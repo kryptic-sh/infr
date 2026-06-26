@@ -56,6 +56,14 @@ pub struct Llama {
     tokenizer: Tokenizer,
 }
 
+/// Per-layer key/value cache held on the GPU (persists across decode steps).
+pub struct KvCache {
+    k: Vec<Box<dyn Buffer>>, // per layer: [max_ctx, n_kv*head_dim]
+    v: Vec<Box<dyn Buffer>>,
+    len: usize,
+    max_ctx: usize,
+}
+
 fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
     g.metadata().u64(key)
 }
@@ -284,6 +292,8 @@ impl Llama {
         let down = alloc(t * ne, BufferUsage::Activations)?;
         let logits = alloc(t * c.vocab, BufferUsage::Readback)?;
 
+        let prof = std::env::var("INFR_PROFILE").is_ok();
+        let t_rec0 = std::time::Instant::now();
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
         for layer in &self.layers {
             rec.rmsnorm(
@@ -297,8 +307,26 @@ impl Llama {
             rec.linear(layer.wq.as_ref(), hn.as_ref(), q.as_ref(), t, ne, nh * hd);
             rec.linear(layer.wk.as_ref(), hn.as_ref(), k.as_ref(), t, ne, nkv * hd);
             rec.linear(layer.wv.as_ref(), hn.as_ref(), v.as_ref(), t, ne, nkv * hd);
-            rec.rope(q.as_ref(), q.as_ref(), t, nh, hd, c.rope_dim, c.rope_theta);
-            rec.rope(k.as_ref(), k.as_ref(), t, nkv, hd, c.rope_dim, c.rope_theta);
+            rec.rope(
+                q.as_ref(),
+                q.as_ref(),
+                t,
+                nh,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                0,
+            );
+            rec.rope(
+                k.as_ref(),
+                k.as_ref(),
+                t,
+                nkv,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                0,
+            );
             rec.attention(
                 q.as_ref(),
                 k.as_ref(),
@@ -362,14 +390,195 @@ impl Llama {
             ne,
             c.vocab,
         );
+        let t_rec = t_rec0.elapsed();
+        let t_gpu0 = std::time::Instant::now();
         rec.finish().map_err(|e| anyhow!("{e}"))?;
+        let t_gpu = t_gpu0.elapsed();
 
         let mut bytes = vec![0u8; t * c.vocab * 4];
         self.be
             .download(logits.as_ref(), &mut bytes)
             .map_err(|e| anyhow!("{e}"))?;
+        if prof {
+            eprintln!("[prof] t={t} record={t_rec:?} gpu_submit_wait={t_gpu:?}");
+        }
         let all: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
         Ok(all[(t - 1) * c.vocab..].to_vec())
+    }
+
+    /// Allocate a KV cache with room for `max_ctx` tokens.
+    pub fn new_kv(&self, max_ctx: usize) -> Result<KvCache> {
+        let c = &self.cfg;
+        let row = c.n_kv * c.head_dim;
+        let mut k = Vec::with_capacity(c.n_layer);
+        let mut v = Vec::with_capacity(c.n_layer);
+        for _ in 0..c.n_layer {
+            k.push(
+                self.be
+                    .alloc(max_ctx * row * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            v.push(
+                self.be
+                    .alloc(max_ctx * row * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        Ok(KvCache {
+            k,
+            v,
+            len: 0,
+            max_ctx,
+        })
+    }
+
+    /// KV-cached resident forward: processes only `new_tokens` (n rows), appends their K/V to
+    /// the cache, and attends over the whole cache. Returns logits for the last new token.
+    pub fn forward_resident_kv(&self, new_tokens: &[u32], kv: &mut KvCache) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let n = new_tokens.len();
+        let pos = kv.len;
+        let (ne, nh, nkv, hd, nff) = (c.n_embd, c.n_head, c.n_kv, c.head_dim, c.n_ff);
+        let kvrow = nkv * hd;
+        if pos + n > kv.max_ctx {
+            bail!("KV cache overflow: {} > {}", pos + n, kv.max_ctx);
+        }
+
+        let mut hidden_host = vec![0f32; n * ne];
+        for (i, &tok) in new_tokens.iter().enumerate() {
+            hidden_host[i * ne..(i + 1) * ne]
+                .copy_from_slice(&self.token_embd[tok as usize * ne..(tok as usize + 1) * ne]);
+        }
+        let alloc = |m: usize, u: BufferUsage| -> Result<Box<dyn Buffer>> {
+            self.be.alloc((m * 4).max(4), u).map_err(|e| anyhow!("{e}"))
+        };
+        let hidden = alloc(n * ne, BufferUsage::Staging)?;
+        self.be
+            .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
+            .map_err(|e| anyhow!("{e}"))?;
+        let hn = alloc(n * ne, BufferUsage::Activations)?;
+        let q = alloc(n * nh * hd, BufferUsage::Activations)?;
+        let k_new = alloc(n * kvrow, BufferUsage::Activations)?;
+        let v_new = alloc(n * kvrow, BufferUsage::Activations)?;
+        let attn = alloc(n * nh * hd, BufferUsage::Activations)?;
+        let ao = alloc(n * ne, BufferUsage::Activations)?;
+        let hn2 = alloc(n * ne, BufferUsage::Activations)?;
+        let gate = alloc(n * nff, BufferUsage::Activations)?;
+        let upb = alloc(n * nff, BufferUsage::Activations)?;
+        let act = alloc(n * nff, BufferUsage::Activations)?;
+        let down = alloc(n * ne, BufferUsage::Activations)?;
+        let logits = alloc(n * c.vocab, BufferUsage::Readback)?;
+
+        let off = pos * kvrow * 4; // byte offset into the cache for the new rows
+        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        for (li, layer) in self.layers.iter().enumerate() {
+            rec.rmsnorm(
+                hidden.as_ref(),
+                layer.attn_norm_buf.as_ref(),
+                hn.as_ref(),
+                n,
+                ne,
+                c.rms_eps,
+            );
+            rec.linear(layer.wq.as_ref(), hn.as_ref(), q.as_ref(), n, ne, nh * hd);
+            rec.linear(layer.wk.as_ref(), hn.as_ref(), k_new.as_ref(), n, ne, kvrow);
+            rec.linear(layer.wv.as_ref(), hn.as_ref(), v_new.as_ref(), n, ne, kvrow);
+            rec.rope(
+                q.as_ref(),
+                q.as_ref(),
+                n,
+                nh,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                pos,
+            );
+            rec.rope(
+                k_new.as_ref(),
+                k_new.as_ref(),
+                n,
+                nkv,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                pos,
+            );
+            rec.copy(k_new.as_ref(), kv.k[li].as_ref(), off, n * kvrow * 4);
+            rec.copy(v_new.as_ref(), kv.v[li].as_ref(), off, n * kvrow * 4);
+            rec.attention_kv(
+                q.as_ref(),
+                kv.k[li].as_ref(),
+                kv.v[li].as_ref(),
+                attn.as_ref(),
+                n,
+                pos + n,
+                nh,
+                nkv,
+                hd,
+                pos,
+            );
+            rec.linear(
+                layer.wo.as_ref(),
+                attn.as_ref(),
+                ao.as_ref(),
+                n,
+                nh * hd,
+                ne,
+            );
+            rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), n * ne);
+            rec.rmsnorm(
+                hidden.as_ref(),
+                layer.ffn_norm_buf.as_ref(),
+                hn2.as_ref(),
+                n,
+                ne,
+                c.rms_eps,
+            );
+            rec.linear(
+                layer.wgate.as_ref(),
+                hn2.as_ref(),
+                gate.as_ref(),
+                n,
+                ne,
+                nff,
+            );
+            rec.linear(layer.wup.as_ref(), hn2.as_ref(), upb.as_ref(), n, ne, nff);
+            rec.silu_mul(gate.as_ref(), upb.as_ref(), act.as_ref(), n * nff);
+            rec.linear(
+                layer.wdown.as_ref(),
+                act.as_ref(),
+                down.as_ref(),
+                n,
+                nff,
+                ne,
+            );
+            rec.add(hidden.as_ref(), down.as_ref(), hidden.as_ref(), n * ne);
+        }
+        rec.rmsnorm(
+            hidden.as_ref(),
+            self.output_norm_buf.as_ref(),
+            hn.as_ref(),
+            n,
+            ne,
+            c.rms_eps,
+        );
+        rec.linear(
+            self.lm_head.as_ref(),
+            hn.as_ref(),
+            logits.as_ref(),
+            n,
+            ne,
+            c.vocab,
+        );
+        rec.finish().map_err(|e| anyhow!("{e}"))?;
+
+        let mut bytes = vec![0u8; n * c.vocab * 4];
+        self.be
+            .download(logits.as_ref(), &mut bytes)
+            .map_err(|e| anyhow!("{e}"))?;
+        kv.len += n;
+        let all: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        Ok(all[(n - 1) * c.vocab..].to_vec())
     }
 
     /// Greedy generate up to `max_new` tokens after `prompt` (already a chat-formatted string).
@@ -383,22 +592,26 @@ impl Llama {
             .tokenizer
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
-        let mut tokens: Vec<u32> = enc.get_ids().to_vec();
-        let start = tokens.len();
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let mut generated: Vec<u32> = Vec::new();
+
+        let mut kv = self.new_kv((prompt_tokens.len() + max_new + 8).min(8192))?;
+        // prefill the whole prompt in one resident pass
+        let mut logits = self.forward_resident_kv(&prompt_tokens, &mut kv)?;
         for _ in 0..max_new {
-            let logits = self.forward_resident(&tokens)?;
             let next = argmax(&logits) as u32;
             if next == self.cfg.eos {
                 break;
             }
-            tokens.push(next);
-            // incremental decode of just the new token
+            generated.push(next);
             if let Ok(piece) = self.tokenizer.decode(&[next], false) {
                 on_token(&piece);
             }
+            // decode step: single new token, attends over the cache
+            logits = self.forward_resident_kv(&[next], &mut kv)?;
         }
         self.tokenizer
-            .decode(&tokens[start..], true)
+            .decode(&generated, true)
             .map_err(|e| anyhow!("decode: {e}"))
     }
 

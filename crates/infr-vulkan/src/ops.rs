@@ -273,13 +273,14 @@ impl VulkanBackend {
         rope_dim: usize,
         theta: f32,
     ) -> Result<Vec<f32>> {
-        let k = self.kernel("rope", ROPE_WGSL, 2, 20);
-        let mut push = [0u8; 20];
+        let k = self.kernel("rope", ROPE_WGSL, 2, 24);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&0u32.to_ne_bytes()); // pos_offset
         self.run_kernel(k, &[x], t * n_heads * hd, &push, (t * n_heads) as u32)
     }
 
@@ -349,7 +350,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 pub(crate) const ROPE_WGSL: &str = r#"
-struct PC { t: u32, nheads: u32, hd: u32, rope_dim: u32, theta: f32 }
+struct PC { t: u32, nheads: u32, hd: u32, rope_dim: u32, theta: f32, pos_offset: u32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> y: array<f32>;
@@ -357,7 +358,7 @@ var<immediate> pc: PC;
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if idx >= pc.t * pc.nheads { return; }
-    let pos = idx / pc.nheads;
+    let pos = pc.pos_offset + idx / pc.nheads;
     let base = idx * pc.hd;
     for (var i: u32 = 0u; i < pc.hd; i = i + 1u) { y[base + i] = x[base + i]; }
     let half = pc.rope_dim / 2u;
@@ -428,6 +429,54 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var l: f32 = 0.0;
 
     for (var j: u32 = 0u; j <= ti; j = j + 1u) {
+        let kbase = (j * pc.nkv + kvh) * hd;
+        var dot: f32 = 0.0;
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q[qbase + d] * k[kbase + d]; }
+        let s = dot * scale;
+        if s > m {
+            let corr = exp(m - s);
+            l = l * corr;
+            for (var d: u32 = 0u; d < hd; d = d + 1u) { acc[d] = acc[d] * corr; }
+            m = s;
+        }
+        let p = exp(s - m);
+        l = l + p;
+        let vbase = (j * pc.nkv + kvh) * hd;
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { acc[d] = acc[d] + p * v[vbase + d]; }
+    }
+    let obase = (ti * pc.nh + h) * hd;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { o[obase + d] = acc[d] / l; }
+}
+"#;
+
+/// Cached attention: q `[q_len, nh, hd]` at absolute positions `pos_offset..`, attends over
+/// the full K/V cache `[kv_len, nkv, hd]` (causal by absolute position). hd<=128.
+pub(crate) const ATTENTION_KV_WGSL: &str = r#"
+struct PC { q_len: u32, kv_len: u32, nh: u32, nkv: u32, hd: u32, pos_offset: u32 }
+var<immediate> pc: PC;
+@group(0) @binding(0) var<storage, read>       q: array<f32>;
+@group(0) @binding(1) var<storage, read>       k: array<f32>;
+@group(0) @binding(2) var<storage, read>       v: array<f32>;
+@group(0) @binding(3) var<storage, read_write> o: array<f32>;
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= pc.q_len * pc.nh { return; }
+    let ti = idx / pc.nh;
+    let h = idx % pc.nh;
+    let abs_pos = pc.pos_offset + ti;
+    let group = pc.nh / pc.nkv;
+    let kvh = h / group;
+    let hd = pc.hd;
+    let scale = 1.0 / sqrt(f32(hd));
+    let qbase = (ti * pc.nh + h) * hd;
+
+    var acc: array<f32, 128>;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { acc[d] = 0.0; }
+    var m: f32 = -3.0e38;
+    var l: f32 = 0.0;
+
+    for (var j: u32 = 0u; j <= abs_pos; j = j + 1u) {
         let kbase = (j * pc.nkv + kvh) * hd;
         var dot: f32 = 0.0;
         for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q[qbase + d] * k[kbase + d]; }

@@ -178,7 +178,9 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// RoPE in place is allowed (`x` and `y` may be the same buffer).
+    /// RoPE in place is allowed (`x` and `y` may be the same buffer). `pos_offset` shifts the
+    /// absolute position of the first row (for cached decode).
+    #[allow(clippy::too_many_arguments)]
     pub fn rope(
         &self,
         x: &dyn Buffer,
@@ -188,20 +190,87 @@ impl<'a> Recorder<'a> {
         hd: usize,
         rope_dim: usize,
         theta: f32,
+        pos_offset: usize,
     ) {
-        let k = self.be.kernel("rope", ops::ROPE_WGSL, 2, 20);
-        let mut push = [0u8; 20];
+        let k = self.be.kernel("rope", ops::ROPE_WGSL, 2, 24);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(x), Self::vkb(y)],
             &push,
             (t * n_heads) as u32,
         );
+    }
+
+    /// Cached attention: q `[q_len,nh,hd]` (abs positions `pos_offset..`) over the K/V cache
+    /// `[kv_len,nkv,hd]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+    ) {
+        let kern = self
+            .be
+            .kernel("attention_kv", ops::ATTENTION_KV_WGSL, 4, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
+            &push,
+            (q_len * nh) as u32,
+        );
+    }
+
+    /// Record a buffer→buffer copy of `bytes` from `src[0..]` into `dst[dst_offset..]`.
+    /// Used to append new K/V rows into the persistent cache.
+    pub fn copy(&self, src: &dyn Buffer, dst: &dyn Buffer, dst_offset: usize, bytes: usize) {
+        let device = &self.be.shared.device;
+        // make prior shader writes to `src` visible to the transfer read
+        let mb = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        unsafe {
+            device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[mb],
+                &[],
+                &[],
+            );
+            device.cmd_copy_buffer(
+                self.cmd,
+                Self::vkb(src),
+                Self::vkb(dst),
+                &[vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: dst_offset as u64,
+                    size: bytes as u64,
+                }],
+            );
+        }
     }
 
     pub fn attention(

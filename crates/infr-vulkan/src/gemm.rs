@@ -27,6 +27,12 @@ const ATTN_PF_PART_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_partial.spv"));
 const ATTN_PF_COMB_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_combine.spv"));
+const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
+const MMV_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8.spv"));
+const MMV_Q4_RES_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4_res.spv"));
+const MMV_Q8_RES_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8_res.spv"));
 static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -34,6 +40,10 @@ static ATTN_PREFILL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PF_PART_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PF_COMB_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static MMV_Q4_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static MMV_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static MMV_Q4_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static MMV_Q8_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
 fn gemm_spv() -> &'static [u32] {
     GEMM_SPV.get_or_init(|| spv_words(GEMM_SPV_BYTES))
@@ -60,6 +70,17 @@ pub(crate) fn attn_prefill_partial_spv() -> &'static [u32] {
 /// SPIR-V for the split-K prefill attention combine pass. Used by the recorder.
 pub(crate) fn attn_prefill_combine_spv() -> &'static [u32] {
     ATTN_PF_COMB_SPV.get_or_init(|| spv_words(ATTN_PF_COMB_SPV_BYTES))
+}
+/// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
+/// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.
+pub(crate) fn mul_mat_vec_q_spv(bits: u32, res: bool) -> &'static [u32] {
+    match (bits, res) {
+        (4, false) => MMV_Q4_SPV.get_or_init(|| spv_words(MMV_Q4_SPV_BYTES)),
+        (8, false) => MMV_Q8_SPV.get_or_init(|| spv_words(MMV_Q8_SPV_BYTES)),
+        (4, true) => MMV_Q4_RES_SPV.get_or_init(|| spv_words(MMV_Q4_RES_SPV_BYTES)),
+        (8, true) => MMV_Q8_RES_SPV.get_or_init(|| spv_words(MMV_Q8_RES_SPV_BYTES)),
+        _ => panic!("mul_mat_vec_q: unsupported bits={bits}"),
+    }
 }
 
 impl VulkanBackend {

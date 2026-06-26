@@ -1,0 +1,92 @@
+#version 460
+// Decode GEMV y = x · Wᵀ for our unified-quant weights (u4/u8 index + per-block f16 scale/min).
+// Replaces the WGSL linear_q (1 output/workgroup, 64-thread shared tree reduction, 6 barriers,
+// runtime bits branch, scalar loads). Borrows llama.cpp mul_mat_vec tricks:
+//   * one SUBGROUP (wave32) per output group → reduce with subgroupAdd, NO shared mem, NO barriers
+//   * NUM_ROWS register blocking → the activation vec is loaded once and reused across NUM_ROWS rows
+//   * vec4 activation loads + word-wide weight unpack (8 nibbles / 4 bytes per u32)
+//   * QBITS specialized at compile time (no per-element branch); compiled as q4 / q8 variants
+// Requires requiredSubgroupSize=32. in_f must be a multiple of the elements-per-word (8 for q4, 4
+// for q8); all qwen3 projections satisfy this (in_f ∈ {1024, 3072}).
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef QBITS
+#define QBITS 4
+#endif
+#ifndef NUM_ROWS
+#define NUM_ROWS 1
+#endif
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint bits; uint blk_shift; } pc;
+layout(binding = 0) readonly buffer QB { uint quants[]; };
+layout(binding = 1) readonly buffer SB { float16_t scales[]; };
+layout(binding = 2) readonly buffer MB { float16_t mins[]; };
+layout(binding = 3) readonly buffer XB { float x_buf[]; };  // [rows, in_f]
+#ifdef USE_RES
+layout(binding = 4) readonly buffer RB { float r_buf[]; };  // [rows, out_f] residual
+layout(binding = 5) buffer YB { float y_buf[]; };           // [rows, out_f]
+#else
+layout(binding = 4) buffer YB { float y_buf[]; };           // [rows, out_f]
+#endif
+
+#if QBITS == 4
+const uint EPW = 8u;   // elements per u32 word
+#else
+const uint EPW = 4u;
+#endif
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;            // 0..31
+    uint groups_per_row = (pc.out_f + NUM_ROWS - 1u) / NUM_ROWS;
+    uint unit = gl_WorkGroupID.x;
+    uint r = unit / groups_per_row;                 // input row
+    uint o0 = (unit % groups_per_row) * NUM_ROWS;   // first output row of this group
+    uint xbase = r * pc.in_f;
+    uint nwords = pc.in_f / EPW;                     // u32 words per weight row
+
+    float acc[NUM_ROWS];
+    [[unroll]] for (uint n = 0u; n < NUM_ROWS; n++) { acc[n] = 0.0; }
+
+    for (uint w = lane; w < nwords; w += 32u) {
+        uint xb = xbase + w * EPW;
+        vec4 x0 = vec4(x_buf[xb], x_buf[xb + 1u], x_buf[xb + 2u], x_buf[xb + 3u]);
+#if QBITS == 4
+        vec4 x1 = vec4(x_buf[xb + 4u], x_buf[xb + 5u], x_buf[xb + 6u], x_buf[xb + 7u]);
+#endif
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; n++) {
+            uint o = o0 + n;
+            if (o >= pc.out_f) { continue; }
+            uint g0 = o * pc.in_f + w * EPW;        // global element index of this word's first elem
+            uint blk = g0 >> pc.blk_shift;          // all EPW elems share one block (EPW | block size)
+            float s = float(scales[blk]);
+            float m = float(mins[blk]);
+            uint word = quants[o * nwords + w];
+#if QBITS == 4
+            vec4 lo = vec4(uvec4(word, word >> 4u, word >> 8u, word >> 12u) & 0xFu);
+            vec4 hi = vec4(uvec4(word >> 16u, word >> 20u, word >> 24u, word >> 28u) & 0xFu);
+            acc[n] += dot(x0, lo * s + m) + dot(x1, hi * s + m);
+#else
+            vec4 v = vec4(uvec4(word, word >> 8u, word >> 16u, word >> 24u) & 0xFFu);
+            acc[n] += dot(x0, v * s + m);
+#endif
+        }
+    }
+
+    [[unroll]] for (uint n = 0u; n < NUM_ROWS; n++) {
+        float sum = subgroupAdd(acc[n]);
+        uint o = o0 + n;
+        if (lane == 0u && o < pc.out_f) {
+#ifdef USE_RES
+            y_buf[r * pc.out_f + o] = r_buf[r * pc.out_f + o] + sum;
+#else
+            y_buf[r * pc.out_f + o] = sum;
+#endif
+        }
+    }
+}

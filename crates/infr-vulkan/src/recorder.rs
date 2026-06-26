@@ -16,6 +16,20 @@ use infr_core::{backend::Buffer, error::Result};
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, ops, VulkanBackend};
 
+/// Output rows computed per workgroup by the subgroup decode GEMV (`mul_mat_vec_q.comp`); must match
+/// the shader's `NUM_ROWS`.
+const MMV_NUM_ROWS: u32 = 1;
+
+/// Elements packed per u32 weight word for a given quant width (8 nibbles for q4, 4 bytes for q8).
+/// `None` ⇒ the subgroup GEMV has no specialization for this width; caller uses the WGSL fallback.
+fn mmv_epw(bits: u32) -> Option<usize> {
+    match bits {
+        4 => Some(8),
+        8 => Some(4),
+        _ => None,
+    }
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
@@ -340,28 +354,43 @@ impl<'a> Recorder<'a> {
         blk_shift: u32,
     ) {
         self.stamp("lm_head");
-        let k = self
-            .be
-            .kernel("linear_q", crate::linear::LINEAR_Q_WGSL, 5, 20);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&bits.to_ne_bytes());
         push[16..20].copy_from_slice(&blk_shift.to_ne_bytes());
-        self.dispatch(
-            k,
-            &[
-                Self::vkb(quants),
-                Self::vkb(scales),
-                Self::vkb(mins),
-                Self::vkb(x),
-                Self::vkb(y),
-            ],
-            1,
-            &push,
-            (rows * out_f) as u32,
-        );
+        let bufs = [
+            Self::vkb(quants),
+            Self::vkb(scales),
+            Self::vkb(mins),
+            Self::vkb(x),
+            Self::vkb(y),
+        ];
+        if let Some(epw) = mmv_epw(bits) {
+            if in_f % epw == 0 {
+                // subgroup GEMV: NUM_ROWS outputs/workgroup, one wave32 each (no shared reduction)
+                let name = if bits == 4 {
+                    "mul_mat_vec_q4"
+                } else {
+                    "mul_mat_vec_q8"
+                };
+                let k = self.be.kernel_spv_sg(
+                    name,
+                    crate::gemm::mul_mat_vec_q_spv(bits, false),
+                    5,
+                    20,
+                    32,
+                );
+                let groups = (out_f as u32).div_ceil(MMV_NUM_ROWS);
+                self.dispatch(k, &bufs, 1, &push, rows as u32 * groups);
+                return;
+            }
+        }
+        let k = self
+            .be
+            .kernel("linear_q", crate::linear::LINEAR_Q_WGSL, 5, 20);
+        self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
     /// Quantized dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
@@ -381,29 +410,43 @@ impl<'a> Recorder<'a> {
         blk_shift: u32,
     ) {
         self.stamp("o_or_down");
-        let k = self
-            .be
-            .kernel("linear_res_q", crate::linear::LINEAR_RES_Q_WGSL, 6, 20);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&bits.to_ne_bytes());
         push[16..20].copy_from_slice(&blk_shift.to_ne_bytes());
-        self.dispatch(
-            k,
-            &[
-                Self::vkb(quants),
-                Self::vkb(scales),
-                Self::vkb(mins),
-                Self::vkb(x),
-                Self::vkb(residual),
-                Self::vkb(y),
-            ],
-            1,
-            &push,
-            (rows * out_f) as u32,
-        );
+        let bufs = [
+            Self::vkb(quants),
+            Self::vkb(scales),
+            Self::vkb(mins),
+            Self::vkb(x),
+            Self::vkb(residual),
+            Self::vkb(y),
+        ];
+        if let Some(epw) = mmv_epw(bits) {
+            if in_f % epw == 0 {
+                let name = if bits == 4 {
+                    "mul_mat_vec_q4_res"
+                } else {
+                    "mul_mat_vec_q8_res"
+                };
+                let k = self.be.kernel_spv_sg(
+                    name,
+                    crate::gemm::mul_mat_vec_q_spv(bits, true),
+                    6,
+                    20,
+                    32,
+                );
+                let groups = (out_f as u32).div_ceil(MMV_NUM_ROWS);
+                self.dispatch(k, &bufs, 1, &push, rows as u32 * groups);
+                return;
+            }
+        }
+        let k = self
+            .be
+            .kernel("linear_res_q", crate::linear::LINEAR_RES_Q_WGSL, 6, 20);
+        self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
     /// `y = residual + x·Wᵀ` (fused residual add). `residual` and `y` may be the same buffer.
@@ -1683,6 +1726,105 @@ mod tests {
         }
         println!("linear_q max_err = {maxe:e}");
         assert!(maxe < 1e-3, "linear_q mismatch: {maxe}");
+    }
+
+    // Covers the subgroup GEMV across BOTH quant widths and the residual variant at realistic
+    // projection sizes (the original linear_q test only hit q8 / no-residual / tiny dims).
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn mul_mat_vec_q_all_variants() {
+        let be = VulkanBackend::new().unwrap();
+        for &(bits, blk_shift) in &[(4u32, 5u32), (8u32, 4u32)] {
+            for &res in &[false, true] {
+                let (rows, in_f, out_f) = (1usize, 1024usize, 1024usize);
+                let numel = in_f * out_f;
+                let block = 1usize << blk_shift;
+                let nblk = numel / block;
+                let qmax = if bits == 4 { 16usize } else { 256usize };
+                let qv: Vec<u32> = (0..numel).map(|i| (i * 7 % qmax) as u32).collect();
+                let scales: Vec<u16> = (0..nblk)
+                    .map(|b| half::f16::from_f32(0.01 + (b % 5) as f32 * 0.003).to_bits())
+                    .collect();
+                let mins: Vec<u16> = (0..nblk)
+                    .map(|b| half::f16::from_f32(-0.2 + (b % 3) as f32 * 0.05).to_bits())
+                    .collect();
+                // pack quants: q4 = 8 nibbles/u32, q8 = 4 bytes/u32
+                let per = if bits == 4 { 8usize } else { 4usize };
+                let shift = if bits == 4 { 4u32 } else { 8u32 };
+                let mut quants = vec![0u32; numel / per];
+                for (g, &q) in qv.iter().enumerate() {
+                    quants[g / per] |= q << (shift * (g % per) as u32);
+                }
+                let x: Vec<f32> = (0..rows * in_f)
+                    .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+                    .collect();
+                let r: Vec<f32> = (0..rows * out_f).map(|i| (i % 7) as f32 * 0.1).collect();
+
+                let bq = be
+                    .upload_weight_bytes(bytemuck::cast_slice(&quants))
+                    .unwrap();
+                let bs = be
+                    .upload_weight_bytes(bytemuck::cast_slice(&scales))
+                    .unwrap();
+                let bm = be.upload_weight_bytes(bytemuck::cast_slice(&mins)).unwrap();
+                let upx = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
+                be.upload(upx.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+                let upr = be.alloc(r.len() * 4, BufferUsage::Staging).unwrap();
+                be.upload(upr.as_ref(), bytemuck::cast_slice(&r)).unwrap();
+                let by = be.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+                let rec = be.recorder().unwrap();
+                if res {
+                    rec.linear_add_q(
+                        bq.as_ref(),
+                        bs.as_ref(),
+                        bm.as_ref(),
+                        upx.as_ref(),
+                        upr.as_ref(),
+                        by.as_ref(),
+                        rows,
+                        in_f,
+                        out_f,
+                        bits,
+                        blk_shift,
+                    );
+                } else {
+                    rec.linear_q(
+                        bq.as_ref(),
+                        bs.as_ref(),
+                        bm.as_ref(),
+                        upx.as_ref(),
+                        by.as_ref(),
+                        rows,
+                        in_f,
+                        out_f,
+                        bits,
+                        blk_shift,
+                    );
+                }
+                rec.finish().unwrap();
+                let mut bytes = vec![0u8; rows * out_f * 4];
+                be.download(by.as_ref(), &mut bytes).unwrap();
+                let got: &[f32] = bytemuck::cast_slice(&bytes);
+
+                let dq = |g: usize| {
+                    half::f16::from_bits(scales[g / block]).to_f32() * qv[g] as f32
+                        + half::f16::from_bits(mins[g / block]).to_f32()
+                };
+                let mut maxe = 0f32;
+                for ri in 0..rows {
+                    for o in 0..out_f {
+                        let mut want: f32 =
+                            (0..in_f).map(|i| dq(o * in_f + i) * x[ri * in_f + i]).sum();
+                        if res {
+                            want += r[ri * out_f + o];
+                        }
+                        maxe = maxe.max((got[ri * out_f + o] - want).abs());
+                    }
+                }
+                println!("mul_mat_vec_q bits={bits} res={res} max_err={maxe:e}");
+                assert!(maxe < 5e-3, "bits={bits} res={res} mismatch: {maxe}");
+            }
+        }
     }
 
     #[test]

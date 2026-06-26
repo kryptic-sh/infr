@@ -56,25 +56,38 @@ var<immediate> pc: PushConstants;
 @group(0) @binding(2) var<storage, read>       r_buf: array<f32>; // [rows, out] residual
 @group(0) @binding(3) var<storage, read_write> y_buf: array<f32>; // [rows, out]
 
+var<workgroup> red: array<f32, 64>;
+
 @compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    let total = pc.rows * pc.out_f;
-    if idx >= total { return; }
-    let r = idx / pc.out_f;
-    let o = idx % pc.out_f;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let unit = wid.x;            // = r * out_f + o
+    let o = unit % pc.out_f;
+    let r = unit / pc.out_f;
+    let t = lid.x;
     let wbase = o * pc.in_f;
     let xbase = r * pc.in_f;
     var acc: f32 = 0.0;
-    for (var i: u32 = 0u; i < pc.in_f; i = i + 1u) {
+    for (var i: u32 = t; i < pc.in_f; i = i + 64u) {
         acc = acc + f32(w_buf[wbase + i]) * x_buf[xbase + i];
     }
-    y_buf[idx] = r_buf[idx] + acc;
+    red[t] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if stride == 0u { break; }
+        if t < stride { red[t] = red[t] + red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if t == 0u { y_buf[unit] = r_buf[unit] + red[0]; }
 }
 "#;
 
-/// f16-weight GEMV `y = x·Wᵀ` for the recorder (e.g. the LM head). Same as `LINEAR_WGSL` but
-/// reads f16 weights; activations/output stay f32. (The host `linear` keeps the f32 `LINEAR_WGSL`.)
+/// f16-weight GEMV `y = x·Wᵀ` for the recorder (e.g. the LM head). ONE workgroup per output
+/// element: its 64 threads stride the K dimension so consecutive lanes read consecutive weights
+/// (coalesced), then a tree-reduce sums the partials. Dispatch `rows*out_f` workgroups. This is
+/// far more bandwidth-efficient than thread-per-output (which read weight rows stride-K apart).
 pub(crate) const LINEAR_F16_WGSL: &str = r#"
 enable f16;
 struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
@@ -84,20 +97,31 @@ var<immediate> pc: PushConstants;
 @group(0) @binding(1) var<storage, read>       x_buf: array<f32>; // [rows, in]
 @group(0) @binding(2) var<storage, read_write> y_buf: array<f32>; // [rows, out]
 
+var<workgroup> red: array<f32, 64>;
+
 @compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    let total = pc.rows * pc.out_f;
-    if idx >= total { return; }
-    let r = idx / pc.out_f;
-    let o = idx % pc.out_f;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let unit = wid.x;            // = r * out_f + o
+    let o = unit % pc.out_f;
+    let r = unit / pc.out_f;
+    let t = lid.x;
     let wbase = o * pc.in_f;
     let xbase = r * pc.in_f;
     var acc: f32 = 0.0;
-    for (var i: u32 = 0u; i < pc.in_f; i = i + 1u) {
+    for (var i: u32 = t; i < pc.in_f; i = i + 64u) {
         acc = acc + f32(w_buf[wbase + i]) * x_buf[xbase + i];
     }
-    y_buf[r * pc.out_f + o] = acc;
+    red[t] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if stride == 0u { break; }
+        if t < stride { red[t] = red[t] + red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if t == 0u { y_buf[unit] = red[0]; }
 }
 "#;
 

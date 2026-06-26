@@ -275,7 +275,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
-            ((rows * out_f) as u32).div_ceil(64),
+            (rows * out_f) as u32, // one workgroup per output element (coalesced GEMV)
         );
     }
 
@@ -309,7 +309,7 @@ impl<'a> Recorder<'a> {
             ],
             1,
             &push,
-            ((rows * out_f) as u32).div_ceil(64),
+            (rows * out_f) as u32, // one workgroup per output element (coalesced GEMV)
         );
     }
 

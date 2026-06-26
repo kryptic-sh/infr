@@ -6,6 +6,7 @@
 //! `VK_KHR_shader_subgroup_extended_types`. See PLAN.md.
 #![allow(dead_code)]
 
+mod linear;
 mod matmul;
 
 use std::ffi::CStr;

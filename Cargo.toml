@@ -9,6 +9,7 @@ members = [
     "crates/infr-decode",
     "crates/infr-engine",
     "crates/infr-server",
+    "crates/infr-llama",
     "crates/infr-cli",
 ]
 
@@ -56,3 +57,4 @@ sha2 = "0.10"
 indicatif = "0.17"
 dirs = "5"
 naga = { version = "29", features = ["wgsl-in", "spv-out"] }
+tokenizers = "0.20"

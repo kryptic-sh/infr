@@ -1151,7 +1151,7 @@ impl Llama {
         } else {
             256 * 64
         };
-        let raw = (budget / (pos + 1)).clamp(64, 1024);
+        let raw = (budget / (pos + 1)).clamp(64, 2048);
         (raw / 64 * 64).max(64)
     }
 

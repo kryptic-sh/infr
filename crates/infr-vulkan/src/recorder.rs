@@ -144,13 +144,14 @@ impl<'a> Recorder<'a> {
         &self,
         k: ComputeKernel,
         buffers: &[vk::Buffer],
-        writes: &[vk::Buffer],
+        n_out: usize,
         push: &[u8],
         groups: u32,
     ) {
-        // Inputs are every bound buffer except the output (always last). Do NOT drop in-place
-        // buffers (e.g. rope x==y): they are genuinely read and may carry a RAW from a prior op.
-        let reads = &buffers[..buffers.len() - 1];
+        // The last `n_out` bound buffers are outputs; the rest are inputs. Inputs keep in-place
+        // buffers (e.g. rope x==y) so a RAW from a prior op is still seen.
+        let split = buffers.len() - n_out;
+        let (reads, writes) = buffers.split_at(split);
         self.sync(reads, writes, false);
         let device = &self.be.shared.device;
         let set = unsafe {
@@ -226,7 +227,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
-            &[Self::vkb(y)],
+            1,
             &push,
             ((rows * out_f) as u32).div_ceil(64),
         );
@@ -259,13 +260,72 @@ impl<'a> Recorder<'a> {
                 Self::vkb(residual),
                 Self::vkb(y),
             ],
-            &[Self::vkb(y)],
+            1,
             &push,
             ((rows * out_f) as u32).div_ceil(64),
         );
     }
 
+    /// Fused attention input: `(q, k, v) = RoPE/identity(RMSNorm(hidden)·{Wq,Wk,Wv})`.
+    /// `q`/`k` are RoPE'd, `v` raw. Requires `q_dim%64==0`, `kv_dim%64==0`, `hd` even, `ne<=8192`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_in(
+        &self,
+        hidden: &dyn Buffer,
+        norm_w: &dyn Buffer,
+        wq: &dyn Buffer,
+        wk: &dyn Buffer,
+        wv: &dyn Buffer,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        rows: usize,
+        ne: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        pos: usize,
+        eps: f32,
+    ) {
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+        debug_assert_eq!(q_dim % 64, 0, "attn_in requires q_dim % 64 == 0");
+        debug_assert_eq!(kv_dim % 64, 0, "attn_in requires kv_dim % 64 == 0");
+        debug_assert!(ne <= 8192, "attn_in requires ne <= 8192");
+        let kern = self.be.kernel("attn_in", ops::ATTN_IN_WGSL, 8, 36);
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(q_dim as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(kv_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&theta.to_ne_bytes());
+        push[28..32].copy_from_slice(&(pos as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&eps.to_ne_bytes());
+        let d = q_dim + 2 * kv_dim;
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(hidden),
+                Self::vkb(norm_w),
+                Self::vkb(wq),
+                Self::vkb(wk),
+                Self::vkb(wv),
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(v),
+            ],
+            3,
+            &push,
+            ((rows * d) as u32).div_ceil(64),
+        );
+    }
+
     /// Fused FFN input: `act = SwiGLU(rmsnorm(hidden)·Wgu)`. Requires `nff % 64 == 0`, `ne <= 8192`.
+    #[allow(clippy::too_many_arguments)]
     pub fn ffn_in(
         &self,
         hidden: &dyn Buffer,
@@ -293,7 +353,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(wgu),
                 Self::vkb(act),
             ],
-            &[Self::vkb(act)],
+            1,
             &push,
             ((rows * nff) as u32).div_ceil(64),
         );
@@ -316,7 +376,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(y)],
-            &[Self::vkb(y)],
+            1,
             &push,
             (rows as u32).div_ceil(64),
         );
@@ -347,7 +407,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(x), Self::vkb(y)],
-            &[Self::vkb(y)],
+            1,
             &push,
             (t * n_heads) as u32,
         );
@@ -382,7 +442,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
-            &[Self::vkb(o)],
+            1,
             &push,
             (q_len * nh) as u32,
         );
@@ -428,7 +488,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[Self::vkb(q), Self::vkb(k), Self::vkb(v), Self::vkb(o)],
-            &[Self::vkb(o)],
+            1,
             &push,
             (t * nh) as u32,
         );
@@ -445,7 +505,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(gu), Self::vkb(y)],
-            &[Self::vkb(y)],
+            1,
             &push,
             (rows * nff) as u32,
         );
@@ -456,7 +516,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
-            &[Self::vkb(y)],
+            1,
             &(n as u32).to_ne_bytes(),
             (n as u32).div_ceil(64),
         );
@@ -468,7 +528,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],
-            &[Self::vkb(y)],
+            1,
             &(n as u32).to_ne_bytes(),
             (n as u32).div_ceil(64),
         );
@@ -505,5 +565,181 @@ impl VulkanBackend {
     /// Start recording a single-submit forward.
     pub fn recorder(&self) -> Result<Recorder<'_>> {
         Recorder::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infr_core::{backend::BufferUsage, Backend};
+
+    fn rmsnorm_cpu(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+        let n = x.len();
+        let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+        let scale = 1.0 / (ss + eps).sqrt();
+        (0..n).map(|i| x[i] * scale * w[i]).collect()
+    }
+    fn dot(w: &[f32], row: usize, ne: usize, x: &[f32]) -> f32 {
+        (0..ne).map(|k| w[row * ne + k] * x[k]).sum()
+    }
+    // ggml NORM-interleaved rope of a head-dim vector in place over the first rope_dim entries.
+    fn rope_head(v: &mut [f32], hd: usize, rope_dim: usize, theta: f32, pos: usize) {
+        for i in 0..rope_dim / 2 {
+            let freq = theta.powf(-2.0 * i as f32 / rope_dim as f32);
+            let ang = pos as f32 * freq;
+            let (s, co) = (ang.sin(), ang.cos());
+            let a = v[2 * i];
+            let b = v[2 * i + 1];
+            v[2 * i] = a * co - b * s;
+            v[2 * i + 1] = a * s + b * co;
+        }
+        let _ = hd;
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn ffn_in_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (ne, nff, eps) = (128usize, 256usize, 1e-5f32);
+        let hidden: Vec<f32> = (0..ne)
+            .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.05)
+            .collect();
+        let nw: Vec<f32> = (0..ne).map(|i| 1.0 + (i % 5) as f32 * 0.01).collect();
+        let wgu: Vec<f32> = (0..2 * nff * ne)
+            .map(|i| ((i * 31 % 97) as f32 - 48.0) * 0.002)
+            .collect();
+
+        let up = |v: &[f32], u| {
+            let b = be.alloc(v.len() * 4, u).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        let bh = up(&hidden, BufferUsage::Staging);
+        let bn = up(&nw, BufferUsage::Staging);
+        let bw = up(&wgu, BufferUsage::Weights);
+        let act = be.alloc(nff * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.ffn_in(
+            bh.as_ref(),
+            bn.as_ref(),
+            bw.as_ref(),
+            act.as_ref(),
+            1,
+            ne,
+            nff,
+            eps,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; nff * 4];
+        be.download(act.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+
+        let norm = rmsnorm_cpu(&hidden, &nw, eps);
+        let mut max_err = 0f32;
+        for f in 0..nff {
+            let g = dot(&wgu, f, ne, &norm);
+            let u = dot(&wgu, nff + f, ne, &norm);
+            let want = (g / (1.0 + (-g).exp())) * u;
+            max_err = max_err.max((got[f] - want).abs());
+        }
+        println!("ffn_in max_err = {max_err:e}");
+        assert!(max_err < 1e-4, "ffn_in mismatch: {max_err}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attn_in_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (ne, nh, nkv, hd) = (128usize, 4usize, 2usize, 32usize);
+        let (rope_dim, theta, pos, eps) = (32usize, 10000f32, 3usize, 1e-5f32);
+        let (q_dim, kv_dim, ctx) = (nh * hd, nkv * hd, 8usize);
+        let hidden: Vec<f32> = (0..ne)
+            .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.04)
+            .collect();
+        let nw: Vec<f32> = (0..ne).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
+        let mkw = |rows: usize, salt: usize| -> Vec<f32> {
+            (0..rows * ne)
+                .map(|i| (((i + salt) * 17 % 89) as f32 - 44.0) * 0.003)
+                .collect()
+        };
+        let wq = mkw(q_dim, 1);
+        let wk = mkw(kv_dim, 2);
+        let wv = mkw(kv_dim, 3);
+
+        let up = |v: &[f32], u| {
+            let b = be.alloc(v.len() * 4, u).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        let bh = up(&hidden, BufferUsage::Staging);
+        let bn = up(&nw, BufferUsage::Staging);
+        let bwq = up(&wq, BufferUsage::Weights);
+        let bwk = up(&wk, BufferUsage::Weights);
+        let bwv = up(&wv, BufferUsage::Weights);
+        let bq = be.alloc(q_dim * 4, BufferUsage::Readback).unwrap();
+        let bkc = be.alloc(ctx * kv_dim * 4, BufferUsage::Readback).unwrap();
+        let bvc = be.alloc(ctx * kv_dim * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attn_in(
+            bh.as_ref(),
+            bn.as_ref(),
+            bwq.as_ref(),
+            bwk.as_ref(),
+            bwv.as_ref(),
+            bq.as_ref(),
+            bkc.as_ref(),
+            bvc.as_ref(),
+            1,
+            ne,
+            nh,
+            nkv,
+            hd,
+            rope_dim,
+            theta,
+            pos,
+            eps,
+        );
+        rec.finish().unwrap();
+        let rd = |b: &dyn Buffer, n: usize| {
+            let mut bytes = vec![0u8; n * 4];
+            be.download(b, &mut bytes).unwrap();
+            bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+        };
+        let gq = rd(bq.as_ref(), q_dim);
+        let gk = rd(bkc.as_ref(), ctx * kv_dim);
+        let gv = rd(bvc.as_ref(), ctx * kv_dim);
+
+        let norm = rmsnorm_cpu(&hidden, &nw, eps);
+        // q reference (per head, roped)
+        let mut wantq = vec![0f32; q_dim];
+        for c in 0..q_dim {
+            wantq[c] = dot(&wq, c, ne, &norm);
+        }
+        for h in 0..nh {
+            rope_head(&mut wantq[h * hd..(h + 1) * hd], hd, rope_dim, theta, pos);
+        }
+        let mut wantk = vec![0f32; kv_dim];
+        for c in 0..kv_dim {
+            wantk[c] = dot(&wk, c, ne, &norm);
+        }
+        for h in 0..nkv {
+            rope_head(&mut wantk[h * hd..(h + 1) * hd], hd, rope_dim, theta, pos);
+        }
+        let wantv: Vec<f32> = (0..kv_dim).map(|c| dot(&wv, c, ne, &norm)).collect();
+
+        let err = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        let eq = err(&gq, &wantq);
+        let ek = err(&gk[pos * kv_dim..(pos + 1) * kv_dim], &wantk);
+        let ev = err(&gv[pos * kv_dim..(pos + 1) * kv_dim], &wantv);
+        println!("attn_in err q={eq:e} k={ek:e} v={ev:e}");
+        assert!(
+            eq < 1e-4 && ek < 1e-4 && ev < 1e-4,
+            "attn_in mismatch q={eq} k={ek} v={ev}"
+        );
     }
 }

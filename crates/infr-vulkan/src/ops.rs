@@ -539,6 +539,91 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
+/// Fused attention input: RMSNorm(hidden) → Q/K/V projections → RoPE on Q,K.
+/// Replaces rmsnorm + 3 linears + 2 ropes (6 dispatches + barriers) with one dispatch.
+/// One workgroup owns 64 contiguous output columns of the packed layout
+/// `[q_dim | kv_dim | kv_dim]` for a single row; it RMS-normalizes that row into shared once,
+/// then each thread does its projection(s). RoPE is ggml-NORM interleaved (pairs 2i,2i+1); a
+/// thread computes both members of its pair's raw dot products so it can rotate. Requires
+/// `q_dim%64==0`, `kv_dim%64==0`, `hd` even, `ne<=8192`.
+pub(crate) const ATTN_IN_WGSL: &str = r#"
+struct PC { rows: u32, ne: u32, q_dim: u32, kv_dim: u32, hd: u32, rope_dim: u32, theta: f32, pos: u32, eps: f32 }
+var<immediate> pc: PC;
+@group(0) @binding(0) var<storage, read>       hidden: array<f32>; // [rows, ne]
+@group(0) @binding(1) var<storage, read>       nw: array<f32>;     // [ne]
+@group(0) @binding(2) var<storage, read>       wq: array<f32>;     // [q_dim, ne]
+@group(0) @binding(3) var<storage, read>       wk: array<f32>;     // [kv_dim, ne]
+@group(0) @binding(4) var<storage, read>       wv: array<f32>;     // [kv_dim, ne]
+@group(0) @binding(5) var<storage, read_write> q: array<f32>;      // [rows, q_dim]
+@group(0) @binding(6) var<storage, read_write> kout: array<f32>;   // KV cache [ctx, kv_dim]
+@group(0) @binding(7) var<storage, read_write> vout: array<f32>;   // KV cache [ctx, kv_dim]
+
+var<workgroup> sh_norm: array<f32, 8192>;
+var<workgroup> ss_partial: array<f32, 64>;
+
+fn dot_q(row: u32) -> f32 { var a: f32 = 0.0; let b = row * pc.ne;
+    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) { a = a + wq[b + k] * sh_norm[k]; } return a; }
+fn dot_k(row: u32) -> f32 { var a: f32 = 0.0; let b = row * pc.ne;
+    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) { a = a + wk[b + k] * sh_norm[k]; } return a; }
+fn dot_v(row: u32) -> f32 { var a: f32 = 0.0; let b = row * pc.ne;
+    for (var k: u32 = 0u; k < pc.ne; k = k + 1u) { a = a + wv[b + k] * sh_norm[k]; } return a; }
+
+// rotate element at within-head index `ih` given its pair's raw values (a=even, b=odd).
+fn rope_elem(ih: u32, a: f32, b: f32) -> f32 {
+    if ih >= pc.rope_dim { if (ih % 2u) == 0u { return a; } return b; }
+    let ip = ih / 2u;
+    let freq = pow(pc.theta, -2.0 * f32(ip) / f32(pc.rope_dim));
+    let ang = f32(pc.pos) * freq;
+    let s = sin(ang);
+    let co = cos(ang);
+    if (ih % 2u) == 0u { return a * co - b * s; }
+    return a * s + b * co;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let t = lid.x;
+    let d = pc.q_dim + 2u * pc.kv_dim;
+    let base = wid.x * 64u;
+    let r = base / d;
+    let rbase = r * pc.ne;
+
+    var local_ss: f32 = 0.0;
+    var i = t;
+    loop { if i >= pc.ne { break; } let v = hidden[rbase + i]; local_ss = local_ss + v * v; i = i + 64u; }
+    ss_partial[t] = local_ss;
+    workgroupBarrier();
+    var stride = 32u;
+    loop { if stride == 0u { break; }
+        if t < stride { ss_partial[t] = ss_partial[t] + ss_partial[t + stride]; }
+        workgroupBarrier(); stride = stride / 2u; }
+    let scale = inverseSqrt(ss_partial[0] / f32(pc.ne) + pc.eps);
+    var j = t;
+    loop { if j >= pc.ne { break; } sh_norm[j] = hidden[rbase + j] * scale * nw[j]; j = j + 64u; }
+    workgroupBarrier();
+
+    let col = base + t - r * d; // column in [0, d)
+    if col < pc.q_dim {
+        let ih = col % pc.hd;
+        let even = col - (col % 2u);
+        let a = dot_q(even);
+        let b = dot_q(even + 1u);
+        q[r * pc.q_dim + col] = rope_elem(ih, a, b);
+    } else if col < pc.q_dim + pc.kv_dim {
+        let kc = col - pc.q_dim;
+        let ih = kc % pc.hd;
+        let even = kc - (kc % 2u);
+        let a = dot_k(even);
+        let b = dot_k(even + 1u);
+        kout[(pc.pos + r) * pc.kv_dim + kc] = rope_elem(ih, a, b);
+    } else {
+        let vc = col - pc.q_dim - pc.kv_dim;
+        vout[(pc.pos + r) * pc.kv_dim + vc] = dot_v(vc);
+    }
+}
+"#;
+
 pub(crate) const ATTENTION_WGSL: &str = r#"
 struct PC { t: u32, nh: u32, nkv: u32, hd: u32 }
 var<immediate> pc: PC;

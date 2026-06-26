@@ -443,7 +443,6 @@ impl Llama {
         let n = new_tokens.len();
         let pos = kv.len;
         let (ne, nh, nkv, hd, nff) = (c.n_embd, c.n_head, c.n_kv, c.head_dim, c.n_ff);
-        let kvrow = nkv * hd;
         if pos + n > kv.max_ctx {
             bail!("KV cache overflow: {} > {}", pos + n, kv.max_ctx);
         }
@@ -462,50 +461,33 @@ impl Llama {
             .map_err(|e| anyhow!("{e}"))?;
         let hn = alloc(n * ne, BufferUsage::Activations)?;
         let q = alloc(n * nh * hd, BufferUsage::Activations)?;
-        let k_new = alloc(n * kvrow, BufferUsage::Activations)?;
-        let v_new = alloc(n * kvrow, BufferUsage::Activations)?;
         let attn = alloc(n * nh * hd, BufferUsage::Activations)?;
         let act = alloc(n * nff, BufferUsage::Activations)?;
         let logits = alloc(n * c.vocab, BufferUsage::Readback)?;
 
-        let off = pos * kvrow * 4; // byte offset into the cache for the new rows
         let prof = std::env::var("INFR_PROF").is_ok();
         let t_rec = std::time::Instant::now();
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
         for (li, layer) in self.layers.iter().enumerate() {
-            rec.rmsnorm(
+            rec.attn_in(
                 hidden.as_ref(),
                 layer.attn_norm_buf.as_ref(),
-                hn.as_ref(),
+                layer.wq.as_ref(),
+                layer.wk.as_ref(),
+                layer.wv.as_ref(),
+                q.as_ref(),
+                kv.k[li].as_ref(),
+                kv.v[li].as_ref(),
                 n,
                 ne,
-                c.rms_eps,
-            );
-            rec.linear(layer.wq.as_ref(), hn.as_ref(), q.as_ref(), n, ne, nh * hd);
-            rec.linear(layer.wk.as_ref(), hn.as_ref(), k_new.as_ref(), n, ne, kvrow);
-            rec.linear(layer.wv.as_ref(), hn.as_ref(), v_new.as_ref(), n, ne, kvrow);
-            rec.rope(
-                q.as_ref(),
-                q.as_ref(),
-                n,
                 nh,
-                hd,
-                c.rope_dim,
-                c.rope_theta,
-                pos,
-            );
-            rec.rope(
-                k_new.as_ref(),
-                k_new.as_ref(),
-                n,
                 nkv,
                 hd,
                 c.rope_dim,
                 c.rope_theta,
                 pos,
+                c.rms_eps,
             );
-            rec.copy(k_new.as_ref(), kv.k[li].as_ref(), off, n * kvrow * 4);
-            rec.copy(v_new.as_ref(), kv.v[li].as_ref(), off, n * kvrow * 4);
             rec.attention_kv(
                 q.as_ref(),
                 kv.k[li].as_ref(),

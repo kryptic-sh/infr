@@ -5,6 +5,12 @@
 //! See PLAN.md "engine".
 #![allow(dead_code, unused_variables)]
 
+pub mod chat;
+
+pub use chat::{
+    apply_chat_template, normalize_messages, parse_tool_calls, split_channels, ToolCall,
+};
+
 use std::path::Path;
 use std::sync::Arc;
 

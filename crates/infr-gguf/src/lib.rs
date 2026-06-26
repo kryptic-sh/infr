@@ -175,10 +175,15 @@ fn ggml_type_to_dtype(t: u32) -> Result<DType> {
     match t {
         0 => Ok(DType::F32),
         1 => Ok(DType::F16),
+        // 2=Q4_0, 3=Q4_1: not needed for MVP; fall through to error
+        // 4,5 removed from ggml
+        6 => Ok(DType::Q5_0), // Q5_0: 32 elems, 22 bytes/block
+        7 => Ok(DType::Q5_1), // Q5_1: 32 elems, 24 bytes/block
         8 => Ok(DType::Q8_0),
         12 => Ok(DType::Q4K),
         13 => Ok(DType::Q5K),
         14 => Ok(DType::Q6K),
+        30 => Ok(DType::Bf16), // GGML_TYPE_BF16
         _ => Err(Error::Unsupported(format!("ggml type {t}"))),
     }
 }
@@ -190,6 +195,11 @@ fn block_layout(dtype: DType) -> (usize, usize) {
     match dtype {
         DType::F32 => (1, 4),
         DType::F16 => (1, 2),
+        DType::Bf16 => (1, 2),
+        // block_q5_0: ggml_half d + uint8_t qh[4] + uint8_t qs[16] = 22 bytes, 32 elems
+        DType::Q5_0 => (32, 22),
+        // block_q5_1: ggml_half d + ggml_half m + uint8_t qh[4] + uint8_t qs[16] = 24 bytes, 32 elems
+        DType::Q5_1 => (32, 24),
         DType::Q8_0 => (32, 34),
         DType::Q4K => (256, 144),
         DType::Q5K => (256, 176),

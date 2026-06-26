@@ -7,8 +7,12 @@
 pub enum DType {
     F32,
     F16,
+    Bf16,
     I32,
     U32,
+    // legacy scalar quants (needed to parse DiffusionGemma rope_freqs + scale tensors)
+    Q5_0,
+    Q5_1,
     // GGUF k-quants we care about for the MVP (extend as needed).
     Q4K,
     Q5K,
@@ -19,7 +23,10 @@ pub enum DType {
 impl DType {
     /// True for block-quantized weight types.
     pub fn is_quant(self) -> bool {
-        matches!(self, DType::Q4K | DType::Q5K | DType::Q6K | DType::Q8_0)
+        matches!(
+            self,
+            DType::Q5_0 | DType::Q5_1 | DType::Q4K | DType::Q5K | DType::Q6K | DType::Q8_0
+        )
     }
 
     /// Bytes for `n` elements of a non-quant dtype. Returns `None` for quant types
@@ -27,7 +34,7 @@ impl DType {
     pub fn dense_bytes(self, n: usize) -> Option<usize> {
         let sz = match self {
             DType::F32 | DType::I32 | DType::U32 => 4,
-            DType::F16 => 2,
+            DType::F16 | DType::Bf16 => 2,
             _ => return None,
         };
         Some(n * sz)

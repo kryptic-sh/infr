@@ -9,3 +9,6 @@ repository.workspace = true
 infr-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+infr-gguf = { path = "../infr-gguf" }

@@ -309,7 +309,7 @@ impl VulkanBackend {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
-        self.run_kernel(k, &[x, w], rows * dim, &push, (rows as u32).div_ceil(64))
+        self.run_kernel(k, &[x, w], rows * dim, &push, rows as u32) // one workgroup per row
     }
 
     /// RoPE (ggml NORM, interleaved pairs) over `x` laid out `[t, n_heads, hd]`.
@@ -380,21 +380,34 @@ impl VulkanBackend {
     }
 }
 
+// ONE workgroup per row; its 64 threads cooperatively reduce the sum-of-squares (coalesced),
+// then write the normalized row. Dispatch `rows` workgroups.
 pub(crate) const RMSNORM_WGSL: &str = r#"
 struct PC { rows: u32, dim: u32, eps: f32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
 @group(0) @binding(1) var<storage, read>       w: array<f32>;
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
+var<workgroup> red: array<f32, 64>;
 @compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let r = gid.x;
-    if r >= pc.rows { return; }
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let r = wid.x;
+    let t = lid.x;
     let base = r * pc.dim;
-    var ss: f32 = 0.0;
-    for (var i: u32 = 0u; i < pc.dim; i = i + 1u) { let v = x[base + i]; ss = ss + v * v; }
-    let scale = 1.0 / sqrt(ss / f32(pc.dim) + pc.eps);
-    for (var i: u32 = 0u; i < pc.dim; i = i + 1u) { y[base + i] = x[base + i] * scale * w[i]; }
+    var pss: f32 = 0.0;
+    for (var i: u32 = t; i < pc.dim; i = i + 64u) { let v = x[base + i]; pss = pss + v * v; }
+    red[t] = pss;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if stride == 0u { break; }
+        if t < stride { red[t] = red[t] + red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let scale = inverseSqrt(red[0] / f32(pc.dim) + pc.eps);
+    for (var i: u32 = t; i < pc.dim; i = i + 64u) { y[base + i] = x[base + i] * scale * w[i]; }
 }
 "#;
 

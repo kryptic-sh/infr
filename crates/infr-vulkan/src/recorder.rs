@@ -424,7 +424,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(w), Self::vkb(y)],
             1,
             &push,
-            (rows as u32).div_ceil(64),
+            rows as u32, // one workgroup per row (cooperative reduction)
         );
     }
 

@@ -279,6 +279,50 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Prefill projection GEMM: `c[m,n] = a[m,k] · Wᵀ` on the matrix cores (coopmat). `a` is f32;
+    /// `wq` is the weight (f16 packed 2/u32 with bits=16, or quant idx with bits=4|8 + scales/mins).
+    /// `c` MUST be allocated `ceil(m/64)*64` rows (the kernel writes padded rows as 0). `n%64==0`,
+    /// `k%32==0`. For f16 weights pass any small non-empty buffer for scales/mins (unused).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_proj(
+        &self,
+        a: &dyn Buffer,
+        wq: &dyn Buffer,
+        scales: &dyn Buffer,
+        mins: &dyn Buffer,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+        bits: u32,
+        blk_shift: u32,
+    ) {
+        self.stamp("matmul_proj");
+        let kern = self
+            .be
+            .kernel_spv_sg("gemm_proj", crate::gemm::gemm_proj_spv(), 5, 20, 32);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&bits.to_ne_bytes());
+        push[16..20].copy_from_slice(&blk_shift.to_ne_bytes());
+        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(a),
+                Self::vkb(wq),
+                Self::vkb(scales),
+                Self::vkb(mins),
+                Self::vkb(c),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Quantized dequant GEMV `y = x·Wᵀ`. `bits` (4|8) and `blk_shift` (log2 scale-block) select
     /// the packed-weight layout.
     #[allow(clippy::too_many_arguments)]
@@ -1143,6 +1187,113 @@ mod tests {
     fn attention_kv_prefill_matches_cpu() {
         run_attn_kv(17, 17, 9, 3, 64);
         run_attn_kv(40, 1500, 9, 3, 64); // multi-tile prefill (kv_len > TILE)
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn matmul_proj_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (m, k, n) = (70usize, 64usize, 128usize); // m not %64 → exercises padding; n%64, k%32
+        let mpad = m.div_ceil(64) * 64;
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+        // weight W[N,K] (row-major [out,in]), f16-rounded
+        let w: Vec<f32> = (0..n * k)
+            .map(|i| half::f16::from_f32(((i * 13 % 23) as f32 - 11.0) * 0.02).to_f32())
+            .collect();
+        let upf = |v: &[f32]| {
+            let b = be.alloc(v.len() * 4, BufferUsage::Staging).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        let ba = upf(&a);
+        let dummy = be.alloc(4, BufferUsage::Activations).unwrap();
+        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        let cpu = |label: &str, c: &[f32]| {
+            let mut e = 0f32;
+            for r in 0..m {
+                for col in 0..n {
+                    let want: f32 = (0..k).map(|x| a[r * k + x] * w[col * k + x]).sum();
+                    e = e.max((c[r * n + col] - want).abs());
+                }
+            }
+            println!("matmul_proj {label} max_err={e:e}");
+            assert!(e < 5e-3, "matmul_proj {label} mismatch: {e}");
+        };
+
+        // --- f16 weights (bits=16) ---
+        let wf16: Vec<u16> = w
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let bw = be.upload_weight_bytes(bytemuck::cast_slice(&wf16)).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.matmul_proj(
+            ba.as_ref(),
+            bw.as_ref(),
+            dummy.as_ref(),
+            dummy.as_ref(),
+            bc.as_ref(),
+            m,
+            k,
+            n,
+            16,
+            0,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; mpad * n * 4];
+        be.download(bc.as_ref(), &mut bytes).unwrap();
+        cpu("f16", bytemuck::cast_slice(&bytes));
+
+        // --- quant weights (bits=8, per-16 scale/min) ---
+        let blk = 16usize;
+        let mut qu = vec![0u32; n * k / 4];
+        let scales: Vec<u16> = (0..n * k / blk)
+            .map(|b| half::f16::from_f32(0.02).to_bits())
+            .collect();
+        let mins: Vec<u16> = (0..n * k / blk)
+            .map(|b| half::f16::from_f32(-1.5).to_bits())
+            .collect();
+        // choose u8 so that scale*u8+min == f16-rounded w (approx): u8 = round((w-min)/scale)
+        let mut wq_ref = vec![0f32; n * k];
+        for g in 0..n * k {
+            let s = half::f16::from_bits(scales[g / blk]).to_f32();
+            let mn = half::f16::from_bits(mins[g / blk]).to_f32();
+            let q = (((w[g] - mn) / s).round().clamp(0.0, 255.0)) as u8;
+            qu[g / 4] |= (q as u32) << (8 * (g % 4));
+            wq_ref[g] = s * q as f32 + mn;
+        }
+        let bwq = be.upload_weight_bytes(bytemuck::cast_slice(&qu)).unwrap();
+        let bs = be
+            .upload_weight_bytes(bytemuck::cast_slice(&scales))
+            .unwrap();
+        let bm = be.upload_weight_bytes(bytemuck::cast_slice(&mins)).unwrap();
+        let bc2 = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.matmul_proj(
+            ba.as_ref(),
+            bwq.as_ref(),
+            bs.as_ref(),
+            bm.as_ref(),
+            bc2.as_ref(),
+            m,
+            k,
+            n,
+            8,
+            4,
+        );
+        rec.finish().unwrap();
+        let mut bytes2 = vec![0u8; mpad * n * 4];
+        be.download(bc2.as_ref(), &mut bytes2).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes2);
+        let mut e = 0f32;
+        for r in 0..m {
+            for col in 0..n {
+                let want: f32 = (0..k).map(|x| a[r * k + x] * wq_ref[col * k + x]).sum();
+                e = e.max((got[r * n + col] - want).abs());
+            }
+        }
+        println!("matmul_proj quant max_err={e:e}");
+        assert!(e < 5e-3, "matmul_proj quant mismatch: {e}");
     }
 
     #[test]

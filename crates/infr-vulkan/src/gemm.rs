@@ -20,14 +20,20 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
 const GEMM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat.spv"));
 const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
+const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
 static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
 fn gemm_spv() -> &'static [u32] {
     GEMM_SPV.get_or_init(|| spv_words(GEMM_SPV_BYTES))
 }
 fn gemm_tiled_spv() -> &'static [u32] {
     GEMM_TILED_SPV.get_or_init(|| spv_words(GEMM_TILED_SPV_BYTES))
+}
+/// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16/quant W). Used by the recorder.
+pub(crate) fn gemm_proj_spv() -> &'static [u32] {
+    GEMM_PROJ_SPV.get_or_init(|| spv_words(GEMM_PROJ_SPV_BYTES))
 }
 
 impl VulkanBackend {

@@ -335,6 +335,16 @@ impl VulkanBackend {
 
         let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
 
+        // Large buffers (KV cache, big weights) get a DEDICATED exact-size VkDeviceMemory; otherwise
+        // they sub-allocate into gpu-allocator's 256MB blocks and waste the remainder (e.g. 3×67MB
+        // KV buffers per block leave ~55MB unused — ~0.7GB across a long-context KV cache). Small/
+        // transient buffers stay sub-allocated (cheap, pooled).
+        const DEDICATED_MIN: u64 = 32 * 1024 * 1024;
+        let scheme = if requirements.size >= DEDICATED_MIN {
+            AllocationScheme::DedicatedBuffer(buffer)
+        } else {
+            AllocationScheme::GpuAllocatorManaged
+        };
         let allocation = {
             let mut alloc = self.shared.allocator.lock().unwrap();
             alloc
@@ -343,7 +353,7 @@ impl VulkanBackend {
                     requirements,
                     location,
                     linear: true,
-                    allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+                    allocation_scheme: scheme,
                 })
                 .map_err(|e| {
                     // Clean up the buffer we created if allocation fails.

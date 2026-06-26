@@ -51,7 +51,7 @@ pub(crate) fn make_compute_kernel(
     n_buf: usize,
     push_size: u32,
 ) -> ComputeKernel {
-    make_compute_kernel_from_spv(device, &compile_wgsl(wgsl), n_buf, push_size)
+    make_compute_kernel_from_spv(device, &compile_wgsl(wgsl), n_buf, push_size, None)
 }
 
 pub(crate) fn make_compute_kernel_from_spv(
@@ -59,6 +59,7 @@ pub(crate) fn make_compute_kernel_from_spv(
     spv: &[u32],
     n_buf: usize,
     push_size: u32,
+    required_sg: Option<u32>,
 ) -> ComputeKernel {
     let shader = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
@@ -95,10 +96,18 @@ pub(crate) fn make_compute_kernel_from_spv(
         unsafe { device.create_pipeline_layout(&plinfo, None) }.expect("pl layout");
 
     let entry = CStr::from_bytes_with_nul(b"main\0").unwrap();
-    let stage = vk::PipelineShaderStageCreateInfo::default()
+    let mut req_sz =
+        vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(0);
+    let mut stage = vk::PipelineShaderStageCreateInfo::default()
         .stage(vk::ShaderStageFlags::COMPUTE)
         .module(shader)
         .name(entry);
+    if let Some(sz) = required_sg {
+        req_sz = req_sz.required_subgroup_size(sz);
+        stage = stage
+            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+            .push_next(&mut req_sz);
+    }
     let pipeline = unsafe {
         device
             .create_compute_pipelines(
@@ -170,7 +179,22 @@ impl VulkanBackend {
     ) -> ComputeKernel {
         let mut map = self.shared.kernels.lock().unwrap();
         *map.entry(name).or_insert_with(|| {
-            make_compute_kernel_from_spv(&self.shared.device, spv, n_buf, push_size)
+            make_compute_kernel_from_spv(&self.shared.device, spv, n_buf, push_size, None)
+        })
+    }
+
+    /// Like `kernel_spv`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
+    pub(crate) fn kernel_spv_sg(
+        &self,
+        name: &'static str,
+        spv: &[u32],
+        n_buf: usize,
+        push_size: u32,
+        sg_size: u32,
+    ) -> ComputeKernel {
+        let mut map = self.shared.kernels.lock().unwrap();
+        *map.entry(name).or_insert_with(|| {
+            make_compute_kernel_from_spv(&self.shared.device, spv, n_buf, push_size, Some(sg_size))
         })
     }
 

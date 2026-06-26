@@ -10,22 +10,44 @@ use infr_core::{backend::BufferUsage, error::Result, Backend};
 
 use super::{as_vk_buf, be, VulkanBackend};
 
+fn spv_words(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
 const GEMM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat.spv"));
+const GEMM_TILED_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
 static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
 fn gemm_spv() -> &'static [u32] {
-    GEMM_SPV.get_or_init(|| {
-        GEMM_SPV_BYTES
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect()
-    })
+    GEMM_SPV.get_or_init(|| spv_words(GEMM_SPV_BYTES))
+}
+fn gemm_tiled_spv() -> &'static [u32] {
+    GEMM_TILED_SPV.get_or_init(|| spv_words(GEMM_TILED_SPV_BYTES))
 }
 
 impl VulkanBackend {
-    /// Cooperative-matrix GEMM: `C[m,n] = A[m,k] * B[k,n]` (row-major). `a`,`b` are f32 host
-    /// slices (converted to f16 for the matrix cores); the result is f32. `m,n,k` must be
-    /// multiples of 16 (v1).
+    /// Untiled coopmat GEMM (m,n,k multiples of 16). Correct but memory-bound; use `matmul_f16`
+    /// (tiled) for throughput.
+    pub fn matmul_f16_untiled(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>> {
+        assert!(m % 16 == 0 && n % 16 == 0 && k % 16 == 0);
+        let kern = self.kernel_spv("gemm_coopmat", gemm_spv(), 3, 12);
+        self.run_gemm(kern, a, b, m, k, n, (n / 16) as u32, (m / 16) as u32)
+    }
+
+    /// Tiled cooperative-matrix GEMM (shared-memory, 64x64 tiles): `C[m,n]=A[m,k]*B[k,n]`.
+    /// f16 inputs, f32 output. v1 requires m,n multiples of 64 and k multiple of 32.
     pub fn matmul_f16(
         &self,
         a: &[f32],
@@ -35,13 +57,120 @@ impl VulkanBackend {
         n: usize,
     ) -> Result<Vec<f32>> {
         assert!(
-            m % 16 == 0 && n % 16 == 0 && k % 16 == 0,
-            "coopmat GEMM v1 needs m,n,k multiples of 16 (got {m},{k},{n})"
+            m % 64 == 0 && n % 64 == 0 && k % 32 == 0,
+            "tiled coopmat GEMM needs m,n %64 and k %32 (got {m},{k},{n})"
         );
+        let kern = self.kernel_spv_sg("gemm_coopmat_tiled", gemm_tiled_spv(), 3, 12, 32);
+        self.run_gemm(kern, a, b, m, k, n, (n / 64) as u32, (m / 64) as u32)
+    }
+
+    /// Benchmark ONLY the tiled GEMM dispatch (weights pre-uploaded as f16; no host
+    /// conversion / transfer in the loop). Returns avg seconds per dispatch.
+    #[doc(hidden)]
+    pub fn bench_tiled_gemm(&self, m: usize, k: usize, n: usize, iters: usize) -> f64 {
+        let kern = self.kernel_spv_sg("gemm_coopmat_tiled", gemm_tiled_spv(), 3, 12, 32);
+        let a16 = vec![0u16; m * k];
+        let b16 = vec![0u16; k * n];
+        let buf_a = self.alloc(a16.len() * 2, BufferUsage::Staging).unwrap();
+        let buf_b = self.alloc(b16.len() * 2, BufferUsage::Staging).unwrap();
+        let buf_c = self.alloc(m * n * 4, BufferUsage::Activations).unwrap();
+        self.upload(buf_a.as_ref(), bytemuck::cast_slice(&a16))
+            .unwrap();
+        self.upload(buf_b.as_ref(), bytemuck::cast_slice(&b16))
+            .unwrap();
+
+        let device = self.shared.device.clone();
+        unsafe {
+            device
+                .reset_descriptor_pool(kern.desc_pool, vk::DescriptorPoolResetFlags::empty())
+                .unwrap();
+        }
+        let set = unsafe {
+            device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(kern.desc_pool)
+                        .set_layouts(std::slice::from_ref(&kern.ds_layout)),
+                )
+                .unwrap()[0]
+        };
+        let bufs = [
+            unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
+            unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
+            unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
+        ];
+        let infos: Vec<vk::DescriptorBufferInfo> = bufs
+            .iter()
+            .map(|&buffer| vk::DescriptorBufferInfo {
+                buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[i..i + 1])
+            })
+            .collect();
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        let (gx, gy) = ((n / 64) as u32, (m / 64) as u32);
+
+        let dispatch = || {
+            let shared = std::sync::Arc::clone(&self.shared);
+            self.one_shot(move |cmd| unsafe {
+                shared
+                    .device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kern.pipeline);
+                shared.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    kern.pipeline_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                shared.device.cmd_push_constants(
+                    cmd,
+                    kern.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &push,
+                );
+                shared.device.cmd_dispatch(cmd, gx, gy, 1);
+            })
+            .unwrap();
+        };
+        dispatch(); // warm
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            dispatch();
+        }
+        t.elapsed().as_secs_f64() / iters as f64
+    }
+
+    fn run_gemm(
+        &self,
+        kern: super::ops::ComputeKernel,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        gx: u32,
+        gy: u32,
+    ) -> Result<Vec<f32>> {
         assert_eq!(a.len(), m * k);
         assert_eq!(b.len(), k * n);
         let device = self.shared.device.clone();
-        let kern = self.kernel_spv("gemm_coopmat", gemm_spv(), 3, 12);
 
         let a16: Vec<u16> = a.iter().map(|x| f16::from_f32(*x).to_bits()).collect();
         let b16: Vec<u16> = b.iter().map(|x| f16::from_f32(*x).to_bits()).collect();
@@ -101,8 +230,6 @@ impl VulkanBackend {
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
 
-        let gx = (n / 16) as u32;
-        let gy = (m / 16) as u32;
         let shared = std::sync::Arc::clone(&self.shared);
         self.one_shot(move |cmd| unsafe {
             shared
@@ -150,43 +277,49 @@ mod tests {
         c
     }
 
+    fn check(got: &[f32], want: &[f32], label: &str) {
+        let mut max_rel = 0f32;
+        for (g, w) in got.iter().zip(want.iter()) {
+            max_rel = max_rel.max((g - w).abs() / w.abs().max(1.0));
+        }
+        println!("{label} max_rel_err = {max_rel:.4e}");
+        assert!(max_rel < 2e-2, "{label} rel err {max_rel} too high");
+    }
+
     #[test]
     #[ignore = "requires a Vulkan GPU with cooperative matrix"]
-    fn coopmat_gemm_matches_cpu() {
+    fn coopmat_gemm_untiled_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
         let (m, k, n) = (64usize, 48usize, 32usize);
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
+        let got = be.matmul_f16_untiled(&a, &b, m, k, n).unwrap();
+        check(&got, &cpu(&a, &b, m, k, n), "untiled");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU with cooperative matrix"]
+    fn coopmat_gemm_tiled_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (m, k, n) = (128usize, 96usize, 64usize); // m,n %64, k %32
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
         let got = be.matmul_f16(&a, &b, m, k, n).unwrap();
-        let want = cpu(&a, &b, m, k, n);
-        let mut max_rel = 0f32;
-        for (g, w) in got.iter().zip(want.iter()) {
-            let denom = w.abs().max(1.0);
-            max_rel = max_rel.max((g - w).abs() / denom);
-        }
-        println!("coopmat GEMM max_rel_err = {max_rel:.4e}");
-        assert!(max_rel < 2e-2, "coopmat GEMM rel err {max_rel} too high");
+        check(&got, &cpu(&a, &b, m, k, n), "tiled");
     }
 
     #[test]
     #[ignore = "benchmark, requires GPU"]
     fn coopmat_gemm_bench() {
         let be = VulkanBackend::new().unwrap();
-        let s = 2048usize; // 2048^3
-        let a = vec![0.01f32; s * s];
-        let b = vec![0.02f32; s * s];
-        let _ = be.matmul_f16(&a, &b, s, s, s).unwrap(); // warm
-        let t = std::time::Instant::now();
-        let iters = 5;
-        for _ in 0..iters {
-            let _ = be.matmul_f16(&a, &b, s, s, s).unwrap();
+        for s in [1024usize, 2048, 4096] {
+            let dt = be.bench_tiled_gemm(s, s, s, 20);
+            let flops = 2.0 * (s as f64).powi(3);
+            println!(
+                "tiled coopmat GEMM {s}^3: {:.3} ms, {:.0} GFLOP/s",
+                dt * 1e3,
+                flops / dt / 1e9
+            );
         }
-        let dt = t.elapsed().as_secs_f64() / iters as f64;
-        let flops = 2.0 * (s as f64).powi(3);
-        println!(
-            "coopmat GEMM {s}^3: {:.2} ms, {:.1} GFLOP/s",
-            dt * 1e3,
-            flops / dt / 1e9
-        );
     }
 }

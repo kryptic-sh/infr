@@ -243,13 +243,18 @@ impl VulkanBackend {
             .vulkan_memory_model_device_scope(true);
         let mut coopmat_ci =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        // Lets us pin the subgroup size to 32 (RDNA3 coopmat is wave32) for the tiled GEMM.
+        let mut sgsize_ci = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+            .subgroup_size_control(true)
+            .compute_full_subgroups(true);
 
         let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_ci))
             .enabled_extension_names(&ext_ptrs)
             .push_next(&mut shader_f16_ci)
             .push_next(&mut storage16_ci)
-            .push_next(&mut memmodel_ci);
+            .push_next(&mut memmodel_ci)
+            .push_next(&mut sgsize_ci);
         if has_coop_matrix {
             device_ci = device_ci.push_next(&mut coopmat_ci);
         }

@@ -820,13 +820,15 @@ impl Llama {
             None
         };
 
-        // Flash-decoding: for single-token decode at long context, split each head's KV range
-        // across many workgroups (partials in pm/pl/pacc), so attention isn't stuck on `nh`
-        // workgroups. Reused across layers.
-        const CHUNK: usize = 256;
+        // Flash-decoding: for single-token decode, split each head's KV range across many
+        // workgroups (partials in pm/pl/pacc), so attention isn't stuck on `nh` workgroups. The
+        // chunk size is adaptive: a coarse fixed chunk leaves too few workgroups at low/mid context
+        // (decode attention is ~67% of the step there), so size it to ~64 chunks/head (≈nh*64
+        // workgroups) with a 64-key floor. Reused across layers.
         let kv_len = pos + n;
-        let use_split = n == 1 && kv_len > CHUNK;
-        let n_chunks = if use_split { kv_len.div_ceil(CHUNK) } else { 0 };
+        let chunk = (kv_len / 64).clamp(64, 512);
+        let use_split = n == 1 && kv_len > chunk;
+        let n_chunks = if use_split { kv_len.div_ceil(chunk) } else { 0 };
         let split_bufs = if use_split {
             Some((
                 alloc(nh * n_chunks, BufferUsage::Activations)?,
@@ -1089,7 +1091,7 @@ impl Llama {
                     nh,
                     nkv,
                     hd,
-                    CHUNK,
+                    chunk,
                     n_chunks,
                 );
             } else {

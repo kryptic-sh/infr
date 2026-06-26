@@ -360,8 +360,117 @@ AMD RX 7900 XTX (RADV NAVI31, gfx1100), Mesa 26.1, Vulkan 1.4:
 - **Graph abstraction vs perf**: the compile-once/execute-many design must not
   force per-op sync; batch aggressively in the Vulkan backend.
 - **Diffusion decode** is novel in Rust — no reference to copy; port carefully
-  from the llama.cpp implementation.
+  from the llama.cpp implementation (see References below).
 
-```
+---
 
-```
+## Reference implementations (read these first)
+
+All paths are on the author's machine; treat them as the source of truth.
+
+- **`~/Projects/llama.cpp`** — checked out on branch **`diffusiongemma`** (PR
+  `ggml-org/llama.cpp#24423`), already built with HIP. Key files:
+  - `src/llama-model.cpp` + `src/llama-arch.cpp` — the `diffusion-gemma`
+    architecture graph (embeddings → 30 layers w/ SWA-vs-full attention
+    selection, MoE FFN, RoPE, RMSNorm → output). **The canonical forward to
+    port.**
+  - `examples/diffusion/diffusion.{cpp,h}` — diffusion algorithms incl.
+    `diffusion_generate_entropy_bound` and the algorithm enum. **Port for
+    `infr-decode`.**
+  - `examples/diffusion-gemma-server/diffusion-gemma-visual-server.cpp` — the
+    patched persistent server (tools passthrough, FA-aware sizing, fixed ubatch,
+    `CMOE`/`NCMOE` expert offload). Reference for diffusion params, context
+    sizing, channel/tool handling.
+  - `conversion/diffusion_gemma.py` — GGUF conversion: **authoritative tensor
+    names + metadata keys.**
+  - `ggml/src/ggml-vulkan/vulkan-shaders/*.comp` + `ggml/src/ggml-vulkan/` — the
+    Vulkan compute shaders to reuse (`mul_mm`, per-quant dequant, etc.) and how
+    descriptor sets / specialization constants are wired.
+- **`~/Projects/scratch/dgemma-openai-server.py`** — the working OpenAI shim we
+  built. Port its logic into `infr-engine`/`infr-server`: channel split
+  (`reasoning_content` vs `content`), `<|tool_call>` → OpenAI `tool_calls`
+  parsing, tools passthrough, SSE streaming.
+- **Test model:**
+  `~/Projects/models/diffusiongemma-26B-A4B-it-GGUF/diffusiongemma-26B-A4B-it-Q4_K_M.gguf`
+  (16 GB, Q4_K_M). Also `unsloth/diffusiongemma-26B-A4B-it-GGUF` on HF, or via
+  the Ollama store.
+- **Validation oracle:** `~/Projects/llama.cpp/build/bin/llama-diffusion-cli`
+  produces reference outputs/logits to diff against.
+
+---
+
+## DiffusionGemma spec (verified from the test GGUF)
+
+Read these from GGUF metadata at runtime — do not hardcode — but here they are
+so the implementer knows the shape up front.
+
+- **arch** `diffusion-gemma`; **vocab** 262144; **hidden** (`embedding_length`)
+  2816; **layers** (`block_count`) 30; **train ctx** 262144.
+- **Attention:** `head_count` 16; `head_count_kv` per layer = `[8,8,8,8,8,2]`
+  repeating → layers **5, 11, 17, 23, 29 are full-attention** (kv_heads 2), the
+  other 25 are **sliding-window** (kv_heads 8); `key_length`=`value_length`=512
+  (full), `*_swa`=256. This SWA split is why 256K KV is only ~a few GB.
+- **MoE:** ~3.8B active of 26B; expert tensors `blk.N.ffn_(gate|up|down)_exps`,
+  router/gate, top-k routing.
+- **Diffusion:** `canvas_length` 256 tokens/block; `mask_token` id **4**;
+  block-autoregressive (commit blocks sequentially). Entropy-bound decoder
+  defaults observed: algorithm 4 (CONFIDENCE_BASED), schedule 0, `max_steps≈48`,
+  `temperature` 0.8, `eps` 0.001, `t∈[0.4,0.8]`, `entropy_bound` 0.1,
+  `stability` 1, `confidence` 0.005, self-conditioning on.
+- **Special tokens / wire format** (the GGUF embeds the jinja `chat_template`;
+  drive it with `minijinja` rather than reimplementing):
+  - turns: `<|turn>role\n … <turn|>`, leading `bos`.
+  - channels: `<|channel>thought\n … <channel|> … final`. Reasoning = before
+    `<channel|>`, answer = after.
+  - tool decl:
+    `<|tool>declaration:NAME{description:<|"|>…<|"|>,parameters:{…}}<tool|>`
+  - tool call: `<|tool_call>call:NAME{key:value,…}<tool_call|>` (strings wrapped
+    `<|"|>…<|"|>`).
+  - tool response: `<|tool_response>response:NAME{…}<tool_response|>`
+- **Quants available:** Q4_K_M (target), Q5_K_M, Q6_K, Q8_0, BF16.
+
+---
+
+## Dependencies & toolchain
+
+- **Rust** 1.96+ (edition 2021; 2024 ok). Workspace with the crates listed
+  above.
+- **Crates (proposed):** `ash` + `gpu-allocator` (Vulkan); `half`, `bytemuck`
+  (dtypes); `memmap2` (GGUF mmap); `serde`/`serde_json`; `reqwest` (rustls) +
+  `sha2` + `indicatif` (hub download); `tokio` + `axum` + `tower-http` (server);
+  `clap` (CLI); `minijinja` (chat templates); `tokenizers` (or implement the
+  GGUF-embedded tokenizer); `thiserror`/`anyhow`; `tracing`.
+- **Shaders:** GLSL `.comp` → SPIR-V via the `shaderc` crate in `build.rs`,
+  **or** reuse precompiled `.spv` from the ggml build. Device features to
+  request: `VK_KHR_cooperative_matrix`, `shaderFloat16`, `VK_KHR_16bit_storage`,
+  `VK_KHR_shader_subgroup_extended_types`; one compute queue.
+
+---
+
+## Validation strategy
+
+- **smoke:** f16 cooperative-matrix matmul vs a CPU naive matmul; assert
+  relative error < 1e-2.
+- **quant:** dequantize a known tensor (Rust/shader) and diff vs a CPU
+  reference; validate each quant type (Q4_K_M, Q8_0) before trusting matmuls.
+- **per-layer:** fixed prompt → compare hidden states / final logits (top-k
+  token probabilities) against `llama-diffusion-cli` on the same model.
+- **end-to-end:** same prompt + fixed seed → compare generated text/structure to
+  the llama.cpp oracle.
+
+---
+
+## Milestone acceptance criteria
+
+| #   | Milestone    | Done when                                                            |
+| --- | ------------ | -------------------------------------------------------------------- |
+| 1   | smoke        | f16 coop-matrix matmul on the GPU matches CPU within tolerance       |
+| 2   | core         | `Tensor`/`Graph`/`Op`/`Backend` compile; a 2-op graph runs on Vulkan |
+| 3   | `infr pull`  | `ollama:` reuses `~/.ollama` with no re-download; `hf:` downloads    |
+| 4   | vk backend   | matmul/dequant/rmsnorm/rope/softmax each validated vs CPU            |
+| 5   | gguf load    | DiffusionGemma weights upload; tokenizer + template exposed          |
+| 6   | forward      | final logits match llama.cpp top-k on a fixed prompt                 |
+| 7   | attn + moe   | full multi-layer forward matches reference (SWA + full + MoE)        |
+| 8   | diffusion    | greedy/fixed-seed generation matches llama.cpp text                  |
+| 9   | `infr run`   | interactive terminal chat streams a coherent answer                  |
+| 10  | `infr serve` | opencode / Claude Code CLI complete an agentic tool turn             |

@@ -616,6 +616,90 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
+/// Fused RMSNorm + quant Q/K/V projection (Qwen3 decode): one workgroup per output column of the
+/// `[q | k | v]` layout, folding RMSNorm into the dot (sum-of-squares + projection in one pass; the
+/// per-row RMS scale factors out after the reduction — same trick as `ffn_in_q`). Writes the RAW
+/// projections `qr`/`kr`/`vr` (QK-norm + RoPE follow). Replaces rmsnorm + 3× `linear_q` (4 dispatches
+/// → 1). q/k/v share `bits`/`blk_shift` (same quant). Dispatch `rows * (q_dim + 2*kvrow)`.
+pub(crate) const ATTN_IN_Q_WGSL: &str = r#"
+enable f16;
+// q/k/v can have DIFFERENT quant (Q4_K_M mixes Q4_K and Q6_K), so bits/blk_shift are per-region.
+struct PC { rows: u32, ne: u32, q_dim: u32, kvrow: u32, eps: f32,
+            qbits: u32, qblk: u32, kbits: u32, kblk: u32, vbits: u32, vblk: u32 }
+var<immediate> pc: PC;
+@group(0) @binding(0)  var<storage, read>       hidden: array<f32>;
+@group(0) @binding(1)  var<storage, read>       nw: array<f32>;
+@group(0) @binding(2)  var<storage, read>       wq: array<u32>;
+@group(0) @binding(3)  var<storage, read>       sq: array<f16>;
+@group(0) @binding(4)  var<storage, read>       mq: array<f16>;
+@group(0) @binding(5)  var<storage, read>       wk: array<u32>;
+@group(0) @binding(6)  var<storage, read>       sk: array<f16>;
+@group(0) @binding(7)  var<storage, read>       mk: array<f16>;
+@group(0) @binding(8)  var<storage, read>       wv: array<u32>;
+@group(0) @binding(9)  var<storage, read>       sv: array<f16>;
+@group(0) @binding(10) var<storage, read>       mv: array<f16>;
+@group(0) @binding(11) var<storage, read_write> qr: array<f32>;  // [rows, q_dim]
+@group(0) @binding(12) var<storage, read_write> kr: array<f32>;  // [rows, kvrow]
+@group(0) @binding(13) var<storage, read_write> vr: array<f32>;  // [rows, kvrow]
+
+var<workgroup> r_ss: array<f32, 64>;
+var<workgroup> r_d: array<f32, 64>;
+
+fn dqw(region: u32, g: u32) -> f32 {
+    var q: u32;
+    var s: f32;
+    var m: f32;
+    if region == 0u {
+        if pc.qbits == 4u { q = (wq[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu; } else { q = (wq[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu; }
+        s = f32(sq[g >> pc.qblk]); m = f32(mq[g >> pc.qblk]);
+    } else if region == 1u {
+        if pc.kbits == 4u { q = (wk[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu; } else { q = (wk[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu; }
+        s = f32(sk[g >> pc.kblk]); m = f32(mk[g >> pc.kblk]);
+    } else {
+        if pc.vbits == 4u { q = (wv[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu; } else { q = (wv[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu; }
+        s = f32(sv[g >> pc.vblk]); m = f32(mv[g >> pc.vblk]);
+    }
+    return s * f32(q) + m;
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let t = lid.x;
+    let total = pc.q_dim + 2u * pc.kvrow;
+    let unit = wid.x;
+    let o = unit % total;
+    let r = unit / total;
+    // region 0=q,1=k,2=v and the weight-row index within that region
+    var region: u32; var local: u32;
+    if o < pc.q_dim { region = 0u; local = o; }
+    else if o < pc.q_dim + pc.kvrow { region = 1u; local = o - pc.q_dim; }
+    else { region = 2u; local = o - pc.q_dim - pc.kvrow; }
+    let rbase = r * pc.ne;
+    let gbase = local * pc.ne;
+    var pss: f32 = 0.0;
+    var pd: f32 = 0.0;
+    for (var k: u32 = t; k < pc.ne; k = k + 64u) {
+        let hv = hidden[rbase + k];
+        pss = pss + hv * hv;
+        pd = pd + hv * nw[k] * dqw(region, gbase + k);
+    }
+    r_ss[t] = pss; r_d[t] = pd;
+    workgroupBarrier();
+    var stride = 32u;
+    loop { if stride == 0u { break; }
+        if t < stride { r_ss[t] = r_ss[t] + r_ss[t + stride]; r_d[t] = r_d[t] + r_d[t + stride]; }
+        workgroupBarrier(); stride = stride / 2u; }
+    if t == 0u {
+        let scale = inverseSqrt(r_ss[0] / f32(pc.ne) + pc.eps);
+        let val = r_d[0] * scale;
+        if region == 0u { qr[r * pc.q_dim + local] = val; }
+        else if region == 1u { kr[r * pc.kvrow + local] = val; }
+        else { vr[r * pc.kvrow + local] = val; }
+    }
+}
+"#;
+
 /// Fused attention input: RMSNorm(hidden) → Q/K/V projections → RoPE on Q,K, writing K/V into the
 /// cache. ONE workgroup per output *pair* (columns 2p, 2p+1) of the packed `[q | k | v]` layout for
 /// a row — its 64 threads stream the two weight rows over K in lockstep (coalesced), reduce, then

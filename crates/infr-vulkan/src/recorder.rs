@@ -539,6 +539,66 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Fused RMSNorm + quant Q/K/V projection (Qwen3 decode): writes raw `qr`/`kr`/`vr`. Replaces
+    /// rmsnorm + 3× `linear_q`. q/k/v carry their OWN `(bits, blk_shift)` (Q4_K_M mixes Q4_K/Q6_K).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_in_q(
+        &self,
+        hidden: &dyn Buffer,
+        norm_w: &dyn Buffer,
+        wq: (&dyn Buffer, &dyn Buffer, &dyn Buffer),
+        wk: (&dyn Buffer, &dyn Buffer, &dyn Buffer),
+        wv: (&dyn Buffer, &dyn Buffer, &dyn Buffer),
+        qr: &dyn Buffer,
+        kr: &dyn Buffer,
+        vr: &dyn Buffer,
+        rows: usize,
+        ne: usize,
+        q_dim: usize,
+        kvrow: usize,
+        eps: f32,
+        qbb: (u32, u32),
+        kbb: (u32, u32),
+        vbb: (u32, u32),
+    ) {
+        self.stamp("attn_in_q");
+        let k = self.be.kernel("attn_in_q", ops::ATTN_IN_Q_WGSL, 14, 44);
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(q_dim as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(kvrow as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&eps.to_ne_bytes());
+        push[20..24].copy_from_slice(&qbb.0.to_ne_bytes());
+        push[24..28].copy_from_slice(&qbb.1.to_ne_bytes());
+        push[28..32].copy_from_slice(&kbb.0.to_ne_bytes());
+        push[32..36].copy_from_slice(&kbb.1.to_ne_bytes());
+        push[36..40].copy_from_slice(&vbb.0.to_ne_bytes());
+        push[40..44].copy_from_slice(&vbb.1.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(hidden),
+                Self::vkb(norm_w),
+                Self::vkb(wq.0),
+                Self::vkb(wq.1),
+                Self::vkb(wq.2),
+                Self::vkb(wk.0),
+                Self::vkb(wk.1),
+                Self::vkb(wk.2),
+                Self::vkb(wv.0),
+                Self::vkb(wv.1),
+                Self::vkb(wv.2),
+                Self::vkb(qr),
+                Self::vkb(kr),
+                Self::vkb(vr),
+            ],
+            3,
+            &push,
+            (rows * (q_dim + 2 * kvrow)) as u32,
+        );
+    }
+
     /// Fused FFN input: `act = SwiGLU(rmsnorm(hidden)·Wgu)`. Requires `nff % 64 == 0`, `ne <= 8192`.
     #[allow(clippy::too_many_arguments)]
     pub fn ffn_in(
@@ -1623,6 +1683,118 @@ mod tests {
         }
         println!("linear_q max_err = {maxe:e}");
         assert!(maxe < 1e-3, "linear_q mismatch: {maxe}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attn_in_q_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (ne, q_dim, kvrow, eps) = (128usize, 64usize, 32usize, 1e-5f32);
+        let mkw = |salt: usize, out: usize| {
+            let numel = out * ne;
+            let qu8: Vec<u8> = (0..numel).map(|i| ((i * 7 + salt) % 64) as u8).collect();
+            let scales: Vec<u16> = (0..numel / 16)
+                .map(|b| half::f16::from_f32(0.01 + ((b + salt) % 5) as f32 * 0.003).to_bits())
+                .collect();
+            let mins: Vec<u16> = (0..numel / 16)
+                .map(|b| half::f16::from_f32(-0.2 + ((b + salt) % 3) as f32 * 0.05).to_bits())
+                .collect();
+            let mut quants = vec![0u32; numel / 4];
+            for (g, &q) in qu8.iter().enumerate() {
+                quants[g / 4] |= (q as u32) << (8 * (g % 4));
+            }
+            (qu8, scales, mins, quants)
+        };
+        let rows = 3usize; // exercise rows>1 (short-prompt prefill path)
+        let (q8, qs, qm, qq) = mkw(1, q_dim);
+        let (k8, ks, km, kq) = mkw(2, kvrow);
+        let (v8, vs, vm, vq) = mkw(3, kvrow);
+        let hidden: Vec<f32> = (0..rows * ne)
+            .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.06)
+            .collect();
+        let nw: Vec<f32> = (0..ne).map(|i| 1.0 + (i % 7) as f32 * 0.02).collect();
+
+        let up = |b: &[u8]| be.upload_weight_bytes(b).unwrap();
+        let bh = be.alloc(rows * ne * 4, BufferUsage::Staging).unwrap();
+        be.upload(bh.as_ref(), bytemuck::cast_slice(&hidden))
+            .unwrap();
+        let bnw = be.alloc(ne * 4, BufferUsage::Staging).unwrap();
+        be.upload(bnw.as_ref(), bytemuck::cast_slice(&nw)).unwrap();
+        let (bqq, bqs, bqm) = (
+            up(bytemuck::cast_slice(&qq)),
+            up(bytemuck::cast_slice(&qs)),
+            up(bytemuck::cast_slice(&qm)),
+        );
+        let (bkq, bks, bkm) = (
+            up(bytemuck::cast_slice(&kq)),
+            up(bytemuck::cast_slice(&ks)),
+            up(bytemuck::cast_slice(&km)),
+        );
+        let (bvq, bvs, bvm) = (
+            up(bytemuck::cast_slice(&vq)),
+            up(bytemuck::cast_slice(&vs)),
+            up(bytemuck::cast_slice(&vm)),
+        );
+        let bqr = be.alloc(rows * q_dim * 4, BufferUsage::Readback).unwrap();
+        let bkr = be.alloc(rows * kvrow * 4, BufferUsage::Readback).unwrap();
+        let bvr = be.alloc(rows * kvrow * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attn_in_q(
+            bh.as_ref(),
+            bnw.as_ref(),
+            (bqq.as_ref(), bqs.as_ref(), bqm.as_ref()),
+            (bkq.as_ref(), bks.as_ref(), bkm.as_ref()),
+            (bvq.as_ref(), bvs.as_ref(), bvm.as_ref()),
+            bqr.as_ref(),
+            bkr.as_ref(),
+            bvr.as_ref(),
+            rows,
+            ne,
+            q_dim,
+            kvrow,
+            eps,
+            (8, 4),
+            (8, 4),
+            (8, 4),
+        );
+        rec.finish().unwrap();
+        let rd = |b: &dyn Buffer, n: usize| {
+            let mut by = vec![0u8; n * 4];
+            be.download(b, &mut by).unwrap();
+            bytemuck::cast_slice::<u8, f32>(&by).to_vec()
+        };
+        let (gq, gk, gv) = (
+            rd(bqr.as_ref(), rows * q_dim),
+            rd(bkr.as_ref(), rows * kvrow),
+            rd(bvr.as_ref(), rows * kvrow),
+        );
+        let dq = |q8: &[u8], s: &[u16], m: &[u16], g: usize| {
+            half::f16::from_bits(s[g / 16]).to_f32() * q8[g] as f32
+                + half::f16::from_bits(m[g / 16]).to_f32()
+        };
+        let check = |got: &[f32], q8: &[u8], s: &[u16], m: &[u16], out: usize, tag: &str| {
+            let mut maxe = 0f32;
+            for r in 0..rows {
+                let ms: f32 = hidden[r * ne..(r + 1) * ne]
+                    .iter()
+                    .map(|h| h * h)
+                    .sum::<f32>()
+                    / ne as f32;
+                let scale = 1.0 / (ms + eps).sqrt();
+                for o in 0..out {
+                    let want: f32 = scale
+                        * (0..ne)
+                            .map(|i| hidden[r * ne + i] * nw[i] * dq(q8, s, m, o * ne + i))
+                            .sum::<f32>();
+                    maxe = maxe.max((got[r * out + o] - want).abs());
+                }
+            }
+            println!("attn_in_q {tag} max_err = {maxe:e}");
+            assert!(maxe < 1e-3, "attn_in_q {tag} mismatch: {maxe}");
+        };
+        check(&gq, &q8, &qs, &qm, q_dim, "q");
+        check(&gk, &k8, &ks, &km, kvrow, "k");
+        check(&gv, &v8, &vs, &vm, kvrow, "v");
     }
 
     #[test]

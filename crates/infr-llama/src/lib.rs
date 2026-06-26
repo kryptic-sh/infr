@@ -1167,19 +1167,74 @@ impl Llama {
         for (li, layer) in self.layers.iter().enumerate() {
             if let Some((qr, kr, vr)) = &qkv_raw {
                 // qwen3: rmsnorm → Q/K/V projections → per-head QK-norm+RoPE (K/V into the cache)
-                rec.rmsnorm(
-                    hidden.as_ref(),
-                    layer.attn_norm_buf.as_ref(),
-                    hn.as_ref(),
-                    n,
-                    ne,
-                    c.rms_eps,
-                );
+                let rmsnorm_qkv = || {
+                    rec.rmsnorm(
+                        hidden.as_ref(),
+                        layer.attn_norm_buf.as_ref(),
+                        hn.as_ref(),
+                        n,
+                        ne,
+                        c.rms_eps,
+                    );
+                };
+                let fuse_qkv = std::env::var("INFR_NOFUSE").is_err()
+                    && matches!(
+                        (&layer.wq, &layer.wk, &layer.wv),
+                        (Wt::Q { .. }, Wt::Q { .. }, Wt::Q { .. })
+                    );
                 if use_gemm {
+                    rmsnorm_qkv();
                     mm(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
                     mm(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
                     mm(&layer.wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow);
+                } else if fuse_qkv {
+                    // decode: fuse rmsnorm + Q/K/V quant projections into one dispatch.
+                    let (
+                        Wt::Q {
+                            q: qq,
+                            s: qs,
+                            m: qm,
+                            bits: qb,
+                            blk_shift: qbs,
+                        },
+                        Wt::Q {
+                            q: kq,
+                            s: ks,
+                            m: km,
+                            bits: kb,
+                            blk_shift: kbs,
+                        },
+                        Wt::Q {
+                            q: vq,
+                            s: vs,
+                            m: vm,
+                            bits: vb,
+                            blk_shift: vbs,
+                        },
+                    ) = (&layer.wq, &layer.wk, &layer.wv)
+                    else {
+                        unreachable!()
+                    };
+                    rec.attn_in_q(
+                        hidden.as_ref(),
+                        layer.attn_norm_buf.as_ref(),
+                        (qq.as_ref(), qs.as_ref(), qm.as_ref()),
+                        (kq.as_ref(), ks.as_ref(), km.as_ref()),
+                        (vq.as_ref(), vs.as_ref(), vm.as_ref()),
+                        qr.as_ref(),
+                        kr.as_ref(),
+                        vr.as_ref(),
+                        n,
+                        ne,
+                        nh * hd,
+                        kvrow,
+                        c.rms_eps,
+                        (*qb, *qbs),
+                        (*kb, *kbs),
+                        (*vb, *vbs),
+                    );
                 } else {
+                    rmsnorm_qkv();
                     lin(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
                     lin(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
                     lin(&layer.wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow);

@@ -37,9 +37,10 @@ pub struct Store {
 }
 
 impl Store {
-    /// Locate the store root: `$INFR_MODELS` → `$OLLAMA_MODELS` → `~/.ollama/models`.
+    /// Locate the store root: `$INFR_MODELS` → `$OLLAMA_MODELS` → `~/.ollama/models` (if it exists)
+    /// → `/var/lib/ollama` (the systemd-service store, if it exists) → `~/.ollama/models`.
     ///
-    /// The directory is not required to exist.
+    /// The chosen directory is not required to exist (the final fallback may be absent).
     pub fn discover() -> Result<Self> {
         let root = if let Ok(p) = std::env::var("INFR_MODELS") {
             PathBuf::from(p)
@@ -48,7 +49,15 @@ impl Store {
         } else {
             let home = dirs::home_dir()
                 .ok_or_else(|| Error::Other("cannot determine home directory".into()))?;
-            home.join(".ollama").join("models")
+            let user_store = home.join(".ollama").join("models");
+            let systemd_store = PathBuf::from("/var/lib/ollama");
+            if user_store.exists() {
+                user_store
+            } else if systemd_store.exists() {
+                systemd_store
+            } else {
+                user_store
+            }
         };
         Ok(Store { root })
     }

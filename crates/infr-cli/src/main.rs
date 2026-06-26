@@ -51,10 +51,11 @@ fn main() -> anyhow::Result<()> {
 use anyhow::{anyhow, Context};
 use std::path::{Path, PathBuf};
 
-/// Resolve a model arg to (gguf_path, tokenizer_json_path).
-/// Bring-up: accept a path to a `.gguf` (tokenizer.json must sit beside it) or an
-/// `hf:`/`ollama:` ref resolved via infr-hub (tokenizer.json beside the cached blob).
-fn resolve(model: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+/// Resolve a model arg to (gguf_path, optional tokenizer_json_path).
+/// Accept a path to a `.gguf` or an `hf:`/`ollama:` ref resolved via infr-hub. The tokenizer is the
+/// `tokenizer.json` beside the GGUF if present, else `None` → derived from the GGUF's embedded vocab
+/// (ollama blobs are content-addressed with no sidecar).
+fn resolve(model: &str) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
     let gguf = if Path::new(model).exists() {
         PathBuf::from(model)
     } else {
@@ -64,8 +65,7 @@ fn resolve(model: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
     let tok = gguf
         .parent()
         .map(|d| d.join("tokenizer.json"))
-        .filter(|p| p.exists())
-        .context("tokenizer.json not found beside the model (bring-up needs it)")?;
+        .filter(|p| p.exists());
     Ok((gguf, tok))
 }
 
@@ -78,15 +78,20 @@ fn cmd_pull(model: &str) -> anyhow::Result<()> {
 
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
-    let llama = infr_llama::Llama::load(&gguf, &tok)?;
+    let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
     let one_shot = |msg: &str| -> anyhow::Result<()> {
         use std::io::Write;
         let prompt = llama.chatml(msg);
+        let t0 = std::time::Instant::now();
+        let mut n = 0usize;
         llama.generate(&prompt, 256, |piece| {
             print!("{piece}");
             let _ = std::io::stdout().flush();
+            n += 1;
         })?;
+        let dt = t0.elapsed().as_secs_f32();
         println!();
+        eprintln!("[{n} tokens, {dt:.2}s, {:.1} tok/s]", n as f32 / dt);
         Ok(())
     };
     if let Some(m) = message {
@@ -140,7 +145,7 @@ impl infr_server::ChatGenerator for LlamaGenerator {
 
 fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
-    let llama = infr_llama::Llama::load(&gguf, &tok)?;
+    let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
     let model_id = gguf
         .file_stem()
         .and_then(|s| s.to_str())

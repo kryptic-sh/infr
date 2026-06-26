@@ -10,11 +10,23 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::backend::{Buffer, BufferUsage};
+use infr_core::loader::MetaValue;
 use infr_core::{Backend, WeightSource};
 use infr_gguf::Gguf;
 use infr_vulkan::VulkanBackend;
 use std::path::Path;
-use tokenizers::Tokenizer;
+use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
+use tokenizers::models::bpe::BPE;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::pre_tokenizers::sequence::Sequence as PreSequence;
+use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
+
+/// Qwen2/Qwen3 pre-tokenizer regex (same string the HF `tokenizer.json` uses) — applied via a
+/// Split before ByteLevel. Differs from the default GPT-2 ByteLevel regex (punctuation/number runs),
+/// which is what made a naive ByteLevel produce different token ids.
+const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -92,6 +104,89 @@ pub struct KvCache {
 
 fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
     g.metadata().u64(key)
+}
+
+/// Build an HF `Tokenizer` from the GGUF's embedded vocab (`tokenizer.ggml.*`). Supports the
+/// GPT-2 byte-level BPE family (Qwen/Llama-3/SmolLM etc., `tokenizer.ggml.model == "gpt2"`):
+/// vocab from `.tokens`, merges from `.merges`, ByteLevel pre-tokenizer + decoder, and control /
+/// user-defined tokens (token_type 3/4, e.g. `<|im_start|>`) registered as special so they encode
+/// atomically. SentencePiece (`model == "llama"`) isn't built here — pass a `tokenizer.json`.
+fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
+    let md = g.metadata();
+    let model = md.str("tokenizer.ggml.model").unwrap_or("");
+    if model != "gpt2" {
+        bail!(
+            "can't derive a tokenizer from tokenizer.ggml.model={model:?} \
+             (only gpt2 byte-level BPE); pass a tokenizer.json sidecar instead"
+        );
+    }
+    let toks = md
+        .get("tokenizer.ggml.tokens")
+        .and_then(MetaValue::as_arr)
+        .context("gguf missing tokenizer.ggml.tokens")?;
+    let vocab: std::collections::HashMap<String, u32> = toks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.as_str().map(|s| (s.to_string(), i as u32)))
+        .collect();
+    let merges: Vec<(String, String)> = md
+        .get("tokenizer.ggml.merges")
+        .and_then(MetaValue::as_arr)
+        .context("gguf missing tokenizer.ggml.merges")?
+        .iter()
+        .filter_map(|m| {
+            let s = m.as_str()?;
+            let mut it = s.splitn(2, ' ');
+            Some((it.next()?.to_string(), it.next()?.to_string()))
+        })
+        .collect();
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .build()
+        .map_err(|e| anyhow!("build bpe: {e}"))?;
+    let mut tok = Tokenizer::new(bpe);
+    let add_prefix = matches!(
+        md.get("tokenizer.ggml.add_space_prefix"),
+        Some(MetaValue::Bool(true))
+    );
+    let pre = md.str("tokenizer.ggml.pre").unwrap_or("default");
+    if pre == "qwen2" {
+        // Sequence[ Split(qwen regex, Isolated), ByteLevel(use_regex=false) ] — matches HF Qwen.
+        let split = Split::new(
+            SplitPattern::Regex(QWEN2_PRE_RE.to_string()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .map_err(|e| anyhow!("split pretokenizer: {e}"))?;
+        let seq = PreSequence::new(vec![
+            PreTokenizerWrapper::Split(split),
+            PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+        ]);
+        tok.with_pre_tokenizer(Some(seq));
+    } else {
+        tok.with_pre_tokenizer(Some(ByteLevel::new(add_prefix, true, true)));
+    }
+    tok.with_decoder(Some(ByteLevelDecoder::default()));
+    // Register control (3) / user-defined (4) tokens as special so chat markers stay atomic.
+    if let Some(types) = md
+        .get("tokenizer.ggml.token_type")
+        .and_then(MetaValue::as_arr)
+    {
+        let special: Vec<AddedToken> = types
+            .iter()
+            .enumerate()
+            .filter(|(i, ty)| *i < toks.len() && matches!(ty.as_u64(), Some(3) | Some(4)))
+            .filter_map(|(i, _)| {
+                toks[i]
+                    .as_str()
+                    .map(|s| AddedToken::from(s.to_string(), true))
+            })
+            .collect();
+        if !special.is_empty() {
+            tok.add_special_tokens(&special);
+        }
+    }
+    Ok(tok)
 }
 
 /// Load a tensor as f32, returning (data, shape) where shape is GGUF ne order ([in, out]).
@@ -361,7 +456,20 @@ impl Llama {
         &self.cfg
     }
 
+    /// Load with an explicit HF `tokenizer.json` sidecar.
     pub fn load(gguf_path: &Path, tokenizer_path: &Path) -> Result<Self> {
+        Self::load_opt(gguf_path, Some(tokenizer_path))
+    }
+
+    /// Load deriving the tokenizer from the GGUF's embedded vocab (`tokenizer.ggml.*`) — no
+    /// sidecar needed (e.g. for `ollama:` refs, whose content-addressed blobs have no
+    /// `tokenizer.json` beside them).
+    pub fn load_embedded(gguf_path: &Path) -> Result<Self> {
+        Self::load_opt(gguf_path, None)
+    }
+
+    /// Load with an optional sidecar tokenizer; falls back to the GGUF's embedded vocab.
+    pub fn load_opt(gguf_path: &Path, tokenizer_path: Option<&Path>) -> Result<Self> {
         let g = Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?;
         let arch = g
             .metadata()
@@ -509,8 +617,10 @@ impl Llama {
             });
         }
 
-        let tokenizer =
-            Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow!("load tokenizer: {e}"))?;
+        let tokenizer = match tokenizer_path {
+            Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,
+            None => build_tokenizer(&g)?,
+        };
 
         let cfg = Config {
             n_layer,
@@ -1355,4 +1465,36 @@ fn attention(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tokenizer_tests {
+    use super::*;
+
+    // Validate the GGUF-derived tokenizer against the HF tokenizer.json sidecar (same model).
+    // Skips if the test model isn't present.
+    #[test]
+    fn embedded_tokenizer_matches_sidecar() {
+        let dir = Path::new("/home/mxaddict/Projects/models/qwen3-0.6b");
+        let gguf = dir.join("Qwen3-0.6B-Q4_K_M.gguf");
+        let side = dir.join("tokenizer.json");
+        if !gguf.exists() || !side.exists() {
+            eprintln!("skip: test model not present");
+            return;
+        }
+        let g = Gguf::open(&gguf).unwrap();
+        let derived = build_tokenizer(&g).unwrap();
+        let sidecar = Tokenizer::from_file(&side).unwrap();
+        for s in [
+            "Hello world",
+            "The quick brown fox.",
+            "<|im_start|>user\nWhat is two plus two?<|im_end|>\n<|im_start|>assistant\n",
+            "café déjà vu — 123 + 456 = 579",
+            "def f(x):\n    return x * 2\n",
+        ] {
+            let a = derived.encode(s, false).unwrap();
+            let b = sidecar.encode(s, false).unwrap();
+            assert_eq!(a.get_ids(), b.get_ids(), "token id mismatch on {s:?}");
+        }
+    }
 }

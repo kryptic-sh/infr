@@ -279,6 +279,75 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Q8_0 dequant GEMV `y = x·Wᵀ` (weights = quants int8×4/u32 + scales f16 per 32-block).
+    pub fn linear_q8(
+        &self,
+        quants: &dyn Buffer,
+        scales: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("lm_head");
+        let k = self
+            .be
+            .kernel("linear_q8", crate::linear::LINEAR_Q8_WGSL, 4, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(quants),
+                Self::vkb(scales),
+                Self::vkb(x),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
+    /// Q8_0 dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_add_q8(
+        &self,
+        quants: &dyn Buffer,
+        scales: &dyn Buffer,
+        x: &dyn Buffer,
+        residual: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("o_or_down");
+        let k = self
+            .be
+            .kernel("linear_res_q8", crate::linear::LINEAR_RES_Q8_WGSL, 5, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(quants),
+                Self::vkb(scales),
+                Self::vkb(x),
+                Self::vkb(residual),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
     /// `y = residual + x·Wᵀ` (fused residual add). `residual` and `y` may be the same buffer.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add(
@@ -367,6 +436,42 @@ impl<'a> Recorder<'a> {
             3,
             &push,
             (rows * half) as u32, // one workgroup per output pair (cooperative-over-K, coalesced)
+        );
+    }
+
+    /// Q8_0 dequant variant of `ffn_in` (Wgu quantized).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ffn_in_q8(
+        &self,
+        hidden: &dyn Buffer,
+        norm_w: &dyn Buffer,
+        quants: &dyn Buffer,
+        scales: &dyn Buffer,
+        act: &dyn Buffer,
+        rows: usize,
+        ne: usize,
+        nff: usize,
+        eps: f32,
+    ) {
+        self.stamp("ffn_in");
+        let k = self.be.kernel("ffn_in_q8", ops::FFN_IN_Q8_WGSL, 5, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nff as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(hidden),
+                Self::vkb(norm_w),
+                Self::vkb(quants),
+                Self::vkb(scales),
+                Self::vkb(act),
+            ],
+            1,
+            &push,
+            (rows * nff) as u32,
         );
     }
 
@@ -989,6 +1094,63 @@ mod tests {
     fn attention_kv_prefill_matches_cpu() {
         run_attn_kv(17, 17, 9, 3, 64);
         run_attn_kv(40, 1500, 9, 3, 64); // multi-tile prefill (kv_len > TILE)
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn linear_q8_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (rows, in_f, out_f) = (2usize, 128usize, 5usize); // in_f % 32 == 0
+        let numel = in_f * out_f;
+        // arbitrary int8 weights + per-32-block f16 scales; dequant = q * scale
+        let qi8: Vec<i8> = (0..numel)
+            .map(|i| ((i * 7 % 255) as i32 - 127) as i8)
+            .collect();
+        let scales: Vec<u16> = (0..numel / 32)
+            .map(|b| half::f16::from_f32(0.01 + (b % 5) as f32 * 0.003).to_bits())
+            .collect();
+        let mut quants = vec![0u32; numel / 4];
+        for (g, &q) in qi8.iter().enumerate() {
+            quants[g / 4] |= ((q as u8) as u32) << (8 * (g % 4));
+        }
+        let x: Vec<f32> = (0..rows * in_f)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+            .collect();
+
+        let bq = be
+            .upload_weight_bytes(bytemuck::cast_slice(&quants))
+            .unwrap();
+        let bs = be
+            .upload_weight_bytes(bytemuck::cast_slice(&scales))
+            .unwrap();
+        let upx = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(upx.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let by = be.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_q8(
+            bq.as_ref(),
+            bs.as_ref(),
+            upx.as_ref(),
+            by.as_ref(),
+            rows,
+            in_f,
+            out_f,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; rows * out_f * 4];
+        be.download(by.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+
+        let dq = |g: usize| qi8[g] as f32 * half::f16::from_bits(scales[g / 32]).to_f32();
+        let mut maxe = 0f32;
+        for r in 0..rows {
+            for o in 0..out_f {
+                let want: f32 = (0..in_f).map(|i| dq(o * in_f + i) * x[r * in_f + i]).sum();
+                maxe = maxe.max((got[r * out_f + o] - want).abs());
+            }
+        }
+        println!("linear_q8 max_err = {maxe:e}");
+        assert!(maxe < 1e-3, "linear_q8 mismatch: {maxe}");
     }
 
     #[test]

@@ -125,6 +125,101 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
+/// Q8_0 in-kernel-dequant GEMV `y = x·Wᵀ` (cooperative-over-K, like `LINEAR_F16_WGSL`). Weights are
+/// stored as repacked Q8_0: `quants` = int8 packed 4-per-u32 (row-major [out,in]), `scales` = one
+/// f16 per 32-element block. `dq(g)` reconstructs weight element g. Dispatch `rows*out_f` workgroups.
+pub(crate) const LINEAR_Q8_WGSL: &str = r#"
+enable f16;
+struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
+var<immediate> pc: PushConstants;
+
+@group(0) @binding(0) var<storage, read>       quants: array<u32>; // int8 x4 per u32, [out, in]
+@group(0) @binding(1) var<storage, read>       scales: array<f16>; // [out*in/32]
+@group(0) @binding(2) var<storage, read>       x_buf: array<f32>;  // [rows, in]
+@group(0) @binding(3) var<storage, read_write> y_buf: array<f32>;  // [rows, out]
+
+var<workgroup> red: array<f32, 64>;
+
+fn dq(g: u32) -> f32 {
+    let w = quants[g >> 2u];
+    let sh = (g & 3u) * 8u;
+    let i8 = (i32(w << (24u - sh))) >> 24u; // sign-extend the selected byte
+    return f32(i8) * f32(scales[g >> 5u]);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let unit = wid.x;
+    let o = unit % pc.out_f;
+    let r = unit / pc.out_f;
+    let t = lid.x;
+    let wbase = o * pc.in_f;
+    let xbase = r * pc.in_f;
+    var acc: f32 = 0.0;
+    for (var i: u32 = t; i < pc.in_f; i = i + 64u) {
+        acc = acc + dq(wbase + i) * x_buf[xbase + i];
+    }
+    red[t] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if stride == 0u { break; }
+        if t < stride { red[t] = red[t] + red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if t == 0u { y_buf[unit] = red[0]; }
+}
+"#;
+
+/// Q8_0 dequant GEMV with fused residual add: `y = residual + x·Wᵀ`. Like `LINEAR_RES_WGSL`.
+pub(crate) const LINEAR_RES_Q8_WGSL: &str = r#"
+enable f16;
+struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
+var<immediate> pc: PushConstants;
+
+@group(0) @binding(0) var<storage, read>       quants: array<u32>;
+@group(0) @binding(1) var<storage, read>       scales: array<f16>;
+@group(0) @binding(2) var<storage, read>       x_buf: array<f32>;
+@group(0) @binding(3) var<storage, read>       r_buf: array<f32>; // [rows, out] residual
+@group(0) @binding(4) var<storage, read_write> y_buf: array<f32>;
+
+var<workgroup> red: array<f32, 64>;
+
+fn dq(g: u32) -> f32 {
+    let w = quants[g >> 2u];
+    let sh = (g & 3u) * 8u;
+    let i8 = (i32(w << (24u - sh))) >> 24u;
+    return f32(i8) * f32(scales[g >> 5u]);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let unit = wid.x;
+    let o = unit % pc.out_f;
+    let r = unit / pc.out_f;
+    let t = lid.x;
+    let wbase = o * pc.in_f;
+    let xbase = r * pc.in_f;
+    var acc: f32 = 0.0;
+    for (var i: u32 = t; i < pc.in_f; i = i + 64u) {
+        acc = acc + dq(wbase + i) * x_buf[xbase + i];
+    }
+    red[t] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if stride == 0u { break; }
+        if t < stride { red[t] = red[t] + red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if t == 0u { y_buf[unit] = r_buf[unit] + red[0]; }
+}
+"#;
+
 static LINEAR_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
 fn linear_spv() -> &'static [u32] {

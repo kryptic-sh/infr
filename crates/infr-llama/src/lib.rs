@@ -33,17 +33,36 @@ pub struct Config {
     pub qk_norm: bool,
 }
 
+/// A projection weight on the GPU: either f16, or in-kernel-dequantized Q8_0
+/// (quants = int8 packed 4-per-u32, scales = one f16 per 32-element block).
+enum Wt {
+    F16(Box<dyn Buffer>),
+    Q8 {
+        q: Box<dyn Buffer>,
+        s: Box<dyn Buffer>,
+    },
+}
+impl Wt {
+    /// The f16 buffer (panics if quantized — used by the llama fused path, which is f16-only).
+    fn f16(&self) -> &dyn Buffer {
+        match self {
+            Wt::F16(b) => b.as_ref(),
+            Wt::Q8 { .. } => panic!("expected f16 weight, got Q8 (llama fused path needs f16)"),
+        }
+    }
+}
+
 struct LayerWeights {
     attn_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
     attn_norm_buf: Box<dyn Buffer>,
     ffn_norm_buf: Box<dyn Buffer>,
-    wq: Box<dyn Buffer>,
-    wk: Box<dyn Buffer>,
-    wv: Box<dyn Buffer>,
-    wo: Box<dyn Buffer>,
-    wgateup: Box<dyn Buffer>, // fused [2*n_ff, n_embd] = concat(gate, up)
-    wdown: Box<dyn Buffer>,
+    wq: Wt,
+    wk: Wt,
+    wv: Wt,
+    wo: Wt,
+    wgateup: Wt, // fused [2*n_ff, n_embd] = concat(gate, up)
+    wdown: Wt,
     q_norm_buf: Option<Box<dyn Buffer>>, // qwen3 QK-norm weights [head_dim]
     k_norm_buf: Option<Box<dyn Buffer>>,
 }
@@ -51,8 +70,8 @@ struct LayerWeights {
 pub struct Llama {
     be: VulkanBackend,
     cfg: Config,
-    token_embd: Vec<f32>,     // [vocab, n_embd] host, for embedding gather
-    lm_head: Box<dyn Buffer>, // [vocab, n_embd] on GPU (tied to token_embd unless output.weight)
+    token_embd: Vec<f32>, // [vocab, n_embd] host, for embedding gather
+    lm_head: Wt,          // [vocab, n_embd] on GPU (tied to token_embd unless output.weight)
     output_norm: Vec<f32>,
     output_norm_buf: Box<dyn Buffer>,
     layers: Vec<LayerWeights>,
@@ -90,7 +109,20 @@ fn load_f32(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
-        other => bail!("unsupported dtype {other:?} for {name} (bring-up wants F16/F32/BF16)"),
+        infr_core::DType::Q8_0 => {
+            // 34-byte blocks: f16 scale + 32 int8
+            let mut out = Vec::with_capacity(bytes.len() / 34 * 32);
+            for blk in bytes.chunks_exact(34) {
+                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+                for &q in &blk[2..34] {
+                    out.push((q as i8) as f32 * d);
+                }
+            }
+            out
+        }
+        other => {
+            bail!("unsupported dtype {other:?} for {name} (host load wants F16/F32/BF16/Q8_0)")
+        }
     };
     Ok((v, info.shape))
 }
@@ -126,6 +158,43 @@ fn f16_bytes(g: &Gguf, name: &str) -> Result<Vec<u8>> {
             Ok(bytemuck::cast_slice(&f16).to_vec())
         }
         other => bail!("unsupported dtype {other:?} for {name} (bring-up wants F16/F32/BF16)"),
+    }
+}
+
+/// Repack a Q8_0 tensor (34-byte blocks: f16 scale + 32 int8) into GPU-aligned arrays:
+/// `quants` = int8 packed 4-per-u32, `scales` = one f16 (u16 bits) per 32-element block.
+fn q8_repack(g: &Gguf, name: &str) -> Result<(Vec<u32>, Vec<u16>)> {
+    let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+    let nblocks = bytes.len() / 34;
+    let mut quants = vec![0u32; nblocks * 8]; // 32 int8/block = 8 u32/block
+    let mut scales = vec![0u16; nblocks];
+    for (b, blk) in bytes.chunks_exact(34).enumerate() {
+        scales[b] = u16::from_le_bytes([blk[0], blk[1]]);
+        for i in 0..32 {
+            let g_idx = b * 32 + i;
+            quants[g_idx / 4] |= (blk[2 + i] as u32) << (8 * (g_idx % 4));
+        }
+    }
+    Ok((quants, scales))
+}
+
+/// Upload a projection weight, keeping Q8_0 quantized in-VRAM (else convert to f16).
+fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
+    let info = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+        .clone();
+    match info.dtype {
+        infr_core::DType::Q8_0 => {
+            let (q, s) = q8_repack(g, name)?;
+            Ok(Wt::Q8 {
+                q: be.upload_weight_bytes(bytemuck::cast_slice(&q))?,
+                s: be.upload_weight_bytes(bytemuck::cast_slice(&s))?,
+            })
+        }
+        _ => Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes(g, name)?)?)),
     }
 }
 
@@ -184,11 +253,14 @@ impl Llama {
         let (token_embd, te_shape) = load_f32(&g, "token_embd.weight")?;
         let vocab = te_shape[1];
         let lm_head = if g.tensors().iter().any(|t| t.name == "output.weight") {
-            be.upload_weight_bytes(&f16_bytes(&g, "output.weight")?)
+            upload_wt(&be, &g, "output.weight")?
         } else {
-            be.upload_weight_f16(&token_embd) // tied; token_embd held as f32 for host gather
-        }
-        .map_err(|e| anyhow!("upload lm_head: {e}"))?;
+            // tied; token_embd already dequantized to f32 for the host gather → f16 lm head
+            Wt::F16(
+                be.upload_weight_f16(&token_embd)
+                    .map_err(|e| anyhow!("upload lm_head: {e}"))?,
+            )
+        };
 
         let (output_norm, _) = load_f32(&g, "output_norm.weight")?;
         let output_norm_buf = be
@@ -198,10 +270,7 @@ impl Llama {
         let mut layers = Vec::with_capacity(n_layer);
         for l in 0..n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
-            let up = |be: &VulkanBackend, name: String| -> Result<Box<dyn Buffer>> {
-                be.upload_weight_bytes(&f16_bytes(&g, &name)?)
-                    .map_err(|e| anyhow!("upload {name}: {e}"))
-            };
+            let up = |be: &VulkanBackend, name: String| -> Result<Wt> { upload_wt(be, &g, &name) };
             let attn_norm = load_f32(&g, &p("attn_norm.weight"))?.0;
             let ffn_norm = load_f32(&g, &p("ffn_norm.weight"))?.0;
             let attn_norm_buf = be
@@ -210,12 +279,30 @@ impl Llama {
             let ffn_norm_buf = be
                 .upload_weight(&ffn_norm)
                 .map_err(|e| anyhow!("upload ffn_norm {l}: {e}"))?;
-            // fuse gate + up into one [2*n_ff, n_embd] f16 weight (concat rows, no f32 round-trip)
-            let mut gateup = f16_bytes(&g, &p("ffn_gate.weight"))?;
-            gateup.extend_from_slice(&f16_bytes(&g, &p("ffn_up.weight"))?);
-            let wgateup = be
-                .upload_weight_bytes(&gateup)
-                .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?;
+            // fuse gate + up into one [2*n_ff, n_embd] weight (concat rows). Q8 stays quantized.
+            let gate_info = g.tensors().iter().find(|t| t.name == p("ffn_gate.weight"));
+            let is_q8 = matches!(gate_info.map(|t| t.dtype), Some(infr_core::DType::Q8_0));
+            let wgateup = if is_q8 {
+                let (mut q, mut s) = q8_repack(&g, &p("ffn_gate.weight"))?;
+                let (qu, su) = q8_repack(&g, &p("ffn_up.weight"))?;
+                q.extend_from_slice(&qu);
+                s.extend_from_slice(&su);
+                Wt::Q8 {
+                    q: be
+                        .upload_weight_bytes(bytemuck::cast_slice(&q))
+                        .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?,
+                    s: be
+                        .upload_weight_bytes(bytemuck::cast_slice(&s))
+                        .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?,
+                }
+            } else {
+                let mut gateup = f16_bytes(&g, &p("ffn_gate.weight"))?;
+                gateup.extend_from_slice(&f16_bytes(&g, &p("ffn_up.weight"))?);
+                Wt::F16(
+                    be.upload_weight_bytes(&gateup)
+                        .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?,
+                )
+            };
             let (q_norm_buf, k_norm_buf) = if qk_norm {
                 (
                     Some(
@@ -295,20 +382,20 @@ impl Llama {
         for layer in &self.layers {
             // --- attention ---
             let hn = rmsnorm_rows(&hidden, &layer.attn_norm, t, ne, c.rms_eps);
-            let mut q = self.lin(layer.wq.as_ref(), &hn, t, ne, nh * hd);
-            let mut k = self.lin(layer.wk.as_ref(), &hn, t, ne, nkv * hd);
-            let v = self.lin(layer.wv.as_ref(), &hn, t, ne, nkv * hd);
+            let mut q = self.lin(layer.wq.f16(), &hn, t, ne, nh * hd);
+            let mut k = self.lin(layer.wk.f16(), &hn, t, ne, nkv * hd);
+            let v = self.lin(layer.wv.f16(), &hn, t, ne, nkv * hd);
             rope_rows(&mut q, t, nh, hd, c.rope_dim, c.rope_theta);
             rope_rows(&mut k, t, nkv, hd, c.rope_dim, c.rope_theta);
             let attn = attention(&q, &k, &v, t, nh, nkv, hd);
-            let ao = self.lin(layer.wo.as_ref(), &attn, t, nh * hd, ne);
+            let ao = self.lin(layer.wo.f16(), &attn, t, nh * hd, ne);
             for i in 0..t * ne {
                 hidden[i] += ao[i];
             }
 
             // --- ffn (SwiGLU) ---
             let hn2 = rmsnorm_rows(&hidden, &layer.ffn_norm, t, ne, c.rms_eps);
-            let gu = self.lin(layer.wgateup.as_ref(), &hn2, t, ne, 2 * c.n_ff);
+            let gu = self.lin(layer.wgateup.f16(), &hn2, t, ne, 2 * c.n_ff);
             let mut act = vec![0f32; t * c.n_ff];
             for r in 0..t {
                 for i in 0..c.n_ff {
@@ -316,7 +403,7 @@ impl Llama {
                     act[r * c.n_ff + i] = silu(g) * gu[r * 2 * c.n_ff + c.n_ff + i];
                 }
             }
-            let down = self.lin(layer.wdown.as_ref(), &act, t, c.n_ff, ne);
+            let down = self.lin(layer.wdown.f16(), &act, t, c.n_ff, ne);
             for i in 0..t * ne {
                 hidden[i] += down[i];
             }
@@ -325,7 +412,7 @@ impl Llama {
         // final norm on the last row, then lm_head
         let last = &hidden[(t - 1) * ne..t * ne];
         let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
-        self.lin(self.lm_head.as_ref(), &normed, 1, ne, c.vocab)
+        self.lin(self.lm_head.f16(), &normed, 1, ne, c.vocab)
     }
 
     /// GPU-resident forward: records the whole stack into one command buffer (one submit),
@@ -375,9 +462,9 @@ impl Llama {
                 ne,
                 c.rms_eps,
             );
-            rec.linear(layer.wq.as_ref(), hn.as_ref(), q.as_ref(), t, ne, nh * hd);
-            rec.linear(layer.wk.as_ref(), hn.as_ref(), k.as_ref(), t, ne, nkv * hd);
-            rec.linear(layer.wv.as_ref(), hn.as_ref(), v.as_ref(), t, ne, nkv * hd);
+            rec.linear(layer.wq.f16(), hn.as_ref(), q.as_ref(), t, ne, nh * hd);
+            rec.linear(layer.wk.f16(), hn.as_ref(), k.as_ref(), t, ne, nkv * hd);
+            rec.linear(layer.wv.f16(), hn.as_ref(), v.as_ref(), t, ne, nkv * hd);
             rec.rope(
                 q.as_ref(),
                 q.as_ref(),
@@ -408,14 +495,7 @@ impl Llama {
                 nkv,
                 hd,
             );
-            rec.linear(
-                layer.wo.as_ref(),
-                attn.as_ref(),
-                ao.as_ref(),
-                t,
-                nh * hd,
-                ne,
-            );
+            rec.linear(layer.wo.f16(), attn.as_ref(), ao.as_ref(), t, nh * hd, ne);
             rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), t * ne);
             rec.rmsnorm(
                 hidden.as_ref(),
@@ -426,7 +506,7 @@ impl Llama {
                 c.rms_eps,
             );
             rec.linear(
-                layer.wgateup.as_ref(),
+                layer.wgateup.f16(),
                 hn2.as_ref(),
                 gu.as_ref(),
                 t,
@@ -434,14 +514,7 @@ impl Llama {
                 2 * nff,
             );
             rec.silu_mul_fused(gu.as_ref(), act.as_ref(), t, nff);
-            rec.linear(
-                layer.wdown.as_ref(),
-                act.as_ref(),
-                down.as_ref(),
-                t,
-                nff,
-                ne,
-            );
+            rec.linear(layer.wdown.f16(), act.as_ref(), down.as_ref(), t, nff, ne);
             rec.add(hidden.as_ref(), down.as_ref(), hidden.as_ref(), t * ne);
         }
         rec.rmsnorm(
@@ -453,7 +526,7 @@ impl Llama {
             c.rms_eps,
         );
         rec.linear(
-            self.lm_head.as_ref(),
+            self.lm_head.f16(),
             hn.as_ref(),
             logits.as_ref(),
             t,
@@ -563,6 +636,38 @@ impl Llama {
         let prof = std::env::var("INFR_PROF").is_ok();
         let t_rec = std::time::Instant::now();
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        // weight-op dispatchers: pick the f16 or Q8 kernel based on how the weight is stored.
+        let lin = |w: &Wt, x: &dyn Buffer, y: &dyn Buffer, rows: usize, inf: usize, outf: usize| {
+            match w {
+                Wt::F16(b) => rec.linear(b.as_ref(), x, y, rows, inf, outf),
+                Wt::Q8 { q, s } => rec.linear_q8(q.as_ref(), s.as_ref(), x, y, rows, inf, outf),
+            }
+        };
+        let lin_add = |w: &Wt,
+                       x: &dyn Buffer,
+                       res: &dyn Buffer,
+                       y: &dyn Buffer,
+                       rows: usize,
+                       inf: usize,
+                       outf: usize| match w {
+            Wt::F16(b) => rec.linear_add(b.as_ref(), x, res, y, rows, inf, outf),
+            Wt::Q8 { q, s } => {
+                rec.linear_add_q8(q.as_ref(), s.as_ref(), x, res, y, rows, inf, outf)
+            }
+        };
+        let ffn = |hidden: &dyn Buffer,
+                   nw: &dyn Buffer,
+                   w: &Wt,
+                   act: &dyn Buffer,
+                   rows: usize,
+                   ne: usize,
+                   nff: usize,
+                   eps: f32| match w {
+            Wt::F16(b) => rec.ffn_in(hidden, nw, b.as_ref(), act, rows, ne, nff, eps),
+            Wt::Q8 { q, s } => {
+                rec.ffn_in_q8(hidden, nw, q.as_ref(), s.as_ref(), act, rows, ne, nff, eps)
+            }
+        };
         for (li, layer) in self.layers.iter().enumerate() {
             if let Some((qr, kr, vr)) = &qkv_raw {
                 // qwen3: rmsnorm → Q/K/V projections → per-head QK-norm+RoPE (K/V into the cache)
@@ -574,9 +679,9 @@ impl Llama {
                     ne,
                     c.rms_eps,
                 );
-                rec.linear(layer.wq.as_ref(), hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
-                rec.linear(layer.wk.as_ref(), hn.as_ref(), kr.as_ref(), n, ne, kvrow);
-                rec.linear(layer.wv.as_ref(), hn.as_ref(), vr.as_ref(), n, ne, kvrow);
+                lin(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
+                lin(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
+                lin(&layer.wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow);
                 rec.qk_norm_rope(
                     qr.as_ref(),
                     layer.q_norm_buf.as_ref().unwrap().as_ref(),
@@ -613,9 +718,9 @@ impl Llama {
                 rec.attn_in(
                     hidden.as_ref(),
                     layer.attn_norm_buf.as_ref(),
-                    layer.wq.as_ref(),
-                    layer.wk.as_ref(),
-                    layer.wv.as_ref(),
+                    layer.wq.f16(),
+                    layer.wk.f16(),
+                    layer.wv.f16(),
                     q.as_ref(),
                     kv.k[li].as_ref(),
                     kv.v[li].as_ref(),
@@ -660,8 +765,8 @@ impl Llama {
                     pos,
                 );
             }
-            rec.linear_add(
-                layer.wo.as_ref(),
+            lin_add(
+                &layer.wo,
                 attn.as_ref(),
                 hidden.as_ref(),
                 hidden.as_ref(),
@@ -669,18 +774,18 @@ impl Llama {
                 nh * hd,
                 ne,
             );
-            rec.ffn_in(
+            ffn(
                 hidden.as_ref(),
                 layer.ffn_norm_buf.as_ref(),
-                layer.wgateup.as_ref(),
+                &layer.wgateup,
                 act.as_ref(),
                 n,
                 ne,
                 nff,
                 c.rms_eps,
             );
-            rec.linear_add(
-                layer.wdown.as_ref(),
+            lin_add(
+                &layer.wdown,
                 act.as_ref(),
                 hidden.as_ref(),
                 hidden.as_ref(),
@@ -697,14 +802,7 @@ impl Llama {
             ne,
             c.rms_eps,
         );
-        rec.linear(
-            self.lm_head.as_ref(),
-            hn.as_ref(),
-            logits.as_ref(),
-            n,
-            ne,
-            c.vocab,
-        );
+        lin(&self.lm_head, hn.as_ref(), logits.as_ref(), n, ne, c.vocab);
         let rec_us = t_rec.elapsed().as_micros();
         let t_gpu = std::time::Instant::now();
         rec.finish().map_err(|e| anyhow!("{e}"))?;

@@ -549,6 +549,68 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
+/// Q8_0 dequant variant of `FFN_IN_WGSL`: `wgu` stored as repacked Q8_0 (quants int8×4/u32 +
+/// scales f16 per 32-block). Same cooperative-over-K structure + RMS-fold.
+pub(crate) const FFN_IN_Q8_WGSL: &str = r#"
+enable f16;
+struct PC { rows: u32, ne: u32, nff: u32, eps: f32 }
+var<immediate> pc: PC;
+@group(0) @binding(0) var<storage, read>       hidden: array<f32>;
+@group(0) @binding(1) var<storage, read>       nw: array<f32>;
+@group(0) @binding(2) var<storage, read>       quants: array<u32>; // [2*nff, ne] q8
+@group(0) @binding(3) var<storage, read>       scales: array<f16>;
+@group(0) @binding(4) var<storage, read_write> act: array<f32>;
+
+var<workgroup> r_ss: array<f32, 64>;
+var<workgroup> r_g: array<f32, 64>;
+var<workgroup> r_u: array<f32, 64>;
+
+fn dq(g: u32) -> f32 {
+    let w = quants[g >> 2u];
+    let sh = (g & 3u) * 8u;
+    let i8 = (i32(w << (24u - sh))) >> 24u;
+    return f32(i8) * f32(scales[g >> 5u]);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let t = lid.x;
+    let unit = wid.x;
+    let f = unit % pc.nff;
+    let r = unit / pc.nff;
+    let rbase = r * pc.ne;
+    let gbase = f * pc.ne;
+    let ubase = (pc.nff + f) * pc.ne;
+    var pss: f32 = 0.0;
+    var pg: f32 = 0.0;
+    var pu: f32 = 0.0;
+    for (var k: u32 = t; k < pc.ne; k = k + 64u) {
+        let hv = hidden[rbase + k];
+        pss = pss + hv * hv;
+        let hn = hv * nw[k];
+        pg = pg + hn * dq(gbase + k);
+        pu = pu + hn * dq(ubase + k);
+    }
+    r_ss[t] = pss; r_g[t] = pg; r_u[t] = pu;
+    workgroupBarrier();
+    var stride = 32u;
+    loop { if stride == 0u { break; }
+        if t < stride {
+            r_ss[t] = r_ss[t] + r_ss[t + stride];
+            r_g[t] = r_g[t] + r_g[t + stride];
+            r_u[t] = r_u[t] + r_u[t + stride];
+        }
+        workgroupBarrier(); stride = stride / 2u; }
+    if t == 0u {
+        let scale = inverseSqrt(r_ss[0] / f32(pc.ne) + pc.eps);
+        let gate = r_g[0] * scale;
+        let up = r_u[0] * scale;
+        act[unit] = (gate / (1.0 + exp(-gate))) * up;
+    }
+}
+"#;
+
 /// Fused attention input: RMSNorm(hidden) → Q/K/V projections → RoPE on Q,K, writing K/V into the
 /// cache. ONE workgroup per output *pair* (columns 2p, 2p+1) of the packed `[q | k | v]` layout for
 /// a row — its 64 threads stream the two weight rows over K in lockstep (coalesced), reduce, then

@@ -676,6 +676,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// Cached attention: q `[q_len, nh, hd]` at absolute positions `pos_offset..`, attends over
 /// the full K/V cache `[kv_len, nkv, hd]` (causal by absolute position). hd<=128.
+// Flash-attention-style cached GQA: ONE workgroup per (query token, head); its 64 threads split
+// the KV positions, each computing a local online-softmax partial, then a tree-reduce merges them.
+// (The old kernel used one active thread per (token,head) — for decode that was 9 threads doing the
+// whole KV loop serially, leaving the GPU ~idle.) `hd <= 128`.
 pub(crate) const ATTENTION_KV_WGSL: &str = r#"
 struct PC { q_len: u32, kv_len: u32, nh: u32, nkv: u32, hd: u32, pos_offset: u32 }
 var<immediate> pc: PC;
@@ -683,28 +687,39 @@ var<immediate> pc: PC;
 @group(0) @binding(1) var<storage, read>       k: array<f32>;
 @group(0) @binding(2) var<storage, read>       v: array<f32>;
 @group(0) @binding(3) var<storage, read_write> o: array<f32>;
+
+var<workgroup> q_sh: array<f32, 128>;
+var<workgroup> red_m: array<f32, 64>;
+var<workgroup> red_l: array<f32, 64>;
+var<workgroup> red_acc: array<f32, 8192>; // 64 threads * 128 hd
+
 @compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= pc.q_len * pc.nh { return; }
-    let ti = idx / pc.nh;
-    let h = idx % pc.nh;
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let t = lid.x;
+    let unit = wid.x;            // one (token, head) per workgroup
+    if unit >= pc.q_len * pc.nh { return; }
+    let ti = unit / pc.nh;
+    let h = unit % pc.nh;
     let abs_pos = pc.pos_offset + ti;
-    let group = pc.nh / pc.nkv;
-    let kvh = h / group;
+    let kvh = h / (pc.nh / pc.nkv);
     let hd = pc.hd;
     let scale = 1.0 / sqrt(f32(hd));
-    let qbase = (ti * pc.nh + h) * hd;
 
+    // load this token/head's query vector into shared
+    let qbase = (ti * pc.nh + h) * hd;
+    for (var d: u32 = t; d < hd; d = d + 64u) { q_sh[d] = q[qbase + d]; }
+    workgroupBarrier();
+
+    // local online-softmax over this thread's slice of KV positions (j = t, t+64, ...)
     var acc: array<f32, 128>;
     for (var d: u32 = 0u; d < hd; d = d + 1u) { acc[d] = 0.0; }
     var m: f32 = -3.0e38;
     var l: f32 = 0.0;
-
-    for (var j: u32 = 0u; j <= abs_pos; j = j + 1u) {
+    for (var j: u32 = t; j <= abs_pos; j = j + 64u) {
         let kbase = (j * pc.nkv + kvh) * hd;
         var dot: f32 = 0.0;
-        for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q[qbase + d] * k[kbase + d]; }
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q_sh[d] * k[kbase + d]; }
         let s = dot * scale;
         if s > m {
             let corr = exp(m - s);
@@ -717,8 +732,36 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let vbase = (j * pc.nkv + kvh) * hd;
         for (var d: u32 = 0u; d < hd; d = d + 1u) { acc[d] = acc[d] + p * v[vbase + d]; }
     }
-    let obase = (ti * pc.nh + h) * hd;
-    for (var d: u32 = 0u; d < hd; d = d + 1u) { o[obase + d] = acc[d] / l; }
+    red_m[t] = m;
+    red_l[t] = l;
+    for (var d: u32 = 0u; d < hd; d = d + 1u) { red_acc[t * hd + d] = acc[d]; }
+    workgroupBarrier();
+
+    // tree-reduce the 64 partials via the online-softmax merge (m sentinel is finite → no NaN)
+    var stride = 32u;
+    loop {
+        if stride == 0u { break; }
+        if t < stride {
+            let ma = red_m[t];
+            let mb = red_m[t + stride];
+            let mm = max(ma, mb);
+            let ca = exp(ma - mm);
+            let cb = exp(mb - mm);
+            red_l[t] = red_l[t] * ca + red_l[t + stride] * cb;
+            for (var d: u32 = 0u; d < hd; d = d + 1u) {
+                red_acc[t * hd + d] = red_acc[t * hd + d] * ca + red_acc[(t + stride) * hd + d] * cb;
+            }
+            red_m[t] = mm;
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+
+    if t == 0u {
+        let obase = (ti * pc.nh + h) * hd;
+        let inv = 1.0 / red_l[0];
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { o[obase + d] = red_acc[d] * inv; }
+    }
 }
 "#;
 

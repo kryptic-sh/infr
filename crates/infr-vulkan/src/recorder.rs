@@ -31,6 +31,11 @@ pub struct Recorder<'a> {
     no_barrier: bool,
     full_barrier: bool,
     prof: bool,
+    /// Per-op GPU timestamp profiling (INFR_PROF2): a timestamp before each op + one at finish,
+    /// attributed to per-op-type labels.
+    prof2: bool,
+    query_pool: vk::QueryPool,
+    ts_labels: RefCell<Vec<&'static str>>,
 }
 
 impl<'a> Recorder<'a> {
@@ -70,6 +75,24 @@ impl<'a> Recorder<'a> {
         }
         .map_err(|e| be(format!("create recorder pool: {e}")))?;
 
+        const MAX_TS: u32 = 8192;
+        let prof2 = std::env::var("INFR_PROF2").is_ok();
+        let query_pool = if prof2 {
+            let qp = unsafe {
+                device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(MAX_TS),
+                    None,
+                )
+            }
+            .map_err(|e| be(format!("create query pool: {e}")))?;
+            unsafe { device.cmd_reset_query_pool(cmd, qp, 0, MAX_TS) };
+            qp
+        } else {
+            vk::QueryPool::null()
+        };
+
         Ok(Self {
             be: backend,
             cmd,
@@ -81,7 +104,27 @@ impl<'a> Recorder<'a> {
             no_barrier: std::env::var("INFR_NOBARRIER").is_ok(),
             full_barrier: std::env::var("INFR_FULLBARRIER").is_ok(),
             prof: std::env::var("INFR_PROF").is_ok(),
+            prof2,
+            query_pool,
+            ts_labels: RefCell::new(Vec::new()),
         })
+    }
+
+    /// Record a profiling timestamp (BOTTOM_OF_PIPE) tagged with an op label, if INFR_PROF2.
+    fn stamp(&self, label: &'static str) {
+        if !self.prof2 {
+            return;
+        }
+        let idx = self.ts_labels.borrow().len() as u32;
+        unsafe {
+            self.be.shared.device.cmd_write_timestamp(
+                self.cmd,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                self.query_pool,
+                idx,
+            );
+        }
+        self.ts_labels.borrow_mut().push(label);
     }
 
     /// Emit a global compute/transfer barrier only if `reads`/`writes` collide with work recorded
@@ -219,6 +262,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        self.stamp("lm_head");
         let k = self
             .be
             .kernel("linear_f16", crate::linear::LINEAR_F16_WGSL, 3, 12);
@@ -247,6 +291,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        self.stamp("o_or_down");
         let k = self
             .be
             .kernel("linear_res", crate::linear::LINEAR_RES_WGSL, 4, 12);
@@ -291,6 +336,7 @@ impl<'a> Recorder<'a> {
         pos: usize,
         eps: f32,
     ) {
+        self.stamp("attn_in");
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
         debug_assert_eq!(q_dim % 64, 0, "attn_in requires q_dim % 64 == 0");
@@ -339,6 +385,7 @@ impl<'a> Recorder<'a> {
         nff: usize,
         eps: f32,
     ) {
+        self.stamp("ffn_in");
         debug_assert_eq!(nff % 64, 0, "ffn_in requires nff % 64 == 0");
         debug_assert!(ne <= 8192, "ffn_in requires ne <= 8192");
         let k = self.be.kernel("ffn_in", ops::FFN_IN_WGSL, 4, 16);
@@ -370,6 +417,7 @@ impl<'a> Recorder<'a> {
         dim: usize,
         eps: f32,
     ) {
+        self.stamp("rmsnorm");
         let k = self.be.kernel("rmsnorm", ops::RMSNORM_WGSL, 3, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
@@ -398,6 +446,7 @@ impl<'a> Recorder<'a> {
         theta: f32,
         pos_offset: usize,
     ) {
+        self.stamp("rope");
         let k = self.be.kernel("rope", ops::ROPE_WGSL, 2, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
@@ -431,6 +480,7 @@ impl<'a> Recorder<'a> {
         hd: usize,
         pos_offset: usize,
     ) {
+        self.stamp("attention_kv");
         let kern = self
             .be
             .kernel("attention_kv", ops::ATTENTION_KV_WGSL, 4, 24);
@@ -481,6 +531,7 @@ impl<'a> Recorder<'a> {
         nkv: usize,
         hd: usize,
     ) {
+        self.stamp("attention");
         let kern = self.be.kernel("attention", ops::ATTENTION_WGSL, 4, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
@@ -542,6 +593,18 @@ impl<'a> Recorder<'a> {
         if self.prof {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
+        // Final timestamp so the last op has an interval to close.
+        if self.prof2 {
+            let idx = self.ts_labels.borrow().len() as u32;
+            unsafe {
+                device.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    idx,
+                );
+            }
+        }
         unsafe { device.end_command_buffer(self.cmd) }.map_err(|e| be(format!("end cmd: {e}")))?;
         let queue = self.be.shared.queue;
         unsafe {
@@ -555,11 +618,65 @@ impl<'a> Recorder<'a> {
             device
                 .queue_wait_idle(queue)
                 .map_err(|e| be(format!("queue_wait_idle: {e}")))?;
+            if self.prof2 {
+                self.report_timestamps();
+                device.destroy_query_pool(self.query_pool, None);
+            }
             let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
             device.free_command_buffers(cmd_pool, &[self.cmd]);
             device.destroy_descriptor_pool(self.pool, None);
         }
         Ok(())
+    }
+
+    /// Read back per-op timestamps and print GPU time aggregated by op label.
+    fn report_timestamps(&self) {
+        let labels = self.ts_labels.borrow();
+        let n = labels.len();
+        if n == 0 {
+            return;
+        }
+        let mut ticks = vec![0u64; n + 1];
+        unsafe {
+            self.be
+                .shared
+                .device
+                .get_query_pool_results(
+                    self.query_pool,
+                    0,
+                    &mut ticks,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+                .expect("get_query_pool_results");
+        }
+        let period = unsafe {
+            self.be
+                .shared
+                .instance
+                .get_physical_device_properties(self.be.shared.physical_device)
+        }
+        .limits
+        .timestamp_period; // ns per tick
+        use std::collections::BTreeMap;
+        let mut by: BTreeMap<&str, (f64, usize)> = BTreeMap::new();
+        let mut total = 0f64;
+        for i in 0..n {
+            let us = (ticks[i + 1].wrapping_sub(ticks[i]) as f64) * period as f64 / 1000.0;
+            let e = by.entry(labels[i]).or_insert((0.0, 0));
+            e.0 += us;
+            e.1 += 1;
+            total += us;
+        }
+        eprintln!("[prof2] per-op GPU time (total {total:.0}us across {n} ops):");
+        let mut rows: Vec<_> = by.into_iter().collect();
+        rows.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+        for (lbl, (us, cnt)) in rows {
+            eprintln!(
+                "[prof2]   {lbl:>14}  {us:8.0}us  ({cnt:3} ops, {:.1}us/op, {:.0}%)",
+                us / cnt as f64,
+                100.0 * us / total
+            );
+        }
     }
 }
 
@@ -596,6 +713,112 @@ mod tests {
             v[2 * i + 1] = a * s + b * co;
         }
         let _ = hd;
+    }
+
+    fn attn_kv_cpu(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        q_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+    ) -> Vec<f32> {
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut o = vec![0f32; q_len * nh * hd];
+        for ti in 0..q_len {
+            let abs = pos_offset + ti;
+            for h in 0..nh {
+                let kvh = h / (nh / nkv);
+                let qb = (ti * nh + h) * hd;
+                let mut sc = vec![0f32; abs + 1];
+                let mut mx = f32::NEG_INFINITY;
+                for (j, scj) in sc.iter_mut().enumerate() {
+                    let kb = (j * nkv + kvh) * hd;
+                    let d: f32 = (0..hd).map(|x| q[qb + x] * k[kb + x]).sum();
+                    *scj = d * scale;
+                    mx = mx.max(*scj);
+                }
+                let mut l = 0f32;
+                for s in &sc {
+                    l += (s - mx).exp();
+                }
+                let ob = (ti * nh + h) * hd;
+                for (j, s) in sc.iter().enumerate() {
+                    let p = (s - mx).exp() / l;
+                    let vb = (j * nkv + kvh) * hd;
+                    for x in 0..hd {
+                        o[ob + x] += p * v[vb + x];
+                    }
+                }
+            }
+        }
+        o
+    }
+
+    fn run_attn_kv(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {
+        let be = VulkanBackend::new().unwrap();
+        let pos_offset = kv_len - q_len; // new tokens are the last q_len of the cache
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        let q = gen(q_len * nh * hd, 1);
+        let k = gen(kv_len * nkv * hd, 2);
+        let v = gen(kv_len * nkv * hd, 3);
+        let up = |val: &[f32]| {
+            let b = be.alloc(val.len() * 4, BufferUsage::Staging).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(val)).unwrap();
+            b
+        };
+        let bq = up(&q);
+        let bk = up(&k);
+        let bv = up(&v);
+        let bo = be
+            .alloc(q_len * nh * hd * 4, BufferUsage::Readback)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_kv(
+            bq.as_ref(),
+            bk.as_ref(),
+            bv.as_ref(),
+            bo.as_ref(),
+            q_len,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            pos_offset,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; q_len * nh * hd * 4];
+        be.download(bo.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset);
+        let err = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!("attention_kv q_len={q_len} kv_len={kv_len} max_err={err:e}");
+        assert!(err < 1e-4, "attention_kv mismatch: {err}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_kv_decode_matches_cpu() {
+        // decode: 1 new token over a long cache (exercises the 64-way KV split + reduce)
+        run_attn_kv(1, 200, 9, 3, 64);
+        run_attn_kv(1, 13, 4, 2, 32);
+        run_attn_kv(1, 1, 4, 2, 32);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_kv_prefill_matches_cpu() {
+        run_attn_kv(17, 17, 9, 3, 64);
     }
 
     #[test]

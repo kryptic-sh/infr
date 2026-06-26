@@ -8,10 +8,11 @@ fn main() -> anyhow::Result<()> {
     let n: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(32768);
     let llama = infr_llama::Llama::load(std::path::Path::new(&gguf), std::path::Path::new(&tok))?;
 
-    // Prefill quietly to N-512 (no prof), then profile the final ~512-token chunk and a decode.
+    // Prefill quietly to N - (realistic adaptive chunk), then profile that final chunk + a decode.
     let kv_target = n + 64;
     let mut kv = llama.new_kv(kv_target)?;
-    let warm = n.saturating_sub(512);
+    let final_chunk = llama.prefill_chunk(n.saturating_sub(1)).min(n);
+    let warm = n - final_chunk;
     let mut pos = 0usize;
     while pos < warm {
         let c = llama.prefill_chunk(pos).min(warm - pos);

@@ -1146,12 +1146,17 @@ impl Llama {
     /// GEMM, cheap projections) gets a bigger budget than Llama (GEMV). Rounded to a multiple of 64
     /// for the GEMM tiling, floored at 64.
     pub fn prefill_chunk(&self, pos: usize) -> usize {
+        // The coopmat prefill attention launches nh*ceil(chunk/64) workgroups; a too-small chunk
+        // starves GPU occupancy (only nh=16 workgroups at chunk=64), which dominates at depth.
+        // Keep chunks large — bigger chunks are more efficient PER QUERY despite re-reading KV —
+        // with a min that holds occupancy up, while the budget still bounds per-submit work to stay
+        // under the GPU watchdog at very long context.
         let budget = if self.cfg.qk_norm {
-            4_000_000
+            16_000_000
         } else {
             256 * 64
         };
-        let raw = (budget / (pos + 1)).clamp(64, 2048);
+        let raw = (budget / (pos + 1)).clamp(256, 2048);
         (raw / 64 * 64).max(64)
     }
 

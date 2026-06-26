@@ -1,5 +1,5 @@
 //! Decode-rate-vs-context benchmark.
-//! cargo run -p infr-llama --example decode_bench --release -- <model.gguf> <tokenizer.json>
+//! cargo run -p infr-llama --example decode_bench --release -- <model.gguf> <tokenizer.json> [max_ctx]
 //!
 //! Fills the KV cache to various depths with dummy tokens (content irrelevant for timing), then
 //! times single-token decodes at each depth — isolating decode throughput at a given context.
@@ -7,15 +7,35 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let gguf = args
         .next()
-        .expect("usage: decode_bench <gguf> <tokenizer.json>");
+        .expect("usage: decode_bench <gguf> <tokenizer.json> [max_ctx]");
     let tok = args.next().expect("need tokenizer.json");
+    let max_ctx: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(16384);
     let llama = infr_llama::Llama::load(std::path::Path::new(&gguf), std::path::Path::new(&tok))?;
+
+    let c = llama.config();
+    let kv_bytes_per_tok = c.n_kv * c.head_dim * 2 /*K+V*/ * 2 /*f16*/ * c.n_layer;
+    println!(
+        "KV cache: {} bytes/token → {:.1} GB at max_ctx={max_ctx}",
+        kv_bytes_per_tok,
+        (kv_bytes_per_tok * max_ctx) as f64 / 1e9
+    );
 
     // Prefill ONCE incrementally; measure decode throughput at each milestone (so the O(n²)
     // prefill is paid a single time, not per depth).
-    let milestones = [128usize, 1024, 4096, 8000, 12000, 16000];
-    let max_ctx = 16384;
-    let mut kv = llama.new_kv(max_ctx)?;
+    let milestones: Vec<usize> = [
+        128usize, 1024, 4096, 8000, 16000, 32768, 65536, 131072, 196608, 262144,
+    ]
+    .into_iter()
+    .filter(|&m| m <= max_ctx)
+    .collect();
+    // +64 headroom so the decode-rate samples at the deepest milestone (== max_ctx) still fit.
+    let mut kv = match llama.new_kv(max_ctx + 64) {
+        Ok(kv) => kv,
+        Err(e) => {
+            println!("new_kv({max_ctx}) FAILED: {e}");
+            return Ok(());
+        }
+    };
     let mut pos = 0usize;
     for &depth in &milestones {
         let tp = std::time::Instant::now();

@@ -339,9 +339,7 @@ impl<'a> Recorder<'a> {
         self.stamp("attn_in");
         let q_dim = nh * hd;
         let kv_dim = nkv * hd;
-        debug_assert_eq!(q_dim % 64, 0, "attn_in requires q_dim % 64 == 0");
-        debug_assert_eq!(kv_dim % 64, 0, "attn_in requires kv_dim % 64 == 0");
-        debug_assert!(ne <= 8192, "attn_in requires ne <= 8192");
+        debug_assert_eq!(hd % 2, 0, "attn_in requires even hd (RoPE pairs)");
         let kern = self.be.kernel("attn_in", ops::ATTN_IN_WGSL, 8, 36);
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
@@ -353,7 +351,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&theta.to_ne_bytes());
         push[28..32].copy_from_slice(&(pos as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&eps.to_ne_bytes());
-        let d = q_dim + 2 * kv_dim;
+        let half = (q_dim + 2 * kv_dim) / 2;
         self.dispatch(
             kern,
             &[
@@ -368,7 +366,7 @@ impl<'a> Recorder<'a> {
             ],
             3,
             &push,
-            ((rows * d) as u32).div_ceil(64),
+            (rows * half) as u32, // one workgroup per output pair (cooperative-over-K, coalesced)
         );
     }
 
@@ -386,8 +384,6 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         self.stamp("ffn_in");
-        debug_assert_eq!(nff % 64, 0, "ffn_in requires nff % 64 == 0");
-        debug_assert!(ne <= 8192, "ffn_in requires ne <= 8192");
         let k = self.be.kernel("ffn_in", ops::FFN_IN_WGSL, 4, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
@@ -404,7 +400,7 @@ impl<'a> Recorder<'a> {
             ],
             1,
             &push,
-            ((rows * nff) as u32).div_ceil(64),
+            (rows * nff) as u32, // one workgroup per output (cooperative-over-K, coalesced)
         );
     }
 
@@ -872,20 +868,18 @@ mod tests {
         assert!(max_err < 1e-4, "ffn_in mismatch: {max_err}");
     }
 
-    #[test]
-    #[ignore = "requires a Vulkan GPU"]
-    fn attn_in_matches_cpu() {
+    fn run_attn_in(rows: usize) {
         let be = VulkanBackend::new().unwrap();
         let (ne, nh, nkv, hd) = (128usize, 4usize, 2usize, 32usize);
         let (rope_dim, theta, pos, eps) = (32usize, 10000f32, 3usize, 1e-5f32);
-        let (q_dim, kv_dim, ctx) = (nh * hd, nkv * hd, 8usize);
-        let hidden: Vec<f32> = (0..ne)
+        let (q_dim, kv_dim, ctx) = (nh * hd, nkv * hd, 16usize);
+        let hidden: Vec<f32> = (0..rows * ne)
             .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.04)
             .collect();
         let nw: Vec<f32> = (0..ne).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
         // f16-rounded weights so the test checks kernel logic, not f16 precision.
-        let mkw = |rows: usize, salt: usize| -> Vec<f32> {
-            (0..rows * ne)
+        let mkw = |r: usize, salt: usize| -> Vec<f32> {
+            (0..r * ne)
                 .map(|i| {
                     half::f16::from_f32((((i + salt) * 17 % 89) as f32 - 44.0) * 0.003).to_f32()
                 })
@@ -905,7 +899,7 @@ mod tests {
         let bwq = be.upload_weight_f16(&wq).unwrap();
         let bwk = be.upload_weight_f16(&wk).unwrap();
         let bwv = be.upload_weight_f16(&wv).unwrap();
-        let bq = be.alloc(q_dim * 4, BufferUsage::Readback).unwrap();
+        let bq = be.alloc(rows * q_dim * 4, BufferUsage::Readback).unwrap();
         let bkc = be.alloc(ctx * kv_dim * 4, BufferUsage::Readback).unwrap();
         let bvc = be.alloc(ctx * kv_dim * 4, BufferUsage::Readback).unwrap();
         let rec = be.recorder().unwrap();
@@ -918,7 +912,7 @@ mod tests {
             bq.as_ref(),
             bkc.as_ref(),
             bvc.as_ref(),
-            1,
+            rows,
             ne,
             nh,
             nkv,
@@ -934,41 +928,44 @@ mod tests {
             be.download(b, &mut bytes).unwrap();
             bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
         };
-        let gq = rd(bq.as_ref(), q_dim);
+        let gq = rd(bq.as_ref(), rows * q_dim);
         let gk = rd(bkc.as_ref(), ctx * kv_dim);
         let gv = rd(bvc.as_ref(), ctx * kv_dim);
 
-        let norm = rmsnorm_cpu(&hidden, &nw, eps);
-        // q reference (per head, roped)
-        let mut wantq = vec![0f32; q_dim];
-        for c in 0..q_dim {
-            wantq[c] = dot(&wq, c, ne, &norm);
+        let mut maxe = 0f32;
+        for r in 0..rows {
+            let norm = rmsnorm_cpu(&hidden[r * ne..(r + 1) * ne], &nw, eps);
+            let abs = pos + r; // per-row absolute position (the prefill correctness check)
+            let mut wq_r = vec![0f32; q_dim];
+            for c in 0..q_dim {
+                wq_r[c] = dot(&wq, c, ne, &norm);
+            }
+            for h in 0..nh {
+                rope_head(&mut wq_r[h * hd..(h + 1) * hd], hd, rope_dim, theta, abs);
+            }
+            let mut wk_r = vec![0f32; kv_dim];
+            for c in 0..kv_dim {
+                wk_r[c] = dot(&wk, c, ne, &norm);
+            }
+            for h in 0..nkv {
+                rope_head(&mut wk_r[h * hd..(h + 1) * hd], hd, rope_dim, theta, abs);
+            }
+            for c in 0..q_dim {
+                maxe = maxe.max((gq[r * q_dim + c] - wq_r[c]).abs());
+            }
+            for c in 0..kv_dim {
+                maxe = maxe.max((gk[abs * kv_dim + c] - wk_r[c]).abs());
+                maxe = maxe.max((gv[abs * kv_dim + c] - dot(&wv, c, ne, &norm)).abs());
+            }
         }
-        for h in 0..nh {
-            rope_head(&mut wantq[h * hd..(h + 1) * hd], hd, rope_dim, theta, pos);
-        }
-        let mut wantk = vec![0f32; kv_dim];
-        for c in 0..kv_dim {
-            wantk[c] = dot(&wk, c, ne, &norm);
-        }
-        for h in 0..nkv {
-            rope_head(&mut wantk[h * hd..(h + 1) * hd], hd, rope_dim, theta, pos);
-        }
-        let wantv: Vec<f32> = (0..kv_dim).map(|c| dot(&wv, c, ne, &norm)).collect();
+        println!("attn_in rows={rows} max_err={maxe:e}");
+        assert!(maxe < 1e-4, "attn_in mismatch rows={rows}: {maxe}");
+    }
 
-        let err = |a: &[f32], b: &[f32]| {
-            a.iter()
-                .zip(b)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0f32, f32::max)
-        };
-        let eq = err(&gq, &wantq);
-        let ek = err(&gk[pos * kv_dim..(pos + 1) * kv_dim], &wantk);
-        let ev = err(&gv[pos * kv_dim..(pos + 1) * kv_dim], &wantv);
-        println!("attn_in err q={eq:e} k={ek:e} v={ev:e}");
-        assert!(
-            eq < 1e-4 && ek < 1e-4 && ev < 1e-4,
-            "attn_in mismatch q={eq} k={ek} v={ev}"
-        );
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attn_in_matches_cpu() {
+        run_attn_in(1); // decode
+        run_attn_in(3); // prefill — exercises per-row RoPE position
     }
 }

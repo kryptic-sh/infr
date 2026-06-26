@@ -279,11 +279,13 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Q8_0 dequant GEMV `y = x·Wᵀ` (weights = quants int8×4/u32 + scales f16 per 32-block).
-    pub fn linear_q8(
+    /// Quantized dequant GEMV `y = x·Wᵀ` (weights = u8 quants + per-16-block f16 scale/min).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_q(
         &self,
         quants: &dyn Buffer,
         scales: &dyn Buffer,
+        mins: &dyn Buffer,
         x: &dyn Buffer,
         y: &dyn Buffer,
         rows: usize,
@@ -293,7 +295,7 @@ impl<'a> Recorder<'a> {
         self.stamp("lm_head");
         let k = self
             .be
-            .kernel("linear_q8", crate::linear::LINEAR_Q8_WGSL, 4, 12);
+            .kernel("linear_q", crate::linear::LINEAR_Q_WGSL, 5, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -303,6 +305,7 @@ impl<'a> Recorder<'a> {
             &[
                 Self::vkb(quants),
                 Self::vkb(scales),
+                Self::vkb(mins),
                 Self::vkb(x),
                 Self::vkb(y),
             ],
@@ -312,12 +315,13 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Q8_0 dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
+    /// Quantized dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
     #[allow(clippy::too_many_arguments)]
-    pub fn linear_add_q8(
+    pub fn linear_add_q(
         &self,
         quants: &dyn Buffer,
         scales: &dyn Buffer,
+        mins: &dyn Buffer,
         x: &dyn Buffer,
         residual: &dyn Buffer,
         y: &dyn Buffer,
@@ -328,7 +332,7 @@ impl<'a> Recorder<'a> {
         self.stamp("o_or_down");
         let k = self
             .be
-            .kernel("linear_res_q8", crate::linear::LINEAR_RES_Q8_WGSL, 5, 12);
+            .kernel("linear_res_q", crate::linear::LINEAR_RES_Q_WGSL, 6, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -338,6 +342,7 @@ impl<'a> Recorder<'a> {
             &[
                 Self::vkb(quants),
                 Self::vkb(scales),
+                Self::vkb(mins),
                 Self::vkb(x),
                 Self::vkb(residual),
                 Self::vkb(y),
@@ -439,14 +444,15 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Q8_0 dequant variant of `ffn_in` (Wgu quantized).
+    /// Quantized variant of `ffn_in` (Wgu = u8 quants + per-16-block f16 scale/min).
     #[allow(clippy::too_many_arguments)]
-    pub fn ffn_in_q8(
+    pub fn ffn_in_q(
         &self,
         hidden: &dyn Buffer,
         norm_w: &dyn Buffer,
         quants: &dyn Buffer,
         scales: &dyn Buffer,
+        mins: &dyn Buffer,
         act: &dyn Buffer,
         rows: usize,
         ne: usize,
@@ -454,7 +460,7 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         self.stamp("ffn_in");
-        let k = self.be.kernel("ffn_in_q8", ops::FFN_IN_Q8_WGSL, 5, 16);
+        let k = self.be.kernel("ffn_in_q", ops::FFN_IN_Q_WGSL, 6, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
@@ -467,6 +473,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(norm_w),
                 Self::vkb(quants),
                 Self::vkb(scales),
+                Self::vkb(mins),
                 Self::vkb(act),
             ],
             1,
@@ -1098,20 +1105,21 @@ mod tests {
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]
-    fn linear_q8_matches_cpu() {
+    fn linear_q_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
-        let (rows, in_f, out_f) = (2usize, 128usize, 5usize); // in_f % 32 == 0
+        let (rows, in_f, out_f) = (2usize, 128usize, 5usize); // in_f % 16 == 0
         let numel = in_f * out_f;
-        // arbitrary int8 weights + per-32-block f16 scales; dequant = q * scale
-        let qi8: Vec<i8> = (0..numel)
-            .map(|i| ((i * 7 % 255) as i32 - 127) as i8)
-            .collect();
-        let scales: Vec<u16> = (0..numel / 32)
+        // unified quant: u8 quants + per-16-block f16 scale/min; dequant = scale*q + min
+        let qu8: Vec<u8> = (0..numel).map(|i| (i * 7 % 64) as u8).collect();
+        let scales: Vec<u16> = (0..numel / 16)
             .map(|b| half::f16::from_f32(0.01 + (b % 5) as f32 * 0.003).to_bits())
             .collect();
+        let mins: Vec<u16> = (0..numel / 16)
+            .map(|b| half::f16::from_f32(-0.2 + (b % 3) as f32 * 0.05).to_bits())
+            .collect();
         let mut quants = vec![0u32; numel / 4];
-        for (g, &q) in qi8.iter().enumerate() {
-            quants[g / 4] |= ((q as u8) as u32) << (8 * (g % 4));
+        for (g, &q) in qu8.iter().enumerate() {
+            quants[g / 4] |= (q as u32) << (8 * (g % 4));
         }
         let x: Vec<f32> = (0..rows * in_f)
             .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
@@ -1123,13 +1131,15 @@ mod tests {
         let bs = be
             .upload_weight_bytes(bytemuck::cast_slice(&scales))
             .unwrap();
+        let bm = be.upload_weight_bytes(bytemuck::cast_slice(&mins)).unwrap();
         let upx = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
         be.upload(upx.as_ref(), bytemuck::cast_slice(&x)).unwrap();
         let by = be.alloc(rows * out_f * 4, BufferUsage::Readback).unwrap();
         let rec = be.recorder().unwrap();
-        rec.linear_q8(
+        rec.linear_q(
             bq.as_ref(),
             bs.as_ref(),
+            bm.as_ref(),
             upx.as_ref(),
             by.as_ref(),
             rows,
@@ -1141,7 +1151,10 @@ mod tests {
         be.download(by.as_ref(), &mut bytes).unwrap();
         let got: &[f32] = bytemuck::cast_slice(&bytes);
 
-        let dq = |g: usize| qi8[g] as f32 * half::f16::from_bits(scales[g / 32]).to_f32();
+        let dq = |g: usize| {
+            half::f16::from_bits(scales[g / 16]).to_f32() * qu8[g] as f32
+                + half::f16::from_bits(mins[g / 16]).to_f32()
+        };
         let mut maxe = 0f32;
         for r in 0..rows {
             for o in 0..out_f {
@@ -1149,8 +1162,8 @@ mod tests {
                 maxe = maxe.max((got[r * out_f + o] - want).abs());
             }
         }
-        println!("linear_q8 max_err = {maxe:e}");
-        assert!(maxe < 1e-3, "linear_q8 mismatch: {maxe}");
+        println!("linear_q max_err = {maxe:e}");
+        assert!(maxe < 1e-3, "linear_q mismatch: {maxe}");
     }
 
     #[test]

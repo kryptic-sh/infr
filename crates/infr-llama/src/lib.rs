@@ -33,13 +33,15 @@ pub struct Config {
     pub qk_norm: bool,
 }
 
-/// A projection weight on the GPU: either f16, or in-kernel-dequantized Q8_0
-/// (quants = int8 packed 4-per-u32, scales = one f16 per 32-element block).
+/// A projection weight on the GPU: either f16, or a unified in-kernel-dequant quant. Every
+/// supported quant (Q8_0/Q4_K/Q5_K/Q6_K) is repacked at load into ONE form — `q` = u8 indices
+/// packed 4-per-u32, `s`/`m` = one f16 scale/min per 16-element block — so `dq = s·u8 + m`.
 enum Wt {
     F16(Box<dyn Buffer>),
-    Q8 {
+    Q {
         q: Box<dyn Buffer>,
         s: Box<dyn Buffer>,
+        m: Box<dyn Buffer>,
     },
 }
 impl Wt {
@@ -47,7 +49,7 @@ impl Wt {
     fn f16(&self) -> &dyn Buffer {
         match self {
             Wt::F16(b) => b.as_ref(),
-            Wt::Q8 { .. } => panic!("expected f16 weight, got Q8 (llama fused path needs f16)"),
+            Wt::Q { .. } => panic!("expected f16 weight, got quant (llama fused path needs f16)"),
         }
     }
 }
@@ -109,19 +111,14 @@ fn load_f32(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
-        infr_core::DType::Q8_0 => {
-            // 34-byte blocks: f16 scale + 32 int8
-            let mut out = Vec::with_capacity(bytes.len() / 34 * 32);
-            for blk in bytes.chunks_exact(34) {
-                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
-                for &q in &blk[2..34] {
-                    out.push((q as i8) as f32 * d);
-                }
-            }
-            out
+        d if is_quant(d) => {
+            let (qv, sc, mn) = dequant_unified(d, bytes);
+            (0..qv.len())
+                .map(|g| sc[g] * qv[g] as f32 + mn[g])
+                .collect()
         }
         other => {
-            bail!("unsupported dtype {other:?} for {name} (host load wants F16/F32/BF16/Q8_0)")
+            bail!("unsupported dtype {other:?} for {name} (host load wants F16/F32/BF16/quant)")
         }
     };
     Ok((v, info.shape))
@@ -161,24 +158,150 @@ fn f16_bytes(g: &Gguf, name: &str) -> Result<Vec<u8>> {
     }
 }
 
-/// Repack a Q8_0 tensor (34-byte blocks: f16 scale + 32 int8) into GPU-aligned arrays:
-/// `quants` = int8 packed 4-per-u32, `scales` = one f16 (u16 bits) per 32-element block.
-fn q8_repack(g: &Gguf, name: &str) -> Result<(Vec<u32>, Vec<u16>)> {
-    let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
-    let nblocks = bytes.len() / 34;
-    let mut quants = vec![0u32; nblocks * 8]; // 32 int8/block = 8 u32/block
-    let mut scales = vec![0u16; nblocks];
-    for (b, blk) in bytes.chunks_exact(34).enumerate() {
-        scales[b] = u16::from_le_bytes([blk[0], blk[1]]);
-        for i in 0..32 {
-            let g_idx = b * 32 + i;
-            quants[g_idx / 4] |= (blk[2 + i] as u32) << (8 * (g_idx % 4));
-        }
+fn rdf16(b: &[u8]) -> f32 {
+    half::f16::from_le_bytes([b[0], b[1]]).to_f32()
+}
+fn k4(j: usize, q: &[u8]) -> (u32, u32) {
+    // get_scale_min_k4: extract 6-bit scale `d` and min `m` for sub-block j (0..8) from scales[12]
+    if j < 4 {
+        ((q[j] & 63) as u32, (q[j + 4] & 63) as u32)
+    } else {
+        (
+            ((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4)) as u32,
+            ((q[j + 4] >> 4) | ((q[j] >> 6) << 4)) as u32,
+        )
     }
-    Ok((quants, scales))
 }
 
-/// Upload a projection weight, keeping Q8_0 quantized in-VRAM (else convert to f16).
+/// Dequant any supported quant into the UNIFIED form: per-element u8 index + per-element
+/// (scale, min) such that `weight = scale*u8 + min` (filled in natural tensor order). Scale/min are
+/// constant across each consecutive 16-element block, which the kernel exploits.
+fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    use infr_core::DType::*;
+    let (qpb, bpb) = match dtype {
+        Q8_0 => (32, 34),
+        Q4K => (256, 144),
+        Q5K => (256, 176),
+        Q6K => (256, 210),
+        _ => unreachable!(),
+    };
+    let nblk = bytes.len() / bpb;
+    let numel = nblk * qpb;
+    let mut qv = vec![0u8; numel];
+    let mut sc = vec![0f32; numel];
+    let mut mn = vec![0f32; numel];
+    let mut set = |g: usize, q: u8, s: f32, m: f32| {
+        qv[g] = q;
+        sc[g] = s;
+        mn[g] = m;
+    };
+    for b in 0..nblk {
+        let blk = &bytes[b * bpb..(b + 1) * bpb];
+        match dtype {
+            Q8_0 => {
+                let d = rdf16(blk);
+                for i in 0..32 {
+                    set(
+                        b * 32 + i,
+                        (blk[2 + i] as i8 as i16 + 128) as u8,
+                        d,
+                        -128.0 * d,
+                    );
+                }
+            }
+            Q4K => {
+                let d = rdf16(&blk[0..2]);
+                let dmin = rdf16(&blk[2..4]);
+                let scales = &blk[4..16];
+                let qs = &blk[16..144];
+                let base = b * 256;
+                for j in 0..4 {
+                    let (sc1, m1) = k4(2 * j, scales);
+                    let (sc2, m2) = k4(2 * j + 1, scales);
+                    let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
+                    let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
+                    for l in 0..32 {
+                        let v = qs[j * 32 + l];
+                        set(base + j * 64 + l, v & 0xF, d1, -mm1);
+                        set(base + j * 64 + 32 + l, v >> 4, d2, -mm2);
+                    }
+                }
+            }
+            Q5K => {
+                let d = rdf16(&blk[0..2]);
+                let dmin = rdf16(&blk[2..4]);
+                let scales = &blk[4..16];
+                let qh = &blk[16..48];
+                let qs = &blk[48..176];
+                let base = b * 256;
+                let (mut u1, mut u2) = (1u8, 2u8);
+                for j in 0..4 {
+                    let (sc1, m1) = k4(2 * j, scales);
+                    let (sc2, m2) = k4(2 * j + 1, scales);
+                    let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
+                    let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
+                    for l in 0..32 {
+                        let v = qs[j * 32 + l];
+                        let lo = (v & 0xF) + if qh[l] & u1 != 0 { 16 } else { 0 };
+                        let hi = (v >> 4) + if qh[l] & u2 != 0 { 16 } else { 0 };
+                        set(base + j * 64 + l, lo, d1, -mm1);
+                        set(base + j * 64 + 32 + l, hi, d2, -mm2);
+                    }
+                    u1 <<= 2;
+                    u2 <<= 2;
+                }
+            }
+            Q6K => {
+                let ql = &blk[0..128];
+                let qh = &blk[128..192];
+                let scales = &blk[192..208]; // 16 × int8
+                let d = rdf16(&blk[208..210]);
+                let sc_i8 = |i: usize| scales[i] as i8 as f32;
+                for half in 0..2 {
+                    let (qlo, qho, sco, base) =
+                        (half * 64, half * 32, half * 8, b * 256 + half * 128);
+                    for l in 0..32 {
+                        let is = l / 16;
+                        let q1 = (ql[qlo + l] & 0xF) | ((qh[qho + l] & 3) << 4);
+                        let q2 = (ql[qlo + l + 32] & 0xF) | (((qh[qho + l] >> 2) & 3) << 4);
+                        let q3 = (ql[qlo + l] >> 4) | (((qh[qho + l] >> 4) & 3) << 4);
+                        let q4 = (ql[qlo + l + 32] >> 4) | (((qh[qho + l] >> 6) & 3) << 4);
+                        for (off, q, sci) in [(0, q1, 0), (32, q2, 2), (64, q3, 4), (96, q4, 6)] {
+                            let s = d * sc_i8(sco + is + sci);
+                            set(base + l + off, q, s, -32.0 * s); // y = s*(q-32)
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    (qv, sc, mn)
+}
+
+fn is_quant(d: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(d, Q8_0 | Q4K | Q5K | Q6K)
+}
+
+/// Pack a unified-dequant result (u8 quants + per-element scale/min) into the GPU layout:
+/// quants u8×4/u32, scales/mins one f16 per 16-element block.
+fn pack_unified(qv: &[u8], sc: &[f32], mn: &[f32]) -> (Vec<u32>, Vec<u16>, Vec<u16>) {
+    let numel = qv.len();
+    let mut quants = vec![0u32; numel / 4];
+    for (g, &q) in qv.iter().enumerate() {
+        quants[g / 4] |= (q as u32) << (8 * (g % 4));
+    }
+    let scales: Vec<u16> = (0..numel / 16)
+        .map(|b| half::f16::from_f32(sc[b * 16]).to_bits())
+        .collect();
+    let mins: Vec<u16> = (0..numel / 16)
+        .map(|b| half::f16::from_f32(mn[b * 16]).to_bits())
+        .collect();
+    (quants, scales, mins)
+}
+
+/// Upload a projection weight, keeping quantized weights quantized in-VRAM (else convert to f16).
 fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
     let info = g
         .tensors()
@@ -186,15 +309,17 @@ fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
         .find(|t| t.name == name)
         .ok_or_else(|| anyhow!("tensor not found: {name}"))?
         .clone();
-    match info.dtype {
-        infr_core::DType::Q8_0 => {
-            let (q, s) = q8_repack(g, name)?;
-            Ok(Wt::Q8 {
-                q: be.upload_weight_bytes(bytemuck::cast_slice(&q))?,
-                s: be.upload_weight_bytes(bytemuck::cast_slice(&s))?,
-            })
-        }
-        _ => Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes(g, name)?)?)),
+    if is_quant(info.dtype) {
+        let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+        let (qv, sc, mn) = dequant_unified(info.dtype, bytes);
+        let (q, s, m) = pack_unified(&qv, &sc, &mn);
+        Ok(Wt::Q {
+            q: be.upload_weight_bytes(bytemuck::cast_slice(&q))?,
+            s: be.upload_weight_bytes(bytemuck::cast_slice(&s))?,
+            m: be.upload_weight_bytes(bytemuck::cast_slice(&m))?,
+        })
+    } else {
+        Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes(g, name)?)?))
     }
 }
 
@@ -279,21 +404,36 @@ impl Llama {
             let ffn_norm_buf = be
                 .upload_weight(&ffn_norm)
                 .map_err(|e| anyhow!("upload ffn_norm {l}: {e}"))?;
-            // fuse gate + up into one [2*n_ff, n_embd] weight (concat rows). Q8 stays quantized.
-            let gate_info = g.tensors().iter().find(|t| t.name == p("ffn_gate.weight"));
-            let is_q8 = matches!(gate_info.map(|t| t.dtype), Some(infr_core::DType::Q8_0));
-            let wgateup = if is_q8 {
-                let (mut q, mut s) = q8_repack(&g, &p("ffn_gate.weight"))?;
-                let (qu, su) = q8_repack(&g, &p("ffn_up.weight"))?;
-                q.extend_from_slice(&qu);
-                s.extend_from_slice(&su);
-                Wt::Q8 {
+            // fuse gate + up into one [2*n_ff, n_embd] weight (concat rows). Quant stays quantized.
+            let gate_dtype = g
+                .tensors()
+                .iter()
+                .find(|t| t.name == p("ffn_gate.weight"))
+                .map(|t| t.dtype);
+            let wgateup = if gate_dtype.map(is_quant).unwrap_or(false) {
+                let dt = gate_dtype.unwrap();
+                let gb = g
+                    .tensor_bytes(&p("ffn_gate.weight"))
+                    .map_err(|e| anyhow!("{e}"))?;
+                let ub = g
+                    .tensor_bytes(&p("ffn_up.weight"))
+                    .map_err(|e| anyhow!("{e}"))?;
+                let (mut qv, mut sc, mut mn) = dequant_unified(dt, gb);
+                let (qu, scu, mnu) = dequant_unified(dt, ub);
+                qv.extend(qu);
+                sc.extend(scu);
+                mn.extend(mnu);
+                let (q, s, m) = pack_unified(&qv, &sc, &mn);
+                Wt::Q {
                     q: be
                         .upload_weight_bytes(bytemuck::cast_slice(&q))
-                        .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?,
+                        .map_err(|e| anyhow!("wgateup {l}: {e}"))?,
                     s: be
                         .upload_weight_bytes(bytemuck::cast_slice(&s))
-                        .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?,
+                        .map_err(|e| anyhow!("wgateup {l}: {e}"))?,
+                    m: be
+                        .upload_weight_bytes(bytemuck::cast_slice(&m))
+                        .map_err(|e| anyhow!("wgateup {l}: {e}"))?,
                 }
             } else {
                 let mut gateup = f16_bytes(&g, &p("ffn_gate.weight"))?;
@@ -636,11 +776,13 @@ impl Llama {
         let prof = std::env::var("INFR_PROF").is_ok();
         let t_rec = std::time::Instant::now();
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
-        // weight-op dispatchers: pick the f16 or Q8 kernel based on how the weight is stored.
+        // weight-op dispatchers: pick the f16 or quant kernel based on how the weight is stored.
         let lin = |w: &Wt, x: &dyn Buffer, y: &dyn Buffer, rows: usize, inf: usize, outf: usize| {
             match w {
                 Wt::F16(b) => rec.linear(b.as_ref(), x, y, rows, inf, outf),
-                Wt::Q8 { q, s } => rec.linear_q8(q.as_ref(), s.as_ref(), x, y, rows, inf, outf),
+                Wt::Q { q, s, m } => {
+                    rec.linear_q(q.as_ref(), s.as_ref(), m.as_ref(), x, y, rows, inf, outf)
+                }
             }
         };
         let lin_add = |w: &Wt,
@@ -651,9 +793,17 @@ impl Llama {
                        inf: usize,
                        outf: usize| match w {
             Wt::F16(b) => rec.linear_add(b.as_ref(), x, res, y, rows, inf, outf),
-            Wt::Q8 { q, s } => {
-                rec.linear_add_q8(q.as_ref(), s.as_ref(), x, res, y, rows, inf, outf)
-            }
+            Wt::Q { q, s, m } => rec.linear_add_q(
+                q.as_ref(),
+                s.as_ref(),
+                m.as_ref(),
+                x,
+                res,
+                y,
+                rows,
+                inf,
+                outf,
+            ),
         };
         let ffn = |hidden: &dyn Buffer,
                    nw: &dyn Buffer,
@@ -664,9 +814,18 @@ impl Llama {
                    nff: usize,
                    eps: f32| match w {
             Wt::F16(b) => rec.ffn_in(hidden, nw, b.as_ref(), act, rows, ne, nff, eps),
-            Wt::Q8 { q, s } => {
-                rec.ffn_in_q8(hidden, nw, q.as_ref(), s.as_ref(), act, rows, ne, nff, eps)
-            }
+            Wt::Q { q, s, m } => rec.ffn_in_q(
+                hidden,
+                nw,
+                q.as_ref(),
+                s.as_ref(),
+                m.as_ref(),
+                act,
+                rows,
+                ne,
+                nff,
+                eps,
+            ),
         };
         for (li, layer) in self.layers.iter().enumerate() {
             if let Some((qr, kr, vr)) = &qkv_raw {

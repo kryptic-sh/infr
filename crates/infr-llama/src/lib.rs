@@ -735,12 +735,12 @@ impl Llama {
             // f16 KV cache: 2 bytes/elem (half the f32 footprint that grows with context).
             k.push(
                 self.be
-                    .alloc(max_ctx * row * 2, BufferUsage::Activations)
+                    .alloc((max_ctx + 64) * row * 2, BufferUsage::Activations)
                     .map_err(|e| anyhow!("{e}"))?,
             );
             v.push(
                 self.be
-                    .alloc(max_ctx * row * 2, BufferUsage::Activations)
+                    .alloc((max_ctx + 64) * row * 2, BufferUsage::Activations)
                     .map_err(|e| anyhow!("{e}"))?,
             );
         }
@@ -782,12 +782,13 @@ impl Llama {
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
             .map_err(|e| anyhow!("{e}"))?;
         let hn = alloc(n * ne, BufferUsage::Activations)?;
-        // q is f16 (read by the f16 attention kernels), like the KV cache.
+        // q is f16 (read by the f16 attention kernels), like the KV cache. q and attn are M-padded
+        // to mpad rows so the coopmat prefill attention can read/write whole 64-row tiles.
         let q = self
             .be
-            .alloc((n * nh * hd * 2).max(4), BufferUsage::Activations)
+            .alloc((mpad * nh * hd * 2).max(4), BufferUsage::Activations)
             .map_err(|e| anyhow!("{e}"))?;
-        let attn = alloc(n * nh * hd, BufferUsage::Activations)?;
+        let attn = alloc(mpad * nh * hd, BufferUsage::Activations)?;
         let act = alloc(n * nff, BufferUsage::Activations)?;
         // Only the LAST position's logits are needed → compute lm_head for one row. (Computing all n
         // rows at long context is a huge wasted dispatch + ~n*vocab buffer that can exceed the GPU
@@ -1017,7 +1018,21 @@ impl Llama {
                     c.rms_eps,
                 );
             }
-            if let Some((pm, pl, pacc)) = &split_bufs {
+            if use_gemm {
+                // prefill: coopmat flash attention (reads each K/V block once per 64-query tile).
+                rec.attention_prefill(
+                    q.as_ref(),
+                    kv.k[li].as_ref(),
+                    kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    n,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                );
+            } else if let Some((pm, pl, pacc)) = &split_bufs {
                 rec.attention_kv_split(
                     q.as_ref(),
                     kv.k[li].as_ref(),
@@ -1132,11 +1147,11 @@ impl Llama {
     /// for the GEMM tiling, floored at 64.
     pub fn prefill_chunk(&self, pos: usize) -> usize {
         let budget = if self.cfg.qk_norm {
-            1_000_000
+            4_000_000
         } else {
             256 * 64
         };
-        let raw = (budget / (pos + 1)).clamp(64, 512);
+        let raw = (budget / (pos + 1)).clamp(64, 1024);
         (raw / 64 * 64).max(64)
     }
 

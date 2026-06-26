@@ -665,6 +665,45 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Coopmat flash-attention for prefill (`q_len` query rows). One workgroup per (64-row query
+    /// tile, head); both matmuls run on cooperative-matrix fragments. `q`/`kc`/`vc` are f16, `o` is
+    /// f32. `hd` must be a multiple of 16 and <= 128. Output buffer `o` and the `q` buffer must be
+    /// allocated for ceil(q_len/64)*64 rows (the last tile writes/reads padded rows).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+    ) {
+        self.stamp("attention_prefill");
+        let kern =
+            self.be
+                .kernel_spv_sg("attn_prefill", crate::gemm::attn_prefill_spv(), 4, 24, 32);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        let groups = (q_len.div_ceil(64) * nh) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Cast-copy f32 `src[0..n]` → f16 `dst[off..off+n]` (write f32 activations into the f16 cache).
     pub fn store_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize, off: usize) {
         self.stamp("store_f16");
@@ -1108,6 +1147,58 @@ mod tests {
         assert!(err < 5e-3, "attention_kv mismatch: {err}");
     }
 
+    fn run_attn_prefill(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {
+        let be = VulkanBackend::new().unwrap();
+        let pos_offset = kv_len - q_len; // new tokens are the last q_len of the cache
+        let mpad = q_len.div_ceil(64) * 64;
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        let q = r16(&gen(q_len * nh * hd, 1));
+        let k = r16(&gen(kv_len * nkv * hd, 2));
+        let v = r16(&gen(kv_len * nkv * hd, 3));
+        // q is M-padded to mpad rows; k/v get +64 rows of slack (coopmat reads whole 64-kv tiles,
+        // which can overrun kv_len on the last tile — those columns are causally masked).
+        let mut qp = q.clone();
+        qp.resize(mpad * nh * hd, 0.0);
+        let mut kp = k.clone();
+        kp.resize((kv_len + 64) * nkv * hd, 0.0);
+        let mut vp = v.clone();
+        vp.resize((kv_len + 64) * nkv * hd, 0.0);
+        let bq = upf16(&be, &qp);
+        let bk = upf16(&be, &kp);
+        let bv = upf16(&be, &vp);
+        let bo = be.alloc(mpad * nh * hd * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_prefill(
+            bq.as_ref(),
+            bk.as_ref(),
+            bv.as_ref(),
+            bo.as_ref(),
+            q_len,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            pos_offset,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; mpad * nh * hd * 4];
+        be.download(bo.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset);
+        // only the first q_len rows are meaningful (rows [q_len, mpad) are padding).
+        let err = got[..q_len * nh * hd]
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!("attention_prefill q_len={q_len} kv_len={kv_len} max_err={err:e}");
+        assert!(err < 5e-3, "attention_prefill mismatch: {err}");
+    }
+
     fn run_attn_kv_split(kv_len: usize, nh: usize, nkv: usize, hd: usize) {
         let be = VulkanBackend::new().unwrap();
         let chunk = 512usize;
@@ -1187,6 +1278,16 @@ mod tests {
     fn attention_kv_prefill_matches_cpu() {
         run_attn_kv(17, 17, 9, 3, 64);
         run_attn_kv(40, 1500, 9, 3, 64); // multi-tile prefill (kv_len > TILE)
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_prefill_matches_cpu() {
+        run_attn_prefill(64, 64, 2, 1, 128); // single tile, GQA, qwen3 hd
+        run_attn_prefill(128, 200, 4, 2, 128); // 2 q-tiles, partial kv tile, pos_offset>0
+        run_attn_prefill(70, 70, 2, 2, 128); // q_len not %64 → padded rows + partial kv tile
+        run_attn_prefill(192, 500, 2, 1, 128); // many kv tiles
+        run_attn_prefill(80, 300, 9, 3, 64); // hd=64, GQA 3:1
     }
 
     #[test]

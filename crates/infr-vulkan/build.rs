@@ -5,7 +5,12 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
-    for name in ["gemm_coopmat", "gemm_coopmat_tiled", "gemm_proj"] {
+    for name in [
+        "gemm_coopmat",
+        "gemm_coopmat_tiled",
+        "gemm_proj",
+        "attn_prefill",
+    ] {
         let src = format!("shaders/{name}.comp");
         let dst = format!("{out}/{name}.spv");
         println!("cargo:rerun-if-changed={src}");

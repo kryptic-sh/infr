@@ -1,0 +1,15 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Compiled shaders
+*.spv
+
+# Models / weights (never commit)
+*.gguf
+*.safetensors
+
+# Editor / OS
+.DS_Store
+*.swp

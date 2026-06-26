@@ -298,6 +298,22 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Fused SwiGLU over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
+    pub fn silu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+        let k = self
+            .be
+            .kernel("silu_mul_fused", ops::SILU_MUL_FUSED_WGSL, 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(gu), Self::vkb(y)],
+            &push,
+            (rows * nff) as u32,
+        );
+    }
+
     pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let k = self.be.kernel("silu_mul", ops::SILU_MUL_WGSL, 3, 4);
         self.dispatch(

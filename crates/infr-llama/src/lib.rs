@@ -40,8 +40,7 @@ struct LayerWeights {
     wk: Box<dyn Buffer>,
     wv: Box<dyn Buffer>,
     wo: Box<dyn Buffer>,
-    wgate: Box<dyn Buffer>,
-    wup: Box<dyn Buffer>,
+    wgateup: Box<dyn Buffer>, // fused [2*n_ff, n_embd] = concat(gate, up)
     wdown: Box<dyn Buffer>,
 }
 
@@ -162,6 +161,12 @@ impl Llama {
             let ffn_norm_buf = be
                 .upload_weight(&ffn_norm)
                 .map_err(|e| anyhow!("upload ffn_norm {l}: {e}"))?;
+            // fuse gate + up into one [2*n_ff, n_embd] weight (concat rows)
+            let mut gateup = load_f32(&g, &p("ffn_gate.weight"))?.0;
+            gateup.extend_from_slice(&load_f32(&g, &p("ffn_up.weight"))?.0);
+            let wgateup = be
+                .upload_weight(&gateup)
+                .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?;
             layers.push(LayerWeights {
                 attn_norm,
                 ffn_norm,
@@ -171,8 +176,7 @@ impl Llama {
                 wk: up(&be, p("attn_k.weight"))?,
                 wv: up(&be, p("attn_v.weight"))?,
                 wo: up(&be, p("attn_output.weight"))?,
-                wgate: up(&be, p("ffn_gate.weight"))?,
-                wup: up(&be, p("ffn_up.weight"))?,
+                wgateup,
                 wdown: up(&be, p("ffn_down.weight"))?,
             });
         }
@@ -238,11 +242,13 @@ impl Llama {
 
             // --- ffn (SwiGLU) ---
             let hn2 = rmsnorm_rows(&hidden, &layer.ffn_norm, t, ne, c.rms_eps);
-            let gate = self.lin(layer.wgate.as_ref(), &hn2, t, ne, c.n_ff);
-            let upp = self.lin(layer.wup.as_ref(), &hn2, t, ne, c.n_ff);
+            let gu = self.lin(layer.wgateup.as_ref(), &hn2, t, ne, 2 * c.n_ff);
             let mut act = vec![0f32; t * c.n_ff];
-            for i in 0..t * c.n_ff {
-                act[i] = silu(gate[i]) * upp[i];
+            for r in 0..t {
+                for i in 0..c.n_ff {
+                    let g = gu[r * 2 * c.n_ff + i];
+                    act[r * c.n_ff + i] = silu(g) * gu[r * 2 * c.n_ff + c.n_ff + i];
+                }
             }
             let down = self.lin(layer.wdown.as_ref(), &act, t, c.n_ff, ne);
             for i in 0..t * ne {
@@ -286,8 +292,7 @@ impl Llama {
         let attn = alloc(t * nh * hd, BufferUsage::Activations)?;
         let ao = alloc(t * ne, BufferUsage::Activations)?;
         let hn2 = alloc(t * ne, BufferUsage::Activations)?;
-        let gate = alloc(t * nff, BufferUsage::Activations)?;
-        let upb = alloc(t * nff, BufferUsage::Activations)?;
+        let gu = alloc(t * 2 * nff, BufferUsage::Activations)?;
         let act = alloc(t * nff, BufferUsage::Activations)?;
         let down = alloc(t * ne, BufferUsage::Activations)?;
         let logits = alloc(t * c.vocab, BufferUsage::Readback)?;
@@ -355,15 +360,14 @@ impl Llama {
                 c.rms_eps,
             );
             rec.linear(
-                layer.wgate.as_ref(),
+                layer.wgateup.as_ref(),
                 hn2.as_ref(),
-                gate.as_ref(),
+                gu.as_ref(),
                 t,
                 ne,
-                nff,
+                2 * nff,
             );
-            rec.linear(layer.wup.as_ref(), hn2.as_ref(), upb.as_ref(), t, ne, nff);
-            rec.silu_mul(gate.as_ref(), upb.as_ref(), act.as_ref(), t * nff);
+            rec.silu_mul_fused(gu.as_ref(), act.as_ref(), t, nff);
             rec.linear(
                 layer.wdown.as_ref(),
                 act.as_ref(),
@@ -463,8 +467,7 @@ impl Llama {
         let attn = alloc(n * nh * hd, BufferUsage::Activations)?;
         let ao = alloc(n * ne, BufferUsage::Activations)?;
         let hn2 = alloc(n * ne, BufferUsage::Activations)?;
-        let gate = alloc(n * nff, BufferUsage::Activations)?;
-        let upb = alloc(n * nff, BufferUsage::Activations)?;
+        let gu = alloc(n * 2 * nff, BufferUsage::Activations)?;
         let act = alloc(n * nff, BufferUsage::Activations)?;
         let down = alloc(n * ne, BufferUsage::Activations)?;
         let logits = alloc(n * c.vocab, BufferUsage::Readback)?;
@@ -535,15 +538,14 @@ impl Llama {
                 c.rms_eps,
             );
             rec.linear(
-                layer.wgate.as_ref(),
+                layer.wgateup.as_ref(),
                 hn2.as_ref(),
-                gate.as_ref(),
+                gu.as_ref(),
                 n,
                 ne,
-                nff,
+                2 * nff,
             );
-            rec.linear(layer.wup.as_ref(), hn2.as_ref(), upb.as_ref(), n, ne, nff);
-            rec.silu_mul(gate.as_ref(), upb.as_ref(), act.as_ref(), n * nff);
+            rec.silu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
             rec.linear(
                 layer.wdown.as_ref(),
                 act.as_ref(),

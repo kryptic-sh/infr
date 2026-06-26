@@ -404,6 +404,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Fused SwiGLU over a combined gate||up buffer `gu` `[rows, 2*nff]`:
+/// `y[r,i] = silu(gu[r,i]) * gu[r, nff+i]`.
+pub(crate) const SILU_MUL_FUSED_WGSL: &str = r#"
+struct PC { rows: u32, nff: u32 }
+var<immediate> pc: PC;
+@group(0) @binding(0) var<storage, read>       gu: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= pc.rows * pc.nff { return; }
+    let r = idx / pc.nff;
+    let i = idx % pc.nff;
+    let base = r * 2u * pc.nff;
+    let g = gu[base + i];
+    y[idx] = (g / (1.0 + exp(-g))) * gu[base + pc.nff + i];
+}
+"#;
+
 pub(crate) const ATTENTION_WGSL: &str = r#"
 struct PC { t: u32, nh: u32, nkv: u32, hd: u32 }
 var<immediate> pc: PC;

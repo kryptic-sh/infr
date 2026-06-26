@@ -140,7 +140,7 @@ pub(crate) fn destroy_compute_kernel(device: &ash::Device, k: &ComputeKernel) {
 
 impl VulkanBackend {
     /// Fetch-or-build a named kernel; returns a Copy of its handles.
-    fn kernel(
+    pub(crate) fn kernel(
         &self,
         name: &'static str,
         wgsl: &str,
@@ -330,7 +330,7 @@ impl VulkanBackend {
     }
 }
 
-const RMSNORM_WGSL: &str = r#"
+pub(crate) const RMSNORM_WGSL: &str = r#"
 struct PC { rows: u32, dim: u32, eps: f32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
@@ -348,7 +348,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-const ROPE_WGSL: &str = r#"
+pub(crate) const ROPE_WGSL: &str = r#"
 struct PC { t: u32, nheads: u32, hd: u32, rope_dim: u32, theta: f32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       x: array<f32>;
@@ -374,7 +374,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-const SILU_MUL_WGSL: &str = r#"
+pub(crate) const SILU_MUL_WGSL: &str = r#"
 struct PC { n: u32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       gate: array<f32>;
@@ -389,7 +389,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-const ADD_WGSL: &str = r#"
+pub(crate) const ADD_WGSL: &str = r#"
 struct PC { n: u32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       a: array<f32>;
@@ -403,7 +403,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-const ATTENTION_WGSL: &str = r#"
+pub(crate) const ATTENTION_WGSL: &str = r#"
 struct PC { t: u32, nh: u32, nkv: u32, hd: u32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       q: array<f32>;

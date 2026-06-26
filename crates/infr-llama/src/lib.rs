@@ -9,8 +9,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use anyhow::{anyhow, bail, Context, Result};
-use infr_core::backend::Buffer;
-use infr_core::WeightSource;
+use infr_core::backend::{Buffer, BufferUsage};
+use infr_core::{Backend, WeightSource};
 use infr_gguf::Gguf;
 use infr_vulkan::VulkanBackend;
 use std::path::Path;
@@ -34,6 +34,8 @@ pub struct Config {
 struct LayerWeights {
     attn_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
+    attn_norm_buf: Box<dyn Buffer>,
+    ffn_norm_buf: Box<dyn Buffer>,
     wq: Box<dyn Buffer>,
     wk: Box<dyn Buffer>,
     wv: Box<dyn Buffer>,
@@ -49,6 +51,7 @@ pub struct Llama {
     token_embd: Vec<f32>,     // [vocab, n_embd] host, for embedding gather
     lm_head: Box<dyn Buffer>, // [vocab, n_embd] on GPU (tied to token_embd unless output.weight)
     output_norm: Vec<f32>,
+    output_norm_buf: Box<dyn Buffer>,
     layers: Vec<LayerWeights>,
     tokenizer: Tokenizer,
 }
@@ -131,6 +134,9 @@ impl Llama {
             .map_err(|e| anyhow!("upload lm_head: {e}"))?;
 
         let (output_norm, _) = load_f32(&g, "output_norm.weight")?;
+        let output_norm_buf = be
+            .upload_weight(&output_norm)
+            .map_err(|e| anyhow!("upload output_norm: {e}"))?;
 
         let mut layers = Vec::with_capacity(n_layer);
         for l in 0..n_layer {
@@ -140,9 +146,19 @@ impl Llama {
                 be.upload_weight(&d)
                     .map_err(|e| anyhow!("upload {name}: {e}"))
             };
+            let attn_norm = load_f32(&g, &p("attn_norm.weight"))?.0;
+            let ffn_norm = load_f32(&g, &p("ffn_norm.weight"))?.0;
+            let attn_norm_buf = be
+                .upload_weight(&attn_norm)
+                .map_err(|e| anyhow!("upload attn_norm {l}: {e}"))?;
+            let ffn_norm_buf = be
+                .upload_weight(&ffn_norm)
+                .map_err(|e| anyhow!("upload ffn_norm {l}: {e}"))?;
             layers.push(LayerWeights {
-                attn_norm: load_f32(&g, &p("attn_norm.weight"))?.0,
-                ffn_norm: load_f32(&g, &p("ffn_norm.weight"))?.0,
+                attn_norm,
+                ffn_norm,
+                attn_norm_buf,
+                ffn_norm_buf,
                 wq: up(&be, p("attn_q.weight"))?,
                 wk: up(&be, p("attn_k.weight"))?,
                 wv: up(&be, p("attn_v.weight"))?,
@@ -175,6 +191,7 @@ impl Llama {
             token_embd,
             lm_head,
             output_norm,
+            output_norm_buf,
             layers,
             tokenizer,
         })
@@ -231,6 +248,130 @@ impl Llama {
         self.lin(self.lm_head.as_ref(), &normed, 1, ne, c.vocab)
     }
 
+    /// GPU-resident forward: records the whole stack into one command buffer (one submit),
+    /// all ops on the GPU. Returns logits (`vocab`) for the last position. Much fewer
+    /// GPU round-trips than `forward` (which submits per linear).
+    pub fn forward_resident(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let t = tokens.len();
+        let (ne, nh, nkv, hd, nff) = (c.n_embd, c.n_head, c.n_kv, c.head_dim, c.n_ff);
+
+        let mut hidden_host = vec![0f32; t * ne];
+        for (i, &tok) in tokens.iter().enumerate() {
+            hidden_host[i * ne..(i + 1) * ne]
+                .copy_from_slice(&self.token_embd[tok as usize * ne..(tok as usize + 1) * ne]);
+        }
+
+        let alloc = |n: usize, usage: BufferUsage| -> Result<Box<dyn Buffer>> {
+            self.be
+                .alloc((n * 4).max(4), usage)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        let hidden = alloc(t * ne, BufferUsage::Staging)?;
+        self.be
+            .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
+            .map_err(|e| anyhow!("{e}"))?;
+        let hn = alloc(t * ne, BufferUsage::Activations)?;
+        let q = alloc(t * nh * hd, BufferUsage::Activations)?;
+        let k = alloc(t * nkv * hd, BufferUsage::Activations)?;
+        let v = alloc(t * nkv * hd, BufferUsage::Activations)?;
+        let attn = alloc(t * nh * hd, BufferUsage::Activations)?;
+        let ao = alloc(t * ne, BufferUsage::Activations)?;
+        let hn2 = alloc(t * ne, BufferUsage::Activations)?;
+        let gate = alloc(t * nff, BufferUsage::Activations)?;
+        let upb = alloc(t * nff, BufferUsage::Activations)?;
+        let act = alloc(t * nff, BufferUsage::Activations)?;
+        let down = alloc(t * ne, BufferUsage::Activations)?;
+        let logits = alloc(t * c.vocab, BufferUsage::Readback)?;
+
+        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        for layer in &self.layers {
+            rec.rmsnorm(
+                hidden.as_ref(),
+                layer.attn_norm_buf.as_ref(),
+                hn.as_ref(),
+                t,
+                ne,
+                c.rms_eps,
+            );
+            rec.linear(layer.wq.as_ref(), hn.as_ref(), q.as_ref(), t, ne, nh * hd);
+            rec.linear(layer.wk.as_ref(), hn.as_ref(), k.as_ref(), t, ne, nkv * hd);
+            rec.linear(layer.wv.as_ref(), hn.as_ref(), v.as_ref(), t, ne, nkv * hd);
+            rec.rope(q.as_ref(), q.as_ref(), t, nh, hd, c.rope_dim, c.rope_theta);
+            rec.rope(k.as_ref(), k.as_ref(), t, nkv, hd, c.rope_dim, c.rope_theta);
+            rec.attention(
+                q.as_ref(),
+                k.as_ref(),
+                v.as_ref(),
+                attn.as_ref(),
+                t,
+                nh,
+                nkv,
+                hd,
+            );
+            rec.linear(
+                layer.wo.as_ref(),
+                attn.as_ref(),
+                ao.as_ref(),
+                t,
+                nh * hd,
+                ne,
+            );
+            rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), t * ne);
+            rec.rmsnorm(
+                hidden.as_ref(),
+                layer.ffn_norm_buf.as_ref(),
+                hn2.as_ref(),
+                t,
+                ne,
+                c.rms_eps,
+            );
+            rec.linear(
+                layer.wgate.as_ref(),
+                hn2.as_ref(),
+                gate.as_ref(),
+                t,
+                ne,
+                nff,
+            );
+            rec.linear(layer.wup.as_ref(), hn2.as_ref(), upb.as_ref(), t, ne, nff);
+            rec.silu_mul(gate.as_ref(), upb.as_ref(), act.as_ref(), t * nff);
+            rec.linear(
+                layer.wdown.as_ref(),
+                act.as_ref(),
+                down.as_ref(),
+                t,
+                nff,
+                ne,
+            );
+            rec.add(hidden.as_ref(), down.as_ref(), hidden.as_ref(), t * ne);
+        }
+        rec.rmsnorm(
+            hidden.as_ref(),
+            self.output_norm_buf.as_ref(),
+            hn.as_ref(),
+            t,
+            ne,
+            c.rms_eps,
+        );
+        rec.linear(
+            self.lm_head.as_ref(),
+            hn.as_ref(),
+            logits.as_ref(),
+            t,
+            ne,
+            c.vocab,
+        );
+        rec.finish().map_err(|e| anyhow!("{e}"))?;
+
+        let mut bytes = vec![0u8; t * c.vocab * 4];
+        self.be
+            .download(logits.as_ref(), &mut bytes)
+            .map_err(|e| anyhow!("{e}"))?;
+        let all: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+        Ok(all[(t - 1) * c.vocab..].to_vec())
+    }
+
     /// Greedy generate up to `max_new` tokens after `prompt` (already a chat-formatted string).
     pub fn generate(
         &self,
@@ -245,7 +386,7 @@ impl Llama {
         let mut tokens: Vec<u32> = enc.get_ids().to_vec();
         let start = tokens.len();
         for _ in 0..max_new {
-            let logits = self.forward(&tokens);
+            let logits = self.forward_resident(&tokens)?;
             let next = argmax(&logits) as u32;
             if next == self.cfg.eos {
                 break;

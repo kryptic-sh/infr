@@ -19,7 +19,7 @@ use infr_core::{
 
 use super::{as_vk_buf, be, VulkanBackend};
 
-const LINEAR_WGSL: &str = r#"
+pub(crate) const LINEAR_WGSL: &str = r#"
 struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
 var<immediate> pc: PushConstants;
 

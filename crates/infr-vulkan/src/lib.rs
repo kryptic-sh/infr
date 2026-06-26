@@ -9,6 +9,9 @@
 mod linear;
 mod matmul;
 mod ops;
+mod recorder;
+
+pub use recorder::Recorder;
 
 use std::collections::HashMap;
 use std::ffi::CStr;

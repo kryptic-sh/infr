@@ -29,6 +29,8 @@ pub struct Config {
     pub rms_eps: f32,
     pub vocab: usize,
     pub eos: u32,
+    /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
+    pub qk_norm: bool,
 }
 
 struct LayerWeights {
@@ -42,6 +44,8 @@ struct LayerWeights {
     wo: Box<dyn Buffer>,
     wgateup: Box<dyn Buffer>, // fused [2*n_ff, n_embd] = concat(gate, up)
     wdown: Box<dyn Buffer>,
+    q_norm_buf: Option<Box<dyn Buffer>>, // qwen3 QK-norm weights [head_dim]
+    k_norm_buf: Option<Box<dyn Buffer>>,
 }
 
 pub struct Llama {
@@ -82,7 +86,11 @@ fn load_f32(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
             .chunks_exact(2)
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect(),
-        other => bail!("unsupported dtype {other:?} for {name} (bring-up wants F16/F32 weights)"),
+        infr_core::DType::Bf16 => bytes
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
+        other => bail!("unsupported dtype {other:?} for {name} (bring-up wants F16/F32/BF16)"),
     };
     Ok((v, info.shape))
 }
@@ -106,7 +114,18 @@ fn f16_bytes(g: &Gguf, name: &str) -> Result<Vec<u8>> {
                 .collect();
             Ok(bytemuck::cast_slice(&f16).to_vec())
         }
-        other => bail!("unsupported dtype {other:?} for {name} (bring-up wants F16/F32)"),
+        infr_core::DType::Bf16 => {
+            // bf16 → f32 → f16 (bf16 is the top 16 bits of f32)
+            let f16: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| {
+                    let f = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
+                    half::f16::from_f32(f).to_bits()
+                })
+                .collect();
+            Ok(bytemuck::cast_slice(&f16).to_vec())
+        }
+        other => bail!("unsupported dtype {other:?} for {name} (bring-up wants F16/F32/BF16)"),
     }
 }
 
@@ -117,22 +136,32 @@ impl Llama {
 
     pub fn load(gguf_path: &Path, tokenizer_path: &Path) -> Result<Self> {
         let g = Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?;
-        let arch = g.metadata().str("general.architecture").unwrap_or("");
-        if arch != "llama" {
-            bail!("infr-llama expects architecture=llama, got {arch:?}");
-        }
-        let n_layer = meta_u64(&g, "llama.block_count").context("block_count")? as usize;
-        let n_embd = meta_u64(&g, "llama.embedding_length").context("embedding_length")? as usize;
-        let n_head = meta_u64(&g, "llama.attention.head_count").context("head_count")? as usize;
-        let n_kv = meta_u64(&g, "llama.attention.head_count_kv").unwrap_or(n_head as u64) as usize;
+        let arch = g
+            .metadata()
+            .str("general.architecture")
+            .unwrap_or("")
+            .to_string();
+        // llama and qwen3 share the transformer; qwen3 adds QK-norm + explicit head_dim.
+        let qk_norm = match arch.as_str() {
+            "llama" | "qwen3" => arch == "qwen3",
+            other => bail!("infr-llama supports architecture=llama|qwen3, got {other:?}"),
+        };
+        let mk = |k: &str| format!("{arch}.{k}");
+        let n_layer = meta_u64(&g, &mk("block_count")).context("block_count")? as usize;
+        let n_embd = meta_u64(&g, &mk("embedding_length")).context("embedding_length")? as usize;
+        let n_head = meta_u64(&g, &mk("attention.head_count")).context("head_count")? as usize;
+        let n_kv = meta_u64(&g, &mk("attention.head_count_kv")).unwrap_or(n_head as u64) as usize;
         let n_ff =
-            meta_u64(&g, "llama.feed_forward_length").context("feed_forward_length")? as usize;
-        let head_dim = n_embd / n_head;
+            meta_u64(&g, &mk("feed_forward_length")).context("feed_forward_length")? as usize;
+        // head_dim: explicit (qwen3 key_length) or n_embd/n_head (llama). Note q_dim = n_head*head_dim
+        // may differ from n_embd (qwen3-0.6B: 16*128=2048 vs embd 1024).
+        let head_dim =
+            meta_u64(&g, &mk("attention.key_length")).unwrap_or((n_embd / n_head) as u64) as usize;
         let rope_dim =
-            meta_u64(&g, "llama.rope.dimension_count").unwrap_or(head_dim as u64) as usize;
+            meta_u64(&g, &mk("rope.dimension_count")).unwrap_or(head_dim as u64) as usize;
         let rope_theta = g
             .metadata()
-            .get("llama.rope.freq_base")
+            .get(&mk("rope.freq_base"))
             .and_then(|v| match v {
                 infr_core::MetaValue::F64(f) => Some(*f as f32),
                 infr_core::MetaValue::U64(u) => Some(*u as f32),
@@ -141,7 +170,7 @@ impl Llama {
             .unwrap_or(10000.0);
         let rms_eps = g
             .metadata()
-            .get("llama.attention.layer_norm_rms_epsilon")
+            .get(&mk("attention.layer_norm_rms_epsilon"))
             .and_then(|v| match v {
                 infr_core::MetaValue::F64(f) => Some(*f as f32),
                 _ => None,
@@ -187,6 +216,20 @@ impl Llama {
             let wgateup = be
                 .upload_weight_bytes(&gateup)
                 .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?;
+            let (q_norm_buf, k_norm_buf) = if qk_norm {
+                (
+                    Some(
+                        be.upload_weight(&load_f32(&g, &p("attn_q_norm.weight"))?.0)
+                            .map_err(|e| anyhow!("upload q_norm {l}: {e}"))?,
+                    ),
+                    Some(
+                        be.upload_weight(&load_f32(&g, &p("attn_k_norm.weight"))?.0)
+                            .map_err(|e| anyhow!("upload k_norm {l}: {e}"))?,
+                    ),
+                )
+            } else {
+                (None, None)
+            };
             layers.push(LayerWeights {
                 attn_norm,
                 ffn_norm,
@@ -198,6 +241,8 @@ impl Llama {
                 wo: up(&be, p("attn_output.weight"))?,
                 wgateup,
                 wdown: up(&be, p("ffn_down.weight"))?,
+                q_norm_buf,
+                k_norm_buf,
             });
         }
 
@@ -216,6 +261,7 @@ impl Llama {
             rms_eps,
             vocab,
             eos,
+            qk_norm,
         };
         Ok(Self {
             be,
@@ -484,6 +530,18 @@ impl Llama {
         let attn = alloc(n * nh * hd, BufferUsage::Activations)?;
         let act = alloc(n * nff, BufferUsage::Activations)?;
         let logits = alloc(n * c.vocab, BufferUsage::Readback)?;
+        let kvrow = nkv * hd;
+        // qwen3 (QK-norm) uses an un-fused attention input: raw Q/K/V projections then a separate
+        // per-head RMSNorm+RoPE. (Llama uses the single fused attn_in instead.)
+        let qkv_raw = if c.qk_norm {
+            Some((
+                alloc(n * nh * hd, BufferUsage::Activations)?,
+                alloc(n * kvrow, BufferUsage::Activations)?,
+                alloc(n * kvrow, BufferUsage::Activations)?,
+            ))
+        } else {
+            None
+        };
 
         // Flash-decoding: for single-token decode at long context, split each head's KV range
         // across many workgroups (partials in pm/pl/pacc), so attention isn't stuck on `nh`
@@ -506,25 +564,72 @@ impl Llama {
         let t_rec = std::time::Instant::now();
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
         for (li, layer) in self.layers.iter().enumerate() {
-            rec.attn_in(
-                hidden.as_ref(),
-                layer.attn_norm_buf.as_ref(),
-                layer.wq.as_ref(),
-                layer.wk.as_ref(),
-                layer.wv.as_ref(),
-                q.as_ref(),
-                kv.k[li].as_ref(),
-                kv.v[li].as_ref(),
-                n,
-                ne,
-                nh,
-                nkv,
-                hd,
-                c.rope_dim,
-                c.rope_theta,
-                pos,
-                c.rms_eps,
-            );
+            if let Some((qr, kr, vr)) = &qkv_raw {
+                // qwen3: rmsnorm → Q/K/V projections → per-head QK-norm+RoPE (K/V into the cache)
+                rec.rmsnorm(
+                    hidden.as_ref(),
+                    layer.attn_norm_buf.as_ref(),
+                    hn.as_ref(),
+                    n,
+                    ne,
+                    c.rms_eps,
+                );
+                rec.linear(layer.wq.as_ref(), hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
+                rec.linear(layer.wk.as_ref(), hn.as_ref(), kr.as_ref(), n, ne, kvrow);
+                rec.linear(layer.wv.as_ref(), hn.as_ref(), vr.as_ref(), n, ne, kvrow);
+                rec.qk_norm_rope(
+                    qr.as_ref(),
+                    layer.q_norm_buf.as_ref().unwrap().as_ref(),
+                    q.as_ref(),
+                    n,
+                    nh,
+                    hd,
+                    c.rope_dim,
+                    c.rope_theta,
+                    pos,
+                    0,
+                    c.rms_eps,
+                );
+                rec.qk_norm_rope(
+                    kr.as_ref(),
+                    layer.k_norm_buf.as_ref().unwrap().as_ref(),
+                    kv.k[li].as_ref(),
+                    n,
+                    nkv,
+                    hd,
+                    c.rope_dim,
+                    c.rope_theta,
+                    pos,
+                    pos,
+                    c.rms_eps,
+                );
+                rec.copy(
+                    vr.as_ref(),
+                    kv.v[li].as_ref(),
+                    pos * kvrow * 4,
+                    n * kvrow * 4,
+                );
+            } else {
+                rec.attn_in(
+                    hidden.as_ref(),
+                    layer.attn_norm_buf.as_ref(),
+                    layer.wq.as_ref(),
+                    layer.wk.as_ref(),
+                    layer.wv.as_ref(),
+                    q.as_ref(),
+                    kv.k[li].as_ref(),
+                    kv.v[li].as_ref(),
+                    n,
+                    ne,
+                    nh,
+                    nkv,
+                    hd,
+                    c.rope_dim,
+                    c.rope_theta,
+                    pos,
+                    c.rms_eps,
+                );
+            }
             if let Some((pm, pl, pacc)) = &split_bufs {
                 rec.attention_kv_split(
                     q.as_ref(),

@@ -496,6 +496,45 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Qwen3 QK-norm + RoPE over `x[rows, nheads, hd]` → `y` at rows `out_base..`. `nw` is the
+    /// per-head [hd] norm weight. (q: out_base=0; k: out_base=pos so it lands in the cache.)
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope(
+        &self,
+        x: &dyn Buffer,
+        nw: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        eps: f32,
+    ) {
+        self.stamp("qk_norm_rope");
+        let k = self
+            .be
+            .kernel("qk_norm_rope", ops::QK_NORM_ROPE_WGSL, 3, 32);
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&(rope_pos as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
     /// Flash-decoding attention (q_len==1): split the KV range into `n_chunks` chunks of `chunk`,
     /// compute per-chunk softmax partials in parallel (`pm`/`pl`/`pacc`), then combine into `o`.
     /// Parallelizes attention across `nh*n_chunks` workgroups so it stays fast at long context.

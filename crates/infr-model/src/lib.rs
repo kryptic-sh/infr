@@ -7,12 +7,7 @@
 //! 512 (full) / 256 (swa), canvas_length 256, mask_token 4. See PLAN.md "DiffusionGemma spec".
 #![allow(dead_code, unused_variables)]
 
-use infr_core::{
-    backend::Capabilities,
-    error::Result,
-    graph::Graph,
-    WeightSource,
-};
+use infr_core::{backend::Capabilities, error::Result, graph::Graph, WeightSource};
 
 /// Static model shape read from GGUF metadata.
 #[derive(Clone, Debug, Default)]

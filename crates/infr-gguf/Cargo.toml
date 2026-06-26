@@ -12,3 +12,6 @@ half.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

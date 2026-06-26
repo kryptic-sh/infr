@@ -15,3 +15,6 @@ indicatif.workspace = true
 dirs.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

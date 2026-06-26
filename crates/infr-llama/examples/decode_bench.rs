@@ -18,11 +18,20 @@ fn main() -> anyhow::Result<()> {
     let mut kv = llama.new_kv(max_ctx)?;
     let mut pos = 0usize;
     for &depth in &milestones {
+        let tp = std::time::Instant::now();
+        let start = pos;
         while pos < depth {
-            let chunk = (depth - pos).min(256);
+            let chunk = llama.prefill_chunk(pos).min(depth - pos);
             let toks: Vec<u32> = (0..chunk).map(|i| ((pos + i) % 100) as u32).collect();
             let _ = llama.forward_resident_kv(&toks, &mut kv)?;
             pos += chunk;
+        }
+        let pdt = tp.elapsed().as_secs_f64();
+        if pos > start {
+            println!(
+                "prefill {start:5}->{depth:5}: {:.1} tok/s",
+                (pos - start) as f64 / pdt
+            );
         }
         let iters = 24;
         let t = std::time::Instant::now();

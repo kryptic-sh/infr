@@ -771,6 +771,12 @@ impl Llama {
         let alloc = |m: usize, u: BufferUsage| -> Result<Box<dyn Buffer>> {
             self.be.alloc((m * 4).max(4), u).map_err(|e| anyhow!("{e}"))
         };
+        // Prefill (many tokens) reuses each weight across all rows → a coopmat GEMM (matmul_proj)
+        // beats the per-row GEMV and lets one submit cover a big chunk without tripping the GPU
+        // watchdog. Decode (n==1) and Llama stay on the fused GEMV path. GEMM writes ceil(n/64)*64
+        // rows (extra rows are 0), so its output buffers are M-padded to mpad.
+        let use_gemm = c.qk_norm && n >= 64 && std::env::var("INFR_NOGEMM").is_err();
+        let mpad = if use_gemm { n.div_ceil(64) * 64 } else { n };
         let hidden = alloc(n * ne, BufferUsage::Staging)?;
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
@@ -793,9 +799,21 @@ impl Llama {
         // per-head RMSNorm+RoPE. (Llama uses the single fused attn_in instead.)
         let qkv_raw = if c.qk_norm {
             Some((
-                alloc(n * nh * hd, BufferUsage::Activations)?,
-                alloc(n * kvrow, BufferUsage::Activations)?,
-                alloc(n * kvrow, BufferUsage::Activations)?,
+                alloc(mpad * nh * hd, BufferUsage::Activations)?,
+                alloc(mpad * kvrow, BufferUsage::Activations)?,
+                alloc(mpad * kvrow, BufferUsage::Activations)?,
+            ))
+        } else {
+            None
+        };
+        // GEMM-prefill scratch: o-proj out (ao), gate/up out (gu), down out (down), all M-padded;
+        // plus a tiny dummy buffer bound as scales/mins when the weight is f16 (unused there).
+        let gemm_bufs = if use_gemm {
+            Some((
+                alloc(mpad * ne, BufferUsage::Activations)?,
+                alloc(mpad * 2 * nff, BufferUsage::Activations)?,
+                alloc(mpad * ne, BufferUsage::Activations)?,
+                alloc(1, BufferUsage::Activations)?,
             ))
         } else {
             None
@@ -903,6 +921,33 @@ impl Llama {
                 *blk_shift,
             ),
         };
+        // coopmat GEMM `c = a · Wᵀ` for prefill; binds the dummy buffer as scales/mins for f16.
+        let mm = |w: &Wt, a: &dyn Buffer, cbuf: &dyn Buffer, rows: usize, k: usize, outf: usize| {
+            let dummy = gemm_bufs.as_ref().unwrap().3.as_ref();
+            match w {
+                Wt::F16(b) => {
+                    rec.matmul_proj(a, b.as_ref(), dummy, dummy, cbuf, rows, k, outf, 16, 0)
+                }
+                Wt::Q {
+                    q,
+                    s,
+                    m,
+                    bits,
+                    blk_shift,
+                } => rec.matmul_proj(
+                    a,
+                    q.as_ref(),
+                    s.as_ref(),
+                    m.as_ref(),
+                    cbuf,
+                    rows,
+                    k,
+                    outf,
+                    *bits,
+                    *blk_shift,
+                ),
+            }
+        };
         for (li, layer) in self.layers.iter().enumerate() {
             if let Some((qr, kr, vr)) = &qkv_raw {
                 // qwen3: rmsnorm → Q/K/V projections → per-head QK-norm+RoPE (K/V into the cache)
@@ -914,9 +959,15 @@ impl Llama {
                     ne,
                     c.rms_eps,
                 );
-                lin(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
-                lin(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
-                lin(&layer.wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow);
+                if use_gemm {
+                    mm(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
+                    mm(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
+                    mm(&layer.wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow);
+                } else {
+                    lin(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
+                    lin(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
+                    lin(&layer.wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow);
+                }
                 rec.qk_norm_rope(
                     qr.as_ref(),
                     layer.q_norm_buf.as_ref().unwrap().as_ref(),
@@ -996,34 +1047,54 @@ impl Llama {
                     pos,
                 );
             }
-            lin_add(
-                &layer.wo,
-                attn.as_ref(),
-                hidden.as_ref(),
-                hidden.as_ref(),
-                n,
-                nh * hd,
-                ne,
-            );
-            ffn(
-                hidden.as_ref(),
-                layer.ffn_norm_buf.as_ref(),
-                &layer.wgateup,
-                act.as_ref(),
-                n,
-                ne,
-                nff,
-                c.rms_eps,
-            );
-            lin_add(
-                &layer.wdown,
-                act.as_ref(),
-                hidden.as_ref(),
-                hidden.as_ref(),
-                n,
-                nff,
-                ne,
-            );
+            if use_gemm {
+                let (ao, gu, down, _) = gemm_bufs.as_ref().unwrap();
+                // o-proj via GEMM then residual add (matmul_proj can't fuse the residual).
+                mm(&layer.wo, attn.as_ref(), ao.as_ref(), n, nh * hd, ne);
+                rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), n * ne);
+                // FFN un-fused: rmsnorm → gate/up GEMM → SwiGLU → down GEMM → residual add.
+                rec.rmsnorm(
+                    hidden.as_ref(),
+                    layer.ffn_norm_buf.as_ref(),
+                    hn.as_ref(),
+                    n,
+                    ne,
+                    c.rms_eps,
+                );
+                mm(&layer.wgateup, hn.as_ref(), gu.as_ref(), n, ne, 2 * nff);
+                rec.silu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
+                mm(&layer.wdown, act.as_ref(), down.as_ref(), n, nff, ne);
+                rec.add(hidden.as_ref(), down.as_ref(), hidden.as_ref(), n * ne);
+            } else {
+                lin_add(
+                    &layer.wo,
+                    attn.as_ref(),
+                    hidden.as_ref(),
+                    hidden.as_ref(),
+                    n,
+                    nh * hd,
+                    ne,
+                );
+                ffn(
+                    hidden.as_ref(),
+                    layer.ffn_norm_buf.as_ref(),
+                    &layer.wgateup,
+                    act.as_ref(),
+                    n,
+                    ne,
+                    nff,
+                    c.rms_eps,
+                );
+                lin_add(
+                    &layer.wdown,
+                    act.as_ref(),
+                    hidden.as_ref(),
+                    hidden.as_ref(),
+                    n,
+                    nff,
+                    ne,
+                );
+            }
         }
         // final norm + lm_head on the LAST row only: copy hidden[n-1] → hlast, norm it, project.
         rec.copy(hidden.as_ref(), (n - 1) * ne * 4, hlast.as_ref(), 0, ne * 4);
@@ -1054,6 +1125,21 @@ impl Llama {
         Ok(bytemuck::cast_slice(&bytes).to_vec())
     }
 
+    /// Prefill chunk size at cache position `pos`. One chunk = one GPU submit; its cost grows with
+    /// chunk×context, so a fixed chunk trips the watchdog (device-lost) at long context. Keep the
+    /// per-submit work roughly constant by shrinking the chunk as context grows. Qwen3 (coopmat
+    /// GEMM, cheap projections) gets a bigger budget than Llama (GEMV). Rounded to a multiple of 64
+    /// for the GEMM tiling, floored at 64.
+    pub fn prefill_chunk(&self, pos: usize) -> usize {
+        let budget = if self.cfg.qk_norm {
+            1_000_000
+        } else {
+            256 * 64
+        };
+        let raw = (budget / (pos + 1)).clamp(64, 512);
+        (raw / 64 * 64).max(64)
+    }
+
     /// Greedy generate up to `max_new` tokens after `prompt` (already a chat-formatted string).
     pub fn generate(
         &self,
@@ -1076,11 +1162,10 @@ impl Llama {
         // the watchdog. (A real GEMM prefill path would let chunks be large; GEMV is the current
         // limit — see coopmat-prefill TODO.) Only the last chunk's logits matter.
         let len = prompt_tokens.len();
-        let chunk = if len <= 2048 { len } else { 256 };
         let mut logits = Vec::new();
         let mut i = 0;
         while i < len {
-            let end = (i + chunk).min(len);
+            let end = (i + self.prefill_chunk(i)).min(len);
             logits = self.forward_resident_kv(&prompt_tokens[i..end], &mut kv)?;
             i = end;
         }

@@ -1365,18 +1365,8 @@ impl Llama {
         (raw / 64 * 64).max(64)
     }
 
-    /// Prefill `new_tokens` into `kv`, then greedily decode up to `max_new` tokens (stop at EOS),
-    /// streaming each decoded piece to `on_token`. Returns the generated token ids. `kv` carries the
-    /// context, so repeated calls on the same `kv` continue one conversation. The EOS token is not
-    /// appended to the cache.
-    fn run_in_cache(
-        &self,
-        new_tokens: &[u32],
-        kv: &mut KvCache,
-        max_new: usize,
-        mut on_token: impl FnMut(&str),
-    ) -> Result<Vec<u32>> {
-        // Prefill in chunks sized by context depth (kv.len) to stay under the GPU watchdog.
+    /// Prefill `new_tokens` into `kv` in watchdog-sized chunks, returning the last-token logits.
+    fn prefill(&self, new_tokens: &[u32], kv: &mut KvCache) -> Result<Vec<f32>> {
         let len = new_tokens.len();
         let mut logits = Vec::new();
         let mut i = 0;
@@ -1385,6 +1375,31 @@ impl Llama {
             logits = self.forward_resident_kv(&new_tokens[i..end], kv)?;
             i = end;
         }
+        Ok(logits)
+    }
+
+    /// Prefill `new_tokens` into `kv`, then decode up to `max_new` tokens (stop at any EOS), streaming
+    /// each decoded piece to `on_token`. Returns the generated token ids. `kv` carries the context, so
+    /// repeated calls continue one conversation. The EOS token is not appended to the cache.
+    fn run_in_cache(
+        &self,
+        new_tokens: &[u32],
+        kv: &mut KvCache,
+        max_new: usize,
+        on_token: impl FnMut(&str),
+    ) -> Result<Vec<u32>> {
+        let logits = self.prefill(new_tokens, kv)?;
+        self.decode_loop(logits, kv, max_new, on_token)
+    }
+
+    /// Greedy/sampled decode loop from `logits` (the next-token distribution), appending to `kv`.
+    fn decode_loop(
+        &self,
+        mut logits: Vec<f32>,
+        kv: &mut KvCache,
+        max_new: usize,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<Vec<u32>> {
         let sampler = self.sampler.get();
         // xorshift64 seed (non-zero); varies per call so sampling isn't fixed across turns.
         let mut rng = std::time::SystemTime::now()
@@ -1508,9 +1523,31 @@ impl ChatSession<'_> {
             );
         }
         self.started = true;
+        // Prefill the user turn; remember where the assistant's generation begins.
+        let logits = self.llama.prefill(toks, &mut self.kv)?;
+        let answer_start = self.kv.len;
         let generated = self
             .llama
-            .run_in_cache(toks, &mut self.kv, max_new, on_token)?;
+            .decode_loop(logits, &mut self.kv, max_new, on_token)?;
+
+        // Keep only the ANSWER in history, not the model's <think>…</think> reasoning: Qwen3
+        // explicitly excludes prior-turn thinking from context, and keeping it accumulates and
+        // degrades the model (it starts emitting only-think then stopping). Rewind the cache to
+        // before this generation and re-prefill just the answer (recomputed without the think in
+        // context). Answer = tokens after the last </think>; only-think (unterminated) → keep none;
+        // no <think> at all → keep everything (a direct answer).
+        let tk = &self.llama.tokenizer;
+        let close = tk.token_to_id("</think>");
+        let open = tk.token_to_id("<think>");
+        let answer: Vec<u32> = match close.and_then(|c| generated.iter().rposition(|&t| t == c)) {
+            Some(pos) => generated[pos + 1..].to_vec(),
+            None if open.is_some_and(|o| generated.contains(&o)) => Vec::new(),
+            None => generated.clone(),
+        };
+        self.kv.len = answer_start; // drop the just-generated think+answer from the cache
+        if !answer.is_empty() {
+            self.llama.prefill(&answer, &mut self.kv)?;
+        }
         self.llama
             .tokenizer
             .decode(&generated, true)

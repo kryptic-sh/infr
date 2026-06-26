@@ -44,6 +44,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// Like `LINEAR_WGSL` but adds a residual: `y = residual + x·Wᵀ`. `r_buf` and `y_buf` may alias
+/// (in-place residual): each invocation reads and writes only index `idx`, so it is safe.
+pub(crate) const LINEAR_RES_WGSL: &str = r#"
+struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
+var<immediate> pc: PushConstants;
+
+@group(0) @binding(0) var<storage, read>       w_buf: array<f32>; // [out, in]
+@group(0) @binding(1) var<storage, read>       x_buf: array<f32>; // [rows, in]
+@group(0) @binding(2) var<storage, read>       r_buf: array<f32>; // [rows, out] residual
+@group(0) @binding(3) var<storage, read_write> y_buf: array<f32>; // [rows, out]
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let total = pc.rows * pc.out_f;
+    if idx >= total { return; }
+    let r = idx / pc.out_f;
+    let o = idx % pc.out_f;
+    let wbase = o * pc.in_f;
+    let xbase = r * pc.in_f;
+    var acc: f32 = 0.0;
+    for (var i: u32 = 0u; i < pc.in_f; i = i + 1u) {
+        acc = acc + w_buf[wbase + i] * x_buf[xbase + i];
+    }
+    y_buf[idx] = r_buf[idx] + acc;
+}
+"#;
+
 static LINEAR_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
 fn linear_spv() -> &'static [u32] {

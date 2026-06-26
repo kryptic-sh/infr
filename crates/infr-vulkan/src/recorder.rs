@@ -6,6 +6,9 @@
 //! Buffers are caller-owned `Box<dyn Buffer>` (from `Backend::alloc`); the recorder only
 //! binds them. Reuses the cached kernels in `VulkanShared.kernels`.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
+
 use ash::vk;
 
 use infr_core::{backend::Buffer, error::Result};
@@ -17,6 +20,17 @@ pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
     pool: vk::DescriptorPool,
+    /// Buffers written since the last barrier (for read-after-write / write-after-write detection).
+    dirty_writes: RefCell<HashSet<vk::Buffer>>,
+    /// Buffers read since the last barrier (for write-after-read detection).
+    dirty_reads: RefCell<HashSet<vk::Buffer>>,
+    /// Whether any un-barriered write was produced by a transfer (copy) rather than a shader.
+    dirty_transfer: std::cell::Cell<bool>,
+    barriers: RefCell<usize>,
+    /// Debug knobs, read once (avoid env lookups in the per-dispatch hot path).
+    no_barrier: bool,
+    full_barrier: bool,
+    prof: bool,
 }
 
 impl<'a> Recorder<'a> {
@@ -60,10 +74,84 @@ impl<'a> Recorder<'a> {
             be: backend,
             cmd,
             pool,
+            dirty_writes: RefCell::new(HashSet::new()),
+            dirty_reads: RefCell::new(HashSet::new()),
+            dirty_transfer: std::cell::Cell::new(false),
+            barriers: RefCell::new(0),
+            no_barrier: std::env::var("INFR_NOBARRIER").is_ok(),
+            full_barrier: std::env::var("INFR_FULLBARRIER").is_ok(),
+            prof: std::env::var("INFR_PROF").is_ok(),
         })
     }
 
-    fn dispatch(&self, k: ComputeKernel, buffers: &[vk::Buffer], push: &[u8], groups: u32) {
+    /// Emit a global compute/transfer barrier only if `reads`/`writes` collide with work recorded
+    /// since the last barrier (RAW / WAR / WAW). Independent dispatches then overlap on the GPU.
+    /// `dst_transfer` = this op consumes via a transfer (copy) rather than a compute shader.
+    /// Returns once any required barrier is recorded; updates the hazard-tracking sets.
+    fn sync(&self, reads: &[vk::Buffer], writes: &[vk::Buffer], dst_transfer: bool) {
+        if self.no_barrier {
+            return;
+        }
+        let dw = self.dirty_writes.borrow();
+        let dr = self.dirty_reads.borrow();
+        let raw = self.full_barrier || reads.iter().any(|b| dw.contains(b));
+        let waw = writes.iter().any(|b| dw.contains(b));
+        let war = writes.iter().any(|b| dr.contains(b));
+        drop(dw);
+        drop(dr);
+        if raw || waw || war {
+            let mb = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ
+                        | vk::AccessFlags::SHADER_WRITE
+                        | vk::AccessFlags::TRANSFER_READ
+                        | vk::AccessFlags::TRANSFER_WRITE,
+                );
+            // Only widen the (expensive) stage mask to TRANSFER when a copy is actually on the
+            // producing or consuming side — most barriers are pure compute→compute.
+            let mut src = vk::PipelineStageFlags::COMPUTE_SHADER;
+            if self.dirty_transfer.get() {
+                src |= vk::PipelineStageFlags::TRANSFER;
+            }
+            let mut dst = vk::PipelineStageFlags::COMPUTE_SHADER;
+            if dst_transfer {
+                dst |= vk::PipelineStageFlags::TRANSFER;
+            }
+            unsafe {
+                self.be.shared.device.cmd_pipeline_barrier(
+                    self.cmd,
+                    src,
+                    dst,
+                    vk::DependencyFlags::empty(),
+                    &[mb],
+                    &[],
+                    &[],
+                );
+            }
+            self.dirty_writes.borrow_mut().clear();
+            self.dirty_reads.borrow_mut().clear();
+            self.dirty_transfer.set(false);
+            *self.barriers.borrow_mut() += 1;
+        }
+        self.dirty_reads.borrow_mut().extend(reads.iter().copied());
+        self.dirty_writes
+            .borrow_mut()
+            .extend(writes.iter().copied());
+    }
+
+    fn dispatch(
+        &self,
+        k: ComputeKernel,
+        buffers: &[vk::Buffer],
+        writes: &[vk::Buffer],
+        push: &[u8],
+        groups: u32,
+    ) {
+        // Inputs are every bound buffer except the output (always last). Do NOT drop in-place
+        // buffers (e.g. rope x==y): they are genuinely read and may carry a RAW from a prior op.
+        let reads = &buffers[..buffers.len() - 1];
+        self.sync(reads, writes, false);
         let device = &self.be.shared.device;
         let set = unsafe {
             device.allocate_descriptor_sets(
@@ -82,7 +170,7 @@ impl<'a> Recorder<'a> {
                 range: vk::WHOLE_SIZE,
             })
             .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
+        let ds_writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
             .map(|i| {
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
@@ -91,22 +179,9 @@ impl<'a> Recorder<'a> {
                     .buffer_info(&infos[i..i + 1])
             })
             .collect();
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        unsafe { device.update_descriptor_sets(&ds_writes, &[]) };
 
-        // Conservative global barrier: make all prior shader writes visible to this dispatch.
-        let mb = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         unsafe {
-            device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[mb],
-                &[],
-                &[],
-            );
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
             device.cmd_bind_descriptor_sets(
                 self.cmd,
@@ -151,6 +226,40 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+            &[Self::vkb(y)],
+            &push,
+            ((rows * out_f) as u32).div_ceil(64),
+        );
+    }
+
+    /// `y = residual + x·Wᵀ` (fused residual add). `residual` and `y` may be the same buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_add(
+        &self,
+        w: &dyn Buffer,
+        x: &dyn Buffer,
+        residual: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let k = self
+            .be
+            .kernel("linear_res", crate::linear::LINEAR_RES_WGSL, 4, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(w),
+                Self::vkb(x),
+                Self::vkb(residual),
+                Self::vkb(y),
+            ],
+            &[Self::vkb(y)],
             &push,
             ((rows * out_f) as u32).div_ceil(64),
         );
@@ -173,6 +282,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(y)],
+            &[Self::vkb(y)],
             &push,
             (rows as u32).div_ceil(64),
         );
@@ -203,6 +313,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(x), Self::vkb(y)],
+            &[Self::vkb(y)],
             &push,
             (t * n_heads) as u32,
         );
@@ -237,6 +348,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
+            &[Self::vkb(o)],
             &push,
             (q_len * nh) as u32,
         );
@@ -246,20 +358,9 @@ impl<'a> Recorder<'a> {
     /// Used to append new K/V rows into the persistent cache.
     pub fn copy(&self, src: &dyn Buffer, dst: &dyn Buffer, dst_offset: usize, bytes: usize) {
         let device = &self.be.shared.device;
-        // make prior shader writes to `src` visible to the transfer read
-        let mb = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+        self.sync(&[Self::vkb(src)], &[Self::vkb(dst)], true);
+        self.dirty_transfer.set(true);
         unsafe {
-            device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[mb],
-                &[],
-                &[],
-            );
             device.cmd_copy_buffer(
                 self.cmd,
                 Self::vkb(src),
@@ -293,6 +394,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             kern,
             &[Self::vkb(q), Self::vkb(k), Self::vkb(v), Self::vkb(o)],
+            &[Self::vkb(o)],
             &push,
             (t * nh) as u32,
         );
@@ -309,6 +411,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(gu), Self::vkb(y)],
+            &[Self::vkb(y)],
             &push,
             (rows * nff) as u32,
         );
@@ -319,6 +422,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
+            &[Self::vkb(y)],
             &(n as u32).to_ne_bytes(),
             (n as u32).div_ceil(64),
         );
@@ -330,6 +434,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(
             k,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],
+            &[Self::vkb(y)],
             &(n as u32).to_ne_bytes(),
             (n as u32).div_ceil(64),
         );
@@ -338,6 +443,9 @@ impl<'a> Recorder<'a> {
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
         let device = &self.be.shared.device;
+        if self.prof {
+            eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
+        }
         unsafe { device.end_command_buffer(self.cmd) }.map_err(|e| be(format!("end cmd: {e}")))?;
         let queue = self.be.shared.queue;
         unsafe {

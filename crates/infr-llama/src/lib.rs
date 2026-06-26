@@ -465,14 +465,14 @@ impl Llama {
         let k_new = alloc(n * kvrow, BufferUsage::Activations)?;
         let v_new = alloc(n * kvrow, BufferUsage::Activations)?;
         let attn = alloc(n * nh * hd, BufferUsage::Activations)?;
-        let ao = alloc(n * ne, BufferUsage::Activations)?;
         let hn2 = alloc(n * ne, BufferUsage::Activations)?;
         let gu = alloc(n * 2 * nff, BufferUsage::Activations)?;
         let act = alloc(n * nff, BufferUsage::Activations)?;
-        let down = alloc(n * ne, BufferUsage::Activations)?;
         let logits = alloc(n * c.vocab, BufferUsage::Readback)?;
 
         let off = pos * kvrow * 4; // byte offset into the cache for the new rows
+        let prof = std::env::var("INFR_PROF").is_ok();
+        let t_rec = std::time::Instant::now();
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
         for (li, layer) in self.layers.iter().enumerate() {
             rec.rmsnorm(
@@ -520,15 +520,15 @@ impl Llama {
                 hd,
                 pos,
             );
-            rec.linear(
+            rec.linear_add(
                 layer.wo.as_ref(),
                 attn.as_ref(),
-                ao.as_ref(),
+                hidden.as_ref(),
+                hidden.as_ref(),
                 n,
                 nh * hd,
                 ne,
             );
-            rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), n * ne);
             rec.rmsnorm(
                 hidden.as_ref(),
                 layer.ffn_norm_buf.as_ref(),
@@ -546,15 +546,15 @@ impl Llama {
                 2 * nff,
             );
             rec.silu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
-            rec.linear(
+            rec.linear_add(
                 layer.wdown.as_ref(),
                 act.as_ref(),
-                down.as_ref(),
+                hidden.as_ref(),
+                hidden.as_ref(),
                 n,
                 nff,
                 ne,
             );
-            rec.add(hidden.as_ref(), down.as_ref(), hidden.as_ref(), n * ne);
         }
         rec.rmsnorm(
             hidden.as_ref(),
@@ -572,7 +572,15 @@ impl Llama {
             ne,
             c.vocab,
         );
+        let rec_us = t_rec.elapsed().as_micros();
+        let t_gpu = std::time::Instant::now();
         rec.finish().map_err(|e| anyhow!("{e}"))?;
+        if prof {
+            eprintln!(
+                "[prof] n={n} record={rec_us}us submit+wait={}us",
+                t_gpu.elapsed().as_micros()
+            );
+        }
 
         let mut bytes = vec![0u8; n * c.vocab * 4];
         self.be

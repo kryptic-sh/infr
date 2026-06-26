@@ -48,19 +48,108 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+use anyhow::{anyhow, Context};
+use std::path::{Path, PathBuf};
+
+/// Resolve a model arg to (gguf_path, tokenizer_json_path).
+/// Bring-up: accept a path to a `.gguf` (tokenizer.json must sit beside it) or an
+/// `hf:`/`ollama:` ref resolved via infr-hub (tokenizer.json beside the cached blob).
+fn resolve(model: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let gguf = if Path::new(model).exists() {
+        PathBuf::from(model)
+    } else {
+        let r = infr_hub::ModelRef::parse(model).map_err(|e| anyhow!("{e}"))?;
+        infr_hub::ensure(&r).map_err(|e| anyhow!("{e}"))?
+    };
+    let tok = gguf
+        .parent()
+        .map(|d| d.join("tokenizer.json"))
+        .filter(|p| p.exists())
+        .context("tokenizer.json not found beside the model (bring-up needs it)")?;
+    Ok((gguf, tok))
+}
+
 fn cmd_pull(model: &str) -> anyhow::Result<()> {
-    // TODO(sonnet): ModelRef::parse -> infr_hub::ensure -> print resolved path.
-    todo!("infr pull")
+    let r = infr_hub::ModelRef::parse(model).map_err(|e| anyhow!("{e}"))?;
+    let path = infr_hub::ensure(&r).map_err(|e| anyhow!("{e}"))?;
+    println!("{}", path.display());
+    Ok(())
 }
 
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
-    // TODO(sonnet): ensure model -> VulkanBackend::new -> Engine::load -> REPL loop calling
-    // engine.chat, printing reasoning dimmed + content normally.
-    todo!("infr run")
+    let (gguf, tok) = resolve(model)?;
+    let llama = infr_llama::Llama::load(&gguf, &tok)?;
+    let one_shot = |msg: &str| -> anyhow::Result<()> {
+        use std::io::Write;
+        let prompt = llama.chatml(msg);
+        llama.generate(&prompt, 256, |piece| {
+            print!("{piece}");
+            let _ = std::io::stdout().flush();
+        })?;
+        println!();
+        Ok(())
+    };
+    if let Some(m) = message {
+        return one_shot(m);
+    }
+    // REPL
+    use std::io::Write;
+    let stdin = std::io::stdin();
+    loop {
+        print!("\n> ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        one_shot(line)?;
+    }
+    Ok(())
+}
+
+/// Adapter: drive `infr-llama` through the server's `ChatGenerator` seam.
+struct LlamaGenerator {
+    llama: infr_llama::Llama,
+}
+
+impl infr_server::ChatGenerator for LlamaGenerator {
+    fn chat(
+        &mut self,
+        messages: &[infr_engine::ChatMessage],
+        _tools_json: Option<&str>,
+        on_delta: &mut dyn FnMut(infr_engine::Delta),
+    ) -> anyhow::Result<()> {
+        // Bring-up: use the last user message; full chat-template/tools wiring comes later.
+        let user = messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let prompt = self.llama.chatml(&user);
+        self.llama.generate(&prompt, 256, |piece| {
+            on_delta(infr_engine::Delta::Content(piece.to_string()));
+        })?;
+        Ok(())
+    }
 }
 
 fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
-    // TODO(sonnet): ensure model -> VulkanBackend::new -> Engine::load -> build a tokio
-    // runtime -> infr_server::serve(engine, addr).
-    todo!("infr serve")
+    let (gguf, tok) = resolve(model)?;
+    let llama = infr_llama::Llama::load(&gguf, &tok)?;
+    let model_id = gguf
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model")
+        .to_string();
+    let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
+    let generator: Box<dyn infr_server::ChatGenerator> = Box::new(LlamaGenerator { llama });
+
+    let rt = tokio::runtime::Runtime::new()?;
+    println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1)");
+    rt.block_on(infr_server::serve(generator, model_id, sockaddr))
 }

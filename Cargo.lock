@@ -934,6 +934,7 @@ dependencies = [
  "infr-core",
  "infr-engine",
  "infr-hub",
+ "infr-llama",
  "infr-server",
  "infr-vulkan",
  "tokio",

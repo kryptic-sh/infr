@@ -34,6 +34,28 @@ use infr_engine::{ChatMessage, Delta, Engine};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+/// Generation backend the server drives — it never knows the model/GPU underneath.
+/// Implemented by `Engine` (below) and by CLI adapters (e.g. a Llama runner).
+pub trait ChatGenerator: Send {
+    fn chat(
+        &mut self,
+        messages: &[ChatMessage],
+        tools_json: Option<&str>,
+        on_delta: &mut dyn FnMut(Delta),
+    ) -> anyhow::Result<()>;
+}
+
+impl ChatGenerator for Engine {
+    fn chat(
+        &mut self,
+        messages: &[ChatMessage],
+        tools_json: Option<&str>,
+        on_delta: &mut dyn FnMut(Delta),
+    ) -> anyhow::Result<()> {
+        Engine::chat(self, messages, tools_json, on_delta).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Request DTOs
 // ---------------------------------------------------------------------------
@@ -178,15 +200,15 @@ pub struct DeltaPayload {
 /// Generation is serialised by the Mutex — single-stream for the MVP.
 #[derive(Clone)]
 pub struct AppState {
-    pub engine: Arc<Mutex<Option<Engine>>>,
+    pub engine: Arc<Mutex<Option<Box<dyn ChatGenerator>>>>,
     pub model_id: Arc<str>,
 }
 
 impl AppState {
-    /// Wrap a loaded engine for production use.
-    pub fn new(engine: Engine, model_id: impl Into<String>) -> Self {
+    /// Wrap a loaded generator for production use.
+    pub fn new(generator: Box<dyn ChatGenerator>, model_id: impl Into<String>) -> Self {
         Self {
-            engine: Arc::new(Mutex::new(Some(engine))),
+            engine: Arc::new(Mutex::new(Some(generator))),
             model_id: Arc::from(model_id.into().as_str()),
         }
     }
@@ -218,8 +240,12 @@ pub fn build_router(state: AppState) -> Router {
 // ---------------------------------------------------------------------------
 
 /// Start the OpenAI-compatible server bound to `addr`, serving `engine` under `model_id`.
-pub async fn serve(engine: Engine, model_id: String, addr: SocketAddr) -> anyhow::Result<()> {
-    let state = AppState::new(engine, model_id);
+pub async fn serve(
+    generator: Box<dyn ChatGenerator>,
+    model_id: String,
+    addr: SocketAddr,
+) -> anyhow::Result<()> {
+    let state = AppState::new(generator, model_id);
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "infr-server listening");

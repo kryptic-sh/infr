@@ -740,9 +740,15 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Record a buffer→buffer copy of `bytes` from `src[0..]` into `dst[dst_offset..]`.
-    /// Used to append new K/V rows into the persistent cache.
-    pub fn copy(&self, src: &dyn Buffer, dst: &dyn Buffer, dst_offset: usize, bytes: usize) {
+    /// Record a buffer→buffer copy of `bytes` from `src[src_offset..]` into `dst[dst_offset..]`.
+    pub fn copy(
+        &self,
+        src: &dyn Buffer,
+        src_offset: usize,
+        dst: &dyn Buffer,
+        dst_offset: usize,
+        bytes: usize,
+    ) {
         let device = &self.be.shared.device;
         self.sync(&[Self::vkb(src)], &[Self::vkb(dst)], true);
         self.dirty_transfer.set(true);
@@ -752,7 +758,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(src),
                 Self::vkb(dst),
                 &[vk::BufferCopy {
-                    src_offset: 0,
+                    src_offset: src_offset as u64,
                     dst_offset: dst_offset as u64,
                     size: bytes as u64,
                 }],

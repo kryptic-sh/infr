@@ -783,7 +783,11 @@ impl Llama {
             .map_err(|e| anyhow!("{e}"))?;
         let attn = alloc(n * nh * hd, BufferUsage::Activations)?;
         let act = alloc(n * nff, BufferUsage::Activations)?;
-        let logits = alloc(n * c.vocab, BufferUsage::Readback)?;
+        // Only the LAST position's logits are needed → compute lm_head for one row. (Computing all n
+        // rows at long context is a huge wasted dispatch + ~n*vocab buffer that can exceed the GPU
+        // watchdog and lose the device.)
+        let hlast = alloc(ne, BufferUsage::Activations)?;
+        let logits = alloc(c.vocab, BufferUsage::Readback)?;
         let kvrow = nkv * hd;
         // qwen3 (QK-norm) uses an un-fused attention input: raw Q/K/V projections then a separate
         // per-head RMSNorm+RoPE. (Llama uses the single fused attn_in instead.)
@@ -1021,15 +1025,17 @@ impl Llama {
                 ne,
             );
         }
+        // final norm + lm_head on the LAST row only: copy hidden[n-1] → hlast, norm it, project.
+        rec.copy(hidden.as_ref(), (n - 1) * ne * 4, hlast.as_ref(), 0, ne * 4);
         rec.rmsnorm(
-            hidden.as_ref(),
+            hlast.as_ref(),
             self.output_norm_buf.as_ref(),
             hn.as_ref(),
-            n,
+            1,
             ne,
             c.rms_eps,
         );
-        lin(&self.lm_head, hn.as_ref(), logits.as_ref(), n, ne, c.vocab);
+        lin(&self.lm_head, hn.as_ref(), logits.as_ref(), 1, ne, c.vocab);
         let rec_us = t_rec.elapsed().as_micros();
         let t_gpu = std::time::Instant::now();
         rec.finish().map_err(|e| anyhow!("{e}"))?;
@@ -1040,13 +1046,12 @@ impl Llama {
             );
         }
 
-        let mut bytes = vec![0u8; n * c.vocab * 4];
+        let mut bytes = vec![0u8; c.vocab * 4];
         self.be
             .download(logits.as_ref(), &mut bytes)
             .map_err(|e| anyhow!("{e}"))?;
         kv.len += n;
-        let all: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
-        Ok(all[(n - 1) * c.vocab..].to_vec())
+        Ok(bytemuck::cast_slice(&bytes).to_vec())
     }
 
     /// Greedy generate up to `max_new` tokens after `prompt` (already a chat-formatted string).
@@ -1065,8 +1070,20 @@ impl Llama {
 
         // Size the KV cache to exactly what this run needs — bounded only by VRAM, not a fixed cap.
         let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
-        // prefill the whole prompt in one resident pass
-        let mut logits = self.forward_resident_kv(&prompt_tokens, &mut kv)?;
+        // Prefill: one submit over a very long prompt can exceed the GPU watchdog (TDR /
+        // device-lost), since each attention/matmul dispatch grows with tokens × context. Short
+        // prompts go in one fast pass; long ones are split into small chunks that stay well under
+        // the watchdog. (A real GEMM prefill path would let chunks be large; GEMV is the current
+        // limit — see coopmat-prefill TODO.) Only the last chunk's logits matter.
+        let len = prompt_tokens.len();
+        let chunk = if len <= 2048 { len } else { 256 };
+        let mut logits = Vec::new();
+        let mut i = 0;
+        while i < len {
+            let end = (i + chunk).min(len);
+            logits = self.forward_resident_kv(&prompt_tokens[i..end], &mut kv)?;
+            i = end;
+        }
         for _ in 0..max_new {
             let next = argmax(&logits) as u32;
             if next == self.cfg.eos {

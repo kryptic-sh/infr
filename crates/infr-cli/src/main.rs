@@ -153,6 +153,25 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     const MAX_NEW: usize = 512;
     let (gguf, tok) = resolve(model)?;
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
+    // Qwen3's recommended sampling — pure greedy makes thinking models degenerate (unterminated
+    // <think>, no answer). Tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
+    let envf = |k: &str, d: f32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let envu = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    llama.set_sampling(
+        envf("INFR_TEMP", 0.6),
+        envu("INFR_TOP_K", 20),
+        envf("INFR_TOP_P", 0.95),
+    );
 
     // One-shot message: single fresh generation, no persisted context.
     if let Some(m) = message {

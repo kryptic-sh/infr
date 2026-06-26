@@ -48,6 +48,25 @@ pub struct Config {
     pub qk_norm: bool,
 }
 
+/// Token sampling: greedy when `temp <= 0`, else temperature + top-k + top-p (nucleus). Qwen3
+/// recommends temp 0.6 / top_k 20 / top_p 0.95 — pure greedy makes thinking models degenerate
+/// (fail to close `</think>`, repeat, or stop without answering).
+#[derive(Clone, Copy, Debug)]
+pub struct Sampler {
+    pub temp: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+}
+impl Default for Sampler {
+    fn default() -> Self {
+        Self {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        }
+    }
+}
+
 /// A projection weight on the GPU: either f16, or a unified in-kernel-dequant quant. Every
 /// supported quant (Q8_0/Q4_K/Q5_K/Q6_K) is repacked at load into ONE form — `q` = u8 indices
 /// packed 4-per-u32, `s`/`m` = one f16 scale/min per 16-element block — so `dq = s·u8 + m`.
@@ -95,6 +114,7 @@ pub struct Llama {
     output_norm_buf: Box<dyn Buffer>,
     layers: Vec<LayerWeights>,
     tokenizer: Tokenizer,
+    sampler: std::cell::Cell<Sampler>,
 }
 
 /// Per-layer key/value cache held on the GPU (persists across decode steps).
@@ -668,7 +688,13 @@ impl Llama {
             output_norm_buf,
             layers,
             tokenizer,
+            sampler: std::cell::Cell::new(Sampler::default()),
         })
+    }
+
+    /// Set token sampling (temp ≤ 0 → greedy). Applies to subsequent `generate`/`ChatSession::turn`.
+    pub fn set_sampling(&self, temp: f32, top_k: usize, top_p: f32) {
+        self.sampler.set(Sampler { temp, top_k, top_p });
     }
 
     fn lin(&self, w: &dyn Buffer, x: &[f32], rows: usize, in_f: usize, out_f: usize) -> Vec<f32> {
@@ -1359,6 +1385,13 @@ impl Llama {
             logits = self.forward_resident_kv(&new_tokens[i..end], kv)?;
             i = end;
         }
+        let sampler = self.sampler.get();
+        // xorshift64 seed (non-zero); varies per call so sampling isn't fixed across turns.
+        let mut rng = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9e3779b97f4a7c15)
+            | 1;
         let mut generated: Vec<u32> = Vec::new();
         // Stream UTF-8-safely: decode the whole reply each step and emit only the newly-completed
         // suffix. A multi-byte char (e.g. an emoji) is split across byte-level BPE tokens; decoding a
@@ -1367,7 +1400,7 @@ impl Llama {
         // generated token (delta may be empty while a char is mid-completion), so callers can count.
         let mut printed = 0usize;
         for _ in 0..max_new {
-            let next = argmax(&logits) as u32;
+            let next = sample_logits(&logits, sampler, &mut rng);
             if self.cfg.eos_ids.contains(&next) {
                 break;
             }
@@ -1501,6 +1534,63 @@ fn argmax(v: &[f32]) -> usize {
         }
     }
     bi
+}
+
+/// Sample a token id from `logits` per `s`. Greedy if `temp<=0`/`top_k==1`; else temperature +
+/// top-k + top-p (nucleus). `rng` is an xorshift64 state advanced in place.
+fn sample_logits(logits: &[f32], s: Sampler, rng: &mut u64) -> u32 {
+    if s.temp <= 0.0 || s.top_k == 1 {
+        return argmax(logits) as u32;
+    }
+    let n = logits.len();
+    let k = if s.top_k == 0 { n } else { s.top_k.min(n) };
+    let cmp = |a: &usize, b: &usize| {
+        logits[*b]
+            .partial_cmp(&logits[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let mut idx: Vec<usize> = (0..n).collect();
+    if k < n {
+        idx.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
+        idx.truncate(k);
+    }
+    idx.sort_unstable_by(cmp); // descending by logit
+    let maxl = logits[idx[0]];
+    let mut probs: Vec<f32> = idx
+        .iter()
+        .map(|&i| ((logits[i] - maxl) / s.temp).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    for p in probs.iter_mut() {
+        *p /= sum;
+    }
+    // nucleus: smallest prefix whose cumulative prob reaches top_p
+    let mut cum = 0.0;
+    let mut cutoff = probs.len();
+    for (j, &p) in probs.iter().enumerate() {
+        cum += p;
+        if cum >= s.top_p {
+            cutoff = j + 1;
+            break;
+        }
+    }
+    let total: f32 = probs[..cutoff].iter().sum();
+    // xorshift64 → uniform [0, total)
+    let mut x = *rng;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *rng = x;
+    let u = (x >> 40) as f32 / (1u64 << 24) as f32;
+    let r = u * total;
+    let mut acc = 0.0;
+    for j in 0..cutoff {
+        acc += probs[j];
+        if r <= acc {
+            return idx[j] as u32;
+        }
+    }
+    idx[cutoff - 1] as u32
 }
 
 fn rmsnorm_rows(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f32> {

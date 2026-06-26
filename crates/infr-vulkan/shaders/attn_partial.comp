@@ -16,47 +16,76 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
     uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks;
 } pc;
-layout(binding = 0) readonly buffer QB { float16_t q[]; };   // [nh, hd]
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [nh, hd] as vec4
 layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
 layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
 layout(binding = 3) buffer PM { float pm[]; };               // [nh, n_chunks]
 layout(binding = 4) buffer PL { float pl[]; };               // [nh, n_chunks]
 layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, hd]
 
-shared float q_sh[128];
 shared float sc[1024];
 shared float red[64];
 
 void main() {
     uint t = gl_LocalInvocationIndex;
-    uint h = gl_WorkGroupID.x / pc.n_chunks;
-    uint c = gl_WorkGroupID.x % pc.n_chunks;
-    uint kvh = h / (pc.nh / pc.nkv);
     uint hd = pc.hd;
+    uint hd4 = hd >> 2u;
+    // Workgroup ID ordered so the g query heads sharing a (kv-head, chunk) are CONSECUTIVE — the
+    // scheduler keeps neighbors co-resident, so the 2nd..g-th head re-read their K/V slice from L2
+    // (hot, multi-TB/s) instead of DRAM. Captures the GQA re-use benefit at zero occupancy cost.
+    uint g = pc.nh / pc.nkv;
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % pc.n_chunks;
+    uint kvh = rest / pc.n_chunks;
+    uint h = kvh * g + hh;
     float scale = 1.0 / sqrt(float(hd));
     uint j0 = c * pc.chunk;
     uint j1 = min(j0 + pc.chunk, pc.kv_len);
 
-    for (uint d = t; d < hd; d += 64u) { q_sh[d] = float(q[h * hd + d]); }
-    barrier();
-
-    // QK via subgroup reduction (one key per subgroup-iteration; coalesced K reads).
+    // QK via subgroup reduction (one key per subgroup-iteration; vec4 coalesced K reads). Each lane's
+    // query vec4(s) are loop-invariant across keys → hold in registers (no q_sh, no barrier).
     uint sg = gl_SubgroupID;            // 0..1
     uint lane = gl_SubgroupInvocationID; // 0..31
     uint nsg = gl_NumSubgroups;          // 2
-    // vec4 K reads: each lane loads 4 contiguous hd values (8B) → 32 lanes cover 128 hd in one wide
-    // coalesced transaction (vs 4 separate f16 reads), which gets RDNA closer to peak bandwidth.
-    uint hd4 = hd >> 2u;
+    vec4 qreg[4];
+    uint nq = 0u;
+    for (uint r = lane; r < hd4; r += 32u) { qreg[nq] = vec4(q4[h * hd4 + r]); nq++; }
     float lmax = -3.0e38;
-    for (uint j = j0 + sg; j < j1; j += nsg) {
+    uint j = j0 + sg;
+    if (hd4 == 32u) {
+        // fast path (hd=128): one vec4/lane per key → software-pipeline 4 keys per iteration. Issue
+        // all 4 independent loads before the dependent subgroupAdds → 4 loads in flight per wave (vs
+        // 1), hiding DRAM latency within the wave instead of relying only on workgroup count.
+        uint q4b = h * 32u;
+        uint kb = (pc.nkv * 32u);
+        for (; j + 3u * nsg < j1; j += 4u * nsg) {
+            vec4 a0 = vec4(k4[j * kb + kvh * 32u + lane]);
+            vec4 a1 = vec4(k4[(j + nsg) * kb + kvh * 32u + lane]);
+            vec4 a2 = vec4(k4[(j + 2u * nsg) * kb + kvh * 32u + lane]);
+            vec4 a3 = vec4(k4[(j + 3u * nsg) * kb + kvh * 32u + lane]);
+            float d0 = subgroupAdd(dot(qreg[0], a0)) * scale;
+            float d1 = subgroupAdd(dot(qreg[0], a1)) * scale;
+            float d2 = subgroupAdd(dot(qreg[0], a2)) * scale;
+            float d3 = subgroupAdd(dot(qreg[0], a3)) * scale;
+            if (lane == 0u) {
+                sc[j - j0] = d0;
+                sc[j + nsg - j0] = d1;
+                sc[j + 2u * nsg - j0] = d2;
+                sc[j + 3u * nsg - j0] = d3;
+            }
+            lmax = max(max(max(max(lmax, d0), d1), d2), d3);
+        }
+    }
+    for (; j < j1; j += nsg) {
         uint kbase4 = (j * pc.nkv + kvh) * hd4;
         float part = 0.0;
+        uint ri = 0u;
         for (uint r = lane; r < hd4; r += 32u) {
-            vec4 kv = vec4(k4[kbase4 + r]);
-            vec4 qv = vec4(q_sh[4u * r], q_sh[4u * r + 1u], q_sh[4u * r + 2u], q_sh[4u * r + 3u]);
-            part += dot(qv, kv);
+            part += dot(qreg[ri], vec4(k4[kbase4 + r]));
+            ri++;
         }
-        float dot = subgroupAdd(part) * scale;  // all lanes get the sum
+        float dot = subgroupAdd(part) * scale;
         if (lane == 0u) { sc[j - j0] = dot; }
         lmax = max(lmax, dot);
     }

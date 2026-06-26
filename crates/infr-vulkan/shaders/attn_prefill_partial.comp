@@ -39,6 +39,8 @@ shared float Os[BM * 128u];
 shared float mrow[BM];
 shared float lrow[BM];
 shared float corr[BM];
+shared float smax[128]; // per-(row,half) partial max for the 2-thread-per-row softmax
+shared float ssum[128]; // per-(row,half) partial sum
 
 void main() {
     uint sp = gl_WorkGroupID.x % pc.n_splits;
@@ -79,26 +81,43 @@ void main() {
         }
         barrier();
 
-        if (li < BM) {
-            uint r = li;
+        // Online softmax, two threads per row (128 threads = 2 halves of BN) so all lanes work.
+        // half 0 owns cols [0,32), half 1 owns [32,64); per-row results combined via shared smax/ssum.
+        {
+            uint r = li & 63u;
+            uint hf = li >> 6u;
+            uint c0 = hf * 32u;
             uint qpos = pc.pos_offset + qr0 + r;
-            float rmax = mrow[r];
-            for (uint j = 0u; j < BN; j++) {
+            float hmax = -1e30;
+            for (uint j = c0; j < c0 + 32u; j++) {
                 uint kpos = kv0 + j;
                 float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : Ss[r * BN + j] * scale;
                 Ss[r * BN + j] = s;
-                rmax = max(rmax, s);
+                hmax = max(hmax, s);
             }
-            float cf = exp(mrow[r] - rmax);
-            float rsum = 0.0;
-            for (uint j = 0u; j < BN; j++) {
+            smax[li] = hmax;
+        }
+        barrier();
+        {
+            // both halves read (not write) mrow[r] here → no race; mrow updated after the barrier
+            uint r = li & 63u;
+            uint hf = li >> 6u;
+            uint c0 = hf * 32u;
+            float rmax = max(mrow[r], max(smax[r], smax[r + 64u]));
+            float hsum = 0.0;
+            for (uint j = c0; j < c0 + 32u; j++) {
                 float p = exp(Ss[r * BN + j] - rmax);
                 Ps[r * BN + j] = float16_t(p);
-                rsum += p;
+                hsum += p;
             }
-            lrow[r] = lrow[r] * cf + rsum;
-            mrow[r] = rmax;
-            corr[r] = cf;
+            ssum[li] = hsum;
+        }
+        barrier();
+        if (li < BM) {
+            float rmax = max(mrow[li], max(smax[li], smax[li + 64u]));
+            corr[li] = exp(mrow[li] - rmax);
+            lrow[li] = lrow[li] * corr[li] + ssum[li] + ssum[li + 64u];
+            mrow[li] = rmax;
         }
         barrier();
 

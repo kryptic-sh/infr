@@ -1442,24 +1442,15 @@ impl Llama {
         // single token would yield a partial sequence → U+FFFD (the `�`). Holding until the decode no
         // longer ends in the replacement char emits whole characters only. `on_token` fires once per
         // generated token (delta may be empty while a char is mid-completion), so callers can count.
-        let mut printed = 0usize;
+        let mut stream = StreamDecoder::default();
         for _ in 0..max_new {
             let next = sample_logits(&logits, sampler, &mut rng);
             if self.cfg.eos_ids.contains(&next) {
                 break;
             }
             generated.push(next);
-            let mut delta = String::new();
-            if let Ok(text) = self.tokenizer.decode(&generated, true) {
-                if !text.ends_with('\u{FFFD}')
-                    && text.len() > printed
-                    && text.is_char_boundary(printed)
-                {
-                    delta = text[printed..].to_string();
-                    printed = text.len();
-                }
-            }
-            on_token(&delta);
+            let full = self.tokenizer.decode(&generated, true).unwrap_or_default();
+            on_token(&stream.step(&full));
             logits = self.forward_resident_kv(&[next], kv)?;
         }
         Ok(generated)
@@ -1580,6 +1571,29 @@ impl ChatSession<'_> {
 
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
+}
+
+/// Incremental UTF-8-safe detokenizer: fed the FULL decoded text each step, returns the newly
+/// completed suffix. Byte-level BPE splits a multi-byte char (e.g. an emoji) across tokens, so a
+/// step's decode can end mid-character as U+FFFD (`�`); we hold output until it completes (decode no
+/// longer ends in `�`), emitting whole characters only.
+#[derive(Default)]
+struct StreamDecoder {
+    printed: usize,
+}
+impl StreamDecoder {
+    fn step(&mut self, full: &str) -> String {
+        if !full.ends_with('\u{FFFD}')
+            && full.len() > self.printed
+            && full.is_char_boundary(self.printed)
+        {
+            let delta = full[self.printed..].to_string();
+            self.printed = full.len();
+            delta
+        } else {
+            String::new()
+        }
+    }
 }
 
 fn argmax(v: &[f32]) -> usize {
@@ -1776,6 +1790,46 @@ mod tokenizer_tests {
             sidecar.decode(ids.get_ids(), true).unwrap(),
             "decode differs from sidecar"
         );
+    }
+
+    // Streaming must hold a multi-byte char (emoji) split across tokens instead of emitting `�`.
+    #[test]
+    fn stream_decoder_holds_partial_utf8() {
+        let mut s = StreamDecoder::default();
+        // Simulate the per-step FULL decode of "Hi😄" where the emoji's bytes arrive across 2 tokens.
+        assert_eq!(s.step("Hi"), "Hi");
+        assert_eq!(s.step("Hi\u{FFFD}"), ""); // emoji half-decoded → hold, no `�` emitted
+        assert_eq!(s.step("Hi😄"), "😄"); // completes → emit the whole char
+        assert_eq!(s.step("Hi😄!"), "!");
+    }
+
+    // Sampling: temp<=0 and top_k==1 are greedy; otherwise picks only within the top-k/top-p set.
+    #[test]
+    fn sample_logits_greedy_and_in_set() {
+        let logits = [1.0f32, 5.0, 2.0, 4.0, 0.0]; // argmax = index 1
+        let mut rng = 0x1234_5678_9abc_def1u64;
+        let greedy = Sampler {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        assert_eq!(sample_logits(&logits, greedy, &mut rng), 1);
+        let topk1 = Sampler {
+            temp: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+        };
+        assert_eq!(sample_logits(&logits, topk1, &mut rng), 1);
+        // top_k=2 → only the two largest logits (indices 1 and 3) can ever be sampled.
+        let topk2 = Sampler {
+            temp: 1.0,
+            top_k: 2,
+            top_p: 1.0,
+        };
+        for _ in 0..200 {
+            let id = sample_logits(&logits, topk2, &mut rng);
+            assert!(id == 1 || id == 3, "sampled outside top-2: {id}");
+        }
     }
 
     // User content must be encoded as literal text: special-token strings in user input must NOT

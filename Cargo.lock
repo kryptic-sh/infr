@@ -817,11 +817,14 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
+ "http-body-util",
  "infr-core",
  "infr-engine",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
 ]

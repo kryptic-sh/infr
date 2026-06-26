@@ -170,23 +170,31 @@ fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         tok.with_pre_tokenizer(Some(ByteLevel::new(add_prefix, true, true)));
     }
     tok.with_decoder(Some(ByteLevelDecoder::default()));
-    // Register control (3) / user-defined (4) tokens as special so chat markers stay atomic.
+    // Add control (type 3, e.g. <|im_end|>) as SPECIAL tokens and user-defined (type 4, e.g.
+    // <think>) as NORMAL added tokens — matching HF. Both encode atomically, but only special ones
+    // are dropped by `decode(.., skip_special=true)`; keeping <think>/</think> non-special means
+    // the reasoning block stays visible (and markable) in the output.
     if let Some(types) = md
         .get("tokenizer.ggml.token_type")
         .and_then(MetaValue::as_arr)
     {
-        let special: Vec<AddedToken> = types
-            .iter()
-            .enumerate()
-            .filter(|(i, ty)| *i < toks.len() && matches!(ty.as_u64(), Some(3) | Some(4)))
-            .filter_map(|(i, _)| {
-                toks[i]
-                    .as_str()
-                    .map(|s| AddedToken::from(s.to_string(), true))
-            })
-            .collect();
-        if !special.is_empty() {
-            tok.add_special_tokens(&special);
+        let mut specials = Vec::new();
+        let mut added = Vec::new();
+        for (i, ty) in types.iter().enumerate() {
+            let Some(s) = toks.get(i).and_then(MetaValue::as_str) else {
+                continue;
+            };
+            match ty.as_u64() {
+                Some(3) => specials.push(AddedToken::from(s.to_string(), true)),
+                Some(4) => added.push(AddedToken::from(s.to_string(), false)),
+                _ => {}
+            }
+        }
+        if !added.is_empty() {
+            tok.add_tokens(&added);
+        }
+        if !specials.is_empty() {
+            tok.add_special_tokens(&specials);
         }
     }
     Ok(tok)
@@ -1605,5 +1613,20 @@ mod tokenizer_tests {
             let b = sidecar.encode(s, false).unwrap();
             assert_eq!(a.get_ids(), b.get_ids(), "token id mismatch on {s:?}");
         }
+        // <think>/</think> are user-defined (non-special): skip_special must KEEP them, while real
+        // special tokens (<|im_end|>) are dropped — matching the sidecar.
+        let think = "<think>\nreasoning\n</think>\n\nanswer<|im_end|>";
+        let ids = derived.encode(think, false).unwrap();
+        let d = derived.decode(ids.get_ids(), true).unwrap();
+        assert!(
+            d.contains("<think>") && d.contains("</think>"),
+            "think tags dropped: {d:?}"
+        );
+        assert!(!d.contains("<|im_end|>"), "special token kept: {d:?}");
+        assert_eq!(
+            d,
+            sidecar.decode(ids.get_ids(), true).unwrap(),
+            "decode differs from sidecar"
+        );
     }
 }

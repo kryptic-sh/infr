@@ -76,6 +76,77 @@ fn cmd_pull(model: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Streams generated text, dimming the model's `<think>…</think>` reasoning so it's visually
+/// distinct from the answer. Handles tags split across deltas via a small carry buffer; ANSI styling
+/// only on a TTY.
+struct ThinkRender {
+    in_think: bool,
+    carry: String,
+    tty: bool,
+}
+impl ThinkRender {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            in_think: false,
+            carry: String::new(),
+            tty: std::io::stdout().is_terminal(),
+        }
+    }
+    fn feed(&mut self, delta: &str) {
+        use std::io::Write;
+        if !self.tty {
+            // Not a terminal: pass through (the literal <think>…</think> tags stay, so the reasoning
+            // is still delimited in piped/redirected output).
+            print!("{delta}");
+            let _ = std::io::stdout().flush();
+            return;
+        }
+        self.carry.push_str(delta);
+        loop {
+            let tag = if self.in_think { "</think>" } else { "<think>" };
+            let Some(i) = self.carry.find(tag) else { break };
+            let before = self.carry[..i].to_string();
+            print!("{before}");
+            self.carry.replace_range(..i + tag.len(), "");
+            self.in_think = !self.in_think;
+            if self.tty {
+                // dim+italic on entering the think block; reset on leaving.
+                print!(
+                    "{}",
+                    if self.in_think {
+                        "\x1b[2;3m"
+                    } else {
+                        "\x1b[0m"
+                    }
+                );
+            }
+        }
+        // Flush all but a tail that might be the start of a tag (keep < longest tag length).
+        let keep = "</think>".len() - 1;
+        if self.carry.len() > keep {
+            let mut cut = self.carry.len() - keep;
+            while cut > 0 && !self.carry.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            print!("{}", &self.carry[..cut]);
+            self.carry.replace_range(..cut, "");
+        }
+        let _ = std::io::stdout().flush();
+    }
+    fn finish(&mut self) {
+        use std::io::Write;
+        print!("{}", self.carry);
+        self.carry.clear();
+        if self.in_think && self.tty {
+            print!("\x1b[0m");
+        }
+        self.in_think = false;
+        println!();
+        let _ = std::io::stdout().flush();
+    }
+}
+
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
     const MAX_CTX: usize = 8192;
@@ -87,13 +158,13 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     if let Some(m) = message {
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
+        let mut render = ThinkRender::new();
         llama.generate(&llama.chatml(m), MAX_NEW, |piece| {
-            print!("{piece}");
-            let _ = std::io::stdout().flush();
             n += 1;
+            render.feed(piece);
         })?;
+        render.finish();
         let dt = t0.elapsed().as_secs_f32();
-        println!();
         eprintln!("[{n} tokens, {dt:.2}s, {:.1} tok/s]", n as f32 / dt);
         return Ok(());
     }
@@ -114,14 +185,15 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         }
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
-        match session.turn(line, MAX_NEW, |piece| {
-            print!("{piece}");
-            let _ = std::io::stdout().flush();
+        let mut render = ThinkRender::new();
+        let res = session.turn(line, MAX_NEW, |piece| {
             n += 1;
-        }) {
+            render.feed(piece);
+        });
+        render.finish();
+        match res {
             Ok(_) => {
                 let dt = t0.elapsed().as_secs_f32();
-                println!();
                 eprintln!(
                     "[{n} tokens, {dt:.2}s, {:.1} tok/s | ctx {}/{}]",
                     n as f32 / dt,
@@ -129,10 +201,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                     session.max_ctx()
                 );
             }
-            Err(e) => {
-                println!();
-                eprintln!("error: {e}");
-            }
+            Err(e) => eprintln!("error: {e}"),
         }
     }
     Ok(())

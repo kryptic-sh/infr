@@ -553,7 +553,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 /// Same cooperative-over-K structure + RMS-fold.
 pub(crate) const FFN_IN_Q_WGSL: &str = r#"
 enable f16;
-struct PC { rows: u32, ne: u32, nff: u32, eps: f32 }
+struct PC { rows: u32, ne: u32, nff: u32, eps: f32, bits: u32, blk_shift: u32 }
 var<immediate> pc: PC;
 @group(0) @binding(0) var<storage, read>       hidden: array<f32>;
 @group(0) @binding(1) var<storage, read>       nw: array<f32>;
@@ -567,8 +567,13 @@ var<workgroup> r_g: array<f32, 64>;
 var<workgroup> r_u: array<f32, 64>;
 
 fn dq(g: u32) -> f32 {
-    let q = f32((quants[g >> 2u] >> ((g & 3u) * 8u)) & 0xffu);
-    let blk = g >> 4u;
+    var q: f32;
+    if pc.bits == 4u {
+        q = f32((quants[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu);
+    } else {
+        q = f32((quants[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu);
+    }
+    let blk = g >> pc.blk_shift;
     return f32(scales[blk]) * q + f32(mins[blk]);
 }
 

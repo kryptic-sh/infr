@@ -279,7 +279,8 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Quantized dequant GEMV `y = x·Wᵀ` (weights = u8 quants + per-16-block f16 scale/min).
+    /// Quantized dequant GEMV `y = x·Wᵀ`. `bits` (4|8) and `blk_shift` (log2 scale-block) select
+    /// the packed-weight layout.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_q(
         &self,
@@ -291,15 +292,19 @@ impl<'a> Recorder<'a> {
         rows: usize,
         in_f: usize,
         out_f: usize,
+        bits: u32,
+        blk_shift: u32,
     ) {
         self.stamp("lm_head");
         let k = self
             .be
-            .kernel("linear_q", crate::linear::LINEAR_Q_WGSL, 5, 12);
-        let mut push = [0u8; 12];
+            .kernel("linear_q", crate::linear::LINEAR_Q_WGSL, 5, 20);
+        let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&bits.to_ne_bytes());
+        push[16..20].copy_from_slice(&blk_shift.to_ne_bytes());
         self.dispatch(
             k,
             &[
@@ -328,15 +333,19 @@ impl<'a> Recorder<'a> {
         rows: usize,
         in_f: usize,
         out_f: usize,
+        bits: u32,
+        blk_shift: u32,
     ) {
         self.stamp("o_or_down");
         let k = self
             .be
-            .kernel("linear_res_q", crate::linear::LINEAR_RES_Q_WGSL, 6, 12);
-        let mut push = [0u8; 12];
+            .kernel("linear_res_q", crate::linear::LINEAR_RES_Q_WGSL, 6, 20);
+        let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&bits.to_ne_bytes());
+        push[16..20].copy_from_slice(&blk_shift.to_ne_bytes());
         self.dispatch(
             k,
             &[
@@ -458,14 +467,18 @@ impl<'a> Recorder<'a> {
         ne: usize,
         nff: usize,
         eps: f32,
+        bits: u32,
+        blk_shift: u32,
     ) {
         self.stamp("ffn_in");
-        let k = self.be.kernel("ffn_in_q", ops::FFN_IN_Q_WGSL, 6, 16);
-        let mut push = [0u8; 16];
+        let k = self.be.kernel("ffn_in_q", ops::FFN_IN_Q_WGSL, 6, 24);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(nff as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        push[16..20].copy_from_slice(&bits.to_ne_bytes());
+        push[20..24].copy_from_slice(&blk_shift.to_ne_bytes());
         self.dispatch(
             k,
             &[
@@ -1145,6 +1158,8 @@ mod tests {
             rows,
             in_f,
             out_f,
+            8,
+            4,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; rows * out_f * 4];

@@ -42,6 +42,8 @@ enum Wt {
         q: Box<dyn Buffer>,
         s: Box<dyn Buffer>,
         m: Box<dyn Buffer>,
+        bits: u32,      // 4 (Q4 → packed 8/u32) or 8 (Q5/Q6/Q8)
+        blk_shift: u32, // log2 of the scale/min block size (5 = per-32, 4 = per-16)
     },
 }
 impl Wt {
@@ -284,19 +286,47 @@ fn is_quant(d: infr_core::DType) -> bool {
     matches!(d, Q8_0 | Q4K | Q5K | Q6K)
 }
 
-/// Pack a unified-dequant result (u8 quants + per-element scale/min) into the GPU layout:
-/// quants u8×4/u32, scales/mins one f16 per 16-element block.
-fn pack_unified(qv: &[u8], sc: &[f32], mn: &[f32]) -> (Vec<u32>, Vec<u16>, Vec<u16>) {
-    let numel = qv.len();
-    let mut quants = vec![0u32; numel / 4];
-    for (g, &q) in qv.iter().enumerate() {
-        quants[g / 4] |= (q as u32) << (8 * (g % 4));
+/// In-VRAM packing per source quant: (bits, scale/min block size). Q4 packs to native 4-bit (8×
+/// smaller index than f16); Q5/Q6/Q8 keep 8-bit. Block size matches the quant's sub-block.
+fn quant_params(d: infr_core::DType) -> (u32, usize) {
+    use infr_core::DType::*;
+    match d {
+        Q4K => (4, 32),
+        Q5K => (8, 32),
+        Q6K => (8, 16),
+        Q8_0 => (8, 32),
+        _ => unreachable!(),
     }
-    let scales: Vec<u16> = (0..numel / 16)
-        .map(|b| half::f16::from_f32(sc[b * 16]).to_bits())
+}
+
+/// Pack a unified-dequant result into the GPU layout: indices at `bits` (4 → 8/u32, else 4/u32),
+/// scales/mins one f16 per `blk`-element block.
+fn pack_unified(
+    qv: &[u8],
+    sc: &[f32],
+    mn: &[f32],
+    bits: u32,
+    blk: usize,
+) -> (Vec<u32>, Vec<u16>, Vec<u16>) {
+    let numel = qv.len();
+    let quants = if bits == 4 {
+        let mut q = vec![0u32; numel / 8];
+        for (g, &v) in qv.iter().enumerate() {
+            q[g / 8] |= ((v & 0xF) as u32) << (4 * (g % 8));
+        }
+        q
+    } else {
+        let mut q = vec![0u32; numel / 4];
+        for (g, &v) in qv.iter().enumerate() {
+            q[g / 4] |= (v as u32) << (8 * (g % 4));
+        }
+        q
+    };
+    let scales: Vec<u16> = (0..numel / blk)
+        .map(|b| half::f16::from_f32(sc[b * blk]).to_bits())
         .collect();
-    let mins: Vec<u16> = (0..numel / 16)
-        .map(|b| half::f16::from_f32(mn[b * 16]).to_bits())
+    let mins: Vec<u16> = (0..numel / blk)
+        .map(|b| half::f16::from_f32(mn[b * blk]).to_bits())
         .collect();
     (quants, scales, mins)
 }
@@ -311,12 +341,15 @@ fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
         .clone();
     if is_quant(info.dtype) {
         let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+        let (bits, blk) = quant_params(info.dtype);
         let (qv, sc, mn) = dequant_unified(info.dtype, bytes);
-        let (q, s, m) = pack_unified(&qv, &sc, &mn);
+        let (q, s, m) = pack_unified(&qv, &sc, &mn, bits, blk);
         Ok(Wt::Q {
             q: be.upload_weight_bytes(bytemuck::cast_slice(&q))?,
             s: be.upload_weight_bytes(bytemuck::cast_slice(&s))?,
             m: be.upload_weight_bytes(bytemuck::cast_slice(&m))?,
+            bits,
+            blk_shift: blk.trailing_zeros(),
         })
     } else {
         Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes(g, name)?)?))
@@ -418,12 +451,13 @@ impl Llama {
                 let ub = g
                     .tensor_bytes(&p("ffn_up.weight"))
                     .map_err(|e| anyhow!("{e}"))?;
+                let (bits, blk) = quant_params(dt);
                 let (mut qv, mut sc, mut mn) = dequant_unified(dt, gb);
                 let (qu, scu, mnu) = dequant_unified(dt, ub);
                 qv.extend(qu);
                 sc.extend(scu);
                 mn.extend(mnu);
-                let (q, s, m) = pack_unified(&qv, &sc, &mn);
+                let (q, s, m) = pack_unified(&qv, &sc, &mn, bits, blk);
                 Wt::Q {
                     q: be
                         .upload_weight_bytes(bytemuck::cast_slice(&q))
@@ -434,6 +468,8 @@ impl Llama {
                     m: be
                         .upload_weight_bytes(bytemuck::cast_slice(&m))
                         .map_err(|e| anyhow!("wgateup {l}: {e}"))?,
+                    bits,
+                    blk_shift: blk.trailing_zeros(),
                 }
             } else {
                 let mut gateup = f16_bytes(&g, &p("ffn_gate.weight"))?;
@@ -780,9 +816,24 @@ impl Llama {
         let lin = |w: &Wt, x: &dyn Buffer, y: &dyn Buffer, rows: usize, inf: usize, outf: usize| {
             match w {
                 Wt::F16(b) => rec.linear(b.as_ref(), x, y, rows, inf, outf),
-                Wt::Q { q, s, m } => {
-                    rec.linear_q(q.as_ref(), s.as_ref(), m.as_ref(), x, y, rows, inf, outf)
-                }
+                Wt::Q {
+                    q,
+                    s,
+                    m,
+                    bits,
+                    blk_shift,
+                } => rec.linear_q(
+                    q.as_ref(),
+                    s.as_ref(),
+                    m.as_ref(),
+                    x,
+                    y,
+                    rows,
+                    inf,
+                    outf,
+                    *bits,
+                    *blk_shift,
+                ),
             }
         };
         let lin_add = |w: &Wt,
@@ -793,7 +844,13 @@ impl Llama {
                        inf: usize,
                        outf: usize| match w {
             Wt::F16(b) => rec.linear_add(b.as_ref(), x, res, y, rows, inf, outf),
-            Wt::Q { q, s, m } => rec.linear_add_q(
+            Wt::Q {
+                q,
+                s,
+                m,
+                bits,
+                blk_shift,
+            } => rec.linear_add_q(
                 q.as_ref(),
                 s.as_ref(),
                 m.as_ref(),
@@ -803,6 +860,8 @@ impl Llama {
                 rows,
                 inf,
                 outf,
+                *bits,
+                *blk_shift,
             ),
         };
         let ffn = |hidden: &dyn Buffer,
@@ -814,7 +873,13 @@ impl Llama {
                    nff: usize,
                    eps: f32| match w {
             Wt::F16(b) => rec.ffn_in(hidden, nw, b.as_ref(), act, rows, ne, nff, eps),
-            Wt::Q { q, s, m } => rec.ffn_in_q(
+            Wt::Q {
+                q,
+                s,
+                m,
+                bits,
+                blk_shift,
+            } => rec.ffn_in_q(
                 hidden,
                 nw,
                 q.as_ref(),
@@ -825,6 +890,8 @@ impl Llama {
                 ne,
                 nff,
                 eps,
+                *bits,
+                *blk_shift,
             ),
         };
         for (li, layer) in self.layers.iter().enumerate() {

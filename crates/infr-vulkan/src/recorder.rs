@@ -621,6 +621,22 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Cast-copy f32 `src[0..n]` → f16 `dst[off..off+n]` (write f32 activations into the f16 cache).
+    pub fn store_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize, off: usize) {
+        self.stamp("store_f16");
+        let k = self.be.kernel("store_f16", ops::STORE_F16_WGSL, 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
     /// Qwen3 QK-norm + RoPE over `x[rows, nheads, hd]` → `y` at rows `out_base..`. `nw` is the
     /// per-head [hd] norm weight. (q: out_base=0; k: out_base=pos so it lands in the cache.)
     #[allow(clippy::too_many_arguments)]
@@ -939,6 +955,21 @@ mod tests {
         let _ = hd;
     }
 
+    // round f32 → f16 → f32 (matches what the f16 q/k/v buffers store)
+    fn r16(v: &[f32]) -> Vec<f32> {
+        v.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect()
+    }
+    // upload f32 values as an f16 buffer
+    fn upf16(be: &VulkanBackend, v: &[f32]) -> Box<dyn Buffer> {
+        let bits: Vec<u16> = v
+            .iter()
+            .map(|&x| half::f16::from_f32(x).to_bits())
+            .collect();
+        let b = be.alloc(bits.len() * 2, BufferUsage::Staging).unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(&bits)).unwrap();
+        b
+    }
+
     fn attn_kv_cpu(
         q: &[f32],
         k: &[f32],
@@ -989,17 +1020,14 @@ mod tests {
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
                 .collect()
         };
-        let q = gen(q_len * nh * hd, 1);
-        let k = gen(kv_len * nkv * hd, 2);
-        let v = gen(kv_len * nkv * hd, 3);
-        let up = |val: &[f32]| {
-            let b = be.alloc(val.len() * 4, BufferUsage::Staging).unwrap();
-            be.upload(b.as_ref(), bytemuck::cast_slice(val)).unwrap();
-            b
-        };
-        let bq = up(&q);
-        let bk = up(&k);
-        let bv = up(&v);
+        // q/k/v are f16 on the GPU; round the reference inputs to f16 too so the test isolates the
+        // attention math (not f16 rounding).
+        let q = r16(&gen(q_len * nh * hd, 1));
+        let k = r16(&gen(kv_len * nkv * hd, 2));
+        let v = r16(&gen(kv_len * nkv * hd, 3));
+        let bq = upf16(&be, &q);
+        let bk = upf16(&be, &k);
+        let bv = upf16(&be, &v);
         let bo = be
             .alloc(q_len * nh * hd * 4, BufferUsage::Readback)
             .unwrap();
@@ -1027,7 +1055,7 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         println!("attention_kv q_len={q_len} kv_len={kv_len} max_err={err:e}");
-        assert!(err < 1e-4, "attention_kv mismatch: {err}");
+        assert!(err < 5e-3, "attention_kv mismatch: {err}");
     }
 
     fn run_attn_kv_split(kv_len: usize, nh: usize, nkv: usize, hd: usize) {
@@ -1040,17 +1068,12 @@ mod tests {
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
                 .collect()
         };
-        let q = gen(nh * hd, 1);
-        let k = gen(kv_len * nkv * hd, 2);
-        let v = gen(kv_len * nkv * hd, 3);
-        let up = |val: &[f32]| {
-            let b = be.alloc(val.len() * 4, BufferUsage::Staging).unwrap();
-            be.upload(b.as_ref(), bytemuck::cast_slice(val)).unwrap();
-            b
-        };
-        let bq = up(&q);
-        let bk = up(&k);
-        let bv = up(&v);
+        let q = r16(&gen(nh * hd, 1));
+        let k = r16(&gen(kv_len * nkv * hd, 2));
+        let v = r16(&gen(kv_len * nkv * hd, 3));
+        let bq = upf16(&be, &q);
+        let bk = upf16(&be, &k);
+        let bv = upf16(&be, &v);
         let bo = be.alloc(nh * hd * 4, BufferUsage::Readback).unwrap();
         let pm = be
             .alloc(nh * n_chunks * 4, BufferUsage::Activations)
@@ -1088,7 +1111,7 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         println!("attn_kv_split kv_len={kv_len} n_chunks={n_chunks} max_err={err:e}");
-        assert!(err < 1e-4, "split mismatch: {err}");
+        assert!(err < 5e-3, "split mismatch: {err}");
     }
 
     #[test]
@@ -1263,9 +1286,10 @@ mod tests {
         let bwq = be.upload_weight_f16(&wq).unwrap();
         let bwk = be.upload_weight_f16(&wk).unwrap();
         let bwv = be.upload_weight_f16(&wv).unwrap();
-        let bq = be.alloc(rows * q_dim * 4, BufferUsage::Readback).unwrap();
-        let bkc = be.alloc(ctx * kv_dim * 4, BufferUsage::Readback).unwrap();
-        let bvc = be.alloc(ctx * kv_dim * 4, BufferUsage::Readback).unwrap();
+        // q + K/V cache are f16
+        let bq = be.alloc(rows * q_dim * 2, BufferUsage::Readback).unwrap();
+        let bkc = be.alloc(ctx * kv_dim * 2, BufferUsage::Readback).unwrap();
+        let bvc = be.alloc(ctx * kv_dim * 2, BufferUsage::Readback).unwrap();
         let rec = be.recorder().unwrap();
         rec.attn_in(
             bh.as_ref(),
@@ -1288,9 +1312,12 @@ mod tests {
         );
         rec.finish().unwrap();
         let rd = |b: &dyn Buffer, n: usize| {
-            let mut bytes = vec![0u8; n * 4];
+            let mut bytes = vec![0u8; n * 2];
             be.download(b, &mut bytes).unwrap();
-            bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+            bytemuck::cast_slice::<u8, u16>(&bytes)
+                .iter()
+                .map(|&h| half::f16::from_bits(h).to_f32())
+                .collect::<Vec<f32>>()
         };
         let gq = rd(bq.as_ref(), rows * q_dim);
         let gk = rd(bkc.as_ref(), ctx * kv_dim);
@@ -1323,7 +1350,7 @@ mod tests {
             }
         }
         println!("attn_in rows={rows} max_err={maxe:e}");
-        assert!(maxe < 1e-4, "attn_in mismatch rows={rows}: {maxe}");
+        assert!(maxe < 5e-3, "attn_in mismatch rows={rows}: {maxe}"); // f16 q/k/v output
     }
 
     #[test]

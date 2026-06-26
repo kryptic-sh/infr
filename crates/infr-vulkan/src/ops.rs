@@ -631,9 +631,9 @@ var<immediate> pc: PC;
 @group(0) @binding(2) var<storage, read>       wq: array<f16>;     // [q_dim, ne] f16
 @group(0) @binding(3) var<storage, read>       wk: array<f16>;     // [kv_dim, ne] f16
 @group(0) @binding(4) var<storage, read>       wv: array<f16>;     // [kv_dim, ne] f16
-@group(0) @binding(5) var<storage, read_write> q: array<f32>;      // [rows, q_dim]
-@group(0) @binding(6) var<storage, read_write> kout: array<f32>;   // KV cache [ctx, kv_dim]
-@group(0) @binding(7) var<storage, read_write> vout: array<f32>;   // KV cache [ctx, kv_dim]
+@group(0) @binding(5) var<storage, read_write> q: array<f16>;      // [rows, q_dim] f16
+@group(0) @binding(6) var<storage, read_write> kout: array<f16>;   // KV cache [ctx, kv_dim] f16
+@group(0) @binding(7) var<storage, read_write> vout: array<f16>;   // KV cache [ctx, kv_dim] f16
 
 var<workgroup> r_ss: array<f32, 64>;
 var<workgroup> r_a: array<f32, 64>; // even column partial
@@ -692,8 +692,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         var b = r_b[0] * scale;
         if region == 2u {
             let vc = col - pc.q_dim - pc.kv_dim;
-            vout[(pc.pos + r) * pc.kv_dim + vc] = a;
-            vout[(pc.pos + r) * pc.kv_dim + vc + 1u] = b;
+            vout[(pc.pos + r) * pc.kv_dim + vc] = f16(a);
+            vout[(pc.pos + r) * pc.kv_dim + vc + 1u] = f16(b);
         } else {
             // RoPE the (a,b) pair at within-head index ih (even)
             let local = select(col - pc.q_dim, col, region == 0u);
@@ -707,11 +707,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 ob = a * s + b * co;
             }
             if region == 0u {
-                q[r * pc.q_dim + col] = oa;
-                q[r * pc.q_dim + col + 1u] = ob;
+                q[r * pc.q_dim + col] = f16(oa);
+                q[r * pc.q_dim + col + 1u] = f16(ob);
             } else {
-                kout[(pc.pos + r) * pc.kv_dim + local] = oa;
-                kout[(pc.pos + r) * pc.kv_dim + local + 1u] = ob;
+                kout[(pc.pos + r) * pc.kv_dim + local] = f16(oa);
+                kout[(pc.pos + r) * pc.kv_dim + local + 1u] = f16(ob);
             }
         }
     }
@@ -771,11 +771,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// running accumulator by exp(m_old - m_new). `hd<=128`. Used for prefill and short decode; long
 /// single-token decode uses the split-K path instead. (Replaces the version that capped at 8192.)
 pub(crate) const ATTENTION_KV_WGSL: &str = r#"
+enable f16;
 struct PC { q_len: u32, kv_len: u32, nh: u32, nkv: u32, hd: u32, pos_offset: u32 }
 var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       q: array<f32>;
-@group(0) @binding(1) var<storage, read>       k: array<f32>;
-@group(0) @binding(2) var<storage, read>       v: array<f32>;
+@group(0) @binding(0) var<storage, read>       q: array<f16>;  // q/k/v are f16
+@group(0) @binding(1) var<storage, read>       k: array<f16>;
+@group(0) @binding(2) var<storage, read>       v: array<f16>;
 @group(0) @binding(3) var<storage, read_write> o: array<f32>;
 
 const TILE: u32 = 1024u;
@@ -797,7 +798,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     let scale = 1.0 / sqrt(f32(hd));
 
     let qbase = (ti * pc.nh + h) * hd;
-    for (var d: u32 = t; d < hd; d = d + 64u) { q_sh[d] = q[qbase + d]; }
+    for (var d: u32 = t; d < hd; d = d + 64u) { q_sh[d] = f32(q[qbase + d]); }
     workgroupBarrier();
 
     // running softmax state; acc held in registers (thread t owns output dims t and t+64)
@@ -817,7 +818,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         for (var j: u32 = ts + t; j < te; j = j + 64u) {
             let kbase = (j * pc.nkv + kvh) * hd;
             var dot: f32 = 0.0;
-            for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q_sh[d] * k[kbase + d]; }
+            for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q_sh[d] * f32(k[kbase + d]); }
             let s = dot * scale;
             sc[j - ts] = s;
             lmax = max(lmax, s);
@@ -852,12 +853,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         m = mnew;
         if t < hd {
             var a: f32 = 0.0;
-            for (var j: u32 = ts; j < te; j = j + 1u) { a = a + sc[j - ts] * v[(j * pc.nkv + kvh) * hd + t]; }
+            for (var j: u32 = ts; j < te; j = j + 1u) { a = a + sc[j - ts] * f32(v[(j * pc.nkv + kvh) * hd + t]); }
             acc0 = acc0 * corr + a;
         }
         if t + 64u < hd {
             var a: f32 = 0.0;
-            for (var j: u32 = ts; j < te; j = j + 1u) { a = a + sc[j - ts] * v[(j * pc.nkv + kvh) * hd + t + 64u]; }
+            for (var j: u32 = ts; j < te; j = j + 1u) { a = a + sc[j - ts] * f32(v[(j * pc.nkv + kvh) * hd + t + 64u]); }
             acc1 = acc1 * corr + a;
         }
         workgroupBarrier(); // sc reused next tile
@@ -871,15 +872,31 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
+/// Cast-copy f32 → f16 into `dst` at element offset `off` (for writing f32 activations into the
+/// f16 KV cache). One thread per element.
+pub(crate) const STORE_F16_WGSL: &str = r#"
+enable f16;
+struct PC { n: u32, off: u32 }
+var<immediate> pc: PC;
+@group(0) @binding(0) var<storage, read>       src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f16>;
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if gid.x >= pc.n { return; }
+    dst[pc.off + gid.x] = f16(src[gid.x]);
+}
+"#;
+
 /// Qwen3 QK-norm + RoPE: ONE workgroup per (token, head). RMS-normalizes the head's `hd`-vector
 /// (weight `nw`) then applies ggml-NORM-interleaved RoPE. Reads raw projections `x[rows,nheads,hd]`,
 /// writes to `y` at row `out_base + r` (q→0, k→cache pos). `hd<=128`.
 pub(crate) const QK_NORM_ROPE_WGSL: &str = r#"
+enable f16;
 struct PC { rows: u32, nheads: u32, hd: u32, rope_dim: u32, theta: f32, rope_pos: u32, out_base: u32, eps: f32 }
 var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       x: array<f32>;  // [rows, nheads, hd]
+@group(0) @binding(0) var<storage, read>       x: array<f32>;  // [rows, nheads, hd] raw projections
 @group(0) @binding(1) var<storage, read>       nw: array<f32>; // [hd]
-@group(0) @binding(2) var<storage, read_write> y: array<f32>;  // [*, nheads, hd]
+@group(0) @binding(2) var<storage, read_write> y: array<f16>;  // q buffer / KV cache (f16)
 
 var<workgroup> xs: array<f32, 128>;
 var<workgroup> red: array<f32, 64>;
@@ -917,8 +934,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         let ang = f32(abs) * freq;
         let s = sin(ang);
         let co = cos(ang);
-        y[out_base_idx + i0] = a * co - b * s;
-        y[out_base_idx + i1] = a * s + b * co;
+        y[out_base_idx + i0] = f16(a * co - b * s);
+        y[out_base_idx + i1] = f16(a * s + b * co);
     }
 }
 "#;
@@ -929,11 +946,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 /// context (the non-split kernel used only `nh` workgroups). Combine merges them. `hd<=128`,
 /// `chunk<=1024`. q is `[nh, hd]` (q_len==1).
 pub(crate) const ATTN_PARTIAL_WGSL: &str = r#"
+enable f16;
 struct PC { kv_len: u32, nh: u32, nkv: u32, hd: u32, chunk: u32, n_chunks: u32 }
 var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       q: array<f32>;    // [nh, hd]
-@group(0) @binding(1) var<storage, read>       k: array<f32>;    // cache [kv_len, nkv, hd]
-@group(0) @binding(2) var<storage, read>       v: array<f32>;
+@group(0) @binding(0) var<storage, read>       q: array<f16>;    // [nh, hd] f16
+@group(0) @binding(1) var<storage, read>       k: array<f16>;    // cache [kv_len, nkv, hd] f16
+@group(0) @binding(2) var<storage, read>       v: array<f16>;
 @group(0) @binding(3) var<storage, read_write> pm: array<f32>;   // [nh, n_chunks]
 @group(0) @binding(4) var<storage, read_write> pl: array<f32>;   // [nh, n_chunks]
 @group(0) @binding(5) var<storage, read_write> pacc: array<f32>; // [nh, n_chunks, hd]
@@ -955,14 +973,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     var j1 = j0 + pc.chunk;
     if j1 > pc.kv_len { j1 = pc.kv_len; }
 
-    for (var d: u32 = t; d < hd; d = d + 64u) { q_sh[d] = q[h * hd + d]; }
+    for (var d: u32 = t; d < hd; d = d + 64u) { q_sh[d] = f32(q[h * hd + d]); }
     workgroupBarrier();
 
     var lmax: f32 = -3.0e38;
     for (var j: u32 = j0 + t; j < j1; j = j + 64u) {
         let kbase = (j * pc.nkv + kvh) * hd;
         var dot: f32 = 0.0;
-        for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q_sh[d] * k[kbase + d]; }
+        for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q_sh[d] * f32(k[kbase + d]); }
         let s = dot * scale;
         sc[j - j0] = s;
         lmax = max(lmax, s);
@@ -994,7 +1012,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     for (var d: u32 = t; d < hd; d = d + 64u) {
         var acc: f32 = 0.0;
         for (var j: u32 = j0; j < j1; j = j + 1u) {
-            acc = acc + sc[j - j0] * v[(j * pc.nkv + kvh) * hd + d];
+            acc = acc + sc[j - j0] * f32(v[(j * pc.nkv + kvh) * hd + d]);
         }
         pacc[pbase + d] = acc;
     }

@@ -732,14 +732,15 @@ impl Llama {
         let mut k = Vec::with_capacity(c.n_layer);
         let mut v = Vec::with_capacity(c.n_layer);
         for _ in 0..c.n_layer {
+            // f16 KV cache: 2 bytes/elem (half the f32 footprint that grows with context).
             k.push(
                 self.be
-                    .alloc(max_ctx * row * 4, BufferUsage::Activations)
+                    .alloc(max_ctx * row * 2, BufferUsage::Activations)
                     .map_err(|e| anyhow!("{e}"))?,
             );
             v.push(
                 self.be
-                    .alloc(max_ctx * row * 4, BufferUsage::Activations)
+                    .alloc(max_ctx * row * 2, BufferUsage::Activations)
                     .map_err(|e| anyhow!("{e}"))?,
             );
         }
@@ -775,7 +776,11 @@ impl Llama {
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
             .map_err(|e| anyhow!("{e}"))?;
         let hn = alloc(n * ne, BufferUsage::Activations)?;
-        let q = alloc(n * nh * hd, BufferUsage::Activations)?;
+        // q is f16 (read by the f16 attention kernels), like the KV cache.
+        let q = self
+            .be
+            .alloc((n * nh * hd * 2).max(4), BufferUsage::Activations)
+            .map_err(|e| anyhow!("{e}"))?;
         let attn = alloc(n * nh * hd, BufferUsage::Activations)?;
         let act = alloc(n * nff, BufferUsage::Activations)?;
         let logits = alloc(n * c.vocab, BufferUsage::Readback)?;
@@ -934,12 +939,8 @@ impl Llama {
                     pos,
                     c.rms_eps,
                 );
-                rec.copy(
-                    vr.as_ref(),
-                    kv.v[li].as_ref(),
-                    pos * kvrow * 4,
-                    n * kvrow * 4,
-                );
+                // v_raw is f32; cast into the f16 V cache at row offset `pos`.
+                rec.store_f16(vr.as_ref(), kv.v[li].as_ref(), n * kvrow, pos * kvrow);
             } else {
                 rec.attn_in(
                     hidden.as_ref(),

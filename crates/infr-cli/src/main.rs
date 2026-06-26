@@ -204,6 +204,9 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         if line.is_empty() {
             continue;
         }
+        if matches!(line, "exit" | "quit" | ":q" | ":quit") {
+            break;
+        }
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
         let mut render = ThinkRender::new();

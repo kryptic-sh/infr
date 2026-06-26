@@ -77,14 +77,17 @@ fn cmd_pull(model: &str) -> anyhow::Result<()> {
 }
 
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
+    use std::io::Write;
+    const MAX_CTX: usize = 8192;
+    const MAX_NEW: usize = 256;
     let (gguf, tok) = resolve(model)?;
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
-    let one_shot = |msg: &str| -> anyhow::Result<()> {
-        use std::io::Write;
-        let prompt = llama.chatml(msg);
+
+    // One-shot message: single fresh generation, no persisted context.
+    if let Some(m) = message {
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
-        llama.generate(&prompt, 256, |piece| {
+        llama.generate(&llama.chatml(m), MAX_NEW, |piece| {
             print!("{piece}");
             let _ = std::io::stdout().flush();
             n += 1;
@@ -92,16 +95,14 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         let dt = t0.elapsed().as_secs_f32();
         println!();
         eprintln!("[{n} tokens, {dt:.2}s, {:.1} tok/s]", n as f32 / dt);
-        Ok(())
-    };
-    if let Some(m) = message {
-        return one_shot(m);
+        return Ok(());
     }
-    // REPL
-    use std::io::Write;
+
+    // REPL: a persistent chat session keeps prior turns in the KV cache (multi-turn context).
+    let mut session = llama.chat_session(MAX_CTX)?;
     let stdin = std::io::stdin();
     loop {
-        print!("\n> ");
+        print!("\n[ctx {}/{}] > ", session.ctx_len(), session.max_ctx());
         std::io::stdout().flush().ok();
         let mut line = String::new();
         if stdin.read_line(&mut line)? == 0 {
@@ -111,7 +112,28 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         if line.is_empty() {
             continue;
         }
-        one_shot(line)?;
+        let t0 = std::time::Instant::now();
+        let mut n = 0usize;
+        match session.turn(line, MAX_NEW, |piece| {
+            print!("{piece}");
+            let _ = std::io::stdout().flush();
+            n += 1;
+        }) {
+            Ok(_) => {
+                let dt = t0.elapsed().as_secs_f32();
+                println!();
+                eprintln!(
+                    "[{n} tokens, {dt:.2}s, {:.1} tok/s | ctx {}/{}]",
+                    n as f32 / dt,
+                    session.ctx_len(),
+                    session.max_ctx()
+                );
+            }
+            Err(e) => {
+                println!();
+                eprintln!("error: {e}");
+            }
+        }
     }
     Ok(())
 }

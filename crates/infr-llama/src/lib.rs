@@ -1316,35 +1316,27 @@ impl Llama {
         (raw / 64 * 64).max(64)
     }
 
-    /// Greedy generate up to `max_new` tokens after `prompt` (already a chat-formatted string).
-    pub fn generate(
+    /// Prefill `new_tokens` into `kv`, then greedily decode up to `max_new` tokens (stop at EOS),
+    /// streaming each decoded piece to `on_token`. Returns the generated token ids. `kv` carries the
+    /// context, so repeated calls on the same `kv` continue one conversation. The EOS token is not
+    /// appended to the cache.
+    fn run_in_cache(
         &self,
-        prompt: &str,
+        new_tokens: &[u32],
+        kv: &mut KvCache,
         max_new: usize,
         mut on_token: impl FnMut(&str),
-    ) -> Result<String> {
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
-        let mut generated: Vec<u32> = Vec::new();
-
-        // Size the KV cache to exactly what this run needs — bounded only by VRAM, not a fixed cap.
-        let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
-        // Prefill: one submit over a very long prompt can exceed the GPU watchdog (TDR /
-        // device-lost), since each attention/matmul dispatch grows with tokens × context. Short
-        // prompts go in one fast pass; long ones are split into small chunks that stay well under
-        // the watchdog. (A real GEMM prefill path would let chunks be large; GEMV is the current
-        // limit — see coopmat-prefill TODO.) Only the last chunk's logits matter.
-        let len = prompt_tokens.len();
+    ) -> Result<Vec<u32>> {
+        // Prefill in chunks sized by context depth (kv.len) to stay under the GPU watchdog.
+        let len = new_tokens.len();
         let mut logits = Vec::new();
         let mut i = 0;
         while i < len {
-            let end = (i + self.prefill_chunk(i)).min(len);
-            logits = self.forward_resident_kv(&prompt_tokens[i..end], &mut kv)?;
+            let end = (i + self.prefill_chunk(kv.len)).min(len);
+            logits = self.forward_resident_kv(&new_tokens[i..end], kv)?;
             i = end;
         }
+        let mut generated: Vec<u32> = Vec::new();
         for _ in 0..max_new {
             let next = argmax(&logits) as u32;
             if next == self.cfg.eos {
@@ -1354,17 +1346,105 @@ impl Llama {
             if let Ok(piece) = self.tokenizer.decode(&[next], false) {
                 on_token(&piece);
             }
-            // decode step: single new token, attends over the cache
-            logits = self.forward_resident_kv(&[next], &mut kv)?;
+            logits = self.forward_resident_kv(&[next], kv)?;
         }
+        Ok(generated)
+    }
+
+    /// Greedy generate up to `max_new` tokens after `prompt` (already a chat-formatted string).
+    /// One-shot: uses a fresh KV cache. For multi-turn context use [`Llama::chat_session`].
+    pub fn generate(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        on_token: impl FnMut(&str),
+    ) -> Result<String> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        // Size the KV cache to exactly what this run needs — bounded only by VRAM, not a fixed cap.
+        let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
+        let generated = self.run_in_cache(&prompt_tokens, &mut kv, max_new, on_token)?;
         self.tokenizer
             .decode(&generated, true)
             .map_err(|e| anyhow!("decode: {e}"))
     }
 
+    /// Start a stateful multi-turn chat with a KV cache sized for `max_ctx` tokens. Each turn keeps
+    /// prior context resident, so only the new tokens are prefilled.
+    pub fn chat_session(&self, max_ctx: usize) -> Result<ChatSession<'_>> {
+        Ok(ChatSession {
+            llama: self,
+            kv: self.new_kv(max_ctx)?,
+            started: false,
+        })
+    }
+
     /// Wrap a user message in the SmolLM2 ChatML template.
     pub fn chatml(&self, user: &str) -> String {
         format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
+    }
+}
+
+/// A stateful multi-turn chat over a persistent KV cache (so the model sees prior turns). Create via
+/// [`Llama::chat_session`]; call [`ChatSession::turn`] per user message.
+pub struct ChatSession<'a> {
+    llama: &'a Llama,
+    kv: KvCache,
+    started: bool,
+}
+
+impl ChatSession<'_> {
+    /// Tokens of context currently held (all prior turns + their replies).
+    pub fn ctx_len(&self) -> usize {
+        self.kv.len
+    }
+
+    /// KV-cache capacity in tokens.
+    pub fn max_ctx(&self) -> usize {
+        self.kv.max_ctx
+    }
+
+    /// Run one user turn: append the message in ChatML, decode the assistant reply (streamed to
+    /// `on_token`), and keep it all in the cache for the next turn. Returns the reply text.
+    pub fn turn(
+        &mut self,
+        user: &str,
+        max_new: usize,
+        on_token: impl FnMut(&str),
+    ) -> Result<String> {
+        // Open this user turn; for turns after the first, first close the prior assistant turn
+        // (its EOS/`<|im_end|>` was not kept in the cache).
+        let text = if self.started {
+            format!("<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
+        } else {
+            format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
+        };
+        let enc = self
+            .llama
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let toks = enc.get_ids();
+        if self.kv.len + toks.len() + max_new + 1 > self.kv.max_ctx {
+            bail!(
+                "context full: {} held + {} prompt + {} max_new > {} cap — start a new session",
+                self.kv.len,
+                toks.len(),
+                max_new,
+                self.kv.max_ctx
+            );
+        }
+        self.started = true;
+        let generated = self
+            .llama
+            .run_in_cache(toks, &mut self.kv, max_new, on_token)?;
+        self.llama
+            .tokenizer
+            .decode(&generated, true)
+            .map_err(|e| anyhow!("decode: {e}"))
     }
 }
 

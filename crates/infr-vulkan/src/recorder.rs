@@ -496,6 +496,70 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Flash-decoding attention (q_len==1): split the KV range into `n_chunks` chunks of `chunk`,
+    /// compute per-chunk softmax partials in parallel (`pm`/`pl`/`pacc`), then combine into `o`.
+    /// Parallelizes attention across `nh*n_chunks` workgroups so it stays fast at long context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+    ) {
+        // pass 1: per-chunk partials
+        self.stamp("attn_partial");
+        let k1 = self
+            .be
+            .kernel("attn_partial", ops::ATTN_PARTIAL_WGSL, 6, 24);
+        let mut p1 = [0u8; 24];
+        p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p1[16..20].copy_from_slice(&(chunk as u32).to_ne_bytes());
+        p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        self.dispatch(
+            k1,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(pm),
+                Self::vkb(pl),
+                Self::vkb(pacc),
+            ],
+            3,
+            &p1,
+            (nh * n_chunks) as u32,
+        );
+        // pass 2: combine
+        self.stamp("attn_combine");
+        let k2 = self
+            .be
+            .kernel("attn_combine", ops::ATTN_COMBINE_WGSL, 4, 12);
+        let mut p2 = [0u8; 12];
+        p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p2[8..12].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        self.dispatch(
+            k2,
+            &[Self::vkb(pm), Self::vkb(pl), Self::vkb(pacc), Self::vkb(o)],
+            1,
+            &p2,
+            nh as u32,
+        );
+    }
+
     /// Record a buffer→buffer copy of `bytes` from `src[0..]` into `dst[dst_offset..]`.
     /// Used to append new K/V rows into the persistent cache.
     pub fn copy(&self, src: &dyn Buffer, dst: &dyn Buffer, dst_offset: usize, bytes: usize) {
@@ -802,19 +866,90 @@ mod tests {
         assert!(err < 1e-4, "attention_kv mismatch: {err}");
     }
 
+    fn run_attn_kv_split(kv_len: usize, nh: usize, nkv: usize, hd: usize) {
+        let be = VulkanBackend::new().unwrap();
+        let chunk = 512usize;
+        let n_chunks = kv_len.div_ceil(chunk);
+        let pos_offset = kv_len - 1; // decode: one new token at the end
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        let q = gen(nh * hd, 1);
+        let k = gen(kv_len * nkv * hd, 2);
+        let v = gen(kv_len * nkv * hd, 3);
+        let up = |val: &[f32]| {
+            let b = be.alloc(val.len() * 4, BufferUsage::Staging).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(val)).unwrap();
+            b
+        };
+        let bq = up(&q);
+        let bk = up(&k);
+        let bv = up(&v);
+        let bo = be.alloc(nh * hd * 4, BufferUsage::Readback).unwrap();
+        let pm = be
+            .alloc(nh * n_chunks * 4, BufferUsage::Activations)
+            .unwrap();
+        let pl = be
+            .alloc(nh * n_chunks * 4, BufferUsage::Activations)
+            .unwrap();
+        let pacc = be
+            .alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_kv_split(
+            bq.as_ref(),
+            bk.as_ref(),
+            bv.as_ref(),
+            bo.as_ref(),
+            pm.as_ref(),
+            pl.as_ref(),
+            pacc.as_ref(),
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; nh * hd * 4];
+        be.download(bo.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let want = attn_kv_cpu(&q, &k, &v, 1, nh, nkv, hd, pos_offset);
+        let err = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!("attn_kv_split kv_len={kv_len} n_chunks={n_chunks} max_err={err:e}");
+        assert!(err < 1e-4, "split mismatch: {err}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_kv_split_matches_cpu() {
+        run_attn_kv_split(600, 9, 3, 64); // 2 chunks
+        run_attn_kv_split(2050, 9, 3, 64); // 5 chunks, partial last
+        run_attn_kv_split(8000, 4, 2, 32); // 16 chunks
+    }
+
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_kv_decode_matches_cpu() {
-        // decode: 1 new token over a long cache (exercises the 64-way KV split + reduce)
+        // decode: 1 new token over a cache; 2500 exercises multi-tile flash (>TILE=1024)
         run_attn_kv(1, 200, 9, 3, 64);
         run_attn_kv(1, 13, 4, 2, 32);
         run_attn_kv(1, 1, 4, 2, 32);
+        run_attn_kv(1, 2500, 9, 3, 64);
     }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_kv_prefill_matches_cpu() {
         run_attn_kv(17, 17, 9, 3, 64);
+        run_attn_kv(40, 1500, 9, 3, 64); // multi-tile prefill (kv_len > TILE)
     }
 
     #[test]

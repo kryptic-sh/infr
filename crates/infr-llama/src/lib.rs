@@ -485,6 +485,23 @@ impl Llama {
         let act = alloc(n * nff, BufferUsage::Activations)?;
         let logits = alloc(n * c.vocab, BufferUsage::Readback)?;
 
+        // Flash-decoding: for single-token decode at long context, split each head's KV range
+        // across many workgroups (partials in pm/pl/pacc), so attention isn't stuck on `nh`
+        // workgroups. Reused across layers.
+        const CHUNK: usize = 256;
+        let kv_len = pos + n;
+        let use_split = n == 1 && kv_len > CHUNK;
+        let n_chunks = if use_split { kv_len.div_ceil(CHUNK) } else { 0 };
+        let split_bufs = if use_split {
+            Some((
+                alloc(nh * n_chunks, BufferUsage::Activations)?,
+                alloc(nh * n_chunks, BufferUsage::Activations)?,
+                alloc(nh * n_chunks * hd, BufferUsage::Activations)?,
+            ))
+        } else {
+            None
+        };
+
         let prof = std::env::var("INFR_PROF").is_ok();
         let t_rec = std::time::Instant::now();
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
@@ -508,18 +525,36 @@ impl Llama {
                 pos,
                 c.rms_eps,
             );
-            rec.attention_kv(
-                q.as_ref(),
-                kv.k[li].as_ref(),
-                kv.v[li].as_ref(),
-                attn.as_ref(),
-                n,
-                pos + n,
-                nh,
-                nkv,
-                hd,
-                pos,
-            );
+            if let Some((pm, pl, pacc)) = &split_bufs {
+                rec.attention_kv_split(
+                    q.as_ref(),
+                    kv.k[li].as_ref(),
+                    kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    pm.as_ref(),
+                    pl.as_ref(),
+                    pacc.as_ref(),
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    CHUNK,
+                    n_chunks,
+                );
+            } else {
+                rec.attention_kv(
+                    q.as_ref(),
+                    kv.k[li].as_ref(),
+                    kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    n,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                );
+            }
             rec.linear_add(
                 layer.wo.as_ref(),
                 attn.as_ref(),
@@ -598,7 +633,8 @@ impl Llama {
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
         let mut generated: Vec<u32> = Vec::new();
 
-        let mut kv = self.new_kv((prompt_tokens.len() + max_new + 8).min(8192))?;
+        // Size the KV cache to exactly what this run needs — bounded only by VRAM, not a fixed cap.
+        let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
         // prefill the whole prompt in one resident pass
         let mut logits = self.forward_resident_kv(&prompt_tokens, &mut kv)?;
         for _ in 0..max_new {

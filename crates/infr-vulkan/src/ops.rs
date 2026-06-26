@@ -696,12 +696,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-/// Cached GQA attention, two-pass. ONE workgroup per (query token, head). Pass 1 parallelizes the
-/// scores over KV positions (threads stride j) into shared, with a cheap scalar max/sum reduction;
-/// pass 3 parallelizes the V-weighted sum over the HEAD dimension (one thread per output d sums all
-/// positions) — so there is NO wide accumulator reduction, only two 1-float reductions. Far less
-/// overhead at short context than the online-softmax-with-acc-merge it replaces. `hd<=128`,
-/// `kv_len<=8192`.
+/// Cached GQA attention, TILED flash (one workgroup per (query token, head)). Streams the KV in
+/// tiles of `TILE` so shared memory is O(TILE), not O(kv_len) — works for ANY context length
+/// (bounded only by the KV-cache VRAM, not a fixed shared array). Per tile: scores into shared
+/// (parallel over j, scalar max reduce), exponentiate (scalar sum reduce), then accumulate the
+/// V-weighted sum parallel over the head dim (thread d owns d=t and d=t+64), online-rescaling the
+/// running accumulator by exp(m_old - m_new). `hd<=128`. Used for prefill and short decode; long
+/// single-token decode uses the split-K path instead. (Replaces the version that capped at 8192.)
 pub(crate) const ATTENTION_KV_WGSL: &str = r#"
 struct PC { q_len: u32, kv_len: u32, nh: u32, nkv: u32, hd: u32, pos_offset: u32 }
 var<immediate> pc: PC;
@@ -710,8 +711,9 @@ var<immediate> pc: PC;
 @group(0) @binding(2) var<storage, read>       v: array<f32>;
 @group(0) @binding(3) var<storage, read_write> o: array<f32>;
 
+const TILE: u32 = 1024u;
 var<workgroup> q_sh: array<f32, 128>;
-var<workgroup> sc: array<f32, 8192>; // scores / probabilities for this (token,head)
+var<workgroup> sc: array<f32, 1024>; // one KV tile of scores/probabilities
 var<workgroup> red: array<f32, 64>;
 
 @compute @workgroup_size(64, 1, 1)
@@ -731,54 +733,184 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     for (var d: u32 = t; d < hd; d = d + 64u) { q_sh[d] = q[qbase + d]; }
     workgroupBarrier();
 
-    // pass 1: scores s_j = scale * (q · k_j), parallel over j; track local max
+    // running softmax state; acc held in registers (thread t owns output dims t and t+64)
+    var m: f32 = -3.0e38;
+    var l: f32 = 0.0;
+    var acc0: f32 = 0.0;
+    var acc1: f32 = 0.0;
+
+    var ts: u32 = 0u;
+    loop {
+        if ts >= kvlen { break; }
+        var te = ts + TILE;
+        if te > kvlen { te = kvlen; }
+
+        // scores for this tile → sc[0..te-ts], local max
+        var lmax: f32 = -3.0e38;
+        for (var j: u32 = ts + t; j < te; j = j + 64u) {
+            let kbase = (j * pc.nkv + kvh) * hd;
+            var dot: f32 = 0.0;
+            for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q_sh[d] * k[kbase + d]; }
+            let s = dot * scale;
+            sc[j - ts] = s;
+            lmax = max(lmax, s);
+        }
+        red[t] = lmax;
+        workgroupBarrier();
+        var stride = 32u;
+        loop { if stride == 0u { break; }
+            if t < stride { red[t] = max(red[t], red[t + stride]); }
+            workgroupBarrier(); stride = stride / 2u; }
+        let mnew = max(m, red[0]);
+        workgroupBarrier();
+
+        // exp(s - mnew) → sc, local sum
+        var lsum: f32 = 0.0;
+        for (var j: u32 = ts + t; j < te; j = j + 64u) {
+            let p = exp(sc[j - ts] - mnew);
+            sc[j - ts] = p;
+            lsum = lsum + p;
+        }
+        red[t] = lsum;
+        workgroupBarrier();
+        stride = 32u;
+        loop { if stride == 0u { break; }
+            if t < stride { red[t] = red[t] + red[t + stride]; }
+            workgroupBarrier(); stride = stride / 2u; }
+        let tsum = red[0];
+
+        // online-rescale accumulator and add this tile's V contribution (parallel over d)
+        let corr = exp(m - mnew);
+        l = l * corr + tsum;
+        m = mnew;
+        if t < hd {
+            var a: f32 = 0.0;
+            for (var j: u32 = ts; j < te; j = j + 1u) { a = a + sc[j - ts] * v[(j * pc.nkv + kvh) * hd + t]; }
+            acc0 = acc0 * corr + a;
+        }
+        if t + 64u < hd {
+            var a: f32 = 0.0;
+            for (var j: u32 = ts; j < te; j = j + 1u) { a = a + sc[j - ts] * v[(j * pc.nkv + kvh) * hd + t + 64u]; }
+            acc1 = acc1 * corr + a;
+        }
+        workgroupBarrier(); // sc reused next tile
+        ts = ts + TILE;
+    }
+
+    let obase = (ti * pc.nh + h) * hd;
+    let inv = 1.0 / l;
+    if t < hd { o[obase + t] = acc0 * inv; }
+    if t + 64u < hd { o[obase + t + 64u] = acc1 * inv; }
+}
+"#;
+
+/// Flash-decoding pass 1 (split-K): ONE workgroup per (head, KV-chunk). Computes that chunk's
+/// softmax partial — max `m`, sum `l`, and un-normalized weighted-V `acc[hd]` (relative to `m`) —
+/// for the single decode query. Many chunks → many workgroups → the GPU stays busy at long
+/// context (the non-split kernel used only `nh` workgroups). Combine merges them. `hd<=128`,
+/// `chunk<=1024`. q is `[nh, hd]` (q_len==1).
+pub(crate) const ATTN_PARTIAL_WGSL: &str = r#"
+struct PC { kv_len: u32, nh: u32, nkv: u32, hd: u32, chunk: u32, n_chunks: u32 }
+var<immediate> pc: PC;
+@group(0) @binding(0) var<storage, read>       q: array<f32>;    // [nh, hd]
+@group(0) @binding(1) var<storage, read>       k: array<f32>;    // cache [kv_len, nkv, hd]
+@group(0) @binding(2) var<storage, read>       v: array<f32>;
+@group(0) @binding(3) var<storage, read_write> pm: array<f32>;   // [nh, n_chunks]
+@group(0) @binding(4) var<storage, read_write> pl: array<f32>;   // [nh, n_chunks]
+@group(0) @binding(5) var<storage, read_write> pacc: array<f32>; // [nh, n_chunks, hd]
+
+var<workgroup> q_sh: array<f32, 128>;
+var<workgroup> sc: array<f32, 1024>;
+var<workgroup> red: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let t = lid.x;
+    let h = wid.x / pc.n_chunks;
+    let c = wid.x % pc.n_chunks;
+    let kvh = h / (pc.nh / pc.nkv);
+    let hd = pc.hd;
+    let scale = 1.0 / sqrt(f32(hd));
+    let j0 = c * pc.chunk;
+    var j1 = j0 + pc.chunk;
+    if j1 > pc.kv_len { j1 = pc.kv_len; }
+
+    for (var d: u32 = t; d < hd; d = d + 64u) { q_sh[d] = q[h * hd + d]; }
+    workgroupBarrier();
+
     var lmax: f32 = -3.0e38;
-    for (var j: u32 = t; j < kvlen; j = j + 64u) {
+    for (var j: u32 = j0 + t; j < j1; j = j + 64u) {
         let kbase = (j * pc.nkv + kvh) * hd;
         var dot: f32 = 0.0;
         for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q_sh[d] * k[kbase + d]; }
         let s = dot * scale;
-        sc[j] = s;
+        sc[j - j0] = s;
         lmax = max(lmax, s);
     }
     red[t] = lmax;
     workgroupBarrier();
     var stride = 32u;
-    loop {
-        if stride == 0u { break; }
+    loop { if stride == 0u { break; }
         if t < stride { red[t] = max(red[t], red[t + stride]); }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
+        workgroupBarrier(); stride = stride / 2u; }
     let m = red[0];
     workgroupBarrier();
 
-    // pass 2: p_j = exp(s_j - m), parallel over j; track local sum
     var lsum: f32 = 0.0;
-    for (var j: u32 = t; j < kvlen; j = j + 64u) {
-        let p = exp(sc[j] - m);
-        sc[j] = p;
+    for (var j: u32 = j0 + t; j < j1; j = j + 64u) {
+        let p = exp(sc[j - j0] - m);
+        sc[j - j0] = p;
         lsum = lsum + p;
     }
     red[t] = lsum;
     workgroupBarrier();
     stride = 32u;
-    loop {
-        if stride == 0u { break; }
+    loop { if stride == 0u { break; }
         if t < stride { red[t] = red[t] + red[t + stride]; }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-    let inv = 1.0 / red[0];
+        workgroupBarrier(); stride = stride / 2u; }
+    let l = red[0];
 
-    // pass 3: o_d = (Σ_j p_j v_j[d]) / l, parallel over d (no accumulator reduction)
-    let obase = (ti * pc.nh + h) * hd;
+    let pbase = (h * pc.n_chunks + c) * hd;
     for (var d: u32 = t; d < hd; d = d + 64u) {
         var acc: f32 = 0.0;
-        for (var j: u32 = 0u; j < kvlen; j = j + 1u) {
-            acc = acc + sc[j] * v[(j * pc.nkv + kvh) * hd + d];
+        for (var j: u32 = j0; j < j1; j = j + 1u) {
+            acc = acc + sc[j - j0] * v[(j * pc.nkv + kvh) * hd + d];
         }
-        o[obase + d] = acc * inv;
+        pacc[pbase + d] = acc;
+    }
+    if t == 0u { pm[h * pc.n_chunks + c] = m; pl[h * pc.n_chunks + c] = l; }
+}
+"#;
+
+/// Flash-decoding pass 2 (combine): ONE workgroup per head. Merges the `n_chunks` partials via the
+/// online-softmax rule (`M=max mₖ; l=Σ lₖ·e^{mₖ−M}; acc=Σ accₖ·e^{mₖ−M}; o=acc/l`), parallel over
+/// the head dim. `n_chunks<=64`.
+pub(crate) const ATTN_COMBINE_WGSL: &str = r#"
+struct PC { nh: u32, hd: u32, n_chunks: u32 }
+var<immediate> pc: PC;
+@group(0) @binding(0) var<storage, read>       pm: array<f32>;   // [nh, n_chunks]
+@group(0) @binding(1) var<storage, read>       pl: array<f32>;   // [nh, n_chunks]
+@group(0) @binding(2) var<storage, read>       pacc: array<f32>; // [nh, n_chunks, hd]
+@group(0) @binding(3) var<storage, read_write> o: array<f32>;    // [nh, hd]
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let h = wid.x;
+    let t = lid.x;
+    let hd = pc.hd;
+    var mm: f32 = -3.0e38;
+    for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) { mm = max(mm, pm[h * pc.n_chunks + c]); }
+    var l: f32 = 0.0;
+    for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) { l = l + pl[h * pc.n_chunks + c] * exp(pm[h * pc.n_chunks + c] - mm); }
+    let inv = 1.0 / l;
+    for (var d: u32 = t; d < hd; d = d + 64u) {
+        var acc: f32 = 0.0;
+        for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) {
+            acc = acc + pacc[(h * pc.n_chunks + c) * hd + d] * exp(pm[h * pc.n_chunks + c] - mm);
+        }
+        o[h * hd + d] = acc * inv;
     }
 }
 "#;

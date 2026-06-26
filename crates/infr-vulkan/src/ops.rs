@@ -1043,21 +1043,27 @@ var<immediate> pc: PC;
 @group(0) @binding(2) var<storage, read>       pacc: array<f32>; // [nh, n_chunks, hd]
 @group(0) @binding(3) var<storage, read_write> o: array<f32>;    // [nh, hd]
 
+var<workgroup> wexp: array<f32, 512>; // exp(pm[c]-max) per chunk, precomputed once and reused
+
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
     let h = wid.x;
     let t = lid.x;
     let hd = pc.hd;
+    let base = h * pc.n_chunks;
     var mm: f32 = -3.0e38;
-    for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) { mm = max(mm, pm[h * pc.n_chunks + c]); }
+    for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) { mm = max(mm, pm[base + c]); }
+    // Precompute the per-chunk softmax weight ONCE (was recomputed via exp() for every (d,c)).
+    for (var c: u32 = t; c < pc.n_chunks; c = c + 64u) { wexp[c] = exp(pm[base + c] - mm); }
+    workgroupBarrier();
     var l: f32 = 0.0;
-    for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) { l = l + pl[h * pc.n_chunks + c] * exp(pm[h * pc.n_chunks + c] - mm); }
+    for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) { l = l + pl[base + c] * wexp[c]; }
     let inv = 1.0 / l;
     for (var d: u32 = t; d < hd; d = d + 64u) {
         var acc: f32 = 0.0;
         for (var c: u32 = 0u; c < pc.n_chunks; c = c + 1u) {
-            acc = acc + pacc[(h * pc.n_chunks + c) * hd + d] * exp(pm[h * pc.n_chunks + c] - mm);
+            acc = acc + pacc[(base + c) * hd + d] * wexp[c];
         }
         o[h * hd + d] = acc * inv;
     }

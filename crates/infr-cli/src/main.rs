@@ -212,7 +212,6 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // One-shot message: a single chat turn (via the session path so user content is encoded safely).
     let mut session = llama.chat_session(MAX_CTX)?;
     if let Some(m) = message {
-        let c0 = session.ctx_len();
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
         let mut t_first: Option<std::time::Instant> = None;
@@ -225,8 +224,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             render.feed(piece);
         })?;
         render.finish();
-        let prompt_toks = session.ctx_len().saturating_sub(c0).saturating_sub(n);
-        print_run_stats(t0, t_first, n, prompt_toks, None);
+        print_run_stats(t0, t_first, n, session.last_prompt_tokens(), None);
         return Ok(());
     }
 
@@ -246,7 +244,6 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         if matches!(line, "exit" | "quit" | ":q" | ":quit") {
             break;
         }
-        let c0 = session.ctx_len();
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
         let mut t_first: Option<std::time::Instant> = None;
@@ -261,12 +258,11 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         render.finish();
         match res {
             Ok(_) => {
-                let prompt_toks = session.ctx_len().saturating_sub(c0).saturating_sub(n);
                 print_run_stats(
                     t0,
                     t_first,
                     n,
-                    prompt_toks,
+                    session.last_prompt_tokens(),
                     Some((session.ctx_len(), session.max_ctx())),
                 );
             }

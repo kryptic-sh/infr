@@ -1560,6 +1560,7 @@ impl Llama {
             llama: self,
             kv: self.new_kv(max_ctx)?,
             started: false,
+            last_prompt_tokens: 0,
         })
     }
 
@@ -1575,12 +1576,19 @@ pub struct ChatSession<'a> {
     llama: &'a Llama,
     kv: KvCache,
     started: bool,
+    last_prompt_tokens: usize,
 }
 
 impl ChatSession<'_> {
     /// Tokens of context currently held (all prior turns + their replies).
     pub fn ctx_len(&self) -> usize {
         self.kv.len
+    }
+
+    /// Prompt tokens prefilled in the most recent [`turn`](Self::turn) (the ChatML-wrapped user
+    /// message, including any turn-open markers). Use for prefill-rate stats.
+    pub fn last_prompt_tokens(&self) -> usize {
+        self.last_prompt_tokens
     }
 
     /// KV-cache capacity in tokens.
@@ -1599,6 +1607,7 @@ impl ChatSession<'_> {
         // Open this user turn (closing the prior assistant turn first if started); user content is
         // encoded as literal text so it can't inject ChatML markers.
         let toks = self.llama.turn_tokens(user, self.started)?;
+        self.last_prompt_tokens = toks.len();
         // Cap generation by whatever context room remains (don't bail) — `max_new` is just a ceiling.
         let room = self.kv.max_ctx.saturating_sub(self.kv.len + toks.len() + 1);
         if room == 0 {

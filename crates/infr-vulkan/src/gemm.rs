@@ -20,6 +20,7 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
 const GEMM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat.spv"));
 const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
+const GEMM_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_warp.spv"));
 const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
 const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial.spv"));
 const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk.spv"));
@@ -33,6 +34,7 @@ const MMV_Q8_RES_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8_res.spv"));
 static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static GEMM_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -48,6 +50,9 @@ fn gemm_spv() -> &'static [u32] {
 }
 fn gemm_tiled_spv() -> &'static [u32] {
     GEMM_TILED_SPV.get_or_init(|| spv_words(GEMM_TILED_SPV_BYTES))
+}
+fn gemm_warp_spv() -> &'static [u32] {
+    GEMM_WARP_SPV.get_or_init(|| spv_words(GEMM_WARP_SPV_BYTES))
 }
 /// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16/quant W). Used by the recorder.
 pub(crate) fn gemm_proj_spv() -> &'static [u32] {
@@ -93,6 +98,20 @@ impl VulkanBackend {
         assert!(m % 16 == 0 && n % 16 == 0 && k % 16 == 0);
         let kern = self.kernel_spv("gemm_coopmat", gemm_spv(), 3, 12);
         self.run_gemm(kern, a, b, m, k, n, (n / 16) as u32, (m / 16) as u32)
+    }
+
+    /// mul_mm-style warp-tiled coopmat GEMM `C[m,n]=A[m,k]·B[k,n]`. m,n %128, k %16.
+    pub fn matmul_warp(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<f32>> {
+        assert!(m % 128 == 0 && n % 128 == 0 && k % 16 == 0);
+        let kern = self.kernel_spv_sg("gemm_warp", gemm_warp_spv(), 3, 12, 32);
+        self.run_gemm(kern, a, b, m, k, n, (n / 128) as u32, (m / 128) as u32)
     }
 
     /// Tiled cooperative-matrix GEMM (shared-memory, 64x64 tiles): `C[m,n]=A[m,k]*B[k,n]`.
@@ -173,6 +192,95 @@ impl VulkanBackend {
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         let (gx, gy) = ((n / 64) as u32, (m / 64) as u32);
 
+        let dispatch = || {
+            let shared = std::sync::Arc::clone(&self.shared);
+            self.one_shot(move |cmd| unsafe {
+                shared
+                    .device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kern.pipeline);
+                shared.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    kern.pipeline_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+                shared.device.cmd_push_constants(
+                    cmd,
+                    kern.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &push,
+                );
+                shared.device.cmd_dispatch(cmd, gx, gy, 1);
+            })
+            .unwrap();
+        };
+        dispatch(); // warm
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            dispatch();
+        }
+        t.elapsed().as_secs_f64() / iters as f64
+    }
+
+    /// Benchmark the mul_mm-style warp-tiled GEMM (m,n %128, k %16). Returns avg sec/dispatch.
+    #[doc(hidden)]
+    pub fn bench_warp_gemm(&self, m: usize, k: usize, n: usize, iters: usize) -> f64 {
+        let kern = self.kernel_spv_sg("gemm_warp", gemm_warp_spv(), 3, 12, 32);
+        let a16 = vec![0u16; m * k];
+        let b16 = vec![0u16; k * n];
+        let buf_a = self.alloc(a16.len() * 2, BufferUsage::Staging).unwrap();
+        let buf_b = self.alloc(b16.len() * 2, BufferUsage::Staging).unwrap();
+        let buf_c = self.alloc(m * n * 4, BufferUsage::Activations).unwrap();
+        self.upload(buf_a.as_ref(), bytemuck::cast_slice(&a16))
+            .unwrap();
+        self.upload(buf_b.as_ref(), bytemuck::cast_slice(&b16))
+            .unwrap();
+        let device = self.shared.device.clone();
+        unsafe {
+            device
+                .reset_descriptor_pool(kern.desc_pool, vk::DescriptorPoolResetFlags::empty())
+                .unwrap();
+        }
+        let set = unsafe {
+            device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(kern.desc_pool)
+                        .set_layouts(std::slice::from_ref(&kern.ds_layout)),
+                )
+                .unwrap()[0]
+        };
+        let bufs = [
+            unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
+            unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
+            unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
+        ];
+        let infos: Vec<vk::DescriptorBufferInfo> = bufs
+            .iter()
+            .map(|&buffer| vk::DescriptorBufferInfo {
+                buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[i..i + 1])
+            })
+            .collect();
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        let (gx, gy) = ((n / 128) as u32, (m / 128) as u32);
         let dispatch = || {
             let shared = std::sync::Arc::clone(&self.shared);
             self.one_shot(move |cmd| unsafe {
@@ -358,6 +466,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn warp_gemm_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        for &(m, k, n) in &[
+            (128usize, 16usize, 128usize),
+            (256, 128, 256),
+            (128, 512, 128),
+        ] {
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
+            let got = be.matmul_warp(&a, &b, m, k, n).unwrap();
+            check(&got, &cpu(&a, &b, m, k, n), "warp");
+        }
+    }
+
+    #[test]
     #[ignore = "benchmark, requires GPU"]
     fn coopmat_gemm_bench() {
         let be = VulkanBackend::new().unwrap();
@@ -379,6 +503,20 @@ mod tests {
             let flops = 2.0 * m as f64 * k as f64 * n as f64;
             println!(
                 "tiled coopmat GEMM {label}: {:.3} ms, {:.0} GFLOP/s",
+                dt * 1e3,
+                flops / dt / 1e9
+            );
+        }
+        // mul_mm-style warp-tiled GEMM at the same shapes (m,n %128, k %16)
+        for &(m, k, n, label) in &[
+            (2048usize, 2048usize, 2048usize, "warp 2048^3"),
+            (512, 128, 32768, "warp QK m512 k128 n32k"),
+            (512, 32768, 128, "warp PV m512 k32k n128"),
+        ] {
+            let dt = be.bench_warp_gemm(m, k, n, 20);
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            println!(
+                "{label}: {:.3} ms, {:.0} GFLOP/s",
                 dt * 1e3,
                 flops / dt / 1e9
             );

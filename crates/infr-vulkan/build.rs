@@ -9,6 +9,7 @@ fn main() {
     let builds: &[(&str, &str, &[&str])] = &[
         ("gemm_coopmat", "gemm_coopmat", &[]),
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
+        ("gemm_warp", "gemm_warp", &[]),
         ("gemm_proj", "gemm_proj", &[]),
         ("attn_partial", "attn_partial", &[]),
         ("attn_qk", "attn_qk", &[]),

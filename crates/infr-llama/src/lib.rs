@@ -965,12 +965,18 @@ impl Llama {
         // rows (extra rows are 0), so its output buffers are M-padded to mpad.
         let use_gemm = c.qk_norm && n >= 64 && std::env::var("INFR_NOGEMM").is_err();
         let mpad = if use_gemm { n.div_ceil(64) * 64 } else { n };
-        // Prefill attention: non-FA clean GEMMs (QK → softmax → PV), matching llama.cpp's non-flash
-        // path (mul_mm + soft_max + mul_mm). Replaces the flash split-K kernel (which had a latent
-        // RADV coopmat race); correct at all context lengths.
+        // Prefill attention has TWO interchangeable algorithms — keep BOTH; which one wins is
+        // HARDWARE-dependent (the card's compute:bandwidth ratio), not a universal choice:
+        //  • non-FA (attn_qk → softmax → attn_pv): materializes the S=[m,kv] scores buffer → more
+        //    HBM traffic, but runs the efficient 8-warp warptile coopmat GEMMs. Wins when bandwidth
+        //    is plentiful vs compute (e.g. RX 7900 XTX ~960 GB/s, ~125 FLOP/byte → non-FA faster).
+        //  • flash (attention_prefill_flash, split-K): never writes S → far less HBM, but the fused
+        //    kernel is more compute/overhead-heavy. Wins on bandwidth-starved cards (low GB/s-per-
+        //    FLOP: APUs, cut-down/older GPUs) and as context grows (S traffic ∝ m·kv).
+        // Both are correctness-tested (attention_prefill_{nonfa,flash}_matches_cpu) so neither rots.
+        // Default = non-FA (fastest on this card); INFR_FLASH selects flash. TODO: auto-select from
+        // device bandwidth/FLOP caps instead of an env knob.
         let nonfa = use_gemm;
-        // Fused flash-attention prefill (no materialized S buffer) when INFR_FLASH is set. A/B vs the
-        // non-FA path; flash should win at high ctx where S round-trips dominate (~81% @32k).
         let use_flash = use_gemm && std::env::var("INFR_FLASH").is_ok();
         let hidden = alloc(n * ne, BufferUsage::Staging)?;
         self.be

@@ -11,6 +11,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -92,27 +93,38 @@ void main() {
         }
         barrier();
 
-        // Online softmax (one thread per row).
-        if (li < BM) {
-            uint r = li;
+        // Online softmax — all 256 threads active: 4 lanes/row (cluster of 4), each owns 16 cols;
+        // subgroupClustered{Max,Add} reduce across the 4. 8 subgroups × 8 rows = 64 rows in parallel.
+        {
+            uint lane = gl_SubgroupInvocationID;        // 0..31
+            uint r = gl_SubgroupID * 8u + lane / 4u;    // 0..63 (cluster of 4 consecutive lanes = 1 row)
+            uint cg = lane % 4u;                         // owns cols [cg*16, +16)
             uint qpos = pc.pos_offset + qr0 + r;
-            float rmax = mrow[r];
-            for (uint j = 0u; j < BN; j++) {
+            float oldm = mrow[r];
+            float oldl = lrow[r];
+            float lmax = -1e30;
+            [[unroll]] for (uint jj = 0u; jj < 16u; jj++) {
+                uint j = cg * 16u + jj;
                 uint kpos = kv0 + j;
                 float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : Ss[r * BN + j] * scale;
                 Ss[r * BN + j] = s;
-                rmax = max(rmax, s);
+                lmax = max(lmax, s);
             }
-            float cf = exp(mrow[r] - rmax);
-            float rsum = 0.0;
-            for (uint j = 0u; j < BN; j++) {
+            float rmax = max(oldm, subgroupClusteredMax(lmax, 4u));
+            float cf = exp(oldm - rmax);
+            float lsum = 0.0;
+            [[unroll]] for (uint jj = 0u; jj < 16u; jj++) {
+                uint j = cg * 16u + jj;
                 float p = exp(Ss[r * BN + j] - rmax);
                 Ps[r * BN + j] = float16_t(p);
-                rsum += p;
+                lsum += p;
             }
-            lrow[r] = lrow[r] * cf + rsum;
-            mrow[r] = rmax;
-            corr[r] = cf;
+            float rsum = subgroupClusteredAdd(lsum, 4u);
+            if (cg == 0u) {
+                lrow[r] = oldl * cf + rsum;
+                mrow[r] = rmax;
+                corr[r] = cf;
+            }
         }
         barrier();
         for (uint i = li; i < BM * HD; i += 256u) { Os[i] *= corr[i / HD]; }

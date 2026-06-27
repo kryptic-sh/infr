@@ -22,6 +22,9 @@ const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
 const GEMM_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_warp.spv"));
 const GEMM_DP4A_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_dp4a.spv"));
+const QUANT_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8.spv"));
+const GEMM_PROJ_MMQ_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_mmq.spv"));
 const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
 const GEMM_PROJ_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp.spv"));
@@ -39,6 +42,8 @@ static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_DP4A_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static QUANT_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static GEMM_PROJ_MMQ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -61,6 +66,14 @@ fn gemm_warp_spv() -> &'static [u32] {
 }
 fn gemm_dp4a_spv() -> &'static [u32] {
     GEMM_DP4A_SPV.get_or_init(|| spv_words(GEMM_DP4A_SPV_BYTES))
+}
+/// SPIR-V for the activation int8 quantize pass (Q8 per block) feeding the dp4a mmq matmul.
+pub(crate) fn quant_q8_spv() -> &'static [u32] {
+    QUANT_Q8_SPV.get_or_init(|| spv_words(QUANT_Q8_SPV_BYTES))
+}
+/// SPIR-V for the integer (dp4a) u4 projection GEMM. Weights stay quantized; no per-GEMM dequant.
+pub(crate) fn gemm_proj_mmq_spv() -> &'static [u32] {
+    GEMM_PROJ_MMQ_SPV.get_or_init(|| spv_words(GEMM_PROJ_MMQ_SPV_BYTES))
 }
 /// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16/quant W). Used by the recorder.
 pub(crate) fn gemm_proj_spv() -> &'static [u32] {

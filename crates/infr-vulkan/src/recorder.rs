@@ -359,6 +359,75 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Integer (dp4a) u4 projection GEMM — the mmq path. Quantizes activations to int8 (Q8 per
+    /// 32-block) via `quant_q8`, then runs the dp4a matmul keeping weights quantized (no per-GEMM
+    /// dequant). Scratch (caller-allocated): `qa` = m*k bytes (int8), `dact`/`sact` = m*(k/32)*2
+    /// bytes (f16). `c` = ceil(m/64)*64 rows f32. Requires u4 weights, `n%64==0`, `k%32==0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_proj_mmq(
+        &self,
+        a: &dyn Buffer,
+        wq: &dyn Buffer,
+        scales: &dyn Buffer,
+        mins: &dyn Buffer,
+        c: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let nblk = k / 32;
+        // pass 1: quantize activations to int8 (Q8, per 32-block) — one subgroup per (row, block)
+        self.stamp("quant_q8");
+        let kq = self
+            .be
+            .kernel_spv_sg("quant_q8", crate::gemm::quant_q8_spv(), 4, 12, 32);
+        let mut p1 = [0u8; 12];
+        p1[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        p1[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
+        p1[8..12].copy_from_slice(&32u32.to_ne_bytes());
+        self.dispatch(
+            kq,
+            &[
+                Self::vkb(a),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+            ],
+            3,
+            &p1,
+            (m * nblk) as u32,
+        );
+        // pass 2: integer dp4a matmul
+        self.stamp("matmul_proj");
+        let km =
+            self.be
+                .kernel_spv_sg("gemm_proj_mmq", crate::gemm::gemm_proj_mmq_spv(), 7, 12, 32);
+        let mut p2 = [0u8; 12];
+        p2[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        p2[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        p2[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        self.dispatch3(
+            km,
+            &[
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(wq),
+                Self::vkb(scales),
+                Self::vkb(mins),
+                Self::vkb(c),
+            ],
+            1,
+            &p2,
+            (n / 64) as u32,
+            m.div_ceil(64) as u32,
+            1,
+        );
+    }
+
     /// Quantized dequant GEMV `y = x·Wᵀ`. `bits` (4|8) and `blk_shift` (log2 scale-block) select
     /// the packed-weight layout.
     #[allow(clippy::too_many_arguments)]
@@ -1460,6 +1529,82 @@ mod tests {
             .fold(0f32, f32::max);
         println!("attn_prefill_nonfa q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attn_prefill_nonfa mismatch: {err}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn matmul_proj_mmq_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (m, k, n) = (70usize, 64usize, 128usize); // m not %64 → padding; k=2 blocks of 32; n%64
+        let nblk = k / 32;
+        let mpad = m.div_ceil(64) * 64;
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
+            .collect();
+        // u4 weights: q in 0..15, per-32-block f16 scale/min
+        let qv: Vec<u32> = (0..n * k).map(|i| (i * 7 % 16) as u32).collect();
+        let scales: Vec<u16> = (0..n * k / 32)
+            .map(|b| half::f16::from_f32(0.015 + (b % 5) as f32 * 0.002).to_bits())
+            .collect();
+        let mins: Vec<u16> = (0..n * k / 32)
+            .map(|b| half::f16::from_f32(-0.12 + (b % 3) as f32 * 0.03).to_bits())
+            .collect();
+        // pack u4: 8 nibbles per u32, weight g = col*k + kk
+        let mut packed = vec![0u32; n * k / 8];
+        for (g, &q) in qv.iter().enumerate() {
+            packed[g / 8] |= q << (4 * (g % 8) as u32);
+        }
+        let dq = |g: usize| {
+            half::f16::from_bits(scales[g / 32]).to_f32() * qv[g] as f32
+                + half::f16::from_bits(mins[g / 32]).to_f32()
+        };
+
+        let upf = |v: &[f32]| {
+            let b = be.alloc(v.len() * 4, BufferUsage::Staging).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        let ba = upf(&a);
+        let bwq = be
+            .upload_weight_bytes(bytemuck::cast_slice(&packed))
+            .unwrap();
+        let bs = be
+            .upload_weight_bytes(bytemuck::cast_slice(&scales))
+            .unwrap();
+        let bmn = be.upload_weight_bytes(bytemuck::cast_slice(&mins)).unwrap();
+        let bc = be.alloc(mpad * n * 4, BufferUsage::Readback).unwrap();
+        // scratch
+        let qa = be.alloc(mpad * k, BufferUsage::Activations).unwrap();
+        let dact = be.alloc(mpad * nblk * 2, BufferUsage::Activations).unwrap();
+        let sact = be.alloc(mpad * nblk * 2, BufferUsage::Activations).unwrap();
+
+        let rec = be.recorder().unwrap();
+        rec.matmul_proj_mmq(
+            ba.as_ref(),
+            bwq.as_ref(),
+            bs.as_ref(),
+            bmn.as_ref(),
+            bc.as_ref(),
+            qa.as_ref(),
+            dact.as_ref(),
+            sact.as_ref(),
+            m,
+            k,
+            n,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; mpad * n * 4];
+        be.download(bc.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let mut e = 0f32;
+        for r in 0..m {
+            for col in 0..n {
+                let want: f32 = (0..k).map(|x| a[r * k + x] * dq(col * k + x)).sum();
+                e = e.max((got[r * n + col] - want).abs());
+            }
+        }
+        println!("matmul_proj_mmq max_err={e:e}");
+        assert!(e < 2e-2, "matmul_proj_mmq mismatch: {e}"); // int8 activation quant tolerance
     }
 
     #[test]

@@ -11,6 +11,8 @@ fn main() {
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
         ("gemm_warp", "gemm_warp", &[]),
         ("gemm_dp4a", "gemm_dp4a", &[]),
+        ("quant_q8", "quant_q8", &[]),
+        ("gemm_proj_mmq", "gemm_proj_mmq", &[]),
         ("gemm_proj", "gemm_proj", &[]),
         ("gemm_proj_warp", "gemm_proj_warp", &[]),
         ("attn_partial", "attn_partial", &[]),

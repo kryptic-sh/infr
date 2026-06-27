@@ -1,0 +1,107 @@
+#version 460
+// Integer (dp4a) projection GEMM for prefill — the mmq path. C[m,n] = A[m,k]·Wᵀ with W = u4 quant
+// (scale·q + min per BLK block). Activations are pre-quantized to int8 (Q8) per block by quant_q8.
+// No per-GEMM dequant: weights stay quantized, the matmul is integer dotPacked4x8, and per-block
+// scales/min fold into f32 after each block. This is llama.cpp's mul_mmq approach (dp4a, not int8
+// WMMA which hangs on RADV). Each thread owns TM×TN f32 outputs. Requires N%BN, K%BLK, BLK=32 (u4).
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_control_flow_attributes : require
+
+const uint BM = 64u;
+const uint BN = 64u;
+const uint BLK = 32u;       // weight block = u4 block (1<<5). k tile step.
+const uint WPB = BLK / 4u;  // packed u32 words per block per row/col = 8
+const uint TM = 4u;
+const uint TN = 4u;
+const uint THREADS = (BM / TM) * (BN / TN); // 256
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint m; uint n; uint k; } pc;
+layout(binding = 0) readonly buffer QA { uint qa[]; };          // [m, k/4] packed int8 activations
+layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, nblk]
+layout(binding = 2) readonly buffer SA { float16_t sact[]; };   // [m, nblk]
+layout(binding = 3) readonly buffer WQ { uint wq[]; };          // [n, k/8] u4 (8 nibbles/word)
+layout(binding = 4) readonly buffer SC { float16_t scales[]; }; // [n*nblk]
+layout(binding = 5) readonly buffer MN { float16_t mins[]; };   // [n*nblk]
+layout(binding = 6) writeonly buffer CB { float c[]; };         // [m, n]
+
+shared uint As[BM * WPB]; // packed int8 activations for the tile block
+shared uint Bs[BN * WPB]; // packed int8 (unpacked nibbles) weights for the tile block
+
+void main() {
+    uint nblk = pc.k / BLK;
+    uint kw = pc.k / 4u;   // packed-u32 width of qa
+    uint ww = pc.k / 8u;   // word width of wq (u4)
+    uint wgRow = gl_WorkGroupID.y * BM;
+    uint wgCol = gl_WorkGroupID.x * BN;
+    uint li = gl_LocalInvocationIndex;
+    uint tr = li / (BN / TN); // 0..15
+    uint tc = li % (BN / TN); // 0..15
+
+    float acc[TM][TN];
+    [[unroll]] for (uint i = 0u; i < TM; i++)
+        [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
+
+    for (uint blk = 0u; blk < nblk; blk++) {
+        // stage activations: BM rows × WPB packed words
+        for (uint idx = li; idx < BM * WPB; idx += THREADS) {
+            uint r = idx / WPB;
+            uint p = idx % WPB;
+            As[idx] = qa[(wgRow + r) * kw + blk * WPB + p];
+        }
+        // stage weights: BN cols × (BLK/8=4) source words, each → 2 packed-int8 words
+        for (uint idx = li; idx < BN * (BLK / 8u); idx += THREADS) {
+            uint cc = idx / (BLK / 8u);
+            uint p4 = idx % (BLK / 8u);
+            uint word = wq[(wgCol + cc) * ww + blk * (BLK / 8u) + p4];
+            uint lo = (word & 0xFu) | ((word >> 4u) & 0xFu) << 8u
+                    | ((word >> 8u) & 0xFu) << 16u | ((word >> 12u) & 0xFu) << 24u;
+            uint hi = ((word >> 16u) & 0xFu) | ((word >> 20u) & 0xFu) << 8u
+                    | ((word >> 24u) & 0xFu) << 16u | ((word >> 28u) & 0xFu) << 24u;
+            Bs[cc * WPB + 2u * p4] = lo;
+            Bs[cc * WPB + 2u * p4 + 1u] = hi;
+        }
+        barrier();
+
+        int qsum[TM][TN];
+        [[unroll]] for (uint i = 0u; i < TM; i++)
+            [[unroll]] for (uint j = 0u; j < TN; j++) qsum[i][j] = 0;
+        [[unroll]] for (uint p = 0u; p < WPB; p++) {
+            int av[TM];
+            int bv[TN];
+            [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * WPB + p]);
+            [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * WPB + p]);
+            [[unroll]] for (uint i = 0u; i < TM; i++)
+                [[unroll]] for (uint j = 0u; j < TN; j++)
+                    qsum[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsum[i][j]);
+        }
+        barrier();
+
+        // fold per-block scales/min into f32
+        float dval[TM];
+        float sval[TM];
+        [[unroll]] for (uint i = 0u; i < TM; i++) {
+            dval[i] = float(dact[(wgRow + tr * TM + i) * nblk + blk]);
+            sval[i] = float(sact[(wgRow + tr * TM + i) * nblk + blk]);
+        }
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            float sc = float(scales[(wgCol + tc * TN + j) * nblk + blk]);
+            float mn = float(mins[(wgCol + tc * TN + j) * nblk + blk]);
+            [[unroll]] for (uint i = 0u; i < TM; i++) {
+                acc[i][j] += dval[i] * sc * float(qsum[i][j]) + mn * sval[i];
+            }
+        }
+    }
+
+    [[unroll]] for (uint i = 0u; i < TM; i++) {
+        uint rr = wgRow + tr * TM + i;
+        [[unroll]] for (uint j = 0u; j < TN; j++) {
+            c[rr * pc.n + (wgCol + tc * TN + j)] = acc[i][j];
+        }
+    }
+}

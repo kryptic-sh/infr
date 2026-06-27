@@ -1062,11 +1062,19 @@ impl Llama {
 
         // Flash-decoding: for single-token decode, split each head's KV range across many
         // workgroups (partials in pm/pl/pacc), so attention isn't stuck on `nh` workgroups. The
-        // chunk size is adaptive: a coarse fixed chunk leaves too few workgroups at low/mid context
-        // (decode attention is ~67% of the step there), so size it to ~64 chunks/head (≈nh*64
-        // workgroups) with a 64-key floor. Reused across layers.
+        // chunk size is adaptive: a coarse fixed chunk leaves too few workgroups at low/mid context,
+        // so size it to ~`nchunk_div` chunks/head (≈nh*nchunk_div workgroups) with a 64-key floor.
+        // ~32 chunks/head saturates pass-1's KV bandwidth on the 7900 XTX (nh*32=512 workgroups ≫ 96
+        // CUs) while HALVING pass-2 (attn_combine) work vs the old 64 — combine is a serial scan over
+        // n_chunks, so fewer chunks is a pure win once pass-1 is bandwidth-bound (decode +3..6% at
+        // d4k-16k, no shallow regression). Override with INFR_DECODE_NCHUNK. Reused across layers.
         let kv_len = pos + n;
-        let chunk = (kv_len / 64).clamp(64, 512);
+        let nchunk_div = std::env::var("INFR_DECODE_NCHUNK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&d| d > 0)
+            .unwrap_or(32);
+        let chunk = (kv_len / nchunk_div).clamp(64, 512);
         // Non-FA scores scratch: [nh, mpad, kv_pad] f16 (kv padded to 256 — the 8-warp attn_qk's BN;
         // the recorder uses the same padding).
         let nonfa_s = if nonfa && !use_flash {

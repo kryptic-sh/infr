@@ -44,6 +44,14 @@ enum Cmd {
         /// Context depth pre-filled (untimed) before measuring — matches llama-bench -d.
         #[arg(short = 'd', long = "n-depth", default_value_t = 0)]
         depth: usize,
+        /// Logical batch size (matches llama-bench -b). Accepted for flag-parity; the engine
+        /// chunks by ubatch, so only -ub affects per-forward work.
+        #[arg(short = 'b', long = "batch-size", default_value_t = 2048)]
+        batch: usize,
+        /// Physical batch = tokens per forward = our prefill chunk (matches llama-bench -ub). 0 =
+        /// the engine's adaptive chunk policy; >0 pins the chunk so both tools sweep identically.
+        #[arg(short = 'u', long = "ubatch-size", default_value_t = 0)]
+        ubatch: usize,
         /// Repetitions (reported value is the average).
         #[arg(short = 'r', long, default_value_t = 3)]
         reps: usize,
@@ -70,9 +78,11 @@ fn main() -> anyhow::Result<()> {
             n_prompt,
             n_gen,
             depth,
+            batch,
+            ubatch,
             reps,
             json,
-        } => cmd_bench(&model, n_prompt, n_gen, depth, reps, json),
+        } => cmd_bench(&model, n_prompt, n_gen, depth, ubatch, reps, json),
     }
 }
 
@@ -341,6 +351,7 @@ fn cmd_bench(
     n_prompt: usize,
     n_gen: usize,
     depth: usize,
+    ubatch: usize,
     reps: usize,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -349,13 +360,21 @@ fn cmd_bench(
     let measure_tg = n_gen > 0;
     let dummy =
         |pos: usize, c: usize| -> Vec<u32> { (0..c).map(|i| ((pos + i) % 100) as u32).collect() };
+    // ubatch>0 pins the prefill chunk (= llama-bench -ub); 0 = the engine's adaptive policy.
+    let chunk = |pos: usize| {
+        if ubatch > 0 {
+            ubatch
+        } else {
+            llama.prefill_chunk(pos)
+        }
+    };
     let mut samples = Vec::with_capacity(reps);
     for _ in 0..reps {
         let mut kv = llama.new_kv(depth + n_prompt + n_gen + 64)?;
         // warm to `depth` (untimed)
         let mut pos = 0usize;
         while pos < depth {
-            let c = llama.prefill_chunk(pos).min(depth - pos);
+            let c = chunk(pos).min(depth - pos);
             llama.forward_resident_kv(&dummy(pos, c), &mut kv)?;
             pos += c;
         }
@@ -368,7 +387,7 @@ fn cmd_bench(
         } else {
             let mut done = 0usize;
             while done < n_prompt {
-                let c = llama.prefill_chunk(pos).min(n_prompt - done);
+                let c = chunk(pos).min(n_prompt - done);
                 llama.forward_resident_kv(&dummy(pos, c), &mut kv)?;
                 pos += c;
                 done += c;

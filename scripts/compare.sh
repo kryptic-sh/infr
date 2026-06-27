@@ -12,6 +12,7 @@ MODEL="${1:-${INFR_MODEL:-/home/mxaddict/Projects/models/qwen3-0.6b/Qwen3-0.6B-Q
 TOK="${2:-${INFR_TOK:-/home/mxaddict/Projects/models/qwen3-0.6b/tokenizer.json}}"
 DEV="${INFR_CMP_DEV:-Vulkan0}"   # llama-bench device (the dGPU); override if device order differs
 REPS="${INFR_CMP_REPS:-3}"
+UB="${INFR_CMP_UB:-0}"           # ubatch (per-forward chunk). 0 = each tool's own default; pin to compare apples-to-apples
 PP=(512 4096 8000 16000 32000)   # prefill prompt lengths
 TG=(512 4096 8000 16000 32000)   # decode context depths
 
@@ -24,11 +25,12 @@ cargo build -q -p infr-cli --release
 INFR=target/release/infr
 
 avg_ts() { python3 -c "import sys,json; print(f\"{json.load(sys.stdin)[0]['avg_ts']:.0f}\")"; }
-infr_b()  { "$INFR" bench "$MODEL" "$@" --json 2>/dev/null | avg_ts; }
-llama_b() { llama-bench -m "$MODEL" -ngl 99 -dev "$DEV" -fa auto -r "$REPS" -o json "$@" 2>/dev/null | avg_ts; }
+UB_I=(); UB_L=(); [ "$UB" -gt 0 ] && { UB_I=(-u "$UB"); UB_L=(-ub "$UB"); }
+infr_b()  { "$INFR" bench "$MODEL" "${UB_I[@]}" "$@" --json 2>/dev/null | avg_ts; }
+llama_b() { llama-bench -m "$MODEL" -ngl 99 -dev "$DEV" -fa auto -r "$REPS" "${UB_L[@]}" -o json "$@" 2>/dev/null | avg_ts; }
 row() { printf '%-8s | %10s | %10s | %.2fx\n' "$1" "$2" "$3" "$(echo "scale=4; $2/$3" | bc)"; }
 
-printf '\nmodel: %s   reps: %s\n' "$(basename "$MODEL")" "$REPS"
+printf '\nmodel: %s   reps: %s   ubatch: %s\n' "$(basename "$MODEL")" "$REPS" "$([ "$UB" -gt 0 ] && echo "$UB" || echo "tool-default")"
 printf '\n%-8s | %10s | %10s | %s\n' "PREFILL" "infr" "llama.cpp" "infr/llama"
 printf -- '---------+------------+------------+-----------\n'
 for n in "${PP[@]}"; do row "$n" "$(infr_b -p "$n" -n 0 -r "$REPS")" "$(llama_b -p "$n" -n 0)"; done

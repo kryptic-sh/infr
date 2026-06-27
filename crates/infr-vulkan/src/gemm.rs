@@ -370,5 +370,18 @@ mod tests {
                 flops / dt / 1e9
             );
         }
+        // Attention shapes (per head, 32k ctx): QK=[512,128]·[128,32768], PV=[512,32768]·[32768,128]
+        for &(m, k, n, label) in &[
+            (512usize, 128usize, 32768usize, "QK m512 k128 n32k"),
+            (512, 32768, 128, "PV m512 k32k n128"),
+        ] {
+            let dt = be.bench_tiled_gemm(m, k, n, 20);
+            let flops = 2.0 * m as f64 * k as f64 * n as f64;
+            println!(
+                "tiled coopmat GEMM {label}: {:.3} ms, {:.0} GFLOP/s",
+                dt * 1e3,
+                flops / dt / 1e9
+            );
+        }
     }
 }

@@ -968,7 +968,9 @@ impl Llama {
         // Non-FA prefill attention (clean QK→softmax→PV GEMMs) wins at low/mid context where the
         // coopmat GEMMs run efficiently; above ~12k the materialized scores buffer makes it HBM-bound
         // and the flash kernel (scores in shared) wins. Hybrid: non-FA below the threshold.
-        let nonfa = use_gemm && (pos + n) <= 8192 && std::env::var("INFR_NO_NONFA").is_err();
+        let nonfa = use_gemm
+            && std::env::var("INFR_NO_NONFA").is_err()
+            && ((pos + n) <= 8192 || std::env::var("INFR_NONFA_ALL").is_ok());
         let hidden = alloc(n * ne, BufferUsage::Staging)?;
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))

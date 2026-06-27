@@ -21,12 +21,7 @@ const GEMM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coo
 const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));
 const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
-const ATTN_PREFILL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill.spv"));
 const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial.spv"));
-const ATTN_PF_PART_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_partial.spv"));
-const ATTN_PF_COMB_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/attn_prefill_combine.spv"));
 const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk.spv"));
 const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
 const ATTN_PV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv.spv"));
@@ -39,10 +34,7 @@ const MMV_Q8_RES_SPV_BYTES: &[u8] =
 static GEMM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_TILED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static GEMM_PROJ_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-static ATTN_PREFILL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-static ATTN_PF_PART_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-static ATTN_PF_COMB_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -61,21 +53,9 @@ fn gemm_tiled_spv() -> &'static [u32] {
 pub(crate) fn gemm_proj_spv() -> &'static [u32] {
     GEMM_PROJ_SPV.get_or_init(|| spv_words(GEMM_PROJ_SPV_BYTES))
 }
-/// SPIR-V for the coopmat flash-attention prefill kernel. Used by the recorder.
-pub(crate) fn attn_prefill_spv() -> &'static [u32] {
-    ATTN_PREFILL_SPV.get_or_init(|| spv_words(ATTN_PREFILL_SPV_BYTES))
-}
 /// SPIR-V for the subgroup-reduction flash-decoding pass-1 (split-K) kernel. Used by the recorder.
 pub(crate) fn attn_partial_spv() -> &'static [u32] {
     ATTN_PARTIAL_SPV.get_or_init(|| spv_words(ATTN_PARTIAL_SPV_BYTES))
-}
-/// SPIR-V for the split-K prefill attention partial pass. Used by the recorder.
-pub(crate) fn attn_prefill_partial_spv() -> &'static [u32] {
-    ATTN_PF_PART_SPV.get_or_init(|| spv_words(ATTN_PF_PART_SPV_BYTES))
-}
-/// SPIR-V for the split-K prefill attention combine pass. Used by the recorder.
-pub(crate) fn attn_prefill_combine_spv() -> &'static [u32] {
-    ATTN_PF_COMB_SPV.get_or_init(|| spv_words(ATTN_PF_COMB_SPV_BYTES))
 }
 /// SPIR-V for the non-FA prefill attention kernels (QK scores / row softmax / PV). Recorder use.
 pub(crate) fn attn_qk_spv() -> &'static [u32] {

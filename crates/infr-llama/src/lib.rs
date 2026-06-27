@@ -965,12 +965,10 @@ impl Llama {
         // rows (extra rows are 0), so its output buffers are M-padded to mpad.
         let use_gemm = c.qk_norm && n >= 64 && std::env::var("INFR_NOGEMM").is_err();
         let mpad = if use_gemm { n.div_ceil(64) * 64 } else { n };
-        // Non-FA prefill attention (clean QK→softmax→PV GEMMs) wins at low/mid context where the
-        // coopmat GEMMs run efficiently; above ~12k the materialized scores buffer makes it HBM-bound
-        // and the flash kernel (scores in shared) wins. Hybrid: non-FA below the threshold.
-        let nonfa = use_gemm
-            && std::env::var("INFR_NO_NONFA").is_err()
-            && ((pos + n) <= 8192 || std::env::var("INFR_NONFA_ALL").is_ok());
+        // Prefill attention: non-FA clean GEMMs (QK → softmax → PV), matching llama.cpp's non-flash
+        // path (mul_mm + soft_max + mul_mm). Replaces the flash split-K kernel (which had a latent
+        // RADV coopmat race); correct at all context lengths.
+        let nonfa = use_gemm;
         let hidden = alloc(n * ne, BufferUsage::Staging)?;
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
@@ -1043,31 +1041,6 @@ impl Llama {
                 alloc(nh * n_chunks, BufferUsage::Activations)?,
                 alloc(nh * n_chunks * hd, BufferUsage::Activations)?,
             ))
-        } else {
-            None
-        };
-
-        // Split-K for the coopmat prefill attention: the single-kernel path launches only
-        // nh*ceil(n/64) workgroups, which starves the GPU at small chunks. Split the kv loop so
-        // there are ~512 workgroups total, then combine. Only worth it when there are few query
-        // tiles; large chunks already have enough (n_splits == 1 → use the single kernel).
-        let pf_split = if use_gemm {
-            let n_qtiles = mpad / 64;
-            let want = (512 / (n_qtiles * nh)).clamp(1, 64);
-            let n_splits = want.min(kv_len.div_ceil(64)).max(1);
-            if n_splits > 1 {
-                let split_len = kv_len.div_ceil(64).div_ceil(n_splits) * 64;
-                let nparts = n_qtiles * nh * n_splits;
-                Some((
-                    n_splits,
-                    split_len,
-                    alloc(nparts * 64, BufferUsage::Activations)?,
-                    alloc(nparts * 64, BufferUsage::Activations)?,
-                    alloc(nparts * 64 * hd, BufferUsage::Activations)?,
-                ))
-            } else {
-                None
-            }
         } else {
             None
         };
@@ -1319,39 +1292,6 @@ impl Llama {
                     kv.v[li].as_ref(),
                     attn.as_ref(),
                     s.as_ref(),
-                    n,
-                    kv_len,
-                    nh,
-                    nkv,
-                    hd,
-                    pos,
-                );
-            } else if let Some((n_splits, split_len, ppm, ppl, ppacc)) = &pf_split {
-                // prefill, small chunk: split-K coopmat attention for occupancy, then combine.
-                rec.attention_prefill_split(
-                    q.as_ref(),
-                    kv.k[li].as_ref(),
-                    kv.v[li].as_ref(),
-                    attn.as_ref(),
-                    ppm.as_ref(),
-                    ppl.as_ref(),
-                    ppacc.as_ref(),
-                    n,
-                    kv_len,
-                    nh,
-                    nkv,
-                    hd,
-                    pos,
-                    *n_splits,
-                    *split_len,
-                );
-            } else if use_gemm {
-                // prefill, large chunk: single coopmat flash attention (enough query tiles already).
-                rec.attention_prefill(
-                    q.as_ref(),
-                    kv.k[li].as_ref(),
-                    kv.v[li].as_ref(),
-                    attn.as_ref(),
                     n,
                     kv_len,
                     nh,

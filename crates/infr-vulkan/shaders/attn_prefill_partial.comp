@@ -11,6 +11,7 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_vote : require
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
@@ -84,6 +85,7 @@ void main() {
         // its coopMatStore just wrote — and never touches another subgroup's rows of Ss/Ps/Os. So the
         // per-row max/sum reductions are subgroup-CLUSTERED (2 lanes per row, halves [0,32)/[32,64)) and
         // need only cheap subgroupBarrier()s, not the workgroup barriers that were ~46% of this kernel.
+        bool any_change;
         {
             uint lr = gl_SubgroupInvocationID >> 1u;   // 0..15: row within this subgroup's band
             uint hf = gl_SubgroupInvocationID & 1u;    // 0/1: which 32-col half
@@ -97,7 +99,11 @@ void main() {
                 Ss[r * BN + j] = s;
                 hmax = max(hmax, s);
             }
-            float rmax = max(mrow[r], subgroupClusteredMax(hmax, 2u));
+            float old_m = mrow[r];
+            float rmax = max(old_m, subgroupClusteredMax(hmax, 2u));
+            // Skip the O-rescale below when NO row's running max grew this block (corr==1) — true for
+            // most blocks once the max stabilizes at depth, saving the 8192-elem shared rescale.
+            any_change = subgroupAny(rmax > old_m);
             float hsum = 0.0;
             for (uint j = c0; j < c0 + 32u; j++) {
                 float p = exp(Ss[r * BN + j] - rmax);
@@ -106,7 +112,7 @@ void main() {
             }
             float rsum = subgroupClusteredAdd(hsum, 2u);
             if (hf == 0u) {
-                float cf = exp(mrow[r] - rmax);
+                float cf = exp(old_m - rmax);
                 corr[r] = cf;
                 lrow[r] = lrow[r] * cf + rsum;
                 mrow[r] = rmax;
@@ -114,12 +120,14 @@ void main() {
         }
         subgroupBarrier();
 
-        // rescale this subgroup's O rows by corr (corr[r] written just above, same subgroup)
-        uint obase = sg * 16u * hd;
-        for (uint i = gl_SubgroupInvocationID; i < 16u * hd; i += 32u) {
-            Os[obase + i] *= corr[sg * 16u + i / hd];
+        // rescale this subgroup's O rows by corr (corr[r] written above) — skipped when corr==1 for all
+        if (any_change) {
+            uint obase = sg * 16u * hd;
+            for (uint i = gl_SubgroupInvocationID; i < 16u * hd; i += 32u) {
+                Os[obase + i] *= corr[sg * 16u + i / hd];
+            }
+            subgroupBarrier();
         }
-        subgroupBarrier();
 
         for (uint ct = 0u; ct < hd; ct += 16u) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;

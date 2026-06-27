@@ -978,6 +978,9 @@ impl Llama {
             .map_err(|e| anyhow!("{e}"))?;
         let attn = alloc(mpad * nh * hd, BufferUsage::Activations)?;
         let act = alloc(n * nff, BufferUsage::Activations)?;
+        // gate+up intermediate for the un-fused decode FFN (rmsnorm → gate/up GEMV → SwiGLU). The
+        // GEMM path uses its own `gu` in `gemm_bufs`; this serves the small-batch (decode) path.
+        let gu_ffn = alloc(n * 2 * nff, BufferUsage::Activations)?;
         // Only the LAST position's logits are needed → compute lm_head for one row. (Computing all n
         // rows at long context is a huge wasted dispatch + ~n*vocab buffer that can exceed the GPU
         // watchdog and lose the device.)
@@ -1177,7 +1180,10 @@ impl Llama {
                         c.rms_eps,
                     );
                 };
-                let fuse_qkv = std::env::var("INFR_NOFUSE").is_err()
+                // Un-fused (rmsnorm + 3× subgroup GEMV) beats the fused attn_in_q: the fused kernel
+                // recomputes the RMS sum-of-squares per output row (~2× compute), and the standalone
+                // GEMV is the fast subgroup mul_mat_vec_q. Opt back into fusion with INFR_FUSE.
+                let fuse_qkv = std::env::var("INFR_FUSE").is_ok()
                     && matches!(
                         (&layer.wq, &layer.wk, &layer.wv),
                         (Wt::Q { .. }, Wt::Q { .. }, Wt::Q { .. })
@@ -1379,16 +1385,31 @@ impl Llama {
                     nh * hd,
                     ne,
                 );
-                ffn(
-                    hidden.as_ref(),
-                    layer.ffn_norm_buf.as_ref(),
-                    &layer.wgateup,
-                    act.as_ref(),
-                    n,
-                    ne,
-                    nff,
-                    c.rms_eps,
-                );
+                if std::env::var("INFR_FUSE").is_ok() {
+                    ffn(
+                        hidden.as_ref(),
+                        layer.ffn_norm_buf.as_ref(),
+                        &layer.wgateup,
+                        act.as_ref(),
+                        n,
+                        ne,
+                        nff,
+                        c.rms_eps,
+                    );
+                } else {
+                    // Un-fused FFN: rmsnorm → gate/up subgroup GEMV → SwiGLU (no per-output redundant
+                    // RMS sum-of-squares; reuses the fast mul_mat_vec_q).
+                    rec.rmsnorm(
+                        hidden.as_ref(),
+                        layer.ffn_norm_buf.as_ref(),
+                        hn.as_ref(),
+                        n,
+                        ne,
+                        c.rms_eps,
+                    );
+                    lin(&layer.wgateup, hn.as_ref(), gu_ffn.as_ref(), n, ne, 2 * nff);
+                    rec.silu_mul_fused(gu_ffn.as_ref(), act.as_ref(), n, nff);
+                }
                 lin_add(
                     &layer.wdown,
                     act.as_ref(),

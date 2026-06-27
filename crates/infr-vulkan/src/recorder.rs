@@ -326,11 +326,13 @@ impl<'a> Recorder<'a> {
         blk_shift: u32,
     ) {
         self.stamp("matmul_proj");
-        // Warp tile (BM=64,BN=128) wins for large M (low/mid-ctx prefill: +10-12%) but its halved
-        // workgroup count loses occupancy when M is small (high ctx, tiny chunk). Pick per chunk.
-        let warp = m >= 1024 && n % 128 == 0;
+        // Warp tile (BM=64,BN=256, 256 threads / 8 warps — matches llama.cpp's AMD-RADV large
+        // warptile; the extra warps hide W-dequant latency). Wins big for M≥768 (low/mid ctx:
+        // 4k+21% 8k+19% 16k+5%); at very small M (32k chunk≈500) its wide N tile still loses to the
+        // BN=64 tiled kernel, so gate on M. Also needs N%256.
+        let warp = m >= 768 && n % 256 == 0;
         let (name, spv, tiles_n) = if warp {
-            ("gemm_proj_warp", crate::gemm::gemm_proj_warp_spv(), n / 128)
+            ("gemm_proj_warp", crate::gemm::gemm_proj_warp_spv(), n / 256)
         } else {
             ("gemm_proj", crate::gemm::gemm_proj_spv(), n / 64)
         };
@@ -1464,7 +1466,7 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn matmul_proj_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
-        let (m, k, n) = (70usize, 64usize, 128usize); // m not %64 → exercises padding; n%64, k%32
+        let (m, k, n) = (800usize, 64usize, 256usize); // m≥768 & not %64 → warp path + padding; n%256
         let mpad = m.div_ceil(64) * 64;
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
         // weight W[N,K] (row-major [out,in]), f16-rounded

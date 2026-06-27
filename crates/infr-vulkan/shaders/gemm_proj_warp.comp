@@ -3,22 +3,25 @@
 // activations (→f16 in shared); W is f16 OR unified quant (u8/u4 + per-block f16 scale/min) dequant'd
 // during staging. mul_mm-style warp tiling: workgroup BM×BN → warp WM×WN → CMS_M×CMS_N register-
 // blocked 16×16 coopmat frags. W staged Bs[n][k] (k contiguous → coalesced dequant reads) then
-// coopMatLoad ColumnMajor → Wᵀ. M padded to BM (rows ≥ M load 0). Requires sg32, N%BN, K%16.
+// coopMatLoad ColumnMajor → Wᵀ. M padded to BM (rows ≥ M load 0). 256 threads / 8 warps matches the
+// llama.cpp AMD-RADV large warptile — the extra warps hide the W-dequant latency that a 4-warp tile
+// can't, which is what made small-M (high-ctx) prefill slow. Requires sg32, N%BN(256), K%16.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : require
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+const uint THREADS = 256u;
 const uint BM = 64u;
-const uint BN = 128u;
-const uint BK = 32u;
+const uint BN = 256u;
+const uint BK = 16u;
 const uint WM = 32u;
 const uint WN = 64u;
 const uint WARPS_M = BM / WM; // 2
-const uint WARPS_N = BN / WN; // 2
+const uint WARPS_N = BN / WN; // 4 → 8 warps / 256 threads
 const uint CMS_M = WM / 16u;  // 2
 const uint CMS_N = WN / 16u;  // 4
 const uint SAK = BK + 8u;
@@ -61,13 +64,13 @@ void main() {
     }
 
     for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
-        for (uint idx = li; idx < BM * BK; idx += 128u) {
+        for (uint idx = li; idx < BM * BK; idx += THREADS) {
             uint r = idx / BK;
             uint cc = idx % BK;
             uint gr = wgRow + r;
             As[r * SAK + cc] = (gr < pc.m) ? float16_t(a[gr * pc.k + k0 + cc]) : float16_t(0.0);
         }
-        for (uint idx = li; idx < BN * BK; idx += 128u) {
+        for (uint idx = li; idx < BN * BK; idx += THREADS) {
             uint cc = idx / BK; // n
             uint kk = idx % BK; // k (contiguous → coalesced dequant)
             Bs[cc * SBK + kk] = float16_t(dqf((wgCol + cc) * pc.k + (k0 + kk)));

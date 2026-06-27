@@ -969,6 +969,9 @@ impl Llama {
         // path (mul_mm + soft_max + mul_mm). Replaces the flash split-K kernel (which had a latent
         // RADV coopmat race); correct at all context lengths.
         let nonfa = use_gemm;
+        // Fused flash-attention prefill (no materialized S buffer) when INFR_FLASH is set. A/B vs the
+        // non-FA path; flash should win at high ctx where S round-trips dominate (~81% @32k).
+        let use_flash = use_gemm && std::env::var("INFR_FLASH").is_ok();
         let hidden = alloc(n * ne, BufferUsage::Staging)?;
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
@@ -1038,7 +1041,7 @@ impl Llama {
         let chunk = (kv_len / 64).clamp(64, 512);
         // Non-FA scores scratch: [nh, mpad, kv_pad] f16 (kv padded to 256 — the 8-warp attn_qk's BN;
         // the recorder uses the same padding).
-        let nonfa_s = if nonfa {
+        let nonfa_s = if nonfa && !use_flash {
             let kv_pad = kv_len.div_ceil(256) * 256;
             Some(
                 self.be
@@ -1049,7 +1052,17 @@ impl Llama {
             None
         };
         // Split-K PV partials: [max_splits, mpad, nh*hd] f32 (summed by attn_pv_reduce). Max 8 splits.
-        let nonfa_pv = if nonfa {
+        // Flash split-K scratch: po=[≤8, mpad, nh, hd] f32 partials + pm/pl=[≤8, mpad, nh] f32.
+        let flash_bufs = if use_flash {
+            Some((
+                alloc(8 * mpad * nh * hd, BufferUsage::Activations)?,
+                alloc(8 * mpad * nh, BufferUsage::Activations)?,
+                alloc(8 * mpad * nh, BufferUsage::Activations)?,
+            ))
+        } else {
+            None
+        };
+        let nonfa_pv = if nonfa && !use_flash {
             Some(
                 self.be
                     .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)
@@ -1335,7 +1348,25 @@ impl Llama {
                     c.rms_eps,
                 );
             }
-            if let Some(s) = &nonfa_s {
+            if use_flash {
+                // prefill: fused flash attention (no materialized S buffer), split-K for occupancy.
+                let (po, pm, pl) = flash_bufs.as_ref().unwrap();
+                rec.attention_prefill_flash(
+                    q.as_ref(),
+                    kv.k[li].as_ref(),
+                    kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    po.as_ref(),
+                    pm.as_ref(),
+                    pl.as_ref(),
+                    n,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                );
+            } else if let Some(s) = &nonfa_s {
                 // prefill: non-FA clean GEMMs (QK → softmax → PV).
                 rec.attention_prefill_nonfa(
                     q.as_ref(),

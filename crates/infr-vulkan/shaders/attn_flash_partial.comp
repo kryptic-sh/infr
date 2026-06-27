@@ -1,0 +1,134 @@
+#version 460
+// Flash-attention prefill, SPLIT-K partial pass. Like attn_flash but each workgroup handles only the
+// kv slice [split*ksplit, +ksplit) (split = gl_WorkGroupID.y) → S× more workgroups + S× shorter kv
+// loops, which is the occupancy the single-kernel flash lacks at high ctx (small q tile count). Each
+// (q-tile, head, split) emits an UN-normalized online-softmax partial: Os (running Σ exp(s-m)·v),
+// m (running max), l (running sum). attn_flash_combine merges splits per (row,head). No race: each
+// partial writes a disjoint [split] slice; combine only reads. Q/K/V f16, partials f32. hd%16,hd<=128.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint BM = 64u;
+const uint BN = 64u;
+
+layout(push_constant) uniform PC {
+    uint q_len;     // mpad (padded query rows)
+    uint kv_len;
+    uint nh;
+    uint nkv;
+    uint hd;
+    uint pos_offset;
+    uint n_splits;
+    uint ksplit;    // kv elements per split (multiple of BN)
+} pc;
+layout(binding = 0) readonly buffer QB { float16_t q[]; };  // [mpad, nh, hd]
+layout(binding = 1) readonly buffer KB { float16_t k[]; };  // [kv_len, nkv, hd]
+layout(binding = 2) readonly buffer VB { float16_t v[]; };  // [kv_len, nkv, hd]
+layout(binding = 3) writeonly buffer POB { float po[]; };   // [n_splits, mpad, nh, hd] un-normalized O
+layout(binding = 4) writeonly buffer PMB { float pm[]; };   // [n_splits, mpad, nh] running max
+layout(binding = 5) writeonly buffer PLB { float pl[]; };   // [n_splits, mpad, nh] running sum
+
+shared float Ss[BM * BN];
+shared float16_t Ps[BM * BN];
+shared float Os[BM * 128u];
+shared float mrow[BM];
+shared float lrow[BM];
+shared float corr[BM];
+
+void main() {
+    uint qt = gl_WorkGroupID.x / pc.nh;
+    uint h = gl_WorkGroupID.x % pc.nh;
+    uint split = gl_WorkGroupID.y;
+    uint qr0 = qt * BM;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint li = gl_LocalInvocationIndex;
+    uint sg = gl_SubgroupID;
+    uint hd = pc.hd;
+    float scale = 1.0 / sqrt(float(hd));
+
+    for (uint i = li; i < BM * hd; i += 128u) { Os[i] = 0.0; }
+    if (li < BM) { mrow[li] = -1e30; lrow[li] = 0.0; }
+    barrier();
+
+    uint qmax = pc.pos_offset + qr0 + BM - 1u;
+    uint kvend = min(min(pc.kv_len, qmax + 1u), split * pc.ksplit + pc.ksplit);
+    uint kv0 = split * pc.ksplit;
+    for (; kv0 < kvend; kv0 += BN) {
+        for (uint ctile = 0u; ctile < BN; ctile += 16u) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            for (uint kf = 0u; kf < hd; kf += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, q, (qr0 + sg * 16u) * pc.nh * hd + h * hd + kf,
+                            pc.nh * hd, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, k, (kv0 + ctile) * pc.nkv * hd + kvh * hd + kf,
+                            pc.nkv * hd, gl_CooperativeMatrixLayoutColumnMajor);
+                acc = coopMatMulAdd(A, B, acc);
+            }
+            coopMatStore(acc, Ss, (sg * 16u) * BN + ctile, BN,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+
+        if (li < BM) {
+            uint r = li;
+            uint qpos = pc.pos_offset + qr0 + r;
+            float rmax = mrow[r];
+            for (uint j = 0u; j < BN; j++) {
+                uint kpos = kv0 + j;
+                float s = (kpos > qpos || kpos >= pc.kv_len) ? -1e30 : Ss[r * BN + j] * scale;
+                Ss[r * BN + j] = s;
+                rmax = max(rmax, s);
+            }
+            float cf = exp(mrow[r] - rmax);
+            float rsum = 0.0;
+            for (uint j = 0u; j < BN; j++) {
+                float p = exp(Ss[r * BN + j] - rmax);
+                Ps[r * BN + j] = float16_t(p);
+                rsum += p;
+            }
+            lrow[r] = lrow[r] * cf + rsum;
+            mrow[r] = rmax;
+            corr[r] = cf;
+        }
+        barrier();
+
+        for (uint i = li; i < BM * hd; i += 128u) { Os[i] *= corr[i / hd]; }
+        barrier();
+
+        for (uint ct = 0u; ct < hd; ct += 16u) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc;
+            coopMatLoad(acc, Os, (sg * 16u) * hd + ct, hd, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint kf = 0u; kf < BN; kf += 16u) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> A;
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                coopMatLoad(A, Ps, (sg * 16u) * BN + kf, BN,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(B, v, (kv0 + kf) * pc.nkv * hd + kvh * hd + ct,
+                            pc.nkv * hd, gl_CooperativeMatrixLayoutRowMajor);
+                acc = coopMatMulAdd(A, B, acc);
+            }
+            coopMatStore(acc, Os, (sg * 16u) * hd + ct, hd,
+                         gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+    }
+
+    // Emit UN-normalized partial for this split (combine merges + normalizes).
+    for (uint i = li; i < BM * hd; i += 128u) {
+        uint r = i / hd;
+        uint d = i % hd;
+        po[(split * pc.q_len + (qr0 + r)) * pc.nh * hd + h * hd + d] = Os[i];
+    }
+    if (li < BM) {
+        uint idx = (split * pc.q_len + (qr0 + li)) * pc.nh + h;
+        pm[idx] = mrow[li];
+        pl[idx] = lrow[li];
+    }
+}

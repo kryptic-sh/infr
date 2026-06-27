@@ -31,6 +31,11 @@ const GEMM_PROJ_WARP_SPV_BYTES: &[u8] =
 const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial.spv"));
 const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk.spv"));
 const ATTN_QK_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk_warp.spv"));
+const ATTN_FLASH_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash.spv"));
+const ATTN_FLASH_PARTIAL_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial.spv"));
+const ATTN_FLASH_COMBINE_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_combine.spv"));
 const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
 const ATTN_PV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv.spv"));
 const ATTN_PV_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_warp.spv"));
@@ -53,6 +58,9 @@ static GEMM_PROJ_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_COMBINE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -103,6 +111,18 @@ pub(crate) fn attn_qk_spv() -> &'static [u32] {
 /// over the 4-warp attn_qk unless INFR_NO_QK_WARP is set.
 pub(crate) fn attn_qk_warp_spv() -> &'static [u32] {
     ATTN_QK_WARP_SPV.get_or_init(|| spv_words(ATTN_QK_WARP_SPV_BYTES))
+}
+/// Fused flash-attention prefill (QK→softmax→PV, no materialized S). Recorder `attention_prefill_flash`.
+pub(crate) fn attn_flash_spv() -> &'static [u32] {
+    ATTN_FLASH_SPV.get_or_init(|| spv_words(ATTN_FLASH_SPV_BYTES))
+}
+/// Flash-attention split-K partial pass (per kv-split online-softmax partials). Recorder use.
+pub(crate) fn attn_flash_partial_spv() -> &'static [u32] {
+    ATTN_FLASH_PARTIAL_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_SPV_BYTES))
+}
+/// Flash-attention split-K combine (merge partials → final O). Recorder use.
+pub(crate) fn attn_flash_combine_spv() -> &'static [u32] {
+    ATTN_FLASH_COMBINE_SPV.get_or_init(|| spv_words(ATTN_FLASH_COMBINE_SPV_BYTES))
 }
 pub(crate) fn attn_softmax_spv() -> &'static [u32] {
     ATTN_SM_SPV.get_or_init(|| spv_words(ATTN_SM_SPV_BYTES))

@@ -7,8 +7,9 @@ use crate::{
     model_ref::ModelRef,
     store::{OllamaManifest, Store, OLLAMA_MODEL_MEDIA_TYPE},
 };
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use infr_core::error::{Error, Result};
+use infr_core::progress::{self, Unit};
 use reqwest::blocking::{Client, Response};
 use sha2::{Digest, Sha256};
 use std::{
@@ -262,7 +263,7 @@ fn download_to_blob(
     };
     let start = if resuming { have } else { 0 };
 
-    let pb = progress_bar(total, label);
+    let pb = progress::bar(total, label, Unit::Bytes);
     pb.set_position(start);
 
     if let Err(e) = stream_into(resp, &mut file, &mut hasher, &pb) {
@@ -318,36 +319,6 @@ fn stream_into(
         pb.inc(n as u64);
     }
     file.flush()
-}
-
-/// A byte-progress bar (or a spinner when the size is unknown).
-fn progress_bar(total: Option<u64>, label: &str) -> ProgressBar {
-    let pb = match total {
-        Some(n) => {
-            let pb = ProgressBar::new(n);
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{msg}\n  {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] \
-                     {bytes}/{total_bytes}  {bytes_per_sec}  ETA {eta}",
-                )
-                .unwrap()
-                .progress_chars("━━╾─"),
-            );
-            pb
-        }
-        None => {
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "{msg}\n  {spinner:.green} [{elapsed_precise}] {bytes} {bytes_per_sec}",
-                )
-                .unwrap(),
-            );
-            pb
-        }
-    };
-    pb.set_message(label.to_owned());
-    pb
 }
 
 // ---------------------------------------------------------------------------

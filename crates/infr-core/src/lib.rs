@@ -8,6 +8,7 @@ pub mod backend;
 pub mod error;
 pub mod graph;
 pub mod loader;
+pub mod progress;
 pub mod tensor;
 
 pub use backend::{Backend, Buffer, BufferUsage, Capabilities, Plan};

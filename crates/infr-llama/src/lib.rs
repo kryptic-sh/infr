@@ -581,23 +581,22 @@ impl Llama {
             .map_err(|e| anyhow!("upload output_norm: {e}"))?;
 
         // Loading the per-layer weights (dequant + GPU upload) dominates startup, especially for
-        // big models — show a progress bar (hidden when stderr isn't a TTY, e.g. piped/served).
-        let pb = {
-            use std::io::IsTerminal;
-            let pb = if std::io::stderr().is_terminal() {
-                indicatif::ProgressBar::new(n_layer as u64)
-            } else {
-                indicatif::ProgressBar::hidden()
-            };
-            pb.set_style(
-                indicatif::ProgressStyle::with_template(
-                    "  {spinner:.green} loading weights [{bar:32.cyan/blue}] {pos}/{len} layers ({elapsed})",
-                )
-                .unwrap()
-                .progress_chars("━━╾─"),
-            );
-            pb
+        // big models — show a byte-progress bar so it reports copy speed + ETA (same shared style as
+        // the download bar). Total/inc are GGUF source bytes; per-layer = sum of that layer's tensors.
+        let layer_bytes = |l: usize| -> u64 {
+            let prefix = format!("blk.{l}.");
+            g.tensors()
+                .iter()
+                .filter(|t| t.name.starts_with(&prefix))
+                .map(|t| t.nbytes as u64)
+                .sum()
         };
+        let total_bytes: u64 = (0..n_layer).map(layer_bytes).sum();
+        let pb = infr_core::progress::bar(
+            Some(total_bytes),
+            "loading weights",
+            infr_core::progress::Unit::Bytes,
+        );
         let mut layers = Vec::with_capacity(n_layer);
         for l in 0..n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
@@ -680,7 +679,7 @@ impl Llama {
                 q_norm_buf,
                 k_norm_buf,
             });
-            pb.inc(1);
+            pb.inc(layer_bytes(l));
         }
         pb.finish_and_clear();
 

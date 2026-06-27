@@ -9,3 +9,4 @@ repository.workspace = true
 thiserror.workspace = true
 half.workspace = true
 bytemuck.workspace = true
+indicatif.workspace = true

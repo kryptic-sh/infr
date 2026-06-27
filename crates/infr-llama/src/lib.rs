@@ -580,6 +580,24 @@ impl Llama {
             .upload_weight(&output_norm)
             .map_err(|e| anyhow!("upload output_norm: {e}"))?;
 
+        // Loading the per-layer weights (dequant + GPU upload) dominates startup, especially for
+        // big models — show a progress bar (hidden when stderr isn't a TTY, e.g. piped/served).
+        let pb = {
+            use std::io::IsTerminal;
+            let pb = if std::io::stderr().is_terminal() {
+                indicatif::ProgressBar::new(n_layer as u64)
+            } else {
+                indicatif::ProgressBar::hidden()
+            };
+            pb.set_style(
+                indicatif::ProgressStyle::with_template(
+                    "  {spinner:.green} loading weights [{bar:32.cyan/blue}] {pos}/{len} layers ({elapsed})",
+                )
+                .unwrap()
+                .progress_chars("━━╾─"),
+            );
+            pb
+        };
         let mut layers = Vec::with_capacity(n_layer);
         for l in 0..n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
@@ -662,7 +680,9 @@ impl Llama {
                 q_norm_buf,
                 k_norm_buf,
             });
+            pb.inc(1);
         }
+        pb.finish_and_clear();
 
         let tokenizer = match tokenizer_path {
             Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,

@@ -1014,6 +1014,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "half",
+ "indicatif",
  "infr-core",
  "infr-gguf",
  "infr-vulkan",

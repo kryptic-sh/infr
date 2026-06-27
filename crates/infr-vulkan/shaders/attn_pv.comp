@@ -2,6 +2,10 @@
 // Non-FA prefill attention, stage 3: O[m,h,:] = sum_n P[h,m,n] · V[n,kvh,:]. A clean coopmat GEMM
 // (A=P, B=V, C=A·B) per head, batched over heads via gl_WorkGroupID.z. P is f16 (softmax output,
 // 0 on masked keys so we sum the full padded kv width), V is f16, O is f32 ([m, nh*hd]).
+// Split-K: gl_WorkGroupID.y = split; each split reduces its [split*ksplit, +ksplit) slice of the kv
+// dim and writes a PARTIAL O into o[split*(m*nh*hd) + ...]; a reduce pass sums the splits. This adds
+// workgroups + shortens the serial K-loop (attn_pv at high ctx is occupancy/latency-bound: few
+// workgroups grinding a 1024-iter reduction). n_splits=1 → base 0, writes O directly (no reduce).
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -22,6 +26,8 @@ layout(push_constant) uniform PC {
     uint hd;
     uint nh;
     uint nkv;
+    uint n_splits;
+    uint ksplit;   // kv elements per split (multiple of BK)
 } pc;
 layout(binding = 0) readonly buffer PB { float16_t p[]; }; // [nh, m, kv_pad]
 layout(binding = 1) readonly buffer VB { float16_t v[]; }; // [kv, nkv, hd]
@@ -42,6 +48,9 @@ void main() {
     uint sgCol = (sgid % 2u) * 32u;
     uint li = gl_LocalInvocationIndex;
     uint pbase = h * pc.m * pc.kv_pad;
+    uint split = gl_WorkGroupID.y;
+    uint kstart = split * pc.ksplit;
+    uint kend = min(kstart + pc.ksplit, pc.kv_pad);
 
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
@@ -49,7 +58,7 @@ void main() {
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 = acc00;
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 = acc00;
 
-    for (uint k0 = 0u; k0 < pc.kv_pad; k0 += BK) {
+    for (uint k0 = kstart; k0 < kend; k0 += BK) {
         for (uint idx = li; idx < BM * BK; idx += 128u) {
             uint r = idx / BK;
             uint cc = idx % BK;
@@ -81,12 +90,13 @@ void main() {
     uint cr = wgRow + sgRow;
     uint cc0 = h * hd + wgCol + sgCol;
     uint stride = pc.nh * hd;
-    coopMatStore(acc00, o, (cr + 0u) * stride + (cc0 + 0u), stride,
+    uint obase = split * pc.m * stride; // partial-O slice for this split (0 when n_splits==1)
+    coopMatStore(acc00, o, obase + (cr + 0u) * stride + (cc0 + 0u), stride,
                  gl_CooperativeMatrixLayoutRowMajor);
-    coopMatStore(acc01, o, (cr + 0u) * stride + (cc0 + 16u), stride,
+    coopMatStore(acc01, o, obase + (cr + 0u) * stride + (cc0 + 16u), stride,
                  gl_CooperativeMatrixLayoutRowMajor);
-    coopMatStore(acc10, o, (cr + 16u) * stride + (cc0 + 0u), stride,
+    coopMatStore(acc10, o, obase + (cr + 16u) * stride + (cc0 + 0u), stride,
                  gl_CooperativeMatrixLayoutRowMajor);
-    coopMatStore(acc11, o, (cr + 16u) * stride + (cc0 + 16u), stride,
+    coopMatStore(acc11, o, obase + (cr + 16u) * stride + (cc0 + 16u), stride,
                  gl_CooperativeMatrixLayoutRowMajor);
 }

@@ -1047,6 +1047,16 @@ impl Llama {
         } else {
             None
         };
+        // Split-K PV partials: [max_splits, mpad, nh*hd] f32 (summed by attn_pv_reduce). Max 8 splits.
+        let nonfa_pv = if nonfa {
+            Some(
+                self.be
+                    .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
         let use_split = n == 1 && kv_len > chunk;
         let n_chunks = if use_split { kv_len.div_ceil(chunk) } else { 0 };
         let split_bufs = if use_split {
@@ -1332,6 +1342,7 @@ impl Llama {
                     kv.v[li].as_ref(),
                     attn.as_ref(),
                     s.as_ref(),
+                    nonfa_pv.as_ref().unwrap().as_ref(),
                     n,
                     kv_len,
                     nh,

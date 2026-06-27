@@ -871,6 +871,7 @@ impl<'a> Recorder<'a> {
         vc: &dyn Buffer,
         attn: &dyn Buffer,
         s: &dyn Buffer,
+        pv_part: &dyn Buffer,
         n: usize,
         kv_len: usize,
         nh: usize,
@@ -918,27 +919,69 @@ impl<'a> Recorder<'a> {
         ps[12..16].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         self.dispatch3(ksm, &[Self::vkb(s)], 1, &ps, mpad, 1, nh as u32);
 
-        // stage 3: O = P·V  (one coopmat GEMM per head)
+        // stage 3: O = P·V  (one coopmat GEMM per head). Split-K when under-occupied: at high ctx
+        // mpad is small so the base workgroup count ((mpad/64)*(hd/64)*nh) is far below the GPU's
+        // capacity while each grinds a huge kv reduction → split the kv dim across gl_WorkGroupID.y
+        // into partials, then sum them.
         self.stamp("attn_pv");
+        let pv_base_wg = (mpad / 64) * (hdu / 64) * nh as u32;
+        let n_splits = match std::env::var("INFR_PV_SPLITS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            Some(v) => v,
+            None => {
+                if pv_base_wg >= 1024 || kv_pad < 4096 {
+                    1u32
+                } else {
+                    (2048 / pv_base_wg.max(1))
+                        .clamp(2, 8)
+                        .min(kv_pad / 2048)
+                        .max(1)
+                }
+            }
+        };
+        let ksplit = kv_pad.div_ceil(n_splits).div_ceil(32) * 32;
         let kpv = self
             .be
-            .kernel_spv_sg("attn_pv", crate::gemm::attn_pv_spv(), 3, 20, 32);
-        let mut pp = [0u8; 20];
+            .kernel_spv_sg("attn_pv", crate::gemm::attn_pv_spv(), 3, 28, 32);
+        let mut pp = [0u8; 28];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&kv_pad.to_ne_bytes());
         pp[8..12].copy_from_slice(&hdu.to_ne_bytes());
         pp[12..16].copy_from_slice(&(nh as u32).to_ne_bytes());
         pp[16..20].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        pp[20..24].copy_from_slice(&n_splits.to_ne_bytes());
+        pp[24..28].copy_from_slice(&ksplit.to_ne_bytes());
         let pv_tiles = (mpad / 64) * (hdu / 64);
+        let pv_out = if n_splits == 1 { attn } else { pv_part };
         self.dispatch3(
             kpv,
-            &[Self::vkb(s), Self::vkb(vc), Self::vkb(attn)],
+            &[Self::vkb(s), Self::vkb(vc), Self::vkb(pv_out)],
             1,
             &pp,
             pv_tiles,
-            1,
+            n_splits,
             nh as u32,
         );
+        if n_splits > 1 {
+            // sum the per-split partials → attn
+            self.stamp("attn_pv");
+            let total = mpad * nh as u32 * hdu;
+            let kr = self
+                .be
+                .kernel_spv("attn_pv_reduce", crate::gemm::attn_pv_reduce_spv(), 2, 8);
+            let mut pr = [0u8; 8];
+            pr[0..4].copy_from_slice(&total.to_ne_bytes());
+            pr[4..8].copy_from_slice(&n_splits.to_ne_bytes());
+            self.dispatch(
+                kr,
+                &[Self::vkb(pv_part), Self::vkb(attn)],
+                1,
+                &pr,
+                total.div_ceil(256),
+            );
+        }
     }
 
     /// Cast-copy f32 `src[0..n]` → f16 `dst[off..off+n]` (write f32 activations into the f16 cache).
@@ -1475,6 +1518,11 @@ mod tests {
         run_attn_prefill_nonfa(70, 70, 2, 2, 128);
         run_attn_prefill_nonfa(192, 500, 2, 1, 128);
         run_attn_prefill_nonfa(80, 300, 9, 3, 64);
+        // force the split-K PV path (n_splits>1) and verify the partial-sum reduce is correct
+        std::env::set_var("INFR_PV_SPLITS", "4");
+        run_attn_prefill_nonfa(70, 300, 4, 2, 128);
+        run_attn_prefill_nonfa(128, 500, 2, 1, 128);
+        std::env::remove_var("INFR_PV_SPLITS");
     }
 
     fn run_attn_prefill_nonfa(q_len: usize, kv_len: usize, nh: usize, nkv: usize, hd: usize) {
@@ -1503,6 +1551,9 @@ mod tests {
         let bs = be
             .alloc(nh * mpad * kv_pad * 2, BufferUsage::Activations)
             .unwrap();
+        let bpv = be
+            .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
         let rec = be.recorder().unwrap();
         rec.attention_prefill_nonfa(
             bq.as_ref(),
@@ -1510,6 +1561,7 @@ mod tests {
             bv.as_ref(),
             bo.as_ref(),
             bs.as_ref(),
+            bpv.as_ref(),
             q_len,
             kv_len,
             nh,

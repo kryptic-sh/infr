@@ -32,6 +32,8 @@ const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk.spv"));
 const ATTN_SM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_softmax.spv"));
 const ATTN_PV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv.spv"));
+const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
 const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
 const MMV_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8.spv"));
 const MMV_Q4_RES_SPV_BYTES: &[u8] =
@@ -50,6 +52,7 @@ static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_PV_REDUCE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q4_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q4_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -97,6 +100,10 @@ pub(crate) fn attn_softmax_spv() -> &'static [u32] {
 }
 pub(crate) fn attn_pv_spv() -> &'static [u32] {
     ATTN_PV_SPV.get_or_init(|| spv_words(ATTN_PV_SPV_BYTES))
+}
+/// SPIR-V for the attn_pv split-K partial reducer (sums n_splits partial-O buffers).
+pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {
+    ATTN_PV_REDUCE_SPV.get_or_init(|| spv_words(ATTN_PV_REDUCE_SPV_BYTES))
 }
 /// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
 /// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.

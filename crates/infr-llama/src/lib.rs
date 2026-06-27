@@ -1571,8 +1571,13 @@ impl Llama {
         // Keep chunks large — bigger chunks are more efficient PER QUERY despite re-reading KV —
         // with a min that holds occupancy up, while the budget still bounds per-submit work to stay
         // under the GPU watchdog at very long context.
+        // Budget bumped 16M→32M: keeps the chunk at the 2048 cap through ~pos 15k and ~1000 at 32k
+        // (was ~1000 at 16k, ~500 at 32k). Bigger chunks at depth are a free win now that prefill is
+        // mmq + flash (lower per-token work) — a coding-agent turn ingests at depth, so its chunks
+        // were the over-shrunk ones. 2048 chunks warmed to 32k run without tripping the watchdog on
+        // this model; the budget still tapers for very long context / bigger models.
         let budget = if self.cfg.qk_norm {
-            16_000_000
+            32_000_000
         } else {
             256 * 64
         };

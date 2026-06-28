@@ -36,6 +36,14 @@ float dq(uint g) {
     float d = f16tof32(ru16(bd));
     return d * float(sgn8(rb(bd + 2u + j)));
 }
+#define HAVE_DQSUB
+float dqsub(uint gstart, uint xoff) {  // one 32-block: decode d once, loop 32 quants.
+    uint bd = (gstart / 32u) * 34u;
+    float d = f16tof32(ru16(bd));
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += d * float(sgn8(rb(bd + 2u + w))) * x_buf[xoff + w]; }
+    return a;
+}
 #endif
 
 #if defined(FMT_Q4_0)
@@ -142,6 +150,24 @@ float dq(uint g) {
     uint qs_byte = rb(bd + 16u + j * 32u + l);
     uint val = (p_j < 32u) ? (qs_byte & 0xFu) : (qs_byte >> 4u);
     return dl * float(val) - mm;
+}
+#define HAVE_DQSUB
+float dqsub(uint gstart, uint xoff) {  // one 32-elem sub-block: decode d/dmin/6-bit scale once.
+    uint sblk = gstart / 32u;          // global sub-block index
+    uint super = sblk / 8u; uint sub = sblk % 8u;
+    uint bd = super * 144u;
+    float d = f16tof32(ru16(bd)); float dmin = f16tof32(ru16(bd + 2u));
+    uvec2 k = k4(sub, bd + 4u);
+    float dl = d * float(k.x); float mm = dmin * float(k.y);
+    uint qbase = bd + 16u + (sub / 2u) * 32u;
+    bool lo = (sub & 1u) == 0u;
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) {
+        uint qb = rb(qbase + w);
+        uint val = lo ? (qb & 0xFu) : (qb >> 4u);
+        a += (dl * float(val) - mm) * x_buf[xoff + w];
+    }
+    return a;
 }
 #endif
 
@@ -410,6 +436,21 @@ float dq(uint g) {
 }
 #endif
 
+// Each thread owns whole sub-blocks (SUBBLK elements) and decodes the shared block scale ONCE,
+// amortizing it across SUBBLK elements instead of re-decoding per element. Formats that define
+// HAVE_DQSUB supply an optimized decode-once dqsub; the rest fall back to looping dq() (identical
+// math, no regression). SUBBLK (default 32) divides every format's row length (in_f).
+#ifndef SUBBLK
+#define SUBBLK 32u
+#endif
+#ifndef HAVE_DQSUB
+float dqsub(uint gstart, uint xoff) {
+    float a = 0.0;
+    for (uint w = 0u; w < SUBBLK; w++) { a += dq(gstart + w) * x_buf[xoff + w]; }
+    return a;
+}
+#endif
+
 void main() {
     uint unit = gl_WorkGroupID.x;
     uint o = unit % pc.out_f;
@@ -417,8 +458,11 @@ void main() {
     uint t = gl_LocalInvocationID.x;
     uint wbase = o * pc.in_f;
     uint xbase = r * pc.in_f;
+    uint nsub = pc.in_f / SUBBLK;
     float acc = 0.0;
-    for (uint i = t; i < pc.in_f; i += 64u) { acc += dq(wbase + i) * x_buf[xbase + i]; }
+    for (uint s = t; s < nsub; s += 64u) {
+        acc += dqsub(wbase + s * SUBBLK, xbase + s * SUBBLK);
+    }
     red[t] = acc;
     barrier();
     for (uint stride = 32u; stride > 0u; stride /= 2u) {

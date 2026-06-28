@@ -52,6 +52,15 @@ unsafe fn as_vk_buf(b: &dyn Buffer) -> &VkBuffer {
 
 // ── shared GPU state ──────────────────────────────────────────────────────────
 
+/// Device-local VRAM snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
+/// `live` is true (VK_EXT_memory_budget present), otherwise it equals `total` (best-effort).
+#[derive(Clone, Copy, Debug)]
+pub struct VramInfo {
+    pub total: u64,
+    pub available: u64,
+    pub live: bool,
+}
+
 struct VulkanShared {
     // NOTE: field declaration order matters for drop.
     // Rust drops struct fields in *declaration order*.  We keep `allocator`
@@ -68,6 +77,8 @@ struct VulkanShared {
     /// Must be dropped before the device is destroyed.
     allocator: ManuallyDrop<Mutex<Allocator>>,
     caps: Capabilities,
+    /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
+    has_mem_budget: bool,
     /// Lazily-built, reused compute pipeline for the linear op (see `linear.rs`).
     linear_kernel: std::sync::OnceLock<crate::linear::LinearKernel>,
     /// Generic cache of compute kernels by name (see `ops.rs`).
@@ -210,6 +221,7 @@ impl VulkanBackend {
         let has_16bit_storage = has_ext(c"VK_KHR_16bit_storage");
         let has_8bit_storage = has_ext(c"VK_KHR_8bit_storage");
         let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
+        let has_mem_budget = has_ext(c"VK_EXT_memory_budget");
 
         // ── probe f16 feature (via VK 1.1 get_physical_device_features2) ──────
         let mut f16_feat = vk::PhysicalDeviceShaderFloat16Int8Features::default();
@@ -230,6 +242,9 @@ impl VulkanBackend {
         }
         if has_subgroup_ext {
             ext_ptrs.push(c"VK_KHR_shader_subgroup_extended_types".as_ptr());
+        }
+        if has_mem_budget {
+            ext_ptrs.push(c"VK_EXT_memory_budget".as_ptr());
         }
 
         // ── logical device ─────────────────────────────────────────────────────
@@ -322,6 +337,7 @@ impl VulkanBackend {
                 cmd_pool: Mutex::new(cmd_pool),
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
+                has_mem_budget,
                 linear_kernel: std::sync::OnceLock::new(),
                 kernels: Mutex::new(HashMap::new()),
             }),
@@ -331,6 +347,43 @@ impl VulkanBackend {
     // ── internal helpers ──────────────────────────────────────────────────────
 
     /// Create a `vk::Buffer` + gpu-allocator sub-allocation of the requested size/location.
+    /// Device-local VRAM: total heap size and currently-available bytes. `available` comes from
+    /// VK_EXT_memory_budget (live, accounts for other processes + our own allocations) when the
+    /// extension is present; otherwise it falls back to the total heap size (best effort).
+    pub fn vram(&self) -> VramInfo {
+        let s = &self.shared;
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+        if s.has_mem_budget {
+            props2 = props2.push_next(&mut budget);
+        }
+        unsafe {
+            s.instance
+                .get_physical_device_memory_properties2(s.physical_device, &mut props2)
+        };
+        let mp = props2.memory_properties;
+        let mut total = 0u64;
+        let mut available = 0u64;
+        for i in 0..mp.memory_heap_count as usize {
+            if mp.memory_heaps[i]
+                .flags
+                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+            {
+                total += mp.memory_heaps[i].size;
+                available += if s.has_mem_budget {
+                    budget.heap_budget[i]
+                } else {
+                    mp.memory_heaps[i].size
+                };
+            }
+        }
+        VramInfo {
+            total,
+            available,
+            live: s.has_mem_budget,
+        }
+    }
+
     fn make_buf(&self, size: usize, location: MemoryLocation, label: &str) -> Result<VkBuffer> {
         let buf_ci = vk::BufferCreateInfo::default()
             .size(size as u64)

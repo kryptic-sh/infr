@@ -1359,6 +1359,64 @@ fn quant_params(d: infr_core::DType) -> (u32, usize) {
     }
 }
 
+/// VRAM the model's weights will occupy once resident, split dense vs MoE-expert. Experts are
+/// tracked separately so a future expert-streaming / partial-offload mode can budget them apart
+/// from the always-resident dense weights — for a dense model `expert` is 0.
+#[derive(Clone, Copy, Debug)]
+pub struct WeightFootprint {
+    /// Always-resident weights: projections, embeddings, norms.
+    pub dense: u64,
+    /// MoE expert weights (GGUF `*_exps` stacked tensors). 0 for dense models.
+    pub expert: u64,
+}
+impl WeightFootprint {
+    pub fn total(&self) -> u64 {
+        self.dense + self.expert
+    }
+}
+
+/// Resident VRAM bytes for one tensor, mirroring [`upload_wt`]'s path so the estimate matches what
+/// actually gets allocated: native raw blocks (padded to u32), unified repack (index@bits + f16
+/// scale + f16 min per block), or f16 (codebook/float/norms dequanted to half).
+fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbytes: usize) -> u64 {
+    if use_native_for(dtype) && is_native_supported(dtype) {
+        ((nbytes + 3) & !3) as u64 // raw blocks, padded to u32 alignment
+    } else if is_quant(dtype) {
+        let (bits, blk) = quant_params(dtype);
+        let q = numel * bits as usize / 8;
+        let sm = 2 * (numel / blk.max(1)) * 2; // scale + min, one f16 each per block
+        (q + sm) as u64
+    } else {
+        (numel * 2) as u64 // f16
+    }
+}
+
+/// Sum the resident weight footprint across all tensors (MoE-aware). Enumerating every tensor means
+/// stacked expert tensors are counted in full, so this is correct for MoE the moment the arch is
+/// supported. `token_embd` is excluded (it lives in host RAM for the CPU embedding gather) unless
+/// the lm head is tied to it (no `output.weight`), where an f16 copy is uploaded to VRAM.
+pub fn weight_footprint(g: &Gguf) -> WeightFootprint {
+    let has_output = g.tensors().iter().any(|t| t.name == "output.weight");
+    let mut dense = 0u64;
+    let mut expert = 0u64;
+    for t in g.tensors() {
+        let numel: usize = t.shape.iter().product();
+        if t.name == "token_embd.weight" {
+            if !has_output {
+                dense += (numel * 2) as u64; // tied lm head, uploaded as f16
+            }
+            continue;
+        }
+        let bytes = tensor_resident_bytes(t.dtype, numel, t.nbytes);
+        if t.name.contains("_exps") {
+            expert += bytes;
+        } else {
+            dense += bytes;
+        }
+    }
+    WeightFootprint { dense, expert }
+}
+
 /// Pack a unified-dequant result into the GPU layout: indices at `bits` (4 → 8/u32, else 4/u32),
 /// scales/mins one f16 per `blk`-element block.
 fn pack_unified(
@@ -1568,6 +1626,38 @@ impl Llama {
         let eos = meta_u64(&g, "tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
 
         let be = VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+
+        // Pre-flight VRAM check: size the resident weights up front and verify they fit before
+        // uploading any tensor — turns a cryptic mid-load allocator OOM into a clear early error.
+        // (KV cache + activation scratch are allocated later by `new_kv`/the forward, not here.)
+        let fp = weight_footprint(&g);
+        let vram = be.vram();
+        let gb = |b: u64| b as f64 / 1e9;
+        let experts = if fp.expert > 0 {
+            format!(", experts {:.2} GB", gb(fp.expert))
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "weights {:.2} GB (dense {:.2} GB{}) | VRAM {:.2} GB {} / {:.2} GB total",
+            gb(fp.total()),
+            gb(fp.dense),
+            experts,
+            gb(vram.available),
+            if vram.live { "free" } else { "total*" },
+            gb(vram.total),
+        );
+        const WEIGHT_HEADROOM: u64 = 384 * 1024 * 1024; // activation/scratch slack beyond weights
+        if fp.total() + WEIGHT_HEADROOM > vram.available {
+            bail!(
+                "weights need {:.2} GB + {:.0} MB scratch but only {:.2} GB VRAM is available \
+                 (total {:.2} GB) — use a smaller quant or free GPU memory",
+                gb(fp.total()),
+                WEIGHT_HEADROOM as f64 / 1e6,
+                gb(vram.available),
+                gb(vram.total),
+            );
+        }
 
         // token embeddings (host) + lm head (GPU). tied unless output.weight present.
         let (token_embd, te_shape) = load_tensor_dequant(&g, "token_embd.weight")?;

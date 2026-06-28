@@ -3637,11 +3637,26 @@ impl Llama {
             .map_err(|e| anyhow!("{e}"))?;
         let (hn, hn2, ao) = (al(t * ne)?, al(t * ne)?, al(t * ne)?);
         let (qr, kr, vr) = (al(t * nh * hd)?, al(t * nkv * hd)?, al(t * nkv * hd)?);
+        // Flash prefill attention (split-K, register-blocked, never materializes the score matrix) is
+        // hd=128-specialized and wants 64-row tiles → pad q/attn to mpad rows. Small chunks (t<64) or
+        // other head dims fall back to the basic per-query attention_kv. INFR_NO_FLASH forces fallback.
+        let use_flash = hd == 128 && t >= 64 && std::env::var("INFR_NO_FLASH").is_err();
+        let mpad = if use_flash { t.div_ceil(64) * 64 } else { t };
         let q_f16 = self
             .be
-            .alloc(t * nh * hd * 2, BufferUsage::Activations)
+            .alloc(mpad * nh * hd * 2, BufferUsage::Activations)
             .map_err(|e| anyhow!("{e}"))?;
-        let attn = al(t * nh * hd)?;
+        let attn = al(mpad * nh * hd)?;
+        // Flash split-K scratch: po=[≤8,mpad,nh,hd] partials, pm/pl=[≤8,mpad,nh] (reused across layers).
+        let flash = if use_flash {
+            Some((
+                al(8 * mpad * nh * hd)?,
+                al(8 * mpad * nh)?,
+                al(8 * mpad * nh)?,
+            ))
+        } else {
+            None
+        };
         let logits = self
             .be
             .alloc(t * mc.n_expert * 4, BufferUsage::Readback)
@@ -3692,18 +3707,36 @@ impl Llama {
                 c.rms_eps,
             );
             rec.store_f16(vr.as_ref(), kv.kv.v[li].as_ref(), t * kvrow, pos * kvrow);
-            rec.attention_kv(
-                q_f16.as_ref(),
-                kv.kv.k[li].as_ref(),
-                kv.kv.v[li].as_ref(),
-                attn.as_ref(),
-                t,
-                kv_len,
-                nh,
-                nkv,
-                hd,
-                pos,
-            );
+            if let Some((po, pm, pl)) = &flash {
+                rec.attention_prefill_flash(
+                    q_f16.as_ref(),
+                    kv.kv.k[li].as_ref(),
+                    kv.kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    po.as_ref(),
+                    pm.as_ref(),
+                    pl.as_ref(),
+                    t,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                );
+            } else {
+                rec.attention_kv(
+                    q_f16.as_ref(),
+                    kv.kv.k[li].as_ref(),
+                    kv.kv.v[li].as_ref(),
+                    attn.as_ref(),
+                    t,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                );
+            }
             rec_linear(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), t, nh * hd, ne);
             rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), t * ne); // residual
             rec.rmsnorm(

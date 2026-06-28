@@ -70,6 +70,17 @@ pub struct MoeKv {
     pool: Option<infr_vulkan::ExpertPool>,
 }
 
+impl MoeKv {
+    /// Tokens currently resident in the cache (the next chunk's start position).
+    pub fn len(&self) -> usize {
+        self.kv.len
+    }
+    /// True when no tokens are resident yet.
+    pub fn is_empty(&self) -> bool {
+        self.kv.len == 0
+    }
+}
+
 /// Token sampling: greedy when `temp <= 0`, else temperature + top-k + top-p (nucleus). Qwen3
 /// recommends temp 0.6 / top_k 20 / top_p 0.95 — pure greedy makes thinking models degenerate
 /// (fail to close `</think>`, repeat, or stop without answering).

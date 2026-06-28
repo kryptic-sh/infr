@@ -471,38 +471,76 @@ fn cmd_bench(
             llama.prefill_chunk(pos)
         }
     };
-    // prefill `count` tokens starting at the cache head, chunked. Returns the throughput's token count.
-    let prefill = |kv: &mut infr_llama::KvCache, count: usize| -> anyhow::Result<()> {
-        let mut done = 0usize;
-        while done < count {
-            let pos = kv.len();
-            let c = chunk(pos).min(count - done);
-            llama.forward_resident_kv(&dummy(pos, c), kv)?;
-            done += c;
-        }
-        Ok(())
-    };
     let cap = depth + pg.map_or(n_prompt + n_gen, |(p, g)| p + g) + 64;
     let mut samples = Vec::with_capacity(reps);
-    for _ in 0..reps {
-        let mut kv = llama.new_kv(cap)?;
-        prefill(&mut kv, depth)?; // warm to `depth` (untimed)
-        let t = std::time::Instant::now();
-        if let Some((p, g)) = pg {
-            // coding-agent turn: time prompt ingest + reply generation together.
-            prefill(&mut kv, p)?;
-            for _ in 0..g {
-                llama.forward_resident_kv(&[7u32], &mut kv)?;
+    // MoE models use the eager forward + GPU MoE KV cache; dense models the resident GPU forward.
+    // Same prefill→measure shape, different forward/cache types, so the rep body is branched.
+    if llama.is_moe() {
+        let prefill = |llama: &infr_llama::Llama,
+                       kv: &mut infr_llama::MoeKv,
+                       count: usize|
+         -> anyhow::Result<()> {
+            let mut done = 0usize;
+            while done < count {
+                let pos = kv.len();
+                let c = chunk(pos).min(count - done);
+                llama.forward_moe_chunk(&dummy(pos, c), kv)?;
+                done += c;
             }
-            samples.push((p + g) as f64 / t.elapsed().as_secs_f64());
-        } else if measure_tg {
-            for _ in 0..n_gen {
-                llama.forward_resident_kv(&[7u32], &mut kv)?;
+            Ok(())
+        };
+        for _ in 0..reps {
+            let mut kv = llama.new_moe_kv(cap)?;
+            prefill(&llama, &mut kv, depth)?; // warm to `depth` (untimed)
+            let t = std::time::Instant::now();
+            if let Some((p, g)) = pg {
+                prefill(&llama, &mut kv, p)?;
+                for _ in 0..g {
+                    llama.forward_moe_chunk(&[7u32], &mut kv)?;
+                }
+                samples.push((p + g) as f64 / t.elapsed().as_secs_f64());
+            } else if measure_tg {
+                for _ in 0..n_gen {
+                    llama.forward_moe_chunk(&[7u32], &mut kv)?;
+                }
+                samples.push(n_gen as f64 / t.elapsed().as_secs_f64());
+            } else {
+                prefill(&llama, &mut kv, n_prompt)?;
+                samples.push(n_prompt as f64 / t.elapsed().as_secs_f64());
             }
-            samples.push(n_gen as f64 / t.elapsed().as_secs_f64());
-        } else {
-            prefill(&mut kv, n_prompt)?;
-            samples.push(n_prompt as f64 / t.elapsed().as_secs_f64());
+        }
+    } else {
+        // prefill `count` tokens at the cache head, chunked.
+        let prefill = |kv: &mut infr_llama::KvCache, count: usize| -> anyhow::Result<()> {
+            let mut done = 0usize;
+            while done < count {
+                let pos = kv.len();
+                let c = chunk(pos).min(count - done);
+                llama.forward_resident_kv(&dummy(pos, c), kv)?;
+                done += c;
+            }
+            Ok(())
+        };
+        for _ in 0..reps {
+            let mut kv = llama.new_kv(cap)?;
+            prefill(&mut kv, depth)?; // warm to `depth` (untimed)
+            let t = std::time::Instant::now();
+            if let Some((p, g)) = pg {
+                // coding-agent turn: time prompt ingest + reply generation together.
+                prefill(&mut kv, p)?;
+                for _ in 0..g {
+                    llama.forward_resident_kv(&[7u32], &mut kv)?;
+                }
+                samples.push((p + g) as f64 / t.elapsed().as_secs_f64());
+            } else if measure_tg {
+                for _ in 0..n_gen {
+                    llama.forward_resident_kv(&[7u32], &mut kv)?;
+                }
+                samples.push(n_gen as f64 / t.elapsed().as_secs_f64());
+            } else {
+                prefill(&mut kv, n_prompt)?;
+                samples.push(n_prompt as f64 / t.elapsed().as_secs_f64());
+            }
         }
     }
     let avg = samples.iter().sum::<f64>() / samples.len() as f64;

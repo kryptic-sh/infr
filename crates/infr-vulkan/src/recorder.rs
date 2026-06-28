@@ -1459,7 +1459,7 @@ impl<'a> Recorder<'a> {
     pub fn silu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
         let k = self
             .be
-            .kernel("silu_mul_fused", ops::SILU_MUL_FUSED_WGSL, 2, 8);
+            .kernel_spv("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());

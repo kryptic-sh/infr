@@ -230,6 +230,19 @@ matmul ≫ CPU; small pool = per-layer stream buffer, no cross-token cache;
 prefill could thrash → batch-tokens-by-expert is a follow-on). Stream falls back
 to CPU for non-native-supported quants.
 
+GPU KV + AUTO-FIT (done): MoE KV cache moved host→GPU (`MoeKv` holds a
+`KvCache`; `moe_attention` records qk_norm_rope/store_f16/attention_kv reusing
+the dense kernels — dropped the host attention/qk-norm/rope + q_norm/k_norm host
+weights; same output, 36 vs 38 tok/s). So context KV now competes for VRAM.
+AUTO-FIT (default, MoE, unless INFR_NCMOE set): reserve dense + KV(target
+ctx=INFR_MAX_CTX, default 8192) + 512MB scratch, keep
+floor(budget/per_layer_expert) expert-layers on GPU, offload overflow (STREAMED
+by default). Pre-flight footprint/arena/fit- check include KV. VERIFIED
+30B-A3B-Q4/24GB: ctx 8k → 48/48 GPU (KV 0.81GB); ctx 128k → 31/48 GPU + 17
+streamed (KV 12.89GB), runs @ 9.2 tok/s; ctx 256k → KV alone 25.78GB → clean
+bail (smaller ctx). ⇒ "load max experts on GPU, leave room for context" is now
+automatic + physically correct.
+
 Infra:
 
 - Pull/store refactor: own store `$INFR_MODELS` or `$XDG_CACHE_HOME/infr/models`

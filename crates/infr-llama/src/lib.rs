@@ -346,6 +346,8 @@ fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>,
         Q5_0 => (32, 22),
         Q5_1 => (32, 24),
         Q8_0 => (32, 34),
+        Q2K => (256, 84),
+        Q3K => (256, 110),
         Q4K => (256, 144),
         Q5K => (256, 176),
         Q6K => (256, 210),
@@ -437,6 +439,113 @@ fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>,
                     );
                 }
             }
+            // ── Q2_K: y = dl*(q2) - ml; per-16-elem sub-block scale/min ─────────
+            // Ref: llama.cpp dequantize_row_q2_K (ggml-quants.c l.903)
+            // Block (84 bytes): [uint8 scales[16]][uint8 qs[64]][half d][half dmin]
+            // x = d*(sc&0xF)*q2 - dmin*(sc>>4) → scale=d*(sc&0xF), index=q2, min=-dmin*(sc>>4)
+            Q2K => {
+                // Memory layout: scales[0..16], qs[16..80], d[80..82], dmin[82..84]
+                let scales = &blk[0..16];
+                let qs = &blk[16..80];
+                let d = rdf16(&blk[80..82]);
+                let dmin = rdf16(&blk[82..84]);
+                let base = b * 256;
+                let mut out = 0usize;
+                let mut is = 0usize; // scale index
+                let mut qoff = 0usize; // offset into qs
+                for _n in 0..2 {
+                    // n=0: elements 0..127, n=1: elements 128..255
+                    let mut shift = 0u32;
+                    for _j in 0..4 {
+                        let sc = scales[is];
+                        is += 1;
+                        let dl = d * (sc & 0xF) as f32;
+                        let ml = dmin * (sc >> 4) as f32;
+                        for l in 0..16 {
+                            let q2 = (qs[qoff + l] >> shift) & 3;
+                            set(base + out, q2, dl, -ml);
+                            out += 1;
+                        }
+                        let sc = scales[is];
+                        is += 1;
+                        let dl = d * (sc & 0xF) as f32;
+                        let ml = dmin * (sc >> 4) as f32;
+                        for l in 0..16 {
+                            let q2 = (qs[qoff + l + 16] >> shift) & 3;
+                            set(base + out, q2, dl, -ml);
+                            out += 1;
+                        }
+                        shift += 2;
+                    }
+                    qoff += 32;
+                }
+            }
+            // ── Q3_K: y = dl*(q3u - 4); per-16-elem 6-bit sub-block scale ────────
+            // Ref: llama.cpp dequantize_row_q3_K (ggml-quants.c l.1247)
+            // Block (110 bytes): [uint8 hmask[32]][uint8 qs[64]][uint8 scales[12]][half d]
+            // q3u = (q_low2 | (hmask_bit << 2)) ∈ 0..7; y = d*(sc6-32)*q3u + d*(sc6-32)*(-4)
+            Q3K => {
+                // Memory layout: hmask[0..32], qs[32..96], scales[96..108], d[108..110]
+                let hmask = &blk[0..32];
+                let qs = &blk[32..96];
+                let scales_raw = &blk[96..108];
+                let d_all = rdf16(&blk[108..110]);
+                let base = b * 256;
+
+                // Decode 6-bit scales: port of the llama.cpp bit manipulation exactly.
+                // scales_raw is 12 bytes encoding 16 × 6-bit values.
+                // kmask1=0x03030303, kmask2=0x0f0f0f0f
+                let mut aux = [0u32; 4];
+                aux[0] = u32::from_le_bytes(scales_raw[0..4].try_into().unwrap());
+                aux[1] = u32::from_le_bytes(scales_raw[4..8].try_into().unwrap());
+                aux[2] = u32::from_le_bytes(scales_raw[8..12].try_into().unwrap());
+                // Note: aux[3] starts as 0 (no 4th word in scales_raw)
+                let kmask1: u32 = 0x0303_0303;
+                let kmask2: u32 = 0x0f0f_0f0f;
+                let tmp = aux[2];
+                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+                aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+                aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+                // Now aux as i8[16] gives decoded 6-bit scales; subtract 32 to get signed scale.
+                let sc6 = |i: usize| -> f32 {
+                    let byte_idx = i / 4;
+                    let bit_shift = (i % 4) * 8;
+                    let sc = ((aux[byte_idx] >> bit_shift) & 0xFF) as u8 as i8;
+                    (sc as i32 - 32) as f32
+                };
+
+                let mut out = 0usize;
+                let mut is = 0usize; // scale index
+                let mut qoff = 0usize; // offset into qs
+                let mut m = 1u8;
+                for _n in 0..2 {
+                    let mut shift = 0u32;
+                    for _j in 0..4 {
+                        let dl = d_all * sc6(is);
+                        is += 1;
+                        for l in 0..16 {
+                            let low2 = (qs[qoff + l] >> shift) & 3;
+                            let high = if hmask[l] & m != 0 { 1u8 } else { 0u8 };
+                            let q3u = low2 | (high << 2); // 0..7
+                            set(base + out, q3u, dl, -4.0 * dl);
+                            out += 1;
+                        }
+                        let dl = d_all * sc6(is);
+                        is += 1;
+                        for l in 0..16 {
+                            let low2 = (qs[qoff + l + 16] >> shift) & 3;
+                            let high = if hmask[l + 16] & m != 0 { 1u8 } else { 0u8 };
+                            let q3u = low2 | (high << 2); // 0..7
+                            set(base + out, q3u, dl, -4.0 * dl);
+                            out += 1;
+                        }
+                        shift += 2;
+                        m <<= 1;
+                    }
+                    qoff += 32;
+                }
+            }
             Q4K => {
                 let d = rdf16(&blk[0..2]);
                 let dmin = rdf16(&blk[2..4]);
@@ -508,11 +617,14 @@ fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>,
 }
 
 /// True for types that go through the GPU in-kernel affine dequant path (`Wt::Q`).
-/// Codebook quants (IQ*/TQ*/fp4) are NOT included here — they go host-dequant → f16.
-/// Q2K and Q3K are added in Phase 2.
+/// All affine quants: legacy round quants + k-quants (Q2K–Q6K).
+/// Codebook quants (IQ*/TQ*/fp4) are NOT included — they go host-dequant → f16.
 fn is_quant(d: infr_core::DType) -> bool {
     use infr_core::DType::*;
-    matches!(d, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q4K | Q5K | Q6K)
+    matches!(
+        d,
+        Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K
+    )
 }
 
 /// In-VRAM packing per source quant: (bits, scale/min block size). Q4 packs to native 4-bit (8×
@@ -525,6 +637,8 @@ fn quant_params(d: infr_core::DType) -> (u32, usize) {
         Q5_0 => (8, 32), // 5-bit index (0..31) stored in 8-bit, per-32-elem scale/min
         Q5_1 => (8, 32), // 5-bit index (0..31) stored in 8-bit, per-32-elem scale/min
         Q8_0 => (8, 32), // 8-bit index, per-32-elem scale/min
+        Q2K => (4, 16),  // 2-bit quant (0..3) in 4-bit packing; per-16-elem sub-scale/min
+        Q3K => (4, 16),  // 3-bit quant (0..7) in 4-bit packing; per-16-elem sub-scale/min
         Q4K => (4, 32),
         Q5K => (8, 32),
         Q6K => (8, 16),
@@ -2068,6 +2182,128 @@ fn dequant_to_f32(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod dequant_tests {
     use super::*;
+
+    // ── Q2_K ────────────────────────────────────────────────────────────────────
+    // Block: [uint8 scales[16]][uint8 qs[64]][half d][half dmin]
+    // y = d*(sc&0xF)*q2 - dmin*(sc>>4), q2 ∈ 0..3
+    // Reference: llama.cpp dequantize_row_q2_K (ggml-quants.c l.903)
+    #[test]
+    fn q2k_single_block() {
+        // d=1.0, dmin=2.0
+        // scales[0]=0x23 → lo=3, hi=2 → first sub-block: dl=3.0, ml=4.0
+        // scales[1]=0x23 → second 16-elem sub-block (qs[16..32]): same dl/ml
+        // qs[0..16]=0x55 → q2 (shift=0) = 0x55 & 3 = 1
+        // Expected y[0] = 3.0*1 - 4.0 = -1.0
+        let mut block = vec![0u8; 84];
+        // scales[0..16]
+        block[0] = 0x23; // lo=3, hi=2
+        block[1] = 0x23; // same for second sub-block
+                         // qs[16..80]
+        for b in &mut block[16..80] {
+            *b = 0x55; // any bits; q2 at shift=0 for first 16 = 1
+        }
+        // d[80..82] = 1.0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        block[80..82].copy_from_slice(&d_bytes);
+        // dmin[82..84] = 2.0
+        let dmin_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        block[82..84].copy_from_slice(&dmin_bytes);
+
+        let y = dequant_to_f32(infr_core::DType::Q2K, &block);
+        assert_eq!(y.len(), 256);
+        // First sub-block, first element: q2=1, y=3.0*1-4.0=-1.0
+        assert!(
+            (y[0] - (-1.0)).abs() < 1e-4,
+            "q2k y[0] expected -1.0, got {}",
+            y[0]
+        );
+        // All elements in first sub-block same q2=1 → same y
+        for i in 0..16 {
+            assert!(
+                (y[i] - (-1.0)).abs() < 1e-4,
+                "q2k y[{i}] expected -1.0, got {}",
+                y[i]
+            );
+        }
+        // Second sub-block (16..32): same scales, qs=0x55, q2=(0x55>>2)&3=(0x15)&3=1
+        // Wait: shift=0 for j=0 applies to BOTH first and second 16-elem groups of the
+        // same j-iteration. Let me re-check the llama logic.
+        // In the llama code, for j=0 (shift=0):
+        //   sc=scales[0], dl=d*(sc&0xF)=3, ml=dmin*(sc>>4)=4
+        //   for l in 0..16: q2 = (q[l] >> 0) & 3 = qs[l] & 3 = 0x55 & 3 = 1
+        //   sc=scales[1], dl=d*(sc&0xF)=3, ml=dmin*(sc>>4)=4
+        //   for l in 0..16: q2 = (q[l+16] >> 0) & 3 = qs[l+16] & 3 = 1
+        // So elements 16..32 also have dl=3, ml=4, q2=1 → y=-1.0
+        assert!(
+            (y[16] - (-1.0)).abs() < 1e-4,
+            "q2k y[16] expected -1.0, got {}",
+            y[16]
+        );
+    }
+
+    // ── Q3_K ────────────────────────────────────────────────────────────────────
+    // Block: [uint8 hmask[32]][uint8 qs[64]][uint8 scales[12]][half d]
+    // y = d*(sc6-32)*(q3u - 4), q3u = (low2 | high_bit<<2) ∈ 0..7
+    // Reference: llama.cpp dequantize_row_q3_K (ggml-quants.c l.1247)
+    #[test]
+    fn q3k_single_block() {
+        // d=1.0
+        // Choose scales to decode as sc6=36 for all sub-blocks → sc6-32=4 → dl=4.0
+        // Encode sc6=36 for first sub-block in scales_raw:
+        //   After decode, aux bytes give sc6 values. Simpler: set all scales[0..12]=0
+        //   so that after bit manipulation aux has all-zero lower nibbles → sc6=0 for all.
+        //   Then dl=0 → y=0 everywhere. That's a trivial test.
+        //
+        // Better: set scales bytes to give sc6=32 for first two sub-blocks (dl=0, y=0)
+        // and verify that y[0..32]=0. Then set hmask and qs to anything.
+        //
+        // Even simpler: set scales_raw all-zero. After bit manipulation:
+        //   aux[0]=0, aux[1]=0, aux[2]=0, aux[3]=0
+        //   sc6(0)= aux[0] byte0 = 0 → sc6-32 = -32 → dl=-32
+        //   hmask[0..16]=0 (high bit=0), qs[0..16]=0x00 (low2=0 at shift=0)
+        //   q3u = 0 | (0<<2) = 0. y = -32*0 + (-4)*(-32) = 128... wait
+        //   y = dl*q3u + (-4*dl) = -32*0 + (-4*(-32)) = 128
+        //
+        // Let me verify this explicitly:
+        //   q3u=0, dl=-32, min=-4*dl=128. y = -32*0 + 128 = 128. ✓
+        //
+        // Alternatively: set scales_raw to encode sc6=32 for sub-block 0.
+        //   When tmp=aux[2]=0, aux[0]=scales_bytes[0..4] as u32.
+        //   For sc6=32 after decode:
+        //     sc6(0) = (aux[0] & 0xFF) = 32 → need aux[0] byte 0 = 32 = 0x20
+        //     After bit manip (tmp=0): aux[0] = (orig_aux0 & 0x0F0F0F0F) | ...
+        //     So (orig_aux0 & 0xF) = 32? 32 > 15, so the lower 4 bits can't encode 32.
+        //
+        // The scale decoding is complex. Let me just use all-zero scales (sc6=0, dl=-32*1=-32)
+        // with hmask[0..16]=0 and qs[0..16]=0x00:
+        // y = -32*0 + (-4*(-32)) = 128.0
+        let mut block = vec![0u8; 110];
+        // hmask[0..32] = all 0 (high bit not set for any elem)
+        // qs[32..96] = all 0 (low2=0 at any shift)
+        // scales[96..108] = all 0 (encodes sc6=0 after bit manipulation → dl=-32)
+        // d[108..110] = 1.0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        block[108..110].copy_from_slice(&d_bytes);
+
+        let y = dequant_to_f32(infr_core::DType::Q3K, &block);
+        assert_eq!(y.len(), 256);
+        // sc6=0 → dl = 1.0*(0-32) = -32.0
+        // q3u = 0 (hmask=0, qs=0), min = -4*(-32) = 128
+        // y[0] = -32*0 + 128 = 128.0
+        assert!(
+            (y[0] - 128.0).abs() < 1e-3,
+            "q3k y[0] expected 128.0, got {}",
+            y[0]
+        );
+        // All elements should be 128.0 (same scale, q3u=0 everywhere)
+        for i in 0..256 {
+            assert!(
+                (y[i] - 128.0).abs() < 1e-3,
+                "q3k y[{i}] expected 128.0, got {}",
+                y[i]
+            );
+        }
+    }
 
     // ── Q4_0 ────────────────────────────────────────────────────────────────────
     // Block: [half d][uint8 qs[16]]; y = d * (q4 - 8), q4 ∈ 0..15

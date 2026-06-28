@@ -37,6 +37,7 @@ fn main() {
         ("linear_bf16", "linear_bf16", &[]),
         ("linear_f32", "linear_f32", &[]),
         ("matmul_f32", "matmul_f32", &[]),
+        ("linear_q", "linear_q", &[]),
         // Decode GEMV: q4/q8 × plain/residual specializations from one source.
         ("mul_mat_vec_q", "mul_mat_vec_q4", &["-DQBITS=4"]),
         ("mul_mat_vec_q", "mul_mat_vec_q8", &["-DQBITS=8"]),

@@ -480,7 +480,7 @@ impl<'a> Recorder<'a> {
         }
         let k = self
             .be
-            .kernel("linear_q", crate::linear::LINEAR_Q_WGSL, 5, 20);
+            .kernel_spv("linear_q", crate::gemm::linear_q_spv(), 5, 20);
         self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 

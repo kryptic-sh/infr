@@ -1,0 +1,42 @@
+#version 460
+// Unified quantized-weight dequant GEMV y = x·Wᵀ. Repacked layout: quants = index per element
+// packed at `bits` (4: 8/u32, else 4/u32); scales/mins = one f16 per (1<<blk_shift)-element block;
+// dq(g) = scales·q + mins. Cooperative-over-K; dispatch rows*out_f workgroups.
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint bits; uint blk_shift; } pc;
+layout(binding = 0) readonly buffer QB { uint quants[]; };
+layout(binding = 1) readonly buffer SB { float16_t scales[]; };
+layout(binding = 2) readonly buffer MB { float16_t mins[]; };
+layout(binding = 3) readonly buffer XB { float x[]; };
+layout(binding = 4) buffer YB { float y[]; };
+
+shared float red[64];
+
+float dq(uint g) {
+    float q;
+    if (pc.bits == 4u) { q = float((quants[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu); }
+    else { q = float((quants[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu); }
+    uint blk = g >> pc.blk_shift;
+    return float(scales[blk]) * q + float(mins[blk]);
+}
+
+void main() {
+    uint unit = gl_WorkGroupID.x;
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += dq(wbase + i) * x[xbase + i]; }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { y[unit] = red[0]; }
+}

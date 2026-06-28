@@ -58,60 +58,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
-/// Unified quantized-weight dequant GEMV `y = x·Wᵀ` (cooperative-over-K, like `LINEAR_F16_WGSL`).
-/// ALL supported quants repack at load into one form: `quants` = index per element packed at
-/// `pc.bits` (4 → 8/u32 for Q4, 8 → 4/u32 for Q5/Q6/Q8), `scales`/`mins` = one f16 each per
-/// `1<<blk_shift`-element block; `dq(g) = scales·q + mins`. Dispatch `rows*out_f` workgroups.
-pub(crate) const LINEAR_Q_WGSL: &str = r#"
-enable f16;
-struct PushConstants { rows: u32, in_f: u32, out_f: u32, bits: u32, blk_shift: u32 }
-var<immediate> pc: PushConstants;
-
-@group(0) @binding(0) var<storage, read>       quants: array<u32>;
-@group(0) @binding(1) var<storage, read>       scales: array<f16>;
-@group(0) @binding(2) var<storage, read>       mins: array<f16>;
-@group(0) @binding(3) var<storage, read>       x_buf: array<f32>;  // [rows, in]
-@group(0) @binding(4) var<storage, read_write> y_buf: array<f32>;  // [rows, out]
-
-var<workgroup> red: array<f32, 64>;
-
-fn dq(g: u32) -> f32 {
-    var q: f32;
-    if pc.bits == 4u {
-        q = f32((quants[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu);
-    } else {
-        q = f32((quants[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu);
-    }
-    let blk = g >> pc.blk_shift;
-    return f32(scales[blk]) * q + f32(mins[blk]);
-}
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-    let unit = wid.x;
-    let o = unit % pc.out_f;
-    let r = unit / pc.out_f;
-    let t = lid.x;
-    let wbase = o * pc.in_f;
-    let xbase = r * pc.in_f;
-    var acc: f32 = 0.0;
-    for (var i: u32 = t; i < pc.in_f; i = i + 64u) {
-        acc = acc + dq(wbase + i) * x_buf[xbase + i];
-    }
-    red[t] = acc;
-    workgroupBarrier();
-    var stride = 32u;
-    loop {
-        if stride == 0u { break; }
-        if t < stride { red[t] = red[t] + red[t + stride]; }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-    if t == 0u { y_buf[unit] = red[0]; }
-}
-"#;
-
 /// Unified quant dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
 pub(crate) const LINEAR_RES_Q_WGSL: &str = r#"
 enable f16;

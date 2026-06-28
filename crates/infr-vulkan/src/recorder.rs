@@ -2230,7 +2230,8 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn mul_mat_vec_q_all_variants() {
         let be = VulkanBackend::new().unwrap();
-        for &(bits, blk_shift) in &[(4u32, 5u32), (8u32, 4u32)] {
+        // (4,5)=Q4_0/Q4_1/Q4K  (8,4)=Q6K  (8,5)=Q5_0/Q5_1/Q8_0  (4,4)=Q2K/Q3K
+        for &(bits, blk_shift) in &[(4u32, 5u32), (8u32, 4u32), (8u32, 5u32), (4u32, 4u32)] {
             for &res in &[false, true] {
                 let (rows, in_f, out_f) = (1usize, 1024usize, 1024usize);
                 let numel = in_f * out_f;

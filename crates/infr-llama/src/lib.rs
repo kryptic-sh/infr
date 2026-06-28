@@ -2418,6 +2418,155 @@ mod dequant_tests {
     }
 }
 
+/// Phase 3: validate that the full dequant_unified → pack_unified → GPU linear_q pipeline
+/// produces the same result as the CPU dequant for each new affine quant type.
+#[cfg(test)]
+mod gpu_affine_tests {
+    use super::*;
+    use infr_core::backend::BufferUsage;
+    use infr_vulkan::VulkanBackend;
+
+    /// Run `linear_q` on the GPU for a single-block weight, compare to CPU.
+    fn check_gpu_affine(dtype: infr_core::DType, block_bytes: &[u8]) {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        // dequant + pack on CPU
+        let (bits, blk) = quant_params(dtype);
+        let (qv, sc, mn) = dequant_unified(dtype, block_bytes);
+        let (q_packed, s_packed, m_packed) = pack_unified(&qv, &sc, &mn, bits, blk);
+        let numel = qv.len();
+
+        // input: one row of `numel` f32 activations, all 1.0 (sum = dot(w, 1) = sum of weights)
+        let x: Vec<f32> = vec![1.0f32; numel];
+        let bq = be
+            .upload_weight_bytes(bytemuck::cast_slice(&q_packed))
+            .unwrap();
+        let bs = be
+            .upload_weight_bytes(bytemuck::cast_slice(&s_packed))
+            .unwrap();
+        let bm = be
+            .upload_weight_bytes(bytemuck::cast_slice(&m_packed))
+            .unwrap();
+        let upx = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(upx.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let by = be.alloc(1 * 4, BufferUsage::Readback).unwrap(); // 1 output row, 1 out feature
+
+        // rows=1, in_f=numel, out_f=1 → single dot product
+        let rec = be.recorder().unwrap();
+        rec.linear_q(
+            bq.as_ref(),
+            bs.as_ref(),
+            bm.as_ref(),
+            upx.as_ref(),
+            by.as_ref(),
+            1,
+            numel,
+            1,
+            bits,
+            blk.trailing_zeros(),
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; 4];
+        be.download(by.as_ref(), &mut bytes).unwrap();
+        let gpu_out: f32 = bytemuck::cast_slice(&bytes)[0];
+
+        // CPU reference: sum of all dequantized weights (dot with all-ones)
+        let cpu_out: f32 = (0..numel)
+            .map(|g| sc[g] * qv[g] as f32 + mn[g])
+            .sum::<f32>();
+        let err = (gpu_out - cpu_out).abs();
+        let rel = err / (cpu_out.abs() + 1e-6);
+        assert!(
+            rel < 5e-3,
+            "{dtype:?} GPU vs CPU: gpu={gpu_out} cpu={cpu_out} err={err} rel={rel}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q4_0_gpu_matches_cpu() {
+        // d=2.0, qs all=0x89 (lo=9,hi=8) → y[0..16]=d*(9-8)=2, y[16..32]=d*(8-8)=0
+        let d_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&d_bytes);
+        for b in &mut block[2..18] {
+            *b = 0x89;
+        }
+        check_gpu_affine(infr_core::DType::Q4_0, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q4_1_gpu_matches_cpu() {
+        // d=1.0, m=0.5, qs all=0x31 (lo=1,hi=3) → y[0..16]=1.5, y[16..32]=3.5
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let m_bytes = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 20];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2..4].copy_from_slice(&m_bytes);
+        for b in &mut block[4..20] {
+            *b = 0x31;
+        }
+        check_gpu_affine(infr_core::DType::Q4_1, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q5_0_gpu_matches_cpu() {
+        // d=1.0, qh=0, qs all=0x0A (lo=10,hi=0) → y=d*(10-16)=-6, y[16..]=d*(0-16)=-16
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 22];
+        block[0..2].copy_from_slice(&d_bytes);
+        for b in &mut block[6..22] {
+            *b = 0x0A;
+        }
+        check_gpu_affine(infr_core::DType::Q5_0, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q5_1_gpu_matches_cpu() {
+        // d=1.0, m=2.0, qh=0, qs all=0x1F (lo=15,hi=1) → y[0..16]=17, y[16..32]=3
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let m_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 24];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2..4].copy_from_slice(&m_bytes);
+        for b in &mut block[8..24] {
+            *b = 0x1F;
+        }
+        check_gpu_affine(infr_core::DType::Q5_1, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q2k_gpu_matches_cpu() {
+        // Minimal 256-elem block: d=1.0, dmin=0, scales[0..2]=0x03 (lo=3,hi=0), qs=0x55
+        let mut block = vec![0u8; 84];
+        block[0] = 0x03;
+        block[1] = 0x03;
+        for b in &mut block[16..80] {
+            *b = 0x55;
+        }
+        block[80..82].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        check_gpu_affine(infr_core::DType::Q2K, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q3k_gpu_matches_cpu() {
+        // All-zero block except d=1.0 → all elements are 128.0 (see q3k unit test)
+        let mut block = vec![0u8; 110];
+        block[108..110].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        check_gpu_affine(infr_core::DType::Q3K, &block);
+    }
+}
+
 #[cfg(test)]
 mod tokenizer_tests {
     use super::*;

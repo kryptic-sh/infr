@@ -31,6 +31,8 @@ fn main() {
         ("rmsnorm", "rmsnorm", &[]),
         ("add", "add", &[]),
         ("add_scaled", "add_scaled", &[]),
+        ("gather_rows", "gather_rows", &[]),
+        ("scatter_add_rows", "scatter_add_rows", &[]),
         ("silu_mul", "silu_mul", &[]),
         ("silu_mul_fused", "silu_mul_fused", &[]),
         ("store_f16", "store_f16", &[]),

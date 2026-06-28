@@ -3603,14 +3603,213 @@ impl Llama {
         Ok(bytemuck::cast_slice(&out).to_vec())
     }
 
+    /// GPU-resident grouped prefill (qwen3moe, all experts on GPU): like [`forward_moe_chunk_gpu`]
+    /// but for a multi-token chunk. The residual stream stays in VRAM; recorder #1 does
+    /// rmsnorm → QKV → attention → O → residual → ffn-norm → router for all `t` tokens; only the
+    /// `t*n_expert` router logits read back for host top-k. Recorder #2 runs the FFN grouped by
+    /// expert — for each active expert: gather its token rows on the GPU, one SwiGLU GEMM, then a
+    /// weighted scatter-add back into the resident hidden. No per-expert host round-trip. Returns
+    /// last-token logits.
+    fn forward_moe_chunk_gpu_prefill(&self, tokens: &[u32], kv: &mut MoeKv) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let mc = c.moe.expect("moe");
+        let t = tokens.len();
+        let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
+        let nff = mc.n_ff_exp;
+        let kvrow = nkv * hd;
+        let pos = kv.kv.len;
+        let kv_len = pos + t;
+        let al = |n: usize| {
+            self.be
+                .alloc((n * 4).max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
+
+        // resident scratch (reused across all layers)
+        let hidden = al(t * ne)?;
+        let mut emb = vec![0f32; t * ne];
+        for (i, &tok) in tokens.iter().enumerate() {
+            emb[i * ne..(i + 1) * ne]
+                .copy_from_slice(&self.token_embd[tok as usize * ne..(tok as usize + 1) * ne]);
+        }
+        self.be
+            .upload(hidden.as_ref(), bytemuck::cast_slice(&emb))
+            .map_err(|e| anyhow!("{e}"))?;
+        let (hn, hn2, ao) = (al(t * ne)?, al(t * ne)?, al(t * ne)?);
+        let (qr, kr, vr) = (al(t * nh * hd)?, al(t * nkv * hd)?, al(t * nkv * hd)?);
+        let q_f16 = self
+            .be
+            .alloc(t * nh * hd * 2, BufferUsage::Activations)
+            .map_err(|e| anyhow!("{e}"))?;
+        let attn = al(t * nh * hd)?;
+        let logits = self
+            .be
+            .alloc(t * mc.n_expert * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // recorder 1: attention + router for all t tokens, on the GPU.
+            let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+            rec.rmsnorm(
+                hidden.as_ref(),
+                layer.attn_norm_buf.as_ref(),
+                hn.as_ref(),
+                t,
+                ne,
+                c.rms_eps,
+            );
+            rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), t, ne, nh * hd);
+            rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), t, ne, nkv * hd);
+            rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), t, ne, nkv * hd);
+            let (qn, kn) = (
+                layer.q_norm_buf.as_ref().unwrap().as_ref(),
+                layer.k_norm_buf.as_ref().unwrap().as_ref(),
+            );
+            rec.qk_norm_rope(
+                qr.as_ref(),
+                qn,
+                q_f16.as_ref(),
+                t,
+                nh,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                pos,
+                0,
+                c.rms_eps,
+            );
+            rec.qk_norm_rope(
+                kr.as_ref(),
+                kn,
+                kv.kv.k[li].as_ref(),
+                t,
+                nkv,
+                hd,
+                c.rope_dim,
+                c.rope_theta,
+                pos,
+                pos,
+                c.rms_eps,
+            );
+            rec.store_f16(vr.as_ref(), kv.kv.v[li].as_ref(), t * kvrow, pos * kvrow);
+            rec.attention_kv(
+                q_f16.as_ref(),
+                kv.kv.k[li].as_ref(),
+                kv.kv.v[li].as_ref(),
+                attn.as_ref(),
+                t,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                pos,
+            );
+            rec_linear(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), t, nh * hd, ne);
+            rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), t * ne); // residual
+            rec.rmsnorm(
+                hidden.as_ref(),
+                layer.ffn_norm_buf.as_ref(),
+                hn2.as_ref(),
+                t,
+                ne,
+                c.rms_eps,
+            );
+            let (gate_inp, experts) = layer.moe();
+            rec_linear(
+                &rec,
+                gate_inp,
+                hn2.as_ref(),
+                logits.as_ref(),
+                t,
+                ne,
+                mc.n_expert,
+            );
+            rec.finish().map_err(|e| anyhow!("{e}"))?;
+
+            // Host top-k per token → per-expert token-row lists + renormalized weights.
+            let mut lb = vec![0u8; t * mc.n_expert * 4];
+            self.be
+                .download(logits.as_ref(), &mut lb)
+                .map_err(|e| anyhow!("{e}"))?;
+            let lh: &[f32] = bytemuck::cast_slice(&lb);
+            let mut rows_of: Vec<Vec<u32>> = vec![Vec::new(); mc.n_expert];
+            let mut wts_of: Vec<Vec<f32>> = vec![Vec::new(); mc.n_expert];
+            for r in 0..t {
+                let (idx, w) = moe_topk(&lh[r * mc.n_expert..(r + 1) * mc.n_expert], &mc);
+                for (ki, &e) in idx.iter().enumerate() {
+                    rows_of[e].push(r as u32);
+                    wts_of[e].push(w[ki]);
+                }
+            }
+
+            // recorder 2: per active expert, gather → SwiGLU GEMM → weighted scatter-add into hidden.
+            let rec2 = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+            let mut keep: Vec<Box<dyn Buffer>> = Vec::new();
+            for e in 0..mc.n_expert {
+                let m = rows_of[e].len();
+                if m == 0 {
+                    continue;
+                }
+                let idxb = al(m)?;
+                self.be
+                    .upload(idxb.as_ref(), bytemuck::cast_slice(&rows_of[e]))
+                    .map_err(|er| anyhow!("{er}"))?;
+                let wb = al(m)?;
+                self.be
+                    .upload(wb.as_ref(), bytemuck::cast_slice(&wts_of[e]))
+                    .map_err(|er| anyhow!("{er}"))?;
+                let (xe, ge, ue, ae, ye) = (
+                    al(m * ne)?,
+                    al(m * nff)?,
+                    al(m * nff)?,
+                    al(m * nff)?,
+                    al(m * ne)?,
+                );
+                let ew = &experts[e];
+                rec2.gather_rows(hn2.as_ref(), idxb.as_ref(), xe.as_ref(), m, ne);
+                rec_linear(&rec2, ew.gate.gpu(), xe.as_ref(), ge.as_ref(), m, ne, nff);
+                rec_linear(&rec2, ew.up.gpu(), xe.as_ref(), ue.as_ref(), m, ne, nff);
+                rec2.silu_mul(ge.as_ref(), ue.as_ref(), ae.as_ref(), m * nff);
+                rec_linear(&rec2, ew.down.gpu(), ae.as_ref(), ye.as_ref(), m, nff, ne);
+                rec2.scatter_add_rows(
+                    ye.as_ref(),
+                    idxb.as_ref(),
+                    wb.as_ref(),
+                    hidden.as_ref(),
+                    m,
+                    ne,
+                );
+                keep.extend([idxb, wb, xe, ge, ue, ae, ye]);
+            }
+            rec2.finish().map_err(|e| anyhow!("{e}"))?;
+            drop(keep);
+        }
+        kv.kv.len += t;
+
+        // Final norm + lm head on the last token only (host tail, reused from the eager path).
+        let mut hbytes = vec![0u8; t * ne * 4];
+        self.be
+            .download(hidden.as_ref(), &mut hbytes)
+            .map_err(|e| anyhow!("{e}"))?;
+        let hh: &[f32] = bytemuck::cast_slice(&hbytes);
+        let last = &hh[(t - 1) * ne..t * ne];
+        let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
+        self.gemv_wt(&self.lm_head, &normed, 1, ne, c.vocab)
+    }
+
     /// Eager MoE forward for one chunk of `tokens` at positions `kv.pos..`, appending K/V to the
     /// cache (so decode steps process only the new token, not the whole sequence). Returns logits
     /// (`vocab`) for the last token. Same math as [`forward_moe`] but cached.
     pub fn forward_moe_chunk(&self, tokens: &[u32], kv: &mut MoeKv) -> Result<Vec<f32>> {
-        // Single-token decode with all experts GPU-resident → the fully GPU-resident path (no
-        // per-matmul host round-trip). Prefill (t>1) and offloaded-expert layers use the eager path.
-        if tokens.len() == 1 && !self.layers[0].moe().1[0].gate.is_cpu() {
-            return self.forward_moe_chunk_gpu(tokens[0], kv);
+        // All experts GPU-resident → fully GPU-resident path (no per-matmul host round-trip):
+        // single-token decode, or grouped-by-expert prefill for a multi-token chunk. Offloaded-expert
+        // layers (host/stream) use the eager path.
+        if !self.layers[0].moe().1[0].gate.is_cpu() {
+            return if tokens.len() == 1 {
+                self.forward_moe_chunk_gpu(tokens[0], kv)
+            } else {
+                self.forward_moe_chunk_gpu_prefill(tokens, kv)
+            };
         }
         let c = &self.cfg;
         let mc = c.moe.expect("forward_moe_chunk requires a MoE model");

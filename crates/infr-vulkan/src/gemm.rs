@@ -295,6 +295,18 @@ pub(crate) fn add_scaled_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the row gather (`dst[j]=src[idx[j]]`).
+pub(crate) fn gather_rows_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gather_rows.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the weighted row scatter-add (`dst[idx[j]] += w[j]*y[j]`).
+pub(crate) fn scatter_add_rows_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scatter_add_rows.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the SwiGLU activation (`y=silu(gate)*up`).
 pub(crate) fn silu_mul_spv() -> &'static [u32] {
     static SILU_MUL_SPV: OnceLock<Vec<u32>> = OnceLock::new();

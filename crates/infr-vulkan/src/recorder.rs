@@ -1534,6 +1534,61 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Gather rows: `dst[j,:] = src[idx[j],:]` for j in 0..m, each row `ne` wide. Assembles an MoE
+    /// expert's token batch from the resident activations.
+    pub fn gather_rows(
+        &self,
+        src: &dyn Buffer,
+        idx: &dyn Buffer,
+        dst: &dyn Buffer,
+        m: usize,
+        ne: usize,
+    ) {
+        let k = self
+            .be
+            .kernel("gather_rows", crate::gemm::gather_rows_spv(), 3, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(idx), Self::vkb(dst)],
+            1,
+            &push,
+            ((m * ne) as u32).div_ceil(64),
+        );
+    }
+
+    /// Weighted scatter-add: `dst[idx[j],:] += w[j] * y[j,:]` for j in 0..m, each row `ne` wide.
+    /// Accumulates an MoE expert's weighted token outputs back into the resident hidden state
+    /// (chained across experts via WAW barriers on `dst`).
+    pub fn scatter_add_rows(
+        &self,
+        y: &dyn Buffer,
+        idx: &dyn Buffer,
+        w: &dyn Buffer,
+        dst: &dyn Buffer,
+        m: usize,
+        ne: usize,
+    ) {
+        let k = self.be.kernel(
+            "scatter_add_rows",
+            crate::gemm::scatter_add_rows_spv(),
+            4,
+            8,
+        );
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(y), Self::vkb(idx), Self::vkb(w), Self::vkb(dst)],
+            1,
+            &push,
+            ((m * ne) as u32).div_ceil(64),
+        );
+    }
+
     /// Elementwise add; in place allowed (`a` may equal `y`).
     pub fn add(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let k = self.be.kernel("add", crate::gemm::add_spv(), 3, 4);

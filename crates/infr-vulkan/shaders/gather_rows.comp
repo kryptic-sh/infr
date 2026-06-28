@@ -1,0 +1,15 @@
+#version 460
+// Gather rows: dst[j, :] = src[idx[j], :] for j in 0..m, each row `ne` wide. Used to assemble an
+// MoE expert's token batch from the resident ffn-normed activations without a host round-trip.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint m; uint ne; } pc;
+layout(binding = 0) readonly buffer SRC { float src[]; };
+layout(binding = 1) readonly buffer IDX { uint idx[]; };
+layout(binding = 2) writeonly buffer DST { float dst[]; };
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= pc.m * pc.ne) return;
+    uint j = t / pc.ne;
+    uint i = t - j * pc.ne;
+    dst[t] = src[idx[j] * pc.ne + i];
+}

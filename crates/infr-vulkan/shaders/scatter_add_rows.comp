@@ -1,0 +1,18 @@
+#version 460
+// Weighted scatter-add: dst[idx[j], :] += w[j] * y[j, :] for j in 0..m, each row `ne` wide.
+// Accumulates one MoE expert's weighted token outputs back into the resident hidden state. Within a
+// dispatch each j is a distinct token row (a token routes to an expert at most once) so no two
+// threads touch the same dst element — no atomics; cross-expert ordering is a WAW barrier on dst.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint m; uint ne; } pc;
+layout(binding = 0) readonly buffer SRC { float y[]; };
+layout(binding = 1) readonly buffer IDX { uint idx[]; };
+layout(binding = 2) readonly buffer WTS { float w[]; };
+layout(binding = 3) buffer DST { float dst[]; };
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= pc.m * pc.ne) return;
+    uint j = t / pc.ne;
+    uint i = t - j * pc.ne;
+    dst[idx[j] * pc.ne + i] += w[j] * y[t];
+}

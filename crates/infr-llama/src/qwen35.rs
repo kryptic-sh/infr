@@ -494,9 +494,14 @@ impl Model {
         let (ne, hd) = (c.n_embd, c.head_dim);
         let (nh, nkv) = (c.n_head, c.n_kv);
         let xn = rmsnorm(hidden, &w.attn_norm, c.eps);
-        let qg = matvec(&w.q, ne, nh * hd + c.d_inner, &xn);
-        let (q_all, gate) = qg.split_at(nh * hd);
-        let mut q = q_all.to_vec();
+        // attn_q outputs query+gate INTERLEAVED PER HEAD: [h0 q(hd) h0 gate(hd) | h1 q gate | …].
+        let qg = matvec(&w.q, ne, nh * 2 * hd, &xn);
+        let mut q = vec![0f32; nh * hd];
+        let mut gate = vec![0f32; nh * hd];
+        for h in 0..nh {
+            q[h * hd..h * hd + hd].copy_from_slice(&qg[h * 2 * hd..h * 2 * hd + hd]);
+            gate[h * hd..h * hd + hd].copy_from_slice(&qg[h * 2 * hd + hd..h * 2 * hd + 2 * hd]);
+        }
         let mut k = matvec(&w.k, ne, nkv * hd, &xn);
         let v = matvec(&w.v, ne, nkv * hd, &xn);
         // per-head q/k norm then RoPE
@@ -647,7 +652,13 @@ mod tests {
     #[ignore = "needs the Qwen3.5-0.8B gguf in the local store"]
     fn greedy_generate() {
         let g = Gguf::open(&model_path()).unwrap();
-        let out = generate(&g, "The capital of France is", 12).unwrap();
+        let prompt =
+            std::env::var("Q35_PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
+        let n = std::env::var("Q35_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16);
+        let out = generate(&g, &prompt, n).unwrap();
         println!("=== qwen35 CPU greedy ===\n{out}");
     }
 }

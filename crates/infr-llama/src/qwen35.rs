@@ -10,7 +10,7 @@
 //! `Q35_CPU=1` to force the pure-CPU path (the correctness oracle, no Vulkan init).
 #![allow(dead_code)] // forward pass is built up incrementally on this loader
 
-use crate::load_f32;
+use crate::load_tensor_dequant;
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::backend::Buffer;
 use infr_core::{DType, WeightSource};
@@ -210,7 +210,7 @@ impl Model {
     /// native bf16 (range-preserving, round-trips exactly through the f32 host buffer); F32 → f32.
     /// This is the single place the "correct dtype per source" decision lives.
     fn upload_lin(g: &Gguf, be: Option<&VulkanBackend>, name: &str) -> Result<Lin> {
-        let w = load_f32(g, name)
+        let w = load_tensor_dequant(g, name)
             .map(|x| x.0)
             .with_context(|| name.to_string())?;
         let be = match be {
@@ -236,9 +236,9 @@ impl Model {
         } else {
             Some(VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?)
         };
-        let (token_embd, te_shape) = load_f32(g, "token_embd.weight")?;
+        let (token_embd, te_shape) = load_tensor_dequant(g, "token_embd.weight")?;
         cfg.vocab = te_shape[1];
-        let output_norm = load_f32(g, "output_norm.weight")?.0;
+        let output_norm = load_tensor_dequant(g, "output_norm.weight")?.0;
 
         // Shared dtype policy: load a projection weight to a GPU `Lin` in the dtype matching its
         // GGUF source (see `upload_lin`), or keep it CPU f32 (`Q35_CPU=1`).
@@ -262,7 +262,9 @@ impl Model {
         for i in 0..cfg.n_layer {
             let p = |s: &str| format!("blk.{i}.{s}");
             let get = |s: &str| -> Result<Vec<f32>> {
-                load_f32(g, &p(s)).map(|x| x.0).with_context(|| p(s))
+                load_tensor_dequant(g, &p(s))
+                    .map(|x| x.0)
+                    .with_context(|| p(s))
             };
             let glin = |s: &str| -> Result<Lin> { lin(&p(s)) };
             let ffn_up_shape = g

@@ -239,22 +239,18 @@ fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     Ok(tok)
 }
 
-/// Load a tensor as f32, returning (data, shape) where shape is GGUF ne order ([in, out]).
-fn load_f32(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
-    let info = g
-        .tensors()
-        .iter()
-        .find(|t| t.name == name)
-        .ok_or_else(|| anyhow!("tensor not found: {name}"))?
-        .clone();
-    let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
-    let v: Vec<f32> = match info.dtype {
-        infr_core::DType::F32 => bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
-        infr_core::DType::F16 => bytes
+/// Dequantize a tensor's raw `bytes` of `dtype` into host f32. Handles plain floats
+/// (F32/F16/BF16), affine quants (via [`dequant_unified`]), and codebook quants (via
+/// [`dequant_codebook`]). The single host-side dequant entry point.
+fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> {
+    use infr_core::DType::*;
+    Ok(match dtype {
+        F32 => bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
+        F16 => bytes
             .chunks_exact(2)
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect(),
-        infr_core::DType::Bf16 => bytes
+        Bf16 => bytes
             .chunks_exact(2)
             .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
@@ -265,10 +261,24 @@ fn load_f32(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
                 .collect()
         }
         d if is_codebook_quant(d) => dequant_codebook(d, bytes),
-        other => {
-            bail!("unsupported dtype {other:?} for {name} (host load wants F16/F32/BF16/quant)")
-        }
-    };
+        other => bail!("unsupported dtype {other:?} (host dequant wants F16/F32/BF16/quant)"),
+    })
+}
+
+/// Load a named tensor and dequantize it to host f32, returning (data, shape in GGUF ne order
+/// `[in, out]`). The host/CPU-side dequant path — it does NOT load the bulk projection weights for
+/// the GPU (those upload quantized/f16 in-VRAM). It feeds: the host embedding gather, the CPU norm
+/// + SSM recurrence math (qwen35), the `Q35_CPU=1` oracle, and serves as the f32 source we convert
+/// into f16/bf16/quant GPU weights. Survives even with full GPU format coverage.
+fn load_tensor_dequant(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+    let info = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+        .clone();
+    let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+    let v = dequant_block(info.dtype, bytes).with_context(|| format!("tensor {name}"))?;
     Ok((v, info.shape))
 }
 
@@ -1472,7 +1482,7 @@ impl Llama {
         let be = VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
 
         // token embeddings (host) + lm head (GPU). tied unless output.weight present.
-        let (token_embd, te_shape) = load_f32(&g, "token_embd.weight")?;
+        let (token_embd, te_shape) = load_tensor_dequant(&g, "token_embd.weight")?;
         let vocab = te_shape[1];
         let lm_head = if g.tensors().iter().any(|t| t.name == "output.weight") {
             upload_wt(&be, &g, "output.weight")?
@@ -1484,7 +1494,7 @@ impl Llama {
             )
         };
 
-        let (output_norm, _) = load_f32(&g, "output_norm.weight")?;
+        let (output_norm, _) = load_tensor_dequant(&g, "output_norm.weight")?;
         let output_norm_buf = be
             .upload_weight(&output_norm)
             .map_err(|e| anyhow!("upload output_norm: {e}"))?;
@@ -1510,8 +1520,8 @@ impl Llama {
         for l in 0..n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
             let up = |be: &VulkanBackend, name: String| -> Result<Wt> { upload_wt(be, &g, &name) };
-            let attn_norm = load_f32(&g, &p("attn_norm.weight"))?.0;
-            let ffn_norm = load_f32(&g, &p("ffn_norm.weight"))?.0;
+            let attn_norm = load_tensor_dequant(&g, &p("attn_norm.weight"))?.0;
+            let ffn_norm = load_tensor_dequant(&g, &p("ffn_norm.weight"))?.0;
             let attn_norm_buf = be
                 .upload_weight(&attn_norm)
                 .map_err(|e| anyhow!("upload attn_norm {l}: {e}"))?;
@@ -1584,11 +1594,11 @@ impl Llama {
             let (q_norm_buf, k_norm_buf) = if qk_norm {
                 (
                     Some(
-                        be.upload_weight(&load_f32(&g, &p("attn_q_norm.weight"))?.0)
+                        be.upload_weight(&load_tensor_dequant(&g, &p("attn_q_norm.weight"))?.0)
                             .map_err(|e| anyhow!("upload q_norm {l}: {e}"))?,
                     ),
                     Some(
-                        be.upload_weight(&load_f32(&g, &p("attn_k_norm.weight"))?.0)
+                        be.upload_weight(&load_tensor_dequant(&g, &p("attn_k_norm.weight"))?.0)
                             .map_err(|e| anyhow!("upload k_norm {l}: {e}"))?,
                     ),
                 )
@@ -2895,15 +2905,6 @@ fn attention(
     out
 }
 
-/// Helper: dequantize `bytes` for `dtype` and return the f32 result.
-#[cfg(test)]
-fn dequant_to_f32(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
-    let (qv, sc, mn) = dequant_unified(dtype, bytes);
-    (0..qv.len())
-        .map(|g| sc[g] * qv[g] as f32 + mn[g])
-        .collect()
-}
-
 #[cfg(test)]
 mod dequant_tests {
     use super::*;
@@ -3238,7 +3239,7 @@ mod dequant_tests {
         let dmin_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
         block[82..84].copy_from_slice(&dmin_bytes);
 
-        let y = dequant_to_f32(infr_core::DType::Q2K, &block);
+        let y = dequant_block(infr_core::DType::Q2K, &block).unwrap();
         assert_eq!(y.len(), 256);
         // First sub-block, first element: q2=1, y=3.0*1-4.0=-1.0
         assert!(
@@ -3314,7 +3315,7 @@ mod dequant_tests {
         let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
         block[108..110].copy_from_slice(&d_bytes);
 
-        let y = dequant_to_f32(infr_core::DType::Q3K, &block);
+        let y = dequant_block(infr_core::DType::Q3K, &block).unwrap();
         assert_eq!(y.len(), 256);
         // sc6=0 → dl = 1.0*(0-32) = -32.0
         // q3u = 0 (hmask=0, qs=0), min = -4*(-32) = 128
@@ -3347,7 +3348,7 @@ mod dequant_tests {
         for b in &mut block[3..18] {
             *b = 0x88; // lo=8, hi=8 → y = d*(8-8) = 0
         }
-        let y = dequant_to_f32(infr_core::DType::Q4_0, &block);
+        let y = dequant_block(infr_core::DType::Q4_0, &block).unwrap();
         assert_eq!(y.len(), 32);
         // y[0] = 2.0*(9-8) = 2.0
         assert!(
@@ -3373,7 +3374,7 @@ mod dequant_tests {
         block[0..2].copy_from_slice(&d_bytes);
         block[2..4].copy_from_slice(&m_bytes);
         block[4] = 0x30; // lo=0, hi=3
-        let y = dequant_to_f32(infr_core::DType::Q4_1, &block);
+        let y = dequant_block(infr_core::DType::Q4_1, &block).unwrap();
         assert_eq!(y.len(), 32);
         // y[0] = 1.0*0 + 0.5 = 0.5
         assert!(
@@ -3401,7 +3402,7 @@ mod dequant_tests {
         block[0..2].copy_from_slice(&d_bytes);
         block[2] = 0x01; // qh[0]: bit 0 set
         block[6] = 0x0F; // qs[0]: lo=15, hi=0
-        let y = dequant_to_f32(infr_core::DType::Q5_0, &block);
+        let y = dequant_block(infr_core::DType::Q5_0, &block).unwrap();
         assert_eq!(y.len(), 32);
         // j=0: xh0 = ((1>>0)<<4)&0x10 = 16. q5 = 15|16=31. y[0] = 1.0*(31-16) = 15.0
         assert!(
@@ -3430,7 +3431,7 @@ mod dequant_tests {
         block[2..4].copy_from_slice(&m_bytes);
         // qh[4] all zero → no high bits
         block[8] = 0x1F; // qs[0]: lo=15, hi=1
-        let y = dequant_to_f32(infr_core::DType::Q5_1, &block);
+        let y = dequant_block(infr_core::DType::Q5_1, &block).unwrap();
         assert_eq!(y.len(), 32);
         // y[0] = 2.0*15 + (-1.0) = 29.0
         assert!(

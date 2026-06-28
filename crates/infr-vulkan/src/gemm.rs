@@ -17,6 +17,28 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+// ── Build-compiled native-block dequant GEMVs (one .spv per format × residual) ──
+const NATIVE_Q8_0_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_q8_0.spv"));
+const NATIVE_Q8_0_RES_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/native_q8_0_res.spv"));
+
+/// Build-compiled native-block dequant GEMV SPIR-V for `(dtype, residual)`, or `None` if that
+/// format is not yet migrated off the runtime (naga) path. Grows one match arm per format.
+pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! sp {
+        ($s:ident, $b:ident) => {{
+            static $s: OnceLock<Vec<u32>> = OnceLock::new();
+            $s.get_or_init(|| spv_words($b)).as_slice()
+        }};
+    }
+    Some(match (dtype, res) {
+        (Q8_0, false) => sp!(NQ80, NATIVE_Q8_0_SPV_BYTES),
+        (Q8_0, true) => sp!(NQ80R, NATIVE_Q8_0_RES_SPV_BYTES),
+        _ => return None,
+    })
+}
+
 const GEMM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat.spv"));
 const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));

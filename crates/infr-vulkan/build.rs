@@ -48,6 +48,13 @@ fn main() {
         ("ffn_in", "ffn_in", &[]),
         ("ffn_in_q", "ffn_in_q", &[]),
         ("attn_in_q", "attn_in_q", &[]),
+        // Native-block dequant GEMVs: one .spv per (quant format, residual) from one source.
+        ("native_gemv", "native_q8_0", &["-DFMT_Q8_0"]),
+        (
+            "native_gemv",
+            "native_q8_0_res",
+            &["-DFMT_Q8_0", "-DUSE_RES"],
+        ),
         // Decode GEMV: q4/q8 × plain/residual specializations from one source.
         ("mul_mat_vec_q", "mul_mat_vec_q4", &["-DQBITS=4"]),
         ("mul_mat_vec_q", "mul_mat_vec_q8", &["-DQBITS=8"]),

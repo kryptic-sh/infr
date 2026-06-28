@@ -1,0 +1,57 @@
+#version 460
+// Native-block dequant GEMV y = x·Wᵀ (raw GGUF blocks in w_buf, padded to u32). Cooperative-over-K:
+// one workgroup per output, 64 threads stride K, shared tree-reduce. The per-format dequant `dq()`
+// is selected by a -DFMT_* define; -DUSE_RES adds a fused residual. Build-compiled by build.rs into
+// one .spv per (format, residual). Grid-based i-quants pull their tables from native_grids.glsl.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; } pc;
+layout(binding = 0) readonly buffer WB { uint w_buf[]; };
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+#ifdef USE_RES
+layout(binding = 2) readonly buffer RB2 { float r_buf[]; };
+layout(binding = 3) buffer YB { float y_buf[]; };
+#else
+layout(binding = 2) buffer YB { float y_buf[]; };
+#endif
+
+shared float red[64];
+
+uint rb(uint bo) { return (w_buf[bo >> 2u] >> ((bo & 3u) << 3u)) & 0xFFu; }
+uint ru16(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u); }
+uint ru32b(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u) | (rb(bo + 2u) << 16u) | (rb(bo + 3u) << 24u); }
+float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+int sgn8(uint byte) { return int(byte) - int(byte >= 128u ? 256u : 0u); }
+
+#if defined(FMT_Q8_0)
+// Q8_0: [f16 d][i8 qs[32]] = 34 bytes, 32 elements. y = d * qs[j].
+float dq(uint g) {
+    uint b = g / 32u;
+    uint j = g % 32u;
+    uint bd = b * 34u;
+    float d = f16tof32(ru16(bd));
+    return d * float(sgn8(rb(bd + 2u + j)));
+}
+#endif
+
+void main() {
+    uint unit = gl_WorkGroupID.x;
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += dq(wbase + i) * x_buf[xbase + i]; }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+#ifdef USE_RES
+    if (t == 0u) { y_buf[unit] = r_buf[unit] + red[0]; }
+#else
+    if (t == 0u) { y_buf[unit] = red[0]; }
+#endif
+}

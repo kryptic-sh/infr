@@ -79,6 +79,9 @@ struct VulkanShared {
     caps: Capabilities,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
+    /// Pre-reserved bump arena for load-once weights (see `reserve_weights`). `None` until reserved;
+    /// weight allocs then sub-allocate from it instead of the gpu-allocator.
+    weight_arena: Mutex<Option<WeightArena>>,
     /// Lazily-built, reused compute pipeline for the linear op (see `linear.rs`).
     linear_kernel: std::sync::OnceLock<crate::linear::LinearKernel>,
     /// Generic cache of compute kernels by name (see `ops.rs`).
@@ -106,6 +109,10 @@ impl Drop for VulkanShared {
             // Destroy command pool.
             let pool = *self.cmd_pool.lock().unwrap();
             self.device.destroy_command_pool(pool, None);
+            // Free the weight arena's device memory before destroying the device.
+            if let Some(arena) = self.weight_arena.lock().unwrap().as_mut() {
+                arena.destroy(&self.device);
+            }
             // Drop the allocator *before* destroying the device.
             ManuallyDrop::drop(&mut self.allocator);
             self.device.destroy_device(None);
@@ -116,22 +123,43 @@ impl Drop for VulkanShared {
 
 // ── VkBuffer ──────────────────────────────────────────────────────────────────
 
+/// How a `VkBuffer`'s device memory is owned.
+enum Backing {
+    /// A gpu-allocator sub-allocation — freed back to the allocator on drop (transient buffers,
+    /// host-visible staging/readback, and weights when no arena is reserved).
+    Pooled(ManuallyDrop<Allocation>),
+    /// Bump-allocated from the [`WeightArena`]. The arena block owns the memory; on drop the buffer
+    /// only destroys its own handle (the block frees the memory when the arena drops).
+    Arena,
+}
+
 struct VkBuffer {
     shared: Arc<VulkanShared>,
     buffer: vk::Buffer,
-    /// Wrapped in ManuallyDrop so we control the drop order in `Drop`.
-    allocation: ManuallyDrop<Allocation>,
+    backing: Backing,
     size: usize,
     location: MemoryLocation,
+}
+
+impl VkBuffer {
+    /// Persistently-mapped host pointer for host-visible (pooled) buffers; `None` for device-local
+    /// or arena buffers (which are never mapped — they're filled via a staging copy).
+    fn mapped_ptr(&self) -> Option<*mut u8> {
+        match &self.backing {
+            Backing::Pooled(a) => a.mapped_ptr().map(|p| p.as_ptr() as *mut u8),
+            Backing::Arena => None,
+        }
+    }
 }
 
 impl Drop for VkBuffer {
     fn drop(&mut self) {
         unsafe {
-            let alloc = ManuallyDrop::take(&mut self.allocation);
-            // Free the gpu-allocator sub-allocation first.
-            self.shared.allocator.lock().unwrap().free(alloc).ok();
-            // Then destroy the Vulkan buffer object.
+            if let Backing::Pooled(alloc) = &mut self.backing {
+                let alloc = ManuallyDrop::take(alloc);
+                self.shared.allocator.lock().unwrap().free(alloc).ok();
+            }
+            // Arena memory belongs to the arena block; only destroy the buffer handle here.
             self.shared.device.destroy_buffer(self.buffer, None);
         }
     }
@@ -143,6 +171,79 @@ unsafe impl Sync for VkBuffer {}
 impl Buffer for VkBuffer {
     fn len_bytes(&self) -> usize {
         self.size
+    }
+}
+
+// ── weight arena ────────────────────────────────────────────────────────────────
+
+/// Buffer usage flags for every device buffer (must match across the arena probe and all
+/// allocations so their memory-type bits / alignment agree).
+const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
+);
+
+/// Overflow arena blocks (only allocated if the reserved block underflows the estimate) stay modest
+/// so a tiny estimate miss can't waste a whole second model-sized block.
+const ARENA_OVERFLOW_BLOCK: u64 = 64 * 1024 * 1024;
+
+/// One large device-local memory block the weight arena bump-allocates from.
+struct ArenaBlock {
+    memory: vk::DeviceMemory,
+    size: u64,
+    cursor: u64,
+}
+
+/// Pre-reserved VRAM for load-once weights: one big block sized to the model (plus modest overflow
+/// blocks if the estimate underflows), bump-allocated since weights are never individually freed.
+/// Reserving the whole model up front guarantees it fits contiguously and frees in one shot.
+/// MoE-ready: a future expert-streaming mode can hold a second arena/pool and evict experts into it
+/// without disturbing the dense arena.
+struct WeightArena {
+    mem_type: u32,
+    blocks: Vec<ArenaBlock>,
+}
+
+impl WeightArena {
+    /// Bump-allocate `size` bytes at `align` from the newest block, growing with an overflow block
+    /// if it won't fit. Returns the device memory + offset to bind a buffer to.
+    fn bump(
+        &mut self,
+        device: &ash::Device,
+        size: u64,
+        align: u64,
+    ) -> Result<(vk::DeviceMemory, u64)> {
+        if let Some(b) = self.blocks.last_mut() {
+            let off = b.cursor.div_ceil(align) * align;
+            if off + size <= b.size {
+                b.cursor = off + size;
+                return Ok((b.memory, off));
+            }
+        }
+        let bs = size.max(ARENA_OVERFLOW_BLOCK);
+        let memory = unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(bs)
+                    .memory_type_index(self.mem_type),
+                None,
+            )
+        }
+        .map_err(|e| be(format!("arena overflow allocate_memory({bs}): {e}")))?;
+        self.blocks.push(ArenaBlock {
+            memory,
+            size: bs,
+            cursor: size,
+        });
+        Ok((memory, 0))
+    }
+
+    /// Free all blocks. Must be called before `destroy_device`.
+    unsafe fn destroy(&mut self, device: &ash::Device) {
+        for b in self.blocks.drain(..) {
+            device.free_memory(b.memory, None);
+        }
     }
 }
 
@@ -338,6 +439,7 @@ impl VulkanBackend {
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
                 has_mem_budget,
+                weight_arena: Mutex::new(None),
                 linear_kernel: std::sync::OnceLock::new(),
                 kernels: Mutex::new(HashMap::new()),
             }),
@@ -384,20 +486,113 @@ impl VulkanBackend {
         }
     }
 
+    /// First device-local memory type compatible with `type_bits` (from a buffer's requirements).
+    fn find_memory_type(&self, type_bits: u32, props: vk::MemoryPropertyFlags) -> Option<u32> {
+        let mp = unsafe {
+            self.shared
+                .instance
+                .get_physical_device_memory_properties(self.shared.physical_device)
+        };
+        (0..mp.memory_type_count).find(|&i| {
+            (type_bits & (1 << i)) != 0
+                && mp.memory_types[i as usize].property_flags.contains(props)
+        })
+    }
+
+    /// Pre-reserve `total` bytes of device-local VRAM as a bump arena for load-once weights, so the
+    /// whole model's weight memory is committed up front (one contiguous block, freed in one shot)
+    /// instead of dribbled out per-tensor. Subsequent `BufferUsage::Weights` allocs sub-allocate
+    /// from it. Call once after the footprint check, before uploading weights. On failure (e.g. no
+    /// contiguous block available) leaves no arena → callers fall back to the per-tensor path.
+    pub fn reserve_weights(&self, total: u64) -> Result<()> {
+        // Probe a weight-shaped buffer for its memory-type bits + alignment (identical for every
+        // weight buffer, since they all share BUFFER_USAGE).
+        let probe = unsafe {
+            self.shared.device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(4096)
+                    .usage(BUFFER_USAGE)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+        }
+        .map_err(|e| be(format!("arena probe buffer: {e}")))?;
+        let req = unsafe { self.shared.device.get_buffer_memory_requirements(probe) };
+        unsafe { self.shared.device.destroy_buffer(probe, None) };
+
+        let mem_type = self
+            .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            .ok_or_else(|| be("no DEVICE_LOCAL memory type for weights"))?;
+        let block = total.max(req.alignment).next_multiple_of(req.alignment);
+        let memory = unsafe {
+            self.shared.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(block)
+                    .memory_type_index(mem_type),
+                None,
+            )
+        }
+        .map_err(|e| be(format!("reserve_weights {block} bytes: {e}")))?;
+
+        *self.shared.weight_arena.lock().unwrap() = Some(WeightArena {
+            mem_type,
+            blocks: vec![ArenaBlock {
+                memory,
+                size: block,
+                cursor: 0,
+            }],
+        });
+        Ok(())
+    }
+
     fn make_buf(&self, size: usize, location: MemoryLocation, label: &str) -> Result<VkBuffer> {
         let buf_ci = vk::BufferCreateInfo::default()
             .size(size as u64)
-            .usage(
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::TRANSFER_DST,
-            )
+            .usage(BUFFER_USAGE)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let buffer = unsafe { self.shared.device.create_buffer(&buf_ci, None) }
             .map_err(|e| be(format!("create_buffer: {e}")))?;
 
         let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+
+        // Load-once weights (label "weights") bind into the pre-reserved bump arena when one exists
+        // — the whole model's VRAM is reserved up front (see `reserve_weights`). Everything else
+        // (transient activations, host-visible staging/readback, and weights with no arena) uses the
+        // gpu-allocator below.
+        if label == "weights" {
+            let mut arena = self.shared.weight_arena.lock().unwrap();
+            if let Some(a) = arena.as_mut() {
+                match a.bump(
+                    &self.shared.device,
+                    requirements.size,
+                    requirements.alignment,
+                ) {
+                    Ok((memory, offset)) => {
+                        unsafe {
+                            self.shared
+                                .device
+                                .bind_buffer_memory(buffer, memory, offset)
+                        }
+                        .map_err(|e| {
+                            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                            be(format!("arena bind_buffer_memory: {e}"))
+                        })?;
+                        return Ok(VkBuffer {
+                            shared: Arc::clone(&self.shared),
+                            buffer,
+                            backing: Backing::Arena,
+                            size,
+                            location,
+                        });
+                    }
+                    Err(e) => {
+                        unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                        return Err(e);
+                    }
+                }
+            }
+        }
 
         // Large buffers (KV cache, big weights) get a DEDICATED exact-size VkDeviceMemory; otherwise
         // they sub-allocate into gpu-allocator's 256MB blocks and waste the remainder (e.g. 3×67MB
@@ -436,7 +631,7 @@ impl VulkanBackend {
         Ok(VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
-            allocation: ManuallyDrop::new(allocation),
+            backing: Backing::Pooled(ManuallyDrop::new(allocation)),
             size,
             location,
         })
@@ -522,19 +717,15 @@ impl Backend for VulkanBackend {
         if vk_dst.location == MemoryLocation::CpuToGpu {
             // Direct write through the persistently-mapped pointer.
             let ptr = vk_dst
-                .allocation
                 .mapped_ptr()
-                .ok_or_else(|| be("CpuToGpu buffer is not persistently mapped"))?
-                .as_ptr() as *mut u8;
+                .ok_or_else(|| be("CpuToGpu buffer is not persistently mapped"))?;
             unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len()) };
         } else {
             // Staging path: CPU → staging → device-local.
             let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_staging")?;
             let stg_ptr = staging
-                .allocation
                 .mapped_ptr()
-                .ok_or_else(|| be("staging buffer is not mapped"))?
-                .as_ptr() as *mut u8;
+                .ok_or_else(|| be("staging buffer is not mapped"))?;
             unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), stg_ptr, src.len()) };
 
             let stg_buf = staging.buffer;
@@ -570,10 +761,9 @@ impl Backend for VulkanBackend {
         if vk_src.location == MemoryLocation::GpuToCpu {
             // Direct read from the persistently-mapped pointer.
             let ptr = vk_src
-                .allocation
                 .mapped_ptr()
                 .ok_or_else(|| be("GpuToCpu buffer is not persistently mapped"))?
-                .as_ptr() as *const u8;
+                as *const u8;
             unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
         } else {
             // Readback path: device-local → staging → host.
@@ -598,10 +788,9 @@ impl Backend for VulkanBackend {
 
             // GPU→staging transfer is complete (queue_wait_idle returned).
             let ptr = staging
-                .allocation
                 .mapped_ptr()
                 .ok_or_else(|| be("readback staging is not mapped"))?
-                .as_ptr() as *const u8;
+                as *const u8;
             unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
             // `staging` dropped here.
         }
@@ -628,6 +817,49 @@ impl Backend for VulkanBackend {
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    /// Weight arena: reserve a small arena, allocate several `Weights` buffers from it (forcing both
+    /// the reserved block and at least one overflow block), and verify each round-trips bytes through
+    /// the staging copy path — proving arena buffers bind to valid, distinct memory regions.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn weight_arena_roundtrip() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        // Reserve only 1 MB so the later allocations spill into an overflow block.
+        be.reserve_weights(1024 * 1024).expect("reserve_weights");
+        let sizes = [4096usize, 256 * 1024, 4 * 1024 * 1024]; // last forces an overflow block
+        let mut bufs = Vec::new();
+        for (bi, &sz) in sizes.iter().enumerate() {
+            let data: Vec<u8> = (0..sz)
+                .map(|i| (i as u8).wrapping_add(bi as u8 * 31))
+                .collect();
+            let buf = be
+                .alloc(sz, BufferUsage::Weights)
+                .expect("arena weight alloc");
+            be.upload(buf.as_ref(), &data).expect("upload");
+            let mut back = vec![0u8; sz];
+            be.download(buf.as_ref(), &mut back).expect("download");
+            assert_eq!(
+                back, data,
+                "arena buffer {bi} (size {sz}) round-trip mismatch"
+            );
+            bufs.push(buf);
+        }
+        // All three buffers coexist (distinct memory) — re-download the first and re-check.
+        let mut back0 = vec![0u8; sizes[0]];
+        be.download(bufs[0].as_ref(), &mut back0)
+            .expect("re-download");
+        assert_eq!(
+            back0[1], 1u8,
+            "first arena buffer corrupted by later allocs"
+        );
+    }
 
     /// GPU f32 matmul correctness: compares `VulkanBackend::matmul_f32` against a CPU
     /// reference; asserts max relative error < 1e-3.

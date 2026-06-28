@@ -1658,6 +1658,12 @@ impl Llama {
                 gb(vram.total),
             );
         }
+        // Reserve the model's weight VRAM up front as one contiguous bump arena (frees in one shot,
+        // no per-tensor fragmentation). Best-effort: if the contiguous block can't be obtained, fall
+        // back to per-tensor allocation rather than failing the load.
+        if let Err(e) = be.reserve_weights(fp.total()) {
+            eprintln!("note: weight arena reservation failed ({e}); using per-tensor allocation");
+        }
 
         // token embeddings (host) + lm head (GPU). tied unless output.weight present.
         let (token_embd, te_shape) = load_tensor_dequant(&g, "token_embd.weight")?;

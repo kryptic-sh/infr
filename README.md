@@ -27,6 +27,43 @@ infr serve  <model-ref>        # OpenAI-compatible HTTP API
 infr bench / infr compare      # tok/s benchmarks vs llama.cpp
 ```
 
+## Benchmarking & profiling
+
+`infr bench` matches `llama-bench`'s `-p`/`-n`/`-d`/`-r` flags, so the two are
+directly comparable. Pipelines are compiled and GPU state is first-touched at
+model load (`Llama::warmup`), so timing measures compute, not one-time setup.
+**Run benchmarks one at a time** — concurrent GPU work skews results.
+
+```bash
+M='hf:unsloth/Qwen3-30B-A3B-GGUF:Qwen3-30B-A3B-Q4_K_M.gguf'   # MoE perf target
+
+# Prefill (pp = n_prompt/time) and decode (tg = n_gen/time):
+infr bench "$M" -p 2048 -n 0 -r 3       # prefill 2048 tokens
+infr bench "$M" -p 8000 -n 0 -r 2       # prefill at depth
+infr bench "$M" -p 0 -n 64 -r 3         # decode 64 tokens
+infr bench "$M" -p 0 -n 64 -d 2048      # decode at context depth 2048 (-d warms, untimed)
+```
+
+**Profile** per-op GPU time (timestamp queries) with `INFR_PROF2=1`; it prints,
+per submit, time aggregated by op label (`matmul_proj`, `attn_flash`,
+`mmq_expert`, `quant_q8`, …). Read the ratios — the aggregate includes warmup:
+
+```bash
+INFR_PROF2=1 infr bench "$M" -p 2048 -n 0 -r 1 2>&1 | grep prof2
+```
+
+**Compare to llama.cpp** — `infr compare` shells out to `infr bench` and the
+system `llama-bench` with matching flags on coding-agent-shaped workloads
+(prefill, decode-at-depth, whole turns). `--ctx` is comma-delimited:
+
+```bash
+infr compare "$M" --ctx 8000,16000 --gen 256 --turn 2048,256 --reps 2
+```
+
+Useful env: `INFR_TEMP` / `INFR_TOP_K` / `INFR_TOP_P` (sampling; `TEMP=0` →
+greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
+`INFR_NO_FLASH`.
+
 ## Scope
 
 - **Format:** GGUF

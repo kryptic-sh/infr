@@ -18,6 +18,24 @@ LLM inference engine. Repo: `~/Projects/kryptic-sh/infr`, remote
 - North star: **long-context speed** (coding-agent workload) — win 16k/32k+,
   deprioritize short prompt.
 
+## MoE (Qwen3moe / Qwen3-30B-A3B-Q4) — LATEST perf (2026-06-29)
+
+Test model `hf:unsloth/Qwen3-30B-A3B-GGUF:Qwen3-30B-A3B-Q4_K_M.gguf` (~18.6GB,
+all-resident on 24GB). **decode 38→94 t/s, prefill pp2048 43→2168 t/s** this
+session. vs llama.cpp: prefill ~0.72×, decode ~0.5×. The pipeline is now fully
+GPU-resident — routing (GPU top-k + counting-sort buckets), sampling (greedy
+argmax + radix-select stochastic), decode (fused multi-slot expert FFN), prefill
+(flash attn + tiled/dp4a expert+projection GEMMs). KEY: every `t>1` matmul had
+been on the per-row `native_gemv` (re-reading each weight t times) — tiling the
+QKV/O projections + experts (`native_gemm` / `matmul_native_off` / dp4a
+`native_gemm_mmq_q4k`) was the big win. Remaining: Q6_K dp4a (V + expert `down`
+still coopmat); decode latency (matmul-bound).
+
+Bench/profile/compare commands → **README** ("Benchmarking & profiling").
+Detailed perf state + remaining levers, warmup, and oracles are in the agent
+memory files (`moe-perf-state`, `gpu-warmup-setup`, `bench-profile-commands`).
+Warmup: `Llama::warmup()` at load compiles all pipelines so timing ≠ setup.
+
 ## Qwen3.5 / Qwen3.6 (`qwen35` = Qwen3-Next) — CPU reference WORKS ✅
 
 Scoped to a CPU reference first. GPU note (CORRECTED): ggml's Vulkan backend

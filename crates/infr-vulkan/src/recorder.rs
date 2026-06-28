@@ -50,6 +50,10 @@ pub struct Recorder<'a> {
     prof2: bool,
     query_pool: vk::QueryPool,
     ts_labels: RefCell<Vec<&'static str>>,
+    /// One-shot prof2 label override: the next `stamp()` uses this instead of its default, then
+    /// clears it. Lets a caller attribute a generic op (e.g. a `linear` used for the vocab head vs a
+    /// projection) to a distinct bucket without per-op API plumbing.
+    next_label: std::cell::Cell<Option<&'static str>>,
 }
 
 impl<'a> Recorder<'a> {
@@ -121,7 +125,15 @@ impl<'a> Recorder<'a> {
             prof2,
             query_pool,
             ts_labels: RefCell::new(Vec::new()),
+            next_label: std::cell::Cell::new(None),
         })
+    }
+
+    /// Override the label of the NEXT profiled op (INFR_PROF2). Consumed once. No-op without prof2.
+    pub fn label_next(&self, label: &'static str) {
+        if self.prof2 {
+            self.next_label.set(Some(label));
+        }
     }
 
     /// Record a profiling timestamp (BOTTOM_OF_PIPE) tagged with an op label, if INFR_PROF2.
@@ -129,6 +141,7 @@ impl<'a> Recorder<'a> {
         if !self.prof2 {
             return;
         }
+        let label = self.next_label.take().unwrap_or(label);
         let idx = self.ts_labels.borrow().len() as u32;
         unsafe {
             self.be.shared.device.cmd_write_timestamp(
@@ -1813,7 +1826,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("lm_head");
+        self.stamp("expert_ffn");
         let name = crate::linear::native_idm_kernel_name(dtype).expect("native idm kernel");
         let spv = crate::gemm::native_idm_build_spv(dtype).expect("native idm spv");
         let k = self.be.kernel(name, spv, 4, 20);

@@ -2193,6 +2193,21 @@ impl Llama {
     /// VkPipeline and first-touch GPU state. The first use of each compute kernel lazily builds its
     /// pipeline (seconds across the whole MoE kernel set); doing it here keeps it out of timed paths.
     pub fn warmup(&self) -> Result<()> {
+        // Suppress per-op profiling (INFR_PROF2) during warmup: recorders read the env at
+        // construction, so without this the warmup forwards' submits pollute a subsequent bench's
+        // [prof2] aggregate with prefill labels (the stage profiler does the same dance).
+        let prof2 = std::env::var_os("INFR_PROF2");
+        if prof2.is_some() {
+            std::env::remove_var("INFR_PROF2");
+        }
+        let r = self.warmup_inner();
+        if let Some(v) = prof2 {
+            std::env::set_var("INFR_PROF2", v);
+        }
+        r
+    }
+
+    fn warmup_inner(&self) -> Result<()> {
         let prompt: Vec<u32> = (0..64).map(|i| (i % 64) as u32).collect();
         if self.cfg.moe.is_some() {
             let mut kv = self.new_moe_kv(96)?;
@@ -3529,6 +3544,7 @@ impl Llama {
             c.n_embd,
             c.rms_eps,
         );
+        rec.label_next("vocab");
         rec_linear(
             &rec,
             &self.lm_head,
@@ -4284,6 +4300,7 @@ impl Llama {
                     let (_, gb) = native_parts(&st.gate);
                     let (_, ub) = native_parts(&st.up);
                     let base = e * st.stride;
+                    rec2.label_next("expert_gateup");
                     rec2.matmul_mmq_q4k(
                         qa.as_ref(),
                         da.as_ref(),
@@ -4295,6 +4312,7 @@ impl Llama {
                         ne,
                         nff,
                     );
+                    rec2.label_next("expert_gateup");
                     rec2.matmul_mmq_q4k(
                         qa.as_ref(),
                         da.as_ref(),
@@ -4308,6 +4326,7 @@ impl Llama {
                     );
                     keep.extend([qa, da, sa]);
                 } else {
+                    rec2.label_next("expert_gateup");
                     rec_gemm_expert(
                         &rec2,
                         &st.gate,
@@ -4319,6 +4338,7 @@ impl Llama {
                         ne,
                         nff,
                     );
+                    rec2.label_next("expert_gateup");
                     rec_gemm_expert(
                         &rec2,
                         &st.up,
@@ -4332,6 +4352,7 @@ impl Llama {
                     );
                 }
                 rec2.silu_mul(ge.as_ref(), ue.as_ref(), ae.as_ref(), m * nff);
+                rec2.label_next("expert_down");
                 rec_gemm_expert(
                     &rec2,
                     &st.down,

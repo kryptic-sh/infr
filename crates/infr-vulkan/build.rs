@@ -43,6 +43,7 @@ fn main() {
         ("attention", "attention", &[]),
         ("attn_combine", "attn_combine", &[]),
         ("attention_kv", "attention_kv", &[]),
+        ("qk_norm_rope", "qk_norm_rope", &[]),
         // Decode GEMV: q4/q8 × plain/residual specializations from one source.
         ("mul_mat_vec_q", "mul_mat_vec_q4", &["-DQBITS=4"]),
         ("mul_mat_vec_q", "mul_mat_vec_q8", &["-DQBITS=8"]),

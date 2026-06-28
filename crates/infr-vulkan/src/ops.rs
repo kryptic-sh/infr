@@ -830,56 +830,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 /// Qwen3 QK-norm + RoPE: ONE workgroup per (token, head). RMS-normalizes the head's `hd`-vector
 /// (weight `nw`) then applies ggml-NORM-interleaved RoPE. Reads raw projections `x[rows,nheads,hd]`,
 /// writes to `y` at row `out_base + r` (q→0, k→cache pos). `hd<=128`.
-pub(crate) const QK_NORM_ROPE_WGSL: &str = r#"
-enable f16;
-struct PC { rows: u32, nheads: u32, hd: u32, rope_dim: u32, theta: f32, rope_pos: u32, out_base: u32, eps: f32 }
-var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       x: array<f32>;  // [rows, nheads, hd] raw projections
-@group(0) @binding(1) var<storage, read>       nw: array<f32>; // [hd]
-@group(0) @binding(2) var<storage, read_write> y: array<f16>;  // q buffer / KV cache (f16)
-
-var<workgroup> xs: array<f32, 128>;
-var<workgroup> red: array<f32, 64>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-    let t = lid.x;
-    let unit = wid.x;
-    let h = unit % pc.nheads;
-    let r = unit / pc.nheads;
-    let in_base = (r * pc.nheads + h) * pc.hd;
-
-    var pss: f32 = 0.0;
-    for (var i: u32 = t; i < pc.hd; i = i + 64u) { let v = x[in_base + i]; xs[i] = v; pss = pss + v * v; }
-    red[t] = pss;
-    workgroupBarrier();
-    var stride = 32u;
-    loop { if stride == 0u { break; }
-        if t < stride { red[t] = red[t] + red[t + stride]; }
-        workgroupBarrier(); stride = stride / 2u; }
-    let scale = inverseSqrt(red[0] / f32(pc.hd) + pc.eps);
-
-    let abs = pc.rope_pos + r;
-    let out_base_idx = ((pc.out_base + r) * pc.nheads + h) * pc.hd;
-    // NEOX-style RoPE (Qwen): pair element p with p + rope_dim/2. (Assumes rope_dim == hd, true for
-    // Qwen3.) RMSNorm weight is applied per element before rotation.
-    let half = pc.rope_dim / 2u;
-    for (var p: u32 = t; p < half; p = p + 64u) {
-        let i0 = p;
-        let i1 = p + half;
-        let a = xs[i0] * scale * nw[i0];
-        let b = xs[i1] * scale * nw[i1];
-        let freq = pow(pc.theta, -2.0 * f32(p) / f32(pc.rope_dim));
-        let ang = f32(abs) * freq;
-        let s = sin(ang);
-        let co = cos(ang);
-        y[out_base_idx + i0] = f16(a * co - b * s);
-        y[out_base_idx + i1] = f16(a * s + b * co);
-    }
-}
-"#;
-
 // Flash-decoding pass 1 (split-K): ONE workgroup per (head, KV-chunk). Computes that chunk's
 // softmax partial — max `m`, sum `l`, and un-normalized weighted-V `acc[hd]` (relative to `m`) —
 // for the single decode query. Many chunks → many workgroups → the GPU stays busy at long

@@ -1,0 +1,50 @@
+#version 460
+// Fused per-head QK-norm (RMSNorm over hd) + NEOX RoPE, writing f16. One workgroup per (row, head).
+// Assumes rope_dim == hd (Qwen3). x [rows, nheads, hd] f32, nw [hd] f32, y f16 (q buffer / KV cache).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows; uint nheads; uint hd; uint rope_dim; float theta; uint rope_pos; uint out_base; float eps;
+} pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer NB { float nw[]; };
+layout(binding = 2) buffer YB { float16_t y[]; };
+
+shared float xs[128];
+shared float red[64];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint unit = gl_WorkGroupID.x;
+    uint h = unit % pc.nheads;
+    uint r = unit / pc.nheads;
+    uint in_base = (r * pc.nheads + h) * pc.hd;
+
+    float pss = 0.0;
+    for (uint i = t; i < pc.hd; i += 64u) { float v = x[in_base + i]; xs[i] = v; pss += v * v; }
+    red[t] = pss;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    float scale = inversesqrt(red[0] / float(pc.hd) + pc.eps);
+
+    uint absp = pc.rope_pos + r;
+    uint out_base_idx = ((pc.out_base + r) * pc.nheads + h) * pc.hd;
+    uint hf = pc.rope_dim / 2u;
+    for (uint p = t; p < hf; p += 64u) {
+        uint i0 = p;
+        uint i1 = p + hf;
+        float a = xs[i0] * scale * nw[i0];
+        float b = xs[i1] * scale * nw[i1];
+        float freq = pow(pc.theta, -2.0 * float(p) / float(pc.rope_dim));
+        float ang = float(absp) * freq;
+        float s = sin(ang);
+        float co = cos(ang);
+        y[out_base_idx + i0] = float16_t(a * co - b * s);
+        y[out_base_idx + i1] = float16_t(a * s + b * co);
+    }
+}

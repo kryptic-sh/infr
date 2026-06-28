@@ -1319,7 +1319,7 @@ impl<'a> Recorder<'a> {
         self.stamp("qk_norm_rope");
         let k = self
             .be
-            .kernel("qk_norm_rope", ops::QK_NORM_ROPE_WGSL, 3, 32);
+            .kernel_spv("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 32);
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());

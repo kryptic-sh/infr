@@ -146,7 +146,6 @@ impl ExpertW {
 }
 
 /// One routed expert's SwiGLU weights (gate/up [n_embd→n_ff_exp], down [n_ff_exp→n_embd]).
-
 struct ExpertWt {
     gate: ExpertW,
     up: ExpertW,

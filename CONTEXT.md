@@ -136,9 +136,23 @@ EXCEPT pg8192,512@32000 = 0.74× (REPRODUCIBLE, not variance — confirmed 2×).
 Root cause: large prefill chunk (8192 tok) on deep KV (32k) ⇒ ingest attends
 over ~40k ctx; infr's DEEP-CONTEXT PREFILL ATTENTION is the bottleneck
 (decode@32k fine 0.97×, pure pp32000 0.84×, small 2048 ingest 0.94× — only
-big-chunk×deep-ctx dips). Next lever for the prefill gap: prefill attention
-scaling at 32k+. **Matched ubatch=2048: we WIN long-ctx prefill (16k 1.34×, 32k
-1.38×).** Short-prompt prefill (0.37× @512) is weakest but lowest priority.
+big-chunk×deep-ctx dips). **Matched ubatch=2048: we WIN long-ctx prefill (16k
+1.34×, 32k 1.38×).** Short-prompt prefill (0.37× @512) is weakest but lowest
+priority.
+
+DEEP-PREFILL-ATTENTION investigation (pg8192,512@32000, repro
+`infr bench --pg 8192,512 -d 32000`): profiled INFR_PROF2 — `attn_flash` grows
+506→1866 µs/op as the ingest deepens 32k→40k, reaching ~47% of chunk GPU time (≈
+matmul_proj). Tuning swept (ALL solo — running 2 benches at once halves each via
+GPU contention, invalidated a first pass): default `attn_flash_warp` 950 t/s
+BEST; INFR_FLASH_REG (FA2 reg-O Br=128) 796, INFR_NO_FLASH (non-FA, materializes
+S) 739, INFR_NO_FLASH_WARP slower. Chunk-budget near-flat (16M 922 / 32M 950 /
+48M 957 / 64M 963 — +1.4% at 64M, not worth watchdog risk). n_splits heuristic
+is adaptive+good (INFR_FLASH_SPLITS override also hits the 512-tok decode →
+can't isolate). attn_flash_warp ALREADY uses coopmat (coopMatMulAdd QK+PV) — the
+limit is BN=64 K-tile (S/P/O in shared) ⇒ ~625 iters over 40k KV. Real lever =
+wider-KV-tile / better-pipelined flash kernel (substantial; FA2-reg attempt
+already lost). Config is otherwise tuned; gap is the kernel, not a knob.
 
 Infra:
 

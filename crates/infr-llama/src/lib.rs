@@ -8,7 +8,6 @@
 //! TODO(next): move host ops to GPU; add a KV cache; fold into the `Model`/`Backend` seams.
 #![allow(clippy::needless_range_loop)]
 
-mod iquant_grids;
 pub mod qwen35;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -779,7 +778,7 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //   y[j] = db * grid[j] * (if ksigns[sign_idx] & (1<<j) { -1 } else { 1 })
         // Ref: llama.cpp dequantize_row_iq2_xxs (ggml-quants.c l.2416)
         Iq2Xxs => {
-            use iquant_grids::{IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+            use infr_core::iquant_grids::{IQ2XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
             let bpb = 66usize; // 2 + 32*2
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -827,7 +826,7 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //                  dl = db[l/2]
         // Ref: llama.cpp dequantize_row_iq2_xs (ggml-quants.c l.2444)
         Iq2Xs => {
-            use iquant_grids::{IQ2XS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+            use infr_core::iquant_grids::{IQ2XS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
             let bpb = 74usize; // 2 + 32*2 + 8
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -872,7 +871,7 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //   grid_idx = qs[l] | ((qh[ib32] << (8-2*l)) & 0x300)  (10-bit → iq2s_grid[1024])
         // Ref: llama.cpp dequantize_row_iq2_s (ggml-quants.c l.2471)
         Iq2S => {
-            use iquant_grids::{IQ2S_GRID, KMASK_IQ2XS};
+            use infr_core::iquant_grids::{IQ2S_GRID, KMASK_IQ2XS};
             let bpb = 82usize; // 2 + 64 + 8 + 8
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -923,7 +922,7 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //     y[j+0] = db * grid1[j] * sign;  y[j+4] = db * grid2[j] * sign
         // Ref: llama.cpp dequantize_row_iq3_xxs (ggml-quants.c l.2503)
         Iq3Xxs => {
-            use iquant_grids::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+            use infr_core::iquant_grids::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
             let bpb = 98usize; // 2 + 96
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -976,7 +975,7 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //   For second group (l in 0..4, using qh[1], db2): similarly
         // Ref: llama.cpp dequantize_row_iq3_s (ggml-quants.c l.2535)
         Iq3S => {
-            use iquant_grids::{IQ3S_GRID, KMASK_IQ2XS};
+            use infr_core::iquant_grids::{IQ3S_GRID, KMASK_IQ2XS};
             let bpb = 110usize; // 2 + 64 + 8 + 32 + 4
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -1061,7 +1060,7 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //     y[j] = dl * (grid[j] as f32 + delta)
         // Ref: llama.cpp dequantize_row_iq1_s (ggml-quants.c l.2578)
         Iq1S => {
-            use iquant_grids::IQ1S_GRID;
+            use infr_core::iquant_grids::IQ1S_GRID;
             let bpb = 50usize; // 2 + 32 + 16
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -1110,7 +1109,7 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         //   l=0,1: y[j] = dl1*(grid[j]+delta[l]); l=2,3: y[j] = dl2*(grid[j]+delta[l])
         // Ref: llama.cpp dequantize_row_iq1_m (ggml-quants.c l.2603)
         Iq1M => {
-            use iquant_grids::IQ1S_GRID;
+            use infr_core::iquant_grids::IQ1S_GRID;
             let bpb = 56usize; // 32 + 16 + 8
             let nblk = bytes.len() / bpb;
             let mut out = vec![0.0f32; nblk * 256];
@@ -1424,6 +1423,9 @@ fn is_native_supported(d: infr_core::DType) -> bool {
             | Nvfp4
             | Tq1_0
             | Tq2_0
+            | Iq2Xxs
+            | Iq2Xs
+            | Iq2S
     )
 }
 
@@ -4432,6 +4434,43 @@ mod gpu_affine_tests {
         fill(&mut block[0..64], 11, 3); // qs
         block[64..66].copy_from_slice(&half::f16::from_f32(1.25).to_bits().to_le_bytes());
         check_native_cb(infr_core::DType::Tq2_0, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn iq2xxs_native_matches_cpu() {
+        // 2 blocks (in_f=512) to exercise cross-block + grid/sign decode.
+        let mut blocks = vec![0u8; 2 * 66];
+        for (bi, blk) in blocks.chunks_mut(66).enumerate() {
+            blk[0..2].copy_from_slice(
+                &half::f16::from_f32(1.0 + bi as f32 * 0.5)
+                    .to_bits()
+                    .to_le_bytes(),
+            );
+            fill(&mut blk[2..66], 31, (bi as u8) * 7 + 13); // qs (grid idx + signs + scale)
+        }
+        check_native_cb(infr_core::DType::Iq2Xxs, &blocks);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn iq2xs_native_matches_cpu() {
+        let mut block = vec![0u8; 74];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..66], 29, 5); // qs (u16 grid idx + sign)
+        fill(&mut block[66..74], 17, 1); // scales
+        check_native_cb(infr_core::DType::Iq2Xs, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn iq2s_native_matches_cpu() {
+        let mut block = vec![0u8; 82];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..66], 23, 7); // qs (idx low) + sign bytes
+        fill(&mut block[66..74], 13, 2); // qh
+        fill(&mut block[74..82], 19, 1); // scales
+        check_native_cb(infr_core::DType::Iq2S, &block);
     }
 }
 

@@ -783,6 +783,124 @@ fn dq(g: u32) -> f32 {
 }
 "#;
 
+// ── Grid-based i-quant helpers ────────────────────────────────────────────────
+// WGSL has no u64, so each u64 grid entry is emitted as two u32 words (lo, hi); the dq() snippet
+// reads byte j from the lo word (j<4) or hi word (j>=4). Grids/ksigns are embedded as module
+// consts (baked into the per-format SPIR-V, compiled once and cached by kernel name).
+
+/// Emit a `u64` grid as a WGSL `const NAME = array<u32, 2N>(lo0, hi0, ...)`.
+fn grid_u64_wgsl(name: &str, grid: &[u64]) -> String {
+    let mut s = format!("const {name} = array<u32,{}>(", grid.len() * 2);
+    for &v in grid {
+        s.push_str(&format!("{}u,{}u,", v as u32, (v >> 32) as u32));
+    }
+    s.pop();
+    s.push_str(");\n");
+    s
+}
+
+/// Emit a `u32` grid (IQ3) as a WGSL `const NAME = array<u32, N>(...)`.
+fn grid_u32_wgsl(name: &str, grid: &[u32]) -> String {
+    let mut s = format!("const {name} = array<u32,{}>(", grid.len());
+    for &v in grid {
+        s.push_str(&format!("{v}u,"));
+    }
+    s.pop();
+    s.push_str(");\n");
+    s
+}
+
+/// The 128-entry `ksigns_iq2xs` sign-mask table as a WGSL const.
+fn ksigns_wgsl() -> String {
+    let mut s = String::from("const KSIGNS = array<u32,128>(");
+    for &v in infr_core::iquant_grids::KSIGNS_IQ2XS.iter() {
+        s.push_str(&format!("{v}u,"));
+    }
+    s.pop();
+    s.push_str(");\n");
+    s
+}
+
+/// IQ2_XXS: [f16 d][u16 qs[32]] = 66 bytes, 256 elements. 8-bit grid index + 7-bit sign + scale.
+const DQ_IQ2XXS: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 66u;
+    let d = f16tof32(ru16(bd));
+    let ib32 = p / 32u;
+    let l = (p % 32u) / 8u;
+    let j = p % 8u;
+    let off = bd + 2u + ib32 * 8u;
+    let aux0 = ru32b(off);
+    let aux1 = ru32b(off + 4u);
+    let grid_idx = (aux0 >> (8u * l)) & 0xFFu;
+    let sign_idx = (aux1 >> (7u * l)) & 127u;
+    let db = d * (0.5 + f32(aux1 >> 28u)) * 0.25;
+    var byte: u32;
+    if j < 4u { byte = (G_IQ2XXS[2u * grid_idx] >> (8u * j)) & 0xFFu; }
+    else { byte = (G_IQ2XXS[2u * grid_idx + 1u] >> (8u * (j - 4u))) & 0xFFu; }
+    let gv = f32(i32(byte) - i32(select(0u, 256u, byte >= 128u)));
+    let sign = select(1.0, -1.0, ((KSIGNS[sign_idx] >> j) & 1u) != 0u);
+    return db * gv * sign;
+}
+"#;
+
+/// IQ2_XS: [f16 d][u16 qs[32]][u8 scales[8]] = 74 bytes, 256 elements. 9-bit grid + 7-bit sign.
+const DQ_IQ2XS: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 74u;
+    let d = f16tof32(ru16(bd));
+    let ib32 = p / 32u;
+    let l = (p % 32u) / 8u;
+    let j = p % 8u;
+    let qs16 = ru16(bd + 2u + (ib32 * 4u + l) * 2u);
+    let grid_idx = qs16 & 511u;
+    let sign_idx = qs16 >> 9u;
+    let sc = rb(bd + 66u + ib32);
+    let db0 = d * (0.5 + f32(sc & 0xFu)) * 0.25;
+    let db1 = d * (0.5 + f32(sc >> 4u)) * 0.25;
+    let dl = select(db1, db0, l < 2u);
+    var byte: u32;
+    if j < 4u { byte = (G_IQ2XS[2u * grid_idx] >> (8u * j)) & 0xFFu; }
+    else { byte = (G_IQ2XS[2u * grid_idx + 1u] >> (8u * (j - 4u))) & 0xFFu; }
+    let gv = f32(i32(byte) - i32(select(0u, 256u, byte >= 128u)));
+    let sign = select(1.0, -1.0, ((KSIGNS[sign_idx] >> j) & 1u) != 0u);
+    return dl * gv * sign;
+}
+"#;
+
+/// IQ2_S: [f16 d][u8 qs[64]][u8 qh[8]][u8 scales[8]] = 82 bytes, 256 elements. 10-bit grid; signs
+/// are inline bytes (qs[32..64]), no ksigns table.
+const DQ_IQ2S: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 82u;
+    let d = f16tof32(ru16(bd));
+    let ib32 = p / 32u;
+    let l = (p % 32u) / 8u;
+    let j = p % 8u;
+    let qs_byte = rb(bd + 2u + ib32 * 4u + l);
+    let sign_byte = rb(bd + 2u + 32u + ib32 * 4u + l);
+    let qh_byte = rb(bd + 66u + ib32);
+    let hi = (qh_byte << (8u - 2u * l)) & 0x300u;
+    let grid_idx = qs_byte | hi;
+    let sc = rb(bd + 74u + ib32);
+    let db0 = d * (0.5 + f32(sc & 0xFu)) * 0.25;
+    let db1 = d * (0.5 + f32(sc >> 4u)) * 0.25;
+    let dl = select(db1, db0, l < 2u);
+    var byte: u32;
+    if j < 4u { byte = (G_IQ2S[2u * grid_idx] >> (8u * j)) & 0xFFu; }
+    else { byte = (G_IQ2S[2u * grid_idx + 1u] >> (8u * (j - 4u))) & 0xFFu; }
+    let gv = f32(i32(byte) - i32(select(0u, 256u, byte >= 128u)));
+    let sign = select(1.0, -1.0, ((sign_byte >> j) & 1u) != 0u);
+    return dl * gv * sign;
+}
+"#;
+
 /// Return the static kernel name for a native-block GEMV (Phase 0-2).
 pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static str {
     use infr_core::DType::*;
@@ -819,6 +937,12 @@ pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static s
         (Tq1_0, true) => "native_tq1_0_res",
         (Tq2_0, false) => "native_tq2_0",
         (Tq2_0, true) => "native_tq2_0_res",
+        (Iq2Xxs, false) => "native_iq2xxs",
+        (Iq2Xxs, true) => "native_iq2xxs_res",
+        (Iq2Xs, false) => "native_iq2xs",
+        (Iq2Xs, true) => "native_iq2xs_res",
+        (Iq2S, false) => "native_iq2s",
+        (Iq2S, true) => "native_iq2s_res",
         _ => panic!("no native GEMV for {:?}", dtype),
     }
 }
@@ -852,6 +976,20 @@ pub fn native_gemv_wgsl(dtype: infr_core::DType, residual: bool) -> String {
         Nvfp4 => return format!("{hdr}{KV_MXFP4_DEF}{UE4M3_FN}{DQ_NVFP4}{body}"),
         Tq1_0 => return format!("{hdr}{POW3_TQ_DEF}{DQ_TQ1_0}{body}"),
         Tq2_0 => return format!("{hdr}{DQ_TQ2_0}{body}"),
+        Iq2Xxs => {
+            let grid = grid_u64_wgsl("G_IQ2XXS", &infr_core::iquant_grids::IQ2XXS_GRID);
+            let ks = ksigns_wgsl();
+            return format!("{hdr}{grid}{ks}{DQ_IQ2XXS}{body}");
+        }
+        Iq2Xs => {
+            let grid = grid_u64_wgsl("G_IQ2XS", &infr_core::iquant_grids::IQ2XS_GRID);
+            let ks = ksigns_wgsl();
+            return format!("{hdr}{grid}{ks}{DQ_IQ2XS}{body}");
+        }
+        Iq2S => {
+            let grid = grid_u64_wgsl("G_IQ2S", &infr_core::iquant_grids::IQ2S_GRID);
+            return format!("{hdr}{grid}{DQ_IQ2S}{body}");
+        }
         _ => panic!("no native GEMV for {dtype:?}"),
     };
     format!("{hdr}{dq}{body}")

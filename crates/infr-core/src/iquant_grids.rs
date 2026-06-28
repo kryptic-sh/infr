@@ -1,9 +1,9 @@
 //! Lookup tables for i-quant codebook dequantization.
 //! Ported verbatim from llama.cpp `ggml/src/ggml-common.h`.
 
-pub(crate) static KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+pub static KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
-pub(crate) static KSIGNS_IQ2XS: [u8; 128] = [
+pub static KSIGNS_IQ2XS: [u8; 128] = [
     0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15, 144, 17, 18, 147, 20, 149,
     150, 23, 24, 153, 154, 27, 156, 29, 30, 159, 160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170,
     43, 172, 45, 46, 175, 48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
@@ -13,7 +13,7 @@ pub(crate) static KSIGNS_IQ2XS: [u8; 128] = [
     252, 125, 126, 255,
 ];
 
-pub(crate) static IQ2XXS_GRID: [u64; 256] = [
+pub static IQ2XXS_GRID: [u64; 256] = [
     0x0808080808080808,
     0x080808080808082b,
     0x0808080808081919,
@@ -272,7 +272,7 @@ pub(crate) static IQ2XXS_GRID: [u64; 256] = [
     0x2b2b2b1908081908,
 ];
 
-pub(crate) static IQ2XS_GRID: [u64; 512] = [
+pub static IQ2XS_GRID: [u64; 512] = [
     0x0808080808080808,
     0x080808080808082b,
     0x0808080808081919,
@@ -787,7 +787,7 @@ pub(crate) static IQ2XS_GRID: [u64; 512] = [
     0x2b2b2b2b2b2b2b2b,
 ];
 
-pub(crate) static IQ2S_GRID: [u64; 1024] = [
+pub static IQ2S_GRID: [u64; 1024] = [
     0x0808080808080808,
     0x080808080808082b,
     0x0808080808081919,
@@ -1814,7 +1814,7 @@ pub(crate) static IQ2S_GRID: [u64; 1024] = [
     0x2b2b2b2b2b2b2b2b,
 ];
 
-pub(crate) static IQ3XXS_GRID: [u32; 256] = [
+pub static IQ3XXS_GRID: [u32; 256] = [
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
     0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
     0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
@@ -1849,7 +1849,7 @@ pub(crate) static IQ3XXS_GRID: [u32; 256] = [
     0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
 ];
 
-pub(crate) static IQ3S_GRID: [u32; 512] = [
+pub static IQ3S_GRID: [u32; 512] = [
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
     0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
     0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
@@ -1916,7 +1916,7 @@ pub(crate) static IQ3S_GRID: [u32; 512] = [
     0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
 ];
 
-pub(crate) static IQ1S_GRID: [u64; 2048] = [
+pub static IQ1S_GRID: [u64; 2048] = [
     0xffffffffffffffff,
     0xffffffffffffff01,
     0xffffffffffff0000,

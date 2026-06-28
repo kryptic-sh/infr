@@ -423,7 +423,7 @@ impl VulkanBackend {
         dim: usize,
         eps: f32,
     ) -> Result<Vec<f32>> {
-        let k = self.kernel("rmsnorm", RMSNORM_WGSL, 3, 12);
+        let k = self.kernel_spv_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
@@ -498,37 +498,6 @@ impl VulkanBackend {
         self.run_kernel(kern, &[q, k, v], t * nh * hd, &push, (t * nh) as u32)
     }
 }
-
-// ONE workgroup per row; its 64 threads cooperatively reduce the sum-of-squares (coalesced),
-// then write the normalized row. Dispatch `rows` workgroups.
-pub(crate) const RMSNORM_WGSL: &str = r#"
-struct PC { rows: u32, dim: u32, eps: f32 }
-var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       x: array<f32>;
-@group(0) @binding(1) var<storage, read>       w: array<f32>;
-@group(0) @binding(2) var<storage, read_write> y: array<f32>;
-var<workgroup> red: array<f32, 64>;
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-    let r = wid.x;
-    let t = lid.x;
-    let base = r * pc.dim;
-    var pss: f32 = 0.0;
-    for (var i: u32 = t; i < pc.dim; i = i + 64u) { let v = x[base + i]; pss = pss + v * v; }
-    red[t] = pss;
-    workgroupBarrier();
-    var stride = 32u;
-    loop {
-        if stride == 0u { break; }
-        if t < stride { red[t] = red[t] + red[t + stride]; }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-    let scale = inverseSqrt(red[0] / f32(pc.dim) + pc.eps);
-    for (var i: u32 = t; i < pc.dim; i = i + 64u) { y[base + i] = x[base + i] * scale * w[i]; }
-}
-"#;
 
 /// Fused SwiGLU over a combined gate||up buffer `gu` `[rows, 2*nff]`:
 /// `y[r,i] = silu(gu[r,i]) * gu[r, nff+i]`.

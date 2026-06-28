@@ -1,0 +1,28 @@
+#version 460
+// RoPE (ggml NORM, interleaved pairs) over x laid out [t, n_heads, hd]. One thread per (t, head).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint t; uint nheads; uint hd; uint rope_dim; float theta; uint pos_offset;
+} pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) buffer YB { float y[]; };
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.t * pc.nheads) { return; }
+    uint pos = pc.pos_offset + idx / pc.nheads;
+    uint base = idx * pc.hd;
+    for (uint i = 0u; i < pc.hd; i++) { y[base + i] = x[base + i]; }
+    uint hf = pc.rope_dim / 2u;
+    for (uint i = 0u; i < hf; i++) {
+        float freq = pow(pc.theta, -2.0 * float(i) / float(pc.rope_dim));
+        float ang = float(pos) * freq;
+        float s = sin(ang);
+        float co = cos(ang);
+        float a = x[base + 2u * i];
+        float b = x[base + 2u * i + 1u];
+        y[base + 2u * i] = a * co - b * s;
+        y[base + 2u * i + 1u] = a * s + b * co;
+    }
+}

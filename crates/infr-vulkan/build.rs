@@ -32,6 +32,7 @@ fn main() {
         ("silu_mul", "silu_mul", &[]),
         ("silu_mul_fused", "silu_mul_fused", &[]),
         ("store_f16", "store_f16", &[]),
+        ("rope", "rope", &[]),
         // Decode GEMV: q4/q8 × plain/residual specializations from one source.
         ("mul_mat_vec_q", "mul_mat_vec_q4", &["-DQBITS=4"]),
         ("mul_mat_vec_q", "mul_mat_vec_q8", &["-DQBITS=8"]),

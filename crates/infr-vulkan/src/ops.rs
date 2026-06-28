@@ -441,7 +441,7 @@ impl VulkanBackend {
         rope_dim: usize,
         theta: f32,
     ) -> Result<Vec<f32>> {
-        let k = self.kernel("rope", ROPE_WGSL, 2, 24);
+        let k = self.kernel_spv("rope", crate::gemm::rope_spv(), 2, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -527,32 +527,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
     }
     let scale = inverseSqrt(red[0] / f32(pc.dim) + pc.eps);
     for (var i: u32 = t; i < pc.dim; i = i + 64u) { y[base + i] = x[base + i] * scale * w[i]; }
-}
-"#;
-
-pub(crate) const ROPE_WGSL: &str = r#"
-struct PC { t: u32, nheads: u32, hd: u32, rope_dim: u32, theta: f32, pos_offset: u32 }
-var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       x: array<f32>;
-@group(0) @binding(1) var<storage, read_write> y: array<f32>;
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= pc.t * pc.nheads { return; }
-    let pos = pc.pos_offset + idx / pc.nheads;
-    let base = idx * pc.hd;
-    for (var i: u32 = 0u; i < pc.hd; i = i + 1u) { y[base + i] = x[base + i]; }
-    let half = pc.rope_dim / 2u;
-    for (var i: u32 = 0u; i < half; i = i + 1u) {
-        let freq = pow(pc.theta, -2.0 * f32(i) / f32(pc.rope_dim));
-        let ang = f32(pos) * freq;
-        let s = sin(ang);
-        let co = cos(ang);
-        let a = x[base + 2u * i];
-        let b = x[base + 2u * i + 1u];
-        y[base + 2u * i] = a * co - b * s;
-        y[base + 2u * i + 1u] = a * s + b * co;
-    }
 }
 "#;
 

@@ -51,6 +51,7 @@ const SILU_MUL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu
 const SILU_MUL_FUSED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul_fused.spv"));
 const STORE_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/store_f16.spv"));
+const ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv"));
 const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
 const MMV_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8.spv"));
 const MMV_Q4_RES_SPV_BYTES: &[u8] =
@@ -183,6 +184,11 @@ pub(crate) fn silu_mul_fused_spv() -> &'static [u32] {
 pub(crate) fn store_f16_spv() -> &'static [u32] {
     static STORE_F16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     STORE_F16_SPV.get_or_init(|| spv_words(STORE_F16_SPV_BYTES))
+}
+/// SPIR-V for RoPE (ggml NORM, interleaved pairs).
+pub(crate) fn rope_spv() -> &'static [u32] {
+    static ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    ROPE_SPV.get_or_init(|| spv_words(ROPE_SPV_BYTES))
 }
 /// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
 /// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.

@@ -129,10 +129,12 @@ Perf (dense qwen3, the optimization target):
   (replaced scripts/compare.sh, now deleted). Coding-agent scenarios: CONTEXT
   LOAD / REPLY@depth / SESSION TURN.
 
-Standing vs llama.cpp (qwen3-0.6b-Q4, tool-default): prefill 0.65/0.73/0.80×
-(8k/16k/32k); decode tg256 0.81/0.84/0.90×; turns 0.81-0.90×. **Matched
-ubatch=2048: we WIN long-ctx prefill (16k 1.34×, 32k 1.38×).** Short-prompt
-prefill (0.37× @512) is weakest but lowest priority.
+Standing vs llama.cpp (qwen3-0.6b-Q4, tool-default, NATIVE DEFAULT): prefill
+0.67/0.75/0.83× (8k/16k/32k); decode tg256 0.94/0.94/0.97× (was 0.81/0.84/0.90×
+pre-native — the native-default flip lifted decode to ~parity); turns 0.90-0.95×
+(outlier pg8192,512@32000 0.74×, re-check — likely variance or deep-prefill).
+**Matched ubatch=2048: we WIN long-ctx prefill (16k 1.34×, 32k 1.38×).**
+Short-prompt prefill (0.37× @512) is weakest but lowest priority.
 
 Infra:
 
@@ -179,9 +181,15 @@ Infra:
 - PREFILL (pp512, t/s) native vs unified — native wins K-quants: Q8_0 8487/6283,
   Q6_K 7622/5437, Q5_K 8018/6320, Q4_K 10248/10744 (unified dp4a mmq still edges
   Q4_K by ~5%). Was native ~3400 (3x slower) pre-GEMM.
-- ⇒ Native now faster on decode (all) + prefill (except Q4_K ~5%) AND smaller
-  VRAM. Candidate to flip to DEFAULT (currently opt-in via INFR_NATIVE) —
-  pending user decision; only Q4_K prefill regresses slightly.
+- ⇒ Native now faster on decode (all) + prefill (except Q4_K ~4%) AND smaller
+  VRAM. NOW THE DEFAULT for optimized affine quants (Q8_0, Q4_0/1, Q5_0/1,
+  Q2_K..Q6_K) via `is_native_default`/`use_native_for`. `INFR_NONATIVE=1` →
+  unified/f16 (old behavior); `INFR_NATIVE=1` → native for ALL supported formats
+  (incl. grid/codebook, which otherwise stay f16 since their native path is the
+  slow per-element fallback). Q4_K prefill gap = unified's int8 dp4a mmq beats
+  f16 coopmat ~5%/op (native coopmat itself is +45% vs unified coopmat); a
+  native dp4a GEMM would close it but is poor ROI (Q4_K superblock scales
+  hairy).
 - Tests: 36 `*_native_matches_cpu` (GEMV decode) + 3
   `*_native_gemm_matches_gemv` (GEMM vs trusted GEMV, M spans row-tiles,
   col-varied weights). All pass.

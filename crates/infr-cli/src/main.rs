@@ -286,6 +286,28 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // answers (lists/stories); override with INFR_MAX_NEW.
     let max_new = envu("INFR_MAX_NEW", 2048);
     let (gguf, tok) = resolve(model)?;
+
+    // Qwen3.5/3.6 (qwen35 / Qwen3-Next) hybrid SSM models run on the CPU reference path — ggml/our
+    // Vulkan backend has no SSM kernels (see docs/QWEN35.md). One-shot only for now.
+    if infr_llama::qwen35::is_qwen35(&gguf) {
+        let Some(msg) = message else {
+            anyhow::bail!("qwen35 (Qwen3-Next) currently supports one-shot only: pass a message");
+        };
+        eprintln!("[qwen35 CPU reference — Qwen3-Next hybrid SSM]");
+        let t0 = std::time::Instant::now();
+        let mut render = ThinkRender::new();
+        let mut t_first: Option<std::time::Instant> = None;
+        let (n_prompt, n_gen) = infr_llama::qwen35::generate_chat(&gguf, msg, max_new, |piece| {
+            if t_first.is_none() {
+                t_first = Some(std::time::Instant::now());
+            }
+            render.feed(piece);
+        })?;
+        render.finish();
+        print_run_stats(t0, t_first, n_gen, n_prompt, None);
+        return Ok(());
+    }
+
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
     // Qwen3's recommended sampling — pure greedy makes thinking models degenerate (unterminated
     // <think>, no answer). Tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.

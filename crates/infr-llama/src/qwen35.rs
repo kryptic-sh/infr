@@ -597,6 +597,67 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> Result<String> {
         .map_err(|e| anyhow!("decode: {e}"))?)
 }
 
+/// True if the GGUF at `path` is a `qwen35` (Qwen3-Next) model.
+pub fn is_qwen35(path: &std::path::Path) -> bool {
+    Gguf::open(path)
+        .ok()
+        .map(|g| g.metadata().str("general.architecture") == Some("qwen35"))
+        .unwrap_or(false)
+}
+
+/// One-shot chat generation on the CPU reference: applies the Qwen chat template, greedy-decodes
+/// until `<|im_end|>`/eos or `max_new`, streaming each decoded piece to `on_piece`. Returns
+/// (prompt_tokens, generated_tokens). For Qwen3.5/3.6 (no GPU path — see docs/QWEN35.md).
+pub fn generate_chat(
+    path: &std::path::Path,
+    message: &str,
+    max_new: usize,
+    mut on_piece: impl FnMut(&str),
+) -> Result<(usize, usize)> {
+    let g = Gguf::open(path).map_err(|e| anyhow!("{e}"))?;
+    let m = Model::load(&g)?;
+    let tok = crate::build_tokenizer(&g)?;
+    let eos = g
+        .metadata()
+        .u64("tokenizer.ggml.eos_token_id")
+        .map(|x| x as u32);
+    let im_end = tok.token_to_id("<|im_end|>");
+    let prompt = format!("<|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n");
+    let enc = tok
+        .encode(prompt, false)
+        .map_err(|e| anyhow!("encode: {e}"))?;
+    let ids = enc.get_ids();
+    let n_prompt = ids.len();
+
+    let mut st = m.new_state();
+    let mut last = 0u32;
+    for (i, &id) in ids.iter().enumerate() {
+        let logits = m.forward(id, &mut st);
+        if i == n_prompt - 1 {
+            last = argmax(&logits);
+        }
+    }
+    // incremental detokenization: decode the growing id list, emit only the new suffix
+    let mut gen_ids: Vec<u32> = Vec::new();
+    let mut shown = String::new();
+    let mut n_gen = 0usize;
+    for _ in 0..max_new {
+        if Some(last) == eos || (im_end.is_some() && Some(last) == im_end) {
+            break;
+        }
+        gen_ids.push(last);
+        n_gen += 1;
+        let full = tok.decode(&gen_ids, false).unwrap_or_default();
+        if full.len() > shown.len() && full.is_char_boundary(shown.len()) {
+            on_piece(&full[shown.len()..]);
+            shown = full;
+        }
+        let logits = m.forward(last, &mut st);
+        last = argmax(&logits);
+    }
+    Ok((n_prompt, n_gen))
+}
+
 fn argmax(v: &[f32]) -> u32 {
     let mut bi = 0usize;
     let mut bv = f32::MIN;

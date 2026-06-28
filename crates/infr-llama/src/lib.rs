@@ -3472,10 +3472,17 @@ impl Llama {
             al(mc.n_ff_exp)?,
             al(ne)?,
         );
-        let logits = self
-            .be
-            .alloc(mc.n_expert * 4, BufferUsage::Readback)
-            .map_err(|e| anyhow!("{e}"))?;
+        let logits = al(mc.n_expert)?;
+        // GPU-resident routing when the expert format has an id-indexed GEMV: top-k + expert ids and
+        // weights stay in VRAM (one submit/layer). Else fall back to host top-k (two submits/layer).
+        let (gate_dtype, _) = native_parts(&self.layers[0].moe_stacked().expect("stacked").1.gate);
+        let gpu_route =
+            infr_vulkan::Recorder::native_id_supported(gate_dtype) && mc.n_expert <= 128;
+        let (ids_buf, wts_buf) = if gpu_route {
+            (Some(al(mc.n_used)?), Some(al(mc.n_used)?))
+        } else {
+            (None, None)
+        };
         // split-K decode attention scratch (parallelize the KV reduction at depth)
         let chunk = (kv_len / 32).clamp(64, 512);
         let use_split = kv_len > chunk;
@@ -3585,56 +3592,111 @@ impl Llama {
                 ne,
                 mc.n_expert,
             );
-            rec.finish().map_err(|e| anyhow!("{e}"))?;
 
-            // top-k expert selection on host (the one unavoidable readback: n_expert floats).
-            let mut lb = vec![0u8; mc.n_expert * 4];
-            self.be
-                .download(logits.as_ref(), &mut lb)
-                .map_err(|e| anyhow!("{e}"))?;
-            let (idx, weights) = moe_topk(bytemuck::cast_slice(&lb), &mc);
-
-            // recorder 2: selected experts' FFN, accumulated into the resident hidden on the GPU.
-            // Each expert is addressed by element offset into the stacked role buffer.
-            let rec2 = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
-            for (ki, &e) in idx.iter().enumerate() {
-                rec_linear_expert(
-                    &rec2,
-                    &st.gate,
-                    e,
-                    st.stride,
-                    hn2.as_ref(),
-                    g.as_ref(),
-                    1,
-                    ne,
-                    mc.n_ff_exp,
+            if let (Some(ids), Some(wts)) = (&ids_buf, &wts_buf) {
+                // Fully GPU-resident: top-k on the GPU writes expert ids + weights to VRAM, then the
+                // selected experts' FFN (id-indexed gather of the stacked weights) accumulates into
+                // hidden — all in this one recorder. No readback, one submit/layer.
+                rec.moe_topk(
+                    logits.as_ref(),
+                    ids.as_ref(),
+                    wts.as_ref(),
+                    mc.n_expert,
+                    mc.n_used,
+                    mc.scale,
                 );
-                rec_linear_expert(
-                    &rec2,
-                    &st.up,
-                    e,
-                    st.stride,
-                    hn2.as_ref(),
-                    u.as_ref(),
-                    1,
-                    ne,
-                    mc.n_ff_exp,
-                );
-                rec2.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), mc.n_ff_exp);
-                rec_linear_expert(
-                    &rec2,
-                    &st.down,
-                    e,
-                    st.stride,
-                    act.as_ref(),
-                    y.as_ref(),
-                    1,
-                    mc.n_ff_exp,
-                    ne,
-                );
-                rec2.add_scaled(y.as_ref(), hidden.as_ref(), weights[ki], ne);
+                let (gd, gb) = native_parts(&st.gate);
+                let (ud, ub) = native_parts(&st.up);
+                let (dd, db) = native_parts(&st.down);
+                for slot in 0..mc.n_used {
+                    rec.linear_native_id(
+                        gd,
+                        gb,
+                        ids.as_ref(),
+                        slot,
+                        st.stride,
+                        hn2.as_ref(),
+                        g.as_ref(),
+                        1,
+                        ne,
+                        mc.n_ff_exp,
+                    );
+                    rec.linear_native_id(
+                        ud,
+                        ub,
+                        ids.as_ref(),
+                        slot,
+                        st.stride,
+                        hn2.as_ref(),
+                        u.as_ref(),
+                        1,
+                        ne,
+                        mc.n_ff_exp,
+                    );
+                    rec.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), mc.n_ff_exp);
+                    rec.linear_native_id(
+                        dd,
+                        db,
+                        ids.as_ref(),
+                        slot,
+                        st.stride,
+                        act.as_ref(),
+                        y.as_ref(),
+                        1,
+                        mc.n_ff_exp,
+                        ne,
+                    );
+                    rec.add_scaled_id(y.as_ref(), wts.as_ref(), slot, hidden.as_ref(), ne);
+                }
+                rec.finish().map_err(|e| anyhow!("{e}"))?;
+            } else {
+                // Fallback (non-id-capable expert format): host top-k between two recorders.
+                rec.finish().map_err(|e| anyhow!("{e}"))?;
+                let mut lb = vec![0u8; mc.n_expert * 4];
+                self.be
+                    .download(logits.as_ref(), &mut lb)
+                    .map_err(|e| anyhow!("{e}"))?;
+                let (idx, weights) = moe_topk(bytemuck::cast_slice(&lb), &mc);
+                let rec2 = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+                for (ki, &e) in idx.iter().enumerate() {
+                    rec_linear_expert(
+                        &rec2,
+                        &st.gate,
+                        e,
+                        st.stride,
+                        hn2.as_ref(),
+                        g.as_ref(),
+                        1,
+                        ne,
+                        mc.n_ff_exp,
+                    );
+                    rec_linear_expert(
+                        &rec2,
+                        &st.up,
+                        e,
+                        st.stride,
+                        hn2.as_ref(),
+                        u.as_ref(),
+                        1,
+                        ne,
+                        mc.n_ff_exp,
+                    );
+                    rec2.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), mc.n_ff_exp);
+                    rec_linear_expert(
+                        &rec2,
+                        &st.down,
+                        e,
+                        st.stride,
+                        act.as_ref(),
+                        y.as_ref(),
+                        1,
+                        mc.n_ff_exp,
+                        ne,
+                    );
+                    rec2.add_scaled(y.as_ref(), hidden.as_ref(), weights[ki], ne);
+                }
+                rec2.finish().map_err(|e| anyhow!("{e}"))?;
             }
-            rec2.finish().map_err(|e| anyhow!("{e}"))?;
         }
         kv.kv.len += 1;
 
@@ -4440,6 +4502,14 @@ fn silu(x: f32) -> f32 {
 }
 
 /// Dispatch a [`Wt`] linear (`y = x·Wᵀ`) into a recorder, picking the f16 / quant / native op.
+/// The (dtype, buffer) of a Native weight — for the stacked MoE expert dispatch (native-only).
+fn native_parts(w: &Wt) -> (infr_core::DType, &dyn Buffer) {
+    match w {
+        Wt::Native { buf, dtype } => (*dtype, buf.as_ref()),
+        _ => unreachable!("stacked MoE experts are native-only"),
+    }
+}
+
 /// Dispatch a stacked MoE expert's linear (`y = x·W_eᵀ`): the weight is `expert * stride` elements
 /// into the role's stacked Native buffer. Stacked experts are native-only (see [`load_moe`]).
 #[allow(clippy::too_many_arguments)]

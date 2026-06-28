@@ -183,6 +183,21 @@ fn main() {
             "native_q8_0_res",
             &["-DFMT_Q8_0", "-DUSE_RES"],
         ),
+        // Id-indexed native GEMVs for GPU-resident MoE decode (expert chosen from a GPU buffer): one
+        // .spv per affine quant format experts are stored in. Codebook/grid formats fall back to the
+        // host-top-k path, so they're omitted here.
+        ("native_gemv_id", "native_id_q8_0", &["-DFMT_Q8_0"]),
+        ("native_gemv_id", "native_id_q4_0", &["-DFMT_Q4_0"]),
+        ("native_gemv_id", "native_id_q4_1", &["-DFMT_Q4_1"]),
+        ("native_gemv_id", "native_id_q5_0", &["-DFMT_Q5_0"]),
+        ("native_gemv_id", "native_id_q5_1", &["-DFMT_Q5_1"]),
+        ("native_gemv_id", "native_id_q2k", &["-DFMT_Q2K"]),
+        ("native_gemv_id", "native_id_q3k", &["-DFMT_Q3K"]),
+        ("native_gemv_id", "native_id_q4k", &["-DFMT_Q4K"]),
+        ("native_gemv_id", "native_id_q5k", &["-DFMT_Q5K"]),
+        ("native_gemv_id", "native_id_q6k", &["-DFMT_Q6K"]),
+        ("moe_topk", "moe_topk", &[]),
+        ("add_scaled_id", "add_scaled_id", &[]),
         // Native-block prefill GEMMs: one .spv per quant format (coopmat tiled, no residual).
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_q4_0", &["-DFMT_Q4_0"]),

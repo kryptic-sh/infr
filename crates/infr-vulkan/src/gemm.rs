@@ -82,6 +82,46 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
     })
 }
 
+/// SPIR-V for the id-indexed native GEMV (expert chosen from a GPU buffer). One specialization per
+/// affine quant format; `None` for formats without an id variant (caller falls back to host top-k).
+pub(crate) fn native_id_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q8_0 => v!("native_id_q8_0"),
+        Q4_0 => v!("native_id_q4_0"),
+        Q4_1 => v!("native_id_q4_1"),
+        Q5_0 => v!("native_id_q5_0"),
+        Q5_1 => v!("native_id_q5_1"),
+        Q2K => v!("native_id_q2k"),
+        Q3K => v!("native_id_q3k"),
+        Q4K => v!("native_id_q4k"),
+        Q5K => v!("native_id_q5k"),
+        Q6K => v!("native_id_q6k"),
+        _ => return None,
+    })
+}
+/// SPIR-V for the GPU MoE router top-k.
+pub(crate) fn moe_topk_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the indexed axpy (`acc += wts[slot]*x`).
+pub(crate) fn add_scaled_id_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
 /// SPIR-V for the native-block prefill GEMM (`C=A·Wᵀ`, raw GGUF blocks dequantized in-shader via the
 /// coopmat tiled kernel). One specialization per quant format; `None` for unsupported dtypes.
 pub(crate) fn native_gemm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {

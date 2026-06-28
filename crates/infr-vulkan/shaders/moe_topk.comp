@@ -1,0 +1,52 @@
+#version 460
+// MoE router top-k on the GPU (one workgroup, 128 lanes): softmax-renormalized top-`n_used` over
+// `n_expert` logits → selected expert ids + weights, all in VRAM. Mirrors the host `moe_topk`
+// (max-shift, top-k by logit, renorm over the selected set, × routing scale) so an on-GPU router can
+// drive the expert matmuls with no host round-trip. Parallel tree-reduce argmax per pick so the
+// kernel doesn't drain the GPU to one lane (n_expert ≤ 128).
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n_expert; uint n_used; float scale; } pc;
+layout(binding = 0) readonly buffer LB { float logits[]; };
+layout(binding = 1) buffer IB { uint ids[]; };
+layout(binding = 2) writeonly buffer WB { float wts[]; };
+
+shared float sval[128];
+shared uint sidx[128];
+shared float slog[128];
+shared uint spick[128];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    slog[t] = (t < pc.n_expert) ? logits[t] : -1e30;
+    spick[t] = 0u;
+    barrier();
+    float lmax = -1e30; // thread 0 captures the global max at the first (unexcluded) pick
+    for (uint k = 0u; k < pc.n_used; k++) {
+        sval[t] = (spick[t] == 0u) ? slog[t] : -1e30;
+        sidx[t] = t;
+        barrier();
+        // tree-reduce argmax; strict > keeps the lower index on ties (matches the host's stable sort)
+        for (uint s = 64u; s > 0u; s /= 2u) {
+            if (t < s && sval[t + s] > sval[t]) {
+                sval[t] = sval[t + s];
+                sidx[t] = sidx[t + s];
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            uint best = sidx[0];
+            ids[k] = best;
+            spick[best] = 1u;
+            if (k == 0u) { lmax = sval[0]; }
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        float wsum = 0.0;
+        for (uint k = 0u; k < pc.n_used; k++) { wsum += exp(slog[ids[k]] - lmax); }
+        wsum = max(wsum, 1e-20);
+        for (uint k = 0u; k < pc.n_used; k++) {
+            wts[k] = exp(slog[ids[k]] - lmax) / wsum * pc.scale;
+        }
+    }
+}

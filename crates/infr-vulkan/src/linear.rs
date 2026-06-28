@@ -27,6 +27,25 @@ use super::{as_vk_buf, be, VulkanBackend};
 // output element, 64 threads stride K, tree-reduce.
 //
 /// Return the static kernel name for a native-block GEMV (Phase 0-2).
+/// Kernel cache name for the id-indexed native GEMV (one per affine quant format); `None` for
+/// formats without an id variant.
+pub fn native_id_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q8_0 => "native_id_q8_0",
+        Q4_0 => "native_id_q4_0",
+        Q4_1 => "native_id_q4_1",
+        Q5_0 => "native_id_q5_0",
+        Q5_1 => "native_id_q5_1",
+        Q2K => "native_id_q2k",
+        Q3K => "native_id_q3k",
+        Q4K => "native_id_q4k",
+        Q5K => "native_id_q5k",
+        Q6K => "native_id_q6k",
+        _ => return None,
+    })
+}
+
 pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static str {
     use infr_core::DType::*;
     match (dtype, residual) {

@@ -1535,6 +1535,99 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Whether the id-indexed native GEMV (GPU-resident MoE routing) supports this expert format.
+    pub fn native_id_supported(dtype: infr_core::DType) -> bool {
+        crate::linear::native_id_kernel_name(dtype).is_some()
+    }
+
+    /// GPU MoE router top-k: softmax-renormalized top-`n_used` over `logits[n_expert]` → selected
+    /// expert `ids` (u32) + `wts` (f32), all in VRAM (no host round-trip). `scale` = routing scale.
+    pub fn moe_topk(
+        &self,
+        logits: &dyn Buffer,
+        ids: &dyn Buffer,
+        wts: &dyn Buffer,
+        n_expert: usize,
+        n_used: usize,
+        scale: f32,
+    ) {
+        let k = self
+            .be
+            .kernel("moe_topk", crate::gemm::moe_topk_spv(), 3, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&scale.to_ne_bytes());
+        // ids is read-modify-write (exclusion scan); bind it as an output alongside wts.
+        self.dispatch(
+            k,
+            &[Self::vkb(logits), Self::vkb(ids), Self::vkb(wts)],
+            2,
+            &push,
+            1,
+        );
+    }
+
+    /// Id-indexed native-block GEMV `y = x · W[ids[slot]]ᵀ` from a stacked expert tensor (element
+    /// stride per expert). Lets GPU-resident MoE decode pick the expert from a GPU buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_id(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        ids: &dyn Buffer,
+        slot: usize,
+        stride: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("lm_head");
+        let name = crate::linear::native_id_kernel_name(dtype).expect("native id kernel");
+        let spv = crate::gemm::native_id_build_spv(dtype).expect("native id spv");
+        let k = self.be.kernel(name, spv, 4, 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(slot as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(stride as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(ids), Self::vkb(y)],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
+    /// `acc += wts[slot] * x` (indexed axpy) — the scale is read from a GPU buffer (the on-GPU router
+    /// weights), so the weighted MoE expert accumulate needs no host scale.
+    pub fn add_scaled_id(
+        &self,
+        x: &dyn Buffer,
+        wts: &dyn Buffer,
+        slot: usize,
+        acc: &dyn Buffer,
+        n: usize,
+    ) {
+        let k = self
+            .be
+            .kernel("add_scaled_id", crate::gemm::add_scaled_id_spv(), 3, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(slot as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(wts), Self::vkb(acc)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
     /// `acc += scale * x` (axpy), in place into `acc`. Accumulates weighted MoE expert outputs into
     /// the resident hidden state on the GPU (chained across experts via WAW barriers on `acc`).
     pub fn add_scaled(&self, x: &dyn Buffer, acc: &dyn Buffer, scale: f32, n: usize) {

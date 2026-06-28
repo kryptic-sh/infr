@@ -263,6 +263,7 @@ fn load_f32(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
                 .map(|g| sc[g] * qv[g] as f32 + mn[g])
                 .collect()
         }
+        d if is_codebook_quant(d) => dequant_codebook(d, bytes),
         other => {
             bail!("unsupported dtype {other:?} for {name} (host load wants F16/F32/BF16/quant)")
         }
@@ -616,6 +617,104 @@ fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>,
     (qv, sc, mn)
 }
 
+// ─── codebook (non-affine) dequant ───────────────────────────────────────────
+
+/// IQ4_NL / IQ4_XS 16-entry signed-integer codebook.
+/// Ref: llama.cpp ggml-common.h `kvalues_iq4nl` (l.1110)
+const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// True for codebook quants (IQ*/TQ*/fp4) that go host-dequant → f16, NOT the GPU affine path.
+fn is_codebook_quant(d: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(
+        d,
+        Iq1S | Iq1M
+            | Iq2Xxs
+            | Iq2Xs
+            | Iq2S
+            | Iq3Xxs
+            | Iq3S
+            | Iq4Nl
+            | Iq4Xs
+            | Tq1_0
+            | Tq2_0
+            | Mxfp4
+            | Nvfp4
+    )
+}
+
+/// Dequantize a codebook (non-affine) quant to f32. Ported from llama.cpp `ggml-quants.c`.
+/// Returns a `Vec<f32>` of length `numel` in natural tensor order.
+fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
+    use infr_core::DType::*;
+    match dtype {
+        // ── IQ4_NL: y = d * kvalues_iq4nl[q4], QK4_NL=32 ───────────────────────
+        // Block: [half d][uint8 qs[16]], 18 bytes
+        // Ref: llama.cpp dequantize_row_iq4_nl (ggml-quants.c l.2653)
+        Iq4Nl => {
+            // Ref: llama.cpp dequantize_row_iq4_nl (ggml-quants.c l.2653)
+            // y[j]    = d * kv[qs[j] & 0xF]  for j in 0..16 → elements  0..15
+            // y[j+16] = d * kv[qs[j] >>  4]  for j in 0..16 → elements 16..31
+            let bpb = 18usize;
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 32];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = rdf16(blk);
+                let qs = &blk[2..18];
+                let base = b * 32;
+                for j in 0..16 {
+                    out[base + j] = d * KVALUES_IQ4NL[(qs[j] & 0xF) as usize] as f32;
+                    out[base + j + 16] = d * KVALUES_IQ4NL[(qs[j] >> 4) as usize] as f32;
+                }
+            }
+            out
+        }
+        // ── IQ4_XS: y = d*(ls-32) * kvalues_iq4nl[q4], QK_K=256 ────────────────
+        // Block: [half d][uint16 scales_h][uint8 scales_l[4]][uint8 qs[128]], 136 bytes
+        // Ref: llama.cpp dequantize_row_iq4_xs (ggml-quants.c l.2671)
+        Iq4Xs => {
+            // Ref: llama.cpp dequantize_row_iq4_xs (ggml-quants.c l.2671)
+            // Block: [half d][uint16 scales_h][uint8 scales_l[4]][uint8 qs[128]], 136 bytes
+            // 8 sub-blocks of 32 elements each; ls = 6-bit scale per sub-block
+            // y[j+0]  = dl * kv[qs[j] & 0xF] for j in 0..16 → elements  0..15 of sub-block
+            // y[j+16] = dl * kv[qs[j] >>  4] for j in 0..16 → elements 16..31 of sub-block
+            let bpb = 136usize;
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let d = rdf16(blk);
+                let scales_h = u16::from_le_bytes(blk[2..4].try_into().unwrap());
+                let scales_l = &blk[4..8];
+                let qs = &blk[8..136];
+                let base = b * 256;
+                let mut qoff = 0usize;
+                let mut outoff = 0usize;
+                for ib in 0..8usize {
+                    // 6-bit ls: lower 4 bits from scales_l, upper 2 bits from scales_h
+                    let lo = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF) as u32;
+                    let hi = ((scales_h >> (2 * ib)) & 3) as u32;
+                    let ls = lo | (hi << 4);
+                    let dl = d * (ls as i32 - 32) as f32;
+                    for j in 0..16 {
+                        out[base + outoff + j] =
+                            dl * KVALUES_IQ4NL[(qs[qoff + j] & 0xF) as usize] as f32;
+                        out[base + outoff + j + 16] =
+                            dl * KVALUES_IQ4NL[(qs[qoff + j] >> 4) as usize] as f32;
+                    }
+                    qoff += 16;
+                    outoff += 32;
+                }
+            }
+            out
+        }
+        other => unimplemented!("codebook dequant for {other:?} not yet implemented"),
+    }
+}
+
 /// True for types that go through the GPU in-kernel affine dequant path (`Wt::Q`).
 /// All affine quants: legacy round quants + k-quants (Q2K–Q6K).
 /// Codebook quants (IQ*/TQ*/fp4) are NOT included — they go host-dequant → f16.
@@ -679,6 +778,9 @@ fn pack_unified(
 }
 
 /// Upload a projection weight, keeping quantized weights quantized in-VRAM (else convert to f16).
+/// Affine quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q6K) → `Wt::Q` (GPU in-kernel dequant).
+/// Codebook quants (IQ*/TQ*/fp4) → host dequant → f16 → `Wt::F16`.
+/// Float types (F16/F32/BF16) → `Wt::F16` directly.
 fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
     let info = g
         .tensors()
@@ -687,6 +789,7 @@ fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
         .ok_or_else(|| anyhow!("tensor not found: {name}"))?
         .clone();
     if is_quant(info.dtype) {
+        // Affine quants: GPU in-kernel dequant path
         let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
         let (bits, blk) = quant_params(info.dtype);
         let (qv, sc, mn) = dequant_unified(info.dtype, bytes);
@@ -698,6 +801,15 @@ fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
             bits,
             blk_shift: blk.trailing_zeros(),
         })
+    } else if is_codebook_quant(info.dtype) {
+        // Codebook quants: host dequant to f32, then upload as f16
+        let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+        let f32_vals = dequant_codebook(info.dtype, bytes);
+        let f16_bytes: Vec<u8> = f32_vals
+            .iter()
+            .flat_map(|&v| f32_to_f16_sat(v).to_bits().to_le_bytes())
+            .collect();
+        Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes)?))
     } else {
         Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes(g, name)?)?))
     }
@@ -848,6 +960,27 @@ impl Llama {
                     bits,
                     blk_shift: blk.trailing_zeros(),
                 }
+            } else if gate_dtype.map(is_codebook_quant).unwrap_or(false) {
+                // Codebook quants: host dequant gate+up → f16, fuse into one buffer
+                let dt = gate_dtype.unwrap();
+                let to_f16_bytes = |bytes: &[u8]| -> Vec<u8> {
+                    dequant_codebook(dt, bytes)
+                        .iter()
+                        .flat_map(|&v| f32_to_f16_sat(v).to_bits().to_le_bytes())
+                        .collect()
+                };
+                let gb = g
+                    .tensor_bytes(&p("ffn_gate.weight"))
+                    .map_err(|e| anyhow!("{e}"))?;
+                let ub = g
+                    .tensor_bytes(&p("ffn_up.weight"))
+                    .map_err(|e| anyhow!("{e}"))?;
+                let mut gateup = to_f16_bytes(gb);
+                gateup.extend_from_slice(&to_f16_bytes(ub));
+                Wt::F16(
+                    be.upload_weight_bytes(&gateup)
+                        .map_err(|e| anyhow!("upload wgateup codebook {l}: {e}"))?,
+                )
             } else {
                 let mut gateup = f16_bytes(&g, &p("ffn_gate.weight"))?;
                 gateup.extend_from_slice(&f16_bytes(&g, &p("ffn_up.weight"))?);
@@ -2182,6 +2315,61 @@ fn dequant_to_f32(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
 #[cfg(test)]
 mod dequant_tests {
     use super::*;
+
+    // ── IQ4_NL ──────────────────────────────────────────────────────────────────
+    // Block: [half d][uint8 qs[16]], 32 elements, 18 bytes
+    // y[j] = d * KVALUES_IQ4NL[qs[j] & 0xF]; y[j+16] = d * KVALUES_IQ4NL[qs[j] >> 4]
+    // Reference: llama.cpp dequantize_row_iq4_nl (ggml-quants.c l.2653)
+    #[test]
+    fn iq4nl_single_block() {
+        // d=1.0, qs[0]=0x80 (lo=0, hi=8)
+        // KVALUES_IQ4NL[0] = -127, KVALUES_IQ4NL[8] = 1
+        // y[0] = 1.0 * (-127) = -127.0
+        // y[16] = 1.0 * 1 = 1.0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2] = 0x80; // lo=0→-127, hi=8→1
+        let y = dequant_codebook(infr_core::DType::Iq4Nl, &block);
+        assert_eq!(y.len(), 32);
+        assert!(
+            (y[0] - (-127.0)).abs() < 1e-3,
+            "iq4nl y[0] expected -127.0, got {}",
+            y[0]
+        );
+        assert!(
+            (y[16] - 1.0).abs() < 1e-3,
+            "iq4nl y[16] expected 1.0, got {}",
+            y[16]
+        );
+    }
+
+    // ── IQ4_XS ──────────────────────────────────────────────────────────────────
+    // Block: [half d][uint16 scales_h][uint8 scales_l[4]][uint8 qs[128]], 256 elements, 136 bytes
+    // y = d*(ls-32) * KVALUES_IQ4NL[q4], ls is 6-bit per 32-elem sub-block
+    // Reference: llama.cpp dequantize_row_iq4_xs (ggml-quants.c l.2671)
+    #[test]
+    fn iq4xs_single_block() {
+        // d=1.0, scales: all sub-blocks have ls=32 → dl=d*(32-32)=0 → y=0
+        // Verify: all 256 outputs are 0.0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 136];
+        block[0..2].copy_from_slice(&d_bytes);
+        // scales_h=0, scales_l=[0x00,0x00,0x00,0x00]: all lo=0, all hi=0 → ls=0 → dl=-32
+        // Wait: ls=lo|(hi<<4). With scales_h=0 and scales_l=0, ls=0. dl=1.0*(0-32)=-32.
+        // qs all 0: qs[j]&0xF=0 → KVALUES_IQ4NL[0]=-127; qs[j]>>4=0 → -127
+        // y = -32 * (-127) = 4064.0 (all elements)
+        let y = dequant_codebook(infr_core::DType::Iq4Xs, &block);
+        assert_eq!(y.len(), 256);
+        let expected = -32.0_f32 * KVALUES_IQ4NL[0] as f32; // 4064.0
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 0.5,
+                "iq4xs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
 
     // ── Q2_K ────────────────────────────────────────────────────────────────────
     // Block: [uint8 scales[16]][uint8 qs[64]][half d][half dmin]

@@ -279,8 +279,8 @@ fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> {
 /// Load a named tensor and dequantize it to host f32, returning (data, shape in GGUF ne order
 /// `[in, out]`). The host/CPU-side dequant path — it does NOT load the bulk projection weights for
 /// the GPU (those upload quantized/f16 in-VRAM). It feeds: the host embedding gather, the CPU norm
-/// + SSM recurrence math (qwen35), the `Q35_CPU=1` oracle, and serves as the f32 source we convert
-/// into f16/bf16/quant GPU weights. Survives even with full GPU format coverage.
+/// and SSM recurrence math (qwen35), the `Q35_CPU=1` oracle, and serves as the f32 source we
+/// convert into f16/bf16/quant GPU weights. Survives even with full GPU format coverage.
 fn load_tensor_dequant(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
     let info = g
         .tensors()
@@ -528,7 +528,7 @@ fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>,
                 let tmp = aux[2];
                 aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
                 aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-                aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+                aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
                 aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
                 // Now aux as i8[16] gives decoded 6-bit scales; subtract 32 to get signed scale.
                 let sc6 = |i: usize| -> f32 {
@@ -1132,12 +1132,12 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
                 let mut qs_off = 0usize;
                 let mut qh_off = 0usize;
                 for ib in 0..8usize {
-                    let dl1 = d * (2.0 * ((sc[ib / 2] >> (6 * (ib % 2) + 0)) & 7) as f32 + 1.0);
+                    let dl1 = d * (2.0 * ((sc[ib / 2] >> (6 * (ib % 2))) & 7) as f32 + 1.0);
                     let dl2 = d * (2.0 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 7) as f32 + 1.0);
                     let qh0 = qh_arr[qh_off];
                     let qh1 = qh_arr[qh_off + 1];
                     let idx = [
-                        qs_arr[qs_off + 0] as usize | (((qh0 as usize) << 8) & 0x700),
+                        qs_arr[qs_off] as usize | (((qh0 as usize) << 8) & 0x700),
                         qs_arr[qs_off + 1] as usize | (((qh0 as usize) << 4) & 0x700),
                         qs_arr[qs_off + 2] as usize | (((qh1 as usize) << 8) & 0x700),
                         qs_arr[qs_off + 3] as usize | (((qh1 as usize) << 4) & 0x700),
@@ -2266,7 +2266,7 @@ impl Llama {
                 } => {
                     // u4 → dp4a integer mmq (no per-GEMM dequant; weights stay quantized). q6/q8
                     // keep the f16 warp matmul_proj. Requires k%32, outf%64 (all projections satisfy).
-                    if *bits == 4 && k % 32 == 0 && outf % 64 == 0 && use_mmq {
+                    if *bits == 4 && k.is_multiple_of(32) && outf.is_multiple_of(64) && use_mmq {
                         let (qa, dact, sact) = mmq_bufs.as_ref().unwrap();
                         rec.matmul_proj_mmq(
                             a,
@@ -3570,7 +3570,7 @@ mod gpu_affine_tests {
             .unwrap();
         let upx = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
         be.upload(upx.as_ref(), bytemuck::cast_slice(&x)).unwrap();
-        let by = be.alloc(1 * 4, BufferUsage::Readback).unwrap(); // 1 output row, 1 out feature
+        let by = be.alloc(4, BufferUsage::Readback).unwrap(); // 1 output row, 1 out feature
 
         // rows=1, in_f=numel, out_f=1 → single dot product
         let rec = be.recorder().unwrap();
@@ -4011,7 +4011,7 @@ mod gpu_affine_tests {
             }
         }
         // CPU reference: compute expected outputs using dequant_unified
-        let mut cpu_outputs = vec![0f32; OUT_F];
+        let mut cpu_outputs = [0f32; OUT_F];
         let x: Vec<f32> = (0..IN_F).map(|i| 1.0f32 + i as f32 * 0.001f32).collect();
         for o in 0..OUT_F {
             let w_row_bytes = &w_bytes[o * N_BLOCKS * BLOCK_SZ..(o + 1) * N_BLOCKS * BLOCK_SZ];
@@ -4162,7 +4162,7 @@ mod gpu_affine_tests {
             }
             w_bytes[off + 208..off + 210].copy_from_slice(&d_bits);
         }
-        let mut cpu_outputs = vec![0f32; OUT_F];
+        let mut cpu_outputs = [0f32; OUT_F];
         let x: Vec<f32> = (0..IN_F).map(|i| 1.0f32 + i as f32 * 0.001f32).collect();
         for o in 0..OUT_F {
             let w_row_bytes = &w_bytes[o * N_BLOCKS * BLOCK_SZ..(o + 1) * N_BLOCKS * BLOCK_SZ];

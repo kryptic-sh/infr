@@ -5,8 +5,6 @@
 //! These eager runners (one submit each) are for validation; the single-command-buffer
 //! resident forward (real speedup) reuses the same kernels via record APIs (added next).
 
-use std::ffi::CStr;
-
 use ash::vk;
 
 use infr_core::{
@@ -102,7 +100,7 @@ pub(crate) fn make_compute_kernel_from_spv(
     let pipeline_layout =
         unsafe { device.create_pipeline_layout(&plinfo, None) }.expect("pl layout");
 
-    let entry = CStr::from_bytes_with_nul(b"main\0").unwrap();
+    let entry = c"main";
     let mut req_sz =
         vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(0);
     let mut stage = vk::PipelineShaderStageCreateInfo::default()
@@ -1145,11 +1143,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
-/// Flash-decoding pass 1 (split-K): ONE workgroup per (head, KV-chunk). Computes that chunk's
-/// softmax partial — max `m`, sum `l`, and un-normalized weighted-V `acc[hd]` (relative to `m`) —
-/// for the single decode query. Many chunks → many workgroups → the GPU stays busy at long
-/// context (the non-split kernel used only `nh` workgroups). Combine merges them. `hd<=128`,
-/// `chunk<=1024`. q is `[nh, hd]` (q_len==1).
+// Flash-decoding pass 1 (split-K): ONE workgroup per (head, KV-chunk). Computes that chunk's
+// softmax partial — max `m`, sum `l`, and un-normalized weighted-V `acc[hd]` (relative to `m`) —
+// for the single decode query. Many chunks → many workgroups → the GPU stays busy at long
+// context (the non-split kernel used only `nh` workgroups). Combine merges them. `hd<=128`,
+// `chunk<=1024`. q is `[nh, hd]` (q_len==1).
 // Flash-decoding pass 1 (split-K) is now a GLSL subgroup-reduction kernel: shaders/attn_partial.comp
 // (the old thread-per-key WGSL version had uncoalesced K reads that dominated long-context decode).
 
@@ -1289,7 +1287,7 @@ mod tests {
         let k: Vec<f32> = (0..t * nkv * hd)
             .map(|i| (i as f32 * 0.017).cos())
             .collect();
-        let v: Vec<f32> = (0..t * nkv * hd).map(|i| (i as f32 * 0.011)).collect();
+        let v: Vec<f32> = (0..t * nkv * hd).map(|i| i as f32 * 0.011).collect();
         let got = be.attention(&q, &k, &v, t, nh, nkv, hd).unwrap();
 
         // host reference: causal GQA with standard softmax

@@ -133,7 +133,7 @@ impl Cfg {
 
     /// Attention (vs linear/SSM) layer test: every `full_attn_interval`-th layer is full attention.
     pub fn is_attn_layer(&self, i: usize) -> bool {
-        (i + 1) % self.full_attn_interval == 0
+        (i + 1).is_multiple_of(self.full_attn_interval)
     }
     pub fn num_k_heads(&self) -> usize {
         self.n_group
@@ -692,9 +692,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> Result<String> {
         last = argmax(&logits);
         outs.push(last);
     }
-    Ok(tok
-        .decode(&outs, false)
-        .map_err(|e| anyhow!("decode: {e}"))?)
+    tok.decode(&outs, false).map_err(|e| anyhow!("decode: {e}"))
 }
 
 /// True if the GGUF at `path` is a `qwen35` (Qwen3-Next) model.

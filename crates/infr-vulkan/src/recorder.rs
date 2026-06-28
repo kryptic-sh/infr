@@ -330,7 +330,7 @@ impl<'a> Recorder<'a> {
         // warptile; the extra warps hide W-dequant latency). Wins big for M≥768 (low/mid ctx:
         // 4k+21% 8k+19% 16k+5%); at very small M (32k chunk≈500) its wide N tile still loses to the
         // BN=64 tiled kernel, so gate on M. Also needs N%256.
-        let warp = m >= 768 && n % 256 == 0;
+        let warp = m >= 768 && n.is_multiple_of(256);
         let (name, spv, tiles_n) = if warp {
             ("gemm_proj_warp", crate::gemm::gemm_proj_warp_spv(), n / 256)
         } else {
@@ -459,7 +459,7 @@ impl<'a> Recorder<'a> {
             Self::vkb(y),
         ];
         if let Some(epw) = mmv_epw(bits) {
-            if in_f % epw == 0 {
+            if in_f.is_multiple_of(epw) {
                 // subgroup GEMV: NUM_ROWS outputs/workgroup, one wave32 each (no shared reduction)
                 let name = if bits == 4 {
                     "mul_mat_vec_q4"
@@ -581,7 +581,7 @@ impl<'a> Recorder<'a> {
             Self::vkb(y),
         ];
         if let Some(epw) = mmv_epw(bits) {
-            if in_f % epw == 0 {
+            if in_f.is_multiple_of(epw) {
                 let name = if bits == 4 {
                     "mul_mat_vec_q4_res"
                 } else {
@@ -1021,7 +1021,7 @@ impl<'a> Recorder<'a> {
         let ksplit = kv_pad.div_ceil(n_splits).div_ceil(32) * 32;
         // 8-warp/256-thread PV warptile (BN=128=hd, matches ollama's mul_mm) when hd%128; else the
         // 4-warp/2×2 attn_pv (also handles hd<128, e.g. hd=64). INFR_NO_PV_WARP forces the 4-warp.
-        let pv_warp = hdu % 128 == 0 && std::env::var("INFR_NO_PV_WARP").is_err();
+        let pv_warp = hdu.is_multiple_of(128) && std::env::var("INFR_NO_PV_WARP").is_err();
         let (pv_name, pv_spv, pv_bn) = if pv_warp {
             ("attn_pv_warp", crate::gemm::attn_pv_warp_spv(), 128u32)
         } else {
@@ -1387,7 +1387,7 @@ impl<'a> Recorder<'a> {
         let k2 = self
             .be
             .kernel("attn_combine", ops::ATTN_COMBINE_WGSL, 4, 16);
-        let ntile = if hd % 4 == 0 { 4u32 } else { 1u32 };
+        let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
         let mut p2 = [0u8; 16];
         p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -2176,10 +2176,10 @@ mod tests {
         let blk = 16usize;
         let mut qu = vec![0u32; n * k / 4];
         let scales: Vec<u16> = (0..n * k / blk)
-            .map(|b| half::f16::from_f32(0.02).to_bits())
+            .map(|_b| half::f16::from_f32(0.02).to_bits())
             .collect();
         let mins: Vec<u16> = (0..n * k / blk)
-            .map(|b| half::f16::from_f32(-1.5).to_bits())
+            .map(|_b| half::f16::from_f32(-1.5).to_bits())
             .collect();
         // choose u8 so that scale*u8+min == f16-rounded w (approx): u8 = round((w-min)/scale)
         let mut wq_ref = vec![0f32; n * k];
@@ -2542,11 +2542,11 @@ mod tests {
 
         let norm = rmsnorm_cpu(&hidden, &nw, eps);
         let mut max_err = 0f32;
-        for f in 0..nff {
+        for (f, &got_f) in got.iter().take(nff).enumerate() {
             let g = dot(&wgu, f, ne, &norm);
             let u = dot(&wgu, nff + f, ne, &norm);
             let want = (g / (1.0 + (-g).exp())) * u;
-            max_err = max_err.max((got[f] - want).abs());
+            max_err = max_err.max((got_f - want).abs());
         }
         println!("ffn_in max_err = {max_err:e}");
         assert!(max_err < 1e-4, "ffn_in mismatch: {max_err}");
@@ -2625,15 +2625,15 @@ mod tests {
             let norm = rmsnorm_cpu(&hidden[r * ne..(r + 1) * ne], &nw, eps);
             let abs = pos + r; // per-row absolute position (the prefill correctness check)
             let mut wq_r = vec![0f32; q_dim];
-            for c in 0..q_dim {
-                wq_r[c] = dot(&wq, c, ne, &norm);
+            for (c, v) in wq_r.iter_mut().enumerate() {
+                *v = dot(&wq, c, ne, &norm);
             }
             for h in 0..nh {
                 rope_head(&mut wq_r[h * hd..(h + 1) * hd], hd, rope_dim, theta, abs);
             }
             let mut wk_r = vec![0f32; kv_dim];
-            for c in 0..kv_dim {
-                wk_r[c] = dot(&wk, c, ne, &norm);
+            for (c, v) in wk_r.iter_mut().enumerate() {
+                *v = dot(&wk, c, ne, &norm);
             }
             for h in 0..nkv {
                 rope_head(&mut wk_r[h * hd..(h + 1) * hd], hd, rope_dim, theta, abs);

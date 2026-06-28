@@ -4,6 +4,13 @@ use infr_core::backend::BufferUsage;
 use infr_core::Backend;
 use infr_vulkan::VulkanBackend;
 
+/// A unified quant weight on the GPU: (quants, scales, mins) buffers.
+type QWeight = (
+    Box<dyn infr_core::backend::Buffer>,
+    Box<dyn infr_core::backend::Buffer>,
+    Box<dyn infr_core::backend::Buffer>,
+);
+
 fn main() {
     let be = VulkanBackend::new().unwrap();
     // (label, k, n) — q/k/v/o/gate+up(fused)/down for qwen3-0.6b
@@ -106,11 +113,7 @@ fn main() {
             .unwrap();
         let reps = 50;
         let pj = |rec: &infr_vulkan::Recorder,
-                  w: &(
-            Box<dyn infr_core::backend::Buffer>,
-            Box<dyn infr_core::backend::Buffer>,
-            Box<dyn infr_core::backend::Buffer>,
-        ),
+                  w: &QWeight,
                   c: &dyn infr_core::backend::Buffer,
                   n: usize| {
             rec.matmul_proj(

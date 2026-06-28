@@ -182,7 +182,7 @@ impl VulkanBackend {
         k: usize,
         n: usize,
     ) -> Result<Vec<f32>> {
-        assert!(m % 16 == 0 && n % 16 == 0 && k % 16 == 0);
+        assert!(m.is_multiple_of(16) && n.is_multiple_of(16) && k.is_multiple_of(16));
         let kern = self.kernel_spv("gemm_coopmat", gemm_spv(), 3, 12);
         self.run_gemm(kern, a, b, m, k, n, (n / 16) as u32, (m / 16) as u32)
     }
@@ -196,7 +196,7 @@ impl VulkanBackend {
         k: usize,
         n: usize,
     ) -> Result<Vec<f32>> {
-        assert!(m % 128 == 0 && n % 128 == 0 && k % 16 == 0);
+        assert!(m.is_multiple_of(128) && n.is_multiple_of(128) && k.is_multiple_of(16));
         let kern = self.kernel_spv_sg("gemm_warp", gemm_warp_spv(), 3, 12, 32);
         self.run_gemm(kern, a, b, m, k, n, (n / 128) as u32, (m / 128) as u32)
     }
@@ -212,7 +212,7 @@ impl VulkanBackend {
         n: usize,
     ) -> Result<Vec<f32>> {
         assert!(
-            m % 64 == 0 && n % 64 == 0 && k % 32 == 0,
+            m.is_multiple_of(64) && n.is_multiple_of(64) && k.is_multiple_of(32),
             "tiled coopmat GEMM needs m,n %64 and k %32 (got {m},{k},{n})"
         );
         let kern = self.kernel_spv_sg("gemm_coopmat_tiled", gemm_tiled_spv(), 3, 12, 32);

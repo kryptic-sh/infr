@@ -6,7 +6,6 @@
 //!
 //! WGSL → SPIR-V via naga, same pattern as `matmul.rs`.
 
-use std::ffi::CStr;
 use std::sync::OnceLock;
 
 use ash::vk;
@@ -400,7 +399,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
-/// Per-format dequant function snippets. Each defines `fn dq(g: u32) -> f32`.
+// Per-format dequant function snippets. Each defines `fn dq(g: u32) -> f32`.
 
 /// Q8_0: [f16 d][i8 qs[32]] = 34 bytes, 32 elements. y = d * qs[j] (signed).
 const DQ_Q8_0: &str = r#"
@@ -1221,7 +1220,7 @@ pub(crate) fn create_linear_kernel(device: &ash::Device) -> LinearKernel {
     }
     .expect("create linear pipeline layout");
 
-    let entry = CStr::from_bytes_with_nul(b"main\0").unwrap();
+    let entry = c"main";
     let stage = vk::PipelineShaderStageCreateInfo::default()
         .stage(vk::ShaderStageFlags::COMPUTE)
         .module(shader)

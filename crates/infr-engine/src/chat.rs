@@ -183,10 +183,7 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let mut search_from = 0usize;
     let mut spans: Vec<(usize, usize)> = Vec::new();
 
-    loop {
-        let Some(open_pos) = text[search_from..].find(TC_OPEN) else {
-            break;
-        };
+    while let Some(open_pos) = text[search_from..].find(TC_OPEN) {
         let open_abs = search_from + open_pos;
         let body_start = open_abs + TC_OPEN.len();
         let Some(close_rel) = text[body_start..].find(TC_CLOSE) else {

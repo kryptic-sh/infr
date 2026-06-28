@@ -439,11 +439,9 @@ mod tests {
         buf.extend_from_slice(s.as_bytes());
     }
 
-    /// Build a minimal valid GGUF v3 file in memory:
-    ///   - 2 metadata KVs:
-    ///       "test.block_count"    = UINT32 30
-    ///       "general.architecture" = STRING "diffusion-gemma"
-    ///   - 1 tensor: "tensor0", F32, shape [4], 16 bytes of zeros
+    /// Build a minimal valid GGUF v3 file in memory: 2 metadata KVs
+    /// (`test.block_count` = UINT32 30, `general.architecture` = STRING "diffusion-gemma")
+    /// and 1 tensor (`tensor0`, F32, shape [4], 16 bytes of zeros).
     fn build_fixture() -> Vec<u8> {
         let mut b: Vec<u8> = Vec::new();
 
@@ -471,7 +469,7 @@ mod tests {
         push_u64(&mut b, 0); // offset = 0
 
         // pad to 32-byte alignment
-        while b.len() % 32 != 0 {
+        while !b.len().is_multiple_of(32) {
             b.push(0);
         }
 

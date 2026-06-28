@@ -6,7 +6,6 @@
 //! Kernel: C[M,N] = A[M,K] × B[K,N].  One invocation per output element; workgroup 16×16×1.
 //! Push constants carry M, N, K as `u32` (12 bytes total).
 
-use std::ffi::CStr;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -151,7 +150,7 @@ impl VulkanBackend {
         .map_err(|e| be(format!("create_pipeline_layout: {e}")))?;
 
         // ── compute pipeline ───────────────────────────────────────────────────
-        let entry_name = CStr::from_bytes_with_nul(b"main\0").unwrap();
+        let entry_name = c"main";
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
@@ -255,8 +254,8 @@ impl VulkanBackend {
         };
 
         // ── record + dispatch ──────────────────────────────────────────────────
-        let groups_x = (m as u32 + WG - 1) / WG;
-        let groups_y = (n as u32 + WG - 1) / WG;
+        let groups_x = (m as u32).div_ceil(WG);
+        let groups_y = (n as u32).div_ceil(WG);
 
         // Clone Arc so the closure owns shared state independently.
         let shared = std::sync::Arc::clone(&self.shared);

@@ -5,6 +5,9 @@
 //! `VK_KHR_cooperative_matrix`, `shaderFloat16`, `VK_KHR_16bit_storage`,
 //! `VK_KHR_shader_subgroup_extended_types`. See PLAN.md.
 #![allow(dead_code)]
+// GPU kernel record/dispatch APIs bind many distinct buffers (weights, scales, activations,
+// scratch) — wide signatures are inherent here, not a refactor smell.
+#![allow(clippy::too_many_arguments)]
 
 mod gemm;
 pub mod linear;

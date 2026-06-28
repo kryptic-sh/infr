@@ -125,6 +125,51 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
+/// bf16-weight GEMV `y = x·Wᵀ`. WGSL has no native bf16, so weights are stored as a flat u16 stream
+/// packed 2-per-u32; each is unpacked losslessly to f32 by `bitcast(bf16_bits << 16)` (bf16 IS the
+/// top 16 bits of an f32). Same cooperative-over-K layout as `LINEAR_F16_WGSL`; dispatch `rows*out_f`
+/// workgroups. Element addressing is global (word = elem/2, half = elem&1) so rows need not be u32-
+/// aligned even when `in_f` is odd.
+pub(crate) const LINEAR_BF16_WGSL: &str = r#"
+struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
+var<immediate> pc: PushConstants;
+
+@group(0) @binding(0) var<storage, read>       w_buf: array<u32>; // [out, in] bf16 packed 2/u32
+@group(0) @binding(1) var<storage, read>       x_buf: array<f32>; // [rows, in]
+@group(0) @binding(2) var<storage, read_write> y_buf: array<f32>; // [rows, out]
+
+var<workgroup> red: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let unit = wid.x;            // = r * out_f + o
+    let o = unit % pc.out_f;
+    let r = unit / pc.out_f;
+    let t = lid.x;
+    let wbase = o * pc.in_f;
+    let xbase = r * pc.in_f;
+    var acc: f32 = 0.0;
+    for (var i: u32 = t; i < pc.in_f; i = i + 64u) {
+        let gi = wbase + i;                                  // global element index
+        let word = w_buf[gi >> 1u];
+        var bits16: u32 = word & 0xffffu;
+        if ((gi & 1u) == 1u) { bits16 = word >> 16u; }
+        acc = acc + bitcast<f32>(bits16 << 16u) * x_buf[xbase + i];
+    }
+    red[t] = acc;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if stride == 0u { break; }
+        if t < stride { red[t] = red[t] + red[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if t == 0u { y_buf[unit] = red[0]; }
+}
+"#;
+
 /// Unified quantized-weight dequant GEMV `y = x·Wᵀ` (cooperative-over-K, like `LINEAR_F16_WGSL`).
 /// ALL supported quants repack at load into one form: `quants` = index per element packed at
 /// `pc.bits` (4 → 8/u32 for Q4, 8 → 4/u32 for Q5/Q6/Q8), `scales`/`mins` = one f16 each per
@@ -378,6 +423,22 @@ impl VulkanBackend {
         self.upload_weight_bytes(bytemuck::cast_slice(&f16))
     }
 
+    /// Upload an `[out, in]` weight as bf16 (truncate-round of f32; bf16 is the top 16 bits of f32).
+    /// Read back losslessly to f32 in-shader by `LINEAR_BF16_WGSL`. Preserves f32's exponent range
+    /// (unlike f16), so it's the correct GPU storage for bf16-source tensors that would overflow f16.
+    pub fn upload_weight_bf16(&self, data: &[f32]) -> Result<Box<dyn Buffer>> {
+        let bf16: Vec<u16> = data
+            .iter()
+            .map(|&x| {
+                // round-to-nearest-even on the f32→bf16 truncation
+                let bits = x.to_bits();
+                let round = 0x7fffu32 + ((bits >> 16) & 1);
+                ((bits.wrapping_add(round)) >> 16) as u16
+            })
+            .collect();
+        self.upload_weight_bytes(bytemuck::cast_slice(&bf16))
+    }
+
     /// Upload raw weight bytes (already in the target dtype) to a persistent device buffer.
     /// Use for f16 GGUF tensors to skip the f16→f32→f16 round-trip.
     pub fn upload_weight_bytes(&self, bytes: &[u8]) -> Result<Box<dyn Buffer>> {
@@ -535,6 +596,61 @@ mod tests {
         }
         for (g, w) in y.iter().zip(want.iter()) {
             assert!((g - w).abs() < 1e-3, "{g} vs {w}");
+        }
+    }
+
+    // CPU reference GEMV for the f16/bf16 eager-path tests (odd in_f exercises bf16 packing).
+    fn cpu_gemv(w: &[f32], x: &[f32], rows: usize, in_f: usize, out_f: usize) -> Vec<f32> {
+        let mut y = vec![0.0f32; rows * out_f];
+        for r in 0..rows {
+            for o in 0..out_f {
+                let mut acc = 0.0;
+                for i in 0..in_f {
+                    acc += x[r * in_f + i] * w[o * in_f + i];
+                }
+                y[r * out_f + o] = acc;
+            }
+        }
+        y
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn linear_f16_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        let (rows, in_f, out_f) = (2usize, 70usize, 5usize);
+        let w: Vec<f32> = (0..out_f * in_f)
+            .map(|i| (i as f32 % 9.0) * 0.05 - 0.2)
+            .collect();
+        let x: Vec<f32> = (0..rows * in_f).map(|i| (i as f32 % 7.0) * 0.03).collect();
+        let wbuf = be.upload_weight_f16(&w).unwrap();
+        let _ = be.linear_f16(wbuf.as_ref(), &x, rows, in_f, out_f).unwrap();
+        let y = be.linear_f16(wbuf.as_ref(), &x, rows, in_f, out_f).unwrap();
+        for (g, c) in y.iter().zip(cpu_gemv(&w, &x, rows, in_f, out_f).iter()) {
+            assert!((g - c).abs() < 1e-2, "{g} vs {c}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn linear_bf16_matches_cpu() {
+        let be = VulkanBackend::new().unwrap();
+        // in_f odd → rows are NOT u32-aligned in the packed bf16 stream (exercises global addressing)
+        let (rows, in_f, out_f) = (3usize, 65usize, 4usize);
+        let w: Vec<f32> = (0..out_f * in_f)
+            .map(|i| (i as f32 % 11.0) * 0.04 - 0.2)
+            .collect();
+        let x: Vec<f32> = (0..rows * in_f).map(|i| (i as f32 % 5.0) * 0.06).collect();
+        let wbuf = be.upload_weight_bf16(&w).unwrap();
+        let _ = be
+            .linear_bf16(wbuf.as_ref(), &x, rows, in_f, out_f)
+            .unwrap();
+        let y = be
+            .linear_bf16(wbuf.as_ref(), &x, rows, in_f, out_f)
+            .unwrap();
+        // bf16 has 8 mantissa bits → looser tolerance than f16
+        for (g, c) in y.iter().zip(cpu_gemv(&w, &x, rows, in_f, out_f).iter()) {
+            assert!((g - c).abs() < 5e-2, "{g} vs {c}");
         }
     }
 }

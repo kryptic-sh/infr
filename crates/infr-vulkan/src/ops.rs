@@ -9,7 +9,11 @@ use std::ffi::CStr;
 
 use ash::vk;
 
-use infr_core::{backend::BufferUsage, error::Result, Backend};
+use infr_core::{
+    backend::{Buffer, BufferUsage},
+    error::Result,
+    Backend,
+};
 
 use super::{as_vk_buf, be, VulkanBackend};
 
@@ -293,6 +297,123 @@ impl VulkanBackend {
         let mut out_bytes = vec![0u8; out_len * 4];
         self.download(out.as_ref(), &mut out_bytes)?;
         Ok(bytemuck::cast_slice(&out_bytes).to_vec())
+    }
+
+    /// Eager GEMV against a PERSISTENT weight buffer (binding 0): `y[rows,out] = x[rows,in] · Wᵀ`.
+    /// Unlike `run_kernel`, the weight is not re-uploaded — only the activation x (staging) and y
+    /// (readback). `groups` is the workgroup count (cooperative-over-K kernels dispatch `rows*out`).
+    /// Shared by the f16 / bf16 eager linears; the f32 `linear` keeps its own (thread-per-output)
+    /// path. See module note: one submit per call, for the hybrid (CPU-interleaved) decode path.
+    fn linear_wbuf(
+        &self,
+        k: ComputeKernel,
+        groups: u32,
+        w_buf: &dyn Buffer,
+        x: &[f32],
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) -> Result<Vec<f32>> {
+        assert_eq!(x.len(), rows * in_f, "x must be rows*in");
+        let device = self.shared.device.clone();
+        unsafe {
+            device
+                .reset_descriptor_pool(k.desc_pool, vk::DescriptorPoolResetFlags::empty())
+                .map_err(|e| be(format!("reset pool: {e}")))?;
+        }
+        let set = unsafe {
+            device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(k.desc_pool)
+                        .set_layouts(std::slice::from_ref(&k.ds_layout)),
+                )
+                .map_err(|e| be(format!("alloc set: {e}")))?[0]
+        };
+        let x_bytes: &[u8] = bytemuck::cast_slice(x);
+        let buf_x = self.alloc(x_bytes.len().max(4), BufferUsage::Staging)?;
+        let buf_y = self.alloc((rows * out_f * 4).max(4), BufferUsage::Readback)?;
+        self.upload(buf_x.as_ref(), x_bytes)?;
+
+        let vk_bufs = [
+            unsafe { as_vk_buf(w_buf) }.buffer,
+            unsafe { as_vk_buf(buf_x.as_ref()) }.buffer,
+            unsafe { as_vk_buf(buf_y.as_ref()) }.buffer,
+        ];
+        let infos: Vec<vk::DescriptorBufferInfo> = vk_bufs
+            .iter()
+            .map(|&buffer| vk::DescriptorBufferInfo {
+                buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[i..i + 1])
+            })
+            .collect();
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        let shared = std::sync::Arc::clone(&self.shared);
+        self.one_shot(move |cmd| unsafe {
+            shared
+                .device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+            shared.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                k.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            shared.device.cmd_push_constants(
+                cmd,
+                k.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                &push,
+            );
+            shared.device.cmd_dispatch(cmd, groups, 1, 1);
+        })?;
+        let mut y = vec![0u8; rows * out_f * 4];
+        self.download(buf_y.as_ref(), &mut y)?;
+        Ok(bytemuck::cast_slice(&y).to_vec())
+    }
+
+    /// Eager f16-weight GEMV: `w_buf` holds `W[out,in]` as f16 (see [`Self::upload_weight_f16`]).
+    pub fn linear_f16(
+        &self,
+        w_buf: &dyn Buffer,
+        x: &[f32],
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) -> Result<Vec<f32>> {
+        let k = self.kernel("linear_f16_eager", crate::linear::LINEAR_F16_WGSL, 3, 12);
+        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f)
+    }
+
+    /// Eager bf16-weight GEMV: `w_buf` holds `W[out,in]` as bf16 (see [`Self::upload_weight_bf16`]).
+    pub fn linear_bf16(
+        &self,
+        w_buf: &dyn Buffer,
+        x: &[f32],
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) -> Result<Vec<f32>> {
+        let k = self.kernel("linear_bf16_eager", crate::linear::LINEAR_BF16_WGSL, 3, 12);
+        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f)
     }
 
     /// RMSNorm over rows: `y[r,i] = x[r,i] / sqrt(mean(x[r]^2)+eps) * w[i]`.

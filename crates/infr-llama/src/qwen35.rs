@@ -1,12 +1,60 @@
 //! Qwen3.5 / Qwen3.6 (`qwen35`, aka Qwen3-Next): hybrid gated-DeltaNet linear-attention + gated
-//! full-attention. See `docs/QWEN35.md`. This module is a **CPU reference** (correctness first);
-//! the GPU path comes after the math is locked against llama.cpp.
+//! full-attention. See `docs/QWEN35.md`.
+//!
+//! **Hybrid GPU execution (the general infr pattern):** infr has no automatic graph scheduler —
+//! every model's forward is hand-written eager code. So "GPU where a kernel exists, CPU where it
+//! doesn't" is expressed directly: the heavy linear projections run through `VulkanBackend::linear`
+//! (see [`Lin`]), while the ops with no GPU kernel — the SSM depthwise conv, the gated-delta
+//! recurrence, and the hd=256 gated full-attention — stay on the CPU. When we later add those GPU
+//! kernels, each CPU block is swapped for a `be.<op>` call with no structural change. Set
+//! `Q35_CPU=1` to force the pure-CPU path (the correctness oracle, no Vulkan init).
 #![allow(dead_code)] // forward pass is built up incrementally on this loader
 
 use crate::load_f32;
 use anyhow::{anyhow, bail, Context, Result};
-use infr_core::WeightSource;
+use infr_core::backend::Buffer;
+use infr_core::{DType, WeightSource};
 use infr_gguf::Gguf;
+use infr_vulkan::VulkanBackend;
+
+/// GPU weight storage dtype. Chosen from the GGUF source dtype by the shared loader policy
+/// ([`Model::upload_lin`]): quant/F16 → `F16` (dequant once, half the bandwidth — decode is
+/// bandwidth-bound); BF16 → `Bf16` (native, preserves f32 exponent range — no f16 overflow clip);
+/// F32 → `F32` (full precision, the rare large-magnitude tensor). Each maps to a GPU GEMV kernel.
+#[derive(Clone, Copy)]
+enum WDtype {
+    F16,
+    Bf16,
+    F32,
+}
+
+/// A linear-projection weight on whichever device has a kernel for it: GPU (dtype-tagged, the fast
+/// path) or CPU f32 (the fallback / `Q35_CPU=1` oracle). One call site, [`Lin::mul`], hides which.
+/// This is how a hand-written forward gets per-op CPU fallback without a graph scheduler.
+enum Lin {
+    Cpu(Vec<f32>),
+    Gpu { buf: Box<dyn Buffer>, dt: WDtype },
+}
+
+impl Lin {
+    /// `y[out] = W[out,in] · x[in]` (single row). GPU path is a GEMV in the weight's dtype; CPU path
+    /// the naive matvec.
+    fn mul(&self, be: Option<&VulkanBackend>, x: &[f32], in_f: usize, out_f: usize) -> Vec<f32> {
+        match self {
+            Lin::Cpu(w) => matvec(w, in_f, out_f, x),
+            Lin::Gpu { buf, dt } => {
+                let be = be.expect("gpu Lin without backend");
+                let w = buf.as_ref();
+                match dt {
+                    WDtype::F16 => be.linear_f16(w, x, 1, in_f, out_f),
+                    WDtype::Bf16 => be.linear_bf16(w, x, 1, in_f, out_f),
+                    WDtype::F32 => be.linear(w, x, 1, in_f, out_f),
+                }
+                .expect("gpu linear")
+            }
+        }
+    }
+}
 
 /// Parsed `qwen35` hyper-parameters (subset needed for the 0.8B dense model).
 #[derive(Debug, Clone)]
@@ -104,38 +152,39 @@ impl Cfg {
     }
 }
 
-/// A linear (gated DeltaNet) layer's weights, all dequantized to f32.
+/// A linear (gated DeltaNet) layer's weights. Big matmuls are [`Lin`] (GPU/CPU); the small SSM
+/// tensors stay CPU f32 (no GPU kernel — they feed the recurrence, which runs on the CPU).
 struct LinearLayer {
     attn_norm: Vec<f32>, // [n_embd]
-    qkv: Vec<f32>,       // [conv_channels, n_embd]  (out,in)
-    gate: Vec<f32>,      // [d_inner, n_embd]  (z)
+    qkv: Lin,            // [conv_channels, n_embd]  (out,in)
+    gate: Lin,           // [d_inner, n_embd]  (z)
     conv1d: Vec<f32>,    // [conv_channels, d_conv]  (per-channel kernel)
     alpha: Vec<f32>,     // [dt_rank, n_embd]
     beta: Vec<f32>,      // [dt_rank, n_embd]
     a: Vec<f32>,         // [dt_rank]  (= -exp(A_log))
     dt_bias: Vec<f32>,   // [dt_rank]
     ssm_norm: Vec<f32>,  // [head_v_dim]
-    out: Vec<f32>,       // [n_embd, d_inner]
+    out: Lin,            // [n_embd, d_inner]
     post_norm: Vec<f32>, // [n_embd]
-    ffn_gate: Vec<f32>,  // [n_ff, n_embd]
-    ffn_up: Vec<f32>,    // [n_ff, n_embd]
-    ffn_down: Vec<f32>,  // [n_embd, n_ff]
+    ffn_gate: Lin,       // [n_ff, n_embd]
+    ffn_up: Lin,         // [n_ff, n_embd]
+    ffn_down: Lin,       // [n_embd, n_ff]
     n_ff: usize,
 }
 
-/// A full-attention layer's weights.
+/// A full-attention layer's weights. Projections are [`Lin`]; q/k norms stay CPU (per-head, hd=256).
 struct AttnLayer {
     attn_norm: Vec<f32>, // [n_embd]
-    q: Vec<f32>,         // [n_head*head_dim + d_inner(gate), n_embd]
-    k: Vec<f32>,         // [n_kv*head_dim, n_embd]
-    v: Vec<f32>,         // [n_kv*head_dim, n_embd]
+    q: Lin,              // [n_head*head_dim + d_inner(gate), n_embd]
+    k: Lin,              // [n_kv*head_dim, n_embd]
+    v: Lin,              // [n_kv*head_dim, n_embd]
     q_norm: Vec<f32>,    // [head_dim]
     k_norm: Vec<f32>,    // [head_dim]
-    out: Vec<f32>,       // [n_embd, n_head*head_dim]
+    out: Lin,            // [n_embd, n_head*head_dim]
     post_norm: Vec<f32>,
-    ffn_gate: Vec<f32>,
-    ffn_up: Vec<f32>,
-    ffn_down: Vec<f32>,
+    ffn_gate: Lin,
+    ffn_up: Lin,
+    ffn_down: Lin,
     n_ff: usize,
 }
 
@@ -144,25 +193,69 @@ enum Layer {
     Attn(AttnLayer),
 }
 
-/// Full model weights (CPU, f32).
+/// Full model weights. Linear projections live on the GPU (f16) unless `Q35_CPU=1`; the SSM /
+/// attention math stays on the CPU either way (see module docs).
 pub struct Model {
     pub cfg: Cfg,
-    token_embd: Vec<f32>, // [vocab, n_embd]
+    token_embd: Vec<f32>, // [vocab, n_embd] host (embedding gather)
     output_norm: Vec<f32>,
-    lm_head: Vec<f32>, // [vocab, n_embd]
+    lm_head: Lin, // [vocab, n_embd]
     layers: Vec<Layer>,
+    be: Option<VulkanBackend>,
 }
 
 impl Model {
+    /// Shared loader policy: map a GGUF projection tensor to a GPU [`Lin`] in the dtype matching its
+    /// source, or CPU f32 when `be` is `None` (`Q35_CPU=1`). quant/F16 → f16 (dequant once); BF16 →
+    /// native bf16 (range-preserving, round-trips exactly through the f32 host buffer); F32 → f32.
+    /// This is the single place the "correct dtype per source" decision lives.
+    fn upload_lin(g: &Gguf, be: Option<&VulkanBackend>, name: &str) -> Result<Lin> {
+        let w = load_f32(g, name)
+            .map(|x| x.0)
+            .with_context(|| name.to_string())?;
+        let be = match be {
+            Some(b) => b,
+            None => return Ok(Lin::Cpu(w)),
+        };
+        let src = g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype);
+        let up =
+            |r: infr_core::Result<Box<dyn Buffer>>| r.map_err(|e| anyhow!("upload {name}: {e}"));
+        let (buf, dt) = match src {
+            Some(DType::Bf16) => (up(be.upload_weight_bf16(&w))?, WDtype::Bf16),
+            Some(DType::F32) => (up(be.upload_weight(&w))?, WDtype::F32),
+            _ => (up(be.upload_weight_f16(&w))?, WDtype::F16), // quant, F16, others → f16
+        };
+        Ok(Lin::Gpu { buf, dt })
+    }
+
     pub fn load(g: &Gguf) -> Result<Self> {
         let mut cfg = Cfg::from_gguf(g)?;
+        // CPU-only oracle skips Vulkan entirely; otherwise upload the matmul weights to the GPU.
+        let be = if std::env::var("Q35_CPU").is_ok() {
+            None
+        } else {
+            Some(VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?)
+        };
         let (token_embd, te_shape) = load_f32(g, "token_embd.weight")?;
         cfg.vocab = te_shape[1];
         let output_norm = load_f32(g, "output_norm.weight")?.0;
+
+        // Shared dtype policy: load a projection weight to a GPU `Lin` in the dtype matching its
+        // GGUF source (see `upload_lin`), or keep it CPU f32 (`Q35_CPU=1`).
+        let lin = |name: &str| -> Result<Lin> { Self::upload_lin(g, be.as_ref(), name) };
         let lm_head = if g.tensors().iter().any(|t| t.name == "output.weight") {
-            load_f32(g, "output.weight")?.0
+            lin("output.weight")?
         } else {
-            token_embd.clone() // tied
+            // tied embeddings: lm head = token_embd (already dequantized to f32 for the host gather)
+            match &be {
+                Some(be) => Lin::Gpu {
+                    buf: be
+                        .upload_weight_f16(&token_embd)
+                        .map_err(|e| anyhow!("upload lm_head: {e}"))?,
+                    dt: WDtype::F16,
+                },
+                None => Lin::Cpu(token_embd.clone()),
+            }
         };
 
         let mut layers = Vec::with_capacity(cfg.n_layer);
@@ -171,6 +264,7 @@ impl Model {
             let get = |s: &str| -> Result<Vec<f32>> {
                 load_f32(g, &p(s)).map(|x| x.0).with_context(|| p(s))
             };
+            let glin = |s: &str| -> Result<Lin> { lin(&p(s)) };
             let ffn_up_shape = g
                 .tensors()
                 .iter()
@@ -181,34 +275,34 @@ impl Model {
             if cfg.is_attn_layer(i) {
                 layers.push(Layer::Attn(AttnLayer {
                     attn_norm: get("attn_norm.weight")?,
-                    q: get("attn_q.weight")?,
-                    k: get("attn_k.weight")?,
-                    v: get("attn_v.weight")?,
+                    q: glin("attn_q.weight")?,
+                    k: glin("attn_k.weight")?,
+                    v: glin("attn_v.weight")?,
                     q_norm: get("attn_q_norm.weight")?,
                     k_norm: get("attn_k_norm.weight")?,
-                    out: get("attn_output.weight")?,
+                    out: glin("attn_output.weight")?,
                     post_norm: get("post_attention_norm.weight")?,
-                    ffn_gate: get("ffn_gate.weight")?,
-                    ffn_up: get("ffn_up.weight")?,
-                    ffn_down: get("ffn_down.weight")?,
+                    ffn_gate: glin("ffn_gate.weight")?,
+                    ffn_up: glin("ffn_up.weight")?,
+                    ffn_down: glin("ffn_down.weight")?,
                     n_ff,
                 }));
             } else {
                 layers.push(Layer::Linear(LinearLayer {
                     attn_norm: get("attn_norm.weight")?,
-                    qkv: get("attn_qkv.weight")?,
-                    gate: get("attn_gate.weight")?,
+                    qkv: glin("attn_qkv.weight")?,
+                    gate: glin("attn_gate.weight")?,
                     conv1d: get("ssm_conv1d.weight")?,
                     alpha: get("ssm_alpha.weight")?,
                     beta: get("ssm_beta.weight")?,
                     a: get("ssm_a")?,
                     dt_bias: get("ssm_dt.bias")?,
                     ssm_norm: get("ssm_norm.weight")?,
-                    out: get("ssm_out.weight")?,
+                    out: glin("ssm_out.weight")?,
                     post_norm: get("post_attention_norm.weight")?,
-                    ffn_gate: get("ffn_gate.weight")?,
-                    ffn_up: get("ffn_up.weight")?,
-                    ffn_down: get("ffn_down.weight")?,
+                    ffn_gate: glin("ffn_gate.weight")?,
+                    ffn_up: glin("ffn_up.weight")?,
+                    ffn_down: glin("ffn_down.weight")?,
                     n_ff,
                 }));
             }
@@ -219,6 +313,7 @@ impl Model {
             output_norm,
             lm_head,
             layers,
+            be,
         })
     }
 }
@@ -353,24 +448,25 @@ impl Model {
         st.pos += 1;
         // final norm + lm head (only this token)
         let hn = rmsnorm(&hidden, &self.output_norm, c.eps);
-        matvec(&self.lm_head, ne, c.vocab, &hn)
+        self.lm_head.mul(self.be.as_ref(), &hn, ne, c.vocab)
     }
 
     fn ffn(
         &self,
         hidden: &[f32],
         norm: &[f32],
-        gate: &[f32],
-        up: &[f32],
-        down: &[f32],
+        gate: &Lin,
+        up: &Lin,
+        down: &Lin,
         n_ff: usize,
     ) -> Vec<f32> {
         let ne = self.cfg.n_embd;
+        let be = self.be.as_ref();
         let h2 = rmsnorm(hidden, norm, self.cfg.eps);
-        let g = matvec(gate, ne, n_ff, &h2);
-        let u = matvec(up, ne, n_ff, &h2);
+        let g = gate.mul(be, &h2, ne, n_ff);
+        let u = up.mul(be, &h2, ne, n_ff);
         let act: Vec<f32> = g.iter().zip(&u).map(|(a, b)| silu(*a) * b).collect();
-        matvec(down, n_ff, ne, &act)
+        down.mul(be, &act, n_ff, ne)
     }
 
     /// Gated DeltaNet linear-attention mixer (one token).
@@ -385,9 +481,10 @@ impl Model {
         let (ne, kd, vd) = (c.n_embd, c.head_k_dim(), c.head_v_dim());
         let (nk, nv) = (c.num_k_heads(), c.num_v_heads());
         let cc = c.conv_channels();
+        let be = self.be.as_ref();
         let xn = rmsnorm(hidden, &w.attn_norm, c.eps);
-        let qkv = matvec(&w.qkv, ne, cc, &xn); // [6144]
-        let z = matvec(&w.gate, ne, c.d_inner, &xn); // [2048]
+        let qkv = w.qkv.mul(be, &xn, ne, cc); // [6144]  GPU
+        let z = w.gate.mul(be, &xn, ne, c.d_inner); // [2048]  GPU
 
         // causal depthwise conv over the cc channels: out[ch] = Σ_k tap_k[ch]*weight[ch*d_conv+k]
         // taps oldest→newest; window = [conv history.., current]
@@ -478,7 +575,7 @@ impl Model {
                 oh[d] = n[d] * silu(zh[d]);
             }
         }
-        matvec(&w.out, c.d_inner, ne, &out)
+        w.out.mul(be, &out, c.d_inner, ne) // GPU
     }
 
     /// Gated full attention (one token), GQA, head_dim 256, partial sectioned RoPE, sigmoid out-gate.
@@ -493,18 +590,19 @@ impl Model {
         let c = &self.cfg;
         let (ne, hd) = (c.n_embd, c.head_dim);
         let (nh, nkv) = (c.n_head, c.n_kv);
+        let be = self.be.as_ref();
         let xn = rmsnorm(hidden, &w.attn_norm, c.eps);
         // attn_q outputs query+gate INTERLEAVED PER HEAD: [h0 q(hd) h0 gate(hd) | h1 q gate | …].
-        let qg = matvec(&w.q, ne, nh * 2 * hd, &xn);
+        let qg = w.q.mul(be, &xn, ne, nh * 2 * hd); // GPU
         let mut q = vec![0f32; nh * hd];
         let mut gate = vec![0f32; nh * hd];
         for h in 0..nh {
             q[h * hd..h * hd + hd].copy_from_slice(&qg[h * 2 * hd..h * 2 * hd + hd]);
             gate[h * hd..h * hd + hd].copy_from_slice(&qg[h * 2 * hd + hd..h * 2 * hd + 2 * hd]);
         }
-        let mut k = matvec(&w.k, ne, nkv * hd, &xn);
-        let v = matvec(&w.v, ne, nkv * hd, &xn);
-        // per-head q/k norm then RoPE
+        let mut k = w.k.mul(be, &xn, ne, nkv * hd); // GPU
+        let v = w.v.mul(be, &xn, ne, nkv * hd); // GPU
+                                                // per-head q/k norm then RoPE
         for h in 0..nh {
             let qh = &mut q[h * hd..h * hd + hd];
             let nq = rmsnorm(qh, &w.q_norm, c.eps);
@@ -551,7 +649,7 @@ impl Model {
                 oh[d] *= sigmoid(gh[d]);
             }
         }
-        matvec(&w.out, nh * hd, ne, &out)
+        w.out.mul(be, &out, nh * hd, ne) // GPU
     }
 }
 

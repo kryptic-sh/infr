@@ -285,22 +285,38 @@ fn f16_bytes(g: &Gguf, name: &str) -> Result<Vec<u8>> {
         infr_core::DType::F32 => {
             let f16: Vec<u16> = bytemuck::cast_slice::<u8, f32>(bytes)
                 .iter()
-                .map(|&x| half::f16::from_f32(x).to_bits())
+                .map(|&x| f32_to_f16_sat(x).to_bits())
                 .collect();
             Ok(bytemuck::cast_slice(&f16).to_vec())
         }
         infr_core::DType::Bf16 => {
-            // bf16 → f32 → f16 (bf16 is the top 16 bits of f32)
+            // bf16 → f32 → f16 (bf16 is the top 16 bits of f32). f16 has MORE mantissa than bf16
+            // (10 vs 7 bits) but a far smaller exponent range, so the only loss is overflow — which
+            // saturates (see `f32_to_f16_sat`) instead of becoming inf. Values that fit (≈all) are
+            // exact. A native-bf16 fused path (no clip at all) is a follow-on; the eager qwen35 path
+            // already stores bf16 natively via `upload_weight_bf16`.
             let f16: Vec<u16> = bytes
                 .chunks_exact(2)
                 .map(|c| {
                     let f = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
-                    half::f16::from_f32(f).to_bits()
+                    f32_to_f16_sat(f).to_bits()
                 })
                 .collect();
             Ok(bytemuck::cast_slice(&f16).to_vec())
         }
         other => bail!("unsupported dtype {other:?} for {name} (bring-up wants F16/F32/BF16)"),
+    }
+}
+
+/// f32 → f16, saturating to ±65504 (f16 max) instead of overflowing to ±inf. Preserves NaN. Used
+/// when down-converting bf16/f32 weights for the f16 fused path so a large-magnitude weight clips
+/// to the largest finite f16 rather than corrupting the matmul with inf/NaN.
+fn f32_to_f16_sat(x: f32) -> half::f16 {
+    const F16_MAX: f32 = 65504.0;
+    if x.is_nan() {
+        half::f16::NAN
+    } else {
+        half::f16::from_f32(x.clamp(-F16_MAX, F16_MAX))
     }
 }
 

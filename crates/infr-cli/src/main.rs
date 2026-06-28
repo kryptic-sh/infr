@@ -287,13 +287,19 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let max_new = envu("INFR_MAX_NEW", 2048);
     let (gguf, tok) = resolve(model)?;
 
-    // Qwen3.5/3.6 (qwen35 / Qwen3-Next) hybrid SSM models run on the CPU reference path — ggml/our
-    // Vulkan backend has no SSM kernels (see docs/QWEN35.md). One-shot only for now.
+    // Qwen3.5/3.6 (qwen35 / Qwen3-Next) run a hybrid path: linear projections on the GPU (f16),
+    // the SSM conv + gated-delta recurrence + hd=256 attention on the CPU (no GPU kernels yet — see
+    // docs/QWEN35.md). `Q35_CPU=1` forces the pure-CPU oracle. One-shot only for now.
     if infr_llama::qwen35::is_qwen35(&gguf) {
         let Some(msg) = message else {
             anyhow::bail!("qwen35 (Qwen3-Next) currently supports one-shot only: pass a message");
         };
-        eprintln!("[qwen35 CPU reference — Qwen3-Next hybrid SSM]");
+        let mode = if std::env::var("Q35_CPU").is_ok() {
+            "CPU oracle"
+        } else {
+            "hybrid GPU"
+        };
+        eprintln!("[qwen35 Qwen3-Next — {mode}: GPU linear + CPU SSM]");
         let t0 = std::time::Instant::now();
         let mut render = ThinkRender::new();
         let mut t_first: Option<std::time::Instant> = None;

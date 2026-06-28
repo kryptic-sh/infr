@@ -197,6 +197,7 @@ fn main() {
         ("native_gemv_id", "native_id_q5k", &["-DFMT_Q5K"]),
         ("native_gemv_id", "native_id_q6k", &["-DFMT_Q6K"]),
         ("moe_topk", "moe_topk", &[]),
+        ("argmax", "argmax", &[]),
         ("moe_bucket_count", "moe_bucket_count", &[]),
         ("moe_bucket_scan", "moe_bucket_scan", &[]),
         ("moe_bucket_scatter", "moe_bucket_scatter", &[]),

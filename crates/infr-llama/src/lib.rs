@@ -236,6 +236,13 @@ impl LayerWeights {
     }
 }
 
+/// A forward step's output: the sampled token (greedy GPU argmax — only 4 bytes cross the bus) or
+/// the full vocab logits (host samples them, for stochastic sampling / logit inspection).
+enum GenOut {
+    Token(u32),
+    Logits(Vec<f32>),
+}
+
 pub struct Llama {
     be: VulkanBackend,
     cfg: Config,
@@ -3435,12 +3442,64 @@ impl Llama {
         Ok(bytemuck::cast_slice(&out).to_vec())
     }
 
+    /// Final norm + lm head from a single resident hidden row `src` [n_embd]. When `greedy`, also
+    /// runs the GPU argmax and reads back only the 4-byte token id; otherwise reads back the full
+    /// vocab logits for host sampling.
+    fn lm_head_out(&self, src: &dyn Buffer, greedy: bool) -> Result<GenOut> {
+        let c = &self.cfg;
+        let al = |n: usize| {
+            self.be
+                .alloc((n * 4).max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        let (normed, final_logits) = (al(c.n_embd)?, al(c.vocab)?);
+        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        rec.rmsnorm(
+            src,
+            self.output_norm_buf.as_ref(),
+            normed.as_ref(),
+            1,
+            c.n_embd,
+            c.rms_eps,
+        );
+        rec_linear(
+            &rec,
+            &self.lm_head,
+            normed.as_ref(),
+            final_logits.as_ref(),
+            1,
+            c.n_embd,
+            c.vocab,
+        );
+        if greedy {
+            let tok = self
+                .be
+                .alloc(4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?;
+            rec.argmax(final_logits.as_ref(), tok.as_ref(), c.vocab);
+            rec.finish().map_err(|e| anyhow!("{e}"))?;
+            let mut tb = [0u8; 4];
+            self.be
+                .download(tok.as_ref(), &mut tb)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(GenOut::Token(u32::from_ne_bytes(tb)))
+        } else {
+            rec.finish().map_err(|e| anyhow!("{e}"))?;
+            let mut out = vec![0u8; c.vocab * 4];
+            self.be
+                .download(final_logits.as_ref(), &mut out)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(GenOut::Logits(bytemuck::cast_slice(&out).to_vec()))
+        }
+    }
+
     /// GPU-resident single-token decode (qwen3moe, all experts on GPU): the residual stream stays in
     /// VRAM the whole layer — rmsnorm / QKV / attention / O / residual / ffn-norm / router are one
     /// recorder, then (after reading back only the router logits for top-k) the selected experts'
     /// gate/up/SiLU/down + weighted accumulate (`hidden += w_e·y_e`) are a second recorder. Only the
-    /// `n_expert` logits cross the PCIe bus per layer — no per-matmul host round-trip. Returns logits.
-    fn forward_moe_chunk_gpu(&self, token: u32, kv: &mut MoeKv) -> Result<Vec<f32>> {
+    /// `n_expert` logits cross the PCIe bus per layer — no per-matmul host round-trip. When `greedy`,
+    /// samples on the GPU and returns just the token; else returns the vocab logits.
+    fn forward_moe_chunk_gpu(&self, token: u32, kv: &mut MoeKv, greedy: bool) -> Result<GenOut> {
         let c = &self.cfg;
         let mc = c.moe.expect("moe");
         let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
@@ -3701,36 +3760,8 @@ impl Llama {
         }
         kv.kv.len += 1;
 
-        // final norm + lm head (on the GPU; only the vocab logits come back).
-        let normed = al(ne)?;
-        let final_logits = self
-            .be
-            .alloc(c.vocab * 4, BufferUsage::Readback)
-            .map_err(|e| anyhow!("{e}"))?;
-        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
-        rec.rmsnorm(
-            hidden.as_ref(),
-            self.output_norm_buf.as_ref(),
-            normed.as_ref(),
-            1,
-            ne,
-            c.rms_eps,
-        );
-        rec_linear(
-            &rec,
-            &self.lm_head,
-            normed.as_ref(),
-            final_logits.as_ref(),
-            1,
-            ne,
-            c.vocab,
-        );
-        rec.finish().map_err(|e| anyhow!("{e}"))?;
-        let mut out = vec![0u8; c.vocab * 4];
-        self.be
-            .download(final_logits.as_ref(), &mut out)
-            .map_err(|e| anyhow!("{e}"))?;
-        Ok(bytemuck::cast_slice(&out).to_vec())
+        // final norm + lm head (on the GPU); greedy → GPU argmax + 4-byte token readback.
+        self.lm_head_out(hidden.as_ref(), greedy)
     }
 
     /// GPU-resident grouped prefill (qwen3moe, all experts on GPU): like [`forward_moe_chunk_gpu`]
@@ -3740,7 +3771,12 @@ impl Llama {
     /// expert — for each active expert: gather its token rows on the GPU, one SwiGLU GEMM, then a
     /// weighted scatter-add back into the resident hidden. No per-expert host round-trip. Returns
     /// last-token logits.
-    fn forward_moe_chunk_gpu_prefill(&self, tokens: &[u32], kv: &mut MoeKv) -> Result<Vec<f32>> {
+    fn forward_moe_chunk_gpu_prefill(
+        &self,
+        tokens: &[u32],
+        kv: &mut MoeKv,
+        greedy: bool,
+    ) -> Result<GenOut> {
         let c = &self.cfg;
         let mc = c.moe.expect("moe");
         let t = tokens.len();
@@ -4072,57 +4108,39 @@ impl Llama {
         }
         kv.kv.len += t;
 
-        // Final norm + lm head on the last token only, on the GPU: gather hidden's last row into a
-        // [ne] buffer, rmsnorm, lm_head — only the `vocab` logits cross the bus (no whole-hidden
-        // download, no host rmsnorm).
+        // Gather hidden's last row on the GPU, then final norm + lm head (+ greedy GPU argmax).
         let last_idx = al(1)?;
         self.be
             .upload(last_idx.as_ref(), bytemuck::cast_slice(&[(t - 1) as u32]))
             .map_err(|e| anyhow!("{e}"))?;
-        let (hlast, normed) = (al(ne)?, al(ne)?);
-        let final_logits = self
-            .be
-            .alloc(c.vocab * 4, BufferUsage::Readback)
-            .map_err(|e| anyhow!("{e}"))?;
+        let hlast = al(ne)?;
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
         rec.gather_rows(hidden.as_ref(), last_idx.as_ref(), 0, hlast.as_ref(), 1, ne);
-        rec.rmsnorm(
-            hlast.as_ref(),
-            self.output_norm_buf.as_ref(),
-            normed.as_ref(),
-            1,
-            ne,
-            c.rms_eps,
-        );
-        rec_linear(
-            &rec,
-            &self.lm_head,
-            normed.as_ref(),
-            final_logits.as_ref(),
-            1,
-            ne,
-            c.vocab,
-        );
         rec.finish().map_err(|e| anyhow!("{e}"))?;
-        let mut out = vec![0u8; c.vocab * 4];
-        self.be
-            .download(final_logits.as_ref(), &mut out)
-            .map_err(|e| anyhow!("{e}"))?;
-        Ok(bytemuck::cast_slice(&out).to_vec())
+        self.lm_head_out(hlast.as_ref(), greedy)
     }
 
     /// Eager MoE forward for one chunk of `tokens` at positions `kv.pos..`, appending K/V to the
     /// cache (so decode steps process only the new token, not the whole sequence). Returns logits
     /// (`vocab`) for the last token. Same math as [`forward_moe`] but cached.
     pub fn forward_moe_chunk(&self, tokens: &[u32], kv: &mut MoeKv) -> Result<Vec<f32>> {
+        match self.forward_moe_chunk_g(tokens, kv, false)? {
+            GenOut::Logits(l) => Ok(l),
+            GenOut::Token(_) => unreachable!("greedy=false always returns logits"),
+        }
+    }
+
+    /// As [`forward_moe_chunk`] but with on-GPU greedy sampling: when `greedy`, the GPU argmaxes the
+    /// vocab logits and only the 4-byte token id crosses the bus (no vocab-logits download).
+    fn forward_moe_chunk_g(&self, tokens: &[u32], kv: &mut MoeKv, greedy: bool) -> Result<GenOut> {
         // Stacked GPU expert bank → fully GPU-resident path (no per-matmul host round-trip):
         // single-token decode, or grouped-by-expert prefill for a multi-token chunk. Offloaded /
         // per-expert layers use the eager path.
         if self.layers[0].moe_stacked().is_some() {
             return if tokens.len() == 1 {
-                self.forward_moe_chunk_gpu(tokens[0], kv)
+                self.forward_moe_chunk_gpu(tokens[0], kv, greedy)
             } else {
-                self.forward_moe_chunk_gpu_prefill(tokens, kv)
+                self.forward_moe_chunk_gpu_prefill(tokens, kv, greedy)
             };
         }
         let c = &self.cfg;
@@ -4185,9 +4203,17 @@ impl Llama {
         }
         kv.kv.len += t;
 
+        // Eager (offloaded) path always returns logits; the caller samples on the host.
+        let _ = greedy;
         let last = &hidden[(t - 1) * ne..t * ne];
         let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
-        self.gemv_wt(&self.lm_head, &normed, 1, ne, c.vocab)
+        Ok(GenOut::Logits(self.gemv_wt(
+            &self.lm_head,
+            &normed,
+            1,
+            ne,
+            c.vocab,
+        )?))
     }
 
     /// Raw quantized bytes of a host-backed expert's `role` weight ("gate"/"up"/"down"), read
@@ -4472,19 +4498,26 @@ impl Llama {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9e3779b97f4a7c15)
             | 1;
+        // Greedy → sample on the GPU (only the token id reads back). Stochastic → host samples the
+        // returned vocab logits.
+        let greedy = sampler.temp <= 0.0 || sampler.top_k == 1;
+        let sample = |out: GenOut, rng: &mut u64| match out {
+            GenOut::Token(t) => t,
+            GenOut::Logits(l) => sample_logits(&l, sampler, rng),
+        };
         let mut kv = self.new_moe_kv(tokens.len() + max_new + 8)?;
-        let mut logits = self.forward_moe_chunk(&tokens, &mut kv)?; // prefill
+        let mut out = self.forward_moe_chunk_g(&tokens, &mut kv, greedy)?; // prefill
         let mut stream = StreamDecoder::default();
         let mut generated: Vec<u32> = Vec::new();
         for _ in 0..max_new {
-            let next = sample_logits(&logits, sampler, &mut rng);
+            let next = sample(out, &mut rng);
             if self.cfg.eos_ids.contains(&next) {
                 break;
             }
             generated.push(next);
             let full = self.tokenizer.decode(&generated, true).unwrap_or_default();
             on_token(&stream.step(&full));
-            logits = self.forward_moe_chunk(&[next], &mut kv)?; // 1-token decode
+            out = self.forward_moe_chunk_g(&[next], &mut kv, greedy)?; // 1-token decode
         }
         self.tokenizer
             .decode(&generated, true)

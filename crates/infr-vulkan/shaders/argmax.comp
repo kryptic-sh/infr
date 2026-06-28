@@ -1,0 +1,29 @@
+#version 460
+// Greedy argmax over `n` logits → token id (one workgroup, 256 lanes, strided scan + tree-reduce).
+// Strict > keeps the lowest index on ties, matching the host argmax. Lets greedy decode read back a
+// single 4-byte token id instead of the whole vocab logits.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n; } pc;
+layout(binding = 0) readonly buffer LB { float logits[]; };
+layout(binding = 1) writeonly buffer OB { uint out_id[]; };
+shared float sval[256];
+shared uint sidx[256];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float best = -1e30;
+    uint bi = 0u;
+    for (uint i = t; i < pc.n; i += 256u) {
+        if (logits[i] > best) { best = logits[i]; bi = i; }
+    }
+    sval[t] = best;
+    sidx[t] = bi;
+    barrier();
+    for (uint s = 128u; s > 0u; s /= 2u) {
+        if (t < s && sval[t + s] > sval[t]) {
+            sval[t] = sval[t + s];
+            sidx[t] = sidx[t + s];
+        }
+        barrier();
+    }
+    if (t == 0u) { out_id[0] = sidx[0]; }
+}

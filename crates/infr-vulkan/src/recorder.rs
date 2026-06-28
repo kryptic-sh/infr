@@ -1540,13 +1540,15 @@ impl<'a> Recorder<'a> {
         crate::linear::native_id_kernel_name(dtype).is_some()
     }
 
-    /// GPU MoE router top-k: softmax-renormalized top-`n_used` over `logits[n_expert]` → selected
-    /// expert `ids` (u32) + `wts` (f32), all in VRAM (no host round-trip). `scale` = routing scale.
+    /// GPU MoE router top-k for `n_tokens` tokens (one workgroup per token): softmax-renormalized
+    /// top-`n_used` over each token's `logits[n_expert]` → selected expert `ids` + `wts` (per token,
+    /// `n_used` each), all in VRAM (no host round-trip). `scale` = routing scale.
     pub fn moe_topk(
         &self,
         logits: &dyn Buffer,
         ids: &dyn Buffer,
         wts: &dyn Buffer,
+        n_tokens: usize,
         n_expert: usize,
         n_used: usize,
         scale: f32,
@@ -1564,7 +1566,94 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(logits), Self::vkb(ids), Self::vkb(wts)],
             2,
             &push,
+            n_tokens as u32,
+        );
+    }
+
+    /// Zero a buffer's first `n` 4-byte elements (cmd_fill_buffer) — clears the bucket counters.
+    pub fn zero(&self, buf: &dyn Buffer, n: usize) {
+        self.sync(&[], &[Self::vkb(buf)], true);
+        unsafe {
+            self.be
+                .shared
+                .device
+                .cmd_fill_buffer(self.cmd, Self::vkb(buf), 0, (n * 4) as u64, 0);
+        }
+    }
+
+    /// MoE bucketing pass 1 (count): tally assignments per expert into `counts` (pre-zeroed).
+    pub fn moe_bucket_count(&self, tok_ids: &dyn Buffer, counts: &dyn Buffer, n_pairs: usize) {
+        let k = self.be.kernel(
+            "moe_bucket_count",
+            crate::gemm::moe_bucket_count_spv(),
+            2,
+            4,
+        );
+        self.dispatch(
+            k,
+            &[Self::vkb(tok_ids), Self::vkb(counts)],
             1,
+            &(n_pairs as u32).to_ne_bytes(),
+            (n_pairs as u32).div_ceil(64),
+        );
+    }
+
+    /// MoE bucketing pass 2 (scan): exclusive prefix sum `counts → offsets`, and reset `fill` to 0.
+    pub fn moe_bucket_scan(
+        &self,
+        counts: &dyn Buffer,
+        offsets: &dyn Buffer,
+        fill: &dyn Buffer,
+        n_expert: usize,
+    ) {
+        let k = self
+            .be
+            .kernel("moe_bucket_scan", crate::gemm::moe_bucket_scan_spv(), 3, 4);
+        self.dispatch(
+            k,
+            &[Self::vkb(counts), Self::vkb(offsets), Self::vkb(fill)],
+            2,
+            &(n_expert as u32).to_ne_bytes(),
+            1,
+        );
+    }
+
+    /// MoE bucketing pass 3 (scatter): group token rows + weights by expert into `bucket_rows` /
+    /// `bucket_wts` (each expert's run starts at `offsets[e]`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_bucket_scatter(
+        &self,
+        tok_ids: &dyn Buffer,
+        tok_wts: &dyn Buffer,
+        offsets: &dyn Buffer,
+        fill: &dyn Buffer,
+        bucket_rows: &dyn Buffer,
+        bucket_wts: &dyn Buffer,
+        n_pairs: usize,
+        n_used: usize,
+    ) {
+        let k = self.be.kernel(
+            "moe_bucket_scatter",
+            crate::gemm::moe_bucket_scatter_spv(),
+            6,
+            8,
+        );
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n_pairs as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(tok_ids),
+                Self::vkb(tok_wts),
+                Self::vkb(offsets),
+                Self::vkb(fill),
+                Self::vkb(bucket_rows),
+                Self::vkb(bucket_wts),
+            ],
+            3,
+            &push,
+            (n_pairs as u32).div_ceil(64),
         );
     }
 
@@ -1652,16 +1741,18 @@ impl<'a> Recorder<'a> {
         &self,
         src: &dyn Buffer,
         idx: &dyn Buffer,
+        idx_base: usize,
         dst: &dyn Buffer,
         m: usize,
         ne: usize,
     ) {
         let k = self
             .be
-            .kernel("gather_rows", crate::gemm::gather_rows_spv(), 3, 8);
-        let mut push = [0u8; 8];
+            .kernel("gather_rows", crate::gemm::gather_rows_spv(), 3, 12);
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(idx_base as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(idx), Self::vkb(dst)],
@@ -1674,11 +1765,13 @@ impl<'a> Recorder<'a> {
     /// Weighted scatter-add: `dst[idx[j],:] += w[j] * y[j,:]` for j in 0..m, each row `ne` wide.
     /// Accumulates an MoE expert's weighted token outputs back into the resident hidden state
     /// (chained across experts via WAW barriers on `dst`).
+    #[allow(clippy::too_many_arguments)]
     pub fn scatter_add_rows(
         &self,
         y: &dyn Buffer,
         idx: &dyn Buffer,
         w: &dyn Buffer,
+        base: usize,
         dst: &dyn Buffer,
         m: usize,
         ne: usize,
@@ -1687,11 +1780,12 @@ impl<'a> Recorder<'a> {
             "scatter_add_rows",
             crate::gemm::scatter_add_rows_spv(),
             4,
-            8,
+            12,
         );
-        let mut push = [0u8; 8];
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(base as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(y), Self::vkb(idx), Self::vkb(w), Self::vkb(dst)],

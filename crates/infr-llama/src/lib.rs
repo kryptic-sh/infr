@@ -3601,6 +3601,7 @@ impl Llama {
                     logits.as_ref(),
                     ids.as_ref(),
                     wts.as_ref(),
+                    1,
                     mc.n_expert,
                     mc.n_used,
                     mc.scale,
@@ -3786,10 +3787,30 @@ impl Llama {
         } else {
             None
         };
-        let logits = self
-            .be
-            .alloc(t * mc.n_expert * 4, BufferUsage::Readback)
-            .map_err(|e| anyhow!("{e}"))?;
+        let logits = al(t * mc.n_expert)?;
+        // GPU routing (n_expert ≤ 128 for the top-k workgroup): per-token top-k → bucket tokens by
+        // expert entirely on the GPU. Only the per-expert counts/offsets (n_expert u32 each) read
+        // back, to size the per-expert GEMM dispatches. Else fall back to host top-k + index uploads.
+        let gpu_route = mc.n_expert <= 128;
+        let n_pairs = t * mc.n_used;
+        let rb = |n: usize| {
+            self.be
+                .alloc((n * 4).max(4), BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        let route = if gpu_route {
+            Some((
+                al(n_pairs)?,     // tok_ids
+                al(n_pairs)?,     // tok_wts
+                rb(mc.n_expert)?, // counts (downloaded)
+                rb(mc.n_expert)?, // offsets (downloaded + used on GPU by scatter)
+                al(mc.n_expert)?, // fill
+                al(n_pairs)?,     // bucket_rows
+                al(n_pairs)?,     // bucket_wts
+            ))
+        } else {
+            None
+        };
 
         for (li, layer) in self.layers.iter().enumerate() {
             // recorder 1: attention + router for all t tokens, on the GPU.
@@ -3886,40 +3907,113 @@ impl Llama {
                 ne,
                 mc.n_expert,
             );
-            rec.finish().map_err(|e| anyhow!("{e}"))?;
 
-            // Host top-k per token → per-expert token-row lists + renormalized weights.
-            let mut lb = vec![0u8; t * mc.n_expert * 4];
-            self.be
-                .download(logits.as_ref(), &mut lb)
-                .map_err(|e| anyhow!("{e}"))?;
-            let lh: &[f32] = bytemuck::cast_slice(&lb);
-            let mut rows_of: Vec<Vec<u32>> = vec![Vec::new(); mc.n_expert];
-            let mut wts_of: Vec<Vec<f32>> = vec![Vec::new(); mc.n_expert];
-            for r in 0..t {
-                let (idx, w) = moe_topk(&lh[r * mc.n_expert..(r + 1) * mc.n_expert], &mc);
-                for (ki, &e) in idx.iter().enumerate() {
-                    rows_of[e].push(r as u32);
-                    wts_of[e].push(w[ki]);
-                }
-            }
+            #[allow(clippy::type_complexity, unused_assignments)]
+            let mut fallback_bufs: Option<(Box<dyn Buffer>, Box<dyn Buffer>)> = None;
+            let (counts_h, offs_h, bucket_rows, bucket_wts) =
+                if let Some((tok_ids, tok_wts, counts, offsets, fill, bucket_rows, bucket_wts)) =
+                    &route
+                {
+                    // GPU routing: per-token top-k → count/scan/scatter buckets, all on the GPU.
+                    rec.moe_topk(
+                        logits.as_ref(),
+                        tok_ids.as_ref(),
+                        tok_wts.as_ref(),
+                        t,
+                        mc.n_expert,
+                        mc.n_used,
+                        mc.scale,
+                    );
+                    rec.zero(counts.as_ref(), mc.n_expert);
+                    rec.moe_bucket_count(tok_ids.as_ref(), counts.as_ref(), n_pairs);
+                    rec.moe_bucket_scan(
+                        counts.as_ref(),
+                        offsets.as_ref(),
+                        fill.as_ref(),
+                        mc.n_expert,
+                    );
+                    rec.moe_bucket_scatter(
+                        tok_ids.as_ref(),
+                        tok_wts.as_ref(),
+                        offsets.as_ref(),
+                        fill.as_ref(),
+                        bucket_rows.as_ref(),
+                        bucket_wts.as_ref(),
+                        n_pairs,
+                        mc.n_used,
+                    );
+                    rec.finish().map_err(|e| anyhow!("{e}"))?;
+                    // Read back only the per-expert counts + offsets (n_expert u32 each) to size dispatches.
+                    let mut cb = vec![0u8; mc.n_expert * 4];
+                    let mut ob = vec![0u8; mc.n_expert * 4];
+                    self.be
+                        .download(counts.as_ref(), &mut cb)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    self.be
+                        .download(offsets.as_ref(), &mut ob)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    (
+                        bytemuck::cast_slice::<u8, u32>(&cb).to_vec(),
+                        bytemuck::cast_slice::<u8, u32>(&ob).to_vec(),
+                        Some(bucket_rows),
+                        Some(bucket_wts),
+                    )
+                } else {
+                    // Fallback: host top-k → per-expert index buffers uploaded to GPU.
+                    rec.finish().map_err(|e| anyhow!("{e}"))?;
+                    let mut lb = vec![0u8; t * mc.n_expert * 4];
+                    self.be
+                        .download(logits.as_ref(), &mut lb)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    let lh: &[f32] = bytemuck::cast_slice(&lb);
+                    let mut rows_of: Vec<Vec<u32>> = vec![Vec::new(); mc.n_expert];
+                    let mut wts_of: Vec<Vec<f32>> = vec![Vec::new(); mc.n_expert];
+                    for r in 0..t {
+                        let (idx, w) = moe_topk(&lh[r * mc.n_expert..(r + 1) * mc.n_expert], &mc);
+                        for (ki, &e) in idx.iter().enumerate() {
+                            rows_of[e].push(r as u32);
+                            wts_of[e].push(w[ki]);
+                        }
+                    }
+                    // Concatenate into the shared bucket layout (offsets = prefix sum) and upload once.
+                    let mut offs = vec![0u32; mc.n_expert];
+                    let mut acc = 0u32;
+                    for e in 0..mc.n_expert {
+                        offs[e] = acc;
+                        acc += rows_of[e].len() as u32;
+                    }
+                    let mut rows_flat = Vec::with_capacity(n_pairs);
+                    let mut wts_flat = Vec::with_capacity(n_pairs);
+                    for e in 0..mc.n_expert {
+                        rows_flat.extend_from_slice(&rows_of[e]);
+                        wts_flat.extend_from_slice(&wts_of[e]);
+                    }
+                    let br = al(rows_flat.len().max(1))?;
+                    let bw = al(wts_flat.len().max(1))?;
+                    self.be
+                        .upload(br.as_ref(), bytemuck::cast_slice(&rows_flat))
+                        .map_err(|e| anyhow!("{e}"))?;
+                    self.be
+                        .upload(bw.as_ref(), bytemuck::cast_slice(&wts_flat))
+                        .map_err(|e| anyhow!("{e}"))?;
+                    let counts: Vec<u32> =
+                        (0..mc.n_expert).map(|e| rows_of[e].len() as u32).collect();
+                    fallback_bufs = Some((br, bw));
+                    let (br, bw) = fallback_bufs.as_ref().unwrap();
+                    (counts, offs, Some(br), Some(bw))
+                };
 
-            // recorder 2: per active expert, gather → SwiGLU GEMM → weighted scatter-add into hidden.
+            // recorder 2: per active expert, gather its bucket slice → SwiGLU GEMM → weighted
+            // scatter-add into hidden. m/offset come from the GPU-built (or host) routing.
+            let (bucket_rows, bucket_wts) = (bucket_rows.unwrap(), bucket_wts.unwrap());
             let rec2 = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
             let mut keep: Vec<Box<dyn Buffer>> = Vec::new();
             for e in 0..mc.n_expert {
-                let m = rows_of[e].len();
+                let m = counts_h[e] as usize;
                 if m == 0 {
                     continue;
                 }
-                let idxb = al(m)?;
-                self.be
-                    .upload(idxb.as_ref(), bytemuck::cast_slice(&rows_of[e]))
-                    .map_err(|er| anyhow!("{er}"))?;
-                let wb = al(m)?;
-                self.be
-                    .upload(wb.as_ref(), bytemuck::cast_slice(&wts_of[e]))
-                    .map_err(|er| anyhow!("{er}"))?;
+                let off = offs_h[e] as usize;
                 let (xe, ge, ue, ae, ye) = (
                     al(m * ne)?,
                     al(m * nff)?,
@@ -3927,7 +4021,7 @@ impl Llama {
                     al(m * nff)?,
                     al(m * ne)?,
                 );
-                rec2.gather_rows(hn2.as_ref(), idxb.as_ref(), xe.as_ref(), m, ne);
+                rec2.gather_rows(hn2.as_ref(), bucket_rows.as_ref(), off, xe.as_ref(), m, ne);
                 rec_linear_expert(
                     &rec2,
                     &st.gate,
@@ -3964,13 +4058,14 @@ impl Llama {
                 );
                 rec2.scatter_add_rows(
                     ye.as_ref(),
-                    idxb.as_ref(),
-                    wb.as_ref(),
+                    bucket_rows.as_ref(),
+                    bucket_wts.as_ref(),
+                    off,
                     hidden.as_ref(),
                     m,
                     ne,
                 );
-                keep.extend([idxb, wb, xe, ge, ue, ae, ye]);
+                keep.extend([xe, ge, ue, ae, ye]);
             }
             rec2.finish().map_err(|e| anyhow!("{e}"))?;
             drop(keep);
@@ -3990,7 +4085,7 @@ impl Llama {
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
-        rec.gather_rows(hidden.as_ref(), last_idx.as_ref(), hlast.as_ref(), 1, ne);
+        rec.gather_rows(hidden.as_ref(), last_idx.as_ref(), 0, hlast.as_ref(), 1, ne);
         rec.rmsnorm(
             hlast.as_ref(),
             self.output_norm_buf.as_ref(),

@@ -16,8 +16,11 @@ shared float slog[128];
 shared uint spick[128];
 
 void main() {
-    uint t = gl_LocalInvocationID.x;
-    slog[t] = (t < pc.n_expert) ? logits[t] : -1e30;
+    uint tok = gl_WorkGroupID.x;       // one workgroup per token (decode: 1, prefill: t)
+    uint t = gl_LocalInvocationID.x;   // one lane per expert
+    uint lbase = tok * pc.n_expert;
+    uint obase = tok * pc.n_used;
+    slog[t] = (t < pc.n_expert) ? logits[lbase + t] : -1e30;
     spick[t] = 0u;
     barrier();
     float lmax = -1e30; // thread 0 captures the global max at the first (unexcluded) pick
@@ -35,7 +38,7 @@ void main() {
         }
         if (t == 0u) {
             uint best = sidx[0];
-            ids[k] = best;
+            ids[obase + k] = best;
             spick[best] = 1u;
             if (k == 0u) { lmax = sval[0]; }
         }
@@ -43,10 +46,10 @@ void main() {
     }
     if (t == 0u) {
         float wsum = 0.0;
-        for (uint k = 0u; k < pc.n_used; k++) { wsum += exp(slog[ids[k]] - lmax); }
+        for (uint k = 0u; k < pc.n_used; k++) { wsum += exp(slog[ids[obase + k]] - lmax); }
         wsum = max(wsum, 1e-20);
         for (uint k = 0u; k < pc.n_used; k++) {
-            wts[k] = exp(slog[ids[k]] - lmax) / wsum * pc.scale;
+            wts[obase + k] = exp(slog[ids[obase + k]] - lmax) / wsum * pc.scale;
         }
     }
 }

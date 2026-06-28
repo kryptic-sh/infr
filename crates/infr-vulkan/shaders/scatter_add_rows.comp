@@ -4,7 +4,7 @@
 // dispatch each j is a distinct token row (a token routes to an expert at most once) so no two
 // threads touch the same dst element — no atomics; cross-expert ordering is a WAW barrier on dst.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-layout(push_constant) uniform PC { uint m; uint ne; } pc;
+layout(push_constant) uniform PC { uint m; uint ne; uint base; } pc;
 layout(binding = 0) readonly buffer SRC { float y[]; };
 layout(binding = 1) readonly buffer IDX { uint idx[]; };
 layout(binding = 2) readonly buffer WTS { float w[]; };
@@ -14,5 +14,5 @@ void main() {
     if (t >= pc.m * pc.ne) return;
     uint j = t / pc.ne;
     uint i = t - j * pc.ne;
-    dst[idx[j] * pc.ne + i] += w[j] * y[t];
+    dst[idx[pc.base + j] * pc.ne + i] += w[pc.base + j] * y[t];
 }

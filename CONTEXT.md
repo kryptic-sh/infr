@@ -154,6 +154,15 @@ limit is BN=64 K-tile (S/P/O in shared) ⇒ ~625 iters over 40k KV. Real lever =
 wider-KV-tile / better-pipelined flash kernel (substantial; FA2-reg attempt
 already lost). Config is otherwise tuned; gap is the kernel, not a knob.
 
+WATCHDOG IS REAL + orthogonal to native loading (it's per-SUBMIT GPU time; the
+recorder submits a whole chunk's 28-layer forward as one cmd buffer +
+queue_wait_idle). PROVEN: forcing the 8192 ingest into ONE chunk at d32000
+(cap=8192) → `VK_ERROR_DEVICE_LOST` (TDR reset; recovers on fresh process). 4096
+chunks complete (387 t/s), 8192 doesn't. So the 32M-budget taper (→~960 tok @
+32k) is load-bearing, not paranoia. Native being faster only buys headroom, not
+removal of chunking. ⇒ chunk size is NOT the deep-prefill lever (bigger barely
+helps + eventually trips TDR); the flash kernel is.
+
 Infra:
 
 - Pull/store refactor: own store `$INFR_MODELS` or `$XDG_CACHE_HOME/infr/models`

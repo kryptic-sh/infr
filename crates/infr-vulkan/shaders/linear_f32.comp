@@ -1,0 +1,21 @@
+#version 460
+// f32-weight GEMV y = x·Wᵀ (thread-per-output). W is [out, in] row-major.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; } pc;
+layout(binding = 0) readonly buffer WB { float w[]; }; // [out, in]
+layout(binding = 1) readonly buffer XB { float x[]; }; // [rows, in]
+layout(binding = 2) buffer YB { float y[]; };          // [rows, out]
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.rows * pc.out_f;
+    if (idx >= total) { return; }
+    uint r = idx / pc.out_f;
+    uint o = idx % pc.out_f;
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = 0u; i < pc.in_f; i++) { acc += w[wbase + i] * x[xbase + i]; }
+    y[r * pc.out_f + o] = acc;
+}

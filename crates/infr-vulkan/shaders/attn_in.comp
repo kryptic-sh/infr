@@ -1,0 +1,84 @@
+#version 460
+// Fused attention input: RMSNorm(hidden) -> Q/K/V projection (f16 weights) -> NEOX RoPE on Q/K,
+// writing f16 Q + appending K/V to the f16 cache. One workgroup per (row, output-pair).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows; uint ne; uint q_dim; uint kv_dim; uint hd; uint rope_dim; float theta; uint pos; float eps;
+} pc;
+layout(binding = 0) readonly buffer HB { float hidden[]; }; // [rows, ne]
+layout(binding = 1) readonly buffer NB { float nw[]; };     // [ne]
+layout(binding = 2) readonly buffer WQ { float16_t wq[]; }; // [q_dim, ne]
+layout(binding = 3) readonly buffer WK { float16_t wk[]; }; // [kv_dim, ne]
+layout(binding = 4) readonly buffer WV { float16_t wv[]; }; // [kv_dim, ne]
+layout(binding = 5) buffer QO { float16_t q[]; };           // [rows, q_dim]
+layout(binding = 6) buffer KO { float16_t kout[]; };        // KV cache [ctx, kv_dim]
+layout(binding = 7) buffer VO { float16_t vout[]; };        // KV cache [ctx, kv_dim]
+
+shared float r_ss[64];
+shared float r_a[64];
+shared float r_b[64];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint d = pc.q_dim + 2u * pc.kv_dim;
+    uint hf = d / 2u;
+    uint unit = gl_WorkGroupID.x;       // = r * hf + p
+    uint p = unit % hf;
+    uint r = unit / hf;
+    uint col = 2u * p;
+    uint rbase = r * pc.ne;
+
+    uint wbase_a; uint wbase_b; uint region;
+    if (col < pc.q_dim) { region = 0u; wbase_a = col * pc.ne; }
+    else if (col < pc.q_dim + pc.kv_dim) { region = 1u; wbase_a = (col - pc.q_dim) * pc.ne; }
+    else { region = 2u; wbase_a = (col - pc.q_dim - pc.kv_dim) * pc.ne; }
+    wbase_b = wbase_a + pc.ne;
+
+    float pss = 0.0; float pa = 0.0; float pb = 0.0;
+    for (uint k = t; k < pc.ne; k += 64u) {
+        float hv = hidden[rbase + k];
+        pss += hv * hv;
+        float hn = hv * nw[k];
+        if (region == 0u) { pa += hn * float(wq[wbase_a + k]); pb += hn * float(wq[wbase_b + k]); }
+        else if (region == 1u) { pa += hn * float(wk[wbase_a + k]); pb += hn * float(wk[wbase_b + k]); }
+        else { pa += hn * float(wv[wbase_a + k]); pb += hn * float(wv[wbase_b + k]); }
+    }
+    r_ss[t] = pss; r_a[t] = pa; r_b[t] = pb;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { r_ss[t] += r_ss[t + stride]; r_a[t] += r_a[t + stride]; r_b[t] += r_b[t + stride]; }
+        barrier();
+    }
+
+    if (t == 0u) {
+        float scale = inversesqrt(r_ss[0] / float(pc.ne) + pc.eps);
+        float a = r_a[0] * scale;
+        float b = r_b[0] * scale;
+        if (region == 2u) {
+            uint vc = col - pc.q_dim - pc.kv_dim;
+            vout[(pc.pos + r) * pc.kv_dim + vc] = float16_t(a);
+            vout[(pc.pos + r) * pc.kv_dim + vc + 1u] = float16_t(b);
+        } else {
+            uint local = (region == 0u) ? col : (col - pc.q_dim);
+            uint ih = local % pc.hd;
+            float oa = a; float ob = b;
+            if (ih < pc.rope_dim) {
+                float freq = pow(pc.theta, -2.0 * float(ih / 2u) / float(pc.rope_dim));
+                float ang = float(pc.pos + r) * freq;
+                float s = sin(ang); float co = cos(ang);
+                oa = a * co - b * s;
+                ob = a * s + b * co;
+            }
+            if (region == 0u) {
+                q[r * pc.q_dim + col] = float16_t(oa);
+                q[r * pc.q_dim + col + 1u] = float16_t(ob);
+            } else {
+                kout[(pc.pos + r) * pc.kv_dim + local] = float16_t(oa);
+                kout[(pc.pos + r) * pc.kv_dim + local + 1u] = float16_t(ob);
+            }
+        }
+    }
+}

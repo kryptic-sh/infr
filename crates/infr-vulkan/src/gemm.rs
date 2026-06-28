@@ -61,6 +61,7 @@ const ATTENTION_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/att
 const ATTN_COMBINE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine.spv"));
 const ATTENTION_KV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention_kv.spv"));
 const QK_NORM_ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qk_norm_rope.spv"));
+const ATTN_IN_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_in.spv"));
 const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
 const MMV_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8.spv"));
 const MMV_Q4_RES_SPV_BYTES: &[u8] =
@@ -243,6 +244,11 @@ pub(crate) fn attention_kv_spv() -> &'static [u32] {
 pub(crate) fn qk_norm_rope_spv() -> &'static [u32] {
     static QK_NORM_ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     QK_NORM_ROPE_SPV.get_or_init(|| spv_words(QK_NORM_ROPE_SPV_BYTES))
+}
+/// SPIR-V for fused attention input (RMSNorm + QKV proj + RoPE).
+pub(crate) fn attn_in_spv() -> &'static [u32] {
+    static ATTN_IN_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    ATTN_IN_SPV.get_or_init(|| spv_words(ATTN_IN_SPV_BYTES))
 }
 /// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
 /// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.

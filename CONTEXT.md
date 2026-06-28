@@ -171,9 +171,22 @@ repack / f16; excludes token_embd=host unless tied lm head), split dense vs
 MoE-expert (`*_exps`); `VulkanBackend::vram()` (VK_EXT_memory_budget) gives
 total+live-free; bail early if weights+384MB > free. Estimates verified vs
 actual: Q4_K 0.57 / Q8_0 0.78 / BF16 1.19 GB. MoE-READY = expert bytes tracked
-separately + all tensors enumerated (correct once an MoE arch is added). MoE
-follow-on (not done): real arena/pool allocation + expert streaming/offload when
-all-resident experts exceed VRAM; current code still per-tensor allocs.
+separately + all tensors enumerated (correct once an MoE arch is added).
+
+WEIGHT ARENA (done): `VulkanBackend::reserve_weights(total)` commits the model's
+whole weight VRAM as ONE contiguous device-memory block up front; `Weights`
+allocs bump-allocate from it (never individually freed → one-shot free, no
+fragmentation). `VkBuffer.backing: Backing::{Pooled(gpu-allocator) | Arena}`;
+arena buffers own only their handle, the block owns memory; `mapped_ptr()`
+replaces direct `.allocation` (arena bufs are device-local, staging-filled).
+64MB overflow blocks cover footprint underestimates; reservation failure →
+loader note
+
+- per-tensor fallback. `load_opt` reserves after the fit check. Test
+  `weight_arena_roundtrip` (reserved+overflow+coexistence). Perf unchanged. MoE
+  follow-on (still open): expert streaming/offload = a SECOND arena/pool evicted
+  into independently of the dense arena, for when all-resident experts exceed
+  VRAM.
 
 Infra:
 

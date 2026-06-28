@@ -9,12 +9,14 @@
 // scratch) — wide signatures are inherent here, not a refactor smell.
 #![allow(clippy::too_many_arguments)]
 
+mod expert_pool;
 mod gemm;
 pub mod linear;
 mod matmul;
 mod ops;
 mod recorder;
 
+pub use expert_pool::ExpertPool;
 pub use recorder::Recorder;
 
 use std::collections::HashMap;

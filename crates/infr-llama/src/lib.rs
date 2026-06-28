@@ -1134,6 +1134,91 @@ fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
             }
             out
         }
+        // ── TQ1_0: block = [u8 qs[48]][u8 qh[4]][half d], 54 bytes, QK_K=256 ────
+        // 5-ternary-digits-per-byte encoding.
+        //   Main loop: j=0..31 (32 bytes), 5 passes → 32*5=160 elements
+        //   Second:   j=32..47 (16 bytes), 5 passes → 16*5=80 elements
+        //   qh loop:  4 bytes, 4 passes →  4*4=16 elements
+        //   Total 256.
+        //   digit_n(b) = ((b * pow3[n] as u16) * 3 >> 8) as i16 → 0,1, or 2
+        //   y = (digit - 1) * d
+        // Ref: llama.cpp dequantize_row_tq1_0 (ggml-quants.c l.2356)
+        Tq1_0 => {
+            let bpb = 54usize; // 48 + 4 + 2
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let qs = &blk[0..48];
+                let qh = &blk[48..52];
+                let d = rdf16(&blk[52..54]);
+                let base = b * 256;
+                let mut outoff = 0usize;
+                // qs[0..32]: 32 bytes, 5 digit passes
+                for n in 0..5usize {
+                    let p3 = POW3[n];
+                    for m in 0..32usize {
+                        let q = qs[m].wrapping_mul(p3);
+                        let xi = (((q as u16) * 3) >> 8) as i16;
+                        out[base + outoff + n * 32 + m] = (xi - 1) as f32 * d;
+                    }
+                }
+                outoff += 5 * 32; // 160
+                                  // qs[32..48]: 16 bytes, 5 digit passes
+                for n in 0..5usize {
+                    let p3 = POW3[n];
+                    for m in 0..16usize {
+                        let q = qs[32 + m].wrapping_mul(p3);
+                        let xi = (((q as u16) * 3) >> 8) as i16;
+                        out[base + outoff + n * 16 + m] = (xi - 1) as f32 * d;
+                    }
+                }
+                outoff += 5 * 16; // 80
+                                  // qh[0..4]: 4 bytes, 4 digit passes
+                for n in 0..4usize {
+                    let p3 = POW3[n];
+                    for j in 0..4usize {
+                        let q = qh[j].wrapping_mul(p3);
+                        let xi = (((q as u16) * 3) >> 8) as i16;
+                        out[base + outoff + n * 4 + j] = (xi - 1) as f32 * d;
+                    }
+                }
+                // outoff += 16 (unused but for clarity)
+                let _ = outoff;
+            }
+            out
+        }
+        // ── TQ2_0: block = [u8 qs[64]][half d], 66 bytes, QK_K=256 ──────────────
+        // 2 bits per element; 4 elements packed per byte; two 32-byte passes.
+        //   For each 32-byte chunk j, for l in 0..4, for m in 0..32:
+        //     q = (qs[j+m] >> (l*2)) & 3  ∈ {0,1,2,3}
+        //     y = (q - 1) * d
+        // Ref: llama.cpp dequantize_row_tq2_0 (ggml-quants.c l.2395)
+        Tq2_0 => {
+            let bpb = 66usize; // 64 + 2
+            let nblk = bytes.len() / bpb;
+            let mut out = vec![0.0f32; nblk * 256];
+            for b in 0..nblk {
+                let blk = &bytes[b * bpb..(b + 1) * bpb];
+                let qs = &blk[0..64];
+                let d = rdf16(&blk[64..66]);
+                let base = b * 256;
+                let mut outoff = 0usize;
+                // Two 32-byte chunks (j=0, j=32)
+                for chunk in 0..2usize {
+                    let j = chunk * 32;
+                    for l in 0..4usize {
+                        for m in 0..32usize {
+                            let q = ((qs[j + m] >> (l * 2)) & 3) as i32;
+                            out[base + outoff] = (q - 1) as f32 * d;
+                            outoff += 1;
+                        }
+                    }
+                }
+            }
+            out
+        }
         other => unimplemented!("codebook dequant for {other:?} not yet implemented"),
     }
 }
@@ -2830,6 +2915,46 @@ mod dequant_tests {
         assert_eq!(y.len(), 256);
         for i in 0..256 {
             assert!(y[i].abs() < 1e-4, "iq1m y[{i}] expected 0.0, got {}", y[i]);
+        }
+    }
+
+    // ── TQ1_0 ───────────────────────────────────────────────────────────────────
+    // Block: [u8 qs[48]][u8 qh[4]][half d], 54 bytes, QK_K=256
+    // All-zero qs/qh: q=0 → xi=0 → y=(0-1)*d = -d for all 256 elements
+    // Ref: llama.cpp dequantize_row_tq1_0 (ggml-quants.c l.2356)
+    #[test]
+    fn tq1_0_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 54];
+        block[52..54].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Tq1_0, &block);
+        assert_eq!(y.len(), 256);
+        for i in 0..256 {
+            assert!(
+                (y[i] - (-1.0)).abs() < 1e-4,
+                "tq1_0 y[{i}] expected -1.0, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── TQ2_0 ───────────────────────────────────────────────────────────────────
+    // Block: [u8 qs[64]][half d], 66 bytes, QK_K=256
+    // All-zero qs: q=(0>>l*2)&3=0 → y=(0-1)*d = -d for all 256 elements
+    // Ref: llama.cpp dequantize_row_tq2_0 (ggml-quants.c l.2395)
+    #[test]
+    fn tq2_0_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 66];
+        block[64..66].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Tq2_0, &block);
+        assert_eq!(y.len(), 256);
+        for i in 0..256 {
+            assert!(
+                (y[i] - (-1.0)).abs() < 1e-4,
+                "tq2_0 y[{i}] expected -1.0, got {}",
+                y[i]
+            );
         }
     }
 

@@ -323,6 +323,30 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         envf("INFR_TOP_P", 0.95),
     );
 
+    // MoE (qwen3moe): eager CPU-orchestrated forward (router top-k + per-expert FFN), no KV cache.
+    // One-shot only for now.
+    if llama.is_moe() {
+        let Some(m) = message else {
+            anyhow::bail!("qwen3moe currently supports one-shot only: pass a message");
+        };
+        eprintln!("[qwen3moe — eager MoE forward: GPU matmuls + CPU router/top-k, no KV cache]");
+        let prompt = llama.chatml(m);
+        let t0 = std::time::Instant::now();
+        let mut n = 0usize;
+        let mut t_first: Option<std::time::Instant> = None;
+        let mut render = ThinkRender::new();
+        llama.generate_moe(&prompt, max_new, |piece| {
+            if t_first.is_none() {
+                t_first = Some(std::time::Instant::now());
+            }
+            n += 1;
+            render.feed(piece);
+        })?;
+        render.finish();
+        print_run_stats(t0, t_first, n, 0, None);
+        return Ok(());
+    }
+
     // One-shot message: a single chat turn (via the session path so user content is encoded safely).
     let mut session = llama.chat_session(MAX_CTX)?;
     if let Some(m) = message {

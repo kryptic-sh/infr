@@ -48,6 +48,19 @@ pub struct Config {
     pub eos_ids: Vec<u32>,
     /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
     pub qk_norm: bool,
+    /// MoE config (qwen3moe): `Some` enables the routed-expert FFN. `None` = dense FFN.
+    pub moe: Option<MoeConfig>,
+}
+
+/// Mixture-of-experts FFN parameters (qwen3moe): a softmax router picks `n_used` of `n_expert`
+/// experts per token, each a SwiGLU FFN of inner size `n_ff_exp`, summed by renormalized top-k
+/// weights (`scale` applied). Attention is identical to dense qwen3.
+#[derive(Clone, Copy, Debug)]
+pub struct MoeConfig {
+    pub n_expert: usize,
+    pub n_used: usize,
+    pub n_ff_exp: usize,
+    pub scale: f32,
 }
 
 /// Token sampling: greedy when `temp <= 0`, else temperature + top-k + top-p (nucleus). Qwen3
@@ -105,6 +118,25 @@ impl Wt {
     }
 }
 
+/// One routed expert's SwiGLU weights (gate/up [n_embd→n_ff_exp], down [n_ff_exp→n_embd]).
+struct ExpertWt {
+    gate: Wt,
+    up: Wt,
+    down: Wt,
+}
+
+/// A layer's FFN: dense fused gate‖up + down, or a routed MoE bank (router + per-expert weights).
+enum FfnWt {
+    Dense {
+        wgateup: Wt,
+        wdown: Wt,
+    },
+    Moe {
+        gate_inp: Wt,
+        experts: Vec<ExpertWt>,
+    },
+}
+
 struct LayerWeights {
     attn_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
@@ -114,10 +146,33 @@ struct LayerWeights {
     wk: Wt,
     wv: Wt,
     wo: Wt,
-    wgateup: Wt, // fused [2*n_ff, n_embd] = concat(gate, up)
-    wdown: Wt,
+    ffn: FfnWt,
     q_norm_buf: Option<Box<dyn Buffer>>, // qwen3 QK-norm weights [head_dim]
     k_norm_buf: Option<Box<dyn Buffer>>,
+    // Host f32 QK-norm weights [head_dim] for the eager MoE forward (qk_norm applied on CPU).
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
+}
+
+impl LayerWeights {
+    fn wgateup(&self) -> &Wt {
+        match &self.ffn {
+            FfnWt::Dense { wgateup, .. } => wgateup,
+            FfnWt::Moe { .. } => panic!("MoE layer has no dense wgateup"),
+        }
+    }
+    fn wdown(&self) -> &Wt {
+        match &self.ffn {
+            FfnWt::Dense { wdown, .. } => wdown,
+            FfnWt::Moe { .. } => panic!("MoE layer has no dense wdown"),
+        }
+    }
+    fn moe(&self) -> (&Wt, &[ExpertWt]) {
+        match &self.ffn {
+            FfnWt::Moe { gate_inp, experts } => (gate_inp, experts),
+            FfnWt::Dense { .. } => panic!("dense layer has no MoE bank"),
+        }
+    }
 }
 
 pub struct Llama {
@@ -1527,29 +1582,34 @@ fn is_native_supported(d: infr_core::DType) -> bool {
 /// - Codebook quants (IQ*/TQ*/fp4) → host dequant → f16 → `Wt::F16` (native via `INFR_NATIVE=1`)
 /// - Float types (F16/F32/BF16) → `Wt::F16` directly
 fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
-    let info = g
+    let dtype = g
         .tensors()
         .iter()
         .find(|t| t.name == name)
         .ok_or_else(|| anyhow!("tensor not found: {name}"))?
-        .clone();
+        .dtype;
+    let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+    upload_wt_bytes(be, dtype, bytes)
+}
+
+/// Like [`upload_wt`] but from a raw byte slice + dtype — lets a stacked MoE expert tensor be sliced
+/// per expert (each expert is a contiguous block of the `*_exps` tensor) and uploaded individually.
+fn upload_wt_bytes(be: &VulkanBackend, dtype: infr_core::DType, bytes: &[u8]) -> Result<Wt> {
     // Native-block path: raw upload + in-shader dequant. Default for optimized affine quants;
     // INFR_NATIVE forces all supported formats, INFR_NONATIVE disables (see use_native_for).
-    if use_native_for(info.dtype) && is_native_supported(info.dtype) {
-        let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+    if use_native_for(dtype) && is_native_supported(dtype) {
         let padded = infr_vulkan::linear::pad_to_u32_align(bytes);
         return Ok(Wt::Native {
             buf: be
                 .upload_weight_bytes(&padded)
-                .map_err(|e| anyhow!("native upload {name}: {e}"))?,
-            dtype: info.dtype,
+                .map_err(|e| anyhow!("native upload: {e}"))?,
+            dtype,
         });
     }
-    if is_quant(info.dtype) {
-        // Affine quants: GPU in-kernel dequant path (legacy)
-        let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
-        let (bits, blk) = quant_params(info.dtype);
-        let (qv, sc, mn) = dequant_unified(info.dtype, bytes);
+    if is_quant(dtype) {
+        // Affine quants: GPU in-kernel dequant path (legacy / INFR_NONATIVE)
+        let (bits, blk) = quant_params(dtype);
+        let (qv, sc, mn) = dequant_unified(dtype, bytes);
         let (q, s, m) = pack_unified(&qv, &sc, &mn, bits, blk);
         Ok(Wt::Q {
             q: be.upload_weight_bytes(bytemuck::cast_slice(&q))?,
@@ -1558,18 +1618,95 @@ fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
             bits,
             blk_shift: blk.trailing_zeros(),
         })
-    } else if is_codebook_quant(info.dtype) {
-        // Codebook quants: host dequant to f32, then upload as f16
-        let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
-        let f32_vals = dequant_codebook(info.dtype, bytes);
-        let f16_bytes: Vec<u8> = f32_vals
+    } else {
+        // Codebook quants and float types → host dequant to f32 → f16.
+        let f16_bytes: Vec<u8> = dequant_block(dtype, bytes)?
             .iter()
             .flat_map(|&v| f32_to_f16_sat(v).to_bits().to_le_bytes())
             .collect();
         Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes)?))
-    } else {
-        Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes(g, name)?)?))
     }
+}
+
+/// Build a dense layer's fused gate‖up weight (`[2*n_ff, n_embd]`, gate rows then up rows). Quant
+/// stays quantized (unified repack); codebook/float → f16. `prefix` is e.g. `"blk.3."`.
+fn build_wgateup(be: &VulkanBackend, g: &Gguf, prefix: &str) -> Result<Wt> {
+    let gate_name = format!("{prefix}ffn_gate.weight");
+    let up_name = format!("{prefix}ffn_up.weight");
+    let gate_dtype = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == gate_name)
+        .map(|t| t.dtype);
+    let gb = g.tensor_bytes(&gate_name).map_err(|e| anyhow!("{e}"))?;
+    let ub = g.tensor_bytes(&up_name).map_err(|e| anyhow!("{e}"))?;
+    if gate_dtype.map(is_quant).unwrap_or(false) {
+        let dt = gate_dtype.unwrap();
+        let (bits, blk) = quant_params(dt);
+        let (mut qv, mut sc, mut mn) = dequant_unified(dt, gb);
+        let (qu, scu, mnu) = dequant_unified(dt, ub);
+        qv.extend(qu);
+        sc.extend(scu);
+        mn.extend(mnu);
+        let (q, s, m) = pack_unified(&qv, &sc, &mn, bits, blk);
+        Ok(Wt::Q {
+            q: be.upload_weight_bytes(bytemuck::cast_slice(&q))?,
+            s: be.upload_weight_bytes(bytemuck::cast_slice(&s))?,
+            m: be.upload_weight_bytes(bytemuck::cast_slice(&m))?,
+            bits,
+            blk_shift: blk.trailing_zeros(),
+        })
+    } else if gate_dtype.map(is_codebook_quant).unwrap_or(false) {
+        let dt = gate_dtype.unwrap();
+        let to_f16 = |bytes: &[u8]| -> Vec<u8> {
+            dequant_codebook(dt, bytes)
+                .iter()
+                .flat_map(|&v| f32_to_f16_sat(v).to_bits().to_le_bytes())
+                .collect()
+        };
+        let mut gateup = to_f16(gb);
+        gateup.extend_from_slice(&to_f16(ub));
+        Ok(Wt::F16(be.upload_weight_bytes(&gateup)?))
+    } else {
+        let mut gateup = f16_bytes(g, &gate_name)?;
+        gateup.extend_from_slice(&f16_bytes(g, &up_name)?);
+        Ok(Wt::F16(be.upload_weight_bytes(&gateup)?))
+    }
+}
+
+/// Load a layer's MoE expert bank: the router `ffn_gate_inp` + the `n_expert` per-expert SwiGLU
+/// weights sliced from the stacked `ffn_{gate,up,down}_exps` tensors (each expert is one contiguous
+/// `1/n_expert` block of the stacked tensor — quant blocks never cross expert boundaries).
+fn load_moe(be: &VulkanBackend, g: &Gguf, prefix: &str, n_expert: usize) -> Result<FfnWt> {
+    let gate_inp = upload_wt(be, g, &format!("{prefix}ffn_gate_inp.weight"))?;
+    let stacked = |role: &str| -> Result<(infr_core::DType, &[u8])> {
+        let name = format!("{prefix}ffn_{role}_exps.weight");
+        let dt = g
+            .tensors()
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+            .dtype;
+        let bytes = g.tensor_bytes(&name).map_err(|e| anyhow!("{e}"))?;
+        Ok((dt, bytes))
+    };
+    let (gdt, gbytes) = stacked("gate")?;
+    let (udt, ubytes) = stacked("up")?;
+    let (ddt, dbytes) = stacked("down")?;
+    let (gstride, ustride, dstride) = (
+        gbytes.len() / n_expert,
+        ubytes.len() / n_expert,
+        dbytes.len() / n_expert,
+    );
+    let mut experts = Vec::with_capacity(n_expert);
+    for e in 0..n_expert {
+        experts.push(ExpertWt {
+            gate: upload_wt_bytes(be, gdt, &gbytes[e * gstride..(e + 1) * gstride])?,
+            up: upload_wt_bytes(be, udt, &ubytes[e * ustride..(e + 1) * ustride])?,
+            down: upload_wt_bytes(be, ddt, &dbytes[e * dstride..(e + 1) * dstride])?,
+        });
+    }
+    Ok(FfnWt::Moe { gate_inp, experts })
 }
 
 impl Llama {
@@ -1597,10 +1734,12 @@ impl Llama {
             .str("general.architecture")
             .unwrap_or("")
             .to_string();
-        // llama and qwen3 share the transformer; qwen3 adds QK-norm + explicit head_dim.
+        // llama / qwen3 / qwen3moe share the transformer; qwen3* add QK-norm + explicit head_dim,
+        // qwen3moe replaces the dense FFN with a routed-expert bank.
         let qk_norm = match arch.as_str() {
-            "llama" | "qwen3" => arch == "qwen3",
-            other => bail!("infr-llama supports architecture=llama|qwen3, got {other:?}"),
+            "llama" => false,
+            "qwen3" | "qwen3moe" => true,
+            other => bail!("infr-llama supports architecture=llama|qwen3|qwen3moe, got {other:?}"),
         };
         let mk = |k: &str| format!("{arch}.{k}");
         let n_layer = meta_u64(&g, &mk("block_count")).context("block_count")? as usize;
@@ -1609,6 +1748,24 @@ impl Llama {
         let n_kv = meta_u64(&g, &mk("attention.head_count_kv")).unwrap_or(n_head as u64) as usize;
         let n_ff =
             meta_u64(&g, &mk("feed_forward_length")).context("feed_forward_length")? as usize;
+        // MoE (qwen3moe): softmax router over `n_expert`, top-`n_used`, per-expert SwiGLU of inner
+        // size `n_ff_exp` (the GGUF `expert_feed_forward_length`).
+        let moe = if arch == "qwen3moe" {
+            let n_expert = meta_u64(&g, &mk("expert_count")).context("expert_count")? as usize;
+            let n_used =
+                meta_u64(&g, &mk("expert_used_count")).context("expert_used_count")? as usize;
+            let n_ff_exp = meta_u64(&g, &mk("expert_feed_forward_length"))
+                .map(|v| v as usize)
+                .unwrap_or(n_ff / n_used.max(1));
+            Some(MoeConfig {
+                n_expert,
+                n_used,
+                n_ff_exp,
+                scale: 1.0, // qwen3moe: renormalize top-k softmax weights, no extra scale
+            })
+        } else {
+            None
+        };
         // head_dim: explicit (qwen3 key_length) or n_embd/n_head (llama). Note q_dim = n_head*head_dim
         // may differ from n_embd (qwen3-0.6B: 16*128=2048 vs embd 1024).
         let head_dim =
@@ -1721,77 +1878,31 @@ impl Llama {
             let ffn_norm_buf = be
                 .upload_weight(&ffn_norm)
                 .map_err(|e| anyhow!("upload ffn_norm {l}: {e}"))?;
-            // fuse gate + up into one [2*n_ff, n_embd] weight (concat rows). Quant stays quantized.
-            let gate_dtype = g
-                .tensors()
-                .iter()
-                .find(|t| t.name == p("ffn_gate.weight"))
-                .map(|t| t.dtype);
-            let wgateup = if gate_dtype.map(is_quant).unwrap_or(false) {
-                let dt = gate_dtype.unwrap();
-                let gb = g
-                    .tensor_bytes(&p("ffn_gate.weight"))
-                    .map_err(|e| anyhow!("{e}"))?;
-                let ub = g
-                    .tensor_bytes(&p("ffn_up.weight"))
-                    .map_err(|e| anyhow!("{e}"))?;
-                let (bits, blk) = quant_params(dt);
-                let (mut qv, mut sc, mut mn) = dequant_unified(dt, gb);
-                let (qu, scu, mnu) = dequant_unified(dt, ub);
-                qv.extend(qu);
-                sc.extend(scu);
-                mn.extend(mnu);
-                let (q, s, m) = pack_unified(&qv, &sc, &mn, bits, blk);
-                Wt::Q {
-                    q: be
-                        .upload_weight_bytes(bytemuck::cast_slice(&q))
-                        .map_err(|e| anyhow!("wgateup {l}: {e}"))?,
-                    s: be
-                        .upload_weight_bytes(bytemuck::cast_slice(&s))
-                        .map_err(|e| anyhow!("wgateup {l}: {e}"))?,
-                    m: be
-                        .upload_weight_bytes(bytemuck::cast_slice(&m))
-                        .map_err(|e| anyhow!("wgateup {l}: {e}"))?,
-                    bits,
-                    blk_shift: blk.trailing_zeros(),
+            // MoE layer: router + per-expert bank. Dense layer: fused gate‖up + down.
+            let ffn = if let Some(mc) = moe {
+                load_moe(&be, &g, &format!("blk.{l}."), mc.n_expert)?
+            } else {
+                FfnWt::Dense {
+                    wgateup: build_wgateup(&be, &g, &format!("blk.{l}."))?,
+                    wdown: up(&be, p("ffn_down.weight"))?,
                 }
-            } else if gate_dtype.map(is_codebook_quant).unwrap_or(false) {
-                // Codebook quants: host dequant gate+up → f16, fuse into one buffer
-                let dt = gate_dtype.unwrap();
-                let to_f16_bytes = |bytes: &[u8]| -> Vec<u8> {
-                    dequant_codebook(dt, bytes)
-                        .iter()
-                        .flat_map(|&v| f32_to_f16_sat(v).to_bits().to_le_bytes())
-                        .collect()
-                };
-                let gb = g
-                    .tensor_bytes(&p("ffn_gate.weight"))
-                    .map_err(|e| anyhow!("{e}"))?;
-                let ub = g
-                    .tensor_bytes(&p("ffn_up.weight"))
-                    .map_err(|e| anyhow!("{e}"))?;
-                let mut gateup = to_f16_bytes(gb);
-                gateup.extend_from_slice(&to_f16_bytes(ub));
-                Wt::F16(
-                    be.upload_weight_bytes(&gateup)
-                        .map_err(|e| anyhow!("upload wgateup codebook {l}: {e}"))?,
+            };
+            let (q_norm_host, k_norm_host) = if qk_norm {
+                (
+                    Some(load_tensor_dequant(&g, &p("attn_q_norm.weight"))?.0),
+                    Some(load_tensor_dequant(&g, &p("attn_k_norm.weight"))?.0),
                 )
             } else {
-                let mut gateup = f16_bytes(&g, &p("ffn_gate.weight"))?;
-                gateup.extend_from_slice(&f16_bytes(&g, &p("ffn_up.weight"))?);
-                Wt::F16(
-                    be.upload_weight_bytes(&gateup)
-                        .map_err(|e| anyhow!("upload wgateup {l}: {e}"))?,
-                )
+                (None, None)
             };
             let (q_norm_buf, k_norm_buf) = if qk_norm {
                 (
                     Some(
-                        be.upload_weight(&load_tensor_dequant(&g, &p("attn_q_norm.weight"))?.0)
+                        be.upload_weight(q_norm_host.as_ref().unwrap())
                             .map_err(|e| anyhow!("upload q_norm {l}: {e}"))?,
                     ),
                     Some(
-                        be.upload_weight(&load_tensor_dequant(&g, &p("attn_k_norm.weight"))?.0)
+                        be.upload_weight(k_norm_host.as_ref().unwrap())
                             .map_err(|e| anyhow!("upload k_norm {l}: {e}"))?,
                     ),
                 )
@@ -1807,10 +1918,11 @@ impl Llama {
                 wk: up(&be, p("attn_k.weight"))?,
                 wv: up(&be, p("attn_v.weight"))?,
                 wo: up(&be, p("attn_output.weight"))?,
-                wgateup,
-                wdown: up(&be, p("ffn_down.weight"))?,
+                ffn,
                 q_norm_buf,
                 k_norm_buf,
+                q_norm: q_norm_host,
+                k_norm: k_norm_host,
             });
             pb.inc(layer_bytes(l));
         }
@@ -1849,6 +1961,7 @@ impl Llama {
             eos,
             eos_ids,
             qk_norm,
+            moe,
         };
         Ok(Self {
             be,
@@ -1923,7 +2036,7 @@ impl Llama {
 
             // --- ffn (SwiGLU) ---
             let hn2 = rmsnorm_rows(&hidden, &layer.ffn_norm, t, ne, c.rms_eps);
-            let gu = self.lin(layer.wgateup.f16(), &hn2, t, ne, 2 * c.n_ff);
+            let gu = self.lin(layer.wgateup().f16(), &hn2, t, ne, 2 * c.n_ff);
             let mut act = vec![0f32; t * c.n_ff];
             for r in 0..t {
                 for i in 0..c.n_ff {
@@ -1931,7 +2044,7 @@ impl Llama {
                     act[r * c.n_ff + i] = silu(g) * gu[r * 2 * c.n_ff + c.n_ff + i];
                 }
             }
-            let down = self.lin(layer.wdown.f16(), &act, t, c.n_ff, ne);
+            let down = self.lin(layer.wdown().f16(), &act, t, c.n_ff, ne);
             for i in 0..t * ne {
                 hidden[i] += down[i];
             }
@@ -1941,6 +2054,148 @@ impl Llama {
         let last = &hidden[(t - 1) * ne..t * ne];
         let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
         self.lin(self.lm_head.f16(), &normed, 1, ne, c.vocab)
+    }
+
+    /// Eager GPU GEMV `y = x·Wᵀ` for any weight kind (f16 / unified-Q / native), one submit. Uploads
+    /// `x`, runs the matching recorder op, reads back `y`. Used by the MoE forward (many small,
+    /// data-dependent matmuls that can't be baked into one resident command buffer).
+    fn gemv_wt(
+        &self,
+        w: &Wt,
+        x: &[f32],
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) -> Result<Vec<f32>> {
+        debug_assert_eq!(x.len(), rows * in_f);
+        let xb = self
+            .be
+            .alloc((rows * in_f).max(1) * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        self.be
+            .upload(xb.as_ref(), bytemuck::cast_slice(x))
+            .map_err(|e| anyhow!("{e}"))?;
+        let yb = self
+            .be
+            .alloc((rows * out_f).max(1) * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        match w {
+            Wt::F16(b) => rec.linear(b.as_ref(), xb.as_ref(), yb.as_ref(), rows, in_f, out_f),
+            Wt::Q {
+                q,
+                s,
+                m,
+                bits,
+                blk_shift,
+            } => rec.linear_q(
+                q.as_ref(),
+                s.as_ref(),
+                m.as_ref(),
+                xb.as_ref(),
+                yb.as_ref(),
+                rows,
+                in_f,
+                out_f,
+                *bits,
+                *blk_shift,
+            ),
+            Wt::Native { buf, dtype } => rec.linear_native(
+                *dtype,
+                buf.as_ref(),
+                xb.as_ref(),
+                yb.as_ref(),
+                rows,
+                in_f,
+                out_f,
+            ),
+        }
+        rec.finish().map_err(|e| anyhow!("{e}"))?;
+        let mut out = vec![0u8; rows * out_f * 4];
+        self.be
+            .download(yb.as_ref(), &mut out)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(bytemuck::cast_slice(&out).to_vec())
+    }
+
+    /// Eager forward for MoE models (qwen3moe). No KV cache (recomputes attention each call) — a
+    /// correctness-first path: all matmuls on GPU via `gemv_wt`; qk-norm / RoPE / attention / router
+    /// softmax+top-k / expert combine on host. Returns logits (`vocab`) for the last position.
+    pub fn forward_moe(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let mc = c.moe.expect("forward_moe requires a MoE model");
+        let t = tokens.len();
+        let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
+
+        let mut hidden = vec![0f32; t * ne];
+        for (i, &tok) in tokens.iter().enumerate() {
+            hidden[i * ne..(i + 1) * ne]
+                .copy_from_slice(&self.token_embd[tok as usize * ne..(tok as usize + 1) * ne]);
+        }
+
+        for layer in &self.layers {
+            // --- attention (identical to dense qwen3: QK-norm → RoPE → causal GQA) ---
+            let hn = rmsnorm_rows(&hidden, &layer.attn_norm, t, ne, c.rms_eps);
+            let mut q = self.gemv_wt(&layer.wq, &hn, t, ne, nh * hd)?;
+            let mut k = self.gemv_wt(&layer.wk, &hn, t, ne, nkv * hd)?;
+            let v = self.gemv_wt(&layer.wv, &hn, t, ne, nkv * hd)?;
+            qk_norm_rows(&mut q, t, nh, hd, layer.q_norm.as_ref().unwrap(), c.rms_eps);
+            qk_norm_rows(
+                &mut k,
+                t,
+                nkv,
+                hd,
+                layer.k_norm.as_ref().unwrap(),
+                c.rms_eps,
+            );
+            rope_rows(&mut q, t, nh, hd, c.rope_dim, c.rope_theta);
+            rope_rows(&mut k, t, nkv, hd, c.rope_dim, c.rope_theta);
+            let attn = attention(&q, &k, &v, t, nh, nkv, hd);
+            let ao = self.gemv_wt(&layer.wo, &attn, t, nh * hd, ne)?;
+            for i in 0..t * ne {
+                hidden[i] += ao[i];
+            }
+
+            // --- MoE FFN: route each token to top-k experts, weighted SwiGLU sum ---
+            let hn2 = rmsnorm_rows(&hidden, &layer.ffn_norm, t, ne, c.rms_eps);
+            let (gate_inp, experts) = layer.moe();
+            let logits = self.gemv_wt(gate_inp, &hn2, t, ne, mc.n_expert)?;
+            for r in 0..t {
+                let rl = &logits[r * mc.n_expert..(r + 1) * mc.n_expert];
+                let maxl = rl.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut probs: Vec<f32> = rl.iter().map(|&x| (x - maxl).exp()).collect();
+                let sum: f32 = probs.iter().sum();
+                for pr in probs.iter_mut() {
+                    *pr /= sum;
+                }
+                let mut idx: Vec<usize> = (0..mc.n_expert).collect();
+                idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                idx.truncate(mc.n_used);
+                let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                let xr = hn2[r * ne..(r + 1) * ne].to_vec();
+                let mut out_row = vec![0f32; ne];
+                for &e in &idx {
+                    let w_e = probs[e] / wsum * mc.scale;
+                    let gate_e = self.gemv_wt(&experts[e].gate, &xr, 1, ne, mc.n_ff_exp)?;
+                    let up_e = self.gemv_wt(&experts[e].up, &xr, 1, ne, mc.n_ff_exp)?;
+                    let mut act = vec![0f32; mc.n_ff_exp];
+                    for i in 0..mc.n_ff_exp {
+                        act[i] = silu(gate_e[i]) * up_e[i];
+                    }
+                    let y_e = self.gemv_wt(&experts[e].down, &act, 1, mc.n_ff_exp, ne)?;
+                    for i in 0..ne {
+                        out_row[i] += w_e * y_e[i];
+                    }
+                }
+                for i in 0..ne {
+                    hidden[r * ne + i] += out_row[i];
+                }
+            }
+        }
+
+        let last = &hidden[(t - 1) * ne..t * ne];
+        let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
+        self.gemv_wt(&self.lm_head, &normed, 1, ne, c.vocab)
     }
 
     /// GPU-resident forward: records the whole stack into one command buffer (one submit),
@@ -2034,7 +2289,7 @@ impl Llama {
                 c.rms_eps,
             );
             rec.linear(
-                layer.wgateup.f16(),
+                layer.wgateup().f16(),
                 hn2.as_ref(),
                 gu.as_ref(),
                 t,
@@ -2042,7 +2297,7 @@ impl Llama {
                 2 * nff,
             );
             rec.silu_mul_fused(gu.as_ref(), act.as_ref(), t, nff);
-            rec.linear(layer.wdown.f16(), act.as_ref(), down.as_ref(), t, nff, ne);
+            rec.linear(layer.wdown().f16(), act.as_ref(), down.as_ref(), t, nff, ne);
             rec.add(hidden.as_ref(), down.as_ref(), hidden.as_ref(), t * ne);
         }
         rec.rmsnorm(
@@ -2652,9 +2907,9 @@ impl Llama {
                     ne,
                     c.rms_eps,
                 );
-                mm(&layer.wgateup, hn.as_ref(), gu.as_ref(), n, ne, 2 * nff);
+                mm(layer.wgateup(), hn.as_ref(), gu.as_ref(), n, ne, 2 * nff);
                 rec.silu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
-                mm(&layer.wdown, act.as_ref(), down.as_ref(), n, nff, ne);
+                mm(layer.wdown(), act.as_ref(), down.as_ref(), n, nff, ne);
                 rec.add(hidden.as_ref(), down.as_ref(), hidden.as_ref(), n * ne);
             } else {
                 lin_add(
@@ -2670,7 +2925,7 @@ impl Llama {
                     ffn(
                         hidden.as_ref(),
                         layer.ffn_norm_buf.as_ref(),
-                        &layer.wgateup,
+                        layer.wgateup(),
                         act.as_ref(),
                         n,
                         ne,
@@ -2688,11 +2943,18 @@ impl Llama {
                         ne,
                         c.rms_eps,
                     );
-                    lin(&layer.wgateup, hn.as_ref(), gu_ffn.as_ref(), n, ne, 2 * nff);
+                    lin(
+                        layer.wgateup(),
+                        hn.as_ref(),
+                        gu_ffn.as_ref(),
+                        n,
+                        ne,
+                        2 * nff,
+                    );
                     rec.silu_mul_fused(gu_ffn.as_ref(), act.as_ref(), n, nff);
                 }
                 lin_add(
-                    &layer.wdown,
+                    layer.wdown(),
                     act.as_ref(),
                     hidden.as_ref(),
                     hidden.as_ref(),
@@ -2834,6 +3096,50 @@ impl Llama {
         // Size the KV cache to exactly what this run needs — bounded only by VRAM, not a fixed cap.
         let mut kv = self.new_kv(prompt_tokens.len() + max_new + 8)?;
         let generated = self.run_in_cache(&prompt_tokens, &mut kv, max_new, on_token)?;
+        self.tokenizer
+            .decode(&generated, true)
+            .map_err(|e| anyhow!("decode: {e}"))
+    }
+
+    /// True for MoE models (qwen3moe) — use [`generate_moe`](Self::generate_moe), not the
+    /// KV-resident path (which is dense-only).
+    pub fn is_moe(&self) -> bool {
+        self.cfg.moe.is_some()
+    }
+
+    /// One-shot MoE generation (qwen3moe). No KV cache: re-runs `forward_moe` over the growing token
+    /// sequence each step (O(n²) — correctness-first). `prompt` is the chat-formatted string;
+    /// `on_token` fires once per generated token. Returns the decoded reply.
+    pub fn generate_moe(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<String> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let mut tokens: Vec<u32> = enc.get_ids().to_vec();
+        let sampler = self.sampler.get();
+        let mut rng = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9e3779b97f4a7c15)
+            | 1;
+        let mut stream = StreamDecoder::default();
+        let mut generated: Vec<u32> = Vec::new();
+        for _ in 0..max_new {
+            let logits = self.forward_moe(&tokens)?;
+            let next = sample_logits(&logits, sampler, &mut rng);
+            if self.cfg.eos_ids.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            tokens.push(next);
+            let full = self.tokenizer.decode(&generated, true).unwrap_or_default();
+            on_token(&stream.step(&full));
+        }
         self.tokenizer
             .decode(&generated, true)
             .map_err(|e| anyhow!("decode: {e}"))
@@ -3047,6 +3353,18 @@ fn rmsnorm_rows(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<
         }
     }
     y
+}
+
+/// Qwen3 per-head RMSNorm (QK-norm): normalize each head's `hd`-vector by its RMS, scaled by `w[hd]`.
+fn qk_norm_rows(x: &mut [f32], t: usize, n_heads: usize, hd: usize, w: &[f32], eps: f32) {
+    for i in 0..t * n_heads {
+        let row = &mut x[i * hd..(i + 1) * hd];
+        let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / hd as f32;
+        let scale = 1.0 / (ms + eps).sqrt();
+        for d in 0..hd {
+            row[d] = row[d] * scale * w[d];
+        }
+    }
 }
 
 /// ggml NORM rope (interleaved pairs (2i, 2i+1)), applied per head over the first `rope_dim` dims.

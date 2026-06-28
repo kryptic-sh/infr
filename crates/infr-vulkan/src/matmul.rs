@@ -1,6 +1,6 @@
 //! Naive f32 matrix multiplication via a WGSL compute shader compiled to SPIR-V at runtime.
 //!
-//! Shader strategy: WGSL source → `naga` (pure-Rust) → SPIR-V words at first call (cached via
+//! Shader strategy: GLSL source → SPIR-V at build time (glslc, see build.rs), cached via
 //! `OnceLock`). No native `glslangValidator`/`shaderc` dependency.
 //!
 //! Kernel: C[M,N] = A[M,K] × B[K,N].  One invocation per output element; workgroup 16×16×1.

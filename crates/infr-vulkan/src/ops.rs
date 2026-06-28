@@ -27,38 +27,6 @@ pub(crate) struct ComputeKernel {
     pub push_size: u32,
 }
 
-fn compile_wgsl(src: &str) -> Vec<u32> {
-    use naga::back::spv;
-    use naga::front::wgsl;
-    use naga::valid::{Capabilities, ValidationFlags, Validator};
-    let module = wgsl::parse_str(src).expect("WGSL parse");
-    let info = Validator::new(
-        ValidationFlags::all(),
-        Capabilities::IMMEDIATES | Capabilities::SHADER_FLOAT16,
-    )
-    .validate(&module)
-    .expect("WGSL validate");
-    spv::write_vec(
-        &module,
-        &info,
-        &spv::Options {
-            lang_version: (1, 3),
-            ..Default::default()
-        },
-        None,
-    )
-    .expect("SPIR-V write")
-}
-
-pub(crate) fn make_compute_kernel(
-    device: &ash::Device,
-    wgsl: &str,
-    n_buf: usize,
-    push_size: u32,
-) -> ComputeKernel {
-    make_compute_kernel_from_spv(device, &compile_wgsl(wgsl), n_buf, push_size, None)
-}
-
 pub(crate) fn make_compute_kernel_from_spv(
     device: &ash::Device,
     spv: &[u32],
@@ -161,20 +129,7 @@ pub(crate) fn destroy_compute_kernel(device: &ash::Device, k: &ComputeKernel) {
 }
 
 impl VulkanBackend {
-    /// Fetch-or-build a named kernel; returns a Copy of its handles.
-    pub(crate) fn kernel(
-        &self,
-        name: &'static str,
-        wgsl: &str,
-        n_buf: usize,
-        push_size: u32,
-    ) -> ComputeKernel {
-        let mut map = self.shared.kernels.lock().unwrap();
-        *map.entry(name)
-            .or_insert_with(|| make_compute_kernel(&self.shared.device, wgsl, n_buf, push_size))
-    }
-
-    /// Like `kernel`, but from precompiled SPIR-V (for GLSL-compiled coopmat shaders).
+    /// Fetch-or-build a named kernel from precompiled SPIR-V (build-compiled GLSL → `.spv`).
     pub(crate) fn kernel_spv(
         &self,
         name: &'static str,

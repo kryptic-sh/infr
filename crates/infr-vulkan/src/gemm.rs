@@ -17,8 +17,8 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-/// Build-compiled native-block dequant GEMV SPIR-V for `(dtype, residual)`, or `None` if that
-/// format is not yet migrated off the runtime (naga) path. Grows one match arm per format.
+/// Build-compiled native-block dequant GEMV SPIR-V for `(dtype, residual)`, or `None` if `dtype`
+/// is not a native-block quant format. One match arm per quant format.
 pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     // Each arm lazily decodes its own build-compiled .spv (a fresh `static` per block).

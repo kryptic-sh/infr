@@ -499,12 +499,8 @@ impl<'a> Recorder<'a> {
     ) {
         self.stamp("lm_head");
         let name = crate::linear::native_kernel_name(dtype, false);
-        let k = match crate::gemm::native_build_spv(dtype, false) {
-            Some(spv) => self.be.kernel_spv(name, spv, 3, 12),
-            None => self
-                .be
-                .kernel(name, &crate::linear::native_gemv_wgsl(dtype, false), 3, 12),
-        };
+        let spv = crate::gemm::native_build_spv(dtype, false).expect("native GEMV spv");
+        let k = self.be.kernel_spv(name, spv, 3, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -533,12 +529,8 @@ impl<'a> Recorder<'a> {
     ) {
         self.stamp("o_or_down");
         let name = crate::linear::native_kernel_name(dtype, true);
-        let k = match crate::gemm::native_build_spv(dtype, true) {
-            Some(spv) => self.be.kernel_spv(name, spv, 4, 12),
-            None => self
-                .be
-                .kernel(name, &crate::linear::native_gemv_wgsl(dtype, true), 4, 12),
-        };
+        let spv = crate::gemm::native_build_spv(dtype, true).expect("native GEMV spv");
+        let k = self.be.kernel_spv(name, spv, 4, 12);
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());

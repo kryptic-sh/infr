@@ -17,24 +17,41 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-// ── Build-compiled native-block dequant GEMVs (one .spv per format × residual) ──
-const NATIVE_Q8_0_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_q8_0.spv"));
-const NATIVE_Q8_0_RES_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/native_q8_0_res.spv"));
-
 /// Build-compiled native-block dequant GEMV SPIR-V for `(dtype, residual)`, or `None` if that
 /// format is not yet migrated off the runtime (naga) path. Grows one match arm per format.
 pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static [u32]> {
     use infr_core::DType::*;
-    macro_rules! sp {
-        ($s:ident, $b:ident) => {{
-            static $s: OnceLock<Vec<u32>> = OnceLock::new();
-            $s.get_or_init(|| spv_words($b)).as_slice()
+    // Each arm lazily decodes its own build-compiled .spv (a fresh `static` per block).
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
         }};
     }
     Some(match (dtype, res) {
-        (Q8_0, false) => sp!(NQ80, NATIVE_Q8_0_SPV_BYTES),
-        (Q8_0, true) => sp!(NQ80R, NATIVE_Q8_0_RES_SPV_BYTES),
+        (Q8_0, false) => v!("native_q8_0"),
+        (Q8_0, true) => v!("native_q8_0_res"),
+        (Q4_0, false) => v!("native_q4_0"),
+        (Q4_0, true) => v!("native_q4_0_res"),
+        (Q4_1, false) => v!("native_q4_1"),
+        (Q4_1, true) => v!("native_q4_1_res"),
+        (Q5_0, false) => v!("native_q5_0"),
+        (Q5_0, true) => v!("native_q5_0_res"),
+        (Q5_1, false) => v!("native_q5_1"),
+        (Q5_1, true) => v!("native_q5_1_res"),
+        (Q2K, false) => v!("native_q2k"),
+        (Q2K, true) => v!("native_q2k_res"),
+        (Q3K, false) => v!("native_q3k"),
+        (Q3K, true) => v!("native_q3k_res"),
+        (Q4K, false) => v!("native_q4k"),
+        (Q4K, true) => v!("native_q4k_res"),
+        (Q5K, false) => v!("native_q5k"),
+        (Q5K, true) => v!("native_q5k_res"),
+        (Q6K, false) => v!("native_q6k"),
+        (Q6K, true) => v!("native_q6k_res"),
         _ => return None,
     })
 }

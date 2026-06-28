@@ -1442,7 +1442,9 @@ impl<'a> Recorder<'a> {
         hd: usize,
     ) {
         self.stamp("attention");
-        let kern = self.be.kernel("attention", ops::ATTENTION_WGSL, 4, 16);
+        let kern = self
+            .be
+            .kernel_spv("attention", crate::gemm::attention_spv(), 4, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());

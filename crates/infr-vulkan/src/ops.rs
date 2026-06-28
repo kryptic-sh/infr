@@ -489,7 +489,7 @@ impl VulkanBackend {
         hd: usize,
     ) -> Result<Vec<f32>> {
         assert!(hd <= 128, "attention kernel supports hd<=128");
-        let kern = self.kernel("attention", ATTENTION_WGSL, 4, 16);
+        let kern = self.kernel_spv("attention", crate::gemm::attention_spv(), 4, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -815,51 +815,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
             }
         }
     }
-}
-"#;
-
-pub(crate) const ATTENTION_WGSL: &str = r#"
-struct PC { t: u32, nh: u32, nkv: u32, hd: u32 }
-var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       q: array<f32>;
-@group(0) @binding(1) var<storage, read>       k: array<f32>;
-@group(0) @binding(2) var<storage, read>       v: array<f32>;
-@group(0) @binding(3) var<storage, read_write> o: array<f32>;
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if idx >= pc.t * pc.nh { return; }
-    let ti = idx / pc.nh;
-    let h = idx % pc.nh;
-    let group = pc.nh / pc.nkv;
-    let kvh = h / group;
-    let hd = pc.hd;
-    let scale = 1.0 / sqrt(f32(hd));
-    let qbase = (ti * pc.nh + h) * hd;
-
-    var acc: array<f32, 128>;
-    for (var d: u32 = 0u; d < hd; d = d + 1u) { acc[d] = 0.0; }
-    var m: f32 = -3.0e38;
-    var l: f32 = 0.0;
-
-    for (var j: u32 = 0u; j <= ti; j = j + 1u) {
-        let kbase = (j * pc.nkv + kvh) * hd;
-        var dot: f32 = 0.0;
-        for (var d: u32 = 0u; d < hd; d = d + 1u) { dot = dot + q[qbase + d] * k[kbase + d]; }
-        let s = dot * scale;
-        if s > m {
-            let corr = exp(m - s);
-            l = l * corr;
-            for (var d: u32 = 0u; d < hd; d = d + 1u) { acc[d] = acc[d] * corr; }
-            m = s;
-        }
-        let p = exp(s - m);
-        l = l + p;
-        let vbase = (j * pc.nkv + kvh) * hd;
-        for (var d: u32 = 0u; d < hd; d = d + 1u) { acc[d] = acc[d] + p * v[vbase + d]; }
-    }
-    let obase = (ti * pc.nh + h) * hd;
-    for (var d: u32 = 0u; d < hd; d = d + 1u) { o[obase + d] = acc[d] / l; }
 }
 "#;
 

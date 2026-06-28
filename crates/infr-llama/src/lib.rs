@@ -3288,18 +3288,51 @@ impl Llama {
             c.rms_eps,
         );
         rec.store_f16(vr.as_ref(), kv.v[li].as_ref(), n * kvrow, pos * kvrow);
-        rec.attention_kv(
-            q_f16.as_ref(),
-            kv.k[li].as_ref(),
-            kv.v[li].as_ref(),
-            attn.as_ref(),
-            n,
-            pos + n,
-            nh,
-            nkv,
-            hd,
-            pos,
-        );
+        // Single-token decode (n==1) at depth: split each head's KV range across many workgroups
+        // (flash-decode split-K, partials in pm/pl/pacc) so attention isn't stuck on `nh` workgroups
+        // grinding the whole cache serially — the dense path's decode kernel. Prefill (n>1) uses the
+        // basic per-(token,head) attention_kv. ~32 chunks/head saturates pass-1's KV bandwidth.
+        let kv_len = pos + n;
+        let chunk = (kv_len / 32).clamp(64, 512);
+        if n == 1 && kv_len > chunk {
+            let n_chunks = kv_len.div_ceil(chunk);
+            let al = |elems: usize| -> Result<Box<dyn Buffer>> {
+                self.be
+                    .alloc((elems * 4).max(4), BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))
+            };
+            let pm = al(nh * n_chunks)?;
+            let pl = al(nh * n_chunks)?;
+            let pacc = al(nh * n_chunks * hd)?;
+            rec.attention_kv_split(
+                q_f16.as_ref(),
+                kv.k[li].as_ref(),
+                kv.v[li].as_ref(),
+                attn.as_ref(),
+                pm.as_ref(),
+                pl.as_ref(),
+                pacc.as_ref(),
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                chunk,
+                n_chunks,
+            );
+        } else {
+            rec.attention_kv(
+                q_f16.as_ref(),
+                kv.k[li].as_ref(),
+                kv.v[li].as_ref(),
+                attn.as_ref(),
+                n,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                pos,
+            );
+        }
         rec.finish().map_err(|e| anyhow!("{e}"))?;
         let mut out = vec![0u8; n * nh * hd * 4];
         self.be

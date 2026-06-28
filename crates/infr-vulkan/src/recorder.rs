@@ -359,6 +359,37 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Native-block projection GEMM `c = a · Wᵀ` for prefill: raw GGUF blocks dequantized in-shader
+    /// during coopmat tiled staging (decode-once per weight element, reused across the 64-row tile).
+    /// `c` is allocated `ceil(m/64)*64` rows. Requires `n%64==0`, `k%32==0`.
+    pub fn matmul_native(
+        &self,
+        dtype: infr_core::DType,
+        a: &dyn Buffer,
+        w: &dyn Buffer,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.stamp("matmul_proj");
+        let name = crate::linear::native_gemm_kernel_name(dtype);
+        let spv = crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv");
+        let kern = self.be.kernel_sg(name, spv, 3, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(a), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Integer (dp4a) u4 projection GEMM — the mmq path. Quantizes activations to int8 (Q8 per
     /// 32-block) via `quant_q8`, then runs the dp4a matmul keeping weights quantized (no per-GEMM
     /// dequant). Scratch (caller-allocated): `qa` = m*k bytes (int8), `dact`/`sact` = m*(k/32)*2

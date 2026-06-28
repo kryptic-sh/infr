@@ -82,6 +82,47 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
     })
 }
 
+/// SPIR-V for the native-block prefill GEMM (`C=A·Wᵀ`, raw GGUF blocks dequantized in-shader via the
+/// coopmat tiled kernel). One specialization per quant format; `None` for unsupported dtypes.
+pub(crate) fn native_gemm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q8_0 => v!("native_gemm_q8_0"),
+        Q4_0 => v!("native_gemm_q4_0"),
+        Q4_1 => v!("native_gemm_q4_1"),
+        Q5_0 => v!("native_gemm_q5_0"),
+        Q5_1 => v!("native_gemm_q5_1"),
+        Q2K => v!("native_gemm_q2k"),
+        Q3K => v!("native_gemm_q3k"),
+        Q4K => v!("native_gemm_q4k"),
+        Q5K => v!("native_gemm_q5k"),
+        Q6K => v!("native_gemm_q6k"),
+        Iq4Nl => v!("native_gemm_iq4nl"),
+        Iq4Xs => v!("native_gemm_iq4xs"),
+        Mxfp4 => v!("native_gemm_mxfp4"),
+        Nvfp4 => v!("native_gemm_nvfp4"),
+        Tq1_0 => v!("native_gemm_tq1_0"),
+        Tq2_0 => v!("native_gemm_tq2_0"),
+        Iq2Xxs => v!("native_gemm_iq2xxs"),
+        Iq2Xs => v!("native_gemm_iq2xs"),
+        Iq2S => v!("native_gemm_iq2s"),
+        Iq3Xxs => v!("native_gemm_iq3xxs"),
+        Iq3S => v!("native_gemm_iq3s"),
+        Iq1S => v!("native_gemm_iq1s"),
+        Iq1M => v!("native_gemm_iq1m"),
+        _ => return None,
+    })
+}
+
 const GEMM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat.spv"));
 const GEMM_TILED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_coopmat_tiled.spv"));

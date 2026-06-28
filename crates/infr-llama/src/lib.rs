@@ -2296,10 +2296,15 @@ impl Llama {
                         );
                     }
                 }
-                // Native-block prefill: use the native GEMV (correct but slower than GEMM;
-                // a native GEMM path is Phase 6 follow-on). Falls back gracefully.
+                // Native-block prefill: coopmat tiled GEMM with in-shader dequant (decode-once per
+                // weight element, reused across the row tile). Needs n%64, k%32 (all projections
+                // satisfy); else fall back to the native GEMV.
                 Wt::Native { buf, dtype } => {
-                    rec.linear_native(*dtype, buf.as_ref(), a, cbuf, rows, k, outf)
+                    if outf.is_multiple_of(64) && k.is_multiple_of(32) {
+                        rec.matmul_native(*dtype, a, buf.as_ref(), cbuf, rows, k, outf)
+                    } else {
+                        rec.linear_native(*dtype, buf.as_ref(), a, cbuf, rows, k, outf)
+                    }
                 }
             }
         };
@@ -4330,6 +4335,139 @@ mod gpu_affine_tests {
             gpu_out[max_idx],
             cpu_out[max_idx]
         );
+    }
+
+    // ── Native-block prefill GEMM parity (matmul_native vs trusted linear_native) ──
+    //
+    // The tiled coopmat GEMM reuses the same per-format dqblk decode as the GEMV, so the decode is
+    // already covered by the *_native_matches_cpu tests. This guards the NEW code — the 64x64 tile,
+    // shared staging, and coopmat accumulation — by checking that C[m,:] from matmul_native equals
+    // the GEMV linear_native(weight, A[m]) for every row m, across M spanning multiple row-tiles.
+    // Weight blocks vary their f16 d per block so columns are distinguishable (catches col mixups).
+
+    // Build one valid native block of `dtype` with f16 scale `d` and a varied payload from `seed`.
+    fn native_block(dtype: infr_core::DType, d: f32, seed: u8) -> Vec<u8> {
+        use infr_core::DType::*;
+        let dbits = half::f16::from_f32(d).to_bits().to_le_bytes();
+        match dtype {
+            Q8_0 => {
+                let mut b = vec![0u8; 34];
+                b[0..2].copy_from_slice(&dbits);
+                fill(&mut b[2..34], 17, seed);
+                b
+            }
+            Q4K => {
+                let mut b = vec![0u8; 144];
+                b[0..2].copy_from_slice(&dbits); // d
+                b[2..4].copy_from_slice(&half::f16::from_f32(0.0).to_bits().to_le_bytes()); // dmin
+                fill(&mut b[4..16], 13, seed); // 6-bit scales
+                fill(&mut b[16..144], 7, seed); // qs
+                b
+            }
+            Q6K => {
+                let mut b = vec![0u8; 210];
+                fill(&mut b[0..128], 7, seed); // ql
+                fill(&mut b[128..192], 11, seed); // qh
+                fill(&mut b[192..208], 3, seed); // i8 scales
+                b[208..210].copy_from_slice(&dbits); // d
+                b
+            }
+            other => panic!("native_block: add {other:?}"),
+        }
+    }
+
+    fn check_native_gemm(dtype: infr_core::DType, m: usize) {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        use infr_vulkan::linear::pad_to_u32_align;
+        let n = 64usize;
+        let k = 256usize;
+        let belems = if dtype == infr_core::DType::Q8_0 {
+            32
+        } else {
+            256
+        };
+        let blocks_per_row = k / belems;
+
+        // Weight [N, K] as native blocks (row-major). d varies per block → distinguishable columns.
+        let mut wbytes: Vec<u8> = Vec::new();
+        for o in 0..n {
+            for bk in 0..blocks_per_row {
+                let d = 0.005 * ((o % 7) as f32 + 1.0) + 0.001 * bk as f32;
+                wbytes.extend_from_slice(&native_block(dtype, d, (o * 3 + bk * 5) as u8));
+            }
+        }
+        let wbuf = be.upload_weight_bytes(&pad_to_u32_align(&wbytes)).unwrap();
+
+        // Activations [M, K], varied per (row, col).
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.05 + ((i / k) as f32) * 0.001)
+            .collect();
+        let abuf = be.alloc(a.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(abuf.as_ref(), bytemuck::cast_slice(&a)).unwrap();
+
+        // GPU GEMM → C [ceil(m/64)*64, N]. Device-local (coopmat store needs it), download via copy.
+        let crows = m.div_ceil(64) * 64;
+        let cbuf = be.alloc(crows * n * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.matmul_native(dtype, abuf.as_ref(), wbuf.as_ref(), cbuf.as_ref(), m, k, n);
+        rec.finish().unwrap();
+        let mut cbytes = vec![0u8; crows * n * 4];
+        be.download(cbuf.as_ref(), &mut cbytes).unwrap();
+        let cgemm: &[f32] = bytemuck::cast_slice(&cbytes);
+
+        // Reference: one GEMV per row → C[m,:]
+        for row in 0..m {
+            let xbuf = be.alloc(k * 4, BufferUsage::Staging).unwrap();
+            be.upload(
+                xbuf.as_ref(),
+                bytemuck::cast_slice(&a[row * k..row * k + k]),
+            )
+            .unwrap();
+            let ybuf = be.alloc(n * 4, BufferUsage::Readback).unwrap();
+            let rec2 = be.recorder().unwrap();
+            rec2.linear_native(dtype, wbuf.as_ref(), xbuf.as_ref(), ybuf.as_ref(), 1, k, n);
+            rec2.finish().unwrap();
+            let mut ybytes = vec![0u8; n * 4];
+            be.download(ybuf.as_ref(), &mut ybytes).unwrap();
+            let yref: &[f32] = bytemuck::cast_slice(&ybytes);
+            // The GEMM rounds activations+weights to f16 for coopmat (GEMV keeps f32 activations), so
+            // compare error against the row's largest magnitude (standard GEMM metric) — near-zero
+            // outputs from cancellation otherwise blow up a pure relative error.
+            let rmax = yref.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            for col in 0..n {
+                let g = cgemm[row * n + col];
+                let r = yref[col];
+                let err = (g - r).abs();
+                assert!(
+                    err < 0.02 * rmax + 1e-4,
+                    "{dtype:?} GEMM vs GEMV at [{row},{col}]: gemm={g} gemv={r} err={err} rmax={rmax}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q8_0_native_gemm_matches_gemv() {
+        check_native_gemm(infr_core::DType::Q8_0, 70);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q4k_native_gemm_matches_gemv() {
+        check_native_gemm(infr_core::DType::Q4K, 70);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q6k_native_gemm_matches_gemv() {
+        check_native_gemm(infr_core::DType::Q6K, 70);
     }
 
     // ── Native-block codebook formats (IQ4_NL/XS, MXFP4, NVFP4, TQ1_0, TQ2_0) ────

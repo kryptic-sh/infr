@@ -80,6 +80,37 @@ pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static s
     }
 }
 
+/// Kernel-cache key for the native-block prefill GEMM (one coopmat pipeline per quant format).
+pub fn native_gemm_kernel_name(dtype: infr_core::DType) -> &'static str {
+    use infr_core::DType::*;
+    match dtype {
+        Q8_0 => "native_gemm_q8_0",
+        Q4_0 => "native_gemm_q4_0",
+        Q4_1 => "native_gemm_q4_1",
+        Q5_0 => "native_gemm_q5_0",
+        Q5_1 => "native_gemm_q5_1",
+        Q2K => "native_gemm_q2k",
+        Q3K => "native_gemm_q3k",
+        Q4K => "native_gemm_q4k",
+        Q5K => "native_gemm_q5k",
+        Q6K => "native_gemm_q6k",
+        Iq4Nl => "native_gemm_iq4nl",
+        Iq4Xs => "native_gemm_iq4xs",
+        Mxfp4 => "native_gemm_mxfp4",
+        Nvfp4 => "native_gemm_nvfp4",
+        Tq1_0 => "native_gemm_tq1_0",
+        Tq2_0 => "native_gemm_tq2_0",
+        Iq2Xxs => "native_gemm_iq2xxs",
+        Iq2Xs => "native_gemm_iq2xs",
+        Iq2S => "native_gemm_iq2s",
+        Iq3Xxs => "native_gemm_iq3xxs",
+        Iq3S => "native_gemm_iq3s",
+        Iq1S => "native_gemm_iq1s",
+        Iq1M => "native_gemm_iq1m",
+        _ => panic!("no native GEMM for {:?}", dtype),
+    }
+}
+
 /// Pad raw GGUF block bytes to the next multiple of 4 for upload as `array<u32>`.
 /// Appends zero bytes; the final u32 word's padding bytes are never read (they
 /// contain only out-of-block data which the shader never accesses for valid g).

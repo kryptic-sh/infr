@@ -901,6 +901,126 @@ fn dq(g: u32) -> f32 {
 }
 "#;
 
+/// IQ3_XXS: [f16 d][u8 qs[64]][u8 sas[32]] = 98 bytes, 256 elements. u32 grid (256 entries).
+const DQ_IQ3XXS: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 98u;
+    let d = f16tof32(ru16(bd));
+    let ib32 = p / 32u;
+    let l = (p % 32u) / 8u;
+    let j8 = p % 8u;
+    let g1_idx = rb(bd + 2u + ib32 * 8u + 2u * l);
+    let g2_idx = rb(bd + 2u + ib32 * 8u + 2u * l + 1u);
+    let aux32 = ru32b(bd + 66u + 4u * ib32);
+    let db = d * (0.5 + f32(aux32 >> 28u)) * 0.5;
+    let signs = KSIGNS[(aux32 >> (7u * l)) & 127u];
+    var gidx: u32;
+    var bytej: u32;
+    if j8 < 4u { gidx = g1_idx; bytej = j8; } else { gidx = g2_idx; bytej = j8 - 4u; }
+    let byte = (G_IQ3XXS[gidx] >> (8u * bytej)) & 0xFFu;
+    let gv = f32(i32(byte) - i32(select(0u, 256u, byte >= 128u)));
+    let sign = select(1.0, -1.0, ((signs >> j8) & 1u) != 0u);
+    return db * gv * sign;
+}
+"#;
+
+/// IQ3_S: [f16 d][u8 qs[64]][u8 qh[8]][u8 signs[32]][u8 scales[4]] = 110 bytes, 256 elements.
+const DQ_IQ3S: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 110u;
+    let d = f16tof32(ru16(bd));
+    let pair = p / 64u;
+    let group = (p % 64u) / 32u;
+    let within = p % 32u;
+    let l = within / 8u;
+    let j8 = within % 8u;
+    let sb = rb(bd + 106u + pair);
+    let db = select(d * (1.0 + 2.0 * f32(sb & 0xFu)), d * (1.0 + 2.0 * f32(sb >> 4u)), group == 1u);
+    let qh = rb(bd + 66u + pair * 2u + group);
+    let qs_base = bd + 2u + pair * 16u + group * 8u;
+    let signs_byte = rb(bd + 74u + pair * 8u + group * 4u + l);
+    var grididx: u32;
+    var bytej: u32;
+    if j8 < 4u {
+        grididx = rb(qs_base + 2u * l) | ((qh << (8u - 2u * l)) & 256u);
+        bytej = j8;
+    } else {
+        grididx = rb(qs_base + 2u * l + 1u) | ((qh << (7u - 2u * l)) & 256u);
+        bytej = j8 - 4u;
+    }
+    let byte = (G_IQ3S[grididx] >> (8u * bytej)) & 0xFFu;
+    let gv = f32(i32(byte) - i32(select(0u, 256u, byte >= 128u)));
+    let sign = select(1.0, -1.0, ((signs_byte >> j8) & 1u) != 0u);
+    return db * gv * sign;
+}
+"#;
+
+/// IQ1_S: [f16 d][u8 qs[32]][u16 qh[8]] = 50 bytes, 256 elements. 11-bit grid index + delta.
+const DQ_IQ1S: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 50u;
+    let d = f16tof32(ru16(bd));
+    let ib = p / 32u;
+    let l = (p % 32u) / 8u;
+    let j = p % 8u;
+    let qh = ru16(bd + 34u + 2u * ib);
+    let dl = d * (2.0 * f32((qh >> 12u) & 7u) + 1.0);
+    let delta = select(0.125, -0.125, (qh & 0x8000u) != 0u);
+    let grid_idx = rb(bd + 2u + ib * 4u + l) | (((qh >> (3u * l)) & 7u) << 8u);
+    var byte: u32;
+    if j < 4u { byte = (G_IQ1S[2u * grid_idx] >> (8u * j)) & 0xFFu; }
+    else { byte = (G_IQ1S[2u * grid_idx + 1u] >> (8u * (j - 4u))) & 0xFFu; }
+    let gv = f32(i32(byte) - i32(select(0u, 256u, byte >= 128u)));
+    return dl * (gv + delta);
+}
+"#;
+
+/// IQ1_M: [u8 qs[32]][u8 qh[16]][u8 scales[8]] = 56 bytes, 256 elements. d packed in scale nibbles;
+/// reuses the IQ1S grid.
+const DQ_IQ1M: &str = r#"
+fn dq(g: u32) -> f32 {
+    let b = g / 256u;
+    let p = g % 256u;
+    let bd = b * 56u;
+    let sc0 = ru16(bd + 48u);
+    let sc1 = ru16(bd + 50u);
+    let sc2 = ru16(bd + 52u);
+    let sc3 = ru16(bd + 54u);
+    let d_bits = (sc0 >> 12u) | ((sc1 >> 8u) & 0xF0u) | ((sc2 >> 4u) & 0xF00u) | (sc3 & 0xF000u);
+    let d = f16tof32(d_bits);
+    let ib = p / 32u;
+    let l = (p % 32u) / 8u;
+    let j = p % 8u;
+    var scw: u32;
+    let scidx = ib / 2u;
+    if scidx == 0u { scw = sc0; } else if scidx == 1u { scw = sc1; }
+    else if scidx == 2u { scw = sc2; } else { scw = sc3; }
+    let dl1 = d * (2.0 * f32((scw >> (6u * (ib & 1u))) & 7u) + 1.0);
+    let dl2 = d * (2.0 * f32((scw >> (6u * (ib & 1u) + 3u)) & 7u) + 1.0);
+    let dl = select(dl1, dl2, l >= 2u);
+    let qh0 = rb(bd + 32u + ib * 2u);
+    let qh1 = rb(bd + 32u + ib * 2u + 1u);
+    var grididx: u32;
+    var deltaneg: bool;
+    if l == 0u { grididx = rb(bd + ib * 4u) | ((qh0 << 8u) & 0x700u); deltaneg = (qh0 & 0x08u) != 0u; }
+    else if l == 1u { grididx = rb(bd + ib * 4u + 1u) | ((qh0 << 4u) & 0x700u); deltaneg = (qh0 & 0x80u) != 0u; }
+    else if l == 2u { grididx = rb(bd + ib * 4u + 2u) | ((qh1 << 8u) & 0x700u); deltaneg = (qh1 & 0x08u) != 0u; }
+    else { grididx = rb(bd + ib * 4u + 3u) | ((qh1 << 4u) & 0x700u); deltaneg = (qh1 & 0x80u) != 0u; }
+    let delta = select(0.125, -0.125, deltaneg);
+    var byte: u32;
+    if j < 4u { byte = (G_IQ1S[2u * grididx] >> (8u * j)) & 0xFFu; }
+    else { byte = (G_IQ1S[2u * grididx + 1u] >> (8u * (j - 4u))) & 0xFFu; }
+    let gv = f32(i32(byte) - i32(select(0u, 256u, byte >= 128u)));
+    return dl * (gv + delta);
+}
+"#;
+
 /// Return the static kernel name for a native-block GEMV (Phase 0-2).
 pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static str {
     use infr_core::DType::*;
@@ -943,6 +1063,14 @@ pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static s
         (Iq2Xs, true) => "native_iq2xs_res",
         (Iq2S, false) => "native_iq2s",
         (Iq2S, true) => "native_iq2s_res",
+        (Iq3Xxs, false) => "native_iq3xxs",
+        (Iq3Xxs, true) => "native_iq3xxs_res",
+        (Iq3S, false) => "native_iq3s",
+        (Iq3S, true) => "native_iq3s_res",
+        (Iq1S, false) => "native_iq1s",
+        (Iq1S, true) => "native_iq1s_res",
+        (Iq1M, false) => "native_iq1m",
+        (Iq1M, true) => "native_iq1m_res",
         _ => panic!("no native GEMV for {:?}", dtype),
     }
 }
@@ -989,6 +1117,23 @@ pub fn native_gemv_wgsl(dtype: infr_core::DType, residual: bool) -> String {
         Iq2S => {
             let grid = grid_u64_wgsl("G_IQ2S", &infr_core::iquant_grids::IQ2S_GRID);
             return format!("{hdr}{grid}{DQ_IQ2S}{body}");
+        }
+        Iq3Xxs => {
+            let grid = grid_u32_wgsl("G_IQ3XXS", &infr_core::iquant_grids::IQ3XXS_GRID);
+            let ks = ksigns_wgsl();
+            return format!("{hdr}{grid}{ks}{DQ_IQ3XXS}{body}");
+        }
+        Iq3S => {
+            let grid = grid_u32_wgsl("G_IQ3S", &infr_core::iquant_grids::IQ3S_GRID);
+            return format!("{hdr}{grid}{DQ_IQ3S}{body}");
+        }
+        Iq1S => {
+            let grid = grid_u64_wgsl("G_IQ1S", &infr_core::iquant_grids::IQ1S_GRID);
+            return format!("{hdr}{grid}{DQ_IQ1S}{body}");
+        }
+        Iq1M => {
+            let grid = grid_u64_wgsl("G_IQ1S", &infr_core::iquant_grids::IQ1S_GRID);
+            return format!("{hdr}{grid}{DQ_IQ1M}{body}");
         }
         _ => panic!("no native GEMV for {dtype:?}"),
     };

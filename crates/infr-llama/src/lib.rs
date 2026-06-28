@@ -1426,6 +1426,10 @@ fn is_native_supported(d: infr_core::DType) -> bool {
             | Iq2Xxs
             | Iq2Xs
             | Iq2S
+            | Iq3Xxs
+            | Iq3S
+            | Iq1S
+            | Iq1M
     )
 }
 
@@ -4471,6 +4475,49 @@ mod gpu_affine_tests {
         fill(&mut block[66..74], 13, 2); // qh
         fill(&mut block[74..82], 19, 1); // scales
         check_native_cb(infr_core::DType::Iq2S, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn iq3xxs_native_matches_cpu() {
+        let mut block = vec![0u8; 98];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..66], 7, 1); // qs (grid indices)
+        fill(&mut block[66..98], 13, 3); // sas (scale+signs)
+        check_native_cb(infr_core::DType::Iq3Xxs, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn iq3s_native_matches_cpu() {
+        let mut block = vec![0u8; 110];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..66], 11, 2); // qs
+        fill(&mut block[66..74], 5, 1); // qh
+        fill(&mut block[74..106], 17, 3); // signs
+        fill(&mut block[106..110], 3, 1); // scales
+        check_native_cb(infr_core::DType::Iq3S, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn iq1s_native_matches_cpu() {
+        let mut block = vec![0u8; 50];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..34], 13, 1); // qs
+        fill(&mut block[34..50], 23, 7); // qh (u16: grid hi bits + scale + delta)
+        check_native_cb(infr_core::DType::Iq1S, &block);
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn iq1m_native_matches_cpu() {
+        let mut block = vec![0u8; 56];
+        fill(&mut block[0..32], 17, 3); // qs
+        fill(&mut block[32..48], 11, 1); // qh
+                                         // scales: nonzero so packed d != 0
+        block[48..56].copy_from_slice(&[0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0x3d]);
+        check_native_cb(infr_core::DType::Iq1M, &block);
     }
 }
 

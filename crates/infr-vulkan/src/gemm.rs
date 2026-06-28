@@ -53,6 +53,7 @@ const SILU_MUL_FUSED_SPV_BYTES: &[u8] =
 const STORE_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/store_f16.spv"));
 const ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv"));
 const LINEAR_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
+const LINEAR_BF16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
 const MMV_Q4_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q4.spv"));
 const MMV_Q8_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_mat_vec_q8.spv"));
 const MMV_Q4_RES_SPV_BYTES: &[u8] =
@@ -195,6 +196,11 @@ pub(crate) fn rope_spv() -> &'static [u32] {
 pub(crate) fn linear_f16_spv() -> &'static [u32] {
     static LINEAR_F16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_F16_SPV.get_or_init(|| spv_words(LINEAR_F16_SPV_BYTES))
+}
+/// SPIR-V for the bf16-weight GEMV (`y=x·Wᵀ`).
+pub(crate) fn linear_bf16_spv() -> &'static [u32] {
+    static LINEAR_BF16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    LINEAR_BF16_SPV.get_or_init(|| spv_words(LINEAR_BF16_SPV_BYTES))
 }
 /// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
 /// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.

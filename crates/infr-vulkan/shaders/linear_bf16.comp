@@ -1,0 +1,34 @@
+#version 460
+// bf16-weight GEMV y = x·Wᵀ. Weights are a flat u16 stream packed 2-per-u32; each unpacks to f32 by
+// uintBitsToFloat(bf16_bits << 16) (bf16 IS the top 16 bits of an f32). Dispatch rows*out_f workgroups.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; } pc;
+layout(binding = 0) readonly buffer WB { uint w[]; };  // [out, in] bf16 packed 2/u32
+layout(binding = 1) readonly buffer XB { float x[]; }; // [rows, in]
+layout(binding = 2) buffer YB { float y[]; };          // [rows, out]
+
+shared float red[64];
+
+void main() {
+    uint unit = gl_WorkGroupID.x;
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) {
+        uint gi = wbase + i;
+        uint word = w[gi >> 1u];
+        uint bits16 = ((gi & 1u) == 1u) ? (word >> 16u) : (word & 0xffffu);
+        acc += uintBitsToFloat(bits16 << 16u) * x[xbase + i];
+    }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { y[unit] = red[0]; }
+}

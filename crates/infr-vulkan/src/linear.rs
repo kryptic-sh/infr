@@ -83,51 +83,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 }
 "#;
 
-/// bf16-weight GEMV `y = x·Wᵀ`. WGSL has no native bf16, so weights are stored as a flat u16 stream
-/// packed 2-per-u32; each is unpacked losslessly to f32 by `bitcast(bf16_bits << 16)` (bf16 IS the
-/// top 16 bits of an f32). Same cooperative-over-K layout as `LINEAR_F16_WGSL`; dispatch `rows*out_f`
-/// workgroups. Element addressing is global (word = elem/2, half = elem&1) so rows need not be u32-
-/// aligned even when `in_f` is odd.
-pub(crate) const LINEAR_BF16_WGSL: &str = r#"
-struct PushConstants { rows: u32, in_f: u32, out_f: u32 }
-var<immediate> pc: PushConstants;
-
-@group(0) @binding(0) var<storage, read>       w_buf: array<u32>; // [out, in] bf16 packed 2/u32
-@group(0) @binding(1) var<storage, read>       x_buf: array<f32>; // [rows, in]
-@group(0) @binding(2) var<storage, read_write> y_buf: array<f32>; // [rows, out]
-
-var<workgroup> red: array<f32, 64>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-    let unit = wid.x;            // = r * out_f + o
-    let o = unit % pc.out_f;
-    let r = unit / pc.out_f;
-    let t = lid.x;
-    let wbase = o * pc.in_f;
-    let xbase = r * pc.in_f;
-    var acc: f32 = 0.0;
-    for (var i: u32 = t; i < pc.in_f; i = i + 64u) {
-        let gi = wbase + i;                                  // global element index
-        let word = w_buf[gi >> 1u];
-        var bits16: u32 = word & 0xffffu;
-        if ((gi & 1u) == 1u) { bits16 = word >> 16u; }
-        acc = acc + bitcast<f32>(bits16 << 16u) * x_buf[xbase + i];
-    }
-    red[t] = acc;
-    workgroupBarrier();
-    var stride = 32u;
-    loop {
-        if stride == 0u { break; }
-        if t < stride { red[t] = red[t] + red[t + stride]; }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-    if t == 0u { y_buf[unit] = red[0]; }
-}
-"#;
-
 /// Unified quantized-weight dequant GEMV `y = x·Wᵀ` (cooperative-over-K, like `LINEAR_F16_WGSL`).
 /// ALL supported quants repack at load into one form: `quants` = index per element packed at
 /// `pc.bits` (4 → 8/u32 for Q4, 8 → 4/u32 for Q5/Q6/Q8), `scales`/`mins` = one f16 each per

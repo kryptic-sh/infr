@@ -204,9 +204,20 @@ n*expert/n_used/n_ff_exp; meta keys expert_count/expert_used_count/
 expert_feed_forward_length). `FfnWt::{Dense|Moe}`; `load_moe` slices each expert
 from stacked
 `ffn*{gate,up,down}\_exps`(contiguous 1/n_expert block) via`upload_wt_bytes`(experts stay quantized).`forward_moe`= eager, NO KV: GPU matmuls via`gemv_wt`(one-submit linear, any Wt kind), host qk-norm/RoPE/causal- GQA/router-softmax-topk(renorm)/expert-combine.`generate_moe`+ cmd_run branch (one-shot). TEST MODEL:`hf:unsloth/Qwen3-30B-A3B-GGUF:Qwen3-30B-A3B-Q4_K_M.gguf`(~18.6GB). RESULT: loads at weights 18.35GB (dense 0.80 + experts 17.55, footprint split correct, arena reserves it, fits 24GB ALL-RESIDENT so ExpertPool not needed here); greedy output correct + coherent ("<think>\nOkay, the user asked..."). PERF: 38.4 tok/s decode (Qwen3-30B-A3B-Q4, greedy), from 0.3 originally (~128x). Wins: (1) host KV cache `MoeKv`+`forward_moe_chunk`+`attention_kv`+`rope_rows_at`→ decode 1 tok/step not O(n²): 0.3→8.6; (2)`gemv_wt_many`batches N independent GEMVs into ONE submit → per-token expert gate+up (1 submit) / down (1 submit) + per-layer QKV (1 submit): ~1400→~240 submits/tok, 8.6→38.4 (prefill 1879→278ms). MoE PERF FOLLOW-ON (open, ~240 submits/tok left): GPU-resident attention (drop qkv→attn→o readbacks); GPU top-k + gathered`mul_mat_id`;
-batch tokens-by-expert in prefill. ExpertPool streaming only needed for MoE
-models that DON'T fit VRAM (PCIe caveat: pays off only if working set fits the
-pool / high LRU hit-rate).
+batch tokens-by-expert in prefill.
+
+CPU EXPERT OFFLOAD (done, like llama.cpp `--n-cpu-moe`): `INFR_NCMOE=N` keeps
+the experts of the first N layers in host RAM (quantized) + computes their FFN
+on CPU (`cpu_expert_matvec`: dequant+matvec); rest GPU-resident.
+`ExpertW = Gpu(Wt) | Cpu{dtype,bytes}`; `load_moe(...on_cpu)` places per layer
+(l<n_cpu_moe). Pre-flight footprint + arena subtract the offloaded experts'
+uniform-per-layer VRAM share, so GPU total/reserve are real; bail msg suggests
+raising INFR_NCMOE. VERIFIED 30B-A3B: NCMOE=24 → GPU 18.35→9.57GB (-8.78),
+output coherent, 0.8 tok/s (CPU layers slow — unoptimized full-dequant matvec;
+rayon + dequant-cache = follow-on). NCMOE=0 default = all-GPU 38 tok/s. ⇒ lets a
+too-big MoE fit by offloading enough layers. ExpertPool streaming (the OTHER
+not-fit strategy) still only needed when even host RAM + streaming is wanted;
+PCIe caveat: pays off only if working set fits the pool.
 
 Infra:
 

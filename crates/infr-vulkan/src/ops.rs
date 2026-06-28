@@ -507,64 +507,6 @@ impl VulkanBackend {
 /// The RMS scale is per-row and factored out: each thread accumulates `Σ hidden·nw·w` and
 /// `Σ hidden²` over its K-slice, a tree-reduce sums them, then scale is applied once. Dispatch
 /// `rows*nff` workgroups.
-pub(crate) const FFN_IN_WGSL: &str = r#"
-enable f16;
-struct PC { rows: u32, ne: u32, nff: u32, eps: f32 }
-var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       hidden: array<f32>; // [rows, ne]
-@group(0) @binding(1) var<storage, read>       nw: array<f32>;     // [ne] rmsnorm weight
-@group(0) @binding(2) var<storage, read>       wgu: array<f16>;    // [2*nff, ne] gate||up (f16)
-@group(0) @binding(3) var<storage, read_write> act: array<f32>;    // [rows, nff]
-
-var<workgroup> r_ss: array<f32, 64>;
-var<workgroup> r_g: array<f32, 64>;
-var<workgroup> r_u: array<f32, 64>;
-
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>,
-        @builtin(workgroup_id) wid: vec3<u32>) {
-    let t = lid.x;
-    let unit = wid.x;              // = r * nff + f
-    let f = unit % pc.nff;
-    let r = unit / pc.nff;
-    let rbase = r * pc.ne;
-    let gbase = f * pc.ne;
-    let ubase = (pc.nff + f) * pc.ne;
-
-    var pss: f32 = 0.0;
-    var pg: f32 = 0.0;
-    var pu: f32 = 0.0;
-    for (var k: u32 = t; k < pc.ne; k = k + 64u) {
-        let hv = hidden[rbase + k];
-        pss = pss + hv * hv;
-        let hn = hv * nw[k];       // hidden * norm weight (RMS scale applied after the reduction)
-        pg = pg + hn * f32(wgu[gbase + k]);
-        pu = pu + hn * f32(wgu[ubase + k]);
-    }
-    r_ss[t] = pss;
-    r_g[t] = pg;
-    r_u[t] = pu;
-    workgroupBarrier();
-    var stride = 32u;
-    loop {
-        if stride == 0u { break; }
-        if t < stride {
-            r_ss[t] = r_ss[t] + r_ss[t + stride];
-            r_g[t] = r_g[t] + r_g[t + stride];
-            r_u[t] = r_u[t] + r_u[t + stride];
-        }
-        workgroupBarrier();
-        stride = stride / 2u;
-    }
-    if t == 0u {
-        let scale = inverseSqrt(r_ss[0] / f32(pc.ne) + pc.eps);
-        let gate = r_g[0] * scale;
-        let up = r_u[0] * scale;
-        act[unit] = (gate / (1.0 + exp(-gate))) * up;
-    }
-}
-"#;
-
 /// Unified-quant variant of `FFN_IN_WGSL`: `wgu` repacked (u8 quants + per-16-block f16 scale/min).
 /// Same cooperative-over-K structure + RMS-fold.
 pub(crate) const FFN_IN_Q_WGSL: &str = r#"

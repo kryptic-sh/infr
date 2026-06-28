@@ -814,7 +814,9 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         self.stamp("ffn_in");
-        let k = self.be.kernel("ffn_in", ops::FFN_IN_WGSL, 4, 16);
+        let k = self
+            .be
+            .kernel_spv("ffn_in", crate::gemm::ffn_in_spv(), 4, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());

@@ -304,7 +304,12 @@ fn f16tof32(bits: u32) -> f32 {
     let s = (bits >> 15u) & 1u;
     let e = (bits >> 10u) & 0x1Fu;
     let m = bits & 0x3FFu;
-    if e == 0u { return bitcast<f32>(s << 31u); }
+    if e == 0u {
+        if m == 0u { return bitcast<f32>(s << 31u); }
+        // Subnormal f16: value = (-1)^s * m * 2^(-24). Convert via integer→float multiply.
+        let v = f32(m) * bitcast<f32>(0x33800000u);
+        return select(v, -v, s != 0u);
+    }
     if e == 31u { return bitcast<f32>((s << 31u) | 0x7F800000u | (m << 13u)); }
     return bitcast<f32>((s << 31u) | ((e + 112u) << 23u) | (m << 13u));
 }
@@ -329,7 +334,11 @@ fn f16tof32(bits: u32) -> f32 {
     let s = (bits >> 15u) & 1u;
     let e = (bits >> 10u) & 0x1Fu;
     let m = bits & 0x3FFu;
-    if e == 0u { return bitcast<f32>(s << 31u); }
+    if e == 0u {
+        if m == 0u { return bitcast<f32>(s << 31u); }
+        let v = f32(m) * bitcast<f32>(0x33800000u);
+        return select(v, -v, s != 0u);
+    }
     if e == 31u { return bitcast<f32>((s << 31u) | 0x7F800000u | (m << 13u)); }
     return bitcast<f32>((s << 31u) | ((e + 112u) << 23u) | (m << 13u));
 }

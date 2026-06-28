@@ -73,9 +73,10 @@ impl Default for Sampler {
 /// A projection weight on the GPU: f16, unified repacked quant, or native raw-block quant.
 ///
 /// - `F16`: f16 weight buffer (float or codebook-quant host-dequanted → f16)
-/// - `Q`: unified repacked affine quant (q/s/m buffers, `dq = s·u8 + m`)
+/// - `Q`: unified repacked affine quant (q/s/m buffers, `dq = s·u8 + m`); kept as
+///   fallback for `INFR_LEGACY=1` and the codepath comparison oracle.
 /// - `Native`: raw GGUF block bytes, padded to u32 alignment, dequantized in-shader.
-///   Active when `INFR_NATIVE=1` (Phase 0–2); becomes the default in Phase 3.
+///   Default for all supported affine quants (Phase 3+).
 enum Wt {
     F16(Box<dyn Buffer>),
     Q {
@@ -1390,12 +1391,12 @@ fn pack_unified(
     (quants, scales, mins)
 }
 
-/// True when the `INFR_NATIVE` environment variable is set (enables native-block GPU path).
-fn use_native() -> bool {
-    std::env::var("INFR_NATIVE").is_ok()
+/// True when `INFR_LEGACY=1` forces the old unified-repack path (Wt::Q).
+fn use_legacy() -> bool {
+    std::env::var("INFR_LEGACY").is_ok()
 }
 
-/// True for affine quant types that have a native-block GEMV shader (Phases 0–2).
+/// True for affine quant types that have a native-block GEMV shader.
 fn is_native_supported(d: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(
@@ -1406,13 +1407,13 @@ fn is_native_supported(d: infr_core::DType) -> bool {
 
 /// Upload a projection weight, keeping quantized weights quantized in-VRAM (else convert to f16).
 ///
-/// When `INFR_NATIVE=1` and dtype is a supported affine quant: upload raw block bytes
-/// zero-copy as `Wt::Native` — no host dequant, no repack (Phase 0 gate).
-///
-/// Otherwise (legacy path):
-/// - Affine quants → `Wt::Q` (dequant + repack, GPU in-kernel via `LINEAR_Q_WGSL`)
+/// Default path (Phase 3+):
+/// - Supported affine quants → `Wt::Native` (raw block bytes, in-shader dequant, no host work)
 /// - Codebook quants (IQ*/TQ*/fp4) → host dequant → f16 → `Wt::F16`
 /// - Float types (F16/F32/BF16) → `Wt::F16` directly
+///
+/// Legacy path (`INFR_LEGACY=1`):
+/// - Affine quants → `Wt::Q` (dequant + repack, GPU in-kernel via `LINEAR_Q_WGSL`)
 fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
     let info = g
         .tensors()
@@ -1420,8 +1421,8 @@ fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
         .find(|t| t.name == name)
         .ok_or_else(|| anyhow!("tensor not found: {name}"))?
         .clone();
-    // Native-block path: raw upload + in-shader dequant (gated on INFR_NATIVE).
-    if use_native() && is_native_supported(info.dtype) {
+    // Native-block path: raw upload + in-shader dequant (default for all supported affine quants).
+    if !use_legacy() && is_native_supported(info.dtype) {
         let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
         let padded = infr_vulkan::linear::pad_to_u32_align(bytes);
         return Ok(Wt::Native {
@@ -3681,7 +3682,15 @@ mod gpu_affine_tests {
         let ybuf = be.alloc(4, BufferUsage::Readback).unwrap();
 
         let rec = be.recorder().unwrap();
-        rec.linear_native(dtype, wbuf.as_ref(), xbuf.as_ref(), ybuf.as_ref(), 1, numel, 1);
+        rec.linear_native(
+            dtype,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            numel,
+            1,
+        );
         rec.finish().unwrap();
 
         let mut out_bytes = vec![0u8; 4];
@@ -3700,22 +3709,41 @@ mod gpu_affine_tests {
             let (bits, blk) = quant_params(dtype);
             let (qv2, sc2, mn2) = dequant_unified(dtype, block_bytes);
             let (q_packed, s_packed, m_packed) = pack_unified(&qv2, &sc2, &mn2, bits, blk);
-            let bq = be.upload_weight_bytes(bytemuck::cast_slice(&q_packed)).unwrap();
-            let bs = be.upload_weight_bytes(bytemuck::cast_slice(&s_packed)).unwrap();
-            let bm = be.upload_weight_bytes(bytemuck::cast_slice(&m_packed)).unwrap();
+            let bq = be
+                .upload_weight_bytes(bytemuck::cast_slice(&q_packed))
+                .unwrap();
+            let bs = be
+                .upload_weight_bytes(bytemuck::cast_slice(&s_packed))
+                .unwrap();
+            let bm = be
+                .upload_weight_bytes(bytemuck::cast_slice(&m_packed))
+                .unwrap();
             let xbuf2 = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
             be.upload(xbuf2.as_ref(), bytemuck::cast_slice(&x)).unwrap();
             let ybuf2 = be.alloc(4, BufferUsage::Readback).unwrap();
             let rec2 = be.recorder().unwrap();
-            rec2.linear_q(bq.as_ref(), bs.as_ref(), bm.as_ref(), xbuf2.as_ref(), ybuf2.as_ref(), 1, numel, 1, bits, blk.trailing_zeros());
+            rec2.linear_q(
+                bq.as_ref(),
+                bs.as_ref(),
+                bm.as_ref(),
+                xbuf2.as_ref(),
+                ybuf2.as_ref(),
+                1,
+                numel,
+                1,
+                bits,
+                blk.trailing_zeros(),
+            );
             rec2.finish().unwrap();
             let mut out2 = vec![0u8; 4];
             be.download(ybuf2.as_ref(), &mut out2).unwrap();
             let q_out: f32 = bytemuck::cast_slice(&out2)[0];
             let err2 = (gpu_out - q_out).abs();
             let rel2 = err2 / (q_out.abs() + 1e-6);
-            assert!(rel2 < 5e-3,
-                "{dtype:?} native vs unified-Q: native={gpu_out} q={q_out} err={err2} rel={rel2}");
+            assert!(
+                rel2 < 5e-3,
+                "{dtype:?} native vs unified-Q: native={gpu_out} q={q_out} err={err2} rel={rel2}"
+            );
         }
     }
 
@@ -3851,6 +3879,300 @@ mod gpu_affine_tests {
         check_native(infr_core::DType::Q5K, &block);
     }
 
+    /// Non-uniform Q5K block: distinct scales per sub-block + non-zero qh.
+    /// The uniform tests above are insensitive to indexing bugs; this one is not.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q5k_native_nonuniform() {
+        // Build a block where each sub-block has a different scale and qh is varied.
+        let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let dmin_bits = half::f16::from_f32(0.25).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 176];
+        block[0..2].copy_from_slice(&d_bits);
+        block[2..4].copy_from_slice(&dmin_bits);
+        // scales[0..12]: encode 8 distinct 6-bit (scale,min) pairs via k4 encoding.
+        // Use simple encoding: first 4 bytes = low bits of sc (i=0..3), bytes 4..8 = low bits of mn,
+        // bytes 8..12 = upper bits mixed.
+        // Set them to varied values so each sub-block has a different scale.
+        block[4] = 0x20; // k4(0): sc=0x20&0x3F=32, mn=block[8]&0x3F
+        block[5] = 0x10; // k4(2): sc=16, mn=...
+        block[6] = 0x08; // k4(4): sc computed via else branch
+        block[7] = 0x04; // k4(6): sc computed via else branch
+        block[8] = 0x3F; // k4(0): mn=63
+        block[9] = 0x2A; // k4(2): mn=42
+        block[10] = 0x15; // k4(4): (used in else branch)
+        block[11] = 0x09; // k4(6): (used in else branch)
+                          // block[12..16] could affect k4(4..7) upper bits; set to varied pattern
+        block[12] = 0xC0; // affects k4(4): sc upper bits from (block[8]>>6)<<4 = (0x3F>>6)<<4=0
+        block[13] = 0x80;
+        block[14] = 0x40;
+        block[15] = 0x20;
+        // qh: set to varied pattern so high bits vary
+        for i in 0..32usize {
+            block[16 + i] = (i as u8).wrapping_mul(17).wrapping_add(1);
+        }
+        // qs: set to varied pattern
+        for i in 0..128usize {
+            block[48 + i] = (i as u8).wrapping_mul(13).wrapping_add(7);
+        }
+        check_native(infr_core::DType::Q5K, &block);
+    }
+
+    /// Non-uniform Q6K block: distinct scales per sub-block.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q6k_native_nonuniform() {
+        let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 210];
+        // ql: varied
+        for i in 0..128usize {
+            block[i] = (i as u8).wrapping_mul(11).wrapping_add(3);
+        }
+        // qh: varied
+        for i in 0..64usize {
+            block[128 + i] = (i as u8).wrapping_mul(7).wrapping_add(5);
+        }
+        // scales: varied signed int8 values (avoid extreme negatives to keep sums finite)
+        for i in 0..16usize {
+            block[192 + i] = ((i as u8).wrapping_mul(5) + 8) & 0x7F;
+        } // positive only
+        block[208..210].copy_from_slice(&d_bits);
+        check_native(infr_core::DType::Q6K, &block);
+    }
+
+    /// Multi-block Q5K test: 4 blocks (in_f=1024), out_f=2. Tests cross-block access.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q5k_native_multiblock() {
+        use infr_vulkan::linear::pad_to_u32_align;
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan");
+                return;
+            }
+        };
+        // Build 8 distinct Q5K blocks (in_f=2048, out_f=2 → weight matrix [2, 2048])
+        const N_BLOCKS: usize = 8;
+        const BLOCK_SZ: usize = 176;
+        const NELEMS: usize = 256;
+        const IN_F: usize = N_BLOCKS * NELEMS;
+        const OUT_F: usize = 2;
+        // Total weight elements: OUT_F * IN_F = 2 * 2048 = 4096 = 16 blocks
+        const TOTAL_BLOCKS: usize = OUT_F * IN_F / NELEMS; // = OUT_F * N_BLOCKS
+        let mut w_bytes = vec![0u8; TOTAL_BLOCKS * BLOCK_SZ];
+        // Fill blocks with distinct, varied data
+        for b in 0..TOTAL_BLOCKS {
+            let off = b * BLOCK_SZ;
+            let d_bits = half::f16::from_f32(0.5 + b as f32 * 0.1)
+                .to_bits()
+                .to_le_bytes();
+            let dmin_bits = half::f16::from_f32(0.1).to_bits().to_le_bytes();
+            w_bytes[off..off + 2].copy_from_slice(&d_bits);
+            w_bytes[off + 2..off + 4].copy_from_slice(&dmin_bits);
+            for i in 0..12 {
+                w_bytes[off + 4 + i] = ((b * 12 + i) as u8).wrapping_mul(3) | 0x20;
+            }
+            for i in 0..32 {
+                w_bytes[off + 16 + i] = ((b * 32 + i) as u8).wrapping_mul(17);
+            }
+            for i in 0..128 {
+                w_bytes[off + 48 + i] = ((b * 128 + i) as u8).wrapping_mul(7).wrapping_add(3);
+            }
+        }
+        // CPU reference: compute expected outputs using dequant_unified
+        let mut cpu_outputs = vec![0f32; OUT_F];
+        let x: Vec<f32> = (0..IN_F).map(|i| 1.0f32 + i as f32 * 0.001f32).collect();
+        for o in 0..OUT_F {
+            let w_row_bytes = &w_bytes[o * N_BLOCKS * BLOCK_SZ..(o + 1) * N_BLOCKS * BLOCK_SZ];
+            let (qv, sc, mn) = dequant_unified(infr_core::DType::Q5K, w_row_bytes);
+            let sum: f32 = (0..IN_F)
+                .map(|i| (sc[i] * qv[i] as f32 + mn[i]) * x[i])
+                .sum();
+            cpu_outputs[o] = sum;
+        }
+        // GPU: upload and run
+        let padded = pad_to_u32_align(&w_bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let xbuf = be.alloc(IN_F * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(OUT_F * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            infr_core::DType::Q5K,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            IN_F,
+            OUT_F,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; OUT_F * 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_outputs: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&out_bytes).to_vec();
+        for o in 0..OUT_F {
+            let err = (gpu_outputs[o] - cpu_outputs[o]).abs();
+            let rel = err / (cpu_outputs[o].abs() + 1e-3);
+            assert!(
+                rel < 5e-3,
+                "Q5K out[{o}]: gpu={} cpu={} err={err} rel={rel}",
+                gpu_outputs[o],
+                cpu_outputs[o]
+            );
+        }
+    }
+
+    /// Full-scale Q6K test matching ffn_down dimensions: out_f=1024, in_f=3072.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q6k_native_fullscale() {
+        use infr_vulkan::linear::pad_to_u32_align;
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan");
+                return;
+            }
+        };
+        const BLOCK_SZ: usize = 210;
+        const NELEMS: usize = 256;
+        const IN_F: usize = 3072;
+        const OUT_F: usize = 1024;
+        let n_blocks_per_row = IN_F / NELEMS; // 12
+        let total_blocks = OUT_F * n_blocks_per_row;
+        let mut w_bytes = vec![0u8; total_blocks * BLOCK_SZ];
+        for b in 0..total_blocks {
+            let off = b * BLOCK_SZ;
+            let d_bits = half::f16::from_f32(0.1 + (b % 16) as f32 * 0.05)
+                .to_bits()
+                .to_le_bytes();
+            for i in 0..128 {
+                w_bytes[off + i] = ((b * 7 + i) as u8).wrapping_mul(11);
+            }
+            for i in 0..64 {
+                w_bytes[off + 128 + i] = ((b * 3 + i) as u8).wrapping_mul(7);
+            }
+            for i in 0..16 {
+                w_bytes[off + 192 + i] = (((b + i) as u8).wrapping_mul(5) + 8) & 0x7F;
+            }
+            w_bytes[off + 208..off + 210].copy_from_slice(&d_bits);
+        }
+        let x: Vec<f32> = (0..IN_F).map(|i| 1.0f32 + i as f32 * 0.001f32).collect();
+        // Only check a few output elements to keep test fast
+        let check_rows = [0usize, 1, 100, 1023];
+        let padded = pad_to_u32_align(&w_bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let xbuf = be.alloc(IN_F * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(OUT_F * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            infr_core::DType::Q6K,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            IN_F,
+            OUT_F,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; OUT_F * 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_outputs: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&out_bytes).to_vec();
+        for &o in &check_rows {
+            let w_row_bytes =
+                &w_bytes[o * n_blocks_per_row * BLOCK_SZ..(o + 1) * n_blocks_per_row * BLOCK_SZ];
+            let (qv, sc, mn) = dequant_unified(infr_core::DType::Q6K, w_row_bytes);
+            let cpu: f32 = (0..IN_F)
+                .map(|i| (sc[i] * qv[i] as f32 + mn[i]) * x[i])
+                .sum();
+            let err = (gpu_outputs[o] - cpu).abs();
+            let rel = err / (cpu.abs() + 1e-3);
+            assert!(
+                rel < 5e-3,
+                "Q6K fullscale out[{o}]: gpu={} cpu={cpu} err={err} rel={rel}",
+                gpu_outputs[o]
+            );
+        }
+    }
+
+    /// Multi-block Q6K test: 8 blocks, out_f=2. Tests cross-block access.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q6k_native_multiblock() {
+        use infr_vulkan::linear::pad_to_u32_align;
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan");
+                return;
+            }
+        };
+        const N_BLOCKS: usize = 4;
+        const BLOCK_SZ: usize = 210;
+        const NELEMS: usize = 256;
+        const IN_F: usize = N_BLOCKS * NELEMS;
+        const OUT_F: usize = 2;
+        const TOTAL_BLOCKS: usize = OUT_F * N_BLOCKS;
+        let mut w_bytes = vec![0u8; TOTAL_BLOCKS * BLOCK_SZ];
+        for b in 0..TOTAL_BLOCKS {
+            let off = b * BLOCK_SZ;
+            let d_bits = half::f16::from_f32(0.5 + b as f32 * 0.1)
+                .to_bits()
+                .to_le_bytes();
+            for i in 0..128 {
+                w_bytes[off + i] = ((b * 128 + i) as u8).wrapping_mul(11).wrapping_add(3);
+            }
+            for i in 0..64 {
+                w_bytes[off + 128 + i] = ((b * 64 + i) as u8).wrapping_mul(7).wrapping_add(5);
+            }
+            for i in 0..16 {
+                w_bytes[off + 192 + i] = (((b * 16 + i) as u8).wrapping_mul(5) + 8) & 0x7F;
+            }
+            w_bytes[off + 208..off + 210].copy_from_slice(&d_bits);
+        }
+        let mut cpu_outputs = vec![0f32; OUT_F];
+        let x: Vec<f32> = (0..IN_F).map(|i| 1.0f32 + i as f32 * 0.001f32).collect();
+        for o in 0..OUT_F {
+            let w_row_bytes = &w_bytes[o * N_BLOCKS * BLOCK_SZ..(o + 1) * N_BLOCKS * BLOCK_SZ];
+            let (qv, sc, mn) = dequant_unified(infr_core::DType::Q6K, w_row_bytes);
+            let sum: f32 = (0..IN_F)
+                .map(|i| (sc[i] * qv[i] as f32 + mn[i]) * x[i])
+                .sum();
+            cpu_outputs[o] = sum;
+        }
+        let padded = pad_to_u32_align(&w_bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let xbuf = be.alloc(IN_F * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(OUT_F * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            infr_core::DType::Q6K,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            IN_F,
+            OUT_F,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; OUT_F * 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_outputs: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&out_bytes).to_vec();
+        for o in 0..OUT_F {
+            let err = (gpu_outputs[o] - cpu_outputs[o]).abs();
+            let rel = err / (cpu_outputs[o].abs() + 1e-3);
+            assert!(
+                rel < 5e-3,
+                "Q6K out[{o}]: gpu={} cpu={} err={err} rel={rel}",
+                gpu_outputs[o],
+                cpu_outputs[o]
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn q6k_native_matches_cpu() {
@@ -3868,6 +4190,116 @@ mod gpu_affine_tests {
         } // scales = +32
         block[208..210].copy_from_slice(&d_bits);
         check_native(infr_core::DType::Q6K, &block);
+    }
+
+    /// Verify Q6K native shader handles f16 subnormal d values correctly.
+    /// Real model weights use subnormal d (e.g. d_bits=0x0140 ≈ 1.9e-5), which
+    /// naive f16→f32 that maps e=0 to 0 will silently zero out every output.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn q6k_native_subnormal_d() {
+        // d_bits = 0x0140 (e=0, m=0x140=320): subnormal f16 ≈ 1.9073e-5
+        let d_bits: u16 = 0x0140;
+        let mut block = vec![0u8; 210];
+        for b in &mut block[0..128] {
+            *b = 0xFF;
+        } // ql all-1
+        for b in &mut block[128..192] {
+            *b = 0xFF;
+        } // qh all-1
+        for b in &mut block[192..208] {
+            *b = 0x20;
+        } // scales = i8 +32
+        block[208..210].copy_from_slice(&d_bits.to_le_bytes());
+        check_native(infr_core::DType::Q6K, &block);
+    }
+
+    /// Load a real Q6K tensor from the model and verify GPU vs CPU.
+    #[test]
+    #[ignore = "requires a Vulkan GPU and model file"]
+    fn q6k_real_model_tensor() {
+        use infr_vulkan::linear::pad_to_u32_align;
+        let model_path = std::path::Path::new(
+            "/home/mxaddict/Projects/models/qwen3-0.6b/Qwen3-0.6B-Q4_K_M.gguf",
+        );
+        if !model_path.exists() {
+            eprintln!("skip: model not found");
+            return;
+        }
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan");
+                return;
+            }
+        };
+        let g = infr_gguf::Gguf::open(model_path).unwrap();
+        // attn_v.weight blk.0: Q6K, [1024, 1024] → in_f=1024, out_f=1024
+        let tensor_name = "blk.0.attn_v.weight";
+        let bytes = g.tensor_bytes(tensor_name).unwrap();
+        let in_f = 1024usize;
+        let out_f = 1024usize;
+        // CPU ref: dot each output row against x=all-1.0
+        let (qv, sc, mn) = dequant_unified(infr_core::DType::Q6K, bytes);
+        let numel = in_f * out_f;
+        assert_eq!(qv.len(), numel, "element count mismatch");
+        let x: Vec<f32> = vec![1.0f32; in_f];
+        let mut cpu_out = vec![0f32; out_f];
+        for o in 0..out_f {
+            cpu_out[o] = (0..in_f)
+                .map(|i| sc[o * in_f + i] * qv[o * in_f + i] as f32 + mn[o * in_f + i])
+                .sum();
+        }
+        // GPU
+        let padded = pad_to_u32_align(bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let xbuf = be.alloc(in_f * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(out_f * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            infr_core::DType::Q6K,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            in_f,
+            out_f,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; out_f * 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_out: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&out_bytes).to_vec();
+        let mut max_err = 0f32;
+        let mut max_idx = 0;
+        let mut n_zero = 0usize;
+        for o in 0..out_f {
+            let err = (gpu_out[o] - cpu_out[o]).abs();
+            if gpu_out[o] == 0.0 && cpu_out[o].abs() > 0.1 {
+                n_zero += 1;
+            }
+            if err > max_err {
+                max_err = err;
+                max_idx = o;
+            }
+        }
+        // Print first 5 failing elements
+        let mut n_print = 0;
+        for o in 0..out_f {
+            let rel = (gpu_out[o] - cpu_out[o]).abs() / (cpu_out[o].abs() + 1e-3);
+            if rel > 5e-3 && n_print < 5 {
+                eprintln!("FAIL out[{o}]: gpu={} cpu={}", gpu_out[o], cpu_out[o]);
+                n_print += 1;
+            }
+        }
+        eprintln!("Real Q6K: n_zero={n_zero}/{out_f}, max_err={max_err} at out[{max_idx}]");
+        let rel = max_err / (cpu_out[max_idx].abs() + 1e-3);
+        assert!(
+            rel < 5e-3,
+            "Real Q6K tensor: max_err={max_err} at out[{max_idx}]: gpu={} cpu={} rel={rel}",
+            gpu_out[max_idx],
+            cpu_out[max_idx]
+        );
     }
 }
 

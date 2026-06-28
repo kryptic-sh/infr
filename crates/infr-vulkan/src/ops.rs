@@ -454,7 +454,7 @@ impl VulkanBackend {
 
     /// SwiGLU activation: `y[i] = silu(gate[i]) * up[i]`.
     pub fn silu_mul(&self, gate: &[f32], up: &[f32], n: usize) -> Result<Vec<f32>> {
-        let k = self.kernel("silu_mul", SILU_MUL_WGSL, 3, 4);
+        let k = self.kernel_spv("silu_mul", crate::gemm::silu_mul_spv(), 3, 4);
         self.run_kernel(
             k,
             &[gate, up],
@@ -553,21 +553,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         y[base + 2u * i] = a * co - b * s;
         y[base + 2u * i + 1u] = a * s + b * co;
     }
-}
-"#;
-
-pub(crate) const SILU_MUL_WGSL: &str = r#"
-struct PC { n: u32 }
-var<immediate> pc: PC;
-@group(0) @binding(0) var<storage, read>       gate: array<f32>;
-@group(0) @binding(1) var<storage, read>       up: array<f32>;
-@group(0) @binding(2) var<storage, read_write> y: array<f32>;
-@compute @workgroup_size(64, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if i >= pc.n { return; }
-    let g = gate[i];
-    y[i] = (g / (1.0 + exp(-g))) * up[i];
 }
 "#;
 

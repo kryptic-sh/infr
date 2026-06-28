@@ -1473,7 +1473,9 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
-        let k = self.be.kernel("silu_mul", ops::SILU_MUL_WGSL, 3, 4);
+        let k = self
+            .be
+            .kernel_spv("silu_mul", crate::gemm::silu_mul_spv(), 3, 4);
         self.dispatch(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],

@@ -64,11 +64,13 @@ pub struct MoeConfig {
 }
 
 /// Host K/V cache for the eager MoE forward — per-layer keys/values appended each chunk so decode
-/// only processes the new token (the dense path's GPU KV cache isn't wired for MoE yet).
+/// only processes the new token (the dense path's GPU KV cache isn't wired for MoE yet). Also holds
+/// the streaming `ExpertPool` for `INFR_MOE_STREAM` (lazily created on first streamed layer).
 pub struct MoeKv {
     k: Vec<Vec<f32>>, // [n_layer] of [pos * nkv*hd]
     v: Vec<Vec<f32>>,
     pos: usize,
+    pool: Option<infr_vulkan::ExpertPool>,
 }
 
 /// Token sampling: greedy when `temp <= 0`, else temperature + top-k + top-p (nucleus). Qwen3
@@ -220,6 +222,9 @@ pub struct Llama {
     /// can't inject turn structure.
     user_tokenizer: Tokenizer,
     sampler: std::cell::Cell<Sampler>,
+    /// MoE: `INFR_MOE_STREAM` makes host-offloaded (`INFR_NCMOE`) layers stream their active experts
+    /// into a VRAM pool + GPU-compute instead of CPU matvec.
+    moe_stream: bool,
 }
 
 /// Per-layer key/value cache held on the GPU (persists across decode steps).
@@ -2046,6 +2051,7 @@ impl Llama {
             tokenizer,
             user_tokenizer,
             sampler: std::cell::Cell::new(Sampler::default()),
+            moe_stream: std::env::var("INFR_MOE_STREAM").is_ok(),
         })
     }
 
@@ -3176,7 +3182,41 @@ impl Llama {
             k: vec![Vec::new(); self.cfg.n_layer],
             v: vec![Vec::new(); self.cfg.n_layer],
             pos: 0,
+            pool: None,
         }
+    }
+
+    /// Eager native GEMV `y = x·Wᵀ` against an already-resident GPU weight buffer (a streaming
+    /// `ExpertPool` slot holding raw native blocks), one submit. Like `gemv_wt` but the weight is a
+    /// borrowed buffer + dtype rather than an owned `Wt`.
+    fn gemv_native_one(
+        &self,
+        w: &dyn Buffer,
+        dtype: infr_core::DType,
+        x: &[f32],
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) -> Result<Vec<f32>> {
+        let xb = self
+            .be
+            .alloc((x.len()).max(1) * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        self.be
+            .upload(xb.as_ref(), bytemuck::cast_slice(x))
+            .map_err(|e| anyhow!("{e}"))?;
+        let yb = self
+            .be
+            .alloc((rows * out_f).max(1) * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        rec.linear_native(dtype, w, xb.as_ref(), yb.as_ref(), rows, in_f, out_f);
+        rec.finish().map_err(|e| anyhow!("{e}"))?;
+        let mut out = vec![0u8; rows * out_f * 4];
+        self.be
+            .download(yb.as_ref(), &mut out)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(bytemuck::cast_slice(&out).to_vec())
     }
 
     /// Eager MoE forward for one chunk of `tokens` at positions `kv.pos..`, appending K/V to the
@@ -3235,6 +3275,8 @@ impl Llama {
                     &logits[r * mc.n_expert..(r + 1) * mc.n_expert],
                     experts,
                     &mc,
+                    li,
+                    &mut kv.pool,
                 )?;
                 for i in 0..ne {
                     hidden[r * ne + i] += out_row[i];
@@ -3250,12 +3292,15 @@ impl Llama {
 
     /// One token's MoE FFN: softmax router → renormalized top-k → weighted SwiGLU sum over the
     /// selected experts. `x` is the (already ffn-normed) token `[n_embd]`, `rl` its router logits.
+    /// `li` = layer index (for streaming-pool keys); `pool` = the streaming VRAM pool (lazily built).
     fn moe_ffn_token(
         &self,
         x: &[f32],
         rl: &[f32],
         experts: &[ExpertWt],
         mc: &MoeConfig,
+        li: usize,
+        pool: &mut Option<infr_vulkan::ExpertPool>,
     ) -> Result<Vec<f32>> {
         let ne = self.cfg.n_embd;
         let maxl = rl.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -3269,10 +3314,17 @@ impl Llama {
         idx.truncate(mc.n_used);
         let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
 
-        // Each expert's SwiGLU → `ys[ki]` (down output). Expert placement is per-layer uniform, so
-        // either run all on the CPU (INFR_NCMOE-offloaded layer) or batch all on the GPU.
-        let cpu_layer = !idx.is_empty() && experts[idx[0]].gate.is_cpu();
-        let ys: Vec<Vec<f32>> = if cpu_layer {
+        // Each expert's SwiGLU → `ys[ki]` (down output). Expert placement is per-layer uniform:
+        // host-offloaded layers (`INFR_NCMOE`) run on the CPU, or — with `INFR_MOE_STREAM` and a
+        // native-supported quant — stream the active experts into a VRAM pool and GPU-compute them;
+        // otherwise the experts are GPU-resident and batched.
+        let host_layer = !idx.is_empty() && experts[idx[0]].gate.is_cpu();
+        let stream_layer = host_layer
+            && self.moe_stream
+            && matches!(&experts[idx[0]].gate, ExpertW::Cpu { dtype, .. } if is_native_supported(*dtype));
+        let ys: Vec<Vec<f32>> = if stream_layer {
+            self.stream_experts(x, &idx, experts, mc, li, pool)?
+        } else if host_layer {
             idx.iter()
                 .map(|&e| {
                     let gate = cpu_expert_matvec(&experts[e].gate, x, ne, mc.n_ff_exp)?;
@@ -3322,6 +3374,64 @@ impl Llama {
             }
         }
         Ok(out)
+    }
+
+    /// Stream a host-offloaded layer's active experts through the VRAM `ExpertPool` and GPU-compute
+    /// them (`INFR_MOE_STREAM`): for each selected expert, make its gate/up/down resident in a pool
+    /// slot (upload-on-miss, LRU-evict) and run the native GEMV against the slot. Returns each
+    /// expert's down output. Faster than the CPU path (GPU matmul), VRAM bounded to the pool.
+    fn stream_experts(
+        &self,
+        x: &[f32],
+        idx: &[usize],
+        experts: &[ExpertWt],
+        mc: &MoeConfig,
+        li: usize,
+        pool: &mut Option<infr_vulkan::ExpertPool>,
+    ) -> Result<Vec<Vec<f32>>> {
+        use infr_vulkan::linear::pad_to_u32_align;
+        let ne = self.cfg.n_embd;
+        let parts = |e: &ExpertW| -> (infr_core::DType, Vec<u8>) {
+            match e {
+                ExpertW::Cpu { dtype, bytes } => (*dtype, pad_to_u32_align(bytes)),
+                ExpertW::Gpu(_) => unreachable!("stream_experts on a GPU expert"),
+            }
+        };
+        // Lazily size the pool: one slot per expert-role's native-padded bytes, enough for a layer's
+        // active set (n_used × 3 roles) plus headroom — bounded VRAM regardless of expert count.
+        if pool.is_none() {
+            let stride = parts(&experts[idx[0]].gate)
+                .1
+                .len()
+                .max(parts(&experts[idx[0]].down).1.len());
+            let n_slots = (mc.n_used * 3 + mc.n_used).max(8);
+            *pool = Some(
+                infr_vulkan::ExpertPool::new(&self.be, stride, n_slots)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        let pool = pool.as_mut().unwrap();
+        let mut ys = Vec::with_capacity(idx.len());
+        for &ex in idx {
+            let key = |role: usize| li * mc.n_expert * 3 + ex * 3 + role;
+            let (gdt, gb) = parts(&experts[ex].gate);
+            let gbuf = pool
+                .resident(&self.be, key(0), &gb)
+                .map_err(|e| anyhow!("{e}"))?;
+            let gate = self.gemv_native_one(gbuf, gdt, x, 1, ne, mc.n_ff_exp)?;
+            let (udt, ub) = parts(&experts[ex].up);
+            let ubuf = pool
+                .resident(&self.be, key(1), &ub)
+                .map_err(|e| anyhow!("{e}"))?;
+            let up = self.gemv_native_one(ubuf, udt, x, 1, ne, mc.n_ff_exp)?;
+            let act: Vec<f32> = (0..mc.n_ff_exp).map(|i| silu(gate[i]) * up[i]).collect();
+            let (ddt, db) = parts(&experts[ex].down);
+            let dbuf = pool
+                .resident(&self.be, key(2), &db)
+                .map_err(|e| anyhow!("{e}"))?;
+            ys.push(self.gemv_native_one(dbuf, ddt, &act, 1, mc.n_ff_exp, ne)?);
+        }
+        Ok(ys)
     }
 
     /// MoE generation (qwen3moe) with a host KV cache — prefill the prompt once, then decode one

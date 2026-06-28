@@ -3819,15 +3819,43 @@ impl Llama {
         }
         kv.kv.len += t;
 
-        // Final norm + lm head on the last token only (host tail, reused from the eager path).
-        let mut hbytes = vec![0u8; t * ne * 4];
+        // Final norm + lm head on the last token only, on the GPU: gather hidden's last row into a
+        // [ne] buffer, rmsnorm, lm_head — only the `vocab` logits cross the bus (no whole-hidden
+        // download, no host rmsnorm).
+        let last_idx = al(1)?;
         self.be
-            .download(hidden.as_ref(), &mut hbytes)
+            .upload(last_idx.as_ref(), bytemuck::cast_slice(&[(t - 1) as u32]))
             .map_err(|e| anyhow!("{e}"))?;
-        let hh: &[f32] = bytemuck::cast_slice(&hbytes);
-        let last = &hh[(t - 1) * ne..t * ne];
-        let normed = rmsnorm_rows(last, &self.output_norm, 1, ne, c.rms_eps);
-        self.gemv_wt(&self.lm_head, &normed, 1, ne, c.vocab)
+        let (hlast, normed) = (al(ne)?, al(ne)?);
+        let final_logits = self
+            .be
+            .alloc(c.vocab * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+        rec.gather_rows(hidden.as_ref(), last_idx.as_ref(), hlast.as_ref(), 1, ne);
+        rec.rmsnorm(
+            hlast.as_ref(),
+            self.output_norm_buf.as_ref(),
+            normed.as_ref(),
+            1,
+            ne,
+            c.rms_eps,
+        );
+        rec_linear(
+            &rec,
+            &self.lm_head,
+            normed.as_ref(),
+            final_logits.as_ref(),
+            1,
+            ne,
+            c.vocab,
+        );
+        rec.finish().map_err(|e| anyhow!("{e}"))?;
+        let mut out = vec![0u8; c.vocab * 4];
+        self.be
+            .download(final_logits.as_ref(), &mut out)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(bytemuck::cast_slice(&out).to_vec())
     }
 
     /// Eager MoE forward for one chunk of `tokens` at positions `kv.pos..`, appending K/V to the

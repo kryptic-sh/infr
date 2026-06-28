@@ -132,9 +132,13 @@ Perf (dense qwen3, the optimization target):
 Standing vs llama.cpp (qwen3-0.6b-Q4, tool-default, NATIVE DEFAULT): prefill
 0.67/0.75/0.83× (8k/16k/32k); decode tg256 0.94/0.94/0.97× (was 0.81/0.84/0.90×
 pre-native — the native-default flip lifted decode to ~parity); turns 0.90-0.95×
-(outlier pg8192,512@32000 0.74×, re-check — likely variance or deep-prefill).
-**Matched ubatch=2048: we WIN long-ctx prefill (16k 1.34×, 32k 1.38×).**
-Short-prompt prefill (0.37× @512) is weakest but lowest priority.
+EXCEPT pg8192,512@32000 = 0.74× (REPRODUCIBLE, not variance — confirmed 2×).
+Root cause: large prefill chunk (8192 tok) on deep KV (32k) ⇒ ingest attends
+over ~40k ctx; infr's DEEP-CONTEXT PREFILL ATTENTION is the bottleneck
+(decode@32k fine 0.97×, pure pp32000 0.84×, small 2048 ingest 0.94× — only
+big-chunk×deep-ctx dips). Next lever for the prefill gap: prefill attention
+scaling at 32k+. **Matched ubatch=2048: we WIN long-ctx prefill (16k 1.34×, 32k
+1.38×).** Short-prompt prefill (0.37× @512) is weakest but lowest priority.
 
 Infra:
 

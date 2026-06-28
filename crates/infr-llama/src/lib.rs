@@ -125,22 +125,18 @@ impl Wt {
     }
 }
 
-/// One routed expert's SwiGLU weights (gate/up [n_embd→n_ff_exp], down [n_ff_exp→n_embd]).
-/// One expert weight: resident on the GPU (`Gpu`) or kept quantized in host RAM and computed on the
-/// CPU (`Cpu`) — the CPU side is the `INFR_NCMOE` offload, trading speed for VRAM so an MoE model
-/// that doesn't fit the GPU can still run (cf. llama.cpp `--n-cpu-moe`).
+/// One expert weight: resident on the GPU (`Gpu`) or host-backed (`Cpu`) — for host-backed experts
+/// the bytes are read on demand from the kept-alive GGUF mmap (no host-RAM copy), then computed on
+/// the CPU or streamed to a VRAM pool (`INFR_NCMOE` / `INFR_MOE_STREAM`, cf. `--n-cpu-moe`).
 enum ExpertW {
     Gpu(Wt),
-    Cpu {
-        dtype: infr_core::DType,
-        bytes: Vec<u8>,
-    },
+    Cpu { dtype: infr_core::DType },
 }
 impl ExpertW {
     fn is_cpu(&self) -> bool {
         matches!(self, ExpertW::Cpu { .. })
     }
-    /// The GPU weight (panics for CPU experts — callers branch on [`is_cpu`] first).
+    /// The GPU weight (panics for host experts — callers branch on [`is_cpu`] first).
     fn gpu(&self) -> &Wt {
         match self {
             ExpertW::Gpu(w) => w,
@@ -148,6 +144,8 @@ impl ExpertW {
         }
     }
 }
+
+/// One routed expert's SwiGLU weights (gate/up [n_embd→n_ff_exp], down [n_ff_exp→n_embd]).
 
 struct ExpertWt {
     gate: ExpertW,
@@ -219,6 +217,9 @@ pub struct Llama {
     /// MoE: `INFR_MOE_STREAM` makes host-offloaded (`INFR_NCMOE`) layers stream their active experts
     /// into a VRAM pool + GPU-compute instead of CPU matvec.
     moe_stream: bool,
+    /// The model's GGUF, kept mmap-alive so host-backed MoE experts can read their bytes on demand
+    /// (zero-copy from the OS page cache) instead of duplicating them into RAM.
+    gguf: Gguf,
 }
 
 /// Per-layer key/value cache held on the GPU (persists across decode steps).
@@ -1734,14 +1735,11 @@ fn load_moe(
         ubytes.len() / n_expert,
         dbytes.len() / n_expert,
     );
-    // GPU experts upload to VRAM; CPU experts keep their quantized bytes in host RAM (computed on
-    // the CPU at forward time) — saving the VRAM their slab would take.
+    // GPU experts upload to VRAM; host experts store only the dtype — their bytes are read on demand
+    // from the kept-alive GGUF mmap at forward time (no host-RAM copy).
     let place = |dt: infr_core::DType, b: &[u8]| -> Result<ExpertW> {
         if on_cpu {
-            Ok(ExpertW::Cpu {
-                dtype: dt,
-                bytes: b.to_vec(),
-            })
+            Ok(ExpertW::Cpu { dtype: dt })
         } else {
             Ok(ExpertW::Gpu(upload_wt_bytes(be, dt, b)?))
         }
@@ -2076,6 +2074,7 @@ impl Llama {
             user_tokenizer,
             sampler: std::cell::Cell::new(Sampler::default()),
             moe_stream,
+            gguf: g,
         })
     }
 
@@ -3391,6 +3390,34 @@ impl Llama {
         self.gemv_wt(&self.lm_head, &normed, 1, ne, c.vocab)
     }
 
+    /// Raw quantized bytes of a host-backed expert's `role` weight ("gate"/"up"/"down"), read
+    /// zero-copy from the GGUF mmap. Each expert is a contiguous `1/n_expert` slice of the stacked
+    /// `ffn_{role}_exps` tensor.
+    fn expert_bytes(&self, li: usize, role: &str, e: usize) -> Result<&[u8]> {
+        let name = format!("blk.{li}.ffn_{role}_exps.weight");
+        let all = self
+            .gguf
+            .tensor_bytes(&name)
+            .map_err(|er| anyhow!("{er}"))?;
+        let n_expert = self.cfg.moe.expect("moe").n_expert;
+        let stride = all.len() / n_expert;
+        Ok(&all[e * stride..(e + 1) * stride])
+    }
+
+    /// (dtype, mmap bytes) for a host-backed expert role — the inputs to a CPU/stream matmul.
+    fn host_expert(
+        &self,
+        ew: &ExpertW,
+        li: usize,
+        role: &str,
+        e: usize,
+    ) -> Result<(infr_core::DType, &[u8])> {
+        let ExpertW::Cpu { dtype } = ew else {
+            unreachable!("host_expert on a GPU expert");
+        };
+        Ok((*dtype, self.expert_bytes(li, role, e)?))
+    }
+
     /// One token's MoE FFN: softmax router → renormalized top-k → weighted SwiGLU sum over the
     /// selected experts. `x` is the (already ffn-normed) token `[n_embd]`, `rl` its router logits.
     /// `li` = layer index (for streaming-pool keys); `pool` = the streaming VRAM pool (lazily built).
@@ -3422,16 +3449,19 @@ impl Llama {
         let host_layer = !idx.is_empty() && experts[idx[0]].gate.is_cpu();
         let stream_layer = host_layer
             && self.moe_stream
-            && matches!(&experts[idx[0]].gate, ExpertW::Cpu { dtype, .. } if is_native_supported(*dtype));
+            && matches!(&experts[idx[0]].gate, ExpertW::Cpu { dtype } if is_native_supported(*dtype));
         let ys: Vec<Vec<f32>> = if stream_layer {
             self.stream_experts(x, &idx, experts, mc, li, pool)?
         } else if host_layer {
             idx.iter()
                 .map(|&e| {
-                    let gate = cpu_expert_matvec(&experts[e].gate, x, ne, mc.n_ff_exp)?;
-                    let up = cpu_expert_matvec(&experts[e].up, x, ne, mc.n_ff_exp)?;
+                    let (gdt, gb) = self.host_expert(&experts[e].gate, li, "gate", e)?;
+                    let gate = cpu_expert_matvec(gdt, gb, x, ne, mc.n_ff_exp)?;
+                    let (udt, ub) = self.host_expert(&experts[e].up, li, "up", e)?;
+                    let up = cpu_expert_matvec(udt, ub, x, ne, mc.n_ff_exp)?;
                     let act: Vec<f32> = (0..mc.n_ff_exp).map(|i| silu(gate[i]) * up[i]).collect();
-                    cpu_expert_matvec(&experts[e].down, &act, mc.n_ff_exp, ne)
+                    let (ddt, db) = self.host_expert(&experts[e].down, li, "down", e)?;
+                    cpu_expert_matvec(ddt, db, &act, mc.n_ff_exp, ne)
                 })
                 .collect::<Result<_>>()?
         } else {
@@ -3492,19 +3522,18 @@ impl Llama {
     ) -> Result<Vec<Vec<f32>>> {
         use infr_vulkan::linear::pad_to_u32_align;
         let ne = self.cfg.n_embd;
-        let parts = |e: &ExpertW| -> (infr_core::DType, Vec<u8>) {
-            match e {
-                ExpertW::Cpu { dtype, bytes } => (*dtype, pad_to_u32_align(bytes)),
-                ExpertW::Gpu(_) => unreachable!("stream_experts on a GPU expert"),
-            }
+        // (dtype, native-padded mmap bytes) for an expert role — bytes read zero-copy then padded.
+        let parts = |ew: &ExpertW, role: &str, ex: usize| -> Result<(infr_core::DType, Vec<u8>)> {
+            let (dt, b) = self.host_expert(ew, li, role, ex)?;
+            Ok((dt, pad_to_u32_align(b)))
         };
         // Lazily size the pool: one slot per expert-role's native-padded bytes, enough for a layer's
         // active set (n_used × 3 roles) plus headroom — bounded VRAM regardless of expert count.
         if pool.is_none() {
-            let stride = parts(&experts[idx[0]].gate)
+            let stride = parts(&experts[idx[0]].gate, "gate", idx[0])?
                 .1
                 .len()
-                .max(parts(&experts[idx[0]].down).1.len());
+                .max(parts(&experts[idx[0]].down, "down", idx[0])?.1.len());
             let n_slots = (mc.n_used * 3 + mc.n_used).max(8);
             *pool = Some(
                 infr_vulkan::ExpertPool::new(&self.be, stride, n_slots)
@@ -3515,18 +3544,18 @@ impl Llama {
         let mut ys = Vec::with_capacity(idx.len());
         for &ex in idx {
             let key = |role: usize| li * mc.n_expert * 3 + ex * 3 + role;
-            let (gdt, gb) = parts(&experts[ex].gate);
+            let (gdt, gb) = parts(&experts[ex].gate, "gate", ex)?;
             let gbuf = pool
                 .resident(&self.be, key(0), &gb)
                 .map_err(|e| anyhow!("{e}"))?;
             let gate = self.gemv_native_one(gbuf, gdt, x, 1, ne, mc.n_ff_exp)?;
-            let (udt, ub) = parts(&experts[ex].up);
+            let (udt, ub) = parts(&experts[ex].up, "up", ex)?;
             let ubuf = pool
                 .resident(&self.be, key(1), &ub)
                 .map_err(|e| anyhow!("{e}"))?;
             let up = self.gemv_native_one(ubuf, udt, x, 1, ne, mc.n_ff_exp)?;
             let act: Vec<f32> = (0..mc.n_ff_exp).map(|i| silu(gate[i]) * up[i]).collect();
-            let (ddt, db) = parts(&experts[ex].down);
+            let (ddt, db) = parts(&experts[ex].down, "down", ex)?;
             let dbuf = pool
                 .resident(&self.be, key(2), &db)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -3783,14 +3812,17 @@ fn rmsnorm_rows(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<
     y
 }
 
-/// Host matvec `y = x·Wᵀ` for a CPU-offloaded expert weight (INFR_NCMOE): dequant the quantized
-/// `[out_f, in_f]` weight to f32, then dot each row with `x`. Correctness-first — the CPU path is
-/// the VRAM/speed tradeoff; not micro-optimized (full dequant per call).
-fn cpu_expert_matvec(e: &ExpertW, x: &[f32], in_f: usize, out_f: usize) -> Result<Vec<f32>> {
-    let ExpertW::Cpu { dtype, bytes } = e else {
-        unreachable!("cpu_expert_matvec on a GPU expert");
-    };
-    let w = dequant_block(*dtype, bytes)?; // [out_f * in_f] row-major (out rows)
+/// Host matvec `y = x·Wᵀ` for a host-backed expert weight: dequant the quantized `[out_f, in_f]`
+/// `bytes` (read zero-copy from the GGUF mmap) to f32, then dot each row with `x`. Correctness-first
+/// — the CPU path is the VRAM/speed tradeoff; not micro-optimized (full dequant per call).
+fn cpu_expert_matvec(
+    dtype: infr_core::DType,
+    bytes: &[u8],
+    x: &[f32],
+    in_f: usize,
+    out_f: usize,
+) -> Result<Vec<f32>> {
+    let w = dequant_block(dtype, bytes)?; // [out_f * in_f] row-major (out rows)
     let mut y = vec![0f32; out_f];
     for o in 0..out_f {
         let row = &w[o * in_f..(o + 1) * in_f];

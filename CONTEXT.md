@@ -13,9 +13,16 @@ inference engine. Repo: `~/Projects/kryptic-sh/infr`, remote
 - Caveman comms mode active (terse); code/commits normal prose. Nickname: "Jean Claude Van Dam".
 - North star: **long-context speed** (coding-agent workload) — win 16k/32k+, deprioritize short prompt.
 
-## Active task: Qwen3.5 / Qwen3.6 (`qwen35` = Qwen3-Next) support — WIP
-User asked to test Qwen3.5/3.6 ≤1B from unsloth, then "implement missing support", scoped to
-**finish the CPU reference** (NOT the GPU path — see why below).
+## Qwen3.5 / Qwen3.6 (`qwen35` = Qwen3-Next) — CPU reference WORKS ✅
+Scoped to the CPU reference (NOT GPU — ggml/our Vulkan has no SSM kernels; even llama.cpp runs
+qwen35 CPU-only). DONE: `infr run hf:unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf "..."`
+produces correct output ("…France is" → "…Paris…"; "2+2=" → "4"). ~3 tok/s (naive single-thread
+f32 matvec — optimization TODO: rayon-parallelize `matvec`, then quantized matvec). One-shot only
+(no multi-turn REPL yet). **THE bug was the attention q/gate split: `attn_q` packs query+gate
+INTERLEAVED PER HEAD `[h0 q|h0 gate|h1 q|h1 gate|…]`, not two contiguous blocks** (fixed in
+commit 2f55bf4 / 3cacd4a). Code: `crates/infr-llama/src/qwen35.rs` (Cfg/Model/forward/generate_chat
+/is_qwen35); dispatched in `cmd_run`. Debug env: `Q35_DBG`, `Q35_NOLIN`, `Q35_NOATTN`, `Q35_PROMPT`,
+`Q35_N`. NOTE: set `TMPDIR=$HOME/.cache/tmp` for shell work — `/tmp` is a quota'd RAM tmpfs.
 
 **Architecture (fully reverse-engineered, spec in `docs/QWEN35.md`):** hybrid of gated-DeltaNet
 linear-attention + gated full-attention. Qwen3.5-0.8B: 24 layers, `full_attention_interval=4` →

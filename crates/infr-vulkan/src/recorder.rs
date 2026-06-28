@@ -912,7 +912,7 @@ impl<'a> Recorder<'a> {
         self.stamp("attention_kv");
         let kern = self
             .be
-            .kernel("attention_kv", ops::ATTENTION_KV_WGSL, 4, 24);
+            .kernel_spv("attention_kv", crate::gemm::attention_kv_spv(), 4, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());

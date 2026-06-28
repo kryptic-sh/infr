@@ -1,0 +1,93 @@
+#version 460
+// Causal GQA attention over an f16 KV cache, tiled online softmax. One workgroup per (token, head).
+// q/k/v f16, o f32. hd <= 128 (thread t owns output dims t and t+64).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; } pc;
+layout(binding = 0) readonly buffer QB { float16_t q[]; };
+layout(binding = 1) readonly buffer KB { float16_t k[]; };
+layout(binding = 2) readonly buffer VB { float16_t v[]; };
+layout(binding = 3) buffer OB { float o[]; };
+
+const uint TILE = 1024u;
+shared float q_sh[128];
+shared float sc[1024];
+shared float red[64];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint unit = gl_WorkGroupID.x;
+    if (unit >= pc.q_len * pc.nh) { return; }
+    uint ti = unit / pc.nh;
+    uint h = unit % pc.nh;
+    uint kvlen = pc.pos_offset + ti + 1u;
+    uint kvh = h / (pc.nh / pc.nkv);
+    uint hd = pc.hd;
+    float scale = 1.0 / sqrt(float(hd));
+
+    uint qbase = (ti * pc.nh + h) * hd;
+    for (uint d = t; d < hd; d += 64u) { q_sh[d] = float(q[qbase + d]); }
+    barrier();
+
+    float m = -3.0e38;
+    float l = 0.0;
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+
+    for (uint ts = 0u; ts < kvlen; ts += TILE) {
+        uint te = min(ts + TILE, kvlen);
+        float lmax = -3.0e38;
+        for (uint j = ts + t; j < te; j += 64u) {
+            uint kbase = (j * pc.nkv + kvh) * hd;
+            float dotv = 0.0;
+            for (uint d = 0u; d < hd; d++) { dotv += q_sh[d] * float(k[kbase + d]); }
+            float s = dotv * scale;
+            sc[j - ts] = s;
+            lmax = max(lmax, s);
+        }
+        red[t] = lmax;
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride /= 2u) {
+            if (t < stride) { red[t] = max(red[t], red[t + stride]); }
+            barrier();
+        }
+        float mnew = max(m, red[0]);
+        barrier();
+
+        float lsum = 0.0;
+        for (uint j = ts + t; j < te; j += 64u) {
+            float p = exp(sc[j - ts] - mnew);
+            sc[j - ts] = p;
+            lsum += p;
+        }
+        red[t] = lsum;
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride /= 2u) {
+            if (t < stride) { red[t] += red[t + stride]; }
+            barrier();
+        }
+        float tsum = red[0];
+
+        float corr = exp(m - mnew);
+        l = l * corr + tsum;
+        m = mnew;
+        if (t < hd) {
+            float a = 0.0;
+            for (uint j = ts; j < te; j++) { a += sc[j - ts] * float(v[(j * pc.nkv + kvh) * hd + t]); }
+            acc0 = acc0 * corr + a;
+        }
+        if (t + 64u < hd) {
+            float a = 0.0;
+            for (uint j = ts; j < te; j++) { a += sc[j - ts] * float(v[(j * pc.nkv + kvh) * hd + t + 64u]); }
+            acc1 = acc1 * corr + a;
+        }
+        barrier();
+    }
+
+    uint obase = (ti * pc.nh + h) * hd;
+    float inv = 1.0 / l;
+    if (t < hd) { o[obase + t] = acc0 * inv; }
+    if (t + 64u < hd) { o[obase + t + 64u] = acc1 * inv; }
+}

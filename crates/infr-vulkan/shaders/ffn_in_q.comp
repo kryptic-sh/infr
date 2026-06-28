@@ -1,0 +1,56 @@
+#version 460
+// Unified-quant variant of ffn_in: RMSNorm(hidden) -> gate/up dequant projection -> SwiGLU.
+// wgu repacked (u8 quants + per-block f16 scale/min). One workgroup per (row, ff-channel).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint ne; uint nff; float eps; uint bits; uint blk_shift; } pc;
+layout(binding = 0) readonly buffer HB { float hidden[]; };
+layout(binding = 1) readonly buffer NB { float nw[]; };
+layout(binding = 2) readonly buffer QB { uint quants[]; }; // [2*nff, ne]
+layout(binding = 3) readonly buffer SB { float16_t scales[]; };
+layout(binding = 4) readonly buffer MB { float16_t mins[]; };
+layout(binding = 5) buffer AB { float act[]; };
+
+shared float r_ss[64];
+shared float r_g[64];
+shared float r_u[64];
+
+float dq(uint g) {
+    float q;
+    if (pc.bits == 4u) { q = float((quants[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu); }
+    else { q = float((quants[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu); }
+    uint blk = g >> pc.blk_shift;
+    return float(scales[blk]) * q + float(mins[blk]);
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint unit = gl_WorkGroupID.x;
+    uint f = unit % pc.nff;
+    uint r = unit / pc.nff;
+    uint rbase = r * pc.ne;
+    uint gbase = f * pc.ne;
+    uint ubase = (pc.nff + f) * pc.ne;
+    float pss = 0.0; float pg = 0.0; float pu = 0.0;
+    for (uint k = t; k < pc.ne; k += 64u) {
+        float hv = hidden[rbase + k];
+        pss += hv * hv;
+        float hn = hv * nw[k];
+        pg += hn * dq(gbase + k);
+        pu += hn * dq(ubase + k);
+    }
+    r_ss[t] = pss; r_g[t] = pg; r_u[t] = pu;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { r_ss[t] += r_ss[t + stride]; r_g[t] += r_g[t + stride]; r_u[t] += r_u[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) {
+        float scale = inversesqrt(r_ss[0] / float(pc.ne) + pc.eps);
+        float gate = r_g[0] * scale;
+        float up = r_u[0] * scale;
+        act[unit] = (gate / (1.0 + exp(-gate))) * up;
+    }
+}

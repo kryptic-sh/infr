@@ -1,0 +1,77 @@
+#version 460
+// Fused RMSNorm + quant Q/K/V projection (Qwen3 decode): one workgroup per output column of the
+// [q | k | v] layout, folding RMSNorm into the dot. q/k/v may have DIFFERENT quant, so bits/blk_shift
+// are per-region. Writes raw projections qr/kr/vr (QK-norm + RoPE follow).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint rows; uint ne; uint q_dim; uint kvrow; float eps;
+    uint qbits; uint qblk; uint kbits; uint kblk; uint vbits; uint vblk;
+} pc;
+layout(binding = 0)  readonly buffer HB { float hidden[]; };
+layout(binding = 1)  readonly buffer NB { float nw[]; };
+layout(binding = 2)  readonly buffer WQ { uint wq[]; };
+layout(binding = 3)  readonly buffer SQ { float16_t sq[]; };
+layout(binding = 4)  readonly buffer MQ { float16_t mq[]; };
+layout(binding = 5)  readonly buffer WK { uint wk[]; };
+layout(binding = 6)  readonly buffer SK { float16_t sk[]; };
+layout(binding = 7)  readonly buffer MK { float16_t mk[]; };
+layout(binding = 8)  readonly buffer WV { uint wv[]; };
+layout(binding = 9)  readonly buffer SV { float16_t sv[]; };
+layout(binding = 10) readonly buffer MV { float16_t mv[]; };
+layout(binding = 11) buffer QR { float qr[]; };
+layout(binding = 12) buffer KR { float kr[]; };
+layout(binding = 13) buffer VR { float vr[]; };
+
+shared float r_ss[64];
+shared float r_d[64];
+
+float dqw(uint region, uint g) {
+    uint q; float s; float m;
+    if (region == 0u) {
+        if (pc.qbits == 4u) { q = (wq[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu; } else { q = (wq[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu; }
+        s = float(sq[g >> pc.qblk]); m = float(mq[g >> pc.qblk]);
+    } else if (region == 1u) {
+        if (pc.kbits == 4u) { q = (wk[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu; } else { q = (wk[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu; }
+        s = float(sk[g >> pc.kblk]); m = float(mk[g >> pc.kblk]);
+    } else {
+        if (pc.vbits == 4u) { q = (wv[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu; } else { q = (wv[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu; }
+        s = float(sv[g >> pc.vblk]); m = float(mv[g >> pc.vblk]);
+    }
+    return s * float(q) + m;
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint total = pc.q_dim + 2u * pc.kvrow;
+    uint unit = gl_WorkGroupID.x;
+    uint o = unit % total;
+    uint r = unit / total;
+    uint region; uint local;
+    if (o < pc.q_dim) { region = 0u; local = o; }
+    else if (o < pc.q_dim + pc.kvrow) { region = 1u; local = o - pc.q_dim; }
+    else { region = 2u; local = o - pc.q_dim - pc.kvrow; }
+    uint rbase = r * pc.ne;
+    uint gbase = local * pc.ne;
+    float pss = 0.0; float pd = 0.0;
+    for (uint k = t; k < pc.ne; k += 64u) {
+        float hv = hidden[rbase + k];
+        pss += hv * hv;
+        pd += hv * nw[k] * dqw(region, gbase + k);
+    }
+    r_ss[t] = pss; r_d[t] = pd;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { r_ss[t] += r_ss[t + stride]; r_d[t] += r_d[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) {
+        float scale = inversesqrt(r_ss[0] / float(pc.ne) + pc.eps);
+        float val = r_d[0] * scale;
+        if (region == 0u) { qr[r * pc.q_dim + local] = val; }
+        else if (region == 1u) { kr[r * pc.kvrow + local] = val; }
+        else { vr[r * pc.kvrow + local] = val; }
+    }
+}

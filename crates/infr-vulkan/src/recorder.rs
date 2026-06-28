@@ -14,7 +14,7 @@ use ash::vk;
 use infr_core::{backend::Buffer, error::Result};
 
 use super::ops::ComputeKernel;
-use super::{as_vk_buf, be, ops, VulkanBackend};
+use super::{as_vk_buf, be, VulkanBackend};
 
 /// Output rows computed per workgroup by the subgroup decode GEMV (`mul_mat_vec_q.comp`); must match
 /// the shader's `NUM_ROWS`.
@@ -716,7 +716,9 @@ impl<'a> Recorder<'a> {
         blk_shift: u32,
     ) {
         self.stamp("ffn_in");
-        let k = self.be.kernel("ffn_in_q", ops::FFN_IN_Q_WGSL, 6, 24);
+        let k = self
+            .be
+            .kernel_spv("ffn_in_q", crate::gemm::ffn_in_q_spv(), 6, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
@@ -763,7 +765,9 @@ impl<'a> Recorder<'a> {
         vbb: (u32, u32),
     ) {
         self.stamp("attn_in_q");
-        let k = self.be.kernel("attn_in_q", ops::ATTN_IN_Q_WGSL, 14, 44);
+        let k = self
+            .be
+            .kernel_spv("attn_in_q", crate::gemm::attn_in_q_spv(), 14, 44);
         let mut push = [0u8; 44];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());

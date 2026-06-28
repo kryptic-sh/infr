@@ -1,0 +1,34 @@
+#version 460
+// Flash-decode combine: one workgroup per (head, hd-tile). Merges n_chunks partial softmax results
+// (per-chunk max pm, sum pl, weighted-V pacc) via the online-softmax rule. o = [nh, hd].
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint nh; uint hd; uint n_chunks; uint ntile; } pc;
+layout(binding = 0) readonly buffer PM { float pm[]; };     // [nh, n_chunks]
+layout(binding = 1) readonly buffer PL { float pl[]; };     // [nh, n_chunks]
+layout(binding = 2) readonly buffer PA { float pacc[]; };   // [nh, n_chunks, hd]
+layout(binding = 3) buffer OB { float o[]; };               // [nh, hd]
+
+shared float wexp[512];
+
+void main() {
+    uint h = gl_WorkGroupID.x / pc.ntile;
+    uint tile = gl_WorkGroupID.x % pc.ntile;
+    uint hd = pc.hd;
+    uint hdt = hd / pc.ntile;
+    uint d0 = tile * hdt;
+    uint t = gl_LocalInvocationID.x;
+    uint base = h * pc.n_chunks;
+    float mm = -3.0e38;
+    for (uint c = 0u; c < pc.n_chunks; c++) { mm = max(mm, pm[base + c]); }
+    for (uint c = t; c < pc.n_chunks; c += 32u) { wexp[c] = exp(pm[base + c] - mm); }
+    barrier();
+    float l = 0.0;
+    for (uint c = 0u; c < pc.n_chunks; c++) { l += pl[base + c] * wexp[c]; }
+    float inv = 1.0 / l;
+    for (uint d = d0 + t; d < d0 + hdt; d += 32u) {
+        float acc = 0.0;
+        for (uint c = 0u; c < pc.n_chunks; c++) { acc += pacc[(base + c) * hd + d] * wexp[c]; }
+        o[h * hd + d] = acc * inv;
+    }
+}

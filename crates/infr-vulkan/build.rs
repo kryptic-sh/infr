@@ -41,6 +41,7 @@ fn main() {
         ("linear_res", "linear_res", &[]),
         ("linear_res_q", "linear_res_q", &[]),
         ("attention", "attention", &[]),
+        ("attn_combine", "attn_combine", &[]),
         // Decode GEMV: q4/q8 × plain/residual specializations from one source.
         ("mul_mat_vec_q", "mul_mat_vec_q4", &["-DQBITS=4"]),
         ("mul_mat_vec_q", "mul_mat_vec_q8", &["-DQBITS=8"]),

@@ -1388,7 +1388,7 @@ impl<'a> Recorder<'a> {
         self.stamp("attn_combine");
         let k2 = self
             .be
-            .kernel("attn_combine", ops::ATTN_COMBINE_WGSL, 4, 16);
+            .kernel_spv("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
         let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
         let mut p2 = [0u8; 16];
         p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());

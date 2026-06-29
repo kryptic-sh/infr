@@ -18,14 +18,16 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 # Linux-only: infr is a Vulkan-first engine. `glslc` (shaderc) compiles the
-# compute shaders at build time; the GPU integration tests are #[ignore]'d
-# (they need a real Vulkan device), so CI builds + runs the CPU test suite.
+# compute shaders at build time, and the dp4a shaders need a recent glslc
+# (GL_EXT_integer_dot_product) — Ubuntu 24.04 ships shaderc 2023.8 which is too
+# old, so we pin ubuntu-26.04 (shaderc 2025+). The GPU integration tests are
+# #[ignore]'d (they need a real Vulkan device); CI builds + runs the CPU suite.
 # ash loads Vulkan at runtime via dlopen, so no libvulkan is needed to build.
 
 jobs:
   fmt:
     name: cargo fmt --check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -38,7 +40,7 @@ jobs:
 
   clippy:
     name: cargo clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Install glslc (shaderc)
@@ -54,7 +56,7 @@ jobs:
 
   test:
     name: cargo test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Install glslc (shaderc)
@@ -73,7 +75,7 @@ jobs:
 
   build:
     name: cargo build --release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - name: Install glslc (shaderc)

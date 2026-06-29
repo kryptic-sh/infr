@@ -54,10 +54,25 @@ pub struct Recorder<'a> {
     /// clears it. Lets a caller attribute a generic op (e.g. a `linear` used for the vocab head vs a
     /// projection) to a distinct bucket without per-op API plumbing.
     next_label: std::cell::Cell<Option<&'static str>>,
+    /// Record-once: when set, the command buffer is begun resubmittable (no ONE_TIME_SUBMIT) and
+    /// `finish_record` hands back its cmd buffer + pool (a [`RecordedCmd`]) instead of submitting and
+    /// freeing — so the caller can replay it across tokens.
+    persistent: bool,
 }
 
 impl<'a> Recorder<'a> {
     pub(crate) fn new(backend: &'a VulkanBackend) -> Result<Self> {
+        Self::new_inner(backend, false)
+    }
+
+    /// A recorder whose command buffer is resubmittable (no ONE_TIME_SUBMIT). `finish_record` returns
+    /// a [`RecordedCmd`] the caller can replay instead of re-recording. Profiling is disabled on this
+    /// path (the recorder is gone after recording, so per-replay timestamps can't be reported).
+    pub(crate) fn new_persistent(backend: &'a VulkanBackend) -> Result<Self> {
+        Self::new_inner(backend, true)
+    }
+
+    fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
         let device = &backend.shared.device;
         let cmd_pool = *backend.shared.cmd_pool.lock().unwrap();
         let cmd = unsafe {
@@ -69,11 +84,15 @@ impl<'a> Recorder<'a> {
             )
         }
         .map_err(|e| be(format!("alloc cmd buffer: {e}")))?[0];
+        let begin_flags = if persistent {
+            vk::CommandBufferUsageFlags::empty()
+        } else {
+            vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT
+        };
         unsafe {
             device.begin_command_buffer(
                 cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                &vk::CommandBufferBeginInfo::default().flags(begin_flags),
             )
         }
         .map_err(|e| be(format!("begin cmd buffer: {e}")))?;
@@ -94,7 +113,9 @@ impl<'a> Recorder<'a> {
         .map_err(|e| be(format!("create recorder pool: {e}")))?;
 
         const MAX_TS: u32 = 8192;
-        let prof2 = std::env::var("INFR_PROF2").is_ok();
+        // No per-op profiling on the persistent (replayed) path — the recorder is dropped after
+        // recording, so it can't report timestamps for replays.
+        let prof2 = std::env::var("INFR_PROF2").is_ok() && !persistent;
         let query_pool = if prof2 {
             let qp = unsafe {
                 device.create_query_pool(
@@ -126,6 +147,7 @@ impl<'a> Recorder<'a> {
             query_pool,
             ts_labels: RefCell::new(Vec::new()),
             next_label: std::cell::Cell::new(None),
+            persistent,
         })
     }
 
@@ -2322,6 +2344,23 @@ impl<'a> Recorder<'a> {
         Ok(())
     }
 
+    /// End recording WITHOUT submitting, returning a [`RecordedCmd`] the caller can replay across
+    /// tokens (skipping per-token re-recording). Only meaningful for a `new_persistent` recorder; the
+    /// descriptor sets bind the (persistent) decode buffers, so replays stay valid as long as those
+    /// buffers live.
+    pub fn finish_record(self) -> Result<RecordedCmd> {
+        if self.prof {
+            eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
+        }
+        unsafe { self.be.shared.device.end_command_buffer(self.cmd) }
+            .map_err(|e| be(format!("end cmd: {e}")))?;
+        Ok(RecordedCmd {
+            shared: std::sync::Arc::clone(&self.be.shared),
+            cmd: self.cmd,
+            pool: self.pool,
+        })
+    }
+
     /// Read back per-op timestamps and print GPU time aggregated by op label.
     fn report_timestamps(&self) {
         let labels = self.ts_labels.borrow();
@@ -2377,6 +2416,52 @@ impl VulkanBackend {
     /// Start recording a single-submit forward.
     pub fn recorder(&self) -> Result<Recorder<'_>> {
         Recorder::new(self)
+    }
+
+    /// Start recording a resubmittable forward — `finish_record` returns a [`RecordedCmd`] to replay.
+    pub fn recorder_persistent(&self) -> Result<Recorder<'_>> {
+        Recorder::new_persistent(self)
+    }
+}
+
+/// A pre-recorded, resubmittable command buffer (from [`Recorder::finish_record`]). Replaying it skips
+/// per-token re-recording in the GPU-resident decode loop. Owns its command buffer + descriptor pool
+/// (whose sets bind the persistent decode buffers); both are freed on drop after the GPU drains.
+pub struct RecordedCmd {
+    shared: std::sync::Arc<crate::VulkanShared>,
+    cmd: vk::CommandBuffer,
+    pool: vk::DescriptorPool,
+}
+
+impl RecordedCmd {
+    /// Resubmit the recorded command buffer and wait for completion.
+    pub fn replay(&self) -> Result<()> {
+        let device = &self.shared.device;
+        unsafe {
+            device
+                .queue_submit(
+                    self.shared.queue,
+                    &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
+                    vk::Fence::null(),
+                )
+                .map_err(|e| be(format!("replay submit: {e}")))?;
+            device
+                .queue_wait_idle(self.shared.queue)
+                .map_err(|e| be(format!("replay wait: {e}")))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RecordedCmd {
+    fn drop(&mut self) {
+        let device = &self.shared.device;
+        unsafe {
+            let _ = device.queue_wait_idle(self.shared.queue);
+            let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
+            device.free_command_buffers(cmd_pool, &[self.cmd]);
+            device.destroy_descriptor_pool(self.pool, None);
+        }
     }
 }
 

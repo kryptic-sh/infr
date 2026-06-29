@@ -17,7 +17,7 @@ mod ops;
 mod recorder;
 
 pub use expert_pool::ExpertPool;
-pub use recorder::Recorder;
+pub use recorder::{RecordedCmd, Recorder};
 
 use std::collections::HashMap;
 use std::ffi::CStr;

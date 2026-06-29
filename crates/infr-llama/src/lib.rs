@@ -76,6 +76,11 @@ pub struct MoeKv {
     /// ~50k/chunk). Experts serialize through it (a barrier on reuse) — which a K-sweep showed they
     /// did anyway (the win is removing the alloc churn, not concurrency). Sized for the largest chunk.
     pf: Option<PrefillScratch>,
+    /// Record-once decode: the GPU-resident decode forward recorded into a resubmittable command
+    /// buffer, keyed by its attention structure `(use_split, chunk, n_chunks)`. Replayed each token
+    /// (only the params SSBO + embedding change) instead of re-recorded; re-recorded when the
+    /// signature changes (every ~chunk tokens) or never if it doesn't.
+    rec_decode: Option<((bool, usize, usize), infr_vulkan::RecordedCmd)>,
 }
 
 /// One reusable scratch set for a grouped prefill expert's SwiGLU. Sized for `m_pad` row capacity;
@@ -3421,6 +3426,7 @@ impl Llama {
             pool: None,
             dec: Some(self.build_decode_scratch(max_ctx)?),
             pf: None,
+            rec_decode: None,
         })
     }
 
@@ -3819,243 +3825,272 @@ impl Llama {
         // Inter-layer hazards on the shared scratch are serialized by the recorder's barrier tracking,
         // so a single submit is correct. The host-topk fallback still finishes per layer (it needs a
         // mid-layer logits readback), swapping in a fresh recorder via `mem::replace`.
-        let mut rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
-        for (li, layer) in self.layers.iter().enumerate() {
-            rec.rmsnorm(
-                hidden.as_ref(),
-                layer.attn_norm_buf.as_ref(),
-                hn.as_ref(),
-                1,
-                ne,
-                c.rms_eps,
-            );
-            rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), 1, ne, nh * hd);
-            rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), 1, ne, nkv * hd);
-            rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), 1, ne, nkv * hd);
-            let (qn, kn) = (
-                layer.q_norm_buf.as_ref().unwrap().as_ref(),
-                layer.k_norm_buf.as_ref().unwrap().as_ref(),
-            );
-            // `_dyn` kernels read pos/kv_len from `dec.params` (written once per token above), so the
-            // recorded command buffer is pos-independent and can be replayed across tokens.
-            rec.qk_norm_rope_dyn(
-                qr.as_ref(),
-                qn,
-                params.as_ref(),
-                q_f16.as_ref(),
-                1,
-                nh,
-                hd,
-                c.rope_dim,
-                c.rope_theta,
-                0, // Q: out_base = 0
-                c.rms_eps,
-            );
-            rec.qk_norm_rope_dyn(
-                kr.as_ref(),
-                kn,
-                params.as_ref(),
-                kv.kv.k[li].as_ref(),
-                1,
-                nkv,
-                hd,
-                c.rope_dim,
-                c.rope_theta,
-                1, // K: out_base = pos
-                c.rms_eps,
-            );
-            rec.store_f16_dyn(vr.as_ref(), params.as_ref(), kv.kv.v[li].as_ref(), kvrow);
-            if use_split {
-                rec.attention_kv_split_dyn(
-                    q_f16.as_ref(),
-                    kv.kv.k[li].as_ref(),
-                    kv.kv.v[li].as_ref(),
-                    attn.as_ref(),
-                    pm.as_ref().unwrap().as_ref(),
-                    pl.as_ref().unwrap().as_ref(),
-                    pacc.as_ref().unwrap().as_ref(),
-                    params.as_ref(),
-                    nh,
-                    nkv,
-                    hd,
-                    chunk,
-                    n_chunks,
-                );
+        //
+        // Record-once (Stage 2): when gpu_route (and not profiling), the whole forward is recorded into
+        // a resubmittable command buffer keyed by the attention structure `sig`. On a cache hit we skip
+        // recording entirely and just replay (only the params SSBO + embedding changed this token).
+        let prof2_env = std::env::var("INFR_PROF2").is_ok();
+        let sig = (use_split, chunk, n_chunks);
+        let use_ro = gpu_route && !prof2_env;
+        let hit = use_ro && kv.rec_decode.as_ref().is_some_and(|(s, _)| *s == sig);
+        if !hit {
+            let mut rec = if use_ro {
+                self.be.recorder_persistent().map_err(|e| anyhow!("{e}"))?
             } else {
-                rec.attention_kv_dyn(
-                    q_f16.as_ref(),
-                    kv.kv.k[li].as_ref(),
-                    kv.kv.v[li].as_ref(),
+                self.be.recorder().map_err(|e| anyhow!("{e}"))?
+            };
+            for (li, layer) in self.layers.iter().enumerate() {
+                rec.rmsnorm(
+                    hidden.as_ref(),
+                    layer.attn_norm_buf.as_ref(),
+                    hn.as_ref(),
+                    1,
+                    ne,
+                    c.rms_eps,
+                );
+                rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), 1, ne, nh * hd);
+                rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), 1, ne, nkv * hd);
+                rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), 1, ne, nkv * hd);
+                let (qn, kn) = (
+                    layer.q_norm_buf.as_ref().unwrap().as_ref(),
+                    layer.k_norm_buf.as_ref().unwrap().as_ref(),
+                );
+                // `_dyn` kernels read pos/kv_len from `dec.params` (written once per token above), so the
+                // recorded command buffer is pos-independent and can be replayed across tokens.
+                rec.qk_norm_rope_dyn(
+                    qr.as_ref(),
+                    qn,
                     params.as_ref(),
-                    attn.as_ref(),
+                    q_f16.as_ref(),
                     1,
                     nh,
+                    hd,
+                    c.rope_dim,
+                    c.rope_theta,
+                    0, // Q: out_base = 0
+                    c.rms_eps,
+                );
+                rec.qk_norm_rope_dyn(
+                    kr.as_ref(),
+                    kn,
+                    params.as_ref(),
+                    kv.kv.k[li].as_ref(),
+                    1,
                     nkv,
                     hd,
+                    c.rope_dim,
+                    c.rope_theta,
+                    1, // K: out_base = pos
+                    c.rms_eps,
                 );
-            }
-            rec_linear(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), 1, nh * hd, ne);
-            rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), ne); // residual
-            rec.rmsnorm(
-                hidden.as_ref(),
-                layer.ffn_norm_buf.as_ref(),
-                hn2.as_ref(),
-                1,
-                ne,
-                c.rms_eps,
-            );
-            let (gate_inp, st) = layer.moe_stacked().expect("stacked experts");
-            rec_linear(
-                &rec,
-                gate_inp,
-                hn2.as_ref(),
-                logits.as_ref(),
-                1,
-                ne,
-                mc.n_expert,
-            );
-
-            if let (Some(ids), Some(wts)) = (&ids_buf, &wts_buf) {
-                // Fully GPU-resident: top-k on the GPU writes expert ids + weights to VRAM, then the
-                // selected experts' FFN (id-indexed gather of the stacked weights) accumulates into
-                // hidden — all in this one recorder. No readback, one submit/layer.
-                rec.moe_topk(
-                    logits.as_ref(),
-                    ids.as_ref(),
-                    wts.as_ref(),
-                    1,
-                    mc.n_expert,
-                    mc.n_used,
-                    mc.scale,
-                );
-                // Fused: all n_used experts per role in ONE dispatch (concurrent, no inter-expert
-                // barrier). gate/up read the shared ffn-normed row; down reads each slot's activation.
-                let (gd, gb) = native_parts(&st.gate);
-                let (ud, ub) = native_parts(&st.up);
-                let (dd, db) = native_parts(&st.down);
-                let nu = mc.n_used;
-                if let (Some(qa), Some(da), Some(sa)) = (&qa, &dact, &sact) {
-                    // Q4_K gate/up via dp4a (mmq): quantize the ffn-normed row to int8 once, shared.
-                    rec.quant_q8(hn2.as_ref(), qa.as_ref(), da.as_ref(), sa.as_ref(), 1, ne);
-                    rec.linear_mmv_id_multi_q4k(
-                        gb,
-                        qa.as_ref(),
-                        da.as_ref(),
-                        sa.as_ref(),
-                        ids.as_ref(),
-                        nu,
-                        st.stride,
-                        g.as_ref(),
-                        ne,
-                        mc.n_ff_exp,
-                    );
-                    rec.linear_mmv_id_multi_q4k(
-                        ub,
-                        qa.as_ref(),
-                        da.as_ref(),
-                        sa.as_ref(),
-                        ids.as_ref(),
-                        nu,
-                        st.stride,
-                        u.as_ref(),
-                        ne,
-                        mc.n_ff_exp,
+                rec.store_f16_dyn(vr.as_ref(), params.as_ref(), kv.kv.v[li].as_ref(), kvrow);
+                if use_split {
+                    rec.attention_kv_split_dyn(
+                        q_f16.as_ref(),
+                        kv.kv.k[li].as_ref(),
+                        kv.kv.v[li].as_ref(),
+                        attn.as_ref(),
+                        pm.as_ref().unwrap().as_ref(),
+                        pl.as_ref().unwrap().as_ref(),
+                        pacc.as_ref().unwrap().as_ref(),
+                        params.as_ref(),
+                        nh,
+                        nkv,
+                        hd,
+                        chunk,
+                        n_chunks,
                     );
                 } else {
-                    rec.linear_native_id_multi(
-                        gd,
-                        gb,
-                        ids.as_ref(),
-                        nu,
-                        st.stride,
-                        hn2.as_ref(),
-                        false,
-                        g.as_ref(),
-                        ne,
-                        mc.n_ff_exp,
-                    );
-                    rec.linear_native_id_multi(
-                        ud,
-                        ub,
-                        ids.as_ref(),
-                        nu,
-                        st.stride,
-                        hn2.as_ref(),
-                        false,
-                        u.as_ref(),
-                        ne,
-                        mc.n_ff_exp,
+                    rec.attention_kv_dyn(
+                        q_f16.as_ref(),
+                        kv.kv.k[li].as_ref(),
+                        kv.kv.v[li].as_ref(),
+                        params.as_ref(),
+                        attn.as_ref(),
+                        1,
+                        nh,
+                        nkv,
+                        hd,
                     );
                 }
-                rec.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), nu * mc.n_ff_exp);
-                rec.linear_native_id_multi(
-                    dd,
-                    db,
-                    ids.as_ref(),
-                    nu,
-                    st.stride,
-                    act.as_ref(),
-                    true,
-                    y.as_ref(),
-                    mc.n_ff_exp,
+                rec_linear(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), 1, nh * hd, ne);
+                rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), ne); // residual
+                rec.rmsnorm(
+                    hidden.as_ref(),
+                    layer.ffn_norm_buf.as_ref(),
+                    hn2.as_ref(),
+                    1,
                     ne,
+                    c.rms_eps,
                 );
-                rec.moe_accumulate(y.as_ref(), wts.as_ref(), hidden.as_ref(), ne, nu);
-                // Tier 1: do NOT finish — keep recording the next layer into the same buffer.
-            } else {
-                // Fallback (non-id-capable expert format): host top-k needs this layer's logits, so
-                // finish here and continue the next layer in a fresh recorder.
-                let done =
-                    std::mem::replace(&mut rec, self.be.recorder().map_err(|e| anyhow!("{e}"))?);
-                done.finish().map_err(|e| anyhow!("{e}"))?;
-                let mut lb = vec![0u8; mc.n_expert * 4];
-                self.be
-                    .download(logits.as_ref(), &mut lb)
-                    .map_err(|e| anyhow!("{e}"))?;
-                let (idx, weights) = moe_topk(bytemuck::cast_slice(&lb), &mc);
-                let rec2 = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
-                for (ki, &e) in idx.iter().enumerate() {
-                    rec_linear_expert(
-                        &rec2,
-                        &st.gate,
-                        e,
-                        st.stride,
-                        hn2.as_ref(),
-                        g.as_ref(),
+                let (gate_inp, st) = layer.moe_stacked().expect("stacked experts");
+                rec_linear(
+                    &rec,
+                    gate_inp,
+                    hn2.as_ref(),
+                    logits.as_ref(),
+                    1,
+                    ne,
+                    mc.n_expert,
+                );
+
+                if let (Some(ids), Some(wts)) = (&ids_buf, &wts_buf) {
+                    // Fully GPU-resident: top-k on the GPU writes expert ids + weights to VRAM, then the
+                    // selected experts' FFN (id-indexed gather of the stacked weights) accumulates into
+                    // hidden — all in this one recorder. No readback, one submit/layer.
+                    rec.moe_topk(
+                        logits.as_ref(),
+                        ids.as_ref(),
+                        wts.as_ref(),
                         1,
-                        ne,
-                        mc.n_ff_exp,
+                        mc.n_expert,
+                        mc.n_used,
+                        mc.scale,
                     );
-                    rec_linear_expert(
-                        &rec2,
-                        &st.up,
-                        e,
-                        st.stride,
-                        hn2.as_ref(),
-                        u.as_ref(),
-                        1,
-                        ne,
-                        mc.n_ff_exp,
-                    );
-                    rec2.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), mc.n_ff_exp);
-                    rec_linear_expert(
-                        &rec2,
-                        &st.down,
-                        e,
+                    // Fused: all n_used experts per role in ONE dispatch (concurrent, no inter-expert
+                    // barrier). gate/up read the shared ffn-normed row; down reads each slot's activation.
+                    let (gd, gb) = native_parts(&st.gate);
+                    let (ud, ub) = native_parts(&st.up);
+                    let (dd, db) = native_parts(&st.down);
+                    let nu = mc.n_used;
+                    if let (Some(qa), Some(da), Some(sa)) = (&qa, &dact, &sact) {
+                        // Q4_K gate/up via dp4a (mmq): quantize the ffn-normed row to int8 once, shared.
+                        rec.quant_q8(hn2.as_ref(), qa.as_ref(), da.as_ref(), sa.as_ref(), 1, ne);
+                        rec.linear_mmv_id_multi_q4k(
+                            gb,
+                            qa.as_ref(),
+                            da.as_ref(),
+                            sa.as_ref(),
+                            ids.as_ref(),
+                            nu,
+                            st.stride,
+                            g.as_ref(),
+                            ne,
+                            mc.n_ff_exp,
+                        );
+                        rec.linear_mmv_id_multi_q4k(
+                            ub,
+                            qa.as_ref(),
+                            da.as_ref(),
+                            sa.as_ref(),
+                            ids.as_ref(),
+                            nu,
+                            st.stride,
+                            u.as_ref(),
+                            ne,
+                            mc.n_ff_exp,
+                        );
+                    } else {
+                        rec.linear_native_id_multi(
+                            gd,
+                            gb,
+                            ids.as_ref(),
+                            nu,
+                            st.stride,
+                            hn2.as_ref(),
+                            false,
+                            g.as_ref(),
+                            ne,
+                            mc.n_ff_exp,
+                        );
+                        rec.linear_native_id_multi(
+                            ud,
+                            ub,
+                            ids.as_ref(),
+                            nu,
+                            st.stride,
+                            hn2.as_ref(),
+                            false,
+                            u.as_ref(),
+                            ne,
+                            mc.n_ff_exp,
+                        );
+                    }
+                    rec.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), nu * mc.n_ff_exp);
+                    rec.linear_native_id_multi(
+                        dd,
+                        db,
+                        ids.as_ref(),
+                        nu,
                         st.stride,
                         act.as_ref(),
+                        true,
                         y.as_ref(),
-                        1,
                         mc.n_ff_exp,
                         ne,
                     );
-                    rec2.add_scaled(y.as_ref(), hidden.as_ref(), weights[ki], ne);
+                    rec.moe_accumulate(y.as_ref(), wts.as_ref(), hidden.as_ref(), ne, nu);
+                    // Tier 1: do NOT finish — keep recording the next layer into the same buffer.
+                } else {
+                    // Fallback (non-id-capable expert format): host top-k needs this layer's logits, so
+                    // finish here and continue the next layer in a fresh recorder.
+                    let done = std::mem::replace(
+                        &mut rec,
+                        self.be.recorder().map_err(|e| anyhow!("{e}"))?,
+                    );
+                    done.finish().map_err(|e| anyhow!("{e}"))?;
+                    let mut lb = vec![0u8; mc.n_expert * 4];
+                    self.be
+                        .download(logits.as_ref(), &mut lb)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    let (idx, weights) = moe_topk(bytemuck::cast_slice(&lb), &mc);
+                    let rec2 = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
+                    for (ki, &e) in idx.iter().enumerate() {
+                        rec_linear_expert(
+                            &rec2,
+                            &st.gate,
+                            e,
+                            st.stride,
+                            hn2.as_ref(),
+                            g.as_ref(),
+                            1,
+                            ne,
+                            mc.n_ff_exp,
+                        );
+                        rec_linear_expert(
+                            &rec2,
+                            &st.up,
+                            e,
+                            st.stride,
+                            hn2.as_ref(),
+                            u.as_ref(),
+                            1,
+                            ne,
+                            mc.n_ff_exp,
+                        );
+                        rec2.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), mc.n_ff_exp);
+                        rec_linear_expert(
+                            &rec2,
+                            &st.down,
+                            e,
+                            st.stride,
+                            act.as_ref(),
+                            y.as_ref(),
+                            1,
+                            mc.n_ff_exp,
+                            ne,
+                        );
+                        rec2.add_scaled(y.as_ref(), hidden.as_ref(), weights[ki], ne);
+                    }
+                    rec2.finish().map_err(|e| anyhow!("{e}"))?;
                 }
-                rec2.finish().map_err(|e| anyhow!("{e}"))?;
+            }
+            // use_ro: keep the recorded buffer to replay; else submit it once (Tier 1) now.
+            if use_ro {
+                kv.rec_decode = Some((sig, rec.finish_record().map_err(|e| anyhow!("{e}"))?));
+            } else {
+                rec.finish().map_err(|e| anyhow!("{e}"))?;
             }
         }
-        // gpu_route: the single submit for all 48 layers. host fallback: a trailing empty recorder.
-        rec.finish().map_err(|e| anyhow!("{e}"))?;
+        // Record-once: replay the cached command buffer (only params + embedding changed this token).
+        if use_ro {
+            kv.rec_decode
+                .as_ref()
+                .unwrap()
+                .1
+                .replay()
+                .map_err(|e| anyhow!("{e}"))?;
+        }
         kv.kv.len += 1;
 
         // final norm + lm head (on the GPU); greedy → GPU argmax + 4-byte token readback.

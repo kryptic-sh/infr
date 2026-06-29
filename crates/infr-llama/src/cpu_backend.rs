@@ -33,6 +33,136 @@ pub struct CpuStats {
     pub decode_secs: f64,
 }
 
+/// Activation quantized to Q8 over 256-element super-blocks: `qs[i] = round(x[i]/d[blk])` (int8),
+/// `d[blk] = max|x|/127`. Quantize the activation ONCE per matvec, then integer-dot it against the
+/// quantized weight rows (llama.cpp's q8_K path) — no per-row f32 weight expansion.
+struct Q8 {
+    qs: Vec<i8>,
+    d: Vec<f32>,
+}
+
+fn quantize_q8(x: &[f32]) -> Q8 {
+    let nb = x.len() / 256;
+    let mut qs = vec![0i8; nb * 256];
+    let mut d = vec![0f32; nb];
+    for b in 0..nb {
+        let blk = &x[b * 256..b * 256 + 256];
+        let amax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let dd = amax / 127.0;
+        let id = if dd > 0.0 { 1.0 / dd } else { 0.0 };
+        d[b] = dd;
+        for (i, &v) in blk.iter().enumerate() {
+            qs[b * 256 + i] = (v * id).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    Q8 { qs, d }
+}
+
+/// `Σ weight·x` for one Q4_K row (144 bytes / 256 elems) against the Q8 activation. Weight value is
+/// `d·sc_s·q4 − dmin·m_s` over 8 sub-blocks of 32; the integer sub-block dot `Σ q4·q8` autovectorizes.
+fn vec_dot_q4k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let blk = &row[b * 144..b * 144 + 144];
+        let d = crate::rdf16(&blk[0..2]);
+        let dmin = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qs = &blk[16..144];
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let (mut sd, mut sm) = (0i32, 0i32);
+        for s in 0..8 {
+            let (sc, m) = crate::k4(s, scales);
+            let (half, hi) = (s / 2, s % 2 == 1);
+            let qbyte = &qs[half * 32..half * 32 + 32];
+            let q8s = &q8b[s * 32..s * 32 + 32];
+            let (mut iprod, mut isum) = (0i32, 0i32);
+            for l in 0..32 {
+                let q4 = if hi {
+                    (qbyte[l] >> 4) as i32
+                } else {
+                    (qbyte[l] & 0xF) as i32
+                };
+                let v = q8s[l] as i32;
+                iprod += q4 * v;
+                isum += v;
+            }
+            sd += sc as i32 * iprod;
+            sm += m as i32 * isum;
+        }
+        sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
+    }
+    sumf
+}
+
+/// `Σ weight·x` for one Q6_K row (210 bytes / 256 elems). Weight value is `d·sc·(q6−32)` over 16
+/// sub-blocks of 16 (int8 scales); accumulate `Σ q6·q8` and `Σ q8` per sub-block.
+fn vec_dot_q6k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let blk = &row[b * 210..b * 210 + 210];
+        let ql = &blk[0..128];
+        let qh = &blk[128..192];
+        let scales = &blk[192..208];
+        let d = crate::rdf16(&blk[208..210]);
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let mut sumi = [0i32; 16];
+        let mut bsum = [0i32; 16];
+        for half in 0..2 {
+            let (qlo, qho, sco, base) = (half * 64, half * 32, half * 8, half * 128);
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = (ql[qlo + l] & 0xF) | ((qh[qho + l] & 3) << 4);
+                let q2 = (ql[qlo + l + 32] & 0xF) | (((qh[qho + l] >> 2) & 3) << 4);
+                let q3 = (ql[qlo + l] >> 4) | (((qh[qho + l] >> 4) & 3) << 4);
+                let q4 = (ql[qlo + l + 32] >> 4) | (((qh[qho + l] >> 6) & 3) << 4);
+                for (off, q, sci) in [(0, q1, 0), (32, q2, 2), (64, q3, 4), (96, q4, 6)] {
+                    let sub = sco + is + sci;
+                    let v = q8b[base + l + off] as i32;
+                    sumi[sub] += q as i32 * v;
+                    bsum[sub] += v;
+                }
+            }
+        }
+        let mut s = 0f32;
+        for sub in 0..16 {
+            s += scales[sub] as i8 as f32 * (sumi[sub] - 32 * bsum[sub]) as f32;
+        }
+        sumf += d * q8.d[b] * s;
+    }
+    sumf
+}
+
+/// `Σ f16_weight·x` (weight is 2 bytes/elem). `target-cpu=native` lowers the f16→f32 to F16C.
+fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
+    let mut acc = [0f32; 8];
+    let n = x.len();
+    let chunks = n / 8;
+    for c in 0..chunks {
+        for (j, ac) in acc.iter_mut().enumerate() {
+            let i = c * 8 + j;
+            let wv = half::f16::from_le_bytes([w[i * 2], w[i * 2 + 1]]).to_f32();
+            *ac += wv * x[i];
+        }
+    }
+    let mut s: f32 = acc.iter().sum();
+    for i in chunks * 8..n {
+        s += half::f16::from_le_bytes([w[i * 2], w[i * 2 + 1]]).to_f32() * x[i];
+    }
+    s
+}
+
+/// `Σ bf16_weight·x` (bf16 = top 16 bits of f32).
+fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
+    let mut s = 0f32;
+    for (i, &xi) in x.iter().enumerate() {
+        let wv = f32::from_bits((u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]) as u32) << 16);
+        s += wv * xi;
+    }
+    s
+}
+
 /// Dot product with 8 independent accumulators so the reduction isn't latency-bound — lets the
 /// autovectorizer (with `target-cpu=native`) keep several AVX FMA lanes in flight. `a`/`b` equal len.
 #[inline]
@@ -325,11 +455,22 @@ impl Backend for CpuBackend {
                     let dt = g.desc(w).dtype;
                     let bpr = wbytes.len() / out_f; // bytes per weight row
                     let mut out = vec![0f32; m * out_f];
-                    // One token (decode) is the hot path: parallelize the output rows directly.
+                    // One token (decode) is the hot path. Dispatch on the weight dtype to the fastest
+                    // per-row kernel: integer Q8×Q4_K/Q6_K dots (quantize the activation once), direct
+                    // f16/bf16/f32 dots, else fall back to dequant-to-f32 + dot. All fan out over rows.
                     if m == 1 {
+                        let xrow = &xs[..in_f];
+                        let q8 = matches!(dt, DType::Q4K | DType::Q6K).then(|| quantize_q8(xrow));
                         out.par_iter_mut().enumerate().for_each(|(o, dst_o)| {
-                            let row = bytes_to_f32(&wbytes[o * bpr..o * bpr + bpr], dt);
-                            *dst_o = dot(&row, &xs[..in_f]);
+                            let row = &wbytes[o * bpr..o * bpr + bpr];
+                            *dst_o = match dt {
+                                DType::Q4K => vec_dot_q4k(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q6K => vec_dot_q6k(row, q8.as_ref().unwrap(), in_f),
+                                DType::F32 => dot(bytemuck::cast_slice(row), xrow),
+                                DType::F16 => dot_f16(row, xrow),
+                                DType::Bf16 => dot_bf16(row, xrow),
+                                _ => dot(&bytes_to_f32(row, dt), xrow),
+                            };
                         });
                     } else {
                         for o in 0..out_f {

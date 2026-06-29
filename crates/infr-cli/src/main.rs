@@ -288,35 +288,65 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
 
     // CPU backend (INFR_CPU=1): run entirely on the CPU through the backend-agnostic compute graph —
-    // NO Vulkan init, NO VRAM. Intercepted before any GPU loader. One-shot (pass a message). Covers
-    // dense Qwen3/Llama, Gemma 3/4 (+E2B), qwen3moe, and qwen35/Qwen3-Next.
+    // NO Vulkan init, NO VRAM. Intercepted before any GPU loader. One-shot (pass a message) or an
+    // interactive REPL (no args). Covers dense Qwen3/Llama, Gemma 3/4 (+E2B), qwen3moe, qwen35.
+    // (Each turn is independent — no cross-turn KV context on the CPU path yet.)
     if std::env::var("INFR_CPU").is_ok() {
-        let Some(m) = message else {
-            anyhow::bail!("INFR_CPU currently supports one-shot only: pass a message");
-        };
-        let mut render = ThinkRender::new();
-        let (_text, stats) = if infr_llama::qwen35::is_qwen35(&gguf) {
+        let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
+        let dense = if is_q35 {
             eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
-            let prompt = format!("<|im_start|>user\n{m}<|im_end|>\n<|im_start|>assistant\n");
-            infr_llama::qwen35::generate_cpu(&gguf, &prompt, max_new, |p| render.feed(p))?
+            None
         } else {
             eprintln!(
                 "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
             );
-            let model = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
-            let prompt = model.chatml(m);
-            model.generate_cpu(&prompt, max_new, |p| render.feed(p))?
+            Some(infr_llama::CpuModel::load(&gguf, tok.as_deref())?)
         };
-        render.finish();
-        let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
-        eprintln!(
-            "[prefill {} tok @ {:.0} tok/s ({:.0} ms) | decode {} tok @ {:.1} tok/s]",
-            stats.n_prompt,
-            rate(stats.n_prompt, stats.prompt_secs),
-            stats.prompt_secs * 1000.0,
-            stats.n_gen,
-            rate(stats.n_gen, stats.decode_secs),
-        );
+        let run_turn = |m: &str| -> anyhow::Result<()> {
+            let mut render = ThinkRender::new();
+            let stats = if let Some(model) = &dense {
+                let prompt = model.chatml(m);
+                model.generate_cpu(&prompt, max_new, |p| render.feed(p))?
+            } else {
+                let prompt = format!("<|im_start|>user\n{m}<|im_end|>\n<|im_start|>assistant\n");
+                infr_llama::qwen35::generate_cpu(&gguf, &prompt, max_new, |p| render.feed(p))?
+            };
+            render.finish();
+            let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+            eprintln!(
+                "[prefill {} tok @ {:.0} tok/s ({:.0} ms) | decode {} tok @ {:.1} tok/s]",
+                stats.n_prompt,
+                rate(stats.n_prompt, stats.prompt_secs),
+                stats.prompt_secs * 1000.0,
+                stats.n_gen,
+                rate(stats.n_gen, stats.decode_secs),
+            );
+            Ok(())
+        };
+        if let Some(m) = message {
+            run_turn(m)?;
+        } else {
+            // Interactive REPL: read a line, generate, repeat. Ctrl-D / exit / quit to leave.
+            let stdin = std::io::stdin();
+            loop {
+                print!("\n> ");
+                std::io::stdout().flush().ok();
+                let mut line = String::new();
+                if stdin.read_line(&mut line)? == 0 {
+                    break;
+                }
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if matches!(line, "exit" | "quit" | ":q" | ":quit") {
+                    break;
+                }
+                if let Err(e) = run_turn(line) {
+                    eprintln!("error: {e}");
+                }
+            }
+        }
         return Ok(());
     }
 

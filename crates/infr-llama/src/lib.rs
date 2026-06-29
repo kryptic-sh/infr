@@ -469,12 +469,14 @@ impl CpuModel {
 
     /// Greedy generation on the CPU reference backend (no GPU). Returns the decoded text plus
     /// timing/counts ([`crate::cpu_backend::CpuStats`]) for the caller's stats line.
+    /// The generated text is delivered through `on_piece` as it streams; only timing/counts are
+    /// returned.
     pub fn generate_cpu(
         &self,
         prompt: &str,
         max_new: usize,
         mut on_piece: impl FnMut(&str),
-    ) -> Result<(String, crate::cpu_backend::CpuStats)> {
+    ) -> Result<crate::cpu_backend::CpuStats> {
         let enc = self
             .tokenizer
             .encode(prompt, false)
@@ -492,11 +494,7 @@ impl CpuModel {
             max_new,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
         )?;
-        let text = self
-            .tokenizer
-            .decode(&acc, true)
-            .map_err(|e| anyhow!("decode: {e}"))?;
-        Ok((text, stats))
+        Ok(stats)
     }
 }
 

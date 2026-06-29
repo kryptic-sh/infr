@@ -460,6 +460,25 @@ impl Backend for CpuBackend {
 // prompt ingestion (looped) and generation — so no GEMM/flash prefill kernels are needed on CPU.
 // The KV cache grows one row per step. Validates the agnostic seam end-to-end against the GPU path.
 
+/// Per-layer weight handles captured while building one decode graph (q/k-norm + the gemma
+/// sandwich norms are optional). The order they're declared in MUST match the upload order so
+/// `weights[i]` binds to `wbufs[i]`.
+struct LayerW {
+    attn_norm: TensorId,
+    wq: TensorId,
+    wk: TensorId,
+    wv: TensorId,
+    q_norm: Option<TensorId>,
+    k_norm: Option<TensorId>,
+    wo: TensorId,
+    post_attn: Option<TensorId>,
+    ffn_norm: TensorId,
+    wgate: TensorId,
+    wup: TensorId,
+    wdown: TensorId,
+    post_ffw: Option<TensorId>,
+}
+
 /// Handles into one freshly-built decode graph that the driver re-binds each step.
 struct DecodeHandles {
     hidden: TensorId,
@@ -467,16 +486,17 @@ struct DecodeHandles {
     logits: TensorId,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
-    weights: Vec<TensorId>, // in upload order (see `WEIGHT_ORDER` build below)
+    weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
-/// Greedy CPU generation for a Qwen3/Llama dense model. `prompt` is the full token prefix; returns
-/// the generated continuation (not including the prompt). Stops at EOS or `max_new`.
-pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> AResult<Vec<u32>> {
+/// Greedy CPU generation for a dense decoder (Qwen3 / Llama / Gemma 3). `prompt` is the full token
+/// prefix; returns the generated continuation. Stops at EOS or `max_new`. gemma4 (per-layer head
+/// dims, V-norm, layer-output scale, E2B) and MoE are not handled yet.
+pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> AResult<Vec<u32>> {
     let c = &llama.cfg;
-    if c.moe.is_some() || c.gemma {
+    if c.moe.is_some() || c.gemma4 {
         return Err(anyhow!(
-            "cpu runner: only dense Qwen3/Llama supported so far (no MoE/Gemma)"
+            "cpu runner: dense Qwen3/Llama/Gemma3 only (no MoE/gemma4 yet)"
         ));
     }
     let be = CpuBackend::new();
@@ -484,9 +504,17 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
     let kvrow = nkv * hd;
     let qrow = nh * hd;
     let nff = c.n_ff;
+    let gemma = c.gemma;
+    let qk_norm = c.qk_norm;
+    let act = if gemma {
+        Activation::Gelu
+    } else {
+        Activation::Silu
+    };
     let max_ctx = prompt.len() + max_new + 1;
 
-    // ── upload weights (all pre-dequantized to f32 for correctness-first) ──────────
+    // ── upload weights (all pre-dequantized to f32 for correctness-first). The order here MUST
+    //    match the `g.weight()` declaration order in `build` below. ───────────────────────────────
     let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
     let mut wf32 = |name: &str| -> AResult<()> {
         let (v, _) = load_tensor_dequant(&llama.gguf, name)?;
@@ -498,22 +526,27 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         wbufs.push(b);
         Ok(())
     };
-    // Per layer: 0 attn_norm, 1 wq, 2 wk, 3 wv, 4 q_norm, 5 k_norm, 6 wo, 7 ffn_norm,
-    //            8 wgate, 9 wup, 10 wdown   (11 weights/layer)
-    const WPL: usize = 11;
     for l in 0..c.n_layer {
         let p = |s: &str| format!("blk.{l}.{s}");
         wf32(&p("attn_norm.weight"))?;
         wf32(&p("attn_q.weight"))?;
         wf32(&p("attn_k.weight"))?;
         wf32(&p("attn_v.weight"))?;
-        wf32(&p("attn_q_norm.weight"))?;
-        wf32(&p("attn_k_norm.weight"))?;
+        if qk_norm {
+            wf32(&p("attn_q_norm.weight"))?;
+            wf32(&p("attn_k_norm.weight"))?;
+        }
         wf32(&p("attn_output.weight"))?;
+        if gemma {
+            wf32(&p("post_attention_norm.weight"))?;
+        }
         wf32(&p("ffn_norm.weight"))?;
         wf32(&p("ffn_gate.weight"))?;
         wf32(&p("ffn_up.weight"))?;
         wf32(&p("ffn_down.weight"))?;
+        if gemma {
+            wf32(&p("post_ffw_norm.weight"))?;
+        }
     }
     // Globals: output_norm, lm_head (output.weight, or tied to token_embd f32).
     wf32("output_norm.weight")?;
@@ -570,24 +603,59 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             k_cache.push(g.input(f32d(max_ctx * kvrow)));
             v_cache.push(g.input(f32d(max_ctx * kvrow)));
         }
-        // weights
-        let mut w = Vec::new();
-        for l in 0..c.n_layer {
-            let _ = l;
-            w.push(g.weight(f32d(ne))); // attn_norm
-            w.push(g.weight(f32d(qrow * ne))); // wq
-            w.push(g.weight(f32d(kvrow * ne))); // wk
-            w.push(g.weight(f32d(kvrow * ne))); // wv
-            w.push(g.weight(f32d(hd))); // q_norm
-            w.push(g.weight(f32d(hd))); // k_norm
-            w.push(g.weight(f32d(ne * qrow))); // wo
-            w.push(g.weight(f32d(ne))); // ffn_norm
-            w.push(g.weight(f32d(nff * ne))); // wgate
-            w.push(g.weight(f32d(nff * ne))); // wup
-            w.push(g.weight(f32d(ne * nff))); // wdown
+
+        // Weights — declared in the SAME order as the upload loop. `wpush` records each handle in
+        // the flat `weights` list (for binding) while we also keep the named handle.
+        let mut weights: Vec<TensorId> = Vec::new();
+        let mut lw: Vec<LayerW> = Vec::new();
+        for _ in 0..c.n_layer {
+            let mut wpush = |g: &mut Graph, n: usize| {
+                let id = g.weight(f32d(n));
+                weights.push(id);
+                id
+            };
+            let attn_norm = wpush(&mut g, ne);
+            let wq = wpush(&mut g, qrow * ne);
+            let wk = wpush(&mut g, kvrow * ne);
+            let wv = wpush(&mut g, kvrow * ne);
+            let (q_norm, k_norm) = if qk_norm {
+                (Some(wpush(&mut g, hd)), Some(wpush(&mut g, hd)))
+            } else {
+                (None, None)
+            };
+            let wo = wpush(&mut g, ne * qrow);
+            let post_attn = if gemma { Some(wpush(&mut g, ne)) } else { None };
+            let ffn_norm = wpush(&mut g, ne);
+            let wgate = wpush(&mut g, nff * ne);
+            let wup = wpush(&mut g, nff * ne);
+            let wdown = wpush(&mut g, ne * nff);
+            let post_ffw = if gemma { Some(wpush(&mut g, ne)) } else { None };
+            lw.push(LayerW {
+                attn_norm,
+                wq,
+                wk,
+                wv,
+                q_norm,
+                k_norm,
+                wo,
+                post_attn,
+                ffn_norm,
+                wgate,
+                wup,
+                wdown,
+                post_ffw,
+            });
         }
-        let w_out_norm = g.weight(f32d(ne));
-        let w_lm = g.weight(f32d(c.vocab * ne));
+        let w_out_norm = {
+            let id = g.weight(f32d(ne));
+            weights.push(id);
+            id
+        };
+        let w_lm = {
+            let id = g.weight(f32d(c.vocab * ne));
+            weights.push(id);
+            id
+        };
         let logits = g.output(f32d(c.vocab));
 
         // scratch
@@ -598,17 +666,23 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         let attn = g.internal(f32d(qrow));
         let gbuf = g.internal(f32d(nff));
         let ubuf = g.internal(f32d(nff));
-        let act = g.internal(f32d(nff));
+        let actbuf = g.internal(f32d(nff));
         let sub = g.internal(f32d(ne));
 
         let eps = c.rms_eps;
-        let theta = c.rope_theta;
+        // gemma3 uses 1/√hd like Qwen; gemma4 (1.0) is rejected above.
         let scale = 1.0 / (hd as f32).sqrt();
-        for l in 0..c.n_layer {
-            let wb = l * WPL;
+        for (l, lw) in lw.iter().enumerate() {
+            let theta = c.layer_rope_theta(l); // gemma dual-rope (SWA 1e4 / full 1e6); uniform else
+            let mask = if gemma && c.is_swa_layer(l) {
+                AttnMask::SlidingWindow(c.swa_window)
+            } else {
+                AttnMask::Causal
+            };
+            // attn input norm
             g.push(Op::RmsNorm {
                 x: hidden,
-                weight: w[wb],
+                weight: lw.attn_norm,
                 dst: hn,
                 rows: 1,
                 dim: ne as u32,
@@ -616,7 +690,7 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             });
             g.push(Op::Linear {
                 x: hn,
-                weight: w[wb + 1],
+                weight: lw.wq,
                 dst: q,
                 m: 1,
                 in_f: ne as u32,
@@ -624,7 +698,7 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             });
             g.push(Op::Linear {
                 x: hn,
-                weight: w[wb + 2],
+                weight: lw.wk,
                 dst: k,
                 m: 1,
                 in_f: ne as u32,
@@ -632,30 +706,32 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             });
             g.push(Op::Linear {
                 x: hn,
-                weight: w[wb + 3],
+                weight: lw.wv,
                 dst: v,
                 m: 1,
                 in_f: ne as u32,
                 out_f: kvrow as u32,
             });
-            g.push(Op::QkNorm {
-                x: q,
-                weight: w[wb + 4],
-                dst: q,
-                rows: 1,
-                n_head: nh as u32,
-                head_dim: hd as u32,
-                eps,
-            });
-            g.push(Op::QkNorm {
-                x: k,
-                weight: w[wb + 5],
-                dst: k,
-                rows: 1,
-                n_head: nkv as u32,
-                head_dim: hd as u32,
-                eps,
-            });
+            if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
+                g.push(Op::QkNorm {
+                    x: q,
+                    weight: qn,
+                    dst: q,
+                    rows: 1,
+                    n_head: nh as u32,
+                    head_dim: hd as u32,
+                    eps,
+                });
+                g.push(Op::QkNorm {
+                    x: k,
+                    weight: kn,
+                    dst: k,
+                    rows: 1,
+                    n_head: nkv as u32,
+                    head_dim: hd as u32,
+                    eps,
+                });
+            }
             g.push(Op::Rope {
                 x: q,
                 positions,
@@ -703,26 +779,38 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 n_kv: nkv as u32,
                 head_dim: hd as u32,
                 scale,
-                mask: AttnMask::Causal,
+                mask,
                 pos: pos as u32,
             });
             g.push(Op::Linear {
                 x: attn,
-                weight: w[wb + 6],
+                weight: lw.wo,
                 dst: sub,
                 m: 1,
                 in_f: qrow as u32,
                 out_f: ne as u32,
             });
+            // gemma sandwich: post-attention norm on the sublayer output BEFORE the residual add.
+            if let Some(pa) = lw.post_attn {
+                g.push(Op::RmsNorm {
+                    x: sub,
+                    weight: pa,
+                    dst: sub,
+                    rows: 1,
+                    dim: ne as u32,
+                    eps,
+                });
+            }
             g.push(Op::Add {
                 a: hidden,
                 b: sub,
                 dst: hidden,
                 n: ne as u32,
             });
+            // ffn
             g.push(Op::RmsNorm {
                 x: hidden,
-                weight: w[wb + 7],
+                weight: lw.ffn_norm,
                 dst: hn,
                 rows: 1,
                 dim: ne as u32,
@@ -730,7 +818,7 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             });
             g.push(Op::Linear {
                 x: hn,
-                weight: w[wb + 8],
+                weight: lw.wgate,
                 dst: gbuf,
                 m: 1,
                 in_f: ne as u32,
@@ -738,7 +826,7 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             });
             g.push(Op::Linear {
                 x: hn,
-                weight: w[wb + 9],
+                weight: lw.wup,
                 dst: ubuf,
                 m: 1,
                 in_f: ne as u32,
@@ -747,20 +835,30 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             g.push(Op::GatedAct {
                 gate: gbuf,
                 up: ubuf,
-                dst: act,
+                dst: actbuf,
                 rows: 1,
                 nff: nff as u32,
-                act: Activation::Silu,
+                act,
                 up_off: 0,
             });
             g.push(Op::Linear {
-                x: act,
-                weight: w[wb + 10],
+                x: actbuf,
+                weight: lw.wdown,
                 dst: sub,
                 m: 1,
                 in_f: nff as u32,
                 out_f: ne as u32,
             });
+            if let Some(pf) = lw.post_ffw {
+                g.push(Op::RmsNorm {
+                    x: sub,
+                    weight: pf,
+                    dst: sub,
+                    rows: 1,
+                    dim: ne as u32,
+                    eps,
+                });
+            }
             g.push(Op::Add {
                 a: hidden,
                 b: sub,
@@ -792,9 +890,6 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 n: c.vocab as u32,
             });
         }
-        let mut weights = w;
-        weights.push(w_out_norm);
-        weights.push(w_lm);
         (
             g,
             DecodeHandles {
@@ -809,14 +904,18 @@ pub fn generate_qwen3_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
     };
 
     // ── drive ───────────────────────────────────────────────────────────────────────
+    let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
     let mut out = Vec::new();
     let mut cur = prompt.to_vec();
     let mut logits = vec![0f32; c.vocab];
     for pos in 0..(prompt.len() + max_new) {
         let tok = cur[pos] as usize;
-        // embed (qwen3/llama: no scale)
-        let emb = &llama.token_embd[tok * ne..tok * ne + ne];
-        be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(emb))
+        // embed (gemma scales by √n_embd; qwen3/llama identity)
+        let emb: Vec<f32> = llama.token_embd[tok * ne..tok * ne + ne]
+            .iter()
+            .map(|&x| x * embed_scale)
+            .collect();
+        be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;

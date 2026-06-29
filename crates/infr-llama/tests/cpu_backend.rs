@@ -43,3 +43,31 @@ fn cpu_matches_gpu_greedy() {
         "CPU reference output must match GPU greedy output"
     );
 }
+
+fn gemma3_1b() -> PathBuf {
+    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
+    let base = format!("{hub}/models--unsloth--gemma-3-1b-it-GGUF/snapshots");
+    for e in std::fs::read_dir(&base).expect("snapshots dir") {
+        let f = e.unwrap().path().join("gemma-3-1b-it-Q4_K_M.gguf");
+        if f.exists() {
+            return f;
+        }
+    }
+    panic!("gemma-3-1b gguf not found");
+}
+
+/// Gemma 3 (sandwich norms, GeGLU, dual-RoPE, SWA, √n_embd embed scale) on the CPU backend must
+/// match the GPU greedy path token-for-token.
+#[test]
+#[ignore = "needs a Vulkan GPU + the gemma-3-1b GGUF; run with INFR_TEMP=0"]
+fn cpu_matches_gpu_gemma3() {
+    std::env::set_var("INFR_TEMP", "0");
+    let llama = infr_llama::Llama::load_opt(&gemma3_1b(), None).expect("load");
+    let prompt = "The capital of France is";
+    let n = 24;
+    let gpu = llama.generate(prompt, n, |_| {}).expect("gpu generate");
+    let cpu = llama.generate_cpu(prompt, n).expect("cpu generate");
+    println!("GPU: {gpu:?}");
+    println!("CPU: {cpu:?}");
+    assert_eq!(cpu, gpu, "gemma3 CPU must match GPU greedy output");
+}

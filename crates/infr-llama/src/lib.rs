@@ -4574,7 +4574,7 @@ impl Llama {
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
-        let generated = crate::cpu_backend::generate_qwen3_cpu(self, &prompt_tokens, max_new)?;
+        let generated = crate::cpu_backend::generate_dense_cpu(self, &prompt_tokens, max_new)?;
         self.tokenizer
             .decode(&generated, true)
             .map_err(|e| anyhow!("decode: {e}"))

@@ -4,7 +4,7 @@
 //! Reference: `~/Projects/llama.cpp/src/llama-model.cpp` (arch `diffusion-gemma`).
 //! Spec (from GGUF): 30 layers, hidden 2816, vocab 262144, head_count 16, head_count_kv
 //! `[8,8,8,8,8,2]×5` (layers 5/11/17/23/29 full, rest sliding-window), key/value_length
-//! 512 (full) / 256 (swa), canvas_length 256, mask_token 4. See PLAN.md "DiffusionGemma spec".
+//! 512 (full) / 256 (swa), canvas_length 256, mask_token 4. See docs/PLAN.md "DiffusionGemma spec".
 #![allow(dead_code, unused_variables)]
 
 use infr_core::{

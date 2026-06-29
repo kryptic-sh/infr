@@ -2,7 +2,7 @@
 //! never names a GPU API. Shared by `infr run` and `infr serve`.
 //!
 //! Reference for chat/channel/tool behavior: `~/Projects/scratch/dgemma-openai-server.py`.
-//! See PLAN.md "engine".
+//! See docs/PLAN.md "engine".
 #![allow(dead_code, unused_variables)]
 
 pub mod chat;

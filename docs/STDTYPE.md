@@ -1,5 +1,14 @@
 # STDTYPE.md — GGUF dtype coverage (match llama.cpp)
 
+> **Status (2026-06-29): host-side dequant coverage largely DONE.** The
+> `infr_core::DType` enum and `infr-llama::dequant_block` / `iquant_grids` now
+> cover the k-quants (Q2_K–Q6_K), the i-quants (IQ1_S … IQ4_XS), ternary
+> (TQ1/TQ2), and fp4 (MXFP4/NVFP4) on the host path — which the new CPU
+> reference backend also rides on. The "Current state vs target" table below
+> predates that and is kept only as the original gap analysis. What's still open
+> is the **GPU in-kernel** side (per-type dequant shaders / native-block VRAM
+> upload) — tracked in [`GPULOAD.md`](GPULOAD.md).
+
 Implementation plan to add the GGUF weight quant types that llama.cpp supports
 but `infr` does not yet. **Scope: GGUF data formats only** (safetensors is
 explicitly out of scope for this work). Reference implementation is the local

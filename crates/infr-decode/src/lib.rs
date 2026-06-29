@@ -1,7 +1,7 @@
 //! Decode seam + diffusion strategy. Turns compiled forward passes into tokens.
 //!
 //! Reference: `~/Projects/llama.cpp/examples/diffusion/diffusion.{cpp,h}`
-//! (`diffusion_generate_entropy_bound`). See PLAN.md "decode".
+//! (`diffusion_generate_entropy_bound`). See docs/PLAN.md "decode".
 #![allow(dead_code, unused_variables)]
 
 use infr_core::error::Result;

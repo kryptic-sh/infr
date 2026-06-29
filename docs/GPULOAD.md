@@ -1,5 +1,12 @@
 # GPULOAD.md — native-block GPU weight loading
 
+> **Status (2026-06-29): NOT started — still a valid pending plan.** The Vulkan
+> loader continues to host-dequant + upload (f16 / repacked quant). This doc is
+> the design for moving that in-kernel. Note the new CPU reference backend
+> already keeps weights in their native GGUF dtype and dequants lazily on read
+> ([root `PLAN.md`](../PLAN.md), "dtype-aware weights") — the same principle,
+> applied to the GPU loader, is what this plan describes.
+
 Plan to upload **raw GGUF quant blocks to VRAM and dequantize in-shader**,
 instead of the current host-side dequant + repack. Eliminates host processing
 for the GPU-consumed weights → faster model load (host dequant currently

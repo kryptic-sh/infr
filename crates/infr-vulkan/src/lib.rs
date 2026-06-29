@@ -3,7 +3,7 @@
 //! Reference: `~/Projects/llama.cpp/ggml/src/ggml-vulkan/` and its `vulkan-shaders/*.comp`
 //! (reuse the tuned quant matmul / dequant / attention shaders). Enable device features
 //! `VK_KHR_cooperative_matrix`, `shaderFloat16`, `VK_KHR_16bit_storage`,
-//! `VK_KHR_shader_subgroup_extended_types`. See PLAN.md.
+//! `VK_KHR_shader_subgroup_extended_types`. See docs/PLAN.md.
 #![allow(dead_code)]
 // GPU kernel record/dispatch APIs bind many distinct buffers (weights, scales, activations,
 // scratch) — wide signatures are inherent here, not a refactor smell.

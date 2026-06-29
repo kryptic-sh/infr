@@ -2,7 +2,7 @@
 //! and chat-template rendering. No GPU, no model, no IO.
 //!
 //! Reference: `~/Projects/scratch/dgemma-openai-server.py` (Python shim).
-//! Token formats: PLAN.md "DiffusionGemma spec".
+//! Token formats: docs/PLAN.md "DiffusionGemma spec".
 
 use serde_json::Value;
 
@@ -340,7 +340,7 @@ pub fn apply_chat_template(
 }
 
 /// Best-effort manual prompt render when minijinja cannot handle the template.
-/// Produces `<|turn>role\ncontent<turn|>` as specified in PLAN.md.
+/// Produces `<|turn>role\ncontent<turn|>` as specified in docs/PLAN.md.
 fn manual_render(messages: &[ChatMessage]) -> String {
     let mut out = String::from("<bos>");
     for m in messages {
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn parse_tool_calls_bash_single_arg() {
-        // Format from PLAN.md: strings wrapped in <|"|>…<|"|>
+        // Format from docs/PLAN.md: strings wrapped in <|"|>…<|"|>
         let text = r#"<|tool_call>call:bash{command:<|"|>ls<|"|>}<tool_call|>"#;
         let (clean, calls) = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);

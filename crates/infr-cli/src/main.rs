@@ -1,5 +1,5 @@
 //! `infr` CLI — `pull` / `run` / `serve`, all over the same engine + backend.
-//! See PLAN.md "Product surface".
+//! See docs/PLAN.md "Product surface".
 #![allow(dead_code, unused_variables)]
 
 use clap::{Parser, Subcommand};

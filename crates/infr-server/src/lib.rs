@@ -1,7 +1,7 @@
 //! OpenAI-compatible HTTP server (axum + SSE). Talks only to `infr-engine` — never the GPU.
 //!
 //! Reference for the wire mapping (streaming, `reasoning_content`, tool_calls): the working
-//! shim at `~/Projects/scratch/dgemma-openai-server.py`. See PLAN.md "server".
+//! shim at `~/Projects/scratch/dgemma-openai-server.py`. See docs/PLAN.md "server".
 //!
 //! Routes:
 //!   GET  /health                -> 200 OK

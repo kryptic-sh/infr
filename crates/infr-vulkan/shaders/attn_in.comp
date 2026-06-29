@@ -13,9 +13,23 @@ layout(binding = 1) readonly buffer NB { float nw[]; };     // [ne]
 layout(binding = 2) readonly buffer WQ { float16_t wq[]; }; // [q_dim, ne]
 layout(binding = 3) readonly buffer WK { float16_t wk[]; }; // [kv_dim, ne]
 layout(binding = 4) readonly buffer WV { float16_t wv[]; }; // [kv_dim, ne]
+#ifdef USE_PARAMS
+// Record-once decode: pos comes from a host-updated params SSBO so the buffer replays across tokens.
+// Outputs shift to bindings 6/7/8 (params takes binding 5) to stay output-last.
+layout(binding = 5) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 6) buffer QO { float16_t q[]; };
+layout(binding = 7) buffer KO { float16_t kout[]; };
+layout(binding = 8) buffer VO { float16_t vout[]; };
+#else
 layout(binding = 5) buffer QO { float16_t q[]; };           // [rows, q_dim]
 layout(binding = 6) buffer KO { float16_t kout[]; };        // KV cache [ctx, kv_dim]
 layout(binding = 7) buffer VO { float16_t vout[]; };        // KV cache [ctx, kv_dim]
+#endif
+#ifdef USE_PARAMS
+#define POS p_pos
+#else
+#define POS pc.pos
+#endif
 
 shared float r_ss[64];
 shared float r_a[64];
@@ -59,15 +73,15 @@ void main() {
         float b = r_b[0] * scale;
         if (region == 2u) {
             uint vc = col - pc.q_dim - pc.kv_dim;
-            vout[(pc.pos + r) * pc.kv_dim + vc] = float16_t(a);
-            vout[(pc.pos + r) * pc.kv_dim + vc + 1u] = float16_t(b);
+            vout[(POS + r) * pc.kv_dim + vc] = float16_t(a);
+            vout[(POS + r) * pc.kv_dim + vc + 1u] = float16_t(b);
         } else {
             uint local = (region == 0u) ? col : (col - pc.q_dim);
             uint ih = local % pc.hd;
             float oa = a; float ob = b;
             if (ih < pc.rope_dim) {
                 float freq = pow(pc.theta, -2.0 * float(ih / 2u) / float(pc.rope_dim));
-                float ang = float(pc.pos + r) * freq;
+                float ang = float(POS + r) * freq;
                 float s = sin(ang); float co = cos(ang);
                 oa = a * co - b * s;
                 ob = a * s + b * co;
@@ -76,8 +90,8 @@ void main() {
                 q[r * pc.q_dim + col] = float16_t(oa);
                 q[r * pc.q_dim + col + 1u] = float16_t(ob);
             } else {
-                kout[(pc.pos + r) * pc.kv_dim + local] = float16_t(oa);
-                kout[(pc.pos + r) * pc.kv_dim + local + 1u] = float16_t(ob);
+                kout[(POS + r) * pc.kv_dim + local] = float16_t(oa);
+                kout[(POS + r) * pc.kv_dim + local + 1u] = float16_t(ob);
             }
         }
     }

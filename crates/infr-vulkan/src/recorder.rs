@@ -874,6 +874,65 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Record-once decode variant of `attn_in`: pos comes from the `params` SSBO (bound before the
+    /// q/k/v outputs) so the buffer can be replayed across tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_in_dyn(
+        &self,
+        hidden: &dyn Buffer,
+        norm_w: &dyn Buffer,
+        wq: &dyn Buffer,
+        wk: &dyn Buffer,
+        wv: &dyn Buffer,
+        params: &dyn Buffer,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        rows: usize,
+        ne: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        eps: f32,
+    ) {
+        self.stamp("attn_in");
+        let q_dim = nh * hd;
+        let kv_dim = nkv * hd;
+        let kern = self
+            .be
+            .kernel("attn_in_dyn", crate::gemm::attn_in_dyn_spv(), 9, 36);
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(q_dim as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(kv_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&theta.to_ne_bytes());
+        // [28..32] pos: unused (from params)
+        push[32..36].copy_from_slice(&eps.to_ne_bytes());
+        let half = (q_dim + 2 * kv_dim) / 2;
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(hidden),
+                Self::vkb(norm_w),
+                Self::vkb(wq),
+                Self::vkb(wk),
+                Self::vkb(wv),
+                Self::vkb(params),
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(v),
+            ],
+            3,
+            &push,
+            (rows * half) as u32,
+        );
+    }
+
     /// Quantized variant of `ffn_in` (Wgu = u8 quants + per-16-block f16 scale/min).
     #[allow(clippy::too_many_arguments)]
     pub fn ffn_in_q(

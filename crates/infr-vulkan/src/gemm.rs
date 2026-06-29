@@ -507,6 +507,7 @@ dyn_spv!(qk_norm_rope_dyn_spv, "qk_norm_rope_dyn");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");
 dyn_spv!(attention_kv_dyn_spv, "attention_kv_dyn");
 dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");
+dyn_spv!(attn_in_dyn_spv, "attn_in_dyn");
 /// SPIR-V for fused attention input (RMSNorm + QKV proj + RoPE).
 pub(crate) fn attn_in_spv() -> &'static [u32] {
     static ATTN_IN_SPV: OnceLock<Vec<u32>> = OnceLock::new();

@@ -53,6 +53,7 @@ fn main() {
         ("qk_norm_rope", "qk_norm_rope", &[]),
         ("qk_norm_rope", "qk_norm_rope_dyn", &["-DUSE_PARAMS"]),
         ("attn_in", "attn_in", &[]),
+        ("attn_in", "attn_in_dyn", &["-DUSE_PARAMS"]),
         ("ffn_in", "ffn_in", &[]),
         ("ffn_in_q", "ffn_in_q", &[]),
         ("attn_in_q", "attn_in_q", &[]),

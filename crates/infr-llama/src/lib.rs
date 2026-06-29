@@ -3398,7 +3398,10 @@ impl Llama {
     /// Returns `None` when ineligible (non-Qwen3, no scratch, or profiling) so the caller falls back.
     fn forward_resident_decode_ro(&self, token: u32, kv: &mut KvCache) -> Result<Option<Vec<f32>>> {
         let c = &self.cfg;
-        if !c.qk_norm || kv.dec.is_none() || std::env::var("INFR_PROF2").is_ok() {
+        // Eligible: Qwen3 (qk-norm; per-quant QKV GEMVs) OR a Llama-arch f16 model (the fused attn_in
+        // path, which requires f16 Q/K/V weights). Quantized Llama / offload / profiling fall back.
+        let llama_f16 = !c.qk_norm && matches!(self.layers[0].wq, Wt::F16(_));
+        if (!c.qk_norm && !llama_f16) || kv.dec.is_none() || std::env::var("INFR_PROF2").is_ok() {
             return Ok(None);
         }
         let (ne, nh, nkv, hd, nff) = (c.n_embd, c.n_head, c.n_kv, c.head_dim, c.n_ff);
@@ -3441,44 +3444,68 @@ impl Llama {
             let rec = self.be.recorder_persistent().map_err(|e| anyhow!("{e}"))?;
             rec.copy(dec.emb_in.as_ref(), 0, hidden.as_ref(), 0, ne * 4);
             for (li, layer) in self.layers.iter().enumerate() {
-                rec.rmsnorm(
-                    hidden.as_ref(),
-                    layer.attn_norm_buf.as_ref(),
-                    hn.as_ref(),
-                    1,
-                    ne,
-                    c.rms_eps,
-                );
-                rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), 1, ne, nh * hd);
-                rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), 1, ne, kvrow);
-                rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), 1, ne, kvrow);
-                rec.qk_norm_rope_dyn(
-                    qr.as_ref(),
-                    layer.q_norm_buf.as_ref().unwrap().as_ref(),
-                    params.as_ref(),
-                    q_f16.as_ref(),
-                    1,
-                    nh,
-                    hd,
-                    c.rope_dim,
-                    c.rope_theta,
-                    0,
-                    c.rms_eps,
-                );
-                rec.qk_norm_rope_dyn(
-                    kr.as_ref(),
-                    layer.k_norm_buf.as_ref().unwrap().as_ref(),
-                    params.as_ref(),
-                    kv.k[li].as_ref(),
-                    1,
-                    nkv,
-                    hd,
-                    c.rope_dim,
-                    c.rope_theta,
-                    1,
-                    c.rms_eps,
-                );
-                rec.store_f16_dyn(vr.as_ref(), params.as_ref(), kv.v[li].as_ref(), kvrow);
+                if c.qk_norm {
+                    // Qwen3: rmsnorm → per-quant Q/K/V GEMVs → QK-norm+RoPE (Q→q_f16, K→cache, V→cache).
+                    rec.rmsnorm(
+                        hidden.as_ref(),
+                        layer.attn_norm_buf.as_ref(),
+                        hn.as_ref(),
+                        1,
+                        ne,
+                        c.rms_eps,
+                    );
+                    rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), 1, ne, nh * hd);
+                    rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), 1, ne, kvrow);
+                    rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), 1, ne, kvrow);
+                    rec.qk_norm_rope_dyn(
+                        qr.as_ref(),
+                        layer.q_norm_buf.as_ref().unwrap().as_ref(),
+                        params.as_ref(),
+                        q_f16.as_ref(),
+                        1,
+                        nh,
+                        hd,
+                        c.rope_dim,
+                        c.rope_theta,
+                        0,
+                        c.rms_eps,
+                    );
+                    rec.qk_norm_rope_dyn(
+                        kr.as_ref(),
+                        layer.k_norm_buf.as_ref().unwrap().as_ref(),
+                        params.as_ref(),
+                        kv.k[li].as_ref(),
+                        1,
+                        nkv,
+                        hd,
+                        c.rope_dim,
+                        c.rope_theta,
+                        1,
+                        c.rms_eps,
+                    );
+                    rec.store_f16_dyn(vr.as_ref(), params.as_ref(), kv.v[li].as_ref(), kvrow);
+                } else {
+                    // Llama: one fused kernel does rmsnorm + Q/K/V proj + RoPE + KV append (f16 weights).
+                    rec.attn_in_dyn(
+                        hidden.as_ref(),
+                        layer.attn_norm_buf.as_ref(),
+                        layer.wq.f16(),
+                        layer.wk.f16(),
+                        layer.wv.f16(),
+                        params.as_ref(),
+                        q_f16.as_ref(),
+                        kv.k[li].as_ref(),
+                        kv.v[li].as_ref(),
+                        1,
+                        ne,
+                        nh,
+                        nkv,
+                        hd,
+                        c.rope_dim,
+                        c.rope_theta,
+                        c.rms_eps,
+                    );
+                }
                 if use_split {
                     rec.attention_kv_split_dyn(
                         q_f16.as_ref(),

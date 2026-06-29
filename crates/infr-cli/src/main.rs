@@ -305,7 +305,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         let run_turn = |m: &str| -> anyhow::Result<()> {
             let mut render = ThinkRender::new();
             let stats = if let Some(model) = &dense {
-                let prompt = model.chatml(m);
+                let prompt = model.render_chat(m);
                 model.generate_cpu(&prompt, max_new, |p| render.feed(p))?
             } else {
                 let prompt = format!("<|im_start|>user\n{m}<|im_end|>\n<|im_start|>assistant\n");

@@ -410,6 +410,44 @@ fn stream_token(
     }
 }
 
+/// Render a single user turn with the GGUF's embedded chat template (`tokenizer.chat_template`, a
+/// Jinja2 string) via minijinja, with `add_generation_prompt`. Returns `None` if there's no template
+/// or it fails to render. Shared by the GPU and CPU paths so an instruct model answers coherently.
+fn render_chat_user(gguf: &Gguf, tokenizer: &Tokenizer, eos: u32, user: &str) -> Option<String> {
+    let template = gguf.metadata().str("tokenizer.chat_template")?;
+    let bos_id = gguf
+        .metadata()
+        .get("tokenizer.ggml.bos_token_id")
+        .and_then(MetaValue::as_u64)
+        .unwrap_or(2) as u32;
+    let bos = tokenizer.id_to_token(bos_id).unwrap_or_default();
+    let eos_s = tokenizer.id_to_token(eos).unwrap_or_default();
+    let mut env = minijinja::Environment::new();
+    env.add_function(
+        "raise_exception",
+        |msg: String| -> std::result::Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        },
+    );
+    env.add_filter("tojson", |v: minijinja::Value| {
+        serde_json::to_string(&v).unwrap_or_else(|_| "null".to_owned())
+    });
+    env.add_template("chat", template).ok()?;
+    let tmpl = env.get_template("chat").ok()?;
+    let msgs = vec![serde_json::json!({ "role": "user", "content": user })];
+    let ctx = minijinja::context! {
+        messages => msgs,
+        tools => serde_json::Value::Null,
+        add_generation_prompt => true,
+        bos_token => bos,
+        eos_token => eos_s,
+    };
+    tmpl.render(ctx).ok()
+}
+
 /// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
 /// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
 fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
@@ -465,6 +503,13 @@ impl CpuModel {
     /// Wrap a user message in the ChatML turn markers (matches [`Llama::chatml`]).
     pub fn chatml(&self, user: &str) -> String {
         format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
+    }
+
+    /// Render a user turn with the model's OWN embedded chat template (so an instruct model — Gemma,
+    /// Qwen, … — answers coherently), falling back to ChatML if the GGUF has no template.
+    pub fn render_chat(&self, user: &str) -> String {
+        render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user)
+            .unwrap_or_else(|| self.chatml(user))
     }
 
     /// Greedy generation on the CPU reference backend (no GPU). Returns the decoded text plus

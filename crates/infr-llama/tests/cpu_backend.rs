@@ -6,6 +6,86 @@
 
 use std::path::PathBuf;
 
+// ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────
+//
+// These don't compare against the GPU: the CPU does the math in f32 while the GPU uses f16 + quant
+// kernels, so greedy decode would split on near-ties (precision, not a bug). Instead the CPU path is
+// validated by a **golden hash**: plain-text prompts are rendered through the model's jinja chat
+// template, generated greedily (deterministic), and a stable FNV-1a of the output is locked — each
+// golden was captured with `INFR_BLESS=1` and the text read to confirm it's coherent + correct, so
+// any op regression flips the hash. Kernel-level math (the Q4_K/Q6_K dot vs the f32 reference) is
+// unit-tested in `src/cpu_backend.rs`. The `cpu_matches_gpu_*` tests below remain as one-shot GPU
+// *integration* checks from bring-up.
+
+/// Stable FNV-1a-64 over a string. (`std::hash::DefaultHasher` is NOT stable across toolchains, so we
+/// roll our own for golden values.)
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Greedy CPU generation with NO GPU: load via [`infr_llama::CpuModel`] (Vulkan-free), render the
+/// prompt with the model's own chat template (so an instruct model answers coherently), collect the
+/// streamed text. This is exactly the production `INFR_CPU=1` path.
+fn cpu_gen(model: &infr_llama::CpuModel, prompt: &str, n: usize) -> String {
+    // Inputs are plain text; `render_chat` (the GGUF's jinja template) turns them into the exact
+    // token stream the instruct model expects.
+    let mut out = String::new();
+    model
+        .generate_cpu(&model.render_chat(prompt), n, |p| out.push_str(p))
+        .expect("cpu generate");
+    out
+}
+
+/// Golden hashes of the deterministic CPU output `(prompt, n, fnv1a)`. Capture/refresh with
+/// `INFR_BLESS=1` (prints the tuples); paste them here. A buggy op flips the hash.
+// Captured + verified coherent (chat-templated, Qwen3 thinks then answers): "…France's capital is
+// Paris", a simple-terms computer explanation, an ocean paragraph.
+const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xfd63781ea3bfa785),
+    (
+        "Explain how a computer works in simple terms.",
+        48,
+        0xcf56ba8c4bb5c455,
+    ),
+    (
+        "Write a short paragraph about the ocean.",
+        48,
+        0xe78aa4678afa273b,
+    ),
+];
+// Captured + verified coherent: "The capital of France is Paris. 😊", a brave-knight short story.
+const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xe5a37ab078db3a2c),
+    (
+        "Tell me a short story about a brave knight.",
+        48,
+        0x5147de9a0ddfae50,
+    ),
+];
+
+/// Assert (or, with `INFR_BLESS=1`, print) the golden hash for each case.
+fn check_golden(model: &infr_llama::CpuModel, cases: &[(&str, usize, u64)]) {
+    let bless = std::env::var("INFR_BLESS").is_ok();
+    for (prompt, n, want) in cases {
+        let out = cpu_gen(model, prompt, *n);
+        let h = fnv1a(&out);
+        if bless {
+            // Print the text too so a human can verify it's coherent before locking the hash.
+            println!("    ({prompt:?}, {n}, 0x{h:016x}),  // {out:?}");
+        } else {
+            assert_eq!(
+                h, *want,
+                "golden hash changed for {prompt:?} (n={n})\n  out: {out:?}\n  got 0x{h:016x} want 0x{want:016x}"
+            );
+        }
+    }
+}
+
 fn qwen3_06b() -> PathBuf {
     if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
         return PathBuf::from(p);
@@ -70,6 +150,25 @@ fn cpu_matches_gpu_gemma3() {
     println!("GPU: {gpu:?}");
     println!("CPU: {cpu:?}");
     assert_eq!(cpu, gpu, "gemma3 CPU must match GPU greedy output");
+}
+
+/// CPU-only (no GPU): the deterministic Qwen3 output (short + long) must match its golden hash. Any
+/// op regression flips the hash. Refresh with `INFR_BLESS=1`.
+#[test]
+#[ignore = "needs the Qwen3-0.6B GGUF (no GPU)"]
+fn cpu_golden_qwen3() {
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&qwen3_06b(), None).expect("cpu load");
+    check_golden(&model, QWEN3_GOLDEN);
+}
+
+/// CPU-only (no GPU): Gemma 3 (sandwich norms, GeGLU, dual-RoPE, SWA) golden-hash lock.
+#[test]
+#[ignore = "needs the gemma-3-1b GGUF (no GPU)"]
+fn cpu_golden_gemma3() {
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&gemma3_1b(), None).expect("cpu load");
+    check_golden(&model, GEMMA3_GOLDEN);
 }
 
 fn qwen3moe_30b() -> PathBuf {

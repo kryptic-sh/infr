@@ -1776,3 +1776,106 @@ fn argmax(v: &[f32]) -> usize {
     }
     bi
 }
+
+#[cfg(test)]
+mod kernel_tests {
+    //! CPU-only, no GPU, no model file: the optimized quant/f16 dot kernels must match the trusted
+    //! f32 reference (`dequant_block` → naive `dot`) on the SAME bytes. We dot against the *quantized*
+    //! activation (`d8 * q8`) so the only difference is f32 summation order — i.e. this isolates
+    //! kernel correctness from the (separate, expected) Q8 activation-quant error.
+    use super::*;
+
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *seed
+    }
+    fn det_bytes(n: usize, mut seed: u64) -> Vec<u8> {
+        (0..n).map(|_| (lcg(&mut seed) >> 33) as u8).collect()
+    }
+    fn det_x(n: usize, mut seed: u64) -> Vec<f32> {
+        (0..n)
+            .map(|_| ((lcg(&mut seed) >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0)
+            .collect()
+    }
+    fn put_f16(b: &mut [u8], v: f32) {
+        b.copy_from_slice(&half::f16::from_f32(v).to_le_bytes());
+    }
+    /// The reference activation the integer kernels actually see: `d8 * q8` per super-block.
+    fn dequant_q8(q8: &Q8) -> Vec<f32> {
+        let mut x = vec![0f32; q8.qs.len()];
+        for (b, &d) in q8.d.iter().enumerate() {
+            for i in 0..256 {
+                x[b * 256 + i] = d * q8.qs[b * 256 + i] as f32;
+            }
+        }
+        x
+    }
+    fn rel_err(got: f32, want: f32) -> f32 {
+        (got - want).abs() / want.abs().max(1.0)
+    }
+
+    #[test]
+    fn q4k_dot_matches_dequant_reference() {
+        let in_f = 768; // 3 super-blocks
+        let nb = in_f / 256;
+        let mut w = det_bytes(nb * 144, 1);
+        for k in 0..nb {
+            put_f16(&mut w[k * 144..k * 144 + 2], 0.05); // d
+            put_f16(&mut w[k * 144 + 2..k * 144 + 4], 0.015); // dmin
+        }
+        let wref = crate::dequant_block(DType::Q4K, &w).unwrap();
+        let q8 = quantize_q8(&det_x(in_f, 2));
+        let got = vec_dot_q4k(&w, &q8, in_f);
+        let want = dot(&wref, &dequant_q8(&q8));
+        assert!(rel_err(got, want) < 1e-3, "q4k: got {got}, want {want}");
+    }
+
+    #[test]
+    fn q6k_dot_matches_dequant_reference() {
+        let in_f = 768;
+        let nb = in_f / 256;
+        let mut w = det_bytes(nb * 210, 3);
+        for k in 0..nb {
+            put_f16(&mut w[k * 210 + 208..k * 210 + 210], 0.04); // d
+        }
+        let wref = crate::dequant_block(DType::Q6K, &w).unwrap();
+        let q8 = quantize_q8(&det_x(in_f, 4));
+        let got = vec_dot_q6k(&w, &q8, in_f);
+        let want = dot(&wref, &dequant_q8(&q8));
+        assert!(rel_err(got, want) < 1e-3, "q6k: got {got}, want {want}");
+    }
+
+    #[test]
+    fn f16_dot_matches_reference() {
+        let n = 257; // odd, exercises the tail past the 8-wide chunks
+        let x = det_x(n, 5);
+        let wf = det_x(n, 6);
+        let wbytes: Vec<u8> = wf
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let wref: Vec<f32> = wf
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        assert!(rel_err(dot_f16(&wbytes, &x), dot(&wref, &x)) < 1e-4);
+    }
+
+    #[test]
+    fn bf16_dot_matches_reference() {
+        let n = 130;
+        let x = det_x(n, 7);
+        let wf = det_x(n, 8);
+        let wbytes: Vec<u8> = wf
+            .iter()
+            .flat_map(|&v| ((v.to_bits() >> 16) as u16).to_le_bytes()) // bf16 = top 16 bits
+            .collect();
+        let wref: Vec<f32> = wf
+            .iter()
+            .map(|&v| f32::from_bits((v.to_bits() >> 16) << 16))
+            .collect();
+        assert!(rel_err(dot_bf16(&wbytes, &x), dot(&wref, &x)) < 1e-4);
+    }
+}

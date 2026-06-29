@@ -68,6 +68,37 @@ pub struct MoeConfig {
 pub struct MoeKv {
     kv: KvCache,
     pool: Option<infr_vulkan::ExpertPool>,
+    /// Persistent decode scratch (Tier 0): the per-token activation buffers, allocated once and
+    /// reused every decode step instead of created/freed per token.
+    dec: Option<DecodeScratch>,
+}
+
+/// Reusable GPU scratch for one decode step's forward (all buffers sized for a single token; the
+/// split-K attention buffers are sized for the cache's worst-case chunk count). Held by [`MoeKv`]
+/// so decode doesn't churn ~22 buffer create/free calls per token.
+struct DecodeScratch {
+    hidden: Box<dyn Buffer>,
+    hn: Box<dyn Buffer>,
+    hn2: Box<dyn Buffer>,
+    ao: Box<dyn Buffer>,
+    qr: Box<dyn Buffer>,
+    kr: Box<dyn Buffer>,
+    vr: Box<dyn Buffer>,
+    q_f16: Box<dyn Buffer>,
+    attn: Box<dyn Buffer>,
+    g: Box<dyn Buffer>,
+    u: Box<dyn Buffer>,
+    act: Box<dyn Buffer>,
+    y: Box<dyn Buffer>,
+    logits: Box<dyn Buffer>,
+    ids: Box<dyn Buffer>,
+    wts: Box<dyn Buffer>,
+    qa: Box<dyn Buffer>,
+    dact: Box<dyn Buffer>,
+    sact: Box<dyn Buffer>,
+    pm: Box<dyn Buffer>,
+    pl: Box<dyn Buffer>,
+    pacc: Box<dyn Buffer>,
 }
 
 impl MoeKv {
@@ -3363,6 +3394,51 @@ impl Llama {
         Ok(MoeKv {
             kv: self.new_kv(max_ctx)?,
             pool: None,
+            dec: Some(self.build_decode_scratch(max_ctx)?),
+        })
+    }
+
+    /// Allocate the persistent decode scratch (Tier 0). Split-K attention buffers are sized for the
+    /// worst-case chunk count (`chunk` is clamped to ≥64, so `n_chunks ≤ ceil(max_ctx/64)`).
+    fn build_decode_scratch(&self, max_ctx: usize) -> Result<DecodeScratch> {
+        let c = &self.cfg;
+        let mc = c.moe.expect("moe");
+        let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
+        let nblk = ne / 32;
+        let ncm = max_ctx.div_ceil(64); // worst-case split-K chunk count
+        let af = |n: usize| {
+            self.be
+                .alloc((n * 4).max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        let ab = |bytes: usize| {
+            self.be
+                .alloc(bytes.max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        Ok(DecodeScratch {
+            hidden: af(ne)?,
+            hn: af(ne)?,
+            hn2: af(ne)?,
+            ao: af(ne)?,
+            qr: af(nh * hd)?,
+            kr: af(nkv * hd)?,
+            vr: af(nkv * hd)?,
+            q_f16: ab(nh * hd * 2)?,
+            attn: af(nh * hd)?,
+            g: af(mc.n_used * mc.n_ff_exp)?,
+            u: af(mc.n_used * mc.n_ff_exp)?,
+            act: af(mc.n_used * mc.n_ff_exp)?,
+            y: af(mc.n_used * ne)?,
+            logits: af(mc.n_expert)?,
+            ids: af(mc.n_used)?,
+            wts: af(mc.n_used)?,
+            qa: ab(ne)?,
+            dact: ab(nblk * 2)?,
+            sact: ab(nblk * 2)?,
+            pm: af(nh * ncm)?,
+            pl: af(nh * ncm)?,
+            pacc: af(nh * ncm * hd)?,
         })
     }
 
@@ -3613,54 +3689,37 @@ impl Llama {
         let kvrow = nkv * hd;
         let pos = kv.kv.len;
         let kv_len = pos + 1;
-        let al = |n: usize| {
-            self.be
-                .alloc((n * 4).max(4), BufferUsage::Activations)
-                .map_err(|e| anyhow!("{e}"))
-        };
-
-        // resident scratch (reused across all 48 layers)
-        let hidden = al(ne)?;
+        // Tier 0: persistent decode scratch — reused every token (no per-token alloc/free). Bound as
+        // `&Box<dyn Buffer>` so the existing `.as_ref()` call sites are unchanged.
+        let dec = kv
+            .dec
+            .as_ref()
+            .expect("decode scratch (built in new_moe_kv)");
+        let hidden = &dec.hidden;
         let emb = &self.token_embd[token as usize * ne..(token as usize + 1) * ne];
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(emb))
             .map_err(|e| anyhow!("{e}"))?;
-        let (hn, hn2, ao) = (al(ne)?, al(ne)?, al(ne)?);
-        let (qr, kr, vr) = (al(nh * hd)?, al(nkv * hd)?, al(nkv * hd)?);
-        let q_f16 = self
-            .be
-            .alloc(nh * hd * 2, BufferUsage::Activations)
-            .map_err(|e| anyhow!("{e}"))?;
-        let attn = al(nh * hd)?;
-        // Sized for the fused multi-slot FFN ([n_used, n_ff] gate/up/act, [n_used, ne] down); the
-        // host-fallback per-expert path uses the [0..] prefix of each.
-        let (g, u, act, y) = (
-            al(mc.n_used * mc.n_ff_exp)?,
-            al(mc.n_used * mc.n_ff_exp)?,
-            al(mc.n_used * mc.n_ff_exp)?,
-            al(mc.n_used * ne)?,
-        );
-        let logits = al(mc.n_expert)?;
+        let (hn, hn2, ao) = (&dec.hn, &dec.hn2, &dec.ao);
+        let (qr, kr, vr) = (&dec.qr, &dec.kr, &dec.vr);
+        let q_f16 = &dec.q_f16;
+        let attn = &dec.attn;
+        let (g, u, act, y) = (&dec.g, &dec.u, &dec.act, &dec.y);
+        let logits = &dec.logits;
         // GPU-resident routing when the expert format has an id-indexed GEMV: top-k + expert ids and
         // weights stay in VRAM (one submit/layer). Else fall back to host top-k (two submits/layer).
         let (gate_dtype, _) = native_parts(&self.layers[0].moe_stacked().expect("stacked").1.gate);
         let gpu_route =
             infr_vulkan::Recorder::native_id_supported(gate_dtype) && mc.n_expert <= 128;
         let (ids_buf, wts_buf) = if gpu_route {
-            (Some(al(mc.n_used)?), Some(al(mc.n_used)?))
+            (Some(&dec.ids), Some(&dec.wts))
         } else {
             (None, None)
         };
         // Q4_K experts → mmq (dp4a): quantize the ffn-normed row to int8 once (shared by gate+up).
-        let ab = |bytes: usize| {
-            self.be
-                .alloc(bytes.max(4), BufferUsage::Activations)
-                .map_err(|e| anyhow!("{e}"))
-        };
         let mmq = gpu_route && matches!(gate_dtype, infr_core::DType::Q4K);
-        let nblk = ne / 32;
         let (qa, dact, sact) = if mmq {
-            (Some(ab(ne)?), Some(ab(nblk * 2)?), Some(ab(nblk * 2)?))
+            (Some(&dec.qa), Some(&dec.dact), Some(&dec.sact))
         } else {
             (None, None, None)
         };
@@ -3669,11 +3728,7 @@ impl Llama {
         let use_split = kv_len > chunk;
         let n_chunks = if use_split { kv_len.div_ceil(chunk) } else { 0 };
         let (pm, pl, pacc) = if use_split {
-            (
-                Some(al(nh * n_chunks)?),
-                Some(al(nh * n_chunks)?),
-                Some(al(nh * n_chunks * hd)?),
-            )
+            (Some(&dec.pm), Some(&dec.pl), Some(&dec.pacc))
         } else {
             (None, None, None)
         };

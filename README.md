@@ -44,12 +44,18 @@ infr bench "$M" -p 0 -n 64 -r 3         # decode 64 tokens
 infr bench "$M" -p 0 -n 64 -d 2048      # decode at context depth 2048 (-d warms, untimed)
 ```
 
-**Profile** per-op GPU time (timestamp queries) with `INFR_PROF2=1`; it prints,
-per submit, time aggregated by op label (`matmul_proj`, `attn_flash`,
-`mmq_expert`, `quant_q8`, …). Read the ratios — the aggregate includes warmup:
+**Profile** per-op GPU time (timestamp queries) with `INFR_PROF2=1`. It prints
+one block **per submit**, each tagged by op label (prefill: `expert_gateup`,
+`expert_down`, `matmul_proj`, `attn_flash`, `quant_q8`; decode: `lm_head`,
+`mmq_expert`, `expert_ffn`, `attention_kv`, `vocab`, …). `warmup` runs
+unprofiled, so the blocks are the timed reps only — sum a label across all
+blocks for its total:
 
 ```bash
-INFR_PROF2=1 infr bench "$M" -p 2048 -n 0 -r 1 2>&1 | grep prof2
+INFR_PROF2=1 infr bench "$M" -p 2048 -n 0 -r 1 2>&1 \
+  | grep '^\[prof2\]' \
+  | awk '!/per-op/{for(i=1;i<=NF;i++)if($i~/us$/){l=$(i-1);v=$i;sub(/us/,"",v);t[l]+=v}}
+         END{for(l in t)printf "%-16s %10.0f us\n",l,t[l]}' | sort -k2 -rn
 ```
 
 **Compare to llama.cpp** — `infr compare` shells out to `infr bench` and the

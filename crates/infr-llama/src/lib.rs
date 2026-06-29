@@ -71,6 +71,28 @@ pub struct MoeKv {
     /// Persistent decode scratch (Tier 0): the per-token activation buffers, allocated once and
     /// reused every decode step instead of created/freed per token.
     dec: Option<DecodeScratch>,
+    /// Persistent prefill expert scratch: one reusable buffer set the grouped-expert FFN reuses for
+    /// every active expert (instead of `create_buffer`/free ~8 buffers per expert per layer,
+    /// ~50k/chunk). Experts serialize through it (a barrier on reuse) — which a K-sweep showed they
+    /// did anyway (the win is removing the alloc churn, not concurrency). Sized for the largest chunk.
+    pf: Option<PrefillScratch>,
+}
+
+/// One reusable scratch set for a grouped prefill expert's SwiGLU. Sized for `m_pad` row capacity;
+/// an expert with fewer rows uses the leading prefix.
+struct PrefillScratch {
+    m_pad: usize,
+    xe: Box<dyn Buffer>,
+    ge: Box<dyn Buffer>,
+    ue: Box<dyn Buffer>,
+    ae: Box<dyn Buffer>,
+    ye: Box<dyn Buffer>,
+    gqa: Box<dyn Buffer>,
+    gda: Box<dyn Buffer>,
+    gsa: Box<dyn Buffer>,
+    dqa: Box<dyn Buffer>,
+    dda: Box<dyn Buffer>,
+    dsa: Box<dyn Buffer>,
 }
 
 /// Reusable GPU scratch for one decode step's forward (all buffers sized for a single token; the
@@ -3395,6 +3417,7 @@ impl Llama {
             kv: self.new_kv(max_ctx)?,
             pool: None,
             dec: Some(self.build_decode_scratch(max_ctx)?),
+            pf: None,
         })
     }
 
@@ -3439,6 +3462,47 @@ impl Llama {
             pm: af(nh * ncm)?,
             pl: af(nh * ncm)?,
             pacc: af(nh * ncm * hd)?,
+        })
+    }
+
+    /// Ensure `kv.pf` holds a prefill pool sized for a chunk of `t` tokens (rebuild if absent or too
+    /// small — chunk size is usually constant, so this allocates once per generation).
+    fn ensure_prefill_scratch(&self, kv: &mut MoeKv, t: usize) -> Result<()> {
+        let m_pad = t.div_ceil(64) * 64;
+        if kv.pf.as_ref().is_none_or(|p| p.m_pad < m_pad) {
+            kv.pf = Some(self.build_prefill_scratch(m_pad)?);
+        }
+        Ok(())
+    }
+
+    /// Allocate the prefill expert scratch (one reusable set sized for `m_pad` rows).
+    fn build_prefill_scratch(&self, m_pad: usize) -> Result<PrefillScratch> {
+        let c = &self.cfg;
+        let mc = c.moe.expect("moe");
+        let (ne, nff) = (c.n_embd, mc.n_ff_exp);
+        let af = |n: usize| {
+            self.be
+                .alloc((n * 4).max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        let ab = |bytes: usize| {
+            self.be
+                .alloc(bytes.max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        Ok(PrefillScratch {
+            m_pad,
+            xe: af(m_pad * ne)?,
+            ge: af(m_pad * nff)?,
+            ue: af(m_pad * nff)?,
+            ae: af(m_pad * nff)?,
+            ye: af(m_pad * ne)?,
+            gqa: ab(m_pad * ne)?,
+            gda: ab(m_pad * (ne / 32) * 2)?,
+            gsa: ab(m_pad * (ne / 32) * 2)?,
+            dqa: ab(m_pad * nff)?,
+            dda: ab(m_pad * (nff / 32) * 2)?,
+            dsa: ab(m_pad * (nff / 32) * 2)?,
         })
     }
 
@@ -4089,6 +4153,10 @@ impl Llama {
             None
         };
 
+        // Persistent expert pool (reused across all layers + chunks) so the FFN doesn't churn ~8
+        // buffer allocs per active expert per layer.
+        self.ensure_prefill_scratch(kv, t)?;
+
         for (li, layer) in self.layers.iter().enumerate() {
             // recorder 1: attention + router for all t tokens, on the GPU.
             let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
@@ -4336,39 +4404,38 @@ impl Llama {
             // scatter-add into hidden. m/offset come from the GPU-built (or host) routing.
             let (bucket_rows, bucket_wts) = (bucket_rows.unwrap(), bucket_wts.unwrap());
             let rec2 = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
-            let mut keep: Vec<Box<dyn Buffer>> = Vec::new();
+            let pool = kv.pf.as_ref().expect("prefill scratch (built above)");
             for e in 0..mc.n_expert {
                 let m = counts_h[e] as usize;
                 if m == 0 {
                     continue;
                 }
                 let off = offs_h[e] as usize;
-                // Tiled GEMM: gate/up/down decode each expert weight ONCE and reuse across the 64-row
-                // tile (vs the per-row GEMV re-reading the weight m times). GEMM outputs are M-padded
-                // to ceil(m/64)*64 rows (extra rows are zero, ignored by silu/scatter on the first m).
-                let mpad = m.div_ceil(64) * 64;
-                let (xe, ge, ue, ae, ye) = (
-                    al(m * ne)?,
-                    al(mpad * nff)?,
-                    al(mpad * nff)?,
-                    al(m * nff)?,
-                    al(mpad * ne)?,
-                );
+                // One reusable scratch set: each expert reuses it (serializing via the recorder's
+                // barriers — a K-sweep showed experts serialize anyway, so the win is removing the
+                // per-expert alloc churn, not concurrency).
+                let s = pool;
+                let (xe, ge, ue, ae, ye) = (&s.xe, &s.ge, &s.ue, &s.ae, &s.ye);
                 rec2.gather_rows(hn2.as_ref(), bucket_rows.as_ref(), off, xe.as_ref(), m, ne);
                 // gate/up: Q4_K → dp4a (mmq) GEMM (int8 dot, faster than coopmat-f16); quantize the
                 // gathered batch to int8 once, shared by both. down (Q6_K) stays on the coopmat GEMM.
                 if matches!(native_parts(&st.gate).0, infr_core::DType::Q4K) {
-                    let nblk = ne / 32;
-                    let (qa, da, sa) = (ab(mpad * ne)?, ab(mpad * nblk * 2)?, ab(mpad * nblk * 2)?);
-                    rec2.quant_q8(xe.as_ref(), qa.as_ref(), da.as_ref(), sa.as_ref(), m, ne);
+                    rec2.quant_q8(
+                        xe.as_ref(),
+                        s.gqa.as_ref(),
+                        s.gda.as_ref(),
+                        s.gsa.as_ref(),
+                        m,
+                        ne,
+                    );
                     let (_, gb) = native_parts(&st.gate);
                     let (_, ub) = native_parts(&st.up);
                     let base = e * st.stride;
                     rec2.label_next("expert_gateup");
                     rec2.matmul_mmq_q4k(
-                        qa.as_ref(),
-                        da.as_ref(),
-                        sa.as_ref(),
+                        s.gqa.as_ref(),
+                        s.gda.as_ref(),
+                        s.gsa.as_ref(),
                         gb,
                         base,
                         ge.as_ref(),
@@ -4378,9 +4445,9 @@ impl Llama {
                     );
                     rec2.label_next("expert_gateup");
                     rec2.matmul_mmq_q4k(
-                        qa.as_ref(),
-                        da.as_ref(),
-                        sa.as_ref(),
+                        s.gqa.as_ref(),
+                        s.gda.as_ref(),
+                        s.gsa.as_ref(),
                         ub,
                         base,
                         ue.as_ref(),
@@ -4388,7 +4455,6 @@ impl Llama {
                         ne,
                         nff,
                     );
-                    keep.extend([qa, da, sa]);
                 } else {
                     rec2.label_next("expert_gateup");
                     rec_gemm_expert(
@@ -4419,15 +4485,19 @@ impl Llama {
                 // down: Q6_K → dp4a (mmq) GEMM (int8 dot, faster than coopmat-f16); quantize the
                 // SwiGLU activations to int8 per 32-block first. Else coopmat-f16 fallback.
                 if matches!(native_parts(&st.down).0, infr_core::DType::Q6K) {
-                    let nblk = nff / 32;
-                    let (qa, da, sa) =
-                        (ab(mpad * nff)?, ab(mpad * nblk * 2)?, ab(mpad * nblk * 2)?);
-                    rec2.quant_q8(ae.as_ref(), qa.as_ref(), da.as_ref(), sa.as_ref(), m, nff);
+                    rec2.quant_q8(
+                        ae.as_ref(),
+                        s.dqa.as_ref(),
+                        s.dda.as_ref(),
+                        s.dsa.as_ref(),
+                        m,
+                        nff,
+                    );
                     let (_, db) = native_parts(&st.down);
                     rec2.label_next("expert_down");
                     rec2.matmul_mmq_q6k(
-                        qa.as_ref(),
-                        da.as_ref(),
+                        s.dqa.as_ref(),
+                        s.dda.as_ref(),
                         db,
                         e * st.stride,
                         ye.as_ref(),
@@ -4435,7 +4505,6 @@ impl Llama {
                         nff,
                         ne,
                     );
-                    keep.extend([qa, da, sa]);
                 } else {
                     rec2.label_next("expert_down");
                     rec_gemm_expert(
@@ -4459,10 +4528,8 @@ impl Llama {
                     m,
                     ne,
                 );
-                keep.extend([xe, ge, ue, ae, ye]);
             }
             rec2.finish().map_err(|e| anyhow!("{e}"))?;
-            drop(keep);
         }
         kv.kv.len += t;
 

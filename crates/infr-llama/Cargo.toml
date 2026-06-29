@@ -16,4 +16,5 @@ rayon.workspace = true
 tracing.workspace = true
 tokenizers = { workspace = true }
 minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
 serde_json = { workspace = true }

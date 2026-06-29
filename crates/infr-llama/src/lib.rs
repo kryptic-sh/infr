@@ -423,6 +423,9 @@ fn render_chat_user(gguf: &Gguf, tokenizer: &Tokenizer, eos: u32, user: &str) ->
     let bos = tokenizer.id_to_token(bos_id).unwrap_or_default();
     let eos_s = tokenizer.id_to_token(eos).unwrap_or_default();
     let mut env = minijinja::Environment::new();
+    // HF chat templates lean on Python str/dict/list methods (`.get`, `.items`, `.strip`, …) that
+    // minijinja core doesn't implement — pycompat supplies them (e.g. gemma4's tool-calling template).
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_function(
         "raise_exception",
         |msg: String| -> std::result::Result<String, minijinja::Error> {
@@ -435,7 +438,12 @@ fn render_chat_user(gguf: &Gguf, tokenizer: &Tokenizer, eos: u32, user: &str) ->
     env.add_filter("tojson", |v: minijinja::Value| {
         serde_json::to_string(&v).unwrap_or_else(|_| "null".to_owned())
     });
-    env.add_template("chat", template).ok()?;
+    if let Err(e) = env.add_template("chat", template) {
+        if std::env::var("INFR_DEBUG_CHAT").is_ok() {
+            eprintln!("[chat-template] parse error: {e:#}");
+        }
+        return None;
+    }
     let tmpl = env.get_template("chat").ok()?;
     let msgs = vec![serde_json::json!({ "role": "user", "content": user })];
     let ctx = minijinja::context! {
@@ -445,7 +453,15 @@ fn render_chat_user(gguf: &Gguf, tokenizer: &Tokenizer, eos: u32, user: &str) ->
         bos_token => bos,
         eos_token => eos_s,
     };
-    tmpl.render(ctx).ok()
+    match tmpl.render(ctx) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            if std::env::var("INFR_DEBUG_CHAT").is_ok() {
+                eprintln!("[chat-template] render error: {e:#}");
+            }
+            None
+        }
+    }
 }
 
 /// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
@@ -3056,6 +3072,7 @@ impl Llama {
         let eos = self.tokenizer.id_to_token(self.cfg.eos).unwrap_or_default();
 
         let mut env = minijinja::Environment::new();
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function(
             "raise_exception",
             |msg: String| -> std::result::Result<String, minijinja::Error> {

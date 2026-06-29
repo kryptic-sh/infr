@@ -747,8 +747,18 @@ enum Q35LayerH {
     Attn(Q35AttnH),
 }
 
-/// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). Mirrors
-/// [`generate`] (raw prompt, no chat template); returns the decoded continuation.
+/// Render a plain user message through the qwen35 GGUF's own jinja chat template (falls back to
+/// ChatML — qwen35's native format — if there's no template). So `infr run` / tests pass plain text.
+pub fn render_chat(path: &std::path::Path, user: &str) -> Result<String> {
+    let g = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
+    let tok = crate::build_tokenizer(&g)?;
+    let eos = g.metadata().u64("tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
+    Ok(crate::render_chat_user(&g, &tok, eos, user)
+        .unwrap_or_else(|| format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")))
+}
+
+/// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). `prompt` is
+/// the already-formatted text (see [`render_chat`]); returns timing/counts, text streams via `on_piece`.
 pub fn generate_cpu(
     path: &std::path::Path,
     prompt: &str,

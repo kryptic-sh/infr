@@ -171,6 +171,53 @@ fn cpu_golden_gemma3() {
     check_golden(&model, GEMMA3_GOLDEN);
 }
 
+fn qwen35_08b() -> PathBuf {
+    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
+    let base = format!("{hub}/models--unsloth--Qwen3.5-0.8B-GGUF/snapshots");
+    for e in std::fs::read_dir(&base).expect("snapshots dir") {
+        let f = e.unwrap().path().join("Qwen3.5-0.8B-Q4_K_M.gguf");
+        if f.exists() {
+            return f;
+        }
+    }
+    panic!("Qwen3.5-0.8B gguf not found");
+}
+
+// Captured + verified coherent (qwen35 / Qwen3-Next: gated-DeltaNet + gated full-attention): "The
+// capital of France is **Paris**. It is the largest city …", a knight story ("Elara … Aethelgard").
+const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0x41a2c8d41bca554d),
+    (
+        "Tell me a short story about a brave knight.",
+        48,
+        0x0001ef9a6385fe30,
+    ),
+];
+
+/// CPU-only (no GPU): qwen35 / Qwen3-Next golden-hash lock (the gated-DeltaNet recurrence + conv +
+/// gated full-attention path). Uses the dedicated `qwen35::generate_cpu` runner.
+#[test]
+#[ignore = "needs the Qwen3.5-0.8B GGUF (no GPU)"]
+fn cpu_golden_qwen35() {
+    std::env::set_var("INFR_TEMP", "0");
+    let path = qwen35_08b();
+    let bless = std::env::var("INFR_BLESS").is_ok();
+    for (prompt, n, want) in QWEN35_GOLDEN {
+        let rendered = infr_llama::qwen35::render_chat(&path, prompt).expect("render");
+        let mut out = String::new();
+        infr_llama::qwen35::generate_cpu(&path, &rendered, *n, |p| out.push_str(p)).expect("gen");
+        let h = fnv1a(&out);
+        if bless {
+            println!("    ({prompt:?}, {n}, 0x{h:016x}),  // {out:?}");
+        } else {
+            assert_eq!(
+                h, *want,
+                "qwen35 golden changed for {prompt:?}\n  out: {out:?}"
+            );
+        }
+    }
+}
+
 fn qwen3moe_30b() -> PathBuf {
     let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
     let base = format!("{hub}/models--unsloth--Qwen3-30B-A3B-GGUF/snapshots");
@@ -237,6 +284,26 @@ fn cpu_matches_gpu_gemma4_e2b() {
     println!("GPU: {gpu:?}");
     println!("CPU: {cpu:?}");
     assert_eq!(cpu, gpu, "gemma4 E2B CPU must match GPU greedy output");
+}
+
+// Captured + verified coherent (gemma4 E2B: per-layer input embeds + KV sharing): "The capital of
+// France is **Paris**.", a brave-knight story ("Sir Kaelan … kingdom of Eldoria …").
+const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xfd644a0cebde4e73),
+    (
+        "Tell me a short story about a brave knight.",
+        48,
+        0x2588804a8fb4c88f,
+    ),
+];
+
+/// CPU-only (no GPU): Gemma 4 E2B golden-hash lock.
+#[test]
+#[ignore = "needs the gemma-4-E2B GGUF (no GPU)"]
+fn cpu_golden_gemma4_e2b() {
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&gemma4_e2b(), None).expect("cpu load");
+    check_golden(&model, GEMMA4_E2B_GOLDEN);
 }
 
 fn gemma4_12b() -> PathBuf {

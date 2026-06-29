@@ -308,7 +308,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                 let prompt = model.render_chat(m);
                 model.generate_cpu(&prompt, max_new, |p| render.feed(p))?
             } else {
-                let prompt = format!("<|im_start|>user\n{m}<|im_end|>\n<|im_start|>assistant\n");
+                let prompt = infr_llama::qwen35::render_chat(&gguf, m)?;
                 infr_llama::qwen35::generate_cpu(&gguf, &prompt, max_new, |p| render.feed(p))?
             };
             render.finish();

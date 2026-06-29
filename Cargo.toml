@@ -44,6 +44,7 @@ axum = "0.7"
 tower-http = { version = "0.6", features = ["trace"] }
 clap = { version = "4", features = ["derive"] }
 minijinja = "2"
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ash = "0.38"

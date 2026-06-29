@@ -773,6 +773,9 @@ mod tests {
     use super::*;
 
     fn model_path() -> std::path::PathBuf {
+        if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
+            return std::path::PathBuf::from(p);
+        }
         // the 0.8B pulled into our store
         dirs_cache().join("infr/models/blobs/sha256-bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517")
     }
@@ -819,5 +822,26 @@ mod tests {
             .unwrap_or(16);
         let out = generate(&g, &prompt, n).unwrap();
         println!("=== qwen35 CPU greedy ===\n{out}");
+    }
+
+    /// qwen35 (Qwen3-Next hybrid: gated DeltaNet + gated full-attention) pure-CPU greedy must match
+    /// the GPU-hybrid greedy token-for-token. `Q35_CPU=1` forces every linear projection onto the CPU
+    /// (f32); unset, they run on the GPU (f16) — so this validates the CPU path end-to-end against the
+    /// GPU one. The SSM recurrence / conv / gated attention run on the CPU in both modes.
+    #[test]
+    #[ignore = "needs a Vulkan GPU + the Qwen3.5-0.8B gguf; run --test-threads=1"]
+    fn cpu_matches_hybrid() {
+        let g = Gguf::open(&model_path()).unwrap();
+        let prompt = "The capital of France is";
+        let n = 16;
+        std::env::set_var("Q35_CPU", "1");
+        let cpu = generate(&g, prompt, n).unwrap();
+        std::env::remove_var("Q35_CPU");
+        let hybrid = generate(&g, prompt, n).unwrap();
+        println!("CPU:    {cpu:?}\nHYBRID: {hybrid:?}");
+        assert_eq!(
+            cpu, hybrid,
+            "qwen35 CPU must match GPU-hybrid greedy output"
+        );
     }
 }

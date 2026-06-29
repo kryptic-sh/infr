@@ -391,6 +391,25 @@ fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerLayerEmbd>> 
     }))
 }
 
+/// UTF-8-safe incremental detokenizer for streaming: appends `id` to `acc`, decodes the whole
+/// sequence so far, and emits the newly-completed suffix past `printed` — holding back a trailing
+/// `�` (a multi-byte char split across tokens) until it completes. Mirrors the GPU path's streamer.
+fn stream_token(
+    tokenizer: &Tokenizer,
+    acc: &mut Vec<u32>,
+    printed: &mut usize,
+    id: u32,
+    on_piece: &mut impl FnMut(&str),
+) {
+    acc.push(id);
+    if let Ok(full) = tokenizer.decode(acc, true) {
+        if !full.ends_with('\u{FFFD}') && full.len() > *printed && full.is_char_boundary(*printed) {
+            on_piece(&full[*printed..]);
+            *printed = full.len();
+        }
+    }
+}
+
 /// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
 /// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
 fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
@@ -454,23 +473,28 @@ impl CpuModel {
         &self,
         prompt: &str,
         max_new: usize,
+        mut on_piece: impl FnMut(&str),
     ) -> Result<(String, crate::cpu_backend::CpuStats)> {
         let enc = self
             .tokenizer
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
-        let (generated, stats) = crate::cpu_backend::generate_dense_cpu(
+        // Stream each generated token: incrementally detokenize and emit the new suffix.
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let (_generated, stats) = crate::cpu_backend::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
             &self.token_embd,
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
+            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
         )?;
         let text = self
             .tokenizer
-            .decode(&generated, true)
+            .decode(&acc, true)
             .map_err(|e| anyhow!("decode: {e}"))?;
         Ok((text, stats))
     }
@@ -4658,6 +4682,7 @@ impl Llama {
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
+            |_| {},
         )?;
         self.tokenizer
             .decode(&generated, true)

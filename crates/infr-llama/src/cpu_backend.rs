@@ -819,6 +819,7 @@ pub(crate) fn generate_dense_cpu(
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
+    mut on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, CpuStats)> {
     let c = cfg;
     let be = CpuBackend::new();
@@ -1579,10 +1580,14 @@ pub(crate) fn generate_dense_cpu(
             be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                 .map_err(|e| anyhow!("{e}"))?;
             let next = argmax(&logits) as u32;
+            let is_eos = c.eos_ids.contains(&next) || next == c.eos;
             out.push(next);
             decode_t += step_t0.elapsed();
             decode_n += 1;
-            if c.eos_ids.contains(&next) || next == c.eos || out.len() >= max_new {
+            if !is_eos {
+                on_token(next); // stream the token (EOS is not emitted)
+            }
+            if is_eos || out.len() >= max_new {
                 break;
             }
             if cur.len() <= pos + 1 {

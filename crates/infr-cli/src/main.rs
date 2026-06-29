@@ -295,19 +295,18 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             anyhow::bail!("INFR_CPU currently supports one-shot only: pass a message");
         };
         let mut render = ThinkRender::new();
-        let (text, stats) = if infr_llama::qwen35::is_qwen35(&gguf) {
+        let (_text, stats) = if infr_llama::qwen35::is_qwen35(&gguf) {
             eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
             let prompt = format!("<|im_start|>user\n{m}<|im_end|>\n<|im_start|>assistant\n");
-            infr_llama::qwen35::generate_cpu(&gguf, &prompt, max_new)?
+            infr_llama::qwen35::generate_cpu(&gguf, &prompt, max_new, |p| render.feed(p))?
         } else {
             eprintln!(
                 "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
             );
             let model = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
             let prompt = model.chatml(m);
-            model.generate_cpu(&prompt, max_new)?
+            model.generate_cpu(&prompt, max_new, |p| render.feed(p))?
         };
-        render.feed(&text);
         render.finish();
         let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
         eprintln!(

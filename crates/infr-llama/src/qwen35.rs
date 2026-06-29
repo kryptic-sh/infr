@@ -753,6 +753,7 @@ pub fn generate_cpu(
     path: &std::path::Path,
     prompt: &str,
     n: usize,
+    mut on_piece: impl FnMut(&str),
 ) -> Result<(String, crate::cpu_backend::CpuStats)> {
     let gg = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
     let g = &gg;
@@ -1294,6 +1295,7 @@ pub fn generate_cpu(
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
+    let mut printed = 0usize; // streaming detok cursor
     for pos in 0..(prompt_ids.len() + n) {
         let step_t0 = std::time::Instant::now();
         let t = cur[pos] as usize;
@@ -1334,7 +1336,7 @@ pub fn generate_cpu(
             be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                 .map_err(|e| anyhow!("{e}"))?;
             let next = argmax(&logits);
-            outs.push(next);
+            crate::stream_token(&tok, &mut outs, &mut printed, next, &mut on_piece);
             decode_t += step_t0.elapsed();
             decode_n += 1;
             if outs.len() >= n {
@@ -1499,7 +1501,7 @@ mod tests {
         let n = 16;
         std::env::set_var("Q35_CPU", "1");
         let oracle = generate(&g, prompt, n).unwrap();
-        let (seam, _stats) = generate_cpu(&model_path(), prompt, n).unwrap();
+        let (seam, _stats) = generate_cpu(&model_path(), prompt, n, |_| {}).unwrap();
         println!("ORACLE: {oracle:?}\nSEAM:   {seam:?}");
         assert_eq!(
             seam, oracle,

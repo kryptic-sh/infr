@@ -369,6 +369,30 @@ pub struct KvCache {
     v: Vec<Box<dyn Buffer>>,
     len: usize,
     max_ctx: usize,
+    /// Record-once decode (Qwen3-style dense models): persistent per-token scratch + the recorded,
+    /// replayable command buffer keyed by `(use_split, chunk, n_chunks)` — mirrors the MoE decode path.
+    dec: Option<DenseDecodeScratch>,
+    rec_decode: Option<((bool, usize, usize), infr_vulkan::RecordedCmd)>,
+}
+
+/// Reusable single-token decode scratch for a dense (non-MoE) Qwen3 model (allocated once, replayed).
+struct DenseDecodeScratch {
+    hidden: Box<dyn Buffer>,
+    hn: Box<dyn Buffer>,
+    qr: Box<dyn Buffer>,
+    kr: Box<dyn Buffer>,
+    vr: Box<dyn Buffer>,
+    q_f16: Box<dyn Buffer>,
+    attn: Box<dyn Buffer>,
+    gu: Box<dyn Buffer>,
+    act: Box<dyn Buffer>,
+    hlast: Box<dyn Buffer>,
+    logits: Box<dyn Buffer>,
+    pm: Box<dyn Buffer>,
+    pl: Box<dyn Buffer>,
+    pacc: Box<dyn Buffer>,
+    params: Box<dyn Buffer>,
+    emb_in: Box<dyn Buffer>,
 }
 
 impl KvCache {
@@ -2671,11 +2695,59 @@ impl Llama {
                     .map_err(|e| anyhow!("{e}"))?,
             );
         }
+        // Record-once decode scratch for Qwen3-style dense models (the path reuses the `_dyn` kernels).
+        let dec = if c.qk_norm {
+            Some(self.build_dense_decode_scratch(max_ctx)?)
+        } else {
+            None
+        };
         Ok(KvCache {
             k,
             v,
             len: 0,
             max_ctx,
+            dec,
+            rec_decode: None,
+        })
+    }
+
+    /// Allocate the persistent dense-decode scratch (single token; split-K buffers sized for the
+    /// worst-case chunk count).
+    fn build_dense_decode_scratch(&self, max_ctx: usize) -> Result<DenseDecodeScratch> {
+        let c = &self.cfg;
+        let (ne, nh, nkv, hd, nff) = (c.n_embd, c.n_head, c.n_kv, c.head_dim, c.n_ff);
+        let ncm = max_ctx.div_ceil(64);
+        let af = |n: usize| {
+            self.be
+                .alloc((n * 4).max(4), BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))
+        };
+        Ok(DenseDecodeScratch {
+            hidden: af(ne)?,
+            hn: af(ne)?,
+            qr: af(nh * hd)?,
+            kr: af(nkv * hd)?,
+            vr: af(nkv * hd)?,
+            q_f16: self
+                .be
+                .alloc(nh * hd * 2, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?,
+            attn: af(nh * hd)?,
+            gu: af(2 * nff)?,
+            act: af(nff)?,
+            hlast: af(ne)?,
+            logits: af(c.vocab)?,
+            pm: af(nh * ncm)?,
+            pl: af(nh * ncm)?,
+            pacc: af(nh * ncm * hd)?,
+            params: self
+                .be
+                .alloc(8, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+            emb_in: self
+                .be
+                .alloc(ne * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
         })
     }
 
@@ -2688,6 +2760,12 @@ impl Llama {
         let (ne, nh, nkv, hd, nff) = (c.n_embd, c.n_head, c.n_kv, c.head_dim, c.n_ff);
         if pos + n > kv.max_ctx {
             bail!("KV cache overflow: {} > {}", pos + n, kv.max_ctx);
+        }
+        // Record-once fast path: single-token decode of a Qwen3 dense model (record once, replay).
+        if n == 1 {
+            if let Some(logits) = self.forward_resident_decode_ro(new_tokens[0], kv)? {
+                return Ok(logits);
+            }
         }
 
         let mut hidden_host = vec![0f32; n * ne];
@@ -3311,6 +3389,198 @@ impl Llama {
             .map_err(|e| anyhow!("{e}"))?;
         kv.len += n;
         Ok(bytemuck::cast_slice(&bytes).to_vec())
+    }
+
+    /// Record-once single-token decode for a dense Qwen3 model — mirrors `forward_moe_chunk_gpu`: the
+    /// whole forward (embed copy → 48 layers → final norm → vocab GEMV) is recorded into a replayable
+    /// command buffer keyed by the attention structure; each token writes only the params SSBO + the
+    /// embedding, then replays. Returns last-token vocab logits (host sampling, like the general path).
+    /// Returns `None` when ineligible (non-Qwen3, no scratch, or profiling) so the caller falls back.
+    fn forward_resident_decode_ro(&self, token: u32, kv: &mut KvCache) -> Result<Option<Vec<f32>>> {
+        let c = &self.cfg;
+        if !c.qk_norm || kv.dec.is_none() || std::env::var("INFR_PROF2").is_ok() {
+            return Ok(None);
+        }
+        let (ne, nh, nkv, hd, nff) = (c.n_embd, c.n_head, c.n_kv, c.head_dim, c.n_ff);
+        let kvrow = nkv * hd;
+        let pos = kv.len;
+        let kv_len = pos + 1;
+        let dec = kv.dec.as_ref().unwrap();
+        // Per-token host writes: the embedding (into the mapped emb_in the recorded buffer copies into
+        // hidden) and [pos, kv_len] (the params SSBO the `_dyn` kernels read). Both are mapped, no submit.
+        let emb = &self.token_embd[token as usize * ne..(token as usize + 1) * ne];
+        self.be
+            .upload(dec.emb_in.as_ref(), bytemuck::cast_slice(emb))
+            .map_err(|e| anyhow!("{e}"))?;
+        self.be
+            .upload(
+                dec.params.as_ref(),
+                bytemuck::cast_slice(&[pos as u32, kv_len as u32]),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        let (hidden, hn, qr, kr, vr, q_f16, attn, gu, act, hlast, logits, params) = (
+            &dec.hidden,
+            &dec.hn,
+            &dec.qr,
+            &dec.kr,
+            &dec.vr,
+            &dec.q_f16,
+            &dec.attn,
+            &dec.gu,
+            &dec.act,
+            &dec.hlast,
+            &dec.logits,
+            &dec.params,
+        );
+        let chunk = (kv_len / 32).clamp(64, 512);
+        let use_split = kv_len > chunk;
+        let n_chunks = if use_split { kv_len.div_ceil(chunk) } else { 0 };
+        let sig = (use_split, chunk, n_chunks);
+        let hit = kv.rec_decode.as_ref().is_some_and(|(s, _)| *s == sig);
+        if !hit {
+            let rec = self.be.recorder_persistent().map_err(|e| anyhow!("{e}"))?;
+            rec.copy(dec.emb_in.as_ref(), 0, hidden.as_ref(), 0, ne * 4);
+            for (li, layer) in self.layers.iter().enumerate() {
+                rec.rmsnorm(
+                    hidden.as_ref(),
+                    layer.attn_norm_buf.as_ref(),
+                    hn.as_ref(),
+                    1,
+                    ne,
+                    c.rms_eps,
+                );
+                rec_linear(&rec, &layer.wq, hn.as_ref(), qr.as_ref(), 1, ne, nh * hd);
+                rec_linear(&rec, &layer.wk, hn.as_ref(), kr.as_ref(), 1, ne, kvrow);
+                rec_linear(&rec, &layer.wv, hn.as_ref(), vr.as_ref(), 1, ne, kvrow);
+                rec.qk_norm_rope_dyn(
+                    qr.as_ref(),
+                    layer.q_norm_buf.as_ref().unwrap().as_ref(),
+                    params.as_ref(),
+                    q_f16.as_ref(),
+                    1,
+                    nh,
+                    hd,
+                    c.rope_dim,
+                    c.rope_theta,
+                    0,
+                    c.rms_eps,
+                );
+                rec.qk_norm_rope_dyn(
+                    kr.as_ref(),
+                    layer.k_norm_buf.as_ref().unwrap().as_ref(),
+                    params.as_ref(),
+                    kv.k[li].as_ref(),
+                    1,
+                    nkv,
+                    hd,
+                    c.rope_dim,
+                    c.rope_theta,
+                    1,
+                    c.rms_eps,
+                );
+                rec.store_f16_dyn(vr.as_ref(), params.as_ref(), kv.v[li].as_ref(), kvrow);
+                if use_split {
+                    rec.attention_kv_split_dyn(
+                        q_f16.as_ref(),
+                        kv.k[li].as_ref(),
+                        kv.v[li].as_ref(),
+                        attn.as_ref(),
+                        dec.pm.as_ref(),
+                        dec.pl.as_ref(),
+                        dec.pacc.as_ref(),
+                        params.as_ref(),
+                        nh,
+                        nkv,
+                        hd,
+                        chunk,
+                        n_chunks,
+                    );
+                } else {
+                    rec.attention_kv_dyn(
+                        q_f16.as_ref(),
+                        kv.k[li].as_ref(),
+                        kv.v[li].as_ref(),
+                        params.as_ref(),
+                        attn.as_ref(),
+                        1,
+                        nh,
+                        nkv,
+                        hd,
+                    );
+                }
+                rec_linear_add(
+                    &rec,
+                    &layer.wo,
+                    attn.as_ref(),
+                    hidden.as_ref(),
+                    hidden.as_ref(),
+                    1,
+                    nh * hd,
+                    ne,
+                );
+                rec.rmsnorm(
+                    hidden.as_ref(),
+                    layer.ffn_norm_buf.as_ref(),
+                    hn.as_ref(),
+                    1,
+                    ne,
+                    c.rms_eps,
+                );
+                rec_linear(
+                    &rec,
+                    layer.wgateup(),
+                    hn.as_ref(),
+                    gu.as_ref(),
+                    1,
+                    ne,
+                    2 * nff,
+                );
+                rec.silu_mul_fused(gu.as_ref(), act.as_ref(), 1, nff);
+                rec_linear_add(
+                    &rec,
+                    layer.wdown(),
+                    act.as_ref(),
+                    hidden.as_ref(),
+                    hidden.as_ref(),
+                    1,
+                    nff,
+                    ne,
+                );
+            }
+            // final norm + vocab GEMV on the single row (hidden row 0 → hlast).
+            rec.copy(hidden.as_ref(), 0, hlast.as_ref(), 0, ne * 4);
+            rec.rmsnorm(
+                hlast.as_ref(),
+                self.output_norm_buf.as_ref(),
+                hn.as_ref(),
+                1,
+                ne,
+                c.rms_eps,
+            );
+            rec.label_next("vocab");
+            rec_linear(
+                &rec,
+                &self.lm_head,
+                hn.as_ref(),
+                logits.as_ref(),
+                1,
+                ne,
+                c.vocab,
+            );
+            kv.rec_decode = Some((sig, rec.finish_record().map_err(|e| anyhow!("{e}"))?));
+        }
+        kv.rec_decode
+            .as_ref()
+            .unwrap()
+            .1
+            .replay()
+            .map_err(|e| anyhow!("{e}"))?;
+        kv.len += 1;
+        let mut bytes = vec![0u8; c.vocab * 4];
+        self.be
+            .download(dec.logits.as_ref(), &mut bytes)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(Some(bytemuck::cast_slice(&bytes).to_vec()))
     }
 
     /// Prefill chunk size at cache position `pos`. One chunk = one GPU submit; its cost grows with
@@ -5288,6 +5558,45 @@ fn rec_linear(
         ),
         Wt::Native { buf, dtype } => {
             rec.linear_native(*dtype, buf.as_ref(), x, y, rows, in_f, out_f)
+        }
+    }
+}
+
+/// `y = x·Wᵀ + residual` (fused-residual GEMV), dispatching on how `W` is stored.
+#[allow(clippy::too_many_arguments)]
+fn rec_linear_add(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    x: &dyn Buffer,
+    residual: &dyn Buffer,
+    y: &dyn Buffer,
+    rows: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    match w {
+        Wt::F16(b) => rec.linear_add(b.as_ref(), x, residual, y, rows, in_f, out_f),
+        Wt::Q {
+            q,
+            s,
+            m,
+            bits,
+            blk_shift,
+        } => rec.linear_add_q(
+            q.as_ref(),
+            s.as_ref(),
+            m.as_ref(),
+            x,
+            residual,
+            y,
+            rows,
+            in_f,
+            out_f,
+            *bits,
+            *blk_shift,
+        ),
+        Wt::Native { buf, dtype } => {
+            rec.linear_add_native(*dtype, buf.as_ref(), x, residual, y, rows, in_f, out_f)
         }
     }
 }

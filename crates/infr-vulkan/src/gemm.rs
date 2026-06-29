@@ -276,6 +276,8 @@ const ADD_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add.spv")
 const SILU_MUL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
 const SILU_MUL_FUSED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul_fused.spv"));
+const GELU_MUL_FUSED_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gelu_mul_fused.spv"));
 const STORE_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/store_f16.spv"));
 const ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv"));
 const LINEAR_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
@@ -436,6 +438,11 @@ pub(crate) fn silu_mul_spv() -> &'static [u32] {
 pub(crate) fn silu_mul_fused_spv() -> &'static [u32] {
     static SILU_MUL_FUSED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     SILU_MUL_FUSED_SPV.get_or_init(|| spv_words(SILU_MUL_FUSED_SPV_BYTES))
+}
+/// SPIR-V for the fused GeGLU (GELU tanh-approx gate) over a combined gate||up buffer (gemma).
+pub(crate) fn gelu_mul_fused_spv() -> &'static [u32] {
+    static GELU_MUL_FUSED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    GELU_MUL_FUSED_SPV.get_or_init(|| spv_words(GELU_MUL_FUSED_SPV_BYTES))
 }
 /// SPIR-V for the f32→f16 cast-store into an f16 cache.
 pub(crate) fn store_f16_spv() -> &'static [u32] {

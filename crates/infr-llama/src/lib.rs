@@ -17,13 +17,17 @@ use infr_core::{Backend, WeightSource};
 use infr_gguf::Gguf;
 use infr_vulkan::VulkanBackend;
 use std::path::Path;
+use tokenizers::decoders::byte_fallback::ByteFallback;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
+use tokenizers::decoders::fuse::Fuse;
+use tokenizers::decoders::sequence::Sequence as DecoderSequence;
 use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 use tokenizers::pre_tokenizers::sequence::Sequence as PreSequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
-use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
+use tokenizers::{AddedToken, DecoderWrapper, SplitDelimiterBehavior, Tokenizer};
 
 /// Qwen2/Qwen3 pre-tokenizer regex (same string the HF `tokenizer.json` uses) — applied via a
 /// Split before ByteLevel. Differs from the default GPT-2 ByteLevel regex (punctuation/number runs),
@@ -48,8 +52,25 @@ pub struct Config {
     pub eos_ids: Vec<u32>,
     /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
     pub qk_norm: bool,
+    /// gemma family: scale input embeddings by √n_embd, sandwich norms (post-attn / post-ffw RMSNorm
+    /// before the residual add), and a GeGLU (GELU) FFN instead of SwiGLU.
+    pub gemma: bool,
+    /// Sliding-window attention size (gemma); `0` = full causal attention everywhere. SWA layers
+    /// only attend to the last `swa_window` keys.
+    pub swa_window: usize,
+    /// SWA layer pattern (gemma): every `swa_pattern`-th layer uses FULL attention, the rest SWA.
+    /// `0`/`1` = no pattern. llama.cpp `set_swa_pattern(p)`: layer `il` is full iff `(il+1) % p == 0`.
+    pub swa_pattern: usize,
     /// MoE config (qwen3moe): `Some` enables the routed-expert FFN. `None` = dense FFN.
     pub moe: Option<MoeConfig>,
+}
+
+impl Config {
+    /// Whether layer `il` uses sliding-window (vs full) attention. gemma interleaves SWA with full
+    /// attention on a fixed period; non-gemma models are always full.
+    pub fn is_swa_layer(&self, il: usize) -> bool {
+        self.swa_window > 0 && self.swa_pattern > 1 && !(il + 1).is_multiple_of(self.swa_pattern)
+    }
 }
 
 /// Mixture-of-experts FFN parameters (qwen3moe): a softmax router picks `n_used` of `n_expert`
@@ -271,6 +292,10 @@ struct LayerWeights {
     ffn: FfnWt,
     q_norm_buf: Option<Box<dyn Buffer>>, // qwen3 QK-norm weights [head_dim]
     k_norm_buf: Option<Box<dyn Buffer>>,
+    // gemma sandwich norms: an extra RMSNorm on the attention / FFN sublayer output BEFORE the
+    // residual add (`post_attention_norm` / `post_ffw_norm`). `None` for llama/qwen3.
+    post_attn_norm_buf: Option<Box<dyn Buffer>>,
+    post_ffw_norm_buf: Option<Box<dyn Buffer>>,
 }
 
 impl LayerWeights {
@@ -422,11 +447,15 @@ fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
 fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     let md = g.metadata();
     let model = md.str("tokenizer.ggml.model").unwrap_or("");
-    if model != "gpt2" {
-        bail!(
-            "can't derive a tokenizer from tokenizer.ggml.model={model:?} \
-             (only gpt2 byte-level BPE); pass a tokenizer.json sidecar instead"
-        );
+    match model {
+        "gpt2" => {}
+        // SentencePiece (llama/gemma): a Unigram model over the GGUF tokens+scores, with byte
+        // fallback for the `<0xXX>` tokens and a Metaspace (▁) word-boundary scheme.
+        "llama" => return build_spm_tokenizer(g),
+        other => bail!(
+            "can't derive a tokenizer from tokenizer.ggml.model={other:?} \
+             (only gpt2 BPE / llama SPM); pass a tokenizer.json sidecar instead"
+        ),
     }
     let toks = md
         .get("tokenizer.ggml.tokens")
@@ -479,6 +508,127 @@ fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     // <think>) as NORMAL added tokens — matching HF. Both encode atomically, but only special ones
     // are dropped by `decode(.., skip_special=true)`; keeping <think>/</think> non-special means
     // the reasoning block stays visible (and markable) in the output.
+    if let Some(types) = md
+        .get("tokenizer.ggml.token_type")
+        .and_then(MetaValue::as_arr)
+    {
+        let mut specials = Vec::new();
+        let mut added = Vec::new();
+        for (i, ty) in types.iter().enumerate() {
+            let Some(s) = toks.get(i).and_then(MetaValue::as_str) else {
+                continue;
+            };
+            match ty.as_u64() {
+                Some(3) => specials.push(AddedToken::from(s.to_string(), true)),
+                Some(4) => added.push(AddedToken::from(s.to_string(), false)),
+                _ => {}
+            }
+        }
+        if !added.is_empty() {
+            tok.add_tokens(&added);
+        }
+        if !specials.is_empty() {
+            tok.add_special_tokens(&specials);
+        }
+    }
+    Ok(tok)
+}
+
+/// Build a SentencePiece (Unigram) tokenizer from a GGUF's embedded vocab (`tokenizer.ggml.model
+/// == "llama"`, used by llama/gemma). The token strings + `scores` become the Unigram lattice;
+/// `<0xXX>` byte tokens (token_type 6) are handled by Unigram byte-fallback; CONTROL tokens
+/// (type 3, e.g. `<bos>`/`<start_of_turn>`) register as special so they encode atomically. The
+/// Metaspace replacement (▁) maps spaces; `add_space_prefix` controls the leading dummy space.
+fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
+    let md = g.metadata();
+    let toks = md
+        .get("tokenizer.ggml.tokens")
+        .and_then(MetaValue::as_arr)
+        .context("gguf missing tokenizer.ggml.tokens")?;
+    let scores = md
+        .get("tokenizer.ggml.scores")
+        .and_then(MetaValue::as_arr)
+        .context("gguf missing tokenizer.ggml.scores (SPM needs token scores)")?;
+    if scores.len() != toks.len() {
+        bail!(
+            "tokenizer scores/tokens length mismatch ({} vs {})",
+            scores.len(),
+            toks.len()
+        );
+    }
+    // gemma/llama SPM is greedy-bigram-merge BPE (the GGUF `scores` are negative merge RANKS, NOT
+    // unigram log-probs — Unigram Viterbi would maximize their sum and wrongly prefer splitting
+    // common words). Represent it as a BPE model whose merges are reconstructed from the vocab, the
+    // same way HF's SpmConverter builds `LlamaTokenizerFast`: for every vocab piece, each split into
+    // two existing pieces is a candidate merge, ordered globally by the merged piece's score
+    // (descending = earliest), ties broken by the pieces' ids. Fed to greedy BPE this reproduces SPM.
+    let token_strs: Vec<String> = toks
+        .iter()
+        .map(|t| t.as_str().unwrap_or("").to_string())
+        .collect();
+    let vocab: std::collections::HashMap<String, u32> = token_strs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.clone(), i as u32))
+        .collect();
+    // (score, id_l, id_r, l, r) per candidate merge — global sort by score desc, then (id_l, id_r).
+    let mut cand: Vec<(f64, u32, u32, &str, &str)> = Vec::new();
+    for (i, piece) in token_strs.iter().enumerate() {
+        if piece.len() < 2 {
+            continue;
+        }
+        let score = scores[i].as_f64().unwrap_or(0.0);
+        for (b, _) in piece.char_indices().skip(1) {
+            let (l, r) = piece.split_at(b);
+            if let (Some(&il), Some(&ir)) = (vocab.get(l), vocab.get(r)) {
+                cand.push((score, il, ir, l, r));
+            }
+        }
+    }
+    // Higher score = earlier merge (rank ascending); stable tie-break on (id_l, id_r).
+    cand.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then((a.1, a.2).cmp(&(b.1, b.2)))
+    });
+    let merges: Vec<(String, String)> = cand
+        .into_iter()
+        .map(|(_, _, _, l, r)| (l.to_string(), r.to_string()))
+        .collect();
+    let unk = md
+        .get("tokenizer.ggml.unknown_token_id")
+        .and_then(MetaValue::as_u64)
+        .and_then(|i| token_strs.get(i as usize).cloned())
+        .unwrap_or_else(|| "<unk>".to_string());
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .unk_token(unk)
+        .byte_fallback(true)
+        .fuse_unk(true)
+        .build()
+        .map_err(|e| anyhow!("build spm bpe: {e}"))?;
+    let mut tok = Tokenizer::new(bpe);
+    // SPM: spaces → ▁. add_space_prefix=true prepends a dummy ▁ (PrependScheme::First); gemma3
+    // sets it false. `split` keeps Metaspace's word splitting on the replacement char.
+    let add_prefix = matches!(
+        md.get("tokenizer.ggml.add_space_prefix"),
+        Some(MetaValue::Bool(true))
+    );
+    let scheme = if add_prefix {
+        PrependScheme::First
+    } else {
+        PrependScheme::Never
+    };
+    tok.with_pre_tokenizer(Some(Metaspace::new('▁', scheme, true)));
+    // Decode: reassemble byte-fallback bytes, fuse, then map ▁→space (Metaspace decoder).
+    let dec = DecoderSequence::new(vec![
+        DecoderWrapper::ByteFallback(ByteFallback::default()),
+        DecoderWrapper::Fuse(Fuse::default()),
+        DecoderWrapper::Metaspace(Metaspace::new('▁', scheme, true)),
+    ]);
+    tok.with_decoder(Some(dec));
+    // CONTROL tokens (type 3, e.g. <bos>/<start_of_turn>/<end_of_turn>) encode atomically as
+    // special; USER_DEFINED (type 4) as normal added tokens — matching HF.
     if let Some(types) = md
         .get("tokenizer.ggml.token_type")
         .and_then(MetaValue::as_arr)
@@ -1977,11 +2127,16 @@ impl Llama {
             .to_string();
         // llama / qwen3 / qwen3moe share the transformer; qwen3* add QK-norm + explicit head_dim,
         // qwen3moe replaces the dense FFN with a routed-expert bank.
+        // gemma3 reuses the qwen3 dense transformer (QK-norm + explicit head_dim) and adds: √n_embd
+        // embedding scale, sandwich norms (post-attn / post-ffw), GeGLU FFN, and sliding-window attn.
         let qk_norm = match arch.as_str() {
             "llama" => false,
-            "qwen3" | "qwen3moe" => true,
-            other => bail!("infr-llama supports architecture=llama|qwen3|qwen3moe, got {other:?}"),
+            "qwen3" | "qwen3moe" | "gemma3" => true,
+            other => {
+                bail!("infr-llama supports architecture=llama|qwen3|qwen3moe|gemma3, got {other:?}")
+            }
         };
+        let gemma = arch == "gemma3";
         let mk = |k: &str| format!("{arch}.{k}");
         let n_layer = meta_u64(&g, &mk("block_count")).context("block_count")? as usize;
         let n_embd = meta_u64(&g, &mk("embedding_length")).context("embedding_length")? as usize;
@@ -2037,6 +2192,18 @@ impl Llama {
                 _ => None,
             })
             .unwrap_or(1e-5);
+        // gemma SWA: most layers attend only to the last `swa_window` keys; every `swa_pattern`-th
+        // layer is full attention (gemma3 default period 6 = 5 SWA : 1 full).
+        let swa_window = if gemma {
+            meta_u64(&g, &mk("attention.sliding_window")).unwrap_or(0) as usize
+        } else {
+            0
+        };
+        let swa_pattern = if swa_window > 0 {
+            meta_u64(&g, &mk("attention.sliding_window_pattern")).unwrap_or(6) as usize
+        } else {
+            0
+        };
         let eos = meta_u64(&g, "tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
 
         let be = VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
@@ -2213,6 +2380,23 @@ impl Llama {
             } else {
                 (None, None)
             };
+            // gemma sandwich norms: post-attention + post-ffw RMSNorm weights.
+            let (post_attn_norm_buf, post_ffw_norm_buf) = if gemma {
+                (
+                    Some(
+                        be.upload_weight(
+                            &load_tensor_dequant(&g, &p("post_attention_norm.weight"))?.0,
+                        )
+                        .map_err(|e| anyhow!("upload post_attention_norm {l}: {e}"))?,
+                    ),
+                    Some(
+                        be.upload_weight(&load_tensor_dequant(&g, &p("post_ffw_norm.weight"))?.0)
+                            .map_err(|e| anyhow!("upload post_ffw_norm {l}: {e}"))?,
+                    ),
+                )
+            } else {
+                (None, None)
+            };
             layers.push(LayerWeights {
                 attn_norm,
                 ffn_norm,
@@ -2225,6 +2409,8 @@ impl Llama {
                 ffn,
                 q_norm_buf,
                 k_norm_buf,
+                post_attn_norm_buf,
+                post_ffw_norm_buf,
             });
             pb.inc(layer_bytes(l));
         }
@@ -2263,6 +2449,9 @@ impl Llama {
             eos,
             eos_ids,
             qk_norm,
+            gemma,
+            swa_window,
+            swa_pattern,
             moe,
         };
         let llama = Self {
@@ -2337,12 +2526,24 @@ impl Llama {
     /// (so a user typing `<|im_end|>`/`<think>`/etc. can't inject or break the turn structure).
     /// `started` closes the previous assistant turn first.
     fn turn_tokens(&self, user: &str, started: bool) -> Result<Vec<u32>> {
-        let pre = if started {
-            "<|im_end|>\n<|im_start|>user\n"
+        // gemma uses <start_of_turn>/<end_of_turn> turns with a leading <bos>; everyone else ChatML.
+        let (pre, post) = if self.cfg.gemma {
+            (
+                if started {
+                    "<end_of_turn>\n<start_of_turn>user\n"
+                } else {
+                    "<bos><start_of_turn>user\n"
+                },
+                "<end_of_turn>\n<start_of_turn>model\n",
+            )
+        } else if started {
+            (
+                "<|im_end|>\n<|im_start|>user\n",
+                "<|im_end|>\n<|im_start|>assistant\n",
+            )
         } else {
-            "<|im_start|>user\n"
+            ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n")
         };
-        let post = "<|im_end|>\n<|im_start|>assistant\n";
         let enc = |t: &Tokenizer, s: &str| -> Result<Vec<u32>> {
             t.encode(s, false)
                 .map(|e| e.get_ids().to_vec())
@@ -2351,6 +2552,13 @@ impl Llama {
         let mut ids = enc(&self.tokenizer, pre)?;
         ids.extend(enc(&self.user_tokenizer, user)?);
         ids.extend(enc(&self.tokenizer, post)?);
+        if std::env::var("INFR_DEBUG_TOKENS").is_ok() {
+            let dump: Vec<(u32, String)> = ids
+                .iter()
+                .map(|&id| (id, self.tokenizer.id_to_token(id).unwrap_or_default()))
+                .collect();
+            eprintln!("[tokens] {dump:?}");
+        }
         Ok(ids)
     }
 
@@ -2776,6 +2984,13 @@ impl Llama {
             hidden_host[i * ne..(i + 1) * ne]
                 .copy_from_slice(&self.token_embd[tok as usize * ne..(tok as usize + 1) * ne]);
         }
+        // gemma scales the input embeddings by √n_embd (done in f32 before upload).
+        if c.gemma {
+            let s = (ne as f32).sqrt();
+            for x in hidden_host.iter_mut() {
+                *x *= s;
+            }
+        }
         let alloc = |m: usize, u: BufferUsage| -> Result<Box<dyn Buffer>> {
             self.be.alloc((m * 4).max(4), u).map_err(|e| anyhow!("{e}"))
         };
@@ -2806,7 +3021,9 @@ impl Llama {
         // Both are correctness-tested (attention_prefill_{nonfa,flash}_matches_cpu) so neither rots.
         // DEFAULT = flash for hd=128. TODO: auto-select from device bandwidth/FLOP caps.
         let use_flash = use_gemm && hd == 128 && std::env::var("INFR_NO_FLASH").is_err();
-        let nonfa = use_gemm && !use_flash;
+        // gemma (hd=256) has no flash/nonfa prefill kernel (those tile on hd=128); keep its GEMM
+        // projections but route attention through the hd-general `attention_kv` path (fall-through).
+        let nonfa = use_gemm && !use_flash && !c.gemma;
         let hidden = alloc(n * ne, BufferUsage::Staging)?;
         self.be
             .upload(hidden.as_ref(), bytemuck::cast_slice(&hidden_host))
@@ -2823,6 +3040,13 @@ impl Llama {
         // gate+up intermediate for the un-fused decode FFN (rmsnorm → gate/up GEMV → SwiGLU). The
         // GEMM path uses its own `gu` in `gemm_bufs`; this serves the small-batch (decode) path.
         let gu_ffn = alloc(n * 2 * nff, BufferUsage::Activations)?;
+        // gemma sandwich norm scratch: the un-fused (decode/small-batch) path can't fuse the residual
+        // add, so it writes the attn/ffn sublayer output here, RMSNorms it, then adds to hidden.
+        let gemma_sub = if c.gemma {
+            Some(alloc(n * ne, BufferUsage::Activations)?)
+        } else {
+            None
+        };
         // Only the LAST position's logits are needed → compute lm_head for one row. (Computing all n
         // rows at long context is a huge wasted dispatch + ~n*vocab buffer that can exceed the GPU
         // watchdog and lose the device.)
@@ -2915,7 +3139,9 @@ impl Llama {
         } else {
             None
         };
-        let use_split = n == 1 && kv_len > chunk;
+        // gemma (hd=256): the split-K decode kernel (attn_partial) tiles for hd≤128, so route
+        // gemma decode through the hd-general `attention_kv` (no split; its TILE loop covers long kv).
+        let use_split = n == 1 && kv_len > chunk && !c.gemma;
         let n_chunks = if use_split { kv_len.div_ceil(chunk) } else { 0 };
         let split_bufs = if use_split {
             Some((
@@ -3292,14 +3518,20 @@ impl Llama {
                     nkv,
                     hd,
                     pos,
+                    if c.is_swa_layer(li) { c.swa_window } else { 0 },
                 );
             }
             if use_gemm {
                 let (ao, gu, down, _) = gemm_bufs.as_ref().unwrap();
-                // o-proj via GEMM then residual add (matmul_proj can't fuse the residual).
+                // o-proj via GEMM then residual add (matmul_proj can't fuse the residual). gemma
+                // inserts a post-attention RMSNorm on `ao` before the add (sandwich norm).
                 mm(&layer.wo, attn.as_ref(), ao.as_ref(), n, nh * hd, ne);
+                if let Some(pn) = &layer.post_attn_norm_buf {
+                    rec.rmsnorm(ao.as_ref(), pn.as_ref(), ao.as_ref(), n, ne, c.rms_eps);
+                }
                 rec.add(hidden.as_ref(), ao.as_ref(), hidden.as_ref(), n * ne);
-                // FFN un-fused: rmsnorm → gate/up GEMM → SwiGLU → down GEMM → residual add.
+                // FFN un-fused: rmsnorm → gate/up GEMM → (Si|Ge)GLU → down GEMM → residual add. gemma
+                // uses GeGLU and a post-ffw RMSNorm on `down` before the add.
                 rec.rmsnorm(
                     hidden.as_ref(),
                     layer.ffn_norm_buf.as_ref(),
@@ -3309,9 +3541,57 @@ impl Llama {
                     c.rms_eps,
                 );
                 mm(layer.wgateup(), hn.as_ref(), gu.as_ref(), n, ne, 2 * nff);
-                rec.silu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
+                if c.gemma {
+                    rec.gelu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
+                } else {
+                    rec.silu_mul_fused(gu.as_ref(), act.as_ref(), n, nff);
+                }
                 mm(layer.wdown(), act.as_ref(), down.as_ref(), n, nff, ne);
+                if let Some(pn) = &layer.post_ffw_norm_buf {
+                    rec.rmsnorm(down.as_ref(), pn.as_ref(), down.as_ref(), n, ne, c.rms_eps);
+                }
                 rec.add(hidden.as_ref(), down.as_ref(), hidden.as_ref(), n * ne);
+            } else if c.gemma {
+                // gemma small-batch/decode: sandwich norms forbid the fused residual add, so o-proj
+                // and down write to `gemma_sub`, get RMSNorm'd, then add to hidden. FFN = GeGLU.
+                let sub = gemma_sub.as_ref().unwrap();
+                lin(&layer.wo, attn.as_ref(), sub.as_ref(), n, nh * hd, ne);
+                rec.rmsnorm(
+                    sub.as_ref(),
+                    layer.post_attn_norm_buf.as_ref().unwrap().as_ref(),
+                    sub.as_ref(),
+                    n,
+                    ne,
+                    c.rms_eps,
+                );
+                rec.add(hidden.as_ref(), sub.as_ref(), hidden.as_ref(), n * ne);
+                rec.rmsnorm(
+                    hidden.as_ref(),
+                    layer.ffn_norm_buf.as_ref(),
+                    hn.as_ref(),
+                    n,
+                    ne,
+                    c.rms_eps,
+                );
+                lin(
+                    layer.wgateup(),
+                    hn.as_ref(),
+                    gu_ffn.as_ref(),
+                    n,
+                    ne,
+                    2 * nff,
+                );
+                rec.gelu_mul_fused(gu_ffn.as_ref(), act.as_ref(), n, nff);
+                lin(layer.wdown(), act.as_ref(), sub.as_ref(), n, nff, ne);
+                rec.rmsnorm(
+                    sub.as_ref(),
+                    layer.post_ffw_norm_buf.as_ref().unwrap().as_ref(),
+                    sub.as_ref(),
+                    n,
+                    ne,
+                    c.rms_eps,
+                );
+                rec.add(hidden.as_ref(), sub.as_ref(), hidden.as_ref(), n * ne);
             } else {
                 lin_add(
                     &layer.wo,
@@ -3404,7 +3684,13 @@ impl Llama {
         // Eligible: Qwen3 (qk-norm; per-quant QKV GEMVs) OR a Llama-arch f16 model (the fused attn_in
         // path, which requires f16 Q/K/V weights). Quantized Llama / offload / profiling fall back.
         let llama_f16 = !c.qk_norm && matches!(self.layers[0].wq, Wt::F16(_));
-        if (!c.qk_norm && !llama_f16) || kv.dec.is_none() || std::env::var("INFR_PROF2").is_ok() {
+        // gemma (sandwich norms + GeGLU + SWA) isn't wired into the record-once decode yet — fall
+        // back to forward_resident_kv, which has the full gemma path.
+        if c.gemma
+            || (!c.qk_norm && !llama_f16)
+            || kv.dec.is_none()
+            || std::env::var("INFR_PROF2").is_ok()
+        {
             return Ok(None);
         }
         let (ne, nh, nkv, hd, nff) = (c.n_embd, c.n_head, c.n_kv, c.head_dim, c.n_ff);
@@ -3952,6 +4238,7 @@ impl Llama {
                 nkv,
                 hd,
                 pos,
+                0, // full causal (llama/qwen3)
             );
         }
         rec.finish().map_err(|e| anyhow!("{e}"))?;
@@ -4671,6 +4958,7 @@ impl Llama {
                     nkv,
                     hd,
                     pos,
+                    0, // full causal (MoE attention)
                 );
             }
             if let (Some(qa), Some(da), Some(sa)) = (&qa_o, &da_o, &sa_o) {

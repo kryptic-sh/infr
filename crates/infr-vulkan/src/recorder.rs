@@ -1137,6 +1137,7 @@ impl<'a> Recorder<'a> {
     /// Cached attention: q `[q_len,nh,hd]` (abs positions `pos_offset..`) over the K/V cache
     /// `[kv_len,nkv,hd]`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_kv(
         &self,
         q: &dyn Buffer,
@@ -1149,18 +1150,22 @@ impl<'a> Recorder<'a> {
         nkv: usize,
         hd: usize,
         pos_offset: usize,
+        // Sliding-window attention: a query at abs pos `p` attends only keys `j > p - window`.
+        // `0` = full causal (llama/qwen3 + gemma full-attention layers).
+        window: usize,
     ) {
         self.stamp("attention_kv");
         let kern = self
             .be
-            .kernel("attention_kv", crate::gemm::attention_kv_spv(), 4, 24);
-        let mut push = [0u8; 24];
+            .kernel("attention_kv", crate::gemm::attention_kv_spv(), 4, 28);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         self.dispatch(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
@@ -1731,15 +1736,16 @@ impl<'a> Recorder<'a> {
             "attention_kv_dyn",
             crate::gemm::attention_kv_dyn_spv(),
             5,
-            24,
+            28,
         );
-        let mut push = [0u8; 24];
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         // [4..8] kv_len: unused
         push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
         // [20..24] pos_offset: unused (from params)
+        // [24..28] window: 0 (record-once decode is gemma-disabled, so always full causal)
         self.dispatch(
             kern,
             &[
@@ -1884,6 +1890,24 @@ impl<'a> Recorder<'a> {
         let k = self
             .be
             .kernel("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(gu), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nff) as u32,
+        );
+    }
+
+    /// Fused GeGLU (GELU tanh-approx gate) over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
+    /// Same layout/dispatch as [`silu_mul_fused`]; gemma uses GELU instead of SiLU.
+    pub fn gelu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+        let k = self
+            .be
+            .kernel("gelu_mul_fused", crate::gemm::gelu_mul_fused_spv(), 2, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nff as u32).to_ne_bytes());
@@ -2640,6 +2664,7 @@ mod tests {
             nkv,
             hd,
             pos_offset,
+            0, // full causal (no sliding window)
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; q_len * nh * hd * 4];

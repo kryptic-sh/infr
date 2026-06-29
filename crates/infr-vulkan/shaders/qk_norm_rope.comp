@@ -21,7 +21,7 @@ layout(binding = 3) buffer YB { float16_t y[]; };
 layout(binding = 2) buffer YB { float16_t y[]; };
 #endif
 
-shared float xs[128];
+shared float xs[256]; // hd up to 256 (gemma); 64 threads each handle hd/64 elements
 shared float red[64];
 
 void main() {

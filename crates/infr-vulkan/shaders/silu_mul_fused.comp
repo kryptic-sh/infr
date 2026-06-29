@@ -1,6 +1,7 @@
 #version 460
-// Fused SwiGLU over a combined gate||up buffer gu[rows, 2*nff]:
-// y[r,i] = silu(gu[r,i]) * gu[r, nff+i]. One thread per output element.
+// Fused gated-GLU over a combined gate||up buffer gu[rows, 2*nff]:
+// y[r,i] = act(gu[r,i]) * gu[r, nff+i]. One thread per output element.
+// Default act = SiLU (SwiGLU); -DGELU = GELU tanh-approx (GeGLU, used by gemma).
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint rows; uint nff; } pc;
@@ -14,5 +15,11 @@ void main() {
     uint i = idx % pc.nff;
     uint base = r * 2u * pc.nff;
     float g = gu[base + i];
-    y[idx] = (g / (1.0 + exp(-g))) * gu[base + pc.nff + i];
+#ifdef GELU
+    // gelu_pytorch_tanh: 0.5*g*(1+tanh(sqrt(2/pi)*(g+0.044715*g^3)))
+    float a = 0.5 * g * (1.0 + tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)));
+#else
+    float a = g / (1.0 + exp(-g));
+#endif
+    y[idx] = a * gu[base + pc.nff + i];
 }

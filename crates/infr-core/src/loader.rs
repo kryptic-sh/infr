@@ -23,6 +23,14 @@ impl MetaValue {
             _ => None,
         }
     }
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            MetaValue::F64(v) => Some(*v),
+            MetaValue::U64(v) => Some(*v as f64),
+            MetaValue::I64(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
     pub fn as_str(&self) -> Option<&str> {
         match self {
             MetaValue::Str(s) => Some(s),

@@ -1,9 +1,11 @@
 //! CPU reference backend — a correctness-first interpreter of the backend-agnostic
 //! [`infr_core`] compute [`Graph`]. No SIMD, no threading yet: every op is a plain scalar loop.
-//! The bulk projection weights (`Op::Linear`) are streamed one row at a time straight from their
-//! native GGUF bytes and dequantized inside the dot — never materialized in f32 — so 12B / MoE
-//! models fit in memory. Only the tiny norm weights are dequant-cached. It exists to (a) run every
-//! model without a GPU and (b) serve as the oracle the GPU backends are validated against.
+//! Weights are read **zero-copy from the GGUF mmap** (no `memcpy`, no owned RAM): the bulk
+//! projection weights (`Op::Linear`) are dequantized one row at a time straight from the mapping
+//! inside the dot, so 12B / MoE models cost only their on-disk size in page cache. Only the tiny
+//! norm weights are dequant-cached; the model writes (KV / conv / recurrent state, per-step IO) use
+//! small owned buffers. It exists to (a) run every model without a GPU and (b) serve as the oracle
+//! the GPU backends are validated against.
 //!
 //! Lives in `infr-llama` for now (next to [`crate::dequant_block`] + the qwen35 CPU oracle) to
 //! avoid a circular crate dep; it implements the agnostic `infr_core::Backend` trait, so it can be
@@ -16,20 +18,62 @@ use infr_core::error::Result;
 use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
+use infr_gguf::{Gguf, TensorBytes};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// A host buffer: a plain byte vector behind a `Mutex` (so `&dyn Buffer` stays `Send + Sync` and
-/// `upload`/`download`/in-place writes are safe single-threaded).
-pub struct CpuBuffer {
-    data: Mutex<Vec<u8>>,
+/// A host buffer. Weights are **mapped** — a zero-copy [`TensorBytes`] view straight into the GGUF
+/// mmap (read-only, no `memcpy`, no owned RAM). Everything the model writes (KV / conv / recurrent
+/// state, per-step IO) is **owned** — a plain byte vec behind a `Mutex` (so `&dyn Buffer` stays
+/// `Send + Sync` and writes are safe). `&dyn Buffer` reads go through [`CpuBuffer::read`].
+pub enum CpuBuffer {
+    Owned(Mutex<Vec<u8>>),
+    Mapped(TensorBytes),
+}
+
+/// A uniform read view over either storage (a `MutexGuard` for owned, the slice for mapped); both
+/// deref to `[u8]`.
+enum CpuRead<'a> {
+    Owned(std::sync::MutexGuard<'a, Vec<u8>>),
+    Mapped(&'a TensorBytes),
+}
+
+impl std::ops::Deref for CpuRead<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            CpuRead::Owned(g) => g,
+            CpuRead::Mapped(t) => t,
+        }
+    }
+}
+
+impl CpuBuffer {
+    /// Read view of the bytes (zero-copy for mapped weights; mutex guard for owned buffers).
+    fn read(&self) -> CpuRead<'_> {
+        match self {
+            CpuBuffer::Owned(m) => CpuRead::Owned(m.lock().unwrap()),
+            CpuBuffer::Mapped(t) => CpuRead::Mapped(t),
+        }
+    }
+    /// Mutable owned storage; panics for mapped (read-only) weights.
+    fn owned(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        match self {
+            CpuBuffer::Owned(m) => m.lock().unwrap(),
+            CpuBuffer::Mapped(_) => {
+                panic!("cpu backend: write to a mapped (read-only) weight buffer")
+            }
+        }
+    }
 }
 
 impl Buffer for CpuBuffer {
     fn len_bytes(&self) -> usize {
-        self.data.lock().unwrap().len()
+        match self {
+            CpuBuffer::Owned(m) => m.lock().unwrap().len(),
+            CpuBuffer::Mapped(t) => t.len(),
+        }
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -59,6 +103,11 @@ pub struct CpuBackend {
 impl CpuBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wrap a zero-copy GGUF mmap view as a read-only weight buffer (no allocation, no `memcpy`).
+    pub fn map_weight(&self, bytes: TensorBytes) -> Box<dyn Buffer> {
+        Box::new(CpuBuffer::Mapped(bytes))
     }
 }
 
@@ -112,19 +161,20 @@ impl Backend for CpuBackend {
     }
 
     fn alloc(&self, bytes: usize, _usage: BufferUsage) -> Result<Box<dyn Buffer>> {
-        Ok(Box::new(CpuBuffer {
-            data: Mutex::new(vec![0u8; bytes.max(4)]),
-        }))
+        Ok(Box::new(CpuBuffer::Owned(Mutex::new(vec![
+            0u8;
+            bytes.max(4)
+        ]))))
     }
 
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
-        let mut d = cpu_buf(dst).data.lock().unwrap();
+        let mut d = cpu_buf(dst).owned();
         d[..src.len()].copy_from_slice(src);
         Ok(())
     }
 
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
-        let s = cpu_buf(src).data.lock().unwrap();
+        let s = cpu_buf(src).read();
         dst.copy_from_slice(&s[..dst.len()]);
         Ok(())
     }
@@ -154,7 +204,7 @@ impl Backend for CpuBackend {
                     let buf = bindings
                         .get(TensorId(i as u32))
                         .expect("cpu backend: unbound Input");
-                    let bytes = cpu_buf(buf).data.lock().unwrap();
+                    let bytes = cpu_buf(buf).read();
                     vals[i] = bytes_to_f32(&bytes, decl.desc.dtype);
                 }
                 TensorKind::Weight => {} // lazily dequantized in `weight()`
@@ -168,7 +218,7 @@ impl Backend for CpuBackend {
             if let Some(w) = self.weight_cache.lock().unwrap().get(&key) {
                 return w.clone();
             }
-            let bytes = cpu_buf(buf).data.lock().unwrap();
+            let bytes = cpu_buf(buf).read();
             let w = Arc::new(bytes_to_f32(&bytes, g.desc(id).dtype));
             self.weight_cache.lock().unwrap().insert(key, w.clone());
             w
@@ -241,7 +291,7 @@ impl Backend for CpuBackend {
                     // big / MoE models fit. GGUF rows are block-aligned, so each row is an equal
                     // `bytes/out_f` slice. (Re-dequant per step — perf is a later pass, PLAN.md §1.)
                     let buf = bindings.get(w).expect("cpu backend: unbound Weight");
-                    let bytes = cpu_buf(buf).data.lock().unwrap();
+                    let bytes = cpu_buf(buf).read();
                     let dt = g.desc(w).dtype;
                     let bpr = bytes.len() / out_f; // bytes per weight row
                     let mut out = vec![0f32; m * out_f];
@@ -478,7 +528,7 @@ impl Backend for CpuBackend {
                     };
                     // Router softmax over all experts.
                     let rbuf = bindings.get(router).expect("cpu backend: unbound router");
-                    let rbytes = cpu_buf(rbuf).data.lock().unwrap();
+                    let rbytes = cpu_buf(rbuf).read();
                     let logits = matvec(&rbytes, g.desc(router).dtype, &xs, ne, n_expert);
                     drop(rbytes);
                     let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -500,9 +550,9 @@ impl Backend for CpuBackend {
                     let dbuf = bindings
                         .get(down_exps)
                         .expect("cpu backend: unbound down_exps");
-                    let gb = cpu_buf(gbuf).data.lock().unwrap();
-                    let ub = cpu_buf(ubuf).data.lock().unwrap();
-                    let db = cpu_buf(dbuf).data.lock().unwrap();
+                    let gb = cpu_buf(gbuf).read();
+                    let ub = cpu_buf(ubuf).read();
+                    let db = cpu_buf(dbuf).read();
                     let (gdt, udt, ddt) = (
                         g.desc(gate_exps).dtype,
                         g.desc(up_exps).dtype,
@@ -656,7 +706,7 @@ impl Backend for CpuBackend {
                 continue;
             }
             if let Some(buf) = bindings.get(TensorId(i as u32)) {
-                let mut d = cpu_buf(buf).data.lock().unwrap();
+                let mut d = cpu_buf(buf).owned();
                 d.copy_from_slice(bytemuck::cast_slice(&vals[i]));
             }
         }
@@ -795,6 +845,8 @@ pub(crate) fn generate_dense_cpu(
     //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
     let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
     let mut wspecs: Vec<(DType, usize)> = Vec::new();
+    // Map a weight tensor zero-copy from the GGUF mmap (no alloc, no memcpy); record its native dtype
+    // + element count so `build` declares the handle to match.
     let mut wraw = |name: &str| -> AResult<()> {
         let info = g
             .tensors()
@@ -802,13 +854,9 @@ pub(crate) fn generate_dense_cpu(
             .find(|t| t.name == name)
             .ok_or_else(|| anyhow!("tensor not found: {name}"))?
             .clone();
-        let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
         let numel: usize = info.shape.iter().product();
-        let b = be
-            .alloc(bytes.len(), BufferUsage::Weights)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(b.as_ref(), bytes).map_err(|e| anyhow!("{e}"))?;
-        wbufs.push(b);
+        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+        wbufs.push(be.map_weight(tb));
         wspecs.push((info.dtype, numel));
         Ok(())
     };
@@ -850,19 +898,14 @@ pub(crate) fn generate_dense_cpu(
             wraw(&p("post_norm.weight"))?;
         }
     }
-    // Globals: output_norm, lm_head (output.weight, or tied to token_embd f32).
+    // Globals: output_norm, lm_head. lm_head = `output.weight`, or (tied) the quantized
+    // `token_embd.weight` mapped from the mmap and dequantized per-row by `Op::Linear` — same f32
+    // values as the host `token_embd`, but zero-copy.
     wraw("output_norm.weight")?;
     if g.tensors().iter().any(|t| t.name == "output.weight") {
         wraw("output.weight")?;
     } else {
-        // tied lm head: the host f32 token_embd (already dequantized for the embedding gather).
-        let b = be
-            .alloc(token_embd.len() * 4, BufferUsage::Weights)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(b.as_ref(), bytemuck::cast_slice(token_embd))
-            .map_err(|e| anyhow!("{e}"))?;
-        wbufs.push(b);
-        wspecs.push((DType::F32, token_embd.len()));
+        wraw("token_embd.weight")?;
     }
     // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
     // of the max head dim serves every layer (a narrower layer reads its leading prefix).

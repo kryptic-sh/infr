@@ -792,13 +792,9 @@ pub fn generate_cpu(path: &std::path::Path, prompt: &str, n: usize) -> Result<St
             .find(|t| t.name == name)
             .ok_or_else(|| anyhow!("tensor not found: {name}"))?
             .clone();
-        let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
         let numel: usize = info.shape.iter().product();
-        let b = be
-            .alloc(bytes.len(), BufferUsage::Weights)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(b.as_ref(), bytes).map_err(|e| anyhow!("{e}"))?;
-        wbufs.push(b);
+        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+        wbufs.push(be.map_weight(tb));
         wspecs.push((info.dtype, numel));
         Ok(())
     };
@@ -842,17 +838,12 @@ pub fn generate_cpu(path: &std::path::Path, prompt: &str, n: usize) -> Result<St
         }
     }
     wraw("output_norm.weight")?;
-    let tied = !g.tensors().iter().any(|t| t.name == "output.weight");
-    if !tied {
+    // lm_head: `output.weight`, or (tied) the quantized `token_embd.weight` mapped zero-copy and
+    // dequantized per-row by `Op::Linear`.
+    if g.tensors().iter().any(|t| t.name == "output.weight") {
         wraw("output.weight")?;
     } else {
-        let b = be
-            .alloc(token_embd.len() * 4, BufferUsage::Weights)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(b.as_ref(), bytemuck::cast_slice(&token_embd))
-            .map_err(|e| anyhow!("{e}"))?;
-        wbufs.push(b);
-        wspecs.push((DType::F32, token_embd.len()));
+        wraw("token_embd.weight")?;
     }
 
     // ── persistent state buffers (f32, zero-init), one set per layer by kind ──────────────────────

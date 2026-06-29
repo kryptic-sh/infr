@@ -16,7 +16,7 @@ use infr_core::{
     WeightSource,
 };
 use memmap2::Mmap;
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{collections::HashMap, fs::File, path::Path, sync::Arc};
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
@@ -30,11 +30,34 @@ const DEFAULT_ALIGNMENT: usize = 32; // GGUF_DEFAULT_ALIGNMENT
 /// The `Mmap` handle keeps the backing memory alive for the lifetime of this
 /// struct; `tensor_bytes` returns slices directly into that region.
 pub struct Gguf {
-    mmap: Mmap,
+    mmap: Arc<Mmap>,
     metadata: Metadata,
     tensors: Vec<TensorInfo>,
     /// Absolute byte offset into `mmap` where tensor data begins.
     data_region_start: usize,
+}
+
+/// An owning, ref-counted view of a tensor's bytes in the mmap'd file — a zero-copy `[u8]` slice that
+/// keeps the whole `Mmap` alive via `Arc`, so it can outlive the borrow of `&Gguf` (e.g. a CPU
+/// backend buffer that reads weights straight from the mapping with no `memcpy`).
+#[derive(Clone)]
+pub struct TensorBytes {
+    mmap: Arc<Mmap>,
+    off: usize,
+    len: usize,
+}
+
+impl std::ops::Deref for TensorBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.mmap[self.off..self.off + self.len]
+    }
+}
+
+impl AsRef<[u8]> for TensorBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
 }
 
 // ─── byte-cursor ──────────────────────────────────────────────────────────────
@@ -363,10 +386,35 @@ impl Gguf {
         }; // ← borrow of `mmap` ends here
 
         Ok(Gguf {
-            mmap,
+            mmap: Arc::new(mmap),
             metadata,
             tensors,
             data_region_start,
+        })
+    }
+
+    /// Zero-copy, ref-counted view of a tensor's raw bytes (keeps the `Mmap` alive via `Arc`). Unlike
+    /// [`WeightSource::tensor_bytes`] the result is not borrow-bound to `&self`, so a backend can hold
+    /// it as a weight buffer and read straight from the mapping — no `memcpy` into owned RAM.
+    pub fn tensor_bytes_arc(&self, name: &str) -> Result<TensorBytes> {
+        let info = self
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| Error::Loader(format!("tensor not found: '{name}'")))?;
+        let off = self.data_region_start + info.offset as usize;
+        let len = info.nbytes;
+        if off + len > self.mmap.len() {
+            return Err(Error::Loader(format!(
+                "tensor '{name}' byte range {off}..{} exceeds file size {}",
+                off + len,
+                self.mmap.len()
+            )));
+        }
+        Ok(TensorBytes {
+            mmap: Arc::clone(&self.mmap),
+            off,
+            len,
         })
     }
 }

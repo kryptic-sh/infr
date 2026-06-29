@@ -14,12 +14,13 @@ A from-the-metal inference server that works across AMD / NVIDIA / Intel
 
 ## Status
 
-Runs **Llama / Qwen2 / Qwen3** (dense) and **Gemma 3** (dense, sliding-window
-attention + QK-norm + GeGLU) on the Vulkan backend, competitive with llama.cpp
-at long context (`infr compare`). **Qwen3.5 / Qwen3.6** (`qwen35` / Qwen3-Next —
-hybrid gated-DeltaNet + attention) run via a CPU reference (`docs/QWEN35.md`); a
-Vulkan/hybrid path is planned. DiffusionGemma (the original target) is future
-work.
+Runs **Llama / Qwen2 / Qwen3** (dense), **Gemma 3** (dense, sliding-window
+attention + QK-norm + GeGLU), and **Gemma 4** (per-layer heterogeneous head
+dims, proportional RoPE, V-norm, per-layer output scale) on the Vulkan backend,
+competitive with llama.cpp at long context (`infr compare`). **Qwen3.5 /
+Qwen3.6** (`qwen35` / Qwen3-Next — hybrid gated-DeltaNet + attention) run via a
+CPU reference (`docs/QWEN35.md`); a Vulkan/hybrid path is planned.
+DiffusionGemma (the original target) is future work.
 
 ```bash
 infr pull   <model-ref>        # org/repo[:quant] (HuggingFace) | path to a .gguf
@@ -79,8 +80,8 @@ greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
 ## Scope
 
 - **Format:** GGUF
-- **Models:** Llama / Qwen3 / Gemma 3 dense (GPU); Qwen3.5/3.6 (CPU ref);
-  DiffusionGemma (planned)
+- **Models:** Llama / Qwen3 / Gemma 3 / Gemma 4 dense (GPU); Qwen3.5/3.6 (CPU
+  ref); DiffusionGemma (planned)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul)
 - **Store:** own cache at `$XDG_CACHE_HOME/infr/models` (standalone HF + Ollama
   HTTP pulls)

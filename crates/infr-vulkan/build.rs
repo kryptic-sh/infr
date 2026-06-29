@@ -32,6 +32,7 @@ fn main() {
         ("rmsnorm", "rmsnorm", &[]),
         ("add", "add", &[]),
         ("add_scaled", "add_scaled", &[]),
+        ("scale", "scale", &[]),
         ("gather_rows", "gather_rows", &[]),
         ("scatter_add_rows", "scatter_add_rows", &[]),
         ("silu_mul", "silu_mul", &[]),

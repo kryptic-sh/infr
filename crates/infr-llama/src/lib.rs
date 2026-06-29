@@ -359,6 +359,9 @@ struct LayerWeights {
     // residual add (`post_attention_norm` / `post_ffw_norm`). `None` for llama/qwen3.
     post_attn_norm_buf: Option<Box<dyn Buffer>>,
     post_ffw_norm_buf: Option<Box<dyn Buffer>>,
+    /// gemma4 per-layer output scale (`layer_output_scale.weight`, a single scalar ~0.005–0.9): the
+    /// whole layer output is multiplied by this before the next layer. `None` for other models.
+    out_scale: Option<f32>,
 }
 
 impl LayerWeights {
@@ -2551,6 +2554,19 @@ impl Llama {
             } else {
                 (None, None)
             };
+            // gemma4 per-layer output scale: a single scalar that multiplies the layer output.
+            let out_scale = if g
+                .tensors()
+                .iter()
+                .any(|t| t.name == p("layer_output_scale.weight"))
+            {
+                load_tensor_dequant(&g, &p("layer_output_scale.weight"))?
+                    .0
+                    .first()
+                    .copied()
+            } else {
+                None
+            };
             layers.push(LayerWeights {
                 attn_norm,
                 ffn_norm,
@@ -2570,6 +2586,7 @@ impl Llama {
                 k_norm_buf,
                 post_attn_norm_buf,
                 post_ffw_norm_buf,
+                out_scale,
             });
             pb.inc(layer_bytes(l));
         }
@@ -3566,13 +3583,7 @@ impl Llama {
                 }
             }
         };
-        let dbg_maxl: Option<usize> = std::env::var("INFR_G4_MAXLAYERS")
-            .ok()
-            .and_then(|v| v.parse().ok());
         for (li, layer) in self.layers.iter().enumerate() {
-            if dbg_maxl.is_some_and(|ml| li >= ml) {
-                break; // debug: truncate the stack to localize a bad layer
-            }
             // Per-layer dims (gemma4: SWA vs full differ in head_dim / KV-heads / rope dim+base;
             // uniform for every other model, so these shadow the outer values with the same numbers).
             let hd = c.layer_head_dim(li);
@@ -3582,10 +3593,7 @@ impl Llama {
             let rope_theta = c.layer_rope_theta(li);
             // gemma4 attends with scale 1.0 (QK-norm controls the magnitude); everyone else 1/√hd.
             let attn_scale = if c.gemma4 {
-                std::env::var("INFR_G4_SCALE")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1.0)
+                1.0
             } else {
                 1.0 / (hd as f32).sqrt()
             };
@@ -3709,16 +3717,14 @@ impl Llama {
                 // gemma4 applies a weightless per-head RMSNorm to V before caching (rmsnorm with a
                 // unit weight = x/rms). Done in place on the f32 `vr` prior to the f16 cast-store.
                 if let Some(ones) = &v_ones {
-                    if std::env::var("INFR_G4_NOVNORM").is_err() {
-                        rec.rmsnorm(
-                            vr.as_ref(),
-                            ones.as_ref(),
-                            vr.as_ref(),
-                            n * nkv,
-                            hd,
-                            c.rms_eps,
-                        );
-                    }
+                    rec.rmsnorm(
+                        vr.as_ref(),
+                        ones.as_ref(),
+                        vr.as_ref(),
+                        n * nkv,
+                        hd,
+                        c.rms_eps,
+                    );
                 }
                 // v_raw is f32; cast into the f16 V cache at row offset `pos`.
                 rec.store_f16(vr.as_ref(), kv.v[li].as_ref(), n * kvrow, pos * kvrow);
@@ -3950,6 +3956,10 @@ impl Llama {
                     ne,
                 );
             }
+            // gemma4: multiply the whole layer output by the per-layer scalar before the next layer.
+            if let Some(s) = layer.out_scale {
+                rec.scale(hidden.as_ref(), s, n * ne);
+            }
         }
         // final norm + lm_head on the LAST row only: copy hidden[n-1] → hlast, norm it, project.
         rec.copy(hidden.as_ref(), (n - 1) * ne * 4, hlast.as_ref(), 0, ne * 4);
@@ -3978,12 +3988,6 @@ impl Llama {
             .map_err(|e| anyhow!("{e}"))?;
         kv.len += n;
         let mut out: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
-        if std::env::var("INFR_DUMP_LOGITS").is_ok() {
-            let mut idx: Vec<usize> = (0..out.len()).collect();
-            idx.sort_by(|&a, &b| out[b].partial_cmp(&out[a]).unwrap());
-            let top: Vec<(usize, f32)> = idx.iter().take(6).map(|&i| (i, out[i])).collect();
-            eprintln!("[logits] pos={} top6={top:?}", kv.len);
-        }
         // gemma4 final logit softcap: `logits = cap * tanh(logits / cap)`. Cheap host-side pass over
         // the single returned row (no shader needed).
         if c.final_softcap > 0.0 {

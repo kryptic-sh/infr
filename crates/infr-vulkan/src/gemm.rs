@@ -419,6 +419,12 @@ pub(crate) fn add_scaled_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the in-place scalar multiply (`y *= scale`). gemma4 per-layer output scale.
+pub(crate) fn scale_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scale.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the row gather (`dst[j]=src[idx[j]]`).
 pub(crate) fn gather_rows_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gather_rows.spv"));

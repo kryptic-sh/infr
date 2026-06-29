@@ -2320,6 +2320,15 @@ impl<'a> Recorder<'a> {
 
     /// `acc += scale * x` (axpy), in place into `acc`. Accumulates weighted MoE expert outputs into
     /// the resident hidden state on the GPU (chained across experts via WAW barriers on `acc`).
+    /// In-place elementwise scalar multiply: `y[i] *= scale` for `i < n` (gemma4 layer output scale).
+    pub fn scale(&self, y: &dyn Buffer, scale: f32, n: usize) {
+        let k = self.be.kernel("scale", crate::gemm::scale_spv(), 1, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch(k, &[Self::vkb(y)], 1, &push, (n as u32).div_ceil(64));
+    }
+
     pub fn add_scaled(&self, x: &dyn Buffer, acc: &dyn Buffer, scale: f32, n: usize) {
         let k = self
             .be
@@ -2783,6 +2792,150 @@ mod tests {
     fn attention_kv_prefill_matches_cpu() {
         run_attn_kv(17, 17, 9, 3, 64);
         run_attn_kv(40, 1500, 9, 3, 64); // multi-tile prefill (kv_len > TILE)
+                                         // gemma4: SWA layers (hd=256, GQA 16:8) and full layers (hd=512, GQA 16:1).
+        run_attn_kv(17, 17, 16, 8, 256);
+        run_attn_kv(17, 17, 16, 1, 512);
+        run_attn_kv(1, 200, 16, 1, 512); // gemma4 full-layer decode
+    }
+
+    // upload f32 values as an f32 buffer (qk_norm_rope reads x / nw / freq_factors as f32).
+    fn upf32(be: &VulkanBackend, v: &[f32]) -> Box<dyn Buffer> {
+        let b = be.alloc(v.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+        b
+    }
+
+    /// CPU reference for fused per-head QK-norm (RMSNorm over hd) + NEOX RoPE (optional freq_factors).
+    #[allow(clippy::too_many_arguments)]
+    fn qk_norm_rope_cpu(
+        x: &[f32],
+        nw: &[f32],
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        eps: f32,
+        ff: Option<&[f32]>,
+    ) -> Vec<f32> {
+        let mut y = vec![0f32; (out_base + rows) * nheads * hd];
+        let hf = rope_dim / 2;
+        for r in 0..rows {
+            for h in 0..nheads {
+                let ib = (r * nheads + h) * hd;
+                let ss: f32 = (0..hd).map(|i| x[ib + i] * x[ib + i]).sum::<f32>() / hd as f32;
+                let scale = 1.0 / (ss + eps).sqrt();
+                let ob = ((out_base + r) * nheads + h) * hd;
+                for p in 0..hf {
+                    let (i0, i1) = (p, p + hf);
+                    let a = x[ib + i0] * scale * nw[i0];
+                    let b = x[ib + i1] * scale * nw[i1];
+                    let freq = theta.powf(-2.0 * p as f32 / rope_dim as f32);
+                    let mut ang = (rope_pos + r) as f32 * freq;
+                    if let Some(ff) = ff {
+                        ang /= ff[p];
+                    }
+                    let (s, c) = (ang.sin(), ang.cos());
+                    y[ob + i0] = a * c - b * s;
+                    y[ob + i1] = a * s + b * c;
+                }
+            }
+        }
+        y
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_qk_norm_rope(
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        rope_pos: usize,
+        out_base: usize,
+        with_ff: bool,
+    ) {
+        let be = VulkanBackend::new().unwrap();
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        let x = gen(rows * nheads * hd, 1);
+        let nw: Vec<f32> = gen(hd, 2).iter().map(|v| v + 1.05).collect(); // ~gemma norm weights near 1
+                                                                          // proportional-rope freq_factors: first quarter rotate (1.0), rest unrotated (1e30) — like gemma4
+        let ff: Vec<f32> = (0..rope_dim / 2)
+            .map(|p| if p < rope_dim / 4 { 1.0 } else { 1e30 })
+            .collect();
+        let bx = upf32(&be, &x);
+        let bnw = upf32(&be, &nw);
+        let bff = upf32(&be, &ff);
+        let y_len = (out_base + rows) * nheads * hd;
+        let by = be.alloc(y_len * 2, BufferUsage::Readback).unwrap(); // f16 out
+        let rec = be.recorder().unwrap();
+        rec.qk_norm_rope(
+            bx.as_ref(),
+            bnw.as_ref(),
+            by.as_ref(),
+            rows,
+            nheads,
+            hd,
+            rope_dim,
+            theta,
+            rope_pos,
+            out_base,
+            1e-6,
+            if with_ff { Some(bff.as_ref()) } else { None },
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; y_len * 2];
+        be.download(by.as_ref(), &mut bytes).unwrap();
+        let got: Vec<f32> = bytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .collect();
+        let want = qk_norm_rope_cpu(
+            &x,
+            &nw,
+            rows,
+            nheads,
+            hd,
+            rope_dim,
+            theta,
+            rope_pos,
+            out_base,
+            1e-6,
+            if with_ff { Some(&ff) } else { None },
+        );
+        // compare only the rows the kernel actually wrote (out_base..out_base+rows)
+        let mut err = 0f32;
+        for r in 0..rows {
+            for h in 0..nheads {
+                for i in 0..hd {
+                    let idx = ((out_base + r) * nheads + h) * hd + i;
+                    err = err.max((got[idx] - want[idx]).abs());
+                }
+            }
+        }
+        println!(
+            "qk_norm_rope rows={rows} nheads={nheads} hd={hd} rope_dim={rope_dim} ff={with_ff} max_err={err:e}"
+        );
+        assert!(err < 1e-2, "qk_norm_rope mismatch: {err}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn qk_norm_rope_matches_cpu() {
+        run_qk_norm_rope(8, 4, 128, 128, 1e6, 0, 0, false); // qwen3 hd=128
+        run_qk_norm_rope(8, 4, 256, 256, 1e4, 0, 0, false); // gemma3 hd=256
+        run_qk_norm_rope(17, 16, 256, 256, 1e4, 5, 0, false); // gemma4 SWA Q (out_base=0)
+        run_qk_norm_rope(17, 8, 256, 256, 1e4, 5, 5, false); // gemma4 SWA K (out_base=pos)
+        run_qk_norm_rope(17, 16, 512, 512, 1e6, 5, 0, false); // gemma4 full Q
+        run_qk_norm_rope(17, 1, 512, 512, 1e6, 5, 5, false); // gemma4 full K
+        run_qk_norm_rope(17, 16, 512, 512, 1e6, 5, 0, true); // gemma4 full Q + freq_factors
+        run_qk_norm_rope(17, 1, 512, 512, 1e6, 5, 5, true); // gemma4 full K + freq_factors
     }
 
     #[test]

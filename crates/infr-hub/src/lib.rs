@@ -1,15 +1,9 @@
-//! Model acquisition: resolve a reference to a local GGUF, pulling from HuggingFace or the Ollama
-//! registry over plain HTTP (no external CLI). Downloads land in **our own** content-addressed
-//! store (never the system Ollama dirs), with resume + a progress bar.
+//! Model acquisition: resolve an `hf:org/repo[:quant]` reference (or a plain path) to a local GGUF,
+//! pulling from HuggingFace over plain HTTP (no external CLI) with resume + a progress bar.
 //!
-//! See PLAN.md §"fetch / model acquisition (infr-hub)". Store layout (root = `$INFR_MODELS` or
-//! `$XDG_CACHE_HOME/infr/models`):
-//!
-//! ```text
-//!   manifests/registry.ollama.ai/<ns>/<name>/<tag>   (ollama pulls)
-//!   manifests/huggingface.co/<org>/<repo>/<file>     (hf pulls)
-//!   blobs/sha256-<digest>                            (layer blobs; model layer == GGUF)
-//! ```
+//! Models live in the **standard HF Hub cache** (`~/.cache/huggingface/hub`), shared with llama.cpp
+//! and `huggingface_hub`, so `infr run hf:org/repo:Q4_K_M` and `llama-cli -hf org/repo:Q4_K_M` use
+//! the same files — see [`store`] for the layout.
 
 mod model_ref;
 mod pull;

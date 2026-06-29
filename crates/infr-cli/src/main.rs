@@ -17,7 +17,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Download + cache a model (hf:org/repo[:file] | ollama:name[:tag] | path).
+    /// Download + cache a model (`org/repo[:quant]` from HuggingFace, or a path to a `.gguf`).
     Pull { model: String },
     /// Interactive terminal chat (auto-pulls if missing).
     Run {
@@ -132,9 +132,9 @@ use anyhow::{anyhow, Context};
 use std::path::{Path, PathBuf};
 
 /// Resolve a model arg to (gguf_path, optional tokenizer_json_path).
-/// Accept a path to a `.gguf` or an `hf:`/`ollama:` ref resolved via infr-hub. The tokenizer is the
-/// `tokenizer.json` beside the GGUF if present, else `None` → derived from the GGUF's embedded vocab
-/// (ollama blobs are content-addressed with no sidecar).
+/// Accept a path to a `.gguf` or an `org/repo[:quant]` HuggingFace ref resolved via infr-hub. The
+/// tokenizer is the `tokenizer.json` beside the GGUF if present, else `None` → derived from the
+/// GGUF's embedded vocab (HF Hub blobs are content-addressed with no sidecar).
 fn resolve(model: &str) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
     let gguf = if Path::new(model).exists() {
         PathBuf::from(model)
@@ -586,7 +586,7 @@ fn cmd_compare(
     use std::process::Command;
     let exe = std::env::current_exe().context("locating the infr binary")?;
     let reps_s = reps.to_string();
-    // llama-bench can't resolve infr's `hf:`/`ollama:` refs — give it the local GGUF blob path.
+    // llama-bench wants a concrete file — give it the resolved GGUF path from the shared cache.
     let model_path = resolve(model)?.0;
     let model_path = model_path.to_string_lossy().into_owned();
 

@@ -1,7 +1,9 @@
 //! CPU reference backend — a correctness-first interpreter of the backend-agnostic
-//! [`infr_core`] compute [`Graph`]. No SIMD, no threading yet: every op is a plain scalar loop,
-//! quantized weights are dequantized on the host (cached). It exists to (a) run every model
-//! without a GPU and (b) serve as the oracle the GPU backends are validated against.
+//! [`infr_core`] compute [`Graph`]. No SIMD, no threading yet: every op is a plain scalar loop.
+//! The bulk projection weights (`Op::Linear`) are streamed one row at a time straight from their
+//! native GGUF bytes and dequantized inside the dot — never materialized in f32 — so 12B / MoE
+//! models fit in memory. Only the tiny norm weights are dequant-cached. It exists to (a) run every
+//! model without a GPU and (b) serve as the oracle the GPU backends are validated against.
 //!
 //! Lives in `infr-llama` for now (next to [`crate::dequant_block`] + the qwen35 CPU oracle) to
 //! avoid a circular crate dep; it implements the agnostic `infr_core::Backend` trait, so it can be
@@ -47,7 +49,9 @@ impl Plan for CpuPlan {
 #[derive(Default)]
 pub struct CpuBackend {
     /// Dequantized-weight cache keyed by the bound buffer's address (weights are bound the same
-    /// every step, so dequant once and reuse — otherwise we'd dequant the whole model per token).
+    /// every step, so dequant once and reuse). Only the small norm weights (`RmsNorm` / `QkNorm`)
+    /// land here — the large `Op::Linear` weights are streamed row-by-row instead (see that arm),
+    /// so this never holds the whole model in f32.
     weight_cache: Mutex<HashMap<usize, Arc<Vec<f32>>>>,
 }
 
@@ -127,8 +131,8 @@ impl Backend for CpuBackend {
             .expect("cpu backend: plan is not a CpuPlan")
             .graph;
 
-        // f32 working store for every Input/Internal/Output handle (weights are read on demand from
-        // the dequant cache, never materialized here — that would re-dequant the model each step).
+        // f32 working store for every Input/Internal/Output handle (weights are read on demand:
+        // norms via the small dequant cache, `Op::Linear` weights streamed row-by-row).
         let mut vals: Vec<Vec<f32>> = vec![Vec::new(); g.tensors.len()];
         for (i, decl) in g.tensors.iter().enumerate() {
             match decl.kind {
@@ -220,15 +224,23 @@ impl Backend for CpuBackend {
                 } => {
                     let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
                     let xs = &vals[x.0 as usize];
-                    let ws = weight(w); // row-major [out_f, in_f]: row o = ws[o*in_f .. o*in_f+in_f]
+                    // Stream the (row-major [out_f, in_f]) weight one row at a time straight from its
+                    // native bytes, dequantizing inside the dot — never materialize the whole
+                    // (possibly quantized) weight in f32. Peak extra memory is one dequant'd row, so
+                    // big / MoE models fit. GGUF rows are block-aligned, so each row is an equal
+                    // `bytes/out_f` slice. (Re-dequant per step — perf is a later pass, PLAN.md §1.)
+                    let buf = bindings.get(w).expect("cpu backend: unbound Weight");
+                    let bytes = cpu_buf(buf).data.lock().unwrap();
+                    let dt = g.desc(w).dtype;
+                    let bpr = bytes.len() / out_f; // bytes per weight row
                     let mut out = vec![0f32; m * out_f];
-                    for r in 0..m {
-                        let xb = r * in_f;
-                        for o in 0..out_f {
-                            let wb = o * in_f;
+                    for o in 0..out_f {
+                        let row = bytes_to_f32(&bytes[o * bpr..o * bpr + bpr], dt);
+                        for r in 0..m {
+                            let xb = r * in_f;
                             let mut acc = 0f32;
                             for k in 0..in_f {
-                                acc += ws[wb + k] * xs[xb + k];
+                                acc += row[k] * xs[xb + k];
                             }
                             out[r * out_f + o] = acc;
                         }

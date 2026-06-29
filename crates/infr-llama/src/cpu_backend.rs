@@ -21,7 +21,7 @@ use infr_core::WeightSource;
 use infr_gguf::{Gguf, TensorBytes};
 use rayon::prelude::*;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// Timing/counts from a CPU generation, for the caller's stats line.
@@ -355,11 +355,32 @@ impl Backend for CpuBackend {
         // f32 working store for every Input/Internal/Output handle (weights are read on demand:
         // norms via the small dequant cache, `Op::Linear` weights streamed row-by-row).
         let mut vals: Vec<Vec<f32>> = vec![Vec::new(); g.tensors.len()];
+        // KV-cache tensors (the `cache` of `WriteKv`, the `k_cache`/`v_cache` of `Attention`) are
+        // accessed straight from their bound buffers — `WriteKv` writes one row, `Attention` reads
+        // `kv_len` rows. They're sized for the WHOLE context (`max_ctx`), so loading them into `vals`
+        // (and writing them back) each token would cost O(max_ctx) memory traffic per token instead of
+        // O(kv_len) — catastrophic at a large `max_new`. Skip the round-trip for them.
+        let mut direct: HashSet<u32> = HashSet::new();
+        for op in &g.ops {
+            match op {
+                Op::WriteKv { cache, .. } => {
+                    direct.insert(cache.0);
+                }
+                Op::Attention {
+                    k_cache, v_cache, ..
+                } => {
+                    direct.insert(k_cache.0);
+                    direct.insert(v_cache.0);
+                }
+                _ => {}
+            }
+        }
         for (i, decl) in g.tensors.iter().enumerate() {
             match decl.kind {
                 TensorKind::Internal | TensorKind::Output => {
                     vals[i] = vec![0f32; decl.desc.numel()]
                 }
+                TensorKind::Input if direct.contains(&(i as u32)) => {} // read/written in place
                 TensorKind::Input => {
                     let buf = bindings
                         .get(TensorId(i as u32))
@@ -532,10 +553,14 @@ impl Backend for CpuBackend {
                     pos,
                 } => {
                     let (rows, rs, pos) = (rows as usize, row_stride as usize, pos as usize);
-                    let s = vals[src.0 as usize].clone();
-                    let dst = &mut vals[cache.0 as usize];
+                    let s = &vals[src.0 as usize];
+                    // Write the new row(s) straight into the persistent KV buffer (f32) — only `rows`
+                    // rows touched, not the whole `max_ctx`-sized cache.
+                    let buf = bindings.get(cache).expect("cpu backend: unbound KV cache");
+                    let mut d = cpu_buf(buf).owned();
+                    let df: &mut [f32] = bytemuck::cast_slice_mut(&mut d);
                     let base = pos * rs;
-                    dst[base..base + rows * rs].copy_from_slice(&s[..rows * rs]);
+                    df[base..base + rows * rs].copy_from_slice(&s[..rows * rs]);
                 }
                 Op::Attention {
                     q,
@@ -559,8 +584,14 @@ impl Backend for CpuBackend {
                         head_dim as usize,
                     );
                     let qs = &vals[q.0 as usize];
-                    let ks = &vals[k_cache.0 as usize];
-                    let vs = &vals[v_cache.0 as usize];
+                    // K/V live in their persistent buffers (f32); borrow them — attention reads only
+                    // the first `kv_len` rows, never the whole `max_ctx` cache.
+                    let kbuf = bindings.get(k_cache).expect("cpu backend: unbound k_cache");
+                    let vbuf = bindings.get(v_cache).expect("cpu backend: unbound v_cache");
+                    let kguard = cpu_buf(kbuf).read();
+                    let vguard = cpu_buf(vbuf).read();
+                    let ks: &[f32] = bytemuck::cast_slice(&kguard);
+                    let vs: &[f32] = bytemuck::cast_slice(&vguard);
                     let group = nh / nkv;
                     let window = match mask {
                         AttnMask::Causal => 0usize,
@@ -872,11 +903,14 @@ impl Backend for CpuBackend {
             }
         }
 
-        // Write back the buffers the model reads after execute: Outputs (logits) and mutated
-        // Inputs (the KV cache). Weights are read-only; positions are I32 and unchanged.
+        // Write back the buffers the model reads after execute: Outputs (logits) and mutated f32
+        // Inputs (conv/recurrent state). KV caches (`direct`) were written in place by `WriteKv`, so
+        // they're skipped — no full-cache copy. Weights are read-only; positions are I32, unchanged.
         for (i, decl) in g.tensors.iter().enumerate() {
             let write_back = matches!(decl.kind, TensorKind::Output)
-                || (decl.kind == TensorKind::Input && decl.desc.dtype == DType::F32);
+                || (decl.kind == TensorKind::Input
+                    && decl.desc.dtype == DType::F32
+                    && !direct.contains(&(i as u32)));
             if !write_back {
                 continue;
             }

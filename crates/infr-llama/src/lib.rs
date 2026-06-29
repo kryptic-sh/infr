@@ -40,7 +40,19 @@ pub struct Config {
     pub n_head: usize,
     pub n_kv: usize,
     pub n_embd: usize,
+    /// Dense FFN inner width. For models with a uniform FFN this is the width every layer uses; for
+    /// gemma4 E2B (per-layer FFN array) it's the MAX over layers, used to size shared FFN scratch.
     pub n_ff: usize,
+    /// Per-layer FFN inner width. gemma4 E2B stores `feed_forward_length` as an array (most 6144, the
+    /// late layers 12288); every other model is uniform (all entries equal `n_ff`).
+    pub n_ff_layers: Vec<usize>,
+    /// gemma4 gemma3n-style per-layer input embeddings: the width of each layer's extra input vector
+    /// (`embedding_length_per_layer_input`, 256 for E2B). `0` = the model has no per-layer embeddings.
+    pub n_embd_per_layer: usize,
+    /// gemma4 E2B KV sharing (gemma3n): only the first `n_layer_kv_from_start` layers compute + cache
+    /// their own K/V; later layers reuse an earlier layer's cache (SWA→`from_start-2`, full→`-1`).
+    /// Equal to `n_layer` (every layer owns its KV) for models without sharing.
+    pub n_layer_kv_from_start: usize,
     pub head_dim: usize,
     pub rope_dim: usize,
     pub rope_theta: f32,
@@ -112,6 +124,30 @@ impl Config {
             self.n_kv_swa
         } else {
             self.n_kv
+        }
+    }
+
+    /// FFN inner width for layer `il`. gemma4 E2B's late layers are wider (12288 vs 6144); uniform
+    /// (`n_ff`) for every other model.
+    pub fn layer_n_ff(&self, il: usize) -> usize {
+        self.n_ff_layers.get(il).copied().unwrap_or(self.n_ff)
+    }
+
+    /// Whether layer `il` computes + caches its own K/V. gemma4 E2B's later layers (`il >=
+    /// n_layer_kv_from_start`) reuse an earlier layer's cache instead. `true` for every layer of a
+    /// non-sharing model.
+    pub fn has_own_kv(&self, il: usize) -> bool {
+        il < self.n_layer_kv_from_start
+    }
+
+    /// The cache layer whose K/V layer `il` attends to. For an own-KV layer that's `il` itself; for a
+    /// gemma4 E2B shared layer it's `n_layer_kv_from_start - (2 if SWA else 1)` (matching llama.cpp's
+    /// gemma3n/gemma4 reuse: SWA shared layers reuse the last own SWA layer, full the last own full).
+    pub fn kv_src_layer(&self, il: usize) -> usize {
+        if self.has_own_kv(il) {
+            il
+        } else {
+            self.n_layer_kv_from_start - if self.is_swa_layer(il) { 2 } else { 1 }
         }
     }
 
@@ -362,6 +398,12 @@ struct LayerWeights {
     /// gemma4 per-layer output scale (`layer_output_scale.weight`, a single scalar ~0.005–0.9): the
     /// whole layer output is multiplied by this before the next layer. `None` for other models.
     out_scale: Option<f32>,
+    /// gemma4 E2B per-layer input-embedding weights (gemma3n mechanism). `None` unless the model has
+    /// per-layer embeddings. `inp_gate` [n_embd→npl] gates the layer output, multiplied by the layer's
+    /// per-layer input slice (GeGLU), `proj` [npl→n_embd] projects back, `post_norm` RMSNorms it.
+    pl_inp_gate: Option<Wt>,
+    pl_proj: Option<Wt>,
+    pl_post_norm: Option<Box<dyn Buffer>>,
 }
 
 impl LayerWeights {
@@ -442,6 +484,18 @@ fn draw_u(rng: &mut u64) -> f32 {
     (x >> 40) as f32 / (1u64 << 24) as f32
 }
 
+/// gemma4 E2B (gemma3n) per-layer input-embedding global tensors. The per-(token,layer) input vector
+/// is `((model_proj·scaled_embd)·1/√n_embd, RMSNorm'd) + (tok_embd_row × √npl)) × 1/√2`.
+struct PerLayerEmbd {
+    npl: usize,                       // per-layer embedding width (256)
+    n_layer: usize,                   // number of layers (35)
+    n_embd: usize,                    // model width (1536)
+    model_proj: Vec<f32>, // [npl*n_layer rows, n_embd] host f32 (row k = the n_embd vector to dot)
+    proj_norm: Vec<f32>,  // [npl] RMSNorm weight over the per-layer dim
+    tok_embd_dtype: infr_core::DType, // per_layer_token_embd dtype (gathered per token from the gguf)
+    tok_embd_row_bytes: usize,        // bytes per token row (npl*n_layer elements)
+}
+
 pub struct Llama {
     be: VulkanBackend,
     cfg: Config,
@@ -452,6 +506,9 @@ pub struct Llama {
     /// gemma4 proportional-rope frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`), used by the
     /// full-attention layers only. `None` for models without proportional rope.
     rope_freqs: Option<Box<dyn Buffer>>,
+    /// gemma4 E2B per-layer input-embedding global tensors. `None` unless the model has per-layer
+    /// embeddings (only E2B/E4B gemma4 variants).
+    per_layer_embd: Option<PerLayerEmbd>,
     layers: Vec<LayerWeights>,
     tokenizer: Tokenizer,
     /// Same vocab as `tokenizer` but with `encode_special_tokens(true)` → special-token strings in
@@ -2222,8 +2279,24 @@ impl Llama {
         let n_embd = meta_u64(&g, &mk("embedding_length")).context("embedding_length")? as usize;
         let n_head = meta_u64(&g, &mk("attention.head_count")).context("head_count")? as usize;
         let n_kv = meta_u64(&g, &mk("attention.head_count_kv")).unwrap_or(n_head as u64) as usize;
-        let n_ff =
-            meta_u64(&g, &mk("feed_forward_length")).context("feed_forward_length")? as usize;
+        // FFN width: a scalar for most models, but gemma4 E2B stores `feed_forward_length` as a
+        // per-layer INT array (most 6144, late layers 12288). Read either; `n_ff` = the max (sizes the
+        // shared FFN scratch), `n_ff_layers` = the per-layer widths (uniform = the scalar for others).
+        let n_ff_layers: Vec<usize> = if let Some(arr) = g
+            .metadata()
+            .get(&mk("feed_forward_length"))
+            .and_then(MetaValue::as_arr)
+        {
+            arr.iter()
+                .filter_map(MetaValue::as_u64)
+                .map(|v| v as usize)
+                .collect()
+        } else {
+            let ff =
+                meta_u64(&g, &mk("feed_forward_length")).context("feed_forward_length")? as usize;
+            vec![ff; n_layer]
+        };
+        let n_ff = n_ff_layers.iter().copied().max().unwrap_or(0);
         // MoE (qwen3moe): softmax router over `n_expert`, top-`n_used`, per-expert SwiGLU of inner
         // size `n_ff_exp` (the GGUF `expert_feed_forward_length`).
         let moe = if arch == "qwen3moe" {
@@ -2352,6 +2425,21 @@ impl Llama {
         } else {
             0.0
         };
+        // gemma4 E2B (gemma3n-derived) per-layer input embeddings: each layer gets an extra input
+        // vector of this width mixed in after its FFN. Absent (0) on the dense gemma4-12b path.
+        let n_embd_per_layer = if gemma4 {
+            meta_u64(&g, &mk("embedding_length_per_layer_input")).unwrap_or(0) as usize
+        } else {
+            0
+        };
+        // gemma4 E2B KV sharing: `shared_kv_layers` layers at the end reuse earlier caches, so only the
+        // first `n_layer - shared_kv_layers` compute their own K/V. Absent (= no sharing) on gemma4-12b.
+        let n_layer_kv_from_start = if gemma4 {
+            let shared = meta_u64(&g, &mk("attention.shared_kv_layers")).unwrap_or(0) as usize;
+            n_layer.saturating_sub(shared)
+        } else {
+            n_layer
+        };
         let eos = meta_u64(&g, "tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
 
         let be = VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
@@ -2476,6 +2564,32 @@ impl Llama {
         } else {
             None
         };
+        // gemma4 E2B global per-layer-embd tensors: model_proj (BF16, dequant to host f32) and
+        // proj_norm (F32). The big per_layer_token_embd stays quantized in the mmap'd gguf and is
+        // gathered per token at forward time (one row = npl*n_layer values, dequant just that row).
+        let per_layer_embd = if n_embd_per_layer > 0 {
+            let (model_proj, _) = load_tensor_dequant(&g, "per_layer_model_proj.weight")?;
+            let (proj_norm, _) = load_tensor_dequant(&g, "per_layer_proj_norm.weight")?;
+            let te = g
+                .tensors()
+                .iter()
+                .find(|t| t.name == "per_layer_token_embd.weight")
+                .ok_or_else(|| anyhow!("per_layer_token_embd.weight not found"))?;
+            // Bytes per token row = total bytes / vocab (te shape is GGUF [npl*n_layer, vocab]).
+            let te_vocab = *te.shape.last().unwrap();
+            let tok_embd_row_bytes = te.nbytes / te_vocab;
+            Some(PerLayerEmbd {
+                npl: n_embd_per_layer,
+                n_layer,
+                n_embd,
+                model_proj,
+                proj_norm,
+                tok_embd_dtype: te.dtype,
+                tok_embd_row_bytes,
+            })
+        } else {
+            None
+        };
 
         // Loading the per-layer weights (dequant + GPU upload) dominates startup, especially for
         // big models — show a byte-progress bar so it reports copy speed + ETA (same shared style as
@@ -2567,6 +2681,20 @@ impl Llama {
             } else {
                 None
             };
+            // gemma4 E2B per-layer input-embedding weights (gate / proj / post-norm). All present iff
+            // the model has per-layer embeddings; absent on dense gemma4-12b.
+            let (pl_inp_gate, pl_proj, pl_post_norm) = if n_embd_per_layer > 0 {
+                (
+                    Some(up(&be, p("inp_gate.weight"))?),
+                    Some(up(&be, p("proj.weight"))?),
+                    Some(
+                        be.upload_weight(&load_tensor_dequant(&g, &p("post_norm.weight"))?.0)
+                            .map_err(|e| anyhow!("upload post_norm {l}: {e}"))?,
+                    ),
+                )
+            } else {
+                (None, None, None)
+            };
             layers.push(LayerWeights {
                 attn_norm,
                 ffn_norm,
@@ -2587,6 +2715,9 @@ impl Llama {
                 post_attn_norm_buf,
                 post_ffw_norm_buf,
                 out_scale,
+                pl_inp_gate,
+                pl_proj,
+                pl_post_norm,
             });
             pb.inc(layer_bytes(l));
         }
@@ -2617,6 +2748,9 @@ impl Llama {
             n_kv,
             n_embd,
             n_ff,
+            n_ff_layers,
+            n_embd_per_layer,
+            n_layer_kv_from_start,
             head_dim,
             rope_dim,
             rope_theta,
@@ -2644,6 +2778,7 @@ impl Llama {
             output_norm,
             output_norm_buf,
             rope_freqs,
+            per_layer_embd,
             layers,
             tokenizer,
             user_tokenizer,
@@ -3304,6 +3439,64 @@ impl Llama {
         } else {
             None
         };
+        // gemma4 E2B per-layer input embeddings (gemma3n): compute the per-(token,layer) input vector
+        // on the host once per forward, laid out layer-major `[n_layer][n][npl]` so each layer's slice
+        // is contiguous, and upload it. `pl_gate`/`pl_p` are the per-layer-embd application scratch.
+        let (inp_per_layer, pl_gate, pl_p) = if let Some(ple) = &self.per_layer_embd {
+            let (npl, nl, nem) = (ple.npl, ple.n_layer, ple.n_embd);
+            let inv_sqrt_ne = 1.0 / (nem as f32).sqrt();
+            let sqrt_npl = (npl as f32).sqrt();
+            let inv_sqrt2 = 1.0 / 2f32.sqrt();
+            let te_bytes = self
+                .gguf
+                .tensor_bytes("per_layer_token_embd.weight")
+                .map_err(|e| anyhow!("{e}"))?;
+            let mut ipl = vec![0f32; nl * n * npl];
+            for t in 0..n {
+                let emb = &hidden_host[t * ne..t * ne + ne]; // scaled token embedding (√n_embd applied)
+                                                             // Per-layer token embedding is a VOCAB table — look it up by token ID, not by
+                                                             // sequence position (matches llama.cpp `ggml_get_rows(per_layer_tok_embd, tokens)`).
+                let r0 = new_tokens[t] as usize * ple.tok_embd_row_bytes;
+                let pl_tok = dequant_block(
+                    ple.tok_embd_dtype,
+                    &te_bytes[r0..r0 + ple.tok_embd_row_bytes],
+                )?;
+                for layer in 0..nl {
+                    // pl_proj = (model_proj · emb) * 1/√n_embd, then RMSNorm over npl with proj_norm.
+                    let mut proj = vec![0f32; npl];
+                    let mut ss = 0f32;
+                    for (j, pj) in proj.iter_mut().enumerate() {
+                        let wrow =
+                            &ple.model_proj[(layer * npl + j) * nem..(layer * npl + j) * nem + nem];
+                        let mut acc = 0f32;
+                        for i in 0..nem {
+                            acc += wrow[i] * emb[i];
+                        }
+                        let v = acc * inv_sqrt_ne;
+                        *pj = v;
+                        ss += v * v;
+                    }
+                    let rms = 1.0 / (ss / npl as f32 + c.rms_eps).sqrt();
+                    let dst = layer * (n * npl) + t * npl;
+                    for j in 0..npl {
+                        let normed = proj[j] * rms * ple.proj_norm[j];
+                        let tok = pl_tok[layer * npl + j] * sqrt_npl;
+                        ipl[dst + j] = (normed + tok) * inv_sqrt2;
+                    }
+                }
+            }
+            let buf = alloc(nl * n * npl, BufferUsage::Staging)?;
+            self.be
+                .upload(buf.as_ref(), bytemuck::cast_slice(&ipl))
+                .map_err(|e| anyhow!("{e}"))?;
+            (
+                Some(buf),
+                Some(alloc(n * npl, BufferUsage::Activations)?),
+                Some(alloc(n * ne, BufferUsage::Activations)?),
+            )
+        } else {
+            (None, None, None)
+        };
         // Only the LAST position's logits are needed → compute lm_head for one row. (Computing all n
         // rows at long context is a huge wasted dispatch + ~n*vocab buffer that can exceed the GPU
         // watchdog and lose the device.)
@@ -3591,6 +3784,15 @@ impl Llama {
             let kvrow = nkv * hd;
             let rope_dim = c.layer_rope_dim(li);
             let rope_theta = c.layer_rope_theta(li);
+            // Per-layer FFN width (gemma4 E2B: 6144 / 12288; uniform `nff` elsewhere). The FFN scratch
+            // is sized to the max `nff`; a narrower layer uses the leading prefix.
+            let nff_l = c.layer_n_ff(li);
+            // gemma4 E2B KV sharing: later layers don't compute their own K/V — they attend to an
+            // earlier layer's cache. `own_kv` gates the K/V projection+store; `kv_src` is the cache to
+            // read. Both are `li`/`true` for every layer of a non-sharing model.
+            let noshare = std::env::var("INFR_E2B_NOSHARE").is_ok();
+            let own_kv = c.has_own_kv(li) || noshare;
+            let kv_src = if noshare { li } else { c.kv_src_layer(li) };
             // gemma4 attends with scale 1.0 (QK-norm controls the magnitude); everyone else 1/√hd.
             let attn_scale = if c.gemma4 {
                 1.0
@@ -3671,12 +3873,15 @@ impl Llama {
                 } else {
                     rmsnorm_qkv();
                     lin(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
-                    lin(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
-                    match &layer.wv {
-                        Some(wv) => lin(wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow),
-                        // gemma4 full layers: V = the raw K projection (kr), copied before K gets
-                        // QK-norm+RoPE (V instead gets a weightless RMSNorm, no rope, just below).
-                        None => rec.copy(kr.as_ref(), 0, vr.as_ref(), 0, n * kvrow * 4),
+                    // gemma4 E2B shared layers compute Q only — K/V come from `kv_src`'s cache.
+                    if own_kv {
+                        lin(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
+                        match &layer.wv {
+                            Some(wv) => lin(wv, hn.as_ref(), vr.as_ref(), n, ne, kvrow),
+                            // gemma4 full layers: V = the raw K projection (kr), copied before K gets
+                            // QK-norm+RoPE (V instead gets a weightless RMSNorm, no rope, just below).
+                            None => rec.copy(kr.as_ref(), 0, vr.as_ref(), 0, n * kvrow * 4),
+                        }
                     }
                 }
                 // QK-norm + RoPE with the layer's rope dim and base (gemma dual-rope; uniform else).
@@ -3700,34 +3905,36 @@ impl Llama {
                     c.rms_eps,
                     layer_ff,
                 );
-                rec.qk_norm_rope(
-                    kr.as_ref(),
-                    layer.k_norm_buf.as_ref().unwrap().as_ref(),
-                    kv.k[li].as_ref(),
-                    n,
-                    nkv,
-                    hd,
-                    rope_dim,
-                    rope_theta,
-                    pos,
-                    pos,
-                    c.rms_eps,
-                    layer_ff,
-                );
-                // gemma4 applies a weightless per-head RMSNorm to V before caching (rmsnorm with a
-                // unit weight = x/rms). Done in place on the f32 `vr` prior to the f16 cast-store.
-                if let Some(ones) = &v_ones {
-                    rec.rmsnorm(
-                        vr.as_ref(),
-                        ones.as_ref(),
-                        vr.as_ref(),
-                        n * nkv,
+                if own_kv {
+                    rec.qk_norm_rope(
+                        kr.as_ref(),
+                        layer.k_norm_buf.as_ref().unwrap().as_ref(),
+                        kv.k[li].as_ref(),
+                        n,
+                        nkv,
                         hd,
+                        rope_dim,
+                        rope_theta,
+                        pos,
+                        pos,
                         c.rms_eps,
+                        layer_ff,
                     );
+                    // gemma4 applies a weightless per-head RMSNorm to V before caching (rmsnorm with a
+                    // unit weight = x/rms). Done in place on the f32 `vr` prior to the f16 cast-store.
+                    if let Some(ones) = &v_ones {
+                        rec.rmsnorm(
+                            vr.as_ref(),
+                            ones.as_ref(),
+                            vr.as_ref(),
+                            n * nkv,
+                            hd,
+                            c.rms_eps,
+                        );
+                    }
+                    // v_raw is f32; cast into the f16 V cache at row offset `pos`.
+                    rec.store_f16(vr.as_ref(), kv.v[li].as_ref(), n * kvrow, pos * kvrow);
                 }
-                // v_raw is f32; cast into the f16 V cache at row offset `pos`.
-                rec.store_f16(vr.as_ref(), kv.v[li].as_ref(), n * kvrow, pos * kvrow);
             } else {
                 rec.attn_in(
                     hidden.as_ref(),
@@ -3820,8 +4027,8 @@ impl Llama {
             } else {
                 rec.attention_kv(
                     q.as_ref(),
-                    kv.k[li].as_ref(),
-                    kv.v[li].as_ref(),
+                    kv.k[kv_src].as_ref(),
+                    kv.v[kv_src].as_ref(),
                     attn.as_ref(),
                     n,
                     kv_len,
@@ -3891,10 +4098,10 @@ impl Llama {
                     gu_ffn.as_ref(),
                     n,
                     ne,
-                    2 * nff,
+                    2 * nff_l,
                 );
-                rec.gelu_mul_fused(gu_ffn.as_ref(), act.as_ref(), n, nff);
-                lin(layer.wdown(), act.as_ref(), sub.as_ref(), n, nff, ne);
+                rec.gelu_mul_fused(gu_ffn.as_ref(), act.as_ref(), n, nff_l);
+                lin(layer.wdown(), act.as_ref(), sub.as_ref(), n, nff_l, ne);
                 rec.rmsnorm(
                     sub.as_ref(),
                     layer.post_ffw_norm_buf.as_ref().unwrap().as_ref(),
@@ -3955,6 +4162,31 @@ impl Llama {
                     nff,
                     ne,
                 );
+            }
+            // gemma4 E2B per-layer input embeddings (gemma3n): mix this layer's per-layer input vector
+            // into `hidden` AFTER the FFN residual, BEFORE the out_scale. `g = gelu(inp_gate·hidden) *
+            // inp_per_layer[il]`, `p = post_norm(proj·g)`, `hidden += p` (residual on the pre-embd value).
+            if let (Some(ipl), Some(gate_w), Some(proj_w), Some(post_norm)) = (
+                &inp_per_layer,
+                &layer.pl_inp_gate,
+                &layer.pl_proj,
+                &layer.pl_post_norm,
+            ) {
+                if std::env::var("INFR_E2B_NOPLE").is_err() {
+                    let npl = self.per_layer_embd.as_ref().unwrap().npl;
+                    let g = pl_gate.as_ref().unwrap();
+                    let p = pl_p.as_ref().unwrap();
+                    // g = inp_gate · hidden  [n_embd → npl]
+                    lin(gate_w, hidden.as_ref(), g.as_ref(), n, ne, npl);
+                    // g = gelu(g) * inp_per_layer[il]  (layer il's contiguous [n, npl] slice)
+                    let off = li * n * npl * 4;
+                    rec.gelu_mul_off(g.as_ref(), ipl.as_ref(), off, g.as_ref(), n * npl);
+                    // p = proj · g  [npl → n_embd], then weightless... no: RMSNorm with post_norm.
+                    lin(proj_w, g.as_ref(), p.as_ref(), n, npl, ne);
+                    rec.rmsnorm(p.as_ref(), post_norm.as_ref(), p.as_ref(), n, ne, c.rms_eps);
+                    // residual: hidden = hidden + p
+                    rec.add(hidden.as_ref(), p.as_ref(), hidden.as_ref(), n * ne);
+                }
             }
             // gemma4: multiply the whole layer output by the per-layer scalar before the next layer.
             if let Some(s) = layer.out_scale {

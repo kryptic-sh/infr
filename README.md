@@ -1,5 +1,7 @@
 # infr
 
+[![CI](https://github.com/kryptic-sh/infr/actions/workflows/ci.yml/badge.svg)](https://github.com/kryptic-sh/infr/actions/workflows/ci.yml)
+
 Pure-Rust LLM inference engine. Vulkan-first, built to run on any mainstream
 GPU.
 
@@ -16,11 +18,12 @@ A from-the-metal inference server that works across AMD / NVIDIA / Intel
 
 Runs **Llama / Qwen2 / Qwen3** (dense), **Gemma 3** (dense, sliding-window
 attention + QK-norm + GeGLU), and **Gemma 4** (per-layer heterogeneous head
-dims, proportional RoPE, V-norm, per-layer output scale) on the Vulkan backend,
-competitive with llama.cpp at long context (`infr compare`). **Qwen3.5 /
-Qwen3.6** (`qwen35` / Qwen3-Next — hybrid gated-DeltaNet + attention) run via a
-CPU reference (`docs/QWEN35.md`); a Vulkan/hybrid path is planned.
-DiffusionGemma (the original target) is future work.
+dims, proportional RoPE, V-norm, per-layer output scale — including the **E2B**
+variant: per-layer input embeddings, per-layer FFN widths, KV-layer sharing) on
+the Vulkan backend, competitive with llama.cpp at long context (`infr compare`).
+**Qwen3.5 / Qwen3.6** (`qwen35` / Qwen3-Next — hybrid gated-DeltaNet +
+attention) run via a CPU reference (`docs/QWEN35.md`); a Vulkan/hybrid path is
+planned. DiffusionGemma (the original target) is future work.
 
 ```bash
 infr pull   <model-ref>        # org/repo[:quant] (HuggingFace) | path to a .gguf
@@ -33,6 +36,43 @@ Model refs match llama.cpp's `-hf`: `org/repo[:quant]` (quant default `Q4_K_M`,
 e.g. `infr run unsloth/Qwen3-14B-GGUF:Q4_K_M`). Models share the standard
 **HuggingFace Hub cache** (`~/.cache/huggingface/hub`) with llama.cpp and
 `huggingface_hub` — one download, used by both.
+
+## Supported models
+
+All run on the Vulkan GPU backend unless noted. The chat template (turn markers,
+system prompt) is read from the GGUF's own `tokenizer.chat_template`.
+
+| Family               | Arch (GGUF) | Notes                                          |
+| -------------------- | ----------- | ---------------------------------------------- |
+| Llama / Qwen2        | `llama`     | dense transformer                              |
+| Qwen3                | `qwen3`     | dense, QK-norm                                 |
+| Qwen3 MoE            | `qwen3moe`  | softmax router, top-_k_ experts (CPU offload)  |
+| Gemma 3              | `gemma3`    | SWA + QK-norm + GeGLU, dual-RoPE               |
+| Gemma 4 (dense)      | `gemma4`    | per-layer head dims, proportional RoPE, V-norm |
+| Gemma 4 **E2B**      | `gemma4`    | + per-layer input embeddings / FFN, KV sharing |
+| Qwen3.5 / Qwen3-Next | `qwen3next` | hybrid gated-DeltaNet — **CPU reference** only |
+
+```bash
+# Qwen3 dense
+infr run unsloth/Qwen3-1.7B-GGUF:Q4_K_M "What is the capital of France?"
+
+# Qwen3 MoE (expert CPU offload with INFR_NCMOE=N for tight VRAM)
+infr run unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M "Explain MoE routing."
+
+# Gemma 3
+infr run unsloth/gemma-3-1b-it-GGUF:Q4_K_M "What is bash?"
+
+# Gemma 4 — dense and the E2B variant
+infr run unsloth/gemma-4-12b-it-GGUF:Q4_K_M  "What is the capital of France?"
+infr run unsloth/gemma-4-E2B-it-GGUF:Q4_K_M  "What is bash?"
+
+# Serve any of them over an OpenAI-compatible API
+infr serve unsloth/Qwen3-14B-GGUF:Q4_K_M
+```
+
+Sampling is greedy at `INFR_TEMP=0`; otherwise `INFR_TEMP` / `INFR_TOP_K` /
+`INFR_TOP_P` control it (see
+[Benchmarking & profiling](#benchmarking--profiling) for the full env list).
 
 ## Benchmarking & profiling
 
@@ -80,8 +120,8 @@ greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
 ## Scope
 
 - **Format:** GGUF
-- **Models:** Llama / Qwen3 / Gemma 3 / Gemma 4 dense (GPU); Qwen3.5/3.6 (CPU
-  ref); DiffusionGemma (planned)
+- **Models:** Llama / Qwen3 / Gemma 3 / Gemma 4 (dense + E2B) (GPU); Qwen3.5/3.6
+  (CPU ref); DiffusionGemma (planned)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul)
 - **Store:** own cache at `$XDG_CACHE_HOME/infr/models` (standalone HF + Ollama
   HTTP pulls)

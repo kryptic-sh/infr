@@ -36,6 +36,7 @@ fn main() {
         ("gather_rows", "gather_rows", &[]),
         ("scatter_add_rows", "scatter_add_rows", &[]),
         ("silu_mul", "silu_mul", &[]),
+        ("silu_mul", "gelu_mul", &["-DGELU"]),
         ("silu_mul_fused", "silu_mul_fused", &[]),
         ("silu_mul_fused", "gelu_mul_fused", &["-DGELU"]),
         ("store_f16", "store_f16", &[]),

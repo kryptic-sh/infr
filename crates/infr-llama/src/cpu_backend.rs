@@ -9,13 +9,14 @@
 //! avoid a circular crate dep; it implements the agnostic `infr_core::Backend` trait, so it can be
 //! extracted to an `infr-cpu` crate later without touching callers.
 
-use crate::{dequant_block, Llama};
+use crate::{dequant_block, Config, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
 use infr_core::error::Result;
 use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
+use infr_gguf::Gguf;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -727,8 +728,15 @@ struct DecodeHandles {
 /// attention block is shared; the FFN is either a dense gated FFN or a routed-expert MoE bank; gemma4
 /// E2B adds per-layer input embeddings + KV-layer sharing. `prompt` is the full token prefix; returns
 /// the generated continuation. Stops at EOS or `max_new`.
-pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> AResult<Vec<u32>> {
-    let c = &llama.cfg;
+pub(crate) fn generate_dense_cpu(
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+) -> AResult<Vec<u32>> {
+    let c = cfg;
     let be = CpuBackend::new();
     let (ne, nh) = (c.n_embd, c.n_head);
     // gemma4: per-layer SWA/full dims differ; size shared scratch + KV by the max over layers.
@@ -753,9 +761,7 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
     // raw K projection); every layer of every other model has one.
     let has_wv: Vec<bool> = (0..c.n_layer)
         .map(|l| {
-            llama
-                .gguf
-                .tensors()
+            g.tensors()
                 .iter()
                 .any(|t| t.name == format!("blk.{l}.attn_v.weight"))
         })
@@ -765,8 +771,8 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
     let out_scale: Vec<Option<f32>> = (0..c.n_layer)
         .map(|l| {
             let name = format!("blk.{l}.layer_output_scale.weight");
-            if llama.gguf.tensors().iter().any(|t| t.name == name) {
-                crate::load_tensor_dequant(&llama.gguf, &name)
+            if g.tensors().iter().any(|t| t.name == name) {
+                crate::load_tensor_dequant(g, &name)
                     .ok()
                     .and_then(|(v, _)| v.first().copied())
             } else {
@@ -776,17 +782,12 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         .collect();
     // gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`): applied on
     // full-attention layers only (SWA layers use plain RoPE). Bound as a per-step f32 Input.
-    let rope_freqs: Option<Vec<f32>> = if gemma4
-        && llama
-            .gguf
-            .tensors()
-            .iter()
-            .any(|t| t.name == "rope_freqs.weight")
-    {
-        Some(crate::load_tensor_dequant(&llama.gguf, "rope_freqs.weight").map(|(v, _)| v)?)
-    } else {
-        None
-    };
+    let rope_freqs: Option<Vec<f32>> =
+        if gemma4 && g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
+            Some(crate::load_tensor_dequant(g, "rope_freqs.weight").map(|(v, _)| v)?)
+        } else {
+            None
+        };
 
     // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
     //    lazily in `bytes_to_f32`, so a quant weight occupies ~quant size, not 8× f32). `wspecs`
@@ -795,14 +796,13 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
     let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
     let mut wspecs: Vec<(DType, usize)> = Vec::new();
     let mut wraw = |name: &str| -> AResult<()> {
-        let info = llama
-            .gguf
+        let info = g
             .tensors()
             .iter()
             .find(|t| t.name == name)
             .ok_or_else(|| anyhow!("tensor not found: {name}"))?
             .clone();
-        let bytes = llama.gguf.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+        let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
         let numel: usize = info.shape.iter().product();
         let b = be
             .alloc(bytes.len(), BufferUsage::Weights)
@@ -852,22 +852,17 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
     }
     // Globals: output_norm, lm_head (output.weight, or tied to token_embd f32).
     wraw("output_norm.weight")?;
-    if llama
-        .gguf
-        .tensors()
-        .iter()
-        .any(|t| t.name == "output.weight")
-    {
+    if g.tensors().iter().any(|t| t.name == "output.weight") {
         wraw("output.weight")?;
     } else {
         // tied lm head: the host f32 token_embd (already dequantized for the embedding gather).
         let b = be
-            .alloc(llama.token_embd.len() * 4, BufferUsage::Weights)
+            .alloc(token_embd.len() * 4, BufferUsage::Weights)
             .map_err(|e| anyhow!("{e}"))?;
-        be.upload(b.as_ref(), bytemuck::cast_slice(&llama.token_embd))
+        be.upload(b.as_ref(), bytemuck::cast_slice(token_embd))
             .map_err(|e| anyhow!("{e}"))?;
         wbufs.push(b);
-        wspecs.push((DType::F32, llama.token_embd.len()));
+        wspecs.push((DType::F32, token_embd.len()));
     }
     // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
     // of the max head dim serves every layer (a narrower layer reads its leading prefix).
@@ -1426,7 +1421,7 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
     for pos in 0..(prompt.len() + max_new) {
         let tok = cur[pos] as usize;
         // embed (gemma scales by √n_embd; qwen3/llama identity)
-        let emb: Vec<f32> = llama.token_embd[tok * ne..tok * ne + ne]
+        let emb: Vec<f32> = token_embd[tok * ne..tok * ne + ne]
             .iter()
             .map(|&x| x * embed_scale)
             .collect();
@@ -1437,13 +1432,12 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
 
         // gemma4 E2B: build this token's per-layer input vector on the host (mirrors the GPU forward):
         // `ipl[l] = ((model_proj_l·emb)/√n_embd, RMSNorm'd over npl) + (per_layer_tok_embd_row × √npl)) / √2`.
-        if let (Some(ple), Some(ipl_buf)) = (llama.per_layer_embd.as_ref(), &ipl_buf) {
+        if let (Some(ple), Some(ipl_buf)) = (ple, &ipl_buf) {
             let (npl, nl, nem) = (ple.npl, ple.n_layer, ple.n_embd);
             let inv_sqrt_ne = 1.0 / (nem as f32).sqrt();
             let sqrt_npl = (npl as f32).sqrt();
             let inv_sqrt2 = 1.0 / 2f32.sqrt();
-            let te_bytes = llama
-                .gguf
+            let te_bytes = g
                 .tensor_bytes("per_layer_token_embd.weight")
                 .map_err(|e| anyhow!("{e}"))?;
             let r0 = tok * ple.tok_embd_row_bytes;

@@ -169,6 +169,304 @@ impl Config {
     pub fn max_n_kv(&self) -> usize {
         self.n_kv.max(self.n_kv_swa)
     }
+
+    /// Parse the model config purely from GGUF metadata + tensor shapes — no GPU/Vulkan, no weight
+    /// upload. The single source of truth for both the GPU loader ([`Llama::load_opt`]) and the
+    /// CPU-only loader ([`CpuModel::load`]). `eos_ids` holds only the GGUF `eos` here; chat-end
+    /// markers (`<|im_end|>` …) are appended once a tokenizer exists (see [`add_chat_eos`]).
+    pub fn from_gguf(g: &Gguf) -> Result<Config> {
+        let arch = g
+            .metadata()
+            .str("general.architecture")
+            .unwrap_or("")
+            .to_string();
+        let qk_norm = match arch.as_str() {
+            "llama" => false,
+            "qwen3" | "qwen3moe" | "gemma3" | "gemma4" => true,
+            other => bail!(
+                "infr-llama supports architecture=llama|qwen3|qwen3moe|gemma3|gemma4, got {other:?}"
+            ),
+        };
+        let gemma4 = arch == "gemma4";
+        let gemma = arch == "gemma3" || gemma4;
+        let mk = |k: &str| format!("{arch}.{k}");
+        let n_layer = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
+        let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
+        let n_head = meta_u64(g, &mk("attention.head_count")).context("head_count")? as usize;
+        let n_kv = meta_u64(g, &mk("attention.head_count_kv")).unwrap_or(n_head as u64) as usize;
+        let n_ff_layers: Vec<usize> = if let Some(arr) = g
+            .metadata()
+            .get(&mk("feed_forward_length"))
+            .and_then(MetaValue::as_arr)
+        {
+            arr.iter()
+                .filter_map(MetaValue::as_u64)
+                .map(|v| v as usize)
+                .collect()
+        } else {
+            let ff =
+                meta_u64(g, &mk("feed_forward_length")).context("feed_forward_length")? as usize;
+            vec![ff; n_layer]
+        };
+        let n_ff = n_ff_layers.iter().copied().max().unwrap_or(0);
+        let moe = if arch == "qwen3moe" {
+            let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
+            let n_used =
+                meta_u64(g, &mk("expert_used_count")).context("expert_used_count")? as usize;
+            let n_ff_exp = meta_u64(g, &mk("expert_feed_forward_length"))
+                .map(|v| v as usize)
+                .unwrap_or(n_ff / n_used.max(1));
+            Some(MoeConfig {
+                n_expert,
+                n_used,
+                n_ff_exp,
+                scale: 1.0,
+            })
+        } else {
+            None
+        };
+        let head_dim =
+            meta_u64(g, &mk("attention.key_length")).unwrap_or((n_embd / n_head) as u64) as usize;
+        let rope_dim = meta_u64(g, &mk("rope.dimension_count")).unwrap_or(head_dim as u64) as usize;
+        let rope_theta = g
+            .metadata()
+            .get(&mk("rope.freq_base"))
+            .and_then(|v| match v {
+                MetaValue::F64(f) => Some(*f as f32),
+                MetaValue::U64(u) => Some(*u as f32),
+                _ => None,
+            })
+            .unwrap_or(10000.0);
+        let rms_eps = g
+            .metadata()
+            .get(&mk("attention.layer_norm_rms_epsilon"))
+            .and_then(|v| match v {
+                MetaValue::F64(f) => Some(*f as f32),
+                _ => None,
+            })
+            .unwrap_or(1e-5);
+        let swa_window = if gemma {
+            meta_u64(g, &mk("attention.sliding_window")).unwrap_or(0) as usize
+        } else {
+            0
+        };
+        let swa_pattern = if swa_window == 0 {
+            0
+        } else if let Some(arr) = g
+            .metadata()
+            .get(&mk("attention.sliding_window_pattern"))
+            .and_then(MetaValue::as_arr)
+        {
+            arr.iter()
+                .position(|v| matches!(v, MetaValue::Bool(false)))
+                .map(|i| i + 1)
+                .unwrap_or(6)
+        } else {
+            meta_u64(g, &mk("attention.sliding_window_pattern")).unwrap_or(6) as usize
+        };
+        let swa_rope_theta = if swa_window > 0 {
+            g.metadata()
+                .get(&mk("rope.freq_base_swa"))
+                .and_then(|v| match v {
+                    MetaValue::F64(f) => Some(*f as f32),
+                    MetaValue::U64(u) => Some(*u as f32),
+                    _ => None,
+                })
+                .unwrap_or(10000.0)
+        } else {
+            rope_theta
+        };
+        let (head_dim, n_kv, rope_dim, head_dim_swa, n_kv_swa, rope_dim_swa) = if gemma4 {
+            let hk = g
+                .metadata()
+                .get(&mk("attention.head_count_kv"))
+                .and_then(MetaValue::as_arr);
+            let kv_at = |i: usize| {
+                hk.and_then(|a| a.get(i))
+                    .and_then(MetaValue::as_u64)
+                    .map(|v| v as usize)
+            };
+            let full_idx = swa_pattern.saturating_sub(1);
+            let hd_full =
+                meta_u64(g, &mk("attention.key_length")).unwrap_or(head_dim as u64) as usize;
+            let hd_swa =
+                meta_u64(g, &mk("attention.key_length_swa")).unwrap_or(hd_full as u64) as usize;
+            let rd_full =
+                meta_u64(g, &mk("rope.dimension_count")).unwrap_or(hd_full as u64) as usize;
+            let rd_swa =
+                meta_u64(g, &mk("rope.dimension_count_swa")).unwrap_or(hd_swa as u64) as usize;
+            (
+                hd_full,
+                kv_at(full_idx).unwrap_or(n_kv),
+                rd_full,
+                hd_swa,
+                kv_at(0).unwrap_or(n_kv),
+                rd_swa,
+            )
+        } else {
+            (head_dim, n_kv, rope_dim, head_dim, n_kv, rope_dim)
+        };
+        let final_softcap = if gemma4 {
+            g.metadata()
+                .get(&mk("final_logit_softcapping"))
+                .and_then(MetaValue::as_f64)
+                .unwrap_or(0.0) as f32
+        } else {
+            0.0
+        };
+        let n_embd_per_layer = if gemma4 {
+            meta_u64(g, &mk("embedding_length_per_layer_input")).unwrap_or(0) as usize
+        } else {
+            0
+        };
+        let n_layer_kv_from_start = if gemma4 {
+            let shared = meta_u64(g, &mk("attention.shared_kv_layers")).unwrap_or(0) as usize;
+            n_layer.saturating_sub(shared)
+        } else {
+            n_layer
+        };
+        let eos = meta_u64(g, "tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
+        // vocab = token_embd rows (GGUF shape `[n_embd, vocab]`) — read from the tensor header, no load.
+        let vocab = g
+            .tensors()
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .and_then(|t| t.shape.last().copied())
+            .context("token_embd.weight shape")?;
+        Ok(Config {
+            n_layer,
+            n_head,
+            n_kv,
+            n_embd,
+            n_ff,
+            n_ff_layers,
+            n_embd_per_layer,
+            n_layer_kv_from_start,
+            head_dim,
+            rope_dim,
+            rope_theta,
+            rms_eps,
+            vocab,
+            eos,
+            eos_ids: vec![eos],
+            qk_norm,
+            gemma,
+            gemma4,
+            head_dim_swa,
+            n_kv_swa,
+            rope_dim_swa,
+            final_softcap,
+            swa_window,
+            swa_pattern,
+            swa_rope_theta,
+            moe,
+        })
+    }
+}
+
+/// Build the gemma4 E2B per-layer-embedding global tensors from the GGUF (host f32 — no GPU). The
+/// big `per_layer_token_embd` stays quantized in the mmap and is gathered per token at forward time.
+/// `None` for models without per-layer embeddings. Shared by the GPU and CPU loaders.
+fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerLayerEmbd>> {
+    if cfg.n_embd_per_layer == 0 {
+        return Ok(None);
+    }
+    let (model_proj, _) = load_tensor_dequant(g, "per_layer_model_proj.weight")?;
+    let (proj_norm, _) = load_tensor_dequant(g, "per_layer_proj_norm.weight")?;
+    let te = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == "per_layer_token_embd.weight")
+        .ok_or_else(|| anyhow!("per_layer_token_embd.weight not found"))?;
+    // Bytes per token row = total bytes / vocab (te shape is GGUF [npl*n_layer, vocab]).
+    let te_vocab = *te.shape.last().unwrap();
+    Ok(Some(PerLayerEmbd {
+        npl: cfg.n_embd_per_layer,
+        n_layer: cfg.n_layer,
+        n_embd: cfg.n_embd,
+        model_proj,
+        proj_norm,
+        tok_embd_dtype: te.dtype,
+        tok_embd_row_bytes: te.nbytes / te_vocab,
+    }))
+}
+
+/// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
+/// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
+fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
+    for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
+        if let Some(id) = tokenizer.token_to_id(name) {
+            if !cfg.eos_ids.contains(&id) {
+                cfg.eos_ids.push(id);
+            }
+        }
+    }
+}
+
+/// A **GPU-free** model for the CPU reference backend. Holds only what the agnostic CPU compute
+/// graph needs — the parsed [`Config`], the host f32 token embeddings (for the gather + tied lm
+/// head), the tokenizer, and the gemma4 E2B per-layer-embd tensors. No `VulkanBackend`, no VRAM,
+/// no weight upload: the projection weights are streamed straight from the kept-open GGUF mmap at
+/// forward time. Dense Qwen3/Llama, Gemma 3, Gemma 4 (dense + E2B), and qwen3moe; for qwen35 use
+/// [`crate::qwen35::generate_cpu`].
+pub struct CpuModel {
+    gguf: Gguf,
+    cfg: Config,
+    token_embd: Vec<f32>,
+    per_layer_embd: Option<PerLayerEmbd>,
+    tokenizer: Tokenizer,
+}
+
+impl CpuModel {
+    /// Load a model for CPU inference without touching the GPU. `tokenizer_path` overrides the
+    /// GGUF's embedded vocab when given.
+    pub fn load(gguf_path: &Path, tokenizer_path: Option<&Path>) -> Result<Self> {
+        let g = Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?;
+        let mut cfg = Config::from_gguf(&g)?;
+        let tokenizer = match tokenizer_path {
+            Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,
+            None => build_tokenizer(&g)?,
+        };
+        add_chat_eos(&mut cfg, &tokenizer);
+        let (token_embd, _) = load_tensor_dequant(&g, "token_embd.weight")?;
+        let per_layer_embd = build_per_layer_embd(&g, &cfg)?;
+        Ok(Self {
+            gguf: g,
+            cfg,
+            token_embd,
+            per_layer_embd,
+            tokenizer,
+        })
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// Wrap a user message in the ChatML turn markers (matches [`Llama::chatml`]).
+    pub fn chatml(&self, user: &str) -> String {
+        format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
+    }
+
+    /// Greedy generation on the CPU reference backend (no GPU). Mirrors [`Llama::generate_cpu`].
+    pub fn generate_cpu(&self, prompt: &str, max_new: usize) -> Result<String> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let generated = crate::cpu_backend::generate_dense_cpu(
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+        )?;
+        self.tokenizer
+            .decode(&generated, true)
+            .map_err(|e| anyhow!("decode: {e}"))
+    }
 }
 
 /// Mixture-of-experts FFN parameters (qwen3moe): a softmax router picks `n_used` of `n_expert`
@@ -487,7 +785,7 @@ fn draw_u(rng: &mut u64) -> f32 {
 
 /// gemma4 E2B (gemma3n) per-layer input-embedding global tensors. The per-(token,layer) input vector
 /// is `((model_proj·scaled_embd)·1/√n_embd, RMSNorm'd) + (tok_embd_row × √npl)) × 1/√2`.
-struct PerLayerEmbd {
+pub(crate) struct PerLayerEmbd {
     npl: usize,                       // per-layer embedding width (256)
     n_layer: usize,                   // number of layers (35)
     n_embd: usize,                    // model width (1536)
@@ -2256,192 +2554,24 @@ impl Llama {
     /// Load with an optional sidecar tokenizer; falls back to the GGUF's embedded vocab.
     pub fn load_opt(gguf_path: &Path, tokenizer_path: Option<&Path>) -> Result<Self> {
         let g = Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?;
-        let arch = g
-            .metadata()
-            .str("general.architecture")
-            .unwrap_or("")
-            .to_string();
-        // llama / qwen3 / qwen3moe share the transformer; qwen3* add QK-norm + explicit head_dim,
-        // qwen3moe replaces the dense FFN with a routed-expert bank.
-        // gemma3 reuses the qwen3 dense transformer (QK-norm + explicit head_dim) and adds: √n_embd
-        // embedding scale, sandwich norms (post-attn / post-ffw), GeGLU FFN, and sliding-window attn.
-        let qk_norm = match arch.as_str() {
-            "llama" => false,
-            "qwen3" | "qwen3moe" | "gemma3" | "gemma4" => true,
-            other => bail!(
-                "infr-llama supports architecture=llama|qwen3|qwen3moe|gemma3|gemma4, got {other:?}"
-            ),
-        };
-        let gemma4 = arch == "gemma4";
-        // gemma3 and gemma4 share: √n_embd embd scale, sandwich norms, GeGLU, dual-rope, SWA.
-        let gemma = arch == "gemma3" || gemma4;
-        let mk = |k: &str| format!("{arch}.{k}");
-        let n_layer = meta_u64(&g, &mk("block_count")).context("block_count")? as usize;
-        let n_embd = meta_u64(&g, &mk("embedding_length")).context("embedding_length")? as usize;
-        let n_head = meta_u64(&g, &mk("attention.head_count")).context("head_count")? as usize;
-        let n_kv = meta_u64(&g, &mk("attention.head_count_kv")).unwrap_or(n_head as u64) as usize;
-        // FFN width: a scalar for most models, but gemma4 E2B stores `feed_forward_length` as a
-        // per-layer INT array (most 6144, late layers 12288). Read either; `n_ff` = the max (sizes the
-        // shared FFN scratch), `n_ff_layers` = the per-layer widths (uniform = the scalar for others).
-        let n_ff_layers: Vec<usize> = if let Some(arr) = g
-            .metadata()
-            .get(&mk("feed_forward_length"))
-            .and_then(MetaValue::as_arr)
-        {
-            arr.iter()
-                .filter_map(MetaValue::as_u64)
-                .map(|v| v as usize)
-                .collect()
-        } else {
-            let ff =
-                meta_u64(&g, &mk("feed_forward_length")).context("feed_forward_length")? as usize;
-            vec![ff; n_layer]
-        };
-        let n_ff = n_ff_layers.iter().copied().max().unwrap_or(0);
-        // MoE (qwen3moe): softmax router over `n_expert`, top-`n_used`, per-expert SwiGLU of inner
-        // size `n_ff_exp` (the GGUF `expert_feed_forward_length`).
-        let moe = if arch == "qwen3moe" {
-            let n_expert = meta_u64(&g, &mk("expert_count")).context("expert_count")? as usize;
-            let n_used =
-                meta_u64(&g, &mk("expert_used_count")).context("expert_used_count")? as usize;
-            let n_ff_exp = meta_u64(&g, &mk("expert_feed_forward_length"))
-                .map(|v| v as usize)
-                .unwrap_or(n_ff / n_used.max(1));
-            Some(MoeConfig {
-                n_expert,
-                n_used,
-                n_ff_exp,
-                scale: 1.0, // qwen3moe: renormalize top-k softmax weights, no extra scale
-            })
-        } else {
-            None
-        };
-        // INFR_NCMOE=N: keep the experts of the first N layers in host RAM, saving their VRAM so a
-        // too-big MoE still fits (cf. llama.cpp --n-cpu-moe). Explicit value disables auto-fit below.
+        // Config is parsed purely from metadata/tensor headers (no GPU). The locals below are the
+        // subset the GPU weight-loading path references; `cfg` itself is moved into the model.
+        let mut cfg = Config::from_gguf(&g)?;
+        let n_layer = cfg.n_layer;
+        let n_embd = cfg.n_embd;
+        let n_kv = cfg.n_kv;
+        let head_dim = cfg.head_dim;
+        let n_embd_per_layer = cfg.n_embd_per_layer;
+        let qk_norm = cfg.qk_norm;
+        let gemma = cfg.gemma;
+        let moe = cfg.moe;
+        // INFR_NCMOE=N: keep the first N layers' experts in host RAM (saves their VRAM, cf. llama.cpp
+        // --n-cpu-moe). An explicit value disables the VRAM auto-fit below.
         let ncmoe_explicit = std::env::var("INFR_NCMOE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
         let mut n_cpu_moe = ncmoe_explicit.unwrap_or(0).min(n_layer);
         let mut moe_stream = std::env::var("INFR_MOE_STREAM").is_ok();
-        // head_dim: explicit (qwen3 key_length) or n_embd/n_head (llama). Note q_dim = n_head*head_dim
-        // may differ from n_embd (qwen3-0.6B: 16*128=2048 vs embd 1024).
-        let head_dim =
-            meta_u64(&g, &mk("attention.key_length")).unwrap_or((n_embd / n_head) as u64) as usize;
-        let rope_dim =
-            meta_u64(&g, &mk("rope.dimension_count")).unwrap_or(head_dim as u64) as usize;
-        let rope_theta = g
-            .metadata()
-            .get(&mk("rope.freq_base"))
-            .and_then(|v| match v {
-                infr_core::MetaValue::F64(f) => Some(*f as f32),
-                infr_core::MetaValue::U64(u) => Some(*u as f32),
-                _ => None,
-            })
-            .unwrap_or(10000.0);
-        let rms_eps = g
-            .metadata()
-            .get(&mk("attention.layer_norm_rms_epsilon"))
-            .and_then(|v| match v {
-                infr_core::MetaValue::F64(f) => Some(*f as f32),
-                _ => None,
-            })
-            .unwrap_or(1e-5);
-        // gemma SWA: most layers attend only to the last `swa_window` keys; every `swa_pattern`-th
-        // layer is full attention (gemma3 default period 6 = 5 SWA : 1 full).
-        let swa_window = if gemma {
-            meta_u64(&g, &mk("attention.sliding_window")).unwrap_or(0) as usize
-        } else {
-            0
-        };
-        // SWA period: gemma3 stores it as a scalar (default 6); gemma4 as a per-layer BOOL array
-        // (true = SWA, false = full) — derive the period as (index of first full layer + 1).
-        let swa_pattern = if swa_window == 0 {
-            0
-        } else if let Some(arr) = g
-            .metadata()
-            .get(&mk("attention.sliding_window_pattern"))
-            .and_then(MetaValue::as_arr)
-        {
-            arr.iter()
-                .position(|v| matches!(v, MetaValue::Bool(false)))
-                .map(|i| i + 1)
-                .unwrap_or(6)
-        } else {
-            meta_u64(&g, &mk("attention.sliding_window_pattern")).unwrap_or(6) as usize
-        };
-        // gemma3 dual-rope: the SWA (local) layers use a smaller rope base than the global layers.
-        // The GGUF usually omits it; llama.cpp's `rope_freq_base_train_swa` default is 10000.
-        let swa_rope_theta = if swa_window > 0 {
-            g.metadata()
-                .get(&mk("rope.freq_base_swa"))
-                .and_then(|v| match v {
-                    infr_core::MetaValue::F64(f) => Some(*f as f32),
-                    infr_core::MetaValue::U64(u) => Some(*u as f32),
-                    _ => None,
-                })
-                .unwrap_or(10000.0)
-        } else {
-            rope_theta
-        };
-        // gemma4 per-layer heterogeneous dims: SWA (local) and full (global) layers differ in head_dim,
-        // KV-head count, and rope dim. The main `head_dim`/`n_kv`/`rope_dim` hold the FULL-layer values
-        // (also the max, used to size shared scratch); the `*_swa` fields hold the SWA-layer values.
-        // For non-gemma4 models the two are identical. (`head_count_kv` is a per-layer array in gemma4.)
-        let (head_dim, n_kv, rope_dim, head_dim_swa, n_kv_swa, rope_dim_swa) = if gemma4 {
-            let hk = g
-                .metadata()
-                .get(&mk("attention.head_count_kv"))
-                .and_then(MetaValue::as_arr);
-            let kv_at = |i: usize| {
-                hk.and_then(|a| a.get(i))
-                    .and_then(MetaValue::as_u64)
-                    .map(|v| v as usize)
-            };
-            let full_idx = swa_pattern.saturating_sub(1); // first full-attention layer
-            let hd_full =
-                meta_u64(&g, &mk("attention.key_length")).unwrap_or(head_dim as u64) as usize;
-            let hd_swa =
-                meta_u64(&g, &mk("attention.key_length_swa")).unwrap_or(hd_full as u64) as usize;
-            let rd_full =
-                meta_u64(&g, &mk("rope.dimension_count")).unwrap_or(hd_full as u64) as usize;
-            let rd_swa =
-                meta_u64(&g, &mk("rope.dimension_count_swa")).unwrap_or(hd_swa as u64) as usize;
-            (
-                hd_full,
-                kv_at(full_idx).unwrap_or(n_kv),
-                rd_full,
-                hd_swa,
-                kv_at(0).unwrap_or(n_kv),
-                rd_swa,
-            )
-        } else {
-            (head_dim, n_kv, rope_dim, head_dim, n_kv, rope_dim)
-        };
-        // gemma4 caps the output logits: `logits = cap * tanh(logits / cap)`.
-        let final_softcap = if gemma4 {
-            g.metadata()
-                .get(&mk("final_logit_softcapping"))
-                .and_then(MetaValue::as_f64)
-                .unwrap_or(0.0) as f32
-        } else {
-            0.0
-        };
-        // gemma4 E2B (gemma3n-derived) per-layer input embeddings: each layer gets an extra input
-        // vector of this width mixed in after its FFN. Absent (0) on the dense gemma4-12b path.
-        let n_embd_per_layer = if gemma4 {
-            meta_u64(&g, &mk("embedding_length_per_layer_input")).unwrap_or(0) as usize
-        } else {
-            0
-        };
-        // gemma4 E2B KV sharing: `shared_kv_layers` layers at the end reuse earlier caches, so only the
-        // first `n_layer - shared_kv_layers` compute their own K/V. Absent (= no sharing) on gemma4-12b.
-        let n_layer_kv_from_start = if gemma4 {
-            let shared = meta_u64(&g, &mk("attention.shared_kv_layers")).unwrap_or(0) as usize;
-            n_layer.saturating_sub(shared)
-        } else {
-            n_layer
-        };
-        let eos = meta_u64(&g, "tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
 
         let be = VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
 
@@ -2540,8 +2670,7 @@ impl Llama {
         }
 
         // token embeddings (host) + lm head (GPU). tied unless output.weight present.
-        let (token_embd, te_shape) = load_tensor_dequant(&g, "token_embd.weight")?;
-        let vocab = te_shape[1];
+        let (token_embd, _te_shape) = load_tensor_dequant(&g, "token_embd.weight")?;
         let lm_head = if g.tensors().iter().any(|t| t.name == "output.weight") {
             upload_wt(&be, &g, "output.weight")?
         } else {
@@ -2565,32 +2694,8 @@ impl Llama {
         } else {
             None
         };
-        // gemma4 E2B global per-layer-embd tensors: model_proj (BF16, dequant to host f32) and
-        // proj_norm (F32). The big per_layer_token_embd stays quantized in the mmap'd gguf and is
-        // gathered per token at forward time (one row = npl*n_layer values, dequant just that row).
-        let per_layer_embd = if n_embd_per_layer > 0 {
-            let (model_proj, _) = load_tensor_dequant(&g, "per_layer_model_proj.weight")?;
-            let (proj_norm, _) = load_tensor_dequant(&g, "per_layer_proj_norm.weight")?;
-            let te = g
-                .tensors()
-                .iter()
-                .find(|t| t.name == "per_layer_token_embd.weight")
-                .ok_or_else(|| anyhow!("per_layer_token_embd.weight not found"))?;
-            // Bytes per token row = total bytes / vocab (te shape is GGUF [npl*n_layer, vocab]).
-            let te_vocab = *te.shape.last().unwrap();
-            let tok_embd_row_bytes = te.nbytes / te_vocab;
-            Some(PerLayerEmbd {
-                npl: n_embd_per_layer,
-                n_layer,
-                n_embd,
-                model_proj,
-                proj_norm,
-                tok_embd_dtype: te.dtype,
-                tok_embd_row_bytes,
-            })
-        } else {
-            None
-        };
+        // gemma4 E2B global per-layer-embd tensors (host f32, no GPU — shared with the CPU loader).
+        let per_layer_embd = build_per_layer_embd(&g, &cfg)?;
 
         // Loading the per-layer weights (dequant + GPU upload) dominates startup, especially for
         // big models — show a byte-progress bar so it reports copy speed + ETA (same shared style as
@@ -2734,43 +2839,8 @@ impl Llama {
 
         // Stop on the GGUF eos plus any chat-end markers in the vocab — a chat model can emit
         // <|endoftext|> mid-turn, and stopping only on <|im_end|> lets it ramble past the answer.
-        let mut eos_ids = vec![eos];
-        for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
-            if let Some(id) = tokenizer.token_to_id(name) {
-                if !eos_ids.contains(&id) {
-                    eos_ids.push(id);
-                }
-            }
-        }
+        add_chat_eos(&mut cfg, &tokenizer);
 
-        let cfg = Config {
-            n_layer,
-            n_head,
-            n_kv,
-            n_embd,
-            n_ff,
-            n_ff_layers,
-            n_embd_per_layer,
-            n_layer_kv_from_start,
-            head_dim,
-            rope_dim,
-            rope_theta,
-            rms_eps,
-            vocab,
-            eos,
-            eos_ids,
-            qk_norm,
-            gemma,
-            gemma4,
-            head_dim_swa,
-            n_kv_swa,
-            rope_dim_swa,
-            final_softcap,
-            swa_window,
-            swa_pattern,
-            swa_rope_theta,
-            moe,
-        };
         let llama = Self {
             be,
             cfg,
@@ -4574,7 +4644,14 @@ impl Llama {
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
-        let generated = crate::cpu_backend::generate_dense_cpu(self, &prompt_tokens, max_new)?;
+        let generated = crate::cpu_backend::generate_dense_cpu(
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+        )?;
         self.tokenizer
             .decode(&generated, true)
             .map_err(|e| anyhow!("decode: {e}"))

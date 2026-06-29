@@ -749,7 +749,9 @@ enum Q35LayerH {
 
 /// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). Mirrors
 /// [`generate`] (raw prompt, no chat template); returns the decoded continuation.
-pub fn generate_cpu(g: &Gguf, prompt: &str, n: usize) -> Result<String> {
+pub fn generate_cpu(path: &std::path::Path, prompt: &str, n: usize) -> Result<String> {
+    let gg = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
+    let g = &gg;
     let c = Cfg::from_gguf(g)?;
     let (token_embd, te_shape) = load_tensor_dequant(g, "token_embd.weight")?;
     let vocab = te_shape[1];
@@ -1485,7 +1487,7 @@ mod tests {
         let n = 16;
         std::env::set_var("Q35_CPU", "1");
         let oracle = generate(&g, prompt, n).unwrap();
-        let seam = generate_cpu(&g, prompt, n).unwrap();
+        let seam = generate_cpu(&model_path(), prompt, n).unwrap();
         println!("ORACLE: {oracle:?}\nSEAM:   {seam:?}");
         assert_eq!(
             seam, oracle,

@@ -287,6 +287,33 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let max_new = envu("INFR_MAX_NEW", 2048);
     let (gguf, tok) = resolve(model)?;
 
+    // CPU backend (INFR_CPU=1): run entirely on the CPU through the backend-agnostic compute graph —
+    // NO Vulkan init, NO VRAM. Intercepted before any GPU loader. One-shot (pass a message). Covers
+    // dense Qwen3/Llama, Gemma 3/4 (+E2B), qwen3moe, and qwen35/Qwen3-Next.
+    if std::env::var("INFR_CPU").is_ok() {
+        let Some(m) = message else {
+            anyhow::bail!("INFR_CPU currently supports one-shot only: pass a message");
+        };
+        let t0 = std::time::Instant::now();
+        let mut render = ThinkRender::new();
+        let text = if infr_llama::qwen35::is_qwen35(&gguf) {
+            eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
+            let prompt = format!("<|im_start|>user\n{m}<|im_end|>\n<|im_start|>assistant\n");
+            infr_llama::qwen35::generate_cpu(&gguf, &prompt, max_new)?
+        } else {
+            eprintln!(
+                "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
+            );
+            let model = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
+            let prompt = model.chatml(m);
+            model.generate_cpu(&prompt, max_new)?
+        };
+        render.feed(&text);
+        render.finish();
+        print_run_stats(t0, None, 0, 0, None);
+        return Ok(());
+    }
+
     // Qwen3.5/3.6 (qwen35 / Qwen3-Next) run a hybrid path: linear projections on the GPU (f16),
     // the SSM conv + gated-delta recurrence + hd=256 attention on the CPU (no GPU kernels yet — see
     // docs/QWEN35.md). `Q35_CPU=1` forces the pure-CPU oracle. One-shot only for now.
@@ -322,24 +349,6 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         envu("INFR_TOP_K", 20),
         envf("INFR_TOP_P", 0.95),
     );
-
-    // CPU reference backend (INFR_CPU=1): run the dense forward through the backend-agnostic compute
-    // Graph on the CPU — no GPU compute. One-shot, dense Qwen3/Llama only for now. (Weights still
-    // load via the GPU loader; a no-GPU load path is a follow-up.)
-    if std::env::var("INFR_CPU").is_ok() {
-        let Some(m) = message else {
-            anyhow::bail!("INFR_CPU currently supports one-shot only: pass a message");
-        };
-        eprintln!("[cpu reference backend — dense forward on CPU via the agnostic compute graph]");
-        let prompt = llama.chatml(m);
-        let t0 = std::time::Instant::now();
-        let text = llama.generate_cpu(&prompt, max_new)?;
-        let mut render = ThinkRender::new();
-        render.feed(&text);
-        render.finish();
-        print_run_stats(t0, None, 0, prompt.len(), None);
-        return Ok(());
-    }
 
     // MoE (qwen3moe): eager CPU-orchestrated forward (router top-k + per-expert FFN), no KV cache.
     // One-shot only for now.

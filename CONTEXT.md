@@ -18,6 +18,23 @@ LLM inference engine. Repo: `~/Projects/kryptic-sh/infr`, remote
 - North star: **long-context speed** (coding-agent workload) — win 16k/32k+,
   deprioritize short prompt.
 
+## Backend-agnostic compute refactor (IN PROGRESS, 2026-06-29)
+
+Making the compute backend swappable (CPU / Vulkan / CUDA / ROCm / Metal / MLX)
+behind one semantic seam. **Canonical plan: [`PLAN.md`](PLAN.md). Full state +
+decisions: the `compute-backend-direction` memory.** Short version:
+
+- Seam lives in `infr-core` (`graph.rs` op-list IR, `backend.rs`
+  Backend/Bindings).
+- CPU reference backend in `crates/infr-llama/src/cpu_backend.rs` runs the graph
+  with scalar loops; **validated token-for-token vs GPU** on Qwen3/Llama + Gemma
+  3 (`crates/infr-llama/tests/cpu_backend.rs`, gated, `INFR_TEMP=0`). CLI:
+  `INFR_CPU=1`.
+- Weights stored in native GGUF dtype (dtype-aware, lazy dequant).
+- **Next:** bounded f32 cache / quantized matvec (CPU memory wall) → Vulkan
+  adapter (`compile`/`execute`, still `todo!()`) → gemma4/E2B/MoE on the seam →
+  cleanup.
+
 ## MoE (Qwen3moe / Qwen3-30B-A3B-Q4) — LATEST perf (2026-06-29)
 
 Test model `hf:unsloth/Qwen3-30B-A3B-GGUF:Qwen3-30B-A3B-Q4_K_M.gguf` (~18.6GB,

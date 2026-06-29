@@ -1564,6 +1564,185 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    // ---- Record-once decode variants (`_dyn`) ----
+    // These read the per-token `pos`/`kv_len` from a host-updated `params` SSBO ([pos, kv_len] u32)
+    // instead of push constants, so the decode command buffer can be recorded once and replayed every
+    // token (only `params` + the embedding change). Used ONLY by the GPU-resident decode path; every
+    // other caller keeps the push-constant kernels. `params` is inserted before the output(s) so the
+    // recorder's reads|writes split stays output-last.
+
+    /// QK-norm + RoPE, pos from `params`. `out_base_mul` = 0 for Q (write to a temp), 1 for K (write
+    /// to the cache at row pos).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_dyn(
+        &self,
+        x: &dyn Buffer,
+        nw: &dyn Buffer,
+        params: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        out_base_mul: usize,
+        eps: f32,
+    ) {
+        self.stamp("qk_norm_rope");
+        let k = self.be.kernel(
+            "qk_norm_rope_dyn",
+            crate::gemm::qk_norm_rope_dyn_spv(),
+            4,
+            32,
+        );
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        // [20..24] rope_pos: unused (from params)
+        push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
+    /// Cast-copy f32 `src[0..n]` → f16 `dst[pos*n..]` (one KV row at position pos from `params`).
+    pub fn store_f16_dyn(&self, src: &dyn Buffer, params: &dyn Buffer, dst: &dyn Buffer, n: usize) {
+        self.stamp("store_f16");
+        let k = self
+            .be
+            .kernel("store_f16_dyn", crate::gemm::store_f16_dyn_spv(), 3, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        // [4..8] off: unused (computed as pos*n from params)
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
+    /// Causal GQA over the KV cache (q_len==1), pos_offset from `params`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_dyn(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        params: &dyn Buffer,
+        o: &dyn Buffer,
+        q_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+    ) {
+        self.stamp("attention_kv");
+        let kern = self.be.kernel(
+            "attention_kv_dyn",
+            crate::gemm::attention_kv_dyn_spv(),
+            5,
+            24,
+        );
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        // [4..8] kv_len: unused
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        // [20..24] pos_offset: unused (from params)
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(params),
+                Self::vkb(o),
+            ],
+            1,
+            &push,
+            (q_len * nh) as u32,
+        );
+    }
+
+    /// Split-K decode attention, kv_len from `params`. `chunk`/`n_chunks` stay push constants (they
+    /// define the dispatch structure; the caller re-records when they change).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split_dyn(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        params: &dyn Buffer,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+    ) {
+        self.stamp("attn_partial");
+        let k1 = self.be.kernel_sg(
+            "attn_partial_dyn",
+            crate::gemm::attn_partial_dyn_spv(),
+            7,
+            24,
+            32,
+        );
+        let mut p1 = [0u8; 24];
+        // [0..4] kv_len: unused (from params)
+        p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p1[16..20].copy_from_slice(&(chunk as u32).to_ne_bytes());
+        p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        self.dispatch(
+            k1,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(params),
+                Self::vkb(pm),
+                Self::vkb(pl),
+                Self::vkb(pacc),
+            ],
+            3,
+            &p1,
+            (nh * n_chunks) as u32,
+        );
+        // pass 2: combine (structure-only, unchanged from the push-constant path)
+        self.stamp("attn_combine");
+        let k2 = self
+            .be
+            .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
+        let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
+        let mut p2 = [0u8; 16];
+        p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p2[8..12].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        p2[12..16].copy_from_slice(&ntile.to_ne_bytes());
+        self.dispatch(
+            k2,
+            &[Self::vkb(pm), Self::vkb(pl), Self::vkb(pacc), Self::vkb(o)],
+            1,
+            &p2,
+            nh as u32 * ntile,
+        );
+    }
+
     /// Record a buffer→buffer copy of `bytes` from `src[src_offset..]` into `dst[dst_offset..]`.
     pub fn copy(
         &self,

@@ -9,7 +9,14 @@ layout(push_constant) uniform PC { uint q_len; uint kv_len; uint nh; uint nkv; u
 layout(binding = 0) readonly buffer QB { float16_t q[]; };
 layout(binding = 1) readonly buffer KB { float16_t k[]; };
 layout(binding = 2) readonly buffer VB { float16_t v[]; };
+#ifdef USE_PARAMS
+// Record-once decode: pos_offset comes from a host-updated params SSBO so the buffer can be replayed.
+// `o` moves to binding 4 (params takes binding 3) so the recorder's reads|writes split is output-last.
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 4) buffer OB { float o[]; };
+#else
 layout(binding = 3) buffer OB { float o[]; };
+#endif
 
 const uint TILE = 1024u;
 shared float q_sh[128];
@@ -22,7 +29,12 @@ void main() {
     if (unit >= pc.q_len * pc.nh) { return; }
     uint ti = unit / pc.nh;
     uint h = unit % pc.nh;
-    uint kvlen = pc.pos_offset + ti + 1u;
+#ifdef USE_PARAMS
+    uint pos_offset = p_pos;
+#else
+    uint pos_offset = pc.pos_offset;
+#endif
+    uint kvlen = pos_offset + ti + 1u;
     uint kvh = h / (pc.nh / pc.nkv);
     uint hd = pc.hd;
     float scale = 1.0 / sqrt(float(hd));

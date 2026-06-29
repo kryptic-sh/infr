@@ -121,6 +121,9 @@ struct DecodeScratch {
     pm: Box<dyn Buffer>,
     pl: Box<dyn Buffer>,
     pacc: Box<dyn Buffer>,
+    /// Host-visible [pos, kv_len] u32 SSBO the `_dyn` decode kernels read, so the decode command
+    /// buffer can be recorded once and replayed (only this + the embedding change per token).
+    params: Box<dyn Buffer>,
 }
 
 impl MoeKv {
@@ -3462,6 +3465,11 @@ impl Llama {
             pm: af(nh * ncm)?,
             pl: af(nh * ncm)?,
             pacc: af(nh * ncm * hd)?,
+            // host-visible so the host can write [pos, kv_len] per token through the mapped pointer
+            params: self
+                .be
+                .alloc(8, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
         })
     }
 
@@ -3770,6 +3778,15 @@ impl Llama {
         let attn = &dec.attn;
         let (g, u, act, y) = (&dec.g, &dec.u, &dec.act, &dec.y);
         let logits = &dec.logits;
+        let params = &dec.params;
+        // Per-token [pos, kv_len] for the `_dyn` kernels — the only thing (besides the embedding) the
+        // host writes per token, so the recorded command buffer can be replayed.
+        self.be
+            .upload(
+                params.as_ref(),
+                bytemuck::cast_slice(&[pos as u32, kv_len as u32]),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
         // GPU-resident routing when the expert format has an id-indexed GEMV: top-k + expert ids and
         // weights stay in VRAM (one submit/layer). Else fall back to host top-k (two submits/layer).
         let (gate_dtype, _) = native_parts(&self.layers[0].moe_stacked().expect("stacked").1.gate);
@@ -3819,35 +3836,37 @@ impl Llama {
                 layer.q_norm_buf.as_ref().unwrap().as_ref(),
                 layer.k_norm_buf.as_ref().unwrap().as_ref(),
             );
-            rec.qk_norm_rope(
+            // `_dyn` kernels read pos/kv_len from `dec.params` (written once per token above), so the
+            // recorded command buffer is pos-independent and can be replayed across tokens.
+            rec.qk_norm_rope_dyn(
                 qr.as_ref(),
                 qn,
+                params.as_ref(),
                 q_f16.as_ref(),
                 1,
                 nh,
                 hd,
                 c.rope_dim,
                 c.rope_theta,
-                pos,
-                0,
+                0, // Q: out_base = 0
                 c.rms_eps,
             );
-            rec.qk_norm_rope(
+            rec.qk_norm_rope_dyn(
                 kr.as_ref(),
                 kn,
+                params.as_ref(),
                 kv.kv.k[li].as_ref(),
                 1,
                 nkv,
                 hd,
                 c.rope_dim,
                 c.rope_theta,
-                pos,
-                pos,
+                1, // K: out_base = pos
                 c.rms_eps,
             );
-            rec.store_f16(vr.as_ref(), kv.kv.v[li].as_ref(), kvrow, pos * kvrow);
+            rec.store_f16_dyn(vr.as_ref(), params.as_ref(), kv.kv.v[li].as_ref(), kvrow);
             if use_split {
-                rec.attention_kv_split(
+                rec.attention_kv_split_dyn(
                     q_f16.as_ref(),
                     kv.kv.k[li].as_ref(),
                     kv.kv.v[li].as_ref(),
@@ -3855,7 +3874,7 @@ impl Llama {
                     pm.as_ref().unwrap().as_ref(),
                     pl.as_ref().unwrap().as_ref(),
                     pacc.as_ref().unwrap().as_ref(),
-                    kv_len,
+                    params.as_ref(),
                     nh,
                     nkv,
                     hd,
@@ -3863,17 +3882,16 @@ impl Llama {
                     n_chunks,
                 );
             } else {
-                rec.attention_kv(
+                rec.attention_kv_dyn(
                     q_f16.as_ref(),
                     kv.kv.k[li].as_ref(),
                     kv.kv.v[li].as_ref(),
+                    params.as_ref(),
                     attn.as_ref(),
                     1,
-                    kv_len,
                     nh,
                     nkv,
                     hd,
-                    pos,
                 );
             }
             rec_linear(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), 1, nh * hd, ne);

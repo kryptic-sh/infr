@@ -492,6 +492,21 @@ pub(crate) fn qk_norm_rope_spv() -> &'static [u32] {
     static QK_NORM_ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     QK_NORM_ROPE_SPV.get_or_init(|| spv_words(QK_NORM_ROPE_SPV_BYTES))
 }
+// Record-once decode variants (`-DUSE_PARAMS`): read the per-token pos/kv_len from a host-updated
+// params SSBO instead of push constants, so the decode command buffer can be replayed across tokens.
+macro_rules! dyn_spv {
+    ($f:ident, $name:literal) => {
+        pub(crate) fn $f() -> &'static [u32] {
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| spv_words(BYTES))
+        }
+    };
+}
+dyn_spv!(qk_norm_rope_dyn_spv, "qk_norm_rope_dyn");
+dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");
+dyn_spv!(attention_kv_dyn_spv, "attention_kv_dyn");
+dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");
 /// SPIR-V for fused attention input (RMSNorm + QKV proj + RoPE).
 pub(crate) fn attn_in_spv() -> &'static [u32] {
     static ATTN_IN_SPV: OnceLock<Vec<u32>> = OnceLock::new();

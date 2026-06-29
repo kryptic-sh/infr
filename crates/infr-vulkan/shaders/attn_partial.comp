@@ -19,9 +19,18 @@ layout(push_constant) uniform PC {
 layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [nh, hd] as vec4
 layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
 layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
+#ifdef USE_PARAMS
+// Record-once decode: kv_len comes from a host-updated params SSBO so the buffer replays across
+// tokens. Outputs shift to bindings 4/5/6 (params takes binding 3) to stay output-last.
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 4) buffer PM { float pm[]; };
+layout(binding = 5) buffer PL { float pl[]; };
+layout(binding = 6) buffer PACC { float pacc[]; };
+#else
 layout(binding = 3) buffer PM { float pm[]; };               // [nh, n_chunks]
 layout(binding = 4) buffer PL { float pl[]; };               // [nh, n_chunks]
 layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, hd]
+#endif
 
 shared float sc[1024];
 shared float red[64];
@@ -42,7 +51,12 @@ void main() {
     uint h = kvh * g + hh;
     float scale = 1.0 / sqrt(float(hd));
     uint j0 = c * pc.chunk;
-    uint j1 = min(j0 + pc.chunk, pc.kv_len);
+#ifdef USE_PARAMS
+    uint kv_len = p_kvlen;
+#else
+    uint kv_len = pc.kv_len;
+#endif
+    uint j1 = min(j0 + pc.chunk, kv_len);
 
     // QK via subgroup reduction (one key per subgroup-iteration; vec4 coalesced K reads). Each lane's
     // query vec4(s) are loop-invariant across keys → hold in registers (no q_sh, no barrier).

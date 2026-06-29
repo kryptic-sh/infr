@@ -6,10 +6,22 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint n; uint off; } pc;
 layout(binding = 0) readonly buffer SB { float src[]; };
+#ifdef USE_PARAMS
+// Record-once decode: the write offset is pos*n (one KV row at position pos), pos from a host-updated
+// params SSBO instead of the `pc.off` push constant. `dst` moves to binding 2 (params takes 1).
+layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 2) buffer DB { float16_t dst[]; };
+#else
 layout(binding = 1) buffer DB { float16_t dst[]; };
+#endif
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) { return; }
-    dst[pc.off + i] = float16_t(src[i]);
+#ifdef USE_PARAMS
+    uint off = p_pos * pc.n;
+#else
+    uint off = pc.off;
+#endif
+    dst[off + i] = float16_t(src[i]);
 }

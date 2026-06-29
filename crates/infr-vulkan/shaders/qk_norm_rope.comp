@@ -10,7 +10,16 @@ layout(push_constant) uniform PC {
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
 layout(binding = 1) readonly buffer NB { float nw[]; };
+#ifdef USE_PARAMS
+// Record-once decode: pos comes from a host-updated params SSBO instead of a push constant, so the
+// command buffer can be replayed across tokens. `pc.rope_pos` is unused; `pc.out_base` is the 0/1
+// out_base multiplier (Q→0, K→pos). Output `y` moves to binding 3 (params takes binding 2) so the
+// recorder's reads|writes split stays output-last.
+layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 3) buffer YB { float16_t y[]; };
+#else
 layout(binding = 2) buffer YB { float16_t y[]; };
+#endif
 
 shared float xs[128];
 shared float red[64];
@@ -32,8 +41,15 @@ void main() {
     }
     float scale = inversesqrt(red[0] / float(pc.hd) + pc.eps);
 
-    uint absp = pc.rope_pos + r;
-    uint out_base_idx = ((pc.out_base + r) * pc.nheads + h) * pc.hd;
+#ifdef USE_PARAMS
+    uint rope_pos = p_pos;
+    uint out_base = pc.out_base * p_pos; // pc.out_base is the 0/1 multiplier in dyn mode
+#else
+    uint rope_pos = pc.rope_pos;
+    uint out_base = pc.out_base;
+#endif
+    uint absp = rope_pos + r;
+    uint out_base_idx = ((out_base + r) * pc.nheads + h) * pc.hd;
     uint hf = pc.rope_dim / 2u;
     for (uint p = t; p < hf; p += 64u) {
         uint i0 = p;

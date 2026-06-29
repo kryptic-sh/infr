@@ -689,13 +689,6 @@ impl Default for Sampler {
 ///   and smaller VRAM (see [`is_native_default`]); `INFR_NATIVE=1` extends it to all formats.
 enum Wt {
     F16(Box<dyn Buffer>),
-    Q {
-        q: Box<dyn Buffer>,
-        s: Box<dyn Buffer>,
-        m: Box<dyn Buffer>,
-        bits: u32,      // 4 (Q4 → packed 8/u32) or 8 (Q5/Q6/Q8)
-        blk_shift: u32, // log2 of the scale/min block size (5 = per-32, 4 = per-16)
-    },
     /// Raw native-block bytes on the GPU; `dtype` identifies the dequant shader.
     Native {
         buf: Box<dyn Buffer>,
@@ -707,7 +700,6 @@ impl Wt {
     fn f16(&self) -> &dyn Buffer {
         match self {
             Wt::F16(b) => b.as_ref(),
-            Wt::Q { .. } => panic!("expected f16 weight, got quant (llama fused path needs f16)"),
             Wt::Native { .. } => {
                 panic!("expected f16 weight, got native quant (llama fused path needs f16)")
             }
@@ -2268,25 +2260,6 @@ fn is_quant(d: infr_core::DType) -> bool {
     )
 }
 
-/// In-VRAM packing per source quant: (bits, scale/min block size). Q4 packs to native 4-bit (8×
-/// smaller index than f16); Q5/Q6/Q8 keep 8-bit. Block size matches the quant's sub-block.
-fn quant_params(d: infr_core::DType) -> (u32, usize) {
-    use infr_core::DType::*;
-    match d {
-        Q4_0 => (4, 32), // 4-bit index (0..15), per-32-elem scale/min
-        Q4_1 => (4, 32), // 4-bit index (0..15), per-32-elem scale/min
-        Q5_0 => (8, 32), // 5-bit index (0..31) stored in 8-bit, per-32-elem scale/min
-        Q5_1 => (8, 32), // 5-bit index (0..31) stored in 8-bit, per-32-elem scale/min
-        Q8_0 => (8, 32), // 8-bit index, per-32-elem scale/min
-        Q2K => (4, 16),  // 2-bit quant (0..3) in 4-bit packing; per-16-elem sub-scale/min
-        Q3K => (4, 16),  // 3-bit quant (0..7) in 4-bit packing; per-16-elem sub-scale/min
-        Q4K => (4, 32),
-        Q5K => (8, 32),
-        Q6K => (8, 16),
-        _ => unreachable!(),
-    }
-}
-
 /// VRAM the model's weights will occupy once resident, split dense vs MoE-expert. Experts are
 /// tracked separately so a future expert-streaming / partial-offload mode can budget them apart
 /// from the always-resident dense weights — for a dense model `expert` is 0.
@@ -2313,16 +2286,11 @@ impl WeightFootprint {
 }
 
 /// Resident VRAM bytes for one tensor, mirroring [`upload_wt`]'s path so the estimate matches what
-/// actually gets allocated: native raw blocks (padded to u32), unified repack (index@bits + f16
-/// scale + f16 min per block), or f16 (codebook/float/norms dequanted to half).
+/// actually gets allocated: native raw blocks (padded to u32) for affine quants, else f16
+/// (codebook/float/norms dequanted to half).
 fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbytes: usize) -> u64 {
-    if use_native_for(dtype) && is_native_supported(dtype) {
+    if is_native_default(dtype) {
         ((nbytes + 3) & !3) as u64 // raw blocks, padded to u32 alignment
-    } else if is_quant(dtype) {
-        let (bits, blk) = quant_params(dtype);
-        let q = numel * bits as usize / 8;
-        let sm = 2 * (numel / blk.max(1)) * 2; // scale + min, one f16 each per block
-        (q + sm) as u64
     } else {
         (numel * 2) as u64 // f16
     }
@@ -2354,38 +2322,6 @@ pub fn weight_footprint(g: &Gguf) -> WeightFootprint {
     WeightFootprint { dense, expert }
 }
 
-/// Pack a unified-dequant result into the GPU layout: indices at `bits` (4 → 8/u32, else 4/u32),
-/// scales/mins one f16 per `blk`-element block.
-fn pack_unified(
-    qv: &[u8],
-    sc: &[f32],
-    mn: &[f32],
-    bits: u32,
-    blk: usize,
-) -> (Vec<u32>, Vec<u16>, Vec<u16>) {
-    let numel = qv.len();
-    let quants = if bits == 4 {
-        let mut q = vec![0u32; numel / 8];
-        for (g, &v) in qv.iter().enumerate() {
-            q[g / 8] |= ((v & 0xF) as u32) << (4 * (g % 8));
-        }
-        q
-    } else {
-        let mut q = vec![0u32; numel / 4];
-        for (g, &v) in qv.iter().enumerate() {
-            q[g / 4] |= (v as u32) << (8 * (g % 4));
-        }
-        q
-    };
-    let scales: Vec<u16> = (0..numel / blk)
-        .map(|b| half::f16::from_f32(sc[b * blk]).to_bits())
-        .collect();
-    let mins: Vec<u16> = (0..numel / blk)
-        .map(|b| half::f16::from_f32(mn[b * blk]).to_bits())
-        .collect();
-    (quants, scales, mins)
-}
-
 /// Affine quants with an optimized decode-once native path: sub-block-major GEMV (`dqblk`) +
 /// tiled coopmat GEMM (`native_gemm`). For these, native beats the unified repack (`Wt::Q`) on BOTH
 /// decode (e.g. Q4_K 506 vs 480 t/s) and prefill (Q8_0/Q6_K/Q5_K +27..40%; Q4_K within ~4% of
@@ -2400,60 +2336,13 @@ fn is_native_default(d: infr_core::DType) -> bool {
     )
 }
 
-/// Whether to use the raw-block / in-shader-dequant path (`Wt::Native`) for `dtype`.
-/// - `INFR_NONATIVE=1` → never (force unified repack / f16, the pre-GEMM behavior).
-/// - `INFR_NATIVE=1` → always, for every native-supported format (incl. grid/codebook).
-/// - default → only the optimized affine formats ([`is_native_default`]).
-fn use_native_for(d: infr_core::DType) -> bool {
-    if std::env::var("INFR_NONATIVE").is_ok() {
-        return false;
-    }
-    if std::env::var("INFR_NATIVE").is_ok() {
-        return true;
-    }
-    is_native_default(d)
-}
-
-/// True for quant types that have a native-block GEMV shader (affine + codebook formats with no
-/// grid-table dependency). Grid-based i-quants (IQ2*/IQ3*/IQ1*) are not yet native — they stay on
-/// the host-dequant → f16 path.
-fn is_native_supported(d: infr_core::DType) -> bool {
-    use infr_core::DType::*;
-    matches!(
-        d,
-        Q8_0 | Q4_0
-            | Q4_1
-            | Q5_0
-            | Q5_1
-            | Q2K
-            | Q3K
-            | Q4K
-            | Q5K
-            | Q6K
-            | Iq4Nl
-            | Iq4Xs
-            | Mxfp4
-            | Nvfp4
-            | Tq1_0
-            | Tq2_0
-            | Iq2Xxs
-            | Iq2Xs
-            | Iq2S
-            | Iq3Xxs
-            | Iq3S
-            | Iq1S
-            | Iq1M
-    )
-}
-
 /// Upload a projection weight, keeping quantized weights quantized in-VRAM (else convert to f16).
 ///
-/// - Optimized affine quants (Q4_K/Q5_K/Q6_K/Q8_0/Q4_0…) → `Wt::Native` by default (raw block
-///   bytes, in-shader decode-once dequant — faster decode + prefill, smaller VRAM; see
-///   [`use_native_for`]). `INFR_NONATIVE=1` falls back to `Wt::Q` (host dequant + repack).
-/// - Other affine quants → `Wt::Q`; `INFR_NATIVE=1` extends native to all supported formats.
-/// - Codebook quants (IQ*/TQ*/fp4) → host dequant → f16 → `Wt::F16` (native via `INFR_NATIVE=1`)
-/// - Float types (F16/F32/BF16) → `Wt::F16` directly
+/// - Affine quants (Q4_K/Q5_K/Q6_K/Q8_0/Q4_0…) → `Wt::Native` (raw block bytes, in-shader
+///   decode-once dequant — faster decode + prefill, smaller VRAM). These have the `native_id_*`
+///   decode GEMV shaders ([`is_native_default`]).
+/// - Codebook quants (IQ*/TQ*/fp4) and float types (F16/F32/BF16) → host dequant → f16 → `Wt::F16`.
+///   The i-quants have no decode-GEMV shader yet, so they stay on f16 until those land.
 fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
     let dtype = g
         .tensors()
@@ -2468,9 +2357,9 @@ fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
 /// Like [`upload_wt`] but from a raw byte slice + dtype — lets a stacked MoE expert tensor be sliced
 /// per expert (each expert is a contiguous block of the `*_exps` tensor) and uploaded individually.
 fn upload_wt_bytes(be: &VulkanBackend, dtype: infr_core::DType, bytes: &[u8]) -> Result<Wt> {
-    // Native-block path: raw upload + in-shader dequant. Default for optimized affine quants;
-    // INFR_NATIVE forces all supported formats, INFR_NONATIVE disables (see use_native_for).
-    if use_native_for(dtype) && is_native_supported(dtype) {
+    // Native-block path: raw upload + in-shader dequant — for affine quants that have decode-GEMV
+    // shaders (is_native_default). Everything else (codebook i-quants, floats) → host dequant → f16.
+    if is_native_default(dtype) {
         let padded = infr_vulkan::linear::pad_to_u32_align(bytes);
         return Ok(Wt::Native {
             buf: be
@@ -2479,26 +2368,12 @@ fn upload_wt_bytes(be: &VulkanBackend, dtype: infr_core::DType, bytes: &[u8]) ->
             dtype,
         });
     }
-    if is_quant(dtype) {
-        // Affine quants: GPU in-kernel dequant path (legacy / INFR_NONATIVE)
-        let (bits, blk) = quant_params(dtype);
-        let (qv, sc, mn) = dequant_unified(dtype, bytes);
-        let (q, s, m) = pack_unified(&qv, &sc, &mn, bits, blk);
-        Ok(Wt::Q {
-            q: be.upload_weight_bytes(bytemuck::cast_slice(&q))?,
-            s: be.upload_weight_bytes(bytemuck::cast_slice(&s))?,
-            m: be.upload_weight_bytes(bytemuck::cast_slice(&m))?,
-            bits,
-            blk_shift: blk.trailing_zeros(),
-        })
-    } else {
-        // Codebook quants and float types → host dequant to f32 → f16.
-        let f16_bytes: Vec<u8> = dequant_block(dtype, bytes)?
-            .iter()
-            .flat_map(|&v| f32_to_f16_sat(v).to_bits().to_le_bytes())
-            .collect();
-        Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes)?))
-    }
+    // Codebook quants and float types → host dequant to f32 → f16.
+    let f16_bytes: Vec<u8> = dequant_block(dtype, bytes)?
+        .iter()
+        .flat_map(|&v| f32_to_f16_sat(v).to_bits().to_le_bytes())
+        .collect();
+    Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes)?))
 }
 
 /// Build a dense layer's fused gate‖up weight (`[2*n_ff, n_embd]`, gate rows then up rows). Quant
@@ -2513,23 +2388,24 @@ fn build_wgateup(be: &VulkanBackend, g: &Gguf, prefix: &str) -> Result<Wt> {
         .map(|t| t.dtype);
     let gb = g.tensor_bytes(&gate_name).map_err(|e| anyhow!("{e}"))?;
     let ub = g.tensor_bytes(&up_name).map_err(|e| anyhow!("{e}"))?;
-    if gate_dtype.map(is_quant).unwrap_or(false) {
-        let dt = gate_dtype.unwrap();
-        let (bits, blk) = quant_params(dt);
-        let (mut qv, mut sc, mut mn) = dequant_unified(dt, gb);
-        let (qu, scu, mnu) = dequant_unified(dt, ub);
-        qv.extend(qu);
-        sc.extend(scu);
-        mn.extend(mnu);
-        let (q, s, m) = pack_unified(&qv, &sc, &mn, bits, blk);
-        Ok(Wt::Q {
-            q: be.upload_weight_bytes(bytemuck::cast_slice(&q))?,
-            s: be.upload_weight_bytes(bytemuck::cast_slice(&s))?,
-            m: be.upload_weight_bytes(bytemuck::cast_slice(&m))?,
-            bits,
-            blk_shift: blk.trailing_zeros(),
-        })
-    } else if gate_dtype.map(is_codebook_quant).unwrap_or(false) {
+    // Native fast path (default for optimized affine quants): the fused `[2*n_ff, n_embd]` weight is
+    // just gate's rows followed by up's rows, and each tensor's bytes are already row-contiguous quant
+    // blocks — so concatenating the raw bytes IS the fused weight (up's first block lands exactly at
+    // `gb.len()`, no inter-tensor padding). Raw upload, in-shader dequant — no host dequant/repack.
+    if let Some(dt) = gate_dtype {
+        if is_native_default(dt) {
+            let mut fused = gb.to_vec();
+            fused.extend_from_slice(ub);
+            let padded = infr_vulkan::linear::pad_to_u32_align(&fused);
+            return Ok(Wt::Native {
+                buf: be
+                    .upload_weight_bytes(&padded)
+                    .map_err(|e| anyhow!("native gateup upload: {e}"))?,
+                dtype: dt,
+            });
+        }
+    }
+    if gate_dtype.map(is_codebook_quant).unwrap_or(false) {
         let dt = gate_dtype.unwrap();
         let to_f16 = |bytes: &[u8]| -> Vec<u8> {
             dequant_codebook(dt, bytes)
@@ -2578,9 +2454,7 @@ fn load_moe(
     // Fully-GPU native model: upload each role's whole `*_exps` tensor as ONE Native buffer and
     // address experts by element offset. Per-expert buffers are dropped (same VRAM, one allocation),
     // and the on-GPU router can index experts without a host round-trip.
-    let native_ok = [gdt, udt, ddt]
-        .iter()
-        .all(|&d| use_native_for(d) && is_native_supported(d));
+    let native_ok = [gdt, udt, ddt].iter().all(|&d| is_native_default(d));
     if build_stacked && !on_cpu && native_ok {
         let mk = |dt, b| upload_wt_bytes(be, dt, b);
         return Ok(FfnWt::Moe {
@@ -3194,24 +3068,6 @@ impl Llama {
         let rec = self.be.recorder().map_err(|e| anyhow!("{e}"))?;
         match w {
             Wt::F16(b) => rec.linear(b.as_ref(), xb.as_ref(), yb.as_ref(), rows, in_f, out_f),
-            Wt::Q {
-                q,
-                s,
-                m,
-                bits,
-                blk_shift,
-            } => rec.linear_q(
-                q.as_ref(),
-                s.as_ref(),
-                m.as_ref(),
-                xb.as_ref(),
-                yb.as_ref(),
-                rows,
-                in_f,
-                out_f,
-                *bits,
-                *blk_shift,
-            ),
             Wt::Native { buf, dtype } => rec.linear_native(
                 *dtype,
                 buf.as_ref(),
@@ -3259,24 +3115,6 @@ impl Llama {
             let (xb, yb) = (xbufs[i].as_ref(), ybufs[i].as_ref());
             match w {
                 Wt::F16(b) => rec.linear(b.as_ref(), xb, yb, rows, in_f, out_f),
-                Wt::Q {
-                    q,
-                    s,
-                    m,
-                    bits,
-                    blk_shift,
-                } => rec.linear_q(
-                    q.as_ref(),
-                    s.as_ref(),
-                    m.as_ref(),
-                    xb,
-                    yb,
-                    rows,
-                    in_f,
-                    out_f,
-                    *bits,
-                    *blk_shift,
-                ),
                 Wt::Native { buf, dtype } => {
                     rec.linear_native(*dtype, buf.as_ref(), xb, yb, rows, in_f, out_f)
                 }
@@ -3703,22 +3541,6 @@ impl Llama {
         } else {
             None
         };
-        // mmq (dp4a integer) prefill scratch: int8 activations + per-32-block f16 scale/sum, sized
-        // for the largest projection K. Reused across all u4 projections. (q6/q8/f16 stay on the
-        // f16 warp matmul_proj.) DEFAULT for u4 prefill (INFR_NOMMQ to disable).
-        let use_mmq_alloc = use_gemm && std::env::var("INFR_NOMMQ").is_err();
-        let mmq_bufs = if use_mmq_alloc {
-            let maxk = ne.max(nh * hd).max(nff);
-            let nblk = maxk / 32;
-            Some((
-                alloc(mpad * maxk, BufferUsage::Activations)?, // qa int8 (1 byte/elem)
-                alloc(mpad * nblk * 2, BufferUsage::Activations)?, // dact f16
-                alloc(mpad * nblk * 2, BufferUsage::Activations)?, // sact f16
-            ))
-        } else {
-            None
-        };
-
         // Flash-decoding: for single-token decode, split each head's KV range across many
         // workgroups (partials in pm/pl/pacc), so attention isn't stuck on `nh` workgroups. The
         // chunk size is adaptive: a coarse fixed chunk leaves too few workgroups at low/mid context,
@@ -3787,24 +3609,6 @@ impl Llama {
         let lin = |w: &Wt, x: &dyn Buffer, y: &dyn Buffer, rows: usize, inf: usize, outf: usize| {
             match w {
                 Wt::F16(b) => rec.linear(b.as_ref(), x, y, rows, inf, outf),
-                Wt::Q {
-                    q,
-                    s,
-                    m,
-                    bits,
-                    blk_shift,
-                } => rec.linear_q(
-                    q.as_ref(),
-                    s.as_ref(),
-                    m.as_ref(),
-                    x,
-                    y,
-                    rows,
-                    inf,
-                    outf,
-                    *bits,
-                    *blk_shift,
-                ),
                 Wt::Native { buf, dtype } => {
                     rec.linear_native(*dtype, buf.as_ref(), x, y, rows, inf, outf)
                 }
@@ -3818,61 +3622,9 @@ impl Llama {
                        inf: usize,
                        outf: usize| match w {
             Wt::F16(b) => rec.linear_add(b.as_ref(), x, res, y, rows, inf, outf),
-            Wt::Q {
-                q,
-                s,
-                m,
-                bits,
-                blk_shift,
-            } => rec.linear_add_q(
-                q.as_ref(),
-                s.as_ref(),
-                m.as_ref(),
-                x,
-                res,
-                y,
-                rows,
-                inf,
-                outf,
-                *bits,
-                *blk_shift,
-            ),
             Wt::Native { buf, dtype } => {
                 rec.linear_add_native(*dtype, buf.as_ref(), x, res, y, rows, inf, outf)
             }
-        };
-        let ffn = |hidden: &dyn Buffer,
-                   nw: &dyn Buffer,
-                   w: &Wt,
-                   act: &dyn Buffer,
-                   rows: usize,
-                   ne: usize,
-                   nff: usize,
-                   eps: f32| match w {
-            Wt::F16(b) => rec.ffn_in(hidden, nw, b.as_ref(), act, rows, ne, nff, eps),
-            Wt::Q {
-                q,
-                s,
-                m,
-                bits,
-                blk_shift,
-            } => rec.ffn_in_q(
-                hidden,
-                nw,
-                q.as_ref(),
-                s.as_ref(),
-                m.as_ref(),
-                act,
-                rows,
-                ne,
-                nff,
-                eps,
-                *bits,
-                *blk_shift,
-            ),
-            // wgateup is always built via the Q/F16 fusion path, so Native won't appear here
-            // for Phases 0-2. If it does (future), fall through to the unfused path.
-            Wt::Native { .. } => unimplemented!("native ffn_in not yet implemented"),
         };
         // coopmat GEMM `c = a · Wᵀ` for prefill; binds the dummy buffer as scales/mins for f16.
         // Integer dp4a mmq path is DEFAULT for u4 projections (INFR_NOMMQ to disable). It keeps the
@@ -3880,51 +3632,11 @@ impl Llama {
         // falls back to the dequant-bound BN=64 gemm_proj and re-dequantizes the whole weight once
         // per BM-row-tile: mmq is +26..50% at ub≤512 and still +3..5% at ub=4096 (where the f16 warp
         // matmul is compute-bound). Adds a cheap quant_q8 activation pass amortized across projections.
-        let use_mmq = use_mmq_alloc;
         let mm = |w: &Wt, a: &dyn Buffer, cbuf: &dyn Buffer, rows: usize, k: usize, outf: usize| {
             let dummy = gemm_bufs.as_ref().unwrap().3.as_ref();
             match w {
                 Wt::F16(b) => {
                     rec.matmul_proj(a, b.as_ref(), dummy, dummy, cbuf, rows, k, outf, 16, 0)
-                }
-                Wt::Q {
-                    q,
-                    s,
-                    m,
-                    bits,
-                    blk_shift,
-                } => {
-                    // u4 → dp4a integer mmq (no per-GEMM dequant; weights stay quantized). q6/q8
-                    // keep the f16 warp matmul_proj. Requires k%32, outf%64 (all projections satisfy).
-                    if *bits == 4 && k.is_multiple_of(32) && outf.is_multiple_of(64) && use_mmq {
-                        let (qa, dact, sact) = mmq_bufs.as_ref().unwrap();
-                        rec.matmul_proj_mmq(
-                            a,
-                            q.as_ref(),
-                            s.as_ref(),
-                            m.as_ref(),
-                            cbuf,
-                            qa.as_ref(),
-                            dact.as_ref(),
-                            sact.as_ref(),
-                            rows,
-                            k,
-                            outf,
-                        );
-                    } else {
-                        rec.matmul_proj(
-                            a,
-                            q.as_ref(),
-                            s.as_ref(),
-                            m.as_ref(),
-                            cbuf,
-                            rows,
-                            k,
-                            outf,
-                            *bits,
-                            *blk_shift,
-                        );
-                    }
                 }
                 // Native-block prefill: coopmat tiled GEMM with in-shader dequant (decode-once per
                 // weight element, reused across the row tile). Needs n%64, k%32 (all projections
@@ -3973,65 +3685,14 @@ impl Llama {
                         c.rms_eps,
                     );
                 };
-                // Un-fused (rmsnorm + 3× subgroup GEMV) beats the fused attn_in_q: the fused kernel
+                // Un-fused (rmsnorm + 3× subgroup GEMV) beats a fused attn_in: the fused kernel
                 // recomputes the RMS sum-of-squares per output row (~2× compute), and the standalone
-                // GEMV is the fast subgroup mul_mat_vec_q. Opt back into fusion with INFR_FUSE.
-                let fuse_qkv = std::env::var("INFR_FUSE").is_ok()
-                    && matches!(
-                        (&layer.wq, &layer.wk, layer.wv.as_ref()),
-                        (Wt::Q { .. }, Wt::Q { .. }, Some(Wt::Q { .. }))
-                    );
+                // GEMV is the fast subgroup mul_mat_vec_q.
                 if use_gemm {
                     rmsnorm_qkv();
                     mm(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
                     mm(&layer.wk, hn.as_ref(), kr.as_ref(), n, ne, kvrow);
                     mm(layer.wv(), hn.as_ref(), vr.as_ref(), n, ne, kvrow);
-                } else if fuse_qkv {
-                    // decode: fuse rmsnorm + Q/K/V quant projections into one dispatch.
-                    let (
-                        Wt::Q {
-                            q: qq,
-                            s: qs,
-                            m: qm,
-                            bits: qb,
-                            blk_shift: qbs,
-                        },
-                        Wt::Q {
-                            q: kq,
-                            s: ks,
-                            m: km,
-                            bits: kb,
-                            blk_shift: kbs,
-                        },
-                        Wt::Q {
-                            q: vq,
-                            s: vs,
-                            m: vm,
-                            bits: vb,
-                            blk_shift: vbs,
-                        },
-                    ) = (&layer.wq, &layer.wk, layer.wv())
-                    else {
-                        unreachable!()
-                    };
-                    rec.attn_in_q(
-                        hidden.as_ref(),
-                        layer.attn_norm_buf.as_ref(),
-                        (qq.as_ref(), qs.as_ref(), qm.as_ref()),
-                        (kq.as_ref(), ks.as_ref(), km.as_ref()),
-                        (vq.as_ref(), vs.as_ref(), vm.as_ref()),
-                        qr.as_ref(),
-                        kr.as_ref(),
-                        vr.as_ref(),
-                        n,
-                        ne,
-                        nh * hd,
-                        kvrow,
-                        c.rms_eps,
-                        (*qb, *qbs),
-                        (*kb, *kbs),
-                        (*vb, *vbs),
-                    );
                 } else {
                     rmsnorm_qkv();
                     lin(&layer.wq, hn.as_ref(), qr.as_ref(), n, ne, nh * hd);
@@ -4283,38 +3944,25 @@ impl Llama {
                     nh * hd,
                     ne,
                 );
-                if std::env::var("INFR_FUSE").is_ok() {
-                    ffn(
-                        hidden.as_ref(),
-                        layer.ffn_norm_buf.as_ref(),
-                        layer.wgateup(),
-                        act.as_ref(),
-                        n,
-                        ne,
-                        nff,
-                        c.rms_eps,
-                    );
-                } else {
-                    // Un-fused FFN: rmsnorm → gate/up subgroup GEMV → SwiGLU (no per-output redundant
-                    // RMS sum-of-squares; reuses the fast mul_mat_vec_q).
-                    rec.rmsnorm(
-                        hidden.as_ref(),
-                        layer.ffn_norm_buf.as_ref(),
-                        hn.as_ref(),
-                        n,
-                        ne,
-                        c.rms_eps,
-                    );
-                    lin(
-                        layer.wgateup(),
-                        hn.as_ref(),
-                        gu_ffn.as_ref(),
-                        n,
-                        ne,
-                        2 * nff,
-                    );
-                    rec.silu_mul_fused(gu_ffn.as_ref(), act.as_ref(), n, nff);
-                }
+                // Un-fused FFN: rmsnorm → gate/up subgroup GEMV → SwiGLU (no per-output redundant
+                // RMS sum-of-squares; reuses the fast mul_mat_vec_q).
+                rec.rmsnorm(
+                    hidden.as_ref(),
+                    layer.ffn_norm_buf.as_ref(),
+                    hn.as_ref(),
+                    n,
+                    ne,
+                    c.rms_eps,
+                );
+                lin(
+                    layer.wgateup(),
+                    hn.as_ref(),
+                    gu_ffn.as_ref(),
+                    n,
+                    ne,
+                    2 * nff,
+                );
+                rec.silu_mul_fused(gu_ffn.as_ref(), act.as_ref(), n, nff);
                 lin_add(
                     layer.wdown(),
                     act.as_ref(),
@@ -6153,7 +5801,7 @@ impl Llama {
         let host_layer = !idx.is_empty() && experts[idx[0]].gate.is_cpu();
         let stream_layer = host_layer
             && self.moe_stream
-            && matches!(&experts[idx[0]].gate, ExpertW::Cpu { dtype } if is_native_supported(*dtype));
+            && matches!(&experts[idx[0]].gate, ExpertW::Cpu { dtype } if is_native_default(*dtype));
         let ys: Vec<Vec<f32>> = if stream_layer {
             self.stream_experts(x, &idx, experts, mc, li, pool)?
         } else if host_layer {
@@ -6675,24 +6323,6 @@ fn rec_linear(
 ) {
     match w {
         Wt::F16(b) => rec.linear(b.as_ref(), x, y, rows, in_f, out_f),
-        Wt::Q {
-            q,
-            s,
-            m,
-            bits,
-            blk_shift,
-        } => rec.linear_q(
-            q.as_ref(),
-            s.as_ref(),
-            m.as_ref(),
-            x,
-            y,
-            rows,
-            in_f,
-            out_f,
-            *bits,
-            *blk_shift,
-        ),
         Wt::Native { buf, dtype } => {
             rec.linear_native(*dtype, buf.as_ref(), x, y, rows, in_f, out_f)
         }
@@ -6713,25 +6343,6 @@ fn rec_linear_add(
 ) {
     match w {
         Wt::F16(b) => rec.linear_add(b.as_ref(), x, residual, y, rows, in_f, out_f),
-        Wt::Q {
-            q,
-            s,
-            m,
-            bits,
-            blk_shift,
-        } => rec.linear_add_q(
-            q.as_ref(),
-            s.as_ref(),
-            m.as_ref(),
-            x,
-            residual,
-            y,
-            rows,
-            in_f,
-            out_f,
-            *bits,
-            *blk_shift,
-        ),
         Wt::Native { buf, dtype } => {
             rec.linear_add_native(*dtype, buf.as_ref(), x, residual, y, rows, in_f, out_f)
         }
@@ -7486,159 +7097,18 @@ mod dequant_tests {
     }
 }
 
-/// Phase 3: validate that the full dequant_unified → pack_unified → GPU linear_q pipeline
-/// produces the same result as the CPU dequant for each new affine quant type.
+/// Validate that the native raw-block GPU GEMV (`linear_native`) matches the CPU dequant for each
+/// affine quant type — the single upload path now that `Wt::Q` (host repack + `linear_q`) is gone.
 #[cfg(test)]
 mod gpu_affine_tests {
     use super::*;
     use infr_core::backend::BufferUsage;
     use infr_vulkan::VulkanBackend;
 
-    /// Run `linear_q` on the GPU for a single-block weight, compare to CPU.
-    fn check_gpu_affine(dtype: infr_core::DType, block_bytes: &[u8]) {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
-        };
-        // dequant + pack on CPU
-        let (bits, blk) = quant_params(dtype);
-        let (qv, sc, mn) = dequant_unified(dtype, block_bytes);
-        let (q_packed, s_packed, m_packed) = pack_unified(&qv, &sc, &mn, bits, blk);
-        let numel = qv.len();
-
-        // input: one row of `numel` f32 activations, all 1.0 (sum = dot(w, 1) = sum of weights)
-        let x: Vec<f32> = vec![1.0f32; numel];
-        let bq = be
-            .upload_weight_bytes(bytemuck::cast_slice(&q_packed))
-            .unwrap();
-        let bs = be
-            .upload_weight_bytes(bytemuck::cast_slice(&s_packed))
-            .unwrap();
-        let bm = be
-            .upload_weight_bytes(bytemuck::cast_slice(&m_packed))
-            .unwrap();
-        let upx = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
-        be.upload(upx.as_ref(), bytemuck::cast_slice(&x)).unwrap();
-        let by = be.alloc(4, BufferUsage::Readback).unwrap(); // 1 output row, 1 out feature
-
-        // rows=1, in_f=numel, out_f=1 → single dot product
-        let rec = be.recorder().unwrap();
-        rec.linear_q(
-            bq.as_ref(),
-            bs.as_ref(),
-            bm.as_ref(),
-            upx.as_ref(),
-            by.as_ref(),
-            1,
-            numel,
-            1,
-            bits,
-            blk.trailing_zeros(),
-        );
-        rec.finish().unwrap();
-        let mut bytes = vec![0u8; 4];
-        be.download(by.as_ref(), &mut bytes).unwrap();
-        let gpu_out: f32 = bytemuck::cast_slice(&bytes)[0];
-
-        // CPU reference: sum of all dequantized weights (dot with all-ones)
-        let cpu_out: f32 = (0..numel)
-            .map(|g| sc[g] * qv[g] as f32 + mn[g])
-            .sum::<f32>();
-        let err = (gpu_out - cpu_out).abs();
-        let rel = err / (cpu_out.abs() + 1e-6);
-        assert!(
-            rel < 5e-3,
-            "{dtype:?} GPU vs CPU: gpu={gpu_out} cpu={cpu_out} err={err} rel={rel}"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires a Vulkan GPU"]
-    fn q4_0_gpu_matches_cpu() {
-        // d=2.0, qs all=0x89 (lo=9,hi=8) → y[0..16]=d*(9-8)=2, y[16..32]=d*(8-8)=0
-        let d_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
-        let mut block = vec![0u8; 18];
-        block[0..2].copy_from_slice(&d_bytes);
-        for b in &mut block[2..18] {
-            *b = 0x89;
-        }
-        check_gpu_affine(infr_core::DType::Q4_0, &block);
-    }
-
-    #[test]
-    #[ignore = "requires a Vulkan GPU"]
-    fn q4_1_gpu_matches_cpu() {
-        // d=1.0, m=0.5, qs all=0x31 (lo=1,hi=3) → y[0..16]=1.5, y[16..32]=3.5
-        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
-        let m_bytes = half::f16::from_f32(0.5).to_bits().to_le_bytes();
-        let mut block = vec![0u8; 20];
-        block[0..2].copy_from_slice(&d_bytes);
-        block[2..4].copy_from_slice(&m_bytes);
-        for b in &mut block[4..20] {
-            *b = 0x31;
-        }
-        check_gpu_affine(infr_core::DType::Q4_1, &block);
-    }
-
-    #[test]
-    #[ignore = "requires a Vulkan GPU"]
-    fn q5_0_gpu_matches_cpu() {
-        // d=1.0, qh=0, qs all=0x0A (lo=10,hi=0) → y=d*(10-16)=-6, y[16..]=d*(0-16)=-16
-        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
-        let mut block = vec![0u8; 22];
-        block[0..2].copy_from_slice(&d_bytes);
-        for b in &mut block[6..22] {
-            *b = 0x0A;
-        }
-        check_gpu_affine(infr_core::DType::Q5_0, &block);
-    }
-
-    #[test]
-    #[ignore = "requires a Vulkan GPU"]
-    fn q5_1_gpu_matches_cpu() {
-        // d=1.0, m=2.0, qh=0, qs all=0x1F (lo=15,hi=1) → y[0..16]=17, y[16..32]=3
-        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
-        let m_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
-        let mut block = vec![0u8; 24];
-        block[0..2].copy_from_slice(&d_bytes);
-        block[2..4].copy_from_slice(&m_bytes);
-        for b in &mut block[8..24] {
-            *b = 0x1F;
-        }
-        check_gpu_affine(infr_core::DType::Q5_1, &block);
-    }
-
-    #[test]
-    #[ignore = "requires a Vulkan GPU"]
-    fn q2k_gpu_matches_cpu() {
-        // Minimal 256-elem block: d=1.0, dmin=0, scales[0..2]=0x03 (lo=3,hi=0), qs=0x55
-        let mut block = vec![0u8; 84];
-        block[0] = 0x03;
-        block[1] = 0x03;
-        for b in &mut block[16..80] {
-            *b = 0x55;
-        }
-        block[80..82].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
-        check_gpu_affine(infr_core::DType::Q2K, &block);
-    }
-
-    #[test]
-    #[ignore = "requires a Vulkan GPU"]
-    fn q3k_gpu_matches_cpu() {
-        // All-zero block except d=1.0 → all elements are 128.0 (see q3k unit test)
-        let mut block = vec![0u8; 110];
-        block[108..110].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
-        check_gpu_affine(infr_core::DType::Q3K, &block);
-    }
-
-    // ── Native-block GPU-vs-CPU parity tests (Phase 0-2) ────────────────────
+    // ── Native-block GPU-vs-CPU parity tests ────────────────────────────────
     //
     // Each test: build a known raw block, run `linear_native` GEMV with x=all-1.0,
     // compare to `dequant_unified`/`dequant_codebook` CPU sum (dot with 1.0 = weight sum).
-    // Also compare against `linear_q` (Wt::Q) for affine quants to prove parity.
 
     fn check_native(dtype: infr_core::DType, block_bytes: &[u8]) {
         let be = match VulkanBackend::new() {
@@ -7685,48 +7155,6 @@ mod gpu_affine_tests {
             rel < 5e-3,
             "{dtype:?} native GPU vs CPU: gpu={gpu_out} cpu={cpu_out} err={err} rel={rel}"
         );
-
-        // Parity with Wt::Q unified path (for affine quants that support it)
-        if is_quant(dtype) {
-            let (bits, blk) = quant_params(dtype);
-            let (qv2, sc2, mn2) = dequant_unified(dtype, block_bytes);
-            let (q_packed, s_packed, m_packed) = pack_unified(&qv2, &sc2, &mn2, bits, blk);
-            let bq = be
-                .upload_weight_bytes(bytemuck::cast_slice(&q_packed))
-                .unwrap();
-            let bs = be
-                .upload_weight_bytes(bytemuck::cast_slice(&s_packed))
-                .unwrap();
-            let bm = be
-                .upload_weight_bytes(bytemuck::cast_slice(&m_packed))
-                .unwrap();
-            let xbuf2 = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
-            be.upload(xbuf2.as_ref(), bytemuck::cast_slice(&x)).unwrap();
-            let ybuf2 = be.alloc(4, BufferUsage::Readback).unwrap();
-            let rec2 = be.recorder().unwrap();
-            rec2.linear_q(
-                bq.as_ref(),
-                bs.as_ref(),
-                bm.as_ref(),
-                xbuf2.as_ref(),
-                ybuf2.as_ref(),
-                1,
-                numel,
-                1,
-                bits,
-                blk.trailing_zeros(),
-            );
-            rec2.finish().unwrap();
-            let mut out2 = vec![0u8; 4];
-            be.download(ybuf2.as_ref(), &mut out2).unwrap();
-            let q_out: f32 = bytemuck::cast_slice(&out2)[0];
-            let err2 = (gpu_out - q_out).abs();
-            let rel2 = err2 / (q_out.abs() + 1e-6);
-            assert!(
-                rel2 < 5e-3,
-                "{dtype:?} native vs unified-Q: native={gpu_out} q={q_out} err={err2} rel={rel2}"
-            );
-        }
     }
 
     // ── Phase 0: Q8_0 ────────────────────────────────────────────────────────

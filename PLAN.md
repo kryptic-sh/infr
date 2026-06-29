@@ -105,6 +105,7 @@ weight dtype and to keep q / KV in f16.
 | Gemma 3 on CPU (sandwich norms, GeGLU, dual-RoPE, SWA, embed scale, softcap) | ✅ `c4d9a78`       |
 | CLI `INFR_CPU=1` one-shot                                                    | ✅ `39ada38`       |
 | Dtype-aware native-dtype weights                                             | ✅ `9964451`       |
+| Streaming Linear (row-by-row dequant, no full-model f32 cache)               | ✅ `a736876`       |
 | Vulkan adapter (`compile`/`execute`)                                         | ⬜ still `todo!()` |
 | gemma4 / E2B / MoE on the seam                                               | ⬜                 |
 
@@ -144,11 +145,13 @@ attention scale `1/√hd` (gemma4 uses `1.0`); fused gate‖up is
 
 ## Remaining phases
 
-1. **Bounded f32 weight cache / true quantized matvec.** The CPU backend's lazy
-   dequant still caches the whole model in f32 (~29 GB for an E2B-size model,
-   OOM for 12B / MoE-30B). Dequant per-block inside the dot product (no full f32
-   materialization), or a size-bounded cache, removes the memory wall and lets
-   real models run on CPU.
+1. ~~**Bounded f32 weight cache / true quantized matvec.**~~ ✅ `a736876`.
+   `Op::Linear` now streams the weight one row at a time straight from its
+   native GGUF bytes, dequantizing inside the dot — peak extra memory is a
+   single dequant'd row, so the whole-model f32 cache (the ~29 GB / OOM wall) is
+   gone. Only the tiny norm weights stay cached. **Perf is unaddressed**: the
+   weight is re-dequantized every step (no SIMD/threading) — a later pass
+   (bounded cache for the hot working set, or SIMD/threaded dequant-matvec).
 2. **f16 KV cache + activations on CPU.** Match the GPU's f16 representation —
    halves KV memory and tightens parity.
 3. **Vulkan adapter (`compile`/`execute`).** Map the dtype-aware graph onto the

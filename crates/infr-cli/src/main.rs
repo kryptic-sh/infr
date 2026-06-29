@@ -586,9 +586,26 @@ fn cmd_compare(
     use std::process::Command;
     let exe = std::env::current_exe().context("locating the infr binary")?;
     let reps_s = reps.to_string();
-    // llama-bench wants a concrete file — give it the resolved GGUF path from the shared cache.
-    let model_path = resolve(model)?.0;
-    let model_path = model_path.to_string_lossy().into_owned();
+    // infr and llama.cpp share the HF Hub cache and the same `org/repo:quant` ref grammar, so hand
+    // BOTH tools the same reference: `infr bench` takes `model` verbatim, and llama-bench gets the
+    // matching `-hf`/`--hf-file` (or `-m` for a local path). Pull once up front so `--offline` holds.
+    let resolved = resolve(model)?.0; // ensures the model is cached; also the `-m` path for a local file
+    let llama_model_args: Vec<String> = match infr_hub::ModelRef::parse(model)? {
+        infr_hub::ModelRef::Repo { repo, sel } => {
+            let mut a = vec!["--offline".to_string()];
+            match sel {
+                None => a.extend(["-hf".into(), repo]),
+                Some(s) if s.to_lowercase().ends_with(".gguf") => {
+                    a.extend(["--hf-repo".into(), repo, "--hf-file".into(), s])
+                }
+                Some(s) => a.extend(["-hf".into(), format!("{repo}:{s}")]),
+            }
+            a
+        }
+        infr_hub::ModelRef::Path(_) => {
+            vec!["-m".to_string(), resolved.to_string_lossy().into_owned()]
+        }
+    };
 
     // Run `infr bench` (this binary) and read its single-row [{"avg_ts":X}].
     let infr_b = |args: &[&str]| -> anyhow::Result<f64> {
@@ -613,19 +630,9 @@ fn cmd_compare(
     // Run `llama-bench -o json` and pick the row matching (n_prompt, n_gen): -pg adds extra rows.
     let llama_b = |np: usize, ng: usize, args: &[&str]| -> Option<f64> {
         let mut c = Command::new(llama_bench);
+        c.args(&llama_model_args);
         c.args([
-            "-m",
-            &model_path,
-            "-ngl",
-            "99",
-            "-dev",
-            dev,
-            "-fa",
-            "auto",
-            "-r",
-            &reps_s,
-            "-o",
-            "json",
+            "-ngl", "99", "-dev", dev, "-fa", "auto", "-r", &reps_s, "-o", "json",
         ]);
         if ubatch > 0 {
             c.args(["-ub", &ubatch.to_string()]);

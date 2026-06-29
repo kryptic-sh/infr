@@ -71,3 +71,32 @@ fn cpu_matches_gpu_gemma3() {
     println!("CPU: {cpu:?}");
     assert_eq!(cpu, gpu, "gemma3 CPU must match GPU greedy output");
 }
+
+fn gemma4_12b() -> PathBuf {
+    let hub = std::env::var("HOME").unwrap() + "/.cache/huggingface/hub";
+    let base = format!("{hub}/models--unsloth--gemma-4-12b-it-GGUF/snapshots");
+    for e in std::fs::read_dir(&base).expect("snapshots dir") {
+        let f = e.unwrap().path().join("gemma-4-12b-it-Q4_K_M.gguf");
+        if f.exists() {
+            return f;
+        }
+    }
+    panic!("gemma-4-12b gguf not found");
+}
+
+/// Gemma 4 dense (per-layer SWA/full head dims, weightless V-norm, V=K reuse on full layers,
+/// proportional-RoPE freq_factors, attn scale 1.0, per-layer output scale, final softcap) on the CPU
+/// backend must match the GPU greedy path token-for-token. Small `n` — 12B re-dequants per step.
+#[test]
+#[ignore = "needs a Vulkan GPU + the gemma-4-12b GGUF; run with INFR_TEMP=0 (slow: 12B on CPU)"]
+fn cpu_matches_gpu_gemma4() {
+    std::env::set_var("INFR_TEMP", "0");
+    let llama = infr_llama::Llama::load_opt(&gemma4_12b(), None).expect("load");
+    let prompt = "The capital of France is";
+    let n = 8;
+    let gpu = llama.generate(prompt, n, |_| {}).expect("gpu generate");
+    let cpu = llama.generate_cpu(prompt, n).expect("cpu generate");
+    println!("GPU: {gpu:?}");
+    println!("CPU: {cpu:?}");
+    assert_eq!(cpu, gpu, "gemma4 CPU must match GPU greedy output");
+}

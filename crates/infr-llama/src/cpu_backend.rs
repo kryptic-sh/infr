@@ -473,13 +473,14 @@ impl Backend for CpuBackend {
 // The KV cache grows one row per step. Validates the agnostic seam end-to-end against the GPU path.
 
 /// Per-layer weight handles captured while building one decode graph (q/k-norm + the gemma
-/// sandwich norms are optional). The order they're declared in MUST match the upload order so
-/// `weights[i]` binds to `wbufs[i]`.
+/// sandwich norms are optional; `wv` is absent on gemma4 full-attention layers, which reuse the raw
+/// K projection as V). The order they're declared in MUST match the upload order so `weights[i]`
+/// binds to `wbufs[i]`.
 struct LayerW {
     attn_norm: TensorId,
     wq: TensorId,
     wk: TensorId,
-    wv: TensorId,
+    wv: Option<TensorId>,
     q_norm: Option<TensorId>,
     k_norm: Option<TensorId>,
     wo: TensorId,
@@ -495,28 +496,35 @@ struct LayerW {
 struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
+    rope_freqs: Option<TensorId>, // gemma4 proportional-RoPE divisors (full-attention layers)
     logits: TensorId,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
-/// Greedy CPU generation for a dense decoder (Qwen3 / Llama / Gemma 3). `prompt` is the full token
-/// prefix; returns the generated continuation. Stops at EOS or `max_new`. gemma4 (per-layer head
-/// dims, V-norm, layer-output scale, E2B) and MoE are not handled yet.
+/// Greedy CPU generation for a dense decoder (Qwen3 / Llama / Gemma 3 / Gemma 4 dense). `prompt` is
+/// the full token prefix; returns the generated continuation. Stops at EOS or `max_new`. gemma4 E2B
+/// (per-layer input embeddings + KV sharing) and MoE are not handled yet.
 pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> AResult<Vec<u32>> {
     let c = &llama.cfg;
-    if c.moe.is_some() || c.gemma4 {
+    if c.moe.is_some() {
+        return Err(anyhow!("cpu runner: dense only (MoE not on the seam yet)"));
+    }
+    if c.n_embd_per_layer > 0 {
         return Err(anyhow!(
-            "cpu runner: dense Qwen3/Llama/Gemma3 only (no MoE/gemma4 yet)"
+            "cpu runner: gemma4 E2B (per-layer input embeddings) not on the seam yet"
         ));
     }
     let be = CpuBackend::new();
-    let (ne, nh, nkv, hd) = (c.n_embd, c.n_head, c.n_kv, c.head_dim);
-    let kvrow = nkv * hd;
-    let qrow = nh * hd;
-    let nff = c.n_ff;
+    let (ne, nh) = (c.n_embd, c.n_head);
+    // gemma4: per-layer SWA/full dims differ; size shared scratch + KV by the max over layers.
+    let max_hd = c.max_head_dim();
+    let max_kvrow = c.max_n_kv() * max_hd;
+    let max_qrow = nh * max_hd;
+    let nff = c.n_ff; // max FFN width
     let gemma = c.gemma;
+    let gemma4 = c.gemma4;
     let qk_norm = c.qk_norm;
     let act = if gemma {
         Activation::Gelu
@@ -524,6 +532,45 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         Activation::Silu
     };
     let max_ctx = prompt.len() + max_new + 1;
+
+    // Per-layer presence of an explicit V projection. gemma4 full-attention layers omit it (V = the
+    // raw K projection); every layer of every other model has one.
+    let has_wv: Vec<bool> = (0..c.n_layer)
+        .map(|l| {
+            llama
+                .gguf
+                .tensors()
+                .iter()
+                .any(|t| t.name == format!("blk.{l}.attn_v.weight"))
+        })
+        .collect();
+    // gemma4 per-layer output scale (`layer_output_scale.weight`, a single scalar multiplying the
+    // layer output before the next layer). Read host-side; applied as an `Op::Scale`.
+    let out_scale: Vec<Option<f32>> = (0..c.n_layer)
+        .map(|l| {
+            let name = format!("blk.{l}.layer_output_scale.weight");
+            if llama.gguf.tensors().iter().any(|t| t.name == name) {
+                crate::load_tensor_dequant(&llama.gguf, &name)
+                    .ok()
+                    .and_then(|(v, _)| v.first().copied())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`): applied on
+    // full-attention layers only (SWA layers use plain RoPE). Bound as a per-step f32 Input.
+    let rope_freqs: Option<Vec<f32>> = if gemma4
+        && llama
+            .gguf
+            .tensors()
+            .iter()
+            .any(|t| t.name == "rope_freqs.weight")
+    {
+        Some(crate::load_tensor_dequant(&llama.gguf, "rope_freqs.weight").map(|(v, _)| v)?)
+    } else {
+        None
+    };
 
     // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
     //    lazily in `bytes_to_f32`, so a quant weight occupies ~quant size, not 8× f32). `wspecs`
@@ -554,7 +601,9 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         wraw(&p("attn_norm.weight"))?;
         wraw(&p("attn_q.weight"))?;
         wraw(&p("attn_k.weight"))?;
-        wraw(&p("attn_v.weight"))?;
+        if has_wv[l] {
+            wraw(&p("attn_v.weight"))?;
+        }
         if qk_norm {
             wraw(&p("attn_q_norm.weight"))?;
             wraw(&p("attn_k_norm.weight"))?;
@@ -590,17 +639,30 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         wbufs.push(b);
         wspecs.push((DType::F32, llama.token_embd.len()));
     }
+    // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
+    // of the max head dim serves every layer (a narrower layer reads its leading prefix).
+    if gemma4 {
+        let ones = vec![1.0f32; max_hd];
+        let b = be
+            .alloc(ones.len() * 4, BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
+            .map_err(|e| anyhow!("{e}"))?;
+        wbufs.push(b);
+        wspecs.push((DType::F32, max_hd));
+    }
 
-    // ── persistent KV cache buffers (f32) ──────────────────────────────────────────
+    // ── persistent KV cache buffers (f32), sized per-layer (gemma4 SWA layers are narrower) ───────
     let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
     let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
-    for _ in 0..c.n_layer {
+    for l in 0..c.n_layer {
+        let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
         kbufs.push(
-            be.alloc(max_ctx * kvrow * 4, BufferUsage::Activations)
+            be.alloc(max_ctx * kvrow_l * 4, BufferUsage::Activations)
                 .map_err(|e| anyhow!("{e}"))?,
         );
         vbufs.push(
-            be.alloc(max_ctx * kvrow * 4, BufferUsage::Activations)
+            be.alloc(max_ctx * kvrow_l * 4, BufferUsage::Activations)
                 .map_err(|e| anyhow!("{e}"))?,
         );
     }
@@ -612,6 +674,17 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
     let pos_buf = be
         .alloc(4, BufferUsage::Staging)
         .map_err(|e| anyhow!("{e}"))?;
+    let rf_buf = match &rope_freqs {
+        Some(rf) => {
+            let b = be
+                .alloc(rf.len() * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(rf))
+                .map_err(|e| anyhow!("{e}"))?;
+            Some((b, rf.len()))
+        }
+        None => None,
+    };
     let logits_buf = be
         .alloc(c.vocab * 4, BufferUsage::Readback)
         .map_err(|e| anyhow!("{e}"))?;
@@ -622,11 +695,13 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         let hidden = g.input(f32d(ne));
         let positions = g.input(TensorDesc::new(vec![1], DType::I32));
+        let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
-        for _ in 0..c.n_layer {
-            k_cache.push(g.input(f32d(max_ctx * kvrow)));
-            v_cache.push(g.input(f32d(max_ctx * kvrow)));
+        for l in 0..c.n_layer {
+            let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
+            k_cache.push(g.input(f32d(max_ctx * kvrow_l)));
+            v_cache.push(g.input(f32d(max_ctx * kvrow_l)));
         }
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
@@ -642,11 +717,15 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             id
         };
         let mut lw: Vec<LayerW> = Vec::new();
-        for _ in 0..c.n_layer {
+        for l in 0..c.n_layer {
             let attn_norm = wpush(&mut g, &mut weights);
             let wq = wpush(&mut g, &mut weights);
             let wk = wpush(&mut g, &mut weights);
-            let wv = wpush(&mut g, &mut weights);
+            let wv = if has_wv[l] {
+                Some(wpush(&mut g, &mut weights))
+            } else {
+                None
+            };
             let (q_norm, k_norm) = if qk_norm {
                 (
                     Some(wpush(&mut g, &mut weights)),
@@ -688,29 +767,48 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         }
         let w_out_norm = wpush(&mut g, &mut weights);
         let w_lm = wpush(&mut g, &mut weights);
+        let v_ones = if gemma4 {
+            Some(wpush(&mut g, &mut weights))
+        } else {
+            None
+        };
         let logits = g.output(f32d(c.vocab));
 
-        // scratch
+        // scratch (sized to the per-layer max; ops reallocate dst, so these are upper bounds)
         let hn = g.internal(f32d(ne));
-        let q = g.internal(f32d(qrow));
-        let k = g.internal(f32d(kvrow));
-        let v = g.internal(f32d(kvrow));
-        let attn = g.internal(f32d(qrow));
+        let q = g.internal(f32d(max_qrow));
+        let k = g.internal(f32d(max_kvrow));
+        let v = g.internal(f32d(max_kvrow));
+        let attn = g.internal(f32d(max_qrow));
         let gbuf = g.internal(f32d(nff));
         let ubuf = g.internal(f32d(nff));
         let actbuf = g.internal(f32d(nff));
         let sub = g.internal(f32d(ne));
 
         let eps = c.rms_eps;
-        // gemma3 uses 1/√hd like Qwen; gemma4 (1.0) is rejected above.
-        let scale = 1.0 / (hd as f32).sqrt();
         for (l, lw) in lw.iter().enumerate() {
+            // Per-layer dims (gemma4 SWA vs full; uniform for every other model).
+            let hd = c.layer_head_dim(l);
+            let nkv = c.layer_n_kv(l);
+            let kvrow = nkv * hd;
+            let qrow = nh * hd;
+            let nff_l = c.layer_n_ff(l);
             let theta = c.layer_rope_theta(l); // gemma dual-rope (SWA 1e4 / full 1e6); uniform else
-            let mask = if gemma && c.is_swa_layer(l) {
+            let rope_dim = c.layer_rope_dim(l);
+            let swa = gemma && c.is_swa_layer(l);
+            let mask = if swa {
                 AttnMask::SlidingWindow(c.swa_window)
             } else {
                 AttnMask::Causal
             };
+            // gemma4: attn scale 1.0 (QK-norm controls magnitude); everyone else 1/√hd.
+            let scale = if gemma4 {
+                1.0
+            } else {
+                1.0 / (hd as f32).sqrt()
+            };
+            // gemma4 proportional-RoPE applies only on full-attention layers.
+            let layer_ff = if gemma4 && !swa { rope_freqs } else { None };
             // attn input norm
             g.push(Op::RmsNorm {
                 x: hidden,
@@ -736,14 +834,25 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 in_f: ne as u32,
                 out_f: kvrow as u32,
             });
-            g.push(Op::Linear {
-                x: hn,
-                weight: lw.wv,
-                dst: v,
-                m: 1,
-                in_f: ne as u32,
-                out_f: kvrow as u32,
-            });
+            // V projection, or (gemma4 full layers) V = the raw K projection, copied BEFORE K is
+            // QK-normed + RoPE'd.
+            match lw.wv {
+                Some(wv) => g.push(Op::Linear {
+                    x: hn,
+                    weight: wv,
+                    dst: v,
+                    m: 1,
+                    in_f: ne as u32,
+                    out_f: kvrow as u32,
+                }),
+                None => g.push(Op::Copy {
+                    src: k,
+                    src_off: 0,
+                    dst: v,
+                    dst_off: 0,
+                    n: kvrow as u32,
+                }),
+            }
             if let (Some(qn), Some(kn)) = (lw.q_norm, lw.k_norm) {
                 g.push(Op::QkNorm {
                     x: q,
@@ -771,9 +880,9 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 rows: 1,
                 n_head: nh as u32,
                 head_dim: hd as u32,
-                rope_dim: c.rope_dim as u32,
+                rope_dim: rope_dim as u32,
                 theta,
-                freq_factors: None,
+                freq_factors: layer_ff,
             });
             g.push(Op::Rope {
                 x: k,
@@ -782,10 +891,22 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 rows: 1,
                 n_head: nkv as u32,
                 head_dim: hd as u32,
-                rope_dim: c.rope_dim as u32,
+                rope_dim: rope_dim as u32,
                 theta,
-                freq_factors: None,
+                freq_factors: layer_ff,
             });
+            // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching.
+            if let Some(ones) = v_ones {
+                g.push(Op::QkNorm {
+                    x: v,
+                    weight: ones,
+                    dst: v,
+                    rows: 1,
+                    n_head: nkv as u32,
+                    head_dim: hd as u32,
+                    eps,
+                });
+            }
             g.push(Op::WriteKv {
                 src: k,
                 cache: k_cache[l],
@@ -854,7 +975,7 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 dst: gbuf,
                 m: 1,
                 in_f: ne as u32,
-                out_f: nff as u32,
+                out_f: nff_l as u32,
             });
             g.push(Op::Linear {
                 x: hn,
@@ -862,14 +983,14 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 dst: ubuf,
                 m: 1,
                 in_f: ne as u32,
-                out_f: nff as u32,
+                out_f: nff_l as u32,
             });
             g.push(Op::GatedAct {
                 gate: gbuf,
                 up: ubuf,
                 dst: actbuf,
                 rows: 1,
-                nff: nff as u32,
+                nff: nff_l as u32,
                 act,
                 up_off: 0,
             });
@@ -878,7 +999,7 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 weight: lw.wdown,
                 dst: sub,
                 m: 1,
-                in_f: nff as u32,
+                in_f: nff_l as u32,
                 out_f: ne as u32,
             });
             if let Some(pf) = lw.post_ffw {
@@ -897,6 +1018,15 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
                 dst: hidden,
                 n: ne as u32,
             });
+            // gemma4: scale the whole layer output by the per-layer scalar before the next layer.
+            if let Some(s) = out_scale[l] {
+                g.push(Op::Scale {
+                    x: hidden,
+                    dst: hidden,
+                    s,
+                    n: ne as u32,
+                });
+            }
         }
         g.push(Op::RmsNorm {
             x: hidden,
@@ -927,6 +1057,7 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
             DecodeHandles {
                 hidden,
                 positions,
+                rope_freqs,
                 logits,
                 k_cache,
                 v_cache,
@@ -957,6 +1088,9 @@ pub fn generate_dense_cpu(llama: &Llama, prompt: &[u32], max_new: usize) -> ARes
         let mut b = Bindings::new();
         b.bind(h.hidden, hidden_buf.as_ref());
         b.bind(h.positions, pos_buf.as_ref());
+        if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
+            b.bind(rid, rb.as_ref());
+        }
         for l in 0..c.n_layer {
             b.bind(h.k_cache[l], kbufs[l].as_ref());
             b.bind(h.v_cache[l], vbufs[l].as_ref());

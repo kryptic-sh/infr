@@ -343,7 +343,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             render.feed(piece);
         })?;
         render.finish();
-        print_run_stats(t0, t_first, n, 0, None);
+        print_run_stats(t0, t_first, n, prompt.len(), None);
         return Ok(());
     }
 

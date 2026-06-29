@@ -1461,7 +1461,13 @@ pub(crate) fn generate_dense_cpu(
     let mut out = Vec::new();
     let mut cur = prompt.to_vec();
     let mut logits = vec![0f32; c.vocab];
+    // INFR_PROF=1: report prompt-ingest + decode tok/s to stderr (CPU perf iteration).
+    let prof = std::env::var("INFR_PROF").is_ok();
+    let mut prompt_t = std::time::Duration::ZERO;
+    let mut decode_t = std::time::Duration::ZERO;
+    let mut decode_n = 0usize;
     for pos in 0..(prompt.len() + max_new) {
+        let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
         // embed (gemma scales by √n_embd; qwen3/llama identity)
         let emb: Vec<f32> = token_embd[tok * ne..tok * ne + ne]
@@ -1534,18 +1540,41 @@ pub(crate) fn generate_dense_cpu(
         be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
 
         // Only sample once we're past the prompt (decode position = last prompt token onward).
-        if pos + 1 >= prompt.len() {
+        let is_decode = pos + 1 >= prompt.len();
+        if is_decode {
             be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                 .map_err(|e| anyhow!("{e}"))?;
             let next = argmax(&logits) as u32;
             out.push(next);
+            decode_t += step_t0.elapsed();
+            decode_n += 1;
             if c.eos_ids.contains(&next) || next == c.eos || out.len() >= max_new {
                 break;
             }
             if cur.len() <= pos + 1 {
                 cur.push(next);
             }
+        } else {
+            prompt_t += step_t0.elapsed();
         }
+    }
+    if prof {
+        let ts = |d: std::time::Duration, n: usize| {
+            if d.as_secs_f64() > 0.0 {
+                n as f64 / d.as_secs_f64()
+            } else {
+                0.0
+            }
+        };
+        eprintln!(
+            "[cpu prof] prompt {} tok in {:.2}s ({:.1} tok/s) | decode {} tok in {:.2}s ({:.2} tok/s)",
+            prompt.len(),
+            prompt_t.as_secs_f64(),
+            ts(prompt_t, prompt.len()),
+            decode_n,
+            decode_t.as_secs_f64(),
+            ts(decode_t, decode_n),
+        );
     }
     Ok(out)
 }

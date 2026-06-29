@@ -80,7 +80,7 @@ pub struct MoeKv {
     /// buffer, keyed by its attention structure `(use_split, chunk, n_chunks)`. Replayed each token
     /// (only the params SSBO + embedding change) instead of re-recorded; re-recorded when the
     /// signature changes (every ~chunk tokens) or never if it doesn't.
-    rec_decode: Option<((bool, usize, usize), infr_vulkan::RecordedCmd)>,
+    rec_decode: Option<((bool, usize, usize, bool), infr_vulkan::RecordedCmd)>,
 }
 
 /// One reusable scratch set for a grouped prefill expert's SwiGLU. Sized for `m_pad` row capacity;
@@ -129,6 +129,14 @@ struct DecodeScratch {
     /// Host-visible [pos, kv_len] u32 SSBO the `_dyn` decode kernels read, so the decode command
     /// buffer can be recorded once and replayed (only this + the embedding change per token).
     params: Box<dyn Buffer>,
+    /// Host-visible source for this token's embedding row: the recorded buffer copies `emb_in`→`hidden`
+    /// at its start, so the host just writes here (mapped, no submit) instead of a per-token upload.
+    emb_in: Box<dyn Buffer>,
+    /// lm-head scratch, folded into the replayed buffer for greedy decode (final norm + vocab GEMV +
+    /// argmax → `tok`), so the whole token is one replay + a 4-byte readback.
+    normed: Box<dyn Buffer>,
+    final_logits: Box<dyn Buffer>,
+    tok: Box<dyn Buffer>,
 }
 
 impl MoeKv {
@@ -3476,6 +3484,16 @@ impl Llama {
                 .be
                 .alloc(8, BufferUsage::Staging)
                 .map_err(|e| anyhow!("{e}"))?,
+            emb_in: self
+                .be
+                .alloc(ne * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+            normed: af(ne)?,
+            final_logits: af(c.vocab)?,
+            tok: self
+                .be
+                .alloc(4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?,
         })
     }
 
@@ -3774,9 +3792,12 @@ impl Llama {
             .as_ref()
             .expect("decode scratch (built in new_moe_kv)");
         let hidden = &dec.hidden;
+        // Write this token's embedding row into the host-visible `emb_in` (mapped, no submit); the
+        // recorded buffer copies emb_in→hidden at its start, so embedding upload isn't a per-token GPU
+        // submit any more.
         let emb = &self.token_embd[token as usize * ne..(token as usize + 1) * ne];
         self.be
-            .upload(hidden.as_ref(), bytemuck::cast_slice(emb))
+            .upload(dec.emb_in.as_ref(), bytemuck::cast_slice(emb))
             .map_err(|e| anyhow!("{e}"))?;
         let (hn, hn2, ao) = (&dec.hn, &dec.hn2, &dec.ao);
         let (qr, kr, vr) = (&dec.qr, &dec.kr, &dec.vr);
@@ -3830,7 +3851,10 @@ impl Llama {
         // a resubmittable command buffer keyed by the attention structure `sig`. On a cache hit we skip
         // recording entirely and just replay (only the params SSBO + embedding changed this token).
         let prof2_env = std::env::var("INFR_PROF2").is_ok();
-        let sig = (use_split, chunk, n_chunks);
+        // Greedy decode folds the lm-head + argmax into the replayed buffer (fully record-once: one
+        // replay + a 4-byte token readback). Stochastic/host sampling keeps lm_head_out separate.
+        let fold_lm = matches!(sample, Some(sp) if sp.greedy());
+        let sig = (use_split, chunk, n_chunks, fold_lm);
         let use_ro = gpu_route && !prof2_env;
         let hit = use_ro && kv.rec_decode.as_ref().is_some_and(|(s, _)| *s == sig);
         if !hit {
@@ -3839,6 +3863,9 @@ impl Llama {
             } else {
                 self.be.recorder().map_err(|e| anyhow!("{e}"))?
             };
+            // Copy this token's embedding (host-written into emb_in) into the GPU-only hidden, as the
+            // first recorded op — so the embedding stops being a separate per-token GPU submit.
+            rec.copy(dec.emb_in.as_ref(), 0, hidden.as_ref(), 0, ne * 4);
             for (li, layer) in self.layers.iter().enumerate() {
                 rec.rmsnorm(
                     hidden.as_ref(),
@@ -4075,6 +4102,29 @@ impl Llama {
                     rec2.finish().map_err(|e| anyhow!("{e}"))?;
                 }
             }
+            // Greedy: fold final norm + vocab GEMV + argmax into the same (replayed) buffer, so the
+            // whole token is one replay producing dec.tok. Stochastic/host: lm_head_out runs separately.
+            if use_ro && fold_lm {
+                rec.rmsnorm(
+                    hidden.as_ref(),
+                    self.output_norm_buf.as_ref(),
+                    dec.normed.as_ref(),
+                    1,
+                    ne,
+                    c.rms_eps,
+                );
+                rec.label_next("vocab");
+                rec_linear(
+                    &rec,
+                    &self.lm_head,
+                    dec.normed.as_ref(),
+                    dec.final_logits.as_ref(),
+                    1,
+                    ne,
+                    c.vocab,
+                );
+                rec.argmax(dec.final_logits.as_ref(), dec.tok.as_ref(), c.vocab);
+            }
             // use_ro: keep the recorded buffer to replay; else submit it once (Tier 1) now.
             if use_ro {
                 kv.rec_decode = Some((sig, rec.finish_record().map_err(|e| anyhow!("{e}"))?));
@@ -4093,8 +4143,17 @@ impl Llama {
         }
         kv.kv.len += 1;
 
-        // final norm + lm head (on the GPU); greedy → GPU argmax + 4-byte token readback.
-        self.lm_head_out(hidden.as_ref(), sample)
+        if use_ro && fold_lm {
+            // Greedy fully record-once: the replayed buffer already wrote the token; just read it back.
+            let mut tb = [0u8; 4];
+            self.be
+                .download(dec.tok.as_ref(), &mut tb)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(GenOut::Token(u32::from_ne_bytes(tb)))
+        } else {
+            // Stochastic/host (or non-record-once): final norm + lm head + sample separately.
+            self.lm_head_out(hidden.as_ref(), sample)
+        }
     }
 
     /// GPU-resident grouped prefill (qwen3moe, all experts on GPU): like [`forward_moe_chunk_gpu`]

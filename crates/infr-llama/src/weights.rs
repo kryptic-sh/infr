@@ -173,3 +173,116 @@ pub(crate) fn build_wgateup(be: &VulkanBackend, g: &Gguf, prefix: &str) -> Resul
     gateup.extend_from_slice(&f16_bytes(g, &up_name)?);
     Ok(Wt::F16(be.upload_weight_bytes(&gateup)?))
 }
+/// Dispatch a [`Wt`] linear (`y = x·Wᵀ`) into a recorder, picking the f16 / quant / native op.
+/// The (dtype, buffer) of a Native weight — for the stacked MoE expert dispatch (native-only).
+pub(crate) fn native_parts(w: &Wt) -> (infr_core::DType, &dyn Buffer) {
+    match w {
+        Wt::Native { buf, dtype } => (*dtype, buf.as_ref()),
+        _ => unreachable!("stacked MoE experts are native-only"),
+    }
+}
+
+/// Prefill projection (`y = X·Wᵀ`, X = [m,in_f], m≥64): tiled coopmat GEMM for native-quant weights
+/// (decode-once, reused across the 64-row tile) instead of the per-row GEMV that re-reads the weight
+/// m times. `y` is allocated `ceil(m/64)*64` rows. Non-native weights (the small f16 router) fall
+/// back to the GEMV.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rec_proj(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    x: &dyn Buffer,
+    y: &dyn Buffer,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    match w {
+        Wt::Native { buf, dtype } => rec.matmul_native(*dtype, x, buf.as_ref(), y, m, in_f, out_f),
+        _ => rec_linear(rec, w, x, y, m, in_f, out_f),
+    }
+}
+
+/// Dispatch a stacked MoE expert as a tiled coopmat GEMM (`y = X·W_eᵀ`, X = [m,in_f]): the weight is
+/// `expert*stride` elements into the stacked Native buffer, decoded ONCE and reused across the 64-row
+/// tile (vs the per-row GEMV re-read). `y` is allocated `ceil(m/64)*64` rows. Native-only.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rec_gemm_expert(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    expert: usize,
+    stride: usize,
+    x: &dyn Buffer,
+    y: &dyn Buffer,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    let (dtype, buf) = native_parts(w);
+    rec.matmul_native_off(dtype, x, buf, expert * stride, y, m, in_f, out_f);
+}
+
+/// Dispatch a stacked MoE expert's linear (`y = x·W_eᵀ`): the weight is `expert * stride` elements
+/// into the role's stacked Native buffer. Stacked experts are native-only (see [`load_moe`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rec_linear_expert(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    expert: usize,
+    stride: usize,
+    x: &dyn Buffer,
+    y: &dyn Buffer,
+    rows: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    match w {
+        Wt::Native { buf, dtype } => rec.linear_native_off(
+            *dtype,
+            buf.as_ref(),
+            expert * stride,
+            x,
+            y,
+            rows,
+            in_f,
+            out_f,
+        ),
+        _ => unreachable!("stacked MoE experts are native-only"),
+    }
+}
+
+pub(crate) fn rec_linear(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    x: &dyn Buffer,
+    y: &dyn Buffer,
+    rows: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    match w {
+        Wt::F16(b) => rec.linear(b.as_ref(), x, y, rows, in_f, out_f),
+        Wt::Native { buf, dtype } => {
+            rec.linear_native(*dtype, buf.as_ref(), x, y, rows, in_f, out_f)
+        }
+    }
+}
+
+/// `y = x·Wᵀ + residual` (fused-residual GEMV), dispatching on how `W` is stored.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rec_linear_add(
+    rec: &infr_vulkan::Recorder,
+    w: &Wt,
+    x: &dyn Buffer,
+    residual: &dyn Buffer,
+    y: &dyn Buffer,
+    rows: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    match w {
+        Wt::F16(b) => rec.linear_add(b.as_ref(), x, residual, y, rows, in_f, out_f),
+        Wt::Native { buf, dtype } => {
+            rec.linear_add_native(*dtype, buf.as_ref(), x, residual, y, rows, in_f, out_f)
+        }
+    }
+}

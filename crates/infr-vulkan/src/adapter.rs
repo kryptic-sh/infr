@@ -583,4 +583,101 @@ mod tests {
             );
         }
     }
+
+    /// A one-op `Attention` graph (GQA, causal, f16 q + f16 KV) must match a host softmax-attention.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn attention_graph_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (nh, nkv, hd, pos) = (2usize, 1usize, 8usize, 2usize);
+        let kv_len = pos + 1; // causal: query at `pos` attends keys 0..=pos
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = nh / nkv;
+        let to_f16 = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let deq = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        };
+        let q: Vec<f32> = (0..nh * hd).map(|i| (i as f32 * 0.07).sin()).collect();
+        let k: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| (i as f32 * 0.05).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| i as f32 * 0.01 - 0.1)
+            .collect();
+        let (qf, kf, vf) = (to_f16(&q), to_f16(&k), to_f16(&v));
+        let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf)); // host uses the same f16-rounded values
+                                                           // host GQA softmax attention
+        let mut want = vec![0f32; nh * hd];
+        for h in 0..nh {
+            let kvh = h / group;
+            let mut sc = vec![0f32; kv_len];
+            let mut mx = f32::NEG_INFINITY;
+            for (j, scj) in sc.iter_mut().enumerate() {
+                let d: f32 = (0..hd)
+                    .map(|x| qd[h * hd + x] * kd[(j * nkv + kvh) * hd + x])
+                    .sum();
+                *scj = d * scale;
+                mx = mx.max(*scj);
+            }
+            let l: f32 = sc.iter().map(|s| (s - mx).exp()).sum();
+            for (j, &s) in sc.iter().enumerate() {
+                let p = (s - mx).exp() / l;
+                for x in 0..hd {
+                    want[h * hd + x] += p * vd[(j * nkv + kvh) * hd + x];
+                }
+            }
+        }
+        let mut g = Graph::new();
+        let qi = g.input(TensorDesc::new(vec![1, nh, hd], DType::F16));
+        let ki = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let vi = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let yi = g.output(TensorDesc::new(vec![1, nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q: qi,
+            k_cache: ki,
+            v_cache: vi,
+            dst: yi,
+            rows: 1,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Causal,
+            pos: pos as u32,
+        });
+        let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
+        let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
+        let vb = be_.alloc(vf.len(), BufferUsage::Activations).unwrap();
+        let yb = be_.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
+        be_.upload(qb.as_ref(), &qf).unwrap();
+        be_.upload(kb.as_ref(), &kf).unwrap();
+        be_.upload(vb.as_ref(), &vf).unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(qi, qb.as_ref());
+        bind.bind(ki, kb.as_ref());
+        bind.bind(vi, vb.as_ref());
+        bind.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got = vec![0f32; nh * hd];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for i in 0..nh * hd {
+            assert!(
+                (got[i] - want[i]).abs() < 2e-2,
+                "attention mismatch at {i}: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
 }

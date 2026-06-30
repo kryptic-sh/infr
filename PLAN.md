@@ -56,6 +56,9 @@ plain loop. Current op set:
 
 - `RmsNorm`, `QkNorm` (per-head), `Linear` (dtype-dispatched matmul)
 - `Rope` (split-half NEOX, optional `freq_factors`), `WriteKv`
+- `QkNormRope` (fused per-head RMSNorm + RoPE — the qwen3/gemma q/k case; maps
+  1:1 to the GPU `qk_norm_rope` kernel, one CPU pass. `QkNorm`/`Rope` stay
+  standalone for gemma4 V-norm / llama)
 - `Attention` (GQA + causal / sliding-window, per-call scale)
 - `GatedAct` (SiLU / GELU / Sigmoid, separate gate/up, `up_off` for E2B)
 - `MoeFfn` (router → top-k → renormalized per-expert SwiGLU sum)

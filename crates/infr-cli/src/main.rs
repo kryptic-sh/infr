@@ -265,13 +265,11 @@ fn print_run_stats(
 
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
-    // Default 8192; override with INFR_MAX_CTX (e.g. 32768 to exercise high-ctx prefill).
-    let max_ctx: usize = std::env::var("INFR_MAX_CTX")
+    // Context window: default to the model's own trained context length (`<arch>.context_length`);
+    // override with INFR_MAX_CTX (e.g. shrink to fit VRAM, or extend to exercise high-ctx prefill).
+    let ctx_override: Option<usize> = std::env::var("INFR_MAX_CTX")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8192);
-    #[allow(non_snake_case)]
-    let MAX_CTX = max_ctx;
+        .and_then(|v| v.parse().ok());
     let envf = |k: &str, d: f32| {
         std::env::var(k)
             .ok()
@@ -329,7 +327,17 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             eprintln!("[qwen3moe — eager MoE forward: GPU matmuls + GPU KV cache + CPU router/top-k + auto-fit]");
             Box::new(infr_llama::model::MoeChat::new(&llama))
         } else {
-            Box::new(llama.chat_session(MAX_CTX)?)
+            // Honor the model's default context length; INFR_MAX_CTX overrides it.
+            let max_ctx = ctx_override.unwrap_or_else(|| llama.config().n_ctx_train);
+            eprintln!(
+                "[ctx {max_ctx}{}]",
+                if ctx_override.is_some() {
+                    " (override)"
+                } else {
+                    " (model default)"
+                }
+            );
+            Box::new(llama.chat_session(max_ctx)?)
         }
     };
 

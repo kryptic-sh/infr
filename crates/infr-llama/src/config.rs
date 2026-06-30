@@ -61,6 +61,10 @@ pub struct Config {
     pub swa_rope_theta: f32,
     /// MoE config (qwen3moe): `Some` enables the routed-expert FFN. `None` = dense FFN.
     pub moe: Option<MoeConfig>,
+    /// The model's trained/default maximum context length (`<arch>.context_length`). Used as the
+    /// default KV-cache size when the caller doesn't request a custom context (overridable). Falls
+    /// back to 8192 if the GGUF omits it.
+    pub n_ctx_train: usize,
 }
 
 impl Config {
@@ -195,6 +199,8 @@ impl Config {
         } else {
             None
         };
+        // The model's trained context length (its default max context). Default 8192 if absent.
+        let n_ctx_train = meta_u64(g, &mk("context_length")).unwrap_or(8192) as usize;
         let head_dim =
             meta_u64(g, &mk("attention.key_length")).unwrap_or((n_embd / n_head) as u64) as usize;
         let rope_dim = meta_u64(g, &mk("rope.dimension_count")).unwrap_or(head_dim as u64) as usize;
@@ -330,6 +336,7 @@ impl Config {
             swa_pattern,
             swa_rope_theta,
             moe,
+            n_ctx_train,
         })
     }
 }

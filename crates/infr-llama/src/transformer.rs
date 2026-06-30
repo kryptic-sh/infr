@@ -166,12 +166,13 @@ impl Llama {
         let fp = weight_footprint(&g);
         let vram = be.vram();
         let gb = |b: u64| b as f64 / 1e9;
-        // GPU KV cache footprint at the target context (`INFR_MAX_CTX`, default 8192): f16 K+V per
-        // layer. MoE attention now stores KV in VRAM, so it competes with experts for space.
+        // GPU KV cache footprint at the target context: f16 K+V per layer. Defaults to the model's
+        // own trained context length (`<arch>.context_length`); override with INFR_MAX_CTX. MoE
+        // attention now stores KV in VRAM, so it competes with experts for space.
         let target_ctx = std::env::var("INFR_MAX_CTX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8192);
+            .unwrap_or(cfg.n_ctx_train);
         let kv_bytes =
             (n_kv * head_dim * 2/*K+V*/ * 2/*f16*/ * n_layer) as u64 * (target_ctx + 64) as u64;
         const ACT_HEADROOM: u64 = 512 * 1024 * 1024; // activation scratch + streaming pool slack

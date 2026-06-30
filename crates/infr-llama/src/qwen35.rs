@@ -451,25 +451,24 @@ fn read(be: &VulkanBackend, buf: &dyn Buffer, n: usize) -> Vec<f32> {
     be.download(buf, &mut bytes).expect("download");
     bytemuck::cast_slice(&bytes).to_vec()
 }
-/// Download `n` f16s from a device buffer, widened to f32.
-fn read_f16(be: &VulkanBackend, buf: &dyn Buffer, n: usize) -> Vec<f32> {
-    let mut bytes = vec![0u8; n * 2];
-    be.download(buf, &mut bytes).expect("download");
-    bytes
-        .chunks_exact(2)
-        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-        .collect()
+/// On-device per-attention-layer KV cache: f16 `[max_ctx, n_kv*head_dim]` buffers appended in place
+/// (qk_norm_rope writes K at `out_base=pos`, store_f16 writes V at `pos`), so the whole attention
+/// runs in one command buffer with no host round-trip. `None` on the Q35_CPU oracle (host Vecs).
+struct DevKv {
+    k: Box<dyn Buffer>,
+    v: Box<dyn Buffer>,
 }
 
-/// Per-layer recurrent state for the CPU reference.
+/// Per-layer recurrent state.
 enum LayerState {
     Linear {
         conv: Vec<f32>, // [d_conv-1, conv_channels] rolling history (oldest first)
         s: Vec<f32>,    // [num_v_heads, head_k_dim, head_v_dim]
     },
     Attn {
-        k: Vec<f32>, // [pos, n_kv*head_dim]
+        k: Vec<f32>, // [pos, n_kv*head_dim] — Q35_CPU oracle only
         v: Vec<f32>,
+        dev: Option<DevKv>, // GPU path: on-device f16 KV cache
     },
 }
 
@@ -478,15 +477,33 @@ pub struct State {
     pos: usize,
 }
 
+/// Max decode context for the on-device KV cache (positions). `INFR_MAX_CTX`, default 8192.
+fn max_ctx() -> usize {
+    std::env::var("INFR_MAX_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192)
+}
+
 impl Model {
     pub fn new_state(&self) -> State {
         let c = &self.cfg;
+        let kvrow = c.n_kv * c.head_dim;
         let layers = (0..c.n_layer)
             .map(|i| {
                 if c.is_attn_layer(i) {
+                    // On the GPU path, alloc the device f16 KV cache (capacity = max_ctx positions).
+                    let dev = self.be.as_ref().map(|be| {
+                        let bytes = (max_ctx() * kvrow * 2).max(4);
+                        DevKv {
+                            k: be.alloc(bytes, BufferUsage::Activations).expect("kv k"),
+                            v: be.alloc(bytes, BufferUsage::Activations).expect("kv v"),
+                        }
+                    });
                     LayerState::Attn {
                         k: vec![],
                         v: vec![],
+                        dev,
                     }
                 } else {
                     LayerState::Linear {
@@ -528,8 +545,8 @@ impl Model {
                         *h += di;
                     }
                 }
-                (Layer::Attn(w), LayerState::Attn { k, v }) => {
-                    let y = self.attn_mixer(w, &hidden, k, v, pos);
+                (Layer::Attn(w), LayerState::Attn { k, v, dev }) => {
+                    let y = self.attn_mixer(w, &hidden, k, v, dev.as_ref(), pos);
                     if std::env::var("Q35_NOATTN").is_err() {
                         for (h, yi) in hidden.iter_mut().zip(&y) {
                             *h += yi;
@@ -840,32 +857,34 @@ impl Model {
     /// KV cache (re-uploaded f16 per token) is a perf wart, not host compute — the resident forward
     /// will make it GPU-resident.
     #[allow(clippy::too_many_arguments)]
+    /// Fully on-device attention for one token (no host round-trip): rmsnorm → q/k/v GEMV →
+    /// deinterleave q/gate → qk-norm+RoPE (Q→`qf16`, K→`kv.k` at row `pos`) → store V into `kv.v` at
+    /// row `pos` → GQA softmax over the device cache (`attention_kv`, kv_len `pos+1`) → sigmoid output
+    /// gate → out proj. One command buffer; the f16 KV cache is appended in place (no per-token
+    /// re-upload), which is what the dense `Llama` decode path does.
     fn attn_mixer_gpu(
         &self,
         be: &VulkanBackend,
         w: &AttnLayer,
         gpu: &AttnGpuW,
+        kv: &DevKv,
         hidden: &[f32],
-        kc: &mut Vec<f32>,
-        vc: &mut Vec<f32>,
         pos: usize,
     ) -> Vec<f32> {
         let c = &self.cfg;
         let (ne, hd) = (c.n_embd, c.head_dim);
         let (nh, nkv) = (c.n_head, c.n_kv);
+        let kvrow = nkv * hd;
         let alloc = |n: usize| {
             be.alloc((n * 4).max(4), BufferUsage::Activations)
                 .expect("alloc")
         };
-        // qk_norm_rope writes f16 (it feeds attention_kv / the f16 KV cache directly), so q/k land
-        // in f16 buffers; q is consumed by attention_kv as-is, k is widened back for the host cache.
+        // qk_norm_rope writes f16 (feeds attention_kv / the f16 KV cache directly): Q→qf16, K straight
+        // into the device cache at row `pos`. qd/kd are the f32 projection outputs it reads.
         let alloc_f16 = |n: usize| {
             be.alloc((n * 2).max(4), BufferUsage::Activations)
                 .expect("alloc f16")
         };
-        // --- stage 1: norm + projections + deinterleave + qk-norm/rope ---
-        // qk_norm_rope reads x (f32) and writes y (f16) to separate bindings: qd/kd are the f32
-        // projection outputs, qf16/kf16 the normed+roped f16 fed to attention_kv / the host cache.
         let hb = dev(be, hidden);
         let xn = alloc(ne);
         let qg = alloc(nh * 2 * hd);
@@ -873,8 +892,11 @@ impl Model {
         let qf16 = alloc_f16(nh * hd);
         let gateb = alloc(nh * hd);
         let kd = alloc(nkv * hd);
-        let kf16 = alloc_f16(nkv * hd);
         let vb = alloc(nkv * hd);
+        let ob = alloc(nh * hd);
+        let og = alloc(nh * hd);
+        let res = alloc(ne);
+        let t = pos + 1; // cached length after appending this token
         {
             let rec = be.recorder().expect("recorder");
             rec.rmsnorm(
@@ -900,7 +922,7 @@ impl Model {
                     hd * 4,
                 );
             }
-            // per-head q/k rmsnorm + RoPE: f32 in (qd/kd) → f16 out (qf16/kf16)
+            // Q → qf16 at row 0; K → the device cache at row `pos` (out_base=pos).
             rec.qk_norm_rope(
                 qd.as_ref(),
                 gpu.q_norm.as_ref(),
@@ -918,44 +940,31 @@ impl Model {
             rec.qk_norm_rope(
                 kd.as_ref(),
                 gpu.k_norm.as_ref(),
-                kf16.as_ref(),
+                kv.k.as_ref(),
                 1,
                 nkv,
                 hd,
                 c.rope_dim,
                 c.rope_theta,
                 pos,
-                0,
+                pos,
                 c.eps,
                 None,
             );
-            rec.finish().expect("finish");
-        }
-        // append normed k/v to the host f32 cache (memory bookkeeping; no compute)
-        kc.extend_from_slice(&read_f16(be, kf16.as_ref(), nkv * hd));
-        vc.extend_from_slice(&read(be, vb.as_ref(), nkv * hd));
-        let t = pos + 1;
-        // --- stage 2: GQA softmax (f16 cache) + sigmoid gate + out proj, one cmd buffer ---
-        // q is already f16 from qk_norm_rope → feed attention_kv directly.
-        let kf = be.upload_weight_f16(kc).expect("kc f16");
-        let vf = be.upload_weight_f16(vc).expect("vc f16");
-        let ob = alloc(nh * hd);
-        let og = alloc(nh * hd);
-        let res = alloc(ne);
-        {
-            let rec = be.recorder().expect("recorder");
-            // pos_offset = t-1 (abs position); window 0 = full causal; scale 0 = default 1/√hd.
+            // V (f32) → device cache (f16) at row `pos`.
+            rec.store_f16(vb.as_ref(), kv.v.as_ref(), kvrow, pos * kvrow);
+            // GQA softmax over the device cache (kv_len = t; pos_offset = pos; full causal; 1/√hd).
             rec.attention_kv(
                 qf16.as_ref(),
-                kf.as_ref(),
-                vf.as_ref(),
+                kv.k.as_ref(),
+                kv.v.as_ref(),
                 ob.as_ref(),
                 1,
                 t,
                 nh,
                 nkv,
                 hd,
-                t - 1,
+                pos,
                 0,
                 0.0,
             );
@@ -972,10 +981,11 @@ impl Model {
         hidden: &[f32],
         kc: &mut Vec<f32>,
         vc: &mut Vec<f32>,
+        dev: Option<&DevKv>,
         pos: usize,
     ) -> Vec<f32> {
-        if let (Some(be), Some(gpu)) = (self.be.as_ref(), w.gpu.as_ref()) {
-            return self.attn_mixer_gpu(be, w, gpu, hidden, kc, vc, pos);
+        if let (Some(be), Some(gpu), Some(dev)) = (self.be.as_ref(), w.gpu.as_ref(), dev) {
+            return self.attn_mixer_gpu(be, w, gpu, dev, hidden, pos);
         }
         // --- CPU reference oracle (Q35_CPU=1; no backend) ---
         let c = &self.cfg;

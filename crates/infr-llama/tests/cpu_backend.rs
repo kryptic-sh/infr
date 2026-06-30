@@ -153,12 +153,12 @@ const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Explain how a computer works in simple terms.",
         48,
-        0xcf56ba8c4bb5c455,
+        0xcb0381bae31a7d8f,
     ),
     (
         "Write a short paragraph about the ocean.",
         48,
-        0xe78aa4678afa273b,
+        0xabca2bf79a3cdda2,
     ),
 ];
 
@@ -196,15 +196,14 @@ fn gpu_golden_qwen3() {
 // (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked (each
 // verified coherent at capture). Missing quants are skipped. Refresh with `INFR_BLESS=1`.
 // All verified coherent at capture — every quant recalls "France's capital is Paris" (Q2_K is a
-// touch repetitive, as expected for 2-bit; higher-precision quants converge: Q4_K==Q6_K,
-// Q5_K==Q8_0==BF16).
+// touch repetitive, as expected for 2-bit; the float-ish quants still converge: Q5_K==Q8_0==BF16).
 const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
     ("IQ4_XS", 32, 0xd028ff03b524cb28),
     ("Q2_K", 32, 0x6442c2818c12ca56),
     ("Q4_0", 32, 0x88221dcfca820246),
     ("Q4_K_M", 32, 0xfd63781ea3bfa785),
     ("Q5_K_M", 32, 0xb68f96c3aa8d22fe),
-    ("Q6_K", 32, 0xfd63781ea3bfa785),
+    ("Q6_K", 32, 0x925b523a6f67356b),
     ("Q8_0", 32, 0xb68f96c3aa8d22fe),
     ("BF16", 32, 0xb68f96c3aa8d22fe),
 ];
@@ -281,7 +280,7 @@ const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x5147de9a0ddfae50,
+        0x3fd9d19a20538db3,
     ),
 ];
 
@@ -403,7 +402,7 @@ const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x2588804a8fb4c88f,
+        0xd1281a5e24ad58b9,
     ),
 ];
 

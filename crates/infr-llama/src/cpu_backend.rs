@@ -608,13 +608,25 @@ impl Backend for CpuBackend {
                 } => {
                     let (rows, rs, pos) = (rows as usize, row_stride as usize, pos as usize);
                     let s = &vals[src.0 as usize];
-                    // Write the new row(s) straight into the persistent KV buffer (f32) — only `rows`
-                    // rows touched, not the whole `max_ctx`-sized cache.
+                    // Write the new row(s) straight into the persistent KV buffer — only `rows` rows
+                    // touched, not the whole `max_ctx`-sized cache. The cache dtype (f16 to match the
+                    // GPU and halve memory, or f32) is read from the graph; cast on write.
                     let buf = bindings.get(cache).expect("cpu backend: unbound KV cache");
                     let mut d = cpu_buf(buf).owned();
-                    let df: &mut [f32] = bytemuck::cast_slice_mut(&mut d);
                     let base = pos * rs;
-                    df[base..base + rows * rs].copy_from_slice(&s[..rows * rs]);
+                    let n = rows * rs;
+                    match g.desc(cache).dtype {
+                        DType::F16 => {
+                            let df: &mut [u16] = bytemuck::cast_slice_mut(&mut d);
+                            for i in 0..n {
+                                df[base + i] = half::f16::from_f32(s[i]).to_bits();
+                            }
+                        }
+                        _ => {
+                            let df: &mut [f32] = bytemuck::cast_slice_mut(&mut d);
+                            df[base..base + n].copy_from_slice(&s[..n]);
+                        }
+                    }
                 }
                 Op::Attention {
                     q,
@@ -644,8 +656,24 @@ impl Backend for CpuBackend {
                     let vbuf = bindings.get(v_cache).expect("cpu backend: unbound v_cache");
                     let kguard = cpu_buf(kbuf).read();
                     let vguard = cpu_buf(vbuf).read();
-                    let ks: &[f32] = bytemuck::cast_slice(&kguard);
-                    let vs: &[f32] = bytemuck::cast_slice(&vguard);
+                    // Materialize the valid KV prefix (`kv_len` rows) as f32, dequantizing an f16
+                    // cache (matches the GPU's f16 KV) — the inner dot then runs in f32 either way.
+                    let need = kv_len * nkv * hd;
+                    let (ks, vs): (Vec<f32>, Vec<f32>) = match g.desc(k_cache).dtype {
+                        DType::F16 => {
+                            let f = |b: &[u8]| -> Vec<f32> {
+                                bytemuck::cast_slice::<u8, u16>(b)[..need]
+                                    .iter()
+                                    .map(|&x| half::f16::from_bits(x).to_f32())
+                                    .collect()
+                            };
+                            (f(&kguard), f(&vguard))
+                        }
+                        _ => (
+                            bytemuck::cast_slice::<u8, f32>(&kguard)[..need].to_vec(),
+                            bytemuck::cast_slice::<u8, f32>(&vguard)[..need].to_vec(),
+                        ),
+                    };
                     let group = nh / nkv;
                     let window = match mask {
                         AttnMask::Causal => 0usize,
@@ -687,7 +715,6 @@ impl Backend for CpuBackend {
                             }
                         }
                     }
-                    let _ = kv_len;
                     vals[dst.0 as usize] = out;
                 }
                 Op::GatedAct {
@@ -1197,12 +1224,13 @@ pub(crate) fn generate_dense_cpu(
     let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
     for l in 0..c.n_layer {
         let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
+        // f16 KV cache (2 bytes/elem) — matches the graph's f16 k_cache/v_cache decls.
         kbufs.push(
-            be.alloc(max_ctx * kvrow_l * 4, BufferUsage::Activations)
+            be.alloc(max_ctx * kvrow_l * 2, BufferUsage::Activations)
                 .map_err(|e| anyhow!("{e}"))?,
         );
         vbufs.push(
-            be.alloc(max_ctx * kvrow_l * 4, BufferUsage::Activations)
+            be.alloc(max_ctx * kvrow_l * 2, BufferUsage::Activations)
                 .map_err(|e| anyhow!("{e}"))?,
         );
     }
@@ -1242,6 +1270,8 @@ pub(crate) fn generate_dense_cpu(
     let build = |pos: usize| -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+        // KV cache is f16 — matches the GPU's f16 cache (halves memory, tightens CPU↔GPU parity).
+        let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
         let hidden = g.input(f32d(ne));
         let positions = g.input(TensorDesc::new(vec![1], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
@@ -1255,8 +1285,8 @@ pub(crate) fn generate_dense_cpu(
         let mut v_cache = Vec::new();
         for l in 0..c.n_layer {
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
-            k_cache.push(g.input(f32d(max_ctx * kvrow_l)));
-            v_cache.push(g.input(f32d(max_ctx * kvrow_l)));
+            k_cache.push(g.input(f16d(max_ctx * kvrow_l)));
+            v_cache.push(g.input(f16d(max_ctx * kvrow_l)));
         }
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from

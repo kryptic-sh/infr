@@ -546,6 +546,7 @@ impl Model {
                     let d = self.ffn(
                         &hidden,
                         &w.post_norm,
+                        w.gpu.as_ref().map(|g| g.post_norm.as_ref()),
                         &w.ffn_gate,
                         &w.ffn_up,
                         &w.ffn_down,
@@ -565,6 +566,7 @@ impl Model {
                     let d = self.ffn(
                         &hidden,
                         &w.post_norm,
+                        w.gpu.as_ref().map(|g| g.post_norm.as_ref()),
                         &w.ffn_gate,
                         &w.ffn_up,
                         &w.ffn_down,
@@ -585,26 +587,80 @@ impl Model {
         }
         st.pos += 1;
         // final norm + lm head (only this token)
+        if let (Some(be), Some(onb)) = (self.be.as_ref(), self.output_norm_buf.as_ref()) {
+            let hb = dev(be, &hidden);
+            let nm = be
+                .alloc(ne * 4, BufferUsage::Activations)
+                .expect("alloc norm");
+            let logits = be
+                .alloc(c.vocab * 4, BufferUsage::Activations)
+                .expect("alloc logits");
+            {
+                let rec = be.recorder().expect("recorder");
+                rec.rmsnorm(hb.as_ref(), onb.as_ref(), nm.as_ref(), 1, ne, c.eps);
+                self.lm_head
+                    .record(&rec, nm.as_ref(), logits.as_ref(), ne, c.vocab);
+                rec.finish().expect("finish");
+            }
+            return read(be, logits.as_ref(), c.vocab);
+        }
         let hn = rmsnorm(&hidden, &self.output_norm, c.eps);
         self.lm_head.mul(self.be.as_ref(), &hn, ne, c.vocab)
     }
 
+    /// SwiGLU FFN (one token). Fully on the GPU when a backend + the GPU norm buffer are present; the
+    /// CPU reference otherwise. `norm`/`norm_buf` are the post-attention norm (host / GPU copy).
+    #[allow(clippy::too_many_arguments)]
     fn ffn(
         &self,
         hidden: &[f32],
         norm: &[f32],
+        norm_buf: Option<&dyn Buffer>,
         gate: &Lin,
         up: &Lin,
         down: &Lin,
         n_ff: usize,
     ) -> Vec<f32> {
         let ne = self.cfg.n_embd;
-        let be = self.be.as_ref();
+        if let (Some(be), Some(nb)) = (self.be.as_ref(), norm_buf) {
+            return self.ffn_gpu(be, hidden, nb, gate, up, down, n_ff);
+        }
         let h2 = rmsnorm(hidden, norm, self.cfg.eps);
-        let g = gate.mul(be, &h2, ne, n_ff);
-        let u = up.mul(be, &h2, ne, n_ff);
+        let g = gate.mul(None, &h2, ne, n_ff);
+        let u = up.mul(None, &h2, ne, n_ff);
         let act: Vec<f32> = g.iter().zip(&u).map(|(a, b)| silu(*a) * b).collect();
-        down.mul(be, &act, n_ff, ne)
+        down.mul(None, &act, n_ff, ne)
+    }
+
+    /// Fully-GPU SwiGLU FFN: rmsnorm → gate/up GEMV → silu_mul → down GEMV, one command buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_gpu(
+        &self,
+        be: &VulkanBackend,
+        hidden: &[f32],
+        norm_buf: &dyn Buffer,
+        gate: &Lin,
+        up: &Lin,
+        down: &Lin,
+        n_ff: usize,
+    ) -> Vec<f32> {
+        let (ne, eps) = (self.cfg.n_embd, self.cfg.eps);
+        let hb = dev(be, hidden);
+        let al = |n: usize| {
+            be.alloc((n * 4).max(4), BufferUsage::Activations)
+                .expect("alloc")
+        };
+        let (h2, g, u, act, out) = (al(ne), al(n_ff), al(n_ff), al(n_ff), al(ne));
+        {
+            let rec = be.recorder().expect("recorder");
+            rec.rmsnorm(hb.as_ref(), norm_buf, h2.as_ref(), 1, ne, eps);
+            gate.record(&rec, h2.as_ref(), g.as_ref(), ne, n_ff);
+            up.record(&rec, h2.as_ref(), u.as_ref(), ne, n_ff);
+            rec.silu_mul(g.as_ref(), u.as_ref(), act.as_ref(), n_ff);
+            down.record(&rec, act.as_ref(), out.as_ref(), n_ff, ne);
+            rec.finish().expect("finish");
+        }
+        read(be, out.as_ref(), ne)
     }
 
     /// Fully-GPU gated-DeltaNet mixer for one token: the ENTIRE mixer (rmsnorm → qkv/gate GEMV →

@@ -362,9 +362,9 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         let mode = if std::env::var("Q35_CPU").is_ok() {
             "CPU oracle"
         } else {
-            "hybrid GPU"
+            "GPU linear + SSM, CPU attention"
         };
-        eprintln!("[qwen35 Qwen3-Next — {mode}: GPU linear + CPU SSM]");
+        eprintln!("[qwen35 Qwen3-Next — {mode}]");
         let t0 = std::time::Instant::now();
         let mut render = ThinkRender::new();
         let mut t_first: Option<std::time::Instant> = None;

@@ -957,3 +957,192 @@ mod tests {
         println!("roundtrip OK — {N} bytes match");
     }
 }
+
+// Qwen3-Next SSM kernels: the GPU conv1d+SiLU and gated-DeltaNet recurrence must match the CPU
+// reference. Self-skip without a GPU (so CI passes, runs locally with a device).
+#[cfg(test)]
+mod ssm_tests {
+    use super::*;
+    use infr_core::backend::{Buffer, BufferUsage};
+
+    fn sigmoid(x: f32) -> f32 {
+        1.0 / (1.0 + (-x).exp())
+    }
+    fn softplus(x: f32) -> f32 {
+        x.max(0.0) + (-x.abs()).exp().ln_1p()
+    }
+    fn det(n: usize, seed: f32) -> Vec<f32> {
+        (0..n).map(|i| (i as f32 * 0.137 + seed).sin()).collect()
+    }
+    fn dev(be: &VulkanBackend, data: &[f32]) -> Box<dyn Buffer> {
+        let b = be
+            .alloc((data.len() * 4).max(4), BufferUsage::Activations)
+            .unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        b
+    }
+    fn read(be: &VulkanBackend, buf: &dyn Buffer, n: usize) -> Vec<f32> {
+        let mut bytes = vec![0u8; n * 4];
+        be.download(buf, &mut bytes).unwrap();
+        bytemuck::cast_slice(&bytes).to_vec()
+    }
+    fn maxerr(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn deltanet_matches_cpu() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let (nv, nk, kd, vd) = (4usize, 2usize, 8usize, 8usize);
+        let eps = 1e-6f32;
+        let q = det(nk * kd, 0.1);
+        let k = det(nk * kd, 0.7);
+        let v = det(nv * vd, 1.3);
+        let blog = det(nv, 2.0);
+        let alpha = det(nv, 0.5);
+        let acoef: Vec<f32> = (0..nv).map(|i| -(0.2 + 0.1 * i as f32)).collect();
+        let dtbias = det(nv, -0.3);
+        let state0 = det(nv * kd * vd, 0.05);
+
+        // CPU reference (mirrors shaders/deltanet.comp + the qwen35 CPU mixer).
+        let qscale = 1.0 / (kd as f32).sqrt();
+        let mut s = state0.clone();
+        let mut out_cpu = vec![0f32; nv * vd];
+        for h in 0..nv {
+            let khid = h % nk;
+            let mut qh = q[khid * kd..khid * kd + kd].to_vec();
+            let mut kh = k[khid * kd..khid * kd + kd].to_vec();
+            let qn = (qh.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
+            let kn = (kh.iter().map(|x| x * x).sum::<f32>() + eps).sqrt();
+            for x in qh.iter_mut() {
+                *x = *x / qn * qscale;
+            }
+            for x in kh.iter_mut() {
+                *x /= kn;
+            }
+            let beta = sigmoid(blog[h]);
+            let decay = (acoef[h] * softplus(alpha[h] + dtbias[h])).exp();
+            let sb = h * kd * vd;
+            for d in 0..vd {
+                let mut kvv = 0.0;
+                for kk in 0..kd {
+                    let sv = s[sb + kk * vd + d] * decay;
+                    s[sb + kk * vd + d] = sv;
+                    kvv += kh[kk] * sv;
+                }
+                let delta = (v[h * vd + d] - kvv) * beta;
+                let mut o = 0.0;
+                for kk in 0..kd {
+                    let sv = s[sb + kk * vd + d] + kh[kk] * delta;
+                    s[sb + kk * vd + d] = sv;
+                    o += qh[kk] * sv;
+                }
+                out_cpu[h * vd + d] = o;
+            }
+        }
+
+        let (qb, kb, vb) = (dev(&be, &q), dev(&be, &k), dev(&be, &v));
+        let (bb, ab) = (dev(&be, &blog), dev(&be, &alpha));
+        let (acb, dtb) = (dev(&be, &acoef), dev(&be, &dtbias));
+        let sbuf = dev(&be, &state0);
+        let ob = be.alloc(nv * vd * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.deltanet(
+            qb.as_ref(),
+            kb.as_ref(),
+            vb.as_ref(),
+            bb.as_ref(),
+            ab.as_ref(),
+            acb.as_ref(),
+            dtb.as_ref(),
+            sbuf.as_ref(),
+            ob.as_ref(),
+            nv,
+            nk,
+            kd,
+            vd,
+            eps,
+        );
+        rec.finish().unwrap();
+        let out_gpu = read(&be, ob.as_ref(), nv * vd);
+        let s_gpu = read(&be, sbuf.as_ref(), nv * kd * vd);
+        assert!(
+            maxerr(&out_cpu, &out_gpu) < 1e-4,
+            "deltanet out err {}",
+            maxerr(&out_cpu, &out_gpu)
+        );
+        assert!(
+            maxerr(&s, &s_gpu) < 1e-4,
+            "deltanet state err {}",
+            maxerr(&s, &s_gpu)
+        );
+    }
+
+    #[test]
+    fn conv1d_silu_matches_cpu() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let (cc, kconv) = (40usize, 4usize);
+        let qkv = det(cc, 0.2);
+        let w = det(cc * kconv, 1.1);
+        let state0 = det((kconv - 1) * cc, 0.3);
+
+        // CPU reference (mirrors shaders/conv1d_silu.comp).
+        let mut st = state0.clone();
+        let mut out_cpu = vec![0f32; cc];
+        let km1 = kconv - 1;
+        for ch in 0..cc {
+            let mut acc = 0.0;
+            for k in 0..km1 {
+                acc += st[k * cc + ch] * w[ch * kconv + k];
+            }
+            acc += qkv[ch] * w[ch * kconv + km1];
+            out_cpu[ch] = acc * sigmoid(acc);
+            for k in 0..km1 - 1 {
+                st[k * cc + ch] = st[(k + 1) * cc + ch];
+            }
+            st[(km1 - 1) * cc + ch] = qkv[ch];
+        }
+
+        let xb = dev(&be, &qkv);
+        let wb = dev(&be, &w);
+        let sbuf = dev(&be, &state0);
+        let ob = be.alloc(cc * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.conv1d_silu(
+            xb.as_ref(),
+            wb.as_ref(),
+            sbuf.as_ref(),
+            ob.as_ref(),
+            cc,
+            kconv,
+        );
+        rec.finish().unwrap();
+        let out_gpu = read(&be, ob.as_ref(), cc);
+        let s_gpu = read(&be, sbuf.as_ref(), (kconv - 1) * cc);
+        assert!(
+            maxerr(&out_cpu, &out_gpu) < 1e-5,
+            "conv out err {}",
+            maxerr(&out_cpu, &out_gpu)
+        );
+        assert!(
+            maxerr(&st, &s_gpu) < 1e-5,
+            "conv state err {}",
+            maxerr(&st, &s_gpu)
+        );
+    }
+}

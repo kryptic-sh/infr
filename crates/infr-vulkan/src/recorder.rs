@@ -1958,6 +1958,87 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Gated-DeltaNet recurrence, one token (Qwen3-Next SSM). The persistent `state` buffer
+    /// `[nv*kd*vd]` is updated in place; `out` is `[nv*vd]`. One workgroup per value head; the
+    /// `nk` q/k heads are tiled up to `nv`. See shaders/deltanet.comp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+    ) {
+        let kern = self
+            .be
+            .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(nv as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nk as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(kd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(vd as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&eps.to_ne_bytes());
+        push[20..24].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(v),
+                Self::vkb(blog),
+                Self::vkb(alpha),
+                Self::vkb(acoef),
+                Self::vkb(dtbias),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2, // state (in/out) + out
+            &push,
+            nv as u32,
+        );
+    }
+
+    /// Causal depthwise conv1d + SiLU, one token (Qwen3-Next SSM input conv). The per-channel history
+    /// `state` `[(kconv-1)*cc]` is updated in place; `out` is `[cc]`. See shaders/conv1d_silu.comp.
+    pub fn conv1d_silu(
+        &self,
+        qkv: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        cc: usize,
+        kconv: usize,
+    ) {
+        let kern = self
+            .be
+            .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(cc as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kconv as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(qkv),
+                Self::vkb(w),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2, // state (in/out) + out
+            &push,
+            (cc as u32).div_ceil(256),
+        );
+    }
+
     /// GeGLU with separate gate/up buffers: `y[i] = gelu(gate[i]) * up[up_off_bytes/4 + i]` (GELU
     /// tanh-approx). `up_off_bytes` lets a layer-major slice of a larger buffer be read in place
     /// (gemma4 per-layer-embd gate: `gelu(inp_gate·hidden) * inp_per_layer[il]`).

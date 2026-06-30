@@ -30,6 +30,8 @@ fn main() {
         ("attn_pv_warp", "attn_pv_warp", &[]),
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
         ("rmsnorm", "rmsnorm", &[]),
+        ("deltanet", "deltanet", &[]),
+        ("conv1d_silu", "conv1d_silu", &[]),
         ("add", "add", &[]),
         ("add_scaled", "add_scaled", &[]),
         ("scale", "scale", &[]),

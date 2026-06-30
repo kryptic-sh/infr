@@ -1,0 +1,101 @@
+#version 460
+// Gated-DeltaNet linear-attention recurrence, ONE token (Qwen3-Next). One workgroup per VALUE head.
+// Per head: L2-normalize q,k (q also scaled by 1/√kd); beta=sigmoid(b); decay=exp(a_coef·softplus(
+// alpha+dt_bias)); update the persistent state S[kd,vd]: S*=decay, kv=kᵀS, delta=(v−kv)·beta,
+// S+=k⊗delta, out=qᵀS. GQA: the nk q/k heads are TILED to nv value heads → head h uses q/k head
+// h % nk. Columns d of S are independent, so the 128 threads parallelize over vd (looping if vd>128).
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint nv;     // value heads (= workgroup count)
+    uint nk;     // key/query heads (tiled up to nv)
+    uint kd;     // head_k_dim
+    uint vd;     // head_v_dim
+    float eps;   // l2norm epsilon
+    float qscale; // 1/sqrt(kd)
+} pc;
+
+layout(binding = 0) readonly buffer QB  { float q[]; };       // [nk*kd]
+layout(binding = 1) readonly buffer KB  { float k[]; };       // [nk*kd]
+layout(binding = 2) readonly buffer VB  { float v[]; };       // [nv*vd]
+layout(binding = 3) readonly buffer BB  { float blog[]; };    // [nv]  beta logits
+layout(binding = 4) readonly buffer AB  { float alpha[]; };   // [nv]
+layout(binding = 5) readonly buffer ACB { float acoef[]; };   // [nv]  (ssm_a weight)
+layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
+layout(binding = 7) buffer SB { float state[]; };             // [nv*kd*vd] in/out
+layout(binding = 8) writeonly buffer OB { float outp[]; };    // [nv*vd]
+
+shared float qn[256]; // normalized q (kd ≤ 256)
+shared float kn[256]; // normalized k
+shared float red[128];
+
+// Tree-reduce red[0..128) → red[0] (sum); call with a barrier already done on red writes.
+float reduce_sum() {
+    uint t = gl_LocalInvocationID.x;
+    for (uint s = 64u; s > 0u; s >>= 1) {
+        if (t < s) { red[t] += red[t + s]; }
+        barrier();
+    }
+    return red[0];
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint khid = h % pc.nk;
+    uint qbase = khid * pc.kd;
+    uint vbase = h * pc.vd;
+    uint sbase = h * pc.kd * pc.vd;
+
+    // ── L2-normalize q and k over kd (each into shared) ──────────────────────
+    float qs = 0.0, ks = 0.0;
+    for (uint i = t; i < pc.kd; i += 128u) {
+        float qv = q[qbase + i];
+        float kv = k[qbase + i]; // k tiled the same as q
+        qn[i] = qv;
+        kn[i] = kv;
+        qs += qv * qv;
+        ks += kv * kv;
+    }
+    red[t] = qs;
+    barrier();
+    float qsum = reduce_sum();
+    barrier();
+    red[t] = ks;
+    barrier();
+    float ksum = reduce_sum();
+    float qnorm = sqrt(qsum + pc.eps);
+    float knorm = sqrt(ksum + pc.eps);
+    barrier();
+    for (uint i = t; i < pc.kd; i += 128u) {
+        qn[i] = qn[i] / qnorm * pc.qscale;
+        kn[i] = kn[i] / knorm;
+    }
+    barrier();
+
+    // ── per-head gates ───────────────────────────────────────────────────────
+    float beta = 1.0 / (1.0 + exp(-blog[h]));
+    float zsp = alpha[h] + dtbias[h];
+    float sp = max(zsp, 0.0) + log(1.0 + exp(-abs(zsp))); // softplus
+    float decay = exp(acoef[h] * sp);
+
+    // ── recurrence over independent columns d of S[kd, vd] ───────────────────
+    for (uint d = t; d < pc.vd; d += 128u) {
+        // S *= decay ; kv = kᵀS  (uses the decayed S)
+        float kvv = 0.0;
+        for (uint kk = 0u; kk < pc.kd; kk++) {
+            float sval = state[sbase + kk * pc.vd + d] * decay;
+            state[sbase + kk * pc.vd + d] = sval;
+            kvv += kn[kk] * sval;
+        }
+        float delta = (v[vbase + d] - kvv) * beta;
+        // S += k⊗delta ; out = qᵀS  (uses the updated S)
+        float o = 0.0;
+        for (uint kk = 0u; kk < pc.kd; kk++) {
+            float sval = state[sbase + kk * pc.vd + d] + kn[kk] * delta;
+            state[sbase + kk * pc.vd + d] = sval;
+            o += qn[kk] * sval;
+        }
+        outp[vbase + d] = o;
+    }
+}

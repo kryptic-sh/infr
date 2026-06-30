@@ -1,0 +1,36 @@
+#version 460
+// Causal depthwise 1-D conv + SiLU, ONE token (Qwen3-Next SSM input conv). One thread per channel:
+//   out[ch] = silu( Σ_{k<K-1} state[k][ch]·w[ch][k] + qkv[ch]·w[ch][K-1] )
+// then shift the per-channel history (drop oldest, append the raw qkv). `state` is [K-1, cc] row-major
+// (k outer), `w` is [cc, K] (per-channel kernel), matching the CPU reference layout.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint cc; uint kconv; } pc;
+
+layout(binding = 0) readonly buffer XB { float qkv[]; };    // [cc]
+layout(binding = 1) readonly buffer WB { float wconv[]; };  // [cc*kconv]
+layout(binding = 2) buffer SB { float cstate[]; };          // [(kconv-1)*cc] in/out
+layout(binding = 3) writeonly buffer OB { float outp[]; };  // [cc]
+
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.cc) {
+        return;
+    }
+    uint km1 = pc.kconv - 1u;
+    float acc = 0.0;
+    for (uint k = 0u; k < km1; k++) {
+        acc += cstate[k * pc.cc + ch] * wconv[ch * pc.kconv + k];
+    }
+    float cur = qkv[ch];
+    acc += cur * wconv[ch * pc.kconv + km1];
+    outp[ch] = acc / (1.0 + exp(-acc)); // SiLU
+
+    // shift history: state[k] = state[k+1] for k in 0..km1-1, then newest slot = cur.
+    for (uint k = 0u; k + 1u < km1; k++) {
+        cstate[k * pc.cc + ch] = cstate[(k + 1u) * pc.cc + ch];
+    }
+    if (km1 >= 1u) {
+        cstate[(km1 - 1u) * pc.cc + ch] = cur;
+    }
+}

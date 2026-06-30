@@ -896,10 +896,63 @@ impl Backend for CpuBackend {
                             };
                         });
                     } else {
+                        // PREFILL (m > 1): parallelize over output rows (one weight row per task),
+                        // reuse each weight row across all m token activations, use the same fast
+                        // Q8 integer-dot kernels as the decode path.
+                        //
+                        // Layout: out[r * out_f + o].  We accumulate into a transposed buffer
+                        // out_t[o * m + r] (contiguous in o-major order) so each parallel chunk
+                        // owns a contiguous slice of m floats, then scatter into out at the end.
+                        let q8s: Vec<Q8> = if matches!(dt, DType::Q4K | DType::Q6K) {
+                            (0..m)
+                                .map(|r| quantize_q8(&xs[r * in_f..r * in_f + in_f]))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let mut out_t = vec![0f32; out_f * m];
+                        out_t.par_chunks_mut(m).enumerate().for_each(|(o, chunk)| {
+                            let row = &wbytes[o * bpr..o * bpr + bpr];
+                            match dt {
+                                DType::Q4K => {
+                                    for r in 0..m {
+                                        chunk[r] = vec_dot_q4k(row, &q8s[r], in_f);
+                                    }
+                                }
+                                DType::Q6K => {
+                                    for r in 0..m {
+                                        chunk[r] = vec_dot_q6k(row, &q8s[r], in_f);
+                                    }
+                                }
+                                DType::F32 => {
+                                    let w32: &[f32] = bytemuck::cast_slice(row);
+                                    for r in 0..m {
+                                        chunk[r] = dot(w32, &xs[r * in_f..r * in_f + in_f]);
+                                    }
+                                }
+                                DType::F16 => {
+                                    for r in 0..m {
+                                        chunk[r] = dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
+                                    }
+                                }
+                                DType::Bf16 => {
+                                    for r in 0..m {
+                                        chunk[r] = dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
+                                    }
+                                }
+                                _ => {
+                                    // Dequant the weight row ONCE, reuse across all m tokens.
+                                    let wf = bytes_to_f32(row, dt);
+                                    for r in 0..m {
+                                        chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                                    }
+                                }
+                            }
+                        });
+                        // Transpose out_t[o * m + r] → out[r * out_f + o].
                         for o in 0..out_f {
-                            let row = bytes_to_f32(&wbytes[o * bpr..o * bpr + bpr], dt);
                             for r in 0..m {
-                                out[r * out_f + o] = dot(&row, &xs[r * in_f..r * in_f + in_f]);
+                                out[r * out_f + o] = out_t[o * m + r];
                             }
                         }
                     }
@@ -1700,14 +1753,17 @@ pub(crate) fn generate_dense_backend(
         .alloc(c.vocab * 4, BufferUsage::Readback)
         .map_err(|e| anyhow!("{e}"))?;
 
-    // Build the decode graph for a given absolute position (kv_len = pos+1).
-    let build = |pos: usize| -> (Graph, DecodeHandles) {
+    // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.
+    // `batch = 1` is the normal decode path; `batch > 1` is the batched-prefill path.
+    // Scratch tensors scale by `batch`; the LM head always runs on the LAST token only
+    // (extracted via Op::Copy for batch > 1) so the logits output is always [vocab].
+    let build = |batch: usize, start_pos: usize| -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache is f16 — matches the GPU's f16 cache (halves memory, tightens CPU↔GPU parity).
         let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
-        let hidden = g.input(f32d(ne));
-        let positions = g.input(TensorDesc::new(vec![1], DType::I32));
+        let hidden = g.input(f32d(batch * ne));
+        let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
         // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]` (computed host-side each step).
         let per_layer_inp = if e2b {
@@ -1814,24 +1870,24 @@ pub(crate) fn generate_dense_backend(
         };
         let logits = g.output(f32d(c.vocab));
 
-        // scratch (sized to the per-layer max; ops reallocate dst, so these are upper bounds)
-        let hn = g.internal(f32d(ne));
-        let q = g.internal(f32d(max_qrow));
-        let k = g.internal(f32d(max_kvrow));
-        let v = g.internal(f32d(max_kvrow));
+        // scratch (sized to the per-layer max × batch; ops reallocate dst, so these are upper bounds)
+        let hn = g.internal(f32d(batch * ne));
+        let q = g.internal(f32d(batch * max_qrow));
+        let k = g.internal(f32d(batch * max_kvrow));
+        let v = g.internal(f32d(batch * max_kvrow));
         // QkNorm+RoPE writes f16 (the GPU `qk_norm_rope` is f32-in→f16-out, can't be in place; the GPU
         // attention reads f16 q). q16/k16 hold the f16 normed+roped q/k for the q/k-norm (qwen3/gemma)
         // path; the llama RoPE-only path stays in f32 q/k. Free on the CPU (its store is f32 regardless).
-        let q16 = g.internal(f16d(max_qrow));
-        let k16 = g.internal(f16d(max_kvrow));
-        let attn = g.internal(f32d(max_qrow));
-        let gbuf = g.internal(f32d(nff));
-        let ubuf = g.internal(f32d(nff));
-        let actbuf = g.internal(f32d(nff));
-        let sub = g.internal(f32d(ne));
+        let q16 = g.internal(f16d(batch * max_qrow));
+        let k16 = g.internal(f16d(batch * max_kvrow));
+        let attn = g.internal(f32d(batch * max_qrow));
+        let gbuf = g.internal(f32d(batch * nff));
+        let ubuf = g.internal(f32d(batch * nff));
+        let actbuf = g.internal(f32d(batch * nff));
+        let sub = g.internal(f32d(batch * ne));
         // E2B per-layer embed scratch: gate `[npl]` and projected `[ne]`.
-        let plg = g.internal(f32d(npl.max(1)));
-        let plp = g.internal(f32d(ne));
+        let plg = g.internal(f32d(batch * npl.max(1)));
+        let plp = g.internal(f32d(batch * ne));
 
         let eps = c.rms_eps;
         for (l, lw) in lw.iter().enumerate() {
@@ -1862,7 +1918,7 @@ pub(crate) fn generate_dense_backend(
                 x: hidden,
                 weight: lw.attn_norm,
                 dst: hn,
-                rows: 1,
+                rows: batch as u32,
                 dim: ne as u32,
                 eps,
             });
@@ -1870,7 +1926,7 @@ pub(crate) fn generate_dense_backend(
                 x: hn,
                 weight: lw.wq,
                 dst: q,
-                m: 1,
+                m: batch as u32,
                 in_f: ne as u32,
                 out_f: qrow as u32,
             });
@@ -1883,7 +1939,7 @@ pub(crate) fn generate_dense_backend(
                     x: hn,
                     weight: lw.wk,
                     dst: k,
-                    m: 1,
+                    m: batch as u32,
                     in_f: ne as u32,
                     out_f: kvrow as u32,
                 });
@@ -1894,7 +1950,7 @@ pub(crate) fn generate_dense_backend(
                         x: hn,
                         weight: wv,
                         dst: v,
-                        m: 1,
+                        m: batch as u32,
                         in_f: ne as u32,
                         out_f: kvrow as u32,
                     }),
@@ -1903,7 +1959,7 @@ pub(crate) fn generate_dense_backend(
                         src_off: 0,
                         dst: v,
                         dst_off: 0,
-                        n: kvrow as u32,
+                        n: (batch * kvrow) as u32,
                     }),
                 }
                 // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
@@ -1914,7 +1970,7 @@ pub(crate) fn generate_dense_backend(
                             weight: kn,
                             positions,
                             dst: k16,
-                            rows: 1,
+                            rows: batch as u32,
                             n_head: nkv as u32,
                             head_dim: hd as u32,
                             rope_dim: rope_dim as u32,
@@ -1929,7 +1985,7 @@ pub(crate) fn generate_dense_backend(
                             x: k,
                             positions,
                             dst: k,
-                            rows: 1,
+                            rows: batch as u32,
                             n_head: nkv as u32,
                             head_dim: hd as u32,
                             rope_dim: rope_dim as u32,
@@ -1945,7 +2001,7 @@ pub(crate) fn generate_dense_backend(
                         x: v,
                         weight: ones,
                         dst: v,
-                        rows: 1,
+                        rows: batch as u32,
                         n_head: nkv as u32,
                         head_dim: hd as u32,
                         eps,
@@ -1954,16 +2010,16 @@ pub(crate) fn generate_dense_backend(
                 g.push(Op::WriteKv {
                     src: k_write,
                     cache: k_cache[l],
-                    rows: 1,
+                    rows: batch as u32,
                     row_stride: kvrow as u32,
-                    pos: pos as u32,
+                    pos: start_pos as u32,
                 });
                 g.push(Op::WriteKv {
                     src: v,
                     cache: v_cache[l],
-                    rows: 1,
+                    rows: batch as u32,
                     row_stride: kvrow as u32,
-                    pos: pos as u32,
+                    pos: start_pos as u32,
                 });
             }
             // Q: fused QkNorm+RoPE (qwen3/gemma) → f16 `q16`, else RoPE alone (llama) in-place f32.
@@ -1974,7 +2030,7 @@ pub(crate) fn generate_dense_backend(
                         weight: qn,
                         positions,
                         dst: q16,
-                        rows: 1,
+                        rows: batch as u32,
                         n_head: nh as u32,
                         head_dim: hd as u32,
                         rope_dim: rope_dim as u32,
@@ -1989,7 +2045,7 @@ pub(crate) fn generate_dense_backend(
                         x: q,
                         positions,
                         dst: q,
-                        rows: 1,
+                        rows: batch as u32,
                         n_head: nh as u32,
                         head_dim: hd as u32,
                         rope_dim: rope_dim as u32,
@@ -2004,20 +2060,20 @@ pub(crate) fn generate_dense_backend(
                 k_cache: k_cache[kv_src],
                 v_cache: v_cache[kv_src],
                 dst: attn,
-                rows: 1,
-                kv_len: (pos + 1) as u32,
+                rows: batch as u32,
+                kv_len: (start_pos + batch) as u32,
                 n_head: nh as u32,
                 n_kv: nkv as u32,
                 head_dim: hd as u32,
                 scale,
                 mask,
-                pos: pos as u32,
+                pos: start_pos as u32,
             });
             g.push(Op::Linear {
                 x: attn,
                 weight: lw.wo,
                 dst: sub,
-                m: 1,
+                m: batch as u32,
                 in_f: qrow as u32,
                 out_f: ne as u32,
             });
@@ -2027,7 +2083,7 @@ pub(crate) fn generate_dense_backend(
                     x: sub,
                     weight: pa,
                     dst: sub,
-                    rows: 1,
+                    rows: batch as u32,
                     dim: ne as u32,
                     eps,
                 });
@@ -2036,14 +2092,14 @@ pub(crate) fn generate_dense_backend(
                 a: hidden,
                 b: sub,
                 dst: hidden,
-                n: ne as u32,
+                n: (batch * ne) as u32,
             });
             // ffn
             g.push(Op::RmsNorm {
                 x: hidden,
                 weight: lw.ffn_norm,
                 dst: hn,
-                rows: 1,
+                rows: batch as u32,
                 dim: ne as u32,
                 eps,
             });
@@ -2053,7 +2109,7 @@ pub(crate) fn generate_dense_backend(
                         x: hn,
                         weight: wgate,
                         dst: gbuf,
-                        m: 1,
+                        m: batch as u32,
                         in_f: ne as u32,
                         out_f: nff_l as u32,
                     });
@@ -2061,7 +2117,7 @@ pub(crate) fn generate_dense_backend(
                         x: hn,
                         weight: wup,
                         dst: ubuf,
-                        m: 1,
+                        m: batch as u32,
                         in_f: ne as u32,
                         out_f: nff_l as u32,
                     });
@@ -2069,7 +2125,7 @@ pub(crate) fn generate_dense_backend(
                         gate: gbuf,
                         up: ubuf,
                         dst: actbuf,
-                        rows: 1,
+                        rows: batch as u32,
                         nff: nff_l as u32,
                         act,
                         up_off: 0,
@@ -2078,7 +2134,7 @@ pub(crate) fn generate_dense_backend(
                         x: actbuf,
                         weight: wdown,
                         dst: sub,
-                        m: 1,
+                        m: batch as u32,
                         in_f: nff_l as u32,
                         out_f: ne as u32,
                     });
@@ -2111,7 +2167,7 @@ pub(crate) fn generate_dense_backend(
                     x: sub,
                     weight: pf,
                     dst: sub,
-                    rows: 1,
+                    rows: batch as u32,
                     dim: ne as u32,
                     eps,
                 });
@@ -2120,7 +2176,7 @@ pub(crate) fn generate_dense_backend(
                 a: hidden,
                 b: sub,
                 dst: hidden,
-                n: ne as u32,
+                n: (batch * ne) as u32,
             });
             // gemma4 E2B per-layer input embedding (gemma3n): mix this layer's input vector into
             // `hidden` after the FFN residual. `g = gelu(inp_gate·hidden) * inp_per_layer[l]`,
@@ -2132,7 +2188,7 @@ pub(crate) fn generate_dense_backend(
                     x: hidden,
                     weight: gate_w,
                     dst: plg,
-                    m: 1,
+                    m: batch as u32,
                     in_f: ne as u32,
                     out_f: npl as u32,
                 });
@@ -2141,7 +2197,7 @@ pub(crate) fn generate_dense_backend(
                     gate: plg,
                     up: ipl,
                     dst: plg,
-                    rows: 1,
+                    rows: batch as u32,
                     nff: npl as u32,
                     act: Activation::Gelu,
                     up_off: (l * npl) as u32,
@@ -2150,7 +2206,7 @@ pub(crate) fn generate_dense_backend(
                     x: plg,
                     weight: proj_w,
                     dst: plp,
-                    m: 1,
+                    m: batch as u32,
                     in_f: npl as u32,
                     out_f: ne as u32,
                 });
@@ -2158,7 +2214,7 @@ pub(crate) fn generate_dense_backend(
                     x: plp,
                     weight: post_norm,
                     dst: plp,
-                    rows: 1,
+                    rows: batch as u32,
                     dim: ne as u32,
                     eps,
                 });
@@ -2166,7 +2222,7 @@ pub(crate) fn generate_dense_backend(
                     a: hidden,
                     b: plp,
                     dst: hidden,
-                    n: ne as u32,
+                    n: (batch * ne) as u32,
                 });
             }
             // gemma4: scale the whole layer output by the per-layer scalar before the next layer.
@@ -2175,7 +2231,7 @@ pub(crate) fn generate_dense_backend(
                     x: hidden,
                     dst: hidden,
                     s,
-                    n: ne as u32,
+                    n: (batch * ne) as u32,
                 });
             }
         }
@@ -2183,12 +2239,28 @@ pub(crate) fn generate_dense_backend(
             x: hidden,
             weight: w_out_norm,
             dst: hn,
-            rows: 1,
+            rows: batch as u32,
             dim: ne as u32,
             eps,
         });
+        // For batch > 1: the LM head runs only on the LAST token's hidden state — extract it
+        // via Op::Copy before the projection so the logits output is always [vocab] regardless
+        // of batch size. (For batch = 1, `hn` is already the single token's hidden state.)
+        let lm_in = if batch > 1 {
+            let hn_last = g.internal(f32d(ne));
+            g.push(Op::Copy {
+                src: hn,
+                src_off: ((batch - 1) * ne) as u32,
+                dst: hn_last,
+                dst_off: 0,
+                n: ne as u32,
+            });
+            hn_last
+        } else {
+            hn
+        };
         g.push(Op::Linear {
-            x: hn,
+            x: lm_in,
             weight: w_lm,
             dst: logits,
             m: 1,
@@ -2228,7 +2300,70 @@ pub(crate) fn generate_dense_backend(
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
-    for pos in 0..(prompt.len() + max_new) {
+
+    // ── batched prefill (dense non-MoE non-E2B models only) ──────────────────────────────────
+    // Process all-but-the-last prompt tokens in a single graph execution: each Op::Linear runs
+    // m=(N-1) activations against every weight row in parallel (O(out_f) rayon tasks, N-1 dots
+    // each), reading each weight row ONCE and reusing it across all tokens. This fills the KV
+    // cache for positions 0..N-2. The last prompt token is left for the normal decode loop so
+    // that the "decode" stats (tok/s) remain meaningful and the first generated token is sampled
+    // in the canonical way.
+    //
+    // Guard: MoE uses Op::MoeFfn (per-token expert routing, no batched variant yet); E2B/gemma4
+    // requires a per-(token,layer) host-side input vector that is computed in the per-step loop.
+    // Both fall through to the original token-by-token loop below unchanged.
+    let decode_start = if prompt.len() > 2 && c.moe.is_none() && !e2b {
+        let pf_m = prompt.len() - 1; // process all but the last prompt token
+                                     // Concatenate embeddings for the pf_m tokens: [pf_m × ne] row-major.
+        let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
+        for &tok in &prompt[..pf_m] {
+            let base = tok as usize * ne;
+            pf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
+        }
+        // Absolute positions [0, 1, ..., pf_m-1].
+        let pf_positions: Vec<i32> = (0..pf_m as i32).collect();
+        // Allocate staging buffers sized for the prefill batch.
+        let pf_hidden_buf = be
+            .alloc(pf_m * ne * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let pf_pos_buf = be
+            .alloc(pf_m * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(pf_hidden_buf.as_ref(), bytemuck::cast_slice(&pf_hidden))
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(pf_pos_buf.as_ref(), bytemuck::cast_slice(&pf_positions))
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let pf_t0 = std::time::Instant::now();
+        let (pf_g, pf_h) = build(pf_m, 0);
+        let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
+        let mut pf_b = Bindings::new();
+        pf_b.bind(pf_h.hidden, pf_hidden_buf.as_ref());
+        pf_b.bind(pf_h.positions, pf_pos_buf.as_ref());
+        for l in 0..c.n_layer {
+            pf_b.bind(pf_h.k_cache[l], kbufs[l].as_ref());
+            pf_b.bind(pf_h.v_cache[l], vbufs[l].as_ref());
+        }
+        for (i, wid) in pf_h.weights.iter().enumerate() {
+            pf_b.bind(*wid, wbufs[i].as_ref());
+        }
+        pf_b.bind(pf_h.logits, logits_buf.as_ref());
+        be.execute(pf_plan.as_ref(), &pf_b)
+            .map_err(|e| anyhow!("{e}"))?;
+        prompt_t += pf_t0.elapsed();
+
+        // KV cache is filled for positions 0..pf_m-1.
+        // The last prompt token (position pf_m) is handled by the decode loop below,
+        // which will write its KV, get the correct logits, and sample the first generated token.
+        pf_m
+    } else {
+        0 // fall through to per-token loop for MoE / E2B / short prompts
+    };
+
+    for pos in decode_start..(prompt.len() + max_new) {
+        if out.len() >= max_new {
+            break;
+        }
         let step_t0 = std::time::Instant::now();
         let tok = cur[pos] as usize;
         // embed (gemma scales by √n_embd; qwen3/llama identity)
@@ -2280,7 +2415,7 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
         }
 
-        let (g, h) = build(pos);
+        let (g, h) = build(1, pos);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         b.bind(h.hidden, hidden_buf.as_ref());

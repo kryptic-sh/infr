@@ -1096,3 +1096,546 @@ pub(crate) fn is_quant(d: infr_core::DType) -> bool {
         Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K
     )
 }
+
+#[cfg(test)]
+mod dequant_tests {
+    use super::*;
+
+    // ── IQ4_NL ──────────────────────────────────────────────────────────────────
+    // Block: [half d][uint8 qs[16]], 32 elements, 18 bytes
+    // y[j] = d * KVALUES_IQ4NL[qs[j] & 0xF]; y[j+16] = d * KVALUES_IQ4NL[qs[j] >> 4]
+    // Reference: llama.cpp dequantize_row_iq4_nl (ggml-quants.c l.2653)
+    #[test]
+    fn iq4nl_single_block() {
+        // d=1.0, qs[0]=0x80 (lo=0, hi=8)
+        // KVALUES_IQ4NL[0] = -127, KVALUES_IQ4NL[8] = 1
+        // y[0] = 1.0 * (-127) = -127.0
+        // y[16] = 1.0 * 1 = 1.0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2] = 0x80; // lo=0→-127, hi=8→1
+        let y = dequant_codebook(infr_core::DType::Iq4Nl, &block);
+        assert_eq!(y.len(), 32);
+        assert!(
+            (y[0] - (-127.0)).abs() < 1e-3,
+            "iq4nl y[0] expected -127.0, got {}",
+            y[0]
+        );
+        assert!(
+            (y[16] - 1.0).abs() < 1e-3,
+            "iq4nl y[16] expected 1.0, got {}",
+            y[16]
+        );
+    }
+
+    // ── IQ4_XS ──────────────────────────────────────────────────────────────────
+    // Block: [half d][uint16 scales_h][uint8 scales_l[4]][uint8 qs[128]], 256 elements, 136 bytes
+    // y = d*(ls-32) * KVALUES_IQ4NL[q4], ls is 6-bit per 32-elem sub-block
+    // Reference: llama.cpp dequantize_row_iq4_xs (ggml-quants.c l.2671)
+    #[test]
+    fn iq4xs_single_block() {
+        // d=1.0, scales: all sub-blocks have ls=32 → dl=d*(32-32)=0 → y=0
+        // Verify: all 256 outputs are 0.0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 136];
+        block[0..2].copy_from_slice(&d_bytes);
+        // scales_h=0, scales_l=[0x00,0x00,0x00,0x00]: all lo=0, all hi=0 → ls=0 → dl=-32
+        // Wait: ls=lo|(hi<<4). With scales_h=0 and scales_l=0, ls=0. dl=1.0*(0-32)=-32.
+        // qs all 0: qs[j]&0xF=0 → KVALUES_IQ4NL[0]=-127; qs[j]>>4=0 → -127
+        // y = -32 * (-127) = 4064.0 (all elements)
+        let y = dequant_codebook(infr_core::DType::Iq4Xs, &block);
+        assert_eq!(y.len(), 256);
+        let expected = -32.0_f32 * KVALUES_IQ4NL[0] as f32; // 4064.0
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 0.5,
+                "iq4xs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ1_S ───────────────────────────────────────────────────────────────────
+    // Block: [half d][u8 qs[32]][u16 qh[8]], 50 bytes, QK_K=256
+    // All-zero block: d=1.0, qh=0 → dl=1.0*(2*0+1)=1.0, delta=+0.125, grid_idx=0
+    //   IQ1S_GRID[0] = 0xffffffffffffffff → gv=-1 for all j
+    //   y[j] = 1.0 * (-1.0 + 0.125) = -0.875 for all 256 elements
+    // Ref: llama.cpp dequantize_row_iq1_s (ggml-quants.c l.2578)
+    #[test]
+    fn iq1s_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 50];
+        block[0..2].copy_from_slice(&d_bytes);
+        // qs=0, qh=0 → grid_idx=0, dl=1.0, delta=+0.125
+        let y = dequant_codebook(infr_core::DType::Iq1S, &block);
+        assert_eq!(y.len(), 256);
+        // IQ1S_GRID[0] = 0xffffffffffffffff → all bytes 0xFF = -1i8
+        let expected = 1.0_f32 * (-1.0_f32 + IQ1S_DELTA);
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq1s y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── MXFP4 ───────────────────────────────────────────────────────────────────
+    // Block: [u8 e][u8 qs[16]], 17 bytes, QK_MXFP4=32
+    // e=128 → d=e8m0_to_fp32_half(128)=2^(128-128)=1.0; qs[0]=0x21 → lo=1, hi=2
+    //   y[0] = KVALUES_MXFP4[1]*1.0 = 1.0; y[16] = KVALUES_MXFP4[2]*1.0 = 2.0
+    // Ref: llama.cpp dequantize_row_mxfp4 (ggml-quants.c l.511)
+    #[test]
+    fn mxfp4_single_block() {
+        let mut block = vec![0u8; 17];
+        block[0] = 128; // e=128 → d=1.0
+        block[1] = 0x21; // lo nibble=1→1, hi nibble=2→2
+        let y = dequant_codebook(infr_core::DType::Mxfp4, &block);
+        assert_eq!(y.len(), 32);
+        assert!(
+            (y[0] - 1.0).abs() < 1e-5,
+            "mxfp4 y[0] expected 1.0, got {}",
+            y[0]
+        );
+        assert!(
+            (y[16] - 2.0).abs() < 1e-5,
+            "mxfp4 y[16] expected 2.0, got {}",
+            y[16]
+        );
+        // rest of qs=0 → x0=x1=0 → y=0.0
+        for i in 1..16 {
+            assert!(y[i].abs() < 1e-5, "mxfp4 y[{i}] expected 0.0, got {}", y[i]);
+        }
+    }
+
+    // ── NVFP4 ───────────────────────────────────────────────────────────────────
+    // Block: [u8 d[4]][u8 qs[32]], 36 bytes, QK_NVFP4=64
+    // All-zero scales: d=ue4m3_to_fp32(0)=0.0 → all y=0.0
+    // Ref: llama.cpp dequantize_row_nvfp4 (ggml-quants.c l.531)
+    #[test]
+    fn nvfp4_single_block() {
+        let block = vec![0u8; 36];
+        let y = dequant_codebook(infr_core::DType::Nvfp4, &block);
+        assert_eq!(y.len(), 64);
+        for i in 0..64 {
+            assert!(y[i].abs() < 1e-5, "nvfp4 y[{i}] expected 0.0, got {}", y[i]);
+        }
+    }
+
+    // ── IQ1_M ───────────────────────────────────────────────────────────────────
+    // Block: [u8 qs[32]][u8 qh[16]][u8 scales[8]], 56 bytes, QK_K=256
+    // All-zero: scales=0 → d_bits=0 → d=0.0 → all y=0.0
+    // Ref: llama.cpp dequantize_row_iq1_m (ggml-quants.c l.2603)
+    #[test]
+    fn iq1m_single_block() {
+        let block = vec![0u8; 56];
+        let y = dequant_codebook(infr_core::DType::Iq1M, &block);
+        assert_eq!(y.len(), 256);
+        for i in 0..256 {
+            assert!(y[i].abs() < 1e-4, "iq1m y[{i}] expected 0.0, got {}", y[i]);
+        }
+    }
+
+    // ── TQ1_0 ───────────────────────────────────────────────────────────────────
+    // Block: [u8 qs[48]][u8 qh[4]][half d], 54 bytes, QK_K=256
+    // All-zero qs/qh: q=0 → xi=0 → y=(0-1)*d = -d for all 256 elements
+    // Ref: llama.cpp dequantize_row_tq1_0 (ggml-quants.c l.2356)
+    #[test]
+    fn tq1_0_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 54];
+        block[52..54].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Tq1_0, &block);
+        assert_eq!(y.len(), 256);
+        for i in 0..256 {
+            assert!(
+                (y[i] - (-1.0)).abs() < 1e-4,
+                "tq1_0 y[{i}] expected -1.0, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── TQ2_0 ───────────────────────────────────────────────────────────────────
+    // Block: [u8 qs[64]][half d], 66 bytes, QK_K=256
+    // All-zero qs: q=(0>>l*2)&3=0 → y=(0-1)*d = -d for all 256 elements
+    // Ref: llama.cpp dequantize_row_tq2_0 (ggml-quants.c l.2395)
+    #[test]
+    fn tq2_0_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 66];
+        block[64..66].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Tq2_0, &block);
+        assert_eq!(y.len(), 256);
+        for i in 0..256 {
+            assert!(
+                (y[i] - (-1.0)).abs() < 1e-4,
+                "tq2_0 y[{i}] expected -1.0, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ2_XXS ─────────────────────────────────────────────────────────────────
+    // Block: [half d][uint16 qs[32]], 66 bytes, QK_K=256
+    // Sub-block 0: aux0=0 → 4 grid indices all 0; aux1=0 → scale_mag=0, sign_idx=0
+    //   IQ2XXS_GRID[0] = 0x0808080808080808 → 8 bytes all 0x08
+    //   KSIGNS_IQ2XS[0] = 0 → no negations
+    //   db = 1.0*(0.5+0)*0.25 = 0.125
+    //   y = 0.125 * 8 = 1.0 for each of 8 elements × 4 groups = 32 elements
+    // Ref: llama.cpp dequantize_row_iq2_xxs (ggml-quants.c l.2416)
+    #[test]
+    fn iq2xxs_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 66];
+        block[0..2].copy_from_slice(&d_bytes);
+        // all qs = 0: aux0=0 (grid_idx=0), aux1=0 (scale_mag=0, sign_idx=0)
+        let y = dequant_codebook(infr_core::DType::Iq2Xxs, &block);
+        assert_eq!(y.len(), 256);
+        // first sub-block, first element
+        let expected = 0.125 * 8.0_f32;
+        for i in 0..32 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq2xxs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+        // remaining sub-blocks: same pattern (all zeros)
+        for i in 32..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq2xxs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ2_XS ──────────────────────────────────────────────────────────────────
+    // Block: [half d][uint16 qs[32]][uint8 scales[8]], 74 bytes, QK_K=256
+    // All zeros: scales[0]=0 → db0=db1=0.125; qs16=0 → grid_idx=0, sign_idx=0
+    //   IQ2XS_GRID[0] = 0x0808080808080808 → gv=8; KSIGNS[0]=0 → +1
+    //   y = 0.125 * 8 = 1.0 for first 32 elements
+    // Ref: llama.cpp dequantize_row_iq2_xs (ggml-quants.c l.2444)
+    #[test]
+    fn iq2xs_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 74];
+        block[0..2].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Iq2Xs, &block);
+        assert_eq!(y.len(), 256);
+        let expected = 0.125 * 8.0_f32;
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq2xs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ2_S ───────────────────────────────────────────────────────────────────
+    // Block: [half d][u8 qs[64]][u8 qh[8]][u8 scales[8]], 82 bytes, QK_K=256
+    // All zeros: scales=0 → db0=db1=0.125; qs_all[0]=0, qh[0]=0 → grid_idx=0
+    //   IQ2S_GRID[0] = 0x0808080808080808 → gv=8; signs[32]=0 → +1
+    //   y = 0.125 * 8 = 1.0 for all 256 elements
+    // Ref: llama.cpp dequantize_row_iq2_s (ggml-quants.c l.2471)
+    #[test]
+    fn iq2s_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 82];
+        block[0..2].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Iq2S, &block);
+        assert_eq!(y.len(), 256);
+        let expected = 0.125 * 8.0_f32;
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq2s y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ3_XXS ─────────────────────────────────────────────────────────────────
+    // Block: [half d][u8 qs[96]], 98 bytes, QK_K=256
+    // qs[0..64]=0 → grid_idx=0 for all; qs[64..96]=0 → aux32=0 → scale_mag=0, sign_idx=0
+    //   IQ3XXS_GRID[0] = 0x04040404 → gv for j=0..3: 4; KSIGNS[0]=0 → +1
+    //   db = 1.0*(0.5+0)*0.5 = 0.25
+    //   y = 0.25 * 4 = 1.0 for first 32 elements
+    // Ref: llama.cpp dequantize_row_iq3_xxs (ggml-quants.c l.2503)
+    #[test]
+    fn iq3xxs_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 98];
+        block[0..2].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Iq3Xxs, &block);
+        assert_eq!(y.len(), 256);
+        let expected = 0.25 * 4.0_f32;
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq3xxs y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── IQ3_S ───────────────────────────────────────────────────────────────────
+    // Block: [half d][u8 qs[64]][u8 qh[8]][u8 signs[32]][u8 scales[4]], 110 bytes
+    // All zeros: scales=0 → db1=db2=1.0*(1+2*0)=1.0; qs=0, qh=0 → grid_idx=0
+    //   IQ3S_GRID[0] = 0x01010101 → gv for j=0..3: 1; signs[0]=0 → +1
+    //   y = 1.0 * 1 = 1.0 for all 256 elements
+    // Ref: llama.cpp dequantize_row_iq3_s (ggml-quants.c l.2535)
+    #[test]
+    fn iq3s_single_block() {
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 110];
+        block[0..2].copy_from_slice(&d_bytes);
+        let y = dequant_codebook(infr_core::DType::Iq3S, &block);
+        assert_eq!(y.len(), 256);
+        let expected = 1.0_f32;
+        for i in 0..256 {
+            assert!(
+                (y[i] - expected).abs() < 1e-4,
+                "iq3s y[{i}] expected {expected}, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── Q2_K ────────────────────────────────────────────────────────────────────
+    // Block: [uint8 scales[16]][uint8 qs[64]][half d][half dmin]
+    // y = d*(sc&0xF)*q2 - dmin*(sc>>4), q2 ∈ 0..3
+    // Reference: llama.cpp dequantize_row_q2_K (ggml-quants.c l.903)
+    #[test]
+    fn q2k_single_block() {
+        // d=1.0, dmin=2.0
+        // scales[0]=0x23 → lo=3, hi=2 → first sub-block: dl=3.0, ml=4.0
+        // scales[1]=0x23 → second 16-elem sub-block (qs[16..32]): same dl/ml
+        // qs[0..16]=0x55 → q2 (shift=0) = 0x55 & 3 = 1
+        // Expected y[0] = 3.0*1 - 4.0 = -1.0
+        let mut block = vec![0u8; 84];
+        // scales[0..16]
+        block[0] = 0x23; // lo=3, hi=2
+        block[1] = 0x23; // same for second sub-block
+                         // qs[16..80]
+        for b in &mut block[16..80] {
+            *b = 0x55; // any bits; q2 at shift=0 for first 16 = 1
+        }
+        // d[80..82] = 1.0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        block[80..82].copy_from_slice(&d_bytes);
+        // dmin[82..84] = 2.0
+        let dmin_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        block[82..84].copy_from_slice(&dmin_bytes);
+
+        let y = dequant_block(infr_core::DType::Q2K, &block).unwrap();
+        assert_eq!(y.len(), 256);
+        // First sub-block, first element: q2=1, y=3.0*1-4.0=-1.0
+        assert!(
+            (y[0] - (-1.0)).abs() < 1e-4,
+            "q2k y[0] expected -1.0, got {}",
+            y[0]
+        );
+        // All elements in first sub-block same q2=1 → same y
+        for i in 0..16 {
+            assert!(
+                (y[i] - (-1.0)).abs() < 1e-4,
+                "q2k y[{i}] expected -1.0, got {}",
+                y[i]
+            );
+        }
+        // Second sub-block (16..32): same scales, qs=0x55, q2=(0x55>>2)&3=(0x15)&3=1
+        // Wait: shift=0 for j=0 applies to BOTH first and second 16-elem groups of the
+        // same j-iteration. Let me re-check the llama logic.
+        // In the llama code, for j=0 (shift=0):
+        //   sc=scales[0], dl=d*(sc&0xF)=3, ml=dmin*(sc>>4)=4
+        //   for l in 0..16: q2 = (q[l] >> 0) & 3 = qs[l] & 3 = 0x55 & 3 = 1
+        //   sc=scales[1], dl=d*(sc&0xF)=3, ml=dmin*(sc>>4)=4
+        //   for l in 0..16: q2 = (q[l+16] >> 0) & 3 = qs[l+16] & 3 = 1
+        // So elements 16..32 also have dl=3, ml=4, q2=1 → y=-1.0
+        assert!(
+            (y[16] - (-1.0)).abs() < 1e-4,
+            "q2k y[16] expected -1.0, got {}",
+            y[16]
+        );
+    }
+
+    // ── Q3_K ────────────────────────────────────────────────────────────────────
+    // Block: [uint8 hmask[32]][uint8 qs[64]][uint8 scales[12]][half d]
+    // y = d*(sc6-32)*(q3u - 4), q3u = (low2 | high_bit<<2) ∈ 0..7
+    // Reference: llama.cpp dequantize_row_q3_K (ggml-quants.c l.1247)
+    #[test]
+    fn q3k_single_block() {
+        // d=1.0
+        // Choose scales to decode as sc6=36 for all sub-blocks → sc6-32=4 → dl=4.0
+        // Encode sc6=36 for first sub-block in scales_raw:
+        //   After decode, aux bytes give sc6 values. Simpler: set all scales[0..12]=0
+        //   so that after bit manipulation aux has all-zero lower nibbles → sc6=0 for all.
+        //   Then dl=0 → y=0 everywhere. That's a trivial test.
+        //
+        // Better: set scales bytes to give sc6=32 for first two sub-blocks (dl=0, y=0)
+        // and verify that y[0..32]=0. Then set hmask and qs to anything.
+        //
+        // Even simpler: set scales_raw all-zero. After bit manipulation:
+        //   aux[0]=0, aux[1]=0, aux[2]=0, aux[3]=0
+        //   sc6(0)= aux[0] byte0 = 0 → sc6-32 = -32 → dl=-32
+        //   hmask[0..16]=0 (high bit=0), qs[0..16]=0x00 (low2=0 at shift=0)
+        //   q3u = 0 | (0<<2) = 0. y = -32*0 + (-4)*(-32) = 128... wait
+        //   y = dl*q3u + (-4*dl) = -32*0 + (-4*(-32)) = 128
+        //
+        // Let me verify this explicitly:
+        //   q3u=0, dl=-32, min=-4*dl=128. y = -32*0 + 128 = 128. ✓
+        //
+        // Alternatively: set scales_raw to encode sc6=32 for sub-block 0.
+        //   When tmp=aux[2]=0, aux[0]=scales_bytes[0..4] as u32.
+        //   For sc6=32 after decode:
+        //     sc6(0) = (aux[0] & 0xFF) = 32 → need aux[0] byte 0 = 32 = 0x20
+        //     After bit manip (tmp=0): aux[0] = (orig_aux0 & 0x0F0F0F0F) | ...
+        //     So (orig_aux0 & 0xF) = 32? 32 > 15, so the lower 4 bits can't encode 32.
+        //
+        // The scale decoding is complex. Let me just use all-zero scales (sc6=0, dl=-32*1=-32)
+        // with hmask[0..16]=0 and qs[0..16]=0x00:
+        // y = -32*0 + (-4*(-32)) = 128.0
+        let mut block = vec![0u8; 110];
+        // hmask[0..32] = all 0 (high bit not set for any elem)
+        // qs[32..96] = all 0 (low2=0 at any shift)
+        // scales[96..108] = all 0 (encodes sc6=0 after bit manipulation → dl=-32)
+        // d[108..110] = 1.0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        block[108..110].copy_from_slice(&d_bytes);
+
+        let y = dequant_block(infr_core::DType::Q3K, &block).unwrap();
+        assert_eq!(y.len(), 256);
+        // sc6=0 → dl = 1.0*(0-32) = -32.0
+        // q3u = 0 (hmask=0, qs=0), min = -4*(-32) = 128
+        // y[0] = -32*0 + 128 = 128.0
+        assert!(
+            (y[0] - 128.0).abs() < 1e-3,
+            "q3k y[0] expected 128.0, got {}",
+            y[0]
+        );
+        // All elements should be 128.0 (same scale, q3u=0 everywhere)
+        for i in 0..256 {
+            assert!(
+                (y[i] - 128.0).abs() < 1e-3,
+                "q3k y[{i}] expected 128.0, got {}",
+                y[i]
+            );
+        }
+    }
+
+    // ── Q4_0 ────────────────────────────────────────────────────────────────────
+    // Block: [half d][uint8 qs[16]]; y = d * (q4 - 8), q4 ∈ 0..15
+    // Reference: llama.cpp dequantize_row_q4_0 (ggml-quants.c l.401)
+    #[test]
+    fn q4_0_single_block() {
+        // d = 2.0 (f16 = 0x4000), qs[0] = 0x89 (lo=9, hi=8), rest = 0x88 (lo=8, hi=8)
+        let d_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2] = 0x89; // qs[0]: lo=9, hi=8
+        for b in &mut block[3..18] {
+            *b = 0x88; // lo=8, hi=8 → y = d*(8-8) = 0
+        }
+        let y = dequant_block(infr_core::DType::Q4_0, &block).unwrap();
+        assert_eq!(y.len(), 32);
+        // y[0] = 2.0*(9-8) = 2.0
+        assert!(
+            (y[0] - 2.0).abs() < 1e-5,
+            "q4_0 y[0] expected 2.0, got {}",
+            y[0]
+        );
+        // y[16] = 2.0*(8-8) = 0.0
+        assert!(y[16].abs() < 1e-5, "q4_0 y[16] expected 0.0, got {}", y[16]);
+        // y[1] = 2.0*(8-8) = 0.0
+        assert!(y[1].abs() < 1e-5, "q4_0 y[1] expected 0.0, got {}", y[1]);
+    }
+
+    // ── Q4_1 ────────────────────────────────────────────────────────────────────
+    // Block: [half d][half m][uint8 qs[16]]; y = d*q4 + m, q4 ∈ 0..15
+    // Reference: llama.cpp dequantize_row_q4_1 (ggml-quants.c l.421)
+    #[test]
+    fn q4_1_single_block() {
+        // d=1.0, m=0.5, qs[0]=0x30 (lo=0, hi=3), rest=0x00
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let m_bytes = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 20];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2..4].copy_from_slice(&m_bytes);
+        block[4] = 0x30; // lo=0, hi=3
+        let y = dequant_block(infr_core::DType::Q4_1, &block).unwrap();
+        assert_eq!(y.len(), 32);
+        // y[0] = 1.0*0 + 0.5 = 0.5
+        assert!(
+            (y[0] - 0.5).abs() < 1e-4,
+            "q4_1 y[0] expected 0.5, got {}",
+            y[0]
+        );
+        // y[16] = 1.0*3 + 0.5 = 3.5
+        assert!(
+            (y[16] - 3.5).abs() < 1e-4,
+            "q4_1 y[16] expected 3.5, got {}",
+            y[16]
+        );
+    }
+
+    // ── Q5_0 ────────────────────────────────────────────────────────────────────
+    // Block: [half d][uint8 qh[4]][uint8 qs[16]]; y = d*(q5 - 16), q5 ∈ 0..31
+    // Reference: llama.cpp dequantize_row_q5_0 (ggml-quants.c l.442)
+    #[test]
+    fn q5_0_single_block() {
+        // d=1.0, qh=[0x01,0,0,0] (bit 0 → element 0 gets high bit → q5=15|16=31)
+        // qs[0]=0x0F (lo=15, hi=0), rest=0
+        let d_bytes = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 22];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2] = 0x01; // qh[0]: bit 0 set
+        block[6] = 0x0F; // qs[0]: lo=15, hi=0
+        let y = dequant_block(infr_core::DType::Q5_0, &block).unwrap();
+        assert_eq!(y.len(), 32);
+        // j=0: xh0 = ((1>>0)<<4)&0x10 = 16. q5 = 15|16=31. y[0] = 1.0*(31-16) = 15.0
+        assert!(
+            (y[0] - 15.0).abs() < 1e-5,
+            "q5_0 y[0] expected 15.0, got {}",
+            y[0]
+        );
+        // j=0: xh1 = (1>>12)&0x10 = 0. q5 = 0. y[16] = 1.0*(0-16) = -16.0
+        assert!(
+            (y[16] - (-16.0)).abs() < 1e-5,
+            "q5_0 y[16] expected -16.0, got {}",
+            y[16]
+        );
+    }
+
+    // ── Q5_1 ────────────────────────────────────────────────────────────────────
+    // Block: [half d][half m][uint8 qh[4]][uint8 qs[16]]; y = d*q5 + m, q5 ∈ 0..31
+    // Reference: llama.cpp dequantize_row_q5_1 (ggml-quants.c l.468)
+    #[test]
+    fn q5_1_single_block() {
+        // d=2.0, m=-1.0, qh=[0,0,0,0], qs[0]=0x1F (lo=15, hi=1)
+        let d_bytes = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let m_bytes = half::f16::from_f32(-1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 24];
+        block[0..2].copy_from_slice(&d_bytes);
+        block[2..4].copy_from_slice(&m_bytes);
+        // qh[4] all zero → no high bits
+        block[8] = 0x1F; // qs[0]: lo=15, hi=1
+        let y = dequant_block(infr_core::DType::Q5_1, &block).unwrap();
+        assert_eq!(y.len(), 32);
+        // y[0] = 2.0*15 + (-1.0) = 29.0
+        assert!(
+            (y[0] - 29.0).abs() < 1e-4,
+            "q5_1 y[0] expected 29.0, got {}",
+            y[0]
+        );
+        // y[16] = 2.0*1 + (-1.0) = 1.0
+        assert!(
+            (y[16] - 1.0).abs() < 1e-4,
+            "q5_1 y[16] expected 1.0, got {}",
+            y[16]
+        );
+    }
+}

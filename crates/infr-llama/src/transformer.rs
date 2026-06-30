@@ -3825,3 +3825,906 @@ fn attention(
     }
     out
 }
+
+/// Validate that the native raw-block GPU GEMV (`linear_native`) matches the CPU dequant for each
+/// affine quant type — the single upload path now that `Wt::Q` (host repack + `linear_q`) is gone.
+#[cfg(test)]
+mod gpu_affine_tests {
+    use super::*;
+    use crate::*;
+    use infr_core::backend::BufferUsage;
+    use infr_core::Backend;
+    use infr_vulkan::VulkanBackend;
+
+    // ── Native-block GPU-vs-CPU parity tests ────────────────────────────────
+    //
+    // Each test: build a known raw block, run `linear_native` GEMV with x=all-1.0,
+    // compare to `dequant_unified`/`dequant_codebook` CPU sum (dot with 1.0 = weight sum).
+
+    fn check_native(dtype: infr_core::DType, block_bytes: &[u8]) {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        use infr_vulkan::linear::pad_to_u32_align;
+
+        // CPU reference: sum of dequantized weights (dot with all-1.0 input)
+        let (qv, sc, mn) = dequant_unified(dtype, block_bytes);
+        let numel = qv.len();
+        let cpu_out: f32 = (0..numel).map(|g| sc[g] * qv[g] as f32 + mn[g]).sum();
+
+        // Upload native raw block bytes (padded to u32)
+        let padded = pad_to_u32_align(block_bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let x: Vec<f32> = vec![1.0f32; numel];
+        let xbuf = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(4, BufferUsage::Readback).unwrap();
+
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            dtype,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            numel,
+            1,
+        );
+        rec.finish().unwrap();
+
+        let mut out_bytes = vec![0u8; 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_out: f32 = bytemuck::cast_slice(&out_bytes)[0];
+
+        let err = (gpu_out - cpu_out).abs();
+        let rel = err / (cpu_out.abs() + 1e-6);
+        assert!(
+            rel < 5e-3,
+            "{dtype:?} native GPU vs CPU: gpu={gpu_out} cpu={cpu_out} err={err} rel={rel}"
+        );
+    }
+
+    // ── Phase 0: Q8_0 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn q8_0_native_matches_cpu() {
+        // d=1.5, qs: bytes 0..32 = signed values -128..127 cycling
+        let d_bits = half::f16::from_f32(1.5).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 34];
+        block[0..2].copy_from_slice(&d_bits);
+        for i in 0..32u8 {
+            // values: 0,1,..,127,-128,-127,...,-97 → will cycle through positive and negative
+            block[2 + i as usize] = i.wrapping_add(100); // e.g. 100,101,..,127,-128,...
+        }
+        check_native(infr_core::DType::Q8_0, &block);
+    }
+
+    // ── Phase 1: Q4_0, Q4_1, Q5_0, Q5_1 ─────────────────────────────────────
+
+    #[test]
+    fn q4_0_native_matches_cpu() {
+        // d=2.0, qs all=0x89 (lo=9,hi=8) → mix of positive/negative after -8
+        let d_bits = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&d_bits);
+        for b in &mut block[2..18] {
+            *b = 0x89;
+        }
+        check_native(infr_core::DType::Q4_0, &block);
+    }
+
+    #[test]
+    fn q4_1_native_matches_cpu() {
+        let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let m_bits = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 20];
+        block[0..2].copy_from_slice(&d_bits);
+        block[2..4].copy_from_slice(&m_bits);
+        for b in &mut block[4..20] {
+            *b = 0x31;
+        }
+        check_native(infr_core::DType::Q4_1, &block);
+    }
+
+    #[test]
+    fn q5_0_native_matches_cpu() {
+        let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 22];
+        block[0..2].copy_from_slice(&d_bits);
+        // qh=0 (no high bits), qs all=0x0A → q5 values 10 (lo) and 0 (hi)
+        for b in &mut block[6..22] {
+            *b = 0x0A;
+        }
+        check_native(infr_core::DType::Q5_0, &block);
+    }
+
+    #[test]
+    fn q5_1_native_matches_cpu() {
+        let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let m_bits = half::f16::from_f32(2.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 24];
+        block[0..2].copy_from_slice(&d_bits);
+        block[2..4].copy_from_slice(&m_bits);
+        for b in &mut block[8..24] {
+            *b = 0x1F;
+        }
+        check_native(infr_core::DType::Q5_1, &block);
+    }
+
+    // ── Phase 2: k-quants ─────────────────────────────────────────────────────
+
+    #[test]
+    fn q2k_native_matches_cpu() {
+        let mut block = vec![0u8; 84];
+        block[0] = 0x03;
+        block[1] = 0x03;
+        for b in &mut block[16..80] {
+            *b = 0x55;
+        }
+        block[80..82].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        check_native(infr_core::DType::Q2K, &block);
+    }
+
+    #[test]
+    fn q3k_native_matches_cpu() {
+        let mut block = vec![0u8; 110];
+        block[108..110].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        check_native(infr_core::DType::Q3K, &block);
+    }
+
+    #[test]
+    fn q4k_native_matches_cpu() {
+        // d=1.0, dmin=0.5, scales[0]=0x33 → sc=3, mn=3
+        let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let dmin_bits = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&d_bits);
+        block[2..4].copy_from_slice(&dmin_bits);
+        // scales[4..16]: all 0x33 → k4(0)=(3,3) for first sub-block
+        for b in &mut block[4..16] {
+            *b = 0x33;
+        }
+        // qs: alternating 0xAB
+        for b in &mut block[16..144] {
+            *b = 0xAB;
+        }
+        check_native(infr_core::DType::Q4K, &block);
+    }
+
+    #[test]
+    fn q5k_native_matches_cpu() {
+        let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let dmin_bits = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 176];
+        block[0..2].copy_from_slice(&d_bits);
+        block[2..4].copy_from_slice(&dmin_bits);
+        for b in &mut block[4..16] {
+            *b = 0x33;
+        }
+        for b in &mut block[48..176] {
+            *b = 0xAB;
+        }
+        check_native(infr_core::DType::Q5K, &block);
+    }
+
+    /// Non-uniform Q5K block: distinct scales per sub-block + non-zero qh.
+    /// The uniform tests above are insensitive to indexing bugs; this one is not.
+    #[test]
+    fn q5k_native_nonuniform() {
+        // Build a block where each sub-block has a different scale and qh is varied.
+        let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let dmin_bits = half::f16::from_f32(0.25).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 176];
+        block[0..2].copy_from_slice(&d_bits);
+        block[2..4].copy_from_slice(&dmin_bits);
+        // scales[0..12]: encode 8 distinct 6-bit (scale,min) pairs via k4 encoding.
+        // Use simple encoding: first 4 bytes = low bits of sc (i=0..3), bytes 4..8 = low bits of mn,
+        // bytes 8..12 = upper bits mixed.
+        // Set them to varied values so each sub-block has a different scale.
+        block[4] = 0x20; // k4(0): sc=0x20&0x3F=32, mn=block[8]&0x3F
+        block[5] = 0x10; // k4(2): sc=16, mn=...
+        block[6] = 0x08; // k4(4): sc computed via else branch
+        block[7] = 0x04; // k4(6): sc computed via else branch
+        block[8] = 0x3F; // k4(0): mn=63
+        block[9] = 0x2A; // k4(2): mn=42
+        block[10] = 0x15; // k4(4): (used in else branch)
+        block[11] = 0x09; // k4(6): (used in else branch)
+                          // block[12..16] could affect k4(4..7) upper bits; set to varied pattern
+        block[12] = 0xC0; // affects k4(4): sc upper bits from (block[8]>>6)<<4 = (0x3F>>6)<<4=0
+        block[13] = 0x80;
+        block[14] = 0x40;
+        block[15] = 0x20;
+        // qh: set to varied pattern so high bits vary
+        for i in 0..32usize {
+            block[16 + i] = (i as u8).wrapping_mul(17).wrapping_add(1);
+        }
+        // qs: set to varied pattern
+        for i in 0..128usize {
+            block[48 + i] = (i as u8).wrapping_mul(13).wrapping_add(7);
+        }
+        check_native(infr_core::DType::Q5K, &block);
+    }
+
+    /// Non-uniform Q6K block: distinct scales per sub-block.
+    #[test]
+    fn q6k_native_nonuniform() {
+        let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 210];
+        // ql: varied
+        for i in 0..128usize {
+            block[i] = (i as u8).wrapping_mul(11).wrapping_add(3);
+        }
+        // qh: varied
+        for i in 0..64usize {
+            block[128 + i] = (i as u8).wrapping_mul(7).wrapping_add(5);
+        }
+        // scales: varied signed int8 values (avoid extreme negatives to keep sums finite)
+        for i in 0..16usize {
+            block[192 + i] = ((i as u8).wrapping_mul(5) + 8) & 0x7F;
+        } // positive only
+        block[208..210].copy_from_slice(&d_bits);
+        check_native(infr_core::DType::Q6K, &block);
+    }
+
+    /// Multi-block Q5K test: 4 blocks (in_f=1024), out_f=2. Tests cross-block access.
+    #[test]
+    fn q5k_native_multiblock() {
+        use infr_vulkan::linear::pad_to_u32_align;
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan");
+                return;
+            }
+        };
+        // Build 8 distinct Q5K blocks (in_f=2048, out_f=2 → weight matrix [2, 2048])
+        const N_BLOCKS: usize = 8;
+        const BLOCK_SZ: usize = 176;
+        const NELEMS: usize = 256;
+        const IN_F: usize = N_BLOCKS * NELEMS;
+        const OUT_F: usize = 2;
+        // Total weight elements: OUT_F * IN_F = 2 * 2048 = 4096 = 16 blocks
+        const TOTAL_BLOCKS: usize = OUT_F * IN_F / NELEMS; // = OUT_F * N_BLOCKS
+        let mut w_bytes = vec![0u8; TOTAL_BLOCKS * BLOCK_SZ];
+        // Fill blocks with distinct, varied data
+        for b in 0..TOTAL_BLOCKS {
+            let off = b * BLOCK_SZ;
+            let d_bits = half::f16::from_f32(0.5 + b as f32 * 0.1)
+                .to_bits()
+                .to_le_bytes();
+            let dmin_bits = half::f16::from_f32(0.1).to_bits().to_le_bytes();
+            w_bytes[off..off + 2].copy_from_slice(&d_bits);
+            w_bytes[off + 2..off + 4].copy_from_slice(&dmin_bits);
+            for i in 0..12 {
+                w_bytes[off + 4 + i] = ((b * 12 + i) as u8).wrapping_mul(3) | 0x20;
+            }
+            for i in 0..32 {
+                w_bytes[off + 16 + i] = ((b * 32 + i) as u8).wrapping_mul(17);
+            }
+            for i in 0..128 {
+                w_bytes[off + 48 + i] = ((b * 128 + i) as u8).wrapping_mul(7).wrapping_add(3);
+            }
+        }
+        // CPU reference: compute expected outputs using dequant_unified
+        let mut cpu_outputs = [0f32; OUT_F];
+        let x: Vec<f32> = (0..IN_F).map(|i| 1.0f32 + i as f32 * 0.001f32).collect();
+        for o in 0..OUT_F {
+            let w_row_bytes = &w_bytes[o * N_BLOCKS * BLOCK_SZ..(o + 1) * N_BLOCKS * BLOCK_SZ];
+            let (qv, sc, mn) = dequant_unified(infr_core::DType::Q5K, w_row_bytes);
+            let sum: f32 = (0..IN_F)
+                .map(|i| (sc[i] * qv[i] as f32 + mn[i]) * x[i])
+                .sum();
+            cpu_outputs[o] = sum;
+        }
+        // GPU: upload and run
+        let padded = pad_to_u32_align(&w_bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let xbuf = be.alloc(IN_F * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(OUT_F * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            infr_core::DType::Q5K,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            IN_F,
+            OUT_F,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; OUT_F * 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_outputs: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&out_bytes).to_vec();
+        for o in 0..OUT_F {
+            let err = (gpu_outputs[o] - cpu_outputs[o]).abs();
+            let rel = err / (cpu_outputs[o].abs() + 1e-3);
+            assert!(
+                rel < 5e-3,
+                "Q5K out[{o}]: gpu={} cpu={} err={err} rel={rel}",
+                gpu_outputs[o],
+                cpu_outputs[o]
+            );
+        }
+    }
+
+    /// Full-scale Q6K test matching ffn_down dimensions: out_f=1024, in_f=3072.
+    #[test]
+    fn q6k_native_fullscale() {
+        use infr_vulkan::linear::pad_to_u32_align;
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan");
+                return;
+            }
+        };
+        const BLOCK_SZ: usize = 210;
+        const NELEMS: usize = 256;
+        const IN_F: usize = 3072;
+        const OUT_F: usize = 1024;
+        let n_blocks_per_row = IN_F / NELEMS; // 12
+        let total_blocks = OUT_F * n_blocks_per_row;
+        let mut w_bytes = vec![0u8; total_blocks * BLOCK_SZ];
+        for b in 0..total_blocks {
+            let off = b * BLOCK_SZ;
+            let d_bits = half::f16::from_f32(0.1 + (b % 16) as f32 * 0.05)
+                .to_bits()
+                .to_le_bytes();
+            for i in 0..128 {
+                w_bytes[off + i] = ((b * 7 + i) as u8).wrapping_mul(11);
+            }
+            for i in 0..64 {
+                w_bytes[off + 128 + i] = ((b * 3 + i) as u8).wrapping_mul(7);
+            }
+            for i in 0..16 {
+                w_bytes[off + 192 + i] = (((b + i) as u8).wrapping_mul(5) + 8) & 0x7F;
+            }
+            w_bytes[off + 208..off + 210].copy_from_slice(&d_bits);
+        }
+        let x: Vec<f32> = (0..IN_F).map(|i| 1.0f32 + i as f32 * 0.001f32).collect();
+        // Only check a few output elements to keep test fast
+        let check_rows = [0usize, 1, 100, 1023];
+        let padded = pad_to_u32_align(&w_bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let xbuf = be.alloc(IN_F * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(OUT_F * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            infr_core::DType::Q6K,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            IN_F,
+            OUT_F,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; OUT_F * 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_outputs: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&out_bytes).to_vec();
+        for &o in &check_rows {
+            let w_row_bytes =
+                &w_bytes[o * n_blocks_per_row * BLOCK_SZ..(o + 1) * n_blocks_per_row * BLOCK_SZ];
+            let (qv, sc, mn) = dequant_unified(infr_core::DType::Q6K, w_row_bytes);
+            let cpu: f32 = (0..IN_F)
+                .map(|i| (sc[i] * qv[i] as f32 + mn[i]) * x[i])
+                .sum();
+            let err = (gpu_outputs[o] - cpu).abs();
+            let rel = err / (cpu.abs() + 1e-3);
+            assert!(
+                rel < 5e-3,
+                "Q6K fullscale out[{o}]: gpu={} cpu={cpu} err={err} rel={rel}",
+                gpu_outputs[o]
+            );
+        }
+    }
+
+    /// Multi-block Q6K test: 8 blocks, out_f=2. Tests cross-block access.
+    #[test]
+    fn q6k_native_multiblock() {
+        use infr_vulkan::linear::pad_to_u32_align;
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan");
+                return;
+            }
+        };
+        const N_BLOCKS: usize = 4;
+        const BLOCK_SZ: usize = 210;
+        const NELEMS: usize = 256;
+        const IN_F: usize = N_BLOCKS * NELEMS;
+        const OUT_F: usize = 2;
+        const TOTAL_BLOCKS: usize = OUT_F * N_BLOCKS;
+        let mut w_bytes = vec![0u8; TOTAL_BLOCKS * BLOCK_SZ];
+        for b in 0..TOTAL_BLOCKS {
+            let off = b * BLOCK_SZ;
+            let d_bits = half::f16::from_f32(0.5 + b as f32 * 0.1)
+                .to_bits()
+                .to_le_bytes();
+            for i in 0..128 {
+                w_bytes[off + i] = ((b * 128 + i) as u8).wrapping_mul(11).wrapping_add(3);
+            }
+            for i in 0..64 {
+                w_bytes[off + 128 + i] = ((b * 64 + i) as u8).wrapping_mul(7).wrapping_add(5);
+            }
+            for i in 0..16 {
+                w_bytes[off + 192 + i] = (((b * 16 + i) as u8).wrapping_mul(5) + 8) & 0x7F;
+            }
+            w_bytes[off + 208..off + 210].copy_from_slice(&d_bits);
+        }
+        let mut cpu_outputs = [0f32; OUT_F];
+        let x: Vec<f32> = (0..IN_F).map(|i| 1.0f32 + i as f32 * 0.001f32).collect();
+        for o in 0..OUT_F {
+            let w_row_bytes = &w_bytes[o * N_BLOCKS * BLOCK_SZ..(o + 1) * N_BLOCKS * BLOCK_SZ];
+            let (qv, sc, mn) = dequant_unified(infr_core::DType::Q6K, w_row_bytes);
+            let sum: f32 = (0..IN_F)
+                .map(|i| (sc[i] * qv[i] as f32 + mn[i]) * x[i])
+                .sum();
+            cpu_outputs[o] = sum;
+        }
+        let padded = pad_to_u32_align(&w_bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let xbuf = be.alloc(IN_F * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(OUT_F * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            infr_core::DType::Q6K,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            IN_F,
+            OUT_F,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; OUT_F * 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_outputs: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&out_bytes).to_vec();
+        for o in 0..OUT_F {
+            let err = (gpu_outputs[o] - cpu_outputs[o]).abs();
+            let rel = err / (cpu_outputs[o].abs() + 1e-3);
+            assert!(
+                rel < 5e-3,
+                "Q6K out[{o}]: gpu={} cpu={} err={err} rel={rel}",
+                gpu_outputs[o],
+                cpu_outputs[o]
+            );
+        }
+    }
+
+    #[test]
+    fn q6k_native_matches_cpu() {
+        // d=0.5, scales[0..16]=0x20 (i8=32), ql=0xFF, qh=0xFF → q6=63
+        let d_bits = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let mut block = vec![0u8; 210];
+        for b in &mut block[0..128] {
+            *b = 0xFF;
+        } // ql
+        for b in &mut block[128..192] {
+            *b = 0xFF;
+        } // qh
+        for b in &mut block[192..208] {
+            *b = 0x20;
+        } // scales = +32
+        block[208..210].copy_from_slice(&d_bits);
+        check_native(infr_core::DType::Q6K, &block);
+    }
+
+    /// Verify Q6K native shader handles f16 subnormal d values correctly.
+    /// Real model weights use subnormal d (e.g. d_bits=0x0140 ≈ 1.9e-5), which
+    /// naive f16→f32 that maps e=0 to 0 will silently zero out every output.
+    #[test]
+    fn q6k_native_subnormal_d() {
+        // d_bits = 0x0140 (e=0, m=0x140=320): subnormal f16 ≈ 1.9073e-5
+        let d_bits: u16 = 0x0140;
+        let mut block = vec![0u8; 210];
+        for b in &mut block[0..128] {
+            *b = 0xFF;
+        } // ql all-1
+        for b in &mut block[128..192] {
+            *b = 0xFF;
+        } // qh all-1
+        for b in &mut block[192..208] {
+            *b = 0x20;
+        } // scales = i8 +32
+        block[208..210].copy_from_slice(&d_bits.to_le_bytes());
+        check_native(infr_core::DType::Q6K, &block);
+    }
+
+    /// Load a real Q6K tensor from the model and verify GPU vs CPU.
+    #[test]
+    fn q6k_real_model_tensor() {
+        use infr_vulkan::linear::pad_to_u32_align;
+        let Some(model_path) = crate::test_qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B not in the HF cache");
+            return;
+        };
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan");
+                return;
+            }
+        };
+        let g = infr_gguf::Gguf::open(&model_path).unwrap();
+        // attn_v.weight blk.0: Q6K, [1024, 1024] → in_f=1024, out_f=1024
+        let tensor_name = "blk.0.attn_v.weight";
+        let bytes = g.tensor_bytes(tensor_name).unwrap();
+        let in_f = 1024usize;
+        let out_f = 1024usize;
+        // CPU ref: dot each output row against x=all-1.0
+        let (qv, sc, mn) = dequant_unified(infr_core::DType::Q6K, bytes);
+        let numel = in_f * out_f;
+        assert_eq!(qv.len(), numel, "element count mismatch");
+        let x: Vec<f32> = vec![1.0f32; in_f];
+        let mut cpu_out = vec![0f32; out_f];
+        for o in 0..out_f {
+            cpu_out[o] = (0..in_f)
+                .map(|i| sc[o * in_f + i] * qv[o * in_f + i] as f32 + mn[o * in_f + i])
+                .sum();
+        }
+        // GPU
+        let padded = pad_to_u32_align(bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let xbuf = be.alloc(in_f * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(out_f * 4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            infr_core::DType::Q6K,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            in_f,
+            out_f,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; out_f * 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_out: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&out_bytes).to_vec();
+        let mut max_err = 0f32;
+        let mut max_idx = 0;
+        let mut n_zero = 0usize;
+        for o in 0..out_f {
+            let err = (gpu_out[o] - cpu_out[o]).abs();
+            if gpu_out[o] == 0.0 && cpu_out[o].abs() > 0.1 {
+                n_zero += 1;
+            }
+            if err > max_err {
+                max_err = err;
+                max_idx = o;
+            }
+        }
+        // Print first 5 failing elements
+        let mut n_print = 0;
+        for o in 0..out_f {
+            let rel = (gpu_out[o] - cpu_out[o]).abs() / (cpu_out[o].abs() + 1e-3);
+            if rel > 5e-3 && n_print < 5 {
+                eprintln!("FAIL out[{o}]: gpu={} cpu={}", gpu_out[o], cpu_out[o]);
+                n_print += 1;
+            }
+        }
+        eprintln!("Real Q6K: n_zero={n_zero}/{out_f}, max_err={max_err} at out[{max_idx}]");
+        let rel = max_err / (cpu_out[max_idx].abs() + 1e-3);
+        assert!(
+            rel < 5e-3,
+            "Real Q6K tensor: max_err={max_err} at out[{max_idx}]: gpu={} cpu={} rel={rel}",
+            gpu_out[max_idx],
+            cpu_out[max_idx]
+        );
+    }
+
+    // ── Native-block prefill GEMM parity (matmul_native vs trusted linear_native) ──
+    //
+    // The tiled coopmat GEMM reuses the same per-format dqblk decode as the GEMV, so the decode is
+    // already covered by the *_native_matches_cpu tests. This guards the NEW code — the 64x64 tile,
+    // shared staging, and coopmat accumulation — by checking that C[m,:] from matmul_native equals
+    // the GEMV linear_native(weight, A[m]) for every row m, across M spanning multiple row-tiles.
+    // Weight blocks vary their f16 d per block so columns are distinguishable (catches col mixups).
+
+    // Build one valid native block of `dtype` with f16 scale `d` and a varied payload from `seed`.
+    fn native_block(dtype: infr_core::DType, d: f32, seed: u8) -> Vec<u8> {
+        use infr_core::DType::*;
+        let dbits = half::f16::from_f32(d).to_bits().to_le_bytes();
+        match dtype {
+            Q8_0 => {
+                let mut b = vec![0u8; 34];
+                b[0..2].copy_from_slice(&dbits);
+                fill(&mut b[2..34], 17, seed);
+                b
+            }
+            Q4K => {
+                let mut b = vec![0u8; 144];
+                b[0..2].copy_from_slice(&dbits); // d
+                b[2..4].copy_from_slice(&half::f16::from_f32(0.0).to_bits().to_le_bytes()); // dmin
+                fill(&mut b[4..16], 13, seed); // 6-bit scales
+                fill(&mut b[16..144], 7, seed); // qs
+                b
+            }
+            Q6K => {
+                let mut b = vec![0u8; 210];
+                fill(&mut b[0..128], 7, seed); // ql
+                fill(&mut b[128..192], 11, seed); // qh
+                fill(&mut b[192..208], 3, seed); // i8 scales
+                b[208..210].copy_from_slice(&dbits); // d
+                b
+            }
+            other => panic!("native_block: add {other:?}"),
+        }
+    }
+
+    fn check_native_gemm(dtype: infr_core::DType, m: usize) {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        use infr_vulkan::linear::pad_to_u32_align;
+        let n = 64usize;
+        let k = 256usize;
+        let belems = if dtype == infr_core::DType::Q8_0 {
+            32
+        } else {
+            256
+        };
+        let blocks_per_row = k / belems;
+
+        // Weight [N, K] as native blocks (row-major). d varies per block → distinguishable columns.
+        let mut wbytes: Vec<u8> = Vec::new();
+        for o in 0..n {
+            for bk in 0..blocks_per_row {
+                let d = 0.005 * ((o % 7) as f32 + 1.0) + 0.001 * bk as f32;
+                wbytes.extend_from_slice(&native_block(dtype, d, (o * 3 + bk * 5) as u8));
+            }
+        }
+        let wbuf = be.upload_weight_bytes(&pad_to_u32_align(&wbytes)).unwrap();
+
+        // Activations [M, K], varied per (row, col).
+        let a: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.05 + ((i / k) as f32) * 0.001)
+            .collect();
+        let abuf = be.alloc(a.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(abuf.as_ref(), bytemuck::cast_slice(&a)).unwrap();
+
+        // GPU GEMM → C [ceil(m/64)*64, N]. Device-local (coopmat store needs it), download via copy.
+        let crows = m.div_ceil(64) * 64;
+        let cbuf = be.alloc(crows * n * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.matmul_native(dtype, abuf.as_ref(), wbuf.as_ref(), cbuf.as_ref(), m, k, n);
+        rec.finish().unwrap();
+        let mut cbytes = vec![0u8; crows * n * 4];
+        be.download(cbuf.as_ref(), &mut cbytes).unwrap();
+        let cgemm: &[f32] = bytemuck::cast_slice(&cbytes);
+
+        // Reference: one GEMV per row → C[m,:]
+        for row in 0..m {
+            let xbuf = be.alloc(k * 4, BufferUsage::Staging).unwrap();
+            be.upload(
+                xbuf.as_ref(),
+                bytemuck::cast_slice(&a[row * k..row * k + k]),
+            )
+            .unwrap();
+            let ybuf = be.alloc(n * 4, BufferUsage::Readback).unwrap();
+            let rec2 = be.recorder().unwrap();
+            rec2.linear_native(dtype, wbuf.as_ref(), xbuf.as_ref(), ybuf.as_ref(), 1, k, n);
+            rec2.finish().unwrap();
+            let mut ybytes = vec![0u8; n * 4];
+            be.download(ybuf.as_ref(), &mut ybytes).unwrap();
+            let yref: &[f32] = bytemuck::cast_slice(&ybytes);
+            // The GEMM rounds activations+weights to f16 for coopmat (GEMV keeps f32 activations), so
+            // compare error against the row's largest magnitude (standard GEMM metric) — near-zero
+            // outputs from cancellation otherwise blow up a pure relative error.
+            let rmax = yref.iter().fold(0f32, |a, &v| a.max(v.abs()));
+            for col in 0..n {
+                let g = cgemm[row * n + col];
+                let r = yref[col];
+                let err = (g - r).abs();
+                assert!(
+                    err < 0.02 * rmax + 1e-4,
+                    "{dtype:?} GEMM vs GEMV at [{row},{col}]: gemm={g} gemv={r} err={err} rmax={rmax}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_native_gemm_matches_gemv() {
+        check_native_gemm(infr_core::DType::Q8_0, 70);
+    }
+
+    #[test]
+    fn q4k_native_gemm_matches_gemv() {
+        check_native_gemm(infr_core::DType::Q4K, 70);
+    }
+
+    #[test]
+    fn q6k_native_gemm_matches_gemv() {
+        check_native_gemm(infr_core::DType::Q6K, 70);
+    }
+
+    // ── Native-block codebook formats (IQ4_NL/XS, MXFP4, NVFP4, TQ1_0, TQ2_0) ────
+    //
+    // CPU reference is `dequant_codebook` (the verified host port). GPU runs `linear_native`
+    // with x=all-1.0 so the output is the sum of dequantized weights.
+
+    fn check_native_cb(dtype: infr_core::DType, block_bytes: &[u8]) {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        use infr_vulkan::linear::pad_to_u32_align;
+        let cpu = dequant_codebook(dtype, block_bytes);
+        let numel = cpu.len();
+        let cpu_out: f32 = cpu.iter().sum();
+
+        let padded = pad_to_u32_align(block_bytes);
+        let wbuf = be.upload_weight_bytes(&padded).unwrap();
+        let x: Vec<f32> = vec![1.0f32; numel];
+        let xbuf = be.alloc(x.len() * 4, BufferUsage::Staging).unwrap();
+        be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ybuf = be.alloc(4, BufferUsage::Readback).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native(
+            dtype,
+            wbuf.as_ref(),
+            xbuf.as_ref(),
+            ybuf.as_ref(),
+            1,
+            numel,
+            1,
+        );
+        rec.finish().unwrap();
+        let mut out_bytes = vec![0u8; 4];
+        be.download(ybuf.as_ref(), &mut out_bytes).unwrap();
+        let gpu_out: f32 = bytemuck::cast_slice(&out_bytes)[0];
+        let rel = (gpu_out - cpu_out).abs() / (cpu_out.abs() + 1e-4);
+        assert!(
+            rel < 5e-3,
+            "{dtype:?} native cb GPU vs CPU: gpu={gpu_out} cpu={cpu_out} rel={rel}"
+        );
+    }
+
+    // varied non-trivial byte pattern
+    fn fill(buf: &mut [u8], mul: u8, add: u8) {
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(mul).wrapping_add(add);
+        }
+    }
+
+    #[test]
+    fn iq4nl_native_matches_cpu() {
+        let mut block = vec![0u8; 18];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.5).to_bits().to_le_bytes());
+        fill(&mut block[2..18], 23, 7);
+        check_native_cb(infr_core::DType::Iq4Nl, &block);
+    }
+
+    #[test]
+    fn iq4xs_native_matches_cpu() {
+        let mut block = vec![0u8; 136];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        block[2..4].copy_from_slice(&0x9ce3u16.to_le_bytes()); // scales_h varied
+        fill(&mut block[4..8], 53, 11); // scales_l
+        fill(&mut block[8..136], 13, 3); // qs
+        check_native_cb(infr_core::DType::Iq4Xs, &block);
+    }
+
+    #[test]
+    fn mxfp4_native_matches_cpu() {
+        let mut block = vec![0u8; 17];
+        block[0] = 128; // e8m0 → d=1.0
+        fill(&mut block[1..17], 29, 5);
+        check_native_cb(infr_core::DType::Mxfp4, &block);
+    }
+
+    #[test]
+    fn nvfp4_native_matches_cpu() {
+        let mut block = vec![0u8; 36];
+        block[0..4].copy_from_slice(&[0x38, 0x40, 0x48, 0x30]); // valid ue4m3 scales
+        fill(&mut block[4..36], 19, 9);
+        check_native_cb(infr_core::DType::Nvfp4, &block);
+    }
+
+    #[test]
+    fn tq1_0_native_matches_cpu() {
+        let mut block = vec![0u8; 54];
+        fill(&mut block[0..52], 17, 1); // qs + qh
+        block[52..54].copy_from_slice(&half::f16::from_f32(0.75).to_bits().to_le_bytes());
+        check_native_cb(infr_core::DType::Tq1_0, &block);
+    }
+
+    #[test]
+    fn tq2_0_native_matches_cpu() {
+        let mut block = vec![0u8; 66];
+        fill(&mut block[0..64], 11, 3); // qs
+        block[64..66].copy_from_slice(&half::f16::from_f32(1.25).to_bits().to_le_bytes());
+        check_native_cb(infr_core::DType::Tq2_0, &block);
+    }
+
+    #[test]
+    fn iq2xxs_native_matches_cpu() {
+        // 2 blocks (in_f=512) to exercise cross-block + grid/sign decode.
+        let mut blocks = vec![0u8; 2 * 66];
+        for (bi, blk) in blocks.chunks_mut(66).enumerate() {
+            blk[0..2].copy_from_slice(
+                &half::f16::from_f32(1.0 + bi as f32 * 0.5)
+                    .to_bits()
+                    .to_le_bytes(),
+            );
+            fill(&mut blk[2..66], 31, (bi as u8) * 7 + 13); // qs (grid idx + signs + scale)
+        }
+        check_native_cb(infr_core::DType::Iq2Xxs, &blocks);
+    }
+
+    #[test]
+    fn iq2xs_native_matches_cpu() {
+        let mut block = vec![0u8; 74];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..66], 29, 5); // qs (u16 grid idx + sign)
+        fill(&mut block[66..74], 17, 1); // scales
+        check_native_cb(infr_core::DType::Iq2Xs, &block);
+    }
+
+    #[test]
+    fn iq2s_native_matches_cpu() {
+        let mut block = vec![0u8; 82];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..66], 23, 7); // qs (idx low) + sign bytes
+        fill(&mut block[66..74], 13, 2); // qh
+        fill(&mut block[74..82], 19, 1); // scales
+        check_native_cb(infr_core::DType::Iq2S, &block);
+    }
+
+    #[test]
+    fn iq3xxs_native_matches_cpu() {
+        let mut block = vec![0u8; 98];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..66], 7, 1); // qs (grid indices)
+        fill(&mut block[66..98], 13, 3); // sas (scale+signs)
+        check_native_cb(infr_core::DType::Iq3Xxs, &block);
+    }
+
+    #[test]
+    fn iq3s_native_matches_cpu() {
+        let mut block = vec![0u8; 110];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..66], 11, 2); // qs
+        fill(&mut block[66..74], 5, 1); // qh
+        fill(&mut block[74..106], 17, 3); // signs
+        fill(&mut block[106..110], 3, 1); // scales
+        check_native_cb(infr_core::DType::Iq3S, &block);
+    }
+
+    #[test]
+    fn iq1s_native_matches_cpu() {
+        let mut block = vec![0u8; 50];
+        block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
+        fill(&mut block[2..34], 13, 1); // qs
+        fill(&mut block[34..50], 23, 7); // qh (u16: grid hi bits + scale + delta)
+        check_native_cb(infr_core::DType::Iq1S, &block);
+    }
+
+    #[test]
+    fn iq1m_native_matches_cpu() {
+        let mut block = vec![0u8; 56];
+        fill(&mut block[0..32], 17, 3); // qs
+        fill(&mut block[32..48], 11, 1); // qh
+                                         // scales: nonzero so packed d != 0
+        block[48..56].copy_from_slice(&[0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0x3d]);
+        check_native_cb(infr_core::DType::Iq1M, &block);
+    }
+}

@@ -234,3 +234,114 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     }
     Ok(tok)
 }
+
+#[cfg(test)]
+mod tokenizer_tests {
+    use super::*;
+    use crate::*;
+
+    // Validate the GGUF-derived tokenizer against the HF tokenizer.json sidecar (same model).
+    // Skips if the test model isn't present.
+    #[test]
+    fn embedded_tokenizer_matches_sidecar() {
+        let Some(gguf) = crate::test_qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B not in the HF cache");
+            return;
+        };
+        // The sidecar tokenizer.json must sit beside the GGUF (HF cache blobs are content-addressed
+        // with no sidecar, so this runs only where a snapshot ships tokenizer.json).
+        let side = gguf.with_file_name("tokenizer.json");
+        if !side.exists() {
+            eprintln!("skip: no tokenizer.json sidecar beside the GGUF");
+            return;
+        }
+        let g = Gguf::open(&gguf).unwrap();
+        let derived = build_tokenizer(&g).unwrap();
+        let sidecar = Tokenizer::from_file(&side).unwrap();
+        for s in [
+            "Hello world",
+            "The quick brown fox.",
+            "<|im_start|>user\nWhat is two plus two?<|im_end|>\n<|im_start|>assistant\n",
+            "café déjà vu — 123 + 456 = 579",
+            "def f(x):\n    return x * 2\n",
+        ] {
+            let a = derived.encode(s, false).unwrap();
+            let b = sidecar.encode(s, false).unwrap();
+            assert_eq!(a.get_ids(), b.get_ids(), "token id mismatch on {s:?}");
+        }
+        // <think>/</think> are user-defined (non-special): skip_special must KEEP them, while real
+        // special tokens (<|im_end|>) are dropped — matching the sidecar.
+        let think = "<think>\nreasoning\n</think>\n\nanswer<|im_end|>";
+        let ids = derived.encode(think, false).unwrap();
+        let d = derived.decode(ids.get_ids(), true).unwrap();
+        assert!(
+            d.contains("<think>") && d.contains("</think>"),
+            "think tags dropped: {d:?}"
+        );
+        assert!(!d.contains("<|im_end|>"), "special token kept: {d:?}");
+        assert_eq!(
+            d,
+            sidecar.decode(ids.get_ids(), true).unwrap(),
+            "decode differs from sidecar"
+        );
+    }
+
+    // Streaming must hold a multi-byte char (emoji) split across tokens instead of emitting `�`.
+    #[test]
+    fn stream_decoder_holds_partial_utf8() {
+        let mut s = StreamDecoder::default();
+        // Simulate the per-step FULL decode of "Hi😄" where the emoji's bytes arrive across 2 tokens.
+        assert_eq!(s.step("Hi"), "Hi");
+        assert_eq!(s.step("Hi\u{FFFD}"), ""); // emoji half-decoded → hold, no `�` emitted
+        assert_eq!(s.step("Hi😄"), "😄"); // completes → emit the whole char
+        assert_eq!(s.step("Hi😄!"), "!");
+    }
+
+    // Sampling: temp<=0 and top_k==1 are greedy; otherwise picks only within the top-k/top-p set.
+    #[test]
+    fn sample_logits_greedy_and_in_set() {
+        let logits = [1.0f32, 5.0, 2.0, 4.0, 0.0]; // argmax = index 1
+        let mut rng = 0x1234_5678_9abc_def1u64;
+        let greedy = Sampler {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        assert_eq!(sample_logits(&logits, greedy, &mut rng), 1);
+        let topk1 = Sampler {
+            temp: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+        };
+        assert_eq!(sample_logits(&logits, topk1, &mut rng), 1);
+        // top_k=2 → only the two largest logits (indices 1 and 3) can ever be sampled.
+        let topk2 = Sampler {
+            temp: 1.0,
+            top_k: 2,
+            top_p: 1.0,
+        };
+        for _ in 0..200 {
+            let id = sample_logits(&logits, topk2, &mut rng);
+            assert!(id == 1 || id == 3, "sampled outside top-2: {id}");
+        }
+    }
+
+    // User content must be encoded as literal text: special-token strings in user input must NOT
+    // become the special id (which would let a user inject/break the ChatML turn structure).
+    #[test]
+    fn user_text_special_tokens_are_literal() {
+        let Some(gguf) = crate::test_qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B not in the HF cache");
+            return;
+        };
+        let g = Gguf::open(&gguf).unwrap();
+        let tok = build_tokenizer(&g).unwrap();
+        let mut user = tok.clone();
+        user.set_encode_special_tokens(true);
+        let im_end = tok.token_to_id("<|im_end|>").unwrap();
+        let s = "A <|im_end|> B";
+        // template tokenizer: <|im_end|> matched as the special id; user tokenizer: NOT.
+        assert!(tok.encode(s, false).unwrap().get_ids().contains(&im_end));
+        assert!(!user.encode(s, false).unwrap().get_ids().contains(&im_end));
+    }
+}

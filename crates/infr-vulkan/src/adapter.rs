@@ -97,6 +97,27 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     Ok(())
 }
 
+/// Short op name for the "not yet implemented" error (until every op is mapped).
+fn op_name(op: &Op) -> &'static str {
+    match op {
+        Op::RmsNorm { .. } => "RmsNorm",
+        Op::Linear { .. } => "Linear",
+        Op::QkNorm { .. } => "QkNorm",
+        Op::Rope { .. } => "Rope",
+        Op::QkNormRope { .. } => "QkNormRope",
+        Op::WriteKv { .. } => "WriteKv",
+        Op::Attention { .. } => "Attention",
+        Op::GatedAct { .. } => "GatedAct",
+        Op::MoeFfn { .. } => "MoeFfn",
+        Op::Conv1dSilu { .. } => "Conv1dSilu",
+        Op::DeltaNet { .. } => "DeltaNet",
+        Op::Add { .. } => "Add",
+        Op::Scale { .. } => "Scale",
+        Op::Softcap { .. } => "Softcap",
+        Op::Copy { .. } => "Copy",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,26 +183,5 @@ mod tests {
                 want[i]
             );
         }
-    }
-}
-
-/// Short op name for the "not yet implemented" error (until every op is mapped).
-fn op_name(op: &Op) -> &'static str {
-    match op {
-        Op::RmsNorm { .. } => "RmsNorm",
-        Op::Linear { .. } => "Linear",
-        Op::QkNorm { .. } => "QkNorm",
-        Op::Rope { .. } => "Rope",
-        Op::QkNormRope { .. } => "QkNormRope",
-        Op::WriteKv { .. } => "WriteKv",
-        Op::Attention { .. } => "Attention",
-        Op::GatedAct { .. } => "GatedAct",
-        Op::MoeFfn { .. } => "MoeFfn",
-        Op::Conv1dSilu { .. } => "Conv1dSilu",
-        Op::DeltaNet { .. } => "DeltaNet",
-        Op::Add { .. } => "Add",
-        Op::Scale { .. } => "Scale",
-        Op::Softcap { .. } => "Softcap",
-        Op::Copy { .. } => "Copy",
     }
 }

@@ -9,6 +9,7 @@
 // scratch) — wide signatures are inherent here, not a refactor smell.
 #![allow(clippy::too_many_arguments)]
 
+mod adapter;
 mod expert_pool;
 mod gemm;
 pub mod linear;
@@ -849,12 +850,12 @@ impl Backend for VulkanBackend {
         Ok(())
     }
 
-    fn compile(&self, _graph: &Graph) -> Result<Box<dyn Plan>> {
-        todo!("lower Graph ops to SPIR-V pipelines + record command buffers")
+    fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
+        adapter::compile(graph)
     }
 
-    fn execute(&self, _plan: &dyn Plan, _bindings: &Bindings) -> Result<()> {
-        todo!("bind buffers, submit command buffer")
+    fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
+        adapter::execute(self, plan, bindings)
     }
 
     fn sync(&self) -> Result<()> {

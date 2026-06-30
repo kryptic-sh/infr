@@ -2111,6 +2111,27 @@ fn cpu_buf(b: &dyn Buffer) -> &CpuBuffer {
         .expect("cpu backend: buffer is not a CpuBuffer (mixed backends?)")
 }
 
+/// Op variant name, for INFR_PROF_OPS per-op-type timing.
+fn op_kind(op: &Op) -> &'static str {
+    match op {
+        Op::RmsNorm { .. } => "RmsNorm",
+        Op::QkNorm { .. } => "QkNorm",
+        Op::Linear { .. } => "Linear",
+        Op::Rope { .. } => "Rope",
+        Op::QkNormRope { .. } => "QkNormRope",
+        Op::WriteKv { .. } => "WriteKv",
+        Op::Attention { .. } => "Attention",
+        Op::GatedAct { .. } => "GatedAct",
+        Op::MoeFfn { .. } => "MoeFfn",
+        Op::Conv1dSilu { .. } => "Conv1dSilu",
+        Op::DeltaNet { .. } => "DeltaNet",
+        Op::Add { .. } => "Add",
+        Op::Scale { .. } => "Scale",
+        Op::Softcap { .. } => "Softcap",
+        Op::Copy { .. } => "Copy",
+    }
+}
+
 impl Backend for CpuBackend {
     fn name(&self) -> &str {
         "cpu"
@@ -2211,7 +2232,14 @@ impl Backend for CpuBackend {
             w
         };
 
+        let prof_ops = std::env::var("INFR_PROF_OPS").is_ok();
+        let mut op_times: HashMap<&'static str, f64> = HashMap::new();
         for op in &g.ops {
+            let __t0 = if prof_ops {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             match *op {
                 Op::RmsNorm {
                     x,
@@ -2379,12 +2407,14 @@ impl Backend for CpuBackend {
                                 }
                             });
                         }
-                        // Transpose out_t[o * m + r] → out[r * out_f + o].
-                        for o in 0..out_f {
-                            for r in 0..m {
-                                out[r * out_f + o] = out_t[o * m + r];
+                        // Transpose out_t[o * m + r] → out[r * out_f + o], parallel over the m output
+                        // rows (each gathers its out_f values from the o-major temp). The serial
+                        // version was ~20% of the matvec at large out_f × m.
+                        out.par_chunks_mut(out_f).enumerate().for_each(|(r, orow)| {
+                            for (o, dst) in orow.iter_mut().enumerate() {
+                                *dst = out_t[o * m + r];
                             }
-                        }
+                        });
                     }
                     vals[dst.0 as usize] = out;
                 }
@@ -2878,6 +2908,18 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+            }
+            if let Some(t0) = __t0 {
+                *op_times.entry(op_kind(op)).or_insert(0.0) += t0.elapsed().as_secs_f64();
+            }
+        }
+        if prof_ops {
+            let mut v: Vec<_> = op_times.into_iter().collect();
+            v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let tot: f64 = v.iter().map(|(_, t)| t).sum();
+            eprintln!("[prof-ops] execute totals ({:.1} ms):", tot * 1000.0);
+            for (k, t) in v {
+                eprintln!("  {k:12} {:7.2} ms  {:5.1}%", t * 1000.0, t / tot * 100.0);
             }
         }
 

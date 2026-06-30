@@ -10,6 +10,7 @@
 
 pub mod cpu_backend;
 mod mixers;
+pub mod model;
 mod quant;
 pub mod qwen35;
 mod tokenizer;

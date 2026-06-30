@@ -352,89 +352,51 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Qwen3.5/3.6 (qwen35 / Qwen3-Next) run a hybrid path: linear projections on the GPU (f16),
-    // the SSM conv + gated-delta recurrence + hd=256 attention on the CPU (no GPU kernels yet — see
-    // docs/QWEN35.md). `Q35_CPU=1` forces the pure-CPU oracle. One-shot only for now.
-    if infr_llama::qwen35::is_qwen35(&gguf) {
-        let Some(msg) = message else {
-            anyhow::bail!("qwen35 (Qwen3-Next) currently supports one-shot only: pass a message");
-        };
+    // Dispatch every architecture behind one ChatTurn interface (infr_llama::model): qwen35 and
+    // qwen3moe are one-shot, dense Qwen3/Llama/Gemma is a multi-turn session. The CLI owns the Llama;
+    // the boxed trait object borrows it (so the borrow-based ChatSession needs no ownership change).
+    let llama; // declared here so a borrowing ChatSession / MoeChat outlives `chat`
+    let mut chat: Box<dyn infr_llama::model::ChatTurn + '_> = if infr_llama::qwen35::is_qwen35(
+        &gguf,
+    ) {
         let mode = if std::env::var("Q35_CPU").is_ok() {
             "CPU oracle"
         } else {
             "GPU linear + SSM + attention"
         };
         eprintln!("[qwen35 Qwen3-Next — {mode}]");
-        let t0 = std::time::Instant::now();
-        let mut render = ThinkRender::new();
-        let mut t_first: Option<std::time::Instant> = None;
-        let (n_prompt, n_gen) = infr_llama::qwen35::generate_chat(&gguf, msg, max_new, |piece| {
-            if t_first.is_none() {
-                t_first = Some(std::time::Instant::now());
-            }
-            render.feed(piece);
-        })?;
-        render.finish();
-        print_run_stats(t0, t_first, n_gen, n_prompt, None);
-        return Ok(());
-    }
+        Box::new(infr_llama::model::Qwen35Chat::new(gguf.clone()))
+    } else {
+        llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
+        // Qwen3's recommended sampling — pure greedy makes thinking models degenerate
+        // (unterminated <think>, no answer). Tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
+        llama.set_sampling(
+            envf("INFR_TEMP", 0.6),
+            envu("INFR_TOP_K", 20),
+            envf("INFR_TOP_P", 0.95),
+        );
+        if llama.is_moe() {
+            eprintln!("[qwen3moe — eager MoE forward: GPU matmuls + GPU KV cache + CPU router/top-k + auto-fit]");
+            Box::new(infr_llama::model::MoeChat::new(&llama))
+        } else {
+            Box::new(llama.chat_session(MAX_CTX)?)
+        }
+    };
 
-    let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
-    // Qwen3's recommended sampling — pure greedy makes thinking models degenerate (unterminated
-    // <think>, no answer). Tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
-    llama.set_sampling(
-        envf("INFR_TEMP", 0.6),
-        envu("INFR_TOP_K", 20),
-        envf("INFR_TOP_P", 0.95),
-    );
-
-    // MoE (qwen3moe): eager CPU-orchestrated forward (router top-k + per-expert FFN), no KV cache.
-    // One-shot only for now.
-    if llama.is_moe() {
-        let Some(m) = message else {
-            anyhow::bail!("qwen3moe currently supports one-shot only: pass a message");
-        };
-        eprintln!("[qwen3moe — eager MoE forward: GPU matmuls + GPU KV cache + CPU router/top-k + auto-fit]");
-        let prompt = llama.render_chat(m)?;
-        let t0 = std::time::Instant::now();
-        let mut n = 0usize;
-        let mut t_first: Option<std::time::Instant> = None;
-        let mut render = ThinkRender::new();
-        llama.generate_moe(&prompt, max_new, |piece| {
-            if t_first.is_none() {
-                t_first = Some(std::time::Instant::now());
-            }
-            n += 1;
-            render.feed(piece);
-        })?;
-        render.finish();
-        print_run_stats(t0, t_first, n, prompt.len(), None);
-        return Ok(());
-    }
-
-    // One-shot message: a single chat turn (via the session path so user content is encoded safely).
-    let mut session = llama.chat_session(MAX_CTX)?;
+    // One-shot (a message) or, if the backend supports it, an interactive multi-turn REPL.
     if let Some(m) = message {
-        let t0 = std::time::Instant::now();
-        let mut n = 0usize;
-        let mut t_first: Option<std::time::Instant> = None;
-        let mut render = ThinkRender::new();
-        session.turn(m, max_new, |piece| {
-            if t_first.is_none() {
-                t_first = Some(std::time::Instant::now());
-            }
-            n += 1;
-            render.feed(piece);
-        })?;
-        render.finish();
-        print_run_stats(t0, t_first, n, session.last_prompt_tokens(), None);
+        run_chat_turn(&mut *chat, m, max_new)?;
         return Ok(());
     }
-
-    // REPL: a persistent chat session keeps prior turns in the KV cache (multi-turn context).
+    if !chat.supports_repl() {
+        anyhow::bail!("this model currently supports one-shot only: pass a message");
+    }
     let stdin = std::io::stdin();
     loop {
-        print!("\n[ctx {}/{}] > ", session.ctx_len(), session.max_ctx());
+        match chat.repl_status() {
+            Some(s) => print!("\n[{s}] > "),
+            None => print!("\n> "),
+        }
         std::io::stdout().flush().ok();
         let mut line = String::new();
         if stdin.read_line(&mut line)? == 0 {
@@ -447,31 +409,32 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         if matches!(line, "exit" | "quit" | ":q" | ":quit") {
             break;
         }
-        let t0 = std::time::Instant::now();
-        let mut n = 0usize;
-        let mut t_first: Option<std::time::Instant> = None;
-        let mut render = ThinkRender::new();
-        let res = session.turn(line, max_new, |piece| {
-            if t_first.is_none() {
-                t_first = Some(std::time::Instant::now());
-            }
-            n += 1;
-            render.feed(piece);
-        });
-        render.finish();
-        match res {
-            Ok(_) => {
-                print_run_stats(
-                    t0,
-                    t_first,
-                    n,
-                    session.last_prompt_tokens(),
-                    Some((session.ctx_len(), session.max_ctx())),
-                );
-            }
-            Err(e) => eprintln!("error: {e}"),
+        if let Err(e) = run_chat_turn(&mut *chat, line, max_new) {
+            eprintln!("error: {e}");
         }
     }
+    Ok(())
+}
+
+/// Run one chat turn through any [`ChatTurn`] backend: stream pieces via the `<think>` renderer, then
+/// print the prefill/decode stats line.
+fn run_chat_turn(
+    chat: &mut dyn infr_llama::model::ChatTurn,
+    message: &str,
+    max_new: usize,
+) -> anyhow::Result<()> {
+    let mut render = ThinkRender::new();
+    let stats = chat.turn(message, max_new, &mut |p| render.feed(p))?;
+    render.finish();
+    let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+    eprintln!(
+        "[prefill {} tok @ {:.0} tok/s ({:.0} ms) | decode {} tok @ {:.1} tok/s]",
+        stats.n_prompt,
+        rate(stats.n_prompt, stats.prompt_secs),
+        stats.prompt_secs * 1000.0,
+        stats.n_gen,
+        rate(stats.n_gen, stats.decode_secs),
+    );
     Ok(())
 }
 

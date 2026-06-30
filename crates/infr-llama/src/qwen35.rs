@@ -317,6 +317,11 @@ impl Model {
         // Shared dtype policy: load a projection weight to a GPU `Lin` in the dtype matching its
         // GGUF source (see `upload_lin`), or keep it CPU f32 (`Q35_CPU=1`).
         let lin = |name: &str| -> Result<Lin> { Self::upload_lin(g, be.as_ref(), name) };
+        // On a GPU run the norm/gate weights live in VRAM (the `gpu` structs below); drop the host
+        // f32 copy so we load straight into VRAM like the other model impls. The host Vec is kept
+        // only for the `Q35_CPU=1` oracle (no backend), whose CPU forward reads it.
+        let host_only = be.is_some();
+        let take = |v: Vec<f32>| if host_only { Vec::new() } else { v };
         let lm_head = if g.tensors().iter().any(|t| t.name == "output.weight") {
             lin("output.weight")?
         } else {
@@ -359,14 +364,14 @@ impl Model {
                     })
                     .transpose()?;
                 layers.push(Layer::Attn(AttnLayer {
-                    attn_norm,
+                    attn_norm: take(attn_norm),
                     q: glin("attn_q.weight")?,
                     k: glin("attn_k.weight")?,
                     v: glin("attn_v.weight")?,
-                    q_norm,
-                    k_norm,
+                    q_norm: take(q_norm),
+                    k_norm: take(k_norm),
                     out: glin("attn_output.weight")?,
-                    post_norm,
+                    post_norm: take(post_norm),
                     ffn_gate: glin("ffn_gate.weight")?,
                     ffn_up: glin("ffn_up.weight")?,
                     ffn_down: glin("ffn_down.weight")?,
@@ -402,17 +407,17 @@ impl Model {
                     })
                     .transpose()?;
                 layers.push(Layer::Linear(LinearLayer {
-                    attn_norm,
+                    attn_norm: take(attn_norm),
                     qkv: glin("attn_qkv.weight")?,
                     gate: glin("attn_gate.weight")?,
-                    conv1d,
-                    alpha,
-                    beta,
-                    a,
-                    dt_bias,
-                    ssm_norm,
+                    conv1d: take(conv1d),
+                    alpha: take(alpha),
+                    beta: take(beta),
+                    a: take(a),
+                    dt_bias: take(dt_bias),
+                    ssm_norm: take(ssm_norm),
                     out: glin("ssm_out.weight")?,
-                    post_norm,
+                    post_norm: take(post_norm),
                     ffn_gate: glin("ffn_gate.weight")?,
                     ffn_up: glin("ffn_up.weight")?,
                     ffn_down: glin("ffn_down.weight")?,
@@ -428,7 +433,7 @@ impl Model {
         Ok(Model {
             cfg,
             token_embd,
-            output_norm,
+            output_norm: take(output_norm),
             output_norm_buf,
             lm_head,
             layers,

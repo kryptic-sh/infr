@@ -21,11 +21,13 @@ use infr_gguf::Gguf;
 use infr_vulkan::VulkanBackend;
 
 /// GPU weight storage dtype. Chosen from the GGUF source dtype by the shared loader policy
-/// ([`Model::upload_lin`]): quant/F16 → `F16` (dequant once, half the bandwidth — decode is
-/// bandwidth-bound); BF16 → `Bf16` (native, preserves f32 exponent range — no f16 overflow clip);
-/// F32 → `F32` (full precision, the rare large-magnitude tensor). Each maps to a GPU GEMV kernel.
+/// ([`Model::upload_lin`]): quant → `Native` (raw GGUF blocks, in-shader dequant — no host dequant,
+/// native bit-width in VRAM); F16 → `F16`; BF16 → `Bf16` (preserves f32 exponent range — no f16
+/// overflow clip); F32 → `F32` (full precision, the rare large-magnitude tensor). Each maps to a GPU
+/// GEMV kernel.
 #[derive(Clone, Copy)]
 enum WDtype {
+    Native(DType),
     F16,
     Bf16,
     F32,
@@ -49,6 +51,7 @@ impl Lin {
                 let be = be.expect("gpu Lin without backend");
                 let w = buf.as_ref();
                 match dt {
+                    WDtype::Native(d) => be.linear_native(*d, w, x, 1, in_f, out_f),
                     WDtype::F16 => be.linear_f16(w, x, 1, in_f, out_f),
                     WDtype::Bf16 => be.linear_bf16(w, x, 1, in_f, out_f),
                     WDtype::F32 => be.linear(w, x, 1, in_f, out_f),
@@ -213,20 +216,39 @@ impl Model {
     /// native bf16 (range-preserving, round-trips exactly through the f32 host buffer); F32 → f32.
     /// This is the single place the "correct dtype per source" decision lives.
     fn upload_lin(g: &Gguf, be: Option<&VulkanBackend>, name: &str) -> Result<Lin> {
-        let w = load_tensor_dequant(g, name)
-            .map(|x| x.0)
-            .with_context(|| name.to_string())?;
         let be = match be {
             Some(b) => b,
-            None => return Ok(Lin::Cpu(w)),
+            None => {
+                return Ok(Lin::Cpu(
+                    load_tensor_dequant(g, name)
+                        .map(|x| x.0)
+                        .with_context(|| name.to_string())?,
+                ))
+            }
         };
         let src = g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype);
         let up =
             |r: infr_core::Result<Box<dyn Buffer>>| r.map_err(|e| anyhow!("upload {name}: {e}"));
+        // Quant with the native pipeline → raw GGUF blocks, in-shader dequant (no host dequant).
+        if let Some(dt) = src {
+            if infr_vulkan::linear::native_dense_supported(dt) {
+                let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{name}: {e}"))?;
+                let padded = infr_vulkan::linear::pad_to_u32_align(bytes);
+                let buf = up(be.upload_weight_bytes(&padded))?;
+                return Ok(Lin::Gpu {
+                    buf,
+                    dt: WDtype::Native(dt),
+                });
+            }
+        }
+        // Float types → dequant to f32 host buffer, upload in the source-matched dtype.
+        let w = load_tensor_dequant(g, name)
+            .map(|x| x.0)
+            .with_context(|| name.to_string())?;
         let (buf, dt) = match src {
             Some(DType::Bf16) => (up(be.upload_weight_bf16(&w))?, WDtype::Bf16),
             Some(DType::F32) => (up(be.upload_weight(&w))?, WDtype::F32),
-            _ => (up(be.upload_weight_f16(&w))?, WDtype::F16), // quant, F16, others → f16
+            _ => (up(be.upload_weight_f16(&w))?, WDtype::F16), // F16 / other floats → f16
         };
         Ok(Lin::Gpu { buf, dt })
     }
@@ -249,16 +271,9 @@ impl Model {
         let lm_head = if g.tensors().iter().any(|t| t.name == "output.weight") {
             lin("output.weight")?
         } else {
-            // tied embeddings: lm head = token_embd (already dequantized to f32 for the host gather)
-            match &be {
-                Some(be) => Lin::Gpu {
-                    buf: be
-                        .upload_weight_f16(&token_embd)
-                        .map_err(|e| anyhow!("upload lm_head: {e}"))?,
-                    dt: WDtype::F16,
-                },
-                None => Lin::Cpu(token_embd.clone()),
-            }
+            // tied: the lm head IS token_embd — load it like any projection (raw native blocks for
+            // quant, in-shader dequant; the host keeps its own f32 `token_embd` for the gather).
+            lin("token_embd.weight")?
         };
 
         let mut layers = Vec::with_capacity(cfg.n_layer);

@@ -266,6 +266,7 @@ impl VulkanBackend {
         rows: usize,
         in_f: usize,
         out_f: usize,
+        push: &[u8],
     ) -> Result<Vec<f32>> {
         assert_eq!(x.len(), rows * in_f, "x must be rows*in");
         let device = self.shared.device.clone();
@@ -312,10 +313,6 @@ impl VulkanBackend {
             .collect();
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         let shared = std::sync::Arc::clone(&self.shared);
         self.one_shot(move |cmd| unsafe {
             shared
@@ -343,6 +340,15 @@ impl VulkanBackend {
         Ok(bytemuck::cast_slice(&y).to_vec())
     }
 
+    /// 12-byte `(rows, in_f, out_f)` push for the f16/bf16 eager GEMVs.
+    fn gemv_push12(rows: usize, in_f: usize, out_f: usize) -> [u8; 12] {
+        let mut p = [0u8; 12];
+        p[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        p[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        p
+    }
+
     /// Eager f16-weight GEMV: `w_buf` holds `W[out,in]` as f16 (see [`Self::upload_weight_f16`]).
     pub fn linear_f16(
         &self,
@@ -353,7 +359,8 @@ impl VulkanBackend {
         out_f: usize,
     ) -> Result<Vec<f32>> {
         let k = self.kernel("linear_f16_eager", crate::gemm::linear_f16_spv(), 3, 12);
-        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f)
+        let push = Self::gemv_push12(rows, in_f, out_f);
+        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f, &push)
     }
 
     /// Eager bf16-weight GEMV: `w_buf` holds `W[out,in]` as bf16 (see [`Self::upload_weight_bf16`]).
@@ -366,7 +373,34 @@ impl VulkanBackend {
         out_f: usize,
     ) -> Result<Vec<f32>> {
         let k = self.kernel("linear_bf16_eager", crate::gemm::linear_bf16_spv(), 3, 12);
-        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f)
+        let push = Self::gemv_push12(rows, in_f, out_f);
+        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f, &push)
+    }
+
+    /// Eager native-block GEMV: `w_buf` holds `W[out,in]` as raw GGUF quant blocks (padded to u32;
+    /// see [`crate::linear::pad_to_u32_align`]). In-shader dequant, no host dequant. `dtype` must be a
+    /// quant format with the native pipeline (see [`crate::linear::native_dense_supported`]).
+    pub fn linear_native(
+        &self,
+        dtype: infr_core::DType,
+        w_buf: &dyn Buffer,
+        x: &[f32],
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) -> Result<Vec<f32>> {
+        let k = self.kernel(
+            crate::linear::native_kernel_name(dtype, false),
+            crate::gemm::native_build_spv(dtype, false).expect("native GEMV spv"),
+            3,
+            16,
+        );
+        // push: (rows, in_f, out_f, w_base=0) — dense weight, no expert offset.
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f, &push)
     }
 
     /// RMSNorm over rows: `y[r,i] = x[r,i] / sqrt(mean(x[r]^2)+eps) * w[i]`.

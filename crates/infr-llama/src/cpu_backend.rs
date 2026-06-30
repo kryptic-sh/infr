@@ -537,6 +537,314 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     sumf
 }
 
+// ─── Q8_0 integer dot kernels ─────────────────────────────────────────────────
+//
+// Q8_0 weight layout: 34 bytes / 32 elements.  Bytes 0..2 = f16 scale `d`; bytes 2..34 = i8 qs.
+// Activation comes in as a `Q8` super-block (256 elems), so one super-block covers 8 Q8_0 weight
+// blocks.  Since both weight and activation are i8, we use the llama.cpp sign trick:
+// `maddubs(abs(qw), sign(qw)·qx)` = `Σ qw[i]·qx[i]` without overflow into i16.
+
+fn vec_dot_q8_0(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe { vec_dot_q8_0_avx512bw(row, q8, in_f) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q8_0_avx2(row, q8, in_f) };
+        }
+    }
+    vec_dot_q8_0_scalar(row, q8, in_f)
+}
+
+fn vec_dot_q8_0_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    let bpr = 34usize; // bytes per Q8_0 weight block (32 elems)
+    let nb_super = in_f / 256; // activation super-blocks
+    let mut sumf = 0f32;
+    for b in 0..nb_super {
+        let d8 = q8.d[b];
+        for s in 0..8usize {
+            let wb = b * 8 + s;
+            let blk = &row[wb * bpr..wb * bpr + bpr];
+            let d_w = crate::rdf16(&blk[0..2]);
+            let qw = &blk[2..34];
+            let qx = &q8.qs[b * 256 + s * 32..b * 256 + s * 32 + 32];
+            let iprod: i32 = (0..32).map(|i| qw[i] as i8 as i32 * qx[i] as i32).sum();
+            sumf += d8 * d_w * iprod as f32;
+        }
+    }
+    sumf
+}
+
+/// AVX2 kernel for `vec_dot_q8_0`: one 32-element Q8_0 weight block per iteration.
+/// Sign trick: `maddubs(abs(qw), sign(qw)·qx)` handles i8×i8 without overflow.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q8_0_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let bpr = 34usize;
+    let nb_super = in_f / 256;
+    let ones = _mm256_set1_epi16(1i16);
+    let mut sumf = 0f32;
+    for b in 0..nb_super {
+        let d8 = q8.d[b];
+        for s in 0..8usize {
+            let wb = b * 8 + s;
+            let blk = &row[wb * bpr..wb * bpr + bpr];
+            let d_w = crate::rdf16(&blk[0..2]);
+            let qw = _mm256_loadu_si256(blk[2..].as_ptr() as *const __m256i);
+            let qx = _mm256_loadu_si256(q8.qs[b * 256 + s * 32..].as_ptr() as *const __m256i);
+            // sign trick: qx_signed = sign(qw) * qx;  abs(qw) stays unsigned
+            let qw_abs = _mm256_abs_epi8(qw);
+            let qx_signed = _mm256_sign_epi8(qx, qw);
+            let prod = _mm256_maddubs_epi16(qw_abs, qx_signed);
+            let sum32 = _mm256_madd_epi16(prod, ones);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += d8 * d_w * iprod as f32;
+        }
+    }
+    sumf
+}
+
+/// AVX-512BW kernel for `vec_dot_q8_0`: TWO 32-element Q8_0 blocks per iteration (64 elems / zmm).
+/// Sign trick is applied at ymm level (no `_mm512_sign_epi8`), then results are packed into zmm
+/// for a single `maddubs512 → madd512` pass.  Activation bytes for the pair are contiguous in
+/// `q8.qs`, so a single `_mm512_loadu_si512` covers both.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q8_0_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let bpr = 34usize;
+    let nb_super = in_f / 256;
+    let ones512 = _mm512_set1_epi16(1i16);
+    let mut sumf = 0f32;
+    for b in 0..nb_super {
+        let d8 = q8.d[b];
+        for k in 0..4usize {
+            let s0 = 2 * k;
+            let s1 = 2 * k + 1;
+            let wb0 = b * 8 + s0;
+            let wb1 = b * 8 + s1;
+            let d_w0 = crate::rdf16(&row[wb0 * bpr..wb0 * bpr + 2]);
+            let d_w1 = crate::rdf16(&row[wb1 * bpr..wb1 * bpr + 2]);
+            // Load weight i8 bytes (32 each, non-contiguous due to f16 header)
+            let qw0 = _mm256_loadu_si256(row[wb0 * bpr + 2..].as_ptr() as *const __m256i);
+            let qw1 = _mm256_loadu_si256(row[wb1 * bpr + 2..].as_ptr() as *const __m256i);
+            // Load 64 contiguous activation bytes as zmm (s0*32 and s1*32 are adjacent)
+            let qx_z = _mm512_loadu_si512(q8.qs[b * 256 + s0 * 32..].as_ptr() as *const __m512i);
+            // Sign trick at ymm level (no avx512 sign_epi8)
+            let qx0 = _mm512_castsi512_si256(qx_z);
+            let qx1 = _mm512_extracti64x4_epi64::<1>(qx_z);
+            let qw_abs0 = _mm256_abs_epi8(qw0);
+            let qw_abs1 = _mm256_abs_epi8(qw1);
+            let qx_s0 = _mm256_sign_epi8(qx0, qw0);
+            let qx_s1 = _mm256_sign_epi8(qx1, qw1);
+            // Pack into zmm
+            let qw_a_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(qw_abs0), qw_abs1);
+            let qx_s_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(qx_s0), qx_s1);
+            // 512-bit dot
+            let prod = _mm512_maddubs_epi16(qw_a_z, qx_s_z);
+            let sum32_z = _mm512_madd_epi16(prod, ones512);
+            let lo_ymm = _mm512_castsi512_si256(sum32_z);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+            let iprod0 = hadd_i32_ymm(lo_ymm);
+            let iprod1 = hadd_i32_ymm(hi_ymm);
+            sumf += d8 * (d_w0 * iprod0 as f32 + d_w1 * iprod1 as f32);
+        }
+    }
+    sumf
+}
+
+// ─── Q5_K integer dot kernels ─────────────────────────────────────────────────
+//
+// Q5_K block layout (176 bytes / 256 elems):
+//   [f16 d][f16 dmin][scales[12]][qh[32]][ql[128]]
+// q5 = (ql_nibble) | (((qh[l] >> bit) & 1) << 4)  ∈ 0..31  (UNSIGNED → maddubs works directly)
+// Dot formula: d·sc·Σ(q5·qx) − dmin·m·Σqx  — identical structure to Q4_K.
+// `q8.bsums` provides Σqx per 32-elem sub-block (precomputed in quantize_q8).
+
+fn vec_dot_q5k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe { vec_dot_q5k_avx512bw(row, q8, in_f) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q5k_avx2(row, q8, in_f) };
+        }
+    }
+    vec_dot_q5k_scalar(row, q8, in_f)
+}
+
+fn vec_dot_q5k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let blk = &row[b * 176..b * 176 + 176];
+        let d = crate::rdf16(&blk[0..2]);
+        let dmin = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qh = &blk[16..48];
+        let ql = &blk[48..176];
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let (mut sd, mut sm) = (0i32, 0i32);
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for j in 0..4usize {
+            let (sc_e, m_e) = crate::k4(2 * j, scales);
+            let (sc_o, m_o) = crate::k4(2 * j + 1, scales);
+            let ql_chunk = &ql[j * 32..j * 32 + 32];
+            let q8_e = &q8b[2 * j * 32..(2 * j + 1) * 32];
+            let q8_o = &q8b[(2 * j + 1) * 32..(2 * j + 2) * 32];
+            let bsum_e = q8.bsums[b * 8 + 2 * j];
+            let bsum_o = q8.bsums[b * 8 + 2 * j + 1];
+            let mut iprod_e = 0i32;
+            let mut iprod_o = 0i32;
+            for l in 0..32 {
+                let v = ql_chunk[l];
+                let q5_e = (v & 0xF) as i32 + if qh[l] & u1 != 0 { 16 } else { 0 };
+                let q5_o = (v >> 4) as i32 + if qh[l] & u2 != 0 { 16 } else { 0 };
+                iprod_e += q5_e * q8_e[l] as i32;
+                iprod_o += q5_o * q8_o[l] as i32;
+            }
+            sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
+            sm += m_e as i32 * bsum_e + m_o as i32 * bsum_o;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+        sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
+    }
+    sumf
+}
+
+/// AVX2 kernel for `vec_dot_q5k`: one nibble-pair per iteration (64 elements = two 32-elem
+/// sub-blocks).  High bit per element is extracted from `qh` using per-j bit masks: if the
+/// bit is set the value adds 16.  `maddubs` works directly since q5 ∈ 0..31 (unsigned).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q5k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let sixteen = _mm256_set1_epi8(0x10_u8 as i8);
+    let ones = _mm256_set1_epi16(1i16);
+    let zero = _mm256_setzero_si256();
+    for b in 0..nb {
+        let blk = &row[b * 176..b * 176 + 176];
+        let d = crate::rdf16(&blk[0..2]);
+        let dmin = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qh = &blk[16..48];
+        let ql = &blk[48..176];
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let qh_ymm = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
+        let (mut sd, mut sm) = (0i32, 0i32);
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for j in 0..4usize {
+            let (sc_e, m_e) = crate::k4(2 * j, scales);
+            let (sc_o, m_o) = crate::k4(2 * j + 1, scales);
+            // Unpack nibbles from ql[j*32..+32]
+            let nibbles = _mm256_loadu_si256(ql[j * 32..].as_ptr() as *const __m256i);
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
+            // High-bit extraction: if (qh[l] & u) != 0 → add 16 to that element.
+            let u1v = _mm256_set1_epi8(u1 as i8);
+            let u2v = _mm256_set1_epi8(u2 as i8);
+            let has_e = _mm256_and_si256(qh_ymm, u1v);
+            let has_o = _mm256_and_si256(qh_ymm, u2v);
+            // andnot(cmpeq_zero, 0x10) = 0x10 where nonzero, 0 otherwise
+            let high_e = _mm256_andnot_si256(_mm256_cmpeq_epi8(has_e, zero), sixteen);
+            let high_o = _mm256_andnot_si256(_mm256_cmpeq_epi8(has_o, zero), sixteen);
+            let q5_e = _mm256_or_si256(lo_nib, high_e);
+            let q5_o = _mm256_or_si256(hi_nib, high_o);
+            // Load Q8 activation bytes for both sub-blocks
+            let q8_e = _mm256_loadu_si256(q8b[2 * j * 32..].as_ptr() as *const __m256i);
+            let q8_o = _mm256_loadu_si256(q8b[(2 * j + 1) * 32..].as_ptr() as *const __m256i);
+            // maddubs: q5 is u8 (0..31), q8 is i8 → direct, no sign trick needed
+            let prod_e = _mm256_maddubs_epi16(q5_e, q8_e);
+            let sum32_e = _mm256_madd_epi16(prod_e, ones);
+            let iprod_e = hadd_i32_ymm(sum32_e);
+            let prod_o = _mm256_maddubs_epi16(q5_o, q8_o);
+            let sum32_o = _mm256_madd_epi16(prod_o, ones);
+            let iprod_o = hadd_i32_ymm(sum32_o);
+            let isum_e = q8.bsums[b * 8 + 2 * j];
+            let isum_o = q8.bsums[b * 8 + 2 * j + 1];
+            sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
+            sm += m_e as i32 * isum_e + m_o as i32 * isum_o;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+        sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
+    }
+    sumf
+}
+
+/// AVX-512BW kernel for `vec_dot_q5k`: identical structure to the Q4_K AVX-512BW kernel but with
+/// the 5th bit ORed in from `qh`.  Each iteration (k=0..4) processes one nibble pair (64 elements)
+/// via a zmm.  The high bit is extracted from `qh_ymm` using per-k bit masks at ymm width; results
+/// are inserted into zmm for the 512-bit `maddubs → madd` pass.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q5k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let sixteen = _mm256_set1_epi8(0x10_u8 as i8);
+    let ones512 = _mm512_set1_epi16(1i16);
+    let zero256 = _mm256_setzero_si256();
+    for b in 0..nb {
+        let blk = &row[b * 176..b * 176 + 176];
+        let d = crate::rdf16(&blk[0..2]);
+        let dmin = crate::rdf16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qh = &blk[16..48];
+        let ql = &blk[48..176];
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let qh_ymm = _mm256_loadu_si256(qh.as_ptr() as *const __m256i);
+        let (mut sd, mut sm) = (0i32, 0i32);
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for k in 0..4usize {
+            let (sc_e, m_e) = crate::k4(2 * k, scales);
+            let (sc_o, m_o) = crate::k4(2 * k + 1, scales);
+            let nibbles = _mm256_loadu_si256(ql[k * 32..].as_ptr() as *const __m256i);
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
+            // High-bit extraction per bit pair
+            let u1v = _mm256_set1_epi8(u1 as i8);
+            let u2v = _mm256_set1_epi8(u2 as i8);
+            let has_e = _mm256_and_si256(qh_ymm, u1v);
+            let has_o = _mm256_and_si256(qh_ymm, u2v);
+            let high_e = _mm256_andnot_si256(_mm256_cmpeq_epi8(has_e, zero256), sixteen);
+            let high_o = _mm256_andnot_si256(_mm256_cmpeq_epi8(has_o, zero256), sixteen);
+            // q5 values (0..31, unsigned)
+            let q5_e = _mm256_or_si256(lo_nib, high_e);
+            let q5_o = _mm256_or_si256(hi_nib, high_o);
+            // Pack into zmm: lower 256 = even sub-block, upper 256 = odd sub-block
+            let q5_zmm = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q5_e), q5_o);
+            // 64 contiguous Q8 activation bytes for this pair
+            let q8_zmm = _mm512_loadu_si512(q8b[k * 64..].as_ptr() as *const __m512i);
+            let prod = _mm512_maddubs_epi16(q5_zmm, q8_zmm);
+            let sum32_z = _mm512_madd_epi16(prod, ones512);
+            let lo_ymm = _mm512_castsi512_si256(sum32_z);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+            let iprod_e = hadd_i32_ymm(lo_ymm);
+            let iprod_o = hadd_i32_ymm(hi_ymm);
+            let isum_e = q8.bsums[b * 8 + 2 * k];
+            let isum_o = q8.bsums[b * 8 + 2 * k + 1];
+            sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
+            sm += m_e as i32 * isum_e + m_o as i32 * isum_o;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+        sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
+    }
+    sumf
+}
+
 /// `Σ f16_weight·x` (weight is 2 bytes/elem). `target-cpu=native` lowers the f16→f32 to F16C.
 fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
     let mut acc = [0f32; 8];
@@ -884,12 +1192,15 @@ impl Backend for CpuBackend {
                     // f16/bf16/f32 dots, else fall back to dequant-to-f32 + dot. All fan out over rows.
                     if m == 1 {
                         let xrow = &xs[..in_f];
-                        let q8 = matches!(dt, DType::Q4K | DType::Q6K).then(|| quantize_q8(xrow));
+                        let q8 = matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
+                            .then(|| quantize_q8(xrow));
                         out.par_iter_mut().enumerate().for_each(|(o, dst_o)| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
                             *dst_o = match dt {
                                 DType::Q4K => vec_dot_q4k(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q6K => vec_dot_q6k(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q8_0 => vec_dot_q8_0(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q5K => vec_dot_q5k(row, q8.as_ref().unwrap(), in_f),
                                 DType::F32 => dot(bytemuck::cast_slice(row), xrow),
                                 DType::F16 => dot_f16(row, xrow),
                                 DType::Bf16 => dot_bf16(row, xrow),
@@ -904,13 +1215,14 @@ impl Backend for CpuBackend {
                         // Layout: out[r * out_f + o].  We accumulate into a transposed buffer
                         // out_t[o * m + r] (contiguous in o-major order) so each parallel chunk
                         // owns a contiguous slice of m floats, then scatter into out at the end.
-                        let q8s: Vec<Q8> = if matches!(dt, DType::Q4K | DType::Q6K) {
-                            (0..m)
-                                .map(|r| quantize_q8(&xs[r * in_f..r * in_f + in_f]))
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
+                        let q8s: Vec<Q8> =
+                            if matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K) {
+                                (0..m)
+                                    .map(|r| quantize_q8(&xs[r * in_f..r * in_f + in_f]))
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
                         let mut out_t = vec![0f32; out_f * m];
                         out_t.par_chunks_mut(m).enumerate().for_each(|(o, chunk)| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
@@ -923,6 +1235,16 @@ impl Backend for CpuBackend {
                                 DType::Q6K => {
                                     for r in 0..m {
                                         chunk[r] = vec_dot_q6k(row, &q8s[r], in_f);
+                                    }
+                                }
+                                DType::Q8_0 => {
+                                    for r in 0..m {
+                                        chunk[r] = vec_dot_q8_0(row, &q8s[r], in_f);
+                                    }
+                                }
+                                DType::Q5K => {
+                                    for r in 0..m {
+                                        chunk[r] = vec_dot_q5k(row, &q8s[r], in_f);
                                     }
                                 }
                                 DType::F32 => {
@@ -2571,6 +2893,39 @@ mod kernel_tests {
         let got = vec_dot_q6k(&w, &q8, in_f);
         let want = dot(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q6k: got {got}, want {want}");
+    }
+
+    #[test]
+    fn q8_0_dot_matches_dequant_reference() {
+        // Q8_0: 34 bytes / 32 elems. in_f must be a multiple of 256 (activation super-block size).
+        let in_f = 512; // 2 super-blocks = 16 Q8_0 weight blocks
+        let nb_w = in_f / 32;
+        let mut w = det_bytes(nb_w * 34, 9);
+        for k in 0..nb_w {
+            put_f16(&mut w[k * 34..k * 34 + 2], 0.03); // d
+        }
+        let wref = crate::dequant_block(DType::Q8_0, &w).unwrap();
+        let q8 = quantize_q8(&det_x(in_f, 10));
+        let got = vec_dot_q8_0(&w, &q8, in_f);
+        let want = dot(&wref, &dequant_q8(&q8));
+        assert!(rel_err(got, want) < 1e-3, "q8_0: got {got}, want {want}");
+    }
+
+    #[test]
+    fn q5k_dot_matches_dequant_reference() {
+        // Q5_K: 176 bytes / 256 elems. in_f must be a multiple of 256.
+        let in_f = 512; // 2 Q5K blocks = 2 super-blocks
+        let nb = in_f / 256;
+        let mut w = det_bytes(nb * 176, 11);
+        for k in 0..nb {
+            put_f16(&mut w[k * 176..k * 176 + 2], 0.05); // d
+            put_f16(&mut w[k * 176 + 2..k * 176 + 4], 0.01); // dmin
+        }
+        let wref = crate::dequant_block(DType::Q5K, &w).unwrap();
+        let q8 = quantize_q8(&det_x(in_f, 12));
+        let got = vec_dot_q5k(&w, &q8, in_f);
+        let want = dot(&wref, &dequant_q8(&q8));
+        assert!(rel_err(got, want) < 1e-3, "q5k: got {got}, want {want}");
     }
 
     #[test]

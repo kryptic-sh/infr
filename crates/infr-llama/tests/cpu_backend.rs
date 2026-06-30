@@ -307,13 +307,13 @@ fn gemma3_1b() -> Option<PathBuf> {
     find_gguf("unsloth--gemma-3-1b-it-GGUF", "gemma-3-1b-it-Q4_K_M.gguf")
 }
 
-// Captured + verified coherent: "The capital of France is Paris. 😊", a brave-knight short story.
+// Captured + verified coherent: "Paris! 🇫🇷", a brave-knight short story (mournful Obsidian Peaks).
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xe5a37ab078db3a2c),
+    ("The capital of France is", 32, 0x4597cda816a0d1e7),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x3fd9d19a20538db3,
+        0xe7c90b188b42cee0,
     ),
 ];
 
@@ -360,7 +360,7 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x0001ef9a6385fe30,
+        0x2ecf16cdcf25fce6,
     ),
 ];
 

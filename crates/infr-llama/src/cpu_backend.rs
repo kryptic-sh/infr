@@ -2667,6 +2667,12 @@ pub(crate) fn generate_dense_backend(
         let mut pf_b = Bindings::new();
         pf_b.bind(pf_h.hidden, pf_hidden_buf.as_ref());
         pf_b.bind(pf_h.positions, pf_pos_buf.as_ref());
+        // gemma4's proportional-RoPE divisors are a graph input too — bind them (the per-token decode
+        // loop below does the same). Without this the batched graph has an unbound `rope_freqs` Input
+        // and panics. (E2B's per-layer input is excluded by the `!e2b` guard above.)
+        if let (Some(rid), Some((rb, _))) = (pf_h.rope_freqs, &rf_buf) {
+            pf_b.bind(rid, rb.as_ref());
+        }
         for l in 0..c.n_layer {
             pf_b.bind(pf_h.k_cache[l], kbufs[l].as_ref());
             pf_b.bind(pf_h.v_cache[l], vbufs[l].as_ref());

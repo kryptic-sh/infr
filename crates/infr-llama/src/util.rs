@@ -1,0 +1,110 @@
+//! Crate-level glue: GGUF metadata helpers, chat-eos detection, streaming detok, the GPU probe,
+//! per-layer-embedding loader, and test helpers. Split out of `lib.rs` (no logic change).
+use crate::*;
+use anyhow::{anyhow, Result};
+use infr_core::WeightSource;
+use infr_gguf::Gguf;
+use infr_vulkan::VulkanBackend;
+use tokenizers::Tokenizer;
+
+/// Qwen2/Qwen3 pre-tokenizer regex (same string the HF `tokenizer.json` uses) — applied via a
+/// Split before ByteLevel. Differs from the default GPT-2 ByteLevel regex (punctuation/number runs),
+/// which is what made a naive ByteLevel produce different token ids.
+pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// Build the gemma4 E2B per-layer-embedding global tensors from the GGUF (host f32 — no GPU). The
+/// big `per_layer_token_embd` stays quantized in the mmap and is gathered per token at forward time.
+/// `None` for models without per-layer embeddings. Shared by the GPU and CPU loaders.
+pub(crate) fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerLayerEmbd>> {
+    if cfg.n_embd_per_layer == 0 {
+        return Ok(None);
+    }
+    let (model_proj, _) = load_tensor_dequant(g, "per_layer_model_proj.weight")?;
+    let (proj_norm, _) = load_tensor_dequant(g, "per_layer_proj_norm.weight")?;
+    let te = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == "per_layer_token_embd.weight")
+        .ok_or_else(|| anyhow!("per_layer_token_embd.weight not found"))?;
+    // Bytes per token row = total bytes / vocab (te shape is GGUF [npl*n_layer, vocab]).
+    let te_vocab = *te.shape.last().unwrap();
+    Ok(Some(PerLayerEmbd {
+        npl: cfg.n_embd_per_layer,
+        n_layer: cfg.n_layer,
+        n_embd: cfg.n_embd,
+        model_proj,
+        proj_norm,
+        tok_embd_dtype: te.dtype,
+        tok_embd_row_bytes: te.nbytes / te_vocab,
+    }))
+}
+
+/// UTF-8-safe incremental detokenizer for streaming: appends `id` to `acc`, decodes the whole
+/// sequence so far, and emits the newly-completed suffix past `printed` — holding back a trailing
+/// `�` (a multi-byte char split across tokens) until it completes. Mirrors the GPU path's streamer.
+pub(crate) fn stream_token(
+    tokenizer: &Tokenizer,
+    acc: &mut Vec<u32>,
+    printed: &mut usize,
+    id: u32,
+    on_piece: &mut impl FnMut(&str),
+) {
+    acc.push(id);
+    if let Ok(full) = tokenizer.decode(acc, true) {
+        if !full.ends_with('\u{FFFD}') && full.len() > *printed && full.is_char_boundary(*printed) {
+            on_piece(&full[*printed..]);
+            *printed = full.len();
+        }
+    }
+}
+
+// Chat-template rendering (`render_chat_jinja`, `render_chat_user`) lives in the shared `infr-chat`
+// crate — imported at the top of this module. There is NO fabricated-ChatML fallback: infr supports
+// only models that ship a `tokenizer.chat_template`, so a missing/broken template is a hard error.
+
+/// The error surfaced when a GGUF has no usable chat template (none embedded, or it failed to render).
+pub(crate) fn no_template_err() -> anyhow::Error {
+    anyhow!(
+        "model GGUF has no usable chat template (no `tokenizer.chat_template`, or it failed to \
+         render — set INFR_DEBUG_CHAT=1 for details). infr requires an instruct model with an \
+         embedded chat template."
+    )
+}
+
+/// Whether a Vulkan device is available — a cheap probe (creates and drops a backend). Lets callers
+/// (and tests) decide between the GPU and CPU paths, or skip GPU-only work when there's no device.
+pub fn gpu_available() -> bool {
+    VulkanBackend::new().is_ok()
+}
+
+/// Locate the Qwen3-0.6B Q4_K_M GGUF in the HF Hub cache (or `INFR_TEST_MODEL`) for the model-backed
+/// unit tests; `None` → the test self-skips. We use the shared HF cache everywhere now (no bespoke
+/// local model dir).
+#[cfg(test)]
+pub(crate) fn test_qwen3_06b() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let hub = std::env::var("HOME").ok()? + "/.cache/huggingface/hub";
+    let base = format!("{hub}/models--unsloth--Qwen3-0.6B-GGUF/snapshots");
+    std::fs::read_dir(&base).ok()?.find_map(|e| {
+        let f = e.ok()?.path().join("Qwen3-0.6B-Q4_K_M.gguf");
+        f.exists().then_some(f)
+    })
+}
+
+/// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
+/// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
+pub(crate) fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
+    for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
+        if let Some(id) = tokenizer.token_to_id(name) {
+            if !cfg.eos_ids.contains(&id) {
+                cfg.eos_ids.push(id);
+            }
+        }
+    }
+}
+
+pub(crate) fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
+    g.metadata().u64(key)
+}

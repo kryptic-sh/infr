@@ -1476,25 +1476,27 @@ fn argmax(v: &[f32]) -> u32 {
 mod tests {
     use super::*;
 
-    fn model_path() -> std::path::PathBuf {
+    /// Locate the Qwen3.5-0.8B GGUF in the HF Hub cache (or `INFR_TEST_MODEL`), or `None` if it isn't
+    /// present (the test self-skips).
+    fn model_path() -> Option<std::path::PathBuf> {
         if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
-            return std::path::PathBuf::from(p);
+            return Some(std::path::PathBuf::from(p));
         }
-        // the 0.8B pulled into our store
-        dirs_cache().join("infr/models/blobs/sha256-bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517")
-    }
-    fn dirs_cache() -> std::path::PathBuf {
-        std::env::var("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache")
-            })
+        let hub = std::env::var("HOME").ok()? + "/.cache/huggingface/hub";
+        let base = format!("{hub}/models--unsloth--Qwen3.5-0.8B-GGUF/snapshots");
+        std::fs::read_dir(&base).ok()?.find_map(|e| {
+            let f = e.ok()?.path().join("Qwen3.5-0.8B-Q4_K_M.gguf");
+            f.exists().then_some(f)
+        })
     }
 
     #[test]
-    #[ignore = "needs the Qwen3.5-0.8B gguf in the local store"]
     fn loads_and_dims() {
-        let g = Gguf::open(&model_path()).unwrap();
+        let Some(path) = model_path() else {
+            eprintln!("skip: Qwen3.5-0.8B not present");
+            return;
+        };
+        let g = Gguf::open(&path).unwrap();
         let m = Model::load(&g).unwrap();
         let c = &m.cfg;
         println!("cfg: {c:?}");
@@ -1515,9 +1517,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs the Qwen3.5-0.8B gguf in the local store"]
     fn greedy_generate() {
-        let g = Gguf::open(&model_path()).unwrap();
+        let Some(path) = model_path() else {
+            eprintln!("skip: Qwen3.5-0.8B not present");
+            return;
+        };
+        let g = Gguf::open(&path).unwrap();
         let prompt =
             std::env::var("Q35_PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
         let n = std::env::var("Q35_N")
@@ -1532,15 +1537,18 @@ mod tests {
     /// ops, no Vulkan) must match the bespoke CPU oracle (`generate` w/ `Q35_CPU=1`) token-for-token —
     /// both are f32, so the match is exact.
     #[test]
-    #[ignore = "needs the Qwen3.5-0.8B gguf; run --test-threads=1"]
     fn seam_cpu_matches_oracle() {
-        let g = Gguf::open(&model_path()).unwrap();
+        let Some(path) = model_path() else {
+            eprintln!("skip: Qwen3.5-0.8B not present");
+            return;
+        };
+        let g = Gguf::open(&path).unwrap();
         let prompt = "The capital of France is";
         let n = 16;
         std::env::set_var("Q35_CPU", "1");
         let oracle = generate(&g, prompt, n).unwrap();
         let mut seam = String::new();
-        generate_cpu(&model_path(), prompt, n, |p| seam.push_str(p)).unwrap();
+        generate_cpu(&path, prompt, n, |p| seam.push_str(p)).unwrap();
         println!("ORACLE: {oracle:?}\nSEAM:   {seam:?}");
         assert_eq!(
             seam, oracle,
@@ -1553,9 +1561,16 @@ mod tests {
     /// (f32); unset, they run on the GPU (f16) — so this validates the CPU path end-to-end against the
     /// GPU one. The SSM recurrence / conv / gated attention run on the CPU in both modes.
     #[test]
-    #[ignore = "needs a Vulkan GPU + the Qwen3.5-0.8B gguf; run --test-threads=1"]
     fn cpu_matches_hybrid() {
-        let g = Gguf::open(&model_path()).unwrap();
+        let Some(path) = model_path() else {
+            eprintln!("skip: Qwen3.5-0.8B not present");
+            return;
+        };
+        if !crate::gpu_available() {
+            eprintln!("skip: no Vulkan GPU");
+            return;
+        }
+        let g = Gguf::open(&path).unwrap();
         let prompt = "The capital of France is";
         let n = 16;
         std::env::set_var("Q35_CPU", "1");

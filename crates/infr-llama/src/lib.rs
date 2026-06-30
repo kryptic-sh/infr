@@ -430,6 +430,22 @@ pub fn gpu_available() -> bool {
     VulkanBackend::new().is_ok()
 }
 
+/// Locate the Qwen3-0.6B Q4_K_M GGUF in the HF Hub cache (or `INFR_TEST_MODEL`) for the model-backed
+/// unit tests; `None` → the test self-skips. We use the shared HF cache everywhere now (no bespoke
+/// local model dir).
+#[cfg(test)]
+fn test_qwen3_06b() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let hub = std::env::var("HOME").ok()? + "/.cache/huggingface/hub";
+    let base = format!("{hub}/models--unsloth--Qwen3-0.6B-GGUF/snapshots");
+    std::fs::read_dir(&base).ok()?.find_map(|e| {
+        let f = e.ok()?.path().join("Qwen3-0.6B-Q4_K_M.gguf");
+        f.exists().then_some(f)
+    })
+}
+
 /// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
 /// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
 fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
@@ -6981,7 +6997,6 @@ mod gpu_affine_tests {
     // ── Phase 0: Q8_0 ────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q8_0_native_matches_cpu() {
         // d=1.5, qs: bytes 0..32 = signed values -128..127 cycling
         let d_bits = half::f16::from_f32(1.5).to_bits().to_le_bytes();
@@ -6997,7 +7012,6 @@ mod gpu_affine_tests {
     // ── Phase 1: Q4_0, Q4_1, Q5_0, Q5_1 ─────────────────────────────────────
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q4_0_native_matches_cpu() {
         // d=2.0, qs all=0x89 (lo=9,hi=8) → mix of positive/negative after -8
         let d_bits = half::f16::from_f32(2.0).to_bits().to_le_bytes();
@@ -7010,7 +7024,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q4_1_native_matches_cpu() {
         let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
         let m_bits = half::f16::from_f32(0.5).to_bits().to_le_bytes();
@@ -7024,7 +7037,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q5_0_native_matches_cpu() {
         let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
         let mut block = vec![0u8; 22];
@@ -7037,7 +7049,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q5_1_native_matches_cpu() {
         let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
         let m_bits = half::f16::from_f32(2.0).to_bits().to_le_bytes();
@@ -7053,7 +7064,6 @@ mod gpu_affine_tests {
     // ── Phase 2: k-quants ─────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q2k_native_matches_cpu() {
         let mut block = vec![0u8; 84];
         block[0] = 0x03;
@@ -7066,7 +7076,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q3k_native_matches_cpu() {
         let mut block = vec![0u8; 110];
         block[108..110].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
@@ -7074,7 +7083,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q4k_native_matches_cpu() {
         // d=1.0, dmin=0.5, scales[0]=0x33 → sc=3, mn=3
         let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
@@ -7094,7 +7102,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q5k_native_matches_cpu() {
         let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
         let dmin_bits = half::f16::from_f32(0.5).to_bits().to_le_bytes();
@@ -7113,7 +7120,6 @@ mod gpu_affine_tests {
     /// Non-uniform Q5K block: distinct scales per sub-block + non-zero qh.
     /// The uniform tests above are insensitive to indexing bugs; this one is not.
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q5k_native_nonuniform() {
         // Build a block where each sub-block has a different scale and qh is varied.
         let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
@@ -7151,7 +7157,6 @@ mod gpu_affine_tests {
 
     /// Non-uniform Q6K block: distinct scales per sub-block.
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q6k_native_nonuniform() {
         let d_bits = half::f16::from_f32(1.0).to_bits().to_le_bytes();
         let mut block = vec![0u8; 210];
@@ -7173,7 +7178,6 @@ mod gpu_affine_tests {
 
     /// Multi-block Q5K test: 4 blocks (in_f=1024), out_f=2. Tests cross-block access.
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q5k_native_multiblock() {
         use infr_vulkan::linear::pad_to_u32_align;
         let be = match VulkanBackend::new() {
@@ -7256,7 +7260,6 @@ mod gpu_affine_tests {
 
     /// Full-scale Q6K test matching ffn_down dimensions: out_f=1024, in_f=3072.
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q6k_native_fullscale() {
         use infr_vulkan::linear::pad_to_u32_align;
         let be = match VulkanBackend::new() {
@@ -7330,7 +7333,6 @@ mod gpu_affine_tests {
 
     /// Multi-block Q6K test: 8 blocks, out_f=2. Tests cross-block access.
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q6k_native_multiblock() {
         use infr_vulkan::linear::pad_to_u32_align;
         let be = match VulkanBackend::new() {
@@ -7405,7 +7407,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q6k_native_matches_cpu() {
         // d=0.5, scales[0..16]=0x20 (i8=32), ql=0xFF, qh=0xFF → q6=63
         let d_bits = half::f16::from_f32(0.5).to_bits().to_le_bytes();
@@ -7427,7 +7428,6 @@ mod gpu_affine_tests {
     /// Real model weights use subnormal d (e.g. d_bits=0x0140 ≈ 1.9e-5), which
     /// naive f16→f32 that maps e=0 to 0 will silently zero out every output.
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q6k_native_subnormal_d() {
         // d_bits = 0x0140 (e=0, m=0x140=320): subnormal f16 ≈ 1.9073e-5
         let d_bits: u16 = 0x0140;
@@ -7447,16 +7447,12 @@ mod gpu_affine_tests {
 
     /// Load a real Q6K tensor from the model and verify GPU vs CPU.
     #[test]
-    #[ignore = "requires a Vulkan GPU and model file"]
     fn q6k_real_model_tensor() {
         use infr_vulkan::linear::pad_to_u32_align;
-        let model_path = std::path::Path::new(
-            "/home/mxaddict/Projects/models/qwen3-0.6b/Qwen3-0.6B-Q4_K_M.gguf",
-        );
-        if !model_path.exists() {
-            eprintln!("skip: model not found");
+        let Some(model_path) = crate::test_qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B not in the HF cache");
             return;
-        }
+        };
         let be = match VulkanBackend::new() {
             Ok(b) => b,
             Err(_) => {
@@ -7464,7 +7460,7 @@ mod gpu_affine_tests {
                 return;
             }
         };
-        let g = infr_gguf::Gguf::open(model_path).unwrap();
+        let g = infr_gguf::Gguf::open(&model_path).unwrap();
         // attn_v.weight blk.0: Q6K, [1024, 1024] → in_f=1024, out_f=1024
         let tensor_name = "blk.0.attn_v.weight";
         let bytes = g.tensor_bytes(tensor_name).unwrap();
@@ -7649,19 +7645,16 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q8_0_native_gemm_matches_gemv() {
         check_native_gemm(infr_core::DType::Q8_0, 70);
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q4k_native_gemm_matches_gemv() {
         check_native_gemm(infr_core::DType::Q4K, 70);
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn q6k_native_gemm_matches_gemv() {
         check_native_gemm(infr_core::DType::Q6K, 70);
     }
@@ -7719,7 +7712,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn iq4nl_native_matches_cpu() {
         let mut block = vec![0u8; 18];
         block[0..2].copy_from_slice(&half::f16::from_f32(1.5).to_bits().to_le_bytes());
@@ -7728,7 +7720,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn iq4xs_native_matches_cpu() {
         let mut block = vec![0u8; 136];
         block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
@@ -7739,7 +7730,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn mxfp4_native_matches_cpu() {
         let mut block = vec![0u8; 17];
         block[0] = 128; // e8m0 → d=1.0
@@ -7748,7 +7738,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn nvfp4_native_matches_cpu() {
         let mut block = vec![0u8; 36];
         block[0..4].copy_from_slice(&[0x38, 0x40, 0x48, 0x30]); // valid ue4m3 scales
@@ -7757,7 +7746,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn tq1_0_native_matches_cpu() {
         let mut block = vec![0u8; 54];
         fill(&mut block[0..52], 17, 1); // qs + qh
@@ -7766,7 +7754,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn tq2_0_native_matches_cpu() {
         let mut block = vec![0u8; 66];
         fill(&mut block[0..64], 11, 3); // qs
@@ -7775,7 +7762,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn iq2xxs_native_matches_cpu() {
         // 2 blocks (in_f=512) to exercise cross-block + grid/sign decode.
         let mut blocks = vec![0u8; 2 * 66];
@@ -7791,7 +7777,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn iq2xs_native_matches_cpu() {
         let mut block = vec![0u8; 74];
         block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
@@ -7801,7 +7786,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn iq2s_native_matches_cpu() {
         let mut block = vec![0u8; 82];
         block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
@@ -7812,7 +7796,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn iq3xxs_native_matches_cpu() {
         let mut block = vec![0u8; 98];
         block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
@@ -7822,7 +7805,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn iq3s_native_matches_cpu() {
         let mut block = vec![0u8; 110];
         block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
@@ -7834,7 +7816,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn iq1s_native_matches_cpu() {
         let mut block = vec![0u8; 50];
         block[0..2].copy_from_slice(&half::f16::from_f32(1.0).to_bits().to_le_bytes());
@@ -7844,7 +7825,6 @@ mod gpu_affine_tests {
     }
 
     #[test]
-    #[ignore = "requires a Vulkan GPU"]
     fn iq1m_native_matches_cpu() {
         let mut block = vec![0u8; 56];
         fill(&mut block[0..32], 17, 3); // qs
@@ -7863,11 +7843,15 @@ mod tokenizer_tests {
     // Skips if the test model isn't present.
     #[test]
     fn embedded_tokenizer_matches_sidecar() {
-        let dir = Path::new("/home/mxaddict/Projects/models/qwen3-0.6b");
-        let gguf = dir.join("Qwen3-0.6B-Q4_K_M.gguf");
-        let side = dir.join("tokenizer.json");
-        if !gguf.exists() || !side.exists() {
-            eprintln!("skip: test model not present");
+        let Some(gguf) = crate::test_qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B not in the HF cache");
+            return;
+        };
+        // The sidecar tokenizer.json must sit beside the GGUF (HF cache blobs are content-addressed
+        // with no sidecar, so this runs only where a snapshot ships tokenizer.json).
+        let side = gguf.with_file_name("tokenizer.json");
+        if !side.exists() {
+            eprintln!("skip: no tokenizer.json sidecar beside the GGUF");
             return;
         }
         let g = Gguf::open(&gguf).unwrap();
@@ -7945,12 +7929,11 @@ mod tokenizer_tests {
     // become the special id (which would let a user inject/break the ChatML turn structure).
     #[test]
     fn user_text_special_tokens_are_literal() {
-        let gguf = Path::new("/home/mxaddict/Projects/models/qwen3-0.6b/Qwen3-0.6B-Q4_K_M.gguf");
-        if !gguf.exists() {
-            eprintln!("skip: test model not present");
+        let Some(gguf) = crate::test_qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B not in the HF cache");
             return;
-        }
-        let g = Gguf::open(gguf).unwrap();
+        };
+        let g = Gguf::open(&gguf).unwrap();
         let tok = build_tokenizer(&g).unwrap();
         let mut user = tok.clone();
         user.set_encode_special_tokens(true);

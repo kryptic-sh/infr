@@ -141,6 +141,17 @@ unsafe fn hadd_i32_ymm(v: std::arch::x86_64::__m256i) -> i32 {
     _mm_cvtsi128_si32(_mm_add_epi32(lo, hi))
 }
 
+/// Horizontal reduction: sum 4 × i32 in an xmm register to a scalar i32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn hadd_i32_xmm(v: std::arch::x86_64::__m128i) -> i32 {
+    use std::arch::x86_64::*;
+    let h = _mm_hadd_epi32(v, v); // [a+b, c+d, a+b, c+d]
+    let hh = _mm_hadd_epi32(h, h); // [a+b+c+d, ...]
+    _mm_cvtsi128_si32(hh)
+}
+
 /// AVX2 kernel for `vec_dot_q4k`: one 32-element sub-block per iteration with 256-bit SIMD.
 /// Nibbles are unpacked with `_mm256_maddubs_epi16` (unsigned×signed → i16 pair-sum) then widened
 /// to i32 via `_mm256_madd_epi16`. `isum` comes from `q8.bsums`, not the inner loop.
@@ -241,9 +252,26 @@ unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     sumf
 }
 
-/// `Σ weight·x` for one Q6_K row (210 bytes / 256 elems). Weight value is `d·sc·(q6−32)` over 16
-/// sub-blocks of 16 (int8 scales); accumulate `Σ q6·q8` and `Σ q8` per sub-block.
+/// `Σ weight·x` for one Q6_K row (210 bytes / 256 elems). Dispatches to the best SIMD path
+/// available at runtime (avx512bw → avx2 → scalar). Weight value is `d·sc·(q6−32)` over 16
+/// sub-blocks of 16 (int8 scales).
 fn vec_dot_q6k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_q6k_avx512bw(row, q8, in_f) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q6k_avx2(row, q8, in_f) };
+        }
+    }
+    vec_dot_q6k_scalar(row, q8, in_f)
+}
+
+/// Scalar fallback for `vec_dot_q6k`; also used on non-x86 targets.
+/// Accumulates `Σ q6·q8` and `Σ q8` per 16-element sub-block, then applies int8 scales.
+fn vec_dot_q6k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let nb = in_f / 256;
     let mut sumf = 0f32;
     for b in 0..nb {
@@ -274,6 +302,234 @@ fn vec_dot_q6k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let mut s = 0f32;
         for sub in 0..16 {
             s += scales[sub] as i8 as f32 * (sumi[sub] - 32 * bsum[sub]) as f32;
+        }
+        sumf += d * q8.d[b] * s;
+    }
+    sumf
+}
+
+/// AVX2 kernel for `vec_dot_q6k`: processes each of the 4 "columns" of 32 q6 values per half
+/// using 256-bit SIMD. Each column maps to two consecutive 16-element sub-blocks (lower/upper
+/// 128 bits after `madd`). q6 is reconstructed from `ql`/`qh` via byte-wise mask+shift; the
+/// dot uses `maddubs(q6_u8, q8_i8) → madd(-, 1)`. The −32·bsum correction is computed from a
+/// parallel `maddubs(1_u8, q8_i8)` sum so no per-element loop is needed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+
+    let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8); // low nibble
+    let mask_30 = _mm256_set1_epi8(0x30_u8 as i8); // bits 4-5
+    let mask_03 = _mm256_set1_epi8(0x03_u8 as i8); // low 2 bits
+    let ones_u8 = _mm256_set1_epi8(1i8); // for bsum via maddubs(1, q8)
+    let ones_i16 = _mm256_set1_epi16(1i16);
+
+    for b in 0..nb {
+        let blk = &row[b * 210..b * 210 + 210];
+        let ql = &blk[0..128];
+        let qh = &blk[128..192];
+        let scales = &blk[192..208];
+        let d = crate::rdf16(&blk[208..210]);
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+
+        let mut s = 0f32;
+
+        // Process two halves (each 128 elements = 8 sub-blocks of 16).
+        for half in 0..2usize {
+            let qlo = half * 64;
+            let qho = half * 32;
+            let sco = half * 8;
+            let base = half * 128;
+
+            // Load qh (32 bytes) and the two ql halves for this block-half.
+            let qh_ymm = _mm256_loadu_si256(qh[qho..].as_ptr() as *const __m256i);
+            let ql_lo = _mm256_loadu_si256(ql[qlo..].as_ptr() as *const __m256i);
+            let ql_hi = _mm256_loadu_si256(ql[qlo + 32..].as_ptr() as *const __m256i);
+
+            // (qh >> 2) & 0x03 per byte — reused in col2 and col6 reconstructions.
+            // Trick: _mm256_srli_epi16(v, 2) shifts 16-bit lanes; masking with 0x03 per byte
+            // gives the correct byte-wise >>2 result for each byte (cross-byte bleed is masked
+            // away: (high_byte << 6) & 0x03 = 0 since high_byte << 6 occupies bits 6-7).
+            let qh_sr2 = _mm256_and_si256(_mm256_srli_epi16(qh_ymm, 2), mask_03);
+
+            // Reconstruct 4 × 32 q6 byte columns (values 0–63, stored as u8 in __m256i).
+            //
+            // col0: (ql_lo & 0x0F) | ((qh & 0x03) << 4)  →  q8b[base..base+32]
+            // col2: (ql_hi & 0x0F) | ((qh>>2 & 0x03) << 4) → q8b[base+32..base+64]
+            // col4: (ql_lo >> 4) | (qh & 0x30)             → q8b[base+64..base+96]
+            // col6: (ql_hi >> 4) | ((qh>>2) & 0x30)        → q8b[base+96..base+128]
+            //
+            // Left-shift by 4 via _mm256_slli_epi16: for bytes 0–3 in range the low byte
+            // result (v << 4) & 0xFF is correct (high byte has no bleed since input ≤ 3).
+            let q6_c0 = _mm256_or_si256(
+                _mm256_and_si256(ql_lo, mask_0f),
+                _mm256_slli_epi16(_mm256_and_si256(qh_ymm, mask_03), 4),
+            );
+            let q6_c2 = _mm256_or_si256(
+                _mm256_and_si256(ql_hi, mask_0f),
+                _mm256_slli_epi16(qh_sr2, 4),
+            );
+            // col4: (qh >> 4 & 3) << 4 = qh & 0x30 (bits 4-5 of qh[i]).
+            let q6_c4 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql_lo, 4), mask_0f),
+                _mm256_and_si256(qh_ymm, mask_30),
+            );
+            // col6: (qh >> 6 & 3) << 4 = (qh >> 2) & 0x30 (bits 6-7 of qh[i] → positions 4-5).
+            let q6_c6 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql_hi, 4), mask_0f),
+                _mm256_and_si256(_mm256_srli_epi16(qh_ymm, 2), mask_30),
+            );
+
+            // For each of the 4 columns: dot with the corresponding 32 q8 bytes, then split the
+            // 8×i32 ymm result into lower 4×i32 (sub-block `sco+ci*2`) and upper 4×i32
+            // (sub-block `sco+ci*2+1`). Reduction order matches scalar sub=0..16, ensuring
+            // bit-identical f32 accumulation.
+            for (ci, q6_col) in [q6_c0, q6_c2, q6_c4, q6_c6].iter().enumerate() {
+                let q8_ymm = _mm256_loadu_si256(q8b[base + ci * 32..].as_ptr() as *const __m256i);
+
+                // maddubs: q6_u8 (0–63) × q8_i8 (±127) → 16×i16 pair-sums (max ±8001 < 32767).
+                // madd with 1: widen 16×i16 → 8×i32 (pairs summed).
+                let prod = _mm256_maddubs_epi16(*q6_col, q8_ymm);
+                let sum32 = _mm256_madd_epi16(prod, ones_i16);
+
+                // bsum: maddubs(1_u8, q8_i8) = q8 pair-sums as i16; madd → 4-group i32 sums.
+                let bsum_i16 = _mm256_maddubs_epi16(ones_u8, q8_ymm);
+                let bsum_i32 = _mm256_madd_epi16(bsum_i16, ones_i16);
+
+                // Lower 128 bits = elements 0..15 (sub-block `sco+ci*2`).
+                // Upper 128 bits = elements 16..31 (sub-block `sco+ci*2+1`).
+                let sum_lo = _mm256_castsi256_si128(sum32);
+                let sum_hi = _mm256_extracti128_si256::<1>(sum32);
+                let bs_lo = _mm256_castsi256_si128(bsum_i32);
+                let bs_hi = _mm256_extracti128_si256::<1>(bsum_i32);
+
+                let iprod_0 = hadd_i32_xmm(sum_lo);
+                let iprod_1 = hadd_i32_xmm(sum_hi);
+                let bs_0 = hadd_i32_xmm(bs_lo);
+                let bs_1 = hadd_i32_xmm(bs_hi);
+
+                let sub_0 = sco + ci * 2;
+                let sub_1 = sco + ci * 2 + 1;
+                s += scales[sub_0] as i8 as f32 * (iprod_0 - 32 * bs_0) as f32;
+                s += scales[sub_1] as i8 as f32 * (iprod_1 - 32 * bs_1) as f32;
+            }
+        }
+        sumf += d * q8.d[b] * s;
+    }
+    sumf
+}
+
+/// AVX-512BW kernel for `vec_dot_q6k`: processes BOTH halves of a 256-element block simultaneously
+/// using zmm registers (512-bit). The two ql half-lo slices are packed into one zmm via
+/// `_mm512_inserti64x4`; qh loads as a single 64-byte zmm (the two halves are contiguous). For
+/// each of the 4 q6 columns, both halves' q8 are also packed into one zmm, so a single
+/// `maddubs512 → madd512` covers 64 elements at once. Results are split back to two ymm
+/// (h0/h1) then two xmm per ymm (per-sub-block) for the scalar scale accumulation.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+
+    let mask_0f_z = _mm512_set1_epi8(0x0F_u8 as i8);
+    let mask_30_z = _mm512_set1_epi8(0x30_u8 as i8);
+    let mask_03_z = _mm512_set1_epi8(0x03_u8 as i8);
+    let ones_u8_z = _mm512_set1_epi8(1i8);
+    let ones_i16_z = _mm512_set1_epi16(1i16);
+
+    for b in 0..nb {
+        let blk = &row[b * 210..b * 210 + 210];
+        let ql = &blk[0..128];
+        let qh = &blk[128..192];
+        let scales = &blk[192..208];
+        let d = crate::rdf16(&blk[208..210]);
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+
+        // qh is 64 contiguous bytes: h0 in bits 0-255, h1 in bits 256-511 → one zmm load.
+        let qh_z = _mm512_loadu_si512(qh.as_ptr() as *const __m512i);
+
+        // ql_lo_z: lower 256 = ql[0..32] (h0_lo), upper 256 = ql[64..96] (h1_lo).
+        // ql_hi_z: lower 256 = ql[32..64] (h0_hi), upper 256 = ql[96..128] (h1_hi).
+        // h0 and h1 slices are non-contiguous (separated by 32 bytes), so 2 ymm loads + insert.
+        let ql_lo_h0 = _mm256_loadu_si256(ql[0..].as_ptr() as *const __m256i);
+        let ql_lo_h1 = _mm256_loadu_si256(ql[64..].as_ptr() as *const __m256i);
+        let ql_lo_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ql_lo_h0), ql_lo_h1);
+
+        let ql_hi_h0 = _mm256_loadu_si256(ql[32..].as_ptr() as *const __m256i);
+        let ql_hi_h1 = _mm256_loadu_si256(ql[96..].as_ptr() as *const __m256i);
+        let ql_hi_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(ql_hi_h0), ql_hi_h1);
+
+        // Same byte-wise shift/mask tricks as AVX2 but on 512-bit registers.
+        let qh_sr2_z = _mm512_and_si512(_mm512_srli_epi16(qh_z, 2), mask_03_z);
+
+        let q6_c0_z = _mm512_or_si512(
+            _mm512_and_si512(ql_lo_z, mask_0f_z),
+            _mm512_slli_epi16(_mm512_and_si512(qh_z, mask_03_z), 4),
+        );
+        let q6_c2_z = _mm512_or_si512(
+            _mm512_and_si512(ql_hi_z, mask_0f_z),
+            _mm512_slli_epi16(qh_sr2_z, 4),
+        );
+        let q6_c4_z = _mm512_or_si512(
+            _mm512_and_si512(_mm512_srli_epi16(ql_lo_z, 4), mask_0f_z),
+            _mm512_and_si512(qh_z, mask_30_z),
+        );
+        let q6_c6_z = _mm512_or_si512(
+            _mm512_and_si512(_mm512_srli_epi16(ql_hi_z, 4), mask_0f_z),
+            _mm512_and_si512(_mm512_srli_epi16(qh_z, 2), mask_30_z),
+        );
+
+        // Collect per-sub-block i32 values in arrays; accumulate in 0..16 order (scalar-identical).
+        let mut simd_sumi = [0i32; 16];
+        let mut simd_bsum = [0i32; 16];
+
+        for (ci, q6_col_z) in [q6_c0_z, q6_c2_z, q6_c4_z, q6_c6_z].iter().enumerate() {
+            // q8 for h0 column ci: q8b[ci*32..ci*32+32]; h1: q8b[128+ci*32..128+ci*32+32].
+            let q8_h0 = _mm256_loadu_si256(q8b[ci * 32..].as_ptr() as *const __m256i);
+            let q8_h1 = _mm256_loadu_si256(q8b[128 + ci * 32..].as_ptr() as *const __m256i);
+            let q8_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8_h0), q8_h1);
+
+            // 512-bit dot: maddubs → madd.
+            let prod = _mm512_maddubs_epi16(*q6_col_z, q8_z);
+            let sum32_z = _mm512_madd_epi16(prod, ones_i16_z);
+
+            let bsum_i16_z = _mm512_maddubs_epi16(ones_u8_z, q8_z);
+            let bsum_i32_z = _mm512_madd_epi16(bsum_i16_z, ones_i16_z);
+
+            // Lower ymm = h0 (sub-blocks ci*2, ci*2+1); upper ymm = h1 (sub-blocks 8+ci*2, 8+ci*2+1).
+            let sum_h0 = _mm512_castsi512_si256(sum32_z);
+            let sum_h1 = _mm512_extracti64x4_epi64::<1>(sum32_z);
+            let bsum_h0 = _mm512_castsi512_si256(bsum_i32_z);
+            let bsum_h1 = _mm512_extracti64x4_epi64::<1>(bsum_i32_z);
+
+            // Each ymm: lower xmm = first 16 elements (is=0), upper xmm = elements 16..31 (is=1).
+            let s_h0_lo = _mm256_castsi256_si128(sum_h0);
+            let s_h0_hi = _mm256_extracti128_si256::<1>(sum_h0);
+            let s_h1_lo = _mm256_castsi256_si128(sum_h1);
+            let s_h1_hi = _mm256_extracti128_si256::<1>(sum_h1);
+            let b_h0_lo = _mm256_castsi256_si128(bsum_h0);
+            let b_h0_hi = _mm256_extracti128_si256::<1>(bsum_h0);
+            let b_h1_lo = _mm256_castsi256_si128(bsum_h1);
+            let b_h1_hi = _mm256_extracti128_si256::<1>(bsum_h1);
+
+            simd_sumi[ci * 2] = hadd_i32_xmm(s_h0_lo);
+            simd_sumi[ci * 2 + 1] = hadd_i32_xmm(s_h0_hi);
+            simd_sumi[8 + ci * 2] = hadd_i32_xmm(s_h1_lo);
+            simd_sumi[8 + ci * 2 + 1] = hadd_i32_xmm(s_h1_hi);
+
+            simd_bsum[ci * 2] = hadd_i32_xmm(b_h0_lo);
+            simd_bsum[ci * 2 + 1] = hadd_i32_xmm(b_h0_hi);
+            simd_bsum[8 + ci * 2] = hadd_i32_xmm(b_h1_lo);
+            simd_bsum[8 + ci * 2 + 1] = hadd_i32_xmm(b_h1_hi);
+        }
+
+        // Accumulate in sub 0..16 order — identical to scalar's final loop.
+        let mut s = 0f32;
+        for sub in 0..16 {
+            s += scales[sub] as i8 as f32 * (simd_sumi[sub] - 32 * simd_bsum[sub]) as f32;
         }
         sumf += d * q8.d[b] * s;
     }

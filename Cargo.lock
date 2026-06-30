@@ -992,6 +992,7 @@ dependencies = [
  "bytemuck",
  "gpu-allocator",
  "half",
+ "indicatif",
  "infr-core",
  "thiserror 2.0.18",
  "tracing",

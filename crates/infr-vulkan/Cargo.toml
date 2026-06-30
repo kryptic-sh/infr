@@ -16,3 +16,4 @@ thiserror.workspace = true
 half.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true
+indicatif.workspace = true

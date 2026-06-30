@@ -88,6 +88,9 @@ struct VulkanShared {
     linear_kernel: std::sync::OnceLock<crate::linear::LinearKernel>,
     /// Generic cache of compute kernels by name (see `ops.rs`).
     kernels: Mutex<HashMap<&'static str, crate::ops::ComputeKernel>>,
+    /// Active weight-load progress bar (see [`VulkanBackend::weight_progress`]). Every
+    /// `BufferUsage::Weights` allocation advances it, so no model loader can forget to tick it.
+    weight_pb: Mutex<Option<indicatif::ProgressBar>>,
 }
 
 // ash Instances/Devices/handles are Send+Sync per the Vulkan spec when
@@ -266,6 +269,20 @@ impl Plan for VkPlan {
 /// Vulkan device + allocator + pipeline cache.
 pub struct VulkanBackend {
     shared: Arc<VulkanShared>,
+}
+
+/// RAII scope for a weight-load progress bar (see [`VulkanBackend::weight_progress`]). While alive,
+/// `BufferUsage::Weights` allocations advance the bar; on drop it finishes and clears it.
+pub struct WeightProgress {
+    shared: Arc<VulkanShared>,
+}
+
+impl Drop for WeightProgress {
+    fn drop(&mut self) {
+        if let Some(pb) = self.shared.weight_pb.lock().unwrap().take() {
+            pb.finish_and_clear();
+        }
+    }
 }
 
 impl VulkanBackend {
@@ -451,8 +468,26 @@ impl VulkanBackend {
                 weight_arena: Mutex::new(None),
                 linear_kernel: std::sync::OnceLock::new(),
                 kernels: Mutex::new(HashMap::new()),
+                weight_pb: Mutex::new(None),
             }),
         })
+    }
+
+    /// Begin a "loading weights" progress bar covering `total_bytes` (pass `None` for an
+    /// indeterminate byte spinner when the total isn't known up front). Every subsequent
+    /// `BufferUsage::Weights` allocation advances it automatically — the ticking lives in `alloc`,
+    /// so a model loader cannot forget it; it only has to open the scope once. The returned guard
+    /// finishes and clears the bar on drop, so the bar's lifetime is the loader's scope.
+    pub fn weight_progress(&self, total_bytes: Option<u64>) -> WeightProgress {
+        let pb = infr_core::progress::bar(
+            total_bytes,
+            "loading weights",
+            infr_core::progress::Unit::Bytes,
+        );
+        *self.shared.weight_pb.lock().unwrap() = Some(pb);
+        WeightProgress {
+            shared: self.shared.clone(),
+        }
     }
 
     // ── internal helpers ──────────────────────────────────────────────────────
@@ -711,6 +746,14 @@ impl Backend for VulkanBackend {
             BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),
         };
         let buf = self.make_buf(bytes, location, label)?;
+        // Advance the weight-load progress bar (if one is active). Ticking here — the single funnel
+        // every weight upload passes through — means no model loader can forget to account for a
+        // tensor. Activation/staging/readback allocs don't count toward the load.
+        if matches!(usage, BufferUsage::Weights) {
+            if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                pb.inc(bytes as u64);
+            }
+        }
         Ok(Box::new(buf))
     }
 

@@ -310,6 +310,13 @@ impl Model {
         } else {
             Some(VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?)
         };
+        // Weight-load progress bar: every BufferUsage::Weights alloc advances it automatically (the
+        // ticking lives in VulkanBackend::alloc), so we just open the scope. Guard drops at end of
+        // `load`. Total = sum of GGUF tensor bytes (the bar's denominator); inert on the CPU oracle.
+        let _wp = be.as_ref().map(|be| {
+            let total: u64 = g.tensors().iter().map(|t| t.nbytes as u64).sum();
+            be.weight_progress(Some(total))
+        });
         let (token_embd, te_shape) = load_tensor_dequant(g, "token_embd.weight")?;
         cfg.vocab = te_shape[1];
         let output_norm = load_tensor_dequant(g, "output_norm.weight")?.0;

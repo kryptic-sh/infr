@@ -2627,20 +2627,10 @@ impl Llama {
         // Loading the per-layer weights (dequant + GPU upload) dominates startup, especially for
         // big models — show a byte-progress bar so it reports copy speed + ETA (same shared style as
         // the download bar). Total/inc are GGUF source bytes; per-layer = sum of that layer's tensors.
-        let layer_bytes = |l: usize| -> u64 {
-            let prefix = format!("blk.{l}.");
-            g.tensors()
-                .iter()
-                .filter(|t| t.name.starts_with(&prefix))
-                .map(|t| t.nbytes as u64)
-                .sum()
-        };
-        let total_bytes: u64 = (0..n_layer).map(layer_bytes).sum();
-        let pb = infr_core::progress::bar(
-            Some(total_bytes),
-            "loading weights",
-            infr_core::progress::Unit::Bytes,
-        );
+        // Weight-load progress: every `BufferUsage::Weights` alloc advances it automatically (the
+        // ticking lives in `VulkanBackend::alloc`), so the loader just opens the scope. `gpu_total`
+        // is the resident VRAM denominator (CPU/host experts excluded). Drops at end of `load`.
+        let _wp = be.weight_progress(Some(gpu_total));
         let mut layers = Vec::with_capacity(n_layer);
         for l in 0..n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
@@ -2752,9 +2742,7 @@ impl Llama {
                 pl_proj,
                 pl_post_norm,
             });
-            pb.inc(layer_bytes(l));
         }
-        pb.finish_and_clear();
 
         let tokenizer = match tokenizer_path {
             Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,

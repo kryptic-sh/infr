@@ -1,7 +1,12 @@
 //! GPU weight-storage types: a projection weight (f16 / native-quant blocks), MoE expert
 //! weights (GPU-resident or host-backed), and a layer FFN (dense gate||up + down, or a MoE
 //! bank). Mechanically split out of `lib.rs` (no logic change).
+use crate::{dequant_block, f16_bytes, f32_to_f16_sat};
+use anyhow::{anyhow, Result};
 use infr_core::backend::Buffer;
+use infr_core::WeightSource;
+use infr_gguf::Gguf;
+use infr_vulkan::VulkanBackend;
 
 /// A projection weight on the GPU: f16, unified repacked quant, or native raw-block quant.
 ///
@@ -80,4 +85,91 @@ pub(crate) enum FfnWt {
         experts: Vec<ExpertWt>, // empty when `stacked` is Some (per-expert buffers dropped)
         stacked: Option<MoeStacked>,
     },
+}
+pub(crate) fn is_native_default(d: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(
+        d,
+        Q8_0 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q2K | Q3K | Q4K | Q5K | Q6K
+    )
+}
+
+/// Upload a projection weight, keeping quantized weights quantized in-VRAM (else convert to f16).
+///
+/// - Affine quants (Q4_K/Q5_K/Q6_K/Q8_0/Q4_0…) → `Wt::Native` (raw block bytes, in-shader
+///   decode-once dequant — faster decode + prefill, smaller VRAM). These have the `native_id_*`
+///   decode GEMV shaders ([`is_native_default`]).
+/// - Codebook quants (IQ*/TQ*/fp4) and float types (F16/F32/BF16) → host dequant → f16 → `Wt::F16`.
+///   The i-quants have no decode-GEMV shader yet, so they stay on f16 until those land.
+pub(crate) fn upload_wt(be: &VulkanBackend, g: &Gguf, name: &str) -> Result<Wt> {
+    let dtype = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+        .dtype;
+    let bytes = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+    upload_wt_bytes(be, dtype, bytes)
+}
+
+/// Like [`upload_wt`] but from a raw byte slice + dtype — lets a stacked MoE expert tensor be sliced
+/// per expert (each expert is a contiguous block of the `*_exps` tensor) and uploaded individually.
+pub(crate) fn upload_wt_bytes(
+    be: &VulkanBackend,
+    dtype: infr_core::DType,
+    bytes: &[u8],
+) -> Result<Wt> {
+    // Native-block path: raw upload + in-shader dequant — for every quant format with the dense
+    // native pipeline (decode GEMV + prefill GEMM; see `native_dense_supported`). Only float types
+    // (F16/F32/BF16, not quants) fall to the host dequant → f16 path.
+    if infr_vulkan::linear::native_dense_supported(dtype) {
+        let padded = infr_vulkan::linear::pad_to_u32_align(bytes);
+        return Ok(Wt::Native {
+            buf: be
+                .upload_weight_bytes(&padded)
+                .map_err(|e| anyhow!("native upload: {e}"))?,
+            dtype,
+        });
+    }
+    // Float types → host dequant to f32 → f16.
+    let f16_bytes: Vec<u8> = dequant_block(dtype, bytes)?
+        .iter()
+        .flat_map(|&v| f32_to_f16_sat(v).to_bits().to_le_bytes())
+        .collect();
+    Ok(Wt::F16(be.upload_weight_bytes(&f16_bytes)?))
+}
+
+/// Build a dense layer's fused gate‖up weight (`[2*n_ff, n_embd]`, gate rows then up rows). Quant
+/// stays quantized (raw native blocks); float → f16. `prefix` is e.g. `"blk.3."`.
+pub(crate) fn build_wgateup(be: &VulkanBackend, g: &Gguf, prefix: &str) -> Result<Wt> {
+    let gate_name = format!("{prefix}ffn_gate.weight");
+    let up_name = format!("{prefix}ffn_up.weight");
+    let gate_dtype = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == gate_name)
+        .map(|t| t.dtype);
+    let gb = g.tensor_bytes(&gate_name).map_err(|e| anyhow!("{e}"))?;
+    let ub = g.tensor_bytes(&up_name).map_err(|e| anyhow!("{e}"))?;
+    // Native path (every quant format): the fused `[2*n_ff, n_embd]` weight is just gate's rows
+    // followed by up's rows, and each tensor's bytes are already row-contiguous native blocks — so
+    // concatenating the raw bytes IS the fused weight (up's first block lands exactly at `gb.len()`,
+    // no inter-tensor padding). Raw upload, in-shader dequant — no host dequant/repack.
+    if let Some(dt) = gate_dtype {
+        if infr_vulkan::linear::native_dense_supported(dt) {
+            let mut fused = gb.to_vec();
+            fused.extend_from_slice(ub);
+            let padded = infr_vulkan::linear::pad_to_u32_align(&fused);
+            return Ok(Wt::Native {
+                buf: be
+                    .upload_weight_bytes(&padded)
+                    .map_err(|e| anyhow!("native gateup upload: {e}"))?,
+                dtype: dt,
+            });
+        }
+    }
+    // Float gate/up → f16.
+    let mut gateup = f16_bytes(g, &gate_name)?;
+    gateup.extend_from_slice(&f16_bytes(g, &up_name)?);
+    Ok(Wt::F16(be.upload_weight_bytes(&gateup)?))
 }

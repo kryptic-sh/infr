@@ -281,7 +281,7 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
             } => {
                 let window = match mask {
                     AttnMask::Causal => 0,
-                    AttnMask::SlidingWindow(w) => *w as usize,
+                    AttnMask::SlidingWindow(w) => *w,
                 };
                 rec.attention_kv(
                     r(*q)?,
@@ -527,9 +527,7 @@ mod tests {
             let ss = (0..hd).map(|i| x[b + i] * x[b + i]).sum::<f32>() / hd as f32;
             let s = 1.0 / (ss + eps).sqrt();
             let nrm: Vec<f32> = (0..hd).map(|i| x[b + i] * s * w[i]).collect();
-            for i in 0..hd {
-                want[b + i] = nrm[i];
-            }
+            want[b..b + hd].copy_from_slice(&nrm);
             for p in 0..hf {
                 let ang = pos as f32 * theta.powf(-2.0 * p as f32 / rope_dim as f32);
                 let (sn, c) = (ang.sin(), ang.cos());

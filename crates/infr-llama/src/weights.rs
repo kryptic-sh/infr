@@ -286,3 +286,139 @@ pub(crate) fn rec_linear_add(
         }
     }
 }
+/// VRAM the model's weights will occupy once resident, split dense vs MoE-expert. Experts are
+/// tracked separately so a future expert-streaming / partial-offload mode can budget them apart
+/// from the always-resident dense weights — for a dense model `expert` is 0.
+#[derive(Clone, Copy, Debug)]
+pub struct WeightFootprint {
+    /// Always-resident weights: projections, embeddings, norms.
+    pub dense: u64,
+    /// MoE expert weights (GGUF `*_exps` stacked tensors). 0 for dense models.
+    pub expert: u64,
+}
+impl WeightFootprint {
+    /// All-resident footprint: dense + every expert kept in VRAM.
+    pub fn total(&self) -> u64 {
+        self.dense + self.expert
+    }
+
+    /// Footprint if experts are STREAMED through an `n_slots`-slot pool of `stride`-byte slots
+    /// (`infr_vulkan::ExpertPool`) instead of all kept resident: `dense + n_slots·stride`, bounded
+    /// regardless of the model's expert count. The MoE loader picks all-resident ([`total`]) when it
+    /// fits VRAM, else reserves this and streams. (`stride` = one expert's max packed weight bytes.)
+    pub fn streaming_total(&self, n_slots: usize, stride: usize) -> u64 {
+        self.dense + n_slots as u64 * stride as u64
+    }
+}
+
+/// Resident VRAM bytes for one tensor, mirroring [`upload_wt`]'s path so the estimate matches what
+/// actually gets allocated: native raw blocks (padded to u32) for every quant format, else f16
+/// (float/norms dequanted to half).
+pub(crate) fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbytes: usize) -> u64 {
+    if infr_vulkan::linear::native_dense_supported(dtype) {
+        ((nbytes + 3) & !3) as u64 // raw blocks, padded to u32 alignment
+    } else {
+        (numel * 2) as u64 // f16
+    }
+}
+
+/// Sum the resident weight footprint across all tensors (MoE-aware). Enumerating every tensor means
+/// stacked expert tensors are counted in full, so this is correct for MoE the moment the arch is
+/// supported. `token_embd` is excluded (it lives in host RAM for the CPU embedding gather) unless
+/// the lm head is tied to it (no `output.weight`), where an f16 copy is uploaded to VRAM.
+pub fn weight_footprint(g: &Gguf) -> WeightFootprint {
+    let has_output = g.tensors().iter().any(|t| t.name == "output.weight");
+    let mut dense = 0u64;
+    let mut expert = 0u64;
+    for t in g.tensors() {
+        let numel: usize = t.shape.iter().product();
+        if t.name == "token_embd.weight" {
+            if !has_output {
+                dense += (numel * 2) as u64; // tied lm head, uploaded as f16
+            }
+            continue;
+        }
+        let bytes = tensor_resident_bytes(t.dtype, numel, t.nbytes);
+        if t.name.contains("_exps") {
+            expert += bytes;
+        } else {
+            dense += bytes;
+        }
+    }
+    WeightFootprint { dense, expert }
+}
+
+/// Load a layer's MoE expert bank: the router `ffn_gate_inp` + the `n_expert` per-expert SwiGLU
+/// weights sliced from the stacked `ffn_{gate,up,down}_exps` tensors (each expert is one contiguous
+/// `1/n_expert` block of the stacked tensor — quant blocks never cross expert boundaries).
+pub(crate) fn load_moe(
+    be: &VulkanBackend,
+    g: &Gguf,
+    prefix: &str,
+    n_expert: usize,
+    on_cpu: bool,
+    build_stacked: bool,
+    stride_elems: usize,
+) -> Result<FfnWt> {
+    let gate_inp = upload_wt(be, g, &format!("{prefix}ffn_gate_inp.weight"))?;
+    let stacked = |role: &str| -> Result<(infr_core::DType, &[u8])> {
+        let name = format!("{prefix}ffn_{role}_exps.weight");
+        let dt = g
+            .tensors()
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+            .dtype;
+        let bytes = g.tensor_bytes(&name).map_err(|e| anyhow!("{e}"))?;
+        Ok((dt, bytes))
+    };
+    let (gdt, gbytes) = stacked("gate")?;
+    let (udt, ubytes) = stacked("up")?;
+    let (ddt, dbytes) = stacked("down")?;
+
+    // Fully-GPU native model: upload each role's whole `*_exps` tensor as ONE Native buffer and
+    // address experts by element offset. Per-expert buffers are dropped (same VRAM, one allocation),
+    // and the on-GPU router can index experts without a host round-trip.
+    let native_ok = [gdt, udt, ddt].iter().all(|&d| is_native_default(d));
+    if build_stacked && !on_cpu && native_ok {
+        let mk = |dt, b| upload_wt_bytes(be, dt, b);
+        return Ok(FfnWt::Moe {
+            gate_inp,
+            experts: Vec::new(),
+            stacked: Some(MoeStacked {
+                gate: mk(gdt, gbytes)?,
+                up: mk(udt, ubytes)?,
+                down: mk(ddt, dbytes)?,
+                stride: stride_elems,
+            }),
+        });
+    }
+
+    let (gstride, ustride, dstride) = (
+        gbytes.len() / n_expert,
+        ubytes.len() / n_expert,
+        dbytes.len() / n_expert,
+    );
+    // GPU experts upload to VRAM; host experts store only the dtype — their bytes are read on demand
+    // from the kept-alive GGUF mmap at forward time (no host-RAM copy).
+    let place = |dt: infr_core::DType, b: &[u8]| -> Result<ExpertW> {
+        if on_cpu {
+            Ok(ExpertW::Cpu { dtype: dt })
+        } else {
+            Ok(ExpertW::Gpu(upload_wt_bytes(be, dt, b)?))
+        }
+    };
+    let mut experts = Vec::with_capacity(n_expert);
+    for e in 0..n_expert {
+        experts.push(ExpertWt {
+            gate: place(gdt, &gbytes[e * gstride..(e + 1) * gstride])?,
+            up: place(udt, &ubytes[e * ustride..(e + 1) * ustride])?,
+            down: place(ddt, &dbytes[e * dstride..(e + 1) * dstride])?,
+        });
+    }
+    Ok(FfnWt::Moe {
+        gate_inp,
+        experts,
+        stacked: None,
+    })
+}

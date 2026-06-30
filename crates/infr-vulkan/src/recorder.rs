@@ -2039,6 +2039,22 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Elementwise sigmoid gate: `y[i] = a[i] * sigmoid(b[i])` (Qwen3-Next attention output gate).
+    pub fn mul_sigmoid(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
+        let kern = self
+            .be
+            .kernel("mul_sigmoid", crate::gemm::mul_sigmoid_spv(), 3, 4);
+        let mut push = [0u8; 4];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
     /// GeGLU with separate gate/up buffers: `y[i] = gelu(gate[i]) * up[up_off_bytes/4 + i]` (GELU
     /// tanh-approx). `up_off_bytes` lets a layer-major slice of a larger buffer be read in place
     /// (gemma4 per-layer-embd gate: `gelu(inp_gate·hidden) * inp_per_layer[il]`).

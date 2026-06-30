@@ -32,6 +32,7 @@ fn main() {
         ("rmsnorm", "rmsnorm", &[]),
         ("deltanet", "deltanet", &[]),
         ("conv1d_silu", "conv1d_silu", &[]),
+        ("mul_sigmoid", "mul_sigmoid", &[]),
         ("add", "add", &[]),
         ("add_scaled", "add_scaled", &[]),
         ("scale", "scale", &[]),

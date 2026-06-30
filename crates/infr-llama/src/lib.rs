@@ -410,10 +410,18 @@ fn stream_token(
     }
 }
 
-/// Render a single user turn with the GGUF's embedded chat template (`tokenizer.chat_template`, a
-/// Jinja2 string) via minijinja, with `add_generation_prompt`. Returns `None` if there's no template
-/// or it fails to render. Shared by the GPU and CPU paths so an instruct model answers coherently.
-fn render_chat_user(gguf: &Gguf, tokenizer: &Tokenizer, eos: u32, user: &str) -> Option<String> {
+/// THE jinja chat renderer — the single source of truth for turning `(role, content)` messages into
+/// a prompt string via the GGUF's embedded `tokenizer.chat_template`. Every prompt-construction path
+/// (single-turn [`render_chat_user`], multi-turn [`Llama::render_chat_messages`], CPU + GPU) funnels
+/// here, so template handling (pycompat, `enable_thinking`, bos/eos, tools) lives in ONE place.
+/// Returns `None` if there's no template or it fails to render (caller falls back to ChatML).
+fn render_chat_jinja(
+    gguf: &Gguf,
+    tokenizer: &Tokenizer,
+    eos: u32,
+    messages: &[(&str, &str)],
+    add_generation_prompt: bool,
+) -> Option<String> {
     let template = gguf.metadata().str("tokenizer.chat_template")?;
     let bos_id = gguf
         .metadata()
@@ -445,16 +453,30 @@ fn render_chat_user(gguf: &Gguf, tokenizer: &Tokenizer, eos: u32, user: &str) ->
         return None;
     }
     let tmpl = env.get_template("chat").ok()?;
-    let msgs = vec![serde_json::json!({ "role": "user", "content": user })];
-    let ctx = minijinja::context! {
-        messages => msgs,
-        tools => serde_json::Value::Null,
-        add_generation_prompt => true,
-        bos_token => bos,
-        eos_token => eos_s,
-    };
-    match tmpl.render(ctx) {
-        Ok(s) => Some(s),
+    let msgs: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|(r, c)| serde_json::json!({ "role": r, "content": c }))
+        .collect();
+    let mut ctx = serde_json::Map::new();
+    ctx.insert("messages".into(), serde_json::Value::Array(msgs));
+    ctx.insert("tools".into(), serde_json::Value::Null);
+    ctx.insert("add_generation_prompt".into(), add_generation_prompt.into());
+    ctx.insert("bos_token".into(), bos.into());
+    ctx.insert("eos_token".into(), eos_s.into());
+    // `enable_thinking` is only set when the user opts in via INFR_THINK — otherwise the key is
+    // ABSENT so each template applies its OWN default (e.g. Qwen3 thinks; Qwen3-Next prefills an
+    // empty `<think></think>` to stay non-thinking, which is what keeps its greedy decode from
+    // degenerating). INFR_THINK=1 forces thinking on, INFR_THINK=0 forces it off.
+    if let Ok(v) = std::env::var("INFR_THINK") {
+        ctx.insert("enable_thinking".into(), (v != "0").into());
+    }
+    match tmpl.render(serde_json::Value::Object(ctx)) {
+        Ok(s) => {
+            if std::env::var("INFR_DEBUG_CHAT").is_ok() {
+                eprintln!("[chat-template] rendered:\n{s}\n[/chat-template]");
+            }
+            Some(s)
+        }
         Err(e) => {
             if std::env::var("INFR_DEBUG_CHAT").is_ok() {
                 eprintln!("[chat-template] render error: {e:#}");
@@ -462,6 +484,12 @@ fn render_chat_user(gguf: &Gguf, tokenizer: &Tokenizer, eos: u32, user: &str) ->
             None
         }
     }
+}
+
+/// Single user turn through [`render_chat_jinja`] (`add_generation_prompt=true`). Shared by the GPU
+/// and CPU one-shot paths so an instruct model answers coherently.
+fn render_chat_user(gguf: &Gguf, tokenizer: &Tokenizer, eos: u32, user: &str) -> Option<String> {
+    render_chat_jinja(gguf, tokenizer, eos, &[("user", user)], true)
 }
 
 /// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
@@ -2924,44 +2952,13 @@ impl Llama {
         messages: &[(&str, &str)],
         add_generation_prompt: bool,
     ) -> Option<String> {
-        let template = self.gguf.metadata().str("tokenizer.chat_template")?;
-        let bos_id = self
-            .gguf
-            .metadata()
-            .get("tokenizer.ggml.bos_token_id")
-            .and_then(MetaValue::as_u64)
-            .unwrap_or(2) as u32;
-        let bos = self.tokenizer.id_to_token(bos_id).unwrap_or_default();
-        let eos = self.tokenizer.id_to_token(self.cfg.eos).unwrap_or_default();
-
-        let mut env = minijinja::Environment::new();
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_function(
-            "raise_exception",
-            |msg: String| -> std::result::Result<String, minijinja::Error> {
-                Err(minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    msg,
-                ))
-            },
-        );
-        env.add_filter("tojson", |v: minijinja::Value| {
-            serde_json::to_string(&v).unwrap_or_else(|_| "null".to_owned())
-        });
-        env.add_template("chat", template).ok()?;
-        let tmpl = env.get_template("chat").ok()?;
-        let msgs: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|(r, c)| serde_json::json!({ "role": r, "content": c }))
-            .collect();
-        let ctx = minijinja::context! {
-            messages => msgs,
-            tools => serde_json::Value::Null,
-            add_generation_prompt => add_generation_prompt,
-            bos_token => bos,
-            eos_token => eos,
-        };
-        tmpl.render(ctx).ok()
+        render_chat_jinja(
+            &self.gguf,
+            &self.tokenizer,
+            self.cfg.eos,
+            messages,
+            add_generation_prompt,
+        )
     }
 
     /// Encode a chat-template-rendered string to token ids (special markers parsed atomically; no

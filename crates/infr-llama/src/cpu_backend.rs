@@ -829,11 +829,17 @@ impl Backend for CpuBackend {
                     state,
                     dst,
                     n_vhead,
+                    n_khead,
                     head_k,
                     head_v,
                     eps,
                 } => {
-                    let (nv, kd, vd) = (n_vhead as usize, head_k as usize, head_v as usize);
+                    let (nv, nk, kd, vd) = (
+                        n_vhead as usize,
+                        n_khead as usize,
+                        head_k as usize,
+                        head_v as usize,
+                    );
                     let qf = vals[q.0 as usize].clone();
                     let kf = vals[k.0 as usize].clone();
                     let vf = vals[v.0 as usize].clone();
@@ -848,8 +854,10 @@ impl Backend for CpuBackend {
                         (slice.iter().map(|x| x * x).sum::<f32>() + eps).sqrt()
                     };
                     for h in 0..nv {
-                        let mut qh = qf[h * kd..h * kd + kd].to_vec();
-                        let mut kh = kf[h * kd..h * kd + kd].to_vec();
+                        // GQA: q/k heads are TILED to nv value heads → v-head h uses q/k head h % nk.
+                        let kh_idx = h % nk;
+                        let mut qh = qf[kh_idx * kd..kh_idx * kd + kd].to_vec();
+                        let mut kh = kf[kh_idx * kd..kh_idx * kd + kd].to_vec();
                         let vh = &vf[h * vd..h * vd + vd];
                         let qn = l2(&qh);
                         let kn = l2(&kh);

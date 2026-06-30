@@ -539,10 +539,13 @@ impl Model {
 
         let mut out = vec![0.0f32; nv * vd];
         let qscale = 1.0 / (kd as f32).sqrt();
+        // GQA linear attention: the `nk` query/key heads are TILED (repeat, not repeat_interleave) up
+        // to `nv` value heads — so value head `h` uses q/k head `h % nk` (identity when nv==nk, e.g.
+        // the 0.8B). Contiguous grouping (`h/(nv/nk)`) produces garbage on the 9B; tiling is correct.
         for h in 0..nv {
-            // num_v_heads == num_k_heads here (1:1)
-            let mut qh = q_all[h * kd..h * kd + kd].to_vec();
-            let mut kh = k_all[h * kd..h * kd + kd].to_vec();
+            let kh_idx = h % nk;
+            let mut qh = q_all[kh_idx * kd..kh_idx * kd + kd].to_vec();
+            let mut kh = k_all[kh_idx * kd..kh_idx * kd + kd].to_vec();
             let vh = &v_all[h * vd..h * vd + vd];
             l2norm(&mut qh, 1e-6);
             l2norm(&mut kh, 1e-6);
@@ -1110,6 +1113,7 @@ pub fn generate_cpu(
                         state: w.s_state,
                         dst: dnout,
                         n_vhead: nv as u32,
+                        n_khead: nk as u32,
                         head_k: kd as u32,
                         head_v: vd as u32,
                         eps: 1e-6,
@@ -1408,7 +1412,12 @@ pub fn generate_chat(
         .u64("tokenizer.ggml.eos_token_id")
         .map(|x| x as u32);
     let im_end = tok.token_to_id("<|im_end|>");
-    let prompt = format!("<|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n");
+    // Render through the model's OWN jinja chat template (Qwen3.5's controls thinking — the hardcoded
+    // ChatML below is only a fallback for templateless GGUFs). Mirrors the CPU path (`render_chat`).
+    let prompt =
+        crate::render_chat_user(&g, &tok, eos.unwrap_or(2), message).unwrap_or_else(|| {
+            format!("<|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n")
+        });
     let enc = tok
         .encode(prompt, false)
         .map_err(|e| anyhow!("encode: {e}"))?;

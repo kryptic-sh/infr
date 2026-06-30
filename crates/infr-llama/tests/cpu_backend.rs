@@ -315,6 +315,7 @@ fn qwen35_08b() -> PathBuf {
 
 // Captured + verified coherent (qwen35 / Qwen3-Next: gated-DeltaNet + gated full-attention): "The
 // capital of France is **Paris**. It is the largest city …", a knight story ("Elara … Aethelgard").
+// Renders at the template's default (non-thinking for Qwen3-Next; no INFR_THINK override).
 const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0x41a2c8d41bca554d),
     (

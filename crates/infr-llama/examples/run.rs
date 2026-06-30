@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
         t0.elapsed()
     );
 
-    let full = llama.chatml(&prompt);
+    let full = llama.render_chat(&prompt);
     eprintln!("--- prompt ---\n{full}\n--- response ---");
     let t1 = std::time::Instant::now();
     let mut n = 0usize;

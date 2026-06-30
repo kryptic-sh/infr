@@ -216,12 +216,14 @@ pub enum Op {
         channels: u32,
         kernel: u32,
     },
-    /// Gated-DeltaNet linear-attention recurrence step (Qwen3-Next), one token. Per head: L2-normalize
-    /// `q`,`k`; scale `q` by `1/√head_k`; `beta = sigmoid(b)`, `decay = exp(a_coef·softplus(a +
-    /// dt_bias))`; update the persistent state `S[head_k, head_v]`: `S *= decay`, `delta = (v − Sᵀk)·
-    /// beta`, `S += k⊗delta`; `dst = Sᵀq`. `q`/`k` are `[n_vhead·head_k]`, `v`/`dst` are
+    /// Gated-DeltaNet linear-attention recurrence step (Qwen3-Next), one token. Per VALUE head:
+    /// L2-normalize `q`,`k`; scale `q` by `1/√head_k`; `beta = sigmoid(b)`, `decay =
+    /// exp(a_coef·softplus(a + dt_bias))`; update the persistent state `S[head_k, head_v]`: `S *=
+    /// decay`, `delta = (v − Sᵀk)·beta`, `S += k⊗delta`; `dst = Sᵀq`. GQA linear attention: `n_vhead`
+    /// value heads share `n_khead` query/key heads in contiguous groups of `n_vhead/n_khead` — value
+    /// head `h` uses q/k head `h/(n_vhead/n_khead)`. `q`/`k` are `[n_khead·head_k]`, `v`/`dst` are
     /// `[n_vhead·head_v]`, `b`/`a` are `[n_vhead]`, `a_coef`/`dt_bias` are weights `[n_vhead]`,
-    /// `state` is `[n_vhead·head_k·head_v]` (mutated in place; n_k_head == n_v_head).
+    /// `state` is `[n_vhead·head_k·head_v]` (mutated in place).
     DeltaNet {
         q: TensorId,
         k: TensorId,
@@ -233,6 +235,7 @@ pub enum Op {
         state: TensorId,
         dst: TensorId,
         n_vhead: u32,
+        n_khead: u32,
         head_k: u32,
         head_v: u32,
         eps: f32,

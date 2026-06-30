@@ -36,7 +36,9 @@ fn cpu_gen(model: &infr_llama::CpuModel, prompt: &str, n: usize) -> String {
     // token stream the instruct model expects.
     let mut out = String::new();
     model
-        .generate_cpu(&model.render_chat(prompt), n, |p| out.push_str(p))
+        .generate_cpu(&model.render_chat(prompt).expect("render chat"), n, |p| {
+            out.push_str(p)
+        })
         .expect("cpu generate");
     out
 }
@@ -114,14 +116,14 @@ fn qwen3_06b() -> PathBuf {
 /// the GPU dense path, return the text. The production GPU path; mirrors [`cpu_gen`].
 fn gpu_gen(llama: &infr_llama::Llama, prompt: &str, n: usize) -> String {
     llama
-        .generate(&llama.render_chat(prompt), n, |_| {})
+        .generate(&llama.render_chat(prompt).expect("render chat"), n, |_| {})
         .expect("gpu generate")
 }
 
 /// As [`gpu_gen`] but via the routed-expert MoE forward ([`Llama::generate_moe`]).
 fn gpu_gen_moe(llama: &infr_llama::Llama, prompt: &str, n: usize) -> String {
     llama
-        .generate_moe(&llama.render_chat(prompt), n, |_| {})
+        .generate_moe(&llama.render_chat(prompt).expect("render chat"), n, |_| {})
         .expect("gpu moe generate")
 }
 

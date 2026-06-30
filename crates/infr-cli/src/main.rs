@@ -307,7 +307,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         let run_turn = |m: &str| -> anyhow::Result<()> {
             let mut render = ThinkRender::new();
             let stats = if let Some(model) = &dense {
-                let prompt = model.render_chat(m);
+                let prompt = model.render_chat(m)?;
                 model.generate_cpu(&prompt, max_new, |p| render.feed(p))?
             } else {
                 let prompt = infr_llama::qwen35::render_chat(&gguf, m)?;
@@ -395,7 +395,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             anyhow::bail!("qwen3moe currently supports one-shot only: pass a message");
         };
         eprintln!("[qwen3moe — eager MoE forward: GPU matmuls + GPU KV cache + CPU router/top-k + auto-fit]");
-        let prompt = llama.render_chat(m);
+        let prompt = llama.render_chat(m)?;
         let t0 = std::time::Instant::now();
         let mut n = 0usize;
         let mut t_first: Option<std::time::Instant> = None;
@@ -494,7 +494,7 @@ impl infr_server::ChatGenerator for LlamaGenerator {
             .find(|m| m.role == "user")
             .map(|m| m.content.clone())
             .unwrap_or_default();
-        let prompt = self.llama.render_chat(&user);
+        let prompt = self.llama.render_chat(&user)?;
         self.llama.generate(&prompt, 256, |piece| {
             on_delta(infr_engine::Delta::Content(piece.to_string()));
         })?;

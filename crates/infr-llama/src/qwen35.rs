@@ -771,7 +771,12 @@ pub fn render_chat(path: &std::path::Path, user: &str) -> Result<String> {
     let g = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
     let tok = crate::build_tokenizer(&g)?;
     let eos = g.metadata().u64("tokenizer.ggml.eos_token_id").unwrap_or(2) as u32;
-    Ok(infr_chat::render_chat_user(&g, &tok, eos, user).unwrap_or_else(|| infr_chat::chatml(user)))
+    infr_chat::render_chat_user(&g, &tok, eos, user).ok_or_else(|| {
+        anyhow!(
+            "model GGUF has no usable chat template (no `tokenizer.chat_template`, or it failed to \
+             render — set INFR_DEBUG_CHAT=1 for details)."
+        )
+    })
 }
 
 /// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). `prompt` is
@@ -1411,10 +1416,15 @@ pub fn generate_chat(
         .u64("tokenizer.ggml.eos_token_id")
         .map(|x| x as u32);
     let im_end = tok.token_to_id("<|im_end|>");
-    // Render through the model's OWN jinja chat template (Qwen3.5's controls thinking — the hardcoded
-    // ChatML below is only a fallback for templateless GGUFs). Mirrors the CPU path (`render_chat`).
-    let prompt = infr_chat::render_chat_user(&g, &tok, eos.unwrap_or(2), message)
-        .unwrap_or_else(|| infr_chat::chatml(message));
+    // Render through the model's OWN jinja chat template (Qwen3.5's controls thinking). No ChatML
+    // fallback — a GGUF without a template is a hard error. Mirrors the CPU path (`render_chat`).
+    let prompt =
+        infr_chat::render_chat_user(&g, &tok, eos.unwrap_or(2), message).ok_or_else(|| {
+            anyhow!(
+            "model GGUF has no usable chat template (no `tokenizer.chat_template`, or it failed to \
+             render — set INFR_DEBUG_CHAT=1 for details)."
+        )
+        })?;
     let enc = tok
         .encode(prompt, false)
         .map_err(|e| anyhow!("encode: {e}"))?;

@@ -92,9 +92,3 @@ pub fn render_chat_user(
 ) -> Option<String> {
     render_chat_jinja(gguf, tokenizer, eos, &[("user", user)], true)
 }
-
-/// Templateless fallback: wrap one user turn in ChatML markers. Used when a GGUF has no embedded
-/// `tokenizer.chat_template`.
-pub fn chatml(user: &str) -> String {
-    format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
-}

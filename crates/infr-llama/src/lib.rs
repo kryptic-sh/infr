@@ -12,7 +12,7 @@ pub mod cpu_backend;
 pub mod qwen35;
 
 use anyhow::{anyhow, bail, Context, Result};
-use infr_chat::{chatml, render_chat_jinja, render_chat_user};
+use infr_chat::{render_chat_jinja, render_chat_user};
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::loader::MetaValue;
 use infr_core::{Backend, WeightSource};
@@ -411,9 +411,18 @@ fn stream_token(
     }
 }
 
-// Chat-template rendering (`render_chat_jinja`, `render_chat_user`, `chatml`) lives in the shared
-// `infr-chat` crate — imported at the top of this module. The per-arch `turn_tokens` fallback below
-// stays here because it needs `Config` + the injection-safe user tokenizer.
+// Chat-template rendering (`render_chat_jinja`, `render_chat_user`) lives in the shared `infr-chat`
+// crate — imported at the top of this module. There is NO fabricated-ChatML fallback: infr supports
+// only models that ship a `tokenizer.chat_template`, so a missing/broken template is a hard error.
+
+/// The error surfaced when a GGUF has no usable chat template (none embedded, or it failed to render).
+fn no_template_err() -> anyhow::Error {
+    anyhow!(
+        "model GGUF has no usable chat template (no `tokenizer.chat_template`, or it failed to \
+         render — set INFR_DEBUG_CHAT=1 for details). infr requires an instruct model with an \
+         embedded chat template."
+    )
+}
 
 /// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
 /// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
@@ -467,16 +476,12 @@ impl CpuModel {
         &self.cfg
     }
 
-    /// Wrap a user message in the ChatML turn markers (matches [`Llama::chatml`]).
-    pub fn chatml(&self, user: &str) -> String {
-        chatml(user)
-    }
-
     /// Render a user turn with the model's OWN embedded chat template (so an instruct model — Gemma,
-    /// Qwen, … — answers coherently), falling back to ChatML if the GGUF has no template.
-    pub fn render_chat(&self, user: &str) -> String {
+    /// Qwen, … — answers coherently). Errors if the GGUF has no `tokenizer.chat_template` or it fails
+    /// to render — infr only supports models that ship one (no fabricated-ChatML fallback).
+    pub fn render_chat(&self, user: &str) -> Result<String> {
         render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user)
-            .unwrap_or_else(|| self.chatml(user))
+            .ok_or_else(no_template_err)
     }
 
     /// Greedy generation on the CPU reference backend (no GPU). Returns the decoded text plus
@@ -843,10 +848,6 @@ pub struct Llama {
     per_layer_embd: Option<PerLayerEmbd>,
     layers: Vec<LayerWeights>,
     tokenizer: Tokenizer,
-    /// Same vocab as `tokenizer` but with `encode_special_tokens(true)` → special-token strings in
-    /// the input encode as literal text. Used for USER content so a user typing `<|im_end|>` etc.
-    /// can't inject turn structure.
-    user_tokenizer: Tokenizer,
     sampler: std::cell::Cell<Sampler>,
     /// MoE: `INFR_MOE_STREAM` makes host-offloaded (`INFR_NCMOE`) layers stream their active experts
     /// into a VRAM pool + GPU-compute instead of CPU matvec.
@@ -2737,10 +2738,6 @@ impl Llama {
             Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,
             None => build_tokenizer(&g)?,
         };
-        // A variant that encodes special-token strings as literal text, for untrusted user content.
-        let mut user_tokenizer = tokenizer.clone();
-        user_tokenizer.set_encode_special_tokens(true);
-
         // Stop on the GGUF eos plus any chat-end markers in the vocab — a chat model can emit
         // <|endoftext|> mid-turn, and stopping only on <|im_end|> lets it ramble past the answer.
         add_chat_eos(&mut cfg, &tokenizer);
@@ -2756,7 +2753,6 @@ impl Llama {
             per_layer_embd,
             layers,
             tokenizer,
-            user_tokenizer,
             sampler: std::cell::Cell::new(Sampler::default()),
             moe_stream,
             gguf: g,
@@ -2815,60 +2811,10 @@ impl Llama {
         Ok(())
     }
 
-    /// Encode one chat turn: ChatML markers as real special tokens, USER content as literal text
-    /// (so a user typing `<|im_end|>`/`<think>`/etc. can't inject or break the turn structure).
-    /// `started` closes the previous assistant turn first.
-    fn turn_tokens(&self, user: &str, started: bool) -> Result<Vec<u32>> {
-        // gemma4 turns use <|turn>role / <turn|> markers (eos = <turn|>); gemma3 uses
-        // <start_of_turn>/<end_of_turn>; everyone else ChatML. All gemmas lead with <bos>.
-        let (pre, post) = if self.cfg.gemma4 {
-            (
-                if started {
-                    "<turn|>\n<|turn>user\n"
-                } else {
-                    "<bos><|turn>user\n"
-                },
-                "<turn|>\n<|turn>model\n",
-            )
-        } else if self.cfg.gemma {
-            (
-                if started {
-                    "<end_of_turn>\n<start_of_turn>user\n"
-                } else {
-                    "<bos><start_of_turn>user\n"
-                },
-                "<end_of_turn>\n<start_of_turn>model\n",
-            )
-        } else if started {
-            (
-                "<|im_end|>\n<|im_start|>user\n",
-                "<|im_end|>\n<|im_start|>assistant\n",
-            )
-        } else {
-            ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n")
-        };
-        let enc = |t: &Tokenizer, s: &str| -> Result<Vec<u32>> {
-            t.encode(s, false)
-                .map(|e| e.get_ids().to_vec())
-                .map_err(|e| anyhow!("encode: {e}"))
-        };
-        let mut ids = enc(&self.tokenizer, pre)?;
-        ids.extend(enc(&self.user_tokenizer, user)?);
-        ids.extend(enc(&self.tokenizer, post)?);
-        if std::env::var("INFR_DEBUG_TOKENS").is_ok() {
-            let dump: Vec<(u32, String)> = ids
-                .iter()
-                .map(|&id| (id, self.tokenizer.id_to_token(id).unwrap_or_default()))
-                .collect();
-            eprintln!("[tokens] {dump:?}");
-        }
-        Ok(ids)
-    }
-
     /// Render a conversation with the model's OWN embedded chat template (`tokenizer.chat_template`,
     /// a Jinja2 string) via minijinja — the source of truth for turn markers, system handling, etc.
-    /// Returns `None` if the GGUF has no template or it fails to render, so the caller can fall back
-    /// to the hardcoded [`turn_tokens`]. `messages` are `(role, content)`; `bos_token`/`eos_token`
+    /// Returns `None` if the GGUF has no template or it fails to render (the caller errors — there is
+    /// no hardcoded fallback). `messages` are `(role, content)`; `bos_token`/`eos_token`
     /// come from the GGUF special-token ids.
     fn render_chat_messages(
         &self,
@@ -4263,11 +4209,11 @@ impl Llama {
     }
 
     /// Render a user turn with the model's OWN embedded chat template (so an instruct model answers
-    /// coherently), falling back to ChatML if the GGUF has no template. Mirrors
+    /// coherently). Errors if the GGUF has no `tokenizer.chat_template` or it fails to render. Mirrors
     /// [`CpuModel::render_chat`] so the GPU and CPU golden tests feed identical token streams.
-    pub fn render_chat(&self, user: &str) -> String {
+    pub fn render_chat(&self, user: &str) -> Result<String> {
         render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user)
-            .unwrap_or_else(|| chatml(user))
+            .ok_or_else(no_template_err)
     }
 
     /// Greedy generate up to `max_new` tokens after `prompt` (already a chat-formatted string).
@@ -5988,11 +5934,6 @@ impl Llama {
             cached: Vec::new(),
         })
     }
-
-    /// Wrap a user message in the SmolLM2 ChatML template.
-    pub fn chatml(&self, user: &str) -> String {
-        chatml(user)
-    }
 }
 
 /// A stateful multi-turn chat over a persistent KV cache (so the model sees prior turns). Create via
@@ -6045,9 +5986,8 @@ impl ChatSession<'_> {
             .map(|(r, c)| (r.as_str(), c.as_str()))
             .collect();
         let Some(rendered) = self.llama.render_chat_messages(&refs, true) else {
-            // No embedded template → hardcoded fallback (no history / prefix-diff).
             self.messages.pop();
-            return self.turn_hardcoded(user, max_new, on_token);
+            return Err(no_template_err());
         };
         let ids = self.llama.encode_special(&rendered)?;
         if std::env::var("INFR_DEBUG_TOKENS").is_ok() {
@@ -6094,48 +6034,6 @@ impl ChatSession<'_> {
         };
         let answer_text = tk.decode(answer, true).unwrap_or_default();
         self.messages.push(("assistant".into(), answer_text));
-        tk.decode(&generated, true)
-            .map_err(|e| anyhow!("decode: {e}"))
-    }
-
-    /// Hardcoded-template turn (GGUF lacks an embedded chat template). Mirrors the historical path:
-    /// per-arch markers via [`turn_tokens`], with prior-turn think dropped from the cache.
-    fn turn_hardcoded(
-        &mut self,
-        user: &str,
-        max_new: usize,
-        on_token: impl FnMut(&str),
-    ) -> Result<String> {
-        let toks = self.llama.turn_tokens(user, self.started)?;
-        self.last_prompt_tokens = toks.len();
-        let room = self.kv.max_ctx.saturating_sub(self.kv.len + toks.len() + 1);
-        if room == 0 {
-            bail!(
-                "context full: {} held + {} prompt = {} cap — start a new session",
-                self.kv.len,
-                toks.len(),
-                self.kv.max_ctx
-            );
-        }
-        let max_new = max_new.min(room);
-        self.started = true;
-        let logits = self.llama.prefill(&toks, &mut self.kv)?;
-        let answer_start = self.kv.len;
-        let generated = self
-            .llama
-            .decode_loop(logits, &mut self.kv, max_new, on_token)?;
-        let tk = &self.llama.tokenizer;
-        let close = tk.token_to_id("</think>");
-        let open = tk.token_to_id("<think>");
-        let answer: Vec<u32> = match close.and_then(|c| generated.iter().rposition(|&t| t == c)) {
-            Some(pos) => generated[pos + 1..].to_vec(),
-            None if open.is_some_and(|o| generated.contains(&o)) => Vec::new(),
-            None => generated.clone(),
-        };
-        self.kv.len = answer_start;
-        if !answer.is_empty() {
-            self.llama.prefill(&answer, &mut self.kv)?;
-        }
         tk.decode(&generated, true)
             .map_err(|e| anyhow!("decode: {e}"))
     }

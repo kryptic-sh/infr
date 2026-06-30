@@ -116,6 +116,24 @@ pub enum Op {
         theta: f32,
         freq_factors: Option<TensorId>,
     },
+    /// Fused per-head RMSNorm + NEOX RoPE — `QkNorm` immediately followed by `Rope` on the same
+    /// tensor (the common qwen3/gemma q/k case). One pass: each head is rmsnormed (`× weight`) then
+    /// its first `rope_dim` rotated, dims beyond `rope_dim` passing through normed. Maps 1:1 to the
+    /// GPU's fused `qk_norm_rope` kernel; the CPU runs it as a single loop. Use the standalone
+    /// `QkNorm` (gemma4 weightless V-norm, no RoPE) or `Rope` (llama, no q/k-norm) when not both.
+    QkNormRope {
+        x: TensorId,
+        weight: TensorId,
+        positions: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        theta: f32,
+        eps: f32,
+        freq_factors: Option<TensorId>,
+    },
     /// Append `src` (`rows × row_stride`) into the persistent KV `cache` starting at row `pos`,
     /// casting to the cache dtype (typically f16). Stateful write — order matters.
     WriteKv {

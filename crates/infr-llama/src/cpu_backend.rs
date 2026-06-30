@@ -545,6 +545,60 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                Op::QkNormRope {
+                    x,
+                    weight: w,
+                    positions,
+                    dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                    rope_dim,
+                    theta,
+                    eps,
+                    freq_factors,
+                } => {
+                    // Fused QkNorm + Rope: one pass per head — rmsnorm (× weight), then rotate the
+                    // first `rope_dim` in place (dims beyond pass through normed). Output-identical to
+                    // the separate QkNorm→Rope pair; maps 1:1 to the GPU `qk_norm_rope` kernel.
+                    let (rows, nh, hd, rd) = (
+                        rows as usize,
+                        n_head as usize,
+                        head_dim as usize,
+                        rope_dim as usize,
+                    );
+                    let xs = vals[x.0 as usize].clone();
+                    let ws = weight(w);
+                    let pos = vals[positions.0 as usize].clone();
+                    let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
+                    let mut out = vec![0f32; rows * nh * hd];
+                    let hf = rd / 2;
+                    for r in 0..rows {
+                        let p0 = pos[r];
+                        for h in 0..nh {
+                            let b = (r * nh + h) * hd;
+                            let ss: f32 =
+                                (0..hd).map(|i| xs[b + i] * xs[b + i]).sum::<f32>() / hd as f32;
+                            let s = 1.0 / (ss + eps).sqrt();
+                            for i in 0..hd {
+                                out[b + i] = xs[b + i] * s * ws[i];
+                            }
+                            for p in 0..hf {
+                                let (i0, i1) = (p, p + hf);
+                                let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
+                                if let Some(ff) = &ff {
+                                    ang /= ff[p];
+                                }
+                                let (sn, c) = (ang.sin(), ang.cos());
+                                let a = out[b + i0];
+                                let bb = out[b + i1];
+                                out[b + i0] = a * c - bb * sn;
+                                out[b + i1] = a * sn + bb * c;
+                            }
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
                 Op::WriteKv {
                     src,
                     cache,
@@ -1383,28 +1437,33 @@ pub(crate) fn generate_dense_cpu(
                         n: kvrow as u32,
                     }),
                 }
-                if let Some(kn) = lw.k_norm {
-                    g.push(Op::QkNorm {
+                // K: fused QkNorm+RoPE when the model has K-norm (qwen3/gemma), else RoPE alone (llama).
+                match lw.k_norm {
+                    Some(kn) => g.push(Op::QkNormRope {
                         x: k,
                         weight: kn,
+                        positions,
                         dst: k,
                         rows: 1,
                         n_head: nkv as u32,
                         head_dim: hd as u32,
+                        rope_dim: rope_dim as u32,
+                        theta,
                         eps,
-                    });
+                        freq_factors: layer_ff,
+                    }),
+                    None => g.push(Op::Rope {
+                        x: k,
+                        positions,
+                        dst: k,
+                        rows: 1,
+                        n_head: nkv as u32,
+                        head_dim: hd as u32,
+                        rope_dim: rope_dim as u32,
+                        theta,
+                        freq_factors: layer_ff,
+                    }),
                 }
-                g.push(Op::Rope {
-                    x: k,
-                    positions,
-                    dst: k,
-                    rows: 1,
-                    n_head: nkv as u32,
-                    head_dim: hd as u32,
-                    rope_dim: rope_dim as u32,
-                    theta,
-                    freq_factors: layer_ff,
-                });
                 // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching.
                 if let Some(ones) = v_ones {
                     g.push(Op::QkNorm {
@@ -1432,29 +1491,33 @@ pub(crate) fn generate_dense_cpu(
                     pos: pos as u32,
                 });
             }
-            // Q QK-norm + RoPE (always).
-            if let Some(qn) = lw.q_norm {
-                g.push(Op::QkNorm {
+            // Q: fused QkNorm+RoPE when the model has Q-norm (qwen3/gemma), else RoPE alone (llama).
+            match lw.q_norm {
+                Some(qn) => g.push(Op::QkNormRope {
                     x: q,
                     weight: qn,
+                    positions,
                     dst: q,
                     rows: 1,
                     n_head: nh as u32,
                     head_dim: hd as u32,
+                    rope_dim: rope_dim as u32,
+                    theta,
                     eps,
-                });
+                    freq_factors: layer_ff,
+                }),
+                None => g.push(Op::Rope {
+                    x: q,
+                    positions,
+                    dst: q,
+                    rows: 1,
+                    n_head: nh as u32,
+                    head_dim: hd as u32,
+                    rope_dim: rope_dim as u32,
+                    theta,
+                    freq_factors: layer_ff,
+                }),
             }
-            g.push(Op::Rope {
-                x: q,
-                positions,
-                dst: q,
-                rows: 1,
-                n_head: nh as u32,
-                head_dim: hd as u32,
-                rope_dim: rope_dim as u32,
-                theta,
-                freq_factors: layer_ff,
-            });
             g.push(Op::Attention {
                 q,
                 k_cache: k_cache[kv_src],

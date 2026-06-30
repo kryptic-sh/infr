@@ -1577,27 +1577,10 @@ pub fn generate_cpu(
                     }
                     lin(&mut gr, xn, w.k, ka, ne, nkv * hd);
                     lin(&mut gr, xn, w.v, va, ne, nkv * hd);
-                    // per-head q/k norm then RoPE
-                    gr.push(Op::QkNorm {
+                    // per-head q/k norm + RoPE — fused (qwen35 always has q/k-norm).
+                    gr.push(Op::QkNormRope {
                         x: qa,
                         weight: w.q_norm,
-                        dst: qa,
-                        rows: 1,
-                        n_head: nh as u32,
-                        head_dim: hd as u32,
-                        eps,
-                    });
-                    gr.push(Op::QkNorm {
-                        x: ka,
-                        weight: w.k_norm,
-                        dst: ka,
-                        rows: 1,
-                        n_head: nkv as u32,
-                        head_dim: hd as u32,
-                        eps,
-                    });
-                    gr.push(Op::Rope {
-                        x: qa,
                         positions,
                         dst: qa,
                         rows: 1,
@@ -1605,10 +1588,12 @@ pub fn generate_cpu(
                         head_dim: hd as u32,
                         rope_dim: c.rope_dim as u32,
                         theta: c.rope_theta,
+                        eps,
                         freq_factors: None,
                     });
-                    gr.push(Op::Rope {
+                    gr.push(Op::QkNormRope {
                         x: ka,
+                        weight: w.k_norm,
                         positions,
                         dst: ka,
                         rows: 1,
@@ -1616,6 +1601,7 @@ pub fn generate_cpu(
                         head_dim: hd as u32,
                         rope_dim: c.rope_dim as u32,
                         theta: c.rope_theta,
+                        eps,
                         freq_factors: None,
                     });
                     gr.push(Op::WriteKv {

@@ -214,6 +214,15 @@ struct LinearGpuW {
     a: Box<dyn Buffer>,
     dt_bias: Box<dyn Buffer>,
     ssm_norm: Box<dyn Buffer>,
+    post_norm: Box<dyn Buffer>,
+}
+
+/// GPU-resident norm weights for one attention layer (`Some` when a backend is present).
+struct AttnGpuW {
+    attn_norm: Box<dyn Buffer>,
+    q_norm: Box<dyn Buffer>,
+    k_norm: Box<dyn Buffer>,
+    post_norm: Box<dyn Buffer>,
 }
 
 /// A full-attention layer's weights. Projections are [`Lin`]; q/k norms stay CPU (per-head, hd=256).
@@ -230,6 +239,8 @@ struct AttnLayer {
     ffn_up: Lin,
     ffn_down: Lin,
     n_ff: usize,
+    /// GPU copies of the attention norm weights (`Some` when a backend is present).
+    gpu: Option<AttnGpuW>,
 }
 
 enum Layer {
@@ -237,13 +248,14 @@ enum Layer {
     Attn(AttnLayer),
 }
 
-/// Full model weights. Linear projections live on the GPU (f16) unless `Q35_CPU=1`; the SSM /
-/// attention math stays on the CPU either way (see module docs).
+/// Full model weights. With a backend the forward runs fully on the GPU; `Q35_CPU=1` forces the
+/// pure-CPU oracle (host `Vec<f32>` weights, no Vulkan).
 pub struct Model {
     pub cfg: Cfg,
     token_embd: Vec<f32>, // [vocab, n_embd] host (embedding gather)
     output_norm: Vec<f32>,
-    lm_head: Lin, // [vocab, n_embd]
+    output_norm_buf: Option<Box<dyn Buffer>>, // GPU copy for the final norm
+    lm_head: Lin,                             // [vocab, n_embd]
     layers: Vec<Layer>,
     be: Option<VulkanBackend>,
 }
@@ -331,19 +343,36 @@ impl Model {
                 .context("ffn_up")?;
             let n_ff = ffn_up_shape[1];
             if cfg.is_attn_layer(i) {
+                let attn_norm = get("attn_norm.weight")?;
+                let q_norm = get("attn_q_norm.weight")?;
+                let k_norm = get("attn_k_norm.weight")?;
+                let post_norm = get("post_attention_norm.weight")?;
+                let gpu = be
+                    .as_ref()
+                    .map(|be| -> Result<AttnGpuW> {
+                        let f32b = |v: &[f32]| be.upload_weight(v).map_err(|e| anyhow!("{e}"));
+                        Ok(AttnGpuW {
+                            attn_norm: f32b(&attn_norm)?,
+                            q_norm: f32b(&q_norm)?,
+                            k_norm: f32b(&k_norm)?,
+                            post_norm: f32b(&post_norm)?,
+                        })
+                    })
+                    .transpose()?;
                 layers.push(Layer::Attn(AttnLayer {
-                    attn_norm: get("attn_norm.weight")?,
+                    attn_norm,
                     q: glin("attn_q.weight")?,
                     k: glin("attn_k.weight")?,
                     v: glin("attn_v.weight")?,
-                    q_norm: get("attn_q_norm.weight")?,
-                    k_norm: get("attn_k_norm.weight")?,
+                    q_norm,
+                    k_norm,
                     out: glin("attn_output.weight")?,
-                    post_norm: get("post_attention_norm.weight")?,
+                    post_norm,
                     ffn_gate: glin("ffn_gate.weight")?,
                     ffn_up: glin("ffn_up.weight")?,
                     ffn_down: glin("ffn_down.weight")?,
                     n_ff,
+                    gpu,
                 }));
             } else {
                 let attn_norm = get("attn_norm.weight")?;
@@ -353,6 +382,7 @@ impl Model {
                 let a = get("ssm_a")?;
                 let dt_bias = get("ssm_dt.bias")?;
                 let ssm_norm = get("ssm_norm.weight")?;
+                let post_norm = get("post_attention_norm.weight")?;
                 // Upload the non-Lin SSM/norm weights to GPU for the resident forward (norms/conv1d/
                 // gates as f32; alpha/beta as f16 GEMV weights). `None` for the Q35_CPU oracle.
                 let gpu = be
@@ -368,6 +398,7 @@ impl Model {
                             a: f32b(&a)?,
                             dt_bias: f32b(&dt_bias)?,
                             ssm_norm: f32b(&ssm_norm)?,
+                            post_norm: f32b(&post_norm)?,
                         })
                     })
                     .transpose()?;
@@ -382,7 +413,7 @@ impl Model {
                     dt_bias,
                     ssm_norm,
                     out: glin("ssm_out.weight")?,
-                    post_norm: get("post_attention_norm.weight")?,
+                    post_norm,
                     ffn_gate: glin("ffn_gate.weight")?,
                     ffn_up: glin("ffn_up.weight")?,
                     ffn_down: glin("ffn_down.weight")?,
@@ -391,10 +422,15 @@ impl Model {
                 }));
             }
         }
+        let output_norm_buf = be
+            .as_ref()
+            .map(|be| be.upload_weight(&output_norm).map_err(|e| anyhow!("{e}")))
+            .transpose()?;
         Ok(Model {
             cfg,
             token_embd,
             output_norm,
+            output_norm_buf,
             lm_head,
             layers,
             be,
@@ -571,86 +607,94 @@ impl Model {
         down.mul(be, &act, n_ff, ne)
     }
 
-    /// Gated DeltaNet linear-attention mixer (one token).
-    /// GPU causal conv1d+SiLU for one token: upload qkv + the rolling history, run, return `conv_out`
-    /// and write the updated history back into `conv`.
-    fn gpu_conv(
+    /// Fully-GPU gated-DeltaNet mixer for one token: the ENTIRE mixer (rmsnorm → qkv/gate GEMV →
+    /// conv1d+SiLU → beta/alpha gate GEMVs → DeltaNet recurrence → silu-gated rmsnorm → out GEMV)
+    /// recorded into ONE command buffer — no CPU math. hidden + the conv/S state round-trip the host
+    /// (perf: a resident forward keeps them on-device); returns the mixer output `[ne]`.
+    fn linear_mixer_gpu(
         &self,
-        be: &VulkanBackend,
+        w: &LinearLayer,
         gpu: &LinearGpuW,
-        qkv: &[f32],
+        be: &VulkanBackend,
+        hidden: &[f32],
         conv: &mut [f32],
-    ) -> Vec<f32> {
-        let cc = self.cfg.conv_channels();
-        let kconv = self.cfg.d_conv;
-        let xb = dev(be, qkv);
-        let sb = dev(be, conv);
-        let ob = be
-            .alloc(cc * 4, BufferUsage::Activations)
-            .expect("alloc conv_out");
-        let rec = be.recorder().expect("recorder");
-        rec.conv1d_silu(
-            xb.as_ref(),
-            gpu.conv1d.as_ref(),
-            sb.as_ref(),
-            ob.as_ref(),
-            cc,
-            kconv,
-        );
-        rec.finish().expect("finish");
-        conv.copy_from_slice(&read(be, sb.as_ref(), conv.len()));
-        read(be, ob.as_ref(), cc)
-    }
-
-    /// GPU gated-DeltaNet recurrence for one token: upload q/k/v + the per-head gate logits + the
-    /// state, run, return `out [nv*vd]` and write the updated state back into `s`.
-    #[allow(clippy::too_many_arguments)]
-    fn gpu_deltanet(
-        &self,
-        be: &VulkanBackend,
-        gpu: &LinearGpuW,
-        q_all: &[f32],
-        k_all: &[f32],
-        v_all: &[f32],
-        blog: &[f32],
-        alpha: &[f32],
         s: &mut [f32],
     ) -> Vec<f32> {
         let c = &self.cfg;
-        let (nv, nk, kd, vd) = (
-            c.num_v_heads(),
-            c.num_k_heads(),
+        let (ne, kd, vd, cc, di) = (
+            c.n_embd,
             c.head_k_dim(),
             c.head_v_dim(),
+            c.conv_channels(),
+            c.d_inner,
         );
-        let (qb, kb, vb) = (dev(be, q_all), dev(be, k_all), dev(be, v_all));
-        let (bb, ab) = (dev(be, blog), dev(be, alpha));
+        let (nk, nv) = (c.num_k_heads(), c.num_v_heads());
+        let (kconv, eps) = (c.d_conv, c.eps);
+        let hb = dev(be, hidden);
+        let convb = dev(be, conv);
         let sb = dev(be, s);
-        let ob = be
-            .alloc(nv * vd * 4, BufferUsage::Activations)
-            .expect("alloc dn_out");
-        let rec = be.recorder().expect("recorder");
-        rec.deltanet(
-            qb.as_ref(),
-            kb.as_ref(),
-            vb.as_ref(),
-            bb.as_ref(),
-            ab.as_ref(),
-            gpu.a.as_ref(),
-            gpu.dt_bias.as_ref(),
-            sb.as_ref(),
-            ob.as_ref(),
-            nv,
-            nk,
-            kd,
-            vd,
-            1e-6,
-        );
-        rec.finish().expect("finish");
+        let al = |n: usize| {
+            be.alloc((n * 4).max(4), BufferUsage::Activations)
+                .expect("alloc scratch")
+        };
+        let (xn, qkv, z, conv_out) = (al(ne), al(cc), al(di), al(cc));
+        let (bg, ag) = (al(nv), al(nv));
+        let (qd, kdd, vdd) = (al(nk * kd), al(nk * kd), al(nv * vd));
+        let (dn, nm, gated, out) = (al(nv * vd), al(nv * vd), al(di), al(ne));
+        {
+            let rec = be.recorder().expect("recorder");
+            rec.rmsnorm(hb.as_ref(), gpu.attn_norm.as_ref(), xn.as_ref(), 1, ne, eps);
+            w.qkv.record(&rec, xn.as_ref(), qkv.as_ref(), ne, cc);
+            w.gate.record(&rec, xn.as_ref(), z.as_ref(), ne, di);
+            rec.conv1d_silu(
+                qkv.as_ref(),
+                gpu.conv1d.as_ref(),
+                convb.as_ref(),
+                conv_out.as_ref(),
+                cc,
+                kconv,
+            );
+            rec.linear(gpu.beta.as_ref(), xn.as_ref(), bg.as_ref(), 1, ne, nv);
+            rec.linear(gpu.alpha.as_ref(), xn.as_ref(), ag.as_ref(), 1, ne, nv);
+            // split conv_out [q | k | v] into the deltanet inputs.
+            rec.copy(conv_out.as_ref(), 0, qd.as_ref(), 0, nk * kd * 4);
+            rec.copy(conv_out.as_ref(), nk * kd * 4, kdd.as_ref(), 0, nk * kd * 4);
+            rec.copy(
+                conv_out.as_ref(),
+                2 * nk * kd * 4,
+                vdd.as_ref(),
+                0,
+                nv * vd * 4,
+            );
+            rec.deltanet(
+                qd.as_ref(),
+                kdd.as_ref(),
+                vdd.as_ref(),
+                bg.as_ref(),
+                ag.as_ref(),
+                gpu.a.as_ref(),
+                gpu.dt_bias.as_ref(),
+                sb.as_ref(),
+                dn.as_ref(),
+                nv,
+                nk,
+                kd,
+                vd,
+                1e-6,
+            );
+            // silu-gated rmsnorm per v-head: rmsnorm(dn, ssm_norm) * silu(z).
+            rec.rmsnorm(dn.as_ref(), gpu.ssm_norm.as_ref(), nm.as_ref(), nv, vd, eps);
+            rec.silu_mul(z.as_ref(), nm.as_ref(), gated.as_ref(), di);
+            w.out.record(&rec, gated.as_ref(), out.as_ref(), di, ne);
+            rec.finish().expect("finish");
+        }
+        conv.copy_from_slice(&read(be, convb.as_ref(), conv.len()));
         s.copy_from_slice(&read(be, sb.as_ref(), s.len()));
-        read(be, ob.as_ref(), nv * vd)
+        read(be, out.as_ref(), ne)
     }
 
+    /// Gated-DeltaNet mixer (one token). Fully on the GPU when a backend is present; the CPU
+    /// reference (`Q35_CPU=1` oracle) otherwise.
     fn linear_mixer(
         &self,
         w: &LinearLayer,
@@ -658,108 +702,83 @@ impl Model {
         conv: &mut [f32],
         s: &mut [f32],
     ) -> Vec<f32> {
+        if let (Some(be), Some(gpu)) = (self.be.as_ref(), w.gpu.as_ref()) {
+            return self.linear_mixer_gpu(w, gpu, be, hidden, conv, s);
+        }
+        // ── CPU reference (oracle) ──────────────────────────────────────────────
         let c = &self.cfg;
         let (ne, kd, vd) = (c.n_embd, c.head_k_dim(), c.head_v_dim());
         let (nk, nv) = (c.num_k_heads(), c.num_v_heads());
         let cc = c.conv_channels();
-        let be = self.be.as_ref();
         let xn = rmsnorm(hidden, &w.attn_norm, c.eps);
-        let qkv = w.qkv.mul(be, &xn, ne, cc); // [6144]  GPU
-        let z = w.gate.mul(be, &xn, ne, c.d_inner); // [2048]  GPU
-
-        // causal depthwise conv + SiLU over the cc channels — on the GPU when a backend is present,
-        // else the CPU reference. `out[ch] = silu(Σ_k tap_k[ch]·weight[ch*d_conv+k])`, taps oldest→
-        // newest (window = [conv history.., current]), then shift history (drop oldest, append qkv).
-        let conv_out = match (be, w.gpu.as_ref()) {
-            (Some(be), Some(gpu)) => self.gpu_conv(be, gpu, &qkv, conv),
-            _ => {
-                let k_conv = c.d_conv;
-                let mut conv_out = vec![0.0f32; cc];
-                for ch in 0..cc {
-                    let mut acc = 0.0;
-                    for k in 0..k_conv - 1 {
-                        acc += conv[k * cc + ch] * w.conv1d[ch * k_conv + k];
-                    }
-                    acc += qkv[ch] * w.conv1d[ch * k_conv + (k_conv - 1)];
-                    conv_out[ch] = silu(acc);
-                }
-                for k in 0..k_conv - 2 {
-                    for ch in 0..cc {
-                        conv[k * cc + ch] = conv[(k + 1) * cc + ch];
-                    }
-                }
-                for ch in 0..cc {
-                    conv[(k_conv - 2) * cc + ch] = qkv[ch];
-                }
-                conv_out
+        let qkv = w.qkv.mul(None, &xn, ne, cc);
+        let z = w.gate.mul(None, &xn, ne, c.d_inner);
+        let k_conv = c.d_conv;
+        let mut conv_out = vec![0.0f32; cc];
+        for ch in 0..cc {
+            let mut acc = 0.0;
+            for k in 0..k_conv - 1 {
+                acc += conv[k * cc + ch] * w.conv1d[ch * k_conv + k];
             }
-        };
-
-        // split conv_out → q,k,v
+            acc += qkv[ch] * w.conv1d[ch * k_conv + (k_conv - 1)];
+            conv_out[ch] = silu(acc);
+        }
+        for k in 0..k_conv - 2 {
+            for ch in 0..cc {
+                conv[k * cc + ch] = conv[(k + 1) * cc + ch];
+            }
+        }
+        for ch in 0..cc {
+            conv[(k_conv - 2) * cc + ch] = qkv[ch];
+        }
         let key_dim = nk * kd;
         let (q_all, rest) = conv_out.split_at(key_dim);
         let (k_all, v_all) = rest.split_at(key_dim);
-
-        // beta / decay gates (per v-head)
         let b = matvec(&w.beta, ne, nv, &xn);
         let a = matvec(&w.alpha, ne, nv, &xn);
-
-        // Gated-DeltaNet recurrence — GPU kernel when a backend is present, else the CPU reference.
-        // GQA: the `nk` q/k heads are TILED to `nv` value heads (value head `h` uses q/k head `h % nk`,
-        // identity when nv==nk). Per head: l2norm q,k; q*=1/√kd; beta=sigmoid(b); decay=exp(a·softplus(
-        // alpha+dt_bias)); S*=decay; kv=kᵀS; delta=(v−kv)·beta; S+=k⊗delta; out=qᵀS.
-        let mut out = match (be, w.gpu.as_ref()) {
-            (Some(be), Some(gpu)) => self.gpu_deltanet(be, gpu, q_all, k_all, v_all, &b, &a, s),
-            _ => {
-                let mut out = vec![0.0f32; nv * vd];
-                let qscale = 1.0 / (kd as f32).sqrt();
-                for h in 0..nv {
-                    let kh_idx = h % nk;
-                    let mut qh = q_all[kh_idx * kd..kh_idx * kd + kd].to_vec();
-                    let mut kh = k_all[kh_idx * kd..kh_idx * kd + kd].to_vec();
-                    let vh = &v_all[h * vd..h * vd + vd];
-                    l2norm(&mut qh, 1e-6);
-                    l2norm(&mut kh, 1e-6);
-                    for x in qh.iter_mut() {
-                        *x *= qscale;
-                    }
-                    let beta = sigmoid(b[h]);
-                    let g = w.a[h] * softplus(a[h] + w.dt_bias[h]); // ≤ 0
-                    let decay = g.exp();
-                    let sh = &mut s[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
-                    for x in sh.iter_mut() {
-                        *x *= decay;
-                    }
-                    let mut kv = vec![0.0f32; vd];
-                    for kk in 0..kd {
-                        let kkv = kh[kk];
-                        let row = &sh[kk * vd..kk * vd + vd];
-                        for d in 0..vd {
-                            kv[d] += kkv * row[d];
-                        }
-                    }
-                    let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
-                    for kk in 0..kd {
-                        let kkv = kh[kk];
-                        let row = &mut sh[kk * vd..kk * vd + vd];
-                        for d in 0..vd {
-                            row[d] += kkv * delta[d];
-                        }
-                    }
-                    let oh = &mut out[h * vd..h * vd + vd];
-                    for kk in 0..kd {
-                        let qv = qh[kk];
-                        let row = &sh[kk * vd..kk * vd + vd];
-                        for d in 0..vd {
-                            oh[d] += qv * row[d];
-                        }
-                    }
-                }
-                out
+        let mut out = vec![0.0f32; nv * vd];
+        let qscale = 1.0 / (kd as f32).sqrt();
+        for h in 0..nv {
+            let kh_idx = h % nk;
+            let mut qh = q_all[kh_idx * kd..kh_idx * kd + kd].to_vec();
+            let mut kh = k_all[kh_idx * kd..kh_idx * kd + kd].to_vec();
+            let vh = &v_all[h * vd..h * vd + vd];
+            l2norm(&mut qh, 1e-6);
+            l2norm(&mut kh, 1e-6);
+            for x in qh.iter_mut() {
+                *x *= qscale;
             }
-        };
-
-        // silu-gated RMSNorm per v-head, gate = z
+            let beta = sigmoid(b[h]);
+            let decay = (w.a[h] * softplus(a[h] + w.dt_bias[h])).exp();
+            let sh = &mut s[h * kd * vd..(h + 1) * kd * vd];
+            for x in sh.iter_mut() {
+                *x *= decay;
+            }
+            let mut kv = vec![0.0f32; vd];
+            for kk in 0..kd {
+                let kkv = kh[kk];
+                let row = &sh[kk * vd..kk * vd + vd];
+                for d in 0..vd {
+                    kv[d] += kkv * row[d];
+                }
+            }
+            let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
+            for kk in 0..kd {
+                let kkv = kh[kk];
+                let row = &mut sh[kk * vd..kk * vd + vd];
+                for d in 0..vd {
+                    row[d] += kkv * delta[d];
+                }
+            }
+            let oh = &mut out[h * vd..h * vd + vd];
+            for kk in 0..kd {
+                let qv = qh[kk];
+                let row = &sh[kk * vd..kk * vd + vd];
+                for d in 0..vd {
+                    oh[d] += qv * row[d];
+                }
+            }
+        }
         for h in 0..nv {
             let oh = &mut out[h * vd..h * vd + vd];
             let n = rmsnorm(oh, &w.ssm_norm, c.eps);
@@ -768,7 +787,7 @@ impl Model {
                 oh[d] = n[d] * silu(zh[d]);
             }
         }
-        w.out.mul(be, &out, c.d_inner, ne) // GPU
+        w.out.mul(None, &out, c.d_inner, ne)
     }
 
     /// Gated full attention (one token), GQA, head_dim 256, partial sectioned RoPE, sigmoid out-gate.

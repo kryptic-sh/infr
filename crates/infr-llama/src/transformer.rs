@@ -4018,6 +4018,118 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
+struct CacheSlot {
+    kv: Option<KvCache>,
+    cached: Vec<u32>,
+    lru: u64,
+}
+
+/// Multi-slot prefix cache for `infr serve`: up to `max_slots` persistent KV caches so
+/// concurrent / interleaved conversations don't thrash a single cache. Each request is routed to
+/// the slot it CONTINUES (that slot's whole cached sequence is a prefix of the request, within a
+/// small slack for reply re-tokenization); a genuinely new conversation takes a free slot, or evicts
+/// the least-recently-used one. Slots are allocated lazily (a single client only ever uses one, so
+/// VRAM is unchanged for that case). `INFR_KV_SLOTS` sets the slot count (default 4); the per-slot
+/// KV is sized like the single-cache path (`INFR_MAX_CTX` / the model's trained context). Reuse math
+/// per slot is the tested [`Llama::generate_ids_cached`]; this only adds the routing.
+pub struct ServeCache {
+    slots: Vec<CacheSlot>,
+    max_slots: usize,
+    tick: u64,
+}
+
+impl ServeCache {
+    /// Build from the environment: `INFR_KV_SLOTS` slots (default 4, min 1).
+    pub fn from_env() -> Self {
+        let max_slots = std::env::var("INFR_KV_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4usize)
+            .max(1);
+        Self {
+            slots: Vec::new(),
+            max_slots,
+            tick: 0,
+        }
+    }
+
+    /// Generate a reply for `prompt`, routing to the right slot and prefilling only the divergent
+    /// suffix (see [`Llama::generate_ids_cached`]). Returns the generated token ids.
+    pub fn generate(
+        &mut self,
+        llama: &Llama,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        on_token: impl FnMut(&str),
+    ) -> Result<Vec<u32>> {
+        self.tick += 1;
+        let idx = self.select(llama, prompt)?;
+        self.slots[idx].lru = self.tick;
+        let slot = &mut self.slots[idx];
+        llama.generate_ids_cached(
+            prompt,
+            max_new,
+            constraint,
+            on_token,
+            &mut slot.kv,
+            &mut slot.cached,
+        )
+    }
+
+    /// Pick the slot index to use: an existing conversation this request continues, else a free
+    /// slot (grow up to `max_slots`), else the least-recently-used slot (evicted → prefilled fresh).
+    fn select(&mut self, llama: &Llama, prompt: &str) -> Result<usize> {
+        // Tokens that reply-tokenization drift may nudge at the cached tail; a match within this of
+        // the slot's full cache still counts as "continues this conversation".
+        const SLACK: usize = 32;
+        if std::env::var("INFR_NO_KV_REUSE").is_err() {
+            let ids: Vec<u32> = llama
+                .tokenizer
+                .encode(prompt, false)
+                .map_err(|e| anyhow!("encode: {e}"))?
+                .get_ids()
+                .to_vec();
+            // Continuation = the LONGEST-cached slot whose whole cache is a (near-)prefix of `ids`.
+            // A different conversation that merely shares the system prompt matches only that far,
+            // which is << its cached length once it has any history, so it won't be misrouted here.
+            let mut best: Option<(usize, usize)> = None;
+            for (i, s) in self.slots.iter().enumerate() {
+                if s.cached.is_empty() {
+                    continue;
+                }
+                let cp = common_prefix_len(&s.cached, &ids);
+                if cp + SLACK >= s.cached.len() && best.is_none_or(|(_, l)| s.cached.len() > l) {
+                    best = Some((i, s.cached.len()));
+                }
+            }
+            if let Some((i, _)) = best {
+                return Ok(i);
+            }
+        }
+        // New conversation: grow lazily, else evict the LRU slot (keep its KV alloc, just clear the
+        // cached tokens so the next generate prefills it fresh — no VRAM churn).
+        let _ = llama;
+        if self.slots.len() < self.max_slots {
+            self.slots.push(CacheSlot {
+                kv: None,
+                cached: Vec::new(),
+                lru: self.tick,
+            });
+            return Ok(self.slots.len() - 1);
+        }
+        let lru = self
+            .slots
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.lru)
+            .map(|(i, _)| i)
+            .unwrap();
+        self.slots[lru].cached.clear();
+        Ok(lru)
+    }
+}
+
 // ---- host ops ----
 
 fn silu(x: f32) -> f32 {

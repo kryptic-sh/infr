@@ -17,7 +17,7 @@ pub use util::gpu_available;
 pub(crate) use util::*;
 mod transformer;
 pub(crate) use transformer::PerLayerEmbd;
-pub use transformer::{ChatSession, Llama};
+pub use transformer::{ChatSession, Llama, ServeCache};
 mod kv;
 pub(crate) use kv::{DecodeScratch, DenseDecodeScratch, PrefillScratch, QBufs};
 pub use kv::{KvCache, MoeConfig, MoeKv};

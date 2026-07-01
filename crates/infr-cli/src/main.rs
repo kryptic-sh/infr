@@ -447,13 +447,11 @@ fn run_chat_turn(
 /// Adapter: drive `infr-llama` through the server's `ChatGenerator` seam.
 struct LlamaGenerator {
     llama: infr_llama::Llama,
-    /// Persistent KV cache reused across requests (server generation is serialized by a Mutex, so a
-    /// single cache is safe). Each request prefills only the token suffix that differs from `cached`
-    /// — a coding agent's stable system prompt + history isn't re-prefilled every turn, cutting
-    /// time-to-first-token. Lazily created on the first request.
-    kv: Option<infr_llama::KvCache>,
-    /// The token sequence currently materialized in `kv` (rendered prompt + last generation).
-    cached: Vec<u32>,
+    /// Multi-slot prefix cache: each request prefills only the suffix that differs from the slot it
+    /// continues, so a coding agent's stable system prompt + history isn't re-prefilled every turn
+    /// (cutting time-to-first-token). Multiple slots keep concurrent/interleaved conversations from
+    /// thrashing one cache. Server generation is serialized by a Mutex, so the cache needs no lock.
+    cache: infr_llama::ServeCache,
 }
 
 impl infr_server::ChatGenerator for LlamaGenerator {
@@ -503,13 +501,12 @@ impl infr_server::ChatGenerator for LlamaGenerator {
             // (e.g. the toktrie bridge masked out the whole call), fall through to unconstrained
             // generation rather than failing the request or returning an empty `stop`.
             let primed = format!("{prompt}<tool_call>\n");
-            let emitted = match self.llama.generate_ids_cached(
+            let emitted = match self.cache.generate(
+                &self.llama,
                 &primed,
                 max_new,
                 Some(&mut constraint),
                 |_| {},
-                &mut self.kv,
-                &mut self.cached,
             ) {
                 Ok(ids) => {
                     let body = self.llama.decode_ids(&ids, false)?;
@@ -552,14 +549,10 @@ impl infr_server::ChatGenerator for LlamaGenerator {
         let mut stream = ChatStream::new(tool_choice != Some("none"));
         {
             let od = &mut *on_delta;
-            self.llama.generate_ids_cached(
-                &prompt,
-                max_new,
-                None,
-                |piece: &str| stream.push(piece, &mut *od),
-                &mut self.kv,
-                &mut self.cached,
-            )?;
+            self.cache
+                .generate(&self.llama, &prompt, max_new, None, |piece: &str| {
+                    stream.push(piece, &mut *od)
+                })?;
         }
         stream.finish(on_delta);
         Ok(())
@@ -1200,9 +1193,8 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         .to_string();
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
     let generator: Box<dyn infr_server::ChatGenerator> = Box::new(LlamaGenerator {
+        cache: infr_llama::ServeCache::from_env(),
         llama,
-        kv: None,
-        cached: Vec::new(),
     });
 
     let rt = tokio::runtime::Runtime::new()?;

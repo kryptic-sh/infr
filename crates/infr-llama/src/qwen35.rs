@@ -16,7 +16,7 @@ use infr_core::graph::{Activation, AttnMask, Graph, Op};
 use infr_core::tensor::TensorDesc;
 use infr_core::{DType, TensorId, WeightSource};
 use infr_cpu::CpuBackend;
-use infr_gguf::Gguf;
+use infr_gguf::{Gguf, TensorBytes};
 use infr_vulkan::VulkanBackend;
 
 /// A linear-projection weight on whichever device has a kernel for it: GPU (the shared
@@ -1175,7 +1175,13 @@ pub fn render_chat_messages(path: &std::path::Path, messages: &[(&str, &str)]) -
 
 /// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). `prompt` is
 /// the already-formatted text (see [`render_chat`]); returns timing/counts, text streams via `on_piece`.
-pub fn generate_cpu(
+/// Backend-generic Qwen3-Next (qwen35) decode runner: builds the per-token composite [`Graph`]
+/// (gated-DeltaNet + conv1d + attention) and runs it on `be`. `bind_weight` turns each native-dtype
+/// GGUF tensor into a backend buffer (CPU maps it zero-copy from the mmap; Metal uploads it). The
+/// thin [`generate_cpu`] / [`generate_metal`] wrappers pick the backend.
+fn generate_seam(
+    be: &dyn Backend,
+    bind_weight: &dyn Fn(TensorBytes) -> Result<Box<dyn Buffer>>,
     path: &std::path::Path,
     prompt: &str,
     n: usize,
@@ -1202,7 +1208,6 @@ pub fn generate_cpu(
     let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
     let max_ctx = prompt_ids.len() + n + 1;
 
-    let be = CpuBackend::new();
     let attn = |i: usize| c.is_attn_layer(i);
     let n_ff_of = |i: usize| -> Result<usize> {
         Ok(g.tensors()
@@ -1225,7 +1230,7 @@ pub fn generate_cpu(
             .clone();
         let numel: usize = info.shape.iter().product();
         let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-        wbufs.push(be.map_weight(tb));
+        wbufs.push(bind_weight(tb)?);
         wspecs.push((info.dtype, numel));
         Ok(())
     };
@@ -1769,6 +1774,43 @@ pub fn generate_cpu(
         n_gen: decode_n,
         decode_secs: decode_t.as_secs_f64(),
     })
+}
+
+/// Qwen3-Next decode on the CPU reference backend (weights mapped zero-copy from the GGUF mmap).
+pub fn generate_cpu(
+    path: &std::path::Path,
+    prompt: &str,
+    n: usize,
+    on_piece: impl FnMut(&str),
+) -> Result<crate::GenStats> {
+    let be = CpuBackend::new();
+    generate_seam(&be, &|tb| Ok(be.map_weight(tb)), path, prompt, n, on_piece)
+}
+
+/// Qwen3-Next decode on the reference Metal backend (weights uploaded to Metal buffers in their
+/// native GGUF dtype; the backend dequantizes lazily). The Apple-GPU twin of [`generate_cpu`].
+#[cfg(target_os = "macos")]
+pub fn generate_metal(
+    path: &std::path::Path,
+    prompt: &str,
+    n: usize,
+    on_piece: impl FnMut(&str),
+) -> Result<crate::GenStats> {
+    let be = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+    generate_seam(
+        &be,
+        &|tb| {
+            let buf = be
+                .alloc(tb.len().max(1), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+            Ok(buf)
+        },
+        path,
+        prompt,
+        n,
+        on_piece,
+    )
 }
 
 /// Open the GGUF at `path` and build the bespoke qwen35 [`Model`] (GPU-resident forward, or the

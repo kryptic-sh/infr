@@ -122,7 +122,9 @@ greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
 - **Format:** GGUF
 - **Models:** Llama / Qwen3 / Gemma 3 / Gemma 4 (dense + E2B) (GPU); Qwen3.5/3.6
   (CPU ref); DiffusionGemma (planned)
-- **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul)
+- **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple via a
+  correctness-first **reference Metal backend** (`INFR_METAL=1`) covering every op the CPU
+  reference does — dense, MoE (`qwen3moe`) and Qwen3-Next (`qwen35`)
 - **Store:** own cache at `$XDG_CACHE_HOME/infr/models` (standalone HF + Ollama
   HTTP pulls)
 - **API:** OpenAI-compatible HTTP (streaming) — works with opencode / Claude
@@ -136,7 +138,7 @@ decode   DecodeStrategy   (AutoRegressive; DiffusionDenoise later)
 model    Model            (Llama/Qwen3; Qwen3-Next CPU ref; DiffusionGemma later)
 runtime  tensors, KV cache, command/descriptor management
 loader   WeightSource     (Gguf; safetensors later)
-compute  Compute          (Vulkan via ash + SPIR-V; Metal/CUDA later)
+compute  Compute          (Vulkan via ash + SPIR-V; reference Metal via MSL; CUDA later)
 ```
 
 ## License

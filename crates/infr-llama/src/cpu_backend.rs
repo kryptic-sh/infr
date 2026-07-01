@@ -155,6 +155,40 @@ pub(crate) fn generate_dense_gpu(
     )
 }
 
+/// Metal seam runner: the SAME dense forward as [`generate_dense_cpu`], on the reference Metal
+/// backend through the agnostic [`Graph`]. Weights are uploaded to Metal buffers in their NATIVE
+/// GGUF dtype (the backend dequantizes lazily in its own `bytes_to_f32`, exactly like the CPU
+/// interpreter — so a quant weight occupies ~quant size, not 8× f32).
+#[cfg(target_os = "macos")]
+pub(crate) fn generate_dense_metal(
+    mtl: &infr_metal::MetalBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend(
+        mtl,
+        &|tb, dt, _n| {
+            let buf = mtl
+                .alloc(tb.len().max(1), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            mtl.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+            Ok((buf, dt))
+        },
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+    )
+}
+
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it
 /// on `be` (CPU reference or Vulkan). `bind_weight` turns each native-dtype GGUF tensor into a
 /// backend buffer: the CPU maps it zero-copy from the mmap; the GPU pads + uploads it to VRAM. This

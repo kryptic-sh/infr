@@ -330,7 +330,21 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // the borrow-based dense `ChatSession` needs no ownership change).
     let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
     let llama; // declared here so a borrowing ChatSession / MoeChat outlives `chat`
-    let model: Box<dyn infr_llama::model::ChatModel + '_> = if std::env::var("INFR_CPU").is_ok() {
+    let model: Box<dyn infr_llama::model::ChatModel + '_> = if std::env::var("INFR_METAL").is_ok() {
+        if is_q35 {
+            eprintln!(
+                "[metal backend — qwen35/Qwen3-Next on the agnostic seam, Apple GPU (reference)]"
+            );
+            Box::new(infr_llama::model::CpuQwen35Chat::new_metal(gguf.clone()))
+        } else {
+            eprintln!(
+                "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph (reference)]"
+            );
+            Box::new(infr_llama::model::CpuDenseChat::new_metal(
+                infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+            ))
+        }
+    } else if std::env::var("INFR_CPU").is_ok() {
         if is_q35 {
             eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
             Box::new(infr_llama::model::CpuQwen35Chat::new(gguf.clone()))

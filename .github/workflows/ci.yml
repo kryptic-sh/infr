@@ -17,12 +17,14 @@ env:
   # to surface upstream incompatibility early. Mirrors the krypt / tikr baseline.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
-# Linux-only: infr is a Vulkan-first engine. `glslc` (shaderc) compiles the
+# Mostly Linux: infr is a Vulkan-first engine. `glslc` (shaderc) compiles the
 # compute shaders at build time, and the dp4a shaders need a recent glslc
 # (GL_EXT_integer_dot_product) — Ubuntu 24.04 ships shaderc 2023.8 which is too
 # old, so we pin ubuntu-26.04 (shaderc 2025+). The GPU integration tests are
 # #[ignore]'d (they need a real Vulkan device); CI builds + runs the CPU suite.
 # ash loads Vulkan at runtime via dlopen, so no libvulkan is needed to build.
+# The `test-macos` job additionally builds on Apple Silicon and runs the
+# reference Metal backend's parity suite against a real Metal device.
 
 jobs:
   fmt:
@@ -87,3 +89,24 @@ jobs:
       - run: rustup update --no-self-update stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --workspace --locked
+
+  # macOS / Metal: the Linux jobs above never build `infr-metal` (it is
+  # `#![cfg(target_os = "macos")]`). This job builds the workspace on an
+  # Apple-Silicon runner — which has a real Metal device — and runs the
+  # infr-metal parity suite. Those tests are `#[ignore]`d like the Vulkan GPU
+  # tests, so they need an explicit `--include-ignored`.
+  test-macos:
+    name: cargo test (macOS / Metal)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc (shaderc)
+        run: brew install shaderc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --locked
+      - run: cargo test -p infr-metal --locked -- --include-ignored

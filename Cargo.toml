@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/infr-core",
     "crates/infr-vulkan",
+    "crates/infr-metal",
     "crates/infr-hub",
     "crates/infr-gguf",
     "crates/infr-cpu",
@@ -25,6 +26,7 @@ repository = "https://github.com/kryptic-sh/infr"
 # internal
 infr-core = { path = "crates/infr-core" }
 infr-vulkan = { path = "crates/infr-vulkan" }
+infr-metal = { path = "crates/infr-metal" }
 infr-hub = { path = "crates/infr-hub" }
 infr-gguf = { path = "crates/infr-gguf" }
 infr-cpu = { path = "crates/infr-cpu" }
@@ -53,6 +55,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ash = "0.38"
 gpu-allocator = { version = "0.27", features = ["vulkan"] }
+metal = "0.33"
+objc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "rustls-tls",

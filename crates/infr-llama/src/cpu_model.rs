@@ -112,6 +112,38 @@ impl CpuModel {
         Ok(stats)
     }
 
+    /// Greedy generation on the reference **Metal** backend through the agnostic seam (the
+    /// Apple-GPU twin of [`generate_cpu`](Self::generate_cpu)): weights are uploaded to Metal
+    /// buffers, the per-token [`infr_core::graph::Graph`] is compiled + executed by `MetalBackend`,
+    /// and generated tokens stream through `on_piece`.
+    #[cfg(target_os = "macos")]
+    pub fn generate_metal(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let (_generated, stats) = crate::cpu_backend::generate_dense_metal(
+            &mtl,
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+        )?;
+        Ok(stats)
+    }
+
     /// Render a user turn with the model's OWN embedded chat template (so an instruct model — Gemma,
     /// Qwen, … — answers coherently). Errors if the GGUF has no `tokenizer.chat_template` or it fails
     /// to render — infr only supports models that ship one (no fabricated-ChatML fallback).

@@ -246,11 +246,21 @@ impl ChatModel for Qwen35Chat {
 /// rendered history in every turn, so multi-turn context works.
 pub struct CpuDenseChat {
     model: CpuModel,
+    /// Run the dense forward on the reference Metal backend instead of the CPU interpreter.
+    metal: bool,
 }
 
 impl CpuDenseChat {
     pub fn new(model: CpuModel) -> Self {
-        Self { model }
+        Self {
+            model,
+            metal: false,
+        }
+    }
+
+    /// Same dense model, but driven through the reference Metal backend (`INFR_METAL`).
+    pub fn new_metal(model: CpuModel) -> Self {
+        Self { model, metal: true }
     }
 }
 
@@ -265,6 +275,14 @@ impl ChatModel for CpuDenseChat {
         max_new: usize,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        if self.metal {
+            #[cfg(target_os = "macos")]
+            return self.model.generate_metal(prompt, max_new, |p| on_piece(p));
+            #[cfg(not(target_os = "macos"))]
+            return Err(anyhow::anyhow!(
+                "the Metal backend is only available on macOS"
+            ));
+        }
         self.model.generate_cpu(prompt, max_new, |p| on_piece(p))
     }
 }
@@ -273,11 +291,18 @@ impl ChatModel for CpuDenseChat {
 /// Same follow-up as [`Qwen35Chat`]: `qwen35::generate_cpu` reloads the GGUF per turn.
 pub struct CpuQwen35Chat {
     path: std::path::PathBuf,
+    /// Run the qwen35 decode on the reference Metal backend instead of the CPU interpreter.
+    metal: bool,
 }
 
 impl CpuQwen35Chat {
     pub fn new(path: std::path::PathBuf) -> Self {
-        Self { path }
+        Self { path, metal: false }
+    }
+
+    /// Same qwen35 decode, driven through the reference Metal backend (`INFR_METAL`).
+    pub fn new_metal(path: std::path::PathBuf) -> Self {
+        Self { path, metal: true }
     }
 }
 
@@ -292,6 +317,14 @@ impl ChatModel for CpuQwen35Chat {
         max_new: usize,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        if self.metal {
+            #[cfg(target_os = "macos")]
+            return crate::qwen35::generate_metal(&self.path, prompt, max_new, |p| on_piece(p));
+            #[cfg(not(target_os = "macos"))]
+            return Err(anyhow::anyhow!(
+                "the Metal backend is only available on macOS"
+            ));
+        }
         crate::qwen35::generate_cpu(&self.path, prompt, max_new, |p| on_piece(p))
     }
 }

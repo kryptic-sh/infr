@@ -1374,8 +1374,8 @@ impl<'a> Recorder<'a> {
         // skips flash entirely when even bm=32 won't fit, so one of these always fits here.
         let shared_limit = self.be.max_shared_memory_bytes();
         let bm64_shared = 64 * crate::FLASH_SHARED_PER_ROW; // 58112 B
-        // INFR_FLASH_BM=32 forces the small (29056 B) tile even on a 64 KB device, so the bm=32
-        // shaders get numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
+                                                            // INFR_FLASH_BM=32 forces the small (29056 B) tile even on a 64 KB device, so the bm=32
+                                                            // shaders get numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
         let force_bm32 = std::env::var("INFR_FLASH_BM").ok().as_deref() == Some("32");
         let bm: u32 = if !force_bm32 && shared_limit >= bm64_shared {
             64

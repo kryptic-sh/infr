@@ -20,6 +20,15 @@ mod recorder;
 pub use expert_pool::ExpertPool;
 pub use recorder::{RecordedCmd, Recorder};
 
+/// Shared-memory bytes consumed per query row of a flash-attention prefill tile
+/// (`Ss` + `Ps` + `Os` + softmax state, at `BN=64` / `HD=128`). The tile height is chosen so
+/// `rows * FLASH_SHARED_PER_ROW <= maxComputeSharedMemorySize`; `use_flash` needs the smallest
+/// tile (`BM=32`) to fit. Keep in sync with `attn_flash{,_warp,_partial}.comp`.
+pub const FLASH_SHARED_PER_ROW: u32 = 908;
+/// Same, for the register-O flash tile (`sfsh` + `Psh` + `pvsh` + state); smallest tile is `BR=64`.
+/// Keep in sync with `attn_flash_reg.comp`.
+pub const FLASH_REG_SHARED_PER_ROW: u32 = 460;
+
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;

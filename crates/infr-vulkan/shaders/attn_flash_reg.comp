@@ -4,7 +4,15 @@
 // q-tiles → fewer K/V re-reads + bigger GEMM reuse). Thread t owns row (t/2) and dims [cw*64,+64)
 // with cw=t%2; O is Of[16] vec4 in registers. Per-row online-softmax rescale is a trivial register
 // multiply (thread owns its row). hd=128 specialized. Split-K over kv via gl_WorkGroupID.y; emits
-// un-normalized partials (Of, m, l) for attn_flash_combine. sg32, 8 subgroups.
+// un-normalized partials (Of, m, l) for attn_flash_combine. sg32.
+// BR_TILE (query rows/tile) is a build knob: shared = sfsh(BR*BC f32) + Psh(BR*BC f16) +
+// pvsh((BR/16)*256 f32) + 3*BR = BR*460 B. BR=128 → 58880 B (needs a 64 KB device); BR=64 →
+// 29440 B (fits NVIDIA 48 KB / MoltenVK 32 KB). The recorder picks the tile from
+// maxComputeSharedMemorySize. BR only scales WARPS_M / workgroup size / shared arrays — the
+// per-warp 32×32 coopmat work (sacc[2][2]) and BC are fixed, so results are identical across tiles.
+#ifndef BR_TILE
+#define BR_TILE 128
+#endif
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -13,12 +21,14 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : require
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// workgroup = WARPS_M*WARPS_N subgroups of 32 = (BR/32)*2*32 = BR*2 threads.
+layout(local_size_x = (BR_TILE * 2), local_size_y = 1, local_size_z = 1) in;
 
-const uint BR = 128u;   // query rows per tile
-const uint BC = 64u;    // kv cols per block
+const uint BR = BR_TILE;        // query rows per tile
+const uint BC = 64u;            // kv cols per block
 const uint HD = 128u;
-const uint DPT = 16u;   // vec4 per thread = (HD/2)/4 — each thread owns 64 dims of its row
+const uint DPT = 16u;           // vec4 per thread = (HD/2)/4 — each thread owns 64 dims of its row
+const uint WARPS_M = BR_TILE / 32u; // QK warptile row-warps (each owns 32 rows); WARPS_N = BC/32 = 2
 
 layout(push_constant) uniform PC {
     uint q_len;     // mpad (multiple of BR)
@@ -39,7 +49,7 @@ layout(binding = 5) writeonly buffer PLB { float pl[]; };    // [n_splits, mpad,
 
 shared float sfsh[BR * BC];      // scores (f32)
 shared float16_t Psh[BR * BC];   // probs (f16) for PV coopmat
-shared float pvsh[8u * 16u * 16u]; // per-subgroup PV tile (16×16)
+shared float pvsh[(BR_TILE / 16u) * 256u]; // per-subgroup PV tile (16×16), one per subgroup (BR/16)
 shared float mrow[BR];
 shared float lrow[BR];
 shared float corr[BR];
@@ -51,10 +61,10 @@ void main() {
     uint qr0 = qt * BR;
     uint kvh = h / (pc.nh / pc.nkv);
     uint tid = gl_LocalInvocationIndex;
-    uint sg = gl_SubgroupID;          // 0..7 → row-panel sg
+    uint sg = gl_SubgroupID;          // 0..(BR/16-1) → row-panel sg
     uint lane = gl_SubgroupInvocationID; // 0..31
-    uint warp_r = sg % 4u;            // QK warptile: 4×2 warps
-    uint warp_c = sg / 4u;
+    uint warp_r = sg % WARPS_M;       // QK warptile: WARPS_M×2 warps
+    uint warp_c = sg / WARPS_M;
     uint nhhd = pc.nh * HD;
     uint nkvhd = pc.nkv * HD;
     float scale = 1.0 / sqrt(float(HD));

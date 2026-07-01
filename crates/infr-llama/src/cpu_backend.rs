@@ -86,7 +86,7 @@ pub(crate) fn generate_dense_cpu(
     let cpu_be = CpuBackend::new();
     generate_dense_backend(
         &cpu_be,
-        &|tb, _dt, _n| Ok(cpu_be.map_weight(tb)),
+        &|tb, dt, _n| Ok((cpu_be.map_weight(tb), dt)),
         g,
         cfg,
         token_embd,
@@ -115,16 +115,35 @@ pub(crate) fn generate_dense_gpu(
 ) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_backend(
         vk,
-        &|tb, _dt, _n| {
-            // Native GGUF block bytes → VRAM (u32-padded, in-shader dequant — the adapter's Linear
-            // dispatches native-quant vs f16 by dtype). One `Weights` buffer per tensor.
-            let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
-            let buf = vk
-                .alloc(padded.len(), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            vk.upload(buf.as_ref(), &padded)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok(buf)
+        &|tb, dt, _n| {
+            // Convert ONLY f16/bf16 weights → f16 in VRAM (mirrors the production loader): the
+            // adapter's Linear then runs the f16 coopmat GEMM for prefill instead of the slow per-row
+            // GEMV, and the declared dtype becomes F16 so the graph handle matches. F32 is left native
+            // — the norm weights are F32 and rmsnorm/qk_norm_rope read f32, so converting them would
+            // corrupt the norms. Quant weights → raw native blocks (u32-padded, in-shader dequant).
+            match dt {
+                DType::F16 | DType::Bf16 => {
+                    let f32v = crate::dequant_block(dt, &tb).map_err(|e| anyhow!("{e}"))?;
+                    let mut f16b = Vec::with_capacity(f32v.len() * 2);
+                    for &v in &f32v {
+                        f16b.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+                    }
+                    let buf = vk
+                        .alloc(f16b.len(), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    vk.upload(buf.as_ref(), &f16b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((buf, DType::F16))
+                }
+                _ => {
+                    let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+                    let buf = vk
+                        .alloc(padded.len(), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    vk.upload(buf.as_ref(), &padded)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    Ok((buf, dt))
+                }
+            }
         },
         g,
         cfg,
@@ -141,10 +160,14 @@ pub(crate) fn generate_dense_gpu(
 /// backend buffer: the CPU maps it zero-copy from the mmap; the GPU pads + uploads it to VRAM. This
 /// is the single forward both backends share — running it on Vulkan and diffing the CPU oracle is
 /// the end-to-end dense parity check.
+/// Turns a native-dtype GGUF tensor into a backend buffer + the EFFECTIVE dtype it now holds (the
+/// GPU binder may convert float weights to f16), so the graph declares the handle to match.
+type BindWeight<'a> = dyn Fn(TensorBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_backend(
     be: &dyn Backend,
-    bind_weight: &dyn Fn(TensorBytes, DType, usize) -> AResult<Box<dyn Buffer>>,
+    bind_weight: &BindWeight,
     g: &Gguf,
     cfg: &Config,
     token_embd: &[f32],
@@ -222,8 +245,11 @@ pub(crate) fn generate_dense_backend(
             .clone();
         let numel: usize = info.shape.iter().product();
         let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-        wbufs.push(bind_weight(tb, info.dtype, numel)?);
-        wspecs.push((info.dtype, numel));
+        // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
+        // weights to f16), so the graph declares the handle to match what the backend will read.
+        let (buf, eff_dt) = bind_weight(tb, info.dtype, numel)?;
+        wbufs.push(buf);
+        wspecs.push((eff_dt, numel));
         Ok(())
     };
     for l in 0..c.n_layer {

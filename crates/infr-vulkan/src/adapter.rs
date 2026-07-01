@@ -44,10 +44,19 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         (0..graph.tensors.len()).map(|_| None).collect();
     for (i, decl) in graph.tensors.iter().enumerate() {
         if matches!(decl.kind, TensorKind::Internal) {
+            let numel = decl.desc.numel();
+            // Pad the leading (row) dim to a multiple of 64 so the prefill GEMM / flash kernels —
+            // which write ceil(rows/64)*64 output rows — write DIRECTLY into this buffer (no padded
+            // temp + copy). The padding rows are never read: downstream ops touch only the real
+            // `rows`, and row-major layout keeps element (r<rows, c) at the same index regardless.
+            let padded = match decl.desc.shape.first() {
+                Some(&rows) if rows > 0 => rows.div_ceil(64) * 64 * (numel / rows),
+                _ => numel,
+            };
             let bytes = decl
                 .desc
                 .dtype
-                .dense_bytes(decl.desc.numel())
+                .dense_bytes(padded)
                 .ok_or_else(|| be("vulkan adapter: internal tensor must be a dense dtype"))?;
             scratch[i] = Some(be_.alloc(bytes.max(4), BufferUsage::Activations)?);
         }
@@ -72,9 +81,11 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         }
     }
 
-    // Transient buffers allocated inside the op loop (MoE routing scratch) must outlive the recorder
-    // — hold them here so they drop only after `rec.finish()` submits.
+    // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
+    // recorder — hold them here so they drop only after `rec.finish()` submits.
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
+    // A tiny unused buffer bound as the (scales, mins) args of the f16 `matmul_proj` GEMM.
+    let dummy = be_.alloc(16, BufferUsage::Activations)?;
 
     let rec = be_.recorder()?;
     for op in &graph.ops {
@@ -111,17 +122,35 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                 let (m, in_f, out_f) = (*m as usize, *in_f as usize, *out_f as usize);
                 let (w, xb, y) = (r(*weight)?, r(*x)?, r(*dst)?);
                 let dt = graph.desc(*weight).dtype;
-                // GEMM (m>1) needs a u32-block dtype + n%64==0, k%32==0, and writes ceil(m/64)*64
-                // output rows — so GEMM into a padded temp, then copy the m real rows into dst. (a is
-                // read row<m-guarded, so the exact-size input is fine.) Q4_K uses the mmq (dp4a int8)
-                // GEMM — the u4 prefill default, faster than coopmat; others use coopmat matmul_native.
-                if m > 1 && native_dense_supported(dt) && out_f % 64 == 0 && in_f % 32 == 0 {
+                // Prefill (m>1): a TILED GEMM writes ceil(m/64)*64 rows DIRECTLY into `y` (Internal
+                // buffers are row-padded to 64 up front, so no temp/copy). Needs n%64==0, k%32==0.
+                //  • Q4_K → mmq (dp4a int8): quantize activations once, integer matmul on the raw
+                //    blocks (no per-GEMM weight dequant) — the u4 prefill default.
+                //  • other native quants → coopmat `matmul_native` (in-shader dequant).
+                //  • f16 (float weights are uploaded as f16) → f16 coopmat `matmul_proj`.
+                // Decode (m=1) and non-tileable shapes fall through to the GEMV.
+                let gemm_ok = m > 1 && out_f % 64 == 0 && in_f % 32 == 0;
+                let is_gemm =
+                    gemm_ok && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16));
+                if is_gemm {
+                    // GEMM writes ceil(m/64)*64 rows. Internal `dst` is row-padded → write direct;
+                    // a non-Internal dst (e.g. the lm_head `logits` Output, unpadded) gets a padded
+                    // temp + copy of the m real rows.
+                    let dst_internal =
+                        matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                     let eb = graph.desc(*dst).dtype.dense_bytes(1).unwrap_or(4);
-                    let mpad = m.div_ceil(64) * 64;
-                    let tmp = be_.alloc((mpad * out_f * eb).max(4), BufferUsage::Activations)?;
+                    let tmp = if dst_internal {
+                        None
+                    } else {
+                        let mpad = m.div_ceil(64) * 64;
+                        Some(be_.alloc((mpad * out_f * eb).max(4), BufferUsage::Activations)?)
+                    };
+                    let out: &dyn Buffer = match &tmp {
+                        Some(t) => t.as_ref(),
+                        None => y,
+                    };
                     if matches!(dt, infr_core::DType::Q4K) {
-                        // Quantize activations to int8 once (Q8 per 32-block), then integer dp4a GEMM
-                        // against the raw Q4_K blocks (no per-GEMM weight dequant).
+                        // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
                         let nblk = in_f / 32;
                         let qa = be_.alloc((m * in_f).max(4), BufferUsage::Activations)?;
                         let dact = be_.alloc((m * nblk * 2).max(4), BufferUsage::Activations)?;
@@ -133,17 +162,33 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                             sact.as_ref(),
                             w,
                             0,
-                            tmp.as_ref(),
+                            out,
                             m,
                             in_f,
                             out_f,
                         );
                         transient.extend([qa, dact, sact]);
+                    } else if native_dense_supported(dt) {
+                        rec.matmul_native(dt, xb, w, out, m, in_f, out_f);
                     } else {
-                        rec.matmul_native(dt, xb, w, tmp.as_ref(), m, in_f, out_f);
+                        // f16 coopmat GEMM (dummy scales/mins unused at bits=16).
+                        rec.matmul_proj(
+                            xb,
+                            w,
+                            dummy.as_ref(),
+                            dummy.as_ref(),
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                            16,
+                            0,
+                        );
                     }
-                    rec.copy(tmp.as_ref(), 0, y, 0, m * out_f * eb);
-                    transient.push(tmp);
+                    if let Some(t) = tmp {
+                        rec.copy(t.as_ref(), 0, y, 0, m * out_f * eb);
+                        transient.push(t);
+                    }
                 } else if native_dense_supported(dt) {
                     rec.linear_native(dt, w, xb, y, m, in_f, out_f);
                 } else {
@@ -323,8 +368,9 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
                 if flash_ok {
+                    // flash writes ceil(rows/64)*64 output rows straight into `dst` (Internal buffers
+                    // are row-padded up front). po/pm/pl are the split-K online-softmax partials.
                     let mpad = rows.div_ceil(64) * 64;
-                    let attn_tmp = be_.alloc(mpad * nh * hd * 4, BufferUsage::Activations)?;
                     let po = be_.alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
                     let pm = be_.alloc(8 * mpad * nh * 4, BufferUsage::Activations)?;
                     let pl = be_.alloc(8 * mpad * nh * 4, BufferUsage::Activations)?;
@@ -332,7 +378,7 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                         r(*q)?,
                         r(*k_cache)?,
                         r(*v_cache)?,
-                        attn_tmp.as_ref(),
+                        r(*dst)?,
                         po.as_ref(),
                         pm.as_ref(),
                         pl.as_ref(),
@@ -343,8 +389,7 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                         hd,
                         pos,
                     );
-                    rec.copy(attn_tmp.as_ref(), 0, r(*dst)?, 0, rows * nh * hd * 4);
-                    transient.extend([attn_tmp, po, pm, pl]);
+                    transient.extend([po, pm, pl]);
                 } else {
                     let window = match mask {
                         AttnMask::Causal => 0,

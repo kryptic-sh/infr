@@ -253,6 +253,39 @@ fn gpu_seam_flash_matches_cpu() {
     );
 }
 
+/// BF16 (float-weight) seam parity: a bf16 model runs on the seam with its projection weights
+/// converted to f16 (the matmul_proj / f16-GEMM prefill path) while the norm weights stay f32 (the
+/// rmsnorm/qk_norm kernels read f32). Must match the CPU reference oracle token-for-token — proving
+/// the float-weight GPU path is correct, not just fast.
+#[test]
+fn gpu_seam_bf16_matches_cpu() {
+    let snap = match qwen3_06b() {
+        Some(p) => p.parent().unwrap().to_path_buf(),
+        None => return,
+    };
+    let path = snap.join("Qwen3-0.6B-BF16.gguf");
+    if !path.exists() {
+        eprintln!("skip: no BF16 model");
+        return;
+    }
+    need_gpu!();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let prompt = model
+        .render_chat("What is the capital of France? Answer in one word.")
+        .expect("render chat");
+    let mut cpu_txt = String::new();
+    model
+        .generate_cpu(&prompt, 16, |p| cpu_txt.push_str(p))
+        .expect("cpu gen");
+    let gpu_txt = model.generate_dense_vulkan(&prompt, 16).expect("seam gen");
+    assert_eq!(
+        cpu_txt.trim(),
+        gpu_txt.trim(),
+        "bf16 seam (f16 projections) diverged from the CPU oracle"
+    );
+}
+
 // CPU quant coverage: the SAME prompt through every available quantization of Qwen3-0.6B — legacy
 // round (Q4_0), k-quants (Q2_K/Q4_K/Q5_K/Q6_K), high-bit (Q8_0), i-quant codebook (IQ4_XS), and float
 // (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked (each

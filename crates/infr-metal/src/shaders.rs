@@ -268,42 +268,50 @@ kernel void gatedact_f32(device const float* gate [[buffer(0)]],
     dst[gb] = gated_act(p.act, gate[gb]) * up[ub];
 }
 
-// ---- Scaled-dot-product attention (GQA + causal/sliding-window), one thread per (query, head).
-// K/V are pre-materialized to f32 (kv_len × n_kv × head_dim). Online (flash) softmax, single pass.
+// ---- Scaled-dot-product attention (GQA + causal/sliding-window). One SIMD group (32 lanes) per
+// (query, head): lanes split head_dim — the q·k score is a lane-strided dot reduced by `simd_sum`,
+// and each lane owns a head_dim/32 slice of the online-softmax `acc`. All lanes see the same score,
+// so `m`/`l` stay in sync with no cross-lane state. Fixes the old one-thread-per-(query,head) kernel,
+// where decode (1 query) ran each head's whole O(kv_len·head_dim) pass on a single thread.
 constant constexpr uint MAX_HD = 256;
+constant constexpr uint MAX_DPL = MAX_HD / 32u;   // head_dim slots per lane (head_dim ≤ MAX_HD)
 struct AttnParams { uint rows; uint kv_len; uint n_head; uint n_kv; uint head_dim; float scale; uint window; uint pos; };
 kernel void attention_f32(device const float* q   [[buffer(0)]],
                           device const float* k   [[buffer(1)]],
                           device const float* v   [[buffer(2)]],
                           device float*       dst [[buffer(3)]],
                           constant AttnParams& p  [[buffer(4)]],
-                          uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.rows * p.n_head) return;
-    uint ti = gid / p.n_head;
-    uint h = gid % p.n_head;
+                          uint gid  [[thread_position_in_grid]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.rows * p.n_head) return;
+    uint ti = sg / p.n_head;
+    uint h = sg % p.n_head;
     uint group = p.n_head / p.n_kv;
     uint kvh = h / group;
-    uint qb = gid * p.head_dim;                 // (ti*n_head + h) * head_dim
-    uint abs = p.pos + ti;                       // absolute position of this query
+    uint qb = sg * p.head_dim;                    // (ti*n_head + h) * head_dim
+    uint abs = p.pos + ti;                         // absolute position of this query
     uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
 
-    float acc[MAX_HD];
-    for (uint d = 0; d < p.head_dim; d++) acc[d] = 0.0f;
+    float acc[MAX_DPL];
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] = 0.0f;
     float m = -INFINITY, l = 0.0f;
     for (uint j = lo; j <= abs; j++) {
         uint kb = (j * p.n_kv + kvh) * p.head_dim;
-        float sc = 0.0f;
-        for (uint d = 0; d < p.head_dim; d++) sc += q[qb + d] * k[kb + d];
-        sc *= p.scale;
+        float part = 0.0f;
+        for (uint d = lane; d < p.head_dim; d += 32u) part += q[qb + d] * k[kb + d];
+        float sc = simd_sum(part) * p.scale;
         float mnew = max(m, sc);
         float corr = exp(m - mnew);
         float pw = exp(sc - mnew);
         l = l * corr + pw;
         uint vb = (j * p.n_kv + kvh) * p.head_dim;
-        for (uint d = 0; d < p.head_dim; d++) acc[d] = acc[d] * corr + pw * v[vb + d];
+        uint t = 0;
+        for (uint d = lane; d < p.head_dim; d += 32u) { acc[t] = acc[t] * corr + pw * v[vb + d]; t++; }
         m = mnew;
     }
-    for (uint d = 0; d < p.head_dim; d++) dst[qb + d] = acc[d] / l;
+    uint t = 0;
+    for (uint d = lane; d < p.head_dim; d += 32u) { dst[qb + d] = acc[t] / l; t++; }
 }
 
 // Same as attention_f32, but reads the KV cache in its native f16 straight from the bound buffer
@@ -313,33 +321,37 @@ kernel void attention_f16kv(device const float* q   [[buffer(0)]],
                             device const half*  v   [[buffer(2)]],
                             device float*       dst [[buffer(3)]],
                             constant AttnParams& p  [[buffer(4)]],
-                            uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.rows * p.n_head) return;
-    uint ti = gid / p.n_head;
-    uint h = gid % p.n_head;
+                            uint gid  [[thread_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.rows * p.n_head) return;
+    uint ti = sg / p.n_head;
+    uint h = sg % p.n_head;
     uint group = p.n_head / p.n_kv;
     uint kvh = h / group;
-    uint qb = gid * p.head_dim;
+    uint qb = sg * p.head_dim;
     uint abs = p.pos + ti;
     uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
 
-    float acc[MAX_HD];
-    for (uint d = 0; d < p.head_dim; d++) acc[d] = 0.0f;
+    float acc[MAX_DPL];
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] = 0.0f;
     float m = -INFINITY, l = 0.0f;
     for (uint j = lo; j <= abs; j++) {
         uint kb = (j * p.n_kv + kvh) * p.head_dim;
-        float sc = 0.0f;
-        for (uint d = 0; d < p.head_dim; d++) sc += q[qb + d] * (float)k[kb + d];
-        sc *= p.scale;
+        float part = 0.0f;
+        for (uint d = lane; d < p.head_dim; d += 32u) part += q[qb + d] * (float)k[kb + d];
+        float sc = simd_sum(part) * p.scale;
         float mnew = max(m, sc);
         float corr = exp(m - mnew);
         float pw = exp(sc - mnew);
         l = l * corr + pw;
         uint vb = (j * p.n_kv + kvh) * p.head_dim;
-        for (uint d = 0; d < p.head_dim; d++) acc[d] = acc[d] * corr + pw * (float)v[vb + d];
+        uint t = 0;
+        for (uint d = lane; d < p.head_dim; d += 32u) { acc[t] = acc[t] * corr + pw * (float)v[vb + d]; t++; }
         m = mnew;
     }
-    for (uint d = 0; d < p.head_dim; d++) dst[qb + d] = acc[d] / l;
+    uint t = 0;
+    for (uint d = lane; d < p.head_dim; d += 32u) { dst[qb + d] = acc[t] / l; t++; }
 }
 
 // ---- WriteKv: cast-copy `n` f32 source elems into the bound KV cache at row offset `base`, on the

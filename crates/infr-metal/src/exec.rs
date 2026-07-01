@@ -792,12 +792,14 @@ impl MetalBackend {
                 p.extend_from_slice(&scale.to_ne_bytes());
                 p.extend_from_slice(&window.to_ne_bytes());
                 p.extend_from_slice(&pos.to_ne_bytes());
-                self.encode(
+                // One simdgroup per (query, head) — see `attention_f32`/`attention_f16kv`.
+                self.encode_tg(
                     r,
                     &pso,
                     &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
                     &p,
-                    rows * nh,
+                    rows * nh * 32,
+                    32,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

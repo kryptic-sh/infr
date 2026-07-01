@@ -1823,7 +1823,26 @@ impl Llama {
         // multi-rep prefill / 2nd serve request crash). Cap the chunk so each submit stays well under
         // the watchdog; taper with context so the growing attention span stays bounded too.
         if self.cfg.gemma {
-            return (524_288 / (pos + 1)).clamp(32, 128);
+            // matmul_proj (the QKVO + FFN projection GEMMs) is the DOMINANT gemma prefill op and it
+            // is CHUNK-BOUND — a bigger chunk amortizes each weight read across more rows. gemma3-12b
+            // pp512 matmul_proj drops 937→597 ms (426→559 t/s) going chunk 128→512. But the per-submit
+            // attention span is chunk·kv ≈ chunk·(pos+chunk): letting chunk stay at 512 as `pos` grows
+            // blows this past the GPU hang watchdog (a forced constant chunk=512 at pp8000 is a hard
+            // device-lost). So pick the LARGEST chunk whose span stays within a proven-safe budget L:
+            // chunk² + pos·chunk − L ≤ 0 → chunk ≤ (√(pos²+4L) − pos)/2. This hands out big chunks at
+            // shallow depth (where the projection GEMM is most starved) and tapers exactly like the
+            // old `L/(pos+1)` budget at depth — L here (524 288) is BELOW the peak span the old
+            // ceil-128 path already ran safely (128·4223 ≈ 540 k at pos≈4096), so it's watchdog-safe
+            // at every depth. gemma3's SWA layers stay windowed, so only the 1-in-`swa_pattern` full
+            // layers grow the span; the bound covers the worst (full-attention) layer.
+            // gemma4 disables the coopmat projection GEMM (its projections run the slow hd-general
+            // GEMV, ~10 ms/token) so a 512-row submit trips the watchdog on projections alone — keep
+            // its ceiling tiny; the same span bound then tapers it further at depth.
+            let ceil = if self.cfg.gemma4 { 128 } else { 512 };
+            let l = 524_288f64;
+            let p = pos as f64;
+            let chunk = 0.5 * ((p * p + 4.0 * l).sqrt() - p);
+            return (chunk as usize).clamp(32, ceil);
         }
         let budget = if self.cfg.qk_norm {
             32_000_000

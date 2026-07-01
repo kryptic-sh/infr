@@ -1372,11 +1372,12 @@ impl<'a> Recorder<'a> {
         // Pick the largest tile the device's maxComputeSharedMemorySize allows: bm=64 → 58112 B (needs
         // 64 KB, e.g. RADV); bm=32 → 29056 B (fits NVIDIA 48 KB / MoltenVK 32 KB). The transformer
         // skips flash entirely when even bm=32 won't fit, so one of these always fits here.
-        let shared_limit = self.be.shared.caps.max_shared_memory_bytes;
+        let shared_limit = self.be.max_shared_memory_bytes();
+        let bm64_shared = 64 * crate::FLASH_SHARED_PER_ROW; // 58112 B
         // INFR_FLASH_BM=32 forces the small (29056 B) tile even on a 64 KB device, so the bm=32
         // shaders get numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
         let force_bm32 = std::env::var("INFR_FLASH_BM").ok().as_deref() == Some("32");
-        let bm: u32 = if !force_bm32 && shared_limit >= 64 * 908 {
+        let bm: u32 = if !force_bm32 && shared_limit >= bm64_shared {
             64
         } else {
             32
@@ -1497,10 +1498,12 @@ impl<'a> Recorder<'a> {
         hd: usize,
         pos_offset: usize,
     ) {
-        let mpad = (n.div_ceil(128) * 128) as u32; // mpad is 128-aligned → divisible by both BR tiles
-                                                   // Register-O shared = BR*460 B: BR=128 → 58880 B (needs 64 KB); BR=64 → 29440 B (NVIDIA
-                                                   // 48 KB / MoltenVK 32 KB). Pick the largest that fits; the transformer skips reg if neither.
-        let br: u32 = if self.be.shared.caps.max_shared_memory_bytes >= 128 * 460 {
+        // mpad is 128-aligned → divisible by both BR tiles.
+        let mpad = (n.div_ceil(128) * 128) as u32;
+        // Register-O shared = BR*FLASH_REG_SHARED_PER_ROW: BR=128 → 58880 B (needs 64 KB); BR=64 →
+        // 29440 B (NVIDIA 48 KB / MoltenVK 32 KB). Largest that fits; transformer skips reg if neither.
+        let br: u32 = if self.be.max_shared_memory_bytes() >= 128 * crate::FLASH_REG_SHARED_PER_ROW
+        {
             128
         } else {
             64

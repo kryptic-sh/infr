@@ -936,7 +936,7 @@ impl Llama {
         // (BR=64) needs 29440 B shared — skip it on devices that can't fit that (else device-lost).
         let use_flash_reg = use_gemm
             && hd == 128
-            && self.be.max_shared_memory_bytes() >= 29440
+            && self.be.max_shared_memory_bytes() >= 64 * infr_vulkan::FLASH_REG_SHARED_PER_ROW
             && std::env::var("INFR_FLASH_REG").is_ok();
         // gemma prefill attention: the flash warptile is hd=128-only, but the non-FA coopmat path
         // (attn_qk → softmax → attn_pv) is hd-general (256/512), so route gemma's attention through
@@ -967,7 +967,7 @@ impl Llama {
         // over-committed pipeline faults the GPU → device-lost). RADV 64 KB / NVIDIA 48 KB both fit.
         let use_flash = use_gemm
             && hd == 128
-            && self.be.max_shared_memory_bytes() >= 29056
+            && self.be.max_shared_memory_bytes() >= 32 * infr_vulkan::FLASH_SHARED_PER_ROW
             && std::env::var("INFR_NO_FLASH").is_err();
         // non-FA coopmat attention: qwen3's hd≠128 / INFR_NO_FLASH fallback, OR gemma prefill
         // (hd=256/512). gemma4 has no use_gemm, so the `gemma_prefill_attn` term brings it in.
@@ -2949,7 +2949,7 @@ impl Llama {
         // dense-prefill use_flash above) so the pipeline never over-commits shared memory.
         let use_flash = hd == 128
             && t >= 64
-            && self.be.max_shared_memory_bytes() >= 29056
+            && self.be.max_shared_memory_bytes() >= 32 * infr_vulkan::FLASH_SHARED_PER_ROW
             && std::env::var("INFR_NO_FLASH").is_err();
         let mpad = if use_flash { t.div_ceil(64) * 64 } else { t };
         let q_f16 = self

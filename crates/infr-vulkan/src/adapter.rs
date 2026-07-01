@@ -81,6 +81,51 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         }
     }
 
+    // Peephole: fuse `QkNormRope(k → k16)` + `WriteKv(k16 → cache, pos)` into a single
+    // `qk_norm_rope(k, weight, cache, ..., out_base=pos)` — matches what the production Recorder
+    // path does (writes directly into the KV cache with the row offset baked in). This eliminates:
+    // (a) the intermediate f16 scratch buffer k16, (b) the subsequent copy dispatch, and — most
+    // importantly — (c) one pipeline barrier per layer (the RAW on k16 before the copy).
+    // On qwen3-0.6B the seam had 28 extra barriers vs production (one per layer); this removes them.
+    //
+    // IMPORTANT: the intermediate tensor (e.g. k16) has ONE TensorId that is reused across ALL
+    // 28 layers' QkNormRope ops. Therefore we key the fusion map by OP INDEX (not TensorId) so
+    // that each layer's QkNormRope → WriteKv pair independently maps to its own KV-cache buffer.
+    //
+    // Key: op index of the QkNormRope that can be fused.
+    // Value: (cache TensorId, row write-offset `pos`).
+    let mut fused_kv_write: std::collections::HashMap<usize, (TensorId, usize)> =
+        std::collections::HashMap::new();
+    // Set of op indices to skip (the WriteKv ops absorbed by the fusion).
+    let mut skip_op: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, op) in graph.ops.iter().enumerate() {
+        if let Op::QkNormRope { dst: kxx, .. } = op {
+            // Only fuse if dst is an Internal (scratch) buffer — we're going to write the KV
+            // cache directly instead. If dst were already the KV cache (Weight/Output), there's
+            // nothing to fuse.
+            if !matches!(graph.tensors[kxx.0 as usize].kind, TensorKind::Internal) {
+                continue;
+            }
+            // The QkNormRope output is always f16 (the shader casts f32→f16). WriteKv with an
+            // f16 src does a plain rec.copy — exactly what the fused out_base replaces.
+            if !matches!(graph.desc(*kxx).dtype, infr_core::DType::F16) {
+                continue;
+            }
+            // Check if the very next op is WriteKv reading this tensor as src.
+            if let Some(Op::WriteKv {
+                src, cache, pos, ..
+            }) = graph.ops.get(i + 1)
+            {
+                if src == kxx {
+                    // Key by op index `i`, not by kxx.0, since k16's TensorId is shared across
+                    // all layers and would be overwritten in the HashMap on each layer iteration.
+                    fused_kv_write.insert(i, (*cache, *pos as usize));
+                    skip_op.insert(i + 1);
+                }
+            }
+        }
+    }
+
     // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
     // recorder — hold them here so they drop only after `rec.finish()` submits.
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
@@ -88,7 +133,10 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     let dummy = be_.alloc(16, BufferUsage::Activations)?;
 
     let rec = be_.recorder()?;
-    for op in &graph.ops {
+    for (op_idx, op) in graph.ops.iter().enumerate() {
+        if skip_op.contains(&op_idx) {
+            continue;
+        }
         match op {
             Op::RmsNorm {
                 x,
@@ -275,6 +323,13 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
             }
             // Fused per-head RMSNorm + RoPE → the GPU's fused kernel (f32 in → f16 out, so `dst` is an
             // f16 tensor). `freq_factors` = gemma4 proportional RoPE.
+            //
+            // Peephole: if the QkNormRope dst was detected (in the pre-pass above) as the sole input
+            // to a `WriteKv(src=dst, cache=C, pos=P)` that immediately follows, we skip the
+            // intermediate scratch write and instead pass the KV cache buffer `C` directly as `y`,
+            // with `out_base=P` so the kernel writes at the correct row offset. The WriteKv op is
+            // skipped (marked in `skip_op`). This eliminates an intermediate f16 buffer allocation,
+            // one copy dispatch, and one pipeline barrier per such layer.
             Op::QkNormRope {
                 x,
                 weight,
@@ -292,17 +347,23 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                     Some(f) => Some(r(*f)?),
                     None => None,
                 };
+                let (out_buf, out_base) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
+                    // Fused: write qk_norm_rope output directly into the KV cache at row `pos`.
+                    (r(cache)?, pos)
+                } else {
+                    (r(*dst)?, 0)
+                };
                 rec.qk_norm_rope(
                     r(*x)?,
                     r(*weight)?,
-                    r(*dst)?,
+                    out_buf,
                     *rows as usize,
                     *n_head as usize,
                     *head_dim as usize,
                     *rope_dim as usize,
                     *theta,
                     rope_pos[&positions.0],
-                    0,
+                    out_base,
                     *eps,
                     ff,
                 );

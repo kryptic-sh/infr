@@ -1215,6 +1215,9 @@ fn generate_seam(
     let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
     let max_ctx = prompt_ids.len() + n + 1;
 
+    if std::env::var("INFR_Q35_TIMING").is_ok() {
+        eprintln!("[q35dims] ne={ne} nv={nv} nk={nk} kd={kd} vd={vd} cc={cc} di={di} n_layer={} nh={nh} nkv={nkv} hd={hd}", c.n_layer);
+    }
     let attn = |i: usize| c.is_attn_layer(i);
     let n_ff_of = |i: usize| -> Result<usize> {
         Ok(g.tensors()
@@ -1788,8 +1791,11 @@ fn generate_seam(
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(posv))
             .map_err(|e| anyhow!("{e}"))?;
+        let _t_build = std::time::Instant::now();
         let (gr, h_hidden, h_pos, h_bind, h_logits) = build(pos, rows)?;
         let plan = be.compile(&gr).map_err(|e| anyhow!("{e}"))?;
+        let _bc = _t_build.elapsed();
+        let _t_exec = std::time::Instant::now();
         let mut b = Bindings::new();
         b.bind(h_hidden, hidden_buf.as_ref());
         b.bind(h_pos, pos_buf.as_ref());
@@ -1810,7 +1816,15 @@ fn generate_seam(
             }
             si += 2;
         }
-        be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))
+        let r = be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"));
+        if std::env::var("INFR_Q35_TIMING").is_ok() {
+            eprintln!(
+                "[q35timing] rows={rows} build+compile={:.2}ms execute={:.2}ms",
+                _bc.as_secs_f64() * 1e3,
+                _t_exec.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        r
     };
 
     let mut outs: Vec<u32> = Vec::new();

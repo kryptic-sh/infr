@@ -358,11 +358,15 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
                     *eps,
                 );
             }
-            // Not yet wired to a Recorder kernel. EXPLICIT arms (not a `_` catch-all) so adding a new
-            // `Op` to infr-core BREAKS this build until the adapter handles it — the compile-time
-            // exhaustiveness the CPU interpreter has. Softcap needs a new GPU kernel; MoeFfn is a
-            // multi-kernel sequence (router matmul → top-k → per-expert SwiGLU → accumulate).
-            Op::Softcap { .. } | Op::MoeFfn { .. } => {
+            // Elementwise gemma logit softcap `y = cap·tanh(x/cap)` (in-place safe).
+            Op::Softcap { x, dst, cap, n } => {
+                rec.softcap(r(*x)?, r(*dst)?, *cap, *n as usize);
+            }
+            // Not yet wired: MoeFfn is a multi-kernel sequence (router matmul → top-k → per-expert
+            // SwiGLU → weighted accumulate), not a single Recorder call. EXPLICIT arm (not a `_`
+            // catch-all) so adding a new `Op` to infr-core BREAKS this build until handled — the
+            // compile-time exhaustiveness the CPU interpreter has.
+            Op::MoeFfn { .. } => {
                 return Err(be(format!(
                     "vulkan adapter: op not yet wired: {}",
                     op.kind()

@@ -2454,6 +2454,22 @@ impl<'a> Recorder<'a> {
         self.dispatch(k, &[Self::vkb(y)], 1, &push, (n as u32).div_ceil(64));
     }
 
+    /// Elementwise softcap `y[i] = cap·tanh(x[i]/cap)` (gemma final-logit / attn softcap). In-place
+    /// safe — bind `x == y`.
+    pub fn softcap(&self, x: &dyn Buffer, y: &dyn Buffer, cap: f32, n: usize) {
+        let k = self.be.kernel("softcap", crate::gemm::softcap_spv(), 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&cap.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
     pub fn add_scaled(&self, x: &dyn Buffer, acc: &dyn Buffer, scale: f32, n: usize) {
         let k = self
             .be

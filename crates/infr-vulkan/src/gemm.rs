@@ -429,6 +429,12 @@ pub(crate) fn scale_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for elementwise softcap `y = cap·tanh(x/cap)` (gemma logit softcap).
+pub(crate) fn softcap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/softcap.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the row gather (`dst[j]=src[idx[j]]`).
 pub(crate) fn gather_rows_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gather_rows.spv"));

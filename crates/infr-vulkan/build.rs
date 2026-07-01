@@ -36,6 +36,7 @@ fn main() {
         ("add", "add", &[]),
         ("add_scaled", "add_scaled", &[]),
         ("scale", "scale", &[]),
+        ("softcap", "softcap", &[]),
         ("gather_rows", "gather_rows", &[]),
         ("scatter_add_rows", "scatter_add_rows", &[]),
         ("silu_mul", "silu_mul", &[]),

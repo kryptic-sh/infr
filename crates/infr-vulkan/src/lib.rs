@@ -1030,6 +1030,28 @@ mod ssm_tests {
     }
 
     #[test]
+    fn softcap_matches_cpu() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let (n, cap) = (100usize, 30.0f32);
+        let x = det(n, 0.5);
+        let out_cpu: Vec<f32> = x.iter().map(|&v| cap * (v / cap).tanh()).collect();
+        let xb = dev(&be, &x);
+        let ob = be.alloc(n * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.softcap(xb.as_ref(), ob.as_ref(), cap, n);
+        rec.finish().unwrap();
+        let out_gpu = read(&be, ob.as_ref(), n);
+        let e = maxerr(&out_cpu, &out_gpu);
+        assert!(e < 1e-4, "softcap err {e}");
+    }
+
+    #[test]
     fn deltanet_matches_cpu() {
         let be = match VulkanBackend::new() {
             Ok(b) => b,

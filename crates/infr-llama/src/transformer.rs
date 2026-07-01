@@ -1814,6 +1814,17 @@ impl Llama {
         // mmq + flash (lower per-token work) — a coding-agent turn ingests at depth, so its chunks
         // were the over-shrunk ones. 2048 chunks warmed to 32k run without tripping the watchdog on
         // this model; the budget still tapers for very long context / bigger models.
+        // gemma/gemma4 route the whole prefill attention through the hd-general `attention_kv` GEMV
+        // (the flash/mmq GEMM kernels assume a uniform hd=128), and gemma4 also disables the coopmat
+        // projection GEMM — so its prefill runs at ~10 ms/token, ~10× the flash path the big-budget
+        // branch below assumes. At the 256-token chunk that budget hands out, ONE submit runs ~2 s and
+        // trips the GPU's hang-recovery watchdog: the first overrun is soft-recovered (survives, but
+        // returns garbage), the SECOND consecutive overrun is a HARD recovery → device lost (the
+        // multi-rep prefill / 2nd serve request crash). Cap the chunk so each submit stays well under
+        // the watchdog; taper with context so the growing attention span stays bounded too.
+        if self.cfg.gemma {
+            return (524_288 / (pos + 1)).clamp(32, 128);
+        }
         let budget = if self.cfg.qk_norm {
             32_000_000
         } else {

@@ -684,6 +684,12 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
+    // qwen35 (Qwen3-Next): a hybrid gated-DeltaNet + GQA model with a bespoke per-token forward —
+    // it is NOT a `Llama` (dense/MoE), so `load_opt` below can't load or run it. Route it through
+    // its own loader + `forward`, reusing the same pp/tg/pg warmup-then-time methodology.
+    if infr_llama::qwen35::is_qwen35(&gguf) {
+        return cmd_bench_qwen35(&gguf, n_prompt, n_gen, depth, pg, reps, ngl == 0, json);
+    }
     // INFR_GPU_SEAM=1: bench the dense forward on the Vulkan backend THROUGH THE AGNOSTIC SEAM
     // instead of the production Recorder path. An eligible qwen3-style dense decode now records the
     // graph ONCE and replays it per token (params-driven `_dyn` kernels), matching the production
@@ -881,6 +887,89 @@ fn cmd_bench_cpu(
             String::new()
         };
         println!("{label}{d} [cpu]: {avg:.1} t/s  ({reps} reps)");
+    }
+    Ok(())
+}
+
+/// qwen35 (Qwen3-Next) bench: the hybrid gated-DeltaNet + GQA forward is a bespoke per-token path
+/// (no batched-prefill kernel, and not a [`infr_llama::Llama`]), so it can't ride the dense/MoE
+/// bench above. Same pp/tg/pg methodology as [`cmd_bench`] — warm the pipelines outside the timed
+/// region, then time prefill and decode SEPARATELY — driven through the model's public
+/// [`infr_llama::qwen35::Model::forward`]. Dummy tokens (timing is data-independent). `cpu` selects
+/// the `Q35_CPU=1` reference forward (`-ngl 0`) vs the GPU-resident forward.
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench_qwen35(
+    gguf: &Path,
+    n_prompt: usize,
+    n_gen: usize,
+    depth: usize,
+    pg: Option<(usize, usize)>,
+    reps: usize,
+    cpu: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    // -ngl 0: force the pure-CPU oracle forward (no Vulkan), matching `llama-bench -ngl 0`.
+    if cpu {
+        std::env::set_var("Q35_CPU", "1");
+    }
+    let model = infr_llama::qwen35::load_path(gguf)?;
+    let measure_tg = pg.is_none() && n_gen > 0;
+    let dummy = |i: usize| (i % 100) as u32;
+    // Untimed warmup: one forward on a throwaway state compiles the lazy GPU pipelines (and pages in
+    // the weights), keeping that one-time cost out of the timed reps — the qwen35 analogue of the
+    // dense path's `Llama::warmup` at load.
+    {
+        let mut st = model.new_state();
+        let _ = model.forward(dummy(0), &mut st);
+    }
+    let mut samples = Vec::with_capacity(reps.max(1));
+    for _ in 0..reps.max(1) {
+        // Fresh state per rep; advance it to `depth` (untimed) so tg is measured at that context.
+        let mut st = model.new_state();
+        for i in 0..depth {
+            let _ = model.forward(dummy(i), &mut st);
+        }
+        let t = std::time::Instant::now();
+        let ts = if let Some((p, g)) = pg {
+            // coding-agent turn: time prompt ingest + reply generation together.
+            for i in 0..p {
+                let _ = model.forward(dummy(depth + i), &mut st);
+            }
+            for _ in 0..g {
+                let _ = model.forward(7u32, &mut st);
+            }
+            (p + g) as f64 / t.elapsed().as_secs_f64()
+        } else if measure_tg {
+            for _ in 0..n_gen {
+                let _ = model.forward(7u32, &mut st);
+            }
+            n_gen as f64 / t.elapsed().as_secs_f64()
+        } else {
+            for i in 0..n_prompt {
+                let _ = model.forward(dummy(depth + i), &mut st);
+            }
+            n_prompt as f64 / t.elapsed().as_secs_f64()
+        };
+        samples.push(ts);
+    }
+    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
+    if json {
+        println!("[{{\"avg_ts\": {avg:.2}}}]");
+    } else {
+        let label = if let Some((p, g)) = pg {
+            format!("pg{p}+{g}")
+        } else if measure_tg {
+            format!("tg{n_gen}")
+        } else {
+            format!("pp{n_prompt}")
+        };
+        let d = if depth > 0 {
+            format!(" @ d{depth}")
+        } else {
+            String::new()
+        };
+        let tag = if cpu { " [cpu]" } else { "" };
+        println!("{label}{d}{tag}: {avg:.1} t/s  ({reps} reps)");
     }
     Ok(())
 }

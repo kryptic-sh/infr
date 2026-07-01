@@ -1771,6 +1771,14 @@ pub fn generate_cpu(
     })
 }
 
+/// Open the GGUF at `path` and build the bespoke qwen35 [`Model`] (GPU-resident forward, or the
+/// `Q35_CPU=1` oracle). CLI/bench convenience so callers can drive the per-token [`Model::forward`]
+/// for timing without depending on `infr_gguf` directly.
+pub fn load_path(path: &std::path::Path) -> Result<Model> {
+    let g = Gguf::open(path).map_err(|e| anyhow!("{e}"))?;
+    Model::load(&g)
+}
+
 /// True if the GGUF at `path` is a `qwen35` (Qwen3-Next) model.
 pub fn is_qwen35(path: &std::path::Path) -> bool {
     Gguf::open(path)

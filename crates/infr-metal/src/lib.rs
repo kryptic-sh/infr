@@ -74,7 +74,10 @@ pub struct MetalBackend {
     qui_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<exec::QuiWeight>>>,
     /// Opt-in execution profiler; active only when `INFR_METAL_PROFILE` is set. `profiling` is
     /// cached so the hot path avoids an env lookup and skips the `Instant` calls when off.
+    /// `prof_ops` (`INFR_METAL_PROFILE=2`) additionally flushes after each op to attribute GPU wall
+    /// per op — costs the batching, so it's an analysis mode, not the fast path.
     pub(crate) profiling: bool,
+    pub(crate) prof_ops: bool,
     pub(crate) prof: std::sync::Mutex<profile::Profile>,
 }
 
@@ -95,6 +98,7 @@ impl MetalBackend {
             weight_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             qui_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             profiling: std::env::var("INFR_METAL_PROFILE").is_ok(),
+            prof_ops: std::env::var("INFR_METAL_PROFILE").as_deref() == Ok("2"),
             prof: std::sync::Mutex::new(profile::Profile::default()),
         })
     }

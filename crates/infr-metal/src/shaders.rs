@@ -85,36 +85,42 @@ kernel void softcap_f32(device const float* x   [[buffer(0)]],
     if (gid < p.n) dst[gid] = p.cap * tanh(x[gid] / p.cap);
 }
 
-// ---- norms (one thread per normalized group; sequential reduce to match the CPU sum order) ----
+// ---- norms: one SIMD group (32 lanes) per normalized group. Lanes stride the group, `simd_sum`
+// reduces the sum-of-squares, then all 32 write the scaled output in parallel. (Decode has rows=1,
+// so the old one-thread-per-row kernel ran the whole reduction on a single thread — pathological.)
 struct RmsParams { uint rows; uint dim; float eps; };
 kernel void rmsnorm_f32(device const float* x   [[buffer(0)]],
                         device const float* w   [[buffer(1)]],
                         device float*       dst [[buffer(2)]],
                         constant RmsParams& p   [[buffer(3)]],
-                        uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.rows) return;
-    uint base = gid * p.dim;
+                        uint gid  [[thread_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    uint row = gid / 32u;
+    if (row >= p.rows) return;
+    uint base = row * p.dim;
     float ss = 0.0f;
-    for (uint i = 0; i < p.dim; i++) { float v = x[base + i]; ss += v * v; }
-    ss /= (float)p.dim;
+    for (uint i = lane; i < p.dim; i += 32u) { float v = x[base + i]; ss += v * v; }
+    ss = simd_sum(ss) / (float)p.dim;
     float s = 1.0f / sqrt(ss + p.eps);
-    for (uint i = 0; i < p.dim; i++) dst[base + i] = x[base + i] * s * w[i];
+    for (uint i = lane; i < p.dim; i += 32u) dst[base + i] = x[base + i] * s * w[i];
 }
 
-// per-head RMSNorm: one thread per (row, head), weight indexed within head_dim
+// per-head RMSNorm: one SIMD group (32 lanes) per (row, head), weight indexed within head_dim.
 struct QkNormParams { uint rows; uint n_head; uint head_dim; float eps; };
 kernel void qknorm_f32(device const float* x   [[buffer(0)]],
                        device const float* w   [[buffer(1)]],
                        device float*       dst [[buffer(2)]],
                        constant QkNormParams& p [[buffer(3)]],
-                       uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.rows * p.n_head) return;
-    uint base = gid * p.head_dim;
+                       uint gid  [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint grp = gid / 32u;
+    if (grp >= p.rows * p.n_head) return;
+    uint base = grp * p.head_dim;
     float ss = 0.0f;
-    for (uint i = 0; i < p.head_dim; i++) { float v = x[base + i]; ss += v * v; }
-    ss /= (float)p.head_dim;
+    for (uint i = lane; i < p.head_dim; i += 32u) { float v = x[base + i]; ss += v * v; }
+    ss = simd_sum(ss) / (float)p.head_dim;
     float s = 1.0f / sqrt(ss + p.eps);
-    for (uint i = 0; i < p.head_dim; i++) dst[base + i] = x[base + i] * s * w[i];
+    for (uint i = lane; i < p.head_dim; i += 32u) dst[base + i] = x[base + i] * s * w[i];
 }
 
 // ---- Linear: dst[m, out_f] = x[m, in_f] · Wᵀ, W row-major [out_f, in_f], pre-dequantized to f32.
@@ -206,6 +212,9 @@ kernel void rope_f32(device const float* x   [[buffer(0)]],
 }
 
 // ---- Fused per-head RMSNorm + RoPE (QkNormRope): rmsnorm (× weight) then rotate the normed head.
+// One SIMD group per (row, head): `simd_sum` for the norm, then lanes split the rotation pairs. Each
+// lane forms its normed values straight from `x` (× s × w), so no cross-lane read of `dst` — no
+// barrier needed. Pass-through dims [rope_dim, head_dim) are written normed in the tail loop.
 struct QkRopeParams { uint rows; uint n_head; uint head_dim; uint rope_dim; float theta; float eps; uint has_ff; };
 kernel void qknormrope_f32(device const float* x   [[buffer(0)]],
                            device const float* w   [[buffer(1)]],
@@ -213,26 +222,29 @@ kernel void qknormrope_f32(device const float* x   [[buffer(0)]],
                            device const float* ff  [[buffer(3)]],
                            device float*       dst [[buffer(4)]],
                            constant QkRopeParams& p [[buffer(5)]],
-                           uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.rows * p.n_head) return;
-    uint r = gid / p.n_head;
-    uint base = gid * p.head_dim;
+                           uint gid  [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    uint grp = gid / 32u;
+    if (grp >= p.rows * p.n_head) return;
+    uint r = grp / p.n_head;
+    uint base = grp * p.head_dim;
     float ss = 0.0f;
-    for (uint i = 0; i < p.head_dim; i++) { float v = x[base + i]; ss += v * v; }
-    ss /= (float)p.head_dim;
+    for (uint i = lane; i < p.head_dim; i += 32u) { float v = x[base + i]; ss += v * v; }
+    ss = simd_sum(ss) / (float)p.head_dim;
     float s = 1.0f / sqrt(ss + p.eps);
-    for (uint i = 0; i < p.head_dim; i++) dst[base + i] = x[base + i] * s * w[i];
     uint hf = p.rope_dim / 2;
     float p0 = pos[r];
-    for (uint pp = 0; pp < hf; pp++) {
+    for (uint pp = lane; pp < hf; pp += 32u) {
         uint i0 = pp, i1 = pp + hf;
         float ang = p0 * pow(p.theta, -2.0f * (float)pp / (float)p.rope_dim);
         if (p.has_ff != 0) ang /= ff[pp];
         float c = cos(ang), sn = sin(ang);
-        float a = dst[base + i0], b = dst[base + i1];
+        float a = x[base + i0] * s * w[i0];
+        float b = x[base + i1] * s * w[i1];
         dst[base + i0] = a * c - b * sn;
         dst[base + i1] = a * sn + b * c;
     }
+    for (uint i = p.rope_dim + lane; i < p.head_dim; i += 32u) dst[base + i] = x[base + i] * s * w[i];
 }
 
 // ---- Gated FFN activation: dst[r,i] = act(gate[r,i]) * up[r, i + up_off]. act: 0=SiLU,1=GELU,2=Sigmoid

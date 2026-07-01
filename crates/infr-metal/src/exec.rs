@@ -309,7 +309,20 @@ impl MetalBackend {
             for op in &g.ops {
                 let t0 = std::time::Instant::now();
                 self.run_op(op, g, bindings, &mut r)?;
-                self.prof.lock().unwrap().add_op(op_name(op), t0.elapsed());
+                let enc = t0.elapsed();
+                // Per-op mode: flush now so this op's GPU wall is isolable (breaks batching).
+                let gpu = if self.prof_ops {
+                    let tg = std::time::Instant::now();
+                    self.flush(&mut r);
+                    Some(tg.elapsed())
+                } else {
+                    None
+                };
+                let mut pr = self.prof.lock().unwrap();
+                pr.add_op(op_name(op), enc);
+                if let Some(gpu) = gpu {
+                    pr.add_op_gpu(op_name(op), gpu);
+                }
             }
             self.prof.lock().unwrap().add_forward();
         } else {
@@ -470,7 +483,15 @@ impl MetalBackend {
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(dim as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                self.encode(r, &pso, &[bx.as_ref(), bw.as_ref(), bd.as_ref()], &p, rows);
+                // One simdgroup (32 lanes) per row — see `rmsnorm_f32`.
+                self.encode_tg(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                    &p,
+                    rows * 32,
+                    32,
+                );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::QkNorm {
@@ -491,12 +512,14 @@ impl MetalBackend {
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                self.encode(
+                // One simdgroup per (row, head) — see `qknorm_f32`.
+                self.encode_tg(
                     r,
                     &pso,
                     &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
                     &p,
-                    rows * nh,
+                    rows * nh * 32,
+                    32,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
@@ -607,7 +630,8 @@ impl MetalBackend {
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
-                self.encode(
+                // One simdgroup per (row, head) — see `qknormrope_f32`.
+                self.encode_tg(
                     r,
                     &pso,
                     &[
@@ -618,7 +642,8 @@ impl MetalBackend {
                         bd.as_ref(),
                     ],
                     &p,
-                    rows * nh,
+                    rows * nh * 32,
+                    32,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

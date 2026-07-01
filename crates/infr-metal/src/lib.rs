@@ -5,17 +5,22 @@
 //! Reference Metal compute backend — a correctness-first implementation of the [`Backend`] seam
 //! (the same one `infr-cpu` and `infr-vulkan` implement) on Apple's Metal API.
 //!
-//! Priorities are *correctness and clarity*, not speed: the backend keeps each graph tensor's
-//! working values in host f32 vectors (exactly like the CPU interpreter), and delegates each op's
-//! arithmetic to a small Metal compute kernel operating on f32 `MTLBuffer`s. Quantized `Op::Linear`
-//! weights are dequantized to f32 on the host (reusing `infr_gguf::dequant`) and cached as device
-//! buffers, so the MSL kernels never need to understand a single GGUF quant format.
+//! Priorities are *correctness and clarity* first, then not being needlessly slow. Each op's
+//! arithmetic runs in a small Metal compute kernel over f32 `MTLBuffer`s, following `infr-cpu`'s
+//! dataflow closely so it stays in numeric parity (see `tests/parity.rs`).
 //!
-//! This follows `infr-cpu`'s execution model closely, which is what makes it easy to keep in
-//! numeric parity (see `tests/parity.rs`). It is not bit-for-bit identical everywhere: quantized
-//! `Op::Linear` runs a full-f32 dequant dot here, whereas the CPU path quantizes the *activation*
-//! to Q8 and uses integer dots — so this backend is actually the slightly more accurate of the two.
-//! A resident-on-device, kernel-fused fast path is future work.
+//! To avoid a CPU↔GPU round-trip per op, graph tensors stay *resident on the device*: a per-forward
+//! executor (`exec::Resident`) tracks whether each tensor's current value is on the host or the
+//! device, encodes consecutive GPU ops into a single command buffer (Metal hazard-tracks the
+//! barriers), and only syncs to the host at a host-side op or the final write-back. Quantized
+//! `Op::Linear` weights are kept in a compact unified form (u8 codes + one `(scale, min)` per 16
+//! elems) and decoded inline by `linear_qui`, so the kernels stay format-agnostic and never blow a
+//! quant weight up to f32. `INFR_METAL_PROFILE=1` prints a per-op / GPU-wall breakdown on drop.
+//!
+//! Not bit-for-bit identical to the CPU everywhere: quantized `Op::Linear` reconstructs the exact
+//! `dequant` value but dots in f32, whereas the CPU path quantizes the *activation* to Q8 and uses
+//! integer dots — so this backend is actually the slightly more accurate of the two. Faster matvec
+//! kernels (GEMV occupancy / fusion) are future work.
 
 use infr_core::backend::{Backend, Bindings, BufferUsage, Capabilities, GraphPlan, Plan};
 use infr_core::error::{Error, Result};
@@ -23,6 +28,7 @@ use infr_core::graph::Graph;
 use metal::{Buffer as MtlBuffer, CommandQueue, Device};
 
 mod exec;
+mod profile;
 mod shaders;
 
 fn be(msg: impl std::fmt::Display) -> Error {
@@ -62,6 +68,14 @@ pub struct MetalBackend {
     /// generation and distinct weights have distinct addresses. Reusing an instance across models
     /// (with buffer free/realloc) could return a stale f32 for a recycled address; don't.
     weight_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<MtlBuffer>>>,
+    /// Native-quant weight cache (same single-generation lifetime as `weight_cache`): a quantized
+    /// weight kept in its compact unified form — u8 codes + one (scale, min) per 16 elems — that the
+    /// `linear_qui` kernel decodes inline. ~12 bpw vs f32's 32, and reconstructs the exact same value.
+    qui_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<exec::QuiWeight>>>,
+    /// Opt-in execution profiler; active only when `INFR_METAL_PROFILE` is set. `profiling` is
+    /// cached so the hot path avoids an env lookup and skips the `Instant` calls when off.
+    pub(crate) profiling: bool,
+    pub(crate) prof: std::sync::Mutex<profile::Profile>,
 }
 
 // MTLDevice / MTLCommandQueue are documented thread-safe; the pipeline states are immutable after
@@ -79,7 +93,18 @@ impl MetalBackend {
             queue,
             pipelines,
             weight_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            qui_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            profiling: std::env::var("INFR_METAL_PROFILE").is_ok(),
+            prof: std::sync::Mutex::new(profile::Profile::default()),
         })
+    }
+}
+
+impl Drop for MetalBackend {
+    fn drop(&mut self) {
+        if self.profiling {
+            self.prof.lock().unwrap().print_summary();
+        }
     }
 }
 

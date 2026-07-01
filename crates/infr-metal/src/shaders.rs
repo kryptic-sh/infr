@@ -118,21 +118,55 @@ kernel void qknorm_f32(device const float* x   [[buffer(0)]],
 }
 
 // ---- Linear: dst[m, out_f] = x[m, in_f] · Wᵀ, W row-major [out_f, in_f], pre-dequantized to f32.
-// Reference kernel: one thread per output element, sequential dot (matches the CPU sum order).
+// One SIMD group (32 lanes) per output element: lanes stride the weight row contiguously — so
+// consecutive lanes read consecutive weights (coalesced, full memory bandwidth, vs the strided
+// one-thread-per-output naive matvec) — then `simd_sum` reduces. The lane-interleaved partial sums
+// change the f32 summation order (still within parity tolerance; Linear was never bit-identical).
 struct LinearParams { uint m; uint in_f; uint out_f; };
 kernel void linear_f32(device const float* x   [[buffer(0)]],
                        device const float* w   [[buffer(1)]],
                        device float*       dst [[buffer(2)]],
                        constant LinearParams& p [[buffer(3)]],
-                       uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.m * p.out_f) return;
-    uint r = gid / p.out_f;
-    uint o = gid % p.out_f;
+                       uint gid [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;                       // one simdgroup per (row, output) pair
+    if (sg >= p.m * p.out_f) return;
+    uint r = sg / p.out_f;
+    uint o = sg % p.out_f;
     device const float* xr = x + (ulong)r * p.in_f;
     device const float* wo = w + (ulong)o * p.in_f;
     float acc = 0.0f;
-    for (uint i = 0; i < p.in_f; i++) acc += xr[i] * wo[i];
-    dst[gid] = acc;
+    for (uint i = lane; i < p.in_f; i += 32u) acc += xr[i] * wo[i];
+    acc = simd_sum(acc);
+    if (lane == 0u) dst[sg] = acc;
+}
+
+// ---- Linear over a NATIVE quantized weight in unified form: `w = scale*code + min`, with one u8
+// code per element and one (scale,min) per 16-element block. Same simdgroup GEMV as linear_f32, but
+// the weight is decoded inline — ~12 bpw read instead of a 32 bpw dequant-to-f32 blow-up. The
+// reconstruction is bit-for-bit what infr_gguf::dequant produces, so parity with the CPU stays exact.
+kernel void linear_qui(device const float*  x     [[buffer(0)]],
+                       device const uchar*  codes [[buffer(1)]],
+                       device const float2* sm    [[buffer(2)]],
+                       device float*        dst   [[buffer(3)]],
+                       constant LinearParams& p   [[buffer(4)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.m * p.out_f) return;
+    uint r = sg / p.out_f;
+    uint o = sg % p.out_f;
+    ulong xbase = (ulong)r * p.in_f;
+    ulong wbase = (ulong)o * p.in_f;
+    float acc = 0.0f;
+    for (uint i = lane; i < p.in_f; i += 32u) {
+        ulong gpos = wbase + i;
+        float2 s = sm[gpos >> 4];                 // (scale, min) for this element's 16-block
+        float w = s.x * (float)codes[gpos] + s.y;
+        acc += x[xbase + i] * w;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) dst[sg] = acc;
 }
 
 // ---- RoPE (NEOX): rotate the first rope_dim of each head; dims beyond pass through. One thread
@@ -248,5 +282,60 @@ kernel void attention_f32(device const float* q   [[buffer(0)]],
         m = mnew;
     }
     for (uint d = 0; d < p.head_dim; d++) dst[qb + d] = acc[d] / l;
+}
+
+// Same as attention_f32, but reads the KV cache in its native f16 straight from the bound buffer
+// (no host materialize-to-f32 round-trip). Values match the CPU's f16→f32 read exactly.
+kernel void attention_f16kv(device const float* q   [[buffer(0)]],
+                            device const half*  k   [[buffer(1)]],
+                            device const half*  v   [[buffer(2)]],
+                            device float*       dst [[buffer(3)]],
+                            constant AttnParams& p  [[buffer(4)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows * p.n_head) return;
+    uint ti = gid / p.n_head;
+    uint h = gid % p.n_head;
+    uint group = p.n_head / p.n_kv;
+    uint kvh = h / group;
+    uint qb = gid * p.head_dim;
+    uint abs = p.pos + ti;
+    uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
+
+    float acc[MAX_HD];
+    for (uint d = 0; d < p.head_dim; d++) acc[d] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint j = lo; j <= abs; j++) {
+        uint kb = (j * p.n_kv + kvh) * p.head_dim;
+        float sc = 0.0f;
+        for (uint d = 0; d < p.head_dim; d++) sc += q[qb + d] * (float)k[kb + d];
+        sc *= p.scale;
+        float mnew = max(m, sc);
+        float corr = exp(m - mnew);
+        float pw = exp(sc - mnew);
+        l = l * corr + pw;
+        uint vb = (j * p.n_kv + kvh) * p.head_dim;
+        for (uint d = 0; d < p.head_dim; d++) acc[d] = acc[d] * corr + pw * (float)v[vb + d];
+        m = mnew;
+    }
+    for (uint d = 0; d < p.head_dim; d++) dst[qb + d] = acc[d] / l;
+}
+
+// ---- WriteKv: cast-copy `n` f32 source elems into the bound KV cache at row offset `base`, on the
+// GPU so it stays in the batch (no host round-trip that would force a per-layer flush). The (half)
+// cast is IEEE round-to-nearest-even — byte-identical to the host `f16::from_f32` reference.
+struct WriteKvParams { uint n; uint base; };
+kernel void writekv_f16(device const float* src   [[buffer(0)]],
+                        device half*        cache [[buffer(1)]],
+                        constant WriteKvParams& p [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    cache[p.base + gid] = (half)src[gid];
+}
+kernel void writekv_f32(device const float* src   [[buffer(0)]],
+                        device float*       cache [[buffer(1)]],
+                        constant WriteKvParams& p [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    cache[p.base + gid] = src[gid];
 }
 "#;

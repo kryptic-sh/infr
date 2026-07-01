@@ -21,8 +21,17 @@ fn main() {
         ("attn_qk", "attn_qk", &[]),
         ("attn_qk_warp", "attn_qk_warp", &[]),
         ("attn_flash", "attn_flash", &[]),
+        ("attn_flash", "attn_flash_bm32", &["-DBM_TILE=32"]),
         ("attn_flash_partial", "attn_flash_partial", &[]),
+        (
+            "attn_flash_partial",
+            "attn_flash_partial_bm32",
+            &["-DBM_TILE=32"],
+        ),
         ("attn_flash_warp", "attn_flash_warp", &[]),
+        // BM=32 tile: 29056 B shared (vs 58112 B), fits NVIDIA (48 KB) / MoltenVK (32 KB) devices
+        // whose maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs.
+        ("attn_flash_warp", "attn_flash_warp_bm32", &["-DBM_TILE=32"]),
         ("attn_flash_reg", "attn_flash_reg", &[]),
         ("attn_flash_combine", "attn_flash_combine", &[]),
         ("attn_softmax", "attn_softmax", &[]),

@@ -24,6 +24,10 @@ pub struct Capabilities {
     pub f16: bool,
     pub cooperative_matrix: bool,
     pub max_buffer_bytes: u64,
+    /// `maxComputeSharedMemorySize` — the per-workgroup shared-memory budget. Vulkan only guarantees
+    /// 16 KB; RADV gives 64 KB, NVIDIA 48 KB, MoltenVK/mobile often 32 KB. The flash-attention tile
+    /// height is picked to fit this (and flash is skipped entirely if even the smallest tile won't).
+    pub max_shared_memory_bytes: u32,
     pub unified_memory: bool,
     /// The backend records a single-token decode graph ONCE and replays it per token, reading the
     /// position from a device-side params buffer (Vulkan seam) instead of the graph's baked `pos`.

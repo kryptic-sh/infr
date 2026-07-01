@@ -1,11 +1,21 @@
 #version 460
-// 8-warp/256-thread register-blocked flash-attention partial (hd=128). Same algorithm as
+// Register-blocked flash-attention partial (hd=128). Same algorithm as
 // attn_flash_partial (fused QK→online-softmax→PV, split-K over kv via gl_WorkGroupID.y, emits
 // un-normalized partials for attn_flash_combine) but both matmuls use the mul_mm-style warp tiling:
 // 8 warps split the tile, each keeps several 16×16 coopmat accumulators in registers and reuses the
 // loaded A fragment across them. K stays in shared via the score buffer; Q/K/V are coopMatLoad'd from
 // global (S/P/O live in shared, which caps the tile at BN=64 — the inherent flash vs non-FA tradeoff).
 // hd is fixed 128 so the per-warp fragment counts are compile-time. Requires sg32, q4-irrelevant.
+//
+// BM_TILE (query rows per workgroup) is a build-time knob: the shared scratch is Ss(BM*BN f32) +
+// Ps(BM*BN f16) + Os(BM*HD f32) + 3*BM f32 = BM*908 bytes. BM=64 → 58112 B needs a 64 KB shared
+// device (AMD RADV); BM=32 → 29056 B fits NVIDIA (48 KB) / MoltenVK (32 KB). The recorder picks the
+// largest tile the device's maxComputeSharedMemorySize allows. BM only scales WARPS_M / workgroup
+// size / shared sizes — the coopmat fragment counts (QK/PV_CMS_N) and the kv block (BN) are fixed,
+// so the online-softmax accumulation order is identical across tiles (bit-for-bit vs BM=64).
+#ifndef BM_TILE
+#define BM_TILE 64
+#endif
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -14,12 +24,13 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : require
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+// workgroup = WARPS_M*WARPS_N subgroups of 32 lanes = (BM/16)*2*32 = BM*4 threads.
+layout(local_size_x = (BM_TILE * 4), local_size_y = 1, local_size_z = 1) in;
 
-const uint BM = 64u;
+const uint BM = BM_TILE;
 const uint BN = 64u;
 const uint HD = 128u;
-const uint WARPS_M = 4u; // warp_r owns rows [warp_r*16, +16)
+const uint WARPS_M = BM_TILE / 16u; // warp_r owns rows [warp_r*16, +16)
 const uint WARPS_N = 2u; // warp_c owns a column band
 const uint QK_CMS_N = (BN / WARPS_N) / 16u; // 2  (cols per warp / 16)
 const uint PV_CMS_N = (HD / WARPS_N) / 16u; // 4
@@ -62,7 +73,7 @@ void main() {
     uint nkvhd = pc.nkv * HD;
     float scale = 1.0 / sqrt(float(HD));
 
-    for (uint i = li; i < BM * HD; i += 256u) { Os[i] = 0.0; }
+    for (uint i = li; i < BM * HD; i += gl_WorkGroupSize.x) { Os[i] = 0.0; }
     if (li < BM) { mrow[li] = -1e30; lrow[li] = 0.0; }
     barrier();
 
@@ -93,8 +104,8 @@ void main() {
         }
         barrier();
 
-        // Online softmax — all 256 threads active: 4 lanes/row (cluster of 4), each owns 16 cols;
-        // subgroupClustered{Max,Add} reduce across the 4. 8 subgroups × 8 rows = 64 rows in parallel.
+        // Online softmax — all threads active: 4 lanes/row (cluster of 4), each owns 16 cols;
+        // subgroupClustered{Max,Add} reduce across the 4. WARPS_M*WARPS_N subgroups × 8 rows = BM rows.
         {
             uint lane = gl_SubgroupInvocationID;        // 0..31
             uint r = gl_SubgroupID * 8u + lane / 4u;    // 0..63 (cluster of 4 consecutive lanes = 1 row)
@@ -127,7 +138,7 @@ void main() {
             }
         }
         barrier();
-        for (uint i = li; i < BM * HD; i += 256u) { Os[i] *= corr[i / HD]; }
+        for (uint i = li; i < BM * HD; i += gl_WorkGroupSize.x) { Os[i] *= corr[i / HD]; }
         barrier();
 
         // O += P·V. warp owns rows [warp_r*16,+16), hd cols [warp_c*64, +64) → PV_CMS_N frags.
@@ -158,7 +169,7 @@ void main() {
     }
 
     uint sl = split * pc.q_len;
-    for (uint i = li; i < BM * HD; i += 256u) {
+    for (uint i = li; i < BM * HD; i += gl_WorkGroupSize.x) {
         uint r = i / HD;
         uint d = i % HD;
         po[(sl + (qr0 + r)) * pc.nh * HD + h * HD + d] = Os[i];

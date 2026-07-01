@@ -5,15 +5,21 @@
 // (q-tile, head, split) emits an UN-normalized online-softmax partial: Os (running Σ exp(s-m)·v),
 // m (running max), l (running sum). attn_flash_combine merges splits per (row,head). No race: each
 // partial writes a disjoint [split] slice; combine only reads. Q/K/V f16, partials f32. hd%16,hd<=128.
+// BM_TILE (query rows/tile) is a build knob: shared scratch = BM*908 B. BM=64 → 58112 B (64 KB
+// device); BM=32 → 29056 B (NVIDIA 48 KB / MoltenVK 32 KB). Recorder picks the tile from
+// maxComputeSharedMemorySize; workgroup = (BM/16) subgroups of 32. (See attn_flash_warp.comp.)
+#ifndef BM_TILE
+#define BM_TILE 64
+#endif
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = (BM_TILE * 2), local_size_y = 1, local_size_z = 1) in;
 
-const uint BM = 64u;
+const uint BM = BM_TILE;
 const uint BN = 64u;
 
 layout(push_constant) uniform PC {
@@ -51,7 +57,7 @@ void main() {
     uint hd = pc.hd;
     float scale = 1.0 / sqrt(float(hd));
 
-    for (uint i = li; i < BM * hd; i += 128u) { Os[i] = 0.0; }
+    for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) { Os[i] = 0.0; }
     if (li < BM) { mrow[li] = -1e30; lrow[li] = 0.0; }
     barrier();
 
@@ -99,7 +105,7 @@ void main() {
         }
         barrier();
 
-        for (uint i = li; i < BM * hd; i += 128u) { Os[i] *= corr[i / hd]; }
+        for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) { Os[i] *= corr[i / hd]; }
         barrier();
 
         for (uint ct = 0u; ct < hd; ct += 16u) {
@@ -121,7 +127,7 @@ void main() {
     }
 
     // Emit UN-normalized partial for this split (combine merges + normalizes).
-    for (uint i = li; i < BM * hd; i += 128u) {
+    for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) {
         uint r = i / hd;
         uint d = i % hd;
         po[(split * pc.q_len + (qr0 + r)) * pc.nh * hd + h * hd + d] = Os[i];

@@ -949,7 +949,13 @@ impl Llama {
         //    or via INFR_NO_FLASH.
         // Both are correctness-tested (attention_prefill_{nonfa,flash}_matches_cpu) so neither rots.
         // DEFAULT = flash for hd=128. TODO: auto-select from device bandwidth/FLOP caps.
-        let use_flash = use_gemm && hd == 128 && std::env::var("INFR_NO_FLASH").is_err();
+        // The flash partial's smallest tile (bm=32) needs 29056 B of shared memory; if the device's
+        // maxComputeSharedMemorySize can't fit even that, fall back to the non-FA path (else the
+        // over-committed pipeline faults the GPU → device-lost). RADV 64 KB / NVIDIA 48 KB both fit.
+        let use_flash = use_gemm
+            && hd == 128
+            && self.be.max_shared_memory_bytes() >= 29056
+            && std::env::var("INFR_NO_FLASH").is_err();
         // gemma (hd=256) has no flash/nonfa prefill kernel (those tile on hd=128); keep its GEMM
         // projections but route attention through the hd-general `attention_kv` path (fall-through).
         let nonfa = use_gemm && !use_flash && !c.gemma;
@@ -2917,7 +2923,12 @@ impl Llama {
         // Flash prefill attention (split-K, register-blocked, never materializes the score matrix) is
         // hd=128-specialized and wants 64-row tiles → pad q/attn to mpad rows. Small chunks (t<64) or
         // other head dims fall back to the basic per-query attention_kv. INFR_NO_FLASH forces fallback.
-        let use_flash = hd == 128 && t >= 64 && std::env::var("INFR_NO_FLASH").is_err();
+        // bm=32 flash tile needs 29056 B shared; skip flash on devices that can't fit it (see the
+        // dense-prefill use_flash above) so the pipeline never over-commits shared memory.
+        let use_flash = hd == 128
+            && t >= 64
+            && self.be.max_shared_memory_bytes() >= 29056
+            && std::env::var("INFR_NO_FLASH").is_err();
         let mpad = if use_flash { t.div_ceil(64) * 64 } else { t };
         let q_f16 = self
             .be

@@ -1356,14 +1356,28 @@ impl<'a> Recorder<'a> {
                 }
             }
         };
-        // hd=128 → 8-warp register-blocked partial (always via partial+combine). Other hd → the
+        // hd=128 → register-blocked partial (always via partial+combine). Other hd → the
         // 4-subgroup path: single fused kernel for n_splits==1, else the scalar partial.
-        let warp = hd == 128 && std::env::var("INFR_NO_FLASH_WARP").is_err();
+        //
+        // The warp partial's shared scratch is bm*908 B (Ss+Ps+Os+mrow/lrow/corr, BN=64/HD=128).
+        // Pick the largest tile the device's maxComputeSharedMemorySize allows: bm=64 → 58112 B (needs
+        // 64 KB, e.g. RADV); bm=32 → 29056 B (fits NVIDIA 48 KB / MoltenVK 32 KB). The transformer
+        // skips flash entirely when even bm=32 won't fit, so one of these always fits here.
+        let shared_limit = self.be.shared.caps.max_shared_memory_bytes;
+        let bm: u32 = if shared_limit >= 64 * 908 { 64 } else { 32 };
+        // Each workgroup covers `bm` query rows → mpad/bm×nh groups (mpad is 64-aligned → /32 exact).
+        let tile_wg = (mpad / bm) * nh as u32;
+        // INFR_NO_FLASH_WARP A/Bs the non-warp partial (BM=64, 58112 B); ignored where it won't fit.
+        let warp =
+            hd == 128 && (std::env::var("INFR_NO_FLASH_WARP").is_err() || shared_limit < 58112);
         if n_splits == 1 && !warp {
             self.stamp("attn_flash");
-            let k = self
-                .be
-                .kernel_sg("attn_flash", crate::gemm::attn_flash_spv(), 4, 24, 32);
+            let (fname, fspv): (&'static str, &[u32]) = if bm == 32 {
+                ("attn_flash_bm32", crate::gemm::attn_flash_bm32_spv())
+            } else {
+                ("attn_flash", crate::gemm::attn_flash_spv())
+            };
+            let k = self.be.kernel_sg(fname, fspv, 4, 24, 32);
             let mut p = [0u8; 24];
             p[0..4].copy_from_slice(&mpad.to_ne_bytes());
             p[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -1376,17 +1390,26 @@ impl<'a> Recorder<'a> {
                 &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(attn)],
                 1,
                 &p,
-                base_wg,
+                tile_wg,
             );
             return;
         }
         // split-K partials
         self.stamp("attn_flash");
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
-        let (pname, pspv) = if warp {
-            ("attn_flash_warp", crate::gemm::attn_flash_warp_spv())
-        } else {
-            ("attn_flash_partial", crate::gemm::attn_flash_partial_spv())
+        // hd=128 → register-blocked warp partial; else the 4-subgroup partial. Each picks its
+        // bm-sized shared build (warp/partial share the bm*908 B footprint) and covers tile_wg groups.
+        let (pname, pspv): (&'static str, &[u32]) = match (warp, bm) {
+            (true, 32) => (
+                "attn_flash_warp_bm32",
+                crate::gemm::attn_flash_warp_bm32_spv(),
+            ),
+            (true, _) => ("attn_flash_warp", crate::gemm::attn_flash_warp_spv()),
+            (false, 32) => (
+                "attn_flash_partial_bm32",
+                crate::gemm::attn_flash_partial_bm32_spv(),
+            ),
+            (false, _) => ("attn_flash_partial", crate::gemm::attn_flash_partial_spv()),
         };
         let kp = self.be.kernel_sg(pname, pspv, 6, 32, 32);
         let mut pp = [0u8; 32];
@@ -1410,7 +1433,7 @@ impl<'a> Recorder<'a> {
             ],
             3,
             &pp,
-            base_wg,
+            tile_wg,
             n_splits,
             1,
         );

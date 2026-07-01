@@ -258,10 +258,16 @@ const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk.spv"));
 const ATTN_QK_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk_warp.spv"));
 const ATTN_FLASH_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash.spv"));
+const ATTN_FLASH_BM32_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_bm32.spv"));
 const ATTN_FLASH_PARTIAL_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial.spv"));
+const ATTN_FLASH_PARTIAL_BM32_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_partial_bm32.spv"));
 const ATTN_FLASH_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp.spv"));
+const ATTN_FLASH_WARP_BM32_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_warp_bm32.spv"));
 const ATTN_FLASH_REG_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash_reg.spv"));
 const ATTN_FLASH_COMBINE_SPV_BYTES: &[u8] =
@@ -317,8 +323,11 @@ static ATTN_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_QK_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_PARTIAL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_PARTIAL_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+static ATTN_FLASH_WARP_BM32_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_REG_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_FLASH_COMBINE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_SM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
@@ -377,13 +386,26 @@ pub(crate) fn attn_qk_warp_spv() -> &'static [u32] {
 pub(crate) fn attn_flash_spv() -> &'static [u32] {
     ATTN_FLASH_SPV.get_or_init(|| spv_words(ATTN_FLASH_SPV_BYTES))
 }
+/// BM=32 build of the fused flash prefill (29056 B shared) for sub-64 KB shared devices.
+pub(crate) fn attn_flash_bm32_spv() -> &'static [u32] {
+    ATTN_FLASH_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_BM32_SPV_BYTES))
+}
 /// Flash-attention split-K partial pass (per kv-split online-softmax partials). Recorder use.
 pub(crate) fn attn_flash_partial_spv() -> &'static [u32] {
     ATTN_FLASH_PARTIAL_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_SPV_BYTES))
 }
-/// 8-warp register-blocked flash partial (hd=128). Used over attn_flash_partial when hd==128.
+/// BM=32 build of the split-K flash partial (29056 B shared) for sub-64 KB shared devices.
+pub(crate) fn attn_flash_partial_bm32_spv() -> &'static [u32] {
+    ATTN_FLASH_PARTIAL_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_BM32_SPV_BYTES))
+}
+/// Register-blocked flash partial (hd=128). Used over attn_flash_partial when hd==128.
 pub(crate) fn attn_flash_warp_spv() -> &'static [u32] {
     ATTN_FLASH_WARP_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_SPV_BYTES))
+}
+/// BM=32 build of the flash partial (29056 B shared vs 58112 B): for devices whose
+/// maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs (NVIDIA, MoltenVK).
+pub(crate) fn attn_flash_warp_bm32_spv() -> &'static [u32] {
+    ATTN_FLASH_WARP_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_BM32_SPV_BYTES))
 }
 /// FlashAttention-2 register-O flash partial (Br=128, per-thread register accumulator). hd=128.
 pub(crate) fn attn_flash_reg_spv() -> &'static [u32] {

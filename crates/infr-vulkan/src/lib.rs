@@ -279,6 +279,12 @@ impl Drop for WeightProgress {
 }
 
 impl VulkanBackend {
+    /// `maxComputeSharedMemorySize` for the active device — the per-workgroup shared-memory budget
+    /// the flash-attention tile height is sized against (cheap accessor; avoids cloning caps).
+    pub fn max_shared_memory_bytes(&self) -> u32 {
+        self.shared.caps.max_shared_memory_bytes
+    }
+
     /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
     /// device + compute queue with the required extensions/features, set up the allocator.
     pub fn new() -> Result<Self> {
@@ -432,6 +438,7 @@ impl VulkanBackend {
             f16: has_f16,
             cooperative_matrix: has_coop_matrix,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
+            max_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
             unified_memory: false, // discrete GPU
             // The seam adapter records the decode graph once and replays it (params-driven `_dyn`
             // kernels); the runner compiles the eligible qwen3 decode graph once.

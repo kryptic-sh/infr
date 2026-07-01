@@ -3,16 +3,22 @@
 // path's 81%-of-high-ctx bottleneck). One workgroup per (BM-row query tile, head). Online softmax
 // state (running max/sum + O accumulator) lives in shared; both matmuls use coopmat. K/V read once
 // per query tile instead of the full m×kv scores round-tripping HBM 4×. Q/K/V f16, O f32. Causal
-// mask via absolute positions. GQA: head h → kv head h/(nh/nkv). hd%16, hd<=128. sg32 (4 subgroups).
+// mask via absolute positions. GQA: head h → kv head h/(nh/nkv). hd%16, hd<=128. sg32.
+// BM_TILE (query rows/tile) is a build knob: shared scratch = BM*908 B. BM=64 → 58112 B (needs a
+// 64 KB device); BM=32 → 29056 B (fits NVIDIA 48 KB / MoltenVK 32 KB). The recorder picks the tile
+// from maxComputeSharedMemorySize; workgroup = (BM/16) subgroups of 32. (See attn_flash_warp.comp.)
+#ifndef BM_TILE
+#define BM_TILE 64
+#endif
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = (BM_TILE * 2), local_size_y = 1, local_size_z = 1) in;
 
-const uint BM = 64u; // query rows per tile (4 subgroups × 16)
+const uint BM = BM_TILE; // query rows per tile ((BM/16) subgroups × 16)
 const uint BN = 64u; // kv columns per block
 
 layout(push_constant) uniform PC {
@@ -45,7 +51,7 @@ void main() {
     uint hd = pc.hd;
     float scale = 1.0 / sqrt(float(hd));
 
-    for (uint i = li; i < BM * hd; i += 128u) { Os[i] = 0.0; }
+    for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) { Os[i] = 0.0; }
     if (li < BM) { mrow[li] = -1e30; lrow[li] = 0.0; }
     barrier();
 
@@ -95,7 +101,7 @@ void main() {
         }
         barrier();
 
-        for (uint i = li; i < BM * hd; i += 128u) { Os[i] *= corr[i / hd]; }
+        for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) { Os[i] *= corr[i / hd]; }
         barrier();
 
         // O += P·V (accumulator round-trips shared Os so the rescale carries across blocks).
@@ -117,7 +123,7 @@ void main() {
         barrier();
     }
 
-    for (uint i = li; i < BM * hd; i += 128u) {
+    for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) {
         uint r = i / hd;
         uint d = i % hd;
         float l = lrow[r];

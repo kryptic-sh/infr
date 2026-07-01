@@ -711,6 +711,7 @@ impl Model {
                 gpu.conv1d.as_ref(),
                 convb.as_ref(),
                 conv_out.as_ref(),
+                1, // rows: single-token bespoke path
                 cc,
                 kconv,
             );
@@ -736,6 +737,7 @@ impl Model {
                 gpu.dt_bias.as_ref(),
                 sb.as_ref(),
                 dn.as_ref(),
+                1, // rows: single-token bespoke path
                 nv,
                 nk,
                 kd,
@@ -1478,6 +1480,7 @@ fn generate_seam(
                         weight: w.conv1d,
                         state: w.conv_state,
                         dst: convout,
+                        rows: 1,
                         channels: cc as u32,
                         kernel: kk as u32,
                     });
@@ -1515,6 +1518,7 @@ fn generate_seam(
                         dt_bias: w.dt_bias,
                         state: w.s_state,
                         dst: dnout,
+                        rows: 1,
                         n_vhead: nv as u32,
                         n_khead: nk as u32,
                         head_k: kd as u32,

@@ -355,6 +355,29 @@ fn lower_op(
                 *n as usize * eb,
             );
         }
+        // Batched strided copy = `rows` buffer-copy regions (cheap vkCmdCopyBuffer). Splits a
+        // batched interleaved buffer (conv q|k|v) into packed per-row slices.
+        Op::CopyStrided {
+            src,
+            src_off,
+            src_stride,
+            dst,
+            dst_off,
+            dst_stride,
+            rows,
+            n,
+        } => {
+            let eb = graph.desc(*src).dtype.dense_bytes(1).unwrap_or(4);
+            for row in 0..*rows as usize {
+                rec.copy(
+                    r(*src)?,
+                    (*src_off as usize + row * *src_stride as usize) * eb,
+                    r(*dst)?,
+                    (*dst_off as usize + row * *dst_stride as usize) * eb,
+                    *n as usize * eb,
+                );
+            }
+        }
         // Gated FFN activation: `act(gate) * up[+up_off]`. up_off (E2B per-layer slice) only
         // arises with Gelu (gemma); silu/sigmoid are always up_off==0.
         Op::GatedAct {
@@ -634,6 +657,7 @@ fn lower_op(
             weight,
             state,
             dst,
+            rows,
             channels,
             kernel,
         } => {
@@ -642,6 +666,7 @@ fn lower_op(
                 r(*weight)?,
                 r(*state)?,
                 r(*dst)?,
+                *rows as usize,
                 *channels as usize,
                 *kernel as usize,
             );
@@ -657,6 +682,7 @@ fn lower_op(
             dt_bias,
             state,
             dst,
+            rows,
             n_vhead,
             n_khead,
             head_k,
@@ -673,6 +699,7 @@ fn lower_op(
                 r(*dt_bias)?,
                 r(*state)?,
                 r(*dst)?,
+                *rows as usize,
                 *n_vhead as usize,
                 *n_khead as usize,
                 *head_k as usize,

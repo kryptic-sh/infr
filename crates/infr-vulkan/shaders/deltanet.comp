@@ -7,6 +7,7 @@
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
+    uint rows;   // tokens to process in sequence (state carried across)
     uint nv;     // value heads (= workgroup count)
     uint nk;     // key/query heads (tiled up to nv)
     uint kd;     // head_k_dim
@@ -15,11 +16,11 @@ layout(push_constant) uniform PC {
     float qscale; // 1/sqrt(kd)
 } pc;
 
-layout(binding = 0) readonly buffer QB  { float q[]; };       // [nk*kd]
-layout(binding = 1) readonly buffer KB  { float k[]; };       // [nk*kd]
-layout(binding = 2) readonly buffer VB  { float v[]; };       // [nv*vd]
-layout(binding = 3) readonly buffer BB  { float blog[]; };    // [nv]  beta logits
-layout(binding = 4) readonly buffer AB  { float alpha[]; };   // [nv]
+layout(binding = 0) readonly buffer QB  { float q[]; };       // [rows, nk*kd]
+layout(binding = 1) readonly buffer KB  { float k[]; };       // [rows, nk*kd]
+layout(binding = 2) readonly buffer VB  { float v[]; };       // [rows, nv*vd]
+layout(binding = 3) readonly buffer BB  { float blog[]; };    // [rows, nv]  beta logits
+layout(binding = 4) readonly buffer AB  { float alpha[]; };   // [rows, nv]
 layout(binding = 5) readonly buffer ACB { float acoef[]; };   // [nv]  (ssm_a weight)
 layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
 layout(binding = 7) buffer SB { float state[]; };             // [nv*kd*vd] in/out
@@ -43,59 +44,67 @@ void main() {
     uint h = gl_WorkGroupID.x;
     uint t = gl_LocalInvocationID.x;
     uint khid = h % pc.nk;
-    uint qbase = khid * pc.kd;
-    uint vbase = h * pc.vd;
+    uint hqbase = khid * pc.kd;   // this head's q/k offset WITHIN a token row
+    uint hvbase = h * pc.vd;      // this head's v/out offset within a token row
     uint sbase = h * pc.kd * pc.vd;
 
-    // ── L2-normalize q and k over kd (each into shared) ──────────────────────
-    float qs = 0.0, ks = 0.0;
-    for (uint i = t; i < pc.kd; i += 128u) {
-        float qv = q[qbase + i];
-        float kv = k[qbase + i]; // k tiled the same as q
-        qn[i] = qv;
-        kn[i] = kv;
-        qs += qv * qv;
-        ks += kv * kv;
-    }
-    red[t] = qs;
-    barrier();
-    float qsum = reduce_sum();
-    barrier();
-    red[t] = ks;
-    barrier();
-    float ksum = reduce_sum();
-    float qnorm = sqrt(qsum + pc.eps);
-    float knorm = sqrt(ksum + pc.eps);
-    barrier();
-    for (uint i = t; i < pc.kd; i += 128u) {
-        qn[i] = qn[i] / qnorm * pc.qscale;
-        kn[i] = kn[i] / knorm;
-    }
-    barrier();
+    // Process the `rows` tokens IN ORDER; the state S[kd,vd] persists across them.
+    for (uint tk = 0u; tk < pc.rows; tk++) {
+        uint qbase = tk * pc.nk * pc.kd + hqbase; // q/k read base for this (token, head)
+        uint vbase = tk * pc.nv * pc.vd + hvbase; // v read / out write base
+        uint ga = tk * pc.nv + h;                 // per-token per-head gate index
 
-    // ── per-head gates ───────────────────────────────────────────────────────
-    float beta = 1.0 / (1.0 + exp(-blog[h]));
-    float zsp = alpha[h] + dtbias[h];
-    float sp = max(zsp, 0.0) + log(1.0 + exp(-abs(zsp))); // softplus
-    float decay = exp(acoef[h] * sp);
+        // ── L2-normalize q and k over kd (each into shared) ──────────────────
+        float qs = 0.0, ks = 0.0;
+        for (uint i = t; i < pc.kd; i += 128u) {
+            float qv = q[qbase + i];
+            float kv = k[qbase + i]; // k tiled the same as q
+            qn[i] = qv;
+            kn[i] = kv;
+            qs += qv * qv;
+            ks += kv * kv;
+        }
+        red[t] = qs;
+        barrier();
+        float qsum = reduce_sum();
+        barrier();
+        red[t] = ks;
+        barrier();
+        float ksum = reduce_sum();
+        float qnorm = sqrt(qsum + pc.eps);
+        float knorm = sqrt(ksum + pc.eps);
+        barrier();
+        for (uint i = t; i < pc.kd; i += 128u) {
+            qn[i] = qn[i] / qnorm * pc.qscale;
+            kn[i] = kn[i] / knorm;
+        }
+        barrier();
 
-    // ── recurrence over independent columns d of S[kd, vd] ───────────────────
-    for (uint d = t; d < pc.vd; d += 128u) {
-        // S *= decay ; kv = kᵀS  (uses the decayed S)
-        float kvv = 0.0;
-        for (uint kk = 0u; kk < pc.kd; kk++) {
-            float sval = state[sbase + kk * pc.vd + d] * decay;
-            state[sbase + kk * pc.vd + d] = sval;
-            kvv += kn[kk] * sval;
+        // ── per-head gates ───────────────────────────────────────────────────
+        float beta = 1.0 / (1.0 + exp(-blog[ga]));
+        float zsp = alpha[ga] + dtbias[h];
+        float sp = max(zsp, 0.0) + log(1.0 + exp(-abs(zsp))); // softplus
+        float decay = exp(acoef[h] * sp);
+
+        // ── recurrence over independent columns d of S[kd, vd] ───────────────
+        for (uint d = t; d < pc.vd; d += 128u) {
+            // S *= decay ; kv = kᵀS  (uses the decayed S)
+            float kvv = 0.0;
+            for (uint kk = 0u; kk < pc.kd; kk++) {
+                float sval = state[sbase + kk * pc.vd + d] * decay;
+                state[sbase + kk * pc.vd + d] = sval;
+                kvv += kn[kk] * sval;
+            }
+            float delta = (v[vbase + d] - kvv) * beta;
+            // S += k⊗delta ; out = qᵀS  (uses the updated S)
+            float o = 0.0;
+            for (uint kk = 0u; kk < pc.kd; kk++) {
+                float sval = state[sbase + kk * pc.vd + d] + kn[kk] * delta;
+                state[sbase + kk * pc.vd + d] = sval;
+                o += qn[kk] * sval;
+            }
+            outp[vbase + d] = o;
         }
-        float delta = (v[vbase + d] - kvv) * beta;
-        // S += k⊗delta ; out = qᵀS  (uses the updated S)
-        float o = 0.0;
-        for (uint kk = 0u; kk < pc.kd; kk++) {
-            float sval = state[sbase + kk * pc.vd + d] + kn[kk] * delta;
-            state[sbase + kk * pc.vd + d] = sval;
-            o += qn[kk] * sval;
-        }
-        outp[vbase + d] = o;
+        barrier(); // finish reading qn/kn before the next token overwrites them
     }
 }

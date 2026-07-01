@@ -1143,6 +1143,7 @@ mod ssm_tests {
             dtb.as_ref(),
             sbuf.as_ref(),
             ob.as_ref(),
+            1, // rows: single-token bespoke path
             nv,
             nk,
             kd,
@@ -1205,6 +1206,7 @@ mod ssm_tests {
             wb.as_ref(),
             sbuf.as_ref(),
             ob.as_ref(),
+            1, // rows: single-token bespoke path
             cc,
             kconv,
         );

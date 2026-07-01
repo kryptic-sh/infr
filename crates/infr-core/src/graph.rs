@@ -202,6 +202,20 @@ pub enum Op {
         dst_off: u32,
         n: u32,
     },
+    /// Batched strided copy: for `rows` rows, copy `n` elements
+    /// `src[src_off + r*src_stride ..] -> dst[dst_off + r*dst_stride ..]`. Used to split a batched
+    /// `[rows, cc]` interleaved buffer (e.g. conv output q|k|v) into packed `[rows, n]` slices in one
+    /// op. `Copy` is the rows=1 special case.
+    CopyStrided {
+        src: TensorId,
+        src_off: u32,
+        src_stride: u32,
+        dst: TensorId,
+        dst_off: u32,
+        dst_stride: u32,
+        rows: u32,
+        n: u32,
+    },
     /// Mixture-of-experts FFN for a single token row (qwen3moe). The router (`Linear` of `x[ne] →
     /// n_expert`) is softmaxed, the top-`n_used` experts selected, their softmax weights renormalized,
     /// and each runs a gated FFN (`act(gate·x) * (up·x)`, then `down·`); the outputs are summed
@@ -222,15 +236,18 @@ pub enum Op {
         scale: f32,
         act: Activation,
     },
-    /// Depthwise causal 1-D conv over `channels` followed by SiLU (Qwen3-Next gated DeltaNet). `x` is
-    /// the current token's `[channels]`; `weight` is the per-channel kernel `[channels, kernel]`;
-    /// `state` is the rolling `[(kernel-1), channels]` history (oldest row first), updated in place
-    /// (drop oldest, append `x`). `dst[ch] = silu(Σ_{j<kernel-1} state[j,ch]·w[ch,j] + x[ch]·w[ch,K-1])`.
+    /// Depthwise causal 1-D conv over `channels` followed by SiLU (Qwen3-Next gated DeltaNet).
+    /// Processes `rows` tokens sequentially, carrying the rolling history in `state` across rows and
+    /// leaving it updated after the last row. `x`/`dst` are `[rows, channels]`; `weight` is the
+    /// per-channel kernel `[channels, kernel]`; `state` is the rolling `[(kernel-1), channels]`
+    /// history (oldest row first). Per token: `dst[ch] = silu(Σ_{j<kernel-1} state[j,ch]·w[ch,j] +
+    /// x[ch]·w[ch,K-1])`, then history shifts (drop oldest, append raw `x`). `rows=1` = one token.
     Conv1dSilu {
         x: TensorId,
         weight: TensorId,
         state: TensorId,
         dst: TensorId,
+        rows: u32,
         channels: u32,
         kernel: u32,
     },
@@ -241,7 +258,10 @@ pub enum Op {
     /// value heads share `n_khead` query/key heads in contiguous groups of `n_vhead/n_khead` — value
     /// head `h` uses q/k head `h/(n_vhead/n_khead)`. `q`/`k` are `[n_khead·head_k]`, `v`/`dst` are
     /// `[n_vhead·head_v]`, `b`/`a` are `[n_vhead]`, `a_coef`/`dt_bias` are weights `[n_vhead]`,
-    /// `state` is `[n_vhead·head_k·head_v]` (mutated in place).
+    /// `state` is `[n_vhead·head_k·head_v]` (mutated in place). Processes `rows` tokens sequentially,
+    /// carrying `state` across rows (and leaving it updated after the last). `q`/`k` are
+    /// `[rows, n_khead·head_k]`, `v`/`dst` are `[rows, n_vhead·head_v]`, `b`/`a` are `[rows, n_vhead]`.
+    /// `rows=1` = one token.
     DeltaNet {
         q: TensorId,
         k: TensorId,
@@ -252,6 +272,7 @@ pub enum Op {
         dt_bias: TensorId,
         state: TensorId,
         dst: TensorId,
+        rows: u32,
         n_vhead: u32,
         n_khead: u32,
         head_k: u32,
@@ -277,6 +298,7 @@ impl Op {
             Op::Scale { .. } => "Scale",
             Op::Softcap { .. } => "Softcap",
             Op::Copy { .. } => "Copy",
+            Op::CopyStrided { .. } => "CopyStrided",
             Op::MoeFfn { .. } => "MoeFfn",
             Op::Conv1dSilu { .. } => "Conv1dSilu",
             Op::DeltaNet { .. } => "DeltaNet",

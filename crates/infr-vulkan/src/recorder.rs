@@ -2025,6 +2025,7 @@ impl<'a> Recorder<'a> {
         dtbias: &dyn Buffer,
         state: &dyn Buffer,
         out: &dyn Buffer,
+        rows: usize,
         nv: usize,
         nk: usize,
         kd: usize,
@@ -2033,14 +2034,15 @@ impl<'a> Recorder<'a> {
     ) {
         let kern = self
             .be
-            .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 24);
-        let mut push = [0u8; 24];
-        push[0..4].copy_from_slice(&(nv as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(nk as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(kd as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(vd as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&eps.to_ne_bytes());
-        push[20..24].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+            .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 28);
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&eps.to_ne_bytes());
+        push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
         self.dispatch(
             kern,
             &[
@@ -2068,15 +2070,17 @@ impl<'a> Recorder<'a> {
         w: &dyn Buffer,
         state: &dyn Buffer,
         out: &dyn Buffer,
+        rows: usize,
         cc: usize,
         kconv: usize,
     ) {
         let kern = self
             .be
-            .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 8);
-        let mut push = [0u8; 8];
-        push[0..4].copy_from_slice(&(cc as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(kconv as u32).to_ne_bytes());
+            .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
         self.dispatch(
             kern,
             &[

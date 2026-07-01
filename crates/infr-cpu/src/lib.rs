@@ -2856,6 +2856,30 @@ impl Backend for CpuBackend {
                     let s = vals[src.0 as usize].clone();
                     vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s[so..so + n]);
                 }
+                Op::CopyStrided {
+                    src,
+                    src_off,
+                    src_stride,
+                    dst,
+                    dst_off,
+                    dst_stride,
+                    rows,
+                    n,
+                } => {
+                    let (so, ss, dof, ds, n) = (
+                        src_off as usize,
+                        src_stride as usize,
+                        dst_off as usize,
+                        dst_stride as usize,
+                        n as usize,
+                    );
+                    let s = vals[src.0 as usize].clone();
+                    let d = &mut vals[dst.0 as usize];
+                    for r in 0..rows as usize {
+                        d[dof + r * ds..dof + r * ds + n]
+                            .copy_from_slice(&s[so + r * ss..so + r * ss + n]);
+                    }
+                }
                 Op::MoeFfn {
                     x,
                     router,
@@ -2945,32 +2969,37 @@ impl Backend for CpuBackend {
                     weight: w,
                     state,
                     dst,
+                    rows,
                     channels,
                     kernel,
                 } => {
-                    let (cc, kk) = (channels as usize, kernel as usize);
-                    let xs = vals[x.0 as usize].clone();
+                    let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
+                    let xs = vals[x.0 as usize].clone(); // [rows, channels]
                     let ws = weight(w); // [channels, kernel] row-major (per-channel kernel)
                     let st = &mut vals[state.0 as usize]; // [(kernel-1), channels], oldest row first
-                    let mut out = vec![0f32; cc];
-                    for ch in 0..cc {
-                        // window = [history rows.. , current x]; tap j uses weight[ch*kk + j].
-                        let mut acc = 0f32;
-                        for j in 0..kk - 1 {
-                            acc += st[j * cc + ch] * ws[ch * kk + j];
-                        }
-                        acc += xs[ch] * ws[ch * kk + (kk - 1)];
-                        out[ch] = acc / (1.0 + (-acc).exp()); // silu
-                    }
-                    // shift history (drop oldest, append raw x).
-                    for j in 0..kk.saturating_sub(2) {
+                    let mut out = vec![0f32; rr * cc];
+                    // Process the rows in sequence, carrying the rolling history across tokens.
+                    for t in 0..rr {
+                        let xt = &xs[t * cc..t * cc + cc];
                         for ch in 0..cc {
-                            st[j * cc + ch] = st[(j + 1) * cc + ch];
+                            // window = [history rows.. , current x]; tap j uses weight[ch*kk + j].
+                            let mut acc = 0f32;
+                            for j in 0..kk - 1 {
+                                acc += st[j * cc + ch] * ws[ch * kk + j];
+                            }
+                            acc += xt[ch] * ws[ch * kk + (kk - 1)];
+                            out[t * cc + ch] = acc / (1.0 + (-acc).exp()); // silu
                         }
-                    }
-                    if kk >= 2 {
-                        for ch in 0..cc {
-                            st[(kk - 2) * cc + ch] = xs[ch];
+                        // shift history (drop oldest, append raw x).
+                        for j in 0..kk.saturating_sub(2) {
+                            for ch in 0..cc {
+                                st[j * cc + ch] = st[(j + 1) * cc + ch];
+                            }
+                        }
+                        if kk >= 2 {
+                            for ch in 0..cc {
+                                st[(kk - 2) * cc + ch] = xt[ch];
+                            }
                         }
                     }
                     vals[dst.0 as usize] = out;
@@ -2985,81 +3014,87 @@ impl Backend for CpuBackend {
                     dt_bias,
                     state,
                     dst,
+                    rows,
                     n_vhead,
                     n_khead,
                     head_k,
                     head_v,
                     eps,
                 } => {
-                    let (nv, nk, kd, vd) = (
+                    let (rr, nv, nk, kd, vd) = (
+                        rows as usize,
                         n_vhead as usize,
                         n_khead as usize,
                         head_k as usize,
                         head_v as usize,
                     );
-                    let qf = vals[q.0 as usize].clone();
+                    let qf = vals[q.0 as usize].clone(); // [rows, nk*kd]
                     let kf = vals[k.0 as usize].clone();
-                    let vf = vals[v.0 as usize].clone();
-                    let bf = vals[b.0 as usize].clone();
+                    let vf = vals[v.0 as usize].clone(); // [rows, nv*vd]
+                    let bf = vals[b.0 as usize].clone(); // [rows, nv]
                     let af = vals[a.0 as usize].clone();
                     let acoef = weight(a_coef);
                     let dtb = weight(dt_bias);
                     let st = &mut vals[state.0 as usize]; // [nv, kd, vd]
-                    let mut out = vec![0f32; nv * vd];
+                    let mut out = vec![0f32; rr * nv * vd];
                     let qscale = 1.0 / (kd as f32).sqrt();
                     let l2 = |slice: &[f32]| -> f32 {
                         (slice.iter().map(|x| x * x).sum::<f32>() + eps).sqrt()
                     };
-                    for h in 0..nv {
-                        // GQA: q/k heads are TILED to nv value heads → v-head h uses q/k head h % nk.
-                        let kh_idx = h % nk;
-                        let mut qh = qf[kh_idx * kd..kh_idx * kd + kd].to_vec();
-                        let mut kh = kf[kh_idx * kd..kh_idx * kd + kd].to_vec();
-                        let vh = &vf[h * vd..h * vd + vd];
-                        let qn = l2(&qh);
-                        let kn = l2(&kh);
-                        for x in qh.iter_mut() {
-                            *x = *x / qn * qscale;
-                        }
-                        for x in kh.iter_mut() {
-                            *x /= kn;
-                        }
-                        let beta = 1.0 / (1.0 + (-bf[h]).exp());
-                        // softplus(a + dt_bias), then g = a_coef * softplus (≤ 0); decay = exp(g).
-                        let sp = {
-                            let z = af[h] + dtb[h];
-                            z.max(0.0) + (-z.abs()).exp().ln_1p()
-                        };
-                        let decay = (acoef[h] * sp).exp();
-                        let sh = &mut st[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
-                        for x in sh.iter_mut() {
-                            *x *= decay;
-                        }
-                        // kv = kᵀS  [vd]
-                        let mut kv = vec![0f32; vd];
-                        for kk in 0..kd {
-                            let kkv = kh[kk];
-                            let row = &sh[kk * vd..kk * vd + vd];
-                            for d in 0..vd {
-                                kv[d] += kkv * row[d];
+                    // Sequential scan over the rows, carrying the per-head state S across tokens.
+                    for t in 0..rr {
+                        let (qb, vb, bb) = (t * nk * kd, t * nv * vd, t * nv);
+                        for h in 0..nv {
+                            // GQA: q/k heads TILED to nv value heads → v-head h uses q/k head h % nk.
+                            let kh_idx = h % nk;
+                            let mut qh = qf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
+                            let mut kh = kf[qb + kh_idx * kd..qb + kh_idx * kd + kd].to_vec();
+                            let vh = &vf[vb + h * vd..vb + h * vd + vd];
+                            let qn = l2(&qh);
+                            let kn = l2(&kh);
+                            for x in qh.iter_mut() {
+                                *x = *x / qn * qscale;
                             }
-                        }
-                        // delta = (v - kv)*beta ; S += k ⊗ delta
-                        let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
-                        for kk in 0..kd {
-                            let kkv = kh[kk];
-                            let row = &mut sh[kk * vd..kk * vd + vd];
-                            for d in 0..vd {
-                                row[d] += kkv * delta[d];
+                            for x in kh.iter_mut() {
+                                *x /= kn;
                             }
-                        }
-                        // out = qᵀS  [vd]
-                        let oh = &mut out[h * vd..h * vd + vd];
-                        for kk in 0..kd {
-                            let qv = qh[kk];
-                            let row = &sh[kk * vd..kk * vd + vd];
-                            for d in 0..vd {
-                                oh[d] += qv * row[d];
+                            let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
+                            // softplus(a + dt_bias), then g = a_coef * softplus (≤ 0); decay = exp(g).
+                            let sp = {
+                                let z = af[bb + h] + dtb[h];
+                                z.max(0.0) + (-z.abs()).exp().ln_1p()
+                            };
+                            let decay = (acoef[h] * sp).exp();
+                            let sh = &mut st[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
+                            for x in sh.iter_mut() {
+                                *x *= decay;
+                            }
+                            // kv = kᵀS  [vd]
+                            let mut kv = vec![0f32; vd];
+                            for kk in 0..kd {
+                                let kkv = kh[kk];
+                                let row = &sh[kk * vd..kk * vd + vd];
+                                for d in 0..vd {
+                                    kv[d] += kkv * row[d];
+                                }
+                            }
+                            // delta = (v - kv)*beta ; S += k ⊗ delta
+                            let delta: Vec<f32> = (0..vd).map(|d| (vh[d] - kv[d]) * beta).collect();
+                            for kk in 0..kd {
+                                let kkv = kh[kk];
+                                let row = &mut sh[kk * vd..kk * vd + vd];
+                                for d in 0..vd {
+                                    row[d] += kkv * delta[d];
+                                }
+                            }
+                            // out = qᵀS  [vd]
+                            let oh = &mut out[vb + h * vd..vb + h * vd + vd];
+                            for kk in 0..kd {
+                                let qv = qh[kk];
+                                let row = &sh[kk * vd..kk * vd + vd];
+                                for d in 0..vd {
+                                    oh[d] += qv * row[d];
+                                }
                             }
                         }
                     }

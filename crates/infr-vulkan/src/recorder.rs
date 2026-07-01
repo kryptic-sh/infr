@@ -2032,6 +2032,7 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
     ) {
+        self.stamp("deltanet");
         let kern = self
             .be
             .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 28);
@@ -2074,6 +2075,7 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
+        self.stamp("conv1d_silu");
         let kern = self
             .be
             .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 12);

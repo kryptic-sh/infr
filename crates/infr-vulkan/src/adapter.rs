@@ -72,6 +72,10 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         }
     }
 
+    // Transient buffers allocated inside the op loop (MoE routing scratch) must outlive the recorder
+    // — hold them here so they drop only after `rec.finish()` submits.
+    let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
+
     let rec = be_.recorder()?;
     for op in &graph.ops {
         match op {
@@ -362,15 +366,129 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
             Op::Softcap { x, dst, cap, n } => {
                 rec.softcap(r(*x)?, r(*dst)?, *cap, *n as usize);
             }
-            // Not yet wired: MoeFfn is a multi-kernel sequence (router matmul → top-k → per-expert
-            // SwiGLU → weighted accumulate), not a single Recorder call. EXPLICIT arm (not a `_`
-            // catch-all) so adding a new `Op` to infr-core BREAKS this build until handled — the
-            // compile-time exhaustiveness the CPU interpreter has.
-            Op::MoeFfn { .. } => {
-                return Err(be(format!(
-                    "vulkan adapter: op not yet wired: {}",
-                    op.kind()
-                )))
+            // MoE FFN (single token): router GEMV → GPU-resident top-k (softmax-renorm, ×scale) →
+            // fused multi-slot expert SwiGLU (gate/up share the row, down reads each slot's act) →
+            // weighted accumulate. Mirrors the production GPU-resident decode path (transformer.rs)
+            // and the CPU `Op::MoeFfn` interpreter. Expert banks must use an id-native quant format.
+            Op::MoeFfn {
+                x,
+                router,
+                gate_exps,
+                up_exps,
+                down_exps,
+                dst,
+                ne,
+                n_expert,
+                n_used,
+                n_ff_exp,
+                scale,
+                act,
+            } => {
+                let (ne, n_expert, n_used, nff) = (
+                    *ne as usize,
+                    *n_expert as usize,
+                    *n_used as usize,
+                    *n_ff_exp as usize,
+                );
+                let stride = nff * ne; // elements per expert (identical for gate/up/down banks)
+                let (gdt, udt, ddt) = (
+                    graph.desc(*gate_exps).dtype,
+                    graph.desc(*up_exps).dtype,
+                    graph.desc(*down_exps).dtype,
+                );
+                if !(crate::linear::native_id_kernel_name(gdt).is_some()
+                    && crate::linear::native_id_kernel_name(udt).is_some()
+                    && crate::linear::native_id_kernel_name(ddt).is_some())
+                {
+                    return Err(be(
+                        "vulkan adapter: MoeFfn expert banks need an id-native quant format",
+                    ));
+                }
+                // Per-execute routing scratch. Local boxes used via `.as_ref()`, then moved into
+                // `transient` at the end of the arm so they outlive `rec.finish()`.
+                let al = |n: usize| be_.alloc((n * 4).max(4), BufferUsage::Activations);
+                let logits = al(n_expert)?;
+                let ids = al(n_used)?;
+                let wts = al(n_used)?;
+                let gbuf = al(n_used * nff)?;
+                let ubuf = al(n_used * nff)?;
+                let abuf = al(n_used * nff)?;
+                let ybuf = al(n_used * ne)?;
+                let xb = r(*x)?;
+
+                // Router logits over all experts.
+                let rdt = graph.desc(*router).dtype;
+                let rw = r(*router)?;
+                if native_dense_supported(rdt) {
+                    rec.linear_native(rdt, rw, xb, logits.as_ref(), 1, ne, n_expert);
+                } else {
+                    rec.linear(rw, xb, logits.as_ref(), 1, ne, n_expert);
+                }
+                // Softmax-renormalized top-`n_used`, weights pre-scaled by `scale`.
+                rec.moe_topk(
+                    logits.as_ref(),
+                    ids.as_ref(),
+                    wts.as_ref(),
+                    1,
+                    n_expert,
+                    n_used,
+                    *scale,
+                );
+                // Fused per-role expert GEMVs: gate/up read the shared row; down reads each slot's act.
+                rec.linear_native_id_multi(
+                    gdt,
+                    r(*gate_exps)?,
+                    ids.as_ref(),
+                    n_used,
+                    stride,
+                    xb,
+                    false,
+                    gbuf.as_ref(),
+                    ne,
+                    nff,
+                );
+                rec.linear_native_id_multi(
+                    udt,
+                    r(*up_exps)?,
+                    ids.as_ref(),
+                    n_used,
+                    stride,
+                    xb,
+                    false,
+                    ubuf.as_ref(),
+                    ne,
+                    nff,
+                );
+                let n_act = n_used * nff;
+                match act {
+                    Activation::Silu => {
+                        rec.silu_mul(gbuf.as_ref(), ubuf.as_ref(), abuf.as_ref(), n_act)
+                    }
+                    Activation::Sigmoid => {
+                        rec.mul_sigmoid(gbuf.as_ref(), ubuf.as_ref(), abuf.as_ref(), n_act)
+                    }
+                    Activation::Gelu => {
+                        rec.gelu_mul_off(gbuf.as_ref(), ubuf.as_ref(), 0, abuf.as_ref(), n_act)
+                    }
+                }
+                rec.linear_native_id_multi(
+                    ddt,
+                    r(*down_exps)?,
+                    ids.as_ref(),
+                    n_used,
+                    stride,
+                    abuf.as_ref(),
+                    true,
+                    ybuf.as_ref(),
+                    nff,
+                    ne,
+                );
+                // `Op::MoeFfn` dst is the pure FFN output (residual Add is a separate op), but
+                // moe_accumulate ADDs — zero dst first.
+                let dstb = r(*dst)?;
+                rec.zero(dstb, ne);
+                rec.moe_accumulate(ybuf.as_ref(), wts.as_ref(), dstb, ne, n_used);
+                transient.extend([logits, ids, wts, gbuf, ubuf, abuf, ybuf]);
             }
         }
     }
@@ -722,6 +840,140 @@ mod tests {
             assert!(
                 (got[i] - want[i]).abs() < 2e-2,
                 "attention mismatch at {i}: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    // ---- Q8_0 helpers (block=32: f16 scale + 32×int8 = 34 bytes) so a MoE test can bind id-native
+    // expert banks and the host reference dequants the SAME rounded values the GPU shader does. ----
+    fn q8_0(x: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(x.len() / 32 * 34);
+        for blk in x.chunks(32) {
+            let amax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+            let d = amax / 127.0;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+            for &v in blk {
+                out.push(((v * id).round().clamp(-127.0, 127.0) as i8) as u8);
+            }
+        }
+        out
+    }
+    fn deq_q8(bytes: &[u8]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(bytes.len() / 34 * 32);
+        for blk in bytes.chunks(34) {
+            let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
+            for i in 0..32 {
+                out.push((blk[2 + i] as i8 as f32) * d);
+            }
+        }
+        out
+    }
+
+    /// A one-op `MoeFfn` graph (Q8_0 router + stacked experts) through the seam must match a host
+    /// reference that mirrors the CPU `Op::MoeFfn` interpreter on the SAME q8-rounded weights:
+    /// router softmax → top-`n_used` → per-expert SwiGLU → weighted (×scale) accumulate.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn moe_ffn_graph_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (ne, n_expert, n_used, nff) = (32usize, 4usize, 2usize, 32usize);
+        let scale = 1.3f32;
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5; // deterministic weight/act filler
+        let x: Vec<f32> = (0..ne).map(|i| f(i, 0.11) + 0.05).collect();
+        // Distinct per-expert router rows so top-k selection is unambiguous.
+        let router: Vec<f32> = (0..n_expert * ne)
+            .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+            .collect();
+        let gate: Vec<f32> = (0..n_expert * nff * ne).map(|i| f(i, 0.017)).collect();
+        let up: Vec<f32> = (0..n_expert * nff * ne).map(|i| f(i, 0.023)).collect();
+        let down: Vec<f32> = (0..n_expert * ne * nff).map(|i| f(i, 0.029)).collect();
+        let (rq, gq, uq, dq) = (q8_0(&router), q8_0(&gate), q8_0(&up), q8_0(&down));
+        // Host reference uses the dequantized (q8-rounded) weights — same values the GPU reads.
+        let (rd, gd, ud, dd) = (deq_q8(&rq), deq_q8(&gq), deq_q8(&uq), deq_q8(&dq));
+        let dot = |w: &[f32], v: &[f32]| w.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+        let silu = |z: f32| z / (1.0 + (-z).exp());
+        // router logits → softmax over all experts
+        let logits: Vec<f32> = (0..n_expert)
+            .map(|e| dot(&rd[e * ne..(e + 1) * ne], &x))
+            .collect();
+        let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+        let psum: f32 = probs.iter().sum();
+        probs.iter_mut().for_each(|p| *p /= psum);
+        let mut idx: Vec<usize> = (0..n_expert).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        idx.truncate(n_used);
+        let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+        let mut want = vec![0f32; ne];
+        for &e in &idx {
+            let gs = e * nff * ne;
+            let ds = e * ne * nff;
+            let actv: Vec<f32> = (0..nff)
+                .map(|j| {
+                    let g = dot(&gd[gs + j * ne..gs + (j + 1) * ne], &x);
+                    let u = dot(&ud[gs + j * ne..gs + (j + 1) * ne], &x);
+                    silu(g) * u
+                })
+                .collect();
+            let w_e = probs[e] / wsum * scale;
+            for (i, wi) in want.iter_mut().enumerate() {
+                *wi += w_e * dot(&dd[ds + i * nff..ds + (i + 1) * nff], &actv);
+            }
+        }
+        // graph
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![1, ne], DType::F32));
+        let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+        let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+        let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+        let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q8_0));
+        let yi = g.output(TensorDesc::new(vec![1, ne], DType::F32));
+        g.push(Op::MoeFfn {
+            x: xi,
+            router: ri,
+            gate_exps: gi,
+            up_exps: ui,
+            down_exps: di,
+            dst: yi,
+            ne: ne as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            n_ff_exp: nff as u32,
+            scale,
+            act: Activation::Silu,
+        });
+        let mk = |bytes: &[u8], usage| {
+            let b = be_.alloc(bytes.len(), usage).unwrap();
+            be_.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let xb = mk(bytemuck::cast_slice(&x), BufferUsage::Activations);
+        let rb = mk(&rq, BufferUsage::Weights);
+        let gb = mk(&gq, BufferUsage::Weights);
+        let ub = mk(&uq, BufferUsage::Weights);
+        let db = mk(&dq, BufferUsage::Weights);
+        let yb = be_.alloc(ne * 4, BufferUsage::Activations).unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(xi, xb.as_ref());
+        bind.bind(ri, rb.as_ref());
+        bind.bind(gi, gb.as_ref());
+        bind.bind(ui, ub.as_ref());
+        bind.bind(di, db.as_ref());
+        bind.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got = vec![0f32; ne];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for i in 0..ne {
+            assert!(
+                (got[i] - want[i]).abs() < 3e-3,
+                "moe_ffn mismatch at {i}: got {} want {}",
                 got[i],
                 want[i]
             );

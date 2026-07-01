@@ -12,7 +12,7 @@ pub mod loader;
 pub mod progress;
 pub mod tensor;
 
-pub use backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
+pub use backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
 pub use error::{Error, Result};
 pub use graph::{Activation, AttnMask, Graph, Op, TensorDecl, TensorKind};
 pub use loader::{MetaValue, Metadata, TensorInfo, WeightSource};

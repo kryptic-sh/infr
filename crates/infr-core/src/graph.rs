@@ -260,6 +260,30 @@ pub enum Op {
     },
 }
 
+impl Op {
+    /// The op's variant name — used by backends for per-op profiling / error messages so the
+    /// mapping lives in ONE place (was duplicated as `op_kind`/`op_name` in each backend).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Op::RmsNorm { .. } => "RmsNorm",
+            Op::Linear { .. } => "Linear",
+            Op::QkNorm { .. } => "QkNorm",
+            Op::Rope { .. } => "Rope",
+            Op::QkNormRope { .. } => "QkNormRope",
+            Op::WriteKv { .. } => "WriteKv",
+            Op::Attention { .. } => "Attention",
+            Op::GatedAct { .. } => "GatedAct",
+            Op::Add { .. } => "Add",
+            Op::Scale { .. } => "Scale",
+            Op::Softcap { .. } => "Softcap",
+            Op::Copy { .. } => "Copy",
+            Op::MoeFfn { .. } => "MoeFfn",
+            Op::Conv1dSilu { .. } => "Conv1dSilu",
+            Op::DeltaNet { .. } => "DeltaNet",
+        }
+    }
+}
+
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].
 #[derive(Clone, Default)]
 pub struct Graph {

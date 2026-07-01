@@ -51,6 +51,28 @@ pub trait Plan: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// The trivial [`Plan`] both current backends share: it just carries a clone of the [`Graph`] — the
+/// CPU interpreter and the Vulkan adapter each re-walk the ops every `execute`, so "compiling" is
+/// only storing the graph. A backend's `compile` returns [`GraphPlan::boxed`]; its `execute` recovers
+/// the graph via `plan.as_any().downcast_ref::<GraphPlan>()`. (Was duplicated as `CpuPlan`/`VkPlan`.)
+pub struct GraphPlan {
+    pub graph: crate::graph::Graph,
+}
+
+impl GraphPlan {
+    pub fn boxed(graph: &crate::graph::Graph) -> Box<dyn Plan> {
+        Box::new(GraphPlan {
+            graph: graph.clone(),
+        })
+    }
+}
+
+impl Plan for GraphPlan {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Binds a [`Graph`]'s `Input`/`Weight`/`Output` handles to concrete backend buffers for one
 /// `execute`. The model holds the buffers; this only borrows them, so re-binding per step is cheap
 /// and the graph/plan is reused across steps without recompilation.

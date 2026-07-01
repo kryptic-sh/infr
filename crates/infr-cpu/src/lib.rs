@@ -9,11 +9,11 @@
 //! the GPU backends are validated against.
 #![allow(clippy::needless_range_loop)]
 
-use infr_gguf::dequant::{dequant_block, k4, rdf16};
-use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
 use infr_core::error::Result;
 use infr_core::graph::{Activation, AttnMask, Graph, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
+use infr_gguf::dequant::{dequant_block, k4, rdf16};
 use infr_gguf::TensorBytes;
 use rayon::prelude::*;
 use std::any::Any;
@@ -2183,17 +2183,6 @@ impl Buffer for CpuBuffer {
     }
 }
 
-/// A compiled plan = the owned graph (the CPU "compiles" nothing; it interprets at execute time).
-pub struct CpuPlan {
-    graph: Graph,
-}
-
-impl Plan for CpuPlan {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
 #[derive(Default)]
 pub struct CpuBackend {
     /// Dequantized-weight cache keyed by the bound buffer's address (weights are bound the same
@@ -2248,27 +2237,6 @@ fn cpu_buf(b: &dyn Buffer) -> &CpuBuffer {
         .expect("cpu backend: buffer is not a CpuBuffer (mixed backends?)")
 }
 
-/// Op variant name, for INFR_PROF_OPS per-op-type timing.
-fn op_kind(op: &Op) -> &'static str {
-    match op {
-        Op::RmsNorm { .. } => "RmsNorm",
-        Op::QkNorm { .. } => "QkNorm",
-        Op::Linear { .. } => "Linear",
-        Op::Rope { .. } => "Rope",
-        Op::QkNormRope { .. } => "QkNormRope",
-        Op::WriteKv { .. } => "WriteKv",
-        Op::Attention { .. } => "Attention",
-        Op::GatedAct { .. } => "GatedAct",
-        Op::MoeFfn { .. } => "MoeFfn",
-        Op::Conv1dSilu { .. } => "Conv1dSilu",
-        Op::DeltaNet { .. } => "DeltaNet",
-        Op::Add { .. } => "Add",
-        Op::Scale { .. } => "Scale",
-        Op::Softcap { .. } => "Softcap",
-        Op::Copy { .. } => "Copy",
-    }
-}
-
 impl Backend for CpuBackend {
     fn name(&self) -> &str {
         "cpu"
@@ -2304,16 +2272,14 @@ impl Backend for CpuBackend {
     }
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
-        Ok(Box::new(CpuPlan {
-            graph: graph.clone(),
-        }))
+        Ok(GraphPlan::boxed(graph))
     }
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
         let g = &plan
             .as_any()
-            .downcast_ref::<CpuPlan>()
-            .expect("cpu backend: plan is not a CpuPlan")
+            .downcast_ref::<GraphPlan>()
+            .expect("cpu backend: plan is not a GraphPlan")
             .graph;
 
         // f32 working store for every Input/Internal/Output handle (weights are read on demand:
@@ -3110,7 +3076,7 @@ impl Backend for CpuBackend {
                 }
             }
             if let Some(t0) = __t0 {
-                *op_times.entry(op_kind(op)).or_insert(0.0) += t0.elapsed().as_secs_f64();
+                *op_times.entry(op.kind()).or_insert(0.0) += t0.elapsed().as_secs_f64();
             }
         }
         if prof_ops {
@@ -3146,7 +3112,6 @@ impl Backend for CpuBackend {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod kernel_tests {

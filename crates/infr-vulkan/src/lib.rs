@@ -256,15 +256,6 @@ impl WeightArena {
     }
 }
 
-// ── VkPlan (stub) ─────────────────────────────────────────────────────────────
-
-struct VkPlan;
-impl Plan for VkPlan {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
 // ── VulkanBackend ─────────────────────────────────────────────────────────────
 
 /// Vulkan device + allocator + pipeline cache.

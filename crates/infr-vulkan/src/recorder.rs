@@ -2033,6 +2033,13 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         self.stamp("deltanet");
+        // The shader caches each column block's state [kd, 32] in shared memory (`ss[128*32]`), so kd
+        // must be ≤ 128. Qwen3-Next uses kd=128; assert so a larger head_k_dim fails loudly instead of
+        // corrupting LDS.
+        debug_assert!(
+            kd <= 128,
+            "deltanet shared-state block assumes kd ≤ 128, got {kd}"
+        );
         let kern = self
             .be
             .kernel("deltanet", crate::gemm::deltanet_spv(), 9, 28);
@@ -2044,6 +2051,8 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&eps.to_ne_bytes());
         push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        // One workgroup per (value head, block of 32 state columns); local_size_x=32.
+        let n_blk = vd.div_ceil(32);
         self.dispatch(
             kern,
             &[
@@ -2059,7 +2068,7 @@ impl<'a> Recorder<'a> {
             ],
             2, // state (in/out) + out
             &push,
-            nv as u32,
+            (nv * n_blk) as u32,
         );
     }
 

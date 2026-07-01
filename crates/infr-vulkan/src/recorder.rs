@@ -1497,8 +1497,15 @@ impl<'a> Recorder<'a> {
         hd: usize,
         pos_offset: usize,
     ) {
-        let mpad = (n.div_ceil(128) * 128) as u32; // Br=128
-        let base_wg = (mpad / 128) * nh as u32;
+        let mpad = (n.div_ceil(128) * 128) as u32; // mpad is 128-aligned → divisible by both BR tiles
+                                                   // Register-O shared = BR*460 B: BR=128 → 58880 B (needs 64 KB); BR=64 → 29440 B (NVIDIA
+                                                   // 48 KB / MoltenVK 32 KB). Pick the largest that fits; the transformer skips reg if neither.
+        let br: u32 = if self.be.shared.caps.max_shared_memory_bytes >= 128 * 460 {
+            128
+        } else {
+            64
+        };
+        let base_wg = (mpad / br) * nh as u32;
         let n_splits = match std::env::var("INFR_FLASH_SPLITS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1516,13 +1523,15 @@ impl<'a> Recorder<'a> {
         };
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         self.stamp("attn_flash");
-        let kp = self.be.kernel_sg(
-            "attn_flash_reg",
-            crate::gemm::attn_flash_reg_spv(),
-            6,
-            32,
-            32,
-        );
+        let (rname, rspv): (&'static str, &[u32]) = if br == 64 {
+            (
+                "attn_flash_reg_br64",
+                crate::gemm::attn_flash_reg_br64_spv(),
+            )
+        } else {
+            ("attn_flash_reg", crate::gemm::attn_flash_reg_spv())
+        };
+        let kp = self.be.kernel_sg(rname, rspv, 6, 32, 32);
         let mut pp = [0u8; 32];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
         pp[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());

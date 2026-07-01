@@ -33,6 +33,8 @@ fn main() {
         // whose maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs.
         ("attn_flash_warp", "attn_flash_warp_bm32", &["-DBM_TILE=32"]),
         ("attn_flash_reg", "attn_flash_reg", &[]),
+        // BR=64 tile: 29440 B shared (vs 58880 B) for sub-64 KB shared devices (NVIDIA, MoltenVK).
+        ("attn_flash_reg", "attn_flash_reg_br64", &["-DBR_TILE=64"]),
         ("attn_flash_combine", "attn_flash_combine", &[]),
         ("attn_softmax", "attn_softmax", &[]),
         ("attn_pv", "attn_pv", &[]),

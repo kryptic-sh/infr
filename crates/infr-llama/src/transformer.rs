@@ -931,14 +931,12 @@ impl Llama {
         // (hd 256/512, nkv 8/1, wv=None → V=K, E2B per-layer FFN/KV-sharing) via the same per-layer
         // args the GEMV path used — see the QKV/FFN blocks below. INFR_NOGEMM restores GEMV.
         let use_gemm = c.qk_norm && n >= 64 && std::env::var("INFR_NOGEMM").is_err();
-        // Register-O flash (FlashAttention-2 layout, Br=128) is opt-in (INFR_FLASH_REG) while it's
-        // A/B'd vs the BM=64 flash; it needs mpad padded to 128 (q/attn/scratch).
-        // The register-O tile statically allocates 58880 B of shared memory (BR=128); skip it when
-        // the device can't fit that (NVIDIA 48 KB / MoltenVK) so it falls back to the size-aware
-        // flash path instead of over-committing shared memory → device-lost. RADV (64 KB) fits.
+        // Register-O flash (FlashAttention-2 layout, Br=128/64) is opt-in (INFR_FLASH_REG) while it's
+        // A/B'd vs the BM=64 flash; it needs mpad padded to 128 (q/attn/scratch). Its smallest tile
+        // (BR=64) needs 29440 B shared — skip it on devices that can't fit that (else device-lost).
         let use_flash_reg = use_gemm
             && hd == 128
-            && self.be.max_shared_memory_bytes() >= 58880
+            && self.be.max_shared_memory_bytes() >= 29440
             && std::env::var("INFR_FLASH_REG").is_ok();
         // gemma prefill attention: the flash warptile is hd=128-only, but the non-FA coopmat path
         // (attn_qk → softmax → attn_pv) is hd-general (256/512), so route gemma's attention through

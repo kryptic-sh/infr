@@ -21,7 +21,6 @@ pub struct CpuStats {
     pub decode_secs: f64,
 }
 
-
 // ─── Qwen3 dense CPU decode runner ───────────────────────────────────────────────
 //
 // Builds the n=1 decode Graph and drives it through `CpuBackend`, one token at a time, for BOTH

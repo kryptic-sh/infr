@@ -9,12 +9,9 @@ use infr_gguf::Gguf;
 // Non-test code uses dequant_block and f32_to_f16_sat; the rest are only needed in tests.
 pub(crate) use infr_gguf::dequant::{dequant_block, f32_to_f16_sat};
 
-// Test-only re-exports: transformer.rs test blocks use these via `use crate::*;`
+// Test-only re-exports: transformer.rs `gpu_affine_tests` use these via `use crate::*;`.
 #[cfg(test)]
-pub(crate) use infr_gguf::dequant::{
-    dequant_codebook, dequant_unified, e8m0_to_fp32_half, is_codebook_quant, is_quant,
-    k4, rdf16, ue4m3_to_fp32, IQ1S_DELTA, KVALUES_IQ4NL, KVALUES_MXFP4,
-};
+pub(crate) use infr_gguf::dequant::{dequant_codebook, dequant_unified};
 
 /// Load a named tensor and dequantize it to host f32, returning (data, shape in GGUF ne order
 /// `[in, out]`). The host/CPU-side dequant path — it does NOT load the bulk projection weights for

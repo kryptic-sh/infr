@@ -303,6 +303,68 @@ fn synth_q6k(n_elem: usize, seed: u32) -> Vec<u8> {
     out
 }
 
+// Linear (m=1, K-quant) immediately followed by a residual Add: the backend's peephole fuses the
+// pair into `linear_*_add` (one dispatch, Add's dst written directly). Compare against the CPU
+// reference running the UNFUSED pair — the fusion must be invisible.
+fn check_linear_add_fusion(dtype: DType, wbytes: Vec<u8>, in_f: usize, out_f: usize) {
+    let xs = rand_f32(in_f, 91);
+    let res = rand_f32(out_f, 92);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![out_f, in_f], dtype));
+    let rt = g.input(TensorDesc::new(vec![out_f], DType::F32));
+    let mid = g.internal(TensorDesc::new(vec![1, out_f], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![out_f], DType::F32));
+    g.push(Op::Linear {
+        x,
+        weight: w,
+        dst: mid,
+        m: 1,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+    });
+    g.push(Op::Add {
+        a: mid,
+        b: rt,
+        dst,
+        n: out_f as u32,
+    });
+    let bound = vec![
+        (x, f32_bytes(&xs)),
+        (w, wbytes.clone()),
+        (rt, f32_bytes(&res)),
+    ];
+    // Reference: dequant the SAME bytes + f32 matmul + add (the CPU backend Q8-quantizes the
+    // activation for quant Linear, so it is not the oracle here — same as the other quant tests).
+    let wref = infr_gguf::dequant::dequant_block(dtype, &wbytes).unwrap();
+    let mut reference = ref_linear(&xs, &wref, 1, in_f, out_f);
+    for (o, r) in reference.iter_mut().zip(res.iter()) {
+        *o += r;
+    }
+    let mtl = run(
+        &MetalBackend::new().expect("metal backend"),
+        &g,
+        &bound,
+        dst,
+        out_f,
+    );
+    assert_close(&reference, &mtl, 1e-3, "linear+add fusion");
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_q4k_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Q4K, synth_q4k(out_f * in_f, 93), in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_q6k_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Q6K, synth_q6k(out_f * in_f, 94), in_f, out_f);
+}
+
 // Shared quant-Linear parity check: Metal dequants `wbytes` (via infr_gguf) and matmuls; compare to
 // a reference that dequants the SAME bytes and matmuls — isolates Metal's quant-weight path.
 fn check_quant_linear_parity(dtype: DType, wbytes: Vec<u8>, m: usize, in_f: usize, out_f: usize) {
@@ -498,6 +560,38 @@ fn linear_q4k_gemm_matches_dequant_reference() {
     check_quant_linear_parity_impl(
         DType::Q4K,
         synth_q4k(out_f * in_f, 28),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+// out_f % 64 == 0 routes to the cooperative-tile GEMM (`linear_*_cmm`); m=40 covers one full
+// 32-row tile plus a partial one. Same f16-operand reference as the other GEMM tests.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q4k_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Q4K,
+        synth_q4k(out_f * in_f, 32),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q6k_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Q6K,
+        synth_q6k(out_f * in_f, 33),
         m,
         in_f,
         out_f,
@@ -789,8 +883,111 @@ fn attention_flash_matches_reference() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
 }
 
-// Long-context decode shape (rows=1, kv_len >= 128, hd <= 128): routes to the 32-way split-KV
-// kernel (`attnsplit32_*`), which the short-kv tests above never reach.
+// Same flash shape at hd = 72 (% 8 but not % 32): routes to the single-simdgroup flash kernel
+// (`attnflash_f16kv`), which the hd % 32 == 0 tests above no longer reach (those take the
+// cooperative `attnflash2_f16kv`).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash_hd72_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 72usize, 119usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 171))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 172))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 173))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
+// The cooperative flash kernel (`attnflash2_f16kv`) at the real model head size (hd = 128), with
+// a partial final query tile (rows = 17) and a KV length that lands mid-block (the kernel's
+// causal-skip keeps tail reads within 7 rows of the limit).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash2_hd128_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 128usize, 119usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 181))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 182))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 183))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
+// Sliding-window masking through the cooperative flash kernel: the analytic per-row window
+// lower bound must match the CPU reference (whole leading KV blocks fall below some rows'
+// windows but not others').
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash2_sliding_window_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 128usize, 119usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::SlidingWindow(64),
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 191))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 192))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 193))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
+// Long-context decode shape (rows=1, kv_len >= 128, hd=128): routes to the VECTOR flash kernel
+// (`attnvec_f16kv_hd128`) — 32 simdgroups, 32 KV positions per simdgroup step, log2 merge. The
+// kv_len=200 tail lands mid-block, exercising the clamped+masked tail rows.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_long_context_split32_parity() {
@@ -818,6 +1015,74 @@ fn attention_long_context_split32_parity() {
         (q, f32_bytes(&rand_f32(rows * nh * hd, 51))),
         (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 52))),
         (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 53))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+}
+
+// The 32-way split-KV kernel (`attnsplit32_*`) retained for head sizes without a vec-kernel
+// instantiation (hd=96 here): same long-context decode shape as above.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_long_context_split32_hd96_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (1usize, 200usize, 8usize, 2usize, 96usize, 199usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 201))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 202))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 203))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+}
+
+// Sliding-window decode at depth through the vector flash kernel: whole leading KV blocks fall
+// below the window (the kernel's block-skip), and the window edge lands mid-block.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_vec_sliding_window_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos, win) = (
+        1usize, 300usize, 8usize, 2usize, 64usize, 299usize, 100usize,
+    );
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::SlidingWindow(win),
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 211))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 212))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 213))),
     ];
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
 }

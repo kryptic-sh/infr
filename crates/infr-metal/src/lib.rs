@@ -81,6 +81,10 @@ pub struct MetalBackend {
     pub(crate) profiling: bool,
     pub(crate) prof_ops: bool,
     pub(crate) prof: std::sync::Mutex<profile::Profile>,
+    /// The recorded decode tape for the seam's record-once replay (`Capabilities::decode_replay`);
+    /// single slot, same single-generation lifetime as the weight caches (one backend per
+    /// generation, bindings stable across the decode loop).
+    pub(crate) replay: std::sync::Mutex<Option<exec::Tape>>,
 }
 
 // MTLDevice / MTLCommandQueue are documented thread-safe; the pipeline states are immutable after
@@ -102,6 +106,7 @@ impl MetalBackend {
             profiling: std::env::var("INFR_METAL_PROFILE").is_ok(),
             prof_ops: std::env::var("INFR_METAL_PROFILE").as_deref() == Ok("2"),
             prof: std::sync::Mutex::new(profile::Profile::default()),
+            replay: std::sync::Mutex::new(None),
         })
     }
 }
@@ -129,9 +134,13 @@ impl Backend for MetalBackend {
             // analogue of Vulkan's maxComputeSharedMemorySize (typically 32 KB, 64 KB on Apple GPUs).
             max_shared_memory_bytes: self.device.max_threadgroup_memory_length() as u32,
             unified_memory: self.device.has_unified_memory(),
-            // Like the CPU interpreter, this backend reads the baked `pos`/`kv_len` from the graph
-            // ops each execute, so the decode graph is rebuilt per token (no record-once replay).
-            decode_replay: false,
+            // Eligible decode graphs are recorded once as a flat dispatch tape and re-encoded
+            // per token, with position-dependent ops on dynamic-pos kernels that read the bound
+            // positions buffer (see `exec::Tape`). The engine may compile the decode graph once
+            // and re-execute it across the whole decode loop.
+            decode_replay: true,
+            // The reference backend keeps the separate gate/up FFN form (no GatedActFused
+            // lowering); the runner's combined-gu upload stays Vulkan-only.
             combined_gu: false,
         }
     }

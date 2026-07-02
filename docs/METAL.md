@@ -1,19 +1,33 @@
 # infr-metal — Apple GPU backend architecture
 
-State as of 2026-07-02 (PRs #4/#5/#6). `crates/infr-metal` implements the same
+State as of 2026-07-02 (PRs #4/#5/#6 merged, #10 = the flash_attn_ext arc).
+`crates/infr-metal` implements the same
 `Backend` seam as `infr-cpu` and `infr-vulkan` on Apple's Metal API. It started
 as a correctness-first reference (per-op command buffers, dequant-to-f32
 everything) and was rebuilt profiling-first; this doc records the architecture
 that emerged and the measured reasoning behind it.
 
-## Numbers (M3 Pro 18-core, Qwen3 Q4_K_M, greedy, 889-token prompt)
+## Numbers (M3 Pro 18-core, Qwen3 Q4_K_M, `infr bench` vs `llama-bench`, same GGUF)
 
-| model | metric | infr-metal | llama.cpp (same GGUF/machine) | gap |
+(One idle-machine run, both engines back-to-back, 2-3 reps each.)
+
+| model | metric | infr-metal | llama.cpp | gap |
 | --- | --- | --- | --- | --- |
-| 0.6B | decode 360 tok | ~132 tok/s | 191 | 1.45× |
-| 0.6B | prefill 889 | ~2840 tok/s | 4191 | 1.48× |
-| 4B | decode 430 tok | 37.5 tok/s | 46.7 | 1.25× |
-| 4B | prefill 889 | ~498 tok/s | 630 | 1.27× |
+| 0.6B | tg128 | 158 tok/s | 193 | 1.23× |
+| 0.6B | tg128 @ d16384 | 49.7 tok/s | 46.6 | **infr ahead** |
+| 0.6B | pp2048 | 3508 tok/s | 3751 | 1.07× |
+| 0.6B | pp8192 | 2233 tok/s | 2342 | 1.05× |
+| 4B | tg128 | 40.5 tok/s | 46.6 | 1.15× |
+| 4B | tg128 @ d16384 | 21.8 tok/s | 24.4 | 1.12× |
+| 4B | pp2048 | 569 tok/s | 603 | 1.06× |
+| 4B | pp8192 | 455 tok/s | 489 | 1.07× |
+
+Decode is weight-stream bound: the GEMV kernels run ~107 GB/s of a measured
+~133 GB/s read roofline, and the per-token host cost is ~0.2 ms (the recorded
+decode-replay tape re-encodes the whole forward with no graph walk). The
+remaining gap vs llama.cpp is effective-bandwidth tail (dispatch ramp on
+36-66 MB matrices + the serial small-op chain), not kernel structure — the
+mul_mv port matches their N_R0/N_SG configuration exactly.
 
 From the naive reference implementation: decode ~44×, prefill ~250×+. Model
 load is ~10× faster than the repack era and resident weight memory is the raw
@@ -76,17 +90,24 @@ NK=32. The load-bearing piece is the **threadgroup-memory layout**: staged
 operands are contiguous 8×8 half tiles (weights written pre-transposed), so
 every `simdgroup_load` is stride-8 and conflict-free — tile size, barrier
 count, and decode width were each probed separately and none of them was the
-gap. Each thread dequantizes exactly one 16-block per K-step (128 threads = the
+gap. Two more mul_mm details each measured real wins later: the device reads +
+dequant issue BEFORE the barrier that drains the previous iteration's MMA
+(latency-hides behind compute, +5% 4B pp2048), and the DEC16 decoders use the
+reference dequantize shapes — in-place high nibble with the /16 folded into
+the scale (Q4_K), uint32-lane ql/qh combines (Q6_K) — bit-identical values,
+~+4% more. Each thread dequantizes exactly one 16-block per K-step (128 threads = the
 whole weight tile) and x is cast f32→f16 inline during staging. Each simdgroup
 owns a 32×16 quadrant as 8 f32 accumulators; partial token tiles stage through
 threadgroup memory with a row-guarded copy-out so every tile takes the MMA
 path.
 
-Precision policy: **decode is bit-exact** against `dequant_block` (same f32
-multiply sequence). Prefill GEMM rounds operands to f16 (~5e-4 relative, well
-under quantization error — the llama.cpp trade); its parity tests compare
-against a reference that rounds operands identically, keeping the tolerance at
-1e-3 instead of testing nothing with a loosened bound.
+Precision policy: **decode is algebraically identical to `dequant_block`, FP
+reassociation only** (the mul_mv-shape GEMV reconstructs the exact dequant
+values but reorders the f32 dot's summation; parity holds at 1e-4). Prefill
+GEMM rounds operands to f16 (~5e-4 relative, well under quantization error —
+the llama.cpp trade); its parity tests compare against a reference that rounds
+operands identically, keeping the tolerance at 1e-3 instead of testing nothing
+with a loosened bound.
 
 ## Attention routing
 
@@ -94,20 +115,36 @@ All scalar variants share `AttnParams` and an online-softmax core; routing is
 by launch shape because the scalar kernels are latency-bound on their serial
 O(kv_len) chain:
 
-- **`attnflash_f16kv`** — wide launches on an f16 cache (rows·n_head ≥ 128,
-  kv_len ≥ 64, hd ≤ 128, hd % 8 == 0): one simdgroup per (8-query tile, head).
-  K^T/V 8×8 fragments load DIRECTLY from the f16 cache (strided, transposed for
-  K), Q is cast once per op to f16, scores + output accumulate f32, the masked
-  online softmax runs scalar f32 on an 8×8 tile per 8-position KV block with
-  the row rescale as a diagonal f32 MMA. An earlier all-f32 flash kernel lost
-  to the scalar split (it staged K/V through 8 KB threadgroup tiles); zero
-  staging is what makes this one win. Tail blocks may read up to 7 rows past
-  the causal limit — always inside the bound cache buffer — and are masked.
-- **`attnsplit32_*` / `attnsplit_*`** — narrow launches (decode) and long
-  contexts: NSG (32 or 8) simdgroups per (query, head), each owning a strided
-  KV slice with a private online softmax, merged in threadgroup memory. The
-  32-way split fires when kv_len ≥ 128 and hd ≤ 128 (its accumulator needs
-  16 KB of threadgroup memory).
+- **`attnflash2_f16kv` (hd 64/128)** — the llama.cpp `kernel_flash_attn_ext`
+  structure for wide launches: NSG=4 simdgroups cooperate on ONE (8-query
+  tile, head) threadgroup over C=64 KV positions per iteration, each phase
+  split along a different axis (QK^T by KV columns with K^T direct from the
+  f16 cache; softmax by query rows, all 32 lanes on float2 scores, M/S stats
+  pinned in the owning simdgroup's registers; P·V by output columns with O
+  fragments held in registers). Analytic causal/window masking, zero-padded
+  partial query tiles. Templated over compile-time head_dim (hd=64/128
+  instantiations — the fully-unrolled loops were worth +38% alone); NSG=8
+  benched slower.
+- **`attnflash_f16kv`** — the single-simdgroup flash kernel, kept for
+  hd % 8 == 0 shapes outside the hd 64/128 instantiations: one simdgroup per
+  (8-query tile, head), K^T/V 8×8 fragments direct from the f16 cache, scalar
+  masked online softmax per 16-position KV block, diagonal-MMA row rescale.
+  An earlier all-f32 flash kernel lost to the scalar split (it staged K/V
+  through 8 KB threadgroup tiles); zero staging is what makes these win. Tail
+  blocks may read up to 7 rows past the causal limit — always inside the
+  bound cache buffer — and are masked.
+- **`attnvec_f16kv` (hd 64/128)** — the llama.cpp `kernel_flash_attn_ext_vec`
+  structure for long-context decode (kv_len ≥ 128): 32 simdgroups per
+  (query, head), each owning interleaved 32-position KV blocks with a private
+  online softmax — 4 KV rows × 8-lane dots per pass, shuffle-tree reduce, ONE
+  simd_max/simd_sum per block (the split kernels below run that chain once
+  per position and are latency-bound on it) — merged once at the end by a
+  log2 tree. Q stays f32 (parity 1e-4); tail rows clamp into the cache and
+  mask in the softmax.
+- **`attnsplit32_*` / `attnsplit_*`** — narrow launches and long contexts on
+  head sizes without a vec instantiation: NSG (32 or 8) simdgroups per
+  (query, head), each owning a strided KV slice with a private online
+  softmax, merged in threadgroup memory.
 - **`attention_*`** — the lean one-simdgroup-per-(query, head) kernel for
   short-context leftovers.
 
@@ -126,16 +163,20 @@ GPU wall per op — costs the batching (analysis mode, not the fast path).
 
 ## Tests
 
-`tests/parity.rs` — 30+ GPU parity tests vs the CPU reference: every op, and
+`tests/parity.rs` — 39 GPU parity tests vs the CPU reference: every op, and
 for quantized Linear every (format × kernel shape) pair including partial
-tiles; attention covers unsplit/split8/split32/flash and sliding window.
+tiles; attention covers unsplit/split8/split32/flash/flash2/vec, sliding
+windows at both tile and block granularity, partial query tiles, and the
+retained hd=72/96 routes.
 `tests/dispatch_overhead.rs`, `tests/gemv_bw.rs` — evidence probes (ignored),
 kept so the floors above stay reproducible.
 
 ## Negative results (measured — don't re-try without new evidence)
 
 - Op fusion / dispatch-count reduction: per-kernel overhead is ~1.2 µs; a fused
-  Add+RmsNorm measured nothing.
+  Add+RmsNorm measured nothing at prefill. (The decode Linear→Add residual
+  peephole — mirroring the Vulkan adapter — is the exception: +2.5% on 4B
+  decode, from removing a dependency stage per sublayer, not dispatch count.)
 - Row-tiled GEMV for prefill weight reuse: zero change — the SLC already
   absorbed the re-reads; the scalar pipeline's ~1:1 load:FMA ratio was the
   limit (hence MMA).

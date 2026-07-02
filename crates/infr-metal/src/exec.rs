@@ -41,13 +41,163 @@ enum Loc {
 
 /// Per-forward execution state: the host mirror (`vals`), a device buffer per tensor (`dev`), where
 /// each tensor currently lives (`loc`), and the open command buffer that batches consecutive GPU ops
-/// so they share a single commit + wait instead of one per op.
+/// so they share a single commit + wait instead of one per op. When `tape` is armed, every encoded
+/// dispatch is also recorded for decode replay (see [`Tape`]), and `posbuf` carries the bound
+/// positions buffer the dynamic-pos kernels read.
 struct Resident {
     vals: Vec<Vec<f32>>,
     dev: Vec<Option<Arc<MtlBuffer>>>,
     loc: Vec<Loc>,
     cb: Option<CommandBuffer>,
     enc: Option<ComputeCommandEncoder>,
+    tape: Option<Vec<TapeEntry>>,
+    posbuf: Option<MtlBuffer>,
+    /// Linear→Add residual fusion (see `linear_add_peephole`): Linear op index → (residual
+    /// tensor, final dst); the absorbed Adds are in `skip`.
+    fused: std::collections::HashMap<usize, (TensorId, TensorId)>,
+    skip: std::collections::HashSet<usize>,
+    /// Host-read override of the graph's baked position (see `run_graph`): the seam's replay
+    /// loop re-executes one compiled decode graph (baked pos=0) and only rewrites the bound
+    /// positions buffer, so on any decode-shaped graph the position-consuming ops (Attention,
+    /// WriteKv) must take the CURRENT position — the tape path reads it on the GPU; this covers
+    /// every graph the tape can't (MoE, gemma shapes, hd without a dyn instantiation).
+    dynpos: Option<u32>,
+}
+
+/// Fuse `Linear (m==1, Q4_K/Q6_K weight, Internal dst) → Add(residual)` into the fused-residual
+/// GEMV (`linear_q4k_add`/`linear_q6k_add`) — one dispatch + one dependency stage instead of two,
+/// and no round-trip of the sublayer output (the decode o_proj/down_proj shape; mirrors the
+/// Vulkan adapter's peephole). Only the IMMEDIATELY following Add fuses: the seam builder emits
+/// the pair adjacent for non-gemma models, and gemma's sandwich norm sits between and correctly
+/// blocks it.
+fn linear_add_peephole(
+    g: &infr_core::graph::Graph,
+) -> (
+    std::collections::HashMap<usize, (TensorId, TensorId)>,
+    std::collections::HashSet<usize>,
+) {
+    let mut fused = std::collections::HashMap::new();
+    let mut skip = std::collections::HashSet::new();
+    for (i, op) in g.ops.iter().enumerate() {
+        let Op::Linear {
+            dst, m: 1, weight, ..
+        } = op
+        else {
+            continue;
+        };
+        if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal) {
+            continue;
+        }
+        if !matches!(g.desc(*weight).dtype, DType::Q4K | DType::Q6K) {
+            continue;
+        }
+        if let Some(Op::Add {
+            a, b, dst: add_dst, ..
+        }) = g.ops.get(i + 1)
+        {
+            let residual = if a == dst {
+                *b
+            } else if b == dst {
+                *a
+            } else {
+                continue;
+            };
+            fused.insert(i, (residual, *add_dst));
+            skip.insert(i + 1);
+        }
+    }
+    (fused, skip)
+}
+
+/// One recorded dispatch: everything `encode_tg` needs to re-encode it verbatim. The buffer clones
+/// are retains, so the tape keeps every transient (intermediate activations, cached weights) alive
+/// across replays — replaying reuses the exact buffers the recording ran on.
+pub(crate) struct TapeEntry {
+    pso: ComputePipelineState,
+    bufs: Vec<MtlBuffer>,
+    params: Vec<u8>,
+    threads: usize,
+    tg: usize,
+}
+
+/// A recorded decode forward for the seam's record-once replay (`Capabilities::decode_replay`):
+/// the engine compiles the decode graph once (baked pos=0), binds everything once, and re-executes
+/// the same plan per token after uploading the new embedding + position. Metal command buffers are
+/// single-use, so "replay" here is re-encoding this flat dispatch list — no graph walk, no host
+/// mirror, no transient allocation, no routing. Ops whose behavior depends on the position use
+/// DYNAMIC-POS kernels that read the bound positions buffer (`attnvec_dyn_*`, `writekv_dyn_f16`;
+/// RoPE already reads it), so the recorded params stay valid for every token.
+pub(crate) struct Tape {
+    /// Fingerprint of (op discriminants, tensor count, bound buffer addresses): a tape is replayed
+    /// only for a graph with the identical op sequence over the identical bindings. Baked pos /
+    /// kv_len MAY differ across tokens — the dynamic-pos kernels ignore them by construction.
+    fp: u64,
+    entries: Vec<TapeEntry>,
+}
+
+/// Fingerprint the (graph shape, bindings) pair for tape matching. Op kind + tensor count pins the
+/// graph structure; the bound buffer addresses pin the weights/caches/IO. Two graphs that agree on
+/// all of that and pass [`replay_shape`] differ at most in baked positions, which replay reads
+/// dynamically.
+fn replay_fp(g: &infr_core::graph::Graph, bindings: &Bindings) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+    mix(g.tensors.len() as u64);
+    for op in &g.ops {
+        mix(op_name(op).as_ptr() as u64);
+    }
+    for i in 0..g.tensors.len() {
+        if let Some(b) = bindings.get(TensorId(i as u32)) {
+            mix(metal_buf(b) as *const _ as u64);
+        }
+    }
+    h
+}
+
+/// Is this graph the decode shape the replay tape supports? Every op must be one the recorder
+/// handles fully on-device, attention must be the rows=1 f16 shape with a dynamic-pos kernel
+/// instantiation (hd 64/128), and a QkNormRope must exist to name the positions buffer.
+fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
+    use infr_core::graph::TensorKind;
+    let mut has_rope = false;
+    let mut has_attn = false;
+    for op in &g.ops {
+        match op {
+            Op::RmsNorm { .. } | Op::Linear { .. } | Op::GatedAct { .. } | Op::Add { .. } => {}
+            Op::QkNormRope { .. } => has_rope = true,
+            Op::WriteKv { cache, .. } => {
+                if g.desc(*cache).dtype != DType::F16 {
+                    return false;
+                }
+            }
+            Op::Attention {
+                rows,
+                head_dim,
+                k_cache,
+                ..
+            } => {
+                has_attn = true;
+                if *rows != 1
+                    || !matches!(*head_dim, 64 | 128)
+                    || g.desc(*k_cache).dtype != DType::F16
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    // Every non-in-place tensor the recording direct-binds must actually be bound.
+    for (i, decl) in g.tensors.iter().enumerate() {
+        let needs_binding = matches!(decl.kind, TensorKind::Input | TensorKind::Output);
+        if needs_binding && bindings.get(TensorId(i as u32)).is_none() {
+            return false;
+        }
+    }
+    has_rope && has_attn
 }
 
 /// Reinterpret raw buffer bytes as `f32` per `dtype` (dequantizing quant/f16/bf16, widening integer
@@ -220,8 +370,52 @@ impl MetalBackend {
             );
         }
         let cap = pso.max_total_threads_per_threadgroup() as usize;
-        let tg = if tg == 0 { cap } else { tg.min(cap) }.min(threads.max(1)) as u64;
-        enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
+        let tgw = if tg == 0 { cap } else { tg.min(cap) }.min(threads.max(1)) as u64;
+        enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tgw, 1, 1));
+        if let Some(tape) = r.tape.as_mut() {
+            tape.push(TapeEntry {
+                pso: pso.clone(),
+                bufs: bufs.iter().map(|b| (*b).clone()).collect(),
+                params: params.to_vec(),
+                threads,
+                tg,
+            });
+        }
+    }
+
+    /// Re-encode a recorded tape: one command buffer, the flat dispatch list, commit + wait.
+    /// This IS the per-token decode cost on the replay path — no graph walk, no host mirror,
+    /// no allocation.
+    fn replay_tape(&self, tape: &Tape) {
+        objc::rc::autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            for e in &tape.entries {
+                enc.set_compute_pipeline_state(&e.pso);
+                for (i, b) in e.bufs.iter().enumerate() {
+                    enc.set_buffer(i as u64, Some(b), 0);
+                }
+                if !e.params.is_empty() {
+                    enc.set_bytes(
+                        e.bufs.len() as u64,
+                        e.params.len() as u64,
+                        e.params.as_ptr() as *const c_void,
+                    );
+                }
+                let cap = e.pso.max_total_threads_per_threadgroup() as usize;
+                let tg = if e.tg == 0 { cap } else { e.tg.min(cap) }.min(e.threads.max(1)) as u64;
+                enc.dispatch_threads(MTLSize::new(e.threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
+            }
+            enc.end_encoding();
+            let t0 = self.profiling.then(std::time::Instant::now);
+            cb.commit();
+            cb.wait_until_completed();
+            if let Some(t0) = t0 {
+                let mut pr = self.prof.lock().unwrap();
+                pr.add_dispatch(t0.elapsed());
+                pr.add_forward();
+            }
+        });
     }
 
     /// Close the open batch: end encoding, commit, and wait. A no-op if nothing is buffered.
@@ -278,12 +472,51 @@ impl MetalBackend {
             .expect("metal backend: plan is not a GraphPlan")
             .graph;
 
+        // Decode replay: if this exact (graph shape, bindings) pair was recorded, re-encode the
+        // tape and skip the graph walk entirely (see `Tape`). The engine's replay loop re-executes
+        // one compiled plan with stable bindings, so after the first recorded token every
+        // subsequent token takes this path. The dynamic-pos vector kernel REQUIRES its full
+        // 1024-thread threadgroup (same silent-clamp hazard as the split kernels), so recording is
+        // gated on its pipeline cap — a capped device (CI paravirtual) keeps the per-token path.
+        let dyn_cap_ok = || -> bool {
+            let kern = g.ops.iter().find_map(|op| match op {
+                Op::Attention { head_dim: 64, .. } => Some("attnvec_dyn_f16kv_hd64"),
+                Op::Attention { head_dim: 128, .. } => Some("attnvec_dyn_f16kv_hd128"),
+                _ => None,
+            });
+            kern.is_some_and(|kn| {
+                self.pipelines
+                    .get(kn)
+                    .map(|pl| pl.max_total_threads_per_threadgroup() >= 1024)
+                    .unwrap_or(false)
+            })
+        };
+        if replay_shape(g, bindings) && dyn_cap_ok() {
+            let fp = replay_fp(g, bindings);
+            if let Some(tape) = self.replay.lock().unwrap().as_ref() {
+                if tape.fp == fp {
+                    self.replay_tape(tape);
+                    return Ok(());
+                }
+            }
+            let entries = objc::rc::autoreleasepool(|| self.run_graph(g, bindings, true))?;
+            if let Some(entries) = entries {
+                *self.replay.lock().unwrap() = Some(Tape { fp, entries });
+            }
+            return Ok(());
+        }
+
         // Wrap the whole forward in one autorelease pool: the batched command buffers/encoders are
         // retained owned handles, so we drain the pool once per forward instead of once per op.
-        objc::rc::autoreleasepool(|| self.run_graph(g, bindings))
+        objc::rc::autoreleasepool(|| self.run_graph(g, bindings, false).map(|_| ()))
     }
 
-    fn run_graph(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> Result<()> {
+    fn run_graph(
+        &self,
+        g: &infr_core::graph::Graph,
+        bindings: &Bindings,
+        record: bool,
+    ) -> Result<Option<Vec<TapeEntry>>> {
         // f32 host mirror for every Input/Internal/Output handle (mirrors the CPU interpreter); GPU
         // results stay on-device until a host op or the write-back needs them (see `Loc`/`Resident`).
         // KV caches are written/read in place from their bound buffers (see `direct`).
@@ -295,13 +528,83 @@ impl MetalBackend {
             loc: vec![Loc::Host; n],
             cb: None,
             enc: None,
+            tape: record.then(Vec::new),
+            posbuf: None,
+            fused: std::collections::HashMap::new(),
+            skip: std::collections::HashSet::new(),
+            dynpos: None,
         };
+        // Decode-shaped graph (a rows==1 Attention) with a bound positions buffer: read the
+        // CURRENT position off the shared-memory buffer and override the baked pos/kv_len in
+        // the position-consuming arms. Single-execute callers bind positions equal to the baked
+        // value, so this is the identity for them; the seam's replay loop is where they differ.
+        let decode_shaped = g
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Attention { rows: 1, .. }));
+        if decode_shaped {
+            let positions = g.ops.iter().find_map(|op| match op {
+                Op::QkNormRope { positions, .. } | Op::Rope { positions, .. } => Some(*positions),
+                _ => None,
+            });
+            if let Some(pid) = positions {
+                if let Some(b) = bindings.get(pid) {
+                    let buf = metal_buf(b);
+                    if buf.len >= 4 {
+                        let v = unsafe { *(buf.raw.contents() as *const i32) };
+                        if v >= 0 {
+                            r.dynpos = Some(v as u32);
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let (fused, skip) = linear_add_peephole(g);
+            r.fused = fused;
+            r.skip = skip;
+        }
+        if record {
+            // Recording (`replay_shape` held): the tape must read/write the BOUND buffers, not
+            // per-execute host-mirror copies — the engine mutates the bound hidden/positions
+            // buffers between replays and reads logits from its bound buffer. So f32 Inputs and
+            // Outputs are direct-bound as the tensor's device buffer, and the positions buffer
+            // (i32, named by the graph's QkNormRope) is stashed for the dynamic-pos kernels.
+            for (i, decl) in g.tensors.iter().enumerate() {
+                let id = TensorId(i as u32);
+                if direct.contains(&id) {
+                    continue;
+                }
+                let bound = match decl.kind {
+                    TensorKind::Input if decl.desc.dtype == DType::F32 => true,
+                    TensorKind::Output => true,
+                    _ => false,
+                };
+                if bound {
+                    let buf = metal_buf(bindings.get(id).expect("replay_shape checked bindings"));
+                    r.dev[i] = Some(Arc::new(buf.raw.clone()));
+                    if decl.kind == TensorKind::Input {
+                        r.loc[i] = Loc::Device;
+                    }
+                }
+            }
+            let positions = g
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    Op::QkNormRope { positions, .. } => Some(*positions),
+                    _ => None,
+                })
+                .expect("replay_shape checked QkNormRope");
+            r.posbuf = Some(metal_buf(bindings.get(positions).unwrap()).raw.clone());
+        }
         for (i, decl) in g.tensors.iter().enumerate() {
             match decl.kind {
                 TensorKind::Internal | TensorKind::Output => {
                     r.vals[i] = vec![0f32; decl.desc.numel()]
                 }
                 TensorKind::Input if direct.contains(&TensorId(i as u32)) => {}
+                TensorKind::Input if record && decl.desc.dtype == DType::F32 => {}
                 TensorKind::Input => {
                     let buf = metal_buf(
                         bindings
@@ -316,9 +619,12 @@ impl MetalBackend {
         }
 
         if self.profiling {
-            for op in &g.ops {
+            for (idx, op) in g.ops.iter().enumerate() {
+                if r.skip.contains(&idx) {
+                    continue;
+                }
                 let t0 = std::time::Instant::now();
-                self.run_op(op, g, bindings, &mut r)?;
+                self.run_op(op, idx, g, bindings, &mut r)?;
                 let enc = t0.elapsed();
                 // Per-op mode: flush now so this op's GPU wall is isolable (breaks batching).
                 let gpu = if self.prof_ops {
@@ -336,8 +642,11 @@ impl MetalBackend {
             }
             self.prof.lock().unwrap().add_forward();
         } else {
-            for op in &g.ops {
-                self.run_op(op, g, bindings, &mut r)?;
+            for (idx, op) in g.ops.iter().enumerate() {
+                if r.skip.contains(&idx) {
+                    continue;
+                }
+                self.run_op(op, idx, g, bindings, &mut r)?;
             }
         }
 
@@ -351,9 +660,14 @@ impl MetalBackend {
                 continue;
             }
             if bindings.get(TensorId(i as u32)).is_some() {
+                let b = metal_buf(bindings.get(TensorId(i as u32)).unwrap());
+                // Direct-bound (recording): the GPU already wrote the bound buffer — nothing to
+                // copy, the trailing flush below makes it visible.
+                if matches!(&r.dev[i], Some(d) if d.contents() == b.raw.contents()) {
+                    continue;
+                }
                 // Pull the value back to the host mirror (flushes the batch if it's still on-device).
                 self.ensure_host(&mut r, g, TensorId(i as u32));
-                let b = metal_buf(bindings.get(TensorId(i as u32)).unwrap());
                 let src: &[u8] = bytemuck::cast_slice(&r.vals[i]);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -366,7 +680,7 @@ impl MetalBackend {
         }
         // Close any trailing batch (an Internal-only tail never pulled to host).
         self.flush(&mut r);
-        Ok(())
+        Ok(r.tape.take())
     }
 
     /// Fetch a dequantized weight as a device f32 buffer, cached by bound-buffer address.
@@ -523,6 +837,7 @@ impl MetalBackend {
     fn run_op(
         &self,
         op: &Op,
+        idx: usize,
         g: &infr_core::graph::Graph,
         bindings: &Bindings,
         r: &mut Resident,
@@ -619,6 +934,22 @@ impl MetalBackend {
                         "linear_q6k" => "linear_q6k_hmm",
                         _ => "linear_quik8_hmm",
                     };
+                    let cmm_kern = match qw.kern {
+                        "linear_quik4" => "linear_quik4_cmm",
+                        "linear_quik6" => "linear_quik6_cmm",
+                        "linear_q4k" => "linear_q4k_cmm",
+                        "linear_q6k" => "linear_q6k_cmm",
+                        _ => "linear_quik8_cmm",
+                    };
+                    // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
+                    // the out_f % 64 != 0 leftovers, and both need the full 128-thread group.
+                    let cmm_ok = m >= 16
+                        && out_f % 64 == 0
+                        && self
+                            .pipelines
+                            .get(cmm_kern)?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
                     let hmm_ok = m >= 16
                         && out_f % 16 == 0
                         && self
@@ -627,7 +958,18 @@ impl MetalBackend {
                             .max_total_threads_per_threadgroup()
                             >= 128;
                     p.extend_from_slice(&qw.dshift.to_ne_bytes());
-                    if hmm_ok {
+                    if cmm_ok {
+                        // Reads f32 x directly (casts to f16 while staging) — no cast pass.
+                        let pso = self.pipelines.get(cmm_kern)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
+                            &p,
+                            m.div_ceil(32) * (out_f / 64) * 128,
+                            128,
+                        );
+                    } else if hmm_ok {
                         // Prefill GEMM runs on half fragments (see `HGEMM_KERNEL`): cast x to a
                         // transient f16 buffer first, then one GEMM dispatch reads it.
                         let xh = Arc::new(self.device.new_buffer(
@@ -657,8 +999,41 @@ impl MetalBackend {
                             };
                             (rt, m.div_ceil(8) * out_f)
                         } else {
-                            (qw.kern, out_f)
+                            // The native mul_mv-shape GEMVs cover TWO output rows per simdgroup.
+                            let sgs = match qw.kern {
+                                "linear_q4k" | "linear_q6k" => out_f.div_ceil(2),
+                                _ => out_f,
+                            };
+                            (qw.kern, sgs)
                         };
+                        // Residual peephole: this Linear absorbed the following Add — take the
+                        // fused-residual variant and write the Add's dst directly.
+                        if let Some(&(res, fdst)) = r.fused.get(&idx) {
+                            let fk = match kern {
+                                "linear_q4k" => "linear_q4k_add",
+                                _ => "linear_q6k_add",
+                            };
+                            let bres = self.ensure_device(r, res);
+                            let bfd = self.dev_dst(r, fdst, out_f);
+                            let pso = self.pipelines.get(fk)?;
+                            self.encode_tg(
+                                r,
+                                &pso,
+                                &[
+                                    bx.as_ref(),
+                                    &qw.codes,
+                                    &qw.scm,
+                                    &qw.dd,
+                                    bfd.as_ref(),
+                                    bres.as_ref(),
+                                ],
+                                &p,
+                                sgs * 32,
+                                32,
+                            );
+                            r.loc[fdst.0 as usize] = Loc::Device;
+                            return Ok(());
+                        }
                         let pso = self.pipelines.get(kern)?;
                         self.encode_tg(
                             r,
@@ -735,7 +1110,18 @@ impl MetalBackend {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings);
-                let bpos = self.ensure_device(r, positions);
+                // The kernel reads the bound i32 positions buffer directly (exact widening in
+                // the shader) — no host round-trip, and the decode-replay tape stays valid when
+                // the engine rewrites the position between replays.
+                let bpos = Arc::new(
+                    metal_buf(
+                        bindings
+                            .get(positions)
+                            .expect("metal backend: unbound positions"),
+                    )
+                    .raw
+                    .clone(),
+                );
                 let bff = match freq_factors {
                     Some(f) => self.ensure_device(r, f),
                     None => Arc::new(self.zeros_buf(1)),
@@ -850,7 +1236,10 @@ impl MetalBackend {
                 // Stateful cast-copy of `rows` rows into the persistent KV buffer, on the GPU so it
                 // stays in the batch (a host write would force a per-layer flush). Metal's hazard
                 // tracking orders this write before the Attention that reads the same cache buffer.
-                let (rows, rs, pos) = (rows as usize, row_stride as usize, pos as usize);
+                let (rows, rs, mut pos) = (rows as usize, row_stride as usize, pos as usize);
+                if let (Some(dp), 1) = (r.dynpos, rows) {
+                    pos = dp as usize;
+                }
                 let bsrc = self.ensure_device(r, src);
                 let cbuf = metal_buf(
                     bindings
@@ -859,14 +1248,23 @@ impl MetalBackend {
                 );
                 let base = pos * rs;
                 let n = rows * rs;
-                let kern = match g.desc(cache).dtype {
-                    DType::F16 => "writekv_f16",
-                    _ => "writekv_f32",
-                };
-                let pso = self.pipelines.get(kern)?;
-                let mut p = (n as u32).to_ne_bytes().to_vec();
-                p.extend_from_slice(&(base as u32).to_ne_bytes());
-                self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, n);
+                if let Some(posbuf) = r.posbuf.clone() {
+                    // Recording a replay tape: the row offset must come from the positions buffer
+                    // (the baked `pos` is this token's only) — f16 cache guaranteed by the gate.
+                    let pso = self.pipelines.get("writekv_dyn_f16")?;
+                    let mut p = (n as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(rs as u32).to_ne_bytes());
+                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw, &posbuf], &p, n);
+                } else {
+                    let kern = match g.desc(cache).dtype {
+                        DType::F16 => "writekv_f16",
+                        _ => "writekv_f32",
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (n as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(base as u32).to_ne_bytes());
+                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, n);
+                }
             }
             Op::Attention {
                 q,
@@ -889,6 +1287,12 @@ impl MetalBackend {
                     n_kv as usize,
                     head_dim as usize,
                 );
+                // Replayed decode graph: the baked pos/kv_len are the compile-time token's;
+                // take the current position (also steers the kv_len-based kernel routing).
+                let (pos, kv_len) = match r.dynpos {
+                    Some(dp) if rows == 1 => (dp, dp as usize + 1),
+                    _ => (pos, kv_len),
+                };
                 if hd > 256 {
                     return Err(Error::Unsupported(format!(
                         "metal attention: head_dim {hd} exceeds MAX_HD 256 (shader acc[] cap)"
@@ -905,6 +1309,37 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::Causal => 0,
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                 };
+                if let Some(posbuf) = r.posbuf.clone() {
+                    // Recording a replay tape (rows==1, f16 cache, hd 64/128 — checked by the
+                    // gate): route straight to the dynamic-pos vector flash kernel, which reads
+                    // pos from the positions buffer and covers every kv_len from 1 up. The usual
+                    // shape routing below would bake this token's kv_len into the kernel CHOICE,
+                    // which is exactly what a replayed tape can't have.
+                    let kern = if hd == 64 {
+                        "attnvec_dyn_f16kv_hd64"
+                    } else {
+                        "attnvec_dyn_f16kv_hd128"
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                    p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    p.extend_from_slice(&window.to_ne_bytes());
+                    p.extend_from_slice(&pos.to_ne_bytes());
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref(), &posbuf],
+                        &p,
+                        rows * nh * 32 * 32,
+                        32 * 32,
+                    );
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
+                }
                 // Route by kernel-latency shape. The one-simdgroup-per-(query, head) kernels are
                 // latency-bound on their serial O(kv_len) online-softmax chain, so any long
                 // context takes a split-KV kernel — NSG simdgroups per (query, head) merged in
@@ -922,6 +1357,23 @@ impl MetalBackend {
                 // path). See `attnflash_f16kv` for why the f32 flash attempt lost and this wins.
                 let flash = f16 && rows * nh >= 128 && kv_len >= 64 && hd <= 128 && hd % 8 == 0;
                 let split = !flash && (rows * nh < 128 || kv_len >= 128);
+                // The cooperative flash kernel (4 simdgroups per query tile, llama.cpp
+                // flash_attn_ext structure) is instantiated per compile-time head size
+                // (fully unrolled QK/PV loops) and needs a 128-thread threadgroup
+                // (pipeline-cap gated like the split kernels); other head sizes keep the
+                // single-simdgroup flash.
+                let flash2_kern = match hd {
+                    64 => Some("attnflash2_f16kv_hd64"),
+                    128 => Some("attnflash2_f16kv_hd128"),
+                    _ => None,
+                };
+                let flash2 = flash
+                    && flash2_kern.is_some_and(|kn| {
+                        self.pipelines
+                            .get(kn)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                            .unwrap_or(false)
+                    });
                 // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup
                 // owns a strided KV slice, so a smaller launch would silently skip positions and
                 // merge uninitialized partials. maxTotalThreadsPerThreadgroup is per-PIPELINE
@@ -935,7 +1387,26 @@ impl MetalBackend {
                         .max_total_threads_per_threadgroup()
                         >= threads)
                 };
+                // The vector flash kernel (llama.cpp flash_attn_ext_vec structure) covers the
+                // long-context decode shape split32 serves, at 32 KV positions per simdgroup
+                // step instead of 1 — same head-size instantiations and cap gating as flash2.
+                let vec_kern = match hd {
+                    64 => Some("attnvec_f16kv_hd64"),
+                    128 => Some("attnvec_f16kv_hd128"),
+                    _ => None,
+                };
+                let vec = !flash
+                    && f16
+                    && split
+                    && kv_len >= 128
+                    && vec_kern.is_some_and(|kn| {
+                        self.pipelines
+                            .get(kn)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 1024)
+                            .unwrap_or(false)
+                    });
                 let split32 = split
+                    && !vec
                     && kv_len >= 128
                     && hd <= 128
                     && fits(
@@ -947,7 +1418,8 @@ impl MetalBackend {
                         1024,
                     )?;
                 let split = split
-                    && (split32
+                    && (vec
+                        || split32
                         || fits(
                             if f16 {
                                 "attnsplit_f16kv"
@@ -957,7 +1429,9 @@ impl MetalBackend {
                             256,
                         )?);
                 let kern = match (flash, f16, split, split32) {
+                    (true, ..) if flash2 => flash2_kern.unwrap(),
                     (true, ..) => "attnflash_f16kv",
+                    (_, true, true, _) if vec => vec_kern.unwrap(),
                     (_, true, false, _) => "attention_f16kv",
                     (_, true, _, true) => "attnsplit32_f16kv",
                     (_, true, true, false) => "attnsplit_f16kv",
@@ -985,18 +1459,20 @@ impl MetalBackend {
                         ));
                     let cast = self.pipelines.get("cast_f32_f16")?;
                     self.encode(r, &cast, &[bq.as_ref(), &qh], &(n as u32).to_ne_bytes(), n);
+                    // flash2 runs 4 cooperating simdgroups per (query tile, head) threadgroup
+                    let tgw = if flash2 { 128 } else { 32 };
                     self.encode_tg(
                         r,
                         &pso,
                         &[qh.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
                         &p,
-                        rows.div_ceil(8) * nh * 32,
-                        32,
+                        rows.div_ceil(8) * nh * tgw,
+                        tgw,
                     );
                 } else {
-                    // One simdgroup per (query, head); split kernels use NSG simdgroups per
-                    // pair, grid still exactly rows*n_head threadgroups.
-                    let nsg = if split32 {
+                    // One simdgroup per (query, head); split/vec kernels use NSG simdgroups
+                    // per pair, grid still exactly rows*n_head threadgroups.
+                    let nsg = if vec || split32 {
                         32
                     } else if split {
                         8

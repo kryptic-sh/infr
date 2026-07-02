@@ -179,6 +179,70 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<Vec<Option<Box<dy
 /// The intermediate tensor (k16) has ONE TensorId reused across ALL layers' QkNormRope ops, so the
 /// map is keyed by OP INDEX (not TensorId): each layer's pair maps to its own KV-cache buffer.
 /// Returns (fused: op index of the QkNormRope → (cache, row offset `pos`); skip: absorbed WriteKv ops).
+/// Per-execute Dynamic-attention shared state: ONE attn_live prologue + ONE pm/pl/pacc split
+/// scratch set for all layers (see `lower_op`'s `dyn_args`).
+struct DynAttnCtx {
+    nh: usize,
+    chunk: usize,
+    n_chunks: usize,
+    hd: usize,
+    args: Box<dyn Buffer>,
+    pm: Box<dyn Buffer>,
+    pl: Box<dyn Buffer>,
+    pacc: Box<dyn Buffer>,
+}
+
+/// Fuse `Linear (m==1, native/f16 weight, Internal dst) → Add(residual)` into the fused-residual
+/// GEMV (`linear_add_native` / `linear_add`) — the bespoke decode path's `o_or_down` shape (one
+/// dispatch + barrier instead of two, and no round-trip of the sublayer output). Keyed by the
+/// Linear's op index → (residual, final dst); the absorbed Add lands in the skip set. Only the
+/// IMMEDIATELY following Add fuses (the seam builder emits the pair adjacent for non-gemma models;
+/// gemma's sandwich norm sits between and correctly blocks the fusion).
+fn linear_add_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, TensorId)>, HashSet<usize>) {
+    let mut fused: HashMap<usize, (TensorId, TensorId)> = HashMap::new();
+    let mut skip: HashSet<usize> = HashSet::new();
+    for (i, op) in graph.ops.iter().enumerate() {
+        let Op::Linear {
+            dst,
+            m: 1,
+            weight,
+            out_f,
+            ..
+        } = op
+        else {
+            continue;
+        };
+        if !matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal) {
+            continue;
+        }
+        let dt = graph.desc(*weight).dtype;
+        if !(native_dense_supported(dt) || matches!(dt, infr_core::DType::F16)) {
+            continue;
+        }
+        if let Some(Op::Add {
+            a,
+            b,
+            dst: add_dst,
+            n,
+        }) = graph.ops.get(i + 1)
+        {
+            if *n != *out_f {
+                continue;
+            }
+            let residual = if b == dst && a != dst {
+                *a
+            } else if a == dst && b != dst {
+                *b
+            } else {
+                continue;
+            };
+            fused.insert(i, (residual, *add_dst));
+            skip.insert(i + 1);
+        }
+    }
+    (fused, skip)
+}
+
 fn kv_write_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, usize)>, HashSet<usize>) {
     let mut fused: HashMap<usize, (TensorId, usize)> = HashMap::new();
     let mut skip: HashSet<usize> = HashSet::new();
@@ -228,11 +292,14 @@ fn lower_op(
     scratch: &[Option<Box<dyn Buffer>>],
     bindings: &Bindings,
     fused_kv_write: &HashMap<usize, (TensorId, usize)>,
+    fused_add: &HashMap<usize, (TensorId, TensorId)>,
     mode: &RopeMode,
     transient: &mut Vec<Box<dyn Buffer>>,
-    // One (nh, chunk, args) prologue per execute, shared by every Dynamic attention op — kv_len is
-    // per-token, not per-layer. Keyed so a heterogeneous graph would fall back to its own prologue.
-    dyn_args: &mut Option<(usize, usize, Box<dyn Buffer>)>,
+    // Per-execute Dynamic-attention context: the prologue args AND the pm/pl/pacc split scratch,
+    // shared by every attention op (layers are serialized by dataflow, so one set suffices — the
+    // bespoke path shares its split scratch the same way; per-layer sets cost 28x the VRAM and
+    // added run-to-run placement variance). Keyed by shape so a heterogeneous graph falls back.
+    dyn_args: &mut Option<DynAttnCtx>,
     dummy: &dyn Buffer,
 ) -> Result<()> {
     let r = |id: TensorId| resolve(scratch, bindings, id);
@@ -269,6 +336,17 @@ fn lower_op(
             let (m, in_f, out_f) = (*m as usize, *in_f as usize, *out_f as usize);
             let (w, xb, y) = (r(*weight)?, r(*x)?, r(*dst)?);
             let dt = graph.desc(*weight).dtype;
+            // Fused Linear+Add (decode residual): one GEMV with the residual added in-kernel —
+            // see linear_add_peephole. `y` (the Linear's scratch dst) is never written.
+            if let Some((residual, final_dst)) = fused_add.get(&op_idx) {
+                let (rr, yf) = (r(*residual)?, r(*final_dst)?);
+                if native_dense_supported(dt) {
+                    rec.linear_add_native(dt, w, xb, rr, yf, m, in_f, out_f);
+                } else {
+                    rec.linear_add(w, xb, rr, yf, m, in_f, out_f);
+                }
+                return Ok(());
+            }
             // Prefill (m>1): a TILED GEMM writes ceil(m/64)*64 rows DIRECTLY into `y` (Internal
             // buffers are row-padded to 64 up front, so no temp/copy). Needs n%64==0, k%32==0.
             //  • Q4_K → mmq (dp4a int8): quantize activations once, integer matmul on the raw
@@ -626,35 +704,44 @@ fn lower_op(
                 let chunk = cap.div_ceil(1024).max(64);
                 let n_chunks = cap.div_ceil(chunk);
                 if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
-                    let pm = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
-                    let pl = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
-                    let pacc =
-                        be_.alloc_uninit(nh * n_chunks * hd * 4, BufferUsage::Activations)?;
-                    // ONE prologue per execute: the first Dynamic attention op records it; every
-                    // later layer reuses the args (kv_len is identical across a token's layers).
-                    if !matches!(dyn_args, Some((n, c, _)) if *n == nh && *c == chunk) {
+                    // ONE prologue + ONE scratch set per execute: the first Dynamic attention op
+                    // records/allocates; every later layer reuses (kv_len is per-token, and the
+                    // layers' attention ops are serialized by dataflow — pm/pl/pacc hazards are
+                    // ordinary RAW/WAW barriers).
+                    let key_ok = matches!(dyn_args, Some(c)
+                        if c.nh == nh && c.chunk == chunk && c.n_chunks == n_chunks && c.hd == hd);
+                    if !key_ok {
                         let args = be_.alloc_uninit(16, BufferUsage::Activations)?;
                         rec.attn_live_prologue(*params, args.as_ref(), nh, chunk);
-                        *dyn_args = Some((nh, chunk, args));
+                        *dyn_args = Some(DynAttnCtx {
+                            nh,
+                            chunk,
+                            n_chunks,
+                            hd,
+                            args,
+                            pm: be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?,
+                            pl: be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?,
+                            pacc: be_
+                                .alloc_uninit(nh * n_chunks * hd * 4, BufferUsage::Activations)?,
+                        });
                     }
-                    let args = &dyn_args.as_ref().unwrap().2;
+                    let ctx = dyn_args.as_ref().unwrap();
                     rec.attention_kv_split_dynac(
                         r(*q)?,
                         r(*k_cache)?,
                         r(*v_cache)?,
                         r(*dst)?,
-                        pm.as_ref(),
-                        pl.as_ref(),
-                        pacc.as_ref(),
+                        ctx.pm.as_ref(),
+                        ctx.pl.as_ref(),
+                        ctx.pacc.as_ref(),
                         *params,
-                        args.as_ref(),
+                        ctx.args.as_ref(),
                         nh,
                         nkv,
                         hd,
                         chunk,
                         n_chunks,
                     );
-                    transient.extend([pm, pl, pacc]);
                 } else {
                     rec.attention_kv_dyn(
                         r(*q)?,
@@ -1121,10 +1208,12 @@ fn record_decode_replay(
             _ => None,
         })
         .ok_or_else(|| be("vulkan adapter: eligible decode has no positions tensor"))?;
-    let (fused_kv_write, skip_op) = kv_write_peephole(graph);
+    let (fused_kv_write, mut skip_op) = kv_write_peephole(graph);
+    let (fused_add, skip_add) = linear_add_peephole(graph);
+    skip_op.extend(skip_add);
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
-    let mut dyn_args: Option<(usize, usize, Box<dyn Buffer>)> = None;
+    let mut dyn_args: Option<DynAttnCtx> = None;
     let dummy = be_.alloc(16, BufferUsage::Activations)?;
     let rec = be_.recorder_persistent()?;
     let mode = RopeMode::Dynamic(params.as_ref());
@@ -1141,14 +1230,15 @@ fn record_decode_replay(
             &scratch,
             bindings,
             &fused_kv_write,
+            &fused_add,
             &mode,
             &mut transient,
             &mut dyn_args,
             dummy.as_ref(),
         )?;
     }
-    if let Some((_, _, args)) = dyn_args.take() {
-        transient.push(args);
+    if let Some(c) = dyn_args.take() {
+        transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
     let recorded = rec.finish_record().map_err(|e| be(e.to_string()))?;
     // dummy is unused in an eligible decode (m=1 GEMV path), but hold it (and any transient) so the
@@ -1187,7 +1277,9 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         }
     }
 
-    let (fused_kv_write, skip_op) = kv_write_peephole(graph);
+    let (fused_kv_write, mut skip_op) = kv_write_peephole(graph);
+    let (fused_add, skip_add) = linear_add_peephole(graph);
+    skip_op.extend(skip_add);
 
     // Transient buffers allocated inside the op loop (GEMM/attention/MoE scratch) must outlive the
     // recorder — hold them here so they drop only after `rec.finish()` submits.
@@ -1197,7 +1289,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
 
     let rec = be_.recorder()?;
     let mode = RopeMode::Static(&rope_pos);
-    let mut dyn_args: Option<(usize, usize, Box<dyn Buffer>)> = None;
+    let mut dyn_args: Option<DynAttnCtx> = None;
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
@@ -1211,14 +1303,15 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &scratch,
             bindings,
             &fused_kv_write,
+            &fused_add,
             &mode,
             &mut transient,
             &mut dyn_args,
             dummy.as_ref(),
         )?;
     }
-    if let Some((_, _, args)) = dyn_args.take() {
-        transient.push(args);
+    if let Some(c) = dyn_args.take() {
+        transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
     rec.finish().map_err(|e| be(e.to_string()))?;
     Ok(())

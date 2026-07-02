@@ -13,11 +13,12 @@ that emerged and the measured reasoning behind it.
 | --- | --- | --- | --- | --- |
 | 0.6B | tg128 | 159 tok/s | 191 | 1.20× |
 | 0.6B | tg128 @ d16384 | 48.3 tok/s | 42.9 | **infr ahead** |
-| 0.6B | pp2048 | 3346 tok/s | 3748 | 1.12× |
-| 0.6B | pp8192 | 2167 tok/s | 2336 | 1.08× |
+| 0.6B | pp2048 | 3543 tok/s | 3748 | 1.06× |
+| 0.6B | pp8192 | 2258 tok/s | 2336 | 1.03× |
 | 4B | tg128 | 40.9 tok/s | 46.7 | 1.14× |
 | 4B | tg128 @ d16384 | 21.4 tok/s | 24.5 | 1.14× |
-| 4B | pp8192 | 422 tok/s | 488 | 1.16× |
+| 4B | pp2048 | 576 tok/s | 608 | 1.06× |
+| 4B | pp8192 | 434 tok/s | 488 | 1.12× |
 
 Decode is weight-stream bound: the GEMV kernels run ~107 GB/s of a measured
 ~133 GB/s read roofline, and the per-token host cost is ~0.2 ms (the recorded
@@ -87,7 +88,12 @@ NK=32. The load-bearing piece is the **threadgroup-memory layout**: staged
 operands are contiguous 8×8 half tiles (weights written pre-transposed), so
 every `simdgroup_load` is stride-8 and conflict-free — tile size, barrier
 count, and decode width were each probed separately and none of them was the
-gap. Each thread dequantizes exactly one 16-block per K-step (128 threads = the
+gap. Two more mul_mm details each measured real wins later: the device reads +
+dequant issue BEFORE the barrier that drains the previous iteration's MMA
+(latency-hides behind compute, +5% 4B pp2048), and the DEC16 decoders use the
+reference dequantize shapes — in-place high nibble with the /16 folded into
+the scale (Q4_K), uint32-lane ql/qh combines (Q6_K) — bit-identical values,
+~+4% more. Each thread dequantizes exactly one 16-block per K-step (128 threads = the
 whole weight tile) and x is cast f32→f16 inline during staging. Each simdgroup
 owns a 32×16 quadrant as 8 f32 accumulators; partial token tiles stage through
 threadgroup memory with a row-guarded copy-out so every tile takes the MMA

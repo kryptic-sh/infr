@@ -430,7 +430,10 @@ impl<'a> Recorder<'a> {
         // W-column vs the 64×64 tile, and the extra warps hide the dequant latency. Needs n%256,
         // k%32; only the hot formats are compiled — everything else stays on the 64×64 kernel.
         // INFR_NO_GEMM_WARP forces the 64×64 tile (A/B).
-        let warp = if n % 256 == 0 && k % 32 == 0 && std::env::var("INFR_NO_GEMM_WARP").is_err() {
+        let warp = if n.is_multiple_of(256)
+            && k.is_multiple_of(32)
+            && std::env::var("INFR_NO_GEMM_WARP").is_err()
+        {
             crate::gemm::native_gemm_warp_build_spv(dtype)
         } else {
             None

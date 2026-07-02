@@ -762,6 +762,7 @@ fn conv1d_silu_parity() {
         weight: w,
         state,
         dst,
+        rows: 1,
         channels: cc as u32,
         kernel: kk as u32,
     });
@@ -801,6 +802,7 @@ fn deltanet_parity() {
         dt_bias,
         state,
         dst,
+        rows: 1,
         n_vhead: nv as u32,
         n_khead: nk as u32,
         head_k: kd as u32,

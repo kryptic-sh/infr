@@ -710,33 +710,45 @@ kernel void moe_topk(device const float* logits [[buffer(0)]],
                      device uint*        tbl    [[buffer(1)]],
                      constant MoeTopkParams& p  [[buffer(2)]],
                      uint gid [[thread_position_in_grid]]) {
-    if (gid != 0u) return;
-    float maxl = -MAXFLOAT;
-    for (uint e = 0; e < p.n_expert; e++) maxl = max(maxl, logits[e]);
+    uint lane = gid;   // one simdgroup (32 threads); each lane owns experts e = lane + 32j
+    float lmax = -MAXFLOAT;
+    for (uint e = lane; e < p.n_expert; e += 32u) lmax = max(lmax, logits[e]);
+    float maxl = simd_max(lmax);
+    // psum in the reference's ascending order (exact bit-match), broadcast from lane 0
     float psum = 0.0f;
-    for (uint e = 0; e < p.n_expert; e++) psum += exp(logits[e] - maxl);
+    if (lane == 0u) {
+        for (uint e = 0; e < p.n_expert; e++) psum += exp(logits[e] - maxl);
+    }
+    psum = simd_broadcast_first(psum);
+    // top-k selection, lane-parallel: each round every lane offers its best untaken expert
+    // (ascending scan + strict > == lowest index per lane), simd_max picks the winning logit
+    // and simd_min the lowest tied index — exactly the reference's stable-sort order
+    uint taken = 0u;   // bitmask over this lane's stride slots j
     uint sel[16];
-    // exp is monotonic: top-k by logit == top-k by prob, same first-index tie rule
     for (uint u = 0; u < p.n_used; u++) {
-        float best = -MAXFLOAT;
-        uint bi = 0u;
-        for (uint e = 0; e < p.n_expert; e++) {
-            bool taken = false;
-            for (uint t = 0; t < u; t++) taken = taken || (sel[t] == e);
-            if (!taken && logits[e] > best) { best = logits[e]; bi = e; }
+        float bv = -MAXFLOAT;
+        uint be = 0xFFFFFFFFu;
+        uint j = 0u;
+        for (uint e = lane; e < p.n_expert; e += 32u, j++) {
+            if ((taken & (1u << j)) == 0u && logits[e] > bv) { bv = logits[e]; be = e; }
         }
-        sel[u] = bi;
+        float m = simd_max(bv);
+        uint pick = simd_min(bv == m ? be : 0xFFFFFFFFu);
+        sel[u] = pick;
+        if ((pick & 31u) == lane) taken |= 1u << (pick >> 5);
     }
-    float wsum = 0.0f;
-    float ws[16];
-    for (uint u = 0; u < p.n_used; u++) {
-        ws[u] = exp(logits[sel[u]] - maxl) / psum;
-        wsum += ws[u];
-    }
-    wsum = max(wsum, 1e-20f);
-    for (uint u = 0; u < p.n_used; u++) {
-        tbl[u] = sel[u];
-        tbl[16u + u] = as_type<uint>(ws[u] / wsum * p.scale);
+    if (lane == 0u) {
+        float wsum = 0.0f;
+        float ws[16];
+        for (uint u = 0; u < p.n_used; u++) {
+            ws[u] = exp(logits[sel[u]] - maxl) / psum;
+            wsum += ws[u];
+        }
+        wsum = max(wsum, 1e-20f);
+        for (uint u = 0; u < p.n_used; u++) {
+            tbl[u] = sel[u];
+            tbl[16u + u] = as_type<uint>(ws[u] / wsum * p.scale);
+        }
     }
 }
 

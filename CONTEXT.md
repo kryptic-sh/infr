@@ -35,6 +35,39 @@ decisions: the `compute-backend-direction` memory.** Short version:
   adapter (`compile`/`execute`, still `todo!()`) → gemma4/E2B/MoE on the seam →
   cleanup.
 
+## Metal backend (Apple Silicon) — REBUILT FOR PERF (2026-07-02, PRs #4/#5/#6)
+
+`crates/infr-metal` went from correctness-first reference to within
+**1.25-1.48× of llama.cpp Metal** on the same GGUF/machine (M3 Pro, Qwen3
+Q4_K_M: 4B decode 37.5 vs 46.7 t/s, 4B pp889 498 vs 630; 0.6B decode 132 vs
+191, pp889 2840 vs 4191). ~44× decode / ~250× prefill over the naive
+reference; model load ~10× faster; resident weights = raw mmap only.
+**Full architecture + measured reasoning: [`docs/METAL.md`](docs/METAL.md).**
+Short version:
+
+- Device residency + ONE command buffer per forward (hazard-tracked batch;
+  was 75k cbs/run, 90% wall).
+- Quant Linear: native raw-block kernels for Q4_K/Q6_K (no repack, in-kernel
+  `get_scale_min_k4`; Q6_K decode must be branch-free — 4-way `if` serialized
+  the simdgroup, 2.3× slower); factored form (packed codes + i16 sc/m per 16 +
+  f16 d/dmin per block, bit-exact) for other affine quants. One `DEC16_*`
+  decoder per format × three kernel shapes: exact-f32 GEMV (decode), row-tiled,
+  and a mul_mm-shape cooperative GEMM (64×32 tile/threadgroup, NK=32,
+  contiguous pre-transposed 8×8 half tiles in threadgroup memory — the smem
+  layout, not tile size/barriers, was the gap; f16 operands, f32 accumulate).
+- Attention: half-fragment flash for wide f16 launches (K^T/V fragments load
+  DIRECTLY from the cache, zero staging — the all-f32 flash version lost);
+  split-KV (32/8 simdgroups per query·head) for decode/long ctx; per-PIPELINE
+  thread-cap gating with graceful degradation (GitHub macOS CI's paravirtual
+  device clamps below 1024 and silently corrupts merges otherwise).
+- Profiler: `INFR_METAL_PROFILE=1` (per-op encode + GPU wall), `=2` (per-op GPU
+  attribution, breaks batching). Probes as ignored tests: dispatch overhead
+  ~1.2 µs/kernel (op fusion is NOT a lever — measured), read roofline
+  ~133 GB/s, GEMV achieved ~90-105 GB/s.
+- Negative results list (don't re-try) + remaining ≤15% levers: `docs/METAL.md`.
+- Bench: `INFR_METAL=1 INFR_TEMP=0 [INFR_MAX_NEW=N] infr run <model> "<prompt>"`
+  — no `infr bench` wiring for metal yet (open TODO).
+
 ## MoE (Qwen3moe / Qwen3-30B-A3B-Q4) — LATEST perf (2026-06-29)
 
 Test model `hf:unsloth/Qwen3-30B-A3B-GGUF:Qwen3-30B-A3B-Q4_K_M.gguf` (~18.6GB,

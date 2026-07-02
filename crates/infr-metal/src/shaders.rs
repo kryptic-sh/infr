@@ -1278,6 +1278,149 @@ typedef decltype(attnflash2_f16kv_t<64, 4>) attnflash2_t;
 template [[host_name("attnflash2_f16kv_hd64")]]  kernel attnflash2_t attnflash2_f16kv_t<64, 4>;
 template [[host_name("attnflash2_f16kv_hd128")]] kernel attnflash2_t attnflash2_f16kv_t<128, 4>;
 
+// ---- Vector flash attention for decode (f16 KV cache, hd 64 or 128, one query row per
+// threadgroup): the llama.cpp `kernel_flash_attn_ext_vec` structure. NSG simdgroups each own
+// interleaved C=32-position KV blocks with a PRIVATE online softmax, merged once at the end by a
+// log2 tree — same split-KV idea as attnsplit32 above, but each simdgroup step handles 32
+// positions instead of 1: lanes fold as (ty, tx) = 4 KV rows x 8-lane dots, a shuffle tree
+// reduces the 8 partials per row, and ONE simd_max/simd_sum softmax pass covers the whole block.
+// That cuts the serial chain per simdgroup from kv_len/NSG simd reductions to kv_len/(NSG*32)
+// block passes — the attnsplit kernels are latency-bound on exactly that chain at long context.
+// Q stays f32 in shared (no rounding: f32 dots over exactly-widened f16 K/V, same numeric class
+// as attnsplit32, only reassociated). Tail positions clamp their row pointer to kv_len-1 and are
+// masked in the softmax, so reads never leave the cache. O accumulates in shared per simdgroup
+// (ty==0 lanes own hd/32 float4 columns each after the fold).
+template<uint hd, uint NSG>
+kernel void attnvec_f16kv_t(device const float* q   [[buffer(0)]],
+                            device const half*  k   [[buffer(1)]],
+                            device const half*  v   [[buffer(2)]],
+                            device float*       dst [[buffer(3)]],
+                            constant AttnParams& p  [[buffer(4)]],
+                            uint3  tgpig [[threadgroup_position_in_grid]],
+                            ushort sgitg [[simdgroup_index_in_threadgroup]],
+                            ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr uint C = 32, NE = 4, NL = 32u / NE;  // 4 KV rows x 8-lane dots per simdgroup pass
+    constexpr uint hd4 = hd / 4u;
+    constexpr uint NI = hd4 / NL;                  // float4s per lane per row (2 or 4)
+    threadgroup float sq[hd];
+    threadgroup float ssc[NSG * C];                // per-simdgroup scores, then P; (S, M) at merge
+    threadgroup float so[NSG * hd];                // per-simdgroup O partials
+
+    uint tg = tgpig.x;
+    uint ti = tg / p.n_head;
+    uint h  = tg % p.n_head;
+    uint kvh = h / (p.n_head / p.n_kv);
+    uint abs = p.pos + ti;
+    uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
+    uint tx = tiisg % NL, ty = tiisg / NL;
+
+    {
+        device const float4* q4 = (device const float4*)(q + ((ulong)ti * p.n_head + h) * hd);
+        threadgroup float4* sq4 = (threadgroup float4*)sq;
+        for (uint i = sgitg * 32u + tiisg; i < hd4; i += NSG * 32u) sq4[i] = q4[i];
+    }
+    threadgroup float* ss = ssc + sgitg * C;
+    threadgroup float4* so4 = (threadgroup float4*)so + sgitg * hd4;
+    if (ty == 0) {
+        for (uint ii = 0; ii < NI; ii++) so4[ii * NL + tx] = float4(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S = 0.0f, M = -MAXFLOAT / 2;
+    device const half4* k4 = (device const half4*)k;
+    device const half4* v4 = (device const half4*)v;
+    threadgroup const float4* sq4 = (threadgroup const float4*)sq;
+
+    for (uint ic = sgitg * C; ic <= abs; ic += NSG * C) {
+        if (ic + C <= lo) continue;   // whole block below the window (uniform per simdgroup)
+
+        // Q*K^T — each (ty, tx) fold: row ic + NE*cc + ty, 8-lane split of the hd dot
+        {
+            float mqk[C / NE];
+            for (uint cc = 0; cc < C / NE; cc++) {
+                // clamp tail rows into the cache; their scores are masked below
+                uint rc = min(ic + NE * cc + ty, p.kv_len - 1u);
+                device const half4* pk = k4 + ((ulong)rc * p.n_kv + kvh) * hd4;
+                float acc = 0.0f;
+                for (uint ii = 0; ii < NI; ii++)
+                    acc += dot(float4(pk[ii * NL + tx]), sq4[ii * NL + tx]);
+                // fold the 8 tx-lane partials of each row
+                acc += simd_shuffle_down(acc, 4);
+                acc += simd_shuffle_down(acc, 2);
+                acc += simd_shuffle_down(acc, 1);
+                mqk[cc] = simd_shuffle(acc, NL * ty);  // broadcast row sum within the ty group
+            }
+            ss[NE * tx + ty] = mqk[tx];  // lane (tx, ty) stores score of row ic + NE*tx + ty
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // online softmax — one pass over the whole 32-score block
+        {
+            float s = ss[tiisg] * p.scale;
+            uint jkv = ic + tiisg;
+            bool valid = (jkv >= lo) && (jkv <= abs);
+            float m = M;
+            M = simd_max(max(M, valid ? s : -MAXFLOAT / 2));
+            float ms = exp(m - M);
+            float vs = valid ? exp(s - M) : 0.0f;
+            S = S * ms + simd_sum(vs);
+            ss[tiisg] = vs;
+            if (ty == 0) {
+                for (uint ii = 0; ii < NI; ii++) so4[ii * NL + tx] *= ms;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // O += P*V — same (ty, tx) fold as Q*K^T, accumulated into the ty==0 lanes' columns
+        {
+            float4 lov[NI];
+            for (uint ii = 0; ii < NI; ii++) lov[ii] = float4(0.0f);
+            for (uint cc = 0; cc < C / NE; cc++) {
+                uint rc = min(ic + NE * cc + ty, p.kv_len - 1u);
+                device const half4* pv = v4 + ((ulong)rc * p.n_kv + kvh) * hd4;
+                float pw = ss[NE * cc + ty];
+                for (uint ii = 0; ii < NI; ii++)
+                    lov[ii] += float4(pv[ii * NL + tx]) * pw;
+            }
+            for (uint ii = 0; ii < NI; ii++) {
+                lov[ii] += simd_shuffle_down(lov[ii], 16);
+                lov[ii] += simd_shuffle_down(lov[ii], 8);
+            }
+            if (ty == 0) {
+                for (uint ii = 0; ii < NI; ii++) so4[ii * NL + tx] += lov[ii];
+            }
+        }
+    }
+
+    // publish (S, M) for the merge (scores are dead)
+    if (tiisg == 0) { ss[0] = S; ss[1] = M; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // log2 merge of the per-simdgroup partials
+    for (uint rr = NSG / 2u; rr > 0u; rr >>= 1u) {
+        if (sgitg < rr) {
+            float s0 = ss[0], s1 = ssc[(sgitg + rr) * C + 0];
+            float m0 = ss[1], m1 = ssc[(sgitg + rr) * C + 1];
+            float mm = max(m0, m1);
+            float ms0 = exp(m0 - mm), ms1 = exp(m1 - mm);
+            if (tiisg == 0) { ss[0] = s0 * ms0 + s1 * ms1; ss[1] = mm; }
+            threadgroup float4* sob = (threadgroup float4*)so + (sgitg + rr) * hd4;
+            for (uint i = tiisg; i < hd4; i += 32u) so4[i] = so4[i] * ms0 + sob[i] * ms1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sgitg == 0) {
+        float sinv = ssc[0] == 0.0f ? 0.0f : 1.0f / ssc[0];
+        device float4* out = (device float4*)(dst + ((ulong)ti * p.n_head + h) * hd);
+        for (uint i = tiisg; i < hd4; i += 32u) out[i] = so4[i] * sinv;
+    }
+}
+
+typedef decltype(attnvec_f16kv_t<64, 32>) attnvec_t;
+template [[host_name("attnvec_f16kv_hd64")]]  kernel attnvec_t attnvec_f16kv_t<64, 32>;
+template [[host_name("attnvec_f16kv_hd128")]] kernel attnvec_t attnvec_f16kv_t<128, 32>;
+
 // ---- WriteKv: cast-copy `n` f32 source elems into the bound KV cache at row offset `base`, on the
 // GPU so it stays in the batch (no host round-trip that would force a per-layer flush). The (half)
 // cast is IEEE round-to-nearest-even — byte-identical to the host `f16::from_f32` reference.

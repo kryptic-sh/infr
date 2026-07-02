@@ -923,8 +923,9 @@ fn attention_flash2_sliding_window_parity() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
 }
 
-// Long-context decode shape (rows=1, kv_len >= 128, hd <= 128): routes to the 32-way split-KV
-// kernel (`attnsplit32_*`), which the short-kv tests above never reach.
+// Long-context decode shape (rows=1, kv_len >= 128, hd=128): routes to the VECTOR flash kernel
+// (`attnvec_f16kv_hd128`) — 32 simdgroups, 32 KV positions per simdgroup step, log2 merge. The
+// kv_len=200 tail lands mid-block, exercising the clamped+masked tail rows.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_long_context_split32_parity() {
@@ -952,6 +953,73 @@ fn attention_long_context_split32_parity() {
         (q, f32_bytes(&rand_f32(rows * nh * hd, 51))),
         (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 52))),
         (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 53))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+}
+
+// The 32-way split-KV kernel (`attnsplit32_*`) retained for head sizes without a vec-kernel
+// instantiation (hd=96 here): same long-context decode shape as above.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_long_context_split32_hd96_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (1usize, 200usize, 8usize, 2usize, 96usize, 199usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 201))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 202))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 203))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+}
+
+// Sliding-window decode at depth through the vector flash kernel: whole leading KV blocks fall
+// below the window (the kernel's block-skip), and the window edge lands mid-block.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_vec_sliding_window_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos, win) =
+        (1usize, 300usize, 8usize, 2usize, 64usize, 299usize, 100usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::SlidingWindow(win),
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 211))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 212))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 213))),
     ];
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
 }

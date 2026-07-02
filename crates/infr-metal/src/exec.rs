@@ -976,7 +976,26 @@ impl MetalBackend {
                         .max_total_threads_per_threadgroup()
                         >= threads)
                 };
+                // The vector flash kernel (llama.cpp flash_attn_ext_vec structure) covers the
+                // long-context decode shape split32 serves, at 32 KV positions per simdgroup
+                // step instead of 1 — same head-size instantiations and cap gating as flash2.
+                let vec_kern = match hd {
+                    64 => Some("attnvec_f16kv_hd64"),
+                    128 => Some("attnvec_f16kv_hd128"),
+                    _ => None,
+                };
+                let vec = !flash
+                    && f16
+                    && split
+                    && kv_len >= 128
+                    && vec_kern.is_some_and(|kn| {
+                        self.pipelines
+                            .get(kn)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 1024)
+                            .unwrap_or(false)
+                    });
                 let split32 = split
+                    && !vec
                     && kv_len >= 128
                     && hd <= 128
                     && fits(
@@ -988,7 +1007,8 @@ impl MetalBackend {
                         1024,
                     )?;
                 let split = split
-                    && (split32
+                    && (vec
+                        || split32
                         || fits(
                             if f16 {
                                 "attnsplit_f16kv"
@@ -1000,6 +1020,7 @@ impl MetalBackend {
                 let kern = match (flash, f16, split, split32) {
                     (true, ..) if flash2 => flash2_kern.unwrap(),
                     (true, ..) => "attnflash_f16kv",
+                    (_, true, true, _) if vec => vec_kern.unwrap(),
                     (_, true, false, _) => "attention_f16kv",
                     (_, true, _, true) => "attnsplit32_f16kv",
                     (_, true, true, false) => "attnsplit_f16kv",
@@ -1038,9 +1059,9 @@ impl MetalBackend {
                         tgw,
                     );
                 } else {
-                    // One simdgroup per (query, head); split kernels use NSG simdgroups per
-                    // pair, grid still exactly rows*n_head threadgroups.
-                    let nsg = if split32 {
+                    // One simdgroup per (query, head); split/vec kernels use NSG simdgroups
+                    // per pair, grid still exactly rows*n_head threadgroups.
+                    let nsg = if vec || split32 {
                         32
                     } else if split {
                         8

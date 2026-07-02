@@ -933,6 +933,46 @@ fn cmd_bench_qwen35(
     if cpu {
         std::env::set_var("Q35_CPU", "1");
     }
+    // GPU (+ no depth): drive the PRODUCTION batched/chunked seam (`generate_vulkan`) — the same
+    // path `infr run`/`generate_chat` uses — instead of the bespoke per-token forward (which is
+    // ~100x slower at prefill and no longer representative). The seam ingests a text prompt, so
+    // synthesize one near `n_prompt` tokens and report the actual token counts from its stats.
+    if !cpu && depth == 0 && pg.is_none() {
+        std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
+        let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens
+        let prompt = if n_prompt > 0 {
+            sentence.repeat(n_prompt.div_ceil(10))
+        } else {
+            sentence.to_string()
+        };
+        let n = n_gen.max(1);
+        // untimed warmup (pipeline compile)
+        let _ = infr_llama::qwen35::generate_vulkan(gguf, sentence, 1, |_| {})?;
+        let (mut pps, mut tgs) = (Vec::new(), Vec::new());
+        let (mut np, mut ng) = (0usize, 0usize);
+        for _ in 0..reps.max(1) {
+            let st = infr_llama::qwen35::generate_vulkan(gguf, &prompt, n, |_| {})?;
+            pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
+            tgs.push(st.n_gen as f64 / st.decode_secs.max(1e-9));
+            (np, ng) = (st.n_prompt, st.n_gen);
+        }
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        if json {
+            let a = if n_gen > 0 { avg(&tgs) } else { avg(&pps) };
+            println!("[{{\"avg_ts\": {a:.2}}}]");
+        } else if n_gen > 0 && n_prompt > 0 {
+            println!(
+                "pp{np}: {:.1} t/s | tg{ng}: {:.1} t/s  ({reps} reps)",
+                avg(&pps),
+                avg(&tgs)
+            );
+        } else if n_gen > 0 {
+            println!("tg{ng}: {:.1} t/s  ({reps} reps)", avg(&tgs));
+        } else {
+            println!("pp{np}: {:.1} t/s  ({reps} reps)", avg(&pps));
+        }
+        return Ok(());
+    }
     let model = infr_llama::qwen35::load_path(gguf)?;
     let measure_tg = pg.is_none() && n_gen > 0;
     let dummy = |i: usize| (i % 100) as u32;

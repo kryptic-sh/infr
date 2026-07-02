@@ -9,6 +9,13 @@
 uint rb(uint bo) { return (nw[bo >> 2u] >> ((bo & 3u) << 3u)) & 0xFFu; }
 uint ru16(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u); }
 uint ru32b(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u) | (rb(bo + 2u) << 16u) | (rb(bo + 3u) << 24u); }
+// Unaligned u32 via two word loads + funnel shift (vs ru32b's four byte-extract chains).
+uint ru32u(uint bo) {
+    uint w0 = nw[bo >> 2u];
+    uint sh = (bo & 3u) << 3u;
+    if (sh == 0u) { return w0; }
+    return (w0 >> sh) | (nw[(bo >> 2u) + 1u] << (32u - sh));
+}
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 int sgn8(uint byte) { return int(byte) - int(byte >= 128u ? 256u : 0u); }
 
@@ -124,16 +131,26 @@ float dq(uint g) {
     return dl * float(q2) - ml;
 }
 #define HAVE_DQBLK
-void dqblk(uint gstart, out float v[32]) {  // hoist d/dmin (2 f16 decodes); scale is 1 byte/elem.
+// A 32-aligned run has CONSTANT n and jj, so its 2-bit quants are 32 CONSECUTIVE bytes = 8 aligned
+// u32 words, under just 2 scale bytes — load those 10 values once instead of 2 byte-extract chains
+// per element (the naive form was ~64 word loads per sub-block; the measured 14B-Q2_K decode
+// catastrophe, 0.26x llama).
+void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 256u) * 84u; uint p0 = gstart % 256u;
     float d = f16tof32(ru16(bd + 80u)); float dmin = f16tof32(ru16(bd + 82u));
-    for (uint w = 0u; w < 32u; w++) {
-        uint p = p0 + w;
-        uint sc_byte = rb(bd + p / 16u);
-        float dl = d * float(sc_byte & 0xFu); float ml = dmin * float(sc_byte >> 4u);
-        uint n = p / 128u; uint p_half = p % 128u; uint jj = p_half / 32u; uint p_j = p_half % 32u;
-        uint q2 = (rb(bd + 16u + 32u * n + p_j) >> (2u * jj)) & 3u;
-        v[w] = dl * float(q2) - ml;
+    uint sb0 = rb(bd + p0 / 16u);        // scale/min nibbles for elements 0..15
+    uint sb1 = rb(bd + p0 / 16u + 1u);   // … and 16..31
+    float dl0 = d * float(sb0 & 0xFu); float ml0 = dmin * float(sb0 >> 4u);
+    float dl1 = d * float(sb1 & 0xFu); float ml1 = dmin * float(sb1 >> 4u);
+    uint shift = 2u * ((p0 % 128u) / 32u);
+    uint qw = (bd + 16u + 32u * (p0 / 128u)) >> 2u; // 84-byte blocks are word-aligned; +16+32n too
+    for (uint w8 = 0u; w8 < 8u; w8++) {
+        uint word = nw[qw + w8];
+        for (uint b = 0u; b < 4u; b++) {
+            uint w = w8 * 4u + b;
+            uint q2 = ((word >> (8u * b)) >> shift) & 3u;
+            v[w] = (w < 16u) ? (dl0 * float(q2) - ml0) : (dl1 * float(q2) - ml1);
+        }
     }
 }
 #endif
@@ -161,7 +178,11 @@ float dq(uint g) {
     return dl * (float(low2 | (high << 2u)) - 4.0);
 }
 #define HAVE_DQBLK
-void dqblk(uint gstart, out float v[32]) {  // hoist d_all + 12-byte scale reconstruction.
+// A 32-aligned run has constant n/jj, so its low-2-bit quants are 32 CONSECUTIVE bytes (8 unaligned
+// u32s via ru32u — 110-byte blocks aren't word-aligned) and its high bits are one fixed mask over
+// the 32 hmask bytes; only 2 of the 16 6-bit scales apply. The naive form did 2 byte-extract
+// chains per ELEMENT (the o/down Q3_K GEMVs in Q2_K-mix models were the decode bottleneck).
+void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 256u) * 110u; uint p0 = gstart % 256u;
     float d_all = f16tof32(ru16(bd + 108u));
     uint a0 = ru32b(bd + 96u); uint a1 = ru32b(bd + 100u); uint a2 = ru32b(bd + 104u);
@@ -171,18 +192,26 @@ void dqblk(uint gstart, out float v[32]) {  // hoist d_all + 12-byte scale recon
     aux[3] = ((a1 >> 4u) & k2) | (((tmp >> 6u) & k1) << 4u);
     aux[0] = (a0 & k2) | ((tmp & k1) << 4u);
     aux[1] = (a1 & k2) | (((tmp >> 2u) & k1) << 4u);
-    uint n = p0 / 128u;  // constant across the 32-elem run
-    for (uint w = 0u; w < 32u; w++) {
-        uint p = p0 + w;
-        uint is = p / 16u;
-        uint sc_byte = (aux[is >> 2u] >> ((is & 3u) * 8u)) & 0xFFu;
-        int sc = int(sc_byte) - int(sc_byte >= 128u ? 256u : 0u) - 32;
-        float dl = d_all * float(sc);
-        uint p_half = p % 128u; uint jj = p_half / 32u; uint p_j = p_half % 32u;
-        uint jg = 4u * n + jj; uint m = 1u << jg;
-        uint low2 = (rb(bd + 32u + 32u * n + p_j) >> (2u * jj)) & 3u;
-        uint high = ((rb(bd + p_j) & m) != 0u) ? 1u : 0u;
-        v[w] = dl * (float(low2 | (high << 2u)) - 4.0);
+    uint is0 = p0 / 16u;
+    uint sb0 = (aux[is0 >> 2u] >> ((is0 & 3u) * 8u)) & 0xFFu;
+    uint sb1 = (aux[(is0 + 1u) >> 2u] >> (((is0 + 1u) & 3u) * 8u)) & 0xFFu;
+    float dl0 = d_all * float(sgn8(sb0) - 32);
+    float dl1 = d_all * float(sgn8(sb1) - 32);
+    uint n = p0 / 128u;
+    uint jj = (p0 % 128u) / 32u;
+    uint shift = 2u * jj;
+    uint m = 1u << (4u * n + jj);
+    uint qb = bd + 32u + 32u * n;
+    for (uint w8 = 0u; w8 < 8u; w8++) {
+        uint qword = ru32u(qb + w8 * 4u);
+        uint hword = ru32u(bd + w8 * 4u);
+        for (uint b = 0u; b < 4u; b++) {
+            uint w = w8 * 4u + b;
+            uint low2 = ((qword >> (8u * b)) >> shift) & 3u;
+            uint high = (((hword >> (8u * b)) & m) != 0u) ? 1u : 0u;
+            float dl = (w < 16u) ? dl0 : dl1;
+            v[w] = dl * (float(low2 | (high << 2u)) - 4.0);
+        }
     }
 }
 #endif

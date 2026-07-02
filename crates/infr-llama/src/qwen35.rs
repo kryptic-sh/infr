@@ -1874,7 +1874,10 @@ fn generate_seam(
     loop {
         let next = argmax(&logits);
         // Stop on EOS / <|im_end|> before emitting the stop token (chat turn boundary).
-        if Some(next) == eos || (im_end.is_some() && Some(next) == im_end) {
+        // INFR_Q35_IGNORE_EOS keeps generating to the cap (benchmarks need a fixed tg count).
+        if (Some(next) == eos || (im_end.is_some() && Some(next) == im_end))
+            && std::env::var("INFR_Q35_IGNORE_EOS").is_err()
+        {
             break;
         }
         crate::stream_token(&tok, &mut outs, &mut printed, next, &mut on_piece);

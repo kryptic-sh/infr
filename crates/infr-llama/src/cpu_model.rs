@@ -211,6 +211,27 @@ impl CpuModel {
         Ok(stats)
     }
 
+    /// Token-level bench on the **Metal** backend through the agnostic seam (the Apple-GPU twin of
+    /// [`bench`](Self::bench)): prefill `n_prompt` dummy tokens, decode `n_gen`, return the timing.
+    /// Lets `infr bench` (with `INFR_METAL=1`) measure pp/tg directly comparable to `llama-bench`
+    /// on the Metal build.
+    #[cfg(target_os = "macos")]
+    pub fn bench_metal(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
+        let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
+        let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+        let (_, stats) = crate::cpu_backend::generate_dense_metal(
+            &mtl,
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            &prompt,
+            n_gen,
+            |_| {},
+        )?;
+        Ok(stats)
+    }
+
     /// Render a user turn with the model's OWN embedded chat template (so an instruct model — Gemma,
     /// Qwen, … — answers coherently). Errors if the GGUF has no `tokenizer.chat_template` or it fails
     /// to render — infr only supports models that ship one (no fabricated-ChatML fallback).

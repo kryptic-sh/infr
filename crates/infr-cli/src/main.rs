@@ -858,6 +858,21 @@ fn cmd_bench(
             json,
         );
     }
+    // INFR_METAL=1 (or --dev Metal): bench the dense forward on the Metal backend through the
+    // agnostic seam — same pp/tg/pg + depth methodology as the CPU arm, directly comparable to
+    // `llama-bench` on the Metal build.
+    if std::env::var("INFR_METAL").is_ok() || dev.eq_ignore_ascii_case("metal") {
+        return cmd_bench_metal(
+            &gguf,
+            tok.as_deref(),
+            n_prompt,
+            n_gen,
+            depth,
+            pg,
+            reps,
+            json,
+        );
+    }
     let _ = dev; // GPU device selection: VulkanBackend uses the default adapter (--dev reserved for parity).
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
     let measure_tg = pg.is_none() && n_gen > 0;
@@ -976,6 +991,57 @@ fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: 
 /// CPU-backend bench (`infr bench -ngl 0`): the GPU bench's pp/tg/pg metrics on the agnostic CPU
 /// reference path, using `CpuModel`'s token-level timing — directly comparable to `llama-bench -ngl 0`.
 #[allow(clippy::too_many_arguments)]
+/// Metal twin of [`cmd_bench_cpu`]: same pp/tg/pg + depth methodology on the Apple-GPU seam
+/// backend (`CpuModel::bench_metal`). On non-macOS this arm is unreachable (the backend crate
+/// compiles to nothing), so the whole body is cfg-gated.
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench_metal(
+    gguf: &Path,
+    tok: Option<&Path>,
+    n_prompt: usize,
+    n_gen: usize,
+    depth: usize,
+    pg: Option<(usize, usize)>,
+    reps: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (gguf, tok, n_prompt, n_gen, depth, pg, reps, json);
+        anyhow::bail!("metal bench requires macOS");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let model = infr_llama::CpuModel::load(gguf, tok)?;
+        let measure_tg = pg.is_none() && n_gen > 0;
+        // One untimed warmup: page-cache the mmap + build the weight caches + compile pipelines.
+        let _ = model.bench_metal(depth.max(1), if measure_tg || pg.is_some() { 1 } else { 0 });
+        let mut samples = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let ts = if let Some((p, g)) = pg {
+                let s = model.bench_metal(p, g)?;
+                (p + g) as f64 / (s.prompt_secs + s.decode_secs)
+            } else if measure_tg {
+                let s = model.bench_metal(depth.max(1), n_gen)?;
+                n_gen as f64 / s.decode_secs
+            } else {
+                let s = model.bench_metal(n_prompt, 0)?;
+                n_prompt as f64 / s.prompt_secs
+            };
+            samples.push(ts);
+        }
+        let label = if let Some((p, g)) = pg {
+            format!("pg{p}+{g}")
+        } else if measure_tg {
+            format!("tg{n_gen}")
+        } else {
+            format!("pp{n_prompt}")
+        };
+        print_bench_avg(&samples, &label, depth, " [metal]", reps, json);
+        Ok(())
+    }
+}
+
 fn cmd_bench_cpu(
     gguf: &Path,
     tok: Option<&Path>,

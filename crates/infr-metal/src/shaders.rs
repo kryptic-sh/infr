@@ -978,8 +978,11 @@ kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
     uint sg = gid / 32u;
     uint ntq = (p.rows + 7u) / 8u;
     if (sg >= ntq * p.n_head) return;
-    uint qt = sg / p.n_head;
-    uint h = sg % p.n_head;
+    /* same-head query tiles are ADJACENT simdgroups: concurrent tiles then stream the SAME
+       head's KV region and hit the SLC, instead of 16 heads' regions at once (measured: the
+       head-fastest order collapsed pp8k to ~1/3 of llama.cpp) */
+    uint qt = sg % ntq;
+    uint h = sg / ntq;
     uint group = p.n_head / p.n_kv;
     uint kvh = h / group;
     uint hd = p.head_dim;

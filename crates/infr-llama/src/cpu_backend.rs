@@ -1323,7 +1323,9 @@ pub(crate) fn generate_dense_backend(
             };
             let pf_t0 = std::time::Instant::now();
             let (pf_g, pf_h) = build(pf_m, cstart);
+            let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
+            let t_compile = pf_t0.elapsed();
             let mut pf_b = Bindings::new();
             pf_b.bind(pf_h.hidden, pf_hidden_buf.as_ref());
             pf_b.bind(pf_h.positions, pf_pos_buf.as_ref());
@@ -1346,6 +1348,17 @@ pub(crate) fn generate_dense_backend(
             pf_b.bind(pf_h.logits, logits_buf.as_ref());
             be.execute(pf_plan.as_ref(), &pf_b)
                 .map_err(|e| anyhow!("{e}"))?;
+            // INFR_PROF_PF: split the per-chunk prefill wall time into host graph build, plan
+            // compile, and execute (record + submit + GPU) — where a small-batch chunk's fixed
+            // cost lives decides whether to attack recording or kernels.
+            if std::env::var("INFR_PROF_PF").is_ok() {
+                eprintln!(
+                    "[pf prof] m={pf_m} build={:.1}ms compile={:.1}ms execute={:.1}ms",
+                    t_build.as_secs_f64() * 1e3,
+                    (t_compile - t_build).as_secs_f64() * 1e3,
+                    (pf_t0.elapsed() - t_compile).as_secs_f64() * 1e3,
+                );
+            }
             prompt_t += pf_t0.elapsed();
             cstart = cend;
         }

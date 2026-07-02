@@ -64,6 +64,10 @@ pub struct Recorder<'a> {
     /// `finish_record` hands back its cmd buffer + pool (a [`RecordedCmd`]) instead of submitting and
     /// freeing — so the caller can replay it across tokens.
     persistent: bool,
+    /// Creation time — INFR_PROF prints the host record time vs the submit+GPU wait in `finish`.
+    t0: std::time::Instant,
+    /// See [`Self::suppress_sync`]: while set, `sync` accumulates hazards without emitting.
+    suppress: std::cell::Cell<bool>,
 }
 
 impl<'a> Recorder<'a> {
@@ -143,7 +147,19 @@ impl<'a> Recorder<'a> {
             ts_labels: RefCell::new(Vec::new()),
             next_label: std::cell::Cell::new(None),
             persistent,
+            t0: std::time::Instant::now(),
+            suppress: std::cell::Cell::new(false),
         })
+    }
+
+    /// Disjoint-batch barrier suppression: while ON, recorded dispatches accumulate hazard state
+    /// but emit NO pipeline barriers. For batches whose members are KNOWN to touch disjoint
+    /// regions of the same buffers (the batched-MoE per-expert stage loop — 128 experts' gathers
+    /// all write `xe`, each at its routed offset). Leave the batch's FIRST dispatch unsuppressed
+    /// so the stage orders after its producers, and turn suppression OFF after the batch (the
+    /// next normal dispatch then fences the whole batch with ONE barrier).
+    pub fn suppress_sync(&self, on: bool) {
+        self.suppress.set(on);
     }
 
     /// Override the label of the NEXT profiled op (INFR_PROF2). Consumed once. No-op without prof2.
@@ -216,6 +232,18 @@ impl<'a> Recorder<'a> {
     /// Returns once any required barrier is recorded; updates the hazard-tracking sets.
     fn sync(&self, reads: &[vk::Buffer], writes: &[vk::Buffer], dst_transfer: bool) {
         if self.no_barrier {
+            return;
+        }
+        // Suppressed (disjoint-batch) dispatch: accumulate the hazard state but emit NO barrier —
+        // the caller guarantees this dispatch touches only regions disjoint from the batch's other
+        // members (per-expert MoE stage loop). The batch's first dispatch runs unsuppressed, so
+        // the stage as a whole still orders after its producers; the NEXT unsuppressed dispatch
+        // sees the accumulated dirty state and fences the whole batch at once.
+        if self.suppress.get() {
+            self.dirty_reads.borrow_mut().extend(reads.iter().copied());
+            self.dirty_writes
+                .borrow_mut()
+                .extend(writes.iter().copied());
             return;
         }
         let dw = self.dirty_writes.borrow();
@@ -3487,6 +3515,7 @@ impl<'a> Recorder<'a> {
     /// End recording, submit once, wait, and release transient objects.
     pub fn finish(self) -> Result<()> {
         let device = &self.be.shared.device;
+        let t_record = self.t0.elapsed();
         if self.prof {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
@@ -3515,6 +3544,13 @@ impl<'a> Recorder<'a> {
             device
                 .queue_wait_idle(queue)
                 .map_err(|e| be(format!("queue_wait_idle: {e}")))?;
+            if self.prof {
+                eprintln!(
+                    "[prof] record={:.1}ms submit+gpu={:.1}ms",
+                    t_record.as_secs_f64() * 1e3,
+                    (self.t0.elapsed() - t_record).as_secs_f64() * 1e3,
+                );
+            }
             if self.prof2 {
                 self.report_timestamps();
                 device.destroy_query_pool(self.query_pool, None);

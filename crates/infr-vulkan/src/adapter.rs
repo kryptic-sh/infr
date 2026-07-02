@@ -1180,19 +1180,98 @@ fn lower_op(
                 let bucket_rows = alu(n_pairs * 4)?;
                 let bucket_wts = alu(n_pairs * 4)?;
                 let args = alu(n_expert * 7 * 16)?;
-                let xe = alu(mpad * ne * 4)?;
-                let gqa = alu(mpad * ne)?;
-                let gda = alu(mpad * (ne / 32) * 2)?;
-                let gsa = alu(mpad * (ne / 32) * 2)?;
-                let ge = alu(mpad * nff * 4)?;
-                let ue = alu(mpad * nff * 4)?;
-                let ae = alu(mpad * nff * 4)?;
-                let dqa = alu(mpad * nff)?;
-                let dda = alu(mpad * (nff / 32) * 2)?;
-                let dsa = alu(mpad * (nff / 32) * 2)?;
-                let ye = alu(mpad * ne * 4)?;
                 let xb = r(*x)?;
                 let yb = r(*dst)?;
+
+                // ── K-WAY wave interleaving. The per-expert pipeline reuses region-0 scratch, so
+                // expert-major recording needs a barrier between nearly every one of the ~1k
+                // dispatches per layer — at small batches those ~8·n_expert full barriers ARE the
+                // chunk's fixed cost (~350ms GPU at p128, mostly serialization). Instead: KWAY
+                // disjoint scratch SETS, experts processed in waves of KWAY, stage-major within
+                // the wave with `suppress_sync` on all but each stage's first dispatch — one
+                // barrier per (wave, stage) instead of per (expert, stage). Scatter targets a
+                // per-SET dst copy (the kernel is a plain +=, and two experts of one token may
+                // share a dst row), reduced into `dst` by KWAY-1 ordinary adds at the end — a
+                // FIXED summation order, so the result stays deterministic (though the order
+                // differs from expert-major: the MoE goldens were re-blessed with this commit).
+                // All per-set scratch is POOLED — one allocation per (role, set) serves every
+                // MoE layer in the graph.
+                const KWAY: usize = 8;
+                const T_XE: [&str; KWAY] = [
+                    "moe_xe0", "moe_xe1", "moe_xe2", "moe_xe3", "moe_xe4", "moe_xe5", "moe_xe6",
+                    "moe_xe7",
+                ];
+                const T_GQA: [&str; KWAY] = [
+                    "moe_gqa0", "moe_gqa1", "moe_gqa2", "moe_gqa3", "moe_gqa4", "moe_gqa5",
+                    "moe_gqa6", "moe_gqa7",
+                ];
+                const T_GDA: [&str; KWAY] = [
+                    "moe_gda0", "moe_gda1", "moe_gda2", "moe_gda3", "moe_gda4", "moe_gda5",
+                    "moe_gda6", "moe_gda7",
+                ];
+                const T_GSA: [&str; KWAY] = [
+                    "moe_gsa0", "moe_gsa1", "moe_gsa2", "moe_gsa3", "moe_gsa4", "moe_gsa5",
+                    "moe_gsa6", "moe_gsa7",
+                ];
+                const T_GE: [&str; KWAY] = [
+                    "moe_ge0", "moe_ge1", "moe_ge2", "moe_ge3", "moe_ge4", "moe_ge5", "moe_ge6",
+                    "moe_ge7",
+                ];
+                const T_UE: [&str; KWAY] = [
+                    "moe_ue0", "moe_ue1", "moe_ue2", "moe_ue3", "moe_ue4", "moe_ue5", "moe_ue6",
+                    "moe_ue7",
+                ];
+                const T_AE: [&str; KWAY] = [
+                    "moe_ae0", "moe_ae1", "moe_ae2", "moe_ae3", "moe_ae4", "moe_ae5", "moe_ae6",
+                    "moe_ae7",
+                ];
+                const T_DQA: [&str; KWAY] = [
+                    "moe_dqa0", "moe_dqa1", "moe_dqa2", "moe_dqa3", "moe_dqa4", "moe_dqa5",
+                    "moe_dqa6", "moe_dqa7",
+                ];
+                const T_DDA: [&str; KWAY] = [
+                    "moe_dda0", "moe_dda1", "moe_dda2", "moe_dda3", "moe_dda4", "moe_dda5",
+                    "moe_dda6", "moe_dda7",
+                ];
+                const T_DSA: [&str; KWAY] = [
+                    "moe_dsa0", "moe_dsa1", "moe_dsa2", "moe_dsa3", "moe_dsa4", "moe_dsa5",
+                    "moe_dsa6", "moe_dsa7",
+                ];
+                const T_YE: [&str; KWAY] = [
+                    "moe_ye0", "moe_ye1", "moe_ye2", "moe_ye3", "moe_ye4", "moe_ye5", "moe_ye6",
+                    "moe_ye7",
+                ];
+                const T_YC: [&str; KWAY] = [
+                    "moe_yc0", "moe_yc1", "moe_yc2", "moe_yc3", "moe_yc4", "moe_yc5", "moe_yc6",
+                    "moe_yc7",
+                ];
+                let nsets = KWAY.min(n_expert);
+                let mut xe = Vec::new();
+                let mut gqa = Vec::new();
+                let mut gda = Vec::new();
+                let mut gsa = Vec::new();
+                let mut ge = Vec::new();
+                let mut ue = Vec::new();
+                let mut ae = Vec::new();
+                let mut dqa = Vec::new();
+                let mut dda = Vec::new();
+                let mut dsa = Vec::new();
+                let mut ye = Vec::new();
+                let mut yc = Vec::new();
+                for i in 0..nsets {
+                    xe.push(pooled(pool, be_, T_XE[i], mpad * ne * 4)?);
+                    gqa.push(pooled(pool, be_, T_GQA[i], mpad * ne)?);
+                    gda.push(pooled(pool, be_, T_GDA[i], mpad * (ne / 32) * 2)?);
+                    gsa.push(pooled(pool, be_, T_GSA[i], mpad * (ne / 32) * 2)?);
+                    ge.push(pooled(pool, be_, T_GE[i], mpad * nff * 4)?);
+                    ue.push(pooled(pool, be_, T_UE[i], mpad * nff * 4)?);
+                    ae.push(pooled(pool, be_, T_AE[i], mpad * nff * 4)?);
+                    dqa.push(pooled(pool, be_, T_DQA[i], mpad * nff)?);
+                    dda.push(pooled(pool, be_, T_DDA[i], mpad * (nff / 32) * 2)?);
+                    dsa.push(pooled(pool, be_, T_DSA[i], mpad * (nff / 32) * 2)?);
+                    ye.push(pooled(pool, be_, T_YE[i], mpad * ne * 4)?);
+                    yc.push(pooled(pool, be_, T_YC[i], rows * ne * 4)?);
+                }
 
                 // Router logits for all rows, then GPU routing.
                 let rdt = graph.desc(*router).dtype;
@@ -1228,116 +1307,167 @@ fn lower_op(
                 );
                 rec.moe_expert_args(counts.as_ref(), args.as_ref(), n_expert, ne, nff);
 
-                // dst accumulates weighted expert outputs — start from zero.
-                rec.zero(yb, rows * ne);
+                // Per-set dst copies accumulate weighted expert outputs — start from zero
+                // (disjoint buffers: batch the zeros under one barrier). nsets==1 degenerates to
+                // scattering straight into `dst` (zeroed like the old expert-major path).
+                if nsets == 1 {
+                    rec.zero(yb, rows * ne);
+                } else {
+                    for (i, k) in yc.iter().enumerate() {
+                        rec.suppress_sync(i != 0);
+                        rec.zero(pool[k].as_ref(), rows * ne);
+                    }
+                    rec.suppress_sync(false);
+                }
                 let (gw, uw, dw) = (r(*gate_exps)?, r(*up_exps)?, r(*down_exps)?);
-                for e in 0..n_expert {
-                    rec.gather_rows_ind(
-                        xb,
-                        bucket_rows.as_ref(),
-                        counts.as_ref(),
-                        offsets.as_ref(),
-                        xe.as_ref(),
-                        args.as_ref(),
-                        e,
-                        0,
-                        ne,
-                    );
-                    rec.quant_q8_ind(
-                        xe.as_ref(),
-                        gqa.as_ref(),
-                        gda.as_ref(),
-                        gsa.as_ref(),
-                        ne,
-                        args.as_ref(),
-                        e,
-                        1,
-                    );
-                    rec.matmul_mmq_q4k_ind(
-                        gqa.as_ref(),
-                        gda.as_ref(),
-                        gsa.as_ref(),
-                        gw,
-                        e * stride,
-                        ge.as_ref(),
-                        ne,
-                        nff,
-                        args.as_ref(),
-                        e,
-                        2,
-                    );
-                    rec.matmul_mmq_q4k_ind(
-                        gqa.as_ref(),
-                        gda.as_ref(),
-                        gsa.as_ref(),
-                        uw,
-                        e * stride,
-                        ue.as_ref(),
-                        ne,
-                        nff,
-                        args.as_ref(),
-                        e,
-                        2,
-                    );
-                    rec.silu_mul_ind(
-                        ge.as_ref(),
-                        ue.as_ref(),
-                        ae.as_ref(),
-                        mpad * nff,
-                        args.as_ref(),
-                        e,
-                        3,
-                    );
-                    rec.quant_q8_ind(
-                        ae.as_ref(),
-                        dqa.as_ref(),
-                        dda.as_ref(),
-                        dsa.as_ref(),
-                        nff,
-                        args.as_ref(),
-                        e,
-                        4,
-                    );
-                    if down_q6 {
-                        rec.matmul_mmq_q6k_ind(
-                            dqa.as_ref(),
-                            dda.as_ref(),
-                            dw,
-                            e * stride,
-                            ye.as_ref(),
-                            nff,
-                            ne,
+                for wave in (0..n_expert).step_by(nsets) {
+                    let wend = (wave + nsets).min(n_expert);
+                    // Each stage records the whole wave with barriers suppressed after its first
+                    // dispatch — the sets are disjoint, so one barrier fences the previous stage
+                    // for all of them at once.
+                    for (i, e) in (wave..wend).enumerate() {
+                        rec.suppress_sync(i != 0);
+                        rec.gather_rows_ind(
+                            xb,
+                            bucket_rows.as_ref(),
+                            counts.as_ref(),
+                            offsets.as_ref(),
+                            pool[&xe[i]].as_ref(),
                             args.as_ref(),
                             e,
-                            5,
-                        );
-                    } else {
-                        rec.matmul_mmq_q4k_ind(
-                            dqa.as_ref(),
-                            dda.as_ref(),
-                            dsa.as_ref(),
-                            dw,
-                            e * stride,
-                            ye.as_ref(),
-                            nff,
+                            0,
                             ne,
-                            args.as_ref(),
-                            e,
-                            5,
                         );
                     }
-                    rec.scatter_add_rows_ind(
-                        ye.as_ref(),
-                        bucket_rows.as_ref(),
-                        bucket_wts.as_ref(),
-                        counts.as_ref(),
-                        offsets.as_ref(),
-                        yb,
-                        args.as_ref(),
-                        e,
-                        6,
-                        ne,
-                    );
+                    for (i, e) in (wave..wend).enumerate() {
+                        rec.suppress_sync(i != 0);
+                        rec.quant_q8_ind(
+                            pool[&xe[i]].as_ref(),
+                            pool[&gqa[i]].as_ref(),
+                            pool[&gda[i]].as_ref(),
+                            pool[&gsa[i]].as_ref(),
+                            ne,
+                            args.as_ref(),
+                            e,
+                            1,
+                        );
+                    }
+                    for (i, e) in (wave..wend).enumerate() {
+                        rec.suppress_sync(i != 0);
+                        rec.matmul_mmq_q4k_ind(
+                            pool[&gqa[i]].as_ref(),
+                            pool[&gda[i]].as_ref(),
+                            pool[&gsa[i]].as_ref(),
+                            gw,
+                            e * stride,
+                            pool[&ge[i]].as_ref(),
+                            ne,
+                            nff,
+                            args.as_ref(),
+                            e,
+                            2,
+                        );
+                        // The up GEMM reads the same quantized activations and writes its own
+                        // buffer — disjoint from every other dispatch of this stage batch.
+                        rec.suppress_sync(true);
+                        rec.matmul_mmq_q4k_ind(
+                            pool[&gqa[i]].as_ref(),
+                            pool[&gda[i]].as_ref(),
+                            pool[&gsa[i]].as_ref(),
+                            uw,
+                            e * stride,
+                            pool[&ue[i]].as_ref(),
+                            ne,
+                            nff,
+                            args.as_ref(),
+                            e,
+                            2,
+                        );
+                    }
+                    for (i, e) in (wave..wend).enumerate() {
+                        rec.suppress_sync(i != 0);
+                        rec.silu_mul_ind(
+                            pool[&ge[i]].as_ref(),
+                            pool[&ue[i]].as_ref(),
+                            pool[&ae[i]].as_ref(),
+                            mpad * nff,
+                            args.as_ref(),
+                            e,
+                            3,
+                        );
+                    }
+                    for (i, e) in (wave..wend).enumerate() {
+                        rec.suppress_sync(i != 0);
+                        rec.quant_q8_ind(
+                            pool[&ae[i]].as_ref(),
+                            pool[&dqa[i]].as_ref(),
+                            pool[&dda[i]].as_ref(),
+                            pool[&dsa[i]].as_ref(),
+                            nff,
+                            args.as_ref(),
+                            e,
+                            4,
+                        );
+                    }
+                    for (i, e) in (wave..wend).enumerate() {
+                        rec.suppress_sync(i != 0);
+                        if down_q6 {
+                            rec.matmul_mmq_q6k_ind(
+                                pool[&dqa[i]].as_ref(),
+                                pool[&dda[i]].as_ref(),
+                                dw,
+                                e * stride,
+                                pool[&ye[i]].as_ref(),
+                                nff,
+                                ne,
+                                args.as_ref(),
+                                e,
+                                5,
+                            );
+                        } else {
+                            rec.matmul_mmq_q4k_ind(
+                                pool[&dqa[i]].as_ref(),
+                                pool[&dda[i]].as_ref(),
+                                pool[&dsa[i]].as_ref(),
+                                dw,
+                                e * stride,
+                                pool[&ye[i]].as_ref(),
+                                nff,
+                                ne,
+                                args.as_ref(),
+                                e,
+                                5,
+                            );
+                        }
+                    }
+                    for (i, e) in (wave..wend).enumerate() {
+                        rec.suppress_sync(i != 0);
+                        let starget = if nsets == 1 {
+                            yb
+                        } else {
+                            pool[&yc[i]].as_ref()
+                        };
+                        rec.scatter_add_rows_ind(
+                            pool[&ye[i]].as_ref(),
+                            bucket_rows.as_ref(),
+                            bucket_wts.as_ref(),
+                            counts.as_ref(),
+                            offsets.as_ref(),
+                            starget,
+                            args.as_ref(),
+                            e,
+                            6,
+                            ne,
+                        );
+                    }
+                    rec.suppress_sync(false);
+                }
+                // Reduce the per-set copies into `dst` — a fixed order, so bit-deterministic.
+                if nsets > 1 {
+                    rec.add(pool[&yc[0]].as_ref(), pool[&yc[1]].as_ref(), yb, rows * ne);
+                    for k in yc.iter().skip(2) {
+                        rec.add(yb, pool[k].as_ref(), yb, rows * ne);
+                    }
                 }
                 transient.extend([
                     logits,
@@ -1349,17 +1479,6 @@ fn lower_op(
                     bucket_rows,
                     bucket_wts,
                     args,
-                    xe,
-                    gqa,
-                    gda,
-                    gsa,
-                    ge,
-                    ue,
-                    ae,
-                    dqa,
-                    dda,
-                    dsa,
-                    ye,
                 ]);
                 return Ok(());
             }

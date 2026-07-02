@@ -754,6 +754,41 @@ fn attention_prefill_wide_parity() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
 }
 
+// Wide launch, long f16 context: routes to the half-fragment flash kernel (`attnflash_f16kv`).
+// Q and P round to f16 in that path (accumulation stays f32), hence the wider tolerance than the
+// exact-f32 attention kernels. kv_len is a multiple of 8 so the kernel's tail-block reads stay
+// inside these exact-sized test buffers (the runtime cache is sized for the full context).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 64usize, 119usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 71))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 72))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 73))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
 // Long-context decode shape (rows=1, kv_len >= 128, hd <= 128): routes to the 32-way split-KV
 // kernel (`attnsplit32_*`), which the short-kv tests above never reach.
 #[test]

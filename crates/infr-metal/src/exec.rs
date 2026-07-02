@@ -908,7 +908,12 @@ impl MetalBackend {
                 // beat the 32-way split on prefill — occupancy-starved by its threadgroup tiles —
                 // so it was dropped.)
                 let f16 = g.desc(k_cache).dtype == DType::F16;
-                let split = rows * nh < 128 || kv_len >= 128;
+                // Wide launches on an f16 cache take the half-fragment flash kernel: K^T/V
+                // fragments load straight from the cache, Q is cast once to f16 below. Small
+                // kv_len stays scalar (also keeps the short-kv wide parity test on the exact
+                // path). See `attnflash_f16kv` for why the f32 flash attempt lost and this wins.
+                let flash = f16 && rows * nh >= 128 && kv_len >= 64 && hd <= 128 && hd % 8 == 0;
+                let split = !flash && (rows * nh < 128 || kv_len >= 128);
                 // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup
                 // owns a strided KV slice, so a smaller launch would silently skip positions and
                 // merge uninitialized partials. maxTotalThreadsPerThreadgroup is per-PIPELINE
@@ -943,13 +948,14 @@ impl MetalBackend {
                             },
                             256,
                         )?);
-                let kern = match (f16, split, split32) {
-                    (true, false, _) => "attention_f16kv",
-                    (true, _, true) => "attnsplit32_f16kv",
-                    (true, true, false) => "attnsplit_f16kv",
-                    (false, false, _) => "attention_f32",
-                    (false, _, true) => "attnsplit32_f32",
-                    (false, true, false) => "attnsplit_f32",
+                let kern = match (flash, f16, split, split32) {
+                    (true, ..) => "attnflash_f16kv",
+                    (_, true, false, _) => "attention_f16kv",
+                    (_, true, _, true) => "attnsplit32_f16kv",
+                    (_, true, true, false) => "attnsplit_f16kv",
+                    (_, false, false, _) => "attention_f32",
+                    (_, false, _, true) => "attnsplit32_f32",
+                    (_, false, true, false) => "attnsplit_f32",
                 };
                 let pso = self.pipelines.get(kern)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
@@ -960,23 +966,44 @@ impl MetalBackend {
                 p.extend_from_slice(&scale.to_ne_bytes());
                 p.extend_from_slice(&window.to_ne_bytes());
                 p.extend_from_slice(&pos.to_ne_bytes());
-                // One simdgroup per (query, head); split kernels use NSG simdgroups per pair,
-                // grid still exactly rows*n_head threadgroups.
-                let nsg = if split32 {
-                    32
-                } else if split {
-                    8
+                if flash {
+                    // Cast q to a transient f16 buffer (one pass), then one flash dispatch:
+                    // one simdgroup per (8-query tile, head).
+                    let n = rows * nh * hd;
+                    let qh =
+                        Arc::new(self.device.new_buffer(
+                            (n * 2).max(4) as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        ));
+                    let cast = self.pipelines.get("cast_f32_f16")?;
+                    self.encode(r, &cast, &[bq.as_ref(), &qh], &(n as u32).to_ne_bytes(), n);
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[qh.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                        &p,
+                        rows.div_ceil(8) * nh * 32,
+                        32,
+                    );
                 } else {
-                    1
-                };
-                self.encode_tg(
-                    r,
-                    &pso,
-                    &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
-                    &p,
-                    rows * nh * nsg * 32,
-                    nsg * 32,
-                );
+                    // One simdgroup per (query, head); split kernels use NSG simdgroups per
+                    // pair, grid still exactly rows*n_head threadgroups.
+                    let nsg = if split32 {
+                        32
+                    } else if split {
+                        8
+                    } else {
+                        1
+                    };
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                        &p,
+                        rows * nh * nsg * 32,
+                        nsg * 32,
+                    );
+                }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::MoeFfn {

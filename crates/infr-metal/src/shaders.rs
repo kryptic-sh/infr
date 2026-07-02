@@ -702,6 +702,146 @@ ATTNSPLIT_KERNEL(attnsplit_f16kv, half, 8u, 256u)
 ATTNSPLIT_KERNEL(attnsplit32_f32, float, 32u, 128u)
 ATTNSPLIT_KERNEL(attnsplit32_f16kv, half, 32u, 128u)
 
+// ---- Half-fragment flash attention for prefill (f16 KV cache, hd <= 128, hd % 8 == 0): one
+// simdgroup per (8-query tile, head). Unlike the earlier f32 simdgroup_matrix attempt (built,
+// benched, lost to the scalar split-KV kernel, removed), there is NO staging: K^T and V 8x8
+// fragments load DIRECTLY from the f16 cache (strided, transposed for K), and Q is pre-cast once
+// per op to f16 — the f32 version spent its time converting K/V through threadgroup memory and
+// choked occupancy on the 8 KB tiles. Scores and the output tile accumulate in f32; the online
+// softmax runs scalar in f32 on an 8x8 score tile per 8-position KV block, with the row-rescale
+// applied as a diagonal f32 MMA. P rounds to f16 (same trade as the half-fragment GEMM).
+// Tail KV blocks may read up to 7 rows past the causal limit — always inside the bound cache
+// buffer (sized for the full context) — and those columns are masked in the softmax.
+// A partial final query tile falls back to the serial per-query path.
+kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
+                            device const half*  k   [[buffer(1)]],
+                            device const half*  v   [[buffer(2)]],
+                            device float*       dst [[buffer(3)]],
+                            constant AttnParams& p  [[buffer(4)]],
+                            uint gid  [[thread_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    uint ntq = (p.rows + 7u) / 8u;
+    if (sg >= ntq * p.n_head) return;
+    uint qt = sg / p.n_head;
+    uint h = sg % p.n_head;
+    uint group = p.n_head / p.n_kv;
+    uint kvh = h / group;
+    uint hd = p.head_dim;
+    uint r0 = qt * 8u;
+
+    if (r0 + 8u > p.rows) {
+        // partial query tile: serial per-query fallback (lane-split dot, online softmax)
+        for (uint ti = r0; ti < p.rows; ti++) {
+            uint qb = (ti * p.n_head + h) * hd;
+            uint abs = p.pos + ti;
+            uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
+            float acc[MAX_DPL];
+            for (uint t = 0; t < MAX_DPL; t++) acc[t] = 0.0f;
+            float m = -INFINITY, l = 0.0f;
+            for (uint j = lo; j <= abs; j++) {
+                ulong kb = ((ulong)j * p.n_kv + kvh) * hd;
+                float part = 0.0f;
+                for (uint d = lane; d < hd; d += 32u) part += (float)q[qb + d] * (float)k[kb + d];
+                float sc = simd_sum(part) * p.scale;
+                float mnew = max(m, sc);
+                float corr = exp(m - mnew);
+                float pw = exp(sc - mnew);
+                l = l * corr + pw;
+                uint t = 0;
+                for (uint d = lane; d < hd; d += 32u) {
+                    acc[t] = acc[t] * corr + pw * (float)v[kb + d];
+                    t++;
+                }
+                m = mnew;
+            }
+            uint t = 0;
+            for (uint d = lane; d < hd; d += 32u) { dst[qb + d] = acc[t] / l; t++; }
+        }
+        return;
+    }
+
+    threadgroup half tgP[64];
+    threadgroup float tgD[64];
+    threadgroup float tgM[8], tgL[8];
+    uint abs0 = p.pos + r0;                 // row i sees positions <= abs0 + i
+    uint abs_max = abs0 + 7u;
+    uint lo_min = (p.window > 0u && abs0 + 1u > p.window) ? (abs0 + 1u - p.window) : 0u;
+    if (lane < 8u) { tgM[lane] = -INFINITY; tgL[lane] = 0.0f; }
+
+    device const half* qbase = q + ((ulong)r0 * p.n_head + h) * hd;
+    ulong qstride = (ulong)p.n_head * hd;
+    ulong kvstride = (ulong)p.n_kv * hd;
+
+    simdgroup_float8x8 oa[16];
+    uint nfrag = hd / 8u;
+    for (uint i = 0; i < nfrag; i++) oa[i] = simdgroup_float8x8(0.0f);
+
+    for (uint j0 = lo_min & ~7u; j0 <= abs_max; j0 += 8u) {
+        device const half* kb = k + ((ulong)j0 * p.n_kv + kvh) * hd;
+        simdgroup_float8x8 sf = simdgroup_float8x8(0.0f);
+        for (uint e0 = 0; e0 < hd; e0 += 8u) {
+            simdgroup_half8x8 qa, kt;
+            simdgroup_load(qa, qbase + e0, qstride);
+            simdgroup_load(kt, kb + e0, kvstride, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(sf, qa, kt, sf);
+        }
+        simdgroup_store(sf, tgD, 8);        // reuse tgD as the f32 score scratch
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 8u) {
+            uint r = lane;
+            uint absr = abs0 + r;
+            uint lor = (p.window > 0u && absr + 1u > p.window) ? (absr + 1u - p.window) : 0u;
+            float mr = tgM[r];
+            float mnew = mr;
+            float s[8];
+            for (uint c = 0; c < 8u; c++) {
+                uint j = j0 + c;
+                bool valid = (j >= lor) && (j <= absr);
+                s[c] = valid ? tgD[r * 8u + c] * p.scale : -INFINITY;
+                mnew = max(mnew, s[c]);
+            }
+            float corr = (mr == mnew) ? 1.0f : exp(mr - mnew);
+            float lsum = 0.0f;
+            for (uint c = 0; c < 8u; c++) {
+                float pw = (s[c] == -INFINITY) ? 0.0f : exp(s[c] - mnew);
+                tgP[r * 8u + c] = (half)pw;
+                lsum += pw;
+            }
+            tgL[r] = tgL[r] * corr + lsum;
+            tgM[r] = mnew;
+            for (uint c = 0; c < 8u; c++) tgD[r * 8u + c] = (c == r) ? corr : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 df;
+        simdgroup_half8x8 pf;
+        simdgroup_load(df, tgD, 8);
+        simdgroup_load(pf, tgP, 8);
+        device const half* vb = v + ((ulong)j0 * p.n_kv + kvh) * hd;
+        for (uint i = 0; i < nfrag; i++) {
+            simdgroup_float8x8 tmp;
+            simdgroup_multiply(tmp, df, oa[i]);
+            simdgroup_half8x8 vf;
+            simdgroup_load(vf, vb + i * 8u, kvstride);
+            simdgroup_multiply_accumulate(oa[i], pf, vf, tmp);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane < 8u) {
+        for (uint c = 0; c < 8u; c++) tgD[lane * 8u + c] = (c == lane) ? 1.0f / tgL[lane] : 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 d2;
+    simdgroup_load(d2, tgD, 8);
+    ulong obase = ((ulong)r0 * p.n_head + h) * hd;
+    ulong ostride = (ulong)p.n_head * hd;
+    for (uint i = 0; i < nfrag; i++) {
+        simdgroup_float8x8 tmp;
+        simdgroup_multiply(tmp, d2, oa[i]);
+        simdgroup_store(tmp, dst + obase + i * 8u, ostride);
+    }
+}
+
 // ---- WriteKv: cast-copy `n` f32 source elems into the bound KV cache at row offset `base`, on the
 // GPU so it stays in the batch (no host round-trip that would force a per-layer flush). The (half)
 // cast is IEEE round-to-nearest-even — byte-identical to the host `f16::from_f32` reference.

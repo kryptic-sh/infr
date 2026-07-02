@@ -815,32 +815,83 @@ fn lower_op(
         } => {
             // Prefill (rows ≥ 32): the chunkwise delta rule processes 32 tokens per state
             // traversal (matmuls + a triangular solve) instead of the token-serial recurrence —
-            // the difference between rows and rows/32 sequential state sweeps. Decode/short rows
-            // keep the sequential kernel. INFR_NO_DN_CHUNK forces sequential.
-            let chunked = *rows >= 32 && std::env::var("INFR_NO_DN_CHUNK").is_err();
-            let dn = if chunked {
-                Recorder::deltanet_chunked
-            } else {
-                Recorder::deltanet
-            };
-            dn(
-                rec,
-                r(*q)?,
-                r(*k)?,
-                r(*v)?,
-                r(*b)?,
-                r(*a)?,
-                r(*a_coef)?,
-                r(*dt_bias)?,
-                r(*state)?,
-                r(*dst)?,
+            // the difference between rows and rows/32 sequential state sweeps. The default is the
+            // SPLIT form (parallel prep/gates passes + a light state-coupled scan; the monolithic
+            // kernel duplicated the prep work per column block). Decode/short rows keep the
+            // sequential kernel. INFR_NO_DN_CHUNK forces sequential; INFR_NO_DN_SPLIT keeps the
+            // chunked math but in the monolithic kernel (A/B).
+            let (rows_, nv_, nk_, kd_, vd_) = (
                 *rows as usize,
                 *n_vhead as usize,
                 *n_khead as usize,
                 *head_k as usize,
                 *head_v as usize,
-                *eps,
             );
+            let chunked = rows_ >= 32 && std::env::var("INFR_NO_DN_CHUNK").is_err();
+            if chunked && std::env::var("INFR_NO_DN_SPLIT").is_err() {
+                let nchunk = rows_.div_ceil(32);
+                // alloc_uninit: every slot the scan reads is written by prep/gates first.
+                let kn =
+                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
+                let qn =
+                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
+                let dk =
+                    be_.alloc_uninit((nchunk * nk_ * 1024 * 4).max(4), BufferUsage::Activations)?;
+                let dq =
+                    be_.alloc_uninit((nchunk * nk_ * 1024 * 4).max(4), BufferUsage::Activations)?;
+                let bg =
+                    be_.alloc_uninit((nchunk * nv_ * 32 * 4).max(4), BufferUsage::Activations)?;
+                let gg =
+                    be_.alloc_uninit((nchunk * nv_ * 32 * 4).max(4), BufferUsage::Activations)?;
+                rec.deltanet_chunked_split(
+                    r(*q)?,
+                    r(*k)?,
+                    r(*v)?,
+                    r(*b)?,
+                    r(*a)?,
+                    r(*a_coef)?,
+                    r(*dt_bias)?,
+                    r(*state)?,
+                    r(*dst)?,
+                    kn.as_ref(),
+                    qn.as_ref(),
+                    dk.as_ref(),
+                    dq.as_ref(),
+                    bg.as_ref(),
+                    gg.as_ref(),
+                    rows_,
+                    nv_,
+                    nk_,
+                    kd_,
+                    vd_,
+                    *eps,
+                );
+                transient.extend([kn, qn, dk, dq, bg, gg]);
+            } else {
+                let dn = if chunked {
+                    Recorder::deltanet_chunked
+                } else {
+                    Recorder::deltanet
+                };
+                dn(
+                    rec,
+                    r(*q)?,
+                    r(*k)?,
+                    r(*v)?,
+                    r(*b)?,
+                    r(*a)?,
+                    r(*a_coef)?,
+                    r(*dt_bias)?,
+                    r(*state)?,
+                    r(*dst)?,
+                    rows_,
+                    nv_,
+                    nk_,
+                    kd_,
+                    vd_,
+                    *eps,
+                );
+            }
         }
         // Elementwise gemma logit softcap `y = cap·tanh(x/cap)` (in-place safe).
         Op::Softcap { x, dst, cap, n } => {

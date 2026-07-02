@@ -1,0 +1,41 @@
+#version 460
+// Chunked gated-DeltaNet, pass 2/3 (GATES — parallel over (chunk, value head)): per-token
+// β = sigmoid(b) and the chunk's INCLUSIVE prefix log-decay G_j = Σ_{l≤j} a_coef·softplus(α+dt_bias).
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+#define C 32u
+
+layout(push_constant) uniform PC { uint rows; uint nv; } pc;
+
+layout(binding = 0) readonly buffer BB  { float blog[]; };   // [rows, nv]
+layout(binding = 1) readonly buffer AB  { float alpha[]; };  // [rows, nv]
+layout(binding = 2) readonly buffer ACB { float acoef[]; };  // [nv]
+layout(binding = 3) readonly buffer DTB { float dtbias[]; }; // [nv]
+layout(binding = 4) writeonly buffer BG { float betag[]; };  // [nchunk, nv, C]
+layout(binding = 5) writeonly buffer GG { float gg[]; };     // [nchunk, nv, C]
+
+shared float gt[C];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint chunk = gl_WorkGroupID.x / pc.nv;
+    uint h = gl_WorkGroupID.x % pc.nv;
+    uint base = chunk * C;
+    uint c = min(C, pc.rows - base);
+    uint obase = (chunk * pc.nv + h) * C;
+
+    if (t < c) {
+        uint ga = (base + t) * pc.nv + h;
+        betag[obase + t] = 1.0 / (1.0 + exp(-blog[ga]));
+        float z = alpha[ga] + dtbias[h];
+        gt[t] = acoef[h] * (max(z, 0.0) + log(1.0 + exp(-abs(z))));
+    }
+    barrier();
+    if (t == 0u) {
+        float run = 0.0;
+        for (uint j = 0u; j < c; j++) {
+            run += gt[j];
+            gg[obase + j] = run;
+        }
+    }
+}

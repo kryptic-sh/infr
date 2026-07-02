@@ -244,6 +244,66 @@ fn qwen35_dn_attn_bench() {
         us * 18.0 / 1e3
     );
 
+    // split variant (prep + gates + scan)
+    let nchunk = rows.div_ceil(32);
+    let kn = be
+        .alloc(rows * nk * kd * 4, BufferUsage::Activations)
+        .unwrap();
+    let qn = be
+        .alloc(rows * nk * kd * 4, BufferUsage::Activations)
+        .unwrap();
+    let dkb = be
+        .alloc(nchunk * nk * 1024 * 4, BufferUsage::Activations)
+        .unwrap();
+    let dqb = be
+        .alloc(nchunk * nk * 1024 * 4, BufferUsage::Activations)
+        .unwrap();
+    let bg = be
+        .alloc(nchunk * nv * 32 * 4, BufferUsage::Activations)
+        .unwrap();
+    let gg = be
+        .alloc(nchunk * nv * 32 * 4, BufferUsage::Activations)
+        .unwrap();
+    let split = |rec: &infr_vulkan::Recorder| {
+        rec.deltanet_chunked_split(
+            q.as_ref(),
+            k.as_ref(),
+            v.as_ref(),
+            b.as_ref(),
+            al.as_ref(),
+            ac.as_ref(),
+            dt.as_ref(),
+            st.as_ref(),
+            o.as_ref(),
+            kn.as_ref(),
+            qn.as_ref(),
+            dkb.as_ref(),
+            dqb.as_ref(),
+            bg.as_ref(),
+            gg.as_ref(),
+            rows,
+            nv,
+            nk,
+            kd,
+            vd,
+            1e-6,
+        );
+    };
+    let rec = be.recorder().unwrap();
+    split(&rec);
+    rec.finish().unwrap();
+    let t0 = std::time::Instant::now();
+    let rec = be.recorder().unwrap();
+    for _ in 0..reps {
+        split(&rec);
+    }
+    rec.finish().unwrap();
+    let us = t0.elapsed().as_micros() as f64 / reps as f64;
+    println!(
+        "deltanet_split   rows=512: {us:.1} us/op  ×18 = {:.1} ms/chunk",
+        us * 18.0 / 1e3
+    );
+
     // nonfa attention at qwen35 attn shape: rows=512, kv=822, nh=16, nkv=2, hd=256
     let (nh, nkv, hd, kv_len) = (16usize, 2usize, 256usize, 822usize);
     let mpad = 512usize;

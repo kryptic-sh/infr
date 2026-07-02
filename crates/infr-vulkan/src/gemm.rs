@@ -305,6 +305,12 @@ const RMSNORM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsno
 const DELTANET_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet.spv"));
 const DELTANET_CHUNKED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_chunked.spv"));
+const DELTANET_PREP_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_prep.spv"));
+const DELTANET_GATES_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_gates.spv"));
+const DELTANET_SCAN_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_scan.spv"));
 const CONV1D_SILU_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
 const CONV1D_SILU_PAR_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par.spv"));
@@ -513,6 +519,21 @@ pub(crate) fn silu_mul_spv() -> &'static [u32] {
 pub(crate) fn deltanet_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SPV_BYTES))
+}
+/// SPIR-V for the chunked-DeltaNet PREP pass (normalize + intra-chunk dot matrices).
+pub(crate) fn deltanet_prep_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_PREP_SPV_BYTES))
+}
+/// SPIR-V for the chunked-DeltaNet GATES pass (β + prefix log-decay per chunk/head).
+pub(crate) fn deltanet_gates_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_GATES_SPV_BYTES))
+}
+/// SPIR-V for the chunked-DeltaNet SCAN pass (the sequential state-coupled part).
+pub(crate) fn deltanet_scan_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_SCAN_SPV_BYTES))
 }
 /// SPIR-V for the CHUNKED gated-DeltaNet prefill (chunkwise delta rule, C=32).
 pub(crate) fn deltanet_chunked_spv() -> &'static [u32] {

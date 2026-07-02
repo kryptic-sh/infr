@@ -1,0 +1,117 @@
+#version 460
+// Chunked gated-DeltaNet, pass 1/3 (PREP — fully parallel over (chunk, k-head)): L2-normalize the
+// chunk's q/k and precompute the intra-chunk dot matrices the scan needs:
+//   kn/qn: normalized k̂ (and q̂·1/√kd), written back to global
+//   D [j][l] = k̂_j·k̂_l   (l < j;  the A matrix before its per-VALUE-head β/decay factors)
+//   Dq[i][j] = q̂_i·k̂_j   (j ≤ i;  the Wq matrix before its decay factor)
+// Hoisting this out of the sequential chunk scan removes the work the scan's column-block
+// workgroups used to DUPLICATE (measured ~37% of the monolithic kernel at 4 blocks), and it runs
+// here at full occupancy since chunks are independent.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define C 32u
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint nk;      // k/q heads
+    uint kd;      // head_k_dim (≤ 128)
+    float eps;
+    float qscale; // 1/sqrt(kd)
+} pc;
+
+layout(binding = 0) readonly buffer QB { float q[]; };   // [rows, nk*kd] raw
+layout(binding = 1) readonly buffer KB { float k[]; };   // [rows, nk*kd] raw
+layout(binding = 2) writeonly buffer KN { float kng[]; }; // [rows, nk*kd] normalized
+layout(binding = 3) writeonly buffer QN { float qng[]; }; // [rows, nk*kd] normalized ×1/√kd
+layout(binding = 4) writeonly buffer DK { float dk[]; };  // [nchunk, nk, C, C], l<j
+layout(binding = 5) writeonly buffer DQ { float dq[]; };  // [nchunk, nk, C, C], j≤i
+
+shared float kn[C * 128u];
+shared float qn[C * 128u];
+shared float red[256];
+shared float nrm[C];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint chunk = gl_WorkGroupID.x / pc.nk;
+    uint kh = gl_WorkGroupID.x % pc.nk;
+    uint base = chunk * C;
+    uint c = min(C, pc.rows - base);
+    uint kd = pc.kd;
+
+    // load raw k,q
+    for (uint p = t; p < c * kd; p += 256u) {
+        uint j = p / kd;
+        uint kk = p % kd;
+        uint src = (base + j) * pc.nk * kd + kh * kd + kk;
+        kn[j * 128u + kk] = k[src];
+        qn[j * 128u + kk] = q[src];
+    }
+    barrier();
+
+    // per-token L2 norms (8 lanes per token) — same reduction shape as the monolithic kernel
+    {
+        uint j = t >> 3u;
+        uint lane = t & 7u;
+        float ks = 0.0;
+        if (j < c) {
+            for (uint kk = lane; kk < kd; kk += 8u) { float x = kn[j * 128u + kk]; ks += x * x; }
+        }
+        red[t] = ks;
+        barrier();
+        if (lane == 0u && j < c) {
+            float s = 0.0;
+            for (uint i = 0u; i < 8u; i++) { s += red[(j << 3u) + i]; }
+            nrm[j] = sqrt(s + pc.eps);
+        }
+        barrier();
+        float kinv = (j < c) ? 1.0 / nrm[j] : 0.0;
+        barrier(); // nrm reused for q
+        float qs = 0.0;
+        if (j < c) {
+            for (uint kk = lane; kk < kd; kk += 8u) { float x = qn[j * 128u + kk]; qs += x * x; }
+        }
+        red[t] = qs;
+        barrier();
+        if (lane == 0u && j < c) {
+            float s = 0.0;
+            for (uint i = 0u; i < 8u; i++) { s += red[(j << 3u) + i]; }
+            nrm[j] = sqrt(s + pc.eps);
+        }
+        barrier();
+        if (j < c) {
+            float qinv = pc.qscale / nrm[j];
+            for (uint kk = lane; kk < kd; kk += 8u) {
+                kn[j * 128u + kk] *= kinv;
+                qn[j * 128u + kk] *= qinv;
+            }
+        }
+    }
+    barrier();
+
+    // write normalized k̂/q̂ back to global (the scan streams them per column block)
+    for (uint p = t; p < c * kd; p += 256u) {
+        uint j = p / kd;
+        uint kk = p % kd;
+        uint dst = (base + j) * pc.nk * kd + kh * kd + kk;
+        kng[dst] = kn[j * 128u + kk];
+        qng[dst] = qn[j * 128u + kk];
+    }
+
+    // D[j][l] = k̂_j·k̂_l (l<j) and Dq[i][j] = q̂_i·k̂_j (j≤i)
+    uint mbase = (chunk * pc.nk + kh) * C * C;
+    for (uint p = t; p < C * C; p += 256u) {
+        uint j = p >> 5u;
+        uint l = p & 31u;
+        if (j < c && l < j) {
+            float dot = 0.0;
+            for (uint kk = 0u; kk < kd; kk++) { dot += kn[j * 128u + kk] * kn[l * 128u + kk]; }
+            dk[mbase + p] = dot;
+        }
+        if (j < c && l <= j) {
+            float dot = 0.0;
+            for (uint kk = 0u; kk < kd; kk++) { dot += qn[j * 128u + kk] * kn[l * 128u + kk]; }
+            dq[mbase + p] = dot;
+        }
+    }
+}

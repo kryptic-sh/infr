@@ -2139,6 +2139,8 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&eps.to_ne_bytes());
         push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
         // One workgroup per (value head, block of 32 state columns); local_size_x=256.
+        // (COLS=16 was tried for occupancy and REGRESSED 2670→3668µs — the per-block duplicated
+        // A/Wq dots dominate; that's what the split prep+scan variant hoists out.)
         let n_blk = vd.div_ceil(32);
         self.dispatch(
             kern,
@@ -2155,6 +2157,118 @@ impl<'a> Recorder<'a> {
             ],
             2, // state (in/out) + out
             &push,
+            (nv * n_blk) as u32,
+        );
+    }
+
+    /// Chunked gated-DeltaNet prefill, SPLIT variant (prep + gates + scan): the chunk-parallel
+    /// work (q/k normalization, intra-chunk D=K̂K̂ᵀ / Dq=Q̂K̂ᵀ dot matrices, gates) is hoisted into
+    /// two fully-parallel passes, so the sequential scan pass does ONLY state-coupled work — which
+    /// parallelizes cleanly over small column blocks (COLS=16 → nv·(vd/16) workgroups). The
+    /// monolithic `deltanet_chunked` duplicated that shared work per column block (~37% of it).
+    /// Scratch (caller-alloc'd, alloc_uninit-safe — every read slot is written by prep/gates):
+    /// kn/qn [rows·nk·kd] f32, dk/dq [nchunk·nk·C·C] f32, betag/gg [nchunk·nv·C] f32, C=32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_chunked_split(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        kn: &dyn Buffer,
+        qn: &dyn Buffer,
+        dk: &dyn Buffer,
+        dq: &dyn Buffer,
+        betag: &dyn Buffer,
+        gg: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+    ) {
+        debug_assert!(kd <= 128, "deltanet split assumes kd ≤ 128, got {kd}");
+        let nchunk = rows.div_ceil(32);
+        self.stamp("deltanet");
+        // pass 1: prep — (chunk, k-head) grid
+        let kp = self
+            .be
+            .kernel("deltanet_prep", crate::gemm::deltanet_prep_spv(), 6, 20);
+        let mut p1 = [0u8; 20];
+        p1[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p1[4..8].copy_from_slice(&(nk as u32).to_ne_bytes());
+        p1[8..12].copy_from_slice(&(kd as u32).to_ne_bytes());
+        p1[12..16].copy_from_slice(&eps.to_ne_bytes());
+        p1[16..20].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        self.dispatch(
+            kp,
+            &[
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(kn),
+                Self::vkb(qn),
+                Self::vkb(dk),
+                Self::vkb(dq),
+            ],
+            4, // kn, qn, dk, dq
+            &p1,
+            (nchunk * nk) as u32,
+        );
+        // pass 2: gates — (chunk, value-head) grid
+        self.stamp("deltanet");
+        let kg = self
+            .be
+            .kernel("deltanet_gates", crate::gemm::deltanet_gates_spv(), 6, 8);
+        let mut p2 = [0u8; 8];
+        p2[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p2[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        self.dispatch(
+            kg,
+            &[
+                Self::vkb(blog),
+                Self::vkb(alpha),
+                Self::vkb(acoef),
+                Self::vkb(dtbias),
+                Self::vkb(betag),
+                Self::vkb(gg),
+            ],
+            2, // betag, gg
+            &p2,
+            (nchunk * nv) as u32,
+        );
+        // pass 3: scan — (value head, column block) grid, sequential over chunks inside
+        self.stamp("deltanet");
+        let ks = self
+            .be
+            .kernel_sg("deltanet_scan", crate::gemm::deltanet_scan_spv(), 9, 20, 32);
+        let mut p3 = [0u8; 20];
+        p3[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p3[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        p3[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
+        p3[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
+        p3[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+        let n_blk = vd.div_ceil(8); // COLS=8, keep in sync with deltanet_scan.comp
+        self.dispatch(
+            ks,
+            &[
+                Self::vkb(v),
+                Self::vkb(kn),
+                Self::vkb(qn),
+                Self::vkb(dk),
+                Self::vkb(dq),
+                Self::vkb(betag),
+                Self::vkb(gg),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2, // state (in/out) + out
+            &p3,
             (nv * n_blk) as u32,
         );
     }

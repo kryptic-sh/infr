@@ -130,8 +130,8 @@ void main() {
 
         // ── R (into dl) + the e^{G}·(q̂ᵀS₀) base term of O (straight to global) ──
         for (uint p = t; p < c * COLS; p += 256u) {
-            uint j = p >> 5u;
-            uint d2 = p & 31u;
+            uint j = p / COLS;
+            uint d2 = p % COLS;
             uint d = d0 + d2;
             if (d < pc.vd) {
                 float ks0 = 0.0, qs0 = 0.0;
@@ -183,8 +183,8 @@ void main() {
 
         // ── O += Wq·Δ ──
         for (uint p = t; p < c * COLS; p += 256u) {
-            uint i = p >> 5u;
-            uint d2 = p & 31u;
+            uint i = p / COLS;
+            uint d2 = p % COLS;
             uint d = d0 + d2;
             if (d < pc.vd) {
                 float acc = 0.0;
@@ -195,8 +195,8 @@ void main() {
         // ── S ← e^{G_{c−1}} S₀ + Σ_j e^{G_{c−1}−G_j} k̂_j ⊗ Δ_j (this block's columns) ──
         float egl = exp(gg[c - 1u]);
         for (uint p = t; p < kd * COLS; p += 256u) {
-            uint kk = p >> 5u;
-            uint d2 = p & 31u;
+            uint kk = p / COLS;
+            uint d2 = p % COLS;
             uint d = d0 + d2;
             if (d < pc.vd) {
                 float acc = egl * state[sbase + kk * pc.vd + d];

@@ -818,16 +818,22 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                 };
                 // Route by launch width. Decode (rows=1) yields only rows*n_head simdgroups —
-                // far too few to occupy the GPU — so it takes the split-KV kernel (8 simdgroups
+                // far too few to occupy the GPU — so it takes a split-KV kernel (NSG simdgroups
                 // per (query, head), merged in threadgroup memory). Prefill has thousands of
                 // (query, head) pairs and keeps the leaner one-simdgroup kernel, whose lack of
-                // threadgroup memory lets more threadgroups run per core.
+                // threadgroup memory lets more threadgroups run per core. Among the split widths:
+                // the kernel is latency-bound on its ~kv_len/NSG serial online-softmax chain, so
+                // longer contexts take the 32-way split when head_dim fits its threadgroup
+                // accumulator (hd <= 128); NSG=8 covers the rest.
                 let split = rows * nh < 128;
-                let kern = match (g.desc(k_cache).dtype, split) {
-                    (DType::F16, false) => "attention_f16kv",
-                    (DType::F16, true) => "attnsplit_f16kv",
-                    (_, false) => "attention_f32",
-                    (_, true) => "attnsplit_f32",
+                let split32 = split && kv_len >= 128 && hd <= 128;
+                let kern = match (g.desc(k_cache).dtype, split, split32) {
+                    (DType::F16, false, _) => "attention_f16kv",
+                    (DType::F16, _, true) => "attnsplit32_f16kv",
+                    (DType::F16, true, false) => "attnsplit_f16kv",
+                    (_, false, _) => "attention_f32",
+                    (_, _, true) => "attnsplit32_f32",
+                    (_, true, false) => "attnsplit_f32",
                 };
                 let pso = self.pipelines.get(kern)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
@@ -838,9 +844,15 @@ impl MetalBackend {
                 p.extend_from_slice(&scale.to_ne_bytes());
                 p.extend_from_slice(&window.to_ne_bytes());
                 p.extend_from_slice(&pos.to_ne_bytes());
-                // One simdgroup per (query, head); split kernel uses NSG=8 simdgroups per pair
-                // (threadgroup = 256 threads), grid still exactly rows*n_head threadgroups.
-                let nsg = if split { 8 } else { 1 };
+                // One simdgroup per (query, head); split kernels use NSG simdgroups per pair,
+                // grid still exactly rows*n_head threadgroups.
+                let nsg = if split32 {
+                    32
+                } else if split {
+                    8
+                } else {
+                    1
+                };
                 self.encode_tg(
                     r,
                     &pso,

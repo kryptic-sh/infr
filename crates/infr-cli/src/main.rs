@@ -933,12 +933,21 @@ fn cmd_bench_qwen35(
     if cpu {
         std::env::set_var("Q35_CPU", "1");
     }
-    // GPU (+ no depth): drive the PRODUCTION batched/chunked seam (`generate_vulkan`) — the same
-    // path `infr run`/`generate_chat` uses — instead of the bespoke per-token forward (which is
-    // ~100x slower at prefill and no longer representative). The seam ingests a text prompt, so
-    // synthesize one near `n_prompt` tokens and report the actual token counts from its stats.
-    if !cpu && depth == 0 && pg.is_none() {
+    // No depth/pg: drive the PRODUCTION path through the SAME `ChatModel` structs `infr run`
+    // builds (Qwen35Chat = the Vulkan seam, CpuQwen35Chat = the seam on the CPU backend), timing
+    // `ChatModel::generate` itself — bench and run share one engine BY CONSTRUCTION, so a
+    // production-path change can never leave the bench measuring a dead path. The seam ingests a
+    // text prompt, so synthesize one near `n_prompt` tokens and report the actual token counts
+    // from its stats. depth/pg still use the bespoke per-token forward below (the seam has no
+    // context-depth warm API yet).
+    if depth == 0 && pg.is_none() {
+        use infr_llama::model::ChatModel;
         std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
+        let mut m: Box<dyn ChatModel> = if cpu {
+            Box::new(infr_llama::model::CpuQwen35Chat::new(gguf.to_path_buf()))
+        } else {
+            Box::new(infr_llama::model::Qwen35Chat::new(gguf.to_path_buf()))
+        };
         let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens
         let prompt = if n_prompt > 0 {
             sentence.repeat(n_prompt.div_ceil(10))
@@ -946,12 +955,12 @@ fn cmd_bench_qwen35(
             sentence.to_string()
         };
         let n = n_gen.max(1);
-        // untimed warmup (pipeline compile)
-        let _ = infr_llama::qwen35::generate_vulkan(gguf, sentence, 1, |_| {})?;
+        // untimed warmup: loads the model once (weights + pipeline compile stay warm across reps)
+        m.generate(sentence, 1, &mut |_| {})?;
         let (mut pps, mut tgs) = (Vec::new(), Vec::new());
         let (mut np, mut ng) = (0usize, 0usize);
         for _ in 0..reps.max(1) {
-            let st = infr_llama::qwen35::generate_vulkan(gguf, &prompt, n, |_| {})?;
+            let st = m.generate(&prompt, n, &mut |_| {})?;
             pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
             tgs.push(st.n_gen as f64 / st.decode_secs.max(1e-9));
             (np, ng) = (st.n_prompt, st.n_gen);

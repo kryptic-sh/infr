@@ -1177,312 +1177,411 @@ pub fn render_chat_messages(path: &std::path::Path, messages: &[(&str, &str)]) -
 
 /// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). `prompt` is
 /// the already-formatted text (see [`render_chat`]); returns timing/counts, text streams via `on_piece`.
-/// Backend-generic Qwen3-Next (qwen35) decode runner: builds the per-token composite [`Graph`]
-/// (gated-DeltaNet + conv1d + attention) and runs it on `be`. `bind_weight` turns each native-dtype
-/// GGUF tensor into a backend buffer (CPU maps it zero-copy from the mmap; Metal uploads it). The
-/// thin [`generate_cpu`] / [`generate_metal`] wrappers pick the backend.
-fn generate_seam(
-    be: &dyn Backend,
-    bind_weight: &dyn Fn(TensorBytes) -> Result<Box<dyn Buffer>>,
-    path: &std::path::Path,
-    prompt: &str,
-    n: usize,
-    mut on_piece: impl FnMut(&str),
-) -> Result<crate::GenStats> {
-    let gg = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
-    let g = &gg;
-    let c = Cfg::from_gguf(g)?;
-    let (token_embd, te_shape) = load_tensor_dequant(g, "token_embd.weight")?;
-    let vocab = te_shape[1];
-    let ne = c.n_embd;
-    let cc = c.conv_channels();
-    let di = c.d_inner;
-    let (nk, kd) = (c.num_k_heads(), c.head_k_dim());
-    let (nv, vd) = (c.num_v_heads(), c.head_v_dim());
-    let key_dim = nk * kd;
-    let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
-    let eps = c.eps;
-    let kk = c.d_conv;
-    let tok = crate::build_tokenizer(g)?;
-    let eos = g
-        .metadata()
-        .u64("tokenizer.ggml.eos_token_id")
-        .map(|x| x as u32);
-    let im_end = tok.token_to_id("<|im_end|>");
-    let enc = tok
-        .encode(prompt, false)
-        .map_err(|e| anyhow!("encode: {e}"))?;
-    let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
-    let max_ctx = prompt_ids.len() + n + 1;
+/// Turns a native-dtype GGUF tensor into a backend weight buffer (upload or zero-copy map).
+pub type BindWeight<'a> = &'a dyn Fn(&dyn Backend, TensorBytes) -> Result<Box<dyn Buffer>>;
 
-    if std::env::var("INFR_Q35_TIMING").is_ok() {
-        eprintln!("[q35dims] ne={ne} nv={nv} nk={nk} kd={kd} vd={vd} cc={cc} di={di} n_layer={} nh={nh} nkv={nkv} hd={hd}", c.n_layer);
-    }
-    let attn = |i: usize| c.is_attn_layer(i);
-    let n_ff_of = |i: usize| -> Result<usize> {
-        Ok(g.tensors()
-            .iter()
-            .find(|t| t.name == format!("blk.{i}.ffn_up.weight"))
-            .context("ffn_up")?
-            .shape[1])
-    };
+/// Load-once Qwen3-Next (qwen35) seam model: a backend + the model's native-dtype weight buffers +
+/// tokenizer/config, constructed ONCE and reused across `generate` calls. This is the SINGLE
+/// generation engine behind `infr run` (via [`crate::model::Qwen35Chat`] /
+/// [`crate::model::CpuQwen35Chat`]) AND `infr bench` — bench times exactly what run executes, so a
+/// production-path change can never silently leave the bench measuring a dead path again. Only the
+/// per-conversation state (conv history, DeltaNet S, KV cache, sized to prompt+n) is allocated per
+/// call.
+pub struct SeamModel {
+    be: Box<dyn Backend>,
+    g: Gguf,
+    c: Cfg,
+    token_embd: Vec<f32>,
+    vocab: usize,
+    tok: tokenizers::Tokenizer,
+    eos: Option<u32>,
+    im_end: Option<u32>,
+    wbufs: Vec<Box<dyn Buffer>>,
+    wspecs: Vec<(DType, usize)>,
+}
 
-    // ── upload weights in native GGUF dtype (the backend dequants on read). Order MUST equal the
-    //    `wpush` order in `build`. ──────────────────────────────────────────────────────────────────
-    let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
-    let mut wspecs: Vec<(DType, usize)> = Vec::new();
-    let mut wraw = |name: &str| -> Result<()> {
-        let info = g
-            .tensors()
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| anyhow!("tensor not found: {name}"))?
-            .clone();
-        let numel: usize = info.shape.iter().product();
-        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-        wbufs.push(bind_weight(tb)?);
-        wspecs.push((info.dtype, numel));
-        Ok(())
-    };
-    for i in 0..c.n_layer {
-        let p = |s: &str| format!("blk.{i}.{s}");
-        if attn(i) {
-            for nm in [
-                "attn_norm.weight",
-                "attn_q.weight",
-                "attn_k.weight",
-                "attn_v.weight",
-                "attn_q_norm.weight",
-                "attn_k_norm.weight",
-                "attn_output.weight",
-                "post_attention_norm.weight",
-                "ffn_gate.weight",
-                "ffn_up.weight",
-                "ffn_down.weight",
-            ] {
-                wraw(&p(nm))?;
-            }
-        } else {
-            for nm in [
-                "attn_norm.weight",
-                "attn_qkv.weight",
-                "attn_gate.weight",
-                "ssm_conv1d.weight",
-                "ssm_alpha.weight",
-                "ssm_beta.weight",
-                "ssm_a",
-                "ssm_dt.bias",
-                "ssm_norm.weight",
-                "ssm_out.weight",
-                "post_attention_norm.weight",
-                "ffn_gate.weight",
-                "ffn_up.weight",
-                "ffn_down.weight",
-            ] {
-                wraw(&p(nm))?;
-            }
-        }
-    }
-    wraw("output_norm.weight")?;
-    // lm_head: `output.weight`, or (tied) the quantized `token_embd.weight` mapped zero-copy and
-    // dequantized per-row by `Op::Linear`.
-    if g.tensors().iter().any(|t| t.name == "output.weight") {
-        wraw("output.weight")?;
-    } else {
-        wraw("token_embd.weight")?;
-    }
-
-    // ── persistent state buffers, one set per layer by kind ──────────────────────
-    // The recurrence REQUIRES these start at zero (conv history, DeltaNet S, KV cache). `be.alloc`
-    // returns uninitialized memory on the GPU backends (only the CPU's Vec happens to be zeroed), so
-    // zero them explicitly via an upload — else the first token attends/accumulates garbage state.
-    let zalloc = |n: usize| -> Result<Box<dyn Buffer>> {
-        let buf = be
-            .alloc(n * 4, BufferUsage::Activations)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(buf.as_ref(), bytemuck::cast_slice(&vec![0f32; n]))
-            .map_err(|e| anyhow!("{e}"))?;
-        Ok(buf)
-    };
-    let mut conv_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
-    let mut s_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
-    let mut k_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
-    let mut v_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
-    for i in 0..c.n_layer {
-        if attn(i) {
-            k_bufs.push(Some(zalloc(max_ctx * nkv * hd)?));
-            v_bufs.push(Some(zalloc(max_ctx * nkv * hd)?));
-            conv_bufs.push(None);
-            s_bufs.push(None);
-        } else {
-            conv_bufs.push(Some(zalloc((kk - 1) * cc)?));
-            s_bufs.push(Some(zalloc(nv * kd * vd)?));
-            k_bufs.push(None);
-            v_bufs.push(None);
-        }
-    }
-
-    // ── per-step IO ───────────────────────────────────────────────────────────────
-    // Prompt tokens are ingested in chunks of up to CHUNK through ONE graph build each (instead of
-    // one build per token); the recurrent conv/DeltaNet ops scan the chunk internally and the KV
-    // cache is written for the whole chunk. Decode then runs one token (rows=1) at a time. The
-    // hidden/pos input buffers are allocated per call sized to the chunk (the CPU backend writes
-    // F32 inputs back, so their length must match the graph input exactly).
-    // 512 beats 128 by ~27% end-to-end: the recurrent scans (DeltaNet/conv1d) cost the same total
-    // either way, but bigger chunks give the GEMMs more row-tiles (occupancy) and amortize the
-    // per-chunk build+compile+submit. INFR_Q35_CHUNK overrides for experiments.
-    let chunk: usize = std::env::var("INFR_Q35_CHUNK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&c: &usize| c > 0)
-        .unwrap_or(512);
-    let logits_buf = be
-        .alloc(vocab * 4, BufferUsage::Readback)
-        .map_err(|e| anyhow!("{e}"))?;
-
-    let f32d = |x: usize| TensorDesc::new(vec![x], DType::F32);
-    let scale = 1.0 / (hd as f32).sqrt();
-
-    // Build the graph that ingests `rows` tokens starting at absolute position `pos`
-    // (kv_len = pos+rows). rows=1 is one decode token; rows>1 is a prefill chunk. Only the LAST
-    // row's logits are produced (the next-token prediction).
-    let build = |pos: usize,
-                 rows: usize|
-     -> Result<(Graph, TensorId, TensorId, Vec<TensorId>, TensorId)> {
-        let mut gr = Graph::new();
-        let hidden = gr.input(f32d(rows * ne));
-        let positions = gr.input(TensorDesc::new(vec![rows], DType::I32));
-        // weights in upload order
-        let mut weights: Vec<TensorId> = Vec::new();
-        let mut wi = 0usize;
-        let mut wpush = |gr: &mut Graph, weights: &mut Vec<TensorId>| -> TensorId {
-            let (dt, num) = wspecs[wi];
-            wi += 1;
-            let id = gr.weight(TensorDesc::new(vec![num], dt));
-            weights.push(id);
-            id
+impl SeamModel {
+    /// Open the GGUF and upload every weight tensor in its native dtype through `bind_weight`
+    /// (Vulkan/Metal: alloc+upload; CPU: zero-copy mmap). The upload order MUST equal the `wpush`
+    /// order in the graph build.
+    pub fn load(
+        be: Box<dyn Backend>,
+        bind_weight: BindWeight,
+        path: &std::path::Path,
+    ) -> Result<Self> {
+        let gg = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
+        let g = &gg;
+        let c = Cfg::from_gguf(g)?;
+        let (token_embd, te_shape) = load_tensor_dequant(g, "token_embd.weight")?;
+        let vocab = te_shape[1];
+        let tok = crate::build_tokenizer(g)?;
+        let eos = g
+            .metadata()
+            .u64("tokenizer.ggml.eos_token_id")
+            .map(|x| x as u32);
+        let im_end = tok.token_to_id("<|im_end|>");
+        let attn = |i: usize| c.is_attn_layer(i);
+        // ── upload weights in native GGUF dtype (the backend dequants on read). Order MUST equal the
+        //    `wpush` order in `build`. ──────────────────────────────────────────────────────────────────
+        let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut wspecs: Vec<(DType, usize)> = Vec::new();
+        let mut wraw = |name: &str| -> Result<()> {
+            let info = g
+                .tensors()
+                .iter()
+                .find(|t| t.name == name)
+                .ok_or_else(|| anyhow!("tensor not found: {name}"))?
+                .clone();
+            let numel: usize = info.shape.iter().product();
+            let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+            wbufs.push(bind_weight(be.as_ref(), tb)?);
+            wspecs.push((info.dtype, numel));
+            Ok(())
         };
-        let mut layers: Vec<Q35LayerH> = Vec::new();
+        for i in 0..c.n_layer {
+            let p = |s: &str| format!("blk.{i}.{s}");
+            if attn(i) {
+                for nm in [
+                    "attn_norm.weight",
+                    "attn_q.weight",
+                    "attn_k.weight",
+                    "attn_v.weight",
+                    "attn_q_norm.weight",
+                    "attn_k_norm.weight",
+                    "attn_output.weight",
+                    "post_attention_norm.weight",
+                    "ffn_gate.weight",
+                    "ffn_up.weight",
+                    "ffn_down.weight",
+                ] {
+                    wraw(&p(nm))?;
+                }
+            } else {
+                for nm in [
+                    "attn_norm.weight",
+                    "attn_qkv.weight",
+                    "attn_gate.weight",
+                    "ssm_conv1d.weight",
+                    "ssm_alpha.weight",
+                    "ssm_beta.weight",
+                    "ssm_a",
+                    "ssm_dt.bias",
+                    "ssm_norm.weight",
+                    "ssm_out.weight",
+                    "post_attention_norm.weight",
+                    "ffn_gate.weight",
+                    "ffn_up.weight",
+                    "ffn_down.weight",
+                ] {
+                    wraw(&p(nm))?;
+                }
+            }
+        }
+        wraw("output_norm.weight")?;
+        // lm_head: `output.weight`, or (tied) the quantized `token_embd.weight` mapped zero-copy and
+        // dequantized per-row by `Op::Linear`.
+        if g.tensors().iter().any(|t| t.name == "output.weight") {
+            wraw("output.weight")?;
+        } else {
+            wraw("token_embd.weight")?;
+        }
+
+        Ok(SeamModel {
+            be,
+            g: gg,
+            c,
+            token_embd,
+            vocab,
+            tok,
+            eos,
+            im_end,
+            wbufs,
+            wspecs,
+        })
+    }
+
+    /// Vulkan (the production GPU path): weights uploaded raw to VRAM, dequantized in-kernel.
+    pub fn load_vulkan(path: &std::path::Path) -> Result<Self> {
+        let be = VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        Self::load(
+            Box::new(be),
+            &|be, tb| {
+                let buf = be
+                    .alloc(tb.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+                Ok(buf)
+            },
+            path,
+        )
+    }
+
+    /// CPU reference backend: weights mapped zero-copy from the GGUF mmap.
+    pub fn load_cpu(path: &std::path::Path) -> Result<Self> {
+        Self::load(
+            Box::new(CpuBackend::new()),
+            &|_, tb| Ok(CpuBackend::new().map_weight(tb)),
+            path,
+        )
+    }
+
+    /// Reference Metal backend (Apple GPU).
+    #[cfg(target_os = "macos")]
+    pub fn load_metal(path: &std::path::Path) -> Result<Self> {
+        let be = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+        Self::load(
+            Box::new(be),
+            &|be, tb| {
+                let buf = be
+                    .alloc(tb.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+                Ok(buf)
+            },
+            path,
+        )
+    }
+
+    /// Generate a completion for the already-rendered `prompt` on the loaded model: batched/chunked
+    /// prefill + per-token decode (greedy), streaming text to `on_piece`. Per-conversation state is
+    /// allocated fresh (sized to prompt+n).
+    pub fn generate(
+        &self,
+        prompt: &str,
+        n: usize,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let be = self.be.as_ref();
+        let g = &self.g;
+        let c = &self.c;
+        let token_embd = &self.token_embd;
+        let vocab = self.vocab;
+        let tok = &self.tok;
+        let (eos, im_end) = (self.eos, self.im_end);
+        let wspecs = &self.wspecs;
+        let wbufs = &self.wbufs;
+        let ne = c.n_embd;
+        let cc = c.conv_channels();
+        let di = c.d_inner;
+        let (nk, kd) = (c.num_k_heads(), c.head_k_dim());
+        let (nv, vd) = (c.num_v_heads(), c.head_v_dim());
+        let key_dim = nk * kd;
+        let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
+        let eps = c.eps;
+        let kk = c.d_conv;
+        let enc = tok
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
+        let max_ctx = prompt_ids.len() + n + 1;
+
+        if std::env::var("INFR_Q35_TIMING").is_ok() {
+            eprintln!("[q35dims] ne={ne} nv={nv} nk={nk} kd={kd} vd={vd} cc={cc} di={di} n_layer={} nh={nh} nkv={nkv} hd={hd}", c.n_layer);
+        }
+        let attn = |i: usize| c.is_attn_layer(i);
+        let n_ff_of = |i: usize| -> Result<usize> {
+            Ok(g.tensors()
+                .iter()
+                .find(|t| t.name == format!("blk.{i}.ffn_up.weight"))
+                .context("ffn_up")?
+                .shape[1])
+        };
+
+        // ── persistent state buffers, one set per layer by kind ──────────────────────
+        // The recurrence REQUIRES these start at zero (conv history, DeltaNet S, KV cache). `be.alloc`
+        // returns uninitialized memory on the GPU backends (only the CPU's Vec happens to be zeroed), so
+        // zero them explicitly via an upload — else the first token attends/accumulates garbage state.
+        let zalloc = |n: usize| -> Result<Box<dyn Buffer>> {
+            let buf = be
+                .alloc(n * 4, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(buf.as_ref(), bytemuck::cast_slice(&vec![0f32; n]))
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(buf)
+        };
+        let mut conv_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+        let mut s_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+        let mut k_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+        let mut v_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
         for i in 0..c.n_layer {
             if attn(i) {
-                let attn_norm = wpush(&mut gr, &mut weights);
-                let q = wpush(&mut gr, &mut weights);
-                let k = wpush(&mut gr, &mut weights);
-                let v = wpush(&mut gr, &mut weights);
-                let q_norm = wpush(&mut gr, &mut weights);
-                let k_norm = wpush(&mut gr, &mut weights);
-                let out = wpush(&mut gr, &mut weights);
-                let post_norm = wpush(&mut gr, &mut weights);
-                let ffn_gate = wpush(&mut gr, &mut weights);
-                let ffn_up = wpush(&mut gr, &mut weights);
-                let ffn_down = wpush(&mut gr, &mut weights);
-                let k_cache = gr.input(f32d(max_ctx * nkv * hd));
-                let v_cache = gr.input(f32d(max_ctx * nkv * hd));
-                layers.push(Q35LayerH::Attn(Q35AttnH {
-                    attn_norm,
-                    q,
-                    k,
-                    v,
-                    q_norm,
-                    k_norm,
-                    out,
-                    post_norm,
-                    ffn_gate,
-                    ffn_up,
-                    ffn_down,
-                    n_ff: n_ff_of(i)?,
-                    k_cache,
-                    v_cache,
-                }));
+                k_bufs.push(Some(zalloc(max_ctx * nkv * hd)?));
+                v_bufs.push(Some(zalloc(max_ctx * nkv * hd)?));
+                conv_bufs.push(None);
+                s_bufs.push(None);
             } else {
-                let attn_norm = wpush(&mut gr, &mut weights);
-                let qkv = wpush(&mut gr, &mut weights);
-                let gate = wpush(&mut gr, &mut weights);
-                let conv1d = wpush(&mut gr, &mut weights);
-                let alpha = wpush(&mut gr, &mut weights);
-                let beta = wpush(&mut gr, &mut weights);
-                let ssm_a = wpush(&mut gr, &mut weights);
-                let dt_bias = wpush(&mut gr, &mut weights);
-                let ssm_norm = wpush(&mut gr, &mut weights);
-                let out = wpush(&mut gr, &mut weights);
-                let post_norm = wpush(&mut gr, &mut weights);
-                let ffn_gate = wpush(&mut gr, &mut weights);
-                let ffn_up = wpush(&mut gr, &mut weights);
-                let ffn_down = wpush(&mut gr, &mut weights);
-                let conv_state = gr.input(f32d((kk - 1) * cc));
-                let s_state = gr.input(f32d(nv * kd * vd));
-                layers.push(Q35LayerH::Lin(Q35LinH {
-                    attn_norm,
-                    qkv,
-                    gate,
-                    conv1d,
-                    alpha,
-                    beta,
-                    ssm_a,
-                    dt_bias,
-                    ssm_norm,
-                    out,
-                    post_norm,
-                    ffn_gate,
-                    ffn_up,
-                    ffn_down,
-                    n_ff: n_ff_of(i)?,
-                    conv_state,
-                    s_state,
-                }));
+                conv_bufs.push(Some(zalloc((kk - 1) * cc)?));
+                s_bufs.push(Some(zalloc(nv * kd * vd)?));
+                k_bufs.push(None);
+                v_bufs.push(None);
             }
         }
-        let w_out_norm = wpush(&mut gr, &mut weights);
-        let w_lm = wpush(&mut gr, &mut weights);
-        let logits = gr.output(f32d(vocab));
 
-        // scratch — every activation buffer holds the whole `rows`-token chunk.
-        let xn = gr.internal(f32d(rows * ne));
-        let hn = gr.internal(f32d(rows * ne));
-        let sub = gr.internal(f32d(rows * ne));
-        let max_ff = (0..c.n_layer)
-            .map(|i| n_ff_of(i).unwrap_or(0))
-            .max()
-            .unwrap_or(0);
-        let gbuf = gr.internal(f32d(rows * max_ff));
-        let ubuf = gr.internal(f32d(rows * max_ff));
-        let actbuf = gr.internal(f32d(rows * max_ff));
-        // linear-mixer scratch
-        let qkvbuf = gr.internal(f32d(rows * cc));
-        let zbuf = gr.internal(f32d(rows * di));
-        let convout = gr.internal(f32d(rows * cc));
-        let qbuf = gr.internal(f32d(rows * key_dim));
-        let kbuf = gr.internal(f32d(rows * key_dim));
-        let vbuf = gr.internal(f32d(rows * nv * vd));
-        let bbuf = gr.internal(f32d(rows * nv));
-        let abuf = gr.internal(f32d(rows * nv));
-        let dnout = gr.internal(f32d(rows * nv * vd));
-        // attn scratch
-        let qg = gr.internal(f32d(rows * nh * 2 * hd));
-        let qa = gr.internal(f32d(rows * nh * hd));
-        let gate_a = gr.internal(f32d(rows * nh * hd));
-        let ka = gr.internal(f32d(rows * nkv * hd));
-        // K-norm output MUST be a dedicated F16 scratch so the Vulkan `kv_write_peephole` fuses the
-        // QkNormRope+WriteKv into a direct-to-cache write (the peephole only fires on an F16 Internal
-        // dst). Reusing the F32 `ka` here would make QkNormRope write f16 into an f32 buffer with NO
-        // fusion, so the following WriteKv's `store_f16` reads those f16 bytes AS f32 → garbage cache.
-        let k16 = gr.internal(TensorDesc::new(vec![rows * nkv * hd], DType::F16));
-        let va = gr.internal(f32d(rows * nkv * hd));
-        let attno = gr.internal(f32d(rows * nh * hd));
+        // ── per-step IO ───────────────────────────────────────────────────────────────
+        // Prompt tokens are ingested in chunks of up to CHUNK through ONE graph build each (instead of
+        // one build per token); the recurrent conv/DeltaNet ops scan the chunk internally and the KV
+        // cache is written for the whole chunk. Decode then runs one token (rows=1) at a time. The
+        // hidden/pos input buffers are allocated per call sized to the chunk (the CPU backend writes
+        // F32 inputs back, so their length must match the graph input exactly).
+        // 512 beats 128 by ~27% end-to-end: the recurrent scans (DeltaNet/conv1d) cost the same total
+        // either way, but bigger chunks give the GEMMs more row-tiles (occupancy) and amortize the
+        // per-chunk build+compile+submit. INFR_Q35_CHUNK overrides for experiments.
+        let chunk: usize = std::env::var("INFR_Q35_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&c: &usize| c > 0)
+            .unwrap_or(512);
+        let logits_buf = be
+            .alloc(vocab * 4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
 
-        // rmsn/lin run over the whole `rows`-token chunk (RmsNorm.rows / Linear.m = rows).
-        let rmsn = |gr: &mut Graph, x: TensorId, w: TensorId, dst: TensorId| {
-            gr.push(Op::RmsNorm {
-                x,
-                weight: w,
-                dst,
-                rows: rows as u32,
-                dim: ne as u32,
-                eps,
-            });
-        };
-        let lin =
-            |gr: &mut Graph, x: TensorId, w: TensorId, dst: TensorId, inf: usize, outf: usize| {
+        let f32d = |x: usize| TensorDesc::new(vec![x], DType::F32);
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        // Build the graph that ingests `rows` tokens starting at absolute position `pos`
+        // (kv_len = pos+rows). rows=1 is one decode token; rows>1 is a prefill chunk. Only the LAST
+        // row's logits are produced (the next-token prediction).
+        let build = |pos: usize,
+                     rows: usize|
+         -> Result<(Graph, TensorId, TensorId, Vec<TensorId>, TensorId)> {
+            let mut gr = Graph::new();
+            let hidden = gr.input(f32d(rows * ne));
+            let positions = gr.input(TensorDesc::new(vec![rows], DType::I32));
+            // weights in upload order
+            let mut weights: Vec<TensorId> = Vec::new();
+            let mut wi = 0usize;
+            let mut wpush = |gr: &mut Graph, weights: &mut Vec<TensorId>| -> TensorId {
+                let (dt, num) = wspecs[wi];
+                wi += 1;
+                let id = gr.weight(TensorDesc::new(vec![num], dt));
+                weights.push(id);
+                id
+            };
+            let mut layers: Vec<Q35LayerH> = Vec::new();
+            for i in 0..c.n_layer {
+                if attn(i) {
+                    let attn_norm = wpush(&mut gr, &mut weights);
+                    let q = wpush(&mut gr, &mut weights);
+                    let k = wpush(&mut gr, &mut weights);
+                    let v = wpush(&mut gr, &mut weights);
+                    let q_norm = wpush(&mut gr, &mut weights);
+                    let k_norm = wpush(&mut gr, &mut weights);
+                    let out = wpush(&mut gr, &mut weights);
+                    let post_norm = wpush(&mut gr, &mut weights);
+                    let ffn_gate = wpush(&mut gr, &mut weights);
+                    let ffn_up = wpush(&mut gr, &mut weights);
+                    let ffn_down = wpush(&mut gr, &mut weights);
+                    let k_cache = gr.input(f32d(max_ctx * nkv * hd));
+                    let v_cache = gr.input(f32d(max_ctx * nkv * hd));
+                    layers.push(Q35LayerH::Attn(Q35AttnH {
+                        attn_norm,
+                        q,
+                        k,
+                        v,
+                        q_norm,
+                        k_norm,
+                        out,
+                        post_norm,
+                        ffn_gate,
+                        ffn_up,
+                        ffn_down,
+                        n_ff: n_ff_of(i)?,
+                        k_cache,
+                        v_cache,
+                    }));
+                } else {
+                    let attn_norm = wpush(&mut gr, &mut weights);
+                    let qkv = wpush(&mut gr, &mut weights);
+                    let gate = wpush(&mut gr, &mut weights);
+                    let conv1d = wpush(&mut gr, &mut weights);
+                    let alpha = wpush(&mut gr, &mut weights);
+                    let beta = wpush(&mut gr, &mut weights);
+                    let ssm_a = wpush(&mut gr, &mut weights);
+                    let dt_bias = wpush(&mut gr, &mut weights);
+                    let ssm_norm = wpush(&mut gr, &mut weights);
+                    let out = wpush(&mut gr, &mut weights);
+                    let post_norm = wpush(&mut gr, &mut weights);
+                    let ffn_gate = wpush(&mut gr, &mut weights);
+                    let ffn_up = wpush(&mut gr, &mut weights);
+                    let ffn_down = wpush(&mut gr, &mut weights);
+                    let conv_state = gr.input(f32d((kk - 1) * cc));
+                    let s_state = gr.input(f32d(nv * kd * vd));
+                    layers.push(Q35LayerH::Lin(Q35LinH {
+                        attn_norm,
+                        qkv,
+                        gate,
+                        conv1d,
+                        alpha,
+                        beta,
+                        ssm_a,
+                        dt_bias,
+                        ssm_norm,
+                        out,
+                        post_norm,
+                        ffn_gate,
+                        ffn_up,
+                        ffn_down,
+                        n_ff: n_ff_of(i)?,
+                        conv_state,
+                        s_state,
+                    }));
+                }
+            }
+            let w_out_norm = wpush(&mut gr, &mut weights);
+            let w_lm = wpush(&mut gr, &mut weights);
+            let logits = gr.output(f32d(vocab));
+
+            // scratch — every activation buffer holds the whole `rows`-token chunk.
+            let xn = gr.internal(f32d(rows * ne));
+            let hn = gr.internal(f32d(rows * ne));
+            let sub = gr.internal(f32d(rows * ne));
+            let max_ff = (0..c.n_layer)
+                .map(|i| n_ff_of(i).unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            let gbuf = gr.internal(f32d(rows * max_ff));
+            let ubuf = gr.internal(f32d(rows * max_ff));
+            let actbuf = gr.internal(f32d(rows * max_ff));
+            // linear-mixer scratch
+            let qkvbuf = gr.internal(f32d(rows * cc));
+            let zbuf = gr.internal(f32d(rows * di));
+            let convout = gr.internal(f32d(rows * cc));
+            let qbuf = gr.internal(f32d(rows * key_dim));
+            let kbuf = gr.internal(f32d(rows * key_dim));
+            let vbuf = gr.internal(f32d(rows * nv * vd));
+            let bbuf = gr.internal(f32d(rows * nv));
+            let abuf = gr.internal(f32d(rows * nv));
+            let dnout = gr.internal(f32d(rows * nv * vd));
+            // attn scratch
+            let qg = gr.internal(f32d(rows * nh * 2 * hd));
+            let qa = gr.internal(f32d(rows * nh * hd));
+            let gate_a = gr.internal(f32d(rows * nh * hd));
+            let ka = gr.internal(f32d(rows * nkv * hd));
+            // K-norm output MUST be a dedicated F16 scratch so the Vulkan `kv_write_peephole` fuses the
+            // QkNormRope+WriteKv into a direct-to-cache write (the peephole only fires on an F16 Internal
+            // dst). Reusing the F32 `ka` here would make QkNormRope write f16 into an f32 buffer with NO
+            // fusion, so the following WriteKv's `store_f16` reads those f16 bytes AS f32 → garbage cache.
+            let k16 = gr.internal(TensorDesc::new(vec![rows * nkv * hd], DType::F16));
+            let va = gr.internal(f32d(rows * nkv * hd));
+            let attno = gr.internal(f32d(rows * nh * hd));
+
+            // rmsn/lin run over the whole `rows`-token chunk (RmsNorm.rows / Linear.m = rows).
+            let rmsn = |gr: &mut Graph, x: TensorId, w: TensorId, dst: TensorId| {
+                gr.push(Op::RmsNorm {
+                    x,
+                    weight: w,
+                    dst,
+                    rows: rows as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+            };
+            let lin = |gr: &mut Graph,
+                       x: TensorId,
+                       w: TensorId,
+                       dst: TensorId,
+                       inf: usize,
+                       outf: usize| {
                 gr.push(Op::Linear {
                     x,
                     weight: w,
@@ -1493,414 +1592,415 @@ fn generate_seam(
                 });
             };
 
-        let __maxl = std::env::var("INFR_Q35_MAXLAYERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(usize::MAX);
-        for (li, lh) in layers.iter().enumerate() {
-            if li >= __maxl {
-                break;
-            }
-            match lh {
-                Q35LayerH::Lin(w) => {
-                    rmsn(&mut gr, hidden, w.attn_norm, xn);
-                    lin(&mut gr, xn, w.qkv, qkvbuf, ne, cc);
-                    lin(&mut gr, xn, w.gate, zbuf, ne, di);
-                    gr.push(Op::Conv1dSilu {
-                        x: qkvbuf,
-                        weight: w.conv1d,
-                        state: w.conv_state,
-                        dst: convout,
-                        rows: rows as u32,
-                        channels: cc as u32,
-                        kernel: kk as u32,
-                    });
-                    // split conv_out [rows, cc=q|k|v] → packed [rows, *] q / k / v (strided per token).
-                    gr.push(Op::CopyStrided {
-                        src: convout,
-                        src_off: 0,
-                        src_stride: cc as u32,
-                        dst: qbuf,
-                        dst_off: 0,
-                        dst_stride: key_dim as u32,
-                        rows: rows as u32,
-                        n: key_dim as u32,
-                    });
-                    gr.push(Op::CopyStrided {
-                        src: convout,
-                        src_off: key_dim as u32,
-                        src_stride: cc as u32,
-                        dst: kbuf,
-                        dst_off: 0,
-                        dst_stride: key_dim as u32,
-                        rows: rows as u32,
-                        n: key_dim as u32,
-                    });
-                    gr.push(Op::CopyStrided {
-                        src: convout,
-                        src_off: 2 * key_dim as u32,
-                        src_stride: cc as u32,
-                        dst: vbuf,
-                        dst_off: 0,
-                        dst_stride: (nv * vd) as u32,
-                        rows: rows as u32,
-                        n: (nv * vd) as u32,
-                    });
-                    lin(&mut gr, xn, w.beta, bbuf, ne, nv);
-                    lin(&mut gr, xn, w.alpha, abuf, ne, nv);
-                    gr.push(Op::DeltaNet {
-                        q: qbuf,
-                        k: kbuf,
-                        v: vbuf,
-                        b: bbuf,
-                        a: abuf,
-                        a_coef: w.ssm_a,
-                        dt_bias: w.dt_bias,
-                        state: w.s_state,
-                        dst: dnout,
-                        rows: rows as u32,
-                        n_vhead: nv as u32,
-                        n_khead: nk as u32,
-                        head_k: kd as u32,
-                        head_v: vd as u32,
-                        eps: 1e-6,
-                    });
-                    // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z)
-                    gr.push(Op::QkNorm {
-                        x: dnout,
-                        weight: w.ssm_norm,
-                        dst: dnout,
-                        rows: rows as u32,
-                        n_head: nv as u32,
-                        head_dim: vd as u32,
-                        eps,
-                    });
-                    gr.push(Op::GatedAct {
-                        gate: zbuf,
-                        up: dnout,
-                        dst: dnout,
-                        rows: rows as u32,
-                        nff: (nv * vd) as u32,
-                        act: Activation::Silu,
-                        up_off: 0,
-                    });
-                    lin(&mut gr, dnout, w.out, sub, di, ne);
-                    gr.push(Op::Add {
-                        a: hidden,
-                        b: sub,
-                        dst: hidden,
-                        n: (rows * ne) as u32,
-                    });
-                    // FFN
-                    rmsn(&mut gr, hidden, w.post_norm, hn);
-                    lin(&mut gr, hn, w.ffn_gate, gbuf, ne, w.n_ff);
-                    lin(&mut gr, hn, w.ffn_up, ubuf, ne, w.n_ff);
-                    gr.push(Op::GatedAct {
-                        gate: gbuf,
-                        up: ubuf,
-                        dst: actbuf,
-                        rows: rows as u32,
-                        nff: w.n_ff as u32,
-                        act: Activation::Silu,
-                        up_off: 0,
-                    });
-                    lin(&mut gr, actbuf, w.ffn_down, sub, w.n_ff, ne);
-                    gr.push(Op::Add {
-                        a: hidden,
-                        b: sub,
-                        dst: hidden,
-                        n: (rows * ne) as u32,
-                    });
+            let __maxl = std::env::var("INFR_Q35_MAXLAYERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(usize::MAX);
+            for (li, lh) in layers.iter().enumerate() {
+                if li >= __maxl {
+                    break;
                 }
-                Q35LayerH::Attn(w) => {
-                    rmsn(&mut gr, hidden, w.attn_norm, xn);
-                    // q proj outputs q+gate interleaved per head [h: q(hd), gate(hd)].
-                    lin(&mut gr, xn, w.q, qg, ne, nh * 2 * hd);
-                    // split interleaved per-head [q(hd) | gate(hd)] → packed qa / gate_a (strided).
-                    for h in 0..nh {
-                        gr.push(Op::CopyStrided {
-                            src: qg,
-                            src_off: (h * 2 * hd) as u32,
-                            src_stride: (nh * 2 * hd) as u32,
-                            dst: qa,
-                            dst_off: (h * hd) as u32,
-                            dst_stride: (nh * hd) as u32,
+                match lh {
+                    Q35LayerH::Lin(w) => {
+                        rmsn(&mut gr, hidden, w.attn_norm, xn);
+                        lin(&mut gr, xn, w.qkv, qkvbuf, ne, cc);
+                        lin(&mut gr, xn, w.gate, zbuf, ne, di);
+                        gr.push(Op::Conv1dSilu {
+                            x: qkvbuf,
+                            weight: w.conv1d,
+                            state: w.conv_state,
+                            dst: convout,
                             rows: rows as u32,
-                            n: hd as u32,
+                            channels: cc as u32,
+                            kernel: kk as u32,
+                        });
+                        // split conv_out [rows, cc=q|k|v] → packed [rows, *] q / k / v (strided per token).
+                        gr.push(Op::CopyStrided {
+                            src: convout,
+                            src_off: 0,
+                            src_stride: cc as u32,
+                            dst: qbuf,
+                            dst_off: 0,
+                            dst_stride: key_dim as u32,
+                            rows: rows as u32,
+                            n: key_dim as u32,
                         });
                         gr.push(Op::CopyStrided {
-                            src: qg,
-                            src_off: (h * 2 * hd + hd) as u32,
-                            src_stride: (nh * 2 * hd) as u32,
-                            dst: gate_a,
-                            dst_off: (h * hd) as u32,
-                            dst_stride: (nh * hd) as u32,
+                            src: convout,
+                            src_off: key_dim as u32,
+                            src_stride: cc as u32,
+                            dst: kbuf,
+                            dst_off: 0,
+                            dst_stride: key_dim as u32,
                             rows: rows as u32,
-                            n: hd as u32,
+                            n: key_dim as u32,
+                        });
+                        gr.push(Op::CopyStrided {
+                            src: convout,
+                            src_off: 2 * key_dim as u32,
+                            src_stride: cc as u32,
+                            dst: vbuf,
+                            dst_off: 0,
+                            dst_stride: (nv * vd) as u32,
+                            rows: rows as u32,
+                            n: (nv * vd) as u32,
+                        });
+                        lin(&mut gr, xn, w.beta, bbuf, ne, nv);
+                        lin(&mut gr, xn, w.alpha, abuf, ne, nv);
+                        gr.push(Op::DeltaNet {
+                            q: qbuf,
+                            k: kbuf,
+                            v: vbuf,
+                            b: bbuf,
+                            a: abuf,
+                            a_coef: w.ssm_a,
+                            dt_bias: w.dt_bias,
+                            state: w.s_state,
+                            dst: dnout,
+                            rows: rows as u32,
+                            n_vhead: nv as u32,
+                            n_khead: nk as u32,
+                            head_k: kd as u32,
+                            head_v: vd as u32,
+                            eps: 1e-6,
+                        });
+                        // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z)
+                        gr.push(Op::QkNorm {
+                            x: dnout,
+                            weight: w.ssm_norm,
+                            dst: dnout,
+                            rows: rows as u32,
+                            n_head: nv as u32,
+                            head_dim: vd as u32,
+                            eps,
+                        });
+                        gr.push(Op::GatedAct {
+                            gate: zbuf,
+                            up: dnout,
+                            dst: dnout,
+                            rows: rows as u32,
+                            nff: (nv * vd) as u32,
+                            act: Activation::Silu,
+                            up_off: 0,
+                        });
+                        lin(&mut gr, dnout, w.out, sub, di, ne);
+                        gr.push(Op::Add {
+                            a: hidden,
+                            b: sub,
+                            dst: hidden,
+                            n: (rows * ne) as u32,
+                        });
+                        // FFN
+                        rmsn(&mut gr, hidden, w.post_norm, hn);
+                        lin(&mut gr, hn, w.ffn_gate, gbuf, ne, w.n_ff);
+                        lin(&mut gr, hn, w.ffn_up, ubuf, ne, w.n_ff);
+                        gr.push(Op::GatedAct {
+                            gate: gbuf,
+                            up: ubuf,
+                            dst: actbuf,
+                            rows: rows as u32,
+                            nff: w.n_ff as u32,
+                            act: Activation::Silu,
+                            up_off: 0,
+                        });
+                        lin(&mut gr, actbuf, w.ffn_down, sub, w.n_ff, ne);
+                        gr.push(Op::Add {
+                            a: hidden,
+                            b: sub,
+                            dst: hidden,
+                            n: (rows * ne) as u32,
                         });
                     }
-                    lin(&mut gr, xn, w.k, ka, ne, nkv * hd);
-                    lin(&mut gr, xn, w.v, va, ne, nkv * hd);
-                    // per-head q/k norm + RoPE — fused (qwen35 always has q/k-norm).
-                    gr.push(Op::QkNormRope {
-                        x: qa,
-                        weight: w.q_norm,
-                        positions,
-                        dst: qa,
-                        rows: rows as u32,
-                        n_head: nh as u32,
-                        head_dim: hd as u32,
-                        rope_dim: c.rope_dim as u32,
-                        theta: c.rope_theta,
-                        eps,
-                        freq_factors: None,
-                    });
-                    gr.push(Op::QkNormRope {
-                        x: ka,
-                        weight: w.k_norm,
-                        positions,
-                        dst: k16, // F16 scratch → peephole fuses this + the WriteKv below into a
-                        // single direct-to-cache qk-norm+rope (see the k16 decl).
-                        rows: rows as u32,
-                        n_head: nkv as u32,
-                        head_dim: hd as u32,
-                        rope_dim: c.rope_dim as u32,
-                        theta: c.rope_theta,
-                        eps,
-                        freq_factors: None,
-                    });
-                    gr.push(Op::WriteKv {
-                        src: k16,
-                        cache: w.k_cache,
-                        rows: rows as u32,
-                        row_stride: (nkv * hd) as u32,
-                        pos: pos as u32,
-                    });
-                    gr.push(Op::WriteKv {
-                        src: va,
-                        cache: w.v_cache,
-                        rows: rows as u32,
-                        row_stride: (nkv * hd) as u32,
-                        pos: pos as u32,
-                    });
-                    gr.push(Op::Attention {
-                        q: qa,
-                        k_cache: w.k_cache,
-                        v_cache: w.v_cache,
-                        dst: attno,
-                        rows: rows as u32,
-                        kv_len: (pos + rows) as u32,
-                        n_head: nh as u32,
-                        n_kv: nkv as u32,
-                        head_dim: hd as u32,
-                        scale,
-                        mask: AttnMask::Causal,
-                        pos: pos as u32,
-                    });
-                    // per-head sigmoid output gate
-                    gr.push(Op::GatedAct {
-                        gate: gate_a,
-                        up: attno,
-                        dst: attno,
-                        rows: rows as u32,
-                        nff: (nh * hd) as u32,
-                        act: Activation::Sigmoid,
-                        up_off: 0,
-                    });
-                    lin(&mut gr, attno, w.out, sub, nh * hd, ne);
-                    gr.push(Op::Add {
-                        a: hidden,
-                        b: sub,
-                        dst: hidden,
-                        n: (rows * ne) as u32,
-                    });
-                    // FFN
-                    rmsn(&mut gr, hidden, w.post_norm, hn);
-                    lin(&mut gr, hn, w.ffn_gate, gbuf, ne, w.n_ff);
-                    lin(&mut gr, hn, w.ffn_up, ubuf, ne, w.n_ff);
-                    gr.push(Op::GatedAct {
-                        gate: gbuf,
-                        up: ubuf,
-                        dst: actbuf,
-                        rows: rows as u32,
-                        nff: w.n_ff as u32,
-                        act: Activation::Silu,
-                        up_off: 0,
-                    });
-                    lin(&mut gr, actbuf, w.ffn_down, sub, w.n_ff, ne);
-                    gr.push(Op::Add {
-                        a: hidden,
-                        b: sub,
-                        dst: hidden,
-                        n: (rows * ne) as u32,
-                    });
-                    let _ = li;
+                    Q35LayerH::Attn(w) => {
+                        rmsn(&mut gr, hidden, w.attn_norm, xn);
+                        // q proj outputs q+gate interleaved per head [h: q(hd), gate(hd)].
+                        lin(&mut gr, xn, w.q, qg, ne, nh * 2 * hd);
+                        // split interleaved per-head [q(hd) | gate(hd)] → packed qa / gate_a (strided).
+                        for h in 0..nh {
+                            gr.push(Op::CopyStrided {
+                                src: qg,
+                                src_off: (h * 2 * hd) as u32,
+                                src_stride: (nh * 2 * hd) as u32,
+                                dst: qa,
+                                dst_off: (h * hd) as u32,
+                                dst_stride: (nh * hd) as u32,
+                                rows: rows as u32,
+                                n: hd as u32,
+                            });
+                            gr.push(Op::CopyStrided {
+                                src: qg,
+                                src_off: (h * 2 * hd + hd) as u32,
+                                src_stride: (nh * 2 * hd) as u32,
+                                dst: gate_a,
+                                dst_off: (h * hd) as u32,
+                                dst_stride: (nh * hd) as u32,
+                                rows: rows as u32,
+                                n: hd as u32,
+                            });
+                        }
+                        lin(&mut gr, xn, w.k, ka, ne, nkv * hd);
+                        lin(&mut gr, xn, w.v, va, ne, nkv * hd);
+                        // per-head q/k norm + RoPE — fused (qwen35 always has q/k-norm).
+                        gr.push(Op::QkNormRope {
+                            x: qa,
+                            weight: w.q_norm,
+                            positions,
+                            dst: qa,
+                            rows: rows as u32,
+                            n_head: nh as u32,
+                            head_dim: hd as u32,
+                            rope_dim: c.rope_dim as u32,
+                            theta: c.rope_theta,
+                            eps,
+                            freq_factors: None,
+                        });
+                        gr.push(Op::QkNormRope {
+                            x: ka,
+                            weight: w.k_norm,
+                            positions,
+                            dst: k16, // F16 scratch → peephole fuses this + the WriteKv below into a
+                            // single direct-to-cache qk-norm+rope (see the k16 decl).
+                            rows: rows as u32,
+                            n_head: nkv as u32,
+                            head_dim: hd as u32,
+                            rope_dim: c.rope_dim as u32,
+                            theta: c.rope_theta,
+                            eps,
+                            freq_factors: None,
+                        });
+                        gr.push(Op::WriteKv {
+                            src: k16,
+                            cache: w.k_cache,
+                            rows: rows as u32,
+                            row_stride: (nkv * hd) as u32,
+                            pos: pos as u32,
+                        });
+                        gr.push(Op::WriteKv {
+                            src: va,
+                            cache: w.v_cache,
+                            rows: rows as u32,
+                            row_stride: (nkv * hd) as u32,
+                            pos: pos as u32,
+                        });
+                        gr.push(Op::Attention {
+                            q: qa,
+                            k_cache: w.k_cache,
+                            v_cache: w.v_cache,
+                            dst: attno,
+                            rows: rows as u32,
+                            kv_len: (pos + rows) as u32,
+                            n_head: nh as u32,
+                            n_kv: nkv as u32,
+                            head_dim: hd as u32,
+                            scale,
+                            mask: AttnMask::Causal,
+                            pos: pos as u32,
+                        });
+                        // per-head sigmoid output gate
+                        gr.push(Op::GatedAct {
+                            gate: gate_a,
+                            up: attno,
+                            dst: attno,
+                            rows: rows as u32,
+                            nff: (nh * hd) as u32,
+                            act: Activation::Sigmoid,
+                            up_off: 0,
+                        });
+                        lin(&mut gr, attno, w.out, sub, nh * hd, ne);
+                        gr.push(Op::Add {
+                            a: hidden,
+                            b: sub,
+                            dst: hidden,
+                            n: (rows * ne) as u32,
+                        });
+                        // FFN
+                        rmsn(&mut gr, hidden, w.post_norm, hn);
+                        lin(&mut gr, hn, w.ffn_gate, gbuf, ne, w.n_ff);
+                        lin(&mut gr, hn, w.ffn_up, ubuf, ne, w.n_ff);
+                        gr.push(Op::GatedAct {
+                            gate: gbuf,
+                            up: ubuf,
+                            dst: actbuf,
+                            rows: rows as u32,
+                            nff: w.n_ff as u32,
+                            act: Activation::Silu,
+                            up_off: 0,
+                        });
+                        lin(&mut gr, actbuf, w.ffn_down, sub, w.n_ff, ne);
+                        gr.push(Op::Add {
+                            a: hidden,
+                            b: sub,
+                            dst: hidden,
+                            n: (rows * ne) as u32,
+                        });
+                        let _ = li;
+                    }
                 }
             }
-        }
-        // Only the LAST token's logits are needed (the next-token prediction). Extract its hidden
-        // row, then output-norm + lm_head at rows=1 (avoids a wasteful [rows, vocab] projection).
-        let last = gr.internal(f32d(ne));
-        gr.push(Op::Copy {
-            src: hidden,
-            src_off: ((rows - 1) * ne) as u32,
-            dst: last,
-            dst_off: 0,
-            n: ne as u32,
-        });
-        gr.push(Op::RmsNorm {
-            x: last,
-            weight: w_out_norm,
-            dst: hn,
-            rows: 1,
-            dim: ne as u32,
-            eps,
-        });
-        gr.push(Op::Linear {
-            x: hn,
-            weight: w_lm,
-            dst: logits,
-            m: 1,
-            in_f: ne as u32,
-            out_f: vocab as u32,
-        });
+            // Only the LAST token's logits are needed (the next-token prediction). Extract its hidden
+            // row, then output-norm + lm_head at rows=1 (avoids a wasteful [rows, vocab] projection).
+            let last = gr.internal(f32d(ne));
+            gr.push(Op::Copy {
+                src: hidden,
+                src_off: ((rows - 1) * ne) as u32,
+                dst: last,
+                dst_off: 0,
+                n: ne as u32,
+            });
+            gr.push(Op::RmsNorm {
+                x: last,
+                weight: w_out_norm,
+                dst: hn,
+                rows: 1,
+                dim: ne as u32,
+                eps,
+            });
+            gr.push(Op::Linear {
+                x: hn,
+                weight: w_lm,
+                dst: logits,
+                m: 1,
+                in_f: ne as u32,
+                out_f: vocab as u32,
+            });
 
-        // collect state-input handles per layer for binding (interleaved by kind)
-        let mut state_ids: Vec<TensorId> = Vec::new();
-        for lh in &layers {
-            match lh {
-                Q35LayerH::Lin(w) => {
-                    state_ids.push(w.conv_state);
-                    state_ids.push(w.s_state);
-                }
-                Q35LayerH::Attn(w) => {
-                    state_ids.push(w.k_cache);
-                    state_ids.push(w.v_cache);
+            // collect state-input handles per layer for binding (interleaved by kind)
+            let mut state_ids: Vec<TensorId> = Vec::new();
+            for lh in &layers {
+                match lh {
+                    Q35LayerH::Lin(w) => {
+                        state_ids.push(w.conv_state);
+                        state_ids.push(w.s_state);
+                    }
+                    Q35LayerH::Attn(w) => {
+                        state_ids.push(w.k_cache);
+                        state_ids.push(w.v_cache);
+                    }
                 }
             }
-        }
-        Ok((gr, hidden, positions, [weights, state_ids].concat(), logits))
-    };
+            Ok((gr, hidden, positions, [weights, state_ids].concat(), logits))
+        };
 
-    // ── drive ───────────────────────────────────────────────────────────────────
-    // Build + compile + bind + execute the graph for the `rows` tokens whose embeddings/positions
-    // are `emb` (rows*ne) / `posv` (rows), at absolute start position `pos`. Binds fresh hidden/pos
-    // input buffers (sized to the chunk), the shared logits buffer, weights, and recurrent state.
-    let run_graph = |pos: usize, emb: &[f32], posv: &[i32]| -> Result<()> {
-        let rows = posv.len();
-        let hidden_buf = be
-            .alloc(emb.len() * 4, BufferUsage::Staging)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(emb))
-            .map_err(|e| anyhow!("{e}"))?;
-        let pos_buf = be
-            .alloc(posv.len() * 4, BufferUsage::Staging)
-            .map_err(|e| anyhow!("{e}"))?;
-        be.upload(pos_buf.as_ref(), bytemuck::cast_slice(posv))
-            .map_err(|e| anyhow!("{e}"))?;
-        let _t_build = std::time::Instant::now();
-        let (gr, h_hidden, h_pos, h_bind, h_logits) = build(pos, rows)?;
-        let plan = be.compile(&gr).map_err(|e| anyhow!("{e}"))?;
-        let _bc = _t_build.elapsed();
-        let _t_exec = std::time::Instant::now();
-        let mut b = Bindings::new();
-        b.bind(h_hidden, hidden_buf.as_ref());
-        b.bind(h_pos, pos_buf.as_ref());
-        b.bind(h_logits, logits_buf.as_ref());
-        let nw = wbufs.len();
-        for (i, id) in h_bind.iter().take(nw).enumerate() {
-            b.bind(*id, wbufs[i].as_ref());
-        }
-        // state handles in layer order: per layer (conv,s) for linear, (k,v) for attn.
-        let mut si = nw;
-        for i in 0..c.n_layer {
-            if attn(i) {
-                b.bind(h_bind[si], k_bufs[i].as_ref().unwrap().as_ref());
-                b.bind(h_bind[si + 1], v_bufs[i].as_ref().unwrap().as_ref());
-            } else {
-                b.bind(h_bind[si], conv_bufs[i].as_ref().unwrap().as_ref());
-                b.bind(h_bind[si + 1], s_bufs[i].as_ref().unwrap().as_ref());
+        // ── drive ───────────────────────────────────────────────────────────────────
+        // Build + compile + bind + execute the graph for the `rows` tokens whose embeddings/positions
+        // are `emb` (rows*ne) / `posv` (rows), at absolute start position `pos`. Binds fresh hidden/pos
+        // input buffers (sized to the chunk), the shared logits buffer, weights, and recurrent state.
+        let run_graph = |pos: usize, emb: &[f32], posv: &[i32]| -> Result<()> {
+            let rows = posv.len();
+            let hidden_buf = be
+                .alloc(emb.len() * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(emb))
+                .map_err(|e| anyhow!("{e}"))?;
+            let pos_buf = be
+                .alloc(posv.len() * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(pos_buf.as_ref(), bytemuck::cast_slice(posv))
+                .map_err(|e| anyhow!("{e}"))?;
+            let _t_build = std::time::Instant::now();
+            let (gr, h_hidden, h_pos, h_bind, h_logits) = build(pos, rows)?;
+            let plan = be.compile(&gr).map_err(|e| anyhow!("{e}"))?;
+            let _bc = _t_build.elapsed();
+            let _t_exec = std::time::Instant::now();
+            let mut b = Bindings::new();
+            b.bind(h_hidden, hidden_buf.as_ref());
+            b.bind(h_pos, pos_buf.as_ref());
+            b.bind(h_logits, logits_buf.as_ref());
+            let nw = wbufs.len();
+            for (i, id) in h_bind.iter().take(nw).enumerate() {
+                b.bind(*id, wbufs[i].as_ref());
             }
-            si += 2;
-        }
-        let r = be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"));
-        if std::env::var("INFR_Q35_TIMING").is_ok() {
-            eprintln!(
-                "[q35timing] rows={rows} build+compile={:.2}ms execute={:.2}ms",
-                _bc.as_secs_f64() * 1e3,
-                _t_exec.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        r
-    };
+            // state handles in layer order: per layer (conv,s) for linear, (k,v) for attn.
+            let mut si = nw;
+            for i in 0..c.n_layer {
+                if attn(i) {
+                    b.bind(h_bind[si], k_bufs[i].as_ref().unwrap().as_ref());
+                    b.bind(h_bind[si + 1], v_bufs[i].as_ref().unwrap().as_ref());
+                } else {
+                    b.bind(h_bind[si], conv_bufs[i].as_ref().unwrap().as_ref());
+                    b.bind(h_bind[si + 1], s_bufs[i].as_ref().unwrap().as_ref());
+                }
+                si += 2;
+            }
+            let r = be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"));
+            if std::env::var("INFR_Q35_TIMING").is_ok() {
+                eprintln!(
+                    "[q35timing] rows={rows} build+compile={:.2}ms execute={:.2}ms",
+                    _bc.as_secs_f64() * 1e3,
+                    _t_exec.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            r
+        };
 
-    let mut outs: Vec<u32> = Vec::new();
-    let mut logits = vec![0f32; vocab];
-    let mut printed = 0usize; // streaming detok cursor
-    let plen = prompt_ids.len();
+        let mut outs: Vec<u32> = Vec::new();
+        let mut logits = vec![0f32; vocab];
+        let mut printed = 0usize; // streaming detok cursor
+        let plen = prompt_ids.len();
 
-    // ── prefill: ingest the prompt in chunks of ≤CHUNK (one graph per chunk) ──
-    let prompt_t0 = std::time::Instant::now();
-    let mut cpos = 0usize;
-    while cpos < plen {
-        let rows = (plen - cpos).min(chunk);
-        let mut emb = vec![0f32; rows * ne];
-        for r in 0..rows {
-            let tid = prompt_ids[cpos + r] as usize;
-            emb[r * ne..r * ne + ne].copy_from_slice(&token_embd[tid * ne..tid * ne + ne]);
+        // ── prefill: ingest the prompt in chunks of ≤CHUNK (one graph per chunk) ──
+        let prompt_t0 = std::time::Instant::now();
+        let mut cpos = 0usize;
+        while cpos < plen {
+            let rows = (plen - cpos).min(chunk);
+            let mut emb = vec![0f32; rows * ne];
+            for r in 0..rows {
+                let tid = prompt_ids[cpos + r] as usize;
+                emb[r * ne..r * ne + ne].copy_from_slice(&token_embd[tid * ne..tid * ne + ne]);
+            }
+            let posv: Vec<i32> = (0..rows).map(|r| (cpos + r) as i32).collect();
+            run_graph(cpos, &emb, &posv)?;
+            cpos += rows;
         }
-        let posv: Vec<i32> = (0..rows).map(|r| (cpos + r) as i32).collect();
-        run_graph(cpos, &emb, &posv)?;
-        cpos += rows;
-    }
-    let prompt_t = prompt_t0.elapsed();
-    // The last chunk's last row predicts the first generated token.
-    be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
-        .map_err(|e| anyhow!("{e}"))?;
-    if std::env::var("INFR_Q35_DUMP").is_ok() {
-        let am = argmax(&logits);
-        let s: f32 = logits.iter().map(|x| x.abs()).sum::<f32>() / logits.len() as f32;
-        eprintln!(
-            "[q35dump] argmax={am} logit[am]={:.4} mean|logit|={s:.4} first6={:?}",
-            logits[am as usize],
-            &logits[..6]
-        );
-    }
-
-    // ── decode: one token at a time (rows=1), feeding the last prediction back ──
-    let decode_t0 = std::time::Instant::now();
-    let mut pos = plen;
-    let mut decode_n = 0usize;
-    loop {
-        let next = argmax(&logits);
-        // Stop on EOS / <|im_end|> before emitting the stop token (chat turn boundary).
-        // INFR_Q35_IGNORE_EOS keeps generating to the cap (benchmarks need a fixed tg count).
-        if (Some(next) == eos || (im_end.is_some() && Some(next) == im_end))
-            && std::env::var("INFR_Q35_IGNORE_EOS").is_err()
-        {
-            break;
-        }
-        crate::stream_token(&tok, &mut outs, &mut printed, next, &mut on_piece);
-        decode_n += 1;
-        if outs.len() >= n {
-            break;
-        }
-        // feed `next` at absolute position `pos`, predict the following token.
-        let emb = &token_embd[next as usize * ne..next as usize * ne + ne];
-        run_graph(pos, emb, &[pos as i32])?;
+        let prompt_t = prompt_t0.elapsed();
+        // The last chunk's last row predicts the first generated token.
         be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
             .map_err(|e| anyhow!("{e}"))?;
-        pos += 1;
-    }
-    let decode_t = decode_t0.elapsed();
+        if std::env::var("INFR_Q35_DUMP").is_ok() {
+            let am = argmax(&logits);
+            let s: f32 = logits.iter().map(|x| x.abs()).sum::<f32>() / logits.len() as f32;
+            eprintln!(
+                "[q35dump] argmax={am} logit[am]={:.4} mean|logit|={s:.4} first6={:?}",
+                logits[am as usize],
+                &logits[..6]
+            );
+        }
 
-    // The text streamed out via `on_piece`; return only timing/counts.
-    Ok(crate::GenStats {
-        n_prompt: plen,
-        prompt_secs: prompt_t.as_secs_f64(),
-        n_gen: decode_n,
-        decode_secs: decode_t.as_secs_f64(),
-    })
+        // ── decode: one token at a time (rows=1), feeding the last prediction back ──
+        let decode_t0 = std::time::Instant::now();
+        let mut pos = plen;
+        let mut decode_n = 0usize;
+        loop {
+            let next = argmax(&logits);
+            // Stop on EOS / <|im_end|> before emitting the stop token (chat turn boundary).
+            // INFR_Q35_IGNORE_EOS keeps generating to the cap (benchmarks need a fixed tg count).
+            if (Some(next) == eos || (im_end.is_some() && Some(next) == im_end))
+                && std::env::var("INFR_Q35_IGNORE_EOS").is_err()
+            {
+                break;
+            }
+            crate::stream_token(tok, &mut outs, &mut printed, next, &mut on_piece);
+            decode_n += 1;
+            if outs.len() >= n {
+                break;
+            }
+            // feed `next` at absolute position `pos`, predict the following token.
+            let emb = &token_embd[next as usize * ne..next as usize * ne + ne];
+            run_graph(pos, emb, &[pos as i32])?;
+            be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                .map_err(|e| anyhow!("{e}"))?;
+            pos += 1;
+        }
+        let decode_t = decode_t0.elapsed();
+
+        // The text streamed out via `on_piece`; return only timing/counts.
+        Ok(crate::GenStats {
+            n_prompt: plen,
+            prompt_secs: prompt_t.as_secs_f64(),
+            n_gen: decode_n,
+            decode_secs: decode_t.as_secs_f64(),
+        })
+    }
 }
 
 /// Qwen3-Next decode on the CPU reference backend (weights mapped zero-copy from the GGUF mmap).
@@ -1910,8 +2010,7 @@ pub fn generate_cpu(
     n: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<crate::GenStats> {
-    let be = CpuBackend::new();
-    generate_seam(&be, &|tb| Ok(be.map_weight(tb)), path, prompt, n, on_piece)
+    SeamModel::load_cpu(path)?.generate(prompt, n, on_piece)
 }
 
 /// Qwen3-Next decode on the reference Metal backend (weights uploaded to Metal buffers in their
@@ -1923,21 +2022,7 @@ pub fn generate_metal(
     n: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<crate::GenStats> {
-    let be = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
-    generate_seam(
-        &be,
-        &|tb| {
-            let buf = be
-                .alloc(tb.len().max(1), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
-            Ok(buf)
-        },
-        path,
-        prompt,
-        n,
-        on_piece,
-    )
+    SeamModel::load_metal(path)?.generate(prompt, n, on_piece)
 }
 
 /// Qwen3-Next on the Vulkan GPU through the AGNOSTIC SEAM (weights uploaded to VRAM in their native
@@ -1955,21 +2040,7 @@ pub fn generate_vulkan(
     n: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<crate::GenStats> {
-    let be = VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
-    generate_seam(
-        &be,
-        &|tb| {
-            let buf = be
-                .alloc(tb.len().max(1), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
-            Ok(buf)
-        },
-        path,
-        prompt,
-        n,
-        on_piece,
-    )
+    SeamModel::load_vulkan(path)?.generate(prompt, n, on_piece)
 }
 
 /// Open the GGUF at `path` and build the bespoke qwen35 [`Model`] (GPU-resident forward, or the
@@ -2008,15 +2079,8 @@ pub fn generate_chat(
     // Fast path: the batched/chunked GPU seam (full-GPU forward incl. attention) — ~7x prefill over
     // the bespoke per-token loop below. Escape hatch INFR_Q35_BESPOKE=1 forces the per-token path.
     if std::env::var("INFR_Q35_BESPOKE").is_err() {
-        if let Ok(be) = VulkanBackend::new() {
-            let bind = |tb: TensorBytes| -> Result<Box<dyn Buffer>> {
-                let buf = be
-                    .alloc(tb.len().max(1), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
-                Ok(buf)
-            };
-            let stats = generate_seam(&be, &bind, path, prompt, max_new, on_piece)?;
+        if let Ok(m) = SeamModel::load_vulkan(path) {
+            let stats = m.generate(prompt, max_new, on_piece)?;
             return Ok((stats.n_prompt, stats.n_gen));
         }
     }

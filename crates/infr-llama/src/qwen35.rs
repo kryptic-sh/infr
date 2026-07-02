@@ -1371,6 +1371,18 @@ impl SeamModel {
         &mut self,
         prompt: &str,
         n: usize,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_constrained(prompt, n, None, on_piece)
+    }
+
+    /// [`generate`](Self::generate) with an optional llguidance grammar constraint (serve's forced
+    /// tool_choice) applied to the decode.
+    pub fn generate_constrained(
+        &mut self,
+        prompt: &str,
+        n: usize,
+        mut constraint: Option<&mut crate::grammar::Constraint>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let be = self.be.as_ref();
@@ -2045,9 +2057,34 @@ impl SeamModel {
         let sampler = crate::sampling::Sampler::from_env();
         let mut rng = crate::sampling::seed_rng();
         let decode_t0 = std::time::Instant::now();
+        let eos_list: Vec<u32> = eos.into_iter().chain(im_end).collect();
         let mut pos = plen;
         let mut decode_n = 0usize;
         loop {
+            // Grammar-forced span (serve's tool_choice "required"/named): the shared llguidance
+            // step; a step can carry several deterministically-forced tokens — feed each through
+            // the graph in order.
+            if let Some(cst) = constraint.as_deref_mut() {
+                let (step, done) = crate::grammar::constrained_step(cst, &mut logits, &eos_list)?;
+                if step.is_empty() {
+                    break;
+                }
+                for &t in &step {
+                    crate::stream_token(tok, &mut outs, &mut printed, t, &mut on_piece);
+                    decode_n += 1;
+                }
+                if done || outs.len() >= n {
+                    break;
+                }
+                for &t in &step {
+                    let emb = &token_embd[t as usize * ne..t as usize * ne + ne];
+                    run_graph(pos, emb, &[pos as i32])?;
+                    pos += 1;
+                }
+                be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                    .map_err(|e| anyhow!("{e}"))?;
+                continue;
+            }
             let next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
             // Stop on EOS / <|im_end|> before emitting the stop token (chat turn boundary).
             // INFR_Q35_IGNORE_EOS keeps generating to the cap (benchmarks need a fixed tg count).

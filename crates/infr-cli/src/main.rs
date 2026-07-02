@@ -610,9 +610,47 @@ impl infr_server::ChatGenerator for SeamGenerator {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2048usize);
-        if matches!(tool_choice, Some(c) if c != "auto" && c != "none") {
+        // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
+        // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
+        // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
+        // constrained JSON; on any failure fall back to unconstrained (mirrors LlamaGenerator).
+        if let Some(mut constraint) = self.renderer.tool_constraint(tools.as_ref(), tool_choice)? {
+            let primed = format!("{prompt}<tool_call>\n");
+            let mut body = String::new();
+            let emitted = match self.model.generate_constrained(
+                &primed,
+                max_new,
+                &mut constraint,
+                &mut |p: &str| body.push_str(p),
+            ) {
+                Ok(_) => {
+                    let body = body.trim().trim_end_matches("</tool_call>").trim();
+                    match serde_json::from_str::<serde_json::Value>(body) {
+                        Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
+                            let arguments = val
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+                            on_delta(infr_engine::Delta::ToolCall {
+                                name: name.to_string(),
+                                arguments: serde_json::to_string(&arguments)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            });
+                        }),
+                        Err(_) => None,
+                    }
+                    .is_some()
+                }
+                Err(e) => {
+                    eprintln!("[tools] seam grammar-constrained generation failed ({e})");
+                    false
+                }
+            };
+            if emitted {
+                return Ok(());
+            }
             eprintln!(
-                "[tools] forced tool_choice is not wired on the seam backend yet — using auto"
+                "[tools] forced tool call produced no parseable call; falling back to unconstrained"
             );
         }
         let mut stream = ChatStream::new(tool_choice != Some("none"));

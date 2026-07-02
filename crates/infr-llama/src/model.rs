@@ -37,6 +37,21 @@ pub trait ChatModel {
     fn status(&self) -> Option<String> {
         None
     }
+
+    /// Like [`generate`](Self::generate), with an llguidance grammar constraint applied to the
+    /// decode (serve's FORCED tool_choice). Backends without constraint support return an error —
+    /// the caller falls back to unconstrained generation.
+    fn generate_constrained(
+        &mut self,
+        _prompt: &str,
+        _max_new: usize,
+        _constraint: &mut crate::grammar::Constraint,
+        _on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        Err(anyhow::anyhow!(
+            "grammar-constrained generation is not supported by this backend"
+        ))
+    }
 }
 
 /// Store only the ANSWER, dropping the model's `<think>…</think>` reasoning (Qwen3 excludes
@@ -297,6 +312,40 @@ impl ChatModel for Qwen35Chat {
             .unwrap()
             .generate(prompt, max_new, |p| on_piece(p))
     }
+
+    fn generate_constrained(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        constraint: &mut crate::grammar::Constraint,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        if std::env::var("INFR_Q35_BESPOKE").is_ok() {
+            return Err(anyhow::anyhow!(
+                "constrained generation is seam-only (INFR_Q35_BESPOKE set)"
+            ));
+        }
+        if self.seam.is_none() {
+            self.seam = Some(match self.backend {
+                SeamBackend::Vulkan => crate::qwen35::SeamModel::load_vulkan(&self.path)?,
+                SeamBackend::Cpu => crate::qwen35::SeamModel::load_cpu(&self.path)?,
+                SeamBackend::Metal => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        crate::qwen35::SeamModel::load_metal(&self.path)?
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    return Err(anyhow::anyhow!(
+                        "the Metal backend is only available on macOS"
+                    ));
+                }
+            });
+        }
+        self.seam
+            .as_mut()
+            .unwrap()
+            .generate_constrained(prompt, max_new, Some(constraint), |p| on_piece(p))
+    }
 }
 
 /// Standalone OpenAI-shaped prompt renderer over a GGUF's own chat template — tool specs and prior
@@ -332,6 +381,24 @@ impl OaiRenderer {
     ) -> Result<String> {
         infr_chat::render_chat_oai(&self.gguf, &self.tokenizer, self.eos, messages, tools, true)
             .ok_or_else(no_template_err)
+    }
+
+    /// Build the FORCED tool-call grammar constraint for this model's tokenizer (see
+    /// [`crate::grammar::tool_constraint_for`]); `None` for auto/none/absent tool_choice.
+    pub fn tool_constraint(
+        &self,
+        tools: Option<&serde_json::Value>,
+        tool_choice: Option<&str>,
+    ) -> Result<Option<crate::grammar::Constraint>> {
+        let vocab = self.tokenizer.get_vocab_size(true);
+        crate::grammar::tool_constraint_for(&self.tokenizer, vocab, &[self.eos], tools, tool_choice)
+    }
+
+    /// Detokenize ids (markers preserved) — the serve-side parse of a constrained tool-call body.
+    pub fn decode_ids(&self, ids: &[u32]) -> Result<String> {
+        self.tokenizer
+            .decode(ids, false)
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))
     }
 }
 
@@ -374,6 +441,29 @@ impl ChatModel for DenseSeamChat {
             .generate_vulkan_session(self.session.as_mut().unwrap(), prompt, max_new, |p| {
                 on_piece(p)
             })
+    }
+
+    fn generate_constrained(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        constraint: &mut crate::grammar::Constraint,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        if self.session.is_none() {
+            let max_ctx = std::env::var("INFR_MAX_CTX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(self.model.config().n_ctx_train);
+            self.session = Some(self.model.vulkan_session(max_ctx)?);
+        }
+        self.model.generate_vulkan_session_constrained(
+            self.session.as_mut().unwrap(),
+            prompt,
+            max_new,
+            Some(constraint),
+            |p| on_piece(p),
+        )
     }
 }
 

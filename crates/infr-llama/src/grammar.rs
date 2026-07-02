@@ -139,6 +139,90 @@ impl Constraint {
     }
 }
 
+/// One CONSTRAINED decode step over `logits`: drain llguidance's deterministically-forced tokens
+/// first (no sampling — the intended flow, keeps compute_mask/consume consistent); otherwise mask
+/// the logits and pick the most-probable grammar-legal token with validate-before-commit (the
+/// healed mask can be a SUPERSET on the non-canonical GGUF tokenizer bridge — a rejected candidate
+/// is dropped and re-picked, never failed). EOS terminates only in an accepting state.
+///
+/// Returns `(tokens emitted this step, grammar finished)`; an EMPTY step means the constrained
+/// span is done (accepting EOS or mask exhausted). ONE implementation shared by the bespoke
+/// decode loop and both seam decode paths.
+pub fn constrained_step(
+    c: &mut Constraint,
+    logits: &mut [f32],
+    eos_ids: &[u32],
+) -> Result<(Vec<u32>, bool)> {
+    let forced = c.forced();
+    if !forced.is_empty() {
+        c.consume(&forced)?;
+        let done = c.stopped();
+        return Ok((forced, done));
+    }
+    c.apply_mask(logits)?;
+    loop {
+        let cand = crate::sampling::argmax(logits) as u32;
+        if !logits[cand as usize].is_finite() {
+            return Ok((Vec::new(), true)); // mask exhausted — nothing grammar-legal left
+        }
+        if eos_ids.contains(&cand) {
+            if c.accepting()? {
+                return Ok((Vec::new(), true)); // legal end of the constrained span
+            }
+            logits[cand as usize] = f32::NEG_INFINITY; // EOS not allowed yet
+            continue;
+        }
+        if c.try_accept(cand)? {
+            let done = c.stopped();
+            return Ok((vec![cand], done));
+        }
+        logits[cand as usize] = f32::NEG_INFINITY; // superset member — drop + retry
+    }
+}
+
+/// Build the grammar [`Constraint`] that FORCES a valid, schema-conforming tool call, for
+/// `tool_choice` values that require one (`"required"`, or a named function). `None` for
+/// `"auto"`/`"none"`/absent. Tokenizer-based (no `Llama` needed) so the seam backends share it.
+pub fn tool_constraint_for(
+    tokenizer: &Tokenizer,
+    vocab: usize,
+    eos_ids: &[u32],
+    tools: Option<&Value>,
+    tool_choice: Option<&str>,
+) -> Result<Option<Constraint>> {
+    let Some(tools) = tools else {
+        return Ok(None);
+    };
+    let (force, only): (bool, Option<&str>) = match tool_choice {
+        Some("required") => (true, None),
+        Some("auto") | Some("none") | None => (false, None),
+        Some(name) => (true, Some(name.trim_matches('"'))),
+    };
+    if !force {
+        return Ok(None);
+    }
+    let filtered;
+    let tools = if let Some(name) = only {
+        let arr = tools.as_array().cloned().unwrap_or_default();
+        filtered = Value::Array(
+            arr.into_iter()
+                .filter(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        == Some(name)
+                })
+                .collect(),
+        );
+        &filtered
+    } else {
+        tools
+    };
+    let grammar = forced_tool_call_grammar(tools)?;
+    let env = build_tok_env(tokenizer, vocab, eos_ids)?;
+    Ok(Some(Constraint::new(env, grammar)?))
+}
+
 /// Build a JSON-schema grammar constraining the tool-call BODY — a single JSON object
 /// `{"name": <one-of-the-tool-names>, "arguments": <that tool's parameter schema>}` (the union over
 /// the request's tools). The caller prefills the `<tool_call>` opener and constrains only this body,

@@ -1976,44 +1976,14 @@ impl Llama {
         while budget > 0 {
             // The tokens emitted THIS step + whether the grammar finished.
             let (step, done): (Vec<u32>, bool) = if let Some(c) = constraint.as_deref_mut() {
-                // Drain the grammar's deterministically-forced tokens first (no sampling) — this is
-                // llguidance's intended flow and keeps compute_mask/consume consistent. Only when
-                // nothing is forced do we mask + greedily pick the most-probable grammar-legal token
-                // (argmax over the masked logits — robust, deterministic, never picks a masked token).
-                let forced = c.forced();
-                if !forced.is_empty() {
-                    c.consume(&forced)?;
-                    (forced, c.stopped())
-                } else {
-                    c.apply_mask(&mut logits)?;
-                    // Pick the most-probable grammar-legal token. The healed mask can be a SUPERSET
-                    // (llguidance token-healing on the non-canonical GGUF tokenizer bridge), so we
-                    // validate-before-commit and drop+re-pick on rejection rather than failing the
-                    // request. EOS only terminates when the grammar is in an accepting state.
-                    let mut chosen: Option<u32> = None;
-                    loop {
-                        let cand = crate::sampling::argmax(&logits) as u32;
-                        if !logits[cand as usize].is_finite() {
-                            break; // mask exhausted — nothing grammar-legal left
-                        }
-                        if self.cfg.eos_ids.contains(&cand) {
-                            if c.accepting()? {
-                                break; // legal end of the constrained span
-                            }
-                            logits[cand as usize] = f32::NEG_INFINITY; // EOS not allowed yet
-                            continue;
-                        }
-                        if c.try_accept(cand)? {
-                            chosen = Some(cand);
-                            break;
-                        }
-                        logits[cand as usize] = f32::NEG_INFINITY; // superset member — drop + retry
-                    }
-                    match chosen {
-                        Some(t) => (vec![t], c.stopped()),
-                        None => break, // accepting EOS or exhausted → constrained span done
-                    }
+                // Shared llguidance step (grammar::constrained_step): drain forced tokens, else
+                // mask + validate-before-commit argmax. Empty step ⇒ the constrained span ended.
+                let (step, done) =
+                    crate::grammar::constrained_step(c, &mut logits, &self.cfg.eos_ids)?;
+                if step.is_empty() {
+                    break;
                 }
+                (step, done)
             } else {
                 let next = sample_logits(&logits, sampler, &mut rng);
                 if self.cfg.eos_ids.contains(&next) {
@@ -2172,35 +2142,13 @@ impl Llama {
         };
         // Narrow `tools` to the chosen function when tool_choice names one; require a call only for
         // "required" or a named choice.
-        let (force, only): (bool, Option<&str>) = match tool_choice {
-            Some("required") => (true, None),
-            Some("auto") | Some("none") | None => (false, None),
-            Some(name) => (true, Some(name.trim_matches('"'))),
-        };
-        if !force {
-            return Ok(None);
-        }
-        let filtered;
-        let tools = if let Some(name) = only {
-            let arr = tools.as_array().cloned().unwrap_or_default();
-            filtered = serde_json::Value::Array(
-                arr.into_iter()
-                    .filter(|t| {
-                        t.get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(serde_json::Value::as_str)
-                            == Some(name)
-                    })
-                    .collect(),
-            );
-            &filtered
-        } else {
-            tools
-        };
-        let grammar = crate::grammar::forced_tool_call_grammar(tools)?;
-        let env =
-            crate::grammar::build_tok_env(&self.tokenizer, self.cfg.vocab, &self.cfg.eos_ids)?;
-        Ok(Some(crate::grammar::Constraint::new(env, grammar)?))
+        crate::grammar::tool_constraint_for(
+            &self.tokenizer,
+            self.cfg.vocab,
+            &self.cfg.eos_ids,
+            Some(tools),
+            tool_choice,
+        )
     }
 
     /// Detokenize ids. `skip_special=false` preserves marker tokens (`<think>`, …) for parsing.

@@ -72,6 +72,19 @@ impl CpuModel {
         session: &mut DenseVulkanSession,
         prompt: &str,
         max_new: usize,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_vulkan_session_constrained(session, prompt, max_new, None, on_piece)
+    }
+
+    /// [`generate_vulkan_session`](Self::generate_vulkan_session) with an optional llguidance
+    /// grammar constraint (serve's forced tool_choice) applied to the decode.
+    pub fn generate_vulkan_session_constrained(
+        &self,
+        session: &mut DenseVulkanSession,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let enc = self
@@ -92,6 +105,7 @@ impl CpuModel {
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
             &mut session.state,
             session.max_ctx,
+            constraint,
         )?;
         Ok(stats)
     }

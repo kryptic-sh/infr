@@ -96,6 +96,7 @@ pub(crate) fn generate_dense_cpu(
         on_token,
         &mut None,
         prompt.len() + max_new + 1,
+        None,
     )
 }
 
@@ -126,6 +127,7 @@ pub(crate) fn generate_dense_gpu(
         on_token,
         &mut None,
         prompt.len() + max_new + 1,
+        None,
     )
 }
 
@@ -144,6 +146,7 @@ pub(crate) fn generate_dense_gpu_session(
     on_token: impl FnMut(u32),
     state: &mut Option<SeamKv>,
     want_ctx: usize,
+    constraint: Option<&mut crate::grammar::Constraint>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_backend(
         vk,
@@ -186,6 +189,7 @@ pub(crate) fn generate_dense_gpu_session(
         on_token,
         state,
         want_ctx,
+        constraint,
     )
 }
 
@@ -222,6 +226,7 @@ pub(crate) fn generate_dense_metal(
         on_token,
         &mut None,
         prompt.len() + max_new + 1,
+        None,
     )
 }
 
@@ -273,6 +278,7 @@ pub(crate) fn generate_dense_backend(
     mut on_token: impl FnMut(u32),
     state: &mut Option<SeamKv>,
     want_ctx: usize,
+    mut constraint: Option<&mut crate::grammar::Constraint>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let (ne, nh) = (c.n_embd, c.n_head);
@@ -1253,23 +1259,48 @@ pub(crate) fn generate_dense_backend(
 
         // Only sample once we're past the prompt (decode position = last prompt token onward).
         let is_decode = pos + 1 >= prompt.len();
-        if is_decode {
+        // Sample only at the FRONTIER (this position's token is the newest one fed). A constrained
+        // step can emit several deterministically-forced tokens at once — they're queued onto
+        // `cur` and the following iterations just feed them (no sampling) until the frontier.
+        let at_frontier = pos + 1 == cur.len();
+        if is_decode && at_frontier {
             be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                 .map_err(|e| anyhow!("{e}"))?;
-            let next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
-            let is_eos = c.eos_ids.contains(&next) || next == c.eos;
-            out.push(next);
-            decode_t += step_t0.elapsed();
-            decode_n += 1;
-            if !is_eos {
-                on_token(next); // stream the token (EOS is not emitted)
-            }
-            if is_eos || out.len() >= max_new {
-                break;
-            }
-            if cur.len() <= pos + 1 {
+            if let Some(cst) = constraint.as_deref_mut() {
+                // Grammar-forced span (serve's tool_choice "required"/named): the shared
+                // llguidance step. Empty step ⇒ the constrained span ended.
+                let (step, done) = crate::grammar::constrained_step(cst, &mut logits, &c.eos_ids)
+                    .map_err(|e| anyhow!("{e}"))?;
+                decode_t += step_t0.elapsed();
+                if step.is_empty() {
+                    break;
+                }
+                for &t in &step {
+                    out.push(t);
+                    on_token(t);
+                    cur.push(t);
+                    decode_n += 1;
+                }
+                if done || out.len() >= max_new {
+                    break;
+                }
+            } else {
+                let next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
+                let is_eos = c.eos_ids.contains(&next) || next == c.eos;
+                out.push(next);
+                decode_t += step_t0.elapsed();
+                decode_n += 1;
+                if !is_eos {
+                    on_token(next); // stream the token (EOS is not emitted)
+                }
+                if is_eos || out.len() >= max_new {
+                    break;
+                }
                 cur.push(next);
             }
+        } else if is_decode {
+            // feeding a queued forced token — its KV write is the whole point of this step
+            decode_t += step_t0.elapsed();
         } else {
             prompt_t += step_t0.elapsed();
         }

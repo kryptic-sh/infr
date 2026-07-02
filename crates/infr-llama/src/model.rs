@@ -293,7 +293,7 @@ impl ChatModel for Qwen35Chat {
             });
         }
         self.seam
-            .as_ref()
+            .as_mut()
             .unwrap()
             .generate(prompt, max_new, |p| on_piece(p))
     }

@@ -1177,6 +1177,11 @@ pub fn render_chat_messages(path: &std::path::Path, messages: &[(&str, &str)]) -
 
 /// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). `prompt` is
 /// the already-formatted text (see [`render_chat`]); returns timing/counts, text streams via `on_piece`.
+/// Context rows a call needs: the whole prompt + the generation budget + the sampled tail.
+fn plen_hint(prompt_ids: &[u32], n: usize) -> usize {
+    prompt_ids.len() + n + 1
+}
+
 /// Turns a native-dtype GGUF tensor into a backend weight buffer (upload or zero-copy map).
 pub type BindWeight<'a> = &'a dyn Fn(&dyn Backend, TensorBytes) -> Result<Box<dyn Buffer>>;
 
@@ -1198,6 +1203,22 @@ pub struct SeamModel {
     im_end: Option<u32>,
     wbufs: Vec<Box<dyn Buffer>>,
     wspecs: Vec<(DType, usize)>,
+    /// Persistent per-conversation state (conv history, DeltaNet S, KV cache) + the token ids FED
+    /// through it. Unlike the dense KV cache, the recurrent state is an append-only summary — it
+    /// can't rewind to a prefix — so a turn reuses it ONLY when the new prompt exactly EXTENDS the
+    /// cached sequence; anything else zero-resets and prefills from scratch.
+    state: Option<SeamState>,
+}
+
+/// See [`SeamModel::state`].
+struct SeamState {
+    conv_bufs: Vec<Option<Box<dyn Buffer>>>,
+    s_bufs: Vec<Option<Box<dyn Buffer>>>,
+    k_bufs: Vec<Option<Box<dyn Buffer>>>,
+    v_bufs: Vec<Option<Box<dyn Buffer>>>,
+    max_ctx: usize,
+    /// Token ids fed through the recurrent state (prompt + generated-and-fed of the last turn).
+    cached: Vec<u32>,
 }
 
 impl SeamModel {
@@ -1297,6 +1318,7 @@ impl SeamModel {
             im_end,
             wbufs,
             wspecs,
+            state: None,
         })
     }
 
@@ -1346,7 +1368,7 @@ impl SeamModel {
     /// prefill + per-token decode (greedy), streaming text to `on_piece`. Per-conversation state is
     /// allocated fresh (sized to prompt+n).
     pub fn generate(
-        &self,
+        &mut self,
         prompt: &str,
         n: usize,
         mut on_piece: impl FnMut(&str),
@@ -1373,7 +1395,6 @@ impl SeamModel {
             .encode(prompt, false)
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_ids: Vec<u32> = enc.get_ids().to_vec();
-        let max_ctx = prompt_ids.len() + n + 1;
 
         if std::env::var("INFR_Q35_TIMING").is_ok() {
             eprintln!("[q35dims] ne={ne} nv={nv} nk={nk} kd={kd} vd={vd} cc={cc} di={di} n_layer={} nh={nh} nkv={nkv} hd={hd}", c.n_layer);
@@ -1387,11 +1408,13 @@ impl SeamModel {
                 .shape[1])
         };
 
-        // ── persistent state buffers, one set per layer by kind ──────────────────────
-        // The recurrence REQUIRES these start at zero (conv history, DeltaNet S, KV cache). `be.alloc`
-        // returns uninitialized memory on the GPU backends (only the CPU's Vec happens to be zeroed), so
-        // zero them explicitly via an upload — else the first token attends/accumulates garbage state.
-        let zalloc = |n: usize| -> Result<Box<dyn Buffer>> {
+        // ── persistent per-conversation state (conv history, DeltaNet S, KV cache) ─────
+        // The recurrence REQUIRES zeros at a fresh start (`be.alloc` is calloc-style, but a REUSED
+        // session must re-zero explicitly on reset). Session reuse: the recurrent state is an
+        // append-only summary of the fed tokens, so a turn continues from it ONLY when the new
+        // prompt exactly EXTENDS the cached sequence (the multi-turn chat shape) — anything else
+        // (divergent prompt, identical prompt, capacity overflow) resets to zeros + full prefill.
+        let zeroed = |be: &dyn Backend, n: usize| -> Result<Box<dyn Buffer>> {
             let buf = be
                 .alloc(n * 4, BufferUsage::Activations)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -1399,23 +1422,73 @@ impl SeamModel {
                 .map_err(|e| anyhow!("{e}"))?;
             Ok(buf)
         };
-        let mut conv_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
-        let mut s_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
-        let mut k_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
-        let mut v_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
-        for i in 0..c.n_layer {
-            if attn(i) {
-                k_bufs.push(Some(zalloc(max_ctx * nkv * hd)?));
-                v_bufs.push(Some(zalloc(max_ctx * nkv * hd)?));
-                conv_bufs.push(None);
-                s_bufs.push(None);
-            } else {
-                conv_bufs.push(Some(zalloc((kk - 1) * cc)?));
-                s_bufs.push(Some(zalloc(nv * kd * vd)?));
-                k_bufs.push(None);
-                v_bufs.push(None);
+        let want_ctx = plen_hint(&prompt_ids, n);
+        let reusable = matches!(&self.state, Some(st) if st.max_ctx >= want_ctx);
+        if !reusable {
+            // (Re)allocate at want + headroom so a growing conversation doesn't realloc per turn.
+            let cap = want_ctx + 4096;
+            let mut conv_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+            let mut s_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+            let mut k_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+            let mut v_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
+            for i in 0..c.n_layer {
+                if attn(i) {
+                    k_bufs.push(Some(zeroed(be, cap * nkv * hd)?));
+                    v_bufs.push(Some(zeroed(be, cap * nkv * hd)?));
+                    conv_bufs.push(None);
+                    s_bufs.push(None);
+                } else {
+                    conv_bufs.push(Some(zeroed(be, (kk - 1) * cc)?));
+                    s_bufs.push(Some(zeroed(be, nv * kd * vd)?));
+                    k_bufs.push(None);
+                    v_bufs.push(None);
+                }
             }
+            self.state = Some(SeamState {
+                conv_bufs,
+                s_bufs,
+                k_bufs,
+                v_bufs,
+                max_ctx: cap,
+                cached: Vec::new(),
+            });
         }
+        let st = self.state.as_mut().expect("seam state just ensured");
+        // Reuse test: the new prompt must strictly extend the fed sequence.
+        let pfx = st
+            .cached
+            .iter()
+            .zip(&prompt_ids)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let start = if pfx == st.cached.len() && pfx < prompt_ids.len() {
+            pfx
+        } else {
+            if !st.cached.is_empty() {
+                // Divergent (or fully-identical) prompt: the recurrent state can't rewind — zero it.
+                let zero_fill = |b: &Option<Box<dyn Buffer>>, n: usize| -> Result<()> {
+                    if let Some(b) = b {
+                        be.upload(b.as_ref(), bytemuck::cast_slice(&vec![0f32; n]))
+                            .map_err(|e| anyhow!("{e}"))?;
+                    }
+                    Ok(())
+                };
+                for i in 0..c.n_layer {
+                    if attn(i) {
+                        zero_fill(&st.k_bufs[i], st.max_ctx * nkv * hd)?;
+                        zero_fill(&st.v_bufs[i], st.max_ctx * nkv * hd)?;
+                    } else {
+                        zero_fill(&st.conv_bufs[i], (kk - 1) * cc)?;
+                        zero_fill(&st.s_bufs[i], nv * kd * vd)?;
+                    }
+                }
+                st.cached.clear();
+            }
+            0
+        };
+        let max_ctx = st.max_ctx;
+        let (conv_bufs, s_bufs, k_bufs, v_bufs) =
+            (&st.conv_bufs, &st.s_bufs, &st.k_bufs, &st.v_bufs);
 
         // ── per-step IO ───────────────────────────────────────────────────────────────
         // Prompt tokens are ingested in chunks of up to CHUNK through ONE graph build each (instead of
@@ -1940,7 +2013,7 @@ impl SeamModel {
 
         // ── prefill: ingest the prompt in chunks of ≤CHUNK (one graph per chunk) ──
         let prompt_t0 = std::time::Instant::now();
-        let mut cpos = 0usize;
+        let mut cpos = start;
         while cpos < plen {
             let rows = (plen - cpos).min(chunk);
             let mut emb = vec![0f32; rows * ne];
@@ -1993,9 +2066,19 @@ impl SeamModel {
         }
         let decode_t = decode_t0.elapsed();
 
+        // Record the tokens FED through the recurrent state for the next turn's extend test:
+        // the prompt plus every generated token that was fed back (the final sampled token — and
+        // an EOS — never is).
+        if let Some(st) = &mut self.state {
+            st.cached = prompt_ids;
+            if !outs.is_empty() {
+                st.cached.extend_from_slice(&outs[..outs.len() - 1]);
+            }
+        }
         // The text streamed out via `on_piece`; return only timing/counts.
         Ok(crate::GenStats {
-            n_prompt: plen,
+            // Tokens actually PREFILLED this call (the un-cached suffix) — the TTFT-honest count.
+            n_prompt: plen - start,
             prompt_secs: prompt_t.as_secs_f64(),
             n_gen: decode_n,
             decode_secs: decode_t.as_secs_f64(),
@@ -2010,7 +2093,8 @@ pub fn generate_cpu(
     n: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<crate::GenStats> {
-    SeamModel::load_cpu(path)?.generate(prompt, n, on_piece)
+    let mut m = SeamModel::load_cpu(path)?;
+    m.generate(prompt, n, on_piece)
 }
 
 /// Qwen3-Next decode on the reference Metal backend (weights uploaded to Metal buffers in their
@@ -2022,7 +2106,8 @@ pub fn generate_metal(
     n: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<crate::GenStats> {
-    SeamModel::load_metal(path)?.generate(prompt, n, on_piece)
+    let mut m = SeamModel::load_metal(path)?;
+    m.generate(prompt, n, on_piece)
 }
 
 /// Qwen3-Next on the Vulkan GPU through the AGNOSTIC SEAM (weights uploaded to VRAM in their native
@@ -2040,7 +2125,8 @@ pub fn generate_vulkan(
     n: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<crate::GenStats> {
-    SeamModel::load_vulkan(path)?.generate(prompt, n, on_piece)
+    let mut m = SeamModel::load_vulkan(path)?;
+    m.generate(prompt, n, on_piece)
 }
 
 /// Open the GGUF at `path` and build the bespoke qwen35 [`Model`] (GPU-resident forward, or the
@@ -2079,7 +2165,7 @@ pub fn generate_chat(
     // Fast path: the batched/chunked GPU seam (full-GPU forward incl. attention) — ~7x prefill over
     // the bespoke per-token loop below. Escape hatch INFR_Q35_BESPOKE=1 forces the per-token path.
     if std::env::var("INFR_Q35_BESPOKE").is_err() {
-        if let Ok(m) = SeamModel::load_vulkan(path) {
+        if let Ok(mut m) = SeamModel::load_vulkan(path) {
             let stats = m.generate(prompt, max_new, on_piece)?;
             return Ok((stats.n_prompt, stats.n_gen));
         }
@@ -2280,6 +2366,60 @@ mod tests {
         let _ = generate_cpu(&path, &prompt, 1, |_| {});
         eprintln!("=== Vulkan seam ===");
         let _ = generate_vulkan(&path, &prompt, 1, |_| {});
+    }
+
+    /// Session reuse on the qwen35 seam: turn 2's prompt EXTENDS turn 1's fed sequence, so the
+    /// recurrent state continues (suffix-only prefill) and must generate exactly what a fresh
+    /// full prefill of the same prompt generates. A divergent prompt resets (also exercised).
+    #[test]
+    #[ignore = "requires the Qwen3.5-0.8B GGUF + a Vulkan GPU"]
+    fn gpu_seam_session_reuse() {
+        let Some(path) = model_path() else {
+            eprintln!("skip: Qwen3.5-0.8B not present");
+            return;
+        };
+        if !crate::gpu_available() {
+            eprintln!("skip: no Vulkan GPU");
+            return;
+        }
+        std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed-length turns (no early stop)
+        let mut m = SeamModel::load_vulkan(&path).unwrap();
+
+        let p1 = "The quick brown fox jumps over the lazy dog. The capital of France is";
+        let mut t1 = String::new();
+        let s1 = m.generate(p1, 8, |p| t1.push_str(p)).unwrap();
+        assert!(s1.n_prompt > 0);
+
+        let p2 = format!("{p1}{t1} And the capital of Germany is");
+        let mut t2 = String::new();
+        let s2 = m.generate(&p2, 8, |p| t2.push_str(p)).unwrap();
+
+        // fresh model = full prefill oracle
+        let mut fresh = SeamModel::load_vulkan(&path).unwrap();
+        let mut tf = String::new();
+        fresh.generate(&p2, 8, |p| tf.push_str(p)).unwrap();
+        assert_eq!(
+            t2.trim(),
+            tf.trim(),
+            "session (suffix prefill on reused recurrent state) diverged from a fresh full prefill"
+        );
+        // suffix-only prefill: far fewer tokens than the whole prompt
+        assert!(
+            s2.n_prompt < s1.n_prompt,
+            "turn 2 prefilled {} tokens — session reuse didn't kick in",
+            s2.n_prompt
+        );
+
+        // divergent prompt → reset + full prefill (correctness, not reuse)
+        let p3 = "Completely different subject: photosynthesis converts";
+        let mut t3 = String::new();
+        let s3 = m.generate(p3, 8, |p| t3.push_str(p)).unwrap();
+        let mut fresh3 = SeamModel::load_vulkan(&path).unwrap();
+        let mut tf3 = String::new();
+        fresh3.generate(p3, 8, |p| tf3.push_str(p)).unwrap();
+        assert_eq!(t3.trim(), tf3.trim(), "post-reset generation diverged");
+        assert!(s3.n_prompt > 0);
+        std::env::remove_var("INFR_Q35_IGNORE_EOS");
     }
 
     /// The batched/chunked-prefill SEAM on Vulkan (vs the bespoke per-token `generate` above). FAST

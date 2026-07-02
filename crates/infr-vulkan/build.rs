@@ -246,6 +246,9 @@ fn main() {
         ("moe_bucket_scatter", "moe_bucket_scatter", &[]),
         ("add_scaled_id", "add_scaled_id", &[]),
         // Native-block prefill GEMMs: one .spv per quant format (coopmat tiled, no residual).
+        ("native_gemm_warp", "native_gemm_warp_q4k", &["-DFMT_Q4K"]),
+        ("native_gemm_warp", "native_gemm_warp_q6k", &["-DFMT_Q6K"]),
+        ("native_gemm_warp", "native_gemm_warp_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_q4_0", &["-DFMT_Q4_0"]),
         ("native_gemm", "native_gemm_q4_1", &["-DFMT_Q4_1"]),

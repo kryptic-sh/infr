@@ -202,6 +202,28 @@ pub(crate) fn add_scaled_id_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
+/// SPIR-V for the LARGE-WARPTILE native-block prefill GEMM (8-warp BM=64×BN=256, gemm_proj_warp
+/// structure with in-shader native dequant). Only the hot formats are compiled; `None` falls back
+/// to the 64×64 `native_gemm_build_spv` kernel.
+pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => v!("native_gemm_warp_q4k"),
+        Q6K => v!("native_gemm_warp_q6k"),
+        Q8_0 => v!("native_gemm_warp_q8_0"),
+        _ => return None,
+    })
+}
+
 /// SPIR-V for the native-block prefill GEMM (`C=A·Wᵀ`, raw GGUF blocks dequantized in-shader via the
 /// coopmat tiled kernel). One specialization per quant format; `None` for unsupported dtypes.
 pub(crate) fn native_gemm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {

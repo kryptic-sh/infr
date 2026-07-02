@@ -1,0 +1,97 @@
+#version 460
+// Native-block prefill GEMM, LARGE WARPTILE: C[M,N] = A[M,K] · Wᵀ, W = [N,K] raw GGUF blocks
+// dequantized in-shader during staging. Same mul_mm-style 8-warp/256-thread warptile as
+// gemm_proj_warp (BM=64 × BN=256 → warp 32×64 → 2×4 register-blocked 16×16 coopmat frags) — the
+// extra warps hide the W-dequant latency, and the 4× wider N tile amortizes each staged
+// A-row/decoded W-column over 4× more math than the 64×64 native_gemm. BK=32 (one whole quant
+// sub-block per column per stage: BN=256 columns / 256 threads → each thread runs dqblk once).
+// -DFMT_* selects the format. Requires requiredSubgroupSize=32, N%256, K%32.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint THREADS = 256u;
+const uint BM = 64u;
+const uint BN = 256u;
+const uint BK = 32u;
+const uint WM = 32u;
+const uint WN = 64u;
+const uint WARPS_M = BM / WM; // 2
+const uint WARPS_N = BN / WN; // 4 → 8 warps / 256 threads
+const uint CMS_M = WM / 16u;  // 2
+const uint CMS_N = WN / 16u;  // 4
+const uint SAK = BK + 8u;
+const uint SBK = BK + 8u;     // Bs is [BN][BK]
+
+// w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
+layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // weights: raw GGUF blocks (native)
+layout(binding = 2) writeonly buffer CBuf { float c[]; };
+
+shared float16_t As[BM * SAK];
+shared float16_t Bs[BN * SBK];
+
+#include "native_decode.glsl"
+
+void main() {
+    uint tilesN = pc.n / BN;
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
+    uint warp = gl_SubgroupID;
+    uint warp_r = warp % WARPS_M;
+    uint warp_c = warp / WARPS_M;
+    uint li = gl_LocalInvocationIndex;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[CMS_M][CMS_N];
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+        for (uint idx = li; idx < BM * BK; idx += THREADS) {
+            uint r = idx / BK;
+            uint cc = idx % BK;
+            uint gr = wgRow + r;
+            As[r * SAK + cc] = (gr < pc.m) ? float16_t(a[gr * pc.k + k0 + cc]) : float16_t(0.0);
+        }
+        // one thread per output column: decode this column's aligned 32-element sub-block
+        {
+            uint cc = li; // BN == THREADS
+            float v[32];
+            dqblk(pc.w_base + (wgCol + cc) * pc.k + k0, v);
+            [[unroll]] for (uint kk = 0u; kk < BK; kk++) { Bs[cc * SBK + kk] = float16_t(v[kk]); }
+        }
+        barrier();
+        [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[CMS_M];
+            [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+                coopMatLoad(af[i], As, (warp_r * WM + i * 16u) * SAK + kf, SAK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
+                coopMatLoad(bf, Bs, (warp_c * WN + j * 16u) * SBK + kf, SBK,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+                    acc[i][j] = coopMatMulAdd(af[i], bf, acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+        [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
+            uint cr = wgRow + warp_r * WM + i * 16u;
+            uint cc = wgCol + warp_c * WN + j * 16u;
+            coopMatStore(acc[i][j], c, cr * pc.n + cc, pc.n, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

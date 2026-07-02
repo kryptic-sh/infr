@@ -426,15 +426,32 @@ impl<'a> Recorder<'a> {
         n: usize,
     ) {
         self.stamp("matmul_proj");
-        let name = crate::linear::native_gemm_kernel_name(dtype);
-        let spv = crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv");
+        // Large-warptile variant (8-warp BM=64×BN=256): 4× the math per staged A-row / decoded
+        // W-column vs the 64×64 tile, and the extra warps hide the dequant latency. Needs n%256,
+        // k%32; only the hot formats are compiled — everything else stays on the 64×64 kernel.
+        // INFR_NO_GEMM_WARP forces the 64×64 tile (A/B).
+        let warp = if n % 256 == 0 && k % 32 == 0 && std::env::var("INFR_NO_GEMM_WARP").is_err() {
+            crate::gemm::native_gemm_warp_build_spv(dtype)
+        } else {
+            None
+        };
+        let (name, spv) = match (warp, dtype) {
+            (Some(spv), infr_core::DType::Q4K) => ("native_gemm_warp_q4k", spv),
+            (Some(spv), infr_core::DType::Q6K) => ("native_gemm_warp_q6k", spv),
+            (Some(spv), infr_core::DType::Q8_0) => ("native_gemm_warp_q8_0", spv),
+            _ => (
+                crate::linear::native_gemm_kernel_name(dtype),
+                crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv"),
+            ),
+        };
         let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
+        let groups_n = if warp.is_some() { n / 256 } else { n / 64 };
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        let groups = (m.div_ceil(64) * groups_n) as u32;
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(w), Self::vkb(c)],

@@ -1016,7 +1016,8 @@ kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
         return;
     }
 
-    threadgroup half tgP[64];
+    threadgroup half tgP[128];
+    threadgroup float tgS16[128];
     threadgroup float tgD[64];
     threadgroup float tgM[8], tgL[8];
     uint abs0 = p.pos + r0;                 // row i sees positions <= abs0 + i
@@ -1032,16 +1033,23 @@ kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
     uint nfrag = hd / 8u;
     for (uint i = 0; i < nfrag; i++) oa[i] = simdgroup_float8x8(0.0f);
 
-    for (uint j0 = lo_min & ~7u; j0 <= abs_max; j0 += 8u) {
+    for (uint j0 = lo_min & ~15u; j0 <= abs_max; j0 += 16u) {
+        /* two 8-position score fragments per iteration: one scalar softmax phase and one
+           rescale per 16 KV positions instead of per 8 — the scalar phase and its barriers,
+           not KV bandwidth, are what this kernel waits on */
         device const half* kb = k + ((ulong)j0 * p.n_kv + kvh) * hd;
-        simdgroup_float8x8 sf = simdgroup_float8x8(0.0f);
+        simdgroup_float8x8 sf0 = simdgroup_float8x8(0.0f);
+        simdgroup_float8x8 sf1 = simdgroup_float8x8(0.0f);
         for (uint e0 = 0; e0 < hd; e0 += 8u) {
             simdgroup_half8x8 qa, kt;
             simdgroup_load(qa, qbase + e0, qstride);
             simdgroup_load(kt, kb + e0, kvstride, ulong2(0, 0), true);
-            simdgroup_multiply_accumulate(sf, qa, kt, sf);
+            simdgroup_multiply_accumulate(sf0, qa, kt, sf0);
+            simdgroup_load(kt, kb + 8u * kvstride + e0, kvstride, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(sf1, qa, kt, sf1);
         }
-        simdgroup_store(sf, tgD, 8);        // reuse tgD as the f32 score scratch
+        simdgroup_store(sf0, tgS16, 16);      // f32 score scratch, 8 rows x 16 cols
+        simdgroup_store(sf1, tgS16 + 8u, 16);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         if (lane < 8u) {
             uint r = lane;
@@ -1049,18 +1057,18 @@ kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
             uint lor = (p.window > 0u && absr + 1u > p.window) ? (absr + 1u - p.window) : 0u;
             float mr = tgM[r];
             float mnew = mr;
-            float s[8];
-            for (uint c = 0; c < 8u; c++) {
+            float s[16];
+            for (uint c = 0; c < 16u; c++) {
                 uint j = j0 + c;
                 bool valid = (j >= lor) && (j <= absr);
-                s[c] = valid ? tgD[r * 8u + c] * p.scale : -INFINITY;
+                s[c] = valid ? tgS16[r * 16u + c] * p.scale : -INFINITY;
                 mnew = max(mnew, s[c]);
             }
             float corr = (mr == mnew) ? 1.0f : exp(mr - mnew);
             float lsum = 0.0f;
-            for (uint c = 0; c < 8u; c++) {
+            for (uint c = 0; c < 16u; c++) {
                 float pw = (s[c] == -INFINITY) ? 0.0f : exp(s[c] - mnew);
-                tgP[r * 8u + c] = (half)pw;
+                tgP[r * 16u + c] = (half)pw;
                 lsum += pw;
             }
             tgL[r] = tgL[r] * corr + lsum;
@@ -1069,16 +1077,19 @@ kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 df;
-        simdgroup_half8x8 pf;
+        simdgroup_half8x8 pf0, pf1;
         simdgroup_load(df, tgD, 8);
-        simdgroup_load(pf, tgP, 8);
+        simdgroup_load(pf0, tgP, 16);
+        simdgroup_load(pf1, tgP + 8u, 16);
         device const half* vb = v + ((ulong)j0 * p.n_kv + kvh) * hd;
         for (uint i = 0; i < nfrag; i++) {
             simdgroup_float8x8 tmp;
             simdgroup_multiply(tmp, df, oa[i]);
             simdgroup_half8x8 vf;
             simdgroup_load(vf, vb + i * 8u, kvstride);
-            simdgroup_multiply_accumulate(oa[i], pf, vf, tmp);
+            simdgroup_multiply_accumulate(tmp, pf0, vf, tmp);
+            simdgroup_load(vf, vb + 8u * kvstride + i * 8u, kvstride);
+            simdgroup_multiply_accumulate(oa[i], pf1, vf, tmp);
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }

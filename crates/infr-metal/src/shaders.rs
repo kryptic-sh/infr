@@ -147,143 +147,44 @@ kernel void linear_f32(device const float* x   [[buffer(0)]],
     if (lane == 0u) dst[sg] = acc;
 }
 
-// ---- Linear over a NATIVE quantized weight in FACTORED form: `w = (d*sc)*code + (dmin*m)`, with
-// bit-packed codes (4/6/8-bit, low bits first), one (sc, m) i16 pair per 16-element block, and one
-// (d, dmin) f16 pair per 2^dshift elements. Same simdgroup GEMV as linear_f32, but each lane
-// decodes one 16-element block per step: block codes + 4 bytes of (sc, m) + an amortized 4 bytes
-// of (d, dmin) — ~6.1 bpw for Q4_K, ~8.1 for Q6_K, where the old u8-code + f32-scale form paid
-// 8-12. Decode GEMV is bound on this stream, so bits are throughput. The two f32 multiplies
-// reproduce the host dequant's scale/min bit-for-bit, keeping parity with the CPU exact.
+// ---- Linear over a NATIVE quantized weight. Two on-device forms:
+//
+// * FACTORED (`dequant_factored`): bit-packed 4/6/8-bit codes + one (sc, m) i16 pair per
+//   16-element block + one (d, dmin) f16 pair per 2^dshift elements — for the affine formats
+//   without a fast native decoder (legacy quants, Q2_K/Q3_K/Q5_K).
+// * NATIVE GGUF blocks for Q4_K (144 B / 256 elems, ~4.5 bpw) and Q6_K (210 B, ~6.6 bpw): the
+//   kernel decodes the raw block bytes — the bound weight buffer is used as-is, no host repack,
+//   no extra residency, and the weight stream shrinks to the format's true size (the factored
+//   form paid ~6.1/8.1 bpw). Decode GEMV is bound on this stream, so bits are throughput.
+//
+// Every decode reproduces the host dequant reference bit-for-bit: the same f32 products
+// (f32(d)·f32(int)) and the same `scale*code + min` operation order.
+//
+// One DEC16_* macro per format decodes the 16-element block with global index `bi` into wk[16]
+// (ambient: `codes`, `scm`, `dd`, `p`, `bi`). Three kernel shapes instantiate each format:
+// GEMV (one simdgroup per output, decode), RT (row-tiled, small m), MM (simdgroup_matrix GEMM,
+// prefill).
 struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
 
-// 4-bit codes: one uint2 = 8 bytes = one 16-element block, code k at bits 4k (LSB-first).
-kernel void linear_quik4(device const float*  x     [[buffer(0)]],
-                         device const uint2*  codes [[buffer(1)]],
-                         device const short2* scm   [[buffer(2)]],
-                         device const half2*  dd    [[buffer(3)]],
-                         device float*        dst   [[buffer(4)]],
-                         constant QLinParams& p     [[buffer(5)]],
-                         uint gid  [[thread_position_in_grid]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-    uint sg = gid / 32u;
-    if (sg >= p.m * p.out_f) return;
-    uint r = sg / p.out_f;
-    uint o = sg % p.out_f;
-    uint nb = p.in_f >> 4;                        // 16-element blocks per weight row
-    ulong row16 = (ulong)o * nb;
-    ulong rowe = (ulong)o * p.in_f;
-    device const float* xr = x + (ulong)r * p.in_f;
-    float acc = 0.0f;
-    for (uint b = lane; b < nb; b += 32u) {
-        uint2 cw = codes[row16 + b];
-        short2 s = scm[row16 + b];
-        half2 dv = dd[(rowe + ((ulong)b << 4)) >> p.dshift];
-        float scale = (float)dv.x * (float)s.x;
-        float mn = (float)dv.y * (float)s.y;
-        device const float* xb = xr + (b << 4);
-        for (uint k = 0; k < 8u; k++) {
-            acc += xb[k]      * (scale * (float)((cw.x >> (4u * k)) & 15u) + mn);
-            acc += xb[k + 8u] * (scale * (float)((cw.y >> (4u * k)) & 15u) + mn);
-        }
-    }
-    acc = simd_sum(acc);
-    if (lane == 0u) dst[sg] = acc;
-}
-
-// 6-bit codes: three uints = 12 bytes = one 16-element block, code k at bits 6k (LSB-first).
-kernel void linear_quik6(device const float*  x     [[buffer(0)]],
-                         device const uint*   codes [[buffer(1)]],
-                         device const short2* scm   [[buffer(2)]],
-                         device const half2*  dd    [[buffer(3)]],
-                         device float*        dst   [[buffer(4)]],
-                         constant QLinParams& p     [[buffer(5)]],
-                         uint gid  [[thread_position_in_grid]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-    uint sg = gid / 32u;
-    if (sg >= p.m * p.out_f) return;
-    uint r = sg / p.out_f;
-    uint o = sg % p.out_f;
-    uint nb = p.in_f >> 4;
-    ulong row16 = (ulong)o * nb;
-    ulong rowe = (ulong)o * p.in_f;
-    device const float* xr = x + (ulong)r * p.in_f;
-    float acc = 0.0f;
-    for (uint b = lane; b < nb; b += 32u) {
-        ulong ci = (row16 + b) * 3ul;
-        uint u0 = codes[ci], u1 = codes[ci + 1ul], u2 = codes[ci + 2ul];
-        short2 s = scm[row16 + b];
-        half2 dv = dd[(rowe + ((ulong)b << 4)) >> p.dshift];
-        float scale = (float)dv.x * (float)s.x;
-        float mn = (float)dv.y * (float)s.y;
-        device const float* xb = xr + (b << 4);
-        uint c[16];
-        c[0] = u0 & 63u;                  c[1] = (u0 >> 6) & 63u;
-        c[2] = (u0 >> 12) & 63u;          c[3] = (u0 >> 18) & 63u;
-        c[4] = (u0 >> 24) & 63u;          c[5] = ((u0 >> 30) | (u1 << 2)) & 63u;
-        c[6] = (u1 >> 4) & 63u;           c[7] = (u1 >> 10) & 63u;
-        c[8] = (u1 >> 16) & 63u;          c[9] = (u1 >> 22) & 63u;
-        c[10] = ((u1 >> 28) | (u2 << 4)) & 63u;
-        c[11] = (u2 >> 2) & 63u;          c[12] = (u2 >> 8) & 63u;
-        c[13] = (u2 >> 14) & 63u;         c[14] = (u2 >> 20) & 63u;
-        c[15] = (u2 >> 26) & 63u;
-        for (uint k = 0; k < 16u; k++) acc += xb[k] * (scale * (float)c[k] + mn);
-    }
-    acc = simd_sum(acc);
-    if (lane == 0u) dst[sg] = acc;
-}
-
-// 8-bit codes: one uchar16 = one 16-element block.
-kernel void linear_quik8(device const float*   x     [[buffer(0)]],
-                         device const uchar4*  codes [[buffer(1)]],
-                         device const short2*  scm   [[buffer(2)]],
-                         device const half2*   dd    [[buffer(3)]],
-                         device float*         dst   [[buffer(4)]],
-                         constant QLinParams&  p     [[buffer(5)]],
-                         uint gid  [[thread_position_in_grid]],
-                         uint lane [[thread_index_in_simdgroup]]) {
-    uint sg = gid / 32u;
-    if (sg >= p.m * p.out_f) return;
-    uint r = sg / p.out_f;
-    uint o = sg % p.out_f;
-    uint nb = p.in_f >> 4;
-    ulong row16 = (ulong)o * nb;
-    ulong rowe = (ulong)o * p.in_f;
-    device const float* xr = x + (ulong)r * p.in_f;
-    float acc = 0.0f;
-    for (uint b = lane; b < nb; b += 32u) {
-        ulong ci = (row16 + b) * 4ul;
-        short2 s = scm[row16 + b];
-        half2 dv = dd[(rowe + ((ulong)b << 4)) >> p.dshift];
-        float scale = (float)dv.x * (float)s.x;
-        float mn = (float)dv.y * (float)s.y;
-        device const float* xb = xr + (b << 4);
-        for (uint q = 0; q < 4u; q++) {
-            uchar4 cq = codes[ci + q];
-            acc += xb[q * 4u]      * (scale * (float)cq.x + mn);
-            acc += xb[q * 4u + 1u] * (scale * (float)cq.y + mn);
-            acc += xb[q * 4u + 2u] * (scale * (float)cq.z + mn);
-            acc += xb[q * 4u + 3u] * (scale * (float)cq.w + mn);
-        }
-    }
-    acc = simd_sum(acc);
-    if (lane == 0u) dst[sg] = acc;
-}
-
-// ---- Row-tiled quantized GEMM for prefill (m > 1): one simdgroup per (row-tile, output), RT=8
-// rows per tile. Each lane decodes a weight block ONCE into registers and applies it to all 8
-// rows — the GEMV kernels above re-stream the whole weight matrix once per row, which is what
-// made prefill weight-traffic-bound (m=600+ re-reads). Per-row summation order matches the GEMV
-// kernels exactly (same lane-strided blocks, same in-block order), so parity is unchanged.
-// DEC(wk, scale, mn): decode the current 16-element block's weights into wk[16], per code width.
-#define RT 8u
-#define DEC_K4(wk, scale, mn)                                                                     \
-    uint2 cw = ((device const uint2*)codes)[bi];                                           \
+// factored, 4-bit codes: one uint2 = 8 bytes = one 16-element block, code k at bits 4k.
+#define DEC16_K4(wk)                                                                              \
+    short2 s = ((device const short2*)scm)[bi];                                                   \
+    half2 dv = ((device const half2*)dd)[((ulong)bi << 4) >> p.dshift];                           \
+    float scale = (float)dv.x * (float)s.x;                                                       \
+    float mn = (float)dv.y * (float)s.y;                                                          \
+    uint2 cw = ((device const uint2*)codes)[bi];                                                  \
     for (uint k = 0; k < 8u; k++) {                                                               \
         wk[k]      = scale * (float)((cw.x >> (4u * k)) & 15u) + mn;                              \
         wk[k + 8u] = scale * (float)((cw.y >> (4u * k)) & 15u) + mn;                              \
     }
-#define DEC_K6(wk, scale, mn)                                                                     \
-    device const uint* cp = (device const uint*)codes + bi * 3ul;                        \
+
+// factored, 6-bit codes: three uints = 12 bytes = one 16-element block, code k at bits 6k.
+#define DEC16_K6(wk)                                                                              \
+    short2 s = ((device const short2*)scm)[bi];                                                   \
+    half2 dv = ((device const half2*)dd)[((ulong)bi << 4) >> p.dshift];                           \
+    float scale = (float)dv.x * (float)s.x;                                                       \
+    float mn = (float)dv.y * (float)s.y;                                                         \
+    device const uint* cp = (device const uint*)codes + bi * 3ul;                                 \
     uint u0 = cp[0], u1 = cp[1], u2 = cp[2];                                                      \
     wk[0]  = scale * (float)(u0 & 63u) + mn;                                                      \
     wk[1]  = scale * (float)((u0 >> 6) & 63u) + mn;                                               \
@@ -301,8 +202,14 @@ kernel void linear_quik8(device const float*   x     [[buffer(0)]],
     wk[13] = scale * (float)((u2 >> 14) & 63u) + mn;                                              \
     wk[14] = scale * (float)((u2 >> 20) & 63u) + mn;                                              \
     wk[15] = scale * (float)((u2 >> 26) & 63u) + mn;
-#define DEC_K8(wk, scale, mn)                                                                     \
-    device const uchar4* cp = (device const uchar4*)codes + bi * 4ul;                    \
+
+// factored, 8-bit codes: one uchar16 = one 16-element block.
+#define DEC16_K8(wk)                                                                              \
+    short2 s = ((device const short2*)scm)[bi];                                                   \
+    half2 dv = ((device const half2*)dd)[((ulong)bi << 4) >> p.dshift];                           \
+    float scale = (float)dv.x * (float)s.x;                                                       \
+    float mn = (float)dv.y * (float)s.y;                                                         \
+    device const uchar4* cp = (device const uchar4*)codes + bi * 4ul;                             \
     for (uint q = 0; q < 4u; q++) {                                                               \
         uchar4 cq = cp[q];                                                                        \
         wk[q * 4u]      = scale * (float)cq.x + mn;                                               \
@@ -311,35 +218,127 @@ kernel void linear_quik8(device const float*   x     [[buffer(0)]],
         wk[q * 4u + 3u] = scale * (float)cq.w + mn;                                               \
     }
 
-#define RT_KERNEL(NAME, DEC)                                                                      \
+// NATIVE Q4_K block (144 B / 256 elems): [f16 d][f16 dmin][12 B 6-bit scales][128 B nibbles].
+// 16-block `sub` within the 256-block: quarter j = sub/4 (qs bytes j*32..), low/high nibble half
+// `hi`, and which 16 of the 32 l-values `l0`. Scale/min pair via get_scale_min_k4(2j + hi).
+// scm/dd are unused (dummy bindings). 144 % 4 == 0, so uint loads stay aligned.
+#define DEC16_Q4K(wk)                                                                             \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 144ul;                                   \
+    uint sub = bi & 15u;                                                                          \
+    uint j = sub >> 2;                                                                            \
+    uint hi = (sub >> 1) & 1u;                                                                    \
+    uint l0 = (sub & 1u) * 16u;                                                                   \
+    uint dm = *(device const uint*)blk;                                                           \
+    float d = (float)as_type<half>((ushort)(dm & 0xFFFFu));                                       \
+    float dmin = (float)as_type<half>((ushort)(dm >> 16));                                        \
+    device const uchar* scb = blk + 4u;                                                           \
+    uint jj = 2u * j + hi;                                                                        \
+    uint sc6, m6;                                                                                 \
+    if (jj < 4u) {                                                                                \
+        sc6 = scb[jj] & 63u;                                                                      \
+        m6 = scb[jj + 4u] & 63u;                                                                  \
+    } else {                                                                                      \
+        sc6 = (scb[jj + 4u] & 0x0Fu) | ((scb[jj - 4u] >> 6) << 4);                                \
+        m6 = (scb[jj + 4u] >> 4) | ((scb[jj] >> 6) << 4);                                         \
+    }                                                                                             \
+    float scale = d * (float)sc6;                                                                 \
+    float mn = -(dmin * (float)m6);                                                               \
+    device const uint* qw4 = (device const uint*)(blk + 16u + j * 32u + l0);                      \
+    for (uint w = 0; w < 4u; w++) {                                                               \
+        uint u = qw4[w];                                                                          \
+        for (uint k2 = 0; k2 < 4u; k2++) {                                                        \
+            uint byt = (u >> (8u * k2)) & 0xFFu;                                                  \
+            uint q = hi ? (byt >> 4) : (byt & 0xFu);                                              \
+            wk[w * 4u + k2] = scale * (float)q + mn;                                              \
+        }                                                                                         \
+    }
+
+// NATIVE Q6_K block (210 B / 256 elems): [128 B ql][64 B qh][16 x i8 scales][f16 d].
+// 16-block `sub`: half h6 = sub/8 (128 elems each), then group off = (sub%8 / 2)*32 with
+// is = sub%2 selecting which 16 l-values; q built from ql/qh nibble+2-bit pieces, scale from the
+// i8 scale at [h6*8 + off/16 + is], min = -32*scale (exact power-of-two scaling of the same f32
+// product the reference computes). 210 % 4 != 0, so all loads are byte loads.
+#define DEC16_Q6K(wk)                                                                             \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 210ul;                                   \
+    uint sub = bi & 15u;                                                                          \
+    uint h6 = sub >> 3;                                                                           \
+    uint sub8 = sub & 7u;                                                                         \
+    uint off = (sub8 >> 1) * 32u;                                                                 \
+    uint is = sub8 & 1u;                                                                          \
+    device const uchar* ql = blk + h6 * 64u;                                                      \
+    device const uchar* qh = blk + 128u + h6 * 32u;                                               \
+    device const uchar* scs = blk + 192u;                                                         \
+    float d = (float)as_type<half>((ushort)(blk[208] | ((ushort)blk[209] << 8)));                 \
+    float scale = d * (float)(char)scs[h6 * 8u + (off >> 4) + is];                                \
+    float mn = -32.0f * scale;                                                                    \
+    uint lb = is * 16u;                                                                           \
+    /* branch-free (lanes hold different `off`s; a 4-way if would serialize the simdgroup): */    \
+    /* ql byte at l (+32 for the odd 32-groups), low/high nibble by off>=64, qh bits at off/16 */ \
+    uint qlo = (off & 32u);                                                                       \
+    uint nsh = (off >= 64u) ? 4u : 0u;                                                            \
+    uint qhs = off >> 4;                                                                          \
+    for (uint k = 0; k < 16u; k++) {                                                              \
+        uint l = lb + k;                                                                          \
+        uint q = ((ql[l + qlo] >> nsh) & 0xFu) | (((qh[l] >> qhs) & 3u) << 4);                    \
+        wk[k] = scale * (float)q + mn;                                                            \
+    }
+
+// GEMV: one simdgroup (32 lanes) per output element; each lane decodes one 16-element block per
+// step, coalesced across lanes, `simd_sum` reduction. m=1 decode is bound on the weight stream.
+#define GEMV_KERNEL(NAME, DEC)                                                                    \
 kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
                  device const uchar*  codes [[buffer(1)]],                                       \
-                 device const short2* scm   [[buffer(2)]],                                       \
-                 device const half2*  dd    [[buffer(3)]],                                       \
+                 device const uchar*  scm   [[buffer(2)]],                                       \
+                 device const uchar*  dd    [[buffer(3)]],                                       \
                  device float*        dst   [[buffer(4)]],                                       \
                  constant QLinParams& p     [[buffer(5)]],                                       \
                  uint gid  [[thread_position_in_grid]],                                          \
                  uint lane [[thread_index_in_simdgroup]]) {                                      \
     uint sg = gid / 32u;                                                                          \
-    uint ntile = (p.m + RT - 1u) / RT;                                                            \
+    if (sg >= p.m * p.out_f) return;                                                              \
+    uint r = sg / p.out_f;                                                                        \
+    uint o = sg % p.out_f;                                                                        \
+    uint nb = p.in_f >> 4;                                                                        \
+    ulong row16 = (ulong)o * nb;                                                                  \
+    device const float* xr = x + (ulong)r * p.in_f;                                               \
+    float acc = 0.0f;                                                                             \
+    for (uint b = lane; b < nb; b += 32u) {                                                       \
+        ulong bi = row16 + b;                                                                     \
+        float wk[16];                                                                             \
+        DEC(wk)                                                                                   \
+        device const float* xb = xr + (b << 4);                                                   \
+        for (uint k = 0; k < 16u; k++) acc += xb[k] * wk[k];                                      \
+    }                                                                                             \
+    acc = simd_sum(acc);                                                                          \
+    if (lane == 0u) dst[sg] = acc;                                                                \
+}
+
+// Row-tiled (1 < m < 16, or shapes the GEMM kernel can't take): one simdgroup per (8-row tile,
+// output); each lane decodes a block once and applies it to all rows.
+#define RT_KERNEL(NAME, DEC)                                                                      \
+kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
+                 device const uchar*  codes [[buffer(1)]],                                       \
+                 device const uchar*  scm   [[buffer(2)]],                                       \
+                 device const uchar*  dd    [[buffer(3)]],                                       \
+                 device float*        dst   [[buffer(4)]],                                       \
+                 constant QLinParams& p     [[buffer(5)]],                                       \
+                 uint gid  [[thread_position_in_grid]],                                          \
+                 uint lane [[thread_index_in_simdgroup]]) {                                      \
+    uint sg = gid / 32u;                                                                          \
+    uint ntile = (p.m + 7u) / 8u;                                                                 \
     if (sg >= ntile * p.out_f) return;                                                            \
     uint t = sg / p.out_f;                                                                        \
     uint o = sg % p.out_f;                                                                        \
-    uint r0 = t * RT;                                                                             \
-    uint rm = min(RT, p.m - r0);                                                                  \
+    uint r0 = t * 8u;                                                                             \
+    uint rm = min(8u, p.m - r0);                                                                  \
     uint nb = p.in_f >> 4;                                                                        \
     ulong row16 = (ulong)o * nb;                                                                  \
-    ulong rowe = (ulong)o * p.in_f;                                                               \
-    float acc[RT];                                                                                \
-    for (uint rr = 0; rr < RT; rr++) acc[rr] = 0.0f;                                              \
+    float acc[8];                                                                                 \
+    for (uint rr = 0; rr < 8u; rr++) acc[rr] = 0.0f;                                              \
     for (uint b = lane; b < nb; b += 32u) {                                                       \
         ulong bi = row16 + b;                                                                     \
-        short2 s = scm[bi];                                                                       \
-        half2 dv = dd[(rowe + ((ulong)b << 4)) >> p.dshift];                                      \
-        float scale = (float)dv.x * (float)s.x;                                                   \
-        float mn = (float)dv.y * (float)s.y;                                                      \
         float wk[16];                                                                             \
-        DEC(wk, scale, mn)                                                                        \
+        DEC(wk)                                                                                   \
         for (uint rr = 0; rr < rm; rr++) {                                                        \
             device const float* xb = x + (ulong)(r0 + rr) * p.in_f + (b << 4);                    \
             for (uint k = 0; k < 16u; k++) acc[rr] += xb[k] * wk[k];                              \
@@ -351,91 +350,106 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     }                                                                                             \
 }
 
-RT_KERNEL(linear_quik4_rt, DEC_K4)
-RT_KERNEL(linear_quik6_rt, DEC_K6)
-RT_KERNEL(linear_quik8_rt, DEC_K8)
 
-// ---- simdgroup_matrix quantized GEMM for prefill (m >= 16): one simdgroup per 8x8 output tile
-// (8 token rows x 8 outputs). Per 16-wide K block: lanes 0..7 each decode one output row's block
-// into a per-simdgroup threadgroup tile (via the same DEC_* macros), then two 8x8x8 MMAs consume
-// it. The matrix pipeline reuses every loaded operand 8x, where the scalar GEMV/row-tiled kernels
-// pay one load per FMA — that ALU/load structure, not weight bandwidth, is what capped prefill.
-// The last (partial) row tile falls back to a scalar dot per element; host only routes here when
-// out_f % 8 == 0. Threadgroup = 128 threads (4 simdgroups), each with its own 8x16 f32 tile.
-#define GEMM_KERNEL(NAME, DEC)                                                                    \
-kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
+// ---- Cast f32 -> f16 (prefill GEMM feeds on half activations; round-to-nearest-even).
+kernel void cast_f32_f16(device const float* src [[buffer(0)]],
+                         device half*        dst [[buffer(1)]],
+                         constant uint&      n   [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid < n) dst[gid] = (half)src[gid];
+}
+
+// Half-fragment GEMM: same 8x16-tile shape as GEMM_KERNEL, but x and the staged weight tile are
+// f16 and the MMAs run half x half -> float (Apple's mixed-precision simdgroup_multiply_accumulate,
+// double the f32 matrix rate and half the staging bytes). Accumulation stays f32. This is the one
+// path that is NOT bit-exact against the dequant reference: weights and activations round to f16
+// (~5e-4 relative) — the llama.cpp trade, well under quantization error. Decode (GEMV) stays f32.
+#define HGEMM_KERNEL(NAME, DEC)                                                                   \
+kernel void NAME(device const half*   x     [[buffer(0)]],                                       \
                  device const uchar*  codes [[buffer(1)]],                                       \
-                 device const short2* scm   [[buffer(2)]],                                       \
-                 device const half2*  dd    [[buffer(3)]],                                       \
+                 device const uchar*  scm   [[buffer(2)]],                                       \
+                 device const uchar*  dd    [[buffer(3)]],                                       \
                  device float*        dst   [[buffer(4)]],                                       \
                  constant QLinParams& p     [[buffer(5)]],                                       \
                  uint gid  [[thread_position_in_grid]],                                          \
                  uint lane [[thread_index_in_simdgroup]],                                        \
                  uint sgid [[simdgroup_index_in_threadgroup]]) {                                 \
     uint sg = gid / 32u;                                                                          \
-    uint ntm = (p.m + 7u) / 8u;                                                                   \
+    uint ntm = (p.m + 31u) / 32u;                                                                 \
     uint nto = p.out_f / 16u;                                                                     \
     if (sg >= ntm * nto) return;                                                                  \
     uint tm = sg / nto;                                                                           \
     uint to = sg % nto;                                                                           \
-    uint r0 = tm * 8u;                                                                            \
+    uint r0 = tm * 32u;                                                                           \
     uint o0 = to * 16u;                                                                           \
     uint nb = p.in_f >> 4;                                                                        \
-    threadgroup float wt[4][16 * 16];                                                             \
-    if (r0 + 8u <= p.m) {                                                                         \
-        simdgroup_float8x8 acc0 = simdgroup_float8x8(0.0f);                                       \
-        simdgroup_float8x8 acc1 = simdgroup_float8x8(0.0f);                                       \
+    threadgroup half wt[4][16 * 16];                                                              \
+    if (r0 + 32u <= p.m) {                                                                        \
+        simdgroup_float8x8 acc[4][2];                                                             \
+        for (uint i = 0; i < 4u; i++)                                                             \
+            for (uint jx = 0; jx < 2u; jx++) acc[i][jx] = simdgroup_float8x8(0.0f);               \
         for (uint kb = 0; kb < nb; kb++) {                                                        \
             if (lane < 16u) {                                                                     \
                 ulong bi = (ulong)(o0 + lane) * nb + kb;                                          \
-                short2 s = scm[bi];                                                               \
-                half2 dv = dd[((ulong)(o0 + lane) * p.in_f + ((ulong)kb << 4)) >> p.dshift];      \
-                float scale = (float)dv.x * (float)s.x;                                           \
-                float mn = (float)dv.y * (float)s.y;                                              \
                 float wk[16];                                                                     \
-                DEC(wk, scale, mn)                                                                \
-                for (uint k2 = 0; k2 < 16u; k2++) wt[sgid][lane * 16u + k2] = wk[k2];             \
+                DEC(wk)                                                                           \
+                for (uint k2 = 0; k2 < 16u; k2++) wt[sgid][lane * 16u + k2] = (half)wk[k2];       \
             }                                                                                     \
             simdgroup_barrier(mem_flags::mem_threadgroup);                                        \
-            device const float* xp = x + (ulong)r0 * p.in_f + ((ulong)kb << 4);                   \
-            simdgroup_float8x8 xa, wb;                                                            \
             for (uint kh = 0; kh < 2u; kh++) {                                                    \
-                simdgroup_load(xa, xp + kh * 8u, p.in_f);                                         \
-                simdgroup_load(wb, &wt[sgid][kh * 8u], 16, ulong2(0, 0), true);                   \
-                simdgroup_multiply_accumulate(acc0, xa, wb, acc0);                                \
-                simdgroup_load(wb, &wt[sgid][128u + kh * 8u], 16, ulong2(0, 0), true);            \
-                simdgroup_multiply_accumulate(acc1, xa, wb, acc1);                                \
+                simdgroup_half8x8 wb0, wb1;                                                       \
+                simdgroup_load(wb0, &wt[sgid][kh * 8u], 16, ulong2(0, 0), true);                  \
+                simdgroup_load(wb1, &wt[sgid][128u + kh * 8u], 16, ulong2(0, 0), true);           \
+                for (uint rh = 0; rh < 4u; rh++) {                                                \
+                    simdgroup_half8x8 xa;                                                         \
+                    device const half* xp =                                                       \
+                        x + (ulong)(r0 + rh * 8u) * p.in_f + ((ulong)kb << 4) + kh * 8u;          \
+                    simdgroup_load(xa, xp, p.in_f);                                               \
+                    simdgroup_multiply_accumulate(acc[rh][0], xa, wb0, acc[rh][0]);               \
+                    simdgroup_multiply_accumulate(acc[rh][1], xa, wb1, acc[rh][1]);               \
+                }                                                                                 \
             }                                                                                     \
             simdgroup_barrier(mem_flags::mem_threadgroup);                                        \
         }                                                                                         \
-        simdgroup_store(acc0, dst + (ulong)r0 * p.out_f + o0, p.out_f);                           \
-        simdgroup_store(acc1, dst + (ulong)r0 * p.out_f + o0 + 8u, p.out_f);                      \
+        for (uint rh = 0; rh < 4u; rh++)                                                          \
+            for (uint oh = 0; oh < 2u; oh++)                                                      \
+                simdgroup_store(acc[rh][oh],                                                      \
+                                dst + (ulong)(r0 + rh * 8u) * p.out_f + o0 + oh * 8u, p.out_f);   \
     } else {                                                                                      \
-        /* partial row tile: scalar dot per (row, output) element, 4 per lane */                  \
-        for (uint e = lane; e < 128u; e += 32u) {                                                 \
+        /* partial row tile: scalar dot per (row, output) element */                              \
+        for (uint e = lane; e < 512u; e += 32u) {                                                 \
             uint rr = r0 + e / 16u;                                                               \
             uint o = o0 + (e % 16u);                                                              \
             if (rr >= p.m) continue;                                                              \
             float a2 = 0.0f;                                                                      \
             for (uint kb = 0; kb < nb; kb++) {                                                    \
                 ulong bi = (ulong)o * nb + kb;                                                    \
-                short2 s = scm[bi];                                                               \
-                half2 dv = dd[((ulong)o * p.in_f + ((ulong)kb << 4)) >> p.dshift];                \
-                float scale = (float)dv.x * (float)s.x;                                           \
-                float mn = (float)dv.y * (float)s.y;                                              \
                 float wk[16];                                                                     \
-                DEC(wk, scale, mn)                                                                \
-                device const float* xb = x + (ulong)rr * p.in_f + ((ulong)kb << 4);               \
-                for (uint k2 = 0; k2 < 16u; k2++) a2 += xb[k2] * wk[k2];                          \
+                DEC(wk)                                                                           \
+                device const half* xb = x + (ulong)rr * p.in_f + ((ulong)kb << 4);                \
+                for (uint k2 = 0; k2 < 16u; k2++) a2 += (float)xb[k2] * (float)((half)wk[k2]);    \
             }                                                                                     \
             dst[(ulong)rr * p.out_f + o] = a2;                                                    \
         }                                                                                         \
     }                                                                                             \
 }
 
-GEMM_KERNEL(linear_quik4_mm, DEC_K4)
-GEMM_KERNEL(linear_quik6_mm, DEC_K6)
-GEMM_KERNEL(linear_quik8_mm, DEC_K8)
+GEMV_KERNEL(linear_quik4, DEC16_K4)
+GEMV_KERNEL(linear_quik6, DEC16_K6)
+GEMV_KERNEL(linear_quik8, DEC16_K8)
+GEMV_KERNEL(linear_q4k, DEC16_Q4K)
+GEMV_KERNEL(linear_q6k, DEC16_Q6K)
+RT_KERNEL(linear_quik4_rt, DEC16_K4)
+RT_KERNEL(linear_quik6_rt, DEC16_K6)
+RT_KERNEL(linear_quik8_rt, DEC16_K8)
+RT_KERNEL(linear_q4k_rt, DEC16_Q4K)
+RT_KERNEL(linear_q6k_rt, DEC16_Q6K)
+HGEMM_KERNEL(linear_quik4_hmm, DEC16_K4)
+HGEMM_KERNEL(linear_quik6_hmm, DEC16_K6)
+HGEMM_KERNEL(linear_quik8_hmm, DEC16_K8)
+HGEMM_KERNEL(linear_q4k_hmm, DEC16_Q4K)
+HGEMM_KERNEL(linear_q6k_hmm, DEC16_Q6K)
+
 
 // ---- RoPE (NEOX): rotate the first rope_dim of each head; dims beyond pass through. One thread
 // per (row, head). `pos`/`ff` buffers are f32. `has_ff` selects the per-pair freq divisor.

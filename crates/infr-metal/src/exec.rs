@@ -840,14 +840,16 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::Causal => 0,
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                 };
-                // Route by launch width. Decode (rows=1) yields only rows*n_head simdgroups —
-                // far too few to occupy the GPU — so it takes a split-KV kernel (NSG simdgroups
-                // per (query, head), merged in threadgroup memory). Prefill has thousands of
-                // (query, head) pairs and keeps the leaner one-simdgroup kernel, whose lack of
-                // threadgroup memory lets more threadgroups run per core. Among the split widths:
-                // the kernel is latency-bound on its ~kv_len/NSG serial online-softmax chain, so
-                // longer contexts take the 32-way split when head_dim fits its threadgroup
-                // accumulator (hd <= 128); NSG=8 covers the rest.
+                // Route by kernel-latency shape. The one-simdgroup-per-(query, head) kernels are
+                // latency-bound on their serial O(kv_len) online-softmax chain, so any long
+                // context takes a split-KV kernel — NSG simdgroups per (query, head) merged in
+                // threadgroup memory — 32-way when head_dim fits its threadgroup accumulator
+                // (hd <= 128), 8-way otherwise. That holds for prefill too (measured, not just
+                // decode): the extra parallelism is redundant there, but the 4x-8x shorter serial
+                // chain still wins. Short contexts keep the lean unsplit kernel. (A
+                // simdgroup_matrix flash-attention kernel was built and benched here; it never
+                // beat the 32-way split on prefill — occupancy-starved by its threadgroup tiles —
+                // so it was dropped.)
                 let split = rows * nh < 128 || kv_len >= 128;
                 let split32 = split && kv_len >= 128 && hd <= 128;
                 let kern = match (g.desc(k_cache).dtype, split, split32) {

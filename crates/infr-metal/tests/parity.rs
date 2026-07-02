@@ -656,6 +656,39 @@ fn attention_gqa_causal_parity() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
 }
 
+// Wide launch, short context (rows*n_head >= 128, kv_len < 128): routes to the lean unsplit
+// kernel (`attention_*`), which the small-shape tests above never reach at this width.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_prefill_wide_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 24usize, 8usize, 2usize, 64usize, 7usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 61))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 62))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 63))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+}
+
 // Long-context decode shape (rows=1, kv_len >= 128, hd <= 128): routes to the 32-way split-KV
 // kernel (`attnsplit32_*`), which the short-kv tests above never reach.
 #[test]

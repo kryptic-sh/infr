@@ -760,7 +760,18 @@ fn lower_op(
             head_v,
             eps,
         } => {
-            rec.deltanet(
+            // Prefill (rows ≥ 32): the chunkwise delta rule processes 32 tokens per state
+            // traversal (matmuls + a triangular solve) instead of the token-serial recurrence —
+            // the difference between rows and rows/32 sequential state sweeps. Decode/short rows
+            // keep the sequential kernel. INFR_NO_DN_CHUNK forces sequential.
+            let chunked = *rows >= 32 && std::env::var("INFR_NO_DN_CHUNK").is_err();
+            let dn = if chunked {
+                Recorder::deltanet_chunked
+            } else {
+                Recorder::deltanet
+            };
+            dn(
+                rec,
                 r(*q)?,
                 r(*k)?,
                 r(*v)?,

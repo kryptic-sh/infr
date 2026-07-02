@@ -2072,6 +2072,70 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// CHUNKED gated-DeltaNet prefill (chunkwise delta rule, C=32): per 32-token chunk the
+    /// recurrence collapses to dense matmuls + one unit-lower-triangular solve, so the state is
+    /// traversed rows/32 times instead of `rows`. Same signature/bindings as `deltanet`; math
+    /// validated against the sequential form in tests/chunked_delta_math.rs. Use for rows ≥ 32
+    /// (decode keeps the sequential kernel). See shaders/deltanet_chunked.comp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_chunked(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+    ) {
+        self.stamp("deltanet");
+        debug_assert!(
+            kd <= 128,
+            "deltanet_chunked LDS chunk tiles assume kd ≤ 128, got {kd}"
+        );
+        let kern = self.be.kernel(
+            "deltanet_chunked",
+            crate::gemm::deltanet_chunked_spv(),
+            9,
+            28,
+        );
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&eps.to_ne_bytes());
+        push[24..28].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        // One workgroup per (value head, block of 32 state columns); local_size_x=256.
+        let n_blk = vd.div_ceil(32);
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(q),
+                Self::vkb(k),
+                Self::vkb(v),
+                Self::vkb(blog),
+                Self::vkb(alpha),
+                Self::vkb(acoef),
+                Self::vkb(dtbias),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2, // state (in/out) + out
+            &push,
+            (nv * n_blk) as u32,
+        );
+    }
+
     /// Causal depthwise conv1d + SiLU, one token (Qwen3-Next SSM input conv). The per-channel history
     /// `state` `[(kconv-1)*cc]` is updated in place; `out` is `[cc]`. See shaders/conv1d_silu.comp.
     pub fn conv1d_silu(

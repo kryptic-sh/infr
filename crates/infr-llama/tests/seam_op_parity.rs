@@ -582,6 +582,73 @@ fn conv1d_silu_parity() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn deltanet_chunked_parity() {
+    // rows ≥ 32 routes to the CHUNKED delta-rule kernel (deltanet_chunked.comp): qwen35-like dims,
+    // GQA tiling, a NONZERO initial state (exercises the cross-chunk carry) and a partial last
+    // chunk (130 = 4×32 + 2). The CPU oracle is the sequential recurrence.
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nv, nk, kd, vd) = (130usize, 8usize, 4usize, 128usize, 128usize);
+    let mut g = Graph::new();
+    let q = g.input(f32d(rows * nk * kd));
+    let k = g.input(f32d(rows * nk * kd));
+    let v = g.input(f32d(rows * nv * vd));
+    let b = g.input(f32d(rows * nv));
+    let a = g.input(f32d(rows * nv));
+    let a_coef = g.weight(f32d(nv));
+    let dt_bias = g.weight(f32d(nv));
+    let state = g.input(f32d(nv * kd * vd));
+    let dst = g.output(f32d(rows * nv * vd));
+    g.push(Op::DeltaNet {
+        q,
+        k,
+        v,
+        b,
+        a,
+        a_coef,
+        dt_bias,
+        state,
+        dst,
+        rows: rows as u32,
+        n_vhead: nv as u32,
+        n_khead: nk as u32,
+        head_k: kd as u32,
+        head_v: vd as u32,
+        eps: 1e-6,
+    });
+    let (qi, ki, vi) = (
+        gen(rows * nk * kd, 1),
+        gen(rows * nk * kd, 2),
+        gen(rows * nv * vd, 3),
+    );
+    let (bi, ai) = (gen(rows * nv, 4), gen(rows * nv, 5));
+    // a_coef must be negative (log-decay scale); gen() is symmetric, so force sign.
+    let aci: Vec<f32> = gen(nv, 8).iter().map(|x| -x.abs() - 0.1).collect();
+    let dti = gen(nv, 9);
+    let st = gen(nv * kd * vd, 10);
+    let ins = [
+        (q, &qi[..]),
+        (k, &ki[..]),
+        (v, &vi[..]),
+        (b, &bi[..]),
+        (a, &ai[..]),
+        (state, &st[..]),
+    ];
+    let ws = [(a_coef, &aci[..]), (dt_bias, &dti[..])];
+    let c = run(&cpu, &g, &ins, &ws, dst, rows * nv * vd);
+    let vv = run(&vk, &g, &ins, &ws, dst, rows * nv * vd);
+    let e = maxerr(&c, &vv);
+    println!("DeltaNet-chunked rows={rows} max_err={e:e}");
+    assert!(
+        e < 1e-3,
+        "chunked DeltaNet diverges from the sequential oracle"
+    );
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
 fn deltanet_parity() {
     let Some(vk) = gpu() else {
         return;

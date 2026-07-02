@@ -42,6 +42,7 @@ fn main() {
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
         ("rmsnorm", "rmsnorm", &[]),
         ("deltanet", "deltanet", &[]),
+        ("deltanet_chunked", "deltanet_chunked", &[]),
         ("conv1d_silu", "conv1d_silu", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
         ("add", "add", &[]),

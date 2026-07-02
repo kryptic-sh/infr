@@ -147,77 +147,123 @@ kernel void linear_f32(device const float* x   [[buffer(0)]],
     if (lane == 0u) dst[sg] = acc;
 }
 
-// ---- Linear over a NATIVE quantized weight in unified form: `w = scale*code + min`, with one u8
-// code per element and one (scale,min) per 16-element block. Same simdgroup GEMV as linear_f32, but
-// the weight is decoded inline — ~12 bpw read instead of a 32 bpw dequant-to-f32 blow-up. The
-// reconstruction is bit-for-bit what infr_gguf::dequant produces, so parity with the CPU stays exact.
-//
-// Codes are read as `uchar4` (in_f is a multiple of 256, so /4 is exact and `wbase` is 4-aligned):
-// one 4-byte load per lane instead of four 1-byte loads, and consecutive lanes cover 128 contiguous
-// bytes per step — a full cache line — so the weight stream is read at memory bandwidth. All four
-// codes in a uchar4 fall in the same 16-block, so their (scale,min) is a single `sm` load.
-kernel void linear_qui(device const float*  x     [[buffer(0)]],
-                       device const uchar4* codes [[buffer(1)]],
-                       device const float2* sm    [[buffer(2)]],
-                       device float*        dst   [[buffer(3)]],
-                       constant LinearParams& p   [[buffer(4)]],
-                       uint gid  [[thread_position_in_grid]],
-                       uint lane [[thread_index_in_simdgroup]]) {
+// ---- Linear over a NATIVE quantized weight in FACTORED form: `w = (d*sc)*code + (dmin*m)`, with
+// bit-packed codes (4/6/8-bit, low bits first), one (sc, m) i16 pair per 16-element block, and one
+// (d, dmin) f16 pair per 2^dshift elements. Same simdgroup GEMV as linear_f32, but each lane
+// decodes one 16-element block per step: block codes + 4 bytes of (sc, m) + an amortized 4 bytes
+// of (d, dmin) — ~6.1 bpw for Q4_K, ~8.1 for Q6_K, where the old u8-code + f32-scale form paid
+// 8-12. Decode GEMV is bound on this stream, so bits are throughput. The two f32 multiplies
+// reproduce the host dequant's scale/min bit-for-bit, keeping parity with the CPU exact.
+struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
+
+// 4-bit codes: one uint2 = 8 bytes = one 16-element block, code k at bits 4k (LSB-first).
+kernel void linear_quik4(device const float*  x     [[buffer(0)]],
+                         device const uint2*  codes [[buffer(1)]],
+                         device const short2* scm   [[buffer(2)]],
+                         device const half2*  dd    [[buffer(3)]],
+                         device float*        dst   [[buffer(4)]],
+                         constant QLinParams& p     [[buffer(5)]],
+                         uint gid  [[thread_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
     uint sg = gid / 32u;
     if (sg >= p.m * p.out_f) return;
     uint r = sg / p.out_f;
     uint o = sg % p.out_f;
-    ulong xbase = (ulong)r * p.in_f;
-    ulong wbase4 = (ulong)o * (p.in_f / 4u);          // uchar4 index of this weight row's start
-    uint n4 = p.in_f / 4u;
+    uint nb = p.in_f >> 4;                        // 16-element blocks per weight row
+    ulong row16 = (ulong)o * nb;
+    ulong rowe = (ulong)o * p.in_f;
+    device const float* xr = x + (ulong)r * p.in_f;
     float acc = 0.0f;
-    for (uint b = lane; b < n4; b += 32u) {
-        uchar4 c = codes[wbase4 + b];
-        uint i = b * 4u;
-        float2 s = sm[((ulong)o * p.in_f + i) >> 4];  // (scale, min) — shared by all 4 codes
-        device const float* xr = x + xbase + i;
-        acc += xr[0] * (s.x * (float)c.x + s.y)
-             + xr[1] * (s.x * (float)c.y + s.y)
-             + xr[2] * (s.x * (float)c.z + s.y)
-             + xr[3] * (s.x * (float)c.w + s.y);
+    for (uint b = lane; b < nb; b += 32u) {
+        uint2 cw = codes[row16 + b];
+        short2 s = scm[row16 + b];
+        half2 dv = dd[(rowe + ((ulong)b << 4)) >> p.dshift];
+        float scale = (float)dv.x * (float)s.x;
+        float mn = (float)dv.y * (float)s.y;
+        device const float* xb = xr + (b << 4);
+        for (uint k = 0; k < 8u; k++) {
+            acc += xb[k]      * (scale * (float)((cw.x >> (4u * k)) & 15u) + mn);
+            acc += xb[k + 8u] * (scale * (float)((cw.y >> (4u * k)) & 15u) + mn);
+        }
     }
     acc = simd_sum(acc);
     if (lane == 0u) dst[sg] = acc;
 }
 
-// ---- linear_qui with NIBBLE-PACKED codes (two 4-bit codes per byte, low nibble first): the Q4
-// family's codes all fit 4 bits, so the host halves the code stream — decode GEMV is bound on
-// exactly that stream, making this a direct ~2x traffic cut on Q4 weights (~6 bpw incl. sm vs
-// linear_qui's ~10). One uchar4 now covers 8 elements; i is a multiple of 8, so all 8 still share
-// one 16-block's (scale, min). Reconstruction stays bit-for-bit `infr_gguf::dequant`.
-kernel void linear_qui4(device const float*  x     [[buffer(0)]],
-                        device const uchar4* codes [[buffer(1)]],
-                        device const float2* sm    [[buffer(2)]],
-                        device float*        dst   [[buffer(3)]],
-                        constant LinearParams& p   [[buffer(4)]],
-                        uint gid  [[thread_position_in_grid]],
-                        uint lane [[thread_index_in_simdgroup]]) {
+// 6-bit codes: three uints = 12 bytes = one 16-element block, code k at bits 6k (LSB-first).
+kernel void linear_quik6(device const float*  x     [[buffer(0)]],
+                         device const uint*   codes [[buffer(1)]],
+                         device const short2* scm   [[buffer(2)]],
+                         device const half2*  dd    [[buffer(3)]],
+                         device float*        dst   [[buffer(4)]],
+                         constant QLinParams& p     [[buffer(5)]],
+                         uint gid  [[thread_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
     uint sg = gid / 32u;
     if (sg >= p.m * p.out_f) return;
     uint r = sg / p.out_f;
     uint o = sg % p.out_f;
-    ulong xbase = (ulong)r * p.in_f;
-    uint n8 = p.in_f / 8u;                            // uchar4s per weight row (in_f % 256 == 0)
-    ulong wbase8 = (ulong)o * n8;
+    uint nb = p.in_f >> 4;
+    ulong row16 = (ulong)o * nb;
+    ulong rowe = (ulong)o * p.in_f;
+    device const float* xr = x + (ulong)r * p.in_f;
     float acc = 0.0f;
-    for (uint b = lane; b < n8; b += 32u) {
-        uchar4 c = codes[wbase8 + b];
-        uint i = b * 8u;
-        float2 s = sm[((ulong)o * p.in_f + i) >> 4];  // one (scale, min) for all 8 elements
-        device const float* xr = x + xbase + i;
-        acc += xr[0] * (s.x * (float)(c.x & 15u) + s.y)
-             + xr[1] * (s.x * (float)(c.x >> 4u) + s.y)
-             + xr[2] * (s.x * (float)(c.y & 15u) + s.y)
-             + xr[3] * (s.x * (float)(c.y >> 4u) + s.y)
-             + xr[4] * (s.x * (float)(c.z & 15u) + s.y)
-             + xr[5] * (s.x * (float)(c.z >> 4u) + s.y)
-             + xr[6] * (s.x * (float)(c.w & 15u) + s.y)
-             + xr[7] * (s.x * (float)(c.w >> 4u) + s.y);
+    for (uint b = lane; b < nb; b += 32u) {
+        ulong ci = (row16 + b) * 3ul;
+        uint u0 = codes[ci], u1 = codes[ci + 1ul], u2 = codes[ci + 2ul];
+        short2 s = scm[row16 + b];
+        half2 dv = dd[(rowe + ((ulong)b << 4)) >> p.dshift];
+        float scale = (float)dv.x * (float)s.x;
+        float mn = (float)dv.y * (float)s.y;
+        device const float* xb = xr + (b << 4);
+        uint c[16];
+        c[0] = u0 & 63u;                  c[1] = (u0 >> 6) & 63u;
+        c[2] = (u0 >> 12) & 63u;          c[3] = (u0 >> 18) & 63u;
+        c[4] = (u0 >> 24) & 63u;          c[5] = ((u0 >> 30) | (u1 << 2)) & 63u;
+        c[6] = (u1 >> 4) & 63u;           c[7] = (u1 >> 10) & 63u;
+        c[8] = (u1 >> 16) & 63u;          c[9] = (u1 >> 22) & 63u;
+        c[10] = ((u1 >> 28) | (u2 << 4)) & 63u;
+        c[11] = (u2 >> 2) & 63u;          c[12] = (u2 >> 8) & 63u;
+        c[13] = (u2 >> 14) & 63u;         c[14] = (u2 >> 20) & 63u;
+        c[15] = (u2 >> 26) & 63u;
+        for (uint k = 0; k < 16u; k++) acc += xb[k] * (scale * (float)c[k] + mn);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) dst[sg] = acc;
+}
+
+// 8-bit codes: one uchar16 = one 16-element block.
+kernel void linear_quik8(device const float*   x     [[buffer(0)]],
+                         device const uchar4*  codes [[buffer(1)]],
+                         device const short2*  scm   [[buffer(2)]],
+                         device const half2*   dd    [[buffer(3)]],
+                         device float*         dst   [[buffer(4)]],
+                         constant QLinParams&  p     [[buffer(5)]],
+                         uint gid  [[thread_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.m * p.out_f) return;
+    uint r = sg / p.out_f;
+    uint o = sg % p.out_f;
+    uint nb = p.in_f >> 4;
+    ulong row16 = (ulong)o * nb;
+    ulong rowe = (ulong)o * p.in_f;
+    device const float* xr = x + (ulong)r * p.in_f;
+    float acc = 0.0f;
+    for (uint b = lane; b < nb; b += 32u) {
+        ulong ci = (row16 + b) * 4ul;
+        short2 s = scm[row16 + b];
+        half2 dv = dd[(rowe + ((ulong)b << 4)) >> p.dshift];
+        float scale = (float)dv.x * (float)s.x;
+        float mn = (float)dv.y * (float)s.y;
+        device const float* xb = xr + (b << 4);
+        for (uint q = 0; q < 4u; q++) {
+            uchar4 cq = codes[ci + q];
+            acc += xb[q * 4u]      * (scale * (float)cq.x + mn);
+            acc += xb[q * 4u + 1u] * (scale * (float)cq.y + mn);
+            acc += xb[q * 4u + 2u] * (scale * (float)cq.z + mn);
+            acc += xb[q * 4u + 3u] * (scale * (float)cq.w + mn);
+        }
     }
     acc = simd_sum(acc);
     if (lane == 0u) dst[sg] = acc;

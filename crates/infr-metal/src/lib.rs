@@ -13,9 +13,10 @@
 //! executor (`exec::Resident`) tracks whether each tensor's current value is on the host or the
 //! device, encodes consecutive GPU ops into a single command buffer (Metal hazard-tracks the
 //! barriers), and only syncs to the host at a host-side op or the final write-back. Quantized
-//! `Op::Linear` weights are kept in a compact unified form (u8 codes + one `(scale, min)` per 16
-//! elems) and decoded inline by `linear_qui`, so the kernels stay format-agnostic and never blow a
-//! quant weight up to f32. `INFR_METAL_PROFILE=1` prints a per-op / GPU-wall breakdown on drop.
+//! `Op::Linear` weights are kept in the compact factored form (`dequant_factored`: bit-packed
+//! 4/6/8-bit codes + one i16 `(sc, m)` per 16 elems + one f16 `(d, dmin)` per quant block) and
+//! decoded inline by the `linear_quik*` kernels, so the kernels stay format-agnostic and never blow
+//! a quant weight up to f32. `INFR_METAL_PROFILE=1` prints a per-op / GPU-wall breakdown on drop.
 //!
 //! Not bit-for-bit identical to the CPU everywhere: quantized `Op::Linear` reconstructs the exact
 //! `dequant` value but dots in f32, whereas the CPU path quantizes the *activation* to Q8 and uses
@@ -69,8 +70,9 @@ pub struct MetalBackend {
     /// (with buffer free/realloc) could return a stale f32 for a recycled address; don't.
     weight_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<MtlBuffer>>>,
     /// Native-quant weight cache (same single-generation lifetime as `weight_cache`): a quantized
-    /// weight kept in its compact unified form — u8 codes + one (scale, min) per 16 elems — that the
-    /// `linear_qui` kernel decodes inline. ~12 bpw vs f32's 32, and reconstructs the exact same value.
+    /// weight kept in its compact factored form — bit-packed 4/6/8-bit codes + i16 (sc, m) per 16
+    /// elems + f16 (d, dmin) per quant block — that the `linear_quik*` kernels decode inline.
+    /// ~6-8 bpw vs f32's 32, and reconstructs the exact same value.
     qui_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<exec::QuiWeight>>>,
     /// Opt-in execution profiler; active only when `INFR_METAL_PROFILE` is set. `profiling` is
     /// cached so the hot path avoids an env lookup and skips the `Instant` calls when off.

@@ -15,16 +15,20 @@ use metal::{
 use std::ffi::c_void;
 use std::sync::Arc;
 
-/// A quantized weight in the compact "unified" device form the `linear_qui` kernel decodes: one u8
-/// code per element plus one `(scale, min)` pair per 16-element block, so `weight = scale*code + min`
-/// exactly (matches `infr_gguf::dequant`). ~12 bpw resident vs 32 bpw for a dequant-to-f32 weight.
+/// A quantized weight in the compact FACTORED device form (`infr_gguf::dequant::Factored`):
+/// bit-packed codes (4/6/8-bit, chosen by the format's max code), one `(sc, m)` i16 pair per
+/// 16-element block, and one `(d, dmin)` f16 pair per `dblk` elements, so
+/// `weight = (d*sc)*code + (dmin*m)` — bit-for-bit the `dequant` reference (same f32 multiplies).
+/// Q4_K lands at ~6.1 bpw resident and Q6_K at ~8.1, vs 32 for a dequant-to-f32 weight; decode
+/// GEMV is bound on exactly this stream.
 pub(crate) struct QuiWeight {
     codes: MtlBuffer,
-    sm: MtlBuffer,
-    /// Codes are nibble-packed (two per byte, low nibble first). True whenever every code of the
-    /// source quant fits in 4 bits (the Q4 family) — halves the dominant weight stream, which is
-    /// what decode GEMV is bound on. Read by `linear_qui4`; unpacked u8 codes by `linear_qui`.
-    packed4: bool,
+    scm: MtlBuffer,
+    dd: MtlBuffer,
+    /// Kernel matching the code packing: `linear_quik4`/`linear_quik6`/`linear_quik8`.
+    kern: &'static str,
+    /// log2(elements per `(d, dmin)` pair): 5 for legacy 32-element blocks, 8 for K-quants.
+    dshift: u32,
 }
 
 /// Where a tensor's current value lives. GPU ops keep their results on the device and only pay a
@@ -382,9 +386,19 @@ impl MetalBackend {
         w
     }
 
-    /// Build (or fetch from cache) a quantized weight in unified device form. Uses the same
-    /// tested host decode as `dequant_block` (`dequant_unified`), then packs it as u8 codes + one
-    /// `(scale, min)` per 16-element block — the block granularity every affine GGUF quant respects.
+    /// A device buffer initialized from a raw byte slice.
+    fn bytes_buf(&self, data: &[u8]) -> MtlBuffer {
+        self.device.new_buffer_with_data(
+            data.as_ptr() as *const c_void,
+            data.len().max(1) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    /// Build (or fetch from cache) a quantized weight in factored device form
+    /// (`dequant_factored`), bit-packing the codes to the narrowest width the format's max code
+    /// fits (4/6/8 bits, low bits first) — decode GEMV is bound on the weight byte stream, so
+    /// every bit shaved here is throughput.
     fn weight_qui(
         &self,
         id: TensorId,
@@ -397,32 +411,40 @@ impl MetalBackend {
             return w.clone();
         }
         let bytes = Self::read_bytes(buf);
-        let (qv, sc, mn) = infr_gguf::dequant::dequant_unified(g.desc(id).dtype, &bytes);
-        let nblk = qv.len() / 16;
-        // Interleave (scale, min) per 16-block; constant within the block, so sample its first elem.
-        let mut sm = vec![0f32; nblk * 2];
-        for b in 0..nblk {
-            sm[2 * b] = sc[b * 16];
-            sm[2 * b + 1] = mn[b * 16];
-        }
-        // 4-bit-code quants (the Q4 family) pack two codes per byte — the weight stream is what
-        // decode GEMV is bandwidth-bound on, so halving it is a direct win. Checked against the
-        // data, not the dtype, so it is exact for any format whose codes happen to fit.
-        let packed4 = qv.iter().all(|&c| c < 16);
-        let codes_bytes: Vec<u8> = if packed4 {
-            qv.chunks_exact(2).map(|p| p[0] | (p[1] << 4)).collect()
+        let f = infr_gguf::dequant::dequant_factored(g.desc(id).dtype, &bytes);
+        let maxcode = f.codes.iter().copied().max().unwrap_or(0);
+        let (kern, codes_bytes): (&'static str, Vec<u8>) = if maxcode < 16 {
+            // two codes per byte, low nibble first
+            (
+                "linear_quik4",
+                f.codes.chunks_exact(2).map(|p| p[0] | (p[1] << 4)).collect(),
+            )
+        } else if maxcode < 64 {
+            // four codes per three bytes, LSB-first 6-bit stream
+            (
+                "linear_quik6",
+                f.codes
+                    .chunks_exact(4)
+                    .flat_map(|c| {
+                        [
+                            c[0] | (c[1] << 6),
+                            (c[1] >> 2) | (c[2] << 4),
+                            (c[2] >> 4) | (c[3] << 2),
+                        ]
+                    })
+                    .collect(),
+            )
         } else {
-            qv
+            ("linear_quik8", f.codes)
         };
-        let codes = self.device.new_buffer_with_data(
-            codes_bytes.as_ptr() as *const c_void,
-            codes_bytes.len().max(1) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
         let w = Arc::new(QuiWeight {
-            codes,
-            sm: self.f32_buf(&sm),
-            packed4,
+            codes: self.bytes_buf(&codes_bytes),
+            scm: self.bytes_buf(bytemuck::cast_slice(&f.scm)),
+            dd: self.bytes_buf(bytemuck::cast_slice(
+                &f.dd.iter().map(|h| h.to_bits()).collect::<Vec<u16>>(),
+            )),
+            kern,
+            dshift: f.dblk.trailing_zeros(),
         });
         self.qui_cache.lock().unwrap().insert(key, w.clone());
         w
@@ -551,19 +573,17 @@ impl MetalBackend {
                 let mut p = (m as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(in_f as u32).to_ne_bytes());
                 p.extend_from_slice(&(out_f as u32).to_ne_bytes());
-                // 32 lanes (one simdgroup) per output element — see `linear_f32`/`linear_qui`.
+                // 32 lanes (one simdgroup) per output element — see `linear_f32`/`linear_quik*`.
                 if infr_gguf::dequant::is_quant(g.desc(weight).dtype) {
-                    // Native quant: decode the compact unified weight inline — no f32 blow-up.
-                    // Nibble-packed (4-bit-code) weights take the qui4 kernel: half the bytes on
-                    // the bandwidth-bound weight stream.
+                    // Native quant: decode the compact factored weight inline — no f32 blow-up.
+                    // Kernel matches the weight's code packing (4/6/8-bit).
                     let qw = self.weight_qui(weight, g, bindings);
-                    let pso = self
-                        .pipelines
-                        .get(if qw.packed4 { "linear_qui4" } else { "linear_qui" })?;
+                    let pso = self.pipelines.get(qw.kern)?;
+                    p.extend_from_slice(&qw.dshift.to_ne_bytes());
                     self.encode_tg(
                         r,
                         &pso,
-                        &[bx.as_ref(), &qw.codes, &qw.sm, bd.as_ref()],
+                        &[bx.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
                         &p,
                         m * out_f * 32,
                         32,

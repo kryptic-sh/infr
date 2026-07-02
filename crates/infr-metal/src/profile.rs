@@ -47,7 +47,7 @@ impl Profile {
         let total: Duration = self.per_op.values().map(|(_, d)| *d).sum();
         let total_s = total.as_secs_f64().max(1e-9);
         let mut rows: Vec<_> = self.per_op.iter().collect();
-        rows.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1 .1));
 
         // Per-op GPU wall (populated only in per-op mode): the share of GPU time each op costs.
         let gpu_total: Duration = self.per_op_gpu.values().copied().sum();

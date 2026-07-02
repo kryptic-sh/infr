@@ -482,7 +482,7 @@ pub(crate) fn generate_dense_backend(
     // the process, so a warm session and its rebuilt graphs always agree.
     let kv_q8 = std::env::var("INFR_KV_Q8").is_ok()
         && matches!(be.name(), "metal" | "cpu-reference")
-        && (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)) % 32 == 0);
+        && (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {

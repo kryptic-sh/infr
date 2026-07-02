@@ -1328,7 +1328,14 @@ fn generate_seam(
     // cache is written for the whole chunk. Decode then runs one token (rows=1) at a time. The
     // hidden/pos input buffers are allocated per call sized to the chunk (the CPU backend writes
     // F32 inputs back, so their length must match the graph input exactly).
-    const CHUNK: usize = 128;
+    // 512 beats 128 by ~27% end-to-end: the recurrent scans (DeltaNet/conv1d) cost the same total
+    // either way, but bigger chunks give the GEMMs more row-tiles (occupancy) and amortize the
+    // per-chunk build+compile+submit. INFR_Q35_CHUNK overrides for experiments.
+    let chunk: usize = std::env::var("INFR_Q35_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&c: &usize| c > 0)
+        .unwrap_or(512);
     let logits_buf = be
         .alloc(vocab * 4, BufferUsage::Readback)
         .map_err(|e| anyhow!("{e}"))?;
@@ -1836,7 +1843,7 @@ fn generate_seam(
     let prompt_t0 = std::time::Instant::now();
     let mut cpos = 0usize;
     while cpos < plen {
-        let rows = (plen - cpos).min(CHUNK);
+        let rows = (plen - cpos).min(chunk);
         let mut emb = vec![0f32; rows * ne];
         for r in 0..rows {
             let tid = prompt_ids[cpos + r] as usize;

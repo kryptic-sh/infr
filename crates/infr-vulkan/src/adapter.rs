@@ -590,6 +590,16 @@ fn lower_op(
                     && hd == 128
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
+                // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
+                // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
+                // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
+                // require both to be Internal.
+                let nonfa_ok = !flash_ok
+                    && rows >= 64
+                    && hd % 64 == 0
+                    && hd <= 512
+                    && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
+                    && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Decode (rows==1), causal, default scale: flash-decoding split-K — each head's KV
                 // range splits across ~32 chunks of workgroups instead of the scalar attention_kv's
                 // rows*nh (= nh at decode, ~16 workgroups on a 96-CU GPU — the decode bottleneck).
@@ -622,6 +632,33 @@ fn lower_op(
                         pos,
                     );
                     transient.extend([po, pm, pl]);
+                } else if nonfa_ok {
+                    let window = match mask {
+                        AttnMask::Causal => 0,
+                        AttnMask::SlidingWindow(w) => *w,
+                    };
+                    let mpad = rows.div_ceil(64) * 64;
+                    let kv_pad = kv_len.div_ceil(256) * 256;
+                    // scores scratch [nh, mpad, kv_pad] f16 + split-K PV partials (≤8 splits) f32
+                    let s = be_.alloc(nh * mpad * kv_pad * 2, BufferUsage::Activations)?;
+                    let pv = be_.alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
+                    rec.attention_prefill_nonfa(
+                        r(*q)?,
+                        r(*k_cache)?,
+                        r(*v_cache)?,
+                        r(*dst)?,
+                        s.as_ref(),
+                        pv.as_ref(),
+                        rows,
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        pos,
+                        window,
+                        *scale,
+                    );
+                    transient.extend([s, pv]);
                 } else if split_ok {
                     let n_chunks = kv_len.div_ceil(chunk);
                     let pm = be_.alloc(nh * n_chunks * 4, BufferUsage::Activations)?;

@@ -277,6 +277,11 @@ const GEMM_PROJ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gem
 const GEMM_PROJ_WARP_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp.spv"));
 const ATTN_PARTIAL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial.spv"));
+const ATTN_PARTIAL_DYNAC_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial_dynac.spv"));
+const ATTN_COMBINE_LIVE_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine_live.spv"));
+const ATTN_LIVE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_live.spv"));
 const ATTN_QK_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk.spv"));
 const ATTN_QK_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_qk_warp.spv"));
 const ATTN_FLASH_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_flash.spv"));
@@ -656,6 +661,22 @@ dyn_spv!(qk_norm_rope_dyn_spv, "qk_norm_rope_dyn");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");
 dyn_spv!(attention_kv_dyn_spv, "attention_kv_dyn");
 dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");
+/// SPIR-V for the SELF-CHUNKING record-once split-K decode partial (adaptive chunk from the live
+/// kv_len; workgroups past the live range early-exit with a zero-weight header).
+pub(crate) fn attn_partial_dynac_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(ATTN_PARTIAL_DYNAC_SPV_BYTES))
+}
+/// SPIR-V for the live-count combine (record-once replay; loops the prologue's live chunks).
+pub(crate) fn attn_combine_live_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(ATTN_COMBINE_LIVE_SPV_BYTES))
+}
+/// SPIR-V for the split-K replay prologue (indirect args + live count from kv_len).
+pub(crate) fn attn_live_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(ATTN_LIVE_SPV_BYTES))
+}
 dyn_spv!(attn_in_dyn_spv, "attn_in_dyn");
 /// SPIR-V for fused attention input (RMSNorm + QKV proj + RoPE).
 pub(crate) fn attn_in_spv() -> &'static [u32] {

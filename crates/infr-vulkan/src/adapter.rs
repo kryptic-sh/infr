@@ -617,14 +617,19 @@ fn lower_op(
                 // combine ignores. attn_combine's shared array caps n_chunks at 512 → scale chunk
                 // with capacity. Scratch is plan-held (`transient`), so replay reuses it.
                 let cap = graph.desc(*k_cache).numel() / (nkv * hd);
-                let chunk = cap.div_ceil(512).max(64);
+                // Baked MIN chunk (64, rising only when the capacity would exceed the 1024-chunk
+                // scratch/combine cap); the kernel derives the effective adaptive chunk from the
+                // live kv_len each token, so one recorded plan serves every depth.
+                let chunk = cap.div_ceil(1024).max(64);
                 let n_chunks = cap.div_ceil(chunk);
                 if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
                     let pm = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
                     let pl = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
                     let pacc =
                         be_.alloc_uninit(nh * n_chunks * hd * 4, BufferUsage::Activations)?;
-                    rec.attention_kv_split_dyn(
+                    // indirect dispatch args + live count, written GPU-side by the prologue
+                    let args = be_.alloc_uninit(16, BufferUsage::Activations)?;
+                    rec.attention_kv_split_dynac(
                         r(*q)?,
                         r(*k_cache)?,
                         r(*v_cache)?,
@@ -633,13 +638,14 @@ fn lower_op(
                         pl.as_ref(),
                         pacc.as_ref(),
                         *params,
+                        args.as_ref(),
                         nh,
                         nkv,
                         hd,
                         chunk,
                         n_chunks,
                     );
-                    transient.extend([pm, pl, pacc]);
+                    transient.extend([pm, pl, pacc, args]);
                 } else {
                     rec.attention_kv_dyn(
                         r(*q)?,

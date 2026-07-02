@@ -41,6 +41,9 @@ pub struct Recorder<'a> {
     /// Whether any un-barriered write was produced by a transfer (copy) rather than a shader.
     dirty_transfer: std::cell::Cell<bool>,
     barriers: RefCell<usize>,
+    /// Set while recording an indirect dispatch so `sync` widens the barrier to cover the
+    /// indirect-command read of GPU-written dispatch args.
+    indirect_pending: std::cell::Cell<bool>,
     /// Debug knobs, read once (avoid env lookups in the per-dispatch hot path).
     no_barrier: bool,
     full_barrier: bool,
@@ -140,6 +143,7 @@ impl<'a> Recorder<'a> {
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
             barriers: RefCell::new(0),
+            indirect_pending: std::cell::Cell::new(false),
             no_barrier: std::env::var("INFR_NOBARRIER").is_ok(),
             full_barrier: std::env::var("INFR_FULLBARRIER").is_ok(),
             prof: std::env::var("INFR_PROF").is_ok(),
@@ -210,6 +214,12 @@ impl<'a> Recorder<'a> {
             if dst_transfer {
                 dst |= vk::PipelineStageFlags::TRANSFER;
             }
+            let mut mb = mb;
+            if self.indirect_pending.get() {
+                // The consumer reads GPU-written dispatch args: cover the indirect-command read.
+                dst |= vk::PipelineStageFlags::DRAW_INDIRECT;
+                mb.dst_access_mask |= vk::AccessFlags::INDIRECT_COMMAND_READ;
+            }
             unsafe {
                 self.be.shared.device.cmd_pipeline_barrier(
                     self.cmd,
@@ -241,6 +251,75 @@ impl<'a> Recorder<'a> {
         groups: u32,
     ) {
         self.dispatch3(k, buffers, n_out, push, groups, 1, 1);
+    }
+
+    /// Like [`Self::dispatch`], but the workgroup count comes from `args` (a GPU-written
+    /// `[gx,gy,gz]` u32 triple at offset 0 — vkCmdDispatchIndirect). `args` joins the hazard reads
+    /// so the barrier after its producer covers the indirect-command read (the barrier's dst stage
+    /// widens to DRAW_INDIRECT whenever an indirect consumer follows).
+    fn dispatch_indirect(
+        &self,
+        k: ComputeKernel,
+        buffers: &[vk::Buffer],
+        n_out: usize,
+        push: &[u8],
+        args: vk::Buffer,
+    ) {
+        let split = buffers.len() - n_out;
+        let (reads, writes) = buffers.split_at(split);
+        let mut all_reads: Vec<vk::Buffer> = reads.to_vec();
+        all_reads.push(args);
+        self.indirect_pending.set(true);
+        self.sync(&all_reads, writes, false);
+        self.indirect_pending.set(false);
+        let device = &self.be.shared.device;
+        let set = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.pool)
+                    .set_layouts(std::slice::from_ref(&k.ds_layout)),
+            )
+        }
+        .expect("alloc descriptor set")[0];
+        let infos: Vec<vk::DescriptorBufferInfo> = buffers
+            .iter()
+            .map(|&buffer| vk::DescriptorBufferInfo {
+                buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+            })
+            .collect();
+        let ds_writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[i..i + 1])
+            })
+            .collect();
+        unsafe { device.update_descriptor_sets(&ds_writes, &[]) };
+        unsafe {
+            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+            device.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                k.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            if k.push_size > 0 {
+                device.cmd_push_constants(
+                    self.cmd,
+                    k.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    push,
+                );
+            }
+            device.cmd_dispatch_indirect(self.cmd, args, 0);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1875,6 +1954,123 @@ impl<'a> Recorder<'a> {
         chunk: usize,
         n_chunks: usize,
     ) {
+        self.attention_kv_split_dyn_inner(
+            q, kc, vc, o, pm, pl, pacc, params, nh, nkv, hd, chunk, n_chunks,
+        )
+    }
+
+    /// SELF-CHUNKING variant for record-once REPLAY over a growing kv_len. A one-thread prologue
+    /// (`attn_live`) derives the adaptive chunk (~32 chunks/head, 64..512, floored by the baked
+    /// minimum `chunk`) from the LIVE kv_len and writes the partial pass's INDIRECT dispatch args
+    /// (`args`, ≥16 bytes: [gx,gy,gz,live]) — so one recorded plan launches exactly nh·live
+    /// workgroups at every depth (no dead workgroups shallow, no re-record deep). The combine
+    /// loops the prologue's live count. `n_chunks` is only the pm/pl/pacc scratch STRIDE/capacity
+    /// (cap.div_ceil(chunk), ≤1024).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split_dynac(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        params: &dyn Buffer,
+        args: &dyn Buffer,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+    ) {
+        // prologue: args = [nh·live, 1, 1, live]
+        self.stamp("attn_live");
+        let kl = self
+            .be
+            .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 8);
+        let mut p0 = [0u8; 8];
+        p0[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p0[4..8].copy_from_slice(&(chunk as u32).to_ne_bytes());
+        self.dispatch(kl, &[Self::vkb(params), Self::vkb(args)], 1, &p0, 1);
+
+        // pass 1: self-chunking partials, workgroup count from `args`
+        self.stamp("attn_partial");
+        let k1 = self.be.kernel_sg(
+            "attn_partial_dynac",
+            crate::gemm::attn_partial_dynac_spv(),
+            7,
+            24,
+            32,
+        );
+        let mut p1 = [0u8; 24];
+        p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p1[16..20].copy_from_slice(&(chunk as u32).to_ne_bytes());
+        p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        self.dispatch_indirect(
+            k1,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(params),
+                Self::vkb(pm),
+                Self::vkb(pl),
+                Self::vkb(pacc),
+            ],
+            3,
+            &p1,
+            Self::vkb(args),
+        );
+
+        // pass 2: combine over the live chunks
+        self.stamp("attn_combine");
+        let k2 = self.be.kernel(
+            "attn_combine_live",
+            crate::gemm::attn_combine_live_spv(),
+            5,
+            16,
+        );
+        let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
+        let mut p2 = [0u8; 16];
+        p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p2[8..12].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        p2[12..16].copy_from_slice(&ntile.to_ne_bytes());
+        self.dispatch(
+            k2,
+            &[
+                Self::vkb(pm),
+                Self::vkb(pl),
+                Self::vkb(pacc),
+                Self::vkb(args),
+                Self::vkb(o),
+            ],
+            1,
+            &p2,
+            nh as u32 * ntile,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_kv_split_dyn_inner(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        params: &dyn Buffer,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+    ) {
         self.stamp("attn_partial");
         let k1 = self.be.kernel_sg(
             "attn_partial_dyn",
@@ -3280,6 +3476,79 @@ mod tests {
             .fold(0f32, f32::max);
         println!("attn_kv_split kv_len={kv_len} n_chunks={n_chunks} max_err={err:e}");
         assert!(err < 5e-3, "split mismatch: {err}");
+    }
+
+    fn run_attn_kv_split_dynac(kv_len: usize, cap: usize, nh: usize, nkv: usize, hd: usize) {
+        let be = VulkanBackend::new().unwrap();
+        let chunk = cap.div_ceil(1024).max(64);
+        let n_chunks = cap.div_ceil(chunk);
+        let pos_offset = kv_len - 1;
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        let q = r16(&gen(nh * hd, 1));
+        let k = r16(&gen(kv_len * nkv * hd, 2));
+        let v = r16(&gen(kv_len * nkv * hd, 3));
+        let bq = upf16(&be, &q);
+        let bk = upf16(&be, &k);
+        let bv = upf16(&be, &v);
+        let bo = be.alloc(nh * hd * 4, BufferUsage::Readback).unwrap();
+        let pm = be
+            .alloc(nh * n_chunks * 4, BufferUsage::Activations)
+            .unwrap();
+        let pl = be
+            .alloc(nh * n_chunks * 4, BufferUsage::Activations)
+            .unwrap();
+        let pacc = be
+            .alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        let params = be.alloc(8, BufferUsage::Activations).unwrap();
+        be.upload(
+            params.as_ref(),
+            bytemuck::cast_slice(&[pos_offset as u32, kv_len as u32]),
+        )
+        .unwrap();
+        let args = be.alloc(16, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_kv_split_dynac(
+            bq.as_ref(),
+            bk.as_ref(),
+            bv.as_ref(),
+            bo.as_ref(),
+            pm.as_ref(),
+            pl.as_ref(),
+            pacc.as_ref(),
+            params.as_ref(),
+            args.as_ref(),
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+        );
+        rec.finish().unwrap();
+        let mut bytes = vec![0u8; nh * hd * 4];
+        be.download(bo.as_ref(), &mut bytes).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&bytes);
+        let want = attn_kv_cpu(&q, &k, &v, 1, nh, nkv, hd, pos_offset, 0, 0.0);
+        let err = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!("attn_kv_split_dynac kv={kv_len} cap={cap} n_chunks={n_chunks} max_err={err:e}");
+        assert!(err < 5e-3, "dynac split mismatch: {err}");
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_kv_split_dynac_matches_cpu() {
+        run_attn_kv_split_dynac(20, 68, 16, 8, 128); // shallow: 1 live chunk, tiny cap
+        run_attn_kv_split_dynac(600, 8065, 9, 3, 64); // wide bake, few live
+        run_attn_kv_split_dynac(8000, 8065, 16, 8, 128); // deep: 32 live chunks
+        run_attn_kv_split_dynac(130, 40960, 4, 2, 128); // huge capacity (chunk floor rises)
     }
 
     #[test]

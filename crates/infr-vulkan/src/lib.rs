@@ -200,7 +200,10 @@ impl Buffer for VkBuffer {
 const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
         | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
-        | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
+        // Any buffer may serve as vkCmdDispatchIndirect args (the split-K replay prologue writes
+        // the partial pass's workgroup count GPU-side).
+        | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
 );
 
 /// Overflow arena blocks (only allocated if the reserved block underflows the estimate) stay modest

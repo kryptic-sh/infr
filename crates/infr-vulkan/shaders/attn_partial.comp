@@ -44,19 +44,38 @@ void main() {
     // scheduler keeps neighbors co-resident, so the 2nd..g-th head re-read their K/V slice from L2
     // (hot, multi-TB/s) instead of DRAM. Captures the GQA re-use benefit at zero occupancy cost.
     uint g = pc.nh / pc.nkv;
-    uint hh = gl_WorkGroupID.x % g;
-    uint rest = gl_WorkGroupID.x / g;
-    uint c = rest % pc.n_chunks;
-    uint kvh = rest / pc.n_chunks;
-    uint h = kvh * g + hh;
     float scale = 1.0 / sqrt(float(hd));
-    uint j0 = c * pc.chunk;
 #ifdef USE_PARAMS
     uint kv_len = p_kvlen;
 #else
     uint kv_len = pc.kv_len;
 #endif
+#ifdef SELF_CHUNK
+    // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, but ONE baked
+    // chunk can't serve every depth (small chunks drown in per-workgroup overhead at deep kv; big
+    // chunks under-occupy at shallow kv). Derive the SAME adaptive policy the re-recording path
+    // uses (~32 chunks/head, 64..512, floored by the baked minimum pc.chunk) from the LIVE kv_len.
+    // The attn_live prologue dispatches EXACTLY nh·live workgroups (indirect), so the workgroup →
+    // (head, chunk) decomposition must use the live count, NOT the baked pc.n_chunks (which is
+    // only the pm/pl/pacc scratch stride).
+    uint chunkv = max(pc.chunk, min(max(kv_len / 32u, 64u), 512u));
+    uint live = (kv_len + chunkv - 1u) / chunkv;
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % live;
+    uint kvh = rest / live;
+    uint h = kvh * g + hh;
+    uint j0 = c * chunkv;
+    uint j1 = min(j0 + chunkv, kv_len);
+#else
+    uint hh = gl_WorkGroupID.x % g;
+    uint rest = gl_WorkGroupID.x / g;
+    uint c = rest % pc.n_chunks;
+    uint kvh = rest / pc.n_chunks;
+    uint h = kvh * g + hh;
+    uint j0 = c * pc.chunk;
     uint j1 = min(j0 + pc.chunk, kv_len);
+#endif
 
     // QK via subgroup reduction (one key per subgroup-iteration; vec4 coalesced K reads). Each lane's
     // query vec4(s) are loop-invariant across keys → hold in registers (no q_sh, no barrier).

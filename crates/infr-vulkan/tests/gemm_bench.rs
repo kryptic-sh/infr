@@ -371,3 +371,163 @@ fn qwen35_dn_attn_bench() {
         us * 6.0 / 1e3
     );
 }
+
+/// Isolated decode-attention kernel A/B at deep context (qwen3-0.6b dims, kv=8000): the push-const
+/// split, the params-driven dyn split, and the self-chunking dynac variant. Hunts the seam-vs-
+/// bespoke deep-decode gap.
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn decode_attn_variants_bench() {
+    let be = VulkanBackend::new().unwrap();
+    let (nh, nkv, hd) = (16usize, 8usize, 128usize);
+    let kv_len = 8000usize;
+    let cap = 8065usize;
+    let q = be.alloc(nh * hd * 2, BufferUsage::Activations).unwrap();
+    let kc = be
+        .alloc(cap * nkv * hd * 2, BufferUsage::Activations)
+        .unwrap();
+    let vc = be
+        .alloc(cap * nkv * hd * 2, BufferUsage::Activations)
+        .unwrap();
+    let o = be.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
+    let params = be.alloc(8, BufferUsage::Activations).unwrap();
+    be.upload(
+        params.as_ref(),
+        bytemuck::cast_slice(&[kv_len as u32 - 1, kv_len as u32]),
+    )
+    .unwrap();
+    let reps = 200usize;
+
+    let run = |name: &str, f: &dyn Fn(&infr_vulkan::Recorder)| {
+        let rec = be.recorder().unwrap();
+        f(&rec);
+        rec.finish().unwrap();
+        let t0 = std::time::Instant::now();
+        let rec = be.recorder().unwrap();
+        for _ in 0..reps {
+            f(&rec);
+        }
+        rec.finish().unwrap();
+        println!(
+            "{name:>22}: {:8.1} us/op",
+            t0.elapsed().as_micros() as f64 / reps as f64
+        );
+    };
+
+    // static split (bespoke-style): adaptive chunk for kv=8000
+    let chunk = (kv_len / 32).clamp(64, 512);
+    let n_chunks = kv_len.div_ceil(chunk);
+    let pm = be
+        .alloc(nh * n_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pl = be
+        .alloc(nh * n_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pacc = be
+        .alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)
+        .unwrap();
+    run("static split c250", &|rec| {
+        rec.attention_kv_split(
+            q.as_ref(),
+            kc.as_ref(),
+            vc.as_ref(),
+            o.as_ref(),
+            pm.as_ref(),
+            pl.as_ref(),
+            pacc.as_ref(),
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+        );
+    });
+    // dyn split, same chunks
+    run("dyn split c250", &|rec| {
+        rec.attention_kv_split_dyn(
+            q.as_ref(),
+            kc.as_ref(),
+            vc.as_ref(),
+            o.as_ref(),
+            pm.as_ref(),
+            pl.as_ref(),
+            pacc.as_ref(),
+            params.as_ref(),
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+        );
+    });
+    // dynac: baked min chunk 64, capacity-sized scratch (the seam's config)
+    let cap_chunks = cap.div_ceil(64);
+    let pm2 = be
+        .alloc(nh * cap_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pl2 = be
+        .alloc(nh * cap_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pacc2 = be
+        .alloc(nh * cap_chunks * hd * 4, BufferUsage::Activations)
+        .unwrap();
+    let args = be.alloc(16, BufferUsage::Activations).unwrap();
+    run("dynac cap126", &|rec| {
+        rec.attention_kv_split_dynac(
+            q.as_ref(),
+            kc.as_ref(),
+            vc.as_ref(),
+            o.as_ref(),
+            pm2.as_ref(),
+            pl2.as_ref(),
+            pacc2.as_ref(),
+            params.as_ref(),
+            args.as_ref(),
+            nh,
+            nkv,
+            hd,
+            64,
+            cap_chunks,
+        );
+    });
+    // dynac with a TIGHT bake (capacity == live): isolates the dead-workgroup/scan cost from the
+    // SELF_CHUNK in-kernel logic cost.
+    run("dynac tight c250", &|rec| {
+        rec.attention_kv_split_dynac(
+            q.as_ref(),
+            kc.as_ref(),
+            vc.as_ref(),
+            o.as_ref(),
+            pm.as_ref(),
+            pl.as_ref(),
+            pacc.as_ref(),
+            params.as_ref(),
+            args.as_ref(),
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+        );
+    });
+    // dyn split with chunk=64 all live (the earlier env-sweep shape)
+    let n64 = kv_len.div_ceil(64);
+    run("dyn split c64", &|rec| {
+        rec.attention_kv_split_dyn(
+            q.as_ref(),
+            kc.as_ref(),
+            vc.as_ref(),
+            o.as_ref(),
+            pm2.as_ref(),
+            pl2.as_ref(),
+            pacc2.as_ref(),
+            params.as_ref(),
+            nh,
+            nkv,
+            hd,
+            64,
+            n64,
+        );
+    });
+}

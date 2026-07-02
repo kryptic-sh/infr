@@ -1019,7 +1019,10 @@ pub(crate) fn generate_dense_backend(
     // proportional-RoPE), so an eligible plan here is guaranteed to take the adapter's replay path.
     // Backends without `decode_replay` (CPU interpreter, which reads the baked `pos`) and every
     // ineligible model keep rebuilding + recompiling per token below.
+    // INFR_SEAM_NO_REPLAY=1 forces per-token rebuild (the adapter's static path) — slower, but
+    // INFR_PROF2 per-op GPU timestamps work there (the replay path can't report them).
     let dyn_replay = be.capabilities().decode_replay
+        && std::env::var("INFR_SEAM_NO_REPLAY").is_err()
         && qk_norm
         && !gemma
         && !gemma4

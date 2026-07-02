@@ -142,6 +142,15 @@ pub trait Backend: Send + Sync {
     }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
+    /// Copy the first `bytes` of `src` into the start of `dst` (both buffers this backend's).
+    /// The KV prefix-sharing primitive: a new chat slot seeds its cache from another slot's
+    /// common prefix instead of re-prefilling it. Default is a host bounce (download the whole
+    /// src, upload the prefix) — correct everywhere; backends override with a device-side copy.
+    fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
+        let mut tmp = vec![0u8; src.len_bytes()];
+        self.download(src, &mut tmp)?;
+        self.upload(dst, &tmp[..bytes])
+    }
 
     // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;

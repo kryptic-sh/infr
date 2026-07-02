@@ -448,6 +448,69 @@ fn gpu_seam_kv_reuse_matches_fresh() {
     );
 }
 
+/// Multi-slot KV prefix sharing: two INTERLEAVED conversations with a common long prefix (a
+/// "system prompt"). Conversation B must (a) generate exactly what a fresh full prefill does,
+/// (b) prefill only past the shared prefix (its slot was SEEDED by a device-side KV copy from
+/// A's slot), and (c) not evict A — A's next turn still extends its own slot cheaply.
+#[test]
+fn gpu_seam_multi_slot_prefix_sharing() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let mut sess = model.vulkan_session(512).expect("session");
+
+    // A long shared prefix (stands in for a system prompt) + two different questions.
+    let sys = "You are a terse geography assistant. Answer in one word only, no punctuation, \
+               no explanations, never refuse, always answer with just the single word asked for. ";
+    let pa = format!("{sys}The capital of France is");
+    let pb = format!("{sys}The capital of Germany is");
+
+    let mut ta = String::new();
+    let sa = model
+        .generate_vulkan_session(&mut sess, &pa, 8, |p| ta.push_str(p))
+        .expect("conv A");
+    assert!(sa.n_prompt > 0);
+
+    // Conversation B: different question, same system prefix → new slot seeded from A's.
+    let mut tb = String::new();
+    let sb = model
+        .generate_vulkan_session(&mut sess, &pb, 8, |p| tb.push_str(p))
+        .expect("conv B");
+    let fresh_b = model.generate_dense_vulkan(&pb, 8).expect("fresh B");
+    assert_eq!(
+        tb.trim(),
+        fresh_b.trim(),
+        "seeded-slot generation diverged from a fresh full prefill"
+    );
+    // The shared prefix must NOT have been re-prefilled (only B's short suffix).
+    assert!(
+        sb.n_prompt < sa.n_prompt / 2,
+        "conv B prefilled {} tokens (conv A: {}) — prefix seeding didn't kick in",
+        sb.n_prompt,
+        sa.n_prompt
+    );
+
+    // Conversation A continues — its slot must still be intact (suffix-only prefill again).
+    let pa2 = format!("{pa}{ta} And the capital of Spain is");
+    let mut ta2 = String::new();
+    let sa2 = model
+        .generate_vulkan_session(&mut sess, &pa2, 8, |p| ta2.push_str(p))
+        .expect("conv A turn 2");
+    let fresh_a2 = model.generate_dense_vulkan(&pa2, 8).expect("fresh A2");
+    assert_eq!(
+        ta2.trim(),
+        fresh_a2.trim(),
+        "conv A slot was clobbered by B"
+    );
+    assert!(
+        sa2.n_prompt < sa.n_prompt / 2,
+        "conv A turn 2 prefilled {} tokens — its slot was evicted",
+        sa2.n_prompt
+    );
+}
+
 /// gemma3 (SWA + dual-rope + GeGLU + sandwich norms, hd=256) through the Vulkan seam.
 #[test]
 fn gpu_seam_matches_cpu_gemma3() {

@@ -341,18 +341,107 @@ type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buf
 /// growing conversation stops re-prefilling its whole history. Pass a fresh `None` for the old
 /// one-shot behavior.
 pub(crate) struct SeamKv {
-    wbufs: Vec<Box<dyn Buffer>>,
-    wspecs: Vec<(DType, usize)>,
+    /// The uploaded weights, SHARED across slots (Arc): forking a new conversation slot costs
+    /// only its KV + IO buffers, never a re-upload.
+    weights: std::sync::Arc<SeamWeights>,
     kbufs: Vec<Box<dyn Buffer>>,
     vbufs: Vec<Box<dyn Buffer>>,
     hidden_buf: Box<dyn Buffer>,
     pos_buf: Box<dyn Buffer>,
-    rf_buf: Option<(Box<dyn Buffer>, usize)>,
     ipl_buf: Option<Box<dyn Buffer>>,
     logits_buf: Box<dyn Buffer>,
     max_ctx: usize,
     /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
     cached: Vec<u32>,
+}
+
+/// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
+/// the rope_freqs constant. Shared across conversation slots via `Arc`.
+pub(crate) struct SeamWeights {
+    wbufs: Vec<Box<dyn Buffer>>,
+    wspecs: Vec<(DType, usize)>,
+    rf_buf: Option<(Box<dyn Buffer>, usize)>,
+}
+
+impl SeamKv {
+    /// Longest common prefix of this slot's materialized tokens and `prompt` — the slot-selection
+    /// score for multi-conversation serve.
+    pub(crate) fn prefix_score(&self, prompt: &[u32]) -> usize {
+        common_prefix_len(&self.cached, prompt)
+    }
+
+    /// Number of token ids materialized in this slot's KV cache.
+    pub(crate) fn cached_len(&self) -> usize {
+        self.cached.len()
+    }
+
+    /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
+    pub(crate) fn fork(&self, be: &dyn Backend, cfg: &Config) -> AResult<SeamKv> {
+        let e2b = self.ipl_buf.is_some();
+        let npl = cfg.n_embd_per_layer.max(1);
+        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        for l in 0..cfg.n_layer {
+            let kvrow_l = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
+            kbufs.push(
+                be.alloc(self.max_ctx * kvrow_l * 2, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            vbufs.push(
+                be.alloc(self.max_ctx * kvrow_l * 2, BufferUsage::Activations)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        Ok(SeamKv {
+            weights: std::sync::Arc::clone(&self.weights),
+            kbufs,
+            vbufs,
+            hidden_buf: be
+                .alloc(cfg.n_embd * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+            pos_buf: be
+                .alloc(4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+            ipl_buf: if e2b {
+                Some(
+                    be.alloc(cfg.n_layer * npl * 4, BufferUsage::Staging)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            },
+            logits_buf: be
+                .alloc(cfg.vocab * 4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?,
+            max_ctx: self.max_ctx,
+            cached: Vec::new(),
+        })
+    }
+
+    /// Seed this slot's KV cache with the first `p` rows of `src`'s (the shared conversation
+    /// prefix — e.g. the system prompt) via a device-side buffer copy, so the new conversation
+    /// skips re-prefilling it. `p` must be ≤ src's materialized length.
+    pub(crate) fn seed_from(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        src: &SeamKv,
+        p: usize,
+    ) -> AResult<()> {
+        let p = p.min(src.cached.len()).min(self.max_ctx);
+        if p == 0 {
+            return Ok(());
+        }
+        for l in 0..cfg.n_layer {
+            let bytes = p * cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2;
+            be.copy_buffer(src.kbufs[l].as_ref(), self.kbufs[l].as_ref(), bytes)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.copy_buffer(src.vbufs[l].as_ref(), self.vbufs[l].as_ref(), bytes)
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+        self.cached = src.cached[..p].to_vec();
+        Ok(())
+    }
 }
 
 /// gemma4 E2B: build the per-(token,layer) input vectors on the host for `rows` tokens —
@@ -661,13 +750,15 @@ pub(crate) fn generate_dense_backend(
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
         *state = Some(SeamKv {
-            wbufs,
-            wspecs,
+            weights: std::sync::Arc::new(SeamWeights {
+                wbufs,
+                wspecs,
+                rf_buf,
+            }),
             kbufs,
             vbufs,
             hidden_buf,
             pos_buf,
-            rf_buf,
             ipl_buf,
             logits_buf,
             max_ctx: want_ctx,
@@ -675,18 +766,21 @@ pub(crate) fn generate_dense_backend(
         });
     }
     let SeamKv {
-        wbufs,
-        wspecs,
+        weights,
         kbufs,
         vbufs,
         hidden_buf,
         pos_buf,
-        rf_buf,
         ipl_buf,
         logits_buf,
         max_ctx,
         cached,
     } = state.as_mut().expect("seam state just initialized");
+    let SeamWeights {
+        wbufs,
+        wspecs,
+        rf_buf,
+    } = weights.as_ref();
     let max_ctx = *max_ctx;
     if prompt.len() + max_new + 1 > max_ctx {
         return Err(anyhow!(

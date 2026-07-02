@@ -823,6 +823,22 @@ impl Backend for VulkanBackend {
     /// Copy `src` (host slice) into `dst` (device buffer).
     ///
     /// If `dst` is host-visible (`CpuToGpu`), writes directly through the
+    /// Device-side prefix copy (`vkCmdCopyBuffer` region `[0, bytes)`) — no host bounce.
+    fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
+        // Safety: every buffer from this backend is a VkBuffer.
+        let (s, d) = unsafe { (as_vk_buf(src), as_vk_buf(dst)) };
+        let (sb, db) = (s.buffer, d.buffer);
+        // one_shot's queue_wait_idle provides the ordering fence vs prior/following work.
+        self.one_shot(move |cmd| unsafe {
+            let region = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size: bytes as u64,
+            };
+            self.shared.device.cmd_copy_buffer(cmd, sb, db, &[region]);
+        })
+    }
+
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
     /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {

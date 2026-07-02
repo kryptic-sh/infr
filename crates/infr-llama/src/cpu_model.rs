@@ -21,12 +21,89 @@ pub struct CpuModel {
     tokenizer: Tokenizer,
 }
 
-/// A persistent Vulkan seam session (see [`CpuModel::vulkan_session`]): owns the backend, the
-/// uploaded weights + KV cache, and the token ids materialized in it.
+/// A persistent Vulkan seam session (see [`CpuModel::vulkan_session`]): owns the backend and up
+/// to `INFR_KV_SLOTS` (default 4) conversation SLOTS — each a KV cache + the token ids
+/// materialized in it, all sharing one weight upload (`Arc<SeamWeights>`). Per request the
+/// best-prefix slot is picked: a prompt that EXTENDS a slot's cache continues it (the classic
+/// next-turn suffix prefill); a prompt that diverges early (a different conversation) forks a
+/// fresh slot and SEEDS it with the longest shared prefix (e.g. a common system prompt) via a
+/// device-side KV copy instead of re-prefilling it; when all slots are taken the LRU one is
+/// recycled. Single-conversation callers (run/bench) naturally stay on one slot.
 pub struct DenseVulkanSession {
     vk: infr_vulkan::VulkanBackend,
-    state: Option<crate::cpu_backend::SeamKv>,
+    slots: Vec<Option<crate::cpu_backend::SeamKv>>,
+    last_used: Vec<u64>,
+    tick: u64,
     max_ctx: usize,
+}
+
+impl DenseVulkanSession {
+    /// Pick (and prepare) the slot for `prompt`; returns its index. See the struct doc for the
+    /// policy. A freshly created slot is `None` — the runner's first call uploads the weights.
+    fn pick_slot(&mut self, cfg: &crate::Config, prompt: &[u32]) -> Result<usize> {
+        // Seeding shorter prefixes than this isn't worth the copy submit.
+        const MIN_SEED: usize = 16;
+        let max_slots: usize = std::env::var("INFR_KV_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(4);
+        self.tick += 1;
+        if self.slots.is_empty() {
+            self.slots.push(None);
+            self.last_used.push(self.tick);
+            return Ok(0);
+        }
+        let score = |st: &Option<crate::cpu_backend::SeamKv>| {
+            st.as_ref().map_or(0, |s| s.prefix_score(prompt))
+        };
+        // A slot whose cache the prompt EXTENDS (or equals) is this conversation continuing.
+        if let Some(i) = (0..self.slots.len()).find(|&i| {
+            self.slots[i].as_ref().is_some_and(|s| {
+                let p = s.prefix_score(prompt);
+                p > 0 && (p == s.cached_len() || p == prompt.len())
+            })
+        }) {
+            self.last_used[i] = self.tick;
+            return Ok(i);
+        }
+        // Different conversation: the best shared prefix (if any) seeds the slot we hand out.
+        let (best_i, best_s) = (0..self.slots.len())
+            .map(|i| (i, score(&self.slots[i])))
+            .max_by_key(|&(_, s)| s)
+            .unwrap();
+        let target = if self.slots.len() < max_slots {
+            // Fork a fresh slot off any initialized one (shared weights, own KV).
+            let src = self
+                .slots
+                .iter()
+                .flatten()
+                .next()
+                .expect("pick_slot: no initialized slot to fork from");
+            let fresh = src.fork(&self.vk, cfg)?;
+            self.slots.push(Some(fresh));
+            self.last_used.push(self.tick);
+            self.slots.len() - 1
+        } else {
+            // Recycle the least-recently-used slot.
+            (0..self.slots.len())
+                .min_by_key(|&i| self.last_used[i])
+                .unwrap()
+        };
+        if best_s >= MIN_SEED && best_i != target {
+            // Give the slot the shared prefix (system prompt etc.) via device-side KV copy —
+            // only when it beats whatever prefix the slot already shares with the prompt.
+            if best_s > score(&self.slots[target]) {
+                let src = self.slots[best_i].take().expect("scored slot is Some");
+                if let Some(dst) = self.slots[target].as_mut() {
+                    dst.seed_from(&self.vk, cfg, &src, best_s)?;
+                }
+                self.slots[best_i] = Some(src);
+            }
+        }
+        self.last_used[target] = self.tick;
+        Ok(target)
+    }
 }
 
 impl CpuModel {
@@ -59,7 +136,9 @@ impl CpuModel {
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
         Ok(DenseVulkanSession {
             vk,
-            state: None,
+            slots: Vec::new(),
+            last_used: Vec::new(),
+            tick: 0,
             max_ctx,
         })
     }
@@ -94,6 +173,8 @@ impl CpuModel {
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
+        let slot = session.pick_slot(&self.cfg, &prompt_tokens)?;
+        let max_ctx = session.max_ctx;
         let (_generated, stats) = crate::cpu_backend::generate_dense_gpu_session(
             &session.vk,
             &self.gguf,
@@ -103,8 +184,8 @@ impl CpuModel {
             &prompt_tokens,
             max_new,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
-            &mut session.state,
-            session.max_ctx,
+            &mut session.slots[slot],
+            max_ctx,
             constraint,
         )?;
         Ok(stats)

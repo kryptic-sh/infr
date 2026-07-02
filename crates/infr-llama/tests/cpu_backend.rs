@@ -607,12 +607,14 @@ fn cpu_golden_qwen3moe() {
 }
 
 // Captured + verified coherent on the GPU (Qwen3-30B-A3B Q4_K_M: routed-expert FFN, ~3B active).
-// Re-blessed 2026-07-02 when `Backend::alloc` became zero-init (calloc): the previous hash depended
-// on uninitialized VRAM in the MoE path (a read-before-fully-written buffer whose recycled garbage
-// was merely stable), so this is now the DETERMINISTIC output. New output stays coherent
-// ("<think>\nOkay, the user is asking...").
+// Re-blessed 2026-07-02 (second time): the previous hash (0xa68ab7f4d15ad931, blessed alongside the
+// calloc-alloc change) did NOT reproduce even at its own bless commit (ddb350f) — every commit from
+// ddb350f..HEAD deterministically produces THIS hash (stable across reruns, rebuilds, and with
+// INFR_POISON_UNINIT=1 poisoning alloc_uninit memory), so the prior bless captured a since-vanished
+// environment/working-tree state, not the committed code. Output verified coherent
+// ("<think>\nOkay, so I need to figure out what the capital of France is…").
 const QWEN3MOE_GPU_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 24, 0xa68ab7f4d15ad931)];
+    &[("The capital of France is", 24, 0x193c084bdd8c8c48)];
 
 /// GPU qwen3moe golden-hash lock (routed-expert FFN: softmax router → top-k → renormalized weighted
 /// SwiGLU sum). Only `n_used` of 128 experts run per token; uses the dedicated MoE GPU forward.

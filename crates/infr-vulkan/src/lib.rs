@@ -800,10 +800,16 @@ impl Backend for VulkanBackend {
 
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         // Opt-out: skip the zero-fill (caller guarantees the full extent is written before any read).
-        // Debug builds poison with 0xFF (= NaN as f32) so a misuse surfaces loudly in tests.
+        // Debug builds poison with 0xFF (= NaN as f32) so a misuse surfaces loudly in tests;
+        // INFR_POISON_UNINIT=1 forces the poison in release too — for hunting layout-sensitive
+        // read-before-write bugs whose output shifts with unrelated code changes.
         let buf = self.make_alloc(bytes, usage)?;
         #[cfg(debug_assertions)]
         self.fill_buf(&buf, 0xFF)?;
+        #[cfg(not(debug_assertions))]
+        if std::env::var("INFR_POISON_UNINIT").is_ok() {
+            self.fill_buf(&buf, 0xFF)?;
+        }
         Ok(Box::new(buf))
     }
 

@@ -779,9 +779,17 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::Causal => 0,
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                 };
-                let kern = match g.desc(k_cache).dtype {
-                    DType::F16 => "attention_f16kv",
-                    _ => "attention_f32",
+                // Route by launch width. Decode (rows=1) yields only rows*n_head simdgroups —
+                // far too few to occupy the GPU — so it takes the split-KV kernel (8 simdgroups
+                // per (query, head), merged in threadgroup memory). Prefill has thousands of
+                // (query, head) pairs and keeps the leaner one-simdgroup kernel, whose lack of
+                // threadgroup memory lets more threadgroups run per core.
+                let split = rows * nh < 128;
+                let kern = match (g.desc(k_cache).dtype, split) {
+                    (DType::F16, false) => "attention_f16kv",
+                    (DType::F16, true) => "attnsplit_f16kv",
+                    (_, false) => "attention_f32",
+                    (_, true) => "attnsplit_f32",
                 };
                 let pso = self.pipelines.get(kern)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
@@ -792,14 +800,16 @@ impl MetalBackend {
                 p.extend_from_slice(&scale.to_ne_bytes());
                 p.extend_from_slice(&window.to_ne_bytes());
                 p.extend_from_slice(&pos.to_ne_bytes());
-                // One simdgroup per (query, head) — see `attention_f32`/`attention_f16kv`.
+                // One simdgroup per (query, head); split kernel uses NSG=8 simdgroups per pair
+                // (threadgroup = 256 threads), grid still exactly rows*n_head threadgroups.
+                let nsg = if split { 8 } else { 1 };
                 self.encode_tg(
                     r,
                     &pso,
                     &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
                     &p,
-                    rows * nh * 32,
-                    32,
+                    rows * nh * nsg * 32,
+                    nsg * 32,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

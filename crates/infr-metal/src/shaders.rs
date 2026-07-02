@@ -354,6 +354,128 @@ kernel void attention_f16kv(device const float* q   [[buffer(0)]],
     for (uint d = lane; d < p.head_dim; d += 32u) { dst[qb + d] = acc[t] / l; t++; }
 }
 
+// ---- Split-KV ("flash-decode") attention: same math as attention_*, but NSG simdgroups per
+// (query, head) threadgroup, each running a private online softmax over a strided slice of the KV
+// positions, merged at the end through threadgroup memory (rescale each partial to the global max,
+// sum, divide). Exists because decode has rows=1: the one-simdgroup kernel then launches only
+// `n_head` simdgroups — far too few to occupy the GPU — and its runtime grows O(kv_len) on that
+// fixed tiny width. Split kernels multiply decode parallelism by NSG; the host routes here only
+// when rows*n_head is small, so prefill keeps the leaner kernel (this one's static ~8 KB of
+// threadgroup memory would cap prefill occupancy).
+constant constexpr uint NSG = 8u;      // simdgroups per threadgroup (threadgroup = NSG*32 threads)
+kernel void attnsplit_f32(device const float* q   [[buffer(0)]],
+                          device const float* k   [[buffer(1)]],
+                          device const float* v   [[buffer(2)]],
+                          device float*       dst [[buffer(3)]],
+                          constant AttnParams& p  [[buffer(4)]],
+                          uint3 tgpig [[threadgroup_position_in_grid]],
+                          uint sgid [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    uint tg = tgpig.x;
+    if (tg >= p.rows * p.n_head) return;   // uniform per threadgroup — safe with the barrier below
+    uint ti = tg / p.n_head;
+    uint h = tg % p.n_head;
+    uint group = p.n_head / p.n_kv;
+    uint kvh = h / group;
+    uint qb = tg * p.head_dim;
+    uint abs = p.pos + ti;
+    uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
+
+    float acc[MAX_DPL];
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint j = lo + sgid; j <= abs; j += NSG) {
+        uint kb = (j * p.n_kv + kvh) * p.head_dim;
+        float part = 0.0f;
+        for (uint d = lane; d < p.head_dim; d += 32u) part += q[qb + d] * k[kb + d];
+        float sc = simd_sum(part) * p.scale;
+        float mnew = max(m, sc);
+        float corr = exp(m - mnew);
+        float pw = exp(sc - mnew);
+        l = l * corr + pw;
+        uint t = 0;
+        for (uint d = lane; d < p.head_dim; d += 32u) { acc[t] = acc[t] * corr + pw * v[kb + d]; t++; }
+        m = mnew;
+    }
+    // Merge the NSG partials. A simdgroup whose slice was empty has l==0 (skip it — its m is -inf).
+    threadgroup float tg_m[NSG], tg_l[NSG], tg_acc[NSG * MAX_HD];
+    if (lane == 0u) { tg_m[sgid] = m; tg_l[sgid] = l; }
+    uint t = 0;
+    for (uint d = lane; d < p.head_dim; d += 32u) { tg_acc[sgid * p.head_dim + d] = acc[t]; t++; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0u) {
+        float gm = -INFINITY;
+        for (uint i = 0; i < NSG; i++) if (tg_l[i] > 0.0f) gm = max(gm, tg_m[i]);
+        float gl = 0.0f;
+        float w[NSG];
+        for (uint i = 0; i < NSG; i++) {
+            w[i] = (tg_l[i] > 0.0f) ? exp(tg_m[i] - gm) : 0.0f;
+            gl += tg_l[i] * w[i];
+        }
+        for (uint d = lane; d < p.head_dim; d += 32u) {
+            float s = 0.0f;
+            for (uint i = 0; i < NSG; i++) s += tg_acc[i * p.head_dim + d] * w[i];
+            dst[qb + d] = s / gl;
+        }
+    }
+}
+
+kernel void attnsplit_f16kv(device const float* q   [[buffer(0)]],
+                            device const half*  k   [[buffer(1)]],
+                            device const half*  v   [[buffer(2)]],
+                            device float*       dst [[buffer(3)]],
+                            constant AttnParams& p  [[buffer(4)]],
+                            uint3 tgpig [[threadgroup_position_in_grid]],
+                            uint sgid [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint tg = tgpig.x;
+    if (tg >= p.rows * p.n_head) return;
+    uint ti = tg / p.n_head;
+    uint h = tg % p.n_head;
+    uint group = p.n_head / p.n_kv;
+    uint kvh = h / group;
+    uint qb = tg * p.head_dim;
+    uint abs = p.pos + ti;
+    uint lo = (p.window > 0u && abs + 1u > p.window) ? (abs + 1u - p.window) : 0u;
+
+    float acc[MAX_DPL];
+    for (uint t = 0; t < MAX_DPL; t++) acc[t] = 0.0f;
+    float m = -INFINITY, l = 0.0f;
+    for (uint j = lo + sgid; j <= abs; j += NSG) {
+        uint kb = (j * p.n_kv + kvh) * p.head_dim;
+        float part = 0.0f;
+        for (uint d = lane; d < p.head_dim; d += 32u) part += q[qb + d] * (float)k[kb + d];
+        float sc = simd_sum(part) * p.scale;
+        float mnew = max(m, sc);
+        float corr = exp(m - mnew);
+        float pw = exp(sc - mnew);
+        l = l * corr + pw;
+        uint t = 0;
+        for (uint d = lane; d < p.head_dim; d += 32u) { acc[t] = acc[t] * corr + pw * (float)v[kb + d]; t++; }
+        m = mnew;
+    }
+    threadgroup float tg_m[NSG], tg_l[NSG], tg_acc[NSG * MAX_HD];
+    if (lane == 0u) { tg_m[sgid] = m; tg_l[sgid] = l; }
+    uint t = 0;
+    for (uint d = lane; d < p.head_dim; d += 32u) { tg_acc[sgid * p.head_dim + d] = acc[t]; t++; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgid == 0u) {
+        float gm = -INFINITY;
+        for (uint i = 0; i < NSG; i++) if (tg_l[i] > 0.0f) gm = max(gm, tg_m[i]);
+        float gl = 0.0f;
+        float w[NSG];
+        for (uint i = 0; i < NSG; i++) {
+            w[i] = (tg_l[i] > 0.0f) ? exp(tg_m[i] - gm) : 0.0f;
+            gl += tg_l[i] * w[i];
+        }
+        for (uint d = lane; d < p.head_dim; d += 32u) {
+            float s = 0.0f;
+            for (uint i = 0; i < NSG; i++) s += tg_acc[i * p.head_dim + d] * w[i];
+            dst[qb + d] = s / gl;
+        }
+    }
+}
+
 // ---- WriteKv: cast-copy `n` f32 source elems into the bound KV cache at row offset `base`, on the
 // GPU so it stays in the batch (no host round-trip that would force a per-layer flush). The (half)
 // cast is IEEE round-to-nearest-even — byte-identical to the host `f16::from_f32` reference.

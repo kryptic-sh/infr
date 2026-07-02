@@ -9,16 +9,18 @@ that emerged and the measured reasoning behind it.
 
 ## Numbers (M3 Pro 18-core, Qwen3 Q4_K_M, `infr bench` vs `llama-bench`, same GGUF)
 
+(One idle-machine run, both engines back-to-back, 2-3 reps each.)
+
 | model | metric | infr-metal | llama.cpp | gap |
 | --- | --- | --- | --- | --- |
-| 0.6B | tg128 | 159 tok/s | 191 | 1.20× |
-| 0.6B | tg128 @ d16384 | 48.3 tok/s | 42.9 | **infr ahead** |
-| 0.6B | pp2048 | 3543 tok/s | 3748 | 1.06× |
-| 0.6B | pp8192 | 2258 tok/s | 2336 | 1.03× |
-| 4B | tg128 | 40.9 tok/s | 46.7 | 1.14× |
-| 4B | tg128 @ d16384 | 21.4 tok/s | 24.5 | 1.14× |
-| 4B | pp2048 | 576 tok/s | 608 | 1.06× |
-| 4B | pp8192 | 434 tok/s | 488 | 1.12× |
+| 0.6B | tg128 | 158 tok/s | 193 | 1.23× |
+| 0.6B | tg128 @ d16384 | 49.7 tok/s | 46.6 | **infr ahead** |
+| 0.6B | pp2048 | 3508 tok/s | 3751 | 1.07× |
+| 0.6B | pp8192 | 2233 tok/s | 2342 | 1.05× |
+| 4B | tg128 | 40.5 tok/s | 46.6 | 1.15× |
+| 4B | tg128 @ d16384 | 21.8 tok/s | 24.4 | 1.12× |
+| 4B | pp2048 | 569 tok/s | 603 | 1.06× |
+| 4B | pp8192 | 455 tok/s | 489 | 1.07× |
 
 Decode is weight-stream bound: the GEMV kernels run ~107 GB/s of a measured
 ~133 GB/s read roofline, and the per-token host cost is ~0.2 ms (the recorded

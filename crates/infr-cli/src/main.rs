@@ -566,6 +566,65 @@ impl infr_server::ChatGenerator for LlamaGenerator {
     }
 }
 
+/// Serve adapter for the seam-backed [`ChatModel`]s (qwen35 on any backend, dense/MoE on the
+/// Vulkan seam or the CPU/Metal reference): renders the FULL OpenAI conversation — including tool
+/// specs and prior tool calls/results — through the model's own chat template
+/// (`infr_chat::render_chat_oai`, model-independent), generates through the SAME `ChatModel`
+/// primitive `infr run`/`bench` drive (persistent session ⇒ per-request suffix-only prefill), and
+/// streams through the same [`ChatStream`] splitter (reasoning/content/auto-parsed tool calls).
+/// Grammar-FORCED tool_choice isn't wired on the seam yet — it degrades to auto with a warning
+/// (the streamed parser still extracts any tool call the model emits). Decode is greedy.
+struct SeamGenerator {
+    model: Box<dyn infr_llama::model::ChatModel + Send>,
+    renderer: infr_llama::model::OaiRenderer,
+}
+
+impl SeamGenerator {
+    fn new(
+        gguf_path: &Path,
+        model: Box<dyn infr_llama::model::ChatModel + Send>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            model,
+            renderer: infr_llama::model::OaiRenderer::open(gguf_path)?,
+        })
+    }
+}
+
+impl infr_server::ChatGenerator for SeamGenerator {
+    fn chat(
+        &mut self,
+        messages: &[infr_engine::ChatMessage],
+        tools_json: Option<&str>,
+        tool_choice: Option<&str>,
+        on_delta: &mut dyn FnMut(infr_engine::Delta),
+    ) -> anyhow::Result<()> {
+        let tools: Option<serde_json::Value> = tools_json
+            .map(serde_json::from_str)
+            .transpose()
+            .context("parsing request `tools`")?;
+        let prompt = self.renderer.render(messages, tools.as_ref())?;
+        let max_new = std::env::var("INFR_MAX_NEW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048usize);
+        if matches!(tool_choice, Some(c) if c != "auto" && c != "none") {
+            eprintln!(
+                "[tools] forced tool_choice is not wired on the seam backend yet — using auto"
+            );
+        }
+        let mut stream = ChatStream::new(tool_choice != Some("none"));
+        {
+            let od = &mut *on_delta;
+            self.model.generate(&prompt, max_new, &mut |piece: &str| {
+                stream.push(piece, &mut *od)
+            })?;
+        }
+        stream.finish(on_delta);
+        Ok(())
+    }
+}
+
 /// Incremental splitter for the streaming server path. Accumulates the raw decoded text and, on each
 /// piece, emits the newly-stable Reasoning (`<think>…</think>`) and Content deltas — holding back a
 /// marker-length tail so a partial `<think>`/`</think>`/`<tool_call>` marker is never emitted. Once a
@@ -1215,6 +1274,50 @@ fn cmd_compare(
 
 fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
+    let model_id = gguf
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model")
+        .to_string();
+    let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
+
+    // Seam-backed serve: qwen35 (which the bespoke Llama engine can't load at all) always, and
+    // dense/MoE when opted in (INFR_SEAM / INFR_CPU / INFR_METAL) — the SAME ChatModel + session
+    // `infr run` uses, so serve gets per-request suffix-only prefill for free. Greedy decode;
+    // forced tool_choice degrades to auto (see SeamGenerator).
+    let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
+    let seam_model: Option<Box<dyn infr_llama::model::ChatModel + Send>> = if is_q35 {
+        let m = if std::env::var("INFR_METAL").is_ok() {
+            infr_llama::model::Qwen35Chat::new_metal(gguf.clone())
+        } else if std::env::var("INFR_CPU").is_ok() {
+            infr_llama::model::Qwen35Chat::new_cpu(gguf.clone())
+        } else {
+            infr_llama::model::Qwen35Chat::new(gguf.clone())
+        };
+        Some(Box::new(m))
+    } else if std::env::var("INFR_METAL").is_ok() {
+        Some(Box::new(infr_llama::model::CpuDenseChat::new_metal(
+            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+        )))
+    } else if std::env::var("INFR_CPU").is_ok() {
+        Some(Box::new(infr_llama::model::CpuDenseChat::new(
+            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+        )))
+    } else if std::env::var("INFR_SEAM").is_ok() {
+        Some(Box::new(infr_llama::model::DenseSeamChat::new(
+            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+        )))
+    } else {
+        None
+    };
+    if let Some(m) = seam_model {
+        let generator: Box<dyn infr_server::ChatGenerator> =
+            Box::new(SeamGenerator::new(&gguf, m)?);
+        let rt = tokio::runtime::Runtime::new()?;
+        println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
+        return rt.block_on(infr_server::serve(generator, model_id, sockaddr));
+    }
+
     let llama = infr_llama::Llama::load_opt(&gguf, tok.as_deref())?;
     // Qwen3's recommended sampling — pure greedy makes thinking models degenerate (unterminated
     // `<think>`, repeated tokens). Mirrors `cmd_run`; tune via INFR_TEMP / INFR_TOP_K / INFR_TOP_P.
@@ -1235,12 +1338,6 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         envu("INFR_TOP_K", 20),
         envf("INFR_TOP_P", 0.95),
     );
-    let model_id = gguf
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model")
-        .to_string();
-    let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
     let generator: Box<dyn infr_server::ChatGenerator> = Box::new(LlamaGenerator {
         cache: infr_llama::ServeCache::from_env(),
         llama,

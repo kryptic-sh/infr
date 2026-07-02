@@ -299,6 +299,42 @@ impl ChatModel for Qwen35Chat {
     }
 }
 
+/// Standalone OpenAI-shaped prompt renderer over a GGUF's own chat template — tool specs and prior
+/// tool calls/results included (`infr_chat::render_chat_oai`). Model-independent: the serve-side
+/// render for seam-backed [`ChatModel`]s, so serve never needs the bespoke `Llama` just to render.
+pub struct OaiRenderer {
+    gguf: infr_gguf::Gguf,
+    tokenizer: tokenizers::Tokenizer,
+    eos: u32,
+}
+
+impl OaiRenderer {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let gguf = infr_gguf::Gguf::open(path).map_err(|e| anyhow::anyhow!("open gguf: {e}"))?;
+        let tokenizer = crate::build_tokenizer(&gguf)?;
+        // Raw metadata (NOT Config::from_gguf — that parser is dense-only and rejects qwen35).
+        use infr_core::WeightSource;
+        let eos = gguf
+            .metadata()
+            .u64("tokenizer.ggml.eos_token_id")
+            .unwrap_or(2) as u32;
+        Ok(Self {
+            gguf,
+            tokenizer,
+            eos,
+        })
+    }
+
+    pub fn render(
+        &self,
+        messages: &[infr_chat::ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
+        infr_chat::render_chat_oai(&self.gguf, &self.tokenizer, self.eos, messages, tools, true)
+            .ok_or_else(no_template_err)
+    }
+}
+
 /// Dense/MoE on the VULKAN agnostic seam with a persistent KV session (`INFR_SEAM=1` for
 /// `infr run`): weights upload once, and every turn prefills only the token suffix that differs
 /// from the previous turn — the seam twin of the bespoke `ChatSession`'s incremental prefill.

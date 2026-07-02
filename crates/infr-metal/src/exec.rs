@@ -8,9 +8,47 @@ use infr_core::graph::{Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_core::Result;
 use infr_gguf::dequant::dequant_block;
-use metal::{Buffer as MtlBuffer, ComputePipelineState, MTLResourceOptions, MTLSize};
+use metal::{
+    Buffer as MtlBuffer, CommandBuffer, ComputeCommandEncoder, ComputePipelineState,
+    MTLResourceOptions, MTLSize,
+};
 use std::ffi::c_void;
 use std::sync::Arc;
+
+/// A quantized weight in the compact FACTORED device form (`infr_gguf::dequant::Factored`):
+/// bit-packed codes (4/6/8-bit, chosen by the format's max code), one `(sc, m)` i16 pair per
+/// 16-element block, and one `(d, dmin)` f16 pair per `dblk` elements, so
+/// `weight = (d*sc)*code + (dmin*m)` — bit-for-bit the `dequant` reference (same f32 multiplies).
+/// Q4_K lands at ~6.1 bpw resident and Q6_K at ~8.1, vs 32 for a dequant-to-f32 weight; decode
+/// GEMV is bound on exactly this stream.
+pub(crate) struct QuiWeight {
+    codes: MtlBuffer,
+    scm: MtlBuffer,
+    dd: MtlBuffer,
+    /// Kernel matching the code packing: `linear_quik4`/`linear_quik6`/`linear_quik8`.
+    kern: &'static str,
+    /// log2(elements per `(d, dmin)` pair): 5 for legacy 32-element blocks, 8 for K-quants.
+    dshift: u32,
+}
+
+/// Where a tensor's current value lives. GPU ops keep their results on the device and only pay a
+/// CPU↔GPU round-trip when a host-side op (or the final write-back) actually needs the bytes.
+#[derive(Clone, Copy, PartialEq)]
+enum Loc {
+    Host,
+    Device,
+}
+
+/// Per-forward execution state: the host mirror (`vals`), a device buffer per tensor (`dev`), where
+/// each tensor currently lives (`loc`), and the open command buffer that batches consecutive GPU ops
+/// so they share a single commit + wait instead of one per op.
+struct Resident {
+    vals: Vec<Vec<f32>>,
+    dev: Vec<Option<Arc<MtlBuffer>>>,
+    loc: Vec<Loc>,
+    cb: Option<CommandBuffer>,
+    enc: Option<ComputeCommandEncoder>,
+}
 
 /// Reinterpret raw buffer bytes as `f32` per `dtype` (dequantizing quant/f16/bf16, widening integer
 /// tensors). The host-side "read a tensor's value", matching `infr-cpu`'s `bytes_to_f32`.
@@ -26,6 +64,28 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
             .map(|&v| v as f32)
             .collect(),
         other => dequant_block(other, bytes).expect("metal backend: host dequant"),
+    }
+}
+
+/// Stable op label for the profiler.
+fn op_name(op: &Op) -> &'static str {
+    match op {
+        Op::RmsNorm { .. } => "RmsNorm",
+        Op::Linear { .. } => "Linear",
+        Op::QkNorm { .. } => "QkNorm",
+        Op::Rope { .. } => "Rope",
+        Op::QkNormRope { .. } => "QkNormRope",
+        Op::WriteKv { .. } => "WriteKv",
+        Op::Attention { .. } => "Attention",
+        Op::GatedAct { .. } => "GatedAct",
+        Op::Add { .. } => "Add",
+        Op::Scale { .. } => "Scale",
+        Op::Softcap { .. } => "Softcap",
+        Op::Copy { .. } => "Copy",
+        Op::CopyStrided { .. } => "CopyStrided",
+        Op::MoeFfn { .. } => "MoeFfn",
+        Op::Conv1dSilu { .. } => "Conv1dSilu",
+        Op::DeltaNet { .. } => "DeltaNet",
     }
 }
 
@@ -69,14 +129,6 @@ impl MetalBackend {
         out
     }
 
-    /// Read the first `n` f16 elements of a buffer, widening to f32.
-    fn read_f16_prefix(buf: &crate::MetalBuffer, n: usize) -> Vec<f32> {
-        let ptr = buf.raw.contents() as *const u16;
-        (0..n)
-            .map(|i| half::f16::from_bits(unsafe { *ptr.add(i) }).to_f32())
-            .collect()
-    }
-
     /// Encode one kernel dispatch and block until it completes (correctness-first: every op is its
     /// own command buffer, so ops run strictly in graph order with no manual barriers). `data_bufs`
     /// bind to buffer indices `0..k`; `params` (packed scalars) binds at index `k`.
@@ -107,9 +159,115 @@ impl MetalBackend {
             let tg = (pso.max_total_threads_per_threadgroup() as usize).min(threads.max(1)) as u64;
             enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
             enc.end_encoding();
+            let t0 = self.profiling.then(std::time::Instant::now);
             cb.commit();
             cb.wait_until_completed();
+            if let Some(t0) = t0 {
+                // Wall time of one op's commit + GPU schedule + wait barrier.
+                self.prof.lock().unwrap().add_dispatch(t0.elapsed());
+            }
         });
+    }
+
+    /// Encode one kernel into the batch's shared command buffer (lazily opened) WITHOUT committing.
+    /// Metal's automatic hazard tracking inserts the needed barriers between kernels that touch the
+    /// same buffers, so the batch runs in graph order inside a single CPU↔GPU round-trip.
+    fn encode(
+        &self,
+        r: &mut Resident,
+        pso: &ComputePipelineState,
+        bufs: &[&MtlBuffer],
+        params: &[u8],
+        threads: usize,
+    ) {
+        // Auto threadgroup: as wide as the pipeline allows (good for the big elementwise grids).
+        self.encode_tg(r, pso, bufs, params, threads, 0);
+    }
+
+    /// As `encode`, but with an explicit threadgroup width (`tg`; 0 = auto). The simdgroup-GEMV
+    /// kernels pass 32 (one simdgroup per threadgroup) so a matvec launches `out_f` threadgroups
+    /// instead of a handful of wide ones — far more threadgroups for the GPU's cores to interleave,
+    /// which hides the memory latency the tiny per-output dot would otherwise stall on.
+    fn encode_tg(
+        &self,
+        r: &mut Resident,
+        pso: &ComputePipelineState,
+        bufs: &[&MtlBuffer],
+        params: &[u8],
+        threads: usize,
+        tg: usize,
+    ) {
+        if threads == 0 {
+            return;
+        }
+        if r.enc.is_none() {
+            let cb = self.queue.new_command_buffer().to_owned();
+            let enc = cb.new_compute_command_encoder().to_owned();
+            r.cb = Some(cb);
+            r.enc = Some(enc);
+        }
+        let enc = r.enc.as_ref().unwrap();
+        enc.set_compute_pipeline_state(pso);
+        for (i, b) in bufs.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), 0);
+        }
+        if !params.is_empty() {
+            enc.set_bytes(
+                bufs.len() as u64,
+                params.len() as u64,
+                params.as_ptr() as *const c_void,
+            );
+        }
+        let cap = pso.max_total_threads_per_threadgroup() as usize;
+        let tg = if tg == 0 { cap } else { tg.min(cap) }.min(threads.max(1)) as u64;
+        enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
+    }
+
+    /// Close the open batch: end encoding, commit, and wait. A no-op if nothing is buffered.
+    fn flush(&self, r: &mut Resident) {
+        if let Some(enc) = r.enc.take() {
+            enc.end_encoding();
+            let cb = r.cb.take().expect("metal: enc without command buffer");
+            let t0 = self.profiling.then(std::time::Instant::now);
+            cb.commit();
+            cb.wait_until_completed();
+            if let Some(t0) = t0 {
+                self.prof.lock().unwrap().add_dispatch(t0.elapsed());
+            }
+        }
+    }
+
+    /// Ensure a tensor's value is a device buffer (uploading from the host mirror if needed), and
+    /// return it. Tensors already produced on-device are returned as-is — no round-trip.
+    fn ensure_device(&self, r: &mut Resident, id: TensorId) -> Arc<MtlBuffer> {
+        let i = id.0 as usize;
+        if r.dev[i].is_none() || r.loc[i] == Loc::Host {
+            r.dev[i] = Some(Arc::new(self.f32_buf(&r.vals[i])));
+            r.loc[i] = Loc::Device;
+        }
+        r.dev[i].clone().unwrap()
+    }
+
+    /// Get (or allocate) the persistent device output buffer for a tensor, sized for `n` f32s.
+    fn dev_dst(&self, r: &mut Resident, id: TensorId, n: usize) -> Arc<MtlBuffer> {
+        let i = id.0 as usize;
+        let big_enough = matches!(&r.dev[i], Some(b) if b.length() as usize >= n * 4);
+        if !big_enough {
+            r.dev[i] = Some(Arc::new(self.zeros_buf(n)));
+        }
+        r.dev[i].clone().unwrap()
+    }
+
+    /// Ensure a tensor's value is in the host mirror `vals`, flushing the batch and downloading from
+    /// the device if the latest value lives there. This is the only place a GPU→host stall happens.
+    fn ensure_host(&self, r: &mut Resident, g: &infr_core::graph::Graph, id: TensorId) {
+        let i = id.0 as usize;
+        if r.loc[i] == Loc::Device {
+            self.flush(r);
+            let n = g.desc(id).numel();
+            r.vals[i] = Self::read_f32(r.dev[i].as_ref().unwrap(), n);
+            r.loc[i] = Loc::Host;
+        }
     }
 
     pub(crate) fn execute_graph(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
@@ -119,14 +277,28 @@ impl MetalBackend {
             .expect("metal backend: plan is not a GraphPlan")
             .graph;
 
-        // f32 working store for every Input/Internal/Output handle (mirrors the CPU interpreter).
+        // Wrap the whole forward in one autorelease pool: the batched command buffers/encoders are
+        // retained owned handles, so we drain the pool once per forward instead of once per op.
+        objc::rc::autoreleasepool(|| self.run_graph(g, bindings))
+    }
+
+    fn run_graph(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> Result<()> {
+        // f32 host mirror for every Input/Internal/Output handle (mirrors the CPU interpreter); GPU
+        // results stay on-device until a host op or the write-back needs them (see `Loc`/`Resident`).
         // KV caches are written/read in place from their bound buffers (see `direct`).
         let direct = g.in_place_inputs();
-        let mut vals: Vec<Vec<f32>> = vec![Vec::new(); g.tensors.len()];
+        let n = g.tensors.len();
+        let mut r = Resident {
+            vals: vec![Vec::new(); n],
+            dev: vec![None; n],
+            loc: vec![Loc::Host; n],
+            cb: None,
+            enc: None,
+        };
         for (i, decl) in g.tensors.iter().enumerate() {
             match decl.kind {
                 TensorKind::Internal | TensorKind::Output => {
-                    vals[i] = vec![0f32; decl.desc.numel()]
+                    r.vals[i] = vec![0f32; decl.desc.numel()]
                 }
                 TensorKind::Input if direct.contains(&TensorId(i as u32)) => {}
                 TensorKind::Input => {
@@ -136,14 +308,36 @@ impl MetalBackend {
                             .expect("metal backend: unbound Input"),
                     );
                     let bytes = Self::read_bytes(buf);
-                    vals[i] = bytes_to_f32(&bytes, decl.desc.dtype);
+                    r.vals[i] = bytes_to_f32(&bytes, decl.desc.dtype);
                 }
                 TensorKind::Weight => {}
             }
         }
 
-        for op in &g.ops {
-            self.run_op(op, g, bindings, &mut vals)?;
+        if self.profiling {
+            for op in &g.ops {
+                let t0 = std::time::Instant::now();
+                self.run_op(op, g, bindings, &mut r)?;
+                let enc = t0.elapsed();
+                // Per-op mode: flush now so this op's GPU wall is isolable (breaks batching).
+                let gpu = if self.prof_ops {
+                    let tg = std::time::Instant::now();
+                    self.flush(&mut r);
+                    Some(tg.elapsed())
+                } else {
+                    None
+                };
+                let mut pr = self.prof.lock().unwrap();
+                pr.add_op(op_name(op), enc);
+                if let Some(gpu) = gpu {
+                    pr.add_op_gpu(op_name(op), gpu);
+                }
+            }
+            self.prof.lock().unwrap().add_forward();
+        } else {
+            for op in &g.ops {
+                self.run_op(op, g, bindings, &mut r)?;
+            }
         }
 
         // Write back Outputs (and mutated f32 Inputs, e.g. recurrent state) to their bound buffers.
@@ -155,9 +349,11 @@ impl MetalBackend {
             if !write_back {
                 continue;
             }
-            if let Some(buf) = bindings.get(TensorId(i as u32)) {
-                let b = metal_buf(buf);
-                let src: &[u8] = bytemuck::cast_slice(&vals[i]);
+            if bindings.get(TensorId(i as u32)).is_some() {
+                // Pull the value back to the host mirror (flushes the batch if it's still on-device).
+                self.ensure_host(&mut r, g, TensorId(i as u32));
+                let b = metal_buf(bindings.get(TensorId(i as u32)).unwrap());
+                let src: &[u8] = bytemuck::cast_slice(&r.vals[i]);
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         src.as_ptr(),
@@ -167,6 +363,8 @@ impl MetalBackend {
                 }
             }
         }
+        // Close any trailing batch (an Internal-only tail never pulled to host).
+        self.flush(&mut r);
         Ok(())
     }
 
@@ -186,6 +384,73 @@ impl MetalBackend {
         let f = bytes_to_f32(&bytes, g.desc(id).dtype);
         let w = Arc::new(self.f32_buf(&f));
         self.weight_cache.lock().unwrap().insert(key, w.clone());
+        w
+    }
+
+    /// A device buffer initialized from a raw byte slice.
+    fn bytes_buf(&self, data: &[u8]) -> MtlBuffer {
+        self.device.new_buffer_with_data(
+            data.as_ptr() as *const c_void,
+            data.len().max(1) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    /// Build (or fetch from cache) a quantized weight in factored device form
+    /// (`dequant_factored`), bit-packing the codes to the narrowest width the format's max code
+    /// fits (4/6/8 bits, low bits first) — decode GEMV is bound on the weight byte stream, so
+    /// every bit shaved here is throughput.
+    fn weight_qui(
+        &self,
+        id: TensorId,
+        g: &infr_core::graph::Graph,
+        bindings: &Bindings,
+    ) -> Arc<QuiWeight> {
+        let buf = metal_buf(bindings.get(id).expect("metal backend: unbound Weight"));
+        let key = buf as *const _ as usize;
+        if let Some(w) = self.qui_cache.lock().unwrap().get(&key) {
+            return w.clone();
+        }
+        let bytes = Self::read_bytes(buf);
+        let f = infr_gguf::dequant::dequant_factored(g.desc(id).dtype, &bytes);
+        let maxcode = f.codes.iter().copied().max().unwrap_or(0);
+        let (kern, codes_bytes): (&'static str, Vec<u8>) = if maxcode < 16 {
+            // two codes per byte, low nibble first
+            (
+                "linear_quik4",
+                f.codes
+                    .chunks_exact(2)
+                    .map(|p| p[0] | (p[1] << 4))
+                    .collect(),
+            )
+        } else if maxcode < 64 {
+            // four codes per three bytes, LSB-first 6-bit stream
+            (
+                "linear_quik6",
+                f.codes
+                    .chunks_exact(4)
+                    .flat_map(|c| {
+                        [
+                            c[0] | (c[1] << 6),
+                            (c[1] >> 2) | (c[2] << 4),
+                            (c[2] >> 4) | (c[3] << 2),
+                        ]
+                    })
+                    .collect(),
+            )
+        } else {
+            ("linear_quik8", f.codes)
+        };
+        let w = Arc::new(QuiWeight {
+            codes: self.bytes_buf(&codes_bytes),
+            scm: self.bytes_buf(bytemuck::cast_slice(&f.scm)),
+            dd: self.bytes_buf(bytemuck::cast_slice(
+                &f.dd.iter().map(|h| h.to_bits()).collect::<Vec<u16>>(),
+            )),
+            kern,
+            dshift: f.dblk.trailing_zeros(),
+        });
+        self.qui_cache.lock().unwrap().insert(key, w.clone());
         w
     }
 
@@ -230,7 +495,7 @@ impl MetalBackend {
         let mut p = 1u32.to_ne_bytes().to_vec(); // m = 1
         p.extend_from_slice(&(in_f as u32).to_ne_bytes());
         p.extend_from_slice(&(out_f as u32).to_ne_bytes());
-        self.dispatch(&pso, &[&bx, &bw, &bd], &p, out_f);
+        self.dispatch(&pso, &[&bx, &bw, &bd], &p, out_f * 32); // 32 lanes/output — see linear_f32
         Ok(Self::read_f32(&bd, out_f))
     }
 
@@ -239,7 +504,7 @@ impl MetalBackend {
         op: &Op,
         g: &infr_core::graph::Graph,
         bindings: &Bindings,
-        vals: &mut [Vec<f32>],
+        r: &mut Resident,
     ) -> Result<()> {
         match *op {
             Op::RmsNorm {
@@ -251,15 +516,23 @@ impl MetalBackend {
                 eps,
             } => {
                 let (rows, dim) = (rows as usize, dim as usize);
-                let bx = self.f32_buf(&vals[x.0 as usize]);
+                let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings);
-                let bd = self.zeros_buf(rows * dim);
+                let bd = self.dev_dst(r, dst, rows * dim);
                 let pso = self.pipelines.get("rmsnorm_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(dim as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                self.dispatch(&pso, &[&bx, bw.as_ref(), &bd], &p, rows);
-                vals[dst.0 as usize] = Self::read_f32(&bd, rows * dim);
+                // One simdgroup (32 lanes) per row — see `rmsnorm_f32`.
+                self.encode_tg(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                    &p,
+                    rows * 32,
+                    32,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::QkNorm {
                 x,
@@ -271,16 +544,24 @@ impl MetalBackend {
                 eps,
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
-                let bx = self.f32_buf(&vals[x.0 as usize]);
+                let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings);
-                let bd = self.zeros_buf(rows * nh * hd);
+                let bd = self.dev_dst(r, dst, rows * nh * hd);
                 let pso = self.pipelines.get("qknorm_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                self.dispatch(&pso, &[&bx, bw.as_ref(), &bd], &p, rows * nh);
-                vals[dst.0 as usize] = Self::read_f32(&bd, rows * nh * hd);
+                // One simdgroup per (row, head) — see `qknorm_f32`.
+                self.encode_tg(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                    &p,
+                    rows * nh * 32,
+                    32,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::Linear {
                 x,
@@ -291,15 +572,73 @@ impl MetalBackend {
                 out_f,
             } => {
                 let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
-                let bx = self.f32_buf(&vals[x.0 as usize]);
-                let bw = self.weight_buf(weight, g, bindings); // dequantized f32, cached
-                let bd = self.zeros_buf(m * out_f);
-                let pso = self.pipelines.get("linear_f32")?;
+                let bx = self.ensure_device(r, x);
+                let bd = self.dev_dst(r, dst, m * out_f);
                 let mut p = (m as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(in_f as u32).to_ne_bytes());
                 p.extend_from_slice(&(out_f as u32).to_ne_bytes());
-                self.dispatch(&pso, &[&bx, bw.as_ref(), &bd], &p, m * out_f);
-                vals[dst.0 as usize] = Self::read_f32(&bd, m * out_f);
+                // 32 lanes (one simdgroup) per output element — see `linear_f32`/`linear_quik*`.
+                if infr_gguf::dequant::is_quant(g.desc(weight).dtype) {
+                    // Native quant: decode the compact factored weight inline — no f32 blow-up.
+                    // Kernel matches the weight's code packing (4/6/8-bit). Multi-row (prefill)
+                    // takes the row-tiled variant: one simdgroup per (8-row tile, output), each
+                    // weight block decoded once for all 8 rows, instead of the GEMV kernel
+                    // re-streaming the whole weight matrix once per row.
+                    let qw = self.weight_qui(weight, g, bindings);
+                    // sgs = simdgroups to launch; tg = threadgroup width. GEMM tiles 8x16 per
+                    // simdgroup (4 simdgroups per threadgroup for the staging tile). The GEMM
+                    // kernel requires its full 128-thread threadgroup (per-simdgroup staging
+                    // tiles indexed by simdgroup_index_in_threadgroup), so it is gated on the
+                    // pipeline's own thread cap — see the Attention arm for why that cap can
+                    // drop below the kernel's need — and degrades to the row-tiled kernel.
+                    let mm_kern = match qw.kern {
+                        "linear_quik4" => "linear_quik4_mm",
+                        "linear_quik6" => "linear_quik6_mm",
+                        _ => "linear_quik8_mm",
+                    };
+                    let mm_ok = m >= 16
+                        && out_f % 16 == 0
+                        && self
+                            .pipelines
+                            .get(mm_kern)?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
+                    let (kern, sgs, tg): (&'static str, usize, usize) = if mm_ok {
+                        (mm_kern, m.div_ceil(8) * (out_f / 16), 128)
+                    } else if m > 1 {
+                        let rt = match qw.kern {
+                            "linear_quik4" => "linear_quik4_rt",
+                            "linear_quik6" => "linear_quik6_rt",
+                            _ => "linear_quik8_rt",
+                        };
+                        (rt, m.div_ceil(8) * out_f, 32)
+                    } else {
+                        (qw.kern, out_f, 32)
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    p.extend_from_slice(&qw.dshift.to_ne_bytes());
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bx.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
+                        &p,
+                        sgs * 32,
+                        tg,
+                    );
+                } else {
+                    // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
+                    let bw = self.weight_buf(weight, g, bindings);
+                    let pso = self.pipelines.get("linear_f32")?;
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                        &p,
+                        m * out_f * 32,
+                        32,
+                    );
+                }
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::Rope {
                 x,
@@ -313,13 +652,13 @@ impl MetalBackend {
                 freq_factors,
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
-                let bx = self.f32_buf(&vals[x.0 as usize]);
-                let bpos = self.f32_buf(&vals[positions.0 as usize]);
+                let bx = self.ensure_device(r, x);
+                let bpos = self.ensure_device(r, positions);
                 let bff = match freq_factors {
-                    Some(f) => self.f32_buf(&vals[f.0 as usize]),
-                    None => self.zeros_buf(1),
+                    Some(f) => self.ensure_device(r, f),
+                    None => Arc::new(self.zeros_buf(1)),
                 };
-                let bd = self.zeros_buf(rows * nh * hd);
+                let bd = self.dev_dst(r, dst, rows * nh * hd);
                 let pso = self.pipelines.get("rope_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
@@ -327,8 +666,14 @@ impl MetalBackend {
                 p.extend_from_slice(&(rope_dim).to_ne_bytes());
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
-                self.dispatch(&pso, &[&bx, &bpos, &bff, &bd], &p, rows * nh);
-                vals[dst.0 as usize] = Self::read_f32(&bd, rows * nh * hd);
+                self.encode(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bpos.as_ref(), bff.as_ref(), bd.as_ref()],
+                    &p,
+                    rows * nh,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::QkNormRope {
                 x,
@@ -344,14 +689,14 @@ impl MetalBackend {
                 freq_factors,
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
-                let bx = self.f32_buf(&vals[x.0 as usize]);
+                let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings);
-                let bpos = self.f32_buf(&vals[positions.0 as usize]);
+                let bpos = self.ensure_device(r, positions);
                 let bff = match freq_factors {
-                    Some(f) => self.f32_buf(&vals[f.0 as usize]),
-                    None => self.zeros_buf(1),
+                    Some(f) => self.ensure_device(r, f),
+                    None => Arc::new(self.zeros_buf(1)),
                 };
-                let bd = self.zeros_buf(rows * nh * hd);
+                let bd = self.dev_dst(r, dst, rows * nh * hd);
                 let pso = self.pipelines.get("qknormrope_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
@@ -360,37 +705,57 @@ impl MetalBackend {
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
-                self.dispatch(&pso, &[&bx, bw.as_ref(), &bpos, &bff, &bd], &p, rows * nh);
-                vals[dst.0 as usize] = Self::read_f32(&bd, rows * nh * hd);
+                // One simdgroup per (row, head) — see `qknormrope_f32`.
+                self.encode_tg(
+                    r,
+                    &pso,
+                    &[
+                        bx.as_ref(),
+                        bw.as_ref(),
+                        bpos.as_ref(),
+                        bff.as_ref(),
+                        bd.as_ref(),
+                    ],
+                    &p,
+                    rows * nh * 32,
+                    32,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::Add { a, b, dst, n } => {
                 let n = n as usize;
-                let ba = self.f32_buf(&vals[a.0 as usize]);
-                let bb = self.f32_buf(&vals[b.0 as usize]);
-                let bd = self.zeros_buf(n);
+                let ba = self.ensure_device(r, a);
+                let bb = self.ensure_device(r, b);
+                let bd = self.dev_dst(r, dst, n);
                 let pso = self.pipelines.get("add_f32")?;
-                self.dispatch(&pso, &[&ba, &bb, &bd], &(n as u32).to_ne_bytes(), n);
-                vals[dst.0 as usize] = Self::read_f32(&bd, n);
+                self.encode(
+                    r,
+                    &pso,
+                    &[ba.as_ref(), bb.as_ref(), bd.as_ref()],
+                    &(n as u32).to_ne_bytes(),
+                    n,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::Scale { x, dst, s, n } => {
                 let n = n as usize;
-                let bx = self.f32_buf(&vals[x.0 as usize]);
-                let bd = self.zeros_buf(n);
+                let bx = self.ensure_device(r, x);
+                let bd = self.dev_dst(r, dst, n);
                 let pso = self.pipelines.get("scale_f32")?;
                 let mut p = s.to_ne_bytes().to_vec();
                 p.extend_from_slice(&(n as u32).to_ne_bytes());
-                self.dispatch(&pso, &[&bx, &bd], &p, n);
-                vals[dst.0 as usize] = Self::read_f32(&bd, n);
+                self.encode(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, n);
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::Softcap { x, dst, cap, n } => {
                 let n = n as usize;
-                let bx = self.f32_buf(&vals[x.0 as usize]);
-                let bd = self.zeros_buf(n);
+                let bx = self.ensure_device(r, x);
+                let bd = self.dev_dst(r, dst, n);
                 let pso = self.pipelines.get("softcap_f32")?;
                 let mut p = cap.to_ne_bytes().to_vec();
                 p.extend_from_slice(&(n as u32).to_ne_bytes());
-                self.dispatch(&pso, &[&bx, &bd], &p, n);
-                vals[dst.0 as usize] = Self::read_f32(&bd, n);
+                self.encode(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, n);
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::GatedAct {
                 gate,
@@ -402,9 +767,9 @@ impl MetalBackend {
                 up_off,
             } => {
                 let (rows, nff) = (rows as usize, nff as usize);
-                let bg = self.f32_buf(&vals[gate.0 as usize]);
-                let bu = self.f32_buf(&vals[up.0 as usize]);
-                let bd = self.zeros_buf(rows * nff);
+                let bg = self.ensure_device(r, gate);
+                let bu = self.ensure_device(r, up);
+                let bd = self.dev_dst(r, dst, rows * nff);
                 let pso = self.pipelines.get("gatedact_f32")?;
                 let act_code: u32 = match act {
                     infr_core::graph::Activation::Silu => 0,
@@ -415,8 +780,14 @@ impl MetalBackend {
                 p.extend_from_slice(&(nff as u32).to_ne_bytes());
                 p.extend_from_slice(&act_code.to_ne_bytes());
                 p.extend_from_slice(&up_off.to_ne_bytes());
-                self.dispatch(&pso, &[&bg, &bu, &bd], &p, rows * nff);
-                vals[dst.0 as usize] = Self::read_f32(&bd, rows * nff);
+                self.encode(
+                    r,
+                    &pso,
+                    &[bg.as_ref(), bu.as_ref(), bd.as_ref()],
+                    &p,
+                    rows * nff,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::WriteKv {
                 src,
@@ -425,10 +796,11 @@ impl MetalBackend {
                 row_stride,
                 pos,
             } => {
-                // Stateful write into the persistent (unified-memory) KV buffer — cast to the cache
-                // dtype on write, touching only `rows` rows. Host-side, matching the CPU reference.
+                // Stateful cast-copy of `rows` rows into the persistent KV buffer, on the GPU so it
+                // stays in the batch (a host write would force a per-layer flush). Metal's hazard
+                // tracking orders this write before the Attention that reads the same cache buffer.
                 let (rows, rs, pos) = (rows as usize, row_stride as usize, pos as usize);
-                let s = &vals[src.0 as usize];
+                let bsrc = self.ensure_device(r, src);
                 let cbuf = metal_buf(
                     bindings
                         .get(cache)
@@ -436,22 +808,14 @@ impl MetalBackend {
                 );
                 let base = pos * rs;
                 let n = rows * rs;
-                match g.desc(cache).dtype {
-                    DType::F16 => {
-                        let ptr = cbuf.raw.contents() as *mut u16;
-                        for (i, &v) in s[..n].iter().enumerate() {
-                            unsafe {
-                                *ptr.add(base + i) = half::f16::from_f32(v).to_bits();
-                            }
-                        }
-                    }
-                    _ => {
-                        let ptr = cbuf.raw.contents() as *mut f32;
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr.add(base), n);
-                        }
-                    }
-                }
+                let kern = match g.desc(cache).dtype {
+                    DType::F16 => "writekv_f16",
+                    _ => "writekv_f32",
+                };
+                let pso = self.pipelines.get(kern)?;
+                let mut p = (n as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(base as u32).to_ne_bytes());
+                self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, n);
             }
             Op::Attention {
                 q,
@@ -479,30 +843,72 @@ impl MetalBackend {
                         "metal attention: head_dim {hd} exceeds MAX_HD 256 (shader acc[] cap)"
                     )));
                 }
-                // Materialize the valid KV prefix (kv_len rows) as f32, dequantizing an f16 cache —
-                // the inner dot runs in f32 either way. Read straight from the bound cache buffers.
-                let need = kv_len * nkv * hd;
+                // Read K/V straight from the bound cache buffers on-device (no host materialize):
+                // f16 caches use the half-typed kernel, f32 caches the plain one. The WriteKv above
+                // wrote this same buffer earlier in the batch; hazard tracking makes it visible here.
                 let kbuf = metal_buf(bindings.get(k_cache).expect("metal: unbound k_cache"));
                 let vbuf = metal_buf(bindings.get(v_cache).expect("metal: unbound v_cache"));
-                let (ks, vs) = match g.desc(k_cache).dtype {
-                    DType::F16 => (
-                        Self::read_f16_prefix(kbuf, need),
-                        Self::read_f16_prefix(vbuf, need),
-                    ),
-                    _ => (
-                        Self::read_f32(&kbuf.raw, need),
-                        Self::read_f32(&vbuf.raw, need),
-                    ),
-                };
-                let bq = self.f32_buf(&vals[q.0 as usize]);
-                let bk = self.f32_buf(&ks);
-                let bv = self.f32_buf(&vs);
-                let bd = self.zeros_buf(rows * nh * hd);
+                let bq = self.ensure_device(r, q);
+                let bd = self.dev_dst(r, dst, rows * nh * hd);
                 let window: u32 = match mask {
                     infr_core::graph::AttnMask::Causal => 0,
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                 };
-                let pso = self.pipelines.get("attention_f32")?;
+                // Route by kernel-latency shape. The one-simdgroup-per-(query, head) kernels are
+                // latency-bound on their serial O(kv_len) online-softmax chain, so any long
+                // context takes a split-KV kernel — NSG simdgroups per (query, head) merged in
+                // threadgroup memory — 32-way when head_dim fits its threadgroup accumulator
+                // (hd <= 128), 8-way otherwise. That holds for prefill too (measured, not just
+                // decode): the extra parallelism is redundant there, but the 4x-8x shorter serial
+                // chain still wins. Short contexts keep the lean unsplit kernel. (A
+                // simdgroup_matrix flash-attention kernel was built and benched here; it never
+                // beat the 32-way split on prefill — occupancy-starved by its threadgroup tiles —
+                // so it was dropped.)
+                let f16 = g.desc(k_cache).dtype == DType::F16;
+                let split = rows * nh < 128 || kv_len >= 128;
+                // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup
+                // owns a strided KV slice, so a smaller launch would silently skip positions and
+                // merge uninitialized partials. maxTotalThreadsPerThreadgroup is per-PIPELINE
+                // (register pressure or a paravirtual device can push it below 1024 — GitHub's
+                // macOS CI runners do), so each width is gated on its own pipeline's cap and
+                // degrades to the next-narrower kernel instead of letting `encode_tg` clamp.
+                let fits = |name: &'static str, threads: u64| -> Result<bool> {
+                    Ok(self
+                        .pipelines
+                        .get(name)?
+                        .max_total_threads_per_threadgroup()
+                        >= threads)
+                };
+                let split32 = split
+                    && kv_len >= 128
+                    && hd <= 128
+                    && fits(
+                        if f16 {
+                            "attnsplit32_f16kv"
+                        } else {
+                            "attnsplit32_f32"
+                        },
+                        1024,
+                    )?;
+                let split = split
+                    && (split32
+                        || fits(
+                            if f16 {
+                                "attnsplit_f16kv"
+                            } else {
+                                "attnsplit_f32"
+                            },
+                            256,
+                        )?);
+                let kern = match (f16, split, split32) {
+                    (true, false, _) => "attention_f16kv",
+                    (true, _, true) => "attnsplit32_f16kv",
+                    (true, true, false) => "attnsplit_f16kv",
+                    (false, false, _) => "attention_f32",
+                    (false, _, true) => "attnsplit32_f32",
+                    (false, true, false) => "attnsplit_f32",
+                };
+                let pso = self.pipelines.get(kern)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
@@ -511,8 +917,24 @@ impl MetalBackend {
                 p.extend_from_slice(&scale.to_ne_bytes());
                 p.extend_from_slice(&window.to_ne_bytes());
                 p.extend_from_slice(&pos.to_ne_bytes());
-                self.dispatch(&pso, &[&bq, &bk, &bv, &bd], &p, rows * nh);
-                vals[dst.0 as usize] = Self::read_f32(&bd, rows * nh * hd);
+                // One simdgroup per (query, head); split kernels use NSG simdgroups per pair,
+                // grid still exactly rows*n_head threadgroups.
+                let nsg = if split32 {
+                    32
+                } else if split {
+                    8
+                } else {
+                    1
+                };
+                self.encode_tg(
+                    r,
+                    &pso,
+                    &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                    &p,
+                    rows * nh * nsg * 32,
+                    nsg * 32,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::MoeFfn {
                 x,
@@ -534,7 +956,8 @@ impl MetalBackend {
                     n_used as usize,
                     n_ff_exp as usize,
                 );
-                let xs = vals[x.0 as usize].clone();
+                self.ensure_host(r, g, x);
+                let xs = r.vals[x.0 as usize].clone();
                 // Router (host, mirroring the CPU reference). Structurally the same top-k selection,
                 // but the logits use a naive f32 sum here vs the CPU's 8-accumulator dot, so the
                 // summation order differs — top-k can pick differently on a near-tie logit.
@@ -585,7 +1008,8 @@ impl MetalBackend {
                         out[i] += w_e * y[i];
                     }
                 }
-                vals[dst.0 as usize] = out;
+                r.vals[dst.0 as usize] = out;
+                r.loc[dst.0 as usize] = Loc::Host;
             }
             // Sequential per-token recurrences (control-flow heavy, tiny) — host-side, exactly
             // mirroring the CPU reference. The recurrent `state` is a bound f32 Input read/written
@@ -600,9 +1024,11 @@ impl MetalBackend {
                 kernel,
             } => {
                 let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
-                let xs = vals[x.0 as usize].clone(); // [rows, channels]
+                self.ensure_host(r, g, x);
+                self.ensure_host(r, g, state);
+                let xs = r.vals[x.0 as usize].clone(); // [rows, channels]
                 let ws = self.weight_host(weight, g, bindings); // [channels, kernel]
-                let st = &mut vals[state.0 as usize]; // [(kernel-1), channels], oldest first
+                let st = &mut r.vals[state.0 as usize]; // [(kernel-1), channels], oldest first
                 let mut out = vec![0f32; rr * cc];
                 for t in 0..rr {
                     let xt = &xs[t * cc..t * cc + cc];
@@ -625,7 +1051,8 @@ impl MetalBackend {
                         }
                     }
                 }
-                vals[dst.0 as usize] = out;
+                r.vals[dst.0 as usize] = out;
+                r.loc[dst.0 as usize] = Loc::Host;
             }
             Op::DeltaNet {
                 q,
@@ -651,14 +1078,17 @@ impl MetalBackend {
                     head_k as usize,
                     head_v as usize,
                 );
-                let qf = vals[q.0 as usize].clone(); // [rows, nk*kd]
-                let kf = vals[k.0 as usize].clone();
-                let vf = vals[v.0 as usize].clone(); // [rows, nv*vd]
-                let bf = vals[b.0 as usize].clone(); // [rows, nv]
-                let af = vals[a.0 as usize].clone();
+                for id in [q, k, v, b, a, state] {
+                    self.ensure_host(r, g, id);
+                }
+                let qf = r.vals[q.0 as usize].clone(); // [rows, nk*kd]
+                let kf = r.vals[k.0 as usize].clone();
+                let vf = r.vals[v.0 as usize].clone(); // [rows, nv*vd]
+                let bf = r.vals[b.0 as usize].clone(); // [rows, nv]
+                let af = r.vals[a.0 as usize].clone();
                 let acoef = self.weight_host(a_coef, g, bindings);
                 let dtb = self.weight_host(dt_bias, g, bindings);
-                let st = &mut vals[state.0 as usize]; // [nv, kd, vd]
+                let st = &mut r.vals[state.0 as usize]; // [nv, kd, vd]
                 let mut out = vec![0f32; rr * nv * vd];
                 let qscale = 1.0 / (kd as f32).sqrt();
                 let l2 = |slice: &[f32]| -> f32 {
@@ -716,7 +1146,8 @@ impl MetalBackend {
                         }
                     }
                 }
-                vals[dst.0 as usize] = out;
+                r.vals[dst.0 as usize] = out;
+                r.loc[dst.0 as usize] = Loc::Host;
             }
             // Pure data movement (no arithmetic): done host-side, identical to the CPU reference.
             Op::Copy {
@@ -727,8 +1158,11 @@ impl MetalBackend {
                 n,
             } => {
                 let (so, dof, n) = (src_off as usize, dst_off as usize, n as usize);
-                let s = vals[src.0 as usize].clone();
-                vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s[so..so + n]);
+                self.ensure_host(r, g, src);
+                self.ensure_host(r, g, dst);
+                let s = r.vals[src.0 as usize].clone();
+                r.vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s[so..so + n]);
+                r.loc[dst.0 as usize] = Loc::Host;
             }
             Op::CopyStrided {
                 src,
@@ -747,12 +1181,15 @@ impl MetalBackend {
                     dst_stride as usize,
                     n as usize,
                 );
-                let s = vals[src.0 as usize].clone();
-                let d = &mut vals[dst.0 as usize];
-                for r in 0..rows as usize {
-                    d[dof + r * ds..dof + r * ds + n]
-                        .copy_from_slice(&s[so + r * ss..so + r * ss + n]);
+                self.ensure_host(r, g, src);
+                self.ensure_host(r, g, dst);
+                let s = r.vals[src.0 as usize].clone();
+                let d = &mut r.vals[dst.0 as usize];
+                for rr in 0..rows as usize {
+                    d[dof + rr * ds..dof + rr * ds + n]
+                        .copy_from_slice(&s[so + rr * ss..so + rr * ss + n]);
                 }
+                r.loc[dst.0 as usize] = Loc::Host;
             }
         }
         Ok(())

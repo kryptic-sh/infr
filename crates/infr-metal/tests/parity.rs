@@ -441,6 +441,22 @@ fn linear_q6k_matches_dequant_reference() {
     check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 27), m, in_f, out_f);
 }
 
+// m >= 16 routes to the simdgroup_matrix GEMM kernels (`linear_quik*_mm`); m=18 also covers the
+// partial row tile's scalar fallback (18 = 2 full 8-row tiles + 2 remainder rows).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q4k_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 28), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q6k_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 29), m, in_f, out_f);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn rmsnorm_parity() {
@@ -636,6 +652,72 @@ fn attention_gqa_causal_parity() {
         (q, f32_bytes(&rand_f32(rows * nh * hd, 41))),
         (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 42))),
         (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 43))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+}
+
+// Wide launch, short context (rows*n_head >= 128, kv_len < 128): routes to the lean unsplit
+// kernel (`attention_*`), which the small-shape tests above never reach at this width.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_prefill_wide_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 24usize, 8usize, 2usize, 64usize, 7usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 61))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 62))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 63))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+}
+
+// Long-context decode shape (rows=1, kv_len >= 128, hd <= 128): routes to the 32-way split-KV
+// kernel (`attnsplit32_*`), which the short-kv tests above never reach.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_long_context_split32_parity() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (1usize, 200usize, 8usize, 2usize, 128usize, 199usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 51))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 52))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 53))),
     ];
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
 }

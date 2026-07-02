@@ -20,6 +20,41 @@ impl Default for Sampler {
     }
 }
 
+impl Sampler {
+    /// Sampler from the INFR_TEMP / INFR_TOP_K / INFR_TOP_P env knobs — the seam paths' sampling
+    /// config (the bespoke path plumbs the same values through `Llama::set_sampling`). Defaults to
+    /// GREEDY when the vars are unset, so library callers and the golden/parity tests stay
+    /// deterministic; the CLI sets chat-appropriate defaults for run/serve.
+    pub fn from_env() -> Self {
+        let f = |k: &str, d: f32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let u = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        Self {
+            temp: f("INFR_TEMP", 0.0),
+            top_k: u("INFR_TOP_K", 20),
+            top_p: f("INFR_TOP_P", 0.95),
+        }
+    }
+}
+
+/// Wall-clock RNG seed for a generation's sampling draws (unused under greedy).
+pub(crate) fn seed_rng() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15)
+        | 1
+}
+
 /// A forward step's output: the sampled token (chosen on the GPU — only 4 bytes cross the bus) or
 /// the full vocab logits (host samples them, when GPU sampling can't handle the config).
 pub(crate) enum GenOut {

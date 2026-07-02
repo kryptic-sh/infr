@@ -2040,11 +2040,15 @@ impl SeamModel {
         }
 
         // ── decode: one token at a time (rows=1), feeding the last prediction back ──
+        // Sampling: greedy unless INFR_TEMP is set (tests stay deterministic; the CLI sets chat
+        // defaults for run/serve).
+        let sampler = crate::sampling::Sampler::from_env();
+        let mut rng = crate::sampling::seed_rng();
         let decode_t0 = std::time::Instant::now();
         let mut pos = plen;
         let mut decode_n = 0usize;
         loop {
-            let next = argmax(&logits);
+            let next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
             // Stop on EOS / <|im_end|> before emitting the stop token (chat turn boundary).
             // INFR_Q35_IGNORE_EOS keeps generating to the cap (benchmarks need a fixed tg count).
             if (Some(next) == eos || (im_end.is_some() && Some(next) == im_end))

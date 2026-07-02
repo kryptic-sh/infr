@@ -1036,6 +1036,10 @@ pub(crate) fn generate_dense_backend(
     };
 
     // ── drive ───────────────────────────────────────────────────────────────────────
+    // Sampling: greedy unless INFR_TEMP is set (the CLI sets chat defaults for run/serve; the
+    // golden/parity tests pin INFR_TEMP=0 or leave it unset).
+    let sampler = crate::sampling::Sampler::from_env();
+    let mut rng = crate::sampling::seed_rng();
     let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
     let mut out = Vec::new();
     let mut cur = prompt.to_vec();
@@ -1252,7 +1256,7 @@ pub(crate) fn generate_dense_backend(
         if is_decode {
             be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                 .map_err(|e| anyhow!("{e}"))?;
-            let next = argmax(&logits) as u32;
+            let next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
             let is_eos = c.eos_ids.contains(&next) || next == c.eos;
             out.push(next);
             decode_t += step_t0.elapsed();
@@ -1313,16 +1317,4 @@ pub(crate) fn generate_dense_backend(
         decode_secs: decode_t.as_secs_f64(),
     };
     Ok((out, stats))
-}
-
-fn argmax(v: &[f32]) -> usize {
-    let mut bi = 0;
-    let mut bv = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > bv {
-            bv = x;
-            bi = i;
-        }
-    }
-    bi
 }

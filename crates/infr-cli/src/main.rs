@@ -329,6 +329,8 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // per-arch one-shot special-case. The CLI owns the Llama; the boxed trait object borrows it (so
     // the borrow-based dense `ChatSession` needs no ownership change).
     let is_q35 = infr_llama::qwen35::is_qwen35(&gguf);
+    // Chat-default sampling for every backend (the bespoke branch reads the same envs below).
+    set_default_sampling_env();
     let llama; // declared here so a borrowing ChatSession / MoeChat outlives `chat`
     let model: Box<dyn infr_llama::model::ChatModel + '_> = if std::env::var("INFR_METAL").is_ok() {
         if is_q35 {
@@ -1272,6 +1274,22 @@ fn cmd_compare(
     Ok(())
 }
 
+/// Seam paths read sampling from INFR_TEMP / INFR_TOP_K / INFR_TOP_P (library default = greedy so
+/// tests stay deterministic). For chat UX, run/serve set the qwen3-recommended defaults when the
+/// user hasn't — pure greedy makes thinking models degenerate. Mirrors the bespoke
+/// `Llama::set_sampling(0.6, 20, 0.95)` defaults.
+fn set_default_sampling_env() {
+    if std::env::var("INFR_TEMP").is_err() {
+        std::env::set_var("INFR_TEMP", "0.6");
+    }
+    if std::env::var("INFR_TOP_K").is_err() {
+        std::env::set_var("INFR_TOP_K", "20");
+    }
+    if std::env::var("INFR_TOP_P").is_err() {
+        std::env::set_var("INFR_TOP_P", "0.95");
+    }
+}
+
 fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
     let model_id = gguf
@@ -1311,6 +1329,7 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         None
     };
     if let Some(m) = seam_model {
+        set_default_sampling_env();
         let generator: Box<dyn infr_server::ChatGenerator> =
             Box::new(SeamGenerator::new(&gguf, m)?);
         let rt = tokio::runtime::Runtime::new()?;

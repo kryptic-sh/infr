@@ -56,6 +56,12 @@ struct Resident {
     /// tensor, final dst); the absorbed Adds are in `skip`.
     fused: std::collections::HashMap<usize, (TensorId, TensorId)>,
     skip: std::collections::HashSet<usize>,
+    /// Host-read override of the graph's baked position (see `run_graph`): the seam's replay
+    /// loop re-executes one compiled decode graph (baked pos=0) and only rewrites the bound
+    /// positions buffer, so on any decode-shaped graph the position-consuming ops (Attention,
+    /// WriteKv) must take the CURRENT position — the tape path reads it on the GPU; this covers
+    /// every graph the tape can't (MoE, gemma shapes, hd without a dyn instantiation).
+    dynpos: Option<u32>,
 }
 
 /// Fuse `Linear (m==1, Q4_K/Q6_K weight, Internal dst) → Add(residual)` into the fused-residual
@@ -525,7 +531,33 @@ impl MetalBackend {
             posbuf: None,
             fused: std::collections::HashMap::new(),
             skip: std::collections::HashSet::new(),
+            dynpos: None,
         };
+        // Decode-shaped graph (a rows==1 Attention) with a bound positions buffer: read the
+        // CURRENT position off the shared-memory buffer and override the baked pos/kv_len in
+        // the position-consuming arms. Single-execute callers bind positions equal to the baked
+        // value, so this is the identity for them; the seam's replay loop is where they differ.
+        let decode_shaped = g
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::Attention { rows: 1, .. }));
+        if decode_shaped {
+            let positions = g.ops.iter().find_map(|op| match op {
+                Op::QkNormRope { positions, .. } | Op::Rope { positions, .. } => Some(*positions),
+                _ => None,
+            });
+            if let Some(pid) = positions {
+                if let Some(b) = bindings.get(pid) {
+                    let buf = metal_buf(b);
+                    if buf.len >= 4 {
+                        let v = unsafe { *(buf.raw.contents() as *const i32) };
+                        if v >= 0 {
+                            r.dynpos = Some(v as u32);
+                        }
+                    }
+                }
+            }
+        }
         {
             let (fused, skip) = linear_add_peephole(g);
             r.fused = fused;
@@ -1196,7 +1228,10 @@ impl MetalBackend {
                 // Stateful cast-copy of `rows` rows into the persistent KV buffer, on the GPU so it
                 // stays in the batch (a host write would force a per-layer flush). Metal's hazard
                 // tracking orders this write before the Attention that reads the same cache buffer.
-                let (rows, rs, pos) = (rows as usize, row_stride as usize, pos as usize);
+                let (rows, rs, mut pos) = (rows as usize, row_stride as usize, pos as usize);
+                if let (Some(dp), 1) = (r.dynpos, rows) {
+                    pos = dp as usize;
+                }
                 let bsrc = self.ensure_device(r, src);
                 let cbuf = metal_buf(
                     bindings
@@ -1244,6 +1279,12 @@ impl MetalBackend {
                     n_kv as usize,
                     head_dim as usize,
                 );
+                // Replayed decode graph: the baked pos/kv_len are the compile-time token's;
+                // take the current position (also steers the kv_len-based kernel routing).
+                let (pos, kv_len) = match r.dynpos {
+                    Some(dp) if rows == 1 => (dp, dp as usize + 1),
+                    _ => (pos, kv_len),
+                };
                 if hd > 256 {
                     return Err(Error::Unsupported(format!(
                         "metal attention: head_dim {hd} exceeds MAX_HD 256 (shader acc[] cap)"

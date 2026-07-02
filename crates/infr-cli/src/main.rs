@@ -1432,8 +1432,16 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     } else {
         None
     };
-    if let Some(m) = seam_model {
+    if let Some(mut m) = seam_model {
         set_default_sampling_env();
+        // Compile every lazily-built pipeline NOW (a tiny throwaway generation) so the first
+        // request doesn't pay seconds of pipeline builds on top of its own prefill.
+        let t0 = std::time::Instant::now();
+        m.warmup()?;
+        eprintln!(
+            "warmup: pipelines compiled in {:.1}s",
+            t0.elapsed().as_secs_f32()
+        );
         let generator: Box<dyn infr_server::ChatGenerator> =
             Box::new(SeamGenerator::new(&gguf, m)?);
         let rt = tokio::runtime::Runtime::new()?;

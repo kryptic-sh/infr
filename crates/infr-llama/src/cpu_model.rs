@@ -38,6 +38,14 @@ pub struct DenseVulkanSession {
 }
 
 impl DenseVulkanSession {
+    /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
+    /// warmup generation so the first real prompt starts from clean slots.
+    pub fn reset_cache(&mut self) {
+        for s in self.slots.iter_mut().flatten() {
+            s.reset();
+        }
+    }
+
     /// Pick (and prepare) the slot for `prompt`; returns its index. See the struct doc for the
     /// policy. A freshly created slot is `None` — the runner's first call uploads the weights.
     fn pick_slot(&mut self, cfg: &crate::Config, prompt: &[u32]) -> Result<usize> {

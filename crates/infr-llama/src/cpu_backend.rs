@@ -375,6 +375,12 @@ impl SeamKv {
         self.cached.len()
     }
 
+    /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from
+    /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
+    pub(crate) fn reset(&mut self) {
+        self.cached.clear();
+    }
+
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
     pub(crate) fn fork(&self, be: &dyn Backend, cfg: &Config) -> AResult<SeamKv> {
         let e2b = self.ipl_buf.is_some();

@@ -38,6 +38,15 @@ pub trait ChatModel {
         None
     }
 
+    /// Run a tiny throwaway generation through the real forward so every lazily-built pipeline
+    /// compiles NOW instead of on the first user request (a cold Vulkan seam pays seconds of
+    /// pipeline builds otherwise). INFR_PROF2 is suppressed for the duration — recorders read it
+    /// at construction, and warmup submits would pollute a later bench's per-op aggregate.
+    /// Default: no-op (stateless/CPU backends have nothing to warm).
+    fn warmup(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Like [`generate`](Self::generate), with an llguidance grammar constraint applied to the
     /// decode (serve's FORCED tool_choice). Backends without constraint support return an error —
     /// the caller falls back to unconstrained generation.
@@ -272,6 +281,20 @@ impl ChatModel for Qwen35Chat {
         crate::qwen35::render_chat_messages(&self.path, messages)
     }
 
+    fn warmup(&mut self) -> Result<()> {
+        let prof2 = std::env::var_os("INFR_PROF2");
+        if prof2.is_some() {
+            std::env::remove_var("INFR_PROF2");
+        }
+        // An undersized warmup SeamState is fine — a bigger real prompt rebuilds it (only the
+        // compiled pipelines need to persist).
+        let r = self.generate("Hi", 2, &mut |_| {});
+        if let Some(v) = prof2 {
+            std::env::set_var("INFR_PROF2", v);
+        }
+        r.map(|_| ())
+    }
+
     fn generate(
         &mut self,
         prompt: &str,
@@ -422,6 +445,24 @@ impl DenseSeamChat {
 impl ChatModel for DenseSeamChat {
     fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.model.render_chat_messages(messages)
+    }
+
+    fn warmup(&mut self) -> Result<()> {
+        let prof2 = std::env::var_os("INFR_PROF2");
+        if prof2.is_some() {
+            std::env::remove_var("INFR_PROF2");
+        }
+        let r = self.generate("Hi", 2, &mut |_| {});
+        if let Some(v) = prof2 {
+            std::env::set_var("INFR_PROF2", v);
+        }
+        r?;
+        // Drop the warmup tokens so the first real prompt prefills clean slots from row 0
+        // instead of forking off a garbage prefix.
+        if let Some(s) = &mut self.session {
+            s.reset_cache();
+        }
+        Ok(())
     }
 
     fn generate(

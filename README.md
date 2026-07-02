@@ -123,8 +123,10 @@ greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
 - **Models:** Llama / Qwen3 / Gemma 3 / Gemma 4 (dense + E2B) (GPU); Qwen3.5/3.6
   (CPU ref); DiffusionGemma (planned)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple via a
-  correctness-first **reference Metal backend** (`INFR_METAL=1`) covering every op the CPU
-  reference does — dense, MoE (`qwen3moe`) and Qwen3-Next (`qwen35`)
+  native **Metal backend** (`INFR_METAL=1`) covering every op the CPU reference does —
+  dense, MoE (`qwen3moe`) and Qwen3-Next (`qwen35`). Dense is optimized (simdgroup-matrix
+  GEMM + flash attention, raw-block quant decode; within ~1.3-1.5× of llama.cpp Metal on
+  M3 Pro — architecture and numbers in [`docs/METAL.md`](docs/METAL.md))
 - **Store:** own cache at `$XDG_CACHE_HOME/infr/models` (standalone HF + Ollama
   HTTP pulls)
 - **API:** OpenAI-compatible HTTP (streaming) — works with opencode / Claude

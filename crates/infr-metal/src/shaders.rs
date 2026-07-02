@@ -461,12 +461,15 @@ kernel void NAME(device const half*   x     [[buffer(0)]],                      
 // GEMV left on the table.
 // Body shared by the plain GEMV and the fused-residual variant (`FADD`: dst = W·x + res, the
 // decode o_proj/down_proj + Add peephole — one dispatch and no sublayer-output round-trip).
-template<bool FADD>
+// EPI epilogue modes: 0 = dst = s; 1 = dst = s + res (fused residual Add); 2 = MoE accumulate,
+// dst = (zeroacc ? 0 : dst) + wgt*s (the weighted expert sum, first expert zeroes).
+template<int EPI, typename PT>
 inline void linear_q4k_body(device const float*  x,
                             device const uchar*  codes,
                             device float*        dst,
                             device const float*  res,
-                            constant QLinParams& p,
+                            constant PT& p,
+                            float wgt, bool zeroacc,
                             uint gid, uint lane) {
     uint first_row = (gid / 32u) * 2u;
     if (first_row >= p.out_f) return;
@@ -532,7 +535,11 @@ inline void linear_q4k_body(device const float*  x,
     }
     for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
         float s = simd_sum(sumf[row]);
-        if (lane == 0u) dst[first_row + row] = FADD ? s + res[first_row + row] : s;
+        if (lane == 0u) {
+            if (EPI == 2)      dst[first_row + row] = (zeroacc ? 0.0f : dst[first_row + row]) + wgt * s;
+            else if (EPI == 1) dst[first_row + row] = s + res[first_row + row];
+            else               dst[first_row + row] = s;
+        }
     }
 }
 
@@ -544,7 +551,7 @@ kernel void linear_q4k(device const float*  x     [[buffer(0)]],
                        constant QLinParams& p     [[buffer(5)]],
                        uint gid  [[thread_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]]) {
-    linear_q4k_body<false>(x, codes, dst, x, p, gid, lane);
+    linear_q4k_body<0>(x, codes, dst, x, p, 0.0f, false, gid, lane);
 }
 kernel void linear_q4k_add(device const float*  x     [[buffer(0)]],
                            device const uchar*  codes [[buffer(1)]],
@@ -555,15 +562,16 @@ kernel void linear_q4k_add(device const float*  x     [[buffer(0)]],
                            constant QLinParams& p     [[buffer(6)]],
                            uint gid  [[thread_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]]) {
-    linear_q4k_body<true>(x, codes, dst, res, p, gid, lane);
+    linear_q4k_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
 }
 
-template<bool FADD>
+template<int EPI, typename PT>
 inline void linear_q6k_body(device const float*  x,
                             device const uchar*  codes,
                             device float*        dst,
                             device const float*  res,
-                            constant QLinParams& p,
+                            constant PT& p,
+                            float wgt, bool zeroacc,
                             uint gid, uint lane) {
     uint first_row = (gid / 32u) * 2u;
     if (first_row >= p.out_f) return;
@@ -619,7 +627,11 @@ inline void linear_q6k_body(device const float*  x,
     }
     for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
         float s = simd_sum(sumf[row]);
-        if (lane == 0u) dst[first_row + row] = FADD ? s + res[first_row + row] : s;
+        if (lane == 0u) {
+            if (EPI == 2)      dst[first_row + row] = (zeroacc ? 0.0f : dst[first_row + row]) + wgt * s;
+            else if (EPI == 1) dst[first_row + row] = s + res[first_row + row];
+            else               dst[first_row + row] = s;
+        }
     }
 }
 
@@ -631,7 +643,7 @@ kernel void linear_q6k(device const float*  x     [[buffer(0)]],
                        constant QLinParams& p     [[buffer(5)]],
                        uint gid  [[thread_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]]) {
-    linear_q6k_body<false>(x, codes, dst, x, p, gid, lane);
+    linear_q6k_body<0>(x, codes, dst, x, p, 0.0f, false, gid, lane);
 }
 kernel void linear_q6k_add(device const float*  x     [[buffer(0)]],
                            device const uchar*  codes [[buffer(1)]],
@@ -642,7 +654,90 @@ kernel void linear_q6k_add(device const float*  x     [[buffer(0)]],
                            constant QLinParams& p     [[buffer(6)]],
                            uint gid  [[thread_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]]) {
-    linear_q6k_body<true>(x, codes, dst, res, p, gid, lane);
+    linear_q6k_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
+}
+
+// ---- MoE expert GEMVs: the shared GEMV bodies, batched over the SELECTED experts — one
+// dispatch covers all n_used experts (slot = high grid bits), each picking its weight slice
+// from the device expert table (`moe_topk` below), so a whole MoE FFN is 7 dispatches with no
+// host round-trip. Gate/up read the shared x and write per-slot rows of the [n_used, out_f]
+// scratch; the down variant (EPI 2) reads its slot's activation row and writes w[slot]*y to its
+// slot's output row — `moe_reduce` then folds the weighted expert sum (slot-ascending, the CPU
+// reference's accumulation order).
+struct MoeLinParams { uint m; uint in_f; uint out_f; uint dshift; uint n_used; };
+#define MOE_WRAP(NAME, BODY, EPI, ROWB)                                                           \
+kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
+                 device const uchar*  codes [[buffer(1)]],                                       \
+                 device const uchar*  scm   [[buffer(2)]],                                       \
+                 device const uchar*  dd    [[buffer(3)]],                                       \
+                 device float*        dst   [[buffer(4)]],                                       \
+                 device const uint*   tbl   [[buffer(5)]],                                       \
+                 constant MoeLinParams& p   [[buffer(6)]],                                       \
+                 uint gid  [[thread_position_in_grid]],                                          \
+                 uint lane [[thread_index_in_simdgroup]]) {                                      \
+    uint sg = gid / 32u;                                                                          \
+    uint per_out = p.out_f >> 1;         /* simdgroups per expert (2 rows each) */               \
+    uint slot = sg / per_out;                                                                     \
+    uint e = tbl[slot];                                                                           \
+    float w = as_type<float>(tbl[16u + slot]); /* weights after the 16-slot index block */        \
+    ulong row_b = (ulong)(p.in_f >> 8) * ROWB;                                                    \
+    device const uchar* ec = codes + (ulong)e * p.out_f * row_b;                                  \
+    device const float* xs = (EPI == 2) ? x + slot * p.in_f : x;                                  \
+    uint g2 = (sg % per_out) * 32u + lane;   /* body sees a per-expert grid */                    \
+    BODY<EPI>(xs, ec, dst + slot * p.out_f, xs, p, w, true, g2, lane);                            \
+}
+MOE_WRAP(linear_q4k_moe,     linear_q4k_body, 0, 144ul)
+MOE_WRAP(linear_q4k_moe_acc, linear_q4k_body, 2, 144ul)
+MOE_WRAP(linear_q6k_moe,     linear_q6k_body, 0, 210ul)
+MOE_WRAP(linear_q6k_moe_acc, linear_q6k_body, 2, 210ul)
+#undef MOE_WRAP
+
+// Weighted expert sum: dst[i] = sum_u y[u*ne + i] (weights already folded into y by the down
+// GEMV's EPI-2 epilogue; slot-ascending order matches the CPU reference).
+struct MoeReduceParams { uint ne; uint n_used; };
+kernel void moe_reduce(device const float* y   [[buffer(0)]],
+                       device float*       dst [[buffer(1)]],
+                       constant MoeReduceParams& p [[buffer(2)]],
+                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.ne) return;
+    float s = 0.0f;
+    for (uint u = 0; u < p.n_used; u++) s += y[u * p.ne + gid];
+    dst[gid] = s;
+}
+
+struct MoeTopkParams { uint n_expert; uint n_used; float scale; };
+kernel void moe_topk(device const float* logits [[buffer(0)]],
+                     device uint*        tbl    [[buffer(1)]],
+                     constant MoeTopkParams& p  [[buffer(2)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (gid != 0u) return;
+    float maxl = -MAXFLOAT;
+    for (uint e = 0; e < p.n_expert; e++) maxl = max(maxl, logits[e]);
+    float psum = 0.0f;
+    for (uint e = 0; e < p.n_expert; e++) psum += exp(logits[e] - maxl);
+    uint sel[16];
+    // exp is monotonic: top-k by logit == top-k by prob, same first-index tie rule
+    for (uint u = 0; u < p.n_used; u++) {
+        float best = -MAXFLOAT;
+        uint bi = 0u;
+        for (uint e = 0; e < p.n_expert; e++) {
+            bool taken = false;
+            for (uint t = 0; t < u; t++) taken = taken || (sel[t] == e);
+            if (!taken && logits[e] > best) { best = logits[e]; bi = e; }
+        }
+        sel[u] = bi;
+    }
+    float wsum = 0.0f;
+    float ws[16];
+    for (uint u = 0; u < p.n_used; u++) {
+        ws[u] = exp(logits[sel[u]] - maxl) / psum;
+        wsum += ws[u];
+    }
+    wsum = max(wsum, 1e-20f);
+    for (uint u = 0; u < p.n_used; u++) {
+        tbl[u] = sel[u];
+        tbl[16u + u] = as_type<uint>(ws[u] / wsum * p.scale);
+    }
 }
 
 GEMV_KERNEL(linear_quik4, DEC16_K4)

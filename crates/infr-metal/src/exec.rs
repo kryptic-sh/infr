@@ -271,6 +271,17 @@ impl MetalBackend {
             .new_buffer((n.max(1) * 4) as u64, MTLResourceOptions::StorageModeShared)
     }
 
+    /// A reusable op-scratch buffer (see `MetalBackend::scratch`): get-or-create by
+    /// (f32 count, tag).
+    fn scratch_buf(&self, n: usize, tag: u8) -> Arc<MtlBuffer> {
+        self.scratch
+            .lock()
+            .unwrap()
+            .entry((n, tag))
+            .or_insert_with(|| Arc::new(self.zeros_buf(n)))
+            .clone()
+    }
+
     /// Read `n` f32s out of a device buffer.
     fn read_f32(buf: &MtlBuffer, n: usize) -> Vec<f32> {
         let mut out = vec![0f32; n];
@@ -1510,6 +1521,144 @@ impl MetalBackend {
                     n_used as usize,
                     n_ff_exp as usize,
                 );
+                // Device path for K-quant experts (the shapes real MoE checkpoints ship): router
+                // GEMV -> on-device top-k -> expert-BATCHED GEMV stages picking their weight
+                // slices from the device expert table, weighted sum via a final reduce. Seven
+                // dispatches, no expert bytes or activations on the host. Falls back to the host
+                // path below for other dtypes (INFR_METAL_NOMOE forces it).
+                let moe_kern = |dt: DType| -> Option<(&'static str, &'static str)> {
+                    match dt {
+                        DType::Q4K => Some(("linear_q4k_moe", "linear_q4k_moe_acc")),
+                        DType::Q6K => Some(("linear_q6k_moe", "linear_q6k_moe_acc")),
+                        _ => None,
+                    }
+                };
+                let (gdt2, udt2, ddt2) = (
+                    g.desc(gate_exps).dtype,
+                    g.desc(up_exps).dtype,
+                    g.desc(down_exps).dtype,
+                );
+                let device_ok = n_used <= 16
+                    && ne % 256 == 0
+                    && nffx % 256 == 0
+                    && std::env::var("INFR_METAL_NOMOE").is_err()
+                    && moe_kern(gdt2).is_some()
+                    && moe_kern(udt2).is_some()
+                    && moe_kern(ddt2).is_some();
+                if device_ok {
+                    let bx = self.ensure_device(r, x);
+                    let bd = self.dev_dst(r, dst, ne);
+                    // Router logits: small f32 GEMV over the dequant-cached router weight.
+                    let rw = self.weight_buf(router, g, bindings);
+                    let logits = self.scratch_buf(n_expert, 0);
+                    let pso = self.pipelines.get("linear_f32")?;
+                    let mut p = 1u32.to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(ne as u32).to_ne_bytes());
+                    p.extend_from_slice(&(n_expert as u32).to_ne_bytes());
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bx.as_ref(), rw.as_ref(), logits.as_ref()],
+                        &p,
+                        n_expert * 32,
+                        32,
+                    );
+                    // Top-k + weights into the fixed 32-slot expert table.
+                    let tbl = self.scratch_buf(32, 1);
+                    let pso = self.pipelines.get("moe_topk")?;
+                    let mut p = (n_expert as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    self.encode_tg(r, &pso, &[logits.as_ref(), tbl.as_ref()], &p, 32, 32);
+                    // Expert FFN, batched over the selected experts — one dispatch per stage
+                    // (gate, up, act, down, reduce), slots resolved from the table in-kernel.
+                    let gq = self.weight_qui(gate_exps, g, bindings);
+                    let uq = self.weight_qui(up_exps, g, bindings);
+                    let dq = self.weight_qui(down_exps, g, bindings);
+                    let gate_t = self.scratch_buf(n_used * nffx, 2);
+                    let up_t = self.scratch_buf(n_used * nffx, 3);
+                    let act_t = self.scratch_buf(n_used * nffx, 4);
+                    let ydown = self.scratch_buf(n_used * ne, 5);
+                    let act_code: u32 = match act {
+                        infr_core::graph::Activation::Silu => 0,
+                        infr_core::graph::Activation::Gelu => 1,
+                        infr_core::graph::Activation::Sigmoid => 2,
+                    };
+                    let pack = |in_f: usize, out_f: usize| -> Vec<u8> {
+                        let mut p = 1u32.to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(in_f as u32).to_ne_bytes());
+                        p.extend_from_slice(&(out_f as u32).to_ne_bytes());
+                        p.extend_from_slice(&0u32.to_ne_bytes()); // dshift (native kernels)
+                        p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                        p
+                    };
+                    let pso = self.pipelines.get(moe_kern(gdt2).unwrap().0)?;
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[
+                            bx.as_ref(),
+                            &gq.codes,
+                            &gq.scm,
+                            &gq.dd,
+                            gate_t.as_ref(),
+                            tbl.as_ref(),
+                        ],
+                        &pack(ne, nffx),
+                        n_used * (nffx / 2) * 32,
+                        32,
+                    );
+                    let pso = self.pipelines.get(moe_kern(udt2).unwrap().0)?;
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[
+                            bx.as_ref(),
+                            &uq.codes,
+                            &uq.scm,
+                            &uq.dd,
+                            up_t.as_ref(),
+                            tbl.as_ref(),
+                        ],
+                        &pack(ne, nffx),
+                        n_used * (nffx / 2) * 32,
+                        32,
+                    );
+                    let pso = self.pipelines.get("gatedact_f32")?;
+                    let mut p = (n_used as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(nffx as u32).to_ne_bytes());
+                    p.extend_from_slice(&act_code.to_ne_bytes());
+                    p.extend_from_slice(&0u32.to_ne_bytes()); // up_off
+                    self.encode(
+                        r,
+                        &pso,
+                        &[gate_t.as_ref(), up_t.as_ref(), act_t.as_ref()],
+                        &p,
+                        n_used * nffx,
+                    );
+                    let pso = self.pipelines.get(moe_kern(ddt2).unwrap().1)?;
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[
+                            act_t.as_ref(),
+                            &dq.codes,
+                            &dq.scm,
+                            &dq.dd,
+                            ydown.as_ref(),
+                            tbl.as_ref(),
+                        ],
+                        &pack(nffx, ne),
+                        n_used * (ne / 2) * 32,
+                        32,
+                    );
+                    let pso = self.pipelines.get("moe_reduce")?;
+                    let mut p = (ne as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                    self.encode(r, &pso, &[ydown.as_ref(), bd.as_ref()], &p, ne);
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
+                }
                 self.ensure_host(r, g, x);
                 let xs = r.vals[x.0 as usize].clone();
                 // `x` may hold several rows (the seam's batched prefill) — route + run per row,

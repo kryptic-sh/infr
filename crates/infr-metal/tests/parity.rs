@@ -1195,6 +1195,54 @@ fn moe_ffn_parity() {
     assert_parity(&g, &bound, dst, ne, 1e-3);
 }
 
+// Quantized experts route to the DEVICE MoE path (router GEMV + on-device top-k + expert-table
+// GEMVs); the f32 test above keeps the host fallback covered. CPU is the oracle here (its MoE
+// matvec dequants the same bytes and dots in f32 — no Q8 activation quantization).
+fn moe_quant_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u32) {
+    let (ne, n_expert, n_used, nff) = (256usize, 8usize, 3usize, 256usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![ne], DType::F32));
+    let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
+    let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+    let up = g.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+    let down = g.weight(TensorDesc::new(vec![n_expert, ne, nff], dtype));
+    let dst = g.output(TensorDesc::new(vec![ne], DType::F32));
+    g.push(Op::MoeFfn {
+        x,
+        router,
+        gate_exps: gate,
+        up_exps: up,
+        down_exps: down,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: nff as u32,
+        scale: 1.0,
+        act: infr_core::graph::Activation::Silu,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(ne, seed as u64))),
+        (router, f32_bytes(&rand_f32(n_expert * ne, seed as u64 + 1))),
+        (gate, synth(n_expert * nff * ne, seed + 2)),
+        (up, synth(n_expert * nff * ne, seed + 3)),
+        (down, synth(n_expert * ne * nff, seed + 4)),
+    ];
+    assert_parity(&g, &bound, dst, ne, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_q4k_device_parity() {
+    moe_quant_test(DType::Q4K, synth_q4k, 80);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_q6k_device_parity() {
+    moe_quant_test(DType::Q6K, synth_q6k, 90);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn conv1d_silu_parity() {

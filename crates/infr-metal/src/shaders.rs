@@ -593,6 +593,98 @@ RT_KERNEL(linear_quik6_rt, DEC16_K6)
 RT_KERNEL(linear_quik8_rt, DEC16_K8)
 RT_KERNEL(linear_q4k_rt, DEC16_Q4K)
 RT_KERNEL(linear_q6k_rt, DEC16_Q6K)
+// Cooperative-tile half-fragment GEMM: one 32-row x 64-output tile per 128-thread THREADGROUP
+// (the HGEMM kernels above give each simdgroup a private tile with private staging). Per 16-wide
+// K step, threads 0..63 decode one output row's block each into the shared weight tile while
+// threads 64..127 stage the 32x16 x tile — the two run concurrently — then each simdgroup
+// consumes its 16-output slice against the SHARED x tile (x device traffic /4) with 8 independent
+// f32 accumulators. This is the mul_mm shape: more resident accumulators per threadgroup to hide
+// MMA latency, one x staging for four simdgroups. Requires out_f % 64 == 0 (every dense shape in
+// practice); others fall back to the per-simdgroup HGEMM.
+#define CMM_KERNEL(NAME, DEC)                                                                     \
+kernel void NAME(device const half*   x     [[buffer(0)]],                                       \
+                 device const uchar*  codes [[buffer(1)]],                                       \
+                 device const uchar*  scm   [[buffer(2)]],                                       \
+                 device const uchar*  dd    [[buffer(3)]],                                       \
+                 device float*        dst   [[buffer(4)]],                                       \
+                 constant QLinParams& p     [[buffer(5)]],                                       \
+                 uint gid  [[thread_position_in_grid]],                                          \
+                 uint lane [[thread_index_in_simdgroup]],                                        \
+                 uint sgid [[simdgroup_index_in_threadgroup]]) {                                 \
+    uint tgix = gid / 128u;                                                                       \
+    uint ntm = (p.m + 31u) / 32u;                                                                 \
+    uint nto = p.out_f / 64u;                                                                     \
+    if (tgix >= ntm * nto) return;                                                                \
+    uint tm = tgix / nto;                                                                         \
+    uint to = tgix % nto;                                                                         \
+    uint r0 = tm * 32u;                                                                           \
+    uint o0 = to * 64u;                                                                           \
+    uint os = o0 + sgid * 16u;      /* this simdgroup's 16-output slice */                        \
+    uint nb = p.in_f >> 4;                                                                        \
+    uint tid = sgid * 32u + lane;                                                                 \
+    threadgroup half tgX[32 * 16];                                                                \
+    threadgroup half tgW[64 * 16];                                                                \
+    if (r0 + 32u <= p.m) {                                                                        \
+        simdgroup_float8x8 acc[4][2];                                                             \
+        for (uint i = 0; i < 4u; i++)                                                             \
+            for (uint jx = 0; jx < 2u; jx++) acc[i][jx] = simdgroup_float8x8(0.0f);               \
+        for (uint kb = 0; kb < nb; kb++) {                                                        \
+            if (tid < 64u) {                                                                      \
+                ulong bi = (ulong)(o0 + tid) * nb + kb;                                           \
+                float wk[16];                                                                     \
+                DEC(wk)                                                                           \
+                for (uint k2 = 0; k2 < 16u; k2++) tgW[tid * 16u + k2] = (half)wk[k2];             \
+            } else {                                                                              \
+                uint t2 = tid - 64u;    /* 8 contiguous halfs each: 64 threads x 8 = 32x16 */     \
+                uint idx = t2 * 8u;                                                               \
+                uint rr = idx >> 4;                                                               \
+                uint e = idx & 15u;                                                               \
+                device const half* xs = x + (ulong)(r0 + rr) * p.in_f + ((ulong)kb << 4) + e;     \
+                for (uint i = 0; i < 8u; i++) tgX[idx + i] = xs[i];                               \
+            }                                                                                     \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+            for (uint kh = 0; kh < 2u; kh++) {                                                    \
+                simdgroup_half8x8 wb0, wb1;                                                       \
+                simdgroup_load(wb0, &tgW[(sgid * 16u) * 16u + kh * 8u], 16, ulong2(0, 0), true);  \
+                simdgroup_load(wb1, &tgW[(sgid * 16u + 8u) * 16u + kh * 8u], 16, ulong2(0, 0), true); \
+                for (uint rh = 0; rh < 4u; rh++) {                                                \
+                    simdgroup_half8x8 xa;                                                         \
+                    simdgroup_load(xa, &tgX[(rh * 8u) * 16u + kh * 8u], 16);                      \
+                    simdgroup_multiply_accumulate(acc[rh][0], xa, wb0, acc[rh][0]);               \
+                    simdgroup_multiply_accumulate(acc[rh][1], xa, wb1, acc[rh][1]);               \
+                }                                                                                 \
+            }                                                                                     \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                                      \
+        }                                                                                         \
+        for (uint rh = 0; rh < 4u; rh++)                                                          \
+            for (uint oh = 0; oh < 2u; oh++)                                                      \
+                simdgroup_store(acc[rh][oh],                                                      \
+                                dst + (ulong)(r0 + rh * 8u) * p.out_f + os + oh * 8u, p.out_f);   \
+    } else {                                                                                      \
+        /* partial row tile: scalar dot per (row, output) element on this simdgroup's slice */    \
+        for (uint e = lane; e < 512u; e += 32u) {                                                 \
+            uint rr = r0 + e / 16u;                                                               \
+            uint o = os + (e % 16u);                                                              \
+            if (rr >= p.m) continue;                                                              \
+            float a2 = 0.0f;                                                                      \
+            for (uint kb = 0; kb < nb; kb++) {                                                    \
+                ulong bi = (ulong)o * nb + kb;                                                    \
+                float wk[16];                                                                     \
+                DEC(wk)                                                                           \
+                device const half* xb = x + (ulong)rr * p.in_f + ((ulong)kb << 4);                \
+                for (uint k2 = 0; k2 < 16u; k2++) a2 += (float)xb[k2] * (float)((half)wk[k2]);    \
+            }                                                                                     \
+            dst[(ulong)rr * p.out_f + o] = a2;                                                    \
+        }                                                                                         \
+    }                                                                                             \
+}
+
+CMM_KERNEL(linear_quik4_cmm, DEC16_K4)
+CMM_KERNEL(linear_quik6_cmm, DEC16_K6)
+CMM_KERNEL(linear_quik8_cmm, DEC16_K8)
+CMM_KERNEL(linear_q4k_cmm, DEC16_Q4K)
+CMM_KERNEL(linear_q6k_cmm, DEC16_Q6K)
+
 HGEMM_KERNEL(linear_quik4_hmm, DEC16_K4)
 HGEMM_KERNEL(linear_quik6_hmm, DEC16_K6)
 HGEMM_KERNEL(linear_quik8_hmm, DEC16_K8)

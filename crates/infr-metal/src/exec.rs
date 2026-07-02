@@ -618,6 +618,22 @@ impl MetalBackend {
                         "linear_q6k" => "linear_q6k_hmm",
                         _ => "linear_quik8_hmm",
                     };
+                    let cmm_kern = match qw.kern {
+                        "linear_quik4" => "linear_quik4_cmm",
+                        "linear_quik6" => "linear_quik6_cmm",
+                        "linear_q4k" => "linear_q4k_cmm",
+                        "linear_q6k" => "linear_q6k_cmm",
+                        _ => "linear_quik8_cmm",
+                    };
+                    // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
+                    // the out_f % 64 != 0 leftovers, and both need the full 128-thread group.
+                    let cmm_ok = m >= 16
+                        && out_f % 64 == 0
+                        && self
+                            .pipelines
+                            .get(cmm_kern)?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
                     let hmm_ok = m >= 16
                         && out_f % 16 == 0
                         && self
@@ -626,7 +642,24 @@ impl MetalBackend {
                             .max_total_threads_per_threadgroup()
                             >= 128;
                     p.extend_from_slice(&qw.dshift.to_ne_bytes());
-                    if hmm_ok {
+                    if cmm_ok {
+                        let xh = Arc::new(self.device.new_buffer(
+                            (m * in_f * 2).max(4) as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        ));
+                        let cast = self.pipelines.get("cast_f32_f16")?;
+                        let n = (m * in_f) as u32;
+                        self.encode(r, &cast, &[bx.as_ref(), &xh], &n.to_ne_bytes(), m * in_f);
+                        let pso = self.pipelines.get(cmm_kern)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[xh.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
+                            &p,
+                            m.div_ceil(32) * (out_f / 64) * 128,
+                            128,
+                        );
+                    } else if hmm_ok {
                         // Prefill GEMM runs on half fragments (see `HGEMM_KERNEL`): cast x to a
                         // transient f16 buffer first, then one GEMM dispatch reads it.
                         let xh = Arc::new(self.device.new_buffer(

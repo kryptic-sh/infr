@@ -506,6 +506,38 @@ fn linear_q4k_gemm_matches_dequant_reference() {
     );
 }
 
+// out_f % 64 == 0 routes to the cooperative-tile GEMM (`linear_*_cmm`); m=40 covers one full
+// 32-row tile plus a partial one. Same f16-operand reference as the other GEMM tests.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q4k_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Q4K,
+        synth_q4k(out_f * in_f, 32),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q6k_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Q6K,
+        synth_q6k(out_f * in_f, 33),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q6k_gemm_matches_dequant_reference() {

@@ -282,8 +282,11 @@ pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Factored {
                             s16((base + out) / 16, s, -4 * s);
                             for l in 0..16 {
                                 let low2 = (qs[qoff + half * 16 + l] >> shift) & 3;
-                                let high =
-                                    if hmask[half * 16 + l] & m != 0 { 1u8 } else { 0u8 };
+                                let high = if hmask[half * 16 + l] & m != 0 {
+                                    1u8
+                                } else {
+                                    0u8
+                                };
                                 codes[base + out] = low2 | (high << 2); // 0..7
                                 out += 1;
                             }
@@ -336,8 +339,7 @@ pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Factored {
                     s16(b16 + 3, sc2 as i16, -(m2 as i16));
                     for l in 0..32 {
                         let v = qs[j * 32 + l];
-                        codes[base + j * 64 + l] =
-                            (v & 0xF) + if qh[l] & u1 != 0 { 16 } else { 0 };
+                        codes[base + j * 64 + l] = (v & 0xF) + if qh[l] & u1 != 0 { 16 } else { 0 };
                         codes[base + j * 64 + 32 + l] =
                             (v >> 4) + if qh[l] & u2 != 0 { 16 } else { 0 };
                     }

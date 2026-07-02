@@ -29,7 +29,10 @@ fn dispatch_overhead() {
         .map(|_| dev.new_buffer(4096, MTLResourceOptions::StorageModeShared))
         .collect();
 
-    for (label, nbuf) in [("serialized (1 buf)", 1usize), ("independent (64 bufs)", 64)] {
+    for (label, nbuf) in [
+        ("serialized (1 buf)", 1usize),
+        ("independent (64 bufs)", 64),
+    ] {
         // warmup + 3 reps
         for rep in 0..4 {
             let cb = queue.new_command_buffer();

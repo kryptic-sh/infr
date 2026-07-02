@@ -418,7 +418,10 @@ impl MetalBackend {
             // two codes per byte, low nibble first
             (
                 "linear_quik4",
-                f.codes.chunks_exact(2).map(|p| p[0] | (p[1] << 4)).collect(),
+                f.codes
+                    .chunks_exact(2)
+                    .map(|p| p[0] | (p[1] << 4))
+                    .collect(),
             )
         } else if maxcode < 64 {
             // four codes per three bytes, LSB-first 6-bit stream

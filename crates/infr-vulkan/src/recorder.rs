@@ -1959,6 +1959,27 @@ impl<'a> Recorder<'a> {
         )
     }
 
+    /// Record the split-K replay prologue ONCE per execute: derives the live chunk count from the
+    /// params SSBO's kv_len and writes `args = [nh·live, 1, 1, live]` — the indirect dispatch args
+    /// and combine loop bound that every subsequent [`Self::attention_kv_split_dynac`] in the same
+    /// execute shares (kv_len is the same for every layer of a token).
+    pub fn attn_live_prologue(
+        &self,
+        params: &dyn Buffer,
+        args: &dyn Buffer,
+        nh: usize,
+        chunk: usize,
+    ) {
+        self.stamp("attn_live");
+        let kl = self
+            .be
+            .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 8);
+        let mut p0 = [0u8; 8];
+        p0[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p0[4..8].copy_from_slice(&(chunk as u32).to_ne_bytes());
+        self.dispatch(kl, &[Self::vkb(params), Self::vkb(args)], 1, &p0, 1);
+    }
+
     /// SELF-CHUNKING variant for record-once REPLAY over a growing kv_len. A one-thread prologue
     /// (`attn_live`) derives the adaptive chunk (~32 chunks/head, 64..512, floored by the baked
     /// minimum `chunk`) from the LIVE kv_len and writes the partial pass's INDIRECT dispatch args
@@ -1984,17 +2005,9 @@ impl<'a> Recorder<'a> {
         chunk: usize,
         n_chunks: usize,
     ) {
-        // prologue: args = [nh·live, 1, 1, live]
-        self.stamp("attn_live");
-        let kl = self
-            .be
-            .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 8);
-        let mut p0 = [0u8; 8];
-        p0[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
-        p0[4..8].copy_from_slice(&(chunk as u32).to_ne_bytes());
-        self.dispatch(kl, &[Self::vkb(params), Self::vkb(args)], 1, &p0, 1);
-
-        // pass 1: self-chunking partials, workgroup count from `args`
+        // pass 1: self-chunking partials, workgroup count from `args` (the caller records ONE
+        // `attn_live_prologue` per execute — kv_len is identical for every layer of a token, so
+        // the args buffer is shared across all attention ops instead of re-derived per layer).
         self.stamp("attn_partial");
         let k1 = self.be.kernel_sg(
             "attn_partial_dynac",
@@ -3512,6 +3525,7 @@ mod tests {
         .unwrap();
         let args = be.alloc(16, BufferUsage::Activations).unwrap();
         let rec = be.recorder().unwrap();
+        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk);
         rec.attention_kv_split_dynac(
             bq.as_ref(),
             bk.as_ref(),

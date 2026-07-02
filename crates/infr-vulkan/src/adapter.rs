@@ -230,6 +230,9 @@ fn lower_op(
     fused_kv_write: &HashMap<usize, (TensorId, usize)>,
     mode: &RopeMode,
     transient: &mut Vec<Box<dyn Buffer>>,
+    // One (nh, chunk, args) prologue per execute, shared by every Dynamic attention op — kv_len is
+    // per-token, not per-layer. Keyed so a heterogeneous graph would fall back to its own prologue.
+    dyn_args: &mut Option<(usize, usize, Box<dyn Buffer>)>,
     dummy: &dyn Buffer,
 ) -> Result<()> {
     let r = |id: TensorId| resolve(scratch, bindings, id);
@@ -627,8 +630,14 @@ fn lower_op(
                     let pl = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
                     let pacc =
                         be_.alloc_uninit(nh * n_chunks * hd * 4, BufferUsage::Activations)?;
-                    // indirect dispatch args + live count, written GPU-side by the prologue
-                    let args = be_.alloc_uninit(16, BufferUsage::Activations)?;
+                    // ONE prologue per execute: the first Dynamic attention op records it; every
+                    // later layer reuses the args (kv_len is identical across a token's layers).
+                    if !matches!(dyn_args, Some((n, c, _)) if *n == nh && *c == chunk) {
+                        let args = be_.alloc_uninit(16, BufferUsage::Activations)?;
+                        rec.attn_live_prologue(*params, args.as_ref(), nh, chunk);
+                        *dyn_args = Some((nh, chunk, args));
+                    }
+                    let args = &dyn_args.as_ref().unwrap().2;
                     rec.attention_kv_split_dynac(
                         r(*q)?,
                         r(*k_cache)?,
@@ -645,7 +654,7 @@ fn lower_op(
                         chunk,
                         n_chunks,
                     );
-                    transient.extend([pm, pl, pacc, args]);
+                    transient.extend([pm, pl, pacc]);
                 } else {
                     rec.attention_kv_dyn(
                         r(*q)?,
@@ -1115,6 +1124,7 @@ fn record_decode_replay(
     let (fused_kv_write, skip_op) = kv_write_peephole(graph);
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
+    let mut dyn_args: Option<(usize, usize, Box<dyn Buffer>)> = None;
     let dummy = be_.alloc(16, BufferUsage::Activations)?;
     let rec = be_.recorder_persistent()?;
     let mode = RopeMode::Dynamic(params.as_ref());
@@ -1133,8 +1143,12 @@ fn record_decode_replay(
             &fused_kv_write,
             &mode,
             &mut transient,
+            &mut dyn_args,
             dummy.as_ref(),
         )?;
+    }
+    if let Some((_, _, args)) = dyn_args.take() {
+        transient.push(args);
     }
     let recorded = rec.finish_record().map_err(|e| be(e.to_string()))?;
     // dummy is unused in an eligible decode (m=1 GEMV path), but hold it (and any transient) so the
@@ -1183,6 +1197,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
 
     let rec = be_.recorder()?;
     let mode = RopeMode::Static(&rope_pos);
+    let mut dyn_args: Option<(usize, usize, Box<dyn Buffer>)> = None;
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
@@ -1198,8 +1213,12 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &fused_kv_write,
             &mode,
             &mut transient,
+            &mut dyn_args,
             dummy.as_ref(),
         )?;
+    }
+    if let Some((_, _, args)) = dyn_args.take() {
+        transient.push(args);
     }
     rec.finish().map_err(|e| be(e.to_string()))?;
     Ok(())

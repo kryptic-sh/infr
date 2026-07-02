@@ -474,6 +474,7 @@ fn decode_attn_variants_bench() {
         .unwrap();
     let args = be.alloc(16, BufferUsage::Activations).unwrap();
     run("dynac cap126", &|rec| {
+        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, 64);
         rec.attention_kv_split_dynac(
             q.as_ref(),
             kc.as_ref(),
@@ -494,6 +495,7 @@ fn decode_attn_variants_bench() {
     // dynac with a TIGHT bake (capacity == live): isolates the dead-workgroup/scan cost from the
     // SELF_CHUNK in-kernel logic cost.
     run("dynac tight c250", &|rec| {
+        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk);
         rec.attention_kv_split_dynac(
             q.as_ref(),
             kc.as_ref(),

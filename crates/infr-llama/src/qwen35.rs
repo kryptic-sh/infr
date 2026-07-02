@@ -1183,7 +1183,7 @@ pub type BindWeight<'a> = &'a dyn Fn(&dyn Backend, TensorBytes) -> Result<Box<dy
 /// Load-once Qwen3-Next (qwen35) seam model: a backend + the model's native-dtype weight buffers +
 /// tokenizer/config, constructed ONCE and reused across `generate` calls. This is the SINGLE
 /// generation engine behind `infr run` (via [`crate::model::Qwen35Chat`] /
-/// [`crate::model::CpuQwen35Chat`]) AND `infr bench` — bench times exactly what run executes, so a
+/// on any backend) AND `infr bench` — bench times exactly what run executes, so a
 /// production-path change can never silently leave the bench measuring a dead path again. Only the
 /// per-conversation state (conv history, DeltaNet S, KV cache, sized to prompt+n) is allocated per
 /// call.

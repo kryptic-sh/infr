@@ -335,7 +335,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             eprintln!(
                 "[metal backend — qwen35/Qwen3-Next on the agnostic seam, Apple GPU (reference)]"
             );
-            Box::new(infr_llama::model::CpuQwen35Chat::new_metal(gguf.clone()))
+            Box::new(infr_llama::model::Qwen35Chat::new_metal(gguf.clone()))
         } else {
             eprintln!(
                 "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph (reference)]"
@@ -347,7 +347,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     } else if std::env::var("INFR_CPU").is_ok() {
         if is_q35 {
             eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
-            Box::new(infr_llama::model::CpuQwen35Chat::new(gguf.clone()))
+            Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.clone()))
         } else {
             eprintln!(
                 "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
@@ -839,30 +839,37 @@ fn cmd_bench(
             }
         }
     }
-    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
-    if json {
-        println!("[{{\"avg_ts\": {avg:.2}}}]");
+    let label = if let Some((p, g)) = pg {
+        format!("pg{p}+{g}")
+    } else if measure_tg {
+        format!("tg{n_gen}")
     } else {
-        let label = if let Some((p, g)) = pg {
-            format!("pg{p}+{g}")
-        } else if measure_tg {
-            format!("tg{n_gen}")
-        } else {
-            format!("pp{n_prompt}")
-        };
-        let d = if depth > 0 {
-            format!(" @ d{depth}")
-        } else {
-            String::new()
-        };
-        println!("{label}{d}: {avg:.1} t/s  ({reps} reps)");
-    }
+        format!("pp{n_prompt}")
+    };
+    print_bench_avg(&samples, &label, depth, "", reps, json);
     Ok(())
 }
 
 /// CPU-backend bench (`infr bench -ngl 0`): the GPU bench's pp/tg/pg metrics on the agnostic CPU
 /// reference path, using `CpuModel`'s token-level timing — directly comparable to `llama-bench -ngl 0`.
 #[allow(clippy::too_many_arguments)]
+/// Shared bench-result reporter: average the per-rep t/s samples and print either the JSON shape
+/// (`[{"avg_ts": ..}]`, llama-bench-comparable) or `label[ @ dN][tag]: X t/s (N reps)`. One
+/// implementation for the dense-CPU / qwen35 bench tails (they previously each had a copy).
+fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: usize, json: bool) {
+    let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
+    if json {
+        println!("[{{\"avg_ts\": {avg:.2}}}]");
+    } else {
+        let d = if depth > 0 {
+            format!(" @ d{depth}")
+        } else {
+            String::new()
+        };
+        println!("{label}{d}{tag}: {avg:.1} t/s  ({reps} reps)");
+    }
+}
+
 fn cmd_bench_cpu(
     gguf: &Path,
     tok: Option<&Path>,
@@ -891,24 +898,14 @@ fn cmd_bench_cpu(
         };
         samples.push(ts);
     }
-    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
-    if json {
-        println!("[{{\"avg_ts\": {avg:.2}}}]");
+    let label = if let Some((p, g)) = pg {
+        format!("pg{p}+{g}")
+    } else if measure_tg {
+        format!("tg{n_gen}")
     } else {
-        let label = if let Some((p, g)) = pg {
-            format!("pg{p}+{g}")
-        } else if measure_tg {
-            format!("tg{n_gen}")
-        } else {
-            format!("pp{n_prompt}")
-        };
-        let d = if depth > 0 {
-            format!(" @ d{depth}")
-        } else {
-            String::new()
-        };
-        println!("{label}{d} [cpu]: {avg:.1} t/s  ({reps} reps)");
-    }
+        format!("pp{n_prompt}")
+    };
+    print_bench_avg(&samples, &label, depth, " [cpu]", reps, json);
     Ok(())
 }
 
@@ -934,7 +931,7 @@ fn cmd_bench_qwen35(
         std::env::set_var("Q35_CPU", "1");
     }
     // No depth/pg: drive the PRODUCTION path through the SAME `ChatModel` structs `infr run`
-    // builds (Qwen35Chat = the Vulkan seam, CpuQwen35Chat = the seam on the CPU backend), timing
+    // builds (Qwen35Chat, on the Vulkan or CPU seam backend), timing
     // `ChatModel::generate` itself — bench and run share one engine BY CONSTRUCTION, so a
     // production-path change can never leave the bench measuring a dead path. The seam ingests a
     // text prompt, so synthesize one near `n_prompt` tokens and report the actual token counts
@@ -944,7 +941,7 @@ fn cmd_bench_qwen35(
         use infr_llama::model::ChatModel;
         std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
         let mut m: Box<dyn ChatModel> = if cpu {
-            Box::new(infr_llama::model::CpuQwen35Chat::new(gguf.to_path_buf()))
+            Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.to_path_buf()))
         } else {
             Box::new(infr_llama::model::Qwen35Chat::new(gguf.to_path_buf()))
         };
@@ -1022,25 +1019,21 @@ fn cmd_bench_qwen35(
         };
         samples.push(ts);
     }
-    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
-    if json {
-        println!("[{{\"avg_ts\": {avg:.2}}}]");
+    let label = if let Some((p, g)) = pg {
+        format!("pg{p}+{g}")
+    } else if measure_tg {
+        format!("tg{n_gen}")
     } else {
-        let label = if let Some((p, g)) = pg {
-            format!("pg{p}+{g}")
-        } else if measure_tg {
-            format!("tg{n_gen}")
-        } else {
-            format!("pp{n_prompt}")
-        };
-        let d = if depth > 0 {
-            format!(" @ d{depth}")
-        } else {
-            String::new()
-        };
-        let tag = if cpu { " [cpu]" } else { "" };
-        println!("{label}{d}{tag}: {avg:.1} t/s  ({reps} reps)");
-    }
+        format!("pp{n_prompt}")
+    };
+    print_bench_avg(
+        &samples,
+        &label,
+        depth,
+        if cpu { " [cpu]" } else { "" },
+        reps,
+        json,
+    );
     Ok(())
 }
 

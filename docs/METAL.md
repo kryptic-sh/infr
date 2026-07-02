@@ -1,19 +1,26 @@
 # infr-metal — Apple GPU backend architecture
 
-State as of 2026-07-02 (PRs #4/#5/#6). `crates/infr-metal` implements the same
+State as of 2026-07-02 (PRs #4/#5/#6 merged, #10 = the flash_attn_ext arc).
+`crates/infr-metal` implements the same
 `Backend` seam as `infr-cpu` and `infr-vulkan` on Apple's Metal API. It started
 as a correctness-first reference (per-op command buffers, dequant-to-f32
 everything) and was rebuilt profiling-first; this doc records the architecture
 that emerged and the measured reasoning behind it.
 
-## Numbers (M3 Pro 18-core, Qwen3 Q4_K_M, greedy, 889-token prompt)
+## Numbers (M3 Pro 18-core, Qwen3 Q4_K_M, `infr bench` vs `llama-bench`, same GGUF)
 
-| model | metric | infr-metal | llama.cpp (same GGUF/machine) | gap |
+| model | metric | infr-metal | llama.cpp | gap |
 | --- | --- | --- | --- | --- |
-| 0.6B | decode 360 tok | ~132 tok/s | 191 | 1.45× |
-| 0.6B | prefill 889 | ~2840 tok/s | 4191 | 1.48× |
-| 4B | decode 430 tok | 37.5 tok/s | 46.7 | 1.25× |
-| 4B | prefill 889 | ~498 tok/s | 630 | 1.27× |
+| 0.6B | tg128 | 147 tok/s | 191 | 1.30× |
+| 0.6B | tg128 @ d16384 | 48.3 tok/s | 42.9 | **infr ahead** |
+| 0.6B | pp2048 | 3346 tok/s | 3748 | 1.12× |
+| 0.6B | pp8192 | 2167 tok/s | 2336 | 1.08× |
+| 4B | tg128 | 39.9 tok/s | 46.7 | 1.17× |
+| 4B | tg128 @ d16384 | 21.4 tok/s | 24.5 | 1.14× |
+| 4B | pp8192 | 422 tok/s | 488 | 1.16× |
+
+The remaining decode gap at short/moderate depth is per-token host cost (graph
+rebuild + encode per token), not kernel time — the decode-replay lever.
 
 From the naive reference implementation: decode ~44×, prefill ~250×+. Model
 load is ~10× faster than the repack era and resident weight memory is the raw
@@ -82,11 +89,13 @@ owns a 32×16 quadrant as 8 f32 accumulators; partial token tiles stage through
 threadgroup memory with a row-guarded copy-out so every tile takes the MMA
 path.
 
-Precision policy: **decode is bit-exact** against `dequant_block` (same f32
-multiply sequence). Prefill GEMM rounds operands to f16 (~5e-4 relative, well
-under quantization error — the llama.cpp trade); its parity tests compare
-against a reference that rounds operands identically, keeping the tolerance at
-1e-3 instead of testing nothing with a loosened bound.
+Precision policy: **decode is algebraically identical to `dequant_block`, FP
+reassociation only** (the mul_mv-shape GEMV reconstructs the exact dequant
+values but reorders the f32 dot's summation; parity holds at 1e-4). Prefill
+GEMM rounds operands to f16 (~5e-4 relative, well under quantization error —
+the llama.cpp trade); its parity tests compare against a reference that rounds
+operands identically, keeping the tolerance at 1e-3 instead of testing nothing
+with a loosened bound.
 
 ## Attention routing
 
@@ -94,20 +103,36 @@ All scalar variants share `AttnParams` and an online-softmax core; routing is
 by launch shape because the scalar kernels are latency-bound on their serial
 O(kv_len) chain:
 
-- **`attnflash_f16kv`** — wide launches on an f16 cache (rows·n_head ≥ 128,
-  kv_len ≥ 64, hd ≤ 128, hd % 8 == 0): one simdgroup per (8-query tile, head).
-  K^T/V 8×8 fragments load DIRECTLY from the f16 cache (strided, transposed for
-  K), Q is cast once per op to f16, scores + output accumulate f32, the masked
-  online softmax runs scalar f32 on an 8×8 tile per 8-position KV block with
-  the row rescale as a diagonal f32 MMA. An earlier all-f32 flash kernel lost
-  to the scalar split (it staged K/V through 8 KB threadgroup tiles); zero
-  staging is what makes this one win. Tail blocks may read up to 7 rows past
-  the causal limit — always inside the bound cache buffer — and are masked.
-- **`attnsplit32_*` / `attnsplit_*`** — narrow launches (decode) and long
-  contexts: NSG (32 or 8) simdgroups per (query, head), each owning a strided
-  KV slice with a private online softmax, merged in threadgroup memory. The
-  32-way split fires when kv_len ≥ 128 and hd ≤ 128 (its accumulator needs
-  16 KB of threadgroup memory).
+- **`attnflash2_f16kv` (hd 64/128)** — the llama.cpp `kernel_flash_attn_ext`
+  structure for wide launches: NSG=4 simdgroups cooperate on ONE (8-query
+  tile, head) threadgroup over C=64 KV positions per iteration, each phase
+  split along a different axis (QK^T by KV columns with K^T direct from the
+  f16 cache; softmax by query rows, all 32 lanes on float2 scores, M/S stats
+  pinned in the owning simdgroup's registers; P·V by output columns with O
+  fragments held in registers). Analytic causal/window masking, zero-padded
+  partial query tiles. Templated over compile-time head_dim (hd=64/128
+  instantiations — the fully-unrolled loops were worth +38% alone); NSG=8
+  benched slower.
+- **`attnflash_f16kv`** — the single-simdgroup flash kernel, kept for
+  hd % 8 == 0 shapes outside the hd 64/128 instantiations: one simdgroup per
+  (8-query tile, head), K^T/V 8×8 fragments direct from the f16 cache, scalar
+  masked online softmax per 16-position KV block, diagonal-MMA row rescale.
+  An earlier all-f32 flash kernel lost to the scalar split (it staged K/V
+  through 8 KB threadgroup tiles); zero staging is what makes these win. Tail
+  blocks may read up to 7 rows past the causal limit — always inside the
+  bound cache buffer — and are masked.
+- **`attnvec_f16kv` (hd 64/128)** — the llama.cpp `kernel_flash_attn_ext_vec`
+  structure for long-context decode (kv_len ≥ 128): 32 simdgroups per
+  (query, head), each owning interleaved 32-position KV blocks with a private
+  online softmax — 4 KV rows × 8-lane dots per pass, shuffle-tree reduce, ONE
+  simd_max/simd_sum per block (the split kernels below run that chain once
+  per position and are latency-bound on it) — merged once at the end by a
+  log2 tree. Q stays f32 (parity 1e-4); tail rows clamp into the cache and
+  mask in the softmax.
+- **`attnsplit32_*` / `attnsplit_*`** — narrow launches and long contexts on
+  head sizes without a vec instantiation: NSG (32 or 8) simdgroups per
+  (query, head), each owning a strided KV slice with a private online
+  softmax, merged in threadgroup memory.
 - **`attention_*`** — the lean one-simdgroup-per-(query, head) kernel for
   short-context leftovers.
 
@@ -126,9 +151,11 @@ GPU wall per op — costs the batching (analysis mode, not the fast path).
 
 ## Tests
 
-`tests/parity.rs` — 30+ GPU parity tests vs the CPU reference: every op, and
+`tests/parity.rs` — 37 GPU parity tests vs the CPU reference: every op, and
 for quantized Linear every (format × kernel shape) pair including partial
-tiles; attention covers unsplit/split8/split32/flash and sliding window.
+tiles; attention covers unsplit/split8/split32/flash/flash2/vec, sliding
+windows at both tile and block granularity, partial query tiles, and the
+retained hd=72/96 routes.
 `tests/dispatch_overhead.rs`, `tests/gemv_bw.rs` — evidence probes (ignored),
 kept so the floors above stay reproducible.
 

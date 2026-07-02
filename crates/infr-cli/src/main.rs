@@ -988,9 +988,6 @@ fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: 
     }
 }
 
-/// CPU-backend bench (`infr bench -ngl 0`): the GPU bench's pp/tg/pg metrics on the agnostic CPU
-/// reference path, using `CpuModel`'s token-level timing — directly comparable to `llama-bench -ngl 0`.
-#[allow(clippy::too_many_arguments)]
 /// Metal twin of [`cmd_bench_cpu`]: same pp/tg/pg + depth methodology on the Apple-GPU seam
 /// backend (`CpuModel::bench_metal`). On non-macOS this arm is unreachable (the backend crate
 /// compiles to nothing), so the whole body is cfg-gated.
@@ -1042,6 +1039,9 @@ fn cmd_bench_metal(
     }
 }
 
+/// CPU-backend bench (`infr bench -ngl 0`): the GPU bench's pp/tg/pg metrics on the agnostic CPU
+/// reference path, using `CpuModel`'s token-level timing — directly comparable to `llama-bench -ngl 0`.
+#[allow(clippy::too_many_arguments)]
 fn cmd_bench_cpu(
     gguf: &Path,
     tok: Option<&Path>,

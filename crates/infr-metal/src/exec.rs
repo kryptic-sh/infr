@@ -836,8 +836,8 @@ impl MetalBackend {
             // Only produced when `Capabilities::combined_gu` is set — Metal leaves it false (the
             // reference backend keeps the separate gate/up form), so this arm is unreachable.
             Op::GatedActFused { .. } => {
-                return Err(be(
-                    "metal: GatedActFused unsupported (combined_gu is false)",
+                return Err(Error::Unsupported(
+                    "metal: GatedActFused unsupported (combined_gu is false)".into(),
                 ))
             }
             Op::WriteKv {

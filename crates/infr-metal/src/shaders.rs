@@ -434,11 +434,160 @@ kernel void NAME(device const half*   x     [[buffer(0)]],                      
     }                                                                                             \
 }
 
+// Decode GEMV for the native K-quant formats, mul_mv shape (ported from llama.cpp's
+// kernel_mul_mv_q4_K_f32 / q6_K and adapted to our buffers): each simdgroup computes TWO output
+// rows; activations load once into registers and are reused across both rows, and the inner loop
+// is decode-free — masked integer nibble ops with the block scales applied once per group (Q4_K
+// splits the affine min out via pre-summed activations; the 1/256 and 1/16 factors are exact
+// power-of-two corrections for the high-nibble/high-byte lanes). Algebraically identical to the
+// reference dequant dot, floating-point reassociated. This access pattern (4 blocks in flight per
+// simdgroup for Q4_K, contiguous 8-element runs per lane) is what the sub-block-scatter DEC16
+// GEMV left on the table.
+kernel void linear_q4k(device const float*  x     [[buffer(0)]],
+                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar*  scm   [[buffer(2)]],
+                       device const uchar*  dd    [[buffer(3)]],
+                       device float*        dst   [[buffer(4)]],
+                       constant QLinParams& p     [[buffer(5)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint first_row = (gid / 32u) * 2u;
+    if (first_row >= p.out_f) return;
+    uint nb = p.in_f >> 8;                 // 256-element blocks per row
+    ulong row_b = (ulong)nb * 144ul;       // row stride in bytes
+    device const uchar* xr = codes + first_row * row_b;
+
+    const ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    uint ix = lane >> 3;                   // 0..3: which of 4 blocks in flight
+    uint it = lane & 7u;
+    uint iq = it >> 2;                     // 0/1: which 128-half
+    uint ir = it & 3u;                     // 0..3: which 8-element run
+
+    float yl[16], yh[16];
+    float sumf[2] = {0.0f, 0.0f};
+    device const float* y4 = x + ix * 256u + 64u * iq + 8u * ir;
+
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    for (uint ib = ix; ib < nb; ib += 4u) {
+        float4 sumy = float4(0.0f);
+        for (uint i = 0; i < 8u; i++) {
+            yl[i]      = y4[i];        sumy[0] += yl[i];
+            yl[i + 8u] = y4[i + 32u];  sumy[1] += yl[i + 8u];
+            yh[i]      = y4[i + 128u]; sumy[2] += yh[i];
+            yh[i + 8u] = y4[i + 160u]; sumy[3] += yh[i + 8u];
+        }
+        device const uchar* blk = xr + (ulong)ib * 144ul;
+        device const ushort* sc = (device const ushort*)(blk + 4u) + iq;
+        device const ushort* q1 = (device const ushort*)(blk + 16u) + 16u * iq + 4u * ir;
+        device const half* dh = (device const half*)blk;
+
+        for (uint row = 0; row < 2u; row++) {
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            device const ushort* q2 = q1 + 32u;
+            float4 acc1 = float4(0.0f);
+            float4 acc2 = float4(0.0f);
+            for (uint i = 0; i < 4u; i++) {
+                acc1[0] += yl[2u * i]      * (float)(q1[i] & 0x000F);
+                acc1[1] += yl[2u * i + 1u] * (float)(q1[i] & 0x0F00);
+                acc1[2] += yl[2u * i + 8u] * (float)(q1[i] & 0x00F0);
+                acc1[3] += yl[2u * i + 9u] * (float)(q1[i] & 0xF000);
+                acc2[0] += yh[2u * i]      * (float)(q2[i] & 0x000F);
+                acc2[1] += yh[2u * i + 1u] * (float)(q2[i] & 0x0F00);
+                acc2[2] += yh[2u * i + 8u] * (float)(q2[i] & 0x00F0);
+                acc2[3] += yh[2u * i + 9u] * (float)(q2[i] & 0xF000);
+            }
+            sumf[row] += (float)dh[0] * ((acc1[0] + 1.0f/256.0f * acc1[1]) * sc8[0] +
+                                         (acc1[2] + 1.0f/256.0f * acc1[3]) * sc8[1] * 1.0f/16.0f +
+                                         (acc2[0] + 1.0f/256.0f * acc2[1]) * sc8[4] +
+                                         (acc2[2] + 1.0f/256.0f * acc2[3]) * sc8[5] * 1.0f/16.0f) -
+                         (float)dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                                         sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            q1 += row_b / 2u;
+            sc += row_b / 2u;
+            dh += row_b / 2u;
+        }
+        y4 += 4u * 256u;
+    }
+    for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
+        float s = simd_sum(sumf[row]);
+        if (lane == 0u) dst[first_row + row] = s;
+    }
+}
+
+kernel void linear_q6k(device const float*  x     [[buffer(0)]],
+                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar*  scm   [[buffer(2)]],
+                       device const uchar*  dd    [[buffer(3)]],
+                       device float*        dst   [[buffer(4)]],
+                       constant QLinParams& p     [[buffer(5)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint first_row = (gid / 32u) * 2u;
+    if (first_row >= p.out_f) return;
+    uint nb = p.in_f >> 8;
+    ulong row_b = (ulong)nb * 210ul;
+    device const uchar* xr = codes + first_row * row_b;
+
+    const uchar kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
+    uint tid2 = lane >> 1;
+    uint ix = lane & 1u;                   // 0/1: which of 2 blocks in flight
+    uint ip = tid2 >> 3;                   // 0/1: which 128-half
+    uint il = tid2 & 7u;
+    uint l0 = 4u * il;
+    uint is = 8u * ip + (l0 >> 4);
+    uint y_off = 128u * ip + l0;
+    uint ql_off = 64u * ip + l0;
+    uint qh_off = 32u * ip + l0;
+
+    float sumf[2] = {0.0f, 0.0f};
+    float yl[16];
+
+    for (uint i = ix; i < nb; i += 2u) {
+        device const uchar* blk = xr + (ulong)i * 210ul;
+        device const uchar* q1 = blk + ql_off;
+        device const uchar* q2 = q1 + 32u;
+        device const uchar* qh = blk + 128u + qh_off;
+        device const char* sc = (device const char*)(blk + 192u) + is;
+        device const half* dh = (device const half*)(blk + 208u);
+        device const float* y = x + i * 256u + y_off;
+
+        for (uint l = 0; l < 4u; l++) {
+            yl[4u * l]      = y[l];
+            yl[4u * l + 1u] = y[l + 32u];
+            yl[4u * l + 2u] = y[l + 64u];
+            yl[4u * l + 3u] = y[l + 96u];
+        }
+        for (uint row = 0; row < 2u; row++) {
+            float4 sums = float4(0.0f);
+            for (uint l = 0; l < 4u; l++) {
+                sums[0] += yl[4u * l]      * (float)((char)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4u * l + 1u] * (float)((char)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4u * l + 2u] * (float)((char)((q1[l] >> 4)  | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4u * l + 3u] * (float)((char)((q2[l] >> 4)  | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+            sumf[row] += (float)dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] +
+                                         sums[2] * sc[4] + sums[3] * sc[6]);
+            q1 += row_b;
+            q2 += row_b;
+            qh += row_b;
+            sc += row_b;
+            dh += row_b / 2u;
+        }
+    }
+    for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
+        float s = simd_sum(sumf[row]);
+        if (lane == 0u) dst[first_row + row] = s;
+    }
+}
+
 GEMV_KERNEL(linear_quik4, DEC16_K4)
 GEMV_KERNEL(linear_quik6, DEC16_K6)
 GEMV_KERNEL(linear_quik8, DEC16_K8)
-GEMV_KERNEL(linear_q4k, DEC16_Q4K)
-GEMV_KERNEL(linear_q6k, DEC16_Q6K)
 RT_KERNEL(linear_quik4_rt, DEC16_K4)
 RT_KERNEL(linear_quik6_rt, DEC16_K6)
 RT_KERNEL(linear_quik8_rt, DEC16_K8)

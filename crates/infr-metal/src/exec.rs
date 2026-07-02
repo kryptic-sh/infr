@@ -656,7 +656,12 @@ impl MetalBackend {
                             };
                             (rt, m.div_ceil(8) * out_f)
                         } else {
-                            (qw.kern, out_f)
+                            // The native mul_mv-shape GEMVs cover TWO output rows per simdgroup.
+                            let sgs = match qw.kern {
+                                "linear_q4k" | "linear_q6k" => out_f.div_ceil(2),
+                                _ => out_f,
+                            };
+                            (qw.kern, sgs)
                         };
                         let pso = self.pipelines.get(kern)?;
                         self.encode_tg(

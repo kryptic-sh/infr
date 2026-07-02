@@ -2066,6 +2066,166 @@ kernel void attnvec_dyn_q8kv_t(device const float* q    [[buffer(0)]],
     attnvec_q8_body<hd, NSG>(q, k, v, dst, p, abs, abs + 1u, sq, ssc, so, tgpig, sgitg, tiisg);
 }
 
+// Cooperative flash attention over a Q8_0 cache — the attnflash2 structure with a cooperative
+// dequant-staging stage (the llama.cpp flash_attn_ext quantized-KV branch shape): K/V can't be
+// simdgroup_load'ed from q8 blocks, so per 64-position KV block all 128 threads dequantize the
+// tile into threadgroup memory — K PRE-TRANSPOSED [hd][64] so the QK fragments load
+// non-transposed and conflict-free, V row-major [64][hd] staged into the SAME tile during the
+// softmax phase (the K reads are done by then; one extra barrier per block). ~24 KB threadgroup
+// at hd=128 (vs 8 KB for the f16 kernel — the occupancy cost of in-kernel dequant).
+template<uint hd, uint NSG>
+kernel void attnflash2_q8kv_t(device const half*  q   [[buffer(0)]],
+                              device const uchar* k   [[buffer(1)]],
+                              device const uchar* v   [[buffer(2)]],
+                              device float*       dst [[buffer(3)]],
+                              constant AttnParams& p  [[buffer(4)]],
+                              uint3  tgpig [[threadgroup_position_in_grid]],
+                              ushort sgitg [[simdgroup_index_in_threadgroup]],
+                              ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr uint QT = 8, C = 64, NQ = QT / NSG, SH = C;
+    constexpr uint NBR = hd / 32u;          // q8 blocks per KV row
+    threadgroup half  sq[QT * hd];
+    threadgroup float so[QT * hd];
+    threadgroup float ss[QT * SH];
+    threadgroup half  kvt[C * hd];          // K as [hd][C], then V as [C][hd]
+
+    uint ntq = (p.rows + QT - 1u) / QT;
+    uint qt = tgpig.x % ntq;
+    uint h  = tgpig.x / ntq;
+    constexpr uint hd4 = hd / 4u;
+    constexpr uint no = hd / (8u * NSG);
+    constexpr uint NC = (C / 8u) / NSG;
+    uint kvh = h / (p.n_head / p.n_kv);
+    uint r0 = qt * QT;
+    uint abs0 = p.pos + r0;
+    uint abs_max = p.pos + min(p.rows - 1u, r0 + QT - 1u);
+    uint lo_min = (p.window > 0u && abs0 + 1u > p.window) ? (abs0 + 1u - p.window) : 0u;
+    ulong qstride = (ulong)p.n_head * hd;
+    uint tid = (uint)sgitg * 32u + tiisg;
+
+    for (uint jj = 0; jj < NQ; jj++) {
+        uint j = jj * NSG + sgitg;
+        bool live = r0 + j < p.rows;
+        device const half4* q4 =
+            (device const half4*)(q + (ulong)min(r0 + j, p.rows - 1u) * qstride + (ulong)h * hd);
+        threadgroup half4*  sq4 = (threadgroup half4*)sq + j * hd4;
+        threadgroup float4* so4 = (threadgroup float4*)so + j * hd4;
+        for (uint i = tiisg; i < hd4; i += 32u) {
+            sq4[i] = live ? q4[i] : half4(0.0h);
+            so4[i] = float4(0.0f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S[NQ];
+    float M[NQ];
+    for (uint jj = 0; jj < NQ; jj++) { S[jj] = 0.0f; M[jj] = -MAXFLOAT / 2; }
+
+    for (uint ic = lo_min & ~(C - 1u); ic <= abs_max; ic += C) {
+        // stage K [hd][C]: each thread dequantizes whole q8 blocks (clamped rows are masked
+        // in the softmax, so their junk never contributes)
+        for (uint b = tid; b < C * NBR; b += NSG * 32u) {
+            uint rr = b / NBR;
+            uint dsub = (b % NBR) * 32u;
+            uint rc = min(ic + rr, p.kv_len - 1u);
+            ulong eb = ((ulong)rc * p.n_kv + kvh) * hd + dsub;
+            device const uchar* blk = k + (eb >> 5) * 34ul;
+            float d = (float)*(device const half*)blk;
+            for (uint i = 0; i < 32u; i++)
+                kvt[(dsub + i) * C + rr] = (half)(d * (float)(char)blk[2u + i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            threadgroup const half* pk = kvt + 8u * sgitg;
+            threadgroup float* ps = ss + 8u * sgitg;
+            for (uint cc = 0; cc < NC; cc++) {
+                simdgroup_float8x8 mqk = simdgroup_float8x8(0.0f);
+                if (ic + 8u * (sgitg + cc * NSG) <= abs_max) {
+                    for (uint i = 0; i < hd; i += 16u) {
+                        simdgroup_half8x8 mq, mk;
+                        simdgroup_load(mq, sq + i, hd);
+                        simdgroup_load(mk, pk + i * C, C);
+                        simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+                        simdgroup_load(mq, sq + i + 8u, hd);
+                        simdgroup_load(mk, pk + (i + 8u) * C, C);
+                        simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+                    }
+                }
+                simdgroup_store(mqk, ps, SH);
+                pk += 8u * NSG;
+                ps += 8u * NSG;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // softmax (rows split across simdgroups) + V staging [C][hd] in the same phase —
+        // the K reads are complete, the V reads haven't started
+        for (uint jj = 0; jj < NQ; jj++) {
+            uint j = jj * NSG + sgitg;
+            uint absr = abs0 + j;
+            uint lor = (p.window > 0u && absr + 1u > p.window) ? (absr + 1u - p.window) : 0u;
+            threadgroup float2* ss2 = (threadgroup float2*)(ss + j * SH);
+            float2 s2 = ss2[tiisg] * p.scale;
+            uint c0 = ic + 2u * tiisg;
+            bool v0 = (c0 >= lor) && (c0 <= absr);
+            bool v1 = (c0 + 1u >= lor) && (c0 + 1u <= absr);
+            float m = M[jj];
+            float mnew =
+                simd_max(max(m, max(v0 ? s2.x : -MAXFLOAT / 2, v1 ? s2.y : -MAXFLOAT / 2)));
+            float ms = exp(m - mnew);
+            float pw0 = v0 ? exp(s2.x - mnew) : 0.0f;
+            float pw1 = v1 ? exp(s2.y - mnew) : 0.0f;
+            S[jj] = S[jj] * ms + simd_sum(pw0 + pw1);
+            M[jj] = mnew;
+            ss2[tiisg] = float2(pw0, pw1);
+            threadgroup float4* so4 = (threadgroup float4*)so + j * hd4;
+            for (uint i = tiisg; i < hd4; i += 32u) so4[i] *= ms;
+        }
+        for (uint b = tid; b < C * NBR; b += NSG * 32u) {
+            uint rr = b / NBR;
+            uint dsub = (b % NBR) * 32u;
+            uint rc = min(ic + rr, p.kv_len - 1u);
+            ulong eb = ((ulong)rc * p.n_kv + kvh) * hd + dsub;
+            device const uchar* blk = v + (eb >> 5) * 34ul;
+            float d = (float)*(device const half*)blk;
+            for (uint i = 0; i < 32u; i++)
+                kvt[rr * hd + dsub + i] = (half)(d * (float)(char)blk[2u + i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            simdgroup_float8x8 lo[4];
+            threadgroup float* sot = so + 8u * sgitg;
+            for (uint ii = 0; ii < no; ii++) simdgroup_load(lo[ii], sot + 8u * NSG * ii, hd);
+            threadgroup const half* pv = kvt + 8u * sgitg;
+            uint nblk = min(C / 8u, (abs_max - ic) / 8u + 1u);
+            for (uint cc = 0; cc < nblk; cc++) {
+                simdgroup_float8x8 vs;
+                simdgroup_load(vs, ss + 8u * cc, SH);
+                for (uint ii = 0; ii < no; ii++) {
+                    simdgroup_half8x8 mv;
+                    simdgroup_load(mv, pv + 8u * NSG * ii, hd);
+                    simdgroup_multiply_accumulate(lo[ii], vs, mv, lo[ii]);
+                }
+                pv += 8u * hd;
+            }
+            for (uint ii = 0; ii < no; ii++) simdgroup_store(lo[ii], sot + 8u * NSG * ii, hd);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint jj = 0; jj < NQ; jj++) {
+        uint j = jj * NSG + sgitg;
+        if (r0 + j >= p.rows) continue;
+        float sc = S[jj] == 0.0f ? 0.0f : 1.0f / S[jj];
+        device float4* out = (device float4*)(dst + ((ulong)(r0 + j)) * qstride + (ulong)h * hd);
+        threadgroup const float4* so4 = (threadgroup const float4*)so + j * hd4;
+        for (uint i = tiisg; i < hd4; i += 32u) out[i] = so4[i] * sc;
+    }
+}
+
+typedef decltype(attnflash2_q8kv_t<64, 4>) attnflash2_q8_t;
+template [[host_name("attnflash2_q8kv_hd64")]]  kernel attnflash2_q8_t attnflash2_q8kv_t<64, 4>;
+template [[host_name("attnflash2_q8kv_hd128")]] kernel attnflash2_q8_t attnflash2_q8kv_t<128, 4>;
+
 typedef decltype(attnvec_q8kv_t<64, 32>) attnvec_q8_t;
 template [[host_name("attnvec_q8kv_hd64")]]  kernel attnvec_q8_t attnvec_q8kv_t<64, 32>;
 template [[host_name("attnvec_q8kv_hd128")]] kernel attnvec_q8_t attnvec_q8kv_t<128, 32>;

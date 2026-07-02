@@ -161,12 +161,15 @@ Opt-in: both caches stored as Q8_0 blocks (34 B / 32 elems) — **half the f16
 footprint and bandwidth**, so 16k-context sessions fit machines the f16 cache
 would swap on. Write quantization is byte-identical between the CPU reference
 and `writekv_q8` (d = amax/127 as f16, q = rint(x/d)); reads dequantize
-exactly. Decode at depth rides `attnvec_q8kv` (the vector kernel with
-dequant-on-read; also serves prefill until a q8 flash port — the named
-follow-up), everything else the scalar fallback. Throughput is
-model-dependent: the q8 read path trades bandwidth for ALU (ushort-pair code
-loads), measuring +13% on 0.6B tg128@d16384 (56.2 t/s) but ~-6% on 4B at
-d4096 — enable it for footprint or for small models at depth.
+exactly. Prefill rides `attnflash2_q8kv` — the cooperative flash structure
+with a dequant-staging stage (all 128 threads dequantize each 64-position KV
+block into a 24 KB threadgroup tile: K pre-transposed [hd][64] for
+conflict-free fragment loads, V staged into the same tile during the softmax
+phase). Decode at depth rides `attnvec_q8kv`; the q8 decode replay tape
+records like f16. Throughput is model-dependent — the q8 read path trades
+bandwidth for ALU: 0.6B tg128@d16384 62.7 t/s (+26% over the f16 cache, +35%
+over llama.cpp's), 4B ~-6% (already weight-stream-bound); pp8192 runs at ~68%
+of the f16 flash. Enable it for the footprint, and for small models at depth.
 
 ## Profiling
 

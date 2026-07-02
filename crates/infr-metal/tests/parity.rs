@@ -879,6 +879,14 @@ fn attention_q8_vec_parity() {
     q8_attention_test(1, 200, 128, 199, 1e-4, 250);
 }
 
+// Wide q8 launch: routes to the cooperative q8 flash (dequant-staged KV tiles). Q rounds to f16
+// on this path (the flash trade), hence the flash-class tolerance.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_q8_flash_parity() {
+    q8_attention_test(17, 136, 128, 119, 5e-3, 260);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_gqa_causal_parity() {

@@ -1372,9 +1372,54 @@ impl MetalBackend {
                 // other shape the scalar dequant-on-read fallback (prefill lives here until a
                 // q8 flash port). Both dequantize exactly — reassociation-only vs the f16 math.
                 if g.desc(k_cache).dtype == DType::Q8_0 {
-                    // Any row count: the vector kernel runs one threadgroup per (row, head),
-                    // so prefill rides it too (no q8 flash port yet — this is the split-KV
-                    // class, ~3-5x slower than flash2 at depth but 100x the scalar fallback).
+                    // Prefill-wide launches take the q8 cooperative flash (dequant-staged KV
+                    // tiles) — the same gate shape as the f16 flash.
+                    let fq8 = rows * nh >= 128 && kv_len >= 64 && matches!(hd, 64 | 128) && {
+                        let kn = if hd == 64 {
+                            "attnflash2_q8kv_hd64"
+                        } else {
+                            "attnflash2_q8kv_hd128"
+                        };
+                        self.pipelines
+                            .get(kn)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                            .unwrap_or(false)
+                    };
+                    if fq8 {
+                        let kern = if hd == 64 {
+                            "attnflash2_q8kv_hd64"
+                        } else {
+                            "attnflash2_q8kv_hd128"
+                        };
+                        let pso = self.pipelines.get(kern)?;
+                        let mut p = (rows as u32).to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                        p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                        p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                        p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                        p.extend_from_slice(&scale.to_ne_bytes());
+                        p.extend_from_slice(&window.to_ne_bytes());
+                        p.extend_from_slice(&pos.to_ne_bytes());
+                        let n = rows * nh * hd;
+                        let qh = Arc::new(self.device.new_buffer(
+                            (n * 2).max(4) as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        ));
+                        let cast = self.pipelines.get("cast_f32_f16")?;
+                        self.encode(r, &cast, &[bq.as_ref(), &qh], &(n as u32).to_ne_bytes(), n);
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[qh.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                            &p,
+                            rows.div_ceil(8) * nh * 128,
+                            128,
+                        );
+                        r.loc[dst.0 as usize] = Loc::Device;
+                        return Ok(());
+                    }
+                    // The vector kernel runs one threadgroup per (row, head), covering decode
+                    // and any prefill shape the flash gate declined.
                     let vq8 = matches!(hd, 64 | 128) && kv_len >= 128 && {
                         let kn = if hd == 64 {
                             "attnvec_q8kv_hd64"

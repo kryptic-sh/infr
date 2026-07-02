@@ -6,15 +6,19 @@
 // no re-record at deep kv) plus the live-chunk count the combine loops over.
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint nh; uint min_chunk; } pc;
+layout(push_constant) uniform PC { uint nh; uint min_chunk; uint window; } pc;
 
 layout(binding = 0) readonly buffer PB { uint p_pos; uint p_kvlen; };
 layout(binding = 1) writeonly buffer IA { uint gx; uint gy; uint gz; uint live; };
 
 void main() {
     uint kv = max(p_kvlen, 1u);
-    uint chunkv = max(pc.min_chunk, min(max(kv / 32u, 64u), 512u));
-    uint lv = (kv + chunkv - 1u) / chunkv;
+    // Sliding-window (gemma): only the window's span is attended, so chunk THAT (matching
+    // attn_partial's SELF_CHUNK decomposition, which offsets its chunk grid by the window start).
+    uint lo = (pc.window > 0u && kv > pc.window) ? kv - pc.window : 0u;
+    uint span = kv - lo;
+    uint chunkv = max(pc.min_chunk, min(max(span / 32u, 64u), 512u));
+    uint lv = (span + chunkv - 1u) / chunkv;
     gx = pc.nh * lv;
     gy = 1u;
     gz = 1u;

@@ -688,6 +688,7 @@ macro_rules! dyn_spv {
     };
 }
 dyn_spv!(qk_norm_rope_dyn_spv, "qk_norm_rope_dyn");
+dyn_spv!(qk_norm_rope_dyn_ff_spv, "qk_norm_rope_dyn_ff");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");
 dyn_spv!(attention_kv_dyn_spv, "attention_kv_dyn");
 dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");

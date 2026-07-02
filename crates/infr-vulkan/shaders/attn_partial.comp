@@ -14,7 +14,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
-    uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks;
+    uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
 } pc;
 layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [nh, hd] as vec4
 layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
@@ -44,12 +44,17 @@ void main() {
     // scheduler keeps neighbors co-resident, so the 2nd..g-th head re-read their K/V slice from L2
     // (hot, multi-TB/s) instead of DRAM. Captures the GQA re-use benefit at zero occupancy cost.
     uint g = pc.nh / pc.nkv;
-    float scale = 1.0 / sqrt(float(hd));
+    // scale > 0 → caller-supplied (gemma4 uses 1.0, QK-norm controls magnitude); else 1/√hd default.
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
 #ifdef USE_PARAMS
     uint kv_len = p_kvlen;
 #else
     uint kv_len = pc.kv_len;
 #endif
+    // Sliding-window attention (decode: the query is position kv_len-1): attend only keys
+    // j >= lo. 0 = full causal. Chunks below `lo` never dispatch work — SELF_CHUNK offsets its
+    // chunk grid by `lo`; the static path clamps each chunk's range (empty → zero-weight partial).
+    uint lo = (pc.window > 0u && kv_len > pc.window) ? kv_len - pc.window : 0u;
 #ifdef SELF_CHUNK
     // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, but ONE baked
     // chunk can't serve every depth (small chunks drown in per-workgroup overhead at deep kv; big
@@ -58,14 +63,17 @@ void main() {
     // The attn_live prologue dispatches EXACTLY nh·live workgroups (indirect), so the workgroup →
     // (head, chunk) decomposition must use the live count, NOT the baked pc.n_chunks (which is
     // only the pm/pl/pacc scratch stride).
-    uint chunkv = max(pc.chunk, min(max(kv_len / 32u, 64u), 512u));
-    uint live = (kv_len + chunkv - 1u) / chunkv;
+    // Chunk the WINDOW's span, offset by `lo` — every dispatched chunk is fully in-window (the
+    // attn_live prologue derives the identical span-based live count).
+    uint span = kv_len - lo;
+    uint chunkv = max(pc.chunk, min(max(span / 32u, 64u), 512u));
+    uint live = (span + chunkv - 1u) / chunkv;
     uint hh = gl_WorkGroupID.x % g;
     uint rest = gl_WorkGroupID.x / g;
     uint c = rest % live;
     uint kvh = rest / live;
     uint h = kvh * g + hh;
-    uint j0 = c * chunkv;
+    uint j0 = lo + c * chunkv;
     uint j1 = min(j0 + chunkv, kv_len);
 #else
     uint hh = gl_WorkGroupID.x % g;
@@ -73,8 +81,10 @@ void main() {
     uint c = rest % pc.n_chunks;
     uint kvh = rest / pc.n_chunks;
     uint h = kvh * g + hh;
-    uint j0 = c * pc.chunk;
-    uint j1 = min(j0 + pc.chunk, kv_len);
+    // Clamp to the window: a chunk fully below `lo` gets an empty range → zero-weight partial
+    // (m = -3e38, l = 0) the combine's `wexp != 0` test skips.
+    uint j0 = max(c * pc.chunk, lo);
+    uint j1 = min(c * pc.chunk + pc.chunk, kv_len);
 #endif
 
     // QK via subgroup reduction (one key per subgroup-iteration; vec4 coalesced K reads). Each lane's

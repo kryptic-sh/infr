@@ -283,10 +283,13 @@ fn e2b_ipl_rows(
     let te_bytes = g
         .tensor_bytes("per_layer_token_embd.weight")
         .map_err(|e| anyhow!("{e}"))?;
-    let mut ipl = vec![0f32; tokens.len() * nl * npl];
-    ipl.par_chunks_mut(nl * npl)
-        .zip(tokens.par_iter())
-        .try_for_each(|(row, &tok)| -> AResult<()> {
+    // Per-row prep (scaled embedding + dequanted per-layer token row) once, serially — cheap next
+    // to the projection matmul. The matmul then parallelizes over FLAT (row, layer) pairs: at
+    // decode rows==1, row-only parallelism left the whole nl×npl×ne projection on one thread
+    // (~5ms/token — the seam's E2B decode bottleneck); flat pairs keep all cores busy at any rows.
+    let prep: Vec<(Vec<f32>, Vec<f32>)> = tokens
+        .iter()
+        .map(|&tok| -> AResult<(Vec<f32>, Vec<f32>)> {
             let tok = tok as usize;
             let emb: Vec<f32> = token_embd[tok * ne..tok * ne + ne]
                 .iter()
@@ -298,26 +301,28 @@ fn e2b_ipl_rows(
                 &te_bytes[r0..r0 + ple.tok_embd_row_bytes],
             )
             .map_err(|e| anyhow!("{e}"))?;
-            for layer in 0..nl {
-                let mut proj = vec![0f32; npl];
-                let mut ss = 0f32;
-                for (j, pj) in proj.iter_mut().enumerate() {
-                    let wrow =
-                        &ple.model_proj[(layer * npl + j) * nem..(layer * npl + j) * nem + nem];
-                    let acc: f32 = wrow.iter().zip(&emb).map(|(a, b)| a * b).sum();
-                    let v = acc * inv_sqrt_ne;
-                    *pj = v;
-                    ss += v * v;
-                }
-                let rms = 1.0 / (ss / npl as f32 + cfg.rms_eps).sqrt();
-                for j in 0..npl {
-                    let normed = proj[j] * rms * ple.proj_norm[j];
-                    let tokv = pl_tok[layer * npl + j] * sqrt_npl;
-                    row[layer * npl + j] = (normed + tokv) * inv_sqrt2;
-                }
-            }
-            Ok(())
-        })?;
+            Ok((emb, pl_tok))
+        })
+        .collect::<AResult<_>>()?;
+    let mut ipl = vec![0f32; tokens.len() * nl * npl];
+    ipl.par_chunks_mut(npl).enumerate().for_each(|(i, slice)| {
+        let (emb, pl_tok) = &prep[i / nl];
+        let layer = i % nl;
+        let mut ss = 0f32;
+        for (j, pj) in slice.iter_mut().enumerate() {
+            let wrow = &ple.model_proj[(layer * npl + j) * nem..(layer * npl + j) * nem + nem];
+            let acc: f32 = wrow.iter().zip(emb).map(|(a, b)| a * b).sum();
+            let v = acc * inv_sqrt_ne;
+            *pj = v;
+            ss += v * v;
+        }
+        let rms = 1.0 / (ss / npl as f32 + cfg.rms_eps).sqrt();
+        for (j, pj) in slice.iter_mut().enumerate() {
+            let normed = *pj * rms * ple.proj_norm[j];
+            let tokv = pl_tok[layer * npl + j] * sqrt_npl;
+            *pj = (normed + tokv) * inv_sqrt2;
+        }
+    });
     Ok(ipl)
 }
 
@@ -774,6 +779,22 @@ pub(crate) fn generate_dense_backend(
                         n: (batch * kvrow) as u32,
                     }),
                 }
+                // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching. Emitted BEFORE
+                // the K QkNormRope so that op stays ADJACENT to its WriteKv — the Vulkan adapter's
+                // kv_write_peephole only fuses an immediately-following pair, and the record-once
+                // decode path REQUIRES the K write fused (a standalone f16 WriteKv has no dyn
+                // kernel). V only depends on the raw K projection, so the order is free.
+                if let Some(ones) = v_ones {
+                    g.push(Op::QkNorm {
+                        x: v,
+                        weight: ones,
+                        dst: v,
+                        rows: batch as u32,
+                        n_head: nkv as u32,
+                        head_dim: hd as u32,
+                        eps,
+                    });
+                }
                 // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
                 let k_write = match lw.k_norm {
                     Some(kn) => {
@@ -807,18 +828,6 @@ pub(crate) fn generate_dense_backend(
                         k
                     }
                 };
-                // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching.
-                if let Some(ones) = v_ones {
-                    g.push(Op::QkNorm {
-                        x: v,
-                        weight: ones,
-                        dst: v,
-                        rows: batch as u32,
-                        n_head: nkv as u32,
-                        head_dim: hd as u32,
-                        eps,
-                    });
-                }
                 g.push(Op::WriteKv {
                     src: k_write,
                     cache: k_cache[l],
@@ -1235,31 +1244,39 @@ pub(crate) fn generate_dense_backend(
         start // fall through to per-token loop for MoE / E2B / short suffixes
     };
 
-    // Record-once decode: for an eligible qwen3-style dense decode on a backend that supports replay
-    // (the Vulkan seam), build+compile+bind ONE plan here and reuse it across the whole decode loop.
-    // The adapter records the graph once and replays it per token, reading `pos` from the bound
-    // positions buffer + a params SSBO — so the baked pos=0 here is irrelevant, and the per-token host
-    // cost drops to just the emb/pos uploads. The gate is a strict subset of the adapter's graph
-    // eligibility (qwen3 dense: qk-norm, causal 1/√hd attention, no softcap / SWA / MoE / E2B /
-    // proportional-RoPE), so an eligible plan here is guaranteed to take the adapter's replay path.
-    // Backends without `decode_replay` (CPU interpreter, which reads the baked `pos`) and every
-    // ineligible model keep rebuilding + recompiling per token below.
+    // Record-once decode: for an eligible decode on a backend that supports replay (the Vulkan
+    // seam), build+compile+bind ONE plan here and reuse it across the whole decode loop. The
+    // adapter records the graph once and replays it per token, reading `pos` from the bound
+    // positions buffer + a params SSBO — so the baked pos=0 here is irrelevant, and the per-token
+    // host cost drops to just the emb/pos (+ E2B ipl) uploads. The gate mirrors the adapter's
+    // graph eligibility: qk-norm models only (llama's plain-Rope decode has no dyn kernel) — the
+    // whole gemma family replays too (SWA windows + scale via push constants, freq_factors via
+    // qk_norm_rope_dyn_ff, V-norm/Softcap/Scale are pos-independent), as does MoE. Backends
+    // without `decode_replay` (CPU interpreter, which reads the baked `pos`) and every ineligible
+    // model keep rebuilding + recompiling per token below.
     // INFR_SEAM_NO_REPLAY=1 forces per-token rebuild (the adapter's static path) — slower, but
     // INFR_PROF2 per-op GPU timestamps work there (the replay path can't report them).
+    // This gate MUST stay a strict subset of the adapter's `decode_eligible` — the plan below
+    // bakes pos=0/kv_len=1, which is only correct when the adapter replays it (dyn kernels read
+    // the live pos/kv_len); an ineligible graph would silently run the static path with the baked
+    // values. Hence the per-layer head-dim mirror of the adapter's Attention check.
     let dyn_replay = be.capabilities().decode_replay
         && std::env::var("INFR_SEAM_NO_REPLAY").is_err()
         && qk_norm
-        && !gemma
-        && !gemma4
-        && !e2b
-        && rope_freqs.is_none()
-        && c.final_softcap <= 0.0;
+        && (0..c.n_layer)
+            .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512);
     let ro = if dyn_replay {
         let (g, h) = build(1, 0);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         b.bind(h.hidden, hidden_buf.as_ref());
         b.bind(h.positions, pos_buf.as_ref());
+        if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
+            b.bind(rid, rb.as_ref());
+        }
+        if let (Some(pid), Some(ib)) = (h.per_layer_inp, &ipl_buf) {
+            b.bind(pid, ib.as_ref());
+        }
         for l in 0..c.n_layer {
             b.bind(h.k_cache[l], kbufs[l].as_ref());
             b.bind(h.v_cache[l], vbufs[l].as_ref());

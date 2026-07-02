@@ -441,6 +441,8 @@ fn decode_attn_variants_bench() {
             hd,
             chunk,
             n_chunks,
+            0.0,
+            0,
         );
     });
     // dyn split, same chunks
@@ -459,6 +461,8 @@ fn decode_attn_variants_bench() {
             hd,
             chunk,
             n_chunks,
+            0.0,
+            0,
         );
     });
     // dynac: baked min chunk 64, capacity-sized scratch (the seam's config)
@@ -474,7 +478,7 @@ fn decode_attn_variants_bench() {
         .unwrap();
     let args = be.alloc(16, BufferUsage::Activations).unwrap();
     run("dynac cap126", &|rec| {
-        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, 64);
+        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, 64, 0);
         rec.attention_kv_split_dynac(
             q.as_ref(),
             kc.as_ref(),
@@ -490,12 +494,14 @@ fn decode_attn_variants_bench() {
             hd,
             64,
             cap_chunks,
+            0.0,
+            0,
         );
     });
     // dynac with a TIGHT bake (capacity == live): isolates the dead-workgroup/scan cost from the
     // SELF_CHUNK in-kernel logic cost.
     run("dynac tight c250", &|rec| {
-        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk);
+        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, 0);
         rec.attention_kv_split_dynac(
             q.as_ref(),
             kc.as_ref(),
@@ -511,6 +517,8 @@ fn decode_attn_variants_bench() {
             hd,
             chunk,
             n_chunks,
+            0.0,
+            0,
         );
     });
     // dyn split with chunk=64 all live (the earlier env-sweep shape)
@@ -530,6 +538,8 @@ fn decode_attn_variants_bench() {
             hd,
             64,
             n64,
+            0.0,
+            0,
         );
     });
 }

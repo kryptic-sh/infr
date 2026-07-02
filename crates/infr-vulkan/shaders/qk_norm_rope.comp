@@ -14,9 +14,15 @@ layout(binding = 1) readonly buffer NB { float nw[]; };
 // Record-once decode: pos comes from a host-updated params SSBO instead of a push constant, so the
 // command buffer can be replayed across tokens. `pc.rope_pos` is unused; `pc.out_base` is the 0/1
 // out_base multiplier (Q→0, K→pos). Output `y` moves to binding 3 (params takes binding 2) so the
-// recorder's reads|writes split stays output-last.
+// recorder's reads|writes split stays output-last. With FREQ_FACTORS (gemma4 full-attention layers
+// replayed), `ff` takes binding 3 and `y` shifts to binding 4 — still output-last.
 layout(binding = 2) readonly buffer PB { uint p_pos; uint p_kvlen; };
+#ifdef FREQ_FACTORS
+layout(binding = 3) readonly buffer FF { float ff[]; };
+layout(binding = 4) buffer YB { float16_t y[]; };
+#else
 layout(binding = 3) buffer YB { float16_t y[]; };
+#endif
 #elif defined(FREQ_FACTORS)
 // gemma4 full-attention layers use proportional RoPE: per-pair frequency divisors (most are huge →
 // those dims are left unrotated). `ff` takes binding 2 (read), `y` shifts to binding 3 (write).

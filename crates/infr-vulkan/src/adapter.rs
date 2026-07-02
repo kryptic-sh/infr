@@ -85,37 +85,25 @@ fn decode_eligible(graph: &Graph) -> bool {
     let mut has_attn = false;
     for op in &graph.ops {
         match op {
-            Op::Attention {
-                rows,
-                mask,
-                scale,
-                head_dim,
-                ..
-            } => {
+            // Any mask (SWA windows ride push constants + the window-aware prologue) and any
+            // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
+            // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
+            // fallback, both of which take scale/window.
+            Op::Attention { rows, head_dim, .. } => {
                 has_attn = true;
-                if *rows != 1 || !matches!(mask, AttnMask::Causal) {
-                    return false;
-                }
-                if (*scale - 1.0 / (*head_dim as f32).sqrt()).abs() > 1e-6 {
+                if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
                     return false;
                 }
             }
-            Op::QkNormRope { freq_factors, .. } => {
-                if freq_factors.is_some() {
-                    return false;
-                }
-                has_qknr = true;
-            }
+            // freq_factors (gemma4 proportional RoPE) binds via qk_norm_rope_dyn_ff.
+            Op::QkNormRope { .. } => has_qknr = true,
             // MoeFfn is REPLAY-SAFE: router GEMV + GPU-side top-k + id-indexed expert GEMVs are
-            // all push-constant/pos-independent, and its scratch is plan-held. The rest stay
-            // rejected (Rope/Softcap = gemma paths with per-layer params the dyn kernels lack;
-            // Conv1dSilu/DeltaNet = recurrent state the replay contract doesn't cover yet).
-            Op::MoeFfn { .. } => {}
-            Op::Rope { .. }
-            | Op::Softcap { .. }
-            | Op::Conv1dSilu { .. }
-            | Op::DeltaNet { .. }
-            | Op::QkNorm { .. } => return false,
+            // all push-constant/pos-independent, and its scratch is plan-held. QkNorm (gemma4
+            // V-norm) and Softcap are pos-independent elementwise — replay-safe as recorded.
+            // Still rejected: Rope (llama plain-rope decode has no dyn kernel) and
+            // Conv1dSilu/DeltaNet (recurrent state the replay contract doesn't cover).
+            Op::MoeFfn { .. } | Op::QkNorm { .. } | Op::Softcap { .. } => {}
+            Op::Rope { .. } | Op::Conv1dSilu { .. } | Op::DeltaNet { .. } => return false,
             _ => {}
         }
     }
@@ -189,12 +177,16 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<Vec<Option<Box<dy
 /// map is keyed by OP INDEX (not TensorId): each layer's pair maps to its own KV-cache buffer.
 /// Returns (fused: op index of the QkNormRope → (cache, row offset `pos`); skip: absorbed WriteKv ops).
 /// Per-execute Dynamic-attention shared state: ONE attn_live prologue + ONE pm/pl/pacc split
-/// scratch set for all layers (see `lower_op`'s `dyn_args`).
+/// scratch set per distinct (nh, hd, chunk, n_chunks, window) attention shape (see `lower_op`'s
+/// `dyn_args`). Uniform models (qwen3) have exactly one; gemma alternates SWA/global layers (and
+/// gemma4-12b alternates hd 256/512), so the contexts live in a small Vec looked up by key —
+/// same-key layers share one prologue dispatch and one scratch set.
 struct DynAttnCtx {
     nh: usize,
     chunk: usize,
     n_chunks: usize,
     hd: usize,
+    window: usize,
     args: Box<dyn Buffer>,
     pm: Box<dyn Buffer>,
     pl: Box<dyn Buffer>,
@@ -307,11 +299,12 @@ fn lower_op(
     fused_add: &HashMap<usize, (TensorId, TensorId)>,
     mode: &RopeMode,
     transient: &mut Vec<Box<dyn Buffer>>,
-    // Per-execute Dynamic-attention context: the prologue args AND the pm/pl/pacc split scratch,
-    // shared by every attention op (layers are serialized by dataflow, so one set suffices — the
-    // bespoke path shares its split scratch the same way; per-layer sets cost 28x the VRAM and
-    // added run-to-run placement variance). Keyed by shape so a heterogeneous graph falls back.
-    dyn_args: &mut Option<DynAttnCtx>,
+    // Per-execute Dynamic-attention contexts: the prologue args AND the pm/pl/pacc split scratch,
+    // shared by every attention op of the same shape (layers are serialized by dataflow, so one
+    // set per shape suffices — the bespoke path shares its split scratch the same way; per-layer
+    // sets cost 28x the VRAM and added run-to-run placement variance). A uniform model (qwen3)
+    // holds one entry; gemma's SWA/global alternation (and gemma4-12b's hd 256/512) holds a few.
+    dyn_args: &mut Vec<DynAttnCtx>,
     dummy: &dyn Buffer,
 ) -> Result<()> {
     let r = |id: TensorId| resolve(scratch, bindings, id);
@@ -619,13 +612,12 @@ fn lower_op(
                     );
                 }
                 RopeMode::Dynamic(params) => {
-                    // gemma4 proportional RoPE rides on QkNormRope, but `decode_eligible` rejects
-                    // `freq_factors`, so the dyn kernel (no freq_factors) never sees one.
-                    if freq_factors.is_some() {
-                        return Err(be(
-                            "vulkan adapter: dynamic decode QkNormRope with freq_factors unsupported",
-                        ));
-                    }
+                    // gemma4 proportional RoPE (full-attention layers): the ff divisors bind via
+                    // the `qk_norm_rope_dyn_ff` variant — pos still comes from `params`.
+                    let ff = match freq_factors {
+                        Some(f) => Some(r(*f)?),
+                        None => None,
+                    };
                     // `out_base_mul` is the 0/1 multiplier the shader scales by pos (then internally
                     // by nheads*hd): 1 → write cache row pos, 0 → write row 0 of the Q scratch.
                     let out_base_mul = usize::from(fused.is_some());
@@ -633,6 +625,7 @@ fn lower_op(
                         r(*x)?,
                         r(*weight)?,
                         *params,
+                        ff,
                         out_buf,
                         *rows as usize,
                         *n_head as usize,
@@ -705,7 +698,15 @@ fn lower_op(
                 *pos as usize,
             );
             if let RopeMode::Dynamic(params) = mode {
-                // Eligibility guarantees rows==1, causal, scale==1/√hd (gemma-disabled).
+                // Eligibility guarantees rows==1. Scale rides a push constant (gemma4 uses 1.0;
+                // 0.0 → kernel default 1/√hd) and SWA windows ride the window-aware prologue +
+                // partial kernel, so gemma-family decode replays too.
+                let window = match mask {
+                    AttnMask::Causal => 0usize,
+                    AttnMask::SlidingWindow(w) => *w,
+                };
+                let def_scale = (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
+                let pscale = if def_scale { 0.0 } else { *scale };
                 // Flash-decoding split-K: the scalar attention_kv_dyn launches only nh workgroups
                 // and rescans the whole cache per token — decode slowed ~4x from kv 100→600 on the
                 // seam replay path. `chunk`/`n_chunks` are push constants (dispatch structure), so
@@ -720,20 +721,28 @@ fn lower_op(
                 let chunk = cap.div_ceil(1024).max(64);
                 let n_chunks = cap.div_ceil(chunk);
                 if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
-                    // ONE prologue + ONE scratch set per execute: the first Dynamic attention op
-                    // records/allocates; every later layer reuses (kv_len is per-token, and the
-                    // layers' attention ops are serialized by dataflow — pm/pl/pacc hazards are
-                    // ordinary RAW/WAW barriers).
-                    let key_ok = matches!(dyn_args, Some(c)
-                        if c.nh == nh && c.chunk == chunk && c.n_chunks == n_chunks && c.hd == hd);
-                    if !key_ok {
+                    // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
+                    // the first Dynamic attention op of a shape records/allocates; every later
+                    // same-shape layer reuses (kv_len is per-token, and the layers' attention ops
+                    // are serialized by dataflow — pm/pl/pacc hazards are ordinary RAW/WAW
+                    // barriers). Gemma alternates SWA/global (and gemma4-12b hd 256/512), so a
+                    // handful of keys coexist per execute.
+                    let key = |c: &DynAttnCtx| {
+                        c.nh == nh
+                            && c.chunk == chunk
+                            && c.n_chunks == n_chunks
+                            && c.hd == hd
+                            && c.window == window
+                    };
+                    if !dyn_args.iter().any(key) {
                         let args = be_.alloc_uninit(16, BufferUsage::Activations)?;
-                        rec.attn_live_prologue(*params, args.as_ref(), nh, chunk);
-                        *dyn_args = Some(DynAttnCtx {
+                        rec.attn_live_prologue(*params, args.as_ref(), nh, chunk, window);
+                        dyn_args.push(DynAttnCtx {
                             nh,
                             chunk,
                             n_chunks,
                             hd,
+                            window,
                             args,
                             pm: be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?,
                             pl: be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?,
@@ -741,7 +750,7 @@ fn lower_op(
                                 .alloc_uninit(nh * n_chunks * hd * 4, BufferUsage::Activations)?,
                         });
                     }
-                    let ctx = dyn_args.as_ref().unwrap();
+                    let ctx = dyn_args.iter().find(|c| key(c)).unwrap();
                     rec.attention_kv_split_dynac(
                         r(*q)?,
                         r(*k_cache)?,
@@ -757,6 +766,8 @@ fn lower_op(
                         hd,
                         chunk,
                         n_chunks,
+                        pscale,
+                        window,
                     );
                 } else {
                     rec.attention_kv_dyn(
@@ -769,6 +780,8 @@ fn lower_op(
                         nh,
                         nkv,
                         hd,
+                        pscale,
+                        window,
                     );
                 }
             } else {
@@ -789,17 +802,14 @@ fn lower_op(
                     && hd <= 512
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
-                // Decode (rows==1), causal, default scale: flash-decoding split-K — each head's KV
-                // range splits across ~32 chunks of workgroups instead of the scalar attention_kv's
-                // rows*nh (= nh at decode, ~16 workgroups on a 96-CU GPU — the decode bottleneck).
-                // attn_partial handles any hd%4==0 ≤ 512 (hd=128 fast path, general path above).
+                // Decode (rows==1): flash-decoding split-K — each head's KV range splits across
+                // ~32 chunks of workgroups instead of the scalar attention_kv's rows*nh (= nh at
+                // decode, ~16 workgroups on a 96-CU GPU — the decode bottleneck). attn_partial
+                // handles any hd%4==0 ≤ 512 (hd=128 fast path, general path above), any scale
+                // (push constant; gemma4 uses 1.0), and SWA windows (chunks below the window
+                // clamp to empty → zero-weight partials the combine skips).
                 let chunk = (kv_len / 32).clamp(64, 512);
-                let split_ok = rows == 1
-                    && kv_len > chunk
-                    && matches!(mask, AttnMask::Causal)
-                    && hd % 4 == 0
-                    && hd <= 512
-                    && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
+                let split_ok = rows == 1 && kv_len > chunk && hd % 4 == 0 && hd <= 512;
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // alloc_uninit: split partials are fully written before the combine reads them
@@ -855,6 +865,10 @@ fn lower_op(
                     );
                     transient.extend([s, pv]);
                 } else if split_ok {
+                    let window = match mask {
+                        AttnMask::Causal => 0,
+                        AttnMask::SlidingWindow(w) => *w,
+                    };
                     let n_chunks = kv_len.div_ceil(chunk);
                     let pm = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
                     let pl = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
@@ -874,6 +888,8 @@ fn lower_op(
                         hd,
                         chunk,
                         n_chunks,
+                        *scale,
+                        window,
                     );
                     transient.extend([pm, pl, pacc]);
                 } else {
@@ -1449,7 +1465,7 @@ fn record_decode_replay(
     skip_op.extend(skip_add);
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
-    let mut dyn_args: Option<DynAttnCtx> = None;
+    let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let dummy = be_.alloc(16, BufferUsage::Activations)?;
     let rec = be_.recorder_persistent()?;
     let mode = RopeMode::Dynamic(params.as_ref());
@@ -1473,7 +1489,7 @@ fn record_decode_replay(
             dummy.as_ref(),
         )?;
     }
-    if let Some(c) = dyn_args.take() {
+    for c in dyn_args.drain(..) {
         transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
     let recorded = rec.finish_record().map_err(|e| be(e.to_string()))?;
@@ -1525,7 +1541,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
 
     let rec = be_.recorder()?;
     let mode = RopeMode::Static(&rope_pos);
-    let mut dyn_args: Option<DynAttnCtx> = None;
+    let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
@@ -1546,7 +1562,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             dummy.as_ref(),
         )?;
     }
-    if let Some(c) = dyn_args.take() {
+    for c in dyn_args.drain(..) {
         transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
     rec.finish().map_err(|e| be(e.to_string()))?;

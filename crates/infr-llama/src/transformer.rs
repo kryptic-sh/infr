@@ -1451,6 +1451,8 @@ impl Llama {
                     hd,
                     chunk,
                     n_chunks,
+                    0.0,
+                    0,
                 );
             } else {
                 rec.attention_kv(
@@ -1723,6 +1725,7 @@ impl Llama {
                         qr.as_ref(),
                         layer.q_norm_buf.as_ref().unwrap().as_ref(),
                         params.as_ref(),
+                        None,
                         q_f16.as_ref(),
                         1,
                         nh,
@@ -1736,6 +1739,7 @@ impl Llama {
                         kr.as_ref(),
                         layer.k_norm_buf.as_ref().unwrap().as_ref(),
                         params.as_ref(),
+                        None,
                         kv.k[li].as_ref(),
                         1,
                         nkv,
@@ -1783,6 +1787,8 @@ impl Llama {
                         hd,
                         chunk,
                         n_chunks,
+                        0.0,
+                        0,
                     );
                 } else {
                     rec.attention_kv_dyn(
@@ -1795,6 +1801,8 @@ impl Llama {
                         nh,
                         nkv,
                         hd,
+                        0.0,
+                        0,
                     );
                 }
                 rec_linear_add(
@@ -2421,6 +2429,8 @@ impl Llama {
                 hd,
                 chunk,
                 n_chunks,
+                0.0,
+                0,
             );
         } else {
             rec.attention_kv(
@@ -2672,6 +2682,7 @@ impl Llama {
                     qr.as_ref(),
                     qn,
                     params.as_ref(),
+                    None,
                     q_f16.as_ref(),
                     1,
                     nh,
@@ -2685,6 +2696,7 @@ impl Llama {
                     kr.as_ref(),
                     kn,
                     params.as_ref(),
+                    None,
                     kv.kv.k[li].as_ref(),
                     1,
                     nkv,
@@ -2710,6 +2722,8 @@ impl Llama {
                         hd,
                         chunk,
                         n_chunks,
+                        0.0,
+                        0,
                     );
                 } else {
                     rec.attention_kv_dyn(
@@ -2722,6 +2736,8 @@ impl Llama {
                         nh,
                         nkv,
                         hd,
+                        0.0,
+                        0,
                     );
                 }
                 rec_linear(&rec, &layer.wo, attn.as_ref(), ao.as_ref(), 1, nh * hd, ne);

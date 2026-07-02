@@ -1824,19 +1824,23 @@ impl<'a> Recorder<'a> {
         hd: usize,
         chunk: usize,
         n_chunks: usize,
+        scale: f32,
+        window: usize,
     ) {
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
         self.stamp("attn_partial");
         let k1 = self
             .be
-            .kernel_sg("attn_partial", crate::gemm::attn_partial_spv(), 6, 24, 32);
-        let mut p1 = [0u8; 24];
+            .kernel_sg("attn_partial", crate::gemm::attn_partial_spv(), 6, 32, 32);
+        let mut p1 = [0u8; 32];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
         p1[16..20].copy_from_slice(&(chunk as u32).to_ne_bytes());
         p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        p1[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        p1[28..32].copy_from_slice(&scale.to_ne_bytes());
         self.dispatch(
             k1,
             &[
@@ -1881,11 +1885,13 @@ impl<'a> Recorder<'a> {
     /// QK-norm + RoPE, pos from `params`. `out_base_mul` = 0 for Q (write to a temp), 1 for K (write
     /// to the cache at row pos).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn qk_norm_rope_dyn(
         &self,
         x: &dyn Buffer,
         nw: &dyn Buffer,
         params: &dyn Buffer,
+        ff: Option<&dyn Buffer>,
         y: &dyn Buffer,
         rows: usize,
         nheads: usize,
@@ -1896,12 +1902,22 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         self.stamp("qk_norm_rope");
-        let k = self.be.kernel(
-            "qk_norm_rope_dyn",
-            crate::gemm::qk_norm_rope_dyn_spv(),
-            4,
-            32,
-        );
+        // With freq_factors (gemma4 full-attention layers) `ff` binds at 3 and the output shifts
+        // to 4 — same PC layout either way.
+        let k = match ff {
+            Some(_) => self.be.kernel(
+                "qk_norm_rope_dyn_ff",
+                crate::gemm::qk_norm_rope_dyn_ff_spv(),
+                5,
+                32,
+            ),
+            None => self.be.kernel(
+                "qk_norm_rope_dyn",
+                crate::gemm::qk_norm_rope_dyn_spv(),
+                4,
+                32,
+            ),
+        };
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
@@ -1911,13 +1927,28 @@ impl<'a> Recorder<'a> {
         // [20..24] rope_pos: unused (from params)
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
-            1,
-            &push,
-            (rows * nheads) as u32,
-        );
+        match ff {
+            Some(f) => self.dispatch(
+                k,
+                &[
+                    Self::vkb(x),
+                    Self::vkb(nw),
+                    Self::vkb(params),
+                    Self::vkb(f),
+                    Self::vkb(y),
+                ],
+                1,
+                &push,
+                (rows * nheads) as u32,
+            ),
+            None => self.dispatch(
+                k,
+                &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
+                1,
+                &push,
+                (rows * nheads) as u32,
+            ),
+        }
     }
 
     /// Cast-copy f32 `src[0..n]` → f16 `dst[pos*n..]` (one KV row at position pos from `params`).
@@ -1951,6 +1982,8 @@ impl<'a> Recorder<'a> {
         nh: usize,
         nkv: usize,
         hd: usize,
+        scale: f32,
+        window: usize,
     ) {
         self.stamp("attention_kv");
         let kern = self.be.kernel(
@@ -1966,8 +1999,8 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
         // [20..24] pos_offset: unused (from params)
-        // [24..28] window: 0 (record-once decode is gemma-disabled, so always full causal)
-        // [28..32] scale: 0.0 → default 1/√hd (record-once decode is gemma-disabled)
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
         self.dispatch(
             kern,
             &[
@@ -2001,9 +2034,11 @@ impl<'a> Recorder<'a> {
         hd: usize,
         chunk: usize,
         n_chunks: usize,
+        scale: f32,
+        window: usize,
     ) {
         self.attention_kv_split_dyn_inner(
-            q, kc, vc, o, pm, pl, pacc, params, nh, nkv, hd, chunk, n_chunks,
+            q, kc, vc, o, pm, pl, pacc, params, nh, nkv, hd, chunk, n_chunks, scale, window,
         )
     }
 
@@ -2017,14 +2052,16 @@ impl<'a> Recorder<'a> {
         args: &dyn Buffer,
         nh: usize,
         chunk: usize,
+        window: usize,
     ) {
         self.stamp("attn_live");
         let kl = self
             .be
-            .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 8);
-        let mut p0 = [0u8; 8];
+            .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 12);
+        let mut p0 = [0u8; 12];
         p0[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
         p0[4..8].copy_from_slice(&(chunk as u32).to_ne_bytes());
+        p0[8..12].copy_from_slice(&(window as u32).to_ne_bytes());
         self.dispatch(kl, &[Self::vkb(params), Self::vkb(args)], 1, &p0, 1);
     }
 
@@ -2052,24 +2089,29 @@ impl<'a> Recorder<'a> {
         hd: usize,
         chunk: usize,
         n_chunks: usize,
+        scale: f32,
+        window: usize,
     ) {
         // pass 1: self-chunking partials, workgroup count from `args` (the caller records ONE
-        // `attn_live_prologue` per execute — kv_len is identical for every layer of a token, so
-        // the args buffer is shared across all attention ops instead of re-derived per layer).
+        // `attn_live_prologue` per (nh, chunk, window) key — kv_len is identical for every layer
+        // of a token, so the args buffer is shared across same-key attention ops instead of
+        // re-derived per layer).
         self.stamp("attn_partial");
         let k1 = self.be.kernel_sg(
             "attn_partial_dynac",
             crate::gemm::attn_partial_dynac_spv(),
             7,
-            24,
+            32,
             32,
         );
-        let mut p1 = [0u8; 24];
+        let mut p1 = [0u8; 32];
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
         p1[16..20].copy_from_slice(&(chunk as u32).to_ne_bytes());
         p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        p1[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        p1[28..32].copy_from_slice(&scale.to_ne_bytes());
         self.dispatch_indirect(
             k1,
             &[
@@ -2132,22 +2174,26 @@ impl<'a> Recorder<'a> {
         hd: usize,
         chunk: usize,
         n_chunks: usize,
+        scale: f32,
+        window: usize,
     ) {
         self.stamp("attn_partial");
         let k1 = self.be.kernel_sg(
             "attn_partial_dyn",
             crate::gemm::attn_partial_dyn_spv(),
             7,
-            24,
+            32,
             32,
         );
-        let mut p1 = [0u8; 24];
+        let mut p1 = [0u8; 32];
         // [0..4] kv_len: unused (from params)
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
         p1[16..20].copy_from_slice(&(chunk as u32).to_ne_bytes());
         p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
+        p1[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        p1[28..32].copy_from_slice(&scale.to_ne_bytes());
         self.dispatch(
             k1,
             &[
@@ -3750,7 +3796,7 @@ mod tests {
         assert!(err < 5e-3, "attention_kv mismatch: {err}");
     }
 
-    fn run_attn_kv_split(kv_len: usize, nh: usize, nkv: usize, hd: usize) {
+    fn run_attn_kv_split(kv_len: usize, nh: usize, nkv: usize, hd: usize, scale: f32, win: usize) {
         let be = VulkanBackend::new().unwrap();
         let chunk = 512usize;
         let n_chunks = kv_len.div_ceil(chunk);
@@ -3791,22 +3837,33 @@ mod tests {
             hd,
             chunk,
             n_chunks,
+            scale,
+            win,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; nh * hd * 4];
         be.download(bo.as_ref(), &mut bytes).unwrap();
         let got: &[f32] = bytemuck::cast_slice(&bytes);
-        let want = attn_kv_cpu(&q, &k, &v, 1, nh, nkv, hd, pos_offset, 0, 0.0);
+        let want = attn_kv_cpu(&q, &k, &v, 1, nh, nkv, hd, pos_offset, win, scale);
         let err = got
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        println!("attn_kv_split kv_len={kv_len} n_chunks={n_chunks} max_err={err:e}");
+        println!("attn_kv_split kv_len={kv_len} n_chunks={n_chunks} win={win} max_err={err:e}");
         assert!(err < 5e-3, "split mismatch: {err}");
     }
 
-    fn run_attn_kv_split_dynac(kv_len: usize, cap: usize, nh: usize, nkv: usize, hd: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn run_attn_kv_split_dynac(
+        kv_len: usize,
+        cap: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        scale: f32,
+        win: usize,
+    ) {
         let be = VulkanBackend::new().unwrap();
         let chunk = cap.div_ceil(1024).max(64);
         let n_chunks = cap.div_ceil(chunk);
@@ -3840,7 +3897,7 @@ mod tests {
         .unwrap();
         let args = be.alloc(16, BufferUsage::Activations).unwrap();
         let rec = be.recorder().unwrap();
-        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk);
+        rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, win);
         rec.attention_kv_split_dynac(
             bq.as_ref(),
             bk.as_ref(),
@@ -3856,38 +3913,50 @@ mod tests {
             hd,
             chunk,
             n_chunks,
+            scale,
+            win,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; nh * hd * 4];
         be.download(bo.as_ref(), &mut bytes).unwrap();
         let got: &[f32] = bytemuck::cast_slice(&bytes);
-        let want = attn_kv_cpu(&q, &k, &v, 1, nh, nkv, hd, pos_offset, 0, 0.0);
+        let want = attn_kv_cpu(&q, &k, &v, 1, nh, nkv, hd, pos_offset, win, scale);
         let err = got
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
-        println!("attn_kv_split_dynac kv={kv_len} cap={cap} n_chunks={n_chunks} max_err={err:e}");
+        println!(
+            "attn_kv_split_dynac kv={kv_len} cap={cap} n_chunks={n_chunks} win={win} max_err={err:e}"
+        );
         assert!(err < 5e-3, "dynac split mismatch: {err}");
     }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_kv_split_dynac_matches_cpu() {
-        run_attn_kv_split_dynac(20, 68, 16, 8, 128); // shallow: 1 live chunk, tiny cap
-        run_attn_kv_split_dynac(600, 8065, 9, 3, 64); // wide bake, few live
-        run_attn_kv_split_dynac(8000, 8065, 16, 8, 128); // deep: 32 live chunks
-        run_attn_kv_split_dynac(130, 40960, 4, 2, 128); // huge capacity (chunk floor rises)
+        run_attn_kv_split_dynac(20, 68, 16, 8, 128, 0.0, 0); // shallow: 1 live chunk, tiny cap
+        run_attn_kv_split_dynac(600, 8065, 9, 3, 64, 0.0, 0); // wide bake, few live
+        run_attn_kv_split_dynac(8000, 8065, 16, 8, 128, 0.0, 0); // deep: 32 live chunks
+        run_attn_kv_split_dynac(130, 40960, 4, 2, 128, 0.0, 0); // huge cap (chunk floor rises)
+                                                                // gemma-family replay shapes: SWA windows (span-chunked grid) + explicit scale.
+        run_attn_kv_split_dynac(2050, 8065, 16, 8, 256, 0.0, 512); // gemma3 SWA deep (window << kv)
+        run_attn_kv_split_dynac(300, 8065, 16, 8, 256, 0.0, 512); // SWA shallow (kv < window)
+        run_attn_kv_split_dynac(700, 8065, 16, 8, 256, 0.0, 640); // window not chunk-aligned
+        run_attn_kv_split_dynac(4000, 8065, 8, 2, 512, 1.0, 1024); // gemma4 hd=512, scale=1.0, SWA
+        run_attn_kv_split_dynac(900, 8065, 8, 4, 256, 1.0, 0); // gemma4 full-attn (scale only)
     }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]
     fn attention_kv_split_matches_cpu() {
-        run_attn_kv_split(600, 9, 3, 64); // 2 chunks
-        run_attn_kv_split(2050, 9, 3, 64); // 5 chunks, partial last
-        run_attn_kv_split(8000, 4, 2, 32); // 16 chunks
-        run_attn_kv_split(830, 16, 2, 256); // qwen35 full-attn decode (hd=256 general path)
-        run_attn_kv_split(2050, 16, 8, 256); // gemma SWA-shape decode (hd=256, GQA 16:8)
+        run_attn_kv_split(600, 9, 3, 64, 0.0, 0); // 2 chunks
+        run_attn_kv_split(2050, 9, 3, 64, 0.0, 0); // 5 chunks, partial last
+        run_attn_kv_split(8000, 4, 2, 32, 0.0, 0); // 16 chunks
+        run_attn_kv_split(830, 16, 2, 256, 0.0, 0); // qwen35 full-attn decode (hd=256 general path)
+        run_attn_kv_split(2050, 16, 8, 256, 0.0, 0); // gemma SWA-shape decode (hd=256, GQA 16:8)
+        run_attn_kv_split(2050, 16, 8, 256, 0.0, 512); // SWA window (chunks below lo → empty)
+        run_attn_kv_split(4000, 8, 2, 512, 1.0, 1024); // gemma4 hd=512, scale=1.0, SWA
     }
 
     #[test]

@@ -88,6 +88,11 @@ fn main() {
         ("qk_norm_rope", "qk_norm_rope", &[]),
         ("qk_norm_rope", "qk_norm_rope_dyn", &["-DUSE_PARAMS"]),
         ("qk_norm_rope", "qk_norm_rope_ff", &["-DFREQ_FACTORS"]),
+        (
+            "qk_norm_rope",
+            "qk_norm_rope_dyn_ff",
+            &["-DUSE_PARAMS", "-DFREQ_FACTORS"],
+        ),
         ("attn_in", "attn_in", &[]),
         ("attn_in", "attn_in_dyn", &["-DUSE_PARAMS"]),
         ("ffn_in", "ffn_in", &[]),

@@ -287,7 +287,8 @@ fn lower_op(
                     None
                 } else {
                     let mpad = m.div_ceil(64) * 64;
-                    Some(be_.alloc((mpad * out_f * eb).max(4), BufferUsage::Activations)?)
+                    // alloc_uninit: the GEMM writes all mpad rows before the copy reads m of them.
+                    Some(be_.alloc_uninit((mpad * out_f * eb).max(4), BufferUsage::Activations)?)
                 };
                 let out: &dyn Buffer = match &tmp {
                     Some(t) => t.as_ref(),
@@ -306,9 +307,10 @@ fn lower_op(
                 {
                     // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
                     let nblk = in_f / 32;
-                    let qa = be_.alloc((m * in_f).max(4), BufferUsage::Activations)?;
-                    let dact = be_.alloc((m * nblk * 2).max(4), BufferUsage::Activations)?;
-                    let sact = be_.alloc((m * nblk * 2).max(4), BufferUsage::Activations)?;
+                    // alloc_uninit: quant_q8 fills all m rows before the GEMM reads them.
+                    let qa = be_.alloc_uninit((m * in_f).max(4), BufferUsage::Activations)?;
+                    let dact = be_.alloc_uninit((m * nblk * 2).max(4), BufferUsage::Activations)?;
+                    let sact = be_.alloc_uninit((m * nblk * 2).max(4), BufferUsage::Activations)?;
                     rec.quant_q8(xb, qa.as_ref(), dact.as_ref(), sact.as_ref(), m, in_f);
                     rec.matmul_mmq_q4k(
                         qa.as_ref(),
@@ -378,14 +380,40 @@ fn lower_op(
             n,
         } => {
             let eb = graph.desc(*src).dtype.dense_bytes(1).unwrap_or(4);
-            for row in 0..*rows as usize {
-                rec.copy(
+            let (rows_, n_) = (*rows as usize, *n as usize);
+            let (so, ss, do_, ds) = (
+                *src_off as usize,
+                *src_stride as usize,
+                *dst_off as usize,
+                *dst_stride as usize,
+            );
+            // One compute dispatch when everything is u32-word aligned (f32 always; f16 when the
+            // element counts are even) — the per-row copy loop recorded `rows` vkCmdCopyBuffer +
+            // hazard checks per split op (thousands per prefill chunk), dwarfing the bytes moved.
+            let word_ok = [so * eb, ss * eb, do_ * eb, ds * eb, n_ * eb]
+                .iter()
+                .all(|b| b % 4 == 0);
+            if word_ok {
+                rec.copy_strided(
                     r(*src)?,
-                    (*src_off as usize + row * *src_stride as usize) * eb,
                     r(*dst)?,
-                    (*dst_off as usize + row * *dst_stride as usize) * eb,
-                    *n as usize * eb,
+                    rows_,
+                    n_ * eb / 4,
+                    so * eb / 4,
+                    ss * eb / 4,
+                    do_ * eb / 4,
+                    ds * eb / 4,
                 );
+            } else {
+                for row in 0..rows_ {
+                    rec.copy(
+                        r(*src)?,
+                        (so + row * ss) * eb,
+                        r(*dst)?,
+                        (do_ + row * ds) * eb,
+                        n_ * eb,
+                    );
+                }
             }
         }
         // Gated FFN activation: `act(gate) * up[+up_off]`. up_off (E2B per-layer slice) only
@@ -623,9 +651,11 @@ fn lower_op(
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6;
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
-                    let po = be_.alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
-                    let pm = be_.alloc(8 * mpad * nh * 4, BufferUsage::Activations)?;
-                    let pl = be_.alloc(8 * mpad * nh * 4, BufferUsage::Activations)?;
+                    // alloc_uninit: split partials are fully written before the combine reads them
+                    // (zero-fill would be a ~70MB host memset per op on ReBAR).
+                    let po = be_.alloc_uninit(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
+                    let pm = be_.alloc_uninit(8 * mpad * nh * 4, BufferUsage::Activations)?;
+                    let pl = be_.alloc_uninit(8 * mpad * nh * 4, BufferUsage::Activations)?;
                     rec.attention_prefill_flash(
                         r(*q)?,
                         r(*k_cache)?,
@@ -649,9 +679,13 @@ fn lower_op(
                     };
                     let mpad = rows.div_ceil(64) * 64;
                     let kv_pad = kv_len.div_ceil(256) * 256;
-                    // scores scratch [nh, mpad, kv_pad] f16 + split-K PV partials (≤8 splits) f32
-                    let s = be_.alloc(nh * mpad * kv_pad * 2, BufferUsage::Activations)?;
-                    let pv = be_.alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
+                    // scores scratch [nh, mpad, kv_pad] f16 + split-K PV partials (≤8 splits) f32.
+                    // alloc_uninit: these are ~80MB per attention op and fully written before read
+                    // (attn_qk fills every [mpad, kv_pad] row; PV partials are written per split
+                    // before the reduce) — the calloc-style alloc's zero-fill is a host memset of
+                    // the whole thing on ReBAR, ~500MB/chunk of pure overhead across 6 attn layers.
+                    let s = be_.alloc_uninit(nh * mpad * kv_pad * 2, BufferUsage::Activations)?;
+                    let pv = be_.alloc_uninit(8 * mpad * nh * hd * 4, BufferUsage::Activations)?;
                     rec.attention_prefill_nonfa(
                         r(*q)?,
                         r(*k_cache)?,
@@ -671,9 +705,10 @@ fn lower_op(
                     transient.extend([s, pv]);
                 } else if split_ok {
                     let n_chunks = kv_len.div_ceil(chunk);
-                    let pm = be_.alloc(nh * n_chunks * 4, BufferUsage::Activations)?;
-                    let pl = be_.alloc(nh * n_chunks * 4, BufferUsage::Activations)?;
-                    let pacc = be_.alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)?;
+                    let pm = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
+                    let pl = be_.alloc_uninit(nh * n_chunks * 4, BufferUsage::Activations)?;
+                    let pacc =
+                        be_.alloc_uninit(nh * n_chunks * hd * 4, BufferUsage::Activations)?;
                     rec.attention_kv_split(
                         r(*q)?,
                         r(*k_cache)?,

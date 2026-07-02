@@ -136,3 +136,178 @@ fn qwen35_gemm_inventory_bench() {
     }
     println!("qwen35 512-row chunk GEMM total: {total:.1} ms");
 }
+
+/// Per-op serialization floor: a chain of small hazard-dependent dispatches (each reads the
+/// previous one's output → global barrier each). wall/ops ≈ the fixed bubble every seam op pays
+/// on top of its kernel time — the number that says how much op-count reduction / overlap is worth.
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn chained_op_bubble_bench() {
+    let be = VulkanBackend::new().unwrap();
+    let n = 512usize * 1024; // one chunk's hidden activations
+    let a = be.alloc(n * 4, BufferUsage::Activations).unwrap();
+    let b = be.alloc(n * 4, BufferUsage::Activations).unwrap();
+    let w = be.alloc(1024 * 4, BufferUsage::Activations).unwrap();
+    for ops in [50usize, 400] {
+        // warmup
+        let rec = be.recorder().unwrap();
+        rec.rmsnorm(a.as_ref(), w.as_ref(), b.as_ref(), 512, 1024, 1e-6);
+        rec.finish().unwrap();
+        let t0 = std::time::Instant::now();
+        let rec = be.recorder().unwrap();
+        for i in 0..ops {
+            // ping-pong a→b→a…: every dispatch RAW-depends on the previous one
+            let (x, y) = if i % 2 == 0 { (&a, &b) } else { (&b, &a) };
+            rec.rmsnorm(x.as_ref(), w.as_ref(), y.as_ref(), 512, 1024, 1e-6);
+        }
+        rec.finish().unwrap();
+        let us = t0.elapsed().as_micros() as f64;
+        println!(
+            "{ops} chained rmsnorm(512x1024): {:.1} us total, {:.1} us/op",
+            us,
+            us / ops as f64
+        );
+    }
+}
+
+/// Real isolated cost of the two remaining big prefill ops at qwen35 shapes.
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn qwen35_dn_attn_bench() {
+    let be = VulkanBackend::new().unwrap();
+    let rows = 512usize;
+    let (nv, nk, kd, vd) = (16usize, 16usize, 128usize, 128usize);
+    let q = be
+        .alloc(rows * nk * kd * 4, BufferUsage::Activations)
+        .unwrap();
+    let k = be
+        .alloc(rows * nk * kd * 4, BufferUsage::Activations)
+        .unwrap();
+    let v = be
+        .alloc(rows * nv * vd * 4, BufferUsage::Activations)
+        .unwrap();
+    let b = be.alloc(rows * nv * 4, BufferUsage::Activations).unwrap();
+    let al = be.alloc(rows * nv * 4, BufferUsage::Activations).unwrap();
+    let ac = be.alloc(nv * 4, BufferUsage::Weights).unwrap();
+    let dt = be.alloc(nv * 4, BufferUsage::Weights).unwrap();
+    let st = be
+        .alloc(nv * kd * vd * 4, BufferUsage::Activations)
+        .unwrap();
+    let o = be
+        .alloc(rows * nv * vd * 4, BufferUsage::Activations)
+        .unwrap();
+    let reps = 10usize;
+    let rec = be.recorder().unwrap();
+    rec.deltanet_chunked(
+        q.as_ref(),
+        k.as_ref(),
+        v.as_ref(),
+        b.as_ref(),
+        al.as_ref(),
+        ac.as_ref(),
+        dt.as_ref(),
+        st.as_ref(),
+        o.as_ref(),
+        rows,
+        nv,
+        nk,
+        kd,
+        vd,
+        1e-6,
+    );
+    rec.finish().unwrap();
+    let t0 = std::time::Instant::now();
+    let rec = be.recorder().unwrap();
+    for _ in 0..reps {
+        rec.deltanet_chunked(
+            q.as_ref(),
+            k.as_ref(),
+            v.as_ref(),
+            b.as_ref(),
+            al.as_ref(),
+            ac.as_ref(),
+            dt.as_ref(),
+            st.as_ref(),
+            o.as_ref(),
+            rows,
+            nv,
+            nk,
+            kd,
+            vd,
+            1e-6,
+        );
+    }
+    rec.finish().unwrap();
+    let us = t0.elapsed().as_micros() as f64 / reps as f64;
+    println!(
+        "deltanet_chunked rows=512: {us:.1} us/op  ×18 = {:.1} ms/chunk",
+        us * 18.0 / 1e3
+    );
+
+    // nonfa attention at qwen35 attn shape: rows=512, kv=822, nh=16, nkv=2, hd=256
+    let (nh, nkv, hd, kv_len) = (16usize, 2usize, 256usize, 822usize);
+    let mpad = 512usize;
+    let kv_pad = kv_len.div_ceil(256) * 256;
+    let qb = be
+        .alloc(mpad * nh * hd * 2, BufferUsage::Activations)
+        .unwrap();
+    let kc = be
+        .alloc(kv_len * nkv * hd * 2, BufferUsage::Activations)
+        .unwrap();
+    let vc = be
+        .alloc(kv_len * nkv * hd * 2, BufferUsage::Activations)
+        .unwrap();
+    let at = be
+        .alloc(mpad * nh * hd * 4, BufferUsage::Activations)
+        .unwrap();
+    let s = be
+        .alloc(nh * mpad * kv_pad * 2, BufferUsage::Activations)
+        .unwrap();
+    let pv = be
+        .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)
+        .unwrap();
+    let rec = be.recorder().unwrap();
+    rec.attention_prefill_nonfa(
+        qb.as_ref(),
+        kc.as_ref(),
+        vc.as_ref(),
+        at.as_ref(),
+        s.as_ref(),
+        pv.as_ref(),
+        mpad,
+        kv_len,
+        nh,
+        nkv,
+        hd,
+        310,
+        0,
+        0.0,
+    );
+    rec.finish().unwrap();
+    let t0 = std::time::Instant::now();
+    let rec = be.recorder().unwrap();
+    for _ in 0..reps {
+        rec.attention_prefill_nonfa(
+            qb.as_ref(),
+            kc.as_ref(),
+            vc.as_ref(),
+            at.as_ref(),
+            s.as_ref(),
+            pv.as_ref(),
+            mpad,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            310,
+            0,
+            0.0,
+        );
+    }
+    rec.finish().unwrap();
+    let us = t0.elapsed().as_micros() as f64 / reps as f64;
+    println!(
+        "nonfa attn rows=512 kv=822 hd=256: {us:.1} us/op  ×6 = {:.1} ms/chunk",
+        us * 6.0 / 1e3
+    );
+}

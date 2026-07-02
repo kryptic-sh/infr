@@ -309,6 +309,7 @@ const CONV1D_SILU_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/c
 const CONV1D_SILU_PAR_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par.spv"));
 const CONV1D_SHIFT_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_shift.spv"));
+const COPY_STRIDED_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_strided.spv"));
 const MUL_SIGMOID_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv"));
 const ADD_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add.spv"));
 const SILU_MUL_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silu_mul.spv"));
@@ -532,6 +533,11 @@ pub(crate) fn conv1d_silu_par_spv() -> &'static [u32] {
 pub(crate) fn conv1d_shift_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(CONV1D_SHIFT_SPV_BYTES))
+}
+/// SPIR-V for the batched strided row copy (Op::CopyStrided in one dispatch).
+pub(crate) fn copy_strided_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(COPY_STRIDED_SPV_BYTES))
 }
 /// SPIR-V for the elementwise sigmoid gate `y = a * sigmoid(b)`.
 pub(crate) fn mul_sigmoid_spv() -> &'static [u32] {

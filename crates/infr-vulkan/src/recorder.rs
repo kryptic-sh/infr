@@ -1979,6 +1979,7 @@ impl<'a> Recorder<'a> {
 
     /// Fused SwiGLU over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
     pub fn silu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+        self.stamp("silu_mul");
         let k = self
             .be
             .kernel("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 8);
@@ -1997,6 +1998,7 @@ impl<'a> Recorder<'a> {
     /// Fused GeGLU (GELU tanh-approx gate) over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
     /// Same layout/dispatch as [`silu_mul_fused`]; gemma uses GELU instead of SiLU.
     pub fn gelu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
+        self.stamp("gelu_mul");
         let k = self
             .be
             .kernel("gelu_mul_fused", crate::gemm::gelu_mul_fused_spv(), 2, 8);
@@ -2013,6 +2015,7 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
+        self.stamp("silu_mul");
         let k = self
             .be
             .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 8);
@@ -2236,8 +2239,45 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Batched strided row copy in ONE dispatch (word granularity): `rows` slices of `nw` u32
+    /// words, `dst[dst_off + r*dst_stride + ..nw] = src[src_off + r*src_stride + ..nw]` (all in
+    /// words). Replaces the per-row copy-command loop for Op::CopyStrided — at rows=512 that was
+    /// 512 vkCmdCopyBuffer + hazard checks per split op, dwarfing the bytes moved.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_strided(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        nw: usize,
+        src_off: usize,
+        src_stride: usize,
+        dst_off: usize,
+        dst_stride: usize,
+    ) {
+        self.stamp("copy");
+        let kern = self
+            .be
+            .kernel("copy_strided", crate::gemm::copy_strided_spv(), 2, 24);
+        let mut push = [0u8; 24];
+        for (i, v) in [rows, nw, src_off, src_stride, dst_off, dst_stride]
+            .iter()
+            .enumerate()
+        {
+            push[i * 4..i * 4 + 4].copy_from_slice(&(*v as u32).to_ne_bytes());
+        }
+        self.dispatch(
+            kern,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            ((rows * nw) as u32).div_ceil(256),
+        );
+    }
+
     /// Elementwise sigmoid gate: `y[i] = a[i] * sigmoid(b[i])` (Qwen3-Next attention output gate).
     pub fn mul_sigmoid(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
+        self.stamp("mul_sigmoid");
         let kern = self
             .be
             .kernel("mul_sigmoid", crate::gemm::mul_sigmoid_spv(), 3, 4);
@@ -2644,6 +2684,7 @@ impl<'a> Recorder<'a> {
     /// the resident hidden state on the GPU (chained across experts via WAW barriers on `acc`).
     /// In-place elementwise scalar multiply: `y[i] *= scale` for `i < n` (gemma4 layer output scale).
     pub fn scale(&self, y: &dyn Buffer, scale: f32, n: usize) {
+        self.stamp("scale");
         let k = self.be.kernel("scale", crate::gemm::scale_spv(), 1, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
@@ -2654,6 +2695,7 @@ impl<'a> Recorder<'a> {
     /// Elementwise softcap `y[i] = cap·tanh(x[i]/cap)` (gemma final-logit / attn softcap). In-place
     /// safe — bind `x == y`.
     pub fn softcap(&self, x: &dyn Buffer, y: &dyn Buffer, cap: f32, n: usize) {
+        self.stamp("softcap");
         let k = self.be.kernel("softcap", crate::gemm::softcap_spv(), 2, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
@@ -2668,6 +2710,7 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn add_scaled(&self, x: &dyn Buffer, acc: &dyn Buffer, scale: f32, n: usize) {
+        self.stamp("add");
         let k = self
             .be
             .kernel("add_scaled", crate::gemm::add_scaled_spv(), 2, 8);
@@ -2745,6 +2788,7 @@ impl<'a> Recorder<'a> {
 
     /// Elementwise add; in place allowed (`a` may equal `y`).
     pub fn add(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
+        self.stamp("add");
         let k = self.be.kernel("add", crate::gemm::add_spv(), 3, 4);
         self.dispatch(
             k,

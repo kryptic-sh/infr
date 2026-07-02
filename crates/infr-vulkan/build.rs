@@ -46,6 +46,7 @@ fn main() {
         ("conv1d_silu", "conv1d_silu", &[]),
         ("conv1d_silu_par", "conv1d_silu_par", &[]),
         ("conv1d_shift", "conv1d_shift", &[]),
+        ("copy_strided", "copy_strided", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
         ("add", "add", &[]),
         ("add_scaled", "add_scaled", &[]),

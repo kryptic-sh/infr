@@ -585,26 +585,36 @@ impl MetalBackend {
                     // weight block decoded once for all 8 rows, instead of the GEMV kernel
                     // re-streaming the whole weight matrix once per row.
                     let qw = self.weight_qui(weight, g, bindings);
-                    // sgs = simdgroups to launch; tg = threadgroup width. GEMM tiles 8x8 per
-                    // simdgroup (4 simdgroups per threadgroup for the staging tile).
-                    let (kern, sgs, tg): (&'static str, usize, usize) =
-                        if m >= 16 && out_f % 16 == 0 {
-                            let mm = match qw.kern {
-                                "linear_quik4" => "linear_quik4_mm",
-                                "linear_quik6" => "linear_quik6_mm",
-                                _ => "linear_quik8_mm",
-                            };
-                            (mm, m.div_ceil(8) * (out_f / 16), 128)
-                        } else if m > 1 {
-                            let rt = match qw.kern {
-                                "linear_quik4" => "linear_quik4_rt",
-                                "linear_quik6" => "linear_quik6_rt",
-                                _ => "linear_quik8_rt",
-                            };
-                            (rt, m.div_ceil(8) * out_f, 32)
-                        } else {
-                            (qw.kern, out_f, 32)
+                    // sgs = simdgroups to launch; tg = threadgroup width. GEMM tiles 8x16 per
+                    // simdgroup (4 simdgroups per threadgroup for the staging tile). The GEMM
+                    // kernel requires its full 128-thread threadgroup (per-simdgroup staging
+                    // tiles indexed by simdgroup_index_in_threadgroup), so it is gated on the
+                    // pipeline's own thread cap — see the Attention arm for why that cap can
+                    // drop below the kernel's need — and degrades to the row-tiled kernel.
+                    let mm_kern = match qw.kern {
+                        "linear_quik4" => "linear_quik4_mm",
+                        "linear_quik6" => "linear_quik6_mm",
+                        _ => "linear_quik8_mm",
+                    };
+                    let mm_ok = m >= 16
+                        && out_f % 16 == 0
+                        && self
+                            .pipelines
+                            .get(mm_kern)?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
+                    let (kern, sgs, tg): (&'static str, usize, usize) = if mm_ok {
+                        (mm_kern, m.div_ceil(8) * (out_f / 16), 128)
+                    } else if m > 1 {
+                        let rt = match qw.kern {
+                            "linear_quik4" => "linear_quik4_rt",
+                            "linear_quik6" => "linear_quik6_rt",
+                            _ => "linear_quik8_rt",
                         };
+                        (rt, m.div_ceil(8) * out_f, 32)
+                    } else {
+                        (qw.kern, out_f, 32)
+                    };
                     let pso = self.pipelines.get(kern)?;
                     p.extend_from_slice(&qw.dshift.to_ne_bytes());
                     self.encode_tg(
@@ -854,15 +864,49 @@ impl MetalBackend {
                 // simdgroup_matrix flash-attention kernel was built and benched here; it never
                 // beat the 32-way split on prefill — occupancy-starved by its threadgroup tiles —
                 // so it was dropped.)
+                let f16 = g.desc(k_cache).dtype == DType::F16;
                 let split = rows * nh < 128 || kv_len >= 128;
-                let split32 = split && kv_len >= 128 && hd <= 128;
-                let kern = match (g.desc(k_cache).dtype, split, split32) {
-                    (DType::F16, false, _) => "attention_f16kv",
-                    (DType::F16, _, true) => "attnsplit32_f16kv",
-                    (DType::F16, true, false) => "attnsplit_f16kv",
-                    (_, false, _) => "attention_f32",
-                    (_, _, true) => "attnsplit32_f32",
-                    (_, true, false) => "attnsplit_f32",
+                // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup
+                // owns a strided KV slice, so a smaller launch would silently skip positions and
+                // merge uninitialized partials. maxTotalThreadsPerThreadgroup is per-PIPELINE
+                // (register pressure or a paravirtual device can push it below 1024 — GitHub's
+                // macOS CI runners do), so each width is gated on its own pipeline's cap and
+                // degrades to the next-narrower kernel instead of letting `encode_tg` clamp.
+                let fits = |name: &'static str, threads: u64| -> Result<bool> {
+                    Ok(self
+                        .pipelines
+                        .get(name)?
+                        .max_total_threads_per_threadgroup()
+                        >= threads)
+                };
+                let split32 = split
+                    && kv_len >= 128
+                    && hd <= 128
+                    && fits(
+                        if f16 {
+                            "attnsplit32_f16kv"
+                        } else {
+                            "attnsplit32_f32"
+                        },
+                        1024,
+                    )?;
+                let split = split
+                    && (split32
+                        || fits(
+                            if f16 {
+                                "attnsplit_f16kv"
+                            } else {
+                                "attnsplit_f32"
+                            },
+                            256,
+                        )?);
+                let kern = match (f16, split, split32) {
+                    (true, false, _) => "attention_f16kv",
+                    (true, _, true) => "attnsplit32_f16kv",
+                    (true, true, false) => "attnsplit_f16kv",
+                    (false, false, _) => "attention_f32",
+                    (false, _, true) => "attnsplit32_f32",
+                    (false, true, false) => "attnsplit_f32",
                 };
                 let pso = self.pipelines.get(kern)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();

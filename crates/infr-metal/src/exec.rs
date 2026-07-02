@@ -643,18 +643,12 @@ impl MetalBackend {
                             >= 128;
                     p.extend_from_slice(&qw.dshift.to_ne_bytes());
                     if cmm_ok {
-                        let xh = Arc::new(self.device.new_buffer(
-                            (m * in_f * 2).max(4) as u64,
-                            MTLResourceOptions::StorageModeShared,
-                        ));
-                        let cast = self.pipelines.get("cast_f32_f16")?;
-                        let n = (m * in_f) as u32;
-                        self.encode(r, &cast, &[bx.as_ref(), &xh], &n.to_ne_bytes(), m * in_f);
+                        // Reads f32 x directly (casts to f16 while staging) — no cast pass.
                         let pso = self.pipelines.get(cmm_kern)?;
                         self.encode_tg(
                             r,
                             &pso,
-                            &[xh.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
+                            &[bx.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
                             &p,
                             m.div_ceil(32) * (out_f / 64) * 128,
                             128,

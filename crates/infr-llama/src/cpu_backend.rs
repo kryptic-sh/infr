@@ -223,6 +223,39 @@ pub(crate) fn generate_dense_metal(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_metal_session(
+        mtl,
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        &mut None,
+        prompt.len() + max_new + 1,
+        None,
+    )
+}
+
+/// Persistent-session Metal seam runner — the Metal twin of [`generate_dense_gpu_session`]:
+/// weights upload once into `state`, the KV cache is sized to `want_ctx`, and each call prefills
+/// only the suffix that differs from the tokens already materialized in the cache.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_metal_session(
+    mtl: &infr_metal::MetalBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    constraint: Option<&mut crate::grammar::Constraint>,
+) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_backend(
         mtl,
         &|tb, dt, _n| {
@@ -239,9 +272,9 @@ pub(crate) fn generate_dense_metal(
         prompt,
         max_new,
         on_token,
-        &mut None,
-        prompt.len() + max_new + 1,
-        None,
+        state,
+        want_ctx,
+        constraint,
     )
 }
 

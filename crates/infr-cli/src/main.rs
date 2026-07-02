@@ -340,11 +340,20 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             Box::new(infr_llama::model::Qwen35Chat::new_metal(gguf.clone()))
         } else {
             eprintln!(
-                "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph (reference)]"
+                "[metal backend — dense/MoE forward on Apple GPU via the agnostic compute graph, persistent KV session]"
             );
-            Box::new(infr_llama::model::CpuDenseChat::new_metal(
-                infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
-            ))
+            #[cfg(target_os = "macos")]
+            {
+                Box::new(infr_llama::model::MetalSeamChat::new(
+                    infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+                ))
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Box::new(infr_llama::model::CpuDenseChat::new_metal(
+                    infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+                ))
+            }
         }
     } else if std::env::var("INFR_CPU").is_ok() {
         if is_q35 {
@@ -1418,9 +1427,18 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         };
         Some(Box::new(m))
     } else if std::env::var("INFR_METAL").is_ok() {
-        Some(Box::new(infr_llama::model::CpuDenseChat::new_metal(
-            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
-        )))
+        #[cfg(target_os = "macos")]
+        {
+            Some(Box::new(infr_llama::model::MetalSeamChat::new(
+                infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+            )))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some(Box::new(infr_llama::model::CpuDenseChat::new_metal(
+                infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+            )))
+        }
     } else if std::env::var("INFR_CPU").is_ok() {
         Some(Box::new(infr_llama::model::CpuDenseChat::new(
             infr_llama::CpuModel::load(&gguf, tok.as_deref())?,

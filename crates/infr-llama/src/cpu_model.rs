@@ -29,6 +29,17 @@ pub struct DenseVulkanSession {
     max_ctx: usize,
 }
 
+/// A persistent Metal seam session — the Apple-GPU twin of [`DenseVulkanSession`]: owns the
+/// backend, the uploaded weights + KV cache, and the token ids materialized in it, so every later
+/// [`CpuModel::generate_metal_session`] call prefills only the suffix that differs from the
+/// previous turn.
+#[cfg(target_os = "macos")]
+pub struct DenseMetalSession {
+    mtl: infr_metal::MetalBackend,
+    state: Option<crate::cpu_backend::SeamKv>,
+    max_ctx: usize,
+}
+
 impl CpuModel {
     /// Load a model for CPU inference without touching the GPU. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
@@ -175,6 +186,67 @@ impl CpuModel {
             &prompt,
             n_gen,
             |_| {},
+        )?;
+        Ok(stats)
+    }
+
+    /// Open a persistent Metal seam session (the Apple-GPU twin of
+    /// [`vulkan_session`](Self::vulkan_session)): weights uploaded ONCE, KV sized to `max_ctx`,
+    /// later calls prefill only the un-cached suffix.
+    #[cfg(target_os = "macos")]
+    pub fn metal_session(&self, max_ctx: usize) -> Result<DenseMetalSession> {
+        let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+        Ok(DenseMetalSession {
+            mtl,
+            state: None,
+            max_ctx,
+        })
+    }
+
+    /// Greedy generation on the Metal seam through a persistent session (see
+    /// [`metal_session`](Self::metal_session)). `stats.n_prompt` reports the tokens actually
+    /// PREFILLED (the un-cached suffix) — the TTFT-honest count.
+    #[cfg(target_os = "macos")]
+    pub fn generate_metal_session(
+        &self,
+        session: &mut DenseMetalSession,
+        prompt: &str,
+        max_new: usize,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_metal_session_constrained(session, prompt, max_new, None, on_piece)
+    }
+
+    /// [`generate_metal_session`](Self::generate_metal_session) with an optional llguidance
+    /// grammar constraint (serve's forced tool_choice) applied to the decode.
+    #[cfg(target_os = "macos")]
+    pub fn generate_metal_session_constrained(
+        &self,
+        session: &mut DenseMetalSession,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let (_generated, stats) = crate::cpu_backend::generate_dense_metal_session(
+            &session.mtl,
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+            &mut session.state,
+            session.max_ctx,
+            constraint,
         )?;
         Ok(stats)
     }

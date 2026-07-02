@@ -350,14 +350,22 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     }                                                                                             \
 }
 
-// simdgroup_matrix GEMM for prefill (m >= 16, out_f % 16 == 0): one simdgroup per 8x16 output
-// tile; per 16-wide K block, lanes 0..15 decode one output row's block each into a threadgroup
-// tile and four 8x8x8 MMAs consume it — every loaded operand reused 8x by the matrix pipeline
-// (the scalar kernels' ~1:1 load:FMA structure is what capped prefill). Partial last row tile
-// falls back to scalar dots. Requires the full 128-thread threadgroup (host gates on the
-// pipeline cap).
-#define GEMM_KERNEL(NAME, DEC)                                                                    \
-kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
+
+// ---- Cast f32 -> f16 (prefill GEMM feeds on half activations; round-to-nearest-even).
+kernel void cast_f32_f16(device const float* src [[buffer(0)]],
+                         device half*        dst [[buffer(1)]],
+                         constant uint&      n   [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid < n) dst[gid] = (half)src[gid];
+}
+
+// Half-fragment GEMM: same 8x16-tile shape as GEMM_KERNEL, but x and the staged weight tile are
+// f16 and the MMAs run half x half -> float (Apple's mixed-precision simdgroup_multiply_accumulate,
+// double the f32 matrix rate and half the staging bytes). Accumulation stays f32. This is the one
+// path that is NOT bit-exact against the dequant reference: weights and activations round to f16
+// (~5e-4 relative) — the llama.cpp trade, well under quantization error. Decode (GEMV) stays f32.
+#define HGEMM_KERNEL(NAME, DEC)                                                                   \
+kernel void NAME(device const half*   x     [[buffer(0)]],                                       \
                  device const uchar*  codes [[buffer(1)]],                                       \
                  device const uchar*  scm   [[buffer(2)]],                                       \
                  device const uchar*  dd    [[buffer(3)]],                                       \
@@ -367,42 +375,49 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
                  uint lane [[thread_index_in_simdgroup]],                                        \
                  uint sgid [[simdgroup_index_in_threadgroup]]) {                                 \
     uint sg = gid / 32u;                                                                          \
-    uint ntm = (p.m + 7u) / 8u;                                                                   \
+    uint ntm = (p.m + 31u) / 32u;                                                                 \
     uint nto = p.out_f / 16u;                                                                     \
     if (sg >= ntm * nto) return;                                                                  \
     uint tm = sg / nto;                                                                           \
     uint to = sg % nto;                                                                           \
-    uint r0 = tm * 8u;                                                                            \
+    uint r0 = tm * 32u;                                                                           \
     uint o0 = to * 16u;                                                                           \
     uint nb = p.in_f >> 4;                                                                        \
-    threadgroup float wt[4][16 * 16];                                                             \
-    if (r0 + 8u <= p.m) {                                                                         \
-        simdgroup_float8x8 acc0 = simdgroup_float8x8(0.0f);                                       \
-        simdgroup_float8x8 acc1 = simdgroup_float8x8(0.0f);                                       \
+    threadgroup half wt[4][16 * 16];                                                              \
+    if (r0 + 32u <= p.m) {                                                                        \
+        simdgroup_float8x8 acc[4][2];                                                             \
+        for (uint i = 0; i < 4u; i++)                                                             \
+            for (uint jx = 0; jx < 2u; jx++) acc[i][jx] = simdgroup_float8x8(0.0f);               \
         for (uint kb = 0; kb < nb; kb++) {                                                        \
             if (lane < 16u) {                                                                     \
                 ulong bi = (ulong)(o0 + lane) * nb + kb;                                          \
                 float wk[16];                                                                     \
                 DEC(wk)                                                                           \
-                for (uint k2 = 0; k2 < 16u; k2++) wt[sgid][lane * 16u + k2] = wk[k2];             \
+                for (uint k2 = 0; k2 < 16u; k2++) wt[sgid][lane * 16u + k2] = (half)wk[k2];       \
             }                                                                                     \
             simdgroup_barrier(mem_flags::mem_threadgroup);                                        \
-            device const float* xp = x + (ulong)r0 * p.in_f + ((ulong)kb << 4);                   \
-            simdgroup_float8x8 xa, wb;                                                            \
             for (uint kh = 0; kh < 2u; kh++) {                                                    \
-                simdgroup_load(xa, xp + kh * 8u, p.in_f);                                         \
-                simdgroup_load(wb, &wt[sgid][kh * 8u], 16, ulong2(0, 0), true);                   \
-                simdgroup_multiply_accumulate(acc0, xa, wb, acc0);                                \
-                simdgroup_load(wb, &wt[sgid][128u + kh * 8u], 16, ulong2(0, 0), true);            \
-                simdgroup_multiply_accumulate(acc1, xa, wb, acc1);                                \
+                simdgroup_half8x8 wb0, wb1;                                                       \
+                simdgroup_load(wb0, &wt[sgid][kh * 8u], 16, ulong2(0, 0), true);                  \
+                simdgroup_load(wb1, &wt[sgid][128u + kh * 8u], 16, ulong2(0, 0), true);           \
+                for (uint rh = 0; rh < 4u; rh++) {                                                \
+                    simdgroup_half8x8 xa;                                                         \
+                    device const half* xp =                                                       \
+                        x + (ulong)(r0 + rh * 8u) * p.in_f + ((ulong)kb << 4) + kh * 8u;          \
+                    simdgroup_load(xa, xp, p.in_f);                                               \
+                    simdgroup_multiply_accumulate(acc[rh][0], xa, wb0, acc[rh][0]);               \
+                    simdgroup_multiply_accumulate(acc[rh][1], xa, wb1, acc[rh][1]);               \
+                }                                                                                 \
             }                                                                                     \
             simdgroup_barrier(mem_flags::mem_threadgroup);                                        \
         }                                                                                         \
-        simdgroup_store(acc0, dst + (ulong)r0 * p.out_f + o0, p.out_f);                           \
-        simdgroup_store(acc1, dst + (ulong)r0 * p.out_f + o0 + 8u, p.out_f);                      \
+        for (uint rh = 0; rh < 4u; rh++)                                                          \
+            for (uint oh = 0; oh < 2u; oh++)                                                      \
+                simdgroup_store(acc[rh][oh],                                                      \
+                                dst + (ulong)(r0 + rh * 8u) * p.out_f + o0 + oh * 8u, p.out_f);   \
     } else {                                                                                      \
-        /* partial row tile: scalar dot per (row, output) element, 4 per lane */                  \
-        for (uint e = lane; e < 128u; e += 32u) {                                                 \
+        /* partial row tile: scalar dot per (row, output) element */                              \
+        for (uint e = lane; e < 512u; e += 32u) {                                                 \
             uint rr = r0 + e / 16u;                                                               \
             uint o = o0 + (e % 16u);                                                              \
             if (rr >= p.m) continue;                                                              \
@@ -411,8 +426,8 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
                 ulong bi = (ulong)o * nb + kb;                                                    \
                 float wk[16];                                                                     \
                 DEC(wk)                                                                           \
-                device const float* xb = x + (ulong)rr * p.in_f + ((ulong)kb << 4);               \
-                for (uint k2 = 0; k2 < 16u; k2++) a2 += xb[k2] * wk[k2];                          \
+                device const half* xb = x + (ulong)rr * p.in_f + ((ulong)kb << 4);                \
+                for (uint k2 = 0; k2 < 16u; k2++) a2 += (float)xb[k2] * (float)((half)wk[k2]);    \
             }                                                                                     \
             dst[(ulong)rr * p.out_f + o] = a2;                                                    \
         }                                                                                         \
@@ -429,11 +444,12 @@ RT_KERNEL(linear_quik6_rt, DEC16_K6)
 RT_KERNEL(linear_quik8_rt, DEC16_K8)
 RT_KERNEL(linear_q4k_rt, DEC16_Q4K)
 RT_KERNEL(linear_q6k_rt, DEC16_Q6K)
-GEMM_KERNEL(linear_quik4_mm, DEC16_K4)
-GEMM_KERNEL(linear_quik6_mm, DEC16_K6)
-GEMM_KERNEL(linear_quik8_mm, DEC16_K8)
-GEMM_KERNEL(linear_q4k_mm, DEC16_Q4K)
-GEMM_KERNEL(linear_q6k_mm, DEC16_Q6K)
+HGEMM_KERNEL(linear_quik4_hmm, DEC16_K4)
+HGEMM_KERNEL(linear_quik6_hmm, DEC16_K6)
+HGEMM_KERNEL(linear_quik8_hmm, DEC16_K8)
+HGEMM_KERNEL(linear_q4k_hmm, DEC16_Q4K)
+HGEMM_KERNEL(linear_q6k_hmm, DEC16_Q6K)
+
 
 // ---- RoPE (NEOX): rotate the first rope_dim of each head; dims beyond pass through. One thread
 // per (row, head). `pos`/`ff` buffers are f32. `has_ff` selects the per-pair freq divisor.

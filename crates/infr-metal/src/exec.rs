@@ -611,44 +611,63 @@ impl MetalBackend {
                     // tiles indexed by simdgroup_index_in_threadgroup), so it is gated on the
                     // pipeline's own thread cap — see the Attention arm for why that cap can
                     // drop below the kernel's need — and degrades to the row-tiled kernel.
-                    let mm_kern = match qw.kern {
-                        "linear_quik4" => "linear_quik4_mm",
-                        "linear_quik6" => "linear_quik6_mm",
-                        "linear_q4k" => "linear_q4k_mm",
-                        "linear_q6k" => "linear_q6k_mm",
-                        _ => "linear_quik8_mm",
+                    let hmm_kern = match qw.kern {
+                        "linear_quik4" => "linear_quik4_hmm",
+                        "linear_quik6" => "linear_quik6_hmm",
+                        "linear_q4k" => "linear_q4k_hmm",
+                        "linear_q6k" => "linear_q6k_hmm",
+                        _ => "linear_quik8_hmm",
                     };
-                    let mm_ok = m >= 16
+                    let hmm_ok = m >= 16
                         && out_f % 16 == 0
                         && self
                             .pipelines
-                            .get(mm_kern)?
+                            .get(hmm_kern)?
                             .max_total_threads_per_threadgroup()
                             >= 128;
-                    let (kern, sgs, tg): (&'static str, usize, usize) = if mm_ok {
-                        (mm_kern, m.div_ceil(8) * (out_f / 16), 128)
-                    } else if m > 1 {
-                        let rt = match qw.kern {
-                            "linear_quik4" => "linear_quik4_rt",
-                            "linear_quik6" => "linear_quik6_rt",
-                            "linear_q4k" => "linear_q4k_rt",
-                            "linear_q6k" => "linear_q6k_rt",
-                            _ => "linear_quik8_rt",
-                        };
-                        (rt, m.div_ceil(8) * out_f, 32)
-                    } else {
-                        (qw.kern, out_f, 32)
-                    };
-                    let pso = self.pipelines.get(kern)?;
                     p.extend_from_slice(&qw.dshift.to_ne_bytes());
-                    self.encode_tg(
-                        r,
-                        &pso,
-                        &[bx.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
-                        &p,
-                        sgs * 32,
-                        tg,
-                    );
+                    if hmm_ok {
+                        // Prefill GEMM runs on half fragments (see `HGEMM_KERNEL`): cast x to a
+                        // transient f16 buffer first, then one GEMM dispatch reads it.
+                        let xh = Arc::new(self.device.new_buffer(
+                            (m * in_f * 2).max(4) as u64,
+                            MTLResourceOptions::StorageModeShared,
+                        ));
+                        let cast = self.pipelines.get("cast_f32_f16")?;
+                        let n = (m * in_f) as u32;
+                        self.encode(r, &cast, &[bx.as_ref(), &xh], &n.to_ne_bytes(), m * in_f);
+                        let pso = self.pipelines.get(hmm_kern)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[xh.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
+                            &p,
+                            m.div_ceil(32) * (out_f / 16) * 32,
+                            128,
+                        );
+                    } else {
+                        let (kern, sgs): (&'static str, usize) = if m > 1 {
+                            let rt = match qw.kern {
+                                "linear_quik4" => "linear_quik4_rt",
+                                "linear_quik6" => "linear_quik6_rt",
+                                "linear_q4k" => "linear_q4k_rt",
+                                "linear_q6k" => "linear_q6k_rt",
+                                _ => "linear_quik8_rt",
+                            };
+                            (rt, m.div_ceil(8) * out_f)
+                        } else {
+                            (qw.kern, out_f)
+                        };
+                        let pso = self.pipelines.get(kern)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[bx.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
+                            &p,
+                            sgs * 32,
+                            32,
+                        );
+                    }
                 } else {
                     // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
                     let bw = self.weight_buf(weight, g, bindings);

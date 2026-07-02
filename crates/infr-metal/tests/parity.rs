@@ -306,9 +306,39 @@ fn synth_q6k(n_elem: usize, seed: u32) -> Vec<u8> {
 // Shared quant-Linear parity check: Metal dequants `wbytes` (via infr_gguf) and matmuls; compare to
 // a reference that dequants the SAME bytes and matmuls — isolates Metal's quant-weight path.
 fn check_quant_linear_parity(dtype: DType, wbytes: Vec<u8>, m: usize, in_f: usize, out_f: usize) {
+    check_quant_linear_parity_tol(dtype, wbytes, m, in_f, out_f, 1e-3);
+}
+
+fn check_quant_linear_parity_tol(
+    dtype: DType,
+    wbytes: Vec<u8>,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    tol: f32,
+) {
+    check_quant_linear_parity_impl(dtype, wbytes, m, in_f, out_f, tol, false);
+}
+
+fn check_quant_linear_parity_impl(
+    dtype: DType,
+    wbytes: Vec<u8>,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    tol: f32,
+    half_ops: bool,
+) {
     use infr_gguf::dequant::dequant_block;
-    let xs = rand_f32(m * in_f, 24);
-    let wref = dequant_block(dtype, &wbytes).unwrap();
+    let mut xs = rand_f32(m * in_f, 24);
+    let mut wref = dequant_block(dtype, &wbytes).unwrap();
+    // Half-fragment GEMM path (m >= 16): the kernel rounds weights and activations to f16, so
+    // the reference mirrors that rounding — the comparison then checks the kernel, not f16.
+    if half_ops {
+        for v in xs.iter_mut().chain(wref.iter_mut()) {
+            *v = half::f16::from_f32(*v).to_f32();
+        }
+    }
     let reference = ref_linear(&xs, &wref, m, in_f, out_f);
 
     let mut g = Graph::new();
@@ -334,8 +364,8 @@ fn check_quant_linear_parity(dtype: DType, wbytes: Vec<u8>, m: usize, in_f: usiz
     for (i, (r, mm)) in reference.iter().zip(mtl.iter()).enumerate() {
         let err = (r - mm).abs() / r.abs().max(1.0);
         assert!(
-            err <= 1e-3,
-            "{dtype:?} elem {i}: ref={r} metal={mm} err={err}"
+            err <= tol,
+            "{dtype:?} elem {i}: ref={r} metal={mm} err={err} > {tol}"
         );
     }
 }
@@ -463,14 +493,33 @@ fn linear_q6k_gemv_matches_dequant_reference() {
 #[ignore = "requires a Metal GPU"]
 fn linear_q4k_gemm_matches_dequant_reference() {
     let (m, in_f, out_f) = (18usize, 256usize, 96usize);
-    check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 28), m, in_f, out_f);
+    // m >= 16 runs the half-fragment GEMM (f16 operands, f32 accumulate — the llama.cpp trade,
+    // well under quantization error); the reference below rounds its operands the same way.
+    check_quant_linear_parity_impl(
+        DType::Q4K,
+        synth_q4k(out_f * in_f, 28),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
 }
 
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q6k_gemm_matches_dequant_reference() {
     let (m, in_f, out_f) = (18usize, 256usize, 96usize);
-    check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 29), m, in_f, out_f);
+    // Half-fragment GEMM path — see the Q4K GEMM test for the f16-operand rationale.
+    check_quant_linear_parity_impl(
+        DType::Q6K,
+        synth_q6k(out_f * in_f, 29),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
 }
 
 #[test]

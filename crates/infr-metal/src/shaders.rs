@@ -664,7 +664,7 @@ kernel void linear_q6k_add(device const float*  x     [[buffer(0)]],
 // scratch; the down variant (EPI 2) reads its slot's activation row and writes w[slot]*y to its
 // slot's output row — `moe_reduce` then folds the weighted expert sum (slot-ascending, the CPU
 // reference's accumulation order).
-struct MoeLinParams { uint m; uint in_f; uint out_f; uint dshift; uint n_used; };
+struct MoeLinParams { uint m; uint in_f; uint out_f; uint dshift; uint n_used; uint row0; };
 #define MOE_WRAP(NAME, BODY, EPI, ROWB)                                                           \
 kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
                  device const uchar*  codes [[buffer(1)]],                                       \
@@ -676,15 +676,20 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
                  uint gid  [[thread_position_in_grid]],                                          \
                  uint lane [[thread_index_in_simdgroup]]) {                                      \
     uint sg = gid / 32u;                                                                          \
-    uint per_out = p.out_f >> 1;         /* simdgroups per expert (2 rows each) */               \
-    uint slot = sg / per_out;                                                                     \
-    uint e = tbl[slot];                                                                           \
-    float w = as_type<float>(tbl[16u + slot]); /* weights after the 16-slot index block */        \
+    uint per_out = p.out_f >> 1;         /* simdgroups per expert (2 weight rows each) */        \
+    uint row = sg / (p.n_used * per_out);          /* token row within this chunk */             \
+    uint rem = sg % (p.n_used * per_out);                                                         \
+    uint slot = rem / per_out;                                                                    \
+    uint e = tbl[(p.row0 + row) * 32u + slot];                                                    \
+    float w = as_type<float>(tbl[(p.row0 + row) * 32u + 16u + slot]);                             \
     ulong row_b = (ulong)(p.in_f >> 8) * ROWB;                                                    \
     device const uchar* ec = codes + (ulong)e * p.out_f * row_b;                                  \
-    device const float* xs = (EPI == 2) ? x + slot * p.in_f : x;                                  \
-    uint g2 = (sg % per_out) * 32u + lane;   /* body sees a per-expert grid */                    \
-    BODY<EPI>(xs, ec, dst + slot * p.out_f, xs, p, w, true, g2, lane);                            \
+    /* gate/up read the token's row of x [rows, ne]; down reads its (row, slot) activation */     \
+    device const float* xs = (EPI == 2) ? x + (ulong)(row * p.n_used + slot) * p.in_f             \
+                                        : x + (ulong)(p.row0 + row) * p.in_f;                     \
+    device float* ds = dst + (ulong)(row * p.n_used + slot) * p.out_f;                            \
+    uint g2 = (rem % per_out) * 32u + lane;  /* body sees a per-(row, expert) grid */             \
+    BODY<EPI>(xs, ec, ds, xs, p, w, true, g2, lane);                                              \
 }
 MOE_WRAP(linear_q4k_moe,     linear_q4k_body, 0, 144ul)
 MOE_WRAP(linear_q4k_moe_acc, linear_q4k_body, 2, 144ul)
@@ -692,25 +697,170 @@ MOE_WRAP(linear_q6k_moe,     linear_q6k_body, 0, 210ul)
 MOE_WRAP(linear_q6k_moe_acc, linear_q6k_body, 2, 210ul)
 #undef MOE_WRAP
 
+// ---- Expert-grouped GEMM for batched MoE prefill (the llama.cpp mul_mm_id shape). Rather than
+// one GEMV per (token, slot) — no MMA, compute-bound at prefill widths — `moe_map` groups the
+// chunk's (token, slot) pairs by EXPERT (one thread per expert scans the routing table, so each
+// expert's list is token-ascending and deterministic), and the `*_cmm_id` kernels run the shared
+// cooperative-GEMM tile over each expert's token group: grid = expert x token-tile x out-tile,
+// tiles past an expert's count return before any barrier, activations stage through the same
+// pre-transposed 8x8 layout with the token row resolved through the id list, and the output
+// SCATTERS through threadgroup staging to each token's (row, slot) scratch row. The down variant
+// folds the routing weight during the scatter. Ids are chunk-relative (`row0` rebases).
+struct MoeMapParams { uint n_expert; uint n_used; uint rows; uint row0; uint cap; };
+kernel void moe_map(device const uint* tbl [[buffer(0)]],
+                    device uint*       ids [[buffer(1)]],
+                    device uint*       tpe [[buffer(2)]],
+                    constant MoeMapParams& p [[buffer(3)]],
+                    uint tid [[thread_position_in_grid]]) {
+    if (tid >= p.n_expert) return;
+    uint n = 0;
+    for (uint r = 0; r < p.rows; r++) {
+        device const uint* rt = tbl + (ulong)(p.row0 + r) * 32u;
+        for (uint u = 0; u < p.n_used; u++) {
+            if (rt[u] == tid) {
+                ids[tid * p.cap + n] = r * p.n_used + u;
+                n++;
+            }
+        }
+    }
+    tpe[tid] = n;
+}
+
+struct MoeCmmParams { uint in_f; uint out_f; uint n_used; uint cap; uint row0; uint ntt; };
+// DIVROW: gate/up read x[row0 + t/n_used]; down (DIVROW=0) reads its (row, slot) activation row.
+// WSCALE: fold the routing weight tbl[(row0 + t/n_used)*32 + 16 + t%n_used] during the scatter.
+#define MOE_CMM_KERNEL(NAME, DEC, DIVROW, WSCALE)                                                 \
+kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
+                 device const uchar*  codes [[buffer(1)]],                                       \
+                 device const uchar*  scm   [[buffer(2)]],                                       \
+                 device const uchar*  dd    [[buffer(3)]],                                       \
+                 device float*        dst   [[buffer(4)]],                                       \
+                 device const uint*   ids   [[buffer(5)]],                                       \
+                 device const uint*   tpe   [[buffer(6)]],                                       \
+                 device const uint*   tbl   [[buffer(7)]],                                       \
+                 constant MoeCmmParams& p   [[buffer(8)]],                                       \
+                 uint gid  [[thread_position_in_grid]],                                          \
+                 uint lane [[thread_index_in_simdgroup]],                                        \
+                 uint sgid [[simdgroup_index_in_threadgroup]]) {                                 \
+    uint tgix = gid / 128u;                                                                       \
+    uint nto = p.out_f / 64u;                                                                     \
+    uint e = tgix / (p.ntt * nto);                                                                \
+    uint rem = tgix % (p.ntt * nto);                                                              \
+    uint tt0 = (rem / nto) * 32u;                                                                 \
+    uint ro = (rem % nto) * 64u;                                                                  \
+    uint cnt = tpe[e];                                                                            \
+    if (tt0 >= cnt) return;   /* uniform per threadgroup, before any barrier */                   \
+    uint nr1 = min(32u, cnt - tt0);                                                               \
+    uint tid = sgid * 32u + lane;                                                                 \
+                                                                                                  \
+    threadgroup float shraw[2048];                                                                \
+    threadgroup half* sa = (threadgroup half*)shraw;                                              \
+    threadgroup half* sb = ((threadgroup half*)shraw) + 2048u;                                    \
+                                                                                                  \
+    uint lr0 = tid >> 1;                                                                          \
+    uint il0 = tid & 1u;                                                                          \
+    uint lr1 = tid >> 2;                                                                          \
+    uint iyk = (tid & 3u) * 8u;                                                                   \
+    uint lr1c = min(lr1, nr1 - 1u);                                                               \
+    uint tident = ids[e * p.cap + tt0 + lr1c];                                                    \
+    uint xrow = DIVROW ? (p.row0 + tident / p.n_used) : tident;                                   \
+                                                                                                  \
+    simdgroup_half8x8 ma[4];                                                                      \
+    simdgroup_half8x8 mb[2];                                                                      \
+    simdgroup_float8x8 mc[8];                                                                     \
+    for (uint i = 0; i < 8u; i++) mc[i] = simdgroup_float8x8(0.0f);                               \
+                                                                                                  \
+    uint nb = p.in_f >> 4;                                                                        \
+    ulong ebase = (ulong)e * p.out_f * nb;   /* expert's first block index */                     \
+    for (uint k0 = 0; k0 < p.in_f; k0 += 32u) {                                                   \
+        ulong bi = ebase + (ulong)(ro + lr0) * nb + (ulong)(k0 >> 4) + il0;                       \
+        float wk[16];                                                                             \
+        DEC(wk)                                                                                   \
+        device const float4* yy =                                                                 \
+            (device const float4*)(x + (ulong)xrow * p.in_f + k0 + iyk);                          \
+        float4 yv0 = yy[0];                                                                       \
+        float4 yv1 = yy[1];                                                                       \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
+        {                                                                                         \
+            uint sy = lr0 >> 3;                                                                   \
+            uint lx = lr0 & 7u;                                                                   \
+            for (uint i = 0; i < 16u; i++) {                                                      \
+                uint sx = 2u * il0 + (i >> 3);                                                    \
+                sa[64u * (8u * sx + sy) + 8u * (i & 7u) + lx] = (half)wk[i];                      \
+            }                                                                                     \
+        }                                                                                         \
+        {                                                                                         \
+            uint ib = 4u * (tid & 3u) + (lr1 >> 3);                                               \
+            uint ly = lr1 & 7u;                                                                   \
+            threadgroup half4* sb4 = (threadgroup half4*)(sb + 64u * ib + 8u * ly);               \
+            sb4[0] = half4(yv0);                                                                  \
+            sb4[1] = half4(yv1);                                                                  \
+        }                                                                                         \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
+        threadgroup const half* lsma = sa + 4u * 64u * (sgid & 1u);                               \
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgid >> 1);                               \
+        for (uint ik = 0; ik < 4u; ik++) {                                                        \
+            simdgroup_barrier(mem_flags::mem_none);                                               \
+            for (uint i = 0; i < 4u; i++) simdgroup_load(ma[i], lsma + 64u * i, 8);               \
+            simdgroup_barrier(mem_flags::mem_none);                                               \
+            for (uint i = 0; i < 2u; i++) simdgroup_load(mb[i], lsmb + 64u * i, 8);               \
+            simdgroup_barrier(mem_flags::mem_none);                                               \
+            for (uint i = 0; i < 8u; i++)                                                         \
+                simdgroup_multiply_accumulate(mc[i], mb[i >> 2], ma[i & 3u], mc[i]);              \
+            lsma += 8u * 64u;                                                                     \
+            lsmb += 4u * 64u;                                                                     \
+        }                                                                                         \
+    }                                                                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                              \
+                                                                                                  \
+    /* scatter through threadgroup staging: token rows are non-contiguous scratch rows */         \
+    threadgroup float* tc = shraw + 32u * (sgid & 1u) + (16u * (sgid >> 1)) * 64u;                \
+    for (uint i = 0; i < 8u; i++)                                                                 \
+        simdgroup_store(mc[i], tc + 8u * (i & 3u) + 8u * 64u * (i >> 2), 64u);                    \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                              \
+    if (sgid == 0u) {                                                                             \
+        for (uint j = lane; j < nr1; j += 32u) {                                                  \
+            uint t = ids[e * p.cap + tt0 + j];                                                    \
+            float w = WSCALE                                                                      \
+                ? as_type<float>(tbl[(ulong)(p.row0 + t / p.n_used) * 32u + 16u + t % p.n_used])  \
+                : 1.0f;                                                                           \
+            device float* d2 = dst + (ulong)t * p.out_f + ro;                                     \
+            threadgroup const float* c2 = shraw + j * 64u;                                        \
+            for (uint i = 0; i < 64u; i++) d2[i] = c2[i] * w;                                     \
+        }                                                                                         \
+    }                                                                                             \
+}
+MOE_CMM_KERNEL(linear_q4k_cmm_id,   DEC16_Q4K, 1, 0)
+MOE_CMM_KERNEL(linear_q4k_cmm_id_w, DEC16_Q4K, 0, 1)
+MOE_CMM_KERNEL(linear_q6k_cmm_id,   DEC16_Q6K, 1, 0)
+MOE_CMM_KERNEL(linear_q6k_cmm_id_w, DEC16_Q6K, 0, 1)
+#undef MOE_CMM_KERNEL
+
 // Weighted expert sum: dst[i] = sum_u y[u*ne + i] (weights already folded into y by the down
 // GEMV's EPI-2 epilogue; slot-ascending order matches the CPU reference).
-struct MoeReduceParams { uint ne; uint n_used; };
+struct MoeReduceParams { uint ne; uint n_used; uint rows; uint row0; };
 kernel void moe_reduce(device const float* y   [[buffer(0)]],
                        device float*       dst [[buffer(1)]],
                        constant MoeReduceParams& p [[buffer(2)]],
                        uint gid [[thread_position_in_grid]]) {
-    if (gid >= p.ne) return;
+    if (gid >= p.rows * p.ne) return;
+    uint row = gid / p.ne;
+    uint i = gid % p.ne;
     float s = 0.0f;
-    for (uint u = 0; u < p.n_used; u++) s += y[u * p.ne + gid];
-    dst[gid] = s;
+    for (uint u = 0; u < p.n_used; u++) s += y[(row * p.n_used + u) * p.ne + i];
+    dst[(p.row0 + row) * p.ne + i] = s;
 }
 
 struct MoeTopkParams { uint n_expert; uint n_used; float scale; };
-kernel void moe_topk(device const float* logits [[buffer(0)]],
-                     device uint*        tbl    [[buffer(1)]],
+kernel void moe_topk(device const float* logits_all [[buffer(0)]],
+                     device uint*        tbl_all    [[buffer(1)]],
                      constant MoeTopkParams& p  [[buffer(2)]],
                      uint gid [[thread_position_in_grid]]) {
-    uint lane = gid;   // one simdgroup (32 threads); each lane owns experts e = lane + 32j
+    // one simdgroup (32 threads) per token row; each lane owns experts e = lane + 32j
+    uint row = gid / 32u;
+    uint lane = gid % 32u;
+    device const float* logits = logits_all + (ulong)row * p.n_expert;
+    device uint* tbl = tbl_all + row * 32u;
     float lmax = -MAXFLOAT;
     for (uint e = lane; e < p.n_expert; e += 32u) lmax = max(lmax, logits[e]);
     float maxl = simd_max(lmax);

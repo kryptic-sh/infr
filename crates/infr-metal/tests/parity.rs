@@ -1243,6 +1243,109 @@ fn moe_ffn_q6k_device_parity() {
     moe_quant_test(DType::Q6K, synth_q6k, 90);
 }
 
+// Batched rows through the device MoE path (rows spanning two 256-row chunks): every row routes
+// independently; parity vs the CPU reference's per-row loop.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_batched_rows_parity() {
+    let (rows, ne, n_expert, n_used, nff) = (300usize, 256usize, 8usize, 3usize, 256usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+    let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
+    let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+    let up = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
+    let down = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q4K));
+    let dst = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+    g.push(Op::MoeFfn {
+        x,
+        router,
+        gate_exps: gate,
+        up_exps: up,
+        down_exps: down,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: nff as u32,
+        scale: 1.0,
+        act: infr_core::graph::Activation::Silu,
+    });
+    // x scaled down: the ~50x-real synthetic weights would push gate/up activations past f16
+    // range (the kernels' operand precision) with unit-scale inputs — real hidden states don't.
+    let xs_small: Vec<f32> = rand_f32(rows * ne, 95).iter().map(|v| v * 0.02).collect();
+    let bound = vec![
+        (x, f32_bytes(&xs_small)),
+        (router, f32_bytes(&rand_f32(n_expert * ne, 96))),
+        (gate, synth_q4k(n_expert * nff * ne, 97)),
+        (up, synth_q4k(n_expert * nff * ne, 98)),
+        (down, synth_q4k(n_expert * ne * nff, 99)),
+    ];
+    // Reference mirrors the grouped-GEMM path's numerics (same policy as the dense GEMM parity
+    // tests): expert weights and stage inputs round to f16 (the kernels' operand precision, f32
+    // accumulate), router/top-k stay f32. Residual tolerance covers reassociation over the
+    // ~50x-real-magnitude synthetic weights' cancellation tail.
+    let r16 =
+        |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect() };
+    let xs: Vec<f32> = {
+        let (_, b) = &bound[0];
+        bytemuck::cast_slice::<u8, f32>(b).to_vec()
+    };
+    let rw: Vec<f32> = {
+        let (_, b) = &bound[1];
+        bytemuck::cast_slice::<u8, f32>(b).to_vec()
+    };
+    use infr_gguf::dequant::dequant_block;
+    let gw = r16(&dequant_block(DType::Q4K, &bound[2].1).unwrap());
+    let uw = r16(&dequant_block(DType::Q4K, &bound[3].1).unwrap());
+    let dw = r16(&dequant_block(DType::Q4K, &bound[4].1).unwrap());
+    let mut reference = vec![0f32; rows * ne];
+    for row in 0..rows {
+        let x = &xs[row * ne..(row + 1) * ne];
+        let logits: Vec<f32> = (0..n_expert)
+            .map(|e| (0..ne).map(|i| rw[e * ne + i] * x[i]).sum::<f32>())
+            .collect();
+        let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+        let psum: f32 = probs.iter().sum();
+        let mut idx: Vec<usize> = (0..n_expert).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        idx.truncate(n_used);
+        let wsum: f32 = idx.iter().map(|&e| probs[e] / psum).sum::<f32>().max(1e-20);
+        let x16 = r16(x);
+        for &e in &idx {
+            let gs = &gw[e * nff * ne..(e + 1) * nff * ne];
+            let us = &uw[e * nff * ne..(e + 1) * nff * ne];
+            let ds = &dw[e * ne * nff..(e + 1) * ne * nff];
+            let gate: Vec<f32> = (0..nff)
+                .map(|o| (0..ne).map(|i| gs[o * ne + i] * x16[i]).sum::<f32>())
+                .collect();
+            let up: Vec<f32> = (0..nff)
+                .map(|o| (0..ne).map(|i| us[o * ne + i] * x16[i]).sum::<f32>())
+                .collect();
+            let act: Vec<f32> = (0..nff)
+                .map(|i| {
+                    let g = gate[i];
+                    (g / (1.0 + (-g).exp())) * up[i]
+                })
+                .collect();
+            let a16 = r16(&act);
+            let w_e = (probs[e] / psum) / wsum;
+            for o in 0..ne {
+                let y: f32 = (0..nff).map(|i| ds[o * nff + i] * a16[i]).sum();
+                reference[row * ne + o] += w_e * y;
+            }
+        }
+    }
+    let mtl = run(
+        &MetalBackend::new().expect("metal backend"),
+        &g,
+        &bound,
+        dst,
+        rows * ne,
+    );
+    assert_close(&reference, &mtl, 5e-3, "moe batched grouped");
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn conv1d_silu_parity() {

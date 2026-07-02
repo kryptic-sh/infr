@@ -1521,6 +1521,9 @@ impl MetalBackend {
                     n_used as usize,
                     n_ff_exp as usize,
                 );
+                // Rows inferred from the bound activation shape (the seam's batched prefill
+                // passes [rows, ne]); each row routes independently.
+                let rows = g.desc(x).numel() / ne;
                 // Device path for K-quant experts (the shapes real MoE checkpoints ship): router
                 // GEMV -> on-device top-k -> expert-BATCHED GEMV stages picking their weight
                 // slices from the device expert table, weighted sum via a final reduce. Seven
@@ -1547,12 +1550,14 @@ impl MetalBackend {
                     && moe_kern(ddt2).is_some();
                 if device_ok {
                     let bx = self.ensure_device(r, x);
-                    let bd = self.dev_dst(r, dst, ne);
-                    // Router logits: small f32 GEMV over the dequant-cached router weight.
+                    let bd = self.dev_dst(r, dst, rows * ne);
+                    // Router logits for ALL rows (one GEMV-per-(row, expert) dispatch over the
+                    // dequant-cached router weight), then per-row top-k into the [rows, 32]
+                    // expert table (idx in slots 0..16, f32 weights in 16..32).
                     let rw = self.weight_buf(router, g, bindings);
-                    let logits = self.scratch_buf(n_expert, 0);
+                    let logits = self.scratch_buf(rows * n_expert, 0);
                     let pso = self.pipelines.get("linear_f32")?;
-                    let mut p = 1u32.to_ne_bytes().to_vec();
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(ne as u32).to_ne_bytes());
                     p.extend_from_slice(&(n_expert as u32).to_ne_bytes());
                     self.encode_tg(
@@ -1560,102 +1565,243 @@ impl MetalBackend {
                         &pso,
                         &[bx.as_ref(), rw.as_ref(), logits.as_ref()],
                         &p,
-                        n_expert * 32,
+                        rows * n_expert * 32,
                         32,
                     );
-                    // Top-k + weights into the fixed 32-slot expert table.
-                    let tbl = self.scratch_buf(32, 1);
+                    let tbl = self.scratch_buf(rows * 32, 1);
                     let pso = self.pipelines.get("moe_topk")?;
                     let mut p = (n_expert as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(n_used as u32).to_ne_bytes());
                     p.extend_from_slice(&scale.to_ne_bytes());
-                    self.encode_tg(r, &pso, &[logits.as_ref(), tbl.as_ref()], &p, 32, 32);
-                    // Expert FFN, batched over the selected experts — one dispatch per stage
-                    // (gate, up, act, down, reduce), slots resolved from the table in-kernel.
+                    self.encode_tg(r, &pso, &[logits.as_ref(), tbl.as_ref()], &p, rows * 32, 32);
+                    // Expert FFN, batched over (chunk rows x selected experts) — one dispatch per
+                    // stage per chunk; chunking bounds the expert scratch (a full 8k-row prefill
+                    // would need ~0.5 GB of it).
                     let gq = self.weight_qui(gate_exps, g, bindings);
                     let uq = self.weight_qui(up_exps, g, bindings);
                     let dq = self.weight_qui(down_exps, g, bindings);
-                    let gate_t = self.scratch_buf(n_used * nffx, 2);
-                    let up_t = self.scratch_buf(n_used * nffx, 3);
-                    let act_t = self.scratch_buf(n_used * nffx, 4);
-                    let ydown = self.scratch_buf(n_used * ne, 5);
+                    const CHUNK: usize = 256;
+                    let chunk = rows.min(CHUNK);
+                    let gate_t = self.scratch_buf(chunk * n_used * nffx, 2);
+                    let up_t = self.scratch_buf(chunk * n_used * nffx, 3);
+                    let act_t = self.scratch_buf(chunk * n_used * nffx, 4);
+                    let ydown = self.scratch_buf(chunk * n_used * ne, 5);
                     let act_code: u32 = match act {
                         infr_core::graph::Activation::Silu => 0,
                         infr_core::graph::Activation::Gelu => 1,
                         infr_core::graph::Activation::Sigmoid => 2,
                     };
-                    let pack = |in_f: usize, out_f: usize| -> Vec<u8> {
+                    let pack = |in_f: usize, out_f: usize, row0: usize| -> Vec<u8> {
                         let mut p = 1u32.to_ne_bytes().to_vec();
                         p.extend_from_slice(&(in_f as u32).to_ne_bytes());
                         p.extend_from_slice(&(out_f as u32).to_ne_bytes());
                         p.extend_from_slice(&0u32.to_ne_bytes()); // dshift (native kernels)
                         p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                        p.extend_from_slice(&(row0 as u32).to_ne_bytes());
                         p
                     };
-                    let pso = self.pipelines.get(moe_kern(gdt2).unwrap().0)?;
-                    self.encode_tg(
-                        r,
-                        &pso,
-                        &[
-                            bx.as_ref(),
-                            &gq.codes,
-                            &gq.scm,
-                            &gq.dd,
-                            gate_t.as_ref(),
-                            tbl.as_ref(),
-                        ],
-                        &pack(ne, nffx),
-                        n_used * (nffx / 2) * 32,
-                        32,
-                    );
-                    let pso = self.pipelines.get(moe_kern(udt2).unwrap().0)?;
-                    self.encode_tg(
-                        r,
-                        &pso,
-                        &[
-                            bx.as_ref(),
-                            &uq.codes,
-                            &uq.scm,
-                            &uq.dd,
-                            up_t.as_ref(),
-                            tbl.as_ref(),
-                        ],
-                        &pack(ne, nffx),
-                        n_used * (nffx / 2) * 32,
-                        32,
-                    );
-                    let pso = self.pipelines.get("gatedact_f32")?;
-                    let mut p = (n_used as u32).to_ne_bytes().to_vec();
-                    p.extend_from_slice(&(nffx as u32).to_ne_bytes());
-                    p.extend_from_slice(&act_code.to_ne_bytes());
-                    p.extend_from_slice(&0u32.to_ne_bytes()); // up_off
-                    self.encode(
-                        r,
-                        &pso,
-                        &[gate_t.as_ref(), up_t.as_ref(), act_t.as_ref()],
-                        &p,
-                        n_used * nffx,
-                    );
-                    let pso = self.pipelines.get(moe_kern(ddt2).unwrap().1)?;
-                    self.encode_tg(
-                        r,
-                        &pso,
-                        &[
-                            act_t.as_ref(),
-                            &dq.codes,
-                            &dq.scm,
-                            &dq.dd,
-                            ydown.as_ref(),
-                            tbl.as_ref(),
-                        ],
-                        &pack(nffx, ne),
-                        n_used * (ne / 2) * 32,
-                        32,
-                    );
-                    let pso = self.pipelines.get("moe_reduce")?;
-                    let mut p = (ne as u32).to_ne_bytes().to_vec();
-                    p.extend_from_slice(&(n_used as u32).to_ne_bytes());
-                    self.encode(r, &pso, &[ydown.as_ref(), bd.as_ref()], &p, ne);
+                    // Expert-grouped GEMM for prefill-width rows (the llama.cpp mul_mm_id
+                    // shape): group the chunk's (token, slot) pairs by expert on-device, then
+                    // run the cooperative-GEMM tile per expert over its token group — MMA
+                    // compute instead of one GEMV per pair. Small row counts (decode) keep the
+                    // GEMV stages below.
+                    let grouped =
+                        rows >= 16 && ne % 64 == 0 && nffx % 64 == 0 && n_expert <= 1024 && {
+                            let kn = if gdt2 == DType::Q4K {
+                                "linear_q4k_cmm_id"
+                            } else {
+                                "linear_q6k_cmm_id"
+                            };
+                            self.pipelines
+                                .get(kn)
+                                .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                                .unwrap_or(false)
+                        };
+                    let ids = self.scratch_buf(n_expert * rows.min(CHUNK), 6);
+                    let tpe = self.scratch_buf(n_expert, 7);
+                    let cmm_id = |dt: DType, scale: bool| -> &'static str {
+                        match (dt, scale) {
+                            (DType::Q4K, false) => "linear_q4k_cmm_id",
+                            (DType::Q4K, true) => "linear_q4k_cmm_id_w",
+                            (DType::Q6K, false) => "linear_q6k_cmm_id",
+                            _ => "linear_q6k_cmm_id_w",
+                        }
+                    };
+                    for row0 in (0..rows).step_by(CHUNK) {
+                        let cr = (rows - row0).min(CHUNK);
+                        if grouped {
+                            let cap = rows.min(CHUNK);
+                            // map: one thread per expert scans the chunk's routing table
+                            let pso = self.pipelines.get("moe_map")?;
+                            let mut p = (n_expert as u32).to_ne_bytes().to_vec();
+                            p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                            p.extend_from_slice(&(cr as u32).to_ne_bytes());
+                            p.extend_from_slice(&(row0 as u32).to_ne_bytes());
+                            p.extend_from_slice(&(cap as u32).to_ne_bytes());
+                            self.encode_tg(
+                                r,
+                                &pso,
+                                &[tbl.as_ref(), ids.as_ref(), tpe.as_ref()],
+                                &p,
+                                n_expert,
+                                n_expert,
+                            );
+                            let ntt = cr.div_ceil(32);
+                            let idpack = |in_f: usize, out_f: usize| -> Vec<u8> {
+                                let mut p = (in_f as u32).to_ne_bytes().to_vec();
+                                p.extend_from_slice(&(out_f as u32).to_ne_bytes());
+                                p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                                p.extend_from_slice(&(cap as u32).to_ne_bytes());
+                                p.extend_from_slice(&(row0 as u32).to_ne_bytes());
+                                p.extend_from_slice(&(ntt as u32).to_ne_bytes());
+                                p
+                            };
+                            let gemm = |me: &Self,
+                                        r: &mut Resident,
+                                        kern: &'static str,
+                                        xb: &MtlBuffer,
+                                        q: &QuiWeight,
+                                        db: &MtlBuffer,
+                                        in_f: usize,
+                                        out_f: usize|
+                             -> Result<()> {
+                                let pso = me.pipelines.get(kern)?;
+                                me.encode_tg(
+                                    r,
+                                    &pso,
+                                    &[
+                                        xb,
+                                        &q.codes,
+                                        &q.scm,
+                                        &q.dd,
+                                        db,
+                                        ids.as_ref(),
+                                        tpe.as_ref(),
+                                        tbl.as_ref(),
+                                    ],
+                                    &idpack(in_f, out_f),
+                                    n_expert * ntt * (out_f / 64) * 128,
+                                    128,
+                                );
+                                Ok(())
+                            };
+                            gemm(
+                                self,
+                                r,
+                                cmm_id(gdt2, false),
+                                bx.as_ref(),
+                                &gq,
+                                gate_t.as_ref(),
+                                ne,
+                                nffx,
+                            )?;
+                            gemm(
+                                self,
+                                r,
+                                cmm_id(udt2, false),
+                                bx.as_ref(),
+                                &uq,
+                                up_t.as_ref(),
+                                ne,
+                                nffx,
+                            )?;
+                            let pso = self.pipelines.get("gatedact_f32")?;
+                            let mut p = ((cr * n_used) as u32).to_ne_bytes().to_vec();
+                            p.extend_from_slice(&(nffx as u32).to_ne_bytes());
+                            p.extend_from_slice(&act_code.to_ne_bytes());
+                            p.extend_from_slice(&0u32.to_ne_bytes());
+                            self.encode(
+                                r,
+                                &pso,
+                                &[gate_t.as_ref(), up_t.as_ref(), act_t.as_ref()],
+                                &p,
+                                cr * n_used * nffx,
+                            );
+                            gemm(
+                                self,
+                                r,
+                                cmm_id(ddt2, true),
+                                act_t.as_ref(),
+                                &dq,
+                                ydown.as_ref(),
+                                nffx,
+                                ne,
+                            )?;
+                            let pso = self.pipelines.get("moe_reduce")?;
+                            let mut p = (ne as u32).to_ne_bytes().to_vec();
+                            p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                            p.extend_from_slice(&(cr as u32).to_ne_bytes());
+                            p.extend_from_slice(&(row0 as u32).to_ne_bytes());
+                            self.encode(r, &pso, &[ydown.as_ref(), bd.as_ref()], &p, cr * ne);
+                            continue;
+                        }
+                        let pso = self.pipelines.get(moe_kern(gdt2).unwrap().0)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[
+                                bx.as_ref(),
+                                &gq.codes,
+                                &gq.scm,
+                                &gq.dd,
+                                gate_t.as_ref(),
+                                tbl.as_ref(),
+                            ],
+                            &pack(ne, nffx, row0),
+                            cr * n_used * (nffx / 2) * 32,
+                            32,
+                        );
+                        let pso = self.pipelines.get(moe_kern(udt2).unwrap().0)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[
+                                bx.as_ref(),
+                                &uq.codes,
+                                &uq.scm,
+                                &uq.dd,
+                                up_t.as_ref(),
+                                tbl.as_ref(),
+                            ],
+                            &pack(ne, nffx, row0),
+                            cr * n_used * (nffx / 2) * 32,
+                            32,
+                        );
+                        let pso = self.pipelines.get("gatedact_f32")?;
+                        let mut p = ((cr * n_used) as u32).to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(nffx as u32).to_ne_bytes());
+                        p.extend_from_slice(&act_code.to_ne_bytes());
+                        p.extend_from_slice(&0u32.to_ne_bytes()); // up_off
+                        self.encode(
+                            r,
+                            &pso,
+                            &[gate_t.as_ref(), up_t.as_ref(), act_t.as_ref()],
+                            &p,
+                            cr * n_used * nffx,
+                        );
+                        let pso = self.pipelines.get(moe_kern(ddt2).unwrap().1)?;
+                        self.encode_tg(
+                            r,
+                            &pso,
+                            &[
+                                act_t.as_ref(),
+                                &dq.codes,
+                                &dq.scm,
+                                &dq.dd,
+                                ydown.as_ref(),
+                                tbl.as_ref(),
+                            ],
+                            &pack(nffx, ne, row0),
+                            cr * n_used * (ne / 2) * 32,
+                            32,
+                        );
+                        let pso = self.pipelines.get("moe_reduce")?;
+                        let mut p = (ne as u32).to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(n_used as u32).to_ne_bytes());
+                        p.extend_from_slice(&(cr as u32).to_ne_bytes());
+                        p.extend_from_slice(&(row0 as u32).to_ne_bytes());
+                        self.encode(r, &pso, &[ydown.as_ref(), bd.as_ref()], &p, cr * ne);
+                    }
                     r.loc[dst.0 as usize] = Loc::Device;
                     return Ok(());
                 }

@@ -72,7 +72,9 @@ fn moe_layer_wall() {
     }
 
     let xs: Vec<f32> = (0..ne).map(|i| (i % 13) as f32 * 0.01 - 0.06).collect();
-    let rw: Vec<f32> = (0..n_expert * ne).map(|i| (i % 17) as f32 * 0.001).collect();
+    let rw: Vec<f32> = (0..n_expert * ne)
+        .map(|i| (i % 17) as f32 * 0.001)
+        .collect();
     let bound: Vec<(infr_core::tensor::TensorId, Vec<u8>)> = vec![
         (x, bytemuck::cast_slice(&xs).to_vec()),
         (router, bytemuck::cast_slice(&rw).to_vec()),

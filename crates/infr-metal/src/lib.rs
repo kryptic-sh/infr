@@ -88,7 +88,8 @@ pub struct MetalBackend {
     /// Op-scratch buffers reused across ops/executes (keyed by (f32 count, tag) — distinct tags
     /// for same-size buffers alive in one op). Reuse across layers is safe: the batch's hazard
     /// tracking orders each layer's writes after the previous layer's reads.
-    pub(crate) scratch: std::sync::Mutex<std::collections::HashMap<(usize, u8), std::sync::Arc<metal::Buffer>>>,
+    pub(crate) scratch:
+        std::sync::Mutex<std::collections::HashMap<(usize, u8), std::sync::Arc<metal::Buffer>>>,
 }
 
 // MTLDevice / MTLCommandQueue are documented thread-safe; the pipeline states are immutable after

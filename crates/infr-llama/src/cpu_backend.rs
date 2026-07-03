@@ -1643,6 +1643,10 @@ pub(crate) fn generate_dense_backend(
         None
     };
 
+    // INFR_IGNORE_EOS=1 (benchmarks): decode the full requested count — a model that emits EOS
+    // instantly on a dummy context (gemma at depth) otherwise "finishes" 64 tokens in one step
+    // and the reported tok/s is fiction. llama-bench ignores EOS the same way.
+    let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
     for pos in decode_start..(prompt.len() + max_new) {
         if out.len() >= max_new {
             break;
@@ -1734,7 +1738,7 @@ pub(crate) fn generate_dense_backend(
                 }
             } else {
                 let next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
-                let is_eos = c.eos_ids.contains(&next) || next == c.eos;
+                let is_eos = !ignore_eos && (c.eos_ids.contains(&next) || next == c.eos);
                 out.push(next);
                 decode_t += step_t0.elapsed();
                 decode_n += 1;

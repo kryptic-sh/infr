@@ -649,6 +649,9 @@ fn cmd_bench(
     if threads > 0 {
         std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
     }
+    // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a model
+    // that emits EOS instantly on the dummy context would otherwise report fictional tok/s.
+    std::env::set_var("INFR_IGNORE_EOS", "1");
     // -pg "P,G": a coding-agent turn (ingest P then generate G); throughput = (P+G)/time.
     let pg = pg
         .map(|s| -> anyhow::Result<(usize, usize)> {
@@ -847,7 +850,7 @@ fn cmd_bench_qwen35(
     // text prompt, so synthesize one near `n_prompt` tokens and report the actual token counts
     // from its stats. depth/pg still use the bespoke per-token forward below (the seam has no
     // context-depth warm API yet).
-    if depth == 0 && pg.is_none() {
+    if pg.is_none() {
         use infr_llama::model::ChatModel;
         std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
         let mut m: Box<dyn ChatModel> = if cpu {
@@ -856,8 +859,13 @@ fn cmd_bench_qwen35(
             Box::new(infr_llama::model::Qwen35Chat::new(gguf.to_path_buf()))
         };
         let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens
-        let prompt = if n_prompt > 0 {
-            sentence.repeat(n_prompt.div_ceil(10))
+                                                                        // Depth rides the PROMPT: `GenStats` splits prompt_secs from decode_secs, so decoding at
+                                                                        // depth d = a ~d-token prompt whose (untimed-for-tg) prefill fills the state, then the
+                                                                        // timed decode runs at that depth. pp is only reported at depth 0 (a deeper prompt can't
+                                                                        // split its prefill time into "depth warm" vs "measured n_prompt").
+        let prompt_toks = n_prompt + depth;
+        let prompt = if prompt_toks > 0 {
+            sentence.repeat(prompt_toks.div_ceil(10))
         } else {
             sentence.to_string()
         };
@@ -876,7 +884,7 @@ fn cmd_bench_qwen35(
         if json {
             let a = if n_gen > 0 { avg(&tgs) } else { avg(&pps) };
             println!("[{{\"avg_ts\": {a:.2}}}]");
-        } else if n_gen > 0 && n_prompt > 0 {
+        } else if n_gen > 0 && n_prompt > 0 && depth == 0 {
             println!(
                 "pp{np}: {:.1} t/s | tg{ng}: {:.1} t/s  ({reps} reps)",
                 avg(&pps),

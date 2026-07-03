@@ -1134,19 +1134,32 @@ impl MetalBackend {
                 let bx = self.ensure_device(r, x);
                 let bw = self.weight_buf(weight, g, bindings);
                 let bd = self.dev_dst(r, dst, rows * dim);
-                let pso = self.pipelines.get("rmsnorm_f32")?;
+                // Decode (few rows): the WIDE kernel — 8 simdgroups per row; the 32-lane form
+                // is latency-bound on dim/32 serial loads (~20 us/launch at dim 1152). Prefill
+                // keeps one simdgroup per row (the rows themselves fill the GPU).
+                let wide = rows <= 4
+                    && self
+                        .pipelines
+                        .get("rmsnorm_wide_f32")
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
+                        .unwrap_or(false);
+                let pso = self.pipelines.get(if wide {
+                    "rmsnorm_wide_f32"
+                } else {
+                    "rmsnorm_f32"
+                })?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(dim as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                // One simdgroup (32 lanes) per row — see `rmsnorm_f32`.
+                let tgw = if wide { 256 } else { 32 };
                 self.encode_tg_w(
                     r,
                     &pso,
                     &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
                     1 << 2,
                     &p,
-                    rows * 32,
-                    32,
+                    rows * tgw,
+                    tgw,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
@@ -1512,7 +1525,19 @@ impl MetalBackend {
                     None => Arc::new(self.zeros_buf(1)),
                 };
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
-                let pso = self.pipelines.get("qknormrope_f32")?;
+                // Decode: the WIDE kernel — see `rmsnorm_wide_f32` (a decode row launches only
+                // n_head simdgroups on the 32-lane form and serializes head_dim/32 loads).
+                let wide = rows <= 4
+                    && self
+                        .pipelines
+                        .get("qknormrope_wide_f32")
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
+                        .unwrap_or(false);
+                let pso = self.pipelines.get(if wide {
+                    "qknormrope_wide_f32"
+                } else {
+                    "qknormrope_f32"
+                })?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
@@ -1520,7 +1545,8 @@ impl MetalBackend {
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
-                // One simdgroup per (row, head) — see `qknormrope_f32`.
+                // One simdgroup per (row, head) — 8 on the wide decode form.
+                let tgw = if wide { 256 } else { 32 };
                 self.encode_tg_w(
                     r,
                     &pso,
@@ -1533,8 +1559,8 @@ impl MetalBackend {
                     ],
                     1 << 4,
                     &p,
-                    rows * nh * 32,
-                    32,
+                    rows * nh * tgw,
+                    tgw,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

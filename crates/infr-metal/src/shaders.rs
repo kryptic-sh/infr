@@ -105,6 +105,35 @@ kernel void rmsnorm_f32(device const float* x   [[buffer(0)]],
     for (uint i = lane; i < p.dim; i += 32u) dst[base + i] = x[base + i] * s * w[i];
 }
 
+// Wide RMSNorm for DECODE (rows == 1): 8 simdgroups (256 threads) cooperate on the one row.
+// The 32-lane kernel is latency-bound on its dim/32 serial loads — ~20 us per launch at
+// dim=1152 (the counter profiler's first catch: gemma decode fires 105 of these per token,
+// 20% of its GPU time). Partials fold through threadgroup memory; every thread re-sums the 8
+// partials to skip a second barrier.
+kernel void rmsnorm_wide_f32(device const float* x   [[buffer(0)]],
+                             device const float* w   [[buffer(1)]],
+                             device float*       dst [[buffer(2)]],
+                             constant RmsParams& p   [[buffer(3)]],
+                             uint tid  [[thread_position_in_threadgroup]],
+                             uint row  [[threadgroup_position_in_grid]],
+                             uint sg   [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    if (row >= p.rows) return;
+    uint base = row * p.dim;
+    float ss = 0.0f;
+    for (uint i = tid; i < p.dim; i += 256u) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    ss = simd_sum(ss);
+    if (lane == 0u) red[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = red[0] + red[1] + red[2] + red[3] + red[4] + red[5] + red[6] + red[7];
+    float s = 1.0f / sqrt(tot / (float)p.dim + p.eps);
+    for (uint i = tid; i < p.dim; i += 256u) dst[base + i] = x[base + i] * s * w[i];
+}
+
 // per-head RMSNorm: one SIMD group (32 lanes) per (row, head), weight indexed within head_dim.
 struct QkNormParams { uint rows; uint n_head; uint head_dim; float eps; };
 kernel void qknorm_f32(device const float* x   [[buffer(0)]],
@@ -1460,6 +1489,50 @@ kernel void qknormrope_f32(device const float* x   [[buffer(0)]],
         dst[base + i1] = a * sn + b * c;
     }
     for (uint i = p.rope_dim + lane; i < p.head_dim; i += 32u) dst[base + i] = x[base + i] * s * w[i];
+}
+
+// Wide fused QkNorm+RoPE for DECODE (rows == 1): 8 simdgroups (256 threads) per (row, head) —
+// same latency story as `rmsnorm_wide_f32` (the 32-lane form serializes head_dim/32 loads and a
+// decode row only launches n_head simdgroups; gemma has FOUR heads).
+kernel void qknormrope_wide_f32(device const float* x   [[buffer(0)]],
+                                device const float* w   [[buffer(1)]],
+                                device const int*   pos [[buffer(2)]],
+                                device const float* ff  [[buffer(3)]],
+                                device float*       dst [[buffer(4)]],
+                                constant QkRopeParams& p [[buffer(5)]],
+                                uint tid  [[thread_position_in_threadgroup]],
+                                uint grp  [[threadgroup_position_in_grid]],
+                                uint sg   [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    if (grp >= p.rows * p.n_head) return;
+    uint r = grp / p.n_head;
+    uint base = grp * p.head_dim;
+    float ss = 0.0f;
+    for (uint i = tid; i < p.head_dim; i += 256u) {
+        float v = x[base + i];
+        ss += v * v;
+    }
+    ss = simd_sum(ss);
+    if (lane == 0u) red[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = red[0] + red[1] + red[2] + red[3] + red[4] + red[5] + red[6] + red[7];
+    float s = 1.0f / sqrt(tot / (float)p.head_dim + p.eps);
+    uint hf = p.rope_dim / 2;
+    float p0 = (float)pos[r];
+    for (uint pp = tid; pp < hf; pp += 256u) {
+        uint i0 = pp, i1 = pp + hf;
+        float ang = p0 * pow(p.theta, -2.0f * (float)pp / (float)p.rope_dim);
+        if (p.has_ff != 0) ang /= ff[pp];
+        float c = cos(ang), sn = sin(ang);
+        float a = x[base + i0] * s * w[i0];
+        float b = x[base + i1] * s * w[i1];
+        dst[base + i0] = a * c - b * sn;
+        dst[base + i1] = a * sn + b * c;
+    }
+    for (uint i = p.rope_dim + tid; i < p.head_dim; i += 256u) {
+        dst[base + i] = x[base + i] * s * w[i];
+    }
 }
 
 // ---- Gated FFN activation: dst[r,i] = act(gate[r,i]) * up[r, i + up_off]. act: 0=SiLU,1=GELU,2=Sigmoid

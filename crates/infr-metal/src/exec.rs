@@ -90,7 +90,10 @@ fn linear_add_peephole(
         if !matches!(g.tensors[dst.0 as usize].kind, TensorKind::Internal) {
             continue;
         }
-        if !matches!(g.desc(*weight).dtype, DType::Q4K | DType::Q6K | DType::Q8_0) {
+        if !matches!(
+            g.desc(*weight).dtype,
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5_0
+        ) {
             continue;
         }
         if let Some(Op::Add {
@@ -858,6 +861,7 @@ impl MetalBackend {
             DType::Q4K => Some("linear_q4k"),
             DType::Q6K => Some("linear_q6k"),
             DType::Q8_0 => Some("linear_q8_0"),
+            DType::Q5_0 => Some("linear_q5_0"),
             _ => None,
         };
         if let Some(kern) = native_kern {
@@ -1064,6 +1068,7 @@ impl MetalBackend {
                         "linear_q4k" => (e / 256 * 144, 0, 0),
                         "linear_q6k" => (e / 256 * 210, 0, 0),
                         "linear_q8_0" => (e / 32 * 34, 0, 0),
+                        "linear_q5_0" => (e / 32 * 22, 0, 0),
                         "linear_quik4" => (e / 2, e / 4, dd_off),
                         "linear_quik6" => (e / 4 * 3, e / 4, dd_off),
                         _ => (e, e / 4, dd_off),
@@ -1088,6 +1093,7 @@ impl MetalBackend {
                         "linear_q4k" => "linear_q4k_hmm",
                         "linear_q6k" => "linear_q6k_hmm",
                         "linear_q8_0" => "linear_q8_0_hmm",
+                        "linear_q5_0" => "linear_q5_0_hmm",
                         _ => "linear_quik8_hmm",
                     };
                     let cmm_kern = match qw.kern {
@@ -1096,6 +1102,7 @@ impl MetalBackend {
                         "linear_q4k" => "linear_q4k_cmm",
                         "linear_q6k" => "linear_q6k_cmm",
                         "linear_q8_0" => "linear_q8_0_cmm",
+                        "linear_q5_0" => "linear_q5_0_cmm",
                         _ => "linear_quik8_cmm",
                     };
                     // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
@@ -1174,6 +1181,7 @@ impl MetalBackend {
                                 "linear_q4k" => "linear_q4k_rt",
                                 "linear_q6k" => "linear_q6k_rt",
                                 "linear_q8_0" => "linear_q8_0_rt",
+                                "linear_q5_0" => "linear_q5_0_rt",
                                 _ => "linear_quik8_rt",
                             };
                             (rt, m.div_ceil(8) * out_f)
@@ -1182,7 +1190,7 @@ impl MetalBackend {
                             // (FOUR for Q8_0 — llama.cpp's N_R0_Q8_0).
                             let sgs = match qw.kern {
                                 "linear_q4k" | "linear_q6k" => out_f.div_ceil(2),
-                                "linear_q8_0" => out_f.div_ceil(4),
+                                "linear_q8_0" | "linear_q5_0" => out_f.div_ceil(4),
                                 _ => out_f,
                             };
                             (qw.kern, sgs)
@@ -1193,6 +1201,7 @@ impl MetalBackend {
                             let fk = match kern {
                                 "linear_q4k" => "linear_q4k_add",
                                 "linear_q8_0" => "linear_q8_0_add",
+                                "linear_q5_0" => "linear_q5_0_add",
                                 _ => "linear_q6k_add",
                             };
                             let bres = self.ensure_device(r, res);
@@ -2424,7 +2433,9 @@ impl MetalBackend {
                 r.vals[dst.0 as usize] = out;
                 r.loc[dst.0 as usize] = Loc::Host;
             }
-            // Pure data movement (no arithmetic): done host-side, identical to the CPU reference.
+            // Pure data movement, ON-DEVICE (the rows=1 case of `copy_strided_f32`): the prefill
+            // graph extracts the last row's hidden state for the LM head with a Copy, and a host
+            // copy here forced a readback + a command-buffer break every prefill chunk.
             Op::Copy {
                 src,
                 src_off,
@@ -2432,12 +2443,17 @@ impl MetalBackend {
                 dst_off,
                 n,
             } => {
-                let (so, dof, n) = (src_off as usize, dst_off as usize, n as usize);
-                self.ensure_host(r, g, src);
-                self.ensure_host(r, g, dst);
-                let s = r.vals[src.0 as usize].clone();
-                r.vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s[so..so + n]);
-                r.loc[dst.0 as usize] = Loc::Host;
+                let bs = self.ensure_device(r, src);
+                let bd = self.ensure_device(r, dst);
+                let mut p = src_off.to_ne_bytes().to_vec();
+                p.extend_from_slice(&0u32.to_ne_bytes()); // src_stride (unused at rows=1)
+                p.extend_from_slice(&dst_off.to_ne_bytes());
+                p.extend_from_slice(&0u32.to_ne_bytes()); // dst_stride
+                p.extend_from_slice(&1u32.to_ne_bytes()); // rows
+                p.extend_from_slice(&n.to_ne_bytes());
+                let pso = self.pipelines.get("copy_strided_f32")?;
+                self.encode_w(r, &pso, &[bs.as_ref(), bd.as_ref()], 1 << 1, &p, n as usize);
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             // On-device: the fused-QKV prefill emits one of these per projection right after the
             // wide GEMM — a host copy would round-trip the [m, qkv] activation mid-forward.

@@ -309,6 +309,29 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
     device const char* qs = (device const char*)(blk + 2u + (bi & 1u) * 16u);                     \
     for (uint k = 0; k < 16u; k++) wk[k] = d * (float)qs[k];
 
+// NATIVE Q5_0 block (22 B / 32 elems): [f16 d][4 B qh][16 B nibbles]. 5.5 bpw streamed vs the
+// factored form's ~8.6 (5-bit codes land in the 6-bit packing + scm + dd) — gemma Q4_K_M ships
+// its q/k/v/gate/up projections as Q5_0, so this is that model family's dominant weight stream.
+// Element e < 16: low nibble of qs[e] plus bit e of qh as bit 4; element e >= 16: high nibble of
+// qs[e-16] plus bit e of qh. Value = d * (q - 16) — every intermediate is exact in f32, so it
+// matches the dequant reference bit-for-bit.
+#define DEC16_Q5_0(wk)                                                                            \
+    device const uchar* blk = codes + (ulong)(bi >> 1) * 22ul;                                    \
+    float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));                     \
+    uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);   \
+    device const uchar* qs = blk + 6u;                                                            \
+    if ((bi & 1u) == 0u) {                                                                        \
+        for (uint k = 0; k < 16u; k++) {                                                          \
+            uint q = (uint)(qs[k] & 0x0Fu) | (((qh >> k) << 4) & 0x10u);                          \
+            wk[k] = d * ((float)q - 16.0f);                                                       \
+        }                                                                                         \
+    } else {                                                                                      \
+        for (uint k = 0; k < 16u; k++) {                                                          \
+            uint q = (uint)(qs[k] >> 4) | ((qh >> (k + 12u)) & 0x10u);                            \
+            wk[k] = d * ((float)q - 16.0f);                                                       \
+        }                                                                                         \
+    }
+
 // GEMV: one simdgroup (32 lanes) per output element; each lane decodes one 16-element block per
 // step, coalesced across lanes, `simd_sum` reduction. m=1 decode is bound on the weight stream.
 #define GEMV_KERNEL(NAME, DEC)                                                                    \
@@ -761,6 +784,86 @@ kernel void linear_q8_0_add(device const float*  x     [[buffer(0)]],
     linear_q8_0_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
 }
 
+// Decode GEMV for NATIVE Q5_0 (22 B / 32-elem blocks), same mul_mv shape as `linear_q8_0_body`:
+// four output rows per simdgroup, 8 blocks in flight x 4 threads per block (8 quants each),
+// activations loaded once and reused across rows. Each thread's 8 elements sit in one nibble
+// half (il in {0,8} low, {16,24} high), so the qh bit extraction is uniform per thread.
+// wk = d * (q - 16), the exact dequantize_q5_0 value, reassociated over the dot only.
+template<int EPI, typename PT>
+inline void linear_q5_0_body(device const float*  x,
+                             device const uchar*  codes,
+                             device float*        dst,
+                             device const float*  res,
+                             constant PT& p,
+                             float wgt, bool zeroacc,
+                             uint gid, uint lane) {
+    uint first_row = (gid / 32u) * 4u;
+    if (first_row >= p.out_f) return;
+    uint nb = p.in_f >> 5;                 // 32-element blocks per row
+    ulong row_b = (ulong)nb * 22ul;        // row stride in bytes
+    uint nrows = min(4u, p.out_f - first_row);
+
+    uint ix = lane >> 2;                   // 0..7: which of 8 blocks in flight
+    uint il = (lane & 3u) * 8u;            // this thread's 8 quants within the block
+    bool hi = il >= 16u;
+    uint jq = hi ? il - 16u : il;          // nibble byte offset within qs
+    uint jh = hi ? il - 4u : il;           // qh shift base: hi bit e sits at (e-16)+12
+
+    float yl[8];
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float* yb = x + ix * 32u + il;
+
+    for (uint ib = ix; ib < nb; ib += 8u) {
+        for (uint i = 0; i < 8u; i++) yl[i] = yb[i];
+        for (uint row = 0; row < 4u; row++) {
+            device const uchar* blk =
+                codes + (ulong)(first_row + min(row, nrows - 1u)) * row_b + (ulong)ib * 22ul;
+            uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16)
+                | ((uint)blk[5] << 24);
+            device const uchar* qs = blk + 6u + jq;
+            float sumq = 0.0f;
+            for (uint i = 0; i < 8u; i++) {
+                uint q = hi ? ((uint)(qs[i] >> 4) | ((qh >> (jh + i)) & 0x10u))
+                            : ((uint)(qs[i] & 0x0Fu) | (((qh >> (jh + i)) << 4) & 0x10u));
+                sumq += ((float)q - 16.0f) * yl[i];
+            }
+            sumf[row] += sumq * (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
+        }
+        yb += 8u * 32u;
+    }
+    for (uint row = 0; row < nrows; row++) {
+        float s = simd_sum(sumf[row]);
+        if (lane == 0u) {
+            uint o = first_row + row;
+            if (EPI == 2)      dst[o] = (zeroacc ? 0.0f : dst[o]) + wgt * s;
+            else if (EPI == 1) dst[o] = s + res[o];
+            else               dst[o] = s;
+        }
+    }
+}
+
+kernel void linear_q5_0(device const float*  x     [[buffer(0)]],
+                        device const uchar*  codes [[buffer(1)]],
+                        device const uchar*  scm   [[buffer(2)]],
+                        device const uchar*  dd    [[buffer(3)]],
+                        device float*        dst   [[buffer(4)]],
+                        constant QLinParams& p     [[buffer(5)]],
+                        uint gid  [[thread_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    linear_q5_0_body<0>(x, codes, dst, x, p, 0.0f, false, gid, lane);
+}
+kernel void linear_q5_0_add(device const float*  x     [[buffer(0)]],
+                            device const uchar*  codes [[buffer(1)]],
+                            device const uchar*  scm   [[buffer(2)]],
+                            device const uchar*  dd    [[buffer(3)]],
+                            device float*        dst   [[buffer(4)]],
+                            device const float*  res   [[buffer(5)]],
+                            constant QLinParams& p     [[buffer(6)]],
+                            uint gid  [[thread_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    linear_q5_0_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
+}
+
 // ---- MoE expert GEMVs: the shared GEMV bodies, batched over the SELECTED experts — one
 // dispatch covers all n_used experts (slot = high grid bits), each picking its weight slice
 // from the device expert table (`moe_topk` below), so a whole MoE FFN is 7 dispatches with no
@@ -1015,6 +1118,7 @@ RT_KERNEL(linear_quik8_rt, DEC16_K8)
 RT_KERNEL(linear_q4k_rt, DEC16_Q4K)
 RT_KERNEL(linear_q6k_rt, DEC16_Q6K)
 RT_KERNEL(linear_q8_0_rt, DEC16_Q8_0)
+RT_KERNEL(linear_q5_0_rt, DEC16_Q5_0)
 // Cooperative-tile half-fragment GEMM, mul_mm-shape: one 64-output x 32-token tile per 128-thread
 // threadgroup, NK=32 K-steps. What the simpler cooperative tile above lacked (each of its shapes
 // measured and replaced): weights AND activations are staged into threadgroup memory as
@@ -1132,6 +1236,7 @@ CMM_KERNEL(linear_quik6_cmm, DEC16_K6)
 CMM_KERNEL(linear_quik8_cmm, DEC16_K8)
 CMM_KERNEL(linear_q4k_cmm, DEC16_Q4K)
 CMM_KERNEL(linear_q8_0_cmm, DEC16_Q8_0)
+CMM_KERNEL(linear_q5_0_cmm, DEC16_Q5_0)
 CMM_KERNEL(linear_q6k_cmm, DEC16_Q6K)
 
 HGEMM_KERNEL(linear_quik4_hmm, DEC16_K4)
@@ -1140,6 +1245,7 @@ HGEMM_KERNEL(linear_quik8_hmm, DEC16_K8)
 HGEMM_KERNEL(linear_q4k_hmm, DEC16_Q4K)
 HGEMM_KERNEL(linear_q6k_hmm, DEC16_Q6K)
 HGEMM_KERNEL(linear_q8_0_hmm, DEC16_Q8_0)
+HGEMM_KERNEL(linear_q5_0_hmm, DEC16_Q5_0)
 
 
 // ---- RoPE (Op::Rope = the no-qk-norm llama-family rotation): INTERLEAVED pairs (2p, 2p+1) —

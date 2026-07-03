@@ -482,6 +482,11 @@ impl CpuModel {
         let mut out: Vec<u32> = Vec::new();
         let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
         let t1 = std::time::Instant::now();
+        // Adaptive draft length: k tracks recent acceptance (EMA) — code-shaped output
+        // accepts ~3/round and deserves the full k; high-entropy text accepts ~1-2 and a
+        // long draft just adds verify rows that get thrown away (measured net-NEGATIVE at
+        // fixed k=4 on prose). Bounds [1, k].
+        let mut ema = 2.0f64;
         'outer: while out.len() < max_new {
             // Commit the token the target already chose (initial sample or verify bonus).
             let is_eos =
@@ -502,7 +507,8 @@ impl CpuModel {
             }
             // Draft proposes up to k greedy continuations of the committed stream (its session
             // suffix-prefills the divergence from last round automatically).
-            let budget = k.min(max_new - out.len());
+            let k_now = (ema.round() as usize).clamp(1, k);
+            let budget = k_now.min(max_new - out.len());
             let td = std::time::Instant::now();
             let (cand, _) = crate::cpu_backend::generate_dense_metal_session(
                 &draft_session.mtl,
@@ -577,6 +583,7 @@ impl CpuModel {
                     break 'outer;
                 }
             }
+            ema = 0.7 * ema + 0.3 * (accepted as f64 + 1.0);
             // Roll the committed view back past the rejected tail: the session's `cached` holds
             // all of `feed`, and the next prefix diff overwrites the stale rows.
             t_next = next.unwrap_or_else(|| {

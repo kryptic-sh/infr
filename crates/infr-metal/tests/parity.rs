@@ -806,6 +806,22 @@ fn linear_q6k_matches_dequant_reference() {
     check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 27), m, in_f, out_f);
 }
 
+// m = 2..8 K-quants route to the MULTI-ROW mul_mv GEMV (weight registers reused across 4
+// token rows); m=5 exercises the partial token block, out_f=94 the partial row pair.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q4k_multirow_matches_dequant_reference() {
+    let (m, in_f, out_f) = (5usize, 512usize, 94usize);
+    check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 110), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q6k_multirow_matches_dequant_reference() {
+    let (m, in_f, out_f) = (3usize, 512usize, 96usize);
+    check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 111), m, in_f, out_f);
+}
+
 // m=1 routes to the GEMV kernels — decode's path, distinct from the m=2 row-tiled and m>=16 GEMM
 // routes the tests above/below take.
 #[test]

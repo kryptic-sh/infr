@@ -438,12 +438,13 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                     let target = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
                     let draft =
                         infr_llama::CpuModel::load(std::path::Path::new(&draft_path), None)?;
-                    // Verify cost is nearly flat in k (one batched forward), so a larger k
-                    // amortizes it; 8 balances the draft cost against acceptance decay.
+                    // Upper bound on the draft length; the driver adapts the actual k per
+                    // round to recent acceptance (verify cost scales with rows on this
+                    // hardware, so over-drafting low-acceptance text costs real time).
                     let k = std::env::var("INFR_SPEC_K")
                         .ok()
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or(8);
+                        .unwrap_or(6);
                     let (tb, db) = (
                         std::fs::metadata(&gguf).map(|m| m.len()).unwrap_or(0),
                         std::fs::metadata(&draft_path).map(|m| m.len()).unwrap_or(0),

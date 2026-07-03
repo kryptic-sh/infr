@@ -1326,6 +1326,37 @@ impl MetalBackend {
                             .max_total_threads_per_threadgroup()
                             >= 128;
                     p.extend_from_slice(&qw.dshift.to_ne_bytes());
+                    // Multi-row mul_mv GEMV for m = 2..8 K-quant shapes (speculative verify,
+                    // short suffix prefills): weight bytes hoisted to registers and reused
+                    // across 8 token rows — one DRAM stream per 8 tokens at GEMV-class
+                    // bandwidth, where the cooperative tile is latency-bound on its serial
+                    // k-loop at these sizes.
+                    let mr_kern = match qw.kern {
+                        "linear_q4k" => Some("linear_q4k_mrv"),
+                        "linear_q6k" => Some("linear_q6k_mrv"),
+                        _ => None,
+                    };
+                    if let (true, Some(kn), 0) = ((2..=8).contains(&m), mr_kern, w_off) {
+                        let pso = self.pipelines.get(kn)?;
+                        let sgs = out_f.div_ceil(2) * m;
+                        self.encode_tg_off(
+                            r,
+                            &pso,
+                            &[
+                                (bx.as_ref(), 0),
+                                (&qw.codes, codes_off),
+                                (&qw.scm, scm_off),
+                                (&qw.dd, dd_off),
+                                (bd.as_ref(), 0),
+                            ],
+                            1 << 4,
+                            &p,
+                            sgs * 32,
+                            32,
+                        );
+                        r.loc[dst.0 as usize] = Loc::Device;
+                        return Ok(());
+                    }
                     if cmm_ok {
                         // Split-K for small-m deep-k (verify rows, short suffix prefills): the
                         // plain tile's out_f/64 threadgroups underfill the GPU and serialize

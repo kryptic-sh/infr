@@ -1,33 +1,31 @@
 # infr-metal — Apple GPU backend architecture
 
-State as of 2026-07-02 (PRs #4/#5/#6 merged, #10 = the flash_attn_ext arc).
-`crates/infr-metal` implements the same
+State as of 2026-07-03 (PRs #4-#14 merged, #15 = native legacy quants + replay
+concurrency + counter profiler). `crates/infr-metal` implements the same
 `Backend` seam as `infr-cpu` and `infr-vulkan` on Apple's Metal API. It started
 as a correctness-first reference (per-op command buffers, dequant-to-f32
 everything) and was rebuilt profiling-first; this doc records the architecture
 that emerged and the measured reasoning behind it.
 
-## Numbers (M3 Pro 18-core, Qwen3 Q4_K_M, `infr bench` vs `llama-bench`, same GGUF)
+## Numbers (M3 Pro 18-core, `infr compare --sweep --dev MTL0`, same GGUFs)
 
-(One idle-machine run, both engines back-to-back, 2-3 reps each.)
+| model | pp512 | tg128 | tg64@d4096 |
+| --- | --- | --- | --- |
+| Qwen3-0.6B Q4_K_M | 0.89× | 0.98× | 1.00× |
+| Qwen3-4B Q4_K_M | 0.93× | 1.00× | 0.96× |
+| Qwen3-0.6B Q8_0 | 0.84× | 0.97× | 0.99× |
+| Qwen3-MoE-2.4B Q4_K_M | 0.87× | 0.96× | 0.99× |
+| gemma3-1b Q4_K_M | 0.84× | 0.96× | 0.92× |
+| TinyLlama-1.1B Q4_0 | 0.85× | **1.02×** | **1.02×** |
 
-| model | metric | infr-metal | llama.cpp | gap |
-| --- | --- | --- | --- | --- |
-| 0.6B | tg128 | 158 tok/s | 193 | 1.23× |
-| 0.6B | tg128 @ d16384 | 49.7 tok/s | 46.6 | **infr ahead** |
-| 0.6B | pp2048 | 3508 tok/s | 3751 | 1.07× |
-| 0.6B | pp8192 | 2233 tok/s | 2342 | 1.05× |
-| 4B | tg128 | 40.5 tok/s | 46.6 | 1.15× |
-| 4B | tg128 @ d16384 | 21.8 tok/s | 24.4 | 1.12× |
-| 4B | pp2048 | 569 tok/s | 603 | 1.06× |
-| 4B | pp8192 | 455 tok/s | 489 | 1.07× |
-
-Decode is weight-stream bound: the GEMV kernels run ~107 GB/s of a measured
-~133 GB/s read roofline, and the per-token host cost is ~0.2 ms (the recorded
-decode-replay tape re-encodes the whole forward with no graph walk). The
-remaining gap vs llama.cpp is effective-bandwidth tail (dispatch ramp on
-36-66 MB matrices + the serial small-op chain), not kernel structure — the
-mul_mv port matches their N_R0/N_SG configuration exactly.
+(ratios = infr / llama.cpp; >1 = infr ahead.) **Decode is at parity.** The
+prefill band decomposes by ablation (strip the dequant scale math: −2.4% of
+GEMM time; strip ALL weight loads + decode: −9%) to a tile floor of ~6.9
+TFLOPS — ~53% of the f16 `simdgroup_matrix` peak and about llama.cpp's own
+effective rate — so what remains there is MMA/tile scheduling margin, not an
+addressable component. Decode was weight-stream + launch-latency bound; the
+levers that closed it are recorded below in the order the profiler surfaced
+them.
 
 From the naive reference implementation: decode ~44×, prefill ~250×+. Model
 load is ~10× faster than the repack era and resident weight memory is the raw
@@ -59,7 +57,8 @@ single-generation lifetime:
 - **Native GGUF blocks — Q4_K, Q6_K** (the formats real checkpoints ship): the
   bound weight buffer is used AS-IS. No host repack, no extra residency;
   kernels decode raw block bytes in-place (`DEC16_Q4K`/`DEC16_Q6K`, one
-  16-element sub-block per call; `get_scale_min_k4` ported). ~4.5 / ~6.6 bpw
+  16-element sub-block per call; `get_scale_min_k4` ported), and the 32-element legacy formats Q8_0 (34 B),
+  Q5_0 (22 B) and Q4_0 (18 B) — every format real checkpoints ship. ~4.5-8.5 bpw
   on the wire. Two hard-won details: the Q6_K sub-block selector must be
   branch-free (a 4-way `if` serializes the simdgroup — measured 2.3× slower),
   and Q6_K blocks are 210 B (2-aligned) so only byte/ushort loads are legal,
@@ -80,6 +79,7 @@ into `wk[16]`; three kernel shapes instantiate each format:
 | shape | route | precision |
 | --- | --- | --- |
 | `linear_*` GEMV | m == 1 (decode) | exact f32 (bit-for-bit dequant, f32 dot) |
+| `linear_*_ks` k-split GEMV | m == 1, row groups ≤ 4096 AND k deep enough to feed 4 simdgroups twice | exact f32, reassociated |
 | `linear_*_rt` row-tiled | 1 < m < 16, or out_f % 16 ≠ 0 | exact f32 |
 | `linear_*_cmm` cooperative GEMM | m ≥ 16 && out_f % 64 == 0 | f16 operands, f32 accumulate |
 | `linear_*_hmm` per-simdgroup GEMM | m ≥ 16 && out_f % 16 == 0 (fallback) | f16 operands, f32 accumulate |
@@ -122,9 +122,9 @@ O(kv_len) chain:
   f16 cache; softmax by query rows, all 32 lanes on float2 scores, M/S stats
   pinned in the owning simdgroup's registers; P·V by output columns with O
   fragments held in registers). Analytic causal/window masking, zero-padded
-  partial query tiles. Templated over compile-time head_dim (hd=64/128
-  instantiations — the fully-unrolled loops were worth +38% alone); NSG=8
-  benched slower.
+  partial query tiles. Templated over compile-time head_dim (hd 64/128/256
+  instantiations — the fully-unrolled loops were worth +38% alone; hd=256 is
+  gemma, whose absence was a 3× prefill crater); NSG=8 benched slower.
 - **`attnflash_f16kv`** — the single-simdgroup flash kernel, kept for
   hd % 8 == 0 shapes outside the hd 64/128 instantiations: one simdgroup per
   (8-query tile, head), K^T/V 8×8 fragments direct from the f16 cache, scalar
@@ -134,7 +134,9 @@ O(kv_len) chain:
   blocks may read up to 7 rows past the causal limit — always inside the
   bound cache buffer — and are masked.
 - **`attnvec_f16kv` (hd 64/128)** — the llama.cpp `kernel_flash_attn_ext_vec`
-  structure for long-context decode (kv_len ≥ 128): 32 simdgroups per
+  structure for long-context decode (kv_len ≥ 128; hd 64/128 at NSG=32,
+  hd=256 at NSG=16 — its per-simdgroup O partials are NSG·hd·4 B and 32
+  simdgroups would blow the threadgroup budget): NSG simdgroups per
   (query, head), each owning interleaved 32-position KV blocks with a private
   online softmax — 4 KV rows × 8-lane dots per pass, shuffle-tree reduce, ONE
   simd_max/simd_sum per block (the split kernels below run that chain once
@@ -171,15 +173,49 @@ bandwidth for ALU: 0.6B tg128@d16384 62.7 t/s (+26% over the f16 cache, +35%
 over llama.cpp's), 4B ~-6% (already weight-stream-bound); pp8192 runs at ~68%
 of the f16 flash. Enable it for the footprint, and for small models at depth.
 
+## Decode latency: wide small-op kernels + the replay tape
+
+The GPU-counter profiler's first reading found gemma decode spending 20% of
+its GPU time in RmsNorm: 105 launches/token, each a single 32-lane simdgroup
+serializing dim/32 dependent loads (~20 µs) with nothing else resident at
+rows==1. The same disease showed in three more places, each fixed the same
+way:
+
+- `rmsnorm_wide_f32` / `qknormrope_wide_f32`: 8 simdgroups per row (per head
+  for rope), partials folded through threadgroup memory, routed at rows ≤ 4.
+  Fleet decode +8-19%.
+- `rope_f32` ran ONE THREAD per (row, head) — serial pairs, trig included,
+  plus a whole-head copy (19% of TinyLlama decode). Now one thread per
+  rotation pair.
+- The k-split GEMVs above (4 simdgroups per row group) — small/mid GEMVs
+  underfill the GPU and serialize the whole k-dim.
+
+The decode replay tape (`Capabilities::decode_replay`) records one token's
+dispatches and re-encodes them per token with **no graph walk** — and replays
+on a CONCURRENT encoder: each recorded dispatch carries a write mask
+(`TapeEntry.wmask`), and barriers are placed exactly at RAW/WAW/WAR hazards,
+so independent runs (q/k/v GEMVs, the two KV writes) overlap. Un-annotated
+dispatches record writes-everything and replay serialized — never
+under-fenced. MoE decode tapes (the device expert path resolves all data
+dependence on-GPU), and so does the llama arch (`Op::Rope` reads the bound
+positions buffer, replay-safe by construction).
+
 ## Profiling
 
 `INFR_METAL_PROFILE=1`: per-op CPU-encode + GPU commit+wait wall, printed on
 drop. `INFR_METAL_PROFILE=2`: additionally flushes after each op to attribute
-GPU wall per op — costs the batching (analysis mode, not the fast path).
+GPU wall per op — costs the batching AND, because the replay tape re-executes
+decode tokens without walking ops, only ever attributes the RECORDED token.
+`INFR_METAL_PROFILE=3` is the honest mode: `MTLCounterSampleBuffer`
+stage-boundary timestamps, one encoder per op inside ONE command buffer —
+true in-context per-op GPU time, with the tape disabled so every token
+attributes. (Apple silicon samples at stage boundaries only, not dispatch
+boundaries; metal-rs 0.33's `resolve_counter_range` returns uninitialized
+memory, so the resolve reads the NSData directly.)
 
 ## Tests
 
-`tests/parity.rs` — 39 GPU parity tests vs the CPU reference: every op, and
+`tests/parity.rs` — 68 GPU parity tests vs the CPU reference: every op, and
 for quantized Linear every (format × kernel shape) pair including partial
 tiles; attention covers unsplit/split8/split32/flash/flash2/vec, sliding
 windows at both tile and block granularity, partial query tiles, and the
@@ -204,11 +240,28 @@ kept so the floors above stay reproducible.
   private and the first cooperative tile: nothing / worse.
 - Linear threadgroup-width sweep (32→1024), uint4-wide GEMV loads, select-based
   `get_scale_min_k4`: all flat.
+- NSG=2 mid-k GEMV split: wash-to-negative (the reduce tax eats the halved
+  chain at gemma's ne=1152 shapes).
+- Vectorized DEC16 staging loads in the GEMM path: no change (staging is
+  hidden behind the MMAs).
+- B-direct cooperative GEMM (activation fragments straight from a pre-cast
+  f16 buffer, no B staging — the Vulkan A_GLOBAL idea): wash on M3; B staging
+  was already free.
+- Ungated k-split: −8% on 0.6B (in_f=1024 is four Q4_K superblocks; three of
+  four simdgroups idle and the reduce is pure tax) — hence the per-format
+  k-depth gates.
 
-## Remaining levers (est. ≤ 15% each on this model class)
+## Remaining levers
 
-Decode GEMV lane remap (llama.cpp's access pattern; the byte win of native
-blocks was partly eaten by scatter), per-format dequant micro-tuning in the
-GEMM staging, MoE path (`Op::MoeFfn` is still host-side here), decode graph
-replay (CPU encode is 2.5 ms/forward and becomes the wall below ~5 ms GPU),
-attention at small-model scale.
+Decode is at parity; prefill sits at the measured tile floor. What's left
+needs a new evidence class or new hardware:
+
+- Prefill GEMM: ~53% of f16 simdgroup_matrix peak, same class as llama.cpp —
+  Xcode's per-line shader profiler (not installed on the dev box) is the next
+  instrument if the last ~10-15% ever matters.
+- Metal-4 tensor ops: the hardware step change; `has tensor = false` on M3,
+  likely M5-only.
+- gemma decode at depth (0.92×): +0.58 ms/token of hd=256 vec attention on
+  the global layers — 4% of one cell, measured and parked.
+- The routing gates (k-split thresholds, wide-norm rows ≤ 4) were tuned on an
+  M3 Pro; a boot-time micro-sweep would adapt them across M1-M4.

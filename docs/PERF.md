@@ -192,16 +192,22 @@ Perf work is only real if the output is unchanged.
 For calibration — the kind of yield each class of fix produced on pp512 ratios
 vs llama.cpp:
 
-| slice                             | class             | result                        |
-| --------------------------------- | ----------------- | ----------------------------- |
-| fused QKV + narrow tile + split-K | grid underfill    | 0.6B 0.56 → 0.74x             |
-| A_GLOBAL (LDS → occupancy)        | occupancy         | 0.6B → 0.92x, 8B 0.72 → 0.83x |
-| batched MoE (dispatch collapse)   | dispatch overhead | MoE 0.59 → 0.91x              |
-| warp-gate n%256 → n%128           | coverage gate     | gemma3-1b 0.60 → 0.67x        |
+| slice                             | class             | result                                                           |
+| --------------------------------- | ----------------- | ---------------------------------------------------------------- |
+| fused QKV + narrow tile + split-K | grid underfill    | 0.6B 0.56 → 0.74x                                                |
+| A_GLOBAL (LDS → occupancy)        | occupancy         | 0.6B → 0.92x, 8B 0.72 → 0.83x                                    |
+| batched MoE (dispatch collapse)   | dispatch overhead | MoE 0.59 → 0.91x                                                 |
+| warp-gate n%256 → n%128           | coverage gate     | gemma3-1b 0.60 → 0.67x                                           |
+| warp-GEMM Q5_K/Q4_0/Q2_K          | coverage gate     | Q4_0 0.6B 0.43 → 0.85x, Q5_K 0.42 → 0.61x, Q2_K 14B 0.47 → 0.68x |
 
-Known open items (re-sweep before trusting): the quant cliff (formats without a
-warp-GEMM dequant variant fall to slow paths — extend `dqblk` coverage
-worst-first), qwen35 engine (DeltaNet occupancy), gemma3-1b's remaining
-narrow-shape GEMM efficiency, decode ratios at depth, and Metal parity for
-everything above (most fast paths are Vulkan-only; Metal states its own
-capabilities, so it degrades gracefully but slowly).
+Known open items (re-sweep before trusting): the quant cliff — **partly closed**
+(Q5_K/Q4_0/Q2_K now on the warptile; the dqblk decoders already existed, so it
+was pure wiring — build.rs variants + build_spv/recorder maps, `.is_some()`
+gates auto-enable). Still on slow paths: **IQ4_XS is the worst combo left (0.25x
+pp / 0.39x tg** on 0.6B — it needs a real `dqblk_iq4xs` written first, it only
+has per-element `dq`, and its _decode_ is slow too, so it's a bigger slice than
+the K-quants). Then: qwen35 engine (DeltaNet occupancy), gemma3-1b's remaining
+narrow-shape GEMM efficiency, decode ratios at depth (gemma-4-E2B tg 0.64x
+@d4096 is the worst Q4_K_M decode gap), and Metal parity for everything above
+(most fast paths are Vulkan-only; Metal states its own capabilities, so it
+degrades gracefully but slowly).

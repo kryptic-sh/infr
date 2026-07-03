@@ -621,6 +621,8 @@ impl<'a> Recorder<'a> {
         let (name, spv) = match (warp, dtype) {
             (Some((spv, 256)), infr_core::DType::Bf16) => ("native_gemm_warp_bf16", spv),
             (Some((spv, 256)), infr_core::DType::Q3K) => ("native_gemm_warp_q3k", spv),
+            (Some((spv, 256)), infr_core::DType::Q5_0) => ("native_gemm_warp_q5_0", spv),
+            (Some((spv, 256)), infr_core::DType::Q5_1) => ("native_gemm_warp_q5_1", spv),
             (Some((spv, 256)), infr_core::DType::Iq4Xs) => ("native_gemm_warp_iq4xs", spv),
             (Some((spv, 256)), infr_core::DType::Q2K) => ("native_gemm_warp_q2k", spv),
             (Some((spv, 256)), infr_core::DType::Q4_0) => ("native_gemm_warp_q4_0", spv),
@@ -630,6 +632,8 @@ impl<'a> Recorder<'a> {
             (Some((spv, 256)), infr_core::DType::Q8_0) => ("native_gemm_warp_q8_0", spv),
             (Some((spv, _)), infr_core::DType::Bf16) => ("native_gemm_warp_bf16_n128", spv),
             (Some((spv, _)), infr_core::DType::Q3K) => ("native_gemm_warp_q3k_n128", spv),
+            (Some((spv, _)), infr_core::DType::Q5_0) => ("native_gemm_warp_q5_0_n128", spv),
+            (Some((spv, _)), infr_core::DType::Q5_1) => ("native_gemm_warp_q5_1_n128", spv),
             (Some((spv, _)), infr_core::DType::Iq4Xs) => ("native_gemm_warp_iq4xs_n128", spv),
             (Some((spv, _)), infr_core::DType::Q2K) => ("native_gemm_warp_q2k_n128", spv),
             (Some((spv, _)), infr_core::DType::Q4_0) => ("native_gemm_warp_q4_0_n128", spv),

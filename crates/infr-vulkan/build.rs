@@ -361,6 +361,12 @@ fn main() {
             "native_gemm_warp_bf16_n128",
             &["-DFMT_BF16", "-DNARROW_N"],
         ),
+        ("native_gemm_warp", "native_gemm_warp_q3k", &["-DFMT_Q3K"]),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q3k_n128",
+            &["-DFMT_Q3K", "-DNARROW_N"],
+        ),
         (
             "native_gemm_warp",
             "native_gemm_warp_iq4xs",

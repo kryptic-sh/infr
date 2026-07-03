@@ -570,6 +570,12 @@ impl infr_server::ChatGenerator for SeamGenerator {
         let mut stream = infr_engine::ChatStream::new(tool_choice != Some("none"));
         {
             let od = &mut *on_delta;
+            // Template-prefilled thinking (the PROMPT ends with the `<think>` opener): inject a
+            // synthetic opener so the splitter emits the head as Reasoning deltas, mirroring
+            // `Chat::turn` — run and serve expose thinking identically.
+            if infr_engine::prompt_prefills_think(&prompt) {
+                stream.push("<think>", &mut *od);
+            }
             self.model.generate(&prompt, max_new, &mut |piece: &str| {
                 stream.push(piece, &mut *od)
             })?;

@@ -113,10 +113,17 @@ impl<'a> Chat<'a> {
             }
         };
         let mut answer = String::new();
-        let stats = self.model.generate(&prompt, max_new, &mut |p| {
+        let mut emit = |p: &str| {
             answer.push_str(p);
             on_piece(p);
-        })?;
+        };
+        // Template-prefilled thinking (Qwen3.5-style: the PROMPT ends with the `<think>` opener,
+        // so the output starts mid-reasoning): inject a synthetic opener so the display styler
+        // and the history stripper see a well-formed block.
+        if infr_chat::prompt_prefills_think(&prompt) {
+            emit("<think>");
+        }
+        let stats = self.model.generate(&prompt, max_new, &mut emit)?;
         self.history
             .push(("assistant".into(), strip_think(&answer)));
         Ok(stats)

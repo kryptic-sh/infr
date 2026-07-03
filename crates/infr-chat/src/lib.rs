@@ -14,7 +14,7 @@ mod stream;
 mod template;
 mod tools;
 
-pub use stream::{ChatStream, Delta};
+pub use stream::{prompt_prefills_think, ChatStream, Delta};
 pub use template::{render_chat_jinja, render_chat_oai, render_chat_user};
 pub use tools::{
     normalize_messages, parse_hermes_tool_calls, parse_tool_calls, split_channels, split_think,

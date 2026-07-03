@@ -19,7 +19,7 @@ use std::sync::Arc;
 use infr_core::{error::Result, Backend};
 
 /// A streamed piece of a response (re-exported from the single splitter in `infr-chat`).
-pub use infr_chat::{ChatStream, Delta};
+pub use infr_chat::{prompt_prefills_think, ChatStream, Delta};
 
 /// Owns the loaded model + compiled plan + decoder, over an opaque backend.
 pub struct Engine {

@@ -550,6 +550,7 @@ impl infr_server::ChatGenerator for SeamGenerator {
         messages: &[infr_engine::ChatMessage],
         tools_json: Option<&str>,
         tool_choice: Option<&str>,
+        max_tokens: Option<u32>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<()> {
         let tools: Option<serde_json::Value> = tools_json
@@ -557,10 +558,14 @@ impl infr_server::ChatGenerator for SeamGenerator {
             .transpose()
             .context("parsing request `tools`")?;
         let prompt = self.renderer.render(messages, tools.as_ref())?;
-        let max_new = std::env::var("INFR_MAX_NEW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2048usize);
+        // The request's `max_tokens` wins; INFR_MAX_NEW (default 2048) is the server-side
+        // default for requests that don't set one.
+        let max_new = max_tokens.map(|v| v as usize).unwrap_or_else(|| {
+            std::env::var("INFR_MAX_NEW")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048usize)
+        });
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
         // seam decode). Prime the assistant turn with the <tool_call> opener and parse the

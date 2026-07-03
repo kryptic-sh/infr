@@ -36,12 +36,15 @@ use tokio::sync::Mutex;
 
 /// Generation backend the server drives — it never knows the model/GPU underneath.
 /// Implemented by `Engine` (below) and by CLI adapters (e.g. a Llama runner).
+/// `max_tokens` is the request's generation budget (OpenAI `max_tokens`); `None` leaves the
+/// generator's own default in charge.
 pub trait ChatGenerator: Send {
     fn chat(
         &mut self,
         messages: &[ChatMessage],
         tools_json: Option<&str>,
         tool_choice: Option<&str>,
+        max_tokens: Option<u32>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<()>;
 }
@@ -52,6 +55,7 @@ impl ChatGenerator for Engine {
         messages: &[ChatMessage],
         tools_json: Option<&str>,
         _tool_choice: Option<&str>,
+        _max_tokens: Option<u32>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<()> {
         Engine::chat(self, messages, tools_json, on_delta).map_err(|e| anyhow::anyhow!("{e}"))
@@ -313,6 +317,7 @@ async fn chat_completions_handler(
             messages,
             tools_json,
             tool_choice,
+            req.max_tokens,
             cid,
             model_id,
             created,
@@ -324,6 +329,7 @@ async fn chat_completions_handler(
             messages,
             tools_json,
             tool_choice,
+            req.max_tokens,
             cid,
             model_id,
             created,
@@ -336,11 +342,13 @@ async fn chat_completions_handler(
 // Non-streaming path
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn non_streaming(
     state: AppState,
     messages: Vec<ChatMessage>,
     tools_json: Option<String>,
     tool_choice: Option<String>,
+    max_tokens: Option<u32>,
     cid: String,
     model_id: String,
     created: i64,
@@ -365,6 +373,7 @@ async fn non_streaming(
                 &messages,
                 tools_json.as_deref(),
                 tool_choice.as_deref(),
+                max_tokens,
                 &mut |delta| match delta {
                     Delta::Reasoning(t) => reasoning.push_str(&t),
                     Delta::Content(t) => content.push_str(&t),
@@ -437,11 +446,13 @@ async fn non_streaming(
 // Streaming path (SSE)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn streaming(
     state: AppState,
     messages: Vec<ChatMessage>,
     tools_json: Option<String>,
     tool_choice: Option<String>,
+    max_tokens: Option<u32>,
     cid: String,
     model_id: String,
     created: i64,
@@ -485,6 +496,7 @@ async fn streaming(
             &messages,
             tools_json.as_deref(),
             tool_choice.as_deref(),
+            max_tokens,
             &mut |delta| {
                 let payload = match delta {
                     Delta::Reasoning(t) => DeltaPayload {

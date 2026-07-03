@@ -21,19 +21,27 @@ pub struct CpuModel {
     tokenizer: Tokenizer,
 }
 
-/// A persistent Vulkan seam session (see [`CpuModel::vulkan_session`]): owns the backend and up
-/// to `INFR_KV_SLOTS` (default 4) conversation SLOTS — each a KV cache + the token ids
-/// materialized in it, all sharing one weight upload (`Arc<SeamWeights>`). Per request the
-/// best-prefix slot is picked: a prompt that EXTENDS a slot's cache continues it (the classic
-/// next-turn suffix prefill); a prompt that diverges early (a different conversation) forks a
-/// fresh slot and SEEDS it with the longest shared prefix (e.g. a common system prompt) via a
-/// device-side KV copy instead of re-prefilling it; when all slots are taken the LRU one is
-/// recycled. Single-conversation callers (run/bench) naturally stay on one slot.
-pub struct DenseVulkanSession {
-    vk: infr_vulkan::VulkanBackend,
+/// The conversation SLOTS a persistent GPU seam session owns: up to `INFR_KV_SLOTS` (default 4)
+/// [`crate::cpu_backend::SeamKv`]s — each a KV cache + the token ids materialized in it, all
+/// sharing one weight upload (`Arc<SeamWeights>`). Per request the best-prefix slot is picked: a
+/// prompt that EXTENDS a slot's cache continues it (the classic next-turn suffix prefill); a
+/// prompt that diverges early (a different conversation) forks a fresh slot and SEEDS it with the
+/// longest shared prefix (e.g. a common system prompt) via a device-side KV copy instead of
+/// re-prefilling it; when all slots are taken the LRU one is recycled. Single-conversation
+/// callers (run/bench/spec drivers) stay on one slot. Backend-agnostic: fork and seed go through
+/// `&dyn Backend` (`copy_buffer` is the seeding primitive), so the Vulkan and Metal sessions
+/// share this policy verbatim.
+struct SlotPool {
     slots: Vec<Option<crate::cpu_backend::SeamKv>>,
     last_used: Vec<u64>,
     tick: u64,
+}
+
+/// A persistent Vulkan seam session (see [`CpuModel::vulkan_session`]): owns the backend and the
+/// conversation [`SlotPool`].
+pub struct DenseVulkanSession {
+    vk: infr_vulkan::VulkanBackend,
+    pool: SlotPool,
     max_ctx: usize,
 }
 
@@ -41,14 +49,46 @@ impl DenseVulkanSession {
     /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
     /// warmup generation so the first real prompt starts from clean slots.
     pub fn reset_cache(&mut self) {
+        self.pool.reset_cache();
+    }
+}
+
+impl SlotPool {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            last_used: Vec::new(),
+            tick: 0,
+        }
+    }
+
+    /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
+    /// warmup generation so the first real prompt starts from clean slots.
+    fn reset_cache(&mut self) {
         for s in self.slots.iter_mut().flatten() {
             s.reset();
         }
     }
 
+    /// The single-conversation slot (the bench/spec drivers, which manage one token stream and
+    /// never contend): slot 0, created empty on first use.
+    #[cfg(target_os = "macos")]
+    fn single(&mut self) -> &mut Option<crate::cpu_backend::SeamKv> {
+        if self.slots.is_empty() {
+            self.slots.push(None);
+            self.last_used.push(self.tick);
+        }
+        &mut self.slots[0]
+    }
+
     /// Pick (and prepare) the slot for `prompt`; returns its index. See the struct doc for the
     /// policy. A freshly created slot is `None` — the runner's first call uploads the weights.
-    fn pick_slot(&mut self, cfg: &crate::Config, prompt: &[u32]) -> Result<usize> {
+    fn pick(
+        &mut self,
+        be: &dyn infr_core::backend::Backend,
+        cfg: &crate::Config,
+        prompt: &[u32],
+    ) -> Result<usize> {
         // Seeding shorter prefixes than this isn't worth the copy submit.
         const MIN_SEED: usize = 16;
         let max_slots: usize = std::env::var("INFR_KV_SLOTS")
@@ -88,7 +128,7 @@ impl DenseVulkanSession {
                 .flatten()
                 .next()
                 .expect("pick_slot: no initialized slot to fork from");
-            let fresh = src.fork(&self.vk, cfg)?;
+            let fresh = src.fork(be, cfg)?;
             self.slots.push(Some(fresh));
             self.last_used.push(self.tick);
             self.slots.len() - 1
@@ -104,7 +144,7 @@ impl DenseVulkanSession {
             if best_s > score(&self.slots[target]) {
                 let src = self.slots[best_i].take().expect("scored slot is Some");
                 if let Some(dst) = self.slots[target].as_mut() {
-                    dst.seed_from(&self.vk, cfg, &src, best_s)?;
+                    dst.seed_from(be, cfg, &src, best_s)?;
                 }
                 self.slots[best_i] = Some(src);
             }
@@ -115,14 +155,26 @@ impl DenseVulkanSession {
 }
 
 /// A persistent Metal seam session — the Apple-GPU twin of [`DenseVulkanSession`]: owns the
-/// backend, the uploaded weights + KV cache, and the token ids materialized in it, so every later
-/// [`CpuModel::generate_metal_session`] call prefills only the suffix that differs from the
-/// previous turn.
+/// backend and the conversation [`SlotPool`], so every later
+/// [`CpuModel::generate_metal_session`] call prefills only the suffix that differs from its
+/// slot's previous turn, and concurrent conversations (serve) each keep their own KV slot off
+/// the one shared weight upload. Slot switches re-record the decode replay tape (its fingerprint
+/// covers the bound KV/IO buffer addresses) — one graph-walk token per switch, never a stale
+/// replay.
 #[cfg(target_os = "macos")]
 pub struct DenseMetalSession {
     mtl: infr_metal::MetalBackend,
-    state: Option<crate::cpu_backend::SeamKv>,
+    pool: SlotPool,
     max_ctx: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl DenseMetalSession {
+    /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
+    /// warmup generation so the first real prompt starts from clean slots.
+    pub fn reset_cache(&mut self) {
+        self.pool.reset_cache();
+    }
 }
 
 impl CpuModel {
@@ -155,9 +207,7 @@ impl CpuModel {
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
         Ok(DenseVulkanSession {
             vk,
-            slots: Vec::new(),
-            last_used: Vec::new(),
-            tick: 0,
+            pool: SlotPool::new(),
             max_ctx,
         })
     }
@@ -192,7 +242,7 @@ impl CpuModel {
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let slot = session.pick_slot(&self.cfg, &prompt_tokens)?;
+        let slot = session.pool.pick(&session.vk, &self.cfg, &prompt_tokens)?;
         let max_ctx = session.max_ctx;
         let (_generated, stats) = crate::cpu_backend::generate_dense_gpu_session(
             &session.vk,
@@ -203,7 +253,7 @@ impl CpuModel {
             &prompt_tokens,
             max_new,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
-            &mut session.slots[slot],
+            &mut session.pool.slots[slot],
             max_ctx,
             constraint,
         )?;
@@ -330,7 +380,7 @@ impl CpuModel {
         let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
         Ok(DenseMetalSession {
             mtl,
-            state: None,
+            pool: SlotPool::new(),
             max_ctx,
         })
     }
@@ -367,6 +417,7 @@ impl CpuModel {
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
+        let slot = session.pool.pick(&session.mtl, &self.cfg, &prompt_tokens)?;
         let (_generated, stats) = crate::cpu_backend::generate_dense_metal_session(
             &session.mtl,
             &self.gguf,
@@ -376,7 +427,7 @@ impl CpuModel {
             &prompt_tokens,
             max_new,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
-            &mut session.state,
+            &mut session.pool.slots[slot],
             session.max_ctx,
             constraint,
         )?;
@@ -476,7 +527,7 @@ impl CpuModel {
             &committed,
             1,
             |_| {},
-            &mut session.state,
+            session.pool.single(),
             session.max_ctx,
             None,
         )?;
@@ -522,7 +573,7 @@ impl CpuModel {
                 &committed,
                 budget,
                 |_| {},
-                &mut draft_session.state,
+                draft_session.pool.single(),
                 draft_session.max_ctx,
                 None,
             )?;
@@ -542,7 +593,7 @@ impl CpuModel {
                 &self.token_embd,
                 self.per_layer_embd.as_ref(),
                 &feed,
-                &mut session.state,
+                session.pool.single(),
                 session.max_ctx,
             )?;
             if std::env::var("INFR_SPEC_DEBUG").is_ok() {
@@ -614,7 +665,7 @@ impl CpuModel {
         n_gen: usize,
     ) -> Result<crate::GenStats> {
         let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
-        if let Some(s) = session.state.as_mut() {
+        if let Some(s) = session.pool.single().as_mut() {
             s.reset_tokens();
         }
         let (_, stats) = crate::cpu_backend::generate_dense_metal_session(
@@ -626,7 +677,7 @@ impl CpuModel {
             &prompt,
             n_gen,
             |_| {},
-            &mut session.state,
+            session.pool.single(),
             session.max_ctx,
             None,
         )?;

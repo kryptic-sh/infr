@@ -436,6 +436,19 @@ impl ChatModel for MetalSeamChat {
         self.model.render_chat_messages(messages)
     }
 
+    fn warmup(&mut self) -> Result<()> {
+        // (No INFR_METAL_PROFILE suppression: the Metal backend reads it at CONSTRUCTION —
+        // which happens inside this first generate — so unsetting it here would disable
+        // profiling for the whole session, not just the warmup.)
+        self.generate("Hi", 2, &mut |_| {})?;
+        // Drop the warmup tokens so the first real prompt prefills clean slots from row 0
+        // instead of forking off a garbage prefix.
+        if let Some(s) = &mut self.session {
+            s.reset_cache();
+        }
+        Ok(())
+    }
+
     fn generate(
         &mut self,
         prompt: &str,

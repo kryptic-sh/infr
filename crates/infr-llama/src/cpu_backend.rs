@@ -674,10 +674,11 @@ pub(crate) fn generate_dense_backend(
     };
     let mut k_fmt = parse_kv_fmt("INFR_KV_TYPE_K");
     let mut v_fmt = parse_kv_fmt("INFR_KV_TYPE_V");
-    // Vulkan currently supports only COUPLED Q8 (K==V==q8): its dequant-on-read attention is a single
-    // coupled-Q8 kernel. A mixed request (one side q8, one f16) falls back to f16 on both (CPU/Metal
-    // handle mixed natively). Drop this once the Vulkan mixed-K/V kernels land.
-    if be.name() == "vulkan" && k_fmt != v_fmt {
+    // The GPU backends currently support only COUPLED Q8 (K==V==q8): their attention picks ONE
+    // Q8-KV kernel that reads BOTH K and V as q8, so a mixed request (one side q8, one f16) would
+    // misread the f16 side. Fall back to f16 on both for a mixed ask on Vulkan/Metal (only the CPU
+    // reference dequants K and V independently). Drop this once the GPU mixed-K/V kernels land.
+    if matches!(be.name(), "vulkan" | "metal") && k_fmt != v_fmt {
         k_fmt = DType::F16;
         v_fmt = DType::F16;
     }

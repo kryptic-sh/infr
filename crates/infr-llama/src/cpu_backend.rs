@@ -63,7 +63,10 @@ struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
     rope_freqs: Option<TensorId>, // gemma4 proportional-RoPE divisors (full-attention layers)
-    per_layer_inp: Option<TensorId>, // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`
+    // gemma4 E2B host-gathered per-layer TOKEN embedding rows `[n_layer*npl]` — the graph Input
+    // the driver binds `ipl_buf` to; the GPU prologue turns this into the layer loop's actual
+    // per-layer input vector (see `per_layer_inp` inside `build`).
+    pl_tok_in: Option<TensorId>,
     logits: TensorId,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
@@ -476,70 +479,35 @@ impl SeamKv {
     }
 }
 
-/// gemma4 E2B: build the per-(token,layer) input vectors on the host for `rows` tokens —
-/// `ipl[r][l] = (RMSNorm(model_proj_l·emb_r/√ne)·proj_norm + per_layer_tok_embd[tok_r][l]·√npl)/√2`
-/// — returning `[rows, n_layer*npl]` row-major. The projection is a real host matmul
-/// (rows × n_layer × npl dots of length ne), so parallelize over (row, layer) with rayon
-/// (mirrors the bespoke path's parallelized per-layer-embedding matmul).
-#[allow(clippy::too_many_arguments)]
-fn e2b_ipl_rows(
-    g: &Gguf,
-    cfg: &Config,
-    ple: &PerLayerEmbd,
-    token_embd: &[f32],
-    tokens: &[u32],
-    embed_scale: f32,
-) -> AResult<Vec<f32>> {
+/// gemma4 E2B: gather + dequant this chunk's per-layer TOKEN embedding rows on the host — the ONLY
+/// part llama.cpp keeps host-side ("very little benefit to offloading the input layer"); the
+/// model_proj GEMV + RMSNorm + combine now run as GPU graph ops (see the E2B prologue in `build`).
+/// Returns `pl_tok_scaled[r][l*npl+j] = per_layer_tok_embd[tok_r][l*npl+j] * √npl`, `[rows,
+/// n_layer*npl]` row-major — uploaded to `ipl_buf` and bound to the graph Input `pl_tok_in`.
+fn e2b_ipl_rows(g: &Gguf, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32>> {
     use rayon::prelude::*;
-    let (npl, nl, nem) = (ple.npl, ple.n_layer, ple.n_embd);
-    let ne = cfg.n_embd;
-    let inv_sqrt_ne = 1.0 / (nem as f32).sqrt();
+    let (npl, nl) = (ple.npl, ple.n_layer);
     let sqrt_npl = (npl as f32).sqrt();
-    let inv_sqrt2 = 1.0 / 2f32.sqrt();
     let te_bytes = g
         .tensor_bytes("per_layer_token_embd.weight")
         .map_err(|e| anyhow!("{e}"))?;
-    // Per-row prep (scaled embedding + dequanted per-layer token row) once, serially — cheap next
-    // to the projection matmul. The matmul then parallelizes over FLAT (row, layer) pairs: at
-    // decode rows==1, row-only parallelism left the whole nl×npl×ne projection on one thread
-    // (~5ms/token — the seam's E2B decode bottleneck); flat pairs keep all cores busy at any rows.
-    let prep: Vec<(Vec<f32>, Vec<f32>)> = tokens
-        .iter()
-        .map(|&tok| -> AResult<(Vec<f32>, Vec<f32>)> {
+    let mut out = vec![0f32; tokens.len() * nl * npl];
+    out.par_chunks_mut(nl * npl)
+        .zip(tokens.par_iter())
+        .try_for_each(|(dst, &tok)| -> AResult<()> {
             let tok = tok as usize;
-            let emb: Vec<f32> = token_embd[tok * ne..tok * ne + ne]
-                .iter()
-                .map(|&x| x * embed_scale)
-                .collect();
             let r0 = tok * ple.tok_embd_row_bytes;
             let pl_tok = dequant_block(
                 ple.tok_embd_dtype,
                 &te_bytes[r0..r0 + ple.tok_embd_row_bytes],
             )
             .map_err(|e| anyhow!("{e}"))?;
-            Ok((emb, pl_tok))
-        })
-        .collect::<AResult<_>>()?;
-    let mut ipl = vec![0f32; tokens.len() * nl * npl];
-    ipl.par_chunks_mut(npl).enumerate().for_each(|(i, slice)| {
-        let (emb, pl_tok) = &prep[i / nl];
-        let layer = i % nl;
-        let mut ss = 0f32;
-        for (j, pj) in slice.iter_mut().enumerate() {
-            let wrow = &ple.model_proj[(layer * npl + j) * nem..(layer * npl + j) * nem + nem];
-            let acc: f32 = wrow.iter().zip(emb).map(|(a, b)| a * b).sum();
-            let v = acc * inv_sqrt_ne;
-            *pj = v;
-            ss += v * v;
-        }
-        let rms = 1.0 / (ss / npl as f32 + cfg.rms_eps).sqrt();
-        for (j, pj) in slice.iter_mut().enumerate() {
-            let normed = *pj * rms * ple.proj_norm[j];
-            let tokv = pl_tok[layer * npl + j] * sqrt_npl;
-            *pj = (normed + tokv) * inv_sqrt2;
-        }
-    });
-    Ok(ipl)
+            for (d, s) in dst.iter_mut().zip(pl_tok.iter()) {
+                *d = s * sqrt_npl;
+            }
+            Ok(())
+        })?;
+    Ok(out)
 }
 
 /// Longest shared prefix of the cached tokens and the new prompt (the KV rows that stay valid).
@@ -767,6 +735,19 @@ pub(crate) fn generate_dense_backend(
         } else {
             wload(&["token_embd.weight"])?;
         }
+        // gemma4 E2B: the per-layer input-embedding projection weights, native-uploaded like any
+        // other weight (model_proj stays bf16 — the seam's native bf16 GEMV/GEMM reads it directly;
+        // proj_norm is f32). The GPU graph prologue (in `build`, below) runs the GEMV + RMSNorm that
+        // used to be a host loop. Declared here (in upload order) — `build` pushes the matching
+        // handles right after `w_lm`/before `v_ones`.
+        if e2b {
+            wload(&["per_layer_model_proj.weight"])?;
+            wload(&["per_layer_proj_norm.weight"])?;
+            // Sanity-check the two uploads landed with the shapes the GPU prologue assumes
+            // (model_proj is `[n_layer*npl, n_embd]`, proj_norm is `[npl]`).
+            debug_assert_eq!(wspecs[wspecs.len() - 2].1, c.n_layer * npl * ne);
+            debug_assert_eq!(wspecs[wspecs.len() - 1].1, npl);
+        }
         // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
         // of the max head dim serves every layer (a narrower layer reads its leading prefix).
         if gemma4 {
@@ -895,8 +876,11 @@ pub(crate) fn generate_dense_backend(
         let hidden = g.input(f32d(batch * ne));
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
         let rope_freqs = rf_buf.as_ref().map(|(_, n)| g.input(f32d(*n)));
-        // gemma4 E2B per-(token,layer) input vectors `[batch, n_layer*npl]` (computed host-side).
-        let per_layer_inp = if e2b {
+        // gemma4 E2B per-(token,layer) TOKEN embedding rows `[batch, n_layer*npl]` — host-gathered
+        // + dequanted (the big `per_layer_token_embd` table stays off-VRAM, gathered per token).
+        // The full `per_layer_inp` consumed by the layer loop is computed from this on the GPU
+        // (model_proj GEMV + RMSNorm), further down, once its weights are declared.
+        let pl_tok_in = if e2b {
             Some(g.input(f32d(batch * c.n_layer * npl)))
         } else {
             None
@@ -1006,6 +990,16 @@ pub(crate) fn generate_dense_backend(
         }
         let w_out_norm = wpush(&mut g, &mut weights);
         let w_lm = wpush(&mut g, &mut weights);
+        // gemma4 E2B per-layer input-embedding projection weights — declared here to match the
+        // `wload` upload order (right after lm_head, before the gemma4 V-norm ones-vector).
+        let (mp_w, pn_w) = if e2b {
+            (
+                Some(wpush(&mut g, &mut weights)),
+                Some(wpush(&mut g, &mut weights)),
+            )
+        } else {
+            (None, None)
+        };
         let v_ones = if gemma4 {
             Some(wpush(&mut g, &mut weights))
         } else {
@@ -1048,6 +1042,59 @@ pub(crate) fn generate_dense_backend(
         let plp = g.internal(f32d(batch * ne));
 
         let eps = c.rms_eps;
+
+        // gemma4 E2B prologue: compute the full per-(token,layer) input vector `per_layer_inp`
+        // ([batch, n_layer*npl]) that the layer loop below consumes, on the GPU — matches
+        // llama.cpp's split (host: gather+dequant the per-layer token embedding row; GPU: the
+        // model_proj GEMV + RMSNorm + combine). `hidden` here is already the scaled token
+        // embedding (`emb = token_embd[tok] * embed_scale`), so it IS the `emb` the host version
+        // used to dot against `model_proj`.
+        let per_layer_inp =
+            if let (Some(mp_w), Some(pn_w), Some(pl_tok_in)) = (mp_w, pn_w, pl_tok_in) {
+                let nlnpl = c.n_layer * npl;
+                let acc = g.internal(f32d(batch * nlnpl));
+                g.push(Op::Linear {
+                    x: hidden,
+                    weight: mp_w,
+                    dst: acc,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: nlnpl as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Scale {
+                    x: acc,
+                    dst: acc,
+                    s: 1.0 / (ne as f32).sqrt(),
+                    n: (batch * nlnpl) as u32,
+                });
+                let normed = g.internal(f32d(batch * nlnpl));
+                g.push(Op::RmsNorm {
+                    x: acc,
+                    weight: pn_w,
+                    dst: normed,
+                    rows: (batch * c.n_layer) as u32,
+                    dim: npl as u32,
+                    eps,
+                });
+                let ipl = g.internal(f32d(batch * nlnpl));
+                g.push(Op::Add {
+                    a: normed,
+                    b: pl_tok_in,
+                    dst: ipl,
+                    n: (batch * nlnpl) as u32,
+                });
+                g.push(Op::Scale {
+                    x: ipl,
+                    dst: ipl,
+                    s: 1.0 / 2f32.sqrt(),
+                    n: (batch * nlnpl) as u32,
+                });
+                Some(ipl)
+            } else {
+                None
+            };
+
         for (l, lw) in lw.iter().enumerate() {
             // Per-layer dims (gemma4 SWA vs full; uniform for every other model).
             let hd = c.layer_head_dim(l);
@@ -1549,7 +1596,7 @@ pub(crate) fn generate_dense_backend(
                 hidden,
                 positions,
                 rope_freqs,
-                per_layer_inp,
+                pl_tok_in,
                 logits,
                 k_cache,
                 v_cache,
@@ -1636,9 +1683,10 @@ pub(crate) fn generate_dense_backend(
             be.upload(pf_pos_buf.as_ref(), bytemuck::cast_slice(&pf_positions))
                 .map_err(|e| anyhow!("{e}"))?;
 
-            // gemma4 E2B: the chunk's per-(token,layer) input vectors, host-computed in parallel.
+            // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only — the
+            // model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build` prologue).
             let pf_ipl_buf = if let Some(ple) = ple {
-                let ipl = e2b_ipl_rows(g, c, ple, token_embd, &prompt[cstart..cend], embed_scale)?;
+                let ipl = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
                 let b = be
                     .alloc(ipl.len() * 4, BufferUsage::Staging)
                     .map_err(|e| anyhow!("{e}"))?;
@@ -1662,7 +1710,7 @@ pub(crate) fn generate_dense_backend(
             if let (Some(rid), Some((rb, _))) = (pf_h.rope_freqs, &rf_buf) {
                 pf_b.bind(rid, rb.as_ref());
             }
-            if let (Some(pid), Some(ib)) = (pf_h.per_layer_inp, &pf_ipl_buf) {
+            if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &pf_ipl_buf) {
                 pf_b.bind(pid, ib.as_ref());
             }
             for l in 0..c.n_layer {
@@ -1729,7 +1777,7 @@ pub(crate) fn generate_dense_backend(
         if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
             b.bind(rid, rb.as_ref());
         }
-        if let (Some(pid), Some(ib)) = (h.per_layer_inp, &ipl_buf) {
+        if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
             b.bind(pid, ib.as_ref());
         }
         for l in 0..c.n_layer {
@@ -1765,10 +1813,10 @@ pub(crate) fn generate_dense_backend(
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;
 
-        // gemma4 E2B: build this token's per-layer input vector on the host (mirrors the GPU forward):
-        // `ipl[l] = ((model_proj_l·emb)/√n_embd, RMSNorm'd over npl) + (per_layer_tok_embd_row × √npl)) / √2`.
+        // gemma4 E2B: this token's per-layer TOKEN embedding row (gather+dequant only — the
+        // model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build` prologue).
         if let (Some(ple), Some(ipl_buf)) = (ple, &ipl_buf) {
-            let ipl = e2b_ipl_rows(g, c, ple, token_embd, &[tok as u32], embed_scale)?;
+            let ipl = e2b_ipl_rows(g, ple, &[tok as u32])?;
             be.upload(ipl_buf.as_ref(), bytemuck::cast_slice(&ipl))
                 .map_err(|e| anyhow!("{e}"))?;
         }
@@ -1790,7 +1838,7 @@ pub(crate) fn generate_dense_backend(
             if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
                 b.bind(rid, rb.as_ref());
             }
-            if let (Some(pid), Some(ib)) = (h.per_layer_inp, &ipl_buf) {
+            if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
                 b.bind(pid, ib.as_ref());
             }
             for l in 0..c.n_layer {

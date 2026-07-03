@@ -12,17 +12,17 @@ use tokenizers::Tokenizer;
 /// which is what made a naive ByteLevel produce different token ids.
 pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-/// Build the gemma4 E2B per-layer-embedding global tensors from the GGUF (host f32 — no GPU). The
-/// big `per_layer_token_embd` stays quantized in the mmap and is gathered per token at forward time.
-/// `None` for models without per-layer embeddings. Shared by the GPU and CPU loaders.
-/// gemma4 E2B (gemma3n) per-layer input-embedding global tensors. The per-(token,layer) input vector
-/// is `((model_proj·scaled_embd)·1/√n_embd, RMSNorm'd) + (tok_embd_row × √npl)) × 1/√2`.
+/// Build the gemma4 E2B per-layer-embedding host-gather metadata from the GGUF. `None` for models
+/// without per-layer embeddings. The big `per_layer_token_embd` table stays quantized in the mmap
+/// and is gathered + dequanted per token at forward time (mirrors llama.cpp, which classifies
+/// input embeddings as CPU-resident: "very little benefit to offloading the input layer"). The
+/// `per_layer_model_proj` / `per_layer_proj_norm` weights are NOT loaded here — they're small
+/// enough to native-upload to VRAM like any other weight (see `wload`/`wpush` in `cpu_backend.rs`)
+/// and the projection + RMSNorm now run as GPU graph ops instead of a host GEMV. Shared by the GPU
+/// and CPU loaders.
 pub(crate) struct PerLayerEmbd {
     pub(crate) npl: usize,                       // per-layer embedding width (256)
     pub(crate) n_layer: usize,                   // number of layers (35)
-    pub(crate) n_embd: usize,                    // model width (1536)
-    pub(crate) model_proj: Vec<f32>, // [npl*n_layer rows, n_embd] host f32 (row k = the n_embd vector to dot)
-    pub(crate) proj_norm: Vec<f32>,  // [npl] RMSNorm weight over the per-layer dim
     pub(crate) tok_embd_dtype: infr_core::DType, // per_layer_token_embd dtype (gathered per token from the gguf)
     pub(crate) tok_embd_row_bytes: usize,        // bytes per token row (npl*n_layer elements)
 }
@@ -31,8 +31,6 @@ pub(crate) fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerL
     if cfg.n_embd_per_layer == 0 {
         return Ok(None);
     }
-    let (model_proj, _) = load_tensor_dequant(g, "per_layer_model_proj.weight")?;
-    let (proj_norm, _) = load_tensor_dequant(g, "per_layer_proj_norm.weight")?;
     let te = g
         .tensors()
         .iter()
@@ -43,9 +41,6 @@ pub(crate) fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerL
     Ok(Some(PerLayerEmbd {
         npl: cfg.n_embd_per_layer,
         n_layer: cfg.n_layer,
-        n_embd: cfg.n_embd,
-        model_proj,
-        proj_norm,
         tok_embd_dtype: te.dtype,
         tok_embd_row_bytes: te.nbytes / te_vocab,
     }))

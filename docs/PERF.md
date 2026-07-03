@@ -63,12 +63,29 @@ Rules that exist because we got burned:
   bit-for-bit alone (verify tg128 before/after); a decode change must leave pp
   alone.
 
+## Archiving sweeps
+
+`scripts/perf-sweep.sh <models...>` (with `INFR_METAL=1` on macOS) runs the
+sweep and archives the matrix under `target/perf/<utc>-<sha>.txt` — keep the
+model list fixed so every commit's ratios are a diff away, and paste the
+matrix into the PR when a slice lands.
+
 ## Profiling
 
 ```bash
 INFR_PROF2=1 infr bench "$M" -p 512 -n 0 -r 1   # per-op GPU timestamps
 INFR_PROF_PF=1 ...                              # per-chunk prefill wall time
 ```
+
+Metal uses `INFR_METAL_PROFILE` instead: `=1` encode/GPU wall split, `=3`
+per-op GPU time from stage-boundary counter samples — **the only honest per-op
+mode**: the decode replay tape re-executes tokens without walking ops, so the
+flush mode (`=2`) silently attributes a sample of one token. `=3` disables the
+tape for the run. Sweep with `--dev MTL0` (llama-bench rejects `Vulkan0` on a
+Metal box). Micro-probes live in `crates/infr-metal/tests/`
+(`gemv_bw`, `dispatch_overhead`) — chained-dispatch numbers there are
+thermally unstable across back-to-back runs; trust e2e benches for accept /
+revert calls.
 
 - `INFR_PROF2` prints one block per submit. **Trust the percentages and per-op
   relative times; the absolute µs totals can overflow.** The op label breakdown

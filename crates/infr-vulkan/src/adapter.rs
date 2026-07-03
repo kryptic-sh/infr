@@ -436,9 +436,11 @@ fn lower_op(
                 };
                 // Q4_K: the 8-warp warptile coopmat GEMM (native_gemm_warp, in-shader dequant)
                 // beats mmq dp4a at prefill shapes (161 vs 417µs on [512,1024]×[1024,6144] — the
-                // wide tile amortizes staging; RADV can't use int8 WMMA). mmq stays for shapes the
-                // warp tile can't cover (n%256≠0). INFR_NO_MMQ also skips mmq for A/B.
-                let warp_ok = out_f % 256 == 0
+                // wide tile amortizes staging; RADV can't use int8 WMMA). mmq stays for shapes NO
+                // warp tile can cover — n%128≠0 (the NARROW_N tile covers n%128; gemma3-1b's
+                // ne=1152 projections sat on scalar mmq at ~10 TF under the old n%256 gate).
+                // INFR_NO_MMQ also skips mmq for A/B.
+                let warp_ok = out_f % 128 == 0
                     && crate::gemm::native_gemm_warp_build_spv(dt).is_some()
                     && std::env::var("INFR_NO_GEMM_WARP").is_err();
                 if matches!(dt, infr_core::DType::Q4K)

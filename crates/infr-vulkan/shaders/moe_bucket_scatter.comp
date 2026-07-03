@@ -11,6 +11,9 @@ layout(binding = 2) readonly buffer OB { uint offsets[]; };
 layout(binding = 3) buffer FB { uint fill[]; };
 layout(binding = 4) writeonly buffer RB { uint bucket_rows[]; };
 layout(binding = 5) writeonly buffer WB { float bucket_wts[]; };
+// Inverse map for the batched pipeline's gather-free reduce: assignment p → its bucket slot, so
+// a per-token pass can read its n_used expert outputs back in FIXED slot order (deterministic sum).
+layout(binding = 6) writeonly buffer IB { uint inv_pos[]; };
 void main() {
     uint p = gl_GlobalInvocationID.x;
     if (p >= pc.n_pairs) { return; }
@@ -18,4 +21,5 @@ void main() {
     uint pos = offsets[e] + atomicAdd(fill[e], 1u);
     bucket_rows[pos] = p / pc.n_used; // token row
     bucket_wts[pos] = tok_wts[p];
+    inv_pos[p] = pos;
 }

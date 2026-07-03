@@ -2857,6 +2857,7 @@ impl<'a> Recorder<'a> {
         fill: &dyn Buffer,
         bucket_rows: &dyn Buffer,
         bucket_wts: &dyn Buffer,
+        inv_pos: &dyn Buffer,
         n_pairs: usize,
         n_used: usize,
     ) {
@@ -2864,7 +2865,7 @@ impl<'a> Recorder<'a> {
         let k = self.be.kernel(
             "moe_bucket_scatter",
             crate::gemm::moe_bucket_scatter_spv(),
-            6,
+            7,
             8,
         );
         let mut push = [0u8; 8];
@@ -2879,10 +2880,152 @@ impl<'a> Recorder<'a> {
                 Self::vkb(fill),
                 Self::vkb(bucket_rows),
                 Self::vkb(bucket_wts),
+                Self::vkb(inv_pos),
             ],
-            3,
+            4,
             &push,
             (n_pairs as u32).div_ceil(64),
+        );
+    }
+
+    /// Fused gather+quant for the batched MoE pipeline: quantize `n_slots` BUCKET rows (each
+    /// reading its source token row via `bucket_rows`) straight into the packed expert-grouped
+    /// layout — one dispatch replaces the per-expert gather and per-expert quant stages.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quant_q8_gather(
+        &self,
+        a: &dyn Buffer,
+        bucket_rows: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        n_slots: usize,
+        k_dim: usize,
+    ) {
+        self.stamp("quant_q8");
+        let kq = self.be.kernel_sg(
+            "quant_q8_gather",
+            crate::gemm::quant_q8_gather_spv(),
+            5,
+            12,
+            32,
+        );
+        let mut p = [0u8; 12];
+        p[0..4].copy_from_slice(&(n_slots as u32).to_ne_bytes());
+        p[4..8].copy_from_slice(&(k_dim as u32).to_ne_bytes());
+        p[8..12].copy_from_slice(&32u32.to_ne_bytes());
+        self.dispatch(
+            kq,
+            &[
+                Self::vkb(a),
+                Self::vkb(bucket_rows),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+            ],
+            3,
+            &p,
+            (n_slots * (k_dim / 32)) as u32,
+        );
+    }
+
+    /// ALL experts' mmq GEMMs in ONE dispatch (`gl_WorkGroupID.y` = expert): activation rows are
+    /// packed by expert (bucket layout, segment e = offsets[e]..+counts[e]); the weight bank is
+    /// indexed `w_base + e·stride`. Grid x covers the worst-case row tiles (`ceil(rows/64)` — the
+    /// whole chunk landing on one expert); tiles past a segment exit immediately, so the empty
+    /// launches cost ~nothing while the dispatch count drops from ~n_expert·stages per layer to
+    /// stages. `sact` is Q4_K's min-term row sums (None for Q6_K, which has no min).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq_experts(
+        &self,
+        dtype: infr_core::DType,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: Option<&dyn Buffer>,
+        w: &dyn Buffer,
+        w_base: usize,
+        stride: usize,
+        counts: &dyn Buffer,
+        offsets: &dyn Buffer,
+        c: &dyn Buffer,
+        rows: usize,
+        k: usize,
+        n: usize,
+        n_expert: usize,
+    ) {
+        self.stamp(match dtype {
+            infr_core::DType::Q6K => "expert_down",
+            _ => "expert_gateup",
+        });
+        let (name, spv, nb): (_, _, usize) = match dtype {
+            infr_core::DType::Q4K => (
+                "native_gemm_mmq_q4k_xp",
+                crate::gemm::native_gemm_mmq_q4k_xp_spv(),
+                7,
+            ),
+            infr_core::DType::Q6K => (
+                "native_gemm_mmq_q6k_xp",
+                crate::gemm::native_gemm_mmq_q6k_xp_spv(),
+                6,
+            ),
+            _ => unreachable!("batched MoE expert GEMM: Q4_K/Q6_K only"),
+        };
+        let kern = self.be.kernel(name, spv, nb, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(stride as u32).to_ne_bytes()); // pc.m = expert stride
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let gx = (rows.div_ceil(64) * (n / 64)) as u32;
+        let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
+        if let Some(sa) = sact {
+            bufs.push(Self::vkb(sa));
+        }
+        bufs.extend_from_slice(&[
+            Self::vkb(w),
+            Self::vkb(counts),
+            Self::vkb(offsets),
+            Self::vkb(c),
+        ]);
+        self.dispatch3(kern, &bufs, 1, &push, gx, n_expert as u32, 1);
+    }
+
+    /// Batched-MoE epilogue: `dst[t] = Σ_s bucket_wts[p]·y_all[p]` over the token's `n_used`
+    /// assignments (p = inv_pos[t·n_used+s]) — fixed slot order, deterministic, no atomics, and
+    /// dst is written directly (no zero + per-expert accumulate passes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scatter_reduce(
+        &self,
+        y_all: &dyn Buffer,
+        bucket_wts: &dyn Buffer,
+        inv_pos: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        ne: usize,
+        n_used: usize,
+    ) {
+        self.stamp("moe_scatter");
+        let k = self.be.kernel(
+            "moe_scatter_reduce",
+            crate::gemm::moe_scatter_reduce_spv(),
+            4,
+            12,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(y_all),
+                Self::vkb(bucket_wts),
+                Self::vkb(inv_pos),
+                Self::vkb(dst),
+            ],
+            1,
+            &push,
+            ((rows * ne) as u32).div_ceil(64),
         );
     }
 
@@ -3130,322 +3273,6 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             (n as u32).div_ceil(64),
-        );
-    }
-
-    /// Gather rows: `dst[j,:] = src[idx[j],:]` for j in 0..m, each row `ne` wide. Assembles an MoE
-    /// expert's token batch from the resident activations.
-    pub fn gather_rows(
-        &self,
-        src: &dyn Buffer,
-        idx: &dyn Buffer,
-        idx_base: usize,
-        dst: &dyn Buffer,
-        m: usize,
-        ne: usize,
-    ) {
-        self.stamp("moe_gather");
-        let k = self
-            .be
-            .kernel("gather_rows", crate::gemm::gather_rows_spv(), 3, 12);
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(idx_base as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(src), Self::vkb(idx), Self::vkb(dst)],
-            1,
-            &push,
-            ((m * ne) as u32).div_ceil(64),
-        );
-    }
-
-    /// Batched-MoE FFN prologue: per-expert INDIRECT dispatch args from the GPU-routed counts
-    /// (7 slots × 4 u32 per expert — see shaders/moe_expert_args.comp). One dispatch; the whole
-    /// expert loop then records with no host readback.
-    pub fn moe_expert_args(
-        &self,
-        counts: &dyn Buffer,
-        args: &dyn Buffer,
-        n_expert: usize,
-        ne: usize,
-        nff: usize,
-    ) {
-        self.stamp("moe_bucket");
-        let k = self
-            .be
-            .kernel("moe_expert_args", crate::gemm::moe_expert_args_spv(), 2, 12);
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(n_expert as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(nff as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(counts), Self::vkb(args)],
-            1,
-            &push,
-            (n_expert as u32).div_ceil(64),
-        );
-    }
-
-    /// GPU-routed row gather for expert `e`: m/offset come from the routing buffers, the grid from
-    /// the prologue's indirect args (`slot` selects which of the 7 per-expert arg slots).
-    #[allow(clippy::too_many_arguments)]
-    pub fn gather_rows_ind(
-        &self,
-        src: &dyn Buffer,
-        idx: &dyn Buffer,
-        counts: &dyn Buffer,
-        offsets: &dyn Buffer,
-        dst: &dyn Buffer,
-        args: &dyn Buffer,
-        e: usize,
-        slot: usize,
-        ne: usize,
-    ) {
-        self.stamp("moe_gather");
-        let k = self
-            .be
-            .kernel("gather_rows_ind", crate::gemm::gather_rows_ind_spv(), 5, 12);
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(e as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
-        self.dispatch_indirect(
-            k,
-            &[
-                Self::vkb(src),
-                Self::vkb(idx),
-                Self::vkb(counts),
-                Self::vkb(offsets),
-                Self::vkb(dst),
-            ],
-            1,
-            &push,
-            Self::vkb(args),
-            ((e * 7 + slot) * 16) as u64,
-        );
-    }
-
-    /// GPU-routed weighted scatter-add for expert `e` (see [`Self::gather_rows_ind`]).
-    #[allow(clippy::too_many_arguments)]
-    pub fn scatter_add_rows_ind(
-        &self,
-        y: &dyn Buffer,
-        idx: &dyn Buffer,
-        w: &dyn Buffer,
-        counts: &dyn Buffer,
-        offsets: &dyn Buffer,
-        dst: &dyn Buffer,
-        args: &dyn Buffer,
-        e: usize,
-        slot: usize,
-        ne: usize,
-    ) {
-        self.stamp("moe_scatter");
-        let k = self.be.kernel(
-            "scatter_add_rows_ind",
-            crate::gemm::scatter_add_rows_ind_spv(),
-            6,
-            12,
-        );
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(e as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
-        self.dispatch_indirect(
-            k,
-            &[
-                Self::vkb(y),
-                Self::vkb(idx),
-                Self::vkb(w),
-                Self::vkb(counts),
-                Self::vkb(offsets),
-                Self::vkb(dst),
-            ],
-            1,
-            &push,
-            Self::vkb(args),
-            ((e * 7 + slot) * 16) as u64,
-        );
-    }
-
-    /// Indirect-grid quant_q8 (grid = m·nblk from the prologue args; the kernel derives its row
-    /// from the workgroup id, so no push-constant m is needed).
-    #[allow(clippy::too_many_arguments)]
-    pub fn quant_q8_ind(
-        &self,
-        a: &dyn Buffer,
-        qa: &dyn Buffer,
-        dact: &dyn Buffer,
-        sact: &dyn Buffer,
-        k_dim: usize,
-        args: &dyn Buffer,
-        e: usize,
-        slot: usize,
-    ) {
-        self.stamp("quant_q8");
-        let kq = self
-            .be
-            .kernel("quant_q8", crate::gemm::quant_q8_spv(), 4, 12);
-        let mut p = [0u8; 12];
-        // m unused in-shader (row = wg / nblk); keep 0.
-        p[4..8].copy_from_slice(&(k_dim as u32).to_ne_bytes());
-        p[8..12].copy_from_slice(&32u32.to_ne_bytes());
-        self.dispatch_indirect(
-            kq,
-            &[
-                Self::vkb(a),
-                Self::vkb(qa),
-                Self::vkb(dact),
-                Self::vkb(sact),
-            ],
-            3,
-            &p,
-            Self::vkb(args),
-            ((e * 7 + slot) * 16) as u64,
-        );
-    }
-
-    /// Indirect-grid Q4_K mmq expert GEMM (the kernel never reads its push-constant m — padded
-    /// rows read garbage and their outputs land in padded scratch, both already tolerated).
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_mmq_q4k_ind(
-        &self,
-        qa: &dyn Buffer,
-        dact: &dyn Buffer,
-        sact: &dyn Buffer,
-        w: &dyn Buffer,
-        w_base: usize,
-        c: &dyn Buffer,
-        k_dim: usize,
-        n: usize,
-        args: &dyn Buffer,
-        e: usize,
-        slot: usize,
-    ) {
-        self.stamp("expert_gateup");
-        let kern = self.be.kernel(
-            "native_gemm_mmq_q4k",
-            crate::gemm::native_gemm_mmq_q4k_spv(),
-            5,
-            16,
-        );
-        let mut push = [0u8; 16];
-        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(k_dim as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch_indirect(
-            kern,
-            &[
-                Self::vkb(qa),
-                Self::vkb(dact),
-                Self::vkb(sact),
-                Self::vkb(w),
-                Self::vkb(c),
-            ],
-            1,
-            &push,
-            Self::vkb(args),
-            ((e * 7 + slot) * 16) as u64,
-        );
-    }
-
-    /// Indirect-grid Q6_K mmq expert GEMM (see [`Self::matmul_mmq_q4k_ind`]).
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_mmq_q6k_ind(
-        &self,
-        qa: &dyn Buffer,
-        dact: &dyn Buffer,
-        w: &dyn Buffer,
-        w_base: usize,
-        c: &dyn Buffer,
-        k_dim: usize,
-        n: usize,
-        args: &dyn Buffer,
-        e: usize,
-        slot: usize,
-    ) {
-        self.stamp("expert_down");
-        let kern = self.be.kernel(
-            "native_gemm_mmq_q6k",
-            crate::gemm::native_gemm_mmq_q6k_spv(),
-            4,
-            16,
-        );
-        let mut push = [0u8; 16];
-        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(k_dim as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch_indirect(
-            kern,
-            &[Self::vkb(qa), Self::vkb(dact), Self::vkb(w), Self::vkb(c)],
-            1,
-            &push,
-            Self::vkb(args),
-            ((e * 7 + slot) * 16) as u64,
-        );
-    }
-
-    /// Indirect-grid SwiGLU (grid = ceil(m·nff/64) from the prologue; push n is the WORST-CASE
-    /// element count so the in-kernel guard passes for the whole dispatched range).
-    #[allow(clippy::too_many_arguments)]
-    pub fn silu_mul_ind(
-        &self,
-        gate: &dyn Buffer,
-        up: &dyn Buffer,
-        y: &dyn Buffer,
-        n_worst: usize,
-        args: &dyn Buffer,
-        e: usize,
-        slot: usize,
-    ) {
-        self.stamp("silu_mul");
-        let k = self
-            .be
-            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 8);
-        let mut push = [0u8; 8];
-        push[0..4].copy_from_slice(&(n_worst as u32).to_ne_bytes());
-        self.dispatch_indirect(
-            k,
-            &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
-            1,
-            &push,
-            Self::vkb(args),
-            ((e * 7 + slot) * 16) as u64,
-        );
-    }
-
-    /// Weighted scatter-add: `dst[idx[j],:] += w[j] * y[j,:]` for j in 0..m, each row `ne` wide.
-    /// Accumulates an MoE expert's weighted token outputs back into the resident hidden state
-    /// (chained across experts via WAW barriers on `dst`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn scatter_add_rows(
-        &self,
-        y: &dyn Buffer,
-        idx: &dyn Buffer,
-        w: &dyn Buffer,
-        base: usize,
-        dst: &dyn Buffer,
-        m: usize,
-        ne: usize,
-    ) {
-        self.stamp("moe_scatter");
-        let k = self.be.kernel(
-            "scatter_add_rows",
-            crate::gemm::scatter_add_rows_spv(),
-            4,
-            12,
-        );
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(base as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(y), Self::vkb(idx), Self::vkb(w), Self::vkb(dst)],
-            1,
-            &push,
-            ((m * ne) as u32).div_ceil(64),
         );
     }
 

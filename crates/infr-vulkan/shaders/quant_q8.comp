@@ -14,10 +14,25 @@
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint m; uint k; uint blk; } pc;
+// Binding order mirrors the recorder's hazard convention (inputs first, outputs last), so the
+// GATHER variant's extra readonly input shifts the outputs up by one.
+#ifdef GATHER
+// Batched-MoE fused gather+quant: the m rows are BUCKET slots (expert-grouped assignments); each
+// reads its source token row through `bucket_rows` and quantizes straight into the packed layout —
+// one dispatch replaces the per-expert gather + per-expert quant stages.
+#define QB 2
+#define DBI 3
+#define SBI 4
+layout(binding = 1) readonly buffer RB { uint bucket_rows[]; };
+#else
+#define QB 1
+#define DBI 2
+#define SBI 3
+#endif
 layout(binding = 0) readonly buffer ABuf { float a[]; };       // [m, k]
-layout(binding = 1) writeonly buffer QBuf { int8_t qa[]; };    // [m, k]
-layout(binding = 2) writeonly buffer DBuf { float16_t dact[]; }; // [m, nblk]
-layout(binding = 3) writeonly buffer SBuf { float16_t sact[]; }; // [m, nblk]
+layout(binding = QB) writeonly buffer QBuf { int8_t qa[]; };    // [m, k]
+layout(binding = DBI) writeonly buffer DBuf { float16_t dact[]; }; // [m, nblk]
+layout(binding = SBI) writeonly buffer SBuf { float16_t sact[]; }; // [m, nblk]
 
 void main() {
     uint nblk = pc.k / pc.blk;
@@ -27,7 +42,11 @@ void main() {
     uint t = gl_LocalInvocationID.x;   // 0 .. blk-1
     uint idx = row * pc.k + blk * pc.blk + t;
 
+#ifdef GATHER
+    float v = a[bucket_rows[row] * pc.k + blk * pc.blk + t];
+#else
     float v = a[idx];
+#endif
     float amax = subgroupMax(abs(v));
     float d = amax / 127.0;
     float inv = (amax > 0.0) ? 1.0 / d : 0.0;

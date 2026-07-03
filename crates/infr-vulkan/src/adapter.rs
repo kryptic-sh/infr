@@ -1300,7 +1300,25 @@ fn lower_op(
                 let al = |n: usize| be_.alloc((n * 4).max(4), BufferUsage::Activations);
                 let alu = |n: usize| be_.alloc_uninit(n.max(4), BufferUsage::Activations);
                 let n_pairs = rows * n_used;
-                let mpad = rows.div_ceil(64) * 64; // GEMMs write padded rows into the scratch
+                let xb = r(*x)?;
+                let yb = r(*dst)?;
+
+                // ── SINGLE-DISPATCH-PER-STAGE pipeline over the PACKED bucket layout. The old
+                // shape ran every stage per expert (8-way waves of indirect dispatches): ~1050
+                // dispatches and ~110 barriers per layer, and at pp512 the launch/serialization
+                // overhead — not GEMM math — was ~60% of MoE prefill GPU time (quant 25%,
+                // gather+scatter+silu 34%). Instead every stage runs ONCE over all n_pairs
+                // packed rows: the expert GEMMs put the expert id on gl_WorkGroupID.y
+                // (segment = offsets[e]..+counts[e], worst-case row tiles exit immediately),
+                // gather fuses into the activation quant, and a per-token reduce over `inv_pos`
+                // (assignment → bucket slot, fixed slot order — deterministic, no atomics)
+                // replaces the KWAY per-set dst copies + adds. ~13 dispatches per layer, no
+                // indirect args, no host readback.
+                //
+                // The GEMM As stage reads up to 63 rows past a segment end (garbage, results
+                // discarded) — pad the packed row dimension so the LAST expert's overread stays
+                // in-bounds.
+                let npad = n_pairs.div_ceil(64) * 64 + 64;
                 let logits = alu(rows * n_expert * 4)?;
                 let ids = alu(n_pairs * 4)?;
                 let wts = alu(n_pairs * 4)?;
@@ -1309,99 +1327,19 @@ fn lower_op(
                 let fill = alu(n_expert * 4)?;
                 let bucket_rows = alu(n_pairs * 4)?;
                 let bucket_wts = alu(n_pairs * 4)?;
-                let args = alu(n_expert * 7 * 16)?;
-                let xb = r(*x)?;
-                let yb = r(*dst)?;
+                let inv_pos = alu(n_pairs * 4)?;
 
-                // ── K-WAY wave interleaving. The per-expert pipeline reuses region-0 scratch, so
-                // expert-major recording needs a barrier between nearly every one of the ~1k
-                // dispatches per layer — at small batches those ~8·n_expert full barriers ARE the
-                // chunk's fixed cost (~350ms GPU at p128, mostly serialization). Instead: KWAY
-                // disjoint scratch SETS, experts processed in waves of KWAY, stage-major within
-                // the wave with `suppress_sync` on all but each stage's first dispatch — one
-                // barrier per (wave, stage) instead of per (expert, stage). Scatter targets a
-                // per-SET dst copy (the kernel is a plain +=, and two experts of one token may
-                // share a dst row), reduced into `dst` by KWAY-1 ordinary adds at the end — a
-                // FIXED summation order, so the result stays deterministic (though the order
-                // differs from expert-major: the MoE goldens were re-blessed with this commit).
-                // All per-set scratch is POOLED — one allocation per (role, set) serves every
-                // MoE layer in the graph.
-                const KWAY: usize = 8;
-                const T_XE: [&str; KWAY] = [
-                    "moe_xe0", "moe_xe1", "moe_xe2", "moe_xe3", "moe_xe4", "moe_xe5", "moe_xe6",
-                    "moe_xe7",
-                ];
-                const T_GQA: [&str; KWAY] = [
-                    "moe_gqa0", "moe_gqa1", "moe_gqa2", "moe_gqa3", "moe_gqa4", "moe_gqa5",
-                    "moe_gqa6", "moe_gqa7",
-                ];
-                const T_GDA: [&str; KWAY] = [
-                    "moe_gda0", "moe_gda1", "moe_gda2", "moe_gda3", "moe_gda4", "moe_gda5",
-                    "moe_gda6", "moe_gda7",
-                ];
-                const T_GSA: [&str; KWAY] = [
-                    "moe_gsa0", "moe_gsa1", "moe_gsa2", "moe_gsa3", "moe_gsa4", "moe_gsa5",
-                    "moe_gsa6", "moe_gsa7",
-                ];
-                const T_GE: [&str; KWAY] = [
-                    "moe_ge0", "moe_ge1", "moe_ge2", "moe_ge3", "moe_ge4", "moe_ge5", "moe_ge6",
-                    "moe_ge7",
-                ];
-                const T_UE: [&str; KWAY] = [
-                    "moe_ue0", "moe_ue1", "moe_ue2", "moe_ue3", "moe_ue4", "moe_ue5", "moe_ue6",
-                    "moe_ue7",
-                ];
-                const T_AE: [&str; KWAY] = [
-                    "moe_ae0", "moe_ae1", "moe_ae2", "moe_ae3", "moe_ae4", "moe_ae5", "moe_ae6",
-                    "moe_ae7",
-                ];
-                const T_DQA: [&str; KWAY] = [
-                    "moe_dqa0", "moe_dqa1", "moe_dqa2", "moe_dqa3", "moe_dqa4", "moe_dqa5",
-                    "moe_dqa6", "moe_dqa7",
-                ];
-                const T_DDA: [&str; KWAY] = [
-                    "moe_dda0", "moe_dda1", "moe_dda2", "moe_dda3", "moe_dda4", "moe_dda5",
-                    "moe_dda6", "moe_dda7",
-                ];
-                const T_DSA: [&str; KWAY] = [
-                    "moe_dsa0", "moe_dsa1", "moe_dsa2", "moe_dsa3", "moe_dsa4", "moe_dsa5",
-                    "moe_dsa6", "moe_dsa7",
-                ];
-                const T_YE: [&str; KWAY] = [
-                    "moe_ye0", "moe_ye1", "moe_ye2", "moe_ye3", "moe_ye4", "moe_ye5", "moe_ye6",
-                    "moe_ye7",
-                ];
-                const T_YC: [&str; KWAY] = [
-                    "moe_yc0", "moe_yc1", "moe_yc2", "moe_yc3", "moe_yc4", "moe_yc5", "moe_yc6",
-                    "moe_yc7",
-                ];
-                let nsets = KWAY.min(n_expert);
-                let mut xe = Vec::new();
-                let mut gqa = Vec::new();
-                let mut gda = Vec::new();
-                let mut gsa = Vec::new();
-                let mut ge = Vec::new();
-                let mut ue = Vec::new();
-                let mut ae = Vec::new();
-                let mut dqa = Vec::new();
-                let mut dda = Vec::new();
-                let mut dsa = Vec::new();
-                let mut ye = Vec::new();
-                let mut yc = Vec::new();
-                for i in 0..nsets {
-                    xe.push(pooled(pool, be_, T_XE[i], mpad * ne * 4)?);
-                    gqa.push(pooled(pool, be_, T_GQA[i], mpad * ne)?);
-                    gda.push(pooled(pool, be_, T_GDA[i], mpad * (ne / 32) * 2)?);
-                    gsa.push(pooled(pool, be_, T_GSA[i], mpad * (ne / 32) * 2)?);
-                    ge.push(pooled(pool, be_, T_GE[i], mpad * nff * 4)?);
-                    ue.push(pooled(pool, be_, T_UE[i], mpad * nff * 4)?);
-                    ae.push(pooled(pool, be_, T_AE[i], mpad * nff * 4)?);
-                    dqa.push(pooled(pool, be_, T_DQA[i], mpad * nff)?);
-                    dda.push(pooled(pool, be_, T_DDA[i], mpad * (nff / 32) * 2)?);
-                    dsa.push(pooled(pool, be_, T_DSA[i], mpad * (nff / 32) * 2)?);
-                    ye.push(pooled(pool, be_, T_YE[i], mpad * ne * 4)?);
-                    yc.push(pooled(pool, be_, T_YC[i], rows * ne * 4)?);
-                }
+                // Packed scratch, POOLED — one set serves every MoE layer in the graph.
+                let qa = pooled(pool, be_, "moe_qa", npad * ne)?;
+                let qda = pooled(pool, be_, "moe_qda", npad * (ne / 32) * 2)?;
+                let qsa = pooled(pool, be_, "moe_qsa", npad * (ne / 32) * 2)?;
+                let ge = pooled(pool, be_, "moe_ge", npad * nff * 4)?;
+                let ue = pooled(pool, be_, "moe_ue", npad * nff * 4)?;
+                let ae = pooled(pool, be_, "moe_ae", npad * nff * 4)?;
+                let dqa = pooled(pool, be_, "moe_dqa", npad * nff)?;
+                let dda = pooled(pool, be_, "moe_dda", npad * (nff / 32) * 2)?;
+                let dsa = pooled(pool, be_, "moe_dsa", npad * (nff / 32) * 2)?;
+                let ye = pooled(pool, be_, "moe_ye", npad * ne * 4)?;
 
                 // Router logits for all rows, then GPU routing.
                 let rdt = graph.desc(*router).dtype;
@@ -1432,173 +1370,97 @@ fn lower_op(
                     fill.as_ref(),
                     bucket_rows.as_ref(),
                     bucket_wts.as_ref(),
+                    inv_pos.as_ref(),
                     n_pairs,
                     n_used,
                 );
-                rec.moe_expert_args(counts.as_ref(), args.as_ref(), n_expert, ne, nff);
 
-                // Per-set dst copies accumulate weighted expert outputs — start from zero
-                // (disjoint buffers: batch the zeros under one barrier). nsets==1 degenerates to
-                // scattering straight into `dst` (zeroed like the old expert-major path).
-                if nsets == 1 {
-                    rec.zero(yb, rows * ne);
-                } else {
-                    for (i, k) in yc.iter().enumerate() {
-                        rec.suppress_sync(i != 0);
-                        rec.zero(pool[k].as_ref(), rows * ne);
-                    }
-                    rec.suppress_sync(false);
-                }
                 let (gw, uw, dw) = (r(*gate_exps)?, r(*up_exps)?, r(*down_exps)?);
-                for wave in (0..n_expert).step_by(nsets) {
-                    let wend = (wave + nsets).min(n_expert);
-                    // Each stage records the whole wave with barriers suppressed after its first
-                    // dispatch — the sets are disjoint, so one barrier fences the previous stage
-                    // for all of them at once.
-                    for (i, e) in (wave..wend).enumerate() {
-                        rec.suppress_sync(i != 0);
-                        rec.gather_rows_ind(
-                            xb,
-                            bucket_rows.as_ref(),
-                            counts.as_ref(),
-                            offsets.as_ref(),
-                            pool[&xe[i]].as_ref(),
-                            args.as_ref(),
-                            e,
-                            0,
-                            ne,
-                        );
-                    }
-                    for (i, e) in (wave..wend).enumerate() {
-                        rec.suppress_sync(i != 0);
-                        rec.quant_q8_ind(
-                            pool[&xe[i]].as_ref(),
-                            pool[&gqa[i]].as_ref(),
-                            pool[&gda[i]].as_ref(),
-                            pool[&gsa[i]].as_ref(),
-                            ne,
-                            args.as_ref(),
-                            e,
-                            1,
-                        );
-                    }
-                    for (i, e) in (wave..wend).enumerate() {
-                        rec.suppress_sync(i != 0);
-                        rec.matmul_mmq_q4k_ind(
-                            pool[&gqa[i]].as_ref(),
-                            pool[&gda[i]].as_ref(),
-                            pool[&gsa[i]].as_ref(),
-                            gw,
-                            e * stride,
-                            pool[&ge[i]].as_ref(),
-                            ne,
-                            nff,
-                            args.as_ref(),
-                            e,
-                            2,
-                        );
-                        // The up GEMM reads the same quantized activations and writes its own
-                        // buffer — disjoint from every other dispatch of this stage batch.
-                        rec.suppress_sync(true);
-                        rec.matmul_mmq_q4k_ind(
-                            pool[&gqa[i]].as_ref(),
-                            pool[&gda[i]].as_ref(),
-                            pool[&gsa[i]].as_ref(),
-                            uw,
-                            e * stride,
-                            pool[&ue[i]].as_ref(),
-                            ne,
-                            nff,
-                            args.as_ref(),
-                            e,
-                            2,
-                        );
-                    }
-                    for (i, e) in (wave..wend).enumerate() {
-                        rec.suppress_sync(i != 0);
-                        rec.silu_mul_ind(
-                            pool[&ge[i]].as_ref(),
-                            pool[&ue[i]].as_ref(),
-                            pool[&ae[i]].as_ref(),
-                            mpad * nff,
-                            args.as_ref(),
-                            e,
-                            3,
-                        );
-                    }
-                    for (i, e) in (wave..wend).enumerate() {
-                        rec.suppress_sync(i != 0);
-                        rec.quant_q8_ind(
-                            pool[&ae[i]].as_ref(),
-                            pool[&dqa[i]].as_ref(),
-                            pool[&dda[i]].as_ref(),
-                            pool[&dsa[i]].as_ref(),
-                            nff,
-                            args.as_ref(),
-                            e,
-                            4,
-                        );
-                    }
-                    for (i, e) in (wave..wend).enumerate() {
-                        rec.suppress_sync(i != 0);
-                        if down_q6 {
-                            rec.matmul_mmq_q6k_ind(
-                                pool[&dqa[i]].as_ref(),
-                                pool[&dda[i]].as_ref(),
-                                dw,
-                                e * stride,
-                                pool[&ye[i]].as_ref(),
-                                nff,
-                                ne,
-                                args.as_ref(),
-                                e,
-                                5,
-                            );
-                        } else {
-                            rec.matmul_mmq_q4k_ind(
-                                pool[&dqa[i]].as_ref(),
-                                pool[&dda[i]].as_ref(),
-                                pool[&dsa[i]].as_ref(),
-                                dw,
-                                e * stride,
-                                pool[&ye[i]].as_ref(),
-                                nff,
-                                ne,
-                                args.as_ref(),
-                                e,
-                                5,
-                            );
-                        }
-                    }
-                    for (i, e) in (wave..wend).enumerate() {
-                        rec.suppress_sync(i != 0);
-                        let starget = if nsets == 1 {
-                            yb
-                        } else {
-                            pool[&yc[i]].as_ref()
-                        };
-                        rec.scatter_add_rows_ind(
-                            pool[&ye[i]].as_ref(),
-                            bucket_rows.as_ref(),
-                            bucket_wts.as_ref(),
-                            counts.as_ref(),
-                            offsets.as_ref(),
-                            starget,
-                            args.as_ref(),
-                            e,
-                            6,
-                            ne,
-                        );
-                    }
-                    rec.suppress_sync(false);
-                }
-                // Reduce the per-set copies into `dst` — a fixed order, so bit-deterministic.
-                if nsets > 1 {
-                    rec.add(pool[&yc[0]].as_ref(), pool[&yc[1]].as_ref(), yb, rows * ne);
-                    for k in yc.iter().skip(2) {
-                        rec.add(yb, pool[k].as_ref(), yb, rows * ne);
-                    }
-                }
+                // Gather+quant all assignments into the packed layout in one pass.
+                rec.quant_q8_gather(
+                    xb,
+                    bucket_rows.as_ref(),
+                    pool[&qa].as_ref(),
+                    pool[&qda].as_ref(),
+                    pool[&qsa].as_ref(),
+                    n_pairs,
+                    ne,
+                );
+                rec.matmul_mmq_experts(
+                    gdt,
+                    pool[&qa].as_ref(),
+                    pool[&qda].as_ref(),
+                    Some(pool[&qsa].as_ref()),
+                    gw,
+                    0,
+                    stride,
+                    counts.as_ref(),
+                    offsets.as_ref(),
+                    pool[&ge].as_ref(),
+                    n_pairs,
+                    ne,
+                    nff,
+                    n_expert,
+                );
+                // The up GEMM reads the same quantized activations and writes its own buffer —
+                // disjoint from the gate GEMM, no barrier needed between them.
+                rec.suppress_sync(true);
+                rec.matmul_mmq_experts(
+                    udt,
+                    pool[&qa].as_ref(),
+                    pool[&qda].as_ref(),
+                    Some(pool[&qsa].as_ref()),
+                    uw,
+                    0,
+                    stride,
+                    counts.as_ref(),
+                    offsets.as_ref(),
+                    pool[&ue].as_ref(),
+                    n_pairs,
+                    ne,
+                    nff,
+                    n_expert,
+                );
+                rec.suppress_sync(false);
+                rec.silu_mul(
+                    pool[&ge].as_ref(),
+                    pool[&ue].as_ref(),
+                    pool[&ae].as_ref(),
+                    n_pairs * nff,
+                );
+                rec.quant_q8(
+                    pool[&ae].as_ref(),
+                    pool[&dqa].as_ref(),
+                    pool[&dda].as_ref(),
+                    pool[&dsa].as_ref(),
+                    n_pairs,
+                    nff,
+                );
+                rec.matmul_mmq_experts(
+                    ddt,
+                    pool[&dqa].as_ref(),
+                    pool[&dda].as_ref(),
+                    (!down_q6).then(|| pool[&dsa].as_ref()),
+                    dw,
+                    0,
+                    stride,
+                    counts.as_ref(),
+                    offsets.as_ref(),
+                    pool[&ye].as_ref(),
+                    n_pairs,
+                    nff,
+                    ne,
+                    n_expert,
+                );
+                rec.moe_scatter_reduce(
+                    pool[&ye].as_ref(),
+                    bucket_wts.as_ref(),
+                    inv_pos.as_ref(),
+                    yb,
+                    rows,
+                    ne,
+                    n_used,
+                );
                 transient.extend([
                     logits,
                     ids,
@@ -1608,7 +1470,7 @@ fn lower_op(
                     fill,
                     bucket_rows,
                     bucket_wts,
-                    args,
+                    inv_pos,
                 ]);
                 return Ok(());
             }

@@ -27,7 +27,18 @@ layout(binding = 0) readonly buffer QA { uint qa[]; };          // [m, k/4] pack
 layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, nblk]
 layout(binding = 2) readonly buffer SA { float16_t sact[]; };   // [m, nblk]
 layout(binding = 3) readonly buffer WB { uint nw[]; };          // stacked Q4_K weight bytes
+#ifdef EXPERT_GRID
+// Batched-MoE all-experts-in-one-dispatch: gl_WorkGroupID.y = expert id; the packed activation
+// rows for expert e live at [offsets[e], offsets[e]+counts[e]) (bucket layout). pc.m is repurposed
+// as the per-expert weight stride (elements). Row tiles past the segment exit immediately; row
+// stores are clipped to the segment (rows are packed — no per-expert padding to stomp). The two
+// extra readonly inputs sit before `c` so the recorder's inputs-first/outputs-last order holds.
+layout(binding = 4) readonly buffer CNT { uint counts[]; };
+layout(binding = 5) readonly buffer OFF { uint offsets[]; };
+layout(binding = 6) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
+#else
 layout(binding = 4) writeonly buffer CB { float c[]; };         // [m, n]
+#endif
 
 shared uint As[BM * SP];
 shared uint Bs[BN * SP];
@@ -48,7 +59,17 @@ void main() {
     uint nblk = pc.k / BLK;
     uint kw = pc.k / 4u;
     uint tilesN = pc.n / BN;
+#ifdef EXPERT_GRID
+    uint ex = gl_WorkGroupID.y;
+    uint cnt = counts[ex];
+    if ((gl_WorkGroupID.x / tilesN) * BM >= cnt) { return; }
+    uint wgRow = offsets[ex] + (gl_WorkGroupID.x / tilesN) * BM;
+    uint rowEnd = offsets[ex] + cnt;
+    uint wbase = pc.w_base + ex * pc.m;
+#else
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    uint wbase = pc.w_base;
+#endif
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;
     uint li = gl_LocalInvocationIndex;
     uint tr = li / (BN / TN);
@@ -67,7 +88,7 @@ void main() {
         }
         // per-col 6-bit scale/min for this block
         for (uint cc = li; cc < BN; cc += THREADS) {
-            uint gelem = pc.w_base + (wgCol + cc) * pc.k + blk * BLK;
+            uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
             uint bd = (gelem / 256u) * 144u;
             uint sub = (gelem / 32u) & 7u;
             uvec2 km = k4(sub, bd + 4u);
@@ -78,7 +99,7 @@ void main() {
         for (uint idx = li; idx < BN * WPB; idx += THREADS) {
             uint cc = idx / WPB;
             uint j = idx % WPB;
-            uint gelem = pc.w_base + (wgCol + cc) * pc.k + blk * BLK;
+            uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
             uint bd = (gelem / 256u) * 144u;
             uint sub = (gelem / 32u) & 7u;
             uint qbase = bd + 16u + (sub >> 1u) * 32u;
@@ -124,6 +145,9 @@ void main() {
 
     [[unroll]] for (uint i = 0u; i < TM; i++) {
         uint rr = wgRow + tr * TM + i;
+#ifdef EXPERT_GRID
+        if (rr >= rowEnd) { continue; }
+#endif
         [[unroll]] for (uint j = 0u; j < TN; j++) {
             c[rr * pc.n + (wgCol + tc * TN + j)] = acc[i][j];
         }

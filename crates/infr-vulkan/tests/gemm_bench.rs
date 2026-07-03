@@ -201,6 +201,67 @@ fn qwen3_gemm_inventory_bench() {
     }
 }
 
+/// The kernel-tuning harness: the real 8B Q4_K prefill shapes (m=512) on the warp kernel —
+/// these run at the kernel's ceiling (~33-36 TF vs llama.cpp's ~45-50 on the same shapes), so
+/// any micro-arch change shows here directly. Serialized reps = per-dispatch latency.
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn qwen3_8b_gemm_shapes_bench() {
+    let be = VulkanBackend::new().unwrap();
+    let m = 512usize;
+    let shapes = [
+        (4096usize, 6144usize, "qkv"),
+        (4096, 4096, "o"),
+        (4096, 24576, "gate+up"),
+        (12288, 4096, "down"),
+    ];
+    let a = be.alloc(m * 12288 * 4, BufferUsage::Activations).unwrap();
+    let a16 = be.alloc(m * 12288 * 2, BufferUsage::Activations).unwrap();
+    let c = be.alloc(m * 24576 * 4, BufferUsage::Activations).unwrap();
+    for (k, n, label) in shapes {
+        let w = be.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
+        for f16a in [false, true] {
+            let run = |reps: usize| {
+                let rec = be.recorder().unwrap();
+                for _ in 0..reps {
+                    if f16a {
+                        rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
+                        rec.matmul_native_f16a(
+                            infr_core::DType::Q4K,
+                            a16.as_ref(),
+                            w.as_ref(),
+                            0,
+                            c.as_ref(),
+                            m,
+                            k,
+                            n,
+                        );
+                    } else {
+                        rec.matmul_native(
+                            infr_core::DType::Q4K,
+                            a.as_ref(),
+                            w.as_ref(),
+                            c.as_ref(),
+                            m,
+                            k,
+                            n,
+                        );
+                    }
+                }
+                rec.finish().unwrap();
+            };
+            run(1);
+            let reps = 10usize;
+            let t0 = std::time::Instant::now();
+            run(reps);
+            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            let tflops = (2.0 * m as f64 * k as f64 * n as f64) / us / 1e6;
+            let tag = if f16a { "f16a" } else { "f32 " };
+            println!("[{label:>8}] [{k}x{n}] {tag} {us:8.1} us  {tflops:5.1} TF");
+        }
+    }
+}
+
 /// Per-op serialization floor: a chain of small hazard-dependent dispatches (each reads the
 /// previous one's output → global barrier each). wall/ops ≈ the fixed bubble every seam op pays
 /// on top of its kernel time — the number that says how much op-count reduction / overlap is worth.

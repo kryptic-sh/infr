@@ -471,6 +471,24 @@ fn lower_op(
                         out_f,
                     );
                 } else if native_dense_supported(dt) {
+                    // A_GLOBAL: convert A to f16 ONCE (a cheap cast-copy — the warp kernels
+                    // rounded A to f16 in their staging loop anyway, so numerics are identical)
+                    // and let the warptiles coopMatLoad it straight from global. Dropping the As
+                    // stage shrinks LDS to Bs-only → occupancy 2→3 wgs/WGP → ~1.5x on the 8B
+                    // prefill shapes (o proj 29→44 TF). Pool pad rows may hold stale garbage;
+                    // GEMM rows are independent, and dst pad rows are never read.
+                    let use_ag = out_f % 128 == 0
+                        && in_f % 32 == 0
+                        && crate::gemm::native_gemm_warp_ag_build_spv(dt).is_some()
+                        && std::env::var("INFR_NO_GEMM_WARP").is_err();
+                    let a16 = if use_ag {
+                        let mpad = m.div_ceil(64) * 64;
+                        let key = pooled(pool, be_, "lin_a16", mpad * in_f * 2)?;
+                        rec.store_f16(xb, pool[&key].as_ref(), m * in_f, 0);
+                        Some(key)
+                    } else {
+                        None
+                    };
                     // SPLIT-K for narrow-n deep-k shapes (o/down projections): the plain tile's
                     // grid underfills the device (n=1024 → 64 wgs on a 96-wg part → 6-11 TFLOPS
                     // vs the kernel's ~36). Split k across enough extra workgroups to fill, with
@@ -485,9 +503,13 @@ fn lower_op(
                     if splits > 1 && crate::gemm::native_gemm_warp_sk_build_spv(dt).is_some() {
                         let mpad = m.div_ceil(64) * 64;
                         let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
+                        let a: &dyn Buffer = match &a16 {
+                            Some(k16) => pool[k16].as_ref(),
+                            None => xb,
+                        };
                         rec.matmul_native_splitk(
                             dt,
-                            xb,
+                            a,
                             w,
                             w_off,
                             pool[&pk].as_ref(),
@@ -496,6 +518,18 @@ fn lower_op(
                             in_f,
                             out_f,
                             splits,
+                            a16.is_some(),
+                        );
+                    } else if let Some(k16) = &a16 {
+                        rec.matmul_native_f16a(
+                            dt,
+                            pool[k16].as_ref(),
+                            w,
+                            w_off,
+                            out,
+                            m,
+                            in_f,
+                            out_f,
                         );
                     } else {
                         rec.matmul_native_off(dt, xb, w, w_off, out, m, in_f, out_f);

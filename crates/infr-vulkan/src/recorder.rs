@@ -634,11 +634,60 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// [`matmul_native_off`](Self::matmul_native_off) with A already converted to f16 (padded to
+    /// ceil(m/64)·64 rows) — the A_GLOBAL warptiles coopMatLoad A straight from global, dropping
+    /// the As stage/LDS (occupancy 2→3 wgs/WGP: ~1.5x on the 8B shapes). Same tile pick as the
+    /// f32 path; caller guarantees k%32==0, n%128==0 and that the _ag SPIR-V exists for `dtype`
+    /// (`native_gemm_warp_ag_build_spv(dtype).is_some()`). Numerics are bit-identical to the f32
+    /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_native_f16a(
+        &self,
+        dtype: infr_core::DType,
+        a16: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.stamp("matmul_proj");
+        let wide_grid = m.div_ceil(64) * (n / 256).max(1);
+        let use_wide = n.is_multiple_of(256) && wide_grid >= 128;
+        let ((name, spv), bn) = if use_wide {
+            (
+                crate::gemm::native_gemm_warp_ag_build_spv(dtype).expect("ag spv"),
+                256,
+            )
+        } else {
+            (
+                crate::gemm::native_gemm_warp_n128_ag_build_spv(dtype).expect("ag n128 spv"),
+                128,
+            )
+        };
+        let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let groups = (m.div_ceil(64) * (n / bn)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(a16), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// SPLIT-K narrow-warptile GEMM: `splits` k-partials into `partials` ([splits, mpad, n] f32),
     /// then the deterministic fixed-order reduce into `c`. The occupancy fix for narrow-n GEMMs
     /// with deep k (o/down projections: n = n_embd, k = 2-3·n_embd — 64 workgroups on a 96-wg
     /// part with the plain tile). Requires n%128==0, k%32==0; caller sizes `partials` to
-    /// `splits · ceil(m/64)·64 · n · 4` bytes.
+    /// `splits · ceil(m/64)·64 · n · 4` bytes. `a_is_f16`: A is the caller's f16 cast-copy
+    /// (padded rows) and the A_GLOBAL tile is used — see [`matmul_native_f16a`](Self::matmul_native_f16a).
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_native_splitk(
         &self,
@@ -652,13 +701,19 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
         splits: usize,
+        a_is_f16: bool,
     ) {
         self.stamp("matmul_proj");
-        let spv = crate::gemm::native_gemm_warp_sk_build_spv(dtype).expect("split-k spv");
-        let name = match dtype {
-            infr_core::DType::Q4K => "native_gemm_warp_q4k_sk",
-            infr_core::DType::Q6K => "native_gemm_warp_q6k_sk",
-            _ => "native_gemm_warp_q8_0_sk",
+        let (name, spv) = if a_is_f16 {
+            crate::gemm::native_gemm_warp_sk_ag_build_spv(dtype).expect("split-k ag spv")
+        } else {
+            let spv = crate::gemm::native_gemm_warp_sk_build_spv(dtype).expect("split-k spv");
+            let name = match dtype {
+                infr_core::DType::Q4K => "native_gemm_warp_q4k_sk",
+                infr_core::DType::Q6K => "native_gemm_warp_q6k_sk",
+                _ => "native_gemm_warp_q8_0_sk",
+            };
+            (name, spv)
         };
         let mpad = m.div_ceil(64) * 64;
         let kern = self.be.kernel_sg(name, spv, 3, 24, 32);

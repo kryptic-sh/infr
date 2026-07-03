@@ -245,6 +245,93 @@ pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option
     })
 }
 
+/// A_GLOBAL warptile variants: A pre-converted to f16 by the caller and coopMatLoad'd straight
+/// from global memory — no As staging, no As LDS. Shrinking LDS to Bs-only lifts occupancy from
+/// 2 to 3 workgroups/WGP, which is worth ~1.5x on the 8B prefill shapes (29→44 TF on the o
+/// projection). Name+SPIR-V per tile so `kernel_sg` caches distinct pipelines.
+pub(crate) fn native_gemm_warp_ag_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => ("native_gemm_warp_q4k_ag", v!("native_gemm_warp_q4k_ag")),
+        Q6K => ("native_gemm_warp_q6k_ag", v!("native_gemm_warp_q6k_ag")),
+        Q8_0 => ("native_gemm_warp_q8_0_ag", v!("native_gemm_warp_q8_0_ag")),
+        _ => return None,
+    })
+}
+
+/// NARROW_N (BN=128) + A_GLOBAL.
+pub(crate) fn native_gemm_warp_n128_ag_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => (
+            "native_gemm_warp_q4k_n128_ag",
+            v!("native_gemm_warp_q4k_n128_ag"),
+        ),
+        Q6K => (
+            "native_gemm_warp_q6k_n128_ag",
+            v!("native_gemm_warp_q6k_n128_ag"),
+        ),
+        Q8_0 => (
+            "native_gemm_warp_q8_0_n128_ag",
+            v!("native_gemm_warp_q8_0_n128_ag"),
+        ),
+        _ => return None,
+    })
+}
+
+/// SPLIT_K (NARROW_N tile) + A_GLOBAL.
+pub(crate) fn native_gemm_warp_sk_ag_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => (
+            "native_gemm_warp_q4k_sk_ag",
+            v!("native_gemm_warp_q4k_sk_ag"),
+        ),
+        Q6K => (
+            "native_gemm_warp_q6k_sk_ag",
+            v!("native_gemm_warp_q6k_sk_ag"),
+        ),
+        Q8_0 => (
+            "native_gemm_warp_q8_0_sk_ag",
+            v!("native_gemm_warp_q8_0_sk_ag"),
+        ),
+        _ => return None,
+    })
+}
+
 /// SPIR-V for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
 pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;

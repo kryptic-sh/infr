@@ -19,17 +19,29 @@ const uint THREADS = 256u;
 // 256 dequant calls per stage (128 cols × 2 k-blocks), the same ~25 KB LDS, but 2× the
 // workgroups — narrow-n GEMMs (n=1024/2048: the qkv/o/down shapes of small-ne models) underfill
 // a big GPU with the wide tile (n=1024 → 32 wgs on a 96-wg part = 5-9 TFLOPS vs the kernel's 36).
+// Tile-shape experiments (kernel tuning): -DBM128 doubles the row tile (WM 32→64: 4×4 acc frags
+// per warp — more B-frag reuse per LDS load); -DBK64W doubles the k-stage on the WIDE tile
+// (half the barriers, 2 staging iterations per thread). Composable.
+#ifdef BM128
+const uint BM = 128u;
+const uint WM = 64u;
+#else
 const uint BM = 64u;
+const uint WM = 32u;
+#endif
 #ifdef NARROW_N
 const uint BN = 128u;
 const uint BK = 64u;
 const uint WN = 32u;
 #else
 const uint BN = 256u;
+#ifdef BK64W
+const uint BK = 64u;
+#else
 const uint BK = 32u;
+#endif
 const uint WN = 64u;
 #endif
-const uint WM = 32u;
 const uint WARPS_M = BM / WM; // 2
 const uint WARPS_N = BN / WN; // 4 → 8 warps / 256 threads
 const uint CMS_M = WM / 16u;  // 2
@@ -46,11 +58,20 @@ layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint spl
 #else
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 #endif
+#ifdef A_GLOBAL
+// A pre-converted to f16 by the caller (one store_f16 pass, padded to the row tile): A fragments
+// coopMatLoad straight from global — no As staging, no As LDS. LDS shrinks to Bs-only
+// (~20 KB → 3 workgroups/WGP instead of 2), which is the occupancy the f32-staging tile lacks.
+layout(binding = 0) readonly buffer ABuf { float16_t a[]; }; // [Mpad, K] f16 activations
+#else
 layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
+#endif
 layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // weights: raw GGUF blocks (native)
 layout(binding = 2) writeonly buffer CBuf { float c[]; };
 
+#ifndef A_GLOBAL
 shared float16_t As[BM * SAK];
+#endif
 shared float16_t Bs[BN * SBK];
 
 #include "native_decode.glsl"
@@ -88,17 +109,19 @@ void main() {
 #else
     for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
 #endif
+#ifndef A_GLOBAL
         for (uint idx = li; idx < BM * BK; idx += THREADS) {
             uint r = idx / BK;
             uint cc = idx % BK;
             uint gr = wgRow + r;
             As[r * SAK + cc] = (gr < pc.m) ? float16_t(a[gr * pc.k + k0 + cc]) : float16_t(0.0);
         }
-        // one thread per (column, 32-elem k-block): BN·(BK/32) == THREADS in both tile configs,
-        // so every thread decodes exactly one aligned quant sub-block per stage.
-        {
-            uint cc = li % BN;
-            uint kb = (li / BN) * 32u;
+#endif
+        // one thread per (column, 32-elem k-block) per iteration — BN·(BK/32) decode slots per
+        // stage, striped across THREADS (exactly one iteration for the base configs).
+        for (uint slot = li; slot < BN * (BK / 32u); slot += THREADS) {
+            uint cc = slot % BN;
+            uint kb = (slot / BN) * 32u;
             float v[32];
             dqblk(pc.w_base + (wgCol + cc) * pc.k + k0 + kb, v);
             [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
@@ -109,8 +132,13 @@ void main() {
         [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af[CMS_M];
             [[unroll]] for (uint i = 0u; i < CMS_M; i++) {
+#ifdef A_GLOBAL
+                coopMatLoad(af[i], a, (wgRow + warp_r * WM + i * 16u) * pc.k + k0 + kf, pc.k,
+                            gl_CooperativeMatrixLayoutRowMajor);
+#else
                 coopMatLoad(af[i], As, (warp_r * WM + i * 16u) * SAK + kf, SAK,
                             gl_CooperativeMatrixLayoutRowMajor);
+#endif
             }
             [[unroll]] for (uint j = 0u; j < CMS_N; j++) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;

@@ -98,7 +98,7 @@ fn linear_add_peephole(
         }
         if !matches!(
             g.desc(*weight).dtype,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5_0
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5_0 | DType::Q4_0
         ) {
             continue;
         }
@@ -189,7 +189,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             | Op::GatedAct { .. }
             | Op::GatedActFused { .. }
             | Op::Add { .. } => {}
-            Op::QkNormRope { .. } => has_rope = true,
+            Op::QkNormRope { .. } | Op::Rope { .. } => has_rope = true,
             // MoE decode tapes only when the arm takes the fully-on-device path (the same gate
             // as the MoeFfn arm's `device_ok`): dtypes with expert kernels, in-bounds shapes,
             // escape hatch off. The host fallback computes on the CPU per token — a tape can't
@@ -831,10 +831,12 @@ impl MetalBackend {
                 .ops
                 .iter()
                 .find_map(|op| match op {
-                    Op::QkNormRope { positions, .. } => Some(*positions),
+                    Op::QkNormRope { positions, .. } | Op::Rope { positions, .. } => {
+                        Some(*positions)
+                    }
                     _ => None,
                 })
-                .expect("replay_shape checked QkNormRope");
+                .expect("replay_shape checked QkNormRope/Rope");
             r.posbuf = Some(metal_buf(bindings.get(positions).unwrap()).raw.clone());
         }
         for (i, decl) in g.tensors.iter().enumerate() {
@@ -987,6 +989,7 @@ impl MetalBackend {
             DType::Q6K => Some("linear_q6k"),
             DType::Q8_0 => Some("linear_q8_0"),
             DType::Q5_0 => Some("linear_q5_0"),
+            DType::Q4_0 => Some("linear_q4_0"),
             _ => None,
         };
         if let Some(kern) = native_kern {
@@ -1231,6 +1234,7 @@ impl MetalBackend {
                         "linear_q6k" => (e / 256 * 210, 0, 0),
                         "linear_q8_0" => (e / 32 * 34, 0, 0),
                         "linear_q5_0" => (e / 32 * 22, 0, 0),
+                        "linear_q4_0" => (e / 32 * 18, 0, 0),
                         "linear_quik4" => (e / 2, e / 4, dd_off),
                         "linear_quik6" => (e / 4 * 3, e / 4, dd_off),
                         _ => (e, e / 4, dd_off),
@@ -1256,6 +1260,7 @@ impl MetalBackend {
                         "linear_q6k" => "linear_q6k_hmm",
                         "linear_q8_0" => "linear_q8_0_hmm",
                         "linear_q5_0" => "linear_q5_0_hmm",
+                        "linear_q4_0" => "linear_q4_0_hmm",
                         _ => "linear_quik8_hmm",
                     };
                     let cmm_kern = match qw.kern {
@@ -1265,6 +1270,7 @@ impl MetalBackend {
                         "linear_q6k" => "linear_q6k_cmm",
                         "linear_q8_0" => "linear_q8_0_cmm",
                         "linear_q5_0" => "linear_q5_0_cmm",
+                        "linear_q4_0" => "linear_q4_0_cmm",
                         _ => "linear_quik8_cmm",
                     };
                     // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
@@ -1344,6 +1350,7 @@ impl MetalBackend {
                                 "linear_q6k" => "linear_q6k_rt",
                                 "linear_q8_0" => "linear_q8_0_rt",
                                 "linear_q5_0" => "linear_q5_0_rt",
+                                "linear_q4_0" => "linear_q4_0_rt",
                                 _ => "linear_quik8_rt",
                             };
                             (rt, m.div_ceil(8) * out_f * 32, 32)
@@ -1357,7 +1364,7 @@ impl MetalBackend {
                             // already saturate and keep NSG=1.
                             let rpg = match qw.kern {
                                 "linear_q4k" | "linear_q6k" => 2usize,
-                                "linear_q8_0" | "linear_q5_0" => 4,
+                                "linear_q8_0" | "linear_q5_0" | "linear_q4_0" => 4,
                                 _ => 1,
                             };
                             let groups = out_f.div_ceil(rpg);
@@ -1370,6 +1377,7 @@ impl MetalBackend {
                                 "linear_q6k" if in_f >= 4096 => Some("linear_q6k_ks"),
                                 "linear_q8_0" if in_f >= 2048 => Some("linear_q8_0_ks"),
                                 "linear_q5_0" if in_f >= 2048 => Some("linear_q5_0_ks"),
+                                "linear_q4_0" if in_f >= 2048 => Some("linear_q4_0_ks"),
                                 _ => None,
                             };
                             let ks = groups <= 4096
@@ -1392,10 +1400,12 @@ impl MetalBackend {
                                 "linear_q4k" => "linear_q4k_add",
                                 "linear_q8_0" => "linear_q8_0_add",
                                 "linear_q5_0" => "linear_q5_0_add",
+                                "linear_q4_0" => "linear_q4_0_add",
                                 "linear_q4k_ks" => "linear_q4k_ks_add",
                                 "linear_q6k_ks" => "linear_q6k_ks_add",
                                 "linear_q8_0_ks" => "linear_q8_0_ks_add",
                                 "linear_q5_0_ks" => "linear_q5_0_ks_add",
+                                "linear_q4_0_ks" => "linear_q4_0_ks_add",
                                 _ => "linear_q6k_add",
                             };
                             let bres = self.ensure_device(r, res);
@@ -1483,12 +1493,15 @@ impl MetalBackend {
                 p.extend_from_slice(&(rope_dim).to_ne_bytes());
                 p.extend_from_slice(&theta.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
-                self.encode(
+                // One thread per (row, head, pair) + pass-through dims — see `rope_f32`.
+                let per = (rope_dim as usize / 2) + (hd - rope_dim as usize);
+                self.encode_w(
                     r,
                     &pso,
                     &[bx.as_ref(), bpos.as_ref(), bff.as_ref(), bd.as_ref()],
+                    1 << 3,
                     &p,
-                    rows * nh,
+                    rows * nh * per,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

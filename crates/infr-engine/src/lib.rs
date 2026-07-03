@@ -18,13 +18,8 @@ use std::sync::Arc;
 
 use infr_core::{error::Result, Backend};
 
-/// A streamed piece of a response.
-#[derive(Clone, Debug)]
-pub enum Delta {
-    Reasoning(String),
-    Content(String),
-    ToolCall { name: String, arguments: String },
-}
+/// A streamed piece of a response (re-exported from the single splitter in `infr-chat`).
+pub use infr_chat::{ChatStream, Delta};
 
 /// Owns the loaded model + compiled plan + decoder, over an opaque backend.
 pub struct Engine {

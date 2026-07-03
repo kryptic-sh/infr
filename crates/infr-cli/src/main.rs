@@ -253,74 +253,69 @@ fn cmd_pull(model: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Streams generated text, dimming the model's `<think>…</think>` reasoning so it's visually
-/// distinct from the answer. Handles tags split across deltas via a small carry buffer; ANSI styling
-/// only on a TTY.
+/// Streams generated text through THE shared reasoning splitter (`infr_engine::ChatStream` — the
+/// same one `infr serve` emits OpenAI deltas from), dimming the reasoning so it's visually
+/// distinct from the answer. Because run and serve consume one splitter, every thinking model is
+/// exposed identically on both surfaces — a new reasoning format lands in `infr-chat` once. On a
+/// non-TTY the raw model text passes through untouched (markers preserved for piped output).
 struct ThinkRender {
+    split: infr_engine::ChatStream,
     in_think: bool,
-    carry: String,
     tty: bool,
 }
 impl ThinkRender {
     fn new() -> Self {
         use std::io::IsTerminal;
         Self {
+            split: infr_engine::ChatStream::new(false),
             in_think: false,
-            carry: String::new(),
             tty: std::io::stdout().is_terminal(),
         }
     }
     fn feed(&mut self, delta: &str) {
         use std::io::Write;
         if !self.tty {
-            // Not a terminal: pass through (the literal <think>…</think> tags stay, so the reasoning
-            // is still delimited in piped/redirected output).
             print!("{delta}");
             let _ = std::io::stdout().flush();
             return;
         }
-        self.carry.push_str(delta);
-        loop {
-            let tag = if self.in_think { "</think>" } else { "<think>" };
-            let Some(i) = self.carry.find(tag) else { break };
-            let before = self.carry[..i].to_string();
-            print!("{before}");
-            self.carry.replace_range(..i + tag.len(), "");
-            self.in_think = !self.in_think;
-            if self.tty {
-                // dim+italic on entering the think block; reset on leaving.
-                print!(
-                    "{}",
-                    if self.in_think {
-                        "\x1b[2;3m"
-                    } else {
-                        "\x1b[0m"
-                    }
-                );
-            }
-        }
-        // Flush all but a tail that might be the start of a tag (keep < longest tag length).
-        let keep = "</think>".len() - 1;
-        if self.carry.len() > keep {
-            let mut cut = self.carry.len() - keep;
-            while cut > 0 && !self.carry.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            print!("{}", &self.carry[..cut]);
-            self.carry.replace_range(..cut, "");
-        }
+        let in_think = &mut self.in_think;
+        self.split.push(delta, &mut |d| Self::render(d, in_think));
         let _ = std::io::stdout().flush();
     }
     fn finish(&mut self) {
         use std::io::Write;
-        print!("{}", self.carry);
-        self.carry.clear();
-        if self.in_think && self.tty {
-            print!("\x1b[0m");
+        if self.tty {
+            let in_think = &mut self.in_think;
+            self.split.finish(&mut |d| Self::render(d, in_think));
+            if *in_think {
+                print!("[0m");
+                self.in_think = false;
+            }
         }
-        self.in_think = false;
         println!();
         let _ = std::io::stdout().flush();
+    }
+    /// Style transitions ride the delta KIND: entering Reasoning dims+italicizes, entering
+    /// Content resets. The splitter already stripped the markers.
+    fn render(d: infr_engine::Delta, in_think: &mut bool) {
+        match d {
+            infr_engine::Delta::Reasoning(t) => {
+                if !*in_think {
+                    print!("[2;3m");
+                    *in_think = true;
+                }
+                print!("{t}");
+            }
+            infr_engine::Delta::Content(t) => {
+                if *in_think {
+                    print!("[0m");
+                    *in_think = false;
+                }
+                print!("{t}");
+            }
+            infr_engine::Delta::ToolCall { .. } => {}
+        }
     }
 }
 
@@ -572,7 +567,7 @@ impl infr_server::ChatGenerator for SeamGenerator {
                 "[tools] forced tool call produced no parseable call; falling back to unconstrained"
             );
         }
-        let mut stream = ChatStream::new(tool_choice != Some("none"));
+        let mut stream = infr_engine::ChatStream::new(tool_choice != Some("none"));
         {
             let od = &mut *on_delta;
             self.model.generate(&prompt, max_new, &mut |piece: &str| {
@@ -582,122 +577,6 @@ impl infr_server::ChatGenerator for SeamGenerator {
         stream.finish(on_delta);
         Ok(())
     }
-}
-
-/// Incremental splitter for the streaming server path. Accumulates the raw decoded text and, on each
-/// piece, emits the newly-stable Reasoning (`<think>…</think>`) and Content deltas — holding back a
-/// marker-length tail so a partial `<think>`/`</think>`/`<tool_call>` marker is never emitted. Once a
-/// `<tool_call>` opener appears (and tool calls are allowed) it stops streaming content; `finish()`
-/// flushes the held-back tails and parses the buffered tool call(s) into ToolCall deltas.
-struct ChatStream {
-    raw: String,
-    sent_r: usize, // reasoning bytes already emitted (offset within the reasoning region)
-    sent_c: usize, // content bytes already emitted (offset within the content region)
-    allow_tools: bool,
-}
-
-impl ChatStream {
-    fn new(allow_tools: bool) -> Self {
-        Self {
-            raw: String::new(),
-            sent_r: 0,
-            sent_c: 0,
-            allow_tools,
-        }
-    }
-
-    fn push(&mut self, piece: &str, on_delta: &mut dyn FnMut(infr_engine::Delta)) {
-        self.raw.push_str(piece);
-        self.emit(false, on_delta);
-    }
-
-    fn finish(&mut self, on_delta: &mut dyn FnMut(infr_engine::Delta)) {
-        self.emit(true, on_delta); // flush the held-back tails (no marker can still be forming)
-        if self.allow_tools {
-            let (_r, body) = infr_engine::split_think(&self.raw);
-            let (_content, calls) = infr_engine::parse_hermes_tool_calls(&body);
-            for call in calls {
-                on_delta(infr_engine::Delta::ToolCall {
-                    name: call.name,
-                    arguments: serde_json::to_string(&call.arguments)
-                        .unwrap_or_else(|_| "{}".to_string()),
-                });
-            }
-        }
-    }
-
-    fn emit(&mut self, final_flush: bool, on_delta: &mut dyn FnMut(infr_engine::Delta)) {
-        const TO: &str = "<think>";
-        const TC: &str = "</think>";
-        const TL: &str = "<tool_call>";
-        let raw = &self.raw;
-        let think_open = raw.find(TO);
-        let think_close = raw.find(TC);
-        let tool_open = if self.allow_tools { raw.find(TL) } else { None };
-        // Reasoning region: between `<think>` and `</think>` (or end, while still thinking).
-        if let Some(to) = think_open {
-            let rs = to + TO.len();
-            let (r_end, hold) = match think_close {
-                Some(tc) => (tc, false),
-                None => (raw.len(), !final_flush),
-            };
-            emit_region(raw, rs, r_end, hold, &mut self.sent_r, true, on_delta);
-        }
-        // Content region: after `</think>` (or from the start when there's no `<think>` at all), up to
-        // a `<tool_call>` opener (whose block is buffered, not streamed) or the end.
-        let c_start = match think_close {
-            Some(tc) => Some(tc + TC.len()),
-            None if think_open.is_none() => Some(0),
-            None => None,
-        };
-        if let Some(cs) = c_start {
-            let (c_end, hold) = match tool_open {
-                Some(t) if t >= cs => (t, false),
-                _ => (raw.len(), !final_flush),
-            };
-            emit_region(raw, cs, c_end, hold, &mut self.sent_c, false, on_delta);
-        }
-    }
-}
-
-/// Emit the not-yet-sent slice of `raw[region_start .. region_end]` (past `*sent` bytes), holding back
-/// a marker-length tail when `hold` (so a partial marker isn't emitted mid-stream), clamped to a UTF-8
-/// boundary. Advances `*sent`.
-fn emit_region(
-    raw: &str,
-    region_start: usize,
-    region_end: usize,
-    hold: bool,
-    sent: &mut usize,
-    reasoning: bool,
-    on_delta: &mut dyn FnMut(infr_engine::Delta),
-) {
-    const HOLD: usize = 12; // > the longest marker, so a partial one never streams
-    let abs = region_start + *sent;
-    if abs >= region_end {
-        return;
-    }
-    let mut end = if hold {
-        region_end.saturating_sub(HOLD).max(abs)
-    } else {
-        region_end
-    };
-    while end > abs && !raw.is_char_boundary(end) {
-        end -= 1;
-    }
-    if end <= abs {
-        return;
-    }
-    let text = &raw[abs..end];
-    if text.is_empty() {
-        return;
-    }
-    on_delta(if reasoning {
-        infr_engine::Delta::Reasoning(text.to_owned())
-    } else {
-        infr_engine::Delta::Content(text.to_owned())
-    });
-    *sent += text.len();
 }
 
 /// Benchmark prefill (pp) or decode (tg) tok/s with the same -p/-n/-d/-r interface as
@@ -1254,74 +1133,5 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
         rt.block_on(infr_server::serve(generator, model_id, sockaddr))
-    }
-}
-
-#[cfg(test)]
-mod chat_stream_tests {
-    use super::*;
-    use infr_engine::Delta;
-
-    /// Feed `pieces` through a `ChatStream` and collect every emitted delta (streaming + finish).
-    fn run(pieces: &[&str], allow_tools: bool) -> (String, String, Vec<(String, String)>) {
-        let mut out: Vec<Delta> = Vec::new();
-        let mut s = ChatStream::new(allow_tools);
-        {
-            let mut od = |d: Delta| out.push(d);
-            for p in pieces {
-                s.push(p, &mut od);
-            }
-        }
-        s.finish(&mut |d: Delta| out.push(d));
-        let (mut r, mut c, mut t) = (String::new(), String::new(), Vec::new());
-        for d in &out {
-            match d {
-                Delta::Reasoning(x) => r.push_str(x),
-                Delta::Content(x) => c.push_str(x),
-                Delta::ToolCall { name, arguments } => t.push((name.clone(), arguments.clone())),
-            }
-        }
-        (r, c, t)
-    }
-
-    #[test]
-    fn streams_think_then_content() {
-        let (r, c, t) = run(
-            &["<think>", "reason", "ing", "</think>", "the ", "answer"],
-            true,
-        );
-        assert_eq!(r.trim(), "reasoning");
-        assert_eq!(c.trim(), "the answer");
-        assert!(t.is_empty());
-    }
-
-    #[test]
-    fn plain_content_no_think() {
-        let (r, c, _) = run(&["hello ", "world, this is a longer reply"], true);
-        assert!(r.trim().is_empty());
-        assert_eq!(c.trim(), "hello world, this is a longer reply");
-    }
-
-    #[test]
-    fn tool_call_buffered_and_parsed() {
-        let (r, _c, t) = run(
-            &[
-                "<think>plan</think>",
-                "<tool_call>\n{\"name\": \"run_bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>",
-            ],
-            true,
-        );
-        assert_eq!(r.trim(), "plan");
-        assert_eq!(t.len(), 1);
-        assert_eq!(t[0].0, "run_bash");
-        assert!(t[0].1.contains("ls"));
-    }
-
-    #[test]
-    fn tool_choice_none_keeps_tool_text_as_content() {
-        // allow_tools=false → a <tool_call> block is NOT extracted; it stays content.
-        let (_r, c, t) = run(&["<tool_call>{\"name\":\"x\"}</tool_call>"], false);
-        assert!(t.is_empty());
-        assert!(c.contains("tool_call"));
     }
 }

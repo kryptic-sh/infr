@@ -63,19 +63,12 @@ pub trait ChatModel {
     }
 }
 
-/// Store only the ANSWER, dropping the model's `<think>…</think>` reasoning (Qwen3 excludes
-/// prior-turn thinking; keeping it degrades the model). Mirrors the dense token-based logic: text
-/// after the LAST `</think>`; a `<think>` with no `</think>` (unterminated) → empty; no `<think>` at
-/// all → the whole reply.
+/// Store only the ANSWER, dropping the model's reasoning (Qwen3 excludes prior-turn thinking;
+/// keeping it degrades the model). Delegates to `infr-chat`'s splitter — the SAME reasoning
+/// grammar `infr run`'s display and `infr serve`'s deltas use — so what history keeps always
+/// matches what the surfaces call "content". Unterminated reasoning (truncated turn) → empty.
 fn strip_think(reply: &str) -> String {
-    const CLOSE: &str = "</think>";
-    if let Some(pos) = reply.rfind(CLOSE) {
-        reply[pos + CLOSE.len()..].to_string()
-    } else if reply.contains("<think>") {
-        String::new()
-    } else {
-        reply.to_string()
-    }
+    infr_chat::split_think(reply).1
 }
 
 /// The SINGLE arch-agnostic chat: owns the conversation history + `<think>`-stripping, drives any
@@ -550,14 +543,14 @@ mod tests {
             chat.history[0],
             ("user".into(), "capital of France?".into())
         );
-        assert_eq!(chat.history[1], ("assistant".into(), "\n\nParis".into()));
+        assert_eq!(chat.history[1], ("assistant".into(), "Paris".into()));
 
         // Turn 2: the rendered prompt must include BOTH prior turns (multi-turn context) with the
         // think-free assistant answer, then the new user message.
         chat.turn("and of Italy?", 8, &mut |_| {}).unwrap();
         let second = &rendered.borrow()[1];
         assert!(second.contains("user: capital of France?"), "{second}");
-        assert!(second.contains("assistant: \n\nParis"), "{second}");
+        assert!(second.contains("assistant: Paris"), "{second}");
         assert!(
             !second.contains("reason"),
             "prior think must be excluded: {second}"
@@ -567,9 +560,9 @@ mod tests {
 
     #[test]
     fn strip_think_variants() {
-        // After the last </think>.
+        // Reasoning spans stripped (ALL of them), content concatenated and trimmed.
         assert_eq!(strip_think("<think>a</think>b"), "b");
-        assert_eq!(strip_think("<think>a</think>x<think>c</think>y"), "y");
+        assert_eq!(strip_think("<think>a</think>x<think>c</think>y"), "xy");
         // Unterminated think → nothing.
         assert_eq!(strip_think("<think>a"), "");
         // No think → the whole reply.

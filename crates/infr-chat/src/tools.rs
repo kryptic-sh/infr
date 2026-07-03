@@ -284,25 +284,47 @@ fn parse_hermes_body(body: &str) -> Option<ToolCall> {
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
-/// Split output into `(reasoning, content)` on the `<think>…</think>` markers Qwen3/DeepSeek-R1 emit.
-/// Handles the prefilled-`<think>` case where the open marker was added by the template (output then
-/// starts mid-reasoning and only the close marker appears). No marker ⇒ all content, empty reasoning.
+/// Split output into `(reasoning, content)` on the `<think>…</think>` markers Qwen3/DeepSeek-R1
+/// emit — stripping EVERY reasoning span, not just the first (a constrained/looped turn can emit
+/// several). Handles the prefilled-`<think>` case where the open marker was added by the template
+/// (output then starts mid-reasoning and only the close marker appears) and an unterminated open
+/// (truncated turn — the tail is reasoning). No marker ⇒ all content, empty reasoning. This is
+/// THE reasoning grammar: `infr run`'s display, `infr serve`'s deltas and the chat history
+/// stripper all resolve reasoning-vs-content through this module.
 pub fn split_think(text: &str) -> (String, String) {
-    if let Some(close) = text.find(THINK_CLOSE) {
-        let head = &text[..close];
-        let head = head.strip_prefix(THINK_OPEN).unwrap_or(head);
-        let head = head.trim_start_matches(THINK_OPEN); // tolerate a stray duplicate
-        let tail = &text[close + THINK_CLOSE.len()..];
-        (head.trim().to_owned(), tail.trim().to_owned())
-    } else if let Some(open) = text.find(THINK_OPEN) {
-        // Open but no close (truncated / max tokens) — everything after the open is reasoning.
-        (
-            text[open + THINK_OPEN.len()..].trim().to_owned(),
-            String::new(),
-        )
-    } else {
-        (String::new(), text.trim().to_owned())
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let open = rest.find(THINK_OPEN);
+        let close = rest.find(THINK_CLOSE);
+        match (open, close) {
+            // Close before (or without) an open: prefilled-`<think>` — the head is reasoning.
+            // `trim_start_matches` tolerates a stray duplicate open marker.
+            (o, Some(c)) if o.is_none_or(|o| c < o) => {
+                reasoning.push_str(rest[..c].trim_start_matches(THINK_OPEN));
+                rest = &rest[c + THINK_CLOSE.len()..];
+            }
+            // Open..close pair (the guard above rules out c < o).
+            (Some(o), Some(c)) => {
+                content.push_str(&rest[..o]);
+                reasoning.push_str(&rest[o + THINK_OPEN.len()..c]);
+                rest = &rest[c + THINK_CLOSE.len()..];
+            }
+            // Open with no close (truncated / max tokens) — the tail is reasoning.
+            (Some(o), None) => {
+                content.push_str(&rest[..o]);
+                reasoning.push_str(&rest[o + THINK_OPEN.len()..]);
+                rest = "";
+            }
+            (None, None) => {
+                content.push_str(rest);
+                rest = "";
+            }
+            // Unreachable: `(None, Some(_))` is consumed by the first arm's guard.
+            (None, Some(_)) => unreachable!("guarded above"),
+        }
     }
+    (reasoning.trim().to_owned(), content.trim().to_owned())
 }
 
 // ---------------------------------------------------------------------------

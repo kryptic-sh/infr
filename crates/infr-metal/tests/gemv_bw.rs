@@ -56,6 +56,7 @@ fn bench(dtype: DType, wbytes: Vec<u8>, in_f: usize, out_f: usize, bpw: f64, lab
         m: m as u32,
         in_f: in_f as u32,
         out_f: out_f as u32,
+        w_off: 0,
     });
 
     let xb = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();

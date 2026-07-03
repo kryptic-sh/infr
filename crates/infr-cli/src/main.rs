@@ -455,12 +455,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             ))
         }
     } else if is_q35 {
-        let mode = if std::env::var("Q35_CPU").is_ok() {
-            "CPU oracle"
-        } else {
-            "GPU linear + SSM + attention"
-        };
-        eprintln!("[qwen35 Qwen3-Next — {mode}]");
+        eprintln!("[qwen35 Qwen3-Next — Vulkan agnostic seam]");
         Box::new(infr_llama::model::Qwen35Chat::new(gguf.clone()))
     } else {
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
@@ -660,9 +655,10 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
-    // qwen35 (Qwen3-Next): a hybrid gated-DeltaNet + GQA model with a bespoke per-token forward —
-    // it is NOT a `Llama` (dense/MoE), so `load_opt` below can't load or run it. Route it through
-    // its own loader + `forward`, reusing the same pp/tg/pg warmup-then-time methodology.
+    // qwen35 (Qwen3-Next): a hybrid gated-DeltaNet + GQA model on its own agnostic-seam graph — it
+    // is NOT a `Llama` (dense/MoE), so `load_opt` below can't load or run it. Route it through the
+    // seam's own `ChatModel` (`cmd_bench_qwen35`), reusing the same pp/tg warmup-then-time
+    // methodology.
     if infr_llama::qwen35::is_qwen35(&gguf) {
         return cmd_bench_qwen35(&gguf, n_prompt, n_gen, depth, pg, reps, ngl == 0, json);
     }
@@ -822,12 +818,12 @@ fn cmd_bench_cpu(
     Ok(())
 }
 
-/// qwen35 (Qwen3-Next) bench: the hybrid gated-DeltaNet + GQA forward is a bespoke per-token path
-/// (no batched-prefill kernel, and not a [`infr_llama::Llama`]), so it can't ride the dense/MoE
-/// bench above. Same pp/tg/pg methodology as [`cmd_bench`] — warm the pipelines outside the timed
-/// region, then time prefill and decode SEPARATELY — driven through the model's public
-/// [`infr_llama::qwen35::Model::forward`]. Dummy tokens (timing is data-independent). `cpu` selects
-/// the `Q35_CPU=1` reference forward (`-ngl 0`) vs the GPU-resident forward.
+/// qwen35 (Qwen3-Next) bench: drives the PRODUCTION path through the SAME `ChatModel` structs
+/// `infr run` builds (`Qwen35Chat`, on the Vulkan or CPU seam backend), timing `ChatModel::generate`
+/// itself — bench and run share one engine BY CONSTRUCTION, so a production-path change can never
+/// leave the bench measuring a dead path. The seam ingests a text prompt, so synthesize one near
+/// `n_prompt` tokens and report the actual token counts from its stats. `cpu` selects the CPU seam
+/// backend (`-ngl 0`) vs the Vulkan GPU-resident forward.
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench_qwen35(
     gguf: &Path,
@@ -839,119 +835,55 @@ fn cmd_bench_qwen35(
     cpu: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    // -ngl 0: force the pure-CPU oracle forward (no Vulkan), matching `llama-bench -ngl 0`.
-    if cpu {
-        std::env::set_var("Q35_CPU", "1");
+    if pg.is_some() {
+        anyhow::bail!(
+            "qwen35 bench does not support -pg (combined prompt+gen); use separate -p/-n"
+        );
     }
-    // No depth/pg: drive the PRODUCTION path through the SAME `ChatModel` structs `infr run`
-    // builds (Qwen35Chat, on the Vulkan or CPU seam backend), timing
-    // `ChatModel::generate` itself — bench and run share one engine BY CONSTRUCTION, so a
-    // production-path change can never leave the bench measuring a dead path. The seam ingests a
-    // text prompt, so synthesize one near `n_prompt` tokens and report the actual token counts
-    // from its stats. depth/pg still use the bespoke per-token forward below (the seam has no
-    // context-depth warm API yet).
-    if pg.is_none() {
-        use infr_llama::model::ChatModel;
-        std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
-        let mut m: Box<dyn ChatModel> = if cpu {
-            Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.to_path_buf()))
-        } else {
-            Box::new(infr_llama::model::Qwen35Chat::new(gguf.to_path_buf()))
-        };
-        let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens
-                                                                        // Depth rides the PROMPT: `GenStats` splits prompt_secs from decode_secs, so decoding at
-                                                                        // depth d = a ~d-token prompt whose (untimed-for-tg) prefill fills the state, then the
-                                                                        // timed decode runs at that depth. pp is only reported at depth 0 (a deeper prompt can't
-                                                                        // split its prefill time into "depth warm" vs "measured n_prompt").
-        let prompt_toks = n_prompt + depth;
-        let prompt = if prompt_toks > 0 {
-            sentence.repeat(prompt_toks.div_ceil(10))
-        } else {
-            sentence.to_string()
-        };
-        let n = n_gen.max(1);
-        // untimed warmup: loads the model once (weights + pipeline compile stay warm across reps)
-        m.generate(sentence, 1, &mut |_| {})?;
-        let (mut pps, mut tgs) = (Vec::new(), Vec::new());
-        let (mut np, mut ng) = (0usize, 0usize);
-        for _ in 0..reps.max(1) {
-            let st = m.generate(&prompt, n, &mut |_| {})?;
-            pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
-            tgs.push(st.n_gen as f64 / st.decode_secs.max(1e-9));
-            (np, ng) = (st.n_prompt, st.n_gen);
-        }
-        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-        if json {
-            let a = if n_gen > 0 { avg(&tgs) } else { avg(&pps) };
-            println!("[{{\"avg_ts\": {a:.2}}}]");
-        } else if n_gen > 0 && n_prompt > 0 && depth == 0 {
-            println!(
-                "pp{np}: {:.1} t/s | tg{ng}: {:.1} t/s  ({reps} reps)",
-                avg(&pps),
-                avg(&tgs)
-            );
-        } else if n_gen > 0 {
-            println!("tg{ng}: {:.1} t/s  ({reps} reps)", avg(&tgs));
-        } else {
-            println!("pp{np}: {:.1} t/s  ({reps} reps)", avg(&pps));
-        }
-        return Ok(());
-    }
-    let model = infr_llama::qwen35::load_path(gguf)?;
-    let measure_tg = pg.is_none() && n_gen > 0;
-    let dummy = |i: usize| (i % 100) as u32;
-    // Untimed warmup: one forward on a throwaway state compiles the lazy GPU pipelines (and pages in
-    // the weights), keeping that one-time cost out of the timed reps — the qwen35 analogue of the
-    // dense path's `Llama::warmup` at load.
-    {
-        let mut st = model.new_state();
-        let _ = model.forward(dummy(0), &mut st);
-    }
-    let mut samples = Vec::with_capacity(reps.max(1));
-    for _ in 0..reps.max(1) {
-        // Fresh state per rep; advance it to `depth` (untimed) so tg is measured at that context.
-        let mut st = model.new_state();
-        for i in 0..depth {
-            let _ = model.forward(dummy(i), &mut st);
-        }
-        let t = std::time::Instant::now();
-        let ts = if let Some((p, g)) = pg {
-            // coding-agent turn: time prompt ingest + reply generation together.
-            for i in 0..p {
-                let _ = model.forward(dummy(depth + i), &mut st);
-            }
-            for _ in 0..g {
-                let _ = model.forward(7u32, &mut st);
-            }
-            (p + g) as f64 / t.elapsed().as_secs_f64()
-        } else if measure_tg {
-            for _ in 0..n_gen {
-                let _ = model.forward(7u32, &mut st);
-            }
-            n_gen as f64 / t.elapsed().as_secs_f64()
-        } else {
-            for i in 0..n_prompt {
-                let _ = model.forward(dummy(depth + i), &mut st);
-            }
-            n_prompt as f64 / t.elapsed().as_secs_f64()
-        };
-        samples.push(ts);
-    }
-    let label = if let Some((p, g)) = pg {
-        format!("pg{p}+{g}")
-    } else if measure_tg {
-        format!("tg{n_gen}")
+    use infr_llama::model::ChatModel;
+    std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
+    let mut m: Box<dyn ChatModel> = if cpu {
+        Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.to_path_buf()))
     } else {
-        format!("pp{n_prompt}")
+        Box::new(infr_llama::model::Qwen35Chat::new(gguf.to_path_buf()))
     };
-    print_bench_avg(
-        &samples,
-        &label,
-        depth,
-        if cpu { " [cpu]" } else { "" },
-        reps,
-        json,
-    );
+    let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens
+                                                                    // Depth rides the PROMPT: `GenStats` splits prompt_secs from decode_secs, so decoding at
+                                                                    // depth d = a ~d-token prompt whose (untimed-for-tg) prefill fills the state, then the
+                                                                    // timed decode runs at that depth. pp is only reported at depth 0 (a deeper prompt can't
+                                                                    // split its prefill time into "depth warm" vs "measured n_prompt").
+    let prompt_toks = n_prompt + depth;
+    let prompt = if prompt_toks > 0 {
+        sentence.repeat(prompt_toks.div_ceil(10))
+    } else {
+        sentence.to_string()
+    };
+    let n = n_gen.max(1);
+    // untimed warmup: loads the model once (weights + pipeline compile stay warm across reps)
+    m.generate(sentence, 1, &mut |_| {})?;
+    let (mut pps, mut tgs) = (Vec::new(), Vec::new());
+    let (mut np, mut ng) = (0usize, 0usize);
+    for _ in 0..reps.max(1) {
+        let st = m.generate(&prompt, n, &mut |_| {})?;
+        pps.push(st.n_prompt as f64 / st.prompt_secs.max(1e-9));
+        tgs.push(st.n_gen as f64 / st.decode_secs.max(1e-9));
+        (np, ng) = (st.n_prompt, st.n_gen);
+    }
+    let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    if json {
+        let a = if n_gen > 0 { avg(&tgs) } else { avg(&pps) };
+        println!("[{{\"avg_ts\": {a:.2}}}]");
+    } else if n_gen > 0 && n_prompt > 0 && depth == 0 {
+        println!(
+            "pp{np}: {:.1} t/s | tg{ng}: {:.1} t/s  ({reps} reps)",
+            avg(&pps),
+            avg(&tgs)
+        );
+    } else if n_gen > 0 {
+        println!("tg{ng}: {:.1} t/s  ({reps} reps)", avg(&tgs));
+    } else {
+        println!("pp{np}: {:.1} t/s  ({reps} reps)", avg(&pps));
+    }
     Ok(())
 }
 

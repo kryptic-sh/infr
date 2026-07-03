@@ -6,8 +6,7 @@ use infr_core::WeightSource;
 use infr_gguf::Gguf;
 
 // Re-export from infr_gguf::dequant so existing callers inside infr-llama resolve via `crate::`.
-// Non-test code uses dequant_block and f32_to_f16_sat; the rest are only needed in tests.
-pub(crate) use infr_gguf::dequant::{dequant_block, f32_to_f16_sat};
+pub(crate) use infr_gguf::dequant::dequant_block;
 
 // Test-only re-exports: transformer.rs `gpu_affine_tests` use these via `use crate::*;`.
 

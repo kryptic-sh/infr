@@ -15,7 +15,6 @@
 
 use crate::{no_template_err, CpuModel, GenStats};
 use anyhow::Result;
-use std::time::Instant;
 
 /// The two arch-specific primitives the shared [`Chat`] drives. Object-safe: no generics, callbacks
 /// are `&mut dyn FnMut`. A stateful backend (dense) may keep a KV cache warm across `generate` calls;
@@ -140,34 +139,6 @@ impl<'a> Chat<'a> {
     }
 }
 
-/// Wrap a callback-driven generate: measure time-to-first-piece + decode time, count pieces. Used by
-/// the stateless backends (dense computes its own timing inside `ChatSession::generate`).
-fn timed(
-    on_piece: &mut dyn FnMut(&str),
-    n_prompt: usize,
-    run: impl FnOnce(&mut dyn FnMut(&str)) -> Result<()>,
-) -> Result<GenStats> {
-    let t0 = Instant::now();
-    let mut t_first: Option<Instant> = None;
-    let mut n_gen = 0usize;
-    let mut cb = |p: &str| {
-        if t_first.is_none() {
-            t_first = Some(Instant::now());
-        }
-        n_gen += 1;
-        on_piece(p);
-    };
-    run(&mut cb)?;
-    let now = Instant::now();
-    let tf = t_first.unwrap_or(now);
-    Ok(GenStats {
-        n_prompt,
-        prompt_secs: tf.duration_since(t0).as_secs_f64(),
-        n_gen,
-        decode_secs: now.duration_since(tf).as_secs_f64(),
-    })
-}
-
 /// Which compute backend a [`Qwen35Chat`] loads its [`crate::qwen35::SeamModel`] on. All variants
 /// run the SAME agnostic seam graph — only the executor differs.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -183,8 +154,7 @@ pub enum SeamBackend {
 /// qwen35 / Qwen3-Next on the agnostic batched/chunked seam ([`crate::qwen35::SeamModel`]), loaded
 /// ONCE on the first turn and reused after (weights stay resident across turns). One struct serves
 /// every backend — Vulkan (production), CPU and Metal (reference) — and it is the same engine
-/// `infr bench` times, so run and bench cannot drift apart. `INFR_Q35_BESPOKE=1` (Vulkan only)
-/// falls back to the per-token reference forward.
+/// `infr bench` times, so run and bench cannot drift apart.
 pub struct Qwen35Chat {
     path: std::path::PathBuf,
     backend: SeamBackend,
@@ -241,19 +211,6 @@ impl ChatModel for Qwen35Chat {
         max_new: usize,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        // Bespoke per-token reference path (per-call load; Vulkan escape hatch only).
-        if self.backend == SeamBackend::Vulkan && std::env::var("INFR_Q35_BESPOKE").is_ok() {
-            let mut n_prompt = 0usize;
-            return timed(on_piece, 0, |cb| {
-                let (np, _ng) = crate::qwen35::generate_chat(&self.path, prompt, max_new, cb)?;
-                n_prompt = np;
-                Ok(())
-            })
-            .map(|mut s| {
-                s.n_prompt = n_prompt;
-                s
-            });
-        }
         if self.seam.is_none() {
             self.seam = Some(match self.backend {
                 SeamBackend::Vulkan => crate::qwen35::SeamModel::load_vulkan(&self.path)?,
@@ -283,11 +240,6 @@ impl ChatModel for Qwen35Chat {
         constraint: &mut crate::grammar::Constraint,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        if std::env::var("INFR_Q35_BESPOKE").is_ok() {
-            return Err(anyhow::anyhow!(
-                "constrained generation is seam-only (INFR_Q35_BESPOKE set)"
-            ));
-        }
         if self.seam.is_none() {
             self.seam = Some(match self.backend {
                 SeamBackend::Vulkan => crate::qwen35::SeamModel::load_vulkan(&self.path)?,

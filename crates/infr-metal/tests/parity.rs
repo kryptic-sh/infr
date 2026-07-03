@@ -434,6 +434,136 @@ fn check_quant_linear_parity_impl(
     }
 }
 
+// Fused-QKV slices: several Linear ops share ONE concatenated [Σslices, in_f] weight, each
+// reading its rows at `w_off` (the runner's combined-QKV shape — `Op::Linear.w_off`). Every
+// slice must match a reference matmul over the dequant of just that slice's rows; the
+// non-zero offsets exercise the byte-offset binds into the codes/scm/dd streams.
+fn check_linear_woff(
+    dtype: DType,
+    wbytes: Vec<u8>,
+    m: usize,
+    in_f: usize,
+    slices: &[usize],
+    half_ops: bool,
+    tol: f32,
+) {
+    use infr_gguf::dequant::dequant_block;
+    let rows_total: usize = slices.iter().sum();
+    let mut xs = rand_f32(m * in_f, 34);
+    let mut wref = dequant_block(dtype, &wbytes).unwrap();
+    if half_ops {
+        for v in xs.iter_mut().chain(wref.iter_mut()) {
+            *v = half::f16::from_f32(*v).to_f32();
+        }
+    }
+    let be = MetalBackend::new().expect("metal backend");
+    let mut row0 = 0usize;
+    for &out_f in slices {
+        let wslice = &wref[row0 * in_f..(row0 + out_f) * in_f];
+        let reference = ref_linear(&xs, wslice, m, in_f, out_f);
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+        let w = g.weight(TensorDesc::new(vec![rows_total, in_f], dtype));
+        let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+        g.push(Op::Linear {
+            x,
+            weight: w,
+            dst,
+            m: m as u32,
+            in_f: in_f as u32,
+            out_f: out_f as u32,
+            w_off: (row0 * in_f) as u32,
+        });
+        let bound = vec![(x, f32_bytes(&xs)), (w, wbytes.clone())];
+        let mtl = run(&be, &g, &bound, dst, m * out_f);
+        for (i, (r, mm)) in reference.iter().zip(mtl.iter()).enumerate() {
+            let err = (r - mm).abs() / r.abs().max(1.0);
+            assert!(
+                err <= tol,
+                "{dtype:?} slice@{row0} elem {i}: ref={r} metal={mm} err={err} > {tol}"
+            );
+        }
+        row0 += out_f;
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_q8_0_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 35);
+    check_linear_woff(
+        DType::Q8_0,
+        quantize_q8_0(&wf),
+        1,
+        in_f,
+        &slices,
+        false,
+        1e-3,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_q8_0_coop_gemm() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 36);
+    check_linear_woff(
+        DType::Q8_0,
+        quantize_q8_0(&wf),
+        40,
+        in_f,
+        &slices,
+        true,
+        1e-3,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_q4k_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    check_linear_woff(
+        DType::Q4K,
+        synth_q4k(256 * in_f, 37),
+        1,
+        in_f,
+        &slices,
+        false,
+        1e-3,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_q4k_coop_gemm() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    check_linear_woff(
+        DType::Q4K,
+        synth_q4k(256 * in_f, 38),
+        40,
+        in_f,
+        &slices,
+        true,
+        1e-3,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_q6k_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    check_linear_woff(
+        DType::Q6K,
+        synth_q6k(256 * in_f, 39),
+        1,
+        in_f,
+        &slices,
+        false,
+        1e-3,
+    );
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_f32_parity() {

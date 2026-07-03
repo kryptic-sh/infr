@@ -367,6 +367,26 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
 }
 
 
+// ---- Strided row copy (the fused-QKV prefill split: one wide GEMM output sliced into q/k/v).
+// Pure data movement, but on-device — a host copy here would round-trip the [m, qkv] buffer and
+// break the command buffer mid-forward.
+struct CopyStridedParams {
+    uint src_off;
+    uint src_stride;
+    uint dst_off;
+    uint dst_stride;
+    uint rows;
+    uint n;
+};
+kernel void copy_strided_f32(device const float*         src [[buffer(0)]],
+                             device float*               dst [[buffer(1)]],
+                             constant CopyStridedParams& p   [[buffer(2)]],
+                             uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows * p.n) return;
+    uint r = gid / p.n, c = gid % p.n;
+    dst[p.dst_off + r * p.dst_stride + c] = src[p.src_off + r * p.src_stride + c];
+}
+
 // ---- Cast f32 -> f16 (prefill GEMM feeds on half activations; round-to-nearest-even).
 kernel void cast_f32_f16(device const float* src [[buffer(0)]],
                          device half*        dst [[buffer(1)]],

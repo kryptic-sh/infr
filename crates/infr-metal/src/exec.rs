@@ -115,6 +115,9 @@ fn linear_add_peephole(
 pub(crate) struct TapeEntry {
     pso: ComputePipelineState,
     bufs: Vec<MtlBuffer>,
+    /// Per-buffer byte offset for `set_buffer` (parallel to `bufs`; all zero except the
+    /// fused-QKV weight slices — see the Linear arm's `w_off`).
+    offs: Vec<u64>,
     params: Vec<u8>,
     threads: usize,
     tg: usize,
@@ -363,6 +366,21 @@ impl MetalBackend {
         threads: usize,
         tg: usize,
     ) {
+        let with_offs: Vec<(&MtlBuffer, u64)> = bufs.iter().map(|b| (*b, 0)).collect();
+        self.encode_tg_off(r, pso, &with_offs, params, threads, tg);
+    }
+
+    /// As `encode_tg`, but each buffer binds at a byte offset — the fused-QKV Linear slices
+    /// bind the shared concatenated weight at each projection's row offset (`Op::Linear.w_off`).
+    fn encode_tg_off(
+        &self,
+        r: &mut Resident,
+        pso: &ComputePipelineState,
+        bufs: &[(&MtlBuffer, u64)],
+        params: &[u8],
+        threads: usize,
+        tg: usize,
+    ) {
         if threads == 0 {
             return;
         }
@@ -374,8 +392,8 @@ impl MetalBackend {
         }
         let enc = r.enc.as_ref().unwrap();
         enc.set_compute_pipeline_state(pso);
-        for (i, b) in bufs.iter().enumerate() {
-            enc.set_buffer(i as u64, Some(b), 0);
+        for (i, (b, off)) in bufs.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), *off);
         }
         if !params.is_empty() {
             enc.set_bytes(
@@ -390,7 +408,8 @@ impl MetalBackend {
         if let Some(tape) = r.tape.as_mut() {
             tape.push(TapeEntry {
                 pso: pso.clone(),
-                bufs: bufs.iter().map(|b| (*b).clone()).collect(),
+                bufs: bufs.iter().map(|(b, _)| (*b).clone()).collect(),
+                offs: bufs.iter().map(|(_, off)| *off).collect(),
                 params: params.to_vec(),
                 threads,
                 tg,
@@ -408,7 +427,7 @@ impl MetalBackend {
             for e in &tape.entries {
                 enc.set_compute_pipeline_state(&e.pso);
                 for (i, b) in e.bufs.iter().enumerate() {
-                    enc.set_buffer(i as u64, Some(b), 0);
+                    enc.set_buffer(i as u64, Some(b), e.offs[i]);
                 }
                 if !e.params.is_empty() {
                     enc.set_bytes(
@@ -931,13 +950,6 @@ impl MetalBackend {
                 out_f,
                 w_off,
             } => {
-                // Only produced by the fused-QKV runner path, which is gated on
-                // `Capabilities::combined_gu` — Metal leaves it false, so this is unreachable.
-                if w_off != 0 {
-                    return Err(Error::Unsupported(
-                        "metal: Linear w_off (fused-QKV slices) unsupported".into(),
-                    ));
-                }
                 let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
                 let bx = self.ensure_device(r, x);
                 let bd = self.dev_dst(r, dst, m * out_f);
@@ -952,6 +964,32 @@ impl MetalBackend {
                     // weight block decoded once for all 8 rows, instead of the GEMV kernel
                     // re-streaming the whole weight matrix once per row.
                     let qw = self.weight_qui(weight, g, bindings);
+                    // Fused-QKV slice: `w_off` is a whole-row element offset into the shared
+                    // concatenated weight (the runner bakes it as `row0 * in_f`), so it lands on
+                    // a block boundary in every stream — bind each stream at the corresponding
+                    // byte offset and the kernels see the slice as a standalone [out_f, in_f]
+                    // weight. Native K-quant streams are raw GGUF blocks (144 B / 210 B per 256
+                    // elements); factored streams are bit-packed codes + 4 B scm per 16 elements
+                    // + 4 B (d, dmin) per 2^dshift elements.
+                    let e = w_off as u64;
+                    let dd_off = (e >> qw.dshift) * 4;
+                    let (codes_off, scm_off, dd_off) = match qw.kern {
+                        _ if w_off == 0 => (0, 0, 0),
+                        // Native kernels read raw GGUF blocks; scm/dd are dummy buffers.
+                        "linear_q4k" => (e / 256 * 144, 0, 0),
+                        "linear_q6k" => (e / 256 * 210, 0, 0),
+                        "linear_quik4" => (e / 2, e / 4, dd_off),
+                        "linear_quik6" => (e / 4 * 3, e / 4, dd_off),
+                        _ => (e, e / 4, dd_off),
+                    };
+                    // `set_buffer` offsets must stay 4-byte aligned; every real fused shape does
+                    // (in_f is a multiple of 512 or the format's stride is already 4-aligned) —
+                    // reject the pathological remainder instead of tripping API validation.
+                    if codes_off % 4 != 0 || scm_off % 4 != 0 || dd_off % 4 != 0 {
+                        return Err(Error::Unsupported(
+                            "metal: Linear w_off lands off 4-byte alignment".into(),
+                        ));
+                    }
                     // sgs = simdgroups to launch; tg = threadgroup width. GEMM tiles 8x16 per
                     // simdgroup (4 simdgroups per threadgroup for the staging tile). The GEMM
                     // kernel requires its full 128-thread threadgroup (per-simdgroup staging
@@ -992,10 +1030,16 @@ impl MetalBackend {
                     if cmm_ok {
                         // Reads f32 x directly (casts to f16 while staging) — no cast pass.
                         let pso = self.pipelines.get(cmm_kern)?;
-                        self.encode_tg(
+                        self.encode_tg_off(
                             r,
                             &pso,
-                            &[bx.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
+                            &[
+                                (bx.as_ref(), 0),
+                                (&qw.codes, codes_off),
+                                (&qw.scm, scm_off),
+                                (&qw.dd, dd_off),
+                                (bd.as_ref(), 0),
+                            ],
                             &p,
                             m.div_ceil(32) * (out_f / 64) * 128,
                             128,
@@ -1011,10 +1055,16 @@ impl MetalBackend {
                         let n = (m * in_f) as u32;
                         self.encode(r, &cast, &[bx.as_ref(), &xh], &n.to_ne_bytes(), m * in_f);
                         let pso = self.pipelines.get(hmm_kern)?;
-                        self.encode_tg(
+                        self.encode_tg_off(
                             r,
                             &pso,
-                            &[xh.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
+                            &[
+                                (xh.as_ref(), 0),
+                                (&qw.codes, codes_off),
+                                (&qw.scm, scm_off),
+                                (&qw.dd, dd_off),
+                                (bd.as_ref(), 0),
+                            ],
                             &p,
                             m.div_ceil(32) * (out_f / 16) * 32,
                             128,
@@ -1047,16 +1097,16 @@ impl MetalBackend {
                             let bres = self.ensure_device(r, res);
                             let bfd = self.dev_dst(r, fdst, out_f);
                             let pso = self.pipelines.get(fk)?;
-                            self.encode_tg(
+                            self.encode_tg_off(
                                 r,
                                 &pso,
                                 &[
-                                    bx.as_ref(),
-                                    &qw.codes,
-                                    &qw.scm,
-                                    &qw.dd,
-                                    bfd.as_ref(),
-                                    bres.as_ref(),
+                                    (bx.as_ref(), 0),
+                                    (&qw.codes, codes_off),
+                                    (&qw.scm, scm_off),
+                                    (&qw.dd, dd_off),
+                                    (bfd.as_ref(), 0),
+                                    (bres.as_ref(), 0),
                                 ],
                                 &p,
                                 sgs * 32,
@@ -1066,10 +1116,16 @@ impl MetalBackend {
                             return Ok(());
                         }
                         let pso = self.pipelines.get(kern)?;
-                        self.encode_tg(
+                        self.encode_tg_off(
                             r,
                             &pso,
-                            &[bx.as_ref(), &qw.codes, &qw.scm, &qw.dd, bd.as_ref()],
+                            &[
+                                (bx.as_ref(), 0),
+                                (&qw.codes, codes_off),
+                                (&qw.scm, scm_off),
+                                (&qw.dd, dd_off),
+                                (bd.as_ref(), 0),
+                            ],
                             &p,
                             sgs * 32,
                             32,
@@ -1079,10 +1135,14 @@ impl MetalBackend {
                     // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
                     let bw = self.weight_buf(weight, g, bindings);
                     let pso = self.pipelines.get("linear_f32")?;
-                    self.encode_tg(
+                    self.encode_tg_off(
                         r,
                         &pso,
-                        &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                        &[
+                            (bx.as_ref(), 0),
+                            (bw.as_ref(), w_off as u64 * 4),
+                            (bd.as_ref(), 0),
+                        ],
                         &p,
                         m * out_f * 32,
                         32,
@@ -2246,6 +2306,8 @@ impl MetalBackend {
                 r.vals[dst.0 as usize][dof..dof + n].copy_from_slice(&s[so..so + n]);
                 r.loc[dst.0 as usize] = Loc::Host;
             }
+            // On-device: the fused-QKV prefill emits one of these per projection right after the
+            // wide GEMM — a host copy would round-trip the [m, qkv] activation mid-forward.
             Op::CopyStrided {
                 src,
                 src_off,
@@ -2256,22 +2318,24 @@ impl MetalBackend {
                 rows,
                 n,
             } => {
-                let (so, ss, dof, ds, n) = (
-                    src_off as usize,
-                    src_stride as usize,
-                    dst_off as usize,
-                    dst_stride as usize,
-                    n as usize,
+                let bs = self.ensure_device(r, src);
+                // The strided write may cover only part of dst — bring the rest along.
+                let bd = self.ensure_device(r, dst);
+                let mut p = src_off.to_ne_bytes().to_vec();
+                p.extend_from_slice(&src_stride.to_ne_bytes());
+                p.extend_from_slice(&dst_off.to_ne_bytes());
+                p.extend_from_slice(&dst_stride.to_ne_bytes());
+                p.extend_from_slice(&rows.to_ne_bytes());
+                p.extend_from_slice(&n.to_ne_bytes());
+                let pso = self.pipelines.get("copy_strided_f32")?;
+                self.encode(
+                    r,
+                    &pso,
+                    &[bs.as_ref(), bd.as_ref()],
+                    &p,
+                    rows as usize * n as usize,
                 );
-                self.ensure_host(r, g, src);
-                self.ensure_host(r, g, dst);
-                let s = r.vals[src.0 as usize].clone();
-                let d = &mut r.vals[dst.0 as usize];
-                for rr in 0..rows as usize {
-                    d[dof + rr * ds..dof + rr * ds + n]
-                        .copy_from_slice(&s[so + rr * ss..so + rr * ss + n]);
-                }
-                r.loc[dst.0 as usize] = Loc::Host;
+                r.loc[dst.0 as usize] = Loc::Device;
             }
         }
         Ok(())

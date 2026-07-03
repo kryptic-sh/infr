@@ -503,6 +503,42 @@ kernel void NAME(device const half*   x     [[buffer(0)]],                      
     }                                                                                             \
 }
 
+// Shared GEMV epilogue: reduce each row's partial across the simdgroup, then — when the k-dim
+// is SPLIT across NSG simdgroups (the ks variants; small/mid GEMVs underfill the GPU with one
+// simdgroup per row group and serialize the whole k-loop) — across the threadgroup via `red`
+// (NSG * R floats), simdgroup 0 folding and writing with the EPI contract. NSG == 1 keeps the
+// original single-simdgroup store; the branch is compile-time.
+// R = rows per group; LIM = live-row bound (R or a clamped nrows).
+#define GEMV_EPILOGUE_N(R, LIM)                                                                   \
+    for (uint row = 0; row < (LIM) && first_row + row < p.out_f; row++)                           \
+        sumf[row] = simd_sum(sumf[row]);                                                          \
+    if (NSG == 1u) {                                                                              \
+        if (lane == 0u) {                                                                         \
+            for (uint row = 0; row < (LIM) && first_row + row < p.out_f; row++) {                 \
+                uint o = first_row + row;                                                         \
+                float s = sumf[row];                                                              \
+                if (EPI == 2)      dst[o] = (zeroacc ? 0.0f : dst[o]) + wgt * s;                  \
+                else if (EPI == 1) dst[o] = s + res[o];                                           \
+                else               dst[o] = s;                                                    \
+            }                                                                                     \
+        }                                                                                         \
+    } else {                                                                                      \
+        if (lane == 0u)                                                                           \
+            for (uint row = 0; row < (R); row++) red[sgitg * (R) + row] = sumf[row];              \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
+        if (sgitg == 0 && lane == 0u) {                                                           \
+            for (uint row = 0; row < (LIM) && first_row + row < p.out_f; row++) {                 \
+                float s = 0.0f;                                                                   \
+                for (uint g = 0; g < NSG; g++) s += red[g * (R) + row];                           \
+                uint o = first_row + row;                                                         \
+                if (EPI == 2)      dst[o] = (zeroacc ? 0.0f : dst[o]) + wgt * s;                  \
+                else if (EPI == 1) dst[o] = s + res[o];                                           \
+                else               dst[o] = s;                                                    \
+            }                                                                                     \
+        }                                                                                         \
+    }
+#define GEMV_EPILOGUE(R) GEMV_EPILOGUE_N(R, R)
+
 // Decode GEMV for the native K-quant formats, mul_mv shape (ported from llama.cpp's
 // kernel_mul_mv_q4_K_f32 / q6_K and adapted to our buffers): each simdgroup computes TWO output
 // rows; activations load once into registers and are reused across both rows, and the inner loop
@@ -516,15 +552,16 @@ kernel void NAME(device const half*   x     [[buffer(0)]],                      
 // decode o_proj/down_proj + Add peephole — one dispatch and no sublayer-output round-trip).
 // EPI epilogue modes: 0 = dst = s; 1 = dst = s + res (fused residual Add); 2 = MoE accumulate,
 // dst = (zeroacc ? 0 : dst) + wgt*s (the weighted expert sum, first expert zeroes).
-template<int EPI, typename PT>
+template<int EPI, uint NSG, typename PT>
 inline void linear_q4k_body(device const float*  x,
                             device const uchar*  codes,
                             device float*        dst,
                             device const float*  res,
                             constant PT& p,
                             float wgt, bool zeroacc,
-                            uint gid, uint lane) {
-    uint first_row = (gid / 32u) * 2u;
+                            uint gid, uint lane,
+                            ushort sgitg, threadgroup float* red) {
+    uint first_row = (gid / (32u * NSG)) * 2u;
     if (first_row >= p.out_f) return;
     uint nb = p.in_f >> 8;                 // 256-element blocks per row
     ulong row_b = (ulong)nb * 144ul;       // row stride in bytes
@@ -538,12 +575,12 @@ inline void linear_q4k_body(device const float*  x,
 
     float yl[16], yh[16];
     float sumf[2] = {0.0f, 0.0f};
-    device const float* y4 = x + ix * 256u + 64u * iq + 8u * ir;
+    device const float* y4 = x + (sgitg * 4u + ix) * 256u + 64u * iq + 8u * ir;
 
     ushort sc16[4];
     thread const uchar* sc8 = (thread const uchar*)sc16;
 
-    for (uint ib = ix; ib < nb; ib += 4u) {
+    for (uint ib = sgitg * 4u + ix; ib < nb; ib += NSG * 4u) {
         float4 sumy = float4(0.0f);
         for (uint i = 0; i < 8u; i++) {
             yl[i]      = y4[i];        sumy[0] += yl[i];
@@ -584,16 +621,9 @@ inline void linear_q4k_body(device const float*  x,
             sc += row_b / 2u;
             dh += row_b / 2u;
         }
-        y4 += 4u * 256u;
+        y4 += NSG * 4u * 256u;
     }
-    for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
-        float s = simd_sum(sumf[row]);
-        if (lane == 0u) {
-            if (EPI == 2)      dst[first_row + row] = (zeroacc ? 0.0f : dst[first_row + row]) + wgt * s;
-            else if (EPI == 1) dst[first_row + row] = s + res[first_row + row];
-            else               dst[first_row + row] = s;
-        }
-    }
+    GEMV_EPILOGUE(2u)
 }
 
 kernel void linear_q4k(device const float*  x     [[buffer(0)]],
@@ -604,7 +634,8 @@ kernel void linear_q4k(device const float*  x     [[buffer(0)]],
                        constant QLinParams& p     [[buffer(5)]],
                        uint gid  [[thread_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]]) {
-    linear_q4k_body<0>(x, codes, dst, x, p, 0.0f, false, gid, lane);
+    threadgroup float red[2];
+    linear_q4k_body<0, 1>(x, codes, dst, x, p, 0.0f, false, gid, lane, 0, red);
 }
 kernel void linear_q4k_add(device const float*  x     [[buffer(0)]],
                            device const uchar*  codes [[buffer(1)]],
@@ -615,18 +646,47 @@ kernel void linear_q4k_add(device const float*  x     [[buffer(0)]],
                            constant QLinParams& p     [[buffer(6)]],
                            uint gid  [[thread_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]]) {
-    linear_q4k_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
+    threadgroup float red[2];
+    linear_q4k_body<1, 1>(x, codes, dst, res, p, 0.0f, false, gid, lane, 0, red);
+}
+// k-split variant: 4 simdgroups share the row group, each covering a strided quarter of the
+// k-dim blocks — 4x the threadgroups on small/mid GEMVs and a quarter of the serial chain.
+kernel void linear_q4k_ks(device const float*  x     [[buffer(0)]],
+                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar*  scm   [[buffer(2)]],
+                       device const uchar*  dd    [[buffer(3)]],
+                       device float*        dst   [[buffer(4)]],
+                       constant QLinParams& p     [[buffer(5)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint sgitg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4 * 2];
+    linear_q4k_body<0, 4>(x, codes, dst, x, p, 0.0f, false, gid, lane, sgitg, red);
+}
+kernel void linear_q4k_ks_add(device const float*  x     [[buffer(0)]],
+                           device const uchar*  codes [[buffer(1)]],
+                           device const uchar*  scm   [[buffer(2)]],
+                           device const uchar*  dd    [[buffer(3)]],
+                           device float*        dst   [[buffer(4)]],
+                           device const float*  res   [[buffer(5)]],
+                           constant QLinParams& p     [[buffer(6)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint sgitg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4 * 2];
+    linear_q4k_body<1, 4>(x, codes, dst, res, p, 0.0f, false, gid, lane, sgitg, red);
 }
 
-template<int EPI, typename PT>
+template<int EPI, uint NSG, typename PT>
 inline void linear_q6k_body(device const float*  x,
                             device const uchar*  codes,
                             device float*        dst,
                             device const float*  res,
                             constant PT& p,
                             float wgt, bool zeroacc,
-                            uint gid, uint lane) {
-    uint first_row = (gid / 32u) * 2u;
+                            uint gid, uint lane,
+                            ushort sgitg, threadgroup float* red) {
+    uint first_row = (gid / (32u * NSG)) * 2u;
     if (first_row >= p.out_f) return;
     uint nb = p.in_f >> 8;
     ulong row_b = (ulong)nb * 210ul;
@@ -646,7 +706,7 @@ inline void linear_q6k_body(device const float*  x,
     float sumf[2] = {0.0f, 0.0f};
     float yl[16];
 
-    for (uint i = ix; i < nb; i += 2u) {
+    for (uint i = sgitg * 2u + ix; i < nb; i += NSG * 2u) {
         device const uchar* blk = xr + (ulong)i * 210ul;
         device const uchar* q1 = blk + ql_off;
         device const uchar* q2 = q1 + 32u;
@@ -678,14 +738,7 @@ inline void linear_q6k_body(device const float*  x,
             dh += row_b / 2u;
         }
     }
-    for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
-        float s = simd_sum(sumf[row]);
-        if (lane == 0u) {
-            if (EPI == 2)      dst[first_row + row] = (zeroacc ? 0.0f : dst[first_row + row]) + wgt * s;
-            else if (EPI == 1) dst[first_row + row] = s + res[first_row + row];
-            else               dst[first_row + row] = s;
-        }
-    }
+    GEMV_EPILOGUE(2u)
 }
 
 kernel void linear_q6k(device const float*  x     [[buffer(0)]],
@@ -696,7 +749,8 @@ kernel void linear_q6k(device const float*  x     [[buffer(0)]],
                        constant QLinParams& p     [[buffer(5)]],
                        uint gid  [[thread_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]]) {
-    linear_q6k_body<0>(x, codes, dst, x, p, 0.0f, false, gid, lane);
+    threadgroup float red[2];
+    linear_q6k_body<0, 1>(x, codes, dst, x, p, 0.0f, false, gid, lane, 0, red);
 }
 kernel void linear_q6k_add(device const float*  x     [[buffer(0)]],
                            device const uchar*  codes [[buffer(1)]],
@@ -707,7 +761,35 @@ kernel void linear_q6k_add(device const float*  x     [[buffer(0)]],
                            constant QLinParams& p     [[buffer(6)]],
                            uint gid  [[thread_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]]) {
-    linear_q6k_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
+    threadgroup float red[2];
+    linear_q6k_body<1, 1>(x, codes, dst, res, p, 0.0f, false, gid, lane, 0, red);
+}
+// k-split variant: 4 simdgroups share the row group, each covering a strided quarter of the
+// k-dim blocks — 4x the threadgroups on small/mid GEMVs and a quarter of the serial chain.
+kernel void linear_q6k_ks(device const float*  x     [[buffer(0)]],
+                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar*  scm   [[buffer(2)]],
+                       device const uchar*  dd    [[buffer(3)]],
+                       device float*        dst   [[buffer(4)]],
+                       constant QLinParams& p     [[buffer(5)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint sgitg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4 * 2];
+    linear_q6k_body<0, 4>(x, codes, dst, x, p, 0.0f, false, gid, lane, sgitg, red);
+}
+kernel void linear_q6k_ks_add(device const float*  x     [[buffer(0)]],
+                           device const uchar*  codes [[buffer(1)]],
+                           device const uchar*  scm   [[buffer(2)]],
+                           device const uchar*  dd    [[buffer(3)]],
+                           device float*        dst   [[buffer(4)]],
+                           device const float*  res   [[buffer(5)]],
+                           constant QLinParams& p     [[buffer(6)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint sgitg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4 * 2];
+    linear_q6k_body<1, 4>(x, codes, dst, res, p, 0.0f, false, gid, lane, sgitg, red);
 }
 
 // Decode GEMV for NATIVE Q8_0 (34 B / 32-elem blocks), mul_mv shape (ported from llama.cpp's
@@ -718,15 +800,16 @@ kernel void linear_q6k_add(device const float*  x     [[buffer(0)]],
 // quik8 form paid ~10.2 bpw for the same values, and decode GEMV is bound on exactly this stream.
 // Same EPI epilogue contract as `linear_q4k_body`. Tail rows clamp their pointer into the weight
 // (their sums are discarded at the write).
-template<int EPI, typename PT>
+template<int EPI, uint NSG, typename PT>
 inline void linear_q8_0_body(device const float*  x,
                              device const uchar*  codes,
                              device float*        dst,
                              device const float*  res,
                              constant PT& p,
                              float wgt, bool zeroacc,
-                             uint gid, uint lane) {
-    uint first_row = (gid / 32u) * 4u;
+                             uint gid, uint lane,
+                             ushort sgitg, threadgroup float* red) {
+    uint first_row = (gid / (32u * NSG)) * 4u;
     if (first_row >= p.out_f) return;
     uint nb = p.in_f >> 5;                 // 32-element blocks per row
     ulong row_b = (ulong)nb * 34ul;        // row stride in bytes
@@ -737,9 +820,9 @@ inline void linear_q8_0_body(device const float*  x,
 
     float yl[8];
     float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    device const float* yb = x + ix * 32u + il;
+    device const float* yb = x + (sgitg * 8u + ix) * 32u + il;
 
-    for (uint ib = ix; ib < nb; ib += 8u) {
+    for (uint ib = sgitg * 8u + ix; ib < nb; ib += NSG * 8u) {
         for (uint i = 0; i < 8u; i++) yl[i] = yb[i];
         for (uint row = 0; row < 4u; row++) {
             device const uchar* blk =
@@ -749,39 +832,60 @@ inline void linear_q8_0_body(device const float*  x,
             for (uint i = 0; i < 8u; i++) sumq += (float)qs[i] * yl[i];
             sumf[row] += sumq * (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));
         }
-        yb += 8u * 32u;
+        yb += NSG * 8u * 32u;
     }
-    for (uint row = 0; row < nrows; row++) {
-        float s = simd_sum(sumf[row]);
-        if (lane == 0u) {
-            uint o = first_row + row;
-            if (EPI == 2)      dst[o] = (zeroacc ? 0.0f : dst[o]) + wgt * s;
-            else if (EPI == 1) dst[o] = s + res[o];
-            else               dst[o] = s;
-        }
-    }
+    GEMV_EPILOGUE_N(4u, nrows)
 }
 
 kernel void linear_q8_0(device const float*  x     [[buffer(0)]],
-                        device const uchar*  codes [[buffer(1)]],
-                        device const uchar*  scm   [[buffer(2)]],
-                        device const uchar*  dd    [[buffer(3)]],
-                        device float*        dst   [[buffer(4)]],
-                        constant QLinParams& p     [[buffer(5)]],
-                        uint gid  [[thread_position_in_grid]],
-                        uint lane [[thread_index_in_simdgroup]]) {
-    linear_q8_0_body<0>(x, codes, dst, x, p, 0.0f, false, gid, lane);
+                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar*  scm   [[buffer(2)]],
+                       device const uchar*  dd    [[buffer(3)]],
+                       device float*        dst   [[buffer(4)]],
+                       constant QLinParams& p     [[buffer(5)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4];
+    linear_q8_0_body<0, 1>(x, codes, dst, x, p, 0.0f, false, gid, lane, 0, red);
 }
 kernel void linear_q8_0_add(device const float*  x     [[buffer(0)]],
-                            device const uchar*  codes [[buffer(1)]],
-                            device const uchar*  scm   [[buffer(2)]],
-                            device const uchar*  dd    [[buffer(3)]],
-                            device float*        dst   [[buffer(4)]],
-                            device const float*  res   [[buffer(5)]],
-                            constant QLinParams& p     [[buffer(6)]],
-                            uint gid  [[thread_position_in_grid]],
-                            uint lane [[thread_index_in_simdgroup]]) {
-    linear_q8_0_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
+                           device const uchar*  codes [[buffer(1)]],
+                           device const uchar*  scm   [[buffer(2)]],
+                           device const uchar*  dd    [[buffer(3)]],
+                           device float*        dst   [[buffer(4)]],
+                           device const float*  res   [[buffer(5)]],
+                           constant QLinParams& p     [[buffer(6)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4];
+    linear_q8_0_body<1, 1>(x, codes, dst, res, p, 0.0f, false, gid, lane, 0, red);
+}
+// k-split variant: 4 simdgroups share the row group, each covering a strided quarter of the
+// k-dim blocks — 4x the threadgroups on small/mid GEMVs and a quarter of the serial chain.
+kernel void linear_q8_0_ks(device const float*  x     [[buffer(0)]],
+                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar*  scm   [[buffer(2)]],
+                       device const uchar*  dd    [[buffer(3)]],
+                       device float*        dst   [[buffer(4)]],
+                       constant QLinParams& p     [[buffer(5)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint sgitg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4 * 4];
+    linear_q8_0_body<0, 4>(x, codes, dst, x, p, 0.0f, false, gid, lane, sgitg, red);
+}
+kernel void linear_q8_0_ks_add(device const float*  x     [[buffer(0)]],
+                           device const uchar*  codes [[buffer(1)]],
+                           device const uchar*  scm   [[buffer(2)]],
+                           device const uchar*  dd    [[buffer(3)]],
+                           device float*        dst   [[buffer(4)]],
+                           device const float*  res   [[buffer(5)]],
+                           constant QLinParams& p     [[buffer(6)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint sgitg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4 * 4];
+    linear_q8_0_body<1, 4>(x, codes, dst, res, p, 0.0f, false, gid, lane, sgitg, red);
 }
 
 // Decode GEMV for NATIVE Q5_0 (22 B / 32-elem blocks), same mul_mv shape as `linear_q8_0_body`:
@@ -789,15 +893,16 @@ kernel void linear_q8_0_add(device const float*  x     [[buffer(0)]],
 // activations loaded once and reused across rows. Each thread's 8 elements sit in one nibble
 // half (il in {0,8} low, {16,24} high), so the qh bit extraction is uniform per thread.
 // wk = d * (q - 16), the exact dequantize_q5_0 value, reassociated over the dot only.
-template<int EPI, typename PT>
+template<int EPI, uint NSG, typename PT>
 inline void linear_q5_0_body(device const float*  x,
                              device const uchar*  codes,
                              device float*        dst,
                              device const float*  res,
                              constant PT& p,
                              float wgt, bool zeroacc,
-                             uint gid, uint lane) {
-    uint first_row = (gid / 32u) * 4u;
+                             uint gid, uint lane,
+                             ushort sgitg, threadgroup float* red) {
+    uint first_row = (gid / (32u * NSG)) * 4u;
     if (first_row >= p.out_f) return;
     uint nb = p.in_f >> 5;                 // 32-element blocks per row
     ulong row_b = (ulong)nb * 22ul;        // row stride in bytes
@@ -810,9 +915,9 @@ inline void linear_q5_0_body(device const float*  x,
 
     float yl[8];
     float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    device const float* yb = x + ix * 32u + il;
+    device const float* yb = x + (sgitg * 8u + ix) * 32u + il;
 
-    for (uint ib = ix; ib < nb; ib += 8u) {
+    for (uint ib = sgitg * 8u + ix; ib < nb; ib += NSG * 8u) {
         float sumy = 0.0f;
         for (uint i = 0; i < 8u; i++) {
             yl[i] = yb[i];
@@ -852,39 +957,60 @@ inline void linear_q5_0_body(device const float*  x,
                 * (acc.x + acc.y * (1.0f / 256.0f) + acc.z * (1.0f / 65536.0f)
                     + acc.w * (1.0f / 16777216.0f) - 16.0f * sumy);
         }
-        yb += 8u * 32u;
+        yb += NSG * 8u * 32u;
     }
-    for (uint row = 0; row < nrows; row++) {
-        float s = simd_sum(sumf[row]);
-        if (lane == 0u) {
-            uint o = first_row + row;
-            if (EPI == 2)      dst[o] = (zeroacc ? 0.0f : dst[o]) + wgt * s;
-            else if (EPI == 1) dst[o] = s + res[o];
-            else               dst[o] = s;
-        }
-    }
+    GEMV_EPILOGUE_N(4u, nrows)
 }
 
 kernel void linear_q5_0(device const float*  x     [[buffer(0)]],
-                        device const uchar*  codes [[buffer(1)]],
-                        device const uchar*  scm   [[buffer(2)]],
-                        device const uchar*  dd    [[buffer(3)]],
-                        device float*        dst   [[buffer(4)]],
-                        constant QLinParams& p     [[buffer(5)]],
-                        uint gid  [[thread_position_in_grid]],
-                        uint lane [[thread_index_in_simdgroup]]) {
-    linear_q5_0_body<0>(x, codes, dst, x, p, 0.0f, false, gid, lane);
+                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar*  scm   [[buffer(2)]],
+                       device const uchar*  dd    [[buffer(3)]],
+                       device float*        dst   [[buffer(4)]],
+                       constant QLinParams& p     [[buffer(5)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4];
+    linear_q5_0_body<0, 1>(x, codes, dst, x, p, 0.0f, false, gid, lane, 0, red);
 }
 kernel void linear_q5_0_add(device const float*  x     [[buffer(0)]],
-                            device const uchar*  codes [[buffer(1)]],
-                            device const uchar*  scm   [[buffer(2)]],
-                            device const uchar*  dd    [[buffer(3)]],
-                            device float*        dst   [[buffer(4)]],
-                            device const float*  res   [[buffer(5)]],
-                            constant QLinParams& p     [[buffer(6)]],
-                            uint gid  [[thread_position_in_grid]],
-                            uint lane [[thread_index_in_simdgroup]]) {
-    linear_q5_0_body<1>(x, codes, dst, res, p, 0.0f, false, gid, lane);
+                           device const uchar*  codes [[buffer(1)]],
+                           device const uchar*  scm   [[buffer(2)]],
+                           device const uchar*  dd    [[buffer(3)]],
+                           device float*        dst   [[buffer(4)]],
+                           device const float*  res   [[buffer(5)]],
+                           constant QLinParams& p     [[buffer(6)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4];
+    linear_q5_0_body<1, 1>(x, codes, dst, res, p, 0.0f, false, gid, lane, 0, red);
+}
+// k-split variant: 4 simdgroups share the row group, each covering a strided quarter of the
+// k-dim blocks — 4x the threadgroups on small/mid GEMVs and a quarter of the serial chain.
+kernel void linear_q5_0_ks(device const float*  x     [[buffer(0)]],
+                       device const uchar*  codes [[buffer(1)]],
+                       device const uchar*  scm   [[buffer(2)]],
+                       device const uchar*  dd    [[buffer(3)]],
+                       device float*        dst   [[buffer(4)]],
+                       constant QLinParams& p     [[buffer(5)]],
+                       uint gid  [[thread_position_in_grid]],
+                       uint sgitg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4 * 4];
+    linear_q5_0_body<0, 4>(x, codes, dst, x, p, 0.0f, false, gid, lane, sgitg, red);
+}
+kernel void linear_q5_0_ks_add(device const float*  x     [[buffer(0)]],
+                           device const uchar*  codes [[buffer(1)]],
+                           device const uchar*  scm   [[buffer(2)]],
+                           device const uchar*  dd    [[buffer(3)]],
+                           device float*        dst   [[buffer(4)]],
+                           device const float*  res   [[buffer(5)]],
+                           constant QLinParams& p     [[buffer(6)]],
+                           uint gid  [[thread_position_in_grid]],
+                           uint sgitg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4 * 4];
+    linear_q5_0_body<1, 4>(x, codes, dst, res, p, 0.0f, false, gid, lane, sgitg, red);
 }
 
 // ---- MoE expert GEMVs: the shared GEMV bodies, batched over the SELECTED experts — one
@@ -919,7 +1045,8 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
                                         : x + (ulong)(p.row0 + row) * p.in_f;                     \
     device float* ds = dst + (ulong)(row * p.n_used + slot) * p.out_f;                            \
     uint g2 = (rem % per_out) * 32u + lane;  /* body sees a per-(row, expert) grid */             \
-    BODY<EPI>(xs, ec, ds, xs, p, w, true, g2, lane);                                              \
+    threadgroup float red[2];                                                                     \
+    BODY<EPI, 1>(xs, ec, ds, xs, p, w, true, g2, lane, 0, red);                                   \
 }
 MOE_WRAP(linear_q4k_moe,     linear_q4k_body, 0, 144ul)
 MOE_WRAP(linear_q4k_moe_acc, linear_q4k_body, 2, 144ul)

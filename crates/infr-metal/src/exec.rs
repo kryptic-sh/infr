@@ -1206,7 +1206,7 @@ impl MetalBackend {
                             128,
                         );
                     } else {
-                        let (kern, sgs): (&'static str, usize) = if m > 1 {
+                        let (kern, threads, tgw): (&'static str, usize, usize) = if m > 1 {
                             let rt = match qw.kern {
                                 "linear_quik4" => "linear_quik4_rt",
                                 "linear_quik6" => "linear_quik6_rt",
@@ -1216,16 +1216,44 @@ impl MetalBackend {
                                 "linear_q5_0" => "linear_q5_0_rt",
                                 _ => "linear_quik8_rt",
                             };
-                            (rt, m.div_ceil(8) * out_f)
+                            (rt, m.div_ceil(8) * out_f * 32, 32)
                         } else {
                             // The native mul_mv-shape GEMVs cover TWO output rows per simdgroup
-                            // (FOUR for Q8_0 — llama.cpp's N_R0_Q8_0).
-                            let sgs = match qw.kern {
-                                "linear_q4k" | "linear_q6k" => out_f.div_ceil(2),
-                                "linear_q8_0" | "linear_q5_0" => out_f.div_ceil(4),
-                                _ => out_f,
+                            // (FOUR for Q8_0/Q5_0). Small/mid row counts underfill the GPU with
+                            // one simdgroup per row group AND serialize the whole k-dim, so they
+                            // take the k-SPLIT variant: 4 cooperating simdgroups per row group
+                            // (needs the full 128-thread threadgroup — cap-gated with a fall
+                            // back to the single-simdgroup form). Big row counts (the LM head)
+                            // already saturate and keep NSG=1.
+                            let rpg = match qw.kern {
+                                "linear_q4k" | "linear_q6k" => 2usize,
+                                "linear_q8_0" | "linear_q5_0" => 4,
+                                _ => 1,
                             };
-                            (qw.kern, sgs)
+                            let groups = out_f.div_ceil(rpg);
+                            // The k-dim must be deep enough that each of the 4 simdgroups gets
+                            // at least two of the body's blocks-in-flight passes — a shallow k
+                            // (0.6B's in_f=1024 is FOUR Q4_K superblocks) leaves simdgroups
+                            // idle and pays the reduce for nothing (measured -8% there).
+                            let ks_kern = match qw.kern {
+                                "linear_q4k" if in_f >= 8192 => Some("linear_q4k_ks"),
+                                "linear_q6k" if in_f >= 4096 => Some("linear_q6k_ks"),
+                                "linear_q8_0" if in_f >= 2048 => Some("linear_q8_0_ks"),
+                                "linear_q5_0" if in_f >= 2048 => Some("linear_q5_0_ks"),
+                                _ => None,
+                            };
+                            let ks = groups <= 4096
+                                && ks_kern.is_some_and(|kn| {
+                                    self.pipelines
+                                        .get(kn)
+                                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                                        .unwrap_or(false)
+                                });
+                            if ks {
+                                (ks_kern.unwrap(), groups * 128, 128)
+                            } else {
+                                (qw.kern, groups * 32, 32)
+                            }
                         };
                         // Residual peephole: this Linear absorbed the following Add — take the
                         // fused-residual variant and write the Add's dst directly.
@@ -1234,6 +1262,10 @@ impl MetalBackend {
                                 "linear_q4k" => "linear_q4k_add",
                                 "linear_q8_0" => "linear_q8_0_add",
                                 "linear_q5_0" => "linear_q5_0_add",
+                                "linear_q4k_ks" => "linear_q4k_ks_add",
+                                "linear_q6k_ks" => "linear_q6k_ks_add",
+                                "linear_q8_0_ks" => "linear_q8_0_ks_add",
+                                "linear_q5_0_ks" => "linear_q5_0_ks_add",
                                 _ => "linear_q6k_add",
                             };
                             let bres = self.ensure_device(r, res);
@@ -1252,8 +1284,8 @@ impl MetalBackend {
                                 ],
                                 1 << 4,
                                 &p,
-                                sgs * 32,
-                                32,
+                                threads,
+                                tgw,
                             );
                             r.loc[fdst.0 as usize] = Loc::Device;
                             return Ok(());
@@ -1271,8 +1303,8 @@ impl MetalBackend {
                             ],
                             1 << 4,
                             &p,
-                            sgs * 32,
-                            32,
+                            threads,
+                            tgw,
                         );
                     }
                 } else {

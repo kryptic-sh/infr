@@ -57,6 +57,13 @@ struct Resident {
     /// tensor, final dst); the absorbed Adds are in `skip`.
     fused: std::collections::HashMap<usize, (TensorId, TensorId)>,
     skip: std::collections::HashSet<usize>,
+    /// GPU-counter sampling state (`INFR_METAL_PROFILE=3`): the timestamp sample buffer, the
+    /// next free sample slot, the (op name, start-sample) log for this batch, and the op the
+    /// walk is currently encoding (sub-dispatches attribute to their parent op).
+    csb: Option<metal::CounterSampleBuffer>,
+    csb_idx: u64,
+    op_samples: Vec<(&'static str, u64)>,
+    cur_op: &'static str,
     /// Host-read override of the graph's baked position (see `run_graph`): the seam's replay
     /// loop re-executes one compiled decode graph (baked pos=0) and only rewrites the bound
     /// positions buffer, so on any decode-shaped graph the position-consuming ops (Attention,
@@ -449,10 +456,41 @@ impl MetalBackend {
             return;
         }
         if r.enc.is_none() {
-            let cb = self.queue.new_command_buffer().to_owned();
-            let enc = cb.new_compute_command_encoder().to_owned();
-            r.cb = Some(cb);
-            r.enc = Some(enc);
+            if r.cb.is_none() {
+                r.cb = Some(self.queue.new_command_buffer().to_owned());
+            }
+            let cb = r.cb.as_ref().unwrap();
+            // Counter profiling: every encoder carries a stage-boundary timestamp pair, so each
+            // op's GPU time is measured IN CONTEXT (the batch still commits once). The walk ends
+            // the encoder between ops; everything an op encodes lands in its encoder(s).
+            r.enc = Some(if let Some(set) = self.counter_set.as_ref() {
+                const CSB_CAP: u64 = 4096;
+                if r.csb.is_none() {
+                    let d = metal::CounterSampleBufferDescriptor::new();
+                    d.set_counter_set(set);
+                    d.set_sample_count(CSB_CAP);
+                    d.set_storage_mode(metal::MTLStorageMode::Shared);
+                    r.csb = self
+                        .device
+                        .new_counter_sample_buffer_with_descriptor(&d)
+                        .ok();
+                }
+                match r.csb.as_ref() {
+                    Some(csb) if r.csb_idx + 2 <= CSB_CAP => {
+                        let desc = metal::ComputePassDescriptor::new();
+                        let att = desc.sample_buffer_attachments().object_at(0).unwrap();
+                        att.set_sample_buffer(csb);
+                        att.set_start_of_encoder_sample_index(r.csb_idx);
+                        att.set_end_of_encoder_sample_index(r.csb_idx + 1);
+                        r.op_samples.push((r.cur_op, r.csb_idx));
+                        r.csb_idx += 2;
+                        cb.compute_command_encoder_with_descriptor(desc).to_owned()
+                    }
+                    _ => cb.new_compute_command_encoder().to_owned(),
+                }
+            } else {
+                cb.new_compute_command_encoder().to_owned()
+            });
         }
         let enc = r.enc.as_ref().unwrap();
         enc.set_compute_pipeline_state(pso);
@@ -562,12 +600,52 @@ impl MetalBackend {
     fn flush(&self, r: &mut Resident) {
         if let Some(enc) = r.enc.take() {
             enc.end_encoding();
-            let cb = r.cb.take().expect("metal: enc without command buffer");
+        }
+        if let Some(cb) = r.cb.take() {
             let t0 = self.profiling.then(std::time::Instant::now);
             cb.commit();
             cb.wait_until_completed();
             if let Some(t0) = t0 {
                 self.prof.lock().unwrap().add_dispatch(t0.elapsed());
+            }
+            // Counter mode: the batch is done — resolve this batch's stage-boundary timestamp
+            // pairs and attribute per op. The samples are GPU-clock ticks, not wall time:
+            // calibrate ticks→ns by bracketing the wait with two CPU/GPU timestamp
+            // correlations (sampleTimestamps) and using their ratio.
+            if r.csb_idx > 0 {
+                if let Some(csb) = r.csb.as_ref() {
+                    let (mut cpu1, mut gpu1) = (0u64, 0u64);
+                    self.device.sample_timestamps(&mut cpu1, &mut gpu1);
+                    let ns_per_tick = {
+                        // one correlation before this resolve and the one cached from init
+                        let (c0, g0) = self.ts_base;
+                        if gpu1 > g0 && cpu1 > c0 {
+                            (cpu1 - c0) as f64 / (gpu1 - g0) as f64
+                        } else {
+                            1.0
+                        }
+                    };
+                    let ts = Self::resolve_counters(csb, r.csb_idx);
+                    if std::env::var("INFR_METAL_PROF_DEBUG").is_ok() {
+                        eprintln!(
+                            "ns_per_tick={ns_per_tick:.4} first samples: {:?}",
+                            &ts[..8.min(ts.len())]
+                        );
+                    }
+                    let mut pr = self.prof.lock().unwrap();
+                    for &(name, i) in &r.op_samples {
+                        if i as usize + 1 >= ts.len() {
+                            break;
+                        }
+                        let (a, b) = (ts[i as usize], ts[i as usize + 1]);
+                        if b > a && a != u64::MAX && b != u64::MAX {
+                            let ns = ((b - a) as f64 * ns_per_tick) as u64;
+                            pr.add_op_gpu(name, std::time::Duration::from_nanos(ns));
+                        }
+                    }
+                }
+                r.csb_idx = 0;
+                r.op_samples.clear();
             }
         }
     }
@@ -645,7 +723,10 @@ impl MetalBackend {
                     .unwrap_or(false)
             })
         };
-        if replay_shape(g, bindings) && dyn_cap_ok() {
+        // Counter profiling is per-op analysis: the tape would replay decode tokens without
+        // walking ops (only the RECORDED token would ever be attributed — every per-token op
+        // reading would silently be a sample of one), so it is disabled under PROFILE=3.
+        if self.counter_set.is_none() && replay_shape(g, bindings) && dyn_cap_ok() {
             let fp = replay_fp(g, bindings);
             if let Some(tape) = self.replay.lock().unwrap().as_ref() {
                 if tape.fp == fp {
@@ -686,6 +767,10 @@ impl MetalBackend {
             posbuf: None,
             fused: std::collections::HashMap::new(),
             skip: std::collections::HashSet::new(),
+            csb: None,
+            csb_idx: 0,
+            op_samples: Vec::new(),
+            cur_op: "",
             dynpos: None,
         };
         // Decode-shaped graph (a rows==1 Attention) with a bound positions buffer: read the
@@ -778,7 +863,15 @@ impl MetalBackend {
                     continue;
                 }
                 let t0 = std::time::Instant::now();
+                r.cur_op = op_name(op);
                 self.run_op(op, idx, g, bindings, &mut r)?;
+                // Counter mode: seal this op's encoder (the command buffer stays open) so the
+                // next op's dispatches land in their own sampled encoder.
+                if self.counter_set.is_some() {
+                    if let Some(e) = r.enc.take() {
+                        e.end_encoding();
+                    }
+                }
                 let enc = t0.elapsed();
                 // Per-op mode: flush now so this op's GPU wall is isolable (breaks batching).
                 let gpu = if self.prof_ops {
@@ -957,6 +1050,30 @@ impl MetalBackend {
             std::ptr::copy_nonoverlapping(buf.raw.contents() as *const u8, v.as_mut_ptr(), v.len());
         }
         v
+    }
+
+    /// Resolve a counter-sample range to raw u64 timestamps. metal-rs 0.33's
+    /// `resolve_counter_range` computes its copy size from an EMPTY vec (0 bytes) and then
+    /// `set_len`s over uninitialized memory — this reads the returned NSData directly.
+    #[allow(unexpected_cfgs)]
+    fn resolve_counters(csb: &metal::CounterSampleBufferRef, len: u64) -> Vec<u64> {
+        use objc::{msg_send, sel, sel_impl};
+        unsafe {
+            let range = metal::NSRange {
+                location: 0,
+                length: len,
+            };
+            let data: *mut objc::runtime::Object = msg_send![csb, resolveCounterRange: range];
+            if data.is_null() {
+                return Vec::new();
+            }
+            let bytes: *const u8 = msg_send![data, bytes];
+            let nbytes: usize = msg_send![data, length];
+            let n = (nbytes / 8).min(len as usize);
+            let mut out = vec![0u64; n];
+            std::ptr::copy_nonoverlapping(bytes, out.as_mut_ptr() as *mut u8, n * 8);
+            out
+        }
     }
 
     /// Read `len` bytes at `off` from a buffer's (unified-memory) contents.

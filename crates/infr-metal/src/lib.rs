@@ -16,7 +16,10 @@
 //! `Op::Linear` weights are kept in the compact factored form (`dequant_factored`: bit-packed
 //! 4/6/8-bit codes + one i16 `(sc, m)` per 16 elems + one f16 `(d, dmin)` per quant block) and
 //! decoded inline by the `linear_quik*` kernels, so the kernels stay format-agnostic and never blow
-//! a quant weight up to f32. `INFR_METAL_PROFILE=1` prints a per-op / GPU-wall breakdown on drop.
+//! a quant weight up to f32. `INFR_METAL_PROFILE=1` prints a per-op / GPU-wall breakdown on drop;
+//! `=2` isolates per-op GPU wall by flushing after each op (distorts totals); `=3` samples
+//! stage-boundary GPU timestamps per op inside ONE command buffer — true in-context per-op GPU
+//! time (the decode tape is disabled so every token's ops are walked and attributed).
 //!
 //! Not bit-for-bit identical to the CPU everywhere: quantized `Op::Linear` reconstructs the exact
 //! `dequant` value but dots in f32, whereas the CPU path quantizes the *activation* to Q8 and uses
@@ -84,6 +87,15 @@ pub struct MetalBackend {
     /// per op — costs the batching, so it's an analysis mode, not the fast path.
     pub(crate) profiling: bool,
     pub(crate) prof_ops: bool,
+    /// GPU-counter profiling (`INFR_METAL_PROFILE=3`): per-op GPU time from stage-boundary
+    /// timestamp samples — one encoder per op inside ONE command buffer, so the numbers are
+    /// in-context (no per-op flush distortion). `None` when the device lacks stage-boundary
+    /// sampling or the timestamp counter set.
+    pub(crate) counter_set: Option<metal::CounterSet>,
+    /// One (cpu_ns, gpu_ticks) correlation taken at init — with a second one at resolve time,
+    /// the ratio converts GPU-clock ticks to nanoseconds (the domains drift only with clock
+    /// rate changes; a long baseline keeps the estimate stable).
+    pub(crate) ts_base: (u64, u64),
     pub(crate) prof: std::sync::Mutex<profile::Profile>,
     /// The recorded decode tape for the seam's record-once replay (`Capabilities::decode_replay`);
     /// single slot, same single-generation lifetime as the weight caches (one backend per
@@ -104,6 +116,32 @@ unsafe impl Sync for MetalBackend {}
 impl MetalBackend {
     pub fn new() -> Result<Self> {
         let device = Device::system_default().ok_or_else(|| be("no Metal device found"))?;
+        let counter_set = (std::env::var("INFR_METAL_PROFILE").as_deref() == Ok("3"))
+            .then(|| {
+                if !device
+                    .supports_counter_sampling(metal::MTLCounterSamplingPoint::AtStageBoundary)
+                {
+                    eprintln!(
+                        "[infr-metal] PROFILE=3: no stage-boundary counter sampling on this \
+                         device — falling back to encode-only profiling"
+                    );
+                    return None;
+                }
+                let set = device
+                    .counter_sets()
+                    .into_iter()
+                    .find(|cs| cs.name() == "timestamp");
+                if set.is_none() {
+                    eprintln!("[infr-metal] PROFILE=3: no timestamp counter set — falling back");
+                }
+                set
+            })
+            .flatten();
+        let ts_base = {
+            let (mut c, mut g) = (0u64, 0u64);
+            device.sample_timestamps(&mut c, &mut g);
+            (c, g)
+        };
         let queue = device.new_command_queue();
         let pipelines = shaders::Pipelines::build(&device)?;
         Ok(Self {
@@ -115,6 +153,8 @@ impl MetalBackend {
             weight_pb: std::sync::Arc::new(std::sync::Mutex::new(None)),
             profiling: std::env::var("INFR_METAL_PROFILE").is_ok(),
             prof_ops: std::env::var("INFR_METAL_PROFILE").as_deref() == Ok("2"),
+            counter_set,
+            ts_base,
             prof: std::sync::Mutex::new(profile::Profile::default()),
             replay: std::sync::Mutex::new(None),
             scratch: std::sync::Mutex::new(std::collections::HashMap::new()),

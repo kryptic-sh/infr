@@ -18,5 +18,10 @@ bytemuck.workspace = true
 metal.workspace = true
 objc.workspace = true
 
+# objc's `sel_impl!` (inside `msg_send!`) expands a `cfg(feature = "cargo-clippy")` check the
+# crate doesn't declare; register it so `-D warnings` builds don't reject `unexpected_cfgs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 [dev-dependencies]
 infr-cpu.workspace = true

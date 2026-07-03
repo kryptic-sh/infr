@@ -461,6 +461,10 @@ impl MetalBackend {
     /// Re-encode a recorded tape: one command buffer, the flat dispatch list, commit + wait.
     /// This IS the per-token decode cost on the replay path — no graph walk, no host mirror,
     /// no allocation.
+    // objc's `sel_impl!` (inside `msg_send!`) emits a `cfg(feature = "cargo-clippy")` check that
+    // trips `unexpected_cfgs` under `-D warnings` — allow it here, scoped to the one fn that
+    // needs the raw selector (metal-rs has no wrapper for memoryBarrierWithScope:).
+    #[allow(unexpected_cfgs)]
     fn replay_tape(&self, tape: &Tape) {
         objc::rc::autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();

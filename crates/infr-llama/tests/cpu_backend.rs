@@ -45,9 +45,9 @@ macro_rules! need_gpu {
 }
 
 /// Serialize the model-gated generation tests. They mutate PROCESS-GLOBAL env that generation reads
-/// (`INFR_TEMP`, and `INFR_THINK` in the KV-reuse test — read at render time in infr-chat), and cargo
+/// (`INFR_TEMP`, and `INFR_NO_THINK` — read at render time in infr-chat), and cargo
 /// runs tests in parallel; without this, one test's env leaks into another's generation (e.g.
-/// `INFR_THINK=0` flipping a Qwen3 golden's thinking off → hash mismatch). Poison-tolerant so a
+/// `INFR_NO_THINK=1` flipping a Qwen3 golden's thinking off → hash mismatch). Poison-tolerant so a
 /// failing test doesn't cascade-poison the rest.
 fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -434,11 +434,15 @@ fn gemma4_e2b() -> Option<PathBuf> {
 // Captured + verified coherent (gemma4 E2B: per-layer input embeds + KV sharing): "The capital of
 // France is **Paris**.", a brave-knight story ("Sir Kaelan … kingdom of Eldoria …").
 const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xfd644a0cebde4e73),
+    (
+        "The capital of France is",
+        32,
+        0x689e792098786962, // channel-thought reasoning ("…Analyze the Request… factual question")
+    ),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0xd1281a5e24ad58b9,
+        0x8909237b9419d782, // channel-thought reasoning (story planning process)
     ),
 ];
 
@@ -596,13 +600,17 @@ fn qwen35_08b() -> Option<PathBuf> {
 
 // Captured + verified coherent (qwen35 / Qwen3-Next: gated-DeltaNet + gated full-attention): "The
 // capital of France is **Paris**. It is the largest city …", a knight story ("Elara … Aethelgard").
-// Renders at the template's default (non-thinking for Qwen3-Next; no INFR_THINK override).
+// Renders with thinking ON (the infr-wide default; INFR_NO_THINK turns it off).
 const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0x41a2c8d41bca554d),
+    (
+        "The capital of France is",
+        32,
+        0x542a9dd055c58884, // prefilled-think reasoning ("Thinking Process… capital of France")
+    ),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x2ecf16cdcf25fce6,
+        0x0a0d2a6554ca9f21, // prefilled-think reasoning (story planning process)
     ),
 ];
 

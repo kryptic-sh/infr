@@ -9,8 +9,8 @@
 // `infr-chat` crate so backends and the server share ONE implementation. Re-exported here for the
 // existing `infr_engine::{ChatMessage, …}` call sites.
 pub use infr_chat::{
-    normalize_messages, parse_hermes_tool_calls, parse_tool_calls, split_channels, split_think,
-    ChatMessage, ToolCall,
+    normalize_messages, parse_hermes_tool_calls, parse_tool_calls, split_channels, split_reasoning,
+    split_think, ChatMessage, ToolCall,
 };
 
 use std::path::Path;

@@ -68,7 +68,7 @@ pub trait ChatModel {
 /// grammar `infr run`'s display and `infr serve`'s deltas use — so what history keeps always
 /// matches what the surfaces call "content". Unterminated reasoning (truncated turn) → empty.
 fn strip_think(reply: &str) -> String {
-    infr_chat::split_think(reply).1
+    infr_chat::split_reasoning(reply).1
 }
 
 /// The SINGLE arch-agnostic chat: owns the conversation history + `<think>`-stripping, drives any

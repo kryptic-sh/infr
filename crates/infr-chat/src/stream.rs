@@ -68,6 +68,36 @@ impl ChatStream {
         const TC: &str = "</think>";
         const TL: &str = "<tool_call>";
         let raw = &self.raw;
+        // Channel-format head (E2B/gpt-oss: `<|channel>thought…<channel|>answer`): reasoning runs
+        // from after the thought marker to the final-answer marker, content after it. While the
+        // head could still be a forming marker, hold everything back.
+        const CT: [&str; 2] = ["<|channel|>thought", "<|channel>thought"];
+        const FINAL: &str = "<channel|>";
+        if let Some(hm) = CT.iter().find_map(|m| raw.starts_with(m).then_some(m.len())) {
+            let (r_end, hold, c_start) = match raw.find(FINAL) {
+                Some(f) => (f, false, Some(f + FINAL.len())),
+                None => (raw.len(), !final_flush, None),
+            };
+            emit_region(raw, hm, r_end, hold, &mut self.sent_r, true, on_delta);
+            if let Some(cs) = c_start {
+                let tool_open = if self.allow_tools { raw.find(TL) } else { None };
+                let (c_end, hold) = match tool_open {
+                    Some(t) if t >= cs => (t, false),
+                    _ => (raw.len(), !final_flush),
+                };
+                emit_region(raw, cs, c_end, hold, &mut self.sent_c, false, on_delta);
+            }
+            return;
+        }
+        if !final_flush
+            && CT.iter().any(|m| {
+                m.as_bytes()
+                    .starts_with(&raw.as_bytes()[..raw.len().min(m.len())])
+            })
+            && raw.len() < CT[0].len()
+        {
+            return; // head could still become a channel marker — hold
+        }
         let think_open = raw.find(TO);
         let think_close = raw.find(TC);
         let tool_open = if self.allow_tools { raw.find(TL) } else { None };
@@ -161,6 +191,34 @@ mod chat_stream_tests {
             }
         }
         (r, c, t)
+    }
+
+    #[test]
+    fn streams_channel_thought_then_final() {
+        // E2B/gpt-oss channel format: reasoning after the thought marker, content after the
+        // final-answer marker — streamed as Reasoning/Content like the <think> form.
+        let (r, c, t) = run(
+            &[
+                "<|channel>th",
+                "ought\nreaso",
+                "ning<chan",
+                "nel|>the answer",
+            ],
+            false,
+        );
+        assert_eq!(r.trim(), "reasoning");
+        assert_eq!(c.trim(), "the answer");
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn prefilled_think_via_injected_opener() {
+        // Template-prefilled thinking (Qwen3.5): the caller injects "<think>" before the model's
+        // mid-reasoning output; the splitter then treats the head as Reasoning.
+        let (r, c, t) = run(&["<think>", "reasoning here", "</think>", "answer"], false);
+        assert_eq!(r.trim(), "reasoning here");
+        assert_eq!(c.trim(), "answer");
+        assert!(t.is_empty());
     }
 
     #[test]

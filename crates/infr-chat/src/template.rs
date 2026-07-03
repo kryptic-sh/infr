@@ -131,13 +131,14 @@ fn render_core(
     ctx.insert("add_generation_prompt".into(), add_generation_prompt.into());
     ctx.insert("bos_token".into(), bos.into());
     ctx.insert("eos_token".into(), eos_s.into());
-    // `enable_thinking` is only set when the user opts in via INFR_THINK — otherwise the key is
-    // ABSENT so each template applies its OWN default (e.g. Qwen3 thinks; Qwen3-Next prefills an
-    // empty `<think></think>` to stay non-thinking, which is what keeps its greedy decode from
-    // degenerating). INFR_THINK=1 forces thinking on, INFR_THINK=0 forces it off.
-    if let Ok(v) = std::env::var("INFR_THINK") {
-        ctx.insert("enable_thinking".into(), (v != "0").into());
-    }
+    // Thinking is ON by default for every model whose template supports it — the key is simply
+    // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5/Qwen3-Next)
+    // then behave the same under `infr run`/`serve` regardless of what their template's own
+    // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
+    // INFR_NO_THINK=1 turns thinking off (INFR_NO_THINK=0 is a no-op, matching the other INFR_NO_*
+    // toggles).
+    let think = !std::env::var("INFR_NO_THINK").is_ok_and(|v| v != "0");
+    ctx.insert("enable_thinking".into(), think.into());
     match tmpl.render(serde_json::Value::Object(ctx)) {
         Ok(s) => {
             if std::env::var("INFR_DEBUG_CHAT").is_ok() {

@@ -2288,8 +2288,19 @@ mod tests {
         })
     }
 
+    /// Serialize the qwen35 tests: they run in one process where `Q35_CPU` (the CPU-oracle
+    /// switch) is process-global env — a concurrent test flipping it mid-generate silently moves
+    /// another test's "GPU" run onto the CPU path (the gpu_golden flake). Poison-tolerant.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn loads_and_dims() {
+        let _s = serial();
         let Some(path) = model_path() else {
             eprintln!("skip: Qwen3.5-0.8B not present");
             return;
@@ -2316,6 +2327,7 @@ mod tests {
 
     #[test]
     fn greedy_generate() {
+        let _s = serial();
         let Some(path) = model_path() else {
             eprintln!("skip: Qwen3.5-0.8B not present");
             return;
@@ -2336,6 +2348,7 @@ mod tests {
     /// both are f32, so the match is exact.
     #[test]
     fn seam_cpu_matches_oracle() {
+        let _s = serial();
         let Some(path) = model_path() else {
             eprintln!("skip: Qwen3.5-0.8B not present");
             return;
@@ -2344,7 +2357,11 @@ mod tests {
         let prompt = "The capital of France is";
         let n = 16;
         std::env::set_var("Q35_CPU", "1");
-        let oracle = generate(&g, prompt, n).unwrap();
+        let oracle = generate(&g, prompt, n);
+        // Unset BEFORE unwrapping: lib tests share one process, and a leaked Q35_CPU silently
+        // flips a later test's "GPU" generate onto the CPU oracle path (the gpu_golden flake).
+        std::env::remove_var("Q35_CPU");
+        let oracle = oracle.unwrap();
         let mut seam = String::new();
         generate_cpu(&path, prompt, n, |p| seam.push_str(p)).unwrap();
         println!("ORACLE: {oracle:?}\nSEAM:   {seam:?}");
@@ -2370,6 +2387,7 @@ mod tests {
     /// refresh with `QWEN35_BLESS=1` (prints the hash + text).
     #[test]
     fn gpu_golden_qwen35() {
+        let _s = serial();
         let Some(path) = model_path() else {
             eprintln!("skip: Qwen3.5-0.8B not present");
             return;
@@ -2387,8 +2405,10 @@ mod tests {
         if std::env::var("QWEN35_BLESS").is_ok() {
             println!("gpu golden: 0x{h:016x}  // {out:?}");
         } else {
+            // Blessed with thinking ON (the infr-wide default): the reply opens with the
+            // prefilled-think reasoning ("Thinking Process: … What is bash …").
             assert_eq!(
-                h, 0x8628d34de5890fb9,
+                h, 0x0cba2491a57b8285,
                 "qwen35 GPU golden changed\n  out: {out:?}"
             );
         }
@@ -2400,6 +2420,7 @@ mod tests {
     #[test]
     #[ignore = "manual bisection (set INFR_Q35_DUMP + INFR_Q35_MAXLAYERS)"]
     fn q35_bisect() {
+        let _s = serial();
         let Some(path) = model_path() else {
             return;
         };
@@ -2419,6 +2440,7 @@ mod tests {
     #[test]
     #[ignore = "requires the Qwen3.5-0.8B GGUF + a Vulkan GPU"]
     fn gpu_seam_session_reuse() {
+        let _s = serial();
         let Some(path) = model_path() else {
             eprintln!("skip: Qwen3.5-0.8B not present");
             return;

@@ -284,6 +284,17 @@ fn parse_hermes_body(body: &str) -> Option<ToolCall> {
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
+/// Format-aware reasoning split: channel-marker output (E2B/gpt-oss `<|channel>thought…<channel|>`)
+/// goes through [`split_channels`], everything else through [`split_think`]. THE one entry point
+/// for "what part of this reply was reasoning" — history stripping and batch consumers use this.
+pub fn split_reasoning(text: &str) -> (String, String) {
+    if MARKERS.iter().any(|m| text.contains(m)) {
+        split_channels(text)
+    } else {
+        split_think(text)
+    }
+}
+
 /// Split output into `(reasoning, content)` on the `<think>…</think>` markers Qwen3/DeepSeek-R1
 /// emit — stripping EVERY reasoning span, not just the first (a constrained/looped turn can emit
 /// several). Handles the prefilled-`<think>` case where the open marker was added by the template

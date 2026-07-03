@@ -13,7 +13,6 @@ use metal::{
     Buffer as MtlBuffer, CommandBuffer, ComputeCommandEncoder, ComputePipelineState,
     MTLResourceOptions, MTLSize,
 };
-use objc::{msg_send, sel, sel_impl};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -395,6 +394,7 @@ impl MetalBackend {
     /// `encode_tg` with an explicit WRITE mask (bit i = `bufs[i]` is written by the dispatch).
     /// The mask only matters on the decode replay tape, where it drives exact barrier placement
     /// under the concurrent encoder — un-annotated dispatches replay serialized.
+    #[allow(clippy::too_many_arguments)]
     fn encode_tg_w(
         &self,
         r: &mut Resident,
@@ -411,6 +411,7 @@ impl MetalBackend {
 
     /// As `encode_tg_w`, but each buffer binds at a byte offset — the fused-QKV Linear slices
     /// bind the shared concatenated weight at each projection's row offset (`Op::Linear.w_off`).
+    #[allow(clippy::too_many_arguments)]
     fn encode_tg_off(
         &self,
         r: &mut Resident,
@@ -461,10 +462,6 @@ impl MetalBackend {
     /// Re-encode a recorded tape: one command buffer, the flat dispatch list, commit + wait.
     /// This IS the per-token decode cost on the replay path — no graph walk, no host mirror,
     /// no allocation.
-    // objc's `sel_impl!` (inside `msg_send!`) emits a `cfg(feature = "cargo-clippy")` check that
-    // trips `unexpected_cfgs` under `-D warnings` — allow it here, scoped to the one fn that
-    // needs the raw selector (metal-rs has no wrapper for memoryBarrierWithScope:).
-    #[allow(unexpected_cfgs)]
     fn replay_tape(&self, tape: &Tape) {
         objc::rc::autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();
@@ -479,6 +476,9 @@ impl MetalBackend {
                 cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
             let mut written: Vec<*const c_void> = Vec::with_capacity(8);
             let mut read: Vec<*const c_void> = Vec::with_capacity(24);
+            // Every buffer touched since the last barrier (owned refs into the tape entries) —
+            // the resource list the barrier fences.
+            let mut touched: Vec<&MtlBuffer> = Vec::with_capacity(32);
             for e in &tape.entries {
                 let is_w = |i: usize| e.wmask & (1u32 << i.min(31)) != 0;
                 let hazard = e.bufs.iter().enumerate().any(|(i, b)| {
@@ -486,14 +486,16 @@ impl MetalBackend {
                     written.contains(&p) || (is_w(i) && read.contains(&p))
                 });
                 if hazard {
-                    // All-buffers scope barrier: prior dispatches' buffer accesses complete
-                    // before anything encoded after. (metal-rs has no wrapper for the scope
-                    // variant; MTLBarrierScopeBuffers = 1.)
-                    unsafe {
-                        let () = msg_send![enc, memoryBarrierWithScope: 1u64];
-                    }
+                    // Barrier over every buffer touched since the last one: prior dispatches'
+                    // accesses to those resources complete before anything encoded after.
+                    let refs: Vec<&metal::ResourceRef> = touched
+                        .iter()
+                        .map(|b| b.as_ref() as &metal::ResourceRef)
+                        .collect();
+                    enc.memory_barrier_with_resources(&refs);
                     written.clear();
                     read.clear();
+                    touched.clear();
                 }
                 for (i, b) in e.bufs.iter().enumerate() {
                     let p = b.as_ptr() as *const c_void;
@@ -501,6 +503,9 @@ impl MetalBackend {
                         written.push(p);
                     } else {
                         read.push(p);
+                    }
+                    if !touched.iter().any(|t| t.as_ptr() as *const c_void == p) {
+                        touched.push(b);
                     }
                 }
                 enc.set_compute_pipeline_state(&e.pso);

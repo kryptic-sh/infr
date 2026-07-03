@@ -213,6 +213,16 @@ pub(crate) fn generate_dense_gpu_session(
             .and_then(|l| l.parse::<usize>().ok())
             .is_some_and(|l| l < n_host_moe)
     };
+    // Weight-load progress bar: every BufferUsage::Weights/HostWeights allocation ticks it
+    // backend-side (the funnel lives in `alloc`, so no loader can forget a tensor) — this scope
+    // only has to exist while the upload runs. Open it for the FIRST call only (session init);
+    // warm sessions upload nothing. Sized by the GGUF's resident footprint (dense + experts).
+    let _weight_pb = if state.is_none() {
+        let fp = crate::weights::weight_footprint(g);
+        Some(vk.weight_progress(Some(fp.dense + fp.expert)))
+    } else {
+        None
+    };
     generate_dense_backend(
         vk,
         &|name, tb, dt, _n| {

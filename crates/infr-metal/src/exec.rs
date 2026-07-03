@@ -190,6 +190,32 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             | Op::GatedActFused { .. }
             | Op::Add { .. } => {}
             Op::QkNormRope { .. } | Op::Rope { .. } => has_rope = true,
+            // qwen35 (Qwen3-Next) decode ops: all pos-independent, on-device, recurrent state
+            // updated in the BOUND buffer — tape-safe when the arm's device gate holds (the
+            // host fallbacks can't tape, so the gates mirror the arms').
+            Op::QkNorm { .. } | Op::Scale { .. } | Op::Copy { .. } | Op::CopyStrided { .. } => {}
+            Op::Conv1dSilu { state, kernel, .. } => {
+                if *kernel > 8
+                    || std::env::var("INFR_METAL_NODELTA").is_ok()
+                    || bindings.get(*state).is_none()
+                {
+                    return false;
+                }
+            }
+            Op::DeltaNet {
+                state,
+                head_k,
+                head_v,
+                ..
+            } => {
+                if *head_k > 256
+                    || !(head_v.is_multiple_of(32) && *head_v <= 1024)
+                    || std::env::var("INFR_METAL_NODELTA").is_ok()
+                    || bindings.get(*state).is_none()
+                {
+                    return false;
+                }
+            }
             // MoE decode tapes only when the arm takes the fully-on-device path (the same gate
             // as the MoeFfn arm's `device_ok`): dtypes with expert kernels, in-bounds shapes,
             // escape hatch off. The host fallback computes on the CPU per token — a tape can't
@@ -1215,10 +1241,11 @@ impl MetalBackend {
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
                 // One simdgroup per (row, head) — see `qknorm_f32`.
-                self.encode_tg(
+                self.encode_tg_w(
                     r,
                     &pso,
                     &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                    1 << 2,
                     &p,
                     rows * nh * 32,
                     32,
@@ -1731,7 +1758,7 @@ impl MetalBackend {
                 let pso = self.pipelines.get("scale_f32")?;
                 let mut p = s.to_ne_bytes().to_vec();
                 p.extend_from_slice(&(n as u32).to_ne_bytes());
-                self.encode(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, n);
+                self.encode_w(r, &pso, &[bx.as_ref(), bd.as_ref()], 1 << 1, &p, n);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::Softcap { x, dst, cap, n } => {
@@ -2687,10 +2714,11 @@ impl MetalBackend {
                         let mut p = (rr as u32).to_ne_bytes().to_vec();
                         p.extend_from_slice(&(cc as u32).to_ne_bytes());
                         p.extend_from_slice(&(kk as u32).to_ne_bytes());
-                        self.encode(
+                        self.encode_w(
                             r,
                             &pso,
                             &[bx.as_ref(), bw.as_ref(), &sbuf.raw, bd.as_ref()],
+                            (1 << 2) | (1 << 3),
                             &p,
                             cc,
                         );
@@ -2787,7 +2815,7 @@ impl MetalBackend {
                             p.extend_from_slice(&(kd as u32).to_ne_bytes());
                             p.extend_from_slice(&(vd as u32).to_ne_bytes());
                             p.extend_from_slice(&eps.to_ne_bytes());
-                            self.encode_tg(
+                            self.encode_tg_w(
                                 r,
                                 &pso,
                                 &[
@@ -2801,6 +2829,7 @@ impl MetalBackend {
                                     &sbuf.raw,
                                     bd.as_ref(),
                                 ],
+                                (1 << 7) | (1 << 8),
                                 &p,
                                 nv * vd,
                                 vd,

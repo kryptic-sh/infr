@@ -446,6 +446,15 @@ impl SeamModel {
                 .map_err(|e| anyhow!("{e}"))?;
             Ok(buf)
         };
+        // F16 variant for the KV caches (2 bytes/elem; f16 zero is all-zero bits).
+        let zeroed16 = |be: &dyn Backend, n: usize| -> Result<Box<dyn Buffer>> {
+            let buf = be
+                .alloc(n * 2, BufferUsage::Activations)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(buf.as_ref(), bytemuck::cast_slice(&vec![0u16; n]))
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(buf)
+        };
         let want_ctx = plen_hint(&prompt_ids, n);
         let reusable = matches!(&self.state, Some(st) if st.max_ctx >= want_ctx);
         if !reusable {
@@ -457,8 +466,8 @@ impl SeamModel {
             let mut v_bufs: Vec<Option<Box<dyn Buffer>>> = Vec::new();
             for i in 0..c.n_layer {
                 if attn(i) {
-                    k_bufs.push(Some(zeroed(be, cap * nkv * hd)?));
-                    v_bufs.push(Some(zeroed(be, cap * nkv * hd)?));
+                    k_bufs.push(Some(zeroed16(be, cap * nkv * hd)?));
+                    v_bufs.push(Some(zeroed16(be, cap * nkv * hd)?));
                     conv_bufs.push(None);
                     s_bufs.push(None);
                 } else {
@@ -497,10 +506,18 @@ impl SeamModel {
                     }
                     Ok(())
                 };
+                // KV caches are F16 (2 bytes/elem).
+                let zero_fill16 = |b: &Option<Box<dyn Buffer>>, n: usize| -> Result<()> {
+                    if let Some(b) = b {
+                        be.upload(b.as_ref(), bytemuck::cast_slice(&vec![0u16; n]))
+                            .map_err(|e| anyhow!("{e}"))?;
+                    }
+                    Ok(())
+                };
                 for i in 0..c.n_layer {
                     if attn(i) {
-                        zero_fill(&st.k_bufs[i], st.max_ctx * nkv * hd)?;
-                        zero_fill(&st.v_bufs[i], st.max_ctx * nkv * hd)?;
+                        zero_fill16(&st.k_bufs[i], st.max_ctx * nkv * hd)?;
+                        zero_fill16(&st.v_bufs[i], st.max_ctx * nkv * hd)?;
                     } else {
                         zero_fill(&st.conv_bufs[i], (kk - 1) * cc)?;
                         zero_fill(&st.s_bufs[i], nv * kd * vd)?;
@@ -568,8 +585,12 @@ impl SeamModel {
                     let ffn_gate = wpush(&mut gr, &mut weights);
                     let ffn_up = wpush(&mut gr, &mut weights);
                     let ffn_down = wpush(&mut gr, &mut weights);
-                    let k_cache = gr.input(f32d(max_ctx * nkv * hd));
-                    let v_cache = gr.input(f32d(max_ctx * nkv * hd));
+                    // F16 KV (matches the dense seam and llama.cpp): halves cache bandwidth
+                    // AND is what the fast attention kernels key on — the f32 cache routed
+                    // every GQA layer to the scalar split (measured 33 ms/call at d4096 on
+                    // Metal, 52% of the whole decode).
+                    let k_cache = gr.input(TensorDesc::new(vec![max_ctx * nkv * hd], DType::F16));
+                    let v_cache = gr.input(TensorDesc::new(vec![max_ctx * nkv * hd], DType::F16));
                     layers.push(Q35LayerH::Attn(Q35AttnH {
                         attn_norm,
                         q,

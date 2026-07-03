@@ -894,6 +894,9 @@ fn cmd_bench_qwen35(
     std::env::set_var("INFR_Q35_IGNORE_EOS", "1"); // fixed tg count, no early stop
     let mut m: Box<dyn ChatModel> = if cpu {
         Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.to_path_buf()))
+    } else if std::env::var("INFR_METAL").is_ok() {
+        // Metal seam (there is no Vulkan loader on macOS — `new()` would dlopen-fail).
+        Box::new(infr_llama::model::Qwen35Chat::new_metal(gguf.to_path_buf()))
     } else {
         Box::new(infr_llama::model::Qwen35Chat::new(gguf.to_path_buf()))
     };

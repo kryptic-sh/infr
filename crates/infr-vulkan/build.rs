@@ -23,6 +23,18 @@ fn main() {
             "attn_partial_dynac",
             &["-DUSE_PARAMS", "-DSELF_CHUNK"],
         ),
+        // Coupled Q8_0 KV cache: coalesced split-K decode reading Q8 blocks (halves KV read traffic).
+        ("attn_partial", "attn_partial_q8", &["-DKVQ8"]),
+        (
+            "attn_partial",
+            "attn_partial_dyn_q8",
+            &["-DKVQ8", "-DUSE_PARAMS"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_dynac_q8",
+            &["-DKVQ8", "-DUSE_PARAMS", "-DSELF_CHUNK"],
+        ),
         ("attn_qk", "attn_qk", &[]),
         ("attn_qk_warp", "attn_qk_warp", &[]),
         ("attn_flash", "attn_flash", &[]),
@@ -71,6 +83,8 @@ fn main() {
         ("store_q8", "store_q8", &[]),
         ("store_q8", "store_q8_dyn", &["-DUSE_PARAMS"]),
         ("store_q8", "store_q8_f16", &["-DSRC_F16"]),
+        // Expand a Q8_0 KV prefix → f16 scratch so the f16 flash/non-FA prefill kernels can run.
+        ("dequant_q8_f16", "dequant_q8_f16", &[]),
         (
             "store_q8",
             "store_q8_f16_dyn",

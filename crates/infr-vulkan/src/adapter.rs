@@ -916,7 +916,7 @@ fn lower_op(
                 // live kv_len each token, so one recorded plan serves every depth.
                 let chunk = cap.div_ceil(1024).max(64);
                 let n_chunks = cap.div_ceil(chunk);
-                if hd % 4 == 0 && hd <= 512 && n_chunks > 1 && !kv_q8 {
+                if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later
                     // same-shape layer reuses (kv_len is per-token, and the layers' attention ops
@@ -964,6 +964,7 @@ fn lower_op(
                         n_chunks,
                         pscale,
                         window,
+                        kv_q8,
                     );
                 } else {
                     rec.attention_kv_dyn(
@@ -982,6 +983,24 @@ fn lower_op(
                     );
                 }
             } else {
+                // Q8 PREFILL (rows>1): the coalesced f16 flash/non-FA kernels can't read Q8 blocks,
+                // and the scalar fallback is O(kv²) — TDR-slow (GPU hang) at depth. Dequant the Q8 KV
+                // prefix → a transient f16 scratch once (O(kv)) and run the fast f16 prefill on it;
+                // the persistent cache stays Q8 (footprint preserved). DECODE (rows==1) reads Q8
+                // natively via the split / scalar kernels, so it keeps the cache directly.
+                let deq_prefill = kv_q8 && rows > 1;
+                let (kc_key, vc_key) = if deq_prefill {
+                    let ne = kv_len * nkv * hd;
+                    let ks = pooled(pool, be_, "q8deq_k", ne * 2)?;
+                    let vs = pooled(pool, be_, "q8deq_v", ne * 2)?;
+                    rec.dequant_q8_f16(r(*k_cache)?, pool[&ks].as_ref(), ne);
+                    rec.dequant_q8_f16(r(*v_cache)?, pool[&vs].as_ref(), ne);
+                    (Some(ks), Some(vs))
+                } else {
+                    (None, None)
+                };
+                // Native Q8 read only on the decode path; prefill reads the dequanted f16 scratch.
+                let kv_q8_eff = kv_q8 && !deq_prefill;
                 // Prefill (rows≥64), causal, hd==128, standard 1/√hd scale: FlashAttention-2 (split-K
                 // online softmax, no materialized [m,kv] scores). The flash kernel hardcodes 1/√hd and
                 // writes ceil(rows/64)*64 output rows, so guard the scale and copy the real rows.
@@ -989,7 +1008,7 @@ fn lower_op(
                     && hd == 128
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
-                    && !kv_q8;
+                    && !kv_q8_eff;
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
                 // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
@@ -998,7 +1017,7 @@ fn lower_op(
                     && rows >= 64
                     && hd % 64 == 0
                     && hd <= 512
-                    && !kv_q8
+                    && !kv_q8_eff
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Decode (rows==1): flash-decoding split-K — each head's KV range splits across
@@ -1008,7 +1027,7 @@ fn lower_op(
                 // (push constant; gemma4 uses 1.0), and SWA windows (chunks below the window
                 // clamp to empty → zero-weight partials the combine skips).
                 let chunk = (kv_len / 32).clamp(64, 512);
-                let split_ok = rows == 1 && kv_len > chunk && hd % 4 == 0 && hd <= 512 && !kv_q8;
+                let split_ok = rows == 1 && kv_len > chunk && hd % 4 == 0 && hd <= 512;
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
@@ -1016,10 +1035,18 @@ fn lower_op(
                     let po = pooled(pool, be_, "flash_po", 8 * mpad * nh * hd * 4)?;
                     let pm = pooled(pool, be_, "flash_pm", 8 * mpad * nh * 4)?;
                     let pl = pooled(pool, be_, "flash_pl", 8 * mpad * nh * 4)?;
+                    let kcb = match &kc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*k_cache)?,
+                    };
+                    let vcb = match &vc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*v_cache)?,
+                    };
                     rec.attention_prefill_flash(
                         r(*q)?,
-                        r(*k_cache)?,
-                        r(*v_cache)?,
+                        kcb,
+                        vcb,
                         r(*dst)?,
                         pool[&po].as_ref(),
                         pool[&pm].as_ref(),
@@ -1044,10 +1071,18 @@ fn lower_op(
                     // the reduce), and one set serves every same-shape layer.
                     let s = pooled(pool, be_, "nonfa_s", nh * mpad * kv_pad * 2)?;
                     let pv = pooled(pool, be_, "nonfa_pv", 8 * mpad * nh * hd * 4)?;
+                    let kcb = match &kc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*k_cache)?,
+                    };
+                    let vcb = match &vc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*v_cache)?,
+                    };
                     rec.attention_prefill_nonfa(
                         r(*q)?,
-                        r(*k_cache)?,
-                        r(*v_cache)?,
+                        kcb,
+                        vcb,
                         r(*dst)?,
                         pool[&s].as_ref(),
                         pool[&pv].as_ref(),
@@ -1069,10 +1104,18 @@ fn lower_op(
                     let pm = pooled(pool, be_, "split_pm", nh * n_chunks * 4)?;
                     let pl = pooled(pool, be_, "split_pl", nh * n_chunks * 4)?;
                     let pacc = pooled(pool, be_, "split_pacc", nh * n_chunks * hd * 4)?;
+                    let kcb = match &kc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*k_cache)?,
+                    };
+                    let vcb = match &vc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*v_cache)?,
+                    };
                     rec.attention_kv_split(
                         r(*q)?,
-                        r(*k_cache)?,
-                        r(*v_cache)?,
+                        kcb,
+                        vcb,
                         r(*dst)?,
                         pool[&pm].as_ref(),
                         pool[&pl].as_ref(),
@@ -1085,16 +1128,25 @@ fn lower_op(
                         n_chunks,
                         *scale,
                         window,
+                        kv_q8_eff,
                     );
                 } else {
                     let window = match mask {
                         AttnMask::Causal => 0,
                         AttnMask::SlidingWindow(w) => *w,
                     };
+                    let kcb = match &kc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*k_cache)?,
+                    };
+                    let vcb = match &vc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*v_cache)?,
+                    };
                     rec.attention_kv(
                         r(*q)?,
-                        r(*k_cache)?,
-                        r(*v_cache)?,
+                        kcb,
+                        vcb,
                         r(*dst)?,
                         rows,
                         kv_len,
@@ -1104,7 +1156,7 @@ fn lower_op(
                         pos,
                         window,
                         *scale,
-                        kv_q8,
+                        kv_q8_eff,
                     );
                 }
             }

@@ -902,6 +902,11 @@ dyn_spv!(store_q8_spv, "store_q8");
 dyn_spv!(store_q8_dyn_spv, "store_q8_dyn");
 dyn_spv!(store_q8_f16_spv, "store_q8_f16");
 dyn_spv!(store_q8_f16_dyn_spv, "store_q8_f16_dyn");
+// Coupled Q8_0 KV: coalesced split-K decode partials reading Q8 blocks (static / dyn / self-chunk).
+dyn_spv!(attn_partial_q8_spv, "attn_partial_q8");
+dyn_spv!(attn_partial_dyn_q8_spv, "attn_partial_dyn_q8");
+dyn_spv!(attn_partial_dynac_q8_spv, "attn_partial_dynac_q8");
+dyn_spv!(dequant_q8_f16_spv, "dequant_q8_f16");
 /// SPIR-V for the SELF-CHUNKING record-once split-K decode partial (adaptive chunk from the live
 /// kv_len; workgroups past the live range early-exit with a zero-weight header).
 pub(crate) fn attn_partial_dynac_spv() -> &'static [u32] {

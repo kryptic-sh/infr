@@ -1,0 +1,24 @@
+#version 460
+// Expand `n` elements of a GGUF Q8_0 buffer ([f16 d][i8 qs[32]] = 34 B / 32 elems) into a contiguous
+// f16 buffer. Used to dequant the Q8 KV cache prefix into an f16 scratch so the fast coalesced flash
+// / non-FA prefill kernels (f16-only) can run — the persistent cache stays Q8 (footprint preserved);
+// the scratch is transient (freed after prefill). One thread per element.
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint n; } pc;
+layout(binding = 0) readonly buffer SB { uint8_t src[]; };
+layout(binding = 1) writeonly buffer DB { float16_t dst[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    uint b = (i / 32u) * 34u;
+    uint16_t s = uint16_t(src[b]) | (uint16_t(src[b + 1u]) << 8);
+    float d = float(uint16BitsToFloat16(s));
+    dst[i] = float16_t(d * float(int8_t(src[b + 2u + i % 32u])));
+}

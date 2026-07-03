@@ -1826,6 +1826,24 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Expand `n` elements of a Q8_0 buffer → an f16 buffer (dequant the KV prefix so the f16
+    /// flash / non-FA prefill kernels can read it; the persistent cache stays Q8).
+    pub fn dequant_q8_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize) {
+        self.stamp("dequant_q8_f16");
+        let k = self
+            .be
+            .kernel("dequant_q8_f16", crate::gemm::dequant_q8_f16_spv(), 2, 4);
+        let mut push = [0u8; 4];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
     /// Qwen3 QK-norm + RoPE over `x[rows, nheads, hd]` → `y` at rows `out_base..`. `nw` is the
     /// per-head [hd] norm weight. (q: out_base=0; k: out_base=pos so it lands in the cache.)
     #[allow(clippy::too_many_arguments)]
@@ -1905,12 +1923,17 @@ impl<'a> Recorder<'a> {
         n_chunks: usize,
         scale: f32,
         window: usize,
+        // Q8_0 KV cache (K==V==q8): coalesced Q8-block read variant. `false` = f16 cache.
+        q8: bool,
     ) {
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
         self.stamp("attn_partial");
-        let k1 = self
-            .be
-            .kernel_sg("attn_partial", crate::gemm::attn_partial_spv(), 6, 32, 32);
+        let (p1name, p1spv) = if q8 {
+            ("attn_partial_q8", crate::gemm::attn_partial_q8_spv())
+        } else {
+            ("attn_partial", crate::gemm::attn_partial_spv())
+        };
+        let k1 = self.be.kernel_sg(p1name, p1spv, 6, 32, 32);
         let mut p1 = [0u8; 32];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -2175,19 +2198,23 @@ impl<'a> Recorder<'a> {
         n_chunks: usize,
         scale: f32,
         window: usize,
+        // Q8_0 KV cache (K==V==q8): coalesced Q8-block read variant. `false` = f16 cache.
+        q8: bool,
     ) {
         // pass 1: self-chunking partials, workgroup count from `args` (the caller records ONE
         // `attn_live_prologue` per (nh, chunk, window) key — kv_len is identical for every layer
         // of a token, so the args buffer is shared across same-key attention ops instead of
         // re-derived per layer).
         self.stamp("attn_partial");
-        let k1 = self.be.kernel_sg(
-            "attn_partial_dynac",
-            crate::gemm::attn_partial_dynac_spv(),
-            7,
-            32,
-            32,
-        );
+        let (p1name, p1spv) = if q8 {
+            (
+                "attn_partial_dynac_q8",
+                crate::gemm::attn_partial_dynac_q8_spv(),
+            )
+        } else {
+            ("attn_partial_dynac", crate::gemm::attn_partial_dynac_spv())
+        };
+        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 32, 32);
         let mut p1 = [0u8; 32];
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
@@ -3761,6 +3788,7 @@ mod tests {
             n_chunks,
             scale,
             win,
+            false, // f16 KV cache
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; nh * hd * 4];
@@ -3837,6 +3865,7 @@ mod tests {
             n_chunks,
             scale,
             win,
+            false, // f16 KV cache
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; nh * hd * 4];

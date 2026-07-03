@@ -10,6 +10,15 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#ifdef KVQ8
+// Coupled Q8_0 KV cache: K and V are GGUF Q8_0 blocks ([f16 d][i8 qs[32]] = 34 B / 32 elems). The
+// coalesced split-K structure is preserved — each `f16vec4` load becomes a 4-code dequant from the
+// enclosing 32-element block (the 4 elements never straddle a block, since the vec4 index maps to a
+// 4-aligned offset). Halves the KV read traffic at decode depth vs the f16 cache.
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_8bit_storage : require
+#endif
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -17,8 +26,33 @@ layout(push_constant) uniform PC {
     uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
 } pc;
 layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [nh, hd] as vec4
+#ifdef KVQ8
+layout(binding = 1) readonly buffer KB { uint8_t kbuf[]; };  // cache [kv_len, nkv, hd] Q8_0 bytes
+layout(binding = 2) readonly buffer VB { uint8_t vbuf[]; };
+// vec4 at vec4-index `i4` (elements 4*i4..4*i4+3) from a Q8_0 byte buffer. The 4 elements share one
+// block (offset o=4*i4%32 is a multiple of 4 → [o,o+3] ⊆ [0,31]); one f16 scale + 4 int8 codes.
+vec4 kq8(uint i4) {
+    uint e = i4 * 4u; uint b = (e / 32u) * 34u; uint o = e % 32u;
+    uint16_t s = uint16_t(kbuf[b]) | (uint16_t(kbuf[b + 1u]) << 8);
+    float d = float(uint16BitsToFloat16(s));
+    return d * vec4(int8_t(kbuf[b + 2u + o]), int8_t(kbuf[b + 3u + o]),
+                    int8_t(kbuf[b + 4u + o]), int8_t(kbuf[b + 5u + o]));
+}
+vec4 vq8(uint i4) {
+    uint e = i4 * 4u; uint b = (e / 32u) * 34u; uint o = e % 32u;
+    uint16_t s = uint16_t(vbuf[b]) | (uint16_t(vbuf[b + 1u]) << 8);
+    float d = float(uint16BitsToFloat16(s));
+    return d * vec4(int8_t(vbuf[b + 2u + o]), int8_t(vbuf[b + 3u + o]),
+                    int8_t(vbuf[b + 4u + o]), int8_t(vbuf[b + 5u + o]));
+}
+#define KVEC4(i) kq8(i)
+#define VVEC4(i) vq8(i)
+#else
 layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
 layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
+#define KVEC4(i) vec4(k4[i])
+#define VVEC4(i) vec4(v4[i])
+#endif
 #ifdef USE_PARAMS
 // Record-once decode: kv_len comes from a host-updated params SSBO so the buffer replays across
 // tokens. Outputs shift to bindings 4/5/6 (params takes binding 3) to stay output-last.
@@ -104,10 +138,10 @@ void main() {
         uint q4b = h * 32u;
         uint kb = (pc.nkv * 32u);
         for (; j + 3u * nsg < j1; j += 4u * nsg) {
-            vec4 a0 = vec4(k4[j * kb + kvh * 32u + lane]);
-            vec4 a1 = vec4(k4[(j + nsg) * kb + kvh * 32u + lane]);
-            vec4 a2 = vec4(k4[(j + 2u * nsg) * kb + kvh * 32u + lane]);
-            vec4 a3 = vec4(k4[(j + 3u * nsg) * kb + kvh * 32u + lane]);
+            vec4 a0 = KVEC4(j * kb + kvh * 32u + lane);
+            vec4 a1 = KVEC4((j + nsg) * kb + kvh * 32u + lane);
+            vec4 a2 = KVEC4((j + 2u * nsg) * kb + kvh * 32u + lane);
+            vec4 a3 = KVEC4((j + 3u * nsg) * kb + kvh * 32u + lane);
             float d0 = subgroupAdd(dot(qreg[0], a0)) * scale;
             float d1 = subgroupAdd(dot(qreg[0], a1)) * scale;
             float d2 = subgroupAdd(dot(qreg[0], a2)) * scale;
@@ -126,7 +160,7 @@ void main() {
         float part = 0.0;
         uint ri = 0u;
         for (uint r = lane; r < hd4; r += 32u) {
-            part += dot(qreg[ri], vec4(k4[kbase4 + r]));
+            part += dot(qreg[ri], KVEC4(kbase4 + r));
             ri++;
         }
         float dot = subgroupAdd(part) * scale;
@@ -170,13 +204,13 @@ void main() {
             uint stride = pc.nkv * hd4;
             uint j = j0 + sg;
             for (; j + nsg < j1; j += 2u * nsg) {
-                vec4 b0 = vec4(v4[j * stride + base]);
-                vec4 b1 = vec4(v4[(j + nsg) * stride + base]);
+                vec4 b0 = VVEC4(j * stride + base);
+                vec4 b1 = VVEC4((j + nsg) * stride + base);
                 acc += sc[j - j0] * b0;
                 acc += sc[j + nsg - j0] * b1;
             }
             for (; j < j1; j += nsg) {
-                acc += sc[j - j0] * vec4(v4[j * stride + base]);
+                acc += sc[j - j0] * VVEC4(j * stride + base);
             }
         }
         if (sg == 1u && lane < hd4) { vsh[lane] = acc; }
@@ -193,7 +227,7 @@ void main() {
         for (uint g = t; g < hd4; g += 64u) {
             vec4 acc = vec4(0.0);
             for (uint j = j0; j < j1; j += 1u) {
-                acc += sc[j - j0] * vec4(v4[(j * pc.nkv + kvh) * hd4 + g]);
+                acc += sc[j - j0] * VVEC4((j * pc.nkv + kvh) * hd4 + g);
             }
             pacc[pbase + 4u * g] = acc.x;
             pacc[pbase + 4u * g + 1u] = acc.y;

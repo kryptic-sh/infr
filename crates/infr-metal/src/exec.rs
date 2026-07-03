@@ -183,6 +183,29 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             | Op::GatedActFused { .. }
             | Op::Add { .. } => {}
             Op::QkNormRope { .. } => has_rope = true,
+            // MoE decode tapes only when the arm takes the fully-on-device path (the same gate
+            // as the MoeFfn arm's `device_ok`): dtypes with expert kernels, in-bounds shapes,
+            // escape hatch off. The host fallback computes on the CPU per token — a tape can't
+            // represent it.
+            Op::MoeFfn {
+                gate_exps,
+                up_exps,
+                down_exps,
+                ne,
+                n_ff_exp,
+                n_used,
+                ..
+            } => {
+                let kq = |t: &TensorId| matches!(g.desc(*t).dtype, DType::Q4K | DType::Q6K);
+                if !(kq(gate_exps) && kq(up_exps) && kq(down_exps))
+                    || *n_used > 16
+                    || *ne % 256 != 0
+                    || *n_ff_exp % 256 != 0
+                    || std::env::var("INFR_METAL_NOMOE").is_ok()
+                {
+                    return false;
+                }
+            }
             Op::WriteKv { cache, .. } => {
                 if !matches!(g.desc(*cache).dtype, DType::F16 | DType::Q8_0) {
                     return false;
@@ -1911,10 +1934,11 @@ impl MetalBackend {
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(ne as u32).to_ne_bytes());
                     p.extend_from_slice(&(n_expert as u32).to_ne_bytes());
-                    self.encode_tg(
+                    self.encode_tg_w(
                         r,
                         &pso,
                         &[bx.as_ref(), rw.as_ref(), logits.as_ref()],
+                        1 << 2,
                         &p,
                         rows * n_expert * 32,
                         32,
@@ -1924,7 +1948,15 @@ impl MetalBackend {
                     let mut p = (n_expert as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(n_used as u32).to_ne_bytes());
                     p.extend_from_slice(&scale.to_ne_bytes());
-                    self.encode_tg(r, &pso, &[logits.as_ref(), tbl.as_ref()], &p, rows * 32, 32);
+                    self.encode_tg_w(
+                        r,
+                        &pso,
+                        &[logits.as_ref(), tbl.as_ref()],
+                        1 << 1,
+                        &p,
+                        rows * 32,
+                        32,
+                    );
                     // Expert FFN, batched over (chunk rows x selected experts) — one dispatch per
                     // stage per chunk; chunking bounds the expert scratch (a full 8k-row prefill
                     // would need ~0.5 GB of it).
@@ -2087,7 +2119,7 @@ impl MetalBackend {
                             continue;
                         }
                         let pso = self.pipelines.get(moe_kern(gdt2).unwrap().0)?;
-                        self.encode_tg(
+                        self.encode_tg_w(
                             r,
                             &pso,
                             &[
@@ -2098,12 +2130,13 @@ impl MetalBackend {
                                 gate_t.as_ref(),
                                 tbl.as_ref(),
                             ],
+                            1 << 4,
                             &pack(ne, nffx, row0),
                             cr * n_used * (nffx / 2) * 32,
                             32,
                         );
                         let pso = self.pipelines.get(moe_kern(udt2).unwrap().0)?;
-                        self.encode_tg(
+                        self.encode_tg_w(
                             r,
                             &pso,
                             &[
@@ -2114,6 +2147,7 @@ impl MetalBackend {
                                 up_t.as_ref(),
                                 tbl.as_ref(),
                             ],
+                            1 << 4,
                             &pack(ne, nffx, row0),
                             cr * n_used * (nffx / 2) * 32,
                             32,
@@ -2123,15 +2157,16 @@ impl MetalBackend {
                         p.extend_from_slice(&(nffx as u32).to_ne_bytes());
                         p.extend_from_slice(&act_code.to_ne_bytes());
                         p.extend_from_slice(&0u32.to_ne_bytes()); // up_off
-                        self.encode(
+                        self.encode_w(
                             r,
                             &pso,
                             &[gate_t.as_ref(), up_t.as_ref(), act_t.as_ref()],
+                            1 << 2,
                             &p,
                             cr * n_used * nffx,
                         );
                         let pso = self.pipelines.get(moe_kern(ddt2).unwrap().1)?;
-                        self.encode_tg(
+                        self.encode_tg_w(
                             r,
                             &pso,
                             &[
@@ -2142,6 +2177,7 @@ impl MetalBackend {
                                 ydown.as_ref(),
                                 tbl.as_ref(),
                             ],
+                            1 << 4,
                             &pack(nffx, ne, row0),
                             cr * n_used * (ne / 2) * 32,
                             32,
@@ -2151,7 +2187,7 @@ impl MetalBackend {
                         p.extend_from_slice(&(n_used as u32).to_ne_bytes());
                         p.extend_from_slice(&(cr as u32).to_ne_bytes());
                         p.extend_from_slice(&(row0 as u32).to_ne_bytes());
-                        self.encode(r, &pso, &[ydown.as_ref(), bd.as_ref()], &p, cr * ne);
+                        self.encode_w(r, &pso, &[ydown.as_ref(), bd.as_ref()], 1 << 1, &p, cr * ne);
                     }
                     r.loc[dst.0 as usize] = Loc::Device;
                     return Ok(());

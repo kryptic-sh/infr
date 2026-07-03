@@ -322,6 +322,7 @@ fn check_linear_add_fusion(dtype: DType, wbytes: Vec<u8>, in_f: usize, out_f: us
         m: 1,
         in_f: in_f as u32,
         out_f: out_f as u32,
+        w_off: 0,
     });
     g.push(Op::Add {
         a: mid,
@@ -414,6 +415,7 @@ fn check_quant_linear_parity_impl(
         m: m as u32,
         in_f: in_f as u32,
         out_f: out_f as u32,
+        w_off: 0,
     });
     let bound = vec![(x, f32_bytes(&xs)), (w, wbytes)];
     let mtl = run(
@@ -447,6 +449,7 @@ fn linear_f32_parity() {
         m: m as u32,
         in_f: in_f as u32,
         out_f: out_f as u32,
+        w_off: 0,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(m * in_f, 20))),
@@ -470,6 +473,7 @@ fn linear_f16_parity() {
         m: m as u32,
         in_f: in_f as u32,
         out_f: out_f as u32,
+        w_off: 0,
     });
     let bound = vec![
         (x, f32_bytes(&rand_f32(m * in_f, 22))),
@@ -502,6 +506,7 @@ fn linear_q8_0_matches_dequant_reference() {
         m: m as u32,
         in_f: in_f as u32,
         out_f: out_f as u32,
+        w_off: 0,
     });
     let bound = vec![(x, f32_bytes(&xs)), (w, wbytes)];
     let mtl = run(

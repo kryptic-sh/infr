@@ -224,6 +224,58 @@ pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'st
     })
 }
 
+/// SPIR-V for the NARROW-N warptile (BN=128/BK=64) — same math per thread, 2× the workgroups; the
+/// occupancy fix for n=1024/2048 GEMMs. `None` for formats without a warp build.
+pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => v!("native_gemm_warp_q4k_n128"),
+        Q6K => v!("native_gemm_warp_q6k_n128"),
+        Q8_0 => v!("native_gemm_warp_q8_0_n128"),
+        _ => return None,
+    })
+}
+
+/// SPIR-V for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
+pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => v!("native_gemm_warp_q4k_sk"),
+        Q6K => v!("native_gemm_warp_q6k_sk"),
+        Q8_0 => v!("native_gemm_warp_q8_0_sk"),
+        _ => return None,
+    })
+}
+
+/// SPIR-V for the split-K reduce (sum the partials planes).
+pub(crate) fn splitk_reduce_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/splitk_reduce.spv"
+        )))
+    })
+}
+
 /// SPIR-V for the native-block prefill GEMM (`C=A·Wᵀ`, raw GGUF blocks dequantized in-shader via the
 /// coopmat tiled kernel). One specialization per quant format; `None` for unsupported dtypes.
 pub(crate) fn native_gemm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {

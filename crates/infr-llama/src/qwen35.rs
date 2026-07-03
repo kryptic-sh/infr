@@ -1678,6 +1678,7 @@ impl SeamModel {
                     m: rows as u32,
                     in_f: inf as u32,
                     out_f: outf as u32,
+                    w_off: 0,
                 });
             };
 
@@ -1951,6 +1952,7 @@ impl SeamModel {
                 m: 1,
                 in_f: ne as u32,
                 out_f: vocab as u32,
+                w_off: 0,
             });
 
             // collect state-input handles per layer for binding (interleaved by kind)

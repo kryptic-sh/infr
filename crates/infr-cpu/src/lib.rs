@@ -2419,6 +2419,7 @@ impl Backend for CpuBackend {
                     m,
                     in_f,
                     out_f,
+                    w_off,
                 } => {
                     let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
                     let xs = &vals[x.0 as usize];
@@ -2428,9 +2429,13 @@ impl Backend for CpuBackend {
                     // independent → fan out over the 32 cores with rayon.
                     let buf = bindings.get(w).expect("cpu backend: unbound Weight");
                     let bytes = cpu_buf(buf).read();
-                    let wbytes: &[u8] = &bytes;
                     let dt = g.desc(w).dtype;
-                    let bpr = wbytes.len() / out_f; // bytes per weight row
+                    // `w_off` (elements, row-aligned) selects a projection's rows inside a
+                    // CONCATENATED weight (fused QKV): total rows = declared numel / in_f.
+                    let total_rows = g.desc(w).numel() / in_f;
+                    let bpr = bytes.len() / total_rows; // bytes per weight row
+                    let row0 = w_off as usize / in_f;
+                    let wbytes: &[u8] = &bytes[row0 * bpr..(row0 + out_f) * bpr];
                     let mut out = vec![0f32; m * out_f];
                     // One token (decode) is the hot path. Dispatch on the weight dtype to the fastest
                     // per-row kernel: integer Q8×Q4_K/Q6_K dots (quantize the activation once), direct

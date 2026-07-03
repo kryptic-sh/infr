@@ -582,28 +582,43 @@ impl<'a> Recorder<'a> {
     ) {
         self.stamp("matmul_proj");
         // Large-warptile variant (8-warp BM=64×BN=256): 4× the math per staged A-row / decoded
-        // W-column vs the 64×64 tile, and the extra warps hide the dequant latency. Needs n%256,
-        // k%32; only the hot formats are compiled — everything else stays on the 64×64 kernel.
-        // INFR_NO_GEMM_WARP forces the 64×64 tile (A/B).
-        let warp = if n.is_multiple_of(256)
-            && k.is_multiple_of(32)
-            && std::env::var("INFR_NO_GEMM_WARP").is_err()
-        {
-            crate::gemm::native_gemm_warp_build_spv(dtype)
+        // W-column vs the 64×64 tile, and the extra warps hide the dequant latency. Needs k%32;
+        // only the hot formats are compiled — everything else stays on the 64×64 kernel.
+        // Tile pick: the wide BN=256 tile when its grid fills the device, else the NARROW BN=128
+        // tile (same per-thread math, 2× the workgroups) — n=1024/2048 GEMMs underfilled a 96-wg
+        // part at 5-9 TFLOPS with the wide tile. INFR_NO_GEMM_WARP forces the 64×64 tile (A/B).
+        // Empirically the wide tile only wins once its own grid saturates (~2× device capacity).
+        const WIDE_GRID_MIN: usize = 128;
+        let wide_grid = m.div_ceil(64) * (n / 256).max(1);
+        let use_wide = n.is_multiple_of(256) && wide_grid >= WIDE_GRID_MIN;
+        let warp = if k.is_multiple_of(32) && std::env::var("INFR_NO_GEMM_WARP").is_err() {
+            if use_wide {
+                crate::gemm::native_gemm_warp_build_spv(dtype).map(|s| (s, 256))
+            } else if n.is_multiple_of(128) {
+                crate::gemm::native_gemm_warp_n128_build_spv(dtype).map(|s| (s, 128))
+            } else {
+                None
+            }
         } else {
             None
         };
         let (name, spv) = match (warp, dtype) {
-            (Some(spv), infr_core::DType::Q4K) => ("native_gemm_warp_q4k", spv),
-            (Some(spv), infr_core::DType::Q6K) => ("native_gemm_warp_q6k", spv),
-            (Some(spv), infr_core::DType::Q8_0) => ("native_gemm_warp_q8_0", spv),
+            (Some((spv, 256)), infr_core::DType::Q4K) => ("native_gemm_warp_q4k", spv),
+            (Some((spv, 256)), infr_core::DType::Q6K) => ("native_gemm_warp_q6k", spv),
+            (Some((spv, 256)), infr_core::DType::Q8_0) => ("native_gemm_warp_q8_0", spv),
+            (Some((spv, _)), infr_core::DType::Q4K) => ("native_gemm_warp_q4k_n128", spv),
+            (Some((spv, _)), infr_core::DType::Q6K) => ("native_gemm_warp_q6k_n128", spv),
+            (Some((spv, _)), infr_core::DType::Q8_0) => ("native_gemm_warp_q8_0_n128", spv),
             _ => (
                 crate::linear::native_gemm_kernel_name(dtype),
                 crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv"),
             ),
         };
         let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
-        let groups_n = if warp.is_some() { n / 256 } else { n / 64 };
+        let groups_n = match warp {
+            Some((_, bn)) => n / bn,
+            None => n / 64,
+        };
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
@@ -616,6 +631,68 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             groups,
+        );
+    }
+
+    /// SPLIT-K narrow-warptile GEMM: `splits` k-partials into `partials` ([splits, mpad, n] f32),
+    /// then the deterministic fixed-order reduce into `c`. The occupancy fix for narrow-n GEMMs
+    /// with deep k (o/down projections: n = n_embd, k = 2-3·n_embd — 64 workgroups on a 96-wg
+    /// part with the plain tile). Requires n%128==0, k%32==0; caller sizes `partials` to
+    /// `splits · ceil(m/64)·64 · n · 4` bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_native_splitk(
+        &self,
+        dtype: infr_core::DType,
+        a: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        partials: &dyn Buffer,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+        splits: usize,
+    ) {
+        self.stamp("matmul_proj");
+        let spv = crate::gemm::native_gemm_warp_sk_build_spv(dtype).expect("split-k spv");
+        let name = match dtype {
+            infr_core::DType::Q4K => "native_gemm_warp_q4k_sk",
+            infr_core::DType::Q6K => "native_gemm_warp_q6k_sk",
+            _ => "native_gemm_warp_q8_0_sk",
+        };
+        let mpad = m.div_ceil(64) * 64;
+        let kern = self.be.kernel_sg(name, spv, 3, 24, 32);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(splits as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(mpad as u32).to_ne_bytes());
+        let groups = ((mpad / 64) * (n / 128) * splits) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(a), Self::vkb(w), Self::vkb(partials)],
+            1,
+            &push,
+            groups,
+        );
+        // reduce: out[i] = Σ_s partials[s·plane + i]
+        self.stamp("matmul_proj");
+        let rk = self
+            .be
+            .kernel("splitk_reduce", crate::gemm::splitk_reduce_spv(), 2, 12);
+        let n_elems = mpad * n;
+        let mut rp = [0u8; 12];
+        rp[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+        rp[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
+        rp[8..12].copy_from_slice(&(n_elems as u32).to_ne_bytes());
+        self.dispatch(
+            rk,
+            &[Self::vkb(partials), Self::vkb(c)],
+            1,
+            &rp,
+            (n_elems as u32).div_ceil(64),
         );
     }
 

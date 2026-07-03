@@ -377,13 +377,27 @@ fn lower_op(
             m,
             in_f,
             out_f,
+            w_off,
         } => {
-            let (m, in_f, out_f) = (*m as usize, *in_f as usize, *out_f as usize);
+            let (m, in_f, out_f, w_off) = (
+                *m as usize,
+                *in_f as usize,
+                *out_f as usize,
+                *w_off as usize,
+            );
             let (w, xb, y) = (r(*weight)?, r(*x)?, r(*dst)?);
             let dt = graph.desc(*weight).dtype;
+            // `w_off` (fused-QKV slices) only rides the offset-capable native paths — the runner
+            // gates fusion on `native_dense_supported`, so the f16/f32 fallbacks never see it.
+            if w_off != 0 && !native_dense_supported(dt) {
+                return Err(be("vulkan adapter: Linear w_off on a non-native weight"));
+            }
             // Fused Linear+Add (decode residual): one GEMV with the residual added in-kernel —
             // see linear_add_peephole. `y` (the Linear's scratch dst) is never written.
             if let Some((residual, final_dst)) = fused_add.get(&op_idx) {
+                if w_off != 0 {
+                    return Err(be("vulkan adapter: Linear w_off with fused residual"));
+                }
                 let (rr, yf) = (r(*residual)?, r(*final_dst)?);
                 if native_dense_supported(dt) {
                     rec.linear_add_native(dt, w, xb, rr, yf, m, in_f, out_f);
@@ -450,14 +464,42 @@ fn lower_op(
                         pool[&dact].as_ref(),
                         pool[&sact].as_ref(),
                         w,
-                        0,
+                        w_off,
                         out,
                         m,
                         in_f,
                         out_f,
                     );
                 } else if native_dense_supported(dt) {
-                    rec.matmul_native(dt, xb, w, out, m, in_f, out_f);
+                    // SPLIT-K for narrow-n deep-k shapes (o/down projections): the plain tile's
+                    // grid underfills the device (n=1024 → 64 wgs on a 96-wg part → 6-11 TFLOPS
+                    // vs the kernel's ~36). Split k across enough extra workgroups to fill, with
+                    // a fixed-order (deterministic) reduce. Wide/filled shapes keep the direct
+                    // path (no partials round-trip).
+                    let narrow_grid = m.div_ceil(64) * (out_f / 128).max(1);
+                    let splits = if out_f % 128 == 0 && in_f >= 1024 && narrow_grid < 128 {
+                        (256 / narrow_grid).next_power_of_two().clamp(1, 8)
+                    } else {
+                        1
+                    };
+                    if splits > 1 && crate::gemm::native_gemm_warp_sk_build_spv(dt).is_some() {
+                        let mpad = m.div_ceil(64) * 64;
+                        let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
+                        rec.matmul_native_splitk(
+                            dt,
+                            xb,
+                            w,
+                            w_off,
+                            pool[&pk].as_ref(),
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                            splits,
+                        );
+                    } else {
+                        rec.matmul_native_off(dt, xb, w, w_off, out, m, in_f, out_f);
+                    }
                 } else {
                     // f16 coopmat GEMM (dummy scales/mins unused at bits=16).
                     rec.matmul_proj(xb, w, dummy, dummy, out, m, in_f, out_f, 16, 0);
@@ -467,7 +509,7 @@ fn lower_op(
                     transient.push(t);
                 }
             } else if native_dense_supported(dt) {
-                rec.linear_native(dt, w, xb, y, m, in_f, out_f);
+                rec.linear_native_off(dt, w, w_off, xb, y, m, in_f, out_f);
             } else if matches!(dt, infr_core::DType::F32) {
                 // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj): the seam
                 // uploads native dtype, and the f16 GEMV would read the f32 bytes as f16 garbage.
@@ -1894,6 +1936,7 @@ mod tests {
             m: 1,
             in_f: in_f as u32,
             out_f: out_f as u32,
+            w_off: 0,
         });
         let xb = be_.alloc(in_f * 4, BufferUsage::Activations).unwrap();
         let wb = be_.alloc(wf16.len(), BufferUsage::Weights).unwrap();

@@ -137,6 +137,70 @@ fn qwen35_gemm_inventory_bench() {
     println!("qwen35 512-row chunk GEMM total: {total:.1} ms");
 }
 
+/// Sum the real qwen3-0.6B Q8_0 prefill GEMM inventory (m=512) per kernel variant — the pp512
+/// sweep gap is 84% GEMM time, and the suspect is narrow-n occupancy on the warp tile (n=1024 →
+/// 32 workgroups on a 96-CU part). Prints per-shape µs + effective TFLOPS for warp vs native64.
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn qwen3_gemm_inventory_bench() {
+    let be = VulkanBackend::new().unwrap();
+    let m = 512usize;
+    // (k, n, count/layer-set): q, k+v, o, gate+up (fused), down — 28 layers.
+    let shapes = [
+        (1024usize, 2048usize, 28usize), // q
+        (1024, 1024, 56),                // k, v
+        (2048, 1024, 28),                // o
+        (1024, 6144, 28),                // gate+up (combined)
+        (3072, 1024, 28),                // down
+    ];
+    let a = be.alloc(m * 3072 * 4, BufferUsage::Activations).unwrap();
+    let c = be.alloc(m * 6144 * 4, BufferUsage::Activations).unwrap();
+    for variant in ["warp", "native64"] {
+        if variant == "native64" {
+            std::env::set_var("INFR_NO_GEMM_WARP", "1");
+        }
+        let mut total = 0f64;
+        for (k, n, cnt) in shapes {
+            let w = be.alloc(n * k / 32 * 34, BufferUsage::Weights).unwrap();
+            let rec = be.recorder().unwrap(); // warmup (pipeline compile)
+            rec.matmul_native(
+                infr_core::DType::Q8_0,
+                a.as_ref(),
+                w.as_ref(),
+                c.as_ref(),
+                m,
+                k,
+                n,
+            );
+            rec.finish().unwrap();
+            let reps = 20usize;
+            let t0 = std::time::Instant::now();
+            let rec = be.recorder().unwrap();
+            for _ in 0..reps {
+                rec.matmul_native(
+                    infr_core::DType::Q8_0,
+                    a.as_ref(),
+                    w.as_ref(),
+                    c.as_ref(),
+                    m,
+                    k,
+                    n,
+                );
+            }
+            rec.finish().unwrap();
+            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            let tflops = (2.0 * m as f64 * k as f64 * n as f64) / us / 1e6;
+            println!(
+                "[{variant:>8}] [{k}x{n}] {us:8.1} us  {tflops:5.1} TF  ×{cnt} = {:.2} ms",
+                us * cnt as f64 / 1e3
+            );
+            total += us * cnt as f64 / 1e3;
+        }
+        println!("[{variant:>8}] qwen3-0.6B m=512 GEMM total: {total:.1} ms\n");
+        std::env::remove_var("INFR_NO_GEMM_WARP");
+    }
+}
+
 /// Per-op serialization floor: a chain of small hazard-dependent dispatches (each reads the
 /// previous one's output → global barrier each). wall/ops ≈ the fixed bubble every seam op pays
 /// on top of its kernel time — the number that says how much op-count reduction / overlap is worth.

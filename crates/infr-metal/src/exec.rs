@@ -929,7 +929,15 @@ impl MetalBackend {
                 m,
                 in_f,
                 out_f,
+                w_off,
             } => {
+                // Only produced by the fused-QKV runner path, which is gated on
+                // `Capabilities::combined_gu` — Metal leaves it false, so this is unreachable.
+                if w_off != 0 {
+                    return Err(Error::Unsupported(
+                        "metal: Linear w_off (fused-QKV slices) unsupported".into(),
+                    ));
+                }
                 let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
                 let bx = self.ensure_device(r, x);
                 let bd = self.dev_dst(r, dst, m * out_f);

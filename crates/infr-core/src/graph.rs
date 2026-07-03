@@ -91,6 +91,11 @@ pub enum Op {
         m: u32,
         in_f: u32,
         out_f: u32,
+        /// ELEMENT offset into `weight` where this projection's rows start (0 = whole tensor).
+        /// Lets several projections share one concatenated weight upload (fused QKV): prefill
+        /// runs ONE wide GEMM over the whole tensor while decode keeps per-projection GEMVs into
+        /// its slices. Must be row-aligned (`w_off % in_f == 0`) and block-aligned for quants.
+        w_off: u32,
     },
     /// Per-head RMSNorm of `x` (`rows × n_head × head_dim`) with a per-`head_dim` `weight`
     /// (Qwen3 / Gemma Q-norm and K-norm). In place when `dst == x`.

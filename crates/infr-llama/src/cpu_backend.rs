@@ -633,6 +633,29 @@ pub(crate) fn generate_dense_backend(
             };
             dt("ffn_gate.weight").is_some() && dt("ffn_gate.weight") == dt("ffn_up.weight")
         });
+    // Combined QKV: one [qrow+2·kvrow, ne] weight → prefill runs ONE wide GEMM (the separate
+    // q/k/v GEMMs are narrow-n and underfill a big GPU — the pp512 sweep's dominant cost), and
+    // decode keeps three offset GEMVs into the same buffer (`Op::Linear.w_off`), so its dispatch
+    // count is unchanged. Needs every layer to own all three projections in ONE native-supported
+    // dtype (gemma4's V-less full layers keep the split form), uniform dims (the offsets are
+    // baked once), and a backend that opted into combined weights.
+    let fuse_qkv = be.capabilities().combined_gu
+        && (0..c.n_layer).all(|l| {
+            let dt = |s: &str| {
+                let name = format!("blk.{l}.{s}");
+                g.tensors().iter().find(|t| t.name == name).map(|t| t.dtype)
+            };
+            let q = dt("attn_q.weight");
+            q.is_some()
+                && q == dt("attn_k.weight")
+                && q == dt("attn_v.weight")
+                && q.is_some_and(|d| {
+                    infr_vulkan::linear::native_dense_supported(d) && d != DType::F16
+                })
+                && c.layer_head_dim(l) == c.head_dim
+                && c.layer_n_kv(l) == c.n_kv
+                && c.has_own_kv(l)
+        });
 
     // INFR_KV_Q8=1 stores the KV cache as Q8_0 blocks (34 bytes / 32 elems — half the f16
     // footprint and bandwidth); the CPU reference and the Metal backend read/write it, other
@@ -696,10 +719,18 @@ pub(crate) fn generate_dense_backend(
         for l in 0..c.n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
             wload(&[&p("attn_norm.weight")])?;
-            wload(&[&p("attn_q.weight")])?;
-            wload(&[&p("attn_k.weight")])?;
-            if has_wv[l] {
-                wload(&[&p("attn_v.weight")])?;
+            if fuse_qkv {
+                wload(&[
+                    &p("attn_q.weight"),
+                    &p("attn_k.weight"),
+                    &p("attn_v.weight"),
+                ])?;
+            } else {
+                wload(&[&p("attn_q.weight")])?;
+                wload(&[&p("attn_k.weight")])?;
+                if has_wv[l] {
+                    wload(&[&p("attn_v.weight")])?;
+                }
             }
             if qk_norm {
                 wload(&[&p("attn_q_norm.weight")])?;
@@ -900,12 +931,20 @@ pub(crate) fn generate_dense_backend(
         let mut lw: Vec<LayerW> = Vec::new();
         for l in 0..c.n_layer {
             let attn_norm = wpush(&mut g, &mut weights);
-            let wq = wpush(&mut g, &mut weights);
-            let wk = wpush(&mut g, &mut weights);
-            let wv = if has_wv[l] {
-                Some(wpush(&mut g, &mut weights))
+            // Fused QKV: ONE concatenated weight handle serves q/k/v (the builder bakes each
+            // projection's `w_off` slice); split form declares three.
+            let (wq, wk, wv) = if fuse_qkv {
+                let wqkv = wpush(&mut g, &mut weights);
+                (wqkv, wqkv, Some(wqkv))
             } else {
-                None
+                let wq = wpush(&mut g, &mut weights);
+                let wk = wpush(&mut g, &mut weights);
+                let wv = if has_wv[l] {
+                    Some(wpush(&mut g, &mut weights))
+                } else {
+                    None
+                };
+                (wq, wk, wv)
             };
             let (q_norm, k_norm) = if qk_norm {
                 (
@@ -992,6 +1031,13 @@ pub(crate) fn generate_dense_backend(
         let q16 = g.internal(f16d(batch * max_qrow));
         let k16 = g.internal(f16d(batch * max_kvrow));
         let attn = g.internal(f32d(batch * max_qrow));
+        // Fused-QKV prefill staging: the wide GEMM writes [batch, qrow+2·kvrow] here, then three
+        // CopyStrided ops split it into q/k/v. Decode (batch==1) skips it (offset GEMVs).
+        let qkvbuf = if fuse_qkv && batch > 1 {
+            Some(g.internal(f32d(batch * (max_qrow + 2 * max_kvrow))))
+        } else {
+            None
+        };
         // Separate gate/up scratch, or one combined [batch, 2*nff] gu buffer when fused — declare
         // only the shape in use (Internal buffers are allocated by the backend even if never read).
         let (gbuf, ubuf, gubuf) = if fuse_gu {
@@ -1041,45 +1087,99 @@ pub(crate) fn generate_dense_backend(
                 dim: ne as u32,
                 eps,
             });
-            g.push(Op::Linear {
-                x: hn,
-                weight: lw.wq,
-                dst: q,
-                m: batch as u32,
-                in_f: ne as u32,
-                out_f: qrow as u32,
-            });
             // gemma4 E2B KV-layer sharing: shared layers compute Q only and attend to an earlier
             // layer's cache. `own_kv`/`kv_src` are `true`/`l` for every layer of a non-sharing model.
             let own_kv = c.has_own_kv(l);
             let kv_src = c.kv_src_layer(l);
-            if own_kv {
+            if let Some(qkv) = qkvbuf {
+                // Fused QKV (prefill): ONE wide GEMM over the concatenated weight — the separate
+                // q/k/v GEMMs are narrow-n and underfill the GPU — then split rows into q/k/v.
+                let stride = (qrow + 2 * kvrow) as u32;
                 g.push(Op::Linear {
                     x: hn,
-                    weight: lw.wk,
-                    dst: k,
+                    weight: lw.wq,
+                    dst: qkv,
                     m: batch as u32,
                     in_f: ne as u32,
-                    out_f: kvrow as u32,
+                    out_f: stride,
+                    w_off: 0,
                 });
-                // V projection, or (gemma4 full layers) V = the raw K projection, copied BEFORE K is
-                // QK-normed + RoPE'd.
-                match lw.wv {
-                    Some(wv) => g.push(Op::Linear {
+                for (dst, off, n) in [
+                    (q, 0u32, qrow as u32),
+                    (k, qrow as u32, kvrow as u32),
+                    (v, (qrow + kvrow) as u32, kvrow as u32),
+                ] {
+                    g.push(Op::CopyStrided {
+                        src: qkv,
+                        src_off: off,
+                        src_stride: stride,
+                        dst,
+                        dst_off: 0,
+                        dst_stride: n,
+                        rows: batch as u32,
+                        n,
+                    });
+                }
+            } else if fuse_qkv {
+                // Fused QKV (decode): three offset GEMVs into the concatenated weight — the same
+                // dispatch count as the split form, no staging copies.
+                for (dst, off, n) in [
+                    (q, 0usize, qrow),
+                    (k, qrow * ne, kvrow),
+                    (v, (qrow + kvrow) * ne, kvrow),
+                ] {
+                    g.push(Op::Linear {
                         x: hn,
-                        weight: wv,
-                        dst: v,
+                        weight: lw.wq,
+                        dst,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: n as u32,
+                        w_off: off as u32,
+                    });
+                }
+            } else {
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: lw.wq,
+                    dst: q,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: qrow as u32,
+                    w_off: 0,
+                });
+            }
+            if own_kv {
+                if !fuse_qkv {
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: lw.wk,
+                        dst: k,
                         m: batch as u32,
                         in_f: ne as u32,
                         out_f: kvrow as u32,
-                    }),
-                    None => g.push(Op::Copy {
-                        src: k,
-                        src_off: 0,
-                        dst: v,
-                        dst_off: 0,
-                        n: (batch * kvrow) as u32,
-                    }),
+                        w_off: 0,
+                    });
+                    // V projection, or (gemma4 full layers) V = the raw K projection, copied BEFORE
+                    // K is QK-normed + RoPE'd.
+                    match lw.wv {
+                        Some(wv) => g.push(Op::Linear {
+                            x: hn,
+                            weight: wv,
+                            dst: v,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: kvrow as u32,
+                            w_off: 0,
+                        }),
+                        None => g.push(Op::Copy {
+                            src: k,
+                            src_off: 0,
+                            dst: v,
+                            dst_off: 0,
+                            n: (batch * kvrow) as u32,
+                        }),
+                    }
                 }
                 // gemma4 weightless per-head RMSNorm on V (= x/rms) before caching. Emitted BEFORE
                 // the K QkNormRope so that op stays ADJACENT to its WriteKv — the Vulkan adapter's
@@ -1203,6 +1303,7 @@ pub(crate) fn generate_dense_backend(
                 m: batch as u32,
                 in_f: qrow as u32,
                 out_f: ne as u32,
+                w_off: 0,
             });
             // gemma sandwich: post-attention norm on the sublayer output BEFORE the residual add.
             if let Some(pa) = lw.post_attn {
@@ -1239,6 +1340,7 @@ pub(crate) fn generate_dense_backend(
                         m: batch as u32,
                         in_f: ne as u32,
                         out_f: (2 * nff_l) as u32,
+                        w_off: 0,
                     });
                     g.push(Op::GatedActFused {
                         gu: gubuf,
@@ -1254,6 +1356,7 @@ pub(crate) fn generate_dense_backend(
                         m: batch as u32,
                         in_f: nff_l as u32,
                         out_f: ne as u32,
+                        w_off: 0,
                     });
                 }
                 FfnW::Dense { wgate, wup, wdown } => {
@@ -1264,6 +1367,7 @@ pub(crate) fn generate_dense_backend(
                         m: batch as u32,
                         in_f: ne as u32,
                         out_f: nff_l as u32,
+                        w_off: 0,
                     });
                     g.push(Op::Linear {
                         x: hn,
@@ -1272,6 +1376,7 @@ pub(crate) fn generate_dense_backend(
                         m: batch as u32,
                         in_f: ne as u32,
                         out_f: nff_l as u32,
+                        w_off: 0,
                     });
                     g.push(Op::GatedAct {
                         gate: gbuf,
@@ -1289,6 +1394,7 @@ pub(crate) fn generate_dense_backend(
                         m: batch as u32,
                         in_f: nff_l as u32,
                         out_f: ne as u32,
+                        w_off: 0,
                     });
                 }
                 FfnW::Moe {
@@ -1343,6 +1449,7 @@ pub(crate) fn generate_dense_backend(
                     m: batch as u32,
                     in_f: ne as u32,
                     out_f: npl as u32,
+                    w_off: 0,
                 });
                 // gelu(plg) * ipl[r, l*npl .. l*npl+npl] — gather each row's layer-l slice of the
                 // [batch, n_layer*npl] input into a contiguous [batch, npl] scratch (one strided-
@@ -1375,6 +1482,7 @@ pub(crate) fn generate_dense_backend(
                     m: batch as u32,
                     in_f: npl as u32,
                     out_f: ne as u32,
+                    w_off: 0,
                 });
                 g.push(Op::RmsNorm {
                     x: plp,
@@ -1432,6 +1540,7 @@ pub(crate) fn generate_dense_backend(
             m: 1,
             in_f: ne as u32,
             out_f: c.vocab as u32,
+            w_off: 0,
         });
         if c.final_softcap > 0.0 {
             g.push(Op::Softcap {

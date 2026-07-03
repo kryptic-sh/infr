@@ -266,6 +266,37 @@ fn main() {
         ("native_gemm_warp", "native_gemm_warp_q4k", &["-DFMT_Q4K"]),
         ("native_gemm_warp", "native_gemm_warp_q6k", &["-DFMT_Q6K"]),
         ("native_gemm_warp", "native_gemm_warp_q8_0", &["-DFMT_Q8_0"]),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128",
+            &["-DFMT_Q4K", "-DNARROW_N"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_n128",
+            &["-DFMT_Q6K", "-DNARROW_N"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_n128",
+            &["-DFMT_Q8_0", "-DNARROW_N"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_sk",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DSPLIT_K"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_sk",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DSPLIT_K"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_sk",
+            &["-DFMT_Q8_0", "-DNARROW_N", "-DSPLIT_K"],
+        ),
+        ("splitk_reduce", "splitk_reduce", &[]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_q4_0", &["-DFMT_Q4_0"]),
         ("native_gemm", "native_gemm_q4_1", &["-DFMT_Q4_1"]),

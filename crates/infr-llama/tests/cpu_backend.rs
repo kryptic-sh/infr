@@ -206,6 +206,33 @@ fn cpu_no_garbage_on_repeated_forward() {
     assert_eq!(g1, g2, "repeated CPU forward diverged");
 }
 
+/// KV-cache Q8_0 quantization (CPU reference): the KV cache stores Q8_0 blocks (34 B / 32 elems)
+/// INDEPENDENTLY for K and V (`INFR_KV_TYPE_K` / `INFR_KV_TYPE_V` ∈ {f16, q8_0}). Q8 KV shifts the
+/// numerics, so it won't match the f16 golden hash — but a correct per-block quantize/dequant must
+/// still yield coherent (non-degenerate) greedy output on a long prompt whose decode reads a deep
+/// cache. Exercises all three quantized combos (q8/q8, q8/f16, f16/q8) to prove K and V decouple.
+#[test]
+fn cpu_kv_q8_coherent() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let prompt = repeat_prompt();
+    // f16 baseline, then each K/V quant mix. Load once per env (the KV dtype is read at graph build).
+    for (k, v) in [("q8_0", "q8_0"), ("q8_0", "f16"), ("f16", "q8_0")] {
+        std::env::set_var("INFR_KV_TYPE_K", k);
+        std::env::set_var("INFR_KV_TYPE_V", v);
+        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let out = cpu_gen(&model, &prompt, 24);
+        assert!(
+            !is_degenerate(&out),
+            "KV K={k} V={v} degenerate: {:?}",
+            out.chars().take(48).collect::<String>()
+        );
+    }
+    std::env::remove_var("INFR_KV_TYPE_K");
+    std::env::remove_var("INFR_KV_TYPE_V");
+}
+
 // Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
 // `Graph` the CPU oracle builds, mapped op-for-op to GPU kernels). Should reproduce the production
 // GPU path (QWEN3_GPU_GOLDEN) — the France case shares its hash (0xfd63781ea3bfa785), confirming the

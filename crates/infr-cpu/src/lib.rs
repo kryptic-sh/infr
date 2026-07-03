@@ -2785,29 +2785,22 @@ impl Backend for CpuBackend {
                     let vbuf = bindings.get(v_cache).expect("cpu backend: unbound v_cache");
                     let kguard = cpu_buf(kbuf).read();
                     let vguard = cpu_buf(vbuf).read();
-                    // Materialize the valid KV prefix (`kv_len` rows) as f32, dequantizing an f16
-                    // cache (matches the GPU's f16 KV) — the inner dot then runs in f32 either way.
+                    // Materialize the valid KV prefix (`kv_len` rows) as f32. K and V pick their
+                    // cache dtype INDEPENDENTLY (f16 matches the GPU's f16 KV; Q8_0 blocks dequant
+                    // via y = d*q) — the inner dot then runs in f32 either way.
                     let need = kv_len * nkv * hd;
-                    let (ks, vs): (Vec<f32>, Vec<f32>) = match g.desc(k_cache).dtype {
-                        DType::F16 => {
-                            let f = |b: &[u8]| -> Vec<f32> {
-                                bytemuck::cast_slice::<u8, u16>(b)[..need]
-                                    .iter()
-                                    .map(|&x| half::f16::from_bits(x).to_f32())
-                                    .collect()
-                            };
-                            (f(&kguard), f(&vguard))
+                    let deq = |b: &[u8], dt: DType| -> Vec<f32> {
+                        match dt {
+                            DType::F16 => bytemuck::cast_slice::<u8, u16>(b)[..need]
+                                .iter()
+                                .map(|&x| half::f16::from_bits(x).to_f32())
+                                .collect(),
+                            DType::Q8_0 => crate::dequant_prefix_q8_0(b, need),
+                            _ => bytemuck::cast_slice::<u8, f32>(b)[..need].to_vec(),
                         }
-                        DType::Q8_0 => {
-                            // Dequant the valid prefix's Q8_0 blocks (y = d * q).
-                            let f = |b: &[u8]| -> Vec<f32> { crate::dequant_prefix_q8_0(b, need) };
-                            (f(&kguard), f(&vguard))
-                        }
-                        _ => (
-                            bytemuck::cast_slice::<u8, f32>(&kguard)[..need].to_vec(),
-                            bytemuck::cast_slice::<u8, f32>(&vguard)[..need].to_vec(),
-                        ),
                     };
+                    let ks = deq(&kguard, g.desc(k_cache).dtype);
+                    let vs = deq(&vguard, g.desc(v_cache).dtype);
                     let group = nh / nkv;
                     let window = match mask {
                         AttnMask::Causal => 0usize,

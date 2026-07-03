@@ -360,12 +360,27 @@ type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buf
 /// prefills only the token suffix that differs from `cached` (the common-prefix diff), so a
 /// growing conversation stops re-prefilling its whole history. Pass a fresh `None` for the old
 /// one-shot behavior.
+/// Byte size of `elems` KV-cache elements stored as `dt`. Q8_0 = 34 bytes / 32-elem block
+/// (a 2-byte f16 scale + 32 int8), F16 = 2 bytes, else raw f32. K and V pick their dtype
+/// independently, so this is called per-side.
+pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
+    match dt {
+        DType::Q8_0 => elems / 32 * 34,
+        DType::F16 => elems * 2,
+        _ => elems * 4,
+    }
+}
+
 pub(crate) struct SeamKv {
     /// The uploaded weights, SHARED across slots (Arc): forking a new conversation slot costs
     /// only its KV + IO buffers, never a re-upload.
     weights: std::sync::Arc<SeamWeights>,
     kbufs: Vec<Box<dyn Buffer>>,
     vbufs: Vec<Box<dyn Buffer>>,
+    /// KV cache element dtypes, chosen per-side (K and V independent). Fork/seed reuse them so a
+    /// forked slot sizes + copies its buffers to match this slot's layout.
+    k_fmt: DType,
+    v_fmt: DType,
     hidden_buf: Box<dyn Buffer>,
     pos_buf: Box<dyn Buffer>,
     ipl_buf: Option<Box<dyn Buffer>>,
@@ -419,18 +434,26 @@ impl SeamKv {
         for l in 0..cfg.n_layer {
             let kvrow_l = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
             kbufs.push(
-                be.alloc(self.max_ctx * kvrow_l * 2, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(
+                    kv_fmt_bytes(self.k_fmt, self.max_ctx * kvrow_l),
+                    BufferUsage::Activations,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
-                be.alloc(self.max_ctx * kvrow_l * 2, BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(
+                    kv_fmt_bytes(self.v_fmt, self.max_ctx * kvrow_l),
+                    BufferUsage::Activations,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
             );
         }
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
             kbufs,
             vbufs,
+            k_fmt: self.k_fmt,
+            v_fmt: self.v_fmt,
             hidden_buf: be
                 .alloc(cfg.n_embd * 4, BufferUsage::Staging)
                 .map_err(|e| anyhow!("{e}"))?,
@@ -468,11 +491,19 @@ impl SeamKv {
             return Ok(());
         }
         for l in 0..cfg.n_layer {
-            let bytes = p * cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2;
-            be.copy_buffer(src.kbufs[l].as_ref(), self.kbufs[l].as_ref(), bytes)
-                .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(src.vbufs[l].as_ref(), self.vbufs[l].as_ref(), bytes)
-                .map_err(|e| anyhow!("{e}"))?;
+            let elems = p * cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
+            be.copy_buffer(
+                src.kbufs[l].as_ref(),
+                self.kbufs[l].as_ref(),
+                kv_fmt_bytes(self.k_fmt, elems),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            be.copy_buffer(
+                src.vbufs[l].as_ref(),
+                self.vbufs[l].as_ref(),
+                kv_fmt_bytes(self.v_fmt, elems),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
         }
         self.cached = src.cached[..p].to_vec();
         Ok(())
@@ -618,13 +649,31 @@ pub(crate) fn generate_dense_backend(
                 && c.has_own_kv(l)
         });
 
-    // INFR_KV_Q8=1 stores the KV cache as Q8_0 blocks (34 bytes / 32 elems — half the f16
-    // footprint and bandwidth); the CPU reference and the Metal backend read/write it, other
-    // backends keep f16. The graph decl carries the dtype either way, and the env is stable for
-    // the process, so a warm session and its rebuilt graphs always agree.
-    let kv_q8 = std::env::var("INFR_KV_Q8").is_ok()
-        && matches!(be.name(), "metal" | "cpu")
-        && (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
+    // KV cache dtype, chosen PER-SIDE (K and V independent, like llama's --cache-type-k /
+    // --cache-type-v). Q8_0 stores 34 bytes / 32 elems — half the f16 footprint and bandwidth.
+    //   INFR_KV_TYPE_K / INFR_KV_TYPE_V ∈ {f16, q8_0}  (per-side override)
+    //   INFR_KV_Q8=1                                    legacy alias: any side not otherwise set → q8_0
+    // Q8_0 needs each layer's KV row (n_kv*head_dim) to be a whole number of 32-elem blocks, and a
+    // backend that implements the Q8 KV read/write. The graph decl carries the dtype either way,
+    // and the env is stable for the process, so a warm session and its rebuilt graphs always agree.
+    let kv_align_ok =
+        (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
+    let kv_q8_backend = matches!(be.name(), "metal" | "cpu");
+    let parse_kv_fmt = |var: &str| -> DType {
+        let side = std::env::var(var).ok();
+        let want_q8 = match side.as_deref() {
+            Some("q8_0") | Some("q8") | Some("Q8_0") => true,
+            Some("f16") | Some("F16") => false,
+            _ => std::env::var("INFR_KV_Q8").is_ok(), // unset/unknown → legacy alias
+        };
+        if want_q8 && kv_align_ok && kv_q8_backend {
+            DType::Q8_0
+        } else {
+            DType::F16
+        }
+    };
+    let k_fmt = parse_kv_fmt("INFR_KV_TYPE_K");
+    let v_fmt = parse_kv_fmt("INFR_KV_TYPE_V");
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {
@@ -761,25 +810,25 @@ pub(crate) fn generate_dense_backend(
             wspecs.push((DType::F32, max_hd));
         }
 
-        // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) ───────
-        let kv_bytes = |elems: usize| {
-            if kv_q8 {
-                elems / 32 * 34
-            } else {
-                elems * 2
-            }
-        };
+        // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
+        //    per-side (K and V pick their dtype independently) ────────────────────────────────
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..c.n_layer {
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
             kbufs.push(
-                be.alloc(kv_bytes(want_ctx * kvrow_l), BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(
+                    kv_fmt_bytes(k_fmt, want_ctx * kvrow_l),
+                    BufferUsage::Activations,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
             );
             vbufs.push(
-                be.alloc(kv_bytes(want_ctx * kvrow_l), BufferUsage::Activations)
-                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(
+                    kv_fmt_bytes(v_fmt, want_ctx * kvrow_l),
+                    BufferUsage::Activations,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
             );
         }
 
@@ -821,6 +870,8 @@ pub(crate) fn generate_dense_backend(
             }),
             kbufs,
             vbufs,
+            k_fmt,
+            v_fmt,
             hidden_buf,
             pos_buf,
             ipl_buf,
@@ -833,6 +884,8 @@ pub(crate) fn generate_dense_backend(
         weights,
         kbufs,
         vbufs,
+        k_fmt: _,
+        v_fmt: _,
         hidden_buf,
         pos_buf,
         ipl_buf,
@@ -866,12 +919,13 @@ pub(crate) fn generate_dense_backend(
     let build = |batch: usize, start_pos: usize| -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
-        // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity);
-        // Q8_0 when the runner enabled it (see `kv_q8` at the cache alloc). ONLY the persistent
-        // caches take this dtype — the roped q16/k16 staging stays f16 (`qk_norm_rope`/`rope_f16`
-        // write f16; a Q8_0 decl there would lie to any backend that trusts it, and the Vulkan
-        // kv-write peephole fuses on the f16 decl).
-        let kvd = |n: usize| TensorDesc::new(vec![n], if kv_q8 { DType::Q8_0 } else { DType::F16 });
+        // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity); Q8_0
+        // per-side when the runner enabled it (see `k_fmt`/`v_fmt` at the cache alloc). ONLY the
+        // persistent caches take this dtype — the roped q16/k16 staging stays f16
+        // (`qk_norm_rope`/`rope_f16` write f16; a Q8_0 decl there would lie to any backend that
+        // trusts it, and the Vulkan kv-write peephole fuses on the f16 decl).
+        let kd = |n: usize| TensorDesc::new(vec![n], k_fmt);
+        let vd = |n: usize| TensorDesc::new(vec![n], v_fmt);
         let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
         let hidden = g.input(f32d(batch * ne));
         let positions = g.input(TensorDesc::new(vec![batch], DType::I32));
@@ -889,8 +943,8 @@ pub(crate) fn generate_dense_backend(
         let mut v_cache = Vec::new();
         for l in 0..c.n_layer {
             let kvrow_l = c.layer_n_kv(l) * c.layer_head_dim(l);
-            k_cache.push(g.input(kvd(max_ctx * kvrow_l)));
-            v_cache.push(g.input(kvd(max_ctx * kvrow_l)));
+            k_cache.push(g.input(kd(max_ctx * kvrow_l)));
+            v_cache.push(g.input(vd(max_ctx * kvrow_l)));
         }
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from

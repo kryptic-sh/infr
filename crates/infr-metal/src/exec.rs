@@ -8,10 +8,12 @@ use infr_core::graph::{Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_core::Result;
 use infr_gguf::dequant::dequant_block;
+use metal::foreign_types::ForeignType;
 use metal::{
     Buffer as MtlBuffer, CommandBuffer, ComputeCommandEncoder, ComputePipelineState,
     MTLResourceOptions, MTLSize,
 };
+use objc::{msg_send, sel, sel_impl};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -118,6 +120,10 @@ pub(crate) struct TapeEntry {
     /// Per-buffer byte offset for `set_buffer` (parallel to `bufs`; all zero except the
     /// fused-QKV weight slices — see the Linear arm's `w_off`).
     offs: Vec<u64>,
+    /// Bitmask over `bufs`: which buffers this dispatch WRITES. Replay runs a CONCURRENT
+    /// encoder and derives the exact barrier placement from these (see `replay_tape`); sites
+    /// that don't annotate record `u32::MAX` — treated as writing everything, i.e. serialized.
+    wmask: u32,
     params: Vec<u8>,
     threads: usize,
     tg: usize,
@@ -353,6 +359,19 @@ impl MetalBackend {
         self.encode_tg(r, pso, bufs, params, threads, 0);
     }
 
+    /// `encode` with a write mask — see `encode_tg_w`.
+    fn encode_w(
+        &self,
+        r: &mut Resident,
+        pso: &ComputePipelineState,
+        bufs: &[&MtlBuffer],
+        wmask: u32,
+        params: &[u8],
+        threads: usize,
+    ) {
+        self.encode_tg_w(r, pso, bufs, wmask, params, threads, 0);
+    }
+
     /// As `encode`, but with an explicit threadgroup width (`tg`; 0 = auto). The simdgroup-GEMV
     /// kernels pass 32 (one simdgroup per threadgroup) so a matvec launches `out_f` threadgroups
     /// instead of a handful of wide ones — far more threadgroups for the GPU's cores to interleave,
@@ -366,17 +385,35 @@ impl MetalBackend {
         threads: usize,
         tg: usize,
     ) {
-        let with_offs: Vec<(&MtlBuffer, u64)> = bufs.iter().map(|b| (*b, 0)).collect();
-        self.encode_tg_off(r, pso, &with_offs, params, threads, tg);
+        // No write annotation: recorded as writes-everything, so replay serializes around it.
+        self.encode_tg_w(r, pso, bufs, u32::MAX, params, threads, tg);
     }
 
-    /// As `encode_tg`, but each buffer binds at a byte offset — the fused-QKV Linear slices
+    /// `encode_tg` with an explicit WRITE mask (bit i = `bufs[i]` is written by the dispatch).
+    /// The mask only matters on the decode replay tape, where it drives exact barrier placement
+    /// under the concurrent encoder — un-annotated dispatches replay serialized.
+    fn encode_tg_w(
+        &self,
+        r: &mut Resident,
+        pso: &ComputePipelineState,
+        bufs: &[&MtlBuffer],
+        wmask: u32,
+        params: &[u8],
+        threads: usize,
+        tg: usize,
+    ) {
+        let with_offs: Vec<(&MtlBuffer, u64)> = bufs.iter().map(|b| (*b, 0)).collect();
+        self.encode_tg_off(r, pso, &with_offs, wmask, params, threads, tg);
+    }
+
+    /// As `encode_tg_w`, but each buffer binds at a byte offset — the fused-QKV Linear slices
     /// bind the shared concatenated weight at each projection's row offset (`Op::Linear.w_off`).
     fn encode_tg_off(
         &self,
         r: &mut Resident,
         pso: &ComputePipelineState,
         bufs: &[(&MtlBuffer, u64)],
+        wmask: u32,
         params: &[u8],
         threads: usize,
         tg: usize,
@@ -410,6 +447,7 @@ impl MetalBackend {
                 pso: pso.clone(),
                 bufs: bufs.iter().map(|(b, _)| (*b).clone()).collect(),
                 offs: bufs.iter().map(|(_, off)| *off).collect(),
+                wmask,
                 params: params.to_vec(),
                 threads,
                 tg,
@@ -423,8 +461,41 @@ impl MetalBackend {
     fn replay_tape(&self, tape: &Tape) {
         objc::rc::autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
+            // CONCURRENT dispatch: with the serial type every dispatch implicitly orders after
+            // the previous one, which costs ~1 µs of pipeline drain per dispatch on runs of
+            // INDEPENDENT work (decode's q/k/v GEMVs, the two KV writes). Ordering here comes
+            // from explicit barriers, placed exactly where the recorded write masks show a
+            // hazard: this dispatch reads or writes a buffer someone wrote since the last
+            // barrier (RAW/WAW), or writes one someone read (WAR). Un-annotated entries
+            // (wmask = MAX) count every buffer as written — serialized, never under-fenced.
+            let enc =
+                cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+            let mut written: Vec<*const c_void> = Vec::with_capacity(8);
+            let mut read: Vec<*const c_void> = Vec::with_capacity(24);
             for e in &tape.entries {
+                let is_w = |i: usize| e.wmask & (1u32 << i.min(31)) != 0;
+                let hazard = e.bufs.iter().enumerate().any(|(i, b)| {
+                    let p = b.as_ptr() as *const c_void;
+                    written.contains(&p) || (is_w(i) && read.contains(&p))
+                });
+                if hazard {
+                    // All-buffers scope barrier: prior dispatches' buffer accesses complete
+                    // before anything encoded after. (metal-rs has no wrapper for the scope
+                    // variant; MTLBarrierScopeBuffers = 1.)
+                    unsafe {
+                        let () = msg_send![enc, memoryBarrierWithScope: 1u64];
+                    }
+                    written.clear();
+                    read.clear();
+                }
+                for (i, b) in e.bufs.iter().enumerate() {
+                    let p = b.as_ptr() as *const c_void;
+                    if is_w(i) {
+                        written.push(p);
+                    } else {
+                        read.push(p);
+                    }
+                }
                 enc.set_compute_pipeline_state(&e.pso);
                 for (i, b) in e.bufs.iter().enumerate() {
                     enc.set_buffer(i as u64, Some(b), e.offs[i]);
@@ -915,10 +986,11 @@ impl MetalBackend {
                 p.extend_from_slice(&(dim as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
                 // One simdgroup (32 lanes) per row — see `rmsnorm_f32`.
-                self.encode_tg(
+                self.encode_tg_w(
                     r,
                     &pso,
                     &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
+                    1 << 2,
                     &p,
                     rows * 32,
                     32,
@@ -1056,6 +1128,7 @@ impl MetalBackend {
                                 (&qw.dd, dd_off),
                                 (bd.as_ref(), 0),
                             ],
+                            1 << 4,
                             &p,
                             m.div_ceil(32) * (out_f / 64) * 128,
                             128,
@@ -1069,7 +1142,14 @@ impl MetalBackend {
                         ));
                         let cast = self.pipelines.get("cast_f32_f16")?;
                         let n = (m * in_f) as u32;
-                        self.encode(r, &cast, &[bx.as_ref(), &xh], &n.to_ne_bytes(), m * in_f);
+                        self.encode_w(
+                            r,
+                            &cast,
+                            &[bx.as_ref(), &xh],
+                            1 << 1,
+                            &n.to_ne_bytes(),
+                            m * in_f,
+                        );
                         let pso = self.pipelines.get(hmm_kern)?;
                         self.encode_tg_off(
                             r,
@@ -1081,6 +1161,7 @@ impl MetalBackend {
                                 (&qw.dd, dd_off),
                                 (bd.as_ref(), 0),
                             ],
+                            1 << 4,
                             &p,
                             m.div_ceil(32) * (out_f / 16) * 32,
                             128,
@@ -1128,6 +1209,7 @@ impl MetalBackend {
                                     (bfd.as_ref(), 0),
                                     (bres.as_ref(), 0),
                                 ],
+                                1 << 4,
                                 &p,
                                 sgs * 32,
                                 32,
@@ -1146,6 +1228,7 @@ impl MetalBackend {
                                 (&qw.dd, dd_off),
                                 (bd.as_ref(), 0),
                             ],
+                            1 << 4,
                             &p,
                             sgs * 32,
                             32,
@@ -1163,6 +1246,7 @@ impl MetalBackend {
                             (bw.as_ref(), w_off as u64 * 4),
                             (bd.as_ref(), 0),
                         ],
+                        1 << 2,
                         &p,
                         m * out_f * 32,
                         32,
@@ -1247,7 +1331,7 @@ impl MetalBackend {
                 p.extend_from_slice(&eps.to_ne_bytes());
                 p.extend_from_slice(&(freq_factors.is_some() as u32).to_ne_bytes());
                 // One simdgroup per (row, head) — see `qknormrope_f32`.
-                self.encode_tg(
+                self.encode_tg_w(
                     r,
                     &pso,
                     &[
@@ -1257,6 +1341,7 @@ impl MetalBackend {
                         bff.as_ref(),
                         bd.as_ref(),
                     ],
+                    1 << 4,
                     &p,
                     rows * nh * 32,
                     32,
@@ -1269,10 +1354,11 @@ impl MetalBackend {
                 let bb = self.ensure_device(r, b);
                 let bd = self.dev_dst(r, dst, n);
                 let pso = self.pipelines.get("add_f32")?;
-                self.encode(
+                self.encode_w(
                     r,
                     &pso,
                     &[ba.as_ref(), bb.as_ref(), bd.as_ref()],
+                    1 << 2,
                     &(n as u32).to_ne_bytes(),
                     n,
                 );
@@ -1321,10 +1407,11 @@ impl MetalBackend {
                 p.extend_from_slice(&(nff as u32).to_ne_bytes());
                 p.extend_from_slice(&act_code.to_ne_bytes());
                 p.extend_from_slice(&up_off.to_ne_bytes());
-                self.encode(
+                self.encode_w(
                     r,
                     &pso,
                     &[bg.as_ref(), bu.as_ref(), bd.as_ref()],
+                    1 << 2,
                     &p,
                     rows * nff,
                 );
@@ -1352,7 +1439,7 @@ impl MetalBackend {
                 p.extend_from_slice(&(nff as u32).to_ne_bytes());
                 p.extend_from_slice(&act_code.to_ne_bytes());
                 p.extend_from_slice(&0u32.to_ne_bytes()); // pad to GatedParams
-                self.encode(r, &pso, &[bg.as_ref(), bd.as_ref()], &p, rows * nff);
+                self.encode_w(r, &pso, &[bg.as_ref(), bd.as_ref()], 1 << 1, &p, rows * nff);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::WriteKv {
@@ -1389,7 +1476,14 @@ impl MetalBackend {
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(rs as u32).to_ne_bytes());
                     let threads = if q8 { n / 32 } else { n };
-                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw, &posbuf], &p, threads);
+                    self.encode_w(
+                        r,
+                        &pso,
+                        &[bsrc.as_ref(), &cbuf.raw, &posbuf],
+                        1 << 1,
+                        &p,
+                        threads,
+                    );
                 } else {
                     let kern = match g.desc(cache).dtype {
                         DType::Q8_0 => "writekv_q8",
@@ -1400,7 +1494,7 @@ impl MetalBackend {
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(base as u32).to_ne_bytes());
                     let threads = if q8 { n / 32 } else { n };
-                    self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, threads);
+                    self.encode_w(r, &pso, &[bsrc.as_ref(), &cbuf.raw], 1 << 1, &p, threads);
                 }
             }
             Op::Attention {
@@ -1471,10 +1565,11 @@ impl MetalBackend {
                     p.extend_from_slice(&scale.to_ne_bytes());
                     p.extend_from_slice(&window.to_ne_bytes());
                     p.extend_from_slice(&pos.to_ne_bytes());
-                    self.encode_tg(
+                    self.encode_tg_w(
                         r,
                         &pso,
                         &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref(), &posbuf],
+                        1 << 3,
                         &p,
                         rows * nh * nsg * 32,
                         nsg * 32,

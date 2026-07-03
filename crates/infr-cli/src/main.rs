@@ -117,7 +117,17 @@ enum Cmd {
     /// Compare infr vs llama.cpp on coding-agent-shaped workloads (long context, replies at depth,
     /// whole turns). Shells out to `infr bench` and `llama-bench` with matching flags, same model+GPU.
     Compare {
-        model: String,
+        /// Model(s): one for the deep coding-agent scenarios, several with --sweep.
+        #[arg(num_args = 1.., required = true)]
+        models: Vec<String>,
+        /// Survey mode: for EVERY model given, measure pp512 / tg128 / tg@depth on both tools and
+        /// print a gap matrix + the worst ratios — the recurring "where are we behind llama.cpp"
+        /// sweep. Without it, the single model gets the deep coding-agent scenarios below.
+        #[arg(long)]
+        sweep: bool,
+        /// Decode depth for the sweep's at-depth metric.
+        #[arg(long, default_value_t = 4096)]
+        sweep_depth: usize,
         /// GPU device for both tools (matches llama-bench --dev; override if device order differs).
         #[arg(long, default_value = "Vulkan0")]
         dev: String,
@@ -198,7 +208,9 @@ fn main() -> anyhow::Result<()> {
             &model, n_prompt, n_gen, depth, pg, ubatch, reps, ngl, threads, &dev, json,
         ),
         Cmd::Compare {
-            model,
+            models,
+            sweep,
+            sweep_depth,
             dev,
             ngl,
             threads,
@@ -208,18 +220,39 @@ fn main() -> anyhow::Result<()> {
             gen,
             turns,
             llama_bench,
-        } => cmd_compare(
-            &model,
-            &dev,
-            ngl,
-            threads,
-            reps,
-            ubatch,
-            &ctx,
-            gen,
-            &turns,
-            &llama_bench,
-        ),
+        } => {
+            if sweep {
+                cmd_compare_sweep(
+                    &models,
+                    sweep_depth,
+                    &dev,
+                    ngl,
+                    threads,
+                    reps,
+                    ubatch,
+                    &llama_bench,
+                )
+            } else {
+                if models.len() > 1 {
+                    anyhow::bail!(
+                        "compare without --sweep takes ONE model (got {}); pass --sweep for the                          multi-model survey",
+                        models.len()
+                    );
+                }
+                cmd_compare(
+                    &models[0],
+                    &dev,
+                    ngl,
+                    threads,
+                    reps,
+                    ubatch,
+                    &ctx,
+                    gen,
+                    &turns,
+                    &llama_bench,
+                )
+            }
+        }
     }
 }
 
@@ -914,6 +947,211 @@ fn cmd_bench_qwen35(
     Ok(())
 }
 
+/// The recurring "where are we behind llama.cpp" survey: for EVERY model given, measure
+/// pp512 (prefill), tg128 (decode) and tg64 at `--sweep-depth` on both tools, print the matrix
+/// as it fills (a sweep is long — partial results beat silence), and finish with the ratios
+/// ranked worst-first so the next perf target is the top of the list.
+#[allow(clippy::too_many_arguments)]
+fn cmd_compare_sweep(
+    models: &[String],
+    depth: usize,
+    dev: &str,
+    ngl: usize,
+    threads: usize,
+    reps: usize,
+    ubatch: usize,
+    llama_bench: &str,
+) -> anyhow::Result<()> {
+    const METRICS: [&str; 3] = ["pp512", "tg128", "tg64@d"];
+    println!(
+        "\n{:<22} {:<10} | {:>9} | {:>9} | {:>10}",
+        "model", "metric", "infr", "llama.cpp", "infr/llama"
+    );
+    println!("{:-<23}{:-<11}+{:-<11}+{:-<11}+{:-<12}", "", "", "", "", "");
+    // (model, metric, infr, llama, ratio) for the ranked summary.
+    let mut rows: Vec<(String, String, f64, f64)> = Vec::new();
+    for model in models {
+        let short = model.rsplit('/').next().unwrap_or(model);
+        let mb = match ModelBench::new(model, dev, ngl, threads, reps, ubatch, llama_bench) {
+            Ok(mb) => mb,
+            Err(e) => {
+                println!("{short:<22} {:<10} | resolve failed: {e}", "-");
+                continue;
+            }
+        };
+        let ds = depth.to_string();
+        let runs: [(&str, Vec<&str>, (usize, usize)); 3] = [
+            ("pp512", vec!["-p", "512", "-n", "0"], (512, 0)),
+            ("tg128", vec!["-p", "0", "-n", "128"], (0, 128)),
+            (METRICS[2], vec!["-p", "0", "-n", "64", "-d", &ds], (0, 64)),
+        ];
+        for (metric, args, (np, ng)) in runs {
+            let metric_label = if metric == "tg64@d" {
+                format!("tg64@d{depth}")
+            } else {
+                metric.to_string()
+            };
+            let iv = mb.infr(&args);
+            let lv = if metric == "tg64@d" {
+                mb.llama(np, ng, &["-p", "0", "-n", "64", "-d", &ds])
+            } else {
+                mb.llama(np, ng, &args)
+            };
+            let is = iv
+                .as_ref()
+                .map(|v| format!("{v:.0}"))
+                .unwrap_or_else(|_| "ERR".into());
+            let ls = lv.map(|v| format!("{v:.0}")).unwrap_or_else(|| "NA".into());
+            let ratio = match (iv.as_ref().ok(), lv) {
+                (Some(&i), Some(l)) if l > 0.0 => {
+                    rows.push((short.to_string(), metric_label.clone(), i, l));
+                    format!("{:.2}x", i / l)
+                }
+                _ => "-".into(),
+            };
+            println!("{short:<22} {metric_label:<10} | {is:>9} | {ls:>9} | {ratio:>10}");
+        }
+    }
+    // Worst-first: the top of this list is the next perf target.
+    rows.sort_by(|a, b| (a.2 / a.3).partial_cmp(&(b.2 / b.3)).unwrap());
+    println!("\nBIGGEST GAPS (infr/llama, worst first):");
+    for (m, metric, i, l) in rows.iter().take(10) {
+        println!("  {:>5.2}x  {m:<22} {metric:<10} ({i:.0} vs {l:.0})", i / l);
+    }
+    Ok(())
+}
+
+/// One model's infr-vs-llama.cpp bench harness: resolves the shared model ref once and shells
+/// out to `infr bench --json` / `llama-bench -o json` with MATCHED flags. Both the deep
+/// coding-agent scenarios (`cmd_compare`) and the multi-model survey (`cmd_compare_sweep`) run
+/// through this, so the two tools are always measured identically.
+struct ModelBench {
+    exe: PathBuf,
+    model: String,
+    llama_model_args: Vec<String>,
+    llama_bench: String,
+    dev: String,
+    ngl: usize,
+    threads: usize,
+    reps: usize,
+    ubatch: usize,
+}
+
+impl ModelBench {
+    fn new(
+        model: &str,
+        dev: &str,
+        ngl: usize,
+        threads: usize,
+        reps: usize,
+        ubatch: usize,
+        llama_bench: &str,
+    ) -> anyhow::Result<Self> {
+        let exe = std::env::current_exe().context("locating the infr binary")?;
+        // infr and llama.cpp share the HF Hub cache and the same `org/repo:quant` ref grammar, so
+        // hand BOTH tools the same reference: `infr bench` takes `model` verbatim, and llama-bench
+        // gets the matching `-hf`/`--hf-file` (or `-m` for a local path). Pull once up front so
+        // `--offline` holds.
+        let resolved = resolve(model)?.0;
+        let llama_model_args: Vec<String> = match infr_hub::ModelRef::parse(model)? {
+            infr_hub::ModelRef::Repo { repo, sel } => {
+                let mut a = vec!["--offline".to_string()];
+                match sel {
+                    None => a.extend(["-hf".into(), repo]),
+                    Some(s) if s.to_lowercase().ends_with(".gguf") => {
+                        a.extend(["--hf-repo".into(), repo, "--hf-file".into(), s])
+                    }
+                    Some(s) => a.extend(["-hf".into(), format!("{repo}:{s}")]),
+                }
+                a
+            }
+            infr_hub::ModelRef::Path(_) => {
+                vec!["-m".to_string(), resolved.to_string_lossy().into_owned()]
+            }
+        };
+        Ok(Self {
+            exe,
+            model: model.to_string(),
+            llama_model_args,
+            llama_bench: llama_bench.to_string(),
+            dev: dev.to_string(),
+            ngl,
+            threads,
+            reps,
+            ubatch,
+        })
+    }
+
+    /// Run `infr bench` (this binary) and read its single-row [{"avg_ts":X}].
+    fn infr(&self, args: &[&str]) -> anyhow::Result<f64> {
+        use std::process::Command;
+        let mut c = Command::new(&self.exe);
+        c.arg("bench")
+            .arg(&self.model)
+            .args(["-r", &self.reps.to_string()]);
+        c.args(["--ngl", &self.ngl.to_string(), "--dev", &self.dev]);
+        if self.threads > 0 {
+            c.args(["-t", &self.threads.to_string()]);
+        }
+        if self.ubatch > 0 {
+            c.args(["-u", &self.ubatch.to_string()]);
+        }
+        c.args(args).arg("--json");
+        let out = c.output().context("running `infr bench`")?;
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| {
+            format!(
+                "parsing infr bench output: {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })?;
+        v[0]["avg_ts"]
+            .as_f64()
+            .context("infr bench: missing avg_ts")
+    }
+
+    /// Run `llama-bench -o json` and pick the row matching (n_prompt, n_gen): -pg adds extra rows.
+    fn llama(&self, np: usize, ng: usize, args: &[&str]) -> Option<f64> {
+        use std::process::Command;
+        let mut c = Command::new(&self.llama_bench);
+        c.args(&self.llama_model_args);
+        c.args([
+            "-ngl",
+            &self.ngl.to_string(),
+            "-dev",
+            &self.dev,
+            "-fa",
+            "auto",
+            "-r",
+            &self.reps.to_string(),
+            "-o",
+            "json",
+        ]);
+        if self.threads > 0 {
+            c.args(["-t", &self.threads.to_string()]);
+        }
+        if self.ubatch > 0 {
+            c.args(["-ub", &self.ubatch.to_string()]);
+        }
+        c.args(args);
+        let out = c.output().ok()?;
+        let rows: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!(
+                    "llama-bench failed (np={np} ng={ng}): {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return None;
+            }
+        };
+        rows.as_array()?.iter().find_map(|r| {
+            let p = r["n_prompt"].as_u64()? as usize;
+            let g = r["n_gen"].as_u64()? as usize;
+            (p == np && g == ng).then(|| r["avg_ts"].as_f64())?
+        })
+    }
+}
+
 /// Compare infr vs llama.cpp on coding-agent-shaped workloads. Shells out to `infr bench` (this same
 /// binary) and `llama-bench` with matching flags, so both run the SAME model + GPU under one driver.
 /// Scenarios (the target workload — see memory infr-optimization-priority):
@@ -933,87 +1171,9 @@ fn cmd_compare(
     turns: &[String],
     llama_bench: &str,
 ) -> anyhow::Result<()> {
-    use std::process::Command;
-    let exe = std::env::current_exe().context("locating the infr binary")?;
-    let reps_s = reps.to_string();
-    let ngl_s = ngl.to_string();
-    let threads_s = threads.to_string();
-    // infr and llama.cpp share the HF Hub cache and the same `org/repo:quant` ref grammar, so hand
-    // BOTH tools the same reference: `infr bench` takes `model` verbatim, and llama-bench gets the
-    // matching `-hf`/`--hf-file` (or `-m` for a local path). Pull once up front so `--offline` holds.
-    let resolved = resolve(model)?.0; // ensures the model is cached; also the `-m` path for a local file
-    let llama_model_args: Vec<String> = match infr_hub::ModelRef::parse(model)? {
-        infr_hub::ModelRef::Repo { repo, sel } => {
-            let mut a = vec!["--offline".to_string()];
-            match sel {
-                None => a.extend(["-hf".into(), repo]),
-                Some(s) if s.to_lowercase().ends_with(".gguf") => {
-                    a.extend(["--hf-repo".into(), repo, "--hf-file".into(), s])
-                }
-                Some(s) => a.extend(["-hf".into(), format!("{repo}:{s}")]),
-            }
-            a
-        }
-        infr_hub::ModelRef::Path(_) => {
-            vec!["-m".to_string(), resolved.to_string_lossy().into_owned()]
-        }
-    };
-
-    // Run `infr bench` (this binary) and read its single-row [{"avg_ts":X}].
-    let infr_b = |args: &[&str]| -> anyhow::Result<f64> {
-        let mut c = Command::new(&exe);
-        c.arg("bench").arg(model).args(["-r", &reps_s]);
-        c.args(["--ngl", &ngl_s, "--dev", dev]);
-        if threads > 0 {
-            c.args(["-t", &threads_s]);
-        }
-        if ubatch > 0 {
-            c.args(["-u", &ubatch.to_string()]);
-        }
-        c.args(args).arg("--json");
-        let out = c.output().context("running `infr bench`")?;
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| {
-            format!(
-                "parsing infr bench output: {}",
-                String::from_utf8_lossy(&out.stdout)
-            )
-        })?;
-        v[0]["avg_ts"]
-            .as_f64()
-            .context("infr bench: missing avg_ts")
-    };
-
-    // Run `llama-bench -o json` and pick the row matching (n_prompt, n_gen): -pg adds extra rows.
-    let llama_b = |np: usize, ng: usize, args: &[&str]| -> Option<f64> {
-        let mut c = Command::new(llama_bench);
-        c.args(&llama_model_args);
-        c.args([
-            "-ngl", &ngl_s, "-dev", dev, "-fa", "auto", "-r", &reps_s, "-o", "json",
-        ]);
-        if threads > 0 {
-            c.args(["-t", &threads_s]);
-        }
-        if ubatch > 0 {
-            c.args(["-ub", &ubatch.to_string()]);
-        }
-        c.args(args);
-        let out = c.output().ok()?;
-        let rows: serde_json::Value = match serde_json::from_slice(&out.stdout) {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!(
-                    "llama-bench failed (np={np} ng={ng}): {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                return None;
-            }
-        };
-        rows.as_array()?.iter().find_map(|r| {
-            let p = r["n_prompt"].as_u64()? as usize;
-            let g = r["n_gen"].as_u64()? as usize;
-            (p == np && g == ng).then(|| r["avg_ts"].as_f64())?
-        })
-    };
+    let mb = ModelBench::new(model, dev, ngl, threads, reps, ubatch, llama_bench)?;
+    let infr_b = |args: &[&str]| mb.infr(args);
+    let llama_b = |np: usize, ng: usize, args: &[&str]| mb.llama(np, ng, args);
 
     let model_name = Path::new(model)
         .file_name()

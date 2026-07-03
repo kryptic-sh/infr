@@ -89,9 +89,21 @@ fn decode_eligible(graph: &Graph) -> bool {
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
             // fallback, both of which take scale/window.
-            Op::Attention { rows, head_dim, .. } => {
+            Op::Attention {
+                rows,
+                head_dim,
+                k_cache,
+                ..
+            } => {
                 has_attn = true;
                 if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
+                    return false;
+                }
+                // A Q8_0 KV cache forces the per-execute STATIC decode: the record-once replay of the
+                // un-fused Q8 K-write (store_q8_dyn) mis-decodes despite correct kernels/barriers (the
+                // static path with the same kernels is bit-correct). TODO: fix the replay and drop
+                // this so Q8 decode gets the record-once speedup too.
+                if matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0) {
                     return false;
                 }
             }
@@ -702,10 +714,12 @@ fn lower_op(
             // peephole is disabled, so the K WriteKv (f16 staging) reaches here alongside the f32 V.
             let cache_q8 = matches!(graph.desc(*cache).dtype, infr_core::DType::Q8_0);
             let src_f16 = matches!(graph.desc(*src).dtype, infr_core::DType::F16);
+            // Planar scales region begins at byte `cap` = total cache elements.
+            let cap = graph.desc(*cache).numel();
             match mode {
-                RopeMode::Static(_) if cache_q8 => rec.store_q8(s, c, n, pos * rs, src_f16),
+                RopeMode::Static(_) if cache_q8 => rec.store_q8(s, c, n, pos * rs, cap, src_f16),
                 RopeMode::Dynamic(params) if cache_q8 => {
-                    rec.store_q8_dyn(s, *params, c, n, src_f16)
+                    rec.store_q8_dyn(s, *params, c, n, cap, src_f16)
                 }
                 RopeMode::Static(_) => match graph.desc(*src).dtype {
                     infr_core::DType::F16 => rec.copy(s, 0, c, pos * rs * 2, n * 2),
@@ -893,6 +907,8 @@ fn lower_op(
             // blocks, so route through the scalar dequant-on-read attention_kv (static) /
             // attention_kv_dyn (decode) instead. (Native-Q8 coalesced kernels are a follow-up.)
             let kv_q8 = matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0);
+            // Planar Q8 scales region base = total cache elements (unused for f16).
+            let cap = graph.desc(*k_cache).numel();
             if let RopeMode::Dynamic(params) = mode {
                 // Eligibility guarantees rows==1. Scale rides a push constant (gemma4 uses 1.0;
                 // 0.0 → kernel default 1/√hd) and SWA windows ride the window-aware prologue +
@@ -965,6 +981,7 @@ fn lower_op(
                         pscale,
                         window,
                         kv_q8,
+                        cap,
                     );
                 } else {
                     rec.attention_kv_dyn(
@@ -980,6 +997,7 @@ fn lower_op(
                         pscale,
                         window,
                         kv_q8,
+                        cap,
                     );
                 }
             } else {
@@ -993,8 +1011,8 @@ fn lower_op(
                     let ne = kv_len * nkv * hd;
                     let ks = pooled(pool, be_, "q8deq_k", ne * 2)?;
                     let vs = pooled(pool, be_, "q8deq_v", ne * 2)?;
-                    rec.dequant_q8_f16(r(*k_cache)?, pool[&ks].as_ref(), ne);
-                    rec.dequant_q8_f16(r(*v_cache)?, pool[&vs].as_ref(), ne);
+                    rec.dequant_q8_f16(r(*k_cache)?, pool[&ks].as_ref(), ne, cap);
+                    rec.dequant_q8_f16(r(*v_cache)?, pool[&vs].as_ref(), ne, cap);
                     (Some(ks), Some(vs))
                 } else {
                     (None, None)
@@ -1129,6 +1147,7 @@ fn lower_op(
                         *scale,
                         window,
                         kv_q8_eff,
+                        cap,
                     );
                 } else {
                     let window = match mask {
@@ -1157,6 +1176,7 @@ fn lower_op(
                         window,
                         *scale,
                         kv_q8_eff,
+                        cap,
                     );
                 }
             }

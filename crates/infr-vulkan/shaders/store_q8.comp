@@ -1,8 +1,10 @@
 #version 460
-// Quantize a contiguous source row (`n` elements) into the GGUF Q8_0 KV cache at element offset
-// `off`: block = [f16 d][i8 qs[32]] = 34 bytes / 32 elems, d = amax/127, q = round(x/d). One
-// workgroup = one subgroup (32 lanes) = one 32-element block, so `n` and `off` must be multiples of
-// 32 (guaranteed: the KV row width n_kv*head_dim is block-aligned and off = pos*row_width).
+// Quantize a contiguous source row (`n` elements) into the Vulkan PLANAR Q8_0 KV cache at element
+// offset `off`. Planar (not GGUF-interleaved): all int8 codes in bytes [0, cap), then all f16 scales
+// in bytes [cap, cap*17/16) — one scale per 32-elem block. `cap` = total cache elements. d = amax/127,
+// q = round(x/d). One workgroup = one subgroup (32 lanes) = one 32-element block, so `n`/`off` are
+// multiples of 32 (the KV row width n_kv*head_dim is block-aligned and off = pos*row_width). This
+// aligned split lets the decode read load 4 codes as one u32 + one scale word (see attn_partial).
 //   SRC_F16 : source is f16 (the un-fused roped K staging); default source is f32 (V projection).
 //   USE_PARAMS : record-once decode — off = p_pos*n from a host-updated params SSBO (one KV row).
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
@@ -15,7 +17,7 @@
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint n; uint off; } pc;
+layout(push_constant) uniform PC { uint n; uint off; uint cap; } pc;
 #ifdef SRC_F16
 layout(binding = 0) readonly buffer SB { float16_t src[]; };
 #else
@@ -41,12 +43,15 @@ void main() {
     float d = amax / 127.0;
     float inv = (amax > 0.0) ? 1.0 / d : 0.0;
     int q = clamp(int(round(v * inv)), -127, 127);
-    // Destination block: (off + blk*32)/32 = off/32 + blk. byte base = block*34.
-    uint b = (off / 32u + blk) * 34u;
+    // Planar: code byte = global element index (codes region [0,cap)); scale for this block sits in
+    // the scales region at byte cap + block*2 (block = (off+blk*32)/32 = off/32 + blk).
+    uint elem = off + blk * 32u + t;
+    cbuf[elem] = uint8_t(q);   // two's-complement byte; reader sign-extends
     if (t == 0u) {
+        uint block = off / 32u + blk;
+        uint sb = pc.cap + block * 2u;
         uint16_t s = float16BitsToUint16(float16_t(d));
-        cbuf[b] = uint8_t(s & uint16_t(0xFFu));
-        cbuf[b + 1u] = uint8_t(s >> 8);
+        cbuf[sb] = uint8_t(s & uint16_t(0xFFu));
+        cbuf[sb + 1u] = uint8_t(s >> 8);
     }
-    cbuf[b + 2u + t] = uint8_t(q);   // two's-complement byte; reader sign-extends
 }

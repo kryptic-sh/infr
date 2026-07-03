@@ -3,37 +3,31 @@
 // q/k/v f16, o f32. hd <= 512 (thread t owns output dims t, t+64, …, t+7*64 that fall < hd).
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#ifdef KVQ8
-// KV cache stored as GGUF Q8_0 blocks: [f16 d][i8 qs[32]] = 34 bytes / 32 elems. K and V are read
-// as raw bytes and dequantized per element (y = d * qs[j]). Coupled K==V==Q8 (mixed K/V dtype is a
-// CPU-only feature for now). Keeps the scalar path correct; the coalesced flash/split kernels stay
-// f16-only and are gated off for a Q8 cache.
-#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_shader_8bit_storage : require
-#endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-layout(push_constant) uniform PC { uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; float scale; } pc;
+layout(push_constant) uniform PC { uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; float scale; uint cap; } pc;
 layout(binding = 0) readonly buffer QB { float16_t q[]; };
 #ifdef KVQ8
-layout(binding = 1) readonly buffer KB { uint8_t kbuf[]; };
-layout(binding = 2) readonly buffer VB { uint8_t vbuf[]; };
-// Dequant element `idx` from a Q8_0 byte buffer: block = idx/32 (byte base block*34), the block's
-// f16 scale sits at the base, the int8 code at base+2+idx%32.
+// Coupled PLANAR Q8_0 KV cache: codes int8[cap] then scales f16[cap/32] (see store_q8). Read as
+// `uint` words; per element = one byte code (from a u32 word) + the block's f16 scale (from the
+// scales region at word cap/4). Coupled K==V==q8 (mixed K/V is CPU-only for now).
+layout(binding = 1) readonly buffer KB { uint ku[]; };
+layout(binding = 2) readonly buffer VB { uint vu[]; };
+// Dequant element `idx`: code byte = word idx/4, lane idx%4 (sign-extended); block = idx/32, scale in
+// the scales region at word cap/4 + block/2, half block&1.
 float dq8k(uint idx) {
-    uint b = (idx / 32u) * 34u;
-    uint16_t s = uint16_t(kbuf[b]) | (uint16_t(kbuf[b + 1u]) << 8);
-    int c = int(kbuf[b + 2u + idx % 32u]);
-    c -= (c >= 128) ? 256 : 0;
-    return float(uint16BitsToFloat16(s)) * float(c);
+    int cw = int(ku[idx >> 2u]);
+    int c = bitfieldExtract(cw, int((idx & 3u) * 8u), 8);
+    uint bk = idx >> 5u;
+    float d = unpackHalf2x16(ku[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
+    return d * float(c);
 }
 float dq8v(uint idx) {
-    uint b = (idx / 32u) * 34u;
-    uint16_t s = uint16_t(vbuf[b]) | (uint16_t(vbuf[b + 1u]) << 8);
-    int c = int(vbuf[b + 2u + idx % 32u]);
-    c -= (c >= 128) ? 256 : 0;
-    return float(uint16BitsToFloat16(s)) * float(c);
+    int cw = int(vu[idx >> 2u]);
+    int c = bitfieldExtract(cw, int((idx & 3u) * 8u), 8);
+    uint bk = idx >> 5u;
+    float d = unpackHalf2x16(vu[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
+    return d * float(c);
 }
 #define KREAD(i) dq8k(i)
 #define VREAD(i) dq8v(i)

@@ -569,6 +569,7 @@ fn decode_attn_variants_bench() {
             0.0,
             0,
             false, // f16 KV cache
+            0,     // cap (unused for f16)
         );
     });
     // dyn split, same chunks
@@ -623,6 +624,7 @@ fn decode_attn_variants_bench() {
             0.0,
             0,
             false, // f16 KV cache
+            0,     // cap (unused for f16)
         );
     });
     // dynac with a TIGHT bake (capacity == live): isolates the dead-workgroup/scan cost from the
@@ -647,6 +649,7 @@ fn decode_attn_variants_bench() {
             0.0,
             0,
             false, // f16 KV cache
+            0,     // cap (unused for f16)
         );
     });
     // dyn split with chunk=64 all live (the earlier env-sweep shape)

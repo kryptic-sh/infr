@@ -10,40 +10,35 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
-#ifdef KVQ8
-// Coupled Q8_0 KV cache: K and V are GGUF Q8_0 blocks ([f16 d][i8 qs[32]] = 34 B / 32 elems). The
-// coalesced split-K structure is preserved — each `f16vec4` load becomes a 4-code dequant from the
-// enclosing 32-element block (the 4 elements never straddle a block, since the vec4 index maps to a
-// 4-aligned offset). Halves the KV read traffic at decode depth vs the f16 cache.
-#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_shader_8bit_storage : require
-#endif
-
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
     uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
+    uint cap;   // KVQ8: total cache elements — the planar scales region begins at word cap/4
 } pc;
 layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [nh, hd] as vec4
 #ifdef KVQ8
-layout(binding = 1) readonly buffer KB { uint8_t kbuf[]; };  // cache [kv_len, nkv, hd] Q8_0 bytes
-layout(binding = 2) readonly buffer VB { uint8_t vbuf[]; };
-// vec4 at vec4-index `i4` (elements 4*i4..4*i4+3) from a Q8_0 byte buffer. The 4 elements share one
-// block (offset o=4*i4%32 is a multiple of 4 → [o,o+3] ⊆ [0,31]); one f16 scale + 4 int8 codes.
+// Coupled PLANAR Q8_0 KV cache: codes int8[cap] then scales f16[cap/32] (see store_q8). Read as
+// `uint` words — each `f16vec4` load becomes ONE aligned u32 (4 codes) + one scale word shared by
+// the 8 vec4s of a block. Far fewer memory transactions than GGUF-interleaved byte reads, and it
+// moves half the KV bytes of the f16 cache at decode depth.
+layout(binding = 1) readonly buffer KB { uint ku[]; };
+layout(binding = 2) readonly buffer VB { uint vu[]; };
+// vec4 at vec4-index `i4` (elements 4*i4..4*i4+3): word i4 holds the 4 packed int8 codes; the block's
+// f16 scale is at scale-word cap/4 + block/2 (block = 4*i4/32 = i4/8), lane picked by block&1.
 vec4 kq8(uint i4) {
-    uint e = i4 * 4u; uint b = (e / 32u) * 34u; uint o = e % 32u;
-    uint16_t s = uint16_t(kbuf[b]) | (uint16_t(kbuf[b + 1u]) << 8);
-    float d = float(uint16BitsToFloat16(s));
-    return d * vec4(int8_t(kbuf[b + 2u + o]), int8_t(kbuf[b + 3u + o]),
-                    int8_t(kbuf[b + 4u + o]), int8_t(kbuf[b + 5u + o]));
+    int cw = int(ku[i4]);
+    uint bk = i4 >> 3u;
+    float d = unpackHalf2x16(ku[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
 }
 vec4 vq8(uint i4) {
-    uint e = i4 * 4u; uint b = (e / 32u) * 34u; uint o = e % 32u;
-    uint16_t s = uint16_t(vbuf[b]) | (uint16_t(vbuf[b + 1u]) << 8);
-    float d = float(uint16BitsToFloat16(s));
-    return d * vec4(int8_t(vbuf[b + 2u + o]), int8_t(vbuf[b + 3u + o]),
-                    int8_t(vbuf[b + 4u + o]), int8_t(vbuf[b + 5u + o]));
+    int cw = int(vu[i4]);
+    uint bk = i4 >> 3u;
+    float d = unpackHalf2x16(vu[(pc.cap >> 2u) + (bk >> 1u)])[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
 }
 #define KVEC4(i) kq8(i)
 #define VVEC4(i) vq8(i)

@@ -1316,8 +1316,10 @@ impl<'a> Recorder<'a> {
         window: usize,
         // QK scale: `> 0` overrides the default 1/√hd (gemma4 passes 1.0). `0.0` = default.
         scale: f32,
-        // Q8_0 KV cache (K==V==q8): dequant-on-read variant. `false` = f16 cache.
+        // Q8_0 KV cache (K==V==q8): planar dequant-on-read variant. `false` = f16 cache.
         q8: bool,
+        // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
+        cap: usize,
     ) {
         self.stamp("attention_kv");
         let (name, spv) = if q8 {
@@ -1325,8 +1327,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("attention_kv", crate::gemm::attention_kv_spv())
         };
-        let kern = self.be.kernel(name, spv, 4, 32);
-        let mut push = [0u8; 32];
+        let kern = self.be.kernel(name, spv, 4, 36);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -1335,6 +1337,7 @@ impl<'a> Recorder<'a> {
         push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
         self.dispatch(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
@@ -1766,15 +1769,17 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Quantize `src[0..n]` → the GGUF Q8_0 KV cache at element offset `off` (34 B / 32-elem block).
-    /// `src_f16` selects the f16-source variant (the un-fused roped K staging); f32 source otherwise
-    /// (the V projection). `n` and `off` must be block-aligned (KV row width is a multiple of 32).
+    /// Quantize `src[0..n]` → the Vulkan planar Q8_0 KV cache at element offset `off`. `cap` = total
+    /// cache elements (the scales region begins at byte `cap`). `src_f16` selects the f16-source
+    /// variant (the un-fused roped K staging); f32 otherwise (the V projection). `n`/`off` are
+    /// block-aligned (KV row width is a multiple of 32).
     pub fn store_q8(
         &self,
         src: &dyn Buffer,
         dst: &dyn Buffer,
         n: usize,
         off: usize,
+        cap: usize,
         src_f16: bool,
     ) {
         self.stamp("store_q8");
@@ -1783,10 +1788,11 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8", crate::gemm::store_q8_spv())
         };
-        let k = self.be.kernel(name, spv, 2, 8);
-        let mut push = [0u8; 8];
+        let k = self.be.kernel(name, spv, 2, 12);
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
         // One workgroup (32 lanes) per 32-element block.
         self.dispatch(
             k,
@@ -1805,6 +1811,7 @@ impl<'a> Recorder<'a> {
         params: &dyn Buffer,
         dst: &dyn Buffer,
         n: usize,
+        cap: usize,
         src_f16: bool,
     ) {
         self.stamp("store_q8");
@@ -1813,10 +1820,11 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
         };
-        let k = self.be.kernel(name, spv, 3, 8);
-        let mut push = [0u8; 8];
+        let k = self.be.kernel(name, spv, 3, 12);
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         // [4..8] off: unused (from params)
+        push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
@@ -1826,15 +1834,17 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Expand `n` elements of a Q8_0 buffer → an f16 buffer (dequant the KV prefix so the f16
-    /// flash / non-FA prefill kernels can read it; the persistent cache stays Q8).
-    pub fn dequant_q8_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize) {
+    /// Expand `n` elements of the planar Q8_0 cache → an f16 buffer (dequant the KV prefix so the
+    /// f16 flash / non-FA prefill kernels can read it; the persistent cache stays Q8). `cap` = total
+    /// cache elements (the planar scales region base).
+    pub fn dequant_q8_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize, cap: usize) {
         self.stamp("dequant_q8_f16");
         let k = self
             .be
-            .kernel("dequant_q8_f16", crate::gemm::dequant_q8_f16_spv(), 2, 4);
-        let mut push = [0u8; 4];
+            .kernel("dequant_q8_f16", crate::gemm::dequant_q8_f16_spv(), 2, 8);
+        let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(cap as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
@@ -1923,8 +1933,10 @@ impl<'a> Recorder<'a> {
         n_chunks: usize,
         scale: f32,
         window: usize,
-        // Q8_0 KV cache (K==V==q8): coalesced Q8-block read variant. `false` = f16 cache.
+        // Q8_0 KV cache (K==V==q8): coalesced planar Q8 read variant. `false` = f16 cache.
         q8: bool,
+        // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
+        cap: usize,
     ) {
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
         self.stamp("attn_partial");
@@ -1933,8 +1945,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("attn_partial", crate::gemm::attn_partial_spv())
         };
-        let k1 = self.be.kernel_sg(p1name, p1spv, 6, 32, 32);
-        let mut p1 = [0u8; 32];
+        let k1 = self.be.kernel_sg(p1name, p1spv, 6, 36, 32);
+        let mut p1 = [0u8; 36];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
@@ -1943,6 +1955,7 @@ impl<'a> Recorder<'a> {
         p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
         p1[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         p1[28..32].copy_from_slice(&scale.to_ne_bytes());
+        p1[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
         self.dispatch(
             k1,
             &[
@@ -2086,8 +2099,10 @@ impl<'a> Recorder<'a> {
         hd: usize,
         scale: f32,
         window: usize,
-        // Q8_0 KV cache (K==V==q8): dequant-on-read variant. `false` = f16 cache.
+        // Q8_0 KV cache (K==V==q8): planar dequant-on-read variant. `false` = f16 cache.
         q8: bool,
+        // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
+        cap: usize,
     ) {
         self.stamp("attention_kv");
         let (name, spv) = if q8 {
@@ -2098,8 +2113,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("attention_kv_dyn", crate::gemm::attention_kv_dyn_spv())
         };
-        let kern = self.be.kernel(name, spv, 5, 32);
-        let mut push = [0u8; 32];
+        let kern = self.be.kernel(name, spv, 5, 36);
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
         // [4..8] kv_len: unused
         push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -2108,6 +2123,7 @@ impl<'a> Recorder<'a> {
         // [20..24] pos_offset: unused (from params)
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
         self.dispatch(
             kern,
             &[
@@ -2198,8 +2214,10 @@ impl<'a> Recorder<'a> {
         n_chunks: usize,
         scale: f32,
         window: usize,
-        // Q8_0 KV cache (K==V==q8): coalesced Q8-block read variant. `false` = f16 cache.
+        // Q8_0 KV cache (K==V==q8): coalesced planar Q8 read variant. `false` = f16 cache.
         q8: bool,
+        // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
+        cap: usize,
     ) {
         // pass 1: self-chunking partials, workgroup count from `args` (the caller records ONE
         // `attn_live_prologue` per (nh, chunk, window) key — kv_len is identical for every layer
@@ -2214,8 +2232,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("attn_partial_dynac", crate::gemm::attn_partial_dynac_spv())
         };
-        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 32, 32);
-        let mut p1 = [0u8; 32];
+        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 36, 32);
+        let mut p1 = [0u8; 36];
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -2223,6 +2241,7 @@ impl<'a> Recorder<'a> {
         p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
         p1[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         p1[28..32].copy_from_slice(&scale.to_ne_bytes());
+        p1[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
         self.dispatch_indirect(
             k1,
             &[
@@ -3730,6 +3749,7 @@ mod tests {
             0,     // full causal (no sliding window)
             0.0,   // default 1/√hd scale
             false, // f16 KV cache
+            0,     // cap (unused for f16)
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; q_len * nh * hd * 4];
@@ -3789,6 +3809,7 @@ mod tests {
             scale,
             win,
             false, // f16 KV cache
+            0,     // cap (unused for f16)
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; nh * hd * 4];
@@ -3866,6 +3887,7 @@ mod tests {
             scale,
             win,
             false, // f16 KV cache
+            0,     // cap (unused for f16)
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; nh * hd * 4];

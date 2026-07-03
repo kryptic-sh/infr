@@ -115,6 +115,7 @@ pub(crate) fn generate_dense_cpu(
         &mut None,
         prompt.len() + max_new + 1,
         None,
+        None,
     )
 }
 
@@ -253,6 +254,7 @@ pub(crate) fn generate_dense_gpu_session(
         state,
         want_ctx,
         constraint,
+        None,
     )
 }
 
@@ -323,7 +325,50 @@ pub(crate) fn generate_dense_metal_session(
         state,
         want_ctx,
         constraint,
+        None,
     )
+}
+
+/// Speculative VERIFY on the Metal seam: one batched forward of `tokens`' un-cached suffix with
+/// the LM head on every suffix row. Returns the [m, vocab] logits plus the graph-execute
+/// seconds, and leaves the session's KV + `cached` covering all of `tokens` — the caller
+/// commits the accepted prefix and the next call's prefix diff overwrites whatever was
+/// speculatively written past it.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_dense_metal2(
+    mtl: &infr_metal::MetalBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+) -> AResult<(Vec<f32>, f64)> {
+    let mut logits = Vec::new();
+    let (_, stats) = generate_dense_backend(
+        mtl,
+        &|_name, tb, dt, _n| {
+            let buf = mtl
+                .alloc(tb.len().max(1), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            mtl.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+            Ok((buf, dt))
+        },
+        g,
+        cfg,
+        token_embd,
+        ple,
+        tokens,
+        0,
+        |_| {},
+        state,
+        want_ctx,
+        None,
+        Some(&mut logits),
+    )?;
+    Ok((logits, stats.prompt_secs))
 }
 
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it
@@ -590,6 +635,7 @@ pub(crate) fn generate_dense_backend(
     state: &mut Option<SeamKv>,
     want_ctx: usize,
     mut constraint: Option<&mut crate::grammar::Constraint>,
+    verify: Option<&mut Vec<f32>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let (ne, nh) = (c.n_embd, c.n_head);
@@ -976,9 +1022,10 @@ pub(crate) fn generate_dense_backend(
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.
     // `batch = 1` is the normal decode path; `batch > 1` is the batched-prefill path.
-    // Scratch tensors scale by `batch`; the LM head always runs on the LAST token only
-    // (extracted via Op::Copy for batch > 1) so the logits output is always [vocab].
-    let build = |batch: usize, start_pos: usize| -> (Graph, DecodeHandles) {
+    // Scratch tensors scale by `batch`; the LM head runs on the last `logits_rows` tokens —
+    // 1 everywhere except speculative VERIFY, which needs the distribution after every
+    // candidate (logits output = [logits_rows, vocab], logits_rows ∈ {1, batch}).
+    let build = |batch: usize, start_pos: usize, logits_rows: usize| -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
         // KV cache dtype: f16 by default (halves memory vs f32, tightens CPU↔GPU parity); Q8_0
@@ -1121,7 +1168,7 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
-        let logits = g.output(f32d(c.vocab));
+        let logits = g.output(f32d(c.vocab * logits_rows));
 
         // scratch (sized to the per-layer max × batch; ops reallocate dst, so these are upper bounds)
         let hn = g.internal(f32d(batch * ne));
@@ -1673,10 +1720,11 @@ pub(crate) fn generate_dense_backend(
             dim: ne as u32,
             eps,
         });
-        // For batch > 1: the LM head runs only on the LAST token's hidden state — extract it
-        // via Op::Copy before the projection so the logits output is always [vocab] regardless
-        // of batch size. (For batch = 1, `hn` is already the single token's hidden state.)
-        let lm_in = if batch > 1 {
+        // For batch > 1 with logits_rows == 1: the LM head runs only on the LAST token's
+        // hidden state — extract it via Op::Copy before the projection so the logits output is
+        // [vocab]. Speculative verify passes logits_rows == batch and runs the head over every
+        // row instead (no Copy).
+        let lm_in = if batch > 1 && logits_rows == 1 {
             let hn_last = g.internal(f32d(ne));
             g.push(Op::Copy {
                 src: hn,
@@ -1693,7 +1741,7 @@ pub(crate) fn generate_dense_backend(
             x: lm_in,
             weight: w_lm,
             dst: logits,
-            m: 1,
+            m: logits_rows as u32,
             in_f: ne as u32,
             out_f: c.vocab as u32,
             w_off: 0,
@@ -1703,7 +1751,7 @@ pub(crate) fn generate_dense_backend(
                 x: logits,
                 dst: logits,
                 cap: c.final_softcap,
-                n: c.vocab as u32,
+                n: (c.vocab * logits_rows) as u32,
             });
         }
         (
@@ -1720,6 +1768,71 @@ pub(crate) fn generate_dense_backend(
             },
         )
     };
+
+    // ── speculative VERIFY ──────────────────────────────────────────────────────────
+    // One batched forward over the un-cached suffix with the LM head on EVERY row: returns
+    // [m, vocab] logits (the distribution after each suffix token) and generates nothing.
+    // The suffix-prefill contract doubles as the accept/rollback mechanism: the caller
+    // truncates its committed token list and the next call's prefix diff overwrites the
+    // stale KV rows. Dense non-E2B models only (mirrors the batched-prefill guard).
+    if let Some(out_logits) = verify {
+        if c.moe.is_some() || ple.is_some() {
+            return Err(anyhow!("speculative verify: dense non-E2B models only"));
+        }
+        let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
+        let m = prompt.len() - start;
+        let mut vf_hidden: Vec<f32> = Vec::with_capacity(m * ne);
+        for &tok in &prompt[start..] {
+            let base = tok as usize * ne;
+            vf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * vf_scale));
+        }
+        let vf_positions: Vec<i32> = (start as i32..(start + m) as i32).collect();
+        let vf_hidden_buf = be
+            .alloc(m * ne * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let vf_pos_buf = be
+            .alloc(m * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let vf_logits_buf = be
+            .alloc(m * c.vocab * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(vf_hidden_buf.as_ref(), bytemuck::cast_slice(&vf_hidden))
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(vf_pos_buf.as_ref(), bytemuck::cast_slice(&vf_positions))
+            .map_err(|e| anyhow!("{e}"))?;
+        let (vg, vh) = build(m, start, m);
+        let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
+        let mut vb = Bindings::new();
+        vb.bind(vh.hidden, vf_hidden_buf.as_ref());
+        vb.bind(vh.positions, vf_pos_buf.as_ref());
+        if let (Some(rid), Some((rb, _))) = (vh.rope_freqs, &rf_buf) {
+            vb.bind(rid, rb.as_ref());
+        }
+        for l in 0..c.n_layer {
+            vb.bind(vh.k_cache[l], kbufs[l].as_ref());
+            vb.bind(vh.v_cache[l], vbufs[l].as_ref());
+        }
+        for (i, wid) in vh.weights.iter().enumerate() {
+            vb.bind(*wid, wbufs[i].as_ref());
+        }
+        vb.bind(vh.logits, vf_logits_buf.as_ref());
+        let t0 = std::time::Instant::now();
+        be.execute(vplan.as_ref(), &vb)
+            .map_err(|e| anyhow!("{e}"))?;
+        out_logits.resize(m * c.vocab, 0.0);
+        be.download(vf_logits_buf.as_ref(), bytemuck::cast_slice_mut(out_logits))
+            .map_err(|e| anyhow!("{e}"))?;
+        cached.extend_from_slice(&prompt[start..]);
+        return Ok((
+            Vec::new(),
+            GenStats {
+                n_prompt: m,
+                prompt_secs: t0.elapsed().as_secs_f64(),
+                n_gen: 0,
+                decode_secs: 0.0,
+            },
+        ));
+    }
 
     // ── drive ───────────────────────────────────────────────────────────────────────
     // Sampling: greedy unless INFR_TEMP is set (the CLI sets chat defaults for run/serve; the
@@ -1813,7 +1926,7 @@ pub(crate) fn generate_dense_backend(
                 None
             };
             let pf_t0 = std::time::Instant::now();
-            let (pf_g, pf_h) = build(pf_m, cstart);
+            let (pf_g, pf_h) = build(pf_m, cstart, 1);
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
             let t_compile = pf_t0.elapsed();
@@ -1892,7 +2005,7 @@ pub(crate) fn generate_dense_backend(
         && (0..c.n_layer)
             .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512);
     let ro = if dyn_replay {
-        let (g, h) = build(1, 0);
+        let (g, h) = build(1, 0, 1);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         b.bind(h.hidden, hidden_buf.as_ref());
@@ -1953,7 +2066,7 @@ pub(crate) fn generate_dense_backend(
             be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
         } else {
-            let (g, h) = build(1, pos);
+            let (g, h) = build(1, pos, 1);
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();
             b.bind(h.hidden, hidden_buf.as_ref());

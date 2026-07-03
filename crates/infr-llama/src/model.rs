@@ -467,6 +467,78 @@ impl ChatModel for MetalSeamChat {
     }
 }
 
+/// Speculative Metal chat (`INFR_SPEC_DRAFT=<gguf>`): TARGET model verified decode with a small
+/// same-tokenizer DRAFT proposing k tokens per round. Greedy-only — the committed stream is
+/// exactly the target's greedy stream. Pays off for ≥8B-class targets (see issue #16's
+/// measurements); the CLI warns when the size ratio looks too thin.
+#[cfg(target_os = "macos")]
+pub struct SpecMetalChat {
+    target: CpuModel,
+    draft: CpuModel,
+    k: usize,
+    target_session: Option<crate::cpu_model::DenseMetalSession>,
+    draft_session: Option<crate::cpu_model::DenseMetalSession>,
+}
+
+#[cfg(target_os = "macos")]
+impl SpecMetalChat {
+    pub fn new(target: CpuModel, draft: CpuModel, k: usize) -> Self {
+        Self {
+            target,
+            draft,
+            k,
+            target_session: None,
+            draft_session: None,
+        }
+    }
+
+    fn ensure_sessions(&mut self) -> Result<()> {
+        if self.target_session.is_none() {
+            // TWO models + TWO KV caches share the working set — a full-n_ctx_train pair
+            // (40k tokens on qwen3) thrashes an 18 GB machine into second-long forwards.
+            // Default to 8k unless INFR_MAX_CTX says otherwise.
+            let max_ctx = std::env::var("INFR_MAX_CTX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| self.target.config().n_ctx_train.min(8192));
+            self.target_session = Some(self.target.metal_session(max_ctx)?);
+            self.draft_session = Some(self.draft.metal_session(max_ctx)?);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ChatModel for SpecMetalChat {
+    fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
+        self.target.render_chat_messages(messages)
+    }
+
+    fn generate(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
+        self.ensure_sessions()?;
+        // Split borrows: sessions come out of the options for the call.
+        let mut ts = self.target_session.take().unwrap();
+        let mut ds = self.draft_session.take().unwrap();
+        let r = self.target.generate_metal_spec(
+            &mut ts,
+            &self.draft,
+            &mut ds,
+            prompt,
+            max_new,
+            self.k,
+            |p| on_piece(p),
+        );
+        self.target_session = Some(ts);
+        self.draft_session = Some(ds);
+        r
+    }
+}
+
 /// CPU reference backend (`INFR_CPU=1`) for dense/MoE: the agnostic compute-graph forward, no GPU.
 /// Stateless full-prefill each turn (no cross-turn KV yet), but the shared `Chat` now feeds the FULL
 /// rendered history in every turn, so multi-turn context works.

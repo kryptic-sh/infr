@@ -1534,6 +1534,141 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     }                                                                                             \
 }
 
+// Split-K cooperative GEMM for SMALL-m deep-k shapes (a chat turn's short suffix prefill,
+// speculative verify's k+1 rows): at m <= 15 the plain tile launches only out_f/64
+// threadgroups, each serializing the whole k loop — grid underfill on exactly the shapes
+// where the weight stream dominates. ksplit threadgroups share each (token, output) tile,
+// each covering a kchunk-slice of k and writing an f32 partial plane [ksplit, m, out_f];
+// `cmm_ks_reduce` folds the planes in fixed (ascending) order — deterministic.
+struct QLinKsParams { uint m; uint in_f; uint out_f; uint dshift; uint ksplit; uint kchunk; };
+#define CMMKS_KERNEL(NAME, DEC)                                                                     \
+kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
+                 device const uchar*  codes [[buffer(1)]],                                       \
+                 device const uchar*  scm   [[buffer(2)]],                                       \
+                 device const uchar*  dd    [[buffer(3)]],                                       \
+                 device float*        dst   [[buffer(4)]],                                       \
+                 constant QLinKsParams& p   [[buffer(5)]],                                       \
+                 uint gid  [[thread_position_in_grid]],                                          \
+                 uint lane [[thread_index_in_simdgroup]],                                        \
+                 uint sgid [[simdgroup_index_in_threadgroup]]) {                                 \
+    uint tgix = gid / 128u;                                                                       \
+    uint nto = p.out_f / 64u;                                                                     \
+    uint ntm = (p.m + 31u) / 32u;                                                                 \
+    uint sidx = tgix / (ntm * nto);                                                               \
+    if (sidx >= p.ksplit) return;                                                                 \
+    tgix %= ntm * nto;                                                                            \
+    device float* dstp = dst + (ulong)sidx * p.m * p.out_f;                                       \
+    uint to = tgix % nto;                                                                         \
+    uint tm = tgix / nto;                                                                         \
+    uint ro = to * 64u;                                                                           \
+    uint rt = tm * 32u;                                                                           \
+    uint tid = sgid * 32u + lane;                                                                 \
+    uint nr1 = min(32u, p.m - rt);                                                                \
+                                                                                                  \
+    threadgroup float shraw[2048];  /* 8 KB: sa(4K half) + sb(2K half); reused f32 for stores */  \
+    threadgroup half* sa = (threadgroup half*)shraw;                                              \
+    threadgroup half* sb = ((threadgroup half*)shraw) + 2048u;                                    \
+                                                                                                  \
+    uint lr0 = tid >> 1;                 /* weight (output) row 0..63 */                          \
+    uint il0 = tid & 1u;                 /* which 16-element half of the 32-K step */             \
+    uint lr1 = tid >> 2;                 /* token row 0..31 */                                    \
+    uint iyk = (tid & 3u) * 8u;          /* k offset within the 32-K step */                      \
+    uint lr1c = min(lr1, nr1 - 1u);      /* clamp token loads to the matrix edge */               \
+                                                                                                  \
+    simdgroup_half8x8 ma[4];                                                                      \
+    simdgroup_half8x8 mb[2];                                                                      \
+    simdgroup_float8x8 mc[8];                                                                     \
+    for (uint i = 0; i < 8u; i++) mc[i] = simdgroup_float8x8(0.0f);                               \
+                                                                                                  \
+    uint nb = p.in_f >> 4;                                                                        \
+    uint k_lo = sidx * p.kchunk;                                                                  \
+    uint k_hi = min(k_lo + p.kchunk, p.in_f);                                                     \
+    for (uint k0 = k_lo; k0 < k_hi; k0 += 32u) {                                                  \
+        /* device reads + dequant FIRST, into registers — issued while the previous       */     \
+        /* iteration's MMA phase (other simdgroups) is still draining; the barrier below  */     \
+        /* orders only the threadgroup-memory stores (mul_mm does exactly this)           */     \
+        ulong bi = (ulong)(ro + lr0) * nb + (ulong)(k0 >> 4) + il0;                               \
+        float wk[16];                                                                             \
+        DEC(wk)                                                                                   \
+        device const float4* yy =                                                                 \
+            (device const float4*)(x + (ulong)(rt + lr1c) * p.in_f + k0 + iyk);                   \
+        float4 yv0 = yy[0];                                                                       \
+        float4 yv1 = yy[1];                                                                       \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
+        {   /* stage A: one 16-block per thread, into pre-transposed 8x8 tiles */                 \
+            uint sy = lr0 >> 3;                                                                   \
+            uint lx = lr0 & 7u;                                                                   \
+            for (uint i = 0; i < 16u; i++) {                                                      \
+                uint sx = 2u * il0 + (i >> 3);                                                    \
+                sa[64u * (8u * sx + sy) + 8u * (i & 7u) + lx] = (half)wk[i];                      \
+            }                                                                                     \
+        }                                                                                         \
+        {   /* stage B: 8 activations per thread, two vectorized f32->f16 half4 stores */         \
+            uint ib = 4u * (tid & 3u) + (lr1 >> 3);                                               \
+            uint ly = lr1 & 7u;                                                                   \
+            threadgroup half4* sb4 = (threadgroup half4*)(sb + 64u * ib + 8u * ly);               \
+            sb4[0] = half4(yv0);                                                                  \
+            sb4[1] = half4(yv1);                                                                  \
+        }                                                                                         \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
+        threadgroup const half* lsma = sa + 4u * 64u * (sgid & 1u);                               \
+        threadgroup const half* lsmb = sb + 2u * 64u * (sgid >> 1);                               \
+        for (uint ik = 0; ik < 4u; ik++) {                                                        \
+            simdgroup_barrier(mem_flags::mem_none);                                               \
+            for (uint i = 0; i < 4u; i++) simdgroup_load(ma[i], lsma + 64u * i, 8);               \
+            simdgroup_barrier(mem_flags::mem_none);                                               \
+            for (uint i = 0; i < 2u; i++) simdgroup_load(mb[i], lsmb + 64u * i, 8);               \
+            simdgroup_barrier(mem_flags::mem_none);                                               \
+            for (uint i = 0; i < 8u; i++)                                                         \
+                simdgroup_multiply_accumulate(mc[i], mb[i >> 2], ma[i & 3u], mc[i]);              \
+            lsma += 8u * 64u;                                                                     \
+            lsmb += 4u * 64u;                                                                     \
+        }                                                                                         \
+    }                                                                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                              \
+                                                                                                  \
+    if (rt + 32u <= p.m) {                                                                        \
+        device float* C = dstp + (ro + 32u * (sgid & 1u)) +                                        \
+                          (ulong)(rt + 16u * (sgid >> 1)) * p.out_f;                              \
+        for (uint i = 0; i < 8u; i++)                                                             \
+            simdgroup_store(mc[i], C + 8u * (i & 3u) + 8u * p.out_f * (i >> 2), p.out_f);         \
+    } else {                                                                                      \
+        /* partial token tile: stage through threadgroup memory, row-guard the copy-out */        \
+        threadgroup float* tc = shraw + 32u * (sgid & 1u) + (16u * (sgid >> 1)) * 64u;            \
+        for (uint i = 0; i < 8u; i++)                                                             \
+            simdgroup_store(mc[i], tc + 8u * (i & 3u) + 8u * 64u * (i >> 2), 64u);                \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
+        if (sgid == 0u) {                                                                         \
+            for (uint j = lane; j < nr1; j += 32u) {                                              \
+                device float* d2 = dstp + ro + (ulong)(rt + j) * p.out_f;                          \
+                threadgroup const float* c2 = shraw + j * 64u;                                    \
+                for (uint i = 0; i < 64u; i++) d2[i] = c2[i];                                     \
+            }                                                                                     \
+        }                                                                                         \
+    }                                                                                             \
+}
+
+
+struct KsReduceParams { uint n; uint ksplit; };
+kernel void cmm_ks_reduce(device const float* parts [[buffer(0)]],
+                          device float*       dst   [[buffer(1)]],
+                          constant KsReduceParams& p [[buffer(2)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    float s = 0.0f;
+    for (uint i = 0; i < p.ksplit; i++) s += parts[(ulong)i * p.n + gid];
+    dst[gid] = s;
+}
+
+CMMKS_KERNEL(linear_quik4_cmm_ks, DEC16_K4)
+CMMKS_KERNEL(linear_quik6_cmm_ks, DEC16_K6)
+CMMKS_KERNEL(linear_quik8_cmm_ks, DEC16_K8)
+CMMKS_KERNEL(linear_q4k_cmm_ks, DEC16_Q4K)
+CMMKS_KERNEL(linear_q6k_cmm_ks, DEC16_Q6K)
+CMMKS_KERNEL(linear_q8_0_cmm_ks, DEC16_Q8_0)
+CMMKS_KERNEL(linear_q5_0_cmm_ks, DEC16_Q5_0)
+CMMKS_KERNEL(linear_q4_0_cmm_ks, DEC16_Q4_0)
+
 CMM_KERNEL(linear_quik4_cmm, DEC16_K4)
 CMM_KERNEL(linear_quik6_cmm, DEC16_K6)
 CMM_KERNEL(linear_quik8_cmm, DEC16_K8)

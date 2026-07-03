@@ -415,6 +415,182 @@ impl CpuModel {
         Ok(stats)
     }
 
+    /// Speculative decoding on the Metal seam (`self` = TARGET, `draft` = the small
+    /// same-tokenizer model): the draft session proposes `k` greedy tokens, ONE batched verify
+    /// forward of the target checks all of them (LM head on every candidate row), the matching
+    /// prefix commits plus the target's own next token as a bonus. Greedy-only (INFR_TEMP=0) —
+    /// the committed stream is then EXACTLY the target's greedy stream, which is the
+    /// correctness bar. Rollback is the session prefix-diff: rejected rows just get
+    /// overwritten by the next round's suffix prefill.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_metal_spec(
+        &self,
+        session: &mut DenseMetalSession,
+        draft: &CpuModel,
+        draft_session: &mut DenseMetalSession,
+        prompt: &str,
+        max_new: usize,
+        k: usize,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let sampler = crate::sampling::Sampler::from_env();
+        if sampler.temp > 0.0 {
+            return Err(anyhow!(
+                "speculative decoding is greedy-only — set INFR_TEMP=0"
+            ));
+        }
+        let vocab = self.cfg.vocab;
+        let argmax = |row: &[f32]| -> u32 {
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in row.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            bi as u32
+        };
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let mut committed: Vec<u32> = enc.get_ids().to_vec();
+        let n_prompt = committed.len();
+
+        // Initial fill: the target's normal (chunked-prefill) path produces the first token —
+        // verify forwards are only for the small k+1 suffixes.
+        let t0 = std::time::Instant::now();
+        let mut acc_buf: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let (first, _stats) = crate::cpu_backend::generate_dense_metal_session(
+            &session.mtl,
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            &committed,
+            1,
+            |_| {},
+            &mut session.state,
+            session.max_ctx,
+            None,
+        )?;
+        let prompt_secs = t0.elapsed().as_secs_f64();
+        let mut t_next = *first.first().ok_or_else(|| anyhow!("empty first token"))?;
+        let mut out: Vec<u32> = Vec::new();
+        let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
+        let t1 = std::time::Instant::now();
+        'outer: while out.len() < max_new {
+            // Commit the token the target already chose (initial sample or verify bonus).
+            let is_eos =
+                !ignore_eos && (self.cfg.eos_ids.contains(&t_next) || t_next == self.cfg.eos);
+            out.push(t_next);
+            if !is_eos {
+                stream_token(
+                    &self.tokenizer,
+                    &mut acc_buf,
+                    &mut printed,
+                    t_next,
+                    &mut on_piece,
+                );
+            }
+            committed.push(t_next);
+            if is_eos || out.len() >= max_new {
+                break;
+            }
+            // Draft proposes up to k greedy continuations of the committed stream (its session
+            // suffix-prefills the divergence from last round automatically).
+            let budget = k.min(max_new - out.len());
+            let td = std::time::Instant::now();
+            let (cand, _) = crate::cpu_backend::generate_dense_metal_session(
+                &draft_session.mtl,
+                &draft.gguf,
+                &draft.cfg,
+                &draft.token_embd,
+                draft.per_layer_embd.as_ref(),
+                &committed,
+                budget,
+                |_| {},
+                &mut draft_session.state,
+                draft_session.max_ctx,
+                None,
+            )?;
+            // Verify: one batched target forward over [t_next, cand..]; row i's argmax is the
+            // target's choice after consuming everything up to and including suffix row i.
+            let mut feed = committed.clone();
+            feed.extend_from_slice(&cand);
+            if feed.len() + 1 > session.max_ctx {
+                break; // context full: the committed stream is still exact
+            }
+            let td = td.elapsed();
+            let tv = std::time::Instant::now();
+            let (logits, vstats) = crate::cpu_backend::verify_dense_metal2(
+                &session.mtl,
+                &self.gguf,
+                &self.cfg,
+                &self.token_embd,
+                self.per_layer_embd.as_ref(),
+                &feed,
+                &mut session.state,
+                session.max_ctx,
+            )?;
+            if std::env::var("INFR_SPEC_DEBUG").is_ok() {
+                eprintln!(
+                    "[spec] draft {:.1}ms verify {:.1}ms (exec {:.1}ms) cand={}",
+                    td.as_secs_f64() * 1e3,
+                    tv.elapsed().as_secs_f64() * 1e3,
+                    vstats * 1e3,
+                    cand.len()
+                );
+            }
+            let m = logits.len() / vocab;
+            // Rows cover feed's un-cached suffix; the candidate checks use the LAST cand.len()+1
+            // rows (the row before cand[0] is t_next's — its argmax checks cand[0]).
+            let base = m - (cand.len() + 1);
+            let mut accepted = 0usize;
+            let mut next = None;
+            for (j, &c) in cand.iter().enumerate() {
+                let pred = argmax(&logits[(base + j) * vocab..(base + j + 1) * vocab]);
+                if pred == c {
+                    accepted += 1;
+                } else {
+                    next = Some(pred);
+                    break;
+                }
+            }
+            for &c in &cand[..accepted] {
+                let is_eos = !ignore_eos && (self.cfg.eos_ids.contains(&c) || c == self.cfg.eos);
+                out.push(c);
+                if !is_eos {
+                    stream_token(
+                        &self.tokenizer,
+                        &mut acc_buf,
+                        &mut printed,
+                        c,
+                        &mut on_piece,
+                    );
+                }
+                committed.push(c);
+                if is_eos || out.len() >= max_new {
+                    break 'outer;
+                }
+            }
+            // Roll the committed view back past the rejected tail: the session's `cached` holds
+            // all of `feed`, and the next prefix diff overwrites the stale rows.
+            t_next = next.unwrap_or_else(|| {
+                argmax(&logits[(base + cand.len()) * vocab..(base + cand.len() + 1) * vocab])
+            });
+        }
+        Ok(crate::GenStats {
+            n_prompt,
+            prompt_secs,
+            n_gen: out.len(),
+            decode_secs: t1.elapsed().as_secs_f64(),
+        })
+    }
+
     /// Token-level bench on the **Metal** backend through the agnostic seam (the Apple-GPU twin of
     /// [`bench`](Self::bench)): prefill `n_prompt` dummy tokens, decode `n_gen`, return the timing.
     /// Lets `infr bench` (with `INFR_METAL=1`) measure pp/tg directly comparable to `llama-bench`

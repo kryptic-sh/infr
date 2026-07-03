@@ -1305,7 +1305,13 @@ impl MetalBackend {
                     };
                     // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
                     // the out_f % 64 != 0 leftovers, and both need the full 128-thread group.
-                    let cmm_ok = m >= 16
+                    // m >= 2 (not 16): small multi-row batches — a chat turn's short suffix
+                    // prefill, speculative VERIFY's k+1 candidate rows — are weight-stream
+                    // bound, so the cooperative tile wins even mostly empty (it reads the
+                    // stream ONCE at GEMM rate; the row-tiled shape re-streams at ~1/3 the
+                    // bandwidth: 140 ms vs ~45 ms per 8B verify forward). m == 1 keeps the
+                    // exact-f32 GEMV (decode's precision contract).
+                    let cmm_ok = m >= 2
                         && out_f % 64 == 0
                         && self
                             .pipelines
@@ -1321,6 +1327,70 @@ impl MetalBackend {
                             >= 128;
                     p.extend_from_slice(&qw.dshift.to_ne_bytes());
                     if cmm_ok {
+                        // Split-K for small-m deep-k (verify rows, short suffix prefills): the
+                        // plain tile's out_f/64 threadgroups underfill the GPU and serialize
+                        // the whole k loop. ksplit tiles share the k-dim into an f32 partial
+                        // plane, reduced in fixed order. Gated to shapes where each split
+                        // still gets >= 4 K-steps.
+                        let nto = out_f / 64;
+                        let ntm = m.div_ceil(32);
+                        let ks_split = if m < 16 {
+                            (160 / (nto * ntm).max(1)).min(8).min(in_f / 32 / 4).max(1)
+                        } else {
+                            1
+                        };
+                        if ks_split > 1 {
+                            let ks_kern = match qw.kern {
+                                "linear_quik4" => "linear_quik4_cmm_ks",
+                                "linear_quik6" => "linear_quik6_cmm_ks",
+                                "linear_q4k" => "linear_q4k_cmm_ks",
+                                "linear_q6k" => "linear_q6k_cmm_ks",
+                                "linear_q8_0" => "linear_q8_0_cmm_ks",
+                                "linear_q5_0" => "linear_q5_0_cmm_ks",
+                                "linear_q4_0" => "linear_q4_0_cmm_ks",
+                                _ => "linear_quik8_cmm_ks",
+                            };
+                            let kchunk = (in_f / 32 / ks_split).max(1) * 32;
+                            // ceil to cover the tail: ksplit*kchunk must reach in_f
+                            let kchunk = if kchunk * ks_split < in_f {
+                                kchunk + 32
+                            } else {
+                                kchunk
+                            };
+                            let parts = self.scratch_buf(ks_split * m * out_f, 8);
+                            let mut kp = p.clone();
+                            kp.extend_from_slice(&(ks_split as u32).to_ne_bytes());
+                            kp.extend_from_slice(&(kchunk as u32).to_ne_bytes());
+                            let pso = self.pipelines.get(ks_kern)?;
+                            self.encode_tg_off(
+                                r,
+                                &pso,
+                                &[
+                                    (bx.as_ref(), 0),
+                                    (&qw.codes, codes_off),
+                                    (&qw.scm, scm_off),
+                                    (&qw.dd, dd_off),
+                                    (parts.as_ref(), 0),
+                                ],
+                                1 << 4,
+                                &kp,
+                                ntm * nto * ks_split * 128,
+                                128,
+                            );
+                            let rp_pso = self.pipelines.get("cmm_ks_reduce")?;
+                            let mut rp = ((m * out_f) as u32).to_ne_bytes().to_vec();
+                            rp.extend_from_slice(&(ks_split as u32).to_ne_bytes());
+                            self.encode_w(
+                                r,
+                                &rp_pso,
+                                &[parts.as_ref(), bd.as_ref()],
+                                1 << 1,
+                                &rp,
+                                m * out_f,
+                            );
+                            r.loc[dst.0 as usize] = Loc::Device;
+                            return Ok(());
+                        }
                         // Reads f32 x directly (casts to f16 while staging) — no cast pass.
                         let pso = self.pipelines.get(cmm_kern)?;
                         self.encode_tg_off(

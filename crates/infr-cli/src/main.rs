@@ -431,9 +431,39 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             );
             #[cfg(target_os = "macos")]
             {
-                Box::new(infr_llama::model::MetalSeamChat::new(
-                    infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
-                ))
+                // INFR_SPEC_DRAFT=<gguf>: speculative decoding — a small same-tokenizer draft
+                // proposes k tokens (INFR_SPEC_K, default 4), one batched target forward
+                // verifies. Greedy-only; pays off for ~8B-class targets (issue #16).
+                if let Ok(draft_path) = std::env::var("INFR_SPEC_DRAFT") {
+                    let target = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
+                    let draft =
+                        infr_llama::CpuModel::load(std::path::Path::new(&draft_path), None)?;
+                    // Verify cost is nearly flat in k (one batched forward), so a larger k
+                    // amortizes it; 8 balances the draft cost against acceptance decay.
+                    let k = std::env::var("INFR_SPEC_K")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(8);
+                    let (tb, db) = (
+                        std::fs::metadata(&gguf).map(|m| m.len()).unwrap_or(0),
+                        std::fs::metadata(&draft_path).map(|m| m.len()).unwrap_or(0),
+                    );
+                    if db * 4 > tb {
+                        eprintln!(
+                            "[spec] warning: draft is more than 1/4 the target's size — \
+                             speculation only pays when the target is much larger (see #16)"
+                        );
+                    }
+                    std::env::set_var("INFR_TEMP", "0");
+                    eprintln!(
+                        "[metal spec — target + {k}-token draft verify, greedy (INFR_TEMP=0)]"
+                    );
+                    Box::new(infr_llama::model::SpecMetalChat::new(target, draft, k))
+                } else {
+                    Box::new(infr_llama::model::MetalSeamChat::new(
+                        infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+                    ))
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {

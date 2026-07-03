@@ -999,16 +999,33 @@ fn cmd_compare_sweep(
             } else {
                 metric.to_string()
             };
-            let iv = mb.infr(&args);
-            let lv = if metric == "tg64@d" {
+            // A cold/low-power GPU can flub Vulkan device init on the first subprocess launch
+            // after a while-idle; one retry absorbs that without forcing a manual re-run of the
+            // whole sweep for one bad cell.
+            let mut iv = mb.infr(&args);
+            if let Err(e) = &iv {
+                eprintln!("infr bench failed ({short} {metric_label}), retrying once: {e:#}");
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                iv = mb.infr(&args);
+            }
+            let mut lv = if metric == "tg64@d" {
                 mb.llama(np, ng, &["-p", "0", "-n", "64", "-d", &ds])
             } else {
                 mb.llama(np, ng, &args)
             };
-            let is = iv
-                .as_ref()
-                .map(|v| format!("{v:.0}"))
-                .unwrap_or_else(|_| "ERR".into());
+            if lv.is_none() {
+                eprintln!("llama-bench failed ({short} {metric_label}), retrying once");
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                lv = if metric == "tg64@d" {
+                    mb.llama(np, ng, &["-p", "0", "-n", "64", "-d", &ds])
+                } else {
+                    mb.llama(np, ng, &args)
+                };
+            }
+            let is = iv.as_ref().map(|v| format!("{v:.0}")).unwrap_or_else(|e| {
+                eprintln!("infr bench failed ({short} {metric_label}): {e:#}");
+                "ERR".into()
+            });
             let ls = lv.map(|v| format!("{v:.0}")).unwrap_or_else(|| "NA".into());
             let ratio = match (iv.as_ref().ok(), lv) {
                 (Some(&i), Some(l)) if l > 0.0 => {

@@ -288,6 +288,8 @@ impl Drop for WeightProgress {
     }
 }
 
+impl infr_core::backend::ProgressScope for WeightProgress {}
+
 impl VulkanBackend {
     /// `maxComputeSharedMemorySize` for the active device — the per-workgroup shared-memory budget
     /// the flash-attention tile height is sized against (cheap accessor; avoids cloning caps).
@@ -492,7 +494,7 @@ impl VulkanBackend {
     /// `BufferUsage::Weights` allocation advances it automatically — the ticking lives in `alloc`,
     /// so a model loader cannot forget it; it only has to open the scope once. The returned guard
     /// finishes and clears the bar on drop, so the bar's lifetime is the loader's scope.
-    pub fn weight_progress(&self, total_bytes: Option<u64>) -> WeightProgress {
+    fn weight_progress_scope(&self, total_bytes: Option<u64>) -> WeightProgress {
         let pb = infr_core::progress::bar(
             total_bytes,
             "loading weights",
@@ -794,6 +796,13 @@ impl Backend for VulkanBackend {
 
     fn capabilities(&self) -> Capabilities {
         self.shared.caps.clone()
+    }
+
+    fn weight_progress(
+        &self,
+        total_bytes: Option<u64>,
+    ) -> Box<dyn infr_core::backend::ProgressScope> {
+        Box::new(self.weight_progress_scope(total_bytes))
     }
 
     fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {

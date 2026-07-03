@@ -57,6 +57,10 @@ pub enum BufferUsage {
 }
 
 /// Opaque device-memory handle owned by a backend.
+/// RAII scope for a weight-load progress display (see [`Backend::weight_progress`]). Purely a
+/// lifetime marker: constructing it starts the display, dropping it finishes/clears it.
+pub trait ProgressScope: Send {}
+
 pub trait Buffer: Send + Sync {
     fn len_bytes(&self) -> usize;
     /// Downcast hook so a backend can recover its concrete buffer type from a `&dyn Buffer`
@@ -142,6 +146,17 @@ pub trait Backend: Send + Sync {
     }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
+    /// Open a weight-load progress scope: while the returned guard lives, this backend's weight
+    /// allocations (`BufferUsage::Weights`/`HostWeights`) advance a visible progress display;
+    /// dropping the guard finishes and clears it. The ticking lives in each backend's `alloc`, so
+    /// no loader can forget a tensor — a loader only opens the scope around its upload loop.
+    /// Backends without a display (the CPU interpreter's zero-copy mmap load is instant) keep
+    /// this default no-op scope.
+    fn weight_progress(&self, _total_bytes: Option<u64>) -> Box<dyn ProgressScope> {
+        struct NoProgress;
+        impl ProgressScope for NoProgress {}
+        Box::new(NoProgress)
+    }
     /// Copy the first `bytes` of `src` into the start of `dst` (both buffers this backend's).
     /// The KV prefix-sharing primitive: a new chat slot seeds its cache from another slot's
     /// common prefix instead of re-prefilling it. Default is a host bounce (download the whole

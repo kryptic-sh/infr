@@ -74,6 +74,10 @@ pub struct MetalBackend {
     /// elems + f16 (d, dmin) per quant block — that the `linear_quik*` kernels decode inline.
     /// ~6-8 bpw vs f32's 32, and reconstructs the exact same value.
     qui_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<exec::QuiWeight>>>,
+    /// Active weight-load progress bar (see [`Backend::weight_progress`]): every
+    /// `BufferUsage::Weights`/`HostWeights` allocation advances it (the funnel lives in `alloc`,
+    /// so no loader can forget a tensor).
+    weight_pb: std::sync::Arc<std::sync::Mutex<Option<indicatif::ProgressBar>>>,
     /// Opt-in execution profiler; active only when `INFR_METAL_PROFILE` is set. `profiling` is
     /// cached so the hot path avoids an env lookup and skips the `Instant` calls when off.
     /// `prof_ops` (`INFR_METAL_PROFILE=2`) additionally flushes after each op to attribute GPU wall
@@ -103,6 +107,7 @@ impl MetalBackend {
             pipelines,
             weight_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             qui_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            weight_pb: std::sync::Arc::new(std::sync::Mutex::new(None)),
             profiling: std::env::var("INFR_METAL_PROFILE").is_ok(),
             prof_ops: std::env::var("INFR_METAL_PROFILE").as_deref() == Ok("2"),
             prof: std::sync::Mutex::new(profile::Profile::default()),
@@ -122,6 +127,29 @@ impl Drop for MetalBackend {
 impl Backend for MetalBackend {
     fn name(&self) -> &str {
         "metal"
+    }
+
+    fn weight_progress(
+        &self,
+        total_bytes: Option<u64>,
+    ) -> Box<dyn infr_core::backend::ProgressScope> {
+        let pb = infr_core::progress::bar(
+            total_bytes,
+            "loading weights",
+            infr_core::progress::Unit::Bytes,
+        );
+        *self.weight_pb.lock().unwrap() = Some(pb);
+        /// RAII scope over the shared bar cell: dropping finishes and clears the display.
+        struct Scope(std::sync::Arc<std::sync::Mutex<Option<indicatif::ProgressBar>>>);
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                if let Some(pb) = self.0.lock().unwrap().take() {
+                    pb.finish_and_clear();
+                }
+            }
+        }
+        impl infr_core::backend::ProgressScope for Scope {}
+        Box::new(Scope(std::sync::Arc::clone(&self.weight_pb)))
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -148,7 +176,7 @@ impl Backend for MetalBackend {
     fn alloc(
         &self,
         bytes: usize,
-        _usage: BufferUsage,
+        usage: BufferUsage,
     ) -> Result<Box<dyn infr_core::backend::Buffer>> {
         let len = bytes.max(4);
         let raw = self
@@ -156,6 +184,13 @@ impl Backend for MetalBackend {
             .new_buffer(len as u64, metal::MTLResourceOptions::StorageModeShared);
         // calloc contract: MTL buffers are not guaranteed zeroed; memset the (host-visible) contents.
         unsafe { std::ptr::write_bytes(raw.contents() as *mut u8, 0u8, len) };
+        // Advance the weight-load progress bar (if a scope is open) — the single funnel every
+        // weight upload passes through (mirrors the Vulkan backend).
+        if matches!(usage, BufferUsage::Weights | BufferUsage::HostWeights) {
+            if let Some(pb) = self.weight_pb.lock().unwrap().as_ref() {
+                pb.inc(bytes as u64);
+            }
+        }
         Ok(Box::new(MetalBuffer { raw, len }))
     }
 

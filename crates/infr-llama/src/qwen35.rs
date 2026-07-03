@@ -1242,6 +1242,10 @@ impl SeamModel {
             .map(|x| x as u32);
         let im_end = tok.token_to_id("<|im_end|>");
         let attn = |i: usize| c.is_attn_layer(i);
+        // Weight-load progress: the backend's alloc(Weights) ticks it; open the scope around the
+        // upload loop (no-op scope on backends without a display). Guard drops at end of `load`.
+        let fp = crate::weights::weight_footprint(g);
+        let _weight_pb = be.weight_progress(Some(fp.dense + fp.expert));
         // ── upload weights in native GGUF dtype (the backend dequants on read). Order MUST equal the
         //    `wpush` order in `build`. ──────────────────────────────────────────────────────────────────
         let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();

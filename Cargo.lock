@@ -1210,6 +1210,7 @@ version = "0.0.0"
 dependencies = [
  "bytemuck",
  "half",
+ "indicatif",
  "infr-core",
  "infr-cpu",
  "infr-gguf",

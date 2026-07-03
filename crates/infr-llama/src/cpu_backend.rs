@@ -213,16 +213,6 @@ pub(crate) fn generate_dense_gpu_session(
             .and_then(|l| l.parse::<usize>().ok())
             .is_some_and(|l| l < n_host_moe)
     };
-    // Weight-load progress bar: every BufferUsage::Weights/HostWeights allocation ticks it
-    // backend-side (the funnel lives in `alloc`, so no loader can forget a tensor) — this scope
-    // only has to exist while the upload runs. Open it for the FIRST call only (session init);
-    // warm sessions upload nothing. Sized by the GGUF's resident footprint (dense + experts).
-    let _weight_pb = if state.is_none() {
-        let fp = crate::weights::weight_footprint(g);
-        Some(vk.weight_progress(Some(fp.dense + fp.expert)))
-    } else {
-        None
-    };
     generate_dense_backend(
         vk,
         &|name, tb, dt, _n| {
@@ -613,6 +603,12 @@ pub(crate) fn generate_dense_backend(
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {
+        // Weight-load progress: opened HERE — the single weight-upload funnel every runner path
+        // (CPU/Vulkan/Metal × one-shot/session/bench/serve) goes through — so no entry point can
+        // load without it. The ticking lives in each backend's `alloc` (Weights/HostWeights);
+        // backends without a display return a no-op scope. Guard drops when the init block ends.
+        let fp = crate::weights::weight_footprint(g);
+        let _weight_pb = be.weight_progress(Some(fp.dense + fp.expert));
         // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
         //    lazily in `bytes_to_f32`, so a quant weight occupies ~quant size, not 8× f32). `wspecs`
         //    records each (dtype, numel) so `build` can declare the handle with the matching dtype; its

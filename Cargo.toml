@@ -72,3 +72,15 @@ dirs = "5"
 tokenizers = "0.20"
 llguidance = "1"
 toktrie_hf_tokenizers = "1"
+
+# `cargo test` builds dev (-O0); the CPU interpreter, GGUF dequant, and f16 conversions at -O0 are
+# 10-50x slower, which turns the locally-gated model tests (CI skips them — no GGUFs in its cache)
+# into minutes EACH. Optimize just the compute crates in dev; test binaries and the harness stay
+# -O0 for fast edit-compile cycles. rustc floats are IEEE at every opt level (no fast-math, no FMA
+# contraction), so the bit-exact CPU goldens are unaffected.
+[profile.dev.package.infr-cpu]
+opt-level = 3
+[profile.dev.package.infr-gguf]
+opt-level = 3
+[profile.dev.package.half]
+opt-level = 3

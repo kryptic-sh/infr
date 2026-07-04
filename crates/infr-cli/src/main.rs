@@ -431,40 +431,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             );
             #[cfg(target_os = "macos")]
             {
-                // INFR_SPEC_DRAFT=<gguf>: speculative decoding — a small same-tokenizer draft
-                // proposes k tokens (INFR_SPEC_K, default 4), one batched target forward
-                // verifies. Greedy-only; pays off for ~8B-class targets (issue #16).
-                if let Ok(draft_path) = std::env::var("INFR_SPEC_DRAFT") {
-                    let target = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
-                    let draft =
-                        infr_llama::CpuModel::load(std::path::Path::new(&draft_path), None)?;
-                    // Upper bound on the draft length; the driver adapts the actual k per
-                    // round to recent acceptance (verify cost scales with rows on this
-                    // hardware, so over-drafting low-acceptance text costs real time).
-                    let k = std::env::var("INFR_SPEC_K")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(6);
-                    let (tb, db) = (
-                        std::fs::metadata(&gguf).map(|m| m.len()).unwrap_or(0),
-                        std::fs::metadata(&draft_path).map(|m| m.len()).unwrap_or(0),
-                    );
-                    if db * 4 > tb {
-                        eprintln!(
-                            "[spec] warning: draft is more than 1/4 the target's size — \
-                             speculation only pays when the target is much larger (see #16)"
-                        );
-                    }
-                    std::env::set_var("INFR_TEMP", "0");
-                    eprintln!(
-                        "[metal spec — target + {k}-token draft verify, greedy (INFR_TEMP=0)]"
-                    );
-                    Box::new(infr_llama::model::SpecMetalChat::new(target, draft, k))
-                } else {
-                    Box::new(infr_llama::model::MetalSeamChat::new(
-                        infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
-                    ))
-                }
+                metal_chat_model(&gguf, tok.as_deref())?
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -548,6 +515,48 @@ fn run_chat_turn(
         rate(stats.n_gen, stats.decode_secs),
     );
     Ok(())
+}
+
+/// The Metal dense/MoE [`ChatModel`] for run AND serve: the persistent-session seam chat, or —
+/// with `INFR_SPEC_DRAFT=<gguf>` — speculative decoding (a small same-tokenizer draft proposes up
+/// to `INFR_SPEC_K` tokens per round, default 6; one batched target forward verifies; greedy-only,
+/// pays off for ~8B-class targets — issue #16). One selection funnel so run and serve can never
+/// disagree on how the Metal model is built.
+#[cfg(target_os = "macos")]
+fn metal_chat_model(
+    gguf: &Path,
+    tok: Option<&Path>,
+) -> anyhow::Result<Box<dyn infr_llama::model::ChatModel + Send>> {
+    if let Ok(draft_path) = std::env::var("INFR_SPEC_DRAFT") {
+        let target = infr_llama::CpuModel::load(gguf, tok)?;
+        let draft = infr_llama::CpuModel::load(std::path::Path::new(&draft_path), None)?;
+        // Upper bound on the draft length; the driver adapts the actual k per round to recent
+        // acceptance (verify cost scales with rows on this hardware, so over-drafting
+        // low-acceptance text costs real time).
+        let k = std::env::var("INFR_SPEC_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6);
+        let (tb, db) = (
+            std::fs::metadata(gguf).map(|m| m.len()).unwrap_or(0),
+            std::fs::metadata(&draft_path).map(|m| m.len()).unwrap_or(0),
+        );
+        if db * 4 > tb {
+            eprintln!(
+                "[spec] warning: draft is more than 1/4 the target's size — \
+                 speculation only pays when the target is much larger (see #16)"
+            );
+        }
+        std::env::set_var("INFR_TEMP", "0");
+        eprintln!("[metal spec — target + {k}-token draft verify, greedy (INFR_TEMP=0)]");
+        Ok(Box::new(infr_llama::model::SpecMetalChat::new(
+            target, draft, k,
+        )))
+    } else {
+        Ok(Box::new(infr_llama::model::MetalSeamChat::new(
+            infr_llama::CpuModel::load(gguf, tok)?,
+        )))
+    }
 }
 
 /// Serve adapter for the seam-backed [`ChatModel`]s (qwen35 on any backend, dense/MoE on the
@@ -1291,13 +1300,13 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
             infr_llama::model::Qwen35Chat::new(gguf.clone())
         })
     } else if std::env::var("INFR_METAL").is_ok() {
-        // Metal: the persistent-session seam chat on macOS (the Vulkan session's Apple twin);
-        // the stateless reference wrapper elsewhere (the arm is unreachable off-macOS anyway).
+        // Metal: the SAME selection funnel as `infr run` — persistent-session seam chat, or
+        // speculative decoding with INFR_SPEC_DRAFT (serve requests then decode through the
+        // draft-verify driver; greedy-only). Stateless reference wrapper elsewhere (the arm is
+        // unreachable off-macOS anyway).
         #[cfg(target_os = "macos")]
         {
-            Box::new(infr_llama::model::MetalSeamChat::new(
-                infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
-            ))
+            metal_chat_model(&gguf, tok.as_deref())?
         }
         #[cfg(not(target_os = "macos"))]
         {

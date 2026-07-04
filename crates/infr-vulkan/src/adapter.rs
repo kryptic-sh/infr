@@ -81,6 +81,17 @@ fn is_kv_quant(dt: infr_core::DType) -> bool {
     matches!(dt, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Iq4Nl)
 }
 
+/// Dense non-f16 KV caches (f32/bf16): stored via a cast-store, read via a cast→f16 prepass.
+fn is_kv_dense_alt(dt: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(dt, F32 | Bf16)
+}
+
+/// Any KV cache dtype that rides the dequant/cast → f16 prepass (not f16 or native-Q8).
+fn is_kv_prepass(dt: infr_core::DType) -> bool {
+    is_kv_quant(dt) || is_kv_dense_alt(dt)
+}
+
 fn decode_eligible(graph: &Graph) -> bool {
     // INFR_SEAM_NO_REPLAY forces the static per-execute path (INFR_PROF2 timestamps work there;
     // the replay path can't report them).
@@ -112,8 +123,8 @@ fn decode_eligible(graph: &Graph) -> bool {
                 // the replay and drop this so Q8 decode gets the record-once speedup too.
                 if matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0)
                     || matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0)
-                    || is_kv_quant(graph.desc(*k_cache).dtype)
-                    || is_kv_quant(graph.desc(*v_cache).dtype)
+                    || is_kv_prepass(graph.desc(*k_cache).dtype)
+                    || is_kv_prepass(graph.desc(*v_cache).dtype)
                 {
                     return false;
                 }
@@ -738,6 +749,10 @@ fn lower_op(
                 RopeMode::Static(_) if is_kv_quant(cache_dt) => {
                     rec.quant_kv(cache_dt, s, c, n, pos * rs, src_f16)
                 }
+                // Dense f32/bf16 cache: cast-store the row (also static-only).
+                RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => {
+                    rec.store_kv_dense(cache_dt, s, c, n, pos * rs, src_f16)
+                }
                 RopeMode::Static(_) => match graph.desc(*src).dtype {
                     infr_core::DType::F16 => rec.copy(s, 0, c, pos * rs * 2, n * 2),
                     _ => rec.store_f16(s, c, n, pos * rs),
@@ -1026,22 +1041,22 @@ fn lower_op(
                 // split/scalar kernels — the scalar O(kv²) path TDR-hangs at depth). The mainline
                 // low-bit quants (q4_0/…/iq4_nl) have no native read, so they dequant on EVERY pass
                 // (prefill + decode). The persistent cache stays quantized (footprint preserved).
-                let k_new = is_kv_quant(graph.desc(*k_cache).dtype);
-                let v_new = is_kv_quant(graph.desc(*v_cache).dtype);
-                let deq_k = (k_q8 && rows > 1) || k_new;
-                let deq_v = (v_q8 && rows > 1) || v_new;
+                let kdt = graph.desc(*k_cache).dtype;
+                let vdt = graph.desc(*v_cache).dtype;
+                let deq_k = (k_q8 && rows > 1) || is_kv_prepass(kdt);
+                let deq_v = (v_q8 && rows > 1) || is_kv_prepass(vdt);
                 let ne = kv_len * nkv * hd;
+                // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
+                // else the shared quant/bf16 dequant (dequant_kv_f16).
                 let kc_key = if deq_k {
                     let k = pooled(pool, be_, "kvdeq_k", ne * 2)?;
+                    let sc = pool[&k].as_ref();
                     if k_q8 {
-                        rec.dequant_q8_f16(r(*k_cache)?, pool[&k].as_ref(), ne, cap);
+                        rec.dequant_q8_f16(r(*k_cache)?, sc, ne, cap);
+                    } else if matches!(kdt, infr_core::DType::F32) {
+                        rec.store_f16(r(*k_cache)?, sc, ne, 0);
                     } else {
-                        rec.dequant_kv_f16(
-                            graph.desc(*k_cache).dtype,
-                            r(*k_cache)?,
-                            pool[&k].as_ref(),
-                            ne,
-                        );
+                        rec.dequant_kv_f16(kdt, r(*k_cache)?, sc, ne);
                     }
                     Some(k)
                 } else {
@@ -1049,15 +1064,13 @@ fn lower_op(
                 };
                 let vc_key = if deq_v {
                     let k = pooled(pool, be_, "kvdeq_v", ne * 2)?;
+                    let sc = pool[&k].as_ref();
                     if v_q8 {
-                        rec.dequant_q8_f16(r(*v_cache)?, pool[&k].as_ref(), ne, cap);
+                        rec.dequant_q8_f16(r(*v_cache)?, sc, ne, cap);
+                    } else if matches!(vdt, infr_core::DType::F32) {
+                        rec.store_f16(r(*v_cache)?, sc, ne, 0);
                     } else {
-                        rec.dequant_kv_f16(
-                            graph.desc(*v_cache).dtype,
-                            r(*v_cache)?,
-                            pool[&k].as_ref(),
-                            ne,
-                        );
+                        rec.dequant_kv_f16(vdt, r(*v_cache)?, sc, ne);
                     }
                     Some(k)
                 } else {

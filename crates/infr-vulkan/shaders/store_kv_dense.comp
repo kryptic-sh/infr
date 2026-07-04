@@ -1,0 +1,36 @@
+#version 460
+// Cast KV activations into a DENSE KV cache: -DDST_F32 (f32 cache) or -DDST_BF16 (bf16 cache), from
+// an f16 source (-DSRC_F16, the roped K) or f32 (V). One thread per element, at element offset `off`.
+// The read side expands these back to an f16 scratch (f32→f16 reuses store_f16; bf16→f16 uses the
+// dequant_kv FMT_BF16 path), so the standard f16 attention runs on them — GPU attention is f16, so
+// f32/bf16 KV is a storage/format choice bounded by the f16 query precision (bf16→f16 is lossless
+// in-range).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint n; uint off; } pc;
+#ifdef SRC_F16
+layout(binding = 0) readonly buffer SB { float16_t src[]; };
+#else
+layout(binding = 0) readonly buffer SB { float src[]; };
+#endif
+#ifdef DST_BF16
+layout(binding = 1) writeonly buffer DB { uint16_t dst[]; };
+#else
+layout(binding = 1) writeonly buffer DB { float dst[]; };
+#endif
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) { return; }
+    float v = float(src[i]);
+#ifdef DST_BF16
+    // bf16 = top 16 bits of f32, round-to-nearest-even.
+    uint b = floatBitsToUint(v);
+    dst[pc.off + i] = uint16_t((b + 0x7FFFu + ((b >> 16) & 1u)) >> 16);
+#else
+    dst[pc.off + i] = v;
+#endif
+}

@@ -133,6 +133,21 @@ fn main() {
         ("dequant_kv_f16", "dequant_kv_q5_0", &["-DFMT_Q5_0"]),
         ("dequant_kv_f16", "dequant_kv_q5_1", &["-DFMT_Q5_1"]),
         ("dequant_kv_f16", "dequant_kv_iq4_nl", &["-DFMT_IQ4NL"]),
+        // Dense KV caches (f32/bf16): a cast-store per (dst, src) + the bf16→f16 read (native_decode
+        // FMT_BF16). f32→f16 read reuses store_f16. K = f16 source, V = f32 source.
+        ("store_kv_dense", "store_kv_f32", &["-DDST_F32"]),
+        (
+            "store_kv_dense",
+            "store_kv_f32_from_f16",
+            &["-DDST_F32", "-DSRC_F16"],
+        ),
+        ("store_kv_dense", "store_kv_bf16", &["-DDST_BF16"]),
+        (
+            "store_kv_dense",
+            "store_kv_bf16_from_f16",
+            &["-DDST_BF16", "-DSRC_F16"],
+        ),
+        ("dequant_kv_f16", "dequant_kv_bf16", &["-DFMT_BF16"]),
         ("rope", "rope", &[]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),

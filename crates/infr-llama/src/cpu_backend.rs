@@ -378,6 +378,9 @@ fn kv_forces_static(dt: DType) -> bool {
             | DType::Turbo2
             | DType::Turbo3
             | DType::Turbo4
+            // Dense f32/bf16 caches also un-fuse the K write on the GPU → force static decode.
+            | DType::F32
+            | DType::Bf16
     )
 }
 
@@ -695,6 +698,8 @@ pub(crate) fn generate_dense_backend(
     // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan (Vulkan uses a dequant→f16 prepass);
     // need 32-block alignment. f32/bf16 KV stay CPU-only (no GPU dense-KV path yet).
     let blk_ok = matches!(be.name(), "cpu" | "vulkan") && kv_align_ok;
+    // Dense f32/bf16 KV: CPU + Vulkan (Vulkan stores dense + reads via a cast→f16 prepass).
+    let dense_ok = matches!(be.name(), "cpu" | "vulkan");
     let parse_kv_fmt = |var: &str| -> DType {
         let side = std::env::var(var).ok();
         match side.as_deref() {
@@ -707,8 +712,8 @@ pub(crate) fn generate_dense_backend(
             Some("q5_0") if blk_ok => DType::Q5_0,
             Some("q5_1") if blk_ok => DType::Q5_1,
             Some("iq4_nl") if blk_ok => DType::Iq4Nl,
-            Some("bf16") if cpu => DType::Bf16,
-            Some("f32") if cpu => DType::F32,
+            Some("bf16") if dense_ok => DType::Bf16,
+            Some("f32") if dense_ok => DType::F32,
             Some("f16") | Some("F16") => DType::F16,
             // unset/unknown → legacy INFR_KV_Q8 alias (both sides q8) or f16.
             _ if std::env::var("INFR_KV_Q8").is_ok() && kv_align_ok && kv_q8_backend => DType::Q8_0,

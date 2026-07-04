@@ -1882,6 +1882,32 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Cast-store `src[0..n]` → a DENSE KV cache of `dst_dt` (F32/Bf16) at element offset `off`.
+    /// `src_f16` = f16 source (roped K); f32 otherwise (V). One thread per element.
+    pub fn store_kv_dense(
+        &self,
+        dst_dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        src_f16: bool,
+    ) {
+        self.stamp("store_kv_dense");
+        let (name, spv) = crate::gemm::store_kv_dense_kernel(dst_dt, src_f16);
+        let k = self.be.kernel(name, spv, 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            (n as u32).div_ceil(64),
+        );
+    }
+
     /// Expand `n` elements of a standard-GGUF-block KV cache of `dt` → an f16 buffer (reuses the
     /// native_decode `dq()`), so the f16 attention can read a quantized KV prefix. One thread/element.
     pub fn dequant_kv_f16(

@@ -492,16 +492,23 @@ fn gpu_seam_kv_mainline_quants_coherent() {
     // Long enough (>64 tokens) to take the flash prefill on the dequanted scratch, then deep decode.
     let long =
         "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
-    std::env::set_var("INFR_KV_TYPE_K", "f16");
-    for v in ["q4_0", "q4_1", "q5_0", "q5_1", "iq4_nl"] {
+    // K=f16 with each quantized V, plus the dense f32/bf16 caches (coupled).
+    for (k, v) in [
+        ("f16", "q4_0"),
+        ("f16", "q4_1"),
+        ("f16", "q5_0"),
+        ("f16", "q5_1"),
+        ("f16", "iq4_nl"),
+        ("f32", "f32"),
+        ("bf16", "bf16"),
+    ] {
+        std::env::set_var("INFR_KV_TYPE_K", k);
         std::env::set_var("INFR_KV_TYPE_V", v);
         let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
-        let out = model
-            .generate_dense_vulkan(&long, 24)
-            .expect("gpu kv-quant gen");
+        let out = model.generate_dense_vulkan(&long, 24).expect("gpu kv gen");
         assert!(
             !is_degenerate(&out),
-            "GPU K=f16 V={v} degenerate: {:?}",
+            "GPU K={k} V={v} degenerate: {:?}",
             head(&out)
         );
     }

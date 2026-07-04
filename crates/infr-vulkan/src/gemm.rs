@@ -920,6 +920,27 @@ dyn_spv!(dequant_kv_q4_1_spv, "dequant_kv_q4_1");
 dyn_spv!(dequant_kv_q5_0_spv, "dequant_kv_q5_0");
 dyn_spv!(dequant_kv_q5_1_spv, "dequant_kv_q5_1");
 dyn_spv!(dequant_kv_iq4_nl_spv, "dequant_kv_iq4_nl");
+dyn_spv!(dequant_kv_bf16_spv, "dequant_kv_bf16");
+// Dense KV cast-store (f32 / bf16 cache, from f16 K or f32 V).
+dyn_spv!(store_kv_f32_spv, "store_kv_f32");
+dyn_spv!(store_kv_f32_from_f16_spv, "store_kv_f32_from_f16");
+dyn_spv!(store_kv_bf16_spv, "store_kv_bf16");
+dyn_spv!(store_kv_bf16_from_f16_spv, "store_kv_bf16_from_f16");
+
+/// (kernel name, SPIR-V) for the dense KV cast-store into `dst_dt` (F32/Bf16), `src_f16` = f16 K.
+pub(crate) fn store_kv_dense_kernel(
+    dst_dt: infr_core::DType,
+    src_f16: bool,
+) -> (&'static str, &'static [u32]) {
+    use infr_core::DType::*;
+    match (dst_dt, src_f16) {
+        (F32, false) => ("store_kv_f32", store_kv_f32_spv()),
+        (F32, true) => ("store_kv_f32_from_f16", store_kv_f32_from_f16_spv()),
+        (Bf16, false) => ("store_kv_bf16", store_kv_bf16_spv()),
+        (Bf16, true) => ("store_kv_bf16_from_f16", store_kv_bf16_from_f16_spv()),
+        _ => unreachable!("store_kv_dense_kernel for non-dense KV dtype {dst_dt:?}"),
+    }
+}
 
 /// (kernel name, SPIR-V) for the KV quantize kernel of `dt` (`src_f16` = f16 K source, else f32 V).
 /// Distinct names per variant so the recorder's name-keyed pipeline cache never collides.
@@ -952,7 +973,8 @@ pub(crate) fn dequant_kv_kernel(dt: infr_core::DType) -> (&'static str, &'static
         Q5_0 => ("dequant_kv_q5_0", dequant_kv_q5_0_spv()),
         Q5_1 => ("dequant_kv_q5_1", dequant_kv_q5_1_spv()),
         Iq4Nl => ("dequant_kv_iq4_nl", dequant_kv_iq4_nl_spv()),
-        _ => unreachable!("dequant_kv_kernel for non-KV-quant dtype {dt:?}"),
+        Bf16 => ("dequant_kv_bf16", dequant_kv_bf16_spv()),
+        _ => unreachable!("dequant_kv_kernel for non-prepass KV dtype {dt:?}"),
     }
 }
 // Coupled Q8_0 KV: coalesced split-K decode partials reading Q8 blocks (static / dyn / self-chunk).

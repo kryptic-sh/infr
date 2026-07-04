@@ -240,7 +240,10 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
                 }
             }
             Op::WriteKv { cache, .. } => {
-                if !matches!(g.desc(*cache).dtype, DType::F16 | DType::Q8_0) {
+                if !matches!(
+                    g.desc(*cache).dtype,
+                    DType::F16 | DType::Q8_0 | DType::Q4_0 | DType::Iq4Nl
+                ) {
                     return false;
                 }
             }
@@ -248,13 +251,17 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
                 rows,
                 head_dim,
                 k_cache,
+                v_cache,
                 ..
             } => {
                 has_attn = true;
-                if *rows != 1
-                    || !matches!(*head_dim, 64 | 128 | 256)
-                    || !matches!(g.desc(*k_cache).dtype, DType::F16 | DType::Q8_0)
-                {
+                let (kdt, vdt) = (g.desc(*k_cache).dtype, g.desc(*v_cache).dtype);
+                // f16/q8 are coupled by the runner's clamp; q4_0/iq4_nl compose per-side in
+                // general but only the COUPLED shape has a native-read dyn kernel — a mixed
+                // pair keeps the static prepass path.
+                let native = matches!(kdt, DType::F16 | DType::Q8_0)
+                    || (kdt == vdt && matches!(kdt, DType::Q4_0 | DType::Iq4Nl));
+                if *rows != 1 || !matches!(*head_dim, 64 | 128 | 256) || !native {
                     return false;
                 }
             }
@@ -269,6 +276,25 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
         }
     }
     has_rope && has_attn
+}
+
+/// Dynamic-pos vector attention kernel for a KV cache dtype (`replay_shape` admitted it): the
+/// name feeds both the recording route and the pipeline-cap check, so they can never disagree.
+fn dyn_attnvec_kern(dt: DType, hd: usize) -> &'static str {
+    match (dt, hd) {
+        (DType::Q8_0, 64) => "attnvec_dyn_q8kv_hd64",
+        (DType::Q8_0, 256) => "attnvec_dyn_q8kv_hd256",
+        (DType::Q8_0, _) => "attnvec_dyn_q8kv_hd128",
+        (DType::Q4_0, 64) => "attnvec_dyn_q4_0kv_hd64",
+        (DType::Q4_0, 256) => "attnvec_dyn_q4_0kv_hd256",
+        (DType::Q4_0, _) => "attnvec_dyn_q4_0kv_hd128",
+        (DType::Iq4Nl, 64) => "attnvec_dyn_iq4nlkv_hd64",
+        (DType::Iq4Nl, 256) => "attnvec_dyn_iq4nlkv_hd256",
+        (DType::Iq4Nl, _) => "attnvec_dyn_iq4nlkv_hd128",
+        (_, 64) => "attnvec_dyn_f16kv_hd64",
+        (_, 256) => "attnvec_dyn_f16kv_hd256",
+        _ => "attnvec_dyn_f16kv_hd128",
+    }
 }
 
 /// Reinterpret raw buffer bytes as `f32` per `dtype` (dequantizing quant/f16/bf16, widening integer
@@ -759,14 +785,7 @@ impl MetalBackend {
                     k_cache,
                     ..
                 } => Some((
-                    match (g.desc(*k_cache).dtype == DType::Q8_0, hd) {
-                        (false, 64) => "attnvec_dyn_f16kv_hd64",
-                        (false, 256) => "attnvec_dyn_f16kv_hd256",
-                        (false, _) => "attnvec_dyn_f16kv_hd128",
-                        (true, 64) => "attnvec_dyn_q8kv_hd64",
-                        (true, 256) => "attnvec_dyn_q8kv_hd256",
-                        (true, _) => "attnvec_dyn_q8kv_hd128",
-                    },
+                    dyn_attnvec_kern(g.desc(*k_cache).dtype, *hd as usize),
                     // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
                     if *hd == 256 { 512 } else { 1024 },
                 )),
@@ -1896,18 +1915,25 @@ impl MetalBackend {
                 );
                 let base = pos * rs;
                 let n = rows * rs;
-                let q8 = g.desc(cache).dtype == DType::Q8_0;
                 if let Some(posbuf) = r.posbuf.clone() {
                     // Recording a replay tape: the row offset must come from the positions buffer
-                    // (the baked `pos` is this token's only) — f16/q8 cache guaranteed by the gate.
-                    let pso = self.pipelines.get(if q8 {
-                        "writekv_dyn_q8"
-                    } else {
-                        "writekv_dyn_f16"
-                    })?;
+                    // (the baked `pos` is this token's only) — f16/q8/q4_0/iq4_nl cache
+                    // guaranteed by the gate; the quantizing variants run one thread per block.
+                    let dt = g.desc(cache).dtype;
+                    let kern = match dt {
+                        DType::Q8_0 => "writekv_dyn_q8",
+                        DType::Q4_0 => "writekv_dyn_q4_0",
+                        DType::Iq4Nl => "writekv_dyn_iq4_nl",
+                        _ => "writekv_dyn_f16",
+                    };
+                    let pso = self.pipelines.get(kern)?;
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(rs as u32).to_ne_bytes());
-                    let threads = if q8 { n / 32 } else { n };
+                    let threads = if matches!(dt, DType::Q8_0 | DType::Q4_0 | DType::Iq4Nl) {
+                        n / 32
+                    } else {
+                        n
+                    };
                     self.encode_w(
                         r,
                         &pso,
@@ -2000,19 +2026,13 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
                 };
                 if let Some(posbuf) = r.posbuf.clone() {
-                    // Recording a replay tape (rows==1, f16/q8 cache, hd 64/128 — checked by the
-                    // gate): route straight to the dynamic-pos vector flash kernel, which reads
-                    // pos from the positions buffer and covers every kv_len from 1 up. The usual
-                    // shape routing below would bake this token's kv_len into the kernel CHOICE,
-                    // which is exactly what a replayed tape can't have.
-                    let kern = match (g.desc(k_cache).dtype == DType::Q8_0, hd) {
-                        (false, 64) => "attnvec_dyn_f16kv_hd64",
-                        (false, 256) => "attnvec_dyn_f16kv_hd256",
-                        (false, _) => "attnvec_dyn_f16kv_hd128",
-                        (true, 64) => "attnvec_dyn_q8kv_hd64",
-                        (true, 256) => "attnvec_dyn_q8kv_hd256",
-                        (true, _) => "attnvec_dyn_q8kv_hd128",
-                    };
+                    // Recording a replay tape (rows==1, f16/q8/coupled-q4_0/iq4_nl cache, hd
+                    // 64/128/256 — checked by the gate): route straight to the dynamic-pos
+                    // vector flash kernel, which reads pos from the positions buffer and covers
+                    // every kv_len from 1 up. The usual shape routing below would bake this
+                    // token's kv_len into the kernel CHOICE, which is exactly what a replayed
+                    // tape can't have.
+                    let kern = dyn_attnvec_kern(g.desc(k_cache).dtype, hd);
                     // hd=256 instantiates at NSG=16 (see the shader) — half the threadgroup.
                     let nsg = if hd == 256 { 16 } else { 32 };
                     let pso = self.pipelines.get(kern)?;
@@ -2060,6 +2080,58 @@ impl MetalBackend {
                 };
                 let kdt = g.desc(k_cache).dtype;
                 let vdt = g.desc(v_cache).dtype;
+                // Coupled q4_0/iq4_nl at decode-class shapes (few rows, deep kv): read the
+                // compact 18 B blocks natively with the vector flash — no scratch allocation,
+                // no whole-prefix re-dequant per token (the prepass costs O(kv_len) dequant
+                // work EVERY token, which measured 3x slower than f16 at d4096), and f32
+                // accumulation over exactly-decoded values. Wide prefill keeps the prepass:
+                // the vector kernel's one-threadgroup-per-(row, head) shape is serial over kv
+                // and loses to dequant-once + flash there.
+                let nat4_kern = || -> Option<&'static str> {
+                    match (kdt, hd) {
+                        (DType::Q4_0, 64) => Some("attnvec_q4_0kv_hd64"),
+                        (DType::Q4_0, 128) => Some("attnvec_q4_0kv_hd128"),
+                        (DType::Q4_0, 256) => Some("attnvec_q4_0kv_hd256"),
+                        (DType::Iq4Nl, 64) => Some("attnvec_iq4nlkv_hd64"),
+                        (DType::Iq4Nl, 128) => Some("attnvec_iq4nlkv_hd128"),
+                        (DType::Iq4Nl, 256) => Some("attnvec_iq4nlkv_hd256"),
+                        _ => None,
+                    }
+                };
+                // No kv_len floor: the replay tape's dyn kernel reads natively from token 1, so
+                // the static walk must too — a shallow-kv prepass here would make replay-on/off
+                // decode diverge (f16 scratch rounding vs exact f32) on the earliest tokens.
+                if kdt == vdt && rows <= 8 {
+                    if let Some(kern) = nat4_kern() {
+                        let nsg = if hd == 256 { 16 } else { 32 };
+                        let cap_ok = self
+                            .pipelines
+                            .get(kern)
+                            .map(|pl| pl.max_total_threads_per_threadgroup() >= nsg as u64 * 32)
+                            .unwrap_or(false);
+                        if cap_ok {
+                            let pso = self.pipelines.get(kern)?;
+                            let mut p = (rows as u32).to_ne_bytes().to_vec();
+                            p.extend_from_slice(&(kv_len as u32).to_ne_bytes());
+                            p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                            p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                            p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                            p.extend_from_slice(&scale.to_ne_bytes());
+                            p.extend_from_slice(&window.to_ne_bytes());
+                            p.extend_from_slice(&pos.to_ne_bytes());
+                            self.encode_tg(
+                                r,
+                                &pso,
+                                &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                                &p,
+                                rows * nh * nsg * 32,
+                                nsg * 32,
+                            );
+                            r.loc[dst.0 as usize] = Loc::Device;
+                            return Ok(());
+                        }
+                    }
+                }
                 let ne = kv_len * nkv * hd;
                 let ks: Option<Arc<MtlBuffer>> = if prep(kdt) {
                     let s = Arc::new(self.device.new_buffer(

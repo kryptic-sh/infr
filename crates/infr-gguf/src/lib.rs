@@ -304,6 +304,13 @@ fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
     (numel / be) * bb
 }
 
+/// Bytes occupied by `numel` elements of `dtype` in its GGUF block layout (`numel` must be a whole
+/// number of blocks). Public helper so backends can size a block-aligned prefix (e.g. a quantized
+/// KV cache: dequant only the first `kv_len` rows).
+pub fn nbytes(dtype: DType, numel: usize) -> usize {
+    tensor_nbytes(dtype, numel)
+}
+
 // ─── Gguf::open ───────────────────────────────────────────────────────────────
 
 impl Gguf {

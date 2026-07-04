@@ -9,6 +9,7 @@
 //! the GPU backends are validated against.
 #![allow(clippy::needless_range_loop)]
 
+pub mod kvquant;
 pub mod turbo;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
@@ -2753,6 +2754,12 @@ impl Backend for CpuBackend {
                                 }
                             }
                         }
+                        DType::Bf16 => {
+                            let df: &mut [u16] = bytemuck::cast_slice_mut(&mut d);
+                            for i in 0..n {
+                                df[base + i] = half::bf16::from_f32(s[i]).to_bits();
+                            }
+                        }
                         dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
                             // TurboQuant: each 128-elem group (a head_dim slice) → one block
                             // (L2-norm + WHT + 2/3/4-bit PolarQuant). base/n are 128-aligned (the
@@ -2768,6 +2775,18 @@ impl Backend for CpuBackend {
                                     &mut d[off..off + bb],
                                 );
                             }
+                        }
+                        dt if crate::kvquant::supported(dt) => {
+                            // Mainline low-bit KV quants (q4_0/q4_1/q5_0/q5_1/iq4_nl): quantize the
+                            // f32 activations into 32-elem blocks. base/n are 32-aligned (kv_align_ok).
+                            debug_assert!(base % 32 == 0 && n % 32 == 0);
+                            let bb = infr_gguf::nbytes(dt, 32);
+                            let off = (base / 32) * bb;
+                            crate::kvquant::quantize_row(
+                                dt,
+                                &s[..n],
+                                &mut d[off..off + n / 32 * bb],
+                            );
                         }
                         _ => {
                             let df: &mut [f32] = bytemuck::cast_slice_mut(&mut d);
@@ -2818,6 +2837,18 @@ impl Backend for CpuBackend {
                             // recovers the original domain so the f32 SDPA below runs unchanged.
                             dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
                                 crate::turbo::dequant_prefix_orig(dt, b, need)
+                            }
+                            // bf16 + mainline low-bit quants: dequant the block-aligned prefix via the
+                            // shared GGUF dequant (only the valid `kv_len` rows, not the whole cache).
+                            DType::Bf16
+                            | DType::Q4_0
+                            | DType::Q4_1
+                            | DType::Q5_0
+                            | DType::Q5_1
+                            | DType::Iq4Nl => {
+                                let pb = infr_gguf::nbytes(dt, need);
+                                infr_gguf::dequant::dequant_block(dt, &b[..pb])
+                                    .expect("cpu backend: KV dequant")
                             }
                             _ => bytemuck::cast_slice::<u8, f32>(b)[..need].to_vec(),
                         }

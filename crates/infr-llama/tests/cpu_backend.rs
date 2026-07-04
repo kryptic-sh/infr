@@ -258,6 +258,39 @@ fn cpu_kv_turbo_coherent() {
     std::env::remove_var("INFR_KV_TYPE_V");
 }
 
+/// Mainline llama.cpp KV cache types (CPU reference): f32/bf16 (dense) + the low-bit round quants
+/// q4_0/q4_1/q5_0/q5_1 and the non-linear iq4_nl, quantized on the fly per 32-elem block on write and
+/// dequantized via the shared GGUF path on read. f32/bf16 run coupled; the low-bit quants run on V
+/// (K=f16) since K needs higher precision. Every config must stay coherent.
+#[test]
+fn cpu_kv_mainline_quants_coherent() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let prompt = repeat_prompt();
+    for (k, v) in [
+        ("f32", "f32"),
+        ("bf16", "bf16"),
+        ("f16", "q4_0"),
+        ("f16", "q4_1"),
+        ("f16", "q5_0"),
+        ("f16", "q5_1"),
+        ("f16", "iq4_nl"),
+    ] {
+        std::env::set_var("INFR_KV_TYPE_K", k);
+        std::env::set_var("INFR_KV_TYPE_V", v);
+        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let out = cpu_gen(&model, &prompt, 24);
+        assert!(
+            !is_degenerate(&out),
+            "KV K={k} V={v} degenerate: {:?}",
+            out.chars().take(48).collect::<String>()
+        );
+    }
+    std::env::remove_var("INFR_KV_TYPE_K");
+    std::env::remove_var("INFR_KV_TYPE_V");
+}
+
 // Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
 // `Graph` the CPU oracle builds, mapped op-for-op to GPU kernels). Should reproduce the production
 // GPU path (QWEN3_GPU_GOLDEN) — the France case shares its hash (0xfd63781ea3bfa785), confirming the

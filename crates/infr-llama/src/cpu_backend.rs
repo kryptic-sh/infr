@@ -371,8 +371,13 @@ pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
         DType::Turbo2 => elems / 128 * 34,
         DType::Turbo3 => elems / 128 * 50,
         DType::Turbo4 => elems / 128 * 66,
-        DType::F16 => elems * 2,
-        _ => elems * 4,
+        // Mainline low-bit KV quants (32-elem blocks) + bf16.
+        DType::Q4_0 | DType::Iq4Nl => elems / 32 * 18,
+        DType::Q4_1 => elems / 32 * 20,
+        DType::Q5_0 => elems / 32 * 22,
+        DType::Q5_1 => elems / 32 * 24,
+        DType::F16 | DType::Bf16 => elems * 2,
+        _ => elems * 4, // F32
     }
 }
 
@@ -658,18 +663,19 @@ pub(crate) fn generate_dense_backend(
     // --cache-type-v). Q8_0 stores 34 bytes / 32 elems — half the f16 footprint and bandwidth.
     //   INFR_KV_TYPE_K / INFR_KV_TYPE_V ∈ {f16, q8_0}  (per-side override)
     //   INFR_KV_Q8=1                                    legacy alias: any side not otherwise set → q8_0
-    // Q8_0 needs each layer's KV row (n_kv*head_dim) to be a whole number of 32-elem blocks, and a
-    // backend that implements the Q8 KV read/write. The graph decl carries the dtype either way,
-    // and the env is stable for the process, so a warm session and its rebuilt graphs always agree.
-    // Q8_0 needs each layer's KV row (n_kv*head_dim) to be a whole number of 32-elem blocks, and a
-    // backend that implements the Q8 KV read/write. TurboQuant turbo3 (INFR_KV_TYPE_K/V=turbo3) is a
-    // WHT-rotated 3-bit KV cache (128-elem blocks = head_dim slices), CPU-reference-only for now, and
-    // needs every layer's head_dim to be a multiple of the 128-element rotation group.
+    // Per-side KV dtype, chosen from INFR_KV_TYPE_K/V (llama's --cache-type-k/-v). The graph decl
+    // carries the dtype and the env is stable for the process, so a warm session and its rebuilt
+    // graphs always agree. Gates: Q8_0 needs each layer's KV row (n_kv*head_dim) 32-block-aligned and
+    // a backend with the Q8 read/write (cpu/vulkan/metal). TurboQuant (turbo2/3/4) is WHT-rotated,
+    // 128-elem blocks = head_dim slices — CPU-only, needs head_dim%128. The mainline low-bit quants
+    // (q4_0/q4_1/q5_0/q5_1/iq4_nl) + f32/bf16 are CPU-only too (no GPU KV kernel yet); the block
+    // quants need 32-alignment. All of these are footprint knobs (quantized KV is slower on CPU).
     let kv_align_ok =
         (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
-    let kv_turbo_ok =
-        be.name() == "cpu" && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
+    let cpu = be.name() == "cpu";
+    let kv_turbo_ok = cpu && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
+    let cpu_blk = cpu && kv_align_ok; // CPU-only block quants (need 32-alignment)
     let parse_kv_fmt = |var: &str| -> DType {
         let side = std::env::var(var).ok();
         match side.as_deref() {
@@ -677,6 +683,13 @@ pub(crate) fn generate_dense_backend(
             Some("turbo3") if kv_turbo_ok => DType::Turbo3,
             Some("turbo4") if kv_turbo_ok => DType::Turbo4,
             Some("q8_0") | Some("q8") | Some("Q8_0") if kv_align_ok && kv_q8_backend => DType::Q8_0,
+            Some("q4_0") if cpu_blk => DType::Q4_0,
+            Some("q4_1") if cpu_blk => DType::Q4_1,
+            Some("q5_0") if cpu_blk => DType::Q5_0,
+            Some("q5_1") if cpu_blk => DType::Q5_1,
+            Some("iq4_nl") if cpu_blk => DType::Iq4Nl,
+            Some("bf16") if cpu => DType::Bf16,
+            Some("f32") if cpu => DType::F32,
             Some("f16") | Some("F16") => DType::F16,
             // unset/unknown → legacy INFR_KV_Q8 alias (both sides q8) or f16.
             _ if std::env::var("INFR_KV_Q8").is_ok() && kv_align_ok && kv_q8_backend => DType::Q8_0,

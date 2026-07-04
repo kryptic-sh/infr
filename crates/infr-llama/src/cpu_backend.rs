@@ -367,6 +367,8 @@ type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buf
 pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
     match dt {
         DType::Q8_0 => (elems / 32 * 34).next_multiple_of(4),
+        // TurboQuant turbo3: 128-elem block → 50 bytes (fp16 norm + qs[32] + signs[16]).
+        DType::Turbo3 => elems / 128 * 50,
         DType::F16 => elems * 2,
         _ => elems * 4,
     }
@@ -657,20 +659,24 @@ pub(crate) fn generate_dense_backend(
     // Q8_0 needs each layer's KV row (n_kv*head_dim) to be a whole number of 32-elem blocks, and a
     // backend that implements the Q8 KV read/write. The graph decl carries the dtype either way,
     // and the env is stable for the process, so a warm session and its rebuilt graphs always agree.
+    // Q8_0 needs each layer's KV row (n_kv*head_dim) to be a whole number of 32-elem blocks, and a
+    // backend that implements the Q8 KV read/write. TurboQuant turbo3 (INFR_KV_TYPE_K/V=turbo3) is a
+    // WHT-rotated 3-bit KV cache (128-elem blocks = head_dim slices), CPU-reference-only for now, and
+    // needs every layer's head_dim to be a multiple of the 128-element rotation group.
     let kv_align_ok =
         (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
+    let kv_turbo_ok =
+        be.name() == "cpu" && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
     let parse_kv_fmt = |var: &str| -> DType {
         let side = std::env::var(var).ok();
-        let want_q8 = match side.as_deref() {
-            Some("q8_0") | Some("q8") | Some("Q8_0") => true,
-            Some("f16") | Some("F16") => false,
-            _ => std::env::var("INFR_KV_Q8").is_ok(), // unset/unknown → legacy alias
-        };
-        if want_q8 && kv_align_ok && kv_q8_backend {
-            DType::Q8_0
-        } else {
-            DType::F16
+        match side.as_deref() {
+            Some("turbo3") if kv_turbo_ok => DType::Turbo3,
+            Some("q8_0") | Some("q8") | Some("Q8_0") if kv_align_ok && kv_q8_backend => DType::Q8_0,
+            Some("f16") | Some("F16") => DType::F16,
+            // unset/unknown → legacy INFR_KV_Q8 alias (both sides q8) or f16.
+            _ if std::env::var("INFR_KV_Q8").is_ok() && kv_align_ok && kv_q8_backend => DType::Q8_0,
+            _ => DType::F16,
         }
     };
     let mut k_fmt = parse_kv_fmt("INFR_KV_TYPE_K");

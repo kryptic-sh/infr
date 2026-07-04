@@ -95,8 +95,11 @@ fn small_m_linear_bench() {
     }
 }
 
-/// The multi-row GEMV must produce EXACTLY what m independent single-row GEMV dispatches produce
-/// (same dqblk decode, same f32 accumulation order over the k sub-blocks) — bit-identical rows.
+/// The multi-row GEMV must match m independent single-row GEMV dispatches to reassociation-only
+/// error: the same dqblk decode feeds vec4 pairwise dots (4 independent FMA chains per sub-block —
+/// the flat-in-m latency win), so the accumulation ORDER differs from the GEMV's sequential scalar
+/// chain. Same contract as the attention kernels ("reassociation-only vs the oracle") and Metal's
+/// spec-verify GEMMs.
 #[test]
 fn mrow_matches_single_row_gemv() {
     let Ok(be) = VulkanBackend::new() else {
@@ -107,10 +110,18 @@ fn mrow_matches_single_row_gemv() {
     // constraint); m sweeps the whole supported range.
     let (k, n) = (512usize, 192usize);
     let wbytes = n * k / 256 * 144;
-    // Deterministic pseudo-random weight bytes (valid Q4_K: any bytes decode somewhere).
-    let wsrc: Vec<u8> = (0..wbytes)
+    // Deterministic pseudo-random weight bytes, with SANE super-block scales: raw random bytes can
+    // decode the f16 d/dmin to ±1e4-class values, whose huge canceling dot terms amplify pure
+    // reassociation error past any fixed tolerance (real checkpoints have no such blocks). Pin
+    // d = dmin = 2^-8 (f16 0x1C00) per 144-byte super-block; the 6-bit scales/mins and nibbles
+    // stay pseudo-random.
+    let mut wsrc: Vec<u8> = (0..wbytes)
         .map(|i| ((i as u32).wrapping_mul(2654435761) >> 24) as u8)
         .collect();
+    for blk in wsrc.chunks_exact_mut(144) {
+        blk[0..2].copy_from_slice(&[0x00, 0x1C]); // d    = 2^-8
+        blk[2..4].copy_from_slice(&[0x00, 0x1C]); // dmin = 2^-8
+    }
     let w = be.alloc(wbytes, BufferUsage::Weights).unwrap();
     be.upload(w.as_ref(), &wsrc).unwrap();
     for m in 2usize..=8 {
@@ -149,10 +160,16 @@ fn mrow_matches_single_row_gemv() {
         };
         let (r, g) = (read(y_ref.as_ref()), read(y_mrow.as_ref()));
         for i in 0..m * n {
-            assert_eq!(
-                r[i].to_bits(),
-                g[i].to_bits(),
-                "m={m} row={} col={}: gemv {} vs mrow {}",
+            // The pseudo-random weight bytes can decode an f16 SCALE to NaN/Inf; NaN poisons the
+            // dot in every accumulation order, so both-NaN counts as agreement (the old bit-exact
+            // assert matched them bitwise).
+            if r[i].is_nan() && g[i].is_nan() {
+                continue;
+            }
+            let tol = 1e-4 * r[i].abs().max(1.0);
+            assert!(
+                (r[i] - g[i]).abs() <= tol,
+                "m={m} row={} col={}: gemv {} vs mrow {} (reassociation tol {tol})",
                 i / n,
                 i % n,
                 r[i],

@@ -2117,6 +2117,14 @@ impl<'a> Recorder<'a> {
             (false, true) => ("attn_partial_vq8", crate::gemm::attn_partial_vq8_spv()),
             (true, true) => ("attn_partial_q8", crate::gemm::attn_partial_q8_spv()),
         };
+        // (A rows-BATCHED pass-1 variant — one workgroup per (head, chunk) streaming K/V once for
+        // an 8-row group, per-row scores staged in 16KB of LDS, cross-lane dots packed into
+        // subgroupAdd(vec4) pairs — was built and benched here: 2-3x SLOWER than this per-row
+        // grid at every m/depth measured (pp4@d16384 542 -> 188 t/s on a 7900 XTX). The KV
+        // bandwidth it saves is outweighed by the occupancy loss (LDS + VGPRs) and the rows x
+        // fewer workgroups' latency hiding. If the m=9..63-at-depth band ever matters, the
+        // promising shape is an LDS-staged K TILE with per-thread full dots — no cross-lane
+        // reductions at all — not per-key row batching.)
         let k1 = self.be.kernel_sg(p1name, p1spv, 6, 44, 32);
         let mut p1 = [0u8; 44];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -2130,6 +2138,7 @@ impl<'a> Recorder<'a> {
         p1[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
         p1[36..40].copy_from_slice(&(pos as u32).to_ne_bytes());
         p1[40..44].copy_from_slice(&(rows as u32).to_ne_bytes());
+        let gy = rows; // workgroup y = query row
         self.dispatch3(
             k1,
             &[
@@ -2143,7 +2152,7 @@ impl<'a> Recorder<'a> {
             3,
             &p1,
             (nh * n_chunks) as u32,
-            rows as u32,
+            gy as u32,
             1,
         );
         // pass 2: combine — split each (row, head)'s hd outputs across `ntile` workgroups for

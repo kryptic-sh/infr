@@ -14,7 +14,10 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // Same push layout as native_gemv (w_base = element offset for fused-QKV slices / MoE experts).
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
 layout(binding = 0) readonly buffer WB { uint nw[]; };
-layout(binding = 1) readonly buffer XB { float x_buf[]; };
+// Activations as vec4 (in_f % 32 == 0, so every row/sub-block boundary is vec4-aligned): 8 wide
+// loads per (row, sub-block) instead of 32 scalar ones — at m=8 the inner loop is issue-bound
+// (m*32 scalar FMAs + loads per decoded block), and the vec4 form keeps the cost near-flat in m.
+layout(binding = 1) readonly buffer XB { vec4 x4[]; };
 layout(binding = 2) buffer YB { float y_buf[]; };
 
 const uint MR = 8u;
@@ -27,17 +30,26 @@ void main() {
     uint t = gl_LocalInvocationID.x;
     uint wbase = pc.w_base + o * pc.in_f;
     uint nsub = pc.in_f / 32u;
+    uint in_f4 = pc.in_f >> 2u;
     float acc[MR];
     for (uint r = 0u; r < MR; r++) { acc[r] = 0.0; }
     for (uint s = t; s < nsub; s += 64u) {
         float v[32];
         dqblk(wbase + s * 32u, v);
-        uint xo = s * 32u;
+        // Repack the decoded sub-block into vec4s once; each row then runs 8 vec4 dots.
+        vec4 v4[8];
+        for (uint w4 = 0u; w4 < 8u; w4++) {
+            v4[w4] = vec4(v[4u * w4], v[4u * w4 + 1u], v[4u * w4 + 2u], v[4u * w4 + 3u]);
+        }
+        uint xo4 = s * 8u;
         for (uint r = 0u; r < MR; r++) {
             if (r < pc.rows) {
-                float a = 0.0;
-                for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[r * pc.in_f + xo + w]; }
-                acc[r] += a;
+                uint b = r * in_f4 + xo4;
+                vec4 a = v4[0] * x4[b] + v4[1] * x4[b + 1u];
+                a += v4[2] * x4[b + 2u] + v4[3] * x4[b + 3u];
+                a += v4[4] * x4[b + 4u] + v4[5] * x4[b + 5u];
+                a += v4[6] * x4[b + 6u] + v4[7] * x4[b + 7u];
+                acc[r] += a.x + a.y + a.z + a.w;
             }
         }
     }

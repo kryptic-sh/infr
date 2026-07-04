@@ -166,8 +166,11 @@ impl Config {
             .unwrap_or("")
             .to_string();
         let qk_norm = match arch.as_str() {
-            "llama" | "qwen2" => false,
-            "qwen3" | "qwen3moe" | "gemma3" | "gemma4" => true,
+            crate::arch::LLAMA | crate::arch::QWEN2 => false,
+            crate::arch::QWEN3
+            | crate::arch::QWEN3_MOE
+            | crate::arch::GEMMA3
+            | crate::arch::GEMMA4 => true,
             // (qwen35 — Qwen3.5's DeltaNet hybrid — never reaches this Config: the runners route
             // it to `qwen35::SeamModel` first. Every name here is llama.cpp-canonical.)
             other => bail!(
@@ -178,10 +181,10 @@ impl Config {
         // Qwen2/2.5 bias their q/k/v projections (Qwen3 removed them); every other supported arch is
         // bias-free on attention. They also keep the HF rotate-half q/k row order (see the
         // `permute_qk_neox` field doc).
-        let qkv_bias = arch == "qwen2";
-        let permute_qk_neox = arch == "qwen2";
-        let gemma4 = arch == "gemma4";
-        let gemma = arch == "gemma3" || gemma4;
+        let qkv_bias = arch == crate::arch::QWEN2;
+        let permute_qk_neox = arch == crate::arch::QWEN2;
+        let gemma4 = arch == crate::arch::GEMMA4;
+        let gemma = arch == crate::arch::GEMMA3 || gemma4;
         let mk = |k: &str| format!("{arch}.{k}");
         let n_layer = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
         let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
@@ -202,7 +205,7 @@ impl Config {
             vec![ff; n_layer]
         };
         let n_ff = n_ff_layers.iter().copied().max().unwrap_or(0);
-        let moe = if arch == "qwen3moe" {
+        let moe = if arch == crate::arch::QWEN3_MOE {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
                 meta_u64(g, &mk("expert_used_count")).context("expert_used_count")? as usize;

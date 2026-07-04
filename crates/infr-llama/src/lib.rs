@@ -8,6 +8,7 @@
 //! TODO(next): move host ops to GPU; add a KV cache; fold into the `Model`/`Backend` seams.
 #![allow(clippy::needless_range_loop)]
 
+pub mod arch;
 mod config;
 pub mod cpu_backend;
 mod cpu_model;

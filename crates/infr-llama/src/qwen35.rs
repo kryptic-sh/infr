@@ -49,7 +49,7 @@ pub struct Cfg {
 impl Cfg {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.metadata().str("general.architecture").unwrap_or("");
-        if arch != "qwen35" {
+        if arch != crate::arch::QWEN35 {
             bail!("not a qwen35 model (arch={arch:?})");
         }
         let u = |k: &str| g.metadata().u64(&format!("qwen35.{k}"));
@@ -1212,7 +1212,7 @@ pub fn generate_vulkan(
 pub fn is_qwen35(path: &std::path::Path) -> bool {
     Gguf::open(path)
         .ok()
-        .map(|g| g.metadata().str("general.architecture") == Some("qwen35"))
+        .map(|g| g.metadata().str("general.architecture") == Some(crate::arch::QWEN35))
         .unwrap_or(false)
 }
 

@@ -11,14 +11,24 @@ that emerged and the measured reasoning behind it.
 
 | model | pp512 | tg128 | tg64@d4096 |
 | --- | --- | --- | --- |
-| Qwen3-0.6B Q4_K_M | 0.89× | 0.98× | 1.00× |
-| Qwen3-4B Q4_K_M | 0.93× | 1.00× | 0.96× |
-| Qwen3-0.6B Q8_0 | 0.84× | 0.97× | 0.99× |
-| Qwen3-MoE-2.4B Q4_K_M | 0.87× | 0.96× | 0.99× |
-| gemma3-1b Q4_K_M | 0.84× | 0.96× | 0.92× |
-| TinyLlama-1.1B Q4_0 | 0.85× | **1.02×** | **1.02×** |
+| Qwen3-0.6B Q4_K_M | 0.88× | 1.00× | **1.02×** |
+| Qwen3-4B Q4_K_M | 0.92× | 1.00× | 0.97× |
+| Qwen3-8B Q4_K_M | 0.88× | 0.99× | 0.98× |
+| Qwen3-0.6B Q8_0 | 0.85× | 0.97× | 0.98× |
+| Qwen3-MoE-2.4B Q4_K_M | 0.87× | 0.97× | 0.97× |
+| gemma3-1b Q4_K_M | 0.82× | 0.95× | 0.95× |
+| TinyLlama-1.1B Q4_0 | 0.86× | 1.00× | 0.97× |
+| Qwen3.5-4B Q4_K_M | 0.80× | 0.96× | 0.97× |
+| Qwen2.5-0.5B Q4_K_M | 0.82× | 0.95× | 0.99× |
+| Qwen3-4B IQ4_XS | 0.89× | 0.89× | 0.87× |
 
-(ratios = infr / llama.cpp; >1 = infr ahead.) **Decode is at parity.** The
+The SHORT TURN shape (a tiny suffix prefill on a warm session — multi-turn
+serve TTFT) is healthy too: pp4@d4096 = 0.89× (0.6B) and 1.45× (4B, ahead) —
+the m=2..8 multi-row GEMV and small-m attention routing cover it.
+
+(ratios = infr / llama.cpp; >1 = infr ahead. Sweep-internal rows run a few
+percent hot — a back-to-back sweep heats the chip; only trust a SOLO re-probe
+for a regression call.) **Decode is at parity.** The
 prefill band decomposes by ablation (strip the dequant scale math: −2.4% of
 GEMM time; strip ALL weight loads + decode: −9%) to a tile floor of ~6.9
 TFLOPS — ~53% of the f16 `simdgroup_matrix` peak and about llama.cpp's own
@@ -157,21 +167,39 @@ which for these kernels means skipped KV slices and garbage merges. Every
 wide-threadgroup route checks its own pipeline's cap and degrades to the
 next-narrower kernel.
 
-## Q8_0 KV cache (`INFR_KV_Q8=1`)
+## Quantized KV caches (`INFR_KV_TYPE_K` / `INFR_KV_TYPE_V`)
 
-Opt-in: both caches stored as Q8_0 blocks (34 B / 32 elems) — **half the f16
-footprint and bandwidth**, so 16k-context sessions fit machines the f16 cache
-would swap on. Write quantization is byte-identical between the CPU reference
-and `writekv_q8` (d = amax/127 as f16, q = rint(x/d)); reads dequantize
-exactly. Prefill rides `attnflash2_q8kv` — the cooperative flash structure
-with a dequant-staging stage (all 128 threads dequantize each 64-position KV
-block into a 24 KB threadgroup tile: K pre-transposed [hd][64] for
-conflict-free fragment loads, V staged into the same tile during the softmax
-phase). Decode at depth rides `attnvec_q8kv`; the q8 decode replay tape
-records like f16. Throughput is model-dependent — the q8 read path trades
-bandwidth for ALU: 0.6B tg128@d16384 62.7 t/s (+26% over the f16 cache, +35%
-over llama.cpp's), 4B ~-6% (already weight-stream-bound); pp8192 runs at ~68%
-of the f16 flash. Enable it for the footprint, and for small models at depth.
+Per-side selection like llama's `--cache-type-k/-v`. Three read classes on
+Metal, in descending preference:
+
+- **Native read — f16, Q8_0, and coupled Q4_0 / IQ4_NL**: the attention
+  kernels decode the compact blocks in-kernel with f32 accumulation, and the
+  decode replay tape records them (dyn kernel variants read the live
+  position). Q8_0 (34 B / 32 elems, `INFR_KV_Q8=1` legacy alias): prefill
+  rides `attnflash2_q8kv` (dequant-staged 24 KB KV tiles, K pre-transposed
+  [hd][64]), decode `attnvec_q8kv`; **beats f16 at depth** (0.6B
+  tg128@d16384 +26% over the f16 cache) on half the bandwidth. Q4_0/IQ4_NL
+  (18 B / 32 elems, quarter footprint): the same vector-flash body over a KV
+  accessor struct — decode at d4096 runs in the q8 class (~3× the prepass
+  path it replaced), and q4_0 beats f16 at depth. The native route requires
+  K and V COUPLED (same dtype); a mixed pair has no native dyn kernel and
+  the replay gate rejects it (a K-only check here once taped the f16 kernel
+  over a quant V cache — corrupt decode; the gate now requires kdt == vdt).
+- **Dequant→f16 prepass — Q4_1, Q5_0, Q5_1, bf16, turbo2/3/4, and any mixed
+  pair**: WriteKv quantizes into the compact cache; Attention expands each
+  quantized side into a transient f16 scratch and runs the f16 kernels over
+  it (the Vulkan model). Correct everywhere, but decode re-expands the WHOLE
+  prefix every token (O(n²) over a generation) and forces static per-token
+  decode — measured ~3× slower than f16 at d4096. Fine for prefill;
+  footprint-only formats.
+- **f32**: its own native f32 attention (exact; the CPU oracle's math).
+
+Quality guidance (measured, planted-secret recall probes): coupled ≤4-bit KV
+on BOTH sides costs long-context recall that the f32-attending CPU keeps —
+keep K at f16/q8 and quantize V (llama guidance) unless footprint forces
+both. turbo2/3/4 destroy small models outright (garbage on a 0.6B on every
+backend — they need a model with margin to spend). Write quantization is
+byte-identical between the CPU reference and every `writekv_*` kernel.
 
 ## Decode latency: wide small-op kernels + the replay tape
 
@@ -200,6 +228,45 @@ under-fenced. MoE decode tapes (the device expert path resolves all data
 dependence on-GPU), and so does the llama arch (`Op::Rope` reads the bound
 positions buffer, replay-safe by construction).
 
+## Linear attention (DeltaNet / Qwen3-Next)
+
+`deltanet_f32_k{1,2,4,8}`: one SIMDGROUP per (value-dim, head) — 32 lanes
+split the k-dim with KPL = kd/32 state entries per lane held in REGISTERS
+across the whole chunk, so the token recurrence needs only `simd_sum`s (no
+threadgroup memory or barriers; the llama.cpp `kernel_gated_delta_net`
+parallelization). KPL is a compile-time template parameter because MSL
+cannot register-promote runtime-indexed arrays — the runtime-bound version
+silently spilled the "register-resident" state to thread-private memory and
+ran 1.7× SLOWER than its predecessor; fixed-KPL unrolled is 1.6× faster
+(qwen35 prefill 0.73× → 0.80×; the residual is the Linear band). State
+updates the bound buffer in place; `conv1d_silu_f32` runs one thread per
+channel with the ring state in registers.
+
+## Speculative decoding (`INFR_SPEC_DRAFT=<gguf>`)
+
+Engine-level draft-verify on the seam, `run` and `serve` through one
+selection funnel (`metal_chat_model`): the draft session proposes up to
+`INFR_SPEC_K` (default 6, adapted per round by an acceptance EMA) greedy
+tokens; ONE batched target forward verifies all of them (`logits_rows` LM
+head over the candidate rows; the m=2..8 rows ride the multi-row GEMV);
+rollback is the session prefix-diff (free). Greedy-only — the committed
+stream is the target's greedy stream over the verify forward, pinned
+end-to-end by `metal_spec_decode_matches_target_only_greedy`. Pays for
+≥8B-class targets: 8B + 0.6B draft = +12-16% on code-shaped output, prose
+break-even. The verify-cost residual (~5-7 ms/row) is NOT simdgroup drift —
+a lockstep variant (barrier-pinned token simdgroups) measured a wash, and
+register-hoisted (ALU-bound) and split-K cooperative (latency-bound) forms
+lost too; all three classes are measured and parked.
+
+## Multi-turn serve: conversation slots
+
+Both GPU sessions share the backend-agnostic `SlotPool` (`INFR_KV_SLOTS`,
+default 4): best-prefix slot pick, fork off the Arc-shared weight upload,
+cross-conversation prefix seeding via device-side KV copy (`copy_buffer`),
+LRU recycling. Slot switches are replay-safe by construction — the tape
+fingerprint covers the bound KV/IO buffer addresses, so a switch re-records
+(one graph-walk token) instead of replaying into a stale slot's buffers.
+
 ## Profiling
 
 `INFR_METAL_PROFILE=1`: per-op CPU-encode + GPU commit+wait wall, printed on
@@ -215,11 +282,16 @@ memory, so the resolve reads the NSData directly.)
 
 ## Tests
 
-`tests/parity.rs` — 68 GPU parity tests vs the CPU reference: every op, and
+`tests/parity.rs` — 90 GPU parity tests vs the CPU reference: every op, and
 for quantized Linear every (format × kernel shape) pair including partial
-tiles; attention covers unsplit/split8/split32/flash/flash2/vec, sliding
-windows at both tile and block granularity, partial query tiles, and the
-retained hd=72/96 routes.
+tiles, the small-m split-K regime at real verify shapes, and deep-coupled
+quant-KV attention at kv_len=2048; attention covers
+unsplit/split8/split32/flash/flash2/vec, sliding windows at both tile and
+block granularity, partial query tiles, and the retained hd=72/96 routes.
+`tests/kernel_names.rs` — the missing-kernel tripwire: every kernel-shaped
+literal in exec.rs must resolve in the compiled library (the cap-check
+fallback otherwise turns a vanished kernel into silent perf loss — it
+happened once, 3× decode loss with zero errors).
 `tests/dispatch_overhead.rs`, `tests/gemv_bw.rs` — evidence probes (ignored),
 kept so the floors above stay reproducible.
 
@@ -250,6 +322,15 @@ kept so the floors above stay reproducible.
 - Ungated k-split: −8% on 0.6B (in_f=1024 is four Q4_K superblocks; three of
   four simdgroups idle and the reduce is pure tax) — hence the per-format
   k-depth gates.
+- Lockstep multi-row GEMV (threadgroup per row pair, m token simdgroups
+  barrier-pinned per block): 80.1 vs mrv's 79.0 ms median on an 8B verify —
+  the barrier costs nothing AND buys nothing, so the free-running simdgroups
+  were already cache-coincident; the verify residual is not weight-stream
+  drift.
+- Runtime-bound local arrays in hot kernels: MSL cannot register-promote a
+  runtime-indexed array — the first simdgroup-per-column DeltaNet spilled its
+  "register" state to thread-private memory and ran 1.7× slower than the
+  kernel it replaced. Compile-time template bounds + unrolled loops, always.
 
 ## Remaining levers
 
@@ -265,3 +346,12 @@ needs a new evidence class or new hardware:
   the global layers — 4% of one cell, measured and parked.
 - The routing gates (k-split thresholds, wide-norm rows ≤ 4) were tuned on an
   M3 Pro; a boot-time micro-sweep would adapt them across M1-M4.
+- Spec-verify flat cost (the ~2× acceptance ceiling): all three kernel
+  classes measured and excluded (register-hoisted ALU-bound, split-K
+  cooperative latency-bound, lockstep a wash) — needs a genuinely new shape.
+- Remaining codebook weight formats (IQ2*/IQ3*/TQ*): guarded (hard error past
+  the working set) but not native; larger codebook grids than IQ4's 16-entry
+  table.
+- qwen35 prefill residual (0.80×): the Linear band at the GEMM floor —
+  qwen35 runs more projections per token than dense; same instrument gap as
+  the prefill GEMM lever above.

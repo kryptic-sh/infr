@@ -1287,6 +1287,27 @@ fn attention_kv_iq4_nl_parity() {
     kvquant_attention_test(DType::Iq4Nl, DType::Iq4Nl, 3, 6, 64, 3, 6e-3, 345);
 }
 
+// Coupled quant/quant at DEPTH: the existing coupled cases run at kv_len=6, which never
+// exercises the prepass scratch indexing past the first blocks or the decode-shape read at a
+// deep position. kv_len=2048 at both the rows==1 decode shape and an 8-row prefill shape pins
+// the block arithmetic at real conversation depth (found relevant while investigating an e2e
+// recall gap on coupled iq4_nl — the kernels are clean at depth; the gap is 4-bit-loss-on-
+// both-sides × f16-attention precision compounding, which these tolerances bound).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_deep_coupled_parity() {
+    for (kdt, vdt, seed) in [
+        (DType::Q4_0, DType::Q4_0, 360),
+        (DType::Q4_1, DType::Q4_1, 362),
+        (DType::Q5_0, DType::Q5_0, 364),
+        (DType::Q5_1, DType::Q5_1, 366),
+        (DType::Iq4Nl, DType::Iq4Nl, 368),
+    ] {
+        kvquant_attention_test(kdt, vdt, 1, 2048, 128, 2047, 6e-3, seed);
+        kvquant_attention_test(kdt, vdt, 8, 2048, 128, 2040, 6e-3, seed + 1);
+    }
+}
+
 // Dense bf16 (near-lossless top-16-bits store, dequant <<16 → f16). Decoupled + coupled.
 #[test]
 #[ignore = "requires a Metal GPU"]

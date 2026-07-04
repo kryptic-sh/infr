@@ -2117,14 +2117,30 @@ impl<'a> Recorder<'a> {
             (false, true) => ("attn_partial_vq8", crate::gemm::attn_partial_vq8_spv()),
             (true, true) => ("attn_partial_q8", crate::gemm::attn_partial_q8_spv()),
         };
-        // (A rows-BATCHED pass-1 variant — one workgroup per (head, chunk) streaming K/V once for
-        // an 8-row group, per-row scores staged in 16KB of LDS, cross-lane dots packed into
-        // subgroupAdd(vec4) pairs — was built and benched here: 2-3x SLOWER than this per-row
-        // grid at every m/depth measured (pp4@d16384 542 -> 188 t/s on a 7900 XTX). The KV
-        // bandwidth it saves is outweighed by the occupancy loss (LDS + VGPRs) and the rows x
-        // fewer workgroups' latency hiding. If the m=9..63-at-depth band ever matters, the
-        // promising shape is an LDS-staged K TILE with per-thread full dots — no cross-lane
-        // reductions at all — not per-key row batching.)
+        // Rows-BATCHED pass 1 (INFR_MROWS_ATTN=1 [+ INFR_MROWS_CHUNK=256], OFF by default): one
+        // workgroup per (head, chunk) streams K/V ONCE for a 4-row group — one subgroupAdd(vec4)
+        // per key, scores staged in LDS. The occupancy sweep on a 7900 XTX (pp4@d16384) was
+        // monotone in LDS — 22KB (RB=8) 188 t/s, 11KB (RB=4) 325, 7KB (RB=4 + c256) 456, vs the
+        // per-row grid's 548 — but even at 7KB the design beats per-row only in a NARROW band:
+        // rows >= ~12 AND deep kv (pp16@d16384 832 -> 925, pp32 963 -> 1123; pp4-8 lose or wash,
+        // pp16@d4096 loses). On RDNA3 the per-row grid's rows-x extra workgroups fill the DRAM
+        // queue better than the batched form's rows-/ bandwidth saving, so the spec-verify band
+        // (m <= 8) keeps per-row. If the m >= 12-at-depth band ever matters, route here on
+        // (rows, kv_len) — or better, build the LDS-staged K-TILE kernel (per-thread full dots,
+        // no cross-lane reductions), which is how llama.cpp wins that cell (1056 t/s).
+        let batched =
+            rows >= 2 && hd <= 128 && !k_q8 && !v_q8 && std::env::var("INFR_MROWS_ATTN").is_ok();
+        let (p1name, p1spv) = if batched && chunk <= 256 {
+            // Half-LDS variant (4KB scores): the residency probe pairs it with INFR_MROWS_CHUNK=256.
+            (
+                "attn_partial_mrows_c256",
+                crate::gemm::attn_partial_mrows_c256_spv(),
+            )
+        } else if batched {
+            ("attn_partial_mrows", crate::gemm::attn_partial_mrows_spv())
+        } else {
+            (p1name, p1spv)
+        };
         let k1 = self.be.kernel_sg(p1name, p1spv, 6, 44, 32);
         let mut p1 = [0u8; 44];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
@@ -2138,7 +2154,8 @@ impl<'a> Recorder<'a> {
         p1[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
         p1[36..40].copy_from_slice(&(pos as u32).to_ne_bytes());
         p1[40..44].copy_from_slice(&(rows as u32).to_ne_bytes());
-        let gy = rows; // workgroup y = query row
+        // Batched probe: workgroup y = 4-row group; per-row default: y = row.
+        let gy = if batched { rows.div_ceil(4) } else { rows };
         self.dispatch3(
             k1,
             &[

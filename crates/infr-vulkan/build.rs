@@ -17,6 +17,13 @@ fn main() {
         ("gemm_proj", "gemm_proj", &[]),
         ("gemm_proj_warp", "gemm_proj_warp", &[]),
         ("attn_partial", "attn_partial", &[]),
+        // PROBE (INFR_MROWS_ATTN=1): RB=4 rows-batched pass 1 — occupancy-hypothesis experiment.
+        ("attn_partial_mrows", "attn_partial_mrows", &[]),
+        (
+            "attn_partial_mrows",
+            "attn_partial_mrows_c256",
+            &["-DSC_MAX=256u"],
+        ),
         ("attn_partial", "attn_partial_dyn", &["-DUSE_PARAMS"]),
         (
             "attn_partial",

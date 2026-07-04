@@ -664,6 +664,17 @@ pub(crate) fn gemm_proj_warp_spv() -> &'static [u32] {
 pub(crate) fn attn_partial_spv() -> &'static [u32] {
     ATTN_PARTIAL_SPV.get_or_init(|| spv_words(ATTN_PARTIAL_SPV_BYTES))
 }
+/// PROBE (INFR_MROWS_ATTN=1): RB=4 rows-batched split pass 1.
+pub(crate) fn attn_partial_mrows_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial_mrows.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+pub(crate) fn attn_partial_mrows_c256_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial_mrows_c256.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the non-FA prefill attention kernels (QK scores / row softmax / PV). Recorder use.
 pub(crate) fn attn_qk_spv() -> &'static [u32] {
     ATTN_QK_SPV.get_or_init(|| spv_words(ATTN_QK_SPV_BYTES))

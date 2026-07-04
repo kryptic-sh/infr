@@ -1147,6 +1147,17 @@ fn lower_op(
                 // ≤ pos + r). Native Q8 reads are decode-only (rows>1 already dequanted to the
                 // f16 scratch above, so k/v_q8_eff are false there by construction).
                 let chunk = (kv_len / 32).clamp(64, 512);
+                // INFR_MROWS_CHUNK: small-m chunk-size probe (pairs with INFR_MROWS_ATTN) —
+                // smaller chunks trade per-chunk overhead for more workgroups + less LDS use.
+                let chunk = if rows >= 2 {
+                    std::env::var("INFR_MROWS_CHUNK")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .map(|c| c.clamp(64, 512))
+                        .unwrap_or(chunk)
+                } else {
+                    chunk
+                };
                 let split_ok = rows < 64
                     && kv_len > chunk
                     && hd % 4 == 0

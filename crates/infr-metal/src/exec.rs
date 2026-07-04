@@ -922,7 +922,12 @@ impl MetalBackend {
                 }
                 let t0 = std::time::Instant::now();
                 r.cur_op = op_name(op);
-                self.run_op(op, idx, g, bindings, &mut r)?;
+                if let Err(e) = self.run_op(op, idx, g, bindings, &mut r) {
+                    // Seal the open encoder before unwinding — dropping it un-ended is a Metal
+                    // assertion failure that masks the real error.
+                    self.flush(&mut r);
+                    return Err(e);
+                }
                 // Counter mode: seal this op's encoder (the command buffer stays open) so the
                 // next op's dispatches land in their own sampled encoder.
                 if self.counter_set.is_some() {
@@ -951,7 +956,12 @@ impl MetalBackend {
                 if r.skip.contains(&idx) {
                     continue;
                 }
-                self.run_op(op, idx, g, bindings, &mut r)?;
+                if let Err(e) = self.run_op(op, idx, g, bindings, &mut r) {
+                    // Seal the open encoder before unwinding — dropping it un-ended is a Metal
+                    // assertion failure that masks the real error.
+                    self.flush(&mut r);
+                    return Err(e);
+                }
             }
         }
 
@@ -989,12 +999,19 @@ impl MetalBackend {
     }
 
     /// Fetch a dequantized weight as a device f32 buffer, cached by bound-buffer address.
+    ///
+    /// GUARDED against silent OOM corruption: this cache stores the weight at 4 bytes/element,
+    /// ballooning a quant tensor 4-8x. Formats without native kernels (IQ2*/IQ3*/TQ*/fp4 — every
+    /// Linear falls here) can push a model that FITS in its quantized form past the GPU working
+    /// set, and Metal shared-storage allocation doesn't fail there — it silently corrupts under
+    /// pressure (observed: a 4B IQ4_XS ballooned to 16 GB on a 12.9 GB working set and generated
+    /// garbage with no error). Exceeding the budget is now a hard error naming the fix.
     fn weight_buf(
         &self,
         id: TensorId,
         g: &infr_core::graph::Graph,
         bindings: &Bindings,
-    ) -> Arc<MtlBuffer> {
+    ) -> Result<Arc<MtlBuffer>> {
         let buf = metal_buf(bindings.get(id).expect("metal backend: unbound Weight"));
         // Key on the UNDERLYING MTLBuffer (unified-memory contents pointer), not the wrapper
         // address: the runner rebuilds its bindings map per prefill graph, so wrapper addresses
@@ -1003,13 +1020,30 @@ impl MetalBackend {
         // uploaded weight, so its contents pointer is stable and unique.
         let key = buf.raw.contents() as usize;
         if let Some(w) = self.weight_cache.lock().unwrap().get(&key) {
-            return w.clone();
+            return Ok(w.clone());
+        }
+        let dt = g.desc(id).dtype;
+        let want = (g.desc(id).numel() * 4) as u64;
+        let used = self.device.current_allocated_size();
+        let budget = self.device.recommended_max_working_set_size();
+        if budget > 0 && used + want > budget {
+            return Err(Error::Backend(format!(
+                "dequant-cached f32 weight would exceed the GPU working set: \
+                 {:.2} GiB allocated + {:.2} GiB for this {dt:?} tensor > {:.2} GiB budget. \
+                 {dt:?} has no native Metal kernel, so its weights are cached at f32 (4-8x the \
+                 quantized size) and the total no longer fits — proceeding would corrupt \
+                 silently. Use a natively-supported quantization (Q4_K_M / Q6_K / Q8_0 / Q5_0 / \
+                 Q4_0) or run this checkpoint on the CPU backend (INFR_CPU=1).",
+                used as f64 / (1u64 << 30) as f64,
+                want as f64 / (1u64 << 30) as f64,
+                budget as f64 / (1u64 << 30) as f64,
+            )));
         }
         let bytes = Self::read_bytes(buf);
-        let f = bytes_to_f32(&bytes, g.desc(id).dtype);
+        let f = bytes_to_f32(&bytes, dt);
         let w = Arc::new(self.f32_buf(&f));
         self.weight_cache.lock().unwrap().insert(key, w.clone());
-        w
+        Ok(w)
     }
 
     /// A device buffer initialized from a raw byte slice.
@@ -1193,7 +1227,7 @@ impl MetalBackend {
             } => {
                 let (rows, dim) = (rows as usize, dim as usize);
                 let bx = self.ensure_device(r, x);
-                let bw = self.weight_buf(weight, g, bindings);
+                let bw = self.weight_buf(weight, g, bindings)?;
                 let bd = self.dev_dst(r, dst, rows * dim);
                 // Decode (few rows): the WIDE kernel — 8 simdgroups per row; the 32-lane form
                 // is latency-bound on dim/32 serial loads (~20 us/launch at dim 1152). Prefill
@@ -1235,7 +1269,7 @@ impl MetalBackend {
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
-                let bw = self.weight_buf(weight, g, bindings);
+                let bw = self.weight_buf(weight, g, bindings)?;
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
                 let pso = self.pipelines.get("qknorm_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
@@ -1618,7 +1652,7 @@ impl MetalBackend {
                     }
                 } else {
                     // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
-                    let bw = self.weight_buf(weight, g, bindings);
+                    let bw = self.weight_buf(weight, g, bindings)?;
                     let pso = self.pipelines.get("linear_f32")?;
                     self.encode_tg_off(
                         r,
@@ -1689,7 +1723,7 @@ impl MetalBackend {
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                 let bx = self.ensure_device(r, x);
-                let bw = self.weight_buf(weight, g, bindings);
+                let bw = self.weight_buf(weight, g, bindings)?;
                 // The kernel reads the bound i32 positions buffer directly (exact widening in
                 // the shader) — no host round-trip, and the decode-replay tape stays valid when
                 // the engine rewrites the position between replays.
@@ -2369,7 +2403,7 @@ impl MetalBackend {
                     // Router logits for ALL rows (one GEMV-per-(row, expert) dispatch over the
                     // dequant-cached router weight), then per-row top-k into the [rows, 32]
                     // expert table (idx in slots 0..16, f32 weights in 16..32).
-                    let rw = self.weight_buf(router, g, bindings);
+                    let rw = self.weight_buf(router, g, bindings)?;
                     let logits = self.scratch_buf(rows * n_expert, 0);
                     let pso = self.pipelines.get("linear_f32")?;
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
@@ -2715,7 +2749,7 @@ impl MetalBackend {
                 if kk <= 8 && std::env::var("INFR_METAL_NODELTA").is_err() {
                     if let Some(sb) = bindings.get(state) {
                         let bx = self.ensure_device(r, x);
-                        let bw = self.weight_buf(weight, g, bindings);
+                        let bw = self.weight_buf(weight, g, bindings)?;
                         let bd = self.dev_dst(r, dst, rr * cc);
                         let sbuf = metal_buf(sb);
                         let i = state.0 as usize;
@@ -2812,8 +2846,8 @@ impl MetalBackend {
                             let bv = self.ensure_device(r, v);
                             let bb = self.ensure_device(r, b);
                             let ba = self.ensure_device(r, a);
-                            let bac = self.weight_buf(a_coef, g, bindings);
-                            let bdt = self.weight_buf(dt_bias, g, bindings);
+                            let bac = self.weight_buf(a_coef, g, bindings)?;
+                            let bdt = self.weight_buf(dt_bias, g, bindings)?;
                             let bd = self.dev_dst(r, dst, rr * nv * vd);
                             let sbuf = metal_buf(sb);
                             let i = state.0 as usize;

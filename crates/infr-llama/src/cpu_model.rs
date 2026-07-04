@@ -558,17 +558,15 @@ impl CpuModel {
             // Rows cover feed's un-cached suffix; the candidate checks use the LAST cand.len()+1
             // rows (the row before cand[0] is t_next's — its argmax checks cand[0]).
             let base = m - (cand.len() + 1);
-            let mut accepted = 0usize;
-            let mut next = None;
-            for (j, &c) in cand.iter().enumerate() {
-                let pred = argmax(&logits[(base + j) * vocab..(base + j + 1) * vocab]);
-                if pred == c {
-                    accepted += 1;
-                } else {
-                    next = Some(pred);
-                    break;
-                }
-            }
+            // Target's greedy choice at each candidate row plus the bonus row, then the pure
+            // accept decision (unit-tested in `spec_accept_tests`, incl. the rejection branch the
+            // self-spec e2e test can't reach): the longest prefix the target ratifies and the
+            // next committed token — the target's correction at the first mismatch, or the bonus
+            // token when all candidates accept.
+            let varg: Vec<u32> = (0..=cand.len())
+                .map(|j| argmax(&logits[(base + j) * vocab..(base + j + 1) * vocab]))
+                .collect();
+            let (accepted, next_tok) = spec_accept(&cand, &varg);
             for &c in &cand[..accepted] {
                 let is_eos = !ignore_eos && (self.cfg.eos_ids.contains(&c) || c == self.cfg.eos);
                 out.push(c);
@@ -589,9 +587,7 @@ impl CpuModel {
             ema = 0.7 * ema + 0.3 * (accepted as f64 + 1.0);
             // Roll the committed view back past the rejected tail: the session's `cached` holds
             // all of `feed`, and the next prefix diff overwrites the stale rows.
-            t_next = next.unwrap_or_else(|| {
-                argmax(&logits[(base + cand.len()) * vocab..(base + cand.len() + 1) * vocab])
-            });
+            t_next = next_tok;
         }
         Ok(crate::GenStats {
             n_prompt,
@@ -682,5 +678,83 @@ impl CpuModel {
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
         )?;
         Ok(stats)
+    }
+}
+
+/// The speculative-decoding accept decision for one verify round (pure — no backend). Given the
+/// draft `cand` and `verify_argmax` — the target verify-forward's greedy choice at each candidate
+/// row plus the bonus row (`cand.len() + 1` entries; index `j` is the target's token after
+/// consuming `cand[..j]`) — return the number of leading candidates the target ratifies (the
+/// longest prefix where its argmax equals the draft) and the next committed token: the target's
+/// correction at the first mismatch, or the bonus token when every candidate is accepted.
+///
+/// Correctness property (see `spec_accept_tests`): the committed stream `cand[..accepted] ++
+/// [next]` is always exactly `verify_argmax[..=accepted]` — the target's own greedy stream — no
+/// matter what the draft proposed. That is what makes speculative decoding output-identical to
+/// target-only greedy; a wrong draft only shortens the accepted prefix, never commits a wrong
+/// token. (`cfg(any(macos, test))`: the only caller is the macOS spec driver, but the logic is
+/// backend-agnostic so its tests run everywhere.)
+#[cfg(any(target_os = "macos", test))]
+fn spec_accept(cand: &[u32], verify_argmax: &[u32]) -> (usize, u32) {
+    debug_assert_eq!(verify_argmax.len(), cand.len() + 1);
+    let accepted = cand
+        .iter()
+        .zip(verify_argmax)
+        .take_while(|(c, v)| c == v)
+        .count();
+    (accepted, verify_argmax[accepted])
+}
+
+#[cfg(test)]
+mod spec_accept_tests {
+    use super::spec_accept;
+
+    #[test]
+    fn all_accepted_returns_bonus() {
+        // Draft fully matches the target → accept all three, next = the bonus-row token.
+        assert_eq!(spec_accept(&[10, 11, 12], &[10, 11, 12, 99]), (3, 99));
+    }
+
+    #[test]
+    fn reject_at_zero_returns_correction() {
+        // Draft wrong at position 0 → accept none, next = the target's correction.
+        assert_eq!(spec_accept(&[10, 11, 12], &[7, 11, 12, 99]), (0, 7));
+    }
+
+    #[test]
+    fn reject_in_middle_commits_prefix() {
+        // Accept [10], reject at 1 → next = the correction 8; the rest is discarded.
+        assert_eq!(spec_accept(&[10, 11, 12], &[10, 8, 12, 99]), (1, 8));
+    }
+
+    #[test]
+    fn empty_draft_returns_sole_token() {
+        // No candidates (adaptive k floored mid-round) → next = the sole bonus token.
+        assert_eq!(spec_accept(&[], &[42]), (0, 42));
+    }
+
+    #[test]
+    fn committed_stream_is_target_greedy_for_any_draft() {
+        // The rejection-sampling invariant the self-spec e2e test cannot reach (its draft always
+        // agrees, so acceptance is always full): whatever the draft proposes, the committed
+        // tokens equal a prefix of the target's own argmax stream — never a token the target
+        // wouldn't have produced. This is the branch the original review flagged as untested.
+        let varg = [5u32, 6, 7, 8]; // the target's greedy choice at each of the four rows
+        for draft in [
+            vec![5, 6, 7], // perfect draft → accept 3
+            vec![9, 6, 7], // wrong at 0    → accept 0
+            vec![5, 9, 7], // wrong at 1    → accept 1
+            vec![5, 6, 9], // wrong at 2    → accept 2
+            vec![0, 0, 0], // all wrong     → accept 0
+        ] {
+            let (accepted, next) = spec_accept(&draft, &varg);
+            let mut committed: Vec<u32> = draft[..accepted].to_vec();
+            committed.push(next);
+            assert_eq!(
+                committed,
+                varg[..=accepted].to_vec(),
+                "draft {draft:?} committed a non-greedy stream"
+            );
+        }
     }
 }

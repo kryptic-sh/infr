@@ -964,7 +964,7 @@ fn cmd_compare_sweep(
     ubatch: usize,
     llama_bench: &str,
 ) -> anyhow::Result<()> {
-    const METRICS: [&str; 3] = ["pp512", "tg128", "tg64@d"];
+    const METRICS: [&str; 4] = ["pp512", "tg128", "tg64@d", "pp4@d"];
     println!(
         "\n{:<22} {:<10} | {:>9} | {:>9} | {:>10}",
         "model", "metric", "infr", "llama.cpp", "infr/llama"
@@ -982,14 +982,17 @@ fn cmd_compare_sweep(
             }
         };
         let ds = depth.to_string();
-        let runs: [(&str, Vec<&str>, (usize, usize)); 3] = [
+        // pp4@d: the tiny-suffix-turn shape (m=2..8 Linears at session depth) — the multi-row
+        // GEMV / spec-verify path; invisible in pp512/tg but it IS multi-turn serve TTFT.
+        let runs: [(&str, Vec<&str>, (usize, usize)); 4] = [
             ("pp512", vec!["-p", "512", "-n", "0"], (512, 0)),
             ("tg128", vec!["-p", "0", "-n", "128"], (0, 128)),
             (METRICS[2], vec!["-p", "0", "-n", "64", "-d", &ds], (0, 64)),
+            (METRICS[3], vec!["-p", "4", "-n", "0", "-d", &ds], (4, 0)),
         ];
         for (metric, args, (np, ng)) in runs {
-            let metric_label = if metric == "tg64@d" {
-                format!("tg64@d{depth}")
+            let metric_label = if metric.ends_with("@d") {
+                format!("{metric}{depth}") // "tg64@d" -> "tg64@d4096"
             } else {
                 metric.to_string()
             };
@@ -1244,6 +1247,28 @@ fn cmd_compare(
             infr_b(&["-p", "0", "-n", &g, "-d", &ds]),
             llama_b(0, gen, &["-p", "0", "-n", &g, "-d", &ds]),
         );
+    }
+
+    // SHORT TURN — the tiny suffix prefill (m = 2..8 Linears): what a brief follow-up costs in a
+    // warm multi-turn session (KV prefix reused, only the new tokens forward). This is the
+    // multi-row-GEMV / spec-verify shape; 16 sits past the mrow gate (the first GEMM point) as
+    // the cliff-edge reference. Cold (@0) isolates the kernels; @depth adds the attention term.
+    hdr("SHORT TURN"); // tiny suffix prefill on a warm session
+    for &n in &[2usize, 4, 8, 16] {
+        let np = n.to_string();
+        row(
+            format!("pp{n}"),
+            infr_b(&["-p", &np, "-n", "0"]),
+            llama_b(n, 0, &["-p", &np, "-n", "0"]),
+        );
+        for &d in ctx {
+            let ds = d.to_string();
+            row(
+                format!("pp{n}@{d}"),
+                infr_b(&["-p", &np, "-n", "0", "-d", &ds]),
+                llama_b(n, 0, &["-p", &np, "-n", "0", "-d", &ds]),
+            );
+        }
     }
 
     for t in turns {

@@ -324,7 +324,10 @@ impl CpuModel {
     ) -> Result<Vec<f64>> {
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
-        let want = depth + p_eff.max(1) + g_eff + 8;
+        // +16: the untimed warmup runs an 8-prompt + 2-gen turn through the SAME session, so the
+        // KV must fit it even when the measured shape is tiny (pp2 with +8 sized the cache to 10
+        // and the warmup itself overflowed it).
+        let want = depth + p_eff.max(1) + g_eff + 16;
         let dummy = |n: usize| -> Vec<u32> { (0..n.max(1)).map(|i| (i % 100) as u32).collect() };
         let mut state: Option<crate::cpu_backend::SeamKv> = None;
         let run = |prompt_len: usize,
@@ -365,7 +368,12 @@ impl CpuModel {
                 let s = run(depth + 1, n_gen, &mut state)?;
                 samples.push(n_gen as f64 / s.decode_secs.max(1e-9));
             } else {
-                let s = run(depth + n_prompt, 0, &mut state)?;
+                // +1: the suffix's LAST token is the decode feed and is never processed at
+                // gen=0, and a suffix of <= 2 skips batched prefill entirely — so `depth + N`
+                // measured N-1 batched rows (and pp2 measured nothing, reporting the 1e-9
+                // floor). With +1, exactly N rows batch-prefill (positions depth..depth+N) and
+                // prompt_secs covers precisely them — llama-bench's -p N semantics.
+                let s = run(depth + n_prompt + 1, 0, &mut state)?;
                 samples.push(n_prompt as f64 / s.prompt_secs.max(1e-9));
             }
         }

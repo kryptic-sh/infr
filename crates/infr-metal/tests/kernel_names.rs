@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")] // like the lib: empty on other targets (metal dep is cfg-gated)
+
 //! Tripwire for the silent-missing-kernel class: every kernel name the executor can dispatch
 //! must exist in the compiled MSL library.
 //!

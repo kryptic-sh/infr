@@ -1,12 +1,19 @@
-# Qwen3.5 / Qwen3.6 (`qwen35` / Qwen3-Next) support
+# Qwen3.5 / Qwen3.6 (`qwen35`) support
 
 Both `unsloth/Qwen3.5-*` and `unsloth/Qwen3.6-*` GGUFs declare
-`general.architecture = qwen35`. It is the **Qwen3-Next** architecture: a hybrid
-of **gated DeltaNet linear-attention** layers and **gated full-attention**
-layers, with SwiGLU (dense for ≤1B; MoE for larger) and sectioned RoPE. Our
-engine is a pure transformer, so this is a net-new architecture family. (Qwen3.6
-has no ≤1B variant; smallest is 27B. Start with
-`unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf` — already pulled.)
+`general.architecture = qwen35`: a hybrid of **gated DeltaNet linear-attention**
+layers and **gated full-attention** layers, with SwiGLU (dense for ≤1B; MoE for
+larger) and sectioned RoPE. Our engine is a pure transformer, so this is a
+net-new architecture family. (Qwen3.6 has no ≤1B variant; smallest is 27B. Start
+with `unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf` — already pulled.)
+
+> **Not Qwen3-Next.** llama.cpp's `qwen3next` is a _sibling_ arch in the same
+> DeltaNet family, but its V heads broadcast differently — Qwen3-Next in blocks
+> (`[k0_v0, k0_v1, k1_v2, k1_v3]`), Qwen3.5 interleaved
+> (`[k0_v0, k1_v1, k0_v2, k1_v3]`, the `h % n_khead` tiling infr implements). A
+> `qwen3next` GGUF through this code would be silently wrong; the arch gate
+> rejects it on purpose. `qwen35moe` is likewise its own arch, unsupported until
+> the expert FFN lands.
 
 ## 0.8B config (metadata)
 

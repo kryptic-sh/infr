@@ -422,7 +422,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     let model: Box<dyn infr_llama::model::ChatModel + '_> = if std::env::var("INFR_METAL").is_ok() {
         if is_q35 {
             eprintln!(
-                "[metal backend — qwen35/Qwen3-Next on the agnostic seam, Apple GPU (reference)]"
+                "[metal backend — qwen35 (Qwen3.5) on the agnostic seam, Apple GPU (reference)]"
             );
             Box::new(infr_llama::model::Qwen35Chat::new_metal(gguf.clone()))
         } else {
@@ -442,7 +442,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         }
     } else if std::env::var("INFR_CPU").is_ok() {
         if is_q35 {
-            eprintln!("[cpu backend — qwen35/Qwen3-Next on the agnostic seam, no GPU]");
+            eprintln!("[cpu backend — qwen35 (Qwen3.5) on the agnostic seam, no GPU]");
             Box::new(infr_llama::model::Qwen35Chat::new_cpu(gguf.clone()))
         } else {
             eprintln!(
@@ -453,7 +453,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             ))
         }
     } else if is_q35 {
-        eprintln!("[qwen35 Qwen3-Next — Vulkan agnostic seam]");
+        eprintln!("[qwen35 (Qwen3.5) — Vulkan agnostic seam]");
         Box::new(infr_llama::model::Qwen35Chat::new(gguf.clone()))
     } else {
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
@@ -700,7 +700,7 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
-    // qwen35 (Qwen3-Next): a hybrid gated-DeltaNet + GQA model on its own agnostic-seam graph — it
+    // qwen35 (Qwen3.5): a hybrid gated-DeltaNet + GQA model on its own agnostic-seam graph — it
     // is NOT a `Llama` (dense/MoE), so `load_opt` below can't load or run it. Route it through the
     // seam's own `ChatModel` (`cmd_bench_qwen35`), reusing the same pp/tg warmup-then-time
     // methodology.
@@ -877,7 +877,7 @@ fn cmd_bench_cpu(
     Ok(())
 }
 
-/// qwen35 (Qwen3-Next) bench: drives the PRODUCTION path through the SAME `ChatModel` structs
+/// qwen35 (Qwen3.5) bench: drives the PRODUCTION path through the SAME `ChatModel` structs
 /// `infr run` builds (`Qwen35Chat`, on the Vulkan or CPU seam backend), timing `ChatModel::generate`
 /// itself — bench and run share one engine BY CONSTRUCTION, so a production-path change can never
 /// leave the bench measuring a dead path. The seam ingests a text prompt, so synthesize one near

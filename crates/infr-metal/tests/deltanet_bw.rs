@@ -1,4 +1,4 @@
-//! Probe: device vs host DeltaNet + Conv1dSilu at Qwen3-Next layer shapes (one linear-attention
+//! Probe: device vs host DeltaNet + Conv1dSilu at qwen35 layer shapes (one linear-attention
 //! sublayer). `INFR_METAL_NODELTA=1` forces the host path for the comparison:
 //! `cargo test -p infr-metal --release --test deltanet_bw -- --ignored --nocapture`.
 #![cfg(target_os = "macos")]
@@ -22,7 +22,7 @@ fn randv(n: usize, mut seed: u64) -> Vec<f32> {
 #[test]
 #[ignore = "requires a Metal GPU (evidence probe)"]
 fn deltanet_layer_wall() {
-    // Qwen3-Next linear-attention shape: 32 value heads, 16 key heads, 128/128 dims.
+    // qwen35 linear-attention shape: 32 value heads, 16 key heads, 128/128 dims.
     let (nv, nk, kd, vd) = (32usize, 16usize, 128usize, 128usize);
     for rows in [1usize, 64] {
         let be = MetalBackend::new().unwrap();

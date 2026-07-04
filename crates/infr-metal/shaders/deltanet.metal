@@ -1,4 +1,4 @@
-// ---- Gated DeltaNet (Qwen3-Next linear attention) + its depthwise conv, ON DEVICE. Both are
+// ---- Gated DeltaNet (qwen35/Qwen3.5 linear attention) + its depthwise conv, ON DEVICE. Both are
 // sequential-over-rows recurrences; the parallelism is across CHANNELS (conv: each thread owns a
 // channel and its state column, no cross-thread deps) and across (value-dim, head) (deltanet:
 // one SIMDGROUP per state column S[:, d], the column register-resident across the chunk — see

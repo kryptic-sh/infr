@@ -132,7 +132,7 @@ fn render_core(
     ctx.insert("bos_token".into(), bos.into());
     ctx.insert("eos_token".into(), eos_s.into());
     // Thinking is ON by default for every model whose template supports it — the key is simply
-    // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5/Qwen3-Next)
+    // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5)
     // then behave the same under `infr run`/`serve` regardless of what their template's own
     // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
     // INFR_NO_THINK=1 turns thinking off (INFR_NO_THINK=0 is a no-op, matching the other INFR_NO_*

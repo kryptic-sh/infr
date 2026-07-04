@@ -1,5 +1,5 @@
 #version 460
-// Causal depthwise 1-D conv + SiLU, ONE token (Qwen3-Next SSM input conv). One thread per channel:
+// Causal depthwise 1-D conv + SiLU, ONE token (qwen35/Qwen3.5 SSM input conv). One thread per channel:
 //   out[ch] = silu( Σ_{k<K-1} state[k][ch]·w[ch][k] + qkv[ch]·w[ch][K-1] )
 // then shift the per-channel history (drop oldest, append the raw qkv). `state` is [K-1, cc] row-major
 // (k outer), `w` is [cc, K] (per-channel kernel), matching the CPU reference layout.

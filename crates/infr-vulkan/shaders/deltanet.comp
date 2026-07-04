@@ -1,5 +1,5 @@
 #version 460
-// Gated-DeltaNet linear-attention recurrence (Qwen3-Next). One workgroup per (value head, block of
+// Gated-DeltaNet linear-attention recurrence (qwen35/Qwen3.5). One workgroup per (value head, block of
 // COL_BLOCK columns of the state S[kd,vd]); the columns of S are independent, so a thread owns one
 // column d and runs the whole `rows`-token recurrence for it. Per head: L2-normalize q,k (q also
 // ×1/√kd), beta=sigmoid(b), decay=exp(a_coef·softplus(alpha+dt_bias)); per token: S*=decay, kv=kᵀS,

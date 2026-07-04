@@ -151,7 +151,7 @@ pub enum SeamBackend {
     Metal,
 }
 
-/// qwen35 / Qwen3-Next on the agnostic batched/chunked seam ([`crate::qwen35::SeamModel`]), loaded
+/// qwen35 (Qwen3.5) on the agnostic batched/chunked seam ([`crate::qwen35::SeamModel`]), loaded
 /// ONCE on the first turn and reused after (weights stay resident across turns). One struct serves
 /// every backend — Vulkan (production), CPU and Metal (reference) — and it is the same engine
 /// `infr bench` times, so run and bench cannot drift apart.

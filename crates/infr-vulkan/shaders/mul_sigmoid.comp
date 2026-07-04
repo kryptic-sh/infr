@@ -1,5 +1,5 @@
 #version 460
-// Elementwise sigmoid gate: y[i] = a[i] * sigmoid(b[i]). Qwen3-Next's per-head attention output gate
+// Elementwise sigmoid gate: y[i] = a[i] * sigmoid(b[i]). qwen35 (Qwen3.5)'s per-head attention output gate
 // (attn · sigmoid(gate)). `a` and `b` may alias `y` for in-place use.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC { uint n; } pc;

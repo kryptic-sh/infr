@@ -794,7 +794,7 @@ pub(crate) fn silu_mul_spv() -> &'static [u32] {
     static SILU_MUL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     SILU_MUL_SPV.get_or_init(|| spv_words(SILU_MUL_SPV_BYTES))
 }
-/// SPIR-V for the gated-DeltaNet recurrence step (Qwen3-Next SSM).
+/// SPIR-V for the gated-DeltaNet recurrence step (qwen35/Qwen3.5 SSM).
 pub(crate) fn deltanet_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SPV_BYTES))
@@ -819,7 +819,7 @@ pub(crate) fn deltanet_chunked_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_CHUNKED_SPV_BYTES))
 }
-/// SPIR-V for the causal depthwise conv1d + SiLU step (Qwen3-Next SSM input conv).
+/// SPIR-V for the causal depthwise conv1d + SiLU step (qwen35/Qwen3.5 SSM input conv).
 pub(crate) fn conv1d_silu_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(CONV1D_SILU_SPV_BYTES))

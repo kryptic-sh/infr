@@ -1,5 +1,5 @@
 #version 460
-// Causal depthwise 1-D conv + SiLU, BATCH pass 1 of 2 (Qwen3-Next SSM input conv, rows ≥ kconv-1).
+// Causal depthwise 1-D conv + SiLU, BATCH pass 1 of 2 (qwen35/Qwen3.5 SSM input conv, rows ≥ kconv-1).
 // The sequential kernel carries the per-channel history token by token (rows serial steps + a
 // global history shuffle per token). But the conv is depthwise with a fixed kernel: every output
 // depends only on the VIRTUAL sequence [state ‖ qkv] — so all rows·cc outputs are independent:

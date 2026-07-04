@@ -1,5 +1,5 @@
 #version 460
-// CHUNKED gated-DeltaNet prefill (Qwen3-Next). The sequential recurrence (one token at a time,
+// CHUNKED gated-DeltaNet prefill (qwen35/Qwen3.5). The sequential recurrence (one token at a time,
 // 2·kd state accesses each) is reformulated chunkwise (C=32): per chunk everything reduces to
 // small dense matmuls plus ONE unit-lower-triangular solve, so a whole chunk of tokens is
 // processed per state traversal. Math (validated CPU-side in tests/chunked_delta_math.rs):

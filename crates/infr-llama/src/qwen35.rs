@@ -1,5 +1,12 @@
-//! Qwen3.5 / Qwen3.6 (`qwen35`, aka Qwen3-Next): hybrid gated-DeltaNet linear-attention + gated
+//! Qwen3.5 / Qwen3.6 (arch `qwen35`): hybrid gated-DeltaNet linear-attention + gated
 //! full-attention. See `docs/QWEN35.md`.
+//!
+//! NOT Qwen3-Next: llama.cpp's `qwen3next` is a SIBLING arch whose DeltaNet V heads broadcast in
+//! a different pattern — Qwen3-Next blocks them (`[k0_v0, k0_v1, k1_v2, k1_v3]`) while Qwen3.5
+//! interleaves (`[k0_v0, k1_v1, k0_v2, k1_v3]`, the `h % n_khead` tiling implemented here). A
+//! `qwen3next` GGUF through this code would produce silently wrong output — the arch gate below
+//! rejecting anything but `qwen35` is load-bearing, not cosmetic. (`qwen35moe` is likewise
+//! unsupported until its expert FFN lands.)
 //!
 //! Production path: [`SeamModel`] builds a backend-agnostic decode `Graph` (composite ops over typed
 //! handles, see `infr_core::graph`) and runs it through whichever [`infr_core::backend::Backend`] is
@@ -183,7 +190,7 @@ pub fn render_chat_messages(path: &std::path::Path, messages: &[(&str, &str)]) -
     })
 }
 
-/// Greedy pure-CPU generation for qwen35 / Qwen3-Next on the agnostic seam (no Vulkan). `prompt` is
+/// Greedy pure-CPU generation for qwen35 (Qwen3.5) on the agnostic seam (no Vulkan). `prompt` is
 /// the already-formatted text (see [`render_chat`]); returns timing/counts, text streams via `on_piece`.
 /// Context rows a call needs: the whole prompt + the generation budget + the sampled tail.
 fn plen_hint(prompt_ids: &[u32], n: usize) -> usize {
@@ -193,7 +200,7 @@ fn plen_hint(prompt_ids: &[u32], n: usize) -> usize {
 /// Turns a native-dtype GGUF tensor into a backend weight buffer (upload or zero-copy map).
 pub type BindWeight<'a> = &'a dyn Fn(&dyn Backend, TensorBytes) -> Result<Box<dyn Buffer>>;
 
-/// Load-once Qwen3-Next (qwen35) seam model: a backend + the model's native-dtype weight buffers +
+/// Load-once qwen35 (Qwen3.5) seam model: a backend + the model's native-dtype weight buffers +
 /// tokenizer/config, constructed ONCE and reused across `generate` calls. This is the SINGLE
 /// generation engine behind `infr run` (via [`crate::model::Qwen35Chat`] /
 /// on any backend) AND `infr bench` — bench times exactly what run executes, so a
@@ -1162,7 +1169,7 @@ impl SeamModel {
     }
 }
 
-/// Qwen3-Next decode on the CPU reference backend (weights mapped zero-copy from the GGUF mmap).
+/// qwen35 (Qwen3.5) decode on the CPU reference backend (weights mapped zero-copy from the GGUF mmap).
 pub fn generate_cpu(
     path: &std::path::Path,
     prompt: &str,
@@ -1173,7 +1180,7 @@ pub fn generate_cpu(
     m.generate(prompt, n, on_piece)
 }
 
-/// Qwen3-Next decode on the reference Metal backend (weights uploaded to Metal buffers in their
+/// qwen35 (Qwen3.5) decode on the reference Metal backend (weights uploaded to Metal buffers in their
 /// native GGUF dtype; the backend dequantizes lazily). The Apple-GPU twin of [`generate_cpu`].
 #[cfg(target_os = "macos")]
 pub fn generate_metal(
@@ -1186,7 +1193,7 @@ pub fn generate_metal(
     m.generate(prompt, n, on_piece)
 }
 
-/// Qwen3-Next on the Vulkan GPU through the AGNOSTIC SEAM (weights uploaded to VRAM in their native
+/// qwen35 (Qwen3.5) on the Vulkan GPU through the AGNOSTIC SEAM (weights uploaded to VRAM in their native
 /// GGUF dtype; the backend dequantizes in-kernel): batched/chunked prefill (the whole prompt flows
 /// through a few graph builds instead of one per token) + per-token decode. The Vulkan twin of
 /// [`generate_cpu`], and the production path behind [`generate_chat`]. See `gpu_seam_qwen35` and the
@@ -1201,7 +1208,7 @@ pub fn generate_vulkan(
     m.generate(prompt, n, on_piece)
 }
 
-/// True if the GGUF at `path` is a `qwen35` (Qwen3-Next) model.
+/// True if the GGUF at `path` is a `qwen35` (Qwen3.5/Qwen3.6) model.
 pub fn is_qwen35(path: &std::path::Path) -> bool {
     Gguf::open(path)
         .ok()

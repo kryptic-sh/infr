@@ -5,7 +5,7 @@
 //! here once and everywhere at once.
 
 /// Does this rendered prompt end with a `<think>` PREFILL (the template opened the reasoning
-/// block itself — Qwen3.5/Qwen3-Next style — so the model's output starts MID-reasoning with only
+/// block itself — Qwen3.5 style — so the model's output starts MID-reasoning with only
 /// the close marker)? Callers inject a synthetic `"<think>"` piece at the head of the stream when
 /// this is true, so the streaming splitter, the display styler and the history stripper all see a
 /// well-formed block through the one shared grammar.

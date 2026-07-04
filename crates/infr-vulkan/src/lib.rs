@@ -1087,7 +1087,7 @@ mod tests {
     }
 }
 
-// Qwen3-Next SSM kernels: the GPU conv1d+SiLU and gated-DeltaNet recurrence must match the CPU
+// qwen35 (Qwen3.5) SSM kernels: the GPU conv1d+SiLU and gated-DeltaNet recurrence must match the CPU
 // reference. Self-skip without a GPU (so CI passes, runs locally with a device).
 #[cfg(test)]
 mod ssm_tests {

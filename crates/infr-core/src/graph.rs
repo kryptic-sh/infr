@@ -38,7 +38,7 @@ pub enum Activation {
     Silu,
     /// GeGLU: `gelu_tanh(gate) * up` (Gemma).
     Gelu,
-    /// `sigmoid(gate) * up` (Qwen3-Next output gate / silu-gated-RMSNorm uses Silu instead).
+    /// `sigmoid(gate) * up` (qwen35 output gate / silu-gated-RMSNorm uses Silu instead).
     Sigmoid,
 }
 
@@ -263,7 +263,7 @@ pub enum Op {
         scale: f32,
         act: Activation,
     },
-    /// Depthwise causal 1-D conv over `channels` followed by SiLU (Qwen3-Next gated DeltaNet).
+    /// Depthwise causal 1-D conv over `channels` followed by SiLU (qwen35 gated DeltaNet).
     /// Processes `rows` tokens sequentially, carrying the rolling history in `state` across rows and
     /// leaving it updated after the last row. `x`/`dst` are `[rows, channels]`; `weight` is the
     /// per-channel kernel `[channels, kernel]`; `state` is the rolling `[(kernel-1), channels]`
@@ -278,7 +278,7 @@ pub enum Op {
         channels: u32,
         kernel: u32,
     },
-    /// Gated-DeltaNet linear-attention recurrence step (Qwen3-Next), one token. Per VALUE head:
+    /// Gated-DeltaNet linear-attention recurrence step (qwen35), one token. Per VALUE head:
     /// L2-normalize `q`,`k`; scale `q` by `1/√head_k`; `beta = sigmoid(b)`, `decay =
     /// exp(a_coef·softplus(a + dt_bias))`; update the persistent state `S[head_k, head_v]`: `S *=
     /// decay`, `delta = (v − Sᵀk)·beta`, `S += k⊗delta`; `dst = Sᵀq`. GQA linear attention: `n_vhead`

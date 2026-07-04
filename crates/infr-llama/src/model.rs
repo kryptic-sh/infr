@@ -527,6 +527,20 @@ impl ChatModel for SpecMetalChat {
         self.target.render_chat_messages(messages)
     }
 
+    fn warmup(&mut self) -> Result<()> {
+        // Compile BOTH models' pipelines now (a spec round drives target prefill, draft decode,
+        // and the batched verify) so serve's first request doesn't pay two cold starts.
+        self.generate("Hi", 2, &mut |_| {})?;
+        // Drop the warmup tokens so the first real prompt prefills clean slots from row 0.
+        if let Some(s) = &mut self.target_session {
+            s.reset_cache();
+        }
+        if let Some(s) = &mut self.draft_session {
+            s.reset_cache();
+        }
+        Ok(())
+    }
+
     fn generate(
         &mut self,
         prompt: &str,

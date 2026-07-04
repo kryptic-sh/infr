@@ -3039,11 +3039,46 @@ kernel void attention_q8kv(device const float* q   [[buffer(0)]],
     for (uint d = lane; d < p.head_dim; d += 32u) { dst[qb + d] = acc[t] / l; t++; }
 }
 
-// Vector flash attention over a Q8_0 cache — the attnvec structure with dequant-on-read
+// Quantized-KV accessors for the vector flash body below: each struct decodes 4 consecutive
+// elements (e % 4 == 0, never straddling a nibble half) of one cache block to f32. All are
+// exact ports of the CPU dequant formulas, so the attention math is f32 over exactly-decoded
+// values — reassociation-only vs the CPU oracle, independent of the storage format.
+struct KVQ8 {
+    static float4 at4(device const uchar* c, ulong e) { return q8_float4(c, e); }
+};
+struct KVQ40 { /* 18 B block: [f16 d][16 B nibbles]; elem j<16 low nibble of byte j, else high */
+    static float4 at4(device const uchar* c, ulong e) {
+        device const uchar* blk = c + (e >> 5) * 18ul;
+        float d = (float)*(device const half*)blk; /* block offset is even: d stays aligned */
+        uint j = (uint)(e & 31u);
+        /* 4 consecutive elems share the nibble half: 4 bytes via two aligned ushort loads */
+        device const ushort* q2 = (device const ushort*)(blk + 2u + (j & 15u));
+        uint lo = q2[0], hi = q2[1];
+        uint s = (j < 16u) ? 0u : 4u;
+        return d * (float4((float)((lo >> s) & 0xFu), (float)((lo >> (8u + s)) & 0xFu),
+                           (float)((hi >> s) & 0xFu), (float)((hi >> (8u + s)) & 0xFu)) -
+                    8.0f);
+    }
+};
+struct KVIQ4NL { /* q4_0 layout, nibbles index the shared IQ4_NL codebook instead of -8 offset */
+    static float4 at4(device const uchar* c, ulong e) {
+        device const uchar* blk = c + (e >> 5) * 18ul;
+        float d = (float)*(device const half*)blk;
+        uint j = (uint)(e & 31u);
+        device const ushort* q2 = (device const ushort*)(blk + 2u + (j & 15u));
+        uint lo = q2[0], hi = q2[1];
+        uint s = (j < 16u) ? 0u : 4u;
+        return d * float4(kvalues_iq4nl_f[(lo >> s) & 0xFu], kvalues_iq4nl_f[(lo >> (8u + s)) & 0xFu],
+                          kvalues_iq4nl_f[(hi >> s) & 0xFu], kvalues_iq4nl_f[(hi >> (8u + s)) & 0xFu]);
+    }
+};
+
+// Vector flash attention over a quantized cache — the attnvec structure with dequant-on-read
 // (see attnvec_body; kept as a sibling body because the KV accessor type differs). Same
-// numeric class: f32 dots over exactly-dequantized q8 values, reassociation only.
-template<uint hd, uint NSG>
-inline void attnvec_q8_body(device const float* q,
+// numeric class: f32 dots over exactly-dequantized values, reassociation only. The accessor
+// struct is the only format-specific part (q8/q4_0/iq4_nl share the body verbatim).
+template<uint hd, uint NSG, typename KV>
+inline void attnvec_q_body(device const float* q,
                             device const uchar* k,
                             device const uchar* v,
                             device float*       dst,
@@ -3090,7 +3125,7 @@ inline void attnvec_q8_body(device const float* q,
                 ulong eb = ((ulong)rc * p.n_kv + kvh) * hd;
                 float acc = 0.0f;
                 for (uint ii = 0; ii < NI; ii++)
-                    acc += dot(q8_float4(k, eb + (ii * NL + tx) * 4u), sq4[ii * NL + tx]);
+                    acc += dot(KV::at4(k, eb + (ii * NL + tx) * 4u), sq4[ii * NL + tx]);
                 acc += simd_shuffle_down(acc, 4);
                 acc += simd_shuffle_down(acc, 2);
                 acc += simd_shuffle_down(acc, 1);
@@ -3122,7 +3157,7 @@ inline void attnvec_q8_body(device const float* q,
                 ulong eb = ((ulong)rc * p.n_kv + kvh) * hd;
                 float pw = ss[NE * cc + ty];
                 for (uint ii = 0; ii < NI; ii++)
-                    lov[ii] += q8_float4(v, eb + (ii * NL + tx) * 4u) * pw;
+                    lov[ii] += KV::at4(v, eb + (ii * NL + tx) * 4u) * pw;
             }
             for (uint ii = 0; ii < NI; ii++) {
                 lov[ii] += simd_shuffle_down(lov[ii], 16);
@@ -3157,37 +3192,37 @@ inline void attnvec_q8_body(device const float* q,
     }
 }
 
-template<uint hd, uint NSG>
-kernel void attnvec_q8kv_t(device const float* q   [[buffer(0)]],
-                           device const uchar* k   [[buffer(1)]],
-                           device const uchar* v   [[buffer(2)]],
-                           device float*       dst [[buffer(3)]],
-                           constant AttnParams& p  [[buffer(4)]],
-                           uint3  tgpig [[threadgroup_position_in_grid]],
-                           ushort sgitg [[simdgroup_index_in_threadgroup]],
-                           ushort tiisg [[thread_index_in_simdgroup]]) {
+template<uint hd, uint NSG, typename KV>
+kernel void attnvec_qkv_t(device const float* q   [[buffer(0)]],
+                          device const uchar* k   [[buffer(1)]],
+                          device const uchar* v   [[buffer(2)]],
+                          device float*       dst [[buffer(3)]],
+                          constant AttnParams& p  [[buffer(4)]],
+                          uint3  tgpig [[threadgroup_position_in_grid]],
+                          ushort sgitg [[simdgroup_index_in_threadgroup]],
+                          ushort tiisg [[thread_index_in_simdgroup]]) {
     threadgroup float sq[hd];
     threadgroup float ssc[NSG * 32];
     threadgroup float so[NSG * hd];
     uint abs = p.pos + tgpig.x / p.n_head;
-    attnvec_q8_body<hd, NSG>(q, k, v, dst, p, abs, p.kv_len, sq, ssc, so, tgpig, sgitg, tiisg);
+    attnvec_q_body<hd, NSG, KV>(q, k, v, dst, p, abs, p.kv_len, sq, ssc, so, tgpig, sgitg, tiisg);
 }
 
-template<uint hd, uint NSG>
-kernel void attnvec_dyn_q8kv_t(device const float* q    [[buffer(0)]],
-                               device const uchar* k    [[buffer(1)]],
-                               device const uchar* v    [[buffer(2)]],
-                               device float*       dst  [[buffer(3)]],
-                               device const int*   posb [[buffer(4)]],
-                               constant AttnParams& p   [[buffer(5)]],
-                               uint3  tgpig [[threadgroup_position_in_grid]],
-                               ushort sgitg [[simdgroup_index_in_threadgroup]],
-                               ushort tiisg [[thread_index_in_simdgroup]]) {
+template<uint hd, uint NSG, typename KV>
+kernel void attnvec_dyn_qkv_t(device const float* q    [[buffer(0)]],
+                              device const uchar* k    [[buffer(1)]],
+                              device const uchar* v    [[buffer(2)]],
+                              device float*       dst  [[buffer(3)]],
+                              device const int*   posb [[buffer(4)]],
+                              constant AttnParams& p   [[buffer(5)]],
+                              uint3  tgpig [[threadgroup_position_in_grid]],
+                              ushort sgitg [[simdgroup_index_in_threadgroup]],
+                              ushort tiisg [[thread_index_in_simdgroup]]) {
     threadgroup float sq[hd];
     threadgroup float ssc[NSG * 32];
     threadgroup float so[NSG * hd];
     uint abs = (uint)posb[0];
-    attnvec_q8_body<hd, NSG>(q, k, v, dst, p, abs, abs + 1u, sq, ssc, so, tgpig, sgitg, tiisg);
+    attnvec_q_body<hd, NSG, KV>(q, k, v, dst, p, abs, abs + 1u, sq, ssc, so, tgpig, sgitg, tiisg);
 }
 
 // Cooperative flash attention over a Q8_0 cache — the attnflash2 structure with a cooperative
@@ -3350,16 +3385,33 @@ typedef decltype(attnflash2_q8kv_t<64, 4>) attnflash2_q8_t;
 template [[host_name("attnflash2_q8kv_hd64")]]  kernel attnflash2_q8_t attnflash2_q8kv_t<64, 4>;
 template [[host_name("attnflash2_q8kv_hd128")]] kernel attnflash2_q8_t attnflash2_q8kv_t<128, 4>;
 
-typedef decltype(attnvec_q8kv_t<64, 32>) attnvec_q8_t;
-template [[host_name("attnvec_q8kv_hd64")]]  kernel attnvec_q8_t attnvec_q8kv_t<64, 32>;
-template [[host_name("attnvec_q8kv_hd128")]] kernel attnvec_q8_t attnvec_q8kv_t<128, 32>;
-typedef decltype(attnvec_dyn_q8kv_t<64, 32>) attnvec_dyn_q8_t;
-template [[host_name("attnvec_dyn_q8kv_hd64")]]  kernel attnvec_dyn_q8_t attnvec_dyn_q8kv_t<64, 32>;
-template [[host_name("attnvec_dyn_q8kv_hd128")]] kernel attnvec_dyn_q8_t attnvec_dyn_q8kv_t<128, 32>;
+typedef decltype(attnvec_qkv_t<64, 32, KVQ8>) attnvec_q_t;
+template [[host_name("attnvec_q8kv_hd64")]]  kernel attnvec_q_t attnvec_qkv_t<64, 32, KVQ8>;
+template [[host_name("attnvec_q8kv_hd128")]] kernel attnvec_q_t attnvec_qkv_t<128, 32, KVQ8>;
+typedef decltype(attnvec_dyn_qkv_t<64, 32, KVQ8>) attnvec_dyn_q_t;
+template [[host_name("attnvec_dyn_q8kv_hd64")]]  kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<64, 32, KVQ8>;
+template [[host_name("attnvec_dyn_q8kv_hd128")]] kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<128, 32, KVQ8>;
 // hd=256 at NSG=16 — same threadgroup-budget math as the f16 vec kernel. (No q8 flash hd256:
 // its dequant-staging tile alone is C*hd = 32 KB half — needs a C=32 variant first.)
-template [[host_name("attnvec_q8kv_hd256")]]     kernel attnvec_q8_t     attnvec_q8kv_t<256, 16>;
-template [[host_name("attnvec_dyn_q8kv_hd256")]] kernel attnvec_dyn_q8_t attnvec_dyn_q8kv_t<256, 16>;
+template [[host_name("attnvec_q8kv_hd256")]]     kernel attnvec_q_t     attnvec_qkv_t<256, 16, KVQ8>;
+template [[host_name("attnvec_dyn_q8kv_hd256")]] kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<256, 16, KVQ8>;
+
+// Native-read q4_0 / iq4_nl decode: the same vector flash over the compact 18 B blocks — no
+// prepass scratch, no whole-prefix re-dequant per token, and f32 accumulation over exactly
+// decoded values (the prepass path rounds the scratch to f16; at 4 bits on BOTH sides that
+// compounding measurably costs long-context recall). Prefill keeps the dequant→f16 prepass.
+template [[host_name("attnvec_q4_0kv_hd64")]]  kernel attnvec_q_t attnvec_qkv_t<64, 32, KVQ40>;
+template [[host_name("attnvec_q4_0kv_hd128")]] kernel attnvec_q_t attnvec_qkv_t<128, 32, KVQ40>;
+template [[host_name("attnvec_q4_0kv_hd256")]] kernel attnvec_q_t attnvec_qkv_t<256, 16, KVQ40>;
+template [[host_name("attnvec_dyn_q4_0kv_hd64")]]  kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<64, 32, KVQ40>;
+template [[host_name("attnvec_dyn_q4_0kv_hd128")]] kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<128, 32, KVQ40>;
+template [[host_name("attnvec_dyn_q4_0kv_hd256")]] kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<256, 16, KVQ40>;
+template [[host_name("attnvec_iq4nlkv_hd64")]]  kernel attnvec_q_t attnvec_qkv_t<64, 32, KVIQ4NL>;
+template [[host_name("attnvec_iq4nlkv_hd128")]] kernel attnvec_q_t attnvec_qkv_t<128, 32, KVIQ4NL>;
+template [[host_name("attnvec_iq4nlkv_hd256")]] kernel attnvec_q_t attnvec_qkv_t<256, 16, KVIQ4NL>;
+template [[host_name("attnvec_dyn_iq4nlkv_hd64")]]  kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<64, 32, KVIQ4NL>;
+template [[host_name("attnvec_dyn_iq4nlkv_hd128")]] kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<128, 32, KVIQ4NL>;
+template [[host_name("attnvec_dyn_iq4nlkv_hd256")]] kernel attnvec_dyn_q_t attnvec_dyn_qkv_t<256, 16, KVIQ4NL>;
 
 // ============================================================================================
 // Decoupled KV-cache quant/dequant (mainline low-bit blocks q4_0/q4_1/q5_0/q5_1/iq4_nl, dense
@@ -3580,6 +3632,65 @@ kernel void dequant_iq4_nl_f16(device const uchar* cache [[buffer(0)]],
     float d = kv_rf16(cache, bd);
     uint nib = (j < 16u) ? (cache[bd + 2u + j] & 0xFu) : (cache[bd + 2u + j - 16u] >> 4u);
     dst[i] = (half)(d * (float)KV_IQ4NL[nib]);
+}
+
+// Replay-tape (dynamic-pos) variants of the q4_0 / iq4_nl quantizing writes: the row offset
+// comes from the bound positions buffer (the baked base is the recorded token's only) — the
+// same contract as writekv_dyn_q8. Quantization formulas are byte-identical to the static
+// kernels above.
+kernel void writekv_dyn_q4_0(device const float* src   [[buffer(0)]],
+                             device uchar*       cache [[buffer(1)]],
+                             device const int*   posb  [[buffer(2)]],
+                             constant WriteKvDynParams& p [[buffer(3)]],
+                             uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 32u) return;
+    device const float* s = src + gid * 32u;
+    float vmax = -1e30f, vmin = 1e30f;
+    for (uint j = 0; j < 32u; j++) { vmax = max(vmax, s[j]); vmin = min(vmin, s[j]); }
+    float mx = (fabs(vmax) >= fabs(vmin)) ? vmax : vmin;
+    float d = mx / -8.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    ulong base_blk = (ulong)(uint)posb[0] * (p.row_stride >> 5);
+    uint bo = (uint)((base_blk + gid) * 18ul);
+    kv_wf16(cache, bo, d);
+    for (uint j = 0; j < 16u; j++) {
+        int xi0 = clamp(int(s[j] * id + 8.5f), 0, 15);
+        int xi1 = clamp(int(s[j + 16u] * id + 8.5f), 0, 15);
+        cache[bo + 2u + j] = (uchar)(xi0 | (xi1 << 4));
+    }
+}
+
+kernel void writekv_dyn_iq4_nl(device const float* src   [[buffer(0)]],
+                               device uchar*       cache [[buffer(1)]],
+                               device const int*   posb  [[buffer(2)]],
+                               constant WriteKvDynParams& p [[buffer(3)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 32u) return;
+    device const float* s = src + gid * 32u;
+    float amax = 0.0f, mxv = 0.0f;
+    for (uint j = 0; j < 32u; j++) { float a = fabs(s[j]); if (a > amax) { amax = a; mxv = s[j]; } }
+    int L[32];
+    float d = 0.0f;
+    if (amax >= 1e-15f) {
+        d = mxv / (float)KV_IQ4NL[0];
+        float id = 1.0f / d;
+        float sumqx = 0.0f, sumq2 = 0.0f;
+        for (uint j = 0; j < 32u; j++) {
+            int li = kv_best_index(id * s[j]);
+            L[j] = li;
+            float q = (float)KV_IQ4NL[li];
+            float w = s[j] * s[j];
+            sumqx += w * q * s[j];
+            sumq2 += w * q * q;
+        }
+        d = sumq2 > 0.0f ? sumqx / sumq2 : 0.0f;
+    } else {
+        for (uint j = 0; j < 32u; j++) L[j] = 0;
+    }
+    ulong base_blk = (ulong)(uint)posb[0] * (p.row_stride >> 5);
+    uint bo = (uint)((base_blk + gid) * 18ul);
+    kv_wf16(cache, bo, d);
+    for (uint j = 0; j < 16u; j++) cache[bo + 2u + j] = (uchar)(L[j] | (L[j + 16u] << 4));
 }
 
 // ---- bf16 (2 B): top 16 bits of the f32 (round-to-nearest-even); dequant is a lossless <<16.

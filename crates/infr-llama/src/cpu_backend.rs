@@ -693,13 +693,16 @@ pub(crate) fn generate_dense_backend(
     let kv_align_ok =
         (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
-    let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan")
+    // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
+    // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
+    let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan" | "metal")
         && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
-    // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan (Vulkan uses a dequant→f16 prepass);
-    // need 32-block alignment. f32/bf16 KV stay CPU-only (no GPU dense-KV path yet).
-    let blk_ok = matches!(be.name(), "cpu" | "vulkan") && kv_align_ok;
-    // Dense f32/bf16 KV: CPU + Vulkan (Vulkan stores dense + reads via a cast→f16 prepass).
-    let dense_ok = matches!(be.name(), "cpu" | "vulkan");
+    // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal (both GPUs dequant→f16
+    // prepass); need 32-block alignment.
+    let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal") && kv_align_ok;
+    // Dense f32/bf16 KV: CPU + Vulkan + Metal. Vulkan/Metal store dense; f32 reads natively (its
+    // own f32 attention), bf16 reads via a cast→f16 prepass.
+    let dense_ok = matches!(be.name(), "cpu" | "vulkan" | "metal");
     let parse_kv_fmt = |var: &str| -> DType {
         let side = std::env::var(var).ok();
         match side.as_deref() {
@@ -722,12 +725,16 @@ pub(crate) fn generate_dense_backend(
     };
     let mut k_fmt = parse_kv_fmt("INFR_KV_TYPE_K");
     let mut v_fmt = parse_kv_fmt("INFR_KV_TYPE_V");
-    // Metal still supports only COUPLED Q8 (its attention picks ONE Q8-KV kernel reading both sides
-    // as q8), so a mixed request (one side q8, one f16) would misread the f16 side — fall back to
-    // f16 on both there. Vulkan and the CPU reference read K and V independently (per-side kernels).
+    // Metal's Q8 and F32 KV use native-read attention that reads BOTH sides as one dtype, so a
+    // mixed request with q8/f32 on one side would misread the other — clamp those to coupled f16.
+    // The prepass formats (block quants / bf16 / turbo) expand each side to its own f16 scratch, so
+    // they compose freely with each other and with a native-f16 side (per-side, like Vulkan/CPU).
     if be.name() == "metal" && k_fmt != v_fmt {
-        k_fmt = DType::F16;
-        v_fmt = DType::F16;
+        let native_read = |dt| matches!(dt, DType::Q8_0 | DType::F32);
+        if native_read(k_fmt) || native_read(v_fmt) {
+            k_fmt = DType::F16;
+            v_fmt = DType::F16;
+        }
     }
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──

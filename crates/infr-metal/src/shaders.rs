@@ -2478,4 +2478,400 @@ template [[host_name("attnvec_dyn_q8kv_hd128")]] kernel attnvec_dyn_q8_t attnvec
 // its dequant-staging tile alone is C*hd = 32 KB half — needs a C=32 variant first.)
 template [[host_name("attnvec_q8kv_hd256")]]     kernel attnvec_q8_t     attnvec_q8kv_t<256, 16>;
 template [[host_name("attnvec_dyn_q8kv_hd256")]] kernel attnvec_dyn_q8_t attnvec_dyn_q8kv_t<256, 16>;
+
+// ============================================================================================
+// Decoupled KV-cache quant/dequant (mainline low-bit blocks q4_0/q4_1/q5_0/q5_1/iq4_nl, dense
+// bf16, and TurboQuant turbo2/3/4). These follow the Vulkan "dequant -> f16 prepass" model:
+// WriteKv quantizes the f32 activation into the compact cache; Attention expands the quantized
+// prefix into a transient f16 scratch, then the existing f16 attention kernels read the scratch.
+// Every quantize/dequant here is a bit-for-bit port of the CPU reference (crates/infr-cpu:
+// kvquant.rs block quants, turbo.rs TurboQuant) so the parity tests hold against the CPU oracle.
+// One thread per 32-elem block for the block quants (n/32 threads), per 128-elem block for turbo
+// (n/128), per element for bf16 and the dequant expansions (dequant turbo is per 128-block).
+// `p.base` is in ELEMENTS (row-aligned to the block size by the runner).
+// ============================================================================================
+
+// f16 read/write at a byte offset into a uchar cache (little-endian, IEEE half).
+inline float kv_rf16(device const uchar* c, uint bo) {
+    ushort h = (ushort)c[bo] | ((ushort)c[bo + 1u] << 8);
+    return (float)as_type<half>(h);
+}
+inline void kv_wf16(device uchar* c, uint bo, float x) {
+    ushort h = as_type<ushort>((half)x);
+    c[bo] = (uchar)(h & 0xFFu);
+    c[bo + 1u] = (uchar)(h >> 8);
+}
+
+// ---- q4_0 (18 B): d = max/-8, q = clamp(x/d + 8.5, 0, 15), 4-bit low/high halves.
+kernel void writekv_q4_0(device const float* src [[buffer(0)]],
+                         device uchar* cache [[buffer(1)]],
+                         constant WriteKvParams& p [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 32u) return;
+    device const float* s = src + gid * 32u;
+    float vmax = -1e30f, vmin = 1e30f;
+    for (uint j = 0; j < 32u; j++) { vmax = max(vmax, s[j]); vmin = min(vmin, s[j]); }
+    float mx = (fabs(vmax) >= fabs(vmin)) ? vmax : vmin;
+    float d = mx / -8.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint bo = (p.base / 32u + gid) * 18u;
+    kv_wf16(cache, bo, d);
+    for (uint j = 0; j < 16u; j++) {
+        int xi0 = clamp(int(s[j] * id + 8.5f), 0, 15);
+        int xi1 = clamp(int(s[j + 16u] * id + 8.5f), 0, 15);
+        cache[bo + 2u + j] = (uchar)(xi0 | (xi1 << 4));
+    }
+}
+kernel void dequant_q4_0_f16(device const uchar* cache [[buffer(0)]],
+                             device half* dst [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    uint j = i % 32u; uint bd = (i / 32u) * 18u;
+    float d = kv_rf16(cache, bd);
+    uint nib = (j < 16u) ? (cache[bd + 2u + j] & 0xFu) : (cache[bd + 2u + j - 16u] >> 4u);
+    dst[i] = (half)(d * (float(nib) - 8.0f));
+}
+
+// ---- q4_1 (20 B): asymmetric d = (max-min)/15, q = clamp((x-min)/d + 0.5, 0, 15), stores min.
+kernel void writekv_q4_1(device const float* src [[buffer(0)]],
+                         device uchar* cache [[buffer(1)]],
+                         constant WriteKvParams& p [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 32u) return;
+    device const float* s = src + gid * 32u;
+    float vmin = 1e30f, vmax = -1e30f;
+    for (uint j = 0; j < 32u; j++) { vmin = min(vmin, s[j]); vmax = max(vmax, s[j]); }
+    float d = (vmax - vmin) / 15.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint bo = (p.base / 32u + gid) * 20u;
+    kv_wf16(cache, bo, d);
+    kv_wf16(cache, bo + 2u, vmin);
+    for (uint j = 0; j < 16u; j++) {
+        int xi0 = clamp(int((s[j] - vmin) * id + 0.5f), 0, 15);
+        int xi1 = clamp(int((s[j + 16u] - vmin) * id + 0.5f), 0, 15);
+        cache[bo + 4u + j] = (uchar)(xi0 | (xi1 << 4));
+    }
+}
+kernel void dequant_q4_1_f16(device const uchar* cache [[buffer(0)]],
+                             device half* dst [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    uint j = i % 32u; uint bd = (i / 32u) * 20u;
+    float d = kv_rf16(cache, bd); float m = kv_rf16(cache, bd + 2u);
+    uint nib = (j < 16u) ? (cache[bd + 4u + j] & 0xFu) : (cache[bd + 4u + j - 16u] >> 4u);
+    dst[i] = (half)(d * float(nib) + m);
+}
+
+// ---- q5_0 (22 B): d = max/-16, 5-bit — low nibble in qs, 5th bit packed into the qh u32.
+kernel void writekv_q5_0(device const float* src [[buffer(0)]],
+                         device uchar* cache [[buffer(1)]],
+                         constant WriteKvParams& p [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 32u) return;
+    device const float* s = src + gid * 32u;
+    float vmax = -1e30f, vmin = 1e30f;
+    for (uint j = 0; j < 32u; j++) { vmax = max(vmax, s[j]); vmin = min(vmin, s[j]); }
+    float mx = (fabs(vmax) >= fabs(vmin)) ? vmax : vmin;
+    float d = mx / -16.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint bo = (p.base / 32u + gid) * 22u;
+    kv_wf16(cache, bo, d);
+    uint qh = 0u;
+    for (uint j = 0; j < 16u; j++) {
+        int xi0 = clamp(int(s[j] * id + 16.5f), 0, 31);
+        int xi1 = clamp(int(s[j + 16u] * id + 16.5f), 0, 31);
+        cache[bo + 6u + j] = (uchar)((xi0 & 0xF) | ((xi1 & 0xF) << 4));
+        qh |= (uint(xi0 & 0x10) >> 4) << j;
+        qh |= (uint(xi1 & 0x10) >> 4) << (j + 16u);
+    }
+    cache[bo + 2u] = (uchar)(qh & 0xFFu);
+    cache[bo + 3u] = (uchar)((qh >> 8) & 0xFFu);
+    cache[bo + 4u] = (uchar)((qh >> 16) & 0xFFu);
+    cache[bo + 5u] = (uchar)((qh >> 24) & 0xFFu);
+}
+kernel void dequant_q5_0_f16(device const uchar* cache [[buffer(0)]],
+                             device half* dst [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    uint j = i % 32u; uint bd = (i / 32u) * 22u;
+    float d = kv_rf16(cache, bd);
+    uint qh = (uint)cache[bd + 2u] | ((uint)cache[bd + 3u] << 8) | ((uint)cache[bd + 4u] << 16) | ((uint)cache[bd + 5u] << 24);
+    uint val;
+    if (j < 16u) { uint xh0 = ((qh >> j) << 4u) & 0x10u; val = (cache[bd + 6u + j] & 0xFu) | xh0; }
+    else { uint jj = j - 16u; uint xh1 = (qh >> (jj + 12u)) & 0x10u; val = (cache[bd + 6u + jj] >> 4u) | xh1; }
+    dst[i] = (half)(d * (float(val) - 16.0f));
+}
+
+// ---- q5_1 (24 B): asymmetric 5-bit — d = (max-min)/31, low nibble in qs, 5th bit in qh, min.
+kernel void writekv_q5_1(device const float* src [[buffer(0)]],
+                         device uchar* cache [[buffer(1)]],
+                         constant WriteKvParams& p [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 32u) return;
+    device const float* s = src + gid * 32u;
+    float vmin = 1e30f, vmax = -1e30f;
+    for (uint j = 0; j < 32u; j++) { vmin = min(vmin, s[j]); vmax = max(vmax, s[j]); }
+    float d = (vmax - vmin) / 31.0f;
+    float id = d != 0.0f ? 1.0f / d : 0.0f;
+    uint bo = (p.base / 32u + gid) * 24u;
+    kv_wf16(cache, bo, d);
+    kv_wf16(cache, bo + 2u, vmin);
+    uint qh = 0u;
+    for (uint j = 0; j < 16u; j++) {
+        int xi0 = int((s[j] - vmin) * id + 0.5f);
+        int xi1 = int((s[j + 16u] - vmin) * id + 0.5f);
+        cache[bo + 8u + j] = (uchar)((xi0 & 0xF) | ((xi1 & 0xF) << 4));
+        qh |= (uint(xi0 & 0x10) >> 4) << j;
+        qh |= (uint(xi1 & 0x10) >> 4) << (j + 16u);
+    }
+    cache[bo + 4u] = (uchar)(qh & 0xFFu);
+    cache[bo + 5u] = (uchar)((qh >> 8) & 0xFFu);
+    cache[bo + 6u] = (uchar)((qh >> 16) & 0xFFu);
+    cache[bo + 7u] = (uchar)((qh >> 24) & 0xFFu);
+}
+kernel void dequant_q5_1_f16(device const uchar* cache [[buffer(0)]],
+                             device half* dst [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    uint j = i % 32u; uint bd = (i / 32u) * 24u;
+    float d = kv_rf16(cache, bd); float m = kv_rf16(cache, bd + 2u);
+    uint qh = (uint)cache[bd + 4u] | ((uint)cache[bd + 5u] << 8) | ((uint)cache[bd + 6u] << 16) | ((uint)cache[bd + 7u] << 24);
+    uint val;
+    if (j < 16u) { uint xh0 = ((qh >> j) << 4u) & 0x10u; val = (cache[bd + 8u + j] & 0xFu) | xh0; }
+    else { uint jj = j - 16u; uint xh1 = (qh >> (jj + 12u)) & 0x10u; val = (cache[bd + 8u + jj] >> 4u) | xh1; }
+    dst[i] = (half)(d * float(val) + m);
+}
+
+// ---- iq4_nl (18 B): non-linear 16-entry codebook. d = max/values[0], least-squares refine
+//      d = Sum(w q x)/Sum(w q^2) (w = x^2, no imatrix -> ntry=-1 path). Indices low/high halves.
+constant int KV_IQ4NL[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+inline int kv_best_index(float x) {
+    if (x <= (float)KV_IQ4NL[0]) return 0;
+    if (x >= (float)KV_IQ4NL[15]) return 15;
+    int ml = 0, mu = 15;
+    while (mu - ml > 1) {
+        int mav = (ml + mu) / 2;
+        if (x < (float)KV_IQ4NL[mav]) mu = mav; else ml = mav;
+    }
+    return ((x - (float)KV_IQ4NL[mu - 1]) < ((float)KV_IQ4NL[mu] - x)) ? (mu - 1) : mu;
+}
+kernel void writekv_iq4_nl(device const float* src [[buffer(0)]],
+                           device uchar* cache [[buffer(1)]],
+                           constant WriteKvParams& p [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 32u) return;
+    device const float* s = src + gid * 32u;
+    float amax = 0.0f, mxv = 0.0f;
+    for (uint j = 0; j < 32u; j++) { float a = fabs(s[j]); if (a > amax) { amax = a; mxv = s[j]; } }
+    int L[32];
+    float d = 0.0f;
+    if (amax >= 1e-15f) {
+        d = mxv / (float)KV_IQ4NL[0];
+        float id = 1.0f / d;
+        float sumqx = 0.0f, sumq2 = 0.0f;
+        for (uint j = 0; j < 32u; j++) {
+            int li = kv_best_index(id * s[j]);
+            L[j] = li;
+            float q = (float)KV_IQ4NL[li];
+            float w = s[j] * s[j];
+            sumqx += w * q * s[j];
+            sumq2 += w * q * q;
+        }
+        d = sumq2 > 0.0f ? sumqx / sumq2 : 0.0f;
+    } else {
+        for (uint j = 0; j < 32u; j++) L[j] = 0;
+    }
+    uint bo = (p.base / 32u + gid) * 18u;
+    kv_wf16(cache, bo, d);
+    for (uint j = 0; j < 16u; j++) cache[bo + 2u + j] = (uchar)(L[j] | (L[j + 16u] << 4));
+}
+kernel void dequant_iq4_nl_f16(device const uchar* cache [[buffer(0)]],
+                               device half* dst [[buffer(1)]],
+                               constant uint& n [[buffer(2)]],
+                               uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    uint j = i % 32u; uint bd = (i / 32u) * 18u;
+    float d = kv_rf16(cache, bd);
+    uint nib = (j < 16u) ? (cache[bd + 2u + j] & 0xFu) : (cache[bd + 2u + j - 16u] >> 4u);
+    dst[i] = (half)(d * (float)KV_IQ4NL[nib]);
+}
+
+// ---- bf16 (2 B): top 16 bits of the f32 (round-to-nearest-even); dequant is a lossless <<16.
+kernel void writekv_bf16(device const float* src [[buffer(0)]],
+                         device uchar* cache [[buffer(1)]],
+                         constant WriteKvParams& p [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    uint b = as_type<uint>(src[gid]);
+    ushort bf = (ushort)((b + 0x7FFFu + ((b >> 16) & 1u)) >> 16);
+    uint bo = (p.base + gid) * 2u;
+    cache[bo] = (uchar)(bf & 0xFFu);
+    cache[bo + 1u] = (uchar)(bf >> 8);
+}
+kernel void dequant_bf16_f16(device const uchar* cache [[buffer(0)]],
+                             device half* dst [[buffer(1)]],
+                             constant uint& n [[buffer(2)]],
+                             uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    ushort b = (ushort)cache[i * 2u] | ((ushort)cache[i * 2u + 1u] << 8);
+    dst[i] = (half)as_type<float>((uint)b << 16);
+}
+
+// ---- TurboQuant (turbo2/3/4): WHT-rotate 128-elem block -> nearest optimal centroid -> pack;
+//      store norm = grp_norm/||recon||. Dequant unpacks centroid*norm (rotated domain) then the
+//      inverse WHT to recover the original domain. Ports crates/infr-cpu/src/turbo.rs verbatim.
+constant float KV_INV_SQRT = 0.088388350f;
+constant char KV_S1[128] = {
+    -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
+    -1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,
+    -1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,
+    -1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1};
+constant char KV_S2[128] = {
+    1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,
+    1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,
+    1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,
+    1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1};
+constant float KV_C2[4] = {-0.133462f, -0.039994f, 0.039994f, 0.133462f};
+constant float KV_M2[3] = {-0.086728f, 0.0f, 0.086728f};
+constant float KV_C3[8] = {-0.190207f, -0.118786f, -0.066822f, -0.021663f, 0.021663f, 0.066822f, 0.118786f, 0.190207f};
+constant float KV_M3[7] = {-0.154496f, -0.092804f, -0.044243f, 0.0f, 0.044243f, 0.092804f, 0.154496f};
+constant float KV_C4[16] = {-0.241529f,-0.182877f,-0.143016f,-0.111036f,-0.083292f,-0.058050f,-0.034299f,-0.011349f,0.011349f,0.034299f,0.058050f,0.083292f,0.111036f,0.143016f,0.182877f,0.241529f};
+constant float KV_M4[15] = {-0.212203f,-0.162947f,-0.127026f,-0.097164f,-0.070671f,-0.046174f,-0.022824f,0.0f,0.022824f,0.046174f,0.070671f,0.097164f,0.127026f,0.162947f,0.212203f};
+
+inline int kv_nearest(constant float* mid, int nmid, float v) {
+    for (int i = 0; i < nmid; i++) if (v < mid[i]) return i;
+    return nmid;
+}
+inline void kv_fwht(thread float* x) {
+    for (int i = 0; i < 128; i++) x[i] *= (float)KV_S1[i];
+    for (int h = 1; h < 128; h *= 2)
+        for (int i = 0; i < 128; i += h * 2)
+            for (int j = i; j < i + h; j++) { float a = x[j], b = x[j + h]; x[j] = a + b; x[j + h] = a - b; }
+    for (int i = 0; i < 128; i++) x[i] *= KV_INV_SQRT * (float)KV_S2[i];
+}
+inline void kv_fwht_inv(thread float* x) {
+    for (int i = 0; i < 128; i++) x[i] *= (float)KV_S2[i];
+    for (int h = 1; h < 128; h *= 2)
+        for (int i = 0; i < 128; i += h * 2)
+            for (int j = i; j < i + h; j++) { float a = x[j], b = x[j + h]; x[j] = a + b; x[j + h] = a - b; }
+    for (int i = 0; i < 128; i++) x[i] *= KV_INV_SQRT * (float)KV_S1[i];
+}
+
+kernel void writekv_turbo2(device const float* src [[buffer(0)]],
+                           device uchar* cache [[buffer(1)]],
+                           constant WriteKvParams& p [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 128u) return;
+    float x[128]; float nsq = 0.0f;
+    for (uint j = 0; j < 128u; j++) { x[j] = src[gid * 128u + j]; nsq += x[j] * x[j]; }
+    float gn = sqrt(nsq); float inv = gn > 1e-10f ? 1.0f / gn : 0.0f;
+    for (uint j = 0; j < 128u; j++) x[j] *= inv;
+    kv_fwht(x);
+    uint bo = (p.base / 128u + gid) * 34u;
+    for (uint b = 2u; b < 34u; b++) cache[bo + b] = 0;
+    float rsq = 0.0f;
+    for (uint j = 0; j < 128u; j++) {
+        int idx = kv_nearest(KV_M2, 3, x[j]);
+        rsq += KV_C2[idx] * KV_C2[idx];
+        cache[bo + 2u + j / 4u] |= (uchar)(idx << ((j % 4u) * 2u));
+    }
+    float rn = sqrt(rsq); float corr = rn > 1e-10f ? gn / rn : gn;
+    kv_wf16(cache, bo, corr);
+}
+kernel void dequant_turbo2_f16(device const uchar* cache [[buffer(0)]],
+                               device half* dst [[buffer(1)]],
+                               constant uint& n [[buffer(2)]],
+                               uint blk [[thread_position_in_grid]]) {
+    if (blk * 128u >= n) return;
+    uint bo = blk * 34u;
+    float norm = kv_rf16(cache, bo);
+    float v[128];
+    for (uint j = 0; j < 128u; j++) {
+        int idx = (cache[bo + 2u + j / 4u] >> ((j % 4u) * 2u)) & 0x3;
+        v[j] = KV_C2[idx] * norm;
+    }
+    kv_fwht_inv(v);
+    for (uint j = 0; j < 128u; j++) dst[blk * 128u + j] = (half)v[j];
+}
+
+kernel void writekv_turbo3(device const float* src [[buffer(0)]],
+                           device uchar* cache [[buffer(1)]],
+                           constant WriteKvParams& p [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 128u) return;
+    float x[128]; float nsq = 0.0f;
+    for (uint j = 0; j < 128u; j++) { x[j] = src[gid * 128u + j]; nsq += x[j] * x[j]; }
+    float gn = sqrt(nsq); float inv = gn > 1e-10f ? 1.0f / gn : 0.0f;
+    for (uint j = 0; j < 128u; j++) x[j] *= inv;
+    kv_fwht(x);
+    uint bo = (p.base / 128u + gid) * 50u;
+    for (uint b = 2u; b < 50u; b++) cache[bo + b] = 0;
+    float rsq = 0.0f;
+    for (uint j = 0; j < 128u; j++) {
+        int idx = kv_nearest(KV_M3, 7, x[j]);
+        rsq += KV_C3[idx] * KV_C3[idx];
+        cache[bo + 2u + j / 4u] |= (uchar)((idx & 0x3) << ((j % 4u) * 2u));
+        if ((idx & 0x4) != 0) cache[bo + 34u + j / 8u] |= (uchar)(1u << (j % 8u));
+    }
+    float rn = sqrt(rsq); float corr = rn > 1e-10f ? gn / rn : gn;
+    kv_wf16(cache, bo, corr);
+}
+kernel void dequant_turbo3_f16(device const uchar* cache [[buffer(0)]],
+                               device half* dst [[buffer(1)]],
+                               constant uint& n [[buffer(2)]],
+                               uint blk [[thread_position_in_grid]]) {
+    if (blk * 128u >= n) return;
+    uint bo = blk * 50u;
+    float norm = kv_rf16(cache, bo);
+    float v[128];
+    for (uint j = 0; j < 128u; j++) {
+        uint low2 = (cache[bo + 2u + j / 4u] >> ((j % 4u) * 2u)) & 0x3u;
+        uint hi1 = (cache[bo + 34u + j / 8u] >> (j % 8u)) & 0x1u;
+        int idx = int(low2 | (hi1 << 2));
+        v[j] = KV_C3[idx] * norm;
+    }
+    kv_fwht_inv(v);
+    for (uint j = 0; j < 128u; j++) dst[blk * 128u + j] = (half)v[j];
+}
+
+kernel void writekv_turbo4(device const float* src [[buffer(0)]],
+                           device uchar* cache [[buffer(1)]],
+                           constant WriteKvParams& p [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n / 128u) return;
+    float x[128]; float nsq = 0.0f;
+    for (uint j = 0; j < 128u; j++) { x[j] = src[gid * 128u + j]; nsq += x[j] * x[j]; }
+    float gn = sqrt(nsq); float inv = gn > 1e-10f ? 1.0f / gn : 0.0f;
+    for (uint j = 0; j < 128u; j++) x[j] *= inv;
+    kv_fwht(x);
+    uint bo = (p.base / 128u + gid) * 66u;
+    for (uint b = 2u; b < 66u; b++) cache[bo + b] = 0;
+    float rsq = 0.0f;
+    for (uint j = 0; j < 128u; j++) {
+        int idx = kv_nearest(KV_M4, 15, x[j]);
+        rsq += KV_C4[idx] * KV_C4[idx];
+        cache[bo + 2u + j / 2u] |= (uchar)(idx << ((j % 2u) * 4u));
+    }
+    float rn = sqrt(rsq); float corr = rn > 1e-10f ? gn / rn : gn;
+    kv_wf16(cache, bo, corr);
+}
+kernel void dequant_turbo4_f16(device const uchar* cache [[buffer(0)]],
+                               device half* dst [[buffer(1)]],
+                               constant uint& n [[buffer(2)]],
+                               uint blk [[thread_position_in_grid]]) {
+    if (blk * 128u >= n) return;
+    uint bo = blk * 66u;
+    float norm = kv_rf16(cache, bo);
+    float v[128];
+    for (uint j = 0; j < 128u; j++) {
+        int idx = (cache[bo + 2u + j / 2u] >> ((j % 2u) * 4u)) & 0xF;
+        v[j] = KV_C4[idx] * norm;
+    }
+    kv_fwht_inv(v);
+    for (uint j = 0; j < 128u; j++) dst[blk * 128u + j] = (half)v[j];
+}
 "#;

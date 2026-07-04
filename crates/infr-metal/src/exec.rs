@@ -298,6 +298,36 @@ impl MetalBackend {
         out
     }
 
+    /// Expand a quantized / dense-alt KV prefix (`ne` elements) into an f16 scratch buffer `out`,
+    /// so the standard f16 attention kernels can read it (the Vulkan dequant->f16 prepass, ported
+    /// to Metal). One dispatch; the kernel is a bit-for-bit port of the CPU dequant so the scratch
+    /// matches the CPU oracle. Block quants + bf16 run one thread per element; turbo one per
+    /// 128-block (the inverse WHT couples all 128).
+    fn dequant_kv_f16(
+        &self,
+        r: &mut Resident,
+        dt: DType,
+        cache: &MtlBuffer,
+        out: &MtlBuffer,
+        ne: usize,
+    ) -> Result<()> {
+        let (kern, threads) = match dt {
+            DType::Q4_0 => ("dequant_q4_0_f16", ne),
+            DType::Q4_1 => ("dequant_q4_1_f16", ne),
+            DType::Q5_0 => ("dequant_q5_0_f16", ne),
+            DType::Q5_1 => ("dequant_q5_1_f16", ne),
+            DType::Iq4Nl => ("dequant_iq4_nl_f16", ne),
+            DType::Bf16 => ("dequant_bf16_f16", ne),
+            DType::Turbo2 => ("dequant_turbo2_f16", ne / 128),
+            DType::Turbo3 => ("dequant_turbo3_f16", ne / 128),
+            DType::Turbo4 => ("dequant_turbo4_f16", ne / 128),
+            _ => unreachable!("dequant_kv_f16 for non-prepass dtype {dt:?}"),
+        };
+        let pso = self.pipelines.get(kern)?;
+        self.encode(r, &pso, &[cache, out], &(ne as u32).to_ne_bytes(), threads);
+        Ok(())
+    }
+
     /// Encode one kernel dispatch and block until it completes (correctness-first: every op is its
     /// own command buffer, so ops run strictly in graph order with no manual barriers). `data_bufs`
     /// bind to buffer indices `0..k`; `params` (packed scalars) binds at index `k`.
@@ -1391,15 +1421,39 @@ impl MetalBackend {
                     let threads = if q8 { n / 32 } else { n };
                     self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw, &posbuf], &p, threads);
                 } else {
-                    let kern = match g.desc(cache).dtype {
+                    // Static per-token write. The decoupled quant formats (block quants, bf16,
+                    // turbo) force static decode (the replay gate rejects them), so their WriteKv
+                    // only ever lands here — one thread per block (32-elem blocks, 128 for turbo)
+                    // or per element (dense). `base` is in elements; each quantize kernel converts
+                    // to its block byte offset internally.
+                    let dt = g.desc(cache).dtype;
+                    let kern = match dt {
                         DType::Q8_0 => "writekv_q8",
                         DType::F16 => "writekv_f16",
+                        DType::Q4_0 => "writekv_q4_0",
+                        DType::Q4_1 => "writekv_q4_1",
+                        DType::Q5_0 => "writekv_q5_0",
+                        DType::Q5_1 => "writekv_q5_1",
+                        DType::Iq4Nl => "writekv_iq4_nl",
+                        DType::Bf16 => "writekv_bf16",
+                        DType::Turbo2 => "writekv_turbo2",
+                        DType::Turbo3 => "writekv_turbo3",
+                        DType::Turbo4 => "writekv_turbo4",
                         _ => "writekv_f32",
                     };
                     let pso = self.pipelines.get(kern)?;
                     let mut p = (n as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(base as u32).to_ne_bytes());
-                    let threads = if q8 { n / 32 } else { n };
+                    let threads = match dt {
+                        DType::Q8_0
+                        | DType::Q4_0
+                        | DType::Q4_1
+                        | DType::Q5_0
+                        | DType::Q5_1
+                        | DType::Iq4Nl => n / 32,
+                        DType::Turbo2 | DType::Turbo3 | DType::Turbo4 => n / 128,
+                        _ => n,
+                    };
                     self.encode(r, &pso, &[bsrc.as_ref(), &cbuf.raw], &p, threads);
                 }
             }
@@ -1482,6 +1536,62 @@ impl MetalBackend {
                     r.loc[dst.0 as usize] = Loc::Device;
                     return Ok(());
                 }
+                // Decoupled quant KV (block quants q4_0/…/iq4_nl, dense bf16, turbo2/3/4): expand
+                // each quantized side into a transient f16 scratch, then fall through to the
+                // standard f16 attention over the scratch (the Vulkan dequant->f16 prepass, ported).
+                // A side already f16 keeps its native cache buffer (the high-precision-K +
+                // quantized-V shape); q8 and f32 keep their own native-read paths below. These
+                // formats force static decode, so no replay tape reaches here. The scratch is laid
+                // out [kv_len, n_kv, head_dim] — identical stride to an f16 cache prefix, so the
+                // f16 kernels index it unchanged.
+                let prep = |dt| {
+                    matches!(
+                        dt,
+                        DType::Q4_0
+                            | DType::Q4_1
+                            | DType::Q5_0
+                            | DType::Q5_1
+                            | DType::Iq4Nl
+                            | DType::Bf16
+                            | DType::Turbo2
+                            | DType::Turbo3
+                            | DType::Turbo4
+                    )
+                };
+                let kdt = g.desc(k_cache).dtype;
+                let vdt = g.desc(v_cache).dtype;
+                let ne = kv_len * nkv * hd;
+                let ks: Option<Arc<MtlBuffer>> = if prep(kdt) {
+                    let s = Arc::new(self.device.new_buffer(
+                        (ne * 2).max(4) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    ));
+                    self.dequant_kv_f16(r, kdt, &kbuf.raw, &s, ne)?;
+                    Some(s)
+                } else {
+                    None
+                };
+                let vs: Option<Arc<MtlBuffer>> = if prep(vdt) {
+                    let s = Arc::new(self.device.new_buffer(
+                        (ne * 2).max(4) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    ));
+                    self.dequant_kv_f16(r, vdt, &vbuf.raw, &s, ne)?;
+                    Some(s)
+                } else {
+                    None
+                };
+                let prep_active = ks.is_some() || vs.is_some();
+                // Effective K/V buffers the attention reads: the f16 scratch where prepassed, else
+                // the native cache. (q8/f32 native paths below ignore these and read kbuf/vbuf.)
+                let k_raw: &MtlBuffer = match &ks {
+                    Some(s) => s,
+                    None => &kbuf.raw,
+                };
+                let v_raw: &MtlBuffer = match &vs {
+                    Some(s) => s,
+                    None => &vbuf.raw,
+                };
                 // Q8_0 cache: rows==1 decode takes the q8 vector kernel (hd 64/128); every
                 // other shape the scalar dequant-on-read fallback (prefill lives here until a
                 // q8 flash port). Both dequantize exactly — reassociation-only vs the f16 math.
@@ -1587,7 +1697,8 @@ impl MetalBackend {
                 // simdgroup_matrix flash-attention kernel was built and benched here; it never
                 // beat the 32-way split on prefill — occupancy-starved by its threadgroup tiles —
                 // so it was dropped.)
-                let f16 = g.desc(k_cache).dtype == DType::F16;
+                // Prepassed quant KV reads an f16 scratch, so it takes the f16 attention path too.
+                let f16 = g.desc(k_cache).dtype == DType::F16 || prep_active;
                 // Wide launches on an f16 cache take the half-fragment flash kernel: K^T/V
                 // fragments load straight from the cache, Q is cast once to f16 below. Small
                 // kv_len stays scalar (also keeps the short-kv wide parity test on the exact
@@ -1711,7 +1822,7 @@ impl MetalBackend {
                     self.encode_tg(
                         r,
                         &pso,
-                        &[qh.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                        &[qh.as_ref(), k_raw, v_raw, bd.as_ref()],
                         &p,
                         rows.div_ceil(8) * nh * tgw,
                         tgw,
@@ -1731,7 +1842,7 @@ impl MetalBackend {
                     self.encode_tg(
                         r,
                         &pso,
-                        &[bq.as_ref(), &kbuf.raw, &vbuf.raw, bd.as_ref()],
+                        &[bq.as_ref(), k_raw, v_raw, bd.as_ref()],
                         &p,
                         rows * nh * nsg * 32,
                         nsg * 32,

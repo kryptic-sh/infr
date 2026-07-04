@@ -1056,6 +1056,167 @@ fn attention_q8_vec_hd256_parity() {
     q8_attention_test(1, 200, 256, 199, 1e-4, 270);
 }
 
+// ── Decoupled quant KV (mainline block quants q4_0/q4_1/q5_0/q5_1/iq4_nl, dense bf16, TurboQuant
+// turbo2/3/4, dense f32). WriteKv quantizes into the compact cache; Attention expands each
+// quantized/bf16 side into a transient f16 scratch (f32 reads natively via attention_f32) and runs
+// the standard f16 attention over it — the ported Vulkan dequant→f16 prepass. Parity is against the
+// CPU oracle, which dequants to f32 and runs f32 SDPA; the tolerances cover the extra f16-scratch
+// attention rounding (looser than the q8 native-read path, which accumulates in float). Each
+// quantize/dequant kernel is a bit-for-bit port of the CPU reference so only the attention precision
+// differs, not the stored quant values. K stays f16 in the common decoupled shape (high-precision K,
+// quantized V — llama's guidance); coupled quant/quant is also covered.
+
+fn kv_bytes(dt: DType, elems: usize) -> usize {
+    match dt {
+        DType::Q4_0 | DType::Iq4Nl => elems / 32 * 18,
+        DType::Q4_1 => elems / 32 * 20,
+        DType::Q5_0 => elems / 32 * 22,
+        DType::Q5_1 => elems / 32 * 24,
+        DType::Turbo2 => elems / 128 * 34,
+        DType::Turbo3 => elems / 128 * 50,
+        DType::Turbo4 => elems / 128 * 66,
+        DType::F16 | DType::Bf16 => elems * 2,
+        _ => elems * 4, // F32
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kvquant_attention_test(
+    kdt: DType,
+    vdt: DType,
+    rows: usize,
+    kv_len: usize,
+    hd: usize,
+    pos: usize,
+    tol: f32,
+    seed: u64,
+) {
+    let (nh, nkv) = (8usize, 2usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], kdt));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], vdt));
+    let ksrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+    let vsrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let row = (nkv * hd) as u32;
+    g.push(Op::WriteKv {
+        src: ksrc,
+        cache: kc,
+        rows: kv_len as u32,
+        row_stride: row,
+        pos: 0,
+    });
+    g.push(Op::WriteKv {
+        src: vsrc,
+        cache: vc,
+        rows: kv_len as u32,
+        row_stride: row,
+        pos: 0,
+    });
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let nkv_elems = kv_len * nkv * hd;
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
+        (kc, vec![0u8; kv_bytes(kdt, nkv_elems)]),
+        (vc, vec![0u8; kv_bytes(vdt, nkv_elems)]),
+        (ksrc, f32_bytes(&rand_f32(nkv_elems, seed + 1))),
+        (vsrc, f32_bytes(&rand_f32(nkv_elems, seed + 2))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, tol);
+}
+
+// Block quants, decoupled (K=f16 native, V=quant prepassed) at the rows==1 vector-flash decode
+// shape, and coupled (quant/quant) at the scalar prefill shape. Both routes read the f16 scratch.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_q4_0_parity() {
+    kvquant_attention_test(DType::F16, DType::Q4_0, 1, 200, 128, 199, 6e-3, 300);
+    kvquant_attention_test(DType::Q4_0, DType::Q4_0, 3, 6, 64, 3, 6e-3, 305);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_q4_1_parity() {
+    kvquant_attention_test(DType::F16, DType::Q4_1, 1, 200, 128, 199, 6e-3, 310);
+    kvquant_attention_test(DType::Q4_1, DType::Q4_1, 3, 6, 64, 3, 6e-3, 315);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_q5_0_parity() {
+    kvquant_attention_test(DType::F16, DType::Q5_0, 1, 200, 128, 199, 6e-3, 320);
+    kvquant_attention_test(DType::Q5_0, DType::Q5_0, 3, 6, 64, 3, 6e-3, 325);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_q5_1_parity() {
+    kvquant_attention_test(DType::F16, DType::Q5_1, 1, 200, 128, 199, 6e-3, 330);
+    kvquant_attention_test(DType::Q5_1, DType::Q5_1, 3, 6, 64, 3, 6e-3, 335);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_iq4_nl_parity() {
+    kvquant_attention_test(DType::F16, DType::Iq4Nl, 1, 200, 128, 199, 6e-3, 340);
+    kvquant_attention_test(DType::Iq4Nl, DType::Iq4Nl, 3, 6, 64, 3, 6e-3, 345);
+}
+
+// Dense bf16 (near-lossless top-16-bits store, dequant <<16 → f16). Decoupled + coupled.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_bf16_parity() {
+    kvquant_attention_test(DType::F16, DType::Bf16, 1, 200, 128, 199, 5e-3, 350);
+    kvquant_attention_test(DType::Bf16, DType::Bf16, 3, 6, 64, 3, 5e-3, 355);
+}
+
+// Dense f32: the native f32 attention path (no prepass) — coupled f32/f32 (the Metal clamp forbids
+// a mixed f32/other request). Both backends run f32 SDPA, so a tight tolerance.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_f32_parity() {
+    kvquant_attention_test(DType::F32, DType::F32, 1, 200, 128, 199, 1e-3, 360);
+    kvquant_attention_test(DType::F32, DType::F32, 3, 6, 64, 3, 1e-3, 365);
+}
+
+// TurboQuant (WHT-rotated, 128-elem blocks = head_dim slices, so hd must be a multiple of 128).
+// Coupled turbo/turbo at the vector shape + K=f16/V=turbo at the scalar shape. The inverse-WHT
+// dequant plus f16-scratch storage widen the tolerance vs the block quants.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_turbo2_parity() {
+    kvquant_attention_test(DType::Turbo2, DType::Turbo2, 1, 200, 128, 199, 1.2e-2, 370);
+    kvquant_attention_test(DType::F16, DType::Turbo2, 3, 6, 128, 3, 1.2e-2, 375);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_turbo3_parity() {
+    kvquant_attention_test(DType::Turbo3, DType::Turbo3, 1, 200, 128, 199, 1.2e-2, 380);
+    kvquant_attention_test(DType::F16, DType::Turbo3, 3, 6, 128, 3, 1.2e-2, 385);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_kv_turbo4_parity() {
+    kvquant_attention_test(DType::Turbo4, DType::Turbo4, 1, 200, 128, 199, 1.2e-2, 390);
+    kvquant_attention_test(DType::F16, DType::Turbo4, 3, 6, 128, 3, 1.2e-2, 395);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_gqa_causal_parity() {

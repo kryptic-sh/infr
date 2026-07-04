@@ -1118,14 +1118,26 @@ fn lower_op(
                 // A dequanted side reads the f16 scratch; native Q8 read only when not dequanted.
                 let k_q8_eff = k_q8 && !deq_k;
                 let v_q8_eff = v_q8 && !deq_v;
-                // Prefill (rows≥64), causal, hd==128, standard 1/√hd scale: FlashAttention-2 (split-K
-                // online softmax, no materialized [m,kv] scores). The flash kernel hardcodes 1/√hd and
-                // writes ceil(rows/64)*64 output rows, so guard the scale and copy the real rows.
-                let flash_ok = rows >= 64
+                // Prefill, causal, hd==128, standard 1/√hd scale: FlashAttention-2 (split-K
+                // online softmax, no materialized [m,kv] scores). The flash kernel hardcodes
+                // 1/√hd and reads/writes ceil(rows/64)*64 q/dst rows, so guard the scale and
+                // require 64-row-padded buffers (Internal). Flash IS the K-tile shape — K/V
+                // streamed once per row-tile, padded rows only waste ALU — so at depth it beats
+                // the per-row split kernel well below a full 64-row tile. Measured crossover
+                // (0.6B, 7900 XTX): flash wins from rows>=24 at kv>=8192 (pp24@8k +13%,
+                // pp32@16k +55%) but LOSES to split at kv=4096 up through rows=32 — hence the
+                // two-tier floor. INFR_FLASH_MIN_ROWS overrides the deep-kv tier (A/B).
+                let flash_min_rows: usize = std::env::var("INFR_FLASH_MIN_ROWS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(24);
+                let flash_ok = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && hd == 128
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
-                    && !(k_q8_eff || v_q8_eff);
+                    && !(k_q8_eff || v_q8_eff)
+                    && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
+                    && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
                 // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
@@ -1146,17 +1158,25 @@ fn lower_op(
                 // gemma4 uses 1.0), SWA windows, and per-row causal ends (row r attends
                 // ≤ pos + r). Native Q8 reads are decode-only (rows>1 already dequanted to the
                 // f16 scratch above, so k/v_q8_eff are false there by construction).
-                let chunk = (kv_len / 32).clamp(64, 512);
-                // INFR_MROWS_CHUNK: small-m chunk-size probe (pairs with INFR_MROWS_ATTN) —
-                // smaller chunks trade per-chunk overhead for more workgroups + less LDS use.
-                let chunk = if rows >= 2 {
-                    std::env::var("INFR_MROWS_CHUNK")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .map(|c| c.clamp(64, 512))
-                        .unwrap_or(chunk)
+                // Rows-BATCHED split tier (rows 12..flash-floor at deep kv): one workgroup per
+                // (head, chunk) streams K/V once per 4-row group through attn_partial_mrows_c256
+                // (7KB LDS). Measured wins over the per-row grid: pp12/16/20@d16384
+                // 741->799/822->924/882->1012 t/s, pp16@8k a wash — below rows=12 or kv=8192
+                // the per-row grid's extra workgroups fill the DRAM queue better than the
+                // bandwidth saving pays. hd<=128 (one q vec4 per lane per row); q8 never reaches
+                // rows>1 (dequanted above). INFR_MROWS_ATTN=1 forces the batched tier on (tests /
+                // A/B), INFR_NO_MROWS_ATTN forces it off.
+                let batched_attn = rows >= 2
+                    && hd <= 128
+                    && !(k_q8_eff || v_q8_eff)
+                    && std::env::var("INFR_NO_MROWS_ATTN").is_err()
+                    && ((rows >= 12 && kv_len >= 8192) || std::env::var("INFR_MROWS_ATTN").is_ok());
+                // The batched kernel stages chunk scores in 4KB of LDS → chunk 256; the per-row
+                // grid keeps the adaptive ~32-chunks policy.
+                let chunk = if batched_attn {
+                    256
                 } else {
-                    chunk
+                    (kv_len / 32).clamp(64, 512)
                 };
                 let split_ok = rows < 64
                     && kv_len > chunk
@@ -1270,6 +1290,7 @@ fn lower_op(
                         k_q8_eff,
                         v_q8_eff,
                         cap,
+                        batched_attn,
                     );
                 } else {
                     let window = match mask {
@@ -2319,8 +2340,20 @@ mod tests {
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()
         };
-        for (rows, window) in [(2usize, 0usize), (5, 0), (8, 0), (17, 0), (4, 128)] {
-            let kv_len = 300usize;
+        // kv=300 exercises the per-row split grid; kv=8300 with rows >= 12 exercises the
+        // rows-BATCHED tier (attn_partial_mrows_c256) — including a short last row-group (17 =
+        // 4+4+4+4+1) and a windowed case. (Flash needs Internal q/dst, so raw-input graphs like
+        // these always take the split family.)
+        for (rows, window, kv_len) in [
+            (2usize, 0usize, 300usize),
+            (5, 0, 300),
+            (8, 0, 300),
+            (17, 0, 300),
+            (4, 128, 300),
+            (17, 0, 8300),
+            (40, 0, 8300),
+            (13, 256, 8300),
+        ] {
             let pos = kv_len - rows; // the suffix occupies the last `rows` positions
             let q: Vec<f32> = (0..rows * nh * hd)
                 .map(|i| (i as f32 * 0.03).sin())

@@ -1585,7 +1585,11 @@ impl<'a> Recorder<'a> {
                                                             // INFR_FLASH_BM=32 forces the small (29056 B) tile even on a 64 KB device, so the bm=32
                                                             // shaders get numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
         let force_bm32 = std::env::var("INFR_FLASH_BM").ok().as_deref() == Some("32");
-        let bm: u32 = if !force_bm32 && shared_limit >= bm64_shared {
+        // Partial tiles (rows < 64, the small-m deep-kv tier) take BM=32: half the padded-row
+        // waste and half the shared scratch (2x resident workgroups). Measured @d16384 on a
+        // 7900 XTX: pp24 1122 -> 1312 t/s, pp32 1510 -> 1734 (llama.cpp: 1313/1933). Full
+        // tiles (rows >= 64) keep the device-based pick — BM=64 wins there when shared fits.
+        let bm: u32 = if !force_bm32 && shared_limit >= bm64_shared && n >= 64 {
             64
         } else {
             32
@@ -2108,6 +2112,9 @@ impl<'a> Recorder<'a> {
         k_q8: bool,
         v_q8: bool,
         cap: usize,
+        // Rows-batched pass 1 (attn_partial_mrows_c256, K/V once per 4-row group): the caller
+        // gates on rows/kv_len/hd (see the adapter's `batched_attn`) and MUST pass chunk <= 256.
+        batched: bool,
     ) {
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
         self.stamp("attn_partial");
@@ -2128,16 +2135,12 @@ impl<'a> Recorder<'a> {
         // (m <= 8) keeps per-row. If the m >= 12-at-depth band ever matters, route here on
         // (rows, kv_len) — or better, build the LDS-staged K-TILE kernel (per-thread full dots,
         // no cross-lane reductions), which is how llama.cpp wins that cell (1056 t/s).
-        let batched =
-            rows >= 2 && hd <= 128 && !k_q8 && !v_q8 && std::env::var("INFR_MROWS_ATTN").is_ok();
-        let (p1name, p1spv) = if batched && chunk <= 256 {
-            // Half-LDS variant (4KB scores): the residency probe pairs it with INFR_MROWS_CHUNK=256.
+        debug_assert!(!batched || (chunk <= 256 && hd <= 128 && !k_q8 && !v_q8 && rows >= 2));
+        let (p1name, p1spv) = if batched {
             (
                 "attn_partial_mrows_c256",
                 crate::gemm::attn_partial_mrows_c256_spv(),
             )
-        } else if batched {
-            ("attn_partial_mrows", crate::gemm::attn_partial_mrows_spv())
         } else {
             (p1name, p1spv)
         };
@@ -2154,7 +2157,7 @@ impl<'a> Recorder<'a> {
         p1[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
         p1[36..40].copy_from_slice(&(pos as u32).to_ne_bytes());
         p1[40..44].copy_from_slice(&(rows as u32).to_ne_bytes());
-        // Batched probe: workgroup y = 4-row group; per-row default: y = row.
+        // Batched: workgroup y = 4-row group; per-row: y = row.
         let gy = if batched { rows.div_ceil(4) } else { rows };
         self.dispatch3(
             k1,
@@ -4042,6 +4045,7 @@ mod tests {
             false, // k f16
             false, // v f16
             0,     // cap (unused for f16)
+            false, // batched: decode shape stays on the per-row grid
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; nh * hd * 4];

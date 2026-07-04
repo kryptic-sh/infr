@@ -573,6 +573,7 @@ fn decode_attn_variants_bench() {
             false, // k f16
             false, // v f16
             0,     // cap (unused for f16)
+            false, // batched: decode shape stays on the per-row grid
         );
     });
     // dyn split, same chunks

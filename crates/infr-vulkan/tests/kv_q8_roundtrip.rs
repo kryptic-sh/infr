@@ -175,6 +175,7 @@ fn planar_q8_attn_partial_matches_f16() {
         false,
         false,
         0,
+        false, // batched: decode shape stays on the per-row grid
     );
     rec.finish().unwrap();
     let mut ofb = vec![0u8; nh * hd * 4];
@@ -214,6 +215,7 @@ fn planar_q8_attn_partial_matches_f16() {
         true,
         true,
         cap,
+        false, // batched: decode shape stays on the per-row grid
     );
     rec.finish().unwrap();
     let mut oqb = vec![0u8; nh * hd * 4];
@@ -302,6 +304,7 @@ fn planar_q8_attn_partial_mixed_kv() {
             k_q8,
             v_q8,
             c,
+            false, // batched: decode shape stays on the per-row grid
         );
         rec.finish().unwrap();
         let mut ob = vec![0u8; nh * hd * 4];

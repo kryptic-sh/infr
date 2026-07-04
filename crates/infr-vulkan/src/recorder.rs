@@ -2675,7 +2675,7 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Gated-DeltaNet recurrence, one token (Qwen3-Next SSM). The persistent `state` buffer
+    /// Gated-DeltaNet recurrence, one token (qwen35 SSM). The persistent `state` buffer
     /// `[nv*kd*vd]` is updated in place; `out` is `[nv*vd]`. One workgroup per value head; the
     /// `nk` q/k heads are tiled up to `nv`. See shaders/deltanet.comp.
     #[allow(clippy::too_many_arguments)]
@@ -2699,7 +2699,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.stamp("deltanet");
         // The shader caches each column block's state [kd, 32] in shared memory (`ss[128*32]`), so kd
-        // must be ≤ 128. Qwen3-Next uses kd=128; assert so a larger head_k_dim fails loudly instead of
+        // must be ≤ 128. qwen35 uses kd=128; assert so a larger head_k_dim fails loudly instead of
         // corrupting LDS.
         debug_assert!(
             kd <= 128,
@@ -2915,7 +2915,7 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Causal depthwise conv1d + SiLU, one token (Qwen3-Next SSM input conv). The per-channel history
+    /// Causal depthwise conv1d + SiLU, one token (qwen35 SSM input conv). The per-channel history
     /// `state` `[(kconv-1)*cc]` is updated in place; `out` is `[cc]`. See shaders/conv1d_silu.comp.
     pub fn conv1d_silu(
         &self,

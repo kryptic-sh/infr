@@ -233,25 +233,27 @@ fn cpu_kv_q8_coherent() {
     std::env::remove_var("INFR_KV_TYPE_V");
 }
 
-/// TurboQuant turbo3 KV cache (CPU reference): WHT-rotated 3-bit PolarQuant, 128-elem blocks. The
-/// per-vector 3-bit error is ~20%, which V tolerates but K does not (llama.cpp: "keep K at higher
-/// precision than V"), so the coherent config is K=f16, V=turbo3. This exercises the full turbo3
-/// quantize (WriteKv) + dequant-with-inverse-WHT (Attention) path end to end; a broken WHT / centroid
-/// / norm-correction would garble even the V-only cache.
+/// TurboQuant KV cache (CPU reference): WHT-rotated 2/3/4-bit PolarQuant, 128-elem blocks. The
+/// per-vector error (turbo2 ~30%, turbo3 ~20%, turbo4 ~12%) is what V tolerates but K does not
+/// (llama.cpp: "keep K at higher precision than V"), so the coherent config is K=f16 with V=turbo*.
+/// Exercises the full quantize (WriteKv) + dequant-with-inverse-WHT (Attention) path for every width;
+/// a broken WHT / centroid table / packing / norm-correction would garble even the V-only cache.
 #[test]
-fn cpu_kv_turbo3_coherent() {
+fn cpu_kv_turbo_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     std::env::set_var("INFR_KV_TYPE_K", "f16");
-    std::env::set_var("INFR_KV_TYPE_V", "turbo3");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
-    let out = cpu_gen(&model, &repeat_prompt(), 24);
-    assert!(
-        !is_degenerate(&out),
-        "K=f16 V=turbo3 degenerate: {:?}",
-        out.chars().take(48).collect::<String>()
-    );
+    for v in ["turbo2", "turbo3", "turbo4"] {
+        std::env::set_var("INFR_KV_TYPE_V", v);
+        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let out = cpu_gen(&model, &repeat_prompt(), 24);
+        assert!(
+            !is_degenerate(&out),
+            "K=f16 V={v} degenerate: {:?}",
+            out.chars().take(48).collect::<String>()
+        );
+    }
     std::env::remove_var("INFR_KV_TYPE_K");
     std::env::remove_var("INFR_KV_TYPE_V");
 }

@@ -39,8 +39,11 @@ pub enum DType {
     Mxfp4,
     Nvfp4,
     // TurboQuant KV-cache-only formats (WHT rotation + PolarQuant centroids). NOT weight dtypes —
-    // only used for the KV cache (like Q8_0-for-KV). turbo3 = 128-elem block, 50 bytes (3.125 bpw).
+    // only used for the KV cache (like Q8_0-for-KV). 128-elem blocks: turbo2 = 34 B (2.125 bpw),
+    // turbo3 = 50 B (3.125), turbo4 = 66 B (4.125).
+    Turbo2,
     Turbo3,
+    Turbo4,
 }
 
 impl DType {

@@ -9,7 +9,7 @@
 //! the GPU backends are validated against.
 #![allow(clippy::needless_range_loop)]
 
-pub mod turbo3;
+pub mod turbo;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
 use infr_core::error::Result;
@@ -2753,17 +2753,19 @@ impl Backend for CpuBackend {
                                 }
                             }
                         }
-                        DType::Turbo3 => {
-                            // TurboQuant turbo3: each 128-elem group (a head_dim slice) → a 50-byte
-                            // block (L2-norm + WHT + 3-bit PolarQuant). base/n are 128-aligned (the
+                        dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
+                            // TurboQuant: each 128-elem group (a head_dim slice) → one block
+                            // (L2-norm + WHT + 2/3/4-bit PolarQuant). base/n are 128-aligned (the
                             // runner gates head_dim%128), so blocks never straddle a write.
                             debug_assert!(base % 128 == 0 && n % 128 == 0);
+                            let bb = crate::turbo::block_bytes(dt);
                             let blk0 = base / 128;
                             for b in 0..n / 128 {
-                                let off = (blk0 + b) * crate::turbo3::BLOCK_BYTES;
-                                crate::turbo3::quantize_block(
+                                let off = (blk0 + b) * bb;
+                                crate::turbo::quantize_block(
+                                    dt,
                                     &s[b * 128..b * 128 + 128],
-                                    &mut d[off..off + crate::turbo3::BLOCK_BYTES],
+                                    &mut d[off..off + bb],
                                 );
                             }
                         }
@@ -2812,9 +2814,11 @@ impl Backend for CpuBackend {
                                 .map(|&x| half::f16::from_bits(x).to_f32())
                                 .collect(),
                             DType::Q8_0 => crate::dequant_prefix_q8_0(b, need),
-                            // turbo3 blocks store the WHT-rotated values; dequant + inverse WHT
+                            // TurboQuant blocks store the WHT-rotated values; dequant + inverse WHT
                             // recovers the original domain so the f32 SDPA below runs unchanged.
-                            DType::Turbo3 => crate::turbo3::dequant_prefix_orig(b, need),
+                            dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
+                                crate::turbo::dequant_prefix_orig(dt, b, need)
+                            }
                             _ => bytemuck::cast_slice::<u8, f32>(b)[..need].to_vec(),
                         }
                     };

@@ -367,8 +367,10 @@ type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buf
 pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
     match dt {
         DType::Q8_0 => (elems / 32 * 34).next_multiple_of(4),
-        // TurboQuant turbo3: 128-elem block → 50 bytes (fp16 norm + qs[32] + signs[16]).
+        // TurboQuant 128-elem blocks: turbo2 = 34 B, turbo3 = 50 B, turbo4 = 66 B.
+        DType::Turbo2 => elems / 128 * 34,
         DType::Turbo3 => elems / 128 * 50,
+        DType::Turbo4 => elems / 128 * 66,
         DType::F16 => elems * 2,
         _ => elems * 4,
     }
@@ -671,7 +673,9 @@ pub(crate) fn generate_dense_backend(
     let parse_kv_fmt = |var: &str| -> DType {
         let side = std::env::var(var).ok();
         match side.as_deref() {
+            Some("turbo2") if kv_turbo_ok => DType::Turbo2,
             Some("turbo3") if kv_turbo_ok => DType::Turbo3,
+            Some("turbo4") if kv_turbo_ok => DType::Turbo4,
             Some("q8_0") | Some("q8") | Some("Q8_0") if kv_align_ok && kv_q8_backend => DType::Q8_0,
             Some("f16") | Some("F16") => DType::F16,
             // unset/unknown → legacy INFR_KV_Q8 alias (both sides q8) or f16.

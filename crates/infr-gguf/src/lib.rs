@@ -289,9 +289,11 @@ fn block_layout(dtype: DType) -> (usize, usize) {
         DType::Mxfp4 => (32, 17),
         // block_nvfp4: uint8[QK_NVFP4/QK_NVFP4_SUB] + QK_NVFP4/2 = 4+32 = 36 bytes; QK_NVFP4=64
         DType::Nvfp4 => (64, 36),
-        // TurboQuant KV-cache format (never a GGUF weight): block_turbo3_0 = fp16 norm + qs[128/4]
-        // + signs[128/8] = 2+32+16 = 50 bytes over 128 elements.
+        // TurboQuant KV-cache formats (never GGUF weights), 128-elem blocks: turbo2 = norm+qs[32] =
+        // 34 B, turbo3 = norm+qs[32]+signs[16] = 50 B, turbo4 = norm+qs[64] = 66 B.
+        DType::Turbo2 => (128, 34),
         DType::Turbo3 => (128, 50),
+        DType::Turbo4 => (128, 66),
         // I32 / U32 are not reachable via ggml_type_to_dtype; kept for exhaustiveness
         DType::I32 | DType::U32 => (1, 4),
     }

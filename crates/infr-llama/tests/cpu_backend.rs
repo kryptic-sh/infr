@@ -582,6 +582,50 @@ fn gpu_seam_multi_slot_prefix_sharing() {
     );
 }
 
+/// Speculative decoding must emit EXACTLY the target-only greedy stream, end to end. The
+/// contract is structural — every committed token is either checked against or produced by a
+/// verify-forward argmax — but the verify forward runs the batched f16 GEMM/cmm path while
+/// target-only decode uses the exact-f32 GEMV, so a near-tie logit could in principle split
+/// them; this test pins the equivalence on a real generation. Self-spec (draft == target)
+/// keeps it to one model download; the accept/commit machinery is identical to a small-draft
+/// pair (the driver never knows the models are the same file).
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_spec_decode_matches_target_only_greedy() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let target = infr_llama::CpuModel::load(&path, None).expect("target load");
+    let draft = infr_llama::CpuModel::load(&path, None).expect("draft load");
+    let prompt = target
+        .render_chat("Write a short paragraph about the ocean.")
+        .expect("render chat");
+
+    let mut plain = String::new();
+    {
+        let mut sess = target.metal_session(1024).expect("target-only session");
+        target
+            .generate_metal_session(&mut sess, &prompt, 64, |p| plain.push_str(p))
+            .expect("target-only greedy");
+    }
+
+    let mut spec = String::new();
+    {
+        let mut ts = target.metal_session(1024).expect("spec target session");
+        let mut ds = draft.metal_session(1024).expect("spec draft session");
+        target
+            .generate_metal_spec(&mut ts, &draft, &mut ds, &prompt, 64, 6, |p| {
+                spec.push_str(p)
+            })
+            .expect("spec decode");
+    }
+
+    assert_eq!(
+        spec, plain,
+        "speculative stream diverged from target-only greedy"
+    );
+}
+
 /// gemma3 (SWA + dual-rope + GeGLU + sandwich norms, hd=256) through the Vulkan seam.
 #[test]
 fn gpu_seam_matches_cpu_gemma3() {

@@ -419,9 +419,12 @@ impl CpuModel {
     /// same-tokenizer model): the draft session proposes `k` greedy tokens, ONE batched verify
     /// forward of the target checks all of them (LM head on every candidate row), the matching
     /// prefix commits plus the target's own next token as a bonus. Greedy-only (INFR_TEMP=0) —
-    /// the committed stream is then EXACTLY the target's greedy stream, which is the
-    /// correctness bar. Rollback is the session prefix-diff: rejected rows just get
-    /// overwritten by the next round's suffix prefill.
+    /// every committed token is checked against (or produced by) a verify-forward argmax, so
+    /// the committed stream is the target's greedy stream over the VERIFY forward. That equals
+    /// target-only greedy decode exactly unless a near-tie logit splits between the batched
+    /// f16 verify kernels and decode's exact-f32 GEMV; end-to-end equality is pinned by
+    /// `metal_spec_decode_matches_target_only_greedy`. Rollback is the session prefix-diff:
+    /// rejected rows just get overwritten by the next round's suffix prefill.
     #[cfg(target_os = "macos")]
     #[allow(clippy::too_many_arguments)]
     pub fn generate_metal_spec(

@@ -972,6 +972,86 @@ fn linear_q6k_gemm_matches_dequant_reference() {
     );
 }
 
+// ─── Split-K coop-GEMM at REAL verify shapes ──────────────────────────────────────
+//
+// The m >= 2 cmm gate routes small multi-row batches (spec verify's k+1 candidate rows, a chat
+// turn's short suffix prefill) through the cooperative tile, and m < 16 with deep k engages the
+// split-K variants (`linear_*_cmm_ks` + `cmm_ks_reduce`): ks_split = min(160/(nto*ntm), 8,
+// in_f/128) partial planes reduced in fixed order. The shapes below make ks_split collapse to
+// its cap of 8 (out_f/64 threadgroups few, k deep), so the k-partition arithmetic, the f32
+// partial plane, and the fixed-order reduce are all on the tested path — the m=40 coop tests
+// keep ks_split == 1 and never touch them. K-quants at m in 2..=8 route to the multi-row GEMV
+// instead (covered by the multirow tests), so the K-quant cases here use m in 9..15.
+//
+// Tolerance 2.5e-3 (not the shallow tests' 1e-3): the reference mirrors the f16 OPERAND
+// rounding but computes f32 products, while the MMA rounds per-product at ~2^-11 relative —
+// accumulated over k=2048..4096 dots that's ~1.5e-3 worst case (observed 1.4e-3 on Q6K),
+// deep-k accumulation, not a kernel defect. The shallow k=256 GEMM tests keep 1e-3.
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q8_0_splitk_verify_shape_matches_dequant_reference() {
+    // m=3: a k=2 verify round's [t_next, cand..] rows. nto=4, ntm=1 → ks_split = 8.
+    let (m, in_f, out_f) = (3usize, 2048usize, 256usize);
+    let wf = rand_f32(out_f * in_f, 41);
+    check_quant_linear_parity_impl(
+        DType::Q8_0,
+        quantize_q8_0(&wf),
+        m,
+        in_f,
+        out_f,
+        2.5e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q5_0_splitk_verify_shape_matches_dequant_reference() {
+    // m=5: a k=4 verify round. Deep-k Q5_0 (gemma's gate/up class) through cmm_ks.
+    let (m, in_f, out_f) = (5usize, 2048usize, 256usize);
+    check_quant_linear_parity_impl(
+        DType::Q5_0,
+        synth_q5_0(out_f * in_f, 42),
+        m,
+        in_f,
+        out_f,
+        2.5e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q4k_splitk_verify_shape_matches_dequant_reference() {
+    // m=12 skips the 2..=8 multi-row GEMV route and lands on cmm_ks (m < 16, deep k).
+    let (m, in_f, out_f) = (12usize, 4096usize, 512usize);
+    check_quant_linear_parity_impl(
+        DType::Q4K,
+        synth_q4k(out_f * in_f, 43),
+        m,
+        in_f,
+        out_f,
+        2.5e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q6k_splitk_verify_shape_matches_dequant_reference() {
+    let (m, in_f, out_f) = (9usize, 2048usize, 256usize);
+    check_quant_linear_parity_impl(
+        DType::Q6K,
+        synth_q6k(out_f * in_f, 44),
+        m,
+        in_f,
+        out_f,
+        2.5e-3,
+        true,
+    );
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn rmsnorm_parity() {

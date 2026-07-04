@@ -30,7 +30,7 @@ fn q4_0_block(x: &[f32], dst: &mut [u8]) {
     for j in 0..QK / 2 {
         let x0 = (x[j] * id + 8.5) as i32 as i8;
         let x1 = (x[j + QK / 2] * id + 8.5) as i32 as i8;
-        let (xi0, xi1) = (x0.min(15).max(0) as u8, x1.min(15).max(0) as u8);
+        let (xi0, xi1) = (x0.clamp(0, 15) as u8, x1.clamp(0, 15) as u8);
         dst[2 + j] = xi0 | (xi1 << 4);
     }
 }
@@ -49,7 +49,7 @@ fn q4_1_block(x: &[f32], dst: &mut [u8]) {
     for j in 0..QK / 2 {
         let x0 = ((x[j] - min) * id + 0.5) as i32 as i8;
         let x1 = ((x[j + QK / 2] - min) * id + 0.5) as i32 as i8;
-        let (xi0, xi1) = (x0.min(15).max(0) as u8, x1.min(15).max(0) as u8);
+        let (xi0, xi1) = (x0.clamp(0, 15) as u8, x1.clamp(0, 15) as u8);
         dst[4 + j] = xi0 | (xi1 << 4);
     }
 }
@@ -68,8 +68,8 @@ fn q5_0_block(x: &[f32], dst: &mut [u8]) {
     dst[0..2].copy_from_slice(&h(d));
     let mut qh: u32 = 0;
     for j in 0..QK / 2 {
-        let xi0 = (((x[j] * id + 16.5) as i32 as i8).min(31).max(0)) as u8;
-        let xi1 = (((x[j + QK / 2] * id + 16.5) as i32 as i8).min(31).max(0)) as u8;
+        let xi0 = (((x[j] * id + 16.5) as i32 as i8).clamp(0, 31)) as u8;
+        let xi1 = (((x[j + QK / 2] * id + 16.5) as i32 as i8).clamp(0, 31)) as u8;
         dst[6 + j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
         qh |= (((xi0 & 0x10) >> 4) as u32) << j;
         qh |= (((xi1 & 0x10) >> 4) as u32) << (j + QK / 2);

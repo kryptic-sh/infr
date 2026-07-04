@@ -1128,25 +1128,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "infr-decode"
-version = "0.0.0"
-dependencies = [
- "infr-core",
- "infr-model",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "infr-engine"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "infr-chat",
  "infr-core",
- "infr-decode",
  "infr-gguf",
- "infr-model",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1216,16 +1204,6 @@ dependencies = [
  "infr-gguf",
  "metal",
  "objc",
-]
-
-[[package]]
-name = "infr-model"
-version = "0.0.0"
-dependencies = [
- "infr-core",
- "infr-gguf",
- "thiserror 2.0.18",
- "tracing",
 ]
 
 [[package]]

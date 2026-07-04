@@ -1,15 +1,54 @@
 # DiffusionGemma (`diffusion-gemma`) — design for the unified seam
 
+## Status
+
+- **UNIFIED-seam DiffusionGemma, phases 1–4 landed (2026-07-05)**: design (phase
+  0, `0785fcf`), config + weights + causal prefill (phase 1, `ca2575a`), canvas
+  denoise + `AttnMask::Canvas` + self-conditioning (phase 2, `2452786`),
+  entropy-bound block decode + `infr run` wiring (phase 3, `c9983c1`),
+  serve/bench/compare + pre-seam scaffolding removal (phase 4, this doc's
+  update). Built on the SAME transformer runner every other arch uses
+  (`CpuModel` + the per-backend `ChatModel` impls) from day one — no bespoke
+  "engine" seam.
+- **What works**: `infr run` (CPU + Vulkan, entropy-bound block-diffusion
+  decode, multi-turn REPL — see the oracle-equivalent captured runs below);
+  `infr serve` (OpenAI `/v1/chat/completions`, streaming + non-streaming,
+  `reasoning_content` split via the shared channel splitter — the exact same
+  `<|channel>thought…<channel|>` markers as the oracle); `infr bench` (DG-aware:
+  reports the block-diffusion shape — pp tok/s, end-to-end generated tok/s, EB
+  steps run, and the "in-step parallel" rate the oracle itself reports — since
+  `llama-bench` has no diffusion mode to compare against); `infr compare` bails
+  with a clear message on this arch instead of a confusing llama-bench failure.
+  CPU==Vulkan cross-backend parity validated per the validation ladder below.
+- **Known gaps** (perf follow-ups, not correctness bugs):
+  - No Metal denoise kernel exists yet — `INFR_METAL` on this arch falls back to
+    the CPU reference session (a loud fallback, not a silent one).
+  - Host-side self-conditioning cost dominates Vulkan decode: the per-step
+    self-conditioning MLP (`self_cond_pre_norm`/gate/up/down) runs on the CPU
+    host, ~190 GFLOP/step, and end-to-end Vulkan decode lands around ~0.9 tok/s
+    as a result.
+  - The denoise graph is rebuilt (recompiled) on every `denoise()` call rather
+    than cached/reused across steps.
+  - The single-dispatch-per-stage batched-MoE Vulkan path doesn't cover DG's
+    fused `ffn_gate_up_exps`/`ffn_down_exps` expert layout — DG's MoE FFN still
+    runs the per-token expert loop on GPU (and, more severely, on CPU: a 256-row
+    canvas × 30 layers × top-8-of-128 experts per-token loop is why the CPU
+    reference denoise is impractically slow for this model size, not just
+    "slower than Vulkan").
+- **Removed in phase 4**: the pre-seam scaffolding (`infr-model`, `infr-decode`,
+  the `infr-engine::Engine` stub) — dead code superseded by the unified runner
+  since phase 1.
+
 Block text-diffusion MoE on a **Gemma-4 backbone**. Reference implementation:
 llama.cpp PR #24423 (checked out at `~/Projects/mxaddict/llama.cpp-dg`,
 `src/models/diffusion-gemma.cpp` + `gemma4-common.h`); oracle binary
 `build/bin/llama-diffusion-cli` (CPU build). Model:
 `unsloth/diffusiongemma-26B-A4B-it-GGUF` (Q4_K_M ≈ 16 GB, fits the 7900 XTX).
 
-This REPLACES the pre-seam scaffolding (`infr-model`/`infr-decode`/the
+This REPLACED the pre-seam scaffolding (`infr-model`/`infr-decode`/the
 `infr-engine::Engine` stub, all dead code) — DiffusionGemma is built on the
-unified transformer runner like every other arch; the scaffolding gets deleted
-in the final phase.
+unified transformer runner like every other arch; the scaffolding was deleted in
+phase 4 (see Status above).
 
 ## Confirmed metadata (real GGUF dump, 2026-07-05)
 

@@ -735,6 +735,34 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
+    // diffusion-gemma (Phase 4, docs/DIFFUSIONGEMMA.md): llama-bench has no diffusion mode, so
+    // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
+    // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
+    // Backend selection mirrors `cmd_run`/`cmd_serve`: -ngl 0 or INFR_CPU picks the CPU reference
+    // session; INFR_METAL falls back to CPU too (no Metal DG session exists yet — Phase 2 only
+    // built CPU/Vulkan).
+    if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
+        let metal = std::env::var("INFR_METAL").is_ok() || dev.eq_ignore_ascii_case("metal");
+        if metal {
+            eprintln!(
+                "[diffusion-gemma bench] no Metal session for this arch yet — falling back to the CPU reference backend"
+            );
+        }
+        if ubatch > 0 {
+            std::env::set_var("INFR_UBATCH", ubatch.to_string());
+        }
+        return cmd_bench_diffusion_gemma(
+            &gguf,
+            tok.as_deref(),
+            n_prompt,
+            n_gen,
+            depth,
+            pg,
+            reps,
+            ngl == 0 || metal || std::env::var("INFR_CPU").is_ok(),
+            json,
+        );
+    }
     // Phase 3 cutover: qwen35 (Qwen3.5) now benches through the STANDARD arms below
     // (`cmd_bench_cpu` / the seam's `bench_vulkan` / `cmd_bench_metal`) — `CpuModel::load` drives
     // it through the unified runner (`Config::from_gguf` + `MixerW::DeltaNet`, Phase 1+2), reusing
@@ -1009,6 +1037,163 @@ fn cmd_bench_qwen35(
     Ok(())
 }
 
+/// diffusion-gemma bench (Phase 4, `docs/DIFFUSIONGEMMA.md`): llama-bench has no diffusion mode
+/// (no llama.cpp comparison possible — this is infr-only reporting), so this drives
+/// `crate::diffusion::diffusion_generate` directly over a persistent
+/// `DiffusionGemmaCpuSession`/`DiffusionGemmaVulkanSession` — the SAME primitive
+/// `DiffusionGemmaChat::generate` (run/serve) uses — rather than going through the generic
+/// `ChatModel::generate`, because bench needs the step/block counts `GenStats` alone doesn't carry.
+///
+/// `-p P`/`-d D` behave like every other bench arm: `D` extra prompt tokens are prefilled UNTIMED
+/// first, then `P` more (an exact-prefix extension of the same real-text token sequence — see the
+/// in-body comment on why NOT the AR arms' `i % 100` dummy ids) through the SAME session — its
+/// reuse forwards only the new `P` suffix, so `prompt_secs` times exactly that, matching the
+/// `-d`/`-p` split every other arch's bench reports. `-n N` then times the block-diffusion decode of
+/// N tokens (`ceil(N / canvas_length)` whole canvas blocks — a `-n 64` request still denoises a
+/// full `canvas_length`-token canvas per step, so besides the naive "committed tokens / decode
+/// secs" rate this also reports the oracle's own "in-step parallel" rate
+/// (`canvas_length * steps / decode_secs`, see the reference runs captured in
+/// `docs/DIFFUSIONGEMMA.md`) — the number that actually reflects how much forward-pass work ran.
+/// `-n 0` measures prefill only (pp, like every other arch's `-n 0`).
+///
+/// `--pg` has no diffusion-shaped meaning (a denoise block isn't an ingest-then-reply AR turn) and
+/// errors clearly rather than silently mis-measuring. `-t`/`-u` keep their generic meaning (rayon
+/// threads for the entropy-bound sampler's per-position reduction; the shared prefill chunk size —
+/// DG's causal prefill rides the exact same `generate_dense_backend` chunked loop as every other
+/// arch) with no DG-specific wiring needed.
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench_diffusion_gemma(
+    gguf: &Path,
+    tok: Option<&Path>,
+    n_prompt: usize,
+    n_gen: usize,
+    depth: usize,
+    pg: Option<(usize, usize)>,
+    reps: usize,
+    cpu: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    use infr_llama::diffusion::{diffusion_generate, EbConfig};
+    if pg.is_some() {
+        anyhow::bail!(
+            "diffusion-gemma bench has no --pg equivalent (a denoise block isn't an ingest-then-reply \
+             AR turn); use separate -p/-n instead — `infr bench <model> -p P -n N`"
+        );
+    }
+    let model = infr_llama::CpuModel::load(gguf, tok)?;
+    let cfg = model.config();
+    let canvas_len = cfg.canvas_length.max(1);
+    let vocab = cfg.vocab;
+    let eb = EbConfig::from_config(cfg);
+    // INFR_IGNORE_EOS (cmd_bench always sets it): a fixed generation budget should never
+    // early-stop on an EOS id, matching every AR bench arm's semantics for the same env.
+    let eos_ids: Vec<u32> = if std::env::var("INFR_IGNORE_EOS").is_ok() {
+        Vec::new()
+    } else {
+        cfg.eos_ids.clone()
+    };
+    let seed: u64 = std::env::var("INFR_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(42);
+
+    let p_eff = n_prompt.max(1); // DG always needs >=1 prompt token (the causal prefix the canvas attends to)
+    let blocks_wanted = if n_gen > 0 {
+        n_gen.div_ceil(canvas_len).max(1)
+    } else {
+        1
+    };
+    let max_ctx = depth + p_eff + blocks_wanted * canvas_len + 64;
+
+    // Unlike the AR bench arms' `i % 100` dummy ids (matmul timing there truly IS
+    // content-independent), DG's entropy-bound sampler converges (steps run, trim point) on the
+    // ACTUAL logits — an out-of-distribution raw-id prompt made the model collapse the whole
+    // canvas to one repeated token in 2 steps (`trim_canvas` then cut it to 0 committed tokens),
+    // which measures a degenerate path instead of the shape `-n` asks for. Encode a real repeated
+    // sentence instead (same "fixed synthetic prompt" convention `cmd_bench_qwen35` uses) and slice
+    // it: `dummy(depth)` is then an exact prefix of `dummy(depth + p_eff)` by construction, so the
+    // untimed depth warm + timed suffix prefill still gets the session's prefix-diff reuse.
+    let long_text = "The quick brown fox jumps over the lazy dog. ".repeat((depth + p_eff) / 4 + 8);
+    let full_ids = model.encode(&long_text)?;
+    if full_ids.len() < depth + p_eff {
+        anyhow::bail!(
+            "internal: synthetic bench prompt too short ({} ids for depth {depth} + p {p_eff})",
+            full_ids.len()
+        );
+    }
+    let dummy = |n: usize| -> Vec<u32> { full_ids[..n.max(1)].to_vec() };
+
+    let mut pps = Vec::with_capacity(reps.max(1));
+    let mut gens = Vec::with_capacity(reps.max(1));
+    let mut steps_v = Vec::with_capacity(reps.max(1));
+    let mut parallel_v = Vec::with_capacity(reps.max(1));
+    let (mut last_np, mut last_ng) = (0usize, 0usize);
+
+    for _ in 0..reps.max(1) {
+        macro_rules! one_rep {
+            ($sess:expr) => {{
+                let mut sess = $sess;
+                if depth > 0 {
+                    sess.prefill(&model, &dummy(depth))?; // untimed depth warm
+                }
+                if n_gen == 0 {
+                    // pp-only: no canvas denoise, just the timed prefill (matches every other
+                    // arch's `-n 0` meaning).
+                    let t0 = std::time::Instant::now();
+                    sess.prefill(&model, &dummy(depth + p_eff))?;
+                    let secs = t0.elapsed().as_secs_f64();
+                    pps.push(p_eff as f64 / secs.max(1e-9));
+                    last_np = p_eff;
+                } else {
+                    let result = diffusion_generate(
+                        &mut sess,
+                        &model,
+                        &dummy(depth + p_eff),
+                        canvas_len,
+                        vocab,
+                        &eos_ids,
+                        &eb,
+                        n_gen,
+                        seed,
+                        max_ctx,
+                    )?;
+                    pps.push(p_eff as f64 / result.stats.prompt_secs.max(1e-9));
+                    gens.push(result.stats.n_gen as f64 / result.stats.decode_secs.max(1e-9));
+                    parallel_v.push(
+                        (canvas_len * result.steps) as f64 / result.stats.decode_secs.max(1e-9),
+                    );
+                    steps_v.push(result.steps as f64);
+                    last_np = p_eff;
+                    last_ng = result.stats.n_gen;
+                }
+            }};
+        }
+        if cpu {
+            one_rep!(model.diffusion_gemma_cpu_session(max_ctx));
+        } else {
+            one_rep!(model.diffusion_gemma_vulkan_session(max_ctx)?);
+        }
+    }
+
+    let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    let tag = if cpu { " [cpu]" } else { "" };
+    if json {
+        let a = if n_gen > 0 { avg(&gens) } else { avg(&pps) };
+        println!("[{{\"avg_ts\": {a:.2}}}]");
+    } else if n_gen > 0 {
+        println!(
+            "pp{last_np}: {:.1} t/s | gen{last_ng}: {:.1} t/s (end-to-end) | {:.1} steps | in-step parallel {:.1} t/s{tag}  ({reps} reps)",
+            avg(&pps),
+            avg(&gens),
+            avg(&steps_v),
+            avg(&parallel_v),
+        );
+    } else {
+        println!("pp{last_np}: {:.1} t/s{tag}  ({reps} reps)", avg(&pps));
+    }
+    Ok(())
+}
+
 /// The recurring "where are we behind llama.cpp" survey: for EVERY model given, measure
 /// pp512 (prefill), tg128 (decode) and tg64 at `--sweep-depth` on both tools, print the matrix
 /// as it fills (a sweep is long — partial results beat silence), and finish with the ratios
@@ -1135,6 +1320,16 @@ impl ModelBench {
         // gets the matching `-hf`/`--hf-file` (or `-m` for a local path). Pull once up front so
         // `--offline` holds.
         let resolved = resolve(model)?.0;
+        // diffusion-gemma (Phase 4, docs/DIFFUSIONGEMMA.md): the PR this arch needs isn't merged
+        // upstream, so `llama-bench` can't run it at all — bail with a clear pointer to `infr
+        // bench` instead of letting the shelled-out llama-bench call fail confusingly below. One
+        // check here covers both `cmd_compare` and `cmd_compare_sweep` (both build a `ModelBench`).
+        if infr_llama::diffusion::is_diffusion_gemma(&resolved) {
+            anyhow::bail!(
+                "{model}: arch=diffusion-gemma has no llama.cpp diffusion bench to compare against \
+                 (the PR isn't merged upstream) — use `infr bench` directly"
+            );
+        }
         let llama_model_args: Vec<String> = match infr_hub::ModelRef::parse(model)? {
             infr_hub::ModelRef::Repo { repo, sel } => {
                 let mut a = vec!["--offline".to_string()];

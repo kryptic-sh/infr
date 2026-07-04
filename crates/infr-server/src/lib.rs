@@ -30,12 +30,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use infr_engine::{ChatMessage, Delta, Engine, ToolCall};
+use infr_engine::{ChatMessage, Delta, ToolCall};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-/// Generation backend the server drives — it never knows the model/GPU underneath.
-/// Implemented by `Engine` (below) and by CLI adapters (e.g. a Llama runner).
+/// Generation backend the server drives — it never knows the model/GPU underneath. Implemented by
+/// the CLI's per-arch adapters (`infr-cli`'s `SeamGenerator` wraps any `infr_llama::ChatModel`,
+/// including `DiffusionGemmaChat` — see `docs/DIFFUSIONGEMMA.md`).
 /// `max_tokens` is the request's generation budget (OpenAI `max_tokens`); `None` leaves the
 /// generator's own default in charge.
 pub trait ChatGenerator: Send {
@@ -47,19 +48,6 @@ pub trait ChatGenerator: Send {
         max_tokens: Option<u32>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<()>;
-}
-
-impl ChatGenerator for Engine {
-    fn chat(
-        &mut self,
-        messages: &[ChatMessage],
-        tools_json: Option<&str>,
-        _tool_choice: Option<&str>,
-        _max_tokens: Option<u32>,
-        on_delta: &mut dyn FnMut(Delta),
-    ) -> anyhow::Result<()> {
-        Engine::chat(self, messages, tools_json, on_delta).map_err(|e| anyhow::anyhow!("{e}"))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,8 +211,8 @@ pub struct DeltaPayload {
 
 /// Shared server state.
 ///
-/// `engine` is `Option<Engine>` so the router can be constructed without a live model
-/// (used in tests and for the /health + /v1/models endpoints which need no generation).
+/// `engine` is `Option<Box<dyn ChatGenerator>>` so the router can be constructed without a live
+/// model (used in tests and for the /health + /v1/models endpoints which need no generation).
 /// Generation is serialised by the Mutex — single-stream for the MVP.
 #[derive(Clone)]
 pub struct AppState {

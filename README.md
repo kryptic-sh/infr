@@ -21,9 +21,11 @@ attention + QK-norm + GeGLU), and **Gemma 4** (per-layer heterogeneous head
 dims, proportional RoPE, V-norm, per-layer output scale — including the **E2B**
 variant: per-layer input embeddings, per-layer FFN widths, KV-layer sharing) on
 the Vulkan backend, competitive with llama.cpp at long context (`infr compare`).
-**Qwen3.5 / Qwen3.6** (`qwen35` / Qwen3-Next — hybrid gated-DeltaNet +
-attention) run via a CPU reference (`docs/QWEN35.md`); a Vulkan/hybrid path is
-planned. DiffusionGemma (the original target) is future work.
+**Qwen3.5 / Qwen3.6** (`qwen35` — hybrid gated-DeltaNet + attention, a sibling
+of Qwen3-Next) run on the same unified runner, CPU + Vulkan (`docs/QWEN35.md`).
+**DiffusionGemma** (the original target — block text-diffusion MoE on a Gemma-4
+backbone, entropy-bound denoise decode) runs end-to-end on CPU + Vulkan
+(`docs/DIFFUSIONGEMMA.md`).
 
 ```bash
 infr pull   <model-ref>        # org/repo[:quant] (HuggingFace) | path to a .gguf
@@ -42,15 +44,17 @@ e.g. `infr run unsloth/Qwen3-14B-GGUF:Q4_K_M`). Models share the standard
 All run on the Vulkan GPU backend unless noted. The chat template (turn markers,
 system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 
-| Family               | Arch (GGUF) | Notes                                          |
-| -------------------- | ----------- | ---------------------------------------------- |
-| Llama / Qwen2        | `llama`     | dense transformer                              |
-| Qwen3                | `qwen3`     | dense, QK-norm                                 |
-| Qwen3 MoE            | `qwen3moe`  | softmax router, top-_k_ experts (CPU offload)  |
-| Gemma 3              | `gemma3`    | SWA + QK-norm + GeGLU, dual-RoPE               |
-| Gemma 4 (dense)      | `gemma4`    | per-layer head dims, proportional RoPE, V-norm |
-| Gemma 4 **E2B**      | `gemma4`    | + per-layer input embeddings / FFN, KV sharing |
-| Qwen3.5 / Qwen3-Next | `qwen3next` | hybrid gated-DeltaNet — **CPU reference** only |
+| Family            | Arch (GGUF)       | Notes                                                  |
+| ----------------- | ----------------- | ------------------------------------------------------ |
+| Llama             | `llama`           | dense transformer                                      |
+| Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                             |
+| Qwen3             | `qwen3`           | dense, QK-norm                                         |
+| Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts (CPU offload)          |
+| Gemma 3           | `gemma3`          | SWA + QK-norm + GeGLU, dual-RoPE                       |
+| Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm         |
+| Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing         |
+| Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)    |
+| DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode |
 
 ```bash
 # Qwen3 dense
@@ -65,6 +69,9 @@ infr run unsloth/gemma-3-1b-it-GGUF:Q4_K_M "What is bash?"
 # Gemma 4 — dense and the E2B variant
 infr run unsloth/gemma-4-12b-it-GGUF:Q4_K_M  "What is the capital of France?"
 infr run unsloth/gemma-4-E2B-it-GGUF:Q4_K_M  "What is bash?"
+
+# DiffusionGemma — block text-diffusion decode (entropy-bound denoise)
+infr run unsloth/diffusiongemma-26B-A4B-it-GGUF:Q4_K_M  "What is the capital of France?"
 
 # Serve any of them over an OpenAI-compatible API
 infr serve unsloth/Qwen3-14B-GGUF:Q4_K_M
@@ -121,12 +128,13 @@ greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
 
 - **Format:** GGUF
 - **Models:** Llama / Qwen3 / Gemma 3 / Gemma 4 (dense + E2B) (GPU); Qwen3.5/3.6
-  (CPU ref); DiffusionGemma (planned)
-- **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple via a
-  native **Metal backend** (`INFR_METAL=1`) covering every op the CPU reference does —
-  dense, MoE (`qwen3moe`) and Qwen3-Next (`qwen35`). Dense is optimized (simdgroup-matrix
-  GEMM + flash attention, raw-block quant decode; within ~1.3-1.5× of llama.cpp Metal on
-  M3 Pro — architecture and numbers in [`docs/METAL.md`](docs/METAL.md))
+  (CPU ref); DiffusionGemma (block text-diffusion, CPU + GPU)
+- **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
+  via a native **Metal backend** (`INFR_METAL=1`) covering every op the CPU
+  reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is
+  optimized (simdgroup-matrix GEMM + flash attention, raw-block quant decode;
+  within ~1.3-1.5× of llama.cpp Metal on M3 Pro — architecture and numbers in
+  [`docs/METAL.md`](docs/METAL.md))
 - **Store:** own cache at `$XDG_CACHE_HOME/infr/models` (standalone HF + Ollama
   HTTP pulls)
 - **API:** OpenAI-compatible HTTP (streaming) — works with opencode / Claude
@@ -136,11 +144,10 @@ greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
 
 ```
 server   axum + SSE  ->  OpenAI /v1
-decode   DecodeStrategy   (AutoRegressive; DiffusionDenoise later)
-model    Model            (Llama/Qwen3; Qwen3-Next CPU ref; DiffusionGemma later)
-runtime  tensors, KV cache, command/descriptor management
+chat     ChatModel        (autoregressive dense/MoE/qwen35; DiffusionGemma's block-diffusion loop)
+runtime  CpuModel          tensors, KV cache, command/descriptor management (the unified runner)
 loader   WeightSource     (Gguf; safetensors later)
-compute  Compute          (Vulkan via ash + SPIR-V; reference Metal via MSL; CUDA later)
+compute  Backend          (Vulkan via ash + SPIR-V; reference Metal via MSL; CUDA later)
 ```
 
 ## License

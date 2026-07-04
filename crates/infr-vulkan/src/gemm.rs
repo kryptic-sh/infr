@@ -927,6 +927,44 @@ dyn_spv!(store_kv_f32_from_f16_spv, "store_kv_f32_from_f16");
 dyn_spv!(store_kv_bf16_spv, "store_kv_bf16");
 dyn_spv!(store_kv_bf16_from_f16_spv, "store_kv_bf16_from_f16");
 
+dyn_spv!(quant_turbo_t2_spv, "quant_turbo_t2");
+dyn_spv!(quant_turbo_t2_f16_spv, "quant_turbo_t2_f16");
+dyn_spv!(quant_turbo_t3_spv, "quant_turbo_t3");
+dyn_spv!(quant_turbo_t3_f16_spv, "quant_turbo_t3_f16");
+dyn_spv!(quant_turbo_t4_spv, "quant_turbo_t4");
+dyn_spv!(quant_turbo_t4_f16_spv, "quant_turbo_t4_f16");
+dyn_spv!(dequant_turbo_t2_spv, "dequant_turbo_t2");
+dyn_spv!(dequant_turbo_t3_spv, "dequant_turbo_t3");
+dyn_spv!(dequant_turbo_t4_spv, "dequant_turbo_t4");
+
+/// (kernel name, SPIR-V) for the TurboQuant KV quantize of `dt` (`src_f16` = f16 K, else f32 V).
+pub(crate) fn quant_turbo_kernel(
+    dt: infr_core::DType,
+    src_f16: bool,
+) -> (&'static str, &'static [u32]) {
+    use infr_core::DType::*;
+    match (dt, src_f16) {
+        (Turbo2, false) => ("quant_turbo_t2", quant_turbo_t2_spv()),
+        (Turbo2, true) => ("quant_turbo_t2_f16", quant_turbo_t2_f16_spv()),
+        (Turbo3, false) => ("quant_turbo_t3", quant_turbo_t3_spv()),
+        (Turbo3, true) => ("quant_turbo_t3_f16", quant_turbo_t3_f16_spv()),
+        (Turbo4, false) => ("quant_turbo_t4", quant_turbo_t4_spv()),
+        (Turbo4, true) => ("quant_turbo_t4_f16", quant_turbo_t4_f16_spv()),
+        _ => unreachable!("quant_turbo_kernel for non-turbo dtype {dt:?}"),
+    }
+}
+
+/// (kernel name, SPIR-V) for the TurboQuant KV dequant→f16 of `dt`.
+pub(crate) fn dequant_turbo_kernel(dt: infr_core::DType) -> (&'static str, &'static [u32]) {
+    use infr_core::DType::*;
+    match dt {
+        Turbo2 => ("dequant_turbo_t2", dequant_turbo_t2_spv()),
+        Turbo3 => ("dequant_turbo_t3", dequant_turbo_t3_spv()),
+        Turbo4 => ("dequant_turbo_t4", dequant_turbo_t4_spv()),
+        _ => unreachable!("dequant_turbo_kernel for non-turbo dtype {dt:?}"),
+    }
+}
+
 /// (kernel name, SPIR-V) for the dense KV cast-store into `dst_dt` (F32/Bf16), `src_f16` = f16 K.
 pub(crate) fn store_kv_dense_kernel(
     dst_dt: infr_core::DType,

@@ -148,6 +148,28 @@ fn main() {
             &["-DDST_BF16", "-DSRC_F16"],
         ),
         ("dequant_kv_f16", "dequant_kv_bf16", &["-DFMT_BF16"]),
+        // TurboQuant KV (WHT-rotated): quantize (f32 V + f16 K) + dequant→f16, per width.
+        ("quant_turbo", "quant_turbo_t2", &["-DTURBO2"]),
+        (
+            "quant_turbo",
+            "quant_turbo_t2_f16",
+            &["-DTURBO2", "-DSRC_F16"],
+        ),
+        ("quant_turbo", "quant_turbo_t3", &["-DTURBO3"]),
+        (
+            "quant_turbo",
+            "quant_turbo_t3_f16",
+            &["-DTURBO3", "-DSRC_F16"],
+        ),
+        ("quant_turbo", "quant_turbo_t4", &["-DTURBO4"]),
+        (
+            "quant_turbo",
+            "quant_turbo_t4_f16",
+            &["-DTURBO4", "-DSRC_F16"],
+        ),
+        ("dequant_turbo_f16", "dequant_turbo_t2", &["-DTURBO2"]),
+        ("dequant_turbo_f16", "dequant_turbo_t3", &["-DTURBO3"]),
+        ("dequant_turbo_f16", "dequant_turbo_t4", &["-DTURBO4"]),
         ("rope", "rope", &[]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),

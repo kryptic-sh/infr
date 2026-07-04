@@ -501,6 +501,9 @@ fn gpu_seam_kv_mainline_quants_coherent() {
         ("f16", "iq4_nl"),
         ("f32", "f32"),
         ("bf16", "bf16"),
+        ("f16", "turbo2"),
+        ("f16", "turbo3"),
+        ("f16", "turbo4"),
     ] {
         std::env::set_var("INFR_KV_TYPE_K", k);
         std::env::set_var("INFR_KV_TYPE_V", v);

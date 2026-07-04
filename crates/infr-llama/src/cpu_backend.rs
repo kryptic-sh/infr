@@ -693,8 +693,8 @@ pub(crate) fn generate_dense_backend(
     let kv_align_ok =
         (0..c.n_layer).all(|l| (c.layer_n_kv(l) * c.layer_head_dim(l)).is_multiple_of(32));
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
-    let cpu = be.name() == "cpu";
-    let kv_turbo_ok = cpu && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
+    let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan")
+        && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
     // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan (Vulkan uses a dequant→f16 prepass);
     // need 32-block alignment. f32/bf16 KV stay CPU-only (no GPU dense-KV path yet).
     let blk_ok = matches!(be.name(), "cpu" | "vulkan") && kv_align_ok;

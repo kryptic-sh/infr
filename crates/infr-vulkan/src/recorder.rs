@@ -1882,6 +1882,55 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Quantize `src[0..n]` → a TurboQuant KV cache of `dt` at element offset `off` (one thread per
+    /// 128-block: L2-norm + WHT + centroid). `src_f16` = f16 K source; f32 V otherwise.
+    pub fn quant_turbo(
+        &self,
+        dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+        off: usize,
+        src_f16: bool,
+    ) {
+        self.stamp("quant_turbo");
+        let (name, spv) = crate::gemm::quant_turbo_kernel(dt, src_f16);
+        let k = self.be.kernel(name, spv, 2, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            ((n / 128) as u32).div_ceil(64),
+        );
+    }
+
+    /// Expand `n` elements of a TurboQuant KV cache of `dt` → an f16 buffer (unpack + inverse WHT).
+    /// One thread per 128-block.
+    pub fn dequant_turbo_f16(
+        &self,
+        dt: infr_core::DType,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        n: usize,
+    ) {
+        self.stamp("dequant_turbo_f16");
+        let (name, spv) = crate::gemm::dequant_turbo_kernel(dt);
+        let k = self.be.kernel(name, spv, 2, 4);
+        let mut push = [0u8; 4];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            ((n / 128) as u32).div_ceil(64),
+        );
+    }
+
     /// Cast-store `src[0..n]` → a DENSE KV cache of `dst_dt` (F32/Bf16) at element offset `off`.
     /// `src_f16` = f16 source (roped K); f32 otherwise (V). One thread per element.
     pub fn store_kv_dense(

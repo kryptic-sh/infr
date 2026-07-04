@@ -87,9 +87,15 @@ fn is_kv_dense_alt(dt: infr_core::DType) -> bool {
     matches!(dt, F32 | Bf16)
 }
 
+/// TurboQuant KV caches (WHT-rotated): quantizing WriteKv + dequant→f16 prepass.
+fn is_turbo(dt: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(dt, Turbo2 | Turbo3 | Turbo4)
+}
+
 /// Any KV cache dtype that rides the dequant/cast → f16 prepass (not f16 or native-Q8).
 fn is_kv_prepass(dt: infr_core::DType) -> bool {
-    is_kv_quant(dt) || is_kv_dense_alt(dt)
+    is_kv_quant(dt) || is_kv_dense_alt(dt) || is_turbo(dt)
 }
 
 fn decode_eligible(graph: &Graph) -> bool {
@@ -753,6 +759,10 @@ fn lower_op(
                 RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => {
                     rec.store_kv_dense(cache_dt, s, c, n, pos * rs, src_f16)
                 }
+                // TurboQuant cache: WHT-quantize the row (static-only).
+                RopeMode::Static(_) if is_turbo(cache_dt) => {
+                    rec.quant_turbo(cache_dt, s, c, n, pos * rs, src_f16)
+                }
                 RopeMode::Static(_) => match graph.desc(*src).dtype {
                     infr_core::DType::F16 => rec.copy(s, 0, c, pos * rs * 2, n * 2),
                     _ => rec.store_f16(s, c, n, pos * rs),
@@ -1055,6 +1065,8 @@ fn lower_op(
                         rec.dequant_q8_f16(r(*k_cache)?, sc, ne, cap);
                     } else if matches!(kdt, infr_core::DType::F32) {
                         rec.store_f16(r(*k_cache)?, sc, ne, 0);
+                    } else if is_turbo(kdt) {
+                        rec.dequant_turbo_f16(kdt, r(*k_cache)?, sc, ne);
                     } else {
                         rec.dequant_kv_f16(kdt, r(*k_cache)?, sc, ne);
                     }
@@ -1069,6 +1081,8 @@ fn lower_op(
                         rec.dequant_q8_f16(r(*v_cache)?, sc, ne, cap);
                     } else if matches!(vdt, infr_core::DType::F32) {
                         rec.store_f16(r(*v_cache)?, sc, ne, 0);
+                    } else if is_turbo(vdt) {
+                        rec.dequant_turbo_f16(vdt, r(*v_cache)?, sc, ne);
                     } else {
                         rec.dequant_kv_f16(vdt, r(*v_cache)?, sc, ne);
                     }

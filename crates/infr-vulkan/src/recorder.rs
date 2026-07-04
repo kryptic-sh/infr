@@ -1038,6 +1038,43 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Multi-row native GEMV (`2 <= rows <= 8`): the GEMV's out_f-wide cooperative-over-K grid,
+    /// each workgroup decoding a weight sub-block ONCE and dotting it against every row — the
+    /// spec-decode verify / short-suffix-prefill shape, where the single-M-tile coopmat GEMM
+    /// underfills the GPU (measured 51-182 GB/s effective vs the GEMV's 292-651 on a 7900 XTX)
+    /// and the plain GEMV re-streams the weight per row. Same push layout as the GEMV; `w_off`
+    /// (fused-QKV slices) rides `w_base`. Caller gates on [`crate::gemm::native_mrow_build_spv`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_mrow(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        debug_assert!((2..=8).contains(&rows));
+        self.stamp("lm_head");
+        let name = crate::gemm::native_mrow_kernel_name(dtype);
+        let spv = crate::gemm::native_mrow_build_spv(dtype).expect("native mrow spv");
+        let k = self.be.kernel(name, spv, 3, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            out_f as u32, // one workgroup per OUTPUT — all rows share its weight stream
+        );
+    }
+
     /// Native-block dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_native(

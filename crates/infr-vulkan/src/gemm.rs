@@ -17,6 +17,59 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+/// Build-compiled multi-row native GEMV SPIR-V (m = 2..8, weight streamed once — the spec-decode
+/// verify / short-suffix-prefill shape). `None` for formats without an mrow build (they keep the
+/// tiled GEMM route).
+pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q8_0 => v!("native_mrow_q8_0"),
+        Bf16 => v!("native_mrow_bf16"),
+        Q4_0 => v!("native_mrow_q4_0"),
+        Q4_1 => v!("native_mrow_q4_1"),
+        Q5_0 => v!("native_mrow_q5_0"),
+        Q5_1 => v!("native_mrow_q5_1"),
+        Q2K => v!("native_mrow_q2k"),
+        Q3K => v!("native_mrow_q3k"),
+        Q4K => v!("native_mrow_q4k"),
+        Q5K => v!("native_mrow_q5k"),
+        Q6K => v!("native_mrow_q6k"),
+        Iq4Nl => v!("native_mrow_iq4nl"),
+        Iq4Xs => v!("native_mrow_iq4xs"),
+        _ => return None,
+    })
+}
+
+/// Kernel-cache name for the multi-row native GEMV (must pair with [`native_mrow_build_spv`]).
+pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> &'static str {
+    use infr_core::DType::*;
+    match dtype {
+        Q8_0 => "native_mrow_q8_0",
+        Bf16 => "native_mrow_bf16",
+        Q4_0 => "native_mrow_q4_0",
+        Q4_1 => "native_mrow_q4_1",
+        Q5_0 => "native_mrow_q5_0",
+        Q5_1 => "native_mrow_q5_1",
+        Q2K => "native_mrow_q2k",
+        Q3K => "native_mrow_q3k",
+        Q4K => "native_mrow_q4k",
+        Q5K => "native_mrow_q5k",
+        Q6K => "native_mrow_q6k",
+        Iq4Nl => "native_mrow_iq4nl",
+        Iq4Xs => "native_mrow_iq4xs",
+        _ => "native_mrow_unsupported",
+    }
+}
+
 /// Build-compiled native-block dequant GEMV SPIR-V for `(dtype, residual)`, or `None` if `dtype`
 /// is not a native-block quant format. One match arm per quant format.
 pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static [u32]> {

@@ -339,6 +339,21 @@ fn main() {
         ("native_gemv", "native_q5k_res", &["-DFMT_Q5K", "-DUSE_RES"]),
         ("native_gemv", "native_q6k", &["-DFMT_Q6K"]),
         ("native_gemv", "native_q6k_res", &["-DFMT_Q6K", "-DUSE_RES"]),
+        // Multi-row GEMV (m = 2..8: spec verify / short suffix prefill) — mainstream dense
+        // projection formats only; the rest fall back to the tiled GEMM.
+        ("native_gemv_mrow", "native_mrow_q8_0", &["-DFMT_Q8_0"]),
+        ("native_gemv_mrow", "native_mrow_bf16", &["-DFMT_BF16"]),
+        ("native_gemv_mrow", "native_mrow_q4_0", &["-DFMT_Q4_0"]),
+        ("native_gemv_mrow", "native_mrow_q4_1", &["-DFMT_Q4_1"]),
+        ("native_gemv_mrow", "native_mrow_q5_0", &["-DFMT_Q5_0"]),
+        ("native_gemv_mrow", "native_mrow_q5_1", &["-DFMT_Q5_1"]),
+        ("native_gemv_mrow", "native_mrow_q2k", &["-DFMT_Q2K"]),
+        ("native_gemv_mrow", "native_mrow_q3k", &["-DFMT_Q3K"]),
+        ("native_gemv_mrow", "native_mrow_q4k", &["-DFMT_Q4K"]),
+        ("native_gemv_mrow", "native_mrow_q5k", &["-DFMT_Q5K"]),
+        ("native_gemv_mrow", "native_mrow_q6k", &["-DFMT_Q6K"]),
+        ("native_gemv_mrow", "native_mrow_iq4nl", &["-DFMT_IQ4NL"]),
+        ("native_gemv_mrow", "native_mrow_iq4xs", &["-DFMT_IQ4XS"]),
         (
             "native_gemv",
             "native_q8_0_res",

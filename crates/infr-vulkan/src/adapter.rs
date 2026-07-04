@@ -455,6 +455,24 @@ fn lower_op(
             //  • other native quants → coopmat `matmul_native` (in-shader dequant).
             //  • f16 (float weights are uploaded as f16) → f16 coopmat `matmul_proj`.
             // Decode (m=1) and non-tileable shapes fall through to the GEMV.
+            // Small multi-row batches (m = 2..8: spec-decode verify rows, a short chat-turn
+            // suffix prefill) take the multi-row GEMV first — the single-M-tile coopmat GEMM
+            // launches only n/64 workgroups (underfills the GPU: measured 51-182 GB/s effective
+            // weight stream vs the GEMV class's 292-651 on a 7900 XTX), and the plain GEMV
+            // re-streams the weight per row. 7900 XTX, 8B Q4_K shapes: m=2 is 5.6-8.3x the GEMM
+            // route, m=4 1.4-4.1x, m=8 1.7-2.6x — EXCEPT very wide n at m>=5 (gate+up n=24576:
+            // 384 tiles fill the GPU and the mrow's per-thread m*32-FMA inner loop turns
+            // ALU-bound), so m=5..8 gates on out_f <= 8192 (<=128 tiles = the GEMM-underfill
+            // regime). Writes exactly m rows (no padded-dst dance). Formats without an mrow
+            // build fall through to the GEMM; INFR_NO_MROW forces the old route (A/B).
+            if ((2..=4).contains(&m) || ((5..=8).contains(&m) && out_f <= 8192))
+                && in_f % 32 == 0
+                && crate::gemm::native_mrow_build_spv(dt).is_some()
+                && std::env::var("INFR_NO_MROW").is_err()
+            {
+                rec.linear_native_mrow(dt, w, w_off, xb, y, m, in_f, out_f);
+                return Ok(());
+            }
             let gemm_ok = m > 1 && out_f % 64 == 0 && in_f % 32 == 0;
             let is_gemm =
                 gemm_ok && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16));

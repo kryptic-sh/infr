@@ -1543,6 +1543,7 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
 /// `block_q4_Kx8` buffers; we pay it once per cached expert).
 /// `(entries keyed by weight-slice (addr, len), total cached bytes)` — see `repack_cache`'s doc.
 type RepackCacheState = (HashMap<(usize, usize), Arc<Q4kPack>>, usize);
+type Repack6CacheState = (HashMap<(usize, usize), Arc<Q6kPack>>, usize);
 
 // Only the x86 ilv kernels read these — plain data everywhere else (aarch64 CI builds with
 // -D warnings, so the not-x86 dead-code must be explicitly allowed rather than cfg'd away:
@@ -3502,7 +3503,7 @@ pub struct CpuBackend {
     /// Q6_K sibling of `repack_cache` (same keying and budget env; separate accounting) — holds
     /// e.g. the tied Q6_K lm_head's ~740 MB pack, built once per session.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    repack6_cache: Mutex<(HashMap<(usize, usize), Arc<Q6kPack>>, usize)>,
+    repack6_cache: Mutex<Repack6CacheState>,
     /// Persistent spin-pool for the op interpreter's parallel loops (see `pool.rs`, threadpool
     /// restructure phase 2). Built on first use so backends constructed for tests/tiny work
     /// never spawn threads. MoeFfn's nested per-expert fan-out stays on rayon (phase 3).

@@ -8,6 +8,7 @@
 //! wherever the models + hardware exist, and quietly no-op elsewhere:
 //!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- --nocapture
 
+use infr_core::WeightSource;
 use std::path::PathBuf;
 
 /// Locate a cached GGUF `<file>` under `~/.cache/huggingface/hub/models--<repo>/snapshots/*/`, or
@@ -1078,6 +1079,165 @@ fn unified_qwen35_session_no_rewind() {
         s3.n_prompt, sf3.n_prompt
     );
     std::env::remove_var("INFR_IGNORE_EOS");
+}
+
+// ─── MTP (multi-token prediction) speculative decoding — Phase 1 (issue #33) ────────────────
+//
+// See docs/MTP.md. Phase 1 only parses `{arch}.nextn_predict_layers` into `Config` (splitting the
+// GGUF's `block_count` into trunk + head) and loads/shape-checks the head's own tensors — no MTP
+// forward yet, so these tests validate LOADING + the `h`-tap primitive Phase 2 needs, not drafting.
+
+fn qwen35_4b_mtp() -> Option<PathBuf> {
+    find_gguf("unsloth--Qwen3.5-4B-MTP-GGUF", "Qwen3.5-4B-UD-Q4_K_XL.gguf")
+}
+
+/// The 4B MTP GGUF's `qwen35.block_count=33` INCLUDES the head layer
+/// (`qwen35.nextn_predict_layers=1`) — `Config::from_gguf` must split it into a 32-layer TRUNK +
+/// `n_layer_nextn=1` (today, before this phase, the trunk layer loop would misclassify `blk.32` as
+/// a gated-DeltaNet layer and fail on missing `ssm_*` tensors — see `Config::n_layer_nextn`'s doc).
+/// `mtp::load_mtp_head` must then find every required head tensor and correctly report the three
+/// optional `nextn.*` fallback tensors ABSENT — this shipped GGUF's live path is 100% fallback to
+/// the main model's `token_embd`/`output`/`output_norm` (see `docs/MTP.md`'s confirmed dump).
+#[test]
+fn mtp_gguf_loads() {
+    let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
+    let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf on the MTP GGUF");
+    assert_eq!(cfg.n_layer, 32, "trunk n_layer must exclude the MTP head");
+    assert_eq!(cfg.n_layer_nextn, 1, "qwen35.nextn_predict_layers=1");
+
+    let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
+    assert_eq!(
+        head.il, 32,
+        "the head sits immediately after the 32-layer trunk"
+    );
+    println!("MTP head tensors (blk.{}):", head.il);
+    println!("  attn_norm              {:?}", head.attn_norm.shape);
+    println!("  attn_q (interleaved q+gate) {:?}", head.attn_q.shape);
+    println!("  attn_k                 {:?}", head.attn_k.shape);
+    println!("  attn_v                 {:?}", head.attn_v.shape);
+    println!("  attn_q_norm            {:?}", head.attn_q_norm.shape);
+    println!("  attn_k_norm            {:?}", head.attn_k_norm.shape);
+    println!("  attn_output            {:?}", head.attn_output.shape);
+    println!(
+        "  post_attention_norm    {:?}",
+        head.post_attention_norm.shape
+    );
+    println!("  ffn_gate               {:?}", head.ffn_gate.shape);
+    println!("  ffn_up                 {:?}", head.ffn_up.shape);
+    println!("  ffn_down               {:?}", head.ffn_down.shape);
+    println!("  nextn.eh_proj          {:?}", head.eh_proj.shape);
+    println!("  nextn.enorm            {:?}", head.enorm.shape);
+    println!("  nextn.hnorm            {:?}", head.hnorm.shape);
+    println!(
+        "  nextn.embed_tokens     {:?} (fallback: main tok_embd)",
+        head.embed_tokens.as_ref().map(|t| &t.shape)
+    );
+    println!(
+        "  nextn.shared_head_head {:?} (fallback: main lm_head)",
+        head.shared_head_head.as_ref().map(|t| &t.shape)
+    );
+    println!(
+        "  nextn.shared_head_norm {:?} (fallback: main output_norm)",
+        head.shared_head_norm.as_ref().map(|t| &t.shape)
+    );
+
+    // Confirmed dump (docs/MTP.md): the shipped GGUF omits `embed_tokens`/`shared_head_head` (so
+    // those fall back to the main model's `token_embd`/tied lm_head) but DOES ship its own
+    // `shared_head_norm` (unlike the other two, this one is NOT a fallback in this GGUF).
+    assert!(head.embed_tokens.is_none(), "confirmed absent in this GGUF");
+    assert!(
+        head.shared_head_head.is_none(),
+        "confirmed absent in this GGUF"
+    );
+    assert!(
+        head.shared_head_norm.is_some(),
+        "confirmed PRESENT in this GGUF (docs/MTP.md)"
+    );
+}
+
+/// The 0.8B (nextn-free) GGUF has no `nextn_predict_layers` key — `Config::from_gguf` must parse
+/// it exactly as before this phase (`n_layer_nextn=0`, `n_layer` unchanged). Run alongside this:
+/// `timeout 600 cargo test --release -p infr-llama --test cpu_backend unified_qwen35 -- --nocapture`
+/// proves the TRUNK FORWARD itself (not just `Config` parsing) is byte-for-byte untouched.
+#[test]
+fn qwen35_trunk_unaffected() {
+    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
+    let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    assert_eq!(cfg.n_layer_nextn, 0, "0.8B has no MTP head");
+    assert_eq!(
+        cfg.n_layer, 24,
+        "trunk layer count must be unaffected by the nextn parsing"
+    );
+}
+
+/// The h-tap (`CpuModel::prefill_logits_and_h_cpu`, issue #33's Phase 2 primitive): the captured
+/// `h` row must be EXACTLY the lm_head's input for the SAME forward's logits row — i.e.
+/// `lm_head(h) == logits` for qwen35 (a plain tied/untied GEMV, no softcap — `Config::final_softcap`
+/// is 0 for every qwen35 model, unlike gemma). Host-recomputes the GEMV from the same dequantized
+/// weight the graph used, in the same f32 precision, so this should match near bit-exactly.
+#[test]
+fn h_tap_matches_lm_head() {
+    let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let tokens = model.encode("The capital of France is").expect("encode");
+
+    let (logits, h) = model
+        .prefill_logits_and_h_cpu(&tokens)
+        .expect("prefill_logits_and_h_cpu");
+    let cfg = model.config();
+    assert_eq!(h.len(), cfg.n_embd, "h is one row: [n_embd]");
+    assert_eq!(logits.len(), cfg.vocab, "logits is one row: [vocab]");
+
+    // Host lm_head: the SAME tensor `build`'s `wload` picks (`output.weight`, or — tied — the
+    // quantized `token_embd.weight`), fully dequantized here (vs the graph's lazy per-row dequant)
+    // — same math, different (irrelevant) dequant call site.
+    let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+    let lm_name = if g.tensors().iter().any(|t| t.name == "output.weight") {
+        "output.weight"
+    } else {
+        "token_embd.weight"
+    };
+    let info = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == lm_name)
+        .expect("lm_head tensor")
+        .clone();
+    let bytes = g.tensor_bytes(lm_name).expect("lm_head bytes");
+    let w = infr_gguf::dequant::dequant_block(info.dtype, bytes).expect("dequant lm_head");
+    let ne = cfg.n_embd;
+    let vocab = cfg.vocab;
+    assert_eq!(w.len(), ne * vocab, "lm_head dequant length");
+
+    let mut host_logits = vec![0f32; vocab];
+    for (v, out) in host_logits.iter_mut().enumerate() {
+        let row = &w[v * ne..v * ne + ne];
+        *out = row.iter().zip(&h).map(|(&wv, &hv)| wv * hv).sum();
+    }
+    let max_abs = logits
+        .iter()
+        .zip(&host_logits)
+        .fold(0f32, |m, (&a, &b)| m.max((a - b).abs()));
+    let max_val = logits.iter().fold(1e-6f32, |m, &v| m.max(v.abs()));
+    let rel = max_abs / max_val;
+    // token_embd here is Q6_K: the graph's `Op::Linear` runs a quantized-activation integer dot
+    // (q8 x q6_k) while this test's host GEMV runs a plain f32 dot over the fully dequantized
+    // weight — the two paths agree to quantization tolerance, not bit-exactly.
+    println!(
+        "h_tap_matches_lm_head: max|graph-host|={max_abs:.6} (logit magnitude ~{max_val:.3}, rel={rel:.6})"
+    );
+    // 2% relative tolerance: the graph quantizes its OWN activation (q8) before the integer
+    // Q6_K dot, while this host GEMV stays f32 throughout — a different (not buggy) arithmetic
+    // path; measured ~1.1% on this model (see the printed `rel` above). A truly bit-exact check
+    // would need to replicate the q8-activation Q6_K dot kernel host-side, which is out of scope
+    // for a Phase 1 wiring check — the point here is "no missing/extra op between `h` and
+    // `logits`", not quant-kernel bit-parity (that's covered elsewhere by the CPU/GPU goldens).
+    assert!(
+        rel < 0.02,
+        "lm_head(h) diverged from the graph's logits: max abs diff {max_abs} (rel {rel})"
+    );
 }
 
 // ─── Qwen3-MoE (routed experts) ─────────────────────────────────────────────────

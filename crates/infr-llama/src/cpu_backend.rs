@@ -135,6 +135,12 @@ struct DecodeHandles {
     sc_logits: Option<TensorId>,
     sc_embt: Option<TensorId>,
     logits: TensorId,
+    // MTP Phase 1 (issue #33, docs/MTP.md): the LM-head INPUT — the same rows `logits` was
+    // computed from, one op earlier (post-`output_norm`, pre-`w_lm`). `Some` only when `build`
+    // was called with `h_tap: true`; `None` for every ordinary caller (no extra op, no extra
+    // download). This is the primitive Phase 2's MTP head needs (`h_p` in `docs/MTP.md`'s forward
+    // pseudocode) — Phase 1 only exposes the tap, no head graph reads it yet.
+    h_out: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
@@ -181,6 +187,7 @@ pub(crate) fn generate_dense_cpu(
         on_token,
         &mut None,
         prompt.len() + max_new + 1,
+        None,
         None,
         None,
         None,
@@ -326,6 +333,7 @@ pub(crate) fn generate_dense_gpu_session(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -399,6 +407,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -440,6 +449,7 @@ pub(crate) fn verify_dense_metal2(
         want_ctx,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
     )?;
@@ -487,8 +497,56 @@ pub(crate) fn verify_dense_cpu(
         None,
         Some(&mut logits),
         None,
+        None,
     )?;
     Ok(logits)
+}
+
+/// [`verify_dense_cpu`]'s MTP Phase 1 twin (issue #33, docs/MTP.md): ALSO captures the LM-head
+/// input rows (`h_out` — `DecodeHandles::h_out`'s doc) alongside the logits, for the
+/// `lm_head(h_row) == logits_row` consistency check `docs/MTP.md`'s Phase 1 validation calls for.
+/// Returns `(logits, h)`, both `[vocab]`/`[n_embd]` for the last prompt token.
+pub(crate) fn verify_dense_cpu_with_h(
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+) -> AResult<(Vec<f32>, Vec<f32>)> {
+    let cpu_be = CpuBackend::new();
+    let mut logits = Vec::new();
+    let mut h = Vec::new();
+    let mut state = None;
+    generate_dense_backend(
+        &cpu_be,
+        &|_name, tb, dt, _n| match tb {
+            WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
+            WBytes::Owned(v) => {
+                let buf = cpu_be
+                    .alloc(v.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                cpu_be
+                    .upload(buf.as_ref(), &v)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok((buf, dt))
+            }
+        },
+        g,
+        cfg,
+        token_embd,
+        ple,
+        tokens,
+        1,
+        |_| {},
+        &mut state,
+        tokens.len() + 2,
+        None,
+        None,
+        Some(&mut logits),
+        Some(&mut h),
+        None,
+    )?;
+    Ok((logits, h))
 }
 
 /// [`verify_dense_cpu`]'s Vulkan twin — the same one-shot causal prefill through the production
@@ -526,6 +584,7 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         Some(&mut logits),
+        None,
         None,
     )?;
     Ok(logits)
@@ -1022,6 +1081,13 @@ pub(crate) fn generate_dense_backend(
     // MoE-incompatible — see its guard below) this rides the existing rows==1 per-token loop, so
     // it works for MoE/diffusion-gemma models too.
     mut logits_out: Option<&mut Vec<f32>>,
+    // MTP Phase 1 (issue #33, docs/MTP.md): captures the LM-head INPUT rows (post-`output_norm`,
+    // pre-`w_lm` — `DecodeHandles::h_out`'s doc) for the SAME row(s) `logits_out`/`verify` came
+    // from: `[ne]` for the per-token decode loop's frontier row, `[m * ne]` for speculative
+    // VERIFY's `m` rows. `None` everywhere else (no extra op, no extra download — see `h_tap`'s
+    // doc on `build`). This is Phase 2's MTP driver primitive (`h_p` in `docs/MTP.md`); Phase 1
+    // only exposes it for validation (`lm_head(h_row) == logits_row`).
+    mut h_out: Option<&mut Vec<f32>>,
     // Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc). `None` everywhere else.
     denoise_req: Option<DenoiseReq>,
 ) -> AResult<(Vec<u32>, GenStats)> {
@@ -1651,11 +1717,16 @@ pub(crate) fn generate_dense_backend(
     // weightless canvas-embed post-norm (always, when `Some`) INSIDE the graph. Baked into the
     // cached plan (the `(cc,p,sc_on)` key — see `DenoiseCache`) rather than a runtime gate, so the
     // compiled graph never branches at execute time.
+    // `h_tap` (MTP Phase 1, issue #33): also expose the LM-head input as a second graph Output
+    // (`DecodeHandles::h_out`) — see that field's doc. `false` for every existing call site;
+    // `true` only from the decode loop / speculative-VERIFY call sites below when the caller
+    // passed `h_out: Some(_)` to `generate_dense_backend`.
     let build = |batch: usize,
                  start_pos: usize,
                  logits_rows: usize,
                  denoise: bool,
-                 gpu_sc: Option<bool>|
+                 gpu_sc: Option<bool>,
+                 h_tap: bool|
      -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
@@ -3007,6 +3078,23 @@ pub(crate) fn generate_dense_backend(
         } else {
             hn
         };
+        // MTP Phase 1 (issue #33): `lm_in` IS the tap target — exactly the rows `logits` is about
+        // to be computed from, one op earlier (the reference's `res->t_h_nextn`, captured right
+        // after `output_norm` in `qwen35.cpp`). A plain Copy into a fresh Output, so this never
+        // disturbs `lm_in`'s existing consumer (the `Op::Linear` below).
+        let h_out = if h_tap {
+            let ho = g.output(f32d(ne * logits_rows));
+            g.push(Op::Copy {
+                src: lm_in,
+                src_off: 0,
+                dst: ho,
+                dst_off: 0,
+                n: (ne * logits_rows) as u32,
+            });
+            Some(ho)
+        } else {
+            None
+        };
         g.push(Op::Linear {
             x: lm_in,
             weight: w_lm,
@@ -3034,6 +3122,7 @@ pub(crate) fn generate_dense_backend(
                 sc_logits: sc_logits_in,
                 sc_embt: sc_embt_id,
                 logits,
+                h_out,
                 k_cache,
                 v_cache,
                 weights,
@@ -3163,7 +3252,14 @@ pub(crate) fn generate_dense_backend(
         if stale {
             // 2/3/4. Per-layer forward: the decoder-scalar / Canvas-mask denoise variant of
             // `build`; 5. logits over ALL C rows (logits_rows = cc).
-            let (dg, dh) = build(cc, p, cc, true, if gpu_sc { Some(plan_sc) } else { None });
+            let (dg, dh) = build(
+                cc,
+                p,
+                cc,
+                true,
+                if gpu_sc { Some(plan_sc) } else { None },
+                false, // MTP h-tap: diffusion-gemma denoise never taps
+            );
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
             let hidden_buf = be
                 .alloc(cc * ne * 4, BufferUsage::Staging)
@@ -3318,8 +3414,20 @@ pub(crate) fn generate_dense_backend(
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(vf_pos_buf.as_ref(), bytemuck::cast_slice(&vf_positions))
             .map_err(|e| anyhow!("{e}"))?;
-        let (vg, vh) = build(m, start, m, false, None);
+        // MTP Phase 1 (issue #33): VERIFY already runs the LM head on every one of the `m` rows —
+        // exactly the rows the MTP catch-up driver needs `h` for (docs/MTP.md's `process()`).
+        // `h_tap` piggybacks on the SAME graph/execute, just an extra Output + download.
+        let want_h = h_out.is_some();
+        let (vg, vh) = build(m, start, m, false, None, want_h);
         let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
+        let vf_h_buf = if want_h {
+            Some(
+                be.alloc(m * ne * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
         let mut vb = Bindings::new();
         vb.bind(vh.hidden, vf_hidden_buf.as_ref());
         vb.bind(vh.positions, vf_pos_buf.as_ref());
@@ -3334,12 +3442,20 @@ pub(crate) fn generate_dense_backend(
             vb.bind(*wid, wbufs[i].as_ref());
         }
         vb.bind(vh.logits, vf_logits_buf.as_ref());
+        if let (Some(ho), Some(hb)) = (vh.h_out, &vf_h_buf) {
+            vb.bind(ho, hb.as_ref());
+        }
         let t0 = std::time::Instant::now();
         be.execute(vplan.as_ref(), &vb)
             .map_err(|e| anyhow!("{e}"))?;
         out_logits.resize(m * c.vocab, 0.0);
         be.download(vf_logits_buf.as_ref(), bytemuck::cast_slice_mut(out_logits))
             .map_err(|e| anyhow!("{e}"))?;
+        if let (Some(out), Some(hb)) = (h_out.take(), &vf_h_buf) {
+            out.resize(m * ne, 0.0);
+            be.download(hb.as_ref(), bytemuck::cast_slice_mut(out))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
         cached.extend_from_slice(&prompt[start..]);
         return Ok((
             Vec::new(),
@@ -3456,7 +3572,13 @@ pub(crate) fn generate_dense_backend(
                 None
             };
             let pf_t0 = std::time::Instant::now();
-            let (pf_g, pf_h) = build(pf_m, cstart, 1, false, None);
+            // MTP h-tap gap (Phase 2 TODO, docs/MTP.md): the chunked BATCHED-PREFILL path never
+            // taps `h` — it only ever runs `logits_rows == 1` (the last row of each chunk, which
+            // this phase never samples/reads), so there's no per-row hidden state worth exposing
+            // here yet. The MTP catch-up driver needs `h` for EVERY prefill row (not just chunk
+            // tails); wiring that requires this path to also carry `logits_rows == pf_m` on
+            // demand, which Phase 2 will add alongside the actual head forward.
+            let (pf_g, pf_h) = build(pf_m, cstart, 1, false, None, false);
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
             let t_compile = pf_t0.elapsed();
@@ -3539,9 +3661,15 @@ pub(crate) fn generate_dense_backend(
         // replay tape isn't proven to re-read their `state` bindings correctly per replay —
         // measured to silently diverge from the static per-token rebuild after a few decode steps.
         // Force the static path for qwen35 until that's audited; every other arch is unaffected.
-        && !c.qwen35;
+        && !c.qwen35
+        // MTP h-tap (Phase 1, issue #33): the replay tape binds a FIXED set of tensors once: an
+        // h-tap request changes the graph shape (an extra Output + Copy) per-call based on
+        // whether THIS position is the one being sampled, which the static replay tape can't
+        // express. Force the ordinary per-token rebuild path below when a caller wants the tap —
+        // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
+        && h_out.is_none();
     let ro = if dyn_replay {
-        let (g, h) = build(1, 0, 1, false, None);
+        let (g, h) = build(1, 0, 1, false, None, false);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         b.bind(h.hidden, hidden_buf.as_ref());
@@ -3593,6 +3721,24 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
         }
 
+        // Only sample once we're past the prompt (decode position = last prompt token onward).
+        let is_decode = pos + 1 >= prompt.len();
+        // Sample only at the FRONTIER (this position's token is the newest one fed). A constrained
+        // step can emit several deterministically-forced tokens at once — they're queued onto
+        // `cur` and the following iterations just feed them (no sampling) until the frontier.
+        let at_frontier = pos + 1 == cur.len();
+        // MTP Phase 1 h-tap (issue #33): only the frontier row is ever sampled/downloaded as
+        // logits — same row `h_out` (when requested) captures. `dyn_replay` already excludes
+        // `h_out.is_some()` (see its doc), so this is always the rebuild (`else`) branch below.
+        let want_h = h_out.is_some() && is_decode && at_frontier;
+        let h_tap_buf = if want_h {
+            Some(
+                be.alloc(ne * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
         let t_setup = std::time::Instant::now();
         let (setup_el, exec_el);
         if let Some((plan, b)) = &ro {
@@ -3602,7 +3748,7 @@ pub(crate) fn generate_dense_backend(
             be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
         } else {
-            let (g, h) = build(1, pos, 1, false, None);
+            let (g, h) = build(1, pos, 1, false, None, want_h);
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();
             b.bind(h.hidden, hidden_buf.as_ref());
@@ -3621,6 +3767,9 @@ pub(crate) fn generate_dense_backend(
                 b.bind(*wid, wbufs[i].as_ref());
             }
             b.bind(h.logits, logits_buf.as_ref());
+            if let (Some(ho), Some(hb)) = (h.h_out, &h_tap_buf) {
+                b.bind(ho, hb.as_ref());
+            }
             setup_el = t_setup.elapsed();
             let t_exec = std::time::Instant::now();
             be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
@@ -3631,12 +3780,6 @@ pub(crate) fn generate_dense_backend(
             dec_exec += exec_el;
         }
 
-        // Only sample once we're past the prompt (decode position = last prompt token onward).
-        let is_decode = pos + 1 >= prompt.len();
-        // Sample only at the FRONTIER (this position's token is the newest one fed). A constrained
-        // step can emit several deterministically-forced tokens at once — they're queued onto
-        // `cur` and the following iterations just feed them (no sampling) until the frontier.
-        let at_frontier = pos + 1 == cur.len();
         if is_decode && at_frontier {
             be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
                 .map_err(|e| anyhow!("{e}"))?;
@@ -3645,6 +3788,13 @@ pub(crate) fn generate_dense_backend(
             // touches `logits` (grammar-constrained steps overwrite it in place below).
             if let Some(out) = logits_out.take() {
                 *out = logits.clone();
+            }
+            // MTP Phase 1 h-tap (see `want_h` above): same row, one op earlier than `logits`.
+            if let (Some(out), Some(hb)) = (h_out.take(), &h_tap_buf) {
+                let mut hrow = vec![0f32; ne];
+                be.download(hb.as_ref(), bytemuck::cast_slice_mut(&mut hrow))
+                    .map_err(|e| anyhow!("{e}"))?;
+                *out = hrow;
             }
             if let Some(cst) = constraint.as_deref_mut() {
                 // Grammar-forced span (serve's tool_choice "required"/named): the shared

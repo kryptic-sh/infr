@@ -25,6 +25,7 @@ pub use config::Config;
 mod weights;
 pub use weights::{weight_footprint, WeightFootprint};
 pub mod model;
+pub mod mtp;
 mod quant;
 pub mod qwen35;
 mod tokenizer;

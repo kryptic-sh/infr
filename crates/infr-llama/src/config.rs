@@ -126,6 +126,14 @@ pub struct Config {
     /// `attn_q` (`[h0 q(hd) | h0 gate(hd) | h1 q | h1 gate | …]`, NOT two contiguous blocks) —
     /// the one real trap in `docs/QWEN35.md`. `true` only for qwen35.
     pub attn_out_gate: bool,
+    /// MTP/NextN (Qwen3.5/3.6, issue #33 — see `docs/MTP.md`): the number of extra decoder blocks
+    /// `{arch}.block_count` includes BEYOND the trunk (`{arch}.nextn_predict_layers`). `n_layer`
+    /// above is already the TRUNK count (`block_count - n_layer_nextn`) — every existing field/
+    /// helper on this `Config` keeps working unmodified. `0` for every model without an MTP head
+    /// (which is every arch except qwen35 today). The MTP head layer itself sits at GGUF index
+    /// `blk.{n_layer}` — Phase 1 only parses this; the head weights load separately (see
+    /// `crate::mtp`) and Phase 2 emits its forward.
+    pub n_layer_nextn: usize,
 }
 
 impl Config {
@@ -273,7 +281,38 @@ impl Config {
         let gemma = arch == crate::arch::GEMMA3 || gemma4;
         let qwen35 = arch == crate::arch::QWEN35;
         let mk = |k: &str| format!("{arch}.{k}");
-        let n_layer = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
+        let n_layer_all = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
+        // MTP/NextN (Qwen3.5/3.6, issue #33 — see docs/MTP.md): `{arch}.nextn_predict_layers`
+        // extra decoder block(s) appended AFTER the trunk — `block_count` INCLUDES them. Ported
+        // from the reference loader's `hparams.n_layer_nextn`
+        // (`llama.cpp/src/models/qwen35.cpp::load_arch_hparams`). The confirmed 4B MTP GGUF sets
+        // `block_count=33`/`nextn_predict_layers=1`: the trunk is 32 layers and `blk.32` is the
+        // MTP head — without this split, `n_layer` below would include it and the trunk layer
+        // loop (`cpu_backend.rs`'s `wload`) would misclassify `blk.32` as a gated-DeltaNet layer
+        // (`(32+1) % full_attn_interval != 0`) and fail on missing `ssm_*` tensors.
+        let n_layer_nextn = meta_u64(g, &mk("nextn_predict_layers")).unwrap_or(0) as usize;
+        if n_layer_nextn > 0 && arch != crate::arch::QWEN35 {
+            bail!(
+                "{arch}.nextn_predict_layers is only supported on arch={} (MTP/NextN); got \
+                 nextn_predict_layers={n_layer_nextn} on arch={arch:?}",
+                crate::arch::QWEN35,
+            );
+        }
+        // The reference caps qwen35 at a single MTP block (`GGML_ASSERT(hparams.n_layer_nextn ==
+        // 1)` in `graph_mtp`'s ctor) — mirrored here so an unsupported wider value fails loudly
+        // instead of silently misreading the tensor layout.
+        if n_layer_nextn > 1 {
+            bail!(
+                "qwen35 MTP: nextn_predict_layers={n_layer_nextn} > 1 not supported (the \
+                 reference implementation caps at a single MTP block — see docs/MTP.md)",
+            );
+        }
+        if n_layer_nextn >= n_layer_all {
+            bail!(
+                "qwen35 MTP: nextn_predict_layers={n_layer_nextn} must be < block_count={n_layer_all}",
+            );
+        }
+        let n_layer = n_layer_all - n_layer_nextn;
         let n_embd = meta_u64(g, &mk("embedding_length")).context("embedding_length")? as usize;
         let n_head = meta_u64(g, &mk("attention.head_count")).context("head_count")? as usize;
         let n_kv = meta_u64(g, &mk("attention.head_count_kv")).unwrap_or(n_head as u64) as usize;
@@ -546,6 +585,7 @@ impl Config {
             ssm_dt_rank,
             rope_sections,
             attn_out_gate,
+            n_layer_nextn,
         })
     }
 }

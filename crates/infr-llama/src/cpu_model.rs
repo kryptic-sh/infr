@@ -319,6 +319,20 @@ impl CpuModel {
         )
     }
 
+    /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s MTP Phase 1 twin (issue #33,
+    /// docs/MTP.md): ALSO returns the LM-head INPUT row (post-`output_norm`, pre-lm_head) for the
+    /// same last-prompt-token row the logits came from — the `h_p` primitive Phase 2's MTP driver
+    /// needs, validated here via `lm_head(h) == logits`. Returns `(logits, h)`.
+    pub fn prefill_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        crate::cpu_backend::verify_dense_cpu_with_h(
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            tokens,
+        )
+    }
+
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s Vulkan twin, for the CPU/Vulkan
     /// cross-backend parity check.
     pub fn prefill_logits_vulkan(&self, tokens: &[u32]) -> Result<Vec<f32>> {
@@ -928,6 +942,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None,
         )?;
         Ok(())
     }
@@ -974,6 +989,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None,
             Some(crate::cpu_backend::DenoiseReq {
                 canvas_tokens,
                 sc_logits,
@@ -1014,6 +1030,7 @@ impl DiffusionGemmaVulkanSession {
             None,
             None,
             None,
+            None,
         )?;
         Ok(())
     }
@@ -1049,6 +1066,7 @@ impl DiffusionGemmaVulkanSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,
@@ -1099,6 +1117,7 @@ impl DiffusionGemmaMetalSession {
             None,
             None,
             None,
+            None,
         )?;
         Ok(())
     }
@@ -1133,6 +1152,7 @@ impl DiffusionGemmaMetalSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,

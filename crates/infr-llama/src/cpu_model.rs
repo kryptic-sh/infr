@@ -363,6 +363,23 @@ impl CpuModel {
         })
     }
 
+    /// [`diffusion_gemma_vulkan_session`](Self::diffusion_gemma_vulkan_session)'s Metal twin
+    /// (Phase D — see docs/DIFFUSIONGEMMA.md's Metal note). The denoise path
+    /// (`generate_dense_backend`'s `denoise_req` branch) is backend-generic, so this is exactly
+    /// the Vulkan constructor with Metal's own weight-upload closure.
+    #[cfg(target_os = "macos")]
+    pub fn diffusion_gemma_metal_session(
+        &self,
+        max_ctx: usize,
+    ) -> Result<DiffusionGemmaMetalSession> {
+        let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
+        Ok(DiffusionGemmaMetalSession {
+            be: mtl,
+            state: None,
+            max_ctx,
+        })
+    }
+
     /// Token-level bench on the CPU reference backend (no GPU): prefill `n_prompt` dummy tokens, then
     /// decode `n_gen`, returning the timing ([`crate::GenStats`] has `prompt_secs`/`decode_secs`). Lets
     /// `infr bench -ngl 0` measure prefill (pp = n_prompt/prompt_secs) and decode (tg = n_gen/decode_secs)
@@ -867,6 +884,15 @@ pub struct DiffusionGemmaVulkanSession {
     max_ctx: usize,
 }
 
+/// [`DiffusionGemmaVulkanSession`]'s Metal twin (Phase D — see
+/// [`CpuModel::diffusion_gemma_metal_session`]).
+#[cfg(target_os = "macos")]
+pub struct DiffusionGemmaMetalSession {
+    be: infr_metal::MetalBackend,
+    state: Option<crate::cpu_backend::SeamKv>,
+    max_ctx: usize,
+}
+
 impl DiffusionGemmaCpuSession {
     /// Causal prefill of `tokens` (encoder scalars, chunked/per-token like every other dense
     /// prefill on this seam) — writes KV rows `0..tokens.len()`. Call once per block before
@@ -1011,6 +1037,90 @@ impl DiffusionGemmaVulkanSession {
                     .map_err(|e| anyhow!("{e}"))?;
                 self.be
                     .upload(buf.as_ref(), &padded)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok((buf, dt))
+            },
+            &model.gguf,
+            &model.cfg,
+            &model.token_embd,
+            model.per_layer_embd.as_ref(),
+            &[],
+            0,
+            |_| {},
+            &mut self.state,
+            self.max_ctx,
+            None,
+            None,
+            None,
+            Some(crate::cpu_backend::DenoiseReq {
+                canvas_tokens,
+                sc_logits,
+                temp_inv,
+                out_logits: &mut out_logits,
+            }),
+        )?;
+        Ok(out_logits)
+    }
+}
+
+/// Phase D: Metal twin of [`DiffusionGemmaVulkanSession`] (see
+/// [`CpuModel::diffusion_gemma_metal_session`]). `generate_dense_backend`'s `denoise_req` branch
+/// is backend-generic (verified — nothing in it besides the Phase-B `gpu_sc` gate distinguishes
+/// Vulkan, and that gate now includes Metal too, see `cpu_backend.rs`), so this only differs from
+/// the Vulkan twin in its weight-upload closure: Metal uploads weights in their NATIVE GGUF dtype
+/// with no padding (matching `generate_dense_metal_session`'s closure), unlike Vulkan's
+/// `pad_to_u32_align`.
+#[cfg(target_os = "macos")]
+impl DiffusionGemmaMetalSession {
+    /// [`DiffusionGemmaCpuSession::prefill`]'s Metal twin.
+    pub fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
+        crate::cpu_backend::generate_dense_backend(
+            &self.be,
+            &|_name, tb, dt, _n| {
+                let buf = self
+                    .be
+                    .alloc(tb.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                self.be
+                    .upload(buf.as_ref(), &tb)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok((buf, dt))
+            },
+            &model.gguf,
+            &model.cfg,
+            &model.token_embd,
+            model.per_layer_embd.as_ref(),
+            tokens,
+            1,
+            |_| {},
+            &mut self.state,
+            self.max_ctx,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// [`DiffusionGemmaCpuSession::denoise`]'s Metal twin.
+    pub fn denoise(
+        &mut self,
+        model: &CpuModel,
+        canvas_tokens: &[u32],
+        sc_logits: Option<&[f32]>,
+        temp_inv: f32,
+    ) -> Result<Vec<f32>> {
+        let mut out_logits = Vec::new();
+        crate::cpu_backend::generate_dense_backend(
+            &self.be,
+            &|_name, tb, dt, _n| {
+                let buf = self
+                    .be
+                    .alloc(tb.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                self.be
+                    .upload(buf.as_ref(), &tb)
                     .map_err(|e| anyhow!("{e}"))?;
                 Ok((buf, dt))
             },

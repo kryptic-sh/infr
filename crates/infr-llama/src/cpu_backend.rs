@@ -615,8 +615,8 @@ pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
 struct DenoiseCache {
     cc: usize,
     p: usize,
-    /// Phase-B perf: whether this plan bakes the in-graph SC subgraph (`gpu_sc: Some(true)` — see
-    /// `build`'s doc). Always `false` on CPU/Metal (their graph never varies with SC). A DIFFERENT
+    /// Phase-B/D perf: whether this plan bakes the in-graph SC subgraph (`gpu_sc: Some(true)` — see
+    /// `build`'s doc). Always `false` on CPU (its graph never varies with SC). A DIFFERENT
     /// graph shape from the no-SC plan (extra ops + an extra weight/input), so it's part of the
     /// cache key: step 0 (no SC) and steps 1+ (SC on) hit two separate cached plans instead of one
     /// runtime-gated plan — see docs/DIFFUSIONGEMMA.md's Phase-B "two-plan" note.
@@ -664,10 +664,10 @@ pub(crate) struct SeamKv {
     /// denoise call with self-conditioning ON. `Arc` so `fork()` shares it with forked conversation
     /// slots for free (a pure function of the model, not per-conversation state).
     self_cond_w: Option<std::sync::Arc<SelfCondWeights>>,
-    /// Phase-B perf: the in-graph SC soft-embedding weight (`token_embd` dequantized + transposed
+    /// Phase-B/D perf: the in-graph SC soft-embedding weight (`token_embd` dequantized + transposed
     /// to f16 `[n_embd, n_vocab]`, ~1.4 GB — see the reference's `dg_ensure_sc_embT` and
-    /// `build_sc_embt`), built lazily on the FIRST Vulkan denoise call with SC on. `None` for
-    /// CPU/Metal (they never set it) and for every non-diffusion-gemma caller. `Arc` so `fork()`
+    /// `build_sc_embt`), built lazily on the FIRST Vulkan/Metal denoise call with SC on. `None` for
+    /// CPU (it never sets it) and for every non-diffusion-gemma caller. `Arc` so `fork()`
     /// shares it with forked conversation slots for free — mirrors `self_cond_w`.
     sc_embt: Option<std::sync::Arc<dyn Buffer>>,
 }
@@ -871,11 +871,12 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 /// Runs entirely on the HOST: `soft` is a `[vocab]`-wide weighted sum of embedding rows, computed
 /// directly against the CPU runner's already-dequantized `token_embd` table (a plain threaded
 /// matvec) rather than materializing the reference's second on-device transposed-embedding
-/// weight (`sc_embT`, ~1.4 GB). CPU/Metal keep this host path (this function). Phase-B moved the
+/// weight (`sc_embT`, ~1.4 GB). CPU keeps this host path (this function). Phase-B moved the
 /// Vulkan denoise path's SC block IN-GRAPH instead (a `sc_embT` device weight + `Op::Softmax` +
 /// `Op::Linear`/`Op::GatedAct` — see the SC subgraph in `build` and `build_sc_embt` below) since
 /// the host matvec here was ~85% of every Vulkan denoise step's wall time (see
-/// `INFR_DIFFUSION_TIME`'s breakdown).
+/// `INFR_DIFFUSION_TIME`'s breakdown); Phase-D widened the same in-graph path to Metal (see
+/// `gpu_sc`'s call site below — Metal's Softmax/Linear ops already cover this shape and dtype).
 ///
 /// Phase-A perf: `scw` is the ONE-TIME dequant of the four self-cond tensors (see
 /// `SeamKv::self_cond_w`) — this used to re-dequantize all four on EVERY call.
@@ -1641,11 +1642,11 @@ pub(crate) fn generate_dense_backend(
     // row P, Attention's kv_len is still `start_pos+batch` = P+C, positions are still bound
     // per-row P..P+C-1 by the caller) — ONLY the attention mask and the per-layer output scalar
     // change. Never true for any existing caller (all pass `false`).
-    // `gpu_sc`: Phase-B perf, DiffusionGemma in-graph self-conditioning (see
+    // `gpu_sc`: Phase-B/D perf, DiffusionGemma in-graph self-conditioning (see
     // docs/DIFFUSIONGEMMA.md's Phase-B and the reference's `dg_canvas_embed`) — `None` for every
-    // ordinary caller (CPU/Metal denoise included: they keep the Phase-A host `diffusion_self_cond`
-    // path, so `hidden` is already the fully-baked residual). `Some(sc_on)` ONLY from the Vulkan
-    // denoise call site: `hidden` there holds the RAW scaled canvas embedding (no SC add, no
+    // ordinary caller (CPU denoise included: it keeps the Phase-A host `diffusion_self_cond`
+    // path, so `hidden` is already the fully-baked residual). `Some(sc_on)` from the Vulkan AND
+    // Metal denoise call sites: `hidden` there holds the RAW scaled canvas embedding (no SC add, no
     // norm) and this flag additionally emits the SC subgraph (`sc_on == true`) and/or the
     // weightless canvas-embed post-norm (always, when `Some`) INSIDE the graph. Baked into the
     // cached plan (the `(cc,p,sc_on)` key — see `DenoiseCache`) rather than a runtime gate, so the
@@ -1862,7 +1863,7 @@ pub(crate) fn generate_dense_backend(
         // diffusion-gemma: self-conditioning gated-MLP handles — declared to match `wload`'s
         // upload order (right after lm_head, before the e2b projection weights). Read by the
         // in-graph SC subgraph below when `gpu_sc == Some(true)`; harmlessly unread otherwise
-        // (every other build, including the CPU/Metal denoise path, which computes SC on the
+        // (every other build, including the CPU denoise path, which computes SC on the
         // host — see `diffusion_self_cond`).
         let (sc_pre_norm_id, sc_gate_id, sc_up_id, sc_down_id) = if c.diffusion_gemma {
             (
@@ -3064,11 +3065,16 @@ pub(crate) fn generate_dense_backend(
             ));
         }
         // Phase-B perf: in-graph self-conditioning on Vulkan (see docs/DIFFUSIONGEMMA.md's
-        // Phase-B and the reference's `dg_canvas_embed`) — CPU/Metal keep the Phase-A host path
-        // (`diffusion_self_cond` + host weightless norm) unchanged below.
-        let gpu_sc = be.name() == "vulkan";
+        // Phase-B and the reference's `dg_canvas_embed`) — Phase D widened this to Metal too:
+        // `Op::Softmax`'s wide kernel handles the [C, vocab] shape unmodified (a plain grid-stride
+        // loop, no row/dim limit) and `sc_embT`'s `DType::F16` weight already flows through
+        // Metal's ordinary non-quant `Op::Linear` path (`weight_buf` dequant-caches it to f32 —
+        // functionally correct, just not the dedicated native-f16 GEMV a quant weight would get;
+        // see `weight_buf`'s VRAM-budget guard for the failure mode if it doesn't fit). CPU alone
+        // keeps the Phase-A host path (`diffusion_self_cond` + host weightless norm) below.
+        let gpu_sc = matches!(be.name(), "vulkan" | "metal");
         let sc_on = req.sc_logits.is_some();
-        // The plan shape only varies with SC on the gpu_sc path (CPU/Metal's graph never changes;
+        // The plan shape only varies with SC on the gpu_sc path (CPU's graph never changes;
         // `sc_on` there is purely a host-side input difference) — see `DenoiseCache::sc`'s doc.
         let plan_sc = gpu_sc && sc_on;
 
@@ -3077,7 +3083,7 @@ pub(crate) fn generate_dense_backend(
         // `embed_scale` is always √n_embd — computed locally (the "── drive ──" section below
         // defines its own copy for the ordinary decode loop, unreached by this early return). On
         // the gpu_sc path this is ALL of `hidden_host` — the SC add + weightless norm run IN-GRAPH
-        // instead (see `build`'s SC subgraph); on CPU/Metal it's completed below exactly as Phase A.
+        // instead (see `build`'s SC subgraph); on CPU it's completed below exactly as Phase A.
         let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let mut hidden_host: Vec<f32> = Vec::with_capacity(cc * ne);
         for &tok in canvas {
@@ -3108,7 +3114,7 @@ pub(crate) fn generate_dense_backend(
                     .for_each(|(d, &s)| *d = s * req.temp_inv);
                 sc_logits_host = Some(scaled);
             } else {
-                // Phase-A host path (CPU/Metal), unchanged.
+                // Phase-A host path (CPU only now), unchanged.
                 // Phase-A perf: dequantize the self-cond MLP weights ONCE per session, not once
                 // per call — `diffusion_self_cond` used to re-run four `load_tensor_dequant`s
                 // every step.
@@ -3132,7 +3138,7 @@ pub(crate) fn generate_dense_backend(
             }
         }
         if !gpu_sc {
-            // Phase-A host weightless canvas-embed norm (CPU/Metal only — the gpu_sc path applies
+            // Phase-A host weightless canvas-embed norm (CPU only now — the gpu_sc path applies
             // this IN-GRAPH for both the sc-on and no-sc plans, see `build`).
             for row in hidden_host.chunks_mut(ne) {
                 let ms: f32 = row.iter().map(|&x| x * x).sum::<f32>() / ne as f32;

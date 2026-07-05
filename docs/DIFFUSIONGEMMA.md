@@ -10,6 +10,22 @@
   update). Built on the SAME transformer runner every other arch uses
   (`CpuModel` + the per-backend `ChatModel` impls) from day one — no bespoke
   "engine" seam.
+- **Phase D: Metal denoise, code-complete but hardware-unvalidated.** Written
+  BLIND on a Linux box (same precedent as the KV-quant Metal work — shipped
+  blind, CI-green): a dedicated split-KV canvas kernel
+  (`attention_canvas_f16kv`/`attention_canvas32_f16kv` + their f32 siblings in
+  `crates/infr-metal/shaders/attention.metal`) gives Metal's attention the
+  bidirectional `[lo, kv_len)`-for-every-row reach `AttnMask::Canvas` needs (see
+  "Metal implementation notes" below); `DiffusionGemmaMetalSession`
+  (`crates/infr-llama/src/cpu_model.rs`) is the Vulkan session's twin;
+  `infr run`/`serve`/`bench` now route `INFR_METAL` there instead of falling
+  back to CPU. In-graph self-conditioning (`gpu_sc`, Phase B) widened to cover
+  Metal too — its `Op::Softmax`/`Op::Linear` already handled the shape/dtype.
+  Metal hardware validation is deferred to the M3 collaborator (see the
+  checklist at the end of this section); CPU and Vulkan remain the validated
+  backends until then. **Not done in Phase D**: a Metal batched-MoE pipeline —
+  DG's fused MoE shape still runs Metal's per-token host-loop fallback (too
+  large to build blind; same gap as Vulkan, see "Known gaps" below).
 - **What works**: `infr run` (CPU + Vulkan, entropy-bound block-diffusion
   decode, multi-turn REPL — see the oracle-equivalent captured runs below);
   `infr serve` (OpenAI `/v1/chat/completions`, streaming + non-streaming,
@@ -21,8 +37,21 @@
   with a clear message on this arch instead of a confusing llama-bench failure.
   CPU==Vulkan cross-backend parity validated per the validation ladder below.
 - **Known gaps** (perf follow-ups, not correctness bugs):
-  - No Metal denoise kernel exists yet — `INFR_METAL` on this arch falls back to
-    the CPU reference session (a loud fallback, not a silent one).
+  - Metal denoise is code-complete (Phase D, see the status bullet above) but
+    **hardware-unvalidated** — nobody has run it on a real Metal device yet. CPU
+    and Vulkan are the only backends whose DG output is confirmed correct.
+  - Metal's canvas attention kernel is a NEW split-KV variant forced on for
+    EVERY row regardless of row count (mirrors the Vulkan `attn_partial` canvas
+    branch's own "perf pass deferred" — see attention.metal) — it never takes
+    Metal's faster flash/flash2/vec tiers, so denoise throughput on Metal is a
+    probably-conservative lower bound until it's profiled.
+  - `sc_embT` (the in-graph self-conditioning soft-embedding weight,
+    `[n_embd, n_vocab]`, `DType::F16`) has no native Metal GEMV — it flows
+    through Metal's generic non-quant `Linear` path, which dequant-caches the
+    WHOLE weight to f32 once per session (~2x the f16 footprint, one host
+    round-trip dequant). Correct, just not the efficient path a quantized weight
+    would get; see `weight_buf`'s VRAM-budget guard for the failure mode if it
+    doesn't fit.
   - Host-side self-conditioning cost dominates Vulkan decode: the per-step
     self-conditioning MLP (`self_cond_pre_norm`/gate/up/down) runs on the CPU
     host, ~190 GFLOP/step, and end-to-end Vulkan decode lands around ~0.9 tok/s
@@ -34,7 +63,9 @@
     runs the per-token expert loop on GPU (and, more severely, on CPU: a 256-row
     canvas × 30 layers × top-8-of-128 experts per-token loop is why the CPU
     reference denoise is impractically slow for this model size, not just
-    "slower than Vulkan").
+    "slower than Vulkan"). Metal shares this gap — Phase D did NOT build a Metal
+    batched-MoE pipeline (too large to write blind); DG's MoE FFN on Metal also
+    falls to the per-token host loop.
 - **Removed in phase 4**: the pre-seam scaffolding (`infr-model`, `infr-decode`,
   the `infr-engine::Engine` stub) — dead code superseded by the unified runner
   since phase 1.
@@ -200,6 +231,81 @@ Resolved from the oracle source (`diffusion-cli.cpp` run_turn, ~line 413+):
    infr's batched machinery is strongest at (Phase 4 bench + compare rows; note
    llama-bench has no diffusion mode, so compare needs a diffusion-aware
    scenario — measure steps/s and tokens/s end-to-end).
+
+## Metal implementation notes (Phase D)
+
+Written BLIND on a Linux box: `infr-metal` compiles here
+(`#![cfg(target_os = "macos")]` strips the whole crate off-macOS, so
+`cargo check`/`clippy` only syntax-check it), but `.metal` shaders only actually
+compile+run on a real Metal device, and macOS CI has no GPU-attached runner for
+this arch's model files. Same situation as the KV-quant Metal work, which
+shipped this way and landed CI-green.
+
+- **Canvas attention** (`AttnMask::Canvas`,
+  `crates/infr-metal/shaders/attention.metal`): every one of Metal's existing
+  attention tiers (the plain kernel, the split-KV `ATTNSPLIT_KERNEL` family, the
+  flash/flash2 kernels, the vector-flash `attnvec_*` kernels) computes its
+  per-row bound from `pos + row_index` plus an optional sliding-window `lo` —
+  none can express "every row shares the SAME `[lo, kv_len)` regardless of its
+  own position". Repurposing an existing kernel's dead field with a sentinel
+  (the way the Vulkan `attn_partial.comp` canvas branch reuses its `rows`
+  push-constant slot) risked a genuine non-canvas dispatch and a canvas dispatch
+  both landing on the same nonzero sentinel value in the SAME kernel, so canvas
+  gets its own dedicated `ATTNSPLIT_CANVAS_KERNEL` macro (4 instantiations:
+  `attention_canvas_f32`/ `attention_canvas_f16kv` at NSG=8/MAXHD=256,
+  `attention_canvas32_f32`/ `attention_canvas32_f16kv` at NSG=32/MAXHD=128) that
+  never serves a non-canvas caller, so its repurposed `p.pos`/`p.kv_len` fields
+  (fixed `hi`/`lo` instead of their ordinary meaning) can't collide with
+  anything. `exec.rs`'s `Op::Attention` arm forces every `AttnMask::Canvas` op
+  straight to this kernel family (bypassing the flash/split/vec routing
+  entirely), gated the same way the ordinary split kernels are (threadgroup-cap
+  `fits()` checks, hd<=128 preferring the 32-wide variant). Q8_0 KV cache +
+  canvas is explicitly rejected (`Error::Unsupported`) — Q8_0's attention family
+  has no split-canvas sibling yet; every other KV dtype (native f16, or a
+  block-quant that goes through the existing dequant-to-f16-scratch prepass) is
+  covered.
+- **Self-conditioning** (`gpu_sc`, Phase B): widened from Vulkan-only to
+  `matches!(be.name(), "vulkan" | "metal")` — verified by reading, not running:
+  `softmax_wide_f32` is a plain grid-stride loop over `(rows, dim)` with no
+  shape restriction (handles the `[256, vocab]` shape unmodified), and
+  `sc_embT`'s `DType::F16` weight already flows through Metal's existing
+  non-quant `Linear` path (`weight_buf` + `linear_f32`) — functionally correct,
+  though not a native f16 GEMV (see "Known gaps" above for the perf/memory
+  caveat).
+- **Batched MoE**: NOT built this phase — too large to write blind. DG's fused
+  MoE shape already falls to Metal's per-token host loop (same as Vulkan's own
+  gap for this shape), unchanged by Phase D.
+
+**Hardware-validation checklist for the M3 collaborator** (each item currently
+unverified):
+
+- [ ] `cargo test --release -p infr-metal -- --include-ignored` on real hardware
+      — confirms the canvas kernels compile+run at all (a syntax slip that
+      Linux's empty-crate `cargo check` can't catch would surface here as an MSL
+      compile error or a GPU validation failure).
+- [ ] `attention_canvas_split32_matches_reference` /
+      `attention_canvas_split8_hd256_matches_reference` (new in
+      `tests/parity.rs`) pass within their `5e-3` relative-error tolerance
+      against the CPU reference — the actual numeric proof the
+      `[lo, kv_len)`-for-every-row math is right, not just that it dispatches.
+- [ ] `cargo test -p infr-metal --test kernel_names -- --include-ignored` —
+      confirms `attention_canvas*` resolve in the compiled MSL library (the
+      tripwire test).
+- [ ] A real DG denoise run (`INFR_METAL=1 infr run <dg-gguf>`) produces
+      coherent, non-garbage text — the end-to-end smoke test no unit test can
+      substitute for.
+- [ ] `INFR_METAL=1 infr bench <dg-gguf> -p 128 -n 256` reports a sane
+      (non-crashing, non-degenerate) pp/decode rate, ideally compared against
+      the Vulkan number on the same machine if available.
+- [ ] With self-conditioning on (the default after a step 0), confirm output
+      stays coherent across multiple steps — this exercises `sc_embT`'s
+      dequant-to-f32 Linear path AND the `softmax_wide_f32` kernel at the real
+      `[C, vocab]` shape, neither of which any existing Metal test dispatches at
+      this size.
+- [ ] If any of the above fails on a memory-constrained device, check for the
+      `weight_buf` "would exceed the GPU working set" error specifically
+      (`sc_embT` dequant-caches to f32, ~2x its f16 size) before assuming a
+      correctness bug.
 
 ## Oracle reference outputs (CPU, greedy `-s 42 --temp 0`, captured 2026-07-05)
 

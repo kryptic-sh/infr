@@ -612,11 +612,15 @@ impl ChatModel for CpuDenseChat {
     }
 }
 
-/// Either DiffusionGemma session (Phase 2, `cpu_model.rs`) behind [`crate::diffusion::DiffusionSession`]
-/// — lets [`DiffusionGemmaChat`] hold ONE persistent session across turns regardless of backend.
+/// Either DiffusionGemma session (Phase 2/D, `cpu_model.rs`) behind
+/// [`crate::diffusion::DiffusionSession`] — lets [`DiffusionGemmaChat`] hold ONE persistent
+/// session across turns regardless of backend.
 enum DiffusionSess {
     Cpu(crate::cpu_model::DiffusionGemmaCpuSession),
     Vulkan(crate::cpu_model::DiffusionGemmaVulkanSession),
+    /// Phase D: the Metal twin, macOS only (see `DiffusionGemmaChat::new_metal`).
+    #[cfg(target_os = "macos")]
+    Metal(crate::cpu_model::DiffusionGemmaMetalSession),
 }
 
 impl crate::diffusion::DiffusionSession for DiffusionSess {
@@ -624,6 +628,8 @@ impl crate::diffusion::DiffusionSession for DiffusionSess {
         match self {
             DiffusionSess::Cpu(s) => s.prefill(model, tokens),
             DiffusionSess::Vulkan(s) => s.prefill(model, tokens),
+            #[cfg(target_os = "macos")]
+            DiffusionSess::Metal(s) => s.prefill(model, tokens),
         }
     }
     fn denoise(
@@ -636,21 +642,34 @@ impl crate::diffusion::DiffusionSession for DiffusionSess {
         match self {
             DiffusionSess::Cpu(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
             DiffusionSess::Vulkan(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
+            #[cfg(target_os = "macos")]
+            DiffusionSess::Metal(s) => s.denoise(model, canvas_tokens, sc_logits, temp_inv),
         }
     }
 }
 
-/// diffusion-gemma (Phase 3 — block text-diffusion, see `docs/DIFFUSIONGEMMA.md` and
-/// `crate::diffusion`): the entropy-bound decode loop over a persistent session, Vulkan by default
-/// or the CPU reference backend under `INFR_CPU`/`INFR_METAL` (no Metal session exists for this
-/// arch yet — Phase 2 only built CPU/Vulkan). The session is opened lazily on the first turn (its
-/// KV cache is sized once the model's `n_ctx_train`/`INFR_MAX_CTX` is known) and stays open across
-/// turns: multi-turn REPL re-sends the WHOLE running token stream as the "prefix" each turn, and
-/// the session's own prefix-diff prefill (see `DiffusionGemmaCpuSession::prefill`'s doc) re-sends
-/// only the un-cached suffix, exactly like every other seam session on this crate.
+/// Which backend [`DiffusionGemmaChat`] opens its session on — decided at construction, before a
+/// session is ever opened (mirrors `DiffusionSess`'s three variants).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DgBackend {
+    Vulkan,
+    Cpu,
+    Metal,
+}
+
+/// diffusion-gemma (Phase 3/D — block text-diffusion, see `docs/DIFFUSIONGEMMA.md` and
+/// `crate::diffusion`): the entropy-bound decode loop over a persistent session, Vulkan by
+/// default, or the CPU/Metal reference backends under `INFR_CPU`/`INFR_METAL` (Phase D added the
+/// Metal DG session — macOS only; the non-macOS build still compiles `new_metal`, `generate`
+/// errors clearly at runtime instead, matching every other INFR_METAL backend on this crate). The
+/// session is opened lazily on the first turn (its KV cache is sized once the model's
+/// `n_ctx_train`/`INFR_MAX_CTX` is known) and stays open across turns: multi-turn REPL re-sends
+/// the WHOLE running token stream as the "prefix" each turn, and the session's own prefix-diff
+/// prefill (see `DiffusionGemmaCpuSession::prefill`'s doc) re-sends only the un-cached suffix,
+/// exactly like every other seam session on this crate.
 pub struct DiffusionGemmaChat {
     model: CpuModel,
-    cpu: bool,
+    backend: DgBackend,
     sess: Option<DiffusionSess>,
     max_ctx: usize,
 }
@@ -660,7 +679,7 @@ impl DiffusionGemmaChat {
     pub fn new(model: CpuModel) -> Self {
         Self {
             model,
-            cpu: false,
+            backend: DgBackend::Vulkan,
             sess: None,
             max_ctx: 0,
         }
@@ -670,7 +689,18 @@ impl DiffusionGemmaChat {
     pub fn new_cpu(model: CpuModel) -> Self {
         Self {
             model,
-            cpu: true,
+            backend: DgBackend::Cpu,
+            sess: None,
+            max_ctx: 0,
+        }
+    }
+
+    /// Reference Metal session (`INFR_METAL=1`, Phase D). Compiles on every target (like
+    /// `CpuDenseChat::new_metal`) — the macOS check happens in `generate`, at session-open time.
+    pub fn new_metal(model: CpuModel) -> Self {
+        Self {
+            model,
+            backend: DgBackend::Metal,
             sess: None,
             max_ctx: 0,
         }
@@ -724,10 +754,25 @@ impl ChatModel for DiffusionGemmaChat {
                 .unwrap_or_else(|| cfg.n_ctx_train.min(8192))
                 .max(needed);
             self.max_ctx = max_ctx;
-            self.sess = Some(if self.cpu {
-                DiffusionSess::Cpu(self.model.diffusion_gemma_cpu_session(max_ctx))
-            } else {
-                DiffusionSess::Vulkan(self.model.diffusion_gemma_vulkan_session(max_ctx)?)
+            self.sess = Some(match self.backend {
+                DgBackend::Cpu => {
+                    DiffusionSess::Cpu(self.model.diffusion_gemma_cpu_session(max_ctx))
+                }
+                DgBackend::Vulkan => {
+                    DiffusionSess::Vulkan(self.model.diffusion_gemma_vulkan_session(max_ctx)?)
+                }
+                DgBackend::Metal => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        DiffusionSess::Metal(self.model.diffusion_gemma_metal_session(max_ctx)?)
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        return Err(anyhow::anyhow!(
+                            "the Metal backend is only available on macOS"
+                        ));
+                    }
+                }
             });
         }
 

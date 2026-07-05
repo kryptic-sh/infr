@@ -166,6 +166,88 @@ ATTNSPLIT_KERNEL(attnsplit_f16kv, half, 8u, 256u)
 ATTNSPLIT_KERNEL(attnsplit32_f32, float, 32u, 128u)
 ATTNSPLIT_KERNEL(attnsplit32_f16kv, half, 32u, 128u)
 
+// ---- Canvas split-KV attention (DiffusionGemma denoise, `AttnMask::Canvas` —
+// docs/DIFFUSIONGEMMA.md): EVERY row attends the SAME fixed bidirectional `[lo, kv_len)` reach,
+// unlike ATTNSPLIT_KERNEL above (and every other kernel in this file), which derives a per-row
+// causal end from `pos + ti` and an optional sliding-window `lo`. Repurposing ATTNSPLIT_KERNEL's
+// fields with a sentinel would risk colliding with a genuine non-canvas dispatch (both would see
+// a nonzero `p.kv_len`, since that field — while dead in ATTNSPLIT_KERNEL — is always sent as the
+// real cache length by the ordinary routing path), so this is a DEDICATED kernel that never serves
+// a non-canvas caller: `p.pos` carries the fixed `hi = kv_len - 1` (identical for every row,
+// instead of `pos + ti`) and `p.kv_len` carries `lo` directly (not the cache length). Otherwise
+// identical split-KV structure (NSG simdgroups per (query, head), merged through threadgroup
+// memory) — see ATTNSPLIT_KERNEL's doc for the shape rationale.
+// UNVERIFIED: ported from the Vulkan `attn_partial.comp` canvas branch (`attention_kv_split`'s
+// `canvas_lo` push field, `adapter.rs`) — Metal is Phase D's blind backend for this mask, never
+// run on hardware; CPU + Vulkan remain the validated references.
+#define ATTNSPLIT_CANVAS_KERNEL(NAME, KVT, NSG, MAXHD)                                             \
+kernel void NAME(device const float* q   [[buffer(0)]],                                           \
+                 device const KVT*   k   [[buffer(1)]],                                           \
+                 device const KVT*   v   [[buffer(2)]],                                           \
+                 device float*       dst [[buffer(3)]],                                           \
+                 constant AttnParams& p  [[buffer(4)]],                                           \
+                 uint3 tgpig [[threadgroup_position_in_grid]],                                    \
+                 uint sgid [[simdgroup_index_in_threadgroup]],                                    \
+                 uint lane [[thread_index_in_simdgroup]]) {                                       \
+    uint tg = tgpig.x;                                                                            \
+    if (tg >= p.rows * p.n_head) return;   /* uniform per threadgroup — safe with the barrier */  \
+    uint h = tg % p.n_head;                                                                       \
+    uint group = p.n_head / p.n_kv;                                                               \
+    uint kvh = h / group;                                                                         \
+    uint qb = tg * p.head_dim;                                                                    \
+    uint hi = p.pos;      /* fixed for every row: kv_len - 1, NOT pos + ti */                      \
+    uint lo = p.kv_len;   /* fixed for every row: the mask's lo, NOT the cache length */           \
+                                                                                                  \
+    float acc[MAXHD / 32u];                                                                       \
+    for (uint t = 0; t < MAXHD / 32u; t++) acc[t] = 0.0f;                                         \
+    float m = -INFINITY, l = 0.0f;                                                                \
+    for (uint j = lo + sgid; j <= hi; j += NSG) {                                                 \
+        uint kb = (j * p.n_kv + kvh) * p.head_dim;                                                \
+        float part = 0.0f;                                                                        \
+        for (uint d = lane; d < p.head_dim; d += 32u) part += q[qb + d] * (float)k[kb + d];       \
+        float sc = simd_sum(part) * p.scale;                                                      \
+        float mnew = max(m, sc);                                                                  \
+        float corr = exp(m - mnew);                                                               \
+        float pw = exp(sc - mnew);                                                                \
+        l = l * corr + pw;                                                                        \
+        uint t = 0;                                                                               \
+        for (uint d = lane; d < p.head_dim; d += 32u) {                                           \
+            acc[t] = acc[t] * corr + pw * (float)v[kb + d];                                       \
+            t++;                                                                                  \
+        }                                                                                         \
+        m = mnew;                                                                                 \
+    }                                                                                             \
+    /* Merge the NSG partials. A simdgroup whose slice was empty has l==0 (skip; its m is -inf) */ \
+    threadgroup float tg_m[NSG], tg_l[NSG], tg_acc[NSG * MAXHD];                                  \
+    if (lane == 0u) { tg_m[sgid] = m; tg_l[sgid] = l; }                                           \
+    uint t = 0;                                                                                   \
+    for (uint d = lane; d < p.head_dim; d += 32u) {                                               \
+        tg_acc[sgid * p.head_dim + d] = acc[t];                                                   \
+        t++;                                                                                      \
+    }                                                                                             \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                              \
+    if (sgid == 0u) {                                                                             \
+        float gm = -INFINITY;                                                                     \
+        for (uint i = 0; i < NSG; i++) if (tg_l[i] > 0.0f) gm = max(gm, tg_m[i]);                 \
+        float gl = 0.0f;                                                                          \
+        float w[NSG];                                                                             \
+        for (uint i = 0; i < NSG; i++) {                                                          \
+            w[i] = (tg_l[i] > 0.0f) ? exp(tg_m[i] - gm) : 0.0f;                                   \
+            gl += tg_l[i] * w[i];                                                                 \
+        }                                                                                         \
+        for (uint d = lane; d < p.head_dim; d += 32u) {                                           \
+            float s = 0.0f;                                                                       \
+            for (uint i = 0; i < NSG; i++) s += tg_acc[i * p.head_dim + d] * w[i];                \
+            dst[qb + d] = s / gl;                                                                 \
+        }                                                                                         \
+    }                                                                                             \
+}
+
+ATTNSPLIT_CANVAS_KERNEL(attention_canvas_f32, float, 8u, 256u)
+ATTNSPLIT_CANVAS_KERNEL(attention_canvas_f16kv, half, 8u, 256u)
+ATTNSPLIT_CANVAS_KERNEL(attention_canvas32_f32, float, 32u, 128u)
+ATTNSPLIT_CANVAS_KERNEL(attention_canvas32_f16kv, half, 32u, 128u)
+
 // ---- Half-fragment flash attention for prefill (f16 KV cache, hd <= 128, hd % 8 == 0): one
 // simdgroup per (8-query tile, head). Unlike the earlier f32 simdgroup_matrix attempt (built,
 // benched, lost to the scalar split-KV kernel, removed), there is NO staging: K^T and V 8x8

@@ -435,18 +435,28 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // Chat-default sampling for every backend (the bespoke branch reads the same envs below).
     set_default_sampling_env();
     let model: Box<dyn infr_llama::model::ChatModel + '_> = if is_dg {
-        // diffusion-gemma (Phase 3): the entropy-bound block-diffusion loop (`infr_llama::diffusion`)
-        // over a persistent session — Vulkan by default, CPU under INFR_CPU like every other arch.
-        // No Metal session exists for this arch yet (Phase 2 only built CPU/Vulkan) — fall through
-        // to the CPU reference backend under INFR_METAL rather than hard-erroring.
-        let cpu = std::env::var("INFR_CPU").is_ok() || std::env::var("INFR_METAL").is_ok();
+        // diffusion-gemma (Phase 3/D): the entropy-bound block-diffusion loop
+        // (`infr_llama::diffusion`) over a persistent session — Vulkan by default, CPU under
+        // INFR_CPU, Metal under INFR_METAL (Phase D added the Metal DG session; macOS only — the
+        // non-macOS build still compiles this arm, `DiffusionGemmaChat::generate` errors clearly
+        // at runtime there instead, matching every other INFR_METAL arm's convention).
+        let cpu = std::env::var("INFR_CPU").is_ok();
+        let metal = std::env::var("INFR_METAL").is_ok();
         eprintln!(
             "[{} — diffusion-gemma entropy-bound block decode]",
-            if cpu { "cpu backend" } else { "vulkan seam" }
+            if cpu {
+                "cpu backend"
+            } else if metal {
+                "metal backend"
+            } else {
+                "vulkan seam"
+            }
         );
         let loaded = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
         Box::new(if cpu {
             infr_llama::model::DiffusionGemmaChat::new_cpu(loaded)
+        } else if metal {
+            infr_llama::model::DiffusionGemmaChat::new_metal(loaded)
         } else {
             infr_llama::model::DiffusionGemmaChat::new(loaded)
         })
@@ -735,19 +745,15 @@ fn cmd_bench(
         })
         .transpose()?;
     let (gguf, tok) = resolve(model)?;
-    // diffusion-gemma (Phase 4, docs/DIFFUSIONGEMMA.md): llama-bench has no diffusion mode, so
+    // diffusion-gemma (Phase 4/D, docs/DIFFUSIONGEMMA.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
     // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
     // Backend selection mirrors `cmd_run`/`cmd_serve`: -ngl 0 or INFR_CPU picks the CPU reference
-    // session; INFR_METAL falls back to CPU too (no Metal DG session exists yet — Phase 2 only
-    // built CPU/Vulkan).
+    // session; INFR_METAL (or --dev Metal) picks the Metal session (Phase D — macOS only, see
+    // `cmd_bench_diffusion_gemma`'s own cfg-gated dispatch).
     if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
         let metal = std::env::var("INFR_METAL").is_ok() || dev.eq_ignore_ascii_case("metal");
-        if metal {
-            eprintln!(
-                "[diffusion-gemma bench] no Metal session for this arch yet — falling back to the CPU reference backend"
-            );
-        }
+        let cpu = ngl == 0 || std::env::var("INFR_CPU").is_ok();
         if ubatch > 0 {
             std::env::set_var("INFR_UBATCH", ubatch.to_string());
         }
@@ -759,7 +765,8 @@ fn cmd_bench(
             depth,
             pg,
             reps,
-            ngl == 0 || metal || std::env::var("INFR_CPU").is_ok(),
+            cpu,
+            metal,
             json,
         );
     }
@@ -1071,6 +1078,9 @@ fn cmd_bench_diffusion_gemma(
     pg: Option<(usize, usize)>,
     reps: usize,
     cpu: bool,
+    // Phase D: the Metal DG session (macOS only — see the `one_rep!` dispatch below). `cpu` wins
+    // if both are set (matches `cmd_run`/`cmd_serve`'s precedence).
+    metal: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     use infr_llama::diffusion::{diffusion_generate, EbConfig};
@@ -1170,13 +1180,30 @@ fn cmd_bench_diffusion_gemma(
         }
         if cpu {
             one_rep!(model.diffusion_gemma_cpu_session(max_ctx));
+        } else if metal {
+            // Phase D: Metal DG session, macOS only — the non-macOS build still compiles this
+            // arm (errors clearly at runtime instead), matching every other INFR_METAL arm.
+            #[cfg(target_os = "macos")]
+            {
+                one_rep!(model.diffusion_gemma_metal_session(max_ctx)?);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                anyhow::bail!("the Metal backend is only available on macOS");
+            }
         } else {
             one_rep!(model.diffusion_gemma_vulkan_session(max_ctx)?);
         }
     }
 
     let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
-    let tag = if cpu { " [cpu]" } else { "" };
+    let tag = if cpu {
+        " [cpu]"
+    } else if metal {
+        " [metal]"
+    } else {
+        ""
+    };
     if json {
         let a = if n_gen > 0 { avg(&gens) } else { avg(&pps) };
         println!("[{{\"avg_ts\": {a:.2}}}]");
@@ -1578,11 +1605,14 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     let use_old_seam = is_q35 && std::env::var("INFR_QWEN35_OLD").is_ok();
     let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let mut m: Box<dyn infr_llama::model::ChatModel + Send> = if is_dg {
-        // diffusion-gemma (Phase 3): same selection as `cmd_run` — see its matching comment.
-        let cpu = std::env::var("INFR_CPU").is_ok() || std::env::var("INFR_METAL").is_ok();
+        // diffusion-gemma (Phase 3/D): same selection as `cmd_run` — see its matching comment.
+        let cpu = std::env::var("INFR_CPU").is_ok();
+        let metal = std::env::var("INFR_METAL").is_ok();
         let loaded = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
         Box::new(if cpu {
             infr_llama::model::DiffusionGemmaChat::new_cpu(loaded)
+        } else if metal {
+            infr_llama::model::DiffusionGemmaChat::new_metal(loaded)
         } else {
             infr_llama::model::DiffusionGemmaChat::new(loaded)
         })

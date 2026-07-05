@@ -2115,23 +2115,43 @@ impl MetalBackend {
                 let vbuf = metal_buf(bindings.get(v_cache).expect("metal: unbound v_cache"));
                 let bq = self.ensure_device(r, q);
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
+                // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md, `AttnMask::Canvas`):
+                // EVERY row attends the SAME fixed bidirectional `[lo, kv_len)`, ignoring its own
+                // causal position entirely. `window` stays meaningless for it (the dedicated
+                // canvas kernel below never reads the field) — extract `lo` separately and route
+                // around the ordinary flash/split/vec tiers further down (see `canvas_lo`'s use).
+                let canvas_lo = match mask {
+                    infr_core::graph::AttnMask::Canvas { lo } => Some(lo),
+                    _ => None,
+                };
                 let window: u32 = match mask {
                     infr_core::graph::AttnMask::Causal => 0,
                     infr_core::graph::AttnMask::SlidingWindow(w) => w as u32,
-                    // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md): every row attends
-                    // the SAME fixed bidirectional `[lo, kv_len)`, not a per-row causal/SWA
-                    // window — none of the kernel tiers below (all built around a per-row causal
-                    // END) implement that reach yet. Fail loudly rather than silently run a
-                    // causal-shaped kernel over a bidirectional mask (Metal is Phase 2's
-                    // blind/unverified backend — CPU + Vulkan are the validated ones).
-                    infr_core::graph::AttnMask::Canvas { .. } => {
-                        return Err(Error::Unsupported(
-                            "metal attention: AttnMask::Canvas (DiffusionGemma denoise) has no \
-                             Metal kernel yet — CPU/Vulkan only so far"
-                                .into(),
-                        ));
-                    }
+                    infr_core::graph::AttnMask::Canvas { .. } => 0,
                 };
+                // Canvas is a denoise-prefill mask, never autoregressive decode, so it should
+                // never reach the record-once replay tape (rows==1, dyn-pos) — no dyn-pos canvas
+                // kernel exists. Fail loudly instead of silently running the wrong (causal) tape.
+                if canvas_lo.is_some() && r.posbuf.is_some() {
+                    return Err(Error::Unsupported(
+                        "metal attention: AttnMask::Canvas on a decode-replay tape is unexpected \
+                         (canvas is a denoise-prefill mask) — no dyn-pos canvas kernel exists"
+                            .into(),
+                    ));
+                }
+                // Q8_0's attention family (attention_q8kv/attnvec_q8kv/attnflash2_q8kv_*) has no
+                // split-canvas sibling — only the f16 path below (native cache or the
+                // dequant-prepass scratch, which covers every other KV dtype) supports canvas.
+                if canvas_lo.is_some()
+                    && (g.desc(k_cache).dtype == DType::Q8_0
+                        || g.desc(v_cache).dtype == DType::Q8_0)
+                {
+                    return Err(Error::Unsupported(
+                        "metal attention: AttnMask::Canvas over a Q8_0 KV cache has no kernel yet \
+                         — f16 cache (native or block-quant dequant-prepassed) only so far"
+                            .into(),
+                    ));
+                }
                 if let Some(posbuf) = r.posbuf.clone() {
                     // Recording a replay tape (rows==1, f16/q8/coupled-q4_0/iq4_nl cache, hd
                     // 64/128/256 — checked by the gate): route straight to the dynamic-pos
@@ -2208,7 +2228,10 @@ impl MetalBackend {
                 // No kv_len floor: the replay tape's dyn kernel reads natively from token 1, so
                 // the static walk must too — a shallow-kv prepass here would make replay-on/off
                 // decode diverge (f16 scratch rounding vs exact f32) on the earliest tokens.
-                if kdt == vdt && rows <= 8 {
+                // Canvas never takes this fast path: `nat4_kern` reads `pos + ti`/`window` like
+                // every other non-canvas kernel here, with no notion of a per-row-independent
+                // `[lo, kv_len)` reach.
+                if kdt == vdt && rows <= 8 && canvas_lo.is_none() {
                     if let Some(kern) = nat4_kern() {
                         let nsg = if hd == 256 { 16 } else { 32 };
                         let cap_ok = self
@@ -2378,6 +2401,72 @@ impl MetalBackend {
                 // so it was dropped.)
                 // Prepassed quant KV reads an f16 scratch, so it takes the f16 attention path too.
                 let f16 = g.desc(k_cache).dtype == DType::F16 || prep_active;
+                // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md, `AttnMask::Canvas`):
+                // route straight to the dedicated split-KV canvas kernel (`ATTNSPLIT_CANVAS_KERNEL`
+                // in attention.metal) instead of the flash/vec/plain routing below — none of those
+                // tiers can express a bound that's the SAME for every row regardless of its own
+                // position. Mirrors the Vulkan adapter forcing the split-K tier whenever
+                // `canvas_lo` is set (`adapter.rs`'s `split_ok`/`canvas_lo` handling). `k_raw`/
+                // `v_raw` above already resolve to an f16 view for every KV dtype this reaches
+                // (Q8_0 was rejected earlier — no split-canvas sibling for it yet).
+                // UNVERIFIED: this whole branch is Phase D's blind Metal work — never run on
+                // hardware; CPU + Vulkan remain the validated references for Canvas.
+                if let Some(lo) = canvas_lo {
+                    let split32_name = if f16 {
+                        "attention_canvas32_f16kv"
+                    } else {
+                        "attention_canvas32_f32"
+                    };
+                    let split_name = if f16 {
+                        "attention_canvas_f16kv"
+                    } else {
+                        "attention_canvas_f32"
+                    };
+                    // Same threadgroup-cap gating as the ordinary split32/split kernels below
+                    // (maxTotalThreadsPerThreadgroup is per-pipeline; a paravirtual/CI device can
+                    // cap it below the 32-wide kernel's 1024 threads, degrading to the 8-wide one).
+                    let fits = |name: &'static str, threads: u64| -> Result<bool> {
+                        Ok(self
+                            .pipelines
+                            .get(name)?
+                            .max_total_threads_per_threadgroup()
+                            >= threads)
+                    };
+                    let (kern, nsg) = if hd <= 128 && fits(split32_name, 1024)? {
+                        (split32_name, 32usize)
+                    } else if fits(split_name, 256)? {
+                        (split_name, 8usize)
+                    } else {
+                        return Err(Error::Unsupported(format!(
+                            "metal attention: canvas split kernel {split_name} doesn't fit this \
+                             device's threadgroup cap"
+                        )));
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    // Repurposed `kv_len` slot (dead in this kernel — see the macro's doc): the
+                    // canvas `lo`, identical for every row.
+                    p.extend_from_slice(&(lo as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                    p.extend_from_slice(&(nkv as u32).to_ne_bytes());
+                    p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    // window: unread by this kernel.
+                    p.extend_from_slice(&0u32.to_ne_bytes());
+                    // Repurposed `pos` slot: the fixed causal end `kv_len - 1`, identical for
+                    // every row (not `pos + ti`).
+                    p.extend_from_slice(&((kv_len - 1) as u32).to_ne_bytes());
+                    self.encode_tg(
+                        r,
+                        &pso,
+                        &[bq.as_ref(), k_raw, v_raw, bd.as_ref()],
+                        &p,
+                        rows * nh * nsg * 32,
+                        nsg * 32,
+                    );
+                    r.loc[dst.0 as usize] = Loc::Device;
+                    return Ok(());
+                }
                 // Wide launches on an f16 cache take the half-fragment flash kernel: K^T/V
                 // fragments load straight from the cache, Q is cast once to f16 below. Small
                 // kv_len stays scalar (also keeps the short-kv wide parity test on the exact

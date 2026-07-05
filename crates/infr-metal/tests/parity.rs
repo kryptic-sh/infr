@@ -2368,3 +2368,80 @@ fn copy_parity() {
     let bound = vec![(src, f32_bytes(&rand_f32(n, 5)))];
     assert_parity(&g, &bound, dst, n, 0.0);
 }
+
+// ---- DiffusionGemma canvas denoise (Phase D — docs/DIFFUSIONGEMMA.md, `AttnMask::Canvas`) ----
+// Metal's blind implementation (attention_canvas*/attention_canvas32* in attention.metal, see
+// exec.rs's `canvas_lo` routing) checked against the CPU reference — the SAME numeric-parity
+// contract every other attention tier in this file gets. Unlike a bare "doesn't return
+// Unsupported" smoke test, this actually exercises the fixed-`[lo, kv_len)`-for-every-row math on
+// real hardware whenever one is present (still `#[ignore]`d off CI, like every other GPU test
+// here). `lo` here is an arbitrary fixed split (not derived from a real prompt/SWA-window pair) —
+// the mask doesn't care, it's just a row-independent bound.
+
+// hd=128: routes to the NSG=32 kernel (attention_canvas32_f16kv — hd <= 128 and the device's
+// threadgroup cap fits 1024 threads).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_canvas_split32_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, lo) = (32usize, 136usize, 8usize, 2usize, 128usize, 40usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Canvas { lo },
+        // `pos` is unused by Canvas (every row's bound is `[lo, kv_len)` regardless of position)
+        // — 0 here matches how the denoise call site sizes it (see `Op::Attention`'s doc).
+        pos: 0,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 501))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 502))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 503))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
+// hd=256 (gemma-shaped): hd > 128 excludes the NSG=32 kernel — routes to attention_canvas_f16kv
+// (NSG=8, MAXHD=256) instead.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_canvas_split8_hd256_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, lo) = (17usize, 200usize, 4usize, 1usize, 256usize, 60usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Canvas { lo },
+        pos: 0,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 511))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 512))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 513))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}

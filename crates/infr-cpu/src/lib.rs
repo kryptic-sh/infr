@@ -2100,7 +2100,7 @@ unsafe fn vec_dot_q6k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw")]
+#[target_feature(enable = "avx512bw,avx512vnni")]
 unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -2109,7 +2109,6 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
     let mask_0f_z = _mm512_set1_epi8(0x0F_u8 as i8);
     let mask_30_z = _mm512_set1_epi8(0x30_u8 as i8);
     let mask_03_z = _mm512_set1_epi8(0x03_u8 as i8);
-    let ones_i16_z = _mm512_set1_epi16(1i16);
 
     // Pre-expand Q6 both halves simultaneously via zmm, store to q6_flat.
     // flat[b*256 + half*128 + ci*32..+32] = q6 column ci for half.
@@ -2191,10 +2190,13 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
             let a1 = _mm512_loadu_si512(qs[64..].as_ptr() as *const __m512i);
             let a2 = _mm512_loadu_si512(qs[128..].as_ptr() as *const __m512i);
             let a3 = _mm512_loadu_si512(qs[192..].as_ptr() as *const __m512i);
-            let s0 = _mm512_madd_epi16(_mm512_maddubs_epi16($w0, a0), ones_i16_z);
-            let s1 = _mm512_madd_epi16(_mm512_maddubs_epi16($w1, a1), ones_i16_z);
-            let s2 = _mm512_madd_epi16(_mm512_maddubs_epi16($w2, a2), ones_i16_z);
-            let s3 = _mm512_madd_epi16(_mm512_maddubs_epi16($w3, a3), ones_i16_z);
+            // dpbusd: one op per 64-byte chunk instead of the maddubs+madd pair —
+            // integer-exact both ways (u8≤63 × i8 groups can't saturate the i16 pairs).
+            let z = _mm512_setzero_si512();
+            let s0 = _mm512_dpbusd_epi32(z, $w0, a0);
+            let s1 = _mm512_dpbusd_epi32(z, $w1, a1);
+            let s2 = _mm512_dpbusd_epi32(z, $w2, a2);
+            let s3 = _mm512_dpbusd_epi32(z, $w3, a3);
             let c0 = _mm512_add_epi32(s0, _mm512_permutexvar_epi32(idx_pair, s0));
             let c0 = _mm512_add_epi32(c0, _mm512_permutexvar_epi32(idx_half, c0));
             let c1 = _mm512_add_epi32(s1, _mm512_permutexvar_epi32(idx_pair, s1));
@@ -2264,7 +2266,7 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
 fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
             return unsafe { vec_dot_q6k_batch_avx512bw(row, q8s, in_f, out) };
         }
         if is_x86_feature_detected!("avx2") {

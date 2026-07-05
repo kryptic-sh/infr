@@ -894,12 +894,15 @@ fn llama32_1b() -> Option<PathBuf> {
 }
 
 // Captured + verified coherent: "Paris! 🇫🇷", a brave-knight short story (mournful Obsidian Peaks).
+// Knight hash re-blessed when dense Q5_0 Linear m>1 moved from the dequant+f32-dot fallback to
+// the int8 Q8x32 batch kernel (same regime as every other quantized dtype); output stayed
+// coherent, France-prompt hash unchanged.
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0x4597cda816a0d1e7),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0xe7c90b188b42cee0,
+        0x92fc5eeefb169094,
     ),
 ];
 

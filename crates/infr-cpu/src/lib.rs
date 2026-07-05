@@ -3952,6 +3952,20 @@ impl Backend for CpuBackend {
                                 let row = &wbytes[o * bpr..o * bpr + bpr];
                                 vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
                             }
+                        } else if dt == DType::Q5_0 && in_f.is_multiple_of(32) {
+                            // Dense-layer Q5_0 (DG stores 16 of its 30 dense ffn_down weights as
+                            // Q5_0): reuse the MoE path's Q8x32-activation batch kernel. This
+                            // dtype previously fell through to the dequant+f32-dot fallback below
+                            // (~11% of every DG denoise step in the samply profile) — the switch
+                            // puts it on the same int8-quantized-activation regime every other
+                            // quantized dtype in this dispatch already uses.
+                            let q8s32: Vec<Q8x32> = (0..m)
+                                .map(|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]))
+                                .collect();
+                            out_t.par_chunks_mut(m).enumerate().for_each(|(o, chunk)| {
+                                let row = &wbytes[o * bpr..o * bpr + bpr];
+                                vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
+                            });
                         } else {
                             out_t.par_chunks_mut(m).enumerate().for_each(|(o, chunk)| {
                                 let row = &wbytes[o * bpr..o * bpr + bpr];

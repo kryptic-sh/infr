@@ -3416,6 +3416,7 @@ fn expert_acts_kind(dt: DType, in_f: usize, int8_ok: bool) -> ActsKind {
 /// exact tile boundaries (and therefore bit-identical per-element results) of a whole-bank call,
 /// no matter how a task list splits the range. The kernels and their dispatch mirror the old
 /// `expert_matvec_batch` fast paths 1/2 + fallback one-for-one.
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
 fn expert_gemm_range(
     wbytes: &[u8],

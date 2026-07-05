@@ -303,11 +303,15 @@ fn vec_dot_q6k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
                 }
             }
         }
-        let mut s = 0f32;
+        // INTEGER epilogue (llama.cpp's `ggml_vec_dot_q6_K_q8_K` shape): the scale-weighted
+        // sub-block dots accumulate exactly in i32 (|Σ| < 2^29, no overflow possible), ONE f32
+        // multiply per super-block — fewer roundings than the old per-sub f32 chain, and the
+        // i32 sum is order-free, so SIMD variants no longer need an order-pinned f32 tail.
+        let mut isum = 0i32;
         for sub in 0..16 {
-            s += scales[sub] as i8 as f32 * (sumi[sub] - 32 * bsum[sub]) as f32;
+            isum += scales[sub] as i8 as i32 * (sumi[sub] - 32 * bsum[sub]);
         }
-        sumf += d * q8.d[b] * s;
+        sumf += d * q8.d[b] * isum as f32;
     }
     sumf
 }
@@ -338,7 +342,7 @@ unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let d = rdf16(&blk[208..210]);
         let q8b = &q8.qs[b * 256..b * 256 + 256];
 
-        let mut s = 0f32;
+        let mut s = 0i32; // integer epilogue — see `vec_dot_q6k_scalar`
 
         // Process two halves (each 128 elements = 8 sub-blocks of 16).
         for half in 0..2usize {
@@ -416,11 +420,11 @@ unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 
                 let sub_0 = sco + ci * 2;
                 let sub_1 = sco + ci * 2 + 1;
-                s += scales[sub_0] as i8 as f32 * (iprod_0 - 32 * bs_0) as f32;
-                s += scales[sub_1] as i8 as f32 * (iprod_1 - 32 * bs_1) as f32;
+                s += scales[sub_0] as i8 as i32 * (iprod_0 - 32 * bs_0);
+                s += scales[sub_1] as i8 as i32 * (iprod_1 - 32 * bs_1);
             }
         }
-        sumf += d * q8.d[b] * s;
+        sumf += d * q8.d[b] * s as f32;
     }
     sumf
 }
@@ -530,12 +534,12 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             simd_bsum[8 + ci * 2 + 1] = hadd_i32_xmm(b_h1_hi);
         }
 
-        // Accumulate in sub 0..16 order — identical to scalar's final loop.
-        let mut s = 0f32;
+        // Integer epilogue — see `vec_dot_q6k_scalar` (i32 sum is order-free and exact).
+        let mut s = 0i32;
         for sub in 0..16 {
-            s += scales[sub] as i8 as f32 * (simd_sumi[sub] - 32 * simd_bsum[sub]) as f32;
+            s += scales[sub] as i8 as i32 * (simd_sumi[sub] - 32 * simd_bsum[sub]);
         }
-        sumf += d * q8.d[b] * s;
+        sumf += d * q8.d[b] * s as f32;
     }
     sumf
 }
@@ -1972,11 +1976,12 @@ fn vec_dot_q6k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]
                     bsum[sub] += v;
                 }
             }
-            let mut s = 0f32;
+            // Integer epilogue — see `vec_dot_q6k_scalar`.
+            let mut s = 0i32;
             for sub in 0..16 {
-                s += scales_arr[b * 16 + sub] as f32 * (sumi[sub] - 32 * bsum[sub]) as f32;
+                s += scales_arr[b * 16 + sub] as i32 * (sumi[sub] - 32 * bsum[sub]);
             }
-            sumf += d_arr[b] * q8.d[b] * s;
+            sumf += d_arr[b] * q8.d[b] * s as f32;
         }
         out[r] = sumf;
     }
@@ -2056,7 +2061,7 @@ unsafe fn vec_dot_q6k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             let flat = &q6_flat[b * 256..b * 256 + 256];
             let q8b = &q8.qs[b * 256..b * 256 + 256];
 
-            let mut s = 0f32;
+            let mut s = 0i32; // integer epilogue — see `vec_dot_q6k_scalar`
             for half in 0..2usize {
                 let sco = half * 8;
                 let base = half * 128;
@@ -2084,11 +2089,11 @@ unsafe fn vec_dot_q6k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 
                     let sub_0 = sco + ci * 2;
                     let sub_1 = sco + ci * 2 + 1;
-                    s += scales_arr[b * 16 + sub_0] as f32 * (iprod_0 - 32 * bs_0) as f32;
-                    s += scales_arr[b * 16 + sub_1] as f32 * (iprod_1 - 32 * bs_1) as f32;
+                    s += scales_arr[b * 16 + sub_0] as i32 * (iprod_0 - 32 * bs_0);
+                    s += scales_arr[b * 16 + sub_1] as i32 * (iprod_1 - 32 * bs_1);
                 }
             }
-            sumf += d * q8.d[b] * s;
+            sumf += d * q8.d[b] * s as f32;
         }
         out[r] = sumf;
     }
@@ -2180,7 +2185,7 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
     // One row's integer dots for super-block `b` against the four preloaded weight chunks:
     // sumi16[s] = Σ_{i∈sub-block s} q6[i]·q8[i] (q6 still biased +32 — corrected in the epilogue).
     macro_rules! q6k_sumi16 {
-        ($q8:expr, $b:expr, $w0:expr, $w1:expr, $w2:expr, $w3:expr, $sumi16:expr) => {{
+        ($q8:expr, $b:expr, $w0:expr, $w1:expr, $w2:expr, $w3:expr) => {{
             let qs = &$q8.qs[$b * 256..$b * 256 + 256];
             let a0 = _mm512_loadu_si512(qs.as_ptr() as *const __m512i);
             let a1 = _mm512_loadu_si512(qs[64..].as_ptr() as *const __m512i);
@@ -2200,24 +2205,21 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
             let c3 = _mm512_add_epi32(c3, _mm512_permutexvar_epi32(idx_half, c3));
             let lo = _mm512_permutex2var_epi32(c0, idx_q14, c1); // subs 0..7 in lanes 0..7
             let hi = _mm512_permutex2var_epi32(c2, idx_q14, c3); // subs 8..15 in lanes 0..7
-            let all = _mm512_permutex2var_epi32(lo, idx_cat, hi);
-            _mm512_storeu_si512($sumi16.as_mut_ptr() as *mut __m512i, all);
+            _mm512_permutex2var_epi32(lo, idx_cat, hi)
         }};
     }
-    // The UNCHANGED f32 epilogue: s accumulated over ascending sub-blocks, then d·d8·s.
+    // INTEGER epilogue in SIMD (see `vec_dot_q6k_scalar`): `Σ_s sc_s·(dp_s − 32·bsum_s)` fully
+    // in 16 i32 lanes (mullo + one reduce), replacing the order-pinned 16-step scalar f32 chain
+    // that used to dominate this kernel's critical path.
     macro_rules! q6k_epilogue {
-        ($q8:expr, $b:expr, $sumi16:expr, $sumf:expr) => {{
-            let bs = &$q8.bsums16[$b * 16..$b * 16 + 16];
-            let mut s = 0f32;
-            for sub in 0..16 {
-                s += scales_arr[$b * 16 + sub] as f32 * ($sumi16[sub] - 32 * bs[sub]) as f32;
-            }
-            $sumf += d_arr[$b] * $q8.d[$b] * s;
+        ($q8:expr, $b:expr, $sumi_z:expr, $scales_z:expr, $sumf:expr) => {{
+            let bs = _mm512_loadu_si512($q8.bsums16[$b * 16..].as_ptr() as *const __m512i);
+            let corr = _mm512_sub_epi32($sumi_z, _mm512_slli_epi32::<5>(bs));
+            let isum = _mm512_reduce_add_epi32(_mm512_mullo_epi32(corr, $scales_z));
+            $sumf += d_arr[$b] * $q8.d[$b] * isum as f32;
         }};
     }
 
-    let mut sumi16_a = [0i32; 16];
-    let mut sumi16_b = [0i32; 16];
     for rp in 0..m / 2 {
         let (ra, rb) = (2 * rp, 2 * rp + 1);
         let (q8a, q8b) = (&q8s[ra], &q8s[rb]);
@@ -2228,10 +2230,13 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
             let w1 = _mm512_loadu_si512(flat[64..].as_ptr() as *const __m512i);
             let w2 = _mm512_loadu_si512(flat[128..].as_ptr() as *const __m512i);
             let w3 = _mm512_loadu_si512(flat[192..].as_ptr() as *const __m512i);
-            q6k_sumi16!(q8a, b, w0, w1, w2, w3, sumi16_a);
-            q6k_sumi16!(q8b, b, w0, w1, w2, w3, sumi16_b);
-            q6k_epilogue!(q8a, b, sumi16_a, sumf_a);
-            q6k_epilogue!(q8b, b, sumi16_b, sumf_b);
+            let sc_z = _mm512_cvtepi8_epi32(_mm_loadu_si128(
+                scales_arr[b * 16..].as_ptr() as *const __m128i
+            ));
+            let sumi_a = q6k_sumi16!(q8a, b, w0, w1, w2, w3);
+            let sumi_b = q6k_sumi16!(q8b, b, w0, w1, w2, w3);
+            q6k_epilogue!(q8a, b, sumi_a, sc_z, sumf_a);
+            q6k_epilogue!(q8b, b, sumi_b, sc_z, sumf_b);
         }
         out[ra] = sumf_a;
         out[rb] = sumf_b;
@@ -2246,8 +2251,11 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
             let w1 = _mm512_loadu_si512(flat[64..].as_ptr() as *const __m512i);
             let w2 = _mm512_loadu_si512(flat[128..].as_ptr() as *const __m512i);
             let w3 = _mm512_loadu_si512(flat[192..].as_ptr() as *const __m512i);
-            q6k_sumi16!(q8, b, w0, w1, w2, w3, sumi16_a);
-            q6k_epilogue!(q8, b, sumi16_a, sumf);
+            let sc_z = _mm512_cvtepi8_epi32(_mm_loadu_si128(
+                scales_arr[b * 16..].as_ptr() as *const __m128i
+            ));
+            let sumi = q6k_sumi16!(q8, b, w0, w1, w2, w3);
+            q6k_epilogue!(q8, b, sumi, sc_z, sumf);
         }
         out[r] = sumf;
     }

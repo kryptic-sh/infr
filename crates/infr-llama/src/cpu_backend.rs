@@ -1032,9 +1032,10 @@ fn diffusion_self_cond(
     // gemma's 262k vocab) once per canvas row — cc=256 rows ≈ 540 GB of DRAM traffic, which alone
     // was ~47% of every denoise step. Instead each `SC_VT`-row embedding tile (SC_VT·ne·4 B ≈
     // 16 MB — L3-resident) is consumed by ALL cc rows while hot, so the table streams from DRAM
-    // ONCE per step. Bit-identical to the naive loop: for a fixed (row, e) the accumulation still
-    // visits v in ascending order (tiles ascend, v ascends within a tile), and the `p == 0.0`
-    // skip is preserved — no FP reassociation anywhere.
+    // ONCE per step. The accumulation uses FMA (`mul_add`): once the tiling made this loop
+    // compute-bound, the unfused mul+add pair was the ceiling — the reference (llama.cpp) runs
+    // this very matmul as f16 weights with FMA accumulation, so f32+FMA is strictly MORE precise
+    // than upstream. Per-(row, e) accumulation order over v is still fixed (ascending).
     let mut soft_all = vec![0f32; cc * ne];
     const SC_VT: usize = 2048;
     for t0 in (0..vocab).step_by(SC_VT) {
@@ -1051,7 +1052,7 @@ fn diffusion_self_cond(
                     }
                     let row_e = &token_embd[v * ne..v * ne + ne];
                     for (s, &e) in sr.iter_mut().zip(row_e) {
-                        *s += p * e;
+                        *s = e.mul_add(p, *s);
                     }
                 }
             });
@@ -1103,7 +1104,7 @@ fn diffusion_self_cond(
         for (f, &w) in drow.iter().enumerate() {
             let arow = &act_t[f * cc..(f + 1) * cc];
             for (a, &x) in acc.iter_mut().zip(arow) {
-                *a += w * x;
+                *a = x.mul_add(w, *a);
             }
         }
     });

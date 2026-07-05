@@ -1723,6 +1723,166 @@ unsafe fn q4k_gemm_group(pg: &Q4kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f
     }
 }
 
+/// [`Q4kPackGroup`]'s Q6_K sibling: 16 sub-blocks of 16 (2 qwords each) instead of 8×32, int8
+/// scales instead of the 6-bit sc/min pairs, and no min term — the `-32` offset rides the
+/// activation `bsums16` at GEMM time (split as `-16·bsum` per pair lane, integer-exact).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+struct Q6kPackGroup {
+    ilv: Vec<u8>, // [nb * 2048]: [st 0..16][qw 0..2][row-interleaved 64 B], codes BIASED (q+32)
+    sc16: Vec<i32>, // [nb * 256]: pair-duplicated int8 scales (lanes 2i, 2i+1 = row i)
+    d: Vec<f32>,  // [nb * 8], PERM order
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) struct Q6kPack {
+    groups: Vec<Q6kPackGroup>,
+    nb: usize,
+}
+
+impl Q6kPack {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    fn bytes(&self) -> usize {
+        self.groups
+            .iter()
+            .map(|g| g.ilv.len() + g.sc16.len() * 4 + g.d.len() * 4)
+            .sum()
+    }
+}
+
+/// Build the interleaved pack for a `[out_f, in_f]` Q6_K bank (e.g. the tied Q6_K lm_head —
+/// ~740 MB of expanded codes for gemma's 262k vocab, built once per session, rayon over groups).
+/// `out_f % 8` tail rows are NOT packed.
+#[cfg(target_arch = "x86_64")]
+fn q6k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q6kPack {
+    const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
+    let nb = in_f / 256;
+    let bpr = wbytes.len() / out_f;
+    let n_groups = out_f / 8;
+    use rayon::prelude::*;
+    let groups: Vec<Q6kPackGroup> = (0..n_groups)
+        .into_par_iter()
+        .map(|g| {
+            let mut pg = Q6kPackGroup {
+                ilv: vec![0u8; nb * 2048],
+                sc16: vec![0i32; nb * 256],
+                d: vec![0f32; nb * 8],
+            };
+            let mut tmp = [[0u8; 256]; 8];
+            let mut sc_rows = [[0i32; 16]; 8];
+            let mut d_rows = [0f32; 8];
+            for b in 0..nb {
+                for i in 0..8 {
+                    let row = &wbytes[(g * 8 + i) * bpr..(g * 8 + i) * bpr + bpr];
+                    let blk = &row[b * 210..b * 210 + 210];
+                    let ql = &blk[0..128];
+                    let qh = &blk[128..192];
+                    let scales = &blk[192..208];
+                    d_rows[i] = rdf16(&blk[208..210]);
+                    for (st, sv) in sc_rows[i].iter_mut().enumerate() {
+                        *sv = scales[st] as i8 as i32;
+                    }
+                    // Linear element order, codes biased (q+32, 0..63) — the same mapping the
+                    // batch kernels' flat expansion uses.
+                    for half in 0..2usize {
+                        let (qlo, qho, base) = (half * 64, half * 32, half * 128);
+                        for l in 0..32 {
+                            let f = &mut tmp[i];
+                            f[base + l] = (ql[qlo + l] & 0xF) | ((qh[qho + l] & 3) << 4);
+                            f[base + l + 32] =
+                                (ql[qlo + l + 32] & 0xF) | (((qh[qho + l] >> 2) & 3) << 4);
+                            f[base + l + 64] = (ql[qlo + l] >> 4) | (((qh[qho + l] >> 4) & 3) << 4);
+                            f[base + l + 96] =
+                                (ql[qlo + l + 32] >> 4) | (((qh[qho + l] >> 6) & 3) << 4);
+                        }
+                    }
+                }
+                for (j, &row) in PERM.iter().enumerate() {
+                    pg.d[b * 8 + j] = d_rows[row];
+                }
+                for st in 0..16usize {
+                    for i in 0..8usize {
+                        pg.sc16[b * 256 + st * 16 + 2 * i] = sc_rows[i][st];
+                        pg.sc16[b * 256 + st * 16 + 2 * i + 1] = sc_rows[i][st];
+                    }
+                    for qw in 0..2usize {
+                        let dst = &mut pg.ilv
+                            [b * 2048 + st * 128 + qw * 64..b * 2048 + st * 128 + qw * 64 + 64];
+                        for i in 0..8 {
+                            dst[i * 8..i * 8 + 8]
+                                .copy_from_slice(&tmp[i][st * 16 + qw * 8..st * 16 + qw * 8 + 8]);
+                        }
+                    }
+                }
+            }
+            pg
+        })
+        .collect();
+    Q6kPack { groups, nb }
+}
+
+/// The GEMM half over a prebuilt [`Q6kPackGroup`] — 8 output rows × all `m` activations. Same
+/// integer core as `vec_dot_q6k_batch_avx512bw` (dpbusd on biased codes, `-32·bsum16` split as
+/// `-16·bsum16` per pair lane — exact) and the same per-super-block f32 sequence
+/// (`(d · q8.d) · isum`), so results are bit-identical to the batch/single kernels.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni")]
+unsafe fn q6k_gemm_group(pg: &Q6kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    assert_eq!(cols.len(), 8 * m);
+    assert!(pg.ilv.len() >= nb * 2048 && pg.sc16.len() >= nb * 256 && pg.d.len() >= nb * 8);
+    let ilv_p = pg.ilv.as_ptr();
+    let sc16_p = pg.sc16.as_ptr();
+    let d_p = pg.d.as_ptr();
+    let cols_p = cols.as_mut_ptr();
+    for r in 0..m {
+        let q8 = &q8s[r];
+        assert!(q8.qs.len() >= nb * 256 && q8.bsums16.len() >= nb * 16 && q8.d.len() >= nb);
+        let qs_p = q8.qs.as_ptr();
+        let bs16_p = q8.bsums16.as_ptr();
+        let qd_p = q8.d.as_ptr();
+        let mut sumf_v = _mm256_setzero_ps();
+        for b in 0..nb {
+            let mut sd_zmm = _mm512_setzero_si512();
+            let q8b = qs_p.add(b * 256);
+            for st in 0..16usize {
+                let mut acc = _mm512_setzero_si512();
+                for qw in 0..2usize {
+                    let w = _mm512_loadu_si512(
+                        ilv_p.add(b * 2048 + st * 128 + qw * 64) as *const __m512i
+                    );
+                    let a = _mm512_set1_epi64(
+                        (q8b.add(st * 16 + qw * 8) as *const i64).read_unaligned(),
+                    );
+                    acc = _mm512_dpbusd_epi32(acc, w, a);
+                }
+                // -32·bsum16 per sub-block, split as -16·bsum16 per pair lane (exact:
+                // (a1-16bs)+(a2-16bs) = dp-32bs).
+                let corr = _mm512_set1_epi32(16 * *bs16_p.add(b * 16 + st));
+                let sc16 = _mm512_loadu_si512(sc16_p.add(b * 256 + st * 16) as *const __m512i);
+                sd_zmm = _mm512_add_epi32(
+                    sd_zmm,
+                    _mm512_mullo_epi32(_mm512_sub_epi32(acc, corr), sc16),
+                );
+            }
+            let sd_lo = _mm512_castsi512_si256(sd_zmm);
+            let sd_hi = _mm512_extracti64x4_epi64::<1>(sd_zmm);
+            let sd_ymm = _mm256_hadd_epi32(sd_lo, sd_hi); // pair-merge -> PERM order
+            let s_f = _mm256_cvtepi32_ps(sd_ymm);
+            let d_v = _mm256_loadu_ps(d_p.add(b * 8));
+            let t = _mm256_mul_ps(d_v, _mm256_set1_ps(*qd_p.add(b)));
+            sumf_v = _mm256_add_ps(sumf_v, _mm256_mul_ps(t, s_f));
+        }
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), sumf_v);
+        const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
+        for (j, &row) in PERM.iter().enumerate() {
+            // SAFETY: row < 8, r < m, cols.len() == 8*m (asserted above).
+            *cols_p.add(row * m + r) = lanes[j];
+        }
+    }
+}
+
 /// Interleaved-x8 Q4_K GEMM tile (AVX512-VNNI) — the ggml `block_q4_Kx8` idea applied per call:
 /// the 8 weight rows' expanded nibbles are INTERLEAVED per (super-block, sub-block, 8-byte group)
 /// so one contiguous zmm load carries the SAME 8 activation positions of ALL 8 rows (qword lane i
@@ -3339,6 +3499,10 @@ pub struct CpuBackend {
     /// are built transient and not inserted. The `usize` is the current cached-bytes total.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     repack_cache: Mutex<RepackCacheState>,
+    /// Q6_K sibling of `repack_cache` (same keying and budget env; separate accounting) — holds
+    /// e.g. the tied Q6_K lm_head's ~740 MB pack, built once per session.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    repack6_cache: Mutex<(HashMap<(usize, usize), Arc<Q6kPack>>, usize)>,
     /// Persistent spin-pool for the op interpreter's parallel loops (see `pool.rs`, threadpool
     /// restructure phase 2). Built on first use so backends constructed for tests/tiny work
     /// never spawn threads. MoeFfn's nested per-expert fan-out stays on rayon (phase 3).
@@ -3370,6 +3534,27 @@ impl CpuBackend {
             .unwrap_or(4096);
         let bytes = pack.bytes();
         let mut guard = self.repack_cache.lock().unwrap();
+        if guard.1 + bytes <= budget_mb * 1024 * 1024 {
+            guard.1 += bytes;
+            guard.0.insert(key, pack.clone());
+        }
+        pack
+    }
+
+    /// Fetch-or-build the [`Q6kPack`] for one weight bank slice — `q4k_pack_for`'s Q6_K sibling.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn q6k_pack_for(&self, w: &[u8], in_f: usize, out_f: usize) -> Arc<Q6kPack> {
+        let key = (w.as_ptr() as usize, w.len());
+        if let Some(p) = self.repack6_cache.lock().unwrap().0.get(&key) {
+            return p.clone();
+        }
+        let pack = Arc::new(q6k_pack(w, in_f, out_f));
+        let budget_mb: usize = std::env::var("INFR_CPU_REPACK_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let bytes = pack.bytes();
+        let mut guard = self.repack6_cache.lock().unwrap();
         if guard.1 + bytes <= budget_mb * 1024 * 1024 {
             guard.1 += bytes;
             guard.0.insert(key, pack.clone());
@@ -3913,6 +4098,34 @@ impl Backend for CpuBackend {
                                 let o = out_f - 1;
                                 let row = &wbytes[o * bpr..o * bpr + bpr];
                                 vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
+                            }
+                        } else if dt == DType::Q6K
+                            && out_f >= 8
+                            && in_f.is_multiple_of(256)
+                            && cfg!(target_arch = "x86_64")
+                            && is_x86_feature_detected!("avx512bw")
+                            && is_x86_feature_detected!("avx512vnni")
+                        {
+                            // Q6_K on the interleaved-x8 pack (the tied Q6_K lm_head is a 189
+                            // GMAC GEMM every DG denoise step): 8 weight rows per activation
+                            // pass instead of 1 — same activation-reuse trick Q4_K got.
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                let pack = self.q6k_pack_for(wbytes, in_f, out_f);
+                                let groups8 = out_f / 8;
+                                let rem = out_f % 8;
+                                let (g8_t, rest_t) = out_t.split_at_mut(groups8 * 8 * m);
+                                self.pool().for_chunks_mut(g8_t, 8 * m, 1, &|g, dc| {
+                                    // SAFETY: VNNI dispatch checked in the branch condition.
+                                    unsafe { q6k_gemm_group(&pack.groups[g], pack.nb, &q8s, dc) };
+                                });
+                                if rem > 0 {
+                                    self.pool().for_chunks_mut(rest_t, m, 1, &|i, chunk| {
+                                        let o = groups8 * 8 + i;
+                                        let row = &wbytes[o * bpr..o * bpr + bpr];
+                                        vec_dot_q6k_batch(row, &q8s, in_f, chunk);
+                                    });
+                                }
                             }
                         } else if dt == DType::Q5_0 && in_f.is_multiple_of(32) {
                             // Dense-layer Q5_0 (DG stores 16 of its 30 dense ffn_down weights as
@@ -5245,6 +5458,50 @@ mod kernel_tests {
     /// only the final `d_w * d8 * iprod` formula does, which is shared. Runs whichever SIMD tier this
     /// CPU actually has (falls through to the same scalar fn on non-x86 or pre-AVX2 hardware, in which
     /// case the assertion is trivially true).
+    #[test]
+    fn q6k_pack_gemm_bit_identical_to_batch() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !(is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni")) {
+                return; // the pack/gemm pair only exists on the VNNI path
+            }
+            let (in_f, out_f, m) = (512usize, 16usize, 5usize);
+            let nb256 = in_f / 256;
+            let mut w = det_bytes(out_f * nb256 * 210, 90);
+            for o in 0..out_f {
+                for b in 0..nb256 {
+                    put_f16(
+                        &mut w[(o * nb256 + b) * 210 + 208..(o * nb256 + b) * 210 + 210],
+                        0.03,
+                    );
+                }
+            }
+            let q8s: Vec<Q8> = (0..m)
+                .map(|r| quantize_q8(&det_x(in_f, 91 + r as u64)))
+                .collect();
+            let pack = q6k_pack(&w, in_f, out_f);
+            let bpr = w.len() / out_f;
+            for (g, pg) in pack.groups.iter().enumerate() {
+                let mut cols = vec![0f32; 8 * m];
+                unsafe { q6k_gemm_group(pg, pack.nb, &q8s, &mut cols) };
+                for i in 0..8 {
+                    let o = g * 8 + i;
+                    let mut want = vec![0f32; m];
+                    vec_dot_q6k_batch(&w[o * bpr..o * bpr + bpr], &q8s, in_f, &mut want);
+                    for r in 0..m {
+                        assert_eq!(
+                            cols[i * m + r].to_bits(),
+                            want[r].to_bits(),
+                            "q6k pack/gemm g={g} i={i} r={r}: got {}, want {}",
+                            cols[i * m + r],
+                            want[r],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn q4k_pack_gemm_bit_identical_to_scalar() {
         #[cfg(target_arch = "x86_64")]

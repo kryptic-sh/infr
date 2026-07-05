@@ -2653,6 +2653,7 @@ fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]
 /// `[nb*32]` u8 buffer ONCE per row — the scalar kernel re-decoded nibble+high-bit per
 /// (activation-row, block), which multiplied the decode cost by the batch size. Shared by the
 /// SIMD kernels; layout `flat[b*32 + j]` = code j of block b (j 0..15 = lo nibbles, 16..31 = hi).
+#[cfg(target_arch = "x86_64")] // only the x86 SIMD kernels call this — dead code on aarch64
 #[inline]
 fn q5_0_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<u8>, Vec<f32>) {
     let mut flat = vec![0u8; nb * 32];

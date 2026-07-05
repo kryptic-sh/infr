@@ -342,8 +342,16 @@ impl ThinkRender {
             }
             infr_engine::Delta::Content(t) => {
                 if *in_think {
-                    print!("[0m");
+                    // Close the dim reasoning with a blank line: `<think>` models emit their own
+                    // whitespace around `</think>`, but channel-format models (diffusion-gemma,
+                    // E2B) end reasoning at a bare `<channel|>` — without this the answer renders
+                    // GLUED to the last thinking line ("…clearly.The capital of France is Paris.").
+                    print!("[0m\n\n");
                     *in_think = false;
+                    // The splitter strips markers, not whitespace: a think-model's own newline
+                    // after `</think>` shouldn't stack a third blank line on top of ours.
+                    print!("{}", t.trim_start_matches('\n'));
+                    return;
                 }
                 print!("{t}");
             }

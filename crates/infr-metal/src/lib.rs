@@ -34,6 +34,7 @@ use metal::{Buffer as MtlBuffer, CommandQueue, Device};
 mod exec;
 mod profile;
 mod shaders;
+pub use shaders::msl_source;
 
 fn be(msg: impl std::fmt::Display) -> Error {
     Error::backend(msg)

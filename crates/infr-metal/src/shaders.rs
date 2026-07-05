@@ -20,6 +20,14 @@ pub struct Pipelines {
 unsafe impl Send for Pipelines {}
 unsafe impl Sync for Pipelines {}
 
+/// The complete assembled MSL source — the ONE string the backend compiles. Public so the
+/// kernel-name tripwire test resolves names against exactly what the runtime compiles (a
+/// separately-maintained file list in the test would drift the same way a duplicated source
+/// copy once did).
+pub fn msl_source() -> String {
+    MSL_PARTS.concat()
+}
+
 impl Pipelines {
     pub fn build(device: &Device) -> Result<Self> {
         let opts = metal::CompileOptions::new();
@@ -27,7 +35,7 @@ impl Pipelines {
         // results stay in tight numeric parity with the CPU interpreter.
         opts.set_fast_math_enabled(false);
         let library = device
-            .new_library_with_source(&MSL_PARTS.concat(), &opts)
+            .new_library_with_source(&msl_source(), &opts)
             .map_err(|e| be(format!("compile MSL library: {e}")))?;
         Ok(Self {
             device: device.clone(),

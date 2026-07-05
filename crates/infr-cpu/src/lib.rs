@@ -1517,6 +1517,159 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
     }
 }
 
+/// One 8-output-row group of a Q4_K weight bank in the interleaved-x8 form the VNNI GEMM
+/// consumes (see [`vec_dot_q4k_batch8_ilv_vnni`]'s layout doc): `ilv` is the byte-interleaved
+/// nibble expansion, the metadata arrays are PERM-lane-ordered per (super-block, sub-block) so
+/// the GEMM can `loadu` them straight into vectors. Cacheable: building this is the per-call
+/// repack cost the (layer, expert) cache eliminates (ggml pays it once at load via its
+/// `block_q4_Kx8` buffers; we pay it once per cached expert).
+/// `(entries keyed by weight-slice (addr, len), total cached bytes)` — see `repack_cache`'s doc.
+type RepackCacheState = (HashMap<(usize, usize), Arc<Q4kPack>>, usize);
+
+struct Q4kPackGroup {
+    ilv: Vec<u8>,   // [nb * 2048]
+    sc: Vec<i32>,   // [nb * 8 subs * 8 lanes], PERM order
+    msc: Vec<i32>,  // [nb * 8 subs * 8 lanes], PERM order
+    d: Vec<f32>,    // [nb * 8 lanes], PERM order
+    dmin: Vec<f32>, // [nb * 8 lanes], PERM order
+}
+
+/// A whole Q4_K weight bank (e.g. one MoE expert's fused gate_up) packed as full 8-row groups —
+/// `out_f % 8` tail rows are NOT packed (callers run them through the per-row kernel).
+pub(crate) struct Q4kPack {
+    groups: Vec<Q4kPackGroup>,
+    nb: usize,
+}
+
+impl Q4kPack {
+    fn bytes(&self) -> usize {
+        self.groups
+            .iter()
+            .map(|g| g.ilv.len() + (g.sc.len() + g.msc.len()) * 4 + (g.d.len() + g.dmin.len()) * 4)
+            .sum()
+    }
+}
+
+/// Build the pack for `wbytes` (a `[out_f, in_f]` Q4_K bank). AVX2 is enough for the expansion.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q4kPack {
+    use std::arch::x86_64::*;
+    const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
+    let nb = in_f / 256;
+    let bpr = wbytes.len() / out_f;
+    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
+    let n_groups = out_f / 8;
+    let mut groups = Vec::with_capacity(n_groups);
+    let mut tmp = [[0u8; 256]; 8];
+    let mut sc_rows = [[0u32; 8]; 8];
+    let mut m_rows = [[0u32; 8]; 8];
+    let mut d_rows = [0f32; 8];
+    let mut dmin_rows = [0f32; 8];
+    for g in 0..n_groups {
+        let mut pg = Q4kPackGroup {
+            ilv: vec![0u8; nb * 2048],
+            sc: vec![0i32; nb * 64],
+            msc: vec![0i32; nb * 64],
+            d: vec![0f32; nb * 8],
+            dmin: vec![0f32; nb * 8],
+        };
+        for b in 0..nb {
+            for i in 0..8 {
+                let row = &wbytes[(g * 8 + i) * bpr..(g * 8 + i) * bpr + bpr];
+                let blk = &row[b * 144..b * 144 + 144];
+                d_rows[i] = rdf16(&blk[0..2]);
+                dmin_rows[i] = rdf16(&blk[2..4]);
+                let scales = &blk[4..16];
+                let qs = &blk[16..144];
+                for s in 0..8usize {
+                    let (sc, mv) = k4(s, scales);
+                    sc_rows[i][s] = sc;
+                    m_rows[i][s] = mv;
+                }
+                for k in 0..4usize {
+                    let nibs = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
+                    let lo = _mm256_and_si256(nibs, mask_lo);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
+                    _mm256_storeu_si256(tmp[i][k * 64..].as_mut_ptr() as *mut __m256i, lo);
+                    _mm256_storeu_si256(tmp[i][k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
+                }
+            }
+            for (j, &row) in PERM.iter().enumerate() {
+                pg.d[b * 8 + j] = d_rows[row];
+                pg.dmin[b * 8 + j] = dmin_rows[row];
+            }
+            for st in 0..8usize {
+                for (j, &row) in PERM.iter().enumerate() {
+                    pg.sc[b * 64 + st * 8 + j] = sc_rows[row][st] as i32;
+                    pg.msc[b * 64 + st * 8 + j] = m_rows[row][st] as i32;
+                }
+                for gg in 0..4usize {
+                    let dst = &mut pg.ilv
+                        [b * 2048 + st * 256 + gg * 64..b * 2048 + st * 256 + gg * 64 + 64];
+                    for i in 0..8 {
+                        dst[i * 8..i * 8 + 8]
+                            .copy_from_slice(&tmp[i][st * 32 + gg * 8..st * 32 + gg * 8 + 8]);
+                    }
+                }
+            }
+        }
+        groups.push(pg);
+    }
+    Q4kPack { groups, nb }
+}
+
+/// The GEMM half of [`vec_dot_q4k_batch8_ilv_vnni`] over a prebuilt [`Q4kPackGroup`] — identical
+/// math and rounding sequence, so bit-identity with the scalar oracle is preserved.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni")]
+unsafe fn q4k_gemm_group(pg: &Q4kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    debug_assert_eq!(cols.len(), 8 * m);
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf_v = _mm256_setzero_ps();
+        for b in 0..nb {
+            let mut sd_ymm = _mm256_setzero_si256();
+            let mut sm_ymm = _mm256_setzero_si256();
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for st in 0..8usize {
+                let mut acc = _mm512_setzero_si512();
+                for gg in 0..4usize {
+                    let w = _mm512_loadu_si512(
+                        pg.ilv[b * 2048 + st * 256 + gg * 64..].as_ptr() as *const __m512i
+                    );
+                    let a = _mm512_set1_epi64(
+                        (q8b[st * 32 + gg * 8..].as_ptr() as *const i64).read_unaligned(),
+                    );
+                    acc = _mm512_dpbusd_epi32(acc, w, a);
+                }
+                let lo = _mm512_castsi512_si256(acc);
+                let hi = _mm512_extracti64x4_epi64::<1>(acc);
+                let sums_perm = _mm256_hadd_epi32(lo, hi);
+                let sc_v = _mm256_loadu_si256(pg.sc[b * 64 + st * 8..].as_ptr() as *const __m256i);
+                let m_v = _mm256_loadu_si256(pg.msc[b * 64 + st * 8..].as_ptr() as *const __m256i);
+                sd_ymm = _mm256_add_epi32(sd_ymm, _mm256_mullo_epi32(sums_perm, sc_v));
+                let isum = _mm256_set1_epi32(q8.bsums[b * 8 + st]);
+                sm_ymm = _mm256_add_epi32(sm_ymm, _mm256_mullo_epi32(m_v, isum));
+            }
+            let sd_f = _mm256_cvtepi32_ps(sd_ymm);
+            let sm_f = _mm256_cvtepi32_ps(sm_ymm);
+            let d_v = _mm256_loadu_ps(pg.d[b * 8..].as_ptr());
+            let dmin_v = _mm256_loadu_ps(pg.dmin[b * 8..].as_ptr());
+            let t = _mm256_sub_ps(_mm256_mul_ps(d_v, sd_f), _mm256_mul_ps(dmin_v, sm_f));
+            sumf_v = _mm256_add_ps(sumf_v, _mm256_mul_ps(_mm256_set1_ps(q8.d[b]), t));
+        }
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), sumf_v);
+        const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
+        for (j, &row) in PERM.iter().enumerate() {
+            cols[row * m + r] = lanes[j];
+        }
+    }
+}
+
 /// Interleaved-x8 Q4_K GEMM tile (AVX512-VNNI) — the ggml `block_q4_Kx8` idea applied per call:
 /// the 8 weight rows' expanded nibbles are INTERLEAVED per (super-block, sub-block, 8-byte group)
 /// so one contiguous zmm load carries the SAME 8 activation positions of ALL 8 rows (qword lane i
@@ -1551,6 +1704,12 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
     let mut m_arr: [Vec<[u32; 8]>; 8] = std::array::from_fn(|_| vec![[0u32; 8]; nb]);
     // per-(b, s) scale vector with rows pre-permuted into hadd order.
     let mut sc_vec = vec![[_mm256_setzero_si256(); 8]; nb];
+    // PERM-ordered per-(b,s) m-scales and per-b f32 d/dmin vectors: lets the sm accumulation and
+    // the final `q8.d*(d*sd - dmin*sm)` run 8-rows-wide in lane space (un-permuted only at the
+    // very end). No FMA anywhere — each mul/sub/add rounds separately, matching the scalar order.
+    let mut m_vec = vec![[_mm256_setzero_si256(); 8]; nb];
+    let mut d_vec = vec![_mm256_setzero_ps(); nb];
+    let mut dmin_vec = vec![_mm256_setzero_ps(); nb];
     let mut ilv = vec![0u8; nb * 2048];
     {
         let mut sc_rows = [[0u32; 8]; 8]; // [row][s]
@@ -1575,6 +1734,26 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
                     _mm256_storeu_si256(tmp[i][k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
                 }
             }
+            d_vec[b] = _mm256_setr_ps(
+                d_arr[PERM[0]][b],
+                d_arr[PERM[1]][b],
+                d_arr[PERM[2]][b],
+                d_arr[PERM[3]][b],
+                d_arr[PERM[4]][b],
+                d_arr[PERM[5]][b],
+                d_arr[PERM[6]][b],
+                d_arr[PERM[7]][b],
+            );
+            dmin_vec[b] = _mm256_setr_ps(
+                dmin_arr[PERM[0]][b],
+                dmin_arr[PERM[1]][b],
+                dmin_arr[PERM[2]][b],
+                dmin_arr[PERM[3]][b],
+                dmin_arr[PERM[4]][b],
+                dmin_arr[PERM[5]][b],
+                dmin_arr[PERM[6]][b],
+                dmin_arr[PERM[7]][b],
+            );
             for s in 0..8usize {
                 sc_vec[b][s] = _mm256_setr_epi32(
                     sc_rows[PERM[0]][s] as i32,
@@ -1585,6 +1764,16 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
                     sc_rows[PERM[5]][s] as i32,
                     sc_rows[PERM[6]][s] as i32,
                     sc_rows[PERM[7]][s] as i32,
+                );
+                m_vec[b][s] = _mm256_setr_epi32(
+                    m_arr[PERM[0]][b][s] as i32,
+                    m_arr[PERM[1]][b][s] as i32,
+                    m_arr[PERM[2]][b][s] as i32,
+                    m_arr[PERM[3]][b][s] as i32,
+                    m_arr[PERM[4]][b][s] as i32,
+                    m_arr[PERM[5]][b][s] as i32,
+                    m_arr[PERM[6]][b][s] as i32,
+                    m_arr[PERM[7]][b][s] as i32,
                 );
                 for g in 0..4usize {
                     let dst =
@@ -1601,11 +1790,14 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
     let [o0, o1, o2, o3, o4, o5, o6, o7] = outs;
     for r in 0..m {
         let q8 = &q8s[r];
-        let mut sumf = [0f32; 8];
+        // Whole-row f32 accumulator, 8 rows wide in PERM lane order — un-permuted only at the
+        // final store. Every f32 op below is a separate mul/sub/add (NO fma): identical rounding
+        // sequence to the scalar per-row expression.
+        let mut sumf_v = _mm256_setzero_ps();
         for b in 0..nb {
-            // sd per row, accumulated across the 8 sub-blocks in hadd-permuted lane order.
+            // sd/sm per row, accumulated across the 8 sub-blocks in hadd-permuted lane order.
             let mut sd_ymm = _mm256_setzero_si256();
-            let mut sm = [0i32; 8];
+            let mut sm_ymm = _mm256_setzero_si256();
             let q8b = &q8.qs[b * 256..b * 256 + 256];
             for s in 0..8usize {
                 let mut acc = _mm512_setzero_si512();
@@ -1624,26 +1816,29 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
                 let hi = _mm512_extracti64x4_epi64::<1>(acc);
                 let sums_perm = _mm256_hadd_epi32(lo, hi);
                 sd_ymm = _mm256_add_epi32(sd_ymm, _mm256_mullo_epi32(sums_perm, sc_vec[b][s]));
-                let isum = q8.bsums[b * 8 + s];
-                for i in 0..8 {
-                    sm[i] += m_arr[i][b][s] as i32 * isum;
-                }
+                let isum = _mm256_set1_epi32(q8.bsums[b * 8 + s]);
+                sm_ymm = _mm256_add_epi32(sm_ymm, _mm256_mullo_epi32(m_vec[b][s], isum));
             }
-            let mut sd_lanes = [0i32; 8];
-            _mm256_storeu_si256(sd_lanes.as_mut_ptr() as *mut __m256i, sd_ymm);
-            for (j, &row) in PERM.iter().enumerate() {
-                sumf[row] += q8.d[b]
-                    * (d_arr[row][b] * sd_lanes[j] as f32 - dmin_arr[row][b] * sm[row] as f32);
-            }
+            // q8.d[b] * (d*sd - dmin*sm), 8 rows at once (cvtepi32→f32 is exact for these
+            // magnitudes; mul/sub/mul/add sequence matches the scalar expression's rounding).
+            let sd_f = _mm256_cvtepi32_ps(sd_ymm);
+            let sm_f = _mm256_cvtepi32_ps(sm_ymm);
+            let t = _mm256_sub_ps(
+                _mm256_mul_ps(d_vec[b], sd_f),
+                _mm256_mul_ps(dmin_vec[b], sm_f),
+            );
+            sumf_v = _mm256_add_ps(sumf_v, _mm256_mul_ps(_mm256_set1_ps(q8.d[b]), t));
         }
-        o0[r] = sumf[0];
-        o1[r] = sumf[1];
-        o2[r] = sumf[2];
-        o3[r] = sumf[3];
-        o4[r] = sumf[4];
-        o5[r] = sumf[5];
-        o6[r] = sumf[6];
-        o7[r] = sumf[7];
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), sumf_v);
+        o0[r] = lanes[0];
+        o1[r] = lanes[1];
+        o4[r] = lanes[2];
+        o5[r] = lanes[3];
+        o2[r] = lanes[4];
+        o3[r] = lanes[5];
+        o6[r] = lanes[6];
+        o7[r] = lanes[7];
     }
 }
 
@@ -2676,12 +2871,13 @@ unsafe fn vec_dot_q32_batch8_ilv_vnni(
 ) {
     use std::arch::x86_64::*;
     let nb = in_f / 32;
-    const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
     let bias = _mm_set1_epi8(-128i8); // +128 == xor 0x80 on u8 lanes
 
     // ── repack: per row, unsigned block bytes; then interleave 8-byte groups across rows ──
     // ilv[b*256 + g*64 + i*8 .. +8] = row i, block b, byte group g.
     let mut d_w: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
+    // PERM-ordered per-block f32 weight-scale vector (see the q4k ilv kernel's d_vec).
+    let mut d_vec = vec![_mm256_setzero_ps(); nb];
     let mut ilv = vec![0u8; nb * 256];
     {
         let bpr = if q5 { 22usize } else { 34usize };
@@ -2717,13 +2913,24 @@ unsafe fn vec_dot_q32_batch8_ilv_vnni(
                     dst[i * 8..i * 8 + 8].copy_from_slice(&tmp[i][g * 8..g * 8 + 8]);
                 }
             }
+            const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
+            d_vec[b] = _mm256_setr_ps(
+                d_w[PERM[0]][b],
+                d_w[PERM[1]][b],
+                d_w[PERM[2]][b],
+                d_w[PERM[3]][b],
+                d_w[PERM[4]][b],
+                d_w[PERM[5]][b],
+                d_w[PERM[6]][b],
+                d_w[PERM[7]][b],
+            );
         }
     }
 
     let sub = if q5 { 16i32 } else { 128i32 }; // per-block bsum multiplier to subtract
     let [o0, o1, o2, o3, o4, o5, o6, o7] = outs;
     for (r, q8) in q8s.iter().enumerate() {
-        let mut sumf = [0f32; 8];
+        let mut sumf_v = _mm256_setzero_ps();
         for b in 0..nb {
             let mut acc = _mm512_setzero_si512();
             let q8b = &q8.qs[b * 32..b * 32 + 32];
@@ -2735,25 +2942,25 @@ unsafe fn vec_dot_q32_batch8_ilv_vnni(
             let lo = _mm512_castsi512_si256(acc);
             let hi = _mm512_extracti64x4_epi64::<1>(acc);
             let sums_perm = _mm256_hadd_epi32(lo, hi);
-            let mut lanes = [0i32; 8];
-            _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, sums_perm);
-            let corr = sub * q8.bsum[b];
-            for (j, &row) in PERM.iter().enumerate() {
-                let iprod = lanes[j] - corr;
-                // Same expression as the scalar oracles: Q8_0 has no bsum term of its own
-                // (the −128·bsum was the bias correction, already inside `iprod`); Q5_0's
-                // −16·bsum is likewise folded into `corr`.
-                sumf[row] += d_w[row][b] * q8.d[b] * iprod as f32;
-            }
+            // Same expression as the scalar oracles, 8 rows wide (no FMA — each mul/add rounds
+            // separately, matching the scalar `d_w * q8.d * iprod` left-assoc sequence): Q8_0 has
+            // no bsum term of its own (the −128·bsum was the bias correction, folded into
+            // `corr`); Q5_0's −16·bsum likewise.
+            let corr = _mm256_set1_epi32(sub * q8.bsum[b]);
+            let iprod_f = _mm256_cvtepi32_ps(_mm256_sub_epi32(sums_perm, corr));
+            let scale = _mm256_mul_ps(d_vec[b], _mm256_set1_ps(q8.d[b]));
+            sumf_v = _mm256_add_ps(sumf_v, _mm256_mul_ps(scale, iprod_f));
         }
-        o0[r] = sumf[0];
-        o1[r] = sumf[1];
-        o2[r] = sumf[2];
-        o3[r] = sumf[3];
-        o4[r] = sumf[4];
-        o5[r] = sumf[5];
-        o6[r] = sumf[6];
-        o7[r] = sumf[7];
+        let mut lanes = [0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), sumf_v);
+        o0[r] = lanes[0];
+        o1[r] = lanes[1];
+        o4[r] = lanes[2];
+        o5[r] = lanes[3];
+        o2[r] = lanes[4];
+        o3[r] = lanes[5];
+        o6[r] = lanes[6];
+        o7[r] = lanes[7];
     }
 }
 
@@ -3021,11 +3228,41 @@ pub struct CpuBackend {
     /// land here — the large `Op::Linear` weights are streamed row-by-row instead (see that arm),
     /// so this never holds the whole model in f32.
     weight_cache: Mutex<HashMap<usize, Arc<Vec<f32>>>>,
+    /// (layer, expert)-granular repack cache for the interleaved-x8 Q4_K GEMM ([`Q4kPack`]):
+    /// keyed by the expert weight slice's (address, length) — stable for the mmap'd/upload-once
+    /// weight buffers this backend binds (same lifetime argument as `weight_cache`). ggml pays
+    /// its `block_q4_Kx8` repack once at LOAD; this pays it once per (expert, session) instead
+    /// of once per CALL. Byte-budgeted (`INFR_CPU_REPACK_MB`, default 4096): over budget, packs
+    /// are built transient and not inserted. The `usize` is the current cached-bytes total.
+    repack_cache: Mutex<RepackCacheState>,
 }
 
 impl CpuBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Fetch-or-build the [`Q4kPack`] for one weight bank slice (see `repack_cache`'s doc).
+    /// SAFETY-adjacent note: callers only reach this from the VNNI ilv path, which implies AVX2
+    /// for the pack expansion.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn q4k_pack_for(&self, w: &[u8], in_f: usize, out_f: usize) -> Arc<Q4kPack> {
+        let key = (w.as_ptr() as usize, w.len());
+        if let Some(p) = self.repack_cache.lock().unwrap().0.get(&key) {
+            return p.clone();
+        }
+        let pack = Arc::new(unsafe { q4k_pack(w, in_f, out_f) });
+        let budget_mb: usize = std::env::var("INFR_CPU_REPACK_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let bytes = pack.bytes();
+        let mut guard = self.repack_cache.lock().unwrap();
+        if guard.1 + bytes <= budget_mb * 1024 * 1024 {
+            guard.1 += bytes;
+            guard.0.insert(key, pack.clone());
+        }
+        pack
     }
 
     /// Wrap a zero-copy GGUF mmap view as a read-only weight buffer (no allocation, no `memcpy`).
@@ -3066,6 +3303,7 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
 /// `in_f = n_ff_exp`, which isn't always a multiple of 256 (e.g. DiffusionGemma's 704 — always a
 /// multiple of 32, Q8_0/Q5_0's own native block, so THAT granularity gets its own int8 fast path
 /// below instead of falling all the way back to the plain f32 dequant+dot).
+#[allow(clippy::too_many_arguments)]
 fn expert_matvec_batch(
     wbytes: &[u8],
     dt: DType,
@@ -3073,6 +3311,9 @@ fn expert_matvec_batch(
     count: usize,
     in_f: usize,
     out_f: usize,
+    // Prebuilt interleaved pack for this bank (Q4_K + VNNI only; see `CpuBackend::q4k_pack_for`).
+    // `Some` skips the per-call repack inside the 8-row tile entirely.
+    q4k_pack: Option<&Q4kPack>,
     // int8-activation fast paths allowed? Decided by the CALLER on the WHOLE MoeFfn call's row
     // count, not this bucket's `count`: a per-bucket gate would mix exact and int8 math inside
     // one batched forward (1-row buckets exact, big buckets int8), which measurably shuffled
@@ -3121,6 +3362,13 @@ fn expert_matvec_batch(
         let q4k_tile = dt == DType::Q4K;
         let dot_cols8 = |o8: usize, cols: &mut [f32]| {
             debug_assert_eq!(cols.len(), 8 * count);
+            #[cfg(target_arch = "x86_64")]
+            if let Some(pack) = q4k_pack {
+                // Cached-pack path: repack already done (once per expert per session).
+                // SAFETY: q4k_pack is only handed in when the VNNI dispatch applies.
+                unsafe { q4k_gemm_group(&pack.groups[o8 / 8], pack.nb, &q8s, cols) };
+                return;
+            }
             let rows: [&[u8]; 8] =
                 std::array::from_fn(|i| &wbytes[(o8 + i) * bpr..(o8 + i) * bpr + bpr]);
             let mut it = cols.chunks_mut(count);
@@ -4207,7 +4455,7 @@ impl Backend for CpuBackend {
                     // parallel over rows is safe).
                     let int8_ok = rows >= 2; // whole-call gate — see expert_matvec_batch's param doc
                     let logits_all =
-                        expert_matvec_batch(&rbytes, rdt, &rxs, rows, ne, n_expert, int8_ok);
+                        expert_matvec_batch(&rbytes, rdt, &rxs, rows, ne, n_expert, None, int8_ok);
                     struct RouteRow {
                         /// Selected experts, sorted by DESCENDING router prob — the same order the
                         /// original per-row loop accumulated in.
@@ -4295,6 +4543,24 @@ impl Backend for CpuBackend {
                             let (gate, up) = if fused_gate_up {
                                 // One batched matvec over the fused [2*nffx, ne] expert slice; first
                                 // nffx rows are gate, next nffx are up (Op::GatedActFused's convention).
+                                // Cached interleaved pack for this expert's fused bank (Q4_K +
+                                // VNNI only — `q4k_pack_for` is a hit after the first call, so
+                                // the repack cost is paid once per (expert, session), not per
+                                // step; see `CpuBackend::repack_cache`).
+                                #[cfg(target_arch = "x86_64")]
+                                let pack = (int8_ok
+                                    && gdt == DType::Q4K
+                                    && ne.is_multiple_of(256)
+                                    && (2 * nffx).is_multiple_of(8)
+                                    && is_x86_feature_detected!("avx512bw")
+                                    && is_x86_feature_detected!("avx512vnni"))
+                                .then(|| {
+                                    self.q4k_pack_for(&gb[e * gst..(e + 1) * gst], ne, 2 * nffx)
+                                });
+                                #[cfg(not(target_arch = "x86_64"))]
+                                let pack: Option<
+                                    std::sync::Arc<Q4kPack>,
+                                > = None;
                                 let full = expert_matvec_batch(
                                     &gb[e * gst..(e + 1) * gst],
                                     gdt,
@@ -4302,6 +4568,7 @@ impl Backend for CpuBackend {
                                     count,
                                     ne,
                                     2 * nffx,
+                                    pack.as_deref(),
                                     int8_ok,
                                 );
                                 let mut gate = vec![0f32; count * nffx];
@@ -4325,6 +4592,7 @@ impl Backend for CpuBackend {
                                         count,
                                         ne,
                                         nffx,
+                                        None,
                                         int8_ok,
                                     ),
                                     expert_matvec_batch(
@@ -4334,6 +4602,7 @@ impl Backend for CpuBackend {
                                         count,
                                         ne,
                                         nffx,
+                                        None,
                                         int8_ok,
                                     ),
                                 )
@@ -4362,6 +4631,7 @@ impl Backend for CpuBackend {
                                 count,
                                 nffx,
                                 ne,
+                                None,
                                 int8_ok,
                             );
                             if let Some(ds) = &dscale {

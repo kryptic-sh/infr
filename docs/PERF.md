@@ -70,6 +70,13 @@ sweep and archives the matrix under `target/perf/<utc>-<sha>.txt` — keep the
 model list fixed so every commit's ratios are a diff away, and paste the
 matrix into the PR when a slice lands.
 
+**Sweep rows are not regression evidence.** A multi-model sweep heats the
+chip; rows measured mid-sweep run a few percent low (observed: a 0.93× row
+reading 0.83× in-sweep, back at 0.91× solo minutes later). Before calling a
+regression, re-probe the flagged row SOLO on an idle machine and compare
+absolute numbers, not just ratios (llama.cpp's side drifts with the same
+heat).
+
 ## Profiling
 
 ```bash

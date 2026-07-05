@@ -10,6 +10,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod kvquant;
+mod pool;
 pub mod turbo;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
@@ -3308,11 +3309,19 @@ pub struct CpuBackend {
     /// are built transient and not inserted. The `usize` is the current cached-bytes total.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     repack_cache: Mutex<RepackCacheState>,
+    /// Persistent spin-pool for the op interpreter's parallel loops (see `pool.rs`, threadpool
+    /// restructure phase 2). Built on first use so backends constructed for tests/tiny work
+    /// never spawn threads. MoeFfn's nested per-expert fan-out stays on rayon (phase 3).
+    pool: std::sync::OnceLock<pool::SpinPool>,
 }
 
 impl CpuBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn pool(&self) -> &pool::SpinPool {
+        self.pool.get_or_init(pool::SpinPool::new)
     }
 
     /// Fetch-or-build the [`Q4kPack`] for one weight bank slice (see `repack_cache`'s doc).
@@ -3747,6 +3756,13 @@ impl Backend for CpuBackend {
         };
 
         let prof_ops = std::env::var("INFR_PROF_OPS").is_ok();
+        // Per-graph spin ceiling: a graph with a rayon section (MoeFfn) needs pool waiters to
+        // park near-immediately or they starve it (qwen3moe pp512 123 -> 97 t/s even with the
+        // arm's `pause`); an all-pool dense graph wants generous spinning (parking between every
+        // op cost qwen3 pp512 404 -> 356 t/s). See `SpinPool::set_budget_cap`.
+        let has_rayon_section = g.ops.iter().any(|o| matches!(o, Op::MoeFfn { .. }));
+        self.pool()
+            .set_budget_cap(if has_rayon_section { 256 } else { 1 << 15 });
         let mut op_times: HashMap<&'static str, f64> = HashMap::new();
         for op in &g.ops {
             let __t0 = if prof_ops {
@@ -3766,19 +3782,17 @@ impl Backend for CpuBackend {
                     let (rows, dim) = (rows as usize, dim as usize);
                     let xs = &vals[x.0 as usize];
                     let ws = weight(w);
-                    // Rows are independent (no cross-row reduction) — rayon over rows, same
+                    // Rows are independent (no cross-row reduction) — spin-pool over rows, same
                     // per-row math and order as before (bit-identical, just distributed).
                     let mut out = vec![0f32; rows * dim];
-                    out.par_chunks_mut(dim)
-                        .zip(xs.par_chunks(dim))
-                        .for_each(|(orow, xrow)| {
-                            let ss: f32 =
-                                (0..dim).map(|i| xrow[i] * xrow[i]).sum::<f32>() / dim as f32;
-                            let s = 1.0 / (ss + eps).sqrt();
-                            for i in 0..dim {
-                                orow[i] = xrow[i] * s * ws[i];
-                            }
-                        });
+                    self.pool().for_chunks_mut(&mut out, dim, 4, &|r, orow| {
+                        let xrow = &xs[r * dim..r * dim + dim];
+                        let ss: f32 = (0..dim).map(|i| xrow[i] * xrow[i]).sum::<f32>() / dim as f32;
+                        let s = 1.0 / (ss + eps).sqrt();
+                        for i in 0..dim {
+                            orow[i] = xrow[i] * s * ws[i];
+                        }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 Op::Softmax {
@@ -3791,21 +3805,20 @@ impl Backend for CpuBackend {
                     let (rows, dim) = (rows as usize, dim as usize);
                     let xs = &vals[x.0 as usize];
                     let mut out = vec![0f32; rows * dim];
-                    out.par_chunks_mut(dim)
-                        .zip(xs.par_chunks(dim))
-                        .for_each(|(o, row)| {
-                            let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v * scale));
-                            let mut denom = 0f32;
-                            for (dst_v, &v) in o.iter_mut().zip(row) {
-                                let e = (v * scale - mx).exp();
-                                *dst_v = e;
-                                denom += e;
-                            }
-                            let inv = 1.0 / denom;
-                            for dst_v in o.iter_mut() {
-                                *dst_v *= inv;
-                            }
-                        });
+                    self.pool().for_chunks_mut(&mut out, dim, 1, &|r, o| {
+                        let row = &xs[r * dim..r * dim + dim];
+                        let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v * scale));
+                        let mut denom = 0f32;
+                        for (dst_v, &v) in o.iter_mut().zip(row) {
+                            let e = (v * scale - mx).exp();
+                            *dst_v = e;
+                            denom += e;
+                        }
+                        let inv = 1.0 / denom;
+                        for dst_v in o.iter_mut() {
+                            *dst_v *= inv;
+                        }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 Op::QkNorm {
@@ -3866,9 +3879,11 @@ impl Backend for CpuBackend {
                         let xrow = &xs[..in_f];
                         let q8 = matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
                             .then(|| quantize_q8(xrow));
-                        out.par_iter_mut().enumerate().for_each(|(o, dst_o)| {
+                        // Spin-pool, 16 output rows per claimed task (decode's per-row dot is
+                        // ~µs-scale; per-row claims would be all cursor contention).
+                        self.pool().for_chunks_mut(&mut out, 1, 16, &|o, dst_o| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
-                            *dst_o = match dt {
+                            dst_o[0] = match dt {
                                 DType::Q4K => vec_dot_q4k(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q6K => vec_dot_q6k(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q8_0 => vec_dot_q8_0(row, q8.as_ref().unwrap(), in_f),
@@ -3894,10 +3909,8 @@ impl Backend for CpuBackend {
                         // the indexed collect, bit-identical.
                         let q8s: Vec<Q8> =
                             if matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K) {
-                                (0..m)
-                                    .into_par_iter()
-                                    .map(|r| quantize_q8(&xs[r * in_f..r * in_f + in_f]))
-                                    .collect()
+                                self.pool()
+                                    .collect(m, &|r| quantize_q8(&xs[r * in_f..r * in_f + in_f]))
                             } else {
                                 Vec::new()
                             };
@@ -3911,8 +3924,8 @@ impl Backend for CpuBackend {
                             let groups8 = out_f / 8;
                             let rem = out_f % 8;
                             let (g8_t, rest_t) = out_t.split_at_mut(groups8 * 8 * m);
-                            // 8-row groups (parallel over rayon).
-                            g8_t.par_chunks_mut(8 * m).enumerate().for_each(|(g, dc)| {
+                            // 8-row groups across the spin-pool.
+                            self.pool().for_chunks_mut(g8_t, 8 * m, 1, &|g, dc| {
                                 let o = g * 8;
                                 let (r0, rest) = dc.split_at_mut(m);
                                 let (r1, rest) = rest.split_at_mut(m);
@@ -3941,17 +3954,13 @@ impl Backend for CpuBackend {
                             let pairs_rem = rem / 2;
                             let (g2_t, odd_t) = rest_t.split_at_mut(pairs_rem * 2 * m);
                             if pairs_rem > 0 {
-                                g2_t.par_chunks_mut(2 * m)
-                                    .enumerate()
-                                    .for_each(|(pair, dc)| {
-                                        let o = groups8 * 8 + pair * 2;
-                                        let (chunk_a, chunk_b) = dc.split_at_mut(m);
-                                        let row_a = &wbytes[o * bpr..o * bpr + bpr];
-                                        let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
-                                        vec_dot_q4k_batch2(
-                                            row_a, row_b, &q8s, in_f, chunk_a, chunk_b,
-                                        );
-                                    });
+                                self.pool().for_chunks_mut(g2_t, 2 * m, 1, &|pair, dc| {
+                                    let o = groups8 * 8 + pair * 2;
+                                    let (chunk_a, chunk_b) = dc.split_at_mut(m);
+                                    let row_a = &wbytes[o * bpr..o * bpr + bpr];
+                                    let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
+                                    vec_dot_q4k_batch2(row_a, row_b, &q8s, in_f, chunk_a, chunk_b);
+                                });
                             }
                             if rem % 2 != 0 {
                                 let o = out_f - 1;
@@ -3962,16 +3971,13 @@ impl Backend for CpuBackend {
                             // Small out_f < 8: fall back to 2-row tile.
                             let pairs = out_f / 2;
                             let (even_t, odd_t) = out_t.split_at_mut(pairs * 2 * m);
-                            even_t
-                                .par_chunks_mut(2 * m)
-                                .enumerate()
-                                .for_each(|(pair, dc)| {
-                                    let o = pair * 2;
-                                    let (chunk_a, chunk_b) = dc.split_at_mut(m);
-                                    let row_a = &wbytes[o * bpr..o * bpr + bpr];
-                                    let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
-                                    vec_dot_q4k_batch2(row_a, row_b, &q8s, in_f, chunk_a, chunk_b);
-                                });
+                            self.pool().for_chunks_mut(even_t, 2 * m, 1, &|pair, dc| {
+                                let o = pair * 2;
+                                let (chunk_a, chunk_b) = dc.split_at_mut(m);
+                                let row_a = &wbytes[o * bpr..o * bpr + bpr];
+                                let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
+                                vec_dot_q4k_batch2(row_a, row_b, &q8s, in_f, chunk_a, chunk_b);
+                            });
                             if out_f % 2 != 0 {
                                 let o = out_f - 1;
                                 let row = &wbytes[o * bpr..o * bpr + bpr];
@@ -3984,64 +3990,54 @@ impl Backend for CpuBackend {
                             // (~11% of every DG denoise step in the samply profile) — the switch
                             // puts it on the same int8-quantized-activation regime every other
                             // quantized dtype in this dispatch already uses.
-                            let q8s32: Vec<Q8x32> = (0..m)
-                                .into_par_iter()
-                                .map(|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]))
-                                .collect();
-                            out_t
-                                .par_chunks_mut(m)
-                                .with_min_len(8)
-                                .enumerate()
-                                .for_each(|(o, chunk)| {
-                                    let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
-                                });
+                            let q8s32: Vec<Q8x32> = self
+                                .pool()
+                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
+                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                let row = &wbytes[o * bpr..o * bpr + bpr];
+                                vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
+                            });
                         } else {
-                            // `with_min_len(8)`: at lm_head shape this loop is 262k one-row items;
-                            // rayon's adaptive splitting overhead on that many tiny tasks is real.
-                            out_t
-                                .par_chunks_mut(m)
-                                .with_min_len(8)
-                                .enumerate()
-                                .for_each(|(o, chunk)| {
-                                    let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    match dt {
-                                        DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
-                                        DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
-                                        DType::F32 => {
-                                            let w32: &[f32] = bytemuck::cast_slice(row);
-                                            for r in 0..m {
-                                                chunk[r] = dot(w32, &xs[r * in_f..r * in_f + in_f]);
-                                            }
-                                        }
-                                        DType::F16 => {
-                                            for r in 0..m {
-                                                chunk[r] =
-                                                    dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
-                                            }
-                                        }
-                                        DType::Bf16 => {
-                                            for r in 0..m {
-                                                chunk[r] =
-                                                    dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
-                                            }
-                                        }
-                                        _ => {
-                                            // Dequant the weight row ONCE, reuse across all m tokens.
-                                            let wf = bytes_to_f32(row, dt);
-                                            for r in 0..m {
-                                                chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
-                                            }
+                            // Grain 8: at lm_head shape this loop is 262k one-row chunks; per-row
+                            // cursor claims (or rayon's per-item splitting) are real overhead.
+                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                let row = &wbytes[o * bpr..o * bpr + bpr];
+                                match dt {
+                                    DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, chunk),
+                                    DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
+                                    DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
+                                    DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
+                                    DType::F32 => {
+                                        let w32: &[f32] = bytemuck::cast_slice(row);
+                                        for r in 0..m {
+                                            chunk[r] = dot(w32, &xs[r * in_f..r * in_f + in_f]);
                                         }
                                     }
-                                });
+                                    DType::F16 => {
+                                        for r in 0..m {
+                                            chunk[r] = dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
+                                        }
+                                    }
+                                    DType::Bf16 => {
+                                        for r in 0..m {
+                                            chunk[r] =
+                                                dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
+                                        }
+                                    }
+                                    _ => {
+                                        // Dequant the weight row ONCE, reuse across all m tokens.
+                                        let wf = bytes_to_f32(row, dt);
+                                        for r in 0..m {
+                                            chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                                        }
+                                    }
+                                }
+                            });
                         }
                         // Transpose out_t[o * m + r] → out[r * out_f + o], parallel over the m output
                         // rows (each gathers its out_f values from the o-major temp). The serial
                         // version was ~20% of the matvec at large out_f × m.
-                        out.par_chunks_mut(out_f).enumerate().for_each(|(r, orow)| {
+                        self.pool().for_chunks_mut(&mut out, out_f, 1, &|r, orow| {
                             for (o, dst) in orow.iter_mut().enumerate() {
                                 *dst = out_t[o * m + r];
                             }
@@ -4126,9 +4122,8 @@ impl Backend for CpuBackend {
                     // Parallel over the m rows. Within a row the RoPE angles depend only on the
                     // position (not the head), so precompute (cos,sin) per rope index ONCE per row and
                     // reuse across all heads — the powf/sin/cos were the bulk and were redone nh×.
-                    out.par_chunks_mut(nh * hd)
-                        .enumerate()
-                        .for_each(|(r, orow)| {
+                    self.pool()
+                        .for_chunks_mut(&mut out, nh * hd, 1, &|r, orow| {
                             let p0 = pos[r];
                             let cs: Vec<(f32, f32)> = (0..hf)
                                 .map(|p| {
@@ -4317,50 +4312,48 @@ impl Backend for CpuBackend {
                     let mut out = vec![0f32; rows * nh * hd];
                     // Each (ti, h) pair writes exactly one hd-sized output slice with no
                     // cross-iteration deps → embarrassingly parallel.  Chunk index i = ti*nh+h.
-                    out.par_chunks_mut(hd)
-                        .enumerate()
-                        .for_each(|(i, ob_slice)| {
-                            let ti = i / nh;
-                            let h = i % nh;
-                            let kvh = h / group;
-                            let qb = (ti * nh + h) * hd;
-                            let abs = pos as usize + ti; // absolute position of this query
-                            let (lo, hi) = match canvas_lo {
-                                // bidirectional: every row attends the same fixed [lo, kv_len).
-                                Some(clo) => (clo, kv_len),
-                                // causal (± SWA): [lo, abs] — SWA clips lo to abs-window+1.
-                                None => {
-                                    let lo = if window > 0 && abs + 1 > window {
-                                        abs + 1 - window
-                                    } else {
-                                        0
-                                    };
-                                    (lo, abs + 1)
-                                }
-                            };
-                            let n_keys = hi - lo;
-                            let mut sc = vec![0f32; n_keys];
-                            let mut mx = f32::NEG_INFINITY;
-                            for (jj, scj) in sc.iter_mut().enumerate() {
-                                let j = lo + jj;
-                                let kb = (j * nkv + kvh) * hd;
-                                let d: f32 = (0..hd).map(|x| qs[qb + x] * ks[kb + x]).sum();
-                                *scj = d * scale;
-                                mx = mx.max(*scj);
+                    self.pool().for_chunks_mut(&mut out, hd, 2, &|i, ob_slice| {
+                        let ti = i / nh;
+                        let h = i % nh;
+                        let kvh = h / group;
+                        let qb = (ti * nh + h) * hd;
+                        let abs = pos as usize + ti; // absolute position of this query
+                        let (lo, hi) = match canvas_lo {
+                            // bidirectional: every row attends the same fixed [lo, kv_len).
+                            Some(clo) => (clo, kv_len),
+                            // causal (± SWA): [lo, abs] — SWA clips lo to abs-window+1.
+                            None => {
+                                let lo = if window > 0 && abs + 1 > window {
+                                    abs + 1 - window
+                                } else {
+                                    0
+                                };
+                                (lo, abs + 1)
                             }
-                            let mut l = 0f32;
-                            for &s in &sc {
-                                l += (s - mx).exp();
+                        };
+                        let n_keys = hi - lo;
+                        let mut sc = vec![0f32; n_keys];
+                        let mut mx = f32::NEG_INFINITY;
+                        for (jj, scj) in sc.iter_mut().enumerate() {
+                            let j = lo + jj;
+                            let kb = (j * nkv + kvh) * hd;
+                            let d: f32 = (0..hd).map(|x| qs[qb + x] * ks[kb + x]).sum();
+                            *scj = d * scale;
+                            mx = mx.max(*scj);
+                        }
+                        let mut l = 0f32;
+                        for &s in &sc {
+                            l += (s - mx).exp();
+                        }
+                        for (jj, &s) in sc.iter().enumerate() {
+                            let j = lo + jj;
+                            let p = (s - mx).exp() / l;
+                            let vb = (j * nkv + kvh) * hd;
+                            for x in 0..hd {
+                                ob_slice[x] += p * vs[vb + x];
                             }
-                            for (jj, &s) in sc.iter().enumerate() {
-                                let j = lo + jj;
-                                let p = (s - mx).exp() / l;
-                                let vb = (j * nkv + kvh) * hd;
-                                for x in 0..hd {
-                                    ob_slice[x] += p * vs[vb + x];
-                                }
-                            }
-                        });
+                        }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 Op::GatedAct {
@@ -4377,9 +4370,9 @@ impl Backend for CpuBackend {
                     let us = &vals[up.0 as usize];
                     // `up` may be a wider layer-major buffer (E2B); the per-row stride stays `nff`
                     // but the read is shifted by `up_off` (0 for the normal [rows, nff] case). Rows
-                    // are independent — rayon over rows, bit-identical to the serial version.
+                    // are independent — spin-pool over rows, bit-identical to the serial version.
                     let mut out = vec![0f32; rows * nff];
-                    out.par_chunks_mut(nff).enumerate().for_each(|(r, orow)| {
+                    self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = r * nff;
                         let ub = r * nff + up_off;
                         for i in 0..nff {
@@ -4396,11 +4389,11 @@ impl Backend for CpuBackend {
                     act,
                 } => {
                     // Combined [rows, 2*nff] gate|up buffer: gate half first, up half second. Rows
-                    // are independent — rayon over rows, bit-identical to the serial version.
+                    // are independent — spin-pool over rows, bit-identical to the serial version.
                     let (rows, nff) = (rows as usize, nff as usize);
                     let gus = &vals[gu.0 as usize];
                     let mut out = vec![0f32; rows * nff];
-                    out.par_chunks_mut(nff).enumerate().for_each(|(r, orow)| {
+                    self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = r * 2 * nff;
                         for i in 0..nff {
                             orow[i] = act_fn(act, gus[gb + i]) * gus[gb + nff + i];
@@ -4410,13 +4403,13 @@ impl Backend for CpuBackend {
                 }
                 Op::Add { a, b, dst, n } => {
                     let n = n as usize;
-                    // Elementwise with no cross-element dependency — chunked rayon, bit-identical.
-                    // (The old form CLONED the whole `a` vector, then added serially: a ~0.7 MB
-                    // memcpy + a one-thread loop per Add while 31 threads slept.)
+                    // Elementwise with no cross-element dependency — chunked spin-pool, bit-
+                    // identical. (The oldest form CLONED the whole `a` vector, then added serially:
+                    // a ~0.7 MB memcpy + a one-thread loop per Add while 31 threads slept.)
                     let av = &vals[a.0 as usize];
                     let bv = &vals[b.0 as usize];
                     let mut out = vec![0f32; n];
-                    out.par_chunks_mut(4096).enumerate().for_each(|(c, oc)| {
+                    self.pool().for_chunks_mut(&mut out, 4096, 4, &|c, oc| {
                         let base = c * 4096;
                         for (i, o) in oc.iter_mut().enumerate() {
                             *o = av[base + i] + bv[base + i];
@@ -4435,9 +4428,9 @@ impl Backend for CpuBackend {
                     let (rows, n) = (rows as usize, n as usize);
                     let xs = &vals[x.0 as usize];
                     let bv = weight(bias); // bias is a bound weight, not an activation
-                                           // Rows independent — rayon over rows, bit-identical (and no whole-input clone).
+                                           // Rows independent — spin-pool over rows, bit-identical (no whole-input clone).
                     let mut out = vec![0f32; rows * n];
-                    out.par_chunks_mut(n).enumerate().for_each(|(r, orow)| {
+                    self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
                         for (c, o) in orow.iter_mut().enumerate() {
                             *o = xs[r * n + c] + bv[c];
                         }
@@ -4447,9 +4440,9 @@ impl Backend for CpuBackend {
                 Op::Scale { x, dst, s, n } => {
                     let n = n as usize;
                     let xs = &vals[x.0 as usize];
-                    // Elementwise — chunked rayon, bit-identical (and no whole-input clone).
+                    // Elementwise — chunked spin-pool, bit-identical (no whole-input clone).
                     let mut out = vec![0f32; n];
-                    out.par_chunks_mut(4096).enumerate().for_each(|(c, oc)| {
+                    self.pool().for_chunks_mut(&mut out, 4096, 4, &|c, oc| {
                         let base = c * 4096;
                         for (i, o) in oc.iter_mut().enumerate() {
                             *o = xs[base + i] * s;
@@ -4469,9 +4462,9 @@ impl Backend for CpuBackend {
                     let (rows, n) = (rows as usize, n as usize);
                     let xs = &vals[x.0 as usize];
                     let vv = weight(vecid); // vec is a bound weight, not an activation
-                                            // Rows independent — rayon over rows, bit-identical (and no whole-input clone).
+                                            // Rows independent — spin-pool over rows, bit-identical (no whole-input clone).
                     let mut out = vec![0f32; rows * n];
-                    out.par_chunks_mut(n).enumerate().for_each(|(r, orow)| {
+                    self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
                         for (c, o) in orow.iter_mut().enumerate() {
                             *o = xs[r * n + c] * vv[c];
                         }
@@ -4485,9 +4478,9 @@ impl Backend for CpuBackend {
                     // rayon with ZERO numeric change. At the lm_head's shape (256 rows × 262144
                     // vocab = ~67M `tanh` calls) this was the single most expensive scalar loop in
                     // the interpreter outside `Op::Linear`/`Op::MoeFfn`.
-                    // Chunked (not per-element zip — 67M one-element items is pure rayon plumbing).
+                    // Chunked (not per-element zip — 67M one-element items is pure plumbing).
                     let mut out = vec![0f32; n];
-                    out.par_chunks_mut(4096).enumerate().for_each(|(c, oc)| {
+                    self.pool().for_chunks_mut(&mut out, 4096, 4, &|c, oc| {
                         let base = c * 4096;
                         for (i, o) in oc.iter_mut().enumerate() {
                             *o = cap * (xs[base + i] / cap).tanh();
@@ -4553,6 +4546,11 @@ impl Backend for CpuBackend {
                         n_used as usize,
                         n_ff_exp as usize,
                     );
+                    // This whole arm is a long RAYON section (per-expert fan-out + nested
+                    // straggler splitting) — park the spin-pool's waiters now so 31 spinning
+                    // threads don't fight rayon for the cores (measured: DG exec 2.95 -> 3.18s
+                    // when they do). See `SpinPool::pause`.
+                    self.pool().pause();
                     let xs = vals[x.0 as usize].clone();
                     // `router_x` is usually the SAME tensor as `x` (qwen3moe); diffusion-gemma binds
                     // a differently-normalized row (see the `Op::MoeFfn` doc). Clone independently —

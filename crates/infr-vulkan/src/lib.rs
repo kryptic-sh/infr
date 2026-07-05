@@ -312,9 +312,28 @@ impl VulkanBackend {
             .engine_version(vk::make_api_version(0, 0, 1, 0))
             .api_version(vk::API_VERSION_1_3);
 
+        // Portability drivers (MoltenVK on macOS) are HIDDEN by the loader unless the instance
+        // opts in with VK_KHR_portability_enumeration + the matching create flag — without it,
+        // create_instance on a Mac reports "unable to find a Vulkan driver" even with MoltenVK
+        // installed. Probe and opt in when available; a no-op on platforms with native drivers.
+        let inst_exts =
+            unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+        let has_portability = inst_exts.iter().any(|e| {
+            e.extension_name_as_c_str()
+                .is_ok_and(|n| n == c"VK_KHR_portability_enumeration")
+        });
+        let mut inst_ext_ptrs: Vec<*const i8> = Vec::new();
+        let mut inst_flags = vk::InstanceCreateFlags::empty();
+        if has_portability {
+            inst_ext_ptrs.push(c"VK_KHR_portability_enumeration".as_ptr());
+            inst_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+        }
         let instance = unsafe {
             entry.create_instance(
-                &vk::InstanceCreateInfo::default().application_info(&app_info),
+                &vk::InstanceCreateInfo::default()
+                    .application_info(&app_info)
+                    .enabled_extension_names(&inst_ext_ptrs)
+                    .flags(inst_flags),
                 None,
             )
         }
@@ -361,11 +380,23 @@ impl VulkanBackend {
         let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
         let has_mem_budget = has_ext(c"VK_EXT_memory_budget");
 
-        // ── probe f16 feature (via VK 1.1 get_physical_device_features2) ──────
+        // ── probe features (via VK 1.1 get_physical_device_features2) ─────────
+        // Memory model and subgroup-size-control are probed rather than assumed: a portability
+        // device (MoltenVK) may lack either, and enabling an unsupported feature fails
+        // create_device outright.
         let mut f16_feat = vk::PhysicalDeviceShaderFloat16Int8Features::default();
-        let mut feat2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f16_feat);
+        let mut memmodel_feat = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
+        let mut sgsize_feat = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
+        let mut feat2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut f16_feat)
+            .push_next(&mut memmodel_feat)
+            .push_next(&mut sgsize_feat);
         unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
         let has_f16 = f16_feat.shader_float16 != 0;
+        let has_memmodel = memmodel_feat.vulkan_memory_model != 0;
+        let has_memmodel_dev = memmodel_feat.vulkan_memory_model_device_scope != 0;
+        let has_sgsize = sgsize_feat.subgroup_size_control != 0;
+        let has_full_sg = sgsize_feat.compute_full_subgroups != 0;
 
         // ── build extension name list (only available ones) ────────────────────
         let mut ext_ptrs: Vec<*const i8> = Vec::new();
@@ -383,6 +414,11 @@ impl VulkanBackend {
         }
         if has_mem_budget {
             ext_ptrs.push(c"VK_EXT_memory_budget".as_ptr());
+        }
+        // A portability (layered) device REQUIRES VK_KHR_portability_subset to be enabled when
+        // it advertises it (Vulkan valid-usage rule); MoltenVK does.
+        if has_ext(c"VK_KHR_portability_subset") {
+            ext_ptrs.push(c"VK_KHR_portability_subset".as_ptr());
         }
 
         // ── logical device ─────────────────────────────────────────────────────
@@ -402,14 +438,14 @@ impl VulkanBackend {
         let mut storage8_ci = vk::PhysicalDevice8BitStorageFeatures::default()
             .storage_buffer8_bit_access(has_8bit_storage);
         let mut memmodel_ci = vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
-            .vulkan_memory_model(true)
-            .vulkan_memory_model_device_scope(true);
+            .vulkan_memory_model(has_memmodel)
+            .vulkan_memory_model_device_scope(has_memmodel_dev);
         let mut coopmat_ci =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         // Lets us pin the subgroup size to 32 (RDNA3 coopmat is wave32) for the tiled GEMM.
         let mut sgsize_ci = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
-            .subgroup_size_control(true)
-            .compute_full_subgroups(true);
+            .subgroup_size_control(has_sgsize)
+            .compute_full_subgroups(has_full_sg);
 
         let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_ci))

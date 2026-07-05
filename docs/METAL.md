@@ -1,11 +1,12 @@
 # infr-metal — Apple GPU backend architecture
 
-State as of 2026-07-03 (PRs #4-#14 merged, #15 = native legacy quants + replay
-concurrency + counter profiler). `crates/infr-metal` implements the same
-`Backend` seam as `infr-cpu` and `infr-vulkan` on Apple's Metal API. It started
-as a correctness-first reference (per-op command buffers, dequant-to-f32
-everything) and was rebuilt profiling-first; this doc records the architecture
-that emerged and the measured reasoning behind it.
+State as of 2026-07-05 (the decode-parity campaign + spec decode, multi-slot
+serve, native-read KV, MTP, and the replay-tape correctness fix all landed).
+`crates/infr-metal` implements the same `Backend` seam as `infr-cpu` and
+`infr-vulkan` on Apple's Metal API. It started as a correctness-first reference
+(per-op command buffers, dequant-to-f32 everything) and was rebuilt
+profiling-first; this doc records the architecture that emerged and the measured
+reasoning behind it.
 
 ## Numbers (M3 Pro 18-core, `infr compare --sweep --dev MTL0`, same GGUFs)
 
@@ -233,6 +234,20 @@ MoE decode tapes (the device expert path resolves all data dependence on-GPU),
 and so does the llama arch (`Op::Rope` reads the bound positions buffer,
 replay-safe by construction).
 
+**The tape is a per-backend cache matched on a `(op-sequence,
+bound-buffer-address)` fingerprint, and it is invalidated on `compile()`.** That
+invalidation is load-bearing correctness, not hygiene: the fingerprint can
+COLLIDE across independent compile+execute calls once the allocator reuses a
+freed buffer's address, which would replay a structurally-stale tape (garbage /
+zeroed output). Only the seam's decode loop — which compiles its plan ONCE and
+executes it per token — keeps a live tape; any code that recompiles a
+decode-shaped graph with fresh IO buffers (the MTP head, which rebuilt a
+rows==1 rope+attention graph every draft step) records afresh instead. This was
+a real bug: the MTP head intermittently replayed a stale zeroed tape, dropping
+its draft acceptance from 0.82 to 0.26 with no error anywhere. When repeated-
+compile GPU output is intermittently zero/garbage, suspect the tape fingerprint
+FIRST.
+
 ## Linear attention (DeltaNet / Qwen3-Next)
 
 `deltanet_f32_k{1,2,4,8}`: one SIMDGROUP per (value-dim, head) — 32 lanes split
@@ -262,6 +277,36 @@ residual (~5-7 ms/row) is NOT simdgroup drift — a lockstep variant
 (ALU-bound) and split-K cooperative (latency-bound) forms lost too; all three
 classes are measured and parked.
 
+Speculative serve is slotted: the target/draft session pair each pick their
+best-prefix slot per request (`SlotPool`, below), so a conversation switch on a
+multi-user spec serve costs a suffix prefill, not a full re-prefill of both
+models — measured 4.2× on conversation return (2.0 s vs 8.4 s at ~1600-token
+contexts).
+
+## MTP (multi-token prediction, `INFR_MTP=1`)
+
+A qwen35 GGUF that ships a trained MTP head (`nextn.*` at `blk.{n_layer}`,
+`Config::n_layer_nextn`) can draft with the head instead of a separate draft
+model: `MtpHeadSession` runs the head's one-layer forward per draft step, the
+target trunk verifies (the same `run_verify` all-rows-logits+hidden path spec
+decode uses), catch-up re-syncs the head KV. The driver is backend-generic
+(`generate_mtp_spec_core` over `&dyn Backend`) with `_vulkan`/`_metal`/`_cpu`
+wrappers; the CPU one is the exact-f32 acceptance ORACLE (a backend whose head
+numerics drift shows up as a lower alpha against it).
+
+Correctness holds on Metal — MTP output is token-identical to target-only
+greedy, and acceptance is 0.82 (the CPU/f32 oracle is 0.96; the residual is
+ordinary f16). But MTP is **net-negative on Metal today**, and the profile says
+why: it is NOT the head or the lm_head — it is the qwen35 no-rewind reprefill.
+DeltaNet's recurrent state can't rewind, so every rejected draft re-prefills the
+whole committed context (`start==0` verify, `m` = full length, ~100 ms+ at
+depth), and at alpha 0.82 rejects are frequent enough that reprefills dominate
+the 74% "verify" share. The fix is DeltaNet state checkpointing (save per
+committed position, restore on reject) — a cross-backend engine feature, not a
+Metal kernel lever; parked because at the Vulkan alpha (~0.95) reprefills are
+~11% of verify, but Metal's lower f16 alpha amplifies them. See "Remaining
+levers".
+
 ## Multi-turn serve: conversation slots
 
 Both GPU sessions share the backend-agnostic `SlotPool` (`INFR_KV_SLOTS`,
@@ -286,12 +331,14 @@ resolve reads the NSData directly.)
 
 ## Tests
 
-`tests/parity.rs` — 90 GPU parity tests vs the CPU reference: every op, and for
+`tests/parity.rs` — 94 GPU parity tests vs the CPU reference: every op, and for
 quantized Linear every (format × kernel shape) pair including partial tiles, the
 small-m split-K regime at real verify shapes, and deep-coupled quant-KV
 attention at kv_len=2048; attention covers
 unsplit/split8/split32/flash/flash2/vec, sliding windows at both tile and block
-granularity, partial query tiles, and the retained hd=72/96 routes.
+granularity, partial query tiles, the retained hd=72/96 routes, and the
+hd=256 rows==1 short-kv `attnsplit` + hd=256 partial-rope (`freq_base` 1e7)
+cases the MTP head decode exercises (which nothing taped ever reaches).
 `tests/kernel_names.rs` — the missing-kernel tripwire: every kernel-shaped
 literal in exec.rs must resolve in the compiled library (the cap-check fallback
 otherwise turns a vanished kernel into silent perf loss — it happened once, 3×
@@ -357,6 +404,11 @@ a new evidence class or new hardware:
 - qwen35 prefill residual (0.80×): the Linear band at the GEMM floor — qwen35
   runs more projections per token than dense; same instrument gap as the prefill
   GEMM lever above.
+- MTP profitability on Metal (net-negative today, see the MTP section): the
+  ceiling is the qwen35 no-rewind reprefill on every rejected draft, NOT any
+  Metal kernel — the fix is engine-level DeltaNet state checkpointing
+  (cross-backend), amplified on Metal only because f16 alpha (0.82) is below the
+  Vulkan reference (~0.95). No Metal-side lever; measured and handed back.
 - DiffusionGemma batched MoE (Phase D left this unbuilt, see
   `docs/DIFFUSIONGEMMA.md`): the fused `ffn_gate_up_exps`/`ffn_down_exps` layout
   doesn't fit the device MoE kernels' assumed shape, so DG's MoE FFN still runs

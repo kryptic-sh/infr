@@ -1213,6 +1213,43 @@ fn qknormrope_parity() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
 }
 
+// The qwen35 MTP head's exact QkNormRope shape: head_dim=256 with a PARTIAL rope_dim=64 (dims
+// 64..256 pass through unrotated) and a high freq_base (1e7). The `qknormrope_parity` above only
+// exercises head_dim==rope_dim==128 at theta 1e4, so partial rope at hd=256 was uncovered — the
+// one caller is the MTP head, whose per-draft decode diverged from CPU starting at position 2
+// (position 0's rotation is identity, so a rotation bug only shows once the angle is non-trivial).
+// rows here span positions 0..6 explicitly so the ≥2 positions are on the tested path.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn qknormrope_hd256_partial_parity() {
+    let (rows, nh, hd, rd) = (6usize, 16usize, 256usize, 64usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![hd], DType::F32));
+    let pos = g.input(TensorDesc::new(vec![rows], DType::I32));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::QkNormRope {
+        x,
+        weight: w,
+        positions: pos,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        rope_dim: rd as u32,
+        theta: 1.0e7,
+        eps: 1e-6,
+        freq_factors: None,
+    });
+    let positions: Vec<i32> = (0..rows as i32).collect(); // 0,1,2,3,4,5 — includes pos >= 2
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(rows * nh * hd, 34))),
+        (w, f32_bytes(&rand_f32(hd, 35))),
+        (pos, i32_bytes(&positions)),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn writekv_f16_parity() {
@@ -1566,6 +1603,52 @@ fn attention_gqa_causal_parity() {
         (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 43))),
     ];
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+}
+
+// rows==1 decode at hd=256 with a SHORT kv_len (< 128): rows*n_head < 128 so it's not a wide
+// launch, and kv_len < 128 so neither the vec nor split32 tier applies (split32 is hd<=128
+// only) — it routes to the 8-way `attnsplit_f16kv`. Every other hd=256 decode in the engine is
+// TAPED (attnvec_dyn_hd256), so this attnsplit path is otherwise unexercised; the MTP head's
+// per-draft-step decode is the one real caller (kv_len grows 1,2,3,… as the head accumulates
+// its own KV), and it diverged there from kv_len 3 on. GQA (nkv=4) like the qwen35 head.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_decode_hd256_short_kv_parity() {
+    for kv_len in [1usize, 2, 3, 5, 8] {
+        let (rows, nh, nkv, hd) = (1usize, 16usize, 4usize, 256usize);
+        let pos = kv_len - 1;
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale: 1.0 / (hd as f32).sqrt(),
+            mask: infr_core::graph::AttnMask::Causal,
+            pos: pos as u32,
+        });
+        let bound = vec![
+            (q, f32_bytes(&rand_f32(rows * nh * hd, 71 + kv_len as u64))),
+            (
+                kc,
+                f16_bytes(&rand_f32(kv_len * nkv * hd, 72 + kv_len as u64)),
+            ),
+            (
+                vc,
+                f16_bytes(&rand_f32(kv_len * nkv * hd, 73 + kv_len as u64)),
+            ),
+        ];
+        assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
+    }
 }
 
 // Wide launch, short context (rows*n_head >= 128, kv_len < 128): routes to the lean unsplit

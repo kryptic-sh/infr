@@ -292,6 +292,16 @@ impl Backend for MetalBackend {
     }
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
+        // Invalidate any recorded decode-replay tape: it belongs to the PREVIOUSLY compiled
+        // plan, and the tape only matches on a (op-sequence, bound-buffer-address) fingerprint —
+        // which can COLLIDE across independent compile+execute calls once the allocator reuses a
+        // freed buffer's address, replaying a structurally-stale tape (observed: the MTP head
+        // forward, which recompiles a decode-shaped graph every draft step with fresh IO buffers,
+        // intermittently got a garbage/zeroed replay of an earlier forward). The seam's decode
+        // loop — the ONLY intended replay user — compiles its plan ONCE and executes it per
+        // token, so its tape survives and still replays; anything that recompiles gets a clean
+        // slate and records afresh.
+        *self.replay.lock().unwrap() = None;
         Ok(GraphPlan::boxed(graph))
     }
 

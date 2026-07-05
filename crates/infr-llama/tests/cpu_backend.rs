@@ -1501,6 +1501,90 @@ fn mtp_head_trunk_acceptance_rate() {
     );
 }
 
+// ─── MTP Phase 3: the self-speculative generation loop (issue #33) ──────────────────────────────
+//
+// See docs/MTP.md. Phase 3 wires the head into a full generation loop (`crate::mtp::
+// generate_mtp_spec_vulkan`) on the production Vulkan seam — these tests drive THAT loop, not the
+// head primitives directly (Phase 2's tests above already cover those in isolation).
+
+/// **The Phase 3 hard bar**: self-speculative MTP decoding must be output-IDENTICAL to plain
+/// target-only greedy decoding on the SAME (real, production) Vulkan seam — the spec ≡
+/// target-greedy invariant `docs/MTP.md`'s own oracle run holds ("byte-identical output"). No
+/// tolerance, no golden hash — a real string equality on a real generation. If this fails, the
+/// accept/commit/KV logic is wrong (see `crate::mtp::generate_mtp_spec_vulkan`'s doc on the
+/// KV-overwrite/no-rewind semantics it relies on) — debug that, don't relax this assertion.
+#[test]
+fn mtp_spec_matches_target_only_greedy() {
+    need_gpu!();
+    let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let prompt = model
+        .render_chat("Tell me a short story about a brave knight.")
+        .expect("render chat");
+    let max_new = 64usize;
+
+    let mut plain = String::new();
+    {
+        let mut sess = model
+            .vulkan_session(prompt.len() + max_new + 64)
+            .expect("target-only session");
+        model
+            .generate_vulkan_session(&mut sess, &prompt, max_new, |p| plain.push_str(p))
+            .expect("target-only greedy");
+    }
+
+    let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
+
+    let mut spec = String::new();
+    infr_llama::mtp::generate_mtp_spec_vulkan(&model, &head, &prompt, max_new, |p| {
+        spec.push_str(p)
+    })
+    .expect("mtp spec decode");
+
+    assert_eq!(
+        spec, plain,
+        "MTP self-speculative stream diverged from target-only greedy"
+    );
+}
+
+/// Acceptance-rate report over a longer generation, 2-3 prompts (`INFR_MTP_TIME=1` also prints a
+/// per-cycle breakdown to stderr — run this test with `-- --nocapture` and that env var set to see
+/// it). Not gated on a specific number (`mtp_head_trunk_acceptance_rate` already sanity-checks the
+/// head's own per-step rate against the oracle's implied ~0.5) — this just surfaces the aggregate
+/// alpha the full loop achieves so it's visible in normal test output.
+#[test]
+fn mtp_spec_acceptance_stats() {
+    need_gpu!();
+    let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
+
+    for user in [
+        "Tell me a short story about a brave knight.",
+        "What is the capital of France?",
+        "Explain how photosynthesis works in two sentences.",
+    ] {
+        let prompt = model.render_chat(user).expect("render chat");
+        let mut out = String::new();
+        let stats = infr_llama::mtp::generate_mtp_spec_vulkan(&model, &head, &prompt, 128, |p| {
+            out.push_str(p)
+        })
+        .expect("mtp spec decode");
+        println!(
+            "mtp_spec_acceptance_stats: {user:?} -> {} tokens in {:.2}s prompt + {:.2}s decode",
+            stats.n_gen, stats.prompt_secs, stats.decode_secs
+        );
+    }
+}
+
 // ─── Qwen3-MoE (routed experts) ─────────────────────────────────────────────────
 
 fn qwen3moe_30b() -> Option<PathBuf> {

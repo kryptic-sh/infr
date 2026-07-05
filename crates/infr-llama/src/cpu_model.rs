@@ -1206,10 +1206,9 @@ impl DiffusionGemmaMetalSession {
 /// [next]` is always exactly `verify_argmax[..=accepted]` — the target's own greedy stream — no
 /// matter what the draft proposed. That is what makes speculative decoding output-identical to
 /// target-only greedy; a wrong draft only shortens the accepted prefix, never commits a wrong
-/// token. (`cfg(any(macos, test))`: the only caller is the macOS spec driver, but the logic is
-/// backend-agnostic so its tests run everywhere.)
-#[cfg(any(target_os = "macos", test))]
-fn spec_accept(cand: &[u32], verify_argmax: &[u32]) -> (usize, u32) {
+/// token. Backend-agnostic (no `cfg` gate): the macOS spec driver above and `crate::mtp`'s Vulkan
+/// MTP spec driver (issue #33) both call this — one pure acceptance rule for every spec flavor.
+pub(crate) fn spec_accept(cand: &[u32], verify_argmax: &[u32]) -> (usize, u32) {
     debug_assert_eq!(verify_argmax.len(), cand.len() + 1);
     let accepted = cand
         .iter()

@@ -684,6 +684,12 @@ pub struct MtpHeadSession<'a> {
     k_cache: Box<dyn Buffer>,
     v_cache: Box<dyn Buffer>,
     max_ctx: usize,
+    /// Phase 3 perf instrumentation (issue #33, `INFR_MTP_TIME=1` — see
+    /// `generate_mtp_spec_vulkan`'s doc on the per-call rebuild cost this is meant to quantify):
+    /// cumulative seconds spent building+compiling a fresh [`Graph`] per [`forward`](Self::forward)
+    /// call vs executing it, reset by [`take_timing`](Self::take_timing).
+    build_secs: f64,
+    exec_secs: f64,
 }
 
 impl<'a> MtpHeadSession<'a> {
@@ -774,7 +780,18 @@ impl<'a> MtpHeadSession<'a> {
             k_cache,
             v_cache,
             max_ctx,
+            build_secs: 0.0,
+            exec_secs: 0.0,
         })
+    }
+
+    /// Drain the cumulative build-vs-exec timing since the last call (or construction) —
+    /// `generate_mtp_spec_vulkan`'s `INFR_MTP_TIME=1` breakdown reads this once per spec cycle.
+    pub fn take_timing(&mut self) -> (f64, f64) {
+        (
+            std::mem::take(&mut self.build_secs),
+            std::mem::take(&mut self.exec_secs),
+        )
     }
 
     /// One head forward over `rows = tokens.len()` `(token, h_target)` pairs at absolute KV
@@ -810,9 +827,12 @@ impl<'a> MtpHeadSession<'a> {
         }
         let positions: Vec<i32> = (start_pos as i32..(start_pos + rows) as i32).collect();
 
+        let t_build = std::time::Instant::now();
         let (graph, h) = build_mtp_graph(&self.cfg, &self.wspecs, self.max_ctx, rows, start_pos);
         let plan = self.be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
+        self.build_secs += t_build.elapsed().as_secs_f64();
 
+        let t_exec = std::time::Instant::now();
         let e_buf = self
             .be
             .alloc(rows * ne * 4, BufferUsage::Staging)
@@ -868,6 +888,7 @@ impl<'a> MtpHeadSession<'a> {
         self.be
             .download(hmtp_buf.as_ref(), bytemuck::cast_slice_mut(&mut h_mtp))
             .map_err(|e| anyhow!("{e}"))?;
+        self.exec_secs += t_exec.elapsed().as_secs_f64();
         Ok((logits, h_mtp))
     }
 }
@@ -948,4 +969,343 @@ fn top1_softmax(logits: &[f32]) -> (u32, f32) {
     }
     let z: f32 = logits.iter().map(|&v| (v - m).exp()).sum();
     (amax as u32, 1.0 / z)
+}
+
+// ─── Phase 3: the MTP self-speculative generation loop + run/serve wiring (issue #33) ───────────
+
+/// llama.cpp's oracle run used `--spec-draft-n-max 6` (`docs/MTP.md`) — the max candidates drafted
+/// per cycle before a batched verify.
+pub const DEFAULT_N_MAX: usize = 6;
+
+/// One batched VERIFY forward (`cpu_backend.rs`'s VERIFY branch) over `tokens`' un-cached suffix,
+/// on a persistent Vulkan session, ALSO capturing `h` for every returned row — the primitive
+/// [`generate_mtp_spec_vulkan`] needs every cycle (`crate::cpu_model::CpuModel`'s own
+/// `verify_dense_*_with_h` helpers all use a FRESH one-shot session; this one threads `state`
+/// across calls so the trunk's KV/DeltaNet state persists cycle to cycle — the whole point of
+/// self-speculative decoding). Returns `(logits [m*vocab], h [m*n_embd])`, `m = tokens.len() -
+/// (tokens already cached in `state`)`.
+#[allow(clippy::too_many_arguments)]
+fn run_verify(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &crate::Config,
+    token_embd: &[f32],
+    tokens: &[u32],
+    state: &mut Option<crate::cpu_backend::SeamKv>,
+    max_ctx: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let mut logits = Vec::new();
+    let mut h = Vec::new();
+    crate::cpu_backend::generate_dense_backend(
+        vk,
+        &|_name, tb, dt, _n| {
+            let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+            let buf = vk
+                .alloc(padded.len(), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            vk.upload(buf.as_ref(), &padded)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok((buf, dt))
+        },
+        g,
+        cfg,
+        token_embd,
+        None,
+        tokens,
+        0,
+        |_| {},
+        state,
+        max_ctx,
+        None,
+        Some(&mut logits),
+        None,
+        Some(&mut h),
+        None,
+    )?;
+    Ok((logits, h))
+}
+
+/// Greedy argmax over one `[vocab]` logits row (unlike [`top1_softmax`], no probability needed —
+/// `spec_accept`/the verify-round check only reads the winning id).
+fn argmax_row(row: &[f32]) -> u32 {
+    let mut bi = 0usize;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &v) in row.iter().enumerate() {
+        if v > bv {
+            bv = v;
+            bi = i;
+        }
+    }
+    bi as u32
+}
+
+/// The MTP self-speculative generation loop (issue #33, Phase 3 — see `docs/MTP.md`'s driver
+/// section and `crate::cpu_model::CpuModel::generate_metal_spec`, whose two-model draft/verify/
+/// commit shape this mirrors for a SINGLE self-speculating trunk on the Vulkan production
+/// backend). **Greedy only** (temp 0) — the commit/accept invariant below only holds at temp 0;
+/// sampling-temperature support is a follow-up phase.
+///
+/// No cross-turn KV reuse: every call builds a FRESH trunk session + [`MtpHeadSession`] and
+/// re-prefills the WHOLE (rendered, multi-turn-inclusive) prompt from scratch. `DenseSeamChat`'s
+/// non-MTP path keeps a persistent per-conversation `DenseVulkanSession`; MTP's
+/// win is DECODE throughput (the thing `docs/MTP.md`'s 2.0x oracle number measures), not prefill
+/// reuse, so trading a little prefill cost for a MUCH simpler (and correct) session lifetime is
+/// the pragmatic call this phase makes — a real persistent MTP session hits a self-referential-
+/// struct problem ([`MtpHeadSession`] borrows the backend + embedding table it's built from) that
+/// isn't worth solving until multi-turn MTP throughput is actually the bottleneck being chased.
+///
+/// ## Round structure (ported from `speculative.cpp`'s `common_speculative_impl_draft_mtp` driver
+/// loop around the target decode, adapted to infr's own VERIFY primitive)
+/// 1. **Prime** (once): a single batched VERIFY forward over the WHOLE prompt captures `h` for
+///    EVERY prompt row in one shot (no chunked-prefill h gap for the prompt sizes this phase
+///    validates — a genuinely huge prompt would need the lazy-priming fallback `docs/MTP.md`
+///    sanctions instead: "MTP attention over a partial-history KV degrades gracefully"). `catch_up`
+///    primes the head over the whole prompt — mirrors `mtp_head_forward_finite`'s `prime_head` test
+///    helper exactly (`shifted_h[0]` zero, `pending_h` = the last row).
+/// 2. **Cycle**: `draft` up to `n_max` tokens off `(id_last, pending_h)`; one batched VERIFY over
+///    `[committed | drafted]`; `crate::cpu_model::spec_accept` picks the longest accepted prefix +
+///    the target's correction/bonus token — EXACTLY the macOS spec driver's rule, so the same
+///    "committed stream == target's own greedy argmax stream" invariant holds here.
+///
+/// ## The `+1` leading row, and why cycle 1 is special
+/// Every cycle's VERIFY feed is `committed ++ drafted`, and `committed` always includes ONE token
+/// the trunk session hasn't been fed yet (the previous cycle's correction/bonus token) — so every
+/// VERIFY call after the first returns `drafted.len() + 1` rows: a leading row that re-confirms/
+/// predicts `drafted[0]`, found at `base = m - (drafted.len() + 1)`. Cycle 1 has NO such leading
+/// row (the prime step already verified — and cached — the WHOLE prompt, so `committed` exactly
+/// equals what's cached when cycle 1's draft is proposed): its leading prediction is instead the
+/// prime step's own LAST logits/h row (the prompt's last token predicting whatever comes right
+/// after it), spliced in as a virtual row so the SAME accept/catch-up code handles cycle 1
+/// identically to every later cycle.
+///
+/// ## KV-overwrite / no-rewind semantics this relies on (see `cpu_backend.rs`)
+/// The trunk session's VERIFY branch always extends `cached` by the WHOLE fed suffix, accepted or
+/// not (`cached.extend_from_slice(&prompt[start..])`) — a rejected draft's rows simply get
+/// OVERWRITTEN by the next cycle's differing suffix, exactly like the macOS dense/attention spec
+/// driver (`CpuModel::generate_metal_spec`'s own doc: "Rollback is the session prefix-diff:
+/// rejected rows just get overwritten by the next round's suffix prefill"). qwen35's gated-
+/// DeltaNet layers can't rewind that way (an append-only recurrent summary, not a per-position
+/// cache — `docs/QWEN35.md`): the SAME `generate_dense_backend` prefix-diff logic that reuses
+/// dense KV rows falls back to a FULL reprefill from position 0 whenever a cycle's committed
+/// stream doesn't EXACTLY extend the trunk's cached tokens (`cpu_backend.rs`'s `start`
+/// computation, the `c.qwen35` branch) — i.e. every partial/zero-accept cycle pays a full
+/// re-prefill of the WHOLE conversation so far. This is an EXISTING limitation of qwen35's KV
+/// reuse (predates MTP; it would bite ANY qwen35 speculative scheme, draft-model or MTP), not
+/// something this phase introduces — see `INFR_MTP_TIME=1`'s per-cycle report for its measured
+/// cost, and the accompanying report for whether it's the dominant cost. The head's OWN KV has no
+/// such issue: `MtpHeadSession`'s attention layer is an ordinary per-position cache (`docs/MTP.md`),
+/// so `catch_up` only ever (re)writes the newly-committed rows, never the whole history.
+///
+/// ## Perf instrumentation (`INFR_MTP_TIME=1`)
+/// Prints one line per cycle (`drafted`/`accepted` counts, `draft`/`verify`/`catchup` wall time,
+/// and the `build`/`exec` split `MtpHeadSession` accumulates internally — Phase 2's doc already
+/// flags the head graph as rebuilding + recompiling from scratch every `forward` call, since
+/// `Op::Attention::kv_len`/`Op::WriteKv::pos` are baked into the graph rather than bound inputs;
+/// this is the number that quantifies that cost) plus a final aggregate-`alpha` summary.
+pub fn generate_mtp_spec_vulkan(
+    model: &crate::CpuModel,
+    head: &MtpHeadWeights,
+    prompt: &str,
+    max_new: usize,
+    mut on_piece: impl FnMut(&str),
+) -> Result<crate::GenStats> {
+    let cfg = model.config();
+    let ne = cfg.n_embd;
+    let vocab = cfg.vocab;
+    let n_max = DEFAULT_N_MAX;
+    let time_mtp = std::env::var("INFR_MTP_TIME").is_ok();
+    let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
+    let hit_eos = |t: u32| !ignore_eos && (cfg.eos_ids.contains(&t) || t == cfg.eos);
+
+    let prompt_tokens = model.encode(prompt)?;
+    anyhow::ensure!(
+        !prompt_tokens.is_empty(),
+        "generate_mtp_spec_vulkan: empty prompt"
+    );
+    let p = prompt_tokens.len();
+    let max_ctx = p + max_new + n_max + 8;
+
+    let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+    let mut trunk_state: Option<crate::cpu_backend::SeamKv> = None;
+    let mut head_sess =
+        MtpHeadSession::new_vulkan(&vk, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
+
+    // ── prime: one VERIFY over the whole prompt, then catch the head up over it ──────────────
+    let t_prime = std::time::Instant::now();
+    let (logits0, h_rows0) = run_verify(
+        &vk,
+        model.gguf(),
+        cfg,
+        model.token_embd(),
+        &prompt_tokens,
+        &mut trunk_state,
+        max_ctx,
+    )?;
+    let prime_verify_secs = t_prime.elapsed().as_secs_f64();
+    anyhow::ensure!(
+        h_rows0.len() == p * ne,
+        "prime verify: h_rows0 length {} != {p}*{ne}",
+        h_rows0.len()
+    );
+
+    let mut shifted_h = vec![0f32; p * ne];
+    if p > 1 {
+        shifted_h[ne..].copy_from_slice(&h_rows0[..(p - 1) * ne]);
+    }
+    catch_up(&mut head_sess, &prompt_tokens, &shifted_h, 0)?;
+
+    let mut committed = prompt_tokens.clone();
+    let mut id_last = prompt_tokens[p - 1];
+    let mut pending_h = h_rows0[(p - 1) * ne..].to_vec();
+    let mut n_past = p;
+
+    // Cycle 1's virtual leading row (see this fn's doc) — `None` from cycle 2 on, once consumed.
+    let mut leading_logits: Option<Vec<f32>> = Some(logits0[(p - 1) * vocab..].to_vec());
+    let mut leading_h: Option<Vec<f32>> = Some(pending_h.clone());
+
+    let mut acc: Vec<u32> = Vec::new();
+    let mut printed = 0usize;
+    let mut out: Vec<u32> = Vec::new();
+    let mut cycle = 0usize;
+    let mut total_drafted = 0usize;
+    let mut total_accepted = 0usize;
+    let t_decode = std::time::Instant::now();
+
+    'cycles: while out.len() < max_new {
+        let n_max_round = n_max.min(max_new - out.len());
+        if n_max_round == 0 {
+            break;
+        }
+        cycle += 1;
+
+        let t_draft = std::time::Instant::now();
+        let drafted = draft(
+            &mut head_sess,
+            id_last,
+            &pending_h,
+            n_past,
+            DEFAULT_P_MIN,
+            n_max_round,
+        )?;
+        let draft_secs = t_draft.elapsed().as_secs_f64();
+        let cand: Vec<u32> = drafted.iter().map(|&(id, _)| id).collect();
+
+        let mut feed = committed.clone();
+        feed.extend_from_slice(&cand);
+        let t_verify = std::time::Instant::now();
+        let (logits, h_rows) = run_verify(
+            &vk,
+            model.gguf(),
+            cfg,
+            model.token_embd(),
+            &feed,
+            &mut trunk_state,
+            max_ctx,
+        )?;
+        let verify_secs = t_verify.elapsed().as_secs_f64();
+        let m = h_rows.len() / ne;
+
+        let has_leading = leading_logits.is_some();
+        let varg: Vec<u32> = if let (Some(ll), Some(_)) = (&leading_logits, &leading_h) {
+            debug_assert_eq!(m, cand.len(), "cycle 1 verify carries no leading row");
+            std::iter::once(argmax_row(ll))
+                .chain((0..cand.len()).map(|j| argmax_row(&logits[j * vocab..(j + 1) * vocab])))
+                .collect()
+        } else {
+            let base = m - (cand.len() + 1);
+            (0..=cand.len())
+                .map(|j| argmax_row(&logits[(base + j) * vocab..(base + j + 1) * vocab]))
+                .collect()
+        };
+
+        let (accepted, next_tok) = crate::cpu_model::spec_accept(&cand, &varg);
+        total_drafted += cand.len();
+        total_accepted += accepted;
+
+        // The (accepted+1) rows of `h` to catch the head's KV up to — row 0 is the virtual/real
+        // leading row, rows 1.. are this cycle's own verify output (see this fn's doc).
+        let catchup_h_all: Vec<f32> = if has_leading {
+            let mut v = leading_h.take().expect("has_leading implies Some");
+            leading_logits = None;
+            v.extend_from_slice(&h_rows);
+            v
+        } else {
+            let base = m - (cand.len() + 1);
+            h_rows[base * ne..].to_vec()
+        };
+        let mut catchup_tokens: Vec<u32> = cand[..accepted].to_vec();
+        catchup_tokens.push(next_tok);
+        let catchup_h = &catchup_h_all[..(accepted + 1) * ne];
+
+        let t_catchup = std::time::Instant::now();
+        catch_up(&mut head_sess, &catchup_tokens, catchup_h, n_past + 1)?;
+        let catchup_secs = t_catchup.elapsed().as_secs_f64();
+        pending_h = catchup_h[accepted * ne..].to_vec();
+
+        let (build_secs, exec_secs) = head_sess.take_timing();
+        if time_mtp {
+            eprintln!(
+                "[mtp cycle {cycle}] drafted={} accepted={accepted} \
+                 draft={:.1}ms verify={:.1}ms catchup={:.1}ms build={:.1}ms exec={:.1}ms",
+                cand.len(),
+                draft_secs * 1e3,
+                verify_secs * 1e3,
+                catchup_secs * 1e3,
+                build_secs * 1e3,
+                exec_secs * 1e3,
+            );
+        }
+
+        let mut stop = false;
+        for &c in &cand[..accepted] {
+            let eos_hit = hit_eos(c);
+            out.push(c);
+            committed.push(c);
+            if !eos_hit {
+                crate::stream_token(model.tokenizer(), &mut acc, &mut printed, c, &mut on_piece);
+            }
+            if eos_hit || out.len() >= max_new {
+                stop = true;
+                break;
+            }
+        }
+        if !stop {
+            let eos_hit = hit_eos(next_tok);
+            out.push(next_tok);
+            committed.push(next_tok);
+            if !eos_hit {
+                crate::stream_token(
+                    model.tokenizer(),
+                    &mut acc,
+                    &mut printed,
+                    next_tok,
+                    &mut on_piece,
+                );
+            }
+            if eos_hit || out.len() >= max_new {
+                stop = true;
+            }
+        }
+        if stop {
+            break 'cycles;
+        }
+
+        id_last = next_tok;
+        n_past = committed.len();
+    }
+
+    if time_mtp {
+        let alpha = total_accepted as f64 / total_drafted.max(1) as f64;
+        eprintln!(
+            "[mtp summary] {cycle} cycles, {total_accepted}/{total_drafted} accepted (alpha={alpha:.3}), {} tokens generated",
+            out.len()
+        );
+    }
+
+    Ok(crate::GenStats {
+        n_prompt: p,
+        prompt_secs: prime_verify_secs,
+        n_gen: out.len(),
+        decode_secs: t_decode.elapsed().as_secs_f64(),
+    })
 }

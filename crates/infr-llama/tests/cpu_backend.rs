@@ -1592,8 +1592,13 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 }
 
 // Captured + verified coherent (qwen3moe: routed-expert FFN, ~3B active of 30B).
+// Re-blessed 2026-07-05 for the whole-call int8 MoE gate (multi-row PREFILL calls now run the
+// int8-activation fast path in every bucket — a deliberate numeric-regime change; see
+// `expert_matvec_batch`'s `int8_ok` doc). Verified coherent ("<think>\nOkay, the user is asking,
+// \"The capital of France is...\" and then it cuts off. I need") — a near-tie token flipped
+// mid-thought vs the previous capture, same meaning.
 const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 24, 0xdac3e0eea1da12ed)];
+    &[("The capital of France is", 24, 0xa68ab7f4d15ad931)];
 
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.

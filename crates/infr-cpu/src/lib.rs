@@ -2124,7 +2124,27 @@ fn quantize_q8_32(x: &[f32]) -> Q8x32 {
 /// already encodes it, see `dequant_block`'s Q8_0 case), so `Σy·x = d_w·Σ(qw·x) ≈ d_w·d8·Σ(qw·q8)`.
 /// The weight row's per-block `d_w` is read once, then dotted against every one of the `count` token
 /// activations — same amortization as the other `_batch` kernels, just without an f32 intermediate.
+/// Dispatches to the best SIMD path available at runtime (avx512bw → avx2 → scalar) — this is
+/// DiffusionGemma's `down` projection kernel (`n_ff_exp=704` isn't a multiple of 256, so it can't use
+/// the K-quant/Q8_0-256 batch path above), previously the single largest scalar hot loop in the MoE
+/// arm (measured via `INFR_PROF_OPS=1`'s per-stage MoeFfn breakdown).
 fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_q8_0_32_batch_avx512bw(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q8_0_32_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_q8_0_32_batch_scalar(row, q8s, in_f, out);
+}
+
+/// Scalar fallback for `vec_dot_q8_0_32_batch`; also used on non-x86 targets, and the exactness
+/// oracle the SIMD kernels below are tested against.
+fn vec_dot_q8_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     let nb = in_f / 32;
     let bpr = 34usize; // f16 d (2B) + 32 × i8 qs
     let mut d_arr = vec![0f32; nb];
@@ -2140,6 +2160,95 @@ fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]
             for i in 0..32 {
                 iprod += qw[i] as i8 as i32 * q8b[i] as i32;
             }
+            sumf += d_arr[b] * q8.d[b] * iprod as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX2 kernel for `vec_dot_q8_0_32_batch`: one native 32-element Q8_0 block per iteration. Same
+/// sign trick as `vec_dot_q8_0_avx2` (`maddubs(abs(qw), sign(qw)·qx)`), just scaled per-block instead
+/// of per-256-superblock (each native block carries its own `d_w`, and the activation's own `d[b]`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_dot_q8_0_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 34usize;
+    let ones = _mm256_set1_epi16(1i16);
+    let mut d_arr = vec![0f32; nb];
+    for b in 0..nb {
+        d_arr[b] = rdf16(&row[b * bpr..b * bpr + 2]);
+    }
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let qw = _mm256_loadu_si256(row[b * bpr + 2..].as_ptr() as *const __m256i);
+            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let qw_abs = _mm256_abs_epi8(qw);
+            let qx_signed = _mm256_sign_epi8(q8v, qw);
+            let prod = _mm256_maddubs_epi16(qw_abs, qx_signed);
+            let sum32 = _mm256_madd_epi16(prod, ones);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += d_arr[b] * q8.d[b] * iprod as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX-512BW kernel for `vec_dot_q8_0_32_batch`: TWO native 32-element blocks per iteration (64
+/// elems / zmm), mirroring `vec_dot_q8_0_avx512bw`'s pairing trick — sign trick applied at ymm level,
+/// then packed into a zmm for one `maddubs512 → madd512` pass. `nb` is even for every shape this
+/// crate has seen (e.g. DiffusionGemma's 22), but an odd tail block is handled scalarly for safety.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+unsafe fn vec_dot_q8_0_32_batch_avx512bw(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 34usize;
+    let ones512 = _mm512_set1_epi16(1i16);
+    let ones256 = _mm256_set1_epi16(1i16);
+    let pairs = nb / 2;
+    let mut d_arr = vec![0f32; nb];
+    for b in 0..nb {
+        d_arr[b] = rdf16(&row[b * bpr..b * bpr + 2]);
+    }
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for k in 0..pairs {
+            let (b0, b1) = (2 * k, 2 * k + 1);
+            let qw0 = _mm256_loadu_si256(row[b0 * bpr + 2..].as_ptr() as *const __m256i);
+            let qw1 = _mm256_loadu_si256(row[b1 * bpr + 2..].as_ptr() as *const __m256i);
+            // b0/b1 activation bytes are contiguous (`Q8x32::qs` is laid out `[b*32..b*32+32]`).
+            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let qx0 = _mm512_castsi512_si256(qx_z);
+            let qx1 = _mm512_extracti64x4_epi64::<1>(qx_z);
+            let qw_abs0 = _mm256_abs_epi8(qw0);
+            let qw_abs1 = _mm256_abs_epi8(qw1);
+            let qx_s0 = _mm256_sign_epi8(qx0, qw0);
+            let qx_s1 = _mm256_sign_epi8(qx1, qw1);
+            let qw_a_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(qw_abs0), qw_abs1);
+            let qx_s_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(qx_s0), qx_s1);
+            let prod = _mm512_maddubs_epi16(qw_a_z, qx_s_z);
+            let sum32_z = _mm512_madd_epi16(prod, ones512);
+            let lo_ymm = _mm512_castsi512_si256(sum32_z);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+            let iprod0 = hadd_i32_ymm(lo_ymm);
+            let iprod1 = hadd_i32_ymm(hi_ymm);
+            // Two SEPARATE f32 adds (not `sumf += a + b`) — matches the scalar oracle's per-block
+            // sequential accumulation order exactly (f32 addition isn't associative).
+            sumf += d_arr[b0] * q8.d[b0] * iprod0 as f32;
+            sumf += d_arr[b1] * q8.d[b1] * iprod1 as f32;
+        }
+        if nb % 2 == 1 {
+            let b = nb - 1;
+            let qw = _mm256_loadu_si256(row[b * bpr + 2..].as_ptr() as *const __m256i);
+            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let qw_abs = _mm256_abs_epi8(qw);
+            let qx_signed = _mm256_sign_epi8(q8v, qw);
+            let prod = _mm256_maddubs_epi16(qw_abs, qx_signed);
+            let sum32 = _mm256_madd_epi16(prod, ones256);
+            let iprod = hadd_i32_ymm(sum32);
             sumf += d_arr[b] * q8.d[b] * iprod as f32;
         }
         out[r] = sumf;
@@ -2342,56 +2451,102 @@ fn expert_matvec_batch(
     count: usize,
     in_f: usize,
     out_f: usize,
+    // int8-activation fast paths allowed? Decided by the CALLER on the WHOLE MoeFfn call's row
+    // count, not this bucket's `count`: a per-bucket gate would mix exact and int8 math inside
+    // one batched forward (1-row buckets exact, big buckets int8), which measurably shuffled
+    // near-tie logits vs the uniform-int8 baseline (the DG CPU/Vulkan parity test caught it).
+    // Single-row CALLS (Metal parity tests, qwen3moe per-token decode) pass false and keep the
+    // exact dequant+f32-dot path byte-for-byte.
+    int8_ok: bool,
 ) -> Vec<f32> {
     let bpr = wbytes.len() / out_f;
     let mut out = vec![0f32; count * out_f];
     // Fast path 1: int8-activation batched dot at the 256-element super-block granularity (same
     // kernels `Op::Linear`'s m>1 path uses) — needs `in_f` to be a whole number of super-blocks;
     // true for MoE's `gate`/`up` (`in_f = n_embd`), not guaranteed for `down`.
-    // Both int8 fast paths are gated on count >= 2: the activation quantization is a real (small)
-    // approximation, and every SINGLE-row consumer — the Metal MoE parity tests (1e-3 elementwise
-    // vs the device), qwen3moe's per-token decode — was calibrated against the exact
-    // dequant+f32-dot path below. Batched callers (DiffusionGemma's 256-row denoise buckets,
-    // average ~16 rows/expert) keep the win; count==1 keeps pre-batching numerics exactly.
-    if count >= 2
+    // Router/gate/up/down calls come from `Op::MoeFfn`'s PER-EXPERT rayon fan-out (one task per
+    // selected expert; see that arm) — with a top-k router, real inputs route wildly unevenly
+    // (DiffusionGemma's masked-canvas rows collapse onto a handful of experts, e.g. one expert can
+    // draw all 256 rows while dozens draw only a handful), so a single expert's `out_f` loop can
+    // dwarf everyone else's and pin ONE thread while the other 31 sit idle waiting on it. Below a
+    // work threshold, run the `o` loop serially (matches the previous behavior, no rayon overhead
+    // for the common small-bucket case); above it, split `o` across rayon so the straggler expert's
+    // own work gets stolen by idle threads instead of serializing on whichever thread drew it.
+    const PAR_O_WORK_THRESHOLD: usize = 200_000; // count * out_f
+    let par_o = count.saturating_mul(out_f) >= PAR_O_WORK_THRESHOLD;
+    if int8_ok
         && matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
         && in_f.is_multiple_of(256)
     {
         let q8s: Vec<Q8> = (0..count)
             .map(|r| quantize_q8(&xin[r * in_f..r * in_f + in_f]))
             .collect();
-        let mut col = vec![0f32; count];
-        for o in 0..out_f {
+        let dot_col = |o: usize, col: &mut [f32]| {
             let row = &wbytes[o * bpr..o * bpr + bpr];
             match dt {
-                DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, &mut col),
-                DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, &mut col),
-                DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, &mut col),
-                DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, &mut col),
+                DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, col),
+                DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, col),
+                DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, col),
+                DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, col),
                 _ => unreachable!(),
             }
-            for r in 0..count {
-                out[r * out_f + o] = col[r];
+        };
+        if par_o {
+            // Transposed scratch (`out_t[o*count+r]`) so each `o` owns a disjoint slice — no
+            // shared `col` to serialize on. Un-transposed into `out` in one final pass.
+            let mut out_t = vec![0f32; out_f * count];
+            out_t
+                .par_chunks_mut(count)
+                .enumerate()
+                .for_each(|(o, col)| dot_col(o, col));
+            for o in 0..out_f {
+                for r in 0..count {
+                    out[r * out_f + o] = out_t[o * count + r];
+                }
+            }
+        } else {
+            let mut col = vec![0f32; count];
+            for o in 0..out_f {
+                dot_col(o, &mut col);
+                for r in 0..count {
+                    out[r * out_f + o] = col[r];
+                }
             }
         }
         return out;
     }
     // Fast path 2: Q8_0/Q5_0 at THEIR OWN 32-element native block — covers `down`'s misaligned
     // `in_f` (e.g. 704) without ever materializing a dequantized f32 row.
-    if count >= 2 && matches!(dt, DType::Q8_0 | DType::Q5_0) && in_f.is_multiple_of(32) {
+    if int8_ok && matches!(dt, DType::Q8_0 | DType::Q5_0) && in_f.is_multiple_of(32) {
         let q8s: Vec<Q8x32> = (0..count)
             .map(|r| quantize_q8_32(&xin[r * in_f..r * in_f + in_f]))
             .collect();
-        let mut col = vec![0f32; count];
-        for o in 0..out_f {
+        let dot_col = |o: usize, col: &mut [f32]| {
             let row = &wbytes[o * bpr..o * bpr + bpr];
             match dt {
-                DType::Q8_0 => vec_dot_q8_0_32_batch(row, &q8s, in_f, &mut col),
-                DType::Q5_0 => vec_dot_q5_0_32_batch(row, &q8s, in_f, &mut col),
+                DType::Q8_0 => vec_dot_q8_0_32_batch(row, &q8s, in_f, col),
+                DType::Q5_0 => vec_dot_q5_0_32_batch(row, &q8s, in_f, col),
                 _ => unreachable!(),
             }
-            for r in 0..count {
-                out[r * out_f + o] = col[r];
+        };
+        if par_o {
+            let mut out_t = vec![0f32; out_f * count];
+            out_t
+                .par_chunks_mut(count)
+                .enumerate()
+                .for_each(|(o, col)| dot_col(o, col));
+            for o in 0..out_f {
+                for r in 0..count {
+                    out[r * out_f + o] = out_t[o * count + r];
+                }
+            }
+        } else {
+            let mut col = vec![0f32; count];
+            for o in 0..out_f {
+                dot_col(o, &mut col);
+                for r in 0..count {
+                    out[r * out_f + o] = col[r];
+                }
             }
         }
         return out;
@@ -3359,7 +3514,9 @@ impl Backend for CpuBackend {
                     // — so this alone replaces what used to be `rows` separate re-dequants of it),
                     // then a per-row softmax + top-`n_used` selection (independent per row, so
                     // parallel over rows is safe).
-                    let logits_all = expert_matvec_batch(&rbytes, rdt, &rxs, rows, ne, n_expert);
+                    let int8_ok = rows >= 2; // whole-call gate — see expert_matvec_batch's param doc
+                    let logits_all =
+                        expert_matvec_batch(&rbytes, rdt, &rxs, rows, ne, n_expert, int8_ok);
                     struct RouteRow {
                         /// Selected experts, sorted by DESCENDING router prob — the same order the
                         /// original per-row loop accumulated in.
@@ -3405,16 +3562,45 @@ impl Backend for CpuBackend {
                     // parallel — a top-`n_used`-of-`n_expert` router already spreads ~`rows·n_used`
                     // row-expert pairs over `n_expert` buckets, so this fan-out alone is enough
                     // parallelism without ALSO parallelizing inside each expert.
+                    //
+                    // Diagnostic breakdown (INFR_PROF_OPS=1 only, zero cost otherwise): per-stage
+                    // work-time summed across all experts (they run in parallel, so this is CPU-time,
+                    // not wall-time) plus per-expert bucket-size skew (min/max routed rows) — used to
+                    // tell whether MoeFfn cost is dominated by a specific dot kernel or by imbalance.
+                    let t_gather = std::sync::atomic::AtomicU64::new(0);
+                    let t_gate_up = std::sync::atomic::AtomicU64::new(0);
+                    let t_act = std::sync::atomic::AtomicU64::new(0);
+                    let t_down = std::sync::atomic::AtomicU64::new(0);
+                    let bucket_max = std::sync::atomic::AtomicUsize::new(0);
+                    let bucket_min = std::sync::atomic::AtomicUsize::new(usize::MAX);
+                    let n_active = std::sync::atomic::AtomicUsize::new(0);
+                    let n_single = std::sync::atomic::AtomicUsize::new(0);
                     let per_expert: Vec<Vec<(usize, usize, Vec<f32>)>> = (0..n_expert)
                         .into_par_iter()
                         .filter(|&e| !expert_tasks[e].is_empty())
                         .map(|e| {
                             let tasks = &expert_tasks[e];
                             let count = tasks.len();
+                            if prof_ops {
+                                bucket_max.fetch_max(count, std::sync::atomic::Ordering::Relaxed);
+                                bucket_min.fetch_min(count, std::sync::atomic::Ordering::Relaxed);
+                                n_active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if count == 1 {
+                                    n_single.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            let ts = prof_ops.then(std::time::Instant::now);
                             let mut xin = vec![0f32; count * ne];
                             for (i, &(r, _)) in tasks.iter().enumerate() {
                                 xin[i * ne..i * ne + ne].copy_from_slice(&xs[r * ne..r * ne + ne]);
                             }
+                            if let Some(t) = ts {
+                                t_gather.fetch_add(
+                                    t.elapsed().as_nanos() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            let ts = prof_ops.then(std::time::Instant::now);
                             let (gate, up) = if fused_gate_up {
                                 // One batched matvec over the fused [2*nffx, ne] expert slice; first
                                 // nffx rows are gate, next nffx are up (Op::GatedActFused's convention).
@@ -3425,6 +3611,7 @@ impl Backend for CpuBackend {
                                     count,
                                     ne,
                                     2 * nffx,
+                                    int8_ok,
                                 );
                                 let mut gate = vec![0f32; count * nffx];
                                 let mut up = vec![0f32; count * nffx];
@@ -3447,6 +3634,7 @@ impl Backend for CpuBackend {
                                         count,
                                         ne,
                                         nffx,
+                                        int8_ok,
                                     ),
                                     expert_matvec_batch(
                                         &ub[e * ust..(e + 1) * ust],
@@ -3455,12 +3643,27 @@ impl Backend for CpuBackend {
                                         count,
                                         ne,
                                         nffx,
+                                        int8_ok,
                                     ),
                                 )
                             };
+                            if let Some(t) = ts {
+                                t_gate_up.fetch_add(
+                                    t.elapsed().as_nanos() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            let ts = prof_ops.then(std::time::Instant::now);
                             let actv: Vec<f32> = (0..count * nffx)
                                 .map(|i| act_fn(act, gate[i]) * up[i])
                                 .collect();
+                            if let Some(t) = ts {
+                                t_act.fetch_add(
+                                    t.elapsed().as_nanos() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            let ts = prof_ops.then(std::time::Instant::now);
                             let mut y = expert_matvec_batch(
                                 &db[e * dst_..(e + 1) * dst_],
                                 ddt,
@@ -3468,12 +3671,19 @@ impl Backend for CpuBackend {
                                 count,
                                 nffx,
                                 ne,
+                                int8_ok,
                             );
                             if let Some(ds) = &dscale {
                                 let s = ds[e];
                                 for v in y.iter_mut() {
                                     *v *= s;
                                 }
+                            }
+                            if let Some(t) = ts {
+                                t_down.fetch_add(
+                                    t.elapsed().as_nanos() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                             }
                             tasks
                                 .iter()
@@ -3482,6 +3692,20 @@ impl Backend for CpuBackend {
                                 .collect()
                         })
                         .collect();
+                    if prof_ops {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        eprintln!(
+                            "[prof-moe] gather {:.2}ms gate_up {:.2}ms act {:.2}ms down {:.2}ms  bucket[min={},max={}] active={} single={}",
+                            t_gather.load(Relaxed) as f64 / 1e6,
+                            t_gate_up.load(Relaxed) as f64 / 1e6,
+                            t_act.load(Relaxed) as f64 / 1e6,
+                            t_down.load(Relaxed) as f64 / 1e6,
+                            bucket_min.load(Relaxed),
+                            bucket_max.load(Relaxed),
+                            n_active.load(Relaxed),
+                            n_single.load(Relaxed),
+                        );
+                    }
 
                     // ── Scatter each expert's per-row result into that row's rank slot, then
                     // accumulate in the SAME order the original per-row loop used (idx sorted by
@@ -3821,6 +4045,39 @@ mod kernel_tests {
                     rel_err(got[r], want) < 1e-3,
                     "q8_0_32 in_f={in_f} row={r}: got {got_r}, want {want}",
                     got_r = got[r]
+                );
+            }
+        }
+    }
+
+    /// The AVX2/AVX-512BW kernels for `vec_dot_q8_0_32_batch` must be BIT-IDENTICAL to the scalar
+    /// oracle (`_scalar`) — integer dot products have no rounding, so summation order doesn't matter,
+    /// only the final `d_w * d8 * iprod` formula does, which is shared. Runs whichever SIMD tier this
+    /// CPU actually has (falls through to the same scalar fn on non-x86 or pre-AVX2 hardware, in which
+    /// case the assertion is trivially true).
+    #[test]
+    fn q8_0_32_batch_simd_bit_identical_to_scalar() {
+        for in_f in [256usize, 704] {
+            let nb = in_f / 32;
+            let m = 5usize;
+            let mut w = det_bytes(nb * 34, 25);
+            for k in 0..nb {
+                put_f16(&mut w[k * 34..k * 34 + 2], 0.02);
+            }
+            let q8s: Vec<Q8x32> = (0..m)
+                .map(|r| quantize_q8_32(&det_x(in_f, 26 + r as u64)))
+                .collect();
+            let mut simd_out = vec![0f32; m];
+            vec_dot_q8_0_32_batch(&w, &q8s, in_f, &mut simd_out);
+            let mut scalar_out = vec![0f32; m];
+            vec_dot_q8_0_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
+            for r in 0..m {
+                assert_eq!(
+                    simd_out[r].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "q8_0_32 in_f={in_f} row={r}: simd {}, scalar {}",
+                    simd_out[r],
+                    scalar_out[r],
                 );
             }
         }

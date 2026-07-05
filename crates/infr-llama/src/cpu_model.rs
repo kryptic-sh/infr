@@ -620,6 +620,16 @@ impl CpuModel {
         let mut committed: Vec<u32> = enc.get_ids().to_vec();
         let n_prompt = committed.len();
 
+        // Conversation slots, like the plain session chat: pick the best-prefix slot in BOTH
+        // sessions from the prompt, once per call (the indices stay stable — LRU recycling only
+        // happens inside pick). A returning conversation suffix-prefills its own slots; a
+        // different conversation forks/seeds instead of clobbering — multi-user spec serve
+        // stops paying a full re-prefill of BOTH models on every conversation switch.
+        let t_slot = session.pool.pick(&session.mtl, &self.cfg, &committed)?;
+        let d_slot = draft_session
+            .pool
+            .pick(&draft_session.mtl, &draft.cfg, &committed)?;
+
         // Initial fill: the target's normal (chunked-prefill) path produces the first token —
         // verify forwards are only for the small k+1 suffixes.
         let t0 = std::time::Instant::now();
@@ -634,7 +644,7 @@ impl CpuModel {
             &committed,
             1,
             |_| {},
-            session.pool.single(),
+            &mut session.pool.slots[t_slot],
             session.max_ctx,
             None,
         )?;
@@ -680,7 +690,7 @@ impl CpuModel {
                 &committed,
                 budget,
                 |_| {},
-                draft_session.pool.single(),
+                &mut draft_session.pool.slots[d_slot],
                 draft_session.max_ctx,
                 None,
             )?;
@@ -700,7 +710,7 @@ impl CpuModel {
                 &self.token_embd,
                 self.per_layer_embd.as_ref(),
                 &feed,
-                session.pool.single(),
+                &mut session.pool.slots[t_slot],
                 session.max_ctx,
             )?;
             if std::env::var("INFR_SPEC_DEBUG").is_ok() {

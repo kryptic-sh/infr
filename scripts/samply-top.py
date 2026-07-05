@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Rank self-time (leaf samples) per function across all threads of a samply profile,
-symbolicating native frames with addr2line (samply itself only symbolicates in its UI).
+"""Rank self-time per FUNCTION (default) or per source line (--lines) across all threads
+of a samply profile, symbolicating native frames with addr2line (samply itself only
+symbolicates in its UI).
 
 Headless companion to `samply record` for CPU perf attribution — see docs/PERF.md's
 "CPU profiling (samply)". Zero dependencies beyond python3 + binutils addr2line.
 
     samply record --save-only -o prof.json.gz -- ./target/release/infr bench ...
-    scripts/samply-top.py prof.json.gz [N]
+    scripts/samply-top.py prof.json.gz [N] [--lines]
 """
 
 import gzip
@@ -15,8 +16,10 @@ import subprocess
 import sys
 from collections import Counter
 
-path = sys.argv[1]
-top_n = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+args = [a for a in sys.argv[1:] if a != "--lines"]
+per_line = "--lines" in sys.argv
+path = args[0]
+top_n = int(args[1]) if len(args) > 1 else 30
 d = json.load(gzip.open(path))
 interval = d["meta"].get("interval", 1.0)  # ms per sample
 libs = d["libs"]
@@ -41,10 +44,10 @@ for t in d["threads"]:
         self_ms[(lib, ft_addr[frame])] += w * interval
         total += w * interval
 
-# Symbolicate the top frames, one addr2line batch per lib.
-top = self_ms.most_common(top_n)
+# Symbolicate EVERY distinct leaf address, one addr2line process per lib (addresses on
+# stdin — argv would overflow on tens of thousands of frames).
 by_lib = {}
-for (lib, addr), _ in top:
+for lib, addr in self_ms:
     by_lib.setdefault(lib, []).append(addr)
 names = {}
 for lib, addrs in by_lib.items():
@@ -53,19 +56,26 @@ for lib, addrs in by_lib.items():
         continue
     try:
         out = subprocess.run(
-            ["addr2line", "-f", "-C", "-e", libpath] + [hex(a) for a in addrs],
+            ["addr2line", "-f", "-C", "-e", libpath],
+            input="\n".join(hex(a) for a in addrs),
             capture_output=True,
             text=True,
             check=True,
         ).stdout.splitlines()
         for i, addr in enumerate(addrs):
             fn, loc = out[2 * i], out[2 * i + 1]
-            names[(lib, addr)] = f"{fn}  ({loc.split('/')[-1]})"
+            names[(lib, addr)] = (fn, loc.split("/")[-1])
     except Exception as e:  # noqa: BLE001 — missing addr2line/lib just degrades to raw addrs
         print(f"addr2line failed for {libpath}: {e}", file=sys.stderr)
 
-print(f"total sampled: {total / 1000:.1f} thread-seconds ({len(d['threads'])} threads)")
-for (lib, addr), ms in top:
+# Aggregate by function name (or function+line with --lines) and rank.
+agg = Counter()
+for (lib, addr), ms in self_ms.items():
     libname = libs[lib]["name"] if lib >= 0 else "?"
-    name = names.get((lib, addr), hex(addr))
-    print(f"{ms / 1000:9.2f}s {ms / total * 100:5.1f}%  [{libname}] {name[:130]}")
+    fn, loc = names.get((lib, addr), (hex(addr), "?"))
+    key = f"[{libname}] {fn}  ({loc})" if per_line else f"[{libname}] {fn}"
+    agg[key] += ms
+
+print(f"total sampled: {total / 1000:.1f} thread-seconds ({len(d['threads'])} threads)")
+for key, ms in agg.most_common(top_n):
+    print(f"{ms / 1000:9.2f}s {ms / total * 100:5.1f}%  {key[:130]}")

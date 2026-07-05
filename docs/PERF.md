@@ -67,15 +67,14 @@ Rules that exist because we got burned:
 
 `scripts/perf-sweep.sh <models...>` (with `INFR_METAL=1` on macOS) runs the
 sweep and archives the matrix under `target/perf/<utc>-<sha>.txt` — keep the
-model list fixed so every commit's ratios are a diff away, and paste the
-matrix into the PR when a slice lands.
+model list fixed so every commit's ratios are a diff away, and paste the matrix
+into the PR when a slice lands.
 
-**Sweep rows are not regression evidence.** A multi-model sweep heats the
-chip; rows measured mid-sweep run a few percent low (observed: a 0.93× row
-reading 0.83× in-sweep, back at 0.91× solo minutes later). Before calling a
-regression, re-probe the flagged row SOLO on an idle machine and compare
-absolute numbers, not just ratios (llama.cpp's side drifts with the same
-heat).
+**Sweep rows are not regression evidence.** A multi-model sweep heats the chip;
+rows measured mid-sweep run a few percent low (observed: a 0.93× row reading
+0.83× in-sweep, back at 0.91× solo minutes later). Before calling a regression,
+re-probe the flagged row SOLO on an idle machine and compare absolute numbers,
+not just ratios (llama.cpp's side drifts with the same heat).
 
 ## Profiling
 
@@ -84,15 +83,14 @@ INFR_PROF2=1 infr bench "$M" -p 512 -n 0 -r 1   # per-op GPU timestamps
 INFR_PROF_PF=1 ...                              # per-chunk prefill wall time
 ```
 
-Metal uses `INFR_METAL_PROFILE` instead: `=1` encode/GPU wall split, `=3`
-per-op GPU time from stage-boundary counter samples — **the only honest per-op
-mode**: the decode replay tape re-executes tokens without walking ops, so the
-flush mode (`=2`) silently attributes a sample of one token. `=3` disables the
-tape for the run. Sweep with `--dev MTL0` (llama-bench rejects `Vulkan0` on a
-Metal box). Micro-probes live in `crates/infr-metal/tests/`
-(`gemv_bw`, `dispatch_overhead`) — chained-dispatch numbers there are
-thermally unstable across back-to-back runs; trust e2e benches for accept /
-revert calls.
+Metal uses `INFR_METAL_PROFILE` instead: `=1` encode/GPU wall split, `=3` per-op
+GPU time from stage-boundary counter samples — **the only honest per-op mode**:
+the decode replay tape re-executes tokens without walking ops, so the flush mode
+(`=2`) silently attributes a sample of one token. `=3` disables the tape for the
+run. Sweep with `--dev MTL0` (llama-bench rejects `Vulkan0` on a Metal box).
+Micro-probes live in `crates/infr-metal/tests/` (`gemv_bw`, `dispatch_overhead`)
+— chained-dispatch numbers there are thermally unstable across back-to-back
+runs; trust e2e benches for accept / revert calls.
 
 - `INFR_PROF2` prints one block per submit. **Trust the percentages and per-op
   relative times; the absolute µs totals can overflow.** The op label breakdown
@@ -105,6 +103,50 @@ revert calls.
   against the kernel's known ceiling — a shape far below ceiling is a shape
   problem (grid/occupancy), the ceiling itself being too low is a kernel
   micro-arch problem.
+
+### CPU profiling (samply)
+
+For CPU-side attribution, use a sampling profiler — **do not add ad-hoc
+`Instant::now()` timers to the code**. Hand-rolled timing gets added, skews what
+it measures (the eprintln/sync overhead is visible at this scale: a denoise
+`exec` read 6.0s with `INFR_PROF_OPS=1` vs 3.85s without), and then has to be
+reverted. A profile answers the same question per-function, per-line, with zero
+code changes, and keeps stack context the timers throw away.
+
+Tooling: [`samply`](https://github.com/mstange/samply) (`cargo install samply`),
+no root needed. `[profile.release] debug = "line-tables-only"` in the workspace
+`Cargo.toml` gives it symbols + line numbers; debug info never affects codegen,
+so release numbers and the bit-exact goldens are unchanged.
+
+```bash
+# Interactive: records, then opens the Firefox Profiler UI (flame graph,
+# per-thread timelines, inverted call tree = self-time ranking).
+samply record ./target/release/infr bench "$M" --ngl 0 -p 16 -n 32 -r 1
+
+# Headless (agents, SSH): save the profile, then rank self-time per function.
+samply record --save-only -o prof.json.gz -- ./target/release/infr bench ...
+scripts/samply-top.py prof.json.gz 30
+```
+
+Reading `samply-top.py` output: percentages are of **total thread-seconds**
+across all threads, not wall time — on 32 threads, a function at 3% of
+thread-time can still be the top wall-time lever if it's serial, and rayon
+plumbing frames (`accum.rs`, `crossbeam_epoch`, `Producer::fold_with`) showing
+up high is itself a finding (fork-join overhead / idle spinning, the
+"whole-graph threadpool" class). For per-line attribution inside one hot
+function, open the same `prof.json.gz` in the UI (`samply load prof.json.gz`).
+
+What samply does NOT give you: hardware counters (DRAM bandwidth, IPC, cache
+misses). When the taxonomy question is "bandwidth-bound or compute-bound?", use
+`perf stat` (`sudo pacman -S perf`) — reason about bytes-moved first though; a
+back-of-envelope traffic count (table size × times streamed) has called it
+correctly every time so far.
+
+The existing env-gated profiles (`INFR_PROF_OPS=1` per-op-kind CPU totals +
+per-stage MoE breakdown, `INFR_DIFFUSION_TIME=1` per-denoise-step phases) stay
+useful as cheap first reads — they're already in-tree, run everywhere, and cost
+nothing when off. The rule is only: don't add NEW timer instrumentation when a
+profile would answer the question.
 
 ## Bottleneck taxonomy — what the profile means
 

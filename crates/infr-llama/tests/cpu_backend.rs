@@ -1240,6 +1240,267 @@ fn h_tap_matches_lm_head() {
     );
 }
 
+// ─── MTP Phase 2: the head forward + the draft loop (issue #33) ─────────────────────────────
+//
+// See docs/MTP.md. Phase 2 builds the head's own 1-layer forward + the catch_up/draft driver
+// primitives (`crate::mtp`) — these tests drive the ACTUAL 4B MTP GGUF's head, not just load it.
+
+/// Prime a fresh [`infr_llama::mtp::MtpHeadSession`] over `prompt_tokens`: prefill the TRUNK on the
+/// CPU backend (capturing `h` for every prompt row via the Phase-1 VERIFY tap), then `catch_up` the
+/// head over the whole prompt in one call. Returns the session plus `(last_token, pending_h)` —
+/// `draft`'s starting point (`docs/MTP.md`'s `process()`/`pending_h` handoff).
+fn prime_head<'a>(
+    model: &'a infr_llama::CpuModel,
+    head: &infr_llama::mtp::MtpHeadWeights,
+    cpu_be: &'a infr_cpu::CpuBackend,
+    g: &infr_gguf::Gguf,
+    max_ctx: usize,
+    prompt_tokens: &[u32],
+) -> (infr_llama::mtp::MtpHeadSession<'a>, u32, Vec<f32>) {
+    let (_logits, h_rows) = model
+        .verify_logits_and_h_cpu(prompt_tokens)
+        .expect("verify_logits_and_h_cpu");
+    let ne = model.config().n_embd;
+    assert_eq!(h_rows.len(), prompt_tokens.len() * ne, "h per prompt row");
+
+    let mut sess = infr_llama::mtp::MtpHeadSession::new_cpu(
+        cpu_be,
+        g,
+        model.config(),
+        head,
+        model.token_embd(),
+        max_ctx,
+    )
+    .expect("MtpHeadSession::new_cpu");
+
+    // docs/MTP.md's process(): the head decodes the SAME tokens with `h` shifted right by one
+    // (`embd[i] = h_tgt[i-1]`); row 0 has no predecessor in a fresh session, so it's paired with a
+    // zero `pending_h` (`speculative.cpp`'s `pending_h` starts zero-initialized — see
+    // `common_speculative_impl_draft_mtp`'s ctor, `pending_h.assign(n_seq, vector<float>(n_embd,
+    // 0.0f))` — there IS no earlier target row to have produced a real one).
+    let mut shifted_h = vec![0f32; prompt_tokens.len() * ne];
+    if prompt_tokens.len() > 1 {
+        shifted_h[ne..].copy_from_slice(&h_rows[..(prompt_tokens.len() - 1) * ne]);
+    }
+    infr_llama::mtp::catch_up(&mut sess, prompt_tokens, &shifted_h, 0).expect("catch_up");
+
+    let id_last = *prompt_tokens.last().expect("nonempty prompt");
+    let pending_h = h_rows[(prompt_tokens.len() - 1) * ne..].to_vec();
+    (sess, id_last, pending_h)
+}
+
+/// The head forward, end to end, on the real 4B MTP GGUF: prefill a short prompt on the TRUNK
+/// (capturing `h` via the Phase-1 tap), `catch_up` the head over it, then `draft` 6 tokens
+/// (`--spec-draft-n-max 6`, matching `docs/MTP.md`'s oracle run). Asserts every logits row is
+/// finite (no NaN/Inf — the eh_proj concat layout is exactly the kind of bug that would show up as
+/// garbage here) and prints the drafted ids + top-1 probabilities.
+#[test]
+fn mtp_head_forward_finite() {
+    let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
+    let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+
+    let prompt_tokens = model.encode("The capital of France is").expect("encode");
+    let cpu_be = infr_cpu::CpuBackend::new();
+    let n_max = 6usize;
+    let max_ctx = prompt_tokens.len() + n_max + 4;
+    let (mut sess, id_last, pending_h) =
+        prime_head(&model, &head, &cpu_be, &g, max_ctx, &prompt_tokens);
+
+    let drafted = infr_llama::mtp::draft(
+        &mut sess,
+        id_last,
+        &pending_h,
+        prompt_tokens.len(),
+        infr_llama::mtp::DEFAULT_P_MIN,
+        n_max,
+    )
+    .expect("draft");
+
+    println!(
+        "mtp_head_forward_finite: drafted {} token(s):",
+        drafted.len()
+    );
+    for (i, &(id, p)) in drafted.iter().enumerate() {
+        println!("  [{i}] id={id} p={p:.4}");
+    }
+    assert!(
+        !drafted.is_empty(),
+        "p_min=0.0 should always draft n_max tokens"
+    );
+    assert_eq!(drafted.len(), n_max, "p_min=0.0 never stops the loop early");
+    for &(id, p) in &drafted {
+        assert!(
+            p.is_finite() && (0.0..=1.0).contains(&p),
+            "top1 prob out of range: {p}"
+        );
+        assert!((id as usize) < cfg.vocab, "drafted id out of vocab range");
+    }
+}
+
+/// CPU/Vulkan parity: the SAME trunk-captured `h` (CPU, per `mtp_head_forward_finite`'s doc — only
+/// the HEAD differs between the two calls below) drafted through the head on both backends must
+/// produce the IDENTICAL token sequence (dense head, no MoE/routing noise to legitimately diverge
+/// on — unlike the CPU/GPU generation goldens elsewhere in this file, which tolerate divergence).
+#[test]
+fn mtp_head_cpu_vulkan_parity() {
+    need_gpu!();
+    let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
+    let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+
+    let prompt_tokens = model.encode("The capital of France is").expect("encode");
+    let n_max = 6usize;
+    let max_ctx = prompt_tokens.len() + n_max + 4;
+
+    let cpu_be = infr_cpu::CpuBackend::new();
+    let (mut cpu_sess, id_last, pending_h) =
+        prime_head(&model, &head, &cpu_be, &g, max_ctx, &prompt_tokens);
+    let cpu_drafted = infr_llama::mtp::draft(
+        &mut cpu_sess,
+        id_last,
+        &pending_h,
+        prompt_tokens.len(),
+        infr_llama::mtp::DEFAULT_P_MIN,
+        n_max,
+    )
+    .expect("cpu draft");
+
+    let vk = infr_vulkan::VulkanBackend::new().expect("vulkan init");
+    let mut vk_sess = infr_llama::mtp::MtpHeadSession::new_vulkan(
+        &vk,
+        &g,
+        model.config(),
+        &head,
+        model.token_embd(),
+        max_ctx,
+    )
+    .expect("MtpHeadSession::new_vulkan");
+    let ne = model.config().n_embd;
+    let mut shifted_h = vec![0f32; prompt_tokens.len() * ne];
+    if prompt_tokens.len() > 1 {
+        let (_logits, h_rows) = model
+            .verify_logits_and_h_cpu(&prompt_tokens)
+            .expect("verify_logits_and_h_cpu");
+        shifted_h[ne..].copy_from_slice(&h_rows[..(prompt_tokens.len() - 1) * ne]);
+    }
+    infr_llama::mtp::catch_up(&mut vk_sess, &prompt_tokens, &shifted_h, 0).expect("vk catch_up");
+    let vk_drafted = infr_llama::mtp::draft(
+        &mut vk_sess,
+        id_last,
+        &pending_h,
+        prompt_tokens.len(),
+        infr_llama::mtp::DEFAULT_P_MIN,
+        n_max,
+    )
+    .expect("vk draft");
+
+    let cpu_ids: Vec<u32> = cpu_drafted.iter().map(|&(id, _)| id).collect();
+    let vk_ids: Vec<u32> = vk_drafted.iter().map(|&(id, _)| id).collect();
+    println!("mtp_head_cpu_vulkan_parity: cpu={cpu_ids:?} vulkan={vk_ids:?}");
+    assert_eq!(cpu_ids, vk_ids, "CPU/Vulkan MTP head drafts diverged");
+}
+
+/// Oracle-invariant fallback (`docs/MTP.md`'s validation ladder — capturing the oracle's OWN
+/// verbose drafted-token trace proved impractical: llama.cpp's `SPC_DBG`/`SPC_TRC` macros gate on
+/// `common_log`'s verbosity, not a dedicated spec-debug env var, and piping a live CPU generation's
+/// stderr for a handful of draft steps is a lot of process-control machinery for what this simpler
+/// check already covers): feed the head's drafted tokens through the TRUNK's OWN greedy decode and
+/// measure how often the trunk's argmax agrees with what the head drafted — the PER-STEP acceptance
+/// probability `alpha` a real spec-verify pass would see (stops at the first mismatch, like a real
+/// verify). For `n_max=6` and i.i.d. per-step acceptance `alpha`, expected tokens/cycle is `(1 -
+/// alpha^7) / (1 - alpha)`; solving that for the oracle's captured 2.0x (`docs/MTP.md`) gives
+/// `alpha ≈ 0.5`, not a flat 60-80% — this test reports the measured per-prompt rate (averaged over
+/// a couple of short prompts to dilute single-prompt noise) against that ~0.5 reference rather than
+/// hard-gating on a specific number (still a coarse sanity check, not a benchmark).
+#[test]
+fn mtp_head_trunk_acceptance_rate() {
+    let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
+    let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
+    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let cpu_be = infr_cpu::CpuBackend::new();
+    let n_max = 6usize;
+    let vocab = cfg.vocab;
+
+    let mut total_accepted = 0usize;
+    let mut total_drafted = 0usize;
+    for prompt in [
+        "The capital of France is",
+        "Tell me a short story about a brave knight.",
+    ] {
+        let prompt_tokens = model.encode(prompt).expect("encode");
+        let max_ctx = prompt_tokens.len() + n_max + 4;
+        let (mut sess, id_last, pending_h) =
+            prime_head(&model, &head, &cpu_be, &g, max_ctx, &prompt_tokens);
+
+        let drafted = infr_llama::mtp::draft(
+            &mut sess,
+            id_last,
+            &pending_h,
+            prompt_tokens.len(),
+            infr_llama::mtp::DEFAULT_P_MIN,
+            n_max,
+        )
+        .expect("draft");
+        let draft_ids: Vec<u32> = drafted.iter().map(|&(id, _)| id).collect();
+
+        // Trunk greedy-verify over [prompt | draft_ids]: row i's logits are the trunk's
+        // distribution AFTER consuming prompt_tokens ++ draft_ids[..i] — i.e. exactly what the
+        // trunk would have sampled in place of draft_ids[i] had it decoded token-by-token (the
+        // spec-verify invariant).
+        let mut full = prompt_tokens.clone();
+        full.extend_from_slice(&draft_ids);
+        let (verify_logits, _h) = model
+            .verify_logits_and_h_cpu(&full)
+            .expect("verify_logits_and_h_cpu over prompt+draft");
+        let p = prompt_tokens.len();
+
+        let mut accepted = 0usize;
+        for (i, &draft_id) in draft_ids.iter().enumerate() {
+            // Row `p - 1 + i` is the trunk's distribution for predicting position `p + i` — i.e.
+            // the token that FOLLOWS `full[..p+i]`, which is exactly `draft_ids[i]` when accepted.
+            let row = &verify_logits[(p - 1 + i) * vocab..(p + i) * vocab];
+            let (argmax, _) =
+                row.iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                        if v > bv {
+                            (i, v)
+                        } else {
+                            (bi, bv)
+                        }
+                    });
+            let ok = argmax as u32 == draft_id;
+            println!(
+                "  {prompt:?} step {i}: drafted={draft_id} trunk_argmax={argmax} {}",
+                if ok { "ACCEPT" } else { "reject" }
+            );
+            if ok {
+                accepted += 1;
+            } else {
+                break; // spec-verify stops at the first mismatch — can't evaluate the rest as-is
+            }
+        }
+        println!(
+            "  {prompt:?}: {accepted}/{} accepted this cycle",
+            draft_ids.len()
+        );
+        total_accepted += accepted;
+        total_drafted += draft_ids.len();
+    }
+    let rate = total_accepted as f64 / total_drafted.max(1) as f64;
+    println!(
+        "mtp_head_trunk_acceptance_rate: {total_accepted}/{total_drafted} accepted overall \
+         ({rate:.2}) — oracle's 2.0x implies a per-step rate around ~0.5 (see this test's doc)"
+    );
+}
+
 // ─── Qwen3-MoE (routed experts) ─────────────────────────────────────────────────
 
 fn qwen3moe_30b() -> Option<PathBuf> {

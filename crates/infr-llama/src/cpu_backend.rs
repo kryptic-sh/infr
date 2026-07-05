@@ -549,6 +549,55 @@ pub(crate) fn verify_dense_cpu_with_h(
     Ok((logits, h))
 }
 
+/// [`verify_dense_cpu_with_h`]'s ALL-ROWS twin (MTP Phase 2, issue #33): rides the speculative-
+/// VERIFY batched forward (the `verify` param, not `logits_out`) so `h`/`logits` cover EVERY one of
+/// `tokens`, not just the last — the shape `crate::mtp::catch_up` needs to prime the head's KV over
+/// a whole prompt in one call (`docs/MTP.md`'s `process()` runs after every target ubatch, not just
+/// the sampled row). Dense non-MoE models only (mirrors the VERIFY branch's own guard). Returns
+/// `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
+pub(crate) fn verify_rows_cpu_with_h(
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: &[f32],
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+) -> AResult<(Vec<f32>, Vec<f32>)> {
+    let cpu_be = CpuBackend::new();
+    let mut logits = Vec::new();
+    let mut h = Vec::new();
+    let mut state = None;
+    generate_dense_backend(
+        &cpu_be,
+        &|_name, tb, dt, _n| match tb {
+            WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
+            WBytes::Owned(v) => {
+                let buf = cpu_be
+                    .alloc(v.len().max(1), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                cpu_be
+                    .upload(buf.as_ref(), &v)
+                    .map_err(|e| anyhow!("{e}"))?;
+                Ok((buf, dt))
+            }
+        },
+        g,
+        cfg,
+        token_embd,
+        ple,
+        tokens,
+        0,
+        |_| {},
+        &mut state,
+        tokens.len() + 2,
+        None,
+        Some(&mut logits),
+        None,
+        Some(&mut h),
+        None,
+    )?;
+    Ok((logits, h))
+}
+
 /// [`verify_dense_cpu`]'s Vulkan twin — the same one-shot causal prefill through the production
 /// Vulkan seam, for the CPU/Vulkan cross-backend parity check.
 pub(crate) fn verify_dense_vulkan(

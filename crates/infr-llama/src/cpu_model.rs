@@ -276,6 +276,19 @@ impl CpuModel {
         &self.cfg
     }
 
+    /// The open GGUF handle — MTP Phase 2 (issue #33) needs it to resolve/upload the head's own
+    /// tensors (`crate::mtp::load_mtp_head` / `MtpHeadSession::new_cpu`/`new_vulkan`).
+    pub fn gguf(&self) -> &Gguf {
+        &self.gguf
+    }
+
+    /// The host f32 token-embedding table (`token_embd.weight`, dequantized once at load) — MTP
+    /// Phase 2 (issue #33) gathers embedding rows from this on the host, mirroring every other
+    /// embed-gather call site on this seam (see `crate::mtp::MtpHeadSession`).
+    pub fn token_embd(&self) -> &[f32] {
+        &self.token_embd
+    }
+
     /// Tokenize raw text with the model's own tokenizer (no chat template) — for callers that
     /// need token ids directly (e.g. a raw-forward validation harness), as opposed to
     /// [`render_chat`](Self::render_chat) + the generation loop.
@@ -325,6 +338,21 @@ impl CpuModel {
     /// needs, validated here via `lm_head(h) == logits`. Returns `(logits, h)`.
     pub fn prefill_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
         crate::cpu_backend::verify_dense_cpu_with_h(
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            tokens,
+        )
+    }
+
+    /// [`prefill_logits_and_h_cpu`](Self::prefill_logits_and_h_cpu)'s ALL-ROWS twin (MTP Phase 2,
+    /// issue #33): returns the LM-head input row for EVERY one of `tokens`, not just the last — the
+    /// shape `crate::mtp::catch_up` needs to prime the head's KV over a whole prompt in one call
+    /// (`docs/MTP.md`'s `process()` hook runs after every target ubatch, not just the sampled row).
+    /// Dense non-MoE models only. Returns `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
+    pub fn verify_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        crate::cpu_backend::verify_rows_cpu_with_h(
             &self.gguf,
             &self.cfg,
             &self.token_embd,

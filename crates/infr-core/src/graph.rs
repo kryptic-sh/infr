@@ -108,6 +108,20 @@ pub enum Op {
         /// its slices. Must be row-aligned (`w_off % in_f == 0`) and block-aligned for quants.
         w_off: u32,
     },
+    /// Row-wise softmax: `dst[r, :] = softmax(x[r, :] * scale)` over `dim` columns, `rows` rows.
+    /// diffusion-gemma's in-graph self-conditioning (see `docs/DIFFUSIONGEMMA.md`'s Phase-B and
+    /// the reference's `dg_canvas_embed`): softmaxes the previous step's canvas logits over the
+    /// FULL vocab before the soft-embedding matmul. `scale` is baked in so a temperature that
+    /// changes per call doesn't need a separate `Scale` op ahead of this one — production code
+    /// pre-multiplies on the host instead (keeps the compiled plan static across steps) and
+    /// passes `scale: 1.0`, but the op itself is general.
+    Softmax {
+        x: TensorId,
+        dst: TensorId,
+        rows: u32,
+        dim: u32,
+        scale: f32,
+    },
     /// Per-head RMSNorm of `x` (`rows × n_head × head_dim`) with a per-`head_dim` `weight`
     /// (Qwen3 / Gemma Q-norm and K-norm). In place when `dst == x`.
     QkNorm {
@@ -355,6 +369,7 @@ impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
             Op::RmsNorm { .. } => "RmsNorm",
+            Op::Softmax { .. } => "Softmax",
             Op::Linear { .. } => "Linear",
             Op::QkNorm { .. } => "QkNorm",
             Op::Rope { .. } => "Rope",

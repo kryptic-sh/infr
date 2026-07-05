@@ -1226,6 +1226,22 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Row-wise softmax: `y[r,:] = softmax(x[r,:] * scale)` over `dim` columns, one workgroup per
+    /// row (diffusion-gemma's in-graph self-conditioning — see docs/DIFFUSIONGEMMA.md's Phase-B
+    /// and the reference's `dg_canvas_embed`). Same 256-thread subgroup-reduction shape as
+    /// `rmsnorm` — `dim` here is the vocab, so the cooperative reduction matters just as much.
+    pub fn softmax(&self, x: &dyn Buffer, y: &dyn Buffer, rows: usize, dim: usize, scale: f32) {
+        self.stamp("softmax");
+        let k = self
+            .be
+            .kernel_sg("softmax", crate::gemm::softmax_spv(), 2, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&scale.to_ne_bytes());
+        self.dispatch(k, &[Self::vkb(x), Self::vkb(y)], 1, &push, rows as u32);
+    }
+
     /// RoPE in place is allowed (`x` and `y` may be the same buffer). `pos_offset` shifts the
     /// absolute position of the first row (for cached decode).
     #[allow(clippy::too_many_arguments)]

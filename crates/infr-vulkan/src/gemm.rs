@@ -742,6 +742,13 @@ pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
     RMSNORM_SPV.get_or_init(|| spv_words(RMSNORM_SPV_BYTES))
 }
+/// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
+/// `softmax` (diffusion-gemma's in-graph self-conditioning).
+pub(crate) fn softmax_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/softmax.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the elementwise add (`y=a+b`).
 pub(crate) fn add_spv() -> &'static [u32] {
     static ADD_SPV: OnceLock<Vec<u32>> = OnceLock::new();

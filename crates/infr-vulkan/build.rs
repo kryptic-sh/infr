@@ -70,6 +70,7 @@ fn main() {
         ("attn_pv_warp", "attn_pv_warp", &[]),
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
         ("rmsnorm", "rmsnorm", &[]),
+        ("softmax", "softmax", &[]),
         ("deltanet", "deltanet", &[]),
         ("deltanet_chunked", "deltanet_chunked", &[]),
         ("deltanet_prep", "deltanet_prep", &[]),

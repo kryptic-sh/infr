@@ -408,6 +408,17 @@ fn lower_op(
                 *eps,
             );
         }
+        // Row-wise softmax over `dim` columns (diffusion-gemma's in-graph self-conditioning — see
+        // docs/DIFFUSIONGEMMA.md's Phase-B and the reference's `dg_canvas_embed`).
+        Op::Softmax {
+            x,
+            dst,
+            rows,
+            dim,
+            scale,
+        } => {
+            rec.softmax(r(*x)?, r(*dst)?, *rows as usize, *dim as usize, *scale);
+        }
         // `dst = x · Wᵀ` — dispatch by weight dtype AND row count. Decode (m=1) uses the native
         // GEMV (or f16 GEMV). Prefill (m>1) with a native-quant weight uses the TILED coopmat GEMM
         // `matmul_native` (decode each weight element ONCE, reuse across the 64-row tile) instead
@@ -2538,6 +2549,294 @@ mod tests {
                 got[i],
                 want[i]
             );
+        }
+    }
+
+    /// A one-op `Softmax` graph (row-wise, with a non-trivial `scale`) must match a host softmax.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn softmax_graph_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (rows, dim, scale) = (3usize, 300usize, 1.3f32);
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| (i as f32 * 0.037).sin() * 5.0)
+            .collect();
+        let mut want = vec![0f32; rows * dim];
+        for r in 0..rows {
+            let b = r * dim;
+            let row = &x[b..b + dim];
+            let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v * scale));
+            let mut denom = 0f32;
+            for (w, &v) in want[b..b + dim].iter_mut().zip(row) {
+                *w = (v * scale - mx).exp();
+                denom += *w;
+            }
+            for w in want[b..b + dim].iter_mut() {
+                *w /= denom;
+            }
+        }
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+        let yi = g.output(TensorDesc::new(vec![rows, dim], DType::F32));
+        g.push(Op::Softmax {
+            x: xi,
+            dst: yi,
+            rows: rows as u32,
+            dim: dim as u32,
+            scale,
+        });
+        let xb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+        let yb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(xi, xb.as_ref());
+        bind.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got = vec![0f32; rows * dim];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for i in 0..rows * dim {
+            assert!(
+                (got[i] - want[i]).abs() < 1e-4,
+                "softmax mismatch at {i}: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    /// DiffusionGemma Phase-B: the FULL in-graph self-conditioning subgraph (softmax → soft-embed
+    /// matmul → scale → rmsnorm → gate/up linears → gated-GELU → down linear — the exact op
+    /// sequence `cpu_backend.rs`'s `build` emits for a SC-on denoise step) at small synthetic dims,
+    /// compared against a host reference computed against the SAME f16-rounded weights (isolating
+    /// the graph WIRING/layout from f16 rounding noise, like `linear_graph_matches_host`). This is
+    /// "one SC denoise step" in miniature — the real model's SC block is this identical op
+    /// sequence at production sizes (ne/vocab/nff/canvas_length), just with GGUF-loaded weights.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn diffusion_gemma_sc_subgraph_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (cc, vocab, ne, nff) = (4usize, 512usize, 128usize, 256usize);
+        let eps = 1e-6f32;
+        let scale = 1.0f32; // production always premultiplies temp_inv on the host (see cpu_backend.rs)
+
+        let to_f16 = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let deq = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        };
+
+        let sc_logits: Vec<f32> = (0..cc * vocab)
+            .map(|i| (i as f32 * 0.0131).sin() * 4.0)
+            .collect();
+        let embt: Vec<f32> = (0..ne * vocab)
+            .map(|i| (i as f32 * 0.0007).cos() * 0.3)
+            .collect();
+        let gate_w: Vec<f32> = (0..nff * ne)
+            .map(|i| (i as f32 * 0.0011).sin() * 0.2)
+            .collect();
+        let up_w: Vec<f32> = (0..nff * ne)
+            .map(|i| (i as f32 * 0.0017).cos() * 0.2)
+            .collect();
+        let down_w: Vec<f32> = (0..ne * nff)
+            .map(|i| (i as f32 * 0.0013).sin() * 0.2)
+            .collect();
+        let pre_norm: Vec<f32> = (0..ne).map(|i| 1.0 + i as f32 * 0.01).collect();
+
+        // Host uses the SAME f16-rounded weights the GPU reads (isolates wiring, not rounding).
+        let (embt16, gate16, up16, down16) = (
+            to_f16(&embt),
+            to_f16(&gate_w),
+            to_f16(&up_w),
+            to_f16(&down_w),
+        );
+        let (embq, gateq, upq, downq) = (deq(&embt16), deq(&gate16), deq(&up16), deq(&down16));
+
+        let mut want = vec![0f32; cc * ne];
+        for r in 0..cc {
+            let row = &sc_logits[r * vocab..(r + 1) * vocab];
+            let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v * scale));
+            let mut probs = vec![0f32; vocab];
+            let mut denom = 0f32;
+            for (p, &v) in probs.iter_mut().zip(row) {
+                *p = (v * scale - mx).exp();
+                denom += *p;
+            }
+            for p in probs.iter_mut() {
+                *p /= denom;
+            }
+            // soft = probs @ embT — embq is [ne, vocab] row-major (Op::Linear's weight layout).
+            let mut soft = vec![0f32; ne];
+            for (e, s) in soft.iter_mut().enumerate() {
+                let erow = &embq[e * vocab..(e + 1) * vocab];
+                *s = probs.iter().zip(erow).map(|(&p, &w)| p * w).sum::<f32>() * (ne as f32).sqrt();
+            }
+            let ms: f32 = soft.iter().map(|&x| x * x).sum::<f32>() / ne as f32;
+            let inv = 1.0 / (ms + eps).sqrt();
+            let normed: Vec<f32> = soft
+                .iter()
+                .zip(&pre_norm)
+                .map(|(&x, &w)| x * inv * w)
+                .collect();
+            let mut gv = vec![0f32; nff];
+            let mut uv = vec![0f32; nff];
+            for f in 0..nff {
+                let grow = &gateq[f * ne..(f + 1) * ne];
+                let urow = &upq[f * ne..(f + 1) * ne];
+                gv[f] = grow.iter().zip(&normed).map(|(&w, &x)| w * x).sum();
+                uv[f] = urow.iter().zip(&normed).map(|(&w, &x)| w * x).sum();
+            }
+            let act: Vec<f32> = gv
+                .iter()
+                .zip(&uv)
+                .map(|(&gd, &ud)| {
+                    let gelu =
+                        0.5 * gd * (1.0 + (0.797_884_6 * (gd + 0.044715 * gd * gd * gd)).tanh());
+                    gelu * ud
+                })
+                .collect();
+            for (e, w_row) in want[r * ne..(r + 1) * ne].iter_mut().enumerate() {
+                let drow = &downq[e * nff..e * nff + nff];
+                *w_row = drow.iter().zip(&act).map(|(&w, &a)| w * a).sum();
+            }
+        }
+
+        let mut g = Graph::new();
+        let logits_i = g.input(TensorDesc::new(vec![cc, vocab], DType::F32));
+        let embt_i = g.weight(TensorDesc::new(vec![ne, vocab], DType::F16));
+        let pre_norm_i = g.weight(TensorDesc::new(vec![ne], DType::F32));
+        let gate_i = g.weight(TensorDesc::new(vec![nff, ne], DType::F16));
+        let up_i = g.weight(TensorDesc::new(vec![nff, ne], DType::F16));
+        let down_i = g.weight(TensorDesc::new(vec![ne, nff], DType::F16));
+        let sig_i = g.output(TensorDesc::new(vec![cc, ne], DType::F32));
+
+        let probs_i = g.internal(TensorDesc::new(vec![cc, vocab], DType::F32));
+        g.push(Op::Softmax {
+            x: logits_i,
+            dst: probs_i,
+            rows: cc as u32,
+            dim: vocab as u32,
+            scale,
+        });
+        let soft_i = g.internal(TensorDesc::new(vec![cc, ne], DType::F32));
+        g.push(Op::Linear {
+            x: probs_i,
+            weight: embt_i,
+            dst: soft_i,
+            m: cc as u32,
+            in_f: vocab as u32,
+            out_f: ne as u32,
+            w_off: 0,
+        });
+        g.push(Op::Scale {
+            x: soft_i,
+            dst: soft_i,
+            s: (ne as f32).sqrt(),
+            n: (cc * ne) as u32,
+        });
+        let normed_i = g.internal(TensorDesc::new(vec![cc, ne], DType::F32));
+        g.push(Op::RmsNorm {
+            x: soft_i,
+            weight: pre_norm_i,
+            dst: normed_i,
+            rows: cc as u32,
+            dim: ne as u32,
+            eps,
+        });
+        let g_i = g.internal(TensorDesc::new(vec![cc, nff], DType::F32));
+        let u_i = g.internal(TensorDesc::new(vec![cc, nff], DType::F32));
+        g.push(Op::Linear {
+            x: normed_i,
+            weight: gate_i,
+            dst: g_i,
+            m: cc as u32,
+            in_f: ne as u32,
+            out_f: nff as u32,
+            w_off: 0,
+        });
+        g.push(Op::Linear {
+            x: normed_i,
+            weight: up_i,
+            dst: u_i,
+            m: cc as u32,
+            in_f: ne as u32,
+            out_f: nff as u32,
+            w_off: 0,
+        });
+        let act_i = g.internal(TensorDesc::new(vec![cc, nff], DType::F32));
+        g.push(Op::GatedAct {
+            gate: g_i,
+            up: u_i,
+            dst: act_i,
+            rows: cc as u32,
+            nff: nff as u32,
+            act: Activation::Gelu,
+            up_off: 0,
+        });
+        g.push(Op::Linear {
+            x: act_i,
+            weight: down_i,
+            dst: sig_i,
+            m: cc as u32,
+            in_f: nff as u32,
+            out_f: ne as u32,
+            w_off: 0,
+        });
+
+        let logits_b = be_.alloc(cc * vocab * 4, BufferUsage::Activations).unwrap();
+        let embt_b = be_.alloc(embt16.len(), BufferUsage::Weights).unwrap();
+        let pre_norm_b = be_.alloc(ne * 4, BufferUsage::Weights).unwrap();
+        let gate_b = be_.alloc(gate16.len(), BufferUsage::Weights).unwrap();
+        let up_b = be_.alloc(up16.len(), BufferUsage::Weights).unwrap();
+        let down_b = be_.alloc(down16.len(), BufferUsage::Weights).unwrap();
+        let sig_b = be_.alloc(cc * ne * 4, BufferUsage::Activations).unwrap();
+        be_.upload(logits_b.as_ref(), bytemuck::cast_slice(&sc_logits))
+            .unwrap();
+        be_.upload(embt_b.as_ref(), &embt16).unwrap();
+        be_.upload(pre_norm_b.as_ref(), bytemuck::cast_slice(&pre_norm))
+            .unwrap();
+        be_.upload(gate_b.as_ref(), &gate16).unwrap();
+        be_.upload(up_b.as_ref(), &up16).unwrap();
+        be_.upload(down_b.as_ref(), &down16).unwrap();
+
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(logits_i, logits_b.as_ref());
+        bind.bind(embt_i, embt_b.as_ref());
+        bind.bind(pre_norm_i, pre_norm_b.as_ref());
+        bind.bind(gate_i, gate_b.as_ref());
+        bind.bind(up_i, up_b.as_ref());
+        bind.bind(down_i, down_b.as_ref());
+        bind.bind(sig_i, sig_b.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got = vec![0f32; cc * ne];
+        be_.download(sig_b.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+
+        let cos = |a: &[f32], b: &[f32]| -> f64 {
+            let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+            for (&x, &y) in a.iter().zip(b) {
+                dot += x as f64 * y as f64;
+                na += x as f64 * x as f64;
+                nb += y as f64 * y as f64;
+            }
+            dot / (na.sqrt() * nb.sqrt())
+        };
+        for r in 0..cc {
+            let (w, g_) = (&want[r * ne..(r + 1) * ne], &got[r * ne..(r + 1) * ne]);
+            let c = cos(w, g_);
+            println!("diffusion_gemma_sc_subgraph_matches_host: row {r} cosine={c:.5}");
+            assert!(c > 0.99, "row {r}: SC subgraph cosine too low: {c}");
         }
     }
 

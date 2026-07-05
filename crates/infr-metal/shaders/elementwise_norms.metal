@@ -94,6 +94,52 @@ kernel void rmsnorm_wide_f32(device const float* x   [[buffer(0)]],
     for (uint i = tid; i < p.dim; i += 256u) dst[base + i] = x[base + i] * s * w[i];
 }
 
+// Row-wise softmax: dst[r,:] = softmax(x[r,:] * scale), one threadgroup (8 simdgroups) per row —
+// diffusion-gemma's in-graph self-conditioning (see docs/DIFFUSIONGEMMA.md's Phase-B and the
+// reference's `dg_canvas_embed`). Same wide-launch shape as `rmsnorm_wide_f32` since the row width
+// (vocab) is large. NOTE: unlike the rest of this backend, this kernel is UNVERIFIED on real
+// Metal hardware (added blind, following the CPU/Vulkan implementations — see infr-vulkan's
+// `softmax.comp` for the sibling shader this mirrors).
+struct SoftmaxParams { uint rows; uint dim; float scale; };
+kernel void softmax_wide_f32(device const float* x   [[buffer(0)]],
+                             device float*       dst [[buffer(1)]],
+                             constant SoftmaxParams& p [[buffer(2)]],
+                             uint tid  [[thread_position_in_threadgroup]],
+                             uint row  [[threadgroup_position_in_grid]],
+                             uint sg   [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    if (row >= p.rows) return;
+    uint base = row * p.dim;
+
+    // row max (numerically stable exp)
+    float m = -INFINITY;
+    for (uint i = tid; i < p.dim; i += 256u) {
+        m = max(m, x[base + i] * p.scale);
+    }
+    m = simd_max(m);
+    if (lane == 0u) red[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m0 = max(max(max(red[0], red[1]), max(red[2], red[3])),
+                   max(max(red[4], red[5]), max(red[6], red[7])));
+    threadgroup_barrier(mem_flags::mem_threadgroup); // every thread read `red[]` before it's reused
+
+    // row sum of exp(x*scale - m0)
+    float s = 0.0f;
+    for (uint i = tid; i < p.dim; i += 256u) {
+        s += exp(x[base + i] * p.scale - m0);
+    }
+    s = simd_sum(s);
+    if (lane == 0u) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = red[0] + red[1] + red[2] + red[3] + red[4] + red[5] + red[6] + red[7];
+    float inv = 1.0f / tot;
+
+    for (uint i = tid; i < p.dim; i += 256u) {
+        dst[base + i] = exp(x[base + i] * p.scale - m0) * inv;
+    }
+}
+
 // per-head RMSNorm: one SIMD group (32 lanes) per (row, head), weight indexed within head_dim.
 struct QkNormParams { uint rows; uint n_head; uint head_dim; float eps; };
 kernel void qknorm_f32(device const float* x   [[buffer(0)]],

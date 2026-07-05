@@ -1,0 +1,44 @@
+#version 460
+// Row-wise softmax: y[r,:] = softmax(x[r,:] * scale), one workgroup per row. diffusion-gemma's
+// in-graph self-conditioning (see docs/DIFFUSIONGEMMA.md's Phase-B and the reference's
+// `dg_canvas_embed`): softmaxes the previous step's canvas logits over the FULL vocab before the
+// soft-embedding matmul. Same 256-thread subgroup-reduction shape as `rmsnorm.comp` — `dim` here
+// is the vocab (hundreds of thousands wide), so the cooperative reduction matters just as much.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint dim; float scale; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) buffer YB { float y[]; };
+
+shared float part[8]; // one partial per subgroup (256 threads / 32 = 8 waves)
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationIndex;
+    uint base = r * pc.dim;
+
+    // row max (numerically stable exp)
+    float mx = -1.0 / 0.0; // -inf
+    for (uint i = t; i < pc.dim; i += 256u) { mx = max(mx, x[base + i] * pc.scale); }
+    mx = subgroupMax(mx);
+    if (subgroupElect()) { part[gl_SubgroupID] = mx; }
+    barrier();
+    float m0 = part[0];
+    for (uint s = 1u; s < gl_NumSubgroups; s++) { m0 = max(m0, part[s]); }
+    barrier(); // every thread has read `part[]` for m0 before it's reused below
+
+    // row sum of exp(x*scale - m0)
+    float sum = 0.0;
+    for (uint i = t; i < pc.dim; i += 256u) { sum += exp(x[base + i] * pc.scale - m0); }
+    sum = subgroupAdd(sum);
+    if (subgroupElect()) { part[gl_SubgroupID] = sum; }
+    barrier();
+    float tot = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[s]; }
+    float inv = 1.0 / tot;
+
+    for (uint i = t; i < pc.dim; i += 256u) { y[base + i] = exp(x[base + i] * pc.scale - m0) * inv; }
+}

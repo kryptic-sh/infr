@@ -2389,6 +2389,33 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = out;
                 }
+                Op::Softmax {
+                    x,
+                    dst,
+                    rows,
+                    dim,
+                    scale,
+                } => {
+                    let (rows, dim) = (rows as usize, dim as usize);
+                    let xs = &vals[x.0 as usize];
+                    let mut out = vec![0f32; rows * dim];
+                    out.par_chunks_mut(dim)
+                        .zip(xs.par_chunks(dim))
+                        .for_each(|(o, row)| {
+                            let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v * scale));
+                            let mut denom = 0f32;
+                            for (dst_v, &v) in o.iter_mut().zip(row) {
+                                let e = (v * scale - mx).exp();
+                                *dst_v = e;
+                                denom += e;
+                            }
+                            let inv = 1.0 / denom;
+                            for dst_v in o.iter_mut() {
+                                *dst_v *= inv;
+                            }
+                        });
+                    vals[dst.0 as usize] = out;
+                }
                 Op::QkNorm {
                     x,
                     weight: w,

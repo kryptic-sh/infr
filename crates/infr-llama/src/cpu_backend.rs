@@ -128,6 +128,12 @@ struct DecodeHandles {
     // the driver binds `ipl_buf` to; the GPU prologue turns this into the layer loop's actual
     // per-layer input vector (see `per_layer_inp` inside `build`).
     pl_tok_in: Option<TensorId>,
+    // Phase-B perf: DiffusionGemma in-graph self-conditioning inputs/weight — `Some` only when
+    // `build` was called with `gpu_sc: Some(true)` (see `build`'s doc). `sc_logits` is the
+    // per-step Input (host-premultiplied previous canvas logits); `sc_embt` is the one-time
+    // device weight bound from `SeamKv::sc_embt`, NOT from the ordinary `weights` upload loop.
+    sc_logits: Option<TensorId>,
+    sc_embt: Option<TensorId>,
     logits: TensorId,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
@@ -609,11 +615,19 @@ pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
 struct DenoiseCache {
     cc: usize,
     p: usize,
+    /// Phase-B perf: whether this plan bakes the in-graph SC subgraph (`gpu_sc: Some(true)` — see
+    /// `build`'s doc). Always `false` on CPU/Metal (their graph never varies with SC). A DIFFERENT
+    /// graph shape from the no-SC plan (extra ops + an extra weight/input), so it's part of the
+    /// cache key: step 0 (no SC) and steps 1+ (SC on) hit two separate cached plans instead of one
+    /// runtime-gated plan — see docs/DIFFUSIONGEMMA.md's Phase-B "two-plan" note.
+    sc: bool,
     plan: Box<dyn Plan>,
     dh: DecodeHandles,
     hidden_buf: Box<dyn Buffer>,
     pos_buf: Box<dyn Buffer>,
     logits_buf: Box<dyn Buffer>,
+    /// Per-step host-premultiplied previous canvas logits `[cc, vocab]` — `Some` only when `sc`.
+    sc_logits_buf: Option<Box<dyn Buffer>>,
 }
 
 /// Phase-A perf: DiffusionGemma's self-conditioning gated-MLP weights, dequantized ONCE (see
@@ -650,6 +664,12 @@ pub(crate) struct SeamKv {
     /// denoise call with self-conditioning ON. `Arc` so `fork()` shares it with forked conversation
     /// slots for free (a pure function of the model, not per-conversation state).
     self_cond_w: Option<std::sync::Arc<SelfCondWeights>>,
+    /// Phase-B perf: the in-graph SC soft-embedding weight (`token_embd` dequantized + transposed
+    /// to f16 `[n_embd, n_vocab]`, ~1.4 GB — see the reference's `dg_ensure_sc_embT` and
+    /// `build_sc_embt`), built lazily on the FIRST Vulkan denoise call with SC on. `None` for
+    /// CPU/Metal (they never set it) and for every non-diffusion-gemma caller. `Arc` so `fork()`
+    /// shares it with forked conversation slots for free — mirrors `self_cond_w`.
+    sc_embt: Option<std::sync::Arc<dyn Buffer>>,
 }
 
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
@@ -752,10 +772,12 @@ impl SeamKv {
             cached: Vec::new(),
             // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
             // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
-            // slot's first denoise call. `self_cond_w` is model-derived, not buffer-derived, so it
-            // DOES carry over (cheap Arc clone, skips a redundant dequant on the forked slot).
+            // slot's first denoise call. `self_cond_w`/`sc_embt` are model-derived (not
+            // buffer-derived, and `sc_embt` lives on the SAME shared backend/device as `self`), so
+            // they DO carry over (cheap Arc clone, skips a redundant dequant/rebuild).
             denoise_cache: None,
             self_cond_w: self.self_cond_w.clone(),
+            sc_embt: self.sc_embt.clone(),
         })
     }
 
@@ -849,9 +871,11 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 /// Runs entirely on the HOST: `soft` is a `[vocab]`-wide weighted sum of embedding rows, computed
 /// directly against the CPU runner's already-dequantized `token_embd` table (a plain threaded
 /// matvec) rather than materializing the reference's second on-device transposed-embedding
-/// weight (`sc_embT`, ~1.4 GB) — see the Phase-2 report's "deviation from spec" note. The Vulkan
-/// denoise path reuses this SAME host routine (identical math, so CPU/Vulkan self-cond agree
-/// bit-for-bit modulo the usual f32 rounding-order noise) rather than a GPU-resident soft-embed.
+/// weight (`sc_embT`, ~1.4 GB). CPU/Metal keep this host path (this function). Phase-B moved the
+/// Vulkan denoise path's SC block IN-GRAPH instead (a `sc_embT` device weight + `Op::Softmax` +
+/// `Op::Linear`/`Op::GatedAct` — see the SC subgraph in `build` and `build_sc_embt` below) since
+/// the host matvec here was ~85% of every Vulkan denoise step's wall time (see
+/// `INFR_DIFFUSION_TIME`'s breakdown).
 ///
 /// Phase-A perf: `scw` is the ONE-TIME dequant of the four self-cond tensors (see
 /// `SeamKv::self_cond_w`) — this used to re-dequantize all four on EVERY call.
@@ -927,6 +951,36 @@ fn diffusion_self_cond(
         }
     });
     Ok(sig)
+}
+
+/// Phase-B perf: build the in-graph SC soft-embedding weight ONCE (see `SeamKv::sc_embt`) —
+/// `token_embd` (already dequantized to f32 host-side, row-major `[vocab, ne]`) TRANSPOSED to f16
+/// `[ne, vocab]` row-major (row `e` holds embedding dim `e` across every vocab token), matching
+/// `Op::Linear`'s `weight: [out_f, in_f]` convention exactly like the reference's `sc_embT` /
+/// `dg_ensure_sc_embT` — the difference being the reference dequantizes `tok_embd` FROM the GGUF
+/// dtype on the host, while this runner already has it in f32 (`token_embd`), so this is a plain
+/// transpose+cast. Threaded over embedding rows (each row's inner loop reads `token_embd` with a
+/// `ne`-element stride — cache-unfriendly, but this runs ONCE per session).
+fn build_sc_embt(
+    be: &dyn Backend,
+    token_embd: &[f32],
+    ne: usize,
+    vocab: usize,
+) -> AResult<std::sync::Arc<dyn Buffer>> {
+    use half::f16;
+    use rayon::prelude::*;
+    let mut dst = vec![0u16; ne * vocab]; // f16 bits, row-major [ne, vocab]
+    dst.par_chunks_mut(vocab).enumerate().for_each(|(e, row)| {
+        for (v, out_v) in row.iter_mut().enumerate() {
+            *out_v = f16::from_f32(token_embd[v * ne + e]).to_bits();
+        }
+    });
+    let buf = be
+        .alloc(dst.len() * 2, BufferUsage::Weights)
+        .map_err(|e| anyhow!("{e}"))?;
+    be.upload(buf.as_ref(), bytemuck::cast_slice(&dst))
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(std::sync::Arc::from(buf))
 }
 
 /// Phase-2 DiffusionGemma canvas-denoise request (see docs/DIFFUSIONGEMMA.md): short-circuits
@@ -1494,6 +1548,7 @@ pub(crate) fn generate_dense_backend(
             cached: Vec::new(),
             denoise_cache: None,
             self_cond_w: None,
+            sc_embt: None,
         });
     }
     let SeamKv {
@@ -1510,6 +1565,7 @@ pub(crate) fn generate_dense_backend(
         cached,
         denoise_cache,
         self_cond_w,
+        sc_embt,
     } = state.as_mut().expect("seam state just initialized");
     let SeamWeights {
         wbufs,
@@ -1585,10 +1641,20 @@ pub(crate) fn generate_dense_backend(
     // row P, Attention's kv_len is still `start_pos+batch` = P+C, positions are still bound
     // per-row P..P+C-1 by the caller) — ONLY the attention mask and the per-layer output scalar
     // change. Never true for any existing caller (all pass `false`).
+    // `gpu_sc`: Phase-B perf, DiffusionGemma in-graph self-conditioning (see
+    // docs/DIFFUSIONGEMMA.md's Phase-B and the reference's `dg_canvas_embed`) — `None` for every
+    // ordinary caller (CPU/Metal denoise included: they keep the Phase-A host `diffusion_self_cond`
+    // path, so `hidden` is already the fully-baked residual). `Some(sc_on)` ONLY from the Vulkan
+    // denoise call site: `hidden` there holds the RAW scaled canvas embedding (no SC add, no
+    // norm) and this flag additionally emits the SC subgraph (`sc_on == true`) and/or the
+    // weightless canvas-embed post-norm (always, when `Some`) INSIDE the graph. Baked into the
+    // cached plan (the `(cc,p,sc_on)` key — see `DenoiseCache`) rather than a runtime gate, so the
+    // compiled graph never branches at execute time.
     let build = |batch: usize,
                  start_pos: usize,
                  logits_rows: usize,
-                 denoise: bool|
+                 denoise: bool,
+                 gpu_sc: Option<bool>|
      -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
@@ -1609,6 +1675,14 @@ pub(crate) fn generate_dense_backend(
         // (model_proj GEMV + RMSNorm), further down, once its weights are declared.
         let pl_tok_in = if e2b {
             Some(g.input(f32d(batch * c.n_layer * npl)))
+        } else {
+            None
+        };
+        // Phase-B perf: previous-step canvas logits `[batch, vocab]`, premultiplied by temp_inv on
+        // the HOST before upload (keeps `Op::Softmax`'s `scale` a constant 1.0 across steps whose
+        // temp_inv legitimately changes, so this same plan replays — see the denoise call site).
+        let sc_logits_in = if gpu_sc == Some(true) {
+            Some(g.input(f32d(batch * c.vocab)))
         } else {
             None
         };
@@ -1785,15 +1859,31 @@ pub(crate) fn generate_dense_backend(
         }
         let w_out_norm = wpush(&mut g, &mut weights);
         let w_lm = wpush(&mut g, &mut weights);
-        // diffusion-gemma: self-conditioning MLP handles — declared to match `wload`'s upload
-        // order (right after lm_head, before the e2b projection weights), discarded (Phase 1
-        // never emits an Op reading them; Phase 2 names them).
-        if c.diffusion_gemma {
-            let _sc_pre_norm = wpush(&mut g, &mut weights);
-            let _sc_gate = wpush(&mut g, &mut weights);
-            let _sc_up = wpush(&mut g, &mut weights);
-            let _sc_down = wpush(&mut g, &mut weights);
-        }
+        // diffusion-gemma: self-conditioning gated-MLP handles — declared to match `wload`'s
+        // upload order (right after lm_head, before the e2b projection weights). Read by the
+        // in-graph SC subgraph below when `gpu_sc == Some(true)`; harmlessly unread otherwise
+        // (every other build, including the CPU/Metal denoise path, which computes SC on the
+        // host — see `diffusion_self_cond`).
+        let (sc_pre_norm_id, sc_gate_id, sc_up_id, sc_down_id) = if c.diffusion_gemma {
+            (
+                Some(wpush(&mut g, &mut weights)),
+                Some(wpush(&mut g, &mut weights)),
+                Some(wpush(&mut g, &mut weights)),
+                Some(wpush(&mut g, &mut weights)),
+            )
+        } else {
+            (None, None, None, None)
+        };
+        // Phase-B perf: the SC soft-embedding weight — `token_embd` dequantized + TRANSPOSED to
+        // f16 `[n_embd, n_vocab]` (row e holds embedding dim e across every vocab token; the
+        // reference's `sc_embT` / `dg_ensure_sc_embT`). NOT a GGUF tensor (`wpush` doesn't cover
+        // it) — built once on the host from the already-dequantized `token_embd` and bound
+        // separately by the denoise call site (see `SeamKv::sc_embt`).
+        let sc_embt_id = if gpu_sc == Some(true) {
+            Some(g.weight(TensorDesc::new(vec![c.vocab * ne], DType::F16)))
+        } else {
+            None
+        };
         // gemma4 E2B per-layer input-embedding projection weights — declared here to match the
         // `wload` upload order (right after lm_head/self_cond, before the gemma4 V-norm ones-vector).
         let (mp_w, pn_w) = if e2b {
@@ -1944,6 +2034,128 @@ pub(crate) fn generate_dense_backend(
             } else {
                 None
             };
+
+        // Phase-B perf: DiffusionGemma in-graph canvas embedding (ported from the reference's
+        // `dg_canvas_embed` in diffusion-gemma.cpp — see docs/DIFFUSIONGEMMA.md's Phase-B).
+        // `hidden` at this point holds ONLY the raw scaled canvas embedding
+        // (`embed(tok)·√n_embd`, no SC add, no norm — the host caller uploads exactly that
+        // instead of the Phase-A fully-baked residual). Runs BEFORE the layer loop below, which
+        // reads/mutates `hidden` in place exactly as every other caller's — no change needed
+        // there.
+        if let Some(sc_on) = gpu_sc {
+            if sc_on {
+                let sc_logits_in =
+                    sc_logits_in.expect("gpu_sc(true) plan always declares sc_logits_in");
+                let sc_embt = sc_embt_id.expect("gpu_sc(true) plan always declares sc_embt_id");
+                let (sc_pre_norm_id, sc_gate_id, sc_up_id, sc_down_id) = (
+                    sc_pre_norm_id.expect("diffusion-gemma always declares sc_pre_norm_id"),
+                    sc_gate_id.expect("diffusion-gemma always declares sc_gate_id"),
+                    sc_up_id.expect("diffusion-gemma always declares sc_up_id"),
+                    sc_down_id.expect("diffusion-gemma always declares sc_down_id"),
+                );
+                let vocab = c.vocab;
+                // probs = softmax(sc_logits) — temp_inv was already applied on the host, so
+                // `scale: 1.0` here (see `sc_logits_in`'s doc).
+                let probs = g.internal(f32d(batch * vocab));
+                g.push(Op::Softmax {
+                    x: sc_logits_in,
+                    dst: probs,
+                    rows: batch as u32,
+                    dim: vocab as u32,
+                    scale: 1.0,
+                });
+                // soft = (probs @ sc_embT) * sqrt(n_embd) — sc_embT is [n_embd, n_vocab]
+                // (Op::Linear's `weight: [out_f, in_f]` convention), so this is exactly the
+                // reference's `ggml_mul_mat(sc_embT, probs)`.
+                let soft = g.internal(f32d(batch * ne));
+                g.push(Op::Linear {
+                    x: probs,
+                    weight: sc_embt,
+                    dst: soft,
+                    m: batch as u32,
+                    in_f: vocab as u32,
+                    out_f: ne as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Scale {
+                    x: soft,
+                    dst: soft,
+                    s: (ne as f32).sqrt(),
+                    n: (batch * ne) as u32,
+                });
+                // sc_pre_norm: a NORMAL (weighted) rmsnorm — unlike the canvas embedding's
+                // weightless one below.
+                let sc_normed = g.internal(f32d(batch * ne));
+                g.push(Op::RmsNorm {
+                    x: soft,
+                    weight: sc_pre_norm_id,
+                    dst: sc_normed,
+                    rows: batch as u32,
+                    dim: ne as u32,
+                    eps,
+                });
+                // Gated-GELU MLP: down(gelu_tanh(gate·normed) * (up·normed)).
+                let sc_g = g.internal(f32d(batch * nff));
+                let sc_u = g.internal(f32d(batch * nff));
+                g.push(Op::Linear {
+                    x: sc_normed,
+                    weight: sc_gate_id,
+                    dst: sc_g,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: nff as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Linear {
+                    x: sc_normed,
+                    weight: sc_up_id,
+                    dst: sc_u,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: nff as u32,
+                    w_off: 0,
+                });
+                let sc_act = g.internal(f32d(batch * nff));
+                g.push(Op::GatedAct {
+                    gate: sc_g,
+                    up: sc_u,
+                    dst: sc_act,
+                    rows: batch as u32,
+                    nff: nff as u32,
+                    act: Activation::Gelu,
+                    up_off: 0,
+                });
+                let sc_sig = g.internal(f32d(batch * ne));
+                g.push(Op::Linear {
+                    x: sc_act,
+                    weight: sc_down_id,
+                    dst: sc_sig,
+                    m: batch as u32,
+                    in_f: nff as u32,
+                    out_f: ne as u32,
+                    w_off: 0,
+                });
+                g.push(Op::Add {
+                    a: hidden,
+                    b: sc_sig,
+                    dst: hidden,
+                    n: (batch * ne) as u32,
+                });
+            }
+            // weightless canvas-embed post-norm (no scale weight — matches `dg_canvas_embed`
+            // exactly). Reuses `router_ones` (the same ne-wide ones vector diffusion-gemma
+            // already declares for the MoE router's weightless norm) instead of a new weight.
+            let ones =
+                router_ones.expect("diffusion-gemma gpu_sc build always declares router_ones");
+            g.push(Op::RmsNorm {
+                x: hidden,
+                weight: ones,
+                dst: hidden,
+                rows: batch as u32,
+                dim: ne as u32,
+                eps,
+            });
+        }
 
         for (l, lw) in lw.iter().enumerate() {
             // Per-layer dims (gemma4 SWA vs full; uniform for every other model).
@@ -2818,6 +3030,8 @@ pub(crate) fn generate_dense_backend(
                 positions,
                 rope_freqs,
                 pl_tok_in,
+                sc_logits: sc_logits_in,
+                sc_embt: sc_embt_id,
                 logits,
                 k_cache,
                 v_cache,
@@ -2836,9 +3050,10 @@ pub(crate) fn generate_dense_backend(
                 "canvas denoise forward: diffusion-gemma models only"
             ));
         }
-        // Phase-A perf: per-step timing, gated on INFR_DIFFUSION_TIME=1 (stderr, one line/step) —
-        // sizes how much of the ~6.6s/step wall time is this host block vs build/exec/download, so
-        // Phase B/C can target the right piece.
+        // Phase-A/B perf: per-step timing, gated on INFR_DIFFUSION_TIME=1 (stderr, one line/step).
+        // Phase A found `sc` was ~85% of every step (the host SC matvec); Phase B moved that
+        // in-graph on Vulkan, so `sc` now reports only the (cheap) host prep — embed gather, and
+        // the temp_inv premultiply on the gpu_sc path — while `exec` absorbs the SC math itself.
         let time_diffusion = std::env::var("INFR_DIFFUSION_TIME").is_ok();
         let canvas = req.canvas_tokens;
         let cc = canvas.len();
@@ -2848,18 +3063,30 @@ pub(crate) fn generate_dense_backend(
                 "denoise: prompt {p} + canvas {cc} exceeds the session KV capacity {max_ctx}"
             ));
         }
+        // Phase-B perf: in-graph self-conditioning on Vulkan (see docs/DIFFUSIONGEMMA.md's
+        // Phase-B and the reference's `dg_canvas_embed`) — CPU/Metal keep the Phase-A host path
+        // (`diffusion_self_cond` + host weightless norm) unchanged below.
+        let gpu_sc = be.name() == "vulkan";
+        let sc_on = req.sc_logits.is_some();
+        // The plan shape only varies with SC on the gpu_sc path (CPU/Metal's graph never changes;
+        // `sc_on` there is purely a host-side input difference) — see `DenoiseCache::sc`'s doc.
+        let plan_sc = gpu_sc && sc_on;
+
         let t_sc0 = std::time::Instant::now();
-        // 1. Canvas embedding: e = embed(tok)·√n_embd [+ self-cond], then weightless rms-norm
-        // (no scale weight — matches `dg_canvas_embed` in the reference exactly). diffusion-gemma
-        // is always gemma-family, so `embed_scale` is always √n_embd — computed locally (the
-        // "── drive ──" section below defines its own copy for the ordinary decode loop, unreached
-        // by this early return).
+        // 1. Canvas embedding: e = embed(tok)·√n_embd. diffusion-gemma is always gemma-family, so
+        // `embed_scale` is always √n_embd — computed locally (the "── drive ──" section below
+        // defines its own copy for the ordinary decode loop, unreached by this early return). On
+        // the gpu_sc path this is ALL of `hidden_host` — the SC add + weightless norm run IN-GRAPH
+        // instead (see `build`'s SC subgraph); on CPU/Metal it's completed below exactly as Phase A.
         let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let mut hidden_host: Vec<f32> = Vec::with_capacity(cc * ne);
         for &tok in canvas {
             let base = tok as usize * ne;
             hidden_host.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
         }
+        // Per-step host-premultiplied previous canvas logits for the gpu_sc path — `Some` only
+        // when `plan_sc` (populated below); declared here so it outlives the upload further down.
+        let mut sc_logits_host: Option<Vec<f32>> = None;
         if let Some(sc_logits) = req.sc_logits {
             if sc_logits.len() != cc * c.vocab {
                 return Err(anyhow!(
@@ -2868,49 +3095,69 @@ pub(crate) fn generate_dense_backend(
                     c.vocab
                 ));
             }
-            // Phase-A perf: dequantize the self-cond MLP weights ONCE per session, not once per
-            // call — `diffusion_self_cond` used to re-run four `load_tensor_dequant`s every step.
-            if self_cond_w.is_none() {
-                let (pre_norm, _) = crate::load_tensor_dequant(g, "self_cond_pre_norm.weight")?;
-                let (gate_w, _) = crate::load_tensor_dequant(g, "self_cond_gate.weight")?; // [nff, ne]
-                let (up_w, _) = crate::load_tensor_dequant(g, "self_cond_up.weight")?; // [nff, ne]
-                let (down_w, _) = crate::load_tensor_dequant(g, "self_cond_down.weight")?; // [ne, nff]
-                *self_cond_w = Some(std::sync::Arc::new(SelfCondWeights {
-                    pre_norm,
-                    gate_w,
-                    up_w,
-                    down_w,
-                }));
-            }
-            let scw = self_cond_w.as_ref().expect("just populated above");
-            let sc_sig = diffusion_self_cond(scw, c, token_embd, sc_logits, req.temp_inv, cc)?;
-            for (h, s) in hidden_host.iter_mut().zip(sc_sig.iter()) {
-                *h += s;
+            if gpu_sc {
+                // Premultiply by temp_inv on the HOST (one pass over cc*vocab floats, threaded) so
+                // the in-graph `Op::Softmax`'s `scale` stays a CONSTANT 1.0 across steps whose
+                // temp_inv legitimately changes — see `sc_logits_in`'s doc in `build`. Everything
+                // downstream (softmax, the soft-embed matmul, the gated MLP) now runs on-device.
+                use rayon::prelude::*;
+                let mut scaled = vec![0f32; sc_logits.len()];
+                scaled
+                    .par_iter_mut()
+                    .zip(sc_logits.par_iter())
+                    .for_each(|(d, &s)| *d = s * req.temp_inv);
+                sc_logits_host = Some(scaled);
+            } else {
+                // Phase-A host path (CPU/Metal), unchanged.
+                // Phase-A perf: dequantize the self-cond MLP weights ONCE per session, not once
+                // per call — `diffusion_self_cond` used to re-run four `load_tensor_dequant`s
+                // every step.
+                if self_cond_w.is_none() {
+                    let (pre_norm, _) = crate::load_tensor_dequant(g, "self_cond_pre_norm.weight")?;
+                    let (gate_w, _) = crate::load_tensor_dequant(g, "self_cond_gate.weight")?; // [nff, ne]
+                    let (up_w, _) = crate::load_tensor_dequant(g, "self_cond_up.weight")?; // [nff, ne]
+                    let (down_w, _) = crate::load_tensor_dequant(g, "self_cond_down.weight")?; // [ne, nff]
+                    *self_cond_w = Some(std::sync::Arc::new(SelfCondWeights {
+                        pre_norm,
+                        gate_w,
+                        up_w,
+                        down_w,
+                    }));
+                }
+                let scw = self_cond_w.as_ref().expect("just populated above");
+                let sc_sig = diffusion_self_cond(scw, c, token_embd, sc_logits, req.temp_inv, cc)?;
+                for (h, s) in hidden_host.iter_mut().zip(sc_sig.iter()) {
+                    *h += s;
+                }
             }
         }
-        for row in hidden_host.chunks_mut(ne) {
-            let ms: f32 = row.iter().map(|&x| x * x).sum::<f32>() / ne as f32;
-            let inv = 1.0 / (ms + c.rms_eps).sqrt();
-            for v in row.iter_mut() {
-                *v *= inv;
+        if !gpu_sc {
+            // Phase-A host weightless canvas-embed norm (CPU/Metal only — the gpu_sc path applies
+            // this IN-GRAPH for both the sc-on and no-sc plans, see `build`).
+            for row in hidden_host.chunks_mut(ne) {
+                let ms: f32 = row.iter().map(|&x| x * x).sum::<f32>() / ne as f32;
+                let inv = 1.0 / (ms + c.rms_eps).sqrt();
+                for v in row.iter_mut() {
+                    *v *= inv;
+                }
             }
         }
         let sc_secs = t_sc0.elapsed().as_secs_f64();
         let dn_positions: Vec<i32> = (p as i32..(p + cc) as i32).collect();
 
-        // Phase-A perf: cache the compiled plan + its staging buffers across denoise() calls,
-        // keyed by (cc, p) — see `DenoiseCache`'s doc. A hit skips `build`+`compile`+3 `alloc`s
-        // entirely; a miss (first call, new block, or a resized canvas) rebuilds once and the
-        // NEXT call on this (cc, p) hits.
+        // Phase-A/B perf: cache the compiled plan + its staging buffers across denoise() calls,
+        // keyed by (cc, p, sc) — see `DenoiseCache`'s doc. A hit skips `build`+`compile`+N `alloc`s
+        // entirely; a miss (first call, a block boundary, a resized canvas, or an SC on/off
+        // transition on the gpu_sc path) rebuilds once and the NEXT call on this key hits.
         let t_build0 = std::time::Instant::now();
         let stale = match denoise_cache {
-            Some(dcache) => dcache.cc != cc || dcache.p != p,
+            Some(dcache) => dcache.cc != cc || dcache.p != p || dcache.sc != plan_sc,
             None => true,
         };
         if stale {
             // 2/3/4. Per-layer forward: the decoder-scalar / Canvas-mask denoise variant of
             // `build`; 5. logits over ALL C rows (logits_rows = cc).
-            let (dg, dh) = build(cc, p, cc, true);
+            let (dg, dh) = build(cc, p, cc, true, if gpu_sc { Some(plan_sc) } else { None });
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
             let hidden_buf = be
                 .alloc(cc * ne * 4, BufferUsage::Staging)
@@ -2921,17 +3168,41 @@ pub(crate) fn generate_dense_backend(
             let logits_buf = be
                 .alloc(cc * c.vocab * 4, BufferUsage::Staging)
                 .map_err(|e| anyhow!("{e}"))?;
+            let sc_logits_buf = if plan_sc {
+                Some(
+                    be.alloc(cc * c.vocab * 4, BufferUsage::Staging)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            };
             *denoise_cache = Some(DenoiseCache {
                 cc,
                 p,
+                sc: plan_sc,
                 plan,
                 dh,
                 hidden_buf,
                 pos_buf,
                 logits_buf,
+                sc_logits_buf,
             });
         }
         let build_secs = t_build0.elapsed().as_secs_f64();
+
+        // Phase-B perf: ensure the one-time SC soft-embedding weight (Vulkan + SC only) — lazy,
+        // built ONCE per session (shared across forked slots — see `SeamKv::sc_embt`) from the
+        // already-dequantized `token_embd`.
+        if plan_sc && sc_embt.is_none() {
+            let t_embt0 = std::time::Instant::now();
+            *sc_embt = Some(build_sc_embt(be, token_embd, ne, c.vocab)?);
+            eprintln!(
+                "[diffusion denoise] built the SC soft-embedding weight ({:.0} MB) in {:.2}s",
+                (ne * c.vocab * 2) as f64 / 1e6,
+                t_embt0.elapsed().as_secs_f64()
+            );
+        }
+
         let dcache = denoise_cache.as_ref().expect("just ensured present above");
 
         be.upload(
@@ -2953,6 +3224,28 @@ pub(crate) fn generate_dense_backend(
         }
         for (i, wid) in dcache.dh.weights.iter().enumerate() {
             db.bind(*wid, wbufs[i].as_ref());
+        }
+        if plan_sc {
+            let sc_logits_host = sc_logits_host
+                .as_ref()
+                .expect("plan_sc implies sc_on implies sc_logits_host is Some");
+            let sc_logits_buf = dcache
+                .sc_logits_buf
+                .as_ref()
+                .expect("plan_sc plan always allocates sc_logits_buf");
+            be.upload(sc_logits_buf.as_ref(), bytemuck::cast_slice(sc_logits_host))
+                .map_err(|e| anyhow!("{e}"))?;
+            db.bind(
+                dcache
+                    .dh
+                    .sc_logits
+                    .expect("plan_sc plan declares sc_logits"),
+                sc_logits_buf.as_ref(),
+            );
+            db.bind(
+                dcache.dh.sc_embt.expect("plan_sc plan declares sc_embt"),
+                sc_embt.as_ref().expect("ensured present above").as_ref(),
+            );
         }
         db.bind(dcache.dh.logits, dcache.logits_buf.as_ref());
         let t_exec0 = std::time::Instant::now();
@@ -3019,7 +3312,7 @@ pub(crate) fn generate_dense_backend(
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(vf_pos_buf.as_ref(), bytemuck::cast_slice(&vf_positions))
             .map_err(|e| anyhow!("{e}"))?;
-        let (vg, vh) = build(m, start, m, false);
+        let (vg, vh) = build(m, start, m, false, None);
         let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
         let mut vb = Bindings::new();
         vb.bind(vh.hidden, vf_hidden_buf.as_ref());
@@ -3145,7 +3438,7 @@ pub(crate) fn generate_dense_backend(
                 None
             };
             let pf_t0 = std::time::Instant::now();
-            let (pf_g, pf_h) = build(pf_m, cstart, 1, false);
+            let (pf_g, pf_h) = build(pf_m, cstart, 1, false, None);
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
             let t_compile = pf_t0.elapsed();
@@ -3230,7 +3523,7 @@ pub(crate) fn generate_dense_backend(
         // Force the static path for qwen35 until that's audited; every other arch is unaffected.
         && !c.qwen35;
     let ro = if dyn_replay {
-        let (g, h) = build(1, 0, 1, false);
+        let (g, h) = build(1, 0, 1, false, None);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         b.bind(h.hidden, hidden_buf.as_ref());
@@ -3291,7 +3584,7 @@ pub(crate) fn generate_dense_backend(
             be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
         } else {
-            let (g, h) = build(1, pos, 1, false);
+            let (g, h) = build(1, pos, 1, false, None);
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();
             b.bind(h.hidden, hidden_buf.as_ref());

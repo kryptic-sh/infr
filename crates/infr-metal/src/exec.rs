@@ -327,6 +327,7 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
 fn op_name(op: &Op) -> &'static str {
     match op {
         Op::RmsNorm { .. } => "RmsNorm",
+        Op::Softmax { .. } => "Softmax",
         Op::Linear { .. } => "Linear",
         Op::QkNorm { .. } => "QkNorm",
         Op::Rope { .. } => "Rope",
@@ -1285,6 +1286,34 @@ impl MetalBackend {
                     &p,
                     rows * tgw,
                     tgw,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            // Row-wise softmax (diffusion-gemma's in-graph self-conditioning — see
+            // docs/DIFFUSIONGEMMA.md's Phase-B). UNVERIFIED on real Metal hardware — added blind,
+            // mirroring `softmax.comp` (see that shader's doc + `softmax_wide_f32`'s doc).
+            Op::Softmax {
+                x,
+                dst,
+                rows,
+                dim,
+                scale,
+            } => {
+                let (rows, dim) = (rows as usize, dim as usize);
+                let bx = self.ensure_device(r, x);
+                let bd = self.dev_dst(r, dst, rows * dim);
+                let pso = self.pipelines.get("softmax_wide_f32")?;
+                let mut p = (rows as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(dim as u32).to_ne_bytes());
+                p.extend_from_slice(&scale.to_ne_bytes());
+                self.encode_tg_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bd.as_ref()],
+                    1 << 1,
+                    &p,
+                    rows * 256,
+                    256,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

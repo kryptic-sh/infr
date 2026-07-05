@@ -39,6 +39,8 @@ struct Q8 {
     /// `-32` offset correction is per 16-element scale group. Precomputed here for the same
     /// reason as `bsums`: `vec_dot_q6k_batch` used to re-derive these sums with SIMD for EVERY
     /// weight row (262k redundant recomputes per lm_head GEMM — ~22% of a DG denoise step).
+    /// Only the x86 SIMD kernel reads it — dead code on aarch64 (macOS CI builds with -D warnings).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     bsums16: Vec<i32>,
 }
 

@@ -218,7 +218,7 @@ impl SpinPool {
                 .is_err()
         {
             use rayon::prelude::*;
-            (0..n_tasks).into_par_iter().for_each(|t| f(t));
+            (0..n_tasks).into_par_iter().for_each(f);
             return;
         }
         let sh = &self.shared;

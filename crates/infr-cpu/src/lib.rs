@@ -3415,9 +3415,19 @@ fn expert_matvec_batch(
         && matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
         && in_f.is_multiple_of(256)
     {
-        let q8s: Vec<Q8> = (0..count)
-            .map(|r| quantize_q8(&xin[r * in_f..r * in_f + in_f]))
-            .collect();
+        // Parallel quantize for big buckets (the straggler expert's serial quantize otherwise
+        // extends the whole MoeFfn join); small buckets stay serial — no rayon overhead, and
+        // the per-row values are identical either way.
+        let q8s: Vec<Q8> = if par_o {
+            (0..count)
+                .into_par_iter()
+                .map(|r| quantize_q8(&xin[r * in_f..r * in_f + in_f]))
+                .collect()
+        } else {
+            (0..count)
+                .map(|r| quantize_q8(&xin[r * in_f..r * in_f + in_f]))
+                .collect()
+        };
         let dot_col = |o: usize, col: &mut [f32]| {
             let row = &wbytes[o * bpr..o * bpr + bpr];
             match dt {
@@ -3469,11 +3479,12 @@ fn expert_matvec_batch(
                         .for_each(|(i, col)| dot_col(tail_start + i, col));
                 },
             );
-            for o in 0..out_f {
-                for r in 0..count {
-                    out[r * out_f + o] = out_t[o * count + r];
+            // Parallel un-transpose (was serial — ~1 ms tacked onto the straggler expert).
+            out.par_chunks_mut(out_f).enumerate().for_each(|(r, orow)| {
+                for (o, dst) in orow.iter_mut().enumerate() {
+                    *dst = out_t[o * count + r];
                 }
-            }
+            });
         } else {
             let mut cols8 = vec![0f32; 8 * count];
             for g in 0..groups {
@@ -3498,9 +3509,16 @@ fn expert_matvec_batch(
     // Fast path 2: Q8_0/Q5_0 at THEIR OWN 32-element native block — covers `down`'s misaligned
     // `in_f` (e.g. 704) without ever materializing a dequantized f32 row.
     if int8_ok && matches!(dt, DType::Q8_0 | DType::Q5_0) && in_f.is_multiple_of(32) {
-        let q8s: Vec<Q8x32> = (0..count)
-            .map(|r| quantize_q8_32(&xin[r * in_f..r * in_f + in_f]))
-            .collect();
+        let q8s: Vec<Q8x32> = if par_o {
+            (0..count)
+                .into_par_iter()
+                .map(|r| quantize_q8_32(&xin[r * in_f..r * in_f + in_f]))
+                .collect()
+        } else {
+            (0..count)
+                .map(|r| quantize_q8_32(&xin[r * in_f..r * in_f + in_f]))
+                .collect()
+        };
         let q5 = dt == DType::Q5_0;
         let dot_col = |o: usize, col: &mut [f32]| {
             let row = &wbytes[o * bpr..o * bpr + bpr];
@@ -3538,11 +3556,12 @@ fn expert_matvec_batch(
                         .for_each(|(i, col)| dot_col(tail_start + i, col));
                 },
             );
-            for o in 0..out_f {
-                for r in 0..count {
-                    out[r * out_f + o] = out_t[o * count + r];
+            // Parallel un-transpose (see fast path 1's matching comment).
+            out.par_chunks_mut(out_f).enumerate().for_each(|(r, orow)| {
+                for (o, dst) in orow.iter_mut().enumerate() {
+                    *dst = out_t[o * count + r];
                 }
-            }
+            });
         } else {
             let mut cols8 = vec![0f32; 8 * count];
             for g in 0..groups {
@@ -3870,9 +3889,13 @@ impl Backend for CpuBackend {
                         // Layout: out[r * out_f + o].  We accumulate into a transposed buffer
                         // out_t[o * m + r] (contiguous in o-major order) so each parallel chunk
                         // owns a contiguous slice of m floats, then scatter into out at the end.
+                        // Parallel: at m=256 canvas rows this collect was ~0.7 ms of SERIAL work
+                        // per Linear (31 threads idle) — rows are independent, order preserved by
+                        // the indexed collect, bit-identical.
                         let q8s: Vec<Q8> =
                             if matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K) {
                                 (0..m)
+                                    .into_par_iter()
                                     .map(|r| quantize_q8(&xs[r * in_f..r * in_f + in_f]))
                                     .collect()
                             } else {
@@ -3962,46 +3985,58 @@ impl Backend for CpuBackend {
                             // puts it on the same int8-quantized-activation regime every other
                             // quantized dtype in this dispatch already uses.
                             let q8s32: Vec<Q8x32> = (0..m)
+                                .into_par_iter()
                                 .map(|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]))
                                 .collect();
-                            out_t.par_chunks_mut(m).enumerate().for_each(|(o, chunk)| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
-                            });
+                            out_t
+                                .par_chunks_mut(m)
+                                .with_min_len(8)
+                                .enumerate()
+                                .for_each(|(o, chunk)| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
+                                });
                         } else {
-                            out_t.par_chunks_mut(m).enumerate().for_each(|(o, chunk)| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                match dt {
-                                    DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, chunk),
-                                    DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
-                                    DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
-                                    DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
-                                    DType::F32 => {
-                                        let w32: &[f32] = bytemuck::cast_slice(row);
-                                        for r in 0..m {
-                                            chunk[r] = dot(w32, &xs[r * in_f..r * in_f + in_f]);
+                            // `with_min_len(8)`: at lm_head shape this loop is 262k one-row items;
+                            // rayon's adaptive splitting overhead on that many tiny tasks is real.
+                            out_t
+                                .par_chunks_mut(m)
+                                .with_min_len(8)
+                                .enumerate()
+                                .for_each(|(o, chunk)| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    match dt {
+                                        DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, chunk),
+                                        DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
+                                        DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
+                                        DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
+                                        DType::F32 => {
+                                            let w32: &[f32] = bytemuck::cast_slice(row);
+                                            for r in 0..m {
+                                                chunk[r] = dot(w32, &xs[r * in_f..r * in_f + in_f]);
+                                            }
+                                        }
+                                        DType::F16 => {
+                                            for r in 0..m {
+                                                chunk[r] =
+                                                    dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
+                                            }
+                                        }
+                                        DType::Bf16 => {
+                                            for r in 0..m {
+                                                chunk[r] =
+                                                    dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
+                                            }
+                                        }
+                                        _ => {
+                                            // Dequant the weight row ONCE, reuse across all m tokens.
+                                            let wf = bytes_to_f32(row, dt);
+                                            for r in 0..m {
+                                                chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                                            }
                                         }
                                     }
-                                    DType::F16 => {
-                                        for r in 0..m {
-                                            chunk[r] = dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
-                                        }
-                                    }
-                                    DType::Bf16 => {
-                                        for r in 0..m {
-                                            chunk[r] =
-                                                dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
-                                        }
-                                    }
-                                    _ => {
-                                        // Dequant the weight row ONCE, reuse across all m tokens.
-                                        let wf = bytes_to_f32(row, dt);
-                                        for r in 0..m {
-                                            chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
-                                        }
-                                    }
-                                }
-                            });
+                                });
                         }
                         // Transpose out_t[o * m + r] → out[r * out_f + o], parallel over the m output
                         // rows (each gathers its out_f values from the o-major temp). The serial
@@ -4375,12 +4410,18 @@ impl Backend for CpuBackend {
                 }
                 Op::Add { a, b, dst, n } => {
                     let n = n as usize;
-                    let av = vals[a.0 as usize].clone();
+                    // Elementwise with no cross-element dependency — chunked rayon, bit-identical.
+                    // (The old form CLONED the whole `a` vector, then added serially: a ~0.7 MB
+                    // memcpy + a one-thread loop per Add while 31 threads slept.)
+                    let av = &vals[a.0 as usize];
                     let bv = &vals[b.0 as usize];
                     let mut out = vec![0f32; n];
-                    for i in 0..n {
-                        out[i] = av[i] + bv[i];
-                    }
+                    out.par_chunks_mut(4096).enumerate().for_each(|(c, oc)| {
+                        let base = c * 4096;
+                        for (i, o) in oc.iter_mut().enumerate() {
+                            *o = av[base + i] + bv[base + i];
+                        }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 // Broadcast bias: add the length-`n` `bias` to each of `rows` rows (Qwen2 q/k/v).
@@ -4392,23 +4433,28 @@ impl Backend for CpuBackend {
                     n,
                 } => {
                     let (rows, n) = (rows as usize, n as usize);
-                    let xs = vals[x.0 as usize].clone();
+                    let xs = &vals[x.0 as usize];
                     let bv = weight(bias); // bias is a bound weight, not an activation
+                                           // Rows independent — rayon over rows, bit-identical (and no whole-input clone).
                     let mut out = vec![0f32; rows * n];
-                    for r in 0..rows {
-                        for c in 0..n {
-                            out[r * n + c] = xs[r * n + c] + bv[c];
+                    out.par_chunks_mut(n).enumerate().for_each(|(r, orow)| {
+                        for (c, o) in orow.iter_mut().enumerate() {
+                            *o = xs[r * n + c] + bv[c];
                         }
-                    }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 Op::Scale { x, dst, s, n } => {
                     let n = n as usize;
-                    let xs = vals[x.0 as usize].clone();
+                    let xs = &vals[x.0 as usize];
+                    // Elementwise — chunked rayon, bit-identical (and no whole-input clone).
                     let mut out = vec![0f32; n];
-                    for i in 0..n {
-                        out[i] = xs[i] * s;
-                    }
+                    out.par_chunks_mut(4096).enumerate().for_each(|(c, oc)| {
+                        let base = c * 4096;
+                        for (i, o) in oc.iter_mut().enumerate() {
+                            *o = xs[base + i] * s;
+                        }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 // Broadcast multiply: the length-`n` `vec` scales every one of `rows` rows
@@ -4421,14 +4467,15 @@ impl Backend for CpuBackend {
                     n,
                 } => {
                     let (rows, n) = (rows as usize, n as usize);
-                    let xs = vals[x.0 as usize].clone();
+                    let xs = &vals[x.0 as usize];
                     let vv = weight(vecid); // vec is a bound weight, not an activation
+                                            // Rows independent — rayon over rows, bit-identical (and no whole-input clone).
                     let mut out = vec![0f32; rows * n];
-                    for r in 0..rows {
-                        for c in 0..n {
-                            out[r * n + c] = xs[r * n + c] * vv[c];
+                    out.par_chunks_mut(n).enumerate().for_each(|(r, orow)| {
+                        for (c, o) in orow.iter_mut().enumerate() {
+                            *o = xs[r * n + c] * vv[c];
                         }
-                    }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 Op::Softcap { x, dst, cap, n } => {
@@ -4438,10 +4485,14 @@ impl Backend for CpuBackend {
                     // rayon with ZERO numeric change. At the lm_head's shape (256 rows × 262144
                     // vocab = ~67M `tanh` calls) this was the single most expensive scalar loop in
                     // the interpreter outside `Op::Linear`/`Op::MoeFfn`.
+                    // Chunked (not per-element zip — 67M one-element items is pure rayon plumbing).
                     let mut out = vec![0f32; n];
-                    out.par_iter_mut()
-                        .zip(xs.par_iter())
-                        .for_each(|(o, &x)| *o = cap * (x / cap).tanh());
+                    out.par_chunks_mut(4096).enumerate().for_each(|(c, oc)| {
+                        let base = c * 4096;
+                        for (i, o) in oc.iter_mut().enumerate() {
+                            *o = cap * (xs[base + i] / cap).tanh();
+                        }
+                    });
                     vals[dst.0 as usize] = out;
                 }
                 Op::Copy {

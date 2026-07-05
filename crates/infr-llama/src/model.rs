@@ -661,11 +661,15 @@ impl ChatModel for CpuDenseChat {
 /// [`crate::diffusion::DiffusionSession`] — lets [`DiffusionGemmaChat`] hold ONE persistent
 /// session across turns regardless of backend.
 enum DiffusionSess {
-    Cpu(crate::cpu_model::DiffusionGemmaCpuSession),
-    Vulkan(crate::cpu_model::DiffusionGemmaVulkanSession),
+    // Boxed so the enum's size is a pointer regardless of which session it holds — the three
+    // session structs differ enough in size to trip clippy's `large_enum_variant` (the
+    // `#[cfg(macos)]` Metal variant makes the spread, so the check only fires on a macOS build —
+    // the Linux clippy CI job never compiles it).
+    Cpu(Box<crate::cpu_model::DiffusionGemmaCpuSession>),
+    Vulkan(Box<crate::cpu_model::DiffusionGemmaVulkanSession>),
     /// Phase D: the Metal twin, macOS only (see `DiffusionGemmaChat::new_metal`).
     #[cfg(target_os = "macos")]
-    Metal(crate::cpu_model::DiffusionGemmaMetalSession),
+    Metal(Box<crate::cpu_model::DiffusionGemmaMetalSession>),
 }
 
 impl crate::diffusion::DiffusionSession for DiffusionSess {
@@ -767,14 +771,18 @@ impl DiffusionGemmaChat {
             .max(needed);
         self.max_ctx = max_ctx;
         self.sess = Some(match self.backend {
-            DgBackend::Cpu => DiffusionSess::Cpu(self.model.diffusion_gemma_cpu_session(max_ctx)),
-            DgBackend::Vulkan => {
-                DiffusionSess::Vulkan(self.model.diffusion_gemma_vulkan_session(max_ctx)?)
+            DgBackend::Cpu => {
+                DiffusionSess::Cpu(Box::new(self.model.diffusion_gemma_cpu_session(max_ctx)))
             }
+            DgBackend::Vulkan => DiffusionSess::Vulkan(Box::new(
+                self.model.diffusion_gemma_vulkan_session(max_ctx)?,
+            )),
             DgBackend::Metal => {
                 #[cfg(target_os = "macos")]
                 {
-                    DiffusionSess::Metal(self.model.diffusion_gemma_metal_session(max_ctx)?)
+                    DiffusionSess::Metal(Box::new(
+                        self.model.diffusion_gemma_metal_session(max_ctx)?,
+                    ))
                 }
                 #[cfg(not(target_os = "macos"))]
                 {

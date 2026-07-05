@@ -1,0 +1,295 @@
+//! Per-layer weight handles + the persistent seam session state ([`SeamKv`]/[`SeamWeights`]).
+//! Pure-move split of `cpu_backend.rs` — see `super` for the module overview.
+use super::sc::{DenoiseCache, SelfCondWeights};
+use super::{common_prefix_len, kv_fmt_bytes};
+use crate::Config;
+use anyhow::{anyhow, Result as AResult};
+use infr_core::backend::{Backend, Buffer, BufferUsage};
+use infr_core::tensor::{DType, TensorId};
+
+/// FFN weight handles: a dense gated FFN, a qwen3moe routed-expert bank (router + stacked
+/// per-expert gate/up/down), or diffusion-gemma's dual FFN (dense ∥ MoE, summed).
+pub(super) enum FfnW {
+    Dense {
+        wgate: TensorId,
+        wup: TensorId,
+        wdown: TensorId,
+    },
+    /// Combined gate+up weight `[2*nff, ne]` (one GEMV/GEMM + `GatedActFused`); see `fuse_gu`.
+    DenseFused { wgu: TensorId, wdown: TensorId },
+    Moe {
+        router: TensorId,
+        gate_exps: TensorId,
+        up_exps: TensorId,
+        down_exps: TensorId,
+    },
+    /// diffusion-gemma's per-layer dual FFN: a dense GeGLU branch (the "shared expert") ∥ a
+    /// 128-expert MoE branch (fused `gate_up_exps` + per-expert `down_exps` scale), summed and
+    /// sandwich-normed. See the FFN wiring in `docs/DIFFUSIONGEMMA.md`. `LayerW::ffn_norm` is the
+    /// dense branch's INPUT norm and `LayerW::post_ffw` the shared FINAL norm (both reused as-is —
+    /// every gemma model already carries them); the fields below are the pieces unique to the
+    /// dual-FFN block.
+    DiffusionMoe {
+        d_gate: TensorId,
+        d_up: TensorId,
+        d_down: TensorId,
+        /// `post_ffw_norm_1`: dense branch output norm (before summing with the MoE branch).
+        d_post_norm: TensorId,
+        /// `pre_ffw_norm_2`: MoE branch's own input norm, applied to `attn_out` (the UNNORMED
+        /// post-attention residual — a separate parallel read from the dense branch's `ffn_norm`).
+        m_pre_norm: TensorId,
+        /// `ffn_gate_inp.weight`: router logits projection.
+        router: TensorId,
+        /// `ffn_gate_inp.scale` `[ne]`: elementwise scale on the router's OWN input (the weightless
+        /// rmsnorm of `attn_out`, further scaled by `1/√ne` — see the graph-build wiring).
+        router_scale: TensorId,
+        /// `ffn_gate_up_exps.weight`, fused `[ne, 2*n_ff_exp, n_expert]`.
+        gate_up_exps: TensorId,
+        down_exps: TensorId,
+        /// `ffn_down_exps.scale` `[n_expert]`: per-expert scale on the down-projection output.
+        down_scale: TensorId,
+        /// `post_ffw_norm_2`: MoE branch output norm (before summing with the dense branch).
+        m_post_norm: TensorId,
+    },
+}
+
+/// Attention-mixer weights (the classic transformer token mixer: QKV projections + output;
+/// q/k-norm optional, `wv` absent on gemma4 full-attention layers which reuse the raw K
+/// projection as V). A future phase adds a DeltaNet variant (qwen35's linear-attention mixer),
+/// so everything attention-specific lives here and everything layer-generic (norms, FFN,
+/// per-layer embeddings) stays on [`LayerW`].
+pub(super) struct AttnW {
+    pub(super) wq: TensorId,
+    pub(super) wk: TensorId,
+    pub(super) wv: Option<TensorId>,
+    // Qwen2/2.5 q/k/v projection biases (`Config::qkv_bias`); `None` on every bias-free arch.
+    pub(super) qb: Option<TensorId>,
+    pub(super) kb: Option<TensorId>,
+    pub(super) vb: Option<TensorId>,
+    pub(super) q_norm: Option<TensorId>,
+    pub(super) k_norm: Option<TensorId>,
+    pub(super) wo: TensorId,
+}
+
+/// qwen35 gated-DeltaNet linear-attention mixer weights (see `docs/QWEN35.md`). Unlike `AttnW` this
+/// mixer owns no KV cache — its recurrent state (a rolling conv history + the DeltaNet `S` matrix)
+/// is session state, held in the SAME `kbufs`/`vbufs` slots a KV-caching layer would use (see
+/// `SeamKv` and the state-buffer alloc in `generate_dense_backend`).
+pub(super) struct DeltaW {
+    pub(super) qkv: TensorId,
+    pub(super) gate: TensorId,
+    pub(super) conv1d: TensorId,
+    pub(super) alpha: TensorId,
+    pub(super) beta: TensorId,
+    pub(super) ssm_a: TensorId,
+    pub(super) dt_bias: TensorId,
+    pub(super) ssm_norm: TensorId,
+    pub(super) out: TensorId,
+}
+
+/// The layer's token mixer: classic attention, or (qwen35) gated-DeltaNet linear attention.
+pub(super) enum MixerW {
+    Attn(AttnW),
+    DeltaNet(DeltaW),
+}
+
+/// Per-layer weight handles captured while building one decode graph (sandwich norms optional).
+/// The order they're declared in MUST match the upload order so `weights[i]` binds to `wbufs[i]`.
+pub(super) struct LayerW {
+    pub(super) attn_norm: TensorId, // the mixer INPUT norm (applies to any mixer type)
+    pub(super) mixer: MixerW,
+    pub(super) post_attn: Option<TensorId>,
+    pub(super) ffn_norm: TensorId,
+    pub(super) ffn: FfnW,
+    pub(super) post_ffw: Option<TensorId>,
+    // gemma4 E2B per-layer input embedding: inp_gate, proj, post_norm.
+    pub(super) pl_inp_gate: Option<TensorId>,
+    pub(super) pl_proj: Option<TensorId>,
+    pub(super) pl_post_norm: Option<TensorId>,
+}
+
+pub(crate) struct SeamKv {
+    /// The uploaded weights, SHARED across slots (Arc): forking a new conversation slot costs
+    /// only its KV + IO buffers, never a re-upload.
+    pub(super) weights: std::sync::Arc<SeamWeights>,
+    pub(super) kbufs: Vec<Box<dyn Buffer>>,
+    pub(super) vbufs: Vec<Box<dyn Buffer>>,
+    /// KV cache element dtypes, chosen per-side (K and V independent). Fork/seed reuse them so a
+    /// forked slot sizes + copies its buffers to match this slot's layout.
+    pub(super) k_fmt: DType,
+    pub(super) v_fmt: DType,
+    pub(super) hidden_buf: Box<dyn Buffer>,
+    pub(super) pos_buf: Box<dyn Buffer>,
+    pub(super) ipl_buf: Option<Box<dyn Buffer>>,
+    pub(super) logits_buf: Box<dyn Buffer>,
+    pub(super) max_ctx: usize,
+    /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
+    pub(super) cached: Vec<u32>,
+    /// Phase-A perf: DiffusionGemma canvas-denoise plan + staging buffers, `None` for every
+    /// non-diffusion-gemma caller (never populated). Reset to `None` whenever the (cc, p) key
+    /// changes (see `DenoiseCache`).
+    pub(super) denoise_cache: Option<DenoiseCache>,
+    /// Phase-A perf: DiffusionGemma self-conditioning MLP weights, dequantized lazily on the first
+    /// denoise call with self-conditioning ON. `Arc` so `fork()` shares it with forked conversation
+    /// slots for free (a pure function of the model, not per-conversation state).
+    pub(super) self_cond_w: Option<std::sync::Arc<SelfCondWeights>>,
+    /// Phase-B/D perf: the in-graph SC soft-embedding weight (`token_embd` dequantized + transposed
+    /// to f16 `[n_embd, n_vocab]`, ~1.4 GB — see the reference's `dg_ensure_sc_embT` and
+    /// `build_sc_embt`), built lazily on the FIRST Vulkan/Metal denoise call with SC on. `None` for
+    /// CPU (it never sets it) and for every non-diffusion-gemma caller. `Arc` so `fork()`
+    /// shares it with forked conversation slots for free — mirrors `self_cond_w`.
+    pub(super) sc_embt: Option<std::sync::Arc<dyn Buffer>>,
+}
+
+/// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
+/// the rope_freqs constant. Shared across conversation slots via `Arc`.
+pub(crate) struct SeamWeights {
+    pub(super) wbufs: Vec<Box<dyn Buffer>>,
+    pub(super) wspecs: Vec<(DType, usize)>,
+    pub(super) rf_buf: Option<(Box<dyn Buffer>, usize)>,
+}
+
+impl SeamKv {
+    /// Longest common prefix of this slot's materialized tokens and `prompt` — the slot-selection
+    /// score for multi-conversation serve.
+    pub(crate) fn prefix_score(&self, prompt: &[u32]) -> usize {
+        common_prefix_len(&self.cached, prompt)
+    }
+
+    /// Forget the materialized tokens WITHOUT dropping weights or buffers: the next call
+    /// re-prefills from position 0 into the same session. Bench reps use this so each rep
+    /// measures a full prefill while weights/pipelines/repack caches stay warm.
+    /// (cfg-gated with its only caller, the Metal bench session — dead code on other targets.)
+    #[cfg(target_os = "macos")]
+    pub(crate) fn reset_tokens(&mut self) {
+        self.cached.clear();
+    }
+
+    /// Number of token ids materialized in this slot's KV cache.
+    pub(crate) fn cached_len(&self) -> usize {
+        self.cached.len()
+    }
+
+    /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from
+    /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
+    pub(crate) fn reset(&mut self) {
+        self.cached.clear();
+    }
+
+    /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
+    pub(crate) fn fork(&self, be: &dyn Backend, cfg: &Config) -> AResult<SeamKv> {
+        let e2b = self.ipl_buf.is_some();
+        let npl = cfg.n_embd_per_layer.max(1);
+        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        for l in 0..cfg.n_layer {
+            // qwen35 DeltaNet layers: fixed-size conv/S state, NOT a `max_ctx`-scaled KV cache (see
+            // the matching alloc in `generate_dense_backend`'s state init and `MixerW::DeltaNet`).
+            if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
+                let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
+                let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+                kbufs.push(
+                    be.alloc(conv_elems * 4, BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                vbufs.push(
+                    be.alloc(s_elems * 4, BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                continue;
+            }
+            let kvrow_l = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
+            kbufs.push(
+                be.alloc(
+                    kv_fmt_bytes(self.k_fmt, self.max_ctx * kvrow_l),
+                    BufferUsage::Activations,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
+            );
+            vbufs.push(
+                be.alloc(
+                    kv_fmt_bytes(self.v_fmt, self.max_ctx * kvrow_l),
+                    BufferUsage::Activations,
+                )
+                .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        Ok(SeamKv {
+            weights: std::sync::Arc::clone(&self.weights),
+            kbufs,
+            vbufs,
+            k_fmt: self.k_fmt,
+            v_fmt: self.v_fmt,
+            hidden_buf: be
+                .alloc(cfg.n_embd * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+            pos_buf: be
+                .alloc(4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?,
+            ipl_buf: if e2b {
+                Some(
+                    be.alloc(cfg.n_layer * npl * 4, BufferUsage::Staging)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            } else {
+                None
+            },
+            logits_buf: be
+                .alloc(cfg.vocab * 4, BufferUsage::Readback)
+                .map_err(|e| anyhow!("{e}"))?,
+            max_ctx: self.max_ctx,
+            cached: Vec::new(),
+            // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
+            // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
+            // slot's first denoise call. `self_cond_w`/`sc_embt` are model-derived (not
+            // buffer-derived, and `sc_embt` lives on the SAME shared backend/device as `self`), so
+            // they DO carry over (cheap Arc clone, skips a redundant dequant/rebuild).
+            denoise_cache: None,
+            self_cond_w: self.self_cond_w.clone(),
+            sc_embt: self.sc_embt.clone(),
+        })
+    }
+
+    /// Seed this slot's KV cache with the first `p` rows of `src`'s (the shared conversation
+    /// prefix — e.g. the system prompt) via a device-side buffer copy, so the new conversation
+    /// skips re-prefilling it. `p` must be ≤ src's materialized length.
+    ///
+    /// qwen35: a no-op. The gated-DeltaNet recurrent state is a single fixed-size summary of
+    /// EVERY token fed so far — there's no "first `p` tokens' worth" of it to slice out and copy
+    /// the way a real per-position KV cache allows (see `docs/QWEN35.md` and the no-rewind rule in
+    /// `generate_dense_backend`). Leaving `self.cached` empty (this slot's `fork()` already zeroed
+    /// its state) is the CORRECT fallback: the next call on this slot fully re-prefills, exactly
+    /// like the single-slot session's divergent-prompt reset.
+    pub(crate) fn seed_from(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        src: &SeamKv,
+        p: usize,
+    ) -> AResult<()> {
+        if cfg.qwen35 {
+            return Ok(());
+        }
+        let p = p.min(src.cached.len()).min(self.max_ctx);
+        if p == 0 {
+            return Ok(());
+        }
+        for l in 0..cfg.n_layer {
+            let elems = p * cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
+            be.copy_buffer(
+                src.kbufs[l].as_ref(),
+                self.kbufs[l].as_ref(),
+                kv_fmt_bytes(self.k_fmt, elems),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            be.copy_buffer(
+                src.vbufs[l].as_ref(),
+                self.vbufs[l].as_ref(),
+                kv_fmt_bytes(self.v_fmt, elems),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        }
+        self.cached = src.cached[..p].to_vec();
+        Ok(())
+    }
+}

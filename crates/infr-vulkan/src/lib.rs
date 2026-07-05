@@ -411,16 +411,25 @@ impl VulkanBackend {
         let mut f16_feat = vk::PhysicalDeviceShaderFloat16Int8Features::default();
         let mut memmodel_feat = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
         let mut sgsize_feat = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
+        let mut coopmat_feat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut feat2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f16_feat)
             .push_next(&mut memmodel_feat)
-            .push_next(&mut sgsize_feat);
+            .push_next(&mut sgsize_feat)
+            .push_next(&mut coopmat_feat);
         unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
         let has_f16 = f16_feat.shader_float16 != 0;
         let has_memmodel = memmodel_feat.vulkan_memory_model != 0;
         let has_memmodel_dev = memmodel_feat.vulkan_memory_model_device_scope != 0;
         let has_sgsize = sgsize_feat.subgroup_size_control != 0;
         let has_full_sg = sgsize_feat.compute_full_subgroups != 0;
+        // Extension presence alone doesn't guarantee the FEATURE bit (a driver may advertise
+        // VK_KHR_cooperative_matrix with cooperativeMatrix=false — enabling it then fails
+        // create_device, the same failure class #32 fixed for memmodel/sgsize). Everything
+        // downstream (the ext push, the feature chain, caps.cooperative_matrix → the coopmat GEMM
+        // tier) keys off ext AND feature. Drivers zero-fill unrecognized feature structs, so the
+        // probe is safe when the extension is absent.
+        let has_coop_matrix = has_coop_matrix && coopmat_feat.cooperative_matrix != 0;
 
         // ── build extension name list (only available ones) ────────────────────
         let mut ext_ptrs: Vec<*const i8> = Vec::new();
@@ -464,6 +473,7 @@ impl VulkanBackend {
         let mut memmodel_ci = vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
             .vulkan_memory_model(has_memmodel)
             .vulkan_memory_model_device_scope(has_memmodel_dev);
+        // Chained below only when `has_coop_matrix` (ext AND probed feature) — see the probe.
         let mut coopmat_ci =
             vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         // Lets us pin the subgroup size to 32 (RDNA3 coopmat is wave32) for the tiled GEMM.

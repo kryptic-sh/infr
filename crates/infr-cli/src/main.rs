@@ -1258,6 +1258,12 @@ fn dg_bench_run(
     n_gen: usize,
     depth: usize,
     reps: usize,
+    // `Some(text)`: encode THIS prompt instead of the synthetic repeated sentence and ignore
+    // `n_prompt` (requires depth == 0). The compare arm passes its shared natural prompt so
+    // BOTH sides' entropy-bound loops converge on the same content — with the synthetic prompt
+    // infr always rode the 48-step cap while the oracle converged in ~23 (steps are
+    // content-sensitive, so e2e was double-penalized by prompt choice alone).
+    prompt_text: Option<&str>,
     cpu: bool,
     // Phase D: the Metal DG session (macOS only — see the `one_rep!` dispatch below). `cpu` wins
     // if both are set (matches `cmd_run`/`cmd_serve`'s precedence).
@@ -1281,7 +1287,14 @@ fn dg_bench_run(
         .and_then(|v| v.parse().ok())
         .unwrap_or(42);
 
-    let p_eff = n_prompt.max(1); // DG always needs >=1 prompt token (the causal prefix the canvas attends to)
+    if prompt_text.is_some() && depth > 0 {
+        anyhow::bail!("dg_bench_run: prompt_text override is depth-0 only (compare's DG arm)");
+    }
+    let p_eff = match prompt_text {
+        // Real-prompt mode: the whole encoded prompt is the causal prefix.
+        Some(text) => model.encode(text)?.len().max(1),
+        None => n_prompt.max(1), // DG always needs >=1 prompt token (the canvas's causal prefix)
+    };
     let blocks_wanted = if n_gen > 0 {
         n_gen.div_ceil(canvas_len).max(1)
     } else {
@@ -1297,8 +1310,14 @@ fn dg_bench_run(
     // sentence instead (same "fixed synthetic prompt" convention `bench_mtp_tg` uses) and slice
     // it: `dummy(depth)` is then an exact prefix of `dummy(depth + p_eff)` by construction, so the
     // untimed depth warm + timed suffix prefill still gets the session's prefix-diff reuse.
-    let long_text = "The quick brown fox jumps over the lazy dog. ".repeat((depth + p_eff) / 4 + 8);
-    let full_ids = model.encode(&long_text)?;
+    let full_ids = match prompt_text {
+        Some(text) => model.encode(text)?,
+        None => {
+            let long_text =
+                "The quick brown fox jumps over the lazy dog. ".repeat((depth + p_eff) / 4 + 8);
+            model.encode(&long_text)?
+        }
+    };
     if full_ids.len() < depth + p_eff {
         anyhow::bail!(
             "internal: synthetic bench prompt too short ({} ids for depth {depth} + p {p_eff})",
@@ -1416,7 +1435,7 @@ fn cmd_bench_diffusion_gemma(
              AR turn); use separate -p/-n instead — `infr bench <model> -p P -n N`"
         );
     }
-    let r = dg_bench_run(gguf, tok, n_prompt, n_gen, depth, reps, cpu, metal)?;
+    let r = dg_bench_run(gguf, tok, n_prompt, n_gen, depth, reps, None, cpu, metal)?;
     let tag = if cpu {
         " [cpu]"
     } else if metal {
@@ -1826,10 +1845,13 @@ impl ModelBench {
         dg_bench_run(
             &self.gguf_path,
             self.tok_path.as_deref(),
-            1,
+            1, // ignored — the shared natural prompt below defines the prefix
             n_gen,
             0,
             self.reps,
+            // The SAME prompt the fork oracle decodes from (`Self::DG_PROMPT`) — entropy-bound
+            // step counts are content-sensitive, so e2e is only comparable on shared content.
+            Some(Self::DG_PROMPT),
             self.ngl == 0,
             false,
         )

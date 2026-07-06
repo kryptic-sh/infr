@@ -1474,6 +1474,20 @@ impl MetalBackend {
                         "linear_q6k" => Some("linear_q6k_mrv"),
                         _ => None,
                     };
+                    // mrv's edge (weight bytes hoisted to registers, reused across the 2..8 rows)
+                    // was tuned on the per-layer projections (out_f <= 9216). The tied lm_head is
+                    // out_f = 248320 — 27x wider — where mrv spawns out_f/2 * m (~870k) simdgroups
+                    // and loses to the cmm GEMM tile, which streams the weight once at GEMM rate.
+                    // Measured on qwen3.5-4B-MTP verify (m=7): routing the lm_head to cmm is +8% on
+                    // the MTP cycle (1.30x -> 1.39x), token-identical to greedy. Gate at 65536 —
+                    // comfortably above every per-layer out_f, below any real lm_head/vocab width.
+                    // INFR_METAL_LMHEAD_MRV forces the old mrv path (A/B + escape hatch).
+                    let mr_kern =
+                        if out_f >= 65536 && std::env::var("INFR_METAL_LMHEAD_MRV").is_err() {
+                            None
+                        } else {
+                            mr_kern
+                        };
                     if let (true, Some(kn), 0) = ((2..=8).contains(&m), mr_kern, w_off) {
                         let pso = self.pipelines.get(kn)?;
                         let sgs = out_f.div_ceil(2) * m;

@@ -190,6 +190,38 @@ pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [
         _ => return None,
     })
 }
+/// SPIR-V for the int8 dp4a decode GEMV (m=1, NUM_ROWS=2, `native_mmv.comp`). `None` = format
+/// has no int-dot build (falls back to the dequant `native_gemv`).
+pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match (dtype, res) {
+        (Q4K, false) => v!("native_mmv_q4k"),
+        (Q4K, true) => v!("native_mmv_q4k_res"),
+        (Q6K, false) => v!("native_mmv_q6k"),
+        (Q6K, true) => v!("native_mmv_q6k_res"),
+        _ => return None,
+    })
+}
+/// Kernel-cache name for the int8 dp4a decode GEMV.
+pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> &'static str {
+    use infr_core::DType::*;
+    match (dtype, res) {
+        (Q4K, false) => "native_mmv_q4k",
+        (Q4K, true) => "native_mmv_q4k_res",
+        (Q6K, false) => "native_mmv_q6k",
+        (Q6K, true) => "native_mmv_q6k_res",
+        _ => unreachable!("native_mmv_kernel_name: gated by native_mmv_build_spv"),
+    }
+}
 /// SPIR-V for the multi-slot id-indexed Q4_K dp4a (mmq) GEMV.
 pub(crate) fn native_mmv_id_q4k_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_mmv_id_q4k.spv"));

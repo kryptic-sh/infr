@@ -1119,6 +1119,87 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Int8 dp4a decode GEMV (m=1): `y = x·Wᵀ` with `x` pre-quantized via [`Self::quant_q8`]
+    /// (qa/dact/sact). NUM_ROWS=2 — one workgroup per 2 consecutive outputs (`ceil(out_f/2)`
+    /// grid), the activation block read once for both. `w_base` = element offset (fused-QKV
+    /// slices). Caller gates on [`crate::gemm::native_mmv_build_spv`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("lm_head");
+        let name = crate::gemm::native_mmv_kernel_name(dtype, false);
+        let spv = crate::gemm::native_mmv_build_spv(dtype, false).expect("native mmv spv");
+        let k = self.be.kernel(name, spv, 5, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(w),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (out_f as u32).div_ceil(2),
+        );
+    }
+
+    /// Int8 dp4a decode GEMV with fused residual add: `y = residual + x·Wᵀ` (see
+    /// [`Self::linear_mmv`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_add_mmv(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        residual: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.stamp("o_or_down");
+        let name = crate::gemm::native_mmv_kernel_name(dtype, true);
+        let spv = crate::gemm::native_mmv_build_spv(dtype, true).expect("native mmv res spv");
+        let k = self.be.kernel(name, spv, 6, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        // push[12..16] = w_base, 0 (the residual GEMV never reads stacked experts).
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(w),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(residual),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (out_f as u32).div_ceil(2),
+        );
+    }
+
     /// Quantized dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_q(

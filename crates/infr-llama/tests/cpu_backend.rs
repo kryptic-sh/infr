@@ -325,7 +325,12 @@ const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Explain how a computer works in simple terms.",
         48,
-        0xcf56ba8c4bb5c455,
+        // Re-blessed for the int8 dp4a decode GEMV (mmv): the Q6_K lm_head (this model's only
+        // >=48M-element weight) now integer-dots quantized activations, shifting logits within
+        // quant noise. Verified coherent: "…breaking down the basic components. First, there's
+        // the hardware, like the CPU, RAM, and storage. Then the software," (the France case is
+        // untouched and still shares the CPU-path hash).
+        0x4a034e88df0dbb84,
     ),
 ];
 

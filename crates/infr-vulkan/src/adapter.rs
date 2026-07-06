@@ -273,6 +273,14 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<Vec<Option<Box<dy
 /// flash-attention partials (≈38 GB) and took the device down.
 type ScratchPool = HashMap<(&'static str, usize), Box<dyn Buffer>>;
 
+/// mmv (int8 dp4a decode GEMV) size gate: below this weight-element count the dequant GEMV is
+/// already so short (<~10us) that the extra quant_q8 dispatch's fixed bubble (~2-3us on a
+/// 7900 XTX) eats the kernel saving. Probe data (gemv_vs_mmv, 7900 XTX): 4096x24576 gate+up
+/// −38%, 12288x4096 Q6_K down −5.5% (= 48M elements, the smallest clear payer), 4096x4096 o
+/// −5% kernel-only but a whole-model LOSS on dispatch-bound decodes (gemma3-1b −2.3%,
+/// qwen3moe −6% with no gate).
+const MMV_MIN_ELEMS: usize = 48 << 20;
+
 /// Get-or-alloc the pool buffer for (tag, bytes); returns the map key so callers can hold several
 /// pool buffers at once via immutable indexing (`pool[&k].as_ref()`).
 fn pooled(
@@ -507,7 +515,40 @@ fn lower_op(
                 }
                 let (rr, yf) = (r(*residual)?, r(*final_dst)?);
                 if native_dense_supported(dt) {
-                    rec.linear_add_native(dt, w, xb, rr, yf, m, in_f, out_f);
+                    // Int8 dp4a decode GEMV (mmv): quantize x to Q8 once, integer-dot the raw
+                    // K-quant blocks (llama.cpp's mmvq) instead of dequanting every weight to
+                    // f32. Scratch is pooled; INFR_NO_MMV forces the dequant GEMV (A/B).
+                    if in_f % 32 == 0
+                        && in_f * out_f >= MMV_MIN_ELEMS
+                        && crate::gemm::native_mmv_build_spv(dt, true).is_some()
+                        && std::env::var("INFR_NO_MMV").is_err()
+                    {
+                        let nblk = in_f / 32;
+                        let qa = pooled(pool, be_, "mmv_qa", in_f)?;
+                        let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
+                        let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
+                        rec.quant_q8(
+                            xb,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            1,
+                            in_f,
+                        );
+                        rec.linear_add_mmv(
+                            dt,
+                            w,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            rr,
+                            yf,
+                            in_f,
+                            out_f,
+                        );
+                    } else {
+                        rec.linear_add_native(dt, w, xb, rr, yf, m, in_f, out_f);
+                    }
                 } else {
                     rec.linear_add(w, xb, rr, yf, m, in_f, out_f);
                 }
@@ -712,7 +753,39 @@ fn lower_op(
                     transient.push(t);
                 }
             } else if native_dense_supported(dt) {
-                rec.linear_native_off(dt, w, w_off, xb, y, m, in_f, out_f);
+                // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
+                if m == 1
+                    && in_f % 32 == 0
+                    && in_f * out_f >= MMV_MIN_ELEMS
+                    && crate::gemm::native_mmv_build_spv(dt, false).is_some()
+                    && std::env::var("INFR_NO_MMV").is_err()
+                {
+                    let nblk = in_f / 32;
+                    let qa = pooled(pool, be_, "mmv_qa", in_f)?;
+                    let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
+                    let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        1,
+                        in_f,
+                    );
+                    rec.linear_mmv(
+                        dt,
+                        w,
+                        w_off,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        y,
+                        in_f,
+                        out_f,
+                    );
+                } else {
+                    rec.linear_native_off(dt, w, w_off, xb, y, m, in_f, out_f);
+                }
             } else if matches!(dt, infr_core::DType::F32) {
                 // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj): the seam
                 // uploads native dtype, and the f16 GEMV would read the f32 bytes as f16 garbage.

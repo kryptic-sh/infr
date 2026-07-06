@@ -398,6 +398,19 @@ fn main() {
         ("moe_accumulate", "moe_accumulate", &[]),
         ("moe_accumulate_scaled", "moe_accumulate_scaled", &[]),
         ("native_mmv_id_q4k", "native_mmv_id_q4k", &[]),
+        // Int8 dp4a decode GEMV (m=1, NUM_ROWS=2): one .spv per (format, residual).
+        ("native_mmv", "native_mmv_q4k", &["-DFMT_Q4K"]),
+        (
+            "native_mmv",
+            "native_mmv_q4k_res",
+            &["-DFMT_Q4K", "-DUSE_RES"],
+        ),
+        ("native_mmv", "native_mmv_q6k", &["-DFMT_Q6K"]),
+        (
+            "native_mmv",
+            "native_mmv_q6k_res",
+            &["-DFMT_Q6K", "-DUSE_RES"],
+        ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),
         (

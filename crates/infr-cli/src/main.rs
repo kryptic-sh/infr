@@ -566,21 +566,23 @@ fn run_chat_turn(
             // single-threaded and `on_step`/`on_piece` never interleave), so a `RefCell` lets them
             // share `v` without two simultaneous `&mut` captures.
             let visual = std::cell::RefCell::new(v);
+            // Buffer the streamed pieces instead of feeding ThinkRender per block: the
+            // template-aware rendering (think/channel-marker handling) only formats correctly
+            // over the COMPLETE response — per-block feeding split markers across pieces and
+            // broke the formatting (user report). The live region is the in-progress display;
+            // the one-shot render below is the permanent transcript.
+            let buffered = std::cell::RefCell::new(String::new());
             let mut on_piece = |p: &str| {
-                visual.borrow_mut().end(); // erase the live region so this block's permanent text
-                                           // prints cleanly below the prior transcript (no-op if
-                                           // no region is currently reserved)
-                render.feed(p);
+                buffered.borrow_mut().push_str(p);
             };
             let mut on_step =
                 |view: infr_llama::diffusion::StepView| visual.borrow_mut().step(view);
             let result =
                 chat.turn_with_step_hook(message, max_new, &mut on_piece, Some(&mut on_step));
-            // Safety net: always leave the terminal clean, whether the turn ended on a clean
-            // final block (region already erased by the last `on_piece`, so this is a no-op) or
-            // an error mid-block (region still reserved — erase it before the `?` below prints
-            // the error).
+            // Erase the live region first, then render the whole response through the
+            // template-aware renderer exactly once — correct formatting, no duplication.
             visual.borrow_mut().end();
+            render.feed(&buffered.borrow());
             result?
         }
         None => chat.turn(message, max_new, &mut |p| render.feed(p))?,

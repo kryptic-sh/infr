@@ -3417,6 +3417,7 @@ impl<'a> Recorder<'a> {
     pub fn matmul_mmq_experts(
         &self,
         dtype: infr_core::DType,
+        stage: &'static str,
         qa: &dyn Buffer,
         dact: &dyn Buffer,
         sact: Option<&dyn Buffer>,
@@ -3431,10 +3432,11 @@ impl<'a> Recorder<'a> {
         n: usize,
         n_expert: usize,
     ) {
-        self.stamp(match dtype {
-            infr_core::DType::Q6K => "expert_down",
-            _ => "expert_gateup",
-        });
+        // NB: the profiler label is the CALLER'S stage (gate_up vs down), not a function of
+        // `dtype` — the down projection isn't always Q6_K (DiffusionGemma's down is Q8_0/Q5_0),
+        // so inferring the stage from dtype mislabeled DG's down-proj dispatches as
+        // "expert_gateup" in INFR_PROF2 output. Every caller knows its own role; trust it.
+        self.stamp(stage);
         let (name, spv, nb): (_, _, usize) = match dtype {
             infr_core::DType::Q4K => (
                 "native_gemm_mmq_q4k_xp",

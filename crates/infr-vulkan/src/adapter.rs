@@ -1764,6 +1764,7 @@ fn lower_op(
                 );
                 rec.matmul_mmq_experts(
                     gdt,
+                    "expert_gateup",
                     pool[&qa].as_ref(),
                     pool[&qda].as_ref(),
                     Some(pool[&qsa].as_ref()),
@@ -1784,6 +1785,7 @@ fn lower_op(
                     rec.suppress_sync(true);
                     rec.matmul_mmq_experts(
                         udt,
+                        "expert_gateup",
                         pool[&qa].as_ref(),
                         pool[&qda].as_ref(),
                         Some(pool[&qsa].as_ref()),
@@ -1835,6 +1837,7 @@ fn lower_op(
                 let down_needs_sact = matches!(ddt, Q4K);
                 rec.matmul_mmq_experts(
                     ddt,
+                    "expert_down",
                     pool[&dqa].as_ref(),
                     pool[&dda].as_ref(),
                     down_needs_sact.then(|| pool[&dsa].as_ref()),

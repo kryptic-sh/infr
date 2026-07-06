@@ -4,7 +4,7 @@
 //! below) — no ops, no forward.
 //!
 //! Phase 2 scope (this module's second half): the head's 1-layer forward as its own backend-generic
-//! `Graph` (`build_mtp_graph`, ported op-for-op from `cpu_backend.rs`'s qwen35 full-attention-layer
+//! `Graph` (`build_mtp_graph`, ported op-for-op from `seam.rs`'s qwen35 full-attention-layer
 //! emission — see that function's doc for the exact line citations) plus the two engine-level driver
 //! primitives `docs/MTP.md` specifies (`catch_up`/`draft`, porting `common/speculative.cpp`'s
 //! `common_speculative_impl_draft_mtp`). NO target-loop integration yet (Phase 3) — `MtpHeadSession`
@@ -158,12 +158,12 @@ pub fn load_mtp_head(g: &Gguf, cfg: &crate::Config) -> Result<MtpHeadWeights> {
 
 // ─── Phase 2: the head forward + the draft primitives (issue #33 — see `docs/MTP.md`) ──────────
 
-/// A weight binder in the shape `cpu_backend.rs`'s (module-private) `BindWeight` uses: turns a
+/// A weight binder in the shape `seam.rs`'s (module-private) `BindWeight` uses: turns a
 /// native-dtype GGUF tensor into a backend buffer + the effective dtype it now holds. Named here
 /// (rather than inlined at each call site) purely to keep clippy's `type_complexity` lint quiet —
 /// see [`upload_mtp_head_bufs`] / [`MtpHeadSession::build`].
 type BindWeightFn<'a> =
-    dyn Fn(&str, crate::cpu_backend::WBytes, DType, usize) -> Result<(Box<dyn Buffer>, DType)> + 'a;
+    dyn Fn(&str, crate::seam::WBytes, DType, usize) -> Result<(Box<dyn Buffer>, DType)> + 'a;
 
 /// [`upload_mtp_head_bufs`]'s return shape: the 16 uploaded weight buffers, index-parallel with
 /// their (effective dtype, element count) — the pair `build_mtp_graph` needs to declare each
@@ -177,7 +177,7 @@ fn main_output_norm(g: &Gguf, ne: usize) -> Result<MtpTensor> {
 }
 
 /// The tied/untied lm_head fallback (`qwen35.cpp:636`'s `layer.nextn.shared_head_head ? ... :
-/// model.output`), mirroring `cpu_backend.rs`'s own tied-weight rule (`wload(&["output.weight"])`
+/// model.output`), mirroring `seam.rs`'s own tied-weight rule (`wload(&["output.weight"])`
 /// vs the `token_embd.weight` fallback right above it in that file).
 fn main_lm_head(g: &Gguf, ne: usize, vocab: usize) -> Result<MtpTensor> {
     if find(g, "output.weight").is_some() {
@@ -200,7 +200,7 @@ pub fn resolve_own_embed_table(g: &Gguf, head: &MtpHeadWeights) -> Result<Option
 
 /// Upload the head's 16 graph weights (attention-layer set + NextN bridge, in `wpush` order —
 /// MUST match [`build_mtp_graph`]'s `wpush` calls 1:1) through the caller's `bind_weight` — the
-/// SAME binder shape `cpu_backend.rs`'s `BindWeight` uses (zero-copy mmap on CPU, padded upload on
+/// SAME binder shape `seam.rs`'s `BindWeight` uses (zero-copy mmap on CPU, padded upload on
 /// Vulkan — see `MtpHeadSession::new_cpu`/`new_vulkan`), so the head's tensors land in memory
 /// exactly like the trunk's do. Falls back to the main model's `output_norm`/tied lm_head for the
 /// two optional NextN tensors that are absent (`docs/MTP.md`'s confirmed dump — `shared_head_norm`
@@ -212,18 +212,13 @@ fn upload_mtp_head_bufs(
     cfg: &crate::Config,
     head: &MtpHeadWeights,
 ) -> Result<WBufs> {
-    let _ = be; // kept for symmetry with cpu_backend's wload closures; binder itself owns `be`
+    let _ = be; // kept for symmetry with seam's wload closures; binder itself owns `be`
     let mut bufs = Vec::with_capacity(16);
     let mut specs = Vec::with_capacity(16);
     let mut push = |t: &MtpTensor| -> Result<()> {
         let tb = g.tensor_bytes_arc(&t.name).map_err(|e| anyhow!("{e}"))?;
         let numel: usize = t.shape.iter().product();
-        let (buf, dt) = bind_weight(
-            &t.name,
-            crate::cpu_backend::WBytes::Mmap(tb),
-            t.dtype,
-            numel,
-        )?;
+        let (buf, dt) = bind_weight(&t.name, crate::seam::WBytes::Mmap(tb), t.dtype, numel)?;
         bufs.push(buf);
         specs.push((dt, numel));
         Ok(())
@@ -277,7 +272,7 @@ struct MtpHandles {
 /// logits = lm_head @ h_mtp
 /// ```
 /// The attention-layer ops (interleaved q+gate split, qk-norm+RoPE, sigmoid out-gate, SwiGLU FFN)
-/// are ported op-for-op from `cpu_backend.rs`'s qwen35 `c.attn_out_gate` branch (that file's
+/// are ported op-for-op from `seam.rs`'s qwen35 `c.attn_out_gate` branch (that file's
 /// `generate_dense_backend::build` closure, roughly lines 2269-2707: the per-layer attn-input norm,
 /// the interleaved qg projection + per-head `CopyStrided` split, k/v projections, `QkNormRope`,
 /// `WriteKv`, `Attention`, the post-attention `GatedAct(Sigmoid)` gate, the o-projection, the
@@ -443,7 +438,7 @@ fn build_mtp_graph(
         w_off: 0,
     });
 
-    // ── one qwen35 full-attention layer on `resid` (own 1-layer KV) — cpu_backend.rs's
+    // ── one qwen35 full-attention layer on `resid` (own 1-layer KV) — seam.rs's
     //    `c.attn_out_gate` branch, qwen35.cpp:556-619 ──
     g.push(Op::RmsNorm {
         x: resid,
@@ -453,7 +448,7 @@ fn build_mtp_graph(
         dim: ne as u32,
         eps,
     });
-    // interleaved q+gate projection + per-head split (cpu_backend.rs:2464-2493, qwen35.cpp:559-576).
+    // interleaved q+gate projection + per-head split (seam.rs:2464-2493, qwen35.cpp:559-576).
     g.push(Op::Linear {
         x: hn,
         weight: w_q,
@@ -504,7 +499,7 @@ fn build_mtp_graph(
         w_off: 0,
     });
     // K: fused QkNorm+RoPE (own KV write immediately follows, matching the trunk's fused-write
-    // adjacency convention — cpu_backend.rs:2587-2636).
+    // adjacency convention — seam.rs:2587-2636).
     g.push(Op::QkNormRope {
         x: k,
         weight: w_kn,
@@ -559,7 +554,7 @@ fn build_mtp_graph(
         mask: AttnMask::Causal,
         pos: start_pos as u32,
     });
-    // sigmoid out-gate BEFORE the o-projection — cpu_backend.rs:2686-2698, qwen35.cpp:602.
+    // sigmoid out-gate BEFORE the o-projection — seam.rs:2686-2698, qwen35.cpp:602.
     g.push(Op::GatedAct {
         gate: gate_a,
         up: attn,
@@ -678,10 +673,10 @@ fn build_mtp_graph(
 
 /// A live MTP head: the head's OWN uploaded weights + its OWN 1-layer KV (independent of the
 /// trunk's — `docs/MTP.md`'s driver section), driven by `forward`/`catch_up`/`draft`. Borrows the
-/// backend and the host embedding table for its lifetime (mirrors `cpu_backend.rs`'s session
+/// backend and the host embedding table for its lifetime (mirrors `seam.rs`'s session
 /// structs) — construct via [`new_cpu`](Self::new_cpu) / [`new_vulkan`](Self::new_vulkan).
 ///
-/// Not cached like `DenoiseCache` (`cpu_backend.rs`): `Op::Attention::kv_len` and `Op::WriteKv::pos`
+/// Not cached like `DenoiseCache` (`seam.rs`): `Op::Attention::kv_len` and `Op::WriteKv::pos`
 /// are BAKED into the graph at build time (there's no dynamic-`kv_len` binding in this IR — see
 /// `docs/MTP.md`'s IR), and both change on essentially every `catch_up`/`draft` call (`draft`
 /// advances `kv_len` by one every step). A shape-keyed cache would almost always miss, so
@@ -711,7 +706,7 @@ pub struct MtpHeadSession<'a> {
 
 impl<'a> MtpHeadSession<'a> {
     /// Construct over the CPU reference backend (zero-copy mmap weight upload — mirrors
-    /// `cpu_model.rs`'s `DiffusionGemmaCpuSession` closures).
+    /// `seam_model.rs`'s `DiffusionGemmaCpuSession` closures).
     pub fn new_cpu(
         cpu_be: &'a infr_cpu::CpuBackend,
         g: &Gguf,
@@ -723,8 +718,8 @@ impl<'a> MtpHeadSession<'a> {
         Self::build(
             cpu_be,
             &|_name, tb, dt, _n| match tb {
-                crate::cpu_backend::WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
-                crate::cpu_backend::WBytes::Owned(v) => {
+                crate::seam::WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
+                crate::seam::WBytes::Owned(v) => {
                     let buf = cpu_be
                         .alloc(v.len().max(1), BufferUsage::Weights)
                         .map_err(|e| anyhow!("{e}"))?;
@@ -742,7 +737,7 @@ impl<'a> MtpHeadSession<'a> {
         )
     }
 
-    /// Construct over the Vulkan backend (padded upload — mirrors `cpu_model.rs`'s
+    /// Construct over the Vulkan backend (padded upload — mirrors `seam_model.rs`'s
     /// `DiffusionGemmaVulkanSession` closures).
     pub fn new_vulkan(
         vk: &'a infr_vulkan::VulkanBackend,
@@ -772,7 +767,7 @@ impl<'a> MtpHeadSession<'a> {
     }
 
     /// Construct over the Metal backend (raw native-dtype upload — mirrors
-    /// `cpu_backend.rs`'s `generate_dense_metal_session` weight closure).
+    /// `seam.rs`'s `generate_dense_metal_session` weight closure).
     #[cfg(target_os = "macos")]
     pub fn new_metal(
         mtl: &'a infr_metal::MetalBackend,
@@ -1022,9 +1017,9 @@ fn top1_softmax(logits: &[f32]) -> (u32, f32) {
 /// per cycle before a batched verify.
 pub const DEFAULT_N_MAX: usize = 6;
 
-/// One batched VERIFY forward (`cpu_backend.rs`'s VERIFY branch) over `tokens`' un-cached suffix,
+/// One batched VERIFY forward (`seam.rs`'s VERIFY branch) over `tokens`' un-cached suffix,
 /// on a persistent Vulkan session, ALSO capturing `h` for every returned row — the primitive
-/// [`generate_mtp_spec_vulkan`] needs every cycle (`crate::cpu_model::CpuModel`'s own
+/// [`generate_mtp_spec_vulkan`] needs every cycle (`crate::seam_model::SeamModel`'s own
 /// `verify_dense_*_with_h` helpers all use a FRESH one-shot session; this one threads `state`
 /// across calls so the trunk's KV/DeltaNet state persists cycle to cycle — the whole point of
 /// self-speculative decoding). Returns `(logits [m*vocab], h [m*n_embd])`, `m = tokens.len() -
@@ -1041,12 +1036,12 @@ fn run_verify(
     cfg: &crate::Config,
     token_embd: &[f32],
     tokens: &[u32],
-    state: &mut Option<crate::cpu_backend::SeamKv>,
+    state: &mut Option<crate::seam::SeamKv>,
     max_ctx: usize,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let mut logits = Vec::new();
     let mut h = Vec::new();
-    crate::cpu_backend::generate_dense_backend(
+    crate::seam::generate_dense_backend(
         be,
         bind,
         g,
@@ -1129,7 +1124,7 @@ fn argmax_row(row: &[f32]) -> u32 {
 }
 
 /// The MTP self-speculative generation loop (issue #33, Phase 3 — see `docs/MTP.md`'s driver
-/// section and `crate::cpu_model::CpuModel::generate_metal_spec`, whose two-model draft/verify/
+/// section and `crate::seam_model::SeamModel::generate_metal_spec`, whose two-model draft/verify/
 /// commit shape this mirrors for a SINGLE self-speculating trunk on the Vulkan production
 /// backend). **Greedy only** (temp 0) — the commit/accept invariant below only holds at temp 0;
 /// sampling-temperature support is a follow-up phase.
@@ -1152,7 +1147,7 @@ fn argmax_row(row: &[f32]) -> u32 {
 ///    primes the head over the whole prompt — mirrors `mtp_head_forward_finite`'s `prime_head` test
 ///    helper exactly (`shifted_h[0]` zero, `pending_h` = the last row).
 /// 2. **Cycle**: `draft` up to `n_max` tokens off `(id_last, pending_h)`; one batched VERIFY over
-///    `[committed | drafted]`; `crate::cpu_model::spec_accept` picks the longest accepted prefix +
+///    `[committed | drafted]`; `crate::seam_model::spec_accept` picks the longest accepted prefix +
 ///    the target's correction/bonus token — EXACTLY the macOS spec driver's rule, so the same
 ///    "committed stream == target's own greedy argmax stream" invariant holds here.
 ///
@@ -1167,16 +1162,16 @@ fn argmax_row(row: &[f32]) -> u32 {
 /// after it), spliced in as a virtual row so the SAME accept/catch-up code handles cycle 1
 /// identically to every later cycle.
 ///
-/// ## KV-overwrite / no-rewind semantics this relies on (see `cpu_backend.rs`)
+/// ## KV-overwrite / no-rewind semantics this relies on (see `seam.rs`)
 /// The trunk session's VERIFY branch always extends `cached` by the WHOLE fed suffix, accepted or
 /// not (`cached.extend_from_slice(&prompt[start..])`) — a rejected draft's rows simply get
 /// OVERWRITTEN by the next cycle's differing suffix, exactly like the macOS dense/attention spec
-/// driver (`CpuModel::generate_metal_spec`'s own doc: "Rollback is the session prefix-diff:
+/// driver (`SeamModel::generate_metal_spec`'s own doc: "Rollback is the session prefix-diff:
 /// rejected rows just get overwritten by the next round's suffix prefill"). qwen35's gated-
 /// DeltaNet layers can't rewind that way (an append-only recurrent summary, not a per-position
 /// cache — `docs/QWEN35.md`): the SAME `generate_dense_backend` prefix-diff logic that reuses
 /// dense KV rows falls back to a FULL reprefill from position 0 whenever a cycle's committed
-/// stream doesn't EXACTLY extend the trunk's cached tokens (`cpu_backend.rs`'s `start`
+/// stream doesn't EXACTLY extend the trunk's cached tokens (`seam.rs`'s `start`
 /// computation, the `c.qwen35` branch) — i.e. every partial/zero-accept cycle pays a full
 /// re-prefill of the WHOLE conversation so far. This is an EXISTING limitation of qwen35's KV
 /// reuse (predates MTP; it would bite ANY qwen35 speculative scheme, draft-model or MTP), not
@@ -1197,7 +1192,7 @@ fn argmax_row(row: &[f32]) -> u32 {
 /// `run`/`serve` (which only want [`crate::GenStats`]) and `bench`/`compare` (which want both)
 /// share one implementation.
 pub fn generate_mtp_spec_vulkan(
-    model: &crate::CpuModel,
+    model: &crate::SeamModel,
     head: &MtpHeadWeights,
     prompt: &str,
     max_new: usize,
@@ -1211,7 +1206,7 @@ pub fn generate_mtp_spec_vulkan(
 /// so `infr bench`'s `mtp` segment and `infr compare`'s MTP DECODE section can report the
 /// draft/verify/catchup phase split and alpha without scraping stderr.
 pub fn generate_mtp_spec_vulkan_timed(
-    model: &crate::CpuModel,
+    model: &crate::SeamModel,
     head: &MtpHeadWeights,
     prompt: &str,
     max_new: usize,
@@ -1247,7 +1242,7 @@ pub fn generate_mtp_spec_vulkan_timed(
 /// the Apple-GPU trunk + head (raw native-dtype weight upload, `MtpHeadSession::new_metal`).
 #[cfg(target_os = "macos")]
 pub fn generate_mtp_spec_metal_timed(
-    model: &crate::CpuModel,
+    model: &crate::SeamModel,
     head: &MtpHeadWeights,
     prompt: &str,
     max_new: usize,
@@ -1281,7 +1276,7 @@ pub fn generate_mtp_spec_metal_timed(
 /// establish the acceptance-rate oracle (a backend whose head numerics differ from the trunk's
 /// shows up as a lower alpha here vs on a GPU backend).
 pub fn generate_mtp_spec_cpu_timed(
-    model: &crate::CpuModel,
+    model: &crate::SeamModel,
     head: &MtpHeadWeights,
     prompt: &str,
     max_new: usize,
@@ -1291,8 +1286,8 @@ pub fn generate_mtp_spec_cpu_timed(
     let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
     let cpu = infr_cpu::CpuBackend::new();
     let bind: &BindWeightFn = &|_name, tb, dt, _n| match tb {
-        crate::cpu_backend::WBytes::Mmap(tb) => Ok((cpu.map_weight(tb), dt)),
-        crate::cpu_backend::WBytes::Owned(v) => {
+        crate::seam::WBytes::Mmap(tb) => Ok((cpu.map_weight(tb), dt)),
+        crate::seam::WBytes::Owned(v) => {
             let buf = cpu
                 .alloc(v.len().max(1), BufferUsage::Weights)
                 .map_err(|e| anyhow!("{e}"))?;
@@ -1317,7 +1312,7 @@ pub fn generate_mtp_spec_cpu_timed(
 /// Non-timed Metal MTP driver (drops the [`MtpTiming`]) — the `ChatModel::generate` entry.
 #[cfg(target_os = "macos")]
 pub fn generate_mtp_spec_metal(
-    model: &crate::CpuModel,
+    model: &crate::SeamModel,
     head: &MtpHeadWeights,
     prompt: &str,
     max_new: usize,
@@ -1334,7 +1329,7 @@ pub fn generate_mtp_spec_metal(
 fn generate_mtp_spec_core(
     be: &dyn Backend,
     bind: &BindWeightFn,
-    model: &crate::CpuModel,
+    model: &crate::SeamModel,
     head_sess: &mut MtpHeadSession,
     max_ctx: usize,
     prompt: &str,
@@ -1353,7 +1348,7 @@ fn generate_mtp_spec_core(
     anyhow::ensure!(!prompt_tokens.is_empty(), "generate_mtp_spec: empty prompt");
     let p = prompt_tokens.len();
 
-    let mut trunk_state: Option<crate::cpu_backend::SeamKv> = None;
+    let mut trunk_state: Option<crate::seam::SeamKv> = None;
 
     // ── prime: one VERIFY over the whole prompt, then catch the head up over it ──────────────
     let t_prime = std::time::Instant::now();
@@ -1450,7 +1445,7 @@ fn generate_mtp_spec_core(
                 .collect()
         };
 
-        let (accepted, next_tok) = crate::cpu_model::spec_accept(&cand, &varg);
+        let (accepted, next_tok) = crate::seam_model::spec_accept(&cand, &varg);
         total_drafted += cand.len();
         total_accepted += accepted;
 

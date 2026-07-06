@@ -8,7 +8,7 @@
   entropy-bound block decode + `infr run` wiring (phase 3, `c9983c1`),
   serve/bench/compare + pre-seam scaffolding removal (phase 4, this doc's
   update). Built on the SAME transformer runner every other arch uses
-  (`CpuModel` + the per-backend `ChatModel` impls) from day one — no bespoke
+  (`SeamModel` + the per-backend `ChatModel` impls) from day one — no bespoke
   "engine" seam.
 - **Phase D: Metal denoise, code-complete but hardware-unvalidated.** Written
   BLIND on a Linux box (same precedent as the KV-quant Metal work — shipped
@@ -17,7 +17,7 @@
   `crates/infr-metal/shaders/attention.metal`) gives Metal's attention the
   bidirectional `[lo, kv_len)`-for-every-row reach `AttnMask::Canvas` needs (see
   "Metal implementation notes" below); `DiffusionGemmaMetalSession`
-  (`crates/infr-llama/src/cpu_model.rs`) is the Vulkan session's twin;
+  (`crates/infr-llama/src/seam_model.rs`) is the Vulkan session's twin;
   `infr run`/`serve`/`bench` now route `INFR_METAL` there instead of falling
   back to CPU. In-graph self-conditioning (`gpu_sc`, Phase B) widened to cover
   Metal too — its `Op::Softmax`/`Op::Linear` already handled the shape/dtype.

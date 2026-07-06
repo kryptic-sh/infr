@@ -62,7 +62,7 @@ fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
 // the two token-for-token is brittle. Instead each backend locks its own FNV-1a golden, captured
 // with `INFR_BLESS=1` and read to confirm it's coherent + correct, so any op regression flips the
 // hash. Kernel-level math (the Q4_K/Q6_K dot vs the f32 reference) is unit-tested in
-// `src/cpu_backend.rs`.
+// `src/seam.rs`.
 
 /// Stable FNV-1a-64 over a string. (`std::hash::DefaultHasher` is NOT stable across toolchains, so we
 /// roll our own for golden values.)
@@ -75,10 +75,10 @@ fn fnv1a(s: &str) -> u64 {
     h
 }
 
-/// Greedy CPU generation with NO GPU: load via [`infr_llama::CpuModel`] (Vulkan-free), render the
+/// Greedy CPU generation with NO GPU: load via [`infr_llama::SeamModel`] (Vulkan-free), render the
 /// prompt with the model's own chat template (so an instruct model answers coherently), collect the
 /// streamed text. This is exactly the production `INFR_CPU=1` path.
-fn cpu_gen(model: &infr_llama::CpuModel, prompt: &str, n: usize) -> String {
+fn cpu_gen(model: &infr_llama::SeamModel, prompt: &str, n: usize) -> String {
     // Inputs are plain text; `render_chat` (the GGUF's jinja template) turns them into the exact
     // token stream the instruct model expects.
     let mut out = String::new();
@@ -91,7 +91,7 @@ fn cpu_gen(model: &infr_llama::CpuModel, prompt: &str, n: usize) -> String {
 }
 
 /// Assert (or, with `INFR_BLESS=1`, print) the golden hash for each case.
-fn check_golden(model: &infr_llama::CpuModel, cases: &[(&str, usize, u64)]) {
+fn check_golden(model: &infr_llama::SeamModel, cases: &[(&str, usize, u64)]) {
     let bless = std::env::var("INFR_BLESS").is_ok();
     for (prompt, n, want) in cases {
         let out = cpu_gen(model, prompt, *n);
@@ -188,7 +188,7 @@ fn cpu_golden_qwen3() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_golden(&model, QWEN3_GOLDEN);
 }
 
@@ -213,7 +213,7 @@ fn cpu_no_garbage_on_repeated_forward() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let p = repeat_prompt();
     let g1 = cpu_gen(&model, &p, 20);
     let g2 = cpu_gen(&model, &p, 20);
@@ -246,7 +246,7 @@ fn cpu_kv_q8_coherent() {
     for (k, v) in [("q8_0", "q8_0"), ("q8_0", "f16"), ("f16", "q8_0")] {
         std::env::set_var("INFR_KV_TYPE_K", k);
         std::env::set_var("INFR_KV_TYPE_V", v);
-        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = cpu_gen(&model, &prompt, 24);
         assert!(
             !is_degenerate(&out),
@@ -271,7 +271,7 @@ fn cpu_kv_turbo_coherent() {
     std::env::set_var("INFR_KV_TYPE_K", "f16");
     for v in ["turbo2", "turbo3", "turbo4"] {
         std::env::set_var("INFR_KV_TYPE_V", v);
-        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = cpu_gen(&model, &repeat_prompt(), 24);
         assert!(
             !is_degenerate(&out),
@@ -304,7 +304,7 @@ fn cpu_kv_mainline_quants_coherent() {
     ] {
         std::env::set_var("INFR_KV_TYPE_K", k);
         std::env::set_var("INFR_KV_TYPE_V", v);
-        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = cpu_gen(&model, &prompt, 24);
         assert!(
             !is_degenerate(&out),
@@ -330,7 +330,7 @@ const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
 ];
 
 /// End-to-end dense parity: run the full Qwen3-0.6B dense forward on the **Vulkan** backend through
-/// the agnostic compute seam ([`CpuModel::generate_dense_vulkan`]) and lock its golden. The seam runs
+/// the agnostic compute seam ([`SeamModel::generate_dense_vulkan`]) and lock its golden. The seam runs
 /// the identical `Graph` the CPU reference builds; this proves the dense forward maps faithfully to
 /// the GPU and reproduces the production GPU path (`gpu_golden_qwen3`).
 #[test]
@@ -339,7 +339,7 @@ fn gpu_seam_golden_qwen3() {
     need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_gpu_golden(
         |p, n| {
             model
@@ -360,7 +360,7 @@ fn gpu_seam_flash_matches_cpu() {
     need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     // ~100+ tokens → pf_m ≥ 64 → flash prefill on the seam.
     let long = "Photosynthesis is the process by which green plants, algae, and some bacteria \
         convert light energy into chemical energy stored in glucose, using carbon dioxide and water \
@@ -387,7 +387,7 @@ fn gpu_seam_flash_matches_cpu() {
 /// covered models exhibit one on these prompts today, so keep the strict compare until it flakes.
 fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(path, None).expect("cpu load");
     let rendered = model.render_chat(prompt).expect("render chat");
     let mut cpu_txt = String::new();
     model
@@ -413,7 +413,7 @@ fn gpu_seam_kv_reuse_matches_fresh() {
     need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut sess = model.vulkan_session(512).expect("session");
 
     let p1 = "The capital of France is";
@@ -463,7 +463,7 @@ fn gpu_seam_kv_q8_coherent() {
     let long =
         "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
 
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     // (a) one-shot static path.
     let g_static = model
         .generate_dense_vulkan(&long, 24)
@@ -491,7 +491,7 @@ fn gpu_seam_kv_q8_coherent() {
     for (k, v) in [("q8_0", "f16"), ("f16", "q8_0")] {
         std::env::set_var("INFR_KV_TYPE_K", k);
         std::env::set_var("INFR_KV_TYPE_V", v);
-        let m = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let m = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = m.generate_dense_vulkan(&long, 20).expect("mixed gen");
         assert!(
             !is_degenerate(&out),
@@ -532,7 +532,7 @@ fn gpu_seam_kv_mainline_quants_coherent() {
     ] {
         std::env::set_var("INFR_KV_TYPE_K", k);
         std::env::set_var("INFR_KV_TYPE_V", v);
-        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = model.generate_dense_vulkan(&long, 24).expect("gpu kv gen");
         assert!(
             !is_degenerate(&out),
@@ -554,7 +554,7 @@ fn gpu_seam_multi_slot_prefix_sharing() {
     need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut sess = model.vulkan_session(512).expect("session");
 
     // A long shared prefix (stands in for a system prompt) + two different questions.
@@ -620,8 +620,8 @@ fn metal_spec_decode_matches_target_only_greedy() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let target = infr_llama::CpuModel::load(&path, None).expect("target load");
-    let draft = infr_llama::CpuModel::load(&path, None).expect("draft load");
+    let target = infr_llama::SeamModel::load(&path, None).expect("target load");
+    let draft = infr_llama::SeamModel::load(&path, None).expect("draft load");
     let prompt = target
         .render_chat("Write a short paragraph about the ocean.")
         .expect("render chat");
@@ -661,7 +661,7 @@ fn metal_seam_multi_slot_prefix_sharing() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut sess = model.metal_session(512).expect("session");
 
     let sys = "You are a terse geography assistant. Answer in one word only, no punctuation, \
@@ -787,7 +787,7 @@ fn gpu_seam_golden_qwen3moe() {
     need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let rendered = model
         .render_chat("What is 2+2? Answer briefly.")
         .expect("render chat");
@@ -823,7 +823,7 @@ fn gpu_seam_bf16_matches_cpu() {
     need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let prompt = model
         .render_chat("What is the capital of France? Answer in one word.")
         .expect("render chat");
@@ -867,7 +867,7 @@ fn cpu_golden_qwen3_quants() {
             eprintln!("skip {quant}: not downloaded");
             continue;
         };
-        let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+        let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
         let out = cpu_gen(&model, prompt, *n);
         let h = fnv1a(&out);
         if bless {
@@ -912,7 +912,7 @@ fn cpu_golden_gemma3() {
     let path = need_model!(gemma3_1b(), "gemma-3-1b");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_golden(&model, GEMMA3_GOLDEN);
 }
 
@@ -964,15 +964,15 @@ fn cpu_golden_qwen35() {
 
 // ─── qwen35 on the UNIFIED shared-transformer path (Phase 2) ──────────────────────
 //
-// `Config::from_gguf` now accepts `arch == "qwen35"` and `cpu_backend`'s layer loop has a
-// `MixerW::DeltaNet` branch (see `docs/QWEN35.md`) — so `CpuModel::load` on a qwen35 GGUF drives
+// `Config::from_gguf` now accepts `arch == "qwen35"` and `seam`'s layer loop has a
+// `MixerW::DeltaNet` branch (see `docs/QWEN35.md`) — so `SeamModel::load` on a qwen35 GGUF drives
 // the SAME shared runner every other arch uses, in parallel with the old hand-written seam above.
 // Phase 3: production routing (`infr run`/`serve`/`bench` in infr-cli) now sends qwen35 through
 // this SAME unified path by default too — the old `qwen35::SeamModel` seam is reachable only via
 // the temporary `INFR_QWEN35_OLD=1` escape hatch. These tests remain the token-identical proof
 // that the two paths agree.
 
-/// The unified CPU path (`CpuModel::generate_cpu`, i.e. `cpu_backend::generate_dense_cpu`) must
+/// The unified CPU path (`SeamModel::generate_cpu`, i.e. `seam::generate_dense_cpu`) must
 /// produce IDENTICAL output to the old hand-written seam (`qwen35::generate_cpu`) for the same
 /// chat-rendered prompt: both run the same op sequence (RmsNorm/Linear/Conv1dSilu/DeltaNet/
 /// QkNorm/GatedAct for the DeltaNet layers; the interleaved-gate split + sigmoid gate for the
@@ -990,7 +990,7 @@ fn unified_qwen35_cpu_matches_old_seam() {
     infr_llama::qwen35::generate_cpu(&path, &prompt, 24, |p| old_out.push_str(p))
         .expect("old seam gen");
 
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut new_out = String::new();
     model
         .generate_cpu(&prompt, 24, |p| new_out.push_str(p))
@@ -1002,8 +1002,8 @@ fn unified_qwen35_cpu_matches_old_seam() {
     );
 }
 
-/// The unified Vulkan seam (`CpuModel::generate_dense_vulkan`) must match the unified CPU oracle
-/// (`CpuModel::generate_cpu`) token-for-token — the seam twin of every other arch's
+/// The unified Vulkan seam (`SeamModel::generate_dense_vulkan`) must match the unified CPU oracle
+/// (`SeamModel::generate_cpu`) token-for-token — the seam twin of every other arch's
 /// `gpu_seam_matches_cpu_*` test, now exercising `MixerW::DeltaNet` (Conv1dSilu/DeltaNet ops) AND
 /// the qwen35 attention layers' interleaved q+gate split + sigmoid output gate through Vulkan.
 #[test]
@@ -1016,7 +1016,7 @@ fn unified_qwen35_gpu_seam_matches_cpu() {
 
 /// qwen35's gated-DeltaNet recurrent state is an APPEND-ONLY summary — it can't rewind to an
 /// arbitrary shared prefix the way a real KV cache can (see docs/QWEN35.md and the no-rewind rule
-/// in `cpu_backend::generate_dense_backend`). On the unified Vulkan session (`vulkan_session` /
+/// in `seam::generate_dense_backend`). On the unified Vulkan session (`vulkan_session` /
 /// `generate_vulkan_session`, the seam twin of `gpu_seam_kv_reuse_matches_fresh`):
 ///   (a) a prompt that EXACTLY EXTENDS the previous turn's fed sequence continues the recurrent
 ///       state — suffix-only prefill (`n_prompt` shrinks), output identical to a fresh full prefill.
@@ -1030,7 +1030,7 @@ fn unified_qwen35_session_no_rewind() {
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     std::env::set_var("INFR_IGNORE_EOS", "1"); // fixed-length turns, no early EOS stop
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let mut sess = model.vulkan_session(512).expect("session");
 
     let p1 = "The quick brown fox jumps over the lazy dog. The capital of France is";
@@ -1175,7 +1175,7 @@ fn qwen35_trunk_unaffected() {
     );
 }
 
-/// The h-tap (`CpuModel::prefill_logits_and_h_cpu`, issue #33's Phase 2 primitive): the captured
+/// The h-tap (`SeamModel::prefill_logits_and_h_cpu`, issue #33's Phase 2 primitive): the captured
 /// `h` row must be EXACTLY the lm_head's input for the SAME forward's logits row — i.e.
 /// `lm_head(h) == logits` for qwen35 (a plain tied/untied GEMV, no softcap — `Config::final_softcap`
 /// is 0 for every qwen35 model, unlike gemma). Host-recomputes the GEMV from the same dequantized
@@ -1183,7 +1183,7 @@ fn qwen35_trunk_unaffected() {
 #[test]
 fn h_tap_matches_lm_head() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let tokens = model.encode("The capital of France is").expect("encode");
 
     let (logits, h) = model
@@ -1253,7 +1253,7 @@ fn h_tap_matches_lm_head() {
 /// head over the whole prompt in one call. Returns the session plus `(last_token, pending_h)` —
 /// `draft`'s starting point (`docs/MTP.md`'s `process()`/`pending_h` handoff).
 fn prime_head<'a>(
-    model: &'a infr_llama::CpuModel,
+    model: &'a infr_llama::SeamModel,
     head: &infr_llama::mtp::MtpHeadWeights,
     cpu_be: &'a infr_cpu::CpuBackend,
     g: &infr_gguf::Gguf,
@@ -1303,7 +1303,7 @@ fn mtp_head_forward_finite() {
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
     let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
     let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
 
     let prompt_tokens = model.encode("The capital of France is").expect("encode");
     let cpu_be = infr_cpu::CpuBackend::new();
@@ -1354,7 +1354,7 @@ fn mtp_head_cpu_vulkan_parity() {
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
     let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
     let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
 
     let prompt_tokens = model.encode("The capital of France is").expect("encode");
     let n_max = 6usize;
@@ -1426,7 +1426,7 @@ fn mtp_head_trunk_acceptance_rate() {
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
     let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
     let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let cpu_be = infr_cpu::CpuBackend::new();
     let n_max = 6usize;
     let vocab = cfg.vocab;
@@ -1522,7 +1522,7 @@ fn mtp_spec_matches_target_only_greedy() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let prompt = model
         .render_chat("Tell me a short story about a brave knight.")
         .expect("render chat");
@@ -1565,7 +1565,7 @@ fn mtp_spec_acceptance_stats() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
     let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
     let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
@@ -1622,7 +1622,7 @@ fn cpu_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_golden(&model, QWEN3MOE_GOLDEN);
 }
 
@@ -1632,7 +1632,7 @@ fn cpu_golden_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     check_golden(&model, GEMMA4_E2B_GOLDEN);
 }
 
@@ -1675,7 +1675,7 @@ fn top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
 fn cpu_diffusion_gemma_prefill_finite() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     let _tlk = test_serial_lock();
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     assert!(
         model.config().diffusion_gemma,
         "arch not parsed as diffusion-gemma"
@@ -1713,7 +1713,7 @@ fn gpu_seam_matches_cpu_diffusion_gemma() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     need_gpu!();
     let _tlk = test_serial_lock();
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let tokens = model
         .encode("What is the capital of France? Answer briefly.")
         .expect("encode");
@@ -1774,7 +1774,7 @@ fn cpu_diffusion_gemma_denoise_step() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let vocab = model.config().vocab;
     let canvas_len = model.config().canvas_length;
     let mask_id = model.config().mask_token_id;
@@ -1884,7 +1884,7 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
     need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let vocab = model.config().vocab;
     let canvas_len = model.config().canvas_length;
     let mask_id = model.config().mask_token_id;
@@ -1965,7 +1965,7 @@ fn diffusion_gemma_decode_matches_oracle() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     need_gpu!();
     let _tlk = test_serial_lock();
-    let model = infr_llama::CpuModel::load(&path, None).expect("cpu load");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     assert!(
         model.config().diffusion_gemma,
         "arch not parsed as diffusion-gemma"

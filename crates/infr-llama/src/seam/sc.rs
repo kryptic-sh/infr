@@ -1,6 +1,6 @@
 //! DiffusionGemma self-conditioning: the Phase-A host self-cond MLP + Phase-B in-graph
 //! soft-embedding weight builder, and the canvas-denoise request/plan-cache types. Pure-move
-//! split of `cpu_backend.rs` — see `super` for the module overview.
+//! split of `seam.rs` — see `super` for the module overview.
 use super::runner::DecodeHandles;
 use crate::Config;
 use anyhow::{anyhow, Result as AResult};

@@ -13,7 +13,7 @@
 //! `ChatSession` (which borrows `&Llama`) needs no ownership change — the caller owns the `Llama`,
 //! the box borrows it.
 
-use crate::{no_template_err, CpuModel, GenStats};
+use crate::{no_template_err, GenStats, SeamModel};
 use anyhow::Result;
 
 /// The two arch-specific primitives the shared [`Chat`] drives. Object-safe: no generics, callbacks
@@ -330,14 +330,14 @@ impl OaiRenderer {
 /// `wants_mtp` is always false, `mtp_head` stays `None` forever, and `generate` takes the EXACT
 /// same `session` path it always has — zero risk to non-MTP models/GGUFs.
 pub struct DenseSeamChat {
-    model: CpuModel,
-    session: Option<crate::cpu_model::DenseVulkanSession>,
+    model: SeamModel,
+    session: Option<crate::seam_model::DenseVulkanSession>,
     mtp_head: Option<crate::mtp::MtpHeadWeights>,
     mtp_checked: bool,
 }
 
 impl DenseSeamChat {
-    pub fn new(model: CpuModel) -> Self {
+    pub fn new(model: SeamModel) -> Self {
         Self {
             model,
             session: None,
@@ -450,15 +450,15 @@ impl ChatModel for DenseSeamChat {
 /// prefills only the suffix that differs from the previous rendered history.
 #[cfg(target_os = "macos")]
 pub struct MetalSeamChat {
-    model: CpuModel,
-    session: Option<crate::cpu_model::DenseMetalSession>,
+    model: SeamModel,
+    session: Option<crate::seam_model::DenseMetalSession>,
     mtp_head: Option<crate::mtp::MtpHeadWeights>,
     mtp_checked: bool,
 }
 
 #[cfg(target_os = "macos")]
 impl MetalSeamChat {
-    pub fn new(model: CpuModel) -> Self {
+    pub fn new(model: SeamModel) -> Self {
         Self {
             model,
             session: None,
@@ -568,16 +568,16 @@ impl ChatModel for MetalSeamChat {
 /// measurements); the CLI warns when the size ratio looks too thin.
 #[cfg(target_os = "macos")]
 pub struct SpecMetalChat {
-    target: CpuModel,
-    draft: CpuModel,
+    target: SeamModel,
+    draft: SeamModel,
     k: usize,
-    target_session: Option<crate::cpu_model::DenseMetalSession>,
-    draft_session: Option<crate::cpu_model::DenseMetalSession>,
+    target_session: Option<crate::seam_model::DenseMetalSession>,
+    draft_session: Option<crate::seam_model::DenseMetalSession>,
 }
 
 #[cfg(target_os = "macos")]
 impl SpecMetalChat {
-    pub fn new(target: CpuModel, draft: CpuModel, k: usize) -> Self {
+    pub fn new(target: SeamModel, draft: SeamModel, k: usize) -> Self {
         Self {
             target,
             draft,
@@ -652,13 +652,13 @@ impl ChatModel for SpecMetalChat {
 /// Stateless full-prefill each turn (no cross-turn KV yet), but the shared `Chat` now feeds the FULL
 /// rendered history in every turn, so multi-turn context works.
 pub struct CpuDenseChat {
-    model: CpuModel,
+    model: SeamModel,
     /// Run the dense forward on the reference Metal backend instead of the CPU interpreter.
     metal: bool,
 }
 
 impl CpuDenseChat {
-    pub fn new(model: CpuModel) -> Self {
+    pub fn new(model: SeamModel) -> Self {
         Self {
             model,
             metal: false,
@@ -666,7 +666,7 @@ impl CpuDenseChat {
     }
 
     /// Same dense model, but driven through the reference Metal backend (`INFR_METAL`).
-    pub fn new_metal(model: CpuModel) -> Self {
+    pub fn new_metal(model: SeamModel) -> Self {
         Self { model, metal: true }
     }
 }
@@ -710,7 +710,7 @@ impl ChatModel for CpuDenseChat {
     }
 }
 
-/// Either DiffusionGemma session (Phase 2/D, `cpu_model.rs`) behind
+/// Either DiffusionGemma session (Phase 2/D, `seam_model.rs`) behind
 /// [`crate::diffusion::DiffusionSession`] — lets [`DiffusionGemmaChat`] hold ONE persistent
 /// session across turns regardless of backend.
 enum DiffusionSess {
@@ -718,15 +718,15 @@ enum DiffusionSess {
     // session structs differ enough in size to trip clippy's `large_enum_variant` (the
     // `#[cfg(macos)]` Metal variant makes the spread, so the check only fires on a macOS build —
     // the Linux clippy CI job never compiles it).
-    Cpu(Box<crate::cpu_model::DiffusionGemmaCpuSession>),
-    Vulkan(Box<crate::cpu_model::DiffusionGemmaVulkanSession>),
+    Cpu(Box<crate::seam_model::DiffusionGemmaCpuSession>),
+    Vulkan(Box<crate::seam_model::DiffusionGemmaVulkanSession>),
     /// Phase D: the Metal twin, macOS only (see `DiffusionGemmaChat::new_metal`).
     #[cfg(target_os = "macos")]
-    Metal(Box<crate::cpu_model::DiffusionGemmaMetalSession>),
+    Metal(Box<crate::seam_model::DiffusionGemmaMetalSession>),
 }
 
 impl crate::diffusion::DiffusionSession for DiffusionSess {
-    fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
+    fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
         match self {
             DiffusionSess::Cpu(s) => s.prefill(model, tokens),
             DiffusionSess::Vulkan(s) => s.prefill(model, tokens),
@@ -736,7 +736,7 @@ impl crate::diffusion::DiffusionSession for DiffusionSess {
     }
     fn denoise(
         &mut self,
-        model: &CpuModel,
+        model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
@@ -770,7 +770,7 @@ enum DgBackend {
 /// prefill (see `DiffusionGemmaCpuSession::prefill`'s doc) re-sends only the un-cached suffix,
 /// exactly like every other seam session on this crate.
 pub struct DiffusionGemmaChat {
-    model: CpuModel,
+    model: SeamModel,
     backend: DgBackend,
     sess: Option<DiffusionSess>,
     max_ctx: usize,
@@ -778,7 +778,7 @@ pub struct DiffusionGemmaChat {
 
 impl DiffusionGemmaChat {
     /// Production Vulkan session.
-    pub fn new(model: CpuModel) -> Self {
+    pub fn new(model: SeamModel) -> Self {
         Self {
             model,
             backend: DgBackend::Vulkan,
@@ -788,7 +788,7 @@ impl DiffusionGemmaChat {
     }
 
     /// Reference CPU session (`INFR_CPU=1`).
-    pub fn new_cpu(model: CpuModel) -> Self {
+    pub fn new_cpu(model: SeamModel) -> Self {
         Self {
             model,
             backend: DgBackend::Cpu,
@@ -799,7 +799,7 @@ impl DiffusionGemmaChat {
 
     /// Reference Metal session (`INFR_METAL=1`, Phase D). Compiles on every target (like
     /// `CpuDenseChat::new_metal`) — the macOS check happens in `generate`, at session-open time.
-    pub fn new_metal(model: CpuModel) -> Self {
+    pub fn new_metal(model: SeamModel) -> Self {
         Self {
             model,
             backend: DgBackend::Metal,

@@ -415,7 +415,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     };
     let (gguf, tok) = resolve(model)?;
     // diffusion-gemma (block text-diffusion, Phase 3 — docs/DIFFUSIONGEMMA.md): a cheap arch peek
-    // (no full CpuModel load) so the default token budget below and the ChatModel selection further
+    // (no full SeamModel load) so the default token budget below and the ChatModel selection further
     // down can both branch on it. -n/max_new drives `blocks = ceil(n_predict / canvas_length)`
     // (256-token canvas) rather than autoregressive tokens, so the AR default of 2048 would run 8
     // whole blocks for a "Hi" reply; 1024 (4 blocks) is the same order of magnitude as a normal
@@ -432,7 +432,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // per-arch one-shot special-case. The CLI owns the Llama; the boxed trait object borrows it (so
     // the borrow-based dense `ChatSession` needs no ownership change).
     // Phase 3 cutover: qwen35 (Qwen3.5) now runs through the SAME standard `ChatModel` structs as
-    // every other arch below — `CpuModel::load` + the CPU/Vulkan/Metal sessions drive any
+    // every other arch below — `SeamModel::load` + the CPU/Vulkan/Metal sessions drive any
     // `Config` arch (including `MixerW::DeltaNet`) since Phase 1+2, so there is no more
     // qwen35-only branch. Escape hatch: `INFR_QWEN35_OLD=1` still reaches the old hand-written
     // seam (`Qwen35Chat` / `qwen35::SeamModel`) for one release — Metal hardware validation
@@ -460,7 +460,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                 "vulkan seam"
             }
         );
-        let loaded = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
+        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
         Box::new(if cpu {
             infr_llama::model::DiffusionGemmaChat::new_cpu(loaded)
         } else if metal {
@@ -485,7 +485,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             #[cfg(not(target_os = "macos"))]
             {
                 Box::new(infr_llama::model::CpuDenseChat::new_metal(
-                    infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+                    infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
                 ))
             }
         }
@@ -500,7 +500,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
                 "[cpu backend — dense/MoE forward on CPU via the agnostic compute graph, no GPU]"
             );
             Box::new(infr_llama::model::CpuDenseChat::new(
-                infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+                infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
     } else if use_old_seam {
@@ -513,7 +513,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         // `MixerW::DeltaNet` unified runner (see `unified_qwen35_*` tests).
         eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");
         Box::new(infr_llama::model::DenseSeamChat::new(
-            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+            infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
         ))
     };
     let mut model = model;
@@ -586,8 +586,8 @@ fn metal_chat_model(
     tok: Option<&Path>,
 ) -> anyhow::Result<Box<dyn infr_llama::model::ChatModel + Send>> {
     if let Ok(draft_path) = std::env::var("INFR_SPEC_DRAFT") {
-        let target = infr_llama::CpuModel::load(gguf, tok)?;
-        let draft = infr_llama::CpuModel::load(std::path::Path::new(&draft_path), None)?;
+        let target = infr_llama::SeamModel::load(gguf, tok)?;
+        let draft = infr_llama::SeamModel::load(std::path::Path::new(&draft_path), None)?;
         // Upper bound on the draft length; the driver adapts the actual k per round to recent
         // acceptance (verify cost scales with rows on this hardware, so over-drafting
         // low-acceptance text costs real time).
@@ -612,7 +612,7 @@ fn metal_chat_model(
         )))
     } else {
         Ok(Box::new(infr_llama::model::MetalSeamChat::new(
-            infr_llama::CpuModel::load(gguf, tok)?,
+            infr_llama::SeamModel::load(gguf, tok)?,
         )))
     }
 }
@@ -784,7 +784,7 @@ fn cmd_bench(
         );
     }
     // Phase 3 cutover: qwen35 (Qwen3.5) now benches through the STANDARD arms below
-    // (`cmd_bench_cpu` / the seam's `bench_vulkan` / `cmd_bench_metal`) — `CpuModel::load` drives
+    // (`cmd_bench_cpu` / the seam's `bench_vulkan` / `cmd_bench_metal`) — `SeamModel::load` drives
     // it through the unified runner (`Config::from_gguf` + `MixerW::DeltaNet`, Phase 1+2), reusing
     // the exact same pp/tg/depth methodology every other arch gets. This permanently kills the
     // class of depth-accounting artifacts the old qwen35-only bench arm (`cmd_bench_qwen35`) had.
@@ -826,7 +826,7 @@ fn cmd_bench(
     if ubatch > 0 {
         std::env::set_var("INFR_UBATCH", ubatch.to_string());
     }
-    let model = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
+    let model = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
     let samples = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
     let label = if let Some((p, g)) = pg {
         format!("pg{p}+{g}")
@@ -870,7 +870,7 @@ struct MtpBenchStats {
 }
 
 fn bench_mtp_tg(
-    model: &infr_llama::CpuModel,
+    model: &infr_llama::SeamModel,
     n_prompt: usize,
     depth: usize,
     n_gen: usize,
@@ -954,7 +954,7 @@ fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: 
 }
 
 /// Metal twin of [`cmd_bench_cpu`]: same pp/tg/pg + depth methodology on the Apple-GPU seam
-/// backend (`CpuModel::bench_metal`). On non-macOS this arm is unreachable (the backend crate
+/// backend (`SeamModel::bench_metal`). On non-macOS this arm is unreachable (the backend crate
 /// compiles to nothing), so the whole body is cfg-gated.
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench_metal(
@@ -974,7 +974,7 @@ fn cmd_bench_metal(
     }
     #[cfg(target_os = "macos")]
     {
-        let model = infr_llama::CpuModel::load(gguf, tok)?;
+        let model = infr_llama::SeamModel::load(gguf, tok)?;
         let measure_tg = pg.is_none() && n_gen > 0;
         // ONE session for warmup + every rep: backend, uploaded weights, compiled pipelines and
         // the dequant/repack weight caches persist (each rep still measures a full prefill —
@@ -1019,7 +1019,7 @@ fn cmd_bench_metal(
 }
 
 /// CPU-backend bench (`infr bench -ngl 0`): the GPU bench's pp/tg/pg metrics on the agnostic CPU
-/// reference path, using `CpuModel`'s token-level timing — directly comparable to `llama-bench -ngl 0`.
+/// reference path, using `SeamModel`'s token-level timing — directly comparable to `llama-bench -ngl 0`.
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench_cpu(
     gguf: &Path,
@@ -1031,7 +1031,7 @@ fn cmd_bench_cpu(
     reps: usize,
     json: bool,
 ) -> anyhow::Result<()> {
-    let model = infr_llama::CpuModel::load(gguf, tok)?;
+    let model = infr_llama::SeamModel::load(gguf, tok)?;
     let measure_tg = pg.is_none() && n_gen > 0;
     // One untimed warmup (page-cache the mmap'd weights) before the timed reps.
     let _ = model.bench(depth.max(1), if measure_tg || pg.is_some() { 1 } else { 0 });
@@ -1200,7 +1200,7 @@ fn cmd_bench_diffusion_gemma(
              AR turn); use separate -p/-n instead — `infr bench <model> -p P -n N`"
         );
     }
-    let model = infr_llama::CpuModel::load(gguf, tok)?;
+    let model = infr_llama::SeamModel::load(gguf, tok)?;
     let cfg = model.config();
     let canvas_len = cfg.canvas_length.max(1);
     let vocab = cfg.vocab;
@@ -1891,7 +1891,7 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         // diffusion-gemma (Phase 3/D): same selection as `cmd_run` — see its matching comment.
         let cpu = std::env::var("INFR_CPU").is_ok();
         let metal = std::env::var("INFR_METAL").is_ok();
-        let loaded = infr_llama::CpuModel::load(&gguf, tok.as_deref())?;
+        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
         Box::new(if cpu {
             infr_llama::model::DiffusionGemmaChat::new_cpu(loaded)
         } else if metal {
@@ -1919,16 +1919,16 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         #[cfg(not(target_os = "macos"))]
         {
             Box::new(infr_llama::model::CpuDenseChat::new_metal(
-                infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+                infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
             ))
         }
     } else if std::env::var("INFR_CPU").is_ok() {
         Box::new(infr_llama::model::CpuDenseChat::new(
-            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+            infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
         ))
     } else {
         Box::new(infr_llama::model::DenseSeamChat::new(
-            infr_llama::CpuModel::load(&gguf, tok.as_deref())?,
+            infr_llama::SeamModel::load(&gguf, tok.as_deref())?,
         ))
     };
     {

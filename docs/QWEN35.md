@@ -89,7 +89,7 @@ attn_output.
 ## Status
 
 - **UNIFIED (2026-07-04, phases 1–3 of the seam merge): qwen35 runs on the
-  SHARED transformer runner** (`cpu_backend::generate_dense_backend`) via
+  SHARED transformer runner** (`seam::generate_dense_backend`) via
   `MixerW::DeltaNet` — same run/serve/bench paths, SlotPool multi-slot serve,
   and every shared-path optimization (mrow GEMV, small-m attention tiers).
   Token-identical to the old seam (`unified_qwen35_*` tests), and FASTER: pp512

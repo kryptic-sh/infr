@@ -145,7 +145,7 @@ greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
 ```
 server   axum + SSE  ->  OpenAI /v1
 chat     ChatModel        (autoregressive dense/MoE/qwen35; DiffusionGemma's block-diffusion loop)
-runtime  CpuModel          tensors, KV cache, command/descriptor management (the unified runner)
+runtime  SeamModel        tensors, KV cache, command/descriptor management (the unified runner)
 loader   WeightSource     (Gguf; safetensors later)
 compute  Backend          (Vulkan via ash + SPIR-V; reference Metal via MSL; CUDA later)
 ```

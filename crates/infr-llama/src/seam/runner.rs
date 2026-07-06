@@ -1,7 +1,7 @@
 //! Backend-generic dense decode runner: builds the agnostic decode [`Graph`] per token/batch and
 //! drives it through a [`Backend`]. This is the giant `generate_dense_backend` — the single
 //! forward every entry point in `super` (CPU/Vulkan/Metal, one-shot/session/verify/denoise) funnels
-//! through. Pure-move split of `cpu_backend.rs` — see `super` for the module overview.
+//! through. Pure-move split of `seam.rs` — see `super` for the module overview.
 use super::sc::{build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, SelfCondWeights};
 use super::weights::{AttnW, DeltaW, FfnW, LayerW, MixerW, SeamKv, SeamWeights};
 use super::{common_prefix_len, e2b_ipl_rows, kv_fmt_bytes, kv_forces_static, BindWeight, WBytes};

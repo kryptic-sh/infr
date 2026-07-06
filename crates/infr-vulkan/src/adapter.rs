@@ -1,6 +1,6 @@
 //! Vulkan adapter for the agnostic `infr_core::Backend` seam: lower a `Graph` of composite ops onto
 //! the existing fused Recorder kernels, recorded into one command buffer. Mirrors the CPU
-//! interpreter (`infr-llama::cpu_backend`) op-for-op, but executes on the GPU — so the SAME model
+//! interpreter (`infr-llama::seam`) op-for-op, but executes on the GPU — so the SAME model
 //! `Graph` runs on either backend. Built incrementally; ops not yet mapped return an error.
 
 use crate::linear::native_dense_supported;
@@ -2553,7 +2553,7 @@ mod tests {
 
     /// DiffusionGemma Phase-B: the FULL in-graph self-conditioning subgraph (softmax → soft-embed
     /// matmul → scale → rmsnorm → gate/up linears → gated-GELU → down linear — the exact op
-    /// sequence `cpu_backend.rs`'s `build` emits for a SC-on denoise step) at small synthetic dims,
+    /// sequence `seam.rs`'s `build` emits for a SC-on denoise step) at small synthetic dims,
     /// compared against a host reference computed against the SAME f16-rounded weights (isolating
     /// the graph WIRING/layout from f16 rounding noise, like `linear_graph_matches_host`). This is
     /// "one SC denoise step" in miniature — the real model's SC block is this identical op
@@ -2566,7 +2566,7 @@ mod tests {
         };
         let (cc, vocab, ne, nff) = (4usize, 512usize, 128usize, 256usize);
         let eps = 1e-6f32;
-        let scale = 1.0f32; // production always premultiplies temp_inv on the host (see cpu_backend.rs)
+        let scale = 1.0f32; // production always premultiplies temp_inv on the host (see seam.rs)
 
         let to_f16 = |v: &[f32]| -> Vec<u8> {
             v.iter()

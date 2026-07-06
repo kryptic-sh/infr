@@ -1,5 +1,5 @@
 //! Phase 3: the entropy-bound block-diffusion decode loop (backend-agnostic — drives either
-//! [`crate::cpu_model::DiffusionGemmaCpuSession`] or its Vulkan twin through the small
+//! [`crate::seam_model::DiffusionGemmaCpuSession`] or its Vulkan twin through the small
 //! [`DiffusionSession`] trait). Ports `diffusion_generate_entropy_bound` + `run_turn`'s block loop
 //! from the oracle reference (`~/Projects/mxaddict/llama.cpp-dg/examples/diffusion/diffusion.cpp`
 //! and `diffusion-cli.cpp`) — see `docs/DIFFUSIONGEMMA.md`'s "Decode loop" section. Line refs in
@@ -11,18 +11,18 @@
 //! output (a 128-expert top-8 MoE model's CPU/Vulkan routing already diverges legitimately), only
 //! the SAME schedule/acceptance/stop semantics under a fixed seed.
 
-use crate::cpu_model::{CpuModel, DiffusionGemmaCpuSession, DiffusionGemmaVulkanSession};
+use crate::seam_model::{DiffusionGemmaCpuSession, DiffusionGemmaVulkanSession, SeamModel};
 use crate::{Config, GenStats};
 use anyhow::Result;
 use rayon::prelude::*;
 
-/// The two DiffusionGemma sessions' shared shape (Phase 2, `cpu_model.rs`): causal prefill of the
+/// The two DiffusionGemma sessions' shared shape (Phase 2, `seam_model.rs`): causal prefill of the
 /// committed prefix, then a canvas denoise forward. One decode loop below drives either backend.
 pub trait DiffusionSession {
-    fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()>;
+    fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()>;
     fn denoise(
         &mut self,
-        model: &CpuModel,
+        model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
@@ -30,12 +30,12 @@ pub trait DiffusionSession {
 }
 
 impl DiffusionSession for DiffusionGemmaCpuSession {
-    fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
+    fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
         DiffusionGemmaCpuSession::prefill(self, model, tokens)
     }
     fn denoise(
         &mut self,
-        model: &CpuModel,
+        model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
@@ -45,12 +45,12 @@ impl DiffusionSession for DiffusionGemmaCpuSession {
 }
 
 impl DiffusionSession for DiffusionGemmaVulkanSession {
-    fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
+    fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
         DiffusionGemmaVulkanSession::prefill(self, model, tokens)
     }
     fn denoise(
         &mut self,
-        model: &CpuModel,
+        model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
@@ -60,18 +60,18 @@ impl DiffusionSession for DiffusionGemmaVulkanSession {
 }
 
 #[cfg(target_os = "macos")]
-impl DiffusionSession for crate::cpu_model::DiffusionGemmaMetalSession {
-    fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
-        crate::cpu_model::DiffusionGemmaMetalSession::prefill(self, model, tokens)
+impl DiffusionSession for crate::seam_model::DiffusionGemmaMetalSession {
+    fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
+        crate::seam_model::DiffusionGemmaMetalSession::prefill(self, model, tokens)
     }
     fn denoise(
         &mut self,
-        model: &CpuModel,
+        model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
     ) -> Result<Vec<f32>> {
-        crate::cpu_model::DiffusionGemmaMetalSession::denoise(
+        crate::seam_model::DiffusionGemmaMetalSession::denoise(
             self,
             model,
             canvas_tokens,
@@ -151,7 +151,7 @@ impl Rng {
 /// `diffusion.cpp:665`).
 fn denoise_block(
     session: &mut impl DiffusionSession,
-    model: &CpuModel,
+    model: &SeamModel,
     canvas_len: usize,
     vocab: usize,
     eb: &EbConfig,
@@ -327,7 +327,7 @@ fn trim_canvas(canvas: &[u32], is_eog: impl Fn(u32) -> bool) -> usize {
 #[allow(clippy::too_many_arguments)]
 pub fn diffusion_generate(
     session: &mut impl DiffusionSession,
-    model: &CpuModel,
+    model: &SeamModel,
     prompt_tokens: &[u32],
     canvas_len: usize,
     vocab: usize,
@@ -397,7 +397,7 @@ pub fn diffusion_generate(
 }
 
 /// Cheap architecture peek (mirrors [`crate::qwen35::is_qwen35`]): open the GGUF and read
-/// `general.architecture` without building a full [`CpuModel`] — lets `infr run`/`serve` pick the
+/// `general.architecture` without building a full [`SeamModel`] — lets `infr run`/`serve` pick the
 /// diffusion decode loop (and its own default token budget) before paying a full model load.
 pub fn is_diffusion_gemma(path: &std::path::Path) -> bool {
     use infr_core::WeightSource;

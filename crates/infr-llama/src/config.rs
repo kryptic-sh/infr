@@ -103,7 +103,7 @@ pub struct Config {
     /// back to 8192 if the GGUF omits it.
     pub n_ctx_train: usize,
     /// qwen35 (Qwen3.5/3.6 gated-DeltaNet hybrid): `true` only for `arch == "qwen35"`. Gates every
-    /// field below plus the DeltaNet mixer branch in `cpu_backend`'s layer loop. In production this
+    /// field below plus the DeltaNet mixer branch in `seam`'s layer loop. In production this
     /// `Config` is never built for a qwen35 GGUF (the runners route it to `crate::qwen35::SeamModel`
     /// first) — this flag exists so the shared transformer skeleton CAN run it (tests only, so far).
     pub qwen35: bool,
@@ -240,7 +240,7 @@ impl Config {
 
     /// Parse the model config purely from GGUF metadata + tensor shapes — no GPU/Vulkan, no weight
     /// upload. The single source of truth for both the GPU loader ([`Llama::load_opt`]) and the
-    /// CPU-only loader ([`CpuModel::load`]). `eos_ids` holds only the GGUF `eos` here; chat-end
+    /// CPU-only loader ([`SeamModel::load`]). `eos_ids` holds only the GGUF `eos` here; chat-end
     /// markers (`<|im_end|>` …) are appended once a tokenizer exists (see [`add_chat_eos`]).
     pub fn from_gguf(g: &Gguf) -> Result<Config> {
         let arch = g
@@ -288,7 +288,7 @@ impl Config {
         // (`llama.cpp/src/models/qwen35.cpp::load_arch_hparams`). The confirmed 4B MTP GGUF sets
         // `block_count=33`/`nextn_predict_layers=1`: the trunk is 32 layers and `blk.32` is the
         // MTP head — without this split, `n_layer` below would include it and the trunk layer
-        // loop (`cpu_backend.rs`'s `wload`) would misclassify `blk.32` as a gated-DeltaNet layer
+        // loop (`seam.rs`'s `wload`) would misclassify `blk.32` as a gated-DeltaNet layer
         // (`(32+1) % full_attn_interval != 0`) and fail on missing `ssm_*` tensors.
         let n_layer_nextn = meta_u64(g, &mk("nextn_predict_layers")).unwrap_or(0) as usize;
         if n_layer_nextn > 0 && arch != crate::arch::QWEN35 {
@@ -333,7 +333,7 @@ impl Config {
         let n_ff = n_ff_layers.iter().copied().max().unwrap_or(0);
         // diffusion-gemma's MoE shape (128 experts / 8 used, softmax gating, no extra routed-weight
         // scale) is parsed identically to qwen3moe's — only the FFN it feeds differs (dual FFN:
-        // dense ∥ MoE, summed, vs qwen3moe's MoE-only), which is a `cpu_backend` graph-build detail.
+        // dense ∥ MoE, summed, vs qwen3moe's MoE-only), which is a `seam` graph-build detail.
         let moe = if arch == crate::arch::QWEN3_MOE || diffusion_gemma {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =

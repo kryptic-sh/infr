@@ -1,5 +1,5 @@
 //! Per-layer weight handles + the persistent seam session state ([`SeamKv`]/[`SeamWeights`]).
-//! Pure-move split of `cpu_backend.rs` — see `super` for the module overview.
+//! Pure-move split of `seam.rs` — see `super` for the module overview.
 use super::sc::{DenoiseCache, SelfCondWeights};
 use super::{common_prefix_len, kv_fmt_bytes};
 use crate::Config;

@@ -10,9 +10,9 @@
 
 pub mod arch;
 mod config;
-pub mod cpu_backend;
-mod cpu_model;
-pub use cpu_model::CpuModel;
+pub mod seam;
+mod seam_model;
+pub use seam_model::SeamModel;
 pub mod diffusion;
 mod util;
 pub use util::gpu_available;

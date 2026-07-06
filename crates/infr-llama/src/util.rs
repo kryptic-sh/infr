@@ -17,7 +17,7 @@ pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}
 /// and is gathered + dequanted per token at forward time (mirrors llama.cpp, which classifies
 /// input embeddings as CPU-resident: "very little benefit to offloading the input layer"). The
 /// `per_layer_model_proj` / `per_layer_proj_norm` weights are NOT loaded here — they're small
-/// enough to native-upload to VRAM like any other weight (see `wload`/`wpush` in `cpu_backend.rs`)
+/// enough to native-upload to VRAM like any other weight (see `wload`/`wpush` in `seam.rs`)
 /// and the projection + RMSNorm now run as GPU graph ops instead of a host GEMV. Shared by the GPU
 /// and CPU loaders.
 pub(crate) struct PerLayerEmbd {

@@ -1,4 +1,4 @@
-//! The GPU-free `CpuModel` for the CPU reference backend (no Vulkan/VRAM; weights streamed
+//! The GPU-free `SeamModel` for the CPU reference backend (no Vulkan/VRAM; weights streamed
 //! from the GGUF mmap at forward time). Split out of `lib.rs` (no logic change).
 use crate::*;
 use anyhow::{anyhow, Result};
@@ -15,7 +15,7 @@ use tokenizers::Tokenizer;
 /// no weight upload: the projection weights are streamed straight from the kept-open GGUF mmap at
 /// forward time. Dense Qwen3/Llama, Gemma 3, Gemma 4 (dense + E2B), and qwen3moe; for qwen35 use
 /// [`crate::qwen35::generate_cpu`].
-pub struct CpuModel {
+pub struct SeamModel {
     gguf: Gguf,
     cfg: Config,
     token_embd: Vec<f32>,
@@ -24,7 +24,7 @@ pub struct CpuModel {
 }
 
 /// The conversation SLOTS a persistent GPU seam session owns: up to `INFR_KV_SLOTS` (default 4)
-/// [`crate::cpu_backend::SeamKv`]s — each a KV cache + the token ids materialized in it, all
+/// [`crate::seam::SeamKv`]s — each a KV cache + the token ids materialized in it, all
 /// sharing one weight upload (`Arc<SeamWeights>`). Per request the best-prefix slot is picked: a
 /// prompt that EXTENDS a slot's cache continues it (the classic next-turn suffix prefill); a
 /// prompt that diverges early (a different conversation) forks a fresh slot and SEEDS it with the
@@ -34,12 +34,12 @@ pub struct CpuModel {
 /// `&dyn Backend` (`copy_buffer` is the seeding primitive), so the Vulkan and Metal sessions
 /// share this policy verbatim.
 struct SlotPool {
-    slots: Vec<Option<crate::cpu_backend::SeamKv>>,
+    slots: Vec<Option<crate::seam::SeamKv>>,
     last_used: Vec<u64>,
     tick: u64,
 }
 
-/// A persistent Vulkan seam session (see [`CpuModel::vulkan_session`]): owns the backend and the
+/// A persistent Vulkan seam session (see [`SeamModel::vulkan_session`]): owns the backend and the
 /// conversation [`SlotPool`].
 pub struct DenseVulkanSession {
     vk: infr_vulkan::VulkanBackend,
@@ -75,7 +75,7 @@ impl SlotPool {
     /// The single-conversation slot (the bench/spec drivers, which manage one token stream and
     /// never contend): slot 0, created empty on first use.
     #[cfg(target_os = "macos")]
-    fn single(&mut self) -> &mut Option<crate::cpu_backend::SeamKv> {
+    fn single(&mut self) -> &mut Option<crate::seam::SeamKv> {
         if self.slots.is_empty() {
             self.slots.push(None);
             self.last_used.push(self.tick);
@@ -89,7 +89,7 @@ impl SlotPool {
     /// This best-prefix choice is prefix-OPTIMAL for a real per-position KV cache (dense/
     /// attention arches): the picked slot always has the longest reusable prefix. For qwen35
     /// (gated-DeltaNet: an append-only recurrent summary, not a per-position cache — see the
-    /// no-rewind rule in `cpu_backend::generate_dense_backend`) a `prefix_score` match is only
+    /// no-rewind rule in `seam::generate_dense_backend`) a `prefix_score` match is only
     /// scored on shared TOKENS, not on whether the state can actually rewind to it — so the pick
     /// here is merely CORRECT, not necessarily optimal: the runner independently re-checks EXACT
     /// extension (`prompt` extends `cached` verbatim) before reusing the slot's state, and
@@ -114,9 +114,8 @@ impl SlotPool {
             self.last_used.push(self.tick);
             return Ok(0);
         }
-        let score = |st: &Option<crate::cpu_backend::SeamKv>| {
-            st.as_ref().map_or(0, |s| s.prefix_score(prompt))
-        };
+        let score =
+            |st: &Option<crate::seam::SeamKv>| st.as_ref().map_or(0, |s| s.prefix_score(prompt));
         // A slot whose cache the prompt EXTENDS (or equals) is this conversation continuing.
         if let Some(i) = (0..self.slots.len()).find(|&i| {
             self.slots[i].as_ref().is_some_and(|s| {
@@ -168,7 +167,7 @@ impl SlotPool {
 
 /// A persistent Metal seam session — the Apple-GPU twin of [`DenseVulkanSession`]: owns the
 /// backend and the conversation [`SlotPool`], so every later
-/// [`CpuModel::generate_metal_session`] call prefills only the suffix that differs from its
+/// [`SeamModel::generate_metal_session`] call prefills only the suffix that differs from its
 /// slot's previous turn, and concurrent conversations (serve) each keep their own KV slot off
 /// the one shared weight upload. Slot switches re-record the decode replay tape (its fingerprint
 /// covers the bound KV/IO buffer addresses) — one graph-walk token per switch, never a stale
@@ -189,7 +188,7 @@ impl DenseMetalSession {
     }
 }
 
-impl CpuModel {
+impl SeamModel {
     /// Load a model for CPU inference without touching the GPU. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
     pub fn load(gguf_path: &Path, tokenizer_path: Option<&Path>) -> Result<Self> {
@@ -256,7 +255,7 @@ impl CpuModel {
         let mut printed = 0usize;
         let slot = session.pool.pick(&session.vk, &self.cfg, &prompt_tokens)?;
         let max_ctx = session.max_ctx;
-        let (_generated, stats) = crate::cpu_backend::generate_dense_gpu_session(
+        let (_generated, stats) = crate::seam::generate_dense_gpu_session(
             &session.vk,
             &self.gguf,
             &self.cfg,
@@ -323,7 +322,7 @@ impl CpuModel {
     /// specific to diffusion-gemma — works for any arch on this seam — but this is its only
     /// caller today (see `docs/DIFFUSIONGEMMA.md`).
     pub fn prefill_logits_cpu(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        crate::cpu_backend::verify_dense_cpu(
+        crate::seam::verify_dense_cpu(
             &self.gguf,
             &self.cfg,
             &self.token_embd,
@@ -337,7 +336,7 @@ impl CpuModel {
     /// same last-prompt-token row the logits came from — the `h_p` primitive Phase 2's MTP driver
     /// needs, validated here via `lm_head(h) == logits`. Returns `(logits, h)`.
     pub fn prefill_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
-        crate::cpu_backend::verify_dense_cpu_with_h(
+        crate::seam::verify_dense_cpu_with_h(
             &self.gguf,
             &self.cfg,
             &self.token_embd,
@@ -352,7 +351,7 @@ impl CpuModel {
     /// (`docs/MTP.md`'s `process()` hook runs after every target ubatch, not just the sampled row).
     /// Dense non-MoE models only. Returns `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
     pub fn verify_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
-        crate::cpu_backend::verify_rows_cpu_with_h(
+        crate::seam::verify_rows_cpu_with_h(
             &self.gguf,
             &self.cfg,
             &self.token_embd,
@@ -365,7 +364,7 @@ impl CpuModel {
     /// cross-backend parity check.
     pub fn prefill_logits_vulkan(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
-        crate::cpu_backend::verify_dense_vulkan(
+        crate::seam::verify_dense_vulkan(
             &vk,
             &self.gguf,
             &self.cfg,
@@ -428,7 +427,7 @@ impl CpuModel {
     /// directly comparable to `llama-bench -ngl 0`. Dummy tokens — timing is data-independent.
     pub fn bench(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
         let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
-        let (_, stats) = crate::cpu_backend::generate_dense_cpu(
+        let (_, stats) = crate::seam::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
             &self.token_embd,
@@ -452,7 +451,7 @@ impl CpuModel {
             .map_err(|e| anyhow!("encode: {e}"))?;
         let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
-        let (generated, _stats) = crate::cpu_backend::generate_dense_gpu(
+        let (generated, _stats) = crate::seam::generate_dense_gpu(
             &vk,
             &self.gguf,
             &self.cfg,
@@ -487,12 +486,12 @@ impl CpuModel {
         // and the warmup itself overflowed it).
         let want = depth + p_eff.max(1) + g_eff + 16;
         let dummy = |n: usize| -> Vec<u32> { (0..n.max(1)).map(|i| (i % 100) as u32).collect() };
-        let mut state: Option<crate::cpu_backend::SeamKv> = None;
+        let mut state: Option<crate::seam::SeamKv> = None;
         let run = |prompt_len: usize,
                    gen: usize,
-                   state: &mut Option<crate::cpu_backend::SeamKv>|
+                   state: &mut Option<crate::seam::SeamKv>|
          -> Result<crate::GenStats> {
-            let (_, stats) = crate::cpu_backend::generate_dense_gpu_session(
+            let (_, stats) = crate::seam::generate_dense_gpu_session(
                 &vk,
                 &self.gguf,
                 &self.cfg,
@@ -584,7 +583,7 @@ impl CpuModel {
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let slot = session.pool.pick(&session.mtl, &self.cfg, &prompt_tokens)?;
-        let (_generated, stats) = crate::cpu_backend::generate_dense_metal_session(
+        let (_generated, stats) = crate::seam::generate_dense_metal_session(
             &session.mtl,
             &self.gguf,
             &self.cfg,
@@ -619,7 +618,7 @@ impl CpuModel {
         let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let (_generated, stats) = crate::cpu_backend::generate_dense_metal(
+        let (_generated, stats) = crate::seam::generate_dense_metal(
             &mtl,
             &self.gguf,
             &self.cfg,
@@ -647,7 +646,7 @@ impl CpuModel {
     pub fn generate_metal_spec(
         &self,
         session: &mut DenseMetalSession,
-        draft: &CpuModel,
+        draft: &SeamModel,
         draft_session: &mut DenseMetalSession,
         prompt: &str,
         max_new: usize,
@@ -694,7 +693,7 @@ impl CpuModel {
         let t0 = std::time::Instant::now();
         let mut acc_buf: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let (first, _stats) = crate::cpu_backend::generate_dense_metal_session(
+        let (first, _stats) = crate::seam::generate_dense_metal_session(
             &session.mtl,
             &self.gguf,
             &self.cfg,
@@ -740,7 +739,7 @@ impl CpuModel {
             let k_now = (ema.round() as usize).clamp(1, k);
             let budget = k_now.min(max_new - out.len());
             let td = std::time::Instant::now();
-            let (cand, _) = crate::cpu_backend::generate_dense_metal_session(
+            let (cand, _) = crate::seam::generate_dense_metal_session(
                 &draft_session.mtl,
                 &draft.gguf,
                 &draft.cfg,
@@ -762,7 +761,7 @@ impl CpuModel {
             }
             let td = td.elapsed();
             let tv = std::time::Instant::now();
-            let (logits, vstats) = crate::cpu_backend::verify_dense_metal2(
+            let (logits, vstats) = crate::seam::verify_dense_metal2(
                 &session.mtl,
                 &self.gguf,
                 &self.cfg,
@@ -844,7 +843,7 @@ impl CpuModel {
         if let Some(s) = session.pool.single().as_mut() {
             s.reset_tokens();
         }
-        let (_, stats) = crate::cpu_backend::generate_dense_metal_session(
+        let (_, stats) = crate::seam::generate_dense_metal_session(
             &session.mtl,
             &self.gguf,
             &self.cfg,
@@ -895,7 +894,7 @@ impl CpuModel {
         // Stream each generated token: incrementally detokenize and emit the new suffix.
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let (_generated, stats) = crate::cpu_backend::generate_dense_cpu(
+        let (_generated, stats) = crate::seam::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
             &self.token_embd,
@@ -909,29 +908,29 @@ impl CpuModel {
 }
 
 /// A persistent CPU-reference session for DiffusionGemma's two-pass forward (Phase 2 — see
-/// docs/DIFFUSIONGEMMA.md and [`CpuModel::diffusion_gemma_cpu_session`]). Model-independent (like
-/// [`DenseVulkanSession`]/[`DenseMetalSession`]) — `prefill`/`denoise` take the `&CpuModel` per
+/// docs/DIFFUSIONGEMMA.md and [`SeamModel::diffusion_gemma_cpu_session`]). Model-independent (like
+/// [`DenseVulkanSession`]/[`DenseMetalSession`]) — `prefill`/`denoise` take the `&SeamModel` per
 /// call instead of borrowing it at construction, so a [`crate::model::ChatModel`] can hold both an
-/// owned `CpuModel` and a persistent session side by side (Phase 3 — no self-referential borrow).
+/// owned `SeamModel` and a persistent session side by side (Phase 3 — no self-referential borrow).
 pub struct DiffusionGemmaCpuSession {
     be: CpuBackend,
-    state: Option<crate::cpu_backend::SeamKv>,
+    state: Option<crate::seam::SeamKv>,
     max_ctx: usize,
 }
 
-/// [`DiffusionGemmaCpuSession`]'s Vulkan twin (see [`CpuModel::diffusion_gemma_vulkan_session`]).
+/// [`DiffusionGemmaCpuSession`]'s Vulkan twin (see [`SeamModel::diffusion_gemma_vulkan_session`]).
 pub struct DiffusionGemmaVulkanSession {
     be: infr_vulkan::VulkanBackend,
-    state: Option<crate::cpu_backend::SeamKv>,
+    state: Option<crate::seam::SeamKv>,
     max_ctx: usize,
 }
 
 /// [`DiffusionGemmaVulkanSession`]'s Metal twin (Phase D — see
-/// [`CpuModel::diffusion_gemma_metal_session`]).
+/// [`SeamModel::diffusion_gemma_metal_session`]).
 #[cfg(target_os = "macos")]
 pub struct DiffusionGemmaMetalSession {
     be: infr_metal::MetalBackend,
-    state: Option<crate::cpu_backend::SeamKv>,
+    state: Option<crate::seam::SeamKv>,
     max_ctx: usize,
 }
 
@@ -941,12 +940,12 @@ impl DiffusionGemmaCpuSession {
     /// [`denoise`](Self::denoise); a second call with a prompt that EXTENDS the previous one
     /// continues the session (ChatSession-style prefix reuse), matching every other session on
     /// this seam.
-    pub fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
-        crate::cpu_backend::generate_dense_backend(
+    pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
+        crate::seam::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| match tb {
-                crate::cpu_backend::WBytes::Mmap(tb) => Ok((self.be.map_weight(tb), dt)),
-                crate::cpu_backend::WBytes::Owned(v) => {
+                crate::seam::WBytes::Mmap(tb) => Ok((self.be.map_weight(tb), dt)),
+                crate::seam::WBytes::Owned(v) => {
                     let buf = self
                         .be
                         .alloc(v.len().max(1), BufferUsage::Weights)
@@ -984,17 +983,17 @@ impl DiffusionGemmaCpuSession {
     /// ever called — errors instead (an empty prompt, P=0).
     pub fn denoise(
         &mut self,
-        model: &CpuModel,
+        model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
     ) -> Result<Vec<f32>> {
         let mut out_logits = Vec::new();
-        crate::cpu_backend::generate_dense_backend(
+        crate::seam::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| match tb {
-                crate::cpu_backend::WBytes::Mmap(tb) => Ok((self.be.map_weight(tb), dt)),
-                crate::cpu_backend::WBytes::Owned(v) => {
+                crate::seam::WBytes::Mmap(tb) => Ok((self.be.map_weight(tb), dt)),
+                crate::seam::WBytes::Owned(v) => {
                     let buf = self
                         .be
                         .alloc(v.len().max(1), BufferUsage::Weights)
@@ -1018,7 +1017,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
-            Some(crate::cpu_backend::DenoiseReq {
+            Some(crate::seam::DenoiseReq {
                 canvas_tokens,
                 sc_logits,
                 temp_inv,
@@ -1031,8 +1030,8 @@ impl DiffusionGemmaCpuSession {
 
 impl DiffusionGemmaVulkanSession {
     /// [`DiffusionGemmaCpuSession::prefill`]'s Vulkan twin.
-    pub fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
-        crate::cpu_backend::generate_dense_backend(
+    pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
+        crate::seam::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| {
                 let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
@@ -1066,13 +1065,13 @@ impl DiffusionGemmaVulkanSession {
     /// [`DiffusionGemmaCpuSession::denoise`]'s Vulkan twin.
     pub fn denoise(
         &mut self,
-        model: &CpuModel,
+        model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
     ) -> Result<Vec<f32>> {
         let mut out_logits = Vec::new();
-        crate::cpu_backend::generate_dense_backend(
+        crate::seam::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| {
                 let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
@@ -1098,7 +1097,7 @@ impl DiffusionGemmaVulkanSession {
             None,
             None,
             None,
-            Some(crate::cpu_backend::DenoiseReq {
+            Some(crate::seam::DenoiseReq {
                 canvas_tokens,
                 sc_logits,
                 temp_inv,
@@ -1110,17 +1109,17 @@ impl DiffusionGemmaVulkanSession {
 }
 
 /// Phase D: Metal twin of [`DiffusionGemmaVulkanSession`] (see
-/// [`CpuModel::diffusion_gemma_metal_session`]). `generate_dense_backend`'s `denoise_req` branch
+/// [`SeamModel::diffusion_gemma_metal_session`]). `generate_dense_backend`'s `denoise_req` branch
 /// is backend-generic (verified — nothing in it besides the Phase-B `gpu_sc` gate distinguishes
-/// Vulkan, and that gate now includes Metal too, see `cpu_backend.rs`), so this only differs from
+/// Vulkan, and that gate now includes Metal too, see `seam.rs`), so this only differs from
 /// the Vulkan twin in its weight-upload closure: Metal uploads weights in their NATIVE GGUF dtype
 /// with no padding (matching `generate_dense_metal_session`'s closure), unlike Vulkan's
 /// `pad_to_u32_align`.
 #[cfg(target_os = "macos")]
 impl DiffusionGemmaMetalSession {
     /// [`DiffusionGemmaCpuSession::prefill`]'s Metal twin.
-    pub fn prefill(&mut self, model: &CpuModel, tokens: &[u32]) -> Result<()> {
-        crate::cpu_backend::generate_dense_backend(
+    pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
+        crate::seam::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| {
                 let buf = self
@@ -1153,13 +1152,13 @@ impl DiffusionGemmaMetalSession {
     /// [`DiffusionGemmaCpuSession::denoise`]'s Metal twin.
     pub fn denoise(
         &mut self,
-        model: &CpuModel,
+        model: &SeamModel,
         canvas_tokens: &[u32],
         sc_logits: Option<&[f32]>,
         temp_inv: f32,
     ) -> Result<Vec<f32>> {
         let mut out_logits = Vec::new();
-        crate::cpu_backend::generate_dense_backend(
+        crate::seam::generate_dense_backend(
             &self.be,
             &|_name, tb, dt, _n| {
                 let buf = self
@@ -1184,7 +1183,7 @@ impl DiffusionGemmaMetalSession {
             None,
             None,
             None,
-            Some(crate::cpu_backend::DenoiseReq {
+            Some(crate::seam::DenoiseReq {
                 canvas_tokens,
                 sc_logits,
                 temp_inv,

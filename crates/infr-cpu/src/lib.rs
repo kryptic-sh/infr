@@ -1153,6 +1153,21 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                Op::Argmax { x, dst, n } => {
+                    // Greedy device-side sampling: strict `>` keeps the lowest index on ties —
+                    // identical to the host sampler's argmax. The id is stored as a u32
+                    // bit-pattern in the f32 slot (the graph's only tensor dtype).
+                    let xs = &vals[x.0 as usize][..n as usize];
+                    let mut best = f32::NEG_INFINITY;
+                    let mut bi = 0u32;
+                    for (i, &v) in xs.iter().enumerate() {
+                        if v > best {
+                            best = v;
+                            bi = i as u32;
+                        }
+                    }
+                    vals[dst.0 as usize] = vec![f32::from_bits(bi)];
+                }
                 Op::Copy {
                     src,
                     src_off,

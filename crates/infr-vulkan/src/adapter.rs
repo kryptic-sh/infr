@@ -1720,6 +1720,10 @@ fn lower_op(
         Op::Softcap { x, dst, cap, n } => {
             rec.softcap(r(*x)?, r(*dst)?, *cap, *n as usize);
         }
+        Op::Argmax { x, dst, n } => {
+            let part = pooled(pool, be_, "argmax_part", 512 * 4)?;
+            rec.argmax(r(*x)?, pool[&part].as_ref(), r(*dst)?, *n as usize);
+        }
         // MoE FFN (single token): router GEMV → GPU-resident top-k (softmax-renorm, ×scale) →
         // fused multi-slot expert SwiGLU (gate/up share the row, down reads each slot's act) →
         // weighted accumulate. Mirrors the production GPU-resident decode path (transformer.rs)

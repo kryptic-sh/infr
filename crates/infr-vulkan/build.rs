@@ -436,7 +436,9 @@ fn main() {
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),
-        ("argmax", "argmax", &[]),
+        // Two-stage greedy argmax (Op::Argmax): slice partials, then a one-workgroup reduce.
+        ("argmax", "argmax_part", &[]),
+        ("argmax", "argmax", &["-DPASS2"]),
         ("moe_sample", "moe_sample", &[]),
         // DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): fused per-row entropy-bound
         // sampler reduction — argmax/entropy/CDF-sample over [rows, vocab] logits on-GPU.

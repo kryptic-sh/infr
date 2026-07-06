@@ -157,3 +157,32 @@ kernel void qknorm_f32(device const float* x   [[buffer(0)]],
     float s = 1.0f / sqrt(ss + p.eps);
     for (uint i = lane; i < p.head_dim; i += 32u) dst[base + i] = x[base + i] * s * w[i];
 }
+
+// Greedy argmax over `n` logits → token id (one 256-thread threadgroup, strided scan +
+// threadgroup tree-reduce). Strict > keeps the lowest index on ties, matching the host argmax
+// (same contract as the Vulkan argmax.comp). The id is written as a u32 bit-pattern into the
+// f32 output slot — greedy decode reads back 4 bytes instead of the [vocab] logits.
+struct ArgmaxParams { uint n; };
+kernel void argmax_f32(device const float* logits [[buffer(0)]],
+                       device uint*        out_id [[buffer(1)]],
+                       constant ArgmaxParams& p   [[buffer(2)]],
+                       uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    float best = -1e30f;
+    uint bi = 0u;
+    for (uint i = t; i < p.n; i += 256u) {
+        if (logits[i] > best) { best = logits[i]; bi = i; }
+    }
+    sval[t] = best;
+    sidx[t] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s /= 2u) {
+        if (t < s && sval[t + s] > sval[t]) {
+            sval[t] = sval[t + s];
+            sidx[t] = sidx[t + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t == 0u) { out_id[0] = sidx[0]; }
+}

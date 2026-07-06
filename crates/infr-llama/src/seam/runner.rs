@@ -42,6 +42,11 @@ pub(super) struct DecodeHandles {
     // download). This is the primitive Phase 2's MTP head needs (`h_p` in `docs/MTP.md`'s forward
     // pseudocode) — Phase 1 only exposes the tap, no head graph reads it yet.
     h_out: Option<TensorId>,
+    // GPU-resident greedy sampling (`gpu_argmax` on `build`): the `Op::Argmax` output — one u32
+    // token id (as an f32-slot bit-pattern). The decode loop reads THIS back (4 bytes) instead of
+    // the `[vocab]` logits. `None` when the build didn't append the op (sampling temp > 0, a
+    // grammar constraint, or a multi-row logits build).
+    tok_id: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
@@ -736,7 +741,8 @@ pub(crate) fn generate_dense_backend(
                  denoise: bool,
                  gpu_sc: Option<bool>,
                  dyn_sc_scale: bool,
-                 h_tap: bool|
+                 h_tap: bool,
+                 gpu_argmax: bool|
      -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
         let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
@@ -2166,6 +2172,20 @@ pub(crate) fn generate_dense_backend(
                 n: (c.vocab * logits_rows) as u32,
             });
         }
+        // GPU-resident greedy sampling: argmax the logits ON the device so only the 4-byte token
+        // id crosses back to the host (the [vocab] logits stay in VRAM). Appended last so it
+        // reads the final (softcapped) logits.
+        let tok_id = if gpu_argmax && logits_rows == 1 {
+            let tid = g.output(f32d(1));
+            g.push(Op::Argmax {
+                x: logits,
+                dst: tid,
+                n: c.vocab as u32,
+            });
+            Some(tid)
+        } else {
+            None
+        };
         (
             g,
             DecodeHandles {
@@ -2178,6 +2198,7 @@ pub(crate) fn generate_dense_backend(
                 temp_inv: temp_inv_id,
                 logits,
                 h_out,
+                tok_id,
                 k_cache,
                 v_cache,
                 weights,
@@ -2377,6 +2398,7 @@ pub(crate) fn generate_dense_backend(
                 if gpu_sc { Some(plan_sc) } else { None },
                 dyn_sc,
                 false, // MTP h-tap: diffusion-gemma denoise never taps
+                false, // gpu_argmax: denoise samples via the EB reducer, not Op::Argmax
             );
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
             let hidden_buf = be
@@ -2649,7 +2671,7 @@ pub(crate) fn generate_dense_backend(
         let time_verify = std::env::var("INFR_MTP_TIME").is_ok();
         let full_reprefill = start == 0 && m > 1;
         let t_vbuild0 = std::time::Instant::now();
-        let (vg, vh) = build(m, start, m, false, None, false, want_h);
+        let (vg, vh) = build(m, start, m, false, None, false, want_h, false);
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
         let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
@@ -2721,6 +2743,17 @@ pub(crate) fn generate_dense_backend(
     // golden/parity tests pin INFR_TEMP=0 or leave it unset).
     let sampler = crate::sampling::Sampler::from_env();
     let mut rng = crate::sampling::seed_rng();
+    // GPU-resident greedy sampling (`Op::Argmax` appended to the decode graph): only the 4-byte
+    // token id is read back per step — the [vocab] logits stay in VRAM (downloaded only for the
+    // one-time `logits_out` hook). Grammar-constrained decodes need host logits every step
+    // (llguidance masking) and temperature sampling still draws host-side, so both keep the full
+    // download. INFR_NO_GPU_ARGMAX forces the host path (A/B).
+    let gpu_argmax = (sampler.temp <= 0.0 || sampler.top_k == 1)
+        && constraint.is_none()
+        && std::env::var("INFR_NO_GPU_ARGMAX").is_err();
+    let tok_id_buf = be
+        .alloc(4, BufferUsage::Readback)
+        .map_err(|e| anyhow!("{e}"))?;
     let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
     let mut out = Vec::new();
     let mut cur = prompt.to_vec();
@@ -2826,7 +2859,7 @@ pub(crate) fn generate_dense_backend(
             // here yet. The MTP catch-up driver needs `h` for EVERY prefill row (not just chunk
             // tails); wiring that requires this path to also carry `logits_rows == pf_m` on
             // demand, which Phase 2 will add alongside the actual head forward.
-            let (pf_g, pf_h) = build(pf_m, cstart, 1, false, None, false, false);
+            let (pf_g, pf_h) = build(pf_m, cstart, 1, false, None, false, false, false);
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
             let t_compile = pf_t0.elapsed();
@@ -2917,7 +2950,7 @@ pub(crate) fn generate_dense_backend(
         // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
         && h_out.is_none();
     let ro = if dyn_replay {
-        let (g, h) = build(1, 0, 1, false, None, false, false);
+        let (g, h) = build(1, 0, 1, false, None, false, false, gpu_argmax);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         b.bind(h.hidden, hidden_buf.as_ref());
@@ -2936,6 +2969,9 @@ pub(crate) fn generate_dense_backend(
             b.bind(*wid, wbufs[i].as_ref());
         }
         b.bind(h.logits, logits_buf.as_ref());
+        if let Some(tid) = h.tok_id {
+            b.bind(tid, tok_id_buf.as_ref());
+        }
         Some((plan, b))
     } else {
         None
@@ -2996,7 +3032,7 @@ pub(crate) fn generate_dense_backend(
             be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
         } else {
-            let (g, h) = build(1, pos, 1, false, None, false, want_h);
+            let (g, h) = build(1, pos, 1, false, None, false, want_h, gpu_argmax);
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();
             b.bind(h.hidden, hidden_buf.as_ref());
@@ -3015,6 +3051,12 @@ pub(crate) fn generate_dense_backend(
                 b.bind(*wid, wbufs[i].as_ref());
             }
             b.bind(h.logits, logits_buf.as_ref());
+            if let Some(tid) = h.tok_id {
+                b.bind(tid, tok_id_buf.as_ref());
+            }
+            if let Some(tid) = h.tok_id {
+                b.bind(tid, tok_id_buf.as_ref());
+            }
             if let (Some(ho), Some(hb)) = (h.h_out, &h_tap_buf) {
                 b.bind(ho, hb.as_ref());
             }
@@ -3029,8 +3071,12 @@ pub(crate) fn generate_dense_backend(
         }
 
         if is_decode && at_frontier {
-            be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
-                .map_err(|e| anyhow!("{e}"))?;
+            // GPU-argmax path: skip the [vocab] logits download entirely — the sampled id is
+            // read below (4 bytes). The one-time `logits_out` hook still wants the full row.
+            if !gpu_argmax || logits_out.is_some() {
+                be.download(logits_buf.as_ref(), bytemuck::cast_slice_mut(&mut logits))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
             // Phase-1 DiffusionGemma validation hook (see the param doc): this is the FIRST
             // is_decode row — the causal prefill's last-token logits — captured before sampling
             // touches `logits` (grammar-constrained steps overwrite it in place below).
@@ -3063,7 +3109,15 @@ pub(crate) fn generate_dense_backend(
                     break;
                 }
             } else {
-                let next = crate::sampling::sample_logits(&logits, sampler, &mut rng);
+                let next = if gpu_argmax {
+                    // Device-side greedy argmax (Op::Argmax): read back the 4-byte id.
+                    let mut idb = [0u8; 4];
+                    be.download(tok_id_buf.as_ref(), &mut idb)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    u32::from_le_bytes(idb)
+                } else {
+                    crate::sampling::sample_logits(&logits, sampler, &mut rng)
+                };
                 let is_eos = !ignore_eos && (c.eos_ids.contains(&next) || next == c.eos);
                 out.push(next);
                 decode_t += step_t0.elapsed();

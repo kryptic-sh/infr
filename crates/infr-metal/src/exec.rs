@@ -341,6 +341,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Scale { .. } => "Scale",
         Op::MulVec { .. } => "MulVec",
         Op::Softcap { .. } => "Softcap",
+        Op::Argmax { .. } => "Argmax",
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
@@ -1991,6 +1992,16 @@ impl MetalBackend {
                 let mut p = cap.to_ne_bytes().to_vec();
                 p.extend_from_slice(&(n as u32).to_ne_bytes());
                 self.encode(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, n);
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::Argmax { x, dst, n } => {
+                // Greedy device-side sampling: one 256-thread threadgroup, the token id (u32
+                // bit-pattern in the f32 slot) is the only readback greedy decode needs.
+                let bx = self.ensure_device(r, x);
+                let bd = self.dev_dst(r, dst, 1);
+                let pso = self.pipelines.get("argmax_f32")?;
+                let p = (*n).to_ne_bytes().to_vec();
+                self.encode_tg(r, &pso, &[bx.as_ref(), bd.as_ref()], &p, 256, 256);
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::GatedAct {

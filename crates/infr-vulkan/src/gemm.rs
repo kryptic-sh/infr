@@ -259,7 +259,13 @@ pub(crate) fn moe_topk_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// SPIR-V for the greedy argmax (vocab logits → token id).
+/// SPIR-V for the greedy-argmax slice pass (256 workgroups → 256 (val, idx) partials).
+pub(crate) fn argmax_part_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax_part.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the greedy-argmax reduce pass (256 partials → token id).
 pub(crate) fn argmax_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();

@@ -3269,13 +3269,26 @@ impl<'a> Recorder<'a> {
 
     /// Greedy argmax over `n` logits → token id (u32) in `out_id[0]`. One workgroup; lets greedy
     /// decode read back a 4-byte token instead of the whole vocab logits.
-    pub fn argmax(&self, logits: &dyn Buffer, out_id: &dyn Buffer, n: usize) {
-        let k = self.be.kernel("argmax", crate::gemm::argmax_spv(), 2, 4);
+    pub fn argmax(&self, logits: &dyn Buffer, part: &dyn Buffer, out_id: &dyn Buffer, n: usize) {
+        // Two-stage (see argmax.comp): 256 slice partials in parallel across the GPU, then a
+        // one-workgroup reduce. `part` = 512 f32 scratch (vals + idx bit-patterns).
+        self.stamp("argmax");
+        let k1 = self
+            .be
+            .kernel("argmax_part", crate::gemm::argmax_part_spv(), 2, 4);
         self.dispatch(
-            k,
-            &[Self::vkb(logits), Self::vkb(out_id)],
+            k1,
+            &[Self::vkb(logits), Self::vkb(part)],
             1,
             &(n as u32).to_ne_bytes(),
+            256,
+        );
+        let k2 = self.be.kernel("argmax", crate::gemm::argmax_spv(), 2, 4);
+        self.dispatch(
+            k2,
+            &[Self::vkb(part), Self::vkb(out_id)],
+            1,
+            &256u32.to_ne_bytes(),
             1,
         );
     }

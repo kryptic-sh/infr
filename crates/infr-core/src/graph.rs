@@ -266,6 +266,11 @@ pub enum Op {
         cap: f32,
         n: u32,
     },
+    /// `dst[0] = argmax(x[0..n])` as a u32 bit-pattern in an f32 tensor slot. Greedy sampling on
+    /// the device: the generated token id is the ONLY thing that crosses back to the host
+    /// (4 bytes), not the `[vocab]` logits. Strict `>` keeps the lowest index on ties, matching
+    /// the host-side sampler.
+    Argmax { x: TensorId, dst: TensorId, n: u32 },
     /// Copy `n` elements `src[src_off..] -> dst[dst_off..]` (extract last row, gather a slice).
     Copy {
         src: TensorId,
@@ -392,6 +397,7 @@ impl Op {
             Op::Scale { .. } => "Scale",
             Op::MulVec { .. } => "MulVec",
             Op::Softcap { .. } => "Softcap",
+            Op::Argmax { .. } => "Argmax",
             Op::Copy { .. } => "Copy",
             Op::CopyStrided { .. } => "CopyStrided",
             Op::MoeFfn { .. } => "MoeFfn",

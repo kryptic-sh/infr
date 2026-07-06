@@ -882,6 +882,207 @@ fn linear_woff_iq4xs_gemv() {
     );
 }
 
+// IQ2_XXS (2.06 bpw codebook): block = [f16 d][64 B qs], 66 B / 256 elems. Random qs bytes are
+// valid — grid indices are any byte (grid has 256 entries), sign indices are 7-bit (<128). The
+// native GEMV/RT/cmm/hmm decode must match `dequant_block`'s IQ2XXS_GRID lookup bit-for-bit.
+fn synth_iq2xxs(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0);
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 66];
+        // IQ2_XXS carries an extra per-sub-block scale up to (0.5 + 15) * 0.25 = 3.875, so a small
+        // d keeps synthetic weight magnitudes realistic (≈ IQ4_XS's), testing the decode rather
+        // than f32 accumulation/cancellation limits at pathologically large values.
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.015).to_le_bytes());
+        blk[2..66].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 64));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq2xxs_matches_dequant_reference() {
+    // f32 routes: GEMV (m=1) and RT (m=2, out_f%64!=0). 5e-3: the decode is bit-exact vs
+    // dequant_block (verified by inspection), but IQ2_XXS's signed grid values cancel heavily in
+    // the dot product, so the f32 kernel (16-lane tree reduction) reassociates away from
+    // ref_linear's sequential f32 sum more than the denser K-quants do — the benign class the
+    // deep-k 2.5e-3 tolerances already document.
+    for (m, in_f, out_f) in [(1usize, 256usize, 96usize), (2, 256, 96)] {
+        check_quant_linear_parity_tol(
+            DType::Iq2Xxs,
+            synth_iq2xxs(out_f * in_f, 210),
+            m,
+            in_f,
+            out_f,
+            5e-3,
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq2xxs_gemm_matches_dequant_reference() {
+    // f16 routes: cmm (m=4, out_f%64==0) and hmm (m=18). half_ops mirrors the kernel's f16 tile
+    // rounding into the reference, so this checks the decode + tiling, not f16 precision.
+    for (m, in_f, out_f) in [(4usize, 512usize, 128usize), (18, 512, 128)] {
+        check_quant_linear_parity_impl(
+            DType::Iq2Xxs,
+            synth_iq2xxs(out_f * in_f, 211),
+            m,
+            in_f,
+            out_f,
+            2.5e-3,
+            true,
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_iq2xxs_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    check_linear_woff(
+        DType::Iq2Xxs,
+        synth_iq2xxs(256 * in_f, 211),
+        1,
+        in_f,
+        &slices,
+        false,
+        1e-3,
+    );
+}
+
+// IQ3_XXS (3.06 bpw codebook): block = [f16 d][64 B grid indices][32 B scales_and_signs], 98 B /
+// 256 elems. Random bytes are valid (indices are any byte, sign indices 7-bit). Small d keeps
+// magnitudes realistic — IQ3_XXS's scale reaches (0.5 + 15) * 0.5 = 7.75.
+fn synth_iq3xxs(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0);
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 98];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.008).to_le_bytes());
+        blk[2..98].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 96));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq3xxs_matches_dequant_reference() {
+    for (m, in_f, out_f) in [(1usize, 256usize, 96usize), (2, 256, 96)] {
+        check_quant_linear_parity_tol(
+            DType::Iq3Xxs,
+            synth_iq3xxs(out_f * in_f, 310),
+            m,
+            in_f,
+            out_f,
+            5e-3,
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq3xxs_gemm_matches_dequant_reference() {
+    for (m, in_f, out_f) in [(4usize, 512usize, 128usize), (18, 512, 128)] {
+        check_quant_linear_parity_impl(
+            DType::Iq3Xxs,
+            synth_iq3xxs(out_f * in_f, 311),
+            m,
+            in_f,
+            out_f,
+            2.5e-3,
+            true,
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_iq3xxs_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    check_linear_woff(
+        DType::Iq3Xxs,
+        synth_iq3xxs(256 * in_f, 312),
+        1,
+        in_f,
+        &slices,
+        false,
+        1e-3,
+    );
+}
+
+// IQ2_XS (74 B), IQ2_S (82 B), IQ3_S (110 B) — random bytes are valid quant blocks (grid indices
+// stay in range, sign indices are 7-bit / per-entry bytes). Small d keeps synthetic magnitudes
+// realistic (IQ3_S's scale reaches d*(1 + 2*15) = 31*d, so it needs the smallest d).
+fn synth_iq_block(n_elem: usize, seed: u32, bpb: usize, d: f32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0);
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; bpb];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        blk[2..bpb].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, bpb - 2));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+fn iq_parity_suite(dtype: DType, bpb: usize, d: f32, seed: u32) {
+    // f32 routes: GEMV (m=1), RT (m=2, out_f%64!=0). 5e-3 for the signed-codebook reassociation.
+    for (m, in_f, out_f) in [(1usize, 256usize, 96usize), (2, 256, 96)] {
+        check_quant_linear_parity_tol(
+            dtype,
+            synth_iq_block(out_f * in_f, seed, bpb, d),
+            m,
+            in_f,
+            out_f,
+            5e-3,
+        );
+    }
+    // f16 routes: cmm (m=4), hmm (m=18), half_ops mirrors the kernel's f16 tile rounding.
+    for (m, in_f, out_f) in [(4usize, 512usize, 128usize), (18, 512, 128)] {
+        check_quant_linear_parity_impl(
+            dtype,
+            synth_iq_block(out_f * in_f, seed + 1, bpb, d),
+            m,
+            in_f,
+            out_f,
+            2.5e-3,
+            true,
+        );
+    }
+    // w_off (fused-QKV slices) through the GEMV.
+    check_linear_woff(
+        dtype,
+        synth_iq_block(256 * 256, seed + 2, bpb, d),
+        1,
+        256,
+        &[128usize, 64, 64],
+        false,
+        1e-3,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq2xs_matches_dequant_reference() {
+    iq_parity_suite(DType::Iq2Xs, 74, 0.015, 410);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq2s_matches_dequant_reference() {
+    iq_parity_suite(DType::Iq2S, 82, 0.015, 420);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq3s_matches_dequant_reference() {
+    iq_parity_suite(DType::Iq3S, 110, 0.002, 430);
+}
+
 // K-quants are the formats real checkpoints actually ship. Exercise the Metal dequant path
 // (`weight_buf` → `dequant_block`) for Q4_K and Q6_K, same dequant-reference comparison as Q8_0.
 #[test]

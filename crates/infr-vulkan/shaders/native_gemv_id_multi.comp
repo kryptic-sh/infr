@@ -5,6 +5,14 @@
 // the expert is ids[slot], weight base = ids[slot]*stride + o*in_f. `x_per_slot` selects shared input
 // (gate/up read the single ffn-normed row) vs per-slot input (down reads each expert's activation).
 // Output y is [n_used, out_f]. Same cooperative-over-K dequant as native_gemv (-DFMT_* per format).
+//
+// Small-batch MoE fast path (Vulkan pp4@d4096 perf slice): the caller can widen this to `rows`
+// tokens in ONE dispatch by treating `ids`/`wts`/`y` as `[rows, n_used, ...]` flat and dispatching
+// `rows*n_used*out_f` workgroups — `slot` below is really a flat `(row, slot)` index (`slot_global`)
+// and gets split back into `row`/`slot` using `pc.n_used` (the per-row expert count); no separate
+// `rows` push constant is needed since the shader never needs the row COUNT, only the per-row
+// stride (`pc.n_used`). `rows == 1` (decode) reduces to the original single-token addressing exactly
+// (row is always 0). See `Op::MoeFfn`'s small-m branch in `adapter.rs`.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC { uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; } pc;
 layout(binding = 0) readonly buffer WB { uint nw[]; };
@@ -26,11 +34,12 @@ float dqsub(uint gstart, uint xoff) {
 
 void main() {
     uint unit = gl_WorkGroupID.x;
-    uint slot = unit / pc.out_f;
-    uint o = unit - slot * pc.out_f;
+    uint slot_global = unit / pc.out_f; // (row, slot) flattened — see the small-batch note above
+    uint o = unit - slot_global * pc.out_f;
+    uint row = slot_global / pc.n_used;
     uint t = gl_LocalInvocationID.x;
-    uint wbase = ids[slot] * pc.stride + o * pc.in_f;
-    uint xbase = (pc.x_per_slot != 0u ? slot * pc.in_f : 0u);
+    uint wbase = ids[slot_global] * pc.stride + o * pc.in_f;
+    uint xbase = (pc.x_per_slot != 0u ? slot_global * pc.in_f : row * pc.in_f);
     uint nsub = pc.in_f / 32u;
     float acc = 0.0;
     for (uint s = t; s < nsub; s += 64u) {

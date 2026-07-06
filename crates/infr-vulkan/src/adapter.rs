@@ -98,6 +98,44 @@ fn is_kv_prepass(dt: infr_core::DType) -> bool {
     is_kv_quant(dt) || is_kv_dense_alt(dt) || is_turbo(dt)
 }
 
+/// `Op::MoeFfn` small-m fast-path threshold: at or below this many rows (tokens in one forward),
+/// use the per-active-expert id-indexed GEMV path instead of the batched whole-bank-streaming GEMM
+/// (see the two paths' docs at the `Op::MoeFfn` match arm).
+///
+/// Measured on Qwen3-30B-A3B-Q4_K_M / RDNA3 (7900 XTX), forcing each path via `INFR_MOE_SMALL_M`
+/// (`=64` / `=0`) at `-d 4096` so both sides run the SAME row count (small path t/s vs batched
+/// path t/s):
+///
+/// | rows (`-p`) |    small |  batched | small path wins by |
+/// |------------:|---------:|---------:|--------------------|
+/// |           2 |  114.4   |   72.7   | +57%                |
+/// |           4 |  158.1   |  125.0   | +26%                |
+/// |           8 |  224.4   |  189.6   | +18%                |
+/// |          16 |  275.8   |  286.3   | -4% (batched ahead) |
+/// |          32 |  326.0   |  414.0   | -21% (batched ahead)|
+/// |          64 |  438.8   |  839.4   | -48% (batched ahead)|
+///
+/// The crossover sits between rows=8 and rows=16 (batched amortizes its per-active-expert weight
+/// read across more of the ~n_used·rows assignments sharing an expert as rows grows; the small
+/// path re-reads a shared expert's weight once per occurrence, so it degrades faster). `8` sits
+/// right at the edge of the small path's win region with headroom to spare.
+///
+/// `INFR_MOE_SMALL_M` overrides the threshold for experimentation, clamped to `MOE_SMALL_M_MAX`:
+/// the small path's GEMV dispatches one workgroup PER (row, slot, out-column) with no row-tile
+/// batching, so at the seam's normal prefill chunk size (`INFR_UBATCH`, 1024 rows by default) an
+/// UNCLAMPED override turns every prefill chunk into a multi-second single dispatch — this isn't
+/// just slow, it trips the amdgpu ring watchdog and device-losts the whole process (reproduced:
+/// `INFR_MOE_SMALL_M=100000` on a 1024-row chunk hangs the GPU; see `runner.rs`'s UBATCH doc for
+/// the same failure class with an unchunked prefill).
+fn moe_small_m_threshold() -> usize {
+    const MOE_SMALL_M_MAX: usize = 64;
+    std::env::var("INFR_MOE_SMALL_M")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+        .min(MOE_SMALL_M_MAX)
+}
+
 fn decode_eligible(graph: &Graph) -> bool {
     // INFR_SEAM_NO_REPLAY forces the static per-execute path (INFR_PROF2 timestamps work there;
     // the replay path can't report them).
@@ -1589,7 +1627,10 @@ fn lower_op(
             // activation kernel — `gelu_mul_fused`/`silu_mul_fused` already implement exactly that
             // split (gate half first, up half second per row), reused unchanged from the per-token
             // path. Split gate/up (qwen3moe): unchanged two-GEMM shape.
-            if rows > 1 {
+            //
+            // Gated on `rows > moe_small_m_threshold()` (not `rows > 1`): tiny prefill chunks (e.g.
+            // `pp4`) take the small-m fast path below instead — see its doc for why.
+            if rows > moe_small_m_threshold() {
                 use infr_core::DType::{Q4K, Q5_0, Q6K, Q8_0};
                 let down_ok = matches!(ddt, Q4K | Q6K | Q8_0 | Q5_0);
                 let act_ok = if *fused_gate_up {
@@ -1825,61 +1866,77 @@ fn lower_op(
                 ]);
                 return Ok(());
             }
-            // Per-execute routing scratch. Local boxes used via `.as_ref()`, then moved into
-            // `transient` at the end of the arm so they outlive `rec.finish()`.
+            // ── SMALL-m fast path (`rows` ≤ `moe_small_m_threshold()`, covering decode's rows==1
+            // AND tiny prefill chunks like `pp4`): the batched path above pays a near-fixed
+            // per-ACTIVE-expert cost — its tiled GEMM streams that expert's FULL weight bank no
+            // matter how few rows use it (inherent to any approach — the weight has to be read
+            // once if the expert is used at all), but ALSO pays quant_q8_gather + bucket
+            // count/scan/scatter and a 64-row-tile GEMM that computes 60+ garbage rows when only
+            // 1-8 are real. For a handful of tokens that overhead dominates. Instead: one dispatch
+            // per stage computes ALL `rows*n_used` (token, expert) pairs' id-indexed GEMVs
+            // directly against the native block format (no int8 quant pass, no bucket sort) —
+            // `linear_native_id_multi`'s `rows` widening (see its doc) flattens `(row, slot)` into
+            // the same indexing the decode path always used for its single token. Trade-off: an
+            // expert used by more than one of the `rows` tokens gets its weight bank re-read once
+            // per occurrence (no shared BM=64-row-tile reuse like the batched path gets), so this
+            // loses once `rows` grows enough for cross-token expert overlap to matter — hence the
+            // threshold (measured; see `moe_small_m_threshold`'s doc). Local boxes used via
+            // `.as_ref()`, then moved into `transient` at the end of the arm so they outlive
+            // `rec.finish()`.
             let al = |n: usize| be_.alloc((n * 4).max(4), BufferUsage::Activations);
-            let logits = al(n_expert)?;
-            let ids = al(n_used)?;
-            let wts = al(n_used)?;
-            // Fused: one [n_used, 2*nff] gate|up buffer (gate half first, up half second per row —
-            // `Op::GatedActFused`'s convention); split: separate [n_used, nff] gate/up buffers.
+            let n_slots = rows * n_used;
+            let logits = al(rows * n_expert)?;
+            let ids = al(n_slots)?;
+            let wts = al(n_slots)?;
+            // Fused: one [n_slots, 2*nff] gate|up buffer (gate half first, up half second per row —
+            // `Op::GatedActFused`'s convention); split: separate [n_slots, nff] gate/up buffers.
             let gubuf = if *fused_gate_up {
-                Some(al(n_used * 2 * nff)?)
+                Some(al(n_slots * 2 * nff)?)
             } else {
                 None
             };
             let gbuf = if *fused_gate_up {
                 None
             } else {
-                Some(al(n_used * nff)?)
+                Some(al(n_slots * nff)?)
             };
             let ubuf = if *fused_gate_up {
                 None
             } else {
-                Some(al(n_used * nff)?)
+                Some(al(n_slots * nff)?)
             };
-            let abuf = al(n_used * nff)?;
-            let ybuf = al(n_used * ne)?;
+            let abuf = al(n_slots * nff)?;
+            let ybuf = al(n_slots * ne)?;
             let xb = r(*x)?;
             // diffusion-gemma's router reads a DIFFERENTLY normalized/scaled row than the experts
             // (see the `Op::MoeFfn` doc); qwen3moe binds the same handle as `x`.
             let rxb = r(*router_x)?;
 
-            // Router logits over all experts.
+            // Router logits over all experts, all `rows` tokens in one dispatch.
             let rdt = graph.desc(*router).dtype;
             let rw = r(*router)?;
             if native_dense_supported(rdt) {
-                rec.linear_native(rdt, rw, rxb, logits.as_ref(), 1, ne, n_expert);
+                rec.linear_native(rdt, rw, rxb, logits.as_ref(), rows, ne, n_expert);
             } else if matches!(rdt, infr_core::DType::F32) {
                 // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its
                 // bytes as f16 garbage and route to arbitrary experts.
-                rec.linear_f32(rw, rxb, logits.as_ref(), 1, ne, n_expert);
+                rec.linear_f32(rw, rxb, logits.as_ref(), rows, ne, n_expert);
             } else {
-                rec.linear(rw, rxb, logits.as_ref(), 1, ne, n_expert);
+                rec.linear(rw, rxb, logits.as_ref(), rows, ne, n_expert);
             }
-            // Softmax-renormalized top-`n_used`, weights pre-scaled by `scale`.
+            // Softmax-renormalized top-`n_used` per token, weights pre-scaled by `scale`.
             rec.moe_topk(
                 logits.as_ref(),
                 ids.as_ref(),
                 wts.as_ref(),
-                1,
+                rows,
                 n_expert,
                 n_used,
                 *scale,
             );
-            let n_act = n_used * nff;
+            let n_act = n_slots * nff;
             if let Some(gubuf) = &gubuf {
-                // Fused per-role expert GEMV: ONE dispatch over the [ne, 2*nff] expert slice.
+                // Fused per-role expert GEMV: ONE dispatch over all rows' [ne, 2*nff] expert slices.
                 rec.linear_native_id_multi(
                     gdt,
                     r(*gate_exps)?,
@@ -1891,13 +1948,14 @@ fn lower_op(
                     gubuf.as_ref(),
                     ne,
                     2 * nff,
+                    rows,
                 );
                 match act {
                     Activation::Silu => {
-                        rec.silu_mul_fused(gubuf.as_ref(), abuf.as_ref(), n_used, nff)
+                        rec.silu_mul_fused(gubuf.as_ref(), abuf.as_ref(), n_slots, nff)
                     }
                     Activation::Gelu => {
-                        rec.gelu_mul_fused(gubuf.as_ref(), abuf.as_ref(), n_used, nff)
+                        rec.gelu_mul_fused(gubuf.as_ref(), abuf.as_ref(), n_slots, nff)
                     }
                     Activation::Sigmoid => {
                         return Err(be(
@@ -1919,6 +1977,7 @@ fn lower_op(
                     gbuf.as_ref(),
                     ne,
                     nff,
+                    rows,
                 );
                 rec.linear_native_id_multi(
                     udt,
@@ -1931,6 +1990,7 @@ fn lower_op(
                     ubuf.as_ref(),
                     ne,
                     nff,
+                    rows,
                 );
                 match act {
                     Activation::Silu => {
@@ -1955,11 +2015,12 @@ fn lower_op(
                 ybuf.as_ref(),
                 nff,
                 ne,
+                rows,
             );
             // `Op::MoeFfn` dst is the pure FFN output (residual Add is a separate op), but
             // moe_accumulate(_scaled) ADDs — zero dst first.
             let dstb = r(*dst)?;
-            rec.zero(dstb, ne);
+            rec.zero(dstb, rows * ne);
             match down_scale {
                 Some(ds) => rec.moe_accumulate_scaled(
                     ybuf.as_ref(),
@@ -1969,8 +2030,9 @@ fn lower_op(
                     dstb,
                     ne,
                     n_used,
+                    rows,
                 ),
-                None => rec.moe_accumulate(ybuf.as_ref(), wts.as_ref(), dstb, ne, n_used),
+                None => rec.moe_accumulate(ybuf.as_ref(), wts.as_ref(), dstb, ne, n_used, rows),
             }
             transient.extend([logits, ids, wts, abuf, ybuf]);
             transient.extend(gubuf);
@@ -3045,9 +3107,15 @@ mod tests {
         out
     }
 
-    /// A one-op `MoeFfn` graph (Q8_0 router + stacked experts) through the seam must match a host
-    /// reference that mirrors the CPU `Op::MoeFfn` interpreter on the SAME q8-rounded weights:
-    /// router softmax → top-`n_used` → per-expert SwiGLU → weighted (×scale) accumulate.
+    /// A one-op `MoeFfn` graph (Q8_0 router + stacked experts, split gate/up, unscaled — qwen3moe's
+    /// exact shape) through the seam must match a host reference that mirrors the CPU `Op::MoeFfn`
+    /// interpreter on the SAME q8-rounded weights: router softmax → top-`n_used` → per-expert
+    /// SwiGLU → weighted (×scale) accumulate. `gate`/`up` are Q8_0 (not Q4_K), so this shape is
+    /// ineligible for the batched path at ANY row count (`matmul_mmq_experts` requires Q4_K
+    /// gate/up) — it only ever exercises the small-m fast path. Runs rows=1 (decode) and rows=4
+    /// (a small prefill chunk, e.g. `pp4`) to cover `linear_native_id_multi`'s multi-row widening
+    /// and (unlike `moe_ffn_batched_fused_scaled_matches_host`, which only exercises the SCALED
+    /// accumulate at multi-row) the plain `moe_accumulate`'s `rows` generalization.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_graph_matches_host() {
@@ -3057,8 +3125,7 @@ mod tests {
         let (ne, n_expert, n_used, nff) = (32usize, 4usize, 2usize, 32usize);
         let scale = 1.3f32;
         let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5; // deterministic weight/act filler
-        let x: Vec<f32> = (0..ne).map(|i| f(i, 0.11) + 0.05).collect();
-        // Distinct per-expert router rows so top-k selection is unambiguous.
+                                                               // Distinct per-expert router rows so top-k selection is unambiguous.
         let router: Vec<f32> = (0..n_expert * ne)
             .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
             .collect();
@@ -3070,89 +3137,96 @@ mod tests {
         let (rd, gd, ud, dd) = (deq_q8(&rq), deq_q8(&gq), deq_q8(&uq), deq_q8(&dq));
         let dot = |w: &[f32], v: &[f32]| w.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
         let silu = |z: f32| z / (1.0 + (-z).exp());
-        // router logits → softmax over all experts
-        let logits: Vec<f32> = (0..n_expert)
-            .map(|e| dot(&rd[e * ne..(e + 1) * ne], &x))
-            .collect();
-        let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
-        let psum: f32 = probs.iter().sum();
-        probs.iter_mut().for_each(|p| *p /= psum);
-        let mut idx: Vec<usize> = (0..n_expert).collect();
-        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-        idx.truncate(n_used);
-        let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
-        let mut want = vec![0f32; ne];
-        for &e in &idx {
-            let gs = e * nff * ne;
-            let ds = e * ne * nff;
-            let actv: Vec<f32> = (0..nff)
-                .map(|j| {
-                    let g = dot(&gd[gs + j * ne..gs + (j + 1) * ne], &x);
-                    let u = dot(&ud[gs + j * ne..gs + (j + 1) * ne], &x);
-                    silu(g) * u
-                })
-                .collect();
-            let w_e = probs[e] / wsum * scale;
-            for (i, wi) in want.iter_mut().enumerate() {
-                *wi += w_e * dot(&dd[ds + i * nff..ds + (i + 1) * nff], &actv);
+
+        for &rows in &[1usize, 4usize] {
+            let x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) + 0.05).collect();
+            let mut want = vec![0f32; rows * ne];
+            for t in 0..rows {
+                let xr = &x[t * ne..(t + 1) * ne];
+                // router logits → softmax over all experts
+                let logits: Vec<f32> = (0..n_expert)
+                    .map(|e| dot(&rd[e * ne..(e + 1) * ne], xr))
+                    .collect();
+                let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+                let psum: f32 = probs.iter().sum();
+                probs.iter_mut().for_each(|p| *p /= psum);
+                let mut idx: Vec<usize> = (0..n_expert).collect();
+                idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                idx.truncate(n_used);
+                let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                for &e in &idx {
+                    let gs = e * nff * ne;
+                    let ds = e * ne * nff;
+                    let actv: Vec<f32> = (0..nff)
+                        .map(|j| {
+                            let g = dot(&gd[gs + j * ne..gs + (j + 1) * ne], xr);
+                            let u = dot(&ud[gs + j * ne..gs + (j + 1) * ne], xr);
+                            silu(g) * u
+                        })
+                        .collect();
+                    let w_e = probs[e] / wsum * scale;
+                    for i in 0..ne {
+                        want[t * ne + i] += w_e * dot(&dd[ds + i * nff..ds + (i + 1) * nff], &actv);
+                    }
+                }
             }
-        }
-        // graph
-        let mut g = Graph::new();
-        let xi = g.input(TensorDesc::new(vec![1, ne], DType::F32));
-        let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
-        let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
-        let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
-        let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q8_0));
-        let yi = g.output(TensorDesc::new(vec![1, ne], DType::F32));
-        g.push(Op::MoeFfn {
-            x: xi,
-            router_x: xi,
-            router: ri,
-            gate_exps: gi,
-            up_exps: ui,
-            down_exps: di,
-            down_scale: None,
-            fused_gate_up: false,
-            dst: yi,
-            ne: ne as u32,
-            n_expert: n_expert as u32,
-            n_used: n_used as u32,
-            n_ff_exp: nff as u32,
-            scale,
-            act: Activation::Silu,
-        });
-        let mk = |bytes: &[u8], usage| {
-            let b = be_.alloc(bytes.len(), usage).unwrap();
-            be_.upload(b.as_ref(), bytes).unwrap();
-            b
-        };
-        let xb = mk(bytemuck::cast_slice(&x), BufferUsage::Activations);
-        let rb = mk(&rq, BufferUsage::Weights);
-        let gb = mk(&gq, BufferUsage::Weights);
-        let ub = mk(&uq, BufferUsage::Weights);
-        let db = mk(&dq, BufferUsage::Weights);
-        let yb = be_.alloc(ne * 4, BufferUsage::Activations).unwrap();
-        let plan = be_.compile(&g).unwrap();
-        let mut bind = Bindings::new();
-        bind.bind(xi, xb.as_ref());
-        bind.bind(ri, rb.as_ref());
-        bind.bind(gi, gb.as_ref());
-        bind.bind(ui, ub.as_ref());
-        bind.bind(di, db.as_ref());
-        bind.bind(yi, yb.as_ref());
-        be_.execute(plan.as_ref(), &bind).unwrap();
-        let mut got = vec![0f32; ne];
-        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
-            .unwrap();
-        for i in 0..ne {
-            assert!(
-                (got[i] - want[i]).abs() < 3e-3,
-                "moe_ffn mismatch at {i}: got {} want {}",
-                got[i],
-                want[i]
-            );
+            // graph
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+            let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q8_0));
+            let yi = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gi,
+                up_exps: ui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: yi,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale,
+                act: Activation::Silu,
+            });
+            let mk = |bytes: &[u8], usage| {
+                let b = be_.alloc(bytes.len(), usage).unwrap();
+                be_.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let xb = mk(bytemuck::cast_slice(&x), BufferUsage::Activations);
+            let rb = mk(&rq, BufferUsage::Weights);
+            let gb = mk(&gq, BufferUsage::Weights);
+            let ub = mk(&uq, BufferUsage::Weights);
+            let db = mk(&dq, BufferUsage::Weights);
+            let yb = be_.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            bind.bind(ri, rb.as_ref());
+            bind.bind(gi, gb.as_ref());
+            bind.bind(ui, ub.as_ref());
+            bind.bind(di, db.as_ref());
+            bind.bind(yi, yb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * ne];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..rows * ne {
+                assert!(
+                    (got[i] - want[i]).abs() < 3e-3,
+                    "moe_ffn mismatch rows={rows} at {i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
         }
     }
 
@@ -3273,15 +3347,24 @@ mod tests {
         }
     }
 
-    /// The `rows>1` (batched, GPU-resident routing) twin of `moe_ffn_fused_scaled_matches_host`:
-    /// diffusion-gemma's ACTUAL production dtypes (fused Q4_K gate_up, not Q8_0 — exercises
-    /// `matmul_mmq_experts`'s Q4_K path with `gu_width = 2*nff`) + Q8_0 down (exercises the new
-    /// `native_gemm_mmq_q8_0_xp` kernel) + per-expert `down_scale` (exercises the
-    /// `moe_bucket_scatter_scaled` dscale-into-bucket_wts path) + a separate `router_x` (exercises
-    /// the batched routing prologue reading `router_x`, not `x`) + GELU (gemma's activation, not
-    /// qwen3moe's SiLU). `ne=256` is the minimum Q4_K superblock width (256-element blocks); the
-    /// real model's ne=2816=11×256. Runs rows=5 (a ragged, non-64-aligned row count — exercises the
-    /// GEMM's row-tile overread/clip path) and rows=256 (diffusion-gemma's canvas width).
+    /// The `rows>moe_small_m_threshold()` (batched, GPU-resident routing) twin of
+    /// `moe_ffn_fused_scaled_matches_host`: diffusion-gemma's ACTUAL production dtypes (fused Q4_K
+    /// gate_up, not Q8_0 — exercises `matmul_mmq_experts`'s Q4_K path with `gu_width = 2*nff`) +
+    /// Q8_0 down (exercises the new `native_gemm_mmq_q8_0_xp` kernel) + per-expert `down_scale`
+    /// (exercises the `moe_bucket_scatter_scaled` dscale-into-bucket_wts path) + a separate
+    /// `router_x` (exercises the batched routing prologue reading `router_x`, not `x`) + GELU
+    /// (gemma's activation, not qwen3moe's SiLU). `ne=256` is the minimum Q4_K superblock width
+    /// (256-element blocks); the real model's ne=2816=11×256. Runs rows=5 (below the small-m
+    /// threshold — exercises the id-indexed GEMV fast path's multi-row widening, `Op::MoeFfn`'s
+    /// OTHER new-code branch introduced alongside it), rows=9 (above threshold, a ragged non-
+    /// 64-aligned row count — exercises the batched GEMM's row-tile overread/clip path, the
+    /// scenario rows=5 used to cover before the small-m threshold existed), and rows=256
+    /// (diffusion-gemma's canvas width). The host reference's int8-activation rounding models the
+    /// BATCHED path's `quant_q8`/`quant_q8_gather` step exactly (rows=9, rows=256); for rows=5 the
+    /// small-m path skips that quantization (reads `x`/`actv` at full f32 precision via
+    /// `linear_native_id_multi`), so the reference only bounds the small-m result from above (its
+    /// error is quantization noise being ADDED to the reference, not present in `got`) — still
+    /// covered by the shared tolerance below, which was sized for the two-quantization-layer case.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_batched_fused_scaled_matches_host() {
@@ -3304,7 +3387,7 @@ mod tests {
         let (rd, gud, dd) = (deq_q8(&rq), deq_q4k(&guq), deq_q8(&dq));
         let dsb_bytes = bytemuck::cast_slice(&down_scale).to_vec();
 
-        for &rows in &[5usize, 256usize] {
+        for &rows in &[5usize, 9usize, 256usize] {
             let x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) + 0.05).collect();
             // A DIFFERENT router input row — if the seam mistakenly routed on `x`, the top-k pick
             // (and hence the whole output) would diverge from this host reference.

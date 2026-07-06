@@ -3476,6 +3476,13 @@ impl<'a> Recorder<'a> {
     /// Multi-slot id GEMV: all `n_used` experts in ONE dispatch → `y` is [n_used, out_f]. The experts
     /// run concurrently (no inter-expert barrier). `x_per_slot`: false → all slots read the same row
     /// `x` (gate/up); true → slot reads `x[slot*in_f..]` (down). Decode FFN fusion.
+    ///
+    /// `rows`: widens the SAME dispatch to `rows` independent tokens — `ids`/`wts`/`y` become
+    /// `[rows, n_used, ...]` flat (the shader splits its flat `slot_global` index back into
+    /// `row`/`slot` using `n_used`, so no push-constant change is needed here). `rows == 1` is the
+    /// original decode call. This is the MoE small-m fast path (see `Op::MoeFfn` in adapter.rs):
+    /// for a handful of prefill tokens it dispatches per-ACTIVE-expert GEMVs over only the routed
+    /// rows, instead of the batched path's whole-expert-bank streaming GEMM.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_id_multi(
         &self,
@@ -3489,6 +3496,7 @@ impl<'a> Recorder<'a> {
         y: &dyn Buffer,
         in_f: usize,
         out_f: usize,
+        rows: usize,
     ) {
         self.stamp("expert_ffn");
         let name = crate::linear::native_idm_kernel_name(dtype).expect("native idm kernel");
@@ -3505,7 +3513,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(w), Self::vkb(x), Self::vkb(ids), Self::vkb(y)],
             1,
             &push,
-            (n_used * out_f) as u32,
+            (rows * n_used * out_f) as u32,
         );
     }
 
@@ -3588,7 +3596,9 @@ impl<'a> Recorder<'a> {
     }
 
     /// Weighted accumulate of all selected experts' down outputs into hidden:
-    /// `hidden[i] += Σ_slot wts[slot] * down[slot*ne + i]`. Folds the per-expert axpys into one op.
+    /// `hidden[row*ne+i] += Σ_slot wts[row*n_used+slot] * down[(row*n_used+slot)*ne + i]`. Folds the
+    /// per-expert axpys into one op. `rows` widens this to independent tokens via grid.y (the MoE
+    /// small-m fast path — see `Op::MoeFfn` in adapter.rs); `rows == 1` is the original decode call.
     pub fn moe_accumulate(
         &self,
         down: &dyn Buffer,
@@ -3596,6 +3606,7 @@ impl<'a> Recorder<'a> {
         hidden: &dyn Buffer,
         ne: usize,
         n_used: usize,
+        rows: usize,
     ) {
         self.stamp("moe_accumulate");
         let k = self
@@ -3604,12 +3615,14 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch3(
             k,
             &[Self::vkb(down), Self::vkb(wts), Self::vkb(hidden)],
             1,
             &push,
             (ne as u32).div_ceil(64),
+            rows as u32,
+            1,
         );
     }
 
@@ -3741,9 +3754,12 @@ impl<'a> Recorder<'a> {
     }
 
     /// Like [`Self::moe_accumulate`], but scales each selected expert's down output by a per-expert
-    /// weight BEFORE the weighted sum: `hidden[i] += sum_slot wts[slot] * dscale[ids[slot]] *
-    /// down[slot*ne+i]` (diffusion-gemma `ffn_down_exps.scale`). `ids` is the same expert-id buffer
-    /// `moe_topk` filled.
+    /// weight BEFORE the weighted sum: `hidden[row*ne+i] += sum_slot wts[row*n_used+slot] *
+    /// dscale[ids[row*n_used+slot]] * down[(row*n_used+slot)*ne+i]` (diffusion-gemma
+    /// `ffn_down_exps.scale`). `ids` is the same expert-id buffer `moe_topk` filled. `rows` widens
+    /// this to independent tokens via grid.y (the MoE small-m fast path); `rows == 1` is the
+    /// original per-token call.
+    #[allow(clippy::too_many_arguments)]
     pub fn moe_accumulate_scaled(
         &self,
         down: &dyn Buffer,
@@ -3753,6 +3769,7 @@ impl<'a> Recorder<'a> {
         hidden: &dyn Buffer,
         ne: usize,
         n_used: usize,
+        rows: usize,
     ) {
         self.stamp("moe_accumulate_scaled");
         let k = self.be.kernel(
@@ -3764,7 +3781,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_used as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch3(
             k,
             &[
                 Self::vkb(down),
@@ -3776,6 +3793,8 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             (ne as u32).div_ceil(64),
+            rows as u32,
+            1,
         );
     }
 

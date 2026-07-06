@@ -2,6 +2,10 @@
 // Weighted accumulate of all selected experts' down outputs into the resident hidden state:
 // hidden[i] += sum_slot wts[slot] * down[slot*ne + i]. One dispatch folds the per-expert axpys
 // (and drops the barriers chaining them) for the GPU-resident decode FFN. `down` is [n_used, ne].
+//
+// grid.y = `row` (MoE small-m fast path: `rows` independent tokens in one dispatch — `down`/`wts`/
+// `hidden` become `[rows, n_used, ne]`/`[rows, n_used]`/`[rows, ne]`; `rows == 1` is the original
+// single-token call, row always 0).
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC { uint ne; uint n_used; } pc;
 layout(binding = 0) readonly buffer DB { float down[]; };
@@ -10,9 +14,11 @@ layout(binding = 2) buffer HB { float hidden[]; };
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.ne) return;
+    uint row = gl_WorkGroupID.y;
+    uint obase = row * pc.n_used;
     float acc = 0.0;
     for (uint slot = 0u; slot < pc.n_used; slot++) {
-        acc += wts[slot] * down[slot * pc.ne + i];
+        acc += wts[obase + slot] * down[(obase + slot) * pc.ne + i];
     }
-    hidden[i] += acc;
+    hidden[row * pc.ne + i] += acc;
 }

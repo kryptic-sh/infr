@@ -120,6 +120,19 @@ system `llama-bench` with matching flags on coding-agent-shaped workloads
 infr compare "$M" --ctx 8000,16000 --gen 256 --turn 2048,256 --reps 2
 ```
 
+**DiffusionGemma** has no upstream-merged `llama-bench` support, so
+`infr compare`/`infr compare --sweep` route `arch=diffusion-gemma` models to a
+different oracle: the reference fork's `llama-diffusion-cli`
+(`~/Projects/mxaddict/llama.cpp-dg`, resolved via `INFR_LLAMA_DIFFUSION_CLI` >
+`PATH` > the fork's `build-vulkan`/`build` directories — see
+`ModelBench::llama_diffusion_cli_path` for the exact precedence and its PATH
+fallback caveat). It prints two rows instead of the usual pp/tg matrix:
+`dg-step` (in-step-parallel tok/s ratio — the apples-to-apples number, since
+both implementations run entropy-bound and take a different number of denoise
+steps) and `dg-e2e` (informational end-to-end tok/s, each side's own step count
+folded into the row so the mismatch is visible). Details in
+[`docs/DIFFUSIONGEMMA.md`](docs/DIFFUSIONGEMMA.md).
+
 Useful env: `INFR_TEMP` / `INFR_TOP_K` / `INFR_TOP_P` (sampling; `TEMP=0` →
 greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
 `INFR_NO_FLASH`.

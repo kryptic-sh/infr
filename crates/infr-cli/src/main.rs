@@ -1032,12 +1032,36 @@ fn cmd_bench_cpu(
     Ok(())
 }
 
-/// diffusion-gemma bench (Phase 4, `docs/DIFFUSIONGEMMA.md`): llama-bench has no diffusion mode
-/// (no llama.cpp comparison possible — this is infr-only reporting), so this drives
+/// Aggregated result of one diffusion-gemma decode measurement (Phase 4/E,
+/// `docs/DIFFUSIONGEMMA.md`): the same numbers `cmd_bench_diffusion_gemma` prints, factored out of
+/// [`dg_bench_run`] so the compare arm (`ModelBench::dg_infr`) can read them directly instead of
+/// scraping this command's own stdout. `pp_ts`/`gen_ts`/`parallel_ts`/`steps` are already averaged
+/// over `reps`; `last_np`/`last_ng` are the LAST rep's actual prompt/gen token counts (matches
+/// every other bench arm's "label from the last rep" convention).
+struct DgBenchResult {
+    pp_ts: f64,
+    /// n_gen / decode_secs — end-to-end, THIS run's own step count. NOT apples-to-apples across
+    /// implementations (entropy-bound step counts are content/impl-sensitive) — see the compare
+    /// arm's dg-step/dg-e2e comment for why `parallel_ts` is the metric that ratio is built on.
+    gen_ts: f64,
+    /// canvas_length * steps / decode_secs — the in-step-parallel rate: the number that reflects
+    /// actual forward-pass work regardless of how many steps the entropy-bound sampler took.
+    /// Directly comparable to llama.cpp's own `llama-diffusion-cli` "in-step parallel N tok/s".
+    parallel_ts: f64,
+    steps: f64,
+    last_np: usize,
+    last_ng: usize,
+}
+
+/// Core diffusion-gemma decode loop (Phase 4, `docs/DIFFUSIONGEMMA.md`): drives
 /// `crate::diffusion::diffusion_generate` directly over a persistent
 /// `DiffusionGemmaCpuSession`/`DiffusionGemmaVulkanSession` — the SAME primitive
 /// `DiffusionGemmaChat::generate` (run/serve) uses — rather than going through the generic
 /// `ChatModel::generate`, because bench needs the step/block counts `GenStats` alone doesn't carry.
+/// Used by BOTH `cmd_bench_diffusion_gemma` (prints the result) and `ModelBench::dg_infr` (Phase
+/// 4/E, the `compare`/`compare --sweep` DG arm — reads the result directly instead of shelling out
+/// to `infr bench` and parsing its printed text, which is what every OTHER arch's compare arm does
+/// via `infr bench --json`; DG's bench has no `--json` support for the per-step fields).
 ///
 /// `-p P`/`-d D` behave like every other bench arm: `D` extra prompt tokens are prefilled UNTIMED
 /// first, then `P` more (an exact-prefix extension of the same real-text token sequence — see the
@@ -1051,33 +1075,26 @@ fn cmd_bench_cpu(
 /// `docs/DIFFUSIONGEMMA.md`) — the number that actually reflects how much forward-pass work ran.
 /// `-n 0` measures prefill only (pp, like every other arch's `-n 0`).
 ///
-/// `--pg` has no diffusion-shaped meaning (a denoise block isn't an ingest-then-reply AR turn) and
-/// errors clearly rather than silently mis-measuring. `-t`/`-u` keep their generic meaning (rayon
+/// `--pg` has no diffusion-shaped meaning (a denoise block isn't an ingest-then-reply AR turn) —
+/// `cmd_bench_diffusion_gemma` errors clearly on it rather than silently mis-measuring; this
+/// function itself has no `pg` parameter at all. `-t`/`-u` keep their generic meaning (rayon
 /// threads for the entropy-bound sampler's per-position reduction; the shared prefill chunk size —
 /// DG's causal prefill rides the exact same `generate_dense_backend` chunked loop as every other
 /// arch) with no DG-specific wiring needed.
 #[allow(clippy::too_many_arguments)]
-fn cmd_bench_diffusion_gemma(
+fn dg_bench_run(
     gguf: &Path,
     tok: Option<&Path>,
     n_prompt: usize,
     n_gen: usize,
     depth: usize,
-    pg: Option<(usize, usize)>,
     reps: usize,
     cpu: bool,
     // Phase D: the Metal DG session (macOS only — see the `one_rep!` dispatch below). `cpu` wins
     // if both are set (matches `cmd_run`/`cmd_serve`'s precedence).
     metal: bool,
-    json: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DgBenchResult> {
     use infr_llama::diffusion::{diffusion_generate, EbConfig};
-    if pg.is_some() {
-        anyhow::bail!(
-            "diffusion-gemma bench has no --pg equivalent (a denoise block isn't an ingest-then-reply \
-             AR turn); use separate -p/-n instead — `infr bench <model> -p P -n N`"
-        );
-    }
     let model = infr_llama::SeamModel::load(gguf, tok)?;
     let cfg = model.config();
     let canvas_len = cfg.canvas_length.max(1);
@@ -1195,6 +1212,41 @@ fn cmd_bench_diffusion_gemma(
     }
 
     let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    Ok(DgBenchResult {
+        pp_ts: avg(&pps),
+        gen_ts: avg(&gens),
+        parallel_ts: avg(&parallel_v),
+        steps: avg(&steps_v),
+        last_np,
+        last_ng,
+    })
+}
+
+/// diffusion-gemma bench (Phase 4, `docs/DIFFUSIONGEMMA.md`): llama-bench has no diffusion mode
+/// (no llama.cpp comparison possible via `llama-bench` — this is infr-only reporting; `infr
+/// compare`'s DG arm instead shells `llama-diffusion-cli` from the fork directly, see
+/// `ModelBench::llama_diffusion`), so this drives [`dg_bench_run`] and formats its result. See
+/// `dg_bench_run`'s doc comment for the -p/-n/-d semantics.
+#[allow(clippy::too_many_arguments)]
+fn cmd_bench_diffusion_gemma(
+    gguf: &Path,
+    tok: Option<&Path>,
+    n_prompt: usize,
+    n_gen: usize,
+    depth: usize,
+    pg: Option<(usize, usize)>,
+    reps: usize,
+    cpu: bool,
+    metal: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    if pg.is_some() {
+        anyhow::bail!(
+            "diffusion-gemma bench has no --pg equivalent (a denoise block isn't an ingest-then-reply \
+             AR turn); use separate -p/-n instead — `infr bench <model> -p P -n N`"
+        );
+    }
+    let r = dg_bench_run(gguf, tok, n_prompt, n_gen, depth, reps, cpu, metal)?;
     let tag = if cpu {
         " [cpu]"
     } else if metal {
@@ -1203,18 +1255,15 @@ fn cmd_bench_diffusion_gemma(
         ""
     };
     if json {
-        let a = if n_gen > 0 { avg(&gens) } else { avg(&pps) };
+        let a = if n_gen > 0 { r.gen_ts } else { r.pp_ts };
         println!("[{{\"avg_ts\": {a:.2}}}]");
     } else if n_gen > 0 {
         println!(
-            "pp{last_np}: {:.1} t/s | gen{last_ng}: {:.1} t/s (end-to-end) | {:.1} steps | in-step parallel {:.1} t/s{tag}  ({reps} reps)",
-            avg(&pps),
-            avg(&gens),
-            avg(&steps_v),
-            avg(&parallel_v),
+            "pp{}: {:.1} t/s | gen{}: {:.1} t/s (end-to-end) | {:.1} steps | in-step parallel {:.1} t/s{tag}  ({reps} reps)",
+            r.last_np, r.pp_ts, r.last_ng, r.gen_ts, r.steps, r.parallel_ts,
         );
     } else {
-        println!("pp{last_np}: {:.1} t/s{tag}  ({reps} reps)", avg(&pps));
+        println!("pp{}: {:.1} t/s{tag}  ({reps} reps)", r.last_np, r.pp_ts);
     }
     Ok(())
 }
@@ -1251,6 +1300,13 @@ fn cmd_compare_sweep(
                 continue;
             }
         };
+        // diffusion-gemma (Phase 4/E): entirely different measurement shape (no upstream
+        // llama-bench support — see `ModelBench::is_dg`'s doc comment), so it prints its own two
+        // rows and skips the standard pp/tg/mtp metrics below entirely.
+        if mb.is_dg {
+            print_dg_sweep_rows(&mb, short, &mut rows);
+            continue;
+        }
         let ds = depth.to_string();
         // pp4@d: the tiny-suffix-turn shape (m=2..8 Linears at session depth) — the multi-row
         // GEMV / spec-verify path; invisible in pp512/tg but it IS multi-turn serve TTFT.
@@ -1372,6 +1428,15 @@ struct ModelBench {
     /// binary directly (no `llama-bench` JSON plumbing for spec decode: `llama-bench` doesn't run
     /// spec at all), so it needs a real `-m <path>` regardless of whether `model` was an `-hf` ref.
     gguf_path: PathBuf,
+    /// Sidecar tokenizer.json beside the GGUF, if any — DG's compare arm (`dg_infr`) loads the
+    /// model in-process (`dg_bench_run`) rather than shelling out, so it needs this the same way
+    /// `cmd_bench`/`cmd_run` do (see `resolve`'s doc comment).
+    tok_path: Option<PathBuf>,
+    /// arch=diffusion-gemma (Phase 4/E, `docs/DIFFUSIONGEMMA.md`): gates the DG rows in
+    /// `cmd_compare`/`cmd_compare_sweep` — no upstream-merged `llama-bench` support exists for
+    /// this arch, so it takes a completely different pair of measurement paths (`dg_infr` +
+    /// `llama_diffusion`) instead of the standard `infr`/`llama` pp/tg arms.
+    is_dg: bool,
     llama_model_args: Vec<String>,
     llama_bench: String,
     dev: String,
@@ -1396,17 +1461,13 @@ impl ModelBench {
         // hand BOTH tools the same reference: `infr bench` takes `model` verbatim, and llama-bench
         // gets the matching `-hf`/`--hf-file` (or `-m` for a local path). Pull once up front so
         // `--offline` holds.
-        let resolved = resolve(model)?.0;
-        // diffusion-gemma (Phase 4, docs/DIFFUSIONGEMMA.md): the PR this arch needs isn't merged
-        // upstream, so `llama-bench` can't run it at all — bail with a clear pointer to `infr
-        // bench` instead of letting the shelled-out llama-bench call fail confusingly below. One
-        // check here covers both `cmd_compare` and `cmd_compare_sweep` (both build a `ModelBench`).
-        if infr_llama::diffusion::is_diffusion_gemma(&resolved) {
-            anyhow::bail!(
-                "{model}: arch=diffusion-gemma has no llama.cpp diffusion bench to compare against \
-                 (the PR isn't merged upstream) — use `infr bench` directly"
-            );
-        }
+        let (resolved, tok_path) = resolve(model)?;
+        // diffusion-gemma (Phase 4/E, docs/DIFFUSIONGEMMA.md): the arch's PR isn't merged into
+        // mainline llama.cpp, so `llama-bench` can't run it — but the reference fork at
+        // `~/Projects/mxaddict/llama.cpp-dg` builds `llama-diffusion-cli`, which IS a usable
+        // oracle (see `ModelBench::llama_diffusion`/`llama_diffusion_cli_path`). `is_dg` routes
+        // `cmd_compare`/`cmd_compare_sweep` to the DG-shaped measurement pair instead of bailing.
+        let is_dg = infr_llama::diffusion::is_diffusion_gemma(&resolved);
         let llama_model_args: Vec<String> = match infr_hub::ModelRef::parse(model)? {
             infr_hub::ModelRef::Repo { repo, sel } => {
                 let mut a = vec!["--offline".to_string()];
@@ -1427,6 +1488,8 @@ impl ModelBench {
             exe,
             model: model.to_string(),
             gguf_path: resolved,
+            tok_path,
+            is_dg,
             llama_model_args,
             llama_bench: llama_bench.to_string(),
             dev: dev.to_string(),
@@ -1582,6 +1645,281 @@ impl ModelBench {
         }
         Some(samples.iter().sum::<f64>() / samples.len().max(1) as f64)
     }
+
+    /// infr's side of the DG compare arm (Phase 4/E): drives [`dg_bench_run`] — the SAME core
+    /// `cmd_bench_diffusion_gemma` uses — in-process, at a fixed `-n <n_gen>` decode with a
+    /// minimal 1-token prompt and no extra depth (this arm measures decode throughput only, not
+    /// a coding-agent-shaped prefill scenario). `cpu` follows `ngl == 0`, matching every other
+    /// arm's `-ngl 0` = CPU-reference-backend convention; Metal has no wiring here (`compare`
+    /// doesn't expose a Metal device selector — out of scope for this arm).
+    fn dg_infr(&self, n_gen: usize) -> anyhow::Result<DgBenchResult> {
+        dg_bench_run(
+            &self.gguf_path,
+            self.tok_path.as_deref(),
+            1,
+            n_gen,
+            0,
+            self.reps,
+            self.ngl == 0,
+            false,
+        )
+    }
+
+    /// Fixed prompt for [`llama_diffusion`](Self::llama_diffusion)'s oracle run — arbitrary but
+    /// fixed content, matching `Self::MTP_PROMPT`'s convention of one shared literal both sides
+    /// decode from (entropy-bound step counts are content-sensitive, see `dg_bench_run`'s comment
+    /// on why `infr`'s own dummy prompt is a fixed real sentence rather than raw ids).
+    const DG_PROMPT: &str = "Write a short story about a robot learning to paint.";
+
+    /// The reference fork's own build directories — `~/Projects/mxaddict/llama.cpp-dg`, the only
+    /// place `arch=diffusion-gemma` support actually exists (it isn't merged into mainline
+    /// llama.cpp): `build-vulkan` (GPU, `cmake -DGGML_VULKAN=ON`) or `build` (CPU-only). `cpu`
+    /// picks between them, mirroring `-ngl 0` vs `-ngl >0` on every other arm. Used both as
+    /// [`llama_diffusion_cli_path`](Self::llama_diffusion_cli_path)'s last-resort candidate AND as
+    /// [`llama_diffusion`](Self::llama_diffusion)'s fallback target (see its doc comment).
+    fn fork_diffusion_cli_path(cpu: bool) -> PathBuf {
+        let fork = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join("Projects/mxaddict/llama.cpp-dg");
+        if cpu {
+            fork.join("build/bin/llama-diffusion-cli")
+        } else {
+            fork.join("build-vulkan/bin/llama-diffusion-cli")
+        }
+    }
+
+    /// Resolve `llama-diffusion-cli`'s binary path (Phase 4/E compare arm) — precedence, in order:
+    ///   1. `INFR_LLAMA_DIFFUSION_CLI` env var (explicit override, e.g. a custom build location).
+    ///   2. `llama-diffusion-cli` on `PATH` (a manual PATH walk — no extra `which` dependency for
+    ///      one binary lookup).
+    ///   3. [`fork_diffusion_cli_path`](Self::fork_diffusion_cli_path) — the reference fork's build.
+    ///
+    /// CAVEAT: mainline llama.cpp already ships a generic `llama-diffusion-cli` (LLaDA/Dream
+    /// support), so tier 2 can resolve to a REAL binary that nonetheless doesn't know
+    /// `arch=diffusion-gemma` (the fork's own unmerged addition) — it loads and errors "unknown
+    /// model architecture" rather than failing to resolve at all, so this function alone can't
+    /// detect the mismatch. [`llama_diffusion`](Self::llama_diffusion) is the one that actually
+    /// runs the binary, so it catches that specific failure and falls through to tier 3 itself.
+    fn llama_diffusion_cli_path(cpu: bool) -> PathBuf {
+        if let Ok(p) = std::env::var("INFR_LLAMA_DIFFUSION_CLI") {
+            return PathBuf::from(p);
+        }
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let cand = dir.join("llama-diffusion-cli");
+                if cand.is_file() {
+                    return cand;
+                }
+            }
+        }
+        Self::fork_diffusion_cli_path(cpu)
+    }
+
+    /// Shell `llama-diffusion-cli` (see [`llama_diffusion_cli_path`](Self::llama_diffusion_cli_path)
+    /// for the resolution precedence) at a fixed `-n <n_gen>` decode and parse its own
+    /// throughput/in-step-parallel/step-count numbers straight out of combined stdout+stderr (this
+    /// binary has no `-o json` mode). `-ngl 999 -dev <dev>` for the GPU compare, `-ngl 0` for CPU —
+    /// mirrors [`Self::llama`]'s handling.
+    ///
+    /// FALLBACK: if the resolved binary loads but rejects the model with "unknown model
+    /// architecture" (the tier-2 PATH caveat documented on `llama_diffusion_cli_path` — a mainline
+    /// install's generic diffusion CLI lacking this arch), retry against
+    /// [`fork_diffusion_cli_path`](Self::fork_diffusion_cli_path) directly instead of reporting a
+    /// hard failure. Detected once per call and then stuck to for the remaining reps.
+    fn llama_diffusion(&self, n_gen: usize) -> Option<DgLlamaResult> {
+        use std::process::Command;
+        let cpu = self.ngl == 0;
+        let mut cli = Self::llama_diffusion_cli_path(cpu);
+        if !cli.is_file() {
+            eprintln!(
+                "llama-diffusion-cli not found ({}): set INFR_LLAMA_DIFFUSION_CLI, put it on PATH, \
+                 or build the fork at ~/Projects/mxaddict/llama.cpp-dg (cmake -DGGML_VULKAN=ON \
+                 -B build-vulkan && cmake --build build-vulkan --target llama-diffusion-cli)",
+                cli.display()
+            );
+            return None;
+        }
+        let n = n_gen.to_string();
+        let run = |cli: &Path| -> Option<String> {
+            let mut c = Command::new(cli);
+            c.args(&self.llama_model_args);
+            c.args(["-p", Self::DG_PROMPT, "-n", &n]);
+            if cpu {
+                c.args(["-ngl", "0"]);
+            } else {
+                c.args(["-ngl", "999", "-dev", &self.dev]);
+            }
+            let out = c.output().ok()?;
+            Some(format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        };
+        let mut e2e = Vec::with_capacity(self.reps.max(1));
+        let mut step = Vec::with_capacity(self.reps.max(1));
+        let mut steps_v = Vec::with_capacity(self.reps.max(1));
+        let mut fell_back = false;
+        for _ in 0..self.reps.max(1) {
+            let mut combined = run(&cli)?;
+            if !fell_back && combined.contains("unknown model architecture") {
+                let fork = Self::fork_diffusion_cli_path(cpu);
+                eprintln!(
+                    "{} doesn't support arch=diffusion-gemma (mainline install?) — falling back \
+                     to the fork build at {}",
+                    cli.display(),
+                    fork.display()
+                );
+                cli = fork;
+                fell_back = true;
+                combined = run(&cli)?;
+            }
+            match parse_llama_diffusion_cli_output(&combined) {
+                Some(r) => {
+                    e2e.push(r.e2e_ts);
+                    step.push(r.step_ts);
+                    steps_v.push(r.steps);
+                }
+                None => {
+                    eprintln!(
+                        "llama-diffusion-cli produced no parseable throughput line: {}",
+                        combined.trim()
+                    );
+                    return None;
+                }
+            }
+        }
+        let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        Some(DgLlamaResult {
+            e2e_ts: avg(&e2e),
+            step_ts: avg(&step),
+            steps: avg(&steps_v),
+        })
+    }
+}
+
+/// llama.cpp's `llama-diffusion-cli` (the fork's DG oracle, Phase 4/E) prints its summary as two
+/// plain-text lines (no `-o json` mode on this binary), e.g.:
+///   `total time: 39559.95ms, time per step: 1582.40ms (25 steps over 1 blocks, entropy-bound)`
+///   `throughput: 6.5 tok/s (256 tok in 39559.95ms), in-step parallel 162 tok/s (256-tok canvas x 25.0 steps/block)`
+/// `e2e_ts` ("throughput:") and `step_ts` ("in-step parallel ... tok/s") both come off the SECOND
+/// line; `steps` (total denoising steps run) comes off the FIRST line's "N steps over" — parsed
+/// separately since it's the one number not repeated on the throughput line.
+struct DgLlamaResult {
+    e2e_ts: f64,
+    step_ts: f64,
+    steps: f64,
+}
+
+/// Pull a `float` out of `s` immediately after the first occurrence of `needle` (shared by
+/// [`parse_llama_diffusion_cli_output`]'s two fields — same "walk forward from a fixed label"
+/// approach as [`parse_llama_cli_gen_rate`], factored out here since this arm needs it twice).
+fn parse_float_after(s: &str, needle: &str) -> Option<f64> {
+    let idx = s.find(needle)?;
+    let after = s[idx + needle.len()..].trim_start();
+    let end = after
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(after.len());
+    after[..end].parse::<f64>().ok()
+}
+
+/// Parse `llama-diffusion-cli`'s two-line summary — see [`DgLlamaResult`]'s doc comment for the
+/// exact format. `steps` is scraped from " steps over " on the first line (walking BACKWARD to
+/// the start of the number, the mirror image of [`parse_float_after`]'s forward walk, since the
+/// number precedes the needle here); `e2e_ts`/`step_ts` come off the "throughput:"/"in-step
+/// parallel " labels on the second line via `parse_float_after`.
+fn parse_llama_diffusion_cli_output(output: &str) -> Option<DgLlamaResult> {
+    let steps = {
+        const NEEDLE: &str = " steps over ";
+        let idx = output.find(NEEDLE)?;
+        let before = &output[..idx];
+        let start = before
+            .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        before[start..].parse::<f64>().ok()?
+    };
+    let line = output.lines().find(|l| l.contains("in-step parallel"))?;
+    let e2e_ts = parse_float_after(line, "throughput:")?;
+    let step_ts = parse_float_after(line, "in-step parallel ")?;
+    Some(DgLlamaResult {
+        e2e_ts,
+        step_ts,
+        steps,
+    })
+}
+
+/// diffusion-gemma's fixed decode length for the compare arm (Phase 4/E) — mirrors the oracle
+/// invocation quoted in `docs/DIFFUSIONGEMMA.md` (`-n 256`), so numbers seen here line up with
+/// numbers already captured there.
+const DG_N_GEN: usize = 256;
+
+/// diffusion-gemma's compare arm (Phase 4/E, `docs/DIFFUSIONGEMMA.md`): shared by
+/// `cmd_compare`/`cmd_compare_sweep` at the point their old hard bail on `arch=diffusion-gemma`
+/// used to sit (`ModelBench::new` no longer bails — see `is_dg`'s doc comment). Runs BOTH tools'
+/// DG decode once at a fixed `-n 256` and returns the raw measurements; callers format their own
+/// rows because `cmd_compare` prints a labeled table and `cmd_compare_sweep` needs `(model,
+/// metric, infr, llama)` tuples for the ranked summary.
+///
+/// METRIC HONESTY: DG is entropy-bound — both implementations run a DIFFERENT NUMBER of denoise
+/// steps for the same `-n 256` request (the early-stop point is content/implementation-sensitive:
+/// see `dg_bench_run`'s comment on why the dummy prompt is a fixed real sentence, not raw ids), so
+/// wall-clock end-to-end tok/s is NOT apples-to-apples between infr and llama.cpp — whichever tool
+/// happens to trim its canvas earlier looks faster for free, independent of actual GPU work done.
+/// The number that DOES reflect forward-pass work is per-step throughput
+/// (`canvas_length * steps / decode_secs`): llama.cpp's own oracle already reports this as
+/// "in-step parallel N tok/s", and infr's `dg_bench_run` computes the IDENTICAL formula
+/// (`DgBenchResult::parallel_ts`), so `dg-step` is the metric this arm treats as the real
+/// infr-vs-llama ratio (it's what feeds the sweep's "BIGGEST GAPS" ranking). `dg-e2e` is still
+/// printed for visibility — informational only, each side's OWN step count folded into the row
+/// text so the mismatch is visible instead of hidden.
+fn dg_compare_measure(mb: &ModelBench) -> (anyhow::Result<DgBenchResult>, Option<DgLlamaResult>) {
+    let infr = mb.dg_infr(DG_N_GEN);
+    let llama = mb.llama_diffusion(DG_N_GEN);
+    (infr, llama)
+}
+
+/// `cmd_compare_sweep`'s DG rows: `dg-step` (in-step-parallel ratio — the real gap metric, feeds
+/// `rows`/the ranked summary) and `dg-e2e` (informational, own-step-count e2e, NOT fed into
+/// `rows`). See [`dg_compare_measure`]'s doc comment for why the split.
+fn print_dg_sweep_rows(mb: &ModelBench, short: &str, rows: &mut Vec<(String, String, f64, f64)>) {
+    let (infr, llama) = dg_compare_measure(mb);
+    let step_label = "dg-step".to_string();
+    let is = infr
+        .as_ref()
+        .map(|r| format!("{:.0}", r.parallel_ts))
+        .unwrap_or_else(|e| {
+            eprintln!("infr DG bench failed ({short}): {e:#}");
+            "ERR".into()
+        });
+    let ls = llama
+        .as_ref()
+        .map(|r| format!("{:.0}", r.step_ts))
+        .unwrap_or_else(|| "NA".into());
+    let ratio = match (infr.as_ref().ok(), llama.as_ref()) {
+        (Some(i), Some(l)) if l.step_ts > 0.0 => {
+            rows.push((
+                short.to_string(),
+                step_label.clone(),
+                i.parallel_ts,
+                l.step_ts,
+            ));
+            format!("{:.2}x", i.parallel_ts / l.step_ts)
+        }
+        _ => "-".into(),
+    };
+    println!("{short:<22} {step_label:<10} | {is:>9} | {ls:>9} | {ratio:>10}");
+
+    let e2e_label = "dg-e2e".to_string();
+    match (&infr, &llama) {
+        (Ok(i), Some(l)) => println!(
+            "{short:<22} {e2e_label:<10} | {:>6.1}t/s@{:.0}st | {:>6.1}t/s@{:.0}st | informational (steps differ)",
+            i.gen_ts, i.steps, l.e2e_ts, l.steps
+        ),
+        _ => println!(
+            "{short:<22} {e2e_label:<10} | {:>9} | {:>9} | {:>10}",
+            "-", "-", "-"
+        ),
+    }
 }
 
 /// Compare infr vs llama.cpp on coding-agent-shaped workloads. Shells out to `infr bench` (this same
@@ -1637,6 +1975,32 @@ fn cmd_compare(
         );
         println!("{:-<18}+{:-<12}+{:-<12}+{:-<10}", "", "", "", "");
     };
+
+    // diffusion-gemma (Phase 4/E): entirely different measurement shape (no upstream llama-bench
+    // support for this arch — see `ModelBench::is_dg`'s doc comment), so it skips every AR
+    // scenario below (CONTEXT LOAD / REPLY @depth / MTP / SHORT TURN / TURN all assume a
+    // prefill-then-decode AR turn shape DG doesn't have) and returns after its own two rows.
+    if mb.is_dg {
+        hdr("DIFFUSION-GEMMA DECODE"); // entropy-bound block-diffusion decode, fixed -n 256
+        let (infr, llama) = dg_compare_measure(&mb);
+        let infr_steps = infr.as_ref().ok().map(|r| r.steps);
+        let infr_e2e = infr.as_ref().ok().map(|r| r.gen_ts);
+        row(
+            "dg-step".to_string(),
+            infr.map(|r| r.parallel_ts),
+            llama.as_ref().map(|r| r.step_ts),
+        );
+        let fmt_st = |ts: Option<f64>, st: Option<f64>| match (ts, st) {
+            (Some(t), Some(s)) => format!("{t:.1} t/s @ {s:.0} steps"),
+            _ => "-".into(),
+        };
+        println!(
+            "  dg-e2e (informational — step counts differ, not apples-to-apples): infr {}   llama {}",
+            fmt_st(infr_e2e, infr_steps),
+            fmt_st(llama.as_ref().map(|r| r.e2e_ts), llama.as_ref().map(|r| r.steps)),
+        );
+        return Ok(());
+    }
 
     hdr("CONTEXT LOAD"); // cold prefill of a repo/file dump
     for &n in ctx {

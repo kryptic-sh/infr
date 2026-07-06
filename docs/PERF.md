@@ -62,6 +62,14 @@ Rules that exist because we got burned:
 - Prefill and decode are separate machines. A prefill change must leave tg
   bit-for-bit alone (verify tg128 before/after); a decode change must leave pp
   alone.
+- **DiffusionGemma sweeps differently.** `arch=diffusion-gemma` has no upstream
+  `llama-bench` support, so its sweep row comes from the reference fork's
+  `llama-diffusion-cli` instead (see the README's Compare section and
+  `docs/DIFFUSIONGEMMA.md`) and prints `dg-step`/`dg-e2e` instead of
+  pp512/tg128/tg64@d/mtp128. Only `dg-step` (in-step-parallel throughput) feeds
+  the ranked "BIGGEST GAPS" summary — `dg-e2e` is informational because the two
+  implementations' entropy-bound samplers run different step counts for the same
+  `-n`, so raw end-to-end tok/s isn't a fair ratio.
 
 ## Archiving sweeps
 

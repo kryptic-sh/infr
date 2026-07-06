@@ -33,9 +33,13 @@
   `<|channel>thought…<channel|>` markers as the oracle); `infr bench` (DG-aware:
   reports the block-diffusion shape — pp tok/s, end-to-end generated tok/s, EB
   steps run, and the "in-step parallel" rate the oracle itself reports — since
-  `llama-bench` has no diffusion mode to compare against); `infr compare` bails
-  with a clear message on this arch instead of a confusing llama-bench failure.
-  CPU==Vulkan cross-backend parity validated per the validation ladder below.
+  `llama-bench` has no diffusion mode to compare against); `infr compare` /
+  `infr compare --sweep` (the mainline `llama-bench` route still has nothing to
+  compare against, but the reference fork at `~/Projects/mxaddict/llama.cpp-dg`
+  builds `llama-diffusion-cli` — a real, usable oracle for this arch — so the
+  compare arm shells that out instead of bailing; see "Comparing against the
+  fork oracle" below). CPU==Vulkan cross-backend parity validated per the
+  validation ladder below.
 - **Known gaps** (perf follow-ups, not correctness bugs):
   - Metal denoise is code-complete (Phase D, see the status bullet above) but
     **hardware-unvalidated** — nobody has run it on a real Metal device yet. CPU
@@ -228,9 +232,57 @@ Resolved from the oracle source (`diffusion-cli.cpp` run_turn, ~line 413+):
 4. End-to-end vs `llama-diffusion-cli` on the same GGUF, greedy/fixed-seed —
    token-identical or documented-equivalent (Phase 3).
 5. Perf: each denoise step is a C=256-row prefill-shaped forward — the shape
-   infr's batched machinery is strongest at (Phase 4 bench + compare rows; note
-   llama-bench has no diffusion mode, so compare needs a diffusion-aware
-   scenario — measure steps/s and tokens/s end-to-end).
+   infr's batched machinery is strongest at (Phase 4 bench + compare rows;
+   `infr compare`/`--sweep` measure this against the fork's
+   `llama-diffusion-cli` oracle — see "Comparing against the fork oracle" below
+   — since mainline `llama-bench` has no diffusion mode at all).
+
+## Comparing against the fork oracle
+
+`arch=diffusion-gemma` isn't merged into mainline llama.cpp, so `llama-bench`
+can't run it — but the reference fork at `~/Projects/mxaddict/llama.cpp-dg`
+builds `llama-diffusion-cli`, a real oracle for this arch. `infr compare` /
+`infr compare --sweep` shell it out instead of bailing (the bail this doc used
+to describe is gone).
+
+**Binary resolution** (`ModelBench::llama_diffusion_cli_path`), in order:
+
+1. `INFR_LLAMA_DIFFUSION_CLI` env var — explicit override.
+2. `llama-diffusion-cli` on `PATH`.
+3. The fork's own build directories: `build-vulkan/bin/llama-diffusion-cli`
+   (GPU,
+   `cmake -DGGML_VULKAN=ON -B build-vulkan && cmake --build build-vulkan --target llama-diffusion-cli`)
+   or `build/bin/llama-diffusion-cli` (CPU-only) — picked by `-ngl 0` vs
+   `-ngl >0`, matching every other arm.
+
+**Caveat hit in practice**: mainline llama.cpp already ships its own generic
+`llama-diffusion-cli` (LLaDA/Dream support), so tier 2 can resolve to a REAL
+binary on `PATH` that still can't load `arch=diffusion-gemma` — it errors
+`unknown model architecture: 'diffusion-gemma'` rather than failing to resolve.
+`ModelBench::llama_diffusion` catches that specific failure signature on the
+first rep and falls through to the fork build automatically (logging the
+fallback), so a stock llama.cpp install on `PATH` doesn't silently break this
+arm.
+
+**Metric honesty**: DG is entropy-bound, so infr and the oracle run a DIFFERENT
+NUMBER of denoise steps for the same `-n 256` request — end-to-end tok/s is NOT
+apples-to-apples (whichever tool trims its canvas earlier looks faster for
+free). The compare/sweep rows split accordingly:
+
+- `dg-step` — per-step throughput (`canvas_length * steps / decode_secs`, infr's
+  `DgBenchResult::parallel_ts` vs the oracle's own reported "in-step parallel N
+  tok/s"). This is the real infr-vs-llama ratio and the only DG metric that
+  feeds the sweep's ranked "BIGGEST GAPS" summary.
+- `dg-e2e` — informational only: each side's own end-to-end tok/s with its own
+  step count folded into the row text (e.g. `14.0t/s@48st` vs `46.8t/s@23st`),
+  so the step-count mismatch is visible rather than hidden.
+
+Example (Vulkan, `unsloth/diffusiongemma-26B-A4B-it-GGUF:Q4_K_M`):
+
+```
+diffusiongemma-26B-A4B-it-Q4_K_M.gguf dg-step    |       674 |      1077 |      0.63x
+diffusiongemma-26B-A4B-it-Q4_K_M.gguf dg-e2e     |   14.0t/s@48st |   46.8t/s@23st | informational (steps differ)
+```
 
 ## Metal implementation notes (Phase D)
 

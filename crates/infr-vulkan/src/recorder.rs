@@ -3324,6 +3324,15 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Advance the decode-replay `params` SSBO on the device: `[pos, kv_len] -> [pos+1, pos+2]`.
+    /// Recorded FIRST in the decode replay so the position stream never leaves the GPU.
+    pub fn params_advance(&self, params: &dyn Buffer) {
+        let k = self
+            .be
+            .kernel("params_advance", crate::gemm::params_advance_spv(), 1, 0);
+        self.dispatch(k, &[Self::vkb(params)], 1, &[], 1);
+    }
+
     /// Largest `top_k` the GPU stochastic sampler handles; above this the caller samples on the host.
     pub const SAMPLE_KMAX: usize = crate::gemm::SAMPLE_KMAX;
 

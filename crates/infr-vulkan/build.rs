@@ -451,6 +451,8 @@ fn main() {
         ("embed_gather", "embed_gather_q6k", &["-DFMT_Q6K"]),
         ("embed_gather", "embed_gather_iq4nl", &["-DFMT_IQ4NL"]),
         ("embed_gather", "embed_gather_iq4xs", &["-DFMT_IQ4XS"]),
+        // Device-side decode-replay params advance ([pos, kv_len] += 1) — see params_advance.comp.
+        ("params_advance", "params_advance", &[]),
         // Two-stage vocab-scale stochastic sampler (Op::Sample): per-slice top-k candidates,
         // then select+softmax+nucleus+CDF over the union.
         ("sample_topk", "sample_topk_part", &[]),

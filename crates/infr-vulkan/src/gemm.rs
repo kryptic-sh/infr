@@ -311,6 +311,12 @@ pub(crate) fn embed_gather_kernel_name(dtype: infr_core::DType) -> &'static str 
         _ => unreachable!("embed_gather_kernel_name: gated by embed_gather_build_spv"),
     }
 }
+/// SPIR-V for the decode-replay params advance (device-side [pos, kv_len] increment).
+pub(crate) fn params_advance_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/params_advance.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the vocab sampler's slice pass (256 workgroups → 256*k (val, idx) candidates).
 pub(crate) fn sample_topk_part_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sample_topk_part.spv"));

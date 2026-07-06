@@ -53,9 +53,13 @@ struct DecodeReplay {
     /// Persistent `Internal` scratch (activations), allocated ONCE. The recorded descriptor sets bind
     /// these, so re-allocating per token would leave the recording pointing at freed buffers.
     scratch: Vec<Option<Box<dyn Buffer>>>,
-    /// `[pos, kv_len]` (u32×2) SSBO the `_dyn` kernels read; the only per-token device write the
-    /// adapter itself makes.
+    /// `[pos, kv_len]` (u32×2) SSBO the `_dyn` kernels read. When `self_advancing`, a
+    /// `params_advance` dispatch recorded FIRST increments it on the device every replay
+    /// (initialized to `[pos0-1, pos0]` at record time) — the adapter never touches it again.
     params: Box<dyn Buffer>,
+    /// The recording starts with the device-side params increment; `execute` skips the host
+    /// `read_pos0` + params upload. INFR_NO_GPU_POS=1 at record time forces the old host path.
+    self_advancing: bool,
     /// The `positions` Input tensor — `execute` downloads element 0 to learn `pos` for `params`.
     positions: TensorId,
     recorded: RecordedCmd,
@@ -2265,13 +2269,15 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         *guard = Some(record_decode_replay(be_, &plan.graph, bindings)?);
     }
     let replay = guard.as_ref().unwrap();
-    // pos from positions[0] (decode rows=1); kv_len = pos+1.
-    let pos = read_pos0(be_, resolve(&replay.scratch, bindings, replay.positions)?)?;
-    let kv_len = pos + 1;
-    let mut pbytes = [0u8; 8];
-    pbytes[0..4].copy_from_slice(&pos.to_le_bytes());
-    pbytes[4..8].copy_from_slice(&kv_len.to_le_bytes());
-    be_.upload(replay.params.as_ref(), &pbytes)?;
+    if !replay.self_advancing {
+        // Host fallback (INFR_NO_GPU_POS): pos from positions[0] (decode rows=1); kv_len = pos+1.
+        let pos = read_pos0(be_, resolve(&replay.scratch, bindings, replay.positions)?)?;
+        let kv_len = pos + 1;
+        let mut pbytes = [0u8; 8];
+        pbytes[0..4].copy_from_slice(&pos.to_le_bytes());
+        pbytes[4..8].copy_from_slice(&kv_len.to_le_bytes());
+        be_.upload(replay.params.as_ref(), &pbytes)?;
+    }
     replay.recorded.replay().map_err(|e| be(e.to_string()))?;
     Ok(())
 }
@@ -2305,6 +2311,19 @@ fn record_decode_replay(
     let mut pool: ScratchPool = HashMap::new();
     let dummy = be_.alloc(16, BufferUsage::Activations)?;
     let rec = be_.recorder_persistent()?;
+    // Device-side position stream: seed params to [pos0-1, pos0] and record a one-thread
+    // increment FIRST — every replay self-advances and the host never writes pos/params again
+    // (no dyn kernel reads the `positions` buffer; they all read params). INFR_NO_GPU_POS=1
+    // keeps the per-replay host read_pos0 + params upload instead (A/B).
+    let self_advancing = std::env::var("INFR_NO_GPU_POS").is_err();
+    if self_advancing {
+        let pos0 = read_pos0(be_, resolve(&scratch, bindings, positions)?)?;
+        let mut pbytes = [0u8; 8];
+        pbytes[0..4].copy_from_slice(&pos0.wrapping_sub(1).to_le_bytes());
+        pbytes[4..8].copy_from_slice(&pos0.to_le_bytes());
+        be_.upload(params.as_ref(), &pbytes)?;
+        rec.params_advance(params.as_ref());
+    }
     let mode = RopeMode::Dynamic(params.as_ref());
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
@@ -2338,6 +2357,7 @@ fn record_decode_replay(
     Ok(DecodeReplay {
         scratch,
         params,
+        self_advancing,
         positions,
         recorded,
         _transient: transient,

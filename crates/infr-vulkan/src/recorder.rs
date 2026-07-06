@@ -1242,6 +1242,35 @@ impl<'a> Recorder<'a> {
         self.dispatch(k, &[Self::vkb(x), Self::vkb(y)], 1, &push, rows as u32);
     }
 
+    /// Like [`Self::softmax`], but the scale comes from `scale_buf[0]` (a 1-element device buffer,
+    /// host-updated via a tiny 4-byte `upload` between calls) instead of a push constant — the
+    /// DiffusionGemma denoise self-conditioning path uses this to vary the softmax temperature
+    /// every step on a plan compiled/cached ONCE (see `Op::Softmax::scale_buf`'s doc and
+    /// docs/DIFFUSIONGEMMA.md's Phase-B). `USE_SCALE_BUF`-compiled variant of the same shader.
+    pub fn softmax_dyn(
+        &self,
+        x: &dyn Buffer,
+        scale_buf: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+    ) {
+        self.stamp("softmax_dyn");
+        let k = self
+            .be
+            .kernel_sg("softmax_dyn", crate::gemm::softmax_dyn_spv(), 3, 8, 32);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(scale_buf), Self::vkb(y)],
+            1,
+            &push,
+            rows as u32,
+        );
+    }
+
     /// RoPE in place is allowed (`x` and `y` may be the same buffer). `pos_offset` shifts the
     /// absolute position of the first row (for cached decode).
     #[allow(clippy::too_many_arguments)]

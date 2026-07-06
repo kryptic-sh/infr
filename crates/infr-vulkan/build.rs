@@ -71,6 +71,9 @@ fn main() {
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
         ("rmsnorm", "rmsnorm", &[]),
         ("softmax", "softmax", &[]),
+        // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
+        // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
+        ("softmax", "softmax_dyn", &["-DUSE_SCALE_BUF"]),
         ("deltanet", "deltanet", &[]),
         ("deltanet_chunked", "deltanet_chunked", &[]),
         ("deltanet_prep", "deltanet_prep", &[]),

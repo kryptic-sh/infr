@@ -1298,7 +1298,16 @@ impl MetalBackend {
                 rows,
                 dim,
                 scale,
+                scale_buf,
             } => {
+                // Perf (DiffusionGemma denoise, Vulkan-only — see `Op::Softmax::scale_buf`'s
+                // doc): Metal's denoise call site never sets this (left on the pre-existing host
+                // premultiply path), so this can't fire today. Not implemented here; fail loudly
+                // instead of silently ignoring a scale a future caller expected to take effect.
+                assert!(
+                    scale_buf.is_none(),
+                    "Metal Op::Softmax: scale_buf is Vulkan-only, unimplemented here"
+                );
                 let (rows, dim) = (rows as usize, dim as usize);
                 let bx = self.ensure_device(r, x);
                 let bd = self.dev_dst(r, dst, rows * dim);

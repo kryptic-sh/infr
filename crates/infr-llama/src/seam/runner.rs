@@ -28,6 +28,11 @@ pub(super) struct DecodeHandles {
     // device weight bound from `SeamKv::sc_embt`, NOT from the ordinary `weights` upload loop.
     sc_logits: Option<TensorId>,
     sc_embt: Option<TensorId>,
+    // Vulkan-only perf (`dyn_sc_scale`'s doc on `build`): the 1-element Input the SC subgraph's
+    // `Op::Softmax` reads its scale from instead of a baked constant. `Some` only when `build` was
+    // called with `gpu_sc: Some(true)` AND `dyn_sc_scale: true`; `None` otherwise (Metal's SC
+    // subgraph, and every non-SC build) — mirrors `sc_logits`/`sc_embt`'s gating.
+    temp_inv: Option<TensorId>,
     logits: TensorId,
     // MTP Phase 1 (issue #33, docs/MTP.md): the LM-head INPUT — the same rows `logits` was
     // computed from, one op earlier (post-`output_norm`, pre-`w_lm`). `Some` only when `build`
@@ -596,6 +601,9 @@ pub(crate) fn generate_dense_backend(
             denoise_cache: None,
             self_cond_w: None,
             sc_embt: None,
+            sc_ping: None,
+            sc_ping_write: 0,
+            sc_temp_inv_buf: None,
         });
     }
     let SeamKv {
@@ -613,6 +621,9 @@ pub(crate) fn generate_dense_backend(
         denoise_cache,
         self_cond_w,
         sc_embt,
+        sc_ping,
+        sc_ping_write,
+        sc_temp_inv_buf,
     } = state.as_mut().expect("seam state just initialized");
     let SeamWeights {
         wbufs,
@@ -701,11 +712,18 @@ pub(crate) fn generate_dense_backend(
     // (`DecodeHandles::h_out`) — see that field's doc. `false` for every existing call site;
     // `true` only from the decode loop / speculative-VERIFY call sites below when the caller
     // passed `h_out: Some(_)` to `generate_dense_backend`.
+    // `dyn_sc_scale` (Vulkan-only perf, docs/DIFFUSIONGEMMA.md's Phase-B "sc round-trip"
+    // elimination): only meaningful when `gpu_sc == Some(true)`. `true` declares an EXTRA 1-element
+    // Input (`DecodeHandles::temp_inv`) and wires it as the SC subgraph's `Op::Softmax::scale_buf`
+    // instead of baking `scale: 1.0` — the denoise call site uploads a 4-byte scalar there each
+    // step instead of premultiplying + reuploading the whole `[batch, vocab]` `sc_logits_in`.
+    // `false` for every other call site (Metal keeps the original host-premultiply path).
     let build = |batch: usize,
                  start_pos: usize,
                  logits_rows: usize,
                  denoise: bool,
                  gpu_sc: Option<bool>,
+                 dyn_sc_scale: bool,
                  h_tap: bool|
      -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
@@ -735,6 +753,15 @@ pub(crate) fn generate_dense_backend(
         // temp_inv legitimately changes, so this same plan replays — see the denoise call site).
         let sc_logits_in = if gpu_sc == Some(true) {
             Some(g.input(f32d(batch * c.vocab)))
+        } else {
+            None
+        };
+        // Vulkan-only perf: the SC softmax's per-step temperature divisor, read from a 4-byte
+        // device buffer instead of baked into the plan (see `dyn_sc_scale`'s doc above and
+        // `Op::Softmax::scale_buf`). `None` keeps the SC subgraph's Softmax at the original
+        // `scale: 1.0` (host-premultiplied `sc_logits_in` — Metal's path).
+        let temp_inv_id = if gpu_sc == Some(true) && dyn_sc_scale {
+            Some(g.input(f32d(1)))
         } else {
             None
         };
@@ -1106,8 +1133,10 @@ pub(crate) fn generate_dense_backend(
                     sc_down_id.expect("diffusion-gemma always declares sc_down_id"),
                 );
                 let vocab = c.vocab;
-                // probs = softmax(sc_logits) — temp_inv was already applied on the host, so
-                // `scale: 1.0` here (see `sc_logits_in`'s doc).
+                // probs = softmax(sc_logits * scale). `dyn_sc_scale`: `scale_buf` reads temp_inv
+                // from a device buffer per step (Vulkan) — `scale: 1.0` below is then ignored.
+                // Otherwise temp_inv was already applied on the host, so `scale: 1.0` is the real
+                // value (see `sc_logits_in`'s doc / Metal's path).
                 let probs = g.internal(f32d(batch * vocab));
                 g.push(Op::Softmax {
                     x: sc_logits_in,
@@ -1115,6 +1144,7 @@ pub(crate) fn generate_dense_backend(
                     rows: batch as u32,
                     dim: vocab as u32,
                     scale: 1.0,
+                    scale_buf: temp_inv_id,
                 });
                 // soft = (probs @ sc_embT) * sqrt(n_embd) — sc_embT is [n_embd, n_vocab]
                 // (Op::Linear's `weight: [out_f, in_f]` convention), so this is exactly the
@@ -2101,6 +2131,7 @@ pub(crate) fn generate_dense_backend(
                 pl_tok_in,
                 sc_logits: sc_logits_in,
                 sc_embt: sc_embt_id,
+                temp_inv: temp_inv_id,
                 logits,
                 h_out,
                 k_cache,
@@ -2146,6 +2177,44 @@ pub(crate) fn generate_dense_backend(
         // The plan shape only varies with SC on the gpu_sc path (CPU's graph never changes;
         // `sc_on` there is purely a host-side input difference) — see `DenoiseCache::sc`'s doc.
         let plan_sc = gpu_sc && sc_on;
+        // Perf (Vulkan only — docs/DIFFUSIONGEMMA.md's Phase-B "sc round-trip" elimination): a
+        // session-persistent ping-pong pair of GPU buffers (`SeamKv::sc_ping`) stands in for
+        // `DenoiseCache`'s per-plan `logits_buf`/`sc_logits_buf`. The previous call's LM-head
+        // output is ALREADY resident in one of the pair (it's the very buffer that call
+        // downloaded from), so this call's self-conditioning softmax reads it directly instead of
+        // the host premultiplying and reuploading the whole `[cc, vocab]` array — see `sc_ping`'s
+        // doc and `dyn_sc_scale`'s doc on `build`. Metal keeps the original host-premultiply path
+        // (unverified hardware, out of scope here); CPU never reaches `plan_sc` at all.
+        let use_ping = be.name() == "vulkan";
+        let dyn_sc = plan_sc && use_ping;
+        if use_ping && sc_ping.is_none() {
+            let bytes = cc * c.vocab * 4;
+            *sc_ping = Some([
+                be.alloc(bytes, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+                be.alloc(bytes, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            ]);
+            *sc_temp_inv_buf = Some(
+                be.alloc(4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            if plan_sc {
+                // Defensive seed: this is the FIRST denoise call ever on this slot and it ALREADY
+                // wants self-conditioning, so the ping slot we're about to read from is freshly
+                // zero-initialized, not real data. Every actual caller (`diffusion_generate`'s
+                // `denoise_block`) resets `sc_logits` to `None` at the start of every block, so
+                // production traffic never takes this branch past the very first call ever — seed
+                // it once from the host slice the caller gave us so a hypothetical caller that
+                // DOESN'T reset stays correct too.
+                let read_idx = 1 - *sc_ping_write;
+                be.upload(
+                    sc_ping.as_ref().expect("just allocated")[read_idx].as_ref(),
+                    bytemuck::cast_slice(req.sc_logits.expect("plan_sc implies sc_on")),
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+            }
+        }
 
         let t_sc0 = std::time::Instant::now();
         // 1. Canvas embedding: e = embed(tok)·√n_embd. diffusion-gemma is always gemma-family, so
@@ -2159,8 +2228,9 @@ pub(crate) fn generate_dense_backend(
             let base = tok as usize * ne;
             hidden_host.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
         }
-        // Per-step host-premultiplied previous canvas logits for the gpu_sc path — `Some` only
-        // when `plan_sc` (populated below); declared here so it outlives the upload further down.
+        // Per-step host-premultiplied previous canvas logits for the Metal `gpu_sc` path — `Some`
+        // only when `plan_sc && !dyn_sc` (populated below); declared here so it outlives the
+        // upload further down. Vulkan's `dyn_sc` path never populates this — see `use_ping`'s doc.
         let mut sc_logits_host: Option<Vec<f32>> = None;
         if let Some(sc_logits) = req.sc_logits {
             if sc_logits.len() != cc * c.vocab {
@@ -2171,17 +2241,21 @@ pub(crate) fn generate_dense_backend(
                 ));
             }
             if gpu_sc {
-                // Premultiply by temp_inv on the HOST (one pass over cc*vocab floats, threaded) so
-                // the in-graph `Op::Softmax`'s `scale` stays a CONSTANT 1.0 across steps whose
-                // temp_inv legitimately changes — see `sc_logits_in`'s doc in `build`. Everything
-                // downstream (softmax, the soft-embed matmul, the gated MLP) now runs on-device.
-                use rayon::prelude::*;
-                let mut scaled = vec![0f32; sc_logits.len()];
-                scaled
-                    .par_iter_mut()
-                    .zip(sc_logits.par_iter())
-                    .for_each(|(d, &s)| *d = s * req.temp_inv);
-                sc_logits_host = Some(scaled);
+                if !dyn_sc {
+                    // Premultiply by temp_inv on the HOST (one pass over cc*vocab floats,
+                    // threaded) so the in-graph `Op::Softmax`'s `scale` stays a CONSTANT 1.0
+                    // across steps whose temp_inv legitimately changes — see `sc_logits_in`'s doc
+                    // in `build`. Metal only now: Vulkan's `dyn_sc` path skips this entirely (the
+                    // previous step's RAW logits are already GPU-resident in `sc_ping` and the
+                    // scale rides `sc_temp_inv_buf` instead — see the bind section below).
+                    use rayon::prelude::*;
+                    let mut scaled = vec![0f32; sc_logits.len()];
+                    scaled
+                        .par_iter_mut()
+                        .zip(sc_logits.par_iter())
+                        .for_each(|(d, &s)| *d = s * req.temp_inv);
+                    sc_logits_host = Some(scaled);
+                }
             } else {
                 // Phase-A host path (CPU only now), unchanged.
                 // Phase-A perf: dequantize the self-cond MLP weights ONCE per session, not once
@@ -2252,6 +2326,7 @@ pub(crate) fn generate_dense_backend(
                 cc,
                 true,
                 if gpu_sc { Some(plan_sc) } else { None },
+                dyn_sc,
                 false, // MTP h-tap: diffusion-gemma denoise never taps
             );
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
@@ -2261,10 +2336,17 @@ pub(crate) fn generate_dense_backend(
             let pos_buf = be
                 .alloc(cc * 4, BufferUsage::Staging)
                 .map_err(|e| anyhow!("{e}"))?;
-            let logits_buf = be
-                .alloc(cc * c.vocab * 4, BufferUsage::Staging)
-                .map_err(|e| anyhow!("{e}"))?;
-            let sc_logits_buf = if plan_sc {
+            // Vulkan: the output lives in the session-level `sc_ping` pair instead (see its doc)
+            // — no per-plan logits_buf to allocate. Metal/CPU keep the original per-plan buffer.
+            let logits_buf = if use_ping {
+                None
+            } else {
+                Some(
+                    be.alloc(cc * c.vocab * 4, BufferUsage::Staging)
+                        .map_err(|e| anyhow!("{e}"))?,
+                )
+            };
+            let sc_logits_buf = if plan_sc && !dyn_sc {
                 Some(
                     be.alloc(cc * c.vocab * 4, BufferUsage::Staging)
                         .map_err(|e| anyhow!("{e}"))?,
@@ -2322,40 +2404,78 @@ pub(crate) fn generate_dense_backend(
             db.bind(*wid, wbufs[i].as_ref());
         }
         if plan_sc {
-            let sc_logits_host = sc_logits_host
-                .as_ref()
-                .expect("plan_sc implies sc_on implies sc_logits_host is Some");
-            let sc_logits_buf = dcache
-                .sc_logits_buf
-                .as_ref()
-                .expect("plan_sc plan always allocates sc_logits_buf");
-            be.upload(sc_logits_buf.as_ref(), bytemuck::cast_slice(sc_logits_host))
-                .map_err(|e| anyhow!("{e}"))?;
-            db.bind(
-                dcache
-                    .dh
-                    .sc_logits
-                    .expect("plan_sc plan declares sc_logits"),
-                sc_logits_buf.as_ref(),
-            );
+            if dyn_sc {
+                // Vulkan perf: the SC input is the OTHER ping slot (this call's write target is
+                // the opposite one — see `sc_ping`'s doc) — already GPU-resident, no upload. Only
+                // the 4-byte temp_inv scalar moves host->device this step.
+                let ping = sc_ping.as_ref().expect("allocated above");
+                let read_idx = 1 - *sc_ping_write;
+                let temp_inv_buf = sc_temp_inv_buf.as_ref().expect("allocated above");
+                be.upload(temp_inv_buf.as_ref(), &req.temp_inv.to_le_bytes())
+                    .map_err(|e| anyhow!("{e}"))?;
+                db.bind(
+                    dcache
+                        .dh
+                        .sc_logits
+                        .expect("plan_sc plan declares sc_logits"),
+                    ping[read_idx].as_ref(),
+                );
+                db.bind(
+                    dcache.dh.temp_inv.expect("dyn_sc plan declares temp_inv"),
+                    temp_inv_buf.as_ref(),
+                );
+            } else {
+                // Metal: original host-premultiply-and-upload path, unchanged.
+                let sc_logits_host = sc_logits_host
+                    .as_ref()
+                    .expect("plan_sc && !dyn_sc implies sc_logits_host is Some");
+                let sc_logits_buf = dcache
+                    .sc_logits_buf
+                    .as_ref()
+                    .expect("plan_sc && !dyn_sc plan always allocates sc_logits_buf");
+                be.upload(sc_logits_buf.as_ref(), bytemuck::cast_slice(sc_logits_host))
+                    .map_err(|e| anyhow!("{e}"))?;
+                db.bind(
+                    dcache
+                        .dh
+                        .sc_logits
+                        .expect("plan_sc plan declares sc_logits"),
+                    sc_logits_buf.as_ref(),
+                );
+            }
             db.bind(
                 dcache.dh.sc_embt.expect("plan_sc plan declares sc_embt"),
                 sc_embt.as_ref().expect("ensured present above").as_ref(),
             );
         }
-        db.bind(dcache.dh.logits, dcache.logits_buf.as_ref());
+        // Vulkan: the ping slot THIS call writes into — the opposite of the one just bound above
+        // as SC input (when `plan_sc`), or simply the current write slot on a non-SC step. Metal/
+        // CPU keep the per-plan `logits_buf`.
+        let logits_out_buf: &dyn Buffer = if use_ping {
+            sc_ping.as_ref().expect("allocated above")[*sc_ping_write].as_ref()
+        } else {
+            dcache
+                .logits_buf
+                .as_ref()
+                .expect("non-ping path always allocates logits_buf")
+                .as_ref()
+        };
+        db.bind(dcache.dh.logits, logits_out_buf);
         let t_exec0 = std::time::Instant::now();
         be.execute(dcache.plan.as_ref(), &db)
             .map_err(|e| anyhow!("{e}"))?;
         let exec_secs = t_exec0.elapsed().as_secs_f64();
         req.out_logits.resize(cc * c.vocab, 0.0);
         let t_dl0 = std::time::Instant::now();
-        be.download(
-            dcache.logits_buf.as_ref(),
-            bytemuck::cast_slice_mut(req.out_logits),
-        )
-        .map_err(|e| anyhow!("{e}"))?;
+        be.download(logits_out_buf, bytemuck::cast_slice_mut(req.out_logits))
+            .map_err(|e| anyhow!("{e}"))?;
         let dl_secs = t_dl0.elapsed().as_secs_f64();
+        // Vulkan: flip which ping slot is "write" vs "read" for the NEXT call — this call's output
+        // (just downloaded above) becomes the next call's self-conditioning input, already
+        // GPU-resident (see `sc_ping`'s doc).
+        if use_ping {
+            *sc_ping_write = 1 - *sc_ping_write;
+        }
         if time_diffusion {
             eprintln!(
                 "[diffusion denoise] sc={sc_secs:.3}s build={build_secs:.3}s exec={exec_secs:.3}s dl={dl_secs:.3}s total={:.3}s",
@@ -2421,7 +2541,7 @@ pub(crate) fn generate_dense_backend(
         let time_verify = std::env::var("INFR_MTP_TIME").is_ok();
         let full_reprefill = start == 0 && m > 1;
         let t_vbuild0 = std::time::Instant::now();
-        let (vg, vh) = build(m, start, m, false, None, want_h);
+        let (vg, vh) = build(m, start, m, false, None, false, want_h);
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
         let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
@@ -2598,7 +2718,7 @@ pub(crate) fn generate_dense_backend(
             // here yet. The MTP catch-up driver needs `h` for EVERY prefill row (not just chunk
             // tails); wiring that requires this path to also carry `logits_rows == pf_m` on
             // demand, which Phase 2 will add alongside the actual head forward.
-            let (pf_g, pf_h) = build(pf_m, cstart, 1, false, None, false);
+            let (pf_g, pf_h) = build(pf_m, cstart, 1, false, None, false, false);
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
             let t_compile = pf_t0.elapsed();
@@ -2689,7 +2809,7 @@ pub(crate) fn generate_dense_backend(
         // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
         && h_out.is_none();
     let ro = if dyn_replay {
-        let (g, h) = build(1, 0, 1, false, None, false);
+        let (g, h) = build(1, 0, 1, false, None, false, false);
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         b.bind(h.hidden, hidden_buf.as_ref());
@@ -2768,7 +2888,7 @@ pub(crate) fn generate_dense_backend(
             be.execute(plan.as_ref(), b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
         } else {
-            let (g, h) = build(1, pos, 1, false, None, want_h);
+            let (g, h) = build(1, pos, 1, false, None, false, want_h);
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();
             b.bind(h.hidden, hidden_buf.as_ref());

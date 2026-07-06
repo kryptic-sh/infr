@@ -121,6 +121,15 @@ pub enum Op {
         rows: u32,
         dim: u32,
         scale: f32,
+        /// Perf (DiffusionGemma denoise, Vulkan — see `crates/infr-llama/src/seam/runner.rs`'s
+        /// denoise call site): when `Some`, the backend reads ONE f32 from this tensor's bound
+        /// buffer at dispatch time and uses THAT as the scale instead of the compile-time `scale`
+        /// field above (which is then ignored). Lets a cached/replayed plan vary the softmax
+        /// temperature every call — a tiny per-step 4-byte upload — instead of re-baking `scale`
+        /// into the plan (which would force a rebuild) or pre-multiplying the whole row host-side.
+        /// `None` (every other call site) keeps the exact prior behavior: `scale` is a plain
+        /// compile-time constant, unmodified.
+        scale_buf: Option<TensorId>,
     },
     /// Per-head RMSNorm of `x` (`rows × n_head × head_dim`) with a per-`head_dim` `weight`
     /// (Qwen3 / Gemma Q-norm and K-norm). In place when `dst == x`.

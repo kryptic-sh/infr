@@ -447,16 +447,21 @@ fn lower_op(
             );
         }
         // Row-wise softmax over `dim` columns (diffusion-gemma's in-graph self-conditioning — see
-        // docs/DIFFUSIONGEMMA.md's Phase-B and the reference's `dg_canvas_embed`).
+        // docs/DIFFUSIONGEMMA.md's Phase-B and the reference's `dg_canvas_embed`). `scale_buf`
+        // (Some only on the DiffusionGemma denoise SC path — see its doc in `infr_core::graph`)
+        // reads the scale from a device buffer instead of the push-constant `scale` field, so this
+        // cached/replayed plan can vary the softmax temperature every step without rebuilding.
         Op::Softmax {
             x,
             dst,
             rows,
             dim,
             scale,
-        } => {
-            rec.softmax(r(*x)?, r(*dst)?, *rows as usize, *dim as usize, *scale);
-        }
+            scale_buf,
+        } => match scale_buf {
+            Some(sb) => rec.softmax_dyn(r(*x)?, r(*sb)?, r(*dst)?, *rows as usize, *dim as usize),
+            None => rec.softmax(r(*x)?, r(*dst)?, *rows as usize, *dim as usize, *scale),
+        },
         // `dst = x · Wᵀ` — dispatch by weight dtype AND row count. Decode (m=1) uses the native
         // GEMV (or f16 GEMV). Prefill (m>1) with a native-quant weight uses the TILED coopmat GEMM
         // `matmul_native` (decode each weight element ONCE, reuse across the 64-row tile) instead
@@ -2591,6 +2596,7 @@ mod tests {
             rows: rows as u32,
             dim: dim as u32,
             scale,
+            scale_buf: None,
         });
         let xb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
         let yb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
@@ -2610,6 +2616,80 @@ mod tests {
                 got[i],
                 want[i]
             );
+        }
+    }
+
+    /// `Op::Softmax` with `scale_buf: Some(_)` (the DiffusionGemma denoise perf path — see its doc)
+    /// must match the SAME host softmax as `scale`, with the scale sourced from a bound 1-element
+    /// buffer instead of a push constant. Also checks that a plan built ONCE and re-`execute`d with
+    /// a DIFFERENT `scale_buf` value each time picks up the new scale — the whole point of the
+    /// mechanism (a cached/replayed plan varying its softmax temperature without a rebuild).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn softmax_dyn_graph_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (rows, dim) = (3usize, 300usize);
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| (i as f32 * 0.037).sin() * 5.0)
+            .collect();
+        let host_softmax = |scale: f32| -> Vec<f32> {
+            let mut want = vec![0f32; rows * dim];
+            for r in 0..rows {
+                let b = r * dim;
+                let row = &x[b..b + dim];
+                let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v * scale));
+                let mut denom = 0f32;
+                for (w, &v) in want[b..b + dim].iter_mut().zip(row) {
+                    *w = (v * scale - mx).exp();
+                    denom += *w;
+                }
+                for w in want[b..b + dim].iter_mut() {
+                    *w /= denom;
+                }
+            }
+            want
+        };
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+        let si = g.input(TensorDesc::new(vec![1], DType::F32));
+        let yi = g.output(TensorDesc::new(vec![rows, dim], DType::F32));
+        g.push(Op::Softmax {
+            x: xi,
+            dst: yi,
+            rows: rows as u32,
+            dim: dim as u32,
+            scale: 1.0, // ignored — scale_buf takes over
+            scale_buf: Some(si),
+        });
+        let xb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+        let sb = be_.alloc(4, BufferUsage::Staging).unwrap();
+        let yb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(xi, xb.as_ref());
+        bind.bind(si, sb.as_ref());
+        bind.bind(yi, yb.as_ref());
+        // Same compiled plan, replayed with two DIFFERENT scale_buf values — exactly the
+        // DiffusionGemma denoise loop's per-step usage (see `crates/infr-llama/src/seam/
+        // runner.rs`'s denoise call site).
+        for &scale in &[1.3f32, 0.42f32] {
+            be_.upload(sb.as_ref(), &scale.to_le_bytes()).unwrap();
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * dim];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            let want = host_softmax(scale);
+            for i in 0..rows * dim {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-4,
+                    "softmax_dyn mismatch at scale={scale} i={i}: got {} want {}",
+                    got[i],
+                    want[i]
+                );
+            }
         }
     }
 
@@ -2732,6 +2812,7 @@ mod tests {
             rows: cc as u32,
             dim: vocab as u32,
             scale,
+            scale_buf: None,
         });
         let soft_i = g.internal(TensorDesc::new(vec![cc, ne], DType::F32));
         g.push(Op::Linear {

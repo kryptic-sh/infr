@@ -997,6 +997,11 @@ macro_rules! dyn_spv {
 }
 dyn_spv!(qk_norm_rope_dyn_spv, "qk_norm_rope_dyn");
 dyn_spv!(qk_norm_rope_dyn_ff_spv, "qk_norm_rope_dyn_ff");
+// Same "read a scalar from a device buffer instead of a push constant" idea, but for
+// DiffusionGemma denoise self-conditioning's softmax scale (`-DUSE_SCALE_BUF`) rather than the
+// record-once decode replay's pos/kv_len — see `Op::Softmax::scale_buf`'s doc and `Recorder::
+// softmax_dyn`.
+dyn_spv!(softmax_dyn_spv, "softmax_dyn");
 dyn_spv!(rope_f16_spv, "rope_f16");
 dyn_spv!(rope_f16_dyn_spv, "rope_f16_dyn");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");

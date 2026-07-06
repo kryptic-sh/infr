@@ -420,8 +420,16 @@ impl Backend for CpuBackend {
                     rows,
                     dim,
                     scale,
+                    scale_buf,
                 } => {
                     let (rows, dim) = (rows as usize, dim as usize);
+                    // Perf (DiffusionGemma denoise, Vulkan) — see `Op::Softmax::scale_buf`'s doc.
+                    // CPU never builds a graph with this set (the CPU denoise path keeps its host
+                    // self-conditioning), but implements it generically rather than panicking.
+                    let scale = match scale_buf {
+                        Some(sb) => vals[sb.0 as usize][0],
+                        None => scale,
+                    };
                     let xs = &vals[x.0 as usize];
                     let mut out = vec![0f32; rows * dim];
                     self.pool().for_chunks_mut(&mut out, dim, 1, &|r, o| {

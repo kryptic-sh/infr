@@ -25,8 +25,14 @@ pub(super) struct DenoiseCache {
     pub(super) dh: DecodeHandles,
     pub(super) hidden_buf: Box<dyn Buffer>,
     pub(super) pos_buf: Box<dyn Buffer>,
-    pub(super) logits_buf: Box<dyn Buffer>,
-    /// Per-step host-premultiplied previous canvas logits `[cc, vocab]` — `Some` only when `sc`.
+    /// Perf (Vulkan — docs/DIFFUSIONGEMMA.md's Phase-B "sc round-trip" elimination): `None` on
+    /// Vulkan, which binds `dh.logits` to `SeamKv::sc_ping` (a session-persistent ping-pong pair)
+    /// instead of a buffer owned by this per-plan cache — see the denoise call site. `Some` on
+    /// Metal/CPU, which keep the original per-plan-owned output buffer.
+    pub(super) logits_buf: Option<Box<dyn Buffer>>,
+    /// Per-step host-premultiplied previous canvas logits `[cc, vocab]` — `Some` only on the
+    /// Metal `sc` path (`plan_sc && !dyn_sc`). Vulkan's `dyn_sc` path reads `SeamKv::sc_ping`
+    /// directly instead (no per-plan buffer, no host premultiply) — see the denoise call site.
     pub(super) sc_logits_buf: Option<Box<dyn Buffer>>,
 }
 

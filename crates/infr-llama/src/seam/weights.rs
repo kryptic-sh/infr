@@ -139,6 +139,23 @@ pub(crate) struct SeamKv {
     /// CPU (it never sets it) and for every non-diffusion-gemma caller. `Arc` so `fork()`
     /// shares it with forked conversation slots for free — mirrors `self_cond_w`.
     pub(super) sc_embt: Option<std::sync::Arc<dyn Buffer>>,
+    /// Perf (Vulkan only — see docs/DIFFUSIONGEMMA.md's Phase-B "sc round-trip" elimination):
+    /// ping-pong pair of persistent `[cc*vocab]` device buffers backing the denoise loop's canvas
+    /// logits, so the previous step's raw output is already GPU-resident for this step's
+    /// self-conditioning softmax input — no host download+reupload. Session-lifetime: `cc`/vocab
+    /// are fixed for the whole session, so this pair survives every `denoise_cache` rebuild
+    /// (block boundaries, the sc off→on plan-shape transition). `None` until the first Vulkan
+    /// denoise call; stays `None` forever on Metal/CPU (they keep the original per-plan-owned
+    /// `DenoiseCache::logits_buf`/`sc_logits_buf`).
+    pub(super) sc_ping: Option<[Box<dyn Buffer>; 2]>,
+    /// Which `sc_ping` slot the NEXT denoise call's LM-head output lands in (flips every call —
+    /// the OTHER slot holds the value to read as that call's self-conditioning input, already
+    /// GPU-resident from the call that wrote it).
+    pub(super) sc_ping_write: usize,
+    /// 4-byte device scalar holding the CURRENT call's self-conditioning `temp_inv`, read by the
+    /// dynamic-scale softmax (`Op::Softmax::scale_buf`) instead of a per-step host premultiply of
+    /// the whole `[cc, vocab]` logits buffer. Lazily allocated alongside `sc_ping`.
+    pub(super) sc_temp_inv_buf: Option<Box<dyn Buffer>>,
 }
 
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
@@ -247,6 +264,12 @@ impl SeamKv {
             denoise_cache: None,
             self_cond_w: self.self_cond_w.clone(),
             sc_embt: self.sc_embt.clone(),
+            // `sc_ping`'s buffers are per-slot device state (bound in the forked slot's own
+            // graph executions), unlike the model-derived `self_cond_w`/`sc_embt` above — rebuild
+            // lazily on this slot's first Vulkan denoise call, exactly like `denoise_cache`.
+            sc_ping: None,
+            sc_ping_write: 0,
+            sc_temp_inv_buf: None,
         })
     }
 

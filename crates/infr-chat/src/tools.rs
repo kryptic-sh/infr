@@ -330,6 +330,7 @@ fn parse_xml_function_body(body: &str) -> Option<ToolCall> {
 ///   models' calls;
 /// - Llama-3.x's bare-JSON form: the template instructs `{"name": .., "parameters": {..}}` as
 ///   the WHOLE response, no markers at all.
+///
 /// Dialects are tried in that order; the bare-JSON form only counts when the entire (trimmed)
 /// body is a single such object, so ordinary prose mentioning JSON is never misparsed. Callers
 /// gate on tools-present (`allow_tools`) as before.

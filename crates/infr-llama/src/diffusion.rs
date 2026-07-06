@@ -252,42 +252,57 @@ fn denoise_block(
 
         // Per-position argmax / entropy(softmax(raw*temp_inv)) / one multinomial draw from that
         // softmax using the pre-drawn `u[pos]` (`diffusion.cpp:583-612`'s `worker`).
+        //
+        // Perf (profiled via samply: this loop's `exp`/`ln` calls — glibc's correctly-rounded
+        // expf/logf helper, `f32subf64x` — were >25% of ALL sampled thread-time on a 256-row
+        // canvas × 262144-vocab step, dwarfing every GPU kernel's share; see docs/PERF.md's class-5
+        // "host-in-the-loop" entry). The original computed `exp(raw*temp_inv - m)` TWICE per vocab
+        // element (once to accumulate `z_sum`, again — bit-for-bit the same value, since `exp` is a
+        // pure function of its input bits — to get `e` for the entropy/cumsum pass). Caching that
+        // first `exp` in a per-thread scratch buffer (`map_init`, reused across this worker's
+        // positions instead of a fresh per-position `Vec`) drops the loop from 2 exp passes + 1 ln
+        // pass to 1 exp pass + 1 ln pass over the row — same values, same order, bit-identical
+        // output, ~1/3 fewer transcendental calls and one fewer full 1 MB/row traversal.
         let per_pos: Vec<(u32, f32, u32)> = (0..c)
             .into_par_iter()
-            .map(|pos| {
-                let row = &logits[pos * vocab..(pos + 1) * vocab];
-                let mut m = f32::NEG_INFINITY;
-                let mut amax = 0u32;
-                for (v, &raw) in row.iter().enumerate() {
-                    let z = raw * temp_inv;
-                    if z > m {
-                        m = z;
-                        amax = v as u32;
+            .map_init(
+                || vec![0f32; vocab],
+                |escratch, pos| {
+                    let row = &logits[pos * vocab..(pos + 1) * vocab];
+                    let mut m = f32::NEG_INFINITY;
+                    let mut amax = 0u32;
+                    for (v, &raw) in row.iter().enumerate() {
+                        let z = raw * temp_inv;
+                        if z > m {
+                            m = z;
+                            amax = v as u32;
+                        }
                     }
-                }
-                let mut z_sum = 0f32;
-                for &raw in row {
-                    z_sum += (raw * temp_inv - m).exp();
-                }
-                let target = u[pos] * z_sum;
-                let mut cum = 0f32;
-                let mut h = 0f32;
-                let mut sampled = (vocab - 1) as u32;
-                let mut picked = false;
-                for (v, &raw) in row.iter().enumerate() {
-                    let e = (raw * temp_inv - m).exp();
-                    let p = e / z_sum;
-                    if p > 0.0 {
-                        h -= p * p.ln();
+                    let mut z_sum = 0f32;
+                    for (v, &raw) in row.iter().enumerate() {
+                        let e = (raw * temp_inv - m).exp();
+                        escratch[v] = e;
+                        z_sum += e;
                     }
-                    cum += e;
-                    if !picked && cum >= target {
-                        sampled = v as u32;
-                        picked = true;
+                    let target = u[pos] * z_sum;
+                    let mut cum = 0f32;
+                    let mut h = 0f32;
+                    let mut sampled = (vocab - 1) as u32;
+                    let mut picked = false;
+                    for (v, &e) in escratch.iter().enumerate() {
+                        let p = e / z_sum;
+                        if p > 0.0 {
+                            h -= p * p.ln();
+                        }
+                        cum += e;
+                        if !picked && cum >= target {
+                            sampled = v as u32;
+                            picked = true;
+                        }
                     }
-                }
-                (amax, h, sampled)
-            })
+                    (amax, h, sampled)
+                },
+            )
             .collect();
         for (pos, &(amax, h, sampled)) in per_pos.iter().enumerate() {
             argmax_canvas[pos] = amax;

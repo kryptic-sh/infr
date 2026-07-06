@@ -500,10 +500,17 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // diffusion-gemma prefill measured 26 t/s vs 1424 t/s warm, all compile.
     model.warmup()?;
     let mut chat = infr_llama::chat::Chat::new(model);
+    // Live denoise canvas view (diffusion-gemma only — see `DiffusionVisual`'s doc); `None` when
+    // unset/not-DG/not-a-tty leaves `run_chat_turn` on the exact pre-existing `chat.turn` path.
+    let mut visual = if is_dg {
+        DiffusionVisual::new(&gguf)?
+    } else {
+        None
+    };
 
     // One-shot (a message) or an interactive multi-turn REPL (every backend now supports it).
     if let Some(m) = message {
-        run_chat_turn(&mut chat, m, max_new)?;
+        run_chat_turn(&mut chat, m, max_new, visual.as_mut())?;
         return Ok(());
     }
     let stdin = std::io::stdin();
@@ -524,7 +531,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         if matches!(line, "exit" | "quit" | ":q" | ":quit") {
             break;
         }
-        if let Err(e) = run_chat_turn(&mut chat, line, max_new) {
+        if let Err(e) = run_chat_turn(&mut chat, line, max_new, visual.as_mut()) {
             eprintln!("error: {e}");
         }
     }
@@ -532,14 +539,50 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
 }
 
 /// Run one chat turn through the shared [`Chat`]: stream pieces via the `<think>` renderer, then
-/// print the prefill/decode stats line.
+/// print the prefill/decode stats line. `visual: Some` (diffusion-gemma, `INFR_DIFFUSION_VISUAL`
+/// set, stdout a tty) drives the turn through `turn_with_step_hook` instead, so the live canvas
+/// view redraws in the reserved terminal region while the block denoises; `None` is the exact
+/// pre-existing `chat.turn` call, byte-for-byte.
 fn run_chat_turn(
     chat: &mut infr_llama::chat::Chat,
     message: &str,
     max_new: usize,
+    visual: Option<&mut DiffusionVisual>,
 ) -> anyhow::Result<()> {
     let mut render = ThinkRender::new();
-    let stats = chat.turn(message, max_new, &mut |p| render.feed(p))?;
+    let stats = match visual {
+        Some(v) => {
+            v.begin();
+            // `on_piece` only starts firing once `diffusion_generate` has produced the WHOLE
+            // reply (all blocks) and `generate_impl` streams it through the shared detok — i.e.
+            // strictly after every `on_step` call for this turn. So its first invocation is
+            // exactly the right moment to erase the live region: erasing after
+            // `turn_with_step_hook` returns instead would be too late, since the plain transcript
+            // text (from `on_piece`) has ALREADY printed to stdout by then, right where the
+            // region's cursor was left — a `v.end()` there would erase the reply, not the region.
+            // Both closures below only need transient access (never concurrently — generation is
+            // single-threaded and `on_step`/`on_piece` never interleave), so a `RefCell` lets them
+            // share `v` without two simultaneous `&mut` captures.
+            let visual = std::cell::RefCell::new(v);
+            let mut ended = false;
+            let mut on_piece = |p: &str| {
+                if !ended {
+                    visual.borrow_mut().end();
+                    ended = true;
+                }
+                render.feed(p);
+            };
+            let mut on_step =
+                |view: infr_llama::diffusion::StepView| visual.borrow_mut().step(view);
+            let result =
+                chat.turn_with_step_hook(message, max_new, &mut on_piece, Some(&mut on_step));
+            if !ended {
+                visual.borrow_mut().end(); // no piece ever streamed (e.g. an empty/error turn)
+            }
+            result?
+        }
+        None => chat.turn(message, max_new, &mut |p| render.feed(p))?,
+    };
     render.finish();
     let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
     eprintln!(
@@ -551,6 +594,132 @@ fn run_chat_turn(
         rate(stats.n_gen, stats.decode_secs),
     );
     Ok(())
+}
+
+/// Fixed-size scratch region (rows) the live view redraws in place — capped rather than sized to
+/// the real terminal so there's no ioctl/terminal-size dependency: worst case on a narrower
+/// terminal a long line wraps, which only affects this scratch region's own redraw math, never the
+/// surrounding transcript.
+const DG_VISUAL_ROWS: usize = 16;
+/// Fixed column cap per rendered line (char-truncated) — same conservative-width rationale as
+/// [`DG_VISUAL_ROWS`].
+const DG_VISUAL_COLS: usize = 120;
+
+use std::io::{IsTerminal, Write as _};
+
+/// `INFR_DIFFUSION_VISUAL` live denoise canvas view for `infr run` (diffusion-gemma only — see
+/// `docs/DIFFUSIONGEMMA.md`, ports the UX idea of the oracle's `--diffusion-visual` without
+/// depending on it): per step, decode the block's CURRENT canvas fresh with a throwaway tokenizer
+/// ([`OaiRenderer::decode_ids`] — cheap, ≤ canvas_len tokens, no GPU work), render accepted
+/// (committed) runs as normal text and not-yet-accepted (still renoising — this sampler has no
+/// literal mask token, see `crate::diffusion`'s module doc) runs as a dim `·` placeholder, and
+/// redraw a fixed-height region in place (cursor-up + erase, DEC synchronized-update framing) so
+/// the terminal never scrolls mid-block. The region is erased once the turn's `generate` call
+/// returns, so the ordinary transcript print (`Chat::turn`'s `on_piece`, unchanged) still prints
+/// the finished reply cleanly below it.
+struct DiffusionVisual {
+    oai: infr_llama::chat::OaiRenderer,
+    /// Rows the previous frame's redraw advanced past the region's top — 0 before the first frame
+    /// (mirrors the oracle's `cb_data.vis_prev_rows`).
+    prev_rows: usize,
+}
+
+impl DiffusionVisual {
+    /// `None` unless `INFR_DIFFUSION_VISUAL=1` (stdout must be a tty) or `=force` (bypasses the
+    /// tty check — for scripted verification against piped stdout, e.g. `... | tail -20`).
+    fn new(gguf: &Path) -> anyhow::Result<Option<Self>> {
+        let mode = std::env::var("INFR_DIFFUSION_VISUAL").unwrap_or_default();
+        let force = mode == "force";
+        if !force && mode != "1" {
+            return Ok(None);
+        }
+        if !force && !std::io::stdout().is_terminal() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            oai: infr_llama::chat::OaiRenderer::open(gguf)?,
+            prev_rows: 0,
+        }))
+    }
+
+    /// Reserve the region: hide the cursor, print `DG_VISUAL_ROWS` blank lines (scrolls once if
+    /// already at the bottom, exactly like a normal print would — scrollback stays intact), then
+    /// park the cursor back at the region's top.
+    fn begin(&mut self) {
+        self.prev_rows = 0;
+        print!("\x1b[?25l{}", "\n".repeat(DG_VISUAL_ROWS));
+        print!("\x1b[{DG_VISUAL_ROWS}A");
+        std::io::stdout().flush().ok();
+    }
+
+    /// Redraw the region for one denoise step.
+    fn step(&mut self, view: infr_llama::diffusion::StepView) {
+        let mut text = String::new();
+        let mut i = 0;
+        while i < view.canvas.len() {
+            if view.accepted[i] {
+                let start = i;
+                while i < view.canvas.len() && view.accepted[i] {
+                    i += 1;
+                }
+                if let Ok(s) = self.oai.decode_ids(&view.canvas[start..i]) {
+                    text.push_str(&s);
+                }
+            } else {
+                let start = i;
+                while i < view.canvas.len() && !view.accepted[i] {
+                    i += 1;
+                }
+                for _ in start..i {
+                    text.push_str("\x1b[2m·\x1b[0m");
+                }
+            }
+        }
+        let mut rows = vec![format!(
+            "[diffusion] block {} step {}/{} (committed {} tok)",
+            view.block,
+            view.step + 1,
+            view.max_steps,
+            view.committed_before,
+        )];
+        for line in text.split('\n') {
+            rows.push(line.chars().take(DG_VISUAL_COLS).collect());
+        }
+        let keep = rows.len().min(DG_VISUAL_ROWS);
+        let shown = &rows[rows.len() - keep..];
+
+        let mut frame = String::from("\x1b[?2026h"); // begin synchronized update
+        if self.prev_rows > 0 {
+            frame.push_str(&format!("\x1b[{}A", self.prev_rows));
+        }
+        frame.push('\r');
+        for r in 0..DG_VISUAL_ROWS {
+            if let Some(line) = shown.get(r) {
+                frame.push_str(line);
+            }
+            frame.push_str("\x1b[K"); // erase to end of line — clears a shorter previous frame
+            if r + 1 < DG_VISUAL_ROWS {
+                frame.push('\n');
+            }
+        }
+        frame.push_str("\x1b[?2026l"); // end synchronized update
+        self.prev_rows = DG_VISUAL_ROWS - 1;
+        print!("{frame}");
+        std::io::stdout().flush().ok();
+    }
+
+    /// Erase the region and restore the cursor — called once the turn's `generate` returns
+    /// (`Ok` or `Err`) so the next thing printed (the normal transcript, or an error) starts clean.
+    fn end(&mut self) {
+        let mut frame = String::new();
+        if self.prev_rows > 0 {
+            frame.push_str(&format!("\x1b[{}A", self.prev_rows));
+        }
+        frame.push_str("\r\x1b[J\x1b[?25h"); // erase from cursor to end of screen, show cursor
+        print!("{frame}");
+        std::io::stdout().flush().ok();
+        self.prev_rows = 0;
+    }
 }
 
 /// The Metal dense/MoE [`ChatModel`] for run AND serve: the persistent-session seam chat, or —
@@ -1181,6 +1350,7 @@ fn dg_bench_run(
                         n_gen,
                         seed,
                         max_ctx,
+                        None,
                     )?;
                     pps.push(p_eff as f64 / result.stats.prompt_secs.max(1e-9));
                     gens.push(result.stats.n_gen as f64 / result.stats.decode_secs.max(1e-9));

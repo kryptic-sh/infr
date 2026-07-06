@@ -185,6 +185,32 @@ impl ChatModel for DiffusionGemmaChat {
         max_new: usize,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        self.generate_impl(prompt, max_new, on_piece, None)
+    }
+
+    fn generate_with_step_hook(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+        on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
+    ) -> Result<GenStats> {
+        self.generate_impl(prompt, max_new, on_piece, on_step)
+    }
+}
+
+impl DiffusionGemmaChat {
+    /// Shared body of [`ChatModel::generate`]/[`ChatModel::generate_with_step_hook`] — `on_step:
+    /// None` (the plain `generate` path) is byte-identical to the pre-hook implementation: the
+    /// hook is only ever read inside [`crate::diffusion::diffusion_generate`]'s step loop, and a
+    /// `None` there is a single `if let` check with no other side effect.
+    fn generate_impl(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+        on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
+    ) -> Result<GenStats> {
         let enc = self
             .model
             .tokenizer()
@@ -227,6 +253,7 @@ impl ChatModel for DiffusionGemmaChat {
             max_new,
             seed,
             self.max_ctx,
+            on_step,
         )?;
 
         // Stream the committed tokens through the shared incremental UTF-8-safe detok — the same

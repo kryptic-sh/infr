@@ -48,6 +48,23 @@ pub trait ChatModel {
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats>;
 
+    /// Like [`generate`](Self::generate), plus an optional per-denoise-step observable view for
+    /// architectures with an internal multi-step decode inside ONE `generate` call (currently only
+    /// diffusion-gemma's block-diffusion loop — [`crate::diffusion::StepView`], driving
+    /// `infr run`'s `INFR_DIFFUSION_VISUAL` live canvas view). Default: ignore the hook and
+    /// delegate to `generate` — every autoregressive backend already streams token-by-token via
+    /// `on_piece` and has no internal notion of a "step", so this default keeps every existing
+    /// `ChatModel` impl byte-identical with zero code change.
+    fn generate_with_step_hook(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+        _on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
+    ) -> Result<GenStats> {
+        self.generate(prompt, max_new, on_piece)
+    }
+
     /// Optional REPL status (e.g. dense returns `ctx N/MAX`); `None` for stateless backends.
     fn status(&self) -> Option<String> {
         None
@@ -112,6 +129,21 @@ impl<'a> Chat<'a> {
         max_new: usize,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        self.turn_with_step_hook(message, max_new, on_piece, None)
+    }
+
+    /// Like [`turn`](Self::turn), plus an optional per-denoise-step hook
+    /// ([`crate::diffusion::StepView`]) forwarded to the backend's
+    /// [`generate_with_step_hook`](ChatModel::generate_with_step_hook) — `infr run`'s
+    /// `INFR_DIFFUSION_VISUAL` live canvas view is the only caller today. `on_step: None` behaves
+    /// EXACTLY like `turn` (same default no-op path in every `ChatModel` impl).
+    pub fn turn_with_step_hook(
+        &mut self,
+        message: &str,
+        max_new: usize,
+        on_piece: &mut dyn FnMut(&str),
+        on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
+    ) -> Result<GenStats> {
         self.history.push(("user".into(), message.to_string()));
         let prompt = {
             let refs: Vec<(&str, &str)> = self
@@ -138,7 +170,9 @@ impl<'a> Chat<'a> {
         if infr_chat::prompt_prefills_think(&prompt) {
             emit("<think>");
         }
-        let stats = self.model.generate(&prompt, max_new, &mut emit)?;
+        let stats = self
+            .model
+            .generate_with_step_hook(&prompt, max_new, &mut emit, on_step)?;
         self.history
             .push(("assistant".into(), strip_think(&answer)));
         Ok(stats)

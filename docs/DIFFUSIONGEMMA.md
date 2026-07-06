@@ -224,6 +224,26 @@ Resolved from the oracle source (`diffusion-cli.cpp` run_turn, ~line 413+):
   (CLI-overridable). Phase 3 ports `diffusion_generate_entropy_bound` from the
   PR.
 
+## Live denoise view (`infr run`)
+
+`INFR_DIFFUSION_VISUAL=1` turns on a live canvas view while `infr run` denoises
+a block — a small opt-in port of the oracle's `--diffusion-visual` UX (see
+`~/Projects/mxaddict/llama.cpp-dg/examples/diffusion/diffusion-cli.cpp`), not a
+dependency on it. Only active on a TTY stdout (piped/redirected output is left
+alone); `INFR_DIFFUSION_VISUAL=force` bypasses the TTY check for scripted
+verification. Per step it decodes the block's current canvas fresh (a throwaway
+tokenizer, ≤ `canvas_length` tokens, no GPU work), prints already-accepted runs
+as normal text and still-renoising positions (this sampler has no literal mask
+token — see `crate::diffusion`'s module doc) as a dim `·` placeholder, and
+redraws a fixed-size scratch region in place (cursor-up + erase) so the terminal
+never scrolls mid-block. The region is erased right before the finished reply
+prints, so the ordinary transcript stays clean; the hook is a no-op with the env
+unset (byte-identical decode loop, zero GPU cost).
+
+```bash
+INFR_DIFFUSION_VISUAL=1 infr run <dg-gguf>
+```
+
 ## Validation ladder
 
 1. Metadata parse matches the GGUF dump (Phase 1).

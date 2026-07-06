@@ -116,6 +116,33 @@ pub struct DiffusionGenResult {
     pub blocks: usize,
 }
 
+/// One denoise step's observable state, handed to the optional `on_step` hook in
+/// [`diffusion_generate`] — everything a live TTY renderer (`INFR_DIFFUSION_VISUAL`, `infr-cli`'s
+/// `cmd_run`) needs to redraw the canvas without reaching into the sampler's internals. Purely
+/// additive: the hook is `Option`, and `None` (every existing caller) skips construction of this
+/// struct entirely — no behavior or timing change on the hot path.
+pub struct StepView<'a> {
+    /// 0-based index of the block currently denoising (`diffusion_generate`'s `b`).
+    pub block: usize,
+    /// 0-based step index WITHIN this block (how many denoise steps have run so far, this one
+    /// included).
+    pub step: usize,
+    /// This block's step budget (`eb.max_steps`) — lets a renderer show "step N/max".
+    pub max_steps: usize,
+    /// This block's current argmax canvas (`diffusion.cpp:658`'s `argmax_canvas`) — the same
+    /// observable output the reference visualizer draws every step, regardless of acceptance.
+    pub canvas: &'a [u32],
+    /// Per-canvas-position: `true` once this step accepted (committed) the position's low-entropy
+    /// sample; `false` means the position is still being renoised each step — this sampler has no
+    /// literal mask token (see the module doc), so "accepted" stands in for "decided" and
+    /// "not yet accepted" for "still masked/undecided".
+    pub accepted: &'a [bool],
+    /// Response tokens already committed BEFORE this block started (`response.len()` at the top
+    /// of the block loop) — the prompt-relative position of this block's canvas, so a renderer can
+    /// place it after prior committed text without re-deriving it from `prefix`/`prompt_tokens`.
+    pub committed_before: usize,
+}
+
 /// Deterministic xorshift64 PRNG (seeded per block — see [`diffusion_generate`]'s doc). Stands in
 /// for the reference's `std::mt19937`: same *role* (canvas init, per-step multinomial draw,
 /// renoise), not bit-identical output — see this module's doc comment.
@@ -144,11 +171,26 @@ impl Rng {
     }
 }
 
+/// Reborrow the per-block `on_step` hook with a fresh, shorter lifetime for one `denoise_block`
+/// call. A bare `on_step.as_deref_mut()` inside `diffusion_generate`'s per-block `for` loop trips
+/// E0499 (no Polonius yet): each iteration's reborrow of the `&mut dyn FnMut` needs to be shorter
+/// than the OUTER lifetime the function signature ties it to, which a method call inline can't
+/// express — routing through this free function gives the reborrow its own elided lifetime.
+fn reborrow_step_hook<'b>(
+    hook: &'b mut Option<&mut dyn FnMut(StepView)>,
+) -> Option<&'b mut dyn FnMut(StepView)> {
+    match hook {
+        Some(cb) => Some(&mut **cb),
+        None => None,
+    }
+}
+
 /// ONE block's entropy-bound denoise (`diffusion_generate_entropy_bound`, `diffusion.cpp:442-683`)
 /// against a session already `prefill`ed with the committed prefix. Returns the block's argmax
 /// canvas (the observable output — `diffusion.cpp:658` writes `argmax_canvas` to `output_tokens`
 /// every step regardless of acceptance) and the number of steps actually run (early stop —
 /// `diffusion.cpp:665`).
+#[allow(clippy::too_many_arguments)]
 fn denoise_block(
     session: &mut impl DiffusionSession,
     model: &SeamModel,
@@ -156,6 +198,9 @@ fn denoise_block(
     vocab: usize,
     eb: &EbConfig,
     rng: &mut Rng,
+    block: usize,
+    committed_before: usize,
+    mut on_step: Option<&mut dyn FnMut(StepView)>,
 ) -> Result<(Vec<u32>, usize)> {
     let c = canvas_len;
     let s = eb.max_steps.max(1);
@@ -268,6 +313,17 @@ fn denoise_block(
         }
         sc_buffer = Some(logits); // this step's raw logits self-condition the next
 
+        if let Some(cb) = on_step.as_deref_mut() {
+            cb(StepView {
+                block,
+                step: steps_run - 1,
+                max_steps: s,
+                canvas: &argmax_canvas,
+                accepted: &accepted,
+                committed_before,
+            });
+        }
+
         // Adaptive stop: argmax stable for `stability_threshold` steps AND confident (mean
         // entropy below the bound) — `diffusion.cpp:662-667`.
         let stable = prev_argmax.as_deref() == Some(argmax_canvas.as_slice());
@@ -336,6 +392,7 @@ pub fn diffusion_generate(
     n_predict: usize,
     seed: u64,
     max_ctx: usize,
+    mut on_step: Option<&mut dyn FnMut(StepView)>,
 ) -> Result<DiffusionGenResult> {
     let blocks_wanted = n_predict.div_ceil(canvas_len.max(1)).max(1);
     let mut prefix: Vec<u32> = prompt_tokens.to_vec();
@@ -369,7 +426,17 @@ pub fn diffusion_generate(
         // Reseed every block (see this fn's doc) — `run_turn`'s per-block sampler call.
         let mut rng = Rng::new(seed);
         let t_dn = std::time::Instant::now();
-        let (canvas, steps) = denoise_block(session, model, canvas_len, vocab, eb, &mut rng)?;
+        let (canvas, steps) = denoise_block(
+            session,
+            model,
+            canvas_len,
+            vocab,
+            eb,
+            &mut rng,
+            b,
+            response.len(),
+            reborrow_step_hook(&mut on_step),
+        )?;
         decode_secs += t_dn.elapsed().as_secs_f64();
         steps_total += steps;
         blocks_run += 1;

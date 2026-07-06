@@ -3402,6 +3402,17 @@ impl<'a> Recorder<'a> {
     /// whole chunk landing on one expert); tiles past a segment exit immediately, so the empty
     /// launches cost ~nothing while the dispatch count drops from ~n_expert·stages per layer to
     /// stages. `sact` is Q4_K's min-term row sums (None for Q6_K/Q8_0/Q5_0, which have no min).
+    ///
+    /// `rows` is a GRID-SIZING BOUND ONLY (never read by the shader — the kernel derives every
+    /// real row range from `counts`/`offsets`): it must be `>=` the largest possible `counts[e]`
+    /// over any expert `e`. Pass the CHUNK's TOKEN count (`x.numel()/ne`), not `n_pairs` (=
+    /// `tokens·n_used`, the total packed-buffer length) — a top-k router never assigns a token to
+    /// the same expert twice, so `counts[e] <= tokens` always (one assignment per token, at most),
+    /// an `n_used`×-tighter bound than `n_pairs`. Passing `n_pairs` here is still CORRECT (a valid
+    /// superset of row tiles, just with more early-exiting empty ones) but launches `n_used`× the
+    /// necessary workgroups — caught during the diffusion-gemma perf campaign (slice 5): DG's
+    /// caller was passing `n_pairs` (n_used=8 → 8× the row-tile grid) alongside qwen3moe's caller,
+    /// which had the same bug. Fixed at both call sites in `adapter.rs`'s `Op::MoeFfn` lowering.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_experts(
         &self,

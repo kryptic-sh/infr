@@ -2906,6 +2906,10 @@ pub(crate) fn act_fn(act: Activation, g: f32) -> f32 {
 mod kernel_tests {
     use super::*;
     use crate::quant::{quantize_q8, quantize_q8_32};
+    // These pack/gemm helpers exist only on x86_64 (AVX2/AVX512-VNNI); the tests that use them
+    // gate their bodies on the same arch, so the import must be gated too or it fails to resolve
+    // on aarch64.
+    #[cfg(target_arch = "x86_64")]
     use crate::repack::{q4k_gemm_group, q4k_pack, q6k_gemm_group, q6k_pack};
     use infr_core::tensor::DType;
     use infr_gguf::dequant::dequant_block;

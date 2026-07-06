@@ -735,13 +735,10 @@ impl DiffusionVisual {
                 lines.last_mut().unwrap().push((c, dim));
             }
         }
-        let mut rows = vec![format!(
-            "[diffusion] block {} step {}/{} (committed {} tok)",
-            view.block,
-            view.step + 1,
-            view.max_steps,
-            view.committed_before,
-        )];
+        // No header line (user feedback: the "[diffusion] block N step S/M" rows read as
+        // noise) — the resolving canvas itself is the progress indicator.
+        let _ = (view.block, view.step, view.max_steps, view.committed_before);
+        let mut rows: Vec<String> = Vec::new();
         for line in &lines {
             let cut = line.len().min(self.cols);
             rows.push(render_dim_line(&line[..cut]));
@@ -749,7 +746,11 @@ impl DiffusionVisual {
         let keep = rows.len().min(DG_VISUAL_ROWS);
         let shown = &rows[rows.len() - keep..];
 
-        let mut frame = String::from("\x1b[?2026h"); // begin synchronized update
+        // ?7l: auto-wrap OFF for the frame — a too-long line truncates at the margin instead
+        // of wrapping to a second physical row, which would desync the fixed-row cursor math
+        // (COLUMNS is a shell variable most shells don't export, so the item clamp can't know
+        // the real width). Restored (?7h) at frame end.
+        let mut frame = String::from("\x1b[?2026h\x1b[?7l"); // begin synchronized update
         if self.prev_rows > 0 {
             frame.push_str(&format!("\x1b[{}A", self.prev_rows));
         }
@@ -763,7 +764,7 @@ impl DiffusionVisual {
                 frame.push('\n');
             }
         }
-        frame.push_str("\x1b[?2026l"); // end synchronized update
+        frame.push_str("\x1b[?7h\x1b[?2026l"); // auto-wrap back on, end synchronized update
         self.prev_rows = DG_VISUAL_ROWS - 1;
         print!("{frame}");
         std::io::stdout().flush().ok();

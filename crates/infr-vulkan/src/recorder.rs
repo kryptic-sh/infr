@@ -311,6 +311,68 @@ impl<'a> Recorder<'a> {
         self.dispatch3(k, buffers, n_out, push, groups, 1, 1);
     }
 
+    /// Bind `k`'s pipeline and all of `buffers` to descriptor set 0. `VK_KHR_push_descriptor`
+    /// (when the device has it) records the bindings straight into the command buffer with one
+    /// `cmd_push_descriptor_set` call — no host-side descriptor-pool allocation or
+    /// `vkUpdateDescriptorSets` syscall, which the pooled path below pays on EVERY dispatch. That
+    /// per-dispatch churn measured as a real chunk of the host-side (non-GPU-timestamped) gap at
+    /// small-m shapes (many-op graphs where GPU busy time is small — PERF.md class 4). Falls back
+    /// to the pooled alloc_set + update_descriptor_sets + cmd_bind_descriptor_sets sequence when
+    /// the extension is unavailable; `k.ds_layout` was built to match (see `ops.rs`).
+    fn bind_descriptors(&self, k: ComputeKernel, buffers: &[vk::Buffer]) {
+        let device = &self.be.shared.device;
+        unsafe { device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline) };
+        let infos: Vec<vk::DescriptorBufferInfo> = buffers
+            .iter()
+            .map(|&buffer| vk::DescriptorBufferInfo {
+                buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+            })
+            .collect();
+        if let Some(pd) = &self.be.shared.push_descriptor {
+            let ds_writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
+                .map(|i| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&infos[i..i + 1])
+                })
+                .collect();
+            unsafe {
+                pd.cmd_push_descriptor_set(
+                    self.cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    k.pipeline_layout,
+                    0,
+                    &ds_writes,
+                );
+            }
+        } else {
+            let set = self.alloc_set(k.ds_layout);
+            let ds_writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
+                .map(|i| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(&infos[i..i + 1])
+                })
+                .collect();
+            unsafe {
+                device.update_descriptor_sets(&ds_writes, &[]);
+                device.cmd_bind_descriptor_sets(
+                    self.cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    k.pipeline_layout,
+                    0,
+                    &[set],
+                    &[],
+                );
+            }
+        }
+    }
+
     /// Like [`Self::dispatch`], but the workgroup count comes from `args` (a GPU-written
     /// `[gx,gy,gz]` u32 triple at offset 0 — vkCmdDispatchIndirect). `args` joins the hazard reads
     /// so the barrier after its producer covers the indirect-command read (the barrier's dst stage
@@ -331,36 +393,9 @@ impl<'a> Recorder<'a> {
         self.indirect_pending.set(true);
         self.sync(&all_reads, writes, false);
         self.indirect_pending.set(false);
+        self.bind_descriptors(k, buffers);
         let device = &self.be.shared.device;
-        let set = self.alloc_set(k.ds_layout);
-        let infos: Vec<vk::DescriptorBufferInfo> = buffers
-            .iter()
-            .map(|&buffer| vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let ds_writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
-            .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&infos[i..i + 1])
-            })
-            .collect();
-        unsafe { device.update_descriptor_sets(&ds_writes, &[]) };
         unsafe {
-            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
-            device.cmd_bind_descriptor_sets(
-                self.cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                k.pipeline_layout,
-                0,
-                &[set],
-                &[],
-            );
             if k.push_size > 0 {
                 device.cmd_push_constants(
                     self.cmd,
@@ -390,38 +425,10 @@ impl<'a> Recorder<'a> {
         let split = buffers.len() - n_out;
         let (reads, writes) = buffers.split_at(split);
         self.sync(reads, writes, false);
+        self.bind_descriptors(k, buffers);
         let device = &self.be.shared.device;
-        let set = self.alloc_set(k.ds_layout);
-
-        let infos: Vec<vk::DescriptorBufferInfo> = buffers
-            .iter()
-            .map(|&buffer| vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let ds_writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
-            .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&infos[i..i + 1])
-            })
-            .collect();
-        unsafe { device.update_descriptor_sets(&ds_writes, &[]) };
 
         unsafe {
-            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
-            device.cmd_bind_descriptor_sets(
-                self.cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                k.pipeline_layout,
-                0,
-                &[set],
-                &[],
-            );
             if k.push_size > 0 {
                 device.cmd_push_constants(
                     self.cmd,

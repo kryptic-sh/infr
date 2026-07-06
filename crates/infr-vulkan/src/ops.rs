@@ -34,6 +34,7 @@ pub(crate) fn make_compute_kernel(
     n_buf: usize,
     push_size: u32,
     required_sg: Option<u32>,
+    push_descriptor: bool,
 ) -> ComputeKernel {
     let shader = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
@@ -49,13 +50,15 @@ pub(crate) fn make_compute_kernel(
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
         })
         .collect();
-    let ds_layout = unsafe {
-        device.create_descriptor_set_layout(
-            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
-            None,
-        )
+    // PUSH_DESCRIPTOR_KHR: this set is bound via `cmd_push_descriptor_set` (recorder.rs /
+    // ops.rs `run_kernel`), never `vkAllocateDescriptorSets` — the two are mutually exclusive
+    // per the Vulkan spec, so the flag must match how every call site below binds it.
+    let mut ds_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    if push_descriptor {
+        ds_ci = ds_ci.flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
     }
-    .expect("ds layout");
+    let ds_layout =
+        unsafe { device.create_descriptor_set_layout(&ds_ci, None) }.expect("ds layout");
 
     let mut plinfo =
         vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&ds_layout));
@@ -148,6 +151,7 @@ impl VulkanBackend {
             n_buf,
             push_size,
             None,
+            self.shared.push_descriptor.is_some(),
         );
         self.shared.kernels.lock().unwrap().insert(name, k);
         self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
@@ -173,6 +177,7 @@ impl VulkanBackend {
             n_buf,
             push_size,
             Some(sg_size),
+            self.shared.push_descriptor.is_some(),
         );
         self.shared.kernels.lock().unwrap().insert(name, k);
         self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
@@ -193,19 +198,25 @@ impl VulkanBackend {
         assert_eq!(push.len() as u32, k.push_size);
         let device = self.shared.device.clone();
 
-        unsafe {
-            device
-                .reset_descriptor_pool(k.desc_pool, vk::DescriptorPoolResetFlags::empty())
-                .map_err(|e| be(format!("reset pool: {e}")))?;
-        }
-        let set = unsafe {
-            device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(k.desc_pool)
-                        .set_layouts(std::slice::from_ref(&k.ds_layout)),
-                )
-                .map_err(|e| be(format!("alloc set: {e}")))?[0]
+        // Pooled fallback (no VK_KHR_push_descriptor): allocate + write a real descriptor set
+        // up front, then just `cmd_bind_descriptor_sets` it inside the one-shot buffer below.
+        let pooled_set = if self.shared.push_descriptor.is_none() {
+            unsafe {
+                device
+                    .reset_descriptor_pool(k.desc_pool, vk::DescriptorPoolResetFlags::empty())
+                    .map_err(|e| be(format!("reset pool: {e}")))?;
+            }
+            Some(unsafe {
+                device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(k.desc_pool)
+                            .set_layouts(std::slice::from_ref(&k.ds_layout)),
+                    )
+                    .map_err(|e| be(format!("alloc set: {e}")))?[0]
+            })
+        } else {
+            None
         };
 
         // input buffers (host-visible) + output buffer (readback)
@@ -233,14 +244,19 @@ impl VulkanBackend {
             .collect();
         let writes: Vec<vk::WriteDescriptorSet> = (0..k.n_buf)
             .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
+                let w = vk::WriteDescriptorSet::default()
                     .dst_binding(i as u32)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&infos[i..i + 1])
+                    .buffer_info(&infos[i..i + 1]);
+                match pooled_set {
+                    Some(set) => w.dst_set(set),
+                    None => w, // push descriptors: dst_set is ignored by the spec
+                }
             })
             .collect();
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        if pooled_set.is_some() {
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
 
         let push_vec = push.to_vec();
         let shared = std::sync::Arc::clone(&self.shared);
@@ -248,14 +264,28 @@ impl VulkanBackend {
             shared
                 .device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
-            shared.device.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                k.pipeline_layout,
-                0,
-                &[set],
-                &[],
-            );
+            match (&shared.push_descriptor, pooled_set) {
+                (Some(pd), _) => {
+                    pd.cmd_push_descriptor_set(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        k.pipeline_layout,
+                        0,
+                        &writes,
+                    );
+                }
+                (None, Some(set)) => {
+                    shared.device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        k.pipeline_layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                }
+                (None, None) => unreachable!("pooled_set is Some whenever push_descriptor is None"),
+            }
             if k.push_size > 0 {
                 shared.device.cmd_push_constants(
                     cmd,

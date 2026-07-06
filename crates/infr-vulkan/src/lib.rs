@@ -91,6 +91,11 @@ struct VulkanShared {
     caps: Capabilities,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
+    /// `VK_KHR_push_descriptor` loader, when the device supports it — every dispatch's
+    /// descriptor binding then records via `cmd_push_descriptor_set` (recorder.rs
+    /// `bind_descriptors`) instead of a pooled `alloc_set` + `update_descriptor_sets` +
+    /// `cmd_bind_descriptor_sets` per op. `None` falls back to the pooled path.
+    push_descriptor: Option<ash::khr::push_descriptor::Device>,
     /// Pre-reserved bump arena for load-once weights (see `reserve_weights`). `None` until reserved;
     /// weight allocs then sub-allocate from it instead of the gpu-allocator.
     weight_arena: Mutex<Option<WeightArena>>,
@@ -403,6 +408,14 @@ impl VulkanBackend {
         let has_8bit_storage = has_ext(c"VK_KHR_8bit_storage");
         let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
         let has_mem_budget = has_ext(c"VK_EXT_memory_budget");
+        // Lets every dispatch bind its buffers with one `cmd_push_descriptor_set` recorded
+        // straight into the command buffer instead of `alloc_set` (pool allocate) +
+        // `update_descriptor_sets` (a separate driver call) + `cmd_bind_descriptor_sets` per op —
+        // measured as a real per-forward host-side cost at small-m shapes (many-op graphs where
+        // GPU busy time is small, so the fixed per-dispatch descriptor churn is a bigger fraction
+        // of wall time). Near-universally supported (desktop RADV/NVIDIA/Intel); the pooled path
+        // stays as a fallback for drivers that lack it (e.g. some portability/MoltenVK builds).
+        let has_push_descriptor = has_ext(c"VK_KHR_push_descriptor");
 
         // ── probe features (via VK 1.1 get_physical_device_features2) ─────────
         // Memory model and subgroup-size-control are probed rather than assumed: a portability
@@ -447,6 +460,9 @@ impl VulkanBackend {
         }
         if has_mem_budget {
             ext_ptrs.push(c"VK_EXT_memory_budget".as_ptr());
+        }
+        if has_push_descriptor {
+            ext_ptrs.push(c"VK_KHR_push_descriptor".as_ptr());
         }
         // A portability (layered) device REQUIRES VK_KHR_portability_subset to be enabled when
         // it advertises it (Vulkan valid-usage rule); MoltenVK does.
@@ -553,6 +569,10 @@ impl VulkanBackend {
             })
             .unwrap_or(vk::PipelineCache::null());
 
+        // Built before `instance`/`device` move into `VulkanShared` below.
+        let push_descriptor =
+            has_push_descriptor.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
+
         Ok(Self {
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -565,6 +585,7 @@ impl VulkanBackend {
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
                 has_mem_budget,
+                push_descriptor,
                 weight_arena: Mutex::new(None),
                 linear_kernel: std::sync::OnceLock::new(),
                 kernels: Mutex::new(HashMap::new()),

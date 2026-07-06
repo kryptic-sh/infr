@@ -1258,11 +1258,12 @@ fn dg_bench_run(
     n_gen: usize,
     depth: usize,
     reps: usize,
-    // `Some(text)`: encode THIS prompt instead of the synthetic repeated sentence and ignore
-    // `n_prompt` (requires depth == 0). The compare arm passes its shared natural prompt so
-    // BOTH sides' entropy-bound loops converge on the same content — with the synthetic prompt
-    // infr always rode the 48-step cap while the oracle converged in ~23 (steps are
-    // content-sensitive, so e2e was double-penalized by prompt choice alone).
+    // `Some(text)`: chat-template-render + encode THIS prompt instead of the synthetic repeated
+    // sentence, and ignore `n_prompt` (requires depth == 0). The compare arm passes its shared
+    // natural prompt so BOTH sides' entropy-bound loops converge on the same (templated) content —
+    // with the synthetic prompt infr always rode the 48-step cap while the oracle converged in ~23
+    // (steps are content-sensitive, so e2e was double-penalized by prompt choice alone). See the
+    // `prompt_ids` binding below for why this is templated, not raw-encoded.
     prompt_text: Option<&str>,
     cpu: bool,
     // Phase D: the Metal DG session (macOS only — see the `one_rep!` dispatch below). `cpu` wins
@@ -1290,9 +1291,24 @@ fn dg_bench_run(
     if prompt_text.is_some() && depth > 0 {
         anyhow::bail!("dg_bench_run: prompt_text override is depth-0 only (compare's DG arm)");
     }
-    let p_eff = match prompt_text {
-        // Real-prompt mode: the whole encoded prompt is the causal prefix.
-        Some(text) => model.encode(text)?.len().max(1),
+    // Real-prompt mode (compare's DG arm): the reference fork's OWN CLI applies the model's chat
+    // template by default before it ever decodes `-p`'s text (`common_params::enable_chat_template`
+    // defaults `true`; `diffusion-cli.cpp`'s `apply_template`/`common_chat_templates_apply`, called
+    // unless `--no-chat-template` is passed — which the compare arm's `llama_diffusion` invocation
+    // does NOT pass). So the oracle's ~23-step convergence is measured on a rendered
+    // `<start_of_turn>user ... <start_of_turn>model` turn, never on the bare sentence. Encoding the
+    // bare sentence here (as this used to) fed our side a badly out-of-distribution prompt for an
+    // instruction-tuned model: entropy never settled — `INFR_EB_TRACE=1` showed it oscillating
+    // (not monotonically falling) with acceptance stuck near 1/256 for dozens of steps — so infr
+    // rode the full step cap on EVERY block while the fork, decoding the SAME text but templated,
+    // converged normally. Render the identical single-user-turn template `cmd_run`/
+    // `DiffusionGemmaChat` already use for a real chat reply, so both tools decode the model's
+    // actual instruction-tuned input shape instead of two different prompts that merely share text.
+    let prompt_ids = prompt_text
+        .map(|text| model.encode(&model.render_chat_messages(&[("user", text)])?))
+        .transpose()?;
+    let p_eff = match &prompt_ids {
+        Some(ids) => ids.len().max(1),
         None => n_prompt.max(1), // DG always needs >=1 prompt token (the canvas's causal prefix)
     };
     let blocks_wanted = if n_gen > 0 {
@@ -1310,8 +1326,8 @@ fn dg_bench_run(
     // sentence instead (same "fixed synthetic prompt" convention `bench_mtp_tg` uses) and slice
     // it: `dummy(depth)` is then an exact prefix of `dummy(depth + p_eff)` by construction, so the
     // untimed depth warm + timed suffix prefill still gets the session's prefix-diff reuse.
-    let full_ids = match prompt_text {
-        Some(text) => model.encode(text)?,
+    let full_ids = match prompt_ids {
+        Some(ids) => ids,
         None => {
             let long_text =
                 "The quick brown fox jumps over the lazy dog. ".repeat((depth + p_eff) / 4 + 8);

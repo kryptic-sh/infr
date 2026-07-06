@@ -223,6 +223,14 @@ fn denoise_block(
     let mut prev_temp_inv = 1.0f32;
     let mut held = 0usize;
     let mut steps_run = 0usize;
+    // Diagnostic (INFR_EB_TRACE=1): per-step schedule/entropy trace, kept permanently since it's
+    // small/clean and env-gated (one std::env::var read per BLOCK, not per step — zero cost when
+    // unset). Grew out of chasing a convergence-speed gap between this sampler and the fork's
+    // (root cause turned out to be upstream of this loop — the compare/bench harness feeding an
+    // untemplated prompt, see `dg_bench_run`'s `prompt_ids` comment — not the sampler itself, which
+    // this trace helped confirm already matches `diffusion.cpp` step-for-step). Useful again next
+    // time infr's/the fork's entropy trajectories need diffing.
+    let eb_trace = std::env::var_os("INFR_EB_TRACE").is_some();
 
     // cur_step: S downto 1 (`diffusion.cpp:530`); step_idx = S - cur_step is the 0-based step.
     for cur_step in (1..=s).rev() {
@@ -328,9 +336,17 @@ fn denoise_block(
         // entropy below the bound) — `diffusion.cpp:662-667`.
         let stable = prev_argmax.as_deref() == Some(argmax_canvas.as_slice());
         held = if stable { held + 1 } else { 0 };
-        let confident = (entropy_sum / c as f32) < eb.confidence_threshold;
+        let mean_entropy = entropy_sum / c as f32;
+        let confident = mean_entropy < eb.confidence_threshold;
         prev_argmax = Some(argmax_canvas.clone());
         prev_temp_inv = temp_inv;
+        if eb_trace {
+            let n_accepted = accepted.iter().filter(|&&a| a).count();
+            eprintln!(
+                "[eb_trace] block={block} step={} temp_inv={temp_inv:.6} mean_entropy={mean_entropy:.6} accepted={n_accepted}/{c} held={held} stable={stable} confident={confident}",
+                steps_run - 1,
+            );
+        }
         if held >= eb.stability_threshold && confident {
             break;
         }

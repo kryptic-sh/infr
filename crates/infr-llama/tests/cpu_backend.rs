@@ -1970,6 +1970,7 @@ fn diffusion_gemma_decode_matches_oracle() {
         /* seed */ 42,
         max_ctx,
         None,
+        None,
     )
     .expect("diffusion_generate");
     let secs = t0.elapsed().as_secs_f64();

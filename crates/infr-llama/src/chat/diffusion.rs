@@ -224,6 +224,14 @@ impl DiffusionGemmaChat {
     /// None` (the plain `generate` path) is byte-identical to the pre-hook implementation: the
     /// hook is only ever read inside [`crate::diffusion::diffusion_generate`]'s step loop, and a
     /// `None` there is a single `if let` check with no other side effect.
+    ///
+    /// Streams each block's COMMITTED text through `on_piece` as soon as that block finishes
+    /// (`diffusion_generate`'s `on_block`), rather than detokenizing the whole reply once
+    /// `diffusion_generate` returns — this is what lets `INFR_DIFFUSION_VISUAL` print a finished
+    /// block permanently while the next one is still denoising. The emitted BYTES are unchanged
+    /// either way: `on_block` fires with exactly the same tokens, in the same order, that used to
+    /// be detokenized in one pass over `result.tokens` afterward — only the timing/chunking of
+    /// `on_piece` calls changes, never the concatenated text.
     fn generate_impl(
         &mut self,
         prompt: &str,
@@ -262,6 +270,24 @@ impl DiffusionGemmaChat {
         let needed = prompt_tokens.len() + blocks * canvas_len + 64;
         self.ensure_sess(needed)?;
 
+        // Stream each block's committed tokens through the shared incremental UTF-8-safe detok —
+        // the same helper every other backend's per-token decode loop uses (`crate::stream_token`)
+        // — as soon as `diffusion_generate`'s `on_block` hands them over, so a block's text
+        // appears as soon as it's decided rather than only after the whole turn finishes. `acc`/
+        // `printed` persist across every block (not reset per block), same as they would across
+        // every token of a single flat loop: a multi-byte char split across a block boundary is
+        // held back exactly like one split across two tokens of the same block.
+        let tokenizer = self.model.tokenizer();
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let mut on_block = |committed: &[u32]| {
+            for &id in committed {
+                crate::stream_token(tokenizer, &mut acc, &mut printed, id, &mut |p: &str| {
+                    on_piece(p)
+                });
+            }
+        };
+
         let result = crate::diffusion::diffusion_generate(
             self.sess.as_mut().unwrap(),
             &self.model,
@@ -274,22 +300,9 @@ impl DiffusionGemmaChat {
             seed,
             self.max_ctx,
             on_step,
+            Some(&mut on_block),
         )?;
 
-        // Stream the committed tokens through the shared incremental UTF-8-safe detok — the same
-        // helper every other backend's per-token decode loop uses (`crate::stream_token`), so a
-        // block's text appears exactly like any other backend's piecewise output.
-        let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
-        for &id in &result.tokens {
-            crate::stream_token(
-                self.model.tokenizer(),
-                &mut acc,
-                &mut printed,
-                id,
-                &mut |p: &str| on_piece(p),
-            );
-        }
         Ok(result.stats)
     }
 }

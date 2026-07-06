@@ -474,7 +474,16 @@ fn trim_canvas(canvas: &[u32], is_eog: impl Fn(u32) -> bool) -> usize {
 /// to `seed` at the start of EVERY block (matching the reference: `diffusion_generate_entropy_bound`
 /// constructs a fresh `std::mt19937(params.seed)` on each call, and `run_turn` calls it once per
 /// block — `diffusion.cpp:467`).
-#[allow(clippy::too_many_arguments)]
+///
+/// `on_block`, if set, fires once per block with EXACTLY the tokens just appended to `response`
+/// (`&canvas[..cut]`, post-`trim_canvas` — i.e. only ever the committed text, never the
+/// still-denoising canvas `on_step` observes) right before that block's commit/break decision —
+/// lets a caller (`DiffusionGemmaChat::generate_impl`) stream each finished block through the
+/// shared incremental detok AS IT COMPLETES instead of waiting for every block to finish. The
+/// concatenation of everything `on_block` ever receives across one call, in order, is always
+/// exactly `response` (equivalently `result.tokens`) — purely an earlier, chunked view of the same
+/// bytes, never a different set of tokens.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn diffusion_generate(
     session: &mut impl DiffusionSession,
     model: &SeamModel,
@@ -487,6 +496,7 @@ pub fn diffusion_generate(
     seed: u64,
     max_ctx: usize,
     mut on_step: Option<&mut dyn FnMut(StepView)>,
+    mut on_block: Option<&mut dyn FnMut(&[u32])>,
 ) -> Result<DiffusionGenResult> {
     let blocks_wanted = n_predict.div_ceil(canvas_len.max(1)).max(1);
     let mut prefix: Vec<u32> = prompt_tokens.to_vec();
@@ -536,6 +546,9 @@ pub fn diffusion_generate(
         blocks_run += 1;
 
         let cut = trim_canvas(&canvas, |t| eos_ids.contains(&t));
+        if let Some(cb) = on_block.as_deref_mut() {
+            cb(&canvas[..cut]);
+        }
         response.extend_from_slice(&canvas[..cut]);
         if cut < canvas_len {
             break; // end token or repetition loop: answer complete (line 478-480)

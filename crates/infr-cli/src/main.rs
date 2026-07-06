@@ -541,8 +541,18 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
 /// Run one chat turn through the shared [`Chat`]: stream pieces via the `<think>` renderer, then
 /// print the prefill/decode stats line. `visual: Some` (diffusion-gemma, `INFR_DIFFUSION_VISUAL`
 /// set, stdout a tty) drives the turn through `turn_with_step_hook` instead, so the live canvas
-/// view redraws in the reserved terminal region while the block denoises; `None` is the exact
+/// view redraws in a reserved terminal region while a block denoises; `None` is the exact
 /// pre-existing `chat.turn` call, byte-for-byte.
+///
+/// `on_piece` now fires once PER FINISHED BLOCK (`DiffusionGemmaChat::generate_impl` streams each
+/// block's committed text through the shared detok as soon as `diffusion_generate`'s `on_block`
+/// hands it over — see that fn's doc), not once for the whole reply at turn end. So each call
+/// erases whatever live region is currently reserved (`DiffusionVisual::end`, a no-op if none is —
+/// e.g. before the very first block), which lets the just-finished block's text print normally
+/// and PERMANENTLY via `render.feed` right where the region's cursor was left, scrolling up
+/// naturally like any other transcript text. `DiffusionVisual::step` then lazily reserves a FRESH
+/// region below that printed text the next time a block starts denoising — so the live-updating
+/// region only ever shows the CURRENT in-progress block, never a finished one.
 fn run_chat_turn(
     chat: &mut infr_llama::chat::Chat,
     message: &str,
@@ -552,33 +562,25 @@ fn run_chat_turn(
     let mut render = ThinkRender::new();
     let stats = match visual {
         Some(v) => {
-            v.begin();
-            // `on_piece` only starts firing once `diffusion_generate` has produced the WHOLE
-            // reply (all blocks) and `generate_impl` streams it through the shared detok — i.e.
-            // strictly after every `on_step` call for this turn. So its first invocation is
-            // exactly the right moment to erase the live region: erasing after
-            // `turn_with_step_hook` returns instead would be too late, since the plain transcript
-            // text (from `on_piece`) has ALREADY printed to stdout by then, right where the
-            // region's cursor was left — a `v.end()` there would erase the reply, not the region.
             // Both closures below only need transient access (never concurrently — generation is
             // single-threaded and `on_step`/`on_piece` never interleave), so a `RefCell` lets them
             // share `v` without two simultaneous `&mut` captures.
             let visual = std::cell::RefCell::new(v);
-            let mut ended = false;
             let mut on_piece = |p: &str| {
-                if !ended {
-                    visual.borrow_mut().end();
-                    ended = true;
-                }
+                visual.borrow_mut().end(); // erase the live region so this block's permanent text
+                                           // prints cleanly below the prior transcript (no-op if
+                                           // no region is currently reserved)
                 render.feed(p);
             };
             let mut on_step =
                 |view: infr_llama::diffusion::StepView| visual.borrow_mut().step(view);
             let result =
                 chat.turn_with_step_hook(message, max_new, &mut on_piece, Some(&mut on_step));
-            if !ended {
-                visual.borrow_mut().end(); // no piece ever streamed (e.g. an empty/error turn)
-            }
+            // Safety net: always leave the terminal clean, whether the turn ended on a clean
+            // final block (region already erased by the last `on_piece`, so this is a no-op) or
+            // an error mid-block (region still reserved — erase it before the `?` below prints
+            // the error).
+            visual.borrow_mut().end();
             result?
         }
         None => chat.turn(message, max_new, &mut |p| render.feed(p))?,
@@ -601,8 +603,12 @@ fn run_chat_turn(
 /// terminal a long line wraps, which only affects this scratch region's own redraw math, never the
 /// surrounding transcript.
 const DG_VISUAL_ROWS: usize = 16;
-/// Fixed column cap per rendered line (char-truncated) — same conservative-width rationale as
-/// [`DG_VISUAL_ROWS`].
+/// Default/fallback column cap per rendered line (item-truncated — see [`DiffusionVisual::cols`]),
+/// same conservative-width rationale as [`DG_VISUAL_ROWS`]. A parseable `$COLUMNS` narrower than
+/// this clamps `cols` down further (audit finding 2: without that clamp, a narrower real terminal
+/// WRAPS a `DG_VISUAL_COLS`-wide line, so the region occupies more than `DG_VISUAL_ROWS` actual
+/// terminal rows and the fixed cursor-up math in `step`/`end` desyncs — frames smear into each
+/// other instead of overwriting cleanly).
 const DG_VISUAL_COLS: usize = 120;
 
 use std::io::{IsTerminal, Write as _};
@@ -614,14 +620,30 @@ use std::io::{IsTerminal, Write as _};
 /// (committed) runs as normal text and not-yet-accepted (still renoising — this sampler has no
 /// literal mask token, see `crate::diffusion`'s module doc) runs as a dim `·` placeholder, and
 /// redraw a fixed-height region in place (cursor-up + erase, DEC synchronized-update framing) so
-/// the terminal never scrolls mid-block. The region is erased once the turn's `generate` call
-/// returns, so the ordinary transcript print (`Chat::turn`'s `on_piece`, unchanged) still prints
-/// the finished reply cleanly below it.
+/// the terminal never scrolls mid-block.
+///
+/// The region is reserved LAZILY (the first `step` call after construction, or after the previous
+/// region was erased by `end`) and erased every time a block finishes (`run_chat_turn`'s
+/// `on_piece`, once per block now — see `DiffusionGemmaChat::generate_impl`'s doc) so that block's
+/// permanent transcript text prints cleanly, scrolling up naturally; the NEXT block's first `step`
+/// then reserves a fresh region below it. So at any moment at most one region is on screen, and it
+/// only ever shows the block currently denoising.
 struct DiffusionVisual {
     oai: infr_llama::chat::OaiRenderer,
     /// Rows the previous frame's redraw advanced past the region's top — 0 before the first frame
     /// (mirrors the oracle's `cb_data.vis_prev_rows`).
     prev_rows: usize,
+    /// Whether a region is currently reserved on screen. `step` reserves one lazily when this is
+    /// `false`; `end` erases the region and clears this back to `false` (a no-op if already
+    /// clear — `run_chat_turn` calls `end` unconditionally on every `on_piece` and once more as a
+    /// post-turn safety net).
+    active: bool,
+    /// Column cap for one rendered line, in DISPLAY ITEMS (audit finding 1: never raw chars/bytes
+    /// of a pre-rendered ANSI string) — `min(DG_VISUAL_COLS, $COLUMNS - 1)` when `COLUMNS` parses
+    /// to something usable, else `DG_VISUAL_COLS`. Best-effort: infr has no ioctl-based terminal
+    /// size probe, and `$COLUMNS` is a shell-maintained convention, not guaranteed exported to a
+    /// child process — this only ever narrows the conservative default, never widens past it.
+    cols: usize,
 }
 
 impl DiffusionVisual {
@@ -636,9 +658,18 @@ impl DiffusionVisual {
         if !force && !std::io::stdout().is_terminal() {
             return Ok(None);
         }
+        let cols = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|c| c.checked_sub(1))
+            .filter(|&c| c > 0)
+            .map(|c| DG_VISUAL_COLS.min(c))
+            .unwrap_or(DG_VISUAL_COLS);
         Ok(Some(Self {
             oai: infr_llama::chat::OaiRenderer::open(gguf)?,
             prev_rows: 0,
+            active: false,
+            cols,
         }))
     }
 
@@ -650,11 +681,21 @@ impl DiffusionVisual {
         print!("\x1b[?25l{}", "\n".repeat(DG_VISUAL_ROWS));
         print!("\x1b[{DG_VISUAL_ROWS}A");
         std::io::stdout().flush().ok();
+        self.active = true;
     }
 
-    /// Redraw the region for one denoise step.
+    /// Redraw the region for one denoise step — lazily reserving it first (`begin`) if the last
+    /// finished block's `on_piece` erased it (or this is the turn's very first step).
     fn step(&mut self, view: infr_llama::diffusion::StepView) {
-        let mut text = String::new();
+        if !self.active {
+            self.begin();
+        }
+        // One flat (display_char, is_dim) sequence: accepted runs decode to real text, sanitized
+        // per audit finding 3 (`\r` dropped — never jumps the cursor mid-line; `\t` -> a single
+        // space, never a literal tab); not-yet-accepted runs render as a dim `·` placeholder.
+        // Kept as tagged chars, NOT pre-rendered ANSI text, so the truncation/line-splitting below
+        // always operates on DISPLAY items and never raw escape bytes (audit finding 1).
+        let mut items: Vec<(char, bool)> = Vec::new();
         let mut i = 0;
         while i < view.canvas.len() {
             if view.accepted[i] {
@@ -663,7 +704,13 @@ impl DiffusionVisual {
                     i += 1;
                 }
                 if let Ok(s) = self.oai.decode_ids(&view.canvas[start..i]) {
-                    text.push_str(&s);
+                    for c in s.chars() {
+                        match c {
+                            '\r' => {}                        // dropped: never jump the cursor
+                            '\t' => items.push((' ', false)), // one space, never a literal tab
+                            _ => items.push((c, false)),
+                        }
+                    }
                 }
             } else {
                 let start = i;
@@ -671,8 +718,21 @@ impl DiffusionVisual {
                     i += 1;
                 }
                 for _ in start..i {
-                    text.push_str("\x1b[2m·\x1b[0m");
+                    items.push(('·', true));
                 }
+            }
+        }
+
+        // Split into display lines on '\n' only (audit finding 3's other half — a literal '\n' in
+        // decoded text is the sole line-break signal), each capped at `self.cols` ITEMS (audit
+        // findings 1/2), then rendered with dim runs balanced one `\x1b[2m`/`\x1b[0m` pair at a
+        // time (`render_dim_line`) — never a bare escape fragment, never a leaked dim mode.
+        let mut lines: Vec<Vec<(char, bool)>> = vec![Vec::new()];
+        for &(c, dim) in &items {
+            if c == '\n' {
+                lines.push(Vec::new());
+            } else {
+                lines.last_mut().unwrap().push((c, dim));
             }
         }
         let mut rows = vec![format!(
@@ -682,8 +742,9 @@ impl DiffusionVisual {
             view.max_steps,
             view.committed_before,
         )];
-        for line in text.split('\n') {
-            rows.push(line.chars().take(DG_VISUAL_COLS).collect());
+        for line in &lines {
+            let cut = line.len().min(self.cols);
+            rows.push(render_dim_line(&line[..cut]));
         }
         let keep = rows.len().min(DG_VISUAL_ROWS);
         let shown = &rows[rows.len() - keep..];
@@ -708,9 +769,12 @@ impl DiffusionVisual {
         std::io::stdout().flush().ok();
     }
 
-    /// Erase the region and restore the cursor — called once the turn's `generate` returns
-    /// (`Ok` or `Err`) so the next thing printed (the normal transcript, or an error) starts clean.
+    /// Erase the region and restore the cursor, if one is currently reserved (a no-op otherwise —
+    /// safe to call unconditionally, e.g. after every finished block AND once more at turn end).
     fn end(&mut self) {
+        if !self.active {
+            return;
+        }
         let mut frame = String::new();
         if self.prev_rows > 0 {
             frame.push_str(&format!("\x1b[{}A", self.prev_rows));
@@ -719,7 +783,36 @@ impl DiffusionVisual {
         print!("{frame}");
         std::io::stdout().flush().ok();
         self.prev_rows = 0;
+        self.active = false;
     }
+}
+
+/// Render one line's `(display_char, is_dim)` items, wrapping each maximal DIM RUN in exactly one
+/// `\x1b[2m`/`\x1b[0m` pair — the fix for audit finding 1: the old code truncated a pre-rendered
+/// `"\x1b[2m·\x1b[0m"` string by raw `char` count, which could cut an escape sequence in half
+/// (printing a literal `[2m` fragment) and/or drop the trailing reset, leaking dim mode into
+/// whatever printed next. Operating on tagged items instead of ANSI bytes makes that class of bug
+/// unrepresentable: every emitted `\x1b[2m` here is always paired with an `\x1b[0m` on the same
+/// line, and truncation (by the caller, before this runs) only ever drops whole items.
+fn render_dim_line(items: &[(char, bool)]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < items.len() {
+        if items[i].1 {
+            out.push_str("\x1b[2m");
+            while i < items.len() && items[i].1 {
+                out.push(items[i].0);
+                i += 1;
+            }
+            out.push_str("\x1b[0m");
+        } else {
+            while i < items.len() && !items[i].1 {
+                out.push(items[i].0);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// The Metal dense/MoE [`ChatModel`] for run AND serve: the persistent-session seam chat, or —
@@ -1425,6 +1518,7 @@ fn dg_bench_run(
                         n_gen,
                         seed,
                         max_ctx,
+                        None,
                         None,
                     )?;
                     pps.push(p_eff as f64 / result.stats.prompt_secs.max(1e-9));

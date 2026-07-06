@@ -157,9 +157,13 @@ pub(crate) fn generate_dense_backend(
     // GatedAct — the bespoke path's fused-gu shape, ~1 dispatch/layer off the decode hot loop).
     // Requires the backend to opt in (Vulkan; the CPU keeps zero-copy separate tensors) AND every
     // dense layer's gate/up to share a dtype (the concat is one [2*nff, ne] tensor). The decision
-    // is global so the upload order and `build`'s handle declarations always agree.
+    // is global so the upload order and `build`'s handle declarations always agree. NOT gated on
+    // `c.moe.is_none()`: a pure MoE arch (qwen3moe) has no `ffn_gate.weight`/`ffn_up.weight` tensors
+    // at all, so the `.all()` below is false for it regardless; diffusion-gemma DOES carry both (its
+    // dense "shared expert" branch, separate from the MoE bank) and its dense n_ff=2112 out_f clears
+    // neither warp-tile gate on its own (%256 nor %128) so it fell to the slower mmq path — fused
+    // out_f=2*2112=4224 clears %128. See `FfnW::DiffusionMoe::fused_gu`.
     let fuse_gu = be.capabilities().combined_gu
-        && c.moe.is_none()
         && (0..c.n_layer).all(|l| {
             let dt = |s: &str| {
                 let name = format!("blk.{l}.{s}");
@@ -419,8 +423,14 @@ pub(crate) fn generate_dense_backend(
             if c.diffusion_gemma {
                 // Dual FFN: dense GeGLU (n_ff=2112) ∥ 128-expert MoE (fused gate_up_exps + a
                 // per-expert down scale), summed — see docs/DIFFUSIONGEMMA.md's FFN wiring.
-                wload(&[&p("ffn_gate.weight")])?;
-                wload(&[&p("ffn_up.weight")])?;
+                // `fuse_gu`: one concatenated [2*nff,ne] gate+up tensor (see the comment at its
+                // definition) instead of two separate n_ff=2112 tensors.
+                if fuse_gu {
+                    wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
+                } else {
+                    wload(&[&p("ffn_gate.weight")])?;
+                    wload(&[&p("ffn_up.weight")])?;
+                }
                 wload(&[&p("ffn_down.weight")])?;
                 wload(&[&p("post_ffw_norm_1.weight")])?;
                 wload(&[&p("pre_ffw_norm_2.weight")])?;
@@ -880,9 +890,19 @@ pub(crate) fn generate_dense_backend(
             };
             let ffn_norm = wpush(&mut g, &mut weights);
             let ffn = if c.diffusion_gemma {
+                let d_gate = wpush(&mut g, &mut weights);
+                // fused: `d_up` is the SAME handle as `d_gate` (one concatenated upload, see the
+                // matching `wload` above) — never separately read; mirrors `FfnW::Moe`'s
+                // `up_exps: gate_up_exps` pattern for the same reason.
+                let d_up = if fuse_gu {
+                    d_gate
+                } else {
+                    wpush(&mut g, &mut weights)
+                };
                 FfnW::DiffusionMoe {
-                    d_gate: wpush(&mut g, &mut weights),
-                    d_up: wpush(&mut g, &mut weights),
+                    d_gate,
+                    d_up,
+                    fused_gu: fuse_gu,
                     d_down: wpush(&mut g, &mut weights),
                     d_post_norm: wpush(&mut g, &mut weights),
                     m_pre_norm: wpush(&mut g, &mut weights),
@@ -1838,6 +1858,7 @@ pub(crate) fn generate_dense_backend(
                 FfnW::DiffusionMoe {
                     d_gate,
                     d_up,
+                    fused_gu,
                     d_down,
                     d_post_norm,
                     m_pre_norm,
@@ -1851,34 +1872,55 @@ pub(crate) fn generate_dense_backend(
                     let mc = c.moe.expect("diffusion-gemma layer without MoeConfig");
                     // Dense branch (the "shared expert"): GELU-par gate/up/down on `hn` (already
                     // ffn_norm(attn_out) from above), then its own post-norm. `act` is Gelu here —
-                    // gemma implies it (see the `act` computation above).
-                    g.push(Op::Linear {
-                        x: hn,
-                        weight: d_gate,
-                        dst: gbuf,
-                        m: batch as u32,
-                        in_f: ne as u32,
-                        out_f: nff_l as u32,
-                        w_off: 0,
-                    });
-                    g.push(Op::Linear {
-                        x: hn,
-                        weight: d_up,
-                        dst: ubuf,
-                        m: batch as u32,
-                        in_f: ne as u32,
-                        out_f: nff_l as u32,
-                        w_off: 0,
-                    });
-                    g.push(Op::GatedAct {
-                        gate: gbuf,
-                        up: ubuf,
-                        dst: actbuf,
-                        rows: batch as u32,
-                        nff: nff_l as u32,
-                        act,
-                        up_off: 0,
-                    });
+                    // gemma implies it (see the `act` computation above). `fused_gu`: one wide
+                    // [ne -> 2*nff] GEMM + `GatedActFused` instead of two n_ff=2112 GEMMs that
+                    // clear no warp-tile gate on their own (see `fuse_gu`'s definition comment).
+                    if fused_gu {
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: d_gate,
+                            dst: gubuf,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: (2 * nff_l) as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::GatedActFused {
+                            gu: gubuf,
+                            dst: actbuf,
+                            rows: batch as u32,
+                            nff: nff_l as u32,
+                            act,
+                        });
+                    } else {
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: d_gate,
+                            dst: gbuf,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: nff_l as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::Linear {
+                            x: hn,
+                            weight: d_up,
+                            dst: ubuf,
+                            m: batch as u32,
+                            in_f: ne as u32,
+                            out_f: nff_l as u32,
+                            w_off: 0,
+                        });
+                        g.push(Op::GatedAct {
+                            gate: gbuf,
+                            up: ubuf,
+                            dst: actbuf,
+                            rows: batch as u32,
+                            nff: nff_l as u32,
+                            act,
+                            up_off: 0,
+                        });
+                    }
                     g.push(Op::Linear {
                         x: actbuf,
                         weight: d_down,

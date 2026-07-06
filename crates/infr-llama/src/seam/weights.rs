@@ -31,7 +31,15 @@ pub(super) enum FfnW {
     /// dual-FFN block.
     DiffusionMoe {
         d_gate: TensorId,
+        /// Equal to `d_gate` (same handle, never separately read) when `fused_gu` — the concat
+        /// mirrors `DenseFused`'s `wgu`, just kept on the `DiffusionMoe` shape since this branch's
+        /// down-projection/router/expert fields don't otherwise fit `FfnW::DenseFused`.
         d_up: TensorId,
+        /// `d_gate`/`d_up` are ONE concatenated `[2*nff, ne]` weight (see `fuse_gu` in `runner.rs`);
+        /// the dense branch issues one wide `Op::Linear` + `Op::GatedActFused` instead of two
+        /// `Op::Linear` + `Op::GatedAct` — out_f=2112 clears neither warp-tile gate (`%256`/`%128`)
+        /// on its own so it fell to the slower `mmq` path; fused out_f=4224 clears `%128`.
+        fused_gu: bool,
         d_down: TensorId,
         /// `post_ffw_norm_1`: dense branch output norm (before summing with the MoE branch).
         d_post_norm: TensorId,

@@ -1187,6 +1187,15 @@ fn generate_mtp_spec_core(
     let ne = cfg.n_embd;
     let n_max = DEFAULT_N_MAX;
     let time_mtp = std::env::var("INFR_MTP_TIME").is_ok();
+    // qwen35 DeltaNet spec-decode rollback (default ON; A/B escape via INFR_NO_MTP_CKPT): snapshot
+    // the trunk's DeltaNet recurrent state at each clean committed boundary so a partial-accept
+    // cycle rolls back to it and re-prefills only the short accepted suffix, instead of qwen35's
+    // default full re-prefill-from-zero on the divergent feed (its append-only recurrent state
+    // can't rewind by cache truncation — see `SeamKv::mtp_snapshot_delta` and the `c.qwen35` branch
+    // in `generate_dense_backend`'s `start` computation). Token-identical either way (a pure decode
+    // speedup): restoring an exact state snapshot + re-prefilling the same committed tokens yields
+    // the same recurrence as prefilling them from zero.
+    let mtp_ckpt = std::env::var("INFR_NO_MTP_CKPT").is_err();
     let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
     let hit_eos = |t: u32| !ignore_eos && (cfg.eos_ids.contains(&t) || t == cfg.eos);
 
@@ -1220,6 +1229,15 @@ fn generate_mtp_spec_core(
         shifted_h[ne..].copy_from_slice(&h_rows0[..(p - 1) * ne]);
     }
     catch_up(head_sess, &prompt_tokens, &shifted_h, 0)?;
+
+    // First clean committed boundary: the trunk's DeltaNet state now covers the whole prompt (the
+    // prime verify left `cached == prompt_tokens`). Snapshot it so cycle 1's partial-accept case
+    // (if any) can roll back here instead of re-prefilling from zero.
+    if mtp_ckpt {
+        if let Some(st) = trunk_state.as_mut() {
+            st.mtp_snapshot_delta(be, cfg)?;
+        }
+    }
 
     let mut committed = prompt_tokens.clone();
     let mut id_last = prompt_tokens[p - 1];
@@ -1292,6 +1310,23 @@ fn generate_mtp_spec_core(
         let (accepted, next_tok) = crate::seam::model::spec_accept(&cand, &varg);
         total_drafted += cand.len();
         total_accepted += accepted;
+
+        // DeltaNet rollback bookkeeping (see `mtp_ckpt`'s doc). A fully-accepted cycle leaves the
+        // trunk's recurrent state on a clean committed prefix (`cached == committed ++ cand`, every
+        // drafted row committed) — snapshot it as the new rollback point. A partial/zero-accept
+        // cycle left the state polluted by the rejected drafts — restore the last clean snapshot so
+        // the NEXT verify's prefix-diff re-prefills only the short accepted suffix from there rather
+        // than triggering qwen35's full state reset. `h_rows`/`varg` were already read above, so the
+        // rollback only affects the trunk state the next cycle consumes.
+        if mtp_ckpt {
+            if let Some(st) = trunk_state.as_mut() {
+                if accepted == cand.len() {
+                    st.mtp_snapshot_delta(be, cfg)?;
+                } else {
+                    st.mtp_restore_delta(be)?;
+                }
+            }
+        }
 
         // The (accepted+1) rows of `h` to catch the head's KV up to — row 0 is the virtual/real
         // leading row, rows 1.. are this cycle's own verify output (see this fn's doc).

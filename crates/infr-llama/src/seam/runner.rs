@@ -689,6 +689,7 @@ pub(crate) fn generate_dense_backend(
             sc_ping: None,
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
+            mtp_delta_ckpt: None,
         });
     }
     let SeamKv {
@@ -709,6 +710,7 @@ pub(crate) fn generate_dense_backend(
         sc_ping,
         sc_ping_write,
         sc_temp_inv_buf,
+        mtp_delta_ckpt: _,
     } = state.as_mut().expect("seam state just initialized");
     let SeamWeights {
         wbufs,

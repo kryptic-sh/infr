@@ -184,6 +184,25 @@ pub(crate) struct SeamKv {
     /// dynamic-scale softmax (`Op::Softmax::scale_buf`) instead of a per-step host premultiply of
     /// the whole `[cc, vocab]` logits buffer. Lazily allocated alongside `sc_ping`.
     pub(super) sc_temp_inv_buf: Option<Box<dyn Buffer>>,
+    /// MTP spec-decode rollback checkpoint (`mtp_snapshot_delta`/`mtp_restore_delta`): a device-
+    /// resident copy of every qwen35 DeltaNet layer's recurrent state at the last CLEAN committed
+    /// boundary, plus the cached-token length there. Lets a partial-accept cycle roll the trunk's
+    /// draft-polluted state back to a committed prefix and re-prefill only the short accepted suffix,
+    /// instead of qwen35's default full re-prefill-from-zero (its append-only DeltaNet state can't
+    /// rewind by cache truncation the way a per-position KV cache can — see the `c.qwen35` branch in
+    /// `generate_dense_backend`'s `start` computation). `None` for every non-MTP caller.
+    pub(super) mtp_delta_ckpt: Option<MtpDeltaCkpt>,
+}
+
+/// The device-resident DeltaNet-state snapshot backing [`SeamKv::mtp_snapshot_delta`] — one
+/// conv-state + one S-state buffer per qwen35 DeltaNet layer (parallel to `layers`), plus the
+/// cached-token length the snapshot corresponds to. Allocated once (lazily) and reused every cycle.
+pub(super) struct MtpDeltaCkpt {
+    kbufs: Vec<Box<dyn Buffer>>,
+    vbufs: Vec<Box<dyn Buffer>>,
+    /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are DeltaNet mixers.
+    layers: Vec<usize>,
+    cached_len: usize,
 }
 
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
@@ -223,6 +242,88 @@ impl SeamKv {
     }
 
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
+    /// Snapshot the qwen35 DeltaNet recurrent state (every DeltaNet layer's conv + S buffers) plus
+    /// the current `cached` length into the device-resident [`MtpDeltaCkpt`] (allocated once on the
+    /// first call). The MTP spec-decode loop calls this at a CLEAN committed boundary (after the
+    /// prime prefill and after every fully-accepted cycle) so a later partial-accept cycle can roll
+    /// back to it via [`mtp_restore_delta`]. A no-op on a non-qwen35 model (no DeltaNet layers). The
+    /// snapshot is a pure device→device buffer copy (`Backend::copy_buffer`), never a host bounce.
+    pub(crate) fn mtp_snapshot_delta(&mut self, be: &dyn Backend, cfg: &Config) -> AResult<()> {
+        if self.mtp_delta_ckpt.is_none() {
+            let layers: Vec<usize> = (0..cfg.n_layer)
+                .filter(|&l| cfg.qwen35 && !cfg.is_qwen35_attn_layer(l))
+                .collect();
+            if layers.is_empty() {
+                return Ok(());
+            }
+            let mut kbufs = Vec::with_capacity(layers.len());
+            let mut vbufs = Vec::with_capacity(layers.len());
+            for &l in &layers {
+                kbufs.push(
+                    be.alloc(self.kbufs[l].len_bytes().max(1), BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+                vbufs.push(
+                    be.alloc(self.vbufs[l].len_bytes().max(1), BufferUsage::Activations)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+            }
+            self.mtp_delta_ckpt = Some(MtpDeltaCkpt {
+                kbufs,
+                vbufs,
+                layers,
+                cached_len: 0,
+            });
+        }
+        let cached_len = self.cached.len();
+        let ck = self.mtp_delta_ckpt.as_ref().expect("just ensured Some");
+        for (i, &l) in ck.layers.iter().enumerate() {
+            be.copy_buffer(
+                self.kbufs[l].as_ref(),
+                ck.kbufs[i].as_ref(),
+                self.kbufs[l].len_bytes(),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            be.copy_buffer(
+                self.vbufs[l].as_ref(),
+                ck.vbufs[i].as_ref(),
+                self.vbufs[l].len_bytes(),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        }
+        self.mtp_delta_ckpt
+            .as_mut()
+            .expect("just ensured Some")
+            .cached_len = cached_len;
+        Ok(())
+    }
+
+    /// Restore the DeltaNet state captured by the last [`mtp_snapshot_delta`] and truncate `cached`
+    /// back to the snapshot's token length — the MTP loop's rollback after a partial-accept cycle
+    /// (drops the rejected drafts the verify forward absorbed into the recurrent state). A no-op
+    /// when no snapshot has been taken yet.
+    pub(crate) fn mtp_restore_delta(&mut self, be: &dyn Backend) -> AResult<()> {
+        let Some(ck) = self.mtp_delta_ckpt.as_ref() else {
+            return Ok(());
+        };
+        for (i, &l) in ck.layers.iter().enumerate() {
+            be.copy_buffer(
+                ck.kbufs[i].as_ref(),
+                self.kbufs[l].as_ref(),
+                ck.kbufs[i].len_bytes(),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            be.copy_buffer(
+                ck.vbufs[i].as_ref(),
+                self.vbufs[l].as_ref(),
+                ck.vbufs[i].len_bytes(),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        }
+        self.cached.truncate(ck.cached_len);
+        Ok(())
+    }
+
     pub(crate) fn fork(&self, be: &dyn Backend, cfg: &Config) -> AResult<SeamKv> {
         let e2b = self.ipl_buf.is_some();
         let npl = cfg.n_embd_per_layer.max(1);
@@ -299,6 +400,7 @@ impl SeamKv {
             sc_ping: None,
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
+            mtp_delta_ckpt: None,
         })
     }
 

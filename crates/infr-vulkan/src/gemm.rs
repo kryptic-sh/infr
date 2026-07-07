@@ -141,6 +141,40 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
     })
 }
 
+/// SPIR-V + kernel-cache name for the multi-output-row decode GEMV (`RM` rows/workgroup, bit-
+/// identical per row to the RM=1 native GEMV). Only the K-quant formats that dominate decode
+/// (Q4_K/Q6_K) have RM builds; everything else stays on the RM=1 path. `rm` is 2 or 4.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_rm_build_spv(
+    dtype: infr_core::DType,
+    res: bool,
+    rm: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, res, rm) {
+        (Q4K, false, 2) => v!("native_q4k_rm2"),
+        (Q4K, true, 2) => v!("native_q4k_rm2_res"),
+        (Q4K, false, 4) => v!("native_q4k_rm4"),
+        (Q4K, true, 4) => v!("native_q4k_rm4_res"),
+        (Q6K, false, 2) => v!("native_q6k_rm2"),
+        (Q6K, true, 2) => v!("native_q6k_rm2_res"),
+        (Q6K, false, 4) => v!("native_q6k_rm4"),
+        (Q6K, true, 4) => v!("native_q6k_rm4_res"),
+        _ => None,
+    }
+}
+
 /// SPIR-V for the id-indexed native GEMV (expert chosen from a GPU buffer). One specialization per
 /// affine quant format; `None` for formats without an id variant (caller falls back to host top-k).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

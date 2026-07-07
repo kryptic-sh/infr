@@ -383,6 +383,33 @@ fn main() {
         ("native_gemv", "native_q5k_res", &["-DFMT_Q5K", "-DUSE_RES"]),
         ("native_gemv", "native_q6k", &["-DFMT_Q6K"]),
         ("native_gemv", "native_q6k_res", &["-DFMT_Q6K", "-DUSE_RES"]),
+        // Multi-output-row decode GEMV (RM rows/workgroup) — bit-identical to the RM=1 GEMV per
+        // row, but RM× the in-flight weight streams per wave to saturate DRAM on the low-out_f
+        // (out_f≈4096) projection GEMVs. K-quant dense/MoE-hot formats only.
+        ("native_gemv_rm", "native_q4k_rm2", &["-DFMT_Q4K", "-DRM=2"]),
+        (
+            "native_gemv_rm",
+            "native_q4k_rm2_res",
+            &["-DFMT_Q4K", "-DRM=2", "-DUSE_RES"],
+        ),
+        ("native_gemv_rm", "native_q4k_rm4", &["-DFMT_Q4K", "-DRM=4"]),
+        (
+            "native_gemv_rm",
+            "native_q4k_rm4_res",
+            &["-DFMT_Q4K", "-DRM=4", "-DUSE_RES"],
+        ),
+        ("native_gemv_rm", "native_q6k_rm2", &["-DFMT_Q6K", "-DRM=2"]),
+        (
+            "native_gemv_rm",
+            "native_q6k_rm2_res",
+            &["-DFMT_Q6K", "-DRM=2", "-DUSE_RES"],
+        ),
+        ("native_gemv_rm", "native_q6k_rm4", &["-DFMT_Q6K", "-DRM=4"]),
+        (
+            "native_gemv_rm",
+            "native_q6k_rm4_res",
+            &["-DFMT_Q6K", "-DRM=4", "-DUSE_RES"],
+        ),
         // Multi-row GEMV (m = 2..8: spec verify / short suffix prefill) — mainstream dense
         // projection formats only; the rest fall back to the tiled GEMM.
         ("native_gemv_mrow", "native_mrow_q8_0", &["-DFMT_Q8_0"]),

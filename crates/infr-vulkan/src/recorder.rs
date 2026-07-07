@@ -31,6 +31,38 @@ fn mmv_epw(bits: u32) -> Option<usize> {
     }
 }
 
+/// Rows-per-workgroup for the multi-output-row decode GEMV, or `None` to keep the RM=1 path.
+/// The RM variant packs RM output rows into one workgroup (RM× the in-flight weight streams per
+/// wave) to feed enough MLP at low `out_f`, where the RM=1 grid (out_f workgroups) is too shallow
+/// to hide DRAM latency — the big GEMVs (lm_head/gate+up, out_f ≥ ~16k) already saturate on RM=1
+/// so they stay there. Only Q4_K/Q6_K have RM builds ([`crate::gemm::native_rm_build_spv`]).
+/// Tunable for A/B: `INFR_NO_GEMV_RM` forces the RM=1 path; `INFR_GEMV_RM`=2|4 forces the factor;
+/// `INFR_GEMV_RM_MAXOUT` overrides the out_f gate.
+fn native_rm_choice(dtype: infr_core::DType, out_f: usize) -> Option<u32> {
+    use infr_core::DType::*;
+    if !matches!(dtype, Q4K | Q6K) || std::env::var("INFR_NO_GEMV_RM").is_ok() {
+        return None;
+    }
+    let max_out = std::env::var("INFR_GEMV_RM_MAXOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    // Below ~2k outputs the RM=1 grid is already shallow; halving it starves the machine (k/v,
+    // out_f=1024, regressed in the cold A/B), so those stay on RM=1.
+    let min_out = std::env::var("INFR_GEMV_RM_MINOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2048usize);
+    if out_f > max_out || out_f < min_out {
+        return None;
+    }
+    let rm = std::env::var("INFR_GEMV_RM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2u32);
+    (rm == 2 || rm == 4).then_some(rm)
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
@@ -1109,6 +1141,28 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        // Multi-output-row route (m=1 decode, low out_f → memory-latency-starved single-row grid).
+        if rows == 1 {
+            if let Some(rm) = native_rm_choice(dtype, out_f) {
+                if let Some((name, spv)) = crate::gemm::native_rm_build_spv(dtype, false, rm) {
+                    self.label_gemv("gemv", rows, in_f, out_f);
+                    let k = self.be.kernel(name, spv, 3, 16);
+                    let mut push = [0u8; 16];
+                    push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+                    push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+                    push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+                    push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+                    self.dispatch(
+                        k,
+                        &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+                        1,
+                        &push,
+                        (out_f as u32).div_ceil(rm),
+                    );
+                    return;
+                }
+            }
+        }
         self.label_gemv("gemv", rows, in_f, out_f);
         let name = crate::linear::native_kernel_name(dtype, false);
         let spv = crate::gemm::native_build_spv(dtype, false).expect("native GEMV spv");
@@ -1234,26 +1288,31 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        let name = crate::linear::native_kernel_name(dtype, true);
-        let spv = crate::gemm::native_build_spv(dtype, true).expect("native GEMV spv");
-        let k = self.be.kernel(name, spv, 4, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         // push[12..16] = w_base, 0 (residual native GEMV is not used for stacked experts).
-        self.dispatch(
-            k,
-            &[
-                Self::vkb(w),
-                Self::vkb(x),
-                Self::vkb(residual),
-                Self::vkb(y),
-            ],
-            1,
-            &push,
-            (rows * out_f) as u32,
-        );
+        let bufs = [
+            Self::vkb(w),
+            Self::vkb(x),
+            Self::vkb(residual),
+            Self::vkb(y),
+        ];
+        // Multi-output-row route (see linear_native_off): o/down decode GEMVs are low-out_f.
+        if rows == 1 {
+            if let Some(rm) = native_rm_choice(dtype, out_f) {
+                if let Some((name, spv)) = crate::gemm::native_rm_build_spv(dtype, true, rm) {
+                    let k = self.be.kernel(name, spv, 4, 16);
+                    self.dispatch(k, &bufs, 1, &push, (out_f as u32).div_ceil(rm));
+                    return;
+                }
+            }
+        }
+        let name = crate::linear::native_kernel_name(dtype, true);
+        let spv = crate::gemm::native_build_spv(dtype, true).expect("native GEMV spv");
+        let k = self.be.kernel(name, spv, 4, 16);
+        self.dispatch(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
     /// Gather + dequantize embedding rows (`Op::EmbedGather`): `dst[r,:] = table[ids[r],:] *

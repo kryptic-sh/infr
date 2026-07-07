@@ -14,3 +14,4 @@ Cargo.lock.bak
 .DS_Store
 *.swp
 /ref/
+target-prof/

@@ -31,6 +31,7 @@ pub const FLASH_REG_SHARED_PER_ROW: u32 = 460;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -112,6 +113,11 @@ struct VulkanShared {
     /// Active weight-load progress bar (see [`VulkanBackend::weight_progress`]). Every
     /// `BufferUsage::Weights` allocation advances it, so no model loader can forget to tick it.
     weight_pb: Mutex<Option<indicatif::ProgressBar>>,
+    /// Cumulative device-local bytes THIS backend has committed (pooled/dedicated allocations +
+    /// weight-arena blocks). The VRAM budget guard's fallback accounting when
+    /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
+    /// (it also sees other processes' VRAM).
+    device_used: AtomicU64,
 }
 
 // ash Instances/Devices/handles are Send+Sync per the Vulkan spec when
@@ -200,6 +206,13 @@ impl Drop for VkBuffer {
         unsafe {
             if let Backing::Pooled(alloc) = &mut self.backing {
                 let alloc = ManuallyDrop::take(alloc);
+                // Keep the budget guard's fallback accounting balanced (arena buffers don't own
+                // their memory — the arena block stays counted until the backend drops).
+                if self.location == MemoryLocation::GpuOnly {
+                    self.shared
+                        .device_used
+                        .fetch_sub(alloc.size(), Ordering::Relaxed);
+                }
                 self.shared.allocator.lock().unwrap().free(alloc).ok();
             }
             // Arena memory belongs to the arena block; only destroy the buffer handle here.
@@ -255,13 +268,25 @@ struct WeightArena {
 }
 
 impl WeightArena {
+    /// Whether a `size`-at-`align` bump fits the newest block WITHOUT growing an overflow block —
+    /// i.e. whether [`bump`](Self::bump) would commit new device memory. The budget guard checks
+    /// this before bumping so only real new commitments are charged against the budget.
+    fn fits(&self, size: u64, align: u64) -> bool {
+        self.blocks.last().is_some_and(|b| {
+            let off = b.cursor.div_ceil(align) * align;
+            off + size <= b.size
+        })
+    }
+
     /// Bump-allocate `size` bytes at `align` from the newest block, growing with an overflow block
-    /// if it won't fit. Returns the device memory + offset to bind a buffer to.
+    /// if it won't fit (the new block's bytes are charged to `used` — the budget guard's fallback
+    /// accounting). Returns the device memory + offset to bind a buffer to.
     fn bump(
         &mut self,
         device: &ash::Device,
         size: u64,
         align: u64,
+        used: &AtomicU64,
     ) -> Result<(vk::DeviceMemory, u64)> {
         if let Some(b) = self.blocks.last_mut() {
             let off = b.cursor.div_ceil(align) * align;
@@ -280,6 +305,7 @@ impl WeightArena {
             )
         }
         .map_err(|e| be(format!("arena overflow allocate_memory({bs}): {e}")))?;
+        used.fetch_add(bs, Ordering::Relaxed);
         self.blocks.push(ArenaBlock {
             memory,
             size: bs,
@@ -595,6 +621,7 @@ impl VulkanBackend {
                 pipeline_cache,
                 pcache,
                 weight_pb: Mutex::new(None),
+                device_used: AtomicU64::new(0),
             }),
         })
     }
@@ -622,6 +649,10 @@ impl VulkanBackend {
     /// Device-local VRAM: total heap size and currently-available bytes. `available` comes from
     /// VK_EXT_memory_budget (live, accounts for other processes + our own allocations) when the
     /// extension is present; otherwise it falls back to the total heap size (best effort).
+    /// NOTE: the extension's `heapBudget` is a CEILING (how much this process may use in total),
+    /// not free bytes — live free = `heapBudget - heapUsage`. Reporting the raw budget here once
+    /// made `available` sit ~constant while we allocated GBs, which let the VRAM guard sail past
+    /// a 53 GiB KV cache into VK_ERROR_DEVICE_LOST.
     pub fn vram(&self) -> VramInfo {
         let s = &self.shared;
         let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
@@ -644,6 +675,8 @@ impl VulkanBackend {
                 total += mp.memory_heaps[i].size;
                 available += if s.has_mem_budget {
                     budget.heap_budget[i]
+                        .saturating_sub(budget.heap_usage[i])
+                        .min(mp.memory_heaps[i].size)
                 } else {
                     mp.memory_heaps[i].size
                 };
@@ -654,6 +687,54 @@ impl VulkanBackend {
             available,
             live: s.has_mem_budget,
         }
+    }
+
+    /// VRAM budget guard: hard-error BEFORE a device-local allocation of `want` bytes that would
+    /// exceed the budget. Over-committing VRAM does not fail cleanly on GPUs — on AMD it TDRs
+    /// (VK_ERROR_DEVICE_LOST) mid-inference or silently degrades once the driver starts evicting,
+    /// so the only safe failure point is here, at allocation time (mirrors the Metal backend's
+    /// working-set guard). Uses the LIVE per-heap budget when VK_EXT_memory_budget is present
+    /// (it accounts for other processes and everything we already hold); otherwise falls back to
+    /// this backend's tracked bytes against the total heap. `GUARD_HEADROOM` absorbs allocation
+    /// slop (alignment, gpu-allocator block rounding) and driver-internal allocations.
+    /// `INFR_NO_VRAM_GUARD=1` disables the check (restoring the old fail-late behavior).
+    ///
+    /// Sub-MiB allocations skip the check (no per-tiny-alloc driver query; they cannot
+    /// individually blow the budget and stay covered by the next large allocation's check).
+    fn check_vram_budget(&self, want: u64) -> Result<()> {
+        const CHECK_MIN: u64 = 1 << 20; // 1 MiB
+        const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
+        if want < CHECK_MIN || std::env::var("INFR_NO_VRAM_GUARD").is_ok() {
+            return Ok(());
+        }
+        let v = self.vram();
+        let used = if v.live {
+            v.total.saturating_sub(v.available)
+        } else {
+            self.shared.device_used.load(Ordering::Relaxed)
+        };
+        let budget = v.total.saturating_sub(GUARD_HEADROOM);
+        if used + want > budget {
+            let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+            return Err(be(format!(
+                "VRAM budget exceeded: {:.2} GiB requested + {:.2} GiB already in use ({}) > \
+                 {:.2} GiB budget ({:.2} GiB device-local minus 256 MiB headroom). Refusing to \
+                 over-commit: exceeding VRAM doesn't fail cleanly — it causes device-lost (TDR) \
+                 or silent corruption mid-inference. Use a smaller context (INFR_MAX_CTX), a \
+                 smaller/more-quantized model, close other GPU processes, or run on the CPU \
+                 backend (INFR_CPU=1). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
+                gib(want),
+                gib(used),
+                if v.live {
+                    "live driver budget"
+                } else {
+                    "tracked by this process; no VK_EXT_memory_budget"
+                },
+                gib(budget),
+                gib(v.total),
+            )));
+        }
+        Ok(())
     }
 
     /// First device-local memory type compatible with `type_bits` (from a buffer's requirements).
@@ -694,6 +775,7 @@ impl VulkanBackend {
             .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
             .ok_or_else(|| be("no DEVICE_LOCAL memory type for weights"))?;
         let block = total.max(req.alignment).next_multiple_of(req.alignment);
+        self.check_vram_budget(block)?;
         let memory = unsafe {
             self.shared.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
@@ -703,6 +785,7 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| be(format!("reserve_weights {block} bytes: {e}")))?;
+        self.shared.device_used.fetch_add(block, Ordering::Relaxed);
 
         *self.shared.weight_arena.lock().unwrap() = Some(WeightArena {
             mem_type,
@@ -733,10 +816,21 @@ impl VulkanBackend {
         if label == "weights" {
             let mut arena = self.shared.weight_arena.lock().unwrap();
             if let Some(a) = arena.as_mut() {
+                // A bump that fits the reserved block commits no NEW device memory (the block was
+                // budget-checked at reserve time); an overflow block does — guard it first.
+                if !a.fits(requirements.size, requirements.alignment) {
+                    if let Err(e) =
+                        self.check_vram_budget(requirements.size.max(ARENA_OVERFLOW_BLOCK))
+                    {
+                        unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                        return Err(e);
+                    }
+                }
                 match a.bump(
                     &self.shared.device,
                     requirements.size,
                     requirements.alignment,
+                    &self.shared.device_used,
                 ) {
                     Ok((memory, offset)) => {
                         unsafe {
@@ -774,6 +868,15 @@ impl VulkanBackend {
         } else {
             AllocationScheme::GpuAllocatorManaged
         };
+        // Budget guard: fail fast, with a clear error, BEFORE committing device-local memory the
+        // budget can't cover (host-visible staging/readback/host-weights are exempt — the guard
+        // protects VRAM only).
+        if location == MemoryLocation::GpuOnly {
+            if let Err(e) = self.check_vram_budget(requirements.size) {
+                unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                return Err(e);
+            }
+        }
         let allocation = {
             let mut alloc = self.shared.allocator.lock().unwrap();
             alloc
@@ -797,6 +900,13 @@ impl VulkanBackend {
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
         }
         .map_err(|e| be(format!("bind_buffer_memory: {e}")))?;
+
+        // Charge the budget guard's fallback accounting (balanced by `VkBuffer::drop`).
+        if location == MemoryLocation::GpuOnly {
+            self.shared
+                .device_used
+                .fetch_add(allocation.size(), Ordering::Relaxed);
+        }
 
         Ok(VkBuffer {
             shared: Arc::clone(&self.shared),

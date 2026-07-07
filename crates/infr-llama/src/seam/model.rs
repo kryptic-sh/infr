@@ -132,17 +132,34 @@ impl SlotPool {
             .max_by_key(|&(_, s)| s)
             .unwrap();
         let target = if self.slots.len() < max_slots {
-            // Fork a fresh slot off any initialized one (shared weights, own KV).
+            // Fork a fresh slot off any initialized one (shared weights, own KV). A fork that
+            // fails the VRAM budget (each slot is a whole max_ctx KV cache — on a big model one
+            // slot can own most of free VRAM) degrades to recycling the LRU slot instead of
+            // failing the request: correctness is identical (the slot re-prefills from scratch),
+            // only cross-conversation KV reuse is lost.
             let src = self
                 .slots
                 .iter()
                 .flatten()
                 .next()
                 .expect("pick_slot: no initialized slot to fork from");
-            let fresh = src.fork(be, cfg)?;
-            self.slots.push(Some(fresh));
-            self.last_used.push(self.tick);
-            self.slots.len() - 1
+            match src.fork(be, cfg) {
+                Ok(fresh) => {
+                    self.slots.push(Some(fresh));
+                    self.last_used.push(self.tick);
+                    self.slots.len() - 1
+                }
+                Err(e) => {
+                    eprintln!(
+                        "kv slots: fork of a {}th slot failed ({e}); recycling the LRU slot \
+                         instead (fewer concurrent conversations keep their KV)",
+                        self.slots.len() + 1,
+                    );
+                    (0..self.slots.len())
+                        .min_by_key(|&i| self.last_used[i])
+                        .unwrap()
+                }
+            }
         } else {
             // Recycle the least-recently-used slot.
             (0..self.slots.len())
@@ -188,6 +205,29 @@ impl DenseMetalSession {
     }
 }
 
+/// Estimated KV-cache bytes per element for one side (K or V), from the same env override the
+/// runner honors (`INFR_KV_TYPE_K/V`, legacy `INFR_KV_Q8`). ESTIMATE ONLY — the runner
+/// additionally gates each format on backend/alignment and falls back to f16, so a gated-out
+/// low-bit request can under-estimate here; the alloc-time VRAM budget guard backstops that.
+/// Unknown/unset → f16 (2 bytes), the GPU default.
+fn kv_bytes_per_elem(var: &str) -> f64 {
+    let side = std::env::var(var).ok();
+    match side.as_deref() {
+        Some("f32") => 4.0,
+        Some("bf16") | Some("f16") | Some("F16") => 2.0,
+        Some("q8_0") | Some("q8") | Some("Q8_0") => 34.0 / 32.0,
+        Some("q4_0") | Some("iq4_nl") => 18.0 / 32.0,
+        Some("q4_1") => 20.0 / 32.0,
+        Some("q5_0") => 22.0 / 32.0,
+        Some("q5_1") => 24.0 / 32.0,
+        Some("turbo2") => 34.0 / 128.0,
+        Some("turbo3") => 50.0 / 128.0,
+        Some("turbo4") => 66.0 / 128.0,
+        _ if std::env::var("INFR_KV_Q8").is_ok() => 34.0 / 32.0,
+        _ => 2.0,
+    }
+}
+
 impl SeamModel {
     /// Load a model for CPU inference without touching the GPU. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
@@ -221,6 +261,86 @@ impl SeamModel {
             pool: SlotPool::new(),
             max_ctx,
         })
+    }
+
+    /// [`vulkan_session`](Self::vulkan_session) with the DEFAULT context window: the model's
+    /// trained context (`n_ctx_train`) clamped so weights + KV cache + activation headroom fit
+    /// the VRAM budget — a long-context model's trained window (128k+) would otherwise allocate
+    /// a KV cache that blows VRAM at startup or on the first request. Explicit contexts
+    /// (INFR_MAX_CTX → `vulkan_session(ctx)`) are NEVER clamped; the Vulkan allocation budget
+    /// guard still fails a truly-oversized one cleanly at alloc time.
+    pub fn vulkan_session_default(&self) -> Result<DenseVulkanSession> {
+        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let max_ctx = self.clamp_default_ctx(&vk, self.cfg.n_ctx_train);
+        Ok(DenseVulkanSession {
+            vk,
+            pool: SlotPool::new(),
+            max_ctx,
+        })
+    }
+
+    /// Clamp a DEFAULT context length so the full weight footprint + one KV cache fit the VRAM
+    /// budget (live free bytes when VK_EXT_memory_budget is present — the backend is created
+    /// before the weights upload, so `available` still includes their space). KV bytes/token
+    /// follows the per-layer KV geometry and the runner's KV-dtype env overrides
+    /// (INFR_KV_TYPE_K/V, INFR_KV_Q8). Only ever shrinks, and logs when it does. Extra KV slots
+    /// (INFR_KV_SLOTS forks) and MoE expert host-offload aren't modeled — the alloc-time budget
+    /// guard remains the backstop for those.
+    fn clamp_default_ctx(&self, vk: &infr_vulkan::VulkanBackend, want: usize) -> usize {
+        /// Take only this fraction of the KV bytes that nominally fit — absorbs allocation slop
+        /// (alignment, dedicated-buffer rounding) and estimate error, same spirit as the alloc
+        /// guard's fixed headroom.
+        const FIT_FRACTION: f64 = 0.95;
+        /// Below this a session is useless anyway — let the alloc guard produce its clear error.
+        const MIN_CTX: usize = 1024;
+        // Reserve beyond weights+KV: activations/scratch PLUS the measured non-modeled residents.
+        // Empirics (gemma-3-12b Q4_K_M, 7900 XTX): live usage ran ~1.5 GiB past weights+KV —
+        // upload-staging pools land in the device-local host-visible heap under ReBAR and
+        // gpu-allocator retains freed blocks, dedicated buffers round up, and the warmup graph's
+        // activations stay resident. A flush clamp just moves the failure to the first real
+        // request's activation alloc (observed as a 500), so reserve generously: max(1 GiB,
+        // total/12) — ~2 GiB on a 24 GiB card, 1 GiB floor on small ones. Over-clamping is safe;
+        // under-clamping errors requests.
+        let vram = vk.vram();
+        let act_headroom: u64 = (vram.total / 12).max(1024 * 1024 * 1024);
+        // Bytes per token across all layers, K side + V side (bytes-per-element from the same
+        // env the runner honors; formats it would gate back to f16 are an estimate only — the
+        // alloc guard catches a resulting overflow).
+        let (kb, vb) = (
+            kv_bytes_per_elem("INFR_KV_TYPE_K"),
+            kv_bytes_per_elem("INFR_KV_TYPE_V"),
+        );
+        let kv_per_tok: u64 = (0..self.cfg.n_layer)
+            .map(|l| {
+                let elems = (self.cfg.layer_n_kv(l) * self.cfg.layer_head_dim(l)) as f64;
+                (elems * (kb + vb)).ceil() as u64
+            })
+            .sum();
+        if kv_per_tok == 0 {
+            return want; // pure recurrent-state arch: no per-token KV to size.
+        }
+        let fp = crate::weights::weight_footprint(&self.gguf);
+        let free = vram
+            .available
+            .saturating_sub(fp.dense + fp.expert + act_headroom);
+        // SeamKv pads its buffers past max_ctx by ~64 rows; mirror that.
+        let fit = ((free as f64 * FIT_FRACTION / kv_per_tok as f64) as usize)
+            .saturating_sub(64)
+            .max(MIN_CTX);
+        if fit < want {
+            eprintln!(
+                "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB + KV \
+                 {:.2} MiB/1k tok + {:.1} GiB activation/overhead reserve vs {:.2} GiB \
+                 available{}); set INFR_MAX_CTX to override",
+                (fp.dense + fp.expert) as f64 / (1u64 << 30) as f64,
+                kv_per_tok as f64 * 1024.0 / (1u64 << 20) as f64,
+                act_headroom as f64 / (1u64 << 30) as f64,
+                vram.available as f64 / (1u64 << 30) as f64,
+                if vram.live { ", live" } else { ", total heap" },
+            );
+            return fit;
+        }
+        want
     }
 
     /// Greedy generation on the Vulkan seam through a persistent session (see

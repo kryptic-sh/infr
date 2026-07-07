@@ -59,6 +59,23 @@ impl DenseSeamChat {
         )?);
         Ok(true)
     }
+
+    /// Lazily open the persistent Vulkan session. Explicit `INFR_MAX_CTX` = user override, used
+    /// verbatim (NEVER clamped — the Vulkan VRAM budget guard still errors cleanly at alloc time
+    /// if it truly doesn't fit); unset = the model's trained context, clamped to the VRAM budget
+    /// (`vulkan_session_default`) so a long-context model's default KV cache can't blow VRAM.
+    fn ensure_session(&mut self) -> Result<()> {
+        if self.session.is_none() {
+            let user_ctx: Option<usize> = std::env::var("INFR_MAX_CTX")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            self.session = Some(match user_ctx {
+                Some(ctx) => self.model.vulkan_session(ctx)?,
+                None => self.model.vulkan_session_default()?,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl ChatModel for DenseSeamChat {
@@ -96,13 +113,7 @@ impl ChatModel for DenseSeamChat {
                 on_piece(p)
             });
         }
-        if self.session.is_none() {
-            let max_ctx = std::env::var("INFR_MAX_CTX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(self.model.config().n_ctx_train);
-            self.session = Some(self.model.vulkan_session(max_ctx)?);
-        }
+        self.ensure_session()?;
         self.model
             .generate_vulkan_session(self.session.as_mut().unwrap(), prompt, max_new, |p| {
                 on_piece(p)
@@ -116,13 +127,7 @@ impl ChatModel for DenseSeamChat {
         constraint: &mut crate::grammar::Constraint,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        if self.session.is_none() {
-            let max_ctx = std::env::var("INFR_MAX_CTX")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(self.model.config().n_ctx_train);
-            self.session = Some(self.model.vulkan_session(max_ctx)?);
-        }
+        self.ensure_session()?;
         self.model.generate_vulkan_session_constrained(
             self.session.as_mut().unwrap(),
             prompt,

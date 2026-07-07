@@ -583,9 +583,13 @@ fn main() {
             &["-DFMT_Q8_0", "-DNARROW_N", "-DSPLIT_K"],
         ),
         (
+            // BK64W (double k-stage, half the barriers) measured +14% on the qwen35-4B wide
+            // prefill GEMMs (pp512 3811→4330) — Q4K's cheap dqblk leaves the tile barrier-bound.
+            // Q5K/Q6K/Q8_0 measured a NET LOSS with it (all-formats build 4330→4000: their
+            // heavier decoders collide with the doubled stage), so Q4K only.
             "native_gemm_warp",
             "native_gemm_warp_q4k_ag",
-            &["-DFMT_Q4K", "-DA_GLOBAL"],
+            &["-DFMT_Q4K", "-DA_GLOBAL", "-DBK64W"],
         ),
         (
             "native_gemm_warp",

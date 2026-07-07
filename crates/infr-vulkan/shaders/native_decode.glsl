@@ -273,12 +273,17 @@ void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once fo
     float d = f16tof32(ru16(bd)); float dmin = f16tof32(ru16(bd + 2u));
     uvec2 k = k4(sub, bd + 4u);
     float dl = d * float(k.x); float mm = dmin * float(k.y);
-    uint qbase = bd + 16u + (sub / 2u) * 32u;
-    bool lo = (sub & 1u) == 0u;
-    for (uint w = 0u; w < 32u; w++) {
-        uint qb = rb(qbase + w);
-        uint val = lo ? (qb & 0xFu) : (qb >> 4u);
-        v[w] = dl * float(val) - mm;
+    // Word-parallel qs: block byte offsets are 4-aligned (144%4==0, qs at +16, sub-row stride 32)
+    // — load 8 whole u32s instead of 32 rb() byte-extract chains; nibble select hoisted (constant
+    // per sub-block). The staging loop of the warptile GEMM is decode-ALU-bound, so this is
+    // directly visible in prefill GEMM throughput.
+    uint qw = (bd + 16u + (sub / 2u) * 32u) >> 2u;
+    uint nsh = ((sub & 1u) == 0u) ? 0u : 4u;
+    for (uint w8 = 0u; w8 < 8u; w8++) {
+        uint q = nw[qw + w8] >> nsh;
+        for (uint b = 0u; b < 4u; b++) {
+            v[w8 * 4u + b] = dl * float((q >> (8u * b)) & 0xFu) - mm;
+        }
     }
 }
 #endif
@@ -305,15 +310,21 @@ void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once fo
     float d = f16tof32(ru16(bd)); float dmin = f16tof32(ru16(bd + 2u));
     uvec2 k = k4(sub, bd + 4u);
     float dl = d * float(k.x); float mm = dmin * float(k.y);
-    uint j = sub / 2u; bool lo = (sub & 1u) == 0u;
-    uint qbase = bd + 48u + j * 32u;
-    uint bit_lo = 1u << (2u * j); uint bit_hi = 2u << (2u * j);
-    for (uint w = 0u; w < 32u; w++) {
-        uint qs_byte = rb(qbase + w); uint qh_byte = rb(bd + 16u + w);
-        uint val;
-        if (lo) { val = (qs_byte & 0xFu) + (((qh_byte & bit_lo) != 0u) ? 16u : 0u); }
-        else { val = (qs_byte >> 4u) + (((qh_byte & bit_hi) != 0u) ? 16u : 0u); }
-        v[w] = dl * float(val) - mm;
+    // Word-parallel qs+qh: block byte offsets are 4-aligned (176%4==0, qh at +16, qs at +48) —
+    // 16 whole-u32 loads instead of 64 rb() byte-extract chains, nibble/high-bit selects hoisted
+    // (constant per sub-block). Same `nib | (h<<4)` value as the scalar loop — bit-identical.
+    uint j = sub / 2u;
+    uint qw = (bd + 48u + j * 32u) >> 2u;
+    uint hw = (bd + 16u) >> 2u;
+    uint nsh = ((sub & 1u) == 0u) ? 0u : 4u;      // low/high nibble of qs
+    uint hsh = 2u * j + (((sub & 1u) == 0u) ? 0u : 1u); // qh bit index for this sub-block
+    for (uint w8 = 0u; w8 < 8u; w8++) {
+        uint q = nw[qw + w8] >> nsh;
+        uint h = nw[hw + w8] >> hsh;
+        for (uint b = 0u; b < 4u; b++) {
+            uint val = ((q >> (8u * b)) & 0xFu) | (((h >> (8u * b)) & 1u) << 4u);
+            v[w8 * 4u + b] = dl * float(val) - mm;
+        }
     }
 }
 #endif
@@ -340,15 +351,24 @@ void dqblk(uint gstart, out float v[32]) {  // hf/og/d constant; hoist branch, o
     uint bd = (gstart / 256u) * 210u; uint p0 = gstart % 256u;
     float d = f16tof32(ru16(bd + 208u));
     uint hf = p0 / 128u; uint og = (p0 % 128u) / 32u;
-    uint qho = hf * 32u; uint scbase = bd + 192u + hf * 8u + 2u * og;
+    uint scbase = bd + 192u + hf * 8u + 2u * og;
     bool useB = (og & 1u) == 1u; bool high = og >= 2u; uint qshift = og * 2u;
     uint qoff = bd + hf * 64u + (useB ? 32u : 0u);  // pick qa/qb half once
-    for (uint w = 0u; w < 32u; w++) {
-        uint base = rb(qoff + w); uint qh = rb(bd + 128u + qho + w);
-        uint nib = high ? (base >> 4u) : (base & 0xFu);
-        uint q = nib | (((qh >> qshift) & 3u) << 4u);
-        int sc = sgn8(rb(scbase + w / 16u));
-        v[w] = d * float(sc) * (float(q) - 32.0);
+    uint qhoff = bd + 128u + hf * 32u;
+    // Word-parallel ql+qh (blocks are 210 bytes — only 2-aligned, so ru32u funnel-shift loads):
+    // 16 u32 loads instead of 96 rb() byte-extract chains; nibble select and the two per-16-elem
+    // scales hoisted. Same (d*sc)*(q-32) product order as the scalar loop — bit-identical.
+    float dsc0 = d * float(sgn8(rb(scbase)));
+    float dsc1 = d * float(sgn8(rb(scbase + 1u)));
+    uint nsh = high ? 4u : 0u;
+    for (uint w8 = 0u; w8 < 8u; w8++) {
+        uint q = ru32u(qoff + w8 * 4u) >> nsh;
+        uint h = ru32u(qhoff + w8 * 4u) >> qshift;
+        float dsc = (w8 < 4u) ? dsc0 : dsc1;
+        for (uint b = 0u; b < 4u; b++) {
+            uint qq = ((q >> (8u * b)) & 0xFu) | (((h >> (8u * b)) & 3u) << 4u);
+            v[w8 * 4u + b] = dsc * (float(qq) - 32.0);
+        }
     }
 }
 #endif

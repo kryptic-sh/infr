@@ -190,6 +190,19 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Stamp a GEMM-class op: with INFR_PROF2_SHAPES set (on top of INFR_PROF2), the label
+    /// itemizes kernel + shape (`kernel:mM:kxn`), splitting the otherwise-monolithic
+    /// "matmul_proj" bucket per kernel route and per projection shape (same rationale as
+    /// [`stamp_gemv`](Self::stamp_gemv)). Profiling-only; the leak is gated off in production.
+    fn stamp_gemm(&self, kernel: &'static str, m: usize, k: usize, n: usize) {
+        if self.prof2 && std::env::var("INFR_PROF2_SHAPES").is_ok() {
+            let s: &'static str = Box::leak(format!("{kernel}:m{m}:{k}x{n}").into_boxed_str());
+            self.stamp(s);
+        } else {
+            self.stamp("matmul_proj");
+        }
+    }
+
     /// Create one descriptor pool tranche (the chain grows by these on exhaustion).
     fn new_desc_pool(device: &ash::Device) -> Result<vk::DescriptorPool> {
         let pool_sizes = [vk::DescriptorPoolSize {
@@ -577,7 +590,6 @@ impl<'a> Recorder<'a> {
         bits: u32,
         blk_shift: u32,
     ) {
-        self.stamp("matmul_proj");
         // Warp tile (BM=64,BN=256, 256 threads / 8 warps — matches llama.cpp's AMD-RADV large
         // warptile; the extra warps hide W-dequant latency). Wins big for M≥768 (low/mid ctx:
         // 4k+21% 8k+19% 16k+5%); at very small M (32k chunk≈500) its wide N tile still loses to the
@@ -588,6 +600,7 @@ impl<'a> Recorder<'a> {
         } else {
             ("gemm_proj", crate::gemm::gemm_proj_spv(), n / 64)
         };
+        self.stamp_gemm(name, m, k, n);
         let kern = self.be.kernel_sg(name, spv, 5, 20, 32);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
@@ -642,7 +655,6 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        self.stamp("matmul_proj");
         // Large-warptile variant (8-warp BM=64×BN=256): 4× the math per staged A-row / decoded
         // W-column vs the 64×64 tile, and the extra warps hide the dequant latency. Needs k%32;
         // only the hot formats are compiled — everything else stays on the 64×64 kernel.
@@ -692,6 +704,7 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv"),
             ),
         };
+        self.stamp_gemm(name, m, k, n);
         let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
         let groups_n = match warp {
             Some((_, bn)) => n / bn,
@@ -730,7 +743,6 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        self.stamp("matmul_proj");
         let wide_grid = m.div_ceil(64) * (n / 256).max(1);
         let use_wide = n.is_multiple_of(256) && wide_grid >= 128;
         let ((name, spv), bn) = if use_wide {
@@ -744,6 +756,7 @@ impl<'a> Recorder<'a> {
                 128,
             )
         };
+        self.stamp_gemm(name, m, k, n);
         let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
@@ -781,7 +794,6 @@ impl<'a> Recorder<'a> {
         splits: usize,
         a_is_f16: bool,
     ) {
-        self.stamp("matmul_proj");
         let (name, spv) = if a_is_f16 {
             crate::gemm::native_gemm_warp_sk_ag_build_spv(dtype).expect("split-k ag spv")
         } else {
@@ -798,6 +810,7 @@ impl<'a> Recorder<'a> {
             };
             (name, spv)
         };
+        self.stamp_gemm(name, m, k, n);
         let mpad = m.div_ceil(64) * 64;
         let kern = self.be.kernel_sg(name, spv, 3, 24, 32);
         let mut push = [0u8; 24];
@@ -816,7 +829,7 @@ impl<'a> Recorder<'a> {
             groups,
         );
         // reduce: out[i] = Σ_s partials[s·plane + i]
-        self.stamp("matmul_proj");
+        self.stamp_gemm("splitk_reduce", m, k, n);
         let rk = self
             .be
             .kernel("splitk_reduce", crate::gemm::splitk_reduce_spv(), 2, 12);
@@ -850,7 +863,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        self.stamp("matmul_proj");
+        self.stamp_gemm("native_gemm_mmq_q4k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q4k",
             crate::gemm::native_gemm_mmq_q4k_spv(),
@@ -894,7 +907,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        self.stamp("matmul_proj");
+        self.stamp_gemm("native_gemm_mmq_q6k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q6k",
             crate::gemm::native_gemm_mmq_q6k_spv(),
@@ -958,7 +971,7 @@ impl<'a> Recorder<'a> {
             (m * nblk) as u32,
         );
         // pass 2: integer dp4a matmul
-        self.stamp("matmul_proj");
+        self.stamp_gemm("gemm_proj_mmq", m, k, n);
         let km = self
             .be
             .kernel_sg("gemm_proj_mmq", crate::gemm::gemm_proj_mmq_spv(), 7, 12, 32);
@@ -3128,7 +3141,7 @@ impl<'a> Recorder<'a> {
     ) {
         debug_assert!(kd <= 128, "deltanet split assumes kd ≤ 128, got {kd}");
         let nchunk = rows.div_ceil(32);
-        self.stamp("deltanet");
+        self.stamp("deltanet_prep");
         // pass 1: prep — (chunk, k-head) grid
         let kp = self
             .be
@@ -3154,7 +3167,7 @@ impl<'a> Recorder<'a> {
             (nchunk * nk) as u32,
         );
         // pass 2: gates — (chunk, value-head) grid
-        self.stamp("deltanet");
+        self.stamp("deltanet_gates");
         let kg = self
             .be
             .kernel("deltanet_gates", crate::gemm::deltanet_gates_spv(), 6, 8);
@@ -3176,7 +3189,7 @@ impl<'a> Recorder<'a> {
             (nchunk * nv) as u32,
         );
         // pass 3: scan — (value head, column block) grid, sequential over chunks inside
-        self.stamp("deltanet");
+        self.stamp("deltanet_scan");
         let ks = self
             .be
             .kernel_sg("deltanet_scan", crate::gemm::deltanet_scan_spv(), 9, 20, 32);

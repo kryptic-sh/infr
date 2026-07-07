@@ -109,7 +109,12 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
 // 6-bit scale dl per 32-elem sub-block (symmetric, like Q6_K — no min/Σa term). Element order:
 // elems 0..15 = KV[qs[j]&0xF], elems 16..31 = KV[qs[j]>>4] (j=0..15), matching the activation qaw's
 // natural order (qaw[j] covers elems 4j..4j+3). Same dl*KV product as the scalar dqblk decode.
-const int KV_IQ4NL[16] = int[](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+// Byte-packed LUT (see native_decode.glsl's kv_iq4nl): a 4-way dynamic index + bitfieldExtract
+// instead of a 16-way dynamic index — same values, bit-identical, cheaper ALU.
+const uint KV_IQ4NL_W[4] = uint[](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+int kv_iq4nl(uint idx) {
+    return bitfieldExtract(int(KV_IQ4NL_W[idx >> 2u]), int((idx & 3u) << 3u), 8);
+}
 float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     uint p = gelem % 256u;
     uint bd = (gelem / 256u) * 136u;
@@ -126,8 +131,8 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
         uint wl = 0u; uint wh = 0u;        // gathered int8 codebook values (low / high nibbles)
         for (uint b = 0u; b < 4u; b++) {
             uint qbyte = (q >> (8u * b)) & 0xFFu;
-            wl |= (uint(KV_IQ4NL[qbyte & 0xFu]) & 0xFFu) << (8u * b);
-            wh |= (uint(KV_IQ4NL[qbyte >> 4u]) & 0xFFu) << (8u * b);
+            wl |= (uint(kv_iq4nl(qbyte & 0xFu)) & 0xFFu) << (8u * b);
+            wh |= (uint(kv_iq4nl(qbyte >> 4u)) & 0xFFu) << (8u * b);
         }
         dp = dotPacked4x8AccSatEXT(int(wl), int(qaw[j]), dp);       // elems 4j..4j+3
         dp = dotPacked4x8AccSatEXT(int(wh), int(qaw[j + 4u]), dp);  // elems 16+4j..16+4j+3

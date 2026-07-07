@@ -113,7 +113,12 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 // f1 = 0 and the Q4_K-style single-dp accumulation (`f0·dact·dp − f1·sact`) degenerates correctly.
 // Element order matches the activation aw[8]: qp[0..3] = KV of low nibbles (elems 0..15),
 // qp[4..7] = KV of high nibbles (elems 16..31). Same dl*KV product as the scalar dqblk decode.
-const int KV_IQ4NL[16] = int[](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+// Byte-packed LUT (see native_decode.glsl's kv_iq4nl): a 4-way dynamic index + bitfieldExtract
+// instead of a 16-way dynamic index — same values, bit-identical, cheaper ALU.
+const uint KV_IQ4NL_W[4] = uint[](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+int kv_iq4nl(uint idx) {
+    return bitfieldExtract(int(KV_IQ4NL_W[idx >> 2u]), int((idx & 3u) << 3u), 8);
+}
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint p = gelem % 256u;
     uint bd = (gelem / 256u) * 136u;
@@ -130,8 +135,8 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
         uint wl = 0u; uint wh = 0u;
         for (uint b = 0u; b < 4u; b++) {
             uint qbyte = (q >> (8u * b)) & 0xFFu;
-            wl |= (uint(KV_IQ4NL[qbyte & 0xFu]) & 0xFFu) << (8u * b);
-            wh |= (uint(KV_IQ4NL[qbyte >> 4u]) & 0xFFu) << (8u * b);
+            wl |= (uint(kv_iq4nl(qbyte & 0xFu)) & 0xFFu) << (8u * b);
+            wh |= (uint(kv_iq4nl(qbyte >> 4u)) & 0xFFu) << (8u * b);
         }
         qp[j] = wl;
         qp[j + 4u] = wh;

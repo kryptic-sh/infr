@@ -375,7 +375,17 @@ void dqblk(uint gstart, out float v[32]) {  // hf/og/d constant; hoist branch, o
 
 // ── codebook formats (small const tables / decode fns, no grid) ──
 #if defined(FMT_IQ4NL) || defined(FMT_IQ4XS)
-const int KV_IQ4NL[16] = int[](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+// kvalues_iq4nl, byte-packed 4-per-u32 (all 16 signed values fit int8) instead of a 16-entry
+// `int[]`: a dynamically-indexed 16-element array lowers (RADV/ACO) to a far longer select
+// cascade than a 4-element one, and the intra-word extract is a single native bitfieldExtract
+// (V_BFE, sign-extending) instead of a second array read — idx>>2 picks the word (4-way), idx&3
+// the byte lane. This IS the ALU floor of IQ4_XS decode: bytes-vs-speed showed IQ4_XS (4.25 bpw,
+// SMALLER than Q4_K's 4.5) running 1.55-2.1x SLOWER per dispatch at matched shapes — codebook-
+// gather ALU, not DRAM bandwidth.
+const uint KV_IQ4NL_W[4] = uint[](0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+int kv_iq4nl(uint idx) {
+    return bitfieldExtract(int(KV_IQ4NL_W[idx >> 2u]), int((idx & 3u) << 3u), 8);
+}
 #endif
 #if defined(FMT_MXFP4) || defined(FMT_NVFP4)
 const int KV_MXFP4[16] = int[](0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
@@ -404,7 +414,7 @@ float dq(uint g) {
     uint j = g % 32u; uint bd = (g / 32u) * 18u;
     float d = f16tof32(ru16(bd));
     uint idx = (j < 16u) ? (rb(bd + 2u + j) & 0xFu) : (rb(bd + 2u + j - 16u) >> 4u);
-    return d * float(KV_IQ4NL[idx]);
+    return d * float(kv_iq4nl(idx));
 }
 #endif
 
@@ -421,7 +431,7 @@ float dq(uint g) {
     float dl = d * float(int(ls) - 32);
     uint qoff = bd + 8u + 16u * ib;
     uint idx = (within < 16u) ? (rb(qoff + within) & 0xFu) : (rb(qoff + within - 16u) >> 4u);
-    return dl * float(KV_IQ4NL[idx]);
+    return dl * float(kv_iq4nl(idx));
 }
 #define HAVE_DQBLK
 // One 32-elem sub-block = exactly one of the 8 IQ4_XS sub-blocks (gstart is 32-aligned).
@@ -445,8 +455,8 @@ void dqblk(uint gstart, out float v[32]) {
         for (uint b = 0u; b < 4u; b++) {
             uint byte = (q >> (8u * b)) & 0xFFu;
             uint j = w4 * 4u + b;
-            v[j] = dl * float(KV_IQ4NL[byte & 0xFu]);
-            v[j + 16u] = dl * float(KV_IQ4NL[byte >> 4u]);
+            v[j] = dl * float(kv_iq4nl(byte & 0xFu));
+            v[j + 16u] = dl * float(kv_iq4nl(byte >> 4u));
         }
     }
 }

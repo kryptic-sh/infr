@@ -12,6 +12,7 @@ fn blk_bytes(dt: DType) -> usize {
     match dt {
         DType::Q4K => 144,
         DType::Q6K => 210,
+        DType::Iq4Xs => 136,
         _ => unreachable!(),
     }
 }
@@ -34,6 +35,15 @@ fn decode_gemv_bw() {
         ("o2k-q6 ", 4096, 2048, DType::Q6K),
         ("o-q6   ", 4096, 4096, DType::Q6K),
         ("lm_head", 4096, 151936, DType::Q6K),
+        // IQ4_XS: same shapes as the Q4_K rows above — codebook-decode ALU-bound-ness (fewer
+        // bytes/weight than Q4_K, yet slower) must hold at TRUE (>96 MiB, cache-busting) DRAM
+        // bandwidth too, not just in the small-model INFR_PROF2 numbers (which are cache-warm).
+        ("q -iq4x", 4096, 4096, DType::Iq4Xs),
+        ("k/v-iq4", 4096, 1024, DType::Iq4Xs),
+        ("qkv-iq4", 4096, 6144, DType::Iq4Xs),
+        ("o  -iq4", 4096, 4096, DType::Iq4Xs),
+        ("g+u-iq4", 4096, 24576, DType::Iq4Xs),
+        ("dn -iq4", 12288, 4096, DType::Iq4Xs),
     ];
     let xmax = 12288;
     let xs: Vec<f32> = (0..xmax).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
@@ -63,6 +73,7 @@ fn decode_gemv_bw() {
                             blk[2..4].copy_from_slice(&[0x00, 0x1C]);
                         }
                         DType::Q6K => blk[208..210].copy_from_slice(&[0x00, 0x1C]),
+                        DType::Iq4Xs => blk[0..2].copy_from_slice(&[0x00, 0x1C]),
                         _ => unreachable!(),
                     }
                 }

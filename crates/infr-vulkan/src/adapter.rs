@@ -325,13 +325,24 @@ fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<ScratchSet> {
 /// flash-attention partials (≈38 GB) and took the device down.
 type ScratchPool = HashMap<(&'static str, usize), Box<dyn Buffer>>;
 
-/// mmv (int8 dp4a decode GEMV) size gate: below this weight-element count the dequant GEMV is
-/// already so short (<~10us) that the extra quant_q8 dispatch's fixed bubble (~2-3us on a
-/// 7900 XTX) eats the kernel saving. Probe data (gemv_vs_mmv, 7900 XTX): 4096x24576 gate+up
-/// −38%, 12288x4096 Q6_K down −5.5% (= 48M elements, the smallest clear payer), 4096x4096 o
-/// −5% kernel-only but a whole-model LOSS on dispatch-bound decodes (gemma3-1b −2.3%,
-/// qwen3moe −6% with no gate).
+/// mmv (int8 dp4a decode GEMV) size gate for the m≥3 small-m PREFILL mrow path: below this
+/// weight-element count the dequant GEMV is already so short (<~10us) that the extra quant_q8
+/// dispatch's fixed bubble (~2-3us on a 7900 XTX) eats the kernel saving. Probe data
+/// (gemv_vs_mmv, 7900 XTX): 4096x24576 gate+up −38%, 12288x4096 Q6_K down −5.5% (= 48M elements,
+/// the smallest clear payer), 4096x4096 o −5% kernel-only but a whole-model LOSS on
+/// dispatch-bound decodes (gemma3-1b −2.3%, qwen3moe −6% with no gate).
 const MMV_MIN_ELEMS: usize = 48 << 20;
+
+/// The m=1 DECODE int8 mmv is DEFAULT-OFF (opt in with `INFR_MMV_DECODE=1`). The word-parallel
+/// K-quant `dqblk` (whole-u32 decode, commit 51a35c8) sped up the SCALAR dequant GEMV enough that
+/// it now beats the int8 mmv at m=1 across the board — measured `INFR_NO_MMV=1` (scalar) vs mmv,
+/// tg128 r=3 on a 7900 XTX: Qwen3-8B 127.3 vs 123.0 (+3.5%), qwen35-4B 142.5 vs 139.4 (+2.2%),
+/// 0.6B 667 vs 662 (+0.8%), 8B tg64@d4096 113.7 vs 110.4 (+3.0%). So decode routes to the scalar
+/// GEMV; the mmv kernels stay reachable for A/B + future re-tuning. (The m≥3 mrow PREFILL mmv is
+/// UNAFFECTED — it still wins: E2B pp4@d4096 loses 5.3% under `INFR_NO_MMV`.)
+fn mmv_decode_enabled() -> bool {
+    std::env::var("INFR_MMV_DECODE").is_ok() && std::env::var("INFR_NO_MMV").is_err()
+}
 
 /// Get-or-alloc the pool buffer for (tag, bytes); returns the map key so callers can hold several
 /// pool buffers at once via immutable indexing (`pool[&k].as_ref()`).
@@ -634,11 +645,12 @@ fn lower_op(
                 if native_dense_supported(dt) {
                     // Int8 dp4a decode GEMV (mmv): quantize x to Q8 once, integer-dot the raw
                     // K-quant blocks (llama.cpp's mmvq) instead of dequanting every weight to
-                    // f32. Scratch is pooled; INFR_NO_MMV forces the dequant GEMV (A/B).
-                    if in_f % 32 == 0
+                    // f32. DEFAULT-OFF at m=1 — the scalar dequant GEMV now wins (see
+                    // `mmv_decode_enabled`); opt in with INFR_MMV_DECODE=1.
+                    if mmv_decode_enabled()
+                        && in_f % 32 == 0
                         && in_f * out_f >= MMV_MIN_ELEMS
                         && crate::gemm::native_mmv_build_spv(dt, true).is_some()
-                        && std::env::var("INFR_NO_MMV").is_err()
                     {
                         let nblk = in_f / 32;
                         let qa = pooled(pool, be_, "mmv_qa", in_f)?;
@@ -927,11 +939,13 @@ fn lower_op(
                 }
             } else if native_dense_supported(dt) {
                 // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
+                // DEFAULT-OFF: the scalar dequant GEMV wins at m=1 post-51a35c8 (see
+                // `mmv_decode_enabled`); opt in with INFR_MMV_DECODE=1.
                 if m == 1
+                    && mmv_decode_enabled()
                     && in_f % 32 == 0
                     && in_f * out_f >= MMV_MIN_ELEMS
                     && crate::gemm::native_mmv_build_spv(dt, false).is_some()
-                    && std::env::var("INFR_NO_MMV").is_err()
                 {
                     let nblk = in_f / 32;
                     let qa = pooled(pool, be_, "mmv_qa", in_f)?;

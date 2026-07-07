@@ -429,6 +429,7 @@ pub enum Op {
     },
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Op {
     /// The op's variant name — used by backends for per-op profiling / error messages so the
     /// mapping lives in ONE place (was duplicated as `op_kind`/`op_name` in each backend).
@@ -472,6 +473,7 @@ pub struct Graph {
     pub outputs: Vec<TensorId>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Graph {
     pub fn new() -> Self {
         Self::default()

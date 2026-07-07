@@ -50,6 +50,7 @@ use infr_core::{
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Terse local shorthand for the shared [`Error::backend`] constructor.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn be(s: impl std::fmt::Display) -> Error {
     Error::backend(s)
 }
@@ -58,6 +59,7 @@ fn be(s: impl std::fmt::Display) -> Error {
 ///
 /// # Safety
 /// Must only be called with buffers returned by `VulkanBackend::alloc`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn as_vk_buf(b: &dyn Buffer) -> &VkBuffer {
     // Fat pointer (data_ptr, vtable_ptr) → thin data_ptr → &VkBuffer.
     &*(b as *const dyn Buffer as *const () as *const VkBuffer)
@@ -125,6 +127,7 @@ struct VulkanShared {
 unsafe impl Send for VulkanShared {}
 unsafe impl Sync for VulkanShared {}
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanShared {
     /// Debounced disk save of the pipeline cache — call after a NEW pipeline lands so long-lived
     /// processes (serve) persist without waiting for a clean Drop.
@@ -135,6 +138,7 @@ impl VulkanShared {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for VulkanShared {
     fn drop(&mut self) {
         unsafe {
@@ -190,6 +194,7 @@ struct VkBuffer {
     location: MemoryLocation,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VkBuffer {
     /// Persistently-mapped host pointer for host-visible (pooled) buffers; `None` for device-local
     /// or arena buffers (which are never mapped — they're filled via a staging copy).
@@ -201,6 +206,7 @@ impl VkBuffer {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for VkBuffer {
     fn drop(&mut self) {
         unsafe {
@@ -224,6 +230,7 @@ impl Drop for VkBuffer {
 unsafe impl Send for VkBuffer {}
 unsafe impl Sync for VkBuffer {}
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Buffer for VkBuffer {
     fn len_bytes(&self) -> usize {
         self.size
@@ -267,6 +274,7 @@ struct WeightArena {
     blocks: Vec<ArenaBlock>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl WeightArena {
     /// Whether a `size`-at-`align` bump fits the newest block WITHOUT growing an overflow block —
     /// i.e. whether [`bump`](Self::bump) would commit new device memory. The budget guard checks
@@ -335,6 +343,7 @@ pub struct WeightProgress {
     shared: Arc<VulkanShared>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for WeightProgress {
     fn drop(&mut self) {
         if let Some(pb) = self.shared.weight_pb.lock().unwrap().take() {
@@ -345,6 +354,7 @@ impl Drop for WeightProgress {
 
 impl infr_core::backend::ProgressScope for WeightProgress {}
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
     /// `maxComputeSharedMemorySize` for the active device — the per-workgroup shared-memory budget
     /// the flash-attention tile height is sized against (cheap accessor; avoids cloning caps).
@@ -1009,6 +1019,7 @@ impl VulkanBackend {
 
 // ── Backend impl ──────────────────────────────────────────────────────────────
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Backend for VulkanBackend {
     fn name(&self) -> &str {
         "vulkan"

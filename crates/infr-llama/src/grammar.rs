@@ -38,6 +38,7 @@ use toktrie_hf_tokenizers::{ByteTokenizer, ByteTokenizerEnv};
 /// `compute_mask` and `consume_token` agree.
 struct NonCanonicalEnv(ByteTokenizerEnv);
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl TokenizerEnv for NonCanonicalEnv {
     fn tok_trie(&self) -> &TokTrie {
         self.0.tok_trie()
@@ -54,6 +55,7 @@ impl TokenizerEnv for NonCanonicalEnv {
 /// and reparses it on toktrie's side (decoupling the `tokenizers` versions); `eos_ids` mark stop
 /// tokens; `vocab` is the model's logit width so the token trie matches the logits exactly. Wrapped in
 /// [`NonCanonicalEnv`] so the mask is consistent with `consume` (see that type's docs).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn build_tok_env(tokenizer: &Tokenizer, vocab: usize, eos_ids: &[u32]) -> Result<TokEnv> {
     let json = tokenizer
         .to_string(false)
@@ -73,6 +75,7 @@ pub struct Constraint {
     vocab: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Constraint {
     /// Construct a constraint for `grammar` over `tok_env`.
     pub fn new(tok_env: TokEnv, grammar: TopLevelGrammar) -> Result<Self> {
@@ -148,6 +151,7 @@ impl Constraint {
 /// Returns `(tokens emitted this step, grammar finished)`; an EMPTY step means the constrained
 /// span is done (accepting EOS or mask exhausted). ONE implementation shared by the bespoke
 /// decode loop and both seam decode paths.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn constrained_step(
     c: &mut Constraint,
     logits: &mut [f32],
@@ -183,6 +187,7 @@ pub fn constrained_step(
 /// Build the grammar [`Constraint`] that FORCES a valid, schema-conforming tool call, for
 /// `tool_choice` values that require one (`"required"`, or a named function). `None` for
 /// `"auto"`/`"none"`/absent. Tokenizer-based (no `Llama` needed) so the seam backends share it.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn tool_constraint_for(
     tokenizer: &Tokenizer,
     vocab: usize,
@@ -229,6 +234,7 @@ pub fn tool_constraint_for(
 /// so the grammar stays pure JSON over normal byte tokens (no special-token / byte-grammar mismatch).
 /// Used for `tool_choice: "required"` / a named tool — the model MUST emit one valid, schema-conforming
 /// call. `tools` is the OpenAI `tools` array.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn forced_tool_call_grammar(tools: &Value) -> Result<TopLevelGrammar> {
     let arr = tools
         .as_array()

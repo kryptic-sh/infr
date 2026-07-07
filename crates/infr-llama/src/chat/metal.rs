@@ -20,6 +20,7 @@ pub struct MetalSeamChat {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl MetalSeamChat {
     pub fn new(model: SeamModel) -> Self {
         Self {
@@ -66,6 +67,7 @@ impl MetalSeamChat {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for MetalSeamChat {
     fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.model.render_chat_messages(messages)
@@ -139,6 +141,7 @@ pub struct SpecMetalChat {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SpecMetalChat {
     pub fn new(target: SeamModel, draft: SeamModel, k: usize) -> Self {
         Self {
@@ -167,6 +170,7 @@ impl SpecMetalChat {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for SpecMetalChat {
     fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.target.render_chat_messages(messages)

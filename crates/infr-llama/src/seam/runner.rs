@@ -60,6 +60,7 @@ pub(super) struct DecodeHandles {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_backend(
     be: &dyn Backend,
     bind_weight: &BindWeight,

@@ -40,6 +40,7 @@ pub trait DiffusionSession {
     ) -> Result<DenoiseOutcome>;
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionSession for DiffusionGemmaCpuSession {
     fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
         DiffusionGemmaCpuSession::prefill(self, model, tokens)
@@ -63,6 +64,7 @@ impl DiffusionSession for DiffusionGemmaCpuSession {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionSession for DiffusionGemmaVulkanSession {
     fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
         DiffusionGemmaVulkanSession::prefill(self, model, tokens)
@@ -89,6 +91,7 @@ impl DiffusionSession for DiffusionGemmaVulkanSession {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionSession for crate::seam::model::DiffusionGemmaMetalSession {
     fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
         crate::seam::model::DiffusionGemmaMetalSession::prefill(self, model, tokens)
@@ -126,6 +129,7 @@ pub struct EbConfig {
     pub confidence_threshold: f32,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl EbConfig {
     pub fn from_config(cfg: &Config) -> Self {
         Self {
@@ -181,6 +185,7 @@ pub struct StepView<'a> {
 /// renoise), not bit-identical output — see this module's doc comment.
 struct Rng(u64);
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Rng {
     fn new(seed: u64) -> Self {
         Self(seed | 1) // xorshift64 never leaves the zero state, but also never enters it from a
@@ -209,6 +214,7 @@ impl Rng {
 /// E0499 (no Polonius yet): each iteration's reborrow of the `&mut dyn FnMut` needs to be shorter
 /// than the OUTER lifetime the function signature ties it to, which a method call inline can't
 /// express — routing through this free function gives the reborrow its own elided lifetime.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn reborrow_step_hook<'b>(
     hook: &'b mut Option<&mut dyn FnMut(StepView)>,
 ) -> Option<&'b mut dyn FnMut(StepView)> {
@@ -224,6 +230,7 @@ fn reborrow_step_hook<'b>(
 /// every step regardless of acceptance) and the number of steps actually run (early stop —
 /// `diffusion.cpp:665`).
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn denoise_block(
     session: &mut impl DiffusionSession,
     model: &SeamModel,
@@ -436,6 +443,7 @@ fn denoise_block(
 /// Cut a denoised canvas at the first end-of-generation token, or (many checkpoints emit no stop
 /// token) at the onset of a repetition loop — a token recurring at stride 1-2 for >= 6 reps
 /// (`diffusion-cli.cpp:388-411`'s `trim_canvas`). A cut shorter than the canvas ends the turn.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn trim_canvas(canvas: &[u32], is_eog: impl Fn(u32) -> bool) -> usize {
     let n = canvas.len();
     let mut cut = n;
@@ -484,6 +492,7 @@ fn trim_canvas(canvas: &[u32], is_eog: impl Fn(u32) -> bool) -> usize {
 /// exactly `response` (equivalently `result.tokens`) — purely an earlier, chunked view of the same
 /// bytes, never a different set of tokens.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn diffusion_generate(
     session: &mut impl DiffusionSession,
     model: &SeamModel,
@@ -573,6 +582,7 @@ pub fn diffusion_generate(
 /// Cheap architecture peek (mirrors [`crate::qwen35::is_qwen35`]): open the GGUF and read
 /// `general.architecture` without building a full [`SeamModel`] — lets `infr run`/`serve` pick the
 /// diffusion decode loop (and its own default token budget) before paying a full model load.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn is_diffusion_gemma(path: &std::path::Path) -> bool {
     use infr_core::WeightSource;
     infr_gguf::Gguf::open(path)

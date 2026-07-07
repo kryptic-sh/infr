@@ -74,6 +74,7 @@ pub struct MtpHeadWeights {
 /// (issue #33, phase 4 — perf-bottleneck visibility) use this to decide whether a model needs the
 /// extra measurement at all, cheaper than `Config::from_gguf` (which validates every other field
 /// too) for a check this narrow.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn has_mtp_head(path: &std::path::Path) -> bool {
     let Ok(g) = Gguf::open(path) else {
         return false;
@@ -85,10 +86,12 @@ pub fn has_mtp_head(path: &std::path::Path) -> bool {
         > 0
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn find<'a>(g: &'a Gguf, name: &str) -> Option<&'a TensorInfo> {
     g.tensors().iter().find(|t| t.name == name)
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn require(g: &Gguf, name: &str, want: &[usize]) -> Result<MtpTensor> {
     let t = find(g, name).ok_or_else(|| anyhow!("MTP head: missing tensor {name}"))?;
     if t.shape != want {
@@ -104,6 +107,7 @@ fn require(g: &Gguf, name: &str, want: &[usize]) -> Result<MtpTensor> {
 /// Like [`require`] but `None` (not an error) when the tensor is simply absent — the reference's
 /// fallback tensors (`nextn.embed_tokens`/`shared_head_head`/`shared_head_norm`). A PRESENT tensor
 /// with the wrong shape is still an error (a real corruption, not an intentional omission).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn optional(g: &Gguf, name: &str, want: &[usize]) -> Result<Option<MtpTensor>> {
     match find(g, name) {
         Some(t) if t.shape == want => Ok(Some(t.clone())),
@@ -119,6 +123,7 @@ fn optional(g: &Gguf, name: &str, want: &[usize]) -> Result<Option<MtpTensor>> {
 /// Locate + shape-check the qwen35 MTP head's tensors (see the module doc). Requires
 /// `cfg.n_layer_nextn == 1` (Phase 1's only supported case — `Config::from_gguf` already rejects
 /// anything else) and `cfg.qwen35`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn load_mtp_head(g: &Gguf, cfg: &crate::Config) -> Result<MtpHeadWeights> {
     if !cfg.qwen35 || cfg.n_layer_nextn != 1 {
         bail!(
@@ -175,6 +180,7 @@ type WBufs = (Vec<Box<dyn Buffer>>, Vec<(DType, usize)>);
 
 /// Resolve a fallback tensor from the MAIN model (the reference's `layer.nextn.X ? layer.nextn.X :
 /// model.Y` — `qwen35.cpp:624-638`) when the head's own `nextn.*` tensor is absent.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn main_output_norm(g: &Gguf, ne: usize) -> Result<MtpTensor> {
     require(g, "output_norm.weight", &[ne])
 }
@@ -182,6 +188,7 @@ fn main_output_norm(g: &Gguf, ne: usize) -> Result<MtpTensor> {
 /// The tied/untied lm_head fallback (`qwen35.cpp:636`'s `layer.nextn.shared_head_head ? ... :
 /// model.output`), mirroring `seam.rs`'s own tied-weight rule (`wload(&["output.weight"])`
 /// vs the `token_embd.weight` fallback right above it in that file).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn main_lm_head(g: &Gguf, ne: usize, vocab: usize) -> Result<MtpTensor> {
     if find(g, "output.weight").is_some() {
         require(g, "output.weight", &[ne, vocab])
@@ -194,6 +201,7 @@ fn main_lm_head(g: &Gguf, ne: usize, vocab: usize) -> Result<MtpTensor> {
 /// one — `None` when it doesn't (the shipped 4B GGUF: `docs/MTP.md`'s confirmed dump), in which
 /// case the caller passes the main model's already-dequantized `token_embd` straight to
 /// [`MtpHeadSession::new_cpu`]/[`new_vulkan`] instead.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn resolve_own_embed_table(g: &Gguf, head: &MtpHeadWeights) -> Result<Option<Vec<f32>>> {
     match &head.embed_tokens {
         Some(t) => Ok(Some(crate::load_tensor_dequant(g, &t.name)?.0)),
@@ -208,6 +216,7 @@ pub fn resolve_own_embed_table(g: &Gguf, head: &MtpHeadWeights) -> Result<Option
 /// exactly like the trunk's do. Falls back to the main model's `output_norm`/tied lm_head for the
 /// two optional NextN tensors that are absent (`docs/MTP.md`'s confirmed dump — `shared_head_norm`
 /// IS present in the shipped 4B GGUF, so only the lm_head fallback fires there in practice).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn upload_mtp_head_bufs(
     be: &dyn Backend,
     bind_weight: &BindWeightFn,
@@ -295,6 +304,7 @@ struct MtpHandles {
 /// `mtp_head_forward_finite`'s finite-logits check plus `h_tap_matches_lm_head`-style consistency
 /// implicit in the parity test (a layout bug here would show up as garbage/NaN logits or gross
 /// CPU/Vulkan disagreement, not a subtle numeric drift).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn build_mtp_graph(
     cfg: &crate::Config,
     wspecs: &[(DType, usize)],
@@ -707,6 +717,7 @@ pub struct MtpHeadSession<'a> {
     exec_secs: f64,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> MtpHeadSession<'a> {
     /// Construct over the CPU reference backend (zero-copy mmap weight upload — mirrors
     /// `seam/model.rs`'s `DiffusionGemmaCpuSession` closures).
@@ -950,6 +961,7 @@ pub const DEFAULT_P_MIN: f32 = 0.0;
 /// `start_pos`, discard the logits" call with no special-casing of the first row. The head's own KV
 /// rows `start_pos..start_pos+tokens.len()` are (over)written — see `forward`'s doc on the
 /// overwrite semantics a re-draft relies on.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn catch_up(
     sess: &mut MtpHeadSession,
     tokens: &[u32],
@@ -973,6 +985,7 @@ pub fn catch_up(
 /// `data[0]`). Returns `(token, top1_prob)` pairs so a caller can inspect confidence without a
 /// second pass; re-drafting from the same `n_past` OVERWRITES the head's KV at those positions
 /// (`forward`'s doc) — the caller doesn't need to reset anything first.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn draft(
     sess: &mut MtpHeadSession,
     id_last: u32,
@@ -1002,6 +1015,7 @@ pub fn draft(
 /// candidate's OWN probability mass is needed (not the runner-up ids a real top-k sampler would
 /// keep), argmax + `1/Σexp(logit - max)` is exactly `softmax(logits)[argmax]` without materializing
 /// the full distribution.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn top1_softmax(logits: &[f32]) -> (u32, f32) {
     let (mut amax, mut m) = (0usize, f32::NEG_INFINITY);
     for (i, &v) in logits.iter().enumerate() {
@@ -1040,6 +1054,7 @@ pub const DEFAULT_N_MAX: usize = 6;
 /// empty) and THIS function does the exact host argmax per row — either way the caller sees the
 /// same `[m]` id vector, bit-identical (both paths argmax the same f32 logits with strict-`>`
 /// lowest-index tie-break).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn run_verify(
     be: &dyn Backend,
     bind: &BindWeightFn,
@@ -1105,6 +1120,7 @@ pub struct MtpTiming {
     pub total_accepted: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl MtpTiming {
     /// Fold another run's counters in (bench averages several reps — see `infr-cli`'s
     /// `bench_mtp_tg`).
@@ -1138,6 +1154,7 @@ impl MtpTiming {
 
 /// Greedy argmax over one `[vocab]` logits row (unlike [`top1_softmax`], no probability needed —
 /// `spec_accept`/the verify-round check only reads the winning id).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn argmax_row(row: &[f32]) -> u32 {
     let mut bi = 0usize;
     let mut bv = f32::NEG_INFINITY;
@@ -1155,6 +1172,7 @@ fn argmax_row(row: &[f32]) -> u32 {
 /// caller-built [`MtpHeadSession`] (bound to the same `be`). Everything between — draft, accept,
 /// catch-up, streaming — is backend-agnostic.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn generate_mtp_spec_core(
     be: &dyn Backend,
     bind: &BindWeightFn,

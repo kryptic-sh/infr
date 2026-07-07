@@ -18,6 +18,7 @@ pub enum Error {
     Other(String),
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Error {
     /// Construct a backend error from anything Display — the constructor each backend used to
     /// reinvent (Vulkan's local `fn be`).

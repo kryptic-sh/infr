@@ -42,6 +42,7 @@ pub(crate) struct Q4kPack {
     pub(crate) nb: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Q4kPack {
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn bytes(&self) -> usize {
@@ -57,6 +58,7 @@ impl Q4kPack {
 /// Build the pack for `wbytes` (a `[out_f, in_f]` Q4_K bank). AVX2 is enough for the expansion.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) unsafe fn q4k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q4kPack {
     use std::arch::x86_64::*;
     const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
@@ -130,6 +132,7 @@ pub(crate) unsafe fn q4k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q4kPa
 /// math and rounding sequence, so bit-identity with the scalar oracle is preserved.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) unsafe fn q4k_gemm_group(pg: &Q4kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -213,6 +216,7 @@ pub(crate) struct Q6kPack {
     pub(crate) nb: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Q6kPack {
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn bytes(&self) -> usize {
@@ -227,6 +231,7 @@ impl Q6kPack {
 /// ~740 MB of expanded codes for gemma's 262k vocab, built once per session, rayon over groups).
 /// `out_f % 8` tail rows are NOT packed.
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn q6k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q6kPack {
     const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
     let nb = in_f / 256;
@@ -300,6 +305,7 @@ pub(crate) fn q6k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q6kPack {
 /// (`(d · q8.d) · isum`), so results are bit-identical to the batch/single kernels.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) unsafe fn q6k_gemm_group(pg: &Q6kPackGroup, nb: usize, q8s: &[Q8], cols: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();

@@ -77,6 +77,7 @@ use super::{
 /// scraper: this function is now a thin wrapper that drops the timing half of that return, so
 /// `run`/`serve` (which only want [`crate::GenStats`]) and `bench`/`compare` (which want both)
 /// share one implementation.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn generate_mtp_spec_vulkan(
     model: &crate::SeamModel,
     head: &MtpHeadWeights,
@@ -91,6 +92,7 @@ pub fn generate_mtp_spec_vulkan(
 /// `eprintln!`s already compute — this is that same accounting, returned instead of only printed,
 /// so `infr bench`'s `mtp` segment and `infr compare`'s MTP DECODE section can report the
 /// draft/verify/catchup phase split and alpha without scraping stderr.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn generate_mtp_spec_vulkan_timed(
     model: &crate::SeamModel,
     head: &MtpHeadWeights,
@@ -127,6 +129,7 @@ pub fn generate_mtp_spec_vulkan_timed(
 /// Metal twin of [`generate_mtp_spec_vulkan_timed`] — the SAME draft-verify-catchup driver over
 /// the Apple-GPU trunk + head (raw native-dtype weight upload, `MtpHeadSession::new_metal`).
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn generate_mtp_spec_metal_timed(
     model: &crate::SeamModel,
     head: &MtpHeadWeights,
@@ -161,6 +164,7 @@ pub fn generate_mtp_spec_metal_timed(
 /// CPU MTP driver — the exact-f32 reference (no GPU). Same draft-verify-catchup loop; used to
 /// establish the acceptance-rate oracle (a backend whose head numerics differ from the trunk's
 /// shows up as a lower alpha here vs on a GPU backend).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn generate_mtp_spec_cpu_timed(
     model: &crate::SeamModel,
     head: &MtpHeadWeights,
@@ -197,6 +201,7 @@ pub fn generate_mtp_spec_cpu_timed(
 
 /// Non-timed Metal MTP driver (drops the [`MtpTiming`]) — the `ChatModel::generate` entry.
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn generate_mtp_spec_metal(
     model: &crate::SeamModel,
     head: &MtpHeadWeights,

@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+infr-prof.workspace = true
+infr-prof-rt.workspace = true
 thiserror.workspace = true
 half.workspace = true
 bytemuck.workspace = true

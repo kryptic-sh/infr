@@ -7,6 +7,7 @@ use anyhow::{bail, Result};
 /// Dequantize a tensor's raw `bytes` of `dtype` into host f32. Handles plain floats
 /// (F32/F16/BF16), affine quants (via [`dequant_unified`]), and codebook quants (via
 /// [`dequant_codebook`]). The single host-side dequant entry point.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> {
     use infr_core::DType::*;
     Ok(match dtype {
@@ -33,6 +34,7 @@ pub fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> 
 /// f32 → f16, saturating to ±65504 (f16 max) instead of overflowing to ±inf. Preserves NaN. Used
 /// when down-converting bf16/f32 weights for the f16 fused path so a large-magnitude weight clips
 /// to the largest finite f16 rather than corrupting the matmul with inf/NaN.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn f32_to_f16_sat(x: f32) -> half::f16 {
     const F16_MAX: f32 = 65504.0;
     if x.is_nan() {
@@ -42,9 +44,13 @@ pub fn f32_to_f16_sat(x: f32) -> half::f16 {
     }
 }
 
+// per-call leaf, too small to probe (see docs/PERF.md)
+#[cfg_attr(infr_profile, infr_prof::skip)]
 pub fn rdf16(b: &[u8]) -> f32 {
     half::f16::from_le_bytes([b[0], b[1]]).to_f32()
 }
+// per-call leaf, too small to probe (see docs/PERF.md)
+#[cfg_attr(infr_profile, infr_prof::skip)]
 pub fn k4(j: usize, q: &[u8]) -> (u32, u32) {
     // get_scale_min_k4: extract 6-bit scale `d` and min `m` for sub-block j (0..8) from scales[12]
     if j < 4 {
@@ -80,6 +86,7 @@ pub struct Factored {
 /// (scale, min) such that `weight = scale*u8 + min` (filled in natural tensor order). Scale/min are
 /// constant across each consecutive 16-element block, which the kernel exploits. Expanded from
 /// [`dequant_factored`] — the single decoder for all affine formats.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
     let f = dequant_factored(dtype, bytes);
     let n = f.codes.len();
@@ -92,6 +99,8 @@ pub fn dequant_unified(dtype: infr_core::DType, bytes: &[u8]) -> (Vec<u8>, Vec<f
     (f.codes, sc, mn)
 }
 
+// per-call leaf, too small to probe (see docs/PERF.md)
+#[cfg_attr(infr_profile, infr_prof::skip)]
 fn rf16(b: &[u8]) -> half::f16 {
     half::f16::from_le_bytes([b[0], b[1]])
 }
@@ -100,6 +109,7 @@ fn rf16(b: &[u8]) -> half::f16 {
 /// dequant (see the per-format comments), but instead of expanding to per-element f32 scale/min it
 /// records the format's own structure: the f16 super scale(s) per block and the small integer
 /// multipliers per 16-element sub-block.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Factored {
     use infr_core::DType::*;
     let (qpb, bpb) = match dtype {
@@ -398,6 +408,7 @@ pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4,
 /// Decode an E8M0 exponent byte to float32, halved (= 2^(x-128)).
 /// Matches llama.cpp `ggml_e8m0_to_fp32_half` (ggml-impl.h l.477).
 #[inline(always)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn e8m0_to_fp32_half(x: u8) -> f32 {
     if x < 2 {
         f32::from_bits(0x0020_0000u32 << x)
@@ -409,6 +420,7 @@ pub fn e8m0_to_fp32_half(x: u8) -> f32 {
 /// Decode a UE4M3 byte (unsigned, 4 exp bits bias=7, 3 mantissa bits) to float32, halved.
 /// Matches llama.cpp `ggml_ue4m3_to_fp32` (ggml-impl.h l.502).
 #[inline(always)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn ue4m3_to_fp32(x: u8) -> f32 {
     if x == 0 || x == 0x7F {
         return 0.0;
@@ -430,6 +442,7 @@ pub const KVALUES_IQ4NL: [i8; 16] = [
 ];
 
 /// True for codebook quants (IQ*/TQ*/fp4) that go host-dequant → f16, NOT the GPU affine path.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn is_codebook_quant(d: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(
@@ -451,6 +464,7 @@ pub fn is_codebook_quant(d: infr_core::DType) -> bool {
 
 /// Dequantize a codebook (non-affine) quant to f32. Ported from llama.cpp `ggml-quants.c`.
 /// Returns a `Vec<f32>` of length `numel` in natural tensor order.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
     use infr_core::DType::*;
     match dtype {
@@ -1077,6 +1091,7 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
 /// True for types that go through the GPU in-kernel affine dequant path (`Wt::Q`).
 /// All affine quants: legacy round quants + k-quants (Q2K–Q6K).
 /// Codebook quants (IQ*/TQ*/fp4) are NOT included — they go host-dequant → f16.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn is_quant(d: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(

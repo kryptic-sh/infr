@@ -99,6 +99,7 @@ pub trait ChatModel {
 /// keeping it degrades the model). Delegates to `infr-chat`'s splitter — the SAME reasoning
 /// grammar `infr run`'s display and `infr serve`'s deltas use — so what history keeps always
 /// matches what the surfaces call "content". Unterminated reasoning (truncated turn) → empty.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn strip_think(reply: &str) -> String {
     infr_chat::split_reasoning(reply).1
 }
@@ -111,6 +112,7 @@ pub struct Chat<'a> {
     history: Vec<(String, String)>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Chat<'a> {
     /// Wrap a per-backend [`ChatModel`] in the shared multi-turn chat.
     pub fn new(model: Box<dyn ChatModel + 'a>) -> Self {
@@ -198,6 +200,7 @@ pub struct OaiRenderer {
     eos: u32,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl OaiRenderer {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let gguf = infr_gguf::Gguf::open(path).map_err(|e| anyhow::anyhow!("open gguf: {e}"))?;

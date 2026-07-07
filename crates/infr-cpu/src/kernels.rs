@@ -11,6 +11,7 @@ use infr_gguf::dequant::{k4, rdf16};
 /// `d·sc_s·q4 − dmin·m_s` over 8 sub-blocks of 32; dispatches to the best SIMD path available at
 /// runtime (avx512bw → avx2 → scalar). The `sm` term uses `q8.bsums` (precomputed in `quantize_q8`)
 /// instead of re-summing q8 values per row.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -26,6 +27,7 @@ pub(crate) fn vec_dot_q4k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 }
 
 /// Scalar fallback for `vec_dot_q4k`; also used on non-x86 targets. Uses `q8.bsums` for `isum`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q4k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let nb = in_f / 256;
     let mut sumf = 0f32;
@@ -66,6 +68,7 @@ fn vec_dot_q4k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// to i32 via `_mm256_madd_epi16`. `isum` comes from `q8.bsums`, not the inner loop.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let nb = in_f / 256;
@@ -116,6 +119,7 @@ unsafe fn vec_dot_q4k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// `iprod_even` and `iprod_odd` in one pass — half the memory traffic of the avx2 path.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let nb = in_f / 256;
@@ -164,6 +168,7 @@ unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// `Σ weight·x` for one Q6_K row (210 bytes / 256 elems). Dispatches to the best SIMD path
 /// available at runtime (avx512bw → avx2 → scalar). Weight value is `d·sc·(q6−32)` over 16
 /// sub-blocks of 16 (int8 scales).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q6k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -180,6 +185,7 @@ pub(crate) fn vec_dot_q6k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 
 /// Scalar fallback for `vec_dot_q6k`; also used on non-x86 targets.
 /// Accumulates `Σ q6·q8` and `Σ q8` per 16-element sub-block, then applies int8 scales.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q6k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let nb = in_f / 256;
     let mut sumf = 0f32;
@@ -228,6 +234,7 @@ fn vec_dot_q6k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// parallel `maddubs(1_u8, q8_i8)` sum so no per-element loop is needed.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let nb = in_f / 256;
@@ -342,6 +349,7 @@ unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// (h0/h1) then two xmm per ymm (per-sub-block) for the scalar scale accumulation.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let nb = in_f / 256;
@@ -449,6 +457,7 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     sumf
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q8_0(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -462,6 +471,7 @@ pub(crate) fn vec_dot_q8_0(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     vec_dot_q8_0_scalar(row, q8, in_f)
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q8_0_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let bpr = 34usize; // bytes per Q8_0 weight block (32 elems)
     let nb_super = in_f / 256; // activation super-blocks
@@ -485,6 +495,7 @@ fn vec_dot_q8_0_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// Sign trick: `maddubs(abs(qw), sign(qw)·qx)` handles i8×i8 without overflow.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q8_0_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let bpr = 34usize;
@@ -517,6 +528,7 @@ unsafe fn vec_dot_q8_0_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// `q8.qs`, so a single `_mm512_loadu_si512` covers both.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q8_0_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let bpr = 34usize;
@@ -560,6 +572,7 @@ unsafe fn vec_dot_q8_0_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     sumf
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q5k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -573,6 +586,7 @@ pub(crate) fn vec_dot_q5k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     vec_dot_q5k_scalar(row, q8, in_f)
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q5k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let nb = in_f / 256;
     let mut sumf = 0f32;
@@ -619,6 +633,7 @@ fn vec_dot_q5k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// bit is set the value adds 16.  `maddubs` works directly since q5 ∈ 0..31 (unsigned).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q5k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let nb = in_f / 256;
@@ -684,6 +699,7 @@ unsafe fn vec_dot_q5k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// are inserted into zmm for the 512-bit `maddubs → madd` pass.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q5k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let nb = in_f / 256;
@@ -742,6 +758,7 @@ unsafe fn vec_dot_q5k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     sumf
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q4k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     let m = q8s.len();
     let nb = in_f / 256;
@@ -797,6 +814,7 @@ fn vec_dot_q4k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -863,6 +881,7 @@ unsafe fn vec_dot_q4k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -937,6 +956,7 @@ unsafe fn vec_dot_q4k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
 /// saturated maddubs' i16 either), and the hadd/scale order is unchanged.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -1000,6 +1020,7 @@ unsafe fn vec_dot_q4k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 
 /// Batch Q4_K dot: `out[r] = vec_dot_q4k(row, &q8s[r], in_f)` for all r, bit-identical to
 /// the single-token kernel. The weight row is decoded ONCE; per-token work is the integer dot only.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1018,6 +1039,7 @@ pub(crate) fn vec_dot_q4k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_batch2_avx512bw(
     row_a: &[u8],
     row_b: &[u8],
@@ -1143,6 +1165,7 @@ unsafe fn vec_dot_q4k_batch2_avx512bw(
 /// dpbusd replacing maddubs+madd — see [`vec_dot_q4k_batch_vnni`]'s bit-identity note).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_batch2_vnni(
     row_a: &[u8],
     row_b: &[u8],
@@ -1254,6 +1277,7 @@ unsafe fn vec_dot_q4k_batch2_vnni(
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4k_batch2(
     row_a: &[u8],
     row_b: &[u8],
@@ -1278,6 +1302,7 @@ pub(crate) fn vec_dot_q4k_batch2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_batch8_avx512bw(
     rows: [&[u8]; 8],
     q8s: &[Q8],
@@ -1409,6 +1434,7 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
 /// its accumulation order are unchanged.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_batch8_ilv_vnni(
     rows: [&[u8]; 8],
     q8s: &[Q8],
@@ -1581,6 +1607,7 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
 /// Bit-identical to the single-token kernel. On AVX-512BW machines the Q8 activation is
 /// loaded once per (block, nibble-pair) and dotted against all 8 weight rows — 8× activation
 /// reuse over single-row, 4× over 2-row. Falls back to 8× `vec_dot_q4k_batch` on older CPUs.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs: [&mut [f32]; 8]) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1604,6 +1631,7 @@ pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs
     vec_dot_q4k_batch(row7, q8s, in_f, out7);
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q6k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     let m = q8s.len();
     let nb = in_f / 256;
@@ -1674,6 +1702,7 @@ fn vec_dot_q6k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q6k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -1786,6 +1815,7 @@ unsafe fn vec_dot_q6k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -1948,6 +1978,7 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1961,6 +1992,7 @@ pub(crate) fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     vec_dot_q6k_batch_scalar(row, q8s, in_f, out);
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q8_0_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     let m = q8s.len();
     let nb_super = in_f / 256;
@@ -2001,6 +2033,7 @@ fn vec_dot_q8_0_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q8_0_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -2045,6 +2078,7 @@ unsafe fn vec_dot_q8_0_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q8_0_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -2102,6 +2136,7 @@ unsafe fn vec_dot_q8_0_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: 
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q8_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -2115,6 +2150,7 @@ pub(crate) fn vec_dot_q8_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
     vec_dot_q8_0_batch_scalar(row, q8s, in_f, out);
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q5k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     let m = q8s.len();
     let nb = in_f / 256;
@@ -2184,6 +2220,7 @@ fn vec_dot_q5k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q5k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -2270,6 +2307,7 @@ unsafe fn vec_dot_q5k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q5k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
@@ -2351,6 +2389,7 @@ unsafe fn vec_dot_q5k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -2378,6 +2417,7 @@ pub(crate) fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
 /// same two SEPARATE f32 adds per pair as the scalar oracle).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni,avx512vl")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q8_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let nb = in_f / 32;
@@ -2424,6 +2464,7 @@ unsafe fn vec_dot_q8_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -2447,6 +2488,7 @@ pub(crate) fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
 
 /// Scalar fallback for `vec_dot_q8_0_32_batch`; also used on non-x86 targets, and the exactness
 /// oracle the SIMD kernels below are tested against.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q8_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     let nb = in_f / 32;
     let bpr = 34usize; // f16 d (2B) + 32 × i8 qs
@@ -2474,6 +2516,7 @@ fn vec_dot_q8_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 /// of per-256-superblock (each native block carries its own `d_w`, and the activation's own `d[b]`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q8_0_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let nb = in_f / 32;
@@ -2505,6 +2548,7 @@ unsafe fn vec_dot_q8_0_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out
 /// crate has seen (e.g. DiffusionGemma's 22), but an odd tail block is handled scalarly for safety.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q8_0_32_batch_avx512bw(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let nb = in_f / 32;
@@ -2561,6 +2605,7 @@ unsafe fn vec_dot_q8_0_32_batch_avx512bw(row: &[u8], q8s: &[Q8x32], in_f: usize,
 /// Batched Q5_0 dot at native 32-block granularity: `y = d_w·(code−16)`, `code ∈ 0..31` (4 nibble
 /// bits from `qs` + 1 high bit from `qh`, per `dequant_block`'s Q5_0 case) — so
 /// `Σy·x = d_w·(Σcode·x − 16·Σx) ≈ d_w·d8·(Σcode·q8 − 16·bsum)`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -2586,6 +2631,7 @@ pub(crate) fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
 /// bit-identical to the scalar oracles (same per-block f32 expression and order).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q32_batch8_ilv_vnni(
     rows: [&[u8]; 8],
     q8s: &[Q8x32],
@@ -2690,6 +2736,7 @@ unsafe fn vec_dot_q32_batch8_ilv_vnni(
 
 /// 8-row tile dispatcher for the native-32-block dots (Q8_0/Q5_0): the interleaved VNNI kernel
 /// on capable hardware, else 8x the per-row batch kernel.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q32_batch8(
     rows: [&[u8]; 8],
     q8s: &[Q8x32],
@@ -2728,6 +2775,7 @@ pub(crate) fn vec_dot_q32_batch8(
 /// SIMD kernels; layout `flat[b*32 + j]` = code j of block b (j 0..15 = lo nibbles, 16..31 = hi).
 #[cfg(target_arch = "x86_64")] // only the x86 SIMD kernels call this — dead code on aarch64
 #[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn q5_0_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<u8>, Vec<f32>) {
     let mut flat = vec![0u8; nb * 32];
     let mut d_arr = vec![0f32; nb];
@@ -2753,6 +2801,7 @@ fn q5_0_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<u8>, Vec<f32>) {
 /// per-block f32 accumulation expression and order are unchanged).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q5_0_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let nb = in_f / 32;
@@ -2778,6 +2827,7 @@ unsafe fn vec_dot_q5_0_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out
 /// SEPARATE and in scalar order).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni,avx512vl")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q5_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let nb = in_f / 32;
@@ -2811,6 +2861,7 @@ unsafe fn vec_dot_q5_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
 }
 
 /// Scalar oracle for `vec_dot_q5_0_32_batch` (also the non-x86 path).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn vec_dot_q5_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
     let nb = in_f / 32;
     let bpr = 22usize; // f16 d (2B) + u32 qh (4B) + 16 × packed-nibble qs
@@ -2840,6 +2891,7 @@ fn vec_dot_q5_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 }
 
 /// `Σ f16_weight·x` (weight is 2 bytes/elem). `target-cpu=native` lowers the f16→f32 to F16C.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
     let mut acc = [0f32; 8];
     let n = x.len();
@@ -2861,6 +2913,7 @@ pub(crate) fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
 }
 
 /// `Σ bf16_weight·x` (bf16 = top 16 bits of f32).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
     let mut s = 0f32;
     for (i, &xi) in x.iter().enumerate() {
@@ -2875,6 +2928,7 @@ pub(crate) fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
 /// fuses each lane's multiply+add into one FMA (numerics policy: llama.cpp's f32 dots are FMA
 /// too) — this fn is attention's QK score and the F32-weight GEMM fallbacks (e.g. DG's router).
 #[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
     let chunks = n / 8;
@@ -2893,6 +2947,8 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Gated-FFN activation applied to the gate value.
+// per-call leaf, too small to probe (see docs/PERF.md)
+#[cfg_attr(infr_profile, infr_prof::skip)]
 pub(crate) fn act_fn(act: Activation, g: f32) -> f32 {
     match act {
         Activation::Silu => g / (1.0 + (-g).exp()),

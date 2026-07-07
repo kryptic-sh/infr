@@ -71,6 +71,7 @@ pub(super) struct SelfCondWeights {
 ///
 /// Phase-A perf: `scw` is the ONE-TIME dequant of the four self-cond tensors (see
 /// `SeamKv::self_cond_w`) — this used to re-dequantize all four on EVERY call.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(super) fn diffusion_self_cond(
     scw: &SelfCondWeights,
     c: &Config,
@@ -206,6 +207,7 @@ pub(super) fn diffusion_self_cond(
 /// dtype on the host, while this runner already has it in f32 (`token_embd`), so this is a plain
 /// transpose+cast. Threaded over embedding rows (each row's inner loop reads `token_embd` with a
 /// `ne`-element stride — cache-unfriendly, but this runs ONCE per session).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(super) fn build_sc_embt(
     be: &dyn Backend,
     token_embd: &[f32],

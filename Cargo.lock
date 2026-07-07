@@ -1164,6 +1164,8 @@ dependencies = [
  "bytemuck",
  "half",
  "indicatif",
+ "infr-prof",
+ "infr-prof-rt",
  "thiserror 2.0.18",
 ]
 
@@ -1176,6 +1178,8 @@ dependencies = [
  "half",
  "infr-core",
  "infr-gguf",
+ "infr-prof",
+ "infr-prof-rt",
  "rayon",
 ]
 
@@ -1201,6 +1205,8 @@ dependencies = [
  "bytemuck",
  "half",
  "infr-core",
+ "infr-prof",
+ "infr-prof-rt",
  "memmap2",
  "tempfile",
  "thiserror 2.0.18",
@@ -1235,6 +1241,8 @@ dependencies = [
  "infr-cpu",
  "infr-gguf",
  "infr-metal",
+ "infr-prof",
+ "infr-prof-rt",
  "infr-vulkan",
  "llguidance",
  "rayon",
@@ -1257,6 +1265,19 @@ dependencies = [
  "metal",
  "objc",
 ]
+
+[[package]]
+name = "infr-prof"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "infr-prof-rt"
+version = "0.0.0"
 
 [[package]]
 name = "infr-server"
@@ -1286,6 +1307,8 @@ dependencies = [
  "half",
  "indicatif",
  "infr-core",
+ "infr-prof",
+ "infr-prof-rt",
  "thiserror 2.0.18",
  "tracing",
 ]

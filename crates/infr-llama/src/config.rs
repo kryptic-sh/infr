@@ -142,6 +142,7 @@ pub struct Config {
     pub shexp_ff: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Config {
     /// Whether layer `il` uses sliding-window (vs full) attention. gemma interleaves SWA with full
     /// attention on a fixed period; non-gemma models are always full.

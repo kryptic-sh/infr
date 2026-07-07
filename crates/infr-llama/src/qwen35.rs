@@ -46,6 +46,7 @@ pub struct Cfg {
     pub dt_rank: usize, // num_v_heads (16)
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Cfg {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.metadata().str("general.architecture").unwrap_or("");
@@ -121,6 +122,7 @@ impl Cfg {
 
 /// Render a plain user message through the qwen35 GGUF's own jinja chat template (falls back to
 /// ChatML — qwen35's native format — if there's no template). So `infr run` / tests pass plain text.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn render_chat(path: &std::path::Path, user: &str) -> Result<String> {
     render_chat_messages(path, &[("user", user)])
 }
@@ -129,6 +131,7 @@ pub fn render_chat(path: &std::path::Path, user: &str) -> Result<String> {
 /// template — the [`crate::chat::ChatModel::render`] primitive for the qwen35 GPU + CPU paths, so
 /// the shared [`crate::chat::Chat`] can drive a history-based REPL. Errors if the GGUF has no usable
 /// `tokenizer.chat_template`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn render_chat_messages(path: &std::path::Path, messages: &[(&str, &str)]) -> Result<String> {
     let g = Gguf::open(path).map_err(|e| anyhow!("open gguf: {e}"))?;
     let tok = crate::build_tokenizer(&g)?;
@@ -142,6 +145,7 @@ pub fn render_chat_messages(path: &std::path::Path, messages: &[(&str, &str)]) -
 }
 
 /// True if the GGUF at `path` is a `qwen35` (Qwen3.5/Qwen3.6) model.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn is_qwen35(path: &std::path::Path) -> bool {
     Gguf::open(path)
         .ok()

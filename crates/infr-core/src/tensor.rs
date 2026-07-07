@@ -46,6 +46,7 @@ pub enum DType {
     Turbo4,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DType {
     /// True for block-quantized weight types.
     pub fn is_quant(self) -> bool {
@@ -98,6 +99,7 @@ pub struct TensorDesc {
     pub dtype: DType,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl TensorDesc {
     pub fn new(shape: impl Into<Shape>, dtype: DType) -> Self {
         Self {

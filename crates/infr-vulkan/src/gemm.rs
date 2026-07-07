@@ -10,6 +10,7 @@ use infr_core::{backend::BufferUsage, error::Result, Backend};
 
 use super::{as_vk_buf, be, VulkanBackend};
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn spv_words(bytes: &[u8]) -> Vec<u32> {
     bytes
         .chunks_exact(4)
@@ -20,6 +21,7 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
 /// Build-compiled multi-row native GEMV SPIR-V (m = 2..8, weight streamed once — the spec-decode
 /// verify / short-suffix-prefill shape). `None` for formats without an mrow build (they keep the
 /// tiled GEMM route).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -50,6 +52,7 @@ pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static 
 }
 
 /// Kernel-cache name for the multi-row native GEMV (must pair with [`native_mrow_build_spv`]).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> &'static str {
     use infr_core::DType::*;
     match dtype {
@@ -72,6 +75,7 @@ pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> &'static str {
 
 /// Build-compiled native-block dequant GEMV SPIR-V for `(dtype, residual)`, or `None` if `dtype`
 /// is not a native-block quant format. One match arm per quant format.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     // Each arm lazily decodes its own build-compiled .spv (a fresh `static` per block).
@@ -139,6 +143,7 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
 
 /// SPIR-V for the id-indexed native GEMV (expert chosen from a GPU buffer). One specialization per
 /// affine quant format; `None` for formats without an id variant (caller falls back to host top-k).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_id_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -165,6 +170,7 @@ pub(crate) fn native_id_build_spv(dtype: infr_core::DType) -> Option<&'static [u
     })
 }
 /// SPIR-V for the multi-slot id-indexed native GEMV (all n_used experts in one dispatch).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -192,6 +198,7 @@ pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [
 }
 /// SPIR-V for the int8 dp4a decode GEMV (m=1, NUM_ROWS=2, `native_mmv.comp`). `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -213,6 +220,7 @@ pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option
 }
 /// SPIR-V for the multi-row int8 dp4a GEMV (m = 2..8, `native_mmv_mrow.comp`). `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv_mrow`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -231,6 +239,7 @@ pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'sta
     })
 }
 /// Kernel-cache name for the multi-row int8 dp4a GEMV.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> &'static str {
     use infr_core::DType::*;
     match dtype {
@@ -242,6 +251,7 @@ pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> &'static s
 /// SPIR-V for a multi-row int8 dp4a GEMV layout variant: `o4` = the small-in_f 4-outputs ×
 /// 16-K-lanes workgroup split (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4) — see
 /// `Recorder::linear_mmv_mrow`'s gates.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_variant_spv(
     dtype: infr_core::DType,
     o4: bool,
@@ -270,6 +280,7 @@ pub(crate) fn native_mmv_mrow_variant_spv(
     })
 }
 /// Kernel-cache name for a multi-row int8 dp4a GEMV layout variant.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_variant_name(
     dtype: infr_core::DType,
     o4: bool,
@@ -289,6 +300,7 @@ pub(crate) fn native_mmv_mrow_variant_name(
     }
 }
 /// Kernel-cache name for the int8 dp4a decode GEMV.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> &'static str {
     use infr_core::DType::*;
     match (dtype, res) {
@@ -300,24 +312,28 @@ pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> &'st
     }
 }
 /// SPIR-V for the multi-slot id-indexed Q4_K dp4a (mmq) GEMV.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_id_q4k_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_mmv_id_q4k.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the tiled Q4_K dp4a (mmq) GEMM.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q4k_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the tiled Q6_K dp4a (mmq) GEMM (the MoE down projection).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the MoE weighted-accumulate (sum of selected experts' down outputs into hidden).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_accumulate_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_accumulate.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -325,12 +341,14 @@ pub(crate) fn moe_accumulate_spv() -> &'static [u32] {
 }
 /// SPIR-V for the MoE weighted-accumulate with a per-expert down-output scale (diffusion-gemma
 /// `ffn_down_exps.scale`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_accumulate_scaled_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_accumulate_scaled.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the GPU MoE router top-k.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_topk_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_topk.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -338,6 +356,7 @@ pub(crate) fn moe_topk_spv() -> &'static [u32] {
 }
 /// SPIR-V for the embedding-row gather+dequant (`Op::EmbedGather`). `None` = format has no
 /// build (grid-table IQ formats) — the runner then keeps the host embed path.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -368,6 +387,7 @@ pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static
     })
 }
 /// Kernel-cache name for the embedding-row gather.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn embed_gather_kernel_name(dtype: infr_core::DType) -> &'static str {
     use infr_core::DType::*;
     match dtype {
@@ -389,24 +409,28 @@ pub(crate) fn embed_gather_kernel_name(dtype: infr_core::DType) -> &'static str 
     }
 }
 /// SPIR-V for the chained-decode id ring log (ring[pos & 63] = sampled id).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn id_log_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/id_log.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the decode-replay params advance (device-side [pos, kv_len] increment).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn params_advance_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/params_advance.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the vocab sampler's slice pass (256 workgroups → 256*k (val, idx) candidates).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn sample_topk_part_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sample_topk_part.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the vocab sampler's select+softmax+nucleus+CDF pass (candidates → token id).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn sample_topk_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sample_topk.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -414,24 +438,28 @@ pub(crate) fn sample_topk_spv() -> &'static [u32] {
 }
 /// SPIR-V for the vocab sampler's chained-decode select+softmax+nucleus+CDF pass: `u` is read
 /// from the 64-slot ring at `u_buf[params[0] & 63]` instead of `u_buf[0]` (see sample_topk.comp).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn sample_topk_chain_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sample_topk_chain.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the greedy-argmax slice pass (256 workgroups → 256 (val, idx) partials).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn argmax_part_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax_part.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the greedy-argmax reduce pass (256 partials → token id).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn argmax_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for GPU stochastic sampling (radix top-k + temp + top-p → token id).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_sample_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_sample.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -439,6 +467,7 @@ pub(crate) fn moe_sample_spv() -> &'static [u32] {
 }
 /// SPIR-V for the DiffusionGemma entropy-bound sampler reduction (perf slice 3): per-canvas-row
 /// argmax/entropy/CDF-sample over `[rows, vocab]` logits — see `shaders/dg_eb_sample.comp`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dg_eb_sample_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dg_eb_sample.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -447,28 +476,33 @@ pub(crate) fn dg_eb_sample_spv() -> &'static [u32] {
 /// Max `top_k` the GPU sampler supports (matches the shader's KMAX); larger falls back to host.
 pub const SAMPLE_KMAX: usize = 64;
 /// SPIR-V for the MoE expert-bucketing passes (count / exclusive-scan / scatter).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_bucket_count_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_bucket_count.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_bucket_scan_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_bucket_scan.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_bucket_scatter_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_bucket_scatter.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for `moe_bucket_scatter`'s per-expert-`dscale`-baking variant (diffusion-gemma).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_bucket_scatter_scaled_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_bucket_scatter_scaled.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the indexed axpy (`acc += wts[slot]*x`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn add_scaled_id_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled_id.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -478,6 +512,7 @@ pub(crate) fn add_scaled_id_spv() -> &'static [u32] {
 /// SPIR-V for the LARGE-WARPTILE native-block prefill GEMM (8-warp BM=64×BN=256, gemm_proj_warp
 /// structure with in-shader native dequant). Only the hot formats are compiled; `None` falls back
 /// to the 64×64 `native_gemm_build_spv` kernel.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -507,6 +542,7 @@ pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'st
 
 /// SPIR-V for the NARROW-N warptile (BN=128/BK=64) — same math per thread, 2× the workgroups; the
 /// occupancy fix for n=1024/2048 GEMMs. `None` for formats without a warp build.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -538,6 +574,7 @@ pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option
 /// from global memory — no As staging, no As LDS. Shrinking LDS to Bs-only lifts occupancy from
 /// 2 to 3 workgroups/WGP, which is worth ~1.5x on the 8B prefill shapes (29→44 TF on the o
 /// projection). Name+SPIR-V per tile so `kernel_sg` caches distinct pipelines.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_ag_build_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
@@ -564,6 +601,7 @@ pub(crate) fn native_gemm_warp_ag_build_spv(
 }
 
 /// NARROW_N (BN=128) + A_GLOBAL.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_n128_ag_build_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
@@ -611,6 +649,7 @@ pub(crate) fn native_gemm_warp_n128_ag_build_spv(
 }
 
 /// SPLIT_K (NARROW_N tile) + A_GLOBAL.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_sk_ag_build_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
@@ -658,6 +697,7 @@ pub(crate) fn native_gemm_warp_sk_ag_build_spv(
 }
 
 /// SPIR-V for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -686,6 +726,7 @@ pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&
 }
 
 /// SPIR-V for the split-K reduce (sum the partials planes).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn splitk_reduce_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {
@@ -698,6 +739,7 @@ pub(crate) fn splitk_reduce_spv() -> &'static [u32] {
 
 /// SPIR-V for the native-block prefill GEMM (`C=A·Wᵀ`, raw GGUF blocks dequantized in-shader via the
 /// coopmat tiled kernel). One specialization per quant format; `None` for unsupported dtypes.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -853,129 +895,159 @@ static MMV_Q8_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q4_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static MMV_Q8_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn gemm_spv() -> &'static [u32] {
     GEMM_SPV.get_or_init(|| spv_words(GEMM_SPV_BYTES))
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn gemm_tiled_spv() -> &'static [u32] {
     GEMM_TILED_SPV.get_or_init(|| spv_words(GEMM_TILED_SPV_BYTES))
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn gemm_warp_spv() -> &'static [u32] {
     GEMM_WARP_SPV.get_or_init(|| spv_words(GEMM_WARP_SPV_BYTES))
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn gemm_dp4a_spv() -> &'static [u32] {
     GEMM_DP4A_SPV.get_or_init(|| spv_words(GEMM_DP4A_SPV_BYTES))
 }
 /// SPIR-V for the activation int8 quantize pass (Q8 per block) feeding the dp4a mmq matmul.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn quant_q8_spv() -> &'static [u32] {
     QUANT_Q8_SPV.get_or_init(|| spv_words(QUANT_Q8_SPV_BYTES))
 }
 /// SPIR-V for the integer (dp4a) u4 projection GEMM. Weights stay quantized; no per-GEMM dequant.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn gemm_proj_mmq_spv() -> &'static [u32] {
     GEMM_PROJ_MMQ_SPV.get_or_init(|| spv_words(GEMM_PROJ_MMQ_SPV_BYTES))
 }
 /// SPIR-V for the prefill projection GEMM (`C=A·Wᵀ`, f16/quant W). Used by the recorder.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn gemm_proj_spv() -> &'static [u32] {
     GEMM_PROJ_SPV.get_or_init(|| spv_words(GEMM_PROJ_SPV_BYTES))
 }
 /// Warp-tiled projection GEMM (BM=64,BN=128). Faster for large M (low/mid-ctx prefill); the recorder
 /// falls back to `gemm_proj_spv` for small M (high ctx) where its fewer workgroups lose occupancy.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn gemm_proj_warp_spv() -> &'static [u32] {
     GEMM_PROJ_WARP_SPV.get_or_init(|| spv_words(GEMM_PROJ_WARP_SPV_BYTES))
 }
 /// SPIR-V for the subgroup-reduction flash-decoding pass-1 (split-K) kernel. Used by the recorder.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_partial_spv() -> &'static [u32] {
     ATTN_PARTIAL_SPV.get_or_init(|| spv_words(ATTN_PARTIAL_SPV_BYTES))
 }
 /// Rows-batched split pass 1 (K/V streamed once per 4-row group; chunk <= 256).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_partial_mrows_c256_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_partial_mrows_c256.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the non-FA prefill attention kernels (QK scores / row softmax / PV). Recorder use.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_qk_spv() -> &'static [u32] {
     ATTN_QK_SPV.get_or_init(|| spv_words(ATTN_QK_SPV_BYTES))
 }
 /// 8-warp/256-thread QK GEMM (kv_pad % 256). Matches ollama's mul_mm warptile; the recorder uses it
 /// over the 4-warp attn_qk unless INFR_NO_QK_WARP is set.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_qk_warp_spv() -> &'static [u32] {
     ATTN_QK_WARP_SPV.get_or_init(|| spv_words(ATTN_QK_WARP_SPV_BYTES))
 }
 /// Fused flash-attention prefill (QK→softmax→PV, no materialized S). Recorder `attention_prefill_flash`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_spv() -> &'static [u32] {
     ATTN_FLASH_SPV.get_or_init(|| spv_words(ATTN_FLASH_SPV_BYTES))
 }
 /// BM=32 build of the fused flash prefill (29056 B shared) for sub-64 KB shared devices.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_bm32_spv() -> &'static [u32] {
     ATTN_FLASH_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_BM32_SPV_BYTES))
 }
 /// Flash-attention split-K partial pass (per kv-split online-softmax partials). Recorder use.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_partial_spv() -> &'static [u32] {
     ATTN_FLASH_PARTIAL_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_SPV_BYTES))
 }
 /// BM=32 build of the split-K flash partial (29056 B shared) for sub-64 KB shared devices.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_partial_bm32_spv() -> &'static [u32] {
     ATTN_FLASH_PARTIAL_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_PARTIAL_BM32_SPV_BYTES))
 }
 /// Register-blocked flash partial (hd=128). Used over attn_flash_partial when hd==128.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_warp_spv() -> &'static [u32] {
     ATTN_FLASH_WARP_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_SPV_BYTES))
 }
 /// BM=32 build of the flash partial (29056 B shared vs 58112 B): for devices whose
 /// maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs (NVIDIA, MoltenVK).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_warp_bm32_spv() -> &'static [u32] {
     ATTN_FLASH_WARP_BM32_SPV.get_or_init(|| spv_words(ATTN_FLASH_WARP_BM32_SPV_BYTES))
 }
 /// FlashAttention-2 register-O flash partial (Br=128, per-thread register accumulator). hd=128.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_reg_spv() -> &'static [u32] {
     ATTN_FLASH_REG_SPV.get_or_init(|| spv_words(ATTN_FLASH_REG_SPV_BYTES))
 }
 /// BR=64 build of the register-O flash partial (29440 B shared) for sub-64 KB shared devices.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_reg_br64_spv() -> &'static [u32] {
     ATTN_FLASH_REG_BR64_SPV.get_or_init(|| spv_words(ATTN_FLASH_REG_BR64_SPV_BYTES))
 }
 /// Flash-attention split-K combine (merge partials → final O). Recorder use.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_flash_combine_spv() -> &'static [u32] {
     ATTN_FLASH_COMBINE_SPV.get_or_init(|| spv_words(ATTN_FLASH_COMBINE_SPV_BYTES))
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_softmax_spv() -> &'static [u32] {
     ATTN_SM_SPV.get_or_init(|| spv_words(ATTN_SM_SPV_BYTES))
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_pv_spv() -> &'static [u32] {
     ATTN_PV_SPV.get_or_init(|| spv_words(ATTN_PV_SPV_BYTES))
 }
 /// 8-warp/256-thread PV GEMM (BN=128=hd, hd % 128). The recorder uses it over the 4-warp attn_pv
 /// when hd % 128 == 0 and INFR_NO_PV_WARP is unset.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_pv_warp_spv() -> &'static [u32] {
     ATTN_PV_WARP_SPV.get_or_init(|| spv_words(ATTN_PV_WARP_SPV_BYTES))
 }
 /// SPIR-V for the attn_pv split-K partial reducer (sums n_splits partial-O buffers).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {
     ATTN_PV_REDUCE_SPV.get_or_init(|| spv_words(ATTN_PV_REDUCE_SPV_BYTES))
 }
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
     RMSNORM_SPV.get_or_init(|| spv_words(RMSNORM_SPV_BYTES))
 }
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn softmax_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/softmax.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the elementwise add (`y=a+b`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn add_spv() -> &'static [u32] {
     static ADD_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ADD_SPV.get_or_init(|| spv_words(ADD_SPV_BYTES))
 }
 /// SPIR-V for the scaled add / axpy (`acc += scale*x`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn add_scaled_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_scaled.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the broadcast bias add (`dst[i] = x[i] + bias[i % n]`; Qwen2 q/k/v projections).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn add_bias_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_bias.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -983,6 +1055,7 @@ pub(crate) fn add_bias_spv() -> &'static [u32] {
 }
 /// SPIR-V for the broadcast vector multiply (`dst[i] = x[i] * vec[i % n]`; diffusion-gemma's
 /// router input scale — the multiplicative twin of `add_bias`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn mul_vec_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_vec.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -990,29 +1063,34 @@ pub(crate) fn mul_vec_spv() -> &'static [u32] {
 }
 /// SPIR-V for the qwen35moe shared-expert combine (`dst[r,c] = moe[r,c] + sigmoid(gate[r]) *
 /// shexp[r,c]`; row-broadcast gate — the shared-expert twin of `mul_vec`'s column broadcast).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_shared_expert_add_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_shared_expert_add.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the in-place scalar multiply (`y *= scale`). gemma4 per-layer output scale.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn scale_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scale.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for elementwise softcap `y = cap·tanh(x/cap)` (gemma logit softcap).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn softcap_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/softcap.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q4k_xp_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q6k_xp_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -1021,6 +1099,7 @@ pub(crate) fn native_gemm_mmq_q6k_xp_spv() -> &'static [u32] {
 
 /// SPIR-V for the tiled Q8_0 dp4a (mmq) GEMM, expert-grid variant (a diffusion-gemma MoE down
 /// projection quant option).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q8_0_xp_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q8_0_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -1029,6 +1108,7 @@ pub(crate) fn native_gemm_mmq_q8_0_xp_spv() -> &'static [u32] {
 
 /// SPIR-V for the tiled Q5_0 dp4a (mmq) GEMM, expert-grid variant (the shipped
 /// diffusiongemma-26B-A4B-it-GGUF quantizes its MoE down projection as Q5_0).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q5_0_xp_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_0_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -1037,18 +1117,21 @@ pub(crate) fn native_gemm_mmq_q5_0_xp_spv() -> &'static [u32] {
 
 /// SPIR-V for the tiled Q5_K dp4a (mmq) GEMM, expert-grid variant (unsloth-dynamic Qwen3.6-MoE
 /// quants mix Q5_K into the MoE down-projection banks; carries Q4_K's min term → binds `sact`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q5k_xp_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5k_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn quant_q8_gather_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8_gather.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_scatter_reduce_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_scatter_reduce.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
@@ -1057,103 +1140,123 @@ pub(crate) fn moe_scatter_reduce_spv() -> &'static [u32] {
 /// SPIR-V for the row gather (`dst[j]=src[idx[j]]`).
 /// SPIR-V for the weighted row scatter-add (`dst[idx[j]] += w[j]*y[j]`).
 /// SPIR-V for the SwiGLU activation (`y=silu(gate)*up`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn silu_mul_spv() -> &'static [u32] {
     static SILU_MUL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     SILU_MUL_SPV.get_or_init(|| spv_words(SILU_MUL_SPV_BYTES))
 }
 /// SPIR-V for the gated-DeltaNet recurrence step (qwen35/Qwen3.5 SSM).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SPV_BYTES))
 }
 /// SPIR-V for the chunked-DeltaNet PREP pass (normalize + intra-chunk dot matrices).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_prep_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_PREP_SPV_BYTES))
 }
 /// SPIR-V for the chunked-DeltaNet GATES pass (β + prefix log-decay per chunk/head).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_gates_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_GATES_SPV_BYTES))
 }
 /// SPIR-V for the chunked-DeltaNet SCAN pass (the sequential state-coupled part).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_scan_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SCAN_SPV_BYTES))
 }
 /// SPIR-V for the CHUNKED gated-DeltaNet prefill (chunkwise delta rule, C=32).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn deltanet_chunked_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_CHUNKED_SPV_BYTES))
 }
 /// SPIR-V for the causal depthwise conv1d + SiLU step (qwen35/Qwen3.5 SSM input conv).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn conv1d_silu_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(CONV1D_SILU_SPV_BYTES))
 }
 /// SPIR-V for the BATCH depthwise conv1d+SiLU (pass 1: all outputs in parallel).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn conv1d_silu_par_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(CONV1D_SILU_PAR_SPV_BYTES))
 }
 /// SPIR-V for the BATCH depthwise conv1d history rebuild (pass 2).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn conv1d_shift_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(CONV1D_SHIFT_SPV_BYTES))
 }
 /// SPIR-V for the batched strided row copy (Op::CopyStrided in one dispatch).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn copy_strided_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(COPY_STRIDED_SPV_BYTES))
 }
 /// SPIR-V for the elementwise sigmoid gate `y = a * sigmoid(b)`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn mul_sigmoid_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(MUL_SIGMOID_SPV_BYTES))
 }
 /// SPIR-V for the GeGLU activation with separate gate/up buffers (`y=gelu(gate)*up`). gemma4's
 /// per-layer-embd gate.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn gelu_mul_spv() -> &'static [u32] {
     static GELU_MUL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     GELU_MUL_SPV.get_or_init(|| spv_words(GELU_MUL_SPV_BYTES))
 }
 /// SPIR-V for the fused SwiGLU over a combined gate||up buffer.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn silu_mul_fused_spv() -> &'static [u32] {
     static SILU_MUL_FUSED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     SILU_MUL_FUSED_SPV.get_or_init(|| spv_words(SILU_MUL_FUSED_SPV_BYTES))
 }
 /// SPIR-V for the fused GeGLU (GELU tanh-approx gate) over a combined gate||up buffer (gemma).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn gelu_mul_fused_spv() -> &'static [u32] {
     static GELU_MUL_FUSED_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     GELU_MUL_FUSED_SPV.get_or_init(|| spv_words(GELU_MUL_FUSED_SPV_BYTES))
 }
 /// SPIR-V for the f32→f16 cast-store into an f16 cache.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn store_f16_spv() -> &'static [u32] {
     static STORE_F16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     STORE_F16_SPV.get_or_init(|| spv_words(STORE_F16_SPV_BYTES))
 }
 /// SPIR-V for RoPE (ggml NORM, interleaved pairs).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rope_spv() -> &'static [u32] {
     static ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ROPE_SPV.get_or_init(|| spv_words(ROPE_SPV_BYTES))
 }
 /// SPIR-V for the f16-weight GEMV (`y=x·Wᵀ`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_f16_spv() -> &'static [u32] {
     static LINEAR_F16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_F16_SPV.get_or_init(|| spv_words(LINEAR_F16_SPV_BYTES))
 }
 /// SPIR-V for the f32-weight GEMV (full-precision projection weights, e.g. gemma4 E2B per-layer).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_f32_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(LINEAR_F32_SPV_BYTES))
 }
 /// SPIR-V for the reduction-shape f32 GEMV (workgroup per output — decode-hot narrow GEMVs).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_f32r_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(LINEAR_F32R_SPV_BYTES))
 }
 /// SPIR-V for the ROW-TILED f32 GEMM (8 rows/workgroup — prefill weight reuse). Bit-identical to
 /// `linear_f32r_spv` per output (same K-accumulation order); grid = out_f·ceil(rows/8).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_f32r_mrow8_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {
@@ -1166,6 +1269,7 @@ pub(crate) fn linear_f32r_mrow8_spv() -> &'static [u32] {
 /// SPIR-V for the vec4 ROW-TILED f32 GEMM (4 rows/workgroup, vec4 K stream — the small-m
 /// prefill shape; requires in_f % 4 == 0). vec4-lane accumulation → NOT bit-identical to the
 /// scalar kernels (f32 tolerance-level shift).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_f32r_mrow4_v4_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {
@@ -1177,6 +1281,7 @@ pub(crate) fn linear_f32r_mrow4_v4_spv() -> &'static [u32] {
 }
 /// SPIR-V for the vec4 ROW-TILED f32 GEMM, 8 rows/workgroup (chunked-prefill rows>4 shape;
 /// requires in_f % 4 == 0). Same vec4 accumulation caveat as the 4-row variant.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_f32r_mrow8_v4_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {
@@ -1187,46 +1292,55 @@ pub(crate) fn linear_f32r_mrow8_v4_spv() -> &'static [u32] {
     })
 }
 /// SPIR-V for the bf16-weight GEMV (`y=x·Wᵀ`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_bf16_spv() -> &'static [u32] {
     static LINEAR_BF16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_BF16_SPV.get_or_init(|| spv_words(LINEAR_BF16_SPV_BYTES))
 }
 /// SPIR-V for the unified affine-quant dequant GEMV (`y=x·Wᵀ`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_q_spv() -> &'static [u32] {
     static LINEAR_Q_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_Q_SPV.get_or_init(|| spv_words(LINEAR_Q_SPV_BYTES))
 }
 /// SPIR-V for the f16-weight GEMV with fused residual.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_res_spv() -> &'static [u32] {
     static LINEAR_RES_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_RES_SPV.get_or_init(|| spv_words(LINEAR_RES_SPV_BYTES))
 }
 /// SPIR-V for the affine-quant dequant GEMV with fused residual.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_res_q_spv() -> &'static [u32] {
     static LINEAR_RES_Q_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_RES_Q_SPV.get_or_init(|| spv_words(LINEAR_RES_Q_SPV_BYTES))
 }
 /// SPIR-V for the online-softmax GQA attention (hd<=128).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attention_spv() -> &'static [u32] {
     static ATTENTION_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ATTENTION_SPV.get_or_init(|| spv_words(ATTENTION_SPV_BYTES))
 }
 /// SPIR-V for flash-decode combine (merge split-K partials).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_combine_spv() -> &'static [u32] {
     static ATTN_COMBINE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ATTN_COMBINE_SPV.get_or_init(|| spv_words(ATTN_COMBINE_SPV_BYTES))
 }
 /// SPIR-V for tiled online-softmax attention over an f16 KV cache.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attention_kv_spv() -> &'static [u32] {
     static ATTENTION_KV_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ATTENTION_KV_SPV.get_or_init(|| spv_words(ATTENTION_KV_SPV_BYTES))
 }
 /// SPIR-V for fused per-head QK-norm + NEOX RoPE (f16 out).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn qk_norm_rope_spv() -> &'static [u32] {
     static QK_NORM_ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     QK_NORM_ROPE_SPV.get_or_init(|| spv_words(QK_NORM_ROPE_SPV_BYTES))
 }
 /// SPIR-V for QK-norm + RoPE with proportional-rope freq_factors (gemma4 full-attention layers).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn qk_norm_rope_ff_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(QK_NORM_ROPE_FF_SPV_BYTES))
@@ -1261,6 +1375,7 @@ dyn_spv!(attn_partial_nohd_spv, "attn_partial_nohd");
 dyn_spv!(attn_partial_dyn_nohd_spv, "attn_partial_dyn_nohd");
 dyn_spv!(attn_partial_dynac_nohd_spv, "attn_partial_dynac_nohd");
 /// `INFR_NO_ATTN_HD=1` — select the `-DNO_HD_SPEC` attn_partial variants (general loops only).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_hd_spec_disabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("INFR_NO_ATTN_HD").is_ok())
@@ -1309,6 +1424,7 @@ dyn_spv!(dequant_turbo_t3_spv, "dequant_turbo_t3");
 dyn_spv!(dequant_turbo_t4_spv, "dequant_turbo_t4");
 
 /// (kernel name, SPIR-V) for the TurboQuant KV quantize of `dt` (`src_f16` = f16 K, else f32 V).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn quant_turbo_kernel(
     dt: infr_core::DType,
     src_f16: bool,
@@ -1326,6 +1442,7 @@ pub(crate) fn quant_turbo_kernel(
 }
 
 /// (kernel name, SPIR-V) for the TurboQuant KV dequant→f16 of `dt`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dequant_turbo_kernel(dt: infr_core::DType) -> (&'static str, &'static [u32]) {
     use infr_core::DType::*;
     match dt {
@@ -1337,6 +1454,7 @@ pub(crate) fn dequant_turbo_kernel(dt: infr_core::DType) -> (&'static str, &'sta
 }
 
 /// (kernel name, SPIR-V) for the dense KV cast-store into `dst_dt` (F32/Bf16), `src_f16` = f16 K.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn store_kv_dense_kernel(
     dst_dt: infr_core::DType,
     src_f16: bool,
@@ -1353,6 +1471,7 @@ pub(crate) fn store_kv_dense_kernel(
 
 /// (kernel name, SPIR-V) for the KV quantize kernel of `dt` (`src_f16` = f16 K source, else f32 V).
 /// Distinct names per variant so the recorder's name-keyed pipeline cache never collides.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn quant_kv_kernel(
     dt: infr_core::DType,
     src_f16: bool,
@@ -1374,6 +1493,7 @@ pub(crate) fn quant_kv_kernel(
 }
 
 /// (kernel name, SPIR-V) for the KV dequant→f16 prefix expander of `dt`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dequant_kv_kernel(dt: infr_core::DType) -> (&'static str, &'static [u32]) {
     use infr_core::DType::*;
     match dt {
@@ -1395,22 +1515,26 @@ dyn_spv!(attn_partial_dynac_q8_spv, "attn_partial_dynac_q8");
 dyn_spv!(dequant_q8_f16_spv, "dequant_q8_f16");
 /// SPIR-V for the SELF-CHUNKING record-once split-K decode partial (adaptive chunk from the live
 /// kv_len; workgroups past the live range early-exit with a zero-weight header).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_partial_dynac_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(ATTN_PARTIAL_DYNAC_SPV_BYTES))
 }
 /// SPIR-V for the live-count combine (record-once replay; loops the prologue's live chunks).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_combine_live_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(ATTN_COMBINE_LIVE_SPV_BYTES))
 }
 /// SPIR-V for the split-K replay prologue (indirect args + live count from kv_len).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_live_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(ATTN_LIVE_SPV_BYTES))
 }
 /// SPIR-V for the subgroup decode GEMV (`y=x·Wᵀ`). `bits`=4/8 picks the quant variant; `res` adds
 /// a fused residual. Used by the recorder's `linear_q` / `linear_add_q`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn mul_mat_vec_q_spv(bits: u32, res: bool) -> &'static [u32] {
     match (bits, res) {
         (4, false) => MMV_Q4_SPV.get_or_init(|| spv_words(MMV_Q4_SPV_BYTES)),
@@ -1421,6 +1545,7 @@ pub(crate) fn mul_mat_vec_q_spv(bits: u32, res: bool) -> &'static [u32] {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
     /// Untiled coopmat GEMM (m,n,k multiples of 16). Correct but memory-bound; use `matmul_f16`
     /// (tiled) for throughput.

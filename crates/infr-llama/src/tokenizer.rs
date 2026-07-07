@@ -22,6 +22,7 @@ use tokenizers::{AddedToken, DecoderWrapper, SplitDelimiterBehavior, Tokenizer};
 /// vocab from `.tokens`, merges from `.merges`, ByteLevel pre-tokenizer + decoder, and control /
 /// user-defined tokens (token_type 3/4, e.g. `<|im_start|>`) registered as special so they encode
 /// atomically. SentencePiece (`model == "llama"`) isn't built here — pass a `tokenizer.json`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     let md = g.metadata();
     let model = md.str("tokenizer.ggml.model").unwrap_or("");
@@ -117,6 +118,7 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
 /// `<0xXX>` byte tokens (token_type 6) are handled by Unigram byte-fallback; CONTROL tokens
 /// (type 3, e.g. `<bos>`/`<start_of_turn>`) register as special so they encode atomically. The
 /// Metaspace replacement (▁) maps spaces; `add_space_prefix` controls the leading dummy space.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     let md = g.metadata();
     let toks = md

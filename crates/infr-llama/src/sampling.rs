@@ -10,6 +10,7 @@ pub struct Sampler {
     pub top_k: usize,
     pub top_p: f32,
 }
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Default for Sampler {
     fn default() -> Self {
         Self {
@@ -20,6 +21,7 @@ impl Default for Sampler {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Sampler {
     /// Sampler from the INFR_TEMP / INFR_TOP_K / INFR_TOP_P env knobs — the seam paths' sampling
     /// config (the bespoke path plumbs the same values through `Llama::set_sampling`). Defaults to
@@ -49,6 +51,7 @@ impl Sampler {
 /// RNG seed for a generation's sampling draws (unused under greedy). `INFR_SEED` pins it for
 /// distribution-identity testing (chained vs per-token temp sampling must draw the same stream
 /// given the same seed); unset falls back to a wall-clock seed.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn seed_rng() -> u64 {
     std::env::var("INFR_SEED")
         .ok()
@@ -65,6 +68,7 @@ pub(crate) fn seed_rng() -> u64 {
 /// Advance the xorshift64 state and return a uniform draw in [0, 1) — the factored-out RNG step
 /// shared by the host sampler and the GPU `Op::Sample` path (which uploads the draw as the
 /// kernel's `u` input, keeping the two paths distribution-identical).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn next_uniform(rng: &mut u64) -> f32 {
     let mut x = *rng;
     x ^= x << 13;
@@ -74,6 +78,7 @@ pub(crate) fn next_uniform(rng: &mut u64) -> f32 {
     (x >> 40) as f32 / (1u64 << 24) as f32
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn argmax(v: &[f32]) -> usize {
     let mut bi = 0;
     let mut bv = f32::NEG_INFINITY;
@@ -88,6 +93,7 @@ pub(crate) fn argmax(v: &[f32]) -> usize {
 
 /// Sample a token id from `logits` per `s`. Greedy if `temp<=0`/`top_k==1`; else temperature +
 /// top-k + top-p (nucleus). `rng` is an xorshift64 state advanced in place.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn sample_logits(logits: &[f32], s: Sampler, rng: &mut u64) -> u32 {
     if s.temp <= 0.0 || s.top_k == 1 {
         return argmax(logits) as u32;

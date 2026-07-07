@@ -27,6 +27,7 @@ pub(crate) struct ComputeKernel {
     pub push_size: u32,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn make_compute_kernel(
     device: &ash::Device,
     pcache: vk::PipelineCache,
@@ -122,6 +123,7 @@ pub(crate) fn make_compute_kernel(
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn destroy_compute_kernel(device: &ash::Device, k: &ComputeKernel) {
     unsafe {
         device.destroy_descriptor_pool(k.desc_pool, None);
@@ -132,6 +134,7 @@ pub(crate) fn destroy_compute_kernel(device: &ash::Device, k: &ComputeKernel) {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
     /// Fetch-or-build a named kernel from precompiled SPIR-V (build-compiled GLSL → `.spv`).
     pub(crate) fn kernel(

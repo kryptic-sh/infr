@@ -15,6 +15,7 @@ pub(crate) use infr_gguf::dequant::dequant_block;
 /// the GPU (those upload quantized/f16 in-VRAM). It feeds: the host embedding gather, the CPU norm
 /// and SSM recurrence math (qwen35), the `Q35_CPU=1` oracle, and serves as the f32 source we
 /// convert into f16/bf16/quant GPU weights. Survives even with full GPU format coverage.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn load_tensor_dequant(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
     let info = g
         .tensors()

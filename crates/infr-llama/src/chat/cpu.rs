@@ -14,6 +14,7 @@ pub struct CpuDenseChat {
     metal: bool,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl CpuDenseChat {
     pub fn new(model: SeamModel) -> Self {
         Self {
@@ -28,6 +29,7 @@ impl CpuDenseChat {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for CpuDenseChat {
     fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.model.render_chat_messages(messages)

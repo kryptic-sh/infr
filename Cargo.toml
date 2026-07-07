@@ -12,6 +12,8 @@ members = [
     "crates/infr-server",
     "crates/infr-llama",
     "crates/infr-cli",
+    "crates/infr-prof",
+    "crates/infr-prof-rt",
 ]
 
 [workspace.package]
@@ -31,6 +33,8 @@ infr-cpu = { path = "crates/infr-cpu" }
 infr-chat = { path = "crates/infr-chat" }
 infr-engine = { path = "crates/infr-engine" }
 infr-server = { path = "crates/infr-server" }
+infr-prof = { path = "crates/infr-prof" }
+infr-prof-rt = { path = "crates/infr-prof-rt" }
 
 # shared third-party
 thiserror = "2"

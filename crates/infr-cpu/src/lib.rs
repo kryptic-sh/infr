@@ -115,6 +115,7 @@ enum CpuRead<'a> {
     Mapped(&'a TensorBytes),
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl std::ops::Deref for CpuRead<'_> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -125,6 +126,7 @@ impl std::ops::Deref for CpuRead<'_> {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl CpuBuffer {
     /// Read view of the bytes (zero-copy for mapped weights; mutex guard for owned buffers).
     fn read(&self) -> CpuRead<'_> {
@@ -144,6 +146,7 @@ impl CpuBuffer {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Buffer for CpuBuffer {
     fn len_bytes(&self) -> usize {
         match self {
@@ -181,6 +184,7 @@ pub struct CpuBackend {
     pool: std::sync::OnceLock<pool::SpinPool>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl CpuBackend {
     pub fn new() -> Self {
         Self::default()
@@ -242,6 +246,7 @@ impl CpuBackend {
 
 /// Reinterpret raw buffer bytes as `f32` values per `dtype` (dequantizing quant/f16/bf16, widening
 /// integer position tensors). The universal "read a tensor's value on the host".
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
     match dtype {
         DType::F32 => bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
@@ -258,6 +263,7 @@ pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn cpu_buf(b: &dyn Buffer) -> &CpuBuffer {
     b.as_any()
         .downcast_ref::<CpuBuffer>()
@@ -265,6 +271,7 @@ fn cpu_buf(b: &dyn Buffer) -> &CpuBuffer {
 }
 
 /// Dequantize the first `need` elements of a Q8_0-block buffer (34 B / 32 elems, y = d*q).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dequant_prefix_q8_0(bytes: &[u8], need: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(need);
     for b in 0..need.div_ceil(32) {
@@ -280,6 +287,7 @@ pub(crate) fn dequant_prefix_q8_0(bytes: &[u8], need: usize) -> Vec<f32> {
     out
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Backend for CpuBackend {
     fn name(&self) -> &str {
         "cpu"

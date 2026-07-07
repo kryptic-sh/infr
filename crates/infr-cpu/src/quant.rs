@@ -23,6 +23,7 @@ pub(crate) struct Q8 {
     pub(crate) bsums16: Vec<i32>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn quantize_q8(x: &[f32]) -> Q8 {
     let nb = x.len() / 256;
     let mut qs = vec![0i8; nb * 256];
@@ -60,6 +61,7 @@ pub(crate) fn quantize_q8(x: &[f32]) -> Q8 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) unsafe fn hadd_i32_ymm(v: std::arch::x86_64::__m256i) -> i32 {
     use std::arch::x86_64::*;
     let h1 = _mm256_hadd_epi32(v, v);
@@ -73,6 +75,7 @@ pub(crate) unsafe fn hadd_i32_ymm(v: std::arch::x86_64::__m256i) -> i32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) unsafe fn hadd_i32_xmm(v: std::arch::x86_64::__m128i) -> i32 {
     use std::arch::x86_64::*;
     let h = _mm_hadd_epi32(v, v); // [a+b, c+d, a+b, c+d]
@@ -90,6 +93,7 @@ pub(crate) struct Q8x32 {
     pub(crate) bsum: Vec<i32>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn quantize_q8_32(x: &[f32]) -> Q8x32 {
     let nb = x.len() / 32;
     let mut qs = vec![0i8; nb * 32];

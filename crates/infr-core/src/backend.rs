@@ -98,6 +98,7 @@ pub struct GraphPlan {
     pub graph: crate::graph::Graph,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl GraphPlan {
     pub fn boxed(graph: &crate::graph::Graph) -> Box<dyn Plan> {
         Box::new(GraphPlan {
@@ -106,6 +107,7 @@ impl GraphPlan {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Plan for GraphPlan {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -120,6 +122,7 @@ pub struct Bindings<'a> {
     map: HashMap<TensorId, &'a dyn Buffer>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Bindings<'a> {
     pub fn new() -> Self {
         Self {

@@ -20,6 +20,7 @@ enum DiffusionSess {
     Metal(Box<crate::seam::model::DiffusionGemmaMetalSession>),
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl crate::diffusion::DiffusionSession for DiffusionSess {
     fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
         match self {
@@ -91,6 +92,7 @@ pub struct DiffusionGemmaChat {
     max_ctx: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionGemmaChat {
     /// Production Vulkan session.
     pub fn new(model: SeamModel) -> Self {
@@ -124,6 +126,7 @@ impl DiffusionGemmaChat {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionGemmaChat {
     /// Open (or grow) the session for a turn needing `needed` KV rows — see the sizing comment at
     /// the call site in [`generate`](ChatModel::generate).
@@ -164,6 +167,7 @@ impl DiffusionGemmaChat {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for DiffusionGemmaChat {
     fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.model.render_chat_messages(messages)
@@ -219,6 +223,7 @@ impl ChatModel for DiffusionGemmaChat {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionGemmaChat {
     /// Shared body of [`ChatModel::generate`]/[`ChatModel::generate_with_step_hook`] — `on_step:
     /// None` (the plain `generate` path) is byte-identical to the pre-hook implementation: the

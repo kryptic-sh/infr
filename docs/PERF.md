@@ -112,6 +112,80 @@ runs; trust e2e benches for accept / revert calls.
   problem (grid/occupancy), the ceiling itself being too low is a kernel
   micro-arch problem.
 
+### Build-time auto-instrumentation (`INFR_PROFILE=1`)
+
+Whole-workspace CPU-side function timing with **zero code in default builds**
+and **zero manual timer edits**:
+
+```bash
+INFR_PROFILE=1 cargo build --release -p infr-cli   # instrumented binary
+./target/release/infr bench "$M" -p 0 -n 128 -r 3  # report prints at exit
+INFR_PROFILE_OUT=prof.json ./target/release/infr ... # + full table as JSON
+```
+
+At process exit the run prints a merged, self-time-sorted table:
+
+```
+== INFR_PROFILE report: 200 sites, 1 threads, wall 1.96s (...), accounted self 1.92s ==
+        self   self%        total        calls  avg(self)  function
+     624.2ms  31.91%      624.2ms           49     12.7ms  infr_vulkan::recorder::RecordedCmd::replay_n
+     581.0ms  29.70%      670.0ms            1    581.0ms  infr_gguf::dequant::dequant_unified
+       7.7ms   0.39%      728.3ms            4      1.9ms  infr_llama::seam::runner::generate_dense_backend
+```
+
+`self` excludes time spent in instrumented callees (`total` is inclusive;
+recursion counts inclusive time once at the outermost frame). Accumulation is
+thread-local (no shared state on the hot path); per-thread tables merge at
+report time, so rayon/spin-pool threads are covered.
+
+**How it works.** Each hot crate's `build.rs` turns `INFR_PROFILE=1` into
+`cfg(infr_profile)`; every top-level `fn` and `impl` block in infr-core,
+infr-cpu, infr-vulkan, infr-gguf and infr-llama carries
+`#[cfg_attr(infr_profile, infr_prof::instrument)]`. Without the env the
+attribute is compiled away entirely — the default binary contains no profiling
+code, no runtime branch, nothing. With it, the `infr-prof` proc macro rewrites
+every function in the item to open an RAII span (`infr-prof-rt`) that survives
+`?`, `return` and panics.
+
+**Coverage rules — what a new function needs:**
+
+- new method in an already-annotated `impl` block: **nothing**, covered
+  automatically.
+- new top-level `fn` or new `impl` block: one line —
+  `#[cfg_attr(infr_profile, infr_prof::instrument)]`.
+- `#[inline]` / `#[inline(always)]` fns are **auto-skipped**: declaring a fn
+  inline already asserts it is smaller than the ~50ns probe pair. Non-inline
+  sub-100ns leaves opt out with `#[cfg_attr(infr_profile, infr_prof::skip)]`
+  (see `infr_gguf::dequant::k4` — at 1.7e9 calls/run, probing such leaves made
+  CPU decode 12x slower and drowned the report).
+- `const fn`, `async fn`, `#[naked]`, `#[test]` fns and closures are skipped
+  automatically; generics share one site across instantiations; trait impls
+  report as `<Ty as Trait>::fn`.
+
+**Overhead (Qwen3-0.6B Q4_K_M, 7900 XTX + CPU backend):** GPU pp512 26.0k →
+25.2k t/s (~3%), GPU tg128 within noise (618 vs 616), CPU pp128 within noise
+(933 vs 943), CPU tg32 118 → 105 t/s (~11%, decode's per-row kernel calls are
+~200ns each so the probe shows). Instrumented builds are for attribution, not
+for ratio benchmarking — never quote instrumented numbers in a perf log.
+
+**Design notes (rejected alternatives).** (B) a build.rs syn-rewrite of crate
+sources into OUT_DIR + `include!` was rejected: non-inline `mod foo;` resolution
+breaks under `include!`, every nested module needs path rewriting, and
+rust-analyzer/incremental builds see phantom sources — fragility for the sole
+benefit of removing one attribute line per item. (C) rustc-level instrumentation
+(`-Z instrument-xray`, mcount-style hooks) is nightly-only and emits to external
+tooling with no self/child or per-thread story on stable — samply already covers
+the "no source markers at all" niche. (A proc-macro attribute on non-inline
+`mod foo;` is also unstable, which is why annotation is per-item, not per-file.)
+
+**Deprecation rule:** do not add new one-off `Instant::now()` accumulators or
+env-gated eprintln timers (`INFR_PROF_DEC`-style) — build with `INFR_PROFILE=1`
+instead. The existing `INFR_PROF*` env gates stay until this system has proven
+itself in a few campaigns, then get removed. GPU-side timing is unchanged:
+`INFR_PROF2` timestamp queries are device-side and cannot be auto-injected — use
+both reports side by side (host report tells you _that_ the GPU path waits in
+`replay_n`; PROF2 tells you which ops the GPU spent it on).
+
 ### CPU profiling (samply)
 
 For CPU-side attribution, use a sampling profiler — **do not add ad-hoc

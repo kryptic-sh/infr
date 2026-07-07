@@ -11,11 +11,13 @@ use infr_gguf::dequant::KVALUES_IQ4NL;
 const QK: usize = 32; // all of these are 32-element blocks
 
 #[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn h(x: f32) -> [u8; 2] {
     f16::from_f32(x).to_bits().to_le_bytes()
 }
 
 /// q4_0 (18 B): `d = max/-8`, `q = clamp(x/d + 8.5, .., 15)`, 4-bit, low/high halves interleaved.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn q4_0_block(x: &[f32], dst: &mut [u8]) {
     let (mut amax, mut max) = (0f32, 0f32);
     for &v in x {
@@ -36,6 +38,7 @@ fn q4_0_block(x: &[f32], dst: &mut [u8]) {
 }
 
 /// q4_1 (20 B): asymmetric — `d = (max-min)/15`, `q = clamp((x-min)/d + 0.5, 0, 15)`, stores `min`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn q4_1_block(x: &[f32], dst: &mut [u8]) {
     let (mut min, mut max) = (f32::MAX, f32::MIN);
     for &v in x {
@@ -55,6 +58,7 @@ fn q4_1_block(x: &[f32], dst: &mut [u8]) {
 }
 
 /// q5_0 (22 B): `d = max/-16`, 5-bit — low nibble in `qs`, 5th bit packed into the `qh` u32.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn q5_0_block(x: &[f32], dst: &mut [u8]) {
     let (mut amax, mut max) = (0f32, 0f32);
     for &v in x {
@@ -78,6 +82,7 @@ fn q5_0_block(x: &[f32], dst: &mut [u8]) {
 }
 
 /// q5_1 (24 B): asymmetric 5-bit — `d = (max-min)/31`, low nibble in `qs`, 5th bit in `qh`, `min`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn q5_1_block(x: &[f32], dst: &mut [u8]) {
     let (mut min, mut max) = (f32::MAX, f32::MIN);
     for &v in x {
@@ -101,6 +106,7 @@ fn q5_1_block(x: &[f32], dst: &mut [u8]) {
 
 /// Nearest codebook index (llama.cpp `best_index_int8`, binary search on the sorted values).
 #[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn best_index(val: &[i8; 16], x: f32) -> usize {
     if x <= val[0] as f32 {
         return 0;
@@ -126,6 +132,7 @@ fn best_index(val: &[i8; 16], x: f32) -> usize {
 
 /// iq4_nl (18 B): non-linear 16-entry codebook. `d = max/values[0]`, least-squares refine
 /// `d = Σwqx/Σwq²` (w = x², no imatrix → the `ntry=-1` path). Indices packed low/high halves.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn iq4nl_block(x: &[f32], dst: &mut [u8]) {
     let (mut amax, mut max) = (0f32, 0f32);
     for &v in x {
@@ -157,6 +164,7 @@ fn iq4nl_block(x: &[f32], dst: &mut [u8]) {
 }
 
 /// Quantize `src.len()` activations (a multiple of 32) into 32-element blocks of `dt` in `dst`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn quantize_row(dt: DType, src: &[f32], dst: &mut [u8]) {
     let bb = infr_gguf::nbytes(dt, QK);
     for (b, chunk) in src.chunks_exact(QK).enumerate() {
@@ -173,6 +181,7 @@ pub fn quantize_row(dt: DType, src: &[f32], dst: &mut [u8]) {
 }
 
 /// Which dtypes this module can quantize on the fly for the KV cache.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn supported(dt: DType) -> bool {
     matches!(
         dt,

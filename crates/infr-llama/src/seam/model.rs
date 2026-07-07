@@ -47,6 +47,7 @@ pub struct DenseVulkanSession {
     max_ctx: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DenseVulkanSession {
     /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
     /// warmup generation so the first real prompt starts from clean slots.
@@ -55,6 +56,7 @@ impl DenseVulkanSession {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SlotPool {
     fn new() -> Self {
         Self {
@@ -197,6 +199,7 @@ pub struct DenseMetalSession {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DenseMetalSession {
     /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
     /// warmup generation so the first real prompt starts from clean slots.
@@ -210,6 +213,7 @@ impl DenseMetalSession {
 /// additionally gates each format on backend/alignment and falls back to f16, so a gated-out
 /// low-bit request can under-estimate here; the alloc-time VRAM budget guard backstops that.
 /// Unknown/unset → f16 (2 bytes), the GPU default.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn kv_bytes_per_elem(var: &str) -> f64 {
     let side = std::env::var(var).ok();
     match side.as_deref() {
@@ -228,6 +232,7 @@ fn kv_bytes_per_elem(var: &str) -> f64 {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamModel {
     /// Load a model for CPU inference without touching the GPU. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
@@ -1054,6 +1059,7 @@ pub struct DiffusionGemmaMetalSession {
     max_ctx: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionGemmaCpuSession {
     /// Causal prefill of `tokens` (encoder scalars, chunked/per-token like every other dense
     /// prefill on this seam) — writes KV rows `0..tokens.len()`. Call once per block before
@@ -1154,6 +1160,7 @@ impl DiffusionGemmaCpuSession {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionGemmaVulkanSession {
     /// [`DiffusionGemmaCpuSession::prefill`]'s Vulkan twin.
     pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
@@ -1263,6 +1270,7 @@ impl DiffusionGemmaVulkanSession {
 /// with no padding (matching `generate_dense_metal_session`'s closure), unlike Vulkan's
 /// `pad_to_u32_align`.
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionGemmaMetalSession {
     /// [`DiffusionGemmaCpuSession::prefill`]'s Metal twin.
     pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
@@ -1360,6 +1368,7 @@ impl DiffusionGemmaMetalSession {
 /// target-only greedy; a wrong draft only shortens the accepted prefix, never commits a wrong
 /// token. Backend-agnostic (no `cfg` gate): the macOS spec driver above and `crate::mtp`'s Vulkan
 /// MTP spec driver (issue #33) both call this — one pure acceptance rule for every spec flavor.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn spec_accept(cand: &[u32], verify_argmax: &[u32]) -> (usize, u32) {
     debug_assert_eq!(verify_argmax.len(), cand.len() + 1);
     let accepted = cand

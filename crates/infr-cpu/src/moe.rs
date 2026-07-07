@@ -38,6 +38,7 @@ pub(crate) enum ActsKind {
 /// Which activation representation an expert bank of this `(dtype, in_f)` uses — the SAME
 /// dispatch order the old `expert_matvec_batch` fast paths had, so every (weights, activations)
 /// pairing lands on the identical kernel.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn expert_acts_kind(dt: DType, in_f: usize, int8_ok: bool) -> ActsKind {
     if int8_ok
         && matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
@@ -59,6 +60,7 @@ pub(crate) fn expert_acts_kind(dt: DType, in_f: usize, int8_ok: bool) -> ActsKin
 /// `expert_matvec_batch` fast paths 1/2 + fallback one-for-one.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn expert_gemm_range(
     wbytes: &[u8],
     dt: DType,

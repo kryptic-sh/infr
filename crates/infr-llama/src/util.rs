@@ -27,6 +27,7 @@ pub(crate) struct PerLayerEmbd {
     pub(crate) tok_embd_row_bytes: usize,        // bytes per token row (npl*n_layer elements)
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerLayerEmbd>> {
     if cfg.n_embd_per_layer == 0 {
         return Ok(None);
@@ -49,6 +50,7 @@ pub(crate) fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerL
 /// UTF-8-safe incremental detokenizer for streaming: appends `id` to `acc`, decodes the whole
 /// sequence so far, and emits the newly-completed suffix past `printed` — holding back a trailing
 /// `�` (a multi-byte char split across tokens) until it completes. Mirrors the GPU path's streamer.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn stream_token(
     tokenizer: &Tokenizer,
     acc: &mut Vec<u32>,
@@ -70,6 +72,7 @@ pub(crate) fn stream_token(
 // only models that ship a `tokenizer.chat_template`, so a missing/broken template is a hard error.
 
 /// The error surfaced when a GGUF has no usable chat template (none embedded, or it failed to render).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn no_template_err() -> anyhow::Error {
     anyhow!(
         "model GGUF has no usable chat template (no `tokenizer.chat_template`, or it failed to \
@@ -80,6 +83,7 @@ pub(crate) fn no_template_err() -> anyhow::Error {
 
 /// Whether a Vulkan device is available — a cheap probe (creates and drops a backend). Lets callers
 /// (and tests) decide between the GPU and CPU paths, or skip GPU-only work when there's no device.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn gpu_available() -> bool {
     VulkanBackend::new().is_ok()
 }
@@ -88,6 +92,7 @@ pub fn gpu_available() -> bool {
 /// unit tests; `None` → the test self-skips. We use the shared HF cache everywhere now (no bespoke
 /// local model dir).
 #[cfg(test)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn test_qwen3_06b() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
         return Some(std::path::PathBuf::from(p));
@@ -102,6 +107,7 @@ pub(crate) fn test_qwen3_06b() -> Option<std::path::PathBuf> {
 
 /// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
 /// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
     for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
         if let Some(id) = tokenizer.token_to_id(name) {
@@ -112,12 +118,14 @@ pub(crate) fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
     g.metadata().u64(key)
 }
 
 /// Float metadata lookup (diffusion-gemma's `eb_*` sampler params are stored as GGUF strings —
 /// same KV store, no typed float accessor on `Metadata` — so parse through `as_f64`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn meta_f64(g: &Gguf, key: &str) -> Option<f64> {
     g.metadata().get(key).and_then(|v| v.as_f64())
 }

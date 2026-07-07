@@ -70,6 +70,8 @@ pub(crate) struct SpinPool {
 /// regrows on jobs arriving mid-spin, so the ceiling can be generous. `INFR_CPU_SPIN` overrides.
 static SPIN_LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
+// per-call leaf, too small to probe (see docs/PERF.md)
+#[cfg_attr(infr_profile, infr_prof::skip)]
 fn spin_limit() -> u32 {
     *SPIN_LIMIT.get_or_init(|| {
         std::env::var("INFR_CPU_SPIN")
@@ -79,6 +81,7 @@ fn spin_limit() -> u32 {
     })
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn worker_loop(me: usize, shared: Arc<Shared>) {
     // Baseline generation is the CONSTRUCTION-time value (0), not a fresh load: a worker whose
     // OS thread starts late — after the first `run()` already bumped `seq` — must still join
@@ -154,6 +157,7 @@ fn worker_loop(me: usize, shared: Arc<Shared>) {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SpinPool {
     /// Thread count follows rayon's (`RAYON_NUM_THREADS` / available parallelism) so `-t` pins
     /// both pools identically.
@@ -318,6 +322,7 @@ impl SpinPool {
 pub(crate) struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
+// not instrumented: per-task pointer accessors in the dispatch hot loop, too small to probe
 impl<T> SendPtr<T> {
     pub(crate) fn new(p: *mut T) -> Self {
         SendPtr(p)
@@ -326,6 +331,7 @@ impl<T> SendPtr<T> {
         self.0
     }
 }
+// not instrumented: trivial Copy-clone in hot loops; a span here would be pure overhead
 impl<T> Clone for SendPtr<T> {
     fn clone(&self) -> Self {
         *self
@@ -333,6 +339,7 @@ impl<T> Clone for SendPtr<T> {
 }
 impl<T> Copy for SendPtr<T> {}
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for SpinPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);

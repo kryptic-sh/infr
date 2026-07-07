@@ -24,6 +24,7 @@ pub struct DenseSeamChat {
     mtp_checked: bool,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DenseSeamChat {
     pub fn new(model: SeamModel) -> Self {
         Self {
@@ -78,6 +79,7 @@ impl DenseSeamChat {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl ChatModel for DenseSeamChat {
     fn render(&self, messages: &[(&str, &str)]) -> Result<String> {
         self.model.render_chat_messages(messages)

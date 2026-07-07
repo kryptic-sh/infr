@@ -23,6 +23,7 @@ pub enum Unit {
 /// - `total: Some(n)` → a full-width bar; `None` → a spinner (unknown length).
 /// - `label` is the left-most field (the `{msg}`).
 /// - Hidden when stderr isn't a TTY (piped output, `infr serve`) so it never spams logs.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn bar(total: Option<u64>, label: &str, unit: Unit) -> ProgressBar {
     if !std::io::stderr().is_terminal() {
         return ProgressBar::hidden();

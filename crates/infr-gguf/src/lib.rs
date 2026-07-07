@@ -49,6 +49,7 @@ pub struct TensorBytes {
     len: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl std::ops::Deref for TensorBytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -56,6 +57,7 @@ impl std::ops::Deref for TensorBytes {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl AsRef<[u8]> for TensorBytes {
     fn as_ref(&self) -> &[u8] {
         self
@@ -69,6 +71,7 @@ struct Reader<'a> {
     pos: usize,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
@@ -196,6 +199,7 @@ impl<'a> Reader<'a> {
 
 // ─── ggml_type → DType + block sizing ────────────────────────────────────────
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn ggml_type_to_dtype(t: u32) -> Result<DType> {
     match t {
         0 => Ok(DType::F32),
@@ -233,6 +237,7 @@ fn ggml_type_to_dtype(t: u32) -> Result<DType> {
 ///
 /// Sizes taken from llama.cpp `ggml/src/ggml.c` `type_traits[]` `.blck_size` / `.type_size`.
 /// GGUF dim order: `ne[0]` is the fastest-varying axis (innermost / columns).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn block_layout(dtype: DType) -> (usize, usize) {
     match dtype {
         DType::F32 => (1, 4),
@@ -299,6 +304,7 @@ fn block_layout(dtype: DType) -> (usize, usize) {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
     let (be, bb) = block_layout(dtype);
     (numel / be) * bb
@@ -307,12 +313,14 @@ fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
 /// Bytes occupied by `numel` elements of `dtype` in its GGUF block layout (`numel` must be a whole
 /// number of blocks). Public helper so backends can size a block-aligned prefix (e.g. a quantized
 /// KV cache: dequant only the first `kv_len` rows).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn nbytes(dtype: DType, numel: usize) -> usize {
     tensor_nbytes(dtype, numel)
 }
 
 // ─── Gguf::open ───────────────────────────────────────────────────────────────
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Gguf {
     /// Open and parse a GGUF file.
     ///
@@ -435,6 +443,7 @@ impl Gguf {
 
 // ─── WeightSource impl ────────────────────────────────────────────────────────
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl WeightSource for Gguf {
     fn metadata(&self) -> &Metadata {
         &self.metadata

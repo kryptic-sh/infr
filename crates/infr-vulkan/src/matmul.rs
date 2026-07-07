@@ -19,6 +19,7 @@ use super::{as_vk_buf, be, VulkanBackend};
 
 static MATMUL_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn matmul_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matmul_f32.spv"));
     MATMUL_SPV.get_or_init(|| {
@@ -35,6 +36,7 @@ const WG: u32 = 16;
 
 // ── VulkanBackend::matmul_f32 ─────────────────────────────────────────────────
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
     /// GPU f32 matmul: C[m×n] = A[m×k] × B[k×n].
     ///

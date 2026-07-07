@@ -29,6 +29,7 @@ pub(crate) struct VkDecodePlan {
     replay: Mutex<Option<DecodeReplay>>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VkDecodePlan {
     fn boxed(graph: &Graph) -> Box<dyn Plan> {
         Box::new(VkDecodePlan {
@@ -39,6 +40,7 @@ impl VkDecodePlan {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Plan for VkDecodePlan {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -73,6 +75,7 @@ struct DecodeReplay {
     _transient: Vec<Box<dyn Buffer>>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn compile(graph: &Graph) -> Result<Box<dyn Plan>> {
     // Eligibility (record-once replay vs per-execute static recording) is a pure function of the
     // graph shape, so decide it here, once. `execute` builds the replay lazily on first run.
@@ -86,24 +89,28 @@ pub(crate) fn compile(graph: &Graph) -> Result<Box<dyn Plan>> {
 /// else (prefill batches, dequant-prepass KV dtypes, f32 in-place Rope) falls back to the static
 /// per-execute path.
 /// Standard-GGUF-block low-bit KV quants that ride the dequant→f16 prepass path (not native reads).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn is_kv_quant(dt: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(dt, Q4_0 | Q4_1 | Q5_0 | Q5_1 | Iq4Nl)
 }
 
 /// Dense non-f16 KV caches (f32/bf16): stored via a cast-store, read via a cast→f16 prepass.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn is_kv_dense_alt(dt: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(dt, F32 | Bf16)
 }
 
 /// TurboQuant KV caches (WHT-rotated): quantizing WriteKv + dequant→f16 prepass.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn is_turbo(dt: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(dt, Turbo2 | Turbo3 | Turbo4)
 }
 
 /// Any KV cache dtype that rides the dequant/cast → f16 prepass (not f16 or native-Q8).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn is_kv_prepass(dt: infr_core::DType) -> bool {
     is_kv_quant(dt) || is_kv_dense_alt(dt) || is_turbo(dt)
 }
@@ -137,6 +144,7 @@ fn is_kv_prepass(dt: infr_core::DType) -> bool {
 /// just slow, it trips the amdgpu ring watchdog and device-losts the whole process (reproduced:
 /// `INFR_MOE_SMALL_M=100000` on a 1024-row chunk hangs the GPU; see `runner.rs`'s UBATCH doc for
 /// the same failure class with an unchunked prefill).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn moe_small_m_threshold() -> usize {
     const MOE_SMALL_M_MAX: usize = 64;
     std::env::var("INFR_MOE_SMALL_M")
@@ -146,6 +154,7 @@ fn moe_small_m_threshold() -> usize {
         .min(MOE_SMALL_M_MAX)
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn decode_eligible(graph: &Graph) -> bool {
     // INFR_SEAM_NO_REPLAY forces the static per-execute path (INFR_PROF2 timestamps work there;
     // the replay path can't report them).
@@ -226,6 +235,7 @@ fn decode_eligible(graph: &Graph) -> bool {
 /// straight from the mapping — zero submit/sync. (The generic `download` on a CpuToGpu buffer would
 /// allocate a staging buffer + one_shot copy + `queue_wait_idle` EVERY token; on the hot decode loop
 /// that per-token full sync is the dominant residual cost.) Falls back to `download` if unmapped.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn read_pos0(be_: &VulkanBackend, buf: &dyn Buffer) -> Result<u32> {
     if let Some(vb) = buf.as_any().downcast_ref::<crate::VkBuffer>() {
         if let Some(ptr) = vb.mapped_ptr() {
@@ -242,6 +252,7 @@ fn read_pos0(be_: &VulkanBackend, buf: &dyn Buffer) -> Result<u32> {
 
 /// Resolve a graph tensor to its device buffer: `Internal` from the scratch, everything else
 /// (`Input`/`Weight`/`Output`) from the model-provided `Bindings`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn resolve<'a>(
     scratch: &'a [Option<Box<dyn Buffer>>],
     bindings: &'a Bindings,
@@ -259,6 +270,7 @@ fn resolve<'a>(
 /// multiple of 64 so the prefill GEMM / flash kernels — which write ceil(rows/64)*64 output rows —
 /// write DIRECTLY into these buffers (no padded temp + copy). Padding rows are never read (downstream
 /// ops touch only the real `rows`, and row-major layout keeps element (r<rows, c) at the same index).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn alloc_scratch(be_: &VulkanBackend, graph: &Graph) -> Result<Vec<Option<Box<dyn Buffer>>>> {
     let mut scratch: Vec<Option<Box<dyn Buffer>>> =
         (0..graph.tensors.len()).map(|_| None).collect();
@@ -305,6 +317,7 @@ const MMV_MIN_ELEMS: usize = 48 << 20;
 
 /// Get-or-alloc the pool buffer for (tag, bytes); returns the map key so callers can hold several
 /// pool buffers at once via immutable indexing (`pool[&k].as_ref()`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn pooled(
     pool: &mut ScratchPool,
     be_: &VulkanBackend,
@@ -342,6 +355,7 @@ struct DynAttnCtx {
 /// Linear's op index → (residual, final dst); the absorbed Add lands in the skip set. Only the
 /// IMMEDIATELY following Add fuses (the seam builder emits the pair adjacent for non-gemma models;
 /// gemma's sandwich norm sits between and correctly blocks the fusion).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn linear_add_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, TensorId)>, HashSet<usize>) {
     let mut fused: HashMap<usize, (TensorId, TensorId)> = HashMap::new();
     let mut skip: HashSet<usize> = HashSet::new();
@@ -390,6 +404,7 @@ fn linear_add_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, TensorId)>, 
     (fused, skip)
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn kv_write_peephole(graph: &Graph) -> (HashMap<usize, (TensorId, usize)>, HashSet<usize>) {
     let mut fused: HashMap<usize, (TensorId, usize)> = HashMap::new();
     let mut skip: HashSet<usize> = HashSet::new();
@@ -436,6 +451,7 @@ enum RopeMode<'a> {
 /// Lower ONE graph op into the recorder. Shared by the static (`execute_static`) and record-once
 /// (`record_decode_replay`) paths — only the three pos-dependent ops branch on `mode`.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn lower_op(
     be_: &VulkanBackend,
     graph: &Graph,
@@ -2403,6 +2419,7 @@ fn lower_op(
     Ok(())
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
     let plan = plan
         .as_any()
@@ -2439,6 +2456,7 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
 /// each iteration's id into the ring. Returns the n ids read from the ring, or `None` when the
 /// plan can't chain (ineligible graph, host-pos fallback, no device sampler, or n out of the
 /// ring's range) — the caller falls back to per-token `execute`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn execute_chain(
     be_: &VulkanBackend,
     plan: &dyn Plan,
@@ -2475,6 +2493,7 @@ pub(crate) fn execute_chain(
 /// `_dyn` (params-driven) kernels for the pos-dependent ops. Only called for a [`decode_eligible`]
 /// graph. The returned recording is replayed (not submitted here) — the caller updates `params` and
 /// calls `replay()`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn record_decode_replay(
     be_: &VulkanBackend,
     graph: &Graph,
@@ -2586,6 +2605,7 @@ fn record_decode_replay(
 /// Per-execute static recording: allocate `Internal` scratch fresh, record every op via `lower_op`
 /// (Static mode — pos as a push constant read from `positions[0]`), submit + wait. Used for prefill
 /// batches and every ineligible decode (gemma/E2B/MoE/qwen35).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
     let scratch = alloc_scratch(be_, graph)?;
 

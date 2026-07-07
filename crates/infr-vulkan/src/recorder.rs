@@ -22,6 +22,7 @@ const MMV_NUM_ROWS: u32 = 1;
 
 /// Elements packed per u32 weight word for a given quant width (8 nibbles for q4, 4 bytes for q8).
 /// `None` ⇒ the subgroup GEMV has no specialization for this width; caller uses the WGSL fallback.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn mmv_epw(bits: u32) -> Option<usize> {
     match bits {
         4 => Some(8),
@@ -70,6 +71,7 @@ pub struct Recorder<'a> {
     suppress: std::cell::Cell<bool>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Recorder<'a> {
     pub(crate) fn new(backend: &'a VulkanBackend) -> Result<Self> {
         Self::new_inner(backend, false)
@@ -4438,6 +4440,7 @@ impl<'a> Recorder<'a> {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
     /// Start recording a single-submit forward.
     pub fn recorder(&self) -> Result<Recorder<'_>> {
@@ -4459,6 +4462,7 @@ pub struct RecordedCmd {
     pools: Vec<vk::DescriptorPool>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl RecordedCmd {
     /// Resubmit the recorded command buffer `n` times in ONE queue submission (legal via
     /// SIMULTANEOUS_USE) and wait once — the chained decode's n back-to-back iterations. The
@@ -4500,6 +4504,7 @@ impl RecordedCmd {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for RecordedCmd {
     fn drop(&mut self) {
         let device = &self.shared.device;

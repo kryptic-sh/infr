@@ -37,6 +37,7 @@ pub(crate) use weights::SeamKv;
 /// attention block is shared; the FFN is either a dense gated FFN or a routed-expert MoE bank; gemma4
 /// E2B adds per-layer input embeddings + KV-layer sharing. `prompt` is the full token prefix; returns
 /// the generated continuation. Stops at EOS or `max_new`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_cpu(
     g: &Gguf,
     cfg: &Config,
@@ -89,6 +90,7 @@ pub(crate) fn generate_dense_cpu(
 /// adapter, and its decode tok/s (still recompiling the graph per token) is the baseline
 /// record-once replay must close. Prefill's batched attention is decode-only on the seam, so the
 /// caller may pass short prompts to force the per-token path.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
@@ -118,6 +120,7 @@ pub(crate) fn generate_dense_vulkan(
 /// across calls and each turn prefills only the suffix that differs from the cached tokens —
 /// ChatSession-style KV reuse on the agnostic seam.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan_session(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
@@ -231,6 +234,7 @@ pub(crate) fn generate_dense_vulkan_session(
 /// GGUF dtype (the backend dequantizes lazily in its own `bytes_to_f32`, exactly like the CPU
 /// interpreter — so a quant weight occupies ~quant size, not 8× f32).
 #[cfg(target_os = "macos")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_metal(
     mtl: &infr_metal::MetalBackend,
     g: &Gguf,
@@ -261,6 +265,7 @@ pub(crate) fn generate_dense_metal(
 /// only the suffix that differs from the tokens already materialized in the cache.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_metal_session(
     mtl: &infr_metal::MetalBackend,
     g: &Gguf,
@@ -308,6 +313,7 @@ pub(crate) fn generate_dense_metal_session(
 /// speculatively written past it.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_metal2(
     mtl: &infr_metal::MetalBackend,
     g: &Gguf,
@@ -351,6 +357,7 @@ pub(crate) fn verify_dense_metal2(
 /// session) through the CPU reference backend, returning the LAST token's raw (pre-softmax, post-
 /// softcap) logits. Rides the ordinary per-token decode loop (`max_new = 1`, the one generated
 /// token discarded) — MoE-compatible, unlike the batched `verify` path.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_cpu(
     g: &Gguf,
     cfg: &Config,
@@ -398,6 +405,7 @@ pub(crate) fn verify_dense_cpu(
 /// input rows (`h_out` — `DecodeHandles::h_out`'s doc) alongside the logits, for the
 /// `lm_head(h_row) == logits_row` consistency check `docs/MTP.md`'s Phase 1 validation calls for.
 /// Returns `(logits, h)`, both `[vocab]`/`[n_embd]` for the last prompt token.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_cpu_with_h(
     g: &Gguf,
     cfg: &Config,
@@ -448,6 +456,7 @@ pub(crate) fn verify_dense_cpu_with_h(
 /// a whole prompt in one call (`docs/MTP.md`'s `process()` runs after every target ubatch, not just
 /// the sampled row). Dense non-MoE models only (mirrors the VERIFY branch's own guard). Returns
 /// `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_rows_cpu_with_h(
     g: &Gguf,
     cfg: &Config,
@@ -494,6 +503,7 @@ pub(crate) fn verify_rows_cpu_with_h(
 
 /// [`verify_dense_cpu`]'s Vulkan twin — the same one-shot causal prefill through the production
 /// Vulkan seam, for the CPU/Vulkan cross-backend parity check.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
@@ -546,6 +556,7 @@ pub(crate) enum WBytes {
     Owned(Vec<u8>),
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl std::ops::Deref for WBytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -576,6 +587,7 @@ type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buf
 /// is disabled for it). Must match the adapter's `decode_eligible` rejection — with one pair-wise
 /// exception the caller handles: COUPLED Q8_0 (K==V==Q8) replays (store_q8_dyn + the planar-Q8 dyn
 /// attention read), so `runner`'s gate checks the pair before consulting this per-side predicate.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn kv_forces_static(dt: DType) -> bool {
     matches!(
         dt,
@@ -594,6 +606,7 @@ fn kv_forces_static(dt: DType) -> bool {
     )
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
     match dt {
         DType::Q8_0 => (elems / 32 * 34).next_multiple_of(4),
@@ -616,6 +629,7 @@ pub(crate) fn kv_fmt_bytes(dt: DType, elems: usize) -> usize {
 /// model_proj GEMV + RMSNorm + combine now run as GPU graph ops (see the E2B prologue in `build`).
 /// Returns `pl_tok_scaled[r][l*npl+j] = per_layer_tok_embd[tok_r][l*npl+j] * √npl`, `[rows,
 /// n_layer*npl]` row-major — uploaded to `ipl_buf` and bound to the graph Input `pl_tok_in`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn e2b_ipl_rows(g: &Gguf, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32>> {
     use rayon::prelude::*;
     let (npl, nl) = (ple.npl, ple.n_layer);
@@ -643,6 +657,7 @@ fn e2b_ipl_rows(g: &Gguf, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32
 }
 
 /// Longest shared prefix of the cached tokens and the new prompt (the KV rows that stay valid).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }

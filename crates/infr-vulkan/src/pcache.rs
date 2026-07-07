@@ -39,6 +39,7 @@ pub(crate) struct PcachePersist {
     last_save: Mutex<Instant>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl PcachePersist {
     /// `~/.cache/infr/vk-pipeline-cache-{vendor:08x}-{device:08x}.bin` (XDG-aware) — keyed per
     /// device so a multi-GPU box never clobbers one GPU's cache with another's.

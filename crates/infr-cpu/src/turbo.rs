@@ -88,6 +88,7 @@ const TURBO4: Codec = Codec {
 };
 
 /// The codec for a turbo KV dtype (panics on a non-turbo dtype — callers gate on the DType).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn codec(dt: DType) -> &'static Codec {
     match dt {
         DType::Turbo2 => &TURBO2,
@@ -98,12 +99,14 @@ fn codec(dt: DType) -> &'static Codec {
 }
 
 /// Bytes per 128-element turbo block for `dt`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn block_bytes(dt: DType) -> usize {
     codec(dt).block_bytes
 }
 
 /// Nearest centroid index via the ascending midpoint thresholds (matches the reference if-chains).
 #[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn nearest(mids: &[f32], v: f32) -> usize {
     for (i, &m) in mids.iter().enumerate() {
         if v < m {
@@ -115,6 +118,7 @@ fn nearest(mids: &[f32], v: f32) -> usize {
 
 /// In-place Hadamard butterfly (unnormalized), shared by the forward/inverse WHT.
 #[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn butterfly(x: &mut [f32; QK]) {
     let mut h = 1;
     while h < QK {
@@ -132,6 +136,7 @@ fn butterfly(x: &mut [f32; QK]) {
 }
 
 /// Forward WHT: `y = D(s2)·N·H·D(s1)·x` (N = 1/√128).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn fwht(x: &mut [f32; QK]) {
     for i in 0..QK {
         x[i] *= S1[i] as f32;
@@ -143,6 +148,7 @@ fn fwht(x: &mut [f32; QK]) {
 }
 
 /// Inverse WHT: swap the sign diagonals (`H·N` self-inverse; s1/s2 are ±1 diagonals).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn fwht_inverse(x: &mut [f32; QK]) {
     for i in 0..QK {
         x[i] *= S2[i] as f32;
@@ -155,6 +161,7 @@ fn fwht_inverse(x: &mut [f32; QK]) {
 
 /// Pack the quantized indices of a rotated group into `body` (the block after the 2-byte norm),
 /// returning `Σ centroid²` for the norm correction. Packing depends on bit width.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn pack(c: &Codec, buf: &[f32; QK], body: &mut [u8]) -> f32 {
     body.fill(0);
     let mut recon_sq = 0f32;
@@ -190,6 +197,7 @@ fn pack(c: &Codec, buf: &[f32; QK], body: &mut [u8]) -> f32 {
 }
 
 /// Unpack a block into the ROTATED (WHT) domain: `centroid[idx]·norm`, no inverse WHT.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn unpack_rot(c: &Codec, blk: &[u8], out: &mut [f32; QK]) {
     let norm = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
     let body = &blk[2..];
@@ -219,6 +227,7 @@ fn unpack_rot(c: &Codec, blk: &[u8], out: &mut [f32; QK]) {
 }
 
 /// Quantize one 128-element group into a turbo block of `dt` (`dst.len() >= block_bytes(dt)`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn quantize_block(dt: DType, src: &[f32], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), QK);
     let c = codec(dt);
@@ -254,6 +263,7 @@ pub fn quantize_block(dt: DType, src: &[f32], dst: &mut [u8]) {
 /// Dequant the first `need` elements (a multiple of 128) to the ORIGINAL domain (rotated dequant +
 /// inverse WHT), so the CPU reference attention reads normal-domain K/V. Mirrors
 /// [`crate::dequant_prefix_q8_0`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn dequant_prefix_orig(dt: DType, bytes: &[u8], need: usize) -> Vec<f32> {
     let c = codec(dt);
     let nb = need / QK;

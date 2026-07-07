@@ -29,6 +29,7 @@ use super::{as_vk_buf, be, VulkanBackend};
 /// Return the static kernel name for a native-block GEMV (Phase 0-2).
 /// Kernel cache name for the id-indexed native GEMV (one per affine quant format); `None` for
 /// formats without an id variant.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_id_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
@@ -47,6 +48,7 @@ pub fn native_id_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
 }
 
 /// Kernel cache name for the multi-slot id-indexed native GEMV; `None` for formats without it.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
@@ -64,6 +66,7 @@ pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     })
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static str {
     use infr_core::DType::*;
     match (dtype, residual) {
@@ -120,6 +123,7 @@ pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static s
 }
 
 /// Kernel-cache key for the native-block prefill GEMM (one coopmat pipeline per quant format).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_gemm_kernel_name(dtype: infr_core::DType) -> &'static str {
     use infr_core::DType::*;
     match dtype {
@@ -162,10 +166,12 @@ pub fn native_gemm_kernel_name(dtype: infr_core::DType) -> &'static str {
 /// [`native_id_kernel_name`] for that.
 /// Formats the `embed_gather` kernel family covers (`Op::EmbedGather` — see
 /// `gemm::embed_gather_build_spv`). The runner gates the token-ids input path on this.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn embed_gather_supported(dtype: infr_core::DType) -> bool {
     crate::gemm::embed_gather_build_spv(dtype).is_some()
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
     use infr_core::DType::*;
     matches!(
@@ -199,6 +205,7 @@ pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
 /// Pad raw GGUF block bytes to the next multiple of 4 for upload as `array<u32>`.
 /// Appends zero bytes; the final u32 word's padding bytes are never read (they
 /// contain only out-of-block data which the shader never accesses for valid g).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn pad_to_u32_align(bytes: &[u8]) -> Vec<u8> {
     let padded = (bytes.len() + 3) & !3;
     let mut v = bytes.to_vec();
@@ -208,6 +215,7 @@ pub fn pad_to_u32_align(bytes: &[u8]) -> Vec<u8> {
 
 static LINEAR_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 fn linear_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32.spv"));
     LINEAR_SPV.get_or_init(|| {
@@ -227,6 +235,7 @@ pub(crate) struct LinearKernel {
     pub desc_pool: vk::DescriptorPool,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn create_linear_kernel(
     device: &ash::Device,
     pcache: vk::PipelineCache,
@@ -309,6 +318,7 @@ pub(crate) fn create_linear_kernel(
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn destroy_linear_kernel(device: &ash::Device, k: &LinearKernel) {
     unsafe {
         device.destroy_descriptor_pool(k.desc_pool, None);
@@ -319,6 +329,7 @@ pub(crate) fn destroy_linear_kernel(device: &ash::Device, k: &LinearKernel) {
     }
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
     fn linear_kernel(&self) -> &LinearKernel {
         let first = self.shared.linear_kernel.get().is_none();

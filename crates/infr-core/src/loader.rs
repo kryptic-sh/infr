@@ -15,6 +15,7 @@ pub enum MetaValue {
     Arr(Vec<MetaValue>),
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl MetaValue {
     pub fn as_u64(&self) -> Option<u64> {
         match self {
@@ -50,6 +51,7 @@ pub struct Metadata {
     pub kv: HashMap<String, MetaValue>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Metadata {
     pub fn get(&self, key: &str) -> Option<&MetaValue> {
         self.kv.get(key)

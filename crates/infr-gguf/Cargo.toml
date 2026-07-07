@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+infr-prof.workspace = true
+infr-prof-rt.workspace = true
 infr-core.workspace = true
 memmap2.workspace = true
 half.workspace = true

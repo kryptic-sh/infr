@@ -194,6 +194,7 @@ pub(crate) struct SeamWeights {
     pub(super) rf_buf: Option<(Box<dyn Buffer>, usize)>,
 }
 
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamKv {
     /// Longest common prefix of this slot's materialized tokens and `prompt` — the slot-selection
     /// score for multi-conversation serve.

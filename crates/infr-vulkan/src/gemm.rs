@@ -211,6 +211,34 @@ pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option
         _ => return None,
     })
 }
+/// SPIR-V for the multi-row int8 dp4a GEMV (m = 2..8, `native_mmv_mrow.comp`). `None` = format
+/// has no int-dot build (falls back to the dequant `native_gemv_mrow`).
+pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => v!("native_mmv_mrow_q4k"),
+        Q6K => v!("native_mmv_mrow_q6k"),
+        _ => return None,
+    })
+}
+/// Kernel-cache name for the multi-row int8 dp4a GEMV.
+pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> &'static str {
+    use infr_core::DType::*;
+    match dtype {
+        Q4K => "native_mmv_mrow_q4k",
+        Q6K => "native_mmv_mrow_q6k",
+        _ => unreachable!("native_mmv_mrow_kernel_name: gated by native_mmv_mrow_build_spv"),
+    }
+}
 /// Kernel-cache name for the int8 dp4a decode GEMV.
 pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> &'static str {
     use infr_core::DType::*;

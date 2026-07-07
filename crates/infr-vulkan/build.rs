@@ -412,6 +412,9 @@ fn main() {
             "native_mmv_q6k_res",
             &["-DFMT_Q6K", "-DUSE_RES"],
         ),
+        // Multi-row int8 dp4a GEMV (m=2..8): weight sub-block unpacked once, dp4a per row.
+        ("native_mmv_mrow", "native_mmv_mrow_q4k", &["-DFMT_Q4K"]),
+        ("native_mmv_mrow", "native_mmv_mrow_q6k", &["-DFMT_Q6K"]),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),
         (

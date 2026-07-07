@@ -135,10 +135,23 @@ void main() {
     uint c = rest % pc.n_chunks;
     uint kvh = rest / pc.n_chunks;
     uint h = kvh * g + hh;
+    // SWA chunk-grid base: the STATIC host path chunks only the rows' union window span
+    // `[base, kv_len)` (`n_chunks` covers that span, not the full cache — see the adapter's
+    // `swa_base`), so this MUST derive the identical base from the same pos/window inputs.
+    // Canvas keeps base 0 (its chunk policy spans the full kv_len; `lo` rides the repurposed
+    // rows slot instead). The plain-dyn variant (USE_PARAMS without SELF_CHUNK) keeps base 0
+    // too: its chunk grid is baked from the cache CAPACITY at record time and `attention_kv_dyn`
+    // doesn't re-chunk per token (the window-aware replay path is SELF_CHUNK, handled above).
+#ifdef USE_PARAMS
+    uint base = 0u;
+#else
+    uint base = (!canvas && pc.window > 0u && pc.pos + 1u > pc.window) ? pc.pos + 1u - pc.window
+                                                                       : 0u;
+#endif
     // Clamp to the window AND this row's causal end: a chunk fully outside either gets an empty
     // range → zero-weight partial (m = -3e38, l = 0) the combine's `wexp != 0` test skips.
-    uint j0 = max(c * pc.chunk, lo);
-    uint j1 = min(c * pc.chunk + pc.chunk, qpos1);
+    uint j0 = max(base + c * pc.chunk, lo);
+    uint j1 = min(base + c * pc.chunk + pc.chunk, qpos1);
 #endif
 
     // QK via subgroup reduction (one key per subgroup-iteration; vec4 coalesced K reads). Each lane's

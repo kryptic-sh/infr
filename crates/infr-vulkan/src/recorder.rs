@@ -1086,6 +1086,50 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Multi-row int8 dp4a GEMV (`2 <= rows <= 8`): [`Self::linear_native_mrow`]'s shape with
+    /// `native_mmv.comp`'s integer-dot math — the weight sub-block is unpacked once into packed
+    /// int8 words and dp4a'd against every row's pre-quantized activation block (`qa`/`dact`/
+    /// `sact` from [`Self::quant_q8`] over `rows` rows). NUM_ROWS=2 outputs per workgroup
+    /// (grid = ceil(out_f/2)). Caller gates on [`crate::gemm::native_mmv_mrow_build_spv`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_mrow(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        debug_assert!((2..=8).contains(&rows));
+        self.stamp("lm_head");
+        let name = crate::gemm::native_mmv_mrow_kernel_name(dtype);
+        let spv = crate::gemm::native_mmv_mrow_build_spv(dtype).expect("native mmv mrow spv");
+        let k = self.be.kernel(name, spv, 5, 16);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(w),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (out_f as u32).div_ceil(2),
+        );
+    }
+
     /// Native-block dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_native(

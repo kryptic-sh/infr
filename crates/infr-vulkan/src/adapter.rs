@@ -455,8 +455,18 @@ fn lower_op(
     // holds one entry; gemma's SWA/global alternation (and gemma4-12b's hd 256/512) holds a few.
     dyn_args: &mut Vec<DynAttnCtx>,
     pool: &mut ScratchPool,
+    // Multi-row mmv quantized-activation memo: `Some((x, m, in_f))` when the pooled `mmvr_*`
+    // scratch already holds `quant_q8(x)` for that shape. Consecutive same-x Linears (fused-QKV
+    // offset GEMVs, gate+up) then skip the requant — which not only drops ~40% of the quant
+    // dispatches but, more importantly, removes the WAR hazard (quant rewrites qa → barrier
+    // against the previous mmv's read) that would otherwise serialize the sibling GEMVs.
+    // `take()`n at the top of every call: ONLY the mmv-mrow branch restores it, so any other op
+    // in between (which may rewrite `x` — e.g. next layer's RmsNorm into the same scratch id)
+    // invalidates the memo by construction.
+    mmv_memo: &mut Option<(TensorId, usize, usize)>,
     dummy: &dyn Buffer,
 ) -> Result<()> {
+    let memo_prev = mmv_memo.take();
     let r = |id: TensorId| resolve(scratch, bindings, id);
     match op {
         Op::RmsNorm {
@@ -598,6 +608,62 @@ fn lower_op(
                 && crate::gemm::native_mrow_build_spv(dt).is_some()
                 && std::env::var("INFR_NO_MROW").is_err()
             {
+                // Int8 dp4a multi-row GEMV (Q4_K/Q6_K): quantize the m activation rows once
+                // (`quant_q8`), then integer-dot the raw weight blocks against ALL rows — the
+                // dequant mrow's per-sub-block scalar byte-extract dequant is the m-batch GEMV
+                // cost on ALU-bound shapes (E2B pp4@d4096: GEMV class 21.0 → 17.0us/op, pp4
+                // 366 → 383 t/s). Gates:
+                //  • m >= 3: m=2 is the single-head MTP spec-verify shape, whose accept loop
+                //    holds a hard output-identical-to-target-greedy bar (`mtp_spec_matches_
+                //    target_only_greedy`) — int8-quantized activations perturb the verify logits
+                //    enough to risk argmax flips vs the m=1 decode GEMV, so that shape keeps the
+                //    f32-dequant mrow.
+                //  • weight >= 8M elements: below that the kernel is dispatch-latency-floor
+                //    bound (the int8 math saves nothing) and the extra quant_q8 bubble is a pure
+                //    loss — qwen3-0.6b (all projections < 8M) measured pp4@d4096 934 → 854 t/s
+                //    ungated, and E2B's own win came from its gu/down (9.4-18.9M elems).
+                //  • out_f < 65536: the vocab-sized lm_head GEMV is pure weight-bandwidth (the
+                //    dequant ALU hides fully behind the stream) — the int8 form measured a hair
+                //    SLOWER there (qwen3-0.6b pp4@d4096 931 vs 916 with lm_head included).
+                // Same INFR_NO_MMV escape as the m=1 mmv (A/B).
+                if m >= 3
+                    && in_f * out_f >= 8 << 20
+                    && out_f < 65536
+                    && crate::gemm::native_mmv_mrow_build_spv(dt).is_some()
+                    && std::env::var("INFR_NO_MMV").is_err()
+                {
+                    let nblk = in_f / 32;
+                    let qa = pooled(pool, be_, "mmvr_qa", m * in_f)?;
+                    let dact = pooled(pool, be_, "mmvr_dact", m * nblk * 2)?;
+                    let sact = pooled(pool, be_, "mmvr_sact", m * nblk * 2)?;
+                    // Same x already quantized by the immediately-preceding Linear(s)? Reuse it
+                    // (see `mmv_memo`'s doc — the take()/restore protocol guarantees nothing
+                    // rewrote x or the pooled qa in between).
+                    if memo_prev != Some((*x, m, in_f)) {
+                        rec.quant_q8(
+                            xb,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            m,
+                            in_f,
+                        );
+                    }
+                    *mmv_memo = Some((*x, m, in_f));
+                    rec.linear_mmv_mrow(
+                        dt,
+                        w,
+                        w_off,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        y,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                    return Ok(());
+                }
                 rec.linear_native_mrow(dt, w, w_off, xb, y, m, in_f, out_f);
                 return Ok(());
             }
@@ -1437,6 +1503,26 @@ fn lower_op(
                 // attn_partial+combine pair vs the old 64-floor's n=5. n=4 landed between the two
                 // (small net win, less than n=3). Default 3; overridable for future re-tuning at
                 // other canvas lengths.
+                // SWA chunk-grid base: a sliding-window layer's rows attend only the union span
+                // `[max(0, pos+1-window), kv_len)` (row r's window start only moves UP with r), so
+                // chunk THAT span instead of `[0, kv_len)` — at pp4@d4096 a gemma SWA layer
+                // (window 512) drops from 33 chunks (28 of them empty: launched, barriered,
+                // zero-partial-written, combine-read) to ~9. The split-K partial pass is
+                // fixed-cost-per-workgroup bound at small m (E2B attn_partial scaled exactly with
+                // nh·n_chunks·rows across depths), so empty chunks cost like full ones.
+                // `attn_partial.comp`'s static branch derives the SAME base from its existing
+                // pos/window push constants (no layout change); the rows-batched mrows kernel and
+                // Canvas don't, so they keep the full-range grid (base 0).
+                let swa_window = match mask {
+                    AttnMask::SlidingWindow(w) => *w,
+                    _ => 0,
+                };
+                let swa_base = if swa_window > 0 && !batched_attn && canvas_lo.is_none() {
+                    (pos + 1).saturating_sub(swa_window)
+                } else {
+                    0
+                };
+                let span = kv_len - swa_base;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
                     let n = std::env::var("INFR_CANVAS_CHUNK_N")
                         .ok()
@@ -1447,12 +1533,12 @@ fn lower_op(
                 } else if batched_attn {
                     256
                 } else {
-                    (kv_len / 32).clamp(64, 512)
+                    (span / 32).clamp(64, 512)
                 };
                 // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
                 // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
                 let split_ok = (rows < 64 || canvas_lo.is_some())
-                    && kv_len > chunk
+                    && span > chunk
                     && hd % 4 == 0
                     && hd <= 512
                     && (rows == 1 || !(k_q8_eff || v_q8_eff));
@@ -1533,7 +1619,7 @@ fn lower_op(
                         AttnMask::SlidingWindow(w) => *w,
                         AttnMask::Canvas { .. } => 0,
                     };
-                    let n_chunks = kv_len.div_ceil(chunk);
+                    let n_chunks = span.div_ceil(chunk);
                     // Scratch scales with rows (rows*nh partial planes); rows==1 keeps the old
                     // decode sizes, so the hot decode pool entries are unchanged.
                     let pm = pooled(pool, be_, "split_pm", rows * nh * n_chunks * 4)?;
@@ -2432,6 +2518,7 @@ fn record_decode_replay(
         rec.params_advance(params.as_ref());
     }
     let mode = RopeMode::Dynamic(params.as_ref());
+    let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
@@ -2450,6 +2537,7 @@ fn record_decode_replay(
             &mut transient,
             &mut dyn_args,
             &mut pool,
+            &mut mmv_memo,
             dummy.as_ref(),
         )?;
     }
@@ -2533,6 +2621,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut pool: ScratchPool = HashMap::new();
+    let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
@@ -2551,6 +2640,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mut transient,
             &mut dyn_args,
             &mut pool,
+            &mut mmv_memo,
             dummy.as_ref(),
         )?;
     }

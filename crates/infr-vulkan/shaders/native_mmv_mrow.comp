@@ -1,0 +1,172 @@
+#version 460
+// Multi-row int8 dp4a GEMV: y[r] = x[r]·Wᵀ for r in 0..rows (rows ≤ 8) — `native_mmv.comp`'s
+// integer-dot math on `native_gemv_mrow.comp`'s weight-streamed-once multi-row shape. The m = 2..8
+// small-batch tier (spec-verify rows / a short chat-turn suffix, e.g. the pp4-at-depth serve
+// shape) previously rode the DEQUANT mrow kernel, whose per-sub-block cost is dominated by the
+// scalar byte-extract dequant-to-f32 + m·8 vec4 FMAs; here the weight sub-block is unpacked ONCE
+// into 8 packed-int8 words and each row costs just 8 dp4a + 8 L2-resident activation-word loads
+// (activations pre-quantized per 32-block by `quant_q8`: qa/dact/sact, layout [m, nblk]).
+// Measured (E2B pp4@d4096, 7900 XTX): the GEMV class 21.0 → 17.0us/op, pp4 366 → 383 t/s (the
+// adapter gates it to >= 8M-element non-vocab weights — see the Linear lowering's gate doc).
+// NUM_ROWS=2: one workgroup per 2 consecutive outputs (grid = ceil(out_f/2)), the activation
+// words read once for both outputs — same grid halving as `native_mmv.comp`.
+// Reduction: per-row subgroupAdd + one shared combine across waves (the mrow pattern — its 8-row
+// shared-tree replacement measured as the real cost there; see native_gemv_mrow.comp's header).
+// -DFMT_Q4K / -DFMT_Q6K select the weight format (the two formats a Q4_K_M/Q6_K model's
+// projections use — others keep the dequant mrow fallback).
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Same push layout as native_gemv/native_mmv (w_base = element offset for fused-QKV slices).
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
+layout(binding = 0) readonly buffer WB { uint nw[]; };          // raw GGUF weight bytes (padded u32)
+layout(binding = 1) readonly buffer QA { uint qa[]; };          // int8 activations, packed 4/u32 [m, in_f/4]
+layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [m, nblk]
+layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [m, nblk]
+layout(binding = 4) buffer YB { float y_buf[]; };
+
+const uint MR = 8u;
+const uint MAX_SG = 8u;                  // 64 threads / min 8-wide subgroup
+shared float part[2u * MR * MAX_SG];     // one partial per (output, row, subgroup)
+
+uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+
+#ifdef FMT_Q4K
+// Q4_K 6-bit scale/min for sub-block i from the 12-byte scales field at sb.
+uvec2 k4(uint i, uint sb) {
+    if (i < 4u) { return uvec2(rb(sb + i) & 63u, rb(sb + i + 4u) & 63u); }
+    uint sc = (rb(sb + i + 4u) & 0xFu) | ((rb(sb + i - 4u) >> 6u) << 4u);
+    uint mn = (rb(sb + i + 4u) >> 4u) | ((rb(sb + i) >> 6u) << 4u);
+    return uvec2(sc, mn);
+}
+
+// Unpack the 32-elem sub-block at element `gelem` into 8 packed-int8 words + its two scale
+// factors: f0 = d·sc (dot term), f1 = dmin·m (min term). Row r then contributes
+// f0·dact[r]·dp4a(qp, qa[r]) − f1·sact[r] — the same math as native_mmv.comp's dpsub.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 256u) * 144u; // super-block byte base
+    uint sub = (gelem / 32u) & 7u;   // sub-block 0..7
+    float d = f16tof32(ru16(bd));
+    float dmin = f16tof32(ru16(bd + 2u));
+    uvec2 km = k4(sub, bd + 4u);
+    f0 = d * float(km.x);
+    f1 = dmin * float(km.y);
+    uint qbase = bd + 16u + (sub >> 1u) * 32u;
+    bool lo = (sub & 1u) == 0u;
+    for (uint j = 0u; j < 8u; j++) {
+        uint w = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint qbyte = rb(qbase + j * 4u + b);
+            w |= (lo ? (qbyte & 0xFu) : (qbyte >> 4u)) << (b * 8u);
+        }
+        qp[j] = w;
+    }
+}
+#endif
+
+#ifdef FMT_Q6K
+// Q6_K: [u8 ql[128]][u8 qh[64]][i8 scales[16]][f16 d] = 210 bytes, 256 elements. The i8 scale
+// covers 16 elements, so the 32-block splits into two dp4a groups (words 0..3 / 4..7): f0 = d·sc0,
+// f1 = d·sc1. The 6-bit q re-biases to signed (q−32) at pack time — no min/Σa term.
+int sgn8(uint b) { return int(b) - ((b > 127u) ? 256 : 0); }
+
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 256u) * 210u;
+    uint p0 = gelem % 256u;
+    float d = f16tof32(ru16(bd + 208u));
+    uint hf = p0 / 128u; uint og = (p0 % 128u) / 32u;
+    uint qho = hf * 32u; uint scbase = bd + 192u + hf * 8u + 2u * og;
+    bool high = og >= 2u; uint qshift = og * 2u;
+    uint qoff = bd + hf * 64u + (((og & 1u) == 1u) ? 32u : 0u); // ql half (qa/qb) once
+    for (uint j = 0u; j < 8u; j++) {
+        uint w = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint base = rb(qoff + j * 4u + b);
+            uint qh = rb(bd + 128u + qho + j * 4u + b);
+            uint nib = high ? (base >> 4u) : (base & 0xFu);
+            uint q = nib | (((qh >> qshift) & 3u) << 4u);
+            w |= ((q - 32u) & 0xFFu) << (b * 8u); // two's-complement signed byte
+        }
+        qp[j] = w;
+    }
+    f0 = d * float(sgn8(rb(scbase)));
+    f1 = d * float(sgn8(rb(scbase + 1u)));
+}
+#endif
+
+void main() {
+    uint o0 = gl_WorkGroupID.x * 2u;
+    uint t = gl_LocalInvocationID.x;
+    uint nsub = pc.in_f / 32u;
+    uint in_fw = pc.in_f >> 2u;      // activation row stride in packed u32 words
+    uint wb0 = pc.w_base + o0 * pc.in_f;
+    bool has1 = (o0 + 1u) < pc.out_f; // workgroup-uniform tail guard (odd out_f)
+    float acc0[MR];
+    float acc1[MR];
+    for (uint r = 0u; r < MR; r++) { acc0[r] = 0.0; acc1[r] = 0.0; }
+    for (uint s = t; s < nsub; s += 64u) {
+        uint qp0[8]; float a0; float b0;
+        wdec(wb0 + s * 32u, qp0, a0, b0);
+        uint qp1[8]; float a1 = 0.0; float b1 = 0.0;
+        if (has1) { wdec(wb0 + pc.in_f + s * 32u, qp1, a1, b1); }
+        for (uint r = 0u; r < MR; r++) {
+            if (r < pc.rows) {
+                float da = float(dact[r * nsub + s]);
+                float sa = float(sact[r * nsub + s]);
+                uint qb = r * in_fw + s * 8u;
+#ifdef FMT_Q4K
+                int dp0 = 0; int dp1 = 0;
+                for (uint j = 0u; j < 8u; j++) {
+                    int w = int(qa[qb + j]);
+                    dp0 = dotPacked4x8AccSatEXT(int(qp0[j]), w, dp0);
+                    if (has1) { dp1 = dotPacked4x8AccSatEXT(int(qp1[j]), w, dp1); }
+                }
+                acc0[r] += a0 * da * float(dp0) - b0 * sa;
+                if (has1) { acc1[r] += a1 * da * float(dp1) - b1 * sa; }
+#else
+                // Q6_K: split dot per 16-elem scale group (words 0..3 / 4..7); no min term.
+                int dp0a = 0; int dp0b = 0; int dp1a = 0; int dp1b = 0;
+                for (uint j = 0u; j < 4u; j++) {
+                    int w = int(qa[qb + j]);
+                    dp0a = dotPacked4x8AccSatEXT(int(qp0[j]), w, dp0a);
+                    if (has1) { dp1a = dotPacked4x8AccSatEXT(int(qp1[j]), w, dp1a); }
+                }
+                for (uint j = 4u; j < 8u; j++) {
+                    int w = int(qa[qb + j]);
+                    dp0b = dotPacked4x8AccSatEXT(int(qp0[j]), w, dp0b);
+                    if (has1) { dp1b = dotPacked4x8AccSatEXT(int(qp1[j]), w, dp1b); }
+                }
+                acc0[r] += da * (a0 * float(dp0a) + b0 * float(dp0b));
+                if (has1) { acc1[r] += da * (a1 * float(dp1a) + b1 * float(dp1b)); }
+#endif
+            }
+        }
+    }
+    for (uint r = 0u; r < MR; r++) {
+        if (r < pc.rows) {
+            float s0 = subgroupAdd(acc0[r]);
+            float s1 = subgroupAdd(acc1[r]);
+            if (subgroupElect()) {
+                part[r * MAX_SG + gl_SubgroupID] = s0;
+                part[(MR + r) * MAX_SG + gl_SubgroupID] = s1;
+            }
+        }
+    }
+    barrier();
+    if (t < pc.rows) {
+        float t0 = 0.0;
+        float t1 = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; s++) {
+            t0 += part[t * MAX_SG + s];
+            t1 += part[(MR + t) * MAX_SG + s];
+        }
+        y_buf[t * pc.out_f + o0] = t0;
+        if (has1) { y_buf[t * pc.out_f + o0 + 1u] = t1; }
+    }
+}

@@ -38,7 +38,10 @@ anyhow = "1"
 half = "2"
 bytemuck = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: chat templates `tojson` the request's tool definitions into the prompt — HF
+# transformers and llama.cpp-minja both keep the author's key order, so infr must too (BTreeMap
+# would alphabetize the JSON the model sees).
+serde_json = { version = "1", features = ["preserve_order"] }
 memmap2 = "0.9"
 rayon = "1"
 tokio = { version = "1", features = ["full"] }
@@ -48,8 +51,11 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 clap_complete_nushell = "4"
 clap_mangen = "0.3"
-minijinja = "2"
+# preserve_order: see serde_json below — template values must keep map key order end-to-end.
+minijinja = { version = "2", features = ["preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+# `strftime_now` in HF chat templates (Llama-3.x stamps "Today Date:") — llama.cpp-minja parity.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ash = "0.38"

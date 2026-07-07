@@ -221,7 +221,13 @@ impl OaiRenderer {
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
         infr_chat::render_chat_oai(&self.gguf, &self.tokenizer, self.eos, messages, tools, true)
-            .ok_or_else(no_template_err)
+            .map_err(|e| match e {
+                // No embedded template at all → the standard "infr requires an instruct model" error.
+                infr_chat::TemplateError::NoTemplate => no_template_err(),
+                // The template EXISTS but failed to render → surface the actual jinja error so
+                // serve's 500 body says what broke (not a generic "no usable template").
+                e @ infr_chat::TemplateError::Render(_) => anyhow::anyhow!("{e}"),
+            })
     }
 
     /// Build the FORCED tool-call grammar constraint for this model's tokenizer (see

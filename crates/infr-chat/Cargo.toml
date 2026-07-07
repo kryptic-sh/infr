@@ -11,4 +11,6 @@ infr-gguf.workspace = true
 tokenizers.workspace = true
 minijinja.workspace = true
 minijinja-contrib.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true

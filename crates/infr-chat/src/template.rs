@@ -10,6 +10,29 @@ use tokenizers::Tokenizer;
 
 use crate::ChatMessage;
 
+/// Why a chat-template render failed — so serve/CLI callers can surface the ACTUAL jinja error
+/// (e.g. a template construct the renderer doesn't support) instead of a generic "no template".
+#[derive(Debug)]
+pub enum TemplateError {
+    /// The GGUF has no `tokenizer.chat_template` metadata at all.
+    NoTemplate,
+    /// The embedded template failed to parse or render (the minijinja error says why).
+    Render(minijinja::Error),
+}
+
+impl std::fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TemplateError::NoTemplate => {
+                write!(f, "model GGUF has no `tokenizer.chat_template`")
+            }
+            TemplateError::Render(e) => write!(f, "chat template failed to render: {e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for TemplateError {}
+
 /// THE jinja chat renderer — turns `(role, content)` messages into a prompt via the GGUF's embedded
 /// `tokenizer.chat_template`. Template handling (pycompat, `enable_thinking`, bos/eos, tools) lives
 /// here so every caller (single-turn, multi-turn, CPU + GPU backends) shares it. Returns `None` if
@@ -33,6 +56,7 @@ pub fn render_chat_jinja(
         Value::Null,
         add_generation_prompt,
     )
+    .ok()
 }
 
 /// Render OpenAI-shaped [`ChatMessage`]s (full multi-turn history WITH tool calls + results) plus an
@@ -43,6 +67,9 @@ pub fn render_chat_jinja(
 /// `tools` is the request's OpenAI `tools` array (`[{type:"function", function:{name, parameters}}]`)
 /// or `None`. Assistant `tool_calls` are emitted as `{type:"function", function:{name, arguments}}`
 /// with `arguments` as a JSON object (templates `| tojson` it).
+///
+/// Errors carry the real cause ([`TemplateError`]) so serve can return the render error message
+/// instead of a bare 500.
 pub fn render_chat_oai(
     gguf: &Gguf,
     tokenizer: &Tokenizer,
@@ -50,7 +77,7 @@ pub fn render_chat_oai(
     messages: &[ChatMessage],
     tools: Option<&Value>,
     add_generation_prompt: bool,
-) -> Option<String> {
+) -> Result<String, TemplateError> {
     let msgs: Vec<Value> = messages.iter().map(message_to_json).collect();
     let tools = tools.cloned().unwrap_or(Value::Null);
     render_core(gguf, tokenizer, eos, msgs, tools, add_generation_prompt)
@@ -83,9 +110,8 @@ fn message_to_json(m: &ChatMessage) -> Value {
     Value::Object(obj)
 }
 
-/// Core renderer: set up the minijinja env (pycompat, `raise_exception`, `tojson`), bind the prompt
-/// context (`messages`, `tools`, bos/eos, `enable_thinking`), and render. Shared by every entry
-/// point so template handling lives in ONE place.
+/// Core renderer over a GGUF: pull the template + bos/eos out of the metadata, then delegate to
+/// [`render_template`]. Shared by every entry point so template handling lives in ONE place.
 fn render_core(
     gguf: &Gguf,
     tokenizer: &Tokenizer,
@@ -93,8 +119,11 @@ fn render_core(
     msgs: Vec<Value>,
     tools: Value,
     add_generation_prompt: bool,
-) -> Option<String> {
-    let template = gguf.metadata().str("tokenizer.chat_template")?;
+) -> Result<String, TemplateError> {
+    let template = gguf
+        .metadata()
+        .str("tokenizer.chat_template")
+        .ok_or(TemplateError::NoTemplate)?;
     let bos_id = gguf
         .metadata()
         .get("tokenizer.ggml.bos_token_id")
@@ -102,6 +131,51 @@ fn render_core(
         .unwrap_or(2) as u32;
     let bos = tokenizer.id_to_token(bos_id).unwrap_or_default();
     let eos_s = tokenizer.id_to_token(eos).unwrap_or_default();
+    // Thinking is ON by default for every model whose template supports it — the key is simply
+    // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5)
+    // then behave the same under `infr run`/`serve` regardless of what their template's own
+    // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
+    // INFR_NO_THINK=1 turns thinking off (INFR_NO_THINK=0 is a no-op, matching the other INFR_NO_*
+    // toggles).
+    let think = !std::env::var("INFR_NO_THINK").is_ok_and(|v| v != "0");
+    match render_template(
+        template,
+        msgs,
+        tools,
+        &bos,
+        &eos_s,
+        add_generation_prompt,
+        think,
+    ) {
+        Ok(s) => {
+            if std::env::var("INFR_DEBUG_CHAT").is_ok() {
+                eprintln!("[chat-template] rendered:\n{s}\n[/chat-template]");
+            }
+            Ok(s)
+        }
+        Err(e) => {
+            if std::env::var("INFR_DEBUG_CHAT").is_ok() {
+                eprintln!("[chat-template] render error: {e:#}");
+            }
+            Err(TemplateError::Render(e))
+        }
+    }
+}
+
+/// Render a raw chat-template STRING with the full infr jinja environment (pycompat,
+/// `raise_exception`, `tojson` with `indent=`, `strftime_now`) and prompt context (`messages`,
+/// `tools`, bos/eos, `enable_thinking`). This is the GGUF-free seam — [`render_core`] wraps it, and
+/// template-compat regression tests feed known templates (e.g. Llama-3.x) straight through it.
+#[allow(clippy::too_many_arguments)]
+pub fn render_template(
+    template: &str,
+    msgs: Vec<Value>,
+    tools: Value,
+    bos_token: &str,
+    eos_token: &str,
+    add_generation_prompt: bool,
+    enable_thinking: bool,
+) -> Result<String, minijinja::Error> {
     let mut env = minijinja::Environment::new();
     // HF chat templates lean on Python str/dict/list methods (`.get`, `.items`, `.strip`, …) that
     // minijinja core doesn't implement — pycompat supplies them (e.g. gemma4's tool-calling template).
@@ -115,44 +189,50 @@ fn render_core(
             ))
         },
     );
-    env.add_filter("tojson", |v: minijinja::Value| {
-        serde_json::to_string(&v).unwrap_or_else(|_| "null".to_owned())
+    // `strftime_now(format)` — llama.cpp-minja parity: Llama-3.x templates stamp
+    // `Today Date: {{ strftime_now("%d %b %Y") }}` (guarded by `is defined`, so defining it
+    // switches those templates from their hardcoded fallback date to the real one).
+    env.add_function("strftime_now", |fmt: String| {
+        chrono::Local::now().format(&fmt).to_string()
     });
-    if let Err(e) = env.add_template("chat", template) {
-        if std::env::var("INFR_DEBUG_CHAT").is_ok() {
-            eprintln!("[chat-template] parse error: {e:#}");
-        }
-        return None;
-    }
-    let tmpl = env.get_template("chat").ok()?;
+    // `tojson` with the optional `indent=` kwarg (Llama-3.x uses `tojson(indent=4)` for the tool
+    // definitions; Qwen-family uses the bare compact form). Not minijinja's built-in `json` filter:
+    // that one HTML-escapes (`<` → `<`), which llama.cpp/HF renders don't.
+    env.add_filter(
+        "tojson",
+        |v: minijinja::Value,
+         kwargs: minijinja::value::Kwargs|
+         -> Result<String, minijinja::Error> {
+            let indent: Option<usize> = kwargs.get("indent")?;
+            kwargs.assert_all_used()?;
+            let out = match indent {
+                Some(n) => {
+                    let pad = " ".repeat(n);
+                    let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+                    let mut buf = Vec::new();
+                    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+                    serde::Serialize::serialize(&v, &mut ser)
+                        .ok()
+                        .and_then(|()| String::from_utf8(buf).ok())
+                }
+                None => serde_json::to_string(&v).ok(),
+            };
+            // Unserializable values degrade to "null" (pre-existing lenient behavior).
+            Ok(out.unwrap_or_else(|| "null".to_owned()))
+        },
+    );
+    env.add_template("chat", template)?;
+    let tmpl = env
+        .get_template("chat")
+        .expect("template was just added under this name");
     let mut ctx = serde_json::Map::new();
     ctx.insert("messages".into(), Value::Array(msgs));
     ctx.insert("tools".into(), tools);
     ctx.insert("add_generation_prompt".into(), add_generation_prompt.into());
-    ctx.insert("bos_token".into(), bos.into());
-    ctx.insert("eos_token".into(), eos_s.into());
-    // Thinking is ON by default for every model whose template supports it — the key is simply
-    // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5)
-    // then behave the same under `infr run`/`serve` regardless of what their template's own
-    // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
-    // INFR_NO_THINK=1 turns thinking off (INFR_NO_THINK=0 is a no-op, matching the other INFR_NO_*
-    // toggles).
-    let think = !std::env::var("INFR_NO_THINK").is_ok_and(|v| v != "0");
-    ctx.insert("enable_thinking".into(), think.into());
-    match tmpl.render(serde_json::Value::Object(ctx)) {
-        Ok(s) => {
-            if std::env::var("INFR_DEBUG_CHAT").is_ok() {
-                eprintln!("[chat-template] rendered:\n{s}\n[/chat-template]");
-            }
-            Some(s)
-        }
-        Err(e) => {
-            if std::env::var("INFR_DEBUG_CHAT").is_ok() {
-                eprintln!("[chat-template] render error: {e:#}");
-            }
-            None
-        }
-    }
+    ctx.insert("bos_token".into(), bos_token.into());
+    ctx.insert("eos_token".into(), eos_token.into());
+    ctx.insert("enable_thinking".into(), enable_thinking.into());
+    tmpl.render(serde_json::Value::Object(ctx))
 }
 
 /// Single user turn through [`render_chat_jinja`] (`add_generation_prompt=true`). Shared by the GPU

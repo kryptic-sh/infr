@@ -172,6 +172,22 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Stamp a GEMV-class op: with INFR_PROF2_SHAPES set (on top of INFR_PROF2), the label
+    /// itemizes route + shape (`kind:mM:in_fxout_f` — e.g. `mmvr:m4:1536x24576`), splitting the
+    /// otherwise-monolithic "lm_head" bucket per kernel and per projection shape. This is what
+    /// made the E2B pp4 63%-GEMV attribution actionable (llama.cpp's perf logger itemizes per
+    /// shape; the flat bucket didn't). The labels leak one small string per op per record —
+    /// profiling-only, gated off in production.
+    fn stamp_gemv(&self, kind: &'static str, rows: usize, in_f: usize, out_f: usize) {
+        if self.prof2 && std::env::var("INFR_PROF2_SHAPES").is_ok() {
+            let s: &'static str =
+                Box::leak(format!("{kind}:m{rows}:{in_f}x{out_f}").into_boxed_str());
+            self.stamp(s);
+        } else {
+            self.stamp("lm_head");
+        }
+    }
+
     /// Create one descriptor pool tranche (the chain grows by these on exhaustion).
     fn new_desc_pool(device: &ash::Device) -> Result<vk::DescriptorPool> {
         let pool_sizes = [vk::DescriptorPoolSize {
@@ -459,7 +475,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("lm_head");
+        self.stamp_gemv("lin_f16", rows, in_f, out_f);
         let k = self
             .be
             .kernel("linear_f16", crate::gemm::linear_f16_spv(), 3, 12);
@@ -490,13 +506,31 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("lm_head");
+        self.stamp_gemv("lin_f32", rows, in_f, out_f);
         // Prefill (rows>1): the ROW-TILED f32 GEMM reads each weight once per 8 rows (grid
         // out_f·ceil(rows/8)) instead of once per row — bit-identical, cuts the F32-projection
         // weight re-reads (E2B inp_gate/proj, qwen3moe router). Decode (rows==1) keeps the 1-row
         // kernel. INFR_NO_F32_MROW forces the 1-row path (A/B).
         let use_mrow = rows > 1 && std::env::var("INFR_NO_F32_MROW").is_err();
-        let (name, spv, groups) = if use_mrow {
+        // vec4 K-stream variants (in_f % 4 == 0): the small-m f32 projections launch only
+        // out_f workgroups (E2B inp_gate 1536×256 = 256 wgs ≈ 2.6 waves/CU on a 7900 XTX) —
+        // latency-bound, so 4x fewer load round trips is the lever. MROW=4 for rows<=4 (half
+        // the idle acc lanes), MROW=8 above. vec4-lane accumulation is NOT bit-identical to
+        // the scalar kernels; INFR_NO_F32_V4 forces the scalar mrow8 (A/B).
+        let use_v4 = use_mrow && in_f.is_multiple_of(4) && std::env::var("INFR_NO_F32_V4").is_err();
+        let (name, spv, groups) = if use_v4 && rows <= 4 {
+            (
+                "linear_f32r_mrow4_v4",
+                crate::gemm::linear_f32r_mrow4_v4_spv(),
+                (out_f * rows.div_ceil(4)) as u32,
+            )
+        } else if use_v4 {
+            (
+                "linear_f32r_mrow8_v4",
+                crate::gemm::linear_f32r_mrow8_v4_spv(),
+                (out_f * rows.div_ceil(8)) as u32,
+            )
+        } else if use_mrow {
             (
                 "linear_f32r_mrow8",
                 crate::gemm::linear_f32r_mrow8_spv(),
@@ -965,7 +999,7 @@ impl<'a> Recorder<'a> {
         bits: u32,
         blk_shift: u32,
     ) {
-        self.stamp("lm_head");
+        self.stamp_gemv("lin_q", rows, in_f, out_f);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -1031,7 +1065,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("lm_head");
+        self.stamp_gemv("gemv", rows, in_f, out_f);
         let name = crate::linear::native_kernel_name(dtype, false);
         let spv = crate::gemm::native_build_spv(dtype, false).expect("native GEMV spv");
         let k = self.be.kernel(name, spv, 3, 16);
@@ -1068,7 +1102,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         debug_assert!((2..=8).contains(&rows));
-        self.stamp("lm_head");
+        self.stamp_gemv("mrow", rows, in_f, out_f);
         let name = crate::gemm::native_mrow_kernel_name(dtype);
         let spv = crate::gemm::native_mrow_build_spv(dtype).expect("native mrow spv");
         let k = self.be.kernel(name, spv, 3, 16);
@@ -1106,9 +1140,22 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         debug_assert!((2..=8).contains(&rows));
-        self.stamp("lm_head");
-        let name = crate::gemm::native_mmv_mrow_kernel_name(dtype);
-        let spv = crate::gemm::native_mmv_mrow_build_spv(dtype).expect("native mmv mrow spv");
+        self.stamp_gemv("mmvr", rows, in_f, out_f);
+        // Small-in_f shape (in_f < 2048 → fewer than 64 32-elem sub-blocks): the 2-output wg
+        // leaves 64−nsub lanes idle (E2B's in_f=1536: 25% dead, single loop iteration) — the
+        // OUTS4 variant splits the wg 4 outputs × 16 K-lanes so every lane stays on a sub-block.
+        // INFR_NO_MMV_O4 forces the 2-output layout (A/B).
+        let o4 = in_f < 2048 && std::env::var("INFR_NO_MMV_O4").is_err();
+        // rows<=4 MR specialization: the MR=8 per-sub-block row loop runs half dead at the pp4
+        // serve shape — -DMRV=4 halves it (and the acc registers). INFR_NO_MMV_M4 forces MR=8
+        // (A/B). o4+m4 together (with the uvec4 activation loads): E2B pp4@d4096 1536x24576
+        // 37.8 → 34.7us/op, pp4 467.6 → 474.9 t/s vs both escapes set — modest; the shape is
+        // ~600 GB/s and mostly weight-stream bound, o4 alone measured neutral.
+        let m4 = rows <= 4 && std::env::var("INFR_NO_MMV_M4").is_err();
+        let name = crate::gemm::native_mmv_mrow_variant_name(dtype, o4, m4);
+        let spv =
+            crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4).expect("native mmv mrow spv");
+        let groups = (out_f as u32).div_ceil(if o4 { 4 } else { 2 });
         let k = self.be.kernel(name, spv, 5, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
@@ -1126,7 +1173,7 @@ impl<'a> Recorder<'a> {
             ],
             1,
             &push,
-            (out_f as u32).div_ceil(2),
+            groups,
         );
     }
 
@@ -1214,7 +1261,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("lm_head");
+        self.stamp_gemv("mmv", 1, in_f, out_f);
         let name = crate::gemm::native_mmv_kernel_name(dtype, false);
         let spv = crate::gemm::native_mmv_build_spv(dtype, false).expect("native mmv spv");
         let k = self.be.kernel(name, spv, 5, 16);
@@ -3889,7 +3936,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("lm_head");
+        self.stamp_gemv("gemv_id", rows, in_f, out_f);
         let name = crate::linear::native_id_kernel_name(dtype).expect("native id kernel");
         let spv = crate::gemm::native_id_build_spv(dtype).expect("native id spv");
         let k = self.be.kernel(name, spv, 4, 20);

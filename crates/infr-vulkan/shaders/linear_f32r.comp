@@ -6,11 +6,58 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; } pc;
+#ifdef VEC4
+layout(binding = 0) readonly buffer WB { vec4 w[]; };      // [out, in/4] f32 vec4
+layout(binding = 1) readonly buffer XB { vec4 x[]; };      // [rows, in/4]
+#else
 layout(binding = 0) readonly buffer WB { float w[]; };     // [out, in] f32
 layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
+#endif
 layout(binding = 2) buffer YB { float y[]; };              // [rows, out]
 
-#ifdef MROW
+#if defined(MROW) && defined(VEC4)
+// vec4 row-tiled prefill GEMM: same wg mapping as MROW below (one output column × MROW rows,
+// grid = out_f·ceil(rows/MROW)) but the K stream is vec4 loads (requires in_f % 4 == 0). The
+// small-m f32 projections (E2B per-layer inp_gate/proj, 1536×256) launch only out_f workgroups
+// (~2.6 waves/CU on a 7900 XTX) — latency-bound, so 4x fewer round trips is the lever (measured
+// 25.7 → single-digit us/op at m=4). Accumulates in vec4 lanes + a pairwise horizontal add, so
+// NOT bit-identical to the scalar kernels (f32 tolerance-level shift only).
+shared float red[64 * MROW];
+
+void main() {
+    uint nv = pc.in_f / 4u;
+    uint o = gl_WorkGroupID.x % pc.out_f;
+    uint r0 = (gl_WorkGroupID.x / pc.out_f) * uint(MROW);
+    uint t = gl_LocalInvocationID.x;
+    uint wbase = o * nv;
+    vec4 acc[MROW];
+    for (uint j = 0u; j < uint(MROW); j++) { acc[j] = vec4(0.0); }
+    for (uint i = t; i < nv; i += 64u) {
+        vec4 wv = w[wbase + i];
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.rows) { acc[j] += wv * x[r * nv + i]; }
+        }
+    }
+    for (uint j = 0u; j < uint(MROW); j++) {
+        vec4 a = acc[j];
+        red[j * 64u + t] = (a.x + a.y) + (a.z + a.w);
+    }
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) {
+            for (uint j = 0u; j < uint(MROW); j++) { red[j * 64u + t] += red[j * 64u + t + stride]; }
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        for (uint j = 0u; j < uint(MROW); j++) {
+            uint r = r0 + j;
+            if (r < pc.rows) { y[r * pc.out_f + o] = red[j * 64u]; }
+        }
+    }
+}
+#elif defined(MROW)
 // Row-tiled prefill GEMM: one workgroup = one output column × MROW rows. Each weight element w[o,i]
 // is read ONCE by thread t and reused across all MROW rows, so the per-row weight re-read of the
 // 1-row kernel (grid = rows·out_f) drops to weight-once-per-MROW-rows (grid = out_f·ceil(rows/MROW)).

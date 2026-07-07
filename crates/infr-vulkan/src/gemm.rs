@@ -239,6 +239,55 @@ pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> &'static s
         _ => unreachable!("native_mmv_mrow_kernel_name: gated by native_mmv_mrow_build_spv"),
     }
 }
+/// SPIR-V for a multi-row int8 dp4a GEMV layout variant: `o4` = the small-in_f 4-outputs ×
+/// 16-K-lanes workgroup split (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4) — see
+/// `Recorder::linear_mmv_mrow`'s gates.
+pub(crate) fn native_mmv_mrow_variant_spv(
+    dtype: infr_core::DType,
+    o4: bool,
+    m4: bool,
+) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match (dtype, o4, m4) {
+        (Q4K, false, false) => v!("native_mmv_mrow_q4k"),
+        (Q4K, false, true) => v!("native_mmv_mrow_q4k_m4"),
+        (Q4K, true, false) => v!("native_mmv_mrow_q4k_o4"),
+        (Q4K, true, true) => v!("native_mmv_mrow_q4k_o4_m4"),
+        (Q6K, false, false) => v!("native_mmv_mrow_q6k"),
+        (Q6K, false, true) => v!("native_mmv_mrow_q6k_m4"),
+        (Q6K, true, false) => v!("native_mmv_mrow_q6k_o4"),
+        (Q6K, true, true) => v!("native_mmv_mrow_q6k_o4_m4"),
+        _ => return None,
+    })
+}
+/// Kernel-cache name for a multi-row int8 dp4a GEMV layout variant.
+pub(crate) fn native_mmv_mrow_variant_name(
+    dtype: infr_core::DType,
+    o4: bool,
+    m4: bool,
+) -> &'static str {
+    use infr_core::DType::*;
+    match (dtype, o4, m4) {
+        (Q4K, false, false) => "native_mmv_mrow_q4k",
+        (Q4K, false, true) => "native_mmv_mrow_q4k_m4",
+        (Q4K, true, false) => "native_mmv_mrow_q4k_o4",
+        (Q4K, true, true) => "native_mmv_mrow_q4k_o4_m4",
+        (Q6K, false, false) => "native_mmv_mrow_q6k",
+        (Q6K, false, true) => "native_mmv_mrow_q6k_m4",
+        (Q6K, true, false) => "native_mmv_mrow_q6k_o4",
+        (Q6K, true, true) => "native_mmv_mrow_q6k_o4_m4",
+        _ => unreachable!("native_mmv_mrow_variant_name: gated by native_mmv_mrow_build_spv"),
+    }
+}
 /// Kernel-cache name for the int8 dp4a decode GEMV.
 pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> &'static str {
     use infr_core::DType::*;
@@ -1111,6 +1160,29 @@ pub(crate) fn linear_f32r_mrow8_spv() -> &'static [u32] {
         spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/linear_f32r_mrow8.spv"
+        )))
+    })
+}
+/// SPIR-V for the vec4 ROW-TILED f32 GEMM (4 rows/workgroup, vec4 K stream — the small-m
+/// prefill shape; requires in_f % 4 == 0). vec4-lane accumulation → NOT bit-identical to the
+/// scalar kernels (f32 tolerance-level shift).
+pub(crate) fn linear_f32r_mrow4_v4_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/linear_f32r_mrow4_v4.spv"
+        )))
+    })
+}
+/// SPIR-V for the vec4 ROW-TILED f32 GEMM, 8 rows/workgroup (chunked-prefill rows>4 shape;
+/// requires in_f % 4 == 0). Same vec4 accumulation caveat as the 4-row variant.
+pub(crate) fn linear_f32r_mrow8_v4_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/linear_f32r_mrow8_v4.spv"
         )))
     })
 }

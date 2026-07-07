@@ -205,6 +205,16 @@ fn main() {
         ("linear_f32", "linear_f32", &[]),
         ("linear_f32r", "linear_f32r", &[]),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
+        (
+            "linear_f32r",
+            "linear_f32r_mrow4_v4",
+            &["-DMROW=4", "-DVEC4"],
+        ),
+        (
+            "linear_f32r",
+            "linear_f32r_mrow8_v4",
+            &["-DMROW=8", "-DVEC4"],
+        ),
         ("matmul_f32", "matmul_f32", &[]),
         ("linear_q", "linear_q", &[]),
         ("linear_res", "linear_res", &[]),
@@ -427,7 +437,37 @@ fn main() {
         ),
         // Multi-row int8 dp4a GEMV (m=2..8): weight sub-block unpacked once, dp4a per row.
         ("native_mmv_mrow", "native_mmv_mrow_q4k", &["-DFMT_Q4K"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_m4",
+            &["-DFMT_Q4K", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_m4",
+            &["-DFMT_Q6K", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_o4_m4",
+            &["-DFMT_Q4K", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_o4_m4",
+            &["-DFMT_Q6K", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_o4",
+            &["-DFMT_Q4K", "-DOUTS4"],
+        ),
         ("native_mmv_mrow", "native_mmv_mrow_q6k", &["-DFMT_Q6K"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_o4",
+            &["-DFMT_Q6K", "-DOUTS4"],
+        ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),
         (

@@ -24,12 +24,20 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // Same push layout as native_gemv/native_mmv (w_base = element offset for fused-QKV slices).
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
 layout(binding = 0) readonly buffer WB { uint nw[]; };          // raw GGUF weight bytes (padded u32)
-layout(binding = 1) readonly buffer QA { uint qa[]; };          // int8 activations, packed 4/u32 [m, in_f/4]
+// int8 activations as uvec4 (in_f % 32 == 0 -> every sub-block is two aligned uvec4s): 2 wide
+// loads per (row, sub-block) instead of 8 scalar u32 ones - the inner loop is load-issue heavy
+// (8 qa loads + 8 dp4a per row per output).
+layout(binding = 1) readonly buffer QA { uvec4 qa4[]; };        // int8 activations [m, in_f/16]
 layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [m, nblk]
 layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [m, nblk]
 layout(binding = 4) buffer YB { float y_buf[]; };
 
-const uint MR = 8u;
+// Row-tile cap: -DMRV=4 builds the rows<=4 specialization (half the dead per-sub-block row
+// iterations + acc registers at the pp4-at-depth serve shape); default 8 covers rows 5..8.
+#ifndef MRV
+#define MRV 8
+#endif
+const uint MR = uint(MRV);
 const uint MAX_SG = 8u;                  // 64 threads / min 8-wide subgroup
 shared float part[2u * MR * MAX_SG];     // one partial per (output, row, subgroup)
 
@@ -57,15 +65,13 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uvec2 km = k4(sub, bd + 4u);
     f0 = d * float(km.x);
     f1 = dmin * float(km.y);
-    uint qbase = bd + 16u + (sub >> 1u) * 32u;
+    // qbase is always word-aligned (bd = sb·144, 144 % 4 == 0; +16 +32·k) — load each 4-byte
+    // quant word ONCE and nibble-mask it packed (vs 4 rb() byte loads + shifts per word).
+    uint qword = (bd + 16u + (sub >> 1u) * 32u) >> 2u;
     bool lo = (sub & 1u) == 0u;
     for (uint j = 0u; j < 8u; j++) {
-        uint w = 0u;
-        for (uint b = 0u; b < 4u; b++) {
-            uint qbyte = rb(qbase + j * 4u + b);
-            w |= (lo ? (qbyte & 0xFu) : (qbyte >> 4u)) << (b * 8u);
-        }
-        qp[j] = w;
+        uint w = nw[qword + j];
+        qp[j] = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
     }
 }
 #endif
@@ -100,11 +106,85 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 }
 #endif
 
+#ifdef OUTS4
+// Small-in_f shape (-DOUTS4, host-gated to in_f < 2048): 4 outputs × 16 K-lanes per workgroup
+// (grid = ceil(out_f/4)). The 2-output layout leaves 64 − nsub lanes IDLE when nsub < 64 (E2B's
+// in_f=1536 gate_up: 48 sub-blocks → 25% of the wg dead, one loop iteration); splitting the wg
+// 4×16 keeps every lane on a sub-block. Reduction: shared tree over each output's 16 lanes.
+shared float part4[4u * MR * 16u];   // [out, row, lane]
+
+void main() {
+    uint o0 = gl_WorkGroupID.x * 4u;
+    uint t = gl_LocalInvocationID.x;
+    uint ot = t >> 4u;               // which of the 4 outputs this lane serves
+    uint sl = t & 15u;               // K sub-lane within the output's 16
+    uint nsub = pc.in_f / 32u;
+    uint in_fq = pc.in_f >> 4u;      // activation row stride in packed uvec4s
+    bool live = (o0 + ot) < pc.out_f; // per-output tail guard (out_f % 4)
+    uint wb = pc.w_base + (o0 + (live ? ot : 0u)) * pc.in_f;
+    float acc[MR];
+    for (uint r = 0u; r < MR; r++) { acc[r] = 0.0; }
+    for (uint s = sl; s < nsub; s += 16u) {
+        uint qp[8]; float f0; float f1;
+        wdec(wb + s * 32u, qp, f0, f1);
+        for (uint r = 0u; r < MR; r++) {
+            if (r < pc.rows) {
+                float da = float(dact[r * nsub + s]);
+                float sa = float(sact[r * nsub + s]);
+                uint qb = r * in_fq + s * 2u;
+                uvec4 a0 = qa4[qb];
+                uvec4 a1 = qa4[qb + 1u];
+#ifdef FMT_Q4K
+                int dp = 0;
+                dp = dotPacked4x8AccSatEXT(int(qp[0]), int(a0.x), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[1]), int(a0.y), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[2]), int(a0.z), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[3]), int(a0.w), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[4]), int(a1.x), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[5]), int(a1.y), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[6]), int(a1.z), dp);
+                dp = dotPacked4x8AccSatEXT(int(qp[7]), int(a1.w), dp);
+                acc[r] += f0 * da * float(dp) - f1 * sa;
+#else
+                // Q6_K: split dot per 16-elem scale group (uvec4 a0 / a1); no min term.
+                int dpa = 0; int dpb = 0;
+                dpa = dotPacked4x8AccSatEXT(int(qp[0]), int(a0.x), dpa);
+                dpa = dotPacked4x8AccSatEXT(int(qp[1]), int(a0.y), dpa);
+                dpa = dotPacked4x8AccSatEXT(int(qp[2]), int(a0.z), dpa);
+                dpa = dotPacked4x8AccSatEXT(int(qp[3]), int(a0.w), dpa);
+                dpb = dotPacked4x8AccSatEXT(int(qp[4]), int(a1.x), dpb);
+                dpb = dotPacked4x8AccSatEXT(int(qp[5]), int(a1.y), dpb);
+                dpb = dotPacked4x8AccSatEXT(int(qp[6]), int(a1.z), dpb);
+                dpb = dotPacked4x8AccSatEXT(int(qp[7]), int(a1.w), dpb);
+                acc[r] += da * (f0 * float(dpa) + f1 * float(dpb));
+#endif
+            }
+        }
+    }
+    for (uint r = 0u; r < MR; r++) {
+        if (r < pc.rows) { part4[(ot * MR + r) * 16u + sl] = acc[r]; }
+    }
+    barrier();
+    for (uint stride = 8u; stride > 0u; stride /= 2u) {
+        if (sl < stride) {
+            for (uint r = 0u; r < MR; r++) {
+                if (r < pc.rows) {
+                    part4[(ot * MR + r) * 16u + sl] += part4[(ot * MR + r) * 16u + sl + stride];
+                }
+            }
+        }
+        barrier();
+    }
+    if (sl < pc.rows && live) {
+        y_buf[sl * pc.out_f + o0 + ot] = part4[(ot * MR + sl) * 16u];
+    }
+}
+#else
 void main() {
     uint o0 = gl_WorkGroupID.x * 2u;
     uint t = gl_LocalInvocationID.x;
     uint nsub = pc.in_f / 32u;
-    uint in_fw = pc.in_f >> 2u;      // activation row stride in packed u32 words
+    uint in_fq = pc.in_f >> 4u;      // activation row stride in packed uvec4s
     uint wb0 = pc.w_base + o0 * pc.in_f;
     bool has1 = (o0 + 1u) < pc.out_f; // workgroup-uniform tail guard (odd out_f)
     float acc0[MR];
@@ -119,13 +199,16 @@ void main() {
             if (r < pc.rows) {
                 float da = float(dact[r * nsub + s]);
                 float sa = float(sact[r * nsub + s]);
-                uint qb = r * in_fw + s * 8u;
+                uint qb = r * in_fq + s * 2u;
+                uvec4 av0 = qa4[qb];
+                uvec4 av1 = qa4[qb + 1u];
+                int aw[8] = int[8](int(av0.x), int(av0.y), int(av0.z), int(av0.w),
+                                   int(av1.x), int(av1.y), int(av1.z), int(av1.w));
 #ifdef FMT_Q4K
                 int dp0 = 0; int dp1 = 0;
                 for (uint j = 0u; j < 8u; j++) {
-                    int w = int(qa[qb + j]);
-                    dp0 = dotPacked4x8AccSatEXT(int(qp0[j]), w, dp0);
-                    if (has1) { dp1 = dotPacked4x8AccSatEXT(int(qp1[j]), w, dp1); }
+                    dp0 = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0);
+                    if (has1) { dp1 = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1); }
                 }
                 acc0[r] += a0 * da * float(dp0) - b0 * sa;
                 if (has1) { acc1[r] += a1 * da * float(dp1) - b1 * sa; }
@@ -133,14 +216,12 @@ void main() {
                 // Q6_K: split dot per 16-elem scale group (words 0..3 / 4..7); no min term.
                 int dp0a = 0; int dp0b = 0; int dp1a = 0; int dp1b = 0;
                 for (uint j = 0u; j < 4u; j++) {
-                    int w = int(qa[qb + j]);
-                    dp0a = dotPacked4x8AccSatEXT(int(qp0[j]), w, dp0a);
-                    if (has1) { dp1a = dotPacked4x8AccSatEXT(int(qp1[j]), w, dp1a); }
+                    dp0a = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0a);
+                    if (has1) { dp1a = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1a); }
                 }
                 for (uint j = 4u; j < 8u; j++) {
-                    int w = int(qa[qb + j]);
-                    dp0b = dotPacked4x8AccSatEXT(int(qp0[j]), w, dp0b);
-                    if (has1) { dp1b = dotPacked4x8AccSatEXT(int(qp1[j]), w, dp1b); }
+                    dp0b = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0b);
+                    if (has1) { dp1b = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1b); }
                 }
                 acc0[r] += da * (a0 * float(dp0a) + b0 * float(dp0b));
                 if (has1) { acc1[r] += da * (a1 * float(dp1a) + b1 * float(dp1b)); }
@@ -170,3 +251,4 @@ void main() {
         if (has1) { y_buf[t * pc.out_f + o0 + 1u] = t1; }
     }
 }
+#endif

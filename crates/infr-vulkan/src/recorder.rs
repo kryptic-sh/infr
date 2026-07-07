@@ -3421,6 +3421,65 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Vocab-scale GPU stochastic sampling for the CHAINED/record-once decode replay (`Op::Sample`
+    /// under `RopeMode::Dynamic`): identical to [`Recorder::sample_topk`], but stage 2 reads its
+    /// uniform draw from the 64-slot `u` ring at `u_buf[params[0] & 63]` instead of `u_buf[0]` —
+    /// the same ring geometry `id_log` keys its ring on, so ONE recording replays correctly whether
+    /// the caller drives it singly (`execute`) or chained (`execute_chain`, N replays/submission),
+    /// consuming the host RNG stream in lockstep with the per-token host sampler either way.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_topk_chain(
+        &self,
+        logits: &dyn Buffer,
+        cand: &dyn Buffer,
+        u: &dyn Buffer,
+        params: &dyn Buffer,
+        out_id: &dyn Buffer,
+        n: usize,
+        top_k: usize,
+        temp: f32,
+        top_p: f32,
+    ) {
+        debug_assert!((2..=Self::SAMPLE_KMAX).contains(&top_k));
+        self.stamp("sample_chain");
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(top_k as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&temp.to_ne_bytes());
+        push[12..16].copy_from_slice(&top_p.to_ne_bytes());
+        let k1 = self.be.kernel(
+            "sample_topk_part",
+            crate::gemm::sample_topk_part_spv(),
+            2,
+            16,
+        );
+        self.dispatch(k1, &[Self::vkb(logits), Self::vkb(cand)], 1, &push, 256);
+        let mut push2 = [0u8; 16];
+        push2[0..4].copy_from_slice(&(256u32 * top_k as u32).to_ne_bytes());
+        push2[4..16].copy_from_slice(&push[4..16]);
+        // Binding order matches sample_topk.comp's CHAIN layout: cand(0), u_buf(1), params(2),
+        // out_id(3) — `params` is a READ so it sits before the write (`dispatch`'s hazard tracker
+        // treats the trailing `n_out` bound buffers as writes).
+        let k2 = self.be.kernel(
+            "sample_topk_chain",
+            crate::gemm::sample_topk_chain_spv(),
+            4,
+            16,
+        );
+        self.dispatch(
+            k2,
+            &[
+                Self::vkb(cand),
+                Self::vkb(u),
+                Self::vkb(params),
+                Self::vkb(out_id),
+            ],
+            1,
+            &push2,
+            1,
+        );
+    }
+
     /// GPU stochastic sampling over `n` logits → token id in `out_id[0]`: temperature + top-k +
     /// top-p (nucleus) via a radix N-ary select, inverse-CDF sampled with the host-drawn uniform `u`.
     /// Requires `2 ≤ top_k ≤ SAMPLE_KMAX`. Only the token reads back — the vocab logits stay in VRAM.

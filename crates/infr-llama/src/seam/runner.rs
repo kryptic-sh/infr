@@ -2898,10 +2898,19 @@ pub(crate) fn generate_dense_backend(
     let dec_ids_buf = be
         .alloc(4, BufferUsage::Staging)
         .map_err(|e| anyhow!("{e}"))?;
-    // GPU stochastic sampling: the per-step host-drawn uniform (`Op::Sample`'s `u` Input).
+    // GPU stochastic sampling: the host-drawn uniform(s) for `Op::Sample`'s `u` Input — a 64-slot
+    // ring (mirrors the chained id-log ring), indexed by `pos & 63` in BOTH the per-token and
+    // chained paths so a record-once recording can be replayed either way (see adapter.rs
+    // `Recorder::sample_topk_chain`). Sized 64*4 unconditionally: the same buffer is bound whether
+    // or not this decode ever actually chains.
     let u_buf = be
-        .alloc(4, BufferUsage::Staging)
+        .alloc(64 * 4, BufferUsage::Staging)
         .map_err(|e| anyhow!("{e}"))?;
+    // Host-side mirror of `u_buf`'s 64 slots. `Backend::upload` has no partial-buffer/offset
+    // form, so setting one slot re-uploads the whole 256 bytes from this mirror — negligible cost.
+    // Positions monotonically increase and are consumed before their slot wraps (mod 64), so no
+    // read ever observes a stale draw from 64 tokens ago within the active window.
+    let mut u_ring_host = [0f32; 64];
     // Chained decode: when the graph both GATHERS from an id input and SAMPLES an id output,
     // bind them to the SAME buffer — within one iteration the gather reads before the sampler
     // writes, and across chained iterations the sampler's id feeds the next gather directly
@@ -3186,7 +3195,17 @@ pub(crate) fn generate_dense_backend(
     // gemma4-E2B can't chain: its per-layer token-embedding rows (`ipl_buf`) are host-gathered
     // per FED token — chained iterations 2..n would read the first token's stale rows. Lifting
     // this needs the per-layer table resident + gathered on-device (task #28 follow-up).
-    let can_chain = gpu_embed && gpu_argmax && ro.is_some() && chain_n >= 2 && ipl_buf.is_none();
+    // Temperature sampling chains too (`gpu_sample`): `Op::Sample`'s `u` ring lets the SAME
+    // recording replay chained — see adapter.rs `Recorder::sample_topk_chain`. The `INFR_NO_GPU_POS`
+    // exclusion matters only here (not for `gpu_argmax`): a decline mid-flight would have already
+    // drawn+uploaded this chunk's uniforms from the host RNG stream, desyncing it from the
+    // per-token fallback's draws for the SAME tokens (argmax draws nothing, so it's harmless there).
+    let can_chain = gpu_embed
+        && (gpu_argmax || gpu_sample)
+        && ro.is_some()
+        && chain_n >= 2
+        && ipl_buf.is_none()
+        && std::env::var("INFR_NO_GPU_POS").is_err();
     let end = prompt.len() + max_new;
     let mut pos = decode_start;
     while pos < end {
@@ -3208,6 +3227,22 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
                 be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
                     .map_err(|e| anyhow!("{e}"))?;
+                // GPU stochastic sampling: draw this chunk's `n` uniforms from the SAME xorshift
+                // stream the per-token path consumes (one per frontier token, in order) and seed
+                // the ring slots the chained replay will read. Replay `j` (1-indexed within this
+                // chunk) feeds the token at sequence position `pos+j-1` (replay 1 feeds THIS
+                // iteration's frontier token, `cur[pos]`, just uploaded above) and its
+                // `params_advance` lands on the adapter's `p0+j` where `p0 = pos-1` (the runner's
+                // `pos` tracks one AHEAD of the device's pre-call `params[0]`, matching
+                // `execute_chain`'s own `p0+1..=p0+n` accounting) — so replay `j`'s ring slot is
+                // `(p0+j)&63 = (pos+j-1)&63`, i.e. slots `pos .. pos+n-1` for `i in 0..n`.
+                if gpu_sample {
+                    for i in 0..n {
+                        u_ring_host[(pos + i) & 63] = crate::sampling::next_uniform(&mut rng);
+                    }
+                    be.upload(u_buf.as_ref(), bytemuck::cast_slice(&u_ring_host))
+                        .map_err(|e| anyhow!("{e}"))?;
+                }
                 let (plan, b) = ro.as_ref().expect("can_chain implies record-once");
                 if let Some(ids) = be
                     .execute_chain(plan.as_ref(), b, n)
@@ -3270,11 +3305,18 @@ pub(crate) fn generate_dense_backend(
         // Only sample once we're past the prompt (decode position = last prompt token onward).
         let is_decode = pos + 1 >= prompt.len();
         // GPU stochastic sampling: draw this step's uniform from the SAME xorshift stream the
-        // host sampler would consume, and hand it to the in-graph Op::Sample (4-byte upload).
-        // Only frontier rows sample, matching the host path's rng consumption exactly.
+        // host sampler would consume. Record-once (`ro.is_some()`, `RopeMode::Dynamic`) seeds the
+        // ring slot `pos & 63` — the in-graph `Op::Sample` reads `u_buf[params[0] & 63]`, matching
+        // the chained fast-path's geometry above, since this iteration's dispatch advances
+        // `params[0]` to `pos` whether it's replayed singly here or folded into an
+        // `execute_chain` chunk (see `Recorder::sample_topk_chain`). The classic per-execute
+        // rebuild (`ro` is `None`, `RopeMode::Static`) has no ring — its kernel always reads
+        // `u_buf[0]`, so pin the write there. Only frontier rows sample, matching the host path's
+        // rng consumption exactly.
         if gpu_sample && is_decode && pos + 1 == cur.len() {
-            let uu = crate::sampling::next_uniform(&mut rng);
-            be.upload(u_buf.as_ref(), &uu.to_le_bytes())
+            let slot = if ro.is_some() { pos & 63 } else { 0 };
+            u_ring_host[slot] = crate::sampling::next_uniform(&mut rng);
+            be.upload(u_buf.as_ref(), bytemuck::cast_slice(&u_ring_host))
                 .map_err(|e| anyhow!("{e}"))?;
         }
         // Sample only at the FRONTIER (this position's token is the newest one fed). A constrained

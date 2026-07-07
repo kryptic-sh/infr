@@ -1758,16 +1758,37 @@ fn lower_op(
             top_p,
         } => {
             let cand = pooled(pool, be_, "sample_cand", 2 * 256 * *top_k as usize * 4)?;
-            rec.sample_topk(
-                r(*x)?,
-                pool[&cand].as_ref(),
-                r(*u)?,
-                r(*dst)?,
-                *n as usize,
-                *top_k as usize,
-                *temp,
-                *top_p,
-            );
+            match mode {
+                // Record-once/self-advancing path (single-shot `execute` OR chained
+                // `execute_chain` — the same recording serves both): `u` is a 64-slot ring keyed
+                // by the self-advancing `params[0]`, matching `id_log`'s ring geometry.
+                RopeMode::Dynamic(params) => {
+                    rec.sample_topk_chain(
+                        r(*x)?,
+                        pool[&cand].as_ref(),
+                        r(*u)?,
+                        *params,
+                        r(*dst)?,
+                        *n as usize,
+                        *top_k as usize,
+                        *temp,
+                        *top_p,
+                    );
+                }
+                // Classic per-execute recording: `u` is the plain 1-float buffer.
+                RopeMode::Static(_) => {
+                    rec.sample_topk(
+                        r(*x)?,
+                        pool[&cand].as_ref(),
+                        r(*u)?,
+                        r(*dst)?,
+                        *n as usize,
+                        *top_k as usize,
+                        *temp,
+                        *top_p,
+                    );
+                }
+            }
         }
         Op::Argmax { x, dst, n } => {
             let part = pooled(pool, be_, "argmax_part", 512 * 4)?;

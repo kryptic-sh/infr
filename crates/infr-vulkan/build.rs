@@ -459,6 +459,9 @@ fn main() {
         // then select+softmax+nucleus+CDF over the union.
         ("sample_topk", "sample_topk_part", &[]),
         ("sample_topk", "sample_topk", &["-DPASS2"]),
+        // Chained-decode variant: stage 2 reads `u` from a 64-slot ring keyed by the self-advancing
+        // `params[0]` instead of a 1-float buffer — see sample_topk.comp's CHAIN doc.
+        ("sample_topk", "sample_topk_chain", &["-DPASS2", "-DCHAIN"]),
         // Two-stage greedy argmax (Op::Argmax): slice partials, then a one-workgroup reduce.
         ("argmax", "argmax_part", &[]),
         ("argmax", "argmax", &["-DPASS2"]),

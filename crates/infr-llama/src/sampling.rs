@@ -46,12 +46,19 @@ impl Sampler {
     }
 }
 
-/// Wall-clock RNG seed for a generation's sampling draws (unused under greedy).
+/// RNG seed for a generation's sampling draws (unused under greedy). `INFR_SEED` pins it for
+/// distribution-identity testing (chained vs per-token temp sampling must draw the same stream
+/// given the same seed); unset falls back to a wall-clock seed.
 pub(crate) fn seed_rng() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15)
+    std::env::var("INFR_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E3779B97F4A7C15)
+        })
         | 1
 }
 

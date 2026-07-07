@@ -10,6 +10,12 @@
 //   stage 2 (-DPASS2): one workgroup radix-selects the global top-k among the 256*k candidates,
 //     then sorts, softmax(temp), nucleus cutoff, inverse-CDF with `u` — `u` is read from a
 //     1-float BUFFER (not a push constant) so a record-once replayed plan can vary it per token.
+//     -DCHAIN (stage 2 only, implies PASS2): the chained-decode variant — `u_buf` is a 64-slot
+//     ring (mirrors `id_log.comp`'s ring) and the draw is `u_buf[params[0] & 63]` instead of
+//     `u_buf[0]`, keyed by the SAME self-advancing `params[0]` the id-log ring uses. This lets ONE
+//     recording replay either singly (record-once per-token) or chained (N replays in one
+//     submission, `execute_chain`) while consuming the host RNG stream in lockstep with the
+//     per-token host sampler (see runner.rs's ring-slot uniform uploads).
 // Only the 4-byte token id ever reads back.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
@@ -21,7 +27,14 @@ layout(push_constant) uniform PC {
 #ifdef PASS2
 layout(binding = 0) readonly buffer CB { float cand[]; };
 layout(binding = 1) readonly buffer UB { float u_buf[]; };
+#ifdef CHAIN
+// CHAIN binds `params` before `out_id` so the recorder's dispatch-buffer array (whose LAST
+// entries are the writes) still ends on `out_id` — see `Recorder::sample_topk_chain`.
+layout(binding = 2) readonly buffer PB2 { uint params[]; };
+layout(binding = 3) writeonly buffer OB { uint out_id[]; };
+#else
 layout(binding = 2) writeonly buffer OB { uint out_id[]; };
+#endif
 #else
 layout(binding = 0) readonly buffer LB { float logits[]; };
 layout(binding = 1) writeonly buffer CB { float cand[]; };
@@ -153,7 +166,12 @@ void main() {
         }
         float total = 0.0;
         for (uint j = 0u; j < cutoff; j++) { total += gval[j]; }
-        float r = u_buf[0] * total;
+#ifdef CHAIN
+        float u = u_buf[params[0] & 63u];
+#else
+        float u = u_buf[0];
+#endif
+        float r = u * total;
         uint tok = gidx[cutoff - 1u];
         float acc = 0.0;
         for (uint j = 0u; j < cutoff; j++) {

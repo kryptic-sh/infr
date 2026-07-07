@@ -335,6 +335,13 @@ pub(crate) fn sample_topk_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the vocab sampler's chained-decode select+softmax+nucleus+CDF pass: `u` is read
+/// from the 64-slot ring at `u_buf[params[0] & 63]` instead of `u_buf[0]` (see sample_topk.comp).
+pub(crate) fn sample_topk_chain_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sample_topk_chain.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the greedy-argmax slice pass (256 workgroups → 256 (val, idx) partials).
 pub(crate) fn argmax_part_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argmax_part.spv"));

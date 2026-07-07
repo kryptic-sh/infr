@@ -446,3 +446,107 @@ fn planar_q8_dynac_matches_f16() {
     }
     eprintln!("attn_partial_dynac_q8 matches f16, max_err = {max_err}");
 }
+
+/// The record-once REPLAY of the Q8 K/V writes must land bit-identical planar bytes to the static
+/// per-token stores. This is the production decode-tape shape: ONE persistent recording
+/// (`global_barrier` → `params_advance` → `store_q8_f16_dyn` (K) → `store_q8_dyn` (V)) whose params
+/// self-advance on the DEVICE, replayed once per "token" (host re-uploads the row between replays,
+/// exactly like the runner's per-token embed upload), then a chained `replay_n` chunk. The historic
+/// "store_q8_dyn mis-decodes under replay" gate turned out to be the Attention lowering passing the
+/// ROW capacity as the planar scales base (`cap`); this test pins the write path itself so a real
+/// regression can't hide behind that story again.
+#[test]
+fn planar_q8_store_replay_tape_matches_static() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let rs: usize = 64; // one KV row = 2 blocks
+    let cap_rows: usize = 64;
+    let cap = cap_rows * rs; // planar scales region base (elements)
+    let cbytes = (cap / 32 * 34).next_multiple_of(4);
+    let t_single = 7usize; // per-token replays (host upload between)
+    let t_chain = 4usize; // one chained replay_n chunk (constant source)
+    let row_at = |t: usize| -> Vec<f32> {
+        (0..rs)
+            .map(|i| ((i as f32) - 30.0) * 0.03 + t as f32 * 0.11)
+            .collect()
+    };
+
+    // ── replay tape: params seeded [pos0-1, pos0] = [-1, 0]; advance lands row 0 first ──
+    let kf = be.alloc(rs * 2, BufferUsage::Activations).unwrap(); // f16 K staging
+    let vf = be.alloc(rs * 4, BufferUsage::Activations).unwrap(); // f32 V
+    let params = be.alloc(8, BufferUsage::Activations).unwrap();
+    be.upload(params.as_ref(), bytemuck::cast_slice(&[u32::MAX, 0u32]))
+        .unwrap();
+    let kq_dyn = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let vq_dyn = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let rec = be.recorder_persistent().unwrap();
+    rec.global_barrier();
+    rec.params_advance(params.as_ref());
+    rec.store_q8_dyn(kf.as_ref(), params.as_ref(), kq_dyn.as_ref(), rs, cap, true);
+    rec.store_q8_dyn(
+        vf.as_ref(),
+        params.as_ref(),
+        vq_dyn.as_ref(),
+        rs,
+        cap,
+        false,
+    );
+    let tape = rec.finish_record().unwrap();
+    for t in 0..t_single {
+        let row = row_at(t);
+        be.upload(kf.as_ref(), &to_f16_bytes(&row)).unwrap();
+        be.upload(vf.as_ref(), bytemuck::cast_slice(&row)).unwrap();
+        tape.replay().unwrap();
+    }
+    // chained chunk: rows t_single..t_single+t_chain, constant source (the device must still
+    // advance p_pos per iteration — a stale pos would leave rows unwritten/zero).
+    let row = row_at(t_single);
+    be.upload(kf.as_ref(), &to_f16_bytes(&row)).unwrap();
+    be.upload(vf.as_ref(), bytemuck::cast_slice(&row)).unwrap();
+    tape.replay_n(t_chain).unwrap();
+
+    // ── static reference: per-token store_q8 at baked offsets ──
+    let kq_st = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    let vq_st = be.alloc(cbytes, BufferUsage::Activations).unwrap();
+    for t in 0..t_single + t_chain {
+        let row = row_at(t.min(t_single));
+        be.upload(kf.as_ref(), &to_f16_bytes(&row)).unwrap();
+        be.upload(vf.as_ref(), bytemuck::cast_slice(&row)).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.store_q8(kf.as_ref(), kq_st.as_ref(), rs, t * rs, cap, true);
+        rec.store_q8(vf.as_ref(), vq_st.as_ref(), rs, t * rs, cap, false);
+        rec.finish().unwrap();
+    }
+
+    // ── compare: code bytes of the written rows + their scale bytes, bit-exact ──
+    let rows = t_single + t_chain;
+    let mut bufs = vec![vec![0u8; cbytes]; 4];
+    for (b, buf) in [&kq_dyn, &vq_dyn, &kq_st, &vq_st]
+        .iter()
+        .zip(bufs.iter_mut())
+    {
+        be.download(b.as_ref(), buf).unwrap();
+    }
+    let (kd, vd, ks, vs) = (&bufs[0], &bufs[1], &bufs[2], &bufs[3]);
+    assert_eq!(
+        &kd[..rows * rs],
+        &ks[..rows * rs],
+        "replayed K codes differ from static"
+    );
+    assert_eq!(
+        &vd[..rows * rs],
+        &vs[..rows * rs],
+        "replayed V codes differ from static"
+    );
+    let (s0, s1) = (cap, cap + rows * rs / 32 * 2);
+    assert_eq!(&kd[s0..s1], &ks[s0..s1], "replayed K scales differ");
+    assert_eq!(&vd[s0..s1], &vs[s0..s1], "replayed V scales differ");
+    // and the device-side position really advanced once per replay
+    let mut p = [0u8; 8];
+    be.download(params.as_ref(), &mut p).unwrap();
+    let p: &[u32] = bytemuck::cast_slice(&p);
+    assert_eq!(p[0] as usize, rows - 1, "params[0] after {rows} replays");
+    eprintln!("replayed Q8 store tape bit-matches static ({rows} rows)");
+}

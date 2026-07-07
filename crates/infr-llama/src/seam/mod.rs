@@ -573,7 +573,9 @@ type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buf
 /// independently, so this is called per-side. Q8_0 is rounded up to a u32 multiple so the Vulkan
 /// backend can bind the buffer as a `uint` array (its planar Q8 layout reads codes/scales as words).
 /// A quantized KV cache dtype that forces per-execute static decode on the GPU (record-once replay
-/// is disabled for it). Must match the adapter's `decode_eligible` rejection.
+/// is disabled for it). Must match the adapter's `decode_eligible` rejection — with one pair-wise
+/// exception the caller handles: COUPLED Q8_0 (K==V==Q8) replays (store_q8_dyn + the planar-Q8 dyn
+/// attention read), so `runner`'s gate checks the pair before consulting this per-side predicate.
 fn kv_forces_static(dt: DType) -> bool {
     matches!(
         dt,

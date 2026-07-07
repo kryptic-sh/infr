@@ -462,12 +462,14 @@ fn gpu_seam_kv_reuse_matches_fresh() {
     );
 }
 
-/// Q8_0 KV cache on the Vulkan seam (coupled K==V==q8 via INFR_KV_Q8). Q8 forces per-execute static
-/// decode (the record-once replay is disabled for a Q8 cache), so both the one-shot generate and the
-/// session path exercise store_q8 (planar write) + attn_partial_q8 / attention_kv_q8 (planar read) +
-/// the flash prefill dequant. Both must produce coherent (non-degenerate) greedy output. Q8 KV shifts
-/// the numerics (no exact match with the f16 golden), but the near-lossless quant must stay sensible;
-/// a broken quantize/dequant or a mis-gated kernel would collapse or garble the output.
+/// Q8_0 KV cache on the Vulkan seam. COUPLED K==V==q8 (INFR_KV_Q8) decode now rides the
+/// record-once replay (store_q8_dyn planar write + attn_partial_dynac_q8 / attention_kv_dyn_q8
+/// planar read, pos/kv_len from the self-advancing params SSBO), so (a)/(b) exercise the replayed
+/// tape end to end plus the static prefill (store_q8 + flash dequant). DECOUPLED sides (c) still
+/// force per-execute static decode (per-side attn_partial_{k,v}q8 kernels). All must produce
+/// coherent (non-degenerate) greedy output. Q8 KV shifts the numerics (no exact match with the
+/// f16 golden), but the near-lossless quant must stay sensible; a broken quantize/dequant, a
+/// mis-gated kernel, or a wrong planar scales base (`cap`) would collapse or garble the output.
 #[test]
 fn gpu_seam_kv_q8_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
@@ -490,7 +492,7 @@ fn gpu_seam_kv_q8_coherent() {
         "Q8 static Vulkan output degenerate: {:?}",
         head(&g_static)
     );
-    // (b) session path (Q8 forces static decode, so this also exercises the static kernels).
+    // (b) session path (record-once: the whole decode loop replays ONE recorded Q8 tape).
     let mut sess = model.vulkan_session(512).expect("q8 session");
     let mut g_sess = String::new();
     model

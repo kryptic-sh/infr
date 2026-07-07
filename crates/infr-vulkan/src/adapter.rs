@@ -79,11 +79,12 @@ pub(crate) fn compile(graph: &Graph) -> Result<Box<dyn Plan>> {
     Ok(VkDecodePlan::boxed(graph))
 }
 
-/// Record-once replay applies ONLY to a qwen3-style single-token decode graph the `_dyn` kernels
-/// cover: every `Attention` is `rows==1`, `Causal`, scale `1/√head_dim`; RoPE rides on `QkNormRope`
-/// (no standalone `Rope`, no `freq_factors`); and there is no `Softcap` / sliding window / `MoeFfn` /
-/// `Conv1dSilu` / `DeltaNet` / per-head `QkNorm`. Anything else falls back to the static path — which
-/// matters for correctness: `attention_kv_dyn` is gemma-disabled (full causal, hardcoded 1/√hd).
+/// Record-once replay applies to a single-token decode graph the `_dyn` kernels cover: every
+/// `Attention` is `rows==1` with a replayable KV dtype (f16, or coupled Q8_0); RoPE rides on
+/// `QkNormRope` or an f16-out standalone `Rope` (no ff there). SWA windows/scale/Softcap/MoeFfn/
+/// QkNorm and the qwen35 recurrent ops (`Conv1dSilu`/`DeltaNet`) are all replay-safe. Anything
+/// else (prefill batches, dequant-prepass KV dtypes, f32 in-place Rope) falls back to the static
+/// per-execute path.
 /// Standard-GGUF-block low-bit KV quants that ride the dequant→f16 prepass path (not native reads).
 fn is_kv_quant(dt: infr_core::DType) -> bool {
     use infr_core::DType::*;
@@ -170,15 +171,20 @@ fn decode_eligible(graph: &Graph) -> bool {
                 if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
                     return false;
                 }
-                // A Q8_0 KV cache (either side) forces the per-execute STATIC decode: the record-once
-                // replay of the un-fused Q8 K-write (store_q8_dyn) mis-decodes despite correct
-                // kernels/barriers (the static path with the same kernels is bit-correct). TODO: fix
-                // the replay and drop this so Q8 decode gets the record-once speedup too.
-                if matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0)
-                    || matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0)
-                    || is_kv_prepass(graph.desc(*k_cache).dtype)
-                    || is_kv_prepass(graph.desc(*v_cache).dtype)
-                {
+                // A COUPLED Q8_0 KV cache (K==V==Q8) replays: store_q8_dyn writes the row at
+                // params' pos and the planar-Q8 dyn attention kernels (attention_kv_dyn_q8 /
+                // attn_partial_dynac_q8) read it. (The historic "store_q8_dyn mis-decodes under
+                // replay" was actually the Attention lowering passing the ROW capacity where the
+                // Q8 kernels expect the ELEMENT capacity `cap` — the planar scales-region base —
+                // see the `cap_rows` fix at the Dynamic Attention branch.) A DECOUPLED Q8 side
+                // still forces static: the dyn kernels' q8 variant dequants BOTH sides, and the
+                // per-side mixed read only exists on the static attn_partial/attention_kv path.
+                // The dequant→f16 prepass dtypes (low-bit block quants, f32/bf16, turbo) force
+                // static too — their WriteKv/prepass have no dyn kernels.
+                let (kdt, vdt) = (graph.desc(*k_cache).dtype, graph.desc(*v_cache).dtype);
+                let k_q8 = matches!(kdt, infr_core::DType::Q8_0);
+                let v_q8 = matches!(vdt, infr_core::DType::Q8_0);
+                if k_q8 != v_q8 || is_kv_prepass(kdt) || is_kv_prepass(vdt) {
                     return false;
                 }
             }
@@ -199,9 +205,16 @@ fn decode_eligible(graph: &Graph) -> bool {
             // MoeFfn is REPLAY-SAFE: router GEMV + GPU-side top-k + id-indexed expert GEMVs are
             // all push-constant/pos-independent, and its scratch is plan-held. QkNorm (gemma4
             // V-norm) and Softcap are pos-independent elementwise — replay-safe as recorded.
-            // Still rejected: Conv1dSilu/DeltaNet (recurrent state the contract doesn't cover).
-            Op::MoeFfn { .. } | Op::QkNorm { .. } | Op::Softcap { .. } => {}
-            Op::Conv1dSilu { .. } | Op::DeltaNet { .. } => return false,
+            // Conv1dSilu/DeltaNet (qwen35 recurrent state) are replay-safe too: decode (rows==1)
+            // takes the sequential kernels, which are pure in-place RMW of the PERSISTENT state
+            // bindings (kbufs/vbufs, stable across the decode loop) with no pos push constant —
+            // the recorded tape re-reads the live state every replay, and the tape's leading
+            // global barrier orders iteration i's state write before i+1's read under replay_n.
+            Op::MoeFfn { .. }
+            | Op::QkNorm { .. }
+            | Op::Softcap { .. }
+            | Op::Conv1dSilu { .. }
+            | Op::DeltaNet { .. } => {}
             _ => {}
         }
     }
@@ -1183,11 +1196,12 @@ fn lower_op(
             );
             // Planar Q8_0 KV cache, chosen PER-SIDE (K and V independent). The coalesced f16
             // flash/split kernels can't read Q8, so a Q8 side routes decode through the native-Q8
-            // split (attn_partial_{k,v}q8) and prefill through a dequant→f16 prepass. A Q8 cache
-            // forces STATIC decode (see decode_eligible), so the Dynamic branch below never sees Q8.
+            // split (attn_partial_{k,v}q8) and prefill through a dequant→f16 prepass. A DECOUPLED
+            // Q8 side forces STATIC decode (see decode_eligible); the Dynamic branch below sees
+            // only coupled K==V==Q8 (or no Q8 at all).
             let k_q8 = matches!(graph.desc(*k_cache).dtype, infr_core::DType::Q8_0);
             let v_q8 = matches!(graph.desc(*v_cache).dtype, infr_core::DType::Q8_0);
-            let kv_q8 = k_q8 && v_q8; // coupled (Dynamic-branch kernels; unreachable for Q8)
+            let kv_q8 = k_q8 && v_q8; // coupled (the Dynamic-branch kernels' q8 variant)
                                       // Planar Q8 scales region base = total cache elements (K and V caches share numel).
             let cap = graph.desc(*k_cache).numel();
             if let RopeMode::Dynamic(params) = mode {
@@ -1211,12 +1225,15 @@ fn lower_op(
                 // (read from `params` at replay) produce zero-weight partials (m=-3e38, l=0) the
                 // combine ignores. attn_combine's shared array caps n_chunks at 512 → scale chunk
                 // with capacity. Scratch is plan-held (`transient`), so replay reuses it.
-                let cap = graph.desc(*k_cache).numel() / (nkv * hd);
+                // NOTE `cap_rows` (row capacity, chunk sizing) vs `cap` (ELEMENT capacity, the
+                // planar-Q8 scales-region base push constant): shadowing the latter with the
+                // former here is exactly the bug that garbled Q8 KV under record-once replay.
+                let cap_rows = graph.desc(*k_cache).numel() / (nkv * hd);
                 // Baked MIN chunk (64, rising only when the capacity would exceed the 1024-chunk
                 // scratch/combine cap); the kernel derives the effective adaptive chunk from the
                 // live kv_len each token, so one recorded plan serves every depth.
-                let chunk = cap.div_ceil(1024).max(64);
-                let n_chunks = cap.div_ceil(chunk);
+                let chunk = cap_rows.div_ceil(1024).max(64);
+                let n_chunks = cap_rows.div_ceil(chunk);
                 if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later

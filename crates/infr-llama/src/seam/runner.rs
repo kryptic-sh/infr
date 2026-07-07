@@ -3266,21 +3266,17 @@ pub(crate) fn generate_dense_backend(
     let dyn_replay = be.capabilities().decode_replay
         && std::env::var("INFR_SEAM_NO_REPLAY").is_err()
         && (qk_norm || rope_freqs.is_none())
-        // Any quantized KV cache forces the per-execute STATIC decode (see the adapter's
-        // `decode_eligible`: Q8's un-fused K-write mis-decodes under record-once replay; the low-bit
-        // block quants use a dequant→f16 prepass with a standalone quantizing WriteKv). Must mirror
-        // that rejection so this gate stays a strict subset — else the loop bakes pos=0 for a static
-        // run. (turbo forces static too but is CPU-only, where decode_replay is off anyway.)
-        && !kv_forces_static(k_fmt)
-        && !kv_forces_static(v_fmt)
+        // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
+        // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16
+        // prepass with a standalone WriteKv that has no dyn kernel) — EXCEPT coupled Q8_0
+        // (K==V==Q8), which replays natively (store_q8_dyn write + the planar-Q8 dyn attention
+        // read). A DECOUPLED Q8 side still forces static (the dyn q8 kernels dequant both sides).
+        // Must mirror the adapter's rejection so this gate stays a strict subset — else the loop
+        // bakes pos=0 for a static run.
+        && ((k_fmt == DType::Q8_0 && v_fmt == DType::Q8_0)
+            || (!kv_forces_static(k_fmt) && !kv_forces_static(v_fmt)))
         && (0..c.n_layer)
             .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512)
-        // qwen35's gated-DeltaNet layers (`Op::Conv1dSilu`/`Op::DeltaNet`) were never exercised
-        // under record-once replay (the old seam always rebuilds per token) and the adapter's
-        // replay tape isn't proven to re-read their `state` bindings correctly per replay —
-        // measured to silently diverge from the static per-token rebuild after a few decode steps.
-        // Force the static path for qwen35 until that's audited; every other arch is unaffected.
-        && !c.qwen35
         // MTP h-tap (Phase 1, issue #33): the replay tape binds a FIXED set of tensors once: an
         // h-tap request changes the graph shape (an extra Output + Copy) per-call based on
         // whether THIS position is the one being sampled, which the static replay tape can't

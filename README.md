@@ -54,6 +54,7 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm         |
 | Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing         |
 | Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)    |
+| Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert     |
 | DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode |
 
 ```bash
@@ -73,9 +74,36 @@ infr run unsloth/gemma-4-E2B-it-GGUF:Q4_K_M  "What is bash?"
 # DiffusionGemma — block text-diffusion decode (entropy-bound denoise)
 infr run unsloth/diffusiongemma-26B-A4B-it-GGUF:Q4_K_M  "What is the capital of France?"
 
-# Serve any of them over an OpenAI-compatible API
-infr serve unsloth/Qwen3-14B-GGUF:Q4_K_M
+# Pick a specific quant with the `:quant` suffix (default is Q4_K_M)
+infr run unsloth/Qwen3-8B-GGUF:Q6_K       "Summarize the plot of Hamlet."
+infr run unsloth/Qwen3-0.6B-GGUF:IQ4_XS   "Write a haiku about Rust."
+
+# Qwen3.5 speculative decoding (opt-in MTP head; output is token-identical to
+# greedy — pure speedup). WIP: fastest on real, content-rich prompts.
+INFR_MTP=1 infr run unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_XL "Explain how a hash map works."
+
+# Sampling: greedy by default (INFR_TEMP=0). Temperature / top-k / top-p:
+INFR_TEMP=0.7 INFR_TOP_K=40 INFR_TOP_P=0.95 \
+  infr run unsloth/Qwen3-1.7B-GGUF:Q4_K_M "Tell me a story."
 ```
+
+### Serving
+
+```bash
+# OpenAI-compatible HTTP API (streaming). Reuses a persistent KV cache across
+# requests (common-prefix diff) for fast TTFT on shared-prefix chats.
+infr serve unsloth/Qwen3-14B-GGUF:Q4_K_M          # default: 127.0.0.1:8080
+
+curl -s localhost:8080/v1/chat/completions -d '{
+  "model": "qwen3",
+  "messages": [{"role": "user", "content": "What is the capital of France?"}],
+  "stream": true
+}'
+```
+
+Works as a drop-in backend for OpenAI-API clients (opencode, the Claude Code
+CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
+(Qwen, Llama-3.x, Gemma tool dialects supported).
 
 Sampling is greedy at `INFR_TEMP=0`; otherwise `INFR_TEMP` / `INFR_TOP_K` /
 `INFR_TOP_P` control it (see
@@ -136,6 +164,47 @@ folded into the row so the mismatch is visible). Details in
 Useful env: `INFR_TEMP` / `INFR_TOP_K` / `INFR_TOP_P` (sampling; `TEMP=0` →
 greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NCMOE` (MoE expert CPU offload),
 `INFR_NO_FLASH`.
+
+## Validated models & performance
+
+Everything below is **validated on an AMD Radeon RX 7900 XTX** (RDNA3, 24 GB,
+Vulkan / RADV): correctness is checked against the CPU reference implementation
+(the `gpu_seam_matches_cpu_*` tests generate token-for-token on both and
+compare) and throughput is measured against the system `llama.cpp` build with
+`infr compare`.
+
+**Throughput vs llama.cpp** — ratios are `infr / llama.cpp` (**>1.0 = infr is
+faster**); `Q4_K_M`, r=3, on the RX 7900 XTX. `pp512` = 512-token prefill,
+`tg128` = 128-token decode, `pp4@d4096` = ingest a short turn on a 4096-deep KV
+cache (the multi-turn serve shape).
+
+| Model                 | pp512     | tg128     | pp4@d4096 |
+| --------------------- | --------- | --------- | --------- |
+| Qwen3-0.6B            | **1.24×** | **1.12×** | **2.10×** |
+| Qwen3-8B              | **1.28×** | 0.94×     | **1.32×** |
+| Qwen3-30B-A3B (MoE)   | 0.97×     | 0.91×     | **1.23×** |
+| Qwen3.5-0.8B          | 0.92×     | **1.04×** | **1.25×** |
+| Qwen3.5-4B            | 0.96×     | 0.89×     | **1.22×** |
+| Qwen3.6-35B-A3B (MoE) | **1.04×** | 0.90×     | **1.36×** |
+| Gemma-3-1B            | **1.02×** | **1.10×** | **1.11×** |
+| Gemma-4-E2B           | **1.12×** | **1.03×** | 0.99×     |
+
+infr **wins prefill and the multi-turn serve shape** across the board; decode on
+the larger models sits at ~0.90-0.94× — the memory-bandwidth wall (the dominant
+GEMVs run at 77-88 % of the card's DRAM peak, matching llama.cpp's own
+efficiency). **DiffusionGemma** (`dg-step`, the in-step-parallel metric) is at
+parity-or-better vs the reference fork.
+
+**Also validated for correctness** (GPU seam vs CPU reference), beyond the perf
+table: Qwen2-0.5B, Llama-3.2-1B, Gemma-4-12B (dense), and Qwen3-0.6B across
+quant formats **Q4_K_M / Q5_K_M / Q6_K / Q4_0 / Q2_K / IQ4_XS / Q8_0 / BF16**
+(each decoded on-device via hand-written SPIR-V, byte-identical to the CPU
+dequant).
+
+> Numbers are a snapshot and move with each perf slice; regenerate on your own
+> hardware with `infr compare --sweep <model...>`. Results on other GPUs
+> (NVIDIA, Intel Arc) and Apple Metal are wanted — please open an issue with
+> your `infr bench` / `infr compare` output.
 
 ## Scope
 

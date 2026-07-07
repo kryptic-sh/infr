@@ -159,9 +159,15 @@ void main() {
     uint sg = gl_SubgroupID;            // 0..1
     uint lane = gl_SubgroupInvocationID; // 0..31
     uint nsg = gl_NumSubgroups;          // 2
+    // Fixed 4-slot guarded unroll (covers hd <= 512): a compile-time trip count keeps qreg[] in
+    // registers — the old `qreg[nq++]` dynamic index forced a scratch spill re-read on EVERY key
+    // for the hd4 > 32 shapes (gemma4's hd=256/512 layers).
     vec4 qreg[4];
-    uint nq = 0u;
-    for (uint r = lane; r < hd4; r += 32u) { qreg[nq] = vec4(q4[(row * pc.nh + h) * hd4 + r]); nq++; }
+    uint qbase = (row * pc.nh + h) * hd4;
+    for (uint i = 0u; i < 4u; i++) {
+        uint r = lane + 32u * i;
+        qreg[i] = (r < hd4) ? vec4(q4[qbase + r]) : vec4(0.0);
+    }
     float lmax = -3.0e38;
     uint j = j0 + sg;
     if (hd4 == 32u) {
@@ -188,13 +194,58 @@ void main() {
             lmax = max(max(max(max(lmax, d0), d1), d2), d3);
         }
     }
+#ifndef NO_HD_SPEC
+    // hd=256/512 fast QK (gemma4's per-layer dims; hd4==32 keeps its 4-key path above): the
+    // compile-time-constant hd4 unrolls the per-key dot (no dynamic qreg index, literal strides)
+    // and software-pipelines 2 keys — 4 (hd=256) / 8 (hd=512) independent loads in flight per
+    // lane before the dependent subgroupAdds. -DNO_HD_SPEC (INFR_NO_ATTN_HD=1) compiles these
+    // out for A/B against the general loop below.
+    else if (hd4 == 64u) {
+        uint kb = pc.nkv * 64u;
+        uint kh = kvh * 64u + lane;
+        for (; j + nsg < j1; j += 2u * nsg) {
+            vec4 a0 = KVEC4(j * kb + kh);
+            vec4 a1 = KVEC4(j * kb + kh + 32u);
+            vec4 b0 = KVEC4((j + nsg) * kb + kh);
+            vec4 b1 = KVEC4((j + nsg) * kb + kh + 32u);
+            float d0 = subgroupAdd(dot(qreg[0], a0) + dot(qreg[1], a1)) * scale;
+            float d1 = subgroupAdd(dot(qreg[0], b0) + dot(qreg[1], b1)) * scale;
+            if (lane == 0u) {
+                sc[j - j0] = d0;
+                sc[j + nsg - j0] = d1;
+            }
+            lmax = max(lmax, max(d0, d1));
+        }
+    } else if (hd4 == 128u) {
+        uint kb = pc.nkv * 128u;
+        uint kh = kvh * 128u + lane;
+        for (; j + nsg < j1; j += 2u * nsg) {
+            vec4 a0 = KVEC4(j * kb + kh);
+            vec4 a1 = KVEC4(j * kb + kh + 32u);
+            vec4 a2 = KVEC4(j * kb + kh + 64u);
+            vec4 a3 = KVEC4(j * kb + kh + 96u);
+            vec4 b0 = KVEC4((j + nsg) * kb + kh);
+            vec4 b1 = KVEC4((j + nsg) * kb + kh + 32u);
+            vec4 b2 = KVEC4((j + nsg) * kb + kh + 64u);
+            vec4 b3 = KVEC4((j + nsg) * kb + kh + 96u);
+            float d0 = subgroupAdd(dot(qreg[0], a0) + dot(qreg[1], a1)
+                                   + dot(qreg[2], a2) + dot(qreg[3], a3)) * scale;
+            float d1 = subgroupAdd(dot(qreg[0], b0) + dot(qreg[1], b1)
+                                   + dot(qreg[2], b2) + dot(qreg[3], b3)) * scale;
+            if (lane == 0u) {
+                sc[j - j0] = d0;
+                sc[j + nsg - j0] = d1;
+            }
+            lmax = max(lmax, max(d0, d1));
+        }
+    }
+#endif
     for (; j < j1; j += nsg) {
         uint kbase4 = (j * pc.nkv + kvh) * hd4;
         float part = 0.0;
-        uint ri = 0u;
-        for (uint r = lane; r < hd4; r += 32u) {
-            part += dot(qreg[ri], KVEC4(kbase4 + r));
-            ri++;
+        for (uint i = 0u; i < 4u; i++) {
+            uint r = lane + 32u * i;
+            if (r < hd4) { part += dot(qreg[i], KVEC4(kbase4 + r)); }
         }
         float dot = subgroupAdd(part) * scale;
         if (lane == 0u) { sc[j - j0] = dot; }
@@ -255,7 +306,51 @@ void main() {
             pacc[pbase + 4u * lane + 2u] = acc.z;
             pacc[pbase + 4u * lane + 3u] = acc.w;
         }
-    } else {
+    }
+#ifndef NO_HD_SPEC
+    // hd=256/512 fast V (full occupancy at compile-time-constant strides). hd4==64: every thread
+    // owns exactly one dim-vec4; software-pipeline 2 keys so 2 loads are in flight per thread.
+    // hd4==128: thread owns dims t and t+64 in ONE pass over keys (the general loop below walks
+    // the key range twice) — 2 independent loads per key, sc read once.
+    else if (hd4 == 64u) {
+        uint vb = kvh * 64u + t;
+        uint stride = pc.nkv * 64u;
+        vec4 acc = vec4(0.0);
+        uint jv = j0;
+        for (; jv + 1u < j1; jv += 2u) {
+            vec4 b0 = VVEC4(jv * stride + vb);
+            vec4 b1 = VVEC4((jv + 1u) * stride + vb);
+            acc += sc[jv - j0] * b0;
+            acc += sc[jv + 1u - j0] * b1;
+        }
+        if (jv < j1) { acc += sc[jv - j0] * VVEC4(jv * stride + vb); }
+        pacc[pbase + 4u * t] = acc.x;
+        pacc[pbase + 4u * t + 1u] = acc.y;
+        pacc[pbase + 4u * t + 2u] = acc.z;
+        pacc[pbase + 4u * t + 3u] = acc.w;
+    } else if (hd4 == 128u) {
+        uint vb = kvh * 128u + t;
+        uint stride = pc.nkv * 128u;
+        vec4 acc0 = vec4(0.0);
+        vec4 acc1 = vec4(0.0);
+        for (uint jv = j0; jv < j1; jv++) {
+            vec4 b0 = VVEC4(jv * stride + vb);
+            vec4 b1 = VVEC4(jv * stride + vb + 64u);
+            float s = sc[jv - j0];
+            acc0 += s * b0;
+            acc1 += s * b1;
+        }
+        pacc[pbase + 4u * t] = acc0.x;
+        pacc[pbase + 4u * t + 1u] = acc0.y;
+        pacc[pbase + 4u * t + 2u] = acc0.z;
+        pacc[pbase + 4u * t + 3u] = acc0.w;
+        pacc[pbase + 4u * (t + 64u)] = acc1.x;
+        pacc[pbase + 4u * (t + 64u) + 1u] = acc1.y;
+        pacc[pbase + 4u * (t + 64u) + 2u] = acc1.z;
+        pacc[pbase + 4u * (t + 64u) + 3u] = acc1.w;
+    }
+#endif
+    else {
         // General fallback (hd4 > 32): all 64 threads each own a dim, loop over all keys.
         for (uint g = t; g < hd4; g += 64u) {
             vec4 acc = vec4(0.0);

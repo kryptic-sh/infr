@@ -24,11 +24,24 @@ fn main() {
             "attn_partial_mrows_c256",
             &["-DSC_MAX=256u"],
         ),
+        // A/B escape (INFR_NO_ATTN_HD=1): compile out the hd=256/512 fast paths so a regression
+        // on those shapes is diagnosable against the general loops (f16 form-factors only).
+        ("attn_partial", "attn_partial_nohd", &["-DNO_HD_SPEC"]),
         ("attn_partial", "attn_partial_dyn", &["-DUSE_PARAMS"]),
+        (
+            "attn_partial",
+            "attn_partial_dyn_nohd",
+            &["-DUSE_PARAMS", "-DNO_HD_SPEC"],
+        ),
         (
             "attn_partial",
             "attn_partial_dynac",
             &["-DUSE_PARAMS", "-DSELF_CHUNK"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_dynac_nohd",
+            &["-DUSE_PARAMS", "-DSELF_CHUNK", "-DNO_HD_SPEC"],
         ),
         // Planar Q8_0 KV cache: coalesced split-K decode reading Q8 blocks (halves KV read traffic).
         // K and V decouple (-DKQ8 / -DVQ8) → 3 quant combos (kq8, vq8, both) for the STATIC split.

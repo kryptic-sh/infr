@@ -2340,6 +2340,9 @@ impl<'a> Recorder<'a> {
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
         self.stamp("attn_partial");
         let (p1name, p1spv) = match (k_q8, v_q8) {
+            (false, false) if crate::gemm::attn_hd_spec_disabled() => {
+                ("attn_partial_nohd", crate::gemm::attn_partial_nohd_spv())
+            }
             (false, false) => ("attn_partial", crate::gemm::attn_partial_spv()),
             (true, false) => ("attn_partial_kq8", crate::gemm::attn_partial_kq8_spv()),
             (false, true) => ("attn_partial_vq8", crate::gemm::attn_partial_vq8_spv()),
@@ -2667,6 +2670,11 @@ impl<'a> Recorder<'a> {
                 "attn_partial_dynac_q8",
                 crate::gemm::attn_partial_dynac_q8_spv(),
             )
+        } else if crate::gemm::attn_hd_spec_disabled() {
+            (
+                "attn_partial_dynac_nohd",
+                crate::gemm::attn_partial_dynac_nohd_spv(),
+            )
         } else {
             ("attn_partial_dynac", crate::gemm::attn_partial_dynac_spv())
         };
@@ -2746,13 +2754,15 @@ impl<'a> Recorder<'a> {
         window: usize,
     ) {
         self.stamp("attn_partial");
-        let k1 = self.be.kernel_sg(
-            "attn_partial_dyn",
-            crate::gemm::attn_partial_dyn_spv(),
-            7,
-            32,
-            32,
-        );
+        let (p1name, p1spv) = if crate::gemm::attn_hd_spec_disabled() {
+            (
+                "attn_partial_dyn_nohd",
+                crate::gemm::attn_partial_dyn_nohd_spv(),
+            )
+        } else {
+            ("attn_partial_dyn", crate::gemm::attn_partial_dyn_spv())
+        };
+        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 32, 32);
         let mut p1 = [0u8; 32];
         // [0..4] kv_len: unused (from params)
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());

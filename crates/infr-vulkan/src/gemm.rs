@@ -1182,6 +1182,17 @@ dyn_spv!(rope_f16_dyn_spv, "rope_f16_dyn");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");
 dyn_spv!(attention_kv_dyn_spv, "attention_kv_dyn");
 dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");
+// A/B escape for the hd=256/512 attn_partial fast paths (INFR_NO_ATTN_HD=1): the same three f16
+// form-factors compiled with -DNO_HD_SPEC, so a regression on those shapes is diagnosable
+// against the general per-key loops.
+dyn_spv!(attn_partial_nohd_spv, "attn_partial_nohd");
+dyn_spv!(attn_partial_dyn_nohd_spv, "attn_partial_dyn_nohd");
+dyn_spv!(attn_partial_dynac_nohd_spv, "attn_partial_dynac_nohd");
+/// `INFR_NO_ATTN_HD=1` — select the `-DNO_HD_SPEC` attn_partial variants (general loops only).
+pub(crate) fn attn_hd_spec_disabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("INFR_NO_ATTN_HD").is_ok())
+}
 // Coupled Q8_0 KV cache: scalar dequant-on-read attention (static + record-once) and the row
 // quantize-store kernels (f32 V + f16 K sources, each with a params/decode variant).
 dyn_spv!(attention_kv_q8_spv, "attention_kv_q8");

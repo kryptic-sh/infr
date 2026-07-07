@@ -355,6 +355,20 @@ fn gpu_seam_golden_qwen3() {
     );
 }
 
+/// IQ4_XS (non-linear 4-bit codebook quant: 4-bit codes index KV_IQ4NL → signed int8, per-32 scale)
+/// through the Vulkan seam vs the CPU oracle. The GPU IQ4_XS decode/prefill runs the word-parallel
+/// `dqblk` (whole-u32 code loads + hoisted codebook gather) and — on ≥48M/≥8M weights (none on this
+/// 0.6B model; its lm_head is tied Q6_K) — the codebook-gather-then-dp4a int8 mmv. This 0.6B's IQ4_XS
+/// projections are all small, so it exercises the `dqblk` path; the assertion guards that the decode
+/// stays bit-faithful (token-for-token with the f32 CPU reference).
+#[test]
+fn gpu_seam_matches_cpu_qwen3_iq4xs() {
+    let path = need_model!(qwen3_quant("IQ4_XS"), "Qwen3-0.6B-IQ4_XS");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+}
+
 /// Flash-attention prefill parity: a prompt LONG ENOUGH (>64 tokens) that the seam's batched prefill
 /// takes the FlashAttention-2 path (`attention_prefill_flash`, rows≥64) + the tiled GEMM/mmq Linear,
 /// must generate the SAME greedy continuation as the CPU reference oracle (which uses the naive

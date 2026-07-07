@@ -443,6 +443,13 @@ fn main() {
             "native_mmv_q6k_res",
             &["-DFMT_Q6K", "-DUSE_RES"],
         ),
+        // IQ4_XS: codebook-gather-then-dp4a (the 4-bit code indexes KV_IQ4NL -> int8 before the dot).
+        ("native_mmv", "native_mmv_iq4xs", &["-DFMT_IQ4XS"]),
+        (
+            "native_mmv",
+            "native_mmv_iq4xs_res",
+            &["-DFMT_IQ4XS", "-DUSE_RES"],
+        ),
         // Multi-row int8 dp4a GEMV (m=2..8): weight sub-block unpacked once, dp4a per row.
         ("native_mmv_mrow", "native_mmv_mrow_q4k", &["-DFMT_Q4K"]),
         (
@@ -475,6 +482,23 @@ fn main() {
             "native_mmv_mrow",
             "native_mmv_mrow_q6k_o4",
             &["-DFMT_Q6K", "-DOUTS4"],
+        ),
+        // IQ4_XS multi-row (m=2..8): codebook-gather-then-dp4a, Q4_K-style single-dp accumulation.
+        ("native_mmv_mrow", "native_mmv_mrow_iq4xs", &["-DFMT_IQ4XS"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4xs_m4",
+            &["-DFMT_IQ4XS", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4xs_o4",
+            &["-DFMT_IQ4XS", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4xs_o4_m4",
+            &["-DFMT_IQ4XS", "-DOUTS4", "-DMRV=4"],
         ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),

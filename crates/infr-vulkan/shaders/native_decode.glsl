@@ -425,7 +425,11 @@ float dq(uint g) {
 }
 #define HAVE_DQBLK
 // One 32-elem sub-block = exactly one of the 8 IQ4_XS sub-blocks (gstart is 32-aligned).
-// Decode d and the 6-bit sub-block scale ONCE, read each of the 16 qs bytes once (both nibbles).
+// Decode d and the 6-bit sub-block scale ONCE. Word-parallel qs: block byte offsets are 4-aligned
+// (136%4==0, qs at +8, sub-block stride 16) — load the 16 qs bytes as 4 whole u32s instead of 16
+// rb() byte-extract chains, with the codebook gather hoisted per byte. Same dl*KV[nibble] value as
+// the scalar loop — bit-identical. The warptile GEMM's staging loop is decode-ALU-bound, so this is
+// directly visible in prefill GEMM (and the decode native_gemv) throughput.
 void dqblk(uint gstart, out float v[32]) {
     uint p = gstart % 256u;
     uint bd = (gstart / 256u) * 136u;
@@ -435,11 +439,15 @@ void dqblk(uint gstart, out float v[32]) {
     uint lo = (rb(bd + 4u + (ib / 2u)) >> (4u * (ib & 1u))) & 0xFu;
     uint hi = (scales_h >> (2u * ib)) & 3u;
     float dl = d * float(int(lo | (hi << 4u)) - 32);
-    uint qoff = bd + 8u + 16u * ib;
-    for (uint j = 0u; j < 16u; j++) {
-        uint b = rb(qoff + j);
-        v[j] = dl * float(KV_IQ4NL[b & 0xFu]);
-        v[j + 16u] = dl * float(KV_IQ4NL[b >> 4u]);
+    uint qw = (bd + 8u + 16u * ib) >> 2u;
+    for (uint w4 = 0u; w4 < 4u; w4++) {
+        uint q = nw[qw + w4];
+        for (uint b = 0u; b < 4u; b++) {
+            uint byte = (q >> (8u * b)) & 0xFFu;
+            uint j = w4 * 4u + b;
+            v[j] = dl * float(KV_IQ4NL[byte & 0xFu]);
+            v[j + 16u] = dl * float(KV_IQ4NL[byte >> 4u]);
+        }
     }
 }
 #endif

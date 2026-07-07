@@ -7,7 +7,7 @@
 // Reduction: shared-tree — the workgroup is one wave64 on RDNA3 so its barriers compile out;
 // the subgroupAdd form measured 15-22% SLOWER on the big-n dispatches (lm_head) via ACO
 // register-allocation fallout (slice-2 notes in native_gemv_mrow.comp).
-// -DFMT_Q4K / -DFMT_Q6K select the weight format; -DUSE_RES fuses a residual add.
+// -DFMT_Q4K / -DFMT_Q6K / -DFMT_IQ4XS select the weight format; -DUSE_RES fuses a residual add.
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_integer_dot_product : require
@@ -99,6 +99,40 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     float sc0 = float(sgn8(rb(scbase)));
     float sc1 = float(sgn8(rb(scbase + 1u)));
     return d * da * (sc0 * float(dp0) + sc1 * float(dp1));
+}
+#endif
+
+#ifdef FMT_IQ4XS
+// IQ4_XS: [f16 d][u16 scales_h][u8 scales_l[4]][u8 qs[128]] = 136 bytes, 256 elements, 8 sub-blocks.
+// Non-linear codebook: the 4-bit code indexes KV_IQ4NL (signed int8). The dp4a trick still applies
+// with a gather step — codebook[code] -> int8, then dp4a against the int8-quantized activation. One
+// 6-bit scale dl per 32-elem sub-block (symmetric, like Q6_K — no min/Σa term). Element order:
+// elems 0..15 = KV[qs[j]&0xF], elems 16..31 = KV[qs[j]>>4] (j=0..15), matching the activation qaw's
+// natural order (qaw[j] covers elems 4j..4j+3). Same dl*KV product as the scalar dqblk decode.
+const int KV_IQ4NL[16] = int[](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+float dpsub(uint gelem, uint qaw[8], float da, float sa) {
+    uint p = gelem % 256u;
+    uint bd = (gelem / 256u) * 136u;
+    float d = f16tof32(ru16(bd));
+    uint scales_h = ru16(bd + 2u);
+    uint ib = p / 32u;
+    uint lo = (rb(bd + 4u + (ib >> 1u)) >> (4u * (ib & 1u))) & 0xFu;
+    uint hi = (scales_h >> (2u * ib)) & 3u;
+    float dl = d * float(int(lo | (hi << 4u)) - 32);
+    uint qw = (bd + 8u + 16u * ib) >> 2u;   // word-aligned qs base for this sub-block
+    int dp = 0;
+    for (uint j = 0u; j < 4u; j++) {
+        uint q = nw[qw + j];               // qs[4j..4j+3]
+        uint wl = 0u; uint wh = 0u;        // gathered int8 codebook values (low / high nibbles)
+        for (uint b = 0u; b < 4u; b++) {
+            uint qbyte = (q >> (8u * b)) & 0xFFu;
+            wl |= (uint(KV_IQ4NL[qbyte & 0xFu]) & 0xFFu) << (8u * b);
+            wh |= (uint(KV_IQ4NL[qbyte >> 4u]) & 0xFFu) << (8u * b);
+        }
+        dp = dotPacked4x8AccSatEXT(int(wl), int(qaw[j]), dp);       // elems 4j..4j+3
+        dp = dotPacked4x8AccSatEXT(int(wh), int(qaw[j + 4u]), dp);  // elems 16+4j..16+4j+3
+    }
+    return dl * da * float(dp);
 }
 #endif
 

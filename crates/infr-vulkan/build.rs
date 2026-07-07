@@ -477,6 +477,44 @@ fn main() {
         ("native_gemv_id_multi", "native_idm_q4k", &["-DFMT_Q4K"]),
         ("native_gemv_id_multi", "native_idm_q5k", &["-DFMT_Q5K"]),
         ("native_gemv_id_multi", "native_idm_q6k", &["-DFMT_Q6K"]),
+        // Reassociation-tolerant subgroup+NR variant of the multi-slot id GEMV (wave32, subgroupAdd,
+        // no shared reduce) for the latency-STARVED Q6_K MoE expert down-projection (out_f≈2048 — the
+        // largest SG win of any decode shape). NOT bit-identical (reordered accumulation); gated to
+        // the Q6_K projection band in the recorder. Q6_K ONLY (mirrors the dense native_gemv_sg
+        // discipline — Q4_K idm already saturates). NR ∈ {2,4,8}.
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q6k_sg2",
+            &["-DFMT_Q6K", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q6k_sg4",
+            &["-DFMT_Q6K", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q6k_sg8",
+            &["-DFMT_Q6K", "-DNR=8"],
+        ),
+        // Q5_K SG id variant: the Qwen3.6-A3B UD-quant stores most expert down-projections as Q5_K
+        // (not Q6_K) at the same out_f≈2048 down shape — the heavy K-quant decode still nets out on
+        // wave32+subgroupAdd (A/B-confirmed a win; Q4_K stays on the tree). NR ∈ {2,4,8}.
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q5k_sg2",
+            &["-DFMT_Q5K", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q5k_sg4",
+            &["-DFMT_Q5K", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_q5k_sg8",
+            &["-DFMT_Q5K", "-DNR=8"],
+        ),
         ("moe_accumulate", "moe_accumulate", &[]),
         ("moe_accumulate_scaled", "moe_accumulate_scaled", &[]),
         ("native_mmv_id_q4k", "native_mmv_id_q4k", &[]),

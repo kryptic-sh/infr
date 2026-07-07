@@ -1,0 +1,69 @@
+#version 460
+// Reassociation-tolerant subgroup+NUM_ROWS variant of native_gemv_id_multi: the id-indexed multi-slot
+// decode GEMV (y = x·W[ids[slot]]ᵀ over all n_used routed experts) rebuilt on the wave32 +
+// subgroupAdd + NR-rows/workgroup structure from native_gemv_sg (NO shared reduce, NO barrier). Each
+// wave keeps 32×NR weight-load requests in flight — the extra MLP the shallow low-out_f MoE expert
+// down-projection grid (Q6_K, out_f≈2048 — the LARGEST subgroup win of all the decode shapes) needs to
+// saturate DRAM, which the 64-thread tree-reduce id kernel leaves on the table. The id addressing is
+// unchanged (weight base = ids[slot_global]*stride + o*in_f); only the K-reduction is reassociated.
+//
+// NOT bit-identical to native_gemv_id_multi: wave32 lane partitioning + the subgroupAdd reduction tree
+// REORDER the float accumulation vs the 64-thread shared tree-reduce (a valid different summation
+// order, ULP-level per element — same class as the blessed int8 mmv path). Gated to the Q6_K
+// projection band ONLY in the recorder (see native_sg_choice / native_id_sg_choice). -DNR=N selects
+// rows/workgroup. Requires requiredSubgroupSize=32.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; } pc;
+layout(binding = 0) readonly buffer WB { uint nw[]; };
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+layout(binding = 2) readonly buffer IDB { uint ids[]; };
+layout(binding = 3) buffer YB { float y_buf[]; };
+
+#ifndef NR
+#define NR 2
+#endif
+
+#include "native_decode.glsl"
+
+// Dot one 32-elem sub-block of weights (decoded once) against the matching activation run.
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    uint lane = gl_SubgroupInvocationID; // 0..31
+    uint og = (pc.out_f + uint(NR) - 1u) / uint(NR); // output-row groups per (row, slot)
+    uint unit = gl_WorkGroupID.x;
+    uint slot_global = unit / og;                    // (row, slot) flattened — see native_gemv_id_multi
+    uint o0 = (unit - slot_global * og) * uint(NR);  // first output row this workgroup owns
+    uint row = slot_global / pc.n_used;
+    uint wexp = ids[slot_global] * pc.stride;
+    uint xbase = (pc.x_per_slot != 0u ? slot_global * pc.in_f : row * pc.in_f);
+    uint nsub = pc.in_f / 32u;
+    float acc[NR];
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) { acc[rr] = 0.0; }
+    for (uint s = lane; s < nsub; s += 32u) {
+        uint xoff = xbase + s * 32u;
+        [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
+            uint o = o0 + rr;
+            if (o < pc.out_f) {
+                acc[rr] += dqsub(wexp + o * pc.in_f + s * 32u, xoff);
+            }
+        }
+    }
+    [[unroll]] for (uint rr = 0u; rr < uint(NR); rr++) {
+        float sum = subgroupAdd(acc[rr]);
+        uint o = o0 + rr;
+        if (lane == 0u && o < pc.out_f) {
+            y_buf[slot_global * pc.out_f + o] = sum;
+        }
+    }
+}

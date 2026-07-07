@@ -263,6 +263,38 @@ pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [
         _ => return None,
     })
 }
+/// SPIR-V + kernel-cache name for the reassociation-tolerant subgroup+NR variant of the multi-slot
+/// id GEMV (`native_gemv_id_multi_sg.comp`, wave32 + subgroupAdd). NOT bit-identical to
+/// `native_idm_*` — reordered accumulation; the caller gates to the Q6_K projection band (see
+/// `native_id_sg_choice`). Only Q6_K has an SG build (Q4_K idm already saturates). `nr` ∈ {2,4,8}.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_idm_sg_build_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, nr) {
+        (Q6K, 2) => v!("native_idm_q6k_sg2"),
+        (Q6K, 4) => v!("native_idm_q6k_sg4"),
+        (Q6K, 8) => v!("native_idm_q6k_sg8"),
+        (Q5K, 2) => v!("native_idm_q5k_sg2"),
+        (Q5K, 4) => v!("native_idm_q5k_sg4"),
+        (Q5K, 8) => v!("native_idm_q5k_sg8"),
+        _ => None,
+    }
+}
+
 /// SPIR-V for the int8 dp4a decode GEMV (m=1, NUM_ROWS=2, `native_mmv.comp`). `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

@@ -105,6 +105,46 @@ fn native_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Optio
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
+/// NUM_ROWS for the reassociation-tolerant subgroup id-indexed decode GEMV
+/// (`native_gemv_id_multi_sg.comp`), or `None` to keep the tree id kernel. Same projection-band
+/// discipline as [`native_sg_choice`], but covers BOTH Q6_K (Qwen3-30B expert down, out_f≈2048 — the
+/// largest SG win of all decode shapes) AND Q5_K (Qwen3.6-A3B UD-quant stores most expert downs as
+/// Q5_K at the same out_f≈2048 shape; A/B-confirmed a win — Q4_K idm already saturates and stays on
+/// the tree). Kept independent of `native_sg_choice` so the byte-identical dense SG path is untouched.
+/// Env: `INFR_NO_GEMV_ID_SG` forces the tree id path (id-only escape); `INFR_NO_GEMV_SG` disables BOTH
+/// the dense and id SG routes; `INFR_GEMV_SG_MINOUT`/`MAXOUT`/`INFR_GEMV_SG_NR` are the shared knobs.
+fn native_id_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Option<u32> {
+    use infr_core::DType::*;
+    if std::env::var("INFR_NO_GEMV_ID_SG").is_ok() || std::env::var("INFR_NO_GEMV_SG").is_ok() {
+        return None;
+    }
+    // Heavy K-quant decodes only (Q6_K/Q5_K): the extra unpack ALU is where wave32 + subgroupAdd's
+    // lower register/barrier overhead nets out. Q4_K's tree id kernel already saturates (SG regressed).
+    if !matches!(dtype, Q6K | Q5K) {
+        return None;
+    }
+    // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
+    if !in_f.is_multiple_of(32) {
+        return None;
+    }
+    let min_out = std::env::var("INFR_GEMV_SG_MINOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2048usize);
+    let max_out = std::env::var("INFR_GEMV_SG_MAXOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192usize);
+    if out_f < min_out || out_f > max_out {
+        return None;
+    }
+    let nr = std::env::var("INFR_GEMV_SG_NR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2u32);
+    matches!(nr, 2 | 4 | 8).then_some(nr)
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
@@ -4098,22 +4138,32 @@ impl<'a> Recorder<'a> {
         out_f: usize,
         rows: usize,
     ) {
-        let name = crate::linear::native_idm_kernel_name(dtype).expect("native idm kernel");
-        let spv = crate::gemm::native_idm_build_spv(dtype).expect("native idm spv");
-        let k = self.be.kernel(name, spv, 4, 20);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(stride as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(x_per_slot as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(w), Self::vkb(x), Self::vkb(ids), Self::vkb(y)],
-            1,
-            &push,
-            (rows * n_used * out_f) as u32,
-        );
+        let bufs = [Self::vkb(w), Self::vkb(x), Self::vkb(ids), Self::vkb(y)];
+        // Reassociation-tolerant subgroup route (m=1 decode, Q6_K/Q5_K expert down-projection band) —
+        // takes precedence over the tree id kernel where it saturates DRAM better. Decode only
+        // (rows == 1); the small-m prefill widening stays on the bit-consistent tree path.
+        if rows == 1 {
+            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f) {
+                if let Some((name, spv)) = crate::gemm::native_idm_sg_build_spv(dtype, nr) {
+                    let k = self.be.kernel_sg(name, spv, 4, 20, 32);
+                    // grid = n_used slots × ceil(out_f/NR) output-groups per slot (the shader splits
+                    // its flat workgroup id back into slot / o0 using this same per-slot group count).
+                    let groups = (n_used * out_f.div_ceil(nr as usize)) as u32;
+                    self.dispatch(k, &bufs, 1, &push, groups);
+                    return;
+                }
+            }
+        }
+        let name = crate::linear::native_idm_kernel_name(dtype).expect("native idm kernel");
+        let spv = crate::gemm::native_idm_build_spv(dtype).expect("native idm spv");
+        let k = self.be.kernel(name, spv, 4, 20);
+        self.dispatch(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
     }
 
     /// Quantize f32 activations `a` [m,k] → int8 `qa` [m,k] + per-32-block f16 `dact`/`sact`

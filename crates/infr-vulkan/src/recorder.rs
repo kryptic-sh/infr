@@ -63,6 +63,48 @@ fn native_rm_choice(dtype: infr_core::DType, out_f: usize) -> Option<u32> {
     (rm == 2 || rm == 4).then_some(rm)
 }
 
+/// NUM_ROWS for the reassociation-tolerant subgroup decode GEMV (`native_gemv_sg.comp`), or `None`
+/// to keep the bit-identical tree/RM path. The subgroup form (wave32 + subgroupAdd, NR output rows)
+/// keeps 32×NR weight-load requests in flight per wave — the extra MLP that the shallow low-out_f
+/// projection grid (q/k/v/o/down) needs to saturate DRAM. It REORDERS the accumulation (not
+/// bit-identical), so it is gated to the latency-starved projection BAND ONLY: the big lm_head /
+/// gate+up GEMVs (out_f ≥ ~16k) already saturate on the tree kernel and subgroupAdd measured a ~20%
+/// occupancy regression there. Q6_K ONLY (see below) — no Q4_K SG build exists.
+/// Env: `INFR_NO_GEMV_SG` forces the tree/RM path; `INFR_GEMV_SG_NR`=2|4|8 overrides NR;
+/// `INFR_GEMV_SG_MINOUT`/`INFR_GEMV_SG_MAXOUT` override the band.
+fn native_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Option<u32> {
+    use infr_core::DType::*;
+    // Q6_K ONLY: the heavier Q6_K decode (210-byte super-blocks, more unpack ALU) is where wave32 +
+    // subgroupAdd's lower register/barrier overhead nets out. On Q4_K the tree/RM kernel already
+    // saturates and SG regressed at every measured shape (decode_gemv_bw A/B). Q6_K also loses below
+    // out_f≈2048 (attn_v, out_f=1024: grid too shallow) and above the band (lm_head, out_f=151936:
+    // already peak on the tree kernel + subgroupAdd occupancy regression) — so the band is the
+    // out_f≈4096 Q6_K projections (ffn_down / o). Default NR=2 (best at every winning shape).
+    if !matches!(dtype, Q6K) || std::env::var("INFR_NO_GEMV_SG").is_ok() {
+        return None;
+    }
+    // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
+    if !in_f.is_multiple_of(32) {
+        return None;
+    }
+    let min_out = std::env::var("INFR_GEMV_SG_MINOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2048usize);
+    let max_out = std::env::var("INFR_GEMV_SG_MAXOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192usize);
+    if out_f < min_out || out_f > max_out {
+        return None;
+    }
+    let nr = std::env::var("INFR_GEMV_SG_NR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2u32);
+    matches!(nr, 2 | 4 | 8).then_some(nr)
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
@@ -1141,6 +1183,29 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        // Reassociation-tolerant subgroup route (m=1 decode, latency-starved projection band) —
+        // takes precedence over the bit-identical RM path where it saturates DRAM better.
+        if rows == 1 {
+            if let Some(nr) = native_sg_choice(dtype, in_f, out_f) {
+                if let Some((name, spv)) = crate::gemm::native_sg_build_spv(dtype, false, nr) {
+                    self.label_gemv("gemv", rows, in_f, out_f);
+                    let k = self.be.kernel_sg(name, spv, 3, 16, 32);
+                    let mut push = [0u8; 16];
+                    push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+                    push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+                    push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+                    push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+                    self.dispatch(
+                        k,
+                        &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+                        1,
+                        &push,
+                        (out_f as u32).div_ceil(nr),
+                    );
+                    return;
+                }
+            }
+        }
         // Multi-output-row route (m=1 decode, low out_f → memory-latency-starved single-row grid).
         if rows == 1 {
             if let Some(rm) = native_rm_choice(dtype, out_f) {
@@ -1299,6 +1364,16 @@ impl<'a> Recorder<'a> {
             Self::vkb(residual),
             Self::vkb(y),
         ];
+        // Reassociation-tolerant subgroup route (see linear_native_off) — precedence over RM.
+        if rows == 1 {
+            if let Some(nr) = native_sg_choice(dtype, in_f, out_f) {
+                if let Some((name, spv)) = crate::gemm::native_sg_build_spv(dtype, true, nr) {
+                    let k = self.be.kernel_sg(name, spv, 4, 16, 32);
+                    self.dispatch(k, &bufs, 1, &push, (out_f as u32).div_ceil(nr));
+                    return;
+                }
+            }
+        }
         // Multi-output-row route (see linear_native_off): o/down decode GEMVs are low-out_f.
         if rows == 1 {
             if let Some(rm) = native_rm_choice(dtype, out_f) {

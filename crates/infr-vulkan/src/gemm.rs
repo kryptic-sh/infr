@@ -175,6 +175,39 @@ pub(crate) fn native_rm_build_spv(
     }
 }
 
+/// SPIR-V + kernel-cache name for the reassociation-tolerant subgroup+NUM_ROWS decode GEMV
+/// (`native_gemv_sg.comp`, wave32 + subgroupAdd). NOT bit-identical to the tree GEMV — reordered
+/// accumulation; the caller must gate to the projection band and re-bless any changed golden. Only
+/// Q6_K has an SG build (on Q4_K the tree/RM kernel already saturates — SG regressed). `nr` ∈ {2,4,8}.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_sg_build_spv(
+    dtype: infr_core::DType,
+    res: bool,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, res, nr) {
+        (Q6K, false, 2) => v!("native_q6k_sg2"),
+        (Q6K, true, 2) => v!("native_q6k_sg2_res"),
+        (Q6K, false, 4) => v!("native_q6k_sg4"),
+        (Q6K, true, 4) => v!("native_q6k_sg4_res"),
+        (Q6K, false, 8) => v!("native_q6k_sg8"),
+        (Q6K, true, 8) => v!("native_q6k_sg8_res"),
+        _ => None,
+    }
+}
+
 /// SPIR-V for the id-indexed native GEMV (expert chosen from a GPU buffer). One specialization per
 /// affine quant format; `None` for formats without an id variant (caller falls back to host top-k).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

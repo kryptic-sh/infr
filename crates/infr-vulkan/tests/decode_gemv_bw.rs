@@ -29,6 +29,10 @@ fn decode_gemv_bw() {
         ("gate+up", 4096, 24576, DType::Q4K),
         ("down-q4", 12288, 4096, DType::Q4K),
         ("down-q6", 12288, 4096, DType::Q6K),
+        ("v-q6   ", 4096, 1024, DType::Q6K),
+        ("v2k-q6 ", 2816, 2048, DType::Q6K),
+        ("o2k-q6 ", 4096, 2048, DType::Q6K),
+        ("o-q6   ", 4096, 4096, DType::Q6K),
         ("lm_head", 4096, 151936, DType::Q6K),
     ];
     let xmax = 12288;
@@ -70,40 +74,63 @@ fn decode_gemv_bw() {
         let y = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
         let reps = (n_w * 4).max(40);
 
-        // Bit-identity: RM=1 vs RM=2 vs RM=4 on the first weight buffer must match exactly.
-        let run_once = |rm: &str| -> Vec<f32> {
-            if rm == "1" {
-                std::env::set_var("INFR_NO_GEMV_RM", "1");
-            } else {
-                std::env::remove_var("INFR_NO_GEMV_RM");
-                std::env::set_var("INFR_GEMV_RM", rm);
-            }
+        // Mode selects tree(RM1) / RM=2/4 (bit-identical) / SG NR=2/4/8 (reassociated). Each mode
+        // fully re-sets the env so precedence is explicit (SG > RM > tree in the recorder).
+        let cfg = |mode: &str| {
             std::env::set_var("INFR_GEMV_RM_MAXOUT", "999999");
+            std::env::set_var("INFR_GEMV_SG_MINOUT", "0");
+            std::env::set_var("INFR_GEMV_SG_MAXOUT", "999999");
+            match mode {
+                "1" => {
+                    std::env::set_var("INFR_NO_GEMV_RM", "1");
+                    std::env::set_var("INFR_NO_GEMV_SG", "1");
+                }
+                "R2" | "R4" => {
+                    std::env::remove_var("INFR_NO_GEMV_RM");
+                    std::env::set_var("INFR_NO_GEMV_SG", "1");
+                    std::env::set_var("INFR_GEMV_RM", &mode[1..]);
+                }
+                _ => {
+                    // SG NR = mode[1..]
+                    std::env::set_var("INFR_NO_GEMV_RM", "1");
+                    std::env::remove_var("INFR_NO_GEMV_SG");
+                    std::env::set_var("INFR_GEMV_SG_NR", &mode[1..]);
+                }
+            }
+        };
+        let run_once = |mode: &str| -> Vec<f32> {
+            cfg(mode);
             let rec = be.recorder().unwrap();
             rec.linear_native(dt, ws[0].as_ref(), x.as_ref(), y.as_ref(), 1, in_f, out_f);
             rec.finish().unwrap();
             read(y.as_ref(), out_f)
         };
         let base = run_once("1");
-        for rm in ["2", "4"] {
-            let got = run_once(rm);
+        // RM stays BIT-identical to the tree kernel.
+        for m in ["R2", "R4"] {
+            let got = run_once(m);
             let mism = base
                 .iter()
                 .zip(&got)
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
-            assert_eq!(mism, 0, "{label} RM={rm}: {mism} bits differ from RM=1");
+            assert_eq!(mism, 0, "{label} {m}: {mism} bits differ from tree");
+        }
+        // SG is reassociated (not bit-identical) — measure how close it stays to the tree ref.
+        let mut sg_maxrel = 0f32;
+        for m in ["S2", "S4", "S8"] {
+            let got = run_once(m);
+            let mut mr = 0f32;
+            for (a, b) in base.iter().zip(&got) {
+                let d = (a - b).abs() / (a.abs().max(b.abs()) + 1e-6);
+                mr = mr.max(d);
+            }
+            sg_maxrel = sg_maxrel.max(mr);
         }
 
         // Bandwidth A/B (cold, rotated).
-        let bench = |rm: &str| -> f64 {
-            if rm == "1" {
-                std::env::set_var("INFR_NO_GEMV_RM", "1");
-            } else {
-                std::env::remove_var("INFR_NO_GEMV_RM");
-                std::env::set_var("INFR_GEMV_RM", rm);
-            }
-            std::env::set_var("INFR_GEMV_RM_MAXOUT", "999999");
+        let bench = |mode: &str| -> f64 {
+            cfg(mode);
             let run = || {
                 let rec = be.recorder().unwrap();
                 for r in 0..reps {
@@ -125,14 +152,33 @@ fn decode_gemv_bw() {
             let us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
             wbytes as f64 / (us * 1e-6) / 1e9
         };
-        let (g1, g2, g4) = (bench("1"), bench("2"), bench("4"));
+        // Best-of-3, interleaved, to fight the ~25% thermal swing.
+        let modes = ["1", "R2", "R4", "S2", "S4", "S8"];
+        let mut best = [0f64; 6];
+        for _ in 0..3 {
+            for (i, m) in modes.iter().enumerate() {
+                best[i] = best[i].max(bench(m));
+            }
+        }
+        let [g1, r2, r4, s2, s4, s8] = best;
+        let rm_best = r2.max(r4);
+        let sg_best = s2.max(s4).max(s8);
         println!(
-            "  {label} in{in_f} out{out_f} {dt:?} [{} MiB]:  RM1 {g1:5.0}  RM2 {g2:5.0}  RM4 {g4:5.0} GB/s  (best {:+.0}%)",
+            "  {label} in{in_f} out{out_f} {dt:?} [{} MiB]:  tree {g1:5.0}  RM2 {r2:5.0} RM4 {r4:5.0}  |  SG2 {s2:5.0} SG4 {s4:5.0} SG8 {s8:5.0} GB/s  (SGbest vs tree {:+.0}%, vs RMbest {:+.0}%, maxrel {sg_maxrel:.1e})",
             wbytes >> 20,
-            (g2.max(g4) / g1 - 1.0) * 100.0,
+            (sg_best / g1 - 1.0) * 100.0,
+            (sg_best / rm_best - 1.0) * 100.0,
         );
     }
-    std::env::remove_var("INFR_NO_GEMV_RM");
-    std::env::remove_var("INFR_GEMV_RM");
-    std::env::remove_var("INFR_GEMV_RM_MAXOUT");
+    for v in [
+        "INFR_NO_GEMV_RM",
+        "INFR_GEMV_RM",
+        "INFR_GEMV_RM_MAXOUT",
+        "INFR_NO_GEMV_SG",
+        "INFR_GEMV_SG_NR",
+        "INFR_GEMV_SG_MINOUT",
+        "INFR_GEMV_SG_MAXOUT",
+    ] {
+        std::env::remove_var(v);
+    }
 }

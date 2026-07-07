@@ -410,6 +410,29 @@ fn main() {
             "native_q6k_rm4_res",
             &["-DFMT_Q6K", "-DRM=4", "-DUSE_RES"],
         ),
+        // Reassociation-tolerant subgroup + NUM_ROWS decode GEMV (wave32, subgroupAdd, no shared
+        // reduce) for the latency-STARVED out_f≈2048-8192 Q6_K projections (ffn_down / o / attn_qkv).
+        // NOT bit-identical to the tree GEMV (reordered accumulation); gated to that band only. Q6_K
+        // ONLY — on Q4_K the tree/RM kernel already saturates and SG regressed at every measured shape
+        // (decode_gemv_bw A/B), so no Q4_K SG build exists. NR ∈ {2,4,8} × {plain,res}.
+        ("native_gemv_sg", "native_q6k_sg2", &["-DFMT_Q6K", "-DNR=2"]),
+        (
+            "native_gemv_sg",
+            "native_q6k_sg2_res",
+            &["-DFMT_Q6K", "-DNR=2", "-DUSE_RES"],
+        ),
+        ("native_gemv_sg", "native_q6k_sg4", &["-DFMT_Q6K", "-DNR=4"]),
+        (
+            "native_gemv_sg",
+            "native_q6k_sg4_res",
+            &["-DFMT_Q6K", "-DNR=4", "-DUSE_RES"],
+        ),
+        ("native_gemv_sg", "native_q6k_sg8", &["-DFMT_Q6K", "-DNR=8"]),
+        (
+            "native_gemv_sg",
+            "native_q6k_sg8_res",
+            &["-DFMT_Q6K", "-DNR=8", "-DUSE_RES"],
+        ),
         // Multi-row GEMV (m = 2..8: spec verify / short suffix prefill) — mainstream dense
         // projection formats only; the rest fall back to the tiled GEMM.
         ("native_gemv_mrow", "native_mrow_q8_0", &["-DFMT_Q8_0"]),

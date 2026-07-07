@@ -183,17 +183,24 @@ cache (the multi-turn serve shape).
 | Qwen3-0.6B            | **1.24×** | **1.12×** | **2.10×** |
 | Qwen3-8B              | **1.28×** | 0.94×     | **1.32×** |
 | Qwen3-30B-A3B (MoE)   | 0.97×     | 0.91×     | **1.23×** |
-| Qwen3.5-0.8B          | 0.92×     | **1.04×** | **1.25×** |
-| Qwen3.5-4B            | 0.96×     | 0.89×     | **1.22×** |
-| Qwen3.6-35B-A3B (MoE) | **1.04×** | 0.90×     | **1.36×** |
+| Qwen3.5-0.8B          | **1.02×** | **1.04×** | **1.25×** |
+| Qwen3.5-4B            | **1.01×** | 0.89×     | **1.22×** |
+| Qwen3.6-35B-A3B (MoE) | 0.92×¹    | 0.90×     | **1.30×** |
 | Gemma-3-1B            | **1.02×** | **1.10×** | **1.11×** |
 | Gemma-4-E2B           | **1.12×** | **1.03×** | 0.99×     |
 
-infr **wins prefill and the multi-turn serve shape** across the board; decode on
-the larger models sits at ~0.90-0.94× — the memory-bandwidth wall (the dominant
-GEMVs run at 77-88 % of the card's DRAM peak, matching llama.cpp's own
-efficiency). **DiffusionGemma** (`dg-step`, the in-step-parallel metric) is at
-parity-or-better vs the reference fork.
+¹ Qwen3.6-MoE (256 experts) numbers are as of the routing-correctness fix
+(`be47c91`) — earlier figures were measured on a GPU router that only examined
+128 of the 256 experts; correct routing spreads a batch across the full pool
+(smaller per-expert GEMMs), which is why its pp512 is lower than the smaller-
+pool models. Output now matches llama.cpp token-for-token.
+
+infr **wins prefill and the multi-turn serve shape** on nearly every model (the
+two big MoEs prefill at 0.92-0.97× — correct full-expert routing costs batch
+efficiency); decode on the larger models sits at ~0.89-0.94× — the
+memory-bandwidth wall (the dominant GEMVs run at 77-88 % of the card's DRAM
+peak, matching llama.cpp's own efficiency). **DiffusionGemma** (`dg-step`, the
+in-step-parallel metric) is at parity-or-better vs the reference fork.
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf
 table: Qwen2-0.5B, Llama-3.2-1B, Gemma-4-12B (dense), and Qwen3-0.6B across

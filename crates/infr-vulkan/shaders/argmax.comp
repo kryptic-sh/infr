@@ -8,8 +8,11 @@
 // Ties: strict > plus an explicit lower-index-wins compare at every reduce step, so the result
 // matches the host argmax (first maximum) EXACTLY — slices are contiguous, so a lower partial
 // slot also means a lower global index.
+// Multi-row (MTP verify accept, issue #31): `off` selects the row — pass 1 reads
+// logits[off..off+n] (off = row*n, indices stay row-local so tie-break is per row), pass 2
+// writes out_id[off] (off = row). The recorder loops rows as sequential two-stage dispatches.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
-layout(push_constant) uniform PC { uint n; } pc;
+layout(push_constant) uniform PC { uint n; uint off; } pc;
 #ifdef PASS2
 layout(binding = 0) readonly buffer PB { float part[]; }; // [0,n): vals, [n,2n): idx bits
 layout(binding = 1) writeonly buffer OB { uint out_id[]; };
@@ -34,7 +37,7 @@ void main() {
     uint hi = min(lo + chunk, pc.n);
     for (uint i = lo + t; i < hi; i += 256u) {
         // ascending scan + strict > keeps the lowest index within this thread's stride
-        if (logits[i] > best) { best = logits[i]; bi = i; }
+        if (logits[pc.off + i] > best) { best = logits[pc.off + i]; bi = i; }
     }
 #endif
     sval[t] = best;
@@ -50,7 +53,7 @@ void main() {
     }
     if (t == 0u) {
 #ifdef PASS2
-        out_id[0] = sidx[0];
+        out_id[pc.off] = sidx[0];
 #else
         part[gl_WorkGroupID.x] = sval[0];
         part[256u + gl_WorkGroupID.x] = uintBitsToFloat(sidx[0]);

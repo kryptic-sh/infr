@@ -970,6 +970,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None,
         )?;
         Ok(())
     }
@@ -1018,6 +1019,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None,
             Some(crate::seam::DenoiseReq {
                 canvas_tokens,
                 sc_logits,
@@ -1057,6 +1059,7 @@ impl DiffusionGemmaVulkanSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,
@@ -1110,6 +1113,7 @@ impl DiffusionGemmaVulkanSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,
@@ -1168,6 +1172,7 @@ impl DiffusionGemmaMetalSession {
             None,
             None,
             None,
+            None,
         )?;
         Ok(())
     }
@@ -1203,6 +1208,7 @@ impl DiffusionGemmaMetalSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,

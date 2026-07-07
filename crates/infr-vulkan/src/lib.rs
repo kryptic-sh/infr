@@ -544,6 +544,7 @@ impl VulkanBackend {
             combined_gu: true,
             embed_gather: true,
             gpu_sample: true,
+            argmax_rows: true,
         };
 
         // ── gpu-allocator ──────────────────────────────────────────────────────

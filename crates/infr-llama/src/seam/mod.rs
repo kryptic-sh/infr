@@ -79,6 +79,7 @@ pub(crate) fn generate_dense_cpu(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -221,6 +222,7 @@ pub(crate) fn generate_dense_vulkan_session(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -295,6 +297,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -339,6 +342,7 @@ pub(crate) fn verify_dense_metal2(
         None,
         None,
         None,
+        None,
     )?;
     Ok((logits, stats.prompt_secs))
 }
@@ -380,6 +384,7 @@ pub(crate) fn verify_dense_cpu(
         |_| {},
         &mut state,
         tokens.len() + 2,
+        None,
         None,
         None,
         Some(&mut logits),
@@ -427,6 +432,7 @@ pub(crate) fn verify_dense_cpu_with_h(
         |_| {},
         &mut state,
         tokens.len() + 2,
+        None,
         None,
         None,
         Some(&mut logits),
@@ -479,6 +485,7 @@ pub(crate) fn verify_rows_cpu_with_h(
         None,
         Some(&mut logits),
         None,
+        None,
         Some(&mut h),
         None,
     )?;
@@ -517,6 +524,7 @@ pub(crate) fn verify_dense_vulkan(
         |_| {},
         &mut state,
         tokens.len() + 2,
+        None,
         None,
         None,
         Some(&mut logits),

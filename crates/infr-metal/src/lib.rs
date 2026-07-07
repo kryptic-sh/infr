@@ -225,6 +225,9 @@ impl Backend for MetalBackend {
             // exec arm for the dtypes outside the Metal set, which error loudly).
             embed_gather: true,
             gpu_sample: true,
+            // argmax_f32 is single-row (whole-buffer scan, no row offset); the MTP verify
+            // accept keeps the host-logits path on Metal — see the Op::Argmax exec arm.
+            argmax_rows: false,
         }
     }
 

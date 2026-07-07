@@ -1805,9 +1805,15 @@ fn lower_op(
                 }
             }
         }
-        Op::Argmax { x, dst, n } => {
+        Op::Argmax { x, dst, n, rows } => {
             let part = pooled(pool, be_, "argmax_part", 512 * 4)?;
-            rec.argmax(r(*x)?, pool[&part].as_ref(), r(*dst)?, *n as usize);
+            rec.argmax(
+                r(*x)?,
+                pool[&part].as_ref(),
+                r(*dst)?,
+                *n as usize,
+                *rows as usize,
+            );
         }
         // MoE FFN (single token): router GEMV → GPU-resident top-k (softmax-renorm, ×scale) →
         // fused multi-slot expert SwiGLU (gate/up share the row, down reads each slot's act) →

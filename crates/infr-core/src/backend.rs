@@ -49,6 +49,12 @@ pub struct Capabilities {
     /// sampling; only the 4-byte token id reads back). False = the runner downloads the logits
     /// and samples on the host.
     pub gpu_sample: bool,
+    /// The backend executes [`crate::Op::Argmax`] with `rows > 1` (per-row greedy argmax over
+    /// `[rows, n]` logits — the MTP speculative-verify accept reads back m 4-byte ids instead of
+    /// the m×vocab logits, issue #31). Every backend handles `rows == 1` (the decode loop);
+    /// backends whose kernel is single-row-only (Metal) leave this false and the runner keeps
+    /// the host-logits accept path there.
+    pub argmax_rows: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

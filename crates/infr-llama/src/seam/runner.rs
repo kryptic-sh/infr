@@ -74,6 +74,15 @@ pub(crate) fn generate_dense_backend(
     want_ctx: usize,
     mut constraint: Option<&mut crate::grammar::Constraint>,
     verify: Option<&mut Vec<f32>>,
+    // GPU-resident MTP verify accept (issue #31): when `Some` alongside `verify`, the VERIFY
+    // branch appends a per-row `Op::Argmax` to the batched forward and downloads the m u32
+    // greedy ids into this (leaving `verify`'s logits vec EMPTY — only m×4 bytes cross the bus,
+    // not m×vocab×4). Falls back to the full-logits download (this vec left empty, `verify`
+    // filled as before) when the backend lacks `Capabilities::argmax_rows`, when a grammar
+    // constraint needs host logits, or under INFR_NO_GPU_ARGMAX / INFR_NO_GPU_MTP_ACCEPT (A/B).
+    // The caller must handle both shapes (`ids.is_empty()` = host path). `None` everywhere but
+    // the MTP driver's `run_verify`.
+    verify_ids: Option<&mut Vec<u32>>,
     // Phase-1 DiffusionGemma validation hook: captures the LAST prompt token's raw logits (the
     // per-token loop's first `is_decode` row, i.e. the causal-prefill result) without disturbing
     // the sampled continuation. `None` everywhere else. Unlike `verify` (a batched m-row forward,
@@ -2403,13 +2412,16 @@ pub(crate) fn generate_dense_backend(
         // GPU-resident sampling: pick the token ON the device so only the 4-byte id crosses
         // back to the host (the [vocab] logits stay in VRAM). Appended last so it reads the
         // final (softcapped) logits. Greedy = Op::Argmax; stochastic = Op::Sample with the
-        // host-drawn uniform read from the 1-float `u_in` Input.
-        let (tok_id, u_in) = if gpu_argmax && logits_rows == 1 {
-            let tid = g.output(f32d(1));
+        // host-drawn uniform read from the 1-float `u_in` Input. `logits_rows > 1` with
+        // `gpu_argmax` is the MTP speculative-verify accept (issue #31): one per-row argmax,
+        // m ids read back instead of m×vocab logits.
+        let (tok_id, u_in) = if gpu_argmax {
+            let tid = g.output(f32d(logits_rows));
             g.push(Op::Argmax {
                 x: logits,
                 dst: tid,
                 n: c.vocab as u32,
+                rows: logits_rows as u32,
             });
             (Some(tid), None)
         } else if gpu_sample && logits_rows == 1 {
@@ -2916,8 +2928,29 @@ pub(crate) fn generate_dense_backend(
         // code — see mtp.rs's `generate_mtp_spec_vulkan_timed` doc on the no-rewind cost.
         let time_verify = std::env::var("INFR_MTP_TIME").is_ok();
         let full_reprefill = start == 0 && m > 1;
+        // GPU-resident verify accept (issue #31, task #31): per-row Op::Argmax appended to the
+        // batched forward — m u32 ids read back instead of the m×vocab f32 logits. Host-logits
+        // fallback: grammar constraints (llguidance needs full logits), backends without the
+        // multi-row kernel (Metal), and the A/B escapes (INFR_NO_GPU_ARGMAX covers all device
+        // argmax; INFR_NO_GPU_MTP_ACCEPT narrows to just this path).
+        let gpu_verify_ids = verify_ids.is_some()
+            && constraint.is_none()
+            && be.capabilities().argmax_rows
+            && std::env::var("INFR_NO_GPU_ARGMAX").is_err()
+            && std::env::var("INFR_NO_GPU_MTP_ACCEPT").is_err();
         let t_vbuild0 = std::time::Instant::now();
-        let (vg, vh) = build(m, start, m, false, None, false, want_h, false, false, false);
+        let (vg, vh) = build(
+            m,
+            start,
+            m,
+            false,
+            None,
+            false,
+            want_h,
+            gpu_verify_ids,
+            false,
+            false,
+        );
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
         let vplan = be.compile(&vg).map_err(|e| anyhow!("{e}"))?;
@@ -2944,6 +2977,18 @@ pub(crate) fn generate_dense_backend(
             vb.bind(*wid, wbufs[i].as_ref());
         }
         vb.bind(vh.logits, vf_logits_buf.as_ref());
+        // The m-slot id output (gpu_verify_ids builds only) — 4 bytes/row readback.
+        let vf_ids_buf = if gpu_verify_ids {
+            Some(
+                be.alloc(m * 4, BufferUsage::Readback)
+                    .map_err(|e| anyhow!("{e}"))?,
+            )
+        } else {
+            None
+        };
+        if let (Some(tid), Some(ib)) = (vh.tok_id, &vf_ids_buf) {
+            vb.bind(tid, ib.as_ref());
+        }
         if let (Some(ho), Some(hb)) = (vh.h_out, &vf_h_buf) {
             vb.bind(ho, hb.as_ref());
         }
@@ -2952,9 +2997,17 @@ pub(crate) fn generate_dense_backend(
             .map_err(|e| anyhow!("{e}"))?;
         let vexec_secs = t0.elapsed().as_secs_f64();
         let t_vdl0 = std::time::Instant::now();
-        out_logits.resize(m * c.vocab, 0.0);
-        be.download(vf_logits_buf.as_ref(), bytemuck::cast_slice_mut(out_logits))
-            .map_err(|e| anyhow!("{e}"))?;
+        if let (Some(out_ids), Some(ib)) = (verify_ids, &vf_ids_buf) {
+            // GPU accept path: m u32 ids down, the m×vocab logits stay in VRAM (`out_logits`
+            // deliberately left EMPTY — the caller keys the fallback off that).
+            out_ids.resize(m, 0);
+            be.download(ib.as_ref(), bytemuck::cast_slice_mut(out_ids))
+                .map_err(|e| anyhow!("{e}"))?;
+        } else {
+            out_logits.resize(m * c.vocab, 0.0);
+            be.download(vf_logits_buf.as_ref(), bytemuck::cast_slice_mut(out_logits))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
         if let (Some(out), Some(hb)) = (h_out.take(), &vf_h_buf) {
             out.resize(m * ne, 0.0);
             be.download(hb.as_ref(), bytemuck::cast_slice_mut(out))

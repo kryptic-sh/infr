@@ -1025,13 +1025,21 @@ pub const DEFAULT_N_MAX: usize = 6;
 /// [`generate_mtp_spec_vulkan`] needs every cycle (`crate::seam::model::SeamModel`'s own
 /// `verify_dense_*_with_h` helpers all use a FRESH one-shot session; this one threads `state`
 /// across calls so the trunk's KV/DeltaNet state persists cycle to cycle — the whole point of
-/// self-speculative decoding). Returns `(logits [m*vocab], h [m*n_embd])`, `m = tokens.len() -
+/// self-speculative decoding). Returns `(argmax ids [m], h [m*n_embd])`, `m = tokens.len() -
 /// (tokens already cached in `state`)`.
 #[allow(clippy::too_many_arguments)]
-/// One TARGET-trunk verify forward over `tokens`, returning (all-row logits, all-row hidden
-/// states) — the hidden rows are the extra tap the MTP head consumes. Backend-generic: the
-/// trunk graph is `generate_dense_backend` (which already takes `be` + a bind closure), so this
-/// drives Vulkan, Metal, or CPU by the caller's binder.
+/// One TARGET-trunk verify forward over `tokens`, returning (per-row greedy argmax ids `[m]`,
+/// all-row hidden states `[m*n_embd]`) — the hidden rows are the extra tap the MTP head
+/// consumes. Backend-generic: the trunk graph is `generate_dense_backend` (which already takes
+/// `be` + a bind closure), so this drives Vulkan, Metal, or CPU by the caller's binder.
+///
+/// GPU-resident accept (issue #31): the runner's VERIFY branch appends a per-row `Op::Argmax`
+/// when the backend supports it (`Capabilities::argmax_rows`; A/B escape via INFR_NO_GPU_ARGMAX
+/// or INFR_NO_GPU_MTP_ACCEPT) so only m×4 id bytes cross the bus, not the m×vocab f32 logits.
+/// When the device path is off (Metal, env A/B), the runner fills `logits` instead (ids left
+/// empty) and THIS function does the exact host argmax per row — either way the caller sees the
+/// same `[m]` id vector, bit-identical (both paths argmax the same f32 logits with strict-`>`
+/// lowest-index tie-break).
 fn run_verify(
     be: &dyn Backend,
     bind: &BindWeightFn,
@@ -1041,8 +1049,9 @@ fn run_verify(
     tokens: &[u32],
     state: &mut Option<crate::seam::SeamKv>,
     max_ctx: usize,
-) -> Result<(Vec<f32>, Vec<f32>)> {
+) -> Result<(Vec<u32>, Vec<f32>)> {
     let mut logits = Vec::new();
+    let mut ids = Vec::new();
     let mut h = Vec::new();
     crate::seam::generate_dense_backend(
         be,
@@ -1058,11 +1067,26 @@ fn run_verify(
         max_ctx,
         None,
         Some(&mut logits),
+        Some(&mut ids),
         None,
         Some(&mut h),
         None,
     )?;
-    Ok((logits, h))
+    if ids.is_empty() {
+        // Host fallback: the runner downloaded the m×vocab logits instead (see this fn's doc).
+        let m = h.len() / cfg.n_embd;
+        anyhow::ensure!(
+            logits.len() == m * cfg.vocab,
+            "run_verify: host-logits fallback expected {}*{} logits, got {}",
+            m,
+            cfg.vocab,
+            logits.len()
+        );
+        ids = (0..m)
+            .map(|j| argmax_row(&logits[j * cfg.vocab..(j + 1) * cfg.vocab]))
+            .collect();
+    }
+    Ok((ids, h))
 }
 
 /// Cumulative per-phase wall time + accept-rate counters over one [`generate_mtp_spec_vulkan_timed`]
@@ -1143,7 +1167,6 @@ fn generate_mtp_spec_core(
 ) -> Result<(crate::GenStats, MtpTiming)> {
     let cfg = model.config();
     let ne = cfg.n_embd;
-    let vocab = cfg.vocab;
     let n_max = DEFAULT_N_MAX;
     let time_mtp = std::env::var("INFR_MTP_TIME").is_ok();
     let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
@@ -1157,7 +1180,7 @@ fn generate_mtp_spec_core(
 
     // ── prime: one VERIFY over the whole prompt, then catch the head up over it ──────────────
     let t_prime = std::time::Instant::now();
-    let (logits0, h_rows0) = run_verify(
+    let (ids0, h_rows0) = run_verify(
         be,
         bind,
         model.gguf(),
@@ -1186,7 +1209,9 @@ fn generate_mtp_spec_core(
     let mut n_past = p;
 
     // Cycle 1's virtual leading row (see this fn's doc) — `None` from cycle 2 on, once consumed.
-    let mut leading_logits: Option<Vec<f32>> = Some(logits0[(p - 1) * vocab..].to_vec());
+    // Only the row's greedy ARGMAX ID is needed (the accept rule below never reads raw logits),
+    // so the GPU-resident verify accept (issue #31) hands back just the ids.
+    let mut leading_id: Option<u32> = Some(ids0[p - 1]);
     let mut leading_h: Option<Vec<f32>> = Some(pending_h.clone());
 
     let mut acc: Vec<u32> = Vec::new();
@@ -1224,7 +1249,7 @@ fn generate_mtp_spec_core(
         let mut feed = committed.clone();
         feed.extend_from_slice(&cand);
         let t_verify = std::time::Instant::now();
-        let (logits, h_rows) = run_verify(
+        let (vids, h_rows) = run_verify(
             be,
             bind,
             model.gguf(),
@@ -1237,17 +1262,13 @@ fn generate_mtp_spec_core(
         let verify_secs = t_verify.elapsed().as_secs_f64();
         let m = h_rows.len() / ne;
 
-        let has_leading = leading_logits.is_some();
-        let varg: Vec<u32> = if let (Some(ll), Some(_)) = (&leading_logits, &leading_h) {
+        let has_leading = leading_id.is_some();
+        let varg: Vec<u32> = if let (Some(lid), Some(_)) = (leading_id, &leading_h) {
             debug_assert_eq!(m, cand.len(), "cycle 1 verify carries no leading row");
-            std::iter::once(argmax_row(ll))
-                .chain((0..cand.len()).map(|j| argmax_row(&logits[j * vocab..(j + 1) * vocab])))
-                .collect()
+            std::iter::once(lid).chain(vids.iter().copied()).collect()
         } else {
             let base = m - (cand.len() + 1);
-            (0..=cand.len())
-                .map(|j| argmax_row(&logits[(base + j) * vocab..(base + j + 1) * vocab]))
-                .collect()
+            vids[base..].to_vec()
         };
 
         let (accepted, next_tok) = crate::seam::model::spec_accept(&cand, &varg);
@@ -1258,7 +1279,7 @@ fn generate_mtp_spec_core(
         // leading row, rows 1.. are this cycle's own verify output (see this fn's doc).
         let catchup_h_all: Vec<f32> = if has_leading {
             let mut v = leading_h.take().expect("has_leading implies Some");
-            leading_logits = None;
+            leading_id = None;
             v.extend_from_slice(&h_rows);
             v
         } else {

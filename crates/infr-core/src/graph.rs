@@ -266,11 +266,20 @@ pub enum Op {
         cap: f32,
         n: u32,
     },
-    /// `dst[0] = argmax(x[0..n])` as a u32 bit-pattern in an f32 tensor slot. Greedy sampling on
-    /// the device: the generated token id is the ONLY thing that crosses back to the host
-    /// (4 bytes), not the `[vocab]` logits. Strict `>` keeps the lowest index on ties, matching
-    /// the host-side sampler.
-    Argmax { x: TensorId, dst: TensorId, n: u32 },
+    /// `dst[r] = argmax(x[r*n..(r+1)*n])` for `rows` rows, each id a u32 bit-pattern in an f32
+    /// tensor slot. Greedy sampling on the device: the generated token id(s) are the ONLY thing
+    /// that crosses back to the host (4 bytes/row), not the `[rows, vocab]` logits. Strict `>`
+    /// keeps the lowest index on ties (per row), matching the host-side sampler. `rows == 1` is
+    /// the decode-loop shape; `rows > 1` is the MTP speculative-verify accept (issue #31) —
+    /// small m, so backends may run m sequential single-row reductions (a whole-vocab
+    /// single-workgroup scan measured SLOWER than the download it replaced). Backends without
+    /// multi-row support advertise `Capabilities::argmax_rows == false`; the runner gates.
+    Argmax {
+        x: TensorId,
+        dst: TensorId,
+        n: u32,
+        rows: u32,
+    },
     /// Device-side stochastic sampling: `dst[0] = sample(x[0..n])` (u32 id bit-pattern in the f32
     /// slot) via temperature + top-k + top-p, inverse-CDF'd with the uniform draw read from the
     /// 1-float `u` Input — the host draws u (4 bytes/token) and reads back only the id, the

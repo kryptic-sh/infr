@@ -3301,30 +3301,38 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Greedy argmax over `n` logits → token id (u32) in `out_id[0]`. One workgroup; lets greedy
-    /// decode read back a 4-byte token instead of the whole vocab logits.
-    pub fn argmax(&self, logits: &dyn Buffer, part: &dyn Buffer, out_id: &dyn Buffer, n: usize) {
+    /// Greedy argmax over `[rows, n]` logits → token ids (u32) in `out_id[0..rows]`. Lets greedy
+    /// decode (rows == 1) and the MTP verify accept (rows == m, issue #31) read back 4 bytes/row
+    /// instead of the whole vocab logits.
+    pub fn argmax(
+        &self,
+        logits: &dyn Buffer,
+        part: &dyn Buffer,
+        out_id: &dyn Buffer,
+        n: usize,
+        rows: usize,
+    ) {
         // Two-stage (see argmax.comp): 256 slice partials in parallel across the GPU, then a
-        // one-workgroup reduce. `part` = 512 f32 scratch (vals + idx bit-patterns).
+        // one-workgroup reduce. `part` = 512 f32 scratch (vals + idx bit-patterns), reused across
+        // rows — the hazard tracker orders row r+1's partial pass after row r's reduce (WAR).
+        // Rows loop sequentially (m is small, 2-7 for MTP); a single-workgroup whole-vocab scan
+        // measured 18% SLOWER than the download it replaced, so each row keeps the full
+        // 256-workgroup two-stage shape.
         self.stamp("argmax");
         let k1 = self
             .be
-            .kernel("argmax_part", crate::gemm::argmax_part_spv(), 2, 4);
-        self.dispatch(
-            k1,
-            &[Self::vkb(logits), Self::vkb(part)],
-            1,
-            &(n as u32).to_ne_bytes(),
-            256,
-        );
-        let k2 = self.be.kernel("argmax", crate::gemm::argmax_spv(), 2, 4);
-        self.dispatch(
-            k2,
-            &[Self::vkb(part), Self::vkb(out_id)],
-            1,
-            &256u32.to_ne_bytes(),
-            1,
-        );
+            .kernel("argmax_part", crate::gemm::argmax_part_spv(), 2, 8);
+        let k2 = self.be.kernel("argmax", crate::gemm::argmax_spv(), 2, 8);
+        for row in 0..rows {
+            let mut p1 = [0u8; 8];
+            p1[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+            p1[4..8].copy_from_slice(&((row * n) as u32).to_ne_bytes());
+            self.dispatch(k1, &[Self::vkb(logits), Self::vkb(part)], 1, &p1, 256);
+            let mut p2 = [0u8; 8];
+            p2[0..4].copy_from_slice(&256u32.to_ne_bytes());
+            p2[4..8].copy_from_slice(&(row as u32).to_ne_bytes());
+            self.dispatch(k2, &[Self::vkb(part), Self::vkb(out_id)], 1, &p2, 1);
+        }
     }
 
     /// Emit an UNCONDITIONAL full compute→compute memory barrier. The chained decode replays one

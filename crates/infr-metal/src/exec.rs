@@ -2085,9 +2085,18 @@ impl MetalBackend {
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
-            Op::Argmax { x, dst, n } => {
+            Op::Argmax { x, dst, n, rows } => {
                 // Greedy device-side sampling: one 256-thread threadgroup, the token id (u32
                 // bit-pattern in the f32 slot) is the only readback greedy decode needs.
+                // Single-row only (argmax_f32 scans the whole buffer with no row offset) —
+                // `Capabilities::argmax_rows` is false so the runner never builds a multi-row
+                // Argmax for Metal (the MTP verify accept keeps the host-logits path there).
+                if rows != 1 {
+                    return Err(Error::Unsupported(
+                        "metal backend: Op::Argmax rows > 1 (MTP verify accept) not implemented"
+                            .into(),
+                    ));
+                }
                 let bx = self.ensure_device(r, x);
                 let bd = self.dev_dst(r, dst, 1);
                 let pso = self.pipelines.get("argmax_f32")?;

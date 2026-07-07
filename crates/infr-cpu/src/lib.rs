@@ -299,6 +299,7 @@ impl Backend for CpuBackend {
             combined_gu: false,
             embed_gather: true,
             gpu_sample: true,
+            argmax_rows: true,
         }
     }
 
@@ -1265,20 +1266,26 @@ impl Backend for CpuBackend {
                     }
                     vals[dst.0 as usize] = vec![f32::from_bits(tok)];
                 }
-                Op::Argmax { x, dst, n } => {
+                Op::Argmax { x, dst, n, rows } => {
                     // Greedy device-side sampling: strict `>` keeps the lowest index on ties —
-                    // identical to the host sampler's argmax. The id is stored as a u32
-                    // bit-pattern in the f32 slot (the graph's only tensor dtype).
-                    let xs = &vals[x.0 as usize][..n as usize];
-                    let mut best = f32::NEG_INFINITY;
-                    let mut bi = 0u32;
-                    for (i, &v) in xs.iter().enumerate() {
-                        if v > best {
-                            best = v;
-                            bi = i as u32;
+                    // identical to the host sampler's argmax (per row). Each id is stored as a
+                    // u32 bit-pattern in the f32 slot (the graph's only tensor dtype). rows == 1
+                    // is the decode loop; rows > 1 is the MTP verify accept (issue #31).
+                    let n = n as usize;
+                    let mut out = Vec::with_capacity(rows as usize);
+                    for r in 0..rows as usize {
+                        let xs = &vals[x.0 as usize][r * n..(r + 1) * n];
+                        let mut best = f32::NEG_INFINITY;
+                        let mut bi = 0u32;
+                        for (i, &v) in xs.iter().enumerate() {
+                            if v > best {
+                                best = v;
+                                bi = i as u32;
+                            }
                         }
+                        out.push(f32::from_bits(bi));
                     }
-                    vals[dst.0 as usize] = vec![f32::from_bits(bi)];
+                    vals[dst.0 as usize] = out;
                 }
                 Op::Copy {
                     src,

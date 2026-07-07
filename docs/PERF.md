@@ -100,9 +100,31 @@ Micro-probes live in `crates/infr-metal/tests/` (`gemv_bw`, `dispatch_overhead`)
 — chained-dispatch numbers there are thermally unstable across back-to-back
 runs; trust e2e benches for accept / revert calls.
 
-- `INFR_PROF2` prints one block per submit. **Trust the percentages and per-op
-  relative times; the absolute µs totals can overflow.** The op label breakdown
-  is the primary signal.
+- `INFR_PROF2` prints one block per submit plus ONE aggregated
+  `INFR_PROF2 GPU report` at process exit (per-label totals summed over every
+  profiled submit — no more awk-summing blocks by hand). **Trust the percentages
+  and per-op relative times; the absolute µs totals can overflow.** The op label
+  breakdown is the primary signal.
+- **Labels are automatic.** Every dispatch is timestamped at the recorder's
+  dispatch chokepoints and labeled with its **kernel name** (the
+  `be.kernel("name", …)` cache key travels on `ComputeKernel`). Adding a stamp
+  call for a new kernel is no longer a thing — a new kernel shows up in the
+  report by existing. Labels are per-dispatch; aggregation by name happens at
+  report time (the old stamp-covers-several-dispatches grouping is gone, which
+  also un-hides dispatches that used to melt into the previous label's bucket).
+  `Recorder::label_next("…")` remains as a one-shot override for kernels whose
+  name alone is ambiguous (e.g. `expert_gateup` vs `expert_down` share one MMQ
+  kernel; the `lin_vocab_out`/`lin_vocab_in` lm_head-vs-projection split).
+  Buffer copies and fills stamp as `copy_buffer` / `zero_fill`.
+- `INFR_PROF2_SHAPES=1` (on top of `INFR_PROF2`) swaps GEMV/GEMM labels for
+  shape-itemized ones (`mmvr:m4:1536x24576`) — per-route, per-projection-shape
+  buckets.
+- `infr bench` excludes its untimed warmup + depth-warm turns from the profile
+  (they run with PROF2 suppressed and the exit aggregate is reset after warmup),
+  so the report covers exactly the timed reps.
+- Decode's record-once replay tape cannot carry per-replay timestamps (queries
+  are baked at record time), so the replayed decode path reports nothing — set
+  `INFR_SEAM_NO_REPLAY=1` to force the re-recorded path when profiling decode.
 - Sum GEMM-ish labels vs elementwise labels vs attention. Then look at **op
   counts**: 50k dispatches per chunk is a finding in itself, regardless of what
   any one op costs.
@@ -181,10 +203,16 @@ the "no source markers at all" niche. (A proc-macro attribute on non-inline
 **Deprecation rule:** do not add new one-off `Instant::now()` accumulators or
 env-gated eprintln timers (`INFR_PROF_DEC`-style) — build with `INFR_PROFILE=1`
 instead. The existing `INFR_PROF*` env gates stay until this system has proven
-itself in a few campaigns, then get removed. GPU-side timing is unchanged:
-`INFR_PROF2` timestamp queries are device-side and cannot be auto-injected — use
-both reports side by side (host report tells you _that_ the GPU path waits in
-`replay_n`; PROF2 tells you which ops the GPU spent it on).
+itself in a few campaigns, then get removed. GPU-side timing is the same idea at
+the dispatch chokepoint: `INFR_PROF2` device timestamps are auto-labeled with
+the kernel name (no manual stamp calls — see the Profiling section above), but
+stay **runtime**-gated, not build-gated: timestamp queries cost nothing when
+off, and toggling GPU profiling without a rebuild is worth keeping. The two
+compose: run an `INFR_PROFILE=1` build with `INFR_PROF2=1` and the exit report
+prints the host function table AND the GPU op aggregate in one output
+(`INFR_PROFILE_OUT` JSON carries both as `"sites"` + `"gpu"`) — the host section
+tells you _that_ the GPU path waits in `replay_n`; the GPU section tells you
+which ops the GPU spent it on.
 
 ### CPU profiling (samply)
 

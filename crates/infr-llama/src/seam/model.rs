@@ -631,15 +631,36 @@ impl SeamModel {
             )?;
             Ok(stats)
         };
+        // Untimed work must stay out of the INFR_PROF2 profile: the warmup turn's m7 batched
+        // rows and the depth warm's huge prefill would otherwise dominate/pollute the per-shape
+        // aggregate for the tiny timed shape (recorders read the env at construction, so
+        // suppressing it around a run() disables their timestamps entirely). Same pattern as
+        // DenseSeamChat::warmup. `gpu_reset` additionally drops anything profiled before the
+        // timed reps (e.g. session-init submits) from the exit aggregate.
+        let unprofiled = |prompt_len: usize,
+                          gen: usize,
+                          state: &mut Option<crate::seam::SeamKv>|
+         -> Result<crate::GenStats> {
+            let prof2 = std::env::var_os("INFR_PROF2");
+            if prof2.is_some() {
+                std::env::remove_var("INFR_PROF2");
+            }
+            let r = run(prompt_len, gen, state);
+            if let Some(v) = prof2 {
+                std::env::set_var("INFR_PROF2", v);
+            }
+            r
+        };
         // Untimed warmup: uploads the weights and compiles every pipeline the timed reps hit.
-        run(8, 2, &mut state)?;
+        unprofiled(8, 2, &mut state)?;
+        infr_prof_rt::gpu_reset();
         let mut samples = Vec::with_capacity(reps);
         for _ in 0..reps.max(1) {
             if let Some(st) = state.as_mut() {
                 st.reset();
             }
             if depth > 0 {
-                run(depth, 0, &mut state)?; // warm the cache to `depth` (untimed)
+                unprofiled(depth, 0, &mut state)?; // warm the cache to `depth` (untimed)
             }
             if let Some((p, g)) = pg {
                 // coding-agent turn: prompt ingest + reply generation timed together.

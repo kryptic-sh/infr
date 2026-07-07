@@ -18,6 +18,9 @@ use super::{as_vk_buf, be, VulkanBackend};
 /// Cached, reusable compute objects for one kernel. All fields are Vulkan handles (Copy).
 #[derive(Clone, Copy)]
 pub(crate) struct ComputeKernel {
+    /// The cache key passed to [`VulkanBackend::kernel`] — the INFR_PROF2 auto-label: every
+    /// recorder dispatch stamps its timestamp with this name (no manual stamp calls).
+    pub name: &'static str,
     pub shader: vk::ShaderModule,
     pub ds_layout: vk::DescriptorSetLayout,
     pub pipeline_layout: vk::PipelineLayout,
@@ -31,6 +34,7 @@ pub(crate) struct ComputeKernel {
 pub(crate) fn make_compute_kernel(
     device: &ash::Device,
     pcache: vk::PipelineCache,
+    name: &'static str,
     spv: &[u32],
     n_buf: usize,
     push_size: u32,
@@ -113,6 +117,7 @@ pub(crate) fn make_compute_kernel(
     .expect("desc pool");
 
     ComputeKernel {
+        name,
         shader,
         ds_layout,
         pipeline_layout,
@@ -150,6 +155,7 @@ impl VulkanBackend {
         let k = make_compute_kernel(
             &self.shared.device,
             self.shared.pipeline_cache,
+            name,
             spv,
             n_buf,
             push_size,
@@ -176,6 +182,7 @@ impl VulkanBackend {
         let k = make_compute_kernel(
             &self.shared.device,
             self.shared.pipeline_cache,
+            name,
             spv,
             n_buf,
             push_size,

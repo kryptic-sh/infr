@@ -17,6 +17,13 @@
 //!
 //! This crate compiles to dead code in default builds — nothing calls it unless a crate was
 //! built with the `infr_profile` cfg (emitted by build.rs when `INFR_PROFILE=1`).
+//!
+//! It ALSO hosts the process-wide **GPU op aggregate** ([`gpu_add`] / [`gpu_reset`]): the Vulkan
+//! recorder's `INFR_PROF2` per-dispatch timestamps feed per-label totals here on every submit,
+//! and the exit report prints them as a separate GPU section (and a `"gpu"` array in the
+//! `INFR_PROFILE_OUT` JSON). This path is runtime-gated (INFR_PROF2), not build-gated — in a
+//! default build with INFR_PROF2 set, the exit report contains only the GPU section; in an
+//! `INFR_PROFILE=1` build it merges with the host function table in one report.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -162,6 +169,31 @@ fn global() -> &'static Global {
     })
 }
 
+/// Process-wide GPU op aggregate: label → (total µs, dispatch count). Fed per submit by the
+/// Vulkan recorder's INFR_PROF2 timestamp readback; printed as the GPU section of [`report`].
+/// A Mutex is fine — this is touched once per submit (not per dispatch), profiling runs only.
+static GPU: Mutex<Vec<(String, f64, u64)>> = Mutex::new(Vec::new());
+
+/// Accumulate `us` GPU-microseconds / `count` dispatches under `label`. Registers the exit
+/// report (idempotent) so a default build with only INFR_PROF2 set still prints the aggregate.
+pub fn gpu_add(label: &str, us: f64, count: u64) {
+    let _ = global(); // ensure the atexit report hook exists
+    let mut g = GPU.lock().unwrap();
+    match g.iter_mut().find(|(l, _, _)| l == label) {
+        Some(row) => {
+            row.1 += us;
+            row.2 += count;
+        }
+        None => g.push((label.to_string(), us, count)),
+    }
+}
+
+/// Clear the GPU aggregate. Benches call this after their untimed warmup so warmup dispatches
+/// (pipeline compiles' first submits, cache-warming turns) don't pollute the exit report.
+pub fn gpu_reset() {
+    GPU.lock().unwrap().clear();
+}
+
 /// Open a span for `site` on the current thread. Returns an RAII guard; span closes when the
 /// guard drops (any exit path). Must be strictly LIFO per thread — guaranteed because the guard
 /// is a local of the instrumented fn.
@@ -273,9 +305,11 @@ fn fmt_ns(ns: u64) -> String {
     }
 }
 
-/// Print the merged profile to stderr (top entries by self time) and, if `INFR_PROFILE_OUT` is
-/// set, write the full table as JSON to that path. Runs automatically at process exit; may also
-/// be called on demand.
+/// Print the merged profile to stderr and, if `INFR_PROFILE_OUT` is set, write the full table
+/// as JSON to that path. Two sections, each printed only when it has data: the host function
+/// table (build-time instrumentation, `INFR_PROFILE=1` builds) and the GPU op aggregate
+/// (runtime `INFR_PROF2` timestamps fed via [`gpu_add`]). Runs automatically at process exit;
+/// may also be called on demand.
 pub fn report() {
     // atexit may fire in odd states; never run twice.
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -286,43 +320,70 @@ pub fn report() {
         return;
     }
     let (rows, n_threads, wall_ns) = collect();
-    if rows.is_empty() {
+    let mut gpu: Vec<(String, f64, u64)> = GPU.lock().unwrap().clone();
+    gpu.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    if rows.is_empty() && gpu.is_empty() {
         return;
     }
-    let accounted: u64 = rows.iter().map(|r| r.self_ns).sum();
-    eprintln!();
-    eprintln!(
-        "== INFR_PROFILE report: {} sites, {} threads, wall {} (since first instrumented call), accounted self {} ==",
-        rows.len(),
-        n_threads,
-        fmt_ns(wall_ns),
-        fmt_ns(accounted),
-    );
-    eprintln!(
-        "{:>12} {:>7} {:>12} {:>12} {:>10}  function",
-        "self", "self%", "total", "calls", "avg(self)"
-    );
-    const TOP: usize = 50;
-    for r in rows.iter().take(TOP) {
+    if !rows.is_empty() {
+        let accounted: u64 = rows.iter().map(|r| r.self_ns).sum();
+        eprintln!();
         eprintln!(
-            "{:>12} {:>6.2}% {:>12} {:>12} {:>10}  {}",
-            fmt_ns(r.self_ns),
-            100.0 * r.self_ns as f64 / wall_ns.max(1) as f64,
-            fmt_ns(r.total_ns),
-            r.count,
-            fmt_ns(r.self_ns / r.count.max(1)),
-            r.name
+            "== INFR_PROFILE report: {} sites, {} threads, wall {} (since first instrumented call), accounted self {} ==",
+            rows.len(),
+            n_threads,
+            fmt_ns(wall_ns),
+            fmt_ns(accounted),
         );
+        eprintln!(
+            "{:>12} {:>7} {:>12} {:>12} {:>10}  function",
+            "self", "self%", "total", "calls", "avg(self)"
+        );
+        const TOP: usize = 50;
+        for r in rows.iter().take(TOP) {
+            eprintln!(
+                "{:>12} {:>6.2}% {:>12} {:>12} {:>10}  {}",
+                fmt_ns(r.self_ns),
+                100.0 * r.self_ns as f64 / wall_ns.max(1) as f64,
+                fmt_ns(r.total_ns),
+                r.count,
+                fmt_ns(r.self_ns / r.count.max(1)),
+                r.name
+            );
+        }
+        if rows.len() > TOP {
+            eprintln!(
+                "  ... {} more sites (set INFR_PROFILE_OUT=path for the full table as JSON)",
+                rows.len() - TOP
+            );
+        }
     }
-    if rows.len() > TOP {
+    if !gpu.is_empty() {
+        let total_us: f64 = gpu.iter().map(|(_, us, _)| us).sum();
+        let total_n: u64 = gpu.iter().map(|(_, _, n)| n).sum();
+        eprintln!();
         eprintln!(
-            "  ... {} more sites (set INFR_PROFILE_OUT=path for the full table as JSON)",
-            rows.len() - TOP
+            "== INFR_PROF2 GPU report: {} ops, {total_n} dispatches, GPU total {} (all submits; warmup excluded where the bench resets) ==",
+            gpu.len(),
+            fmt_ns((total_us * 1e3) as u64),
         );
+        eprintln!(
+            "{:>12} {:>7} {:>12} {:>10}  gpu op",
+            "total", "gpu%", "dispatches", "avg"
+        );
+        for (label, us, count) in &gpu {
+            eprintln!(
+                "{:>12} {:>6.2}% {:>12} {:>10}  {label}",
+                fmt_ns((us * 1e3) as u64),
+                100.0 * us / total_us.max(f64::MIN_POSITIVE),
+                count,
+                fmt_ns((us * 1e3) as u64 / count.max(&1)),
+            );
+        }
     }
     if let Ok(path) = std::env::var("INFR_PROFILE_OUT") {
         if !path.is_empty() {
-            match write_json(&path, &rows, n_threads, wall_ns) {
+            match write_json(&path, &rows, &gpu, n_threads, wall_ns) {
                 Ok(()) => eprintln!("profile JSON written to {path}"),
                 Err(e) => eprintln!("failed to write INFR_PROFILE_OUT={path}: {e}"),
             }
@@ -330,20 +391,37 @@ pub fn report() {
     }
 }
 
-fn write_json(path: &str, rows: &[Row], n_threads: usize, wall_ns: u64) -> std::io::Result<()> {
+fn write_json(
+    path: &str,
+    rows: &[Row],
+    gpu: &[(String, f64, u64)],
+    n_threads: usize,
+    wall_ns: u64,
+) -> std::io::Result<()> {
     use std::io::Write;
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(f, "{{")?;
     writeln!(f, "  \"wall_ns\": {wall_ns},")?;
     writeln!(f, "  \"threads\": {n_threads},")?;
     writeln!(f, "  \"sites\": [")?;
     for (i, r) in rows.iter().enumerate() {
-        let name = r.name.replace('\\', "\\\\").replace('"', "\\\"");
+        let name = esc(&r.name);
         let comma = if i + 1 < rows.len() { "," } else { "" };
         writeln!(
             f,
             "    {{\"name\": \"{name}\", \"calls\": {}, \"total_ns\": {}, \"self_ns\": {}}}{comma}",
             r.count, r.total_ns, r.self_ns
+        )?;
+    }
+    writeln!(f, "  ],")?;
+    writeln!(f, "  \"gpu\": [")?;
+    for (i, (label, us, count)) in gpu.iter().enumerate() {
+        let label = esc(label);
+        let comma = if i + 1 < gpu.len() { "," } else { "" };
+        writeln!(
+            f,
+            "    {{\"label\": \"{label}\", \"dispatches\": {count}, \"total_us\": {us:.1}}}{comma}",
         )?;
     }
     writeln!(f, "  ]")?;

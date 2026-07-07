@@ -52,14 +52,22 @@ pub struct Recorder<'a> {
     no_barrier: bool,
     full_barrier: bool,
     prof: bool,
-    /// Per-op GPU timestamp profiling (INFR_PROF2): a timestamp before each op + one at finish,
-    /// attributed to per-op-type labels.
+    /// Per-op GPU timestamp profiling (INFR_PROF2): a timestamp before EVERY dispatch — labeled
+    /// automatically with the dispatched kernel's name at the `dispatch3`/`dispatch_indirect`
+    /// chokepoints — plus one at finish. No manual stamp calls; aggregation by label happens at
+    /// report time.
     prof2: bool,
+    /// INFR_PROF2_SHAPES (on top of INFR_PROF2): GEMV/GEMM dispatches get shape-itemized labels
+    /// (`kind:mM:KxN`) instead of the bare kernel name. Read once at construction.
+    prof2_shapes: bool,
     query_pool: vk::QueryPool,
     ts_labels: RefCell<Vec<&'static str>>,
-    /// One-shot prof2 label override: the next `stamp()` uses this instead of its default, then
-    /// clears it. Lets a caller attribute a generic op (e.g. a `linear` used for the vocab head vs a
-    /// projection) to a distinct bucket without per-op API plumbing.
+    /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
+    ts_dropped: std::cell::Cell<usize>,
+    /// One-shot prof2 label override: the NEXT dispatch's timestamp uses this instead of the
+    /// kernel name, then clears it. Lets a caller attribute a generic kernel (e.g. the lm_head
+    /// GEMM vs a projection, expert gate_up vs down) to a distinct bucket without per-op API
+    /// plumbing.
     next_label: std::cell::Cell<Option<&'static str>>,
     /// Record-once: when set, the command buffer is begun resubmittable (no ONE_TIME_SUBMIT) and
     /// `finish_record` hands back its cmd buffer + pool (a [`RecordedCmd`]) instead of submitting and
@@ -115,10 +123,14 @@ impl<'a> Recorder<'a> {
         // Big pool: one descriptor set per recorded op.
         let pool = Self::new_desc_pool(device)?;
 
-        const MAX_TS: u32 = 8192;
+        // Per-DISPATCH stamps (auto-labels): a batched prefill chunk can record tens of
+        // thousands of dispatches; 64k × 8 B = 512 KiB of query pool, profiling runs only.
+        // Overflow is counted (`ts_dropped`) and reported, never UB.
+        const MAX_TS: u32 = Recorder::<'_>::MAX_TS;
         // No per-op profiling on the persistent (replayed) path — the recorder is dropped after
         // recording, so it can't report timestamps for replays.
         let prof2 = std::env::var("INFR_PROF2").is_ok() && !persistent;
+        let prof2_shapes = prof2 && std::env::var("INFR_PROF2_SHAPES").is_ok();
         let query_pool = if prof2 {
             let qp = unsafe {
                 device.create_query_pool(
@@ -148,8 +160,10 @@ impl<'a> Recorder<'a> {
             full_barrier: std::env::var("INFR_FULLBARRIER").is_ok(),
             prof: std::env::var("INFR_PROF").is_ok(),
             prof2,
+            prof2_shapes,
             query_pool,
             ts_labels: RefCell::new(Vec::new()),
+            ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
             persistent,
             t0: std::time::Instant::now(),
@@ -167,39 +181,36 @@ impl<'a> Recorder<'a> {
         self.suppress.set(on);
     }
 
-    /// Override the label of the NEXT profiled op (INFR_PROF2). Consumed once. No-op without prof2.
+    /// Override the label of the NEXT dispatch's timestamp (INFR_PROF2). Consumed once — a
+    /// pre-set override wins over the automatic kernel-name label AND over the shape itemizers
+    /// below. No-op without prof2.
     pub fn label_next(&self, label: &'static str) {
         if self.prof2 {
             self.next_label.set(Some(label));
         }
     }
 
-    /// Stamp a GEMV-class op: with INFR_PROF2_SHAPES set (on top of INFR_PROF2), the label
-    /// itemizes route + shape (`kind:mM:in_fxout_f` — e.g. `mmvr:m4:1536x24576`), splitting the
-    /// otherwise-monolithic "lm_head" bucket per kernel and per projection shape. This is what
-    /// made the E2B pp4 63%-GEMV attribution actionable (llama.cpp's perf logger itemizes per
-    /// shape; the flat bucket didn't). The labels leak one small string per op per record —
-    /// profiling-only, gated off in production.
-    fn stamp_gemv(&self, kind: &'static str, rows: usize, in_f: usize, out_f: usize) {
-        if self.prof2 && std::env::var("INFR_PROF2_SHAPES").is_ok() {
+    /// Shape-itemize the next GEMV-class dispatch: with INFR_PROF2_SHAPES set (on top of
+    /// INFR_PROF2), its label becomes `kind:mM:in_fxout_f` (e.g. `mmvr:m4:1536x24576`) instead of
+    /// the bare kernel name, splitting the bucket per route and per projection shape. This is
+    /// what made the E2B pp4 63%-GEMV attribution actionable (llama.cpp's perf logger itemizes
+    /// per shape; a flat bucket didn't). A pending `label_next` override wins. The labels leak
+    /// one small string per op per record — profiling-only, gated off in production.
+    fn label_gemv(&self, kind: &'static str, rows: usize, in_f: usize, out_f: usize) {
+        if self.prof2_shapes && self.next_label.get().is_none() {
             let s: &'static str =
                 Box::leak(format!("{kind}:m{rows}:{in_f}x{out_f}").into_boxed_str());
-            self.stamp(s);
-        } else {
-            self.stamp("lm_head");
+            self.next_label.set(Some(s));
         }
     }
 
-    /// Stamp a GEMM-class op: with INFR_PROF2_SHAPES set (on top of INFR_PROF2), the label
-    /// itemizes kernel + shape (`kernel:mM:kxn`), splitting the otherwise-monolithic
-    /// "matmul_proj" bucket per kernel route and per projection shape (same rationale as
-    /// [`stamp_gemv`](Self::stamp_gemv)). Profiling-only; the leak is gated off in production.
-    fn stamp_gemm(&self, kernel: &'static str, m: usize, k: usize, n: usize) {
-        if self.prof2 && std::env::var("INFR_PROF2_SHAPES").is_ok() {
+    /// Shape-itemize the next GEMM-class dispatch (`kernel:mM:kxn` under INFR_PROF2_SHAPES —
+    /// same rationale as [`label_gemv`](Self::label_gemv)). Profiling-only; the leak is gated
+    /// off in production.
+    fn label_gemm(&self, kernel: &'static str, m: usize, k: usize, n: usize) {
+        if self.prof2_shapes && self.next_label.get().is_none() {
             let s: &'static str = Box::leak(format!("{kernel}:m{m}:{k}x{n}").into_boxed_str());
-            self.stamp(s);
-        } else {
-            self.stamp("matmul_proj");
+            self.next_label.set(Some(s));
         }
     }
 
@@ -242,13 +253,24 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// Query-pool capacity (timestamps per recorder). Stamps past `MAX_TS - 1` (one slot is
+    /// reserved for the closing timestamp in `finish`) are dropped and counted.
+    const MAX_TS: u32 = 65536;
+
     /// Record a profiling timestamp (BOTTOM_OF_PIPE) tagged with an op label, if INFR_PROF2.
+    /// Called automatically at the dispatch chokepoints with the kernel name — op methods no
+    /// longer stamp by hand (use [`label_next`](Self::label_next) to override a too-generic
+    /// kernel name).
     fn stamp(&self, label: &'static str) {
         if !self.prof2 {
             return;
         }
         let label = self.next_label.take().unwrap_or(label);
         let idx = self.ts_labels.borrow().len() as u32;
+        if idx >= Self::MAX_TS - 1 {
+            self.ts_dropped.set(self.ts_dropped.get() + 1);
+            return;
+        }
         unsafe {
             self.be.shared.device.cmd_write_timestamp(
                 self.cmd,
@@ -420,6 +442,11 @@ impl<'a> Recorder<'a> {
         args: vk::Buffer,
         args_off: u64,
     ) {
+        // Auto-label (INFR_PROF2): every dispatch stamps a timestamp tagged with its kernel name
+        // — the chokepoint knows the kernel, so no op method needs a manual stamp call. Placed
+        // before `sync` so a barrier's cost lands in the op it fences (same as the old
+        // stamp-at-op-start convention). One `prof2` branch when profiling is off.
+        self.stamp(k.name);
         let split = buffers.len() - n_out;
         let (reads, writes) = buffers.split_at(split);
         let mut all_reads: Vec<vk::Buffer> = reads.to_vec();
@@ -454,6 +481,8 @@ impl<'a> Recorder<'a> {
         gy: u32,
         gz: u32,
     ) {
+        // Auto-label (INFR_PROF2): see `dispatch_indirect` — kernel-name timestamp per dispatch.
+        self.stamp(k.name);
         // The last `n_out` bound buffers are outputs; the rest are inputs. Inputs keep in-place
         // buffers (e.g. rope x==y) so a RAW from a prior op is still seen.
         let split = buffers.len() - n_out;
@@ -490,7 +519,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp_gemv("lin_f16", rows, in_f, out_f);
+        self.label_gemv("lin_f16", rows, in_f, out_f);
         let k = self
             .be
             .kernel("linear_f16", crate::gemm::linear_f16_spv(), 3, 12);
@@ -521,7 +550,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp_gemv("lin_f32", rows, in_f, out_f);
+        self.label_gemv("lin_f32", rows, in_f, out_f);
         // Prefill (rows>1): the ROW-TILED f32 GEMM reads each weight once per 8 rows (grid
         // out_f·ceil(rows/8)) instead of once per row — bit-identical, cuts the F32-projection
         // weight re-reads (E2B inp_gate/proj, qwen3moe router). Decode (rows==1) keeps the 1-row
@@ -600,7 +629,7 @@ impl<'a> Recorder<'a> {
         } else {
             ("gemm_proj", crate::gemm::gemm_proj_spv(), n / 64)
         };
-        self.stamp_gemm(name, m, k, n);
+        self.label_gemm(name, m, k, n);
         let kern = self.be.kernel_sg(name, spv, 5, 20, 32);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
@@ -704,7 +733,7 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_build_spv(dtype).expect("native GEMM spv"),
             ),
         };
-        self.stamp_gemm(name, m, k, n);
+        self.label_gemm(name, m, k, n);
         let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
         let groups_n = match warp {
             Some((_, bn)) => n / bn,
@@ -756,7 +785,7 @@ impl<'a> Recorder<'a> {
                 128,
             )
         };
-        self.stamp_gemm(name, m, k, n);
+        self.label_gemm(name, m, k, n);
         let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
@@ -810,7 +839,7 @@ impl<'a> Recorder<'a> {
             };
             (name, spv)
         };
-        self.stamp_gemm(name, m, k, n);
+        self.label_gemm(name, m, k, n);
         let mpad = m.div_ceil(64) * 64;
         let kern = self.be.kernel_sg(name, spv, 3, 24, 32);
         let mut push = [0u8; 24];
@@ -829,7 +858,7 @@ impl<'a> Recorder<'a> {
             groups,
         );
         // reduce: out[i] = Σ_s partials[s·plane + i]
-        self.stamp_gemm("splitk_reduce", m, k, n);
+        self.label_gemm("splitk_reduce", m, k, n);
         let rk = self
             .be
             .kernel("splitk_reduce", crate::gemm::splitk_reduce_spv(), 2, 12);
@@ -863,7 +892,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        self.stamp_gemm("native_gemm_mmq_q4k", m, k, n);
+        self.label_gemm("native_gemm_mmq_q4k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q4k",
             crate::gemm::native_gemm_mmq_q4k_spv(),
@@ -907,7 +936,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        self.stamp_gemm("native_gemm_mmq_q6k", m, k, n);
+        self.label_gemm("native_gemm_mmq_q6k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q6k",
             crate::gemm::native_gemm_mmq_q6k_spv(),
@@ -950,7 +979,6 @@ impl<'a> Recorder<'a> {
     ) {
         let nblk = k / 32;
         // pass 1: quantize activations to int8 (Q8, per 32-block) — one subgroup per (row, block)
-        self.stamp("quant_q8");
         let kq = self
             .be
             .kernel_sg("quant_q8", crate::gemm::quant_q8_spv(), 4, 12, 32);
@@ -971,7 +999,7 @@ impl<'a> Recorder<'a> {
             (m * nblk) as u32,
         );
         // pass 2: integer dp4a matmul
-        self.stamp_gemm("gemm_proj_mmq", m, k, n);
+        self.label_gemm("gemm_proj_mmq", m, k, n);
         let km = self
             .be
             .kernel_sg("gemm_proj_mmq", crate::gemm::gemm_proj_mmq_spv(), 7, 12, 32);
@@ -1014,7 +1042,7 @@ impl<'a> Recorder<'a> {
         bits: u32,
         blk_shift: u32,
     ) {
-        self.stamp_gemv("lin_q", rows, in_f, out_f);
+        self.label_gemv("lin_q", rows, in_f, out_f);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -1080,7 +1108,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp_gemv("gemv", rows, in_f, out_f);
+        self.label_gemv("gemv", rows, in_f, out_f);
         let name = crate::linear::native_kernel_name(dtype, false);
         let spv = crate::gemm::native_build_spv(dtype, false).expect("native GEMV spv");
         let k = self.be.kernel(name, spv, 3, 16);
@@ -1117,7 +1145,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         debug_assert!((2..=8).contains(&rows));
-        self.stamp_gemv("mrow", rows, in_f, out_f);
+        self.label_gemv("mrow", rows, in_f, out_f);
         let name = crate::gemm::native_mrow_kernel_name(dtype);
         let spv = crate::gemm::native_mrow_build_spv(dtype).expect("native mrow spv");
         let k = self.be.kernel(name, spv, 3, 16);
@@ -1155,7 +1183,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         debug_assert!((2..=8).contains(&rows));
-        self.stamp_gemv("mmvr", rows, in_f, out_f);
+        self.label_gemv("mmvr", rows, in_f, out_f);
         // Small-in_f shape (in_f < 2048 → fewer than 64 32-elem sub-blocks): the 2-output wg
         // leaves 64−nsub lanes idle (E2B's in_f=1536: 25% dead, single loop iteration) — the
         // OUTS4 variant splits the wg 4 outputs × 16 K-lanes so every lane stays on a sub-block.
@@ -1205,7 +1233,6 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("o_or_down");
         let name = crate::linear::native_kernel_name(dtype, true);
         let spv = crate::gemm::native_build_spv(dtype, true).expect("native GEMV spv");
         let k = self.be.kernel(name, spv, 4, 16);
@@ -1242,7 +1269,6 @@ impl<'a> Recorder<'a> {
         ne: usize,
         scale: f32,
     ) {
-        self.stamp("embed_gather");
         let name = crate::gemm::embed_gather_kernel_name(dtype);
         let spv = crate::gemm::embed_gather_build_spv(dtype).expect("embed_gather spv");
         let k = self.be.kernel(name, spv, 3, 12);
@@ -1276,7 +1302,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp_gemv("mmv", 1, in_f, out_f);
+        self.label_gemv("mmv", 1, in_f, out_f);
         let name = crate::gemm::native_mmv_kernel_name(dtype, false);
         let spv = crate::gemm::native_mmv_build_spv(dtype, false).expect("native mmv spv");
         let k = self.be.kernel(name, spv, 5, 16);
@@ -1315,7 +1341,6 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("o_or_down");
         let name = crate::gemm::native_mmv_kernel_name(dtype, true);
         let spv = crate::gemm::native_mmv_build_spv(dtype, true).expect("native mmv res spv");
         let k = self.be.kernel(name, spv, 6, 16);
@@ -1356,7 +1381,6 @@ impl<'a> Recorder<'a> {
         bits: u32,
         blk_shift: u32,
     ) {
-        self.stamp("o_or_down");
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -1404,7 +1428,6 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("o_or_down");
         let k = self
             .be
             .kernel("linear_res", crate::gemm::linear_res_spv(), 4, 12);
@@ -1435,7 +1458,6 @@ impl<'a> Recorder<'a> {
         dim: usize,
         eps: f32,
     ) {
-        self.stamp("rmsnorm");
         // 256-thread subgroup kernel (requiredSubgroupSize=32): more load/store parallelism and a
         // single barrier vs the 64-thread WGSL shared-tree. ~2.6× faster as a kernel; end-to-end
         // neutral here (decode is dispatch-latency-bound) but a win on slower/higher-latency GPUs.
@@ -1460,7 +1482,6 @@ impl<'a> Recorder<'a> {
     /// and the reference's `dg_canvas_embed`). Same 256-thread subgroup-reduction shape as
     /// `rmsnorm` — `dim` here is the vocab, so the cooperative reduction matters just as much.
     pub fn softmax(&self, x: &dyn Buffer, y: &dyn Buffer, rows: usize, dim: usize, scale: f32) {
-        self.stamp("softmax");
         let k = self
             .be
             .kernel_sg("softmax", crate::gemm::softmax_spv(), 2, 12, 32);
@@ -1484,7 +1505,6 @@ impl<'a> Recorder<'a> {
         rows: usize,
         dim: usize,
     ) {
-        self.stamp("softmax_dyn");
         let k = self
             .be
             .kernel_sg("softmax_dyn", crate::gemm::softmax_dyn_spv(), 3, 8, 32);
@@ -1514,7 +1534,6 @@ impl<'a> Recorder<'a> {
         theta: f32,
         pos_offset: usize,
     ) {
-        self.stamp("rope");
         let k = self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28);
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
@@ -1549,7 +1568,6 @@ impl<'a> Recorder<'a> {
         pos_offset: usize,
         out_base: usize,
     ) {
-        self.stamp("rope");
         let k = self
             .be
             .kernel("rope_f16", crate::gemm::rope_f16_spv(), 2, 28);
@@ -1585,7 +1603,6 @@ impl<'a> Recorder<'a> {
         theta: f32,
         out_base_mul: usize,
     ) {
-        self.stamp("rope");
         let k = self
             .be
             .kernel("rope_f16_dyn", crate::gemm::rope_f16_dyn_spv(), 3, 28);
@@ -1633,7 +1650,6 @@ impl<'a> Recorder<'a> {
         v_q8: bool,
         cap: usize,
     ) {
-        self.stamp("attention_kv");
         let (name, spv) = match (k_q8, v_q8) {
             (false, false) => ("attention_kv", crate::gemm::attention_kv_spv()),
             (true, false) => ("attention_kv_kq8", crate::gemm::attention_kv_kq8_spv()),
@@ -1697,7 +1713,6 @@ impl<'a> Recorder<'a> {
 
         // stage 1: S = scale·Q·Kᵀ. 8-warp/256-thread warptile (BN=256, matches ollama's mul_mm)
         // unless INFR_NO_QK_WARP forces the 4-warp/2×2 attn_qk.
-        self.stamp("attn_qk");
         let qk_warp = std::env::var("INFR_NO_QK_WARP").is_err();
         let (qk_name, qk_spv, qk_bn) = if qk_warp {
             ("attn_qk_warp", crate::gemm::attn_qk_warp_spv(), 256u32)
@@ -1724,7 +1739,6 @@ impl<'a> Recorder<'a> {
         );
 
         // stage 2: row softmax (causal + optional sliding window), in place S → P
-        self.stamp("attn_softmax");
         let ksm = self
             .be
             .kernel("attn_softmax", crate::gemm::attn_softmax_spv(), 1, 20);
@@ -1740,7 +1754,6 @@ impl<'a> Recorder<'a> {
         // mpad is small so the base workgroup count ((mpad/64)*(hd/64)*nh) is far below the GPU's
         // capacity while each grinds a huge kv reduction → split the kv dim across gl_WorkGroupID.y
         // into partials, then sum them.
-        self.stamp("attn_pv");
         let pv_base_wg = (mpad / 64) * (hdu / 64) * nh as u32;
         let n_splits = match std::env::var("INFR_PV_SPLITS")
             .ok()
@@ -1789,7 +1802,6 @@ impl<'a> Recorder<'a> {
         );
         if n_splits > 1 {
             // sum the per-split partials → attn
-            self.stamp("attn_pv");
             let total = mpad * nh as u32 * hdu;
             let kr = self
                 .be
@@ -1875,7 +1887,6 @@ impl<'a> Recorder<'a> {
         // no longer forced back to warp on NVIDIA / MoltenVK.
         let warp = hd == 128 && std::env::var("INFR_NO_FLASH_WARP").is_err();
         if n_splits == 1 && !warp {
-            self.stamp("attn_flash");
             let (fname, fspv): (&'static str, &[u32]) = if bm == 32 {
                 ("attn_flash_bm32", crate::gemm::attn_flash_bm32_spv())
             } else {
@@ -1899,7 +1910,6 @@ impl<'a> Recorder<'a> {
             return;
         }
         // split-K partials
-        self.stamp("attn_flash");
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         // hd=128 → register-blocked warp partial; else the 4-subgroup partial. Each picks its
         // bm-sized shared build (warp/partial share the bm*908 B footprint) and covers tile_wg groups.
@@ -1942,7 +1952,6 @@ impl<'a> Recorder<'a> {
             1,
         );
         // combine → attn
-        self.stamp("attn_flash");
         let kc2 = self.be.kernel_sg(
             "attn_flash_combine",
             crate::gemm::attn_flash_combine_spv(),
@@ -2011,7 +2020,6 @@ impl<'a> Recorder<'a> {
             }
         };
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
-        self.stamp("attn_flash");
         let (rname, rspv): (&'static str, &[u32]) = if br == 64 {
             (
                 "attn_flash_reg_br64",
@@ -2046,7 +2054,6 @@ impl<'a> Recorder<'a> {
             n_splits,
             1,
         );
-        self.stamp("attn_flash");
         let kc2 = self.be.kernel_sg(
             "attn_flash_combine",
             crate::gemm::attn_flash_combine_spv(),
@@ -2070,7 +2077,6 @@ impl<'a> Recorder<'a> {
 
     /// Cast-copy f32 `src[0..n]` → f16 `dst[off..off+n]` (write f32 activations into the f16 cache).
     pub fn store_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize, off: usize) {
-        self.stamp("store_f16");
         let k = self
             .be
             .kernel("store_f16", crate::gemm::store_f16_spv(), 2, 8);
@@ -2099,7 +2105,6 @@ impl<'a> Recorder<'a> {
         cap: usize,
         src_f16: bool,
     ) {
-        self.stamp("store_q8");
         let (name, spv) = if src_f16 {
             ("store_q8_f16", crate::gemm::store_q8_f16_spv())
         } else {
@@ -2131,7 +2136,6 @@ impl<'a> Recorder<'a> {
         cap: usize,
         src_f16: bool,
     ) {
-        self.stamp("store_q8");
         let (name, spv) = if src_f16 {
             ("store_q8_f16_dyn", crate::gemm::store_q8_f16_dyn_spv())
         } else {
@@ -2155,7 +2159,6 @@ impl<'a> Recorder<'a> {
     /// f16 flash / non-FA prefill kernels can read it; the persistent cache stays Q8). `cap` = total
     /// cache elements (the planar scales region base).
     pub fn dequant_q8_f16(&self, src: &dyn Buffer, dst: &dyn Buffer, n: usize, cap: usize) {
-        self.stamp("dequant_q8_f16");
         let k = self
             .be
             .kernel("dequant_q8_f16", crate::gemm::dequant_q8_f16_spv(), 2, 8);
@@ -2182,7 +2185,6 @@ impl<'a> Recorder<'a> {
         off: usize,
         src_f16: bool,
     ) {
-        self.stamp("quant_kv");
         let (name, spv) = crate::gemm::quant_kv_kernel(dt, src_f16);
         let k = self.be.kernel(name, spv, 2, 8);
         let mut push = [0u8; 8];
@@ -2208,7 +2210,6 @@ impl<'a> Recorder<'a> {
         off: usize,
         src_f16: bool,
     ) {
-        self.stamp("quant_turbo");
         let (name, spv) = crate::gemm::quant_turbo_kernel(dt, src_f16);
         let k = self.be.kernel(name, spv, 2, 8);
         let mut push = [0u8; 8];
@@ -2232,7 +2233,6 @@ impl<'a> Recorder<'a> {
         dst: &dyn Buffer,
         n: usize,
     ) {
-        self.stamp("dequant_turbo_f16");
         let (name, spv) = crate::gemm::dequant_turbo_kernel(dt);
         let k = self.be.kernel(name, spv, 2, 4);
         let mut push = [0u8; 4];
@@ -2257,7 +2257,6 @@ impl<'a> Recorder<'a> {
         off: usize,
         src_f16: bool,
     ) {
-        self.stamp("store_kv_dense");
         let (name, spv) = crate::gemm::store_kv_dense_kernel(dst_dt, src_f16);
         let k = self.be.kernel(name, spv, 2, 8);
         let mut push = [0u8; 8];
@@ -2281,7 +2280,6 @@ impl<'a> Recorder<'a> {
         dst: &dyn Buffer,
         n: usize,
     ) {
-        self.stamp("dequant_kv_f16");
         let (name, spv) = crate::gemm::dequant_kv_kernel(dt);
         let k = self.be.kernel(name, spv, 2, 4);
         let mut push = [0u8; 4];
@@ -2315,7 +2313,6 @@ impl<'a> Recorder<'a> {
         // RoPE (qwen3 / gemma3 / gemma4 SWA layers).
         freq_factors: Option<&dyn Buffer>,
     ) {
-        self.stamp("qk_norm_rope");
         let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
@@ -2400,7 +2397,6 @@ impl<'a> Recorder<'a> {
         batched: bool,
     ) {
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
-        self.stamp("attn_partial");
         let (p1name, p1spv) = match (k_q8, v_q8) {
             (false, false) if crate::gemm::attn_hd_spec_disabled() => {
                 ("attn_partial_nohd", crate::gemm::attn_partial_nohd_spv())
@@ -2474,7 +2470,6 @@ impl<'a> Recorder<'a> {
         );
         // pass 2: combine — split each (row, head)'s hd outputs across `ntile` workgroups for
         // occupancy. The combine is row-agnostic: rows*nh independent [n_chunks] partial sets.
-        self.stamp("attn_combine");
         let k2 = self
             .be
             .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
@@ -2519,7 +2514,6 @@ impl<'a> Recorder<'a> {
         out_base_mul: usize,
         eps: f32,
     ) {
-        self.stamp("qk_norm_rope");
         // With freq_factors (gemma4 full-attention layers) `ff` binds at 3 and the output shifts
         // to 4 — same PC layout either way.
         let k = match ff {
@@ -2571,7 +2565,6 @@ impl<'a> Recorder<'a> {
 
     /// Cast-copy f32 `src[0..n]` → f16 `dst[pos*n..]` (one KV row at position pos from `params`).
     pub fn store_f16_dyn(&self, src: &dyn Buffer, params: &dyn Buffer, dst: &dyn Buffer, n: usize) {
-        self.stamp("store_f16");
         let k = self
             .be
             .kernel("store_f16_dyn", crate::gemm::store_f16_dyn_spv(), 3, 8);
@@ -2607,7 +2600,6 @@ impl<'a> Recorder<'a> {
         // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
         cap: usize,
     ) {
-        self.stamp("attention_kv");
         let (name, spv) = if q8 {
             (
                 "attention_kv_dyn_q8",
@@ -2680,7 +2672,6 @@ impl<'a> Recorder<'a> {
         chunk: usize,
         window: usize,
     ) {
-        self.stamp("attn_live");
         let kl = self
             .be
             .kernel("attn_live", crate::gemm::attn_live_spv(), 2, 12);
@@ -2726,7 +2717,6 @@ impl<'a> Recorder<'a> {
         // `attn_live_prologue` per (nh, chunk, window) key — kv_len is identical for every layer
         // of a token, so the args buffer is shared across same-key attention ops instead of
         // re-derived per layer).
-        self.stamp("attn_partial");
         let (p1name, p1spv) = if q8 {
             (
                 "attn_partial_dynac_q8",
@@ -2768,7 +2758,6 @@ impl<'a> Recorder<'a> {
         );
 
         // pass 2: combine over the live chunks
-        self.stamp("attn_combine");
         let k2 = self.be.kernel(
             "attn_combine_live",
             crate::gemm::attn_combine_live_spv(),
@@ -2815,7 +2804,6 @@ impl<'a> Recorder<'a> {
         scale: f32,
         window: usize,
     ) {
-        self.stamp("attn_partial");
         let (p1name, p1spv) = if crate::gemm::attn_hd_spec_disabled() {
             (
                 "attn_partial_dyn_nohd",
@@ -2850,7 +2838,6 @@ impl<'a> Recorder<'a> {
             (nh * n_chunks) as u32,
         );
         // pass 2: combine (structure-only, unchanged from the push-constant path)
-        self.stamp("attn_combine");
         let k2 = self
             .be
             .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
@@ -2878,6 +2865,9 @@ impl<'a> Recorder<'a> {
         dst_offset: usize,
         bytes: usize,
     ) {
+        // Transfer chokepoint: previously un-stamped, so copy time silently landed in the
+        // preceding label's bucket. Distinct from the `copy_strided` compute kernel.
+        self.stamp("copy_buffer");
         let device = &self.be.shared.device;
         self.sync(&[Self::vkb(src)], &[Self::vkb(dst)], true);
         self.dirty_transfer.set(true);
@@ -2906,7 +2896,6 @@ impl<'a> Recorder<'a> {
         nkv: usize,
         hd: usize,
     ) {
-        self.stamp("attention");
         let kern = self
             .be
             .kernel("attention", crate::gemm::attention_spv(), 4, 16);
@@ -2926,7 +2915,6 @@ impl<'a> Recorder<'a> {
 
     /// Fused SwiGLU over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
     pub fn silu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
-        self.stamp("silu_mul");
         let k = self
             .be
             .kernel("silu_mul_fused", crate::gemm::silu_mul_fused_spv(), 2, 8);
@@ -2946,7 +2934,6 @@ impl<'a> Recorder<'a> {
     /// Fused GeGLU (GELU tanh-approx gate) over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
     /// Same layout/dispatch as [`silu_mul_fused`]; gemma uses GELU instead of SiLU.
     pub fn gelu_mul_fused(&self, gu: &dyn Buffer, y: &dyn Buffer, rows: usize, nff: usize) {
-        self.stamp("gelu_mul");
         let k = self
             .be
             .kernel("gelu_mul_fused", crate::gemm::gelu_mul_fused_spv(), 2, 8);
@@ -2964,7 +2951,6 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
-        self.stamp("silu_mul");
         let k = self
             .be
             .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 8);
@@ -3001,7 +2987,6 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
     ) {
-        self.stamp("deltanet");
         // The shader caches each column block's state [kd, 32] in shared memory (`ss[128*32]`), so kd
         // must be ≤ 128. qwen35 uses kd=128; assert so a larger head_k_dim fails loudly instead of
         // corrupting LDS.
@@ -3065,7 +3050,6 @@ impl<'a> Recorder<'a> {
         vd: usize,
         eps: f32,
     ) {
-        self.stamp("deltanet");
         debug_assert!(
             kd <= 128,
             "deltanet_chunked LDS chunk tiles assume kd ≤ 128, got {kd}"
@@ -3141,7 +3125,6 @@ impl<'a> Recorder<'a> {
     ) {
         debug_assert!(kd <= 128, "deltanet split assumes kd ≤ 128, got {kd}");
         let nchunk = rows.div_ceil(32);
-        self.stamp("deltanet_prep");
         // pass 1: prep — (chunk, k-head) grid
         let kp = self
             .be
@@ -3167,7 +3150,6 @@ impl<'a> Recorder<'a> {
             (nchunk * nk) as u32,
         );
         // pass 2: gates — (chunk, value-head) grid
-        self.stamp("deltanet_gates");
         let kg = self
             .be
             .kernel("deltanet_gates", crate::gemm::deltanet_gates_spv(), 6, 8);
@@ -3189,7 +3171,6 @@ impl<'a> Recorder<'a> {
             (nchunk * nv) as u32,
         );
         // pass 3: scan — (value head, column block) grid, sequential over chunks inside
-        self.stamp("deltanet_scan");
         let ks = self
             .be
             .kernel_sg("deltanet_scan", crate::gemm::deltanet_scan_spv(), 9, 20, 32);
@@ -3231,7 +3212,6 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
-        self.stamp("conv1d_silu");
         let kern = self
             .be
             .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 12);
@@ -3269,7 +3249,6 @@ impl<'a> Recorder<'a> {
         kconv: usize,
     ) {
         debug_assert!(rows >= kconv - 1, "conv1d_silu_batch needs rows ≥ kconv-1");
-        self.stamp("conv1d_silu");
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
@@ -3289,7 +3268,6 @@ impl<'a> Recorder<'a> {
             &push,
             ((rows * cc) as u32).div_ceil(256),
         );
-        self.stamp("conv1d_shift");
         let k2 = self
             .be
             .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12);
@@ -3318,7 +3296,6 @@ impl<'a> Recorder<'a> {
         dst_off: usize,
         dst_stride: usize,
     ) {
-        self.stamp("copy");
         let kern = self
             .be
             .kernel("copy_strided", crate::gemm::copy_strided_spv(), 2, 24);
@@ -3340,7 +3317,6 @@ impl<'a> Recorder<'a> {
 
     /// Elementwise sigmoid gate: `y[i] = a[i] * sigmoid(b[i])` (Qwen3-Next attention output gate).
     pub fn mul_sigmoid(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
-        self.stamp("mul_sigmoid");
         let kern = self
             .be
             .kernel("mul_sigmoid", crate::gemm::mul_sigmoid_spv(), 3, 4);
@@ -3399,7 +3375,6 @@ impl<'a> Recorder<'a> {
         n_used: usize,
         scale: f32,
     ) {
-        self.stamp("moe_topk");
         let k = self
             .be
             .kernel("moe_topk", crate::gemm::moe_topk_spv(), 3, 12);
@@ -3434,7 +3409,6 @@ impl<'a> Recorder<'a> {
         // Rows loop sequentially (m is small, 2-7 for MTP); a single-workgroup whole-vocab scan
         // measured 18% SLOWER than the download it replaced, so each row keeps the full
         // 256-workgroup two-stage shape.
-        self.stamp("argmax");
         let k1 = self
             .be
             .kernel("argmax_part", crate::gemm::argmax_part_spv(), 2, 8);
@@ -3517,7 +3491,6 @@ impl<'a> Recorder<'a> {
         top_p: f32,
     ) {
         debug_assert!((2..=Self::SAMPLE_KMAX).contains(&top_k));
-        self.stamp("sample");
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(top_k as u32).to_ne_bytes());
@@ -3565,7 +3538,6 @@ impl<'a> Recorder<'a> {
         top_p: f32,
     ) {
         debug_assert!((2..=Self::SAMPLE_KMAX).contains(&top_k));
-        self.stamp("sample_chain");
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(top_k as u32).to_ne_bytes());
@@ -3646,7 +3618,6 @@ impl<'a> Recorder<'a> {
         dim: usize,
         temp_inv: f32,
     ) {
-        self.stamp("dg_eb_sample");
         let k = self
             .be
             .kernel_sg("dg_eb_sample", crate::gemm::dg_eb_sample_spv(), 5, 8, 32);
@@ -3670,6 +3641,8 @@ impl<'a> Recorder<'a> {
 
     /// Zero a buffer's first `n` 4-byte elements (cmd_fill_buffer) — clears the bucket counters.
     pub fn zero(&self, buf: &dyn Buffer, n: usize) {
+        // Transfer chokepoint (see `copy`): previously an un-stamped blind spot.
+        self.stamp("zero_fill");
         self.sync(&[], &[Self::vkb(buf)], true);
         unsafe {
             self.be
@@ -3681,7 +3654,6 @@ impl<'a> Recorder<'a> {
 
     /// MoE bucketing pass 1 (count): tally assignments per expert into `counts` (pre-zeroed).
     pub fn moe_bucket_count(&self, tok_ids: &dyn Buffer, counts: &dyn Buffer, n_pairs: usize) {
-        self.stamp("moe_bucket");
         let k = self.be.kernel(
             "moe_bucket_count",
             crate::gemm::moe_bucket_count_spv(),
@@ -3705,7 +3677,6 @@ impl<'a> Recorder<'a> {
         fill: &dyn Buffer,
         n_expert: usize,
     ) {
-        self.stamp("moe_bucket");
         let k = self
             .be
             .kernel("moe_bucket_scan", crate::gemm::moe_bucket_scan_spv(), 3, 4);
@@ -3739,7 +3710,6 @@ impl<'a> Recorder<'a> {
         n_pairs: usize,
         n_used: usize,
     ) {
-        self.stamp("moe_bucket");
         let (name, spv): (_, _) = match dscale {
             Some(_) => (
                 "moe_bucket_scatter_scaled",
@@ -3779,7 +3749,6 @@ impl<'a> Recorder<'a> {
         n_slots: usize,
         k_dim: usize,
     ) {
-        self.stamp("quant_q8");
         let kq = self.be.kernel_sg(
             "quant_q8_gather",
             crate::gemm::quant_q8_gather_spv(),
@@ -3843,11 +3812,11 @@ impl<'a> Recorder<'a> {
         n: usize,
         n_expert: usize,
     ) {
-        // NB: the profiler label is the CALLER'S stage (gate_up vs down), not a function of
-        // `dtype` — the down projection isn't always Q6_K (DiffusionGemma's down is Q8_0/Q5_0),
-        // so inferring the stage from dtype mislabeled DG's down-proj dispatches as
-        // "expert_gateup" in INFR_PROF2 output. Every caller knows its own role; trust it.
-        self.stamp(stage);
+        // NB: the profiler label is the CALLER'S stage (gate_up vs down), not the kernel name —
+        // the same `native_gemm_mmq_*_xp` kernel serves both roles, so the auto kernel-name
+        // label would merge them (and inferring the stage from dtype mislabeled DG's down-proj
+        // dispatches as "expert_gateup"). Every caller knows its own role; trust it.
+        self.label_next(stage);
         let (name, spv, nb): (_, _, usize) = match dtype {
             infr_core::DType::Q4K => (
                 "native_gemm_mmq_q4k_xp",
@@ -3910,7 +3879,6 @@ impl<'a> Recorder<'a> {
         ne: usize,
         n_used: usize,
     ) {
-        self.stamp("moe_scatter");
         let k = self.be.kernel(
             "moe_scatter_reduce",
             crate::gemm::moe_scatter_reduce_spv(),
@@ -3951,7 +3919,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp_gemv("gemv_id", rows, in_f, out_f);
+        self.label_gemv("gemv_id", rows, in_f, out_f);
         let name = crate::linear::native_id_kernel_name(dtype).expect("native id kernel");
         let spv = crate::gemm::native_id_build_spv(dtype).expect("native id spv");
         let k = self.be.kernel(name, spv, 4, 20);
@@ -3995,7 +3963,6 @@ impl<'a> Recorder<'a> {
         out_f: usize,
         rows: usize,
     ) {
-        self.stamp("expert_ffn");
         let name = crate::linear::native_idm_kernel_name(dtype).expect("native idm kernel");
         let spv = crate::gemm::native_idm_build_spv(dtype).expect("native idm spv");
         let k = self.be.kernel(name, spv, 4, 20);
@@ -4025,7 +3992,6 @@ impl<'a> Recorder<'a> {
         m: usize,
         k: usize,
     ) {
-        self.stamp("quant_q8");
         let kq = self
             .be
             .kernel_sg("quant_q8", crate::gemm::quant_q8_spv(), 4, 12, 32);
@@ -4064,7 +4030,6 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.stamp("mmq_expert");
         let k = self.be.kernel(
             "native_mmv_id_q4k",
             crate::gemm::native_mmv_id_q4k_spv(),
@@ -4105,7 +4070,6 @@ impl<'a> Recorder<'a> {
         n_used: usize,
         rows: usize,
     ) {
-        self.stamp("moe_accumulate");
         let k = self
             .be
             .kernel("moe_accumulate", crate::gemm::moe_accumulate_spv(), 3, 8);
@@ -4133,7 +4097,6 @@ impl<'a> Recorder<'a> {
         acc: &dyn Buffer,
         n: usize,
     ) {
-        self.stamp("moe_accumulate");
         let k = self
             .be
             .kernel("add_scaled_id", crate::gemm::add_scaled_id_spv(), 3, 8);
@@ -4153,7 +4116,6 @@ impl<'a> Recorder<'a> {
     /// the resident hidden state on the GPU (chained across experts via WAW barriers on `acc`).
     /// In-place elementwise scalar multiply: `y[i] *= scale` for `i < n` (gemma4 layer output scale).
     pub fn scale(&self, y: &dyn Buffer, scale: f32, n: usize) {
-        self.stamp("scale");
         let k = self.be.kernel("scale", crate::gemm::scale_spv(), 1, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
@@ -4164,7 +4126,6 @@ impl<'a> Recorder<'a> {
     /// Elementwise softcap `y[i] = cap·tanh(x[i]/cap)` (gemma final-logit / attn softcap). In-place
     /// safe — bind `x == y`.
     pub fn softcap(&self, x: &dyn Buffer, y: &dyn Buffer, cap: f32, n: usize) {
-        self.stamp("softcap");
         let k = self.be.kernel("softcap", crate::gemm::softcap_spv(), 2, 8);
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
@@ -4179,7 +4140,6 @@ impl<'a> Recorder<'a> {
     }
 
     pub fn add_scaled(&self, x: &dyn Buffer, acc: &dyn Buffer, scale: f32, n: usize) {
-        self.stamp("add");
         let k = self
             .be
             .kernel("add_scaled", crate::gemm::add_scaled_spv(), 2, 8);
@@ -4197,7 +4157,6 @@ impl<'a> Recorder<'a> {
 
     /// Elementwise add; in place allowed (`a` may equal `y`).
     pub fn add(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
-        self.stamp("add");
         let k = self.be.kernel("add", crate::gemm::add_spv(), 3, 4);
         self.dispatch(
             k,
@@ -4217,7 +4176,6 @@ impl<'a> Recorder<'a> {
         rows: usize,
         n: usize,
     ) {
-        self.stamp("add_bias");
         let total = (rows * n) as u32;
         let k = self
             .be
@@ -4236,7 +4194,6 @@ impl<'a> Recorder<'a> {
     /// Broadcast multiply: `dst[i] = x[i] * vec[i % n]` over `total = rows*n` elements
     /// (diffusion-gemma's router input scale — the multiplicative twin of `add_bias`).
     pub fn mul_vec(&self, x: &dyn Buffer, vec: &dyn Buffer, y: &dyn Buffer, rows: usize, n: usize) {
-        self.stamp("mul_vec");
         let total = (rows * n) as u32;
         let k = self.be.kernel("mul_vec", crate::gemm::mul_vec_spv(), 3, 8);
         let mut pc = (n as u32).to_ne_bytes().to_vec();
@@ -4264,7 +4221,6 @@ impl<'a> Recorder<'a> {
         rows: usize,
         n: usize,
     ) {
-        self.stamp("moe_shared_expert_add");
         let total = (rows * n) as u32;
         let k = self.be.kernel(
             "moe_shared_expert_add",
@@ -4306,7 +4262,6 @@ impl<'a> Recorder<'a> {
         n_used: usize,
         rows: usize,
     ) {
-        self.stamp("moe_accumulate_scaled");
         let k = self.be.kernel(
             "moe_accumulate_scaled",
             crate::gemm::moe_accumulate_scaled_spv(),
@@ -4402,12 +4357,23 @@ impl<'a> Recorder<'a> {
         })
     }
 
-    /// Read back per-op timestamps and print GPU time aggregated by op label.
+    /// Read back per-dispatch timestamps and print GPU time aggregated by label (the kernel
+    /// name, unless overridden via [`label_next`](Self::label_next) or the shape itemizers).
+    /// Each label's total also feeds the process-wide aggregate (`infr_prof_rt::gpu_add`),
+    /// printed once at exit — and merged with the host-side function table when the binary was
+    /// ALSO built with `INFR_PROFILE=1`.
     fn report_timestamps(&self) {
         let labels = self.ts_labels.borrow();
         let n = labels.len();
         if n == 0 {
             return;
+        }
+        if self.ts_dropped.get() > 0 {
+            eprintln!(
+                "[prof2] WARNING: {} dispatches past the {}-timestamp query pool went unstamped",
+                self.ts_dropped.get(),
+                Self::MAX_TS,
+            );
         }
         let mut ticks = vec![0u64; n + 1];
         unsafe {
@@ -4444,6 +4410,7 @@ impl<'a> Recorder<'a> {
         let mut rows: Vec<_> = by.into_iter().collect();
         rows.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
         for (lbl, (us, cnt)) in rows {
+            infr_prof_rt::gpu_add(lbl, us, cnt as u64);
             eprintln!(
                 "[prof2]   {lbl:>14}  {us:8.0}us  ({cnt:3} ops, {:.1}us/op, {:.0}%)",
                 us / cnt as f64,

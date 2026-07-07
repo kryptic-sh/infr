@@ -98,18 +98,18 @@ infr bench "$M" -p 0 -n 64 -r 3         # decode 64 tokens
 infr bench "$M" -p 0 -n 64 -d 2048      # decode at context depth 2048 (-d warms, untimed)
 ```
 
-**Profile** per-op GPU time (timestamp queries) with `INFR_PROF2=1`. It prints
-one block **per submit**, each tagged by op label (prefill: `expert_gateup`,
-`expert_down`, `matmul_proj`, `attn_flash`, `quant_q8`; decode: `lm_head`,
-`mmq_expert`, `expert_ffn`, `attention_kv`, `vocab`, …). `warmup` runs
-unprofiled, so the blocks are the timed reps only — sum a label across all
-blocks for its total:
+**Profile** per-op GPU time (timestamp queries) with `INFR_PROF2=1`. Every
+dispatch is timestamped and labeled **automatically with its kernel name** (plus
+a few role overrides like `expert_gateup`/`expert_down`); no manual stamping. It
+prints one block per submit and ONE aggregated `INFR_PROF2 GPU report` at
+process exit (per-kernel totals, counts, avg, %GPU over all timed submits —
+warmup runs unprofiled). Add `INFR_PROF2_SHAPES=1` for shape-itemized GEMV/GEMM
+buckets (`mmvr:m4:1536x24576`). Decode's replay tape carries no timestamps —
+profile decode with `INFR_SEAM_NO_REPLAY=1`. Details in
+[`docs/PERF.md`](docs/PERF.md).
 
 ```bash
-INFR_PROF2=1 infr bench "$M" -p 2048 -n 0 -r 1 2>&1 \
-  | grep '^\[prof2\]' \
-  | awk '!/per-op/{for(i=1;i<=NF;i++)if($i~/us$/){l=$(i-1);v=$i;sub(/us/,"",v);t[l]+=v}}
-         END{for(l in t)printf "%-16s %10.0f us\n",l,t[l]}' | sort -k2 -rn
+INFR_PROF2=1 infr bench "$M" -p 2048 -n 0 -r 1 2>&1 | tail -30   # exit aggregate
 ```
 
 **Compare to llama.cpp** — `infr compare` shells out to `infr bench` and the

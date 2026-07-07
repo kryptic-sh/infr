@@ -2026,12 +2026,63 @@ impl MetalBackend {
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
-            Op::EmbedGather { .. } => {
-                // Capability-gated off (Capabilities::embed_gather = false): the runner keeps the
-                // host embed path on Metal, so this is unreachable.
-                return Err(Error::Unsupported(
-                    "Metal Op::EmbedGather: embed_gather capability is false".into(),
-                ));
+            // GPU embed gather: `dst[r, :] = dequant(table[ids[r], :]) * scale` — the table's
+            // RAW GGUF bytes are bound as-is (the kernels reuse linear.metal's DEC16_* native
+            // decode, no host repack, no dequant cache). One simdgroup per row.
+            //
+            // Covered formats: F16, BF16, Q8_0, Q4_0, Q5_0, Q4_K, Q6_K, IQ4_NL, IQ4_XS — every
+            // dtype with a native 16-block decode in the MSL library. The runner gates gpu_embed
+            // on the SHARED format list (infr_vulkan::linear::embed_gather_supported), which is
+            // wider (Q4_1/Q5_1/Q2_K/Q3_K/Q5_K have factored-only Metal decode): those return
+            // Unsupported here and fail loudly rather than silently gathering garbage.
+            //
+            // `ids` reaches the device as f32 NUMERIC token ids: the graph declares it I32, the
+            // host mirror widens it via bytes_to_f32, and `ensure_device` uploads that f32
+            // vector (an EmbedGather graph never records a tape — replay_shape rejects the op —
+            // so the mirror is always the source; the kernels read `device const float*`).
+            Op::EmbedGather {
+                ids,
+                table,
+                dst,
+                rows,
+                ne,
+                scale,
+            } => {
+                let dt = g.desc(table).dtype;
+                let kern = match dt {
+                    DType::F16 => "embed_gather_f16",
+                    DType::Bf16 => "embed_gather_bf16",
+                    DType::Q8_0 => "embed_gather_q8_0",
+                    DType::Q4_0 => "embed_gather_q4_0",
+                    DType::Q5_0 => "embed_gather_q5_0",
+                    DType::Q4K => "embed_gather_q4k",
+                    DType::Q6K => "embed_gather_q6k",
+                    DType::Iq4Nl => "embed_gather_iq4nl",
+                    DType::Iq4Xs => "embed_gather_iq4xs",
+                    other => {
+                        return Err(Error::Unsupported(format!(
+                            "Metal Op::EmbedGather: no native gather kernel for {other:?}"
+                        )));
+                    }
+                };
+                let (rows_u, ne_u) = (rows as usize, ne as usize);
+                let bt = metal_buf(bindings.get(table).expect("metal backend: unbound Weight"));
+                let bi = self.ensure_device(r, ids);
+                let bd = self.dev_dst(r, dst, rows_u * ne_u);
+                let pso = self.pipelines.get(kern)?;
+                let mut p = rows.to_ne_bytes().to_vec();
+                p.extend_from_slice(&ne.to_ne_bytes());
+                p.extend_from_slice(&scale.to_ne_bytes());
+                self.encode_tg_w(
+                    r,
+                    &pso,
+                    &[&bt.raw, bi.as_ref(), bd.as_ref()],
+                    1 << 2,
+                    &p,
+                    rows_u * 32,
+                    32,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::Argmax { x, dst, n } => {
                 // Greedy device-side sampling: one 256-thread threadgroup, the token id (u32

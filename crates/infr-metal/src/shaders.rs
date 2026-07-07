@@ -113,7 +113,7 @@ impl Pipelines {
 /// drifted (the string was restored in a rebase while new kernels landed only in the files),
 /// which silently disabled every kernel that existed only in the non-live copy — the pipeline
 /// cap-checks treat a missing function as "capability absent" and fall back, so nothing errors.
-const MSL_PARTS: [&str; 8] = [
+const MSL_PARTS: [&str; 9] = [
     include_str!("../shaders/common.metal"),
     include_str!("../shaders/elementwise_norms.metal"),
     include_str!("../shaders/linear.metal"),
@@ -122,4 +122,6 @@ const MSL_PARTS: [&str; 8] = [
     include_str!("../shaders/attention.metal"),
     include_str!("../shaders/deltanet.metal"),
     include_str!("../shaders/kv_cache.metal"),
+    // Instantiates linear.metal's DEC16_* decode macros — must come after it.
+    include_str!("../shaders/embed_gather.metal"),
 ];

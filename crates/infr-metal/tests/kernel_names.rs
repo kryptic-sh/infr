@@ -27,6 +27,7 @@ const KERNEL_PREFIXES: &[&str] = &[
     "copy_",
     "deltanet_",
     "dequant_",
+    "embed_gather_",
     "gatedact",
     "linear_",
     "moe_",

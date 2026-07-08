@@ -1193,6 +1193,47 @@ pub fn draft(
     Ok(result)
 }
 
+/// A truncated (top-k/top-p, temperature-scaled) distribution: `(vocab id, normalized prob)` pairs
+/// summing to 1 — [`sampling::truncated_dist`](crate::sampling::truncated_dist)'s return shape,
+/// named here purely to keep clippy's `type_complexity` lint quiet on [`draft_stochastic`]'s
+/// signature.
+type TruncDist = Vec<(u32, f32)>;
+
+/// Temperature-aware draft loop — [`draft`]'s stochastic sibling, used when `INFR_TEMP > 0` (see
+/// `crate::seam::model::spec_accept_stochastic`'s doc for why greedy-only MTP degenerates on
+/// thinking models). Self-chaining SAMPLE (not argmax) decode over the head's own KV, one row per
+/// step: each step calls [`MtpHeadSession::forward`] (the full-logits path — NOT
+/// [`MtpHeadSession::forward_draft`]'s fused GPU `Op::ArgmaxProb`, which only surfaces a top-1
+/// id+prob and can't support the accept rule's full-distribution ratio/residual test), truncates
+/// the head's logits with `sampling::truncated_dist` at the SAME `sampler` config the caller's
+/// target verify uses, and draws the drafted id from that truncated distribution via the shared
+/// `rng` stream. Returns `(id, q_i)` pairs — the drafted id AND its full truncated proposal
+/// distribution `q_i`, since the caller's accept rule needs `q_i(x)` for arbitrary `x` (the
+/// residual-resample case), not just the drafted token's own probability.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn draft_stochastic(
+    sess: &mut MtpHeadSession,
+    id_last: u32,
+    pending_h: &[f32],
+    n_past: usize,
+    n_max: usize,
+    sampler: crate::sampling::Sampler,
+    rng: &mut u64,
+) -> Result<Vec<(u32, TruncDist)>> {
+    let mut result = Vec::with_capacity(n_max);
+    let mut tok = id_last;
+    let mut h = pending_h.to_vec();
+    for pos in n_past..n_past + n_max {
+        let (logits, h_mtp) = sess.forward(&[tok], &h, pos)?;
+        let dist = crate::sampling::truncated_dist(&logits, sampler);
+        let id = crate::sampling::sample_from_dist(&dist, rng);
+        result.push((id, dist));
+        tok = id;
+        h = h_mtp; // self-chain: the head's OWN h_mtp feeds the next draft step
+    }
+    Ok(result)
+}
+
 /// Greedy top-1 token id + its softmax probability over one `[vocab]` logits row
 /// (`speculative.cpp`'s `common_sampler_sample`/`cur_p->data[0]`): since only the winning
 /// candidate's OWN probability mass is needed (not the runner-up ids a real top-k sampler would
@@ -1287,6 +1328,51 @@ fn run_verify(
     Ok((ids, h))
 }
 
+/// Full-distribution VERIFY forward — the temperature-aware MTP accept rule's twin of
+/// [`run_verify`]. Identical batched trunk forward, except it passes `verify_ids: None` to
+/// `generate_dense_backend`, which disables the GPU-resident argmax-only accept path (see that
+/// param's doc) so the runner ALWAYS downloads the full `[m, vocab]` logits instead of `m` argmax
+/// ids. `run_verify`'s fused id-only GPU accept can't support
+/// `crate::seam::model::spec_accept_stochastic`'s importance-ratio test (it needs each row's full
+/// truncated distribution, not just the argmax id), so temp>0 pays the full `m*vocab*4`-byte
+/// download every verify cycle instead of `m*4` bytes — the perf tradeoff noted on
+/// [`generate_mtp_spec_core`]'s doc. Returns `(logits [m*vocab], h [m*n_embd])`.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn run_verify_full(
+    be: &dyn Backend,
+    bind: &BindWeightFn,
+    g: &Gguf,
+    cfg: &crate::Config,
+    token_embd: &[f32],
+    tokens: &[u32],
+    state: &mut Option<crate::seam::SeamKv>,
+    max_ctx: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let mut logits = Vec::new();
+    let mut h = Vec::new();
+    crate::seam::generate_dense_backend(
+        be,
+        bind,
+        g,
+        cfg,
+        token_embd,
+        None,
+        tokens,
+        0,
+        |_| {},
+        state,
+        max_ctx,
+        None,
+        Some(&mut logits),
+        None, // verify_ids: None forces the full-logits download path (see this fn's doc)
+        None,
+        Some(&mut h),
+        None,
+    )?;
+    Ok((logits, h))
+}
+
 /// Cumulative per-phase wall time + accept-rate counters over one [`generate_mtp_spec_vulkan_timed`]
 /// run (issue #33, phase 4 — `infr bench`/`infr compare`'s perf-bottleneck visibility pass: this is
 /// the struct return `docs/MTP.md`'s `INFR_MTP_TIME` per-cycle `eprintln!`s are refactored to feed,
@@ -1354,6 +1440,20 @@ fn argmax_row(row: &[f32]) -> u32 {
 /// drivers. The trunk verify runs through `run_verify(be, bind, …)`; the draft head is the
 /// caller-built [`MtpHeadSession`] (bound to the same `be`). Everything between — draft, accept,
 /// catch-up, streaming — is backend-agnostic.
+///
+/// Sampling: reads `Sampler::from_env()` (`INFR_TEMP`/`INFR_TOP_K`/`INFR_TOP_P`) exactly like the
+/// non-MTP seam decode loop. `temp <= 0` takes the ORIGINAL greedy fast path — `draft` +
+/// `crate::seam::model::spec_accept` against the trunk's GPU-resident argmax, bit-identical to
+/// before this doc comment was added (pinned by `mtp_spec_matches_target_only_greedy`). `temp > 0`
+/// takes the stochastic path — `draft_stochastic` + `crate::seam::model::spec_accept_stochastic`,
+/// the standard speculative-sampling acceptance rule (Leviathan & Kalman 2023 / Chen et al. 2023),
+/// which provably preserves the TARGET's sampling distribution instead of forcing pure greedy.
+/// This is the fix for Qwen3.5/3.6 (thinking models) degenerating under MTP's old greedy-only
+/// accept rule — see `docs/MTP.md` / issue #33's follow-up. Perf tradeoff: `temp > 0` can't use
+/// either GPU-resident id-only fast path (verify's `Op::Argmax` or draft's fused
+/// `Op::ArgmaxProb`) — the ratio/residual test needs each row's FULL truncated distribution, not
+/// just an argmax id — so it downloads the full `[vocab]` logits row on every draft step AND every
+/// verify row instead of 4 bytes each. Correctness over speed: the greedy path stays the fast one.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn generate_mtp_spec_core(
@@ -1381,6 +1481,11 @@ fn generate_mtp_spec_core(
     let mtp_ckpt = std::env::var("INFR_NO_MTP_CKPT").is_err();
     let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
     let hit_eos = |t: u32| !ignore_eos && (cfg.eos_ids.contains(&t) || t == cfg.eos);
+    // Sampling config (see this fn's doc): temp<=0 keeps the original bit-identical greedy path;
+    // temp>0 (the CLI's chat default, INFR_TEMP=0.6) takes the stochastic accept rule.
+    let sampler = crate::sampling::Sampler::from_env();
+    let mut rng = crate::sampling::seed_rng();
+    let stochastic = sampler.temp > 0.0;
 
     let prompt_tokens = model.encode(prompt)?;
     anyhow::ensure!(!prompt_tokens.is_empty(), "generate_mtp_spec: empty prompt");
@@ -1390,16 +1495,34 @@ fn generate_mtp_spec_core(
 
     // ── prime: one VERIFY over the whole prompt, then catch the head up over it ──────────────
     let t_prime = std::time::Instant::now();
-    let (ids0, h_rows0) = run_verify(
-        be,
-        bind,
-        model.gguf(),
-        cfg,
-        model.token_embd(),
-        &prompt_tokens,
-        &mut trunk_state,
-        max_ctx,
-    )?;
+    // Greedy needs only the prime verify's per-row argmax ids (GPU-resident, `run_verify`); the
+    // stochastic path needs the FULL logits (to build cycle 1's leading truncated distribution
+    // below) — `run_verify_full`'s doc.
+    let (ids0, logits0, h_rows0) = if stochastic {
+        let (logits0, h_rows0) = run_verify_full(
+            be,
+            bind,
+            model.gguf(),
+            cfg,
+            model.token_embd(),
+            &prompt_tokens,
+            &mut trunk_state,
+            max_ctx,
+        )?;
+        (Vec::new(), logits0, h_rows0)
+    } else {
+        let (ids0, h_rows0) = run_verify(
+            be,
+            bind,
+            model.gguf(),
+            cfg,
+            model.token_embd(),
+            &prompt_tokens,
+            &mut trunk_state,
+            max_ctx,
+        )?;
+        (ids0, Vec::new(), h_rows0)
+    };
     let prime_verify_secs = t_prime.elapsed().as_secs_f64();
     anyhow::ensure!(
         h_rows0.len() == p * ne,
@@ -1428,9 +1551,13 @@ fn generate_mtp_spec_core(
     let mut n_past = p;
 
     // Cycle 1's virtual leading row (see this fn's doc) — `None` from cycle 2 on, once consumed.
-    // Only the row's greedy ARGMAX ID is needed (the accept rule below never reads raw logits),
-    // so the GPU-resident verify accept (issue #31) hands back just the ids.
-    let mut leading_id: Option<u32> = Some(ids0[p - 1]);
+    // Greedy only needs the row's ARGMAX ID (the GPU-resident verify accept, issue #31, hands back
+    // just the ids); the stochastic path needs the row's full truncated distribution instead
+    // (`leading_dist`), built from the prime verify's full logits row.
+    let mut leading_id: Option<u32> = (!stochastic).then(|| ids0[p - 1]);
+    let mut leading_dist: Option<Vec<(u32, f32)>> = stochastic.then(|| {
+        crate::sampling::truncated_dist(&logits0[(p - 1) * cfg.vocab..p * cfg.vocab], sampler)
+    });
     let mut leading_h: Option<Vec<f32>> = Some(pending_h.clone());
 
     let mut acc: Vec<u32> = Vec::new();
@@ -1454,43 +1581,102 @@ fn generate_mtp_spec_core(
         cycle += 1;
 
         let t_draft = std::time::Instant::now();
-        let drafted = draft(
-            head_sess,
-            id_last,
-            &pending_h,
-            n_past,
-            DEFAULT_P_MIN,
-            n_max_round,
-        )?;
+        // cand: the drafted token ids, either flavor. q_dists: the stochastic flavor's per-step
+        // truncated proposal distributions (empty/unused on the greedy path).
+        let (cand, q_dists): (Vec<u32>, Vec<Vec<(u32, f32)>>) = if stochastic {
+            let drafted = draft_stochastic(
+                head_sess,
+                id_last,
+                &pending_h,
+                n_past,
+                n_max_round,
+                sampler,
+                &mut rng,
+            )?;
+            let cand = drafted.iter().map(|(id, _)| *id).collect();
+            let q_dists = drafted.into_iter().map(|(_, q)| q).collect();
+            (cand, q_dists)
+        } else {
+            let drafted = draft(
+                head_sess,
+                id_last,
+                &pending_h,
+                n_past,
+                DEFAULT_P_MIN,
+                n_max_round,
+            )?;
+            (drafted.iter().map(|&(id, _)| id).collect(), Vec::new())
+        };
         let draft_secs = t_draft.elapsed().as_secs_f64();
-        let cand: Vec<u32> = drafted.iter().map(|&(id, _)| id).collect();
 
         let mut feed = committed.clone();
         feed.extend_from_slice(&cand);
         let t_verify = std::time::Instant::now();
-        let (vids, h_rows) = run_verify(
-            be,
-            bind,
-            model.gguf(),
-            cfg,
-            model.token_embd(),
-            &feed,
-            &mut trunk_state,
-            max_ctx,
-        )?;
+        // vids: greedy flavor's per-row argmax ids. vlogits: stochastic flavor's full [m*vocab]
+        // logits (needed to build each row's truncated target distribution below).
+        let (vids, vlogits, h_rows) = if stochastic {
+            let (vlogits, h_rows) = run_verify_full(
+                be,
+                bind,
+                model.gguf(),
+                cfg,
+                model.token_embd(),
+                &feed,
+                &mut trunk_state,
+                max_ctx,
+            )?;
+            (Vec::new(), vlogits, h_rows)
+        } else {
+            let (vids, h_rows) = run_verify(
+                be,
+                bind,
+                model.gguf(),
+                cfg,
+                model.token_embd(),
+                &feed,
+                &mut trunk_state,
+                max_ctx,
+            )?;
+            (vids, Vec::new(), h_rows)
+        };
         let verify_secs = t_verify.elapsed().as_secs_f64();
         let m = h_rows.len() / ne;
 
-        let has_leading = leading_id.is_some();
-        let varg: Vec<u32> = if let (Some(lid), Some(_)) = (leading_id, &leading_h) {
-            debug_assert_eq!(m, cand.len(), "cycle 1 verify carries no leading row");
-            std::iter::once(lid).chain(vids.iter().copied()).collect()
+        // `leading_h` tracks cycle-1-vs-later for BOTH flavors (only one of leading_id/leading_dist
+        // is ever populated, matching `stochastic`); read it before either gets `.take()`n below.
+        let has_leading = leading_h.is_some();
+        let (accepted, next_tok) = if stochastic {
+            let vocab = cfg.vocab;
+            let p_rows: Vec<Vec<(u32, f32)>> = if let Some(ld) = leading_dist.take() {
+                debug_assert_eq!(m, cand.len(), "cycle 1 verify carries no leading row");
+                let mut v = Vec::with_capacity(m + 1);
+                v.push(ld);
+                v.extend((0..m).map(|j| {
+                    crate::sampling::truncated_dist(&vlogits[j * vocab..(j + 1) * vocab], sampler)
+                }));
+                v
+            } else {
+                let base = m - (cand.len() + 1);
+                (base..m)
+                    .map(|j| {
+                        crate::sampling::truncated_dist(
+                            &vlogits[j * vocab..(j + 1) * vocab],
+                            sampler,
+                        )
+                    })
+                    .collect()
+            };
+            crate::seam::model::spec_accept_stochastic(&cand, &q_dists, &p_rows, &mut rng)
         } else {
-            let base = m - (cand.len() + 1);
-            vids[base..].to_vec()
+            let varg: Vec<u32> = if let (Some(lid), Some(_)) = (leading_id, &leading_h) {
+                debug_assert_eq!(m, cand.len(), "cycle 1 verify carries no leading row");
+                std::iter::once(lid).chain(vids.iter().copied()).collect()
+            } else {
+                let base = m - (cand.len() + 1);
+                vids[base..].to_vec()
+            };
+            crate::seam::model::spec_accept(&cand, &varg)
         };
-
-        let (accepted, next_tok) = crate::seam::model::spec_accept(&cand, &varg);
         total_drafted += cand.len();
         total_accepted += accepted;
 

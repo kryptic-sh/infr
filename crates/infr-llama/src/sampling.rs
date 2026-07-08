@@ -141,3 +141,77 @@ pub(crate) fn sample_logits(logits: &[f32], s: Sampler, rng: &mut u64) -> u32 {
     }
     idx[cutoff - 1] as u32
 }
+
+/// Temperature + top-k + top-p (nucleus) truncated distribution over `logits`, returned as
+/// `(vocab id, normalized probability)` pairs summing to 1 — the same support selection
+/// [`sample_logits`] draws from, just not collapsed into a single draw. A fresh, SEPARATE
+/// implementation (not a shared refactor of `sample_logits`) so the existing bit-pinned
+/// greedy/temperature decode path is untouched by this addition — see `sample_logits`'s callers
+/// (the GPU `Op::Sample` parity tests) for why that path's exact float ops must not move.
+///
+/// Used by the MTP temperature-aware speculative accept rule
+/// (`crate::seam::model::spec_accept_stochastic`): the proposal (`q`, from the draft head) and
+/// target (`p`, from the trunk verify) distributions are truncated with the SAME `Sampler` config,
+/// so the importance ratio `p(x)/q(x)` and the residual `max(p-q,0)` are well-defined — a token
+/// truncated out of a distribution simply has probability 0 in it.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn truncated_dist(logits: &[f32], s: Sampler) -> Vec<(u32, f32)> {
+    let n = logits.len();
+    let k = if s.top_k == 0 { n } else { s.top_k.min(n) };
+    let cmp = |a: &usize, b: &usize| {
+        logits[*b]
+            .partial_cmp(&logits[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let mut idx: Vec<usize> = (0..n).collect();
+    if k < n {
+        idx.select_nth_unstable_by(k - 1, cmp);
+        idx.truncate(k);
+    }
+    idx.sort_unstable_by(cmp); // descending by logit
+    let maxl = logits[idx[0]];
+    let temp = if s.temp > 0.0 { s.temp } else { 1.0 }; // this fn is only meaningful for temp>0
+                                                        // callers; guard div-by-zero regardless
+    let mut probs: Vec<f32> = idx
+        .iter()
+        .map(|&i| ((logits[i] - maxl) / temp).exp())
+        .collect();
+    let sum: f32 = probs.iter().sum();
+    for p in probs.iter_mut() {
+        *p /= sum;
+    }
+    let mut cum = 0.0;
+    let mut cutoff = probs.len();
+    for (j, &p) in probs.iter().enumerate() {
+        cum += p;
+        if cum >= s.top_p {
+            cutoff = j + 1;
+            break;
+        }
+    }
+    let total: f32 = probs[..cutoff].iter().sum();
+    idx[..cutoff]
+        .iter()
+        .zip(probs[..cutoff].iter())
+        .map(|(&i, &p)| (i as u32, p / total))
+        .collect()
+}
+
+/// Draw one id from a normalized `(id, prob)` distribution (as returned by [`truncated_dist`])
+/// using the shared xorshift64 uniform draw — the stochastic MTP accept rule's residual/bonus
+/// sampling (`crate::seam::model::spec_accept_stochastic`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn sample_from_dist(dist: &[(u32, f32)], rng: &mut u64) -> u32 {
+    let Some(&(last_id, _)) = dist.last() else {
+        return 0; // empty distribution: nothing to draw (caller-guaranteed not to happen)
+    };
+    let r = next_uniform(rng);
+    let mut acc = 0.0;
+    for &(id, p) in dist {
+        acc += p;
+        if r <= acc {
+            return id;
+        }
+    }
+    last_id // float rounding: r landed a hair past the cumulative sum — take the last entry
+}

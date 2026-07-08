@@ -1400,6 +1400,100 @@ pub(crate) fn spec_accept(cand: &[u32], verify_argmax: &[u32]) -> (usize, u32) {
     (accepted, verify_argmax[accepted])
 }
 
+/// Temperature-aware speculative accept rule — the stochastic sibling of [`spec_accept`], used
+/// when `INFR_TEMP > 0` (the greedy rule above requires the trunk's argmax as its one-and-only
+/// target, which is why pure greedy makes thinking models degenerate — see `crate::sampling`'s
+/// `Sampler` doc — and why MTP needs this at all). Implements the standard speculative-sampling
+/// acceptance rule (Leviathan & Kalman 2023 / Chen et al. 2023):
+///
+/// Draft head proposes `cand[i]` from its own truncated proposal distribution `q_dists[i]`
+/// (top-k/top-p-truncated at the SAME `Sampler` config the target uses — `sampling::truncated_dist`
+/// applied to the head's own logits). The target trunk's verify forward gives the truncated
+/// distributions `p_dists[0..=cand.len()]` at those same positions (row `j` = the target's
+/// distribution conditioned on `cand[..j]`; `p_dists[cand.len()]` is the bonus row, conditioned on
+/// every candidate being accepted). For `i` in `0..cand.len()`: draw `u ~ Uniform(0,1)`; accept
+/// `cand[i]` iff `u < min(1, p_i(cand[i]) / q_i(cand[i]))`. On the first rejection, sample the next
+/// token from the normalized residual `max(p_i - q_i, 0)` and STOP this cycle (no bonus). If every
+/// candidate is accepted, sample the bonus token from `p_dists[cand.len()]`.
+///
+/// This provably preserves the TARGET's sampling distribution — unlike `spec_accept`, the
+/// committed stream is not required to equal any single model's argmax/sample stream token-for-
+/// token across a re-run; it's a sample from the target's distribution either way (see
+/// `spec_accept_stochastic_tests` for the acceptance-rule properties this is pinned to: identical
+/// p/q always accepts, an off-support draft always rejects, the residual always renormalizes, and
+/// a fixed seed is deterministic).
+fn dist_prob(dist: &[(u32, f32)], x: u32) -> f32 {
+    dist.iter()
+        .find(|&&(id, _)| id == x)
+        .map(|&(_, p)| p)
+        .unwrap_or(0.0)
+}
+
+/// The rejection-sampling residual `max(p - q, 0)`, renormalized to sum to 1 — the distribution
+/// [`spec_accept_stochastic`] resamples from on a coin-flip rejection. Only entries in `p`'s own
+/// support can contribute a positive residual (an entry outside `p` has `p == 0`, which clamps to
+/// 0 regardless of `q`), so the returned ids are always a subset of `p`'s ids. Empty when `p` and
+/// `q` agree pointwise everywhere on `p`'s support — the degenerate case `spec_accept_stochastic`
+/// falls back to `p`'s own top choice for (see `spec_accept_stochastic_tests` for both properties).
+fn residual_dist(p: &[(u32, f32)], q: &[(u32, f32)]) -> Vec<(u32, f32)> {
+    let mut residual: Vec<(u32, f32)> = Vec::with_capacity(p.len());
+    let mut sum = 0.0f32;
+    for &(id, pv) in p {
+        let r = (pv - dist_prob(q, id)).max(0.0);
+        if r > 0.0 {
+            residual.push((id, r));
+            sum += r;
+        }
+    }
+    if sum > 0.0 {
+        for e in residual.iter_mut() {
+            e.1 /= sum;
+        }
+    }
+    residual
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn spec_accept_stochastic(
+    cand: &[u32],
+    q_dists: &[Vec<(u32, f32)>],
+    p_dists: &[Vec<(u32, f32)>],
+    rng: &mut u64,
+) -> (usize, u32) {
+    debug_assert_eq!(q_dists.len(), cand.len());
+    debug_assert_eq!(p_dists.len(), cand.len() + 1);
+    for i in 0..cand.len() {
+        let x = cand[i];
+        let q_x = dist_prob(&q_dists[i], x);
+        let p_x = dist_prob(&p_dists[i], x);
+        // q_x > 0 always holds in practice (x was drawn from q_dists[i]'s own support), but guard
+        // the division for a caller that hands in an inconsistent (cand, q_dists) pair.
+        let ratio = if q_x > 0.0 { (p_x / q_x).min(1.0) } else { 0.0 };
+        let u = crate::sampling::next_uniform(rng);
+        if u < ratio {
+            continue; // accept — draw the next position's coin
+        }
+        // Reject: sample the next committed token from the normalized residual max(p_i - q_i, 0).
+        let residual = residual_dist(&p_dists[i], &q_dists[i]);
+        let next = if !residual.is_empty() {
+            crate::sampling::sample_from_dist(&residual, rng)
+        } else {
+            // Degenerate: q_i == p_i pointwise on p_i's support, so the residual is empty, yet the
+            // coin still rejected (only possible if x itself sat outside p_i's support, p_x == 0).
+            // Fall back to p_i's own top choice so the cycle always makes forward progress.
+            p_dists[i]
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|&(id, _)| id)
+                .unwrap_or(0)
+        };
+        return (i, next);
+    }
+    // Every candidate accepted: sample the bonus token from the target's own distribution.
+    let bonus = crate::sampling::sample_from_dist(&p_dists[cand.len()], rng);
+    (cand.len(), bonus)
+}
+
 #[cfg(test)]
 mod spec_accept_tests {
     use super::spec_accept;
@@ -1451,5 +1545,93 @@ mod spec_accept_tests {
                 "draft {draft:?} committed a non-greedy stream"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod spec_accept_stochastic_tests {
+    use super::{residual_dist, spec_accept_stochastic};
+
+    #[test]
+    fn identical_p_q_always_accepts() {
+        // q == p everywhere ⇒ the ratio is exactly 1 at every position, so `u < 1` always holds
+        // (next_uniform draws are in [0,1)) ⇒ every candidate is accepted, every seed.
+        let dist = vec![(10u32, 0.5f32), (11, 0.3), (12, 0.2)];
+        let cand = [10u32, 11, 12];
+        let q_dists = vec![dist.clone(), dist.clone(), dist.clone()];
+        let p_dists = vec![dist.clone(), dist.clone(), dist.clone(), dist.clone()];
+        for seed in 1..50u64 {
+            let mut rng = seed | 1;
+            let (accepted, next) = spec_accept_stochastic(&cand, &q_dists, &p_dists, &mut rng);
+            assert_eq!(accepted, cand.len(), "seed {seed}: expected full accept");
+            // The bonus token must come from the (only nonzero-mass) support of p_dists[3].
+            assert!(dist.iter().any(|&(id, _)| id == next));
+        }
+    }
+
+    #[test]
+    fn zero_target_prob_always_rejects() {
+        // The drafted token (99) has zero probability under the target's truncated distribution
+        // (it isn't in p_dist's support at all) ⇒ ratio == 0 ⇒ always rejected regardless of the
+        // coin draw, and the residual must be resampled (never token 99 itself).
+        let q_dist = vec![(99u32, 1.0f32)]; // draft head is CERTAIN of a token the target rejects
+        let p_dist = vec![(10u32, 0.6f32), (11, 0.4)]; // target never puts mass on 99
+        let cand = [99u32];
+        let q_dists = vec![q_dist];
+        let p_dists = vec![p_dist.clone(), p_dist.clone()];
+        for seed in 1..50u64 {
+            let mut rng = seed | 1;
+            let (accepted, next) = spec_accept_stochastic(&cand, &q_dists, &p_dists, &mut rng);
+            assert_eq!(accepted, 0, "seed {seed}: p(x)=0 must always reject");
+            assert_ne!(
+                next, 99,
+                "seed {seed}: rejected token must not be re-emitted"
+            );
+            assert!(p_dist.iter().any(|&(id, _)| id == next));
+        }
+    }
+
+    #[test]
+    fn residual_normalizes_and_is_nonnegative() {
+        // p has mass q doesn't (10, 12); q has mass p doesn't (99, ignored); both have 11 with
+        // q's share larger than p's (clamps to 0 there).
+        let p = vec![(10u32, 0.5f32), (11, 0.2), (12, 0.3)];
+        let q = vec![(11u32, 0.9f32), (99, 0.1)];
+        let r = residual_dist(&p, &q);
+        // Only p's support can appear; 11's residual (0.2 - 0.9 clamped to 0) must be dropped.
+        assert!(r.iter().all(|&(id, _)| id == 10 || id == 12));
+        assert!(!r.iter().any(|&(id, _)| id == 11));
+        assert!(r.iter().all(|&(_, p)| p >= 0.0));
+        let sum: f32 = r.iter().map(|&(_, p)| p).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "residual must renormalize to 1, got {sum}"
+        );
+    }
+
+    #[test]
+    fn residual_empty_when_q_dominates_p_everywhere() {
+        // q >= p pointwise on p's whole support ⇒ every residual clamps to 0 ⇒ empty.
+        let p = vec![(10u32, 0.3f32), (11, 0.3)];
+        let q = vec![(10u32, 0.5f32), (11, 0.5)];
+        assert!(residual_dist(&p, &q).is_empty());
+    }
+
+    #[test]
+    fn deterministic_given_fixed_seed() {
+        let q_dist = vec![(5u32, 1.0f32)];
+        let p_dist = vec![(5u32, 0.4f32), (6, 0.6)];
+        let cand = [5u32];
+        let q_dists = vec![q_dist];
+        let p_dists = vec![p_dist.clone(), p_dist];
+        // A fixed, non-env-dependent seed (not `sampling::seed_rng()`, which falls back to a
+        // wall-clock seed and would make this test flaky under parallel `cargo test`). Must be odd
+        // (the xorshift64 state must be nonzero and `seed_rng()` always ORs in `1`).
+        let mut rng_a = 1u64;
+        let mut rng_b = 1u64;
+        let a = spec_accept_stochastic(&cand, &q_dists, &p_dists, &mut rng_a);
+        let b = spec_accept_stochastic(&cand, &q_dists, &p_dists, &mut rng_b);
+        assert_eq!(a, b, "same seed must reproduce the same accept decision");
+        assert_eq!(rng_a, rng_b, "same seed must reproduce the same rng stream");
     }
 }

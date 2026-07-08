@@ -55,6 +55,14 @@ pub struct Capabilities {
     /// SEPARATE primitive from coopmat (hence not `i8_coopmat`). False = route to the scalar dequant
     /// GEMV (needs no extension). Independent of `f16`/`f16_coopmat`.
     pub i8_dot: bool,
+    /// The cooperative-matrix unit accepts SINT8×SINT8→SINT32 components at the exact 16x16x16 tile
+    /// every int8 coopmat shader here is hardcoded to (enumerated from the device's coopmat config
+    /// list, same discipline as `f16_coopmat`). DETECTION ONLY — true on this RX 7900 XTX (Mesa
+    /// 26.1.4), but int8 coopmat previously HUNG the GPU on an older Mesa (commit ad82a77; the
+    /// standalone `coopmat_int8_test` harness confirmed the fix). The kernel is therefore an
+    /// ADDITIONAL opt-in gate on top of this flag: the adapter only dispatches it when
+    /// `INFR_I8_COOPMAT=1` is also set (default off) — see adapter.rs's `Op::Linear` GEMM branch.
+    pub i8_coopmat: bool,
     /// Supported subgroup-size range (`VkPhysicalDeviceSubgroupSizeControlProperties`). The coopmat
     /// GEMM pins `requiredSubgroupSize = 32` (RDNA3 wave32); a device whose range excludes 32 can't
     /// run the pinned kernel and must fall back to a non-pinned variant. `(0, 0)` =

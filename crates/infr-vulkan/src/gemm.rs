@@ -445,6 +445,14 @@ pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the int8 cooperative-matrix (WMMA) prefill GEMM, Q8_0 only — measurement kernel
+/// gated behind `INFR_I8_COOPMAT=1` (see `native_gemm_i8cm_q8_0.comp` for the design doc).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_i8cm_q8_0_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_i8cm_q8_0.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the MoE weighted-accumulate (sum of selected experts' down outputs into hidden).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_accumulate_spv() -> &'static [u32] {

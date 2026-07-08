@@ -1174,6 +1174,47 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// int8 cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — MEASUREMENT kernel, gated by
+    /// the adapter behind `INFR_I8_COOPMAT=1` + `caps.i8_coopmat` (see
+    /// `native_gemm_i8cm_q8_0.comp` for the design doc: 16x16 tile per workgroup, per-Q8_0-block
+    /// int32 WMMA dot + shared-mem store/scale epilogue). `qa`/`dact` from `quant_q8`. `c` is
+    /// `ceil(m/64)*64` rows (same padding convention as `matmul_native_off`). Requires `n%16==0`,
+    /// `k%32==0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_i8cm_q8_0(
+        &self,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.label_gemm("native_gemm_i8cm_q8_0", m, k, n);
+        let kern = self.be.kernel_sg(
+            "native_gemm_i8cm_q8_0",
+            crate::gemm::native_gemm_i8cm_q8_0_spv(),
+            4,
+            16,
+            32,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let groups = (m.div_ceil(16) * (n / 16)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(qa), Self::vkb(dact), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Tiled Q6_K dp4a (mmq) GEMM for a stacked expert (the MoE down projection): `c = qa·W[w_base]ᵀ`
     /// using hardware int8 dot-product (activations pre-quantized via `quant_q8`; the per-block sum is
     /// unused — Q6_K is symmetric, no min). `c` is `ceil(m/64)*64` rows. Faster than the coopmat-f16

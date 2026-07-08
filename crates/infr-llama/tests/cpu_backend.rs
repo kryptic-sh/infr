@@ -385,6 +385,24 @@ fn gpu_seam_matches_cpu_qwen3_q2k() {
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
 
+/// int8 cooperative-matrix (WMMA) prefill GEMM measurement kernel (`INFR_I8_COOPMAT=1`, Q8_0 only —
+/// see `crates/infr-vulkan/shaders/native_gemm_i8cm_q8_0.comp`): the Vulkan seam must still match
+/// the f32 CPU oracle token-for-token with the toggle on, proving the new per-Q8_0-block WMMA-dot +
+/// shared-store scale epilogue is numerically equivalent to the production f16-coopmat dequant path
+/// (and to the dp4a mmq reference it mirrors). Self-skips without a Q8_0 GGUF or a GPU with
+/// `caps.i8_coopmat` (the toggle is a no-op on hardware/driver that doesn't detect the config — see
+/// `Capabilities::i8_coopmat`'s doc — so this test would otherwise silently run the default f16
+/// path and prove nothing).
+#[test]
+fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
+    let path = need_model!(qwen3_quant("Q8_0"), "Qwen3-0.6B-Q8_0");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_I8_COOPMAT", "1");
+    seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
+    std::env::remove_var("INFR_I8_COOPMAT");
+}
+
 /// Flash-attention prefill parity: a prompt LONG ENOUGH (>64 tokens) that the seam's batched prefill
 /// takes the FlashAttention-2 path (`attention_prefill_flash`, rows≥64) + the tiled GEMM/mmq Linear,
 /// must generate the SAME greedy continuation as the CPU reference oracle (which uses the naive

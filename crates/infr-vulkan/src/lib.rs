@@ -583,6 +583,21 @@ impl VulkanBackend {
             && coopmat_configs.iter().any(|&(_, _, _, a, b, _, _)| {
                 a.as_raw() >= 1_000_000_000 || b.as_raw() >= 1_000_000_000
             });
+        // i8 coopmat: a config with SINT8 A AND B operands and a SINT32 result, at the exact
+        // 16x16x16 tile every int8 coopmat shader here uses — same discipline as `f16_coopmat`'s
+        // dimension check above. DETECTION ONLY (see the `i8_coopmat` doc comment on
+        // `Capabilities`): the standalone `coopmat_int8_test` harness confirmed this exact config
+        // (SINT8xSINT8->SINT32, subgroup-pinned 32, A RowMajor/B ColumnMajor) dispatches correctly
+        // on this driver, but int8 coopmat hung an OLDER Mesa (commit ad82a77) despite enumerating
+        // fine there too — so detection alone does NOT make this capability a safe default; the
+        // adapter requires `INFR_I8_COOPMAT=1` in addition to `caps.i8_coopmat` before ever
+        // dispatching the kernel.
+        let i8c = vk::ComponentTypeKHR::SINT8;
+        let i32c = vk::ComponentTypeKHR::SINT32;
+        let has_i8_coopmat = has_coop_ext_feat
+            && coopmat_configs.iter().any(|&(m, n, k, a, b, _, r)| {
+                (m, n, k) == CMS_TILE && a == i8c && b == i8c && r == i32c
+            });
 
         // ── force-disable capabilities for fallback-path testing on capable HW ──
         // These env knobs drop a DETECTED capability so the next kernel tier down is exercised on a
@@ -595,6 +610,11 @@ impl VulkanBackend {
             has_coop_matrix && has_f16 && std::env::var("INFR_NO_COOPMAT").is_err();
         // f8 coopmat is a coopmat sub-tier, so dropping coopmat drops it too.
         let has_f8_coopmat = has_f8_coopmat && has_coop_matrix;
+        // i8 coopmat rides the SAME device feature enable (coopmat_ci is only chained into
+        // device_ci below when `has_coop_matrix`) — without it the extension isn't enabled on the
+        // logical device even if int8 configs were enumerated, so this is a real dependency, not
+        // just symmetry with f8_coopmat above. INFR_NO_COOPMAT/INFR_NO_F16 drop it too.
+        let has_i8_coopmat = has_i8_coopmat && has_coop_matrix;
         let has_i8_dot = has_i8_dot && std::env::var("INFR_NO_I8DOT").is_err();
 
         // ── build extension name list (only available ones) ────────────────────
@@ -725,6 +745,7 @@ impl VulkanBackend {
             f8_coopmat: has_f8_coopmat,
             i8: has_int8,
             i8_dot: has_i8_dot,
+            i8_coopmat: has_i8_coopmat,
             subgroup_min,
             subgroup_max,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
@@ -750,7 +771,7 @@ impl VulkanBackend {
         // `INFR_MTP=1` run prints exactly one banner again without needing this dedup.
         let yn = |b: bool| if b { "y" } else { "n" };
         eprintln!(
-            "[infr] GPU: {} | f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} \
+            "[infr] GPU: {} | f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} i8cm:{} \
              subgroup:{}-{} shared:{}KB",
             caps.name,
             yn(caps.f16),
@@ -759,6 +780,7 @@ impl VulkanBackend {
             yn(caps.f8_coopmat),
             yn(caps.i8),
             yn(caps.i8_dot),
+            yn(caps.i8_coopmat),
             caps.subgroup_min,
             caps.subgroup_max,
             caps.max_shared_memory_bytes / 1024,

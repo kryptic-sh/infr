@@ -807,7 +807,42 @@ fn lower_op(
                 let warp_ok = out_f % 128 == 0
                     && crate::gemm::native_gemm_warp_build_spv(dt).is_some()
                     && std::env::var("INFR_NO_GEMM_WARP").is_err();
-                if matches!(dt, infr_core::DType::Q4K)
+                // int8 cooperative-matrix (WMMA) prefill GEMM — MEASUREMENT path, Q8_0 only
+                // (crates/infr-vulkan/shaders/native_gemm_i8cm_q8_0.comp). `caps.i8_coopmat` is
+                // hardware detection only (see its doc); this dispatch ALSO requires
+                // `INFR_I8_COOPMAT=1` (default off) because int8 coopmat hung the GPU on an older
+                // Mesa despite enumerating fine there too (commit ad82a77) — the toggle keeps that
+                // regression class opt-in until a Mesa-version-gated default is warranted. Default
+                // behavior (unset) is completely unaffected: this is a new, additive branch ahead
+                // of the existing Q4_K-mmq / warp-coopmat / off-tier arms below, which are
+                // untouched.
+                let i8cm_ok = matches!(dt, infr_core::DType::Q8_0)
+                    && be_.caps().i8_coopmat
+                    && std::env::var("INFR_I8_COOPMAT").is_ok();
+                if i8cm_ok {
+                    let nblk = in_f / 32;
+                    let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
+                    let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
+                    let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        m,
+                        in_f,
+                    );
+                    rec.matmul_i8cm_q8_0(
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        w,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                } else if matches!(dt, infr_core::DType::Q4K)
                     && !warp_ok
                     && be_.caps().i8_dot
                     && std::env::var("INFR_NO_MMQ").is_err()

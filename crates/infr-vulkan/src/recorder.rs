@@ -1262,13 +1262,16 @@ impl<'a> Recorder<'a> {
 
     /// fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — gated by the adapter
     /// behind `INFR_F8_COOPMAT=1` + `caps.f8_coopmat` (see `native_gemm_f8cm_q8_0.comp` for the
-    /// design doc: this is structurally `matmul_native`'s 64x64/2x2-tile f16-coopmat GEMM with fp8
-    /// operands — a DIRECT matmul, no per-block int rescale like `matmul_i8cm_q8_0` needs). `qa`
+    /// design doc: this is the SAME 256-thread/8-warp warptile as `native_gemm_warp`'s f16 GEMM,
+    /// fp8-typed — a DIRECT matmul, no per-block int rescale like `matmul_i8cm_q8_0` needs). `qa`
     /// is the PRE-SCALED fp8 activation buffer from `quant_f8_row` (E4M3's range is tiny — raw f32
     /// activations must be range-scaled before the cast or they overflow to inf/NaN), `srow` is
     /// its per-row f32 descale factor, applied to the output in the shader's epilogue. `c` is
-    /// `ceil(m/64)*64` rows (same padding convention as `matmul_native`). Requires `n%64==0`,
-    /// `k%32==0`. Correctness UNVALIDATED on hardware without fp8 coopmat.
+    /// `ceil(m/64)*64` rows (same padding convention as `matmul_native`). Picks the WIDE (BN=256,
+    /// BK=32) tile when `n%256==0`, else the NARROW_N (BN=128, BK=64) tile — mirrors
+    /// `matmul_native_off`'s self-contained wide/narrow pick; the caller (adapter.rs `f8cm_ok`)
+    /// already checked shape eligibility for one of these before calling in. Requires `k%32==0`
+    /// (wide) or `k%64==0` (narrow). Correctness UNVALIDATED on hardware without fp8 coopmat.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_f8cm_q8_0(
         &self,
@@ -1281,21 +1284,29 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        self.label_gemm("native_gemm_f8cm_q8_0", m, k, n);
-        let kern = self.be.kernel_sg(
-            "native_gemm_f8cm_q8_0",
-            crate::gemm::native_gemm_f8cm_q8_0_spv(),
-            4,
-            16,
-            32,
-        );
+        let wide = n.is_multiple_of(256);
+        let (name, spv, bn) = if wide {
+            (
+                "native_gemm_f8cm_q8_0",
+                crate::gemm::native_gemm_f8cm_q8_0_spv(),
+                256,
+            )
+        } else {
+            (
+                "native_gemm_f8cm_q8_0_n128",
+                crate::gemm::native_gemm_f8cm_q8_0_n128_spv(),
+                128,
+            )
+        };
+        self.label_gemm(name, m, k, n);
+        let kern = self.be.kernel_sg(name, spv, 4, 16, 32);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        // BM=64/BN=64 (see the shader header): one workgroup covers 64 rows x 64 cols.
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        // BM=64 (both tiles): one workgroup covers 64 rows x `bn` cols.
+        let groups = (m.div_ceil(64) * (n / bn)) as u32;
         self.dispatch(
             kern,
             &[Self::vkb(qa), Self::vkb(w), Self::vkb(srow), Self::vkb(c)],

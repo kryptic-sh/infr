@@ -614,8 +614,15 @@ fn main() {
         // fp8 (E4M3) coopmat prefill GEMM, Q8_0 only — gated behind INFR_F8_COOPMAT=1 +
         // caps.f8_coopmat (RDNA4 native fp8 WMMA; see adapter.rs `f8cm_ok` / the .comp file's
         // design doc). Default-off; correctness UNVALIDATED on this box (no fp8 coopmat hardware
-        // here — compile-checked only), pending an RDNA4 run.
+        // here — compile-checked only), pending an RDNA4 run. Same 256-thread/8-warp warptile as
+        // native_gemm_warp (BM=64xBN=256 wide); -DNARROW_N mirrors native_gemm_warp's n%128
+        // occupancy-fix variant (BN=128/BK=64).
         ("native_gemm_f8cm_q8_0", "native_gemm_f8cm_q8_0", &[]),
+        (
+            "native_gemm_f8cm_q8_0",
+            "native_gemm_f8cm_q8_0_n128",
+            &["-DNARROW_N"],
+        ),
         // Row-wise activation quant for the fp8-coopmat GEMM (whole-K amax -> scale = amax/448,
         // range-scales activations into E4M3 before the cast; see quant_f8_row.comp). Gated by
         // the same INFR_F8_COOPMAT=1 + caps.f8_coopmat as native_gemm_f8cm_q8_0 above.

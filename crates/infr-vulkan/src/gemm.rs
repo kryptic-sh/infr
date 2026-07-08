@@ -461,11 +461,21 @@ pub(crate) fn quant_q8_row_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// SPIR-V for the fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM, Q8_0 only — gated behind
-/// `INFR_F8_COOPMAT=1` + `caps.f8_coopmat` (see `native_gemm_f8cm_q8_0.comp` for the design doc).
+/// SPIR-V for the fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM, Q8_0 only, WIDE tile
+/// (BM=64xBN=256, same warptile shape as `native_gemm_warp`) — gated behind `INFR_F8_COOPMAT=1` +
+/// `caps.f8_coopmat` (see `native_gemm_f8cm_q8_0.comp` for the design doc).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_f8cm_q8_0_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_f8cm_q8_0.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the fp8-coopmat GEMM's NARROW_N tile (BM=64xBN=128, BK=64) — the occupancy fix for
+/// n%128 (not n%256) shapes, mirroring `native_gemm_warp_n128_build_spv`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_f8cm_q8_0_n128_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_f8cm_q8_0_n128.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

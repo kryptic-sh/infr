@@ -829,8 +829,18 @@ fn lower_op(
                 // measurement tiers, so when a caller opts into fp8 it takes priority. Default
                 // behavior (unset) is completely unaffected — new, additive branch ahead of the
                 // i8cm / Q4_K-mmq / warp-coopmat / off-tier arms below, which are untouched.
+                //
+                // Shape gate mirrors `warp_ok`'s f16 warptile pick: WIDE (BN=256, BK=32) needs
+                // out_f%256==0 && in_f%32==0; NARROW_N (BN=128, BK=64) needs out_f%128==0 &&
+                // in_f%64==0 for shapes the wide tile can't cover (n%128 not n%256 — see
+                // native_gemm_f8cm_q8_0.comp's -DNARROW_N). Neither divides (e.g. out_f%128!=0, or
+                // out_f%128==0 with in_f%64!=0 so narrow's BK=64 can't stage either) -> f8cm_ok is
+                // false and the shape falls through to i8cm/mmq/native below, unaffected.
+                let f8_wide = out_f % 256 == 0 && in_f % 32 == 0;
+                let f8_narrow = !f8_wide && out_f % 128 == 0 && in_f % 64 == 0;
                 let f8cm_ok = matches!(dt, infr_core::DType::Q8_0)
                     && be_.caps().f8_coopmat
+                    && (f8_wide || f8_narrow)
                     && std::env::var("INFR_F8_COOPMAT").is_ok();
                 let i8cm_ok = matches!(dt, infr_core::DType::Q8_0)
                     && be_.caps().i8_coopmat

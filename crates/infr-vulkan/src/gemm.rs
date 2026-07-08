@@ -488,6 +488,39 @@ pub(crate) fn quant_f8_row_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the `-DPREPACK` fp8-coopmat GEMM WIDE tile: reads a pre-packed E4M3 weight buffer
+/// directly (no in-shader Q8_0 dequant) — the measurement variant for whether removing the dqblk
+/// bottleneck lets fp8 beat f16 (see `native_gemm_f8cm_q8_0.comp` header + `repack_q8_to_f8.comp`).
+/// Gated behind `INFR_F8_COOPMAT=1` + `INFR_F8_PREPACK=1` + `caps.f8_coopmat`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_f8cm_q8_0_prepack_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_f8cm_q8_0_prepack.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the `-DPREPACK` fp8-coopmat GEMM's NARROW_N tile (BM=64xBN=128, BK=64) — the n%128
+/// occupancy fix, mirroring `native_gemm_f8cm_q8_0_n128_spv` but reading pre-packed E4M3 weights.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_f8cm_q8_0_prepack_n128_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_f8cm_q8_0_prepack_n128.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for `repack_q8_to_f8.comp`: bakes each Q8_0 32-block's scale into an E4M3 output
+/// (decode-once via `dqblk`), producing the pre-packed weight buffer the PREPACK GEMM variants
+/// above read directly. Gated behind `INFR_F8_COOPMAT=1` + `INFR_F8_PREPACK=1`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn repack_q8_to_f8_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/repack_q8_to_f8.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the int8-coopmat GEMM's "Idea 2" whole-row-activation-scale measurement variant
 /// (see `native_gemm_i8cm_q8_0.comp` #ifdef ROW_SCALE), gated behind `INFR_I8_ROW_SCALE=1`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

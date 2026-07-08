@@ -856,16 +856,41 @@ fn lower_op(
                     let qa = pooled(pool, be_, "f8cm_qa", m * in_f)?;
                     let srow = pooled(pool, be_, "f8cm_srow", m * 4)?;
                     rec.quant_f8_row(xb, pool[&qa].as_ref(), pool[&srow].as_ref(), m, in_f);
-                    rec.matmul_f8cm_q8_0(
-                        pool[&qa].as_ref(),
-                        pool[&srow].as_ref(),
-                        w,
-                        w_off,
-                        out,
-                        m,
-                        in_f,
-                        out_f,
-                    );
+                    // INFR_F8_PREPACK=1 (requires INFR_F8_COOPMAT=1 too, since it only takes
+                    // effect inside this arm): bakes the Q8_0 block scale into an E4M3 weight
+                    // buffer ONCE via `repack_q8_to_f8`, then the GEMM's Bs staging reads that
+                    // buffer DIRECTLY — no in-shader dqblk. Isolates whether removing the
+                    // dequant-ALU bottleneck (the SAME cost f16 pays; fp8-dqblk measured 0.73x
+                    // f16 on RDNA4) lets fp8's 2x WMMA rate win. The E4M3 buffer is pooled
+                    // per-shape scratch (like every other tier here) and re-repacked on EVERY
+                    // forward call — a real deployment would cache the repack at load time, not
+                    // redo it per Linear; this is a per-op profiling isolation path, not the
+                    // proposed production shape. Unset (default): unchanged dqblk path below,
+                    // byte-identical to before this branch existed.
+                    if std::env::var("INFR_F8_PREPACK").is_ok() {
+                        let f8_w8 = pooled(pool, be_, "f8_w8", out_f * in_f)?;
+                        rec.repack_q8_to_f8(w, w_off, pool[&f8_w8].as_ref(), out_f, in_f);
+                        rec.matmul_f8cm_q8_0_prepacked(
+                            pool[&qa].as_ref(),
+                            pool[&srow].as_ref(),
+                            pool[&f8_w8].as_ref(),
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                        );
+                    } else {
+                        rec.matmul_f8cm_q8_0(
+                            pool[&qa].as_ref(),
+                            pool[&srow].as_ref(),
+                            w,
+                            w_off,
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                        );
+                    }
                 } else if i8cm_ok {
                     // "Idea 2" measurement (INFR_I8_ROW_SCALE=1, requires INFR_I8_COOPMAT=1 too):
                     // whole-row (block-invariant) activation scale instead of quant_q8's

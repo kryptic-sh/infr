@@ -627,6 +627,25 @@ fn main() {
         // range-scales activations into E4M3 before the cast; see quant_f8_row.comp). Gated by
         // the same INFR_F8_COOPMAT=1 + caps.f8_coopmat as native_gemm_f8cm_q8_0 above.
         ("quant_f8_row", "quant_f8_row", &[]),
+        // -DPREPACK measurement variant: reads a pre-packed E4M3 weight buffer directly (no
+        // in-shader Q8_0 dequant) — tests whether removing the dqblk bottleneck lets fp8 beat f16
+        // (see native_gemm_f8cm_q8_0.comp header). Gated behind INFR_F8_COOPMAT=1 +
+        // INFR_F8_PREPACK=1 (adapter.rs `f8cm_ok`'s INFR_F8_PREPACK arm). Default path (unset) is
+        // completely unaffected — these are new, additive SPIR-V entries.
+        (
+            "native_gemm_f8cm_q8_0",
+            "native_gemm_f8cm_q8_0_prepack",
+            &["-DPREPACK"],
+        ),
+        (
+            "native_gemm_f8cm_q8_0",
+            "native_gemm_f8cm_q8_0_prepack_n128",
+            &["-DPREPACK", "-DNARROW_N"],
+        ),
+        // Bakes each Q8_0 32-block's scale into an E4M3 output (decode-once via dqblk), producing
+        // the pre-packed weight buffer the PREPACK GEMM variants above read directly. Gated by the
+        // same INFR_F8_COOPMAT=1 + INFR_F8_PREPACK=1.
+        ("repack_q8_to_f8", "repack_q8_to_f8", &[]),
         (
             "native_gemm_mmq_q4k",
             "native_gemm_mmq_q4k_xp",

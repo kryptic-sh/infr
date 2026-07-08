@@ -1316,6 +1316,91 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `-DPREPACK` measurement variant of `matmul_f8cm_q8_0`: `w8` is a PRE-PACKED E4M3 weight
+    /// buffer (from `repack_q8_to_f8`, block scale already baked in) instead of raw Q8_0 blocks —
+    /// the Bs staging in `native_gemm_f8cm_q8_0.comp` reads it DIRECTLY, no in-shader dqblk. Tests
+    /// whether removing that dequant-ALU cost (the SAME cost f16 pays, which is why fp8-dqblk
+    /// measured 0.73x f16 on RDNA4) lets fp8's 2x WMMA rate actually win. `qa`/`srow` are the
+    /// SAME pre-scaled fp8 activations / per-row descale `matmul_f8cm_q8_0` uses (from
+    /// `quant_f8_row`) — only the weight path differs. `w8` is always its own base (element 0):
+    /// the adapter repacks into a per-shape pooled scratch buffer every call (see adapter.rs
+    /// `f8cm_ok`'s INFR_F8_PREPACK arm), so no `w_base` parameter is needed (the push constant's
+    /// `w_base` field is unused under `-DPREPACK`, kept at 0 only to share the push-const layout).
+    /// `c` is `ceil(m/64)*64` rows, same convention as `matmul_f8cm_q8_0`. Gated by
+    /// `INFR_F8_COOPMAT=1` + `INFR_F8_PREPACK=1`. Correctness UNVALIDATED on hardware without fp8
+    /// coopmat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_f8cm_q8_0_prepacked(
+        &self,
+        qa: &dyn Buffer,
+        srow: &dyn Buffer,
+        w8: &dyn Buffer,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let wide = n.is_multiple_of(256);
+        let (name, spv, bn) = if wide {
+            (
+                "native_gemm_f8cm_q8_0_prepack",
+                crate::gemm::native_gemm_f8cm_q8_0_prepack_spv(),
+                256,
+            )
+        } else {
+            (
+                "native_gemm_f8cm_q8_0_prepack_n128",
+                crate::gemm::native_gemm_f8cm_q8_0_prepack_n128_spv(),
+                128,
+            )
+        };
+        self.label_gemm(name, m, k, n);
+        let kern = self.be.kernel_sg(name, spv, 4, 16, 32);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&0u32.to_ne_bytes()); // w_base: unused under -DPREPACK
+                                                           // BM=64 (both tiles): one workgroup covers 64 rows x `bn` cols.
+        let groups = (m.div_ceil(64) * (n / bn)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(qa), Self::vkb(w8), Self::vkb(srow), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
+    /// Prepack a Q8_0 weight tensor into E4M3 (`w8`), block scale BAKED IN — decode-once via
+    /// `dqblk` (see `repack_q8_to_f8.comp`), producing the weight buffer
+    /// `matmul_f8cm_q8_0_prepacked` reads directly. `w` is the Q8_0 SOURCE weight buffer, `w_base`
+    /// the usual element-offset convention into it (fused-QKV slices / stacked-MoE expert offset);
+    /// `w8` is written starting at element 0 (the caller's pooled per-shape scratch — see
+    /// adapter.rs `f8cm_ok`'s INFR_F8_PREPACK arm). `w8` is `[n, k]` E4M3, 1 byte/elem. Gated by
+    /// `INFR_F8_COOPMAT=1` + `INFR_F8_PREPACK=1`. Repacks EVERY call (no cross-call weight cache)
+    /// — a real deployment would cache the repack at load time; this is a per-op profiling
+    /// isolation path.
+    pub fn repack_q8_to_f8(
+        &self,
+        w: &dyn Buffer,
+        w_base: usize,
+        w8: &dyn Buffer,
+        n: usize,
+        k: usize,
+    ) {
+        let kern = self
+            .be
+            .kernel("repack_q8_to_f8", crate::gemm::repack_q8_to_f8_spv(), 2, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let total_blocks = ((n * k) / 32) as u32;
+        let groups = total_blocks.div_ceil(256);
+        self.dispatch_wide(kern, &[Self::vkb(w), Self::vkb(w8)], 1, &push, groups);
+    }
+
     /// Row-wise (whole-K) fp8 (E4M3) activation quantize pass — the activation-scaling step for
     /// `matmul_f8cm_q8_0` (see `quant_f8_row.comp`): ONE f32 scale per row (`srow[m]`), computed
     /// from the row's amax and applied so activations land inside E4M3's +-448 range before the

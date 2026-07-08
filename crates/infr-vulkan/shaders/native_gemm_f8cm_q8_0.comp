@@ -83,6 +83,15 @@
 // Requires n%256==0,k%32==0 (default) or n%128==0,k%64==0 (-DNARROW_N). requiredSubgroupSize=32
 // (set at pipeline-creation time, `kernel_sg`). Weight format: Q8_0 only (raw signed int8 +
 // per-32-block f16 scale, native_decode.glsl FMT_Q8_0).
+//
+// -DPREPACK (measurement variant, see recorder.rs `matmul_f8cm_q8_0_prepacked` / adapter.rs
+// `f8cm_ok`'s INFR_F8_PREPACK arm): binding 1 becomes a PRE-PACKED E4M3 weight buffer
+// (`repack_q8_to_f8.comp` bakes the Q8_0 block scale in ONCE ahead of this dispatch), and the Bs
+// staging below reads it DIRECTLY — no dqblk, no per-dispatch Q8_0 decode. Everything else
+// (activations, srow epilogue, warptile, NARROW_N) is UNCHANGED. This tests whether removing the
+// in-shader dequant (the SAME cost f16 pays, which the base variant above still pays) lets fp8's
+// 2x WMMA rate actually win, instead of the dequant-ALU bottleneck the base variant measured
+// (0.73x f16 on RDNA4).
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_float_e4m3 : require
@@ -115,9 +124,14 @@ const uint SAK = BK + 8u;     // As is [BM][SAK] — bank-conflict padding (see 
 const uint SBK = BK + 8u;     // Bs is [BN][SBK]
 
 // w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
+// Unused under -DPREPACK (the prepacked `w8` buffer is always its own base — see header note).
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 layout(binding = 0) readonly buffer QABuf { floate4m3_t qa[]; }; // [M, K] pre-scaled fp8 acts
+#ifdef PREPACK
+layout(binding = 1) readonly buffer WBuf { floate4m3_t w8[]; }; // [N, K] prepacked E4M3, scale baked in
+#else
 layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // Q8_0 weight: raw GGUF blocks (native)
+#endif
 layout(binding = 2) readonly buffer SBuf { float srow[]; }; // [M] per-row activation descale
 layout(binding = 3) writeonly buffer CBuf { float c[]; };
 
@@ -128,8 +142,10 @@ shared floate4m3_t Bs[BN * SBK];
 // store+scale round, in `storeScaledTile`).
 shared float tile16[WARPS_M * WARPS_N * 256u];
 
+#ifndef PREPACK
 #define FMT_Q8_0
 #include "native_decode.glsl"
+#endif
 
 // Store one 16x16 f32 accumulator tile to `tile16` (KNOWN RowMajor layout: element (r,c) at
 // tile16[tbase + r*16+c]), then scale-and-write it into `c` at (rowOff+r, colOff+c), guarded by
@@ -183,18 +199,26 @@ void main() {
             uint gr = wgRow + r;
             As[r * SAK + cc] = (gr < pc.m) ? qa[gr * pc.k + k0 + cc] : floate4m3_t(0.0);
         }
-        // One thread per (column, 32-elem k-block) per iteration — BN*(BK/32) decode slots per
-        // stage, striped across THREADS (exactly one iteration for both the wide and narrow tile:
+        // One thread per (column, 32-elem k-block) per iteration — BN*(BK/32) slots per stage,
+        // striped across THREADS (exactly one iteration for both the wide and narrow tile:
         // 256*1 = 128*2 = 256). Column-major stage into Bs, matching native_gemm_warp's Q8_0
-        // weight staging.
+        // weight staging. Under -DPREPACK the weight is ALREADY E4M3 (scale baked in by
+        // repack_q8_to_f8.comp) — read it straight from `w8[]`, no dqblk / no per-dispatch decode.
         for (uint slot = li; slot < BN * (BK / 32u); slot += THREADS) {
             uint cc = slot % BN;
             uint kb = (slot / BN) * 32u;
+#ifdef PREPACK
+            uint base = (wgCol + cc) * pc.k + k0 + kb;
+            [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
+                Bs[cc * SBK + kb + kk] = w8[base + kk];
+            }
+#else
             float v[32];
             dqblk(pc.w_base + (wgCol + cc) * pc.k + k0 + kb, v);
             [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
                 Bs[cc * SBK + kb + kk] = floate4m3_t(v[kk]);
             }
+#endif
         }
         barrier();
         [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {

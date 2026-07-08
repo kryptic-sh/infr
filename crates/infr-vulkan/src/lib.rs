@@ -737,6 +737,25 @@ impl VulkanBackend {
             (0, 0)
         };
 
+        // infr's Vulkan compute kernels are written for a PINNED subgroup size of 32 (RDNA3 wave32):
+        // rmsnorm / softmax / quant_q8 / the coopmat GEMM / attention QK+PV / flash / DeltaNet all
+        // dispatch via `kernel_sg(..., 32)`, which sets `requiredSubgroupSize=32` and FAILS pipeline
+        // creation on any device that can't provide a size-32 subgroup (no `subgroup_size_control`,
+        // or 32 outside `[minSubgroupSize, maxSubgroupSize]`). rmsnorm/softmax run on EVERY forward
+        // and are NOT coopmat-gated, so gating only the coopmat caps wouldn't prevent the crash —
+        // the whole backend needs 32. Refuse the Vulkan backend here (a clean Err, not a mid-forward
+        // panic) so `gpu_available()`/the seam falls back to CPU. Every real target — RADV (32-64),
+        // NVIDIA (32), Intel Arc (…-32) — provides 32; this only rejects exotic no-32 /
+        // no-size-control devices (older/mobile/llvmpipe), which can't run these wave32 kernels
+        // correctly anyway.
+        if !(has_sgsize && subgroup_min <= 32 && 32 <= subgroup_max) {
+            return Err(be(format!(
+                "infr's Vulkan backend requires a pinnable subgroup size of 32 (wave32); this \
+                 device's subgroup range is [{subgroup_min}, {subgroup_max}] and \
+                 subgroup_size_control={has_sgsize} — falling back to another backend"
+            )));
+        }
+
         let caps = Capabilities {
             name: device_name,
             f16: has_f16,

@@ -593,6 +593,10 @@ fn main() {
         ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),
+        // int8 coopmat (WMMA) prefill GEMM, Q8_0 only — measurement kernel gated behind
+        // INFR_I8_COOPMAT=1 (see adapter.rs / docs in the .comp file). Default-off; correctness
+        // validated against native_gemm_mmq_q8_0/native_gemm_warp_q8_0.
+        ("native_gemm_i8cm_q8_0", "native_gemm_i8cm_q8_0", &[]),
         (
             "native_gemm_mmq_q4k",
             "native_gemm_mmq_q4k_xp",

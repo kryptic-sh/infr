@@ -676,6 +676,39 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `y[rows,out] = x[rows,in] · Wᵀ` (W stored `[out,in]` f16) — the `!caps.f16` tier: same shape
+    /// as [`Self::linear`] but the weight buffer is read as packed u32 + `unpackHalf2x16` instead
+    /// of a `float16_t` SSBO element, so it needs no shaderFloat16/Float16 SPIR-V capability. See
+    /// `linear_f16_noext.comp`. Correctness-first — not row-tiled like the f32 mrow variants.
+    pub fn linear_f16_noext(
+        &self,
+        w: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("lin_f16_noext", rows, in_f, out_f);
+        let k = self.be.kernel(
+            "linear_f16_noext",
+            crate::gemm::linear_f16_noext_spv(),
+            3,
+            12,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
     /// f32-weight GEMV `y = x·Wᵀ` — full-precision projection weights (gemma4 E2B's per-layer
     /// inp_gate/proj and qwen3moe's router ship as F32; reading them through the f16 kernel
     /// produced garbage). Reuses the eager path's thread-per-output `linear_f32` kernel

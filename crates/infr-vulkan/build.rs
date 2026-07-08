@@ -209,6 +209,9 @@ fn main() {
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),
         ("linear_f16", "linear_f16", &[]),
+        // !caps.f16 fallback (no shaderFloat16 ext): reads the f16 weight buffer as packed u32 +
+        // unpackHalf2x16 (core GLSL) instead of a float16_t SSBO read.
+        ("linear_f16_noext", "linear_f16_noext", &[]),
         ("linear_bf16", "linear_bf16", &[]),
         ("linear_f32", "linear_f32", &[]),
         ("linear_f32r", "linear_f32r", &[]),

@@ -1,0 +1,43 @@
+#version 460
+// f16-weight GEMV y = x·Wᵀ — NO shaderFloat16 dependency. Fork of linear_f16.comp for devices
+// that lack VK_KHR_shader_float16/shaderFloat16 (which also implies no coopmat — f16 is a coopmat
+// prerequisite, see the caps.f16/caps.cooperative_matrix fallback ladder in adapter.rs). The f16
+// weight buffer is read as packed uint32 words (2 halves/word, the exact in-memory layout of a
+// tightly-packed f16 array) and unpacked via `unpackHalf2x16`, a CORE GLSL builtin requiring no
+// extension — instead of declaring a `float16_t` SSBO element (which needs the Float16 SPIR-V
+// capability). Same dispatch shape as linear_f16.comp (one workgroup per output element, 64
+// threads stride K, shared tree-reduce) and the same accumulation order, so results are bit- (or
+// near-bit-) identical to the f16 path modulo the dequant method. Correctness-first: no row-tiling
+// (unlike linear_f32's mrow variants) — this is the last-resort tier, not perf-tuned.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; } pc;
+layout(binding = 0) readonly buffer WB { uint w[]; };   // [out, in] f16 packed 2/u32 (raw bytes)
+layout(binding = 1) readonly buffer XB { float x[]; };  // [rows, in]
+layout(binding = 2) buffer YB { float y[]; };            // [rows, out]
+
+shared float red[64];
+
+float w_at(uint idx) {
+    uint word = w[idx >> 1];
+    vec2 h = unpackHalf2x16(word);
+    return (idx & 1u) == 0u ? h.x : h.y;
+}
+
+void main() {
+    uint unit = gl_WorkGroupID.x;       // = r * out_f + o
+    uint o = unit % pc.out_f;
+    uint r = unit / pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    uint wbase = o * pc.in_f;
+    uint xbase = r * pc.in_f;
+    float acc = 0.0;
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += w_at(wbase + i) * x[xbase + i]; }
+    red[t] = acc;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride /= 2u) {
+        if (t < stride) { red[t] += red[t + stride]; }
+        barrier();
+    }
+    if (t == 0u) { y[unit] = red[0]; }
+}

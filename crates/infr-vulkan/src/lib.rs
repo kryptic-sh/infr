@@ -362,6 +362,13 @@ impl VulkanBackend {
         self.shared.caps.max_shared_memory_bytes
     }
 
+    /// Borrowed capabilities — the kernel-tier fallback ladder's gate (`caps.cooperative_matrix`,
+    /// `caps.f16`, `caps.i8_dot`). Cheap: a reference, not the [`Backend::capabilities`] clone (which
+    /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
+    pub(crate) fn caps(&self) -> &Capabilities {
+        &self.shared.caps
+    }
+
     /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
     /// device + compute queue with the required extensions/features, set up the allocator.
     pub fn new() -> Result<Self> {

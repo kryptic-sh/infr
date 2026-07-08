@@ -417,6 +417,16 @@ re-open without a native-low-bit model.**
   so block-quant integer matmul pays a rescale tax f16-dequant doesn't. **The
   principled integer path is dp4a `mmq`** (each thread owns its accumulator →
   scale-after for free), which is what infr's Q4_K mmq + llama.cpp both use.
+- **bf16 coopmat GEMM** — built (`native_gemm_bf16cm.comp`,
+  `INFR_BF16_COOPMAT=1`, default-off): `bfloat16_t` operands + f32 accumulate,
+  reads bf16 weights exactly (no f16 clamp), no scaling. RDNA4 Qwen3-0.6B-BF16
+  pp512: **~6109 t/s vs the existing f16-clamp `native_gemm_warp_bf16` ~6575 = a
+  TIE** (marginally slower). bf16 WMMA runs at the f16 rate and both stage
+  through f32, so no speed win. Its only value is **precision faithfulness** —
+  it preserves bf16's exponent range instead of clamping to f16 (max 65504),
+  which matters only for bf16 models with out-of-f16-range values; in-range
+  models already run fine on the default f16-clamp path (which even has more
+  mantissa). Kept as an opt-in faithful path.
 - **Why no 8-bit operand swap wins:** on Vulkan/AMD, low-bit-float weights have
   no native matmul — you always dequant/convert to the WMMA operand type first,
   and RDNA4's fp8/int8 WMMA doesn't out-rate f16 on inference-shaped GEMMs.

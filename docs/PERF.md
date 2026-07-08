@@ -417,6 +417,22 @@ re-open without a native-low-bit model.**
   so block-quant integer matmul pays a rescale tax f16-dequant doesn't. **The
   principled integer path is dp4a `mmq`** (each thread owns its accumulator →
   scale-after for free), which is what infr's Q4_K mmq + llama.cpp both use.
+- **coopmat2 (`VK_NV_cooperative_matrix2`) per-element — tested, doesn't rescue
+  int8.** Coopmat2's `coopMatPerElementNV` gives (row,col)-indexed in-fragment
+  element access → apply the per-block rank-1 descale with NO store-to-shared
+  round trip (the "rescale tax" above). Present on RDNA4 RADV behind the driconf
+  flag `radv_cooperative_matrix2_nv=true` (Mesa 26.1.4); glslc compiles it
+  (`GL_NV_cooperative_matrix2`;
+  `void coopMatPerElementNV(out coopmat r, coopmat m, T fn)`). The probe
+  `crates/infr-vulkan/examples/coopmat2_test.rs` (per-element vs the v1
+  store-to-shared epilogue) measures coopmat2 **SLOWER at both scales**:
+  single-tile 2.16 vs 2.24µs (1.04×, noise); **full-GEMM 512×2048×2048 (64
+  rescale blocks, 4096 wg) 1239.8 vs 1195.3µs = 0.964× (coopmat2 slower)**. So
+  removing the rescale tax doesn't help — it was never the bottleneck
+  (store-to-shared is cheap on RDNA4). Example KEPT as a re-test tool; **re-run
+  it if a future Mesa stabilizes/optimizes coopmat2** (it's currently
+  experimental/driconf-gated). Run:
+  `radv_cooperative_matrix2_nv=true cargo run --release -p infr-vulkan --example coopmat2_test`.
 - **bf16 coopmat GEMM** — `native_gemm_warp.comp` `-DBF16CM` variant
   (`INFR_BF16_COOPMAT=1`, default-off): the PRODUCTION warptile with
   `bfloat16_t` operands instead of `float16_t` (a `CMTYPE` macro; default build

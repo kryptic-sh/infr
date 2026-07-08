@@ -2,8 +2,7 @@
 // int8 cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — MEASUREMENT variant, gated behind
 // INFR_I8_COOPMAT=1 (default off, see adapter.rs). C[m,n] = A[m,k]·Wᵀ via native SINT8×SINT8→SINT32
 // coopmat tiles (16x16x16 — the exact config `coopmat_int8_test`'s "baseline" variant proved
-// hang-free + bit-exact on this driver). One 16x16 output tile per workgroup (= one subgroup = 32
-// threads, matching the harness's subgroup_pin=32/local_size=32).
+// hang-free + bit-exact on this driver).
 //
 // Activations are pre-quantized by `quant_q8` (int8 `qa` + per-32-block f16 `dact`, mirroring the
 // dp4a mmq pass-1). Q8_0 weight bytes are ALREADY signed int8 (native_decode.glsl FMT_Q8_0) with a
@@ -22,15 +21,45 @@
 // measures.
 //
 // Requires m%1 (row-padded internally), n%16==0, k%32==0. requiredSubgroupSize=32.
+//
+// PERF NOTES (two measured wins, both kept; see recorder.rs `matmul_i8cm_q8_0` for the matching
+// dispatch-side grid math):
+//
+// 1. M-widening, multi-subgroup. One workgroup covers BM=128 rows (MSUB=8 stacked 16-row coopmat
+//    subtiles) x one 16-col tile, using 8 subgroups (256 threads) — ONE subgroup per subtile,
+//    running CONCURRENTLY, not serially. A single-subgroup-per-workgroup version of this (all
+//    subtiles processed one after another by the same 32 threads, BM=64/MSUB=4) was TRIED and
+//    measured SLOWER than the original 16x16 tile (pp512 6355->3831 t/s on Qwen3-0.6B-Q8_0 /
+//    RX7900XTX): serializing 4x the work into 1/4 as many workgroups starves the GPU of
+//    independent waves to hide latency with (fewer workgroups in flight + more registers/LDS per
+//    workgroup = lower occupancy), which cost more than the saved weight-unpack work was worth.
+//    Keeping wave count roughly constant (fewer, bigger workgroups, but proportionally more warps
+//    per workgroup) avoids that regression while still amortizing the weight byte staging over
+//    more output rows, since it depends only on the column tile and is staged ONCE per block by
+//    the whole workgroup, then reused by every concurrent subgroup. Swept BM=64/128/256 (pp512):
+//    8883 / 9105 / 8854 t/s — BM=128 is the measured sweet spot on this GPU.
+//
+// 2. Shared weight-scale hoist. `wv[]` (the per-column weight scale: a `bd`-division + `ru16`/
+//    `f16tof32` fetch) depends only on the column tile, NOT the row/subtile — but before this fix
+//    every subgroup in the workgroup recomputed it independently (pure redundant work, since
+//    subgroups aren't lockstep with each other the way lanes within one are). A diagnostic build
+//    that stripped it out entirely recovered ~37% of the kernel's runtime, dwarfing the ~4% from
+//    stripping the weight BYTE unpack itself — i.e. this redundant scale fetch, not the named
+//    scalar-byte tax, was the single largest cost in the kernel. Hoisting it into a `Ws[16]`
+//    shared array computed ONCE per block (by 16 threads, guarded) and read by every subgroup
+//    turned the BM=64 multi-subgroup variant's 6446 t/s into 8883 t/s (+38%) on its own.
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 const uint BK = 32u;
+const uint BM = 128u;        // rows per workgroup
+const uint MSUB = BM / 16u;  // stacked 16-row coopmat subtiles per workgroup = subgroups/workgroup
 
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 layout(binding = 0) readonly buffer QA { int8_t qa[]; };        // [m, k] int8 activations (quant_q8)
@@ -38,9 +67,10 @@ layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, k/32] per
 layout(binding = 2) readonly buffer WB { uint nw[]; };          // raw Q8_0 weight bytes ([n,k] blocks)
 layout(binding = 3) writeonly buffer CB { float c[]; };         // [mpad, n]
 
-shared int8_t As[16u * BK];
+shared int8_t As[BM * BK];
 shared int8_t Bs[16u * BK];
-shared int Tmp[256];
+shared int Tmp[MSUB * 256u];
+shared float Ws[16]; // per-block column weight scale — computed ONCE per block, shared by all subtiles
 
 uint rb(uint bo) { return (nw[bo >> 2u] >> ((bo & 3u) << 3u)) & 0xFFu; }
 uint ru16(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u); }
@@ -49,30 +79,46 @@ int sgn8(uint byte) { return int(byte) - int(byte >= 128u ? 256u : 0u); }
 
 void main() {
     uint tilesN = pc.n / 16u;
-    uint wgRow = (gl_WorkGroupID.x / tilesN) * 16u;
+    uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
     uint wgCol = (gl_WorkGroupID.x % tilesN) * 16u;
-    uint lane = gl_LocalInvocationIndex; // 0..31 — local_size_x=32 == exactly one subgroup
+    uint li = gl_LocalInvocationIndex;      // 0..255 — whole-workgroup staging index
+    uint sg = gl_SubgroupID;                // 0..MSUB-1 (0..7 at BM=128) — this lane's subtile
+    uint lane = gl_SubgroupInvocationID;    // 0..31 — this lane's index within its subgroup
     uint nblk = pc.k / BK;
+    uint rowBase = wgRow + sg * 16u;
 
     float acc[8];
     [[unroll]] for (uint e = 0u; e < 8u; e++) { acc[e] = 0.0; }
 
     for (uint blk = 0u; blk < nblk; blk++) {
         uint k0 = blk * BK;
-        // Stage 16 rows x 32 int8 activations + 16 cols x 32 int8 weight bytes for this block.
-        // 32 threads x 16 iters covers 16*32=512 elements each.
-        for (uint idx = lane; idx < 16u * BK; idx += 32u) {
+        // Stage BM rows x 32 int8 activations (cheap, contiguous, zero-padded past pc.m) —
+        // whole workgroup (256 threads) cooperates.
+        for (uint idx = li; idx < BM * BK; idx += 256u) {
             uint r = idx / BK;
             uint kk = idx % BK;
             uint gr = wgRow + r;
             As[idx] = (gr < pc.m) ? qa[gr * pc.k + k0 + kk] : int8_t(0);
         }
-        for (uint idx = lane; idx < 16u * BK; idx += 32u) {
+        // Stage 16 cols x 32 int8 weight bytes ONCE for this block — shared by all MSUB subtiles.
+        for (uint idx = li; idx < 16u * BK; idx += 256u) {
             uint cc = idx / BK;
             uint kk = idx % BK;
             uint gelem = pc.w_base + (wgCol + cc) * pc.k + k0 + kk;
             uint bd = (gelem / 32u) * 34u;
             Bs[idx] = int8_t(sgn8(rb(bd + 2u + kk)));
+        }
+        // Per-col weight scale for THIS block — computed ONCE by 16 threads (not once per
+        // subgroup): profiling showed this bd-division + ru16/f16tof32 fetch, when redundantly
+        // recomputed by every subgroup, was the SINGLE largest cost in the kernel (bigger than
+        // the weight byte unpack above) — isolating it via a diagnostic build (skip wv entirely)
+        // recovered ~37% of the runtime, vs ~4% for skipping the byte unpack. Hoisting it to a
+        // shared array computed once cuts that cost ~4x.
+        if (li < 16u) {
+            uint cc = li;
+            uint gelem = pc.w_base + (wgCol + cc) * pc.k + k0;
+            uint bd = (gelem / 32u) * 34u;
+            Ws[cc] = f16tof32(ru16(bd));
         }
         barrier();
 
@@ -81,40 +127,38 @@ void main() {
         [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {
             coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> af;
             coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bf;
-            coopMatLoad(af, As, kf, BK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(af, As, sg * 16u * BK + kf, BK, gl_CooperativeMatrixLayoutRowMajor);
             coopMatLoad(bf, Bs, kf, BK, gl_CooperativeMatrixLayoutColumnMajor);
             csub = coopMatMulAdd(af, bf, csub);
         }
-        coopMatStore(csub, Tmp, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(csub, Tmp, sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
 
-        // Per-row activation scale + per-col weight scale for THIS block, then scale-accumulate
-        // the raw int32 dot (Tmp) into the persistent float accumulator (registers, one lane owns
-        // a fixed set of 8 of the 256 tile elements across every block iteration).
+        // wv comes straight from the shared Ws computed above (once per block, not per subtile) +
+        // per-row activation scale for THIS subgroup's subtile, then scale-accumulate the raw
+        // int32 dot (Tmp) into the persistent float accumulator (registers, one lane owns a fixed
+        // set of 8 of its subtile's 256 elements across every block iteration).
         float dv[16];
         [[unroll]] for (uint r = 0u; r < 16u; r++) {
-            uint gr = wgRow + r;
+            uint gr = rowBase + r;
             dv[r] = (gr < pc.m) ? float(dact[gr * nblk + blk]) : 0.0;
         }
-        float wv[16];
-        [[unroll]] for (uint cc = 0u; cc < 16u; cc++) {
-            uint gelem = pc.w_base + (wgCol + cc) * pc.k + k0;
-            uint bd = (gelem / 32u) * 34u;
-            wv[cc] = f16tof32(ru16(bd));
-        }
         [[unroll]] for (uint e = 0u; e < 8u; e++) {
-            uint idx = lane + e * 32u; // 0..255, fixed per-lane element set
+            uint idx = lane + e * 32u; // 0..255, fixed per-lane element set within this subtile
             uint r = idx / 16u;
             uint cc = idx % 16u;
-            acc[e] += float(Tmp[idx]) * dv[r] * wv[cc];
+            acc[e] += float(Tmp[sg * 256u + idx]) * dv[r] * Ws[cc];
         }
-        barrier(); // Tmp fully consumed before the next block's coopMatStore overwrites it
+        barrier(); // Tmp/As fully consumed before the next block's staging overwrites them
     }
 
     [[unroll]] for (uint e = 0u; e < 8u; e++) {
         uint idx = lane + e * 32u;
         uint r = idx / 16u;
         uint cc = idx % 16u;
-        c[(wgRow + r) * pc.n + (wgCol + cc)] = acc[e];
+        uint gr = rowBase + r;
+        if (gr < pc.m) {
+            c[gr * pc.n + (wgCol + cc)] = acc[e];
+        }
     }
 }

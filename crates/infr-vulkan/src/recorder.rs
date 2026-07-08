@@ -1205,7 +1205,8 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        let groups = (m.div_ceil(16) * (n / 16)) as u32;
+        // BM=128 (see the shader header): one workgroup covers 128 rows x 16 cols.
+        let groups = (m.div_ceil(128) * (n / 16)) as u32;
         self.dispatch(
             kern,
             &[Self::vkb(qa), Self::vkb(dact), Self::vkb(w), Self::vkb(c)],

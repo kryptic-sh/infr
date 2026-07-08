@@ -597,6 +597,17 @@ fn main() {
         // INFR_I8_COOPMAT=1 (see adapter.rs / docs in the .comp file). Default-off; correctness
         // validated against native_gemm_mmq_q8_0/native_gemm_warp_q8_0.
         ("native_gemm_i8cm_q8_0", "native_gemm_i8cm_q8_0", &[]),
+        // "Idea 2" measurement variant: whole-row (block-invariant) activation scale instead of
+        // per-32-block, gated behind INFR_I8_ROW_SCALE=1 (see native_gemm_i8cm_q8_0.comp #ifdef
+        // ROW_SCALE + quant_q8_row.comp).
+        (
+            "native_gemm_i8cm_q8_0",
+            "native_gemm_i8cm_q8_0_rowscale",
+            &["-DROW_SCALE"],
+        ),
+        // Row-wise activation quant for the int8-coopmat GEMM's "Idea 2" measurement (whole-K
+        // scale instead of per-32-block; see quant_q8_row.comp). Gated by INFR_I8_ROW_SCALE=1.
+        ("quant_q8_row", "quant_q8_row", &[]),
         (
             "native_gemm_mmq_q4k",
             "native_gemm_mmq_q4k_xp",

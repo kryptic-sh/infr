@@ -10,20 +10,46 @@
 // dequants every weight element to f16 during staging.
 //
 // Per Q8_0 block (BK=32 = 2 chained 16-K coopmat sub-tiles): accumulate a RAW int32 dot product via
-// coopMatMulAdd, then coopMatStore that block's int32 partial to shared and have each lane
-// scale-accumulate `dact[row,blk] * d_w[col,blk]` into a persistent float register — the same
+// coopMatMulAdd, then have each lane scale-accumulate `dact[row,blk] * d_w[col,blk]` into a
+// persistent float register directly from its OWN fragment elements (`csub[i]`) — the same
 // per-block scale-after-dot the dp4a mmq kernel does (native_gemm_mmq_q8_0.comp's `qsum`/`dl`/`dval`
-// epilogue), just computing the raw dot via WMMA tiles instead of dotPacked4x8AccSatEXT. This
-// store+scale round trip (impossible to avoid: KHR_cooperative_matrix v1 has no generic per-element
-// indexed access, and the row/col scale is a rank-1 outer product coopmat can't apply via a single
-// matrix-scalar op) is the int8-coopmat tax against the f16-coopmat path's dequant-once-during-stage
-// design — expected to eat into the raw 2x WMMA-rate advantage; that trade-off is what this kernel
-// measures.
+// epilogue), just computing the raw dot via WMMA tiles instead of dotPacked4x8AccSatEXT.
 //
 // Requires m%1 (row-padded internally), n%16==0, k%32==0. requiredSubgroupSize=32.
 //
-// PERF NOTES (two measured wins, both kept; see recorder.rs `matmul_i8cm_q8_0` for the matching
+// #ifdef ROW_SCALE ("Idea 2" measurement, INFR_I8_ROW_SCALE=1, requires INFR_I8_COOPMAT=1 too;
+// build variant `native_gemm_i8cm_q8_0_rowscale`, see recorder.rs `matmul_i8cm_q8_0_rowscale` +
+// `quant_q8_row.comp`): activations get ONE f16 scale per row over the WHOLE k dim instead of
+// quant_q8's per-32-block scale. Block-invariant, so it factors out of the per-block sum: `dv[16]`
+// is computed ONCE before the block loop (was: once per block, `nblk` global `dact` reads per
+// lane) and applied ONCE to `acc[i]` after the block loop, instead of every block. Measured
+// pp512 Qwen3-0.6B-Q8_0/RX7900XTX: 9800-9940 -> 11000-11900 t/s (+~15-20% over the non-ROW_SCALE
+// kernel above, +~25-28% over the pre-Idea-1 baseline of 9260). Coarser quant DOES diverge greedy
+// decode output from the non-ROW_SCALE kernel (the one documented, allowed exception to the
+// bit-identical correctness gate) — measured ~254 chars / ~48 words of identical generation
+// before diverging (vs. the pre-existing ~token-55 f16-vs-int8cm divergence), output stays
+// coherent (still a well-formed continuation, not garbage). Off by default even under
+// INFR_I8_COOPMAT=1; opt in with INFR_I8_ROW_SCALE=1.
+//
+// PERF NOTES (three measured wins, all kept; see recorder.rs `matmul_i8cm_q8_0` for the matching
 // dispatch-side grid math):
+//
+// 0. In-fragment epilogue (no coopMatStore/shared round trip). KHR_cooperative_matrix v1 has no
+//    spec-portable per-element (row,col) indexing, so the original version of this kernel routed
+//    every block's int32 partial through `coopMatStore(...) -> barrier() -> reload` to apply the
+//    rank-1 d_act*d_w scale (coopmat's only scalar op multiplies the WHOLE matrix by one scalar).
+//    But `csub[i]` element access (`.length()`/`operator[]`) IS exposed by the extension, just with
+//    an implementation-defined i->(row,col) mapping. Empirically derived on this driver/config
+//    (16x16x16 SINT32 accumulator, wave32) via `coopmat_int8_test --fragment_layout` (loads a
+//    known matrix M[r*16+c]=r*16+c into an accumulator-use coopmat and dumps every lane's
+//    `csub[i]`): lane `lane` owns 8 elements, `csub[i]` at (row,col) = (2*i + (lane>>4), lane&15).
+//    Per the KHR_cooperative_matrix spec this component/index<->element mapping is fixed for a
+//    given (type,use,rows,cols,scope) regardless of whether the fragment was populated by
+//    coopMatLoad (as the probe does) or coopMatMulAdd (as the real kernel does), so it's safe to
+//    reuse here. Reading `csub[i]` directly and scale-accumulating removes the coopMatStore, the
+//    `Tmp` shared array, and the barrier that separated store from reload — measured +5-7% pp512
+//    on Qwen3-0.6B-Q8_0/RX7900XTX (9260 -> ~9800-9940 t/s), output byte-identical (greedy decode,
+//    100 tokens) to the pre-change kernel.
 //
 // 1. M-widening, multi-subgroup. One workgroup covers BM=128 rows (MSUB=8 stacked 16-row coopmat
 //    subtiles) x one 16-col tile, using 8 subgroups (256 threads) — ONE subgroup per subtile,
@@ -62,14 +88,20 @@ const uint BM = 128u;        // rows per workgroup
 const uint MSUB = BM / 16u;  // stacked 16-row coopmat subtiles per workgroup = subgroups/workgroup
 
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
-layout(binding = 0) readonly buffer QA { int8_t qa[]; };        // [m, k] int8 activations (quant_q8)
+layout(binding = 0) readonly buffer QA { int8_t qa[]; };        // [m, k] int8 activations
+#ifdef ROW_SCALE
+// Idea 2 (measurement, INFR_I8_ROW_SCALE=1): ONE f16 scale per row over the WHOLE k dim (from
+// quant_q8_row), instead of quant_q8's per-32-block scale — coarser, but block-invariant so it
+// factors out of the per-block sum entirely (see the epilogue below).
+layout(binding = 1) readonly buffer DA { float16_t dactRow[]; }; // [m] whole-row act scale
+#else
 layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, k/32] per-block act scale
+#endif
 layout(binding = 2) readonly buffer WB { uint nw[]; };          // raw Q8_0 weight bytes ([n,k] blocks)
 layout(binding = 3) writeonly buffer CB { float c[]; };         // [mpad, n]
 
 shared int8_t As[BM * BK];
 shared int8_t Bs[16u * BK];
-shared int Tmp[MSUB * 256u];
 shared float Ws[16]; // per-block column weight scale — computed ONCE per block, shared by all subtiles
 
 uint rb(uint bo) { return (nw[bo >> 2u] >> ((bo & 3u) << 3u)) & 0xFFu; }
@@ -89,6 +121,16 @@ void main() {
 
     float acc[8];
     [[unroll]] for (uint e = 0u; e < 8u; e++) { acc[e] = 0.0; }
+
+#ifdef ROW_SCALE
+    // Whole-row act scale is block-invariant: fetch it ONCE per lane for the whole k-loop instead
+    // of once per block (removes nblk-1 redundant global loads + multiplies per lane).
+    float dv[16];
+    [[unroll]] for (uint r = 0u; r < 16u; r++) {
+        uint gr = rowBase + r;
+        dv[r] = (gr < pc.m) ? float(dactRow[gr]) : 0.0;
+    }
+#endif
 
     for (uint blk = 0u; blk < nblk; blk++) {
         uint k0 = blk * BK;
@@ -131,34 +173,47 @@ void main() {
             coopMatLoad(bf, Bs, kf, BK, gl_CooperativeMatrixLayoutColumnMajor);
             csub = coopMatMulAdd(af, bf, csub);
         }
-        coopMatStore(csub, Tmp, sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        barrier();
-
-        // wv comes straight from the shared Ws computed above (once per block, not per subtile) +
-        // per-row activation scale for THIS subgroup's subtile, then scale-accumulate the raw
-        // int32 dot (Tmp) into the persistent float accumulator (registers, one lane owns a fixed
-        // set of 8 of its subtile's 256 elements across every block iteration).
+        // In-fragment epilogue (no coopMatStore/shared round trip): RDNA3's int32 16x16
+        // accumulator fragment layout was derived empirically (coopmat_int8_test --
+        // fragment_layout) and is fixed per (type,use,rows,cols,scope) per the KHR_cooperative_matrix
+        // spec, so it applies identically whether the fragment was populated by coopMatLoad (as the
+        // probe did) or by coopMatMulAdd (as here): lane `lane` owns 8 elements `csub[i]`, i in
+        // 0..8, at (row, col) = (2*i + (lane>>4), lane&15). Reading `csub[i]` directly and
+        // scale-accumulating removes the coopMatStore + its barrier (the store/reload tax this
+        // kernel's header documents) entirely.
+#ifndef ROW_SCALE
         float dv[16];
         [[unroll]] for (uint r = 0u; r < 16u; r++) {
             uint gr = rowBase + r;
             dv[r] = (gr < pc.m) ? float(dact[gr * nblk + blk]) : 0.0;
         }
-        [[unroll]] for (uint e = 0u; e < 8u; e++) {
-            uint idx = lane + e * 32u; // 0..255, fixed per-lane element set within this subtile
-            uint r = idx / 16u;
-            uint cc = idx % 16u;
-            acc[e] += float(Tmp[sg * 256u + idx]) * dv[r] * Ws[cc];
+#endif
+        uint cc = lane & 15u;
+        uint rHalf = lane >> 4u; // 0 or 1
+        float wcol = Ws[cc];
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
+#ifdef ROW_SCALE
+            // dv (whole-row scale) applied ONCE after the block loop below, not per block.
+            acc[i] += float(csub[i]) * wcol;
+#else
+            uint r = 2u * i + rHalf;
+            acc[i] += float(csub[i]) * dv[r] * wcol;
+#endif
         }
-        barrier(); // Tmp/As fully consumed before the next block's staging overwrites them
+        barrier(); // As/Bs fully consumed before the next block's staging overwrites them
     }
 
-    [[unroll]] for (uint e = 0u; e < 8u; e++) {
-        uint idx = lane + e * 32u;
-        uint r = idx / 16u;
-        uint cc = idx % 16u;
+    uint cc = lane & 15u;
+    uint rHalf = lane >> 4u;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        uint r = 2u * i + rHalf;
         uint gr = rowBase + r;
         if (gr < pc.m) {
-            c[gr * pc.n + (wgCol + cc)] = acc[e];
+#ifdef ROW_SCALE
+            c[gr * pc.n + (wgCol + cc)] = acc[i] * dv[r];
+#else
+            c[gr * pc.n + (wgCol + cc)] = acc[i];
+#endif
         }
     }
 }

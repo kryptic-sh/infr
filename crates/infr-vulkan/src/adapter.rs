@@ -820,28 +820,50 @@ fn lower_op(
                     && be_.caps().i8_coopmat
                     && std::env::var("INFR_I8_COOPMAT").is_ok();
                 if i8cm_ok {
-                    let nblk = in_f / 32;
-                    let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
-                    let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
-                    let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
-                    rec.quant_q8(
-                        xb,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        m,
-                        in_f,
-                    );
-                    rec.matmul_i8cm_q8_0(
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        w,
-                        w_off,
-                        out,
-                        m,
-                        in_f,
-                        out_f,
-                    );
+                    // "Idea 2" measurement (INFR_I8_ROW_SCALE=1, requires INFR_I8_COOPMAT=1 too):
+                    // whole-row (block-invariant) activation scale instead of quant_q8's
+                    // per-32-block scale — see native_gemm_i8cm_q8_0.comp #ifdef ROW_SCALE /
+                    // quant_q8_row.comp. Separate pool tag (different buffer size/layout) and a
+                    // separate kernel pair, so this can be measured and reverted independently of
+                    // the i8cm baseline path above.
+                    if std::env::var("INFR_I8_ROW_SCALE").is_ok() {
+                        let qa = pooled(pool, be_, "i8cm_qa_row", m * in_f)?;
+                        let dact_row = pooled(pool, be_, "i8cm_dact_row", m * 2)?;
+                        rec.quant_q8_row(xb, pool[&qa].as_ref(), pool[&dact_row].as_ref(), m, in_f);
+                        rec.matmul_i8cm_q8_0_rowscale(
+                            pool[&qa].as_ref(),
+                            pool[&dact_row].as_ref(),
+                            w,
+                            w_off,
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                        );
+                    } else {
+                        let nblk = in_f / 32;
+                        let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
+                        let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
+                        let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                        rec.quant_q8(
+                            xb,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            m,
+                            in_f,
+                        );
+                        rec.matmul_i8cm_q8_0(
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            w,
+                            w_off,
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                        );
+                    }
                 } else if matches!(dt, infr_core::DType::Q4K)
                     && !warp_ok
                     && be_.caps().i8_dot

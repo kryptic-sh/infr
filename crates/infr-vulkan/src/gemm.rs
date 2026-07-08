@@ -453,6 +453,23 @@ pub(crate) fn native_gemm_i8cm_q8_0_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the row-wise (whole-K) activation quant pass — int8-coopmat GEMM "Idea 2"
+/// measurement variant (see `quant_q8_row.comp`), gated behind `INFR_I8_ROW_SCALE=1`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn quant_q8_row_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8_row.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the int8-coopmat GEMM's "Idea 2" whole-row-activation-scale measurement variant
+/// (see `native_gemm_i8cm_q8_0.comp` #ifdef ROW_SCALE), gated behind `INFR_I8_ROW_SCALE=1`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_i8cm_q8_0_rowscale_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_i8cm_q8_0_rowscale.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the MoE weighted-accumulate (sum of selected experts' down outputs into hidden).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn moe_accumulate_spv() -> &'static [u32] {

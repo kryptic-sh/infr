@@ -1216,6 +1216,66 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// "Idea 2" measurement variant of `matmul_i8cm_q8_0`: `dact_row` is ONE f16 scale per row
+    /// (whole-K, from `quant_q8_row`) instead of per-32-block — coarser precision, but lets the
+    /// shader pull the activation scale out of its per-block sum. Gated by `INFR_I8_ROW_SCALE=1`
+    /// (see `native_gemm_i8cm_q8_0.comp` #ifdef ROW_SCALE).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_i8cm_q8_0_rowscale(
+        &self,
+        qa: &dyn Buffer,
+        dact_row: &dyn Buffer,
+        w: &dyn Buffer,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.label_gemm("native_gemm_i8cm_q8_0_rowscale", m, k, n);
+        let kern = self.be.kernel_sg(
+            "native_gemm_i8cm_q8_0_rowscale",
+            crate::gemm::native_gemm_i8cm_q8_0_rowscale_spv(),
+            4,
+            16,
+            32,
+        );
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let groups = (m.div_ceil(128) * (n / 16)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(qa), Self::vkb(dact_row), Self::vkb(w), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
+    /// Row-wise (whole-K) int8 activation quantize pass — int8-coopmat GEMM "Idea 2" measurement
+    /// variant (see `quant_q8_row.comp` / `native_gemm_i8cm_q8_0.comp`): ONE f16 scale per row
+    /// (`dact_row[m]`) instead of `quant_q8`'s per-32-block scale, coarser but block-invariant so
+    /// the i8cm kernel can pull it out of its per-block sum. Gated by `INFR_I8_ROW_SCALE=1`; used
+    /// only by the int8-coopmat GEMM path, `quant_q8` (every other int8 kernel) is untouched.
+    pub fn quant_q8_row(&self, a: &dyn Buffer, qa: &dyn Buffer, dact_row: &dyn Buffer, m: usize, k: usize) {
+        let kq = self
+            .be
+            .kernel_sg("quant_q8_row", crate::gemm::quant_q8_row_spv(), 3, 8, 32);
+        let mut p = [0u8; 8];
+        p[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        p[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
+        self.dispatch(
+            kq,
+            &[Self::vkb(a), Self::vkb(qa), Self::vkb(dact_row)],
+            2,
+            &p,
+            m as u32,
+        );
+    }
+
     /// Tiled Q6_K dp4a (mmq) GEMM for a stacked expert (the MoE down projection): `c = qa·W[w_base]ᵀ`
     /// using hardware int8 dot-product (activations pre-quantized via `quant_q8`; the per-block sum is
     /// unused — Q6_K is symmetric, no min). `c` is `ceil(m/64)*64` rows. Faster than the coopmat-f16

@@ -270,6 +270,35 @@ void main() {
 }
 "#;
 
+// Idea 1a probe: derive RADV's int32-accumulator 16x16x16 fragment `i -> (row,col)` mapping.
+// Loads a KNOWN int32 matrix (M[r*16+c] = r*16+c) into an accumulator-use coopmat via coopMatLoad
+// RowMajor (the same load semantics coopMatStore RowMajor writes use, just inverted), then has
+// every lane dump `csub[i]` for i in 0..csub.length() to a buffer indexed by [lane*16+i]. Since
+// M's value AT (r,c) directly encodes r*16+c, csub[i]'s value tells us r=csub[i]/16, c=csub[i]%16
+// for whichever (r,c) lane/i owns — no separate cross-check against coopMatStore needed, the
+// encoding IS the cross-check (RowMajor load and RowMajor store share the same linearization).
+const INT8_FRAGMENT_LAYOUT_SHADER: &str = r#"#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer MBuf { int m[]; };       // [16,16] row-major, m[r*16+c]=r*16+c
+layout(binding = 2) writeonly buffer OutBuf { int outv[]; }; // outv[0]=length, outv[1+lane*16+i]=csub[i]
+
+void main() {
+    coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> csub;
+    coopMatLoad(csub, m, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    uint lane = gl_SubgroupInvocationID;
+    uint len = csub.length();
+    if (lane == 0u) { outv[0] = int(len); }
+    for (uint i = 0u; i < len; i++) {
+        outv[1u + lane * 16u + i] = csub[i];
+    }
+}
+"#;
+
 const PLAIN_ADD_SHADER: &str = r#"#version 460
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(binding = 0) readonly buffer ABuf { float a[]; };
@@ -758,6 +787,7 @@ fn main() {
         }
         eprintln!("  looped_k (K=256, 16 chained coopMatMulAdd)");
         eprintln!("  multi_wg (2x2=4 concurrent workgroups)");
+        eprintln!("  fragment_layout (dump csub[i] -> (row,col) mapping, idea 1a)");
         eprintln!("recovery-check variants:");
         eprintln!("  f16_known_good");
         eprintln!("  plain_add");
@@ -971,6 +1001,66 @@ fn main() {
             c == cpu_c
         });
         print_result("multi_wg", &outcome, correct);
+        std::process::exit(match outcome {
+            Outcome::Completed(_) => 0,
+            Outcome::Timeout => 2,
+            _ => 3,
+        });
+    }
+
+    if name == "fragment_layout" {
+        let ctx = init_ctx();
+        let mut m_bytes = vec![0u8; 16 * 16 * 4];
+        for r in 0..16usize {
+            for c in 0..16usize {
+                let v = (r * 16 + c) as i32;
+                let idx = r * 16 + c;
+                m_bytes[idx * 4..idx * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+            }
+        }
+        let dummy_b = vec![0u8; 4];
+        let out_size = (1 + 32 * 16) * 4;
+        let spv = match compile_glsl(INT8_FRAGMENT_LAYOUT_SHADER, "fragment_layout") {
+            Ok(w) => w,
+            Err(e) => {
+                println!("RESULT variant=fragment_layout outcome=COMPILE_ERROR msg={e:?}");
+                eprintln!("--- shader source ---\n{INT8_FRAGMENT_LAYOUT_SHADER}");
+                std::process::exit(4);
+            }
+        };
+        let (outcome, data) = unsafe {
+            dispatch_one(
+                &ctx,
+                &spv,
+                Some(32),
+                &m_bytes,
+                &dummy_b,
+                out_size,
+                (1, 1, 1),
+            )
+        };
+        match &outcome {
+            Outcome::Completed(_) => {
+                let bytes = data.unwrap();
+                let vals: Vec<i32> = bytes
+                    .chunks_exact(4)
+                    .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let len = vals[0];
+                println!("RESULT variant=fragment_layout outcome=COMPLETED length={len}");
+                for lane in 0..32usize {
+                    let mut row = format!("lane={lane}:");
+                    for i in 0..(len.max(0) as usize) {
+                        let v = vals[1 + lane * 16 + i];
+                        let r = v / 16;
+                        let c = v % 16;
+                        row.push_str(&format!(" i={i}->(r={r},c={c},raw={v})"));
+                    }
+                    println!("{row}");
+                }
+            }
+            _ => print_result("fragment_layout", &outcome, None),
+        }
         std::process::exit(match outcome {
             Outcome::Completed(_) => 0,
             Outcome::Timeout => 2,

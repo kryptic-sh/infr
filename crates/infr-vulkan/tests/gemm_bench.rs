@@ -1412,3 +1412,245 @@ fn dense_small_m_row_tile_bench() {
     }
     std::env::remove_var("INFR_NO_SMALL_BM");
 }
+
+// REAL production routing distributions captured via `INFR_MOE_COUNTS_DEBUG=1
+// INFR_MOE_COUNTS_DUMP=1 infr bench <model> -p 512 -n 0 -r 1 --ngl 0` (CPU reference path, whose
+// top-k routing is bit-identical to the GPU's) at pp512 on the bench's synthetic `i%100` prompt.
+// qwen3-30B-A3B: 128 experts, avg=32/expert. qwen3.6-MoE: 256 experts, avg=16/expert. Both are
+// HEAVILY skewed (a couple of hot experts near the `rows`=511 ceiling, a long tail of near-empty
+// ones) — nothing like the mean-balanced counts `moe_expert_row_tile_bench` sweeps.
+#[rustfmt::skip]
+const COUNTS_30B: [u32; 128] = [510, 0, 367, 0, 10, 0, 65, 12, 10, 0, 0, 290, 1, 413, 24, 0, 0, 16, 0, 3, 0, 1, 0, 1, 0, 0, 13, 1, 0, 0, 0, 167, 0, 0, 27, 0, 0, 0, 0, 42, 0, 0, 1, 0, 21, 0, 1, 0, 0, 23, 261, 1, 0, 2, 0, 100, 13, 1, 0, 0, 0, 1, 0, 0, 11, 0, 0, 0, 0, 21, 1, 0, 0, 0, 0, 0, 0, 0, 10, 85, 0, 4, 111, 0, 3, 472, 0, 0, 0, 0, 344, 3, 10, 0, 0, 28, 0, 0, 0, 1, 10, 0, 0, 0, 0, 0, 0, 61, 423, 0, 0, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0];
+#[rustfmt::skip]
+const COUNTS_36MOE: [u32; 256] = [0, 11, 0, 0, 0, 0, 46, 5, 2, 25, 0, 2, 6, 0, 0, 20, 0, 2, 8, 0, 0, 0, 0, 0, 1, 0, 68, 0, 0, 0, 0, 2, 0, 32, 0, 0, 32, 14, 1, 0, 39, 138, 0, 66, 42, 3, 16, 0, 26, 0, 0, 0, 1, 1, 0, 6, 17, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 21, 0, 26, 191, 0, 2, 0, 2, 0, 0, 15, 3, 0, 0, 13, 21, 0, 3, 1, 0, 0, 0, 28, 0, 0, 0, 173, 0, 0, 0, 11, 413, 44, 1, 5, 0, 0, 0, 139, 0, 0, 0, 0, 81, 1, 0, 0, 0, 13, 0, 4, 0, 249, 9, 0, 4, 3, 0, 0, 0, 0, 0, 0, 0, 7, 0, 18, 7, 31, 0, 0, 0, 22, 258, 79, 0, 1, 28, 7, 0, 0, 0, 0, 0, 0, 27, 0, 0, 0, 0, 17, 28, 0, 2, 4, 0, 0, 0, 44, 0, 347, 0, 15, 0, 6, 6, 0, 0, 16, 0, 3, 37, 0, 9, 0, 10, 22, 0, 0, 0, 0, 0, 0, 0, 0, 4, 34, 0, 0, 0, 0, 10, 34, 0, 0, 0, 0, 0, 0, 1, 28, 5, 1, 0, 22, 1, 0, 33, 0, 204, 53, 33, 137, 0, 0, 4, 131, 8, 0, 2, 0, 0, 0, 0, 0, 3, 33, 0, 0, 52, 0, 0, 9, 6, 0, 5, 0, 43, 28, 3, 0, 0, 0, 0, 0, 0, 0];
+
+/// BM=32 vs BM=64 (gate_up AND down) against REAL (heavily skewed) pp512 routing distributions
+/// captured from `infr bench <model> -p 512 -n 0 --ngl 0` with `INFR_MOE_COUNTS_DEBUG=1
+/// INFR_MOE_COUNTS_DUMP=1` (CPU reference, bit-identical top-k to the GPU router) — see
+/// `COUNTS_30B`/`COUNTS_36MOE` above. `moe_expert_row_tile_bench`'s BM=32 vs BM=64 crossover
+/// (`MOE_EXPERT_SMALL_TILE_AVG_ROWS` in recorder.rs) was picked against a MEAN-BALANCED synthetic
+/// distribution; production routing is nowhere near balanced (a couple of hot experts absorb most
+/// of a chunk's rows, most experts get single-digit or zero rows), so this bench re-runs that same
+/// tile question against the REAL shape instead — CONFIRMS the shipped threshold is still right:
+/// BM=32 wins both gate_up and down at qwen3.6-MoE's real avg~16, BM=64 wins down (clearly, ~26%)
+/// at qwen3-30B-A3B's real avg~32.
+///
+/// Two more aggressive levers were tried against this same real-skew data and REJECTED:
+/// - A BM=16 tile: lost to both 32 and 64 in every case (extra per-workgroup fixed cost from
+///   twice the real tiles outweighs the smaller masked-waste bound) — never wired up as a shipped
+///   kernel variant.
+/// - A separate, higher BM=32 threshold for gate_up (deep K, more BLK=32 loop iterations to
+///   amortize fixed cost over) vs down (shallow K): gate_up's BM32-vs-BM64 isolated-dispatch delta
+///   at qwen3-30B-A3B's real avg~32 was NOT a stable win (ranged +4% to -25% across repeated runs
+///   of this same bench — noise-dominated, no clear direction), and an end-to-end interleaved
+///   `infr bench` pp512 A/B with the split threshold wired in showed no measurable difference from
+///   baseline (~3040 t/s either way). Not shipped — the shared threshold is already
+///   near-optimal for both stages at the shapes that matter here.
+///
+/// `n_used_probe` forces a specific tile (`matmul_mmq_experts`' avg-rows heuristic only steers
+/// kernel selection, never touches counts/offsets/data) into the BM=32 vs BM=64 buckets set by
+/// `MOE_EXPERT_SMALL_TILE_AVG_ROWS`.
+#[allow(clippy::type_complexity)]
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn moe_expert_row_tile_bench_real_skew() {
+    let be = VulkanBackend::new().unwrap();
+    let reps = 30usize;
+
+    // (label, ne, gate/up nff, gate/up dtype, down dtype, n_expert, tokens, counts,
+    //  probe32 = an n_used value that lands avg_rows comfortably inside BOTH thresholds' BM=32
+    //  bucket for THIS n_expert/tokens combo, so the SAME probe exercises BM=32 for both stages)
+    let cases: &[(
+        &str,
+        usize,
+        usize,
+        infr_core::DType,
+        infr_core::DType,
+        usize,
+        usize,
+        &[u32],
+        usize,
+    )] = &[
+        (
+            "qwen3-30B-A3B avg~32",
+            2048,
+            768,
+            infr_core::DType::Q4K,
+            infr_core::DType::Q6K,
+            128,
+            511,
+            &COUNTS_30B,
+            5,
+        ),
+        (
+            "qwen3.6-moe avg~16",
+            2048,
+            512,
+            infr_core::DType::Q4K,
+            infr_core::DType::Q5K,
+            256,
+            511,
+            &COUNTS_36MOE,
+            8,
+        ),
+    ];
+
+    for &(label, ne, nff, gdt, ddt, n_expert, tokens, counts_v, probe32) in cases {
+        let n_pairs: usize = counts_v.iter().map(|&c| c as usize).sum();
+        let npad = n_pairs.div_ceil(64) * 64 + 64;
+
+        let qa = be.alloc(npad * ne, BufferUsage::Activations).unwrap();
+        let dact = be
+            .alloc(npad * (ne / 32) * 2, BufferUsage::Activations)
+            .unwrap();
+        let sact = be
+            .alloc(npad * (ne / 32) * 2, BufferUsage::Activations)
+            .unwrap();
+        let gu_c = be
+            .alloc(npad * (2 * nff) * 4, BufferUsage::Activations)
+            .unwrap();
+        let gu_w = be
+            .alloc(
+                n_expert * (2 * nff) * (ne / 256) * 144,
+                BufferUsage::Weights,
+            )
+            .unwrap();
+
+        let dqa = be.alloc(npad * nff, BufferUsage::Activations).unwrap();
+        let dda = be
+            .alloc(npad * (nff / 32) * 2, BufferUsage::Activations)
+            .unwrap();
+        let dsa = be
+            .alloc(npad * (nff / 32) * 2, BufferUsage::Activations)
+            .unwrap();
+        let down_c = be.alloc(npad * ne * 4, BufferUsage::Activations).unwrap();
+        let down_w = be
+            .alloc(
+                n_expert * ne * (nff / 256).max(1) * 176,
+                BufferUsage::Weights,
+            )
+            .unwrap();
+
+        let mut offsets_v = vec![0u32; n_expert];
+        let mut acc = 0u32;
+        for e in 0..n_expert {
+            offsets_v[e] = acc;
+            acc += counts_v[e];
+        }
+        let counts = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+        let offsets = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+        be.upload(counts.as_ref(), bytemuck::cast_slice(counts_v))
+            .unwrap();
+        be.upload(offsets.as_ref(), bytemuck::cast_slice(&offsets_v))
+            .unwrap();
+
+        // n_used_probe values chosen so avg_rows=tokens*probe/n_expert lands comfortably under
+        // MOE_EXPERT_SMALL_TILE_AVG_ROWS (BM32 bucket) regardless of the real n_used (probe32 is
+        // NOT the model's real n_used=8 for the 30B case — it's an artificial probe forcing BM32
+        // on that distribution for comparison, since its real avg~32 already selects BM64).
+        for (tile_label, n_used_probe) in [("BM32", probe32), ("BM64", n_expert * 100)] {
+            let rec = be.recorder().unwrap();
+            rec.matmul_mmq_experts(
+                gdt,
+                "bench_gateup",
+                qa.as_ref(),
+                dact.as_ref(),
+                Some(sact.as_ref()),
+                gu_w.as_ref(),
+                0,
+                ne,
+                counts.as_ref(),
+                offsets.as_ref(),
+                gu_c.as_ref(),
+                tokens,
+                ne,
+                2 * nff,
+                n_expert,
+                n_used_probe,
+            );
+            rec.finish().unwrap();
+            let t0 = std::time::Instant::now();
+            let rec = be.recorder().unwrap();
+            for _ in 0..reps {
+                rec.matmul_mmq_experts(
+                    gdt,
+                    "bench_gateup",
+                    qa.as_ref(),
+                    dact.as_ref(),
+                    Some(sact.as_ref()),
+                    gu_w.as_ref(),
+                    0,
+                    ne,
+                    counts.as_ref(),
+                    offsets.as_ref(),
+                    gu_c.as_ref(),
+                    tokens,
+                    ne,
+                    2 * nff,
+                    n_expert,
+                    n_used_probe,
+                );
+            }
+            rec.finish().unwrap();
+            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            let flops = 2.0 * (n_pairs as f64) * (ne as f64) * (2.0 * nff as f64);
+            let tflops = flops / (us * 1e-6) / 1e12;
+            println!("[gate_up {label:>20}] tile={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)");
+        }
+
+        for (tile_label, n_used_probe) in [("BM32", probe32), ("BM64", n_expert * 100)] {
+            let sact_d: Option<&dyn Buffer> = if matches!(ddt, infr_core::DType::Q5K) {
+                Some(dsa.as_ref())
+            } else {
+                None
+            };
+            let rec = be.recorder().unwrap();
+            rec.matmul_mmq_experts(
+                ddt,
+                "bench_down",
+                dqa.as_ref(),
+                dda.as_ref(),
+                sact_d,
+                down_w.as_ref(),
+                0,
+                nff,
+                counts.as_ref(),
+                offsets.as_ref(),
+                down_c.as_ref(),
+                tokens,
+                nff,
+                ne,
+                n_expert,
+                n_used_probe,
+            );
+            rec.finish().unwrap();
+            let t0 = std::time::Instant::now();
+            let rec = be.recorder().unwrap();
+            for _ in 0..reps {
+                rec.matmul_mmq_experts(
+                    ddt,
+                    "bench_down",
+                    dqa.as_ref(),
+                    dda.as_ref(),
+                    sact_d,
+                    down_w.as_ref(),
+                    0,
+                    nff,
+                    counts.as_ref(),
+                    offsets.as_ref(),
+                    down_c.as_ref(),
+                    tokens,
+                    nff,
+                    ne,
+                    n_expert,
+                    n_used_probe,
+                );
+            }
+            rec.finish().unwrap();
+            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            let flops = 2.0 * (n_pairs as f64) * (nff as f64) * (ne as f64);
+            let tflops = flops / (us * 1e-6) / 1e12;
+            println!("[down    {label:>20}] tile={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)");
+        }
+    }
+}

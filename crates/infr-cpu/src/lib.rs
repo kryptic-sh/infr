@@ -1519,6 +1519,78 @@ impl Backend for CpuBackend {
                         }
                     }
                     let n_pairs = pair_row.len();
+                    // `INFR_MOE_COUNTS_DEBUG=1`: print the REAL per-expert row-count distribution
+                    // for this chunk/layer (this CPU interpreter's top-k routing is bit-identical
+                    // to the GPU's, so this is a host-side stand-in for reading the GPU's own
+                    // counts/offsets buffers without a mid-graph readback). Used to check whether
+                    // `matmul_mmq_experts`' BM=32/64 row-tile heuristic (recorder.rs,
+                    // MOE_EXPERT_SMALL_TILE_AVG_ROWS) — picked against a MEAN-BALANCED synthetic
+                    // distribution — still holds up against real (possibly skewed) routing.
+                    // `INFR_MOE_COUNTS_DUMP=1` additionally dumps the raw per-expert counts array
+                    // (for feeding into an isolated GPU tile-choice bench, e.g.
+                    // `moe_expert_row_tile_bench_real_skew` in infr-vulkan's gemm_bench.rs).
+                    if std::env::var("INFR_MOE_COUNTS_DEBUG").is_ok() {
+                        let mut counts = vec![0usize; n_expert];
+                        for &(e, _, c) in buckets.iter() {
+                            counts[e] = c;
+                        }
+                        let mut sorted = counts.clone();
+                        sorted.sort_unstable();
+                        let sum: usize = counts.iter().sum();
+                        let max = *sorted.last().unwrap_or(&0);
+                        let min = *sorted.first().unwrap_or(&0);
+                        let mean = sum as f64 / n_expert as f64;
+                        let p50 = sorted[n_expert / 2];
+                        let p90 = sorted[(n_expert * 9) / 10];
+                        let nz = counts.iter().filter(|&&c| c > 0).count();
+                        let buckets_hist = [0usize, 4, 8, 16, 24, 32, 48, 64, usize::MAX];
+                        let mut hist = vec![0usize; buckets_hist.len() - 1];
+                        for &c in counts.iter() {
+                            for w in 0..buckets_hist.len() - 1 {
+                                if c >= buckets_hist[w] && c < buckets_hist[w + 1] {
+                                    hist[w] += 1;
+                                    break;
+                                }
+                            }
+                        }
+                        let waste = |bm: usize| -> usize {
+                            counts
+                                .iter()
+                                .map(|&c| c.div_ceil(bm).max(1) * bm - c)
+                                .sum::<usize>()
+                        };
+                        let real_tiles = |bm: usize| -> usize {
+                            counts.iter().map(|&c| c.div_ceil(bm)).sum::<usize>()
+                        };
+                        // per-expert OPTIMAL tile from {16,32,64} (min waste, tie -> larger BM
+                        // for fewer real tiles / less fixed per-workgroup overhead):
+                        let opt_waste: usize = counts
+                            .iter()
+                            .map(|&c| {
+                                [16usize, 32, 64]
+                                    .iter()
+                                    .map(|&bm| c.div_ceil(bm).max(1) * bm - c)
+                                    .min()
+                                    .unwrap()
+                            })
+                            .sum();
+                        eprintln!(
+                            "MOE_COUNTS rows={rows} n_expert={n_expert} n_used={n_used} \
+                             n_pairs={n_pairs} nonzero={nz} min={min} max={max} mean={mean:.2} \
+                             p50={p50} p90={p90} hist(0-3,4-7,8-15,16-23,24-31,32-47,48-63,64+)={hist:?} \
+                             waste16={} waste32={} waste64={} waste_opt={opt_waste} \
+                             tiles16={} tiles32={} tiles64={}",
+                            waste(16),
+                            waste(32),
+                            waste(64),
+                            real_tiles(16),
+                            real_tiles(32),
+                            real_tiles(64),
+                        );
+                        if std::env::var("INFR_MOE_COUNTS_DUMP").is_ok() {
+                            eprintln!("MOE_COUNTS_RAW {counts:?}");
+                        }
+                    }
                     let out_gu = if fused_gate_up { 2 * nffx } else { nffx };
                     // o-major output offsets per bucket for the gate_up / down GEMM stages.
                     let mut gu_off = vec![0usize; buckets.len() + 1];

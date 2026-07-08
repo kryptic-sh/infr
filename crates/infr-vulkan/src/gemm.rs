@@ -469,6 +469,15 @@ pub(crate) fn native_gemm_f8cm_q8_0_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the row-wise (whole-K) fp8 activation quant pass — the activation-scaling step for
+/// `native_gemm_f8cm_q8_0` (see `quant_f8_row.comp`), gated behind `INFR_F8_COOPMAT=1` +
+/// `caps.f8_coopmat`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn quant_f8_row_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_f8_row.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the int8-coopmat GEMM's "Idea 2" whole-row-activation-scale measurement variant
 /// (see `native_gemm_i8cm_q8_0.comp` #ifdef ROW_SCALE), gated behind `INFR_I8_ROW_SCALE=1`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

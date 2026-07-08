@@ -616,6 +616,10 @@ fn main() {
         // design doc). Default-off; correctness UNVALIDATED on this box (no fp8 coopmat hardware
         // here — compile-checked only), pending an RDNA4 run.
         ("native_gemm_f8cm_q8_0", "native_gemm_f8cm_q8_0", &[]),
+        // Row-wise activation quant for the fp8-coopmat GEMM (whole-K amax -> scale = amax/448,
+        // range-scales activations into E4M3 before the cast; see quant_f8_row.comp). Gated by
+        // the same INFR_F8_COOPMAT=1 + caps.f8_coopmat as native_gemm_f8cm_q8_0 above.
+        ("quant_f8_row", "quant_f8_row", &[]),
         (
             "native_gemm_mmq_q4k",
             "native_gemm_mmq_q4k_xp",

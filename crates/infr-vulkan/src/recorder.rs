@@ -1263,13 +1263,17 @@ impl<'a> Recorder<'a> {
     /// fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — gated by the adapter
     /// behind `INFR_F8_COOPMAT=1` + `caps.f8_coopmat` (see `native_gemm_f8cm_q8_0.comp` for the
     /// design doc: this is structurally `matmul_native`'s 64x64/2x2-tile f16-coopmat GEMM with fp8
-    /// operands — a DIRECT matmul, no per-block rescale like `matmul_i8cm_q8_0` needs). `x` is the
-    /// f32 activation buffer as-is (no separate quantize pass — fp8 conversion happens in-shader
-    /// during staging). `c` is `ceil(m/64)*64` rows (same padding convention as `matmul_native`).
-    /// Requires `n%64==0`, `k%32==0`. Correctness UNVALIDATED on hardware without fp8 coopmat.
+    /// operands — a DIRECT matmul, no per-block int rescale like `matmul_i8cm_q8_0` needs). `qa`
+    /// is the PRE-SCALED fp8 activation buffer from `quant_f8_row` (E4M3's range is tiny — raw f32
+    /// activations must be range-scaled before the cast or they overflow to inf/NaN), `srow` is
+    /// its per-row f32 descale factor, applied to the output in the shader's epilogue. `c` is
+    /// `ceil(m/64)*64` rows (same padding convention as `matmul_native`). Requires `n%64==0`,
+    /// `k%32==0`. Correctness UNVALIDATED on hardware without fp8 coopmat.
+    #[allow(clippy::too_many_arguments)]
     pub fn matmul_f8cm_q8_0(
         &self,
-        x: &dyn Buffer,
+        qa: &dyn Buffer,
+        srow: &dyn Buffer,
         w: &dyn Buffer,
         w_base: usize,
         c: &dyn Buffer,
@@ -1281,7 +1285,7 @@ impl<'a> Recorder<'a> {
         let kern = self.be.kernel_sg(
             "native_gemm_f8cm_q8_0",
             crate::gemm::native_gemm_f8cm_q8_0_spv(),
-            3,
+            4,
             16,
             32,
         );
@@ -1294,10 +1298,38 @@ impl<'a> Recorder<'a> {
         let groups = (m.div_ceil(64) * (n / 64)) as u32;
         self.dispatch(
             kern,
-            &[Self::vkb(x), Self::vkb(w), Self::vkb(c)],
+            &[Self::vkb(qa), Self::vkb(w), Self::vkb(srow), Self::vkb(c)],
             1,
             &push,
             groups,
+        );
+    }
+
+    /// Row-wise (whole-K) fp8 (E4M3) activation quantize pass — the activation-scaling step for
+    /// `matmul_f8cm_q8_0` (see `quant_f8_row.comp`): ONE f32 scale per row (`srow[m]`), computed
+    /// from the row's amax and applied so activations land inside E4M3's +-448 range before the
+    /// f32->fp8 cast. Structurally mirrors `quant_q8_row` (one workgroup per row, 256 threads),
+    /// but the scale is a pure range rescale (`amax/448`), not a fixed-point quant step.
+    pub fn quant_f8_row(
+        &self,
+        a: &dyn Buffer,
+        qa: &dyn Buffer,
+        srow: &dyn Buffer,
+        m: usize,
+        k: usize,
+    ) {
+        let kq = self
+            .be
+            .kernel_sg("quant_f8_row", crate::gemm::quant_f8_row_spv(), 3, 8, 32);
+        let mut p = [0u8; 8];
+        p[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        p[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
+        self.dispatch(
+            kq,
+            &[Self::vkb(a), Self::vkb(qa), Self::vkb(srow)],
+            2,
+            &p,
+            m as u32,
         );
     }
 

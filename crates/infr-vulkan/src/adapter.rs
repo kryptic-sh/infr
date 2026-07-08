@@ -836,10 +836,26 @@ fn lower_op(
                     && be_.caps().i8_coopmat
                     && std::env::var("INFR_I8_COOPMAT").is_ok();
                 if f8cm_ok {
-                    // fp8 conversion happens in-shader during staging — no separate quantize pass
-                    // needed (unlike i8cm's `quant_q8`), the f32 activations feed straight in, same
-                    // as the plain f16-coopmat GEMM (`native_dense_supported` arm below) does.
-                    rec.matmul_f8cm_q8_0(xb, w, w_off, out, m, in_f, out_f);
+                    // E4M3's range is tiny (max normal 448) — unscaled f32 activations overflow to
+                    // inf/NaN on cast, which is what produced garbage output on the first RDNA4
+                    // run. `quant_f8_row` pre-scales activations into E4M3's range (one amax/scale
+                    // per row) before the coopmat GEMM, which descales the output by that same
+                    // per-row scale in its epilogue. Q8_0 weights are unscaled (see
+                    // native_gemm_f8cm_q8_0.comp doc — their post-dequant magnitude is expected to
+                    // already fit E4M3).
+                    let qa = pooled(pool, be_, "f8cm_qa", m * in_f)?;
+                    let srow = pooled(pool, be_, "f8cm_srow", m * 4)?;
+                    rec.quant_f8_row(xb, pool[&qa].as_ref(), pool[&srow].as_ref(), m, in_f);
+                    rec.matmul_f8cm_q8_0(
+                        pool[&qa].as_ref(),
+                        pool[&srow].as_ref(),
+                        w,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
                 } else if i8cm_ok {
                     // "Idea 2" measurement (INFR_I8_ROW_SCALE=1, requires INFR_I8_COOPMAT=1 too):
                     // whole-row (block-invariant) activation scale instead of quant_q8's

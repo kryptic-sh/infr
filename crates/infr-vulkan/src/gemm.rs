@@ -1025,6 +1025,8 @@ const GELU_MUL_FUSED_SPV_BYTES: &[u8] =
 const STORE_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/store_f16.spv"));
 const ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv"));
 const LINEAR_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
+const LINEAR_F16_NOEXT_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16_noext.spv"));
 const LINEAR_F32_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32.spv"));
 const LINEAR_F32R_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r.spv"));
 const LINEAR_BF16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
@@ -1452,6 +1454,12 @@ pub(crate) fn rope_spv() -> &'static [u32] {
 pub(crate) fn linear_f16_spv() -> &'static [u32] {
     static LINEAR_F16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     LINEAR_F16_SPV.get_or_init(|| spv_words(LINEAR_F16_SPV_BYTES))
+}
+/// SPIR-V for the f16-weight GEMV, `!caps.f16` tier (no shaderFloat16 — `unpackHalf2x16` dequant).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f16_noext_spv() -> &'static [u32] {
+    static LINEAR_F16_NOEXT_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    LINEAR_F16_NOEXT_SPV.get_or_init(|| spv_words(LINEAR_F16_NOEXT_SPV_BYTES))
 }
 /// SPIR-V for the f32-weight GEMV (full-precision projection weights, e.g. gemma4 E2B per-layer).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

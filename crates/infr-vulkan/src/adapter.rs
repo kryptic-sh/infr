@@ -648,6 +648,7 @@ fn lower_op(
                     // f32. DEFAULT-OFF at m=1 — the scalar dequant GEMV now wins (see
                     // `mmv_decode_enabled`); opt in with INFR_MMV_DECODE=1.
                     if mmv_decode_enabled()
+                        && be_.caps().i8_dot
                         && in_f % 32 == 0
                         && in_f * out_f >= MMV_MIN_ELEMS
                         && crate::gemm::native_mmv_build_spv(dt, true).is_some()
@@ -724,6 +725,7 @@ fn lower_op(
                 //    SLOWER there (qwen3-0.6b pp4@d4096 931 vs 916 with lm_head included).
                 // Same INFR_NO_MMV escape as the m=1 mmv (A/B).
                 if m >= 3
+                    && be_.caps().i8_dot
                     && in_f * out_f >= 8 << 20
                     && out_f < 65536
                     && crate::gemm::native_mmv_mrow_build_spv(dt).is_some()
@@ -765,8 +767,19 @@ fn lower_op(
                 return Ok(());
             }
             let gemm_ok = m > 1 && out_f % 64 == 0 && in_f % 32 == 0;
-            let is_gemm =
-                gemm_ok && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16));
+            // The whole GEMM tier below (matmul_native*/matmul_proj, the coopmat tiled prefill
+            // GEMM) dispatches ONLY coopmat SPIR-V — RADV still executes it on hardware without
+            // the feature (silent, no fault), so gating is required, not optional (issue: coopmat
+            // dispatch on a device that lacks VK_KHR_cooperative_matrix segfaults on some
+            // drivers). `!caps.cooperative_matrix` routes to the `else` arms below instead
+            // (`linear_native_off`/`linear`/`linear_f32` — the SAME scalar dequant-in-shader
+            // kernels the m==1 decode GEMV already uses, generalized to `rows=m`; they dispatch
+            // `rows*out_f` (or row-tiled) workgroups with no upper bound on `rows`, so they are a
+            // drop-in, just without the coopmat tile's weight-reuse-across-64-rows win). This is
+            // the coopmat->scalar fallback tier; bit-identical to before when caps are all true.
+            let is_gemm = gemm_ok
+                && be_.caps().cooperative_matrix
+                && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16));
             if is_gemm {
                 // GEMM writes ceil(m/64)*64 rows. Internal `dst` is row-padded → write direct;
                 // a non-Internal dst (e.g. the lm_head `logits` Output, unpadded) gets a padded
@@ -796,6 +809,7 @@ fn lower_op(
                     && std::env::var("INFR_NO_GEMM_WARP").is_err();
                 if matches!(dt, infr_core::DType::Q4K)
                     && !warp_ok
+                    && be_.caps().i8_dot
                     && std::env::var("INFR_NO_MMQ").is_err()
                 {
                     // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
@@ -943,6 +957,7 @@ fn lower_op(
                 // `mmv_decode_enabled`); opt in with INFR_MMV_DECODE=1.
                 if m == 1
                     && mmv_decode_enabled()
+                    && be_.caps().i8_dot
                     && in_f % 32 == 0
                     && in_f * out_f >= MMV_MIN_ELEMS
                     && crate::gemm::native_mmv_build_spv(dt, false).is_some()
@@ -977,8 +992,15 @@ fn lower_op(
                 // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj): the seam
                 // uploads native dtype, and the f16 GEMV would read the f32 bytes as f16 garbage.
                 rec.linear_f32(w, xb, y, m, in_f, out_f);
-            } else {
+            } else if be_.caps().f16 {
                 rec.linear(w, xb, y, m, in_f, out_f);
+            } else {
+                // No shaderFloat16 (implies no coopmat too — f16 is a coopmat prerequisite):
+                // linear_f16.comp's `float16_t` SSBO read needs the Float16 SPIR-V capability the
+                // device lacks. linear_f16_noext.comp is the same dispatch shape reading the f16
+                // weight buffer as packed u32 words and unpacking via the CORE `unpackHalf2x16`
+                // builtin instead — correctness-first, not perf-tuned (no row-tiling).
+                rec.linear_f16_noext(w, xb, y, m, in_f, out_f);
             }
         }
         Op::Add { a, b, dst, n } => rec.add(r(*a)?, r(*b)?, r(*dst)?, *n as usize),
@@ -1528,11 +1550,20 @@ fn lower_op(
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(24);
+                // attn_flash*/attn_qk*/attn_pv* are ALL coopmat SPIR-V (see the module doc / audit
+                // for this fallback ladder) — `flash_ok`/`nonfa_ok` additionally require
+                // `caps.cooperative_matrix` so a device without the feature never gets one
+                // dispatched (RADV silently executes coopmat SPIR-V even with the feature bit
+                // off, so "it ran" isn't proof; other drivers fault). Gated false, both fall
+                // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
+                // already the scalar decode/short-prefill path, dispatch with no coopmat and no
+                // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
                 let flash_ok = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && hd == 128
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
                     && !(k_q8_eff || v_q8_eff)
+                    && be_.caps().cooperative_matrix
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
@@ -1555,6 +1586,7 @@ fn lower_op(
                     && hd % 64 == 0
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
+                    && be_.caps().cooperative_matrix
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 // Decode (rows==1) AND small-m suffix prefill (rows 2..63, below the flash/nonfa
@@ -1877,7 +1909,16 @@ fn lower_op(
                 *head_v as usize,
             );
             let chunked = rows_ >= 32 && std::env::var("INFR_NO_DN_CHUNK").is_err();
-            if chunked && std::env::var("INFR_NO_DN_SPLIT").is_err() {
+            // deltanet_chunked_split's prep pass (deltanet_prep.comp) is the ONLY DeltaNet shader
+            // using coopmat (the D/Dq dot matrices); deltanet_chunked (monolithic) and deltanet
+            // (sequential) are both scalar. `!caps.cooperative_matrix` routes to the still-chunked
+            // (still fast, just not split-prep) `deltanet_chunked` kernel below instead of the
+            // sequential one — chunked math doesn't require coopmat, only this particular prep
+            // kernel's implementation does.
+            if chunked
+                && be_.caps().cooperative_matrix
+                && std::env::var("INFR_NO_DN_SPLIT").is_err()
+            {
                 let nchunk = rows_.div_ceil(32);
                 // alloc_uninit: every slot the scan reads is written by prep/gates first.
                 let kn =
@@ -2102,7 +2143,13 @@ fn lower_op(
             //
             // Gated on `rows > moe_small_m_threshold()` (not `rows > 1`): tiny prefill chunks (e.g.
             // `pp4`) take the small-m fast path below instead — see its doc for why.
-            if rows > moe_small_m_threshold() {
+            // ALSO gated on `caps.i8_dot`: the batched path's expert GEMM (`matmul_mmq_experts`,
+            // below) is dp4a int8 ONLY — no coopmat, no scalar sibling. A device lacking packed
+            // integer dot product falls through to the small-m path unconditionally instead (its
+            // `linear_native_id_multi` id-indexed GEMVs are plain dequant-in-shader, no dp4a) —
+            // correct for any `rows`, just without the batched path's cross-token weight-bank
+            // reuse (a real perf cost for large-batch MoE prefill on such hardware).
+            if rows > moe_small_m_threshold() && be_.caps().i8_dot {
                 use infr_core::DType::{Q4K, Q5K, Q5_0, Q6K, Q8_0};
                 let down_ok = matches!(ddt, Q4K | Q5K | Q6K | Q8_0 | Q5_0);
                 let act_ok = if *fused_gate_up {

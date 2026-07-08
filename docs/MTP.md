@@ -8,6 +8,13 @@ the `nextn.*` head tensors are baked into the MAIN GGUF (no sibling file for
 qwen35; the `--mtp`/`mtp-*.gguf` sibling download flow is for other arch
 families). llama.cpp reports ~1.5-2× generation speedup.
 
+> **Status: LANDED.** The single-head MTP path shipped in `infr` — opt-in via
+> `INFR_MTP=1`, wired for CPU + Vulkan (`crates/infr-llama/src/mtp/`,
+> `chat/{cpu,vulkan}.rs`), with temp-aware stochastic spec-accept,
+> token-identical to the target-only greedy path. Tests: `mtp_*` in
+> `crates/infr-llama/tests/cpu_backend.rs`. The Phase 1–3 build plan below is
+> kept as the design record (history, not a TODO).
+
 ## The head, exactly (qwen35: ONE MTP layer, `n_layer_nextn = 1`)
 
 Tensors at `blk.{n_layer}.nextn.*` (the layer index AFTER the trunk), plus a

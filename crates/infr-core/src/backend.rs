@@ -1,7 +1,7 @@
 //! The compute backend seam — the ONLY device-aware trait. Everything above is generic over it.
 //!
 //! Object-safe on purpose so the engine can hold `Arc<dyn Backend>` and stay blind to whether
-//! Vulkan / CPU / CUDA / ROCm / Metal / MLX is underneath. See PLAN.md "backend abstraction".
+//! Vulkan / CPU / CUDA / ROCm / Metal / MLX is underneath. See docs/PLAN.md.
 //!
 //! ## Execution model
 //!

@@ -3,9 +3,11 @@
 > **Status:** this is the original master plan from the DiffusionGemma era. Most
 > of it shipped — against autoregressive decoders (Llama / Qwen3 / Gemma), not
 > DiffusionGemma. It's kept for the architecture overview, crate layout, the
-> DiffusionGemma spec, and reference links. **The active plan for the current
-> backend-agnostic compute refactor is the root [`PLAN.md`](../PLAN.md).** Live
-> session state + perf numbers live in [`CONTEXT.md`](../CONTEXT.md).
+> DiffusionGemma spec, and reference links. The backend-agnostic compute
+> refactor it anticipated has since shipped: the op-list IR + `Backend` trait
+> live in `crates/infr-core` (`graph.rs`, `backend.rs`) and run on CPU
+> (`infr-cpu`), Vulkan (`infr-vulkan`), and Metal (`infr-metal`). Current perf
+> state: [`docs/PERF.md`](PERF.md).
 
 Pure-Rust LLM inference engine. Vulkan-first, designed to run on any mainstream
 GPU. The only non-Rust surface is the GPU driver (called through thin Rust FFI)
@@ -130,19 +132,18 @@ generic `B: Backend`) and otherwise treats it as opaque.
 
 ## The backend abstraction (the core design goal)
 
-> **This is now being built. The live design + status moved to the root
-> [`PLAN.md`](../PLAN.md) ("Backend-agnostic compute refactor").** The seam
-> landed as `infr-core::{Graph, Op, Backend, Bindings}` with a validated CPU
-> reference backend; the Vulkan adapter is in progress.
+> **Shipped.** The seam landed as `infr-core::{Graph, Op, Backend, Bindings}`
+> with a validated CPU reference backend (`infr-cpu`), the Vulkan adapter
+> (`infr-vulkan`), and a Metal backend (`infr-metal`).
 
 The hard requirement still holds: _the server does not know what's running
 behind it, and a new driver (CUDA / ROCm / Metal / MLX) can be dropped in
 without changing anything above `compute`._ The seam is drawn at the level of
 **semantic tensor ops**: the model builds an ordered op-list (`Graph`) over
 typed tensor handles; each backend compiles + executes it however it likes
-(Vulkan SPIR-V, CPU loops, later cuBLAS / rocBLAS / Metal / MLX). See the root
-`PLAN.md` for the as-built trait, the op set, the dtype-awareness decision, and
-the remaining phases.
+(Vulkan SPIR-V, CPU loops, later cuBLAS / rocBLAS / Metal / MLX). The as-built
+trait, op set, and the dtype-awareness decision live in the `infr-core` source
+(`graph.rs`, `backend.rs`).
 
 ---
 
@@ -267,7 +268,7 @@ diffusion decode loop is still future work. Status as of 2026-06-29:
 
 1. ✅ **Compute smoke test** — Vulkan enum + alloc + coop-matrix matmul vs CPU.
 2. ✅ **Core trait + tensor/graph** — `infr-core` Tensor/dtypes/Graph/Op/Backend
-   (the seam; see root `PLAN.md` for the as-built shape).
+   (the seam; the as-built shape lives in `graph.rs` / `backend.rs`).
 3. ✅ **`infr pull`** — HF + Ollama resolve/download, shared HF hub cache.
 4. ✅ **Vulkan backend** — matmul (coopmat + dp4a/mmq), broad dequant coverage,
    rmsnorm, rope, softmax, flash + non-FA attention, fused FFN.
@@ -279,10 +280,11 @@ diffusion decode loop is still future work. Status as of 2026-06-29:
 9. ✅ **`infr run`** — terminal chat (streaming, reasoning split).
 10. ✅ **`infr serve`** — axum OpenAI server (streaming, tool-call bridge).
 11. 🔄 **Perf pass** — ongoing (coopmat/dp4a tuning, record-once decode, KV
-    layout); see [`CONTEXT.md`](../CONTEXT.md).
-12. 🔄 **Backend-agnostic refactor + second backend** — IN PROGRESS. The seam +
-    a validated CPU reference backend have landed; the Vulkan adapter and later
-    CUDA/ROCm/Metal/MLX are tracked in the root [`PLAN.md`](../PLAN.md).
+    layout); see [`docs/PERF.md`](PERF.md).
+12. ✅ **Backend-agnostic refactor + second backend** — DONE. The op-list seam
+    (`crates/infr-core`) runs on CPU (`infr-cpu`), Vulkan (`infr-vulkan`), and
+    Metal (`infr-metal`); CUDA / ROCm / MLX remain future backends behind the
+    same `Backend` trait.
 
 ---
 

@@ -125,8 +125,8 @@ is a separate later decision, not part of this plan.
 - `crates/infr-core/src/backend.rs` — `alloc`/`compile`/`execute` seam reused
   as-is; activations become persistent bindings.
 - `crates/infr-cpu/src/lib.rs` — home of the reference backward kernels.
-- `crates/infr-llama/src/cpu_backend.rs` — the forward decode-graph builder to
-  mirror for a training-graph builder.
+- `crates/infr-llama/src/seam/{model,runner}.rs` — the forward decode-graph
+  builder to mirror for a training-graph builder.
 - `crates/infr-gguf/` — loader reused; writer is net-new.
 - `crates/infr-hub/`, tokenizer — reused unchanged.
 

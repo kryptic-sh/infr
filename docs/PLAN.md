@@ -322,6 +322,43 @@ gemma4 mem-shared MTP mode (see [`MTP.md`](MTP.md) "Later").
 
 ---
 
+## Vulkan / GPU features to investigate
+
+Leads surfaced from the 2026-07 RDNA4 coopmat exploration (RX 9060 XT / Navi 44,
+Mesa 26.1.4). Context on what's already been ruled out: `docs/PERF.md` "Coopmat
+operand tiers" — on coopmat **v1**, no operand swap (fp8/bf16/int8) beats f16
+for these GEMMs. The items below are NOT yet tried.
+
+1. **`VK_NV_cooperative_matrix2` (coopmat2) — the promising one.** Verified
+   present on the RDNA4 box, but gated OFF by default (RADV driconf
+   `radv_cooperative_matrix2_nv=true` exposes it; `VK_KHR_cooperative_matrix` is
+   all that's exposed by default). Its `coopMatPerElementNV` gives each fragment
+   element WITH its (row,col) index → apply a per-block rank-1 (row·col) scale
+   **directly in-fragment**, removing the store-to-shared "rescale tax" that
+   dragged int8 coopmat from its ~2× raw rate to 0.73× vs f16 (v1 has no
+   per-element access). **Payoff:** int8 WMMA could finally beat f16 for
+   quantized-weight prefill — the win that eluded the v1 experiments, and the
+   reason llama.cpp uses dp4a instead of int8-coopmat-v1. **Before building,
+   verify tooling:** does `glslc` (shaderc 2026.2) compile
+   `GL_NV_cooperative_matrix2` / `coopMatPerElementNV`, and does `ash` expose
+   the coopmat2 device API (0.38 likely predates it — may need a newer ash or
+   hand-rolled bindings). **Caveats:** NV extension, RADV-experimental (users
+   must enable the driconf flag), NV+RADV-only → a gated fast-tier, not a
+   default. Then: retry the int8 coopmat GEMM with a coopmat2 per-element
+   descale, measure on the RDNA4 box. See [[int8-coopmat-status]].
+2. **`VK_NV_cooperative_vector`** — matrix×**vector** (i.e. decode / GEMV,
+   infr's current perf frontier). **NOT exposed by RADV yet** (checked both
+   default and driconf modes on Mesa 26.1.4). Watch for it in a future Mesa — if
+   it lands, it could route the decode GEMVs through the matrix unit. Nothing to
+   do until RADV ships it.
+3. **bf16-coopmat rate on a future Mesa** — RDNA4's `bfloat16_t` WMMA currently
+   runs ~12-27% slower than `float16_t` on the same kernel (see `docs/PERF.md`);
+   likely RADV codegen immaturity for the newer path. Re-check on a future Mesa:
+   if it reaches f16 rate, native bf16 (already built, opt-in
+   `INFR_BF16_COOPMAT`) becomes a free-accuracy default for bf16 models.
+
+---
+
 ## Risks / open questions
 
 - **Reusing ggml SPIR-V**: licensing (MIT — compatible) and binding layout/ABI

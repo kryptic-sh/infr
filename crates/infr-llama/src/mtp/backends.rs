@@ -92,6 +92,14 @@ pub fn generate_mtp_spec_vulkan(
 /// `eprintln!`s already compute — this is that same accounting, returned instead of only printed,
 /// so `infr bench`'s `mtp` segment and `infr compare`'s MTP DECODE section can report the
 /// draft/verify/catchup phase split and alpha without scraping stderr.
+///
+/// Constructs its OWN [`infr_vulkan::VulkanBackend`] (a fresh device every call) — this is what
+/// `infr bench`'s MTP arm wants (each rep measures a cold run, `bench_mtp_tg`'s doc). A caller
+/// that invokes the MTP driver repeatedly on the SAME device (e.g. `DenseSeamChat`'s `warmup()`
+/// plus every later chat turn) should call [`generate_mtp_spec_vulkan_timed_on`] instead and hold
+/// the backend itself — otherwise every call re-pays a full VkDevice + allocator + pipeline-cache
+/// init (issue: an `INFR_MTP=1` chat run used to construct TWO full Vulkan backends — one for
+/// `warmup()`, one for the first real turn — for exactly this reason).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn generate_mtp_spec_vulkan_timed(
     model: &crate::SeamModel,
@@ -100,9 +108,27 @@ pub fn generate_mtp_spec_vulkan_timed(
     max_new: usize,
     on_piece: impl FnMut(&str),
 ) -> Result<(crate::GenStats, MtpTiming)> {
+    let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+    generate_mtp_spec_vulkan_timed_on(&vk, model, head, prompt, max_new, on_piece)
+}
+
+/// [`generate_mtp_spec_vulkan_timed`] over a CALLER-supplied Vulkan backend, so a persistent
+/// caller can share ONE device (+ allocator + pipeline cache) across every MTP `generate()` call
+/// instead of constructing a fresh one per call. Each call still rebuilds a fresh trunk+head
+/// SESSION (KV cache state) by design — see this module's doc on "no cross-turn KV reuse" — that
+/// is an ordinary-sized allocation, not a VkDevice re-init, so sharing the backend loses nothing
+/// while dropping the redundant device construction.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub fn generate_mtp_spec_vulkan_timed_on(
+    vk: &infr_vulkan::VulkanBackend,
+    model: &crate::SeamModel,
+    head: &MtpHeadWeights,
+    prompt: &str,
+    max_new: usize,
+    on_piece: impl FnMut(&str),
+) -> Result<(crate::GenStats, MtpTiming)> {
     let cfg = model.config();
     let max_ctx = model.encode(prompt)?.len() + max_new + DEFAULT_N_MAX + 8;
-    let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
     let bind: &BindWeightFn = &|_name, tb, dt, _n| {
         let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
         let buf = vk
@@ -113,9 +139,9 @@ pub fn generate_mtp_spec_vulkan_timed(
         Ok((buf, dt))
     };
     let mut head_sess =
-        MtpHeadSession::new_vulkan(&vk, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
+        MtpHeadSession::new_vulkan(vk, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
     generate_mtp_spec_core(
-        &vk,
+        vk,
         bind,
         model,
         &mut head_sess,

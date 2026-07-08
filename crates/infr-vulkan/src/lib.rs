@@ -55,15 +55,6 @@ fn be(s: impl std::fmt::Display) -> Error {
     Error::backend(s)
 }
 
-/// Process-global set of device names whose startup banner has already been printed, so the
-/// `[infr] GPU: …` line logs once per physical device even when several `VulkanBackend`s are
-/// constructed in one run (MTP builds a separate trunk + head backend on the same device).
-fn banner_seen() -> &'static Mutex<std::collections::HashSet<String>> {
-    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
-}
-
 /// Downcast `&dyn Buffer` → `&VkBuffer`.
 ///
 /// # Safety
@@ -751,26 +742,27 @@ impl VulkanBackend {
 
         // One-line device banner (stderr) — the first thing to check on a portability bug report:
         // which GPU was picked and which kernel tiers are live. `y`/`n` per capability + the
-        // subgroup range + shared-mem budget. Deduped by device name across the process: a single
-        // run can construct several `VulkanBackend`s (e.g. MTP builds a separate trunk + head
-        // backend), and we want ONE banner per physical device, not one per backend instance.
-        if banner_seen().lock().unwrap().insert(caps.name.clone()) {
-            let yn = |b: bool| if b { "y" } else { "n" };
-            eprintln!(
-                "[infr] GPU: {} | f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} \
-                 subgroup:{}-{} shared:{}KB",
-                caps.name,
-                yn(caps.f16),
-                yn(caps.f16_coopmat),
-                yn(caps.f8),
-                yn(caps.f8_coopmat),
-                yn(caps.i8),
-                yn(caps.i8_dot),
-                caps.subgroup_min,
-                caps.subgroup_max,
-                caps.max_shared_memory_bytes / 1024,
-            );
-        }
+        // subgroup range + shared-mem budget. Printed on every `VulkanBackend::new()` (no
+        // process-wide dedup): a single run constructing several backends on the same device (an
+        // `infr bench` MTP rep loop; a CPU/Vulkan parity check) now genuinely means one construction
+        // per printed line, not a duplicate — `DenseSeamChat`'s MTP chat path shares ONE backend
+        // across `warmup()` + every turn (see `chat/vulkan.rs`'s `mtp_vk`), so an ordinary
+        // `INFR_MTP=1` run prints exactly one banner again without needing this dedup.
+        let yn = |b: bool| if b { "y" } else { "n" };
+        eprintln!(
+            "[infr] GPU: {} | f16:{} f16cm:{} f8:{} f8cm:{} i8:{} i8dot:{} \
+             subgroup:{}-{} shared:{}KB",
+            caps.name,
+            yn(caps.f16),
+            yn(caps.f16_coopmat),
+            yn(caps.f8),
+            yn(caps.f8_coopmat),
+            yn(caps.i8),
+            yn(caps.i8_dot),
+            caps.subgroup_min,
+            caps.subgroup_max,
+            caps.max_shared_memory_bytes / 1024,
+        );
 
         // ── gpu-allocator ──────────────────────────────────────────────────────
         let allocator = Allocator::new(&AllocatorCreateDesc {

@@ -833,6 +833,46 @@ pub(crate) fn native_gemm_warp_sk_ag_build_spv(
     })
 }
 
+/// BM=32 row-tile variant of [`native_gemm_warp_n128_ag_build_spv`] — see the recorder's
+/// `DENSE_SMALL_TILE_MAX_M` doc. Only the formats MTP verify's qwen35-4B-UD-Q4_K_XL run actually
+/// hits (Q4_K/Q5_K/Q6_K/Q8_0) are built. NOT built for the sk_ag (split-K) family —
+/// `dense_small_m_row_tile_bench` measured a net LOSS there (split-K's own `splits` dimension
+/// already fills the device; see `matmul_native_splitk`'s doc).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_warp_n128_ag_bm32_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => (
+            "native_gemm_warp_q4k_n128_ag_bm32",
+            v!("native_gemm_warp_q4k_n128_ag_bm32"),
+        ),
+        Q5K => (
+            "native_gemm_warp_q5k_n128_ag_bm32",
+            v!("native_gemm_warp_q5k_n128_ag_bm32"),
+        ),
+        Q6K => (
+            "native_gemm_warp_q6k_n128_ag_bm32",
+            v!("native_gemm_warp_q6k_n128_ag_bm32"),
+        ),
+        Q8_0 => (
+            "native_gemm_warp_q8_0_n128_ag_bm32",
+            v!("native_gemm_warp_q8_0_n128_ag_bm32"),
+        ),
+        _ => return None,
+    })
+}
+
 /// SPIR-V for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {

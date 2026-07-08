@@ -945,6 +945,36 @@ fn main() {
             "native_gemm_warp_q5k_sk_ag",
             &["-DFMT_Q5K", "-DNARROW_N", "-DSPLIT_K", "-DA_GLOBAL"],
         ),
+        // BM=32 row-tile variants of the A_GLOBAL dense warp GEMM's n128_ag (non-split-K) family
+        // — MTP verify's batched-prefill draft window (m≈6-24, growing under the no-rewind
+        // fallback) on the default BM=64 tile is mostly masked waste (m=8 → 87.5%). Only the
+        // formats the qwen35-4B-UD-Q4_K_XL verify GEMMs actually hit (Q4_K/Q5_K/Q6_K/Q8_0, per
+        // INFR_PROF2_SHAPES profiling) get a variant; selected per-dispatch by the recorder from
+        // `m` (see `DENSE_SMALL_TILE_MAX_M` in recorder.rs). Same K-accumulation order as BM=64 —
+        // tile GRANULARITY only, bit-identical. NO sk_ag (split-K) variants: the split-K family's
+        // own `splits` dimension already fills the device at these shapes, so a smaller row tile
+        // there measured a net LOSS (`dense_small_m_row_tile_bench`) — BM=64 stays unconditional
+        // on that path (see `matmul_native_splitk`'s doc).
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q4k_n128_ag_bm32",
+            &["-DFMT_Q4K", "-DNARROW_N", "-DA_GLOBAL", "-DBM32"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q5k_n128_ag_bm32",
+            &["-DFMT_Q5K", "-DNARROW_N", "-DA_GLOBAL", "-DBM32"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q6k_n128_ag_bm32",
+            &["-DFMT_Q6K", "-DNARROW_N", "-DA_GLOBAL", "-DBM32"],
+        ),
+        (
+            "native_gemm_warp",
+            "native_gemm_warp_q8_0_n128_ag_bm32",
+            &["-DFMT_Q8_0", "-DNARROW_N", "-DA_GLOBAL", "-DBM32"],
+        ),
         ("splitk_reduce", "splitk_reduce", &[]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_bf16", &["-DFMT_BF16"]),

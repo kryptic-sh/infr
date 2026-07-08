@@ -1250,3 +1250,165 @@ fn moe_expert_row_tile_bench_down() {
         }
     }
 }
+
+/// BM=64 vs BM=32 dense A_GLOBAL warp-GEMM row tile at REAL small-m batched-prefill shapes: MTP
+/// verify's draft window (m≈6-8 steady state, growing to ~m30-50 under the no-rewind fallback)
+/// runs every dense projection GEMM through `matmul_native_f16a` (n128_ag family: wide-N shapes
+/// like gate_up/vocab-head) or `matmul_native_splitk` (sk_ag family: narrow-N deep-k shapes like
+/// down/o/kv-proj) on the qwen35-4B-UD-Q4_K_XL shapes seen under `INFR_MTP=1 INFR_PROF2_SHAPES=1`.
+/// Sweeps m to find the BM=32/BM=64 crossover and confirm `DENSE_SMALL_TILE_MAX_M` (recorder.rs)
+/// sits on the right side of both the steady-state (m≈7) and no-rewind-tail (m≈30-50) regimes.
+/// `bm(dtype)`: probes the recorder's real gate by toggling `INFR_NO_SMALL_BM` (forces BM=64),
+/// so this exercises the SAME code path production uses, not a hand-rolled kernel pick.
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn dense_small_m_row_tile_bench() {
+    let be = VulkanBackend::new().unwrap();
+    let reps = 30usize;
+    let ms: &[usize] = &[4, 6, 8, 12, 16, 20, 24, 32, 48, 64];
+
+    fn blk(dtype: infr_core::DType) -> (usize, usize) {
+        use infr_core::DType::*;
+        match dtype {
+            Q4K => (256, 144),
+            Q5K => (256, 176),
+            Q6K => (256, 210),
+            Q8_0 => (32, 34),
+            _ => unreachable!("bench dtype not covered"),
+        }
+    }
+
+    // n128_ag family (matmul_native_f16a): wide-N shapes — gate_up fused proj, vocab head.
+    let n128_shapes: &[(&str, infr_core::DType, usize, usize)] = &[
+        ("gate_up", infr_core::DType::Q4K, 2560, 18432),
+        ("vocab_head", infr_core::DType::Q6K, 2560, 248320),
+    ];
+    for &(label, dtype, k, n) in n128_shapes {
+        let (be_, k_, n_) = (&be, k, n);
+        let mpad_max = 64usize;
+        let (belem, bbytes) = blk(dtype);
+        let a16 = be_
+            .alloc(mpad_max * k_ * 2, BufferUsage::Activations)
+            .unwrap();
+        let w = be_
+            .alloc(n_ * (k_ / belem) * bbytes, BufferUsage::Weights)
+            .unwrap();
+        let c = be_
+            .alloc(mpad_max * n_ * 4, BufferUsage::Activations)
+            .unwrap();
+        for &m in ms {
+            for (tile_label, no_small_bm) in [("BM32", false), ("BM64", true)] {
+                if no_small_bm {
+                    std::env::set_var("INFR_NO_SMALL_BM", "1");
+                } else {
+                    std::env::remove_var("INFR_NO_SMALL_BM");
+                }
+                let rec = be_.recorder().unwrap();
+                rec.matmul_native_f16a(dtype, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k_, n_);
+                rec.finish().unwrap(); // warmup (pipeline compile)
+                let t0 = std::time::Instant::now();
+                let rec = be_.recorder().unwrap();
+                for _ in 0..reps {
+                    rec.matmul_native_f16a(
+                        dtype,
+                        a16.as_ref(),
+                        w.as_ref(),
+                        0,
+                        c.as_ref(),
+                        m,
+                        k_,
+                        n_,
+                    );
+                }
+                rec.finish().unwrap();
+                let us = t0.elapsed().as_micros() as f64 / reps as f64;
+                let flops = 2.0 * m as f64 * k_ as f64 * n_ as f64;
+                let tflops = flops / (us * 1e-6) / 1e12;
+                let fill = m as f64 / if no_small_bm { 64.0 } else { 32.0 };
+                println!(
+                    "[n128_ag {label:>10} k={k_} n={n_:>6}] m={m:3} tile={tile_label}: {us:7.1} us  ({tflops:5.2} TFLOP/s, fill={fill:4.0}%)",
+                    fill = fill * 100.0,
+                );
+            }
+        }
+    }
+    std::env::remove_var("INFR_NO_SMALL_BM");
+
+    // sk_ag family (matmul_native_splitk, a_is_f16=true): narrow-N deep-k shapes — down/o/kv-proj.
+    let sk_shapes: &[(&str, infr_core::DType, usize, usize)] = &[
+        ("down", infr_core::DType::Q4K, 9216, 2560),
+        ("attn_out", infr_core::DType::Q8_0, 4096, 2560),
+        ("kv", infr_core::DType::Q5K, 2560, 4096),
+        ("q_proj", infr_core::DType::Q4K, 2560, 8192),
+        ("o_small", infr_core::DType::Q6K, 2560, 1024),
+    ];
+    let splits = 8usize;
+    for &(label, dtype, k, n) in sk_shapes {
+        let (be_, k_, n_) = (&be, k, n);
+        let mpad_max = 64usize;
+        let (belem, bbytes) = blk(dtype);
+        let a16 = be_
+            .alloc(mpad_max * k_ * 2, BufferUsage::Activations)
+            .unwrap();
+        let w = be_
+            .alloc(n_ * (k_ / belem) * bbytes, BufferUsage::Weights)
+            .unwrap();
+        let c = be_
+            .alloc(mpad_max * n_ * 4, BufferUsage::Activations)
+            .unwrap();
+        let partials = be_
+            .alloc(splits * mpad_max * n_ * 4, BufferUsage::Activations)
+            .unwrap();
+        for &m in ms {
+            for (tile_label, no_small_bm) in [("BM32", false), ("BM64", true)] {
+                if no_small_bm {
+                    std::env::set_var("INFR_NO_SMALL_BM", "1");
+                } else {
+                    std::env::remove_var("INFR_NO_SMALL_BM");
+                }
+                let rec = be_.recorder().unwrap();
+                rec.matmul_native_splitk(
+                    dtype,
+                    a16.as_ref(),
+                    w.as_ref(),
+                    0,
+                    partials.as_ref(),
+                    c.as_ref(),
+                    m,
+                    k_,
+                    n_,
+                    splits,
+                    true,
+                );
+                rec.finish().unwrap(); // warmup (pipeline compile)
+                let t0 = std::time::Instant::now();
+                let rec = be_.recorder().unwrap();
+                for _ in 0..reps {
+                    rec.matmul_native_splitk(
+                        dtype,
+                        a16.as_ref(),
+                        w.as_ref(),
+                        0,
+                        partials.as_ref(),
+                        c.as_ref(),
+                        m,
+                        k_,
+                        n_,
+                        splits,
+                        true,
+                    );
+                }
+                rec.finish().unwrap();
+                let us = t0.elapsed().as_micros() as f64 / reps as f64;
+                let flops = 2.0 * m as f64 * k_ as f64 * n_ as f64;
+                let tflops = flops / (us * 1e-6) / 1e12;
+                let fill = m as f64 / if no_small_bm { 64.0 } else { 32.0 };
+                println!(
+                    "[sk_ag {label:>10} k={k_:>5} n={n_:>5}] m={m:3} tile={tile_label}: {us:7.1} us  ({tflops:5.2} TFLOP/s, fill={fill:4.0}%)",
+                    fill = fill * 100.0,
+                );
+            }
+        }
+    }
+    std::env::remove_var("INFR_NO_SMALL_BM");
+}

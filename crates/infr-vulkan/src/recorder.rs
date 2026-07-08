@@ -28,6 +28,24 @@ const MMV_NUM_ROWS: u32 = 1;
 /// BM=64 as the segments fill in.
 const MOE_EXPERT_SMALL_TILE_AVG_ROWS: usize = 24;
 
+/// Dense A_GLOBAL warp-GEMM `matmul_native_f16a` (n128_ag, non-split-K family) BM=64 → BM=32
+/// row-tile crossover, in real batched-prefill rows `m`. MTP verify's draft window runs a batched
+/// prefill of the drafted suffix (m≈6-8 steady-state, growing up to ~m30-50 under the no-rewind
+/// fallback's carried-forward unaccepted prefix) through every dense projection GEMM on the SAME
+/// BM=64 tile prefill uses at m=512+ — at m=8 that's 87.5% masked waste (56 of 64 rows discarded
+/// at the store). Below this threshold the BM=32 `_bm32` kernel variant wins (halves the waste,
+/// same per-thread math as `matmul_mmq_experts`' `_xp32`); at/above it BM=64 (default, unchanged)
+/// wins — picked from `dense_small_m_row_tile_bench`'s crossover sweep (BM=32 wins clearly through
+/// m=24, a wash by m=32, a loss by m=64). `INFR_NO_SMALL_BM` forces BM=64 (A/B escape). Same
+/// K-accumulation order either way — tile GRANULARITY only, bit-identical to the BM=64 path.
+///
+/// NOT applied to `matmul_native_splitk`'s sk_ag family (o/down/kv-proj at these same m — the
+/// OTHER half of verify's dense GEMM traffic): the same bench shows a net LOSS there across the
+/// whole m≈4-64 sweep — split-K's own `splits` dimension already fans the GEMM across enough
+/// workgroups to fill the device, so a smaller row tile only adds fixed per-workgroup cost with
+/// no occupancy win to pay for it (see `matmul_native_splitk`'s doc).
+const DENSE_SMALL_TILE_MAX_M: usize = 24;
+
 /// Elements packed per u32 weight word for a given quant width (8 nibbles for q4, 4 bytes for q8).
 /// `None` ⇒ the subgroup GEMV has no specialization for this width; caller uses the WGSL fallback.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -915,16 +933,25 @@ impl<'a> Recorder<'a> {
         let use_wide = n.is_multiple_of(256)
             && wide_grid >= 128
             && std::env::var("INFR_GEMM_WIDE_TILE").is_ok();
-        let ((name, spv), bn) = if use_wide {
-            (
-                crate::gemm::native_gemm_warp_ag_build_spv(dtype).expect("ag spv"),
-                256,
-            )
+        // Small-m batched prefill (MTP verify's draft window, m≈6-24): the default BM=64 row tile
+        // is mostly masked waste (see DENSE_SMALL_TILE_MAX_M's doc) — switch to the BM=32 `_bm32`
+        // n128_ag variant when it exists for `dtype` (only the K-quant formats verify actually
+        // hits: Q4_K/Q5_K/Q6_K/Q8_0) and the wide tile wasn't explicitly requested (wide_grid>=128
+        // never fires at these m anyway, short of the vocab-head GEMM under INFR_GEMM_WIDE_TILE).
+        let small_bm =
+            !use_wide && m <= DENSE_SMALL_TILE_MAX_M && std::env::var("INFR_NO_SMALL_BM").is_err();
+        let bm32 = small_bm
+            .then(|| crate::gemm::native_gemm_warp_n128_ag_bm32_build_spv(dtype))
+            .flatten();
+        let (name, spv, bn, bm): (_, _, usize, usize) = if use_wide {
+            let (name, spv) = crate::gemm::native_gemm_warp_ag_build_spv(dtype).expect("ag spv");
+            (name, spv, 256, 64)
+        } else if let Some((name, spv)) = bm32 {
+            (name, spv, 128, 32)
         } else {
-            (
-                crate::gemm::native_gemm_warp_n128_ag_build_spv(dtype).expect("ag n128 spv"),
-                128,
-            )
+            let (name, spv) =
+                crate::gemm::native_gemm_warp_n128_ag_build_spv(dtype).expect("ag n128 spv");
+            (name, spv, 128, 64)
         };
         self.label_gemm(name, m, k, n);
         let kern = self.be.kernel_sg(name, spv, 3, 16, 32);
@@ -933,7 +960,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / bn)) as u32;
+        let groups = (m.div_ceil(bm) * (n / bn)) as u32;
         self.dispatch(
             kern,
             &[Self::vkb(a16), Self::vkb(w), Self::vkb(c)],
@@ -964,6 +991,13 @@ impl<'a> Recorder<'a> {
         splits: usize,
         a_is_f16: bool,
     ) {
+        // NB: `dense_small_m_row_tile_bench` also probed a BM=32 tile here (mirroring
+        // `matmul_native_f16a`'s small-m gate) and found a NET LOSS across the whole m≈4-64
+        // sweep on every sk_ag shape tested (down/attn_out/kv/q_proj/o_small) — split-K's own
+        // `splits` dimension already fans this GEMM out across enough extra workgroups to fill
+        // the device, so a smaller row tile only adds fixed per-workgroup cost (barrier/staging)
+        // without an occupancy win to pay for it. BM=64 stays unconditional here; the win lives
+        // in `matmul_native_f16a` (the non-split-K n128_ag family), which had no such fill floor.
         let (name, spv) = if a_is_f16 {
             crate::gemm::native_gemm_warp_sk_ag_build_spv(dtype).expect("split-k ag spv")
         } else {

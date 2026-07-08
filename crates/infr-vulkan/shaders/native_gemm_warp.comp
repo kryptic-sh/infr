@@ -20,11 +20,19 @@ const uint THREADS = 256u;
 // workgroups — narrow-n GEMMs (n=1024/2048: the qkv/o/down shapes of small-ne models) underfill
 // a big GPU with the wide tile (n=1024 → 32 wgs on a 96-wg part = 5-9 TFLOPS vs the kernel's 36).
 // Tile-shape experiments (kernel tuning): -DBM128 doubles the row tile (WM 32→64: 4×4 acc frags
-// per warp — more B-frag reuse per LDS load); -DBK64W doubles the k-stage on the WIDE tile
-// (half the barriers, 2 staging iterations per thread). Composable.
+// per warp — more B-frag reuse per LDS load); -DBM32 HALVES it (WM 32→16: 2×4 → 1×4 acc frags
+// per warp) for small-m batched prefill (MTP verify's m≈6-24 draft window on a 64-row default
+// tile wastes most of the tile as masked rows past `pc.m`); -DBK64W doubles the k-stage on the
+// WIDE tile (half the barriers, 2 staging iterations per thread). Composable. WARPS_M = BM/WM is
+// always 2 (128/64, 64/32, 32/16) — the coopmat compute/store loop indexes `gl_SubgroupID` over
+// WARPS_M*WARPS_N (=2*4=8) without bounds-checking, so this ratio must stay fixed at 2 for any
+// new BM variant to reuse the same warp-index math.
 #ifdef BM128
 const uint BM = 128u;
 const uint WM = 64u;
+#elif defined(BM32)
+const uint BM = 32u;
+const uint WM = 16u;
 #else
 const uint BM = 64u;
 const uint WM = 32u;

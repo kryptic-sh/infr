@@ -22,6 +22,13 @@ pub struct DenseSeamChat {
     session: Option<crate::seam::model::DenseVulkanSession>,
     mtp_head: Option<crate::mtp::MtpHeadWeights>,
     mtp_checked: bool,
+    /// The ONE Vulkan backend MTP mode's trunk+head share across every `generate()` call
+    /// (`ensure_mtp_backend`). MTP's driver rebuilds a fresh trunk+head SESSION every call by
+    /// design (`crate::mtp`'s "no cross-turn KV reuse" doc) — but that's an ordinary allocation,
+    /// not a device re-init, so this field is what keeps `warmup()`'s call and every real chat
+    /// turn on the SAME VkDevice/allocator/pipeline-cache instead of constructing a new one each
+    /// time (previously: two full Vulkan backends for a single-turn `INFR_MTP=1` run).
+    mtp_vk: Option<infr_vulkan::VulkanBackend>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -32,6 +39,7 @@ impl DenseSeamChat {
             session: None,
             mtp_head: None,
             mtp_checked: false,
+            mtp_vk: None,
         }
     }
 
@@ -77,6 +85,19 @@ impl DenseSeamChat {
         }
         Ok(())
     }
+
+    /// Lazily construct the shared MTP Vulkan backend (see [`mtp_vk`](Self::mtp_vk)'s doc) —
+    /// `generate`'s MTP branch calls this instead of letting `crate::mtp::generate_mtp_spec_vulkan`
+    /// construct its own per-call backend.
+    fn ensure_mtp_backend(&mut self) -> Result<()> {
+        if self.mtp_vk.is_none() {
+            self.mtp_vk = Some(
+                infr_vulkan::VulkanBackend::new()
+                    .map_err(|e| anyhow::anyhow!("vulkan init: {e}"))?,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -110,10 +131,18 @@ impl ChatModel for DenseSeamChat {
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         if self.wants_mtp()? {
+            self.ensure_mtp_backend()?;
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
-            return crate::mtp::generate_mtp_spec_vulkan(&self.model, head, prompt, max_new, |p| {
-                on_piece(p)
-            });
+            let vk = self.mtp_vk.as_ref().expect("ensure_mtp_backend set it");
+            return crate::mtp::generate_mtp_spec_vulkan_timed_on(
+                vk,
+                &self.model,
+                head,
+                prompt,
+                max_new,
+                |p| on_piece(p),
+            )
+            .map(|(stats, _)| stats);
         }
         self.ensure_session()?;
         self.model

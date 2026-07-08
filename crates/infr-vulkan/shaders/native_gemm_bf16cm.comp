@@ -18,14 +18,15 @@
 // DIRECT matmul with a plain f32 `coopMatStore`, structurally identical to native_gemm_warp's
 // epilogue.
 //
-// WEIGHTS: the bf16 weight tensor is contiguous 16-bit values. The weight SSBO is declared
-// `bfloat16_t w[]` (16-bit storage, `GL_EXT_shader_16bit_storage`) and read DIRECTLY into `Bs` —
-// ZERO conversion, the bf16 bit pattern is copied as-is. (An earlier revision went through
-// `native_gemm_warp`'s shared `dqblk`/FMT_BF16 helper, which decodes bf16->f32 via
-// `bitcast(bits<<16)`, then cast f32->bfloat16_t back down — exact but a redundant widen-then-
-// narrow; reading `bfloat16_t` directly skips both.) Never touches f16 → no range/precision clamp.
-// ACTIVATIONS are plain f32 (model activations) — staged into `As` via `bfloat16_t(a[...])`, a
-// normal narrowing cast, mirroring native_gemm_warp's `float16_t(a[...])` staging.
+// WEIGHTS: the bf16 weight tensor is contiguous 16-bit truncated-f32 values (native_decode.glsl
+// FMT_BF16 — `bitcast(bits << 16)` is EXACT, bf16 IS the top 16 bits of f32). Staged via the
+// SAME `dqblk`/FMT_BF16 decode-to-f32 `native_gemm_warp` already uses for its f16-clamped bf16
+// path, then cast `bfloat16_t(v[kk])` instead of `float16_t(v[kk])`: this f32->bf16 cast is an
+// EXACT round-trip (no rounding loss) because the intermediate f32 value already has its low 16
+// mantissa bits zeroed by the FMT_BF16 decode — so this stages the ORIGINAL bf16 bit pattern into
+// `Bs`, never touching f16 or losing range/precision. ACTIVATIONS are plain f32 (model
+// activations, not pre-truncated) — staged into `As` via `bfloat16_t(a[...])`, a normal (rounding)
+// f32->bf16 narrowing cast, exactly mirroring native_gemm_warp's `float16_t(a[...])` staging.
 //
 // Not ported from native_gemm_warp (same discipline as native_gemm_f8cm_q8_0.comp): A_GLOBAL,
 // SPLIT_K, and the BM128/BM32 row-tile variants are separate tuning experiments on top of the base
@@ -43,7 +44,6 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_bfloat16 : require
-#extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : require
 
@@ -73,12 +73,15 @@ const uint SBK = BK + 8u;     // Bs is [BN][SBK]
 
 // w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
-layout(binding = 0) readonly buffer ABuf { float a[]; };        // [M, K] f32 activations
-layout(binding = 1) readonly buffer WBuf { bfloat16_t w[]; };   // [N, K] bf16 weights, read DIRECT
+layout(binding = 0) readonly buffer ABuf { float a[]; };   // [M, K] f32 activations
+layout(binding = 1) readonly buffer WBuf { uint nw[]; };   // bf16 weights: contiguous 16-bit, 2/word
 layout(binding = 2) writeonly buffer CBuf { float c[]; };
 
 shared bfloat16_t As[BM * SAK];
 shared bfloat16_t Bs[BN * SBK];
+
+#define FMT_BF16
+#include "native_decode.glsl"
 
 void main() {
     uint tilesN = pc.n / BN;
@@ -106,15 +109,21 @@ void main() {
             uint gr = wgRow + r;
             As[r * SAK + cc] = (gr < pc.m) ? bfloat16_t(a[gr * pc.k + k0 + cc]) : bfloat16_t(0.0);
         }
-        // Stage BN cols x BK bf16 weights DIRECTLY — `w[]` is a `bfloat16_t` SSBO (16-bit storage),
-        // so the bf16 bit pattern copies straight into `Bs` with ZERO conversion. No dqblk, no
-        // f32 round-trip: the earlier revision decoded bf16->f32 (bitcast(bits<<16)) then cast
-        // f32->bfloat16_t, an exact-but-redundant widen-then-narrow — this reads the bf16 value as
-        // itself. (Still no f16 clamp: the operand type is bf16 through to the coopmat.)
-        for (uint idx = li; idx < BN * BK; idx += THREADS) {
-            uint cc = idx / BK;
-            uint kk = idx % BK;
-            Bs[cc * SBK + kk] = w[pc.w_base + (wgCol + cc) * pc.k + k0 + kk];
+        // One thread per (column, 32-elem k-block) per iteration — BN*(BK/32) decode slots per
+        // stage, striped across THREADS (exactly one iteration for both the wide and narrow tile:
+        // 256*1 = 128*2 = 256). dqblk (FMT_BF16) decodes the raw bf16 bits to f32 EXACTLY
+        // (bitcast(bits<<16)); casting that f32 straight to bfloat16_t is an exact round-trip (the
+        // low 16 mantissa bits are already zero) — so this reconstructs the ORIGINAL bf16 bit
+        // pattern with no f16 clamp and no precision loss, unlike native_gemm_warp_bf16's
+        // bf16->f32->f16 path.
+        for (uint slot = li; slot < BN * (BK / 32u); slot += THREADS) {
+            uint cc = slot % BN;
+            uint kb = (slot / BN) * 32u;
+            float v[32];
+            dqblk(pc.w_base + (wgCol + cc) * pc.k + k0 + kb, v);
+            [[unroll]] for (uint kk = 0u; kk < 32u; kk++) {
+                Bs[cc * SBK + kb + kk] = bfloat16_t(v[kk]);
+            }
         }
         barrier();
         [[unroll]] for (uint kf = 0u; kf < BK; kf += 16u) {

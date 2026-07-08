@@ -778,6 +778,11 @@ impl VulkanBackend {
             gpu_sample: true,
             argmax_rows: true,
             argmax_prob: true,
+            // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — the
+            // `rmsnorm_gate` kernel (rmsnorm.comp's -DGATE build). Collapses QkNorm→GatedAct's
+            // read-after-write barrier into one dispatch. INFR_NO_GATED_RMSNORM forces the split
+            // form for A/B.
+            gated_rmsnorm: true,
         };
 
         // One-line device banner (stderr) — the first thing to check on a portability bug report:

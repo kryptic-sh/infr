@@ -222,6 +222,14 @@ pub(crate) fn generate_dense_backend(
                 && c.has_own_kv(l)
         });
 
+    // qwen35 DeltaNet silu-gated RMSNorm fusion (decode op-fusion campaign): QkNorm's per-head
+    // rmsnorm write is immediately read-after-write by the z-gate GatedAct — a real barrier on
+    // backends that track hazards (Vulkan). `Op::GatedRmsNorm` collapses the pair into one
+    // dispatch with bit-identical math (same reduction, elementwise gate multiply added on
+    // store). INFR_NO_GATED_RMSNORM forces the split form for A/B (default unset = fuse).
+    let fuse_gated_rmsnorm =
+        be.capabilities().gated_rmsnorm && std::env::var("INFR_NO_GATED_RMSNORM").is_err();
+
     // GPU embed gather (Op::EmbedGather, task #28): the host feeds token IDS (4 bytes each) and
     // the device gathers+dequantizes the embedding rows from the resident quantized table —
     // decode and prefill stop uploading f32 embedding rows entirely (a 512-token prefill chunk
@@ -1585,25 +1593,41 @@ pub(crate) fn generate_dense_backend(
                     head_v: q35_vd as u32,
                     eps: 1e-6,
                 });
-                // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z)
-                g.push(Op::QkNorm {
-                    x: dn_out,
-                    weight: dw.ssm_norm,
-                    dst: dn_out,
-                    rows: batch as u32,
-                    n_head: q35_nv as u32,
-                    head_dim: q35_vd as u32,
-                    eps,
-                });
-                g.push(Op::GatedAct {
-                    gate: dn_zbuf,
-                    up: dn_out,
-                    dst: dn_out,
-                    rows: batch as u32,
-                    nff: (q35_nv * q35_vd) as u32,
-                    act: Activation::Silu,
-                    up_off: 0,
-                });
+                // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z). Fused into
+                // ONE dispatch when the backend supports it (see `fuse_gated_rmsnorm`'s doc) — the
+                // split form's GatedAct reads QkNorm's freshly-written `dn_out`, a real
+                // read-after-write hazard the fusion removes.
+                if fuse_gated_rmsnorm {
+                    g.push(Op::GatedRmsNorm {
+                        x: dn_out,
+                        weight: dw.ssm_norm,
+                        gate: dn_zbuf,
+                        dst: dn_out,
+                        rows: batch as u32,
+                        n_head: q35_nv as u32,
+                        head_dim: q35_vd as u32,
+                        eps,
+                    });
+                } else {
+                    g.push(Op::QkNorm {
+                        x: dn_out,
+                        weight: dw.ssm_norm,
+                        dst: dn_out,
+                        rows: batch as u32,
+                        n_head: q35_nv as u32,
+                        head_dim: q35_vd as u32,
+                        eps,
+                    });
+                    g.push(Op::GatedAct {
+                        gate: dn_zbuf,
+                        up: dn_out,
+                        dst: dn_out,
+                        rows: batch as u32,
+                        nff: (q35_nv * q35_vd) as u32,
+                        act: Activation::Silu,
+                        up_off: 0,
+                    });
+                }
                 g.push(Op::Linear {
                     x: dn_out,
                     weight: dw.out,

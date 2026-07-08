@@ -219,8 +219,11 @@ fn decode_eligible(graph: &Graph) -> bool {
             // bindings (kbufs/vbufs, stable across the decode loop) with no pos push constant —
             // the recorded tape re-reads the live state every replay, and the tape's leading
             // global barrier orders iteration i's state write before i+1's read under replay_n.
+            // GatedRmsNorm (qwen35 DeltaNet z-gate) is pos-independent elementwise like QkNorm —
+            // same replay-safety argument.
             Op::MoeFfn { .. }
             | Op::QkNorm { .. }
+            | Op::GatedRmsNorm { .. }
             | Op::Softcap { .. }
             | Op::Conv1dSilu { .. }
             | Op::DeltaNet { .. } => {}
@@ -1905,6 +1908,28 @@ fn lower_op(
                 *eps,
             );
         }
+        // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — one dispatch
+        // instead of QkNorm→GatedAct's two, removing the read-after-write barrier between them.
+        Op::GatedRmsNorm {
+            x,
+            weight,
+            gate,
+            dst,
+            rows,
+            n_head,
+            head_dim,
+            eps,
+        } => {
+            rec.rmsnorm_gate(
+                r(*x)?,
+                r(*weight)?,
+                r(*gate)?,
+                r(*dst)?,
+                (*rows * *n_head) as usize,
+                *head_dim as usize,
+                *eps,
+            );
+        }
         // Qwen3-Next SSM: depthwise causal conv + SiLU (rolling conv `state` mutated in place).
         Op::Conv1dSilu {
             x,
@@ -2974,6 +2999,76 @@ mod tests {
             assert!(
                 (got[i] - want[i]).abs() < 1e-3,
                 "rmsnorm mismatch at {i}: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    /// A one-op `GatedRmsNorm` graph (fused per-head RMSNorm + SiLU gate, qwen35 DeltaNet z-gate)
+    /// through the seam must match `rmsnorm(x,w) * silu(z)` computed in two host passes — i.e.
+    /// the SAME thing the split `QkNorm`→`GatedAct` pair produces. Multi-head (n_head=2) shape so
+    /// the per-head reduction boundary is exercised, not just a single-row rmsnorm.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn gated_rmsnorm_graph_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (rows, n_head, head_dim, eps) = (2usize, 2usize, 8usize, 1e-6f32);
+        let dim = n_head * head_dim;
+        let x: Vec<f32> = (0..rows * dim).map(|i| i as f32 * 0.1 - 0.4).collect();
+        let w: Vec<f32> = (0..head_dim).map(|i| 1.0 + i as f32 * 0.05).collect();
+        let z: Vec<f32> = (0..rows * dim).map(|i| (i as f32 * 0.37).sin()).collect();
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        // host reference: per-head rmsnorm, then elementwise silu(z) gate — the split-op semantics.
+        let mut want = vec![0f32; rows * dim];
+        for r in 0..rows {
+            for h in 0..n_head {
+                let b = (r * n_head + h) * head_dim;
+                let ss = (0..head_dim).map(|i| x[b + i] * x[b + i]).sum::<f32>() / head_dim as f32;
+                let s = 1.0 / (ss + eps).sqrt();
+                for i in 0..head_dim {
+                    want[b + i] = x[b + i] * s * w[i] * silu(z[b + i]);
+                }
+            }
+        }
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+        let wi = g.weight(TensorDesc::new(vec![head_dim], DType::F32));
+        let zi = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+        let yi = g.output(TensorDesc::new(vec![rows, dim], DType::F32));
+        g.push(Op::GatedRmsNorm {
+            x: xi,
+            weight: wi,
+            gate: zi,
+            dst: yi,
+            rows: rows as u32,
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            eps,
+        });
+        let xb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+        let wb = be_.alloc(head_dim * 4, BufferUsage::Weights).unwrap();
+        let zb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+        let yb = be_.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+        be_.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        be_.upload(wb.as_ref(), bytemuck::cast_slice(&w)).unwrap();
+        be_.upload(zb.as_ref(), bytemuck::cast_slice(&z)).unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(xi, xb.as_ref());
+        bind.bind(wi, wb.as_ref());
+        bind.bind(zi, zb.as_ref());
+        bind.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got = vec![0f32; rows * dim];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for i in 0..rows * dim {
+            assert!(
+                (got[i] - want[i]).abs() < 1e-3,
+                "gated_rmsnorm mismatch at {i}: got {} want {}",
                 got[i],
                 want[i]
             );

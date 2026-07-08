@@ -330,6 +330,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Softmax { .. } => "Softmax",
         Op::Linear { .. } => "Linear",
         Op::QkNorm { .. } => "QkNorm",
+        Op::GatedRmsNorm { .. } => "GatedRmsNorm",
         Op::Rope { .. } => "Rope",
         Op::QkNormRope { .. } => "QkNormRope",
         Op::WriteKv { .. } => "WriteKv",
@@ -3516,6 +3517,15 @@ impl MetalBackend {
                 // silent wrong-output run rather than pretending to support it blind.
                 return Err(Error::Unsupported(
                     "Metal Op::MoeSharedExpertAdd (qwen35moe shared expert) not yet implemented"
+                        .into(),
+                ));
+            }
+            Op::GatedRmsNorm { .. } => {
+                // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — landed on
+                // CPU + Vulkan only so far (`Capabilities::gated_rmsnorm` is false here, so the
+                // runner never emits this for Metal); fails loudly rather than pretending.
+                return Err(Error::Unsupported(
+                    "Metal Op::GatedRmsNorm (qwen35 DeltaNet z-gate fusion) not yet implemented"
                         .into(),
                 ));
             }

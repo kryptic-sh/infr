@@ -1025,6 +1025,7 @@ const ATTN_PV_WARP_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/
 const ATTN_PV_REDUCE_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_pv_reduce.spv"));
 const RMSNORM_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm.spv"));
+const RMSNORM_GATE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rmsnorm_gate.spv"));
 const DELTANET_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet.spv"));
 const DELTANET_CHUNKED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_chunked.spv"));
@@ -1229,6 +1230,13 @@ pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
     RMSNORM_SPV.get_or_init(|| spv_words(RMSNORM_SPV_BYTES))
+}
+/// SPIR-V for the fused per-head RMSNorm + SiLU gate multiply (`rmsnorm.comp`'s -DGATE build,
+/// `Op::GatedRmsNorm`) — the qwen35 DeltaNet z-gate, one dispatch instead of `rmsnorm`+`silu_mul`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rmsnorm_gate_spv() -> &'static [u32] {
+    static RMSNORM_GATE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    RMSNORM_GATE_SPV.get_or_init(|| spv_words(RMSNORM_GATE_SPV_BYTES))
 }
 /// SPIR-V for the 256-thread subgroup row-softmax (`y=softmax(x*scale)`). Used by the recorder's
 /// `softmax` (diffusion-gemma's in-graph self-conditioning).

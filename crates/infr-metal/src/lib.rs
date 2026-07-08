@@ -242,6 +242,10 @@ impl Backend for MetalBackend {
             // draft loop keeps the host `top1_softmax` logits-download path on Metal. See the
             // Op::ArgmaxProb exec arm's Unsupported note.
             argmax_prob: false,
+            // No fused rmsnorm+gate kernel yet (Vulkan-only so far, qwen35 decode-fusion
+            // campaign) — the runner keeps the split QkNorm→GatedAct pair on Metal. See the
+            // Op::GatedRmsNorm exec arm's Unsupported note.
+            gated_rmsnorm: false,
         }
     }
 

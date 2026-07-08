@@ -1893,6 +1893,41 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Fused per-head RMSNorm + SiLU gate multiply: `y[i] = rmsnorm(x)[i] * silu(z[i])`, one
+    /// workgroup per (row, head) — `rmsnorm.comp`'s -DGATE build (`Op::GatedRmsNorm`, qwen35
+    /// DeltaNet z-gate). Same reduction as `rmsnorm`; `z` must be the SAME shape/layout as `x`
+    /// (`rows*dim` flat, indexed identically — see `Op::GatedRmsNorm`'s doc). Removes the
+    /// read-after-write barrier a separate `rmsnorm`→`silu_mul` pair would need (GatedAct reading
+    /// QkNorm's freshly-written output).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_gate(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        z: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        let k = self
+            .be
+            .kernel_sg("rmsnorm_gate", crate::gemm::rmsnorm_gate_spv(), 4, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        // Binding order MUST be x, w, z, y (matches the shader's -DGATE layout) — `y` last so the
+        // hazard tracker's `n_out=1` marks only the true output as written (see the shader's doc).
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(z), Self::vkb(y)],
+            1,
+            &push,
+            rows as u32, // one workgroup per row (cooperative reduction)
+        );
+    }
+
     /// Row-wise softmax: `y[r,:] = softmax(x[r,:] * scale)` over `dim` columns, one workgroup per
     /// row (diffusion-gemma's in-graph self-conditioning — see docs/DIFFUSIONGEMMA.md's Phase-B
     /// and the reference's `dg_canvas_embed`). Same 256-thread subgroup-reduction shape as

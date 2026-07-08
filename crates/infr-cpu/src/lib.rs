@@ -319,6 +319,11 @@ impl Backend for CpuBackend {
             gpu_sample: true,
             argmax_rows: true,
             argmax_prob: true,
+            // The interpreter implements `Op::GatedRmsNorm` (below) for direct-op parity tests,
+            // but leaves the capability false so the runner keeps emitting the split
+            // `QkNorm`→`GatedAct` pair here — no GPU barrier to save on a scalar interpreter, and
+            // it keeps the CPU oracle's op sequence matching the pre-fusion baseline.
+            gated_rmsnorm: false,
         }
     }
 
@@ -491,6 +496,41 @@ impl Backend for CpuBackend {
                             let s = 1.0 / (ss + eps).sqrt();
                             for i in 0..hd {
                                 out[b + i] = xs[b + i] * s * ws[i];
+                            }
+                        }
+                    }
+                    vals[dst.0 as usize] = out;
+                }
+                // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate). Reduction
+                // structure is IDENTICAL to the `QkNorm` arm above (bit-stable normalization); the
+                // gate multiply is the extra elementwise step `GatedAct(Silu)` would otherwise do
+                // as a second op.
+                Op::GatedRmsNorm {
+                    x,
+                    weight: w,
+                    gate,
+                    dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                    eps,
+                } => {
+                    let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
+                    let xs = &vals[x.0 as usize];
+                    let zs = &vals[gate.0 as usize];
+                    let ws = weight(w);
+                    let mut out = vec![0f32; rows * nh * hd];
+                    for r in 0..rows {
+                        for h in 0..nh {
+                            let b = (r * nh + h) * hd;
+                            let ss: f32 =
+                                (0..hd).map(|i| xs[b + i] * xs[b + i]).sum::<f32>() / hd as f32;
+                            let s = 1.0 / (ss + eps).sqrt();
+                            for i in 0..hd {
+                                let normed = xs[b + i] * s * ws[i];
+                                let zv = zs[b + i];
+                                let silu = zv / (1.0 + (-zv).exp());
+                                out[b + i] = normed * silu;
                             }
                         }
                     }

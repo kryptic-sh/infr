@@ -142,6 +142,30 @@ pub enum Op {
         head_dim: u32,
         eps: f32,
     },
+    /// Fused per-head RMSNorm + SiLU gate multiply: `QkNorm` immediately followed by an
+    /// `Op::GatedAct` (`Activation::Silu`) consuming QkNorm's own output (qwen35's DeltaNet
+    /// silu-gated RMSNorm — see docs/QWEN35.md). One pass: for each of `rows * n_head` heads,
+    /// `dst[i] = (x[i] * rms_scale * weight[i]) * silu(gate[i])` where `rms_scale =
+    /// 1/sqrt(mean_head(x^2) + eps)` and `i` ranges over the head's `head_dim` elements. `gate` is
+    /// a same-shape `[rows, n_head*head_dim]` buffer, indexed by the SAME flat element position as
+    /// `x` (not a separate per-head layout). In place when `dst == x`.
+    ///
+    /// Exists because `GatedAct` reading `QkNorm`'s freshly-written output is a real
+    /// read-after-write hazard (a pipeline barrier on GPU backends) — fusing the two into one
+    /// dispatch removes it. The rmsnorm reduction is bit-identical to standalone `QkNorm`; the
+    /// gate multiply is pure elementwise (no reassociation of the reduction). Backends without a
+    /// fused kernel advertise `Capabilities::gated_rmsnorm == false`; the runner keeps emitting
+    /// the split `QkNorm` → `GatedAct` pair for them.
+    GatedRmsNorm {
+        x: TensorId,
+        weight: TensorId,
+        gate: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+        eps: f32,
+    },
     /// NEOX RoPE over the first `rope_dim` of each head. `positions` is an i32 tensor of length
     /// `rows`. `freq_factors`, if present, divides per-pair angles (Gemma proportional RoPE).
     Rope {
@@ -468,6 +492,7 @@ impl Op {
             Op::Softmax { .. } => "Softmax",
             Op::Linear { .. } => "Linear",
             Op::QkNorm { .. } => "QkNorm",
+            Op::GatedRmsNorm { .. } => "GatedRmsNorm",
             Op::Rope { .. } => "Rope",
             Op::QkNormRope { .. } => "QkNormRope",
             Op::WriteKv { .. } => "WriteKv",

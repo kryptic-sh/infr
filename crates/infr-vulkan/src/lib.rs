@@ -55,6 +55,15 @@ fn be(s: impl std::fmt::Display) -> Error {
     Error::backend(s)
 }
 
+/// Process-global set of device names whose startup banner has already been printed, so the
+/// `[infr] GPU: …` line logs once per physical device even when several `VulkanBackend`s are
+/// constructed in one run (MTP builds a separate trunk + head backend on the same device).
+fn banner_seen() -> &'static Mutex<std::collections::HashSet<String>> {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
 /// Downcast `&dyn Buffer` → `&VkBuffer`.
 ///
 /// # Safety
@@ -630,19 +639,23 @@ impl VulkanBackend {
 
         // One-line device banner (stderr) — the first thing to check on a portability bug report:
         // which GPU was picked and which kernel tiers are live. `y`/`n` per capability + the
-        // subgroup range + shared-mem budget.
-        let yn = |b: bool| if b { "y" } else { "n" };
-        eprintln!(
-            "[infr] GPU: {} | coopmat:{} f16:{} i8dot:{} f8:{} subgroup:{}-{} shared:{}KB",
-            caps.name,
-            yn(caps.cooperative_matrix),
-            yn(caps.f16),
-            yn(caps.i8_dot),
-            yn(caps.f8_coopmat),
-            caps.subgroup_min,
-            caps.subgroup_max,
-            caps.max_shared_memory_bytes / 1024,
-        );
+        // subgroup range + shared-mem budget. Deduped by device name across the process: a single
+        // run can construct several `VulkanBackend`s (e.g. MTP builds a separate trunk + head
+        // backend), and we want ONE banner per physical device, not one per backend instance.
+        if banner_seen().lock().unwrap().insert(caps.name.clone()) {
+            let yn = |b: bool| if b { "y" } else { "n" };
+            eprintln!(
+                "[infr] GPU: {} | coopmat:{} f16:{} i8dot:{} f8:{} subgroup:{}-{} shared:{}KB",
+                caps.name,
+                yn(caps.cooperative_matrix),
+                yn(caps.f16),
+                yn(caps.i8_dot),
+                yn(caps.f8_coopmat),
+                caps.subgroup_min,
+                caps.subgroup_max,
+                caps.max_shared_memory_bytes / 1024,
+            );
+        }
 
         // ── gpu-allocator ──────────────────────────────────────────────────────
         let allocator = Allocator::new(&AllocatorCreateDesc {

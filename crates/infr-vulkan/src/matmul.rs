@@ -125,6 +125,16 @@ impl VulkanBackend {
                 )
                 .map_err(|(_, e)| be(format!("create_compute_pipelines: {e}")))?[0]
         };
+        // A driver can return VK_SUCCESS with a VK_NULL_HANDLE pipeline (some ICDs use this to
+        // signal a per-pipeline compile failure inside an otherwise-successful batch call). Using
+        // that handle in a later vkCmdBindPipeline/vkCmdDispatch is how the segfault manifested —
+        // check here and fail with a clear error instead of dereferencing garbage downstream.
+        if pipeline == vk::Pipeline::null() {
+            return Err(be(
+                "create_compute_pipelines: driver returned VK_SUCCESS with a null pipeline handle \
+                 (matmul_f32)",
+            ));
+        }
 
         // ── descriptor pool + set ──────────────────────────────────────────────
         let pool_sizes = [vk::DescriptorPoolSize {

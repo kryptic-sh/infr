@@ -91,16 +91,31 @@ pub(crate) fn make_compute_kernel(
             .push_next(&mut req_sz);
     }
     let pipeline = unsafe {
-        device
-            .create_compute_pipelines(
-                pcache, // disk-persisted device cache (see pcache.rs); null = caching off
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(pipeline_layout)],
-                None,
-            )
-            .expect("pipeline")[0]
-    };
+        device.create_compute_pipelines(
+            pcache, // disk-persisted device cache (see pcache.rs); null = caching off
+            &[vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(pipeline_layout)],
+            None,
+        )
+    }
+    .unwrap_or_else(|(_, e)| {
+        panic!(
+            "create_compute_pipelines failed for kernel {name:?}: {e} — a device whose \
+             coopmat/subgroup config doesn't match this kernel should have been filtered out by \
+             capability detection before reaching here"
+        )
+    })[0];
+    // A driver can return VK_SUCCESS with a VK_NULL_HANDLE pipeline (observed as the root cause of
+    // a segfault on Intel/Mesa ANV: a coopmat pipeline whose tile size the device doesn't support).
+    // Binding/dispatching that handle later is the actual crash — fail loudly HERE instead, with
+    // the offending kernel named, rather than deref garbage downstream.
+    assert!(
+        pipeline != vk::Pipeline::null(),
+        "create_compute_pipelines returned VK_SUCCESS with a null pipeline handle for kernel \
+         {name:?} — likely an unsupported coopmat/subgroup config that slipped past capability \
+         detection"
+    );
 
     let pool_sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::STORAGE_BUFFER,

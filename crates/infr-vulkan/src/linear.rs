@@ -283,16 +283,22 @@ pub(crate) fn create_linear_kernel(
         .module(shader)
         .name(entry);
     let pipeline = unsafe {
-        device
-            .create_compute_pipelines(
-                pcache, // disk-persisted device cache (see pcache.rs)
-                &[vk::ComputePipelineCreateInfo::default()
-                    .stage(stage)
-                    .layout(pipeline_layout)],
-                None,
-            )
-            .expect("create linear pipeline")[0]
-    };
+        device.create_compute_pipelines(
+            pcache, // disk-persisted device cache (see pcache.rs)
+            &[vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(pipeline_layout)],
+            None,
+        )
+    }
+    .unwrap_or_else(|(_, e)| panic!("create_compute_pipelines failed for linear kernel: {e}"))[0];
+    // See ops.rs::make_compute_kernel for why this is checked explicitly: a driver can return
+    // VK_SUCCESS with a null pipeline handle, and using it later is the actual crash.
+    assert!(
+        pipeline != vk::Pipeline::null(),
+        "create_compute_pipelines returned VK_SUCCESS with a null pipeline handle for the linear \
+         kernel"
+    );
 
     // Pool holds one set; we reset + reallocate it each call (single-stream gen).
     let pool_sizes = [vk::DescriptorPoolSize {

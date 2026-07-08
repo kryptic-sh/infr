@@ -514,37 +514,73 @@ impl VulkanBackend {
         let has_coop_ext_feat = has_coop_matrix && coopmat_feat.cooperative_matrix != 0;
 
         // Enumerate the device's cooperative-matrix configs ONCE — the AUTHORITATIVE source for
-        // which component types the matrix unit accepts. Each config lists a/b/c/result types; the
-        // ext's presence alone tells us nothing about them. Empty when the ext/feature is absent.
-        // Extract just the (a_type, b_type) pairs (Copy) — the returned structs borrow the loader
-        // `cm`, so we can't let them outlive this block.
-        let coopmat_configs: Vec<(vk::ComponentTypeKHR, vk::ComponentTypeKHR)> =
-            if has_coop_ext_feat {
-                let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
-                unsafe { cm.get_physical_device_cooperative_matrix_properties(physical_device) }
-                    .map(|v| v.iter().map(|p| (p.a_type, p.b_type)).collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-        // Diagnostic: dump every enumerated (a_type, b_type) raw value — the definitive list of what
-        // the matrix unit accepts, for bringing up new HW (RDNA4 fp8, bf16) and sanity-checking the
-        // per-type detection below. `INFR_DEBUG_COOPMAT=1`.
+        // which component types AND tile dimensions the matrix unit accepts. Each config lists
+        // m/n/k size + a/b/c/result types; the ext's presence alone tells us nothing about them.
+        // Empty when the ext/feature is absent. Extract a Copy tuple — the returned structs borrow
+        // the loader `cm`, so we can't let them outlive this block.
+        type CoopmatConfig = (
+            u32,
+            u32,
+            u32,
+            vk::ComponentTypeKHR,
+            vk::ComponentTypeKHR,
+            vk::ComponentTypeKHR,
+            vk::ComponentTypeKHR,
+        );
+        let coopmat_configs: Vec<CoopmatConfig> = if has_coop_ext_feat {
+            let cm = ash::khr::cooperative_matrix::Instance::new(&entry, &instance);
+            unsafe { cm.get_physical_device_cooperative_matrix_properties(physical_device) }
+                .map(|v| {
+                    v.iter()
+                        .map(|p| {
+                            (
+                                p.m_size,
+                                p.n_size,
+                                p.k_size,
+                                p.a_type,
+                                p.b_type,
+                                p.c_type,
+                                p.result_type,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Diagnostic: dump every enumerated (M,N,K,aType,bType,cType,resultType) — the definitive
+        // list of what the matrix unit accepts, for bringing up new HW (RDNA4 fp8, bf16, Intel's
+        // 8/8/16 tiles) and sanity-checking the per-type/per-dim detection below.
+        // `INFR_DEBUG_COOPMAT=1`.
         if std::env::var("INFR_DEBUG_COOPMAT").is_ok() {
-            let raws: Vec<(i32, i32)> = coopmat_configs
+            let raws: Vec<(u32, u32, u32, i32, i32, i32, i32)> = coopmat_configs
                 .iter()
-                .map(|&(a, b)| (a.as_raw(), b.as_raw()))
+                .map(|&(m, n, k, a, b, c, r)| {
+                    (m, n, k, a.as_raw(), b.as_raw(), c.as_raw(), r.as_raw())
+                })
                 .collect();
-            eprintln!("[infr] coopmat configs (a_raw,b_raw): {raws:?}");
+            eprintln!(
+                "[infr] coopmat configs (M,N,K,aType_raw,bType_raw,cType_raw,resultType_raw): \
+                 {raws:?}"
+            );
         }
-        // f16 coopmat: a config with f16 A AND B operands (result f16 or f32). THE gate for the
-        // current production GEMM (any weight dtype dequants to f16 in-shader before the multiply).
-        // Derived from the enumeration, not assumed from the ext bit — every real coopmat impl ships
-        // f16, but check it. `has_coop_matrix` keeps its downstream name (ext-enable, feature chain,
-        // caps.f16_coopmat).
+        // f16 coopmat: a config with f16 A AND B operands (accumulator/result f16 or f32) AND the
+        // EXACT tile dims our coopmat shaders are hardcoded to: M=16, N=16, K=16 (every
+        // `coopmat<...,16,16,...>` declaration across gemm_coopmat*/gemm_warp/native_gemm*/attn_*
+        // /deltanet_prep). Component types alone are NOT sufficient — an Intel A770 (Mesa ANV)
+        // advertises f16×f16→f32 only at M=8,N=8,K=16; creating our 16x16x16 pipeline on such a
+        // device silently fails vkCreateComputePipelines (the segfault bug — the result wasn't
+        // checked, see `create_compute_pipeline` below). Requiring the dimension match here makes
+        // an unsupported device fall back to the scalar/f16 non-coopmat ladder instead of crashing.
+        // Derived from the enumeration, not assumed from the ext bit. `has_coop_matrix` keeps its
+        // downstream name (ext-enable, feature chain, caps.f16_coopmat).
         let f16c = vk::ComponentTypeKHR::FLOAT16;
-        let has_coop_matrix =
-            has_coop_ext_feat && coopmat_configs.iter().any(|&(a, b)| a == f16c && b == f16c);
+        const CMS_TILE: (u32, u32, u32) = (16, 16, 16); // M, N, K — matches every coopmat shader
+        let has_coop_matrix = has_coop_ext_feat
+            && coopmat_configs
+                .iter()
+                .any(|&(m, n, k, a, b, _, _)| (m, n, k) == CMS_TILE && a == f16c && b == f16c);
         // f8 coopmat components: any config with an operand in the extension-added ComponentTypeKHR
         // range (`as_raw() >= 1e9` — all CORE types are 0..=10: FLOAT16/FLOAT32/SINT8/…). fp8
         // (E4M3/E5M2) and any newer matrix type live there. Avoids hardcoding a specific fp8 enum
@@ -553,9 +589,9 @@ impl VulkanBackend {
         // Also requires the float8 storage ext.
         let has_f8_coopmat = has_coop_ext_feat
             && has_f8_ext
-            && coopmat_configs
-                .iter()
-                .any(|&(a, b)| a.as_raw() >= 1_000_000_000 || b.as_raw() >= 1_000_000_000);
+            && coopmat_configs.iter().any(|&(_, _, _, a, b, _, _)| {
+                a.as_raw() >= 1_000_000_000 || b.as_raw() >= 1_000_000_000
+            });
 
         // ── force-disable capabilities for fallback-path testing on capable HW ──
         // These env knobs drop a DETECTED capability so the next kernel tier down is exercised on a
@@ -590,6 +626,18 @@ impl VulkanBackend {
         if has_push_descriptor {
             ext_ptrs.push(c"VK_KHR_push_descriptor".as_ptr());
         }
+        // The int8 dp4a decode GEMVs (native_mmv.comp, native_mmv_mrow.comp, native_mmv_id_q4k.comp,
+        // mul_mat_vec_q.comp's dotPacked builtins) compile to SPIR-V with the DotProduct /
+        // DotProductInput4x8BitPacked capabilities, which VUID-VkShaderModuleCreateInfo-pCode-08740
+        // requires `shaderIntegerDotProduct` to be enabled on the DEVICE for — not just detected.
+        // This was previously probed into `caps.i8_dot` (detection-only, per an now-stale comment
+        // claiming no shader used the builtin yet) but never actually enabled, so vkCreateShaderModule
+        // for those kernels violated the VUID on any driver that validates it (reproduced on the
+        // 7900 XTX under validation layers with an 8B model, which is wide enough to select the mmv
+        // dp4a tier — the small model's shapes never hit it, hence the bug staying latent).
+        if has_i8_dot {
+            ext_ptrs.push(c"VK_KHR_shader_integer_dot_product".as_ptr());
+        }
         // A portability (layered) device REQUIRES VK_KHR_portability_subset to be enabled when
         // it advertises it (Vulkan valid-usage rule); MoltenVK does.
         if has_ext(c"VK_KHR_portability_subset") {
@@ -622,6 +670,9 @@ impl VulkanBackend {
         let mut sgsize_ci = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
             .subgroup_size_control(has_sgsize)
             .compute_full_subgroups(has_full_sg);
+        // Chained below only when `has_i8_dot` — see the ext_ptrs comment above.
+        let mut intdot_ci = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
+            .shader_integer_dot_product(true);
 
         let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_ci))
@@ -631,6 +682,9 @@ impl VulkanBackend {
             .push_next(&mut storage8_ci)
             .push_next(&mut memmodel_ci)
             .push_next(&mut sgsize_ci);
+        if has_i8_dot {
+            device_ci = device_ci.push_next(&mut intdot_ci);
+        }
         if has_coop_matrix {
             device_ci = device_ci.push_next(&mut coopmat_ci);
         }

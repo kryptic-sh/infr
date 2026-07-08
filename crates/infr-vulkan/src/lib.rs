@@ -527,6 +527,16 @@ impl VulkanBackend {
             } else {
                 Vec::new()
             };
+        // Diagnostic: dump every enumerated (a_type, b_type) raw value — the definitive list of what
+        // the matrix unit accepts, for bringing up new HW (RDNA4 fp8, bf16) and sanity-checking the
+        // per-type detection below. `INFR_DEBUG_COOPMAT=1`.
+        if std::env::var("INFR_DEBUG_COOPMAT").is_ok() {
+            let raws: Vec<(i32, i32)> = coopmat_configs
+                .iter()
+                .map(|&(a, b)| (a.as_raw(), b.as_raw()))
+                .collect();
+            eprintln!("[infr] coopmat configs (a_raw,b_raw): {raws:?}");
+        }
         // f16 coopmat: a config with f16 A AND B operands (result f16 or f32). THE gate for the
         // current production GEMM (any weight dtype dequants to f16 in-shader before the multiply).
         // Derived from the enumeration, not assumed from the ext bit — every real coopmat impl ships

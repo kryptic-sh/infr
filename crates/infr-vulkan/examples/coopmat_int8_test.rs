@@ -43,27 +43,120 @@ const INT8_VARIANTS: &[Variant] = &[
     // 1. Cleanest mirror of the production f16 coopmat kernel's setup, varied only in component
     //    types: pure SINT8xSINT8->SINT32, subgroup pinned 32 (RDNA3 coopmat is wave32), A
     //    RowMajor / B ColMajor (matches native_gemm_warp.comp), non-saturating.
-    Variant { name: "baseline", a_glsl: "int8_t", b_glsl: "int8_t", a_row_major: true, b_row_major: false, saturating: false, subgroup_pin: Some(32), local_size: 32 },
+    Variant {
+        name: "baseline",
+        a_glsl: "int8_t",
+        b_glsl: "int8_t",
+        a_row_major: true,
+        b_row_major: false,
+        saturating: false,
+        subgroup_pin: Some(32),
+        local_size: 32,
+    },
     // 2/3. The MIXED-sign config the commit specifically named (SINT8xUINT8), both operand orders.
-    Variant { name: "mixed_a_sint_b_uint", a_glsl: "int8_t", b_glsl: "uint8_t", a_row_major: true, b_row_major: false, saturating: false, subgroup_pin: Some(32), local_size: 32 },
-    Variant { name: "mixed_a_uint_b_sint", a_glsl: "uint8_t", b_glsl: "int8_t", a_row_major: true, b_row_major: false, saturating: false, subgroup_pin: Some(32), local_size: 32 },
+    Variant {
+        name: "mixed_a_sint_b_uint",
+        a_glsl: "int8_t",
+        b_glsl: "uint8_t",
+        a_row_major: true,
+        b_row_major: false,
+        saturating: false,
+        subgroup_pin: Some(32),
+        local_size: 32,
+    },
+    Variant {
+        name: "mixed_a_uint_b_sint",
+        a_glsl: "uint8_t",
+        b_glsl: "int8_t",
+        a_row_major: true,
+        b_row_major: false,
+        saturating: false,
+        subgroup_pin: Some(32),
+        local_size: 32,
+    },
     // 4. Subgroup size 64 instead of the wave32 pin.
-    Variant { name: "sg64", a_glsl: "int8_t", b_glsl: "int8_t", a_row_major: true, b_row_major: false, saturating: false, subgroup_pin: Some(64), local_size: 64 },
+    Variant {
+        name: "sg64",
+        a_glsl: "int8_t",
+        b_glsl: "int8_t",
+        a_row_major: true,
+        b_row_major: false,
+        saturating: false,
+        subgroup_pin: Some(64),
+        local_size: 64,
+    },
     // 5. No requiredSubgroupSize pin at all (production always pins for its coopmat kernels).
-    Variant { name: "sg_unpinned", a_glsl: "int8_t", b_glsl: "int8_t", a_row_major: true, b_row_major: false, saturating: false, subgroup_pin: None, local_size: 32 },
+    Variant {
+        name: "sg_unpinned",
+        a_glsl: "int8_t",
+        b_glsl: "int8_t",
+        a_row_major: true,
+        b_row_major: false,
+        saturating: false,
+        subgroup_pin: None,
+        local_size: 32,
+    },
     // 6/7. Layout variations (both RowMajor, both ColMajor) vs the baseline's Row/Col mix.
-    Variant { name: "layout_rowrow", a_glsl: "int8_t", b_glsl: "int8_t", a_row_major: true, b_row_major: true, saturating: false, subgroup_pin: Some(32), local_size: 32 },
-    Variant { name: "layout_colcol", a_glsl: "int8_t", b_glsl: "int8_t", a_row_major: false, b_row_major: false, saturating: false, subgroup_pin: Some(32), local_size: 32 },
+    Variant {
+        name: "layout_rowrow",
+        a_glsl: "int8_t",
+        b_glsl: "int8_t",
+        a_row_major: true,
+        b_row_major: true,
+        saturating: false,
+        subgroup_pin: Some(32),
+        local_size: 32,
+    },
+    Variant {
+        name: "layout_colcol",
+        a_glsl: "int8_t",
+        b_glsl: "int8_t",
+        a_row_major: false,
+        b_row_major: false,
+        saturating: false,
+        subgroup_pin: Some(32),
+        local_size: 32,
+    },
     // 8. Saturating accumulation variant (gl_MatrixOperandsSaturatingAccumulation).
-    Variant { name: "saturating", a_glsl: "int8_t", b_glsl: "int8_t", a_row_major: true, b_row_major: false, saturating: true, subgroup_pin: Some(32), local_size: 32 },
+    Variant {
+        name: "saturating",
+        a_glsl: "int8_t",
+        b_glsl: "int8_t",
+        a_row_major: true,
+        b_row_major: false,
+        saturating: true,
+        subgroup_pin: Some(32),
+        local_size: 32,
+    },
     // 9. Pure UINT8xUINT8->SINT32 (also enumerated by coopmat_probe).
-    Variant { name: "uint_uint", a_glsl: "uint8_t", b_glsl: "uint8_t", a_row_major: true, b_row_major: false, saturating: false, subgroup_pin: Some(32), local_size: 32 },
+    Variant {
+        name: "uint_uint",
+        a_glsl: "uint8_t",
+        b_glsl: "uint8_t",
+        a_row_major: true,
+        b_row_major: false,
+        saturating: false,
+        subgroup_pin: Some(32),
+        local_size: 32,
+    },
 ];
 
 fn gen_int8_shader(v: &Variant) -> String {
-    let a_layout = if v.a_row_major { "gl_CooperativeMatrixLayoutRowMajor" } else { "gl_CooperativeMatrixLayoutColumnMajor" };
-    let b_layout = if v.b_row_major { "gl_CooperativeMatrixLayoutRowMajor" } else { "gl_CooperativeMatrixLayoutColumnMajor" };
-    let sat_arg = if v.saturating { ", gl_MatrixOperandsSaturatingAccumulation" } else { "" };
+    let a_layout = if v.a_row_major {
+        "gl_CooperativeMatrixLayoutRowMajor"
+    } else {
+        "gl_CooperativeMatrixLayoutColumnMajor"
+    };
+    let b_layout = if v.b_row_major {
+        "gl_CooperativeMatrixLayoutRowMajor"
+    } else {
+        "gl_CooperativeMatrixLayoutColumnMajor"
+    };
+    let sat_arg = if v.saturating {
+        ", gl_MatrixOperandsSaturatingAccumulation"
+    } else {
+        ""
+    };
     format!(
         r#"#version 460
 #extension GL_KHR_cooperative_matrix : require
@@ -236,21 +329,34 @@ fn init_ctx() -> VkCtx {
         let entry = ash::Entry::load().expect("ash::Entry::load");
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let instance = entry
-            .create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None)
+            .create_instance(
+                &vk::InstanceCreateInfo::default().application_info(&app),
+                None,
+            )
             .expect("create_instance");
 
-        let pdevices = instance.enumerate_physical_devices().expect("enumerate_physical_devices");
+        let pdevices = instance
+            .enumerate_physical_devices()
+            .expect("enumerate_physical_devices");
         assert!(!pdevices.is_empty(), "no Vulkan physical devices");
         // Prefer discrete GPU — same selection rule as production `VulkanBackend::new()`, so this
         // targets the RX 7900 XTX even on a box with an APU also enumerated.
         let pdevice = pdevices
             .iter()
             .copied()
-            .find(|&pd| instance.get_physical_device_properties(pd).device_type == vk::PhysicalDeviceType::DISCRETE_GPU)
+            .find(|&pd| {
+                instance.get_physical_device_properties(pd).device_type
+                    == vk::PhysicalDeviceType::DISCRETE_GPU
+            })
             .unwrap_or(pdevices[0]);
-        let dev_name = CStr::from_ptr(instance.get_physical_device_properties(pdevice).device_name.as_ptr())
-            .to_string_lossy()
-            .into_owned();
+        let dev_name = CStr::from_ptr(
+            instance
+                .get_physical_device_properties(pdevice)
+                .device_name
+                .as_ptr(),
+        )
+        .to_string_lossy()
+        .into_owned();
 
         let qf_props = instance.get_physical_device_queue_family_properties(pdevice);
         let qfi = qf_props
@@ -276,12 +382,30 @@ fn init_ctx() -> VkCtx {
             .push_next(&mut s8_feat)
             .push_next(&mut s16_feat);
         instance.get_physical_device_features2(pdevice, &mut feat2);
-        assert!(cm_feat.cooperative_matrix != 0, "{dev_name}: no cooperativeMatrix feature");
-        assert!(f16_feat.shader_int8 != 0, "{dev_name}: no shaderInt8 feature");
-        assert!(f16_feat.shader_float16 != 0, "{dev_name}: no shaderFloat16 feature");
-        assert!(mm_feat.vulkan_memory_model != 0, "{dev_name}: no vulkanMemoryModel feature");
-        assert!(s8_feat.storage_buffer8_bit_access != 0, "{dev_name}: no storageBuffer8BitAccess");
-        assert!(s16_feat.storage_buffer16_bit_access != 0, "{dev_name}: no storageBuffer16BitAccess");
+        assert!(
+            cm_feat.cooperative_matrix != 0,
+            "{dev_name}: no cooperativeMatrix feature"
+        );
+        assert!(
+            f16_feat.shader_int8 != 0,
+            "{dev_name}: no shaderInt8 feature"
+        );
+        assert!(
+            f16_feat.shader_float16 != 0,
+            "{dev_name}: no shaderFloat16 feature"
+        );
+        assert!(
+            mm_feat.vulkan_memory_model != 0,
+            "{dev_name}: no vulkanMemoryModel feature"
+        );
+        assert!(
+            s8_feat.storage_buffer8_bit_access != 0,
+            "{dev_name}: no storageBuffer8BitAccess"
+        );
+        assert!(
+            s16_feat.storage_buffer16_bit_access != 0,
+            "{dev_name}: no storageBuffer16BitAccess"
+        );
 
         let ext_ptrs = [
             c"VK_KHR_cooperative_matrix".as_ptr(),
@@ -291,18 +415,23 @@ fn init_ctx() -> VkCtx {
         let mut shader_f16_ci = vk::PhysicalDeviceShaderFloat16Int8Features::default()
             .shader_float16(true)
             .shader_int8(true);
-        let mut s8_ci = vk::PhysicalDevice8BitStorageFeatures::default().storage_buffer8_bit_access(true);
-        let mut s16_ci = vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
+        let mut s8_ci =
+            vk::PhysicalDevice8BitStorageFeatures::default().storage_buffer8_bit_access(true);
+        let mut s16_ci =
+            vk::PhysicalDevice16BitStorageFeatures::default().storage_buffer16_bit_access(true);
         let mut mm_ci = vk::PhysicalDeviceVulkanMemoryModelFeatures::default()
             .vulkan_memory_model(true)
             .vulkan_memory_model_device_scope(true);
-        let mut cm_ci = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        let mut cm_ci =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut sg_ci = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
             .subgroup_size_control(true)
             .compute_full_subgroups(true);
 
         let priorities = [1.0f32];
-        let queue_ci = vk::DeviceQueueCreateInfo::default().queue_family_index(qfi).queue_priorities(&priorities);
+        let queue_ci = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(qfi)
+            .queue_priorities(&priorities);
         let device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_ci))
             .enabled_extension_names(&ext_ptrs)
@@ -312,7 +441,9 @@ fn init_ctx() -> VkCtx {
             .push_next(&mut mm_ci)
             .push_next(&mut cm_ci)
             .push_next(&mut sg_ci);
-        let device = instance.create_device(pdevice, &device_ci, None).expect("create_device");
+        let device = instance
+            .create_device(pdevice, &device_ci, None)
+            .expect("create_device");
         let queue = device.get_device_queue(qfi, 0);
         let cmd_pool = device
             .create_command_pool(
@@ -325,7 +456,14 @@ fn init_ctx() -> VkCtx {
         let mem_props = instance.get_physical_device_memory_properties(pdevice);
 
         eprintln!("[ctx] device = {dev_name}");
-        VkCtx { entry, instance, device, queue, mem_props, cmd_pool }
+        VkCtx {
+            entry,
+            instance,
+            device,
+            queue,
+            mem_props,
+            cmd_pool,
+        }
     }
 }
 
@@ -343,13 +481,25 @@ unsafe fn alloc_host_buffer(ctx: &VkCtx, size: u64) -> (vk::Buffer, vk::DeviceMe
     let req = ctx.device.get_buffer_memory_requirements(buf);
     let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     let mt = (0..ctx.mem_props.memory_type_count)
-        .find(|&i| (req.memory_type_bits & (1 << i)) != 0 && ctx.mem_props.memory_types[i as usize].property_flags.contains(want))
+        .find(|&i| {
+            (req.memory_type_bits & (1 << i)) != 0
+                && ctx.mem_props.memory_types[i as usize]
+                    .property_flags
+                    .contains(want)
+        })
         .expect("no host-visible+coherent memory type");
     let mem = ctx
         .device
-        .allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt), None)
+        .allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mt),
+            None,
+        )
         .expect("allocate_memory");
-    ctx.device.bind_buffer_memory(buf, mem, 0).expect("bind_buffer_memory");
+    ctx.device
+        .bind_buffer_memory(buf, mem, 0)
+        .expect("bind_buffer_memory");
     let ptr = ctx
         .device
         .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
@@ -397,11 +547,17 @@ unsafe fn dispatch_one(
         .collect();
     let ds_layout = ctx
         .device
-        .create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)
+        .create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+            None,
+        )
         .expect("create_descriptor_set_layout");
     let pipeline_layout = ctx
         .device
-        .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&ds_layout)), None)
+        .create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&ds_layout)),
+            None,
+        )
         .expect("create_pipeline_layout");
 
     let entry_name = c"main";
@@ -412,11 +568,15 @@ unsafe fn dispatch_one(
         .name(entry_name);
     if let Some(sz) = subgroup_pin {
         req_sz = req_sz.required_subgroup_size(sz);
-        stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut req_sz);
+        stage = stage
+            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
+            .push_next(&mut req_sz);
     }
     let pipeline = match ctx.device.create_compute_pipelines(
         vk::PipelineCache::null(),
-        &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout)],
+        &[vk::ComputePipelineCreateInfo::default()
+            .stage(stage)
+            .layout(pipeline_layout)],
         None,
     ) {
         Ok(p) => {
@@ -436,10 +596,18 @@ unsafe fn dispatch_one(
     // Poison C before dispatch so a no-op / early-exit shader can't look "correct" by accident.
     std::ptr::write_bytes(c_ptr, 0xAA, c_size);
 
-    let pool_sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 3 }];
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: 3,
+    }];
     let desc_pool = ctx
         .device
-        .create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&pool_sizes), None)
+        .create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes),
+            None,
+        )
         .expect("create_descriptor_pool");
     let ds = ctx
         .device
@@ -450,9 +618,18 @@ unsafe fn dispatch_one(
         )
         .expect("allocate_descriptor_sets")[0];
     let infos = [
-        vk::DescriptorBufferInfo::default().buffer(a_buf).offset(0).range(vk::WHOLE_SIZE),
-        vk::DescriptorBufferInfo::default().buffer(b_buf).offset(0).range(vk::WHOLE_SIZE),
-        vk::DescriptorBufferInfo::default().buffer(c_buf).offset(0).range(vk::WHOLE_SIZE),
+        vk::DescriptorBufferInfo::default()
+            .buffer(a_buf)
+            .offset(0)
+            .range(vk::WHOLE_SIZE),
+        vk::DescriptorBufferInfo::default()
+            .buffer(b_buf)
+            .offset(0)
+            .range(vk::WHOLE_SIZE),
+        vk::DescriptorBufferInfo::default()
+            .buffer(c_buf)
+            .offset(0)
+            .range(vk::WHOLE_SIZE),
     ];
     let writes: Vec<_> = (0..3usize)
         .map(|i| {
@@ -475,15 +652,31 @@ unsafe fn dispatch_one(
         )
         .expect("allocate_command_buffers")[0];
     ctx.device
-        .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+        .begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
         .expect("begin_command_buffer");
-    ctx.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
     ctx.device
-        .cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, &[ds], &[]);
+        .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+    ctx.device.cmd_bind_descriptor_sets(
+        cmd,
+        vk::PipelineBindPoint::COMPUTE,
+        pipeline_layout,
+        0,
+        &[ds],
+        &[],
+    );
     ctx.device.cmd_dispatch(cmd, wg.0, wg.1, wg.2);
-    ctx.device.end_command_buffer(cmd).expect("end_command_buffer");
+    ctx.device
+        .end_command_buffer(cmd)
+        .expect("end_command_buffer");
 
-    let fence = ctx.device.create_fence(&vk::FenceCreateInfo::default(), None).expect("create_fence");
+    let fence = ctx
+        .device
+        .create_fence(&vk::FenceCreateInfo::default(), None)
+        .expect("create_fence");
     let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
     let t0 = Instant::now();
     if let Err(e) = ctx.device.queue_submit(ctx.queue, &[submit], fence) {
@@ -537,7 +730,10 @@ fn cpu_matmul16(a: &dyn Fn(usize, usize) -> i32, b: &dyn Fn(usize, usize) -> i32
 
 fn print_result(variant: &str, outcome: &Outcome, correct: Option<bool>) {
     let (status, extra) = match outcome {
-        Outcome::Completed(d) => ("COMPLETED", format!("elapsed_ms={:.2}", d.as_secs_f64() * 1000.0)),
+        Outcome::Completed(d) => (
+            "COMPLETED",
+            format!("elapsed_ms={:.2}", d.as_secs_f64() * 1000.0),
+        ),
         Outcome::Timeout => ("TIMEOUT", String::new()),
         Outcome::DeviceLost(e) => ("DEVICE_LOST", format!("vk_result={e:?}")),
         Outcome::PipelineCreateFailed(e) => ("PIPELINE_CREATE_FAILED", format!("vk_result={e:?}")),
@@ -582,10 +778,16 @@ fn main() {
                 std::process::exit(4);
             }
         };
-        let (outcome, data) = unsafe { dispatch_one(&ctx, &spv, None, &a_bytes, &b_bytes, 64 * 4, (1, 1, 1)) };
+        let (outcome, data) =
+            unsafe { dispatch_one(&ctx, &spv, None, &a_bytes, &b_bytes, 64 * 4, (1, 1, 1)) };
         let correct = data.map(|bytes| {
-            let c: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
-            c.iter().zip(a.iter().zip(b.iter())).all(|(cv, (av, bv))| (*cv - (av + bv)).abs() < 1e-6)
+            let c: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            c.iter()
+                .zip(a.iter().zip(b.iter()))
+                .all(|(cv, (av, bv))| (*cv - (av + bv)).abs() < 1e-6)
         });
         print_result("plain_add", &outcome, correct);
         std::process::exit(match outcome {
@@ -600,7 +802,9 @@ fn main() {
         // A[i][k] = (i+k)%5, B[k][j]=(k+j)%3, small values exact in f16.
         let a_get = |i: usize, k: usize| ((i + k) % 5) as i32;
         let b_get = |k: usize, j: usize| ((k + j) % 3) as i32;
-        let a16: Vec<half::f16> = (0..16).flat_map(|i| (0..16).map(move |k| half::f16::from_f32(a_get(i, k) as f32))).collect();
+        let a16: Vec<half::f16> = (0..16)
+            .flat_map(|i| (0..16).map(move |k| half::f16::from_f32(a_get(i, k) as f32)))
+            .collect();
         // b16 packed ColumnMajor to match the shader's coopMatLoad layout: buf[j*16+k] = B[k][j].
         let mut b16_col = vec![half::f16::from_f32(0.0); 256];
         for k in 0..16 {
@@ -617,11 +821,26 @@ fn main() {
                 std::process::exit(4);
             }
         };
-        let (outcome, data) = unsafe { dispatch_one(&ctx, &spv, Some(32), &a_bytes, &b_bytes, 16 * 16 * 4, (1, 1, 1)) };
+        let (outcome, data) = unsafe {
+            dispatch_one(
+                &ctx,
+                &spv,
+                Some(32),
+                &a_bytes,
+                &b_bytes,
+                16 * 16 * 4,
+                (1, 1, 1),
+            )
+        };
         let cpu_c = cpu_matmul16(&a_get, &b_get);
         let correct = data.map(|bytes| {
-            let c: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
-            c.iter().zip(cpu_c.iter()).all(|(gv, rv)| (*gv - (*rv as f32)).abs() < 1e-3)
+            let c: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            c.iter()
+                .zip(cpu_c.iter())
+                .all(|(gv, rv)| (*gv - (*rv as f32)).abs() < 1e-3)
         });
         print_result("f16_known_good", &outcome, correct);
         std::process::exit(match outcome {
@@ -656,7 +875,17 @@ fn main() {
                 std::process::exit(4);
             }
         };
-        let (outcome, data) = unsafe { dispatch_one(&ctx, &spv, Some(32), &a_bytes, &b_bytes, 16 * 16 * 4, (1, 1, 1)) };
+        let (outcome, data) = unsafe {
+            dispatch_one(
+                &ctx,
+                &spv,
+                Some(32),
+                &a_bytes,
+                &b_bytes,
+                16 * 16 * 4,
+                (1, 1, 1),
+            )
+        };
         let cpu_c = {
             let mut c = vec![0i32; 16 * 16];
             for i in 0..16 {
@@ -671,7 +900,10 @@ fn main() {
             c
         };
         let correct = data.map(|bytes| {
-            let c: Vec<i32> = bytes.chunks_exact(4).map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let c: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             c == cpu_c
         });
         print_result("looped_k", &outcome, correct);
@@ -707,7 +939,17 @@ fn main() {
                 std::process::exit(4);
             }
         };
-        let (outcome, data) = unsafe { dispatch_one(&ctx, &spv, Some(32), &a_bytes, &b_bytes, 32 * 32 * 4, (2, 2, 1)) };
+        let (outcome, data) = unsafe {
+            dispatch_one(
+                &ctx,
+                &spv,
+                Some(32),
+                &a_bytes,
+                &b_bytes,
+                32 * 32 * 4,
+                (2, 2, 1),
+            )
+        };
         let cpu_c = {
             let mut c = vec![0i32; 32 * 32];
             for i in 0..32 {
@@ -722,7 +964,10 @@ fn main() {
             c
         };
         let correct = data.map(|bytes| {
-            let c: Vec<i32> = bytes.chunks_exact(4).map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let c: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             c == cpu_c
         });
         print_result("multi_wg", &outcome, correct);
@@ -753,16 +998,32 @@ fn main() {
     let spv = match compile_glsl(&src, variant.name) {
         Ok(w) => w,
         Err(e) => {
-            println!("RESULT variant={} outcome=COMPILE_ERROR msg={:?}", variant.name, e);
+            println!(
+                "RESULT variant={} outcome=COMPILE_ERROR msg={:?}",
+                variant.name, e
+            );
             eprintln!("--- shader source ---\n{src}");
             std::process::exit(4);
         }
     };
 
-    let (outcome, data) = unsafe { dispatch_one(&ctx, &spv, variant.subgroup_pin, &a_bytes, &b_bytes, 16 * 16 * 4, (1, 1, 1)) };
+    let (outcome, data) = unsafe {
+        dispatch_one(
+            &ctx,
+            &spv,
+            variant.subgroup_pin,
+            &a_bytes,
+            &b_bytes,
+            16 * 16 * 4,
+            (1, 1, 1),
+        )
+    };
     let cpu_c = cpu_matmul16(&a_get, &b_get);
     let correct = data.map(|bytes| {
-        let c: Vec<i32> = bytes.chunks_exact(4).map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let c: Vec<i32> = bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         c == cpu_c
     });
     print_result(variant.name, &outcome, correct);

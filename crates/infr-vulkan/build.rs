@@ -615,6 +615,37 @@ fn main() {
             "native_gemm_mmq_q5k_xp",
             &["-DEXPERT_GRID"],
         ),
+        // BM=32 row-tile variants of the expert-grid GEMM (see matmul_mmq_experts' `n_used` doc):
+        // at small rows-per-expert (Qwen3.6-MoE's 256-expert pool averages ~16/expert at pp512)
+        // the default BM=64 tile is ~75% masked waste — a BM=32 tile halves that. Selected
+        // per-dispatch by the recorder based on the caller's actual avg rows/expert; qwen3-30B-A3B
+        // (128 experts, ~32/expert) still gets BM=64 by default at pp512, so this is additive, not
+        // a blanket swap.
+        (
+            "native_gemm_mmq_q4k",
+            "native_gemm_mmq_q4k_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q8_0",
+            "native_gemm_mmq_q8_0_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q5_0",
+            "native_gemm_mmq_q5_0_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q5k",
+            "native_gemm_mmq_q5k_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),

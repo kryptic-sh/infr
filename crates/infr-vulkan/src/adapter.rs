@@ -2245,6 +2245,7 @@ fn lower_op(
                     ne,
                     gu_width,
                     n_expert,
+                    n_used,
                 );
                 if let Some(ue) = ue {
                     // Split (qwen3moe): the up GEMM reads the same quantized activations and
@@ -2266,6 +2267,7 @@ fn lower_op(
                         ne,
                         nff,
                         n_expert,
+                        n_used,
                     );
                     rec.suppress_sync(false);
                     rec.silu_mul(
@@ -2318,6 +2320,7 @@ fn lower_op(
                     nff,
                     ne,
                     n_expert,
+                    n_used,
                 );
                 rec.moe_scatter_reduce(
                     pool[&ye].as_ref(),

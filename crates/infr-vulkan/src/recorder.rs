@@ -20,6 +20,14 @@ use super::{as_vk_buf, be, VulkanBackend};
 /// the shader's `NUM_ROWS`.
 const MMV_NUM_ROWS: u32 = 1;
 
+/// `matmul_mmq_experts`' BM=64 → BM=32 row-tile crossover, in average rows-per-expert
+/// (`rows·n_used/n_expert`). Below this, the BM=32 `_xp32` kernel wins (less masked-tile waste);
+/// at/above it BM=64 (default) wins. Picked from `moe_expert_grid_bound_bench`'s tile sweep —
+/// bumped past qwen3.6-MoE's pp512 avg (~16/expert) but below qwen3-30B-A3B's (~32/expert), so a
+/// deeper-context prefill that pushes avg rows/expert up for either model naturally slides back to
+/// BM=64 as the segments fill in.
+const MOE_EXPERT_SMALL_TILE_AVG_ROWS: usize = 24;
+
 /// Elements packed per u32 weight word for a given quant width (8 nibbles for q4, 4 bytes for q8).
 /// `None` ⇒ the subgroup GEMV has no specialization for this width; caller uses the WGSL fallback.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -4013,7 +4021,7 @@ impl<'a> Recorder<'a> {
 
     /// ALL experts' mmq GEMMs in ONE dispatch (`gl_WorkGroupID.y` = expert): activation rows are
     /// packed by expert (bucket layout, segment e = offsets[e]..+counts[e]); the weight bank is
-    /// indexed `w_base + e·stride`. Grid x covers the worst-case row tiles (`ceil(rows/64)` — the
+    /// indexed `w_base + e·stride`. Grid x covers the worst-case row tiles (`ceil(rows/BM)` — the
     /// whole chunk landing on one expert); tiles past a segment exit immediately, so the empty
     /// launches cost ~nothing while the dispatch count drops from ~n_expert·stages per layer to
     /// stages. `sact` is Q4_K/Q5_K's min-term row sums (None for Q6_K/Q8_0/Q5_0, which have no
@@ -4029,6 +4037,20 @@ impl<'a> Recorder<'a> {
     /// necessary workgroups — caught during the diffusion-gemma perf campaign (slice 5): DG's
     /// caller was passing `n_pairs` (n_used=8 → 8× the row-tile grid) alongside qwen3moe's caller,
     /// which had the same bug. Fixed at both call sites in `adapter.rs`'s `Op::MoeFfn` lowering.
+    ///
+    /// `n_used`: NOT read by the shader — used HERE only to pick the row TILE size (BM). The
+    /// default kernel tiles M in BM=64 chunks; at small rows-per-expert (Qwen3.6-MoE's 256-expert
+    /// pool averages `rows·n_used/n_expert` ≈ 16/expert at pp512) that tile is mostly masked
+    /// waste — a full 64-row tile launches, does the full BM×BN×K compute, but only ~16 of the 64
+    /// rows are real (the rest are past the expert's segment and their results are discarded at
+    /// the store). `rows·n_used/n_expert` (integer division; sum(counts) == rows·n_used == n_pairs
+    /// spread evenly is the EXACT mean, not a bound) selects a BM=32 tile
+    /// (`native_gemm_mmq_*_xp32`) below `MOE_EXPERT_SMALL_TILE_AVG_ROWS`, halving the average
+    /// waste — measured via `moe_expert_grid_bound_bench`'s tile sweep (see its doc): BM=32 wins at
+    /// avg~16 (qwen3.6-MoE), BM=64 (unchanged) still wins at avg~32+ (qwen3-30B-A3B, DG) where
+    /// tiles are fuller and the smaller tile's extra per-workgroup fixed cost (barrier/staging,
+    /// amortized over less work) stops paying for itself. Same K-accumulation order either way —
+    /// this is tile GRANULARITY only, so results stay bit-identical to the BM=64 path.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_experts(
         &self,
@@ -4047,36 +4069,65 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
         n_expert: usize,
+        n_used: usize,
     ) {
         // NB: the profiler label is the CALLER'S stage (gate_up vs down), not the kernel name —
         // the same `native_gemm_mmq_*_xp` kernel serves both roles, so the auto kernel-name
         // label would merge them (and inferring the stage from dtype mislabeled DG's down-proj
         // dispatches as "expert_gateup"). Every caller knows its own role; trust it.
         self.label_next(stage);
-        let (name, spv, nb): (_, _, usize) = match dtype {
-            infr_core::DType::Q4K => (
+        let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
+        let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
+        let bm: usize = if small_tile { 32 } else { 64 };
+        let (name, spv, nb): (_, _, usize) = match (dtype, small_tile) {
+            (infr_core::DType::Q4K, false) => (
                 "native_gemm_mmq_q4k_xp",
                 crate::gemm::native_gemm_mmq_q4k_xp_spv(),
                 7,
             ),
-            infr_core::DType::Q6K => (
+            (infr_core::DType::Q4K, true) => (
+                "native_gemm_mmq_q4k_xp32",
+                crate::gemm::native_gemm_mmq_q4k_xp32_spv(),
+                7,
+            ),
+            (infr_core::DType::Q6K, false) => (
                 "native_gemm_mmq_q6k_xp",
                 crate::gemm::native_gemm_mmq_q6k_xp_spv(),
                 6,
             ),
-            infr_core::DType::Q8_0 => (
+            (infr_core::DType::Q6K, true) => (
+                "native_gemm_mmq_q6k_xp32",
+                crate::gemm::native_gemm_mmq_q6k_xp32_spv(),
+                6,
+            ),
+            (infr_core::DType::Q8_0, false) => (
                 "native_gemm_mmq_q8_0_xp",
                 crate::gemm::native_gemm_mmq_q8_0_xp_spv(),
                 6,
             ),
-            infr_core::DType::Q5_0 => (
+            (infr_core::DType::Q8_0, true) => (
+                "native_gemm_mmq_q8_0_xp32",
+                crate::gemm::native_gemm_mmq_q8_0_xp32_spv(),
+                6,
+            ),
+            (infr_core::DType::Q5_0, false) => (
                 "native_gemm_mmq_q5_0_xp",
                 crate::gemm::native_gemm_mmq_q5_0_xp_spv(),
                 6,
             ),
-            infr_core::DType::Q5K => (
+            (infr_core::DType::Q5_0, true) => (
+                "native_gemm_mmq_q5_0_xp32",
+                crate::gemm::native_gemm_mmq_q5_0_xp32_spv(),
+                6,
+            ),
+            (infr_core::DType::Q5K, false) => (
                 "native_gemm_mmq_q5k_xp",
                 crate::gemm::native_gemm_mmq_q5k_xp_spv(),
+                7,
+            ),
+            (infr_core::DType::Q5K, true) => (
+                "native_gemm_mmq_q5k_xp32",
+                crate::gemm::native_gemm_mmq_q5k_xp32_spv(),
                 7,
             ),
             _ => unreachable!("batched MoE expert GEMM: Q4_K/Q5_K/Q6_K/Q8_0/Q5_0 only"),
@@ -4087,7 +4138,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        let gx = (rows.div_ceil(64) * (n / 64)) as u32;
+        let gx = (rows.div_ceil(bm) * (n / 64)) as u32;
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if let Some(sa) = sact {
             bufs.push(Self::vkb(sa));

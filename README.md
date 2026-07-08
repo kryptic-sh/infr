@@ -185,7 +185,7 @@ cache (the multi-turn serve shape).
 | Qwen3-30B-A3B (MoE)   | 0.97×     | 0.91×     | **1.23×** |
 | Qwen3.5-0.8B          | **1.02×** | **1.04×** | **1.25×** |
 | Qwen3.5-4B            | **1.01×** | 0.89×     | **1.22×** |
-| Qwen3.6-35B-A3B (MoE) | 0.92×¹    | 0.90×     | **1.30×** |
+| Qwen3.6-35B-A3B (MoE) | 0.95×¹    | 0.90×     | **1.30×** |
 | Gemma-3-1B            | **1.02×** | **1.10×** | **1.11×** |
 | Gemma-4-E2B           | **1.12×** | **1.03×** | 0.99×     |
 
@@ -193,11 +193,16 @@ cache (the multi-turn serve shape).
 (`be47c91`) — earlier figures were measured on a GPU router that only examined
 128 of the 256 experts; correct routing spreads a batch across the full pool
 (smaller per-expert GEMMs), which is why its pp512 is lower than the smaller-
-pool models. Output now matches llama.cpp token-for-token.
+pool models. Output now matches llama.cpp token-for-token. The batched expert
+GEMM (`matmul_mmq_experts`) picks a BM=32 row tile instead of BM=64 when the
+average rows/expert is small (256-expert pool ≈16/expert at pp512 — a 64-row
+tile is ~75% masked waste there; 32 halves it), recovering 0.92×→0.95×
+(qwen3-30B-A3B's 128-expert pool, ≈32/expert, keeps the BM=64 tile — no
+regression, see `MOE_EXPERT_SMALL_TILE_AVG_ROWS` in `recorder.rs`).
 
 infr **wins prefill and the multi-turn serve shape** on nearly every model (the
-two big MoEs prefill at 0.92-0.97× — correct full-expert routing costs batch
-efficiency); decode on the larger models sits at ~0.89-0.94× — the
+two big MoEs prefill at 0.95-0.97× — correct full-expert routing still costs
+some batch efficiency); decode on the larger models sits at ~0.89-0.94× — the
 memory-bandwidth wall (the dominant GEMVs run at 77-88 % of the card's DRAM
 peak, matching llama.cpp's own efficiency). **DiffusionGemma** (`dg-step`, the
 in-step-parallel metric) is at parity-or-better vs the reference fork.

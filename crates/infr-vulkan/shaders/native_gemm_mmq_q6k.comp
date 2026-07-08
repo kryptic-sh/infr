@@ -14,7 +14,12 @@
 #extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_control_flow_attributes : require
 
-const uint BM = 64u;
+#ifndef BM_TILE
+#define BM_TILE 64u
+#endif
+const uint BM = BM_TILE; // row tile — 64 default, EXPERT_GRID batched-MoE callers may
+                         // override smaller (e.g. 32) to fit small per-expert row counts
+
 const uint BN = 64u;
 const uint BLK = 16u;       // Q6_K scale sub-block
 const uint WPB = BLK / 4u;  // 4 packed-int8 u32 words per 16-block

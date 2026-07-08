@@ -981,6 +981,7 @@ fn moe_expert_grid_bound_bench() {
             ne,
             2 * nff,
             n_expert,
+            n_used,
         );
     });
     run("down", &|rec, bound, counts, offsets| {
@@ -1000,6 +1001,7 @@ fn moe_expert_grid_bound_bench() {
             nff,
             ne,
             n_expert,
+            n_used,
         );
     });
     // A BN=128 tile (halving down's 44 N-tiles to 22, matching gate_up's grid granularity) was
@@ -1012,4 +1014,239 @@ fn moe_expert_grid_bound_bench() {
     // iterations, less loop depth to amortize fixed per-iteration cost), not a tile/occupancy
     // config bug — reverted both variants per docs/PERF.md's "a measured wash gets reverted"
     // rule rather than landing a wash.
+}
+
+/// BM=64 vs BM=32 ROW tile at REAL small-rows-per-expert shapes (post routing-fix `be47c91`):
+/// qwen3.6-MoE's 256-expert pool averages ~16 rows/expert at pp512 (`rows·n_used/n_expert`),
+/// qwen3-30B-A3B's 128-expert pool averages ~32. `matmul_mmq_experts` picks BM=32
+/// (`native_gemm_mmq_*_xp32`) below `MOE_EXPERT_SMALL_TILE_AVG_ROWS` and BM=64 (unchanged,
+/// default) at/above it — this bench drives BOTH tiles against the SAME balanced counts
+/// distribution per shape (the `n_used` argument only steers the Rust-side tile pick, never read
+/// by the shader, so overriding it to force the "other" tile for comparison doesn't change
+/// correctness, only which kernel variant is dispatched) to find the crossover and confirm the
+/// picked threshold (24) sits on the right side of both production shapes.
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn moe_expert_row_tile_bench() {
+    let be = VulkanBackend::new().unwrap();
+    let reps = 30usize;
+
+    // (label, ne, nff, n_expert, real n_used, tokens)
+    let shapes: &[(&str, usize, usize, usize, usize, usize)] = &[
+        ("qwen3.6-moe avg~16", 2048, 512, 256, 8, 512),
+        ("qwen3-30B-a3b avg~32", 2048, 768, 128, 8, 512),
+        ("avg~48", 2048, 512, 256, 8, 1536),
+        ("deep-ctx avg~64", 2048, 512, 256, 8, 2048),
+        ("avg~96", 2048, 512, 256, 8, 3072),
+        ("avg~128", 2048, 512, 256, 8, 4096),
+        ("avg~256(pp8000)", 2048, 512, 256, 8, 8192),
+    ];
+
+    for &(label, ne, nff, n_expert, n_used, tokens) in shapes {
+        let n_pairs = tokens * n_used;
+        let npad = n_pairs.div_ceil(64) * 64 + 64;
+
+        let qa = be.alloc(npad * ne, BufferUsage::Activations).unwrap();
+        let dact = be
+            .alloc(npad * (ne / 32) * 2, BufferUsage::Activations)
+            .unwrap();
+        let sact = be
+            .alloc(npad * (ne / 32) * 2, BufferUsage::Activations)
+            .unwrap();
+        let gu_c = be
+            .alloc(npad * (2 * nff) * 4, BufferUsage::Activations)
+            .unwrap();
+        let gu_w = be
+            .alloc(
+                n_expert * (2 * nff) * (ne / 256) * 144,
+                BufferUsage::Weights,
+            )
+            .unwrap();
+
+        // Balanced: n_pairs spread as evenly as possible (a trained router with a load-balance
+        // aux loss keeps aggregate assignment close to uniform over a few hundred tokens).
+        let base = (n_pairs / n_expert) as u32;
+        let rem = n_pairs - base as usize * n_expert;
+        let mut counts_v = vec![base; n_expert];
+        for c in counts_v.iter_mut().take(rem) {
+            *c += 1;
+        }
+        let mut offsets_v = vec![0u32; n_expert];
+        let mut acc = 0u32;
+        for e in 0..n_expert {
+            offsets_v[e] = acc;
+            acc += counts_v[e];
+        }
+        let counts = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+        let offsets = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+        be.upload(counts.as_ref(), bytemuck::cast_slice(&counts_v))
+            .unwrap();
+        be.upload(offsets.as_ref(), bytemuck::cast_slice(&offsets_v))
+            .unwrap();
+
+        // n_used_probe = n_expert*100 forces avg_rows far past the threshold → BM=64, regardless
+        // of the shape's real n_used — the counts/offsets/rows stay the SAME real distribution.
+        for (tile_label, n_used_probe) in [("BM32", n_used), ("BM64", n_expert * 100)] {
+            let rec = be.recorder().unwrap();
+            rec.matmul_mmq_experts(
+                infr_core::DType::Q4K,
+                "bench_gateup",
+                qa.as_ref(),
+                dact.as_ref(),
+                Some(sact.as_ref()),
+                gu_w.as_ref(),
+                0,
+                ne,
+                counts.as_ref(),
+                offsets.as_ref(),
+                gu_c.as_ref(),
+                tokens,
+                ne,
+                2 * nff,
+                n_expert,
+                n_used_probe,
+            );
+            rec.finish().unwrap(); // warmup (pipeline compile)
+            let t0 = std::time::Instant::now();
+            let rec = be.recorder().unwrap();
+            for _ in 0..reps {
+                rec.matmul_mmq_experts(
+                    infr_core::DType::Q4K,
+                    "bench_gateup",
+                    qa.as_ref(),
+                    dact.as_ref(),
+                    Some(sact.as_ref()),
+                    gu_w.as_ref(),
+                    0,
+                    ne,
+                    counts.as_ref(),
+                    offsets.as_ref(),
+                    gu_c.as_ref(),
+                    tokens,
+                    ne,
+                    2 * nff,
+                    n_expert,
+                    n_used_probe,
+                );
+            }
+            rec.finish().unwrap();
+            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            let flops = 2.0 * (n_pairs as f64) * (ne as f64) * (2.0 * nff as f64);
+            let tflops = flops / (us * 1e-6) / 1e12;
+            println!("[{label:>20}] tile={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)");
+        }
+    }
+}
+
+/// Same crossover question as `moe_expert_row_tile_bench`, but for the DOWN projection (Q5_K,
+/// qwen3.6-MoE's down bank format): k=nff=512 (16 BLK=32 iterations vs gate_up's 64) — fewer K
+/// iterations means the per-workgroup fixed cost (barrier/staging) amortizes over LESS loop depth,
+/// which is exactly the "K-depth ceiling" `moe_expert_grid_bound_bench` flagged for why down runs
+/// at lower TFLOP/s than gate_up already; a smaller BM tile could plausibly make that fixed-cost
+/// ratio worse instead of better, so down needs its own check rather than assuming gate_up's
+/// verdict transfers.
+#[test]
+#[ignore = "requires a Vulkan GPU (perf micro-bench)"]
+fn moe_expert_row_tile_bench_down() {
+    let be = VulkanBackend::new().unwrap();
+    let reps = 30usize;
+    let (ne, nff, n_expert, n_used) = (2048usize, 512usize, 256usize, 8usize);
+
+    let shapes: &[(&str, usize)] = &[
+        ("avg~16", 512),
+        ("avg~32", 1024),
+        ("avg~64", 2048),
+        ("avg~128", 4096),
+    ];
+
+    for &(label, tokens) in shapes {
+        let n_pairs = tokens * n_used;
+        let npad = n_pairs.div_ceil(64) * 64 + 64;
+
+        let dqa = be.alloc(npad * nff, BufferUsage::Activations).unwrap();
+        let dda = be
+            .alloc(npad * (nff / 32) * 2, BufferUsage::Activations)
+            .unwrap();
+        let dsa = be
+            .alloc(npad * (nff / 32) * 2, BufferUsage::Activations)
+            .unwrap();
+        let down_c = be.alloc(npad * ne * 4, BufferUsage::Activations).unwrap();
+        let down_w = be
+            .alloc(
+                n_expert * ne * (nff / 256).max(1) * 176,
+                BufferUsage::Weights,
+            )
+            .unwrap();
+
+        let base = (n_pairs / n_expert) as u32;
+        let rem = n_pairs - base as usize * n_expert;
+        let mut counts_v = vec![base; n_expert];
+        for c in counts_v.iter_mut().take(rem) {
+            *c += 1;
+        }
+        let mut offsets_v = vec![0u32; n_expert];
+        let mut acc = 0u32;
+        for e in 0..n_expert {
+            offsets_v[e] = acc;
+            acc += counts_v[e];
+        }
+        let counts = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+        let offsets = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+        be.upload(counts.as_ref(), bytemuck::cast_slice(&counts_v))
+            .unwrap();
+        be.upload(offsets.as_ref(), bytemuck::cast_slice(&offsets_v))
+            .unwrap();
+
+        for (tile_label, n_used_probe) in [("BM32", n_used), ("BM64", n_expert * 100)] {
+            let rec = be.recorder().unwrap();
+            rec.matmul_mmq_experts(
+                infr_core::DType::Q5K,
+                "bench_down",
+                dqa.as_ref(),
+                dda.as_ref(),
+                Some(dsa.as_ref()),
+                down_w.as_ref(),
+                0,
+                nff,
+                counts.as_ref(),
+                offsets.as_ref(),
+                down_c.as_ref(),
+                tokens,
+                nff,
+                ne,
+                n_expert,
+                n_used_probe,
+            );
+            rec.finish().unwrap();
+            let t0 = std::time::Instant::now();
+            let rec = be.recorder().unwrap();
+            for _ in 0..reps {
+                rec.matmul_mmq_experts(
+                    infr_core::DType::Q5K,
+                    "bench_down",
+                    dqa.as_ref(),
+                    dda.as_ref(),
+                    Some(dsa.as_ref()),
+                    down_w.as_ref(),
+                    0,
+                    nff,
+                    counts.as_ref(),
+                    offsets.as_ref(),
+                    down_c.as_ref(),
+                    tokens,
+                    nff,
+                    ne,
+                    n_expert,
+                    n_used_probe,
+                );
+            }
+            rec.finish().unwrap();
+            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            let flops = 2.0 * (n_pairs as f64) * (nff as f64) * (ne as f64);
+            let tflops = flops / (us * 1e-6) / 1e12;
+            println!(
+                "[down {label:>10}] tile={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)"
+            );
+        }
+    }
 }

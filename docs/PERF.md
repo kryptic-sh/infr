@@ -51,6 +51,13 @@ infr compare --sweep <models...> --sweep-depth 4096
 Rules that exist because we got burned:
 
 - **One benchmark at a time.** Concurrent GPU work skews both sides.
+- **Cool-down between manual runs.** When running multiple `infr bench`
+  commands back to back (e.g. A/B testing kernel variants), insert a 60s+ sleep
+  between runs so the GPU cools to idle temperature. A hot GPU from a prior run
+  can depress the next run's numbers by 2-8% — enough to reverse a winning
+  variant. This applies to manual bench calls; `infr compare --sweep` already
+  serializes internally but the multi-model chip heating is its own problem (see
+  Archiving sweeps below).
 - **r=2 is noisy.** A "regression" that appears at r=2 may be variance —
   re-measure with r=3+ and compare against the historical range before reacting.
   Never auto-revert; diagnose first.

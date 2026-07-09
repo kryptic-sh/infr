@@ -419,6 +419,62 @@ fn main() {
             "native_q6k_rm4_res",
             &["-DFMT_Q6K", "-DRM=4", "-DUSE_RES"],
         ),
+        // ── Experimental RM kernel variants (env-gated, default OFF) ──────────────────────────
+        // Subgroup shuffle tree-reduce (replaces shared-mem + 2 barriers per row)
+        (
+            "native_gemv_rm_v2",
+            "native_q4k_rm2_sg",
+            &["-DFMT_Q4K", "-DRM=2", "-DVARIANT_SG"],
+        ),
+        (
+            "native_gemv_rm_v2",
+            "native_q4k_rm2_sg_res",
+            &["-DFMT_Q4K", "-DRM=2", "-DUSE_RES", "-DVARIANT_SG"],
+        ),
+        // Double-buffered dequant (pre-load next dqblk during current dot product)
+        (
+            "native_gemv_rm_v2",
+            "native_q4k_rm2_dbuf",
+            &["-DFMT_Q4K", "-DRM=2", "-DVARIANT_DBUF"],
+        ),
+        (
+            "native_gemv_rm_v2",
+            "native_q4k_rm2_dbuf_res",
+            &["-DFMT_Q4K", "-DRM=2", "-DUSE_RES", "-DVARIANT_DBUF"],
+        ),
+        // 128-thread workgroup (2x memory requests in flight)
+        (
+            "native_gemv_rm_v2",
+            "native_q4k_rm2_wg128",
+            &["-DFMT_Q4K", "-DRM=2", "-DVARIANT_WG128"],
+        ),
+        (
+            "native_gemv_rm_v2",
+            "native_q4k_rm2_wg128_res",
+            &["-DFMT_Q4K", "-DRM=2", "-DUSE_RES", "-DVARIANT_WG128"],
+        ),
+        // Register-only reduce via subgroup ops (no shared memory at all)
+        (
+            "native_gemv_rm_v2",
+            "native_q4k_rm2_reg",
+            &["-DFMT_Q4K", "-DRM=2", "-DVARIANT_REG"],
+        ),
+        (
+            "native_gemv_rm_v2",
+            "native_q4k_rm2_reg_res",
+            &["-DFMT_Q4K", "-DRM=2", "-DUSE_RES", "-DVARIANT_REG"],
+        ),
+        // Q6K subgroup variant
+        (
+            "native_gemv_rm_v2",
+            "native_q6k_rm2_sg",
+            &["-DFMT_Q6K", "-DRM=2", "-DVARIANT_SG"],
+        ),
+        (
+            "native_gemv_rm_v2",
+            "native_q6k_rm2_sg_res",
+            &["-DFMT_Q6K", "-DRM=2", "-DUSE_RES", "-DVARIANT_SG"],
+        ),
         // Reassociation-tolerant subgroup + NUM_ROWS decode GEMV (wave32, subgroupAdd, no shared
         // reduce) for the latency-STARVED out_f≈2048-8192 Q6_K projections (ffn_down / o / attn_qkv).
         // NOT bit-identical to the tree GEMV (reordered accumulation); gated to that band only. Q6_K

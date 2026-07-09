@@ -175,6 +175,41 @@ pub(crate) fn native_rm_build_spv(
     }
 }
 
+/// SPIR-V + kernel name for an experimental RM kernel variant (env-gated, default OFF).
+/// Returns (kernel_name, spv) for the given variant + dtype + res combination.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_rm_variant_spv(
+    variant: &str,
+    dtype: infr_core::DType,
+    res: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (variant, dtype, res) {
+        ("sg", Q4K, false) => v!("native_q4k_rm2_sg"),
+        ("sg", Q4K, true) => v!("native_q4k_rm2_sg_res"),
+        ("sg", Q6K, false) => v!("native_q6k_rm2_sg"),
+        ("sg", Q6K, true) => v!("native_q6k_rm2_sg_res"),
+        ("dbuf", Q4K, false) => v!("native_q4k_rm2_dbuf"),
+        ("dbuf", Q4K, true) => v!("native_q4k_rm2_dbuf_res"),
+        ("wg128", Q4K, false) => v!("native_q4k_rm2_wg128"),
+        ("wg128", Q4K, true) => v!("native_q4k_rm2_wg128_res"),
+        ("reg", Q4K, false) => v!("native_q4k_rm2_reg"),
+        ("reg", Q4K, true) => v!("native_q4k_rm2_reg_res"),
+        _ => None,
+    }
+}
+
 /// SPIR-V + kernel-cache name for the reassociation-tolerant subgroup+NUM_ROWS decode GEMV
 /// (`native_gemv_sg.comp`, wave32 + subgroupAdd). NOT bit-identical to the tree GEMV — reordered
 /// accumulation; the caller must gate to the projection band and re-bless any changed golden. Only

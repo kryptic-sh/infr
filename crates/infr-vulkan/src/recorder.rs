@@ -1798,6 +1798,28 @@ impl<'a> Recorder<'a> {
         }
         // Multi-output-row route (m=1 decode, low out_f → memory-latency-starved single-row grid).
         if rows == 1 {
+            let variant = std::env::var("INFR_GEMV_VARIANT").ok();
+            if let Some(ref v) = variant {
+                // Experimental kernel variant, env-gated for A/B testing.
+                if let Some((name, spv)) = crate::gemm::native_rm_variant_spv(v, dtype, false) {
+                    let rm: u32 = 2; // variants are RM=2
+                    self.label_gemv("gemv", rows, in_f, out_f);
+                    let k = self.be.kernel(name, spv, 3, 16);
+                    let mut push = [0u8; 16];
+                    push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+                    push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+                    push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+                    push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+                    self.dispatch_wide(
+                        k,
+                        &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+                        1,
+                        &push,
+                        (out_f as u32).div_ceil(rm),
+                    );
+                    return;
+                }
+            }
             if let Some(rm) = native_rm_choice(dtype, out_f) {
                 if let Some((name, spv)) = crate::gemm::native_rm_build_spv(dtype, false, rm) {
                     self.label_gemv("gemv", rows, in_f, out_f);
@@ -1966,6 +1988,15 @@ impl<'a> Recorder<'a> {
         }
         // Multi-output-row route (see linear_native_off): o/down decode GEMVs are low-out_f.
         if rows == 1 {
+            let variant = std::env::var("INFR_GEMV_VARIANT").ok();
+            if let Some(ref v) = variant {
+                if let Some((name, spv)) = crate::gemm::native_rm_variant_spv(v, dtype, true) {
+                    let rm: u32 = 2;
+                    let k = self.be.kernel(name, spv, 4, 16);
+                    self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(rm));
+                    return;
+                }
+            }
             if let Some(rm) = native_rm_choice(dtype, out_f) {
                 if let Some((name, spv)) = crate::gemm::native_rm_build_spv(dtype, true, rm) {
                     let k = self.be.kernel(name, spv, 4, 16);

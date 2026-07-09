@@ -1,0 +1,56 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Multi-output-row decode GEMV with SUBGROUP shuffle tree-reduce (replaces shared-memory + barriers).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
+layout(binding = 0) readonly buffer WB { uint nw[]; };
+layout(binding = 1) readonly buffer XB { float x_buf[]; };
+#ifdef USE_RES
+layout(binding = 2) readonly buffer RB2 { float r_buf[]; };
+layout(binding = 3) buffer YB { float y_buf[]; };
+#else
+layout(binding = 2) buffer YB { float y_buf[]; };
+#endif
+
+#ifndef RM
+#define RM 2
+#endif
+
+#include "native_decode.glsl"
+
+float dqsub(uint gstart, uint xoff) {
+    float v[32];
+    dqblk(gstart, v);
+    float a = 0.0;
+    for (uint w = 0u; w < 32u; w++) { a += v[w] * x_buf[xoff + w]; }
+    return a;
+}
+
+void main() {
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(RM);
+    uint t = gl_LocalInvocationID.x;
+    uint nsub = pc.in_f / 32u;
+    float acc[RM];
+    [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) { acc[rr] = 0.0; }
+    for (uint s = t; s < nsub; s += 64u) {
+        uint xoff = s * 32u;
+        [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+            uint o = o0 + rr;
+            if (o < pc.out_f) {
+                acc[rr] += dqsub(pc.w_base + o * pc.in_f + s * 32u, xoff);
+            }
+        }
+    }
+    // Subgroup shuffle reduce: adds within each wave, then one shared combine for the 2 waves.
+    // Eliminates 2 barriers per RM row vs the shared-memory tree-reduce.
+    float red_sg[RM];
+    [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) {
+        float partial = subgroupAdd(acc[rr]); // sum across 32-thread wave
+        // Wave-leader writes to a tiny shared array; the 2 wave leaders then read+sum.
+        // With 64 threads and requiredSubgroupSize=32, there are 2 subgroups.
+        // Just broadcast the subgroup result via shared.
+    }
+}

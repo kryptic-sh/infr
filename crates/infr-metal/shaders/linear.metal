@@ -174,6 +174,41 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
         wk[4u * i + 3u] = dl3 * (float)(q & 0xFF000000u) + mn;                                    \
     }
 
+// NATIVE Q5_K block (176 B / 256 elems): [f16 d][f16 dmin][12 B 6-bit scales/mins][32 B qh]
+// [128 B qs]. 5.5 bpw streamed vs the factored form's ~8. Same two-level (d,dmin)+(sc,m) scale as
+// Q4_K (get_scale_min_k4), plus a 5th bit per element from the qh plane: sub-block s uses qh bit
+// (1 << s). code = nibble + 16*qh_bit; value = d*sc*code - dmin*m — bit-exact vs dequant_block.
+#define DEC16_Q5K(wk)                                                                             \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 176ul;                                   \
+    uint sub = bi & 15u;                                                                          \
+    uint s = sub >> 1u;                                                                           \
+    uint j = s >> 1u;                                                                             \
+    bool is_low = (s & 1u) == 0u;                                                                 \
+    uint l0 = (sub & 1u) * 16u;                                                                   \
+    uint dm = *(device const uint*)blk;                                                           \
+    float d = (float)as_type<half>((ushort)(dm & 0xFFFFu));                                       \
+    float dmin = (float)as_type<half>((ushort)(dm >> 16));                                        \
+    device const uchar* scb = blk + 4u;                                                           \
+    uint sc6, m6;                                                                                 \
+    if (s < 4u) {                                                                                 \
+        sc6 = scb[s] & 63u;                                                                       \
+        m6 = scb[s + 4u] & 63u;                                                                   \
+    } else {                                                                                      \
+        sc6 = (scb[s + 4u] & 0x0Fu) | ((scb[s - 4u] >> 6) << 4);                                  \
+        m6 = (scb[s + 4u] >> 4) | ((scb[s] >> 6) << 4);                                           \
+    }                                                                                             \
+    float scale = d * (float)sc6;                                                                 \
+    float mn = -(dmin * (float)m6);                                                               \
+    device const uchar* qh = blk + 16u;                                                           \
+    device const uchar* qs = blk + 48u + j * 32u;                                                 \
+    uint qhmask = 1u << s;                                                                        \
+    for (uint k = 0u; k < 16u; k++) {                                                             \
+        uint l = l0 + k;                                                                          \
+        uint nib = is_low ? (uint)(qs[l] & 0x0Fu) : (uint)(qs[l] >> 4);                           \
+        uint code = nib + ((qh[l] & qhmask) != 0u ? 16u : 0u);                                    \
+        wk[k] = scale * (float)code + mn;                                                         \
+    }
+
 // NATIVE Q4_0 block (18 B / 32 elems): [f16 d][16 B nibbles] — 4.5 bpw streamed vs the
 // factored form's ~6.1. Element e < 16 is the low nibble of qs[e], e >= 16 the high nibble of
 // qs[e-16]; value = d * (q - 8), exact per element.

@@ -844,6 +844,39 @@ fn linear_q5k_gemv_matches_dequant_reference() {
     check_quant_linear_parity(DType::Q5K, synth_q5k(out_f * in_f, 121), m, in_f, out_f);
 }
 
+// Native Q5_K (this PR) — the m=1/m=2 tests above now exercise the native GEMV/RT; these add the
+// f16 GEMM routes (cmm at m=4, hmm at m=18) and the fused-QKV w_off slice.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q5k_gemm_matches_dequant_reference() {
+    for (m, in_f, out_f) in [(4usize, 512usize, 128usize), (18, 512, 128)] {
+        check_quant_linear_parity_impl(
+            DType::Q5K,
+            synth_q5k(out_f * in_f, 122),
+            m,
+            in_f,
+            out_f,
+            2.5e-3,
+            true,
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_q5k_gemv() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    check_linear_woff(
+        DType::Q5K,
+        synth_q5k(256 * in_f, 123),
+        1,
+        in_f,
+        &slices,
+        false,
+        1e-3,
+    );
+}
+
 // IQ4_XS is codebook (host-dequant to a cached f32 device weight on Metal); the fused-QKV
 // runner slices it with w_off, so both the plain and offset routes need coverage. Valid blocks:
 // 136 B / 256 elems = [f16 d][u16 scales_h][u32 scales_l... layout per gguf]; LCG payload works

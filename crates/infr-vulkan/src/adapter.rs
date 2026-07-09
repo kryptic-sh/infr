@@ -361,6 +361,46 @@ fn mmv_decode_enabled() -> bool {
     std::env::var("INFR_MMV_DECODE").is_ok() && std::env::var("INFR_NO_MMV").is_err()
 }
 
+/// Multi-warp int8 dp4a decode GEMV route (`native_mmv_mw.comp`, llama's mul_mat_vec_q block:
+/// warp-per-row subgroupAdd, WARPS warps/block) for WAVE32-NATIVE GPUs (`subgroup_max == 32`:
+/// NVIDIA/Intel). There the AMD-tuned scalar-dequant decode GEMV runs memory-LATENCY-starved
+/// (~30 GB/s of 616 on an RTX 2080 Ti) — a per-op dead end for the scalar path, since it is the f32
+/// dequant ALU + the `v[32]` register pressure (not the reduction) that cap it (a scalar multi-warp
+/// variant measured SLOWER than the tree). Only dp4a (raw int8 blocks, no f32 dequant) breaks the
+/// ceiling: Qwen3-1.7B Q4_K_M tg128 17.9 → 61.7 t/s isolated (3.4x), 0.11x → ~0.5x of llama.cpp.
+///
+/// OPT-IN (`INFR_MMV_MW=1`), NOT default: dp4a's int8-activation quant is coarser than the scalar
+/// default and forks from the f32 CPU oracle earlier — the same precision tier as llama.cpp's mmvq,
+/// but below infr's stricter token-for-token / deep-KV-Q8 coherence bar (this is exactly why 51a35c8
+/// made scalar the default on AMD, where it was ALSO faster). Kept as a validated
+/// (`mmv_mw_parity` test: matches `native_mmv` to ≤2e-3) knob so a wave32 deployment that accepts
+/// llama-level decode precision can take the 3.4x. AMD (`subgroup_max == 64`) returns None → its
+/// decode path is byte-identical (zero regression by construction). `INFR_MMV_MW_WARPS` ∈ {4,8}.
+fn mmv_mw_choice(
+    caps: &infr_core::backend::Capabilities,
+    dt: infr_core::DType,
+    in_f: usize,
+    out_f: usize,
+) -> Option<u32> {
+    if std::env::var("INFR_MMV_MW").is_err() || !caps.i8_dot || caps.subgroup_max != 32 {
+        return None;
+    }
+    if !matches!(dt, infr_core::DType::Q4K | infr_core::DType::Q6K) {
+        return None;
+    }
+    // Skip tiny GEMVs where per-dispatch overhead dominates (k/v projections); the projection band
+    // and lm_head are all well above 2M elements.
+    if !in_f.is_multiple_of(32) || in_f * out_f < (2usize << 20) {
+        return None;
+    }
+    let warps = std::env::var("INFR_MMV_MW_WARPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8u32);
+    (matches!(warps, 4 | 8) && crate::gemm::native_mmv_mw_build_spv(dt, false, warps).is_some())
+        .then_some(warps)
+}
+
 /// Get-or-alloc the pool buffer for (tag, bytes); returns the map key so callers can hold several
 /// pool buffers at once via immutable indexing (`pool[&k].as_ref()`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -660,11 +700,35 @@ fn lower_op(
                 }
                 let (rr, yf) = (r(*residual)?, r(*final_dst)?);
                 if native_dense_supported(dt) {
-                    // Int8 dp4a decode GEMV (mmv): quantize x to Q8 once, integer-dot the raw
-                    // K-quant blocks (llama.cpp's mmvq) instead of dequanting every weight to
-                    // f32. DEFAULT-OFF at m=1 — the scalar dequant GEMV now wins (see
-                    // `mmv_decode_enabled`); opt in with INFR_MMV_DECODE=1.
-                    if mmv_decode_enabled()
+                    // Multi-warp dp4a decode GEMV (wave32-native GPUs) takes precedence — see
+                    // `mmv_mw_choice`. AMD returns None here and falls to the scalar/old-mmv path.
+                    if let Some(warps) = mmv_mw_choice(be_.caps(), dt, in_f, out_f) {
+                        let nblk = in_f / 32;
+                        let qa = pooled(pool, be_, "mmv_qa", in_f)?;
+                        let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
+                        let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
+                        rec.quant_q8(
+                            xb,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            1,
+                            in_f,
+                        );
+                        rec.linear_mmv_mw(
+                            dt,
+                            warps,
+                            w,
+                            0,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            Some(rr),
+                            yf,
+                            in_f,
+                            out_f,
+                        );
+                    } else if mmv_decode_enabled()
                         && be_.caps().i8_dot
                         && in_f % 32 == 0
                         && in_f * out_f >= MMV_MIN_ELEMS
@@ -1118,9 +1182,40 @@ fn lower_op(
                 }
             } else if native_dense_supported(dt) {
                 // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
-                // DEFAULT-OFF: the scalar dequant GEMV wins at m=1 post-51a35c8 (see
-                // `mmv_decode_enabled`); opt in with INFR_MMV_DECODE=1.
-                if m == 1
+                // Wave32-native GPUs take the multi-warp dp4a route first (`mmv_mw_choice`); AMD
+                // falls through to the scalar GEMV (default) or the old mmv (INFR_MMV_DECODE=1).
+                let mw = if m == 1 {
+                    mmv_mw_choice(be_.caps(), dt, in_f, out_f)
+                } else {
+                    None
+                };
+                if let Some(warps) = mw {
+                    let nblk = in_f / 32;
+                    let qa = pooled(pool, be_, "mmv_qa", in_f)?;
+                    let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
+                    let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        1,
+                        in_f,
+                    );
+                    rec.linear_mmv_mw(
+                        dt,
+                        warps,
+                        w,
+                        w_off,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        None,
+                        y,
+                        in_f,
+                        out_f,
+                    );
+                } else if m == 1
                     && mmv_decode_enabled()
                     && be_.caps().i8_dot
                     && in_f % 32 == 0

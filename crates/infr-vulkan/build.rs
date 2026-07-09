@@ -537,6 +537,48 @@ fn main() {
             "native_mmv_q6k_res",
             &["-DFMT_Q6K", "-DUSE_RES"],
         ),
+        // Multi-warp int8 dp4a decode GEMV (llama mul_mat_vec_q block, warp-per-row subgroupAdd) for
+        // wave32-native GPUs. WARPS ∈ {4,8} rows/block × {plain,res}. Gated to subgroup_max==32.
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w4",
+            &["-DFMT_Q4K", "-DWARPS=4"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w4_res",
+            &["-DFMT_Q4K", "-DWARPS=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w8",
+            &["-DFMT_Q4K", "-DWARPS=8"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w8_res",
+            &["-DFMT_Q4K", "-DWARPS=8", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q6k_w4",
+            &["-DFMT_Q6K", "-DWARPS=4"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q6k_w4_res",
+            &["-DFMT_Q6K", "-DWARPS=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q6k_w8",
+            &["-DFMT_Q6K", "-DWARPS=8"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q6k_w8_res",
+            &["-DFMT_Q6K", "-DWARPS=8", "-DUSE_RES"],
+        ),
         // IQ4_XS: codebook-gather-then-dp4a (the 4-bit code indexes KV_IQ4NL -> int8 before the dot).
         ("native_mmv", "native_mmv_iq4xs", &["-DFMT_IQ4XS"]),
         (

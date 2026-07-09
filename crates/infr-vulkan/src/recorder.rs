@@ -2056,6 +2056,47 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Multi-warp int8 dp4a decode GEMV (`native_mmv_mw.comp`, `warps` rows/block, subgroupAdd).
+    /// Wave32-native GPUs only. `res` selects the fused-residual variant (extra `residual` binding).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_mw(
+        &self,
+        dtype: infr_core::DType,
+        warps: u32,
+        w: &dyn Buffer,
+        w_base: usize,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        residual: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("mmv", 1, in_f, out_f);
+        let res = residual.is_some();
+        let (name, spv) =
+            crate::gemm::native_mmv_mw_build_spv(dtype, res, warps).expect("native mmv_mw spv");
+        let nbind = if res { 6 } else { 5 };
+        let k = self.be.kernel_sg(name, spv, nbind, 16, 32);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        let mut bufs = vec![
+            Self::vkb(w),
+            Self::vkb(qa),
+            Self::vkb(dact),
+            Self::vkb(sact),
+        ];
+        if let Some(r) = residual {
+            bufs.push(Self::vkb(r));
+        }
+        bufs.push(Self::vkb(y));
+        self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(warps));
+    }
+
     /// Quantized dequant GEMV with fused residual add: `y = residual + x·Wᵀ`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_q(

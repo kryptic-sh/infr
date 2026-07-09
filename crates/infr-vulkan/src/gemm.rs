@@ -319,6 +319,39 @@ pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option
         _ => return None,
     })
 }
+/// SPIR-V + cache name for the multi-warp int8 dp4a decode GEMV (`native_mmv_mw.comp`, warp-per-row
+/// subgroupAdd, `warps` rows/block). Wave32-native GPUs only (see the recorder's `mmv_mw_choice`).
+/// `warps` ∈ {4, 8}. `None` for formats/warp counts without a build.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_mmv_mw_build_spv(
+    dtype: infr_core::DType,
+    res: bool,
+    warps: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, res, warps) {
+        (Q4K, false, 4) => v!("native_mmv_mw_q4k_w4"),
+        (Q4K, true, 4) => v!("native_mmv_mw_q4k_w4_res"),
+        (Q4K, false, 8) => v!("native_mmv_mw_q4k_w8"),
+        (Q4K, true, 8) => v!("native_mmv_mw_q4k_w8_res"),
+        (Q6K, false, 4) => v!("native_mmv_mw_q6k_w4"),
+        (Q6K, true, 4) => v!("native_mmv_mw_q6k_w4_res"),
+        (Q6K, false, 8) => v!("native_mmv_mw_q6k_w8"),
+        (Q6K, true, 8) => v!("native_mmv_mw_q6k_w8_res"),
+        _ => None,
+    }
+}
 /// SPIR-V for the multi-row int8 dp4a GEMV (m = 2..8, `native_mmv_mrow.comp`). `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv_mrow`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

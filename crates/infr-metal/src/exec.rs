@@ -1316,38 +1316,23 @@ impl MetalBackend {
                 dim,
                 eps,
             } => {
-                // Metal: decompose to RmsNorm then add in-place (no dedicated fused kernel yet).
+                // Metal fallback: read post_norm weight from host, compute on host values.
+                self.ensure_host(r, g, x);
+                self.ensure_host(r, g, dst);
+                let w = self.weight_host(weight, g, bindings);
+                let xs = &r.vals[x.0 as usize];
+                let mut ds = r.vals[dst.0 as usize].clone();
                 let (rows, dim) = (rows as usize, dim as usize);
-                let bx = self.ensure_device(r, x);
-                let bw = self.weight_buf(weight, g, bindings)?;
-                let bd = self.ensure_device(r, dst);
-                let pso = self.pipelines.get("rmsnorm_f32")?;
-                let mut p = (rows as u32).to_ne_bytes().to_vec();
-                p.extend_from_slice(&(dim as u32).to_ne_bytes());
-                p.extend_from_slice(&eps.to_ne_bytes());
-                // temp scratch for rmsnorm result
-                let tmp = self.alloc_scratch(r, rows * dim);
-                self.encode_tg_w(
-                    r,
-                    &pso,
-                    &[bx.as_ref(), bw.as_ref(), tmp.as_ref()],
-                    1 << 2,
-                    &p,
-                    rows * 32,
-                    32,
-                );
-                // add to dst in-place
-                let pso_a = self.pipelines.get("add_f32")?;
-                self.encode_tg_w(
-                    r,
-                    &pso_a,
-                    &[tmp.as_ref(), bd.as_ref(), bd.as_ref()],
-                    1 << 2,
-                    &((rows * dim) as u32).to_ne_bytes(),
-                    rows * 32,
-                    32,
-                );
-                r.loc[dst.0 as usize] = Loc::Device;
+                for ri in 0..rows {
+                    let xrow = &xs[ri * dim..(ri + 1) * dim];
+                    let ss: f32 = (0..dim).map(|i| xrow[i] * xrow[i]).sum::<f32>() / dim as f32;
+                    let s = 1.0 / (ss + eps).sqrt();
+                    for i in 0..dim {
+                        ds[ri * dim + i] += xrow[i] * s * w[i];
+                    }
+                }
+                r.vals[dst.0 as usize] = ds;
+                r.loc[dst.0 as usize] = Loc::Host;
             }
             // Row-wise softmax (diffusion-gemma's in-graph self-conditioning — see
             // docs/DIFFUSIONGEMMA.md's Phase-B). UNVERIFIED on real Metal hardware — added blind,

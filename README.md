@@ -195,7 +195,7 @@ serve shape).
 | Qwen3.5-9B             | **1.11×** | 0.95×     | 0.96×      | **1.35×** |
 | Gemma-3-12B            | **1.24×** | **1.02×** | **1.03×**  | **1.47×** |
 | Qwen3-14B              | **1.11×** | 0.90×     | 0.86×      | **1.04×** |
-| Gemma-4-E2B            | **1.14×** | **1.09×** | **1.04×**  | **1.04×** |
+| Gemma-4-E2B            | **1.14×** | **1.09×** | **1.04×**  | **1.08×** |
 | Qwen3.6-27B            | **1.08×** | 0.91×     | 0.91×      | **1.13×** |
 | Qwen3-30B-A3B (MoE)    | 0.96×     | 0.95×     | 0.94×      | **1.17×** |
 | Qwen3.6-35B-A3B (MoE)² | 0.93×     | 0.94×     | 0.95×      | **1.45×** |
@@ -206,9 +206,8 @@ sweep (see [PERF.md](docs/PERF.md#archiving-sweeps)). Three dispatch fusions
 landed to close the gap:
 1. `CopyStrided` eliminated via per-row source stride on `GatedAct` (35 dispatches)
 2. inp_gate `Op::Linear` + `GatedAct` fused into `e2b_gate` kernel (35 dispatches)
-3. proj `Op::Linear` + `Op::RmsNormAdd` fused into `e2b_proj` kernel (35 dispatches,
-   batched-prefill only — decode parallelism gate keeps separate path for m=1)
-Total: 105 dispatches eliminated (891 → 786). Now beats llama.cpp on every metric.
+3. proj `Op::RmsNorm` + `Op::Add` fused into `rmsnorm_add` kernel (35 dispatches)
+Total: 70 dispatches eliminated. E2B now beats llama.cpp on every metric.
 
 ² Qwen3.6-35B-A3B is the UD (ultra-dense) variant — only the standard UD Q4_K_M
 quant was available.

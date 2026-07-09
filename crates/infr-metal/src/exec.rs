@@ -1111,8 +1111,14 @@ impl MetalBackend {
         if let Some(w) = self.qui_cache.lock().unwrap().get(&key) {
             return w.clone();
         }
+        // INFR_METAL_NO_KQUANT_NATIVE routes Q5_K back through the factored quik path (A/B + escape
+        // hatch). Only Q5_K nativizes: it reuses Q4_K's cheap 6-bit scale extraction, so the
+        // narrower 5.5-bpw stream wins; Q3_K/Q2_K native measured SLOWER (their scale-decode ALU —
+        // Q3_K's aux-shuffle — costs more than the factored path's precomputed scales save).
+        let kq_native = std::env::var("INFR_METAL_NO_KQUANT_NATIVE").is_err();
         let native_kern = match g.desc(id).dtype {
             DType::Q4K => Some("linear_q4k"),
+            DType::Q5K if kq_native => Some("linear_q5k"),
             DType::Q6K => Some("linear_q6k"),
             DType::Q8_0 => Some("linear_q8_0"),
             DType::Q5_0 => Some("linear_q5_0"),
@@ -1416,6 +1422,7 @@ impl MetalBackend {
                         // Native kernels read raw GGUF blocks; scm/dd are dummy buffers.
                         "linear_q4k" => (e / 256 * 144, 0, 0),
                         "linear_q6k" => (e / 256 * 210, 0, 0),
+                        "linear_q5k" => (e / 256 * 176, 0, 0),
                         "linear_q8_0" => (e / 32 * 34, 0, 0),
                         "linear_q5_0" => (e / 32 * 22, 0, 0),
                         "linear_q4_0" => (e / 32 * 18, 0, 0),
@@ -1449,6 +1456,7 @@ impl MetalBackend {
                         "linear_quik6" => "linear_quik6_hmm",
                         "linear_q4k" => "linear_q4k_hmm",
                         "linear_q6k" => "linear_q6k_hmm",
+                        "linear_q5k" => "linear_q5k_hmm",
                         "linear_q8_0" => "linear_q8_0_hmm",
                         "linear_q5_0" => "linear_q5_0_hmm",
                         "linear_q4_0" => "linear_q4_0_hmm",
@@ -1466,6 +1474,7 @@ impl MetalBackend {
                         "linear_quik6" => "linear_quik6_cmm",
                         "linear_q4k" => "linear_q4k_cmm",
                         "linear_q6k" => "linear_q6k_cmm",
+                        "linear_q5k" => "linear_q5k_cmm",
                         "linear_q8_0" => "linear_q8_0_cmm",
                         "linear_q5_0" => "linear_q5_0_cmm",
                         "linear_q4_0" => "linear_q4_0_cmm",
@@ -1565,6 +1574,7 @@ impl MetalBackend {
                                 "linear_quik6" => "linear_quik6_cmm_ks",
                                 "linear_q4k" => "linear_q4k_cmm_ks",
                                 "linear_q6k" => "linear_q6k_cmm_ks",
+                                "linear_q5k" => "linear_q5k_cmm_ks",
                                 "linear_q8_0" => "linear_q8_0_cmm_ks",
                                 "linear_q5_0" => "linear_q5_0_cmm_ks",
                                 "linear_q4_0" => "linear_q4_0_cmm_ks",
@@ -1673,6 +1683,7 @@ impl MetalBackend {
                                 "linear_quik6" => "linear_quik6_rt",
                                 "linear_q4k" => "linear_q4k_rt",
                                 "linear_q6k" => "linear_q6k_rt",
+                                "linear_q5k" => "linear_q5k_rt",
                                 "linear_q8_0" => "linear_q8_0_rt",
                                 "linear_q5_0" => "linear_q5_0_rt",
                                 "linear_q4_0" => "linear_q4_0_rt",

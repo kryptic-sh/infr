@@ -1218,7 +1218,7 @@ pub(crate) fn generate_dense_backend(
         // the post-attention `GatedAct(Sigmoid)`. Unused (but harmlessly allocated) on every other
         // arch, exactly like the E2B scratch above.
         let qg = g.internal(f32d(batch * max_qrow * 2));
-        let gate_a = g.internal(f32d(batch * max_qrow));
+        let _gate_a = g.internal(f32d(batch * max_qrow));
 
         // qwen35 gated-DeltaNet mixer scratch (see docs/QWEN35.md), reused across every DeltaNet
         // layer exactly like `hn`/`sub` above (qwen35's SSM dims are uniform across layers, unlike
@@ -1416,6 +1416,7 @@ pub(crate) fn generate_dense_backend(
                     up_off: 0,
                     up_stride: 0,
                     gate_stride: 0,
+                    gate_block_width: 0,
                 });
                 let sc_sig = g.internal(f32d(batch * ne));
                 g.push(Op::Linear {
@@ -1631,6 +1632,7 @@ pub(crate) fn generate_dense_backend(
                         up_off: 0,
                         up_stride: 0,
                         gate_stride: 0,
+                        gate_block_width: 0,
                     });
                 }
                 g.push(Op::Linear {
@@ -1709,29 +1711,9 @@ pub(crate) fn generate_dense_backend(
                         out_f: (qrow * 2) as u32,
                         w_off: 0,
                     });
-                    for h in 0..nh {
-                        g.push(Op::CopyStrided {
-                            src: qg,
-                            src_off: (h * 2 * hd) as u32,
-                            src_stride: (nh * 2 * hd) as u32,
-                            dst: q,
-                            dst_off: (h * hd) as u32,
-                            dst_stride: (nh * hd) as u32,
-                            rows: batch as u32,
-                            n: hd as u32,
-                        });
-                        // CopyStrided for gate only — QkNormRope reads q from qg with stride.
-                        g.push(Op::CopyStrided {
-                            src: qg,
-                            src_off: (h * 2 * hd + hd) as u32,
-                            src_stride: (nh * 2 * hd) as u32,
-                            dst: gate_a,
-                            dst_off: (h * hd) as u32,
-                            dst_stride: (nh * hd) as u32,
-                            rows: batch as u32,
-                            n: hd as u32,
-                        });
-                    }
+                    // qwen35 attn_out_gate: QkNormRope reads q from qg with stride,
+                    // GatedAct(sigmoid) reads gate from qg with stride.
+                    // No CopyStrided needed — both ops consume qg directly.
                 } else {
                     g.push(Op::Linear {
                         x: hn,
@@ -1938,7 +1920,7 @@ pub(crate) fn generate_dense_backend(
                 // o-projection (`gate_a` was split out of the interleaved `attn_q` projection above).
                 if c.attn_out_gate {
                     g.push(Op::GatedAct {
-                        gate: gate_a,
+                        gate: qg, // read gate directly from interleaved q+g buffer
                         up: attn,
                         dst: attn,
                         rows: batch as u32,
@@ -1946,7 +1928,8 @@ pub(crate) fn generate_dense_backend(
                         act: Activation::Sigmoid,
                         up_off: 0,
                         up_stride: 0,
-                        gate_stride: 0,
+                        gate_stride: (nh * 2 * hd) as u32, // per-row stride in qg
+                        gate_block_width: (2 * hd) as u32, // query+gate block per head
                     });
                 }
                 g.push(Op::Linear {
@@ -2042,6 +2025,7 @@ pub(crate) fn generate_dense_backend(
                         up_off: 0,
                         up_stride: 0,
                         gate_stride: 0,
+                        gate_block_width: 0,
                     });
                     g.push(Op::Linear {
                         x: actbuf,
@@ -2133,6 +2117,7 @@ pub(crate) fn generate_dense_backend(
                             up_off: 0,
                             up_stride: 0,
                             gate_stride: 0,
+                            gate_block_width: 0,
                         });
                         g.push(Op::Linear {
                             x: actbuf,
@@ -2219,6 +2204,7 @@ pub(crate) fn generate_dense_backend(
                             up_off: 0,
                             up_stride: 0,
                             gate_stride: 0,
+                            gate_block_width: 0,
                         });
                     }
                     g.push(Op::Linear {
@@ -2353,6 +2339,7 @@ pub(crate) fn generate_dense_backend(
                     up_off: (l * npl) as u32,
                     up_stride: (c.n_layer * npl) as u32,
                     gate_stride: 0,
+                    gate_block_width: 0,
                 });
                 g.push(Op::Linear {
                     x: plg,

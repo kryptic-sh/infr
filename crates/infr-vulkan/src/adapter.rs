@@ -1398,6 +1398,7 @@ fn lower_op(
             up_off,
             up_stride,
             gate_stride,
+            gate_block_width,
             ..
         } => {
             let n = *rows as usize * *nff as usize;
@@ -1418,7 +1419,15 @@ fn lower_op(
                             "vulkan adapter: GatedAct Sigmoid up_off/stride!=0 unsupported",
                         ));
                     }
-                    rec.mul_sigmoid(u_, g_, y, n);
+                    rec.mul_sigmoid(
+                        u_,
+                        g_,
+                        y,
+                        n,
+                        *gate_stride as usize,
+                        *nff as usize,
+                        *gate_block_width as usize,
+                    );
                 }
                 Activation::Gelu => {
                     rec.gelu_mul_off(
@@ -1429,6 +1438,7 @@ fn lower_op(
                         *nff as usize,
                         *gate_stride as usize * eb,
                         *nff as usize,
+                        (*gate_block_width as usize) * eb,
                         y,
                         n,
                     );
@@ -2921,9 +2931,15 @@ fn lower_op(
                     Activation::Silu => {
                         rec.silu_mul(gbuf.get(pool), ubuf.get(pool), abuf.get(pool), n_act)
                     }
-                    Activation::Sigmoid => {
-                        rec.mul_sigmoid(gbuf.get(pool), ubuf.get(pool), abuf.get(pool), n_act)
-                    }
+                    Activation::Sigmoid => rec.mul_sigmoid(
+                        gbuf.get(pool),
+                        ubuf.get(pool),
+                        abuf.get(pool),
+                        n_act,
+                        0,
+                        0,
+                        0,
+                    ),
                     Activation::Gelu => rec.gelu_mul_off(
                         gbuf.get(pool),
                         ubuf.get(pool),
@@ -2932,6 +2948,7 @@ fn lower_op(
                         nff,
                         0,
                         nff,
+                        0,
                         abuf.get(pool),
                         n_act,
                     ),
@@ -3506,6 +3523,7 @@ mod tests {
             up_off: 0,
             gate_stride: 0,
             up_stride: 0,
+            gate_block_width: 0,
         });
         let gb = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
         let ub = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
@@ -4015,6 +4033,7 @@ mod tests {
             up_off: 0,
             gate_stride: 0,
             up_stride: 0,
+            gate_block_width: 0,
         });
         g.push(Op::Linear {
             x: act_i,

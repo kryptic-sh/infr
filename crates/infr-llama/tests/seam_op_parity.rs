@@ -196,6 +196,7 @@ fn gated_sigmoid_parity() {
         up_off: 0,
         up_stride: 0,
         gate_stride: 0,
+        gate_block_width: 0,
     });
     let gi = gen(rows * nff, 2);
     let ui = gen(rows * nff, 3);
@@ -229,6 +230,7 @@ fn gated_gelu_offset_parity() {
         up_off: up_off as u32,
         up_stride: 0,
         gate_stride: 0,
+        gate_block_width: 0,
     });
     let gi = gen(rows * nff, 2);
     let ui = gen(up_off + rows * nff + 8, 3);

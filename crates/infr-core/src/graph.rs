@@ -249,6 +249,8 @@ pub enum Op {
     /// 0 means the rows are tightly packed (stride = nff).
     /// `gate_stride` is the same for the `gate` buffer — used when gate data is strided in a wider
     /// interleaved buffer (e.g. qwen35's q+g layout where query and gate share rows).
+    /// `gate_block_width` (>0) means the gate is interleaved in blocks of this width, with each
+    /// block containing query+gate pairs (qwen35: block_width = 2*hd, gate at offset hd within block).
     GatedAct {
         gate: TensorId,
         up: TensorId,
@@ -259,6 +261,7 @@ pub enum Op {
         up_off: u32,
         up_stride: u32,
         gate_stride: u32,
+        gate_block_width: u32,
     },
     /// Gated FFN activation over a COMBINED `gu` buffer `[rows, 2*nff]` (gate half first, up half
     /// second per row): `dst[r,i] = act(gu[r,i]) * gu[r, nff+i]`. Produced when the runner

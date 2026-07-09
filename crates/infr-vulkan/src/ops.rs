@@ -519,8 +519,8 @@ impl VulkanBackend {
 
     /// SwiGLU activation: `y[i] = silu(gate[i]) * up[i]`.
     pub fn silu_mul(&self, gate: &[f32], up: &[f32], n: usize) -> Result<Vec<f32>> {
-        let k = self.kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 24);
-        let mut push = [0u8; 24];
+        let k = self.kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 28);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         self.run_kernel(k, &[gate, up], n, &push, (n as u32).div_ceil(64))
     }

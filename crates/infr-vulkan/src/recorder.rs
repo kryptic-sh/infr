@@ -3959,8 +3959,8 @@ impl<'a> Recorder<'a> {
     pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let k = self
             .be
-            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 24);
-        let mut push = [0u8; 24];
+            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 28);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         self.dispatch(
             k,
@@ -4329,12 +4329,26 @@ impl<'a> Recorder<'a> {
     }
 
     /// Elementwise sigmoid gate: `y[i] = a[i] * sigmoid(b[i])` (Qwen3-Next attention output gate).
-    pub fn mul_sigmoid(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
+    /// `gate_stride_elements`, `gate_row_width`, `gate_block_width`: interleaved gate buffer params.
+    /// All zero = flat gate read.
+    pub fn mul_sigmoid(
+        &self,
+        a: &dyn Buffer,
+        b: &dyn Buffer,
+        y: &dyn Buffer,
+        n: usize,
+        gate_stride_el: usize,
+        gate_row_width: usize,
+        gate_block_width: usize,
+    ) {
         let kern = self
             .be
-            .kernel("mul_sigmoid", crate::gemm::mul_sigmoid_spv(), 3, 4);
-        let mut push = [0u8; 4];
+            .kernel("mul_sigmoid", crate::gemm::mul_sigmoid_spv(), 3, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(gate_stride_el as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(gate_row_width as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(gate_block_width as u32).to_ne_bytes());
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],
@@ -4358,19 +4372,21 @@ impl<'a> Recorder<'a> {
         row_width: usize,
         gate_stride_bytes: usize,
         gate_row_width: usize,
+        gate_block_width: usize,
         y: &dyn Buffer,
         n: usize,
     ) {
         let k = self
             .be
-            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 24);
-        let mut push = [0u8; 24];
+            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 28);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&((up_off_bytes / 4) as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&((up_stride_bytes / 4) as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(row_width as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((gate_stride_bytes / 4) as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(gate_row_width as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&((gate_block_width / 4) as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],

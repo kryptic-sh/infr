@@ -665,6 +665,7 @@ fn build_mtp_graph(
         up_off: 0,
         up_stride: 0,
         gate_stride: 0,
+        gate_block_width: 0,
     });
     g.push(Op::Linear {
         x: attn,
@@ -721,6 +722,7 @@ fn build_mtp_graph(
         up_off: 0,
         up_stride: 0,
         gate_stride: 0,
+        gate_block_width: 0,
     });
     g.push(Op::Linear {
         x: actbuf,
@@ -1124,6 +1126,7 @@ fn build_mtp_draft_chain_graph(
             up_off: 0,
             up_stride: 0,
             gate_stride: 0,
+            gate_block_width: 0,
         });
         g.push(Op::Linear {
             x: attn,
@@ -1176,6 +1179,7 @@ fn build_mtp_draft_chain_graph(
             up_off: 0,
             up_stride: 0,
             gate_stride: 0,
+            gate_block_width: 0,
         });
         g.push(Op::Linear {
             x: actbuf,

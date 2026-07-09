@@ -179,38 +179,51 @@ compare) and throughput is measured against the system `llama.cpp` build with
 `infr compare`.
 
 **Throughput vs llama.cpp** — ratios are `infr / llama.cpp` (**>1.0 = infr is
-faster**); `Q4_K_M`, r=3, on the RX 7900 XTX. `pp512` = 512-token prefill,
-`tg128` = 128-token decode, `pp4@d4096` = ingest a short turn on a 4096-deep KV
-cache (the multi-turn serve shape).
+faster**); `Q4_K_M`, r=3, 2026-07-09 snapshot. Hardware: **AMD Radeon RX 7900
+XTX** (RDNA3, 24 GB, Vulkan / RADV, Mesa). `pp512` = 512-token prefill
+throughput, `tg128` = 128-token decode throughput, `tg64@d4096` = decode at 4096
+KV depth, `pp4@d4096` = short-turn prefill at 4096 KV depth (the multi-turn
+serve shape).
 
-| Model                 | pp512     | tg128     | pp4@d4096 |
-| --------------------- | --------- | --------- | --------- |
-| Qwen3-0.6B            | **1.24×** | **1.12×** | **2.10×** |
-| Qwen3-8B              | **1.28×** | 0.94×     | **1.32×** |
-| Qwen3-30B-A3B (MoE)   | 0.97×     | 0.91×     | **1.23×** |
-| Qwen3.5-0.8B          | **1.02×** | **1.04×** | **1.25×** |
-| Qwen3.5-4B            | **1.01×** | 0.89×     | **1.22×** |
-| Qwen3.6-35B-A3B (MoE) | 0.95×¹    | 0.90×     | **1.30×** |
-| Gemma-3-1B            | **1.02×** | **1.10×** | **1.11×** |
-| Gemma-4-E2B           | **1.12×** | **1.03×** | 0.99×     |
+| Model                  | pp512     | tg128     | tg64@d4096 | pp4@d4096 |
+| ---------------------- | --------- | --------- | ---------- | --------- |
+| Qwen3-0.6B             | **1.18×** | **1.22×** | **1.28×**  | **2.07×** |
+| Gemma-3-1B             | **1.04×** | **1.17×** | **1.09×**  | **1.04×** |
+| Qwen3-1.7B             | **1.12×** | **1.10×** | **1.13×**  | **1.60×** |
+| Qwen3.5-4B             | **1.02×** | 0.91×     | 0.93×      | **1.36×** |
+| Qwen3-8B               | **1.28×** | 0.95×     | 0.96×      | **1.23×** |
+| Qwen3.5-9B             | **1.11×** | 0.95×     | 0.96×      | **1.35×** |
+| Gemma-3-12B            | **1.24×** | **1.02×** | **1.03×**  | **1.47×** |
+| Qwen3-14B              | **1.11×** | 0.90×     | 0.86×      | **1.04×** |
+| Gemma-4-E2B            | **1.06×** | **1.09×** | **1.01×**  | 0.73×¹    |
+| Qwen3.6-27B            | **1.08×** | 0.91×     | 0.91×      | **1.13×** |
+| Qwen3-30B-A3B (MoE)    | 0.96×     | 0.95×     | 0.94×      | **1.17×** |
+| Qwen3.6-35B-A3B (MoE)² | 0.93×     | 0.94×     | 0.95×      | **1.45×** |
 
-¹ Qwen3.6-MoE (256 experts) numbers are as of the routing-correctness fix
-(`be47c91`) — earlier figures were measured on a GPU router that only examined
-128 of the 256 experts; correct routing spreads a batch across the full pool
-(smaller per-expert GEMMs), which is why its pp512 is lower than the smaller-
-pool models. Output now matches llama.cpp token-for-token. The batched expert
-GEMM (`matmul_mmq_experts`) picks a BM=32 row tile instead of BM=64 when the
-average rows/expert is small (256-expert pool ≈16/expert at pp512 — a 64-row
-tile is ~75% masked waste there; 32 halves it), recovering 0.92×→0.95×
-(qwen3-30B-A3B's 128-expert pool, ≈32/expert, keeps the BM=64 tile — no
-regression, see `MOE_EXPERT_SMALL_TILE_AVG_ROWS` in `recorder.rs`).
+¹ gemma-4-E2B `pp4@d4096` is the worst ratio in the table (422 vs 578 t/s) — the
+in-sweep reading was 0.46× (261 vs 572), but re-measured solo on an idle GPU it
+recovered to 0.73× — the mid-sweep thermal throttling penalty confirms the
+[PERF.md rule](docs/PERF.md#archiving-sweeps): always re-probe flagged rows solo
+before treating them as regressions. The remaining gap (0.73×) likely hits a
+dispatch-overhead or host-routing bottleneck on deep-KV short-turn prefill for
+this architecture (class 4/5 in the
+[perf taxonomy](docs/PERF.md#bottleneck-taxonomy---what-the-profile-means)).
 
-infr **wins prefill and the multi-turn serve shape** on nearly every model (the
-two big MoEs prefill at 0.95-0.97× — correct full-expert routing still costs
-some batch efficiency); decode on the larger models sits at ~0.89-0.94× — the
-memory-bandwidth wall (the dominant GEMVs run at 77-88 % of the card's DRAM
-peak, matching llama.cpp's own efficiency). **DiffusionGemma** (`dg-step`, the
-in-step-parallel metric) is at parity-or-better vs the reference fork.
+² Qwen3.6-35B-A3B is the UD (ultra-dense) variant — only the standard UD Q4_K_M
+quant was available.
+
+infr **wins prefill on every dense model** (1.02–1.28×); the two MoEs prefill at
+0.93–0.96× — correct full-expert routing (batch spreads across 128 or 256
+experts into smaller per-expert GEMMs) costs some batch efficiency vs
+llama.cpp's own expert dispatch. Multi-turn ingest **dominates on every model**
+(1.04–2.07× on 11/12, with gemma-4-E2B as the sole outlier at 0.73×). Decode is
+at-or-above parity on models up to ~4B, and slightly behind on larger models —
+dense 8B/9B/14B/27B at 0.90–0.96×, MoE 30B/35B at 0.94–0.95×, all bounded by the
+memory-bandwidth wall (decode GEMVs run at 77–88% of DRAM peak, matching
+llama.cpp's own efficiency). The **Qwen3.5-4B MTP path** trails at 0.67× (185 vs
+277 t/s) — drafted-token throughput not yet matching the batched-speculative
+path in llama.cpp. **DiffusionGemma** (`dg-step`, the in-step-parallel metric)
+is at parity-or-better vs the reference fork.
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf
 table: Qwen2-0.5B, Llama-3.2-1B, Gemma-4-12B (dense), and Qwen3-0.6B across

@@ -1575,20 +1575,37 @@ fn lower_op(
                     // `out_base_mul` is the 0/1 multiplier the shader scales by pos (then internally
                     // by nheads*hd): 1 → write cache row pos, 0 → write row 0 of the Q scratch.
                     let out_base_mul = usize::from(fused.is_some());
-                    rec.qk_norm_rope_dyn(
-                        r(*x)?,
-                        r(*weight)?,
-                        *params,
-                        ff,
-                        out_buf,
-                        *rows as usize,
-                        *n_head as usize,
-                        *head_dim as usize,
-                        *rope_dim as usize,
-                        *theta,
-                        out_base_mul,
-                        *eps,
-                    );
+                    if *x_stride > 0 && ff.is_none() {
+                        rec.qk_norm_rope_interleaved_dyn(
+                            r(*x)?,
+                            r(*weight)?,
+                            *params,
+                            out_buf,
+                            *rows as usize,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            out_base_mul,
+                            *eps,
+                            *x_stride as usize,
+                        );
+                    } else {
+                        rec.qk_norm_rope_dyn(
+                            r(*x)?,
+                            r(*weight)?,
+                            *params,
+                            ff,
+                            out_buf,
+                            *rows as usize,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            out_base_mul,
+                            *eps,
+                        );
+                    } // x_stride > 0
                 }
             }
         }

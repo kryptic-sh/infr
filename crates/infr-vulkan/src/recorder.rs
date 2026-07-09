@@ -3295,6 +3295,54 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Fused QkNormRope reading from interleaved buffer, Dynamic/record-once variant.
+    /// Same as qk_norm_rope_interleaved but with USE_PARAMS: pos from SSBO for decode replay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_interleaved_dyn(
+        &self,
+        qg: &dyn Buffer,
+        nw: &dyn Buffer,
+        params: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        nheads: usize,
+        hd: usize,
+        rope_dim: usize,
+        theta: f32,
+        out_base_mul: usize,
+        eps: f32,
+        src_stride: usize,
+    ) {
+        let k = self.be.kernel(
+            "qk_norm_rope_interleaved_dyn",
+            crate::gemm::qk_norm_rope_interleaved_dyn_spv(),
+            4,
+            36,
+        );
+        let mut push = [0u8; 36];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(nheads as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(rope_dim as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&theta.to_ne_bytes());
+        push[20..24].copy_from_slice(&0u32.to_ne_bytes()); // unused rope_pos
+        push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&eps.to_ne_bytes());
+        push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[
+                Self::vkb(qg),
+                Self::vkb(nw),
+                Self::vkb(params),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (rows * nheads) as u32,
+        );
+    }
+
     /// Flash-decoding attention (q_len==1): split the KV range into `n_chunks` chunks of `chunk`,
     /// compute per-chunk softmax partials in parallel (`pm`/`pl`/`pacc`), then combine into `o`.
     /// Parallelizes attention across `nh*n_chunks` workgroups so it stays fast at long context.

@@ -1879,9 +1879,8 @@ pub(crate) fn generate_dense_backend(
                 // Q: fused QkNorm+RoPE (qwen3/gemma) → f16 `q16`, else RoPE alone (llama) in-place f32.
                 let q_attn = match aw.q_norm {
                     Some(qn) => {
-                        // TODO: enable when interleaved kernel is debugged
-                        let (q_src, q_stride) = if false {
-                            // c.attn_out_gate → interleaved qg buffer
+                        // Interleaved q+g buffer: skip CopyStrided, QkNormRope reads from qg with stride.
+                        let (q_src, q_stride) = if c.attn_out_gate {
                             (qg, (nh * 2 * hd) as u32)
                         } else {
                             (q, 0)

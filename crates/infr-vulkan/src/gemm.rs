@@ -1762,6 +1762,17 @@ pub(crate) fn qk_norm_rope_interleaved_spv() -> &'static [u32] {
         )))
     })
 }
+/// SPIR-V for interleaved QkNormRope with USE_PARAMS (record-once decode replay).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn qk_norm_rope_interleaved_dyn_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/qk_norm_rope_interleaved_dyn.spv"
+        )))
+    })
+}
 /// SPIR-V for the bf16-weight GEMV (`y=x·Wᵀ`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_bf16_spv() -> &'static [u32] {

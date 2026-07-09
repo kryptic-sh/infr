@@ -261,8 +261,13 @@ fn main() {
             &["-DUSE_PARAMS", "-DFREQ_FACTORS"],
         ),
         // Interleaved q+g variant: reads query elements from strided buffer, eliminates per-head
-        // CopyStrided dispatches (qwen35 attention layers). Static (non-USE_PARAMS) only.
+        // CopyStrided dispatches (qwen35 attention layers).
         ("qk_norm_rope_interleaved", "qk_norm_rope_interleaved", &[]),
+        (
+            "qk_norm_rope_interleaved",
+            "qk_norm_rope_interleaved_dyn",
+            &["-DUSE_PARAMS"],
+        ),
         // Native-block dequant GEMVs: one .spv per (quant format, residual) from one source.
         ("native_gemv", "native_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemv", "native_bf16", &["-DFMT_BF16"]),

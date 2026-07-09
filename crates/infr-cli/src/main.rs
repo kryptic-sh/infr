@@ -1635,6 +1635,8 @@ fn cmd_compare_sweep(
     let mut rows: Vec<(String, String, f64, f64)> = Vec::new();
     for model in models {
         let short = model.rsplit('/').next().unwrap_or(model);
+        // Cooldown between models to reduce thermal skew across the sweep.
+        std::thread::sleep(std::time::Duration::from_secs(10));
         let mb = match ModelBench::new(model, dev, ngl, threads, reps, ubatch, llama_bench) {
             Ok(mb) => mb,
             Err(e) => {
@@ -1664,6 +1666,8 @@ fn cmd_compare_sweep(
             } else {
                 metric.to_string()
             };
+            // Cooldown between metric pairs (infr + llama.cpp) to reduce thermal coupling.
+            std::thread::sleep(std::time::Duration::from_secs(10));
             // A cold/low-power GPU can flub Vulkan device init on the first subprocess launch
             // after a while-idle; one retry absorbs that without forcing a manual re-run of the
             // whole sweep for one bad cell.

@@ -491,6 +491,10 @@ pub enum Op {
         head_k: u32,
         head_v: u32,
         eps: f32,
+        /// When >0, q/k/v are slices of a single source buffer with per-row stride.
+        /// q at offset 0, k at n_khead*head_k, v at 2*n_khead*head_k within each row.
+        /// Eliminates 3 CopyStrided dispatches per DeltaNet layer (qwen35).
+        src_stride: u32,
     },
     /// qwen35moe Qwen2-MoE-style shared-expert combine: `dst[r,c] = moe[r,c] + sigmoid(gate[r]) *
     /// shexp[r,c]` for `rows` rows of `n` elements. `moe` is the routed-MoE branch's output

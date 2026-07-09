@@ -2257,6 +2257,8 @@ fn lower_op(
             head_k,
             head_v,
             eps,
+            src_stride,
+            ..
         } => {
             // Prefill AND multi-row batches (rows ≥ 2): the chunkwise delta rule processes up to 32
             // tokens per state traversal (matmuls + a triangular solve) instead of the token-serial

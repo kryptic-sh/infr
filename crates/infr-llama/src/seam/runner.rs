@@ -1530,37 +1530,7 @@ pub(crate) fn generate_dense_backend(
                     channels: q35_cc as u32,
                     kernel: c.ssm_d_conv as u32,
                 });
-                // split conv_out [batch, cc=q|k|v] → packed [batch, *] q / k / v (strided/token).
-                g.push(Op::CopyStrided {
-                    src: dn_convout,
-                    src_off: 0,
-                    src_stride: q35_cc as u32,
-                    dst: dn_qbuf,
-                    dst_off: 0,
-                    dst_stride: q35_keydim as u32,
-                    rows: batch as u32,
-                    n: q35_keydim as u32,
-                });
-                g.push(Op::CopyStrided {
-                    src: dn_convout,
-                    src_off: q35_keydim as u32,
-                    src_stride: q35_cc as u32,
-                    dst: dn_kbuf,
-                    dst_off: 0,
-                    dst_stride: q35_keydim as u32,
-                    rows: batch as u32,
-                    n: q35_keydim as u32,
-                });
-                g.push(Op::CopyStrided {
-                    src: dn_convout,
-                    src_off: (2 * q35_keydim) as u32,
-                    src_stride: q35_cc as u32,
-                    dst: dn_vbuf,
-                    dst_off: 0,
-                    dst_stride: (q35_nv * q35_vd) as u32,
-                    rows: batch as u32,
-                    n: (q35_nv * q35_vd) as u32,
-                });
+                // q/k/v read from conv_out via src_stride in DeltaNet op — no CopyStrided needed.
                 g.push(Op::Linear {
                     x: hn,
                     weight: dw.beta,
@@ -1579,10 +1549,12 @@ pub(crate) fn generate_dense_backend(
                     out_f: q35_nv as u32,
                     w_off: 0,
                 });
+                // DeltaNet: q/k/v read from conv_out with stride, skipping 3 CopyStrided dispatches.
+                // q at offset 0, k at q35_keydim, v at 2*q35_keydim within each row.
                 g.push(Op::DeltaNet {
-                    q: dn_qbuf,
-                    k: dn_kbuf,
-                    v: dn_vbuf,
+                    q: dn_convout,
+                    k: dn_convout,
+                    v: dn_convout,
                     b: dn_bbuf,
                     a: dn_abuf,
                     a_coef: dw.ssm_a,
@@ -1595,6 +1567,7 @@ pub(crate) fn generate_dense_backend(
                     head_k: q35_kd as u32,
                     head_v: q35_vd as u32,
                     eps: 1e-6,
+                    src_stride: q35_cc as u32,
                 });
                 // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z). Fused into
                 // ONE dispatch when the backend supports it (see `fuse_gated_rmsnorm`'s doc) — the

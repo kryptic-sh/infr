@@ -2067,6 +2067,8 @@ impl Backend for CpuBackend {
                     head_k,
                     head_v,
                     eps,
+                    src_stride,
+                    ..
                 } => {
                     let (rr, nv, nk, kd, vd) = (
                         rows as usize,

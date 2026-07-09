@@ -261,6 +261,7 @@ fn qknorm_parity() {
         n_head: n_head as u32,
         head_dim: head_dim as u32,
         eps: 1e-6,
+        src_stride: 0,
         x_stride: 0,
     });
     let xi = gen(rows * n_head * head_dim, 4);
@@ -310,6 +311,7 @@ fn qknormrope_parity_qwen35_dims() {
         rope_dim: rope_dim as u32,
         theta: 1e7,
         eps: 1e-6,
+        src_stride: 0,
         freq_factors: None,
         x_stride: 0,
     });
@@ -383,6 +385,7 @@ fn qknormrope_attn_chain() {
         rope_dim: rope_dim as u32,
         theta: 1e7,
         eps: 1e-6,
+        src_stride: 0,
         freq_factors: None,
         x_stride: 0,
     });
@@ -488,6 +491,7 @@ fn qwen35_attn_core_writekv() {
         rope_dim: rope_dim as u32,
         theta: 1e7,
         eps: 1e-6,
+        src_stride: 0,
         freq_factors: None,
         x_stride: 0,
     };
@@ -658,6 +662,7 @@ fn deltanet_chunked_parity() {
         head_k: kd as u32,
         head_v: vd as u32,
         eps: 1e-6,
+        src_stride: 0,
     });
     let (qi, ki, vi) = (
         gen(rows * nk * kd, 1),
@@ -722,6 +727,7 @@ fn deltanet_parity() {
         head_k: kd as u32,
         head_v: vd as u32,
         eps: 1e-6,
+        src_stride: 0,
     });
     let (qi, ki, vi) = (
         gen(rows * nk * kd, 1),

@@ -3553,6 +3553,7 @@ mod tests {
             theta,
             eps,
             freq_factors: None,
+            x_stride: 0,
         });
         let xb = be_.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
         let wb = be_.alloc(hd * 4, BufferUsage::Weights).unwrap();

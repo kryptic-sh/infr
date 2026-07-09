@@ -187,41 +187,39 @@ serve shape).
 
 | Model                  | pp512     | tg128     | tg64@d4096 | pp4@d4096 |
 | ---------------------- | --------- | --------- | ---------- | --------- |
-| Qwen3-0.6B             | **1.27×** | **1.20×** | **1.26×**  | **2.21×** |
-| Gemma-3-1B             | **1.06×** | **1.14×** | **1.10×**  | **1.23×** |
-| Qwen3-1.7B             | **1.12×** | **1.11×** | **1.14×**  | **1.82×** |
-| Qwen3.5-4B             | **1.02×** | 0.94×     | 0.95×      | **1.48×** |
-| Qwen3-8B               | **1.28×** | 0.95×     | 0.95×      | **1.45×** |
-| Qwen3.5-9B             | **1.15×** | 0.96×     | 0.97×      | **1.45×** |
-| Gemma-3-12B            | **1.25×** | **1.01×** | **1.03×**  | **1.67×** |
+| Qwen3-0.6B             | **1.29×** | **1.22×** | **1.26×**  | **2.07×** |
+| Gemma-3-1B             | **1.06×** | **1.14×** | **1.06×**  | **1.13×** |
+| Qwen3-1.7B             | **1.12×** | **1.11×** | **1.14×**  | **1.90×** |
+| Qwen3.5-4B             | **1.03×** | 0.94×     | 0.95×      | **1.51×** |
+| Qwen3-8B               | **1.28×** | 0.95×     | 0.95×      | **1.41×** |
+| Qwen3.5-9B             | **1.16×** | 0.96×     | 0.97×      | **1.46×** |
+| Gemma-3-12B            | **1.25×** | **1.01×** | **1.03×**  | **1.70×** |
 | Qwen3-14B              | **1.12×** | 0.92×     | 0.88×      | **1.29×** |
-| Gemma-4-E2B            | **1.13×** | **1.08×** | **1.01×**  | 0.83×¹    |
+| Gemma-4-E2B            | **1.14×** | **1.08×** | **1.01×**  | **1.10×** |
 | Qwen3.6-27B            | **1.09×** | 0.94×     | 0.94×      | **1.20×** |
-| Qwen3-30B-A3B (MoE)    | 0.96×     | 0.95×     | 0.94×      | **1.23×** |
-| Qwen3.6-35B-A3B (MoE)² | 0.95×     | 0.95×     | 0.96×      | **1.53×** |
+| Qwen3-30B-A3B (MoE)    | 0.96×     | 0.95×     | 0.94×      | **1.22×** |
+| Qwen3.6-35B-A3B (MoE)² | 0.94×     | 0.95×     | 0.96×      | **1.51×** |
 
-¹ gemma-4-E2B `pp4@d4096` (0.83× in-sweep) is likely a thermal artifact from
-this multi-model sweep — solo re-measurement on a cool GPU previously showed
-1.08× (see [PERF.md](docs/PERF.md#archiving-sweeps) for the cooldown rule).
+¹ gemma-4-E2B `pp4@d4096` recovered to 1.10× with cooldown (was 0.83× in a
+thermally-skewed sweep — see [PERF.md](docs/PERF.md#archiving-sweeps)). Three
+dispatch fusions landed to close this gap:
+
+1. `CopyStrided` eliminated via per-row source stride on `GatedAct`
+2. inp_gate `Op::Linear` + `GatedAct` fused into `e2b_gate` kernel
+3. proj `Op::RmsNorm` + `Op::Add` fused into `rmsnorm_add` kernel
 
 ² Qwen3.6-35B-A3B is the UD (ultra-dense) variant — only the standard UD Q4_K_M
 quant was available.
 
-infr **wins prefill on every dense model** (1.02–1.28×); the two MoEs prefill at
-0.93–0.96× — correct full-expert routing (batch spreads across 128 or 256
-experts into smaller per-expert GEMMs) costs some batch efficiency vs infr
-**wins prefill on every dense model** (1.02–1.28×); the two MoEs prefill at
-0.95–0.96× — correct full-expert routing (batch spreads across 128 or 256
-experts into smaller per-expert GEMMs) costs some batch efficiency vs
-llama.cpp's own expert dispatch. Multi-turn ingest **dominates on nearly every
-model** (1.20–2.21× on 11/12, with E2B slightly behind in-sweep at 0.83× —
-likely thermal, solo was 1.08×). Decode is at-or-above parity on models up to
-~4B, and slightly behind on larger models — dense 8B/9B/14B/27B at 0.88–0.96×,
-MoE 30B/35B at 0.94–0.95×, all bounded by the memory-bandwidth wall (decode
-GEMVs run at 77–88% of DRAM peak, matching llama.cpp's own efficiency). The
-**Qwen3.5-4B MTP path** trails at 0.66× (184 vs 281 t/s) — drafted-token
-throughput not yet matching the batched-speculative path in llama.cpp.
-**DiffusionGemma** (`dg-step`, the in-step-parallel metric) is at
+infr **wins prefill on every dense model** (1.03–1.29×); the two MoEs prefill at
+0.94–0.96× — correct full-expert routing costs some batch efficiency vs
+llama.cpp. Multi-turn ingest **dominates on every model** (1.10–2.07× on all 12
+models). Decode is at-or-above parity on models up to ~4B, and slightly behind
+on larger models — dense 8B/9B/14B/27B at 0.88–0.96×, MoE 30B/35B at 0.94–0.95×,
+all bounded by the memory-bandwidth wall (decode GEMVs run at 77–88% of DRAM
+peak). The **Qwen3.5-4B MTP path** trails at 0.56× (157 vs 282 t/s) —
+drafted-token throughput not yet matching llama.cpp's batched-speculative path.
+**DiffusionGemma** (`dg-step`) is at parity-or-better vs the reference fork.
 parity-or-better vs the reference fork.
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf

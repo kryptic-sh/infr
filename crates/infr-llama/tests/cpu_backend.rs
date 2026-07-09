@@ -1433,6 +1433,74 @@ fn mtp_head_cpu_vulkan_parity() {
     assert_eq!(cpu_ids, vk_ids, "CPU/Vulkan MTP head drafts diverged");
 }
 
+/// Regression: the fused on-device `draft_chain` (one submit for all `n_max` steps) MUST draft the
+/// EXACT same token ids as the per-step `draft()` from an identical primed state. Both run on
+/// Vulkan and use the same GPU `Op::ArgmaxProb`; the only difference is graph structure, so any
+/// divergence is a chain-graph bug. Guards the `decode_eligible` fix: the unrolled chain's
+/// all-`rows==1` attentions used to (wrongly) qualify for record-once decode replay, which drives
+/// every pos-dependent op from ONE shared params position — collapsing all `n_max` steps onto the
+/// same KV row / RoPE angle / kv_len and corrupting every step past the first. Fuzzes several
+/// realistic primed states (each prompt row's trunk-`h` as `pending_h`, varied `id_last`).
+#[test]
+fn mtp_draft_chain_matches_per_step() {
+    need_gpu!();
+    let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
+    let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
+    let head = infr_llama::mtp::load_mtp_head(&g, &cfg).expect("load_mtp_head");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let ne = cfg.n_embd;
+    let n_max = 6usize;
+
+    let prompt_tokens = model.encode("The capital of France is").expect("encode");
+    let p = prompt_tokens.len();
+    let max_ctx = p + n_max + 4;
+
+    let vk = infr_vulkan::VulkanBackend::new().expect("vulkan init");
+    let mut sess = infr_llama::mtp::MtpHeadSession::new_vulkan(
+        &vk,
+        &g,
+        model.config(),
+        &head,
+        model.token_embd(),
+        max_ctx,
+    )
+    .expect("MtpHeadSession::new_vulkan");
+    assert!(sess.can_draft_chain(), "vulkan should support draft_chain");
+
+    let (_logits0, h_rows0) = model
+        .verify_logits_and_h_cpu(&prompt_tokens)
+        .expect("verify_logits_and_h_cpu");
+    let mut shifted_h = vec![0f32; p * ne];
+    if p > 1 {
+        shifted_h[ne..].copy_from_slice(&h_rows0[..(p - 1) * ne]);
+    }
+    infr_llama::mtp::catch_up(&mut sess, &prompt_tokens, &shifted_h, 0).expect("catch_up");
+
+    for r in 0..p {
+        let h_r = h_rows0[r * ne..(r + 1) * ne].to_vec();
+        for &tok in &[prompt_tokens[r], (r as u32 * 997 + 13) % cfg.vocab as u32] {
+            let per_step: Vec<u32> = infr_llama::mtp::draft(
+                &mut sess,
+                tok,
+                &h_r,
+                p,
+                infr_llama::mtp::DEFAULT_P_MIN,
+                n_max,
+            )
+            .expect("draft")
+            .iter()
+            .map(|&(id, _)| id)
+            .collect();
+            let chained = sess.draft_chain(tok, &h_r, p, n_max).expect("draft_chain");
+            assert_eq!(
+                per_step, chained,
+                "draft_chain diverged from per-step draft (tok={tok}, row={r})"
+            );
+        }
+    }
+}
+
 /// Oracle-invariant fallback (`docs/MTP.md`'s validation ladder — capturing the oracle's OWN
 /// verbose drafted-token trace proved impractical: llama.cpp's `SPC_DBG`/`SPC_TRC` macros gate on
 /// `common_log`'s verbosity, not a dedicated spec-debug env var, and piping a live CPU generation's

@@ -197,6 +197,14 @@ fn main_lm_head(g: &Gguf, ne: usize, vocab: usize) -> Result<MtpTensor> {
     }
 }
 
+/// The main model's `token_embd.weight` fallback (`qwen35.cpp`'s `layer.nextn.embed_tokens ? ... :
+/// model.tok_embd`) for [`build_embed_chain_buf`]'s device-side table upload, when the head has no
+/// own `nextn.embed_tokens` — mirrors [`main_lm_head`]'s fallback shape.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn main_token_embd(g: &Gguf, ne: usize, vocab: usize) -> Result<MtpTensor> {
+    require(g, "token_embd.weight", &[ne, vocab])
+}
+
 /// Resolve the head's OWN embedding table (`nextn.embed_tokens`, dequantized) when the GGUF ships
 /// one — `None` when it doesn't (the shipped 4B GGUF: `docs/MTP.md`'s confirmed dump), in which
 /// case the caller passes the main model's already-dequantized `token_embd` straight to
@@ -258,6 +266,57 @@ fn upload_mtp_head_bufs(
         None => push(&main_lm_head(g, cfg.n_embd, cfg.vocab)?)?,
     }
     Ok((bufs, specs))
+}
+
+/// Resolve + conditionally upload the head's embedding table as a device Weight buffer for
+/// [`MtpHeadSession::draft_chain`]'s on-device `Op::EmbedGather` chain (issue #33 follow-up).
+/// Source tensor: the head's own `nextn.embed_tokens` when the GGUF ships one, else the main
+/// model's `token_embd.weight` (mirrors [`resolve_own_embed_table`]'s fallback — the SAME table
+/// [`MtpHeadSession::embed_table`]'s host-side dequantized copy comes from). Uploaded through the
+/// caller's `bind_weight` (the SAME per-backend binder the other 16 head weights use — zero-copy
+/// mmap on CPU, padded upload on Vulkan), so its device layout matches every other resident weight.
+///
+/// Gated on `Capabilities::embed_gather && Capabilities::argmax_prob` (both must hold for the
+/// chained draft loop's `Op::EmbedGather` + `Op::ArgmaxProb` to run on-device), `cfg.n_embd`
+/// 32-aligned, and the table's native dtype passing
+/// `infr_vulkan::linear::embed_gather_supported` — the SAME three gates `seam/runner.rs`'s
+/// `gpu_embed` flag checks for the trunk's own embed-gather path, reused verbatim here rather than
+/// re-deriving a parallel dtype allowlist. Returns `(None, DType::F32)` when any gate fails —
+/// `MtpHeadSession::can_draft_chain` reflects the `None` and `draft_chain` refuses to run, falling
+/// back to the host-driven [`draft`] loop (Metal today: `argmax_prob == false`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn build_embed_chain_buf(
+    be: &dyn Backend,
+    bind_weight: &BindWeightFn,
+    g: &Gguf,
+    cfg: &crate::Config,
+    head: &MtpHeadWeights,
+) -> Result<(Option<Box<dyn Buffer>>, DType)> {
+    let t = match &head.embed_tokens {
+        Some(t) => t.clone(),
+        None => main_token_embd(g, cfg.n_embd, cfg.vocab)?,
+    };
+    let caps = be.capabilities();
+    // The fused chain feeds each step's device-produced argmax id (`Op::ArgmaxProb`) straight into
+    // the next step's device `Op::EmbedGather` — a pure device submit-batching win over the per-step
+    // `draft()`. The scalar CPU-reference interpreter can't round-trip that on-device id chain: it
+    // stores an argmax id as a BIT-PATTERN f32 (`f32::from_bits`, so the host readback of the id
+    // output is byte-correct) but reads `EmbedGather` ids NUMERICALLY (`id as f32`, matching a
+    // host-uploaded i32 ids input), so a chained id decodes to garbage. The chain has no perf value
+    // on the reference backend anyway (no real submits to batch), so gate it to GPU backends and let
+    // CPU take the canonical per-step `draft()` path (which the MTP acceptance oracle wants regardless).
+    let gate = caps.name != "cpu-reference"
+        && caps.embed_gather
+        && caps.argmax_prob
+        && cfg.n_embd.is_multiple_of(32)
+        && infr_vulkan::linear::embed_gather_supported(t.dtype);
+    if !gate {
+        return Ok((None, DType::F32));
+    }
+    let tb = g.tensor_bytes_arc(&t.name).map_err(|e| anyhow!("{e}"))?;
+    let numel: usize = t.shape.iter().product();
+    let (buf, dt) = bind_weight(&t.name, crate::seam::WBytes::Mmap(tb), t.dtype, numel)?;
+    Ok((Some(buf), dt))
 }
 
 /// The head graph's tensor handles `MtpHeadSession::forward` binds/reads each call.
@@ -723,6 +782,462 @@ fn build_mtp_graph(
     )
 }
 
+/// [`build_mtp_draft_chain_graph`]'s tensor handles: the inputs bound once per `draft_chain` call
+/// (`id0`/`h0`/the `n_steps` `pos_s`/the head's own KV/the 16 weights/the embed table), plus the
+/// `n_steps` `Op::ArgmaxProb` id [`Output`](TensorId)s the host reads back after the ONE `execute`.
+struct MtpChainHandles {
+    id0: TensorId,
+    h0: TensorId,
+    pos_s: Vec<TensorId>,
+    k_cache: TensorId,
+    v_cache: TensorId,
+    /// The 16 weight handles, same push order as [`MtpHandles::weights`].
+    weights: Vec<TensorId>,
+    /// The head's own/main-model embedding table, uploaded as a device Weight so
+    /// [`Op::EmbedGather`] can gather+dequantize each step's drafted token on-device (see
+    /// [`build_embed_chain_buf`]).
+    w_embd: TensorId,
+    /// The `n_steps` drafted-id outputs, index-parallel with the draft position
+    /// (`ids[s]` was drafted at absolute KV position `start_pos + s`).
+    ids: Vec<TensorId>,
+}
+
+/// Build the MTP head's self-chaining greedy draft loop as ONE unrolled `Graph`: `n_steps` copies
+/// of [`build_mtp_graph`]'s `rows == 1, fuse_prob == true` body, back-to-back, with the id/`h_mtp`
+/// chain dependency threaded ON DEVICE instead of round-tripping through the host between steps
+/// (issue #33 follow-up — see [`MtpHeadSession::draft_chain`]'s doc for the correctness argument
+/// and the perf motivation). Step `s`'s drafted id feeds step `s+1`'s [`Op::EmbedGather`] (reading
+/// the SAME embedding table the trunk gathers from — `w_embd`); step `s`'s `h_mtp` feeds step
+/// `s+1`'s `h_in` directly (an `Internal` tensor, never bound/downloaded). `positions` can't be one
+/// shared multi-element input the way `build_mtp_graph`'s batched `rows` case uses it: every step
+/// here has `rows == 1`, so `QkNormRope`'s `positions[row]` would read element 0 of a shared buffer
+/// every step — `n_steps` separate 1-element `pos_s` inputs sidestep that (the caller uploads
+/// `[start_pos + s]` into each once, no per-step re-upload once bound).
+///
+/// The attention-layer SCRATCH tensors (`e_norm`/`h_norm`/`concat`/`resid`/`hn`/`qg`/`q`/`gate_a`/
+/// `k`/`v`/`q16`/`k16`/`attn`/`sub`/`gbuf`/`ubuf`/`actbuf`/`hn2`/`layer_out`) are declared ONCE and
+/// REUSED across every step, exactly like [`build_mtp_graph`]'s own `resid` (written by one op,
+/// read by a later one, written again) — see that function's doc + `Recorder::sync`'s hazard
+/// tracker (`infr-vulkan/src/recorder.rs`): ops execute in `graph.ops` push order and a barrier is
+/// auto-inserted only when a real RAW/WAR/WAW hazard exists against work since the last one, so
+/// reusing one scratch id across `n_steps` sequential step-bodies is exactly as safe as reusing it
+/// across the ops WITHIN one step already is today. Per-step tensors that must NOT be shared
+/// (`e_raw_s`/`logits_s`/`h_mtp_s`/`id_s`/its prob scratch) get a fresh id every step instead.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+#[allow(clippy::too_many_arguments)]
+fn build_mtp_draft_chain_graph(
+    cfg: &crate::Config,
+    wspecs: &[(DType, usize)],
+    embed_dtype: DType,
+    max_ctx: usize,
+    n_steps: usize,
+    start_pos: usize,
+) -> (Graph, MtpChainHandles) {
+    let ne = cfg.n_embd;
+    let nh = cfg.n_head;
+    let nkv = cfg.n_kv;
+    let hd = cfg.head_dim;
+    let qrow = nh * hd;
+    let kvrow = nkv * hd;
+    let nff = cfg.n_ff;
+    let eps = cfg.rms_eps;
+    let theta = cfg.rope_theta;
+    let rope_dim = cfg.rope_dim;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let vocab = cfg.vocab;
+
+    let mut g = Graph::new();
+    let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+    let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+    let i32d = |n: usize| TensorDesc::new(vec![n], DType::I32);
+
+    let id0 = g.input(i32d(1));
+    let h0 = g.input(f32d(ne));
+    let k_cache = g.input(f16d(max_ctx * kvrow));
+    let v_cache = g.input(f16d(max_ctx * kvrow));
+
+    let mut wi = 0usize;
+    let mut wpush = |g: &mut Graph| -> TensorId {
+        let (dt, n) = wspecs[wi];
+        wi += 1;
+        g.weight(TensorDesc::new(vec![n], dt))
+    };
+    // MUST match `upload_mtp_head_bufs`'s push order exactly (same 16 weights `build_mtp_graph`
+    // uses, unrolled `n_steps` times below against these SAME handles).
+    let w_attn_norm = wpush(&mut g);
+    let w_q = wpush(&mut g);
+    let w_k = wpush(&mut g);
+    let w_v = wpush(&mut g);
+    let w_qn = wpush(&mut g);
+    let w_kn = wpush(&mut g);
+    let w_o = wpush(&mut g);
+    let w_ffn_norm = wpush(&mut g);
+    let w_gate = wpush(&mut g);
+    let w_up = wpush(&mut g);
+    let w_down = wpush(&mut g);
+    let w_eh_proj = wpush(&mut g);
+    let w_enorm = wpush(&mut g);
+    let w_hnorm = wpush(&mut g);
+    let w_head_norm = wpush(&mut g);
+    let w_lm_head = wpush(&mut g);
+    let weights = vec![
+        w_attn_norm,
+        w_q,
+        w_k,
+        w_v,
+        w_qn,
+        w_kn,
+        w_o,
+        w_ffn_norm,
+        w_gate,
+        w_up,
+        w_down,
+        w_eh_proj,
+        w_enorm,
+        w_hnorm,
+        w_head_norm,
+        w_lm_head,
+    ];
+    let w_embd = g.weight(TensorDesc::new(vec![vocab * ne], embed_dtype));
+
+    let mut pos_s_vec = Vec::with_capacity(n_steps);
+    let mut ids_out = Vec::with_capacity(n_steps);
+    let mut prev_id = id0;
+    let mut prev_h = h0;
+
+    for s in 0..n_steps {
+        let pos_s = g.input(i32d(1));
+        pos_s_vec.push(pos_s);
+        let sp = start_pos + s;
+
+        // ── per-step attention-layer scratch (a fresh id set each step; the recorder serializes
+        //    the sequential step bodies via ordinary RAW/WAR hazards) ──
+        let e_norm = g.internal(f32d(ne));
+        let h_norm = g.internal(f32d(ne));
+        let concat = g.internal(f32d(2 * ne));
+        let resid = g.internal(f32d(ne));
+        let hn = g.internal(f32d(ne));
+        let qg = g.internal(f32d(2 * qrow));
+        let q = g.internal(f32d(qrow));
+        let gate_a = g.internal(f32d(qrow));
+        let k = g.internal(f32d(kvrow));
+        let v = g.internal(f32d(kvrow));
+        let q16 = g.internal(f16d(qrow));
+        let k16 = g.internal(f16d(kvrow));
+        let attn = g.internal(f32d(qrow));
+        let sub = g.internal(f32d(ne));
+        let gbuf = g.internal(f32d(nff));
+        let ubuf = g.internal(f32d(nff));
+        let actbuf = g.internal(f32d(nff));
+        let hn2 = g.internal(f32d(ne));
+        let layer_out = g.internal(f32d(ne));
+
+        // e_raw_s = table[prev_id, :] * 1.0 — qwen35 isn't gemma, no embed scale (see
+        // `build_mtp_graph`'s `forward_draft` twin: the host-embed path uses scale 1.0 too).
+        let e_raw_s = g.internal(f32d(ne));
+        g.push(Op::EmbedGather {
+            ids: prev_id,
+            table: w_embd,
+            dst: e_raw_s,
+            rows: 1,
+            ne: ne as u32,
+            scale: 1.0,
+        });
+        let h_in_s = prev_h;
+
+        // e = rmsnorm(embed(t), enorm); h = rmsnorm(h_target, hnorm) — qwen35.cpp:542-546.
+        g.push(Op::RmsNorm {
+            x: e_raw_s,
+            weight: w_enorm,
+            dst: e_norm,
+            rows: 1,
+            dim: ne as u32,
+            eps,
+        });
+        g.push(Op::RmsNorm {
+            x: h_in_s,
+            weight: w_hnorm,
+            dst: h_norm,
+            rows: 1,
+            dim: ne as u32,
+            eps,
+        });
+        // concat = [e_norm | h_norm] — qwen35.cpp:548 (see `build_mtp_graph`'s doc on this layout).
+        g.push(Op::CopyStrided {
+            src: e_norm,
+            src_off: 0,
+            src_stride: ne as u32,
+            dst: concat,
+            dst_off: 0,
+            dst_stride: (2 * ne) as u32,
+            rows: 1,
+            n: ne as u32,
+        });
+        g.push(Op::CopyStrided {
+            src: h_norm,
+            src_off: 0,
+            src_stride: ne as u32,
+            dst: concat,
+            dst_off: ne as u32,
+            dst_stride: (2 * ne) as u32,
+            rows: 1,
+            n: ne as u32,
+        });
+        // resid = eh_proj @ concat — qwen35.cpp:551.
+        g.push(Op::Linear {
+            x: concat,
+            weight: w_eh_proj,
+            dst: resid,
+            m: 1,
+            in_f: (2 * ne) as u32,
+            out_f: ne as u32,
+            w_off: 0,
+        });
+
+        // ── one qwen35 full-attention layer on `resid` (own 1-layer KV) — qwen35.cpp:556-619 ──
+        g.push(Op::RmsNorm {
+            x: resid,
+            weight: w_attn_norm,
+            dst: hn,
+            rows: 1,
+            dim: ne as u32,
+            eps,
+        });
+        g.push(Op::Linear {
+            x: hn,
+            weight: w_q,
+            dst: qg,
+            m: 1,
+            in_f: ne as u32,
+            out_f: (qrow * 2) as u32,
+            w_off: 0,
+        });
+        for h in 0..nh {
+            g.push(Op::CopyStrided {
+                src: qg,
+                src_off: (h * 2 * hd) as u32,
+                src_stride: (nh * 2 * hd) as u32,
+                dst: q,
+                dst_off: (h * hd) as u32,
+                dst_stride: (nh * hd) as u32,
+                rows: 1,
+                n: hd as u32,
+            });
+            g.push(Op::CopyStrided {
+                src: qg,
+                src_off: (h * 2 * hd + hd) as u32,
+                src_stride: (nh * 2 * hd) as u32,
+                dst: gate_a,
+                dst_off: (h * hd) as u32,
+                dst_stride: (nh * hd) as u32,
+                rows: 1,
+                n: hd as u32,
+            });
+        }
+        g.push(Op::Linear {
+            x: hn,
+            weight: w_k,
+            dst: k,
+            m: 1,
+            in_f: ne as u32,
+            out_f: kvrow as u32,
+            w_off: 0,
+        });
+        g.push(Op::Linear {
+            x: hn,
+            weight: w_v,
+            dst: v,
+            m: 1,
+            in_f: ne as u32,
+            out_f: kvrow as u32,
+            w_off: 0,
+        });
+        g.push(Op::QkNormRope {
+            x: k,
+            weight: w_kn,
+            positions: pos_s,
+            dst: k16,
+            rows: 1,
+            n_head: nkv as u32,
+            head_dim: hd as u32,
+            rope_dim: rope_dim as u32,
+            theta,
+            eps,
+            freq_factors: None,
+        });
+        g.push(Op::WriteKv {
+            src: k16,
+            cache: k_cache,
+            rows: 1,
+            row_stride: kvrow as u32,
+            pos: sp as u32,
+        });
+        g.push(Op::WriteKv {
+            src: v,
+            cache: v_cache,
+            rows: 1,
+            row_stride: kvrow as u32,
+            pos: sp as u32,
+        });
+        g.push(Op::QkNormRope {
+            x: q,
+            weight: w_qn,
+            positions: pos_s,
+            dst: q16,
+            rows: 1,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            rope_dim: rope_dim as u32,
+            theta,
+            eps,
+            freq_factors: None,
+        });
+        g.push(Op::Attention {
+            q: q16,
+            k_cache,
+            v_cache,
+            dst: attn,
+            rows: 1,
+            kv_len: (sp + 1) as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Causal,
+            pos: sp as u32,
+        });
+        g.push(Op::GatedAct {
+            gate: gate_a,
+            up: attn,
+            dst: attn,
+            rows: 1,
+            nff: qrow as u32,
+            act: Activation::Sigmoid,
+            up_off: 0,
+        });
+        g.push(Op::Linear {
+            x: attn,
+            weight: w_o,
+            dst: sub,
+            m: 1,
+            in_f: qrow as u32,
+            out_f: ne as u32,
+            w_off: 0,
+        });
+        g.push(Op::Add {
+            a: resid,
+            b: sub,
+            dst: resid,
+            n: ne as u32,
+        });
+        g.push(Op::RmsNorm {
+            x: resid,
+            weight: w_ffn_norm,
+            dst: hn2,
+            rows: 1,
+            dim: ne as u32,
+            eps,
+        });
+        g.push(Op::Linear {
+            x: hn2,
+            weight: w_gate,
+            dst: gbuf,
+            m: 1,
+            in_f: ne as u32,
+            out_f: nff as u32,
+            w_off: 0,
+        });
+        g.push(Op::Linear {
+            x: hn2,
+            weight: w_up,
+            dst: ubuf,
+            m: 1,
+            in_f: ne as u32,
+            out_f: nff as u32,
+            w_off: 0,
+        });
+        g.push(Op::GatedAct {
+            gate: gbuf,
+            up: ubuf,
+            dst: actbuf,
+            rows: 1,
+            nff: nff as u32,
+            act: Activation::Silu,
+            up_off: 0,
+        });
+        g.push(Op::Linear {
+            x: actbuf,
+            weight: w_down,
+            dst: sub,
+            m: 1,
+            in_f: nff as u32,
+            out_f: ne as u32,
+            w_off: 0,
+        });
+        g.push(Op::Add {
+            a: resid,
+            b: sub,
+            dst: layer_out,
+            n: ne as u32,
+        });
+
+        // h_mtp_s = rmsnorm(layer_out, shared_head_norm) — fed to step s+1's h_in AS-IS (internal,
+        // never bound/downloaded — see this fn's doc).
+        let h_mtp_s = g.internal(f32d(ne));
+        g.push(Op::RmsNorm {
+            x: layer_out,
+            weight: w_head_norm,
+            dst: h_mtp_s,
+            rows: 1,
+            dim: ne as u32,
+            eps,
+        });
+        // logits_s = lm_head @ h_mtp_s — Internal, read straight into Op::ArgmaxProb below (never
+        // leaves the device, exactly like `build_mtp_graph(fuse_prob=true)`).
+        let logits_s = g.internal(f32d(vocab));
+        g.push(Op::Linear {
+            x: h_mtp_s,
+            weight: w_lm_head,
+            dst: logits_s,
+            m: 1,
+            in_f: ne as u32,
+            out_f: vocab as u32,
+            w_off: 0,
+        });
+
+        // id_s: the drafted token, read back by the host AND fed as step s+1's EmbedGather ids
+        // (Op::ArgmaxProb writes a raw u32 index; Op::EmbedGather reads its `ids` input as I32 —
+        // same bit pattern, see this fn's doc). prob is discarded (greedy: p_min == 0.0 never
+        // early-exits, `draft`'s doc / `DEFAULT_P_MIN`).
+        let id_s = g.output(i32d(1));
+        let prob_scratch_s = g.internal(f32d(1));
+        g.push(Op::ArgmaxProb {
+            x: logits_s,
+            dst_id: id_s,
+            dst_prob: prob_scratch_s,
+            n: vocab as u32,
+        });
+
+        ids_out.push(id_s);
+        prev_id = id_s;
+        prev_h = h_mtp_s;
+    }
+
+    (
+        g,
+        MtpChainHandles {
+            id0,
+            h0,
+            pos_s: pos_s_vec,
+            k_cache,
+            v_cache,
+            weights,
+            w_embd,
+            ids: ids_out,
+        },
+    )
+}
+
 /// A live MTP head: the head's OWN uploaded weights + its OWN 1-layer KV (independent of the
 /// trunk's — `docs/MTP.md`'s driver section), driven by `forward`/`catch_up`/`draft`. Borrows the
 /// backend and the host embedding table for its lifetime (mirrors `seam.rs`'s session
@@ -748,6 +1263,14 @@ pub struct MtpHeadSession<'a> {
     k_cache: Box<dyn Buffer>,
     v_cache: Box<dyn Buffer>,
     max_ctx: usize,
+    /// The head's own/main-model embedding table, uploaded as a device Weight — `Some` only when
+    /// the backend + table dtype support on-device `Op::EmbedGather` (see
+    /// [`build_embed_chain_buf`]/[`can_draft_chain`](Self::can_draft_chain)). `None` means
+    /// [`draft_chain`](Self::draft_chain) is unavailable and callers must fall back to [`draft`].
+    embed_buf: Option<Box<dyn Buffer>>,
+    /// The embedding table's effective dtype as uploaded (mirrors `wspecs`'s per-weight dtype) —
+    /// meaningless when `embed_buf` is `None`.
+    embed_dtype: DType,
     /// Phase 3 perf instrumentation (issue #33, `INFR_MTP_TIME=1` — see
     /// `generate_mtp_spec_vulkan`'s doc on the per-call rebuild cost this is meant to quantify):
     /// cumulative seconds spent building+compiling a fresh [`Graph`] per [`forward`](Self::forward)
@@ -864,6 +1387,7 @@ impl<'a> MtpHeadSession<'a> {
         let v_cache = be
             .alloc(max_ctx * kvrow * 2, BufferUsage::Activations)
             .map_err(|e| anyhow!("{e}"))?;
+        let (embed_buf, embed_dtype) = build_embed_chain_buf(be, bind_weight, g, cfg, head)?;
         Ok(Self {
             be,
             cfg: cfg.clone(),
@@ -873,6 +1397,8 @@ impl<'a> MtpHeadSession<'a> {
             k_cache,
             v_cache,
             max_ctx,
+            embed_buf,
+            embed_dtype,
             build_secs: 0.0,
             exec_secs: 0.0,
         })
@@ -1124,6 +1650,152 @@ impl<'a> MtpHeadSession<'a> {
     /// escape (byte-identity verification against the host `top1_softmax` path) must be unset.
     fn gpu_draft_prob_enabled(&self) -> bool {
         self.be.capabilities().argmax_prob && std::env::var("INFR_NO_GPU_DRAFT_PROB").is_err()
+    }
+
+    /// Whether [`draft_chain`](Self::draft_chain) can run: the head's embedding table uploaded as
+    /// a device Weight (see [`build_embed_chain_buf`]) — `None` when the backend/dtype doesn't
+    /// support on-device `Op::EmbedGather` for this table (Metal today, or an unsupported quant
+    /// format). Callers gate the fused-chain fast path on this and fall back to [`draft`].
+    pub fn can_draft_chain(&self) -> bool {
+        self.embed_buf.is_some()
+    }
+
+    /// The self-chained greedy draft loop (issue #33 follow-up to `forward_draft`'s per-step
+    /// fusion): unrolls `n_steps` copies of the head forward into ONE [`Graph`]
+    /// ([`build_mtp_draft_chain_graph`]) — id/`h_mtp` chained device-side via
+    /// `Op::EmbedGather`/internal tensors instead of the old `draft()`'s `n_steps` sequential
+    /// submit→wait→readback round-trips — compiles + executes it ONCE, and downloads the
+    /// `n_steps` drafted ids in one pass. Measured baseline: `n_max = 6` round-trips cost ~9ms/
+    /// cycle on Qwen3.5-9B, ~0.9ms/step of which is pure submit/wait/readback/alloc overhead (not
+    /// compute) — fusing to one submission is expected to roughly halve draft wall time.
+    ///
+    /// ## Correctness
+    /// `crate::seam::model::spec_accept` (the VERIFY step every caller of `draft`/`draft_chain`
+    /// runs the candidates through) only ever COMMITS a token the trunk's own greedy argmax
+    /// independently confirms — the draft candidates are a proposal, never committed directly.
+    /// That means the draft head's numerics can only ever affect α (how many of its guesses the
+    /// trunk happens to agree with), NEVER which tokens land in the output stream: the committed
+    /// stream is provably trunk-greedy regardless of whether the draft ran as `n_steps` separate
+    /// calls or one fused chain. The fixed `n_steps`-long unroll (no early exit mid-chain) is valid
+    /// because greedy drafting uses `DEFAULT_P_MIN == 0.0` and a softmax top-1 probability is
+    /// always `> 0.0`, so `draft`'s `if p < p_min { break }` NEVER fires in practice — every greedy
+    /// draft call already runs the full `n_max` steps today, so unrolling exactly that many steps
+    /// changes nothing observable. Finally, `Op::EmbedGather` here reads the SAME embedding table
+    /// (`w_embd`, uploaded from the identical GGUF tensor `build_embed_chain_buf` resolves) the
+    /// host-side `forward_draft`/`draft` path reads via `embed_table` — same bytes, same dequant —
+    /// so α should match or improve, never regress from a table mismatch.
+    ///
+    /// Requires [`can_draft_chain`](Self::can_draft_chain); panics (via `expect`) if called
+    /// without checking it first — callers MUST gate on `can_draft_chain()` (see
+    /// `generate_mtp_spec_core`'s greedy branch).
+    pub fn draft_chain(
+        &mut self,
+        id_last: u32,
+        pending_h: &[f32],
+        n_past: usize,
+        n_steps: usize,
+    ) -> Result<Vec<u32>> {
+        let ne = self.cfg.n_embd;
+        anyhow::ensure!(
+            pending_h.len() == ne,
+            "MTP head draft_chain: pending_h length {} != ne {ne}",
+            pending_h.len()
+        );
+        anyhow::ensure!(
+            n_past + n_steps <= self.max_ctx,
+            "MTP head draft_chain: KV overflow ({n_past}+{n_steps} > max_ctx {})",
+            self.max_ctx
+        );
+        anyhow::ensure!(n_steps > 0, "MTP head draft_chain: n_steps must be > 0");
+
+        let t_build = std::time::Instant::now();
+        let (graph, h) = build_mtp_draft_chain_graph(
+            &self.cfg,
+            &self.wspecs,
+            self.embed_dtype,
+            self.max_ctx,
+            n_steps,
+            n_past,
+        );
+        let plan = self.be.compile(&graph).map_err(|e| anyhow!("{e}"))?;
+        self.build_secs += t_build.elapsed().as_secs_f64();
+
+        let t_exec = std::time::Instant::now();
+        let id0_buf = self
+            .be
+            .alloc(4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let h0_buf = self
+            .be
+            .alloc(ne * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        let mut pos_bufs = Vec::with_capacity(n_steps);
+        for _ in 0..n_steps {
+            pos_bufs.push(
+                self.be
+                    .alloc(4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        let mut id_bufs = Vec::with_capacity(n_steps);
+        for _ in 0..n_steps {
+            id_bufs.push(
+                self.be
+                    .alloc(4, BufferUsage::Readback)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+
+        self.be
+            .upload(id0_buf.as_ref(), bytemuck::cast_slice(&[id_last as i32]))
+            .map_err(|e| anyhow!("{e}"))?;
+        self.be
+            .upload(h0_buf.as_ref(), bytemuck::cast_slice(pending_h))
+            .map_err(|e| anyhow!("{e}"))?;
+        for (s, pos_buf) in pos_bufs.iter().enumerate() {
+            let p = (n_past + s) as i32;
+            self.be
+                .upload(pos_buf.as_ref(), bytemuck::cast_slice(&[p]))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+
+        let embed_buf = self
+            .embed_buf
+            .as_ref()
+            .expect("draft_chain requires can_draft_chain() to be checked by the caller")
+            .as_ref();
+
+        let mut b = Bindings::new();
+        b.bind(h.id0, id0_buf.as_ref());
+        b.bind(h.h0, h0_buf.as_ref());
+        b.bind(h.k_cache, self.k_cache.as_ref());
+        b.bind(h.v_cache, self.v_cache.as_ref());
+        for (i, wid) in h.weights.iter().enumerate() {
+            b.bind(*wid, self.wbufs[i].as_ref());
+        }
+        b.bind(h.w_embd, embed_buf);
+        for (pos_id, pos_buf) in h.pos_s.iter().zip(pos_bufs.iter()) {
+            b.bind(*pos_id, pos_buf.as_ref());
+        }
+        for (id_id, id_buf) in h.ids.iter().zip(id_bufs.iter()) {
+            b.bind(*id_id, id_buf.as_ref());
+        }
+
+        self.be
+            .execute(plan.as_ref(), &b)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        let mut out = Vec::with_capacity(n_steps);
+        for buf in &id_bufs {
+            let mut idb = [0u8; 4];
+            self.be
+                .download(buf.as_ref(), &mut idb)
+                .map_err(|e| anyhow!("{e}"))?;
+            out.push(u32::from_le_bytes(idb));
+        }
+        self.exec_secs += t_exec.elapsed().as_secs_f64();
+
+        Ok(out)
     }
 }
 
@@ -1596,6 +2268,13 @@ fn generate_mtp_spec_core(
             let cand = drafted.iter().map(|(id, _)| *id).collect();
             let q_dists = drafted.into_iter().map(|(_, q)| q).collect();
             (cand, q_dists)
+        } else if head_sess.can_draft_chain() && std::env::var("INFR_NO_MTP_DRAFT_CHAIN").is_err() {
+            // Fused single-submission chain (issue #33 follow-up — see `draft_chain`'s doc for the
+            // correctness argument): replaces `n_max_round` sequential submit→wait→readback
+            // round-trips with ONE compile+execute+download. `INFR_NO_MTP_DRAFT_CHAIN=1` A/B
+            // escape keeps the old per-step `draft()` path for comparison.
+            let cand = head_sess.draft_chain(id_last, &pending_h, n_past, n_max_round)?;
+            (cand, Vec::new())
         } else {
             let drafted = draft(
                 head_sess,

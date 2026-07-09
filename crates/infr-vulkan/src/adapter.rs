@@ -639,6 +639,23 @@ fn lower_op(
                 *eps,
             );
         }
+        Op::RmsNormAdd {
+            x,
+            weight,
+            dst,
+            rows,
+            dim,
+            eps,
+        } => {
+            rec.rmsnorm_add(
+                r(*x)?,
+                r(*weight)?,
+                r(*dst)?,
+                *rows as usize,
+                *dim as usize,
+                *eps,
+            );
+        }
         // Row-wise softmax over `dim` columns (diffusion-gemma's in-graph self-conditioning — see
         // docs/DIFFUSIONGEMMA.md's Phase-B and the reference's `dg_canvas_embed`). `scale_buf`
         // (Some only on the DiffusionGemma denoise SC path — see its doc in `infr_core::graph`)

@@ -2343,19 +2343,14 @@ pub(crate) fn generate_dense_backend(
                     out_f: ne as u32,
                     w_off: 0,
                 });
-                g.push(Op::RmsNorm {
+                // fused RMSNorm + Add: hidden += rmsnorm(plp, post_norm)
+                g.push(Op::RmsNormAdd {
                     x: plp,
                     weight: post_norm,
-                    dst: plp,
+                    dst: hidden,
                     rows: batch as u32,
                     dim: ne as u32,
                     eps,
-                });
-                g.push(Op::Add {
-                    a: hidden,
-                    b: plp,
-                    dst: hidden,
-                    n: (batch * ne) as u32,
                 });
             }
             // gemma4: scale the whole layer output by the per-layer scalar before the next layer.

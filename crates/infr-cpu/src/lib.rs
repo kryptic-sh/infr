@@ -443,6 +443,30 @@ impl Backend for CpuBackend {
                     });
                     vals[dst.0 as usize] = out;
                 }
+                Op::RmsNormAdd {
+                    x,
+                    weight: w,
+                    dst,
+                    rows: _rows,
+                    dim,
+                    eps,
+                } => {
+                    let dim = dim as usize;
+                    let xs = &vals[x.0 as usize];
+                    let ws = weight(w);
+                    let mut dst_vals = vals[dst.0 as usize].clone();
+                    self.pool()
+                        .for_chunks_mut(&mut dst_vals, dim, 4, &|r, drow| {
+                            let xrow = &xs[r * dim..r * dim + dim];
+                            let ss: f32 =
+                                (0..dim).map(|i| xrow[i] * xrow[i]).sum::<f32>() / dim as f32;
+                            let s = 1.0 / (ss + eps).sqrt();
+                            for i in 0..dim {
+                                drow[i] += xrow[i] * s * ws[i];
+                            }
+                        });
+                    vals[dst.0 as usize] = dst_vals;
+                }
                 Op::Softmax {
                     x,
                     dst,

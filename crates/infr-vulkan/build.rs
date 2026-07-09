@@ -94,6 +94,7 @@ fn main() {
         // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate, Op::GatedRmsNorm) —
         // same reduction as `rmsnorm`, one extra buffer + the gate multiply on store.
         ("rmsnorm", "rmsnorm_gate", &["-DGATE"]),
+        ("rmsnorm", "rmsnorm_add", &["-DADD"]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).

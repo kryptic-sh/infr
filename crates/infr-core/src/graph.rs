@@ -93,6 +93,16 @@ pub enum Op {
         dim: u32,
         eps: f32,
     },
+    /// `dst += rmsnorm(x) * weight`: normalize `x` per row, then add to `dst` in-place.
+    /// Eliminates the separate RmsNorm + Add dispatch pair (E2B per-layer projection tail).
+    RmsNormAdd {
+        x: TensorId,
+        weight: TensorId,
+        dst: TensorId,
+        rows: u32,
+        dim: u32,
+        eps: f32,
+    },
     /// `dst[m, out_f] = x[m, in_f] · weightᵀ`. `weight` may be any (quantized) dtype; the backend
     /// dispatches the kernel (GEMV/GEMM/MMQ on GPU, dequant+matvec on CPU).
     Linear {
@@ -492,6 +502,7 @@ impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
             Op::RmsNorm { .. } => "RmsNorm",
+            Op::RmsNormAdd { .. } => "RmsNormAdd",
             Op::Softmax { .. } => "Softmax",
             Op::Linear { .. } => "Linear",
             Op::QkNorm { .. } => "QkNorm",

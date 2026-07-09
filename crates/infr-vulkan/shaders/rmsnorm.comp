@@ -1,18 +1,8 @@
 #version 460
 // RMSNorm: y[i] = x[i] * inversesqrt(mean(x²) + eps) * w[i], one workgroup per row.
-// Replaces the 64-thread WGSL shared-tree version (6 barriers): 256 threads (4× the load/store
-// parallelism for this memory-bound op) and a subgroup reduction (subgroupAdd within each wave +
-// one shared combine across the 8 waves → a single barrier). Decode rmsnorm is one workgroup on a
-// 96-CU GPU; the kernel is ~2.6× faster (8.6→3.3us/op). End-to-end neutral on the 7900 XTX (decode
-// is dispatch-latency-bound, prefill matmul-bound), but a strict win on hardware where this op or
-// its barriers cost more. Requires requiredSubgroupSize=32 (wave32 → 8 subgroups).
-//
-// -DGATE build (`rmsnorm_gate`, `Op::GatedRmsNorm`): fuses in the qwen35 DeltaNet z-gate multiply
-// — y[i] = rmsnorm(x)[i] * silu(z[i]) — so QkNorm's write and GatedAct's read of it never round-
-// trip through a barrier. Reduction code below is UNCHANGED between the two builds (bit-identical
-// normalization); GATE only adds the extra buffer read + silu multiply on the final store. `z`
-// (read-only) is bound BEFORE `y` (the write) — the recorder's hazard tracker treats the buffer
-// array's trailing entries as writes (`Recorder::rmsnorm_gate`'s `n_out=1`), so `y` must be last.
+// -DGATE build (`rmsnorm_gate`): fuses in the qwen35 DeltaNet z-gate multiply
+// -DADD build (`rmsnorm_add`): fuses in an in-place add to dst: dst[i] += norm_result[i]
+// Requires requiredSubgroupSize=32 (wave32 → 8 subgroups).
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
@@ -24,11 +14,13 @@ layout(binding = 1) readonly buffer WB { float w[]; };
 #ifdef GATE
 layout(binding = 2) readonly buffer ZB { float z[]; };
 layout(binding = 3) buffer YB { float y[]; };
+#elif defined(ADD)
+layout(binding = 2) buffer DB { float dst[]; };
 #else
 layout(binding = 2) buffer YB { float y[]; };
 #endif
 
-shared float part[8];   // one partial per subgroup (256 threads / 32 = 8 waves)
+shared float part[8];
 
 void main() {
     uint r = gl_WorkGroupID.x;
@@ -52,6 +44,8 @@ void main() {
         float gate = zv / (1.0 + exp(-zv));
         y[base + i] = x[base + i] * scale * w[i] * gate;
     }
+#elif defined(ADD)
+    for (uint i = t; i < pc.dim; i += 256u) { dst[base + i] += x[base + i] * scale * w[i]; }
 #else
     for (uint i = t; i < pc.dim; i += 256u) { y[base + i] = x[base + i] * scale * w[i]; }
 #endif

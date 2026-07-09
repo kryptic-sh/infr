@@ -185,6 +185,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
     for op in &g.ops {
         match op {
             Op::RmsNorm { .. }
+            | Op::RmsNormAdd { .. }
             | Op::Linear { .. }
             | Op::GatedAct { .. }
             | Op::GatedActFused { .. }
@@ -327,6 +328,7 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
 fn op_name(op: &Op) -> &'static str {
     match op {
         Op::RmsNorm { .. } => "RmsNorm",
+        Op::RmsNormAdd { .. } => "RmsNormAdd",
         Op::Softmax { .. } => "Softmax",
         Op::Linear { .. } => "Linear",
         Op::QkNorm { .. } => "QkNorm",
@@ -1303,6 +1305,47 @@ impl MetalBackend {
                     &p,
                     rows * tgw,
                     tgw,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::RmsNormAdd {
+                x,
+                weight,
+                dst,
+                rows,
+                dim,
+                eps,
+            } => {
+                // Metal: decompose to RmsNorm then add in-place (no dedicated fused kernel yet).
+                let (rows, dim) = (rows as usize, dim as usize);
+                let bx = self.ensure_device(r, x);
+                let bw = self.weight_buf(weight, g, bindings)?;
+                let bd = self.ensure_device(r, dst);
+                let pso = self.pipelines.get("rmsnorm_f32")?;
+                let mut p = (rows as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(dim as u32).to_ne_bytes());
+                p.extend_from_slice(&eps.to_ne_bytes());
+                // temp scratch for rmsnorm result
+                let tmp = self.alloc_scratch(r, rows * dim);
+                self.encode_tg_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bw.as_ref(), tmp.as_ref()],
+                    1 << 2,
+                    &p,
+                    rows * 32,
+                    32,
+                );
+                // add to dst in-place
+                let pso_a = self.pipelines.get("add_f32")?;
+                self.encode_tg_w(
+                    r,
+                    &pso_a,
+                    &[tmp.as_ref(), bd.as_ref(), bd.as_ref()],
+                    1 << 2,
+                    &((rows * dim) as u32).to_ne_bytes(),
+                    rows * 32,
+                    32,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

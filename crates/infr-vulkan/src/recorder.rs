@@ -2215,6 +2215,33 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Fused RMSNorm + in-place add: `dst[r*..] += rmsnorm(x)[r*..] * w`. One workgroup per row.
+    /// Replaces the RmsNorm + Add dispatch pair (E2B per-layer projection tail).
+    pub fn rmsnorm_add(
+        &self,
+        x: &dyn Buffer,
+        w: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) {
+        let k = self
+            .be
+            .kernel_sg("rmsnorm_add", crate::gemm::rmsnorm_add_spv(), 3, 12, 32);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(dst)],
+            1,
+            &push,
+            rows as u32,
+        );
+    }
+
     pub fn rmsnorm(
         &self,
         x: &dyn Buffer,

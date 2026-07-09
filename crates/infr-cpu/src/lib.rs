@@ -1095,13 +1095,22 @@ impl Backend for CpuBackend {
                     up_off,
                     up_stride,
                 } => {
-                    let (rows, nff, up_off, up_stride) = (rows as usize, nff as usize, up_off as usize, up_stride as usize);
+                    let (rows, nff, up_off, up_stride) = (
+                        rows as usize,
+                        nff as usize,
+                        up_off as usize,
+                        up_stride as usize,
+                    );
                     let gs = &vals[gate.0 as usize];
                     let us = &vals[up.0 as usize];
                     let mut out = vec![0f32; rows * nff];
                     self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = r * nff;
-                        let ub = if up_stride == 0 { r * nff + up_off } else { r * up_stride + up_off };
+                        let ub = if up_stride == 0 {
+                            r * nff + up_off
+                        } else {
+                            r * up_stride + up_off
+                        };
                         for i in 0..nff {
                             orow[i] = act_fn(act, gs[gb + i]) * us[ub + i];
                         }

@@ -1387,23 +1387,29 @@ fn lower_op(
             match act {
                 Activation::Silu => {
                     if *up_off != 0 || *up_stride != 0 {
-                        return Err(be("vulkan adapter: GatedAct Silu up_off/stride!=0 unsupported"));
+                        return Err(be(
+                            "vulkan adapter: GatedAct Silu up_off/stride!=0 unsupported",
+                        ));
                     }
                     rec.silu_mul(g_, u_, y, n);
                 }
                 Activation::Sigmoid => {
                     if *up_off != 0 || *up_stride != 0 {
-                        return Err(be("vulkan adapter: GatedAct Sigmoid up_off/stride!=0 unsupported"));
+                        return Err(be(
+                            "vulkan adapter: GatedAct Sigmoid up_off/stride!=0 unsupported",
+                        ));
                     }
                     rec.mul_sigmoid(u_, g_, y, n);
                 }
                 Activation::Gelu => {
                     rec.gelu_mul_off(
-                        g_, u_,
+                        g_,
+                        u_,
                         *up_off as usize * eb,
                         *up_stride as usize * eb,
                         *nff as usize,
-                        y, n,
+                        y,
+                        n,
                     );
                 }
             }
@@ -2858,9 +2864,15 @@ fn lower_op(
                     Activation::Sigmoid => {
                         rec.mul_sigmoid(gbuf.get(pool), ubuf.get(pool), abuf.get(pool), n_act)
                     }
-                    Activation::Gelu => {
-                        rec.gelu_mul_off(gbuf.get(pool), ubuf.get(pool), 0, 0, nff, abuf.get(pool), n_act)
-                    }
+                    Activation::Gelu => rec.gelu_mul_off(
+                        gbuf.get(pool),
+                        ubuf.get(pool),
+                        0,
+                        0,
+                        nff,
+                        abuf.get(pool),
+                        n_act,
+                    ),
                 }
             }
             rec.linear_native_id_multi(
@@ -3380,6 +3392,7 @@ mod tests {
             nff: nff as u32,
             act: Activation::Silu,
             up_off: 0,
+            up_stride: 0,
         });
         let gb = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
         let ub = be_.alloc(nff * 4, BufferUsage::Activations).unwrap();
@@ -3886,6 +3899,7 @@ mod tests {
             nff: nff as u32,
             act: Activation::Gelu,
             up_off: 0,
+            up_stride: 0,
         });
         g.push(Op::Linear {
             x: act_i,

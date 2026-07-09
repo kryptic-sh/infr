@@ -1626,9 +1626,9 @@ pub(crate) fn generate_dense_backend(
                         rows: batch as u32,
                         nff: (q35_nv * q35_vd) as u32,
                         act: Activation::Silu,
-up_off: 0,
-                    up_stride: 0,
-                });
+                        up_off: 0,
+                        up_stride: 0,
+                    });
                 }
                 g.push(Op::Linear {
                     x: dn_out,
@@ -1929,9 +1929,9 @@ up_off: 0,
                         rows: batch as u32,
                         nff: qrow as u32,
                         act: Activation::Sigmoid,
-up_off: 0,
-                    up_stride: 0,
-                });
+                        up_off: 0,
+                        up_stride: 0,
+                    });
                 }
                 g.push(Op::Linear {
                     x: attn,
@@ -2023,9 +2023,9 @@ up_off: 0,
                         rows: batch as u32,
                         nff: nff_l as u32,
                         act,
-up_off: 0,
-                    up_stride: 0,
-                });
+                        up_off: 0,
+                        up_stride: 0,
+                    });
                     g.push(Op::Linear {
                         x: actbuf,
                         weight: wdown,

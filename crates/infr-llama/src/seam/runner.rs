@@ -481,9 +481,10 @@ pub(crate) fn generate_dense_backend(
                 "ffn_norm.weight"
             };
             wload(&[&p(ffn_norm_name)])?;
-            if c.diffusion_gemma {
+            if c.dual_moe() {
                 // Dual FFN: dense GeGLU (n_ff=2112) ∥ 128-expert MoE (fused gate_up_exps + a
-                // per-expert down scale), summed — see docs/DIFFUSIONGEMMA.md's FFN wiring.
+                // per-expert down scale), summed — see docs/DIFFUSIONGEMMA.md's FFN wiring. Shared
+                // by diffusion-gemma and the autoregressive gemma4 MoE (26B-A4B); identical tensors.
                 // `fuse_gu`: one concatenated [2*nff,ne] gate+up tensor (see the comment at its
                 // definition) instead of two separate n_ff=2112 tensors.
                 if fuse_gu {
@@ -591,10 +592,11 @@ pub(crate) fn generate_dense_backend(
             wbufs.push(b);
             wspecs.push((DType::F32, max_hd));
         }
-        // diffusion-gemma: weightless FULL-WIDTH (ne-wide) RMSNorm for the MoE router's own input
-        // (`rmsnorm_noscale(attn_out)`, see the graph-build wiring) — a SEPARATE ones-vector from
-        // `v_ones` above (that one's per-HEAD width `max_hd`; this is the whole residual width).
-        if c.diffusion_gemma {
+        // dual-FFN MoE (diffusion-gemma / gemma4 26B-A4B): weightless FULL-WIDTH (ne-wide) RMSNorm
+        // for the MoE router's own input (`rmsnorm_noscale(attn_out)`, see the graph-build wiring) —
+        // a SEPARATE ones-vector from `v_ones` above (that one's per-HEAD width `max_hd`; this is
+        // the whole residual width).
+        if c.dual_moe() {
             let ones = vec![1.0f32; ne];
             let b = be
                 .alloc(ones.len() * 4, BufferUsage::Weights)
@@ -1016,7 +1018,7 @@ pub(crate) fn generate_dense_backend(
                 None
             };
             let ffn_norm = wpush(&mut g, &mut weights);
-            let ffn = if c.diffusion_gemma {
+            let ffn = if c.dual_moe() {
                 let d_gate = wpush(&mut g, &mut weights);
                 // fused: `d_up` is the SAME handle as `d_gate` (one concatenated upload, see the
                 // matching `wload` above) — never separately read; mirrors `FfnW::Moe`'s
@@ -1155,9 +1157,10 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
-        // diffusion-gemma: weightless full-width (ne) RMSNorm ones-vector for the MoE router's own
-        // input — see the matching upload in `generate_dense_backend`'s init block.
-        let router_ones = if c.diffusion_gemma {
+        // dual-FFN MoE (diffusion-gemma / gemma4 26B-A4B): weightless full-width (ne) RMSNorm
+        // ones-vector for the MoE router's own input — see the matching upload in
+        // `generate_dense_backend`'s init block.
+        let router_ones = if c.dual_moe() {
             Some(wpush(&mut g, &mut weights))
         } else {
             None
@@ -3152,7 +3155,7 @@ pub(crate) fn generate_dense_backend(
     };
     let moe_batched_ok = c.moe.is_some() && {
         let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
-        if c.diffusion_gemma {
+        if c.dual_moe() {
             (0..c.n_layer).all(|l| {
                 moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_up_exps.weight")))
                     && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))

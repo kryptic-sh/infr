@@ -53,6 +53,7 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | Gemma 3           | `gemma3`          | SWA + QK-norm + GeGLU, dual-RoPE                       |
 | Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm         |
 | Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing         |
+| Gemma 4 **MoE**   | `gemma4`          | 26B-A4B: dual FFN (dense GeGLU ∥ 8-of-128 routed), AR  |
 | Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)    |
 | Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert     |
 | DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode |
@@ -237,8 +238,8 @@ dequant).
 
 - **Format:** GGUF
 - **Models:** Llama, Qwen2/2.5, Qwen3 (dense + MoE), Gemma 3, Gemma 4 (dense +
-  E2B), Qwen3.5/3.6 (dense + MoE) — all on GPU **and** the CPU reference;
-  DiffusionGemma (block text-diffusion, CPU + GPU)
+  E2B + 26B-A4B MoE), Qwen3.5/3.6 (dense + MoE) — all on GPU **and** the CPU
+  reference; DiffusionGemma (block text-diffusion, CPU + GPU)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
   via a native **Metal backend** (`INFR_METAL=1`) covering every op the CPU
   reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is

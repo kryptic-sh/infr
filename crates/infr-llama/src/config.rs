@@ -60,6 +60,11 @@ pub struct Config {
     /// summed) and the encoder-scalar tensor name (`enc_layer_output_scale` vs gemma4's
     /// `layer_output_scale`); everything else reuses the `gemma4` backbone gate above.
     pub diffusion_gemma: bool,
+    /// gemma4 MoE (26B-A4B): `true` for a plain `gemma4` arch that carries routed-expert tensors.
+    /// Shares diffusion-gemma's dual-FFN wiring (`FfnW::DiffusionMoe`) — gate the FFN build with
+    /// [`Config::dual_moe`], NOT `diffusion_gemma`, so both variants take it — but runs the standard
+    /// autoregressive decode (no canvas/denoise). `false` for gemma4 dense (E2B/E4B).
+    pub gemma4_moe: bool,
     /// diffusion-gemma: the canvas (denoise-target) length — `[prompt | canvas]` splits at
     /// `n_tokens - canvas_length`. Phase 1 (prompt-only causal prefill) doesn't slice the canvas
     /// off, but the field is parsed now so later phases don't need to touch `Config` again. `0`
@@ -220,6 +225,13 @@ impl Config {
         self.n_kv.max(self.n_kv_swa)
     }
 
+    /// Whether the per-layer FFN is the dual GeGLU ∥ MoE block (`FfnW::DiffusionMoe`): both
+    /// diffusion-gemma and the autoregressive gemma4 MoE (26B-A4B) share that FFN wiring. Gate
+    /// FFN structure on this, NOT `diffusion_gemma` (which additionally implies canvas/denoise).
+    pub fn dual_moe(&self) -> bool {
+        self.diffusion_gemma || self.gemma4_moe
+    }
+
     /// qwen35: whether layer `il` is one of the FULL-attention layers (vs gated-DeltaNet linear
     /// attention). `false` for every non-qwen35 model. Mirrors the old seam's `Cfg::is_attn_layer`.
     pub fn is_qwen35_attn_layer(&self, il: usize) -> bool {
@@ -288,6 +300,14 @@ impl Config {
         // actually different (dual FFN, canvas/mask fields, encoder-scalar tensor name).
         let gemma4 = arch == crate::arch::GEMMA4 || diffusion_gemma;
         let gemma = arch == crate::arch::GEMMA3 || gemma4;
+        // gemma4 MoE (26B-A4B): the same gemma4 backbone with a routed-expert FFN — structurally
+        // identical to diffusion-gemma's dual FFN (dense GeGLU ∥ 128-expert MoE, fused `gate_up_exps`
+        // + per-expert `down_exps` scale + router-input rmsnorm/scale, summed), minus the diffusion
+        // decode. Detected by expert tensors on a plain `gemma4` arch (dense E2B/E4B carry none).
+        // Gates the `FfnW::DiffusionMoe` FFN build via `dual_moe()`; every other gemma4-shared field
+        // (attention, softcap, `layer_output_scale`) is unchanged.
+        let gemma4_moe =
+            arch == crate::arch::GEMMA4 && meta_u64(g, &format!("{arch}.expert_count")).is_some();
         // qwen35moe (Qwen3.6 MoE) runs the identical DeltaNet/full-attention skeleton as dense
         // qwen35 — `qwen35` gates every shared field below; `qwen35_moe` alone gates the FFN
         // shape (routed-expert bank + shared expert vs plain dense).
@@ -363,7 +383,7 @@ impl Config {
         // gating, confirmed against llama.cpp's `qwen35moe.cpp::build_layer_ffn` — hardcoded
         // `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX`/`norm_w=true`, identical to qwen3moe); only its
         // Qwen2-MoE-style SHARED expert (`shexp_ff` below) is genuinely new.
-        let moe = if arch == crate::arch::QWEN3_MOE || diffusion_gemma || qwen35_moe {
+        let moe = if arch == crate::arch::QWEN3_MOE || diffusion_gemma || qwen35_moe || gemma4_moe {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
                 meta_u64(g, &mk("expert_used_count")).context("expert_used_count")? as usize;
@@ -595,6 +615,7 @@ impl Config {
             gemma,
             gemma4,
             diffusion_gemma,
+            gemma4_moe,
             canvas_length,
             mask_token_id,
             eb_max_steps,

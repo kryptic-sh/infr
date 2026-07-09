@@ -25,7 +25,9 @@ pub const QWEN3_MOE: &str = "qwen3moe";
 /// Gemma 3: SWA + dual-rope, hd=256, GeGLU, sandwich norms, SPM tokenizer.
 pub const GEMMA3: &str = "gemma3";
 /// Gemma 4 (incl. E2B): per-layer heterogeneous dims, V-norm, freq_factors, softcap,
-/// per-layer output scale; E2B adds KV-sharing + per-layer input embeddings.
+/// per-layer output scale; E2B adds KV-sharing + per-layer input embeddings. The 26B-A4B variant
+/// carries routed-expert tensors on the same string — `Config::gemma4_moe` detects them and swaps
+/// in diffusion-gemma's dual FFN (`FfnW::DiffusionMoe`) via `Config::dual_moe`, autoregressive.
 pub const GEMMA4: &str = "gemma4";
 /// Qwen3.5/3.6 gated-DeltaNet hybrid (DENSE FFN) — runs through `Config::from_gguf`'s `qwen35`
 /// fields + `MixerW::DeltaNet` (see `crate::qwen35::Cfg` for the raw metadata parse). NOT

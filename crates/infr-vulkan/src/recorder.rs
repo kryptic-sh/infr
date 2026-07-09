@@ -3959,8 +3959,8 @@ impl<'a> Recorder<'a> {
     pub fn silu_mul(&self, gate: &dyn Buffer, up: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let k = self
             .be
-            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 16);
-        let mut push = [0u8; 16];
+            .kernel("silu_mul", crate::gemm::silu_mul_spv(), 3, 24);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         self.dispatch(
             k,
@@ -4356,17 +4356,21 @@ impl<'a> Recorder<'a> {
         up_off_bytes: usize,
         up_stride_bytes: usize,
         row_width: usize,
+        gate_stride_bytes: usize,
+        gate_row_width: usize,
         y: &dyn Buffer,
         n: usize,
     ) {
         let k = self
             .be
-            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 16);
-        let mut push = [0u8; 16];
+            .kernel("gelu_mul", crate::gemm::gelu_mul_spv(), 3, 24);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&((up_off_bytes / 4) as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&((up_stride_bytes / 4) as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(row_width as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((gate_stride_bytes / 4) as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(gate_row_width as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],

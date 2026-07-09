@@ -1136,6 +1136,7 @@ impl Backend for CpuBackend {
                     act,
                     up_off,
                     up_stride,
+                    ..
                 } => {
                     let (rows, nff, up_off, up_stride) = (
                         rows as usize,

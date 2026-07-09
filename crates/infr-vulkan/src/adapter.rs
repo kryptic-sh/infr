@@ -1397,6 +1397,8 @@ fn lower_op(
             act,
             up_off,
             up_stride,
+            gate_stride,
+            ..
         } => {
             let n = *rows as usize * *nff as usize;
             let (g_, u_, y) = (r(*gate)?, r(*up)?, r(*dst)?);
@@ -1424,6 +1426,8 @@ fn lower_op(
                         u_,
                         *up_off as usize * eb,
                         *up_stride as usize * eb,
+                        *nff as usize,
+                        *gate_stride as usize * eb,
                         *nff as usize,
                         y,
                         n,
@@ -2924,6 +2928,8 @@ fn lower_op(
                         gbuf.get(pool),
                         ubuf.get(pool),
                         0,
+                        0,
+                        nff,
                         0,
                         nff,
                         abuf.get(pool),

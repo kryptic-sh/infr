@@ -1415,6 +1415,7 @@ pub(crate) fn generate_dense_backend(
                     act: Activation::Gelu,
                     up_off: 0,
                     up_stride: 0,
+                    gate_stride: 0,
                 });
                 let sc_sig = g.internal(f32d(batch * ne));
                 g.push(Op::Linear {
@@ -1629,6 +1630,7 @@ pub(crate) fn generate_dense_backend(
                         act: Activation::Silu,
                         up_off: 0,
                         up_stride: 0,
+                        gate_stride: 0,
                     });
                 }
                 g.push(Op::Linear {
@@ -1944,6 +1946,7 @@ pub(crate) fn generate_dense_backend(
                         act: Activation::Sigmoid,
                         up_off: 0,
                         up_stride: 0,
+                        gate_stride: 0,
                     });
                 }
                 g.push(Op::Linear {
@@ -2038,6 +2041,7 @@ pub(crate) fn generate_dense_backend(
                         act,
                         up_off: 0,
                         up_stride: 0,
+                        gate_stride: 0,
                     });
                     g.push(Op::Linear {
                         x: actbuf,
@@ -2128,6 +2132,7 @@ pub(crate) fn generate_dense_backend(
                             act,
                             up_off: 0,
                             up_stride: 0,
+                            gate_stride: 0,
                         });
                         g.push(Op::Linear {
                             x: actbuf,
@@ -2213,6 +2218,7 @@ pub(crate) fn generate_dense_backend(
                             act,
                             up_off: 0,
                             up_stride: 0,
+                            gate_stride: 0,
                         });
                     }
                     g.push(Op::Linear {
@@ -2346,6 +2352,7 @@ pub(crate) fn generate_dense_backend(
                     act: Activation::Gelu,
                     up_off: (l * npl) as u32,
                     up_stride: (c.n_layer * npl) as u32,
+                    gate_stride: 0,
                 });
                 g.push(Op::Linear {
                     x: plg,

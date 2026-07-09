@@ -245,8 +245,10 @@ pub enum Op {
     /// and `up` are separate handles (a backend may fuse them into one buffer internally). `up_off`
     /// shifts the `up` read by a whole-element offset so a layer-major slice of a bigger buffer can
     /// be consumed in place (Gemma E2B per-layer embedding); 0 for the normal case. `up_stride`
-    /// is the per-row byte stride of the `up` buffer when it's embedded in a wider row-major tensor;
+    /// is the per-row stride of the `up` buffer when it's embedded in a wider row-major tensor;
     /// 0 means the rows are tightly packed (stride = nff).
+    /// `gate_stride` is the same for the `gate` buffer — used when gate data is strided in a wider
+    /// interleaved buffer (e.g. qwen35's q+g layout where query and gate share rows).
     GatedAct {
         gate: TensorId,
         up: TensorId,
@@ -256,6 +258,7 @@ pub enum Op {
         act: Activation,
         up_off: u32,
         up_stride: u32,
+        gate_stride: u32,
     },
     /// Gated FFN activation over a COMBINED `gu` buffer `[rows, 2*nff]` (gate half first, up half
     /// second per row): `dst[r,i] = act(gu[r,i]) * gu[r, nff+i]`. Produced when the runner

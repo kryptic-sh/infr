@@ -1,0 +1,54 @@
+#version 460
+// E2B per-layer proj: fused f32 GEMV + RMSNorm + in-place add.
+// hidden[r,o] += rmsnorm(gemv(plg, proj))[r,o] * post_norm[o]
+// One workgroup per row, 256 threads, per-row RMSNorm reduction.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC { uint m; uint in_f; uint out_f; float eps; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer WB { float w[]; };
+layout(binding = 2) readonly buffer PB { float pn[]; };
+layout(binding = 3) buffer HB { float h[]; };
+
+shared float part[8];
+shared float gemv[256 * 6]; // per-thread raw GEMV results (ncol <= 6 for out_f <= 1536)
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.m) { return; }
+    uint t = gl_LocalInvocationIndex;
+    uint ncol = (pc.out_f + 255u) / 256u;
+
+    // Phase 1: GEMV, store result, accumulate raw^2 for RMSNorm
+    float ss = 0.0;
+    for (uint ci = 0u; ci < ncol; ci++) {
+        uint o = t * ncol + ci;
+        if (o >= pc.out_f) { break; }
+        float acc = 0.0;
+        uint wbase = o * pc.in_f;
+        uint xbase = r * pc.in_f;
+        for (uint k = 0u; k < pc.in_f; k++) { acc += x[xbase + k] * w[wbase + k]; }
+        gemv[t * ncol + ci] = acc;
+        ss += acc * acc;
+    }
+
+    // Phase 2: subgroup + shared reduction for RMSNorm
+    ss = subgroupAdd(ss);
+    if (subgroupElect()) { part[gl_SubgroupID] = ss; }
+    barrier();
+
+    float tot = 0.0;
+    for (uint s = 0u; s < gl_NumSubgroups; s++) { tot += part[s]; }
+    float scale = inversesqrt(tot / float(pc.out_f) + pc.eps);
+
+    // Phase 3: add scaled result to hidden: h += gemv * scale * post_norm
+    barrier(); // ensure gemv writes from phase 1 are visible (subgroup+shared after subgroupElect)
+    for (uint ci = 0u; ci < ncol; ci++) {
+        uint o = t * ncol + ci;
+        if (o >= pc.out_f) { break; }
+        h[r * pc.out_f + o] += gemv[t * ncol + ci] * scale * pn[o];
+    }
+}

@@ -1710,6 +1710,12 @@ pub(crate) fn e2b_gate_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/e2b_gate.spv"))))
 }
+/// SPIR-V for E2B per-layer proj: fused f32 GEMV+RMSNorm+Add kernel.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn e2b_proj_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/e2b_proj.spv"))))
+}
 /// SPIR-V for the bf16-weight GEMV (`y=x·Wᵀ`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_bf16_spv() -> &'static [u32] {

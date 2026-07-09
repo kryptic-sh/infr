@@ -2242,6 +2242,36 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// E2B per-layer proj: fused f32 GEMV + RMSNorm + in-place add.
+    /// `h[r,o] += rmsnorm(sum_k x[r,k] * w[o,k]) * pn[o]`. 256 threads/workgroup, one wg per row.
+    pub fn e2b_proj(
+        &self,
+        x: &dyn Buffer,  // [m, in_f] plg input
+        w: &dyn Buffer,  // [out_f, in_f] proj weight f32
+        pn: &dyn Buffer, // [out_f] post_norm weight
+        h: &dyn Buffer,  // [m, out_f] hidden (read+write)
+        m: usize,
+        in_f: usize,
+        out_f: usize,
+        eps: f32,
+    ) {
+        let k = self
+            .be
+            .kernel_sg("e2b_proj", crate::gemm::e2b_proj_spv(), 4, 16, 32);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&eps.to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(w), Self::vkb(pn), Self::vkb(h)],
+            1,
+            &push,
+            m as u32, // one workgroup per row
+        );
+    }
+
     pub fn rmsnorm(
         &self,
         x: &dyn Buffer,

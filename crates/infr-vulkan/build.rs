@@ -231,6 +231,7 @@ fn main() {
             &["-DMROW=8", "-DVEC4"],
         ),
         ("e2b_gate", "e2b_gate", &[]),
+        ("e2b_proj", "e2b_proj", &[]),
         ("matmul_f32", "matmul_f32", &[]),
         ("linear_q", "linear_q", &[]),
         ("linear_res", "linear_res", &[]),

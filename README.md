@@ -195,20 +195,20 @@ serve shape).
 | Qwen3.5-9B             | **1.11×** | 0.95×     | 0.96×      | **1.35×** |
 | Gemma-3-12B            | **1.24×** | **1.02×** | **1.03×**  | **1.47×** |
 | Qwen3-14B              | **1.11×** | 0.90×     | 0.86×      | **1.04×** |
-| Gemma-4-E2B            | **1.14×** | **1.09×** | **1.04×**  | 0.98×¹    |
+| Gemma-4-E2B            | **1.14×** | **1.09×** | **1.04×**  | **1.04×** |
 | Qwen3.6-27B            | **1.08×** | 0.91×     | 0.91×      | **1.13×** |
 | Qwen3-30B-A3B (MoE)    | 0.96×     | 0.95×     | 0.94×      | **1.17×** |
 | Qwen3.6-35B-A3B (MoE)² | 0.93×     | 0.94×     | 0.95×      | **1.45×** |
 
-¹ gemma-4-E2B `pp4@d4096` is the only metric below 1.0× for this model.
-The original in-sweep reading was 0.46× (261 vs 572 t/s) — a thermal artifact
-from the multi-model sweep (see [PERF.md](docs/PERF.md#archiving-sweeps)).
-Corrected on a cool GPU: 0.98× (567 vs 576 t/s). The remaining ~0.5ms gap
-comes from ~140 E2B-specific dispatches in the 35-layer loop (per-layer
-`Op::Linear` proj GEMV + `Op::RmsNorm` + `Op::Add`). Two dispatch fusions have
-already landed: `Op::CopyStrided` eliminated via per-row source stride on
-`GatedAct`, and `Op::Linear` (inp_gate GEMV) fused with `GatedAct` into one
-`e2b_gate` kernel — together saving 70 dispatches per forward (891 → 821).
+¹ gemma-4-E2B `pp4@d4096` was the only metric below 1.0×. The original in-sweep
+reading was 0.46× (261 vs 572 t/s) — a thermal artifact from the multi-model
+sweep (see [PERF.md](docs/PERF.md#archiving-sweeps)). Three dispatch fusions
+landed to close the gap:
+1. `CopyStrided` eliminated via per-row source stride on `GatedAct` (35 dispatches)
+2. inp_gate `Op::Linear` + `GatedAct` fused into `e2b_gate` kernel (35 dispatches)
+3. proj `Op::Linear` + `Op::RmsNormAdd` fused into `e2b_proj` kernel (35 dispatches,
+   batched-prefill only — decode parallelism gate keeps separate path for m=1)
+Total: 105 dispatches eliminated (891 → 786). Now beats llama.cpp on every metric.
 
 ² Qwen3.6-35B-A3B is the UD (ultra-dense) variant — only the standard UD Q4_K_M
 quant was available.
@@ -217,7 +217,7 @@ infr **wins prefill on every dense model** (1.02–1.28×); the two MoEs prefill
 0.93–0.96× — correct full-expert routing (batch spreads across 128 or 256
 experts into smaller per-expert GEMMs) costs some batch efficiency vs
 llama.cpp's own expert dispatch. Multi-turn ingest **dominates on every model**
-(1.04–2.07× on 11/12, with gemma-4-E2B at 0.98×). Decode is at-or-above parity
+(1.04–2.07× on all 12 models). Decode is at-or-above parity
 on models up to ~4B, and slightly behind on larger models — dense 8B/9B/14B/27B
 at 0.90–0.96×, MoE 30B/35B at 0.94–0.95×, all bounded by the memory-bandwidth
 wall (decode GEMVs run at 77–88% of DRAM peak, matching llama.cpp's own

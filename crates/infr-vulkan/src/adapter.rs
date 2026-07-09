@@ -3106,6 +3106,42 @@ fn record_decode_replay(
                         continue;
                     }
                 }
+                // Peephole: fuse Op::Linear (f32) + Op::RmsNormAdd into one e2b_proj dispatch
+                // for E2B per-layer proj + RMSNorm + Add tail. Only for batched prefill (m>1):
+                // the 256-thread/workgroup kernel loses GEMV parallelism vs 1536 separate
+                // workgroups for m=1 decode (0.52× regression); wins on m=4 (1.03×).
+                if *m > 1 {
+                    if let Op::RmsNormAdd {
+                        x: rn_x,
+                        weight: rn_w,
+                        dst: rn_dst,
+                        rows: _,
+                        dim: _,
+                        eps: rn_eps,
+                    } = &graph.ops[op_idx + 1]
+                    {
+                        if *rn_x == *dst {
+                            let (x_buf, w_buf, pn_buf, h_buf) = (
+                                resolve(&scratch, bindings, *x)?,
+                                resolve(&scratch, bindings, *weight)?,
+                                resolve(&scratch, bindings, *rn_w)?,
+                                resolve(&scratch, bindings, *rn_dst)?,
+                            );
+                            rec.e2b_proj(
+                                x_buf,
+                                w_buf,
+                                pn_buf,
+                                h_buf,
+                                *m as usize,
+                                *in_f as usize,
+                                *out_f as usize,
+                                *rn_eps,
+                            );
+                            skip_op.insert(op_idx + 1);
+                            continue;
+                        }
+                    }
+                } // *m > 1
             }
         }
         lower_op(

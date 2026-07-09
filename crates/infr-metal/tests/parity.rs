@@ -2762,3 +2762,181 @@ fn attention_canvas_split8_hd256_matches_reference() {
     ];
     assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
 }
+
+// ============================================================================
+// GPU-resident decode path: Op::Argmax / Op::Sample / Op::EmbedGather.
+//
+// These ops move the last decode step onto the GPU so decode only reads back
+// the 4-byte token id (Argmax/Sample) or the gathered embedding rows
+// (EmbedGather), not the [vocab] logits or a host-dequantized embed table. The
+// kernels (argmax_f32 / sample_f32 in elementwise_norms.metal, embed_gather_*
+// in embed_gather.metal) were added without a Metal device in the loop, so
+// until now only the kernel-name tripwire covered them — nothing checked their
+// NUMBERS. Each test runs the SAME graph op on the CPU interpreter (the trusted
+// reference for these arms) and on Metal and asserts the result matches.
+// ============================================================================
+
+// A token id is a u32 bit-pattern stored in the f32 dst slot; compare raw bits
+// (a wrong token is a different id, an exact match is bit-equal — no tolerance,
+// and NaN-safe unlike a float subtract).
+fn assert_id_parity(g: &Graph, bound: &[(TensorId, Vec<u8>)], dst: TensorId, rows: usize) {
+    let cpu = run(&CpuBackend::new(), g, bound, dst, rows);
+    let mtl = run(
+        &MetalBackend::new().expect("metal backend"),
+        g,
+        bound,
+        dst,
+        rows,
+    );
+    for r in 0..rows {
+        assert_eq!(
+            cpu[r].to_bits(),
+            mtl[r].to_bits(),
+            "token id row {r}: cpu={} metal={}",
+            cpu[r].to_bits(),
+            mtl[r].to_bits(),
+        );
+    }
+}
+
+// bf16 store: the top 16 bits of the f32 (truncation) — the CPU and Metal
+// dequant both widen this same u16 back with a lossless << 16, so a bf16 embed
+// row round-trips bit-exactly.
+fn bf16_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|&x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+        .collect()
+}
+
+// argmax_f32: greedy token = highest logit (lowest index on ties). With
+// distinct logits — the real decode case, since vocab-scale logit sums are
+// ~never bit-equal — Metal must land on the same id as the host argmax. An
+// injected unique peak anchors a known answer; the surrounding random spread
+// exercises the strided-scan + tree reduce over a vocab-scale buffer.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn argmax_f32_matches_cpu() {
+    for (n, seed, peak) in [
+        (151936usize, 7u64, 90210usize),
+        (8192, 8, 4001),
+        (4099, 9, 0),
+    ] {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![n], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![1], DType::F32));
+        g.push(Op::Argmax {
+            x,
+            dst,
+            n: n as u32,
+            rows: 1,
+        });
+        let mut xs: Vec<f32> = rand_f32(n, seed).iter().map(|v| v * 10.0).collect();
+        xs[peak] = 1000.0; // unique max
+        assert_id_parity(&g, &[(x, f32_bytes(&xs))], dst, 1);
+        // Known answer too, not just CPU==Metal agreement.
+        let got = run(
+            &MetalBackend::new().unwrap(),
+            &g,
+            &[(x, f32_bytes(&xs))],
+            dst,
+            1,
+        );
+        assert_eq!(got[0].to_bits() as usize, peak, "argmax n={n}");
+    }
+}
+
+// sample_f32: temperature + top-k + top-p stochastic pick, with the uniform
+// draw factored out into the `u` input so the op is a pure function. It must
+// mirror the host `sample_logits` order of operations exactly, so the same `u`
+// picks the same token. Distinct logits; sweep `u` and the (top_k, temp, top_p)
+// knobs. top_k stays <= 64 (the kernel's SAMPLE_KMAX cap, which the caller
+// respects — a larger top_k would diverge from the uncapped host reference).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn sample_f32_matches_cpu() {
+    let n = 8192usize;
+    let xs: Vec<f32> = rand_f32(n, 21).iter().map(|v| v * 8.0).collect();
+    for (top_k, temp, top_p) in [
+        (40u32, 0.8f32, 0.95f32),
+        (64, 1.0, 1.0),
+        (20, 0.7, 0.90),
+        (8, 1.2, 0.98),
+    ] {
+        for &uu in &[0.03f32, 0.29, 0.51, 0.74, 0.97] {
+            let mut g = Graph::new();
+            let x = g.input(TensorDesc::new(vec![n], DType::F32));
+            let u = g.input(TensorDesc::new(vec![1], DType::F32));
+            let dst = g.output(TensorDesc::new(vec![1], DType::F32));
+            g.push(Op::Sample {
+                x,
+                u,
+                dst,
+                n: n as u32,
+                top_k,
+                temp,
+                top_p,
+            });
+            assert_id_parity(&g, &[(x, f32_bytes(&xs)), (u, f32_bytes(&[uu]))], dst, 1);
+        }
+    }
+}
+
+// embed_gather_*: dst[r, :] = dequant(table[ids[r], :]) * scale, gathering the
+// resident quantized token_embd row on-device (the SAME DEC16_* decode the
+// linear kernels use) instead of a host dequant + upload. Covers both kernel
+// families — the DEC16 quant macro (Q4_K/Q6_K/Q5_0/Q8_0/IQ4_XS) and the
+// plain-widen f16/bf16 kernels — plus multi-row gather and a non-unit embed
+// scale (Gemma's sqrt(n_embd)).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn embed_gather_matches_cpu() {
+    let (vocab, ne) = (8usize, 256usize); // ne % 32 == 0, whole K-quant blocks
+    let ids: Vec<i32> = vec![5, 0, 7, 3]; // gather these rows (out of order, repeats none)
+    let rows = ids.len();
+    let check = |dt: DType, bytes: Vec<u8>, scale: f32, tol: f32, tag: &str| {
+        let mut g = Graph::new();
+        let id = g.input(TensorDesc::new(vec![rows], DType::I32));
+        let table = g.weight(TensorDesc::new(vec![vocab, ne], dt));
+        let dst = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+        g.push(Op::EmbedGather {
+            ids: id,
+            table,
+            dst,
+            rows: rows as u32,
+            ne: ne as u32,
+            scale,
+        });
+        let bound = vec![(id, i32_bytes(&ids)), (table, bytes)];
+        let cpu = run(&CpuBackend::new(), &g, &bound, dst, rows * ne);
+        let mtl = run(
+            &MetalBackend::new().expect("metal backend"),
+            &g,
+            &bound,
+            dst,
+            rows * ne,
+        );
+        assert_close(&cpu, &mtl, tol, &format!("embed_gather {tag}"));
+    };
+    let rf = rand_f32(vocab * ne, 31);
+    // f16/bf16 are a lossless widen → bit-exact; the quant decodes match the
+    // linear path's dequant to ULP (tol like the linear quant tests).
+    check(DType::F16, f16_bytes(&rf), 1.0, 0.0, "f16");
+    check(DType::Bf16, bf16_bytes(&rf), 22.627417, 0.0, "bf16 scaled");
+    check(DType::Q8_0, quantize_q8_0(&rf), 1.0, 1e-3, "q8_0");
+    check(DType::Q5_0, synth_q5_0(vocab * ne, 32), 1.0, 1e-3, "q5_0");
+    check(
+        DType::Q4K,
+        synth_q4k(vocab * ne, 33),
+        1.5,
+        1e-3,
+        "q4k scaled",
+    );
+    check(DType::Q6K, synth_q6k(vocab * ne, 34), 1.0, 1e-3, "q6k");
+    check(
+        DType::Iq4Xs,
+        synth_iq4xs(vocab * ne, 35),
+        1.0,
+        1e-3,
+        "iq4xs",
+    );
+}

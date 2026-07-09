@@ -509,6 +509,7 @@ impl Backend for CpuBackend {
                     n_head,
                     head_dim,
                     eps,
+                    ..
                 } => {
                     let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                     let xs = &vals[x.0 as usize];
@@ -804,6 +805,7 @@ impl Backend for CpuBackend {
                     rope_dim,
                     theta,
                     freq_factors,
+                    ..
                 } => {
                     let (rows, nh, hd, rd) = (
                         rows as usize,
@@ -852,17 +854,33 @@ impl Backend for CpuBackend {
                     theta,
                     eps,
                     freq_factors,
+                    x_stride,
+                    ..
                 } => {
-                    // Fused QkNorm + Rope: one pass per head — rmsnorm (× weight), then rotate the
-                    // first `rope_dim` in place (dims beyond pass through normed). Output-identical to
-                    // the separate QkNorm→Rope pair; maps 1:1 to the GPU `qk_norm_rope` kernel.
                     let (rows, nh, hd, rd) = (
                         rows as usize,
                         n_head as usize,
                         head_dim as usize,
                         rope_dim as usize,
                     );
-                    let xs = &vals[x.0 as usize];
+                    let raw = &vals[x.0 as usize];
+                    let x_stride = x_stride as usize;
+                    // If input is interleaved (stride > 0), extract packed query data per row.
+                    let xs: Vec<f32> = if x_stride > 0 {
+                        let mut packed = vec![0f32; rows * nh * hd];
+                        for r in 0..rows {
+                            let row_base = r * x_stride;
+                            for h in 0..nh {
+                                let src = row_base + h * 2 * hd; // head h query starts here
+                                let dst = (r * nh + h) * hd;
+                                packed[dst..dst + hd].copy_from_slice(&raw[src..src + hd]);
+                            }
+                        }
+                        packed
+                    } else {
+                        raw.clone()
+                    };
+                    let xs = &xs;
                     let ws = weight(w);
                     let pos = &vals[positions.0 as usize];
                     let ff = freq_factors.map(|f| vals[f.0 as usize].clone());

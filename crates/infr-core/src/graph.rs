@@ -151,6 +151,10 @@ pub enum Op {
         n_head: u32,
         head_dim: u32,
         eps: f32,
+        /// Per-row stride in `x`. 0 = packed (stride = n_head * head_dim). Non-zero when
+        /// reading from an interleaved buffer (e.g. qwen35's q+g layout) to skip a
+        /// per-head CopyStrided dispatch.
+        x_stride: u32,
     },
     /// Fused per-head RMSNorm + SiLU gate multiply: `QkNorm` immediately followed by an
     /// `Op::GatedAct` (`Activation::Silu`) consuming QkNorm's own output (qwen35's DeltaNet
@@ -188,6 +192,8 @@ pub enum Op {
         rope_dim: u32,
         theta: f32,
         freq_factors: Option<TensorId>,
+        /// Per-row stride in `x`. 0 = packed (stride = n_head * head_dim).
+        x_stride: u32,
     },
     /// Fused per-head RMSNorm + NEOX RoPE — `QkNorm` immediately followed by `Rope` on the same
     /// tensor (the common qwen3/gemma q/k case). One pass: each head is rmsnormed (`× weight`) then
@@ -206,6 +212,8 @@ pub enum Op {
         theta: f32,
         eps: f32,
         freq_factors: Option<TensorId>,
+        /// Per-row stride in `x`. 0 = packed (stride = n_head * head_dim).
+        x_stride: u32,
     },
     /// Append `src` (`rows × row_stride`) into the persistent KV `cache` starting at row `pos`,
     /// casting to the cache dtype (typically f16). Stateful write — order matters.

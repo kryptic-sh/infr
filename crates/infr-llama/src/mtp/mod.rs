@@ -610,6 +610,7 @@ fn build_mtp_graph(
         theta,
         eps,
         freq_factors: None, // gemma4-only; qwen35 never sets this
+        x_stride: 0,
     });
     g.push(Op::WriteKv {
         src: k16,
@@ -637,6 +638,7 @@ fn build_mtp_graph(
         theta,
         eps,
         freq_factors: None,
+        x_stride: 0,
     });
     g.push(Op::Attention {
         q: q16,
@@ -1066,6 +1068,7 @@ fn build_mtp_draft_chain_graph(
             theta,
             eps,
             freq_factors: None,
+            x_stride: 0,
         });
         g.push(Op::WriteKv {
             src: k16,
@@ -1093,6 +1096,7 @@ fn build_mtp_draft_chain_graph(
             theta,
             eps,
             freq_factors: None,
+            x_stride: 0,
         });
         g.push(Op::Attention {
             q: q16,

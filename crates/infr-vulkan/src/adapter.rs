@@ -1518,6 +1518,8 @@ fn lower_op(
             theta,
             eps,
             freq_factors,
+            x_stride,
+            ..
         } => {
             let (out_buf, fused) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
                 (r(cache)?, Some(pos))
@@ -1530,20 +1532,38 @@ fn lower_op(
                         Some(f) => Some(r(*f)?),
                         None => None,
                     };
-                    rec.qk_norm_rope(
-                        r(*x)?,
-                        r(*weight)?,
-                        out_buf,
-                        *rows as usize,
-                        *n_head as usize,
-                        *head_dim as usize,
-                        *rope_dim as usize,
-                        *theta,
-                        rope_pos[&positions.0],
-                        fused.unwrap_or(0),
-                        *eps,
-                        ff,
-                    );
+                    if *x_stride > 0 && ff.is_none() {
+                        // Interleaved q+g buffer: read query with stride, skip CopyStrided per head.
+                        rec.qk_norm_rope_interleaved(
+                            r(*x)?,
+                            r(*weight)?,
+                            out_buf,
+                            *rows as usize,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            rope_pos[&positions.0],
+                            fused.unwrap_or(0),
+                            *eps,
+                            *x_stride as usize,
+                        );
+                    } else {
+                        rec.qk_norm_rope(
+                            r(*x)?,
+                            r(*weight)?,
+                            out_buf,
+                            *rows as usize,
+                            *n_head as usize,
+                            *head_dim as usize,
+                            *rope_dim as usize,
+                            *theta,
+                            rope_pos[&positions.0],
+                            fused.unwrap_or(0),
+                            *eps,
+                            ff,
+                        );
+                    } // x_stride > 0
                 }
                 RopeMode::Dynamic(params) => {
                     // gemma4 proportional RoPE (full-attention layers): the ff divisors bind via
@@ -1586,6 +1606,7 @@ fn lower_op(
             rope_dim,
             theta,
             freq_factors,
+            ..
         } => {
             if freq_factors.is_some() {
                 return Err(be(
@@ -2127,6 +2148,7 @@ fn lower_op(
             n_head,
             head_dim,
             eps,
+            ..
         } => {
             rec.rmsnorm(
                 r(*x)?,

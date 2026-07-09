@@ -1618,6 +1618,7 @@ pub(crate) fn generate_dense_backend(
                         n_head: q35_nv as u32,
                         head_dim: q35_vd as u32,
                         eps,
+                        x_stride: 0,
                     });
                     g.push(Op::GatedAct {
                         gate: dn_zbuf,
@@ -1717,6 +1718,7 @@ pub(crate) fn generate_dense_backend(
                             rows: batch as u32,
                             n: hd as u32,
                         });
+                        // CopyStrided for gate only — QkNormRope reads q from qg with stride.
                         g.push(Op::CopyStrided {
                             src: qg,
                             src_off: (h * 2 * hd + hd) as u32,
@@ -1818,6 +1820,7 @@ pub(crate) fn generate_dense_backend(
                             n_head: nkv as u32,
                             head_dim: hd as u32,
                             eps,
+                            x_stride: 0,
                         });
                     }
                     // K: fused QkNorm+RoPE (qwen3/gemma) → f16 `k16`, else RoPE alone (llama) in-place f32.
@@ -1835,6 +1838,7 @@ pub(crate) fn generate_dense_backend(
                                 theta,
                                 eps,
                                 freq_factors: layer_ff,
+                                x_stride: 0,
                             });
                             k16
                         }
@@ -1852,6 +1856,7 @@ pub(crate) fn generate_dense_backend(
                                 rope_dim: rope_dim as u32,
                                 theta,
                                 freq_factors: layer_ff,
+                                x_stride: 0,
                             });
                             k16
                         }
@@ -1874,8 +1879,13 @@ pub(crate) fn generate_dense_backend(
                 // Q: fused QkNorm+RoPE (qwen3/gemma) → f16 `q16`, else RoPE alone (llama) in-place f32.
                 let q_attn = match aw.q_norm {
                     Some(qn) => {
+                        let (q_src, q_stride) = if false && c.attn_out_gate {
+                            (qg, (nh * 2 * hd) as u32)
+                        } else {
+                            (q, 0)
+                        };
                         g.push(Op::QkNormRope {
-                            x: q,
+                            x: q_src,
                             weight: qn,
                             positions,
                             dst: q16,
@@ -1886,6 +1896,7 @@ pub(crate) fn generate_dense_backend(
                             theta,
                             eps,
                             freq_factors: layer_ff,
+                            x_stride: q_stride,
                         });
                         q16
                     }
@@ -1901,6 +1912,7 @@ pub(crate) fn generate_dense_backend(
                             rope_dim: rope_dim as u32,
                             theta,
                             freq_factors: layer_ff,
+                            x_stride: 0,
                         });
                         q16
                     }

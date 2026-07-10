@@ -5289,14 +5289,18 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(slot as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(stride as u32).to_ne_bytes());
+        // Binding order MUST match the shader's `-DPAGED` layout (`native_gemv_id.comp`) AND keep
+        // `y` last: `dispatch3`'s hazard tracking treats the tail `n_out` buffers as writes and
+        // everything before as reads (one contiguous split) — `y` bound before `lut` would get
+        // mis-tracked as a read, silently dropping the barrier a later dispatch needs.
         self.dispatch_wide(
             k,
             &[
                 Self::vkb(w),
                 Self::vkb(x),
                 Self::vkb(ids),
-                Self::vkb(y),
                 Self::vkb(lut),
+                Self::vkb(y),
             ],
             1,
             &push,
@@ -5330,12 +5334,14 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(stride as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(x_per_slot as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(rows as u32).to_ne_bytes());
+        // `y` last — see `linear_native_id_paged`'s doc on why binding order matters for
+        // `dispatch3`'s hazard tracking (this is the same fix, for the multi-slot variant).
         let bufs = [
             Self::vkb(w),
             Self::vkb(x),
             Self::vkb(ids),
-            Self::vkb(y),
             Self::vkb(lut),
+            Self::vkb(y),
         ];
         let name =
             crate::linear::native_idm_paged_kernel_name(dtype).expect("native idm paged kernel");

@@ -21,9 +21,17 @@ layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint slot; 
 layout(binding = 0) readonly buffer WB { uint nw[]; };
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
-layout(binding = 3) buffer YB { float y_buf[]; };
+// `y_buf` (the sole write) is always the LAST binding in either build. `Recorder::dispatch3`'s
+// hazard tracking treats the tail `n_out` buffers of its binding array as writes and everything
+// before as reads (one contiguous split) — the original PAGED layout bound `y_buf` at 3 and `lut`
+// at 4, so the split (`n_out=1`) marked `lut` (a read) as the write and `y_buf` (the real write) as
+// a read, silently skipping the barrier a LATER dispatch needs before reading `y_buf`. Binding LUT
+// ahead of Y here (and in the matching Rust buffer array) keeps Y last in both builds instead.
 #ifdef PAGED
-layout(binding = 4) readonly buffer LUTB { uint lut[]; };
+layout(binding = 3) readonly buffer LUTB { uint lut[]; };
+layout(binding = 4) buffer YB { float y_buf[]; };
+#else
+layout(binding = 3) buffer YB { float y_buf[]; };
 #endif
 
 shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)

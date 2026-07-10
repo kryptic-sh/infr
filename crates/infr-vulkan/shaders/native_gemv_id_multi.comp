@@ -29,10 +29,16 @@ layout(push_constant) uniform PC {
 layout(binding = 0) readonly buffer WB { uint nw[]; };
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
-layout(binding = 3) buffer YB { float y_buf[]; };
 // -DPAGED: see native_gemv_id.comp's doc comment — same LUT hop, same zero-cost-when-off contract.
+// `y_buf` (the sole write) is always the LAST binding — see that same doc comment for why the
+// original PAGED layout (`y_buf`=3, `lut`=4) made `Recorder::dispatch3`'s hazard tracking mark
+// `y_buf` as a read and `lut` as the write, silently dropping a barrier a later dispatch (e.g. the
+// small-m MoE arm's activation, reading this GEMV's `y`) needed.
 #ifdef PAGED
-layout(binding = 4) readonly buffer LUTB { uint lut[]; };
+layout(binding = 3) readonly buffer LUTB { uint lut[]; };
+layout(binding = 4) buffer YB { float y_buf[]; };
+#else
+layout(binding = 3) buffer YB { float y_buf[]; };
 #endif
 
 shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)

@@ -53,6 +53,17 @@ pub enum Activation {
     Sigmoid,
 }
 
+/// Router gating function for a routed-expert FFN ([`Op::MoeFfn`]) — how the per-expert logits
+/// (`router · x`) become the selection scores + per-expert weights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeGating {
+    /// `probs = softmax(logits)` over all experts (qwen3moe / qwen35moe / diffusion-gemma).
+    Softmax,
+    /// `probs = sigmoid(logits)` per expert (llama4). Selection order is unchanged by the monotone
+    /// sigmoid, so top-k picks the same experts as by raw logits.
+    Sigmoid,
+}
+
 /// How a tensor handle is provisioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorKind {
@@ -448,6 +459,18 @@ pub enum Op {
         n_ff_exp: u32,
         scale: f32,
         act: Activation,
+        /// Router gating (softmax over experts vs per-expert sigmoid). `Softmax` for
+        /// qwen3moe/qwen35moe/diffusion-gemma; `Sigmoid` for llama4.
+        gating: MoeGating,
+        /// Renormalize the selected top-k expert weights to sum to 1 before scaling
+        /// (`w[e] = probs[e] / Σprobs · scale`). `true` for softmax MoE (the reference
+        /// `norm_w`); `false` for llama4 (top-1, weight = `sigmoid(logit) · scale`, no renorm).
+        norm_w: bool,
+        /// Apply the per-expert routing weight to the expert INPUT (before the gate/up projections
+        /// and activation) rather than to the expert OUTPUT. `true` only for llama4 (its
+        /// `weight_before_ffn`); the two differ through the SiLU nonlinearity. Folded into the
+        /// gate/up activations on CPU (`silu(w·gate)·(w·up)`), exact since gate/up are linear.
+        weight_before: bool,
     },
     /// Depthwise causal 1-D conv over `channels` followed by SiLU (qwen35 gated DeltaNet).
     /// Processes `rows` tokens sequentially, carrying the rolling history in `state` across rows and

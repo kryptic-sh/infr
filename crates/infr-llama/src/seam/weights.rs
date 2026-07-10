@@ -22,11 +22,11 @@ pub(super) enum FfnW {
         gate_exps: TensorId,
         up_exps: TensorId,
         down_exps: TensorId,
-        /// qwen35moe (Qwen3.6 MoE) Qwen2-MoE-style shared expert: `Some` when the model carries
-        /// `ffn_*_shexp`/`ffn_gate_inp_shexp` tensors (`Config::shexp_ff > 0`) — a dense SwiGLU
-        /// branch run on the SAME input as the routed bank, gated by a per-token sigmoid and
-        /// summed with the routed-MoE output (`Op::MoeSharedExpertAdd`). `None` for qwen3moe
-        /// (no shared expert).
+        /// Shared expert (qwen35moe / llama4): `Some` when `Config::shexp_ff > 0` — a dense SwiGLU
+        /// branch run on the SAME input as the routed bank and summed with its output. qwen35moe
+        /// gates it by a per-token sigmoid (`Op::MoeSharedExpertAdd`, `gate_inp = Some`); llama4
+        /// sums it in PLAIN (`Op::Add`, `gate_inp = None` — `Config::shexp_gated == false`). `None`
+        /// for qwen3moe (no shared expert).
         shexp: Option<MoeSharedW>,
     },
     /// diffusion-gemma's per-layer dual FFN: a dense GeGLU branch (the "shared expert") ∥ a
@@ -74,8 +74,9 @@ pub(super) enum FfnW {
 #[derive(Clone, Copy)]
 pub(super) struct MoeSharedW {
     /// `ffn_gate_inp_shexp.weight` `[ne]`: projects the FFN input to ONE raw (pre-sigmoid) gate
-    /// logit per token (`Op::Linear` with `out_f=1`).
-    pub(super) gate_inp: TensorId,
+    /// logit per token (`Op::Linear` with `out_f=1`). `Some` for the sigmoid-gated qwen35moe
+    /// shared expert; `None` for llama4 (its shared expert is summed in plain — no gate tensor).
+    pub(super) gate_inp: Option<TensorId>,
     pub(super) wgate: TensorId,
     pub(super) wup: TensorId,
     pub(super) wdown: TensorId,

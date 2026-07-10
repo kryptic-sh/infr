@@ -1,6 +1,6 @@
 //! GGUF-embedded tokenizer construction (byte-level BPE + SentencePiece).
 //! Mechanically split out of `lib.rs` (no logic change).
-use crate::QWEN2_PRE_RE;
+use crate::{LLAMA4_PRE_RE, QWEN2_PRE_RE};
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource;
@@ -66,10 +66,16 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         Some(MetaValue::Bool(true))
     );
     let pre = md.str("tokenizer.ggml.pre").unwrap_or("default");
-    if pre == "qwen2" {
-        // Sequence[ Split(qwen regex, Isolated), ByteLevel(use_regex=false) ] — matches HF Qwen.
+    // qwen2/llama4 both split on a regex before ByteLevel (matching HF); only the pattern differs.
+    let split_re = match pre {
+        "qwen2" => Some(QWEN2_PRE_RE),
+        "llama4" => Some(LLAMA4_PRE_RE),
+        _ => None,
+    };
+    if let Some(re) = split_re {
+        // Sequence[ Split(pre regex, Isolated), ByteLevel(use_regex=false) ] — matches HF.
         let split = Split::new(
-            SplitPattern::Regex(QWEN2_PRE_RE.to_string()),
+            SplitPattern::Regex(re.to_string()),
             SplitDelimiterBehavior::Isolated,
             false,
         )

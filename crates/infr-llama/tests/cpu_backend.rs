@@ -1848,6 +1848,112 @@ fn cpu_qwen35_dense_unaffected_by_moe_fields() {
     );
 }
 
+// ─── Llama 4 Scout (llama4: sigmoid top-1 MoE + plain shared expert + iRoPE) ───────
+//
+// `general.architecture == "llama4"` (see `arch::LLAMA4`). 48 layers, 16 experts / top-1, sigmoid
+// gating (no top-k renorm), weight-before-FFN, a PLAIN (ungated) shared expert summed in, and
+// iRoPE: every 4th layer is NoPE (rope skipped, global attention) while rope layers apply a
+// weightless per-head L2-norm to Q/K after rope. Chunked masking + attn-temperature scaling are
+// no-ops below the 8192 chunk size (untestable on CPU for a 109B model — see `arch::LLAMA4`).
+
+fn llama4_scout() -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--Llama-4-Scout-17B-16E-Instruct-GGUF",
+        "Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf",
+    )
+}
+
+/// llama4 config parses as expected (MoE present, top-1, plain shared expert, iRoPE + L2-norm on).
+#[test]
+fn cpu_llama4_config() {
+    let path = need_model!(llama4_scout(), "Llama-4-Scout");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let cfg = model.config();
+    assert!(cfg.llama4);
+    let moe = cfg.moe.expect("llama4 has an MoE config");
+    assert_eq!(moe.n_expert, 16);
+    assert_eq!(moe.n_used, 1);
+    assert!(matches!(moe.gating, infr_core::graph::MoeGating::Sigmoid));
+    assert!(!moe.norm_w, "llama4 does not renormalize top-k weights");
+    assert!(
+        moe.weight_before,
+        "llama4 applies the weight before the FFN"
+    );
+    assert!(cfg.shexp_ff > 0, "llama4 has a shared expert");
+    assert!(
+        !cfg.shexp_gated,
+        "llama4's shared expert is summed in plain"
+    );
+    assert_eq!(cfg.moe_interleave_step, 1, "Scout is MoE on every layer");
+    assert_eq!(cfg.no_rope_step, 4, "iRoPE NoPE every 4th layer");
+    assert!(
+        cfg.kq_l2norm,
+        "Scout (16E) applies the post-rope Q/K L2-norm"
+    );
+    assert!(
+        cfg.is_nope_layer(3) && !cfg.is_nope_layer(0),
+        "layer 3 is NoPE"
+    );
+}
+
+/// llama4 CPU greedy generation, token-identical to the `llama-completion` oracle.
+///
+/// Oracle (same Q2_K GGUF, CPU, greedy):
+///   `llama-completion -m <gguf> -p "The capital of France is" -n 24 -c 512 --no-conversation \
+///        -ngl 0 --temp 0`
+/// Both tokenize the prompt to `[200000, 954, 7963, 323, 11698, 373]` (BOS + 5), and the first 19
+/// GENERATED tokens are byte-identical:
+///   `13796 26 589 7963 323 19584 373 20589 26 589 7963 323 26049 373 30827 26 589 7963 323`
+///   (" Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of").
+/// They then split at index 19 on the 4th country of an OPEN-ENDED list — infr `31154` (" Spain")
+/// vs llama.cpp `15462` (" Australia") — a Q2_K (2-bit) near-tie broken by CPU f32 reassociation
+/// (the "precision, not a bug" class every CPU golden here notes). The 19-token match exercises all
+/// 48 layers, every NoPE/rope-pattern boundary, the weightless post-rope L2-norm, and the
+/// sigmoid-top-1-weight-before-FFN MoE + plain shared expert on every step. `INFR_L4_PROMPT`/
+/// `INFR_L4_N`/`INFR_L4_NOBOS` override the defaults. Slow (109B on CPU) — few tokens.
+#[test]
+fn cpu_llama4_scout_greedy() {
+    let path = need_model!(llama4_scout(), "Llama-4-Scout");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let prompt =
+        std::env::var("INFR_L4_PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
+    let n: usize = std::env::var("INFR_L4_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    let mut ids = model.encode(&prompt).expect("encode");
+    if std::env::var("INFR_L4_NOBOS").is_err() {
+        // llama.cpp adds BOS by default; Scout's BOS is `<|begin_of_text|>` (200000).
+        ids.insert(0, 200000);
+    }
+    println!("prompt ({} tok): {ids:?}", ids.len());
+    let mut gen = Vec::new();
+    let out = model
+        .generate_cpu_ids(&ids, n, |id| gen.push(id))
+        .expect("cpu generate");
+    println!("generated ids: {out:?}");
+    println!("captured  ids: {gen:?}");
+    println!("text: {:?}", model.decode(&out).expect("decode"));
+    // Token-identity lock against the llama-completion oracle: the deterministic 19-token prefix
+    // (before the open-ended country-list near-tie) must match exactly, on the default prompt.
+    if prompt == "The capital of France is" && std::env::var("INFR_L4_NOBOS").is_err() {
+        const ORACLE_PREFIX: &[u32] = &[
+            13796, 26, 589, 7963, 323, 19584, 373, 20589, 26, 589, 7963, 323, 26049, 373, 30827,
+            26, 589, 7963, 323,
+        ];
+        assert!(
+            out.len() >= ORACLE_PREFIX.len() && out[..ORACLE_PREFIX.len()] == *ORACLE_PREFIX,
+            "llama4 greedy diverged from the llama-completion oracle within the deterministic \
+             prefix\n  got: {:?}\n  want prefix: {ORACLE_PREFIX:?}",
+            &out[..ORACLE_PREFIX.len().min(out.len())],
+        );
+    }
+    assert!(!out.is_empty());
+    assert!(out.iter().all(|&t| (t as usize) < model.config().vocab));
+}
+
 // ─── Gemma 4 12b (dense) ────────────────────────────────────────────────────────
 
 fn gemma4_12b() -> Option<PathBuf> {

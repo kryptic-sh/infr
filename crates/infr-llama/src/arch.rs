@@ -15,6 +15,14 @@
 /// Llama family (Llama 3.x, Mistral dense, TinyLlama, R1-Distill-Llama). NORM (interleaved) rope
 /// from the converter's q/k permute; no qk-norm, no attention bias.
 pub const LLAMA: &str = "llama";
+/// Llama 4 (Scout 17B-16E etc.): the llama skeleton (NORM/interleaved rope, no attention bias)
+/// plus a 16-expert top-1 SIGMOID-gated MoE FFN (weight-before-FFN, no top-k renorm) with a
+/// Qwen2-MoE-style DENSE shared expert summed IN (no per-token gate, unlike qwen35moe), and iRoPE:
+/// every `no_rope_layer_step`-th layer is NoPE (rope skipped, global attention) while rope layers
+/// carry chunked local attention; rope layers also apply a WEIGHTLESS per-head L2-norm to Q/K
+/// AFTER rope (`Llama4TextL2Norm`). Chunked-attention masking + NoPE attention-temperature scaling
+/// (both no-ops below the 8192-token chunk size) are CPU follow-ups — see `Config::from_gguf`.
+pub const LLAMA4: &str = "llama4";
 /// Qwen2/2.5 (incl. Qwen2.5-Coder, R1-Distill-Qwen). Llama path + q/k/v projection biases; ships
 /// HF rotate-half q/k order, so the loader permutes rows (`Config::permute_qk_neox`).
 pub const QWEN2: &str = "qwen2";
@@ -51,6 +59,7 @@ pub const DIFFUSION_GEMMA: &str = "diffusion-gemma";
 /// routed-MoE `qwen3moe` (same attention/KV machinery, an expert FFN swapped in).
 pub const TRANSFORMER: &[&str] = &[
     LLAMA,
+    LLAMA4,
     QWEN2,
     QWEN3,
     QWEN3_MOE,
@@ -62,6 +71,7 @@ pub const TRANSFORMER: &[&str] = &[
 /// Every architecture infr runs, across both paths.
 pub const ALL: &[&str] = &[
     LLAMA,
+    LLAMA4,
     QWEN2,
     QWEN3,
     QWEN3_MOE,

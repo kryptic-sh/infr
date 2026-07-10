@@ -502,16 +502,21 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("ffn_down_exps.weight")])?;
                 wload(&[&p("ffn_down_exps.scale")])?;
                 wload(&[&p("post_ffw_norm_2.weight")])?;
-            } else if c.moe.is_some() {
-                // qwen3moe / qwen35moe: router + stacked per-expert gate/up/down banks.
+            } else if c.moe.is_some() && c.is_moe_layer(l) {
+                // qwen3moe / qwen35moe / llama4 (MoE layer): router + stacked per-expert gate/up/
+                // down banks. (llama4 interleaves dense layers on `moe_interleave_step`; those fall
+                // through to the dense branches below — Scout's step==1 makes every layer MoE.)
                 wload(&[&p("ffn_gate_inp.weight")])?;
                 wload(&[&p("ffn_gate_exps.weight")])?;
                 wload(&[&p("ffn_up_exps.weight")])?;
                 wload(&[&p("ffn_down_exps.weight")])?;
                 if c.shexp_ff > 0 {
-                    // qwen35moe Qwen2-MoE-style shared expert: a dense SwiGLU FFN alongside the
-                    // routed bank, gated by a per-token sigmoid — see `FfnW::Moe`'s `shexp` field.
-                    wload(&[&p("ffn_gate_inp_shexp.weight")])?;
+                    // Shared expert (qwen35moe / llama4): a dense SwiGLU FFN alongside the routed
+                    // bank. qwen35moe gates it by a per-token sigmoid (`ffn_gate_inp_shexp`); llama4
+                    // has no gate tensor and sums it in plain — see `FfnW::Moe`'s `shexp` field.
+                    if c.shexp_gated {
+                        wload(&[&p("ffn_gate_inp_shexp.weight")])?;
+                    }
                     wload(&[&p("ffn_gate_shexp.weight")])?;
                     wload(&[&p("ffn_up_shexp.weight")])?;
                     wload(&[&p("ffn_down_shexp.weight")])?;
@@ -605,6 +610,19 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
             wbufs.push(b);
             wspecs.push((DType::F32, ne));
+        }
+        // llama4 `Llama4TextL2Norm`: a WEIGHTLESS per-head RMS/L2-norm on Q and K after rope (rope
+        // layers only) = `QkNorm` with a unit weight. One `head_dim`-wide ones-vector serves every
+        // rope layer (see the matching `qk_ones` handle in `build`).
+        if c.kq_l2norm {
+            let ones = vec![1.0f32; c.head_dim];
+            let b = be
+                .alloc(ones.len() * 4, BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
+                .map_err(|e| anyhow!("{e}"))?;
+            wbufs.push(b);
+            wspecs.push((DType::F32, c.head_dim));
         }
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
@@ -1042,15 +1060,22 @@ pub(crate) fn generate_dense_backend(
                     down_scale: wpush(&mut g, &mut weights),
                     m_post_norm: wpush(&mut g, &mut weights),
                 }
-            } else if c.moe.is_some() {
+            } else if c.moe.is_some() && c.is_moe_layer(l) {
                 FfnW::Moe {
                     router: wpush(&mut g, &mut weights),
                     gate_exps: wpush(&mut g, &mut weights),
                     up_exps: wpush(&mut g, &mut weights),
                     down_exps: wpush(&mut g, &mut weights),
                     shexp: if c.shexp_ff > 0 {
+                        // Order MUST mirror the `wload` above: `gate_inp` (qwen35moe only) precedes
+                        // the gate/up/down. llama4 has no gate tensor (`gate_inp = None`).
+                        let gate_inp = if c.shexp_gated {
+                            Some(wpush(&mut g, &mut weights))
+                        } else {
+                            None
+                        };
                         Some(MoeSharedW {
-                            gate_inp: wpush(&mut g, &mut weights),
+                            gate_inp,
                             wgate: wpush(&mut g, &mut weights),
                             wup: wpush(&mut g, &mut weights),
                             wdown: wpush(&mut g, &mut weights),
@@ -1161,6 +1186,13 @@ pub(crate) fn generate_dense_backend(
         // ones-vector for the MoE router's own input — see the matching upload in
         // `generate_dense_backend`'s init block.
         let router_ones = if c.dual_moe() {
+            Some(wpush(&mut g, &mut weights))
+        } else {
+            None
+        };
+        // llama4 weightless per-head Q/K L2-norm ones-vector (`head_dim`-wide) — upload order
+        // matches the `if c.kq_l2norm` block above.
+        let qk_ones = if c.kq_l2norm {
             Some(wpush(&mut g, &mut weights))
         } else {
             None
@@ -1463,6 +1495,11 @@ pub(crate) fn generate_dense_backend(
             let theta = c.layer_rope_theta(l); // gemma dual-rope (SWA 1e4 / full 1e6); uniform else
             let rope_dim = c.layer_rope_dim(l);
             let swa = gemma && c.is_swa_layer(l);
+            // llama4 iRoPE: NoPE (global) layers skip rope entirely; rope (local) layers apply a
+            // weightless per-head L2-norm to Q/K AFTER rope (`Llama4TextL2Norm`). `l2norm` is the
+            // ones-vector handle on llama4 rope layers, `None` on NoPE layers and every other model.
+            let nope = c.is_nope_layer(l);
+            let l2norm = if nope { None } else { qk_ones };
             // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md): every canvas query attends
             // the SAME fixed bidirectional range `[lo, kv_len)` — `lo = 0` on full-attention
             // layers (every prompt + canvas key visible), `lo = max(0, P-(n_swa-1))` on SWA
@@ -1840,6 +1877,12 @@ pub(crate) fn generate_dense_backend(
                             });
                             k16
                         }
+                        None if nope => {
+                            // llama4 NoPE (global) layer: NO rope, NO L2-norm — cache the raw K
+                            // projection directly. (On CPU every buffer is f32, so the "f16" k16
+                            // scratch isn't needed; the raw `k` feeds WriteKv unchanged.)
+                            k
+                        }
                         None => {
                             // llama (no k-norm): interleaved RoPE straight to the f16 scratch — the
                             // same fused shape as the qk-norm path, so the Vulkan peephole redirects
@@ -1856,6 +1899,19 @@ pub(crate) fn generate_dense_backend(
                                 freq_factors: layer_ff,
                                 x_stride: 0,
                             });
+                            // llama4 rope layer: weightless per-head L2-norm on the roped K.
+                            if let Some(ones) = l2norm {
+                                g.push(Op::QkNorm {
+                                    x: k16,
+                                    weight: ones,
+                                    dst: k16,
+                                    rows: batch as u32,
+                                    n_head: nkv as u32,
+                                    head_dim: hd as u32,
+                                    eps,
+                                    x_stride: 0,
+                                });
+                            }
                             k16
                         }
                     };
@@ -1899,6 +1955,14 @@ pub(crate) fn generate_dense_backend(
                         });
                         q16
                     }
+                    None if nope => {
+                        // llama4 NoPE (global) layer: Q is UNROPED — the attention reads the raw
+                        // f32 projection directly. (The reference multiplies Q by an attention-
+                        // temperature scale here; that scale is EXACTLY 1.0 below the 8192-token
+                        // chunk size, so it is a no-op in infr's CPU-testable regime — see the
+                        // `llama4` arch note for the long-context follow-up.)
+                        q
+                    }
                     None => {
                         // llama: Q roped to the f16 scratch (the attention kernels read f16 q).
                         g.push(Op::Rope {
@@ -1913,6 +1977,19 @@ pub(crate) fn generate_dense_backend(
                             freq_factors: layer_ff,
                             x_stride: 0,
                         });
+                        // llama4 rope layer: weightless per-head L2-norm on the roped Q.
+                        if let Some(ones) = l2norm {
+                            g.push(Op::QkNorm {
+                                x: q16,
+                                weight: ones,
+                                dst: q16,
+                                rows: batch as u32,
+                                n_head: nh as u32,
+                                head_dim: hd as u32,
+                                eps,
+                                x_stride: 0,
+                            });
+                        }
                         q16
                     }
                 };
@@ -2078,7 +2155,10 @@ pub(crate) fn generate_dense_backend(
                         n_used: mc.n_used as u32,
                         n_ff_exp: mc.n_ff_exp as u32,
                         scale: mc.scale,
-                        act, // qwen3moe/qwen35moe: SwiGLU (act == Silu)
+                        act, // qwen3moe/qwen35moe/llama4: SwiGLU (act == Silu)
+                        gating: mc.gating,
+                        norm_w: mc.norm_w,
+                        weight_before: mc.weight_before,
                     });
                     if let Some(MoeSharedW {
                         gate_inp,
@@ -2087,29 +2167,34 @@ pub(crate) fn generate_dense_backend(
                         wdown,
                     }) = shexp
                     {
-                        // qwen35moe Qwen2-MoE-style shared expert: a plain dense SwiGLU FFN on the
-                        // SAME input (`hn`) as the routed bank, gated by a per-token sigmoid and
-                        // summed with the routed output. `nff_l` here holds `shexp_ff` (see
-                        // `Config::n_ff_layers`'s qwen35moe fallback in `config.rs`) — `fuse_gu` is
-                        // always false for qwen35moe (no dense `ffn_gate.weight` tensors to fuse;
-                        // see `fuse_gu`'s definition), so `gbuf`/`ubuf`/`actbuf` are the plain
-                        // separate-tensor scratch, exactly like `FfnW::Dense` above.
-                        g.push(Op::Linear {
-                            x: hn,
-                            weight: gate_inp,
-                            dst: shexp_gate,
-                            m: batch as u32,
-                            in_f: ne as u32,
-                            out_f: 1,
-                            w_off: 0,
-                        });
+                        // Shared expert (qwen35moe / llama4): a dense SwiGLU FFN on the SAME input
+                        // (`hn`) as the routed bank, summed with the routed output. Width is
+                        // `shexp_ff` — NOT `nff_l` (llama4's dense `feed_forward_length` is WIDER
+                        // than a shared expert; qwen35moe's `nff_l` happens to equal `shexp_ff`).
+                        // `fuse_gu` is always false here (no dense `ffn_gate.weight` to fuse), so
+                        // `gbuf`/`ubuf`/`actbuf` are the plain scratch (sized to `n_ff >= shexp_ff`),
+                        // exactly like `FfnW::Dense` above.
+                        let sff = c.shexp_ff as u32;
+                        // qwen35moe only: per-token sigmoid gate logit (`Op::Linear` out_f=1).
+                        // llama4's shared expert has no gate — it's summed in plain (`Op::Add`).
+                        if let Some(gi) = gate_inp {
+                            g.push(Op::Linear {
+                                x: hn,
+                                weight: gi,
+                                dst: shexp_gate,
+                                m: batch as u32,
+                                in_f: ne as u32,
+                                out_f: 1,
+                                w_off: 0,
+                            });
+                        }
                         g.push(Op::Linear {
                             x: hn,
                             weight: wgate,
                             dst: gbuf,
                             m: batch as u32,
                             in_f: ne as u32,
-                            out_f: nff_l as u32,
+                            out_f: sff,
                             w_off: 0,
                         });
                         g.push(Op::Linear {
@@ -2118,7 +2203,7 @@ pub(crate) fn generate_dense_backend(
                             dst: ubuf,
                             m: batch as u32,
                             in_f: ne as u32,
-                            out_f: nff_l as u32,
+                            out_f: sff,
                             w_off: 0,
                         });
                         g.push(Op::GatedAct {
@@ -2126,7 +2211,7 @@ pub(crate) fn generate_dense_backend(
                             up: ubuf,
                             dst: actbuf,
                             rows: batch as u32,
-                            nff: nff_l as u32,
+                            nff: sff,
                             act,
                             up_off: 0,
                             up_stride: 0,
@@ -2138,18 +2223,29 @@ pub(crate) fn generate_dense_backend(
                             weight: wdown,
                             dst: d_out,
                             m: batch as u32,
-                            in_f: nff_l as u32,
+                            in_f: sff,
                             out_f: ne as u32,
                             w_off: 0,
                         });
-                        g.push(Op::MoeSharedExpertAdd {
-                            moe: moe_out,
-                            shexp: d_out,
-                            gate: shexp_gate,
-                            dst: sub,
-                            rows: batch as u32,
-                            n: ne as u32,
-                        });
+                        if gate_inp.is_some() {
+                            // qwen35moe: `moe_out + sigmoid(gate) · shexp`.
+                            g.push(Op::MoeSharedExpertAdd {
+                                moe: moe_out,
+                                shexp: d_out,
+                                gate: shexp_gate,
+                                dst: sub,
+                                rows: batch as u32,
+                                n: ne as u32,
+                            });
+                        } else {
+                            // llama4: `moe_out + shexp` (plain sum, no gate).
+                            g.push(Op::Add {
+                                a: moe_out,
+                                b: d_out,
+                                dst: sub,
+                                n: (batch * ne) as u32,
+                            });
+                        }
                     }
                 }
                 FfnW::DiffusionMoe {
@@ -2290,6 +2386,9 @@ pub(crate) fn generate_dense_backend(
                         n_ff_exp: mc.n_ff_exp as u32,
                         scale: mc.scale,
                         act,
+                        gating: mc.gating,
+                        norm_w: mc.norm_w,
+                        weight_before: mc.weight_before,
                     });
                     g.push(Op::RmsNorm {
                         x: moe_out,

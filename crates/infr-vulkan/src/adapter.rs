@@ -2496,7 +2496,18 @@ fn lower_op(
             n_ff_exp,
             scale,
             act,
+            gating,
+            norm_w,
+            weight_before,
         } => {
+            // The Vulkan MoE lowering implements only softmax gating + top-k renormalization +
+            // output-weighting (qwen3moe/qwen35moe/diffusion-gemma). llama4's sigmoid/no-renorm/
+            // weight-before-FFN routing is CPU-only (see the `llama4` arch note) — it never reaches
+            // a GPU backend in-tree, so guard rather than silently miscompute.
+            assert!(
+                matches!(*gating, infr_core::graph::MoeGating::Softmax) && *norm_w && !*weight_before,
+                "Vulkan MoeFfn: only softmax + renorm + output-weighting supported (llama4 is CPU-only)"
+            );
             let (ne, n_expert, n_used, nff) = (
                 *ne as usize,
                 *n_expert as usize,
@@ -4470,6 +4481,9 @@ mod tests {
                 n_ff_exp: nff as u32,
                 scale,
                 act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -4586,6 +4600,9 @@ mod tests {
             n_ff_exp: nff as u32,
             scale,
             act: Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
         });
         let mk = |bytes: &[u8], usage| {
             let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -4840,6 +4857,9 @@ mod tests {
                 n_ff_exp: nff as u32,
                 scale,
                 act: Activation::Gelu,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -4985,6 +5005,9 @@ mod tests {
                 n_ff_exp: nff as u32,
                 scale,
                 act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -5117,6 +5140,9 @@ mod tests {
                 n_ff_exp: nff as u32,
                 scale,
                 act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();

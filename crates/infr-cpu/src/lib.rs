@@ -20,7 +20,7 @@ mod repack;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
 use infr_core::error::Result;
-use infr_core::graph::{AttnMask, Graph, Op, TensorKind};
+use infr_core::graph::{AttnMask, Graph, MoeGating, Op, TensorKind};
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
 use infr_gguf::TensorBytes;
@@ -1489,6 +1489,9 @@ impl Backend for CpuBackend {
                     n_ff_exp,
                     scale,
                     act,
+                    gating,
+                    norm_w,
+                    weight_before,
                 } => {
                     let (ne, n_expert, n_used, nffx) = (
                         ne as usize,
@@ -1582,18 +1585,35 @@ impl Backend for CpuBackend {
                     }
                     let routes: Vec<RouteRow> = pool.collect(rows, &|r| {
                         let logits = &logits_all[r * n_expert..r * n_expert + n_expert];
-                        let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let mut probs: Vec<f32> =
-                            logits.iter().map(|&v| (v - maxl).exp()).collect();
-                        let psum: f32 = probs.iter().sum();
-                        for p in probs.iter_mut() {
-                            *p /= psum;
-                        }
+                        // Router probabilities: softmax over all experts (qwen3moe/…) or a per-expert
+                        // sigmoid (llama4). Both are monotone in the logit, so the top-`n_used`
+                        // selection is identical either way (llama4 selects by raw logits — same set).
+                        let probs: Vec<f32> = match gating {
+                            MoeGating::Softmax => {
+                                let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                                let mut p: Vec<f32> =
+                                    logits.iter().map(|&v| (v - maxl).exp()).collect();
+                                let psum: f32 = p.iter().sum();
+                                for v in p.iter_mut() {
+                                    *v /= psum;
+                                }
+                                p
+                            }
+                            MoeGating::Sigmoid => {
+                                logits.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect()
+                            }
+                        };
                         let mut idx: Vec<usize> = (0..n_expert).collect();
                         idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
                         idx.truncate(n_used);
-                        let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
-                        let w: Vec<f32> = idx.iter().map(|&e| probs[e] / wsum * scale).collect();
+                        // `norm_w`: renormalize the selected weights to sum to 1 before scaling
+                        // (softmax MoE); llama4 uses the raw sigmoid prob × scale (no renorm).
+                        let w: Vec<f32> = if norm_w {
+                            let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                            idx.iter().map(|&e| probs[e] / wsum * scale).collect()
+                        } else {
+                            idx.iter().map(|&e| probs[e] * scale).collect()
+                        };
                         RouteRow { idx, w }
                     });
 
@@ -1610,6 +1630,9 @@ impl Backend for CpuBackend {
                     let mut pair_row: Vec<usize> = Vec::new();
                     let mut pair_bucket: Vec<u32> = Vec::new();
                     let mut pair_local: Vec<u32> = Vec::new();
+                    // llama4 `weight_before_ffn`: the routing weight per (row→expert) pair, folded
+                    // into that pair's gate/up activations (stage C) instead of the output (stage E).
+                    let mut pair_w: Vec<f32> = Vec::new();
                     // slot_pair[r][rank] = flat pair index — stage E's replay map.
                     let mut slot_pair: Vec<Vec<usize>> = routes
                         .iter()
@@ -1632,6 +1655,7 @@ impl Backend for CpuBackend {
                                 pair_row.push(r);
                                 pair_bucket.push(buckets.len() as u32);
                                 pair_local.push(i as u32);
+                                pair_w.push(routes[r].w[rank]);
                             }
                             buckets.push((e, p0, pair_row.len() - p0));
                         }
@@ -1874,17 +1898,22 @@ impl Backend for CpuBackend {
                         let b = pair_bucket[p] as usize;
                         let i = pair_local[p] as usize;
                         let count = buckets[b].2;
+                        // llama4 weight-before-FFN: scale gate & up by the pair's routing weight
+                        // BEFORE the activation. Exact (`gate`/`up` are linear, so `gate(w·x) =
+                        // w·gate(x)`): `silu(w·gate)·(w·up)` == applying `w` to the FFN input.
+                        let wp = if weight_before { pair_w[p] } else { 1.0 };
                         let mut row = vec![0f32; nffx];
                         if fused_gate_up {
                             let gu = &gu_all[gu_off[b]..gu_off[b] + 2 * nffx * count];
                             for (f, v) in row.iter_mut().enumerate() {
-                                *v = act_fn(act, gu[f * count + i]) * gu[(nffx + f) * count + i];
+                                *v = act_fn(act, wp * gu[f * count + i])
+                                    * (wp * gu[(nffx + f) * count + i]);
                             }
                         } else {
                             let gt = &gu_all[gu_off[b]..gu_off[b] + nffx * count];
                             let ut = &up_all[gu_off[b]..gu_off[b] + nffx * count];
                             for (f, v) in row.iter_mut().enumerate() {
-                                *v = act_fn(act, gt[f * count + i]) * ut[f * count + i];
+                                *v = act_fn(act, wp * gt[f * count + i]) * (wp * ut[f * count + i]);
                             }
                         }
                         row
@@ -2002,7 +2031,8 @@ impl Backend for CpuBackend {
                         let rr = &routes[r];
                         for (rank, &p) in slot_pair[r].iter().enumerate() {
                             debug_assert_ne!(p, usize::MAX);
-                            let w_e = rr.w[rank];
+                            // weight_before already folded the routing weight into stage C.
+                            let w_e = if weight_before { 1.0 } else { rr.w[rank] };
                             let y = &y_pairs[p * ne..p * ne + ne];
                             for (o, &yv) in orow.iter_mut().zip(y) {
                                 *o += w_e * yv;

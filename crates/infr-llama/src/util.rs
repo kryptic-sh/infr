@@ -12,6 +12,12 @@ use tokenizers::Tokenizer;
 /// which is what made a naive ByteLevel produce different token ids.
 pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// Llama 4 pre-tokenizer regex (`tokenizer.ggml.pre == "llama4"` → llama.cpp's `GPT4O` pre-type,
+/// the original split from the model's `tokenizer.json`). Applied via a Split before ByteLevel,
+/// exactly like `QWEN2_PRE_RE`. Numbers group in runs of up to 3 digits (`\p{N}{1,3}`), and the
+/// letter runs are split by case (upper-run then lower-run) — distinct from the Qwen regex.
+pub(crate) const LLAMA4_PRE_RE: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// Build the gemma4 E2B per-layer-embedding host-gather metadata from the GGUF. `None` for models
 /// without per-layer embeddings. The big `per_layer_token_embd` table stays quantized in the mmap
 /// and is gathered + dequanted per token at forward time (mirrors llama.cpp, which classifies

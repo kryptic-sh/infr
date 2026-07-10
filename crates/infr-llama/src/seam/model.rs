@@ -1051,6 +1051,28 @@ impl SeamModel {
         )?;
         Ok(stats)
     }
+
+    /// Token-level CPU greedy generation: prefill the given prompt token ids and stream each
+    /// GENERATED token id through `on_id` (BOS/template handling is entirely the caller's — nothing
+    /// is prepended). Returns the generated ids. The id-exact counterpart to [`Self::generate_cpu`],
+    /// used for token-identity checks against a reference implementation.
+    pub fn generate_cpu_ids(
+        &self,
+        prompt_tokens: &[u32],
+        max_new: usize,
+        on_id: impl FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let (generated, _stats) = crate::seam::generate_dense_cpu(
+            &self.gguf,
+            &self.cfg,
+            &self.token_embd,
+            self.per_layer_embd.as_ref(),
+            prompt_tokens,
+            max_new,
+            on_id,
+        )?;
+        Ok(generated)
+    }
 }
 
 /// A persistent CPU-reference session for DiffusionGemma's two-pass forward (Phase 2 — see

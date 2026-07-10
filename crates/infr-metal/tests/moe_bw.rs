@@ -70,6 +70,9 @@ fn moe_layer_wall() {
             n_ff_exp: nff as u32,
             scale: 1.0,
             act: infr_core::graph::Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
         });
         cur = dst;
     }

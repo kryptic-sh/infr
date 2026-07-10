@@ -145,6 +145,24 @@ pub struct Config {
     /// `seam::runner`). `0` = no shared expert — every non-qwen35moe model, and any qwen35moe
     /// model without `ffn_*_shexp` tensors.
     pub shexp_ff: usize,
+    /// llama4 (Scout etc.): `true` only for `arch == "llama4"`. Gates every field below plus the
+    /// per-layer NoPE / weightless-L2-norm attention wiring and the sigmoid-gated MoE in `seam`.
+    pub llama4: bool,
+    /// llama4 `interleave_moe_layer_step`: layer `il` is a MoE layer iff `(il+1) % step == 0`
+    /// (`step == 1` on Scout → every layer). Other layers are dense FFN. `0` for every non-llama4
+    /// model (whose MoE archs — qwen3moe etc. — are MoE on ALL layers; see [`Config::is_moe_layer`]).
+    pub moe_interleave_step: usize,
+    /// llama4 iRoPE `no_rope_layer_step`: layer `il` SKIPS rope (NoPE / global attention) iff
+    /// `(il+1) % step == 0` (4 on Scout — pattern "3 local-rope, 1 global-NoPE"). `0` = every layer
+    /// uses rope (every non-llama4 model, and a llama4 checkpoint with `attention.sliding_window==0`).
+    pub no_rope_step: usize,
+    /// llama4 `Llama4TextL2Norm`: a WEIGHTLESS per-head RMS/L2-norm applied to Q and K AFTER rope,
+    /// on the rope (non-NoPE) layers only. `use_kq_norm = n_expert != 128` in the reference (`true`
+    /// for Scout 16E). `false` for every non-llama4 model.
+    pub kq_l2norm: bool,
+    /// Whether the MoE shared expert is GATED by a per-token sigmoid (qwen35moe, Qwen2-MoE style)
+    /// or summed in PLAIN (llama4). Only meaningful when `shexp_ff > 0`. `false` for llama4.
+    pub shexp_gated: bool,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -232,6 +250,20 @@ impl Config {
         self.diffusion_gemma || self.gemma4_moe
     }
 
+    /// Whether layer `il` uses the routed-expert (MoE) FFN. For every MoE arch except llama4 that's
+    /// EVERY layer (`moe_interleave_step == 0`); llama4 interleaves MoE with dense layers on a fixed
+    /// step (`(il+1) % step == 0`). `false` for dense models (`self.moe` is `None`).
+    pub fn is_moe_layer(&self, il: usize) -> bool {
+        self.moe.is_some()
+            && (self.moe_interleave_step == 0 || (il + 1).is_multiple_of(self.moe_interleave_step))
+    }
+
+    /// llama4 iRoPE: whether layer `il` SKIPS rope (a NoPE / global-attention layer). `false` for
+    /// every non-llama4 model (`no_rope_step == 0`).
+    pub fn is_nope_layer(&self, il: usize) -> bool {
+        self.no_rope_step > 0 && (il + 1).is_multiple_of(self.no_rope_step)
+    }
+
     /// qwen35: whether layer `il` is one of the FULL-attention layers (vs gated-DeltaNet linear
     /// attention). `false` for every non-qwen35 model. Mirrors the old seam's `Cfg::is_attn_layer`.
     pub fn is_qwen35_attn_layer(&self, il: usize) -> bool {
@@ -268,7 +300,9 @@ impl Config {
             .unwrap_or("")
             .to_string();
         let qk_norm = match arch.as_str() {
-            crate::arch::LLAMA | crate::arch::QWEN2 => false,
+            // llama4 has no LEARNED q/k-norm weights; its weightless per-head L2-norm on Q/K is
+            // applied AFTER rope (see `kq_l2norm` below), not via the qwen3-style QkNormRope.
+            crate::arch::LLAMA | crate::arch::LLAMA4 | crate::arch::QWEN2 => false,
             crate::arch::QWEN3
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
@@ -293,6 +327,11 @@ impl Config {
         // `permute_qk_neox` field doc).
         let qkv_bias = arch == crate::arch::QWEN2;
         let permute_qk_neox = arch == crate::arch::QWEN2;
+        // llama4 (Scout etc.): shares the llama attention skeleton (NORM/interleaved rope, no bias,
+        // converter-permuted q/k) but adds a 16-expert sigmoid top-1 MoE + iRoPE (per-layer NoPE) +
+        // a weightless post-rope Q/K L2-norm. All the divergent semantics are HARDCODED for `llama4`
+        // in the reference loader (`models/llama4.cpp`), not metadata-driven.
+        let llama4 = arch == crate::arch::LLAMA4;
         let diffusion_gemma = arch == crate::arch::DIFFUSION_GEMMA;
         // diffusion-gemma's backbone IS gemma4's (heterogeneous per-layer dims, V-norm,
         // freq_factors, softcap) verbatim — see docs/DIFFUSIONGEMMA.md — so it folds into the same
@@ -383,18 +422,41 @@ impl Config {
         // gating, confirmed against llama.cpp's `qwen35moe.cpp::build_layer_ffn` — hardcoded
         // `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX`/`norm_w=true`, identical to qwen3moe); only its
         // Qwen2-MoE-style SHARED expert (`shexp_ff` below) is genuinely new.
-        let moe = if arch == crate::arch::QWEN3_MOE || diffusion_gemma || qwen35_moe || gemma4_moe {
+        let moe = if arch == crate::arch::QWEN3_MOE
+            || diffusion_gemma
+            || qwen35_moe
+            || gemma4_moe
+            || llama4
+        {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
                 meta_u64(g, &mk("expert_used_count")).context("expert_used_count")? as usize;
             let n_ff_exp = meta_u64(g, &mk("expert_feed_forward_length"))
                 .map(|v| v as usize)
                 .unwrap_or(n_ff / n_used.max(1));
+            // llama4 hardcodes SIGMOID gating, NO top-k renormalization, and weight-before-FFN
+            // (`models/llama4.cpp::build_arch_graph` → `build_moe_ffn(.., norm_w=false, ..,
+            // LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID)` with `weight_before_ffn = arch == LLAMA4`).
+            // Its routed-weight scale is `expert_weights_scale` (absent on Scout → 1.0). Every other
+            // MoE arch here is softmax + renormalized top-k, output-weighted, scale 1.0.
+            let (gating, norm_w, weight_before, scale) = if llama4 {
+                (
+                    infr_core::graph::MoeGating::Sigmoid,
+                    false,
+                    true,
+                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(1.0) as f32,
+                )
+            } else {
+                (infr_core::graph::MoeGating::Softmax, true, false, 1.0)
+            };
             Some(MoeConfig {
                 n_expert,
                 n_used,
                 n_ff_exp,
-                scale: 1.0,
+                scale,
+                gating,
+                norm_w,
+                weight_before,
             })
         } else {
             None
@@ -547,12 +609,37 @@ impl Config {
             [0u32; 4]
         };
         let attn_out_gate = qwen35;
-        // qwen35moe shared expert (Qwen2-MoE-style) — see the `shexp_ff` field doc. `0` (no
-        // shared expert) when the key is absent, e.g. a future qwen35moe checkpoint without one.
+        // Shared-expert FFN width. qwen35moe reads `expert_shared_feed_forward_length`; llama4 has
+        // NO such key — its shared expert is the SAME width as a routed expert
+        // (`models/llama4.cpp`: `n_ff_shexp = n_ff_exp`). `0` = no shared expert.
         let shexp_ff = if qwen35_moe {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
+        } else if llama4 {
+            moe.map(|m| m.n_ff_exp).unwrap_or(0)
         } else {
             0
+        };
+        // llama4 shared expert is summed in PLAIN (no per-token gate); qwen35moe gates by sigmoid.
+        let shexp_gated = qwen35_moe;
+        // llama4 iRoPE + MoE interleave. `interleave_moe_layer_step` defaults to 1 (every layer MoE,
+        // as on Scout). The NoPE step: the reference forces the chunked-attention branch whenever
+        // `attention.sliding_window` is absent or nonzero, in which case `n_no_rope_layer_step`
+        // stays its default 4; only an explicit `sliding_window == 0` disables NoPE (all-rope). The
+        // attention temperature params (floor 8192, scale 0.1, offset 1.0) and the 8192 chunk size
+        // are likewise hardcoded there — both are exact no-ops below 8192 tokens, so infr's CPU
+        // path (which can't reach that length on a 109B model) leaves them unimplemented; see the
+        // arch doc.
+        let (moe_interleave_step, no_rope_step, kq_l2norm) = if llama4 {
+            let step = meta_u64(g, &mk("interleave_moe_layer_step")).unwrap_or(1) as usize;
+            let no_rope = match meta_u64(g, &mk("attention.sliding_window")) {
+                Some(0) => 0, // all-rope (swa_type NONE)
+                _ => 4,       // chunked branch → default no_rope_layer_step
+            };
+            // `use_kq_norm = type != LLM_TYPE_17B_128E` (i.e. n_expert != 128).
+            let l2 = moe.map(|m| m.n_expert != 128).unwrap_or(true);
+            (step, no_rope, l2)
+        } else {
+            (0, 0, false)
         };
         // diffusion-gemma's canvas/mask keys sit at the TOP level (`diffusion.*` /
         // `tokenizer.ggml.*`), not namespaced under `{arch}.*` like everything else above —
@@ -644,6 +731,11 @@ impl Config {
             attn_out_gate,
             n_layer_nextn,
             shexp_ff,
+            llama4,
+            moe_interleave_step,
+            no_rope_step,
+            kq_l2norm,
+            shexp_gated,
         })
     }
 }

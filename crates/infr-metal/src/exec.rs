@@ -2864,7 +2864,19 @@ impl MetalBackend {
                 n_ff_exp,
                 scale,
                 act,
+                gating,
+                norm_w,
+                weight_before,
             } => {
+                // The Metal MoE path implements only softmax gating + top-k renorm + output-
+                // weighting; llama4's sigmoid/no-renorm/weight-before-FFN routing is CPU-only (see
+                // the `llama4` arch note) and never reaches a GPU backend in-tree.
+                assert!(
+                    matches!(gating, infr_core::graph::MoeGating::Softmax)
+                        && norm_w
+                        && !weight_before,
+                    "Metal MoeFfn: only softmax + renorm + output-weighting supported (llama4 is CPU-only)"
+                );
                 let (ne, n_expert, n_used, nffx) = (
                     ne as usize,
                     n_expert as usize,

@@ -1309,6 +1309,7 @@ dependencies = [
  "infr-core",
  "infr-prof",
  "infr-prof-rt",
+ "memmap2",
  "thiserror 2.0.18",
  "tracing",
 ]

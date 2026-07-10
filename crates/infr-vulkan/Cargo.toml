@@ -19,3 +19,6 @@ half.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true
 indicatif.workspace = true
+
+[dev-dependencies]
+memmap2.workspace = true

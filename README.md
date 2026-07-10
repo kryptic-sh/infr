@@ -50,7 +50,7 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE, paged experts |
 | Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                              |
 | Qwen3             | `qwen3`           | dense, QK-norm                                          |
-| Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts (CPU offload)           |
+| Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts, paged experts          |
 | Gemma 3           | `gemma3`          | SWA + QK-norm + GeGLU, dual-RoPE                        |
 | Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm          |
 | Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing          |
@@ -68,8 +68,8 @@ and the 35B rides `qwen35moe` with no code changes
 # Qwen3 dense
 infr run unsloth/Qwen3-1.7B-GGUF:Q4_K_M "What is the capital of France?"
 
-# Qwen3 MoE (expert host offload with INFR_NCMOE=N, or the paged VRAM cache —
-# see INFR_MOE_CACHE_GB below — for tight VRAM)
+# Qwen3 MoE (experts page through the VRAM LRU cache when they don't fit —
+# see INFR_MOE_CACHE_GB below)
 infr run unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M "Explain MoE routing."
 
 # Llama 4 Scout (37 GB Q2_K) — paged expert cache runs it on a 24 GB card
@@ -190,20 +190,18 @@ folded into the row so the mismatch is visible). Details in
 Useful env: `INFR_TEMP` / `INFR_TOP_K` / `INFR_TOP_P` (sampling; `TEMP=0` →
 greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NO_FLASH`.
 
-**MoE expert placement** (when the expert banks don't fit VRAM): resident when
-they fit (zero config, zero change); otherwise `INFR_NCMOE=N` explicitly forces
-the first `N` layers' expert banks HOST-VISIBLE (GPU reads them over the PCIe
-bus every dispatch — the legacy path, unconditional even if everything would
-otherwise fit); with `INFR_NCMOE` unset, an overflow instead pages through a
-VRAM-resident LRU expert cache (`infr_vulkan::pager`) — `INFR_MOE_CACHE_GB=X`
+**MoE expert placement**: resident when the expert banks fit VRAM (zero config,
+zero change); otherwise every layer pages through a VRAM-resident LRU expert
+cache (`infr_vulkan::pager`) sized to the remaining VRAM. `INFR_MOE_CACHE_GB=X`
 forces every layer through the pager with an `X` GB budget regardless of fit
-(useful for testing, or to free VRAM for a larger `--ctx`). The pager needs a
-SPLIT (non-fused) gate/up bank with one dtype per role across every layer —
-llama4/Qwen3-MoE/Qwen3.6-MoE qualify; a fused-gate-up bank (DiffusionGemma,
-Gemma-4 MoE) or a mixed-dtype role (some unsloth-dynamic quants bump a subset of
-layers' `ffn_down_exps` to a wider K-quant) falls back to the host-visible split
-instead — paging can't address a role whose experts aren't all one byte size.
-`INFR_PAGER_STATS=1` prints each role's hit/miss/eviction counts.
+(useful for testing, or to free VRAM for a larger `--ctx`). Every bank shape
+pages: split gate/up (llama4/Qwen3-MoE/Qwen3.6-MoE), fused gate_up
+(DiffusionGemma, Gemma-4 MoE — one double-width slot per expert), and
+mixed-dtype roles (unsloth-dynamic quants bumping a subset of layers' banks to a
+wider K-quant — one arena pool per (role, byte size)). `INFR_NCMOE=N` (the
+retired host-visible split) is a DEPRECATED alias, mapped to an equivalent pager
+budget with a warning. `INFR_PAGER_STATS=1` prints each pool's hit/miss/eviction
+counts.
 
 ## Validated models & performance
 

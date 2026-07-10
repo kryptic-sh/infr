@@ -487,8 +487,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     } else {
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
         // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit (fully
-        // resident when experts fit; INFR_NCMOE / the paged expert cache — INFR_MOE_CACHE_GB —
-        // otherwise). qwen35 (Qwen3.5) lands here too — same seam, same `Config::from_gguf` +
+        // resident when experts fit; the paged expert cache — INFR_MOE_CACHE_GB — otherwise). qwen35 (Qwen3.5) lands here too — same seam, same `Config::from_gguf` +
         // `MixerW::DeltaNet` unified runner (see `unified_qwen35_*` tests). llama4 (Scout) lands
         // here too now: the paged expert cache lets its 37 GB Q2_K bank run on a 24 GB card.
         eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");

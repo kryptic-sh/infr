@@ -3623,10 +3623,9 @@ fn execute_paged_moe(
     // layer are already resident and the LUT flushed (the `touch_role` calls above resolve every
     // id in the chunk — up to `n_expert` distinct simultaneously, which the pager budget floor in
     // `seam::mod` guarantees fits); buckets with count 0 never read the LUT. Gated on the exact
-    // dtype set that has `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — a
-    // STRICT SUBSET of `MOE_MMQ_DTYPES`, checked by `moe_mmq_drift_test`; Scout's shipped Q2_K/
-    // Q3_K plus Q4_0/Q4_1/IQ4_NL/IQ4_XS) + SiLU + dp4a support; anything else stays on the
-    // id-GEMV segment below, which is shape-general.
+    // dtype set that has `_xpg` kernel builds (`infr_core::tensor::MOE_MMQ_PAGED_DTYPES` — now
+    // the FULL `MOE_MMQ_DTYPES` set, mirror checked by `moe_mmq_drift_test`) + activation + dp4a
+    // support; anything else stays on the id-GEMV segment below, which is shape-general.
     {
         let paged_mmq_ok = infr_core::tensor::moe_paged_mmq_ok;
         let act_ok = if *fused_gate_up {
@@ -3999,9 +3998,11 @@ mod tests {
     /// The drift guard the SSOT lists promise (`infr_core::tensor::MOE_MMQ_DTYPES`'s doc): every
     /// dtype claimed by the batched-mmq family must ALSO have the small-m id-GEMV kernels its
     /// per-token/decode fallback needs (a format on the fast path but not the slow one would
-    /// panic at decode time), the paged subset must have its paged twins, and the subset/sact
-    /// relations must hold. Pure name-table checks — the per-format GPU parity tests in this
-    /// module exercise the actual `matmul_mmq_experts(_paged)` dispatch arms (whose `_ =>
+    /// panic at decode time), the paged set must have its paged twins AND mirror the mmq set in
+    /// full (the pager is the sole MoE offload mechanism — an mmq dtype missing a paged build
+    /// would silently fall back to the far slower id-GEMV prefill segment when paged), and the
+    /// subset/sact relations must hold. Pure name-table checks — the per-format GPU parity tests
+    /// in this module exercise the actual `matmul_mmq_experts(_paged)` dispatch arms (whose `_ =>
     /// unreachable!` is the runtime backstop for a listed-but-unwired format).
     #[test]
     fn moe_mmq_drift_test() {
@@ -4014,6 +4015,11 @@ mod tests {
             assert!(
                 crate::linear::native_idm_kernel_name(dt).is_some(),
                 "{dt:?} is mmq-covered but has no multi-slot idm-GEMV kernel (decode fallback)"
+            );
+            assert!(
+                infr_core::tensor::moe_paged_mmq_ok(dt),
+                "{dt:?} is mmq-covered but has no paged (_xpg) batched build — paged prefill \
+                 would silently degrade to the id-GEMV segment"
             );
         }
         for &dt in MOE_MMQ_PAGED_DTYPES {

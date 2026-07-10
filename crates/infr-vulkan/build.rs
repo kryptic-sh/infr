@@ -1086,6 +1086,66 @@ fn main() {
             "native_gemm_mmq_iq4_xs_xpg32",
             &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
+        (
+            "native_gemm_mmq_q8_0",
+            "native_gemm_mmq_q8_0_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q8_0",
+            "native_gemm_mmq_q8_0_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q5_0",
+            "native_gemm_mmq_q5_0_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q5_0",
+            "native_gemm_mmq_q5_0_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q5_1",
+            "native_gemm_mmq_q5_1_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q5_1",
+            "native_gemm_mmq_q5_1_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q4k",
+            "native_gemm_mmq_q4k_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q4k",
+            "native_gemm_mmq_q4k_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q5k",
+            "native_gemm_mmq_q5k_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q5k",
+            "native_gemm_mmq_q5k_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),
         ("moe_scatter_reduce", "moe_scatter_reduce", &[]),
         ("moe_topk", "moe_topk", &[]),

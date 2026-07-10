@@ -33,7 +33,15 @@ layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 layout(binding = 0) readonly buffer QA { uint qa[]; };          // [m, k/4] packed int8 activations
 layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, k/32]
 layout(binding = 2) readonly buffer WB { uint nw[]; };          // stacked Q5_0 weight bytes
-#ifdef EXPERT_GRID
+#ifdef PAGED
+// PAGED (implies EXPERT_GRID): `nw` is a GpuPager arena of uniform slots; see
+// native_gemm_mmq_q2_k.comp's PAGED doc (word base not slot index, pc.w_base = layer_base, pc.m
+// unused, rb() chokepoint).
+layout(binding = 3) readonly buffer LUT { uint lut[]; };
+layout(binding = 4) readonly buffer CNT { uint counts[]; };
+layout(binding = 5) readonly buffer OFF { uint offsets[]; };
+layout(binding = 6) writeonly buffer CB { float c[]; };         // [n_pairs, n] packed
+#elif defined(EXPERT_GRID)
 // Batched-MoE all-experts-in-one-dispatch: gl_WorkGroupID.y = expert id; the packed activation
 // rows for expert e live at [offsets[e], offsets[e]+counts[e]) (bucket layout). pc.m is repurposed
 // as the per-expert weight stride (elements). Row tiles past the segment exit immediately; row
@@ -50,7 +58,12 @@ shared uint As[BM * SP];
 shared uint Bs[BN * SP];
 shared float Bdl[BN];
 
+#ifdef PAGED
+uint nw_base = 0u; // this expert's arena WORD base (set once in main from the LUT)
+uint rb(uint byte) { return (nw[nw_base + (byte >> 2)] >> ((byte & 3u) * 8u)) & 0xFFu; }
+#else
 uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+#endif
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 uint ru32(uint byte) {
     return rb(byte) | (rb(byte + 1u) << 8u) | (rb(byte + 2u) << 16u) | (rb(byte + 3u) << 24u);
@@ -78,7 +91,14 @@ void main() {
     if ((gl_WorkGroupID.x / tilesN) * BM >= cnt) { return; }
     uint wgRow = offsets[ex] + (gl_WorkGroupID.x / tilesN) * BM;
     uint rowEnd = offsets[ex] + cnt;
+#ifdef PAGED
+    // Resolved AFTER the count early-exit: a bucket with count 0 was never routed, so its LUT
+    // entry may be stale/absent — no workgroup that would read it gets here.
+    nw_base = lut[pc.w_base + ex];
+    uint wbase = 0u;
+#else
     uint wbase = pc.w_base + ex * pc.m;
+#endif
 #else
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
     uint wbase = pc.w_base;

@@ -138,14 +138,24 @@ pub fn moe_mmq_needs_sact(dt: DType) -> bool {
 }
 
 /// Subset of [`MOE_MMQ_DTYPES`] with a PAGED (`_xpg`/`_xpg32`) batched expert-GEMM build — i.e.
-/// usable in Scout-style paged-expert-cache prefill, not just the resident-bank path. A STRICT
-/// subset of `MOE_MMQ_DTYPES` (not every format needs a paged build — only ones a shipped paged
-/// model's expert banks actually use); `moe_mmq_drift_test` checks the subset relationship holds.
+/// usable in paged-expert-cache prefill, not just the resident-bank path. Mirrors
+/// `MOE_MMQ_DTYPES` IN FULL since the pager became the sole MoE offload mechanism (fused gemma-4
+/// MoE / DiffusionGemma banks ship Q4_K/Q5_0/Q5_1/Q8_0, UD quants mix Q4_K/Q5_K/Q6_K — any mmq
+/// dtype can now end up paged, and a listed-but-unpaged format would silently fall back to the
+/// far slower id-GEMV prefill segment). Kept as a separate list (not an alias) so the paged
+/// builds' existence stays independently assertable; `moe_mmq_drift_test` checks the subset
+/// relationship AND that every member has its `_xpg` kernels.
 pub const MOE_MMQ_PAGED_DTYPES: &[DType] = &[
-    DType::Q2K,
-    DType::Q3K,
     DType::Q4_0,
     DType::Q4_1,
+    DType::Q5_0,
+    DType::Q5_1,
+    DType::Q8_0,
+    DType::Q2K,
+    DType::Q3K,
+    DType::Q4K,
+    DType::Q5K,
+    DType::Q6K,
     DType::Iq4Nl,
     DType::Iq4Xs,
 ];

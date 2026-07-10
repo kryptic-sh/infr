@@ -5203,10 +5203,11 @@ impl<'a> Recorder<'a> {
     /// as the paged GEMVs). The caller must have made every ROUTED expert of this layer resident
     /// (all of them simultaneously — buckets run in one dispatch) and flushed the LUT before this
     /// records; buckets with count 0 exit before any LUT/weight read, so unrouted experts may be
-    /// absent. Covers every dtype `paged_mmq_ok` accepts (mirrors the resident twin's dtype set in
-    /// full — see adapter.rs's drift-guard doc); `sact` is `Some` only for the min-carrying dtypes
-    /// (Q4_1 — Q2_K/Q3_K/Q4_0/IQ4_NL/IQ4_XS are symmetric-or-self-summed, same split the resident
-    /// twin's `*_needs_sact` uses). Tile selection (BM=64 vs 32) matches the resident twin.
+    /// absent. Covers every dtype `paged_mmq_ok` accepts — the FULL `MOE_MMQ_DTYPES` set, since
+    /// `MOE_MMQ_PAGED_DTYPES` now mirrors it (see adapter.rs's drift-guard doc); `sact` is `Some`
+    /// only for the min-carrying dtypes (Q4_K/Q5_K/Q5_1/Q4_1 — the rest are
+    /// symmetric-or-self-summed, same `MOE_MMQ_SACT_DTYPES` split the resident twin uses). Tile
+    /// selection (BM=64 vs 32) matches the resident twin.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_experts_paged(
         &self,
@@ -5293,8 +5294,71 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_mmq_iq4_xs_xpg32_spv(),
                 7,
             ),
+            // Q8_0/Q5_0/Q6_K: symmetric, no `sact` (7 bindings = resident's 6 + LUT).
+            (infr_core::DType::Q8_0, false) => (
+                "native_gemm_mmq_q8_0_xpg",
+                crate::gemm::native_gemm_mmq_q8_0_xpg_spv(),
+                7,
+            ),
+            (infr_core::DType::Q8_0, true) => (
+                "native_gemm_mmq_q8_0_xpg32",
+                crate::gemm::native_gemm_mmq_q8_0_xpg32_spv(),
+                7,
+            ),
+            (infr_core::DType::Q5_0, false) => (
+                "native_gemm_mmq_q5_0_xpg",
+                crate::gemm::native_gemm_mmq_q5_0_xpg_spv(),
+                7,
+            ),
+            (infr_core::DType::Q5_0, true) => (
+                "native_gemm_mmq_q5_0_xpg32",
+                crate::gemm::native_gemm_mmq_q5_0_xpg32_spv(),
+                7,
+            ),
+            (infr_core::DType::Q6K, false) => (
+                "native_gemm_mmq_q6k_xpg",
+                crate::gemm::native_gemm_mmq_q6k_xpg_spv(),
+                7,
+            ),
+            (infr_core::DType::Q6K, true) => (
+                "native_gemm_mmq_q6k_xpg32",
+                crate::gemm::native_gemm_mmq_q6k_xpg32_spv(),
+                7,
+            ),
+            // Q4_K/Q5_K/Q5_1: min-carrying — one extra `sact` binding (8 = resident's 7 + LUT).
+            (infr_core::DType::Q4K, false) => (
+                "native_gemm_mmq_q4k_xpg",
+                crate::gemm::native_gemm_mmq_q4k_xpg_spv(),
+                8,
+            ),
+            (infr_core::DType::Q4K, true) => (
+                "native_gemm_mmq_q4k_xpg32",
+                crate::gemm::native_gemm_mmq_q4k_xpg32_spv(),
+                8,
+            ),
+            (infr_core::DType::Q5K, false) => (
+                "native_gemm_mmq_q5k_xpg",
+                crate::gemm::native_gemm_mmq_q5k_xpg_spv(),
+                8,
+            ),
+            (infr_core::DType::Q5K, true) => (
+                "native_gemm_mmq_q5k_xpg32",
+                crate::gemm::native_gemm_mmq_q5k_xpg32_spv(),
+                8,
+            ),
+            (infr_core::DType::Q5_1, false) => (
+                "native_gemm_mmq_q5_1_xpg",
+                crate::gemm::native_gemm_mmq_q5_1_xpg_spv(),
+                8,
+            ),
+            (infr_core::DType::Q5_1, true) => (
+                "native_gemm_mmq_q5_1_xpg32",
+                crate::gemm::native_gemm_mmq_q5_1_xpg32_spv(),
+                8,
+            ),
             _ => unreachable!(
-                "paged batched MoE expert GEMM: Q2_K/Q3_K/Q4_0/Q4_1/IQ4_NL/IQ4_XS only"
+                "paged batched MoE expert GEMM: the MOE_MMQ_PAGED_DTYPES set only \
+                 (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS)"
             ),
         };
         let kern = self.be.kernel(name, spv, nb, 16);

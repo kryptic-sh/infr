@@ -256,14 +256,16 @@ id-indexed small-m GEMV — the ONE shape the paged executor split targets. Gree
 output is oracle-locked against llama.cpp (`cpu_llama4_scout_greedy`) AND
 against the paged Vulkan path itself
 (`gpu_seam_paged_moe_matches_scout_oracle`), token-for-token identical. Measured
-(22/48 layers paged, tiny 6-8 slot cache — VRAM left no room for more): `tg32`
-**9.7 t/s** (> llama.cpp's CPU-offload-hybrid 6.55 t/s; the reused-staging floor
-at a 0%-hit-rate top-1 router is ~10 t/s). `pp512` **~9-10.5 t/s** — far below
-llama.cpp's 136, because Scout's prefill has no batched path at all (every token
-pays a router→readback→touch→GEMV round trip per layer, per the small-m-only
-constraint above); closing that gap needs a batched paged-expert GEMM for
-codebook quants, filed as a follow-up. `INFR_MOE_CACHE_GB` sizes the pager's
-budget (see the MoE placement paragraph above); pure CPU stays available under
+(all 48 expert layers paged, per-role LRU caches of 312/312/238 experts — each
+role's arena is one SSBO, capped at the device's 4 GiB binding range): `tg32`
+**12.6 t/s** at 72-77% hit rates (> llama.cpp's CPU-offload-hybrid 6.55 t/s),
+`pp512` **27.6 t/s** at 94-96% hit rates — still far below llama.cpp's 136,
+because Scout's prefill has no batched path at all (every token pays a
+router→readback→touch→GEMV round trip per layer, per the small-m-only constraint
+above); closing that gap needs a batched paged-expert GEMM for codebook quants,
+filed as a follow-up (as is splitting a role across several arena buffers to
+lift the 4 GiB per-role cache cap). `INFR_MOE_CACHE_GB` sizes the pager's budget
+(see the MoE placement paragraph above); pure CPU stays available under
 `INFR_CPU=1` / `-ngl 0`.
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf

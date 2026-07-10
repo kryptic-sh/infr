@@ -1533,6 +1533,16 @@ pub(crate) fn native_gemm_mmq_q5k_xp_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
+/// SPIR-V for the tiled Q5_1 dp4a (mmq) GEMM, expert-grid variant (the shipped
+/// gemma-4-26B-A4B-it-GGUF quantizes its MoE down projection as Q5_1 on 29/30 layers; min-carrying
+/// like Q4_K/Q5_K → binds `sact`, but no superblock sub-scale — one d/m pair per 32-block).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q5_1_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_1_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
 // BM=32 row-tile expert-grid variants — see build.rs's `_xp32` entries and
 // `matmul_mmq_experts`'s small-rows-per-expert doc.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1562,6 +1572,12 @@ pub(crate) fn native_gemm_mmq_q5_0_xp32_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q5k_xp32_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5k_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q5_1_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_1_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

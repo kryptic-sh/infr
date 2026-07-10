@@ -3235,13 +3235,14 @@ pub(crate) fn generate_dense_backend(
     // Guard: E2B/gemma4 requires a per-(token,layer) host-side input vector that is computed in
     // the per-step loop, so it falls through to the original token-by-token loop below unchanged.
     // Batched MoE prefill needs the adapter's GPU-routed expert path: gate/up AND down each
-    // independently in {Q4_K, Q5_K, Q6_K, Q8_0, Q5_0} (split gate/up, what qwen3moe/qwen35moe
-    // ship, or fused gate_up, diffusion-gemma's `ffn_gate_up_exps`) — Q5_0 is what the shipped
-    // diffusiongemma-26B-A4B-it-GGUF's down banks use; unsloth-dynamic Qwen3.6-MoE (UD) quants mix
-    // Q5_K/Q6_K into gate/up/down banks across layers. Codebook quants (IQ*/Q2_K/Q3_K — no dp4a-mmq
-    // kernel) keep the per-token loop. This set must exactly mirror the Vulkan adapter's batched
-    // `Op::MoeFfn` coverage (its `mmq_ok`) — a mismatch either silently falls back to per-token
-    // prefill or compiles a graph the adapter rejects.
+    // independently in {Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, Q5_1} (split gate/up, what qwen3moe/qwen35moe
+    // ship, or fused gate_up, diffusion-gemma's/gemma-4-MoE's `ffn_gate_up_exps`) — Q5_0 is what
+    // the shipped diffusiongemma-26B-A4B-it-GGUF's down banks use; Q5_1 is what the shipped
+    // gemma-4-26B-A4B-it-GGUF's down banks use (29/30 layers); unsloth-dynamic Qwen3.6-MoE (UD)
+    // quants mix Q5_K/Q6_K into gate/up/down banks across layers. Codebook quants (IQ*/Q2_K/Q3_K —
+    // no dp4a-mmq kernel) keep the per-token loop. This set must exactly mirror the Vulkan
+    // adapter's batched `Op::MoeFfn` coverage (its `mmq_ok`) — a mismatch either silently falls
+    // back to per-token prefill or compiles a graph the adapter rejects.
     let moe_mmq_ok = |d: Option<DType>| {
         matches!(
             d,
@@ -3250,6 +3251,7 @@ pub(crate) fn generate_dense_backend(
                 | Some(DType::Q6K)
                 | Some(DType::Q8_0)
                 | Some(DType::Q5_0)
+                | Some(DType::Q5_1)
         )
     };
     let moe_batched_ok = c.moe.is_some() && {

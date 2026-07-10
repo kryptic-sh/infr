@@ -201,7 +201,19 @@ pub(crate) fn generate_dense_vulkan_session(
     let mut n_host_moe = 0usize; // tier 1: first N layers host-visible
     let mut n_paged = 0usize; // tier 2/3: first N layers paged
     let mut pager_budget_bytes = 0u64;
-    if cfg.moe.is_some() {
+    // Placement is decided ONCE, on the session's FIRST load — the only call where `bind_weight`
+    // runs (see the `state.is_none()` init block in `generate_dense_backend`) and the only moment
+    // the tier-3 budget math is consistent: `vram.available` is LIVE (heapBudget − heapUsage), so
+    // once this model's weights are resident a recompute would subtract `fp.dense` from an
+    // `available` that ALREADY excludes it — double-counting the model against itself and
+    // collapsing the budget (observed: a fully-resident 16.4 GB model "re-placed" as 5/30
+    // resident on the warm second call of a bench). Warm calls leave n_host_moe/n_paged at 0;
+    // nothing consumes them (no binding, and the pager init below is first_load-gated anyway).
+    // A first load racing ANOTHER resident model (swap mid-drain) still reads reduced
+    // `available` — that's real pressure, deliberately not compensated; the alloc-time VRAM
+    // budget guard is the backstop against over-commit.
+    let first_load = state.is_none();
+    if first_load && cfg.moe.is_some() {
         match (explicit_ncmoe, moe_cache_gb_override) {
             (Some(n), _) => n_host_moe = n.min(cfg.n_layer),
             (None, Some(gb)) if !cannot_page => {
@@ -294,8 +306,9 @@ pub(crate) fn generate_dense_vulkan_session(
     // to a 4-byte placeholder nobody registered, would leave `execute_static` reading that
     // placeholder as if it were the full bank (see `pager::MoePagerLayout`'s doc). Only on the
     // FIRST load of a session (`bind_weight` isn't called again once `state` already holds
-    // uploaded weights, so a second `init_moe_pager` would wipe an already-warm cache for nothing).
-    let first_load = state.is_none();
+    // uploaded weights, so a second `init_moe_pager` would wipe an already-warm cache for nothing;
+    // `n_paged > 0` already implies `first_load` — the placement calc above is first_load-gated —
+    // but keep the guard explicit).
     if first_load && n_paged > 0 {
         let moe = cfg.moe.as_ref().expect("n_paged > 0 implies MoE");
         let tensor_bytes = |suffix: &str| -> Option<usize> {

@@ -151,6 +151,21 @@ profile decode with `INFR_SEAM_NO_REPLAY=1`. Details in
 INFR_PROF2=1 infr bench "$M" -p 2048 -n 0 -r 1 2>&1 | tail -30   # exit aggregate
 ```
 
+**Validate Vulkan work** — any change touching `infr-vulkan` (kernels, recorder,
+adapter, pager) must run its GPU tests and at least one end-to-end generation
+under the Khronos validation layer, and fix every error AND warning it reports
+before landing (validation silence is the bar, not "it produces the right
+tokens" — robust-access reads, missing barriers, and binding-range overflows can
+return plausible garbage instead of crashing):
+
+```bash
+VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation cargo test -p infr-vulkan -- --ignored
+VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation infr run "$M" "smoke prompt"
+```
+
+The layer ships with the `vulkan-validation-layers` package. It slows GPU work
+noticeably — use it for correctness passes, never inside timed benches.
+
 **Compare to llama.cpp** — `infr compare` shells out to `infr bench` and the
 system `llama-bench` with matching flags on coding-agent-shaped workloads
 (prefill, decode-at-depth, whole turns). `--ctx` is comma-delimited:

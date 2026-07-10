@@ -3107,7 +3107,10 @@ impl MetalBackend {
                             let mut p = ((cr * n_used) as u32).to_ne_bytes().to_vec();
                             p.extend_from_slice(&(nffx as u32).to_ne_bytes());
                             p.extend_from_slice(&act_code.to_ne_bytes());
-                            p.extend_from_slice(&0u32.to_ne_bytes());
+                            // up_off + up_stride/gate_stride/gate_block_width — all 0 (packed):
+                            // the shader reads the full 7-field GatedActParams, so every dispatch
+                            // site must push all of it or the tail fields read garbage.
+                            p.extend_from_slice(&[0u8; 16]);
                             self.encode(
                                 r,
                                 &pso,
@@ -3171,7 +3174,10 @@ impl MetalBackend {
                         let mut p = ((cr * n_used) as u32).to_ne_bytes().to_vec();
                         p.extend_from_slice(&(nffx as u32).to_ne_bytes());
                         p.extend_from_slice(&act_code.to_ne_bytes());
-                        p.extend_from_slice(&0u32.to_ne_bytes()); // up_off
+                        // up_off + up_stride/gate_stride/gate_block_width — all 0 (packed): the
+                        // shader reads the full 7-field GatedActParams, so every dispatch site
+                        // must push all of it or the tail fields read garbage.
+                        p.extend_from_slice(&[0u8; 16]);
                         self.encode_w(
                             r,
                             &pso,

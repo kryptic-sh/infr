@@ -269,6 +269,20 @@ pub trait Backend: Send + Sync {
     }
     fn sync(&self) -> Result<()>;
 
+    /// Whether the currently loaded model is running any MoE expert layer through a paged VRAM
+    /// cache (an expert bank too big to keep fully resident — see `infr_vulkan::pager::GpuPager`).
+    /// Paged execution needs a host readback of the router's chosen expert ids BETWEEN a layer's
+    /// GEMV stages (to resolve/upload cache misses before the id-indexed GEMV reads them), which a
+    /// cached record-once decode replay can't express (the whole point of replay is recording
+    /// every position-dependent op ONCE with no host round-trip in between). The seam's decode-loop
+    /// gate and the Vulkan adapter's own `execute`/`execute_chain` both check this and force the
+    /// per-execute static path instead — see `infr_vulkan::adapter::execute`'s doc.
+    /// `false` for every backend but Vulkan, and for Vulkan whenever no paged model is loaded (the
+    /// overwhelming common case: MoE experts that fit VRAM are fully resident with zero change).
+    fn moe_paged(&self) -> bool {
+        false
+    }
+
     /// Perf (DiffusionGemma denoise, perf slice 3 — docs/DIFFUSIONGEMMA.md): fused per-canvas-row
     /// entropy-bound sampler reduction over raw `[rows, dim]` logits, avoiding a full `[rows,
     /// dim]` host download. `u` is `rows` host-drawn uniform `[0,1)` floats (the seeded

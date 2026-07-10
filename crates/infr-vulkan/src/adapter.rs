@@ -3106,7 +3106,13 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         .as_any()
         .downcast_ref::<VkDecodePlan>()
         .ok_or_else(|| be("vulkan adapter: plan is not a VkDecodePlan"))?;
-    if !plan.eligible {
+    // A paged model forces the static per-execute path regardless of `plan.eligible`: paged
+    // execution needs a host readback between a MoE layer's router/top-k and its expert GEMVs
+    // (see `execute_static`'s paged branch), which the record-once replay tape — recorded ONCE
+    // with no host round-trip built in — can't express. `Backend::moe_paged`'s doc has the full
+    // rationale; the seam's `dyn_replay` gate mirrors this so a paged model never even BUILDS the
+    // (then-unused) replay plan, but this check is what actually guarantees correctness.
+    if !plan.eligible || be_.moe_paged() {
         return execute_static(be_, &plan.graph, bindings);
     }
 
@@ -3147,7 +3153,7 @@ pub(crate) fn execute_chain(
     let Some(plan) = plan.as_any().downcast_ref::<VkDecodePlan>() else {
         return Ok(None);
     };
-    if !plan.eligible || n == 0 || n > 64 {
+    if !plan.eligible || n == 0 || n > 64 || be_.moe_paged() {
         return Ok(None);
     }
     let mut guard = plan.replay.lock().unwrap();
@@ -3367,7 +3373,14 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // recorder — hold them here so they drop only after `rec.finish()` submits.
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
 
-    let rec = be_.recorder()?;
+    // `rec` is an `Option` (not a plain binding) because a PAGED `MoeFfn` op splits this graph
+    // into several submissions: everything before it, a tiny router+top-k segment whose ids the
+    // host must read back, the pager touch/upload/LUT-flush (no recorder involved — a handful of
+    // `one_shot` copies + a mapped-pointer memcpy), then a fresh segment for the paged expert
+    // GEMVs onward. `execute_paged_moe` owns that whole dance; here we just finish the segment
+    // before it and open a new one after. Every non-paged graph (the overwhelming common case)
+    // never takes this branch and records exactly like before — one recorder, one submit.
+    let mut rec = Some(be_.recorder()?);
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut pool: ScratchPool = HashMap::new();
@@ -3376,12 +3389,33 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         if skip_op.contains(&op_idx) {
             continue;
         }
+        if let Op::MoeFfn { gate_exps, .. } = op {
+            let gbuf = resolve(&scratch, bindings, *gate_exps)?;
+            let paged = be_.moe_pager().lock().unwrap().as_ref().is_some_and(|s| {
+                s.is_paged(
+                    crate::pager::Role::Gate,
+                    crate::pager::buffer_identity(gbuf),
+                )
+            });
+            if paged {
+                for c in dyn_args.drain(..) {
+                    transient.extend([c.args, c.pm, c.pl, c.pacc]);
+                }
+                rec.take()
+                    .expect("segment always Some between ops")
+                    .finish()
+                    .map_err(|e| be(e.to_string()))?;
+                execute_paged_moe(be_, graph, op, &scratch, bindings, &mut pool)?;
+                rec = Some(be_.recorder()?);
+                continue;
+            }
+        }
         lower_op(
             be_,
             graph,
             op_idx,
             op,
-            &rec,
+            rec.as_ref().expect("segment always Some between ops"),
             &scratch,
             bindings,
             &fused_kv_write,
@@ -3398,7 +3432,297 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
     transient.extend(pool.into_values());
-    rec.finish().map_err(|e| be(e.to_string()))?;
+    rec.take()
+        .expect("segment always Some at loop end")
+        .finish()
+        .map_err(|e| be(e.to_string()))?;
+    Ok(())
+}
+
+/// Get-or-alloc a pooled buffer with an explicit `usage` (unlike [`pooled`], which is always
+/// `Activations`) — the paged MoE segment's `ids_global` scratch needs `Staging` (host-visible, so
+/// the global-id upload is a plain memcpy with no extra submit).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn pooled_usage(
+    pool: &mut ScratchPool,
+    be_: &VulkanBackend,
+    tag: &'static str,
+    bytes: usize,
+    usage: BufferUsage,
+) -> Result<(&'static str, usize)> {
+    let key = (tag, bytes.max(4));
+    if let std::collections::hash_map::Entry::Vacant(e) = pool.entry(key) {
+        e.insert(be_.alloc_uninit(key.1, usage)?);
+    }
+    Ok(key)
+}
+
+/// Execute ONE paged `Op::MoeFfn` as a sequence of submissions with a host sync in between, so the
+/// pager can resolve/upload this layer's chosen experts before the id-indexed GEMV reads them.
+/// Only reached from `execute_static`'s loop, and only for a `MoeFfn` whose `gate_exps` buffer is
+/// registered in the backend's `MoePagerSession` (see `pager.rs`'s module doc for why that check —
+/// not a graph-level flag — is the paging signal). Mirrors the non-batched small-m arm's math
+/// (`lower_op`'s `Op::MoeFfn` match, the `rows <= moe_small_m_threshold()` branch) exactly, just
+/// split around one readback and reading the pager's arena+LUT instead of a fully-resident bank.
+///
+/// Scope: split gate/up only (`fused_gate_up` errors — no paged model needs the diffusion-gemma
+/// fused-bank shape today; that's a follow-up if one ever does). `rows`/`n_used` are otherwise
+/// general (not hardcoded to llama4's rows=1/n_used=1), reusing the same shapes the existing
+/// small-m arm already supports.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn execute_paged_moe(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    op: &Op,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+    pool: &mut ScratchPool,
+) -> Result<()> {
+    use crate::pager::{buffer_identity, Role};
+    let Op::MoeFfn {
+        x,
+        router_x,
+        router,
+        gate_exps,
+        up_exps,
+        down_exps,
+        down_scale,
+        fused_gate_up,
+        dst,
+        ne,
+        n_expert,
+        n_used,
+        n_ff_exp,
+        scale,
+        act,
+        gating,
+        norm_w,
+        weight_before,
+    } = op
+    else {
+        unreachable!("execute_paged_moe only ever called for an Op::MoeFfn");
+    };
+    if *fused_gate_up {
+        return Err(be(
+            "vulkan adapter: paged MoeFfn needs split gate/up (fused_gate_up unsupported — no \
+             paged model needs the diffusion-gemma fused-bank shape today)",
+        ));
+    }
+    let gating_u32 = match gating {
+        infr_core::graph::MoeGating::Softmax => 0u32,
+        infr_core::graph::MoeGating::Sigmoid => 1u32,
+    };
+    let (ne, n_expert, n_used, nff) = (
+        *ne as usize,
+        *n_expert as usize,
+        *n_used as usize,
+        *n_ff_exp as usize,
+    );
+    let stride = nff * ne;
+    let down_stride = nff * ne;
+    let (gdt, udt, ddt) = (
+        graph.desc(*gate_exps).dtype,
+        graph.desc(*up_exps).dtype,
+        graph.desc(*down_exps).dtype,
+    );
+    let rows = graph.desc(*x).numel() / ne;
+    let n_slots = rows * n_used;
+    let r = |id: TensorId| resolve(scratch, bindings, id);
+
+    // ── Segment 1: router GEMV + top-k, into a pooled ids/wts pair. Submits + waits on its own —
+    // the host needs `ids` back before the paged GEMVs can be recorded.
+    let logits = pooled(pool, be_, "moe_paged_logits", rows * n_expert * 4)?;
+    let ids_key = pooled(pool, be_, "moe_paged_ids", n_slots * 4)?;
+    let wts = pooled(pool, be_, "moe_paged_wts", n_slots * 4)?;
+    {
+        let rec1 = be_.recorder()?;
+        let rxb = r(*router_x)?;
+        let rw = r(*router)?;
+        let rdt = graph.desc(*router).dtype;
+        if native_dense_supported(rdt) {
+            rec1.linear_native(rdt, rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+        } else if matches!(rdt, infr_core::DType::F32) {
+            rec1.linear_f32(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+        } else {
+            rec1.linear(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+        }
+        rec1.moe_topk(
+            pool[&logits].as_ref(),
+            pool[&ids_key].as_ref(),
+            pool[&wts].as_ref(),
+            rows,
+            n_expert,
+            n_used,
+            *scale,
+            gating_u32,
+            *norm_w,
+        );
+        rec1.finish().map_err(|e| be(e.to_string()))?;
+    }
+
+    // ── Host round-trip: read back this layer's chosen (local) expert ids, resolve residency for
+    // all three roles (uploading misses through the pager's shared staging buffer), flush each
+    // role's LUT, then re-upload the GLOBAL ids (`layer_base`-shifted — see `ExpertSource`) the
+    // paged GEMV must index the shared LUT with.
+    let mut id_bytes = vec![0u8; n_slots * 4];
+    be_.download(pool[&ids_key].as_ref(), &mut id_bytes)
+        .map_err(|e| be(e.to_string()))?;
+    let local_ids: Vec<u32> = bytemuck::cast_slice(&id_bytes).to_vec();
+
+    let gate_buf = r(*gate_exps)?;
+    let up_buf = r(*up_exps)?;
+    let down_buf = r(*down_exps)?;
+    let (gate_id, up_id, down_id) = (
+        buffer_identity(gate_buf),
+        buffer_identity(up_buf),
+        buffer_identity(down_buf),
+    );
+    let global_ids = {
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let sess = guard
+            .as_mut()
+            .expect("execute_static only reaches here when be_.moe_paged() is true");
+        let g = sess.touch_role(be_, Role::Gate, gate_id, &local_ids)?;
+        let u = sess.touch_role(be_, Role::Up, up_id, &local_ids)?;
+        let d = sess.touch_role(be_, Role::Down, down_id, &local_ids)?;
+        debug_assert_eq!(g, u, "gate/up/down of one layer share the SAME layer_base");
+        debug_assert_eq!(g, d, "gate/up/down of one layer share the SAME layer_base");
+        g
+    };
+    let ids_global_key = pooled_usage(
+        pool,
+        be_,
+        "moe_paged_ids_global",
+        n_slots * 4,
+        BufferUsage::Staging,
+    )?;
+    be_.upload(
+        pool[&ids_global_key].as_ref(),
+        bytemuck::cast_slice(&global_ids),
+    )
+    .map_err(|e| be(e.to_string()))?;
+
+    // ── Segment 2: the paged expert GEMVs (arena+LUT instead of a resident bank) through the rest
+    // of this MoeFfn's math — activation, down-projection, weighted accumulate — exactly mirroring
+    // the non-paged small-m arm.
+    let gbuf = pooled(pool, be_, "moe_paged_g", n_slots * nff * 4)?;
+    let ubuf = pooled(pool, be_, "moe_paged_u", n_slots * nff * 4)?;
+    let abuf = pooled(pool, be_, "moe_paged_a", n_slots * nff * 4)?;
+    let ybuf = pooled(pool, be_, "moe_paged_y", n_slots * ne * 4)?;
+    let n_act = n_slots * nff;
+    let rec2 = be_.recorder()?;
+    let xb = r(*x)?;
+    {
+        let guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_ref().expect("checked above");
+        rec2.linear_native_id_multi_paged(
+            gdt,
+            sess.arena(Role::Gate),
+            sess.lut(Role::Gate),
+            pool[&ids_global_key].as_ref(),
+            n_used,
+            stride,
+            xb,
+            false,
+            pool[&gbuf].as_ref(),
+            ne,
+            nff,
+            rows,
+        );
+        rec2.linear_native_id_multi_paged(
+            udt,
+            sess.arena(Role::Up),
+            sess.lut(Role::Up),
+            pool[&ids_global_key].as_ref(),
+            n_used,
+            stride,
+            xb,
+            false,
+            pool[&ubuf].as_ref(),
+            ne,
+            nff,
+            rows,
+        );
+    }
+    if *weight_before {
+        rec2.moe_weight_scale(pool[&gbuf].as_ref(), pool[&wts].as_ref(), n_slots, nff);
+        rec2.moe_weight_scale(pool[&ubuf].as_ref(), pool[&wts].as_ref(), n_slots, nff);
+    }
+    match act {
+        Activation::Silu => rec2.silu_mul(
+            pool[&gbuf].as_ref(),
+            pool[&ubuf].as_ref(),
+            pool[&abuf].as_ref(),
+            n_act,
+        ),
+        Activation::Sigmoid => rec2.mul_sigmoid(
+            pool[&gbuf].as_ref(),
+            pool[&ubuf].as_ref(),
+            pool[&abuf].as_ref(),
+            n_act,
+            0,
+            0,
+            0,
+        ),
+        Activation::Gelu => rec2.gelu_mul_off(
+            pool[&gbuf].as_ref(),
+            pool[&ubuf].as_ref(),
+            0,
+            0,
+            nff,
+            0,
+            nff,
+            0,
+            pool[&abuf].as_ref(),
+            n_act,
+        ),
+    }
+    {
+        let guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_ref().expect("checked above");
+        rec2.linear_native_id_multi_paged(
+            ddt,
+            sess.arena(Role::Down),
+            sess.lut(Role::Down),
+            pool[&ids_global_key].as_ref(),
+            n_used,
+            down_stride,
+            pool[&abuf].as_ref(),
+            true,
+            pool[&ybuf].as_ref(),
+            nff,
+            ne,
+            rows,
+        );
+    }
+    let dstb = r(*dst)?;
+    rec2.zero(dstb, rows * ne);
+    match down_scale {
+        Some(ds) => rec2.moe_accumulate_scaled(
+            pool[&ybuf].as_ref(),
+            pool[&wts].as_ref(),
+            // `down_scale[expert_id]` indexes by the LOCAL id (the layer's own [n_expert] scale
+            // array), not the global/LUT id — reuse the router's own `ids` buffer, not the
+            // re-uploaded global one.
+            pool[&ids_key].as_ref(),
+            r(*ds)?,
+            dstb,
+            ne,
+            n_used,
+            rows,
+        ),
+        None => rec2.moe_accumulate(
+            pool[&ybuf].as_ref(),
+            pool[&wts].as_ref(),
+            dstb,
+            ne,
+            n_used,
+            rows,
+            *weight_before,
+        ),
+    }
+    rec2.finish().map_err(|e| be(e.to_string()))?;
     Ok(())
 }
 

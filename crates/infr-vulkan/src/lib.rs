@@ -121,6 +121,12 @@ struct VulkanShared {
     /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
     /// (it also sees other processes' VRAM).
     device_used: AtomicU64,
+    /// Paged MoE expert cache (see `pager::MoePagerSession`) — `Some` only when the loaded model's
+    /// expert banks don't fit VRAM and the seam's placement policy chose paging over the legacy
+    /// host-visible split (see `infr-llama`'s `generate_dense_vulkan_session`). `None` is the
+    /// overwhelming common case (fits resident) and costs nothing beyond one `Mutex` lock check
+    /// per `Backend::moe_paged` call.
+    moe_pager: crate::pager::MoePagerCell,
 }
 
 // ash Instances/Devices/handles are Send+Sync per the Vulkan spec when
@@ -881,6 +887,7 @@ impl VulkanBackend {
                 pcache,
                 weight_pb: Mutex::new(None),
                 device_used: AtomicU64::new(0),
+                moe_pager: Mutex::new(None),
             }),
         })
     }
@@ -900,6 +907,49 @@ impl VulkanBackend {
         WeightProgress {
             shared: self.shared.clone(),
         }
+    }
+
+    /// Install this model's paged-MoE session (see `pager::MoePagerSession`), sized but with no
+    /// tensors registered yet — called BEFORE the seam's weight-load closure runs (see
+    /// `pager::MoePagerLayout`'s doc for why the ordering matters: `Backend::moe_paged` must
+    /// already read true by the time that closure's placeholder buffers are bound). Replaces any
+    /// previous session (there is only ever one loaded model per process today).
+    pub fn init_moe_pager(&self, layout: crate::pager::MoePagerLayout) -> Result<()> {
+        let session = crate::pager::MoePagerSession::new(self, layout)?;
+        *self.shared.moe_pager.lock().unwrap() = Some(session);
+        Ok(())
+    }
+
+    /// Register one paged layer's role tensor with the session `init_moe_pager` already installed
+    /// — called from the seam's weight-load closure instead of uploading the tensor's full bytes.
+    /// Panics if no session is installed (a caller bug: `init_moe_pager` must run first).
+    pub fn register_paged_expert(
+        &self,
+        role: crate::pager::Role,
+        buf_id: usize,
+        source: crate::pager::ExpertSource,
+    ) {
+        self.shared
+            .moe_pager
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("register_paged_expert called before init_moe_pager")
+            .register(role, buf_id, source);
+    }
+
+    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded.
+    pub fn print_moe_pager_stats(&self) {
+        if let Some(s) = self.shared.moe_pager.lock().unwrap().as_ref() {
+            s.print_stats_if_enabled();
+        }
+    }
+
+    /// Locked access to the paged-MoE session for the adapter's `execute_static` — `pub(crate)`
+    /// (only `adapter.rs` reaches into this); see `pager.rs`'s module doc for why this lives
+    /// outside the `Graph`/`Bindings` seam instead of a per-op flag.
+    pub(crate) fn moe_pager(&self) -> &crate::pager::MoePagerCell {
+        &self.shared.moe_pager
     }
 
     // ── internal helpers ──────────────────────────────────────────────────────
@@ -1482,6 +1532,10 @@ impl Backend for VulkanBackend {
     fn sync(&self) -> Result<()> {
         unsafe { self.shared.device.device_wait_idle() }
             .map_err(|e| be(format!("device_wait_idle: {e}")))
+    }
+
+    fn moe_paged(&self) -> bool {
+        self.shared.moe_pager.lock().unwrap().is_some()
     }
 
     /// DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): one eager dispatch of

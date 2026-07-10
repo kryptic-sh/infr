@@ -14,6 +14,7 @@
 //!      block (the "pinned staging region" the pager's upload machinery is meant to use), split
 //!      into its two phases: `memcpy` (host mmap → mapped pointer) and `pcie` (`copy_buffer`,
 //!      i.e. `vkCmdCopyBuffer` + submit + wait).
+//!
 //! The source bytes come from a real mmap (memmap2, matching `infr-gguf`'s zero-copy tensor
 //! loading) of the locally-cached Llama-4-Scout Q2_K GGUF when present, else a scratch temp file —
 //! either way the source is genuinely page-cache-backed, unpinned host memory, not a `Vec` the

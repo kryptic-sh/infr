@@ -9,6 +9,7 @@ pub mod error;
 pub mod graph;
 pub mod iquant_grids;
 pub mod loader;
+pub mod pager;
 pub mod progress;
 pub mod tensor;
 
@@ -16,4 +17,5 @@ pub use backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPla
 pub use error::{Error, Result};
 pub use graph::{Activation, AttnMask, Graph, Op, TensorDecl, TensorKind};
 pub use loader::{MetaValue, Metadata, TensorInfo, WeightSource};
+pub use pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};
 pub use tensor::{DType, Shape, TensorDesc, TensorId};

@@ -544,6 +544,59 @@ fn main() {
         ("native_gemv_id", "native_id_q4k", &["-DFMT_Q4K"]),
         ("native_gemv_id", "native_id_q5k", &["-DFMT_Q5K"]),
         ("native_gemv_id", "native_id_q6k", &["-DFMT_Q6K"]),
+        // Paged twins (`infr_vulkan::pager::GpuPager`): one extra LUT-buffer hop, `slot =
+        // lut[expert_id]` — see native_gemv_id.comp's `-DPAGED` doc comment. Same format coverage
+        // as the resident-bank kernels above (the pager only ever holds native-block formats).
+        (
+            "native_gemv_id",
+            "native_id_q8_0_paged",
+            &["-DFMT_Q8_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_q4_0_paged",
+            &["-DFMT_Q4_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_q4_1_paged",
+            &["-DFMT_Q4_1", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_q5_0_paged",
+            &["-DFMT_Q5_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_q5_1_paged",
+            &["-DFMT_Q5_1", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_q2k_paged",
+            &["-DFMT_Q2K", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_q3k_paged",
+            &["-DFMT_Q3K", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_q4k_paged",
+            &["-DFMT_Q4K", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_q5k_paged",
+            &["-DFMT_Q5K", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_q6k_paged",
+            &["-DFMT_Q6K", "-DPAGED"],
+        ),
         // Multi-slot id GEMV: all n_used experts in one dispatch (concurrent, no inter-expert barrier).
         ("native_gemv_id_multi", "native_idm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemv_id_multi", "native_idm_q4_0", &["-DFMT_Q4_0"]),
@@ -555,6 +608,57 @@ fn main() {
         ("native_gemv_id_multi", "native_idm_q4k", &["-DFMT_Q4K"]),
         ("native_gemv_id_multi", "native_idm_q5k", &["-DFMT_Q5K"]),
         ("native_gemv_id_multi", "native_idm_q6k", &["-DFMT_Q6K"]),
+        // Paged twins — same LUT hop as above, for the decode/small-m multi-expert dispatch.
+        (
+            "native_gemv_id_multi",
+            "native_idm_q8_0_paged",
+            &["-DFMT_Q8_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q4_0_paged",
+            &["-DFMT_Q4_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q4_1_paged",
+            &["-DFMT_Q4_1", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q5_0_paged",
+            &["-DFMT_Q5_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q5_1_paged",
+            &["-DFMT_Q5_1", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q2k_paged",
+            &["-DFMT_Q2K", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q3k_paged",
+            &["-DFMT_Q3K", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q4k_paged",
+            &["-DFMT_Q4K", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q5k_paged",
+            &["-DFMT_Q5K", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_q6k_paged",
+            &["-DFMT_Q6K", "-DPAGED"],
+        ),
         // Reassociation-tolerant subgroup+NR variant of the multi-slot id GEMV (wave32, subgroupAdd,
         // no shared reduce) for the latency-STARVED Q6_K MoE expert down-projection (out_f≈2048 — the
         // largest SG win of any decode shape). NOT bit-identical (reordered accumulation); gated to

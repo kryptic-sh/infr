@@ -66,6 +66,46 @@ pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     })
 }
 
+/// [`native_id_kernel_name`]'s paged twin (`infr_vulkan::pager::GpuPager` build — one extra LUT
+/// hop, `slot = lut[expert_id]`, see `shaders/native_gemv_id.comp`'s `-DPAGED` doc comment).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub fn native_id_paged_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q8_0 => "native_id_q8_0_paged",
+        Q4_0 => "native_id_q4_0_paged",
+        Q4_1 => "native_id_q4_1_paged",
+        Q5_0 => "native_id_q5_0_paged",
+        Q5_1 => "native_id_q5_1_paged",
+        Q2K => "native_id_q2k_paged",
+        Q3K => "native_id_q3k_paged",
+        Q4K => "native_id_q4k_paged",
+        Q5K => "native_id_q5k_paged",
+        Q6K => "native_id_q6k_paged",
+        _ => return None,
+    })
+}
+
+/// [`native_idm_kernel_name`]'s paged twin — same LUT hop, for the decode/small-m multi-expert
+/// dispatch.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub fn native_idm_paged_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q8_0 => "native_idm_q8_0_paged",
+        Q4_0 => "native_idm_q4_0_paged",
+        Q4_1 => "native_idm_q4_1_paged",
+        Q5_0 => "native_idm_q5_0_paged",
+        Q5_1 => "native_idm_q5_1_paged",
+        Q2K => "native_idm_q2k_paged",
+        Q3K => "native_idm_q3k_paged",
+        Q4K => "native_idm_q4k_paged",
+        Q5K => "native_idm_q5k_paged",
+        Q6K => "native_idm_q6k_paged",
+        _ => return None,
+    })
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_kernel_name(dtype: infr_core::DType, residual: bool) -> &'static str {
     use infr_core::DType::*;

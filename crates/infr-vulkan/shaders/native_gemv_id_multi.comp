@@ -30,6 +30,10 @@ layout(binding = 0) readonly buffer WB { uint nw[]; };
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
 layout(binding = 3) buffer YB { float y_buf[]; };
+// -DPAGED: see native_gemv_id.comp's doc comment — same LUT hop, same zero-cost-when-off contract.
+#ifdef PAGED
+layout(binding = 4) readonly buffer LUTB { uint lut[]; };
+#endif
 
 shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
 
@@ -53,7 +57,11 @@ void main() {
     uint o = unit - slot_global * pc.out_f;
     uint row = slot_global / pc.n_used;
     uint t = gl_LocalInvocationID.x;
+#ifdef PAGED
+    uint wbase = lut[ids[slot_global]] * pc.stride + o * pc.in_f;
+#else
     uint wbase = ids[slot_global] * pc.stride + o * pc.in_f;
+#endif
     uint xbase = (pc.x_per_slot != 0u ? slot_global * pc.in_f : row * pc.in_f);
     uint nsub = pc.in_f / 32u;
     float acc = 0.0;

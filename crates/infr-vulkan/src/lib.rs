@@ -14,6 +14,7 @@ mod gemm;
 pub mod linear;
 mod matmul;
 mod ops;
+pub mod pager;
 mod pcache;
 mod recorder;
 

@@ -298,6 +298,60 @@ pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [
         _ => return None,
     })
 }
+/// [`native_id_build_spv`]'s paged twin (`infr_vulkan::pager`) — one extra LUT-buffer binding.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_id_paged_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q8_0 => v!("native_id_q8_0_paged"),
+        Q4_0 => v!("native_id_q4_0_paged"),
+        Q4_1 => v!("native_id_q4_1_paged"),
+        Q5_0 => v!("native_id_q5_0_paged"),
+        Q5_1 => v!("native_id_q5_1_paged"),
+        Q2K => v!("native_id_q2k_paged"),
+        Q3K => v!("native_id_q3k_paged"),
+        Q4K => v!("native_id_q4k_paged"),
+        Q5K => v!("native_id_q5k_paged"),
+        Q6K => v!("native_id_q6k_paged"),
+        _ => return None,
+    })
+}
+/// [`native_idm_build_spv`]'s paged twin (`infr_vulkan::pager`) — one extra LUT-buffer binding.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q8_0 => v!("native_idm_q8_0_paged"),
+        Q4_0 => v!("native_idm_q4_0_paged"),
+        Q4_1 => v!("native_idm_q4_1_paged"),
+        Q5_0 => v!("native_idm_q5_0_paged"),
+        Q5_1 => v!("native_idm_q5_1_paged"),
+        Q2K => v!("native_idm_q2k_paged"),
+        Q3K => v!("native_idm_q3k_paged"),
+        Q4K => v!("native_idm_q4k_paged"),
+        Q5K => v!("native_idm_q5k_paged"),
+        Q6K => v!("native_idm_q6k_paged"),
+        _ => return None,
+    })
+}
 /// SPIR-V + kernel-cache name for the reassociation-tolerant subgroup+NR variant of the multi-slot
 /// id GEMV (`native_gemv_id_multi_sg.comp`, wave32 + subgroupAdd). NOT bit-identical to
 /// `native_idm_*` — reordered accumulation; the caller gates to the Q6_K projection band (see

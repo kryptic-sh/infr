@@ -5256,6 +5256,94 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
     }
 
+    /// [`linear_native_id`]'s paged twin: `w` is a `GpuPager` arena (fixed uniform slots, not one
+    /// contiguous per-expert tensor) and `lut` is that pager's device LUT buffer — the kernel does
+    /// `slot = lut[ids[slot_idx]]` before the usual `slot * stride` addressing (see
+    /// `shaders/native_gemv_id.comp`'s `-DPAGED` branch). Always the tree kernel — the SG variant
+    /// has no paged build (Q6_K/Q5_K only, gated off; see `native_id_sg_choice`'s doc — a paged
+    /// model never reaches that gate today since MoE auto-fit picks the pager only on overflow,
+    /// but this keeps the two builds from silently diverging if that changes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_id_paged(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        lut: &dyn Buffer,
+        ids: &dyn Buffer,
+        slot: usize,
+        stride: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("gemv_id_paged", rows, in_f, out_f);
+        let name =
+            crate::linear::native_id_paged_kernel_name(dtype).expect("native id paged kernel");
+        let spv = crate::gemm::native_id_paged_build_spv(dtype).expect("native id paged spv");
+        let k = self.be.kernel(name, spv, 5, 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(slot as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(stride as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(w),
+                Self::vkb(x),
+                Self::vkb(ids),
+                Self::vkb(y),
+                Self::vkb(lut),
+            ],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
+    /// [`linear_native_id_multi`]'s paged twin — same LUT hop as [`linear_native_id_paged`], for
+    /// the decode/small-m all-`n_used`-experts-in-one-dispatch path. Always the tree kernel (see
+    /// [`linear_native_id_paged`]'s doc for why the SG fast path is skipped).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_id_multi_paged(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        lut: &dyn Buffer,
+        ids: &dyn Buffer,
+        n_used: usize,
+        stride: usize,
+        x: &dyn Buffer,
+        x_per_slot: bool,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        rows: usize,
+    ) {
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(stride as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(x_per_slot as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(rows as u32).to_ne_bytes());
+        let bufs = [
+            Self::vkb(w),
+            Self::vkb(x),
+            Self::vkb(ids),
+            Self::vkb(y),
+            Self::vkb(lut),
+        ];
+        let name =
+            crate::linear::native_idm_paged_kernel_name(dtype).expect("native idm paged kernel");
+        let spv = crate::gemm::native_idm_paged_build_spv(dtype).expect("native idm paged spv");
+        let k = self.be.kernel(name, spv, 5, 24);
+        self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
+    }
+
     /// Quantize f32 activations `a` [m,k] → int8 `qa` [m,k] + per-32-block f16 `dact`/`sact`
     /// ([m, k/32]) for the dp4a mmq matmul. (Pass 1 of mmq, reusable standalone.)
     pub fn quant_q8(

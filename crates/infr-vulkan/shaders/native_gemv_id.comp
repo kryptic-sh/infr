@@ -6,6 +6,13 @@
 // Reduction: subgroupAdd within each wave + one shared combine across the gl_NumSubgroups waves,
 // one barrier total, wave-size-agnostic (no pinned subgroup size) — same pattern as rmsnorm.comp /
 // mul_mat_vec_q.comp; see native_gemv_mrow.comp for why the m=1 native_gemv keeps its tree.
+//
+// -DPAGED: the pager build (`infr_vulkan::pager::GpuPager`) — `W` is a fixed-slot arena, not one
+// contiguous per-expert-id tensor, so the expert base needs one more hop through a small device LUT
+// (`slot = lut[expert_id]`, host-updated between dispatches — see the pager module doc). Adds one
+// buffer binding + one L1-cache-hot uint read; the non-PAGED build is BYTE-IDENTICAL to before this
+// existed (zero cost when paging is off — this #ifdef is the "new shader variant" the resident-bank
+// fast path keeps, not a runtime branch).
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
@@ -15,6 +22,9 @@ layout(binding = 0) readonly buffer WB { uint nw[]; };
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
 layout(binding = 3) buffer YB { float y_buf[]; };
+#ifdef PAGED
+layout(binding = 4) readonly buffer LUTB { uint lut[]; };
+#endif
 
 shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
 
@@ -35,7 +45,11 @@ void main() {
     uint o = unit % pc.out_f;
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;
+#ifdef PAGED
+    uint wbase = lut[ids[pc.slot]] * pc.stride + o * pc.in_f;
+#else
     uint wbase = ids[pc.slot] * pc.stride + o * pc.in_f;
+#endif
     uint xbase = r * pc.in_f;
     uint nsub = pc.in_f / 32u;
     float acc = 0.0;

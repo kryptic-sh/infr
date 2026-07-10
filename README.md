@@ -198,6 +198,7 @@ serve shape).
 | Gemma-3-12B            | **1.25×** | **1.01×** | **1.03×**  | **1.70×** |
 | Qwen3-14B              | **1.12×** | 0.92×     | 0.88×      | **1.29×** |
 | Gemma-4-E2B            | **1.14×** | **1.08×** | **1.01×**  | **1.10×** |
+| Gemma-4-26B-A4B (MoE)³ | **1.01×** | 0.92×     | 0.95×      | **1.43×** |
 | Qwen3.6-27B            | **1.09×** | 0.94×     | 0.94×      | **1.20×** |
 | Qwen3-30B-A3B (MoE)    | 0.96×     | 0.95×     | 0.94×      | **1.22×** |
 | Qwen3.6-35B-A3B (MoE)² | 0.94×     | 0.95×     | 0.96×      | **1.51×** |
@@ -213,16 +214,27 @@ dispatch fusions landed to close this gap:
 ² Qwen3.6-35B-A3B is the UD (ultra-dense) variant — only the standard UD Q4_K_M
 quant was available.
 
-infr **wins prefill on every dense model** (1.03–1.29×); the two MoEs prefill at
-0.94–0.96× — correct full-expert routing costs some batch efficiency vs
-llama.cpp. Multi-turn ingest **dominates on every model** (1.10–2.07× on all 12
-models). Decode is at-or-above parity on models up to ~4B, and slightly behind
-on larger models — dense 8B/9B/14B/27B at 0.88–0.96×, MoE 30B/35B at 0.94–0.95×,
-all bounded by the memory-bandwidth wall (decode GEMVs run at 77–88% of DRAM
-peak). The **Qwen3.5-4B MTP path** trails at 0.56× (157 vs 282 t/s) —
-drafted-token throughput not yet matching llama.cpp's batched-speculative path.
+³ Gemma-4-26B-A4B measured 2026-07-10 (r=2). Its UD Q4_K_M ships the routed
+`ffn_down_exps` banks as Q5_1, which needed its own batched-MoE mmq kernel —
+before that landed, prefill fell back to the per-token path at 0.04×.
+
+infr **wins prefill on every dense model** (1.03–1.29×) and is at parity on the
+gemma-4 MoE (1.01×); the two Qwen MoEs prefill at 0.94–0.96× — correct
+full-expert routing costs some batch efficiency vs llama.cpp. Multi-turn ingest
+**dominates on every model** (1.10–2.07× on all 13 models). Decode is
+at-or-above parity on models up to ~4B, and slightly behind on larger models —
+dense 8B/9B/14B/27B at 0.88–0.96×, MoE 26B/30B/35B at 0.92–0.95×, all bounded by
+the memory-bandwidth wall (decode GEMVs run at 77–88% of DRAM peak). The
+**Qwen3.5-4B MTP path** trails at 0.56× (157 vs 282 t/s) — drafted-token
+throughput not yet matching llama.cpp's batched-speculative path.
 **DiffusionGemma** (`dg-step`) is at parity-or-better vs the reference fork.
-parity-or-better vs the reference fork.
+
+**Llama-4-Scout** (109B-A17B, Q2_K) is a CPU-only correctness bring-up and is
+deliberately absent from the table: the CPU reference path runs it at ~0.3 t/s
+prefill/decode vs llama.cpp CPU's 10.0/3.3 (pp64/tg32) — Q2_K is a codebook
+quant with no batched-MoE path, and the llama4 GPU lowering (sigmoid
+weight-before-FFN routing, NoPE) hasn't been built yet. Greedy output is
+oracle-locked against llama.cpp (`cpu_llama4_scout_greedy`).
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf
 table: Qwen2-0.5B, Llama-3.2-1B, Gemma-4-12B (dense), and Qwen3-0.6B across

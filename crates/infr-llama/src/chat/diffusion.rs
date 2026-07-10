@@ -81,7 +81,7 @@ enum DgBackend {
 /// Metal DG session — macOS only; the non-macOS build still compiles `new_metal`, `generate`
 /// errors clearly at runtime instead, matching every other INFR_METAL backend on this crate). The
 /// session is opened lazily on the first turn (its KV cache is sized once the model's
-/// `n_ctx_train`/`INFR_MAX_CTX` is known) and stays open across turns: multi-turn REPL re-sends
+/// `n_ctx_train`/`INFR_CTX` is known) and stays open across turns: multi-turn REPL re-sends
 /// the WHOLE running token stream as the "prefix" each turn, and the session's own prefix-diff
 /// prefill (see `DiffusionGemmaCpuSession::prefill`'s doc) re-sends only the un-cached suffix,
 /// exactly like every other seam session on this crate.
@@ -135,9 +135,12 @@ impl DiffusionGemmaChat {
             return Ok(());
         }
         let cfg = self.model.config();
-        let max_ctx = std::env::var("INFR_MAX_CTX")
+        // INFR_CTX shared size grammar; % resolves against the trained context (DG sessions
+        // size against the canvas/prompt shape, not a VRAM-fit calc).
+        let max_ctx = std::env::var("INFR_CTX")
             .ok()
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| infr_core::parse_size(&v))
+            .map(|s| s.resolve(cfg.n_ctx_train as u64) as usize)
             .unwrap_or_else(|| cfg.n_ctx_train.min(8192))
             .max(needed);
         self.max_ctx = max_ctx;

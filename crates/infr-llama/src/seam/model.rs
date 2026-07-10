@@ -272,11 +272,29 @@ impl SeamModel {
     /// trained context (`n_ctx_train`) clamped so weights + KV cache + activation headroom fit
     /// the VRAM budget — a long-context model's trained window (128k+) would otherwise allocate
     /// a KV cache that blows VRAM at startup or on the first request. Explicit contexts
-    /// (INFR_MAX_CTX → `vulkan_session(ctx)`) are NEVER clamped; the Vulkan allocation budget
+    /// (INFR_CTX → `vulkan_session(ctx)`) are NEVER clamped; the Vulkan allocation budget
     /// guard still fails a truly-oversized one cleanly at alloc time.
     pub fn vulkan_session_default(&self) -> Result<DenseVulkanSession> {
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
         let max_ctx = self.clamp_default_ctx(&vk, self.cfg.n_ctx_train);
+        Ok(DenseVulkanSession {
+            vk,
+            pool: SlotPool::new(),
+            max_ctx,
+        })
+    }
+
+    /// [`vulkan_session`](Self::vulkan_session) sized as a FRACTION of the device's free-VRAM KV
+    /// capacity (`INFR_CTX=50%` → half the tokens that would fit after weights + headroom —
+    /// device-appropriate %-base: this KV cache lives in VRAM). Uses the same fit math as
+    /// [`vulkan_session_default`]'s clamp, scaled by `frac`; unlike an explicit token count the
+    /// result is inherently within budget, and the alloc-time guard stays the backstop.
+    pub fn vulkan_session_frac(&self, frac: f64) -> Result<DenseVulkanSession> {
+        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        // A pure recurrent-state arch has no per-token KV to size a fraction of — fall back to
+        // the trained context (same shape as the default path's `kv_per_tok == 0` escape).
+        let fit = self.kv_fit_ctx(&vk).unwrap_or(self.cfg.n_ctx_train);
+        let max_ctx = ((fit as f64 * frac) as usize).max(1024);
         Ok(DenseVulkanSession {
             vk,
             pool: SlotPool::new(),
@@ -292,6 +310,32 @@ impl SeamModel {
     /// (INFR_KV_SLOTS forks) and MoE expert host-offload aren't modeled — the alloc-time budget
     /// guard remains the backstop for those.
     fn clamp_default_ctx(&self, vk: &infr_vulkan::VulkanBackend, want: usize) -> usize {
+        let Some(fit) = self.kv_fit_ctx(vk) else {
+            return want; // pure recurrent-state arch: no per-token KV to size.
+        };
+        if fit < want {
+            let vram = vk.vram();
+            let fp = crate::weights::weight_footprint(&self.gguf);
+            eprintln!(
+                "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB vs \
+                 {:.2} GiB available{}); set INFR_CTX to override",
+                (fp.dense + fp.expert) as f64 / (1u64 << 30) as f64,
+                vram.available as f64 / (1u64 << 30) as f64,
+                if vram.live { ", live" } else { ", total heap" },
+            );
+            return fit;
+        }
+        want
+    }
+
+    /// The VRAM-fit KV capacity in tokens: how much context fits in the device's AVAILABLE
+    /// memory after the full weight footprint + activation headroom (live free bytes when
+    /// VK_EXT_memory_budget is present — call before the weights upload so `available` still
+    /// includes their space). KV bytes/token follows the per-layer KV geometry and the runner's
+    /// KV-dtype env overrides (INFR_KV_TYPE_K/V, INFR_KV_Q8). `None` for a pure recurrent-state
+    /// arch (no per-token KV). Extra KV slots (INFR_KV_SLOTS forks) aren't modeled — the
+    /// alloc-time budget guard remains the backstop.
+    fn kv_fit_ctx(&self, vk: &infr_vulkan::VulkanBackend) -> Option<usize> {
         /// Take only this fraction of the KV bytes that nominally fit — absorbs allocation slop
         /// (alignment, dedicated-buffer rounding) and estimate error, same spirit as the alloc
         /// guard's fixed headroom.
@@ -322,30 +366,18 @@ impl SeamModel {
             })
             .sum();
         if kv_per_tok == 0 {
-            return want; // pure recurrent-state arch: no per-token KV to size.
+            return None;
         }
         let fp = crate::weights::weight_footprint(&self.gguf);
         let free = vram
             .available
             .saturating_sub(fp.dense + fp.expert + act_headroom);
         // SeamKv pads its buffers past max_ctx by ~64 rows; mirror that.
-        let fit = ((free as f64 * FIT_FRACTION / kv_per_tok as f64) as usize)
-            .saturating_sub(64)
-            .max(MIN_CTX);
-        if fit < want {
-            eprintln!(
-                "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB + KV \
-                 {:.2} MiB/1k tok + {:.1} GiB activation/overhead reserve vs {:.2} GiB \
-                 available{}); set INFR_MAX_CTX to override",
-                (fp.dense + fp.expert) as f64 / (1u64 << 30) as f64,
-                kv_per_tok as f64 * 1024.0 / (1u64 << 20) as f64,
-                act_headroom as f64 / (1u64 << 30) as f64,
-                vram.available as f64 / (1u64 << 30) as f64,
-                if vram.live { ", live" } else { ", total heap" },
-            );
-            return fit;
-        }
-        want
+        Some(
+            ((free as f64 * FIT_FRACTION / kv_per_tok as f64) as usize)
+                .saturating_sub(64)
+                .max(MIN_CTX),
+        )
     }
 
     /// Greedy generation on the Vulkan seam through a persistent session (see
@@ -1235,7 +1267,7 @@ impl DiffusionGemmaCpuSession {
 impl DiffusionGemmaVulkanSession {
     /// [`DiffusionGemmaCpuSession::prefill`]'s Vulkan twin. Weights bind through the SHARED
     /// [`crate::seam::vulkan_moe_binder`] so DG gets the same MoE expert placement tiers
-    /// (resident / `INFR_MOE_CACHE_GB` / auto-paged) as every other MoE model — DG's fused
+    /// (resident / `INFR_CACHE` / auto-paged) as every other MoE model — DG's fused
     /// `ffn_gate_up_exps` bank pages under `Role::Gate` and its mixed Q5_0/Q8_0 down banks split
     /// into per-byte-size pools (see `infr_vulkan::pager`'s MoE-session doc).
     pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {

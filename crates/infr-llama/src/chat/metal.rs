@@ -56,10 +56,14 @@ impl MetalSeamChat {
 
     fn ensure_session(&mut self) -> Result<()> {
         if self.session.is_none() {
-            let max_ctx = std::env::var("INFR_MAX_CTX")
+            // INFR_CTX shared size grammar; % resolves against the trained context (this path
+            // has no VRAM-fit calc — the Metal working-set guard is the backstop).
+            let train = self.model.config().n_ctx_train;
+            let max_ctx = std::env::var("INFR_CTX")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(self.model.config().n_ctx_train);
+                .and_then(|v| infr_core::parse_size(&v))
+                .map(|s| s.resolve(train as u64) as usize)
+                .unwrap_or(train);
             self.session = Some(self.model.metal_session(max_ctx)?);
         }
         Ok(())
@@ -157,11 +161,14 @@ impl SpecMetalChat {
         if self.target_session.is_none() {
             // TWO models + TWO KV caches share the working set — a full-n_ctx_train pair
             // (40k tokens on qwen3) thrashes an 18 GB machine into second-long forwards.
-            // Default to 8k unless INFR_MAX_CTX says otherwise.
-            let max_ctx = std::env::var("INFR_MAX_CTX")
+            // Default to 8k unless INFR_CTX says otherwise (shared size grammar; % of the
+            // trained context, same note as ensure_session above).
+            let train = self.target.config().n_ctx_train;
+            let max_ctx = std::env::var("INFR_CTX")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(|| self.target.config().n_ctx_train.min(8192));
+                .and_then(|v| infr_core::parse_size(&v))
+                .map(|s| s.resolve(train as u64) as usize)
+                .unwrap_or_else(|| train.min(8192));
             self.target_session = Some(self.target.metal_session(max_ctx)?);
             self.draft_session = Some(self.draft.metal_session(max_ctx)?);
         }

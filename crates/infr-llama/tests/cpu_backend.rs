@@ -1719,7 +1719,7 @@ fn cpu_golden_qwen3moe() {
     check_golden(&model, QWEN3MOE_GOLDEN);
 }
 
-/// Paged MoE expert cache (`infr_vulkan::pager`, wired into the seam via `INFR_MOE_CACHE_GB`):
+/// Paged MoE expert cache (`infr_vulkan::pager`, wired into the seam via `INFR_CACHE`):
 /// forces the paged path on this model and asserts the greedy output is IDENTICAL,
 /// token-for-token, to both the all-resident GPU run and the CPU reference.
 ///
@@ -1759,7 +1759,7 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
         .generate_cpu_ids(&prompt_ids, n, |id| cpu_ids.push(id))
         .expect("cpu gen");
 
-    std::env::remove_var("INFR_MOE_CACHE_GB");
+    std::env::remove_var("INFR_CACHE");
     let mut resident_ids = Vec::new();
     model
         .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
@@ -1767,11 +1767,11 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
 
     // 0.05 GB is far below what even ONE Q4_K_M expert layer's gate+up+down banks need — guarantees
     // real eviction pressure across the model's 48 MoE layers.
-    std::env::set_var("INFR_MOE_CACHE_GB", "0.05");
+    std::env::set_var("INFR_CACHE", "50m");
     std::env::set_var("INFR_PAGER_STATS", "1");
     let mut paged_ids = Vec::new();
     let paged_result = model.generate_vulkan_ids(&prompt_ids, n, |id| paged_ids.push(id));
-    std::env::remove_var("INFR_MOE_CACHE_GB");
+    std::env::remove_var("INFR_CACHE");
     std::env::remove_var("INFR_UBATCH");
     std::env::remove_var("INFR_PAGER_STATS");
     paged_result.expect("paged gpu gen");

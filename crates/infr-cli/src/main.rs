@@ -396,11 +396,8 @@ fn print_run_stats(
 
 fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     use std::io::Write;
-    // Context window: default to the model's own trained context length (`<arch>.context_length`);
-    // override with INFR_MAX_CTX (e.g. shrink to fit VRAM, or extend to exercise high-ctx prefill).
-    let ctx_override: Option<usize> = std::env::var("INFR_MAX_CTX")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    // Context window: the model's trained context by default; INFR_CTX overrides (shared size
+    // grammar — tokens, `256k`, or `%` of the free-VRAM KV capacity), read by the chat sessions.
     let envf = |k: &str, d: f32| {
         std::env::var(k)
             .ok()
@@ -487,7 +484,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     } else {
         // The default: dense/MoE on the VULKAN agnostic seam — persistent multi-slot KV sessions
         // (per-turn suffix-only prefill), record-once decode replay, MoE expert auto-fit (fully
-        // resident when experts fit; the paged expert cache — INFR_MOE_CACHE_GB — otherwise). qwen35 (Qwen3.5) lands here too — same seam, same `Config::from_gguf` +
+        // resident when experts fit; the paged expert cache — INFR_CACHE — otherwise). qwen35 (Qwen3.5) lands here too — same seam, same `Config::from_gguf` +
         // `MixerW::DeltaNet` unified runner (see `unified_qwen35_*` tests). llama4 (Scout) lands
         // here too now: the paged expert cache lets its 37 GB Q2_K bank run on a 24 GB card.
         eprintln!("[vulkan seam — dense/MoE on the agnostic compute graph, persistent KV session]");

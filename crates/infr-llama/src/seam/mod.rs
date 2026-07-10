@@ -151,7 +151,7 @@ pub(crate) fn generate_dense_vulkan_session(
 /// (FIRST load only), and return the Vulkan weight binder that implements it. Shared by every
 /// Vulkan weight-uploading session — [`generate_dense_vulkan_session`] and the DiffusionGemma
 /// session (`model.rs`), which drives `generate_dense_backend` directly and would otherwise
-/// silently skip placement (observed: `INFR_MOE_CACHE_GB` was a no-op on DG).
+/// silently skip placement (observed: `INFR_CACHE` was a no-op on DG).
 ///
 /// For a non-MoE model (or a warm call — `first_load == false`) this degrades to the plain
 /// pad-and-upload resident binder: placement is decided ONCE per weight upload, both because
@@ -166,28 +166,25 @@ pub(crate) fn vulkan_moe_binder<'a>(
 ) -> AResult<Box<BindWeight<'a>>> {
     // ── MoE expert placement ─────────────────────────────────────────────────────────────────
     // The pager (`infr_vulkan::pager`) is the ONLY MoE offload mechanism — the legacy
-    // host-visible (HostWeights/GTT) split is retired. Tiers, in precedence order:
-    //   1. `INFR_NCMOE=N` — DEPRECATED alias, kept so existing workflows don't break: mapped to
-    //      an equivalent pager budget of `fp.expert · (n_layer − N) / n_layer` (the total expert
-    //      bytes minus the N layers' worth the old split pushed off-VRAM), with a loud warning.
-    //      `N == 0` means "nothing offloaded" and stays fully resident.
-    //   2. `INFR_MOE_CACHE_GB=X` EXPLICIT override — force EVERY expert layer through the pager
-    //      with an X GB byte budget, regardless of whether the banks would fit resident. Lets a
+    // host-visible (HostWeights/GTT) split and its INFR_NCMOE knob are gone. Tiers, in
+    // precedence order:
+    //   1. `INFR_CACHE=<size>` EXPLICIT override — force EVERY expert layer through the pager
+    //      with that byte budget, regardless of whether the banks would fit resident. Lets a
     //      caller (or a test) force the paged path deterministically instead of depending on
-    //      this box's free VRAM — see the `gpu_seam_paged_moe_matches_*` tests.
-    //   3. Auto (both unset): fully resident (the fast path, zero change) when the banks fit
-    //      VRAM; otherwise the pager with budget = remaining VRAM after dense+KV+headroom.
+    //      this box's free VRAM — see the `gpu_seam_paged_moe_matches_*` tests. The value is the
+    //      shared size grammar (`infr_core::parse_size`): plain bytes, `k/m/g/t` 1024-suffixes
+    //      (`INFR_CACHE=19g`), or a percentage of the device's AVAILABLE VRAM at first load
+    //      (`INFR_CACHE=80%` — device-appropriate base: the cache lives in VRAM).
+    //   2. Auto (unset): fully resident (the fast path, zero change) when the banks fit VRAM;
+    //      otherwise the pager with budget = remaining VRAM after dense+KV+headroom.
     // Paging rides the adapter's paged executor split (`infr_vulkan::adapter::execute_static`'s
     // paged branch). FUSED gate_up banks (gemma-4 MoE / DiffusionGemma) page under `Role::Gate`
     // with a double-width slot, and MIXED-dtype roles (unsloth-dynamic quants bumping a subset
     // of layers' banks to a wider format) split into per-(role, slot_bytes) arena pools — see
     // `infr_vulkan::pager`'s MoE-session doc.
-    let explicit_ncmoe = std::env::var("INFR_NCMOE")
+    let cache_override = std::env::var("INFR_CACHE")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok());
-    let moe_cache_gb_override = std::env::var("INFR_MOE_CACHE_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok());
+        .and_then(|v| infr_core::parse_size(&v));
 
     let mut n_paged = 0usize; // paged layer-count (0 = fully resident, or all = cfg.n_layer)
     let mut pager_budget_bytes = 0u64;
@@ -203,27 +200,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // that's real pressure, deliberately not compensated; the alloc-time VRAM budget guard is
     // the backstop against over-commit.
     if first_load && cfg.moe.is_some() {
-        match (explicit_ncmoe, moe_cache_gb_override) {
-            (Some(n), _) if n > 0 => {
-                let fp = crate::weights::weight_footprint(g);
-                let n = n.min(cfg.n_layer);
+        match cache_override {
+            Some(spec) => {
                 n_paged = cfg.n_layer;
-                pager_budget_bytes =
-                    fp.expert * (cfg.n_layer - n) as u64 / cfg.n_layer.max(1) as u64;
-                eprintln!(
-                    "INFR_NCMOE is DEPRECATED (the host-visible expert split was retired): \
-                     mapping N={n} to a paged-expert-cache budget of {:.2} GB (total expert \
-                     bytes minus the {n} offloaded layers' share) — set INFR_MOE_CACHE_GB=X \
-                     directly instead",
-                    pager_budget_bytes as f64 / 1e9,
-                );
+                // Percent resolves against AVAILABLE VRAM at this (first-load, pre-upload)
+                // moment — the same consistent snapshot the auto tier uses below.
+                pager_budget_bytes = spec.resolve(vk.vram().available);
             }
-            (Some(_), _) => {} // INFR_NCMOE=0: nothing offloaded — fully resident.
-            (None, Some(gb)) => {
-                n_paged = cfg.n_layer;
-                pager_budget_bytes = (gb * 1e9) as u64;
-            }
-            (None, None) => {
+            None => {
                 let fp = crate::weights::weight_footprint(g);
                 let vram = vk.vram();
                 let kv_bytes: u64 = (0..cfg.n_layer)

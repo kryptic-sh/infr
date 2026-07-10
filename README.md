@@ -69,7 +69,7 @@ and the 35B rides `qwen35moe` with no code changes
 infr run unsloth/Qwen3-1.7B-GGUF:Q4_K_M "What is the capital of France?"
 
 # Qwen3 MoE (experts page through the VRAM LRU cache when they don't fit —
-# see INFR_MOE_CACHE_GB below)
+# see INFR_CACHE below)
 infr run unsloth/Qwen3-30B-A3B-GGUF:Q4_K_M "Explain MoE routing."
 
 # Llama 4 Scout (37 GB Q2_K) — paged expert cache runs it on a 24 GB card
@@ -188,20 +188,26 @@ folded into the row so the mismatch is visible). Details in
 [`docs/DIFFUSIONGEMMA.md`](docs/DIFFUSIONGEMMA.md).
 
 Useful env: `INFR_TEMP` / `INFR_TOP_K` / `INFR_TOP_P` (sampling; `TEMP=0` →
-greedy), `INFR_MAX_NEW`, `INFR_MAX_CTX`, `INFR_NO_FLASH`.
+greedy), `INFR_MAX_NEW`, `INFR_CTX`, `INFR_NO_FLASH`.
 
 **MoE expert placement**: resident when the expert banks fit VRAM (zero config,
 zero change); otherwise every layer pages through a VRAM-resident LRU expert
-cache (`infr_vulkan::pager`) sized to the remaining VRAM. `INFR_MOE_CACHE_GB=X`
-forces every layer through the pager with an `X` GB budget regardless of fit
-(useful for testing, or to free VRAM for a larger `--ctx`). Every bank shape
-pages: split gate/up (llama4/Qwen3-MoE/Qwen3.6-MoE), fused gate_up
-(DiffusionGemma, Gemma-4 MoE — one double-width slot per expert), and
-mixed-dtype roles (unsloth-dynamic quants bumping a subset of layers' banks to a
-wider K-quant — one arena pool per (role, byte size)). `INFR_NCMOE=N` (the
-retired host-visible split) is a DEPRECATED alias, mapped to an equivalent pager
-budget with a warning. `INFR_PAGER_STATS=1` prints each pool's hit/miss/eviction
-counts.
+cache (`infr_vulkan::pager`) sized to the remaining VRAM. `INFR_CACHE=<size>`
+forces every layer through the pager with that budget regardless of fit (useful
+for testing, or to free VRAM for a larger context). Every bank shape pages:
+split gate/up (llama4/Qwen3-MoE/Qwen3.6-MoE), fused gate_up (DiffusionGemma,
+Gemma-4 MoE — one double-width slot per expert), and mixed-dtype roles
+(unsloth-dynamic quants bumping a subset of layers' banks to a wider K-quant —
+one arena pool per (role, byte size)). `INFR_PAGER_STATS=1` prints each pool's
+hit/miss/eviction counts.
+
+**Size grammar** — `INFR_CACHE` and `INFR_CTX` share one value grammar
+(`infr_core::parse_size`): a plain number is the base unit (bytes for
+`INFR_CACHE`, tokens for `INFR_CTX`), `k`/`m`/`g`/`t` suffixes scale by 1024
+(`INFR_CACHE=19g`, `INFR_CTX=256k`), and `%` resolves against the
+device-appropriate base — available VRAM for the expert cache, the free-VRAM KV
+capacity for the Vulkan context (`INFR_CACHE=80%`, `INFR_CTX=50%`; on the
+CPU/Metal chat paths a ctx-`%` resolves against the model's trained context).
 
 ## Validated models & performance
 
@@ -285,9 +291,9 @@ is now HOST-bound, not GPU-bound: the profiler puts the GPU work itself at ~363
 t/s-equivalent (the mmq kernels beat llama.cpp's 136 ceiling handily) with ~89%
 GPU idle from the per-layer submit→readback→upload cadence — pipelining that
 orchestration is the filed follow-up (as is splitting a role across several
-arena buffers to lift the 4 GiB per-role cache cap). `INFR_MOE_CACHE_GB` sizes
-the pager's budget (see the MoE placement paragraph above); pure CPU stays
-available under `INFR_CPU=1` / `-ngl 0`.
+arena buffers to lift the 4 GiB per-role cache cap). `INFR_CACHE` sizes the
+pager's budget (see the MoE placement paragraph above); pure CPU stays available
+under `INFR_CPU=1` / `-ngl 0`.
 
 **Also validated for correctness** (GPU seam vs CPU reference), beyond the perf
 table: Qwen2-0.5B, Llama-3.2-1B, Gemma-4-12B (dense), and Qwen3-0.6B across

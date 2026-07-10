@@ -69,17 +69,20 @@ impl DenseSeamChat {
         Ok(true)
     }
 
-    /// Lazily open the persistent Vulkan session. Explicit `INFR_MAX_CTX` = user override, used
-    /// verbatim (NEVER clamped — the Vulkan VRAM budget guard still errors cleanly at alloc time
-    /// if it truly doesn't fit); unset = the model's trained context, clamped to the VRAM budget
-    /// (`vulkan_session_default`) so a long-context model's default KV cache can't blow VRAM.
+    /// Lazily open the persistent Vulkan session. Explicit `INFR_CTX` = user override (shared
+    /// size grammar: `8192`, `256k`, or `50%` of the free-VRAM KV capacity — see
+    /// `infr_core::parse_size`); token counts are used verbatim (NEVER clamped — the Vulkan VRAM
+    /// budget guard still errors cleanly at alloc time if it truly doesn't fit); unset = the
+    /// model's trained context, clamped to the VRAM budget (`vulkan_session_default`) so a
+    /// long-context model's default KV cache can't blow VRAM.
     fn ensure_session(&mut self) -> Result<()> {
         if self.session.is_none() {
-            let user_ctx: Option<usize> = std::env::var("INFR_MAX_CTX")
+            let user_ctx = std::env::var("INFR_CTX")
                 .ok()
-                .and_then(|v| v.parse().ok());
+                .and_then(|v| infr_core::parse_size(&v));
             self.session = Some(match user_ctx {
-                Some(ctx) => self.model.vulkan_session(ctx)?,
+                Some(infr_core::SizeSpec::Bytes(ctx)) => self.model.vulkan_session(ctx as usize)?,
+                Some(infr_core::SizeSpec::Percent(f)) => self.model.vulkan_session_frac(f)?,
                 None => self.model.vulkan_session_default()?,
             });
         }

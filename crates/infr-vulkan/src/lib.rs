@@ -1030,7 +1030,7 @@ impl VulkanBackend {
                 "VRAM budget exceeded: {:.2} GiB requested + {:.2} GiB already in use ({}) > \
                  {:.2} GiB budget ({:.2} GiB device-local minus 256 MiB headroom). Refusing to \
                  over-commit: exceeding VRAM doesn't fail cleanly — it causes device-lost (TDR) \
-                 or silent corruption mid-inference. Use a smaller context (INFR_MAX_CTX), a \
+                 or silent corruption mid-inference. Use a smaller context (INFR_CTX), a \
                  smaller/more-quantized model, close other GPU processes, or run on the CPU \
                  backend (INFR_CPU=1). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
                 gib(want),

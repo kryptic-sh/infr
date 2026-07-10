@@ -90,6 +90,12 @@ pub struct Pager {
     lru: VecDeque<BlockId>,
     /// Slot indices never yet handed out (drained before any eviction kicks in).
     free: Vec<u32>,
+    /// block_id -> the [`Self::begin_batch`] epoch of its last touch. Eviction skips blocks
+    /// touched in the CURRENT batch — the explicit form of the within-batch safety invariant
+    /// (MRU ordering used to carry it implicitly; the scan-resistant [`Self::touch_cold`] path
+    /// inserts at the COLD end, so it needs the epoch guard instead).
+    epoch: HashMap<BlockId, u64>,
+    cur_epoch: u64,
     stats: PagerStats,
 }
 
@@ -105,8 +111,18 @@ impl Pager {
             resident: HashMap::with_capacity(n_slots),
             lru: VecDeque::with_capacity(n_slots),
             free: (0..n_slots as u32).rev().collect(), // pop() hands out slot 0 first
+            epoch: HashMap::with_capacity(n_slots),
+            cur_epoch: 0,
             stats: PagerStats::default(),
         }
+    }
+
+    /// Open a new touch batch (one dispatch's worth of `touch`/`touch_cold` calls). Blocks
+    /// touched under the current epoch are never eviction victims, which makes the within-batch
+    /// safety invariant explicit for BOTH insertion orders (classic MRU and `touch_cold`'s
+    /// cold-end scan inserts, where LRU position alone no longer protects batch siblings).
+    pub fn begin_batch(&mut self) {
+        self.cur_epoch += 1;
     }
 
     pub fn n_slots(&self) -> usize {
@@ -135,34 +151,78 @@ impl Pager {
         self.lru.push_back(id);
     }
 
-    /// Ensure `id` is resident, evicting the LRU block if the cache is full. Returns whether it
-    /// was already resident (caller skips the upload) or had to be paged in (caller must upload
-    /// the block's bytes into `slot` and write the device LUT entry `id -> slot` before any
-    /// dispatch reads it).
+    /// Ensure `id` is resident, evicting the least-recently-used unprotected block if the cache
+    /// is full. Returns whether it was already resident (caller skips the upload) or had to be
+    /// paged in (caller must upload the block's bytes into `slot` and write the device LUT entry
+    /// `id -> slot` before any dispatch reads it).
     pub fn touch(&mut self, id: BlockId) -> Resolution {
+        self.epoch.insert(id, self.cur_epoch);
         if let Some(&slot) = self.resident.get(&id) {
             self.stats.hits += 1;
             self.mark_mru(id);
             return Resolution::Hit { slot };
         }
         self.stats.misses += 1;
-        let (slot, evicted) = if let Some(s) = self.free.pop() {
-            (s, None)
-        } else {
-            let victim = self
-                .lru
-                .pop_front()
-                .expect("resident.len() == n_slots > 0 with no free slots implies an LRU entry");
-            let vslot = self
-                .resident
-                .remove(&victim)
-                .expect("every lru entry has a resident mapping");
-            self.stats.evictions += 1;
-            (vslot, Some(victim))
-        };
+        let (slot, evicted) = self.take_slot();
         self.resident.insert(id, slot);
         self.lru.push_back(id);
         Resolution::Miss { slot, evicted }
+    }
+
+    /// [`Self::touch`]'s SCAN-RESISTANT twin, for full-set sweeps (a batched-prefill layer
+    /// pre-ensuring all `n_expert` experts, layer 0..n cyclically): hits keep their LRU position
+    /// (no MRU promotion) and misses insert at the COLD end. Under plain LRU a cyclic sweep
+    /// larger than the cache is the pathological worst case — every block evicted exactly before
+    /// its next use, 0% steady-state reuse (measured on Scout pp512: 768/768 blocks re-uploaded
+    /// per rep). Cold insertion makes the sweep churn a single victim region instead and
+    /// converges to a stable resident prefix of ~`n_slots` blocks — near the offline-optimal
+    /// hit count for a repeated sweep — while recency-driven [`Self::touch`] users (decode's
+    /// routed-only path) keep their hot set at the MRU end, out of the sweep's victim zone.
+    /// Within-batch safety comes from the batch epoch (see [`Self::begin_batch`]), NOT ordering.
+    pub fn touch_cold(&mut self, id: BlockId) -> Resolution {
+        self.epoch.insert(id, self.cur_epoch);
+        if let Some(&slot) = self.resident.get(&id) {
+            self.stats.hits += 1;
+            return Resolution::Hit { slot };
+        }
+        self.stats.misses += 1;
+        let (slot, evicted) = self.take_slot();
+        self.resident.insert(id, slot);
+        self.lru.push_front(id);
+        Resolution::Miss { slot, evicted }
+    }
+
+    /// A free slot, evicting if none remain. The victim is the coldest block NOT touched in the
+    /// current batch (epoch guard — see [`Self::begin_batch`]); legacy callers that never open a
+    /// batch share epoch 0 everywhere, for which the guard degrades to plain LRU `pop_front`.
+    fn take_slot(&mut self) -> (u32, Option<BlockId>) {
+        if let Some(s) = self.free.pop() {
+            return (s, None);
+        }
+        let idx = self
+            .lru
+            .iter()
+            .position(|b| self.epoch.get(b) != Some(&self.cur_epoch))
+            // Every resident block touched by the CURRENT batch means the batch exceeded
+            // n_slots — the sizing floor (`Pager::new`'s doc) was violated upstream. Falling
+            // back to pop_front would silently evict a batch sibling mid-flight (the
+            // coherent-but-wrong class); fail loudly instead when batches are in use.
+            .unwrap_or_else(|| {
+                assert!(
+                    self.cur_epoch == 0,
+                    "pager: a single batch touched more blocks than n_slots={} — within-batch \
+                     eviction safety is unsatisfiable (sizing floor violated)",
+                    self.n_slots
+                );
+                0 // epoch never used (legacy caller): plain LRU
+            });
+        let victim = self.lru.remove(idx).expect("index from position()");
+        let vslot = self
+            .resident
+            .remove(&victim)
+            .expect("every lru entry has a resident mapping");
+        self.stats.evictions += 1;
+        (vslot, Some(victim))
     }
 }
 
@@ -301,6 +361,84 @@ mod tests {
         }
         assert!(p.stats().hits > 0);
         assert!(p.stats().evictions > 0);
+    }
+
+    #[test]
+    fn cold_touch_sweep_converges_to_a_stable_prefix() {
+        // A cyclic sweep of 6 blocks through 3 slots: plain LRU would miss EVERY touch from the
+        // second pass on (the pathological case touch_cold exists for); cold insertion must
+        // instead keep a stable resident prefix and only churn the cold end.
+        let mut p = Pager::new(3);
+        for _pass in 0..4 {
+            for id in 0..6u32 {
+                p.begin_batch(); // one "layer" per id in this reduced shape
+                p.touch_cold(id);
+            }
+        }
+        // Steady state: passes 2..4 must hit the stable prefix — strictly more than plain LRU's
+        // zero. (Exact count: 2 hits/pass here — n_slots-1 stable + 1 churn slot.)
+        assert!(
+            p.stats().hits >= 6,
+            "cold sweep should retain a stable prefix (hits={})",
+            p.stats().hits
+        );
+        // And the prefix blocks are still resident for the next pass.
+        assert!(p.slot_of(0).is_some());
+        assert!(p.slot_of(1).is_some());
+    }
+
+    #[test]
+    fn cold_touch_batch_cannot_evict_its_own_siblings() {
+        // Within-batch safety under COLD insertion: LRU position no longer protects batch
+        // siblings (they sit at the cold end), so the epoch guard must. A 3-slot cache fully
+        // occupied by an old batch, then one batch cold-touching 3 fresh blocks: all 3 must be
+        // simultaneously resident at the end — no sibling may evict another.
+        let mut p = Pager::new(3);
+        p.begin_batch();
+        for id in [100u32, 101, 102] {
+            p.touch_cold(id);
+        }
+        p.begin_batch();
+        for id in [7u32, 8, 9] {
+            p.touch_cold(id);
+        }
+        for id in [7u32, 8, 9] {
+            assert!(p.slot_of(id).is_some(), "batch sibling {id} was evicted");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "within-batch eviction safety")]
+    fn batch_larger_than_cache_fails_loudly() {
+        // The sizing-floor violation must panic (silent sibling eviction = the
+        // coherent-but-wrong output class), not degrade.
+        let mut p = Pager::new(2);
+        p.begin_batch();
+        for id in 0..3u32 {
+            p.touch_cold(id);
+        }
+    }
+
+    #[test]
+    fn classic_touches_keep_their_hot_set_against_cold_sweeps() {
+        // Decode's recency set (classic touch → MRU end) must survive a prefill-style cold
+        // sweep, which churns the COLD end only.
+        let mut p = Pager::new(4);
+        p.begin_batch();
+        p.touch(1); // decode-hot
+        p.touch(2); // decode-hot
+        for id in 10..16u32 {
+            p.begin_batch();
+            p.touch_cold(id); // sweep bigger than the remaining capacity
+        }
+        assert!(
+            p.slot_of(1).is_some(),
+            "hot block 1 evicted by a cold sweep"
+        );
+        assert!(
+            p.slot_of(2).is_some(),
+            "hot block 2 evicted by a cold sweep"
+        );
     }
 
     #[test]

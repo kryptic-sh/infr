@@ -284,7 +284,7 @@ prefill at 4096 KV depth (the multi-turn serve shape).
 | Qwen3-30B-A3B (MoE)   | Q4_K_M      | 0.96×     | 0.95×     | 0.93×      | **1.14×** |
 | Gemma-4-31B           | UD-Q5_K_XL³ | 0.89×     | 0.09×     | 0.07×      | 0.11×     |
 | Ornith-1.0-35B        | Q4_K_M      | 0.83×     | **1.01×** | **1.03×**  | **1.27×** |
-| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁴   | —         | —         | —          | —         |
+| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁴   | 0.03×     | 0.50×     | 0.52×      | 0.35×     |
 | Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | 0.94×     | 0.95×     | 0.96×      | **1.46×** |
 
 ¹ New gaps surfaced by sweeping the full quant spread, queued for the perf loop:
@@ -303,11 +303,14 @@ auto-placement reserves activation/guard headroom and **streams** the overflow
 through the pager — decode then sits at the PCIe ceiling (~3 t/s). Fix queued:
 try-resident-first placement for dense models at small context.
 
-⁴ IQ3_S expert banks currently device-lose during decode (known issue, fix
-queued) — the grid id-GEMV floor landed for them in `a3e1e9a` (the model now
-loads and prefill-parity tests pass on synthetic banks), but real-size decode
-faults the device. llama.cpp reference numbers for the row: pp512 2799,
-tg128 151.
+⁴ Grid i-quant (IQ1–IQ3) expert banks are **correct but on the slow floor** (row
+measured post-`618cd3b`, which fixed a device-lost TDR: dynamically indexed GLSL
+`const` codebook tables were lowered to ~1 MB of per-invocation scratch by
+RADV/ACO — they now stage through `shared` memory, ~400× faster). Remaining gaps
+are structural and queued: grid formats have no batched dp4a mmq GEMM, so MoE
+**prefill** rides the per-token id-GEMV floor (0.03×), and the grid decode still
+pays a per-element `dq()` (a grid-aware `dqblk` is the decode lever, ~0.50×
+today).
 
 The MoE expert kernel floor (the id-indexed GEMV family every MoE model needs
 for decode) now covers **every weight dtype the dense Vulkan path supports** —

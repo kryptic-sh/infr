@@ -51,10 +51,19 @@ float dq(uint g) {
     return f16tof32(ru16(bd)) * float(sgn8(rb(bd + 2u + g % 32u)));
 }
 #define HAVE_DQBLK
+// Word-parallel qs: one unaligned u32 covers 4 bytes (34-byte blocks aren't word-aligned), and a
+// SIGNED bitfieldExtract per element replaces the rb() byte-extract + sgn8 select chain — the
+// byte-serial form left the Q8_0 decode GEMV at ~600-690 GB/s (llama.cpp's runs ~850-900).
+// bitfieldExtract(int, 8b, 8) IS the signed byte value — same integers, bit-identical.
 void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 32u) * 34u;
     float d = f16tof32(ru16(bd));
-    for (uint w = 0u; w < 32u; w++) { v[w] = d * float(sgn8(rb(bd + 2u + w))); }
+    for (uint w8 = 0u; w8 < 8u; w8++) {
+        int q4 = int(ru32u(bd + 2u + w8 * 4u));
+        for (uint b = 0u; b < 4u; b++) {
+            v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+        }
+    }
 }
 #endif
 

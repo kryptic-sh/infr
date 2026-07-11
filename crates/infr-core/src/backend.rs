@@ -283,6 +283,19 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Whether the currently loaded DENSE model streams per-layer weight blocks through a paged
+    /// VRAM cache (dense layer streaming — the `crate::pager::Pager::schedule` policy; see
+    /// `infr_vulkan::pager`'s dense session). Unlike [`Backend::moe_paged`] no host readback is
+    /// ever needed (dense layer order is deterministic, every "miss" is known in advance), but
+    /// the record-once decode replay still can't express the per-token ring staging +
+    /// arena-offset rebinding, so the same gates that force a paged-MoE model onto the
+    /// per-execute static path check this too. `false` for every backend but Vulkan, and for
+    /// Vulkan whenever the loaded model's dense weights fit VRAM (the overwhelming common case —
+    /// zero change there).
+    fn dense_paged(&self) -> bool {
+        false
+    }
+
     /// Perf (DiffusionGemma denoise, perf slice 3 — docs/DIFFUSIONGEMMA.md): fused per-canvas-row
     /// entropy-bound sampler reduction over raw `[rows, dim]` logits, avoiding a full `[rows,
     /// dim]` host download. `u` is `rows` host-drawn uniform `[0,1)` floats (the seeded

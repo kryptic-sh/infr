@@ -13,13 +13,14 @@
 //! `infr-vulkan`'s `pager` module) with a demand/LRU policy — an expert is paged in on first use
 //! by a layer and evicted least-recently-used when the arena is full.
 //!
-//! ## Planned: dense layer streaming
-//! A future policy can reuse the SAME arena/LUT/upload core for `BlockId = layer_idx` in a dense
-//! model whose weights don't fit VRAM: since a dense decode visits layers in a fixed, known order
-//! every step, that policy would be schedule-driven (exact prefetch of layer `l+1` while layer `l`
-//! runs) rather than demand/LRU — `Pager` doesn't bake in LRU-only semantics anywhere a caller
-//! couldn't substitute its own `touch`-equivalent, but the prefetch scheduling itself is NOT
-//! implemented here (see the task doc); only documented as the intended extension point.
+//! ## Dense layer streaming
+//! The second policy reuses the SAME slot bookkeeping for `BlockId = layer_idx` (or a per-tensor
+//! block within a layer) in a dense model whose weights don't fit VRAM: a dense forward visits
+//! layers in a fixed, known order every step, so residency is schedule-driven via
+//! [`Pager::schedule`] (exact cyclic-sweep eviction, Belady-parity — see its doc) rather than
+//! demand/LRU. The PREFETCH side (staging layer `l+1`'s bytes while `l` executes) is the
+//! backend's job — `infr-vulkan`'s `DensePagerSession` records uploads ahead of GPU execution
+//! through its pipelined ring; this module stays pure residency/eviction bookkeeping.
 use std::collections::{HashMap, VecDeque};
 
 /// Opaque identifier for one pageable block. The pager never interprets this — callers pack
@@ -167,6 +168,26 @@ impl Pager {
         self.resident.insert(id, slot);
         self.lru.push_back(id);
         Resolution::Miss { slot, evicted }
+    }
+
+    /// Schedule-driven residency for a DETERMINISTIC cyclic sweep — the dense layer-streaming
+    /// policy the module doc names (`BlockId = layer`, every forward pass visits blocks in the
+    /// same fixed order). This is NOT demand/LRU: under a cyclic sweep the block whose next use
+    /// is FURTHEST away is precisely the one the sweep just passed, so a miss inserts at the COLD
+    /// end (it won't be needed again until every other block has been visited) and a hit keeps
+    /// its position (promotion would let the sweep evict the stable set). The cache converges to
+    /// a stable resident prefix of `n_slots - 1` blocks re-hit every pass plus one churn slot the
+    /// remaining blocks cycle through — the same hit count Belady's offline-optimal policy
+    /// achieves on a cyclic sweep (see `schedule_cyclic_sweep_is_belady_optimal`).
+    ///
+    /// Mechanically this shares [`Self::touch_cold`]'s cold-end insertion; it is a separate entry
+    /// point because the CONTRACT differs: `touch_cold` promises scan-resistance for full-set
+    /// sweeps MIXED with recency (`touch`) traffic on the same pager, while `schedule` promises
+    /// Belady-parity for a pager driven EXCLUSIVELY by one fixed cyclic order (dense layer
+    /// streaming never mixes policies on a pool). Within-batch safety still rides the batch
+    /// epoch ([`Self::begin_batch`]), not insertion order.
+    pub fn schedule(&mut self, id: BlockId) -> Resolution {
+        self.touch_cold(id)
     }
 
     /// [`Self::touch`]'s SCAN-RESISTANT twin, for full-set sweeps (a batched-prefill layer
@@ -439,6 +460,72 @@ mod tests {
             p.slot_of(2).is_some(),
             "hot block 2 evicted by a cold sweep"
         );
+    }
+
+    #[test]
+    fn schedule_cyclic_sweep_is_belady_optimal() {
+        // Dense layer streaming's access shape: N blocks visited 0..N in order, repeated every
+        // forward pass, through C < N slots. Belady (evict the furthest-next-use block) yields
+        // exactly C-1 hits per steady-state pass on this trace; `schedule` must match it —
+        // plain LRU would yield ZERO (every block evicted right before its reuse).
+        let (n_blocks, n_slots, passes) = (10u32, 4usize, 5u64);
+        let mut p = Pager::new(n_slots);
+        for _ in 0..passes {
+            for id in 0..n_blocks {
+                p.begin_batch(); // one layer's weights = one batch
+                p.schedule(id);
+            }
+        }
+        // Pass 1 is all misses; every later pass hits the stable prefix of n_slots-1 blocks.
+        let want_hits = (passes - 1) * (n_slots as u64 - 1);
+        assert_eq!(
+            p.stats().hits,
+            want_hits,
+            "schedule policy fell short of the Belady hit count on a cyclic sweep"
+        );
+    }
+
+    #[test]
+    fn schedule_stable_prefix_keeps_its_slots_across_passes() {
+        // The stable prefix must not only stay resident but keep the SAME slot assignment pass
+        // over pass — the property that makes the streamed dispatch's per-pass offsets cheap to
+        // reason about (only the churn slot's occupant changes).
+        let mut p = Pager::new(3);
+        let record = |p: &Pager| (0..3u32).map(|id| p.slot_of(id)).collect::<Vec<_>>();
+        for id in 0..8u32 {
+            p.begin_batch();
+            p.schedule(id);
+        }
+        let first = record(&p);
+        for _ in 0..3 {
+            for id in 0..8u32 {
+                p.begin_batch();
+                p.schedule(id);
+            }
+            assert_eq!(record(&p), first, "stable-prefix slots moved between passes");
+        }
+        // And the prefix really is resident (blocks 0..n_slots-1 minus the churn slot).
+        assert!(p.slot_of(0).is_some());
+        assert!(p.slot_of(1).is_some());
+    }
+
+    #[test]
+    fn schedule_batch_siblings_are_eviction_safe() {
+        // A layer whose weights span several blocks in ONE pool touches them as one batch; the
+        // epoch guard must keep earlier siblings resident while later ones evict (same invariant
+        // as touch_cold, restated for the schedule entry point).
+        let mut p = Pager::new(3);
+        p.begin_batch();
+        for id in [100u32, 101, 102] {
+            p.schedule(id);
+        }
+        p.begin_batch();
+        for id in [7u32, 8, 9] {
+            p.schedule(id);
+        }
+        for id in [7u32, 8, 9] {
+            assert!(p.slot_of(id).is_some(), "batch sibling {id} was evicted");
+        }
     }
 
     #[test]

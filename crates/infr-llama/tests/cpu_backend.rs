@@ -906,8 +906,12 @@ fn gpu_seam_golden_qwen3moe() {
     if std::env::var("INFR_BLESS").is_ok() {
         println!("qwen3moe seam golden: 0x{h:016x}  // {out:?}");
     } else {
+        // Refreshed post-e38becc: the Q6_K mmq nibble-map fix corrected this model's batched
+        // expert-GEMM output (its Q4_K_M ships Q6_K ffn_down banks) — the old hash locked the
+        // buggy kernel's text. New output verified coherent + q6k parity-proven vs the host
+        // reference (nc_gemm_parity random banks).
         assert_eq!(
-            h, 0xfacca402bd6434e9,
+            h, 0xe2ed327ed3301524,
             "qwen3moe seam golden changed\n  out: {out:?}"
         );
     }

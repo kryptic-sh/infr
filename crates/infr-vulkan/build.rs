@@ -1119,6 +1119,13 @@ fn main() {
         ("native_gemm_fma", "native_gemm_fma_f16", &["-DFMT_F16"]),
         ("native_gemm_fma", "native_gemm_fma_bf16", &["-DFMT_BF16"]),
         ("native_gemm_fma", "native_gemm_fma_f32", &["-DFMT_F32"]),
+        // Non-coopmat shared-memory fma flash-attention prefill (adapter.rs `nc_fa_ok`, see
+        // attn_nc_fa.comp): the attention companion of the fma GEMM tier above. No subgroup ops.
+        // One build per shared-Os ceiling: hd<=128 (37.6 KB), hd<=256 (54.0 KB), hd<=512 (BM=16,
+        // 47.6 KB) — the recorder picks the smallest that fits the layer's head dim.
+        ("attn_nc_fa", "attn_nc_fa_hd128", &[]),
+        ("attn_nc_fa", "attn_nc_fa_hd256", &["-DHD_MAX=256"]),
+        ("attn_nc_fa", "attn_nc_fa_hd512", &["-DHD_MAX=512"]),
         // int8 coopmat (WMMA) prefill GEMM, Q8_0 only — measurement kernel gated behind
         // INFR_I8_COOPMAT=1 (see adapter.rs / docs in the .comp file). Default-off; correctness
         // validated against native_gemm_mmq_q8_0/native_gemm_warp_q8_0.

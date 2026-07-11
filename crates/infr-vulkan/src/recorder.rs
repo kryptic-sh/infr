@@ -3002,6 +3002,53 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Non-coopmat shared-memory fma flash-attention prefill (`attn_nc_fa.comp`, adapter.rs
+    /// `nc_fa_ok` — the Intel Arc tier): fused tile QK^T → online softmax → PV, one workgroup per
+    /// (BM-row query tile, head), no subgroup ops, no pinned subgroup size, no scratch buffers.
+    /// Handles causal + sliding-window masks, ring KV caches (position → row via the `cap` push
+    /// constant, attn_partial's mapping), caller scale (0 → 1/√hd) and GQA. f16 KV only (the
+    /// adapter dequants quantized KV to the f16 ring-layout scratch before rows>1 attention).
+    /// `q`/`attn` rows need NOT be tile-padded: pad rows stage zeros / are never written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_nc_fa(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        attn: &dyn Buffer,
+        rows: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos: usize,
+        window: usize,
+        scale: f32,
+        cap: usize,
+    ) {
+        let (name, spv, bm) =
+            crate::gemm::attn_nc_fa_spv(hd).expect("attention_prefill_nc_fa: hd gated <= 512");
+        let k = self.be.kernel(name, spv, 4, 36);
+        let mut p = [0u8; 36];
+        p[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        p[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        p[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p[20..24].copy_from_slice(&(pos as u32).to_ne_bytes());
+        p[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        p[28..32].copy_from_slice(&scale.to_ne_bytes());
+        p[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        let groups = (rows.div_ceil(bm) * nh) as u32;
+        self.dispatch(
+            k,
+            &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(attn)],
+            1,
+            &p,
+            groups,
+        );
+    }
+
     /// FlashAttention-2 register-O prefill (Br=128, per-thread register accumulator → no [Br][HD]
     /// shared O; 2× the query tile of the shared-Os flash → fewer q-tiles). hd MUST be 128 and the
     /// caller MUST allocate q/attn/po to mpad128 = ceil(n/128)*128 rows. Split-K → partials → combine.
@@ -7123,6 +7170,133 @@ mod tests {
             .fold(0f32, f32::max);
         println!("attn_prefill_flash q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attn_prefill_flash mismatch: {err}");
+    }
+
+    /// Non-coopmat fma flash prefill (`attn_nc_fa`): host-reference parity across causal /
+    /// windowed / ring-wrapped / GQA configs on all three HD_MAX builds, PLUS same-dispatch-3x
+    /// bitwise determinism (the mmq barrier-race lesson — goldens can't catch intra-dispatch
+    /// races). Runs on any GPU: the kernel uses no coopmat and no subgroup ops.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_prefill_nc_fa_matches_cpu() {
+        // causal, GQA, rows not a tile multiple (pad-row guards), hd128 build
+        run_attn_nc_fa(100, 160, 4, 2, 128, 0, 0.0, None);
+        // multi-block kv, qwen3-shaped
+        run_attn_nc_fa(448, 2000, 16, 8, 128, 0, 0.0, None);
+        // sliding window on a full-context cache + non-default scale (gemma4 pushes 1.0)
+        run_attn_nc_fa(100, 300, 4, 2, 128, 64, 1.0, None);
+        // hd=64 (BK tail guards: hd < the build's HD_MAX)
+        run_attn_nc_fa(80, 300, 9, 3, 64, 0, 0.0, None);
+        // hd256 build, windowed (gemma4 SWA shape)
+        run_attn_nc_fa(96, 400, 8, 4, 256, 128, 1.0, None);
+        // hd512 build (BM=16 tile)
+        run_attn_nc_fa(70, 200, 2, 1, 512, 0, 0.0, None);
+        // RING cache wrapped past capacity (kv_len > ring rows): window 64, ring 192 —
+        // union span (kvend - first tile's window base) = 163 <= 192, the runner's invariant
+        run_attn_nc_fa(100, 260, 4, 2, 128, 64, 0.0, Some(192));
+        // ring + hd256 + gemma scale
+        run_attn_nc_fa(96, 288, 8, 4, 256, 96, 1.0, Some(192));
+        // gemma-4-12b mid-prefill ubatch chunk, EXACT runner shapes (INFR_UBATCH=256): SWA layer
+        // (hd 256, window 1024, ring = round64(window+ubatch) = 1280, wrapped: kv_len 1536)…
+        run_attn_nc_fa(256, 1536, 16, 8, 256, 1024, 1.0, Some(1280));
+        // …and the paired global layer (hd 512, BM=16 build, full-context cache, deep pos)
+        run_attn_nc_fa(256, 1536, 16, 1, 512, 0, 1.0, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_attn_nc_fa(
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        window: usize,
+        scale: f32,
+        ring_rows: Option<usize>,
+    ) {
+        let be = VulkanBackend::new().unwrap();
+        let pos_offset = kv_len - q_len;
+        let gen = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
+                .collect()
+        };
+        let q = r16(&gen(q_len * nh * hd, 1));
+        let k = r16(&gen(kv_len * nkv * hd, 2));
+        let v = r16(&gen(kv_len * nkv * hd, 3));
+        // Build the cache buffers in RING layout: position j lives at row j % rcap, ascending j
+        // so later positions overwrite recycled rows (exactly what the runner's ring writes do).
+        // rcap = kv_len for the full-context configs (the modulo is an identity there).
+        let rcap = ring_rows.unwrap_or(kv_len);
+        let rw = nkv * hd;
+        let mut kr = vec![0f32; rcap * rw];
+        let mut vr = vec![0f32; rcap * rw];
+        for j in 0..kv_len {
+            let r = j % rcap;
+            kr[r * rw..(r + 1) * rw].copy_from_slice(&k[j * rw..(j + 1) * rw]);
+            vr[r * rw..(r + 1) * rw].copy_from_slice(&v[j * rw..(j + 1) * rw]);
+        }
+        let bq = upf16(&be, &q);
+        let bk = upf16(&be, &kr);
+        let bv = upf16(&be, &vr);
+        // dst is NOT tile-padded — the kernel guards pad-row writes (no Internal requirement)
+        let outs: Vec<_> = (0..3)
+            .map(|_| {
+                be.alloc(q_len * nh * hd * 4, BufferUsage::Readback)
+                    .unwrap()
+            })
+            .collect();
+        let cap = rcap * rw;
+        let rec = be.recorder().unwrap();
+        for o in &outs {
+            rec.attention_prefill_nc_fa(
+                bq.as_ref(),
+                bk.as_ref(),
+                bv.as_ref(),
+                o.as_ref(),
+                q_len,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                pos_offset,
+                window,
+                scale,
+                cap,
+            );
+        }
+        rec.finish().unwrap();
+        let dl = |b: &dyn Buffer| -> Vec<f32> {
+            let mut bytes = vec![0u8; q_len * nh * hd * 4];
+            be.download(b, &mut bytes).unwrap();
+            bytemuck::cast_slice(&bytes).to_vec()
+        };
+        let got = dl(outs[0].as_ref());
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "attn_nc_fa q={q_len} kv={kv_len} hd={hd}: non-finite output"
+        );
+        for (run, o) in outs.iter().enumerate().skip(1) {
+            let other = dl(o.as_ref());
+            let ndiff = got.iter().zip(&other).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                ndiff, 0,
+                "attn_nc_fa q={q_len} kv={kv_len} hd={hd} ring={ring_rows:?}: \
+                 nondeterministic — dispatch 0 vs {run}: {ndiff} differ"
+            );
+        }
+        // reference over the LOGICAL (position-ordered) K/V — the ring layout must be invisible
+        let want = attn_kv_cpu(&q, &k, &v, q_len, nh, nkv, hd, pos_offset, window, scale);
+        let err = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!(
+            "attn_nc_fa q={q_len} kv={kv_len} nh={nh}/{nkv} hd={hd} win={window} \
+             ring={ring_rows:?} max_err={err:e}"
+        );
+        assert!(err < 5e-3, "attn_nc_fa mismatch: {err}");
     }
 
     #[test]

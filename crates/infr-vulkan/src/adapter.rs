@@ -2143,6 +2143,28 @@ fn lower_op(
                     && be_.caps().f16_coopmat
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
+                // NON-COOPMAT flash tier (`attn_nc_fa.comp`, the attention companion of the
+                // `nc_mmq`/`nc_fma` GEMM tier): flash/nonfa above are coopmat SPIR-V, so a device
+                // without the feature (Intel Arc/ANV) previously ran ALL prefill attention on the
+                // scalar per-row `attention_kv` (31% of knob pp512 on Qwen3-14B) or, for rows<64 /
+                // ring-past shapes, the split-K path. This shared-memory fma tile (no subgroup
+                // ops, ≤54 KB shared) takes the flash tier's row floor; unlike flash/nonfa it
+                // handles SWA windows AND ring caches (attn_partial's `cap` row-modulo mapping),
+                // so ring-past prefill rides it too. f16 KV only — quantized KV was already
+                // dequanted to the f16 ring-layout scratch above at rows>1 (`k/v_q8_eff` false by
+                // construction), and the gate keeps the exclusion explicit. No Internal-buffer
+                // requirement: the kernel guards pad-row reads/writes itself. Exercisable on
+                // coopmat hardware via INFR_NO_COOPMAT=1; INFR_NO_NC_FA=1 disables the arm (A/B
+                // against the scalar/split floor).
+                let nc_fa_ok = !flash_ok
+                    && !nonfa_ok
+                    && !be_.caps().f16_coopmat
+                    && (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
+                    && canvas_lo.is_none()
+                    && hd % 4 == 0
+                    && hd <= 512
+                    && !(k_q8_eff || v_q8_eff)
+                    && std::env::var("INFR_NO_NC_FA").is_err();
                 // Decode (rows==1) AND small-m suffix prefill (rows 2..63, below the flash/nonfa
                 // floor): flash-decoding split-K — each (row, head)'s KV range splits across ~32
                 // chunks of workgroups instead of the scalar attention_kv's rows*nh (= nh at
@@ -2307,6 +2329,35 @@ fn lower_op(
                         pos,
                         window,
                         *scale,
+                    );
+                } else if nc_fa_ok {
+                    let window = match mask {
+                        AttnMask::Causal => 0,
+                        AttnMask::SlidingWindow(w) => *w,
+                        AttnMask::Canvas { .. } => unreachable!("nc_fa_ok excludes Canvas"),
+                    };
+                    let kcb = match &kc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*k_cache)?,
+                    };
+                    let vcb = match &vc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*v_cache)?,
+                    };
+                    rec.attention_prefill_nc_fa(
+                        r(*q)?,
+                        kcb,
+                        vcb,
+                        r(*dst)?,
+                        rows,
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        pos,
+                        window,
+                        *scale,
+                        cap,
                     );
                 } else if split_ok {
                     // `canvas_lo` (computed above) rides a SEPARATE param into

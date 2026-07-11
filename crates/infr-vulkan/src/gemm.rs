@@ -726,6 +726,29 @@ pub(crate) fn native_gemm_fma_build_spv(
         _ => return None,
     })
 }
+/// SPIR-V for the non-coopmat shared-memory fma flash-attention prefill (the "nc_fa" tier, see
+/// `attn_nc_fa.comp`): fused QK^T → online softmax → PV for devices without a usable f16 coopmat
+/// (adapter.rs `nc_fa_ok`). Three shared-Os builds; returns the smallest that fits `hd` as
+/// `(kernel_cache_name, spv, BM row tile)`, or `None` for hd > 512.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn attn_nc_fa_spv(hd: usize) -> Option<(&'static str, &'static [u32], usize)> {
+    macro_rules! spv {
+        ($name:literal, $bm:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice(), $bm)
+        }};
+    }
+    Some(if hd <= 128 {
+        spv!("attn_nc_fa_hd128", 32)
+    } else if hd <= 256 {
+        spv!("attn_nc_fa_hd256", 32)
+    } else if hd <= 512 {
+        spv!("attn_nc_fa_hd512", 16)
+    } else {
+        return None;
+    })
+}
 /// SPIR-V for the int8 cooperative-matrix (WMMA) prefill GEMM, Q8_0 only — measurement kernel
 /// gated behind `INFR_I8_COOPMAT=1` (see `native_gemm_i8cm_q8_0.comp` for the design doc).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

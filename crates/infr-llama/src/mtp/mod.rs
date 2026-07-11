@@ -2167,6 +2167,24 @@ fn generate_mtp_spec_core(
     // speedup): restoring an exact state snapshot + re-prefilling the same committed tokens yields
     // the same recurrence as prefilling them from zero.
     let mtp_ckpt = std::env::var("INFR_NO_MTP_CKPT").is_err();
+    // Bounded rollback window (INFR_NO_MTP_REPRIME=1 A/B escape): the snapshot above only advances
+    // on FULL-accept cycles, so at low accept rates (alpha≈0.5 on repetitive/dummy prompts —
+    // full-accept probability ≈ alpha^n_max ≈ 2%) the boundary stalls and each cycle's verify
+    // re-prefills a suffix that GROWS by (accepted+1) per cycle: measured verify m climbing 7→36
+    // on the 9B at alpha=0.51, which pushes every projection GEMM off the small-m fast kernels
+    // (mrow/BM16 gate at m<=8/m<=16) onto larger tiles at 2-4x the per-row cost. The fix
+    // (`reprime_pending` below): when the NEXT verify's row count would leave the fast-tile
+    // regime, re-prefill the committed suffix as its own pass right after this cycle commits —
+    // the identical rows the next verify would have re-run anyway — snapshot the now-clean
+    // boundary, and carry the pass's last row as the next cycle's leading row (the existing
+    // cycle-1 mechanism). THRESHOLDED, not every-cycle: small-m GEMMs are weight-bandwidth-bound,
+    // so splitting one m=13 verify into a m=7 reprime + m=6 verify streams the whole trunk (and
+    // the vocab head) TWICE — measured a 4.6% mtp128 LOSS on the 4B when reprimed on every
+    // partial cycle vs +22% on the 9B whose window actually blew out. Repriming only when
+    // window + n_max + 1 > MTP_REPRIME_MAX_M keeps typical cycles single-stream and caps the
+    // verify at the BM16 tile's m<=16 gate (`DENSE_SMALL_TILE_MAX_M16`).
+    let mtp_reprime = mtp_ckpt && std::env::var("INFR_NO_MTP_REPRIME").is_err();
+    const MTP_REPRIME_MAX_M: usize = 16;
     let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
     let hit_eos = |t: u32| !ignore_eos && (cfg.eos_ids.contains(&t) || t == cfg.eos);
     // Sampling config (see this fn's doc): temp<=0 keeps the original bit-identical greedy path;
@@ -2232,6 +2250,9 @@ fn generate_mtp_spec_core(
             st.mtp_snapshot_delta(be, cfg)?;
         }
     }
+    // Committed-token length of the last snapshot — the rollback window `committed.len() -
+    // boundary` is what the next verify re-prefills after a partial accept (`mtp_reprime`'s doc).
+    let mut boundary = p;
 
     let mut committed = prompt_tokens.clone();
     let mut id_last = prompt_tokens[p - 1];
@@ -2382,12 +2403,19 @@ fn generate_mtp_spec_core(
         // the NEXT verify's prefix-diff re-prefills only the short accepted suffix from there rather
         // than triggering qwen35's full state reset. `h_rows`/`varg` were already read above, so the
         // rollback only affects the trunk state the next cycle consumes.
+        let mut restored = false;
         if mtp_ckpt {
             if let Some(st) = trunk_state.as_mut() {
                 if accepted == cand.len() {
                     st.mtp_snapshot_delta(be, cfg)?;
+                    // The state covers `feed` = committed ++ cand (next_tok never went through
+                    // the trunk this cycle) — that's the snapshot's committed length.
+                    boundary = feed.len();
                 } else {
                     st.mtp_restore_delta(be)?;
+                    // A clean boundary may need re-establishing at the END of this cycle (after
+                    // the accepted tokens + next_tok are committed) — see `mtp_reprime`'s doc.
+                    restored = true;
                 }
             }
         }
@@ -2465,6 +2493,66 @@ fn generate_mtp_spec_core(
 
         id_last = next_tok;
         n_past = committed.len();
+
+        // Partial-accept boundary re-prime (`mtp_reprime`'s doc): when the rollback window has
+        // grown enough that the NEXT verify would leave the small-m fast-tile regime, prefill the
+        // committed suffix now (prefix-diff from the just-restored snapshot — the SAME rows the
+        // next verify would otherwise re-run inside its own pass), snapshot the clean state, and
+        // hand the last row to the next cycle as its leading row exactly like the prompt prime
+        // does for cycle 1. Timed into the catchup bucket: it's committed-boundary maintenance,
+        // not verify work.
+        if restored && mtp_reprime && (committed.len() - boundary) + n_max > MTP_REPRIME_MAX_M {
+            let t_reprime = std::time::Instant::now();
+            if stochastic {
+                let (rlogits, rh) = run_verify_full(
+                    be,
+                    bind,
+                    model.gguf(),
+                    cfg,
+                    model.token_embd(),
+                    &committed,
+                    &mut trunk_state,
+                    max_ctx,
+                )?;
+                let mr = rh.len() / ne;
+                anyhow::ensure!(
+                    mr >= 1 && rlogits.len() == mr * cfg.vocab,
+                    "mtp reprime: expected {mr}>=1 rows and {}*{} logits, got {}",
+                    mr,
+                    cfg.vocab,
+                    rlogits.len()
+                );
+                leading_dist = Some(crate::sampling::truncated_dist(
+                    &rlogits[(mr - 1) * cfg.vocab..],
+                    sampler,
+                ));
+                leading_h = Some(rh[(mr - 1) * ne..].to_vec());
+            } else {
+                let (rids, rh) = run_verify(
+                    be,
+                    bind,
+                    model.gguf(),
+                    cfg,
+                    model.token_embd(),
+                    &committed,
+                    &mut trunk_state,
+                    max_ctx,
+                )?;
+                let mr = rh.len() / ne;
+                anyhow::ensure!(
+                    mr >= 1 && rids.len() == mr,
+                    "mtp reprime: expected {mr}>=1 rows with matching ids, got {}",
+                    rids.len()
+                );
+                leading_id = Some(rids[mr - 1]);
+                leading_h = Some(rh[(mr - 1) * ne..].to_vec());
+            }
+            if let Some(st) = trunk_state.as_mut() {
+                st.mtp_snapshot_delta(be, cfg)?;
+            }
+            boundary = committed.len();
+            sum_catchup_secs += t_reprime.elapsed().as_secs_f64();
+        }
     }
 
     let timing = MtpTiming {

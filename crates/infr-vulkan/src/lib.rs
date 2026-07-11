@@ -488,7 +488,12 @@ impl VulkanBackend {
         // GPU busy time is small, so the fixed per-dispatch descriptor churn is a bigger fraction
         // of wall time). Near-universally supported (desktop RADV/NVIDIA/Intel); the pooled path
         // stays as a fallback for drivers that lack it (e.g. some portability/MoltenVK builds).
-        let has_push_descriptor = has_ext(c"VK_KHR_push_descriptor");
+        // INFR_NO_PUSH_DESC=1 forces the pooled-classic fallback even when the extension exists —
+        // lets a RADV dev box exercise the code path a driver WITHOUT push descriptors takes
+        // (field report: teardown validation findings on Intel Arc/ANV that RADV runs never
+        // reproduce because the classic pools are never created here). Test/diagnosis knob only.
+        let has_push_descriptor =
+            has_ext(c"VK_KHR_push_descriptor") && std::env::var("INFR_NO_PUSH_DESC").is_err();
 
         // ── probe features (via VK 1.1 get_physical_device_features2) ─────────
         // Memory model and subgroup-size-control are probed rather than assumed: a portability

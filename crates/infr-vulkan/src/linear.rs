@@ -70,6 +70,16 @@ pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     })
 }
 
+/// Whether the Vulkan MoE expert paths can dispatch a bank of this dtype AT ALL — the id-indexed
+/// GEMV kernels are the floor every MoE model needs (decode + the per-token fallback). A dtype
+/// missing here would `expect`-panic mid-inference in `linear_native_id(_multi)`; the seam's
+/// MoE binder gates on this at LOAD instead, with a clear error naming the CPU escape hatch
+/// (field report: an MXFP4_MOE quant — MXFP4 expert banks — panicked on a user's box; MXFP4 has
+/// dense kernels but no id-GEMV/mmq family yet).
+pub fn moe_expert_dtype_ok(dtype: infr_core::DType) -> bool {
+    native_id_kernel_name(dtype).is_some() && native_idm_kernel_name(dtype).is_some()
+}
+
 /// [`native_id_kernel_name`]'s paged twin (`infr_vulkan::pager::GpuPager` build — one extra LUT
 /// hop, `nw_base = lut[expert_id]` (a u32-WORD arena base), see `shaders/native_gemv_id.comp`'s
 /// `-DPAGED` doc comment).

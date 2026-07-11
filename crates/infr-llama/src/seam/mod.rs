@@ -200,6 +200,23 @@ pub(crate) fn vulkan_moe_binder<'a>(
     // that's real pressure, deliberately not compensated; the alloc-time VRAM budget guard is
     // the backstop against over-commit.
     if first_load && cfg.moe.is_some() {
+        // Load-time floor check: every expert-bank dtype must have the id-indexed GEMV kernels
+        // (the MoE decode/fallback floor) — a miss would `expect`-panic MID-INFERENCE in the
+        // recorder instead (field report: MXFP4_MOE expert banks on an Arc A770; MXFP4 has dense
+        // kernels but no id-GEMV/mmq family yet). Fail here, clearly, and name the CPU escape.
+        for t in g.tensors() {
+            if t.name.contains("_exps.weight") && !infr_vulkan::linear::moe_expert_dtype_ok(t.dtype)
+            {
+                return Err(anyhow!(
+                    "expert bank {} is {:?}, which the Vulkan MoE expert kernels don't cover yet \
+                     — run on the CPU backend (INFR_CPU=1) or pick a quant whose expert banks use \
+                     a covered format (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/\
+                     IQ4_XS)",
+                    t.name,
+                    t.dtype,
+                ));
+            }
+        }
         match cache_override {
             Some(spec) => {
                 n_paged = cfg.n_layer;

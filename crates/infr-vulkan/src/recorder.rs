@@ -7211,8 +7211,13 @@ mod tests {
         let a: Vec<f32> = (0..m * k)
             .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
             .collect();
-        // q6 quants, per-16 i8 scales, per-256 f16 super-scale (weight g = col*k + kk)
-        let q6: Vec<u32> = (0..n * k).map(|i| (i * 13 % 64) as u32).collect();
+        // q6 quants, per-16 i8 scales, per-256 f16 super-scale (weight g = col*k + kk).
+        // NOT 64-periodic: the original `i*13 % 64` satisfied q6[p+64]==q6[p], which made the
+        // shader's og=1/og=2 ql-source transposition (fixed 2026-07, see the .comp) invisible —
+        // the `(i/64)*31` term breaks the period so a nibble-map regression fails loudly here.
+        let q6: Vec<u32> = (0..n * k)
+            .map(|i| ((i * 13 + (i / 64) * 31) % 64) as u32)
+            .collect();
         let sc: Vec<i8> = (0..n * k / 16)
             .map(|b| ((b % 11) as i32 - 5) as i8)
             .collect();

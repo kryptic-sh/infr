@@ -139,9 +139,16 @@ void main() {
             uint packed = 0u;
             for (uint b = 0u; b < 4u; b++) {
                 uint l = l0 + 4u * wd + b;
-                uint byte = (og < 2u) ? rb(bd + qlo + l) : rb(bd + qlo + l + 32u);
+                // ggml Q6_K nibble map (see native_decode.glsl FMT_Q6K, the production GEMV
+                // decode): og pairs {0,2} share ql[l] (low/high nibble), {1,3} share ql[l+32] —
+                // byte select on og&1, nibble select on og<2. This was TRANSPOSED here (byte on
+                // og<2, nibble on og&1 — og=1/og=2 read each other's ql source) from the kernel's
+                // introduction until 2026-07: every in-tree parity input was 64-periodic
+                // (q6[p+64]==q6[p]), which makes the transposition invisible; random banks
+                // (nc_gemm_parity.rs) exposed it.
+                uint byte = ((og & 1u) == 0u) ? rb(bd + qlo + l) : rb(bd + qlo + l + 32u);
                 uint qh = rb(bd + 128u + qho + l);
-                uint nib = ((og & 1u) == 0u) ? (byte & 0xFu) : (byte >> 4u);
+                uint nib = (og < 2u) ? (byte & 0xFu) : (byte >> 4u);
                 uint q = nib | (((qh >> (2u * og)) & 3u) << 4u);
                 packed |= (uint(int(q) - 32) & 0xFFu) << (b * 8u);
             }

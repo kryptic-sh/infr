@@ -60,6 +60,7 @@ float dqsub(uint gstart, uint xoff) {
 }
 
 void main() {
+    GRID_INIT; // barrier inside — must precede the (workgroup-uniform) early return below
     // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
     uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
     if (unit >= pc.rows * pc.out_f) { return; }

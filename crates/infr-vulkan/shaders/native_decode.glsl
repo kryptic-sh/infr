@@ -32,8 +32,16 @@ uint ru32u(uint bo) {
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 int sgn8(uint byte) { return int(byte) - int(byte >= 128u ? 256u : 0u); }
 
+// USE_GRID builds stage their codebook tables into `shared` memory once per workgroup
+// (grid_init() in the generated native_grids.glsl — see build.rs's gen_grids for why const-array
+// indexing is a per-invocation-scratch catastrophe on RADV/ACO). Every includer runs `GRID_INIT;`
+// at the TOP of main(): it contains a barrier(), so it must precede any early return / divergent
+// flow. Non-grid builds expand it to an empty statement — byte-identical SPIR-V.
 #ifdef USE_GRID
 #include "native_grids.glsl"
+#define GRID_INIT grid_init()
+#else
+#define GRID_INIT
 #endif
 
 #if defined(FMT_Q8_0)

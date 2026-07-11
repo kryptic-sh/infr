@@ -27,6 +27,7 @@ shared float16_t Bs[BK * BN];
 #include "native_decode.glsl"
 
 void main() {
+    GRID_INIT; // barrier inside — must run in uniform control flow before any dqblk()
     uint tilesN = pc.n / BN;
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;

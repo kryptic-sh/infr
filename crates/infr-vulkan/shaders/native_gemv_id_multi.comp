@@ -62,6 +62,7 @@ float dqsub(uint gstart, uint xoff) {
 }
 
 void main() {
+    GRID_INIT; // barrier inside — must precede the (workgroup-uniform) early return below
     // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
     // `slot_global` (and the `ids[]` read it drives) can go out of range for a padding workgroup,
     // so this needs an explicit bound (unlike native_gemv_rm/sg's per-output-only guard).

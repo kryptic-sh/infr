@@ -5171,9 +5171,30 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_mmq_iq4_xs_xp32_spv(),
                 6,
             ),
+            // MXFP4/NVFP4: signed E2M1 codebook — IQ4_NL's treatment, symmetric, no `sact`.
+            (infr_core::DType::Mxfp4, false) => (
+                "native_gemm_mmq_mxfp4_xp",
+                crate::gemm::native_gemm_mmq_mxfp4_xp_spv(),
+                6,
+            ),
+            (infr_core::DType::Mxfp4, true) => (
+                "native_gemm_mmq_mxfp4_xp32",
+                crate::gemm::native_gemm_mmq_mxfp4_xp32_spv(),
+                6,
+            ),
+            (infr_core::DType::Nvfp4, false) => (
+                "native_gemm_mmq_nvfp4_xp",
+                crate::gemm::native_gemm_mmq_nvfp4_xp_spv(),
+                6,
+            ),
+            (infr_core::DType::Nvfp4, true) => (
+                "native_gemm_mmq_nvfp4_xp32",
+                crate::gemm::native_gemm_mmq_nvfp4_xp32_spv(),
+                6,
+            ),
             _ => unreachable!(
-                "batched MoE expert GEMM: Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K/\
-                 IQ4_NL/IQ4_XS only"
+                "batched MoE expert GEMM: the MOE_MMQ_DTYPES set only (Q4_0/Q4_1/Q4_K/Q5_K/Q6_K/\
+                 Q8_0/Q5_0/Q5_1/Q2_K/Q3_K/IQ4_NL/IQ4_XS/MXFP4/NVFP4)"
             ),
         };
         let kern = self.be.kernel(name, spv, nb, 16);
@@ -5360,9 +5381,30 @@ impl<'a> Recorder<'a> {
                 crate::gemm::native_gemm_mmq_q5_1_xpg32_spv(),
                 8,
             ),
+            // MXFP4/NVFP4: symmetric codebook, no `sact` (7 bindings = resident's 6 + LUT).
+            (infr_core::DType::Mxfp4, false) => (
+                "native_gemm_mmq_mxfp4_xpg",
+                crate::gemm::native_gemm_mmq_mxfp4_xpg_spv(),
+                7,
+            ),
+            (infr_core::DType::Mxfp4, true) => (
+                "native_gemm_mmq_mxfp4_xpg32",
+                crate::gemm::native_gemm_mmq_mxfp4_xpg32_spv(),
+                7,
+            ),
+            (infr_core::DType::Nvfp4, false) => (
+                "native_gemm_mmq_nvfp4_xpg",
+                crate::gemm::native_gemm_mmq_nvfp4_xpg_spv(),
+                7,
+            ),
+            (infr_core::DType::Nvfp4, true) => (
+                "native_gemm_mmq_nvfp4_xpg32",
+                crate::gemm::native_gemm_mmq_nvfp4_xpg32_spv(),
+                7,
+            ),
             _ => unreachable!(
                 "paged batched MoE expert GEMM: the MOE_MMQ_PAGED_DTYPES set only \
-                 (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS)"
+                 (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/IQ4_NL/IQ4_XS/MXFP4/NVFP4)"
             ),
         };
         let kern = self.be.kernel(name, spv, nb, 16);

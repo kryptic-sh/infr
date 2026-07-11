@@ -103,6 +103,23 @@ impl DType {
 /// hand-written per format — this list is what a reviewer/test diffs them against, and the
 /// recorder's per-format kernel-name match arms `unreachable!()` at runtime if a format is listed
 /// here without its kernel wired, which is the compile-adjacent failure mode for that side).
+///
+/// DELIBERATE EXCLUSIONS (these fall back to the looped id-GEMV expert path for prefill —
+/// correct, just slower; this doc is the SSOT for why each stays out):
+///   * `Tq1_0`/`Tq2_0` (ternary): the values ARE tiny signed ints, but TQ1_0's per-element
+///     base-3 digit extraction (a pow3-multiply + funnel per element, three different packing
+///     regions per 256-block) has no natural word-parallel nibble→int8 staging — the dp4a
+///     staging loop would degenerate into the same scalar decode the idm fallback already does;
+///     TQ2_0 would map, but no shipped MoE GGUF quantizes expert banks ternary, so neither earns
+///     a kernel until one does.
+///   * `Iq1S`/`Iq1M`/`Iq2Xxs`/`Iq2Xs`/`Iq2S`/`Iq3Xxs`/`Iq3S` (grid i-quants): decode is a
+///     per-8-element codebook-grid gather + 7-bit sign-mask expansion (large LUTs, several
+///     dependent loads per byte staged) — the dp4a int path's win (cheap int8 staging feeding
+///     the dot) inverts when staging itself is the bottleneck (the same ALU-not-bandwidth
+///     lesson `native_dense_supported`'s grid note records for dense GEMV). They keep the idm
+///     fallback.
+///   * `Bf16`/`F16`/`F32` (float weights): not dp4a material at all — no integer codes to feed
+///     the packed int8 dot; they ride the float GEMM/GEMV routes.
 pub const MOE_MMQ_DTYPES: &[DType] = &[
     DType::Q4_0,
     DType::Q4_1,
@@ -116,6 +133,8 @@ pub const MOE_MMQ_DTYPES: &[DType] = &[
     DType::Q6K,
     DType::Iq4Nl,
     DType::Iq4Xs,
+    DType::Mxfp4,
+    DType::Nvfp4,
 ];
 
 /// True for dtypes the batched-MoE dp4a mmq expert-GEMM family covers (gate/up/down each
@@ -129,7 +148,8 @@ pub fn moe_mmq_ok(dt: DType) -> bool {
 /// convention). Q2_K is ALSO min-carrying but is deliberately excluded — its 16-elem sub-block is
 /// HALF the activation's 32-elem `sact` granularity, so it self-computes its own narrower Σx
 /// in-shader instead (see `native_gemm_mmq_q2_k.comp`'s doc); Q3_K/Q6_K/Q8_0/Q5_0/Q4_0/IQ4_NL/
-/// IQ4_XS are symmetric (no min term at all).
+/// IQ4_XS/MXFP4/NVFP4 are symmetric (no min term at all — the two fp4 formats share IQ4_NL's
+/// signed-codebook treatment).
 pub const MOE_MMQ_SACT_DTYPES: &[DType] = &[DType::Q4K, DType::Q5K, DType::Q5_1, DType::Q4_1];
 
 /// True for [`MOE_MMQ_DTYPES`] members whose mmq kernel reads the activation's `sact` buffer.
@@ -158,6 +178,8 @@ pub const MOE_MMQ_PAGED_DTYPES: &[DType] = &[
     DType::Q6K,
     DType::Iq4Nl,
     DType::Iq4Xs,
+    DType::Mxfp4,
+    DType::Nvfp4,
 ];
 
 /// True for [`MOE_MMQ_DTYPES`] members with a paged (Scout-style GpuPager) batched expert-GEMM

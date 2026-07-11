@@ -65,6 +65,20 @@ void dqblk(uint gstart, out float v[32]) {
 }
 #endif
 
+#if defined(FMT_F32)
+// F32: contiguous IEEE single (no blocks/scale) — one weight element per u32 word, EXACT. Serves
+// the PAGED MoE expert path only: a paged float expert bank stages its RAW GGUF bytes into the
+// arena (no host f16 conversion — resident float banks go through `bind_weight`, which converts
+// to f16 and reports the effective dtype, so they hit FMT_F16 instead).
+float dq(uint g) {
+    return uintBitsToFloat(NW(g));
+}
+#define HAVE_DQBLK
+void dqblk(uint gstart, out float v[32]) {
+    for (uint w = 0u; w < 32u; w++) { v[w] = uintBitsToFloat(NW(gstart + w)); }
+}
+#endif
+
 #if defined(FMT_BF16)
 // BF16: contiguous 16-bit truncated-f32 (no blocks/scale). y = bitcast(bits << 16) — EXACT (bf16 is
 // the top 16 bits of an f32). Element e lives at byte e*2 (packed 2-per-u32).

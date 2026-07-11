@@ -244,7 +244,9 @@ pub(crate) fn native_sg_build_spv(
 }
 
 /// SPIR-V for the id-indexed native GEMV (expert chosen from a GPU buffer). One specialization per
-/// affine quant format; `None` for formats without an id variant (caller falls back to host top-k).
+/// weight format an expert bank can hold — the FULL dense native-GEMV format set plus F16/F32 for
+/// float banks (resident float banks bind as effective f16; paged ones stage raw GGUF bytes, so
+/// both float variants exist). `None` only for non-weight dtypes (I32/U32/...).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_id_build_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
     use infr_core::DType::*;
@@ -270,6 +272,20 @@ pub(crate) fn native_id_build_spv(dtype: infr_core::DType) -> Option<&'static [u
         Q6K => v!("native_id_q6k"),
         Iq4Nl => v!("native_id_iq4nl"),
         Iq4Xs => v!("native_id_iq4xs"),
+        Mxfp4 => v!("native_id_mxfp4"),
+        Nvfp4 => v!("native_id_nvfp4"),
+        Tq1_0 => v!("native_id_tq1_0"),
+        Tq2_0 => v!("native_id_tq2_0"),
+        Iq2Xxs => v!("native_id_iq2xxs"),
+        Iq2Xs => v!("native_id_iq2xs"),
+        Iq2S => v!("native_id_iq2s"),
+        Iq3Xxs => v!("native_id_iq3xxs"),
+        Iq3S => v!("native_id_iq3s"),
+        Iq1S => v!("native_id_iq1s"),
+        Iq1M => v!("native_id_iq1m"),
+        Bf16 => v!("native_id_bf16"),
+        F16 => v!("native_id_f16"),
+        F32 => v!("native_id_f32"),
         _ => return None,
     })
 }
@@ -299,6 +315,20 @@ pub(crate) fn native_idm_build_spv(dtype: infr_core::DType) -> Option<&'static [
         Q6K => v!("native_idm_q6k"),
         Iq4Nl => v!("native_idm_iq4nl"),
         Iq4Xs => v!("native_idm_iq4xs"),
+        Mxfp4 => v!("native_idm_mxfp4"),
+        Nvfp4 => v!("native_idm_nvfp4"),
+        Tq1_0 => v!("native_idm_tq1_0"),
+        Tq2_0 => v!("native_idm_tq2_0"),
+        Iq2Xxs => v!("native_idm_iq2xxs"),
+        Iq2Xs => v!("native_idm_iq2xs"),
+        Iq2S => v!("native_idm_iq2s"),
+        Iq3Xxs => v!("native_idm_iq3xxs"),
+        Iq3S => v!("native_idm_iq3s"),
+        Iq1S => v!("native_idm_iq1s"),
+        Iq1M => v!("native_idm_iq1m"),
+        Bf16 => v!("native_idm_bf16"),
+        F16 => v!("native_idm_f16"),
+        F32 => v!("native_idm_f32"),
         _ => return None,
     })
 }
@@ -328,6 +358,20 @@ pub(crate) fn native_id_paged_build_spv(dtype: infr_core::DType) -> Option<&'sta
         Q6K => v!("native_id_q6k_paged"),
         Iq4Nl => v!("native_id_iq4nl_paged"),
         Iq4Xs => v!("native_id_iq4xs_paged"),
+        Mxfp4 => v!("native_id_mxfp4_paged"),
+        Nvfp4 => v!("native_id_nvfp4_paged"),
+        Tq1_0 => v!("native_id_tq1_0_paged"),
+        Tq2_0 => v!("native_id_tq2_0_paged"),
+        Iq2Xxs => v!("native_id_iq2xxs_paged"),
+        Iq2Xs => v!("native_id_iq2xs_paged"),
+        Iq2S => v!("native_id_iq2s_paged"),
+        Iq3Xxs => v!("native_id_iq3xxs_paged"),
+        Iq3S => v!("native_id_iq3s_paged"),
+        Iq1S => v!("native_id_iq1s_paged"),
+        Iq1M => v!("native_id_iq1m_paged"),
+        Bf16 => v!("native_id_bf16_paged"),
+        F16 => v!("native_id_f16_paged"),
+        F32 => v!("native_id_f32_paged"),
         _ => return None,
     })
 }
@@ -357,6 +401,20 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
         Q6K => v!("native_idm_q6k_paged"),
         Iq4Nl => v!("native_idm_iq4nl_paged"),
         Iq4Xs => v!("native_idm_iq4xs_paged"),
+        Mxfp4 => v!("native_idm_mxfp4_paged"),
+        Nvfp4 => v!("native_idm_nvfp4_paged"),
+        Tq1_0 => v!("native_idm_tq1_0_paged"),
+        Tq2_0 => v!("native_idm_tq2_0_paged"),
+        Iq2Xxs => v!("native_idm_iq2xxs_paged"),
+        Iq2Xs => v!("native_idm_iq2xs_paged"),
+        Iq2S => v!("native_idm_iq2s_paged"),
+        Iq3Xxs => v!("native_idm_iq3xxs_paged"),
+        Iq3S => v!("native_idm_iq3s_paged"),
+        Iq1S => v!("native_idm_iq1s_paged"),
+        Iq1M => v!("native_idm_iq1m_paged"),
+        Bf16 => v!("native_idm_bf16_paged"),
+        F16 => v!("native_idm_f16_paged"),
+        F32 => v!("native_idm_f32_paged"),
         _ => return None,
     })
 }
@@ -1913,6 +1971,64 @@ pub(crate) fn native_gemm_mmq_q6k_xpg_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q6k_xpg32_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xpg32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled MXFP4 dp4a (mmq) GEMM, expert-grid variant (the MXFP4_MOE quant family's
+/// expert banks — signed E2M1 codebook → dp4a, IQ4_NL's treatment; symmetric, no `sact`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_mxfp4_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_mxfp4_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_mxfp4_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_mxfp4_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_mxfp4_xpg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_mxfp4_xpg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_mxfp4_xpg32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_mxfp4_xpg32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
+/// SPIR-V for the tiled NVFP4 dp4a (mmq) GEMM, expert-grid variant (shares MXFP4's E2M1 codebook;
+/// per-16 UE4M3 sub-block scales split each 32-block into two dp4a halves — see the shader doc).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_nvfp4_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_nvfp4_xp.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_nvfp4_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_nvfp4_xp32.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_nvfp4_xpg_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_nvfp4_xpg.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_nvfp4_xpg32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_nvfp4_xpg32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

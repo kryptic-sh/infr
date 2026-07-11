@@ -23,3 +23,6 @@ rayon.workspace = true
 
 [dev-dependencies]
 memmap2.workspace = true
+# host dequant reference for the MoE id-GEMV/mmq parity tests (synthetic quant banks vs
+# `infr_gguf::dequant::dequant_block`)
+infr-gguf.workspace = true

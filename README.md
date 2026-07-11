@@ -280,12 +280,17 @@ quant was available.
 `ffn_down_exps` banks as Q5_1, which needed its own batched-MoE mmq kernel —
 before that landed, prefill fell back to the per-token path at 0.04×.
 
-The batched-MoE dp4a mmq family now covers **every quant infr ships in expert
-banks**: Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K /
-IQ4_NL / IQ4_XS (`infr_core::tensor::MOE_MMQ_DTYPES` is the single source of
-truth both the graph-build and adapter gates derive from; `moe_mmq_drift_test`
-guards the kernel tables against drift). Remaining exotics (IQ1–IQ3, TQ\*) keep
-the per-token path.
+The MoE expert kernel floor (the id-indexed GEMV family every MoE model needs
+for decode) now covers **every weight dtype the dense Vulkan path supports** —
+all quants (Q\*, K-quants, IQ\*, TQ\*, MXFP4/NVFP4, BF16) plus F16/F32 float
+banks — so no expert-bank quant is rejected at load. On top of that, the
+batched-MoE dp4a mmq prefill family covers Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0 /
+Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ4_NL / IQ4_XS / MXFP4 / NVFP4
+(`infr_core::tensor::MOE_MMQ_DTYPES` is the single source of truth both the
+graph-build and adapter gates derive from; `moe_mmq_drift_test` guards the
+kernel tables against drift, and its doc records the deliberate exclusions: grid
+i-quants (IQ1–IQ3), ternary (TQ\*), and float banks prefill via the per-token
+id-GEMV path).
 
 infr **wins prefill on every dense model** (1.03–1.29×) and is at parity on the
 gemma-4 MoE (1.01×); the two Qwen MoEs prefill at 0.94–0.96× — correct

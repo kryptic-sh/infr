@@ -2606,9 +2606,10 @@ fn lower_op(
             // layers); Q5_K/Q6_K is what unsloth-dynamic Qwen3.6-MoE quants mix into most layers'
             // gate/up/down banks; Q2_K/Q3_K is Llama-4-Scout's shipped gate/up (Q2_K) and down
             // (Q3_K) — every dtype routes through the SAME dtype-generic `matmul_mmq_experts` dp4a
-            // kernel table, so there's no per-role dtype restriction beyond that shared set. Other
-            // codebook quants (IQ*) still have no dp4a-mmq kernel and route through the per-token
-            // path below regardless of role.
+            // kernel table, so there's no per-role dtype restriction beyond that shared set —
+            // MXFP4/NVFP4 joined it via the IQ4_NL signed-codebook treatment. The remaining
+            // non-mmq formats (grid i-quants, ternary, floats — see `MOE_MMQ_DTYPES`'s DELIBERATE
+            // EXCLUSIONS doc) route through the per-token path below regardless of role.
             //
             // Fused gate_up (diffusion-gemma): native block formats can't be split at an
             // arbitrary row offset without block-alignment gymnastics (Q4_K's superblocks straddle
@@ -2631,9 +2632,9 @@ fn lower_op(
                 // `infr_core::tensor::MOE_MMQ_DTYPES` — that's why `down_ok` already covered the
                 // wider set) and role-agnostic (gate/up/down all call the SAME function, just with
                 // a different weight handle and stride) — so gate/up get the SAME coverage as
-                // down. Other codebook quants (IQ1/IQ2/IQ3/TQ*/fp4) have no dp4a-mmq kernel at all
-                // and stay out of this set; those experts keep falling through to the per-token
-                // path below.
+                // down. The grid i-quants (IQ1/IQ2/IQ3), ternary (TQ*), and float banks have no
+                // dp4a-mmq kernel (deliberate — see `MOE_MMQ_DTYPES`'s EXCLUSIONS doc) and stay
+                // out of this set; those experts keep falling through to the per-token path below.
                 //
                 // `MOE_MMQ_DTYPES` is the SINGLE SOURCE OF TRUTH this gate and infr-llama/seam/
                 // runner.rs's `moe_mmq_ok` both derive from — see its doc for why a mismatch here

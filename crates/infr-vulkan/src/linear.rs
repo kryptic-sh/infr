@@ -27,8 +27,11 @@ use super::{as_vk_buf, be, VulkanBackend};
 // output element, 64 threads stride K, tree-reduce.
 //
 /// Return the static kernel name for a native-block GEMV (Phase 0-2).
-/// Kernel cache name for the id-indexed native GEMV (one per affine quant format); `None` for
-/// formats without an id variant.
+/// Kernel cache name for the id-indexed native GEMV; `None` only for non-weight dtypes. Covers the
+/// FULL dense native-GEMV format set (affine quants, codebook/grid i-quants, fp4, ternary, bf16)
+/// plus F16/F32 for float expert banks — resident float banks arrive as effective f16 (the seam's
+/// `bind_weight` converts and reports the effective dtype), while PAGED float banks stage raw GGUF
+/// bytes into the arena, so both float variants exist.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_id_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
@@ -45,6 +48,20 @@ pub fn native_id_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
         Q6K => "native_id_q6k",
         Iq4Nl => "native_id_iq4nl",
         Iq4Xs => "native_id_iq4xs",
+        Mxfp4 => "native_id_mxfp4",
+        Nvfp4 => "native_id_nvfp4",
+        Tq1_0 => "native_id_tq1_0",
+        Tq2_0 => "native_id_tq2_0",
+        Iq2Xxs => "native_id_iq2xxs",
+        Iq2Xs => "native_id_iq2xs",
+        Iq2S => "native_id_iq2s",
+        Iq3Xxs => "native_id_iq3xxs",
+        Iq3S => "native_id_iq3s",
+        Iq1S => "native_id_iq1s",
+        Iq1M => "native_id_iq1m",
+        Bf16 => "native_id_bf16",
+        F16 => "native_id_f16",
+        F32 => "native_id_f32",
         _ => return None,
     })
 }
@@ -66,16 +83,32 @@ pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
         Q6K => "native_idm_q6k",
         Iq4Nl => "native_idm_iq4nl",
         Iq4Xs => "native_idm_iq4xs",
+        Mxfp4 => "native_idm_mxfp4",
+        Nvfp4 => "native_idm_nvfp4",
+        Tq1_0 => "native_idm_tq1_0",
+        Tq2_0 => "native_idm_tq2_0",
+        Iq2Xxs => "native_idm_iq2xxs",
+        Iq2Xs => "native_idm_iq2xs",
+        Iq2S => "native_idm_iq2s",
+        Iq3Xxs => "native_idm_iq3xxs",
+        Iq3S => "native_idm_iq3s",
+        Iq1S => "native_idm_iq1s",
+        Iq1M => "native_idm_iq1m",
+        Bf16 => "native_idm_bf16",
+        F16 => "native_idm_f16",
+        F32 => "native_idm_f32",
         _ => return None,
     })
 }
 
 /// Whether the Vulkan MoE expert paths can dispatch a bank of this dtype AT ALL — the id-indexed
 /// GEMV kernels are the floor every MoE model needs (decode + the per-token fallback). A dtype
-/// missing here would `expect`-panic mid-inference in `linear_native_id(_multi)`; the seam's
-/// MoE binder gates on this at LOAD instead, with a clear error naming the CPU escape hatch
-/// (field report: an MXFP4_MOE quant — MXFP4 expert banks — panicked on a user's box; MXFP4 has
-/// dense kernels but no id-GEMV/mmq family yet).
+/// missing here would `expect`-panic mid-inference in `linear_native_id(_multi)`. Since the id
+/// family reached dense parity (every dense-GEMV format + F16/F32 for float banks) this is true
+/// for EVERY dtype a GGUF expert bank can hold — `moe_expert_floor_covers_dense_set` (this
+/// module's tests) pins that invariant, which let the seam's old load-time reject go (field
+/// report: an MXFP4_MOE quant panicked mid-inference before that gate existed; the gate then
+/// clean-rejected MXFP4 until the id family covered everything and the gate went dead).
 pub fn moe_expert_dtype_ok(dtype: infr_core::DType) -> bool {
     native_id_kernel_name(dtype).is_some() && native_idm_kernel_name(dtype).is_some()
 }
@@ -99,6 +132,20 @@ pub fn native_id_paged_kernel_name(dtype: infr_core::DType) -> Option<&'static s
         Q6K => "native_id_q6k_paged",
         Iq4Nl => "native_id_iq4nl_paged",
         Iq4Xs => "native_id_iq4xs_paged",
+        Mxfp4 => "native_id_mxfp4_paged",
+        Nvfp4 => "native_id_nvfp4_paged",
+        Tq1_0 => "native_id_tq1_0_paged",
+        Tq2_0 => "native_id_tq2_0_paged",
+        Iq2Xxs => "native_id_iq2xxs_paged",
+        Iq2Xs => "native_id_iq2xs_paged",
+        Iq2S => "native_id_iq2s_paged",
+        Iq3Xxs => "native_id_iq3xxs_paged",
+        Iq3S => "native_id_iq3s_paged",
+        Iq1S => "native_id_iq1s_paged",
+        Iq1M => "native_id_iq1m_paged",
+        Bf16 => "native_id_bf16_paged",
+        F16 => "native_id_f16_paged",
+        F32 => "native_id_f32_paged",
         _ => return None,
     })
 }
@@ -121,6 +168,20 @@ pub fn native_idm_paged_kernel_name(dtype: infr_core::DType) -> Option<&'static 
         Q6K => "native_idm_q6k_paged",
         Iq4Nl => "native_idm_iq4nl_paged",
         Iq4Xs => "native_idm_iq4xs_paged",
+        Mxfp4 => "native_idm_mxfp4_paged",
+        Nvfp4 => "native_idm_nvfp4_paged",
+        Tq1_0 => "native_idm_tq1_0_paged",
+        Tq2_0 => "native_idm_tq2_0_paged",
+        Iq2Xxs => "native_idm_iq2xxs_paged",
+        Iq2Xs => "native_idm_iq2xs_paged",
+        Iq2S => "native_idm_iq2s_paged",
+        Iq3Xxs => "native_idm_iq3xxs_paged",
+        Iq3S => "native_idm_iq3s_paged",
+        Iq1S => "native_idm_iq1s_paged",
+        Iq1M => "native_idm_iq1m_paged",
+        Bf16 => "native_idm_bf16_paged",
+        F16 => "native_idm_f16_paged",
+        F32 => "native_idm_f32_paged",
         _ => return None,
     })
 }
@@ -221,8 +282,8 @@ pub fn native_gemm_kernel_name(dtype: infr_core::DType) -> &'static str {
 /// (affine k-quants, legacy round, codebook i-quants, fp4, ternary, and grid i-quants). Float types
 /// (F16/F32/BF16) are not quants and stay on the plain f16 GEMV.
 ///
-/// The MoE *stacked/id-indexed* path (`native_id_*`/`native_idm_*`) is narrower — affine only; use
-/// [`native_id_kernel_name`] for that.
+/// The MoE *stacked/id-indexed* path (`native_id_*`/`native_idm_*`) covers this whole set PLUS
+/// F16/F32 (float expert banks); use [`native_id_kernel_name`] for that.
 /// Formats the `embed_gather` kernel family covers (`Op::EmbedGather` — see
 /// `gemm::embed_gather_build_spv`). The runner gates the token-ids input path on this.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -585,6 +646,34 @@ mod tests {
     /// here until this change) used to only surface as a silent decode-perf regression (GPU-
     /// resident MoE decode falling back to the host top-k path for that format), not a build/test
     /// failure — this test turns that into an immediate, CI-visible failure instead.
+    /// Pins the invariant `moe_expert_dtype_ok`'s doc promises (and the reason the seam's MoE
+    /// load-time dtype gate could be removed): EVERY dtype the dense native path supports — plus
+    /// F16/F32, the float-bank forms — has the complete id-GEMV floor: id, idm, and both paged
+    /// twins. Pure name-table lookups, no GPU.
+    #[test]
+    fn moe_expert_floor_covers_dense_set() {
+        use infr_core::DType::{self, *};
+        let all: &[DType] = &[
+            Bf16, F16, F32, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2K, Q3K, Q4K, Q5K, Q6K, Iq4Nl, Iq4Xs,
+            Mxfp4, Nvfp4, Tq1_0, Tq2_0, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq1S, Iq1M,
+        ];
+        for &d in all {
+            assert!(
+                d == F16 || d == F32 || native_dense_supported(d),
+                "{d:?} listed here but not dense-supported — update this test's set"
+            );
+            assert!(
+                moe_expert_dtype_ok(d),
+                "{d:?} is dense-supported but the MoE expert floor rejects it"
+            );
+            assert!(
+                native_id_paged_kernel_name(d).is_some()
+                    && native_idm_paged_kernel_name(d).is_some(),
+                "{d:?} has resident id kernels but no paged twins"
+            );
+        }
+    }
+
     #[test]
     fn moe_mmq_dtypes_have_id_gemv_coverage() {
         for &d in infr_core::tensor::MOE_MMQ_DTYPES {

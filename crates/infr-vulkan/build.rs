@@ -532,8 +532,8 @@ fn main() {
             &["-DFMT_Q8_0", "-DUSE_RES"],
         ),
         // Id-indexed native GEMVs for GPU-resident MoE decode (expert chosen from a GPU buffer): one
-        // .spv per affine quant format experts are stored in. Codebook/grid formats fall back to the
-        // host-top-k path, so they're omitted here.
+        // .spv per weight format experts can be stored in — the FULL dense-GEMV format set (plus
+        // F16/F32 for float banks), so `moe_expert_dtype_ok` never rejects a dense-supported bank.
         ("native_gemv_id", "native_id_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemv_id", "native_id_q4_0", &["-DFMT_Q4_0"]),
         ("native_gemv_id", "native_id_q4_1", &["-DFMT_Q4_1"]),
@@ -549,6 +549,55 @@ fn main() {
         // decode can pick an IQ4_NL/IQ4_XS expert from a GPU buffer too — previously absent).
         ("native_gemv_id", "native_id_iq4nl", &["-DFMT_IQ4NL"]),
         ("native_gemv_id", "native_id_iq4xs", &["-DFMT_IQ4XS"]),
+        // Full dense-parity id coverage (fp4 / ternary / grid i-quants / floats): every remaining
+        // dtype the dense native GEMV decodes gets its id twin so `moe_expert_dtype_ok` accepts
+        // everything dense accepts (field report: MXFP4_MOE expert banks used to be clean-rejected
+        // at load). Grid formats add -DUSE_GRID exactly like their dense builds (the codebook LUTs
+        // are compile-time consts from native_grids.glsl — no extra binding). F16/F32 serve FLOAT
+        // expert banks: resident float banks bind as effective f16 (`bind_weight` converts), paged
+        // float banks stage raw GGUF bytes — hence both variants exist.
+        ("native_gemv_id", "native_id_mxfp4", &["-DFMT_MXFP4"]),
+        ("native_gemv_id", "native_id_nvfp4", &["-DFMT_NVFP4"]),
+        ("native_gemv_id", "native_id_tq1_0", &["-DFMT_TQ1_0"]),
+        ("native_gemv_id", "native_id_tq2_0", &["-DFMT_TQ2_0"]),
+        (
+            "native_gemv_id",
+            "native_id_iq2xxs",
+            &["-DFMT_IQ2XXS", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq2xs",
+            &["-DFMT_IQ2XS", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq2s",
+            &["-DFMT_IQ2S", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq3xxs",
+            &["-DFMT_IQ3XXS", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq3s",
+            &["-DFMT_IQ3S", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq1s",
+            &["-DFMT_IQ1S", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq1m",
+            &["-DFMT_IQ1M", "-DUSE_GRID"],
+        ),
+        ("native_gemv_id", "native_id_bf16", &["-DFMT_BF16"]),
+        ("native_gemv_id", "native_id_f16", &["-DFMT_F16"]),
+        ("native_gemv_id", "native_id_f32", &["-DFMT_F32"]),
         // Paged twins (`infr_vulkan::pager::GpuPager`): one extra LUT-buffer hop, `slot =
         // lut[expert_id]` — see native_gemv_id.comp's `-DPAGED` doc comment. Same format coverage
         // as the resident-bank kernels above (the pager only ever holds native-block formats).
@@ -612,6 +661,76 @@ fn main() {
             "native_id_iq4xs_paged",
             &["-DFMT_IQ4XS", "-DPAGED"],
         ),
+        (
+            "native_gemv_id",
+            "native_id_mxfp4_paged",
+            &["-DFMT_MXFP4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_nvfp4_paged",
+            &["-DFMT_NVFP4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_tq1_0_paged",
+            &["-DFMT_TQ1_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_tq2_0_paged",
+            &["-DFMT_TQ2_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq2xxs_paged",
+            &["-DFMT_IQ2XXS", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq2xs_paged",
+            &["-DFMT_IQ2XS", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq2s_paged",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq3xxs_paged",
+            &["-DFMT_IQ3XXS", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq3s_paged",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq1s_paged",
+            &["-DFMT_IQ1S", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_iq1m_paged",
+            &["-DFMT_IQ1M", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_bf16_paged",
+            &["-DFMT_BF16", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_f16_paged",
+            &["-DFMT_F16", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id",
+            "native_id_f32_paged",
+            &["-DFMT_F32", "-DPAGED"],
+        ),
         // Multi-slot id GEMV: all n_used experts in one dispatch (concurrent, no inter-expert barrier).
         ("native_gemv_id_multi", "native_idm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemv_id_multi", "native_idm_q4_0", &["-DFMT_Q4_0"]),
@@ -625,6 +744,49 @@ fn main() {
         ("native_gemv_id_multi", "native_idm_q6k", &["-DFMT_Q6K"]),
         ("native_gemv_id_multi", "native_idm_iq4nl", &["-DFMT_IQ4NL"]),
         ("native_gemv_id_multi", "native_idm_iq4xs", &["-DFMT_IQ4XS"]),
+        // Full dense-parity idm coverage — same rationale/defines as the native_gemv_id set above.
+        ("native_gemv_id_multi", "native_idm_mxfp4", &["-DFMT_MXFP4"]),
+        ("native_gemv_id_multi", "native_idm_nvfp4", &["-DFMT_NVFP4"]),
+        ("native_gemv_id_multi", "native_idm_tq1_0", &["-DFMT_TQ1_0"]),
+        ("native_gemv_id_multi", "native_idm_tq2_0", &["-DFMT_TQ2_0"]),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2xxs",
+            &["-DFMT_IQ2XXS", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2xs",
+            &["-DFMT_IQ2XS", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s",
+            &["-DFMT_IQ2S", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs",
+            &["-DFMT_IQ3XXS", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s",
+            &["-DFMT_IQ3S", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq1s",
+            &["-DFMT_IQ1S", "-DUSE_GRID"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq1m",
+            &["-DFMT_IQ1M", "-DUSE_GRID"],
+        ),
+        ("native_gemv_id_multi", "native_idm_bf16", &["-DFMT_BF16"]),
+        ("native_gemv_id_multi", "native_idm_f16", &["-DFMT_F16"]),
+        ("native_gemv_id_multi", "native_idm_f32", &["-DFMT_F32"]),
         // Paged twins — same LUT hop as above, for the decode/small-m multi-expert dispatch.
         (
             "native_gemv_id_multi",
@@ -685,6 +847,76 @@ fn main() {
             "native_gemv_id_multi",
             "native_idm_iq4xs_paged",
             &["-DFMT_IQ4XS", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_mxfp4_paged",
+            &["-DFMT_MXFP4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_nvfp4_paged",
+            &["-DFMT_NVFP4", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_tq1_0_paged",
+            &["-DFMT_TQ1_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_tq2_0_paged",
+            &["-DFMT_TQ2_0", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2xxs_paged",
+            &["-DFMT_IQ2XXS", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2xs_paged",
+            &["-DFMT_IQ2XS", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq2s_paged",
+            &["-DFMT_IQ2S", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3xxs_paged",
+            &["-DFMT_IQ3XXS", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq3s_paged",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq1s_paged",
+            &["-DFMT_IQ1S", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_iq1m_paged",
+            &["-DFMT_IQ1M", "-DUSE_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_bf16_paged",
+            &["-DFMT_BF16", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_f16_paged",
+            &["-DFMT_F16", "-DPAGED"],
+        ),
+        (
+            "native_gemv_id_multi",
+            "native_idm_f32_paged",
+            &["-DFMT_F32", "-DPAGED"],
         ),
         // Reassociation-tolerant subgroup+NR variant of the multi-slot id GEMV (wave32, subgroupAdd,
         // no shared reduce) for the latency-STARVED Q6_K MoE expert down-projection (out_f≈2048 — the
@@ -1144,6 +1376,51 @@ fn main() {
         (
             "native_gemm_mmq_q6k",
             "native_gemm_mmq_q6k_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        // MXFP4 / NVFP4 batched expert GEMMs (the MXFP4_MOE quant family): both share the signed
+        // E2M1 codebook (kvalues_mxfp4), so they get the IQ4_NL treatment — codebook LUT → signed
+        // dp4a int path, no sact. NVFP4's per-16 UE4M3 sub-block scales split each 32-block's
+        // dp4a accumulation into two halves (see the shader doc). Same _xp/_xp32/_xpg/_xpg32
+        // variant set as every other mmq dtype.
+        (
+            "native_gemm_mmq_mxfp4",
+            "native_gemm_mmq_mxfp4_xp",
+            &["-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_mxfp4",
+            "native_gemm_mmq_mxfp4_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_mxfp4",
+            "native_gemm_mmq_mxfp4_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_mxfp4",
+            "native_gemm_mmq_mxfp4_xpg32",
+            &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_nvfp4",
+            "native_gemm_mmq_nvfp4_xp",
+            &["-DEXPERT_GRID"],
+        ),
+        (
+            "native_gemm_mmq_nvfp4",
+            "native_gemm_mmq_nvfp4_xp32",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            "native_gemm_mmq_nvfp4",
+            "native_gemm_mmq_nvfp4_xpg",
+            &["-DEXPERT_GRID", "-DPAGED"],
+        ),
+        (
+            "native_gemm_mmq_nvfp4",
+            "native_gemm_mmq_nvfp4_xpg32",
             &["-DEXPERT_GRID", "-DPAGED", "-DBM_TILE=32u"],
         ),
         ("quant_q8", "quant_q8_gather", &["-DGATHER"]),

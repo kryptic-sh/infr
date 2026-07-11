@@ -208,10 +208,13 @@ void dqblk(uint gstart, out float v[32]) {
     uint shift = 2u * ((p0 % 128u) / 32u);
     uint qw = (bd + 16u + 32u * (p0 / 128u)) >> 2u; // 84-byte blocks are word-aligned; +16+32n too
     for (uint w8 = 0u; w8 < 8u; w8++) {
-        uint word = NW(qw + w8);
+        // Hoist the plane shift to a single packed op: one shift+mask isolates all four 2-bit
+        // codes, then a per-element bitfieldExtract (1 op) replaces the >>8b >>shift &3 chain.
+        // Same integers, same v[w] expression — bit-identical to the per-element form.
+        uint q4 = (NW(qw + w8) >> shift) & 0x03030303u;
         for (uint b = 0u; b < 4u; b++) {
             uint w = w8 * 4u + b;
-            uint q2 = ((word >> (8u * b)) >> shift) & 3u;
+            uint q2 = bitfieldExtract(q4, int(8u * b), 2);
             v[w] = (w < 16u) ? (dl0 * float(q2) - ml0) : (dl1 * float(q2) - ml1);
         }
     }
@@ -248,7 +251,8 @@ float dq(uint g) {
 void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 256u) * 110u; uint p0 = gstart % 256u;
     float d_all = f16tof32(ru16(bd + 108u));
-    uint a0 = ru32b(bd + 96u); uint a1 = ru32b(bd + 100u); uint a2 = ru32b(bd + 104u);
+    // ru32u (2 word loads + funnel) instead of ru32b (4 byte-extract chains) — same value.
+    uint a0 = ru32u(bd + 96u); uint a1 = ru32u(bd + 100u); uint a2 = ru32u(bd + 104u);
     uint k1 = 0x03030303u; uint k2 = 0x0f0f0f0fu; uint tmp = a2;
     uint aux[4];
     aux[2] = ((a0 >> 4u) & k2) | (((tmp >> 4u) & k1) << 4u);
@@ -263,17 +267,22 @@ void dqblk(uint gstart, out float v[32]) {
     uint n = p0 / 128u;
     uint jj = (p0 % 128u) / 32u;
     uint shift = 2u * jj;
-    uint m = 1u << (4u * n + jj);
+    uint jg = 4u * n + jj;
     uint qb = bd + 32u + 32u * n;
     for (uint w8 = 0u; w8 < 8u; w8++) {
-        uint qword = ru32u(qb + w8 * 4u);
-        uint hword = ru32u(bd + w8 * 4u);
+        // Packed plane extraction: one shift+mask isolates the four 2-bit codes, one
+        // shift+mask+shl turns the four hmask bits into the packed +4 plane, one OR merges —
+        // the per-element >>8b>>shift&3 chain and &m!=0 compare/select drop to a single
+        // bitfieldExtract. XOR 0x04 flips the +4 plane so a SIGNED 3-bit extract yields q-4
+        // directly ((q^4) as s3 == q-4 for q in 0..7), dropping the per-element -4.0 subtract.
+        // float(int(q-4)) == float(q)-4.0 exactly (small integers) — bit-identical.
+        uint q4 = ((ru32u(qb + w8 * 4u) >> shift) & 0x03030303u)
+            | (((ru32u(bd + w8 * 4u) >> jg) & 0x01010101u) << 2u);
+        int q4s = int(q4 ^ 0x04040404u);
         for (uint b = 0u; b < 4u; b++) {
             uint w = w8 * 4u + b;
-            uint low2 = ((qword >> (8u * b)) >> shift) & 3u;
-            uint high = (((hword >> (8u * b)) & m) != 0u) ? 1u : 0u;
             float dl = (w < 16u) ? dl0 : dl1;
-            v[w] = dl * (float(low2 | (high << 2u)) - 4.0);
+            v[w] = dl * float(bitfieldExtract(q4s, int(8u * b), 3));
         }
     }
 }

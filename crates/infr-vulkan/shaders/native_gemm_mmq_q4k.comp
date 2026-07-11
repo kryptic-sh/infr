@@ -18,7 +18,10 @@
 const uint BM = BM_TILE; // row tile — 64 default, EXPERT_GRID batched-MoE callers may
                          // override smaller (e.g. 32) to fit small per-expert row counts
 
-const uint BN = 64u;
+#ifndef BN_TILE
+#define BN_TILE 64u
+#endif
+const uint BN = BN_TILE; // col tile — 64 default, EXPERT_GRID small-row callers may widen (128)
 const uint BLK = 32u;
 const uint WPB = BLK / 4u; // 8 packed-int8 u32 words per 32-block
 const uint TM = 4u;

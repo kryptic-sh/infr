@@ -5042,11 +5042,24 @@ impl<'a> Recorder<'a> {
         self.label_next(stage);
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
+        // Q4_K/Q6_K small tiles have a BN=128 wide-N twin (`_xp32w`, see build.rs): halves the
+        // workgroup count and the per-output As-staging traffic at the shallow-k 256-expert down
+        // shapes (Ornith-35B pp512 +6.5%, Qwen3.6-35B +4.5%, interleaved). Needs n%128; other
+        // n keeps the BN=64 small tile. The paged twin keeps BN=64 kernels throughout.
+        let wide_bn = small_tile
+            && n.is_multiple_of(128)
+            && matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K);
         let bm: usize = if small_tile { 32 } else { 64 };
+        let bn: usize = if wide_bn { 128 } else { 64 };
         let (name, spv, nb): (_, _, usize) = match (dtype, small_tile) {
             (infr_core::DType::Q4K, false) => (
                 "native_gemm_mmq_q4k_xp",
                 crate::gemm::native_gemm_mmq_q4k_xp_spv(),
+                7,
+            ),
+            (infr_core::DType::Q4K, true) if wide_bn => (
+                "native_gemm_mmq_q4k_xp32w",
+                crate::gemm::native_gemm_mmq_q4k_xp32w_spv(),
                 7,
             ),
             (infr_core::DType::Q4K, true) => (
@@ -5057,6 +5070,11 @@ impl<'a> Recorder<'a> {
             (infr_core::DType::Q6K, false) => (
                 "native_gemm_mmq_q6k_xp",
                 crate::gemm::native_gemm_mmq_q6k_xp_spv(),
+                6,
+            ),
+            (infr_core::DType::Q6K, true) if wide_bn => (
+                "native_gemm_mmq_q6k_xp32w",
+                crate::gemm::native_gemm_mmq_q6k_xp32w_spv(),
                 6,
             ),
             (infr_core::DType::Q6K, true) => (
@@ -5206,7 +5224,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        let gx = (rows.div_ceil(bm) * (n / 64)) as u32;
+        let gx = (rows.div_ceil(bm) * (n / bn)) as u32;
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if let Some(sa) = sact {
             bufs.push(Self::vkb(sa));

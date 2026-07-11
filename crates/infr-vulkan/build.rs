@@ -1201,9 +1201,27 @@ fn main() {
             &["-DEXPERT_GRID", "-DBM_TILE=32u"],
         ),
         (
+            // BN=128 wide-N twin of the small tile (Q4_K/Q6_K only): halves the workgroup
+            // count and the per-output As staging at the shallow-k (k=512-768) 256-expert
+            // down shapes. Selected by matmul_mmq_experts when n%128==0 (Ornith-35B pp512
+            // +6.5%, Qwen3.6-35B +4.5%, measured interleaved); n%128!=0 keeps the BN=64 tile.
+            "native_gemm_mmq_q4k",
+            "native_gemm_mmq_q4k_xp32w",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u", "-DBN_TILE=128u"],
+        ),
+        (
             "native_gemm_mmq_q6k",
             "native_gemm_mmq_q6k_xp32",
             &["-DEXPERT_GRID", "-DBM_TILE=32u"],
+        ),
+        (
+            // BN=128 wide-N twin of the small tile (Q4_K/Q6_K only): halves the workgroup
+            // count and the per-output As staging at the shallow-k (k=512-768) 256-expert
+            // down shapes. Selected by matmul_mmq_experts when n%128==0 (Ornith-35B pp512
+            // +6.5%, Qwen3.6-35B +4.5%, measured interleaved); n%128!=0 keeps the BN=64 tile.
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_xp32w",
+            &["-DEXPERT_GRID", "-DBM_TILE=32u", "-DBN_TILE=128u"],
         ),
         (
             "native_gemm_mmq_q8_0",

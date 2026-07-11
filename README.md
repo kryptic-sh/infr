@@ -260,7 +260,7 @@ prefill at 4096 KV depth (the multi-turn serve shape).
 | Qwen3-0.6B            | Q8_0        | **1.12×** | **1.06×** | **1.13×**  | **2.12×** |
 | Qwen3-0.6B            | BF16        | **1.09×** | 0.88×     | 0.94×      | **1.81×** |
 | Qwen3.5-0.8B          | Q4_K_M      | **1.01×** | **1.10×** | **1.06×**  | **1.78×** |
-| Gemma-3-1B            | Q2_K¹       | 0.37×     | 0.66×     | 0.65×      | 0.74×     |
+| Gemma-3-1B            | Q2_K¹       | **1.21×** | **1.11×** | **1.04×**  | 0.83×     |
 | Gemma-3-1B            | Q4_K_M      | **1.06×** | **1.13×** | **1.05×**  | **1.08×** |
 | Gemma-3-1B            | Q8_0        | **1.18×** | **1.07×** | 1.00×      | **1.08×** |
 | Llama-3.2-1B          | Q4_K_M      | 1.00×     | 0.96×     | 0.89×      | **1.04×** |
@@ -276,21 +276,28 @@ prefill at 4096 KV depth (the multi-turn serve shape).
 | Qwen3.5-9B (MTP)²     | UD-Q4_K_XL  | **1.15×** | 0.93×     | 0.93×      | **1.22×** |
 | Gemma-3-12B           | Q4_K_M      | **1.25×** | 1.00×     | **1.03×**  | **1.39×** |
 | Gemma-4-12B           | Q4_K_M      | **1.27×** | **1.01×** | 1.00×      | **1.40×** |
-| Qwen3-14B             | Q2_K¹       | **1.14×** | 0.68×     | 0.67×      | 0.92×     |
+| Qwen3-14B             | Q2_K¹       | **1.21×** | 0.74×     | 0.73×      | 0.96×     |
 | Qwen3-14B             | Q4_K_M      | **1.12×** | 0.92×     | 0.88×      | **1.21×** |
-| Qwen3-14B             | Q8_0¹       | 0.88×     | 0.75×     | 0.74×      | 0.81×     |
+| Qwen3-14B             | Q8_0¹       | **1.14×** | **1.02×** | 0.97×      | 0.93×     |
 | Gemma-4-26B-A4B (MoE) | UD-Q4_K_M   | 0.99×     | 0.92×     | 0.95×      | **1.16×** |
 | Qwen3.6-27B           | Q4_K_M      | **1.09×** | 0.94×     | 0.93×      | **1.14×** |
 | Qwen3-30B-A3B (MoE)   | Q4_K_M      | 0.96×     | 0.95×     | 0.93×      | **1.14×** |
 | Gemma-4-31B           | UD-Q5_K_XL³ | **0.98×** | 0.89×     | 0.08×      | 0.13×     |
-| Ornith-1.0-35B        | Q4_K_M      | 0.83×     | **1.01×** | **1.03×**  | **1.27×** |
+| Ornith-1.0-35B        | Q4_K_M¹     | 0.89×     | **1.01×** | **1.03×**  | **1.48×** |
 | Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁴   | 0.03×     | 0.50×     | 0.52×      | 0.35×     |
-| Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | 0.94×     | 0.95×     | 0.96×      | **1.46×** |
+| Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | **1.03×** | 0.98×     | 0.99×      | **1.53×** |
 
-¹ New gaps surfaced by sweeping the full quant spread, queued for the perf loop:
-gemma-3-1b **Q2_K** is wildly out of family (its Q4_K_M/Q8_0 rows win, and
-Qwen3-0.6B Q2_K is 1.28×); Qwen3-14B **Q2_K/Q8_0 decode** trails (0.67–0.75×)
-where the same file's Q4_K_M sits at 0.88–0.92×.
+¹ Rows re-measured 2026-07-12 after the quant-extreme perf slice
+(`e55d744..50059c9`): gemma-3-1b "Q2_K" (a mixed quant whose ffn/attn_q banks
+are actually **IQ4_NL** — the last 4-bit codebook format with no warp-GEMM
+family) went 0.37× → 1.21× pp512; Qwen3-14B **Q8_0** decode went 0.75× → 1.02×
+(word-parallel dqblk, ~600 → ~850 GB/s); Qwen3-14B **Q2_K** decode improved
+0.68× → 0.74× (packed bit-plane extraction) — the rest of that gap is
+llama.cpp's dp4a **mmvq** int8-activation tier, a precision trade infr
+deliberately doesn't take by default; Ornith-35B pp512 improved 0.83× → 0.89×
+(BN=128 expert tile, also +4.5% on Qwen3.6-35B) — the residual is the DeltaNet
+scan kernel (4.6× slower than llama.cpp's fused GDN, queued). Other Q8_0/Q2_K
+rows in the table predate these fixes and can only have improved.
 
 ² The MTP repos ship a `mtp-*.gguf` draft head; their `mtp128`
 speculative-decode ratio is 0.63–0.68× (4B) / 0.52–0.55× (9B) — see the MTP

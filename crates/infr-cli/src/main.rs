@@ -1106,6 +1106,12 @@ struct MtpBenchStats {
     catchup_pct: f64,
 }
 
+/// The one sentence (~10 tokens/rep) every MTP measurement decodes from, on BOTH engines
+/// ([`bench_mtp_tg`] for infr, `ModelBench::MTP_PROMPT` → llama-cli `-no-cnv` for the oracle) —
+/// α is content-sensitive, so cross-engine mtp ratios are only meaningful on shared
+/// un-templated content.
+const MTP_SENTENCE: &str = "The quick brown fox jumps over the lazy dog. ";
+
 fn bench_mtp_tg(
     model: &infr_llama::SeamModel,
     n_prompt: usize,
@@ -1114,9 +1120,8 @@ fn bench_mtp_tg(
     reps: usize,
 ) -> anyhow::Result<MtpBenchStats> {
     let head = infr_llama::mtp::load_mtp_head(model.gguf(), model.config())?;
-    let sentence = "The quick brown fox jumps over the lazy dog. "; // ~10 tokens/rep
     let want = (n_prompt + depth).max(1);
-    let prompt = sentence.repeat(want.div_ceil(10));
+    let prompt = MTP_SENTENCE.repeat(want.div_ceil(10));
     let mut samples = Vec::with_capacity(reps.max(1));
     let mut timing = infr_llama::mtp::MtpTiming::default();
     // Backend selection mirrors the rest of the CLI: INFR_METAL routes the MTP driver onto the
@@ -1937,9 +1942,14 @@ impl ModelBench {
         })
     }
 
-    /// The fixed prompt both tools' MTP arm decodes from — `docs/MTP.md`'s own oracle prompt, so
-    /// this number is directly comparable to the numbers already captured there.
-    const MTP_PROMPT: &str = "What is the capital of France?";
+    /// The fixed prompt both tools' MTP arm decodes from — the SAME raw sentence
+    /// [`bench_mtp_tg`] feeds infr's side, passed to llama-cli with `-no-cnv` so neither side
+    /// chat-templates it. MTP throughput is dominated by the accept rate α, and α is strongly
+    /// content-sensitive (greedy drafting collapses on some regimes) — the two engines are only
+    /// comparable decoding the SAME un-templated content. The previous asymmetry (infr: raw fox
+    /// sentence, α≈0.51 on the 9B; llama-cli: chat-templated "capital of France", a friendlier
+    /// regime) manufactured ~0.05-0.08 of phantom ratio gap in the sweep's mtp128 row.
+    const MTP_PROMPT: &str = MTP_SENTENCE;
 
     /// `llama-cli` sits alongside `llama-bench` in the same install (`/usr/sbin` on this box) —
     /// derive its path from `--llama-bench` instead of adding a second CLI flag: replace the
@@ -1969,7 +1979,7 @@ impl ModelBench {
                 .args(["-ngl", "99"])
                 .args(["-p", Self::MTP_PROMPT])
                 .args(["-n", &n])
-                .args(["--temp", "0", "--single-turn"])
+                .args(["--temp", "0", "--single-turn", "-no-cnv"])
                 .args(["--spec-type", "draft-mtp", "--spec-draft-n-max", "6"])
                 .output()
                 .ok()?;

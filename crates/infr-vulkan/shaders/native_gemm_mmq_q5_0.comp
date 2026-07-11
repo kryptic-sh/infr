@@ -154,7 +154,6 @@ void main() {
                 [[unroll]] for (uint j = 0u; j < TN; j++)
                     qsum[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsum[i][j]);
         }
-        barrier();
 
         float dval[TM];
         [[unroll]] for (uint i = 0u; i < TM; i++)
@@ -165,6 +164,12 @@ void main() {
                 acc[i][j] += dval[i] * dl * float(qsum[i][j]);
             }
         }
+        // Placed AFTER the shared-scale reads above (Bdl/Bmm), not after the qsum loop: every
+        // shared read of this iteration (As/Bs in qsum AND the per-col scales here) must complete
+        // before any thread loops around and restages — a barrier between qsum and this block let
+        // a fast thread overwrite Bdl/Bmm while a slow one was still reading them (data race,
+        // exposed by the BN=128 wide tile's fuller occupancy; nondeterministic expert GEMM output).
+        barrier();
     }
 
     [[unroll]] for (uint i = 0u; i < TM; i++) {

@@ -133,7 +133,16 @@ impl SlotPool {
             .map(|i| (i, score(&self.slots[i])))
             .max_by_key(|&(_, s)| s)
             .unwrap();
-        let target = if self.slots.len() < max_slots {
+        // An EMPTY slot (freshly created, or reset — e.g. by the warmup discard) holds no cached
+        // prefix worth keeping, so reusing it can never lose another conversation's KV. Prefer it
+        // (LRU first) over forking: forking here would permanently strand a whole full-ctx KV
+        // allocation per process (every `infr run` / first serve request pays one otherwise).
+        let empty = (0..self.slots.len())
+            .filter(|&i| self.slots[i].as_ref().is_none_or(|s| s.cached_len() == 0))
+            .min_by_key(|&i| self.last_used[i]);
+        let target = if let Some(i) = empty {
+            i
+        } else if self.slots.len() < max_slots {
             // Fork a fresh slot off any initialized one (shared weights, own KV). A fork that
             // fails the VRAM budget (each slot is a whole max_ctx KV cache — on a big model one
             // slot can own most of free VRAM) degrades to recycling the LRU slot instead of

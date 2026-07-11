@@ -154,6 +154,72 @@ pub(crate) fn destroy_compute_kernel(device: &ash::Device, k: &ComputeKernel) {
     }
 }
 
+/// Set-0 descriptor binding for the one-shot eager runners (`run_kernel`, `linear_wbuf`, and
+/// gemm.rs's eager/bench GEMMs). A [`ComputeKernel`]'s set layout carries PUSH_DESCRIPTOR_KHR
+/// whenever the device has `VK_KHR_push_descriptor`, and such a layout must never be passed to
+/// `vkAllocateDescriptorSets` (VUID-VkDescriptorSetAllocateInfo-pSetLayouts-00308) — so this
+/// pushes the set inside the command buffer in that case and only falls back to a pooled classic
+/// set (allocated up front from the kernel's pool) when the extension, and thus the flag, is
+/// absent. Build with [`VulkanBackend::eager_bind`]; record with [`EagerBind::bind`].
+pub(crate) struct EagerBind {
+    /// `Some` iff the device lacks push descriptors (the classic-bind fallback).
+    pooled_set: Option<vk::DescriptorSet>,
+    /// One STORAGE_BUFFER info per binding 0..n_buf; owned here so the write structs built in
+    /// [`Self::writes`] stay valid for the synchronous `one_shot` submit.
+    infos: Vec<vk::DescriptorBufferInfo>,
+}
+
+impl EagerBind {
+    fn writes(&self) -> Vec<vk::WriteDescriptorSet<'_>> {
+        self.infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                let w = vk::WriteDescriptorSet::default()
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info));
+                match self.pooled_set {
+                    Some(set) => w.dst_set(set),
+                    None => w, // push descriptors: dst_set is ignored by the spec
+                }
+            })
+            .collect()
+    }
+
+    /// Record the set-0 binding into the one-shot command buffer (push or classic, per
+    /// construction).
+    ///
+    /// # Safety
+    /// `cmd` must be in the recording state and `layout` must be `k.pipeline_layout` of the
+    /// kernel this binding was built for.
+    pub(crate) unsafe fn bind(
+        &self,
+        shared: &super::VulkanShared,
+        cmd: vk::CommandBuffer,
+        layout: vk::PipelineLayout,
+    ) {
+        match (&shared.push_descriptor, self.pooled_set) {
+            (Some(pd), _) => pd.cmd_push_descriptor_set(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &self.writes(),
+            ),
+            (None, Some(set)) => shared.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[set],
+                &[],
+            ),
+            (None, None) => unreachable!("pooled_set is Some whenever push_descriptor is None"),
+        }
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
     /// Fetch-or-build a named kernel from precompiled SPIR-V (build-compiled GLSL → `.spv`).
@@ -209,22 +275,12 @@ impl VulkanBackend {
         k
     }
 
-    /// Eagerly run a kernel: bind `inputs` (read) then one output buffer (read_write), push
-    /// `push` bytes, dispatch `groups` workgroups in x. Host-visible buffers → memcpy I/O.
-    fn run_kernel(
-        &self,
-        k: ComputeKernel,
-        inputs: &[&[f32]],
-        out_len: usize,
-        push: &[u8],
-        groups: u32,
-    ) -> Result<Vec<f32>> {
-        assert_eq!(inputs.len() + 1, k.n_buf);
-        assert_eq!(push.len() as u32, k.push_size);
-        let device = self.shared.device.clone();
-
-        // Pooled fallback (no VK_KHR_push_descriptor): allocate + write a real descriptor set
-        // up front, then just `cmd_bind_descriptor_sets` it inside the one-shot buffer below.
+    /// Build the [`EagerBind`] for one one-shot dispatch of `k`: with push descriptors the
+    /// writes are recorded later by [`EagerBind::bind`]; without, a classic set is allocated
+    /// from `k.desc_pool` (reset first — the pool holds one set) and written here.
+    pub(crate) fn eager_bind(&self, k: &ComputeKernel, bufs: &[vk::Buffer]) -> Result<EagerBind> {
+        assert_eq!(bufs.len(), k.n_buf);
+        let device = &self.shared.device;
         let pooled_set = if self.shared.push_descriptor.is_none() {
             unsafe {
                 device
@@ -243,6 +299,35 @@ impl VulkanBackend {
         } else {
             None
         };
+        let bind = EagerBind {
+            pooled_set,
+            infos: bufs
+                .iter()
+                .map(|&buffer| vk::DescriptorBufferInfo {
+                    buffer,
+                    offset: 0,
+                    range: vk::WHOLE_SIZE,
+                })
+                .collect(),
+        };
+        if bind.pooled_set.is_some() {
+            unsafe { device.update_descriptor_sets(&bind.writes(), &[]) };
+        }
+        Ok(bind)
+    }
+
+    /// Eagerly run a kernel: bind `inputs` (read) then one output buffer (read_write), push
+    /// `push` bytes, dispatch `groups` workgroups in x. Host-visible buffers → memcpy I/O.
+    fn run_kernel(
+        &self,
+        k: ComputeKernel,
+        inputs: &[&[f32]],
+        out_len: usize,
+        push: &[u8],
+        groups: u32,
+    ) -> Result<Vec<f32>> {
+        assert_eq!(inputs.len() + 1, k.n_buf);
+        assert_eq!(push.len() as u32, k.push_size);
 
         // input buffers (host-visible) + output buffer (readback)
         let mut bufs = Vec::with_capacity(k.n_buf);
@@ -259,65 +344,21 @@ impl VulkanBackend {
             .map(|b| unsafe { as_vk_buf(b.as_ref()) }.buffer)
             .chain(std::iter::once(unsafe { as_vk_buf(out.as_ref()) }.buffer))
             .collect();
-        let infos: Vec<vk::DescriptorBufferInfo> = vk_bufs
-            .iter()
-            .map(|&buffer| vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = (0..k.n_buf)
-            .map(|i| {
-                let w = vk::WriteDescriptorSet::default()
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&infos[i..i + 1]);
-                match pooled_set {
-                    Some(set) => w.dst_set(set),
-                    None => w, // push descriptors: dst_set is ignored by the spec
-                }
-            })
-            .collect();
-        if pooled_set.is_some() {
-            unsafe { device.update_descriptor_sets(&writes, &[]) };
-        }
+        let binding = self.eager_bind(&k, &vk_bufs)?;
 
-        let push_vec = push.to_vec();
-        let shared = std::sync::Arc::clone(&self.shared);
-        self.one_shot(move |cmd| unsafe {
+        let shared = &self.shared;
+        self.one_shot(|cmd| unsafe {
             shared
                 .device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
-            match (&shared.push_descriptor, pooled_set) {
-                (Some(pd), _) => {
-                    pd.cmd_push_descriptor_set(
-                        cmd,
-                        vk::PipelineBindPoint::COMPUTE,
-                        k.pipeline_layout,
-                        0,
-                        &writes,
-                    );
-                }
-                (None, Some(set)) => {
-                    shared.device.cmd_bind_descriptor_sets(
-                        cmd,
-                        vk::PipelineBindPoint::COMPUTE,
-                        k.pipeline_layout,
-                        0,
-                        &[set],
-                        &[],
-                    );
-                }
-                (None, None) => unreachable!("pooled_set is Some whenever push_descriptor is None"),
-            }
+            binding.bind(shared, cmd, k.pipeline_layout);
             if k.push_size > 0 {
                 shared.device.cmd_push_constants(
                     cmd,
                     k.pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    &push_vec,
+                    push,
                 );
             }
             shared.device.cmd_dispatch(cmd, groups, 1, 1);
@@ -345,21 +386,6 @@ impl VulkanBackend {
         push: &[u8],
     ) -> Result<Vec<f32>> {
         assert_eq!(x.len(), rows * in_f, "x must be rows*in");
-        let device = self.shared.device.clone();
-        unsafe {
-            device
-                .reset_descriptor_pool(k.desc_pool, vk::DescriptorPoolResetFlags::empty())
-                .map_err(|e| be(format!("reset pool: {e}")))?;
-        }
-        let set = unsafe {
-            device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(k.desc_pool)
-                        .set_layouts(std::slice::from_ref(&k.ds_layout)),
-                )
-                .map_err(|e| be(format!("alloc set: {e}")))?[0]
-        };
         let x_bytes: &[u8] = bytemuck::cast_slice(x);
         let buf_x = self.alloc(x_bytes.len().max(4), BufferUsage::Staging)?;
         let buf_y = self.alloc((rows * out_f * 4).max(4), BufferUsage::Readback)?;
@@ -370,38 +396,14 @@ impl VulkanBackend {
             unsafe { as_vk_buf(buf_x.as_ref()) }.buffer,
             unsafe { as_vk_buf(buf_y.as_ref()) }.buffer,
         ];
-        let infos: Vec<vk::DescriptorBufferInfo> = vk_bufs
-            .iter()
-            .map(|&buffer| vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
-            .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&infos[i..i + 1])
-            })
-            .collect();
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let binding = self.eager_bind(&k, &vk_bufs)?;
 
-        let shared = std::sync::Arc::clone(&self.shared);
-        self.one_shot(move |cmd| unsafe {
+        let shared = &self.shared;
+        self.one_shot(|cmd| unsafe {
             shared
                 .device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
-            shared.device.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                k.pipeline_layout,
-                0,
-                &[set],
-                &[],
-            );
+            binding.bind(shared, cmd, k.pipeline_layout);
             shared.device.cmd_push_constants(
                 cmd,
                 k.pipeline_layout,

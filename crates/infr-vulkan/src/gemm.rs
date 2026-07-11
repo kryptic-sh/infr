@@ -8,7 +8,7 @@ use half::f16;
 
 use infr_core::{backend::BufferUsage, error::Result, Backend};
 
-use super::{as_vk_buf, be, VulkanBackend};
+use super::{as_vk_buf, VulkanBackend};
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn spv_words(bytes: &[u8]) -> Vec<u32> {
@@ -2457,44 +2457,12 @@ impl VulkanBackend {
         self.upload(buf_b.as_ref(), bytemuck::cast_slice(&b16))
             .unwrap();
 
-        let device = self.shared.device.clone();
-        unsafe {
-            device
-                .reset_descriptor_pool(kern.desc_pool, vk::DescriptorPoolResetFlags::empty())
-                .unwrap();
-        }
-        let set = unsafe {
-            device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(kern.desc_pool)
-                        .set_layouts(std::slice::from_ref(&kern.ds_layout)),
-                )
-                .unwrap()[0]
-        };
         let bufs = [
             unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
             unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
             unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
         ];
-        let infos: Vec<vk::DescriptorBufferInfo> = bufs
-            .iter()
-            .map(|&buffer| vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
-            .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&infos[i..i + 1])
-            })
-            .collect();
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let binding = self.eager_bind(&kern, &bufs).unwrap();
 
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
@@ -2503,19 +2471,12 @@ impl VulkanBackend {
         let (gx, gy) = ((n / 64) as u32, (m / 64) as u32);
 
         let dispatch = || {
-            let shared = std::sync::Arc::clone(&self.shared);
-            self.one_shot(move |cmd| unsafe {
+            let shared = &self.shared;
+            self.one_shot(|cmd| unsafe {
                 shared
                     .device
                     .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kern.pipeline);
-                shared.device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    kern.pipeline_layout,
-                    0,
-                    &[set],
-                    &[],
-                );
+                binding.bind(shared, cmd, kern.pipeline_layout);
                 shared.device.cmd_push_constants(
                     cmd,
                     kern.pipeline_layout,
@@ -2548,63 +2509,24 @@ impl VulkanBackend {
             .unwrap();
         self.upload(buf_b.as_ref(), bytemuck::cast_slice(&b16))
             .unwrap();
-        let device = self.shared.device.clone();
-        unsafe {
-            device
-                .reset_descriptor_pool(kern.desc_pool, vk::DescriptorPoolResetFlags::empty())
-                .unwrap();
-        }
-        let set = unsafe {
-            device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(kern.desc_pool)
-                        .set_layouts(std::slice::from_ref(&kern.ds_layout)),
-                )
-                .unwrap()[0]
-        };
         let bufs = [
             unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
             unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
             unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
         ];
-        let infos: Vec<vk::DescriptorBufferInfo> = bufs
-            .iter()
-            .map(|&buffer| vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
-            .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&infos[i..i + 1])
-            })
-            .collect();
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let binding = self.eager_bind(&kern, &bufs).unwrap();
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         let (gx, gy) = ((n / 128) as u32, (m / 128) as u32);
         let dispatch = || {
-            let shared = std::sync::Arc::clone(&self.shared);
-            self.one_shot(move |cmd| unsafe {
+            let shared = &self.shared;
+            self.one_shot(|cmd| unsafe {
                 shared
                     .device
                     .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kern.pipeline);
-                shared.device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    kern.pipeline_layout,
-                    0,
-                    &[set],
-                    &[],
-                );
+                binding.bind(shared, cmd, kern.pipeline_layout);
                 shared.device.cmd_push_constants(
                     cmd,
                     kern.pipeline_layout,
@@ -2634,63 +2556,24 @@ impl VulkanBackend {
         let buf_c = self.alloc(m * n * 4, BufferUsage::Activations).unwrap();
         self.upload(buf_a.as_ref(), &vec![0u8; m * kp * 4]).unwrap();
         self.upload(buf_b.as_ref(), &vec![0u8; n * kp * 4]).unwrap();
-        let device = self.shared.device.clone();
-        unsafe {
-            device
-                .reset_descriptor_pool(kern.desc_pool, vk::DescriptorPoolResetFlags::empty())
-                .unwrap();
-        }
-        let set = unsafe {
-            device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(kern.desc_pool)
-                        .set_layouts(std::slice::from_ref(&kern.ds_layout)),
-                )
-                .unwrap()[0]
-        };
         let bufs = [
             unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
             unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
             unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
         ];
-        let infos: Vec<vk::DescriptorBufferInfo> = bufs
-            .iter()
-            .map(|&buffer| vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
-            .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&infos[i..i + 1])
-            })
-            .collect();
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let binding = self.eager_bind(&kern, &bufs).unwrap();
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(kp as u32).to_ne_bytes());
         let (gx, gy) = ((n / 64) as u32, (m / 64) as u32);
         let dispatch = || {
-            let shared = std::sync::Arc::clone(&self.shared);
-            self.one_shot(move |cmd| unsafe {
+            let shared = &self.shared;
+            self.one_shot(|cmd| unsafe {
                 shared
                     .device
                     .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kern.pipeline);
-                shared.device.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    kern.pipeline_layout,
-                    0,
-                    &[set],
-                    &[],
-                );
+                binding.bind(shared, cmd, kern.pipeline_layout);
                 shared.device.cmd_push_constants(
                     cmd,
                     kern.pipeline_layout,
@@ -2723,7 +2606,6 @@ impl VulkanBackend {
     ) -> Result<Vec<f32>> {
         assert_eq!(a.len(), m * k);
         assert_eq!(b.len(), k * n);
-        let device = self.shared.device.clone();
 
         let a16: Vec<u16> = a.iter().map(|x| f16::from_f32(*x).to_bits()).collect();
         let b16: Vec<u16> = b.iter().map(|x| f16::from_f32(*x).to_bits()).collect();
@@ -2733,69 +2615,24 @@ impl VulkanBackend {
         self.upload(buf_a.as_ref(), bytemuck::cast_slice(&a16))?;
         self.upload(buf_b.as_ref(), bytemuck::cast_slice(&b16))?;
 
-        unsafe {
-            device
-                .reset_descriptor_pool(kern.desc_pool, vk::DescriptorPoolResetFlags::empty())
-                .map_err(|e| be(format!("reset pool: {e}")))?;
-        }
-        let set = unsafe {
-            device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(kern.desc_pool)
-                        .set_layouts(std::slice::from_ref(&kern.ds_layout)),
-                )
-                .map_err(|e| be(format!("alloc set: {e}")))?[0]
-        };
-        let vk_a = unsafe { as_vk_buf(buf_a.as_ref()) }.buffer;
-        let vk_b = unsafe { as_vk_buf(buf_b.as_ref()) }.buffer;
-        let vk_c = unsafe { as_vk_buf(buf_c.as_ref()) }.buffer;
-        let infos = [
-            vk::DescriptorBufferInfo {
-                buffer: vk_a,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            },
-            vk::DescriptorBufferInfo {
-                buffer: vk_b,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            },
-            vk::DescriptorBufferInfo {
-                buffer: vk_c,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            },
+        let bufs = [
+            unsafe { as_vk_buf(buf_a.as_ref()) }.buffer,
+            unsafe { as_vk_buf(buf_b.as_ref()) }.buffer,
+            unsafe { as_vk_buf(buf_c.as_ref()) }.buffer,
         ];
-        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
-            .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&infos[i..i + 1])
-            })
-            .collect();
-        unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let binding = self.eager_bind(&kern, &bufs)?;
 
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
 
-        let shared = std::sync::Arc::clone(&self.shared);
-        self.one_shot(move |cmd| unsafe {
+        let shared = &self.shared;
+        self.one_shot(|cmd| unsafe {
             shared
                 .device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kern.pipeline);
-            shared.device.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                kern.pipeline_layout,
-                0,
-                &[set],
-                &[],
-            );
+            binding.bind(shared, cmd, kern.pipeline_layout);
             shared.device.cmd_push_constants(
                 cmd,
                 kern.pipeline_layout,

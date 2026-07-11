@@ -188,7 +188,9 @@ fn mrow_matches_single_row_gemv() {
 /// activation quantization alone puts ~1e-2 mean relative noise between the two families.)
 /// k=1536 exercises the OUTS4 layout (in_f < 2048, 48 sub-blocks); k=2048 the 2-output layout;
 /// n=66 exercises both layouts' tail guards (66 % 4 == 2 -> OUTS4's per-output `live` mask; odd
-/// out_f pairs the 2-out `has1`). m sweeps 2..8 (MRV=4 vs 8 variants).
+/// out_f pairs the 2-out `has1`). m sweeps 2..16 (MRV=4 vs 8 variants, plus the rows 9..=16
+/// MRV=16 tier — m>8 always takes the 2-output m16 variant regardless of in_f, so the k=1536
+/// OUTS4-shaped case covers that pairing too).
 #[test]
 fn mmv_mrow_matches_single_row_mmv() {
     let Ok(be) = VulkanBackend::new() else {
@@ -217,7 +219,7 @@ fn mmv_mrow_matches_single_row_mmv() {
             let w = be.alloc(wbytes, BufferUsage::Weights).unwrap();
             be.upload(w.as_ref(), &wsrc).unwrap();
             let nblk = k / 32;
-            for m in 2usize..=8 {
+            for m in 2usize..=16 {
                 let xs: Vec<f32> = (0..m * k)
                     .map(|i| ((i % 97) as f32 - 48.0) * 0.021)
                     .collect();

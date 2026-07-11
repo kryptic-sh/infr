@@ -598,6 +598,39 @@ pub(crate) fn native_mmv_mrow_variant_name(
         _ => unreachable!("native_mmv_mrow_variant_name: gated by native_mmv_mrow_build_spv"),
     }
 }
+/// SPIR-V for the rows 9..=16 multi-row int8 dp4a GEMV tier (`-DMRV=16`, 2-output layout — no
+/// OUTS4 twin: the tier is gated to >= 8M-element weights, whose in_f is comfortably >= 2048).
+/// `None` = format not covered (same coverage as [`native_mmv_mrow_build_spv`]; those shapes stay
+/// on the split-K GEMM tile).
+pub(crate) fn native_mmv_mrow_m16_spv(dtype: infr_core::DType) -> Option<&'static [u32]> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            S.get_or_init(|| {
+                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+            })
+            .as_slice()
+        }};
+    }
+    Some(match dtype {
+        Q4K => v!("native_mmv_mrow_q4k_m16"),
+        Q6K => v!("native_mmv_mrow_q6k_m16"),
+        Iq4Xs => v!("native_mmv_mrow_iq4xs_m16"),
+        _ => return None,
+    })
+}
+/// Kernel-cache name for the rows 9..=16 multi-row int8 dp4a GEMV tier.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_mmv_mrow_m16_name(dtype: infr_core::DType) -> &'static str {
+    use infr_core::DType::*;
+    match dtype {
+        Q4K => "native_mmv_mrow_q4k_m16",
+        Q6K => "native_mmv_mrow_q6k_m16",
+        Iq4Xs => "native_mmv_mrow_iq4xs_m16",
+        _ => unreachable!("native_mmv_mrow_m16_name: gated by native_mmv_mrow_m16_spv"),
+    }
+}
 /// Kernel-cache name for the int8 dp4a decode GEMV.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> &'static str {

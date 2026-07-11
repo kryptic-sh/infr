@@ -841,7 +841,28 @@ fn lower_op(
             // ALU-bound), so m=5..8 gates on out_f <= 8192 (<=128 tiles = the GEMM-underfill
             // regime). Writes exactly m rows (no padded-dst dance). Formats without an mrow
             // build fall through to the GEMM; INFR_NO_MROW forces the old route (A/B).
-            if ((2..=4).contains(&m) || ((5..=8).contains(&m) && out_f <= 8192))
+            // The int8 dp4a mrow's own gates (see the block comment below) — hoisted so the
+            // 9..=16 tier can require them UP FRONT: unlike m<=8 there is no dequant-mrow
+            // fallback above 8 rows, so entering the tier is only legal when the int8 kernel is
+            // actually dispatchable.
+            let mmv_gate = be_.caps().i8_dot
+                && in_f * out_f >= 8 << 20
+                && out_f < 65536
+                && crate::gemm::native_mmv_mrow_build_spv(dt).is_some()
+                && std::env::var("INFR_NO_MMV").is_err();
+            // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
+            // once its rollback window carries a few committed rows on top of the n_max drafts.
+            // These shapes previously fell through to the split-K coopmat tile, which streams the
+            // same weight at 2-4x the per-row cost at this m (9B mtp128 measured: q4k down-proj
+            // m=11 sk_ag 148us vs mmvr m=7 67.5us; q6k 194us). Same out_f <= 8192 wide-n cutoff
+            // as m=5..8 (the GEMM tiles win on gate_up-wide shapes), same formats as the m<=8
+            // int8 tier (others keep the GEMM route — no dequant mrow above 8 rows).
+            let mrow16 = (9..=16).contains(&m)
+                && out_f <= 8192
+                && mmv_gate
+                && crate::gemm::native_mmv_mrow_m16_spv(dt).is_some()
+                && std::env::var("INFR_NO_MROW16").is_err();
+            if ((2..=4).contains(&m) || ((5..=8).contains(&m) && out_f <= 8192) || mrow16)
                 && in_f % 32 == 0
                 && crate::gemm::native_mrow_build_spv(dt).is_some()
                 && std::env::var("INFR_NO_MROW").is_err()
@@ -864,13 +885,7 @@ fn lower_op(
                 //    dequant ALU hides fully behind the stream) — the int8 form measured a hair
                 //    SLOWER there (qwen3-0.6b pp4@d4096 931 vs 916 with lm_head included).
                 // Same INFR_NO_MMV escape as the m=1 mmv (A/B).
-                if m >= 3
-                    && be_.caps().i8_dot
-                    && in_f * out_f >= 8 << 20
-                    && out_f < 65536
-                    && crate::gemm::native_mmv_mrow_build_spv(dt).is_some()
-                    && std::env::var("INFR_NO_MMV").is_err()
-                {
+                if m >= 3 && mmv_gate {
                     let nblk = in_f / 32;
                     let qa = pooled(pool, be_, "mmvr_qa", m * in_f)?;
                     let dact = pooled(pool, be_, "mmvr_dact", m * nblk * 2)?;

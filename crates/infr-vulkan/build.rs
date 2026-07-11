@@ -1071,6 +1071,25 @@ fn main() {
             "native_mmv_mrow_iq4xs_o4_m4",
             &["-DFMT_IQ4XS", "-DOUTS4", "-DMRV=4"],
         ),
+        // rows 9..=16 tier (-DMRV=16, 2-output layout only): the MTP spec-verify batch when the
+        // rollback window has a few committed rows on top of the n_max drafts — these previously
+        // fell off the mrow tier onto the split-K coopmat tile at 2-4x the per-row cost (measured
+        // 9B mtp128: sk_ag m=11 down-proj 148us vs mmvr m=7 67.5us for the same weight stream).
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q4k_m16",
+            &["-DFMT_Q4K", "-DMRV=16"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q6k_m16",
+            &["-DFMT_Q6K", "-DMRV=16"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_iq4xs_m16",
+            &["-DFMT_IQ4XS", "-DMRV=16"],
+        ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),
         // int8 coopmat (WMMA) prefill GEMM, Q8_0 only — measurement kernel gated behind

@@ -1924,7 +1924,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        debug_assert!((2..=8).contains(&rows));
+        debug_assert!((2..=16).contains(&rows));
         self.label_gemv("mmvr", rows, in_f, out_f);
         // Small-in_f shape (in_f < 2048 → fewer than 64 32-elem sub-blocks): the 2-output wg
         // leaves 64−nsub lanes idle (E2B's in_f=1536: 25% dead, single loop iteration) — the
@@ -1937,10 +1937,22 @@ impl<'a> Recorder<'a> {
         // 37.8 → 34.7us/op, pp4 467.6 → 474.9 t/s vs both escapes set — modest; the shape is
         // ~600 GB/s and mostly weight-stream bound, o4 alone measured neutral.
         let m4 = rows <= 4 && std::env::var("INFR_NO_MMV_M4").is_err();
-        let name = crate::gemm::native_mmv_mrow_variant_name(dtype, o4, m4);
-        let spv =
-            crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4).expect("native mmv mrow spv");
-        let groups = (out_f as u32).div_ceil(if o4 { 4 } else { 2 });
+        // rows 9..=16 tier (-DMRV=16, always the 2-output layout — no OUTS4 twin; see
+        // `native_mmv_mrow_m16_spv`): the MTP verify batch above the m<=8 tier. Caller gates on
+        // the m16 SPIR-V existing for `dtype`.
+        let (name, spv) = if rows > 8 {
+            (
+                crate::gemm::native_mmv_mrow_m16_name(dtype),
+                crate::gemm::native_mmv_mrow_m16_spv(dtype).expect("native mmv mrow m16 spv"),
+            )
+        } else {
+            (
+                crate::gemm::native_mmv_mrow_variant_name(dtype, o4, m4),
+                crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4)
+                    .expect("native mmv mrow spv"),
+            )
+        };
+        let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
         let k = self.be.kernel(name, spv, 5, 16);
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());

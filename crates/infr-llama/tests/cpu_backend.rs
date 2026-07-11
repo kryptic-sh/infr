@@ -1786,6 +1786,116 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
     );
 }
 
+/// Dense layer streaming (`infr_vulkan::pager::DensePagerSession`, wired via `INFR_CACHE` on a
+/// DENSE model): a tiny forced budget streams (nearly) every per-layer Linear weight group
+/// through the cyclic-sweep pager, and the greedy output must be IDENTICAL, token-for-token, to
+/// both the all-resident GPU run and the CPU reference — the streamed dispatch is the SAME
+/// kernels reading the same bytes at an arena element offset, so any divergence is a real bug
+/// (slot misalignment, stale slot, ring lifetime), not precision.
+///
+/// Qwen3-1.7B-Q4_K_M exercises the SPLIT q/k/v form (this unsloth quant mixes attn_v dtypes
+/// across layers, so `fuse_qkv_decision` is false) plus a fused gate_up block and mixed
+/// Q4_K/Q6_K pools; the 14B test below covers the fused-qkv form.
+#[test]
+fn gpu_seam_dense_stream_matches_resident_and_cpu() {
+    let path = need_model!(qwen3_17b(), "Qwen3-1.7B");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let n = 8usize;
+
+    let model = infr_llama::SeamModel::load(&path, None).expect("load");
+    let rendered = model
+        .render_chat("What is 2+2? Answer briefly.")
+        .expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+
+    let mut cpu_ids = Vec::new();
+    model
+        .generate_cpu_ids(&prompt_ids, n, |id| cpu_ids.push(id))
+        .expect("cpu gen");
+
+    std::env::remove_var("INFR_CACHE");
+    let mut resident_ids = Vec::new();
+    model
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+
+    // 0.2 GB is far below the model's ~1.4 GB of streamable projections — every pool runs at its
+    // floor slot count, so (nearly) every layer re-uploads every pass: real eviction pressure.
+    std::env::set_var("INFR_CACHE", "200m");
+    std::env::set_var("INFR_PAGER_STATS", "1");
+    let mut streamed_ids = Vec::new();
+    let streamed_result = model.generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id));
+    std::env::remove_var("INFR_CACHE");
+    std::env::remove_var("INFR_PAGER_STATS");
+    streamed_result.expect("streamed gpu gen");
+
+    assert_eq!(
+        streamed_ids, resident_ids,
+        "dense streaming diverged from the all-resident GPU run"
+    );
+    assert_eq!(
+        streamed_ids, cpu_ids,
+        "dense streaming diverged from the CPU reference"
+    );
+}
+
+fn qwen3_17b() -> Option<PathBuf> {
+    find_gguf("unsloth--Qwen3-1.7B-GGUF", "Qwen3-1.7B-Q4_K_M.gguf")
+}
+
+fn qwen3_14b_q8() -> Option<PathBuf> {
+    find_gguf("unsloth--Qwen3-14B-GGUF", "Qwen3-14B-Q8_0.gguf")
+}
+
+/// The BIG dense streaming shape: Qwen3-14B Q8_0 (~15.7 GB — genuinely more than an 8 GB budget)
+/// with fused qkv AND fused gate_up blocks (uniform Q8_0 passes both fuse gates), streamed vs
+/// fully resident. Same token-identity bar as the 1.7B test; CPU included (Q8_0 int dots on both
+/// sides — the 14B CPU run is ~15 s of the suite, the price of a real >budget model check).
+#[test]
+fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
+    let path = need_model!(qwen3_14b_q8(), "Qwen3-14B-Q8_0");
+    need_gpu!();
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let n = 8usize;
+
+    let model = infr_llama::SeamModel::load(&path, None).expect("load");
+    let rendered = model
+        .render_chat("What is 2+2? Answer briefly.")
+        .expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+
+    let mut cpu_ids = Vec::new();
+    model
+        .generate_cpu_ids(&prompt_ids, n, |id| cpu_ids.push(id))
+        .expect("cpu gen");
+
+    std::env::remove_var("INFR_CACHE");
+    let mut resident_ids = Vec::new();
+    model
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+
+    std::env::set_var("INFR_CACHE", "8g");
+    std::env::set_var("INFR_PAGER_STATS", "1");
+    let mut streamed_ids = Vec::new();
+    let streamed_result = model.generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id));
+    std::env::remove_var("INFR_CACHE");
+    std::env::remove_var("INFR_PAGER_STATS");
+    streamed_result.expect("streamed gpu gen");
+
+    assert_eq!(
+        streamed_ids, resident_ids,
+        "dense streaming diverged from the all-resident GPU run (14B)"
+    );
+    assert_eq!(
+        streamed_ids, cpu_ids,
+        "dense streaming diverged from the CPU reference (14B)"
+    );
+}
+
 /// CPU-only: Gemma 4 E2B golden-hash lock.
 #[test]
 fn cpu_golden_gemma4_e2b() {

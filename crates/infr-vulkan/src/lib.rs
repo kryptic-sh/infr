@@ -362,6 +362,44 @@ pub struct VulkanBackend {
     shared: Arc<VulkanShared>,
 }
 
+/// Device-local VRAM info for a backend's shared state — the body of [`VulkanBackend::vram`],
+/// factored out so scopes that only hold the `Arc<VulkanShared>` (e.g. [`WeightProgress`]'s
+/// post-load log) can read it too.
+fn vram_info(s: &VulkanShared) -> VramInfo {
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+    if s.has_mem_budget {
+        props2 = props2.push_next(&mut budget);
+    }
+    unsafe {
+        s.instance
+            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
+    };
+    let mp = props2.memory_properties;
+    let mut total = 0u64;
+    let mut available = 0u64;
+    for i in 0..mp.memory_heap_count as usize {
+        if mp.memory_heaps[i]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+        {
+            total += mp.memory_heaps[i].size;
+            available += if s.has_mem_budget {
+                budget.heap_budget[i]
+                    .saturating_sub(budget.heap_usage[i])
+                    .min(mp.memory_heaps[i].size)
+            } else {
+                mp.memory_heaps[i].size
+            };
+        }
+    }
+    VramInfo {
+        total,
+        available,
+        live: s.has_mem_budget,
+    }
+}
+
 /// RAII scope for a weight-load progress bar (see [`VulkanBackend::weight_progress`]). While alive,
 /// `BufferUsage::Weights` allocations advance the bar; on drop it finishes and clears it.
 pub struct WeightProgress {
@@ -373,6 +411,20 @@ impl Drop for WeightProgress {
     fn drop(&mut self) {
         if let Some(pb) = self.shared.weight_pb.lock().unwrap().take() {
             pb.finish_and_clear();
+        }
+        // Post-load memory-hygiene visibility (INFR_VRAM_LOG=1): the LIVE in-use figure right
+        // after the LAST weight upload — the number the VRAM-audit residual math (in-use minus
+        // weights+KV estimate) starts from. The upload staging that ran under this scope was
+        // dedicated-allocated (see `Backend::upload`), so by this drop it has fully returned
+        // its device memory; what remains is weights + already-allocated session buffers.
+        if std::env::var("INFR_VRAM_LOG").is_ok() {
+            let v = vram_info(&self.shared);
+            eprintln!(
+                "post-load vram in use: {:.2} GiB of {:.2} GiB ({})",
+                v.total.saturating_sub(v.available) as f64 / (1u64 << 30) as f64,
+                v.total as f64 / (1u64 << 30) as f64,
+                if v.live { "live" } else { "tracked" },
+            );
         }
     }
 }
@@ -1071,39 +1123,7 @@ impl VulkanBackend {
     /// made `available` sit ~constant while we allocated GBs, which let the VRAM guard sail past
     /// a 53 GiB KV cache into VK_ERROR_DEVICE_LOST.
     pub fn vram(&self) -> VramInfo {
-        let s = &self.shared;
-        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-        let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
-        if s.has_mem_budget {
-            props2 = props2.push_next(&mut budget);
-        }
-        unsafe {
-            s.instance
-                .get_physical_device_memory_properties2(s.physical_device, &mut props2)
-        };
-        let mp = props2.memory_properties;
-        let mut total = 0u64;
-        let mut available = 0u64;
-        for i in 0..mp.memory_heap_count as usize {
-            if mp.memory_heaps[i]
-                .flags
-                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-            {
-                total += mp.memory_heaps[i].size;
-                available += if s.has_mem_budget {
-                    budget.heap_budget[i]
-                        .saturating_sub(budget.heap_usage[i])
-                        .min(mp.memory_heaps[i].size)
-                } else {
-                    mp.memory_heaps[i].size
-                };
-            }
-        }
-        VramInfo {
-            total,
-            available,
-            live: s.has_mem_budget,
-        }
+        vram_info(&self.shared)
     }
 
     /// VRAM budget guard: hard-error BEFORE a device-local allocation of `want` bytes that would
@@ -1216,6 +1236,26 @@ impl VulkanBackend {
     }
 
     fn make_buf(&self, size: usize, location: MemoryLocation, label: &str) -> Result<VkBuffer> {
+        self.make_buf_ex(size, location, label, false)
+    }
+
+    /// [`make_buf`](Self::make_buf) with an explicit dedicated-allocation override. Post-load
+    /// memory hygiene: `force_dedicated` bypasses gpu-allocator's general (sub-allocating)
+    /// memory blocks entirely, so a TRANSIENT buffer frees its `VkDeviceMemory` fully on drop.
+    /// Without it, sub-block transients grow general blocks the allocator then RETAINS: the
+    /// vendored gpu-allocator (0.27) frees an emptied general block only while another general
+    /// block exists in the same memory type (`active_general_blocks > 1` in its `free()`), and
+    /// exposes no purge/trim API — so the last 64 MiB host-visible block (and a 256 MiB
+    /// device-local one) would sit empty in the ReBAR heap for the whole session. Used by the
+    /// weight-upload staging path below; never on a per-token path (a dedicated allocation costs
+    /// a `vkAllocateMemory`, fine once per tensor at load, wrong per token).
+    fn make_buf_ex(
+        &self,
+        size: usize,
+        location: MemoryLocation,
+        label: &str,
+        force_dedicated: bool,
+    ) -> Result<VkBuffer> {
         let buf_ci = vk::BufferCreateInfo::default()
             .size(size as u64)
             .usage(BUFFER_USAGE)
@@ -1280,7 +1320,7 @@ impl VulkanBackend {
         // KV buffers per block leave ~55MB unused — ~0.7GB across a long-context KV cache). Small/
         // transient buffers stay sub-allocated (cheap, pooled).
         const DEDICATED_MIN: u64 = 32 * 1024 * 1024;
-        let scheme = if requirements.size >= DEDICATED_MIN {
+        let scheme = if force_dedicated || requirements.size >= DEDICATED_MIN {
             AllocationScheme::DedicatedBuffer(buffer)
         } else {
             AllocationScheme::GpuAllocatorManaged
@@ -1537,8 +1577,18 @@ impl Backend for VulkanBackend {
                 .ok_or_else(|| be("CpuToGpu buffer is not persistently mapped"))?;
             unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len()) };
         } else {
-            // Staging path: CPU → staging → device-local.
-            let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_staging")?;
+            // Staging path: CPU → staging → device-local. During a WEIGHT LOAD (progress scope
+            // active — the single funnel every model load opens), the staging is a DEDICATED
+            // allocation so it frees fully on drop instead of leaving retained empty general
+            // blocks in the ReBAR device-local host-visible heap after the last upload (see
+            // `make_buf_ex`'s doc — the vendored gpu-allocator has no way to release those).
+            let dedicated = self.shared.weight_pb.lock().unwrap().is_some();
+            let staging = self.make_buf_ex(
+                src.len(),
+                MemoryLocation::CpuToGpu,
+                "upload_staging",
+                dedicated,
+            )?;
             let stg_ptr = staging
                 .mapped_ptr()
                 .ok_or_else(|| be("staging buffer is not mapped"))?;

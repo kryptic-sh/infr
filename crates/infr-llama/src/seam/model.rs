@@ -393,6 +393,11 @@ impl SeamModel {
         // request's activation alloc (observed as a 500), so reserve generously: max(1 GiB,
         // total/12) — ~2 GiB on a 24 GiB card, 1 GiB floor on small ones. Over-clamping is safe;
         // under-clamping errors requests.
+        // 2026-07 re-audit (after dedicated weight-upload staging landed in infr-vulkan): /sys
+        // VRAM watermarks on the 14B (Q4_K_M) and gemma-4-31B (UD-Q5_K_XL) loads were unchanged
+        // to within ~0.2 MiB — the residual this reserve absorbs is warmup activation pools,
+        // gpu-allocator block granularity, and driver internals, NOT reclaimable staging, so
+        // the total/12 headroom stays.
         let vram = vk.vram();
         let mut act_headroom: u64 = (vram.total / 12).max(1024 * 1024 * 1024);
         // Keep the clamp CONSISTENT with the dense placement decision (`vulkan_moe_binder`'s

@@ -63,6 +63,9 @@ Fine-tunes on any of these backbones run unchanged. **Ornith-1.0**
 (DeepReinforce.AI agentic-coding) validated 2026-07-09 — the 9B rides `qwen35`
 and the 35B rides `qwen35moe` with no code changes
 (`infr run deepreinforce-ai/Ornith-1.0-9B-GGUF:Q4_K_M "..."`).
+**Ternary-Bonsai** (Prism ML, weights trained to {-1, 0, +1}) validated
+2026-07-12 — the 1.7B/4B ride `qwen3` zero-code in the TQ2_0 repack
+(`superkaiii/Ternary-Bonsai-4B-GGUF`).
 
 ```bash
 # Qwen3 dense

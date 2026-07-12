@@ -12,8 +12,12 @@
 // words read once for both outputs — same grid halving as `native_mmv.comp`.
 // Reduction: per-row subgroupAdd + one shared combine across waves (the mrow pattern — its 8-row
 // shared-tree replacement measured as the real cost there; see native_gemv_mrow.comp's header).
-// -DFMT_Q4K / -DFMT_Q6K select the weight format (the two formats a Q4_K_M/Q6_K model's
-// projections use — others keep the dequant mrow fallback).
+// -DFMT_Q4K / -DFMT_Q6K / -DFMT_Q2K / -DFMT_Q3K select the weight format (the formats with a
+// symmetric-int8 tier on either the decode `mmv_mw` or the verify `mrow` side — see adapter.rs's
+// `mmv_mw_choice`/`mmv_gate` doc for the per-dtype policy table; others keep the dequant mrow
+// fallback). Q2_K/Q3_K's dequant math is a direct port of `native_mmv_mw.comp`'s already
+// host-reference-validated FMT_Q2K/FMT_Q3K `dpsub` (see `mmv_mw_q2k_q3k_match_host_reference`) —
+// weight-only unpack hoisted out of the per-row loop the same way Q4_K/Q6_K already are here.
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_integer_dot_product : require
@@ -44,6 +48,20 @@ shared float part[2u * MR * MAX_SG];     // one partial per (output, row, subgro
 uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+// Shared by Q6_K and Q3_K's wdec (both re-bias an unsigned scale byte to signed) — unconditional
+// since each SPV build activates exactly one FMT_* define, so there is never a redefinition.
+int sgn8(uint b) { return int(b) - ((b > 127u) ? 256 : 0); }
+
+#ifdef FMT_Q3K
+// Unaligned u32 via two word loads + funnel shift (Q3_K's 110-byte blocks are only 2-aligned) —
+// same helper as native_mmv_mw.comp's FMT_Q3K.
+uint ru32u(uint byte) {
+    uint w0 = nw[byte >> 2u];
+    uint sh = (byte & 3u) << 3u;
+    if (sh == 0u) { return w0; }
+    return (w0 >> sh) | (nw[(byte >> 2u) + 1u] << (32u - sh));
+}
+#endif
 
 #ifdef FMT_Q4K
 // Q4_K 6-bit scale/min for sub-block i from the 12-byte scales field at sb.
@@ -80,8 +98,6 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 // Q6_K: [u8 ql[128]][u8 qh[64]][i8 scales[16]][f16 d] = 210 bytes, 256 elements. The i8 scale
 // covers 16 elements, so the 32-block splits into two dp4a groups (words 0..3 / 4..7): f0 = d·sc0,
 // f1 = d·sc1. The 6-bit q re-biases to signed (q−32) at pack time — no min/Σa term.
-int sgn8(uint b) { return int(b) - ((b > 127u) ? 256 : 0); }
-
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 256u) * 210u;
     uint p0 = gelem % 256u;
@@ -103,6 +119,47 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     }
     f0 = d * float(sgn8(rb(scbase)));
     f1 = d * float(sgn8(rb(scbase + 1u)));
+}
+#endif
+
+#ifdef FMT_Q3K
+// Q3_K: [u8 hmask[32]][u8 qs[64]][u8 scales_raw[12]][f16 d] = 110 bytes, 256 elements. The 6-bit
+// scale covers 16 elements → two dp4a groups per 32-block; q = (low2 | hbit<<2) − 4 is SYMMETRIC
+// (∈ −4..3, fits a signed byte) so there is no min/Σa term — same f0/f1 shape as Q6_K's wdec.
+// Bit math is a direct port of native_mmv_mw.comp's FMT_Q3K `dpsub` (host-reference-validated by
+// `mmv_mw_q2k_q3k_match_host_reference`), just hoisting the weight-only unpack out of the
+// per-row loop into a once-per-sub-block qp[8] + (f0,f1) pair, same shape as this file's Q4_K/Q6_K.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 256u) * 110u;
+    uint p0 = gelem % 256u;
+    float d_all = f16tof32(ru16(bd + 108u));
+    uint a0 = ru32u(bd + 96u); uint a1 = ru32u(bd + 100u); uint a2 = ru32u(bd + 104u);
+    uint k1 = 0x03030303u; uint k2 = 0x0f0f0f0fu;
+    uint aux0 = (a0 & k2) | ((a2 & k1) << 4u);
+    uint aux1 = (a1 & k2) | (((a2 >> 2u) & k1) << 4u);
+    uint aux2 = ((a0 >> 4u) & k2) | (((a2 >> 4u) & k1) << 4u);
+    uint aux3 = ((a1 >> 4u) & k2) | (((a2 >> 6u) & k1) << 4u);
+    uint aux[4] = uint[4](aux0, aux1, aux2, aux3);
+    uint is0 = p0 / 16u;
+    uint sb0 = (aux[is0 >> 2u] >> ((is0 & 3u) * 8u)) & 0xFFu;
+    uint sb1 = (aux[(is0 + 1u) >> 2u] >> (((is0 + 1u) & 3u) * 8u)) & 0xFFu;
+    f0 = d_all * float(sgn8(sb0) - 32);
+    f1 = d_all * float(sgn8(sb1) - 32);
+    uint n = p0 / 128u;
+    uint jj = (p0 % 128u) / 32u;
+    uint shift = 2u * jj;
+    uint jg = 4u * n + jj;          // hmask bit index for this run
+    uint qb = bd + 32u + 32u * n;   // low-2-bit byte base for this run
+    for (uint j = 0u; j < 8u; j++) {
+        uint q4 = ((ru32u(qb + j * 4u) >> shift) & 0x03030303u)
+            | (((ru32u(bd + j * 4u) >> jg) & 0x01010101u) << 2u);
+        uint w = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint q = (q4 >> (8u * b)) & 7u;
+            w |= ((q - 4u) & 0xFFu) << (8u * b); // two's-complement signed byte, q−4 ∈ −4..3
+        }
+        qp[j] = w;
+    }
 }
 #endif
 
@@ -144,6 +201,33 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 }
 #endif
 
+#ifdef FMT_Q2K
+// Q2_K: [u8 scales[16]][u8 qs[64]][f16 d][f16 dmin] = 84 bytes, 256 elements. Each 16-elem group
+// has its own 4-bit scale|min nibble pair — a Q4_K-shaped min term, but split per HALF of the
+// 32-block (dl0/ml0 for elems 0..15, dl1/ml1 for elems 16..31) rather than Q4_K's one pair per
+// whole 32-block. That doesn't fit the shared f0/f1 `wdec` interface above (needs 4 scalars, not
+// 2), so Q2_K gets its own `wdec2k` + a dedicated accumulation branch in main() below. Direct port
+// of native_mmv_mw.comp's FMT_Q2K `dpsub` (host-reference-validated), weight-only unpack hoisted
+// out of the per-row loop the same way. The min term needs PER-16 activation sums, which the
+// per-32-block `sact` can't split — same as the m=1 kernel, sub-sums are recomputed per row via
+// dp4a against packed ones (0x01010101).
+void wdec2k(uint gelem, out uint qp[8], out float dl0, out float ml0, out float dl1, out float ml1) {
+    uint bd = (gelem / 256u) * 84u;
+    uint p0 = gelem % 256u;
+    float d = f16tof32(ru16(bd + 80u));
+    float dmin = f16tof32(ru16(bd + 82u));
+    uint sb0 = rb(bd + p0 / 16u);        // scale|min nibbles for elems 0..15
+    uint sb1 = rb(bd + p0 / 16u + 1u);   // … and 16..31
+    dl0 = d * float(sb0 & 0xFu);  ml0 = dmin * float(sb0 >> 4u);
+    dl1 = d * float(sb1 & 0xFu);  ml1 = dmin * float(sb1 >> 4u);
+    uint shift = 2u * ((p0 % 128u) / 32u);
+    uint qw = (bd + 16u + 32u * (p0 / 128u)) >> 2u; // aligned word base of this run's 2-bit codes
+    for (uint j = 0u; j < 8u; j++) {
+        qp[j] = (nw[qw + j] >> shift) & 0x03030303u; // four 2-bit codes, one per byte (0..3)
+    }
+}
+#endif
+
 #ifdef OUTS4
 // Small-in_f shape (-DOUTS4, host-gated to in_f < 2048): 4 outputs × 16 K-lanes per workgroup
 // (grid = ceil(out_f/4)). The 2-output layout leaves 64 − nsub lanes IDLE when nsub < 64 (E2B's
@@ -166,8 +250,13 @@ void main() {
     float acc[MR];
     for (uint r = 0u; r < MR; r++) { acc[r] = 0.0; }
     for (uint s = sl; s < nsub; s += 16u) {
+#ifdef FMT_Q2K
+        uint qp[8]; float dl0; float ml0; float dl1; float ml1;
+        wdec2k(wb + s * 32u, qp, dl0, ml0, dl1, ml1);
+#else
         uint qp[8]; float f0; float f1;
         wdec(wb + s * 32u, qp, f0, f1);
+#endif
         for (uint r = 0u; r < MR; r++) {
             if (r < pc.rows) {
                 float da = float(dact[r * nsub + s]);
@@ -186,8 +275,28 @@ void main() {
                 dp = dotPacked4x8AccSatEXT(int(qp[6]), int(a1.z), dp);
                 dp = dotPacked4x8AccSatEXT(int(qp[7]), int(a1.w), dp);
                 acc[r] += f0 * da * float(dp) - f1 * sa;
+#elif defined(FMT_Q2K)
+                int dp0 = 0; int dp1 = 0; int s0 = 0; int s1 = 0;
+                dp0 = dotPacked4x8AccSatEXT(int(qp[0]), int(a0.x), dp0);
+                dp0 = dotPacked4x8AccSatEXT(int(qp[1]), int(a0.y), dp0);
+                dp0 = dotPacked4x8AccSatEXT(int(qp[2]), int(a0.z), dp0);
+                dp0 = dotPacked4x8AccSatEXT(int(qp[3]), int(a0.w), dp0);
+                dp1 = dotPacked4x8AccSatEXT(int(qp[4]), int(a1.x), dp1);
+                dp1 = dotPacked4x8AccSatEXT(int(qp[5]), int(a1.y), dp1);
+                dp1 = dotPacked4x8AccSatEXT(int(qp[6]), int(a1.z), dp1);
+                dp1 = dotPacked4x8AccSatEXT(int(qp[7]), int(a1.w), dp1);
+                s0 = dotPacked4x8AccSatEXT(0x01010101, int(a0.x), s0);
+                s0 = dotPacked4x8AccSatEXT(0x01010101, int(a0.y), s0);
+                s0 = dotPacked4x8AccSatEXT(0x01010101, int(a0.z), s0);
+                s0 = dotPacked4x8AccSatEXT(0x01010101, int(a0.w), s0);
+                s1 = dotPacked4x8AccSatEXT(0x01010101, int(a1.x), s1);
+                s1 = dotPacked4x8AccSatEXT(0x01010101, int(a1.y), s1);
+                s1 = dotPacked4x8AccSatEXT(0x01010101, int(a1.z), s1);
+                s1 = dotPacked4x8AccSatEXT(0x01010101, int(a1.w), s1);
+                acc[r] += da * (dl0 * float(dp0) + dl1 * float(dp1))
+                        - da * (ml0 * float(s0) + ml1 * float(s1));
 #else
-                // Q6_K: split dot per 16-elem scale group (uvec4 a0 / a1); no min term.
+                // Q6_K/Q3_K: split dot per 16-elem scale group (uvec4 a0 / a1); no min term.
                 int dpa = 0; int dpb = 0;
                 dpa = dotPacked4x8AccSatEXT(int(qp[0]), int(a0.x), dpa);
                 dpa = dotPacked4x8AccSatEXT(int(qp[1]), int(a0.y), dpa);
@@ -236,10 +345,17 @@ void main() {
     float acc1[MR];
     for (uint r = 0u; r < MR; r++) { acc0[r] = 0.0; acc1[r] = 0.0; }
     for (uint s = t; s < nsub; s += 64u) {
+#ifdef FMT_Q2K
+        uint qp0[8]; float dl00; float ml00; float dl10; float ml10;
+        wdec2k(wb0 + s * 32u, qp0, dl00, ml00, dl10, ml10);
+        uint qp1[8]; float dl01 = 0.0; float ml01 = 0.0; float dl11 = 0.0; float ml11 = 0.0;
+        if (has1) { wdec2k(wb0 + pc.in_f + s * 32u, qp1, dl01, ml01, dl11, ml11); }
+#else
         uint qp0[8]; float a0; float b0;
         wdec(wb0 + s * 32u, qp0, a0, b0);
         uint qp1[8]; float a1 = 0.0; float b1 = 0.0;
         if (has1) { wdec(wb0 + pc.in_f + s * 32u, qp1, a1, b1); }
+#endif
         for (uint r = 0u; r < MR; r++) {
             if (r < pc.rows) {
                 float da = float(dact[r * nsub + s]);
@@ -257,8 +373,27 @@ void main() {
                 }
                 acc0[r] += a0 * da * float(dp0) - b0 * sa;
                 if (has1) { acc1[r] += a1 * da * float(dp1) - b1 * sa; }
+#elif defined(FMT_Q2K)
+                int dp0a = 0; int dp0b = 0; int dp1a = 0; int dp1b = 0;
+                int s0a = 0; int s0b = 0;
+                for (uint j = 0u; j < 4u; j++) {
+                    dp0a = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0a);
+                    if (has1) { dp1a = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1a); }
+                    s0a = dotPacked4x8AccSatEXT(0x01010101, aw[j], s0a);
+                }
+                for (uint j = 4u; j < 8u; j++) {
+                    dp0b = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0b);
+                    if (has1) { dp1b = dotPacked4x8AccSatEXT(int(qp1[j]), aw[j], dp1b); }
+                    s0b = dotPacked4x8AccSatEXT(0x01010101, aw[j], s0b);
+                }
+                acc0[r] += da * (dl00 * float(dp0a) + dl10 * float(dp0b))
+                         - da * (ml00 * float(s0a) + ml10 * float(s0b));
+                if (has1) {
+                    acc1[r] += da * (dl01 * float(dp1a) + dl11 * float(dp1b))
+                             - da * (ml01 * float(s0a) + ml11 * float(s0b));
+                }
 #else
-                // Q6_K: split dot per 16-elem scale group (words 0..3 / 4..7); no min term.
+                // Q6_K/Q3_K: split dot per 16-elem scale group (words 0..3 / 4..7); no min term.
                 int dp0a = 0; int dp0b = 0; int dp1a = 0; int dp1b = 0;
                 for (uint j = 0u; j < 4u; j++) {
                     dp0a = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0a);

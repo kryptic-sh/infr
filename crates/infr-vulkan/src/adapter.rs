@@ -377,41 +377,71 @@ fn mmv_decode_enabled() -> bool {
 /// (raw int8 blocks, no f32 dequant) breaks the ceiling: Qwen3-1.7B Q4_K_M tg128 17.9 → 61.7 t/s
 /// isolated (3.4x), 0.11x → ~0.5x of llama.cpp.
 ///
-/// DEFAULT-ON on Intel (`caps.vendor_intel`), opt-in (`INFR_MMV_MW=1`) elsewhere,
-/// `INFR_MMV_MW=0` force-off everywhere. Precision: dp4a's int8-activation quant is coarser than
-/// the scalar default and forks from the f32 CPU oracle earlier — the same mmvq precision tier
-/// llama.cpp ships as ITS Intel default (their measured MMVQ table, ggml-vulkan.cpp:8886), but
-/// below infr's stricter token-for-token / deep-KV-Q8 coherence bar — which is exactly why AMD
-/// keeps the scalar default (51a35c8: scalar was ALSO faster there) and why the Intel default is
-/// the llama-parity call, not a universal one. Validated by `mmv_mw_parity` (matches `native_mmv`
-/// ≤5e-3) + the Q2K/Q3K host-reference parity/determinism tests.
+/// Per-(dtype, vendor) decode-int8 DEFAULT policy — a llama.cpp-style table
+/// (`ggml_vk_should_use_mmvq`, `ggml-vulkan.cpp:8877`), but each entry is a number MEASURED on
+/// infr's own kernels/hardware, not assumed from llama.cpp's table (their dp4a mmvq kernel and
+/// infr's mmv_mw are different code with different per-dispatch overhead, so a win on one engine
+/// doesn't imply a win on the other):
 ///
-/// Dtypes follow llama.cpp's measured Intel table: Q4_K/Q6_K (Q6_K is an Intel win even on Xe1)
-/// plus Q2_K/Q3_K (Xe2 always-MMVQ). Q4_0/Q5_1 are deliberately ABSENT (measured losses on A770
-/// Linux). AMD default (env unset) returns None → its decode path is byte-identical (zero
-/// regression by construction); explicit `INFR_MMV_MW=1` works on any backend device for A/B
-/// (every accepted device can pin 32). `INFR_MMV_MW_WARPS` ∈ {4,8}.
+/// - **Intel**: Q4_K/Q6_K/Q2_K/Q3_K all measured wins (unchanged from before this table existed —
+///   `mmv_mw_parity`'s host-reference tests cover the numerics; the Intel A770 throughput deltas
+///   predate this doc, see git blame).
+/// - **AMD RDNA3/RADV** (this box, `llama-bench` oracle b9957): **Q2_K** measured
+///   `infr bench Qwen3-14B-GGUF:Q2_K -p0 -n64` 86.4 → 104.0 t/s (**+20.4%**) — DEFAULT-ON. **Q4_K**
+///   measured `Qwen3-14B-GGUF:Q4_K_M` same shape 78.5 → 71.0 t/s (**−9.6%**, a real regression: the
+///   extra `quant_q8` dispatch + int8 dot loses to the word-parallel `dqblk` scalar GEMV at m=1 on
+///   AMD for this dtype) — stays OFF by default, `INFR_MMV_MW=1` opt-in only for A/B. **Q6_K/Q3_K**
+///   are UNMEASURED on AMD (no mid/large Q6_K and no Q3_K model in the validated local cache) —
+///   left OFF rather than assumed; this also matches llama.cpp's own carve-out (their table
+///   excludes Q6_K off-Intel entirely — 2-byte alignment is an Intel-only win). Re-measure with a
+///   real model before flipping either on.
+///
+/// Symmetry: this policy set is ALSO what gates Q2_K/Q3_K's entry into the m>=3 int8 `mrow`
+/// verify/prefill tier (see [`mrow_int8_dtype_ok`]) — a dtype added here is int8 in BOTH streams
+/// or in NEITHER. That is the invariant whose violation broke Q5_K token-identity (decode int8,
+/// verify f32-exact, or vice versa: the occasional greedy argmax flips between the spec and
+/// non-spec streams). Concretely on AMD today: Q2_K int8 in both, Q3_K f32-exact in both.
+///
+/// `INFR_MMV_MW=1` force-enables the FULL measured-safe dtype set {Q4_K, Q6_K, Q2_K, Q3_K} on ANY
+/// vendor (including the known-loss AMD Q4_K case) for A/B measurement; `INFR_MMV_MW=0` force-off
+/// everywhere. Both flow through [`mmv_int8_decode_dtypes`], so the A/B escapes stay symmetric
+/// too. `INFR_MMV_MW_WARPS` ∈ {4,8}.
+fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [infr_core::DType] {
+    use infr_core::DType::{Q2K, Q3K, Q4K, Q6K};
+    match std::env::var("INFR_MMV_MW").ok().as_deref() {
+        Some("0") => &[],                                   // force-off everywhere
+        Some(_) => &[Q4K, Q6K, Q2K, Q3K], // explicit opt-in: full set, any vendor (A/B)
+        None if caps.vendor_intel => &[Q4K, Q6K, Q2K, Q3K], // Intel: all four measured wins
+        None => &[Q2K], // AMD default: only the measured win (Q4_K measured a LOSS, see doc)
+    }
+}
+
+/// Does `dt` take the int8 dp4a `mrow` kernel for the m>=3 verify/prefill batch?
+///
+/// - **Q4_K / Q6_K / IQ4_XS**: YES, unconditionally on any `i8_dot` device — the PRE-EXISTING
+///   behavior (predates the decode policy table; load-bearing for the E2B `pp4@d4096` numbers).
+///   Note this IS asymmetric with the m=1 decode tier on AMD (int8 at m>=3, f32-exact at m=1) —
+///   a known, deliberately untouched wart, not something to extend.
+/// - **Q2_K / Q3_K**: only when [`mmv_int8_decode_dtypes`] also gives them the int8 DECODE tier on
+///   this device. These two dtypes' mrow kernels exist solely to keep the decode policy symmetric;
+///   letting them run int8 at m>=3 while decode stays f32-exact at m=1 would recreate the exact
+///   Q5_K token-divergence bug the decode policy is built to avoid.
+fn mrow_int8_dtype_ok(caps: &infr_core::backend::Capabilities, dt: infr_core::DType) -> bool {
+    use infr_core::DType::{Iq4Xs, Q2K, Q3K, Q4K, Q6K};
+    match dt {
+        Q4K | Q6K | Iq4Xs => true,
+        Q2K | Q3K => mmv_int8_decode_dtypes(caps).contains(&dt),
+        _ => false, // no int8 mrow kernel exists (native_mmv_mrow_build_spv returns None)
+    }
+}
+
 fn mmv_mw_choice(
     caps: &infr_core::backend::Capabilities,
     dt: infr_core::DType,
     in_f: usize,
     out_f: usize,
 ) -> Option<u32> {
-    let enabled = match std::env::var("INFR_MMV_MW").ok().as_deref() {
-        Some("0") => false,        // force-off everywhere
-        Some(_) => true,           // explicit opt-in (A/B on any device)
-        None => caps.vendor_intel, // measured default only on Intel
-    };
-    if !enabled || !caps.i8_dot {
-        return None;
-    }
-    if !matches!(
-        dt,
-        infr_core::DType::Q4K
-            | infr_core::DType::Q6K
-            | infr_core::DType::Q2K
-            | infr_core::DType::Q3K
-    ) {
+    if !caps.i8_dot || !mmv_int8_decode_dtypes(caps).contains(&dt) {
         return None;
     }
     // Skip tiny GEMVs where per-dispatch overhead dominates (k/v projections); the projection band
@@ -888,6 +918,7 @@ fn lower_op(
                 && in_f * out_f >= 8 << 20
                 && out_f < 65536
                 && crate::gemm::native_mmv_mrow_build_spv(dt).is_some()
+                && mrow_int8_dtype_ok(be_.caps(), dt)
                 && std::env::var("INFR_NO_MMV").is_err();
             // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
             // once its rollback window carries a few committed rows on top of the n_max drafts.
@@ -906,11 +937,16 @@ fn lower_op(
                 && crate::gemm::native_mrow_build_spv(dt).is_some()
                 && std::env::var("INFR_NO_MROW").is_err()
             {
-                // Int8 dp4a multi-row GEMV (Q4_K/Q6_K): quantize the m activation rows once
-                // (`quant_q8`), then integer-dot the raw weight blocks against ALL rows — the
-                // dequant mrow's per-sub-block scalar byte-extract dequant is the m-batch GEMV
-                // cost on ALU-bound shapes (E2B pp4@d4096: GEMV class 21.0 → 17.0us/op, pp4
-                // 366 → 383 t/s). Gates:
+                // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
+                // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
+                // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound
+                // shapes (E2B pp4@d4096: GEMV class 21.0 → 17.0us/op, pp4 366 → 383 t/s). Dtype
+                // eligibility is `mrow_int8_dtype_ok`: Q4_K/Q6_K/IQ4_XS unconditionally (the
+                // pre-existing behavior), Q2_K/Q3_K only when `mmv_int8_decode_dtypes` ALSO gives
+                // them the int8 m=1 decode tier on this device — so those two are int8 in both
+                // streams or in neither, never split (that split IS the Q5_K token-divergence bug;
+                // `mmv_mrow_symmetric_q2k_q3k` proves the two kernels agree once both are on).
+                // Gates:
                 //  • m >= 3: m=2 is the single-head MTP spec-verify shape, whose accept loop
                 //    holds a hard output-identical-to-target-greedy bar (`mtp_spec_matches_
                 //    target_only_greedy`) — int8-quantized activations perturb the verify logits
@@ -4581,6 +4617,60 @@ mod tests {
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
     use infr_core::DType;
+
+    /// THE symmetry invariant (the Q5_K token-divergence bug class, guarded at the policy level):
+    /// for every dtype whose int8 tier is policy-driven (Q2_K/Q3_K), the m=1 DECODE tier
+    /// (`mmv_int8_decode_dtypes`) and the m>=3 VERIFY/prefill tier (`mrow_int8_dtype_ok`) must
+    /// agree on EVERY (vendor × env) combination — int8 in both streams or in neither. A dtype
+    /// that is int8 in one stream and f32-exact in the other flips the occasional greedy argmax
+    /// between the spec and non-spec streams (this is precisely how the Q5_K attempt broke
+    /// `mtp_spec_matches_target_only_greedy`).
+    ///
+    /// Q4_K/Q6_K/IQ4_XS are deliberately EXEMPT: their mrow tier is unconditional and predates the
+    /// decode policy (see `mrow_int8_dtype_ok`'s doc — a known, untouched asymmetry on AMD).
+    #[test]
+    fn int8_decode_and_mrow_tiers_agree_on_policy_dtypes() {
+        let amd = infr_core::backend::Capabilities {
+            i8_dot: true,
+            vendor_intel: false,
+            ..Default::default()
+        };
+        let intel = infr_core::backend::Capabilities {
+            i8_dot: true,
+            vendor_intel: true,
+            ..Default::default()
+        };
+        // (env value for INFR_MMV_MW, label) — None = unset (the shipping default).
+        for env in [None, Some("1"), Some("0")] {
+            for (caps, vendor) in [(&amd, "amd"), (&intel, "intel")] {
+                // Serialized by the env mutation; these are pure table lookups.
+                match env {
+                    Some(v) => std::env::set_var("INFR_MMV_MW", v),
+                    None => std::env::remove_var("INFR_MMV_MW"),
+                }
+                for dt in [DType::Q2K, DType::Q3K] {
+                    let decode_int8 = mmv_int8_decode_dtypes(caps).contains(&dt);
+                    let mrow_int8 = mrow_int8_dtype_ok(caps, dt);
+                    assert_eq!(
+                        decode_int8, mrow_int8,
+                        "{vendor} INFR_MMV_MW={env:?} {dt:?}: decode int8={decode_int8} but \
+                         verify/mrow int8={mrow_int8} — ASYMMETRIC (the Q5_K bug class)"
+                    );
+                }
+            }
+        }
+        std::env::remove_var("INFR_MMV_MW");
+        // The shipping AMD default, spelled out so a policy edit has to face it: Q2_K int8 in
+        // BOTH streams (the measured +20% win), Q3_K f32-exact in BOTH (unmeasured on AMD).
+        assert!(mmv_int8_decode_dtypes(&amd).contains(&DType::Q2K));
+        assert!(mrow_int8_dtype_ok(&amd, DType::Q2K));
+        assert!(!mmv_int8_decode_dtypes(&amd).contains(&DType::Q3K));
+        assert!(!mrow_int8_dtype_ok(&amd, DType::Q3K));
+        // The exempt pre-existing set stays unconditional (not something this policy may weaken).
+        for dt in [DType::Q4K, DType::Q6K, DType::Iq4Xs] {
+            assert!(mrow_int8_dtype_ok(&amd, dt), "{dt:?} mrow must stay on");
+        }
+    }
 
     /// The drift guard the SSOT lists promise (`infr_core::tensor::MOE_MMQ_DTYPES`'s doc): every
     /// dtype claimed by the batched-mmq family must ALSO have the small-m id-GEMV kernels its

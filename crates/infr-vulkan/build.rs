@@ -1134,6 +1134,42 @@ fn main() {
             "native_mmv_mrow_iq4xs_o4_m4",
             &["-DFMT_IQ4XS", "-DOUTS4", "-DMRV=4"],
         ),
+        // Q2_K / Q3_K multi-row (m=2..8): symmetric-decode partners for `mmv_mw_choice`'s Q2_K/Q3_K
+        // decode tier (adapter.rs) — without these the MTP verify batch would keep the f32-exact
+        // dequant mrow for a dtype whose m=1 decode already went int8, exactly the asymmetry that
+        // broke Q5_K token-identity. Math ported from native_mmv_mw.comp's FMT_Q2K/FMT_Q3K.
+        ("native_mmv_mrow", "native_mmv_mrow_q2k", &["-DFMT_Q2K"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q2k_m4",
+            &["-DFMT_Q2K", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q2k_o4",
+            &["-DFMT_Q2K", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q2k_o4_m4",
+            &["-DFMT_Q2K", "-DOUTS4", "-DMRV=4"],
+        ),
+        ("native_mmv_mrow", "native_mmv_mrow_q3k", &["-DFMT_Q3K"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q3k_m4",
+            &["-DFMT_Q3K", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q3k_o4",
+            &["-DFMT_Q3K", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q3k_o4_m4",
+            &["-DFMT_Q3K", "-DOUTS4", "-DMRV=4"],
+        ),
         // rows 9..=16 tier (-DMRV=16, 2-output layout only): the MTP spec-verify batch when the
         // rollback window has a few committed rows on top of the n_max drafts — these previously
         // fell off the mrow tier onto the split-K coopmat tile at 2-4x the per-row cost (measured
@@ -1152,6 +1188,16 @@ fn main() {
             "native_mmv_mrow",
             "native_mmv_mrow_iq4xs_m16",
             &["-DFMT_IQ4XS", "-DMRV=16"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q2k_m16",
+            &["-DFMT_Q2K", "-DMRV=16"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q3k_m16",
+            &["-DFMT_Q3K", "-DMRV=16"],
         ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),

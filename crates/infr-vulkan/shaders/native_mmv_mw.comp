@@ -8,8 +8,8 @@
 // warp-per-row reduction avoids the cross-warp sync the wave64 tree kernel pays on wave32 hardware.
 // Activation pre-quantized to symmetric int8 per 32-block (quant_q8: qa/dact/sact); weight stays raw.
 // REORDERED accumulation vs the tree kernel (subgroupAdd order) → reassociation-tolerant, gated by
-// `mmv_mw_choice` in the adapter. -DFMT_Q4K/-DFMT_Q6K/-DFMT_Q2K/-DFMT_Q3K select the format;
-// -DWARPS=N rows/block; -DUSE_RES fuses a residual add. Requires requiredSubgroupSize=SG.
+// `mmv_mw_choice` in the adapter. -DFMT_Q4K/-DFMT_Q5K/-DFMT_Q6K/-DFMT_Q2K/-DFMT_Q3K select the
+// format; -DWARPS=N rows/block; -DUSE_RES fuses a residual add. Requires requiredSubgroupSize=SG.
 //
 // -DSG=16|32 (default 32): pinned subgroup ("warp") width — the block is WARPS subgroups of SG
 // lanes, each subgroup still owns ONE output row (gl_SubgroupID is unchanged by the width), lanes
@@ -59,13 +59,16 @@ uint ru32u(uint byte) {
 #endif
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 
-#ifdef FMT_Q4K
+#if defined(FMT_Q4K) || defined(FMT_Q5K)
 uvec2 k4(uint i, uint sb) {
     if (i < 4u) { return uvec2(rb(sb + i) & 63u, rb(sb + i + 4u) & 63u); }
     uint sc = (rb(sb + i + 4u) & 0xFu) | ((rb(sb + i - 4u) >> 6u) << 4u);
     uint mn = (rb(sb + i + 4u) >> 4u) | ((rb(sb + i) >> 6u) << 4u);
     return uvec2(sc, mn);
 }
+#endif
+
+#ifdef FMT_Q4K
 // Dot the 32-elem sub-block at element `gelem` against the activation block — same math (and same
 // per-block value) as native_mmv.comp's dpsub.
 float dpsub(uint gelem, uint qaw[8], float da, float sa) {
@@ -85,6 +88,36 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     for (uint j = 0u; j < 8u; j++) {
         uint w = nw[qword + j];
         uint qp = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
+        dp = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp);
+    }
+    return dl * da * float(dp) - mm * sa;
+}
+#endif
+
+#ifdef FMT_Q5K
+// Q5_K: [f16 d][f16 dmin][u8 scales[12]][u8 qh[32]][u8 qs[128]] = 176 bytes, 256 elements. Same
+// word-parallel unpack as `native_mmv_mrow.comp`'s FMT_Q5K wdec (see that file's doc for the qh
+// bit-plane derivation) — this is the m=1 decode twin, dot-reduced per-lane instead of packed into
+// qp[8] for a multi-row caller.
+uint qhword_q5k(uint bd) { return (bd + 16u) >> 2u; }
+float dpsub(uint gelem, uint qaw[8], float da, float sa) {
+    uint bd = (gelem / 256u) * 176u;
+    uint sub = (gelem / 32u) & 7u;
+    float d = f16tof32(ru16(bd));
+    float dmin = f16tof32(ru16(bd + 2u));
+    uvec2 km = k4(sub, bd + 4u);
+    float dl = d * float(km.x);
+    float mm = dmin * float(km.y);
+    uint qlword = (bd + 48u + (sub >> 1u) * 32u) >> 2u;
+    uint qhword = qhword_q5k(bd);
+    bool lo = (sub & 1u) == 0u;
+    int dp = 0;
+    for (uint j = 0u; j < 8u; j++) {
+        uint wl = nw[qlword + j];
+        uint wh = nw[qhword + j];
+        uint nib = lo ? (wl & 0x0F0F0F0Fu) : ((wl >> 4u) & 0x0F0F0F0Fu);
+        uint bit5 = ((wh >> sub) & 0x01010101u) << 4u;
+        uint qp = nib | bit5;
         dp = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp);
     }
     return dl * da * float(dp) - mm * sa;

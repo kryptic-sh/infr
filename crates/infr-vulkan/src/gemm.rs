@@ -561,6 +561,12 @@ pub(crate) fn native_mmv_mw_build_spv(
         (Q3K, true, 4, true) => v!("native_mmv_mw_q3k_w4_res_sg16"),
         (Q3K, false, 8, true) => v!("native_mmv_mw_q3k_w8_sg16"),
         (Q3K, true, 8, true) => v!("native_mmv_mw_q3k_w8_res_sg16"),
+        // Q5_K: NEW int8 decode arm — {plain,res} x WARPS{4,8}, no sg16 twin (AMD-only
+        // measurement; add an Intel SG=16 build before ever defaulting it on there).
+        (Q5K, false, 4, false) => v!("native_mmv_mw_q5k_w4"),
+        (Q5K, true, 4, false) => v!("native_mmv_mw_q5k_w4_res"),
+        (Q5K, false, 8, false) => v!("native_mmv_mw_q5k_w8"),
+        (Q5K, true, 8, false) => v!("native_mmv_mw_q5k_w8_res"),
         _ => None,
     }
 }
@@ -584,6 +590,7 @@ pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'sta
         Iq4Xs => v!("native_mmv_mrow_iq4xs"),
         Q2K => v!("native_mmv_mrow_q2k"),
         Q3K => v!("native_mmv_mrow_q3k"),
+        Q5K => v!("native_mmv_mrow_q5k"),
         _ => return None,
     })
 }
@@ -597,6 +604,7 @@ pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> &'static s
         Iq4Xs => "native_mmv_mrow_iq4xs",
         Q2K => "native_mmv_mrow_q2k",
         Q3K => "native_mmv_mrow_q3k",
+        Q5K => "native_mmv_mrow_q5k",
         _ => unreachable!("native_mmv_mrow_kernel_name: gated by native_mmv_mrow_build_spv"),
     }
 }
@@ -651,6 +659,12 @@ pub(crate) fn native_mmv_mrow_variant_spv(
         (Q3K, true, true, false) => v!("native_mmv_mrow_q3k_o4_m4"),
         (Q3K, false, true, true) => v!("native_mmv_mrow_q3k_m4_res"),
         (Q3K, true, true, true) => v!("native_mmv_mrow_q3k_o4_m4_res"),
+        (Q5K, false, false, false) => v!("native_mmv_mrow_q5k"),
+        (Q5K, false, true, false) => v!("native_mmv_mrow_q5k_m4"),
+        (Q5K, true, false, false) => v!("native_mmv_mrow_q5k_o4"),
+        (Q5K, true, true, false) => v!("native_mmv_mrow_q5k_o4_m4"),
+        (Q5K, false, true, true) => v!("native_mmv_mrow_q5k_m4_res"),
+        (Q5K, true, true, true) => v!("native_mmv_mrow_q5k_o4_m4_res"),
         _ => return None,
     })
 }
@@ -692,6 +706,12 @@ pub(crate) fn native_mmv_mrow_variant_name(
         (Q3K, true, true, false) => "native_mmv_mrow_q3k_o4_m4",
         (Q3K, false, true, true) => "native_mmv_mrow_q3k_m4_res",
         (Q3K, true, true, true) => "native_mmv_mrow_q3k_o4_m4_res",
+        (Q5K, false, false, false) => "native_mmv_mrow_q5k",
+        (Q5K, false, true, false) => "native_mmv_mrow_q5k_m4",
+        (Q5K, true, false, false) => "native_mmv_mrow_q5k_o4",
+        (Q5K, true, true, false) => "native_mmv_mrow_q5k_o4_m4",
+        (Q5K, false, true, true) => "native_mmv_mrow_q5k_m4_res",
+        (Q5K, true, true, true) => "native_mmv_mrow_q5k_o4_m4_res",
         _ => unreachable!("native_mmv_mrow_variant_name: gated by native_mmv_mrow_build_spv"),
     }
 }
@@ -716,6 +736,7 @@ pub(crate) fn native_mmv_mrow_m16_spv(dtype: infr_core::DType) -> Option<&'stati
         Iq4Xs => v!("native_mmv_mrow_iq4xs_m16"),
         Q2K => v!("native_mmv_mrow_q2k_m16"),
         Q3K => v!("native_mmv_mrow_q3k_m16"),
+        Q5K => v!("native_mmv_mrow_q5k_m16"),
         _ => return None,
     })
 }
@@ -729,6 +750,7 @@ pub(crate) fn native_mmv_mrow_m16_name(dtype: infr_core::DType) -> &'static str 
         Iq4Xs => "native_mmv_mrow_iq4xs_m16",
         Q2K => "native_mmv_mrow_q2k_m16",
         Q3K => "native_mmv_mrow_q3k_m16",
+        Q5K => "native_mmv_mrow_q5k_m16",
         _ => unreachable!("native_mmv_mrow_m16_name: gated by native_mmv_mrow_m16_spv"),
     }
 }

@@ -1,12 +1,16 @@
-//! Symmetric-int8 proof for Q2_K/Q3_K: the m=1 DECODE tier (`linear_mmv_mw`, gated by
+//! Symmetric-int8 proof for Q2_K/Q3_K/Q5_K: the m=1 DECODE tier (`linear_mmv_mw`, gated by
 //! `adapter::mmv_mw_choice`) and the m>=2 VERIFY/prefill tier (`linear_mmv_mrow`, gated by
 //! `adapter::mmv_gate`) must agree row-for-row, since both now take the int8 dp4a path for these
-//! two dtypes by default on AMD (see adapter.rs's `mmv_mw_choice` doc). A dtype that is int8 in
-//! one stream and f32-exact (or differently-reassociated int8) in the other is exactly the bug
-//! class that broke Q5_K MTP token-identity — this test is the guard against reintroducing it for
-//! Q2_K/Q3_K now that `native_mmv_mrow.comp` grew FMT_Q2K/FMT_Q3K support (ported from
-//! `native_mmv_mw.comp`'s already host-reference-validated dequant math — see
-//! `mmv_mw_parity::mmv_mw_q2k_q3k_match_host_reference`).
+//! dtypes by default on AMD (see adapter.rs's `mmv_mw_choice` doc). A dtype that is int8 in one
+//! stream and f32-exact (or differently-reassociated int8) in the other is exactly the bug class
+//! that broke Q5_K MTP token-identity — this test is the guard against reintroducing it for
+//! Q2_K/Q3_K (and now Q5_K itself, whose original break IS this bug class) now that
+//! `native_mmv_mrow.comp` has FMT_Q2K/FMT_Q3K/FMT_Q5K support (ported from `native_mmv_mw.comp`'s
+//! already host-reference-validated dequant math — see `mmv_mw_parity::mmv_mw_q2k_q3k_match_host_
+//! reference` / `mmv_mw_q5k_match_host_reference`). Q5_K's own m=1/m>=2 kernels are exercised here
+//! at the RAW `Recorder` level (bypassing `mrow_int8_dtype_ok`'s decode-tied policy gate, which
+//! only controls whether either tier is *reachable by default* — this test proves the two kernels
+//! themselves agree, independent of that policy switch, exactly as it already does for Q2_K/Q3_K).
 //!
 //! Run: cargo test -p infr-vulkan --test mmv_mrow_symmetric_q2k_q3k -- --ignored --nocapture
 use infr_core::backend::{Backend, BufferUsage};
@@ -23,10 +27,11 @@ fn mrow_matches_mmv_mw_q2k_q3k() {
     let blk = |dt: DType| match dt {
         DType::Q2K => 84usize,
         DType::Q3K => 110,
+        DType::Q5K => 176,
         _ => unreachable!(),
     };
     let f16b = |x: f32| half::f16::from_f32(x).to_le_bytes();
-    for dt in [DType::Q2K, DType::Q3K] {
+    for dt in [DType::Q2K, DType::Q3K, DType::Q5K] {
         // Same shapes small_m_bench's mmv_mrow_matches_single_row_mmv uses: k=1536 hits the OUTS4
         // layout, k=2048 the 2-output layout; n=66 exercises both layouts' tail guards.
         for (k, n) in [(1536usize, 66usize), (2048, 66)] {
@@ -42,6 +47,10 @@ fn mrow_matches_mmv_mw_q2k_q3k() {
                         b[82..84].copy_from_slice(&f16b(0.1 + (bi % 5) as f32 * 0.02));
                     }
                     DType::Q3K => b[108..110].copy_from_slice(&f16b(d)),
+                    DType::Q5K => {
+                        b[0..2].copy_from_slice(&f16b(d));
+                        b[2..4].copy_from_slice(&f16b(0.05 + (bi % 5) as f32 * 0.015));
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -124,7 +133,7 @@ fn mrow_matches_mmv_mw_q2k_q3k() {
         }
     }
     eprintln!(
-        "Q2_K/Q3_K: verify tier (mmv_mrow, m=2..16) == decode tier (mmv_mw, m=1) at \
+        "Q2_K/Q3_K/Q5_K: verify tier (mmv_mrow, m=2..16) == decode tier (mmv_mw, m=1) at \
          reassociation tolerance — symmetric int8"
     );
 }

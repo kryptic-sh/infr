@@ -7,8 +7,15 @@
 //! `rows=1` (decode) or `rows=2..16` (verify) — see `native_mmv_mrow.comp`'s header. A row's
 //! result depends only on its own `qa`/`dact`/`sact` slice, never on `rows`, so this test proves
 //! decode-shape (rows=1) and verify-shape (rows=3) agree bit-for-bit, for every dtype on the
-//! int8-decode/mrow tier (Q4_K, Q6_K, Q2_K, Q3_K) — the set `native_mmv_mrow_variant_spv` builds a
-//! `-DUSE_RES` rows=1 twin for.
+//! int8-decode/mrow tier (Q4_K, Q6_K, Q2_K, Q3_K, Q5_K) — the set `native_mmv_mrow_variant_spv`
+//! builds a `-DUSE_RES` rows=1 twin for.
+//!
+//! Q5_K is the dtype this whole invariant is NAMED after: the historical Q5_K int8 attempt wired
+//! only the verify batch, left plain decode f32-exact, and flipped greedy tokens. It now has an
+//! int8 arm in the unified kernel, so it belongs here — even though its decode tier ships OFF (a
+//! measured throughput wash; see `adapter::mmv_int8_decode_dtypes`). This test exercises the
+//! kernels directly, so it proves bit-identity regardless of that policy switch — i.e. it stays
+//! meaningful as the guard for whoever flips Q5_K on later.
 //!
 //! Before this fix, decode (m=1) dispatched a DIFFERENT kernel (`native_mmv_mw.comp`,
 //! warp-per-row `subgroupAdd`) whose cross-sub-block summation order differs from mrow's row-tile
@@ -31,6 +38,7 @@ fn blk_bytes(dt: DType) -> usize {
         DType::Q6K => 210,
         DType::Q2K => 84,
         DType::Q3K => 110,
+        DType::Q5K => 176,
         _ => unreachable!(),
     }
 }
@@ -53,6 +61,11 @@ fn patch_scales(dt: DType, bi: usize, blk: &mut [u8]) {
             blk[82..84].copy_from_slice(&f16b(0.1 + (bi % 5) as f32 * 0.02));
         }
         DType::Q3K => blk[108..110].copy_from_slice(&f16b(d)),
+        // Q5_K: same leading [f16 d][f16 dmin] as Q4_K (the two share a scale/min layout family).
+        DType::Q5K => {
+            blk[0..2].copy_from_slice(&f16b(d));
+            blk[2..4].copy_from_slice(&f16b(0.05 + (bi % 5) as f32 * 0.015));
+        }
         _ => unreachable!(),
     }
 }
@@ -68,7 +81,7 @@ fn mmv_row1_matches_mrow_row0_exact() {
     // (in_f, out_f) pairs exercise both layout gates: in_f < 2048 takes -DOUTS4, in_f >= 2048
     // takes the 2-output layout; odd out_f exercises the has1/tail guard.
     let shapes = [(1536usize, 66usize), (2048, 66), (2048, 2049), (6144, 2048)];
-    for dt in [DType::Q4K, DType::Q6K, DType::Q2K, DType::Q3K] {
+    for dt in [DType::Q4K, DType::Q6K, DType::Q2K, DType::Q3K, DType::Q5K] {
         for &(in_f, out_f) in &shapes {
             let blk = blk_bytes(dt);
             let wbytes = in_f * out_f / 256 * blk;

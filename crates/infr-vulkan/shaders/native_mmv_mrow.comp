@@ -25,12 +25,15 @@
 // words read once for both outputs — same grid halving as `native_mmv.comp`.
 // Reduction: per-row subgroupAdd + one shared combine across waves (the mrow pattern — its 8-row
 // shared-tree replacement measured as the real cost there; see native_gemv_mrow.comp's header).
-// -DFMT_Q4K / -DFMT_Q6K / -DFMT_Q2K / -DFMT_Q3K select the weight format (the formats with a
-// symmetric-int8 tier on either the decode `mmv_mw` or the verify `mrow` side — see adapter.rs's
-// `mmv_mw_choice`/`mmv_gate` doc for the per-dtype policy table; others keep the dequant mrow
-// fallback). Q2_K/Q3_K's dequant math is a direct port of `native_mmv_mw.comp`'s already
-// host-reference-validated FMT_Q2K/FMT_Q3K `dpsub` (see `mmv_mw_q2k_q3k_match_host_reference`) —
-// weight-only unpack hoisted out of the per-row loop the same way Q4_K/Q6_K already are here.
+// -DFMT_Q4K / -DFMT_Q5K / -DFMT_Q6K / -DFMT_Q2K / -DFMT_Q3K select the weight format (the formats
+// with a symmetric-int8 tier on either the decode `mmv_mw` or the verify `mrow` side — see
+// adapter.rs's `mmv_mw_choice`/`mmv_gate` doc for the per-dtype policy table; others keep the
+// dequant mrow fallback). Q2_K/Q3_K's dequant math is a direct port of `native_mmv_mw.comp`'s
+// already host-reference-validated FMT_Q2K/FMT_Q3K `dpsub` (see
+// `mmv_mw_q2k_q3k_match_host_reference`) — weight-only unpack hoisted out of the per-row loop the
+// same way Q4_K/Q6_K already are here. FMT_Q5K mirrors FMT_Q4K's word-parallel wdec exactly (same
+// 6-bit packed scale/min layout, same f0/f1 accumulation shape), plus a second aligned-u32 load for
+// the 5th-bit `qh` plane — see the wdec doc below.
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_integer_dot_product : require
@@ -81,15 +84,18 @@ uint ru32u(uint byte) {
 }
 #endif
 
-#ifdef FMT_Q4K
-// Q4_K 6-bit scale/min for sub-block i from the 12-byte scales field at sb.
+#if defined(FMT_Q4K) || defined(FMT_Q5K)
+// Q4_K/Q5_K share the same 6-bit scale/min packed layout for sub-block i from the 12-byte scales
+// field at sb.
 uvec2 k4(uint i, uint sb) {
     if (i < 4u) { return uvec2(rb(sb + i) & 63u, rb(sb + i + 4u) & 63u); }
     uint sc = (rb(sb + i + 4u) & 0xFu) | ((rb(sb + i - 4u) >> 6u) << 4u);
     uint mn = (rb(sb + i + 4u) >> 4u) | ((rb(sb + i) >> 6u) << 4u);
     return uvec2(sc, mn);
 }
+#endif
 
+#ifdef FMT_Q4K
 // Unpack the 32-elem sub-block at element `gelem` into 8 packed-int8 words + its two scale
 // factors: f0 = d·sc (dot term), f1 = dmin·m (min term). Row r then contributes
 // f0·dact[r]·dp4a(qp, qa[r]) − f1·sact[r] — the same math as native_mmv.comp's dpsub.
@@ -108,6 +114,43 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     for (uint j = 0u; j < 8u; j++) {
         uint w = nw[qword + j];
         qp[j] = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
+    }
+}
+#endif
+
+#ifdef FMT_Q5K
+// Q5_K: [f16 d][f16 dmin][u8 scales[12]][u8 qh[32]][u8 qs[128]] = 176 bytes, 256 elements. Same
+// 6-bit packed scale/min layout as Q4_K (k4 above) and the same f0/f1 accumulation shape, but each
+// element is 5 bits: a 4-bit nibble from `qs` (identical low/high-nibble-per-half-of-64 addressing
+// to Q4_K) OR'd with a 5th bit from a `qh` bit-plane that is SHARED across all 8 sub-blocks (32
+// bytes covering all 256 elements; sub-block `sub` reads bit `sub` of each byte — this is exactly
+// llama.cpp's dequantize_row_q5_K u1/u2 shift-by-2-per-64-block sequence, reindexed: bit position
+// == sub because u1/u2 start at bits 0/1 and left-shift by 2 every 64-elem group).
+// Word-parallel unpack (mirrors Q4_K's wdec — NOT a byte-at-a-time loop, see the -5.8% Q4_K bug
+// this repo already fixed once): one aligned u32 load for the qs nibbles (same nibble-mask trick as
+// Q4_K) AND one aligned u32 load for the qh byte-plane, bit `sub` extracted from all 4 byte lanes
+// in a single shift+mask (shifting a u32 right by sub<8 moves bit `sub` of each byte to that byte's
+// bit 0 without cross-lane contamination, since the shift distance is smaller than a byte; masking
+// 0x01010101 then isolates exactly those four bits), then <<4 to merge as the nibble's 5th bit.
+void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
+    uint bd = (gelem / 256u) * 176u; // super-block byte base
+    uint sub = (gelem / 32u) & 7u;   // sub-block 0..7 (== llama.cpp's `is`)
+    float d = f16tof32(ru16(bd));
+    float dmin = f16tof32(ru16(bd + 2u));
+    uvec2 km = k4(sub, bd + 4u);
+    f0 = d * float(km.x);
+    f1 = dmin * float(km.y);
+    // qs base: bd+48 (d+dmin+scales=16 bytes, then qh=32 bytes -> qs at +48), word-aligned the same
+    // way Q4_K's qword is (bd, 48, 32·k, 4·j all multiples of 4).
+    uint qlword = (bd + 48u + (sub >> 1u) * 32u) >> 2u;
+    uint qhword = (bd + 16u) >> 2u; // qh base: right after scales, reused for every sub-block
+    bool lo = (sub & 1u) == 0u;
+    for (uint j = 0u; j < 8u; j++) {
+        uint wl = nw[qlword + j];
+        uint wh = nw[qhword + j];
+        uint nib = lo ? (wl & 0x0F0F0F0Fu) : ((wl >> 4u) & 0x0F0F0F0Fu);
+        uint bit5 = ((wh >> sub) & 0x01010101u) << 4u;
+        qp[j] = nib | bit5;
     }
 }
 #endif
@@ -282,7 +325,7 @@ void main() {
                 uint qb = r * in_fq + s * 2u;
                 uvec4 a0 = qa4[qb];
                 uvec4 a1 = qa4[qb + 1u];
-#if defined(FMT_Q4K) || defined(FMT_IQ4XS)
+#if defined(FMT_Q4K) || defined(FMT_IQ4XS) || defined(FMT_Q5K)
                 int dp = 0;
                 dp = dotPacked4x8AccSatEXT(int(qp[0]), int(a0.x), dp);
                 dp = dotPacked4x8AccSatEXT(int(qp[1]), int(a0.y), dp);
@@ -390,7 +433,7 @@ void main() {
                 uvec4 av1 = qa4[qb + 1u];
                 int aw[8] = int[8](int(av0.x), int(av0.y), int(av0.z), int(av0.w),
                                    int(av1.x), int(av1.y), int(av1.z), int(av1.w));
-#if defined(FMT_Q4K) || defined(FMT_IQ4XS)
+#if defined(FMT_Q4K) || defined(FMT_IQ4XS) || defined(FMT_Q5K)
                 int dp0 = 0; int dp1 = 0;
                 for (uint j = 0u; j < 8u; j++) {
                     dp0 = dotPacked4x8AccSatEXT(int(qp0[j]), aw[j], dp0);

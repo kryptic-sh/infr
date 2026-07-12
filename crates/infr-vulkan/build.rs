@@ -1112,6 +1112,32 @@ fn main() {
             "native_mmv_mw_q3k_w8_res",
             &["-DFMT_Q3K", "-DWARPS=8", "-DUSE_RES"],
         ),
+        // Q5_K mmv_mw: NEW int8 decode arm (previously no int8 tier in either stream — see
+        // adapter.rs's `mmv_int8_decode_dtypes` doc). Same {plain,res} × WARPS∈{4,8} set as
+        // Q2_K/Q3_K; no dispatch-shape sweep (AMD-only measurement). `native_mmv_mw` is in
+        // SG16_SOURCES below, so a `_sg16` twin gets auto-compiled too, but `gemm.rs`
+        // deliberately leaves the sg16 match arms unwired — Q5_K isn't in Intel's decode-dtype
+        // set, so nothing would ever request it; add the arms alongside an Intel measurement.
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q5k_w4",
+            &["-DFMT_Q5K", "-DWARPS=4"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q5k_w4_res",
+            &["-DFMT_Q5K", "-DWARPS=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q5k_w8",
+            &["-DFMT_Q5K", "-DWARPS=8"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q5k_w8_res",
+            &["-DFMT_Q5K", "-DWARPS=8", "-DUSE_RES"],
+        ),
         // IQ4_XS: codebook-gather-then-dp4a (the 4-bit code indexes KV_IQ4NL -> int8 before the dot).
         ("native_mmv", "native_mmv_iq4xs", &["-DFMT_IQ4XS"]),
         (
@@ -1252,6 +1278,38 @@ fn main() {
             "native_mmv_mrow_q3k_o4_m4_res",
             &["-DFMT_Q3K", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
         ),
+        // Q5_K multi-row: NEW int8 arm — previously no int8 tier in either stream. Gated by
+        // adapter.rs `mrow_int8_dtype_ok` the same way as Q2_K/Q3_K (tied to the decode policy set,
+        // never unconditional) so this dtype can never ship verify-int8/decode-f32-exact by default
+        // — that exact split is the historical Q5_K MTP token-divergence bug. Post-unification this
+        // same shader serves BOTH the m>=2 verify/prefill tier and (on AMD) the rows=1 decode tier,
+        // so the -DUSE_RES twins below are required for the decode Linear+Add fusion.
+        ("native_mmv_mrow", "native_mmv_mrow_q5k", &["-DFMT_Q5K"]),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5k_m4",
+            &["-DFMT_Q5K", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5k_o4",
+            &["-DFMT_Q5K", "-DOUTS4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5k_o4_m4",
+            &["-DFMT_Q5K", "-DOUTS4", "-DMRV=4"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5k_m4_res",
+            &["-DFMT_Q5K", "-DMRV=4", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5k_o4_m4_res",
+            &["-DFMT_Q5K", "-DOUTS4", "-DMRV=4", "-DUSE_RES"],
+        ),
         // rows 9..=16 tier (-DMRV=16, 2-output layout only): the MTP spec-verify batch when the
         // rollback window has a few committed rows on top of the n_max drafts — these previously
         // fell off the mrow tier onto the split-K coopmat tile at 2-4x the per-row cost (measured
@@ -1280,6 +1338,11 @@ fn main() {
             "native_mmv_mrow",
             "native_mmv_mrow_q3k_m16",
             &["-DFMT_Q3K", "-DMRV=16"],
+        ),
+        (
+            "native_mmv_mrow",
+            "native_mmv_mrow_q5k_m16",
+            &["-DFMT_Q5K", "-DMRV=16"],
         ),
         ("native_gemm_mmq_q4k", "native_gemm_mmq_q4k", &[]),
         ("native_gemm_mmq_q6k", "native_gemm_mmq_q6k", &[]),

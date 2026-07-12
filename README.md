@@ -345,25 +345,55 @@ of truth both gates read, and a unit guard asserts they agree across every
 vendor × env combination. That symmetry is exactly the constraint footnote ²'s
 Q5_K attempt violated.
 
-**Q4_K is deliberately NOT on the tier on AMD: measured −9.6%** (14B Q4_K_M tg64
-78.5 → 71.0 t/s). That is a fact about _infr's_ kernel, not about the trade —
-llama.cpp defaults Q4_K to mmvq on AMD and still wins the row, so their
-`q4_k × q8_1` kernel beats their f32 path while ours loses to ours. Root cause
-found: infr's m=1 kernel unpacks Q4_K **byte-at-a-time**, where llama.cpp (and
-infr's own `mrow` kernel) read **aligned u32s** and nibble-mask 4 weights at a
-time. A throwaway patch to word-parallel unpack measured **+5.8%, bit-identical
-output**, leaving ~4% that is workgroup shape (llama.cpp runs one row per
-workgroup with a subgroup reduce; infr runs 8 warps/block, one row per warp —
-never swept). Fixing that kernel is the open lever on the mid/large decode rows,
-since Q4_K_M is the quant under nearly every model in this table. Q6_K/Q3_K stay
-off on AMD as **unmeasured** (no suitable model in the validated cache) — left
-off rather than assumed.
+**Q4_K is deliberately NOT on the tier on AMD** — the throughput half of this is
+now FIXED, the correctness half is not, so it stays off by default. What was
+fixed: the old **−9.6%** (14B Q4_K_M tg64 78.5 → 71.0 t/s) is root-caused and
+closed. (1) infr's m=1 kernel unpacked Q4_K **byte-at-a-time**, where llama.cpp
+(and infr's own `mrow` kernel) read **aligned u32s** and nibble-mask 4 weights
+at a time; switching `native_mmv_mw.comp`'s Q4_K `dpsub` to the same
+word-parallel load measured **+5.8%, bit-identical output** (`mmv_mw_parity`).
+(2) A dispatch-shape sweep over `INFR_MMV_MW_WARPS` (rows/block) — llama.cpp
+runs Q4_K mmvq on AMD non-GCN at `rm_kq_int=1` (one output row per workgroup,
+single-subgroup reduce), infr had only ever tried {4, 8} warps/block — found
+WARPS=1 the clear winner over the full {1, 2, 4, 8, 16} sweep: 14B Q4_K_M tg64
+78.3 → **80.1 t/s (+2.3%)**, tg128 78.0 → 79.8, tg64@d4096 68.2 → 69.3. Int8
+Q4_K now genuinely beats infr's own f32 path.
+
+It still isn't shipped as the AMD default, because flipping it breaks
+`mtp_spec_matches_target_only_greedy`: infr's `mrow` kernel (m≥3 verify batch)
+has taken Q4_K int8 **unconditionally** since before this policy table existed
+(see the wart noted below), so turning on the m=1 decode tier makes BOTH streams
+int8 for the first time — and they still disagree on the occasional greedy
+token. The two kernels are different code (warp-per-row `subgroupAdd` vs
+row-tile accumulation); both quantize activations identically and dot the same
+integers per sub-block, but the cross-sub-block **summation order** differs, the
+same reassociation class `mmv_mw_parity` already tolerates at 5e-3 for
+throughput purposes — apparently wide enough here to flip an argmax across
+streams often enough to fail in 64 tokens. This is not a regression introduced
+by the fixes above: it reproduces on the pre-fix code too via the pre-existing
+`INFR_MMV_MW=1` escape, which nobody had run against the MTP symmetry test
+before. The lesson: **"both streams int8" is necessary but not sufficient for
+token-identity** — it also needs the two kernels bit-identical at the same
+position, and `mmv_mw`/`mrow` aren't. Making them so (e.g. porting `mmv_mw` to
+`mrow`'s row-tile accumulation, or vice versa) is a real kernel project, left
+open. Until then the fix + WARPS=1 stay reachable via
+`INFR_MMV_MW=1 INFR_MMV_MW_WARPS=1` for A/B measurement on non-MTP workloads,
+where the win is real (14B Q4_K_M: tg128 0.92× → 0.94×, tg64@d4096 0.87× →
+0.89×, both still short of llama.cpp parity but a real step, not a forced one).
+Q6_K/Q3_K stay off on AMD as **unmeasured** (no suitable model in the validated
+cache) — left off rather than assumed.
 
 Known wart, recorded rather than hidden: Q4_K/Q6_K/IQ4_XS take the int8 `mrow`
 kernel at m≥3 **unconditionally**, while their m=1 decode stays f32-exact on AMD
 — the same decode/verify asymmetry described above, pre-dating the policy table
 and live on every Q4_K MTP run today. It is untouched here (it is load-bearing
-for the Gemma-4-E2B `pp4@d4096` numbers) and queued as its own fix.
+for the Gemma-4-E2B `pp4@d4096` numbers) and queued as its own fix. **Turns out
+"fixing" it by making m=1 int8 too is not actually a fix** — see footnote ³:
+`mmv_mw` and `mrow` are different kernels that don't agree bit-for-bit at the
+same position, so making both streams int8 for Q4_K trades a known asymmetry for
+a different, still-live disagreement (`mtp_spec_matches_target_only_greedy`
+fails either way). The real fix needs the two kernels bit-identical, not just
+same-precision.
 
 ⁴ Gemma-4-31B (21.9 GiB weights on the 24 GB card) runs **fully resident,
 including at depth**, after two placement slices: try-resident-first dense
@@ -421,15 +451,18 @@ Decode is at-or-above parity up to ~1.7B, on the gemma-4 MoE (1.03×), and on th
   its batched verify amortizes further. Levers: wide-n small-m GEMM efficiency,
   and verifying the lm_head only over the rows whose logits are kept.
 - **Mid/large dense + Qwen MoE decode** (8B–31B at 0.87–0.97×, Qwen3-30B/35B MoE
-  at 0.91–0.99×) — these are all **Q4_K_M** rows, and footnote ³ now names the
-  cause: infr's int8 Q4_K GEMV kernel is slower than its own f32 path (so the
-  tier stays off), while llama.cpp's is faster than theirs (so they take it and
-  win). This was previously written off as the memory-bandwidth wall — decode
-  GEMVs do run at 77–88% of DRAM peak — but that figure was measured on the
-  f32-activation kernels, and llama.cpp beating us by 35% on 14B Q2_K decode
-  proves those rows are partly **ALU-bound**, with more headroom than the wall
-  story implied. Correct full-expert routing separately costs the Qwen MoEs some
-  prefill batch efficiency (0.95× on Qwen3-30B).
+  at 0.91–0.99×) — these are all **Q4_K_M** rows. Footnote ³ named the cause
+  (infr's int8 Q4_K GEMV kernel was slower than its own f32 path) and the kernel
+  is now fixed — int8 Q4_K measures a real win in isolation — but it stays
+  unshipped because it breaks MTP token-identity against the pre-existing
+  always-int8 `mrow` verify tier (footnote ³ again), so these rows are
+  unchanged: still on the f32 path, still behind llama.cpp's `q4_k × q8_1`. This
+  was previously written off as the memory-bandwidth wall — decode GEMVs do run
+  at 77–88% of DRAM peak — but that figure was measured on the f32-activation
+  kernels, and llama.cpp beating us by 35% on 14B Q2_K decode proves those rows
+  are partly **ALU-bound**, with more headroom than the wall story implied.
+  Correct full-expert routing separately costs the Qwen MoEs some prefill batch
+  efficiency (0.95× on Qwen3-30B).
 - **Qwen3-14B Q2_K decode** (0.78–0.81×, was 0.72–0.74×) — improved by the
   int8-activation tier (footnote ³); the residual is infr's Q4_K/Q2_K GEMV
   kernel shape, not the precision policy.

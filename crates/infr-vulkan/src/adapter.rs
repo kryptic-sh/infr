@@ -388,9 +388,32 @@ fn mmv_decode_enabled() -> bool {
 ///   predate this doc, see git blame).
 /// - **AMD RDNA3/RADV** (this box, `llama-bench` oracle b9957): **Q2_K** measured
 ///   `infr bench Qwen3-14B-GGUF:Q2_K -p0 -n64` 86.4 → 104.0 t/s (**+20.4%**) — DEFAULT-ON. **Q4_K**
-///   measured `Qwen3-14B-GGUF:Q4_K_M` same shape 78.5 → 71.0 t/s (**−9.6%**, a real regression: the
-///   extra `quant_q8` dispatch + int8 dot loses to the word-parallel `dqblk` scalar GEMV at m=1 on
-///   AMD for this dtype) — stays OFF by default, `INFR_MMV_MW=1` opt-in only for A/B. **Q6_K/Q3_K**
+///   was measured a regression at the {4,8}-warps/block shape (78.5 → 71.0 t/s, **−9.6%**) and
+///   stayed OFF. Root-caused and the THROUGHPUT half FIXED (README footnote 3): (1) the m=1
+///   `dpsub` unpacked Q4_K quants byte-at-a-time instead of the word-parallel nibble-mask
+///   `native_mmv_mrow.comp` already used (+5.8%, bit-identical, `mmv_mw_parity`); (2) a
+///   dispatch-shape sweep over `INFR_MMV_MW_WARPS` ∈ {1,2,4,8,16} found WARPS=1 (llama.cpp's
+///   `rm_kq_int=1` shape — one output row per workgroup, single-subgroup reduce) the clear winner:
+///   `Qwen3-14B-GGUF:Q4_K_M` tg64 78.3 → 80.1 t/s (**+2.3%**), tg128 78.0 → 79.8 (+2.3%), tg64@d4096
+///   68.2 → 69.3 (+1.6%) — int8 Q4_K now genuinely beats infr's own f32 path in isolation.
+///
+///   **Still NOT flipped on by default on AMD**, despite that win: turning it on breaks
+///   `mtp_spec_matches_target_only_greedy` (`crates/infr-llama/tests/cpu_backend.rs`) — the m=1
+///   decode stream (`mmv_mw`, this fix) and the m>=3 verify stream (`mrow`, unconditionally int8
+///   for Q4_K already — see `mrow_int8_dtype_ok`) disagree on the occasional greedy token even
+///   though BOTH are now int8. This is NOT something this session introduced: it reproduces on the
+///   unmodified pre-fix code too via the pre-existing `INFR_MMV_MW=1` escape — nobody had run the
+///   MTP symmetry test against that escape before. The two kernels are different code (warp-per-row
+///   subgroupAdd vs row-tile accumulation) that both quantize activations to int8 and both dot in
+///   the same integers, so per-sub-block terms match exactly, but the cross-sub-block SUMMATION
+///   ORDER differs — the same reassociation class `mmv_mw_parity` already tolerates at the 5e-3
+///   level for throughput purposes, but apparently wide enough here to occasionally flip a greedy
+///   argmax across the two streams. "Both streams int8" (the Q2_K/Q3_K symmetry story below) is
+///   necessary but NOT sufficient for token-identity — it also needs the two kernels to be
+///   bit-identical for the same position, which mmv_mw/mrow are not. Making them so is a real
+///   kernel project, out of scope here. Until then Q4_K decode stays OFF by default on AMD; the
+///   throughput fix + WARPS=1 remain reachable via `INFR_MMV_MW=1 INFR_MMV_MW_WARPS=1` for A/B
+///   measurement on non-MTP workloads, where the win is real and unconditional. **Q6_K/Q3_K**
 ///   are UNMEASURED on AMD (no mid/large Q6_K and no Q3_K model in the validated local cache) —
 ///   left OFF rather than assumed; this also matches llama.cpp's own carve-out (their table
 ///   excludes Q6_K off-Intel entirely — 2-byte alignment is an Intel-only win). Re-measure with a
@@ -400,19 +423,26 @@ fn mmv_decode_enabled() -> bool {
 /// verify/prefill tier (see [`mrow_int8_dtype_ok`]) — a dtype added here is int8 in BOTH streams
 /// or in NEITHER. That is the invariant whose violation broke Q5_K token-identity (decode int8,
 /// verify f32-exact, or vice versa: the occasional greedy argmax flips between the spec and
-/// non-spec streams). Concretely on AMD today: Q2_K int8 in both, Q3_K f32-exact in both.
+/// non-spec streams). Concretely on AMD today: Q2_K int8 in both, Q3_K f32-exact in both, Q4_K
+/// f32-exact at m=1 / int8 at m>=3 (the pre-existing, deliberately untouched wart — see
+/// `mrow_int8_dtype_ok`'s doc — which the paragraph above found is not merely a wart: even fully
+/// symmetric-by-dtype Q4_K still isn't symmetric-by-VALUE across these two particular kernels).
 ///
 /// `INFR_MMV_MW=1` force-enables the FULL measured-safe dtype set {Q4_K, Q6_K, Q2_K, Q3_K} on ANY
-/// vendor (including the known-loss AMD Q4_K case) for A/B measurement; `INFR_MMV_MW=0` force-off
-/// everywhere. Both flow through [`mmv_int8_decode_dtypes`], so the A/B escapes stay symmetric
-/// too. `INFR_MMV_MW_WARPS` ∈ {4,8}.
+/// vendor (including the known-MTP-breaking AMD Q4_K case, opt-in only) for A/B measurement;
+/// `INFR_MMV_MW=0` force-off everywhere. Both flow through [`mmv_int8_decode_dtypes`], so the A/B
+/// escapes stay symmetric too. `INFR_MMV_MW_WARPS` ∈ {1,2,4,8,16} — {1,2,16} are Q4_K-only
+/// dispatch-shape sweep builds (see `native_mmv_mw_build_spv`), not shipped for Q6_K/Q2_K/Q3_K.
 fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [infr_core::DType] {
     use infr_core::DType::{Q2K, Q3K, Q4K, Q6K};
     match std::env::var("INFR_MMV_MW").ok().as_deref() {
         Some("0") => &[],                                   // force-off everywhere
         Some(_) => &[Q4K, Q6K, Q2K, Q3K], // explicit opt-in: full set, any vendor (A/B)
         None if caps.vendor_intel => &[Q4K, Q6K, Q2K, Q3K], // Intel: all four measured wins
-        None => &[Q2K], // AMD default: only the measured win (Q4_K measured a LOSS, see doc)
+        // AMD default: only the measured-safe win. Q4_K measures faster than f32 now (see doc) but
+        // stays OFF — it breaks MTP token-identity (mtp_spec_matches_target_only_greedy) against
+        // the pre-existing always-int8 mrow verify tier. INFR_MMV_MW=1 opt-in only.
+        None => &[Q2K],
     }
 }
 
@@ -449,13 +479,25 @@ fn mmv_mw_choice(
     if !in_f.is_multiple_of(32) || in_f * out_f < (2usize << 20) {
         return None;
     }
+    // Default WARPS is per-(vendor, dtype): Intel keeps 8 (pre-existing, measured good for all four
+    // Intel dtypes). AMD Q4_K defaults to 1 — the dispatch-shape sweep winner (README footnote 3:
+    // llama.cpp's rm_kq_int=1 shape, one output row per workgroup / single-subgroup reduce, beats
+    // {4,8} and beats the f32 path). AMD Q2_K stays at 8, its already-measured/shipped shape — not
+    // re-swept here, so left untouched rather than assumed to share Q4_K's optimum.
+    let default_warps = if caps.vendor_intel || dt != infr_core::DType::Q4K {
+        8u32
+    } else {
+        1u32
+    };
     let warps = std::env::var("INFR_MMV_MW_WARPS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(8u32);
+        .unwrap_or(default_warps);
     // sg16=false probe: the SG=16 twin set is identical per (dtype, res, warps), so base existence
-    // is the correct gate on every device.
-    (matches!(warps, 4 | 8)
+    // is the correct gate on every device. {1,2,16} are Q4_K-only dispatch-shape sweep builds (see
+    // README footnote 3 / native_mmv_mw_build_spv) — not part of the shipped {4,8} policy set for
+    // Q6_K/Q2_K/Q3_K, only reachable via the INFR_MMV_MW_WARPS A/B escape for those dtypes.
+    (matches!(warps, 1 | 2 | 4 | 8 | 16)
         && crate::gemm::native_mmv_mw_build_spv(dt, false, warps, false).is_some())
     .then_some(warps)
 }
@@ -4666,6 +4708,12 @@ mod tests {
         assert!(mrow_int8_dtype_ok(&amd, DType::Q2K));
         assert!(!mmv_int8_decode_dtypes(&amd).contains(&DType::Q3K));
         assert!(!mrow_int8_dtype_ok(&amd, DType::Q3K));
+        // Q4_K stays OFF the AMD decode default despite measuring a real throughput win in
+        // isolation (README footnote 3 / mmv_int8_decode_dtypes's doc): flipping it broke
+        // mtp_spec_matches_target_only_greedy against the pre-existing always-int8 mrow tier below
+        // (both streams int8 is necessary but not sufficient for token-identity — the two kernels
+        // aren't bit-identical for the same position). INFR_MMV_MW=1 opt-in only.
+        assert!(!mmv_int8_decode_dtypes(&amd).contains(&DType::Q4K));
         // The exempt pre-existing set stays unconditional (not something this policy may weaken).
         for dt in [DType::Q4K, DType::Q6K, DType::Iq4Xs] {
             assert!(mrow_int8_dtype_ok(&amd, dt), "{dt:?} mrow must stay on");

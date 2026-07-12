@@ -1014,6 +1014,41 @@ fn main() {
             "native_mmv_mw_q4k_w8_res",
             &["-DFMT_Q4K", "-DWARPS=8", "-DUSE_RES"],
         ),
+        // Dispatch-shape sweep (Q4_K only, root cause #2 in README footnote 3): WARPS ∈ {1,2,16}
+        // extends the {4,8} set above. WARPS=1 is llama.cpp's rm_kq_int=1 shape (one output row
+        // per workgroup, single-subgroup reduce, no cross-warp anything) — the AMD non-GCN mmvq
+        // config footnote 3 names as the untried lever. Gated through the same INFR_MMV_MW_WARPS
+        // env escape as {4,8}; not part of the default policy set.
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w1",
+            &["-DFMT_Q4K", "-DWARPS=1"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w1_res",
+            &["-DFMT_Q4K", "-DWARPS=1", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w2",
+            &["-DFMT_Q4K", "-DWARPS=2"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w2_res",
+            &["-DFMT_Q4K", "-DWARPS=2", "-DUSE_RES"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w16",
+            &["-DFMT_Q4K", "-DWARPS=16"],
+        ),
+        (
+            "native_mmv_mw",
+            "native_mmv_mw_q4k_w16_res",
+            &["-DFMT_Q4K", "-DWARPS=16", "-DUSE_RES"],
+        ),
         (
             "native_mmv_mw",
             "native_mmv_mw_q6k_w4",

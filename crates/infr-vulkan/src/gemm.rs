@@ -522,6 +522,13 @@ pub(crate) fn native_mmv_mw_build_spv(
         }};
     }
     match (dtype, res, warps, sg16) {
+        // Dispatch-shape sweep builds (Q4_K only, WARPS ∈ {1,2,16} — no sg16 twin, AMD-only probe).
+        (Q4K, false, 1, false) => v!("native_mmv_mw_q4k_w1"),
+        (Q4K, true, 1, false) => v!("native_mmv_mw_q4k_w1_res"),
+        (Q4K, false, 2, false) => v!("native_mmv_mw_q4k_w2"),
+        (Q4K, true, 2, false) => v!("native_mmv_mw_q4k_w2_res"),
+        (Q4K, false, 16, false) => v!("native_mmv_mw_q4k_w16"),
+        (Q4K, true, 16, false) => v!("native_mmv_mw_q4k_w16_res"),
         (Q4K, false, 4, false) => v!("native_mmv_mw_q4k_w4"),
         (Q4K, true, 4, false) => v!("native_mmv_mw_q4k_w4_res"),
         (Q4K, false, 8, false) => v!("native_mmv_mw_q4k_w8"),

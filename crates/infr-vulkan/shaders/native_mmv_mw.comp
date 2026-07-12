@@ -76,16 +76,15 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     uvec2 km = k4(sub, bd + 4u);
     float dl = d * float(km.x);
     float mm = dmin * float(km.y);
-    uint qbase = bd + 16u + (sub >> 1u) * 32u;
+    // qbase is always word-aligned (bd = sb·144, 144 % 4 == 0; +16 +32·k) — load each 4-byte
+    // quant word ONCE and nibble-mask it packed, same as native_mmv_mrow.comp's wdec, instead of
+    // 4 rb() byte loads + shift + re-pack per word.
+    uint qword = (bd + 16u + (sub >> 1u) * 32u) >> 2u;
     bool lo = (sub & 1u) == 0u;
     int dp = 0;
     for (uint j = 0u; j < 8u; j++) {
-        uint qp = 0u;
-        for (uint b = 0u; b < 4u; b++) {
-            uint qbyte = rb(qbase + j * 4u + b);
-            uint val = lo ? (qbyte & 0xFu) : (qbyte >> 4u);
-            qp |= val << (b * 8u);
-        }
+        uint w = nw[qword + j];
+        uint qp = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
         dp = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp);
     }
     return dl * da * float(dp) - mm * sa;

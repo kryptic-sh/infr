@@ -83,7 +83,9 @@ pub(super) struct DecodeHandles {
     // called with `gpu_sc: Some(true)` AND `dyn_sc_scale: true`; `None` otherwise (Metal's SC
     // subgraph, and every non-SC build) — mirrors `sc_logits`/`sc_embt`'s gating.
     temp_inv: Option<TensorId>,
-    logits: TensorId,
+    // `None` for headless builds (`logits_rows == 0` — the batched-prefill chunks, whose logits
+    // nothing consumes); `Some` everywhere else.
+    logits: Option<TensorId>,
     // MTP Phase 1 (issue #33, docs/MTP.md): the LM-head INPUT — the same rows `logits` was
     // computed from, one op earlier (post-`output_norm`, pre-`w_lm`). `Some` only when `build`
     // was called with `h_tap: true`; `None` for every ordinary caller (no extra op, no extra
@@ -875,7 +877,9 @@ pub(crate) fn generate_dense_backend(
     // `batch = 1` is the normal decode path; `batch > 1` is the batched-prefill path.
     // Scratch tensors scale by `batch`; the LM head runs on the last `logits_rows` tokens —
     // 1 everywhere except speculative VERIFY, which needs the distribution after every
-    // candidate (logits output = [logits_rows, vocab], logits_rows ∈ {1, batch}).
+    // candidate (logits output = [logits_rows, vocab], logits_rows ∈ {0, 1, batch}).
+    // `logits_rows == 0` builds a HEADLESS graph (no logits Output, no LM-head tail at all) —
+    // the batched-prefill chunks, whose logits nothing consumes (task #27).
     // `denoise`: build the DiffusionGemma canvas-denoise variant of this layer stack instead of
     // the ordinary causal forward — see docs/DIFFUSIONGEMMA.md's "Seam extensions". `batch` is the
     // canvas length C, `start_pos` the prompt length P (unchanged meaning: WriteKv still lands at
@@ -1278,7 +1282,13 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
-        let logits = g.output(f32d(c.vocab * logits_rows));
+        // `logits_rows == 0` (task #27): a HEADLESS graph — the chunked batched-prefill path,
+        // whose per-chunk logits nothing ever consumes (the sampler reads the decode loop's own
+        // fresh logits for the LAST prompt token; earlier rows' logits were always discarded).
+        // No logits Output is declared and the whole LM-head tail (output_norm RmsNorm over the
+        // chunk, last-row Copy, vocab-wide Linear, Softcap, sampling ops) is skipped — the
+        // graph's effect is purely its KV writes.
+        let logits = (logits_rows > 0).then(|| g.output(f32d(c.vocab * logits_rows)));
 
         // scratch (sized to the per-layer max × batch; ops reallocate dst, so these are upper bounds)
         let hn = g.internal(f32d(batch * ne));
@@ -2590,95 +2600,102 @@ pub(crate) fn generate_dense_backend(
                 });
             }
         }
-        g.push(Op::RmsNorm {
-            x: hidden,
-            weight: w_out_norm,
-            dst: hn,
-            rows: batch as u32,
-            dim: ne as u32,
-            eps,
-        });
-        // For batch > 1 with logits_rows == 1: the LM head runs only on the LAST token's
-        // hidden state — extract it via Op::Copy before the projection so the logits output is
-        // [vocab]. Speculative verify passes logits_rows == batch and runs the head over every
-        // row instead (no Copy).
-        let lm_in = if batch > 1 && logits_rows == 1 {
-            let hn_last = g.internal(f32d(ne));
-            g.push(Op::Copy {
-                src: hn,
-                src_off: ((batch - 1) * ne) as u32,
-                dst: hn_last,
-                dst_off: 0,
-                n: ne as u32,
+        // LM-head tail — skipped entirely for headless builds (`logits_rows == 0`, the batched
+        // prefill chunks: see `logits`' declaration above).
+        let (h_out, tok_id, u_in) = if let Some(logits) = logits {
+            g.push(Op::RmsNorm {
+                x: hidden,
+                weight: w_out_norm,
+                dst: hn,
+                rows: batch as u32,
+                dim: ne as u32,
+                eps,
             });
-            hn_last
-        } else {
-            hn
-        };
-        // MTP Phase 1 (issue #33): `lm_in` IS the tap target — exactly the rows `logits` is about
-        // to be computed from, one op earlier (the reference's `res->t_h_nextn`, captured right
-        // after `output_norm` in `qwen35.cpp`). A plain Copy into a fresh Output, so this never
-        // disturbs `lm_in`'s existing consumer (the `Op::Linear` below).
-        let h_out = if h_tap {
-            let ho = g.output(f32d(ne * logits_rows));
-            g.push(Op::Copy {
-                src: lm_in,
-                src_off: 0,
-                dst: ho,
-                dst_off: 0,
-                n: (ne * logits_rows) as u32,
-            });
-            Some(ho)
-        } else {
-            None
-        };
-        g.push(Op::Linear {
-            x: lm_in,
-            weight: w_lm,
-            dst: logits,
-            m: logits_rows as u32,
-            in_f: ne as u32,
-            out_f: c.vocab as u32,
-            w_off: 0,
-        });
-        if c.final_softcap > 0.0 {
-            g.push(Op::Softcap {
-                x: logits,
+            // For batch > 1 with logits_rows == 1: the LM head runs only on the LAST token's
+            // hidden state — extract it via Op::Copy before the projection so the logits output is
+            // [vocab]. Speculative verify passes logits_rows == batch and runs the head over every
+            // row instead (no Copy).
+            let lm_in = if batch > 1 && logits_rows == 1 {
+                let hn_last = g.internal(f32d(ne));
+                g.push(Op::Copy {
+                    src: hn,
+                    src_off: ((batch - 1) * ne) as u32,
+                    dst: hn_last,
+                    dst_off: 0,
+                    n: ne as u32,
+                });
+                hn_last
+            } else {
+                hn
+            };
+            // MTP Phase 1 (issue #33): `lm_in` IS the tap target — exactly the rows `logits` is about
+            // to be computed from, one op earlier (the reference's `res->t_h_nextn`, captured right
+            // after `output_norm` in `qwen35.cpp`). A plain Copy into a fresh Output, so this never
+            // disturbs `lm_in`'s existing consumer (the `Op::Linear` below).
+            let h_out = if h_tap {
+                let ho = g.output(f32d(ne * logits_rows));
+                g.push(Op::Copy {
+                    src: lm_in,
+                    src_off: 0,
+                    dst: ho,
+                    dst_off: 0,
+                    n: (ne * logits_rows) as u32,
+                });
+                Some(ho)
+            } else {
+                None
+            };
+            g.push(Op::Linear {
+                x: lm_in,
+                weight: w_lm,
                 dst: logits,
-                cap: c.final_softcap,
-                n: (c.vocab * logits_rows) as u32,
+                m: logits_rows as u32,
+                in_f: ne as u32,
+                out_f: c.vocab as u32,
+                w_off: 0,
             });
-        }
-        // GPU-resident sampling: pick the token ON the device so only the 4-byte id crosses
-        // back to the host (the [vocab] logits stay in VRAM). Appended last so it reads the
-        // final (softcapped) logits. Greedy = Op::Argmax; stochastic = Op::Sample with the
-        // host-drawn uniform read from the 1-float `u_in` Input. `logits_rows > 1` with
-        // `gpu_argmax` is the MTP speculative-verify accept (issue #31): one per-row argmax,
-        // m ids read back instead of m×vocab logits.
-        let (tok_id, u_in) = if gpu_argmax {
-            let tid = g.output(f32d(logits_rows));
-            g.push(Op::Argmax {
-                x: logits,
-                dst: tid,
-                n: c.vocab as u32,
-                rows: logits_rows as u32,
-            });
-            (Some(tid), None)
-        } else if gpu_sample && logits_rows == 1 {
-            let uin = g.input(f32d(1));
-            let tid = g.output(f32d(1));
-            g.push(Op::Sample {
-                x: logits,
-                u: uin,
-                dst: tid,
-                n: c.vocab as u32,
-                top_k: sampler.top_k as u32,
-                temp: sampler.temp,
-                top_p: sampler.top_p,
-            });
-            (Some(tid), Some(uin))
+            if c.final_softcap > 0.0 {
+                g.push(Op::Softcap {
+                    x: logits,
+                    dst: logits,
+                    cap: c.final_softcap,
+                    n: (c.vocab * logits_rows) as u32,
+                });
+            }
+            // GPU-resident sampling: pick the token ON the device so only the 4-byte id crosses
+            // back to the host (the [vocab] logits stay in VRAM). Appended last so it reads the
+            // final (softcapped) logits. Greedy = Op::Argmax; stochastic = Op::Sample with the
+            // host-drawn uniform read from the 1-float `u_in` Input. `logits_rows > 1` with
+            // `gpu_argmax` is the MTP speculative-verify accept (issue #31): one per-row argmax,
+            // m ids read back instead of m×vocab logits.
+            let (tok_id, u_in) = if gpu_argmax {
+                let tid = g.output(f32d(logits_rows));
+                g.push(Op::Argmax {
+                    x: logits,
+                    dst: tid,
+                    n: c.vocab as u32,
+                    rows: logits_rows as u32,
+                });
+                (Some(tid), None)
+            } else if gpu_sample && logits_rows == 1 {
+                let uin = g.input(f32d(1));
+                let tid = g.output(f32d(1));
+                g.push(Op::Sample {
+                    x: logits,
+                    u: uin,
+                    dst: tid,
+                    n: c.vocab as u32,
+                    top_k: sampler.top_k as u32,
+                    temp: sampler.temp,
+                    top_p: sampler.top_p,
+                });
+                (Some(tid), Some(uin))
+            } else {
+                (None, None)
+            };
+            (h_out, tok_id, u_in)
         } else {
-            (None, None)
+            (None, None, None)
         };
         (
             g,
@@ -3029,7 +3046,10 @@ pub(crate) fn generate_dense_backend(
                 .expect("non-ping path always allocates logits_buf")
                 .as_ref()
         };
-        db.bind(dcache.dh.logits, logits_out_buf);
+        db.bind(
+            dcache.dh.logits.expect("denoise build has logits"),
+            logits_out_buf,
+        );
         let t_exec0 = std::time::Instant::now();
         be.execute(dcache.plan.as_ref(), &db)
             .map_err(|e| anyhow!("{e}"))?;
@@ -3216,7 +3236,10 @@ pub(crate) fn generate_dense_backend(
         for (i, wid) in vh.weights.iter().enumerate() {
             vb.bind(*wid, wbufs[i].as_ref());
         }
-        vb.bind(vh.logits, vf_logits_buf.as_ref());
+        vb.bind(
+            vh.logits.expect("verify build has logits"),
+            vf_logits_buf.as_ref(),
+        );
         // The m-slot id output (gpu_verify_ids builds only) — 4 bytes/row readback.
         let vf_ids_buf = if gpu_verify_ids {
             Some(
@@ -3432,14 +3455,17 @@ pub(crate) fn generate_dense_backend(
                 None
             };
             let pf_t0 = std::time::Instant::now();
+            // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
+            // chunk's logits — the decode loop below feeds the LAST prompt token itself and
+            // samples from its own fresh logits — so the LM-head tail (whole-chunk output_norm,
+            // last-row Copy, vocab-wide Linear, Softcap) is skipped per chunk. On a 262k-vocab
+            // model that drops a vocab×n_embd GEMV + a [chunk, n_embd] RmsNorm per chunk.
             // MTP h-tap gap (Phase 2 TODO, docs/MTP.md): the chunked BATCHED-PREFILL path never
-            // taps `h` — it only ever runs `logits_rows == 1` (the last row of each chunk, which
-            // this phase never samples/reads), so there's no per-row hidden state worth exposing
-            // here yet. The MTP catch-up driver needs `h` for EVERY prefill row (not just chunk
-            // tails); wiring that requires this path to also carry `logits_rows == pf_m` on
-            // demand, which Phase 2 will add alongside the actual head forward.
+            // taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring that
+            // requires this path to carry `logits_rows == pf_m` on demand, which Phase 2 will
+            // add alongside the actual head forward.
             let (pf_g, pf_h) = build(
-                pf_m, cstart, 1, false, None, false, false, false, false, gpu_embed,
+                pf_m, cstart, 0, false, None, false, false, false, false, gpu_embed,
             );
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
@@ -3470,7 +3496,10 @@ pub(crate) fn generate_dense_backend(
             for (i, wid) in pf_h.weights.iter().enumerate() {
                 pf_b.bind(*wid, wbufs[i].as_ref());
             }
-            pf_b.bind(pf_h.logits, logits_buf.as_ref());
+            debug_assert!(
+                pf_h.logits.is_none(),
+                "headless prefill build has no logits"
+            );
             be.execute(pf_plan.as_ref(), &pf_b)
                 .map_err(|e| anyhow!("{e}"))?;
             // INFR_PROF_PF: split the per-chunk prefill wall time into host graph build, plan
@@ -3574,7 +3603,10 @@ pub(crate) fn generate_dense_backend(
         for (i, wid) in h.weights.iter().enumerate() {
             b.bind(*wid, wbufs[i].as_ref());
         }
-        b.bind(h.logits, logits_buf.as_ref());
+        b.bind(
+            h.logits.expect("decode build has logits"),
+            logits_buf.as_ref(),
+        );
         if let Some(tid) = h.tok_id {
             b.bind(tid, id_out);
         }
@@ -3785,7 +3817,10 @@ pub(crate) fn generate_dense_backend(
             for (i, wid) in h.weights.iter().enumerate() {
                 b.bind(*wid, wbufs[i].as_ref());
             }
-            b.bind(h.logits, logits_buf.as_ref());
+            b.bind(
+                h.logits.expect("decode build has logits"),
+                logits_buf.as_ref(),
+            );
             if let Some(tid) = h.tok_id {
                 b.bind(tid, id_out);
             }

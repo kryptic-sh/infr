@@ -153,21 +153,37 @@ pub(crate) fn generate_dense_vulkan_session(
 /// full prefill chunk of `rows = min(ubatch, want_ctx)` rows (the runner chunks batched prefill at
 /// INFR_UBATCH, default 1024; decode's single row is dwarfed by this).
 ///
-/// Derivation — measured on gemma-4-31B UD-Q5_K_XL (n_embd 5376, n_ff 32768, vocab 262144) on a
-/// 24 GiB 7900 XTX by tracing the live-VRAM watermark at every alloc-guard check on a forced
-/// -resident run: a 1024-row prefill chunk at ctx 2064 committed ~1.1 GB of activation pools
-/// (dominant single allocs: 512 MiB = rows*vocab*2 whole-chunk f16 logits, 256 MiB = rows*2*n_ff*4
-/// fused gate_up f32, 168 MiB = rows*8*n_embd*4 fused qkv f32, 128 MiB = rows*n_ff*4) and needed
-/// at least 1.7 GB before the guard cut it off; a 528-row chunk fit in ~0.6 GB. Per-row model:
-/// `2*vocab` (whole-chunk f16 logits, the largest term on a 262k-vocab model) + `12*n_ff` (fused
-/// gate_up out `8*n_ff` + activated intermediate `4*n_ff`, f32) + `96*n_embd` (qkv/attn-out/norm/
-/// residual f32 temps: measured `32*n_embd`, 3x for pool variety across graph shapes —
-/// m1/m2..m8/prefill each pool their own tags). All times a 1.25 margin for unmeasured tails
-/// (flash partials, per-shape pool duplicates), plus a fixed
-/// 256 MiB for what shapes don't scale: gpu-allocator's block granularity, retained upload
-/// staging (device-local under ReBAR), and the weight-buffer u32/dedicated-alloc padding not in
-/// `weight_footprint`. Deliberately a slight over-reserve: under-reserving makes the alloc-time
-/// VRAM guard error a live request mid-prefill, over-reserving only streams a borderline model.
+/// Derivation — measured on gemma-4-31B UD-Q5_K_XL (n_embd 5376, n_ff 32768, n_head 32,
+/// head_dim 512/256 full/SWA) on a 24 GiB 7900 XTX with a tagged allocation trace
+/// (INFR_ALLOC_TRACE-style eprintln on every ≥16 MiB activation alloc) at a 1024-row prefill
+/// chunk, ctx 2064:
+/// - Internal graph tensors (`alloc_scratch`, ~850 MiB): fused gate_up out `[rows, 2*n_ff]` f32
+///   (256 MiB) + activated intermediate `[rows, n_ff]` f32 (128 MiB) + fused qkv staging
+///   (168 MiB = rows*8*n_embd*4 here) + ~a dozen `[rows, n_embd]`-class f32/f16 temps.
+///   Modeled as `12*n_ff + 96*n_embd` per row (the n_embd umbrella also absorbs the
+///   lin_a16/mmq activation-quant pools, which are n_embd/n_ff-wide f16/i8).
+/// - Attention pools — the term a previous calibration MISATTRIBUTED as "rows*vocab*2
+///   whole-chunk f16 logits" (batched prefill has run a last-row-only m=1 LM head since long
+///   before that trace, and is fully headless now — no logits allocation scales with rows;
+///   2*vocab merely coincided with the real per-row attention bytes on this model, where
+///   2*262144 == 8*n_head*head_dim*4 at head_dim 512):
+/// - `nonfa_pv`/`flash_po`: `8*rows*n_head*head_dim*4` per DISTINCT head shape — gemma4
+///   alternates SWA(256)/full(512) head dims, so BOTH pools live at once (512 + 256 MiB
+///   measured) → `32*n_head*(head_dim + head_dim_swa-if-distinct)` per row.
+/// - `nonfa_s` (score tiles, non-flash tier only — any model with SWA layers or
+///   head_dim != 128): `n_head*rows*kv_pad*2`, kv_pad = kv_len rounded up to 256. The pool
+///   key includes the byte size, so as kv grows across chunks stale sizes are retained —
+///   modeled as 2 live pools at the final ctx: `4*n_head*ctx_pad` per row. Uniform-hd-128
+///   no-SWA models (llama/qwen3) ride the single-pass flash tier: no score tiles, only the
+///   (negligible) flash_pm/pl partials — term skipped.
+///
+/// All times a 1.25 margin for unmeasured tails (split-path partials, per-shape pool
+/// duplicates), plus a fixed 256 MiB for what shapes don't scale: gpu-allocator's block
+/// granularity, retained upload staging (device-local under ReBAR), and the weight-buffer
+/// u32/dedicated-alloc padding not in `weight_footprint`. Deliberately a slight over-reserve:
+/// under-reserving makes the alloc-time VRAM guard error a live request mid-prefill (exactly
+/// what the old formula did on this 31B at pp2048 — the second chunk's 512 MiB `nonfa_pv`
+/// tripped the guard mid-run), over-reserving only streams/clamps a borderline model.
 pub(crate) fn dense_act_reserve(cfg: &Config, want_ctx: usize) -> u64 {
     dense_act_reserve_at(cfg, want_ctx, ubatch_rows())
 }
@@ -176,7 +192,28 @@ pub(crate) fn dense_act_reserve(cfg: &Config, want_ctx: usize) -> u64 {
 pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize) -> u64 {
     // Prefill GEMM outputs pad rows to 64 (see the Vulkan adapter's `alloc_scratch`).
     let rows = ubatch.min(want_ctx).max(1).next_multiple_of(64) as u64;
-    let per_row = (2 * cfg.vocab + 12 * cfg.n_ff + 96 * cfg.n_embd) as u64;
+    // Attention pv accumulators: one pool per distinct (n_head, head_dim) shape.
+    let hd_shapes = if cfg.swa_window > 0 && cfg.head_dim_swa != cfg.head_dim {
+        cfg.head_dim + cfg.head_dim_swa
+    } else {
+        cfg.head_dim
+    };
+    let attn_pv = 32 * cfg.n_head * hd_shapes;
+    // Non-flash score tiles (see the doc above): skipped for uniform-hd-128 no-SWA models.
+    // When ONLY the SWA layers miss the flash tier (hd == 128, e.g. gemma3-12b: full layers are
+    // Causal+hd128 = flash), the widest score tile is the SWA ring's `window + chunk` rows, not
+    // the full context.
+    let attn_s = if cfg.swa_window == 0 && cfg.max_head_dim() == 128 {
+        0
+    } else {
+        let kv_span = if cfg.max_head_dim() == 128 {
+            want_ctx.min(cfg.swa_window + ubatch)
+        } else {
+            want_ctx
+        };
+        4 * cfg.n_head * kv_span.next_multiple_of(256)
+    };
+    let per_row = (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s) as u64;
     const FIXED: u64 = 256 * 1024 * 1024;
     FIXED + rows * per_row * 5 / 4
 }

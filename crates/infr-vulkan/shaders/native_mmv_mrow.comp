@@ -73,9 +73,14 @@ float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 // since each SPV build activates exactly one FMT_* define, so there is never a redefinition.
 int sgn8(uint b) { return int(b) - ((b > 127u) ? 256 : 0); }
 
-#ifdef FMT_Q3K
-// Unaligned u32 via two word loads + funnel shift (Q3_K's 110-byte blocks are only 2-aligned) —
-// same helper as native_mmv_mw.comp's FMT_Q3K.
+#if defined(FMT_Q3K) || defined(FMT_Q6K)
+// Unaligned u32 via two word loads + funnel shift — same helper as native_mmv_mw.comp's FMT_Q3K.
+// Q3_K's 110-byte blocks are only 2-aligned. Q6_K's 210-byte blocks are ALSO only 2-aligned (210 %
+// 4 == 2), so every odd-indexed super-block's `bd` sits at a byte offset that is 2 mod 4, not 0 —
+// unlike Q4_K (144 % 4 == 0) and Q5_K (176 % 4 == 0), a plain `nw[byte >> 2]` load is illegal here
+// for anything computed as an offset from `bd` (ql/qh planes both inherit `bd`'s parity). This
+// funnel-shift load is what makes the FMT_Q6K word-parallel unpack below correct at BOTH parities
+// instead of silently misreading every other super-block.
 uint ru32u(uint byte) {
     uint w0 = nw[byte >> 2u];
     uint sh = (byte & 3u) << 3u;
@@ -159,6 +164,23 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 // Q6_K: [u8 ql[128]][u8 qh[64]][i8 scales[16]][f16 d] = 210 bytes, 256 elements. The i8 scale
 // covers 16 elements, so the 32-block splits into two dp4a groups (words 0..3 / 4..7): f0 = d·sc0,
 // f1 = d·sc1. The 6-bit q re-biases to signed (q−32) at pack time — no min/Σa term.
+//
+// Word-parallel unpack (was byte-at-a-time: 8 rb() loads for ql + 8 more for qh per 32-elem
+// sub-block — the dp4a-decode -25% AMD regression this rewrite targets). `ql`/`qh` are each loaded
+// as one aligned-OR-unaligned u32 per j (via `ru32u`, see its doc: bd is only 2-byte aligned on odd
+// super-blocks, so a plain `nw[]` word load would misread half of them) instead of 4 scalar byte
+// loads, then all 4 byte lanes are unpacked together with mask/shift, mirroring FMT_Q4K's nibble
+// trick and FMT_Q5K's qh-bit-plane trick:
+//   - nibble select: `qlw & 0x0F0F0F0F` (low) or `(qlw >> 4) & 0x0F0F0F0F` (high) — masking after
+//     the shift discards the cross-byte bits the `>>4` pulls in from the next lane, same as Q4_K.
+//   - 2-bit qh field: `((qhw >> qshift) & 0x03030303) << 4` — qshift < 8 so the mask likewise
+//     isolates each byte's own field before it's parked at bits [5:4], same shape as Q5_K's qh bit.
+//   - signed rebias (q−32, q ∈ 0..63, packed as a two's-complement byte): plain per-byte
+//     subtraction can't be done as one 32-bit op (borrow would propagate across byte lanes when a
+//     byte's code is < 32). SWAR-safe form: q ∈ [0,63] so q+96 ∈ [96,159] never over/underflows a
+//     byte lane, and `(x + 128) mod 256 == x xor 128` for any 8-bit x — so
+//     `(q + 0x60606060) ^ 0x80808080` == `(q − 32) mod 256` per byte lane, with zero cross-lane
+//     borrow, bit-identical to the old `(q - 32u) & 0xFFu` computed one byte at a time.
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 256u) * 210u;
     uint p0 = gelem % 256u;
@@ -167,16 +189,14 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint qho = hf * 32u; uint scbase = bd + 192u + hf * 8u + 2u * og;
     bool high = og >= 2u; uint qshift = og * 2u;
     uint qoff = bd + hf * 64u + (((og & 1u) == 1u) ? 32u : 0u); // ql half (qa/qb) once
+    uint qhbase = bd + 128u + qho;
     for (uint j = 0u; j < 8u; j++) {
-        uint w = 0u;
-        for (uint b = 0u; b < 4u; b++) {
-            uint base = rb(qoff + j * 4u + b);
-            uint qh = rb(bd + 128u + qho + j * 4u + b);
-            uint nib = high ? (base >> 4u) : (base & 0xFu);
-            uint q = nib | (((qh >> qshift) & 3u) << 4u);
-            w |= ((q - 32u) & 0xFFu) << (b * 8u); // two's-complement signed byte
-        }
-        qp[j] = w;
+        uint qlw = ru32u(qoff + j * 4u);
+        uint qhw = ru32u(qhbase + j * 4u);
+        uint nib = high ? ((qlw >> 4u) & 0x0F0F0F0Fu) : (qlw & 0x0F0F0F0Fu);
+        uint bit2 = ((qhw >> qshift) & 0x03030303u) << 4u;
+        uint q = nib | bit2; // six-bit codes, one per byte lane, each in 0..63
+        qp[j] = (q + 0x60606060u) ^ 0x80808080u; // (q − 32) as two's-complement bytes, SWAR-safe
     }
     f0 = d * float(sgn8(rb(scbase)));
     f1 = d * float(sgn8(rb(scbase + 1u)));

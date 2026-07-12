@@ -415,11 +415,12 @@ fn mmv_decode_enabled() -> bool {
 ///   `mmv_row1_bit_identical` (`tests/mmv_row1_bit_identical.rs`). Intel is UNCHANGED (still
 ///   `native_mmv_mw.comp`, SG=16-pinned, WARPS-tuned) — no Intel GPU in this validation
 ///   environment, so its already-shipped, already-tuned kernel is left alone rather than swapped
-///   blind; see [`unified_mmv_row1`]. **Q6_K/Q3_K** stay UNMEASURED on AMD (no mid/large Q6_K and
-///   no Q3_K model in the validated local cache) — left OFF rather than assumed; this also matches
-///   llama.cpp's own carve-out (their table excludes Q6_K off-Intel entirely — 2-byte alignment is
-///   an Intel-only win). Both are now bit-identical-safe to flip (same unified kernel path) the
-///   moment they're measured; re-measure with a real model first.
+///   blind; see [`unified_mmv_row1`]. **Q3_K** stays UNMEASURED on AMD (no Q3_K model in the
+///   validated local cache) — left OFF rather than assumed. **Q6_K was MEASURED and REJECTED** —
+///   see the dedicated note in the `None` arm below (it wins on raw throughput after the
+///   word-parallel `wdec` rewrite, but fails `mtp_spec_matches_target_only_greedy`). Both are
+///   bit-identical-safe to flip in isolation (same unified kernel path, `mmv_row1_bit_identical`
+///   passes for both) — bit-identity alone is not sufficient, see the Q6_K note.
 ///
 /// Symmetry (MTP-verify only): this policy set is ALSO what gates every dtype's entry into the
 /// m>=3 int8 `mrow` kernel for an MTP-VERIFY batch (`Graph::mtp_verify`, see
@@ -470,8 +471,39 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
         None if caps.vendor_intel => &[Q4K, Q6K, Q2K, Q3K],
         // AMD default: Q2_K (measured +20.4%) and Q4_K (measured +2.3% tg128 in isolation, and now
         // bit-identical to its mrow verify twin via the unified rows=1 kernel — see
-        // `unified_mmv_row1` — so mtp_spec_matches_target_only_greedy holds). Q6_K stays OFF
-        // (decode unmeasured on AMD, not unsafe).
+        // `unified_mmv_row1` — so mtp_spec_matches_target_only_greedy holds).
+        //
+        // **Q6_K was TRIED default-on here and REVERTED** — record of a real, reproducible failure
+        // so it isn't re-attempted blind. `native_mmv_mrow.comp`'s FMT_Q6K `wdec` used to unpack its
+        // `ql`/`qh` bit-planes byte-at-a-time (8 `rb()` scalar loads per 32-elem sub-block, vs the
+        // word-parallel nibble-mask loads every other k-quant format already used) — the prime
+        // suspect for Q6_K's -25% AMD decode loss (44.3 int8 vs 58.9 f32 t/s, Qwen3-14B-Q6_K). That
+        // was REWRITTEN to a word-parallel unpack (aligned/funnel-shifted `ru32u` word loads +
+        // SWAR mask/shift/XOR rebias, bit-identical to the old byte loop — proved by exhaustive
+        // random byte-lane simulation and by `mmv_row1_bit_identical`/`mmv_mw_parity` staying green)
+        // and it WORKED on the throughput axis: decode `-p0 -n64 -r10` 44.3 → ~61-64 t/s, now
+        // BEATING f32 (58.4 t/s, +5-10%); prefill `pp4@d4096 -r3` 137.9 → ~183-184 t/s (+33%, on top
+        // of an already-shipped win — Q6_K was already unconditional int8 at ordinary prefill via
+        // [`mrow_int8_prefill_dtypes`], this rewrite just made that faster too).
+        //
+        // But flipping Q6_K into THIS set (which also gates MTP-verify, see `mrow_int8_dtype_ok`)
+        // FAILS `mtp_spec_matches_target_only_greedy` on Qwen3.5-4B-MTP — reproducibly, in TWO
+        // configurations: (1) the full `INFR_MMV_MW=1` opt-in set {Q4K,Q6K,Q2K,Q3K,Q5K}, and (2) an
+        // isolation probe with ONLY {Q4K,Q2K,Q6K} (Q3_K/Q5_K excluded, to rule out them being the
+        // cause) — both diverge from target-only greedy within the first ~30 generated tokens on the
+        // same prompt. This is NOT a bit-identity bug (`mmv_row1_bit_identical` passes for Q6_K —
+        // decode and MTP-verify dispatch the exact same kernel at the exact same position) and NOT a
+        // coherence cliff (`gpu_seam_matches_cpu_qwen3_q2k` — whose lm_head IS Q6_K — plus
+        // `gpu_seam_matches_cpu_qwen3_iq4xs` and `gpu_seam_matches_cpu_llama` all stayed coherent and
+        // matched the CPU oracle with Q6_K flipped on). It is instead genuine int8-activation
+        // quantization error: MTP verify's greedy argmax and the plain-decode chain it must match
+        // are computed at DIFFERENT sequence positions with different KV/context state even though
+        // they share a kernel, so the same small per-token int8 rounding noise that any quantized
+        // decode dtype carries (Q2_K/Q4_K pay it too, just rarely enough to not flip an argmax on
+        // the tests we run) was enough to flip a close-margin greedy token on this model/prompt. Not
+        // re-baselineable — the fix path is either an accuracy mitigation (int8 decode with an f32
+        // fallback near a logit-margin threshold?) or accepting the prefill-only win permanently, not
+        // a re-measure. Re-attempting needs that question answered, not just faster ALU.
         //
         // **Q3_K was TRIED default-on here and REVERTED** — record of a real, reproducible failure
         // so it isn't re-attempted blind. The case FOR it looked strong post-unification: decode is
@@ -501,7 +533,10 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
 /// must bit-match (see `infr_core::graph::Graph::mtp_verify`'s doc) — it is one path through the
 /// model, so it is free to take whichever kernel measures fastest, independent of the m=1 decode
 /// policy ([`mmv_int8_decode_dtypes`]) entirely. Every dtype here is a MEASURED win on
-/// Qwen3-14B (AMD RDNA3/RADV, `pp4@d4096`, r=3-5): Q6_K +67% (137.9 vs 82.8), IQ4_XS +81% (155.1
+/// Qwen3-14B (AMD RDNA3/RADV, `pp4@d4096`, r=3-5): Q6_K +67% (137.9 vs 82.8) at the time this table
+/// was written — since improved further to ~183-184 vs 72.8 f32 (+~150%) by the FMT_Q6K
+/// word-parallel `wdec` rewrite (see the dedicated note in `mmv_int8_decode_dtypes`'s `None` arm;
+/// same numerics, bit-identical, just less unpack ALU per element), IQ4_XS +81% (155.1
 /// vs 85.6), Q5_K +45% (188 vs 130), Q3_K +29% (211 vs 161) — Q2_K/Q4_K's wins predate this table
 /// (footnote 3). Q4_K/Q6_K/IQ4_XS were already unconditional mrow dtypes before this split (this
 /// is not a behavior change for them at prefill); Q2_K/Q3_K/Q5_K are newly unconditional here

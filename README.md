@@ -390,8 +390,24 @@ open. Until then the fix + WARPS=1 stay reachable via
 `INFR_MMV_MW=1 INFR_MMV_MW_WARPS=1` for A/B measurement on non-MTP workloads,
 where the win is real (14B Q4_K_M: tg128 0.92× → 0.94×, tg64@d4096 0.87× →
 0.89×, both still short of llama.cpp parity but a real step, not a forced one).
-Q6_K/Q3_K stay off on AMD as **unmeasured** (no suitable model in the validated
-cache) — left off rather than assumed.
+Q3_K stays off on AMD as **unmeasured** (no suitable model in the validated
+cache) — left off rather than assumed. **Q6_K was subsequently measured and
+rejected** (a later session, once a Q6_K model was cached):
+`native_mmv_mrow.comp`'s FMT_Q6K unpack was byte-at-a-time too (same bug
+class as Q4_K above), rewritten to a word-parallel `wdec` (bit-identical,
+proved by exhaustive byte-lane simulation plus
+`mmv_row1_bit_identical`/`mmv_mw_parity`), which closed the decode loss (14B
+Q6_K: 44.3 → ~61-64 t/s int8, now **beating** f32's 58.4) and widened the
+already-shipped prefill win (`pp4@d4096` 137.9 → ~183-184 vs 72.8 f32).
+Throughput fixed, but flipping it into the AMD decode-tier default still
+fails `mtp_spec_matches_target_only_greedy` — not a bit-identity bug (passes)
+and not a coherence cliff (three `gpu_seam_matches_cpu_*` golden tests,
+including one whose lm_head IS Q6_K, all stay coherent) but plain
+int8-activation quantization noise flipping a close-margin greedy token
+often enough across ~64 generated tokens on the MTP model. See
+`mmv_int8_decode_dtypes`'s doc in `crates/infr-vulkan/src/adapter.rs` for the
+full isolation record. Q6_K stays off the decode/MTP-verify tier; its prefill
+win ships unconditionally via `mrow_int8_prefill_dtypes`, unaffected by this.
 
 **Former wart, now CLOSED**: Q4_K/Q6_K/IQ4_XS used to take the int8 `mrow`
 kernel at m≥3 **unconditionally**, while their m=1 decode stayed f32-exact on

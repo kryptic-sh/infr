@@ -284,7 +284,7 @@ multi-turn serve shape).
 | Qwen3.5-9B (MTP)²     | UD-Q4_K_XL  | **1.16×**  | 0.93×     | 0.94×      | **1.44×** |
 | Gemma-3-12B           | Q4_K_M      | **1.25×**  | 1.00×     | **1.02×**  | **1.77×** |
 | Gemma-4-12B           | Q4_K_M      | **1.27×**  | 1.00×     | 0.99×      | **1.73×** |
-| Qwen3-14B             | Q2_K³       | **1.22×**  | 0.74×     | 0.72×      | 0.98×     |
+| Qwen3-14B             | Q2_K³       | **1.22×**  | 0.81×     | 0.78×      | **1.17×** |
 | Qwen3-14B             | Q4_K_M      | **1.12×**  | 0.92×     | 0.87×      | **1.30×** |
 | Qwen3-14B             | Q8_0        | **1.14×**  | **1.02×** | 0.97×      | 0.93×     |
 | Gemma-4-26B-A4B (MoE) | UD-Q4_K_M   | **1.06×**  | **1.03×** | **1.04×**  | **1.52×** |
@@ -330,16 +330,40 @@ only covered the SWA `ring_past` case — so the op fell through to the scalar
 whole-prompt verify is the only shape that reliably lands `kv_len` within one
 tile-pad of the cache's row capacity.
 
-³ The Qwen3-14B **Q2_K** decode gap (0.72–0.74×) is llama.cpp's dp4a **mmvq**
-int8-activation tier, which infr does not take by default. Note this is
-llama.cpp's **default** on this hardware, not an exotic mode:
-`ggml_vk_should_use_mmvq` returns true for every quant type on AMD at
-`k >= 2048`, carving out only Q6_K (2-byte alignment makes it a loss off Intel)
-and Q8_0 (GCN only) — so Q2_K/Q3_K/Q4_K/Q5_K all decode with Q8_1-quantized
-activations and an integer dot. `INFR_MMV_MW=1` already buys +20% on this row.
-Matching them is parity, not a regression in output quality, and doing it
-**symmetrically** (plain decode and MTP verify on the same tier) is the single
-lever behind both this row and footnote ²'s MTP gap.
+³ **Q2_K now decodes on the int8-activation tier by default on AMD**
+(`43806da`): tg128 0.74× → **0.81×**, tg64@d4096 0.72× → **0.78×**, and
+`pp4@d4096` 0.98× → **1.17×** (a loss turned into a win). This is the same trade
+llama.cpp takes — their `ggml_vk_should_use_mmvq` returns true for every quant
+type on AMD at `k >= 2048`, carving out only Q6_K (2-byte alignment, an
+Intel-only win) and Q8_0 (GCN only) — so matching it is parity, not a quality
+regression. infr's tier is **per-(dtype, vendor) with every entry measured on
+infr's own kernels** rather than inherited from llama.cpp's table (the two
+engines' kernels have different overheads, so a win on one does not imply a win
+on the other). It is also **symmetric**: any dtype on the int8 decode tier takes
+int8 in the MTP verify batch too — `mmv_int8_decode_dtypes` is the single source
+of truth both gates read, and a unit guard asserts they agree across every
+vendor × env combination. That symmetry is exactly the constraint footnote ²'s
+Q5_K attempt violated.
+
+**Q4_K is deliberately NOT on the tier on AMD: measured −9.6%** (14B Q4_K_M tg64
+78.5 → 71.0 t/s). That is a fact about _infr's_ kernel, not about the trade —
+llama.cpp defaults Q4_K to mmvq on AMD and still wins the row, so their
+`q4_k × q8_1` kernel beats their f32 path while ours loses to ours. Root cause
+found: infr's m=1 kernel unpacks Q4_K **byte-at-a-time**, where llama.cpp (and
+infr's own `mrow` kernel) read **aligned u32s** and nibble-mask 4 weights at a
+time. A throwaway patch to word-parallel unpack measured **+5.8%, bit-identical
+output**, leaving ~4% that is workgroup shape (llama.cpp runs one row per
+workgroup with a subgroup reduce; infr runs 8 warps/block, one row per warp —
+never swept). Fixing that kernel is the open lever on the mid/large decode rows,
+since Q4_K_M is the quant under nearly every model in this table. Q6_K/Q3_K stay
+off on AMD as **unmeasured** (no suitable model in the validated cache) — left
+off rather than assumed.
+
+Known wart, recorded rather than hidden: Q4_K/Q6_K/IQ4_XS take the int8 `mrow`
+kernel at m≥3 **unconditionally**, while their m=1 decode stays f32-exact on AMD
+— the same decode/verify asymmetry described above, pre-dating the policy table
+and live on every Q4_K MTP run today. It is untouched here (it is load-bearing
+for the Gemma-4-E2B `pp4@d4096` numbers) and queued as its own fix.
 
 ⁴ Gemma-4-31B (21.9 GiB weights on the 24 GB card) runs **fully resident,
 including at depth**, after two placement slices: try-resident-first dense
@@ -397,12 +421,18 @@ Decode is at-or-above parity up to ~1.7B, on the gemma-4 MoE (1.03×), and on th
   its batched verify amortizes further. Levers: wide-n small-m GEMM efficiency,
   and verifying the lm_head only over the rows whose logits are kept.
 - **Mid/large dense + Qwen MoE decode** (8B–31B at 0.87–0.97×, Qwen3-30B/35B MoE
-  at 0.91–0.99×) — the memory-bandwidth wall; infr's decode GEMVs already run at
-  77–88% of DRAM peak, so this is a few percent of achievable, not a structural
-  gap. Correct full-expert routing also costs the Qwen MoEs some prefill batch
-  efficiency (0.95× on Qwen3-30B).
-- **Qwen3-14B Q2_K decode** (0.72–0.74×) — the `mmvq` precision trade, footnote
-  ³.
+  at 0.91–0.99×) — these are all **Q4_K_M** rows, and footnote ³ now names the
+  cause: infr's int8 Q4_K GEMV kernel is slower than its own f32 path (so the
+  tier stays off), while llama.cpp's is faster than theirs (so they take it and
+  win). This was previously written off as the memory-bandwidth wall — decode
+  GEMVs do run at 77–88% of DRAM peak — but that figure was measured on the
+  f32-activation kernels, and llama.cpp beating us by 35% on 14B Q2_K decode
+  proves those rows are partly **ALU-bound**, with more headroom than the wall
+  story implied. Correct full-expert routing separately costs the Qwen MoEs some
+  prefill batch efficiency (0.95× on Qwen3-30B).
+- **Qwen3-14B Q2_K decode** (0.78–0.81×, was 0.72–0.74×) — improved by the
+  int8-activation tier (footnote ³); the residual is infr's Q4_K/Q2_K GEMV
+  kernel shape, not the precision policy.
 - **Ornith-35B prefill** (0.89×) and **the IQ3_S MoE** (0.90×) — the DeltaNet
   scan kernel (footnote ⁵) and the grid i-quant path (footnote ⁶), both known
   kernel projects.

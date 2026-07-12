@@ -2279,6 +2279,21 @@ fn lower_op(
                 // so the split-K path must take EVERY row count here — the scalar attention_kv
                 // fallback at prefill row counts (1024 rows x deep kv) is a guaranteed TDR.
                 let ring_past = swa_window > 0 && kv_len > att_cap_rows;
+                // Capacity-limited prefill on a FULL-CONTEXT (non-ring) cache: `nonfa_ok` above
+                // pads its K-tile read up to a whole 256-row tile (`kv_len.div_ceil(256)*256`),
+                // masked in softmax but still a real read — unsafe once that padded width exceeds
+                // the cache's declared row capacity, exactly like `ring_past` but without an SWA
+                // window. A session's `max_ctx` is sized with only a small slack above the actual
+                // prompt length (room for generation, not for 256-row alignment), and the ordinary
+                // chunked dense-prefill loop (ubatch-sized chunks) rarely lands a chunk boundary
+                // there — but MTP's single un-chunked whole-prompt VERIFY (`generate_mtp_spec_core`'s
+                // prime step) is ONE dispatch at rows == kv_len == the whole prompt, so it can park
+                // kv_len within one tile-pad of `max_ctx`'s slack (observed: Qwen3.5-4B-MTP bench at
+                // d>=3584, kv_len=3591 padding to 3840 against a 3637-row cache — device-lost TDR
+                // when this fell through to the scalar `attention_kv` fallback below). Route it to
+                // the split-K path instead: `attn_partial`'s `cap` push constant already carries a
+                // correct (identity, since kv_len < att_cap_rows always holds) row mapping.
+                let cap_short = kv_len.div_ceil(256) * 256 > att_cap_rows;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
                     let n = std::env::var("INFR_CANVAS_CHUNK_N")
                         .ok()
@@ -2288,19 +2303,19 @@ fn lower_op(
                     kv_len.div_ceil(n).min(kv_len - 1).max(1)
                 } else if batched_attn {
                     256
-                } else if ring_past && rows >= 64 {
-                    // Large-rows ring prefill: the pm/pl/pacc partials are [rows, nh, n_chunks,
-                    // hd] — the ordinary ~32-chunk policy would balloon them (1024 rows x 32
-                    // chunks x hd 256 ≈ 1 GB), and the span is already bounded by window + rows,
-                    // so a few big chunks keep the scratch ~100s of MB with plenty of workgroups
-                    // (nh * n_chunks * rows).
+                } else if (ring_past || cap_short) && rows >= 64 {
+                    // Large-rows ring/capacity-limited prefill: the pm/pl/pacc partials are [rows,
+                    // nh, n_chunks, hd] — the ordinary ~32-chunk policy would balloon them (1024
+                    // rows x 32 chunks x hd 256 ≈ 1 GB), and the span is already bounded (window +
+                    // rows for a ring, kv_len itself here), so a few big chunks keep the scratch
+                    // ~100s of MB with plenty of workgroups (nh * n_chunks * rows).
                     512
                 } else {
                     (span / 32).clamp(64, 512)
                 };
                 // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
                 // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
-                let split_ok = (rows < 64 || canvas_lo.is_some() || ring_past)
+                let split_ok = (rows < 64 || canvas_lo.is_some() || ring_past || cap_short)
                     && span > chunk
                     && hd % 4 == 0
                     && hd <= 512

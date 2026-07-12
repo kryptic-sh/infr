@@ -569,6 +569,16 @@ impl VulkanBackend {
             .push_next(&mut coopmat_feat)
             .push_next(&mut intdot_feat);
         unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
+        // Core Vulkan 1.0 feature (no extension struct — `get_physical_device_features2` always
+        // populates the chain's base `.features`). Several KV-cache dequant/attention shaders
+        // (dequant_turbo_f16.comp, dequant_q8_f16.comp, attn_*.comp) declare SPIR-V's `Int16`
+        // capability (16-bit integer arithmetic, e.g. GL_EXT_shader_explicit_arithmetic_types_int16
+        // int16_t/uint16_t locals — distinct from `storageBuffer16BitAccess`, which only covers
+        // 16-bit SSBO/UBO *storage*, not arithmetic): VUID-VkShaderModuleCreateInfo-pCode-08740
+        // requires `shaderInt16` enabled on the DEVICE for that capability, same class of bug as the
+        // `shaderIntegerDotProduct` one fixed below — detected via caps but never chained into
+        // `device_ci`, so vkCreateShaderModule for those kernels violated the VUID under validation.
+        let has_int16 = feat2.features.shader_int16 != 0;
         let has_f16 = f16_feat.shader_float16 != 0;
         let has_memmodel = memmodel_feat.vulkan_memory_model != 0;
         let has_memmodel_dev = memmodel_feat.vulkan_memory_model_device_scope != 0;
@@ -848,9 +858,16 @@ impl VulkanBackend {
         let mut intdot_ci = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
             .shader_integer_dot_product(true);
 
+        // Core 1.0 features (shaderInt16 — see the probe comment above): passed via
+        // `enabled_features`, NOT a pNext-chained `PhysicalDeviceFeatures2` (the two are mutually
+        // exclusive per the spec; this device_ci never chains `PhysicalDeviceFeatures2` itself, only
+        // extension-specific feature structs, so `enabled_features` is the correct, conflict-free
+        // slot for it).
+        let core_features = vk::PhysicalDeviceFeatures::default().shader_int16(has_int16);
         let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_ci))
             .enabled_extension_names(&ext_ptrs)
+            .enabled_features(&core_features)
             .push_next(&mut shader_f16_ci)
             .push_next(&mut storage16_ci)
             .push_next(&mut storage8_ci)

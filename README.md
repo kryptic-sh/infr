@@ -321,6 +321,16 @@ is therefore not an MTP fix at all — it is to make the int8-activation tier
 **symmetric** across plain decode and verify (footnote ³), which is also what
 closes the mid/large decode gap.
 
+A later session split ORDINARY prefill from MTP verify at the kernel-selection
+level (`infr_core::graph::Graph::mtp_verify`, see the "Known wart, now CLOSED"
+paragraph below) so Q5_K/Q3_K's big prefill win could ship WITHOUT this
+symmetry requirement — but that split deliberately does NOT touch MTP verify
+itself: verify still only takes int8 when the dtype is ALSO on the decode
+default, so Q5_K's verify batch stays f32-exact (matching its still-f32
+decode) and this paragraph's MTP-verify gap is unchanged. The lever described
+here — verify-tier int8 for a dtype whose decode isn't — remains closed by
+design, not reopened.
+
 These four rows' `tg64@d4096` cells were a GPU device-lost in the raw sweep and
 are re-measured post-`8513358`: 35821b6's capacity gate on the `nonfa` coopmat
 prefill tier (which reads K in whole 256-row tiles, so it touches
@@ -383,17 +393,39 @@ where the win is real (14B Q4_K_M: tg128 0.92× → 0.94×, tg64@d4096 0.87× �
 Q6_K/Q3_K stay off on AMD as **unmeasured** (no suitable model in the validated
 cache) — left off rather than assumed.
 
-Known wart, recorded rather than hidden: Q4_K/Q6_K/IQ4_XS take the int8 `mrow`
-kernel at m≥3 **unconditionally**, while their m=1 decode stays f32-exact on AMD
-— the same decode/verify asymmetry described above, pre-dating the policy table
-and live on every Q4_K MTP run today. It is untouched here (it is load-bearing
-for the Gemma-4-E2B `pp4@d4096` numbers) and queued as its own fix. **Turns out
-"fixing" it by making m=1 int8 too is not actually a fix** — see footnote ³:
-`mmv_mw` and `mrow` are different kernels that don't agree bit-for-bit at the
-same position, so making both streams int8 for Q4_K trades a known asymmetry for
-a different, still-live disagreement (`mtp_spec_matches_target_only_greedy`
-fails either way). The real fix needs the two kernels bit-identical, not just
-same-precision.
+**Former wart, now CLOSED**: Q4_K/Q6_K/IQ4_XS used to take the int8 `mrow`
+kernel at m≥3 **unconditionally**, while their m=1 decode stayed f32-exact on
+AMD — the same decode/verify asymmetry described above, pre-dating the policy
+table, live on every Q4_K/Q6_K/IQ4_XS MTP run. The fix is NOT "make m=1 int8
+too" (that was tried and rejected above — `mmv_mw`/`mrow` don't agree
+bit-for-bit at the same position even when both are int8) — it's recognizing
+that **ordinary prefill and MTP verify are different consumers with different
+constraints**, and the old code conflated them into one "m≥3" bucket. Only
+MTP-verify has a bit-identity contract to protect (it must match plain decode,
+`mtp_spec_matches_target_only_greedy`'s bar); ordinary prefill has no such
+partner and never needed to inherit verify's caution.
+`infr_core::graph::Graph::mtp_verify` (set only by the MTP driver's `run_verify`/
+`run_verify_full` batched forward, `crates/infr-llama/src/mtp/mod.rs`) threads
+that distinction down to kernel selection: `infr_vulkan::adapter::
+mrow_int8_dtype_ok(caps, dt, verify)` now takes an explicit `verify` flag and
+gates MTP-verify to the EXACT decode dtype set (`mmv_int8_decode_dtypes`) —
+Q6_K/IQ4_XS's verify batch now correctly falls back to f32-exact, matching
+their f32 decode — while ordinary prefill reads a SEPARATE, unconditional
+policy (`mrow_int8_dtype_ok`'s `verify: false` arm /
+`mrow_int8_prefill_dtypes`) that additionally unlocks Q3_K and Q5_K's prefill
+win (previously unreachable by default because it was tied to their off-by-
+default decode tier). `int8_decode_and_mrow_tiers_agree_on_policy_dtypes`
+(`crates/infr-vulkan/src/adapter.rs`) now asserts the STRONGER invariant across
+every dtype: decode int8 ⟺ MTP-verify int8, with no exemptions.
+
+Before shipping Q3_K's prefill default, this session isolated whether the
+historical Q3_K accuracy cliff (below) was a decode-tier or prefill-tier
+problem, since the two are now independently switchable: `gpu_seam_matches_cpu_
+qwen3_q2k` run PREFILL-int8-only stayed coherent (bit-for-bit the passing CPU-
+oracle-matching golden); the SAME test run DECODE-int8-only reproduced the
+exact historical divergent output. The cliff is conclusively decode-side —
+Q3_K's ordinary-prefill int8 is safe and now default-on; its decode tier stays
+off pending its own measurement.
 
 ⁴ Gemma-4-31B (21.9 GiB weights on the 24 GB card) runs **fully resident,
 including at depth**, after two placement slices: try-resident-first dense

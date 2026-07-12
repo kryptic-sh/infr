@@ -948,9 +948,14 @@ pub(crate) fn generate_dense_backend(
                  gpu_sample: bool,
                  // build the graph input as TOKEN IDS + an in-graph EmbedGather (gpu_embed
                  // callers) instead of the host-embedded f32 `hidden` rows.
-                 use_ids: bool|
+                 use_ids: bool,
+                 // Sets `Graph::mtp_verify` — see that field's doc. `true` from ONLY the
+                 // speculative-VERIFY call site below (this fn's `verify` param is `Some`);
+                 // `false` from every other caller (decode loop, batched prefill, DG denoise).
+                 mtp_verify: bool|
      -> (Graph, DecodeHandles) {
         let mut g = Graph::new();
+        g.mtp_verify = mtp_verify;
         // DiffusionGemma: force the per-execute STATIC path for every graph of this model (see
         // `Graph::no_decode_replay`). The record-once replay's `_dyn` kernels agree with the
         // static recording only to float-reassociation noise; the entropy-bound denoise loop
@@ -2922,6 +2927,7 @@ pub(crate) fn generate_dense_backend(
                 false, // gpu_argmax: denoise samples via the EB reducer, not Op::Argmax
                 false, // gpu_sample: same
                 false, // use_ids: the canvas rows are soft-embeds, not token ids
+                false, // mtp_verify: DG denoise is never an MTP-verify batch
             );
             let plan = be.compile(&dg).map_err(|e| anyhow!("{e}"))?;
             let hidden_buf = be
@@ -3218,6 +3224,7 @@ pub(crate) fn generate_dense_backend(
             gpu_verify_ids,
             false,
             false,
+            true, // mtp_verify: this IS the speculative-VERIFY batched forward
         );
         let vbuild_secs = t_vbuild0.elapsed().as_secs_f64();
         let t_vcompile0 = std::time::Instant::now();
@@ -3477,6 +3484,7 @@ pub(crate) fn generate_dense_backend(
             // add alongside the actual head forward.
             let (pf_g, pf_h) = build(
                 pf_m, cstart, 0, false, None, false, false, false, false, gpu_embed,
+                false, // mtp_verify: ordinary chunked prefill, not MTP verify
             );
             let t_build = pf_t0.elapsed();
             let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
@@ -3589,6 +3597,7 @@ pub(crate) fn generate_dense_backend(
     let ro = if dyn_replay {
         let (g, h) = build(
             1, 0, 1, false, None, false, false, gpu_argmax, gpu_sample, gpu_embed,
+            false, // mtp_verify: ordinary per-token decode, not MTP verify
         );
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
@@ -3803,6 +3812,7 @@ pub(crate) fn generate_dense_backend(
         } else {
             let (g, h) = build(
                 1, pos, 1, false, None, false, want_h, gpu_argmax, gpu_sample, gpu_embed,
+                false, // mtp_verify: ordinary per-token decode, not MTP verify
             );
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
             let mut b = Bindings::new();

@@ -597,6 +597,21 @@ pub struct Graph {
     /// execution modes run the SAME (static) kernels bit-identically; everything else keeps the
     /// replay fast path. See `infr-vulkan`'s `decode_eligible`.
     pub no_decode_replay: bool,
+    /// Set `true` ONLY for an MTP-verify batched forward — the trunk's speculative VERIFY pass
+    /// (`crates/infr-llama/src/mtp/mod.rs`'s `run_verify`/`run_verify_full`, driven through
+    /// `generate_dense_backend`'s `verify` branch). `false` (the `Graph::default()`/`Graph::new()`
+    /// value) for every other graph this seam builds: the per-token decode loop, the chunked
+    /// ordinary batched-prefill path, and the DiffusionGemma canvas denoise.
+    ///
+    /// Why this exists: MTP verify's greedy output must bit-match plain (non-speculative) decode
+    /// at the same position — that's `mtp_spec_matches_target_only_greedy`'s whole contract, and
+    /// the historical Q5_K bug (README footnote 2) was exactly this bit-identity breaking. Ordinary
+    /// prefill has no such partner dispatch to agree with: it's one path through the model, free to
+    /// take whichever kernel measures fastest. Before this flag, both were just "m>=3 batched
+    /// forward" to the kernel-selection code, so a dtype's int8 `mrow` tier could only be unlocked
+    /// for prefill by ALSO unlocking it for MTP verify — which is what broke token-identity. See
+    /// `infr_vulkan::adapter`'s `mrow_int8_dtype_ok` for the consumer.
+    pub mtp_verify: bool,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]

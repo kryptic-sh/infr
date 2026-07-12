@@ -421,18 +421,24 @@ fn mmv_decode_enabled() -> bool {
 ///   an Intel-only win). Both are now bit-identical-safe to flip (same unified kernel path) the
 ///   moment they're measured; re-measure with a real model first.
 ///
-/// Symmetry: this policy set is ALSO what gates Q2_K/Q3_K's entry into the m>=3 int8 `mrow`
-/// verify/prefill tier (see [`mrow_int8_dtype_ok`]) — a dtype added here is int8 in BOTH streams
-/// or in NEITHER. That is the invariant whose violation broke Q5_K token-identity (decode int8,
-/// verify f32-exact, or vice versa: the occasional greedy argmax flips between the spec and
-/// non-spec streams). Concretely on AMD today: Q2_K int8 in both (unified kernel), Q3_K f32-exact
-/// in both, Q4_K int8 in both via the SAME unified kernel (the pre-existing m>=3-only wart is
-/// closed for Q4_K — see [`unified_mmv_row1`]; Q6_K's mrow tier is still unconditional per
-/// `mrow_int8_dtype_ok` while its decode tier stays off, so Q6_K's wart is untouched, deliberately,
-/// pending a measurement).
+/// Symmetry (MTP-verify only): this policy set is ALSO what gates every dtype's entry into the
+/// m>=3 int8 `mrow` kernel for an MTP-VERIFY batch (`Graph::mtp_verify`, see
+/// [`mrow_int8_dtype_ok`]'s `verify` arm) — a dtype added here is int8 in BOTH the decode stream
+/// and the verify stream, or in NEITHER. That is the invariant whose violation broke Q5_K
+/// token-identity (decode int8, verify f32-exact, or vice versa: the occasional greedy argmax
+/// flips between the spec and non-spec streams). ORDINARY prefill is NOT gated by this set at all
+/// — see [`mrow_int8_prefill_dtypes`], which every dtype below is also a member of (this decode
+/// set is always a subset of the prefill set: prefill has no bit-identity partner to protect, so
+/// it never needs to be MORE conservative than decode). Concretely on AMD today: Q2_K/Q4_K int8 in
+/// both decode AND verify (the unified kernel makes them bit-identical, not just both-int8 — see
+/// [`unified_mmv_row1`]); Q3_K/Q5_K/Q6_K/IQ4_XS f32-exact in both decode AND verify, while all six
+/// take the int8 `mrow` kernel at ordinary prefill.
 ///
 /// `INFR_MMV_MW=1` force-enables the FULL measured-safe dtype set {Q4_K, Q6_K, Q2_K, Q3_K, Q5_K} on
-/// ANY vendor for A/B measurement; `INFR_MMV_MW=0` force-off everywhere. Both flow through
+/// ANY vendor for A/B measurement (of the DECODE + MTP-verify tier only — ordinary prefill is
+/// already unconditionally on for these dtypes and unaffected by this env); `INFR_MMV_MW=0`
+/// force-off everywhere (decode + verify only; prefill is instead controlled by the general
+/// `INFR_NO_MMV`/`INFR_NO_MROW` kill switches, same as any other mrow dtype). Both flow through
 /// [`mmv_int8_decode_dtypes`], so the A/B escapes stay symmetric too. `INFR_MMV_MW_WARPS` ∈
 /// {1,2,4,8,16} only affects Intel now (AMD's decode tier no longer reads WARPS — see
 /// [`unified_mmv_row1`]); {1,2,16} are Q4_K-only dispatch-shape sweep builds (see
@@ -445,15 +451,13 @@ fn mmv_decode_enabled() -> bool {
 /// word-parallel wdec plus a 5th-bit `qh` plane. AMD MEASUREMENTS (Qwen3-14B-Q5_K_M, r=5/r=3, this
 /// box, post-unification): decode `-p0 -n64` **66.8 int8 vs 67.8 f32 — a small LOSS, -1.4%**
 /// (reproducible across 3 alternating runs); prefill `pp4@d4096` **188 int8 vs 130 f32 — +45%**.
-/// That is the same loses-at-decode,
-/// wins-big-at-prefill split Q6_K and IQ4_XS already show (per-dispatch activation-quantize
-/// overhead is dead weight at m=1, amortized hard at m>=3). So Q5_K is **NOT** in either vendor's
-/// default set: no decode win to justify it, and because [`mrow_int8_dtype_ok`] ties Q5_K's mrow
-/// eligibility to THIS set (rather than making it unconditional like Q6_K/IQ4_XS), the prefill win
-/// is deliberately NOT reachable by default either. Do not add a `Q5K => true` unconditional arm to
-/// `mrow_int8_dtype_ok` to chase that prefill win in isolation — verify-int8/decode-f32 IS the
-/// historical bug. The clean way to bank it is the planned split of MTP-verify from ordinary
-/// prefill; until then it's behind `INFR_MMV_MW=1`.
+/// That is the same loses-at-decode, wins-big-at-prefill split Q6_K and IQ4_XS already show
+/// (per-dispatch activation-quantize overhead is dead weight at m=1, amortized hard at m>=3). So
+/// Q5_K is **NOT** in either vendor's DECODE default set (no decode win to justify it) — but its
+/// ordinary-prefill win IS banked, unconditionally, via [`mrow_int8_prefill_dtypes`]: the
+/// MTP-verify/decode split (`Graph::mtp_verify`) is exactly the "clean way to bank it" this doc
+/// used to defer to, and it is now in place. MTP verify still runs Q5_K f32-exact (matching
+/// decode), so token-identity holds; only ordinary prefill takes the win.
 fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [infr_core::DType] {
     use infr_core::DType::{Q2K, Q3K, Q4K, Q5K, Q6K};
     match std::env::var("INFR_MMV_MW").ok().as_deref() {
@@ -491,31 +495,67 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
     }
 }
 
-/// Does `dt` take the int8 dp4a `mrow` kernel for the m>=3 verify/prefill batch?
+/// Per-dtype int8 PREFILL policy for the m>=3 ORDINARY (non-MTP-verify) batched forward — the
+/// chunked batched-prefill path and the small-multi-row shapes (spec-decode-shaped verify batches
+/// aside, see [`mrow_int8_dtype_ok`]'s `verify` arm). Ordinary prefill has no partner dispatch it
+/// must bit-match (see `infr_core::graph::Graph::mtp_verify`'s doc) — it is one path through the
+/// model, so it is free to take whichever kernel measures fastest, independent of the m=1 decode
+/// policy ([`mmv_int8_decode_dtypes`]) entirely. Every dtype here is a MEASURED win on
+/// Qwen3-14B (AMD RDNA3/RADV, `pp4@d4096`, r=3-5): Q6_K +67% (137.9 vs 82.8), IQ4_XS +81% (155.1
+/// vs 85.6), Q5_K +45% (188 vs 130), Q3_K +29% (211 vs 161) — Q2_K/Q4_K's wins predate this table
+/// (footnote 3). Q4_K/Q6_K/IQ4_XS were already unconditional mrow dtypes before this split (this
+/// is not a behavior change for them at prefill); Q2_K/Q3_K/Q5_K are newly unconditional here
+/// (previously tied to the decode set, which is what kept Q3_K/Q5_K's prefill win unreachable by
+/// default).
 ///
-/// - **Q4_K / Q6_K / IQ4_XS**: YES, unconditionally on any `i8_dot` device — the PRE-EXISTING
-///   behavior (predates the decode policy table; load-bearing for the E2B `pp4@d4096` numbers).
-///   This is VALUE-asymmetric with the m=1 decode tier on AMD only for the dtypes decode still
-///   keeps off ([`mmv_int8_decode_dtypes`]: Q6_K, IQ4_XS have no decode int8 tier at all) — a
-///   known, deliberately untouched wart for those two. Q4_K is no longer part of that wart: its
-///   decode tier is now on AND dispatches the same unified `linear_mmv_mrow(rows=1)` kernel this
-///   m>=3 tier uses (see [`unified_mmv_row1`]), so the two streams are bit-identical, not just
-///   both-int8.
-/// - **Q2_K / Q3_K / Q5_K**: only when [`mmv_int8_decode_dtypes`] also gives them the int8 DECODE
-///   tier on this device. These dtypes' mrow kernels exist solely to keep the decode policy
-///   symmetric; letting them run int8 at m>=3 while decode stays f32-exact at m=1 would recreate
-///   the exact Q5_K token-divergence bug the decode policy is built to avoid — Q5_K especially,
-///   since that IS the historical bug (the previous attempt wired Q5_K into the verify batch only
-///   while plain decode stayed f32-exact). Tying it to the decode set here makes that split
-///   structurally unreachable through the default policy; and on AMD, where decode dispatches the
-///   unified rows=1 mrow kernel, turning the decode tier on for one of these dtypes makes its two
-///   streams bit-identical (not merely both-int8) by construction.
-fn mrow_int8_dtype_ok(caps: &infr_core::backend::Capabilities, dt: infr_core::DType) -> bool {
+/// Q3_K's accuracy was ISOLATED before this default shipped, not assumed: an earlier attempt to
+/// flip Q3_K default-on tied decode AND mrow together (the pre-split policy) and broke
+/// `gpu_seam_matches_cpu_qwen3_q2k` into a divergent/degenerate generation (unsloth's Q2_K GGUF is
+/// MIXED and carries Q3_K tensors, so the flip moved a 0.6B model's layers to int8 where
+/// accumulated quant error is worst). This session bisected which side of the split caused it by
+/// running the SAME test three ways: (1) PREFILL-int8-only (this set has Q3_K, decode tier
+/// untouched — Q3_K stays OFF `mmv_int8_decode_dtypes`) — **coherent, matches the CPU oracle
+/// token-for-token**; (2) DECODE-int8-only (`INFR_MMV_MW=1` with Q3_K temporarily pulled out of
+/// this prefill set) — **reproduces the exact same divergent generation** as (3); (3) both-on
+/// (`INFR_MMV_MW=1` at head, unmodified) — the original historical failure. (1) alone stayed
+/// coherent; (2) alone reproduced the failure bit-for-bit identically to (3) — conclusively
+/// isolating the cliff to the DECODE tier, not this one. Ordinary prefill's int8 win for Q3_K is
+/// therefore safe to ship unconditionally; Q3_K's DECODE default stays off (its own accuracy
+/// question is still open — this only clears prefill).
+fn mrow_int8_prefill_dtypes(dt: infr_core::DType) -> bool {
     use infr_core::DType::{Iq4Xs, Q2K, Q3K, Q4K, Q5K, Q6K};
-    match dt {
-        Q4K | Q6K | Iq4Xs => true,
-        Q2K | Q3K | Q5K => mmv_int8_decode_dtypes(caps).contains(&dt),
-        _ => false, // no int8 mrow kernel exists (native_mmv_mrow_build_spv returns None)
+    matches!(dt, Q2K | Q3K | Q4K | Q5K | Q6K | Iq4Xs)
+}
+
+/// Does `dt` take the int8 dp4a `mrow` kernel for the m>=3 batched forward? `verify` selects which
+/// of the two independent policies gates it (see `infr_core::graph::Graph::mtp_verify`'s doc for
+/// why they must differ):
+///
+/// - **MTP-verify batch** (`verify == true`): gated to the EXACT SAME dtype set as the m=1 decode
+///   tier ([`mmv_int8_decode_dtypes`]) on this (vendor, env) combination — no exceptions, not even
+///   for Q4_K/Q6_K/IQ4_XS. Verify's greedy output must bit-match plain decode at the same position
+///   (`mtp_spec_matches_target_only_greedy`'s contract); letting a dtype run int8 in verify while
+///   decode stays f32-exact (or vice versa) is the exact Q5_K token-divergence bug class. On AMD,
+///   where decode dispatches the unified `linear_mmv_mrow(rows=1)` kernel (see
+///   [`unified_mmv_row1`]), a dtype on the decode set is bit-identical in both streams by
+///   construction, not merely both-int8.
+/// - **Ordinary prefill** (`verify == false`): [`mrow_int8_prefill_dtypes`] — every measured win,
+///   independent of the decode policy.
+///
+/// This closes a real bug: Q6_K and IQ4_XS used to take this kernel UNCONDITIONALLY at m>=3
+/// (predating this split), while their m=1 decode is f32-exact and neither is ever on the decode
+/// set (IQ4_XS has no int8 decode arm at all; Q6_K's decode is off on AMD by default) — so an MTP
+/// verify batch on either dtype could flip a greedy token vs plain decode. After this split, their
+/// MTP verify lands on the f32-exact path (matching decode) while ordinary prefill keeps the win.
+fn mrow_int8_dtype_ok(
+    caps: &infr_core::backend::Capabilities,
+    dt: infr_core::DType,
+    verify: bool,
+) -> bool {
+    if verify {
+        mmv_int8_decode_dtypes(caps).contains(&dt)
+    } else {
+        mrow_int8_prefill_dtypes(dt)
     }
 }
 
@@ -1052,7 +1092,7 @@ fn lower_op(
                 && in_f * out_f >= 8 << 20
                 && out_f < 65536
                 && crate::gemm::native_mmv_mrow_build_spv(dt).is_some()
-                && mrow_int8_dtype_ok(be_.caps(), dt)
+                && mrow_int8_dtype_ok(be_.caps(), dt, graph.mtp_verify)
                 && std::env::var("INFR_NO_MMV").is_err();
             // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
             // once its rollback window carries a few committed rows on top of the n_max drafts.
@@ -1075,11 +1115,12 @@ fn lower_op(
                 // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
                 // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound
                 // shapes (E2B pp4@d4096: GEMV class 21.0 → 17.0us/op, pp4 366 → 383 t/s). Dtype
-                // eligibility is `mrow_int8_dtype_ok`: Q4_K/Q6_K/IQ4_XS unconditionally (the
-                // pre-existing behavior), Q2_K/Q3_K only when `mmv_int8_decode_dtypes` ALSO gives
-                // them the int8 m=1 decode tier on this device — so those two are int8 in both
-                // streams or in neither, never split (that split IS the Q5_K token-divergence bug;
-                // `mmv_mrow_symmetric_q2k_q3k` proves the two kernels agree once both are on).
+                // eligibility is `mrow_int8_dtype_ok(caps, dt, graph.mtp_verify)`: an MTP-verify
+                // batch (`Graph::mtp_verify`) is gated to the SAME dtype set as the m=1 decode
+                // tier (`mmv_int8_decode_dtypes`) — int8 in both streams or in neither, never
+                // split (that split IS the Q5_K token-divergence bug; `mmv_mrow_symmetric_q2k_q3k`
+                // proves the two kernels agree once both are on). Ordinary prefill instead reads
+                // `mrow_int8_prefill_dtypes` — every measured win, independent of the decode set.
                 // Gates:
                 //  • m >= 3: m=2 is the single-head MTP spec-verify shape, whose accept loop
                 //    holds a hard output-identical-to-target-greedy bar (`mtp_spec_matches_
@@ -4772,15 +4813,18 @@ mod tests {
     use infr_core::DType;
 
     /// THE symmetry invariant (the Q5_K token-divergence bug class, guarded at the policy level):
-    /// for every dtype whose int8 tier is policy-driven (Q2_K/Q3_K), the m=1 DECODE tier
-    /// (`mmv_int8_decode_dtypes`) and the m>=3 VERIFY/prefill tier (`mrow_int8_dtype_ok`) must
-    /// agree on EVERY (vendor × env) combination — int8 in both streams or in neither. A dtype
-    /// that is int8 in one stream and f32-exact in the other flips the occasional greedy argmax
-    /// between the spec and non-spec streams (this is precisely how the Q5_K attempt broke
-    /// `mtp_spec_matches_target_only_greedy`).
+    /// for EVERY dtype, the m=1 DECODE tier (`mmv_int8_decode_dtypes`) and the m>=3 MTP-VERIFY
+    /// tier (`mrow_int8_dtype_ok(.., verify: true)`) must agree on EVERY (vendor × env)
+    /// combination — int8 in both streams or in neither. A dtype that is int8 in one stream and
+    /// f32-exact in the other flips the occasional greedy argmax between the spec and non-spec
+    /// streams (this is precisely how the Q5_K attempt broke `mtp_spec_matches_target_only_greedy`,
+    /// and how the pre-split code's unconditional Q4_K/Q6_K/IQ4_XS mrow tier could have too — see
+    /// `mrow_int8_dtype_ok`'s doc).
     ///
-    /// Q4_K/Q6_K/IQ4_XS are deliberately EXEMPT: their mrow tier is unconditional and predates the
-    /// decode policy (see `mrow_int8_dtype_ok`'s doc — a known, untouched asymmetry on AMD).
+    /// This is the NEW, stronger invariant post-split: unlike the old test, NO dtype is exempt —
+    /// `verify` no longer has an unconditional arm for Q4_K/Q6_K/IQ4_XS. ORDINARY prefill (verify:
+    /// false) is intentionally NOT covered by this loop: it has no bit-identity partner, so it is
+    /// checked separately below against `mrow_int8_prefill_dtypes` instead.
     #[test]
     fn int8_decode_and_mrow_tiers_agree_on_policy_dtypes() {
         let amd = infr_core::backend::Capabilities {
@@ -4801,51 +4845,81 @@ mod tests {
                     Some(v) => std::env::set_var("INFR_MMV_MW", v),
                     None => std::env::remove_var("INFR_MMV_MW"),
                 }
-                for dt in [DType::Q2K, DType::Q3K, DType::Q5K] {
+                for dt in [
+                    DType::Q2K,
+                    DType::Q3K,
+                    DType::Q4K,
+                    DType::Q5K,
+                    DType::Q6K,
+                    DType::Iq4Xs,
+                ] {
                     let decode_int8 = mmv_int8_decode_dtypes(caps).contains(&dt);
-                    let mrow_int8 = mrow_int8_dtype_ok(caps, dt);
+                    let verify_int8 = mrow_int8_dtype_ok(caps, dt, true);
                     assert_eq!(
-                        decode_int8, mrow_int8,
+                        decode_int8, verify_int8,
                         "{vendor} INFR_MMV_MW={env:?} {dt:?}: decode int8={decode_int8} but \
-                         verify/mrow int8={mrow_int8} — ASYMMETRIC (the Q5_K bug class)"
+                         MTP-verify int8={verify_int8} — ASYMMETRIC (the Q5_K bug class)"
+                    );
+                    // Ordinary prefill is NEVER more conservative than MTP-verify (the decode set
+                    // is always a subset of the prefill set) — prefill has no partner to protect,
+                    // so it can only be equal or more permissive.
+                    let prefill_int8 = mrow_int8_dtype_ok(caps, dt, false);
+                    assert!(
+                        prefill_int8 || !verify_int8,
+                        "{vendor} INFR_MMV_MW={env:?} {dt:?}: verify int8={verify_int8} but \
+                         prefill int8={prefill_int8} — prefill is stricter than verify, backwards"
                     );
                 }
             }
         }
         std::env::remove_var("INFR_MMV_MW");
         // The shipping AMD default, spelled out so a policy edit has to face it: Q2_K int8 in BOTH
-        // streams (the measured +20% win), Q3_K f32-exact in BOTH. Q3_K is off despite a +29%
-        // pp4@d4096 prefill win because turning it on breaks `gpu_seam_matches_cpu_qwen3_q2k` —
-        // Q2_K GGUFs are mixed and carry Q3_K tensors, and on a 0.6B the int8 error there drove the
-        // GPU seam into degenerate output. NOT an MTP/bit-identity failure (both pass with it on) —
-        // an accuracy one. See mmv_int8_decode_dtypes's doc before re-attempting.
+        // decode and verify (the measured +20% win), Q3_K f32-exact in both. Q3_K's DECODE stays
+        // off despite the accuracy isolation (see `mrow_int8_prefill_dtypes`'s doc) finding the
+        // cliff was decode-side, not prefill-side — decode was never proven safe, just not (yet)
+        // re-attempted, so it stays conservatively off pending its own measurement.
         assert!(mmv_int8_decode_dtypes(&amd).contains(&DType::Q2K));
-        assert!(mrow_int8_dtype_ok(&amd, DType::Q2K));
+        assert!(mrow_int8_dtype_ok(&amd, DType::Q2K, true));
         assert!(!mmv_int8_decode_dtypes(&amd).contains(&DType::Q3K));
-        assert!(!mrow_int8_dtype_ok(&amd, DType::Q3K));
-        // Q4_K is NOW ON the AMD decode default (was off): the throughput win (README footnote 3)
-        // is real AND, since decode now dispatches the unified `linear_mmv_mrow(rows=1)` kernel
-        // (see `unified_mmv_row1`) instead of the legacy `native_mmv_mw.comp`, it is bit-identical
-        // to the m>=3 mrow verify tier at the same position — `mtp_spec_matches_target_only_greedy`
+        assert!(!mrow_int8_dtype_ok(&amd, DType::Q3K, true));
+        // Q4_K is ON the AMD decode default: the throughput win (README footnote 3) is real AND,
+        // since decode dispatches the unified `linear_mmv_mrow(rows=1)` kernel (see
+        // `unified_mmv_row1`) instead of the legacy `native_mmv_mw.comp`, it is bit-identical to
+        // the m>=3 mrow verify tier at the same position — `mtp_spec_matches_target_only_greedy`
         // holds. `mmv_row1_bit_identical` (tests/mmv_row1_bit_identical.rs) is the numeric guard.
         assert!(mmv_int8_decode_dtypes(&amd).contains(&DType::Q4K));
+        assert!(mrow_int8_dtype_ok(&amd, DType::Q4K, true));
         assert!(
             unified_mmv_row1(&amd),
             "AMD must take the unified rows=1 path for Q4_K safety"
         );
-        // Q5_K: NEW int8 arm this session (previously none in either stream), OFF by default on
-        // every vendor — decode measured a small LOSS on AMD (66.8 int8 vs 67.8 f32, -1.4%; see
-        // mmv_int8_decode_dtypes's doc) and is unmeasured on Intel. Its big prefill win (+45%) is
-        // deliberately NOT banked, because mrow eligibility is tied to this decode set and the
-        // verify-int8/decode-f32 split is the historical Q5_K MTP bug. These are the assertions to
-        // flip (alongside the AMD `match` arm) if a future measurement justifies it.
+        // Q5_K: decode measured a small LOSS on AMD (66.8 int8 vs 67.8 f32, -1.4%; see
+        // mmv_int8_decode_dtypes's doc) and is unmeasured on Intel — OFF the decode/verify default
+        // on every vendor. Its ordinary-prefill win (+45%) IS banked below regardless.
         assert!(!mmv_int8_decode_dtypes(&amd).contains(&DType::Q5K));
-        assert!(!mrow_int8_dtype_ok(&amd, DType::Q5K));
+        assert!(!mrow_int8_dtype_ok(&amd, DType::Q5K, true));
         assert!(!mmv_int8_decode_dtypes(&intel).contains(&DType::Q5K));
-        assert!(!mrow_int8_dtype_ok(&intel, DType::Q5K));
-        // The exempt pre-existing set stays unconditional (not something this policy may weaken).
-        for dt in [DType::Q4K, DType::Q6K, DType::Iq4Xs] {
-            assert!(mrow_int8_dtype_ok(&amd, dt), "{dt:?} mrow must stay on");
+        assert!(!mrow_int8_dtype_ok(&intel, DType::Q5K, true));
+        // Q6_K/IQ4_XS: CLOSES the pre-split wart. IQ4_XS has no int8 decode arm on ANY vendor, and
+        // Q6_K's decode is off on the AMD default — so before this split, both took the mrow
+        // kernel unconditionally at MTP-verify, silently able to flip a greedy token vs plain
+        // decode (README's former "Known wart"). Now verify correctly lands on f32-exact for both.
+        assert!(!mrow_int8_dtype_ok(&amd, DType::Q6K, true));
+        assert!(!mrow_int8_dtype_ok(&amd, DType::Iq4Xs, true));
+        // Every dtype's ORDINARY PREFILL is unconditionally on regardless of the decode/verify
+        // policy above — this is the actual point of the split: prefill has no partner to protect.
+        for dt in [
+            DType::Q2K,
+            DType::Q3K,
+            DType::Q4K,
+            DType::Q5K,
+            DType::Q6K,
+            DType::Iq4Xs,
+        ] {
+            assert!(
+                mrow_int8_dtype_ok(&amd, dt, false),
+                "{dt:?} ordinary-prefill mrow must stay on"
+            );
         }
         // Intel is untouched by this task (no Intel GPU in this environment to re-validate the
         // unified path on) — still the legacy per-vendor mmv_mw route.

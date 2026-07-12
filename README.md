@@ -64,12 +64,12 @@ Fine-tunes on any of these backbones run unchanged. **Ornith-1.0**
 and the 35B rides `qwen35moe` with no code changes
 (`infr run deepreinforce-ai/Ornith-1.0-9B-GGUF:Q4_K_M "..."`).
 **Ternary-Bonsai** (Prism ML, weights trained to {-1, 0, +1}) validated
-2026-07-12 — the 1.7B/4B ride `qwen3`, both zero-code in the TQ2_0 repack
-(`superkaiii/Ternary-Bonsai-4B-GGUF`) and in llama.cpp's new **Q2_0** weight
-dtype (2.25 bpw, GGML type 42 — native in-shader dequant + dp4a mmq, no fork
-needed; note the pre-merge `prism-ml/*-Q2_0.gguf` uploads use an older
-incompatible 128-elem block layout — requantize from F16 with upstream
-`llama-quantize ... Q2_0`).
+2026-07-12 — the 1.7B / 4B / 8B all ride `qwen3`, zero-code, both in the TQ2_0
+repack (`superkaiii/Ternary-Bonsai-4B-GGUF`) and in llama.cpp's new **Q2_0**
+weight dtype (2.25 bpw, GGML type 42 — native in-shader dequant + dp4a mmq, no
+fork needed). infr is the **only engine that runs Q2_0 on a GPU** (llama.cpp
+merged the dtype CPU-only) — see the perf table below. Pull the `Q2_0_g64`
+files: `infr run prism-ml/Ternary-Bonsai-8B-gguf:Q2_0_g64 "..."`.
 
 ```bash
 # Qwen3 dense
@@ -367,6 +367,32 @@ both engines) — llama.cpp's spec self-speedup survives low accept rates better
 GEMM efficiency and verifying the lm_head only over the rows whose logits are
 kept. **DiffusionGemma** (`dg-step`) beats the reference fork at 1.20× (53.1 vs
 46.3 t/s e2e at matched-ish 24/23 steps).
+
+**Ternary-Bonsai (Q2_0) — infr is the only engine that runs these on a GPU.**
+llama.cpp merged the **Q2_0** weight dtype (GGML type 42) but shipped **no GPU
+kernels for it**: there is not a single `q2_0` reference in its `ggml-vulkan/`
+or `ggml-cuda/` trees, so every backend but CPU refuses to load these files.
+infr runs Q2_0 natively on Vulkan (in-shader dequant + dp4a mmq — `ad89fb4`), so
+the comparison below is **absolute throughput on different devices, not a
+like-for- like ratio**: infr on the RX 7900 XTX vs llama.cpp on a Ryzen 9
+9950X3D (16 threads, Release + `GGML_NATIVE`). r=3, 2026-07-12.
+
+| Model (Prism ML) | Size    | infr pp512 | infr tg128 | llama.cpp pp512 | llama.cpp tg128 |
+| ---------------- | ------- | ---------- | ---------- | --------------- | --------------- |
+| Bonsai-1.7B      | 462 MiB | **6365**   | **594**    | 108.7 (CPU)     | 78.3 (CPU)      |
+| Bonsai-4B        | 1.05 GB | **2756**   | **303**    | 41.9 (CPU)      | 33.9 (CPU)      |
+| Bonsai-8B        | 2.15 GB | **1647**   | **212**    | 22.1 (CPU)      | 18.6 (CPU)      |
+
+Use the **`Q2_0_g64`** files — despite the name they are the layout upstream
+merged (64-elem / 18 B blocks, 2.25 bpw). The repos' plain `*-Q2_0.gguf` /
+`*-PQ2_0.gguf` uploads predate the merge and use 128-elem / 34 B blocks (2.125
+bpw); llama.cpp master rejects them too. Same scheme otherwise — one f16 scale
+per 128 weights instead of per 64 — so they could be supported by a lossless
+load-time repack if the format sticks around.
+
+```bash
+infr run prism-ml/Ternary-Bonsai-8B-gguf:Q2_0_g64 "What is the capital of France?"
+```
 
 **Llama-4-Scout** (109B-A17B, Q2_K, 37 GB) is deliberately absent from the table
 above (its per-token small-m dispatch shape isn't comparable to the batched

@@ -110,6 +110,11 @@ pub(crate) fn pick_gguf(names: &[String], sel: Option<&str>) -> Option<String> {
 }
 
 /// Match a cached `.gguf` filename against a selector (an explicit `*.gguf` name, or a quant).
+///
+/// The quant must sit on **token boundaries** in the filename, else neighbouring formats collide:
+/// `…-PQ2_0.gguf` / `…-TQ2_0.gguf` / `…-Q2_0_g64.gguf` are all DIFFERENT weight layouts from `Q2_0`
+/// and must never satisfy a `Q2_0` selector. A token starts after `-`/`_`/`.` (or the name start) and
+/// ends before `-`/`.` (or the stem end) — `_` does not end it, since quant names embed it (`Q4_K_M`).
 fn gguf_match(fname: &str, sel: &str) -> Match {
     if sel.to_lowercase().ends_with(".gguf") {
         return if fname.eq_ignore_ascii_case(sel) {
@@ -119,9 +124,24 @@ fn gguf_match(fname: &str, sel: &str) -> Match {
         };
     }
     let (f, q) = (fname.to_lowercase(), sel.to_lowercase());
-    if f.ends_with(&format!("-{q}.gguf")) || f.ends_with(&format!("{q}.gguf")) {
-        Match::Exact
-    } else if f.contains(&q) {
+    let Some(stem) = f.strip_suffix(".gguf") else {
+        return Match::No;
+    };
+    let starts_token = |i: usize| i == 0 || matches!(stem.as_bytes()[i - 1], b'-' | b'_' | b'.');
+    let ends_token = |i: usize| i == stem.len() || matches!(stem.as_bytes()[i], b'-' | b'.');
+
+    let mut loose = false;
+    for (i, _) in stem.match_indices(q.as_str()) {
+        let end = i + q.len();
+        if !starts_token(i) || !ends_token(end) {
+            continue;
+        }
+        if end == stem.len() {
+            return Match::Exact; // the quant IS the trailing token: `…-Q4_K_M.gguf`
+        }
+        loose = true; // a delimited hit elsewhere: split shards, `…-Q4_K_M-00001-of-00003.gguf`
+    }
+    if loose {
         Match::Loose
     } else {
         Match::No
@@ -184,6 +204,50 @@ mod tests {
             .resolve_repo("u/r", Some("q4_k_m")) // case-insensitive
             .unwrap()
             .ends_with("model-Q4_K_M.gguf"));
+    }
+
+    /// prism-ml/Ternary-Bonsai-*-gguf ships Q2_0 next to PQ2_0 and Q2_0_g64 — all different layouts.
+    /// A `Q2_0` selector must land on Q2_0 regardless of listing order, never on its neighbours.
+    #[test]
+    fn pick_gguf_quant_neighbours_never_collide() {
+        let names: Vec<String> = [
+            "Ternary-Bonsai-1.7B-F16.gguf",
+            "Ternary-Bonsai-1.7B-PQ2_0.gguf",
+            "Ternary-Bonsai-1.7B-Q2_0.gguf",
+            "Ternary-Bonsai-1.7B-Q2_0_g64.gguf",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            pick_gguf(&names, Some("Q2_0")).as_deref(),
+            Some("Ternary-Bonsai-1.7B-Q2_0.gguf")
+        );
+        assert_eq!(
+            pick_gguf(&names, Some("PQ2_0")).as_deref(),
+            Some("Ternary-Bonsai-1.7B-PQ2_0.gguf")
+        );
+        assert_eq!(
+            pick_gguf(&names, Some("Q2_0_g64")).as_deref(),
+            Some("Ternary-Bonsai-1.7B-Q2_0_g64.gguf")
+        );
+        // No Q2_0 in the repo at all → a PQ2_0/TQ2_0 sibling must NOT be served as a fallback.
+        let only_p = vec!["Ternary-Bonsai-4B-TQ2_0.gguf".to_string()];
+        assert_eq!(pick_gguf(&only_p, Some("Q2_0")), None);
+    }
+
+    #[test]
+    fn pick_gguf_split_shards_are_loose() {
+        let names: Vec<String> = ["m-Q4_K_M-00001-of-00002.gguf", "m-Q8_0.gguf"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            pick_gguf(&names, Some("Q4_K_M")).as_deref(),
+            Some("m-Q4_K_M-00001-of-00002.gguf")
+        );
+        // A quant that is a strict prefix of another must not match it.
+        assert_eq!(pick_gguf(&names, Some("Q4_K")), None);
     }
 
     #[test]

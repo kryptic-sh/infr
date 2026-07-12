@@ -2061,6 +2061,70 @@ fn run_verify_full(
     Ok((logits, h))
 }
 
+/// Re-primes the trunk's KV/DeltaNet state over `tokens`' un-cached suffix WITHOUT paying
+/// [`run_verify`]/[`run_verify_full`]'s full-batch lm_head cost — the reprime call site
+/// (`mtp_reprime`'s doc on [`generate_mtp_spec_core`]) only ever consumes the LAST row's id (or
+/// full distribution) and `h`, never the other `mr-1` rows [`run_verify`] computes the vocab-wide
+/// `Op::Linear` over. This drives the ORDINARY (non-VERIFY) per-token decode path instead —
+/// `generate_dense_backend`'s `logits_rows == 1` lm_head tail already extracts just the frontier
+/// row via a `Copy` before the `Linear` (`runner.rs`'s `lm_in` selection), so the wasted rows are
+/// simply never computed, not computed-then-discarded. `max_new = 1` runs the model's own
+/// greedy/stochastic sampling for that one row: greedy reads back `ids[0]` (the same
+/// `Op::Argmax`-with-strict-`>`-tie-break every ordinary decode step already uses — bit-identical
+/// to [`run_verify`]'s per-row argmax by construction, since it is the SAME kernel path); passing
+/// `logits_out` additionally captures the row's raw logits (needed for the stochastic accept
+/// rule's truncated distribution) without disturbing the sample. Using the exact path plain
+/// (non-MTP) decode already runs for this shape is deliberate: it cannot introduce a NEW
+/// precision asymmetry between the spec and non-spec streams (unlike, say, routing this row
+/// through a small-batch GEMV kernel plain decode never touches — an int8-quantized-activation
+/// mrow tier for Q5_K was tried as a *different* MTP verify lever earlier in this same campaign
+/// and rejected for exactly that reason: it made MTP's own verify batch numerically diverge from
+/// this fn's single-row path, occasionally flipping a greedy token). Returns `(id, logits or
+/// empty, h[ne])` — `logits` is only populated when `want_logits` (the stochastic flavor).
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn run_prime_last(
+    be: &dyn Backend,
+    bind: &BindWeightFn,
+    g: &Gguf,
+    cfg: &crate::Config,
+    token_embd: &[f32],
+    tokens: &[u32],
+    state: &mut Option<crate::seam::SeamKv>,
+    max_ctx: usize,
+    want_logits: bool,
+) -> Result<(u32, Vec<f32>, Vec<f32>)> {
+    let mut logits = Vec::new();
+    let mut h = Vec::new();
+    let (ids, _) = crate::seam::generate_dense_backend(
+        be,
+        bind,
+        g,
+        cfg,
+        token_embd,
+        None,
+        tokens,
+        1,
+        |_| {},
+        state,
+        max_ctx,
+        None,
+        None,
+        None,
+        want_logits.then_some(&mut logits),
+        Some(&mut h),
+        None,
+    )?;
+    anyhow::ensure!(
+        ids.len() == 1 && h.len() == cfg.n_embd,
+        "run_prime_last: expected 1 id and {} h floats, got {} ids, {} h floats",
+        cfg.n_embd,
+        ids.len(),
+        h.len()
+    );
+    Ok((ids[0], logits, h))
+}
+
 /// Cumulative per-phase wall time + accept-rate counters over one [`generate_mtp_spec_vulkan_timed`]
 /// run (issue #33, phase 4 — `infr bench`/`infr compare`'s perf-bottleneck visibility pass: this is
 /// the struct return `docs/MTP.md`'s `INFR_MTP_TIME` per-cycle `eprintln!`s are refactored to feed,
@@ -2500,53 +2564,35 @@ fn generate_mtp_spec_core(
         // next verify would otherwise re-run inside its own pass), snapshot the clean state, and
         // hand the last row to the next cycle as its leading row exactly like the prompt prime
         // does for cycle 1. Timed into the catchup bucket: it's committed-boundary maintenance,
-        // not verify work.
+        // not verify work. Uses [`run_prime_last`], NOT [`run_verify`]/[`run_verify_full`]: only
+        // the LAST row's id/logits/h is ever read below (`leading_id`/`leading_dist`/`leading_h`),
+        // so a full VERIFY's per-row lm_head here would compute up to `MTP_REPRIME_MAX_M`-1 rows
+        // of vocab-wide GEMM that are immediately thrown away — see `run_prime_last`'s doc.
         if restored && mtp_reprime && (committed.len() - boundary) + n_max > MTP_REPRIME_MAX_M {
             let t_reprime = std::time::Instant::now();
+            let (rid, rlogits, rh) = run_prime_last(
+                be,
+                bind,
+                model.gguf(),
+                cfg,
+                model.token_embd(),
+                &committed,
+                &mut trunk_state,
+                max_ctx,
+                stochastic,
+            )?;
             if stochastic {
-                let (rlogits, rh) = run_verify_full(
-                    be,
-                    bind,
-                    model.gguf(),
-                    cfg,
-                    model.token_embd(),
-                    &committed,
-                    &mut trunk_state,
-                    max_ctx,
-                )?;
-                let mr = rh.len() / ne;
                 anyhow::ensure!(
-                    mr >= 1 && rlogits.len() == mr * cfg.vocab,
-                    "mtp reprime: expected {mr}>=1 rows and {}*{} logits, got {}",
-                    mr,
+                    rlogits.len() == cfg.vocab,
+                    "mtp reprime: expected {} logits, got {}",
                     cfg.vocab,
                     rlogits.len()
                 );
-                leading_dist = Some(crate::sampling::truncated_dist(
-                    &rlogits[(mr - 1) * cfg.vocab..],
-                    sampler,
-                ));
-                leading_h = Some(rh[(mr - 1) * ne..].to_vec());
+                leading_dist = Some(crate::sampling::truncated_dist(&rlogits, sampler));
             } else {
-                let (rids, rh) = run_verify(
-                    be,
-                    bind,
-                    model.gguf(),
-                    cfg,
-                    model.token_embd(),
-                    &committed,
-                    &mut trunk_state,
-                    max_ctx,
-                )?;
-                let mr = rh.len() / ne;
-                anyhow::ensure!(
-                    mr >= 1 && rids.len() == mr,
-                    "mtp reprime: expected {mr}>=1 rows with matching ids, got {}",
-                    rids.len()
-                );
-                leading_id = Some(rids[mr - 1]);
-                leading_h = Some(rh[(mr - 1) * ne..].to_vec());
+                leading_id = Some(rid);
             }
+            leading_h = Some(rh);
             if let Some(st) = trunk_state.as_mut() {
                 st.mtp_snapshot_delta(be, cfg)?;
             }

@@ -68,12 +68,40 @@ pub struct MtpHeadWeights {
     pub shared_head_norm: Option<MtpTensor>,
 }
 
+/// MASTER KILL-SWITCH for the whole MTP self-speculative decode path — currently **DISABLED**.
+///
+/// Every MTP entry point (the three `chat/{cpu,metal,vulkan}.rs` `INFR_MTP=1` gates, `infr bench`'s
+/// `mtp` arm, `infr compare`'s `mtp128` column) routes through this. While it returns `false`:
+/// `INFR_MTP=1` is IGNORED with a warning, and a head-bearing GGUF (Qwen3.5-*-MTP) simply runs the
+/// ORDINARY non-speculative decode path — the `nextn` head tensors are left unused, which is
+/// harmless (they are extra tensors, not a different trunk).
+///
+/// WHY (2026-07-13): MTP's contract is that its output is token-identical to non-speculative greedy
+/// ("pure speedup"). That no longer holds. int8-activation decode kernels — which every fast dtype
+/// now uses — carry small per-token rounding noise, and MTP's verify batch and the plain-decode
+/// chain it must match are computed at DIFFERENT sequence positions with different KV state. The
+/// same noise that plain decode absorbs harmlessly is enough to flip a close-margin greedy argmax
+/// across the two streams, so `mtp_spec_matches_target_only_greedy` fails. This is NOT a
+/// bit-identity bug (`mmv_row1_bit_identical` passes — decode and verify share one kernel) and NOT
+/// an accuracy cliff (all 13 `gpu_seam_matches_cpu_*` pass, output stays coherent). It is inherent
+/// quantization noise, and it was BLOCKING the int8 decode tier for Q6_K (+10% decode, +34%
+/// prefill) and others. Rather than hold every other dtype's win hostage to a speculative-decode
+/// path that was already our slowest row (0.59-0.78x vs llama.cpp), MTP is parked.
+///
+/// TO RE-ENABLE: return `true` here, then make `mtp_spec_matches_target_only_greedy` pass again.
+/// The real fix is an accuracy mitigation (e.g. re-verify in f32 when the top-2 logit margin is
+/// below a threshold), NOT faster kernels — see `infr_vulkan`'s `mmv_int8_decode_dtypes` doc.
+pub fn mtp_enabled() -> bool {
+    false
+}
+
 /// Cheap arch/head check from a resolved GGUF path — no `Config`/tensor validation, just the
 /// metadata flag (mirrors `qwen35::is_qwen35`/`diffusion::is_diffusion_gemma`'s "peek without a
 /// full load" convention). `infr compare`'s MTP DECODE section and the `--sweep` `mtp` column
 /// (issue #33, phase 4 — perf-bottleneck visibility) use this to decide whether a model needs the
 /// extra measurement at all, cheaper than `Config::from_gguf` (which validates every other field
-/// too) for a check this narrow.
+/// too) for a check this narrow. Callers must ALSO check [`mtp_enabled`] — while MTP is parked this
+/// stays truthful about the FILE (the head really is there), it just must not be acted on.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn has_mtp_head(path: &std::path::Path) -> bool {
     let Ok(g) = Gguf::open(path) else {

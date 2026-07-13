@@ -96,9 +96,10 @@ infr run unsloth/diffusiongemma-26B-A4B-it-GGUF:Q4_K_M  "What is the capital of 
 infr run unsloth/Qwen3-8B-GGUF:Q6_K       "Summarize the plot of Hamlet."
 infr run unsloth/Qwen3-0.6B-GGUF:IQ4_XS   "Write a haiku about Rust."
 
-# Qwen3.5 speculative decoding (opt-in MTP head; output is token-identical to
-# greedy — pure speedup). WIP: fastest on real, content-rich prompts.
-INFR_MTP=1 infr run unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_XL "Explain how a hash map works."
+# MTP speculative decoding is currently DISABLED (see "MTP is parked" below).
+# INFR_MTP=1 is ignored with a warning; MTP-head models run the ordinary decode
+# path (their `nextn` tensors are simply unused) and are otherwise fully supported.
+infr run unsloth/Qwen3.5-4B-MTP-GGUF:Q4_K_XL "Explain how a hash map works."
 
 # Sampling: greedy by default (INFR_TEMP=0). Temperature / top-k / top-p:
 INFR_TEMP=0.7 INFR_TOP_K=40 INFR_TOP_P=0.95 \
@@ -301,35 +302,10 @@ run-to-run nondeterministic in its tier/chunk choice (a known open issue), and
 this small-model row has the widest spread of any in the table. Treat ±5% on
 `pp512` as noise everywhere; this row's spread is larger than that.
 
-² The MTP repos ship a `mtp-*.gguf` draft head. Their `mtp128`
-speculative-decode ratio is **0.76–0.78× (4B) / 0.61–0.70× (9B)** — infr's one
-consistent loss, see the prose below. Plain (non-MTP) metrics for the same
-weights are the rows shown.
-
-An optimization pass (`a9b5cae`) removed the wasted vocab-wide `lm_head` compute
-on the reprime re-sync pass (it computed up to `MTP_REPRIME_MAX_M`−1 rows and
-discarded all but the last); token-identity is preserved, but the gain does not
-survive independent re-measurement against a fresh llama.cpp baseline, so the
-ratios above are unchanged. **The verify pass (57–60% of MTP wall time) is still
-the whole gap**, and the reason it is stuck is worth recording: the obvious
-lever — an int8-quantized-activation `mrow` GEMV tier for the small-m verify
-batch — was built for **Q5_K** and **broke token-identity**, because infr's
-_plain_ decode still runs Q5_K through an f32-exact dequant GEMV. That asymmetry
-between the spec and non-spec streams flips the occasional greedy token.
-Q4_K/Q6_K don't have the problem: both streams already use int8 there. The fix
-is therefore not an MTP fix at all — it is to make the int8-activation tier
-**symmetric** across plain decode and verify (footnote ³), which is also what
-closes the mid/large decode gap.
-
-A later session split ORDINARY prefill from MTP verify at the kernel-selection
-level (`infr_core::graph::Graph::mtp_verify`, see the "Known wart, now CLOSED"
-paragraph below) so Q5_K/Q3_K's big prefill win could ship WITHOUT this
-symmetry requirement — but that split deliberately does NOT touch MTP verify
-itself: verify still only takes int8 when the dtype is ALSO on the decode
-default, so Q5_K's verify batch stays f32-exact (matching its still-f32
-decode) and this paragraph's MTP-verify gap is unchanged. The lever described
-here — verify-tier int8 for a dtype whose decode isn't — remains closed by
-design, not reopened.
+² **MTP speculative decode is currently DISABLED — see "MTP is parked" below.**
+These rows are the models' ORDINARY (non-speculative) numbers, which is how the
+MTP-head GGUFs now run. `INFR_MTP=1` is ignored with a warning; the `mtp128`
+column is no longer measured.
 
 These four rows' `tg64@d4096` cells were a GPU device-lost in the raw sweep and
 are re-measured post-`8513358`: 35821b6's capacity gate on the `nonfa` coopmat
@@ -490,30 +466,43 @@ the shape a coding agent actually runs, and it is where infr is furthest ahead.
 Decode is at-or-above parity up to ~1.7B, on the gemma-4 MoE (1.03×), and on the
 35B-class DeltaNet models (Ornith-35B 1.02×).
 
-**Where infr loses.** Four places, all understood:
+### MTP is parked
 
-- **MTP speculative decode** (`mtp128`, 0.60–0.78×) — the only consistent,
-  material loss. Both engines decode the same un-templated content (α is
-  content-sensitive, so cross-engine spec ratios are meaningless otherwise);
-  llama.cpp's spec self-speedup simply survives low accept rates better because
-  its batched verify amortizes further. Levers: wide-n small-m GEMM efficiency,
-  and verifying the lm_head only over the rows whose logits are kept.
-- **Mid/large dense + Qwen MoE decode** (8B–31B at 0.87–0.97×, Qwen3-30B/35B MoE
-  at 0.91–0.99×) — these are all **Q4_K_M** rows. Footnote ³ named the cause
-  (infr's int8 Q4_K GEMV kernel was slower than its own f32 path) and the kernel
-  is now fixed — int8 Q4_K measures a real win in isolation — but it stays
-  unshipped because it breaks MTP token-identity against the pre-existing
-  always-int8 `mrow` verify tier (footnote ³ again), so these rows are
-  unchanged: still on the f32 path, still behind llama.cpp's `q4_k × q8_1`. This
-  was previously written off as the memory-bandwidth wall — decode GEMVs do run
-  at 77–88% of DRAM peak — but that figure was measured on the f32-activation
-  kernels, and llama.cpp beating us by 35% on 14B Q2_K decode proves those rows
-  are partly **ALU-bound**, with more headroom than the wall story implied.
-  Correct full-expert routing separately costs the Qwen MoEs some prefill batch
-  efficiency (0.95× on Qwen3-30B).
-- **Qwen3-14B Q2_K decode** (0.78–0.81×, was 0.72–0.74×) — improved by the
-  int8-activation tier (footnote ³); the residual is infr's Q4_K/Q2_K GEMV
-  kernel shape, not the precision policy.
+**MTP self-speculative decode is DISABLED** (`infr_llama::mtp::mtp_enabled` is
+the single kill-switch, and carries the full rationale). `INFR_MTP=1` is ignored
+with a warning, and the MTP-head GGUFs (Qwen3.5-\*-MTP) run the **ordinary**
+decode path — their `nextn` tensors are simply unused, which is harmless. Those
+models are otherwise fully supported; only the speculative path is off.
+
+Why: MTP's contract was that its output is **token-identical to non-speculative
+greedy** — a pure speedup, not a quality trade. That no longer holds. The
+int8-activation decode kernels every fast dtype now uses carry small per-token
+rounding noise, and MTP's verify batch and the plain-decode chain it must match
+are computed at **different sequence positions with different KV state**. The
+same noise plain decode absorbs harmlessly is enough to flip a close-margin
+greedy argmax between the two streams, so `mtp_spec_matches_target_only_greedy`
+fails. Notably this is **not** a bit-identity bug (`mmv_row1_bit_identical`
+passes — decode and verify share one kernel) and **not** an accuracy cliff (all
+13 `gpu_seam_matches_cpu_*` pass; output stays coherent).
+
+That guarantee was holding the rest of the engine hostage: it blocked Q6_K's int8
+decode tier (+10% decode, +34% prefill) on a speculative path that was already
+our slowest row (0.59–0.78× vs llama.cpp). So MTP is parked and the kernel wins
+ship. The identity test is `#[ignore]`d, **not weakened** — the assertion is
+correct; re-enabling MTP means making it pass again, which needs an accuracy
+mitigation (e.g. re-verify in f32 when the top-2 logit margin is tight), not
+faster kernels.
+
+**Where infr loses.** Three places, all understood:
+
+- **Mid/large dense + Qwen MoE decode** (Q4_K_M rows) — the memory-bandwidth wall
+  is the residual here, but it is a smaller wall than we thought: decode GEMVs
+  run at 77–88% of DRAM peak, yet that figure was measured on the f32-activation
+  kernels, and these rows are partly **ALU-bound**. The int8 tier (footnote ³)
+  closed much of the gap; what remains is kernel shape. Correct full-expert
+  routing separately costs the Qwen MoEs some prefill batch efficiency.
+- **Qwen3-14B Q2_K decode** — improved by the int8-activation tier (footnote ³);
+  the residual is GEMV kernel shape, not the precision policy.
 - **Ornith-35B prefill** (0.89×) and **the IQ3_S MoE** (0.90×) — the DeltaNet
   scan kernel (footnote ⁵) and the grid i-quant path (footnote ⁶), both known
   kernel projects.

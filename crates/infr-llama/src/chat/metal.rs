@@ -42,7 +42,8 @@ impl MetalSeamChat {
             return Ok(false);
         }
         self.mtp_checked = true;
-        if std::env::var("INFR_MTP").ok().as_deref() != Some("1")
+        if !crate::mtp::mtp_enabled()
+            || std::env::var("INFR_MTP").ok().as_deref() != Some("1")
             || self.model.config().n_layer_nextn == 0
         {
             return Ok(false);

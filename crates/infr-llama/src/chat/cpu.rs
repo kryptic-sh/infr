@@ -52,7 +52,8 @@ impl ChatModel for CpuDenseChat {
         // CPU MTP (INFR_MTP=1 on a head-bearing qwen35 GGUF): the exact-f32 reference for the
         // draft-verify loop — its acceptance rate is the oracle a GPU backend's alpha is judged
         // against (a backend whose head numerics drift from its trunk shows a lower alpha here).
-        if std::env::var("INFR_MTP").ok().as_deref() == Some("1")
+        if crate::mtp::mtp_enabled()
+            && std::env::var("INFR_MTP").ok().as_deref() == Some("1")
             && self.model.config().n_layer_nextn > 0
         {
             let head = crate::mtp::load_mtp_head(self.model.gguf(), self.model.config())?;

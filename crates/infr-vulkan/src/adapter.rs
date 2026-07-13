@@ -523,7 +523,7 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
         //
         // Q5_K stays OFF on a plain throughput tradeoff (decode -1.4%, prefill +45%) — see the doc
         // above; its accuracy was never the blocker.
-        None => &[Q2K, Q4K],
+        None => &[Q2K, Q4K, Q6K],
     }
 }
 

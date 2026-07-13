@@ -1079,7 +1079,11 @@ fn cmd_bench(
     // combined ingest+reply shape the MTP arm doesn't have an equivalent for). Models without a
     // head take the exact path above unchanged — `mtp` stays `None`, `print_bench_avg_mtp` falls
     // straight through to the pre-existing `print_bench_avg` line.
-    let mtp = if pg.is_none() && n_gen > 0 && model.config().n_layer_nextn > 0 {
+    let mtp = if infr_llama::mtp::mtp_enabled()
+        && pg.is_none()
+        && n_gen > 0
+        && model.config().n_layer_nextn > 0
+    {
         Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps)?)
     } else {
         None
@@ -1282,7 +1286,11 @@ fn cmd_bench_metal(
         // gets its self-speculative Metal decode (accept rate + phase split) measured alongside the
         // baseline tg above. `bench_mtp_tg` reads INFR_METAL (set here) to route onto the Metal
         // timed driver. Models without a head keep `mtp = None` → byte-identical to the old output.
-        let mtp = if pg.is_none() && n_gen > 0 && model.config().n_layer_nextn > 0 {
+        let mtp = if infr_llama::mtp::mtp_enabled()
+            && pg.is_none()
+            && n_gen > 0
+            && model.config().n_layer_nextn > 0
+        {
             Some(bench_mtp_tg(&model, n_prompt, depth, n_gen, reps)?)
         } else {
             None
@@ -1715,7 +1723,10 @@ fn cmd_compare_sweep(
         // run + one infr mtp run; every other model prints a blank row instantly, keeping the
         // sweep's runtime dominated by the 4 metrics above, not this column).
         let metric_label = "mtp128".to_string();
-        if mb.has_mtp_head() {
+        // MTP is PARKED (`infr_llama::mtp::mtp_enabled`'s doc) — the column stays in the table shape
+        // (a blank row, same as any model without a head) so the sweep archive's columns keep lining
+        // up with older archives, but neither engine is measured.
+        if infr_llama::mtp::mtp_enabled() && mb.has_mtp_head() {
             let iv = mb.infr_mtp(&["-p", "0", "-n", "128"]);
             let lv = mb.llama_cli_mtp(128);
             let is = iv.as_ref().map(|v| format!("{v:.0}")).unwrap_or_else(|e| {

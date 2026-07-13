@@ -59,6 +59,17 @@ impl DenseSeamChat {
         if std::env::var("INFR_MTP").ok().as_deref() != Some("1") {
             return Ok(false);
         }
+        // MTP is PARKED (`mtp::mtp_enabled`'s doc): honour the env var with a warning, then fall
+        // through to the ordinary decode path. A head-bearing GGUF still runs — its `nextn` tensors
+        // are simply unused.
+        if !crate::mtp::mtp_enabled() {
+            eprintln!(
+                "[infr] INFR_MTP=1 ignored: MTP speculative decode is disabled (known-broken — it \
+                 no longer matches greedy output under the int8 decode kernels; see README). \
+                 Running the ordinary decode path."
+            );
+            return Ok(false);
+        }
         if self.model.config().n_layer_nextn == 0 {
             return Ok(false);
         }

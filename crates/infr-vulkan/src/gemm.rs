@@ -438,7 +438,8 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
 /// SPIR-V + kernel-cache name for the reassociation-tolerant subgroup+NR variant of the multi-slot
 /// id GEMV (`native_gemv_id_multi_sg.comp`, wave32 + subgroupAdd). NOT bit-identical to
 /// `native_idm_*` — reordered accumulation; the caller gates to the Q6_K projection band (see
-/// `native_id_sg_choice`). Only Q6_K has an SG build (Q4_K idm already saturates). `nr` ∈ {2,4,8}.
+/// `native_id_sg_choice`). Q6_K/Q5_K/IQ3_S only (Q4_K idm already saturates; IQ2_S's gate/up
+/// shape REGRESSES on this tier). `nr` ∈ {2,4,8}.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_idm_sg_build_spv(
     dtype: infr_core::DType,
@@ -470,6 +471,12 @@ pub(crate) fn native_idm_sg_build_spv(
         (Q5K, 2, true) => v!("native_idm_q5k_sg2_sg16"),
         (Q5K, 4, true) => v!("native_idm_q5k_sg4_sg16"),
         (Q5K, 8, true) => v!("native_idm_q5k_sg8_sg16"),
+        (Iq3S, 2, false) => v!("native_idm_iq3s_sg2"),
+        (Iq3S, 4, false) => v!("native_idm_iq3s_sg4"),
+        (Iq3S, 8, false) => v!("native_idm_iq3s_sg8"),
+        (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_sg16"),
+        (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_sg16"),
+        (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_sg16"),
         _ => None,
     }
 }

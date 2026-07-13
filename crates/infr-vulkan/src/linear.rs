@@ -333,12 +333,22 @@ pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
 /// Pad raw GGUF block bytes to the next multiple of 4 for upload as `array<u32>`.
 /// Appends zero bytes; the final u32 word's padding bytes are never read (they
 /// contain only out-of-block data which the shader never accesses for valid g).
+///
+/// Returns a `Cow` so the common case is ZERO-COPY: nearly every GGUF tensor's byte length is
+/// already a multiple of 4 (block sizes 18/20/34/144/210… × a block count), so padding is a no-op
+/// and we can hand the caller the mmap slice straight through. This used to unconditionally
+/// `to_vec()` every tensor — a full host copy of the entire model (~9 GiB on Qwen3-14B, ~1.26s of
+/// pure memcpy + allocation) purely to append zero bytes that, in the overwhelming majority of
+/// cases, did not exist.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn pad_to_u32_align(bytes: &[u8]) -> Vec<u8> {
+pub fn pad_to_u32_align(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let padded = (bytes.len() + 3) & !3;
+    if padded == bytes.len() {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
     let mut v = bytes.to_vec();
     v.resize(padded, 0u8);
-    v
+    std::borrow::Cow::Owned(v)
 }
 
 static LINEAR_SPV: OnceLock<Vec<u32>> = OnceLock::new();

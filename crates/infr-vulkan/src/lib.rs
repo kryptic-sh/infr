@@ -29,10 +29,11 @@ pub const FLASH_SHARED_PER_ROW: u32 = 908;
 /// Keep in sync with `attn_flash_reg.comp`.
 pub const FLASH_REG_SHARED_PER_ROW: u32 = 460;
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -121,6 +122,46 @@ struct VulkanShared {
     /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
     /// (it also sees other processes' VRAM).
     device_used: AtomicU64,
+    /// Memory type index for DIRECT-TO-VRAM weight writes (Resizable BAR), or `None` when the
+    /// device doesn't expose one. See [`probe_rebar_type`]: it is a
+    /// `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` type sitting on the device's LARGEST
+    /// device-local heap — i.e. the whole of VRAM is host-visible, not just a 256 MiB BAR window.
+    rebar_type: Option<u32>,
+    /// Whether the CURRENT weight load writes straight into VRAM through `rebar_type`. Decided
+    /// once per load in `weight_progress_scope` (needs `rebar_type` AND enough room on its heap
+    /// for the model), so a ReBAR-less box — or a model too big for the host-visible heap —
+    /// cleanly takes the staging-ring path instead. Only meaningful while a weight scope is open.
+    weights_direct: AtomicBool,
+    /// Reused staging ring for the NON-direct weight path (see [`StagingRing`]). Built lazily on
+    /// the first staged weight upload of a load and torn down with the weight scope.
+    staging_ring: Mutex<Option<StagingRing>>,
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl VulkanShared {
+    /// Wait for every in-flight staging copy and tear the ring down. Called when the weight-load
+    /// scope ends, so all weights are fully resident before any forward is recorded — this is the
+    /// synchronization point that replaced the old per-tensor `queue_wait_idle`.
+    fn drain_staging_ring(&self) {
+        let Some(mut ring) = self.staging_ring.lock().unwrap().take() else {
+            return;
+        };
+        let pending: Vec<vk::Fence> = (0..RING_SLOTS)
+            .filter(|&i| ring.busy[i])
+            .map(|i| ring.fences[i])
+            .collect();
+        unsafe {
+            if !pending.is_empty() {
+                let _ = self.device.wait_for_fences(&pending, true, u64::MAX);
+            }
+            let pool = *self.cmd_pool.lock().unwrap();
+            self.device.free_command_buffers(pool, &ring.cmds);
+            for f in ring.fences.drain(..) {
+                self.device.destroy_fence(f, None);
+            }
+        }
+        // `ring.bufs` drop here → the staging slots are freed.
+    }
 }
 
 // ash Instances/Devices/handles are Send+Sync per the Vulkan spec when
@@ -185,24 +226,47 @@ enum Backing {
     /// Bump-allocated from the [`WeightArena`]. The arena block owns the memory; on drop the buffer
     /// only destroys its own handle (the block frees the memory when the arena drops).
     Arena,
+    /// A DEDICATED `VkDeviceMemory` this buffer owns outright, allocated from the ReBAR memory type
+    /// (`VulkanShared::rebar_type`) and PERSISTENTLY MAPPED: device-local VRAM that the host can
+    /// write through directly. This is the fast weight-load path — `upload` memcpys the GGUF bytes
+    /// straight into VRAM with no staging buffer, no `vkCmdCopyBuffer` and no queue stall. Freed
+    /// (unmapped + `vkFreeMemory`) on drop.
+    ///
+    /// Allocated per weight tensor rather than from one big arena because
+    /// `maxMemoryAllocationSize` is ~4 GiB on RADV — a single block for a 9 GiB (let alone
+    /// 21.9 GiB) model is impossible, and a chunked arena would strand the tail of every block.
+    /// Per-tensor `vkAllocateMemory` measured ~14 ms across a whole 443-tensor load, so there is
+    /// nothing to win by pooling here.
+    Vram {
+        memory: vk::DeviceMemory,
+        ptr: *mut u8,
+    },
 }
 
 struct VkBuffer {
     shared: Arc<VulkanShared>,
     buffer: vk::Buffer,
     backing: Backing,
+    /// Logical buffer size (what the caller asked for and what `upload`/`fill_buf` touch).
     size: usize,
+    /// Device-memory bytes actually committed for this buffer (`requirements.size`, i.e. `size`
+    /// rounded up for alignment). Charged to / released from the VRAM budget guard's accounting
+    /// by [`Backing::Vram`], which owns its `VkDeviceMemory` outright.
+    mem_size: u64,
     location: MemoryLocation,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VkBuffer {
-    /// Persistently-mapped host pointer for host-visible (pooled) buffers; `None` for device-local
-    /// or arena buffers (which are never mapped — they're filled via a staging copy).
+    /// Persistently-mapped host pointer for host-visible buffers — pooled host-visible allocations
+    /// AND [`Backing::Vram`] weights (device-local VRAM the host can write through, via ReBAR).
+    /// `None` for plain device-local or arena buffers, which are filled via a staging copy.
+    /// Every "can I just memcpy into this?" decision (`upload`, `fill_buf`) keys off this.
     fn mapped_ptr(&self) -> Option<*mut u8> {
         match &self.backing {
             Backing::Pooled(a) => a.mapped_ptr().map(|p| p.as_ptr() as *mut u8),
             Backing::Arena => None,
+            Backing::Vram { ptr, .. } => Some(*ptr),
         }
     }
 }
@@ -211,16 +275,28 @@ impl VkBuffer {
 impl Drop for VkBuffer {
     fn drop(&mut self) {
         unsafe {
-            if let Backing::Pooled(alloc) = &mut self.backing {
-                let alloc = ManuallyDrop::take(alloc);
-                // Keep the budget guard's fallback accounting balanced (arena buffers don't own
-                // their memory — the arena block stays counted until the backend drops).
-                if self.location == MemoryLocation::GpuOnly {
+            match &mut self.backing {
+                Backing::Pooled(alloc) => {
+                    let alloc = ManuallyDrop::take(alloc);
+                    // Keep the budget guard's fallback accounting balanced (arena buffers don't own
+                    // their memory — the arena block stays counted until the backend drops).
+                    if self.location == MemoryLocation::GpuOnly {
+                        self.shared
+                            .device_used
+                            .fetch_sub(alloc.size(), Ordering::Relaxed);
+                    }
+                    self.shared.allocator.lock().unwrap().free(alloc).ok();
+                }
+                // ReBAR weight: we own the VkDeviceMemory outright. It lives in the device-local
+                // heap, so it IS charged to the budget guard (see `make_buf_ex`) — balance it here.
+                Backing::Vram { memory, .. } => {
                     self.shared
                         .device_used
-                        .fetch_sub(alloc.size(), Ordering::Relaxed);
+                        .fetch_sub(self.mem_size, Ordering::Relaxed);
+                    self.shared.device.unmap_memory(*memory);
+                    self.shared.device.free_memory(*memory, None);
                 }
-                self.shared.allocator.lock().unwrap().free(alloc).ok();
+                Backing::Arena => {}
             }
             // Arena memory belongs to the arena block; only destroy the buffer handle here.
             self.shared.device.destroy_buffer(self.buffer, None);
@@ -257,6 +333,116 @@ const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 /// Overflow arena blocks (only allocated if the reserved block underflows the estimate) stay modest
 /// so a tiny estimate miss can't waste a whole second model-sized block.
 const ARENA_OVERFLOW_BLOCK: u64 = 64 * 1024 * 1024;
+
+/// Find the memory type for DIRECT-TO-VRAM weight writes ("Resizable BAR") — OPT-IN, see below.
+///
+/// The target is a `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` memory type on the device's
+/// LARGEST device-local heap: real VRAM the host can write straight through, so `upload` can
+/// memcpy a weight in with no staging buffer, no `vkCmdCopyBuffer` and no fence. Requiring the
+/// LARGEST device-local heap is what distinguishes true ReBAR from the legacy 256 MiB BAR window
+/// (without ReBAR, RADV still exposes a `DEVICE_LOCAL | HOST_VISIBLE` type, but on a separate tiny
+/// heap — allocating a 9 GiB model from it would exhaust it and silently spill into system RAM).
+///
+/// ## Why this is OFF by default: it is SLOWER than the staging ring. MEASURED, not assumed.
+///
+/// It is the obvious "one pass instead of two" optimization, and it loses. On a 7900 XTX
+/// (PCIe 4.0 x16), Qwen3-14B-Q4_K_M (~9 GiB of weights), warm page cache:
+///
+/// | weight-upload path                        | `upload` self | effective  | total load |
+/// |-------------------------------------------|---------------|------------|------------|
+/// | direct-to-VRAM, single-threaded memcpy     | 1.02 s        |  8.8 GB/s  | 2.01 s     |
+/// | direct-to-VRAM, parallel memcpy            | ~0.62 s       | ~14.5 GB/s | 1.57 s     |
+/// | reused staging ring ([`StagingRing`])      | 0.50 s        | ~18 GB/s   | 1.42 s     |
+///
+/// The catch is WHERE the host's stores land. Writing to ReBAR VRAM puts every byte on the PCIe
+/// bus AT MEMCPY TIME, through a write-combined mapping — one core saturates at ~8.8 GB/s, and even
+/// all cores together can't beat the link. The staging ring's memcpy instead lands in ordinary
+/// system RAM at full speed (~18 GB/s), and the PCIe crossing is done afterwards by the DMA
+/// engine — which OVERLAPS with the host filling the next chunk. So the "extra" copy is free: it
+/// buys you the ability to hide the bus behind the memcpy. Two overlapped passes beat one
+/// serialized pass over a slower bus.
+///
+/// Kept because it is a genuine win on hardware where the host↔device link is NOT the bottleneck
+/// (integrated/UMA GPUs, where "VRAM" is system RAM and the DMA is a pointless extra copy), and
+/// because it is the natural path for a future load that wants to skip host staging entirely.
+/// `INFR_REBAR=1` opts in; the default is the ring on every device.
+fn probe_rebar_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u32> {
+    if !std::env::var("INFR_REBAR").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return None;
+    }
+    let want = vk::MemoryPropertyFlags::DEVICE_LOCAL
+        | vk::MemoryPropertyFlags::HOST_VISIBLE
+        | vk::MemoryPropertyFlags::HOST_COHERENT;
+    // The heap holding the bulk of VRAM.
+    let vram_heap = (0..mp.memory_heap_count)
+        .filter(|&h| {
+            mp.memory_heaps[h as usize]
+                .flags
+                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+        })
+        .max_by_key(|&h| mp.memory_heaps[h as usize].size)?;
+    (0..mp.memory_type_count).find(|&i| {
+        let t = mp.memory_types[i as usize];
+        t.property_flags.contains(want) && t.heap_index == vram_heap
+    })
+}
+
+/// The size of the heap backing memory type `ty`.
+fn heap_size_of(mp: &vk::PhysicalDeviceMemoryProperties, ty: u32) -> u64 {
+    mp.memory_heaps[mp.memory_types[ty as usize].heap_index as usize].size
+}
+
+/// Copy `src` into a persistently-mapped destination, in PARALLEL for large buffers.
+///
+/// For a ReBAR weight the destination is write-combined VRAM across PCIe, where a single core
+/// cannot saturate the link (measured ~8.8 GB/s single-threaded on a 7900 XTX / PCIe 4.0 x16).
+/// Splitting the copy across cores lets several write-combine streams be in flight at once. Small
+/// buffers copy inline — below the threshold the rayon fork/join costs more than it saves.
+fn copy_to_mapped(src: &[u8], dst: *mut u8) {
+    /// Below this, a plain memcpy beats paying for fork/join.
+    const PAR_MIN: usize = 4 * 1024 * 1024;
+    /// Chunk per task: big enough to amortize scheduling, small enough to spread over cores.
+    const PAR_CHUNK: usize = 2 * 1024 * 1024;
+
+    if src.len() < PAR_MIN {
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        return;
+    }
+    // `dst` is valid for `src.len()` bytes and the chunks are disjoint, so the per-chunk raw
+    // writes never alias. `usize` is carried across the thread boundary because `*mut u8` is
+    // not `Send`.
+    let base = dst as usize;
+    src.par_chunks(PAR_CHUNK).enumerate().for_each(|(i, c)| {
+        let off = i * PAR_CHUNK;
+        unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (base + off) as *mut u8, c.len()) };
+    });
+}
+
+/// A ring of REUSED, fixed-size staging buffers — the DEFAULT weight-upload path on every device
+/// (it measured faster than writing straight into ReBAR VRAM; see [`probe_rebar_type`]).
+///
+/// The old path allocated a fresh DEDICATED staging buffer as large as each tensor, memcpy'd into
+/// it, submitted a copy, then `vkQueueWaitIdle`'d and freed it — per tensor. That serialized the
+/// host memcpy against the DMA and paid an allocate/submit/stall/free cycle 443 times.
+///
+/// Here the ring is allocated ONCE per load. Big tensors are chunked across slots, and each slot
+/// carries its own command buffer + fence, so while slot N's DMA is in flight the host is already
+/// memcpy'ing into slot N+1 — the copy engine and the CPU overlap instead of taking turns. A slot
+/// is only waited on when it is reused (its fence), never after every tensor. That overlap is the
+/// whole point: it hides the PCIe crossing behind a full-speed system-RAM memcpy.
+struct StagingRing {
+    /// Fixed-size host-visible staging slots (`RING_SLOTS` × `RING_SLOT_BYTES`).
+    bufs: Vec<VkBuffer>,
+    cmds: Vec<vk::CommandBuffer>,
+    fences: Vec<vk::Fence>,
+    /// Whether slot `i` has work in flight that its fence must be waited on before reuse.
+    busy: Vec<bool>,
+    next: usize,
+}
+
+/// Staging-ring geometry: enough slots to keep the copy engine fed while the host fills the next.
+const RING_SLOTS: usize = 4;
+const RING_SLOT_BYTES: usize = 32 * 1024 * 1024;
 
 /// One large device-local memory block the weight arena bump-allocates from.
 struct ArenaBlock {
@@ -409,6 +595,12 @@ pub struct WeightProgress {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for WeightProgress {
     fn drop(&mut self) {
+        // Drain the staging ring FIRST: on the non-ReBAR path its copies are still in flight (we
+        // fence per slot instead of stalling the queue per tensor), and the weights must be fully
+        // resident before the loader records a forward. No-op on the direct-to-VRAM path, which
+        // never builds a ring.
+        self.shared.drain_staging_ring();
+        self.shared.weights_direct.store(false, Ordering::Relaxed);
         if let Some(pb) = self.shared.weight_pb.lock().unwrap().take() {
             pb.finish_and_clear();
         }
@@ -1069,6 +1261,12 @@ impl VulkanBackend {
         let push_descriptor =
             has_push_descriptor.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
 
+        // Direct-to-VRAM weight writes (Resizable BAR), if this device exposes the memory type.
+        // Probed once here; whether a given LOAD actually uses it is decided in
+        // `weight_progress_scope` (it also has to fit).
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let rebar_type = probe_rebar_type(&mem_props);
+
         Ok(Self {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
@@ -1091,6 +1289,9 @@ impl VulkanBackend {
                 pcache,
                 weight_pb: Mutex::new(None),
                 device_used: AtomicU64::new(0),
+                rebar_type,
+                weights_direct: AtomicBool::new(false),
+                staging_ring: Mutex::new(None),
             }),
         })
     }
@@ -1101,6 +1302,31 @@ impl VulkanBackend {
     /// so a model loader cannot forget it; it only has to open the scope once. The returned guard
     /// finishes and clears the bar on drop, so the bar's lifetime is the loader's scope.
     fn weight_progress_scope(&self, total_bytes: Option<u64>) -> WeightProgress {
+        // Pick the weight-upload path for THIS load, from the device's actual memory properties.
+        //
+        // The DEFAULT is the reused, pipelined staging ring — it is both faster than direct-to-VRAM
+        // writes and available on every device (see `probe_rebar_type` for the measurements).
+        //
+        // Direct-to-VRAM (ReBAR, opt-in via INFR_REBAR=1) additionally requires:
+        //   * a DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type on the main VRAM heap
+        //     (`probe_rebar_type` — absent when ReBAR is off in the BIOS), and
+        //   * enough room on that heap for the model. `total_bytes` is the loader's weight
+        //     footprint; if it doesn't fit we take the ring rather than allocate until the heap
+        //     gives out. Unknown total (`None`) → assume it fits; a mid-load failure still falls
+        //     back gracefully (see `make_buf_ex`).
+        let direct = match self.shared.rebar_type {
+            Some(ty) => {
+                let mp = unsafe {
+                    self.shared
+                        .instance
+                        .get_physical_device_memory_properties(self.shared.physical_device)
+                };
+                total_bytes.is_none_or(|t| t <= heap_size_of(&mp, ty))
+            }
+            None => false,
+        };
+        self.shared.weights_direct.store(direct, Ordering::Relaxed);
+
         let pb = infr_core::progress::bar(
             total_bytes,
             "loading weights",
@@ -1316,6 +1542,66 @@ impl VulkanBackend {
         Ok(())
     }
 
+    /// Bind `buffer` to a fresh, PERSISTENTLY MAPPED dedicated allocation of memory type `ty` (the
+    /// ReBAR type — device-local VRAM the host can write through). See [`Backing::Vram`].
+    ///
+    /// The caller owns `buffer` and must destroy it if this returns `Err`. Budget-guarded and
+    /// charged to `device_used` exactly like any other device-local allocation.
+    fn alloc_vram_mapped(
+        &self,
+        buffer: vk::Buffer,
+        size: usize,
+        requirements: &vk::MemoryRequirements,
+        ty: u32,
+    ) -> Result<VkBuffer> {
+        self.check_vram_budget(requirements.size)?;
+
+        let memory = unsafe {
+            self.shared.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(ty),
+                None,
+            )
+        }
+        .map_err(|e| be(format!("rebar allocate_memory({}): {e}", requirements.size)))?;
+
+        let ptr = match unsafe {
+            self.shared
+                .device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        } {
+            Ok(p) => p as *mut u8,
+            Err(e) => {
+                unsafe { self.shared.device.free_memory(memory, None) };
+                return Err(be(format!("rebar map_memory: {e}")));
+            }
+        };
+
+        if let Err(e) = unsafe { self.shared.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.shared.device.unmap_memory(memory);
+                self.shared.device.free_memory(memory, None);
+            }
+            return Err(be(format!("rebar bind_buffer_memory: {e}")));
+        }
+
+        self.shared
+            .device_used
+            .fetch_add(requirements.size, Ordering::Relaxed);
+
+        Ok(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::Vram { memory, ptr },
+            // Logical size = what the caller asked for; `requirements.size` only rounds it up for
+            // alignment, and `fill_buf`/`upload` must not touch past the logical extent.
+            size,
+            mem_size: requirements.size,
+            location: MemoryLocation::GpuOnly,
+        })
+    }
+
     fn make_buf(&self, size: usize, location: MemoryLocation, label: &str) -> Result<VkBuffer> {
         self.make_buf_ex(size, location, label, false)
     }
@@ -1346,6 +1632,33 @@ impl VulkanBackend {
             .map_err(|e| be(format!("create_buffer: {e}")))?;
 
         let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
+
+        // ── ReBAR fast path: a weight, during a load that chose direct-to-VRAM writes ──────────
+        // Allocate this tensor's VRAM from the host-visible device-local type and map it, so
+        // `upload` can memcpy the GGUF bytes straight in (no staging, no copy cmd, no stall).
+        // The memory is device-local, so it is budget-guarded and accounted exactly like a GpuOnly
+        // allocation — this changes WHERE weights are allocated from, not how much VRAM they take.
+        if label == "weights" && self.shared.weights_direct.load(Ordering::Relaxed) {
+            if let Some(ty) = self.shared.rebar_type {
+                // Only if the buffer's requirements actually permit that memory type.
+                if requirements.memory_type_bits & (1 << ty) != 0 {
+                    match self.alloc_vram_mapped(buffer, size, &requirements, ty) {
+                        Ok(b) => return Ok(b),
+                        Err(e) => {
+                            // Out of host-visible VRAM (or map failed): fall through to the normal
+                            // allocator rather than failing the load — the staging path still works.
+                            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+                            self.shared.weights_direct.store(false, Ordering::Relaxed);
+                            eprintln!(
+                                "[infr] direct-to-VRAM weight alloc failed ({e}); \
+                                 falling back to the staging ring for the rest of this load"
+                            );
+                            return self.make_buf_ex(size, location, label, force_dedicated);
+                        }
+                    }
+                }
+            }
+        }
 
         // Load-once weights (label "weights") bind into the pre-reserved bump arena when one exists
         // — the whole model's VRAM is reserved up front (see `reserve_weights`). Everything else
@@ -1385,6 +1698,7 @@ impl VulkanBackend {
                             buffer,
                             backing: Backing::Arena,
                             size,
+                            mem_size: requirements.size,
                             location,
                         });
                     }
@@ -1451,6 +1765,7 @@ impl VulkanBackend {
             buffer,
             backing: Backing::Pooled(ManuallyDrop::new(allocation)),
             size,
+            mem_size: requirements.size,
             location,
         })
     }
@@ -1537,6 +1852,118 @@ impl VulkanBackend {
             }
         }
         Ok(buf)
+    }
+
+    /// Copy `src` into device-local `dst_buf` through the REUSED staging ring (see [`StagingRing`])
+    /// — the weight-load path on a device without ReBAR.
+    ///
+    /// The tensor is chunked across fixed-size slots. For each chunk we wait only on the fence of
+    /// the slot we are about to REUSE (not on the queue as a whole), memcpy into it, and submit its
+    /// copy. With `RING_SLOTS` slots in flight the host's memcpy for chunk N+1 overlaps the DMA of
+    /// chunk N, instead of the old `queue_wait_idle`-after-every-tensor lockstep.
+    ///
+    /// Uploads are not awaited here; [`WeightProgress::drop`] drains the ring, which happens long
+    /// before any forward is submitted.
+    fn upload_staged_ring(&self, dst_buf: vk::Buffer, src: &[u8]) -> Result<()> {
+        let device = &self.shared.device;
+        let mut guard = self.shared.staging_ring.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(self.make_staging_ring()?);
+        }
+        let ring = guard.as_mut().expect("just built");
+
+        let mut off = 0usize;
+        while off < src.len() {
+            let n = (src.len() - off).min(RING_SLOT_BYTES);
+            let i = ring.next;
+            ring.next = (ring.next + 1) % RING_SLOTS;
+
+            // Reuse of a slot is the ONLY place we block: wait for its previous copy to land.
+            if ring.busy[i] {
+                unsafe { device.wait_for_fences(&[ring.fences[i]], true, u64::MAX) }
+                    .map_err(|e| be(format!("staging ring wait_for_fences: {e}")))?;
+                ring.busy[i] = false;
+            }
+            unsafe { device.reset_fences(&[ring.fences[i]]) }
+                .map_err(|e| be(format!("staging ring reset_fences: {e}")))?;
+
+            let ptr = ring.bufs[i]
+                .mapped_ptr()
+                .ok_or_else(|| be("staging ring slot is not mapped"))?;
+            copy_to_mapped(&src[off..off + n], ptr);
+
+            let cmd = ring.cmds[i];
+            unsafe {
+                device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| be(format!("staging ring reset_command_buffer: {e}")))?;
+                device
+                    .begin_command_buffer(
+                        cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|e| be(format!("staging ring begin_command_buffer: {e}")))?;
+                device.cmd_copy_buffer(
+                    cmd,
+                    ring.bufs[i].buffer,
+                    dst_buf,
+                    &[vk::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: off as u64,
+                        size: n as u64,
+                    }],
+                );
+                device
+                    .end_command_buffer(cmd)
+                    .map_err(|e| be(format!("staging ring end_command_buffer: {e}")))?;
+
+                let cmds = [cmd];
+                let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+                device
+                    .queue_submit(self.shared.queue, &[submit], ring.fences[i])
+                    .map_err(|e| be(format!("staging ring queue_submit: {e}")))?;
+            }
+            ring.busy[i] = true;
+            off += n;
+        }
+        Ok(())
+    }
+
+    /// Allocate the staging ring's slots, command buffers and fences — ONCE per load.
+    fn make_staging_ring(&self) -> Result<StagingRing> {
+        let device = &self.shared.device;
+        let pool = *self.shared.cmd_pool.lock().unwrap();
+        let cmds = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(RING_SLOTS as u32),
+            )
+        }
+        .map_err(|e| be(format!("staging ring allocate_command_buffers: {e}")))?;
+
+        let mut bufs = Vec::with_capacity(RING_SLOTS);
+        let mut fences = Vec::with_capacity(RING_SLOTS);
+        for _ in 0..RING_SLOTS {
+            bufs.push(self.make_buf(
+                RING_SLOT_BYTES,
+                MemoryLocation::CpuToGpu,
+                "upload_staging",
+            )?);
+            fences.push(
+                unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+                    .map_err(|e| be(format!("staging ring create_fence: {e}")))?,
+            );
+        }
+        Ok(StagingRing {
+            bufs,
+            cmds,
+            fences,
+            busy: vec![false; RING_SLOTS],
+            next: 0,
+        })
     }
 
     /// Record a single command into a one-shot command buffer, submit it to the
@@ -1650,50 +2077,59 @@ impl Backend for VulkanBackend {
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
         // Safety: every buffer from this backend is a VkBuffer.
         let vk_dst = unsafe { as_vk_buf(dst) };
-
-        if vk_dst.location == MemoryLocation::CpuToGpu {
-            // Direct write through the persistently-mapped pointer.
-            let ptr = vk_dst
-                .mapped_ptr()
-                .ok_or_else(|| be("CpuToGpu buffer is not persistently mapped"))?;
-            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), ptr, src.len()) };
-        } else {
-            // Staging path: CPU → staging → device-local. During a WEIGHT LOAD (progress scope
-            // active — the single funnel every model load opens), the staging is a DEDICATED
-            // allocation so it frees fully on drop instead of leaving retained empty general
-            // blocks in the ReBAR device-local host-visible heap after the last upload (see
-            // `make_buf_ex`'s doc — the vendored gpu-allocator has no way to release those).
-            let dedicated = self.shared.weight_pb.lock().unwrap().is_some();
-            let staging = self.make_buf_ex(
+        if src.len() > vk_dst.size {
+            return Err(be(format!(
+                "upload: {} bytes into a {}-byte buffer",
                 src.len(),
-                MemoryLocation::CpuToGpu,
-                "upload_staging",
-                dedicated,
-            )?;
-            let stg_ptr = staging
-                .mapped_ptr()
-                .ok_or_else(|| be("staging buffer is not mapped"))?;
-            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), stg_ptr, src.len()) };
-
-            let stg_buf = staging.buffer;
-            let dst_buf = vk_dst.buffer;
-            let size = src.len() as u64;
-            // Clone the Arc so the closure is independent of `self`.
-            let shared = Arc::clone(&self.shared);
-            self.one_shot(move |cmd| {
-                let region = vk::BufferCopy {
-                    src_offset: 0,
-                    dst_offset: 0,
-                    size,
-                };
-                unsafe {
-                    shared
-                        .device
-                        .cmd_copy_buffer(cmd, stg_buf, dst_buf, &[region])
-                };
-            })?;
-            // `staging` is dropped here → frees vk::Buffer + gpu-allocator sub-allocation.
+                vk_dst.size
+            )));
         }
+
+        // ── Direct write: any PERSISTENTLY MAPPED destination ─────────────────────────────────
+        // Host-visible staging/readback buffers as before, AND — the big one — ReBAR weights
+        // (`Backing::Vram`): device-local VRAM the host writes straight through. One pass over the
+        // bytes, no staging buffer, no `vkCmdCopyBuffer`, no queue stall. The memory is
+        // HOST_COHERENT (see `probe_rebar_type`) so no explicit flush is needed, and the host
+        // writes are made visible to the device by the implicit host-write domain operation that
+        // `vkQueueSubmit` performs — every weight is written long before the first forward is
+        // submitted.
+        if let Some(ptr) = vk_dst.mapped_ptr() {
+            copy_to_mapped(src, ptr);
+            return Ok(());
+        }
+
+        // ── Staged write: device-local destination with no host mapping ───────────────────────
+        // During a weight load this goes through the REUSED, pipelined staging ring; anywhere else
+        // (and for a tensor larger than the ring's slot on a non-load path) it is a single
+        // synchronous copy.
+        if self.shared.weight_pb.lock().unwrap().is_some() {
+            return self.upload_staged_ring(vk_dst.buffer, src);
+        }
+
+        let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_staging")?;
+        let stg_ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("staging buffer is not mapped"))?;
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), stg_ptr, src.len()) };
+
+        let stg_buf = staging.buffer;
+        let dst_buf = vk_dst.buffer;
+        let size = src.len() as u64;
+        // Clone the Arc so the closure is independent of `self`.
+        let shared = Arc::clone(&self.shared);
+        self.one_shot(move |cmd| {
+            let region = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size,
+            };
+            unsafe {
+                shared
+                    .device
+                    .cmd_copy_buffer(cmd, stg_buf, dst_buf, &[region])
+            };
+        })?;
+        // `staging` is dropped here → frees vk::Buffer + gpu-allocator sub-allocation.
         Ok(())
     }
 

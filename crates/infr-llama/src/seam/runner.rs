@@ -7,6 +7,7 @@ use super::sc::{
 };
 use super::weights::{AttnW, DeltaW, FfnW, LayerW, MixerW, MoeSharedW, SeamKv, SeamWeights};
 use super::{common_prefix_len, e2b_ipl_rows, kv_fmt_bytes, kv_forces_static, BindWeight, WBytes};
+use crate::seam::TokenEmbd;
 use crate::{Config, GenStats, PerLayerEmbd};
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
@@ -116,7 +117,7 @@ pub(crate) fn generate_dense_backend(
     bind_weight: &BindWeight,
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
@@ -2815,6 +2816,7 @@ pub(crate) fn generate_dense_backend(
         // instead (see `build`'s SC subgraph); on CPU it's completed below exactly as Phase A.
         let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let mut hidden_host: Vec<f32> = Vec::with_capacity(cc * ne);
+        let token_embd = token_embd.get(); // host embed gather → materialize the table
         for &tok in canvas {
             let base = tok as usize * ne;
             hidden_host.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
@@ -3172,6 +3174,7 @@ pub(crate) fn generate_dense_backend(
         let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
         let mut vf_hidden: Vec<f32> = Vec::with_capacity(m * ne);
+        let token_embd = token_embd.get(); // host embed gather → materialize the table
         for &tok in &prompt[start..] {
             let base = tok as usize * ne;
             vf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * vf_scale));
@@ -3440,6 +3443,7 @@ pub(crate) fn generate_dense_backend(
                 b
             } else {
                 let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
+                let token_embd = token_embd.get(); // host embed gather → materialize the table
                 for &tok in &prompt[cstart..cend] {
                     let base = tok as usize * ne;
                     pf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
@@ -3750,7 +3754,7 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
         } else {
             // embed (gemma scales by √n_embd; qwen3/llama identity)
-            let emb: Vec<f32> = token_embd[tok * ne..tok * ne + ne]
+            let emb: Vec<f32> = token_embd.get()[tok * ne..tok * ne + ne]
                 .iter()
                 .map(|&x| x * embed_scale)
                 .collect();

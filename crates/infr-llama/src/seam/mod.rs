@@ -27,6 +27,44 @@ pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use weights::SeamKv;
 
+/// A LAZILY-dequantized host f32 token-embedding table, threaded through the seam runners in place
+/// of a `&[f32]`.
+///
+/// `token_embd.weight` blown up to f32 is enormous — Qwen3-14B's 151936×5120 Q4_K table becomes
+/// 3.1 GiB of host RAM and costs ~4s of dequant, which used to be paid EAGERLY by every
+/// `SeamModel::load`, i.e. by every model load on every backend. But the Vulkan and Metal dense
+/// paths upload `token_embd.weight` to the device in its NATIVE dtype and gather embeddings ON
+/// DEVICE (`Op::EmbedGather` / the tied-lm_head `Op::Linear`), so they never look at the host
+/// table. Only the host-gather consumers touch it: the CPU runner's embed, the DiffusionGemma SC
+/// soft-embed, and the MTP heads.
+///
+/// Passing this handle instead of a materialized slice keeps the dequant OFF the GPU load path
+/// while leaving every host consumer byte-for-byte identical — they call [`get`](Self::get), which
+/// dequantizes once into the owning [`model::SeamModel`]'s cache and returns the cached table on
+/// every later call.
+#[derive(Clone, Copy)]
+pub(crate) struct TokenEmbd<'a> {
+    cell: &'a std::sync::OnceLock<Vec<f32>>,
+    gguf: &'a Gguf,
+}
+
+impl<'a> TokenEmbd<'a> {
+    pub(crate) fn new(cell: &'a std::sync::OnceLock<Vec<f32>>, gguf: &'a Gguf) -> Self {
+        Self { cell, gguf }
+    }
+
+    /// The dequantized `[vocab, n_embd]` row-major table — dequantized on first call, cached after.
+    /// `Config::from_gguf` already validated the tensor exists at load, so this can only fail on a
+    /// corrupt/truncated GGUF.
+    pub(crate) fn get(&self) -> &'a [f32] {
+        self.cell.get_or_init(|| {
+            crate::quant::load_tensor_dequant(self.gguf, "token_embd.weight")
+                .expect("token_embd.weight: validated at load by Config::from_gguf")
+                .0
+        })
+    }
+}
+
 // ─── Qwen3 dense CPU decode runner ───────────────────────────────────────────────
 //
 // Builds the n=1 decode Graph and drives it through `CpuBackend`, one token at a time, for BOTH
@@ -41,7 +79,7 @@ pub(crate) use weights::SeamKv;
 pub(crate) fn generate_dense_cpu(
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
@@ -95,7 +133,7 @@ pub(crate) fn generate_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
@@ -125,7 +163,7 @@ pub(crate) fn generate_dense_vulkan_session(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
@@ -1032,8 +1070,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
             }
         }
         let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+        // alloc_uninit: the `upload` right below writes the buffer's FULL extent (it is sized to
+        // exactly `padded.len()`), so the calloc contract's zero-fill is dead work — and an
+        // expensive kind: on the device-local path it costs a `vkCmdFillBuffer` over the whole
+        // model plus a submit + `queue_wait_idle` PER TENSOR, doubling the load's stall count.
         let buf = vk
-            .alloc(padded.len(), BufferUsage::Weights)
+            .alloc_uninit(padded.len(), BufferUsage::Weights)
             .map_err(|e| anyhow!("{e}"))?;
         vk.upload(buf.as_ref(), &padded)
             .map_err(|e| anyhow!("{e}"))?;
@@ -1051,7 +1093,7 @@ pub(crate) fn generate_dense_metal(
     mtl: &infr_metal::MetalBackend,
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
@@ -1082,7 +1124,7 @@ pub(crate) fn generate_dense_metal_session(
     mtl: &infr_metal::MetalBackend,
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
@@ -1130,7 +1172,7 @@ pub(crate) fn verify_dense_metal2(
     mtl: &infr_metal::MetalBackend,
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
     state: &mut Option<SeamKv>,
@@ -1173,7 +1215,7 @@ pub(crate) fn verify_dense_metal2(
 pub(crate) fn verify_dense_cpu(
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<Vec<f32>> {
@@ -1221,7 +1263,7 @@ pub(crate) fn verify_dense_cpu(
 pub(crate) fn verify_dense_cpu_with_h(
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<(Vec<f32>, Vec<f32>)> {
@@ -1272,7 +1314,7 @@ pub(crate) fn verify_dense_cpu_with_h(
 pub(crate) fn verify_rows_cpu_with_h(
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<(Vec<f32>, Vec<f32>)> {
@@ -1320,7 +1362,7 @@ pub(crate) fn verify_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
     g: &Gguf,
     cfg: &Config,
-    token_embd: &[f32],
+    token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<Vec<f32>> {

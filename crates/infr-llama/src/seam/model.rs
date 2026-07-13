@@ -18,7 +18,13 @@ use tokenizers::Tokenizer;
 pub struct SeamModel {
     gguf: Gguf,
     cfg: Config,
-    token_embd: Vec<f32>,
+    /// Host f32 token-embedding table — materialized LAZILY (see [`SeamModel::token_embd`]).
+    /// Dequantizing it eagerly at load cost ~4s and ~3.1 GiB of RSS on Qwen3-14B (a 151936×5120
+    /// Q4_K table blown up to f32) for every load, while the GPU/Metal dense path never reads it:
+    /// those upload `token_embd.weight` to the device in its NATIVE dtype and gather on-device.
+    /// Only the host-gather consumers (MTP heads, the DiffusionGemma SC soft-embed, the CPU
+    /// runner) touch it, so they now pay for it — and only on first use.
+    token_embd: std::sync::OnceLock<Vec<f32>>,
     per_layer_embd: Option<PerLayerEmbd>,
     tokenizer: Tokenizer,
 }
@@ -256,12 +262,14 @@ impl SeamModel {
             None => build_tokenizer(&g)?,
         };
         add_chat_eos(&mut cfg, &tokenizer);
-        let (token_embd, _) = load_tensor_dequant(&g, "token_embd.weight")?;
+        // `token_embd.weight` is NOT dequantized here — see the field's doc. `Config::from_gguf`
+        // above already read its shape, so a model missing the tensor still fails at load, not on
+        // the lazy path below.
         let per_layer_embd = build_per_layer_embd(&g, &cfg)?;
         Ok(Self {
             gguf: g,
             cfg,
-            token_embd,
+            token_embd: std::sync::OnceLock::new(),
             per_layer_embd,
             tokenizer,
         })
@@ -507,7 +515,7 @@ impl SeamModel {
             &session.vk,
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
@@ -529,11 +537,24 @@ impl SeamModel {
         &self.gguf
     }
 
-    /// The host f32 token-embedding table (`token_embd.weight`, dequantized once at load) — MTP
-    /// Phase 2 (issue #33) gathers embedding rows from this on the host, mirroring every other
-    /// embed-gather call site on this seam (see `crate::mtp::MtpHeadSession`).
+    /// The host f32 token-embedding table (`token_embd.weight`), dequantized ONCE on first call
+    /// and cached — MTP Phase 2 (issue #33) gathers embedding rows from this on the host,
+    /// mirroring every other embed-gather call site on this seam (see `crate::mtp::MtpHeadSession`).
+    ///
+    /// Lazy on purpose: the Vulkan/Metal dense path uploads `token_embd.weight` to the device in
+    /// its native dtype and never calls this, so it must not pay the dequant (~4s / ~3.1 GiB on
+    /// Qwen3-14B). `Config::from_gguf` validated the tensor exists at load, so the dequant here
+    /// can only fail on a corrupt/truncated file.
     pub fn token_embd(&self) -> &[f32] {
-        &self.token_embd
+        self.embd().get()
+    }
+
+    /// The LAZY handle to the host token-embedding table, as threaded into the seam runners.
+    /// Prefer this over [`token_embd`](Self::token_embd) at any call site that only PASSES the
+    /// table on: the GPU/Metal dense runners never read it, so handing them the handle (rather
+    /// than a materialized slice) keeps the ~4s / ~3.1 GiB dequant off the GPU load path.
+    pub(crate) fn embd(&self) -> crate::seam::TokenEmbd<'_> {
+        crate::seam::TokenEmbd::new(&self.token_embd, &self.gguf)
     }
 
     /// Tokenize raw text with the model's own tokenizer (no chat template) — for callers that
@@ -573,7 +594,7 @@ impl SeamModel {
         crate::seam::verify_dense_cpu(
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             tokens,
         )
@@ -587,7 +608,7 @@ impl SeamModel {
         crate::seam::verify_dense_cpu_with_h(
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             tokens,
         )
@@ -602,7 +623,7 @@ impl SeamModel {
         crate::seam::verify_rows_cpu_with_h(
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             tokens,
         )
@@ -616,7 +637,7 @@ impl SeamModel {
             &vk,
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             tokens,
         )
@@ -678,7 +699,7 @@ impl SeamModel {
         let (_, stats) = crate::seam::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt,
             n_gen,
@@ -703,7 +724,7 @@ impl SeamModel {
             &vk,
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
@@ -733,7 +754,7 @@ impl SeamModel {
             &vk,
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             prompt_tokens,
             max_new,
@@ -771,7 +792,7 @@ impl SeamModel {
                 &vk,
                 &self.gguf,
                 &self.cfg,
-                &self.token_embd,
+                self.embd(),
                 self.per_layer_embd.as_ref(),
                 &dummy(prompt_len),
                 gen,
@@ -884,7 +905,7 @@ impl SeamModel {
             &session.mtl,
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
@@ -919,7 +940,7 @@ impl SeamModel {
             &mtl,
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
@@ -994,7 +1015,7 @@ impl SeamModel {
             &session.mtl,
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             &committed,
             1,
@@ -1040,7 +1061,7 @@ impl SeamModel {
                 &draft_session.mtl,
                 &draft.gguf,
                 &draft.cfg,
-                &draft.token_embd,
+                draft.embd(),
                 draft.per_layer_embd.as_ref(),
                 &committed,
                 budget,
@@ -1062,7 +1083,7 @@ impl SeamModel {
                 &session.mtl,
                 &self.gguf,
                 &self.cfg,
-                &self.token_embd,
+                self.embd(),
                 self.per_layer_embd.as_ref(),
                 &feed,
                 &mut session.pool.slots[t_slot],
@@ -1144,7 +1165,7 @@ impl SeamModel {
             &session.mtl,
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt,
             n_gen,
@@ -1194,7 +1215,7 @@ impl SeamModel {
         let (_generated, stats) = crate::seam::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
@@ -1216,7 +1237,7 @@ impl SeamModel {
         let (generated, _stats) = crate::seam::generate_dense_cpu(
             &self.gguf,
             &self.cfg,
-            &self.token_embd,
+            self.embd(),
             self.per_layer_embd.as_ref(),
             prompt_tokens,
             max_new,
@@ -1278,7 +1299,7 @@ impl DiffusionGemmaCpuSession {
             },
             &model.gguf,
             &model.cfg,
-            &model.token_embd,
+            model.embd(),
             model.per_layer_embd.as_ref(),
             tokens,
             1, // rides the ordinary per-token causal-prefill loop (see `verify_dense_cpu`'s doc)
@@ -1328,7 +1349,7 @@ impl DiffusionGemmaCpuSession {
             },
             &model.gguf,
             &model.cfg,
-            &model.token_embd,
+            model.embd(),
             model.per_layer_embd.as_ref(),
             &[], // denoise never touches the prompt/generation token stream — see `DenoiseReq`
             0,
@@ -1374,7 +1395,7 @@ impl DiffusionGemmaVulkanSession {
             &*bind,
             &model.gguf,
             &model.cfg,
-            &model.token_embd,
+            model.embd(),
             model.per_layer_embd.as_ref(),
             tokens,
             1,
@@ -1430,7 +1451,7 @@ impl DiffusionGemmaVulkanSession {
             &*bind,
             &model.gguf,
             &model.cfg,
-            &model.token_embd,
+            model.embd(),
             model.per_layer_embd.as_ref(),
             &[],
             0,
@@ -1485,7 +1506,7 @@ impl DiffusionGemmaMetalSession {
             },
             &model.gguf,
             &model.cfg,
-            &model.token_embd,
+            model.embd(),
             model.per_layer_embd.as_ref(),
             tokens,
             1,
@@ -1526,7 +1547,7 @@ impl DiffusionGemmaMetalSession {
             },
             &model.gguf,
             &model.cfg,
-            &model.token_embd,
+            model.embd(),
             model.per_layer_embd.as_ref(),
             &[],
             0,

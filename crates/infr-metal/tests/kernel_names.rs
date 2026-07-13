@@ -40,27 +40,83 @@ const KERNEL_PREFIXES: &[&str] = &[
     "writekv_",
 ];
 
+/// Strip ALL whitespace, so a shader tripwire matches on TOKENS rather than on exact source
+/// formatting.
+///
+/// These `.metal` files are macro bodies with column-aligned `\` line continuations: adding one
+/// long line re-pads the backslash column of its neighbours, and a formatter that rewrites
+/// `16u * (sgid >> 1)` to `16u*(sgid>>1)` changes not one bit of generated code. A raw
+/// `src.contains("...")` tripwire goes red on both — a false failure that teaches the next
+/// person to "fix" the test, which is exactly how a tripwire stops being trusted. Comparing
+/// de-spaced needles against de-spaced source survives reformatting while still going red if
+/// the operative expression actually changes.
+fn despace(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Assert `needle` appears in `src`, ignoring whitespace. Panics with the needle for a readable
+/// failure (the de-spaced haystack is a useless thing to print).
+#[track_caller]
+fn asserts_token_seq(src: &str, needle: &str) {
+    assert!(
+        despace(src).contains(&despace(needle)),
+        "shader tripwire: expected to find `{needle}` (ignoring whitespace).\n\
+         If this optimization was removed ON PURPOSE, delete the tripwire in the same commit \
+         and say so — do not relax it.",
+    );
+}
+
+// The three tripwires below guard OPTIMIZATIONS, not correctness. The parity tests pass whether
+// or not these are present (a reverted optimization is still numerically right, just slower), so
+// nothing else in the suite would notice if one silently vanished — the exact failure mode this
+// file's header describes. That is why they assert on shader source at all.
+
 #[test]
 fn iq4nl_has_a_native_four_row_decode_body() {
     let src = include_str!("../shaders/linear.metal");
-    assert!(src.contains("inline void linear_iq4nl_body"));
-    assert!(src.contains("kernel void linear_iq4nl_add"));
+    asserts_token_seq(src, "inline void linear_iq4nl_body");
+    asserts_token_seq(src, "kernel void linear_iq4nl_add");
 }
 
 #[test]
 fn moe_cmm_masks_inactive_matrix_row_fragments() {
+    // Partial expert tiles must skip dead 8-row fragments instead of running the full MMA and
+    // discarding half of it (see moe.metal). `row_base` is derived from `sgid` alone, which is
+    // what keeps the branch simdgroup-uniform and the `simdgroup_barrier` inside it legal.
     let src = include_str!("../shaders/moe.metal");
-    assert!(src.contains("uint row_base = 16u * (sgid >> 1);"));
-    assert!(src.contains("if (row_base + 8u < nr1) {"));
-    assert!(src.contains("else if (row_base < nr1) {"));
+    asserts_token_seq(src, "uint row_base = 16u * (sgid >> 1);");
+    asserts_token_seq(src, "if (row_base + 8u < nr1) {");
+    asserts_token_seq(src, "else if (row_base < nr1) {");
 }
 
 #[test]
 fn q5k_reconstructs_four_codes_per_word() {
+    // SWAR: rebuild four 5-bit codes per word (4-bit code | 5th bit) instead of decoding 16
+    // bytes one at a time.
     let src = include_str!("../shaders/linear.metal");
-    assert!(src.contains("uint packed = (q & 0x0F0F0F0Fu)"));
-    assert!(src.contains("(h & 0x01010101u) << 4u"));
-    assert!(src.contains("packed >> 24u"));
+    asserts_token_seq(src, "uint packed = (q & 0x0F0F0F0Fu)");
+    asserts_token_seq(src, "(h & 0x01010101u) << 4u");
+    asserts_token_seq(src, "packed >> 24u");
+}
+
+// The two below test the TRIPWIRE ITSELF. A guard nobody has watched fail is not a guard: it can
+// rot into a tautology (matching something that is always present) and nothing would say so.
+
+#[test]
+#[should_panic(expected = "shader tripwire")]
+fn a_tripwire_goes_red_when_its_optimization_is_removed() {
+    let gutted =
+        include_str!("../shaders/moe.metal").replace("uint row_base = 16u * (sgid >> 1);", "");
+    asserts_token_seq(&gutted, "uint row_base = 16u * (sgid >> 1);");
+}
+
+#[test]
+fn a_tripwire_survives_reformatting_of_its_optimization() {
+    let reformatted = include_str!("../shaders/moe.metal").replace(
+        "uint row_base = 16u * (sgid >> 1);",
+        "uint row_base=16u*(sgid>>1);", // same tokens, no whitespace
+    );
+    asserts_token_seq(&reformatted, "uint row_base = 16u * (sgid >> 1);");
 }
 
 #[test]

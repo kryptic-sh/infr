@@ -28,6 +28,24 @@ const MMV_NUM_ROWS: u32 = 1;
 /// BM=64 as the segments fill in.
 const MOE_EXPERT_SMALL_TILE_AVG_ROWS: usize = 24;
 
+/// Max K for which the DEFAULT (BM=64) expert tile takes the BN=128 wide-N kernel (`_xp128`).
+///
+/// Wide-N halves the per-workgroup activation (As) staging and the workgroup count, but costs
+/// occupancy (THREADS = (64/4)·(128/4) = 512 vs 256). Which way that trades depends on K, because
+/// K sets how many k-block iterations the one-time staging is amortized over:
+///
+/// * SHALLOW k (the MoE `down` proj — k = n_ff_exp, 768 on qwen3-30B-A3B): the k-loop is short
+///   (nblk = 24), staging is a large share of the kernel, and halving As traffic WINS —
+///   expert_down 56.7ms → 50.0ms (−11.8%) at pp512.
+/// * DEEP k (the `gate`/`up` projs — k = n_embd, 2048): nblk = 64 already amortizes staging, so
+///   the As saving is small and the 512-thread occupancy hit dominates — expert_gateup
+///   65.0ms → 69.2ms (+6.5%, a LOSS).
+///
+/// 1024 sits between the two (768 vs 2048) with room on both sides. The `small_tile` (BM=32)
+/// path keeps its own unconditional n%128 wide-N rule — at 256 threads it has no occupancy
+/// penalty to trade against, so it wants wide-N at every K.
+const MOE_EXPERT_WIDE_BN_MAX_K: usize = 1024;
+
 /// Dense A_GLOBAL warp-GEMM `matmul_native_f16a` (n128_ag, non-split-K family) BM=64 → BM=32
 /// row-tile crossover, in real batched-prefill rows `m`. MTP verify's draft window runs a batched
 /// prefill of the drafted suffix (m≈6-8 steady-state, growing up to ~m30-50 under the no-rewind
@@ -5279,16 +5297,26 @@ impl<'a> Recorder<'a> {
         self.label_next(stage);
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
-        // Q4_K/Q6_K small tiles have a BN=128 wide-N twin (`_xp32w`, see build.rs): halves the
-        // workgroup count and the per-output As-staging traffic at the shallow-k 256-expert down
-        // shapes (Ornith-35B pp512 +6.5%, Qwen3.6-35B +4.5%, interleaved). Needs n%128; other
-        // n keeps the BN=64 small tile. The paged twin keeps BN=64 kernels throughout.
-        let wide_bn = small_tile
-            && n.is_multiple_of(128)
+        // Q4_K/Q6_K get a BN=128 wide-N twin: halves the workgroup count and the per-output
+        // As-staging traffic. Needs n%128; other n keeps the BN=64 tile. Two families:
+        //   * small tile (BM=32) → `_xp32w`, taken at every K (256 threads, no occupancy cost to
+        //     trade against) — the shallow-k 256-expert down shapes (Ornith-35B pp512 +6.5%,
+        //     Qwen3.6-35B +4.5%, interleaved).
+        //   * default tile (BM=64) → `_xp128`, taken only up to `MOE_EXPERT_WIDE_BN_MAX_K` —
+        //     512 threads, so it pays for itself only where the k-loop is too short to amortize
+        //     staging. See that const's doc for the measured both-ways split.
+        // The paged twin keeps BN=64 kernels throughout.
+        let wide_bn = n.is_multiple_of(128)
+            && (small_tile || k <= MOE_EXPERT_WIDE_BN_MAX_K)
             && matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K);
         let bm: usize = if small_tile { 32 } else { 64 };
         let bn: usize = if wide_bn { 128 } else { 64 };
         let (name, spv, nb): (_, _, usize) = match (dtype, small_tile) {
+            (infr_core::DType::Q4K, false) if wide_bn => (
+                "native_gemm_mmq_q4k_xp128",
+                crate::gemm::native_gemm_mmq_q4k_xp128_spv(),
+                7,
+            ),
             (infr_core::DType::Q4K, false) => (
                 "native_gemm_mmq_q4k_xp",
                 crate::gemm::native_gemm_mmq_q4k_xp_spv(),
@@ -5303,6 +5331,11 @@ impl<'a> Recorder<'a> {
                 "native_gemm_mmq_q4k_xp32",
                 crate::gemm::native_gemm_mmq_q4k_xp32_spv(),
                 7,
+            ),
+            (infr_core::DType::Q6K, false) if wide_bn => (
+                "native_gemm_mmq_q6k_xp128",
+                crate::gemm::native_gemm_mmq_q6k_xp128_spv(),
+                6,
             ),
             (infr_core::DType::Q6K, false) => (
                 "native_gemm_mmq_q6k_xp",

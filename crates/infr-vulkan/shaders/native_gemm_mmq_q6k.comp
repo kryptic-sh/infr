@@ -103,6 +103,14 @@ void main() {
     [[unroll]] for (uint i = 0u; i < TM; i++)
         [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
 
+#ifdef EXPERT_GRID
+    // Dead-row mask for partial expert tiles — see native_gemm_mmq_q4k.comp's `live` doc (same
+    // reasoning, same wave-coherent tr stripe; staging + both barriers stay unconditional).
+    bool live = (wgRow + tr * TM) < rowEnd;
+#else
+    const bool live = true;
+#endif
+
     for (uint sub = 0u; sub < nsub; sub++) {
         uint blk32 = sub >> 1u; // the 32-block this 16-sub-block lives in (for dact)
         // stage activations: BM rows × WPB packed words (rows ≥ m read garbage, output ignored)
@@ -156,6 +164,7 @@ void main() {
         }
         barrier();
 
+        if (live) {
         int qsum[TM][TN];
         [[unroll]] for (uint i = 0u; i < TM; i++)
             [[unroll]] for (uint j = 0u; j < TN; j++) qsum[i][j] = 0;
@@ -177,6 +186,7 @@ void main() {
             [[unroll]] for (uint i = 0u; i < TM; i++) {
                 acc[i][j] += dval[i] * dl * float(qsum[i][j]);
             }
+        }
         }
         // Placed AFTER the shared-scale reads above (Bdl/Bmm), not after the qsum loop: every
         // shared read of this iteration (As/Bs in qsum AND the per-col scales here) must complete

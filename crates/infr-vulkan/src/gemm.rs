@@ -2114,6 +2114,20 @@ pub(crate) fn native_gemm_mmq_q6k_xp32w_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+// BM=64 (default row tile) + BN=128 (wide-N) expert-grid variants — see build.rs's `_xp128`
+// entries and `matmul_mmq_experts`'s wide-BN doc. Same two dtypes as the `_xp32w` small-tile pair.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4k_xp128_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp128.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q6k_xp128_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp128.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_q8_0_xp32_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q8_0_xp32.spv"));

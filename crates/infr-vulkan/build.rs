@@ -1639,9 +1639,28 @@ fn main() {
             &["-DEXPERT_GRID"],
         ),
         (
+            // BN=128 wide-N twin of the DEFAULT (BM=64) expert tile — the big-tile sibling of the
+            // `_xp32w` small-tile variant below. At the mid rows/expert band (qwen3-30B-A3B:
+            // 128 experts × top-8 ⇒ ~32 rows/expert at pp512) BM=64 is already the right row tile
+            // (one row-tile per expert ⇒ each expert's weight bank is staged exactly ONCE, the
+            // floor); the remaining staging cost is the ACTIVATION tile, re-read once per N-tile.
+            // Doubling BN to 128 halves that As traffic and halves the workgroup count, without
+            // adding a second row tile (which is what makes `_xp32*` lose here — it re-reads the
+            // much larger weight bank). THREADS = (64/4)·(128/4) = 512. Needs n%128.
+            "native_gemm_mmq_q4k",
+            "native_gemm_mmq_q4k_xp128",
+            &["-DEXPERT_GRID", "-DBN_TILE=128u"],
+        ),
+        (
             "native_gemm_mmq_q6k",
             "native_gemm_mmq_q6k_xp",
             &["-DEXPERT_GRID"],
+        ),
+        (
+            // BN=128 wide-N twin of the default BM=64 expert tile — see q4k_xp128 above.
+            "native_gemm_mmq_q6k",
+            "native_gemm_mmq_q6k_xp128",
+            &["-DEXPERT_GRID", "-DBN_TILE=128u"],
         ),
         (
             "native_gemm_mmq_q8_0",

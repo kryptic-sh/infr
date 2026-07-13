@@ -125,7 +125,7 @@ impl ChatModel for DenseSeamChat {
         if prof2.is_some() {
             std::env::remove_var("INFR_PROF2");
         }
-        let r = self.generate("Hi", 2, &mut |_| {});
+        let r = self.generate("Hi", 2, None, &mut |_| {});
         if let Some(v) = prof2 {
             std::env::set_var("INFR_PROF2", v);
         }
@@ -142,6 +142,7 @@ impl ChatModel for DenseSeamChat {
         &mut self,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         if self.wants_mtp()? {
@@ -159,10 +160,13 @@ impl ChatModel for DenseSeamChat {
             .map(|(stats, _)| stats);
         }
         self.ensure_session()?;
-        self.model
-            .generate_vulkan_session(self.session.as_mut().unwrap(), prompt, max_new, |p| {
-                on_piece(p)
-            })
+        self.model.generate_vulkan_session(
+            self.session.as_mut().unwrap(),
+            prompt,
+            max_new,
+            req,
+            |p| on_piece(p),
+        )
     }
 
     fn generate_constrained(
@@ -170,6 +174,7 @@ impl ChatModel for DenseSeamChat {
         prompt: &str,
         max_new: usize,
         constraint: &mut crate::grammar::Constraint,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         self.ensure_session()?;
@@ -178,6 +183,7 @@ impl ChatModel for DenseSeamChat {
             prompt,
             max_new,
             Some(constraint),
+            req,
             |p| on_piece(p),
         )
     }

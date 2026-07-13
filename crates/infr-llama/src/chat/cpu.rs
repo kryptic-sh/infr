@@ -39,11 +39,14 @@ impl ChatModel for CpuDenseChat {
         &mut self,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         if self.metal {
             #[cfg(target_os = "macos")]
-            return self.model.generate_metal(prompt, max_new, |p| on_piece(p));
+            return self
+                .model
+                .generate_metal(prompt, max_new, req, |p| on_piece(p));
             #[cfg(not(target_os = "macos"))]
             return Err(anyhow::anyhow!(
                 "the Metal backend is only available on macOS"
@@ -66,6 +69,7 @@ impl ChatModel for CpuDenseChat {
             )
             .map(|(stats, _)| stats);
         }
-        self.model.generate_cpu(prompt, max_new, |p| on_piece(p))
+        self.model
+            .generate_cpu(prompt, max_new, req, |p| on_piece(p))
     }
 }

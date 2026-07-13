@@ -41,10 +41,17 @@ pub trait ChatModel {
     fn render(&self, messages: &[(&str, &str)]) -> Result<String>;
 
     /// Generate a completion for the already-rendered `prompt`, streaming decoded text to `on_piece`.
+    ///
+    /// `req` is the in-flight SEQUENCE's own state (`infr serve`): its sampling overrides, its
+    /// stop-sequence abort latch, and its turn on the GPU baton. `None` — `infr run`, `bench`, every
+    /// test — means "inherit the process default", i.e. exactly the pre-existing behavior. It is an
+    /// explicit parameter rather than ambient state precisely because a server steps several
+    /// sequences at once; see [`crate::sampling::RequestCtx`].
     fn generate(
         &mut self,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats>;
 
@@ -59,10 +66,11 @@ pub trait ChatModel {
         &mut self,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
         _on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
     ) -> Result<GenStats> {
-        self.generate(prompt, max_new, on_piece)
+        self.generate(prompt, max_new, req, on_piece)
     }
 
     /// Optional REPL status (e.g. dense returns `ctx N/MAX`); `None` for stateless backends.
@@ -87,6 +95,7 @@ pub trait ChatModel {
         _prompt: &str,
         _max_new: usize,
         _constraint: &mut crate::grammar::Constraint,
+        _req: Option<&crate::sampling::RequestCtx>,
         _on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         Err(anyhow::anyhow!(
@@ -172,9 +181,11 @@ impl<'a> Chat<'a> {
         if infr_chat::prompt_prefills_think(&prompt) {
             emit("<think>");
         }
+        // `req: None` — the interactive REPL is a sole sequence: sampling comes from the env/CLI
+        // defaults, there is no stop-sequence latch, and there is no GPU to share.
         let stats = self
             .model
-            .generate_with_step_hook(&prompt, max_new, &mut emit, on_step)?;
+            .generate_with_step_hook(&prompt, max_new, None, &mut emit, on_step)?;
         self.history
             .push(("assistant".into(), strip_think(&answer)));
         Ok(stats)
@@ -281,6 +292,7 @@ mod tests {
             &mut self,
             _prompt: &str,
             _max_new: usize,
+            _req: Option<&crate::sampling::RequestCtx>,
             on_piece: &mut dyn FnMut(&str),
         ) -> Result<GenStats> {
             on_piece(&self.reply);

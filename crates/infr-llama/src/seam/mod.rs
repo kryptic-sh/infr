@@ -76,6 +76,7 @@ impl<'a> TokenEmbd<'a> {
 /// E2B adds per-layer input embeddings + KV-layer sharing. `prompt` is the full token prefix; returns
 /// the generated continuation. Stops at EOS or `max_new`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_cpu(
     g: &Gguf,
     cfg: &Config,
@@ -83,6 +84,7 @@ pub(crate) fn generate_dense_cpu(
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
+    req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
     // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a zero-copy weight binder
@@ -113,12 +115,13 @@ pub(crate) fn generate_dense_cpu(
         on_token,
         &mut None,
         prompt.len() + max_new + 1,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        None, // constraint
+        None, // verify
+        None, // verify_ids
+        None, // logits_out
+        None, // h_out
+        None, // denoise_req
+        req,
     )
 }
 
@@ -150,7 +153,8 @@ pub(crate) fn generate_dense_vulkan(
         on_token,
         &mut None,
         prompt.len() + max_new + 1,
-        None,
+        None, // constraint
+        None, // req: the one-shot runner is a sole sequence — env sampling, no gate
     )
 }
 
@@ -171,11 +175,18 @@ pub(crate) fn generate_dense_vulkan_session(
     state: &mut Option<SeamKv>,
     want_ctx: usize,
     constraint: Option<&mut crate::grammar::Constraint>,
+    req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
-    let bind = vulkan_moe_binder(vk, g, cfg, state.is_none(), want_ctx)?;
+    // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
+    // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
+    // baton is released before the runner starts stepping. See `StepGate`.
+    let bind = {
+        let _gp = req.and_then(|r| r.gate_pass());
+        vulkan_moe_binder(vk, g, cfg, state.is_none(), want_ctx)?
+    };
     let out = generate_dense_backend(
         vk, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
-        constraint, None, None, None, None, None,
+        constraint, None, None, None, None, None, req,
     )?;
     // INFR_PAGER_STATS=1: cumulative hit/miss/eviction counters since this pager was installed
     // (persists across calls on the same session — see `MoePagerSession`). A no-op when no paged
@@ -265,6 +276,25 @@ pub(crate) fn ubatch_rows() -> usize {
         .and_then(|v| v.parse().ok())
         .filter(|&v| v > 0)
         .unwrap_or_else(|| PINNED_UBATCH.get().copied().unwrap_or(1024))
+}
+
+/// Prefill chunk (rows) for a sequence SHARING the GPU with other in-flight sequences
+/// (`infr serve --parallel N`, i.e. the runner's `req` carries a `StepGate`).
+///
+/// A prefill chunk is unpreemptible GPU: the whole chunk holds the baton, so it is exactly how long
+/// a newly-admitted request's prefill stalls every in-flight decode. The solo default (1024 rows,
+/// [`ubatch_rows`]) is ~100ms+ on a 14B — a visible hitch across 3 other streams. 256 rows bounds
+/// that to ~25-30ms (about the cost of ~4 decode steps) at a small prefill-throughput cost, which
+/// is the right trade when N clients are streaming. Never applies to a sole request: `infr run`,
+/// `bench`, the goldens, and a `-np 1` server all keep the full [`ubatch_rows`] chunk, so prefill
+/// throughput there is UNCHANGED. INFR_UBATCH_PARALLEL overrides; it only ever SHRINKS the chunk
+/// (the runner takes the `min` with [`ubatch_rows`]).
+pub(crate) fn ubatch_rows_parallel() -> usize {
+    std::env::var("INFR_UBATCH_PARALLEL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(256)
 }
 
 /// Placement-pinned prefill chunk (rows): set ONCE by the dense try-resident sweep when a smaller
@@ -1157,6 +1187,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1199,6 +1230,7 @@ pub(crate) fn verify_dense_metal2(
         want_ctx,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
         None,
@@ -1251,6 +1283,7 @@ pub(crate) fn verify_dense_cpu(
         Some(&mut logits),
         None,
         None,
+        None,
     )?;
     Ok(logits)
 }
@@ -1299,6 +1332,7 @@ pub(crate) fn verify_dense_cpu_with_h(
         None,
         Some(&mut logits),
         Some(&mut h),
+        None,
         None,
     )?;
     Ok((logits, h))
@@ -1351,6 +1385,7 @@ pub(crate) fn verify_rows_cpu_with_h(
         None,
         Some(&mut h),
         None,
+        None,
     )?;
     Ok((logits, h))
 }
@@ -1392,6 +1427,7 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         Some(&mut logits),
+        None,
         None,
         None,
     )?;

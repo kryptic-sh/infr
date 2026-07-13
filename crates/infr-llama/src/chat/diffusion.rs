@@ -206,10 +206,20 @@ impl ChatModel for DiffusionGemmaChat {
         r
     }
 
+    /// `_req` is ACCEPTED AND IGNORED, which is exactly what this backend did before the
+    /// per-sequence conversion too — and is therefore not a regression, but it IS a gap.
+    ///
+    /// DiffusionGemma does not sample in the autoregressive decode loop at all: its tokens come out
+    /// of the block-diffusion denoise (`crate::diffusion::diffusion_generate`, `dg_eb_sample`),
+    /// which has its OWN sampler and never consults `Sampler::resolve`. So the old thread-local
+    /// never reached it either — a `temperature`/`seed`/`stop` on a DG serve request was already a
+    /// no-op. Wiring per-request sampling (and the stop-sequence abort latch) into the denoise loop
+    /// is a separate piece of work; it is reported, not silently papered over.
     fn generate(
         &mut self,
         prompt: &str,
         max_new: usize,
+        _req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         self.generate_impl(prompt, max_new, on_piece, None)
@@ -219,6 +229,7 @@ impl ChatModel for DiffusionGemmaChat {
         &mut self,
         prompt: &str,
         max_new: usize,
+        _req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
         on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
     ) -> Result<GenStats> {

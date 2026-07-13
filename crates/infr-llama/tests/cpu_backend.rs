@@ -83,9 +83,12 @@ fn cpu_gen(model: &infr_llama::SeamModel, prompt: &str, n: usize) -> String {
     // token stream the instruct model expects.
     let mut out = String::new();
     model
-        .generate_cpu(&model.render_chat(prompt).expect("render chat"), n, |p| {
-            out.push_str(p)
-        })
+        .generate_cpu(
+            &model.render_chat(prompt).expect("render chat"),
+            n,
+            None,
+            |p| out.push_str(p),
+        )
         .expect("cpu generate");
     out
 }
@@ -444,7 +447,7 @@ fn gpu_seam_flash_matches_cpu() {
         sentence why this process is essential for life on Earth.";
     let mut cpu_txt = String::new();
     model
-        .generate_cpu(long, 24, |p| cpu_txt.push_str(p))
+        .generate_cpu(long, 24, None, |p| cpu_txt.push_str(p))
         .expect("cpu gen");
     let gpu_txt = model.generate_dense_vulkan(long, 24).expect("seam gen");
     // The f16 GPU flash/GEMM kernels and the f32 CPU oracle accumulate in different precision, so a
@@ -477,7 +480,7 @@ fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
     let rendered = model.render_chat(prompt).expect("render chat");
     let mut cpu_txt = String::new();
     model
-        .generate_cpu(&rendered, n, |p| cpu_txt.push_str(p))
+        .generate_cpu(&rendered, n, None, |p| cpu_txt.push_str(p))
         .expect("cpu gen");
     let gpu_txt = model
         .generate_dense_vulkan(&rendered, n)
@@ -505,14 +508,14 @@ fn gpu_seam_kv_reuse_matches_fresh() {
     let p1 = "The capital of France is";
     let mut t1 = String::new();
     let s1 = model
-        .generate_vulkan_session(&mut sess, p1, 8, |p| t1.push_str(p))
+        .generate_vulkan_session(&mut sess, p1, 8, None, |p| t1.push_str(p))
         .expect("turn 1");
     assert!(s1.n_prompt > 0);
 
     let p2 = format!("{p1}{t1} And the capital of Germany is");
     let mut t2 = String::new();
     let s2 = model
-        .generate_vulkan_session(&mut sess, &p2, 8, |p| t2.push_str(p))
+        .generate_vulkan_session(&mut sess, &p2, 8, None, |p| t2.push_str(p))
         .expect("turn 2");
 
     // (a) same output as a fresh full prefill of the identical prompt
@@ -565,7 +568,7 @@ fn gpu_seam_kv_q8_coherent() {
     let mut sess = model.vulkan_session(512).expect("q8 session");
     let mut g_sess = String::new();
     model
-        .generate_vulkan_session(&mut sess, &long, 24, |p| g_sess.push_str(p))
+        .generate_vulkan_session(&mut sess, &long, 24, None, |p| g_sess.push_str(p))
         .expect("q8 session gen");
     assert!(
         !is_degenerate(&g_sess),
@@ -653,14 +656,14 @@ fn gpu_seam_multi_slot_prefix_sharing() {
 
     let mut ta = String::new();
     let sa = model
-        .generate_vulkan_session(&mut sess, &pa, 8, |p| ta.push_str(p))
+        .generate_vulkan_session(&mut sess, &pa, 8, None, |p| ta.push_str(p))
         .expect("conv A");
     assert!(sa.n_prompt > 0);
 
     // Conversation B: different question, same system prefix → new slot seeded from A's.
     let mut tb = String::new();
     let sb = model
-        .generate_vulkan_session(&mut sess, &pb, 8, |p| tb.push_str(p))
+        .generate_vulkan_session(&mut sess, &pb, 8, None, |p| tb.push_str(p))
         .expect("conv B");
     let fresh_b = model.generate_dense_vulkan(&pb, 8).expect("fresh B");
     assert_eq!(
@@ -680,7 +683,7 @@ fn gpu_seam_multi_slot_prefix_sharing() {
     let pa2 = format!("{pa}{ta} And the capital of Spain is");
     let mut ta2 = String::new();
     let sa2 = model
-        .generate_vulkan_session(&mut sess, &pa2, 8, |p| ta2.push_str(p))
+        .generate_vulkan_session(&mut sess, &pa2, 8, None, |p| ta2.push_str(p))
         .expect("conv A turn 2");
     let fresh_a2 = model.generate_dense_vulkan(&pa2, 8).expect("fresh A2");
     assert_eq!(
@@ -905,7 +908,7 @@ fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
         .expect("render chat");
     let mut cpu_txt = String::new();
     model
-        .generate_cpu(&rendered, 16, |p| cpu_txt.push_str(p))
+        .generate_cpu(&rendered, 16, None, |p| cpu_txt.push_str(p))
         .expect("cpu gen");
     let gpu_txt = model
         .generate_dense_vulkan(&rendered, 16)
@@ -1028,7 +1031,7 @@ fn gpu_seam_bf16_matches_cpu() {
         .expect("render chat");
     let mut cpu_txt = String::new();
     model
-        .generate_cpu(&prompt, 16, |p| cpu_txt.push_str(p))
+        .generate_cpu(&prompt, 16, None, |p| cpu_txt.push_str(p))
         .expect("cpu gen");
     let gpu_txt = model.generate_dense_vulkan(&prompt, 16).expect("seam gen");
     assert_eq!(
@@ -1197,7 +1200,7 @@ fn unified_qwen35_session_no_rewind() {
     let p1 = "The quick brown fox jumps over the lazy dog. The capital of France is";
     let mut t1 = String::new();
     let s1 = model
-        .generate_vulkan_session(&mut sess, p1, 8, |p| t1.push_str(p))
+        .generate_vulkan_session(&mut sess, p1, 8, None, |p| t1.push_str(p))
         .expect("turn 1");
     assert!(s1.n_prompt > 0);
 
@@ -1205,7 +1208,7 @@ fn unified_qwen35_session_no_rewind() {
     let p2 = format!("{p1}{t1} And the capital of Germany is");
     let mut t2 = String::new();
     let s2 = model
-        .generate_vulkan_session(&mut sess, &p2, 8, |p| t2.push_str(p))
+        .generate_vulkan_session(&mut sess, &p2, 8, None, |p| t2.push_str(p))
         .expect("turn 2 (extend)");
     let fresh2 = model.generate_dense_vulkan(&p2, 8).expect("fresh turn 2");
     assert_eq!(
@@ -1225,12 +1228,12 @@ fn unified_qwen35_session_no_rewind() {
     let p3 = "Completely different subject entirely: photosynthesis converts";
     let mut t3 = String::new();
     let s3 = model
-        .generate_vulkan_session(&mut sess, p3, 8, |p| t3.push_str(p))
+        .generate_vulkan_session(&mut sess, p3, 8, None, |p| t3.push_str(p))
         .expect("turn 3 (divergent)");
     let mut fresh_sess = model.vulkan_session(512).expect("fresh session");
     let mut tf3 = String::new();
     let sf3 = model
-        .generate_vulkan_session(&mut fresh_sess, p3, 8, |p| tf3.push_str(p))
+        .generate_vulkan_session(&mut fresh_sess, p3, 8, None, |p| tf3.push_str(p))
         .expect("fresh turn 3");
     assert_eq!(
         t3.trim(),
@@ -1774,7 +1777,7 @@ fn mtp_spec_matches_target_only_greedy() {
             .vulkan_session(prompt.len() + max_new + 64)
             .expect("target-only session");
         model
-            .generate_vulkan_session(&mut sess, &prompt, max_new, |p| plain.push_str(p))
+            .generate_vulkan_session(&mut sess, &prompt, max_new, None, |p| plain.push_str(p))
             .expect("target-only greedy");
     }
 

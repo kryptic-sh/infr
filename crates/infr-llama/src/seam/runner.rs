@@ -150,6 +150,18 @@ pub(crate) fn generate_dense_backend(
     mut h_out: Option<&mut Vec<f32>>,
     // Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc). `None` everywhere else.
     denoise_req: Option<DenoiseReq>,
+    // The in-flight SEQUENCE's own state (`infr serve`): its sampling overrides, its stop-sequence
+    // abort latch, and its turn on the GPU baton.
+    //
+    // Explicitly per-SEQUENCE, and deliberately LAST so that adding it could not silently reshuffle
+    // the `Option`-heavy tail above (a misplaced bare `None` would still typecheck). This used to be
+    // a `thread_local!`, which was only sound while one generation owned one thread; N concurrent
+    // sequences make that wrong by construction — see `crate::sampling::RequestCtx`.
+    //
+    // `None` on every non-serve path (run / bench / every test / both goldens / MTP): sampling then
+    // resolves purely from the env, no abort latch is polled, and no gate is taken — byte-for-byte
+    // the pre-existing behavior.
+    req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     let (ne, nh) = (c.n_embd, c.n_head);
@@ -364,6 +376,11 @@ pub(crate) fn generate_dense_backend(
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {
+        // Every backend call below (alloc, upload) records into the shared Vulkan command pool, so
+        // it must hold the GPU baton like any other step — see `StepGate`'s "correctness" note.
+        // `infr serve` pre-forks its slots at startup, so a REQUEST never lands here; this is the
+        // lazy `infr run` / CPU / Metal path, plus that startup fork itself.
+        let _gp = req.and_then(|r| r.gate_pass());
         // Weight-load progress: opened HERE — the single weight-upload funnel every runner path
         // (CPU/Vulkan/Metal × one-shot/session/bench/serve) goes through — so no entry point can
         // load without it. The ticking lives in each backend's `alloc` (Weights/HostWeights);
@@ -917,13 +934,13 @@ pub(crate) fn generate_dense_backend(
     // Sampling: greedy unless INFR_TEMP is set (the CLI sets chat defaults for run/serve; the
     // golden/parity tests pin INFR_TEMP=0 or leave it unset). Defined BEFORE `build` — the
     // GPU-sampling ops bake the sampler config into the graph.
-    let sampler = crate::sampling::Sampler::resolve();
-    let mut rng = crate::sampling::resolve_seed();
+    let sampler = crate::sampling::Sampler::resolve(req);
+    let mut rng = crate::sampling::resolve_seed(req);
     // Repetition penalties (`infr serve`'s presence/frequency/repeat request fields). `None` for
     // every non-serve caller AND for any request that leaves them at their neutral defaults — see
     // `Penalties::resolve`. When active they must MUTATE the logits row, so they force the host
     // sampling path below (exactly like a grammar constraint does).
-    let mut penalties = crate::sampling::Penalties::resolve();
+    let mut penalties = crate::sampling::Penalties::resolve(req);
     let penalize = penalties.is_some();
     // GPU-resident greedy sampling (`Op::Argmax` appended to the decode graph): only the 4-byte
     // token id is read back per step — the [vocab] logits stay in VRAM (downloaded only for the
@@ -3327,22 +3344,31 @@ pub(crate) fn generate_dense_backend(
     }
 
     // ── drive ───────────────────────────────────────────────────────────────────────
-    let tok_id_buf = be
-        .alloc(4, BufferUsage::Readback)
-        .map_err(|e| anyhow!("{e}"))?;
-    // GPU embed gather: the decode loop's 4-byte token-id input (replaces the n_embd*4 host
-    // embed + hidden upload when `gpu_embed`).
-    let dec_ids_buf = be
-        .alloc(4, BufferUsage::Staging)
-        .map_err(|e| anyhow!("{e}"))?;
-    // GPU stochastic sampling: the host-drawn uniform(s) for `Op::Sample`'s `u` Input — a 64-slot
-    // ring (mirrors the chained id-log ring), indexed by `pos & 63` in BOTH the per-token and
-    // chained paths so a record-once recording can be replayed either way (see adapter.rs
-    // `Recorder::sample_topk_chain`). Sized 64*4 unconditionally: the same buffer is bound whether
-    // or not this decode ever actually chains.
-    let u_buf = be
-        .alloc(64 * 4, BufferUsage::Staging)
-        .map_err(|e| anyhow!("{e}"))?;
+    // The per-call decode IO buffers. These are `be.alloc`s, and on Vulkan an `alloc` zero-fills
+    // through a one-shot command buffer — i.e. it RECORDS, so it needs the baton exactly like a
+    // step does (see `StepGate`: the command pool is externally synchronised, and the backend hands
+    // its handle out from under the mutex). Scoped so the baton is released before the prefill loop
+    // below, which takes its own per-chunk turn.
+    let (tok_id_buf, dec_ids_buf, u_buf) = {
+        let _gp = req.and_then(|r| r.gate_pass());
+        let tok_id_buf = be
+            .alloc(4, BufferUsage::Readback)
+            .map_err(|e| anyhow!("{e}"))?;
+        // GPU embed gather: the decode loop's 4-byte token-id input (replaces the n_embd*4 host
+        // embed + hidden upload when `gpu_embed`).
+        let dec_ids_buf = be
+            .alloc(4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        // GPU stochastic sampling: the host-drawn uniform(s) for `Op::Sample`'s `u` Input — a 64-slot
+        // ring (mirrors the chained id-log ring), indexed by `pos & 63` in BOTH the per-token and
+        // chained paths so a record-once recording can be replayed either way (see adapter.rs
+        // `Recorder::sample_topk_chain`). Sized 64*4 unconditionally: the same buffer is bound whether
+        // or not this decode ever actually chains.
+        let u_buf = be
+            .alloc(64 * 4, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?;
+        (tok_id_buf, dec_ids_buf, u_buf)
+    };
     // Host-side mirror of `u_buf`'s 64 slots. `Backend::upload` has no partial-buffer/offset
     // form, so setting one slot re-uploads the whole 256 bytes from this mirror — negligible cost.
     // Positions monotonically increase and are consumed before their slot wraps (mod 64), so no
@@ -3432,10 +3458,26 @@ pub(crate) fn generate_dense_backend(
         // submit; fixed-size chunks bound both, exactly like the bespoke path's ubatches.
         // Shared reader (`crate::seam::ubatch_rows`): the SWA ring sizing must cover exactly
         // this chunk height — see `kv_rows`' correctness bound.
-        let ubatch: usize = crate::seam::ubatch_rows();
+        // Prefill vs in-flight decodes (`infr serve --parallel N`): the chunk is the unit of GPU
+        // ownership, so a chunk is exactly how long a newly-admitted request's prefill can stall
+        // everyone else's decode. The default ubatch (INFR_UBATCH, 1024 rows) is ~100ms+ of
+        // unpreemptible GPU on a 14B — enough to visibly hitch 3 other streams. Under a gate we
+        // therefore cap the chunk (INFR_UBATCH_PARALLEL, default 256 rows), yield the baton between
+        // chunks, and let the round-robin interleave prefill chunks with the other sequences' decode
+        // steps. This is llama.cpp's "chunked prefill interleaved with decode" without the shared
+        // batch: same starvation bound, no batching win. A sole request (`req` None, or `-np 1`)
+        // keeps the full 1024-row chunk — prefill throughput is UNCHANGED there.
+        let ubatch: usize = if req.is_some_and(crate::sampling::RequestCtx::shares_gpu) {
+            crate::seam::ubatch_rows().min(crate::seam::ubatch_rows_parallel())
+        } else {
+            crate::seam::ubatch_rows()
+        };
         let pf_end = prompt.len() - 1;
         let mut cstart = start;
         while cstart < pf_end {
+            // One chunk = one turn on the GPU. Dropped at the end of the iteration, handing the
+            // baton to whichever sequence has been waiting longest.
+            let _gp = req.and_then(|r| r.gate_pass());
             let cend = (cstart + ubatch).min(pf_end);
             let pf_m = cend - cstart;
             // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
@@ -3607,6 +3649,9 @@ pub(crate) fn generate_dense_backend(
         // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
         && h_out.is_none();
     let ro = if dyn_replay {
+        // `compile` builds pipelines and records the replay tape into the shared command pool —
+        // GPU work, so it takes a turn like any step.
+        let _gp = req.and_then(|r| r.gate_pass());
         let (g, h) = build(
             1, 0, 1, false, None, false, false, gpu_argmax, gpu_sample, gpu_embed,
             false, // mtp_verify: ordinary per-token decode, not MTP verify
@@ -3690,6 +3735,13 @@ pub(crate) fn generate_dense_backend(
         if out.len() >= max_new && pos + 1 >= prompt.len() {
             break;
         }
+        // ONE turn on the GPU per loop iteration — a single decode step, or one chained chunk of
+        // `chain_n` steps (the `can_chain` branch below submits them as one recording). Dropped at
+        // the end of the iteration (including on `continue`, `break`, and `?`), handing the baton
+        // to the longest-waiting sequence. THIS is the token-granularity round-robin: no request
+        // can be head-of-line blocked behind another's whole generation, only behind one step of it.
+        // `req` None (run/bench/tests) constructs nothing.
+        let _gp = req.and_then(|r| r.gate_pass());
         if can_chain && pos + 1 >= prompt.len() && pos + 1 == cur.len() && logits_out.is_none() {
             let n = chain_n.min(max_new - out.len()).min(64);
             if n >= 2 {
@@ -3739,7 +3791,14 @@ pub(crate) fn generate_dense_backend(
                         }
                         on_token(id);
                         cur.push(id);
-                        if out.len() >= max_new {
+                        // `abort_requested` was NOT polled here before (pre-existing bug, reported):
+                        // the chained path is the DEFAULT decode fast path (greedy + gpu_embed), so
+                        // an `infr serve` request with a `stop` sequence kept generating all the way
+                        // to `max_tokens` after its stop had already fired. The client's TEXT was
+                        // right (StopMatcher suppresses emission after a hit) but the server burned
+                        // the whole budget on tokens nobody would ever see — and, now, held a slot
+                        // other requests were queued behind. Same shape as the EOS/max_new checks.
+                        if out.len() >= max_new || crate::sampling::abort_requested(req) {
                             stop = true;
                             break;
                         }
@@ -3909,7 +3968,7 @@ pub(crate) fn generate_dense_backend(
                     cur.push(t);
                     decode_n += 1;
                 }
-                if done || out.len() >= max_new || crate::sampling::abort_requested() {
+                if done || out.len() >= max_new || crate::sampling::abort_requested(req) {
                     break;
                 }
             } else {
@@ -3937,8 +3996,9 @@ pub(crate) fn generate_dense_backend(
                     on_token(next); // stream the token (EOS is not emitted)
                 }
                 // `on_token` -> the server's stop-sequence matcher may have latched an abort (a stop
-                // string completed inside this token's text). One thread-local `Cell` read/token.
-                if is_eos || out.len() >= max_new || crate::sampling::abort_requested() {
+                // string completed inside this token's text). One relaxed atomic load per token,
+                // and not even that when `req` is None.
+                if is_eos || out.len() >= max_new || crate::sampling::abort_requested(req) {
                     break;
                 }
                 cur.push(next);
@@ -3950,6 +4010,21 @@ pub(crate) fn generate_dense_backend(
             prompt_t += step_t0.elapsed();
         }
         pos += 1;
+    }
+    // TEARDOWN IS GPU WORK TOO. The record-once replay plan owns a Vulkan command buffer, and
+    // dropping it runs `RecordedCmd::drop` -> `vkQueueWaitIdle` + `vkFreeCommandBuffers`. Left to
+    // fall out of scope at the end of this function it would do that OUTSIDE the baton — and N
+    // sequences finishing at once would then hit the queue and the command pool concurrently, which
+    // is exactly the "externally synchronised" rule Vulkan states for both. The validation layer
+    // caught this (UNASSIGNED-Threading-MultipleThreads-Write on VkQueue) even though every
+    // *stepping* call site was already gated: the leak was in the destructor, not the hot loop.
+    //
+    // So take one last turn and drop it deliberately. (The prefill chunk plans are declared INSIDE
+    // their gated scope, so they already drop before that scope's baton is released — drop order is
+    // reverse-declaration and `_gp` is declared first.)
+    {
+        let _gp = req.and_then(|r| r.gate_pass());
+        drop(ro);
     }
     if prof {
         let ts = |d: std::time::Duration, n: usize| {

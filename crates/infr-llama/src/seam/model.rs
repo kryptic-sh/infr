@@ -480,9 +480,10 @@ impl SeamModel {
         session: &mut DenseVulkanSession,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        self.generate_vulkan_session_constrained(session, prompt, max_new, None, on_piece)
+        self.generate_vulkan_session_constrained(session, prompt, max_new, None, req, on_piece)
     }
 
     /// [`generate_vulkan_session`](Self::generate_vulkan_session) with an optional llguidance
@@ -493,6 +494,7 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
         constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let enc = self
@@ -523,6 +525,7 @@ impl SeamModel {
             &mut session.pool.slots[slot],
             max_ctx,
             constraint,
+            req,
         )?;
         Ok(stats)
     }
@@ -573,6 +576,70 @@ impl SeamModel {
     /// diffusion decode loop, Phase 3) via the shared [`crate::stream_token`] helper.
     pub(crate) fn tokenizer(&self) -> &Tokenizer {
         &self.tokenizer
+    }
+
+    /// gemma4-E2B per-layer embedding tensors — threaded into the seam runners by callers that
+    /// drive `generate_dense_vulkan_session` directly (`crate::parallel::ParallelSeam`).
+    pub(crate) fn per_layer_embd(&self) -> Option<&PerLayerEmbd> {
+        self.per_layer_embd.as_ref()
+    }
+
+    /// The PER-SLOT context for an N-slot `infr serve --parallel N` session.
+    ///
+    /// N slots means N KV caches, so the derived per-slot window is the VRAM-fit window DIVIDED by
+    /// N: `min(n_ctx_train, kv_fit / N)`.
+    ///
+    /// **The invariant this buys is "cannot OOM", NOT "same VRAM".** Total KV across the N slots is
+    /// `N * (kv_fit / N) = kv_fit` at most — i.e. it is bounded by exactly the same VRAM fit a
+    /// 1-slot server is bounded by, so raising `-np` can never overflow a device that `-np 1` fit.
+    /// It does NOT mean the footprint is unchanged: when the model's trained window sits BELOW the
+    /// fit (Qwen3-14B: trained 40960, fit ~84000 on a 24 GiB card), `-np 1` only allocates the
+    /// trained 40960 while `-np 4` allocates 4 x 21097 — more total KV, but still inside budget.
+    /// The visible cost of parallelism is the per-request window shrinking (40960 -> 21097 here).
+    ///
+    /// `want` (from `--ctx` / `INFR_CTX`, sharing `infr_core::parse_size`'s grammar):
+    /// - `None` — derive as above.
+    /// - `Bytes(c)` — an explicit token count, used VERBATIM per slot and never clamped (the Vulkan
+    ///   alloc-time budget guard errors cleanly if `N * c` truly doesn't fit — the user asked).
+    /// - `Percent(f)` — `f` of the free-VRAM KV capacity IN TOTAL, split across the N slots
+    ///   (`kv_fit * f / N`), so `--ctx 50%` means the same total VRAM at any `-np`.
+    ///
+    /// `n_slots <= 1` with `want: None` is EXACTLY [`clamp_default_ctx`](Self::clamp_default_ctx) —
+    /// byte-for-byte today's default sizing, auto-q8 rung and all.
+    pub(crate) fn vulkan_slot_ctx(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        n_slots: usize,
+        want: Option<infr_core::SizeSpec>,
+    ) -> usize {
+        let n_slots = n_slots.max(1);
+        // An explicit token count is the user's demand — honour it verbatim, at any N.
+        if let Some(infr_core::SizeSpec::Bytes(c)) = want {
+            return (c as usize).max(1);
+        }
+        if n_slots == 1 && want.is_none() {
+            return self.clamp_default_ctx(vk, self.cfg.n_ctx_train);
+        }
+        let trained = self.cfg.n_ctx_train;
+        let Some(fit) = self.kv_fit_ctx(vk) else {
+            return trained; // pure recurrent-state arch: no per-token KV to divide.
+        };
+        let budget = match want {
+            Some(infr_core::SizeSpec::Percent(f)) => (fit as f64 * f) as usize,
+            _ => fit,
+        };
+        // 1024 is the runner's own floor (`kv_fit_ctx`'s MIN_CTX) — below it a slot is useless and
+        // the alloc guard's clear error is the better outcome than a silently-crippled window.
+        let per_slot = (budget / n_slots).max(1024);
+        let ctx = trained.min(per_slot);
+        if ctx < trained {
+            eprintln!(
+                "ctx clamp: --parallel {n_slots} -> per-slot context {trained} -> {ctx} \
+                 (each of the {n_slots} slots owns a full KV cache; their total stays within the \
+                 same VRAM budget a single slot is held to). Set --ctx to override."
+            );
+        }
+        ctx
     }
 
     /// Detokenize ids back to text (`encode`'s twin, `skip_special_tokens=true` — matches
@@ -703,6 +770,7 @@ impl SeamModel {
             self.per_layer_embd.as_ref(),
             &prompt,
             n_gen,
+            None, // req: bench is a sole sequence — env sampling, no abort latch, no gate
             |_| {},
         )?;
         Ok(stats)
@@ -799,7 +867,8 @@ impl SeamModel {
                 |_| {},
                 state,
                 want,
-                None,
+                None, // constraint
+                None, // req: bench is a sole sequence — env sampling, no gate
             )?;
             Ok(stats)
         };
@@ -1202,6 +1271,7 @@ impl SeamModel {
         &self,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let enc = self
@@ -1219,6 +1289,7 @@ impl SeamModel {
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
+            req,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
         )?;
         Ok(stats)
@@ -1241,6 +1312,7 @@ impl SeamModel {
             self.per_layer_embd.as_ref(),
             prompt_tokens,
             max_new,
+            None, // req: token-identity checks are a sole sequence — env sampling, no gate
             on_id,
         )?;
         Ok(generated)
@@ -1312,6 +1384,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None,
         )?;
         Ok(())
     }
@@ -1370,6 +1443,7 @@ impl DiffusionGemmaCpuSession {
                 sample_temp_inv: 0.0,
                 reduced: &mut reduced,
             }),
+            None,
         )?;
         Ok(out_logits)
     }
@@ -1402,6 +1476,7 @@ impl DiffusionGemmaVulkanSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,
@@ -1472,6 +1547,7 @@ impl DiffusionGemmaVulkanSession {
                 sample_temp_inv,
                 reduced: &mut reduced,
             }),
+            None,
         )?;
         Ok(match reduced {
             Some(r) => crate::seam::DenoiseOutcome::Reduced(r),
@@ -1513,6 +1589,7 @@ impl DiffusionGemmaMetalSession {
             |_| {},
             &mut self.state,
             self.max_ctx,
+            None,
             None,
             None,
             None,
@@ -1568,6 +1645,7 @@ impl DiffusionGemmaMetalSession {
                 sample_temp_inv: 0.0,
                 reduced: &mut reduced,
             }),
+            None,
         )?;
         Ok(out_logits)
     }

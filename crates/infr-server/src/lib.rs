@@ -32,7 +32,7 @@ use axum::{
 };
 use infr_engine::{ChatMessage, Delta, ToolCall};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 /// Why generation ended — the OpenAI `finish_reason`. The generator reports it; the handlers
 /// serialize it (a tool call still overrides to [`Finish::ToolCalls`] at the wire layer).
@@ -57,15 +57,24 @@ impl Finish {
 }
 
 /// Generation backend the server drives — it never knows the model/GPU underneath. Implemented by
-/// the CLI's per-arch adapters (`infr-cli`'s `SeamGenerator` wraps any `infr_llama::ChatModel`,
-/// including `DiffusionGemmaChat` — see `docs/DIFFUSIONGEMMA.md`).
+/// the CLI's per-arch adapters (`infr-cli`'s `ParallelGenerator` over `infr_llama::ParallelSeam` for
+/// the Vulkan seam; `SeamGenerator` wraps any `infr_llama::ChatModel` for the rest, including
+/// `DiffusionGemmaChat` — see `docs/DIFFUSIONGEMMA.md`).
 ///
 /// [`GenParams`] carries the request's PER-REQUEST sampling config (temperature/top_p/top_k/seed/
 /// penalties/stop/max_tokens). Every field is an `Option` whose `None` means "inherit the process
 /// default" — so a request that sends nothing generates EXACTLY as it did before this existed.
-pub trait ChatGenerator: Send {
+///
+/// **`&self`, `Send + Sync`.** This is the whole concurrency contract: the server calls `chat` from
+/// N request tasks at once and the generator is responsible for its own slot allocation and GPU
+/// turn-taking. It used to be `&mut self` behind an `Arc<Mutex<_>>` the handlers held for an ENTIRE
+/// generation, which meant request #2 waited for request #1 to finish — head-of-line blocking, no
+/// parallelism. An implementation that genuinely cannot run concurrently (CPU / Metal / diffusion
+/// today) keeps an internal `Mutex` and is served with `--parallel 1`, which is honest rather than
+/// silently serialising a server the user asked to parallelise.
+pub trait ChatGenerator: Send + Sync {
     fn chat(
-        &mut self,
+        &self,
         messages: &[ChatMessage],
         tools_json: Option<&str>,
         tool_choice: Option<&str>,
@@ -485,29 +494,43 @@ pub struct DeltaPayload {
 
 /// Shared server state.
 ///
-/// `engine` is `Option<Box<dyn ChatGenerator>>` so the router can be constructed without a live
-/// model (used in tests and for the /health + /v1/models endpoints which need no generation).
-/// Generation is serialised by the Mutex — single-stream for the MVP.
+/// `engine` is an `Option<Arc<dyn ChatGenerator>>` so the router can be constructed without a live
+/// model (used in tests and for the /health + /v1/models endpoints which need no generation). It is
+/// an `Arc`, NOT an `Arc<Mutex<_>>`: generation runs concurrently and the generator synchronises
+/// itself (see [`ChatGenerator`]'s `&self` contract).
+///
+/// `slots` is the ADMISSION control — one permit per KV slot (`--parallel N`). A request takes a
+/// permit for the whole of its generation and returns it at the end, so at most N generate
+/// concurrently and the N+1'th QUEUES (tokio's semaphore is FIFO, so it queues fairly) rather than
+/// being rejected. This is the only thing that bounds in-flight work; the generator's own slot pool
+/// is sized to match.
 #[derive(Clone)]
 pub struct AppState {
-    pub engine: Arc<Mutex<Option<Box<dyn ChatGenerator>>>>,
+    pub engine: Option<Arc<dyn ChatGenerator>>,
     pub model_id: Arc<str>,
+    slots: Arc<Semaphore>,
 }
 
 impl AppState {
-    /// Wrap a loaded generator for production use.
-    pub fn new(generator: Box<dyn ChatGenerator>, model_id: impl Into<String>) -> Self {
+    /// Wrap a loaded generator for production use with `n_parallel` concurrent slots.
+    pub fn new(
+        generator: Arc<dyn ChatGenerator>,
+        model_id: impl Into<String>,
+        n_parallel: usize,
+    ) -> Self {
         Self {
-            engine: Arc::new(Mutex::new(Some(generator))),
+            engine: Some(generator),
             model_id: Arc::from(model_id.into().as_str()),
+            slots: Arc::new(Semaphore::new(n_parallel.max(1))),
         }
     }
 
     /// No-engine state — for /health, /v1/models, and serialisation tests.
     pub fn headless(model_id: impl Into<String>) -> Self {
         Self {
-            engine: Arc::new(Mutex::new(None)),
+            engine: None,
             model_id: Arc::from(model_id.into().as_str()),
+            slots: Arc::new(Semaphore::new(1)),
         }
     }
 }
@@ -529,16 +552,18 @@ pub fn build_router(state: AppState) -> Router {
 // Server entry point
 // ---------------------------------------------------------------------------
 
-/// Start the OpenAI-compatible server bound to `addr`, serving `engine` under `model_id`.
+/// Start the OpenAI-compatible server bound to `addr`, serving `engine` under `model_id` with
+/// `n_parallel` concurrent generation slots (`--parallel N`).
 pub async fn serve(
-    generator: Box<dyn ChatGenerator>,
+    generator: Arc<dyn ChatGenerator>,
     model_id: String,
     addr: SocketAddr,
+    n_parallel: usize,
 ) -> anyhow::Result<()> {
-    let state = AppState::new(generator, model_id);
+    let state = AppState::new(generator, model_id, n_parallel);
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "infr-server listening");
+    tracing::info!(%addr, %n_parallel, "infr-server listening");
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -624,14 +649,22 @@ async fn non_streaming(
     model_id: String,
     created: i64,
 ) -> Response {
+    // Wait for a free slot. With `--parallel N`, the (N+1)'th concurrent request queues HERE — in
+    // the async runtime, holding no thread — and is admitted FIFO as soon as one finishes.
+    let Ok(permit) = state.slots.clone().acquire_owned().await else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down".into(),
+        );
+    };
     let engine_arc = state.engine.clone();
     let cid_blk = cid.clone();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let handle = tokio::runtime::Handle::current();
-        let mut guard = handle.block_on(engine_arc.lock());
-
-        let Some(ref mut engine) = *guard else {
+        // The permit is MOVED into the blocking task and dropped when it ends: a slot is held for
+        // exactly the generation, and the next queued request is admitted the moment it frees.
+        let _permit = permit;
+        let Some(engine) = engine_arc else {
             anyhow::bail!("no engine loaded");
         };
 
@@ -729,9 +762,24 @@ async fn streaming(
     model_id: String,
     created: i64,
 ) -> Response {
-    // Bounded channel: 64 events of headroom before the generator blocks.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
+    // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
+    // slow (or stalled) SSE client apply backpressure straight into that callback, so ONE
+    // non-draining client would block the GPU step it is inside of and stall every OTHER sequence
+    // behind it: precisely the head-of-line blocking this whole change exists to remove. Decoupling
+    // the socket from the decode loop costs a queue whose depth is bounded anyway by `max_tokens`
+    // (a few thousand short strings, worst case), which is the right trade.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
 
+    // Same admission gate as the non-streaming path — the (N+1)'th concurrent stream queues here.
+    // Taken BEFORE the SSE response is returned, so a queued client simply waits for its first byte
+    // rather than being handed an open-but-silent stream.
+    let Ok(permit) = state.slots.clone().acquire_owned().await else {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server shutting down".into(),
+        );
+    };
     let engine_arc = state.engine.clone();
     // Clone sender + strings for use inside the on_delta callback closure.
     let tx_cb = tx.clone();
@@ -739,12 +787,11 @@ async fn streaming(
     let model_cb = model_id.clone();
 
     tokio::task::spawn_blocking(move || {
-        // Acquire the tokio runtime handle inherited from the parent async context.
-        let handle = tokio::runtime::Handle::current();
-        let mut guard = handle.block_on(engine_arc.lock());
+        // Held for exactly this generation; freed for the next queued request on return.
+        let _permit = permit;
 
         // First chunk: role delta (mirrors the Python shim's opening chunk).
-        let _ = handle.block_on(tx.send(Ok(sse_chunk(
+        let _ = tx.send(Ok(sse_chunk(
             &cid,
             &model_id,
             created,
@@ -753,11 +800,11 @@ async fn streaming(
                 ..Default::default()
             },
             None,
-        ))));
+        )));
 
-        let Some(ref mut engine) = *guard else {
+        let Some(engine) = engine_arc else {
             // No engine — close the stream immediately.
-            let _ = handle.block_on(tx.send(Ok(Event::default().data("[DONE]"))));
+            let _ = tx.send(Ok(Event::default().data("[DONE]")));
             return;
         };
 
@@ -794,9 +841,7 @@ async fn streaming(
                         }
                     }
                 };
-                let _ = handle.block_on(
-                    tx_cb.send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None))),
-                );
+                let _ = tx_cb.send(Ok(sse_chunk(&cid_cb, &model_cb, created, payload, None)));
             },
         );
 
@@ -807,16 +852,16 @@ async fn streaming(
         };
 
         // Finish chunk: empty delta + finish_reason.
-        let _ = handle.block_on(tx.send(Ok(sse_chunk(
+        let _ = tx.send(Ok(sse_chunk(
             &cid,
             &model_id,
             created,
             DeltaPayload::default(),
             Some(finish.as_str().into()),
-        ))));
+        )));
 
         // OpenAI SSE sentinel.
-        let _ = handle.block_on(tx.send(Ok(Event::default().data("[DONE]"))));
+        let _ = tx.send(Ok(Event::default().data("[DONE]")));
         // `tx` and `tx_cb` are both dropped here, which closes the channel and ends the stream.
     });
 

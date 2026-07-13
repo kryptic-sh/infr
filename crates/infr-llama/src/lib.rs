@@ -20,6 +20,8 @@ pub(crate) use util::*;
 mod kv;
 pub use kv::MoeConfig;
 pub mod grammar;
+/// N-slot concurrent generation (`infr serve --parallel N`) — see [`parallel::ParallelSeam`].
+pub mod parallel;
 pub mod sampling;
 pub use config::Config;
 mod weights;

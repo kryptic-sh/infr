@@ -70,6 +70,29 @@ enum Cmd {
         model: String,
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
+        /// Concurrent generation slots (llama-server's `-np`). N requests generate at once, each
+        /// with its own KV cache, taking turns on the GPU at token granularity; the (N+1)'th queues.
+        ///
+        /// Each slot owns a full KV cache, so the DEFAULT per-slot context is the VRAM-fit window
+        /// divided by N: the N slots together stay inside the same VRAM budget one slot is held to,
+        /// and raising `-np` can never OOM a box that `-np 1` fit. The visible cost is a smaller
+        /// per-request window. Pass `--ctx` to pin the per-slot window instead (then `N * ctx` must
+        /// fit, and the Vulkan budget guard will say so if it doesn't).
+        /// `--np` is accepted as an alias (llama-server spells this `-np`; clap shorts are a single
+        /// character, so `-n` is the short form and `--np` the familiar long one).
+        #[arg(
+            long = "parallel",
+            visible_alias = "np",
+            short = 'n',
+            default_value_t = 4,
+            value_name = "N"
+        )]
+        parallel: usize,
+        /// Per-slot context window in tokens (`8192`, `256k`, or `50%` of the free-VRAM KV
+        /// capacity). Default: the model's trained context, clamped to VRAM and divided by
+        /// `--parallel`. Overrides INFR_CTX.
+        #[arg(long, value_name = "TOKENS")]
+        ctx: Option<String>,
     },
     /// Benchmark prefill/decode tok/s — same interface as llama.cpp's `llama-bench` (-p/-n/-d/-r),
     /// so the two are directly comparable. Prefill (pp) when -n 0; decode (tg) when -p 0.
@@ -190,7 +213,12 @@ fn main() -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model),
         Cmd::Run { model, message } => cmd_run(&model, message.as_deref()),
-        Cmd::Serve { model, addr } => cmd_serve(&model, &addr),
+        Cmd::Serve {
+            model,
+            addr,
+            parallel,
+            ctx,
+        } => cmd_serve(&model, &addr, parallel, ctx.as_deref()),
         Cmd::Bench {
             model,
             n_prompt,
@@ -866,8 +894,12 @@ fn metal_chat_model(
 /// streams through the same [`ChatStream`] splitter (reasoning/content/auto-parsed tool calls).
 /// Grammar-FORCED tool_choice builds an llguidance constraint and generates through
 /// `generate_constrained` (llama.cpp-parity reliability); auto/none stream through the parser.
+/// SERIALISED: the backend is a `&mut`-only `ChatModel` with a single KV session, so concurrent
+/// requests take turns behind a `Mutex`. Used for CPU / Metal / diffusion-gemma, which have no
+/// multi-slot engine — `cmd_serve` pins those to `--parallel 1` so the queueing is explicit rather
+/// than a silent serialisation of a server the user asked to parallelise.
 struct SeamGenerator {
-    model: Box<dyn infr_llama::chat::ChatModel + Send>,
+    model: std::sync::Mutex<Box<dyn infr_llama::chat::ChatModel + Send>>,
     renderer: infr_llama::chat::OaiRenderer,
 }
 
@@ -877,9 +909,103 @@ impl SeamGenerator {
         model: Box<dyn infr_llama::chat::ChatModel + Send>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            model,
+            model: std::sync::Mutex::new(model),
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path)?,
         })
+    }
+}
+
+/// CONCURRENT: N KV slots on the Vulkan seam, round-robin on the GPU at token granularity — see
+/// [`infr_llama::parallel::ParallelSeam`]. The `infr serve --parallel N` default path.
+struct ParallelGenerator {
+    engine: infr_llama::parallel::ParallelSeam,
+    renderer: infr_llama::chat::OaiRenderer,
+}
+
+impl ParallelGenerator {
+    fn new(gguf_path: &Path, engine: infr_llama::parallel::ParallelSeam) -> anyhow::Result<Self> {
+        Ok(Self {
+            engine,
+            renderer: infr_llama::chat::OaiRenderer::open(gguf_path)?,
+        })
+    }
+}
+
+/// The two things a serve backend must do, so the OpenAI wire logic (rendering, forced tool calls,
+/// stop sequences, reasoning/content splitting) lives in ONE place — [`run_chat`] — instead of being
+/// duplicated per backend.
+trait GenBackend: Send + Sync {
+    fn renderer(&self) -> &infr_llama::chat::OaiRenderer;
+
+    /// This sequence's own state: sampling config, abort latch, and (when the engine is
+    /// multi-slot) its turn on the GPU baton.
+    fn request_ctx(
+        &self,
+        sampling: infr_llama::sampling::RequestSampling,
+    ) -> infr_llama::sampling::RequestCtx;
+
+    fn generate(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut infr_llama::grammar::Constraint>,
+        req: &infr_llama::sampling::RequestCtx,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_llama::GenStats>;
+}
+
+impl GenBackend for SeamGenerator {
+    fn renderer(&self) -> &infr_llama::chat::OaiRenderer {
+        &self.renderer
+    }
+
+    fn request_ctx(
+        &self,
+        sampling: infr_llama::sampling::RequestSampling,
+    ) -> infr_llama::sampling::RequestCtx {
+        // No gate: this backend is serialised by the Mutex below, so there is never more than one
+        // sequence on the GPU to take turns with.
+        infr_llama::sampling::RequestCtx::new(sampling)
+    }
+
+    fn generate(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut infr_llama::grammar::Constraint>,
+        req: &infr_llama::sampling::RequestCtx,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_llama::GenStats> {
+        let mut model = self.model.lock().expect("serve generator poisoned");
+        match constraint {
+            Some(c) => model.generate_constrained(prompt, max_new, c, Some(req), on_piece),
+            None => model.generate(prompt, max_new, Some(req), on_piece),
+        }
+    }
+}
+
+impl GenBackend for ParallelGenerator {
+    fn renderer(&self) -> &infr_llama::chat::OaiRenderer {
+        &self.renderer
+    }
+
+    fn request_ctx(
+        &self,
+        sampling: infr_llama::sampling::RequestSampling,
+    ) -> infr_llama::sampling::RequestCtx {
+        self.engine.request_ctx(sampling)
+    }
+
+    fn generate(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut infr_llama::grammar::Constraint>,
+        req: &infr_llama::sampling::RequestCtx,
+        on_piece: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_llama::GenStats> {
+        self.engine
+            .generate(prompt, max_new, constraint, req, |p| on_piece(p))
     }
 }
 
@@ -901,18 +1027,53 @@ fn request_sampling(p: &infr_server::GenParams) -> infr_llama::sampling::Request
 
 impl infr_server::ChatGenerator for SeamGenerator {
     fn chat(
-        &mut self,
+        &self,
         messages: &[infr_engine::ChatMessage],
         tools_json: Option<&str>,
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<infr_server::Finish> {
+        run_chat(self, messages, tools_json, tool_choice, params, on_delta)
+    }
+}
+
+impl infr_server::ChatGenerator for ParallelGenerator {
+    fn chat(
+        &self,
+        messages: &[infr_engine::ChatMessage],
+        tools_json: Option<&str>,
+        tool_choice: Option<&str>,
+        params: &infr_server::GenParams,
+        on_delta: &mut dyn FnMut(infr_engine::Delta),
+    ) -> anyhow::Result<infr_server::Finish> {
+        run_chat(self, messages, tools_json, tool_choice, params, on_delta)
+    }
+}
+
+/// The OpenAI chat body, shared by every serve backend: render the conversation through the model's
+/// own template, honour a FORCED tool_choice with an llguidance constraint, then stream the reply
+/// through the reasoning/content/tool-call splitter with stop sequences applied to the raw text.
+///
+/// Backend-agnostic by construction — all the per-sequence state (sampling, RNG seed, penalties,
+/// stop matcher, abort latch) is created HERE, per call, and handed to the backend explicitly. Two
+/// concurrent calls therefore share nothing: that is what makes request A's `temperature` unable to
+/// leak into request B (the old thread-local could not offer that guarantee once one thread stepped
+/// several sequences).
+fn run_chat(
+    be: &dyn GenBackend,
+    messages: &[infr_engine::ChatMessage],
+    tools_json: Option<&str>,
+    tool_choice: Option<&str>,
+    params: &infr_server::GenParams,
+    on_delta: &mut dyn FnMut(infr_engine::Delta),
+) -> anyhow::Result<infr_server::Finish> {
+    {
         let tools: Option<serde_json::Value> = tools_json
             .map(serde_json::from_str)
             .transpose()
             .context("parsing request `tools`")?;
-        let prompt = self.renderer.render(messages, tools.as_ref())?;
+        let prompt = be.renderer().render(messages, tools.as_ref())?;
         // The request's `max_tokens`/`max_completion_tokens` wins; INFR_MAX_NEW (default 2048) is
         // the server-side default for requests that don't set one.
         let max_new = params.max_tokens.map(|v| v as usize).unwrap_or_else(|| {
@@ -921,20 +1082,22 @@ impl infr_server::ChatGenerator for SeamGenerator {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2048usize)
         });
-        // Per-request sampling (temperature/top_p/top_k/seed/penalties) for the duration of THIS
-        // generation only — the guard restores the process default on drop, including on error.
-        let _scope = infr_llama::sampling::RequestScope::new(request_sampling(params));
+        // THIS sequence's own sampling (temperature/top_p/top_k/seed/penalties) + abort latch + GPU
+        // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
+        // or leak into, any other in-flight request.
+        let req = be.request_ctx(request_sampling(params));
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
         // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
         // constrained JSON; on any failure fall back to unconstrained (mirrors LlamaGenerator).
-        if let Some(mut constraint) = self.renderer.tool_constraint(tools.as_ref(), tool_choice)? {
+        if let Some(mut constraint) = be.renderer().tool_constraint(tools.as_ref(), tool_choice)? {
             let primed = format!("{prompt}<tool_call>\n");
             let mut body = String::new();
-            let emitted = match self.model.generate_constrained(
+            let emitted = match be.generate(
                 &primed,
                 max_new,
-                &mut constraint,
+                Some(&mut constraint),
+                &req,
                 &mut |p: &str| body.push_str(p),
             ) {
                 Ok(_) => {
@@ -970,8 +1133,10 @@ impl infr_server::ChatGenerator for SeamGenerator {
         let mut stream = infr_engine::ChatStream::new(tool_choice != Some("none"));
         // Stop sequences run on the RAW decoded text, BEFORE the reasoning/tool splitter — so a
         // stop string that spans two tokens still fires, and a partial stop prefix is held back
-        // instead of being streamed out (see `StopMatcher`). A hit latches an abort that the decode
-        // loop polls after the current token (`infr_llama::sampling::request_abort`).
+        // instead of being streamed out (see `StopMatcher`). A hit latches an abort on THIS
+        // sequence's own `RequestCtx`, which its decode loop polls after the current token. The
+        // matcher and the latch are both per-call locals, so N concurrent requests each stop on
+        // their OWN stop strings and nobody else's.
         let mut stops = infr_server::StopMatcher::new(params.stop.clone());
         let stats = {
             let od = &mut *on_delta;
@@ -981,13 +1146,13 @@ impl infr_server::ChatGenerator for SeamGenerator {
             if infr_engine::prompt_prefills_think(&prompt) {
                 stream.push("<think>", &mut *od);
             }
-            let stats = self.model.generate(&prompt, max_new, &mut |piece: &str| {
+            let stats = be.generate(&prompt, max_new, None, &req, &mut |piece: &str| {
                 let safe = stops.push(piece);
                 if !safe.is_empty() {
                     stream.push(&safe, &mut *od);
                 }
                 if stops.hit() {
-                    infr_llama::sampling::request_abort();
+                    req.abort();
                 }
             })?;
             // No stop fired: whatever the matcher was holding back was never a stop prefix.
@@ -2523,7 +2688,7 @@ fn set_default_sampling_env() {
     }
 }
 
-fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
+fn cmd_serve(model: &str, addr: &str, parallel: usize, ctx: Option<&str>) -> anyhow::Result<()> {
     let (gguf, tok) = resolve(model)?;
     let model_id = gguf
         .file_stem()
@@ -2531,6 +2696,63 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         .unwrap_or("model")
         .to_string();
     let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
+    let parallel = parallel.max(1);
+
+    // `--ctx` is the per-slot context. It shares the size grammar (`8192`, `256k`, `50%`) with
+    // INFR_CTX, which it overrides — one grammar, one meaning (`infr_core::parse_size`).
+    if let Some(c) = ctx {
+        if infr_core::parse_size(c).is_none() {
+            anyhow::bail!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)");
+        }
+        std::env::set_var("INFR_CTX", c);
+    }
+
+    let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
+    let is_vulkan =
+        !is_dg && std::env::var("INFR_METAL").is_err() && std::env::var("INFR_CPU").is_err();
+
+    set_default_sampling_env();
+
+    // ── the CONCURRENT path: dense/MoE/qwen35 on the Vulkan seam ────────────────────────────────
+    // N KV slots off ONE weight upload, round-robin on the GPU at token granularity. This is the
+    // default `infr serve` engine.
+    if is_vulkan {
+        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        // `--ctx` (or INFR_CTX) is the PER-SLOT window: an explicit token count is used verbatim,
+        // a `%` is a fraction of the whole device's KV capacity split across the slots, and unset
+        // derives it from the VRAM fit divided by N. See `SeamModel::vulkan_slot_ctx`.
+        let want_ctx = std::env::var("INFR_CTX")
+            .ok()
+            .as_deref()
+            .and_then(infr_core::parse_size);
+        let t0 = std::time::Instant::now();
+        let engine = infr_llama::parallel::ParallelSeam::new(loaded, parallel, want_ctx)?;
+        eprintln!(
+            "warmup: pipelines compiled in {:.1}s",
+            t0.elapsed().as_secs_f32()
+        );
+        let n_slots = engine.n_slots();
+        let max_ctx = engine.max_ctx();
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
+            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine)?);
+        let rt = tokio::runtime::Runtime::new()?;
+        println!(
+            "infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, {n_slots} slot{} x {max_ctx} ctx)",
+            if n_slots == 1 { "" } else { "s" },
+        );
+        return rt.block_on(infr_server::serve(generator, model_id, sockaddr, n_slots));
+    }
+
+    // ── the SERIALISED path: CPU / Metal / diffusion-gemma ──────────────────────────────────────
+    // These have no multi-slot engine (one `&mut` ChatModel, one KV session), so concurrent
+    // requests would only queue behind a Mutex. Say so rather than pretending to parallelise.
+    if parallel > 1 {
+        eprintln!(
+            "note: --parallel {parallel} ignored on the CPU/Metal/diffusion backends (no \
+             multi-slot engine); serving 1 request at a time. The Vulkan seam is the concurrent \
+             engine."
+        );
+    }
 
     // Seam-backed serve — the ONE engine: the SAME ChatModel + multi-slot session `infr run`
     // uses, so serve gets per-request suffix-only prefill and cross-conversation prefix seeding
@@ -2538,7 +2760,6 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
     // qwen35 shares the SAME selection funnel as every other arch below — see the matching
     // comment in `cmd_run` (the old standalone `Qwen35Chat` branch + its env-gated escape hatch
     // were deleted once the unified path was validated; issue #30).
-    let is_dg = infr_llama::diffusion::is_diffusion_gemma(&gguf);
     let mut m: Box<dyn infr_llama::chat::ChatModel + Send> = if is_dg {
         // diffusion-gemma (Phase 3/D): same selection as `cmd_run` — see its matching comment.
         let cpu = std::env::var("INFR_CPU").is_ok();
@@ -2576,7 +2797,6 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
         ))
     };
     {
-        set_default_sampling_env();
         // Compile every lazily-built pipeline NOW (a tiny throwaway generation) so the first
         // request doesn't pay seconds of pipeline builds on top of its own prefill.
         let t0 = std::time::Instant::now();
@@ -2585,10 +2805,10 @@ fn cmd_serve(model: &str, addr: &str) -> anyhow::Result<()> {
             "warmup: pipelines compiled in {:.1}s",
             t0.elapsed().as_secs_f32()
         );
-        let generator: Box<dyn infr_server::ChatGenerator> =
-            Box::new(SeamGenerator::new(&gguf, m)?);
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
+            std::sync::Arc::new(SeamGenerator::new(&gguf, m)?);
         let rt = tokio::runtime::Runtime::new()?;
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
-        rt.block_on(infr_server::serve(generator, model_id, sockaddr))
+        rt.block_on(infr_server::serve(generator, model_id, sockaddr, 1))
     }
 }

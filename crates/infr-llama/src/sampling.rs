@@ -47,12 +47,13 @@ impl Sampler {
         }
     }
 
-    /// The sampler the decode loop actually runs: a [`RequestSampling`] scope's EXPLICIT overrides
-    /// (one `infr serve` HTTP request) layered over [`from_env`](Self::from_env). Outside a scope
-    /// (`infr run`, `bench`, every test) this IS `from_env()` — byte-for-byte the old behavior.
-    pub fn resolve() -> Self {
+    /// The sampler the decode loop actually runs: ONE sequence's EXPLICIT overrides (its
+    /// [`RequestCtx`], carried by the scheduler's slot) layered over [`from_env`](Self::from_env).
+    /// `req: None` (`infr run`, `bench`, every test) IS `from_env()` — byte-for-byte the old
+    /// behavior.
+    pub fn resolve(req: Option<&RequestCtx>) -> Self {
         let mut s = Self::from_env();
-        with_request(|r| {
+        if let Some(r) = req.map(RequestCtx::sampling) {
             if let Some(t) = r.temp {
                 s.temp = t;
             }
@@ -62,7 +63,7 @@ impl Sampler {
             if let Some(p) = r.top_p {
                 s.top_p = p;
             }
-        });
+        }
         s
     }
 }
@@ -71,19 +72,10 @@ impl Sampler {
 // Per-request sampling scope (the `infr serve` seam)
 // ---------------------------------------------------------------------------
 
-/// Per-request sampling overrides + penalty config + an abort latch, installed for the duration of
-/// ONE generation by [`RequestScope`].
+/// Per-request sampling overrides + penalty config — the CONFIG half of a [`RequestCtx`].
 ///
-/// Why a thread-scoped value rather than an extra `generate_dense_backend` argument: sampling has to
-/// reach the innermost decode step (penalties mutate the logits row; the stop-sequence matcher has
-/// to *halt* the loop from inside the `on_piece` callback, which returns `()`), and that step sits
-/// behind 6 backend wrappers and 18 call sites. Scoping it keeps ONE knob to thread instead of a
-/// parameter on every path, and — critically — keeps the default path (`None`) a single
-/// thread-local read per generation, not per token.
-///
-/// The scope is safe because generation is synchronous and single-threaded per request: `infr
-/// serve` serialises generation behind a mutex on ONE `spawn_blocking` thread, and `on_piece` is
-/// invoked inline from the decode loop on that same thread.
+/// Every field is an `Option`/neutral default whose "unset" meaning is *inherit the process
+/// default*, so a request that sends nothing generates EXACTLY as `infr run`/`bench`/the goldens do.
 #[derive(Clone, Debug)]
 pub struct RequestSampling {
     /// `None` = inherit the env/CLI default (this is what makes an ABSENT request field a no-op).
@@ -130,52 +122,167 @@ impl RequestSampling {
     }
 }
 
-thread_local! {
-    static REQUEST: std::cell::RefCell<Option<RequestSampling>> = const { std::cell::RefCell::new(None) };
-    /// Latched by [`request_abort`] from inside a streaming callback (the server's stop-sequence
-    /// matcher); polled once per decoded token by the decode loop.
-    static ABORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// EVERYTHING one in-flight sequence owns that is not its KV cache: its sampling config, its abort
+/// latch, and its turn on the GPU.
+///
+/// **This used to be a `thread_local!`** (a `RequestSampling` installed by an RAII `RequestScope`),
+/// which was only sound because one generation owned one thread: `infr serve` serialised ALL
+/// generation behind a single mutex. The moment N sequences make progress concurrently that
+/// invariant dies — a thread-local is per-THREAD, not per-SEQUENCE, so every sequence would read
+/// whichever config was installed last. Request A's temperature would silently apply to request B.
+///
+/// So the state is now EXPLICIT and per-sequence: the scheduler hands each in-flight sequence its
+/// own `RequestCtx`, threaded into `generate_dense_backend` as `req: Option<&RequestCtx>` and read
+/// nowhere else. `None` (`infr run`, `bench`, every test, every golden) means "inherit the process
+/// default", i.e. byte-for-byte the pre-existing behavior — there is no thread-local left on any
+/// path a decode step can reach.
+///
+/// Shared across threads by `&`: `abort` is an atomic and `gate` is an `Arc`, so the server's
+/// `on_piece` callback can latch a stop-sequence hit on the same `&RequestCtx` the decode loop is
+/// reading.
+pub struct RequestCtx {
+    sampling: RequestSampling,
+    /// Latched by [`abort`](Self::abort) from inside a streaming callback (the server's
+    /// stop-sequence matcher); polled once per decoded token by the decode loop.
+    abort: std::sync::atomic::AtomicBool,
+    /// This sequence's turn-taking baton on the GPU (`None` = sole user, e.g. `infr run`).
+    gate: Option<std::sync::Arc<StepGate>>,
 }
 
-fn with_request<R>(f: impl FnOnce(&RequestSampling) -> R) -> Option<R> {
-    REQUEST.with(|c| c.borrow().as_ref().map(f))
-}
+impl RequestCtx {
+    /// A sequence with no GPU contention (a lone request, or a `-np 1` server).
+    pub fn new(sampling: RequestSampling) -> Self {
+        Self {
+            sampling,
+            abort: std::sync::atomic::AtomicBool::new(false),
+            gate: None,
+        }
+    }
 
-/// RAII guard installing a [`RequestSampling`] for the current thread. Restores the previous value
-/// (normally `None`) and clears the abort latch on drop, so a panicking/erroring request can never
-/// leak its sampling config into the next one on a reused `spawn_blocking` thread.
-pub struct RequestScope(Option<RequestSampling>);
+    /// A sequence sharing the GPU with the other slots of a `-np N` server: every decode step and
+    /// prefill chunk takes a turn on `gate`.
+    pub fn with_gate(sampling: RequestSampling, gate: std::sync::Arc<StepGate>) -> Self {
+        Self {
+            sampling,
+            abort: std::sync::atomic::AtomicBool::new(false),
+            gate: Some(gate),
+        }
+    }
 
-impl RequestScope {
-    pub fn new(r: RequestSampling) -> Self {
-        let prev = REQUEST.with(|c| c.borrow_mut().replace(r));
-        ABORT.with(|c| c.set(false));
-        Self(prev)
+    pub fn sampling(&self) -> &RequestSampling {
+        &self.sampling
+    }
+
+    /// Ask the running decode loop to stop after the current token — the stop-sequence hit. Called
+    /// from inside the `on_piece` callback (which returns `()` and so has no other way to say
+    /// "done"). `Relaxed` is enough: the decode loop polls the SAME atomic and the callback runs
+    /// inline on the decode thread; there is no other data to publish.
+    pub fn abort(&self) {
+        self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Polled by the decode loop once per token (one relaxed atomic load — no allocation, no lock).
+    pub(crate) fn aborted(&self) -> bool {
+        self.abort.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Take this sequence's turn on the GPU, blocking until the baton reaches it. `None` (no gate)
+    /// is the uncontended path — the pass is never constructed, so a lone request pays NOTHING.
+    pub(crate) fn gate_pass(&self) -> Option<GatePass<'_>> {
+        self.gate.as_deref().map(StepGate::enter)
+    }
+
+    /// Is this sequence sharing the GPU? (A PREDICATE — unlike [`gate_pass`](Self::gate_pass) it
+    /// does not take the baton.) Used to pick the prefill chunk size: a shared GPU wants small
+    /// chunks so decodes aren't starved, a sole one wants big chunks for prefill throughput.
+    pub(crate) fn shares_gpu(&self) -> bool {
+        self.gate.is_some()
     }
 }
 
-impl Drop for RequestScope {
+/// The decode loop's abort poll, hoisted so `req: None` (every non-serve path) is a single
+/// `Option::is_some_and` and not an atomic load.
+pub(crate) fn abort_requested(req: Option<&RequestCtx>) -> bool {
+    req.is_some_and(RequestCtx::aborted)
+}
+
+// ---------------------------------------------------------------------------
+// The GPU baton (`infr serve --parallel N`)
+// ---------------------------------------------------------------------------
+
+/// A FAIR (FIFO) turnstile serialising GPU work across the N in-flight sequences of a `-np N`
+/// server — the "one forward at a time, round-robin" rule.
+///
+/// It exists for two reasons, one hard and one soft:
+///
+/// 1. **Correctness.** `VulkanBackend` hands out its `VkCommandPool` by COPYING the handle out of
+///    its mutex (`*cmd_pool.lock().unwrap()`) and then records/allocates outside the lock. Vulkan
+///    requires a command pool be externally synchronised, so two threads recording concurrently is
+///    UB. The baton is that external synchronisation.
+/// 2. **Fairness.** A plain `Mutex` is not FIFO and can starve a waiter indefinitely. A ticket lock
+///    hands the GPU to the longest-waiting sequence, so N clients round-robin at step granularity
+///    and no request is head-of-line blocked behind another's whole generation.
+///
+/// The granularity is ONE decode step (or one chained decode chunk, or one prefill chunk) — see the
+/// `gate_pass()` call sites in `seam::runner`. Uncontended cost is one mutex acquire/release per
+/// step (~20ns against a multi-millisecond forward), and a `-np 1` server / `infr run` never
+/// constructs a gate at all.
+#[derive(Debug, Default)]
+pub struct StepGate {
+    inner: std::sync::Mutex<GateInner>,
+    turn: std::sync::Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GateInner {
+    /// Next ticket to hand out.
+    next: u64,
+    /// The ticket whose turn it is right now.
+    serving: u64,
+}
+
+impl StepGate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Block until this caller's ticket comes up. The returned [`GatePass`] releases the baton to
+    /// the next ticket-holder on drop.
+    fn enter(&self) -> GatePass<'_> {
+        let mut g = self.inner.lock().expect("step gate poisoned");
+        let ticket = g.next;
+        g.next += 1;
+        while g.serving != ticket {
+            g = self.turn.wait(g).expect("step gate poisoned");
+        }
+        GatePass(self)
+    }
+}
+
+/// The baton itself — held for exactly one GPU step, released on drop (including on error/panic,
+/// which is why it is an RAII guard and not a pair of calls: a sequence that errors mid-step must
+/// not wedge every other sequence forever).
+pub(crate) struct GatePass<'a>(&'a StepGate);
+
+impl Drop for GatePass<'_> {
     fn drop(&mut self) {
-        REQUEST.with(|c| *c.borrow_mut() = self.0.take());
-        ABORT.with(|c| c.set(false));
+        // Poisoning: another sequence panicked mid-step. Advance anyway — refusing to would hang
+        // every remaining client on a queue that can never drain.
+        let mut g = match self.0.inner.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        g.serving += 1;
+        drop(g);
+        self.0.turn.notify_all();
     }
 }
 
-/// Ask the running decode loop to stop after the current token — the stop-sequence hit. Called from
-/// inside the `on_piece` callback (which returns `()` and so has no other way to say "done").
-pub fn request_abort() {
-    ABORT.with(|c| c.set(true));
-}
-
-/// Polled by the decode loop once per token (a thread-local `Cell` read — no allocation, no lock).
-pub(crate) fn abort_requested() -> bool {
-    ABORT.with(|c| c.get())
-}
-
-/// The RNG seed for this generation: the request's explicit `seed` wins, else `INFR_SEED`, else
-/// wall clock (see [`seed_rng`]).
-pub(crate) fn resolve_seed() -> u64 {
-    match with_request(|r| r.seed).flatten() {
+/// The RNG seed for this generation: the sequence's explicit `seed` wins, else `INFR_SEED`, else
+/// wall clock (see [`seed_rng`]). Per-SEQUENCE, so `seed: 42` reproduces byte-identically no matter
+/// how many other requests are in flight.
+pub(crate) fn resolve_seed(req: Option<&RequestCtx>) -> u64 {
+    match req.and_then(|r| r.sampling.seed) {
         Some(s) => s | 1, // xorshift64 state must be nonzero
         None => seed_rng(),
     }
@@ -199,8 +306,8 @@ pub(crate) struct Penalties {
 }
 
 impl Penalties {
-    pub(crate) fn resolve() -> Option<Self> {
-        let r = with_request(|r| r.clone())?;
+    pub(crate) fn resolve(req: Option<&RequestCtx>) -> Option<Self> {
+        let r = req.map(RequestCtx::sampling)?;
         if !r.penalties_active() {
             return None;
         }
@@ -412,4 +519,148 @@ pub(crate) fn sample_from_dist(dist: &[(u32, f32)], rng: &mut u64) -> u32 {
         }
     }
     last_id // float rounding: r landed a hair past the cumulative sum — take the last entry
+}
+
+// ---------------------------------------------------------------------------
+// Tests — per-SEQUENCE isolation (the thread-local bug catcher)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(temp: f32, seed: u64) -> RequestSampling {
+        RequestSampling {
+            temp: Some(temp),
+            seed: Some(seed),
+            ..Default::default()
+        }
+    }
+
+    /// **The regression test for the thread-local.**
+    ///
+    /// `RequestSampling` used to live in a `thread_local!` installed by an RAII `RequestScope`. That
+    /// is per-THREAD, not per-SEQUENCE, so the instant ONE thread steps several sequences — exactly
+    /// what a batched/interleaved scheduler does — every sequence reads whichever config was
+    /// installed last. Request A's temperature would silently apply to request B, and no existing
+    /// test would have caught it.
+    ///
+    /// So: interleave two sequences' sampling reads ON ONE THREAD (the batched-step shape) and
+    /// demand each still sees its own config. Under the old design this test fails; under explicit
+    /// per-sequence state it cannot.
+    #[test]
+    fn one_thread_stepping_two_sequences_keeps_their_sampling_separate() {
+        let a = RequestCtx::new(cfg(0.0, 42));
+        let b = RequestCtx::new(cfg(1.5, 7));
+
+        for _ in 0..8 {
+            // A step of sequence A, then a step of sequence B, then A again — one thread, both live.
+            assert_eq!(Sampler::resolve(Some(&a)).temp, 0.0, "A must keep temp 0");
+            assert_eq!(Sampler::resolve(Some(&b)).temp, 1.5, "B must keep temp 1.5");
+        }
+        assert_eq!(resolve_seed(Some(&a)), 42 | 1);
+        assert_eq!(resolve_seed(Some(&b)), 7 | 1);
+
+        // The abort latch (stop sequences) is per-sequence too: A hitting its stop string must not
+        // halt B.
+        a.abort();
+        assert!(abort_requested(Some(&a)), "A latched its own abort");
+        assert!(!abort_requested(Some(&b)), "B must NOT see A's abort");
+        // And a non-serve caller (run/bench/tests/goldens) has no latch at all.
+        assert!(!abort_requested(None));
+    }
+
+    /// `seed: 42` must reproduce byte-identically no matter how many other sequences are in flight.
+    /// Each sequence carries its OWN xorshift state, so interleaving another sequence's draws
+    /// between two of ours cannot perturb our stream.
+    #[test]
+    fn per_sequence_rng_is_reproducible_under_interleaving() {
+        let logits: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin()).collect();
+        let s = Sampler {
+            temp: 1.0,
+            top_k: 8,
+            top_p: 0.95,
+        };
+
+        // Sequence A, alone.
+        let a = RequestCtx::new(cfg(1.0, 42));
+        let mut rng_a = resolve_seed(Some(&a));
+        let alone: Vec<u32> = (0..16)
+            .map(|_| sample_logits(&logits, s, &mut rng_a))
+            .collect();
+
+        // Sequence A again — but now a second sequence B draws from the SAME thread between every
+        // one of A's draws (the interleaved-scheduler shape).
+        let a2 = RequestCtx::new(cfg(1.0, 42));
+        let b = RequestCtx::new(cfg(1.5, 7));
+        let mut rng_a2 = resolve_seed(Some(&a2));
+        let mut rng_b = resolve_seed(Some(&b));
+        let interleaved: Vec<u32> = (0..16)
+            .map(|_| {
+                let t = sample_logits(&logits, s, &mut rng_a2);
+                let _ = sample_logits(&logits, s, &mut rng_b); // B steps in between
+                t
+            })
+            .collect();
+
+        assert_eq!(
+            alone, interleaved,
+            "a seeded sequence must draw the same tokens whether or not it shares the engine"
+        );
+    }
+
+    /// Penalties are per-sequence state (their token history is), and a sequence that sets none must
+    /// stay on the untouched GPU-sampled hot path (`None`) even while another sequence has them on.
+    #[test]
+    fn penalties_are_per_sequence() {
+        let plain = RequestCtx::new(RequestSampling::default());
+        let penalized = RequestCtx::new(RequestSampling {
+            repeat_penalty: 1.5,
+            ..Default::default()
+        });
+        assert!(Penalties::resolve(Some(&plain)).is_none());
+        assert!(Penalties::resolve(Some(&penalized)).is_some());
+        assert!(Penalties::resolve(None).is_none());
+    }
+
+    /// The baton is mutually exclusive (only one sequence records on the GPU at a time) and FIFO
+    /// (a waiter cannot be starved). Mutual exclusion is the CORRECTNESS property — the Vulkan
+    /// command pool is externally synchronised.
+    #[test]
+    fn step_gate_is_mutually_exclusive_and_fifo() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = std::sync::Arc::new(StepGate::new());
+        let inside = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut hs = Vec::new();
+        for id in 0..4 {
+            let (gate, inside, max_seen, order) = (
+                gate.clone(),
+                inside.clone(),
+                max_seen.clone(),
+                order.clone(),
+            );
+            hs.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let _pass = gate.enter();
+                    let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(n, Ordering::SeqCst);
+                    order.lock().unwrap().push(id);
+                    std::thread::yield_now();
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "two sequences were inside the gate at once — the GPU command pool would be racing"
+        );
+        assert_eq!(order.lock().unwrap().len(), 100);
+    }
 }

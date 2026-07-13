@@ -20,6 +20,18 @@ use super::{as_vk_buf, be, VulkanBackend};
 /// the shader's `NUM_ROWS`.
 const MMV_NUM_ROWS: u32 = 1;
 
+/// State columns carried per subgroup by the token-serial DeltaNet scan; must match
+/// `deltanet_seq.comp`'s `NCOL`.
+///
+/// Raising NCOL cuts the redundant k̂/q̂ cache re-reads (every column-workgroup of a head reads the
+/// same row each token, ~1.07 GB/layer of L2 traffic at NCOL=1) and lets the NCOL reductions
+/// pipeline — but it divides the wave count by NCOL, and this kernel is latency-bound, so the two
+/// effects fight and the curve has an interior optimum. Measured, Ornith-35B pp512, scan total over
+/// the 30 DeltaNet layers: NCOL=1 → 10.07ms (2048 waves), NCOL=2 → 8.29ms (1024), NCOL=4 → 9.42ms
+/// (512), NCOL=8 → 14.06ms (256, register pressure). NOTE this is NOT a bandwidth-bound kernel: the
+/// 4x traffic cut from NCOL=1→4 bought only ~6%, which is what ruled the bandwidth theory out.
+pub(crate) const DN_SEQ_NCOL: usize = 2;
+
 /// `matmul_mmq_experts`' BM=64 → BM=32 row-tile crossover, in average rows-per-expert
 /// (`rows·n_used/n_expert`). Below this, the BM=32 `_xp32` kernel wins (less masked-tile waste);
 /// at/above it BM=64 (default) wins. Picked from `moe_expert_grid_bound_bench`'s tile sweep —
@@ -4554,6 +4566,119 @@ impl<'a> Recorder<'a> {
             2, // state (in/out) + out
             &p3,
             (nv * n_blk) as u32,
+        );
+    }
+
+    /// Token-serial gated-DeltaNet prefill with the state column REGISTER-resident (norm + gates +
+    /// seq). This is the default prefill path at `kd == 128`; `deltanet_chunked_split` remains the
+    /// fallback (and the `INFR_DN_CHUNK_SCAN=1` A/B).
+    ///
+    /// The chunked delta rule does not actually do less arithmetic than the plain recurrence (~420M
+    /// vs ~402M FMA per layer at qwen35/Ornith dims) — it only shortens the dependency chain, and it
+    /// pays for that with LDS-resident state, unrollable-blocking runtime trip counts, ~96 workgroup
+    /// barriers, and just nv·(vd/8)=256 workgroups. This form keeps the state in registers, uses
+    /// single-subgroup workgroups (zero barriers; the two kd-contractions are subgroupAdd), and
+    /// launches nv·vd = 2048 workgroups at the same total thread count. See deltanet_seq.comp.
+    ///
+    /// Scratch (caller-alloc'd, alloc_uninit-safe — every read slot is written by norm/gates):
+    /// kn/qn `[rows·nk·kd]` f32, bet/dec `[rows·nv]` f32. No dk/dq — the D/Dq chunk dot matrices
+    /// exist only for the chunked triangular solve, which this path does not perform.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deltanet_seq_split(
+        &self,
+        q: &dyn Buffer,
+        k: &dyn Buffer,
+        v: &dyn Buffer,
+        blog: &dyn Buffer,
+        alpha: &dyn Buffer,
+        acoef: &dyn Buffer,
+        dtbias: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        kn: &dyn Buffer,
+        qn: &dyn Buffer,
+        bet: &dyn Buffer,
+        dec: &dyn Buffer,
+        rows: usize,
+        nv: usize,
+        nk: usize,
+        kd: usize,
+        vd: usize,
+        eps: f32,
+    ) {
+        debug_assert_eq!(
+            kd, 128,
+            "deltanet_seq assumes kd == 128 (RPL=4 register shards); caller must fall back"
+        );
+        debug_assert!(
+            vd.is_multiple_of(DN_SEQ_NCOL),
+            "deltanet_seq's NCOL={DN_SEQ_NCOL} column blocking needs NCOL | vd, got vd={vd}"
+        );
+        // pass 1: norm — (token, k-head) grid, 32 lanes each
+        let kn_k = self
+            .be
+            .kernel_sg("deltanet_norm", crate::gemm::deltanet_norm_spv(), 4, 20, 32);
+        let mut p1 = [0u8; 20];
+        p1[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p1[4..8].copy_from_slice(&(nk as u32).to_ne_bytes());
+        p1[8..12].copy_from_slice(&(kd as u32).to_ne_bytes());
+        p1[12..16].copy_from_slice(&eps.to_ne_bytes());
+        p1[16..20].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
+        self.dispatch(
+            kn_k,
+            &[Self::vkb(q), Self::vkb(k), Self::vkb(kn), Self::vkb(qn)],
+            2, // kn, qn
+            &p1,
+            (rows * nk) as u32,
+        );
+        // pass 2: gates — flat rows·nv grid, 256 threads per workgroup
+        let kg = self.be.kernel(
+            "deltanet_gates_seq",
+            crate::gemm::deltanet_gates_seq_spv(),
+            6,
+            8,
+        );
+        let mut p2 = [0u8; 8];
+        p2[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p2[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        self.dispatch(
+            kg,
+            &[
+                Self::vkb(blog),
+                Self::vkb(alpha),
+                Self::vkb(acoef),
+                Self::vkb(dtbias),
+                Self::vkb(bet),
+                Self::vkb(dec),
+            ],
+            2, // bet, dec
+            &p2,
+            (rows * nv).div_ceil(256) as u32,
+        );
+        // pass 3: seq scan — one 32-lane workgroup per (value head, state column)
+        let ks = self
+            .be
+            .kernel_sg("deltanet_seq", crate::gemm::deltanet_seq_spv(), 7, 20, 32);
+        let mut p3 = [0u8; 20];
+        p3[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        p3[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
+        p3[8..12].copy_from_slice(&(nk as u32).to_ne_bytes());
+        p3[12..16].copy_from_slice(&(kd as u32).to_ne_bytes());
+        p3[16..20].copy_from_slice(&(vd as u32).to_ne_bytes());
+        self.dispatch(
+            ks,
+            &[
+                Self::vkb(kn),
+                Self::vkb(qn),
+                Self::vkb(v),
+                Self::vkb(bet),
+                Self::vkb(dec),
+                Self::vkb(state),
+                Self::vkb(out),
+            ],
+            2, // state (in/out) + out
+            &p3,
+            (nv * (vd / DN_SEQ_NCOL)) as u32,
         );
     }
 

@@ -1743,6 +1743,11 @@ const DELTANET_GATES_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_gates.spv"));
 const DELTANET_SCAN_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_scan.spv"));
+const DELTANET_NORM_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_norm.spv"));
+const DELTANET_GATES_SEQ_SPV_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_gates_seq.spv"));
+const DELTANET_SEQ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_seq.spv"));
 const CONV1D_SILU_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
 const CONV1D_SILU_PAR_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par.spv"));
@@ -2593,6 +2598,24 @@ pub(crate) fn deltanet_gates_spv() -> &'static [u32] {
 pub(crate) fn deltanet_scan_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_SCAN_SPV_BYTES))
+}
+/// SPIR-V for the sequential-DeltaNet NORM pass (q/k L2-normalize; prep without the D/Dq dots).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn deltanet_norm_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_NORM_SPV_BYTES))
+}
+/// SPIR-V for the sequential-DeltaNet GATES pass (β + per-token decay, flat rows·nv grid).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn deltanet_gates_seq_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_GATES_SEQ_SPV_BYTES))
+}
+/// SPIR-V for the token-serial DeltaNet SCAN with the state column register-resident.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn deltanet_seq_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(DELTANET_SEQ_SPV_BYTES))
 }
 /// SPIR-V for the CHUNKED gated-DeltaNet prefill (chunkwise delta rule, C=32).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

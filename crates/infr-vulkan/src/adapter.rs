@@ -2963,6 +2963,60 @@ fn lower_op(
                 *head_v as usize,
             );
             let chunked = rows_ >= 2 && std::env::var("INFR_NO_DN_CHUNK").is_err();
+            // DEFAULT prefill path: the token-serial scan with the state column register-resident
+            // (norm + gates + seq). The chunked delta rule was believed to win by doing ⌈rows/32⌉
+            // state sweeps instead of `rows`, but counted out it does NOT save arithmetic (~420M vs
+            // ~402M FMA per layer at Ornith dims: the chunk form trades state sweeps for the
+            // triangular solve + D/Dq contractions) — it only shortens the dependency chain, and it
+            // pays with LDS state, unroll-blocking runtime trip counts, ~96 workgroup barriers, and
+            // only nv·(vd/8)=256 workgroups (~2.7/CU on a 96-CU part → nothing to hide latency).
+            // The serial form keeps state in registers, has zero barriers (single-subgroup
+            // workgroups; the kd-contractions are subgroupAdd), and launches nv·vd=2048 workgroups.
+            // Measured on Ornith-35B pp512: deltanet_scan 31.7ms → deltanet_seq 6.0ms.
+            // Needs kd == 128 (RPL=4 register shards) — anything else falls back to chunked below.
+            // INFR_DN_CHUNK_SCAN=1 forces the old chunked-split path (A/B).
+            //
+            // NOTE no f16_coopmat gate: coopmat was only ever needed by deltanet_prep's D/Dq
+            // contractions, and this path never forms them. So DeltaNet prefill no longer needs
+            // coopmat at all — non-coopmat GPUs get the fast path too instead of being routed to
+            // the monolithic chunked kernel.
+            if chunked
+                && kd_ == 128
+                && vd_.is_multiple_of(crate::recorder::DN_SEQ_NCOL)
+                && std::env::var("INFR_DN_CHUNK_SCAN").is_err()
+                && std::env::var("INFR_NO_DN_SPLIT").is_err()
+            {
+                // alloc_uninit: every slot the scan reads is written by norm/gates first.
+                let kn =
+                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
+                let qn =
+                    be_.alloc_uninit((rows_ * nk_ * kd_ * 4).max(4), BufferUsage::Activations)?;
+                let bet = be_.alloc_uninit((rows_ * nv_ * 4).max(4), BufferUsage::Activations)?;
+                let dec = be_.alloc_uninit((rows_ * nv_ * 4).max(4), BufferUsage::Activations)?;
+                rec.deltanet_seq_split(
+                    r(*q)?,
+                    r(*k)?,
+                    r(*v)?,
+                    r(*b)?,
+                    r(*a)?,
+                    r(*a_coef)?,
+                    r(*dt_bias)?,
+                    r(*state)?,
+                    r(*dst)?,
+                    kn.as_ref(),
+                    qn.as_ref(),
+                    bet.as_ref(),
+                    dec.as_ref(),
+                    rows_,
+                    nv_,
+                    nk_,
+                    kd_,
+                    vd_,
+                    *eps,
+                );
+                transient.extend([kn, qn, bet, dec]);
+                return Ok(());
+            }
             // deltanet_chunked_split's prep pass (deltanet_prep.comp) is the ONLY DeltaNet shader
             // using coopmat (the D/Dq dot matrices); deltanet_chunked (monolithic) and deltanet
             // (sequential) are both scalar. `!caps.f16_coopmat` routes to the still-chunked

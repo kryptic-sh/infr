@@ -109,6 +109,11 @@ fn main() {
         ("deltanet_prep", "deltanet_prep", &[]),
         ("deltanet_gates", "deltanet_gates", &[]),
         ("deltanet_scan", "deltanet_scan", &[]),
+        // Token-serial prefill scan with the state column register-resident (norm + gates + seq).
+        // Replaces the chunked prep/gates/scan trio at kd==128; see deltanet_seq.comp.
+        ("deltanet_norm", "deltanet_norm", &[]),
+        ("deltanet_gates_seq", "deltanet_gates_seq", &[]),
+        ("deltanet_seq", "deltanet_seq", &[]),
         ("conv1d_silu", "conv1d_silu", &[]),
         ("conv1d_silu_par", "conv1d_silu_par", &[]),
         ("conv1d_shift", "conv1d_shift", &[]),

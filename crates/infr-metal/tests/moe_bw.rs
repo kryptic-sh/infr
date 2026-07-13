@@ -35,13 +35,18 @@ fn synth_q4k(n_elem: usize, seed: u32) -> Vec<u8> {
 fn moe_layer_wall() {
     // Qwen3-30B-A3B MoE layer: ne=2048, n_ff_exp=768, 128 experts, 8 used.
     let (ne, n_expert, n_used, nff) = (2048usize, 128usize, 8usize, 768usize);
+    let rows = std::env::var("INFR_METAL_MOE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1usize);
     let be = MetalBackend::new().unwrap();
 
     // CHAIN of layers in one graph (dst feeds the next op's x), so the timing reports the
     // MARGINAL per-layer cost inside a batched forward, not the fixed per-execute overhead.
-    let nlayers = 8usize;
+    let nlayers = if rows == 1 { 8usize } else { 1usize };
+    let shape = if rows == 1 { vec![ne] } else { vec![rows, ne] };
     let mut g = Graph::new();
-    let x = g.input(TensorDesc::new(vec![ne], DType::F32));
+    let x = g.input(TensorDesc::new(shape.clone(), DType::F32));
     let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
     let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
     let up = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q4K));
@@ -50,9 +55,9 @@ fn moe_layer_wall() {
     let mut dst = x;
     for l in 0..nlayers {
         dst = if l + 1 == nlayers {
-            g.output(TensorDesc::new(vec![ne], DType::F32))
+            g.output(TensorDesc::new(shape.clone(), DType::F32))
         } else {
-            g.internal(TensorDesc::new(vec![ne], DType::F32))
+            g.internal(TensorDesc::new(shape.clone(), DType::F32))
         };
         g.push(Op::MoeFfn {
             x: cur,
@@ -77,10 +82,20 @@ fn moe_layer_wall() {
         cur = dst;
     }
 
-    let xs: Vec<f32> = (0..ne).map(|i| (i % 13) as f32 * 0.01 - 0.06).collect();
-    let rw: Vec<f32> = (0..n_expert * ne)
-        .map(|i| (i % 17) as f32 * 0.001)
-        .collect();
+    // Identity router plus eight positive expert coordinates per row gives deterministic,
+    // balanced top-8 routing. At rows=256 every expert receives 16 live rows, exposing the
+    // grouped kernel's half-full 32-row tile without relying on random routing distribution.
+    let mut xs = vec![0.0f32; rows * ne];
+    for r in 0..rows {
+        for u in 0..n_used {
+            let e = (r * 17 + u * 37) % n_expert;
+            xs[r * ne + e] = 2.0 - u as f32 * 0.05;
+        }
+    }
+    let mut rw = vec![0.0f32; n_expert * ne];
+    for e in 0..n_expert {
+        rw[e * ne + e] = 1.0;
+    }
     let bound: Vec<(infr_core::tensor::TensorId, Vec<u8>)> = vec![
         (x, bytemuck::cast_slice(&xs).to_vec()),
         (router, bytemuck::cast_slice(&rw).to_vec()),
@@ -95,7 +110,7 @@ fn moe_layer_wall() {
         be.upload(b.as_ref(), bytes).unwrap();
         bufs.push((*id, b));
     }
-    let ob = be.alloc(ne * 4, BufferUsage::Activations).unwrap();
+    let ob = be.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
     bufs.push((dst, ob));
     let mut binds = Bindings::new();
     for (id, b) in &bufs {
@@ -108,7 +123,10 @@ fn moe_layer_wall() {
         be.execute(plan.as_ref(), &binds).unwrap();
     }
     be.sync().unwrap();
-    let reps = 50;
+    let reps = std::env::var("INFR_METAL_MOE_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if rows == 1 { 50 } else { 5 });
     let t0 = std::time::Instant::now();
     for _ in 0..reps {
         be.execute(plan.as_ref(), &binds).unwrap();
@@ -120,11 +138,12 @@ fn moe_layer_wall() {
     } else {
         "device"
     };
-    // Active bytes per token: 3 matmuls x n_used experts (q4k = 4.5 bpw -> 0.5625 B/elem).
+    // Dense-equivalent bytes: grouped GEMM reuses each expert's weights across routed rows.
     let mb = (3 * n_used * nff * ne) as f64 * 0.5625 / 1e6;
     println!(
-        "moe layer ({path}, marginal of {nlayers}-chain): {:.3} ms/op, active expert stream {mb:.1} MB -> {:.1} GB/s",
+        "moe layer ({path}, rows={rows}, marginal of {nlayers}-chain): {:.3} ms/op, dense-equivalent expert bytes {:.1} MB -> {:.1} effective GB/s",
         per * 1e3,
-        mb / 1e3 / per
+        mb * rows as f64,
+        mb * rows as f64 / 1e3 / per
     );
 }

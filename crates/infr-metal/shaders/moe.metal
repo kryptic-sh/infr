@@ -106,6 +106,8 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     uint lr1c = min(lr1, nr1 - 1u);                                                               \
     uint tident = ids[e * p.cap + tt0 + lr1c];                                                    \
     uint xrow = DIVROW ? (p.row0 + tident / p.n_used) : tident;                                   \
+    /* Preserve the full-band sequence; partial final tiles skip dead 8-row matrix fragments. */ \
+    uint row_base = 16u * (sgid >> 1);                                                            \
                                                                                                   \
     simdgroup_half8x8 ma[4];                                                                      \
     simdgroup_half8x8 mb[2];                                                                      \
@@ -143,12 +145,21 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
         threadgroup const half* lsmb = sb + 2u * 64u * (sgid >> 1);                               \
         for (uint ik = 0; ik < 4u; ik++) {                                                        \
             simdgroup_barrier(mem_flags::mem_none);                                               \
-            for (uint i = 0; i < 4u; i++) simdgroup_load(ma[i], lsma + 64u * i, 8);               \
-            simdgroup_barrier(mem_flags::mem_none);                                               \
-            for (uint i = 0; i < 2u; i++) simdgroup_load(mb[i], lsmb + 64u * i, 8);               \
-            simdgroup_barrier(mem_flags::mem_none);                                               \
-            for (uint i = 0; i < 8u; i++)                                                         \
-                simdgroup_multiply_accumulate(mc[i], mb[i >> 2], ma[i & 3u], mc[i]);              \
+            if (row_base + 8u < nr1) {                                                            \
+                for (uint i = 0; i < 4u; i++) simdgroup_load(ma[i], lsma + 64u * i, 8);           \
+                simdgroup_barrier(mem_flags::mem_none);                                           \
+                for (uint i = 0; i < 2u; i++) simdgroup_load(mb[i], lsmb + 64u * i, 8);           \
+                simdgroup_barrier(mem_flags::mem_none);                                           \
+                for (uint i = 0; i < 8u; i++)                                                     \
+                    simdgroup_multiply_accumulate(mc[i], mb[i >> 2], ma[i & 3u], mc[i]);           \
+            } else if (row_base < nr1) {                                                          \
+                for (uint i = 0; i < 4u; i++) simdgroup_load(ma[i], lsma + 64u * i, 8);           \
+                simdgroup_barrier(mem_flags::mem_none);                                           \
+                simdgroup_load(mb[0], lsmb, 8);                                                   \
+                simdgroup_barrier(mem_flags::mem_none);                                           \
+                for (uint i = 0; i < 4u; i++)                                                     \
+                    simdgroup_multiply_accumulate(mc[i], mb[0], ma[i], mc[i]);                    \
+            }                                                                                     \
             lsma += 8u * 64u;                                                                     \
             lsmb += 4u * 64u;                                                                     \
         }                                                                                         \

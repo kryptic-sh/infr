@@ -48,6 +48,14 @@ fn iq4nl_has_a_native_four_row_decode_body() {
 }
 
 #[test]
+fn moe_cmm_masks_inactive_matrix_row_fragments() {
+    let src = include_str!("../shaders/moe.metal");
+    assert!(src.contains("uint row_base = 16u * (sgid >> 1);"));
+    assert!(src.contains("if (row_base + 8u < nr1) {"));
+    assert!(src.contains("else if (row_base < nr1) {"));
+}
+
+#[test]
 #[ignore = "requires a Metal GPU"]
 fn every_dispatchable_kernel_exists_in_the_library() {
     let src = include_str!("../src/exec.rs");

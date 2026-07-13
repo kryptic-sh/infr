@@ -56,6 +56,14 @@ fn moe_cmm_masks_inactive_matrix_row_fragments() {
 }
 
 #[test]
+fn q5k_reconstructs_four_codes_per_word() {
+    let src = include_str!("../shaders/linear.metal");
+    assert!(src.contains("uint packed = (q & 0x0F0F0F0Fu)"));
+    assert!(src.contains("(h & 0x01010101u) << 4u"));
+    assert!(src.contains("packed >> 24u"));
+}
+
+#[test]
 #[ignore = "requires a Metal GPU"]
 fn every_dispatchable_kernel_exists_in_the_library() {
     let src = include_str!("../src/exec.rs");

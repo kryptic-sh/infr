@@ -40,6 +40,19 @@ fn synth_q6k(n_elem: usize, seed: u32) -> Vec<u8> {
     out
 }
 
+fn synth_q5k(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0);
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 176];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.05).to_le_bytes());
+        blk[2..4].copy_from_slice(&half::f16::from_f32(0.10).to_le_bytes());
+        blk[4..176].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 172));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
 fn bench(dtype: DType, wbytes: Vec<u8>, in_f: usize, out_f: usize, bpw: f64, label: &str) {
     let be = MetalBackend::new().unwrap();
     let m = 1usize;
@@ -118,6 +131,13 @@ fn gemv_bandwidth() {
         6.125,
         "quik4-ffn",
     );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn q5k_swar_probe() {
+    let wq5k = synth_q5k(65536 * 1152, 4);
+    bench_chained(DType::Q5K, &wq5k, 1152, 65536, 5.5, "q5k head");
 }
 
 fn synth_q5_0(n_elem: usize, seed: u32) -> Vec<u8> {

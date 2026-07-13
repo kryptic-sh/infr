@@ -199,14 +199,19 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
     }                                                                                             \
     float scale = d * (float)sc6;                                                                 \
     float mn = -(dmin * (float)m6);                                                               \
-    device const uchar* qh = blk + 16u;                                                           \
-    device const uchar* qs = blk + 48u + j * 32u;                                                 \
-    uint qhmask = 1u << s;                                                                        \
-    for (uint k = 0u; k < 16u; k++) {                                                             \
-        uint l = l0 + k;                                                                          \
-        uint nib = is_low ? (uint)(qs[l] & 0x0Fu) : (uint)(qs[l] >> 4);                           \
-        uint code = nib + ((qh[l] & qhmask) != 0u ? 16u : 0u);                                    \
-        wk[k] = scale * (float)code + mn;                                                         \
+    device const uchar* qh = blk + 16u + l0;                                                      \
+    device const uchar* qs = blk + 48u + j * 32u + l0;                                            \
+    device const uint* qh4 = (device const uint*)qh;                                               \
+    device const uint* qs4 = (device const uint*)qs;                                               \
+    uint qshift = is_low ? 0u : 4u;                                                               \
+    for (uint k = 0u; k < 4u; k++) {                                                              \
+        uint q = qs4[k] >> qshift;                                                                 \
+        uint h = qh4[k] >> s;                                                                      \
+        uint packed = (q & 0x0F0F0F0Fu) | ((h & 0x01010101u) << 4u);                              \
+        wk[4u * k]      = scale * (float)(packed & 0x1Fu) + mn;                                   \
+        wk[4u * k + 1u] = scale * (float)((packed >> 8u) & 0x1Fu) + mn;                            \
+        wk[4u * k + 2u] = scale * (float)((packed >> 16u) & 0x1Fu) + mn;                           \
+        wk[4u * k + 3u] = scale * (float)(packed >> 24u) + mn;                                    \
     }
 
 // NATIVE Q4_0 block (18 B / 32 elems): [f16 d][16 B nibbles] — 4.5 bpw streamed vs the

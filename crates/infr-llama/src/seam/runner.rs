@@ -917,14 +917,21 @@ pub(crate) fn generate_dense_backend(
     // Sampling: greedy unless INFR_TEMP is set (the CLI sets chat defaults for run/serve; the
     // golden/parity tests pin INFR_TEMP=0 or leave it unset). Defined BEFORE `build` — the
     // GPU-sampling ops bake the sampler config into the graph.
-    let sampler = crate::sampling::Sampler::from_env();
-    let mut rng = crate::sampling::seed_rng();
+    let sampler = crate::sampling::Sampler::resolve();
+    let mut rng = crate::sampling::resolve_seed();
+    // Repetition penalties (`infr serve`'s presence/frequency/repeat request fields). `None` for
+    // every non-serve caller AND for any request that leaves them at their neutral defaults — see
+    // `Penalties::resolve`. When active they must MUTATE the logits row, so they force the host
+    // sampling path below (exactly like a grammar constraint does).
+    let mut penalties = crate::sampling::Penalties::resolve();
+    let penalize = penalties.is_some();
     // GPU-resident greedy sampling (`Op::Argmax` appended to the decode graph): only the 4-byte
     // token id is read back per step — the [vocab] logits stay in VRAM (downloaded only for the
     // one-time `logits_out` hook). Grammar-constrained decodes need host logits every step
     // (llguidance masking). INFR_NO_GPU_ARGMAX forces the host path (A/B).
     let gpu_argmax = (sampler.temp <= 0.0 || sampler.top_k == 1)
         && constraint.is_none()
+        && !penalize
         && std::env::var("INFR_NO_GPU_ARGMAX").is_err();
     // GPU-resident stochastic sampling (`Op::Sample`): temperature + top-k + top-p ON the device,
     // inverse-CDF'd with a host-drawn uniform uploaded as 4 bytes/token — the host consumes the
@@ -935,6 +942,7 @@ pub(crate) fn generate_dense_backend(
         && sampler.temp > 0.0
         && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
         && constraint.is_none()
+        && !penalize
         && be.capabilities().gpu_sample
         && std::env::var("INFR_NO_GPU_SAMPLE").is_err();
 
@@ -3901,7 +3909,7 @@ pub(crate) fn generate_dense_backend(
                     cur.push(t);
                     decode_n += 1;
                 }
-                if done || out.len() >= max_new {
+                if done || out.len() >= max_new || crate::sampling::abort_requested() {
                     break;
                 }
             } else {
@@ -3911,8 +3919,16 @@ pub(crate) fn generate_dense_backend(
                     be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
                     u32::from_le_bytes(idb)
                 } else {
+                    // Serve-only: repetition penalties patch the row in place (no-op allocation-wise
+                    // — `penalties` is `None` on every other path, so this is one branch per token).
+                    if let Some(p) = penalties.as_ref() {
+                        p.apply(&mut logits);
+                    }
                     crate::sampling::sample_logits(&logits, sampler, &mut rng)
                 };
+                if let Some(p) = penalties.as_mut() {
+                    p.observe(next);
+                }
                 let is_eos = !ignore_eos && (c.eos_ids.contains(&next) || next == c.eos);
                 out.push(next);
                 decode_t += step_t0.elapsed();
@@ -3920,7 +3936,9 @@ pub(crate) fn generate_dense_backend(
                 if !is_eos {
                     on_token(next); // stream the token (EOS is not emitted)
                 }
-                if is_eos || out.len() >= max_new {
+                // `on_token` -> the server's stop-sequence matcher may have latched an abort (a stop
+                // string completed inside this token's text). One thread-local `Cell` read/token.
+                if is_eos || out.len() >= max_new || crate::sampling::abort_requested() {
                     break;
                 }
                 cur.push(next);

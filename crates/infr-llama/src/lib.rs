@@ -20,7 +20,7 @@ pub(crate) use util::*;
 mod kv;
 pub use kv::MoeConfig;
 pub mod grammar;
-pub(crate) mod sampling;
+pub mod sampling;
 pub use config::Config;
 mod weights;
 pub use weights::{weight_footprint, WeightFootprint};

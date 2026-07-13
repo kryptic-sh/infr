@@ -883,28 +883,47 @@ impl SeamGenerator {
     }
 }
 
+/// Map the validated request params onto the seam's per-request sampling scope. An ABSENT request
+/// field stays `None`/neutral, so the decode loop keeps inheriting the CLI's `INFR_TEMP` /
+/// `INFR_TOP_K` / `INFR_TOP_P` defaults for it — only an EXPLICIT field overrides.
+fn request_sampling(p: &infr_server::GenParams) -> infr_llama::sampling::RequestSampling {
+    infr_llama::sampling::RequestSampling {
+        temp: p.temperature,
+        top_k: p.top_k,
+        top_p: p.top_p,
+        seed: p.seed,
+        presence_penalty: p.presence_penalty.unwrap_or(0.0),
+        frequency_penalty: p.frequency_penalty.unwrap_or(0.0),
+        repeat_penalty: p.repeat_penalty.unwrap_or(1.0),
+        ..Default::default()
+    }
+}
+
 impl infr_server::ChatGenerator for SeamGenerator {
     fn chat(
         &mut self,
         messages: &[infr_engine::ChatMessage],
         tools_json: Option<&str>,
         tool_choice: Option<&str>,
-        max_tokens: Option<u32>,
+        params: &infr_server::GenParams,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<infr_server::Finish> {
         let tools: Option<serde_json::Value> = tools_json
             .map(serde_json::from_str)
             .transpose()
             .context("parsing request `tools`")?;
         let prompt = self.renderer.render(messages, tools.as_ref())?;
-        // The request's `max_tokens` wins; INFR_MAX_NEW (default 2048) is the server-side
-        // default for requests that don't set one.
-        let max_new = max_tokens.map(|v| v as usize).unwrap_or_else(|| {
+        // The request's `max_tokens`/`max_completion_tokens` wins; INFR_MAX_NEW (default 2048) is
+        // the server-side default for requests that don't set one.
+        let max_new = params.max_tokens.map(|v| v as usize).unwrap_or_else(|| {
             std::env::var("INFR_MAX_NEW")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2048usize)
         });
+        // Per-request sampling (temperature/top_p/top_k/seed/penalties) for the duration of THIS
+        // generation only — the guard restores the process default on drop, including on error.
+        let _scope = infr_llama::sampling::RequestScope::new(request_sampling(params));
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
         // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
@@ -942,14 +961,19 @@ impl infr_server::ChatGenerator for SeamGenerator {
                 }
             };
             if emitted {
-                return Ok(());
+                return Ok(infr_server::Finish::ToolCalls);
             }
             eprintln!(
                 "[tools] forced tool call produced no parseable call; falling back to unconstrained"
             );
         }
         let mut stream = infr_engine::ChatStream::new(tool_choice != Some("none"));
-        {
+        // Stop sequences run on the RAW decoded text, BEFORE the reasoning/tool splitter — so a
+        // stop string that spans two tokens still fires, and a partial stop prefix is held back
+        // instead of being streamed out (see `StopMatcher`). A hit latches an abort that the decode
+        // loop polls after the current token (`infr_llama::sampling::request_abort`).
+        let mut stops = infr_server::StopMatcher::new(params.stop.clone());
+        let stats = {
             let od = &mut *on_delta;
             // Template-prefilled thinking (the PROMPT ends with the `<think>` opener): inject a
             // synthetic opener so the splitter emits the head as Reasoning deltas, mirroring
@@ -957,12 +981,31 @@ impl infr_server::ChatGenerator for SeamGenerator {
             if infr_engine::prompt_prefills_think(&prompt) {
                 stream.push("<think>", &mut *od);
             }
-            self.model.generate(&prompt, max_new, &mut |piece: &str| {
-                stream.push(piece, &mut *od)
+            let stats = self.model.generate(&prompt, max_new, &mut |piece: &str| {
+                let safe = stops.push(piece);
+                if !safe.is_empty() {
+                    stream.push(&safe, &mut *od);
+                }
+                if stops.hit() {
+                    infr_llama::sampling::request_abort();
+                }
             })?;
-        }
+            // No stop fired: whatever the matcher was holding back was never a stop prefix.
+            let tail = stops.flush();
+            if !tail.is_empty() {
+                stream.push(&tail, &mut *od);
+            }
+            stats
+        };
         stream.finish(on_delta);
-        Ok(())
+        Ok(if stops.hit() {
+            infr_server::Finish::Stop
+        } else if stats.n_gen >= max_new {
+            // The budget was exhausted (EOS would have broken the loop earlier).
+            infr_server::Finish::Length
+        } else {
+            infr_server::Finish::Stop
+        })
     }
 }
 

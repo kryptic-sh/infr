@@ -1544,7 +1544,12 @@ impl MetalBackend {
                     None
                 };
                 let mut pr = self.prof.lock().unwrap();
-                pr.add_op(op_name(op), enc);
+                let name = if self.counter_set.is_some() {
+                    r.cur_op
+                } else {
+                    op_name(op)
+                };
+                pr.add_op(name, enc);
                 if let Some(gpu) = gpu {
                     pr.add_op_gpu(op_name(op), gpu);
                 }
@@ -2350,6 +2355,9 @@ impl MetalBackend {
                             let bres = self.ensure_device(r, res);
                             let bfd = self.dev_dst(r, fdst, out_f);
                             let pso = self.pipelines.get(fk)?;
+                            if self.counter_set.is_some() && m == 1 {
+                                r.cur_op = fk;
+                            }
                             self.encode_tg_off(
                                 r,
                                 &pso,
@@ -2370,6 +2378,9 @@ impl MetalBackend {
                             return Ok(());
                         }
                         let pso = self.pipelines.get(kern)?;
+                        if self.counter_set.is_some() && m == 1 {
+                            r.cur_op = kern;
+                        }
                         self.encode_tg_off(
                             r,
                             &pso,
@@ -2390,6 +2401,9 @@ impl MetalBackend {
                     // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
                     let bw = self.weight_buf(weight, g, bindings)?;
                     let pso = self.pipelines.get("linear_f32")?;
+                    if self.counter_set.is_some() && m == 1 {
+                        r.cur_op = "linear_f32";
+                    }
                     self.encode_tg_off(
                         r,
                         &pso,

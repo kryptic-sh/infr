@@ -318,7 +318,15 @@ mod tests {
         bindings.bind(greedy, greedy_buf.as_ref());
 
         let plan = be.compile(&g).unwrap();
+        let replay_capable = be.replay_capable(&g, &bindings);
         be.execute(plan.as_ref(), &bindings).unwrap();
+        if !replay_capable {
+            assert!(
+                be.replay.lock().unwrap().is_none(),
+                "a capability-capped device must stay on static execution"
+            );
+            return;
+        }
         let first_tape = {
             let replay = be.replay.lock().unwrap();
             let tape = replay.as_ref().expect("first execute must record a tape");

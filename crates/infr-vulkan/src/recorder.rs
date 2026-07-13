@@ -2529,11 +2529,26 @@ impl<'a> Recorder<'a> {
         eps: f32,
     ) {
         // 256-thread subgroup kernel (requiredSubgroupSize=32): more load/store parallelism and a
-        // single barrier vs the 64-thread WGSL shared-tree. ~2.6× faster as a kernel; end-to-end
-        // neutral here (decode is dispatch-latency-bound) but a win on slower/higher-latency GPUs.
-        let k = self
-            .be
-            .kernel_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32);
+        // single barrier vs the 64-thread WGSL shared-tree. ~2.6× faster as a kernel.
+        //
+        // DECODE (rows==1) takes the -DWIDE twin instead. The kernel is one-workgroup-per-row, so
+        // rows==1 is a SINGLE workgroup: at 256 threads that is 8 wave32s on one WGP with a ~21 KB
+        // row, i.e. memory-LATENCY bound with barely any requests in flight. Profiled on
+        // gemma-4-31B (dim 5376) it cost 10.5 us/dispatch — vs ~1.2 us for `add` over the SAME
+        // vector, which fans out to dim/64 workgroups — and 301 dispatches/token made it 8.9% of
+        // ALL decode GPU time. WIDE keeps the one workgroup (the reduction can't be split without a
+        // second dispatch) but runs it 1024-wide with vec4 loads: 4x the waves x 4x the bytes per
+        // request. Gate is exactly the decode hidden-norm shape — prefill (rows>1) already fills
+        // the GPU with row-workgroups, and the per-head Q/K/V norms (rows=n_head, small dim) would
+        // just idle 3/4 of the lanes, so both keep the 256-thread build.
+        let wide = rows == 1 && dim >= 2048 && dim % 4 == 0;
+        let k = if wide {
+            self.be
+                .kernel_sg("rmsnorm_wide", crate::gemm::rmsnorm_wide_spv(), 3, 12, 32)
+        } else {
+            self.be
+                .kernel_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32)
+        };
         let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());

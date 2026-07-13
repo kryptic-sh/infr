@@ -91,6 +91,9 @@ fn main() {
         ("attn_pv_warp", "attn_pv_warp", &[]),
         ("attn_pv_reduce", "attn_pv_reduce", &[]),
         ("rmsnorm", "rmsnorm", &[]),
+        // Decode twin of `rmsnorm`: 1024 threads + vec4 loads in the single rows==1 workgroup, to
+        // buy back the memory-level parallelism the 256-thread build lacks (see rmsnorm.comp).
+        ("rmsnorm", "rmsnorm_wide", &["-DWIDE"]),
         // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate, Op::GatedRmsNorm) —
         // same reduction as `rmsnorm`, one extra buffer + the gate multiply on store.
         ("rmsnorm", "rmsnorm_gate", &["-DGATE"]),

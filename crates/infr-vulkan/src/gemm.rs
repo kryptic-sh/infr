@@ -1951,6 +1951,18 @@ pub(crate) fn attn_pv_reduce_spv() -> &'static [u32] {
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
     RMSNORM_SPV.get_or_init(|| spv_words(RMSNORM_SPV_BYTES))
 }
+/// SPIR-V for the 1024-thread vec4 RMSNorm (`rmsnorm.comp`'s -DWIDE build) — the decode-shaped
+/// twin of [`rmsnorm_spv`], picked by the recorder when `rows==1 && dim>=2048 && dim%4==0`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn rmsnorm_wide_spv() -> &'static [u32] {
+    static RMSNORM_WIDE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
+    RMSNORM_WIDE_SPV.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/rmsnorm_wide.spv"
+        )))
+    })
+}
 /// SPIR-V for the fused per-head RMSNorm + SiLU gate multiply (`rmsnorm.comp`'s -DGATE build,
 /// `Op::GatedRmsNorm`) — the qwen35 DeltaNet z-gate, one dispatch instead of `rmsnorm`+`silu_mul`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

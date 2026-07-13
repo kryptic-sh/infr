@@ -34,20 +34,44 @@ use infr_engine::{ChatMessage, Delta, ToolCall};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+/// Why generation ended — the OpenAI `finish_reason`. The generator reports it; the handlers
+/// serialize it (a tool call still overrides to [`Finish::ToolCalls`] at the wire layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finish {
+    /// EOS, or a `stop` sequence fired.
+    Stop,
+    /// The `max_tokens` / `max_completion_tokens` budget was exhausted.
+    Length,
+    /// A tool call was emitted.
+    ToolCalls,
+}
+
+impl Finish {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Finish::Stop => "stop",
+            Finish::Length => "length",
+            Finish::ToolCalls => "tool_calls",
+        }
+    }
+}
+
 /// Generation backend the server drives — it never knows the model/GPU underneath. Implemented by
 /// the CLI's per-arch adapters (`infr-cli`'s `SeamGenerator` wraps any `infr_llama::ChatModel`,
 /// including `DiffusionGemmaChat` — see `docs/DIFFUSIONGEMMA.md`).
-/// `max_tokens` is the request's generation budget (OpenAI `max_tokens`); `None` leaves the
-/// generator's own default in charge.
+///
+/// [`GenParams`] carries the request's PER-REQUEST sampling config (temperature/top_p/top_k/seed/
+/// penalties/stop/max_tokens). Every field is an `Option` whose `None` means "inherit the process
+/// default" — so a request that sends nothing generates EXACTLY as it did before this existed.
 pub trait ChatGenerator: Send {
     fn chat(
         &mut self,
         messages: &[ChatMessage],
         tools_json: Option<&str>,
         tool_choice: Option<&str>,
-        max_tokens: Option<u32>,
+        params: &GenParams,
         on_delta: &mut dyn FnMut(Delta),
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Finish>;
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +79,9 @@ pub trait ChatGenerator: Send {
 // ---------------------------------------------------------------------------
 
 /// Top-level chat completion request (OpenAI wire format).
+///
+/// Unknown fields are IGNORED (no `deny_unknown_fields`) — an OpenAI client sending `n`, `user`,
+/// `logit_bias`, … must not 400. Known-but-invalid VALUES do 400, via [`GenParams::from_request`].
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -69,6 +96,253 @@ pub struct ChatRequest {
     pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// OpenAI's rename of `max_tokens`. Preferred when both are present.
+    #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Not in the OpenAI schema; llama.cpp/vLLM/Ollama all accept it and so do we.
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// `"\n"` or `["\n", "END"]` (OpenAI: up to 4).
+    #[serde(default)]
+    pub stop: Option<serde_json::Value>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// llama.cpp extension (1.0 = off).
+    #[serde(default)]
+    pub repeat_penalty: Option<f32>,
+}
+
+/// The validated, per-request generation config handed to [`ChatGenerator::chat`]. `None` fields
+/// mean "the request didn't say" — the generator leaves the process default (`INFR_TEMP` /
+/// `INFR_TOP_K` / `INFR_TOP_P` / `INFR_MAX_NEW`) in charge for exactly those.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GenParams {
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub seed: Option<u64>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    /// Already normalised: empty strings dropped (an empty stop would fire on the first token).
+    pub stop: Vec<String>,
+}
+
+/// An OpenAI-shaped 400: `{"error":{"message":..,"type":"invalid_request_error","param":..}}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamError {
+    pub param: &'static str,
+    pub message: String,
+}
+
+impl GenParams {
+    /// Validate + normalise the request's sampling fields. Out-of-range values are a 400, NEVER a
+    /// silent clamp and never a panic (OpenAI's own ranges: temperature 0..2, top_p 0..1,
+    /// presence/frequency -2..2, at most 4 stop sequences).
+    pub fn from_request(req: &ChatRequest) -> Result<Self, ParamError> {
+        let rng = |param: &'static str,
+                   v: Option<f32>,
+                   lo: f32,
+                   hi: f32|
+         -> Result<Option<f32>, ParamError> {
+            match v {
+                Some(x) if !x.is_finite() || x < lo || x > hi => Err(ParamError {
+                    param,
+                    message: format!("{param} must be between {lo} and {hi}, got {x}"),
+                }),
+                other => Ok(other),
+            }
+        };
+
+        let top_k = match req.top_k {
+            // 0 = "no top-k" in llama.cpp; negative is meaningless.
+            Some(k) if k < 0 => {
+                return Err(ParamError {
+                    param: "top_k",
+                    message: format!("top_k must be >= 0, got {k}"),
+                })
+            }
+            Some(k) => Some(k as usize),
+            None => None,
+        };
+
+        let stop = match &req.stop {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(a)) => {
+                let mut v = Vec::with_capacity(a.len());
+                for item in a {
+                    match item.as_str() {
+                        Some(s) => v.push(s.to_string()),
+                        None => {
+                            return Err(ParamError {
+                                param: "stop",
+                                message: "stop must be a string or an array of strings".into(),
+                            })
+                        }
+                    }
+                }
+                v
+            }
+            Some(_) => {
+                return Err(ParamError {
+                    param: "stop",
+                    message: "stop must be a string or an array of strings".into(),
+                })
+            }
+        };
+        if stop.len() > 4 {
+            return Err(ParamError {
+                param: "stop",
+                message: format!("at most 4 stop sequences are supported, got {}", stop.len()),
+            });
+        }
+        // An empty stop string would match at every position — drop it rather than dead-stop.
+        let stop: Vec<String> = stop.into_iter().filter(|s| !s.is_empty()).collect();
+
+        if let Some(p) = req.repeat_penalty {
+            if !p.is_finite() || p <= 0.0 {
+                return Err(ParamError {
+                    param: "repeat_penalty",
+                    message: format!("repeat_penalty must be > 0, got {p}"),
+                });
+            }
+        }
+
+        Ok(Self {
+            // OpenAI renamed `max_tokens` -> `max_completion_tokens`; the new name wins.
+            max_tokens: req.max_completion_tokens.or(req.max_tokens),
+            temperature: rng("temperature", req.temperature, 0.0, 2.0)?,
+            top_p: rng("top_p", req.top_p, 0.0, 1.0)?,
+            top_k,
+            seed: req.seed,
+            presence_penalty: rng("presence_penalty", req.presence_penalty, -2.0, 2.0)?,
+            frequency_penalty: rng("frequency_penalty", req.frequency_penalty, -2.0, 2.0)?,
+            repeat_penalty: req.repeat_penalty,
+            stop,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stop sequences
+// ---------------------------------------------------------------------------
+
+/// Incremental stop-sequence matcher over the DECODED text stream.
+///
+/// The hard part is that a stop string need not align with token boundaries: `"\n\n"` may arrive as
+/// `"\n"` + `"\n"`, and `"END"` as `"E"` + `"ND"`. Two rules make that work:
+///
+/// 1. **Match on the accumulated tail**, not on the individual piece — so a split stop still fires.
+/// 2. **Hold back** the longest suffix of the emitted text that is a PREFIX of some stop string.
+///    Streaming clients must never see `"E"` from a token that turns out to begin `"END"`; if the
+///    next piece completes the stop, that `"E"` was never ours to send. The hold-back is bounded by
+///    `longest_stop - 1` bytes, so at most 3-4 bytes of latency in practice.
+///
+/// On a hit, the text BEFORE the stop string is emitted and the stop string itself is discarded
+/// (OpenAI does not include it in the completion).
+#[derive(Debug, Default)]
+pub struct StopMatcher {
+    stops: Vec<String>,
+    /// Text seen but not yet emitted (a possible stop prefix).
+    held: String,
+    hit: bool,
+}
+
+impl StopMatcher {
+    pub fn new(stops: Vec<String>) -> Self {
+        Self {
+            stops: stops.into_iter().filter(|s| !s.is_empty()).collect(),
+            held: String::new(),
+            hit: false,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.stops.is_empty()
+    }
+
+    /// A stop sequence has fired: generation must halt and no further text may be emitted.
+    pub fn hit(&self) -> bool {
+        self.hit
+    }
+
+    /// Feed one decoded piece; returns the text that is now SAFE to emit (possibly empty).
+    pub fn push(&mut self, piece: &str) -> String {
+        if self.hit {
+            return String::new();
+        }
+        if self.stops.is_empty() {
+            return piece.to_string();
+        }
+        self.held.push_str(piece);
+
+        // 1. Full match anywhere in the held tail -> emit the head, drop the stop and the rest.
+        if let Some(cut) = self
+            .stops
+            .iter()
+            .filter_map(|s| self.held.find(s.as_str()))
+            .min()
+        {
+            self.hit = true;
+            let out = self.held[..cut].to_string();
+            self.held.clear();
+            return out;
+        }
+
+        // 2. No match: hold back the longest suffix that could still BECOME one.
+        let hold = self.longest_partial_suffix();
+        let split = self.held.len() - hold;
+        let out = self.held[..split].to_string();
+        self.held.drain(..split);
+        out
+    }
+
+    /// End of generation with no stop hit: whatever is still held was never a stop, so emit it.
+    pub fn flush(&mut self) -> String {
+        if self.hit {
+            return String::new();
+        }
+        std::mem::take(&mut self.held)
+    }
+
+    /// Length (bytes) of the longest suffix of `held` that is a proper prefix of some stop string.
+    /// Always lands on a char boundary: a suffix of `held` equal to `stop[..n]` starts at `stop`'s
+    /// first byte, which is a UTF-8 lead byte.
+    fn longest_partial_suffix(&self) -> usize {
+        let max = self
+            .stops
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1)
+            .min(self.held.len());
+        for n in (1..=max).rev() {
+            let start = self.held.len() - n;
+            if !self.held.is_char_boundary(start) {
+                continue;
+            }
+            let tail = &self.held[start..];
+            if self
+                .stops
+                .iter()
+                .any(|s| s.as_bytes().starts_with(tail.as_bytes()))
+            {
+                return n;
+            }
+        }
+        0
+    }
 }
 
 /// Normalise OpenAI `tool_choice` to a string the generator understands: `"auto"`/`"required"`/
@@ -290,8 +564,17 @@ async fn models_handler(State(state): State<AppState>) -> Json<ModelsResponse> {
 
 async fn chat_completions_handler(
     State(state): State<AppState>,
-    Json(req): Json<ChatRequest>,
+    body: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // Malformed JSON / wrong types: an OpenAI-shaped 400, not axum's default 422 text body.
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(e) => return param_error(None, e.body_text()),
+    };
+    let params = match GenParams::from_request(&req) {
+        Ok(p) => p,
+        Err(e) => return param_error(Some(e.param), e.message),
+    };
     let messages: Vec<ChatMessage> = req.messages.iter().map(dto_to_engine).collect();
     let tools_json: Option<String> = req.tools.as_ref().map(|v| v.to_string());
     let tool_choice: Option<String> = req.tool_choice.as_ref().and_then(tool_choice_str);
@@ -305,7 +588,7 @@ async fn chat_completions_handler(
             messages,
             tools_json,
             tool_choice,
-            req.max_tokens,
+            params,
             cid,
             model_id,
             created,
@@ -317,7 +600,7 @@ async fn chat_completions_handler(
             messages,
             tools_json,
             tool_choice,
-            req.max_tokens,
+            params,
             cid,
             model_id,
             created,
@@ -336,7 +619,7 @@ async fn non_streaming(
     messages: Vec<ChatMessage>,
     tools_json: Option<String>,
     tool_choice: Option<String>,
-    max_tokens: Option<u32>,
+    params: GenParams,
     cid: String,
     model_id: String,
     created: i64,
@@ -356,12 +639,12 @@ async fn non_streaming(
         let mut content = String::new();
         let mut tool_calls: Vec<OAIToolCall> = Vec::new();
 
-        engine
+        let finish = engine
             .chat(
                 &messages,
                 tools_json.as_deref(),
                 tool_choice.as_deref(),
-                max_tokens,
+                &params,
                 &mut |delta| match delta {
                     Delta::Reasoning(t) => reasoning.push_str(&t),
                     Delta::Content(t) => content.push_str(&t),
@@ -378,7 +661,7 @@ async fn non_streaming(
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        Ok((reasoning, content, tool_calls))
+        Ok((reasoning, content, tool_calls, finish))
     })
     .await
     .map_err(anyhow::Error::from)
@@ -386,12 +669,13 @@ async fn non_streaming(
 
     match result {
         Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Ok((reasoning, content, tool_calls)) => {
+        Ok((reasoning, content, tool_calls, finish)) => {
             let finish = if tool_calls.is_empty() {
-                "stop"
+                finish
             } else {
-                "tool_calls"
-            };
+                Finish::ToolCalls
+            }
+            .as_str();
             Json(ChatCompletionResponse {
                 id: cid,
                 object: "chat.completion",
@@ -440,7 +724,7 @@ async fn streaming(
     messages: Vec<ChatMessage>,
     tools_json: Option<String>,
     tool_choice: Option<String>,
-    max_tokens: Option<u32>,
+    params: GenParams,
     cid: String,
     model_id: String,
     created: i64,
@@ -478,13 +762,13 @@ async fn streaming(
         };
 
         let mut tc_index = 0usize;
-        let mut finish: &str = "stop";
+        let mut saw_tool_call = false;
 
-        let _ = engine.chat(
+        let res = engine.chat(
             &messages,
             tools_json.as_deref(),
             tool_choice.as_deref(),
-            max_tokens,
+            &params,
             &mut |delta| {
                 let payload = match delta {
                     Delta::Reasoning(t) => DeltaPayload {
@@ -503,7 +787,7 @@ async fn streaming(
                             function: OAIFunction { name, arguments },
                         };
                         tc_index += 1;
-                        finish = "tool_calls";
+                        saw_tool_call = true;
                         DeltaPayload {
                             tool_calls: Some(vec![tc]),
                             ..Default::default()
@@ -516,13 +800,19 @@ async fn streaming(
             },
         );
 
+        let finish = if saw_tool_call {
+            Finish::ToolCalls
+        } else {
+            res.unwrap_or(Finish::Stop)
+        };
+
         // Finish chunk: empty delta + finish_reason.
         let _ = handle.block_on(tx.send(Ok(sse_chunk(
             &cid,
             &model_id,
             created,
             DeltaPayload::default(),
-            Some(finish.into()),
+            Some(finish.as_str().into()),
         ))));
 
         // OpenAI SSE sentinel.
@@ -569,6 +859,18 @@ fn sse_chunk(
 fn json_error(status: StatusCode, msg: String) -> Response {
     let body = serde_json::json!({"error": {"message": msg, "type": "server_error"}});
     (status, Json(body)).into_response()
+}
+
+/// OpenAI-shaped 400 for a bad request parameter (`invalid_request_error`, with the offending
+/// `param` named). NOT a clamp and NOT a panic — see [`GenParams::from_request`].
+fn param_error(param: Option<&str>, msg: String) -> Response {
+    let body = serde_json::json!({"error": {
+        "message": msg,
+        "type": "invalid_request_error",
+        "param": param,
+        "code": serde_json::Value::Null,
+    }});
+    (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
 fn make_id() -> String {
@@ -1001,6 +1303,248 @@ mod tests {
         assert_eq!(v["data"][0]["id"], "my-model");
         assert_eq!(v["data"][0]["object"], "model");
         assert_eq!(v["data"][0]["owned_by"], "local");
+    }
+
+    // --- sampling param plumbing -------------------------------------------
+
+    fn req(raw: &str) -> ChatRequest {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn absent_sampling_fields_stay_none() {
+        // The whole point of Option-everything: a request that says nothing must not override the
+        // process defaults (INFR_TEMP/TOP_K/TOP_P), i.e. today's behavior is preserved exactly.
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(p, GenParams::default());
+    }
+
+    #[test]
+    fn sampling_fields_parse() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"temperature":0.0,"top_p":0.9,"top_k":40,"seed":42,
+                "presence_penalty":0.5,"frequency_penalty":-0.25,"repeat_penalty":1.1,
+                "stop":["\n\n","END"]}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.temperature, Some(0.0));
+        assert_eq!(p.top_p, Some(0.9));
+        assert_eq!(p.top_k, Some(40));
+        assert_eq!(p.seed, Some(42));
+        assert_eq!(p.presence_penalty, Some(0.5));
+        assert_eq!(p.frequency_penalty, Some(-0.25));
+        assert_eq!(p.repeat_penalty, Some(1.1));
+        assert_eq!(p.stop, vec!["\n\n".to_string(), "END".to_string()]);
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_not_rejected() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"n":1,"user":"bob","logit_bias":{},"logprobs":true}"#,
+        ))
+        .unwrap();
+        assert_eq!(p, GenParams::default());
+    }
+
+    #[test]
+    fn max_completion_tokens_is_preferred_alias() {
+        let p = GenParams::from_request(&req(r#"{"model":"m","messages":[],"max_tokens":10}"#))
+            .unwrap();
+        assert_eq!(p.max_tokens, Some(10));
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"max_completion_tokens":20}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.max_tokens, Some(20));
+        // Both present: the new name wins.
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"max_tokens":10,"max_completion_tokens":20}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.max_tokens, Some(20));
+    }
+
+    #[test]
+    fn stop_accepts_a_bare_string() {
+        let p =
+            GenParams::from_request(&req(r#"{"model":"m","messages":[],"stop":"\n"}"#)).unwrap();
+        assert_eq!(p.stop, vec!["\n".to_string()]);
+    }
+
+    #[test]
+    fn empty_stop_strings_are_dropped() {
+        // An empty stop would match at position 0 of every step — kill it at the door.
+        let p =
+            GenParams::from_request(&req(r#"{"model":"m","messages":[],"stop":["",""]}"#)).unwrap();
+        assert!(p.stop.is_empty());
+    }
+
+    #[test]
+    fn invalid_values_are_param_errors_not_clamps() {
+        for (raw, param) in [
+            (
+                r#"{"model":"m","messages":[],"temperature":-1}"#,
+                "temperature",
+            ),
+            (
+                r#"{"model":"m","messages":[],"temperature":3}"#,
+                "temperature",
+            ),
+            (r#"{"model":"m","messages":[],"top_p":5}"#, "top_p"),
+            (r#"{"model":"m","messages":[],"top_k":-2}"#, "top_k"),
+            (
+                r#"{"model":"m","messages":[],"presence_penalty":-3}"#,
+                "presence_penalty",
+            ),
+            (
+                r#"{"model":"m","messages":[],"frequency_penalty":9}"#,
+                "frequency_penalty",
+            ),
+            (
+                r#"{"model":"m","messages":[],"repeat_penalty":0}"#,
+                "repeat_penalty",
+            ),
+            (r#"{"model":"m","messages":[],"stop":[1,2]}"#, "stop"),
+            (
+                r#"{"model":"m","messages":[],"stop":["a","b","c","d","e"]}"#,
+                "stop",
+            ),
+        ] {
+            let e = GenParams::from_request(&req(raw)).unwrap_err();
+            assert_eq!(e.param, param, "{raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_temperature_returns_openai_shaped_400() {
+        let resp = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":-1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["param"], "temperature");
+    }
+
+    // --- StopMatcher: the token-boundary case -------------------------------
+
+    /// Drive a matcher over a token sequence, returning (emitted text, hit).
+    fn run_stops(stops: &[&str], pieces: &[&str]) -> (String, bool) {
+        let mut m = StopMatcher::new(stops.iter().map(|s| s.to_string()).collect());
+        let mut out = String::new();
+        for p in pieces {
+            out.push_str(&m.push(p));
+            if m.hit() {
+                break;
+            }
+        }
+        if !m.hit() {
+            out.push_str(&m.flush());
+        }
+        (out, m.hit())
+    }
+
+    #[test]
+    fn stop_within_one_token_fires_and_is_excluded() {
+        let (out, hit) = run_stops(&["END"], &["hello ", "END", " more"]);
+        assert!(hit);
+        assert_eq!(out, "hello ");
+    }
+
+    #[test]
+    fn stop_split_across_two_tokens_still_fires() {
+        // THE boundary case: "END" arrives as "E" + "ND". It must fire, and the partial "E" must
+        // NEVER have been emitted.
+        let (out, hit) = run_stops(&["END"], &["hello ", "E", "ND", " more"]);
+        assert!(hit, "a stop split across tokens must fire");
+        assert_eq!(out, "hello ", "no partial stop prefix may leak");
+    }
+
+    #[test]
+    fn stop_split_across_three_tokens_still_fires() {
+        let (out, hit) = run_stops(&["<|done|>"], &["a", "<|", "do", "ne", "|>", "b"]);
+        assert!(hit);
+        assert_eq!(out, "a");
+    }
+
+    #[test]
+    fn double_newline_stop_split_across_tokens() {
+        let (out, hit) = run_stops(&["\n\n"], &["line", "\n", "\n", "next"]);
+        assert!(hit);
+        assert_eq!(out, "line");
+    }
+
+    #[test]
+    fn stop_prefix_that_does_not_complete_is_eventually_emitted() {
+        // "E" looked like the start of "END" but turned out to be "Every" — it must still be
+        // delivered, exactly once, in order.
+        let (out, hit) = run_stops(&["END"], &["E", "very", " day"]);
+        assert!(!hit);
+        assert_eq!(out, "Every day");
+    }
+
+    #[test]
+    fn held_prefix_is_flushed_at_end_of_generation() {
+        // Generation ends while the matcher still holds a partial prefix -> flush must emit it.
+        let (out, hit) = run_stops(&["END"], &["done E"]);
+        assert!(!hit);
+        assert_eq!(out, "done E");
+    }
+
+    #[test]
+    fn multiple_stops_take_the_earliest_match() {
+        let (out, hit) = run_stops(&["World", "lo"], &["hel", "lo World"]);
+        assert!(hit);
+        assert_eq!(out, "hel");
+    }
+
+    #[test]
+    fn no_stops_is_a_passthrough() {
+        let (out, hit) = run_stops(&[], &["a", "b", "c"]);
+        assert!(!hit);
+        assert_eq!(out, "abc");
+        assert!(!StopMatcher::new(vec![]).is_active());
+    }
+
+    #[test]
+    fn multibyte_stop_split_mid_codepoint_is_safe() {
+        // Pieces are always whole UTF-8, but a stop's own bytes may straddle them: "→END" arriving
+        // as "→" + "END". Must fire without panicking on a char boundary.
+        let (out, hit) = run_stops(&["→END"], &["x", "→", "END", "y"]);
+        assert!(hit);
+        assert_eq!(out, "x");
+    }
+
+    #[test]
+    fn nothing_is_emitted_after_a_hit() {
+        let mut m = StopMatcher::new(vec!["END".into()]);
+        assert_eq!(m.push("aEND"), "a");
+        assert!(m.hit());
+        assert_eq!(m.push("more"), "");
+        assert_eq!(m.flush(), "");
+    }
+
+    // --- finish_reason ------------------------------------------------------
+
+    #[test]
+    fn finish_reason_strings() {
+        assert_eq!(Finish::Stop.as_str(), "stop");
+        assert_eq!(Finish::Length.as_str(), "length");
+        assert_eq!(Finish::ToolCalls.as_str(), "tool_calls");
     }
 
     // --- flatten_content unit tests ----------------------------------------

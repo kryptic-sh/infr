@@ -323,15 +323,24 @@ const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "The capital of France is",
         32,
-        // RE-BLESSED: Q4_K decode flipped default-on for AMD (the mmv_mw/mrow bit-identity fix —
-        // see adapter.rs's `unified_mmv_row1` / README footnote 3). This 0.6B model's gate_up/down
-        // projections cross the int8-decode tier's 2M-element gate, so their decode GEMV switched
-        // from f32-exact dequant to int8 dp4a — a real numerics change, not a bug: verified
-        // coherent, "<think>\nOkay, the user is asking about the capital of France. Let me think.
-        // I know that France is a country in Europe, and its capital is" (cut off by the 32-token
-        // budget mid-think; the previous golden's shorter think block answered "…Paris" within
-        // budget — same topic, different token path, both correct).
-        0xe91c03c96815974c,
+        // RE-BLESSED (2026-07-13) for `de987d7`: **Q6_K** joined the AMD int8-activation DECODE
+        // tier (`mmv_int8_decode_dtypes`). unsloth's Qwen3-0.6B-**Q4_K_M** is a MIXED GGUF — its
+        // tied lm_head/embed is Q6_K — so flipping Q6_K moved that tensor's decode GEMV from
+        // f32-exact dequant to int8 dp4a. Same class of real-but-benign numerics shift as the
+        // Q4_K re-blessing this comment used to describe: int8-activation rounding shifts a
+        // close-margin greedy argmax and the token path diverges, while the answer stays right.
+        //
+        // Verified coherent AND correct before re-blessing (greedy, same prompt):
+        //   "<think>\nOkay, the user is asking about the capital of France. I need to make sure I
+        //    recall the correct answer. France's capital is Paris. …"
+        //   → "The capital of France is **Paris**."
+        //
+        // MY PROCESS FAILURE, recorded so it isn't repeated: `de987d7` shipped this numerics flip
+        // and I did NOT re-bless — this golden has been RED on main ever since (found only when a
+        // later agent tripped over it). A precision-policy flip is exactly the change that stales a
+        // golden; re-bless it IN THE SAME COMMIT, with the generated text pasted in as proof, or
+        // don't ship the flip.
+        0xfd63781ea3bfa785,
     ),
     (
         "Explain how a computer works in simple terms.",

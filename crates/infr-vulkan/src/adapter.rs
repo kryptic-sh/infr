@@ -415,12 +415,11 @@ fn mmv_decode_enabled() -> bool {
 ///   `mmv_row1_bit_identical` (`tests/mmv_row1_bit_identical.rs`). Intel is UNCHANGED (still
 ///   `native_mmv_mw.comp`, SG=16-pinned, WARPS-tuned) — no Intel GPU in this validation
 ///   environment, so its already-shipped, already-tuned kernel is left alone rather than swapped
-///   blind; see [`unified_mmv_row1`]. **Q3_K** stays UNMEASURED on AMD (no Q3_K model in the
-///   validated local cache) — left OFF rather than assumed. **Q6_K was MEASURED and REJECTED** —
-///   see the dedicated note in the `None` arm below (it wins on raw throughput after the
-///   word-parallel `wdec` rewrite, but fails `mtp_spec_matches_target_only_greedy`). Both are
-///   bit-identical-safe to flip in isolation (same unified kernel path, `mmv_row1_bit_identical`
-///   passes for both) — bit-identity alone is not sufficient, see the Q6_K note.
+///   blind; see [`unified_mmv_row1`]. **Q6_K is now ON** (`de987d7`) — the word-parallel `wdec`
+///   rewrite turned its decode loss into a win, and the `mtp_spec_matches_target_only_greedy`
+///   failure that used to block it no longer gates anything: the MTP speculative path is PARKED
+///   (`infr_llama::mtp::mtp_enabled` returns false). **Q3_K stays OFF** — not for MTP reasons but
+///   for a real coherence cliff on mixed GGUFs; see the dedicated note in the `None` arm below.
 ///
 /// Symmetry (MTP-verify only): this policy set is ALSO what gates every dtype's entry into the
 /// m>=3 int8 `mrow` kernel for an MTP-VERIFY batch (`Graph::mtp_verify`, see
@@ -430,13 +429,18 @@ fn mmv_decode_enabled() -> bool {
 /// flips between the spec and non-spec streams). ORDINARY prefill is NOT gated by this set at all
 /// — see [`mrow_int8_prefill_dtypes`], which every dtype below is also a member of (this decode
 /// set is always a subset of the prefill set: prefill has no bit-identity partner to protect, so
-/// it never needs to be MORE conservative than decode). Concretely on AMD today: Q2_K/Q4_K int8 in
-/// both decode AND verify (the unified kernel makes them bit-identical, not just both-int8 — see
-/// [`unified_mmv_row1`]); Q3_K/Q5_K/Q6_K/IQ4_XS f32-exact in both decode AND verify, while all six
-/// take the int8 `mrow` kernel at ordinary prefill.
+/// it never needs to be MORE conservative than decode). Concretely on AMD today: Q2_K/Q4_K/Q6_K/
+/// Q4_0/Q5_0/Q5_1/IQ4_NL int8 in both decode AND verify (the unified kernel makes them
+/// bit-identical, not just both-int8 — see [`unified_mmv_row1`]); Q3_K/Q5_K/IQ4_XS/Q8_0/Q4_1
+/// f32-exact in both decode AND verify, while ALL of them take the int8 `mrow` kernel at ordinary
+/// prefill (every integer dtype is a measured prefill win — see [`mrow_int8_prefill_dtypes`]).
+/// NOTE: the MTP-verify half of this symmetry is currently DORMANT, not load-bearing — the
+/// speculative path is parked (`infr_llama::mtp::mtp_enabled`), so nothing dispatches a verify
+/// batch today. The invariant and its unit guard are kept green so re-enabling MTP is a policy
+/// question, not an archaeology exercise.
 ///
-/// `INFR_MMV_MW=1` force-enables the FULL measured-safe dtype set {Q4_K, Q6_K, Q2_K, Q3_K, Q5_K} on
-/// ANY vendor for A/B measurement (of the DECODE + MTP-verify tier only — ordinary prefill is
+/// `INFR_MMV_MW=1` force-enables EVERY dtype with an int8 decode arm (all 11) on ANY vendor for
+/// A/B measurement (of the DECODE + MTP-verify tier only — ordinary prefill is
 /// already unconditionally on for these dtypes and unaffected by this env); `INFR_MMV_MW=0`
 /// force-off everywhere (decode + verify only; prefill is instead controlled by the general
 /// `INFR_NO_MMV`/`INFR_NO_MROW` kill switches, same as any other mrow dtype). Both flow through
@@ -476,8 +480,9 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
         // bit-identical to its mrow verify twin via the unified rows=1 kernel — see
         // `unified_mmv_row1` — so mtp_spec_matches_target_only_greedy holds).
         //
-        // **Q6_K was TRIED default-on here and REVERTED** — record of a real, reproducible failure
-        // so it isn't re-attempted blind. `native_mmv_mrow.comp`'s FMT_Q6K `wdec` used to unpack its
+        // **Q6_K is ON** (`de987d7`) — but the road here is worth keeping, because the throughput
+        // fix and the accuracy blocker were two separate things and only one of them was a kernel
+        // problem. `native_mmv_mrow.comp`'s FMT_Q6K `wdec` used to unpack its
         // `ql`/`qh` bit-planes byte-at-a-time (8 `rb()` scalar loads per 32-elem sub-block, vs the
         // word-parallel nibble-mask loads every other k-quant format already used) — the prime
         // suspect for Q6_K's -25% AMD decode loss (44.3 int8 vs 58.9 f32 t/s, Qwen3-14B-Q6_K). That
@@ -489,8 +494,9 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
         // of an already-shipped win — Q6_K was already unconditional int8 at ordinary prefill via
         // [`mrow_int8_prefill_dtypes`], this rewrite just made that faster too).
         //
-        // But flipping Q6_K into THIS set (which also gates MTP-verify, see `mrow_int8_dtype_ok`)
-        // FAILS `mtp_spec_matches_target_only_greedy` on Qwen3.5-4B-MTP — reproducibly, in TWO
+        // What BLOCKED it for a while: flipping Q6_K into THIS set (which also gates MTP-verify, see
+        // `mrow_int8_dtype_ok`)
+        // FAILED `mtp_spec_matches_target_only_greedy` on Qwen3.5-4B-MTP — reproducibly, in TWO
         // configurations: (1) the full `INFR_MMV_MW=1` opt-in set {Q4K,Q6K,Q2K,Q3K,Q5K}, and (2) an
         // isolation probe with ONLY {Q4K,Q2K,Q6K} (Q3_K/Q5_K excluded, to rule out them being the
         // cause) — both diverge from target-only greedy within the first ~30 generated tokens on the
@@ -503,10 +509,15 @@ fn mmv_int8_decode_dtypes(caps: &infr_core::backend::Capabilities) -> &'static [
         // are computed at DIFFERENT sequence positions with different KV/context state even though
         // they share a kernel, so the same small per-token int8 rounding noise that any quantized
         // decode dtype carries (Q2_K/Q4_K pay it too, just rarely enough to not flip an argmax on
-        // the tests we run) was enough to flip a close-margin greedy token on this model/prompt. Not
-        // re-baselineable — the fix path is either an accuracy mitigation (int8 decode with an f32
-        // fallback near a logit-margin threshold?) or accepting the prefill-only win permanently, not
-        // a re-measure. Re-attempting needs that question answered, not just faster ALU.
+        // the tests we run) was enough to flip a close-margin greedy token on this model/prompt.
+        //
+        // HOW IT RESOLVED: not by fixing the noise. The MTP speculative path was PARKED
+        // (`infr_llama::mtp::mtp_enabled` — see its doc), which is the ONLY consumer that ever
+        // demanded verify/decode token-identity. With no verify batch in flight, Q6_K's decode win
+        // ships. The accuracy question is DEFERRED, not answered: if MTP is ever re-enabled, this
+        // exact failure comes back, and the fix path is an accuracy mitigation (int8 decode with an
+        // f32 re-verify near a tight top-2 logit margin?), not faster ALU. Do not re-enable MTP
+        // expecting the kernels to have fixed this.
         //
         // **Q3_K was TRIED default-on here and REVERTED** — record of a real, reproducible failure
         // so it isn't re-attempted blind. The case FOR it looked strong post-unification: decode is

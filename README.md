@@ -251,56 +251,70 @@ compare) and throughput is measured against the system `llama.cpp` build with
 `infr compare`.
 
 **Throughput vs llama.cpp** — ratios are `infr / llama.cpp` (**>1.0 = infr is
-faster**); r=3, 2026-07-12 snapshot (commit `8513358`, every model×quant in the
+faster**); r=3, 2026-07-13 snapshot (commit `51dd930`, every model×quant in the
 local cache, oracle `llama-bench` **b9957** on every row). Hardware: **AMD
 Radeon RX 7900 XTX** (RDNA3, 24 GB, Vulkan / RADV, Mesa). `pp512` = 512-token
 prefill throughput, `tg128` = 128-token decode throughput, `tg64@d4096` = decode
 at 4096 KV depth, `pp4@d4096` = short-turn prefill at 4096 KV depth (the
-multi-turn serve shape).
+multi-turn serve shape). **`pp512` is run-to-run noisy (±5%)** — infr's default
+prefill is nondeterministic in its tier/chunk choice (a known open issue), so
+treat small `pp512` deltas as noise, not signal.
 
-| Model                 | Quant       | pp512      | tg128     | tg64@d4096 | pp4@d4096 |
-| --------------------- | ----------- | ---------- | --------- | ---------- | --------- |
-| Qwen3-0.6B            | Q2_K        | **1.30×**  | **1.46×** | **1.36×**  | **2.17×** |
-| Qwen3-0.6B            | IQ4_XS      | **1.14×**  | **1.12×** | **1.19×**  | **2.01×** |
-| Qwen3-0.6B            | Q4_0        | **1.23×**  | **1.32×** | **1.28×**  | **2.16×** |
-| Qwen3-0.6B            | Q4_K_M      | **1.16×**  | **1.17×** | **1.23×**  | **2.01×** |
-| Qwen3-0.6B            | Q5_K_M      | **1.08×**  | **1.19×** | **1.23×**  | **2.04×** |
-| Qwen3-0.6B            | Q6_K        | **1.23×¹** | **1.10×** | **1.15×**  | **1.86×** |
-| Qwen3-0.6B            | Q8_0        | **1.25×**  | **1.18×** | **1.20×**  | **2.09×** |
-| Qwen3-0.6B            | BF16        | **1.08×**  | 0.87×     | 0.93×      | **1.83×** |
-| Qwen3.5-0.8B          | Q4_K_M      | **1.02×**  | **1.12×** | **1.06×**  | **1.74×** |
-| Gemma-3-1B            | Q2_K        | **1.16×**  | **1.09×** | **1.02×**  | **1.15×** |
-| Gemma-3-1B            | Q4_K_M      | **1.04×**  | **1.18×** | **1.09×**  | **1.16×** |
-| Gemma-3-1B            | Q8_0        | **1.44×**  | **1.25×** | **1.15×**  | **1.09×** |
-| Llama-3.2-1B          | Q4_K_M      | 0.99×      | 0.96×     | 0.88×      | 0.96×     |
-| Llama-3.2-1B          | Q8_0        | **1.05×**  | **1.05×** | 0.90×      | **1.01×** |
-| Qwen3-1.7B            | Q4_K_M      | **1.11×**  | **1.09×** | **1.13×**  | **1.70×** |
-| Qwen3.5-4B (MTP)²     | Q4_K_M      | 0.98×      | 0.93×     | 0.95×      | **1.64×** |
-| Qwen3.5-4B (MTP)²     | UD-Q4_K_XL  | **1.03×**  | 0.94×     | 0.95×      | **1.51×** |
-| Gemma-4-E2B           | Q4_K_M      | **1.14×**  | **1.06×** | 0.98×      | **1.01×** |
-| Qwen3-8B              | Q4_K_M      | **1.29×**  | 0.94×     | 0.93×      | **1.40×** |
-| Ornith-1.0-9B         | Q4_K_M      | **1.18×**  | 0.95×     | 0.96×      | **1.61×** |
-| Qwen3.5-9B            | Q4_K_M      | **1.17×**  | 0.96×     | 0.97×      | **1.54×** |
-| Qwen3.5-9B (MTP)²     | Q4_K_M      | **1.19×**  | 0.92×     | 0.93×      | **1.55×** |
-| Qwen3.5-9B (MTP)²     | UD-Q4_K_XL  | **1.16×**  | 0.93×     | 0.94×      | **1.44×** |
-| Gemma-3-12B           | Q4_K_M      | **1.25×**  | 1.00×     | **1.02×**  | **1.77×** |
-| Gemma-4-12B           | Q4_K_M      | **1.27×**  | 1.00×     | 0.99×      | **1.73×** |
-| Qwen3-14B             | Q2_K³       | **1.22×**  | 0.81×     | 0.78×      | **1.17×** |
-| Qwen3-14B             | Q4_K_M      | **1.12×**  | 0.92×     | 0.87×      | **1.30×** |
-| Qwen3-14B             | Q8_0        | **1.15×**  | **1.02×** | 0.97×      | **1.13×⁷** |
-| Gemma-4-26B-A4B (MoE) | UD-Q4_K_M   | **1.06×**  | **1.03×** | **1.04×**  | **1.52×** |
-| Qwen3.6-27B           | Q4_K_M      | **1.09×**  | 0.94×     | 0.93×      | **1.21×** |
-| Qwen3-30B-A3B (MoE)   | Q4_K_M      | 0.95×      | 0.94×     | 0.91×      | **1.17×** |
-| Gemma-4-31B           | UD-Q5_K_XL⁴ | 0.98×      | 0.88×     | 0.90×      | 0.84×     |
-| Ornith-1.0-35B        | Q4_K_M⁵     | 0.89×      | **1.02×** | **1.02×**  | **1.55×** |
-| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁶   | 0.90×      | 0.89×     | 0.90×      | **1.08×** |
-| Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | **1.02×**  | 0.98×     | 0.99×      | **1.51×** |
+| Model                 | Quant       | pp512     | tg128     | tg64@d4096 | pp4@d4096  |
+| --------------------- | ----------- | --------- | --------- | ---------- | ---------- |
+| Qwen3-0.6B            | Q2_K        | **1.32×** | **1.52×** | **1.35×**  | **2.21×**  |
+| Qwen3-0.6B            | IQ4_XS      | **1.24×** | **1.16×** | **1.21×**  | **2.02×**  |
+| Qwen3-0.6B            | Q4_0        | **1.20×** | **1.32×** | **1.27×**  | **2.23×**  |
+| Qwen3-0.6B            | Q4_K_M      | **1.14×** | **1.17×** | **1.22×**  | **2.09×**  |
+| Qwen3-0.6B            | Q5_K_M      | **1.16×** | **1.20×** | **1.23×**  | **2.11×**  |
+| Qwen3-0.6B            | Q6_K¹       | **1.20×** | **1.07×** | **1.15×**  | **1.87×**  |
+| Qwen3-0.6B            | Q8_0        | **1.32×** | **1.18×** | **1.20×**  | **2.06×**  |
+| Qwen3-0.6B            | BF16        | **1.11×** | 0.87×     | 0.93×      | **1.73×**  |
+| Qwen3.5-0.8B          | Q4_K_M      | **1.02×** | **1.12×** | **1.07×**  | **1.84×**  |
+| Gemma-3-1B            | Q2_K        | **1.18×** | **1.14×** | **1.05×**  | **1.14×**  |
+| Gemma-3-1B            | Q4_K_M      | **1.07×** | **1.25×** | **1.14×**  | **1.19×**  |
+| Gemma-3-1B            | Q8_0        | **1.43×** | **1.24×** | **1.20×**  | **1.14×**  |
+| Llama-3.2-1B          | Q4_K_M      | **1.02×** | 0.99×     | 0.89×      | **1.10×**  |
+| Llama-3.2-1B          | Q8_0        | **1.02×** | 1.00×     | 0.90×      | **1.11×**  |
+| Qwen3-1.7B            | Q4_K_M      | **1.12×** | **1.07×** | **1.11×**  | **1.81×**  |
+| Qwen3.5-4B (MTP)²     | Q4_K_M      | **1.03×** | 0.98×     | 0.99×      | **1.54×**  |
+| Qwen3.5-4B (MTP)²     | UD-Q4_K_XL  | **1.03×** | 0.99×     | 0.99×      | **1.67×**  |
+| Gemma-4-E2B           | Q4_K_M      | **1.14×** | **1.07×** | 0.99×      | **1.07×**  |
+| Qwen3-8B              | Q4_K_M      | **1.30×** | 0.96×     | 0.95×      | **1.48×**  |
+| Ornith-1.0-9B         | Q4_K_M      | **1.19×** | 0.99×     | **1.01×**  | **1.71×**  |
+| Qwen3.5-9B            | Q4_K_M      | **1.17×** | 0.99×     | 1.00×      | **1.50×**  |
+| Qwen3.5-9B (MTP)²     | Q4_K_M      | **1.19×** | 0.95×     | 0.96×      | **1.67×**  |
+| Qwen3.5-9B (MTP)²     | UD-Q4_K_XL  | **1.16×** | 0.97×     | 0.97×      | **1.56×**  |
+| Gemma-3-12B           | Q4_K_M      | **1.25×** | **1.02×** | **1.04×**  | **1.84×**  |
+| Gemma-4-12B           | Q4_K_M      | **1.26×** | **1.03×** | **1.02×**  | **1.82×**  |
+| Qwen3-14B             | Q2_K³       | **1.22×** | 0.81×     | 0.78×      | **1.56×**  |
+| Qwen3-14B             | Q4_K_M      | **1.12×** | 0.97×     | 0.91×      | **1.33×**  |
+| Qwen3-14B             | Q8_0        | **1.15×** | **1.02×** | 0.97×      | **1.18×⁷** |
+| Gemma-4-26B-A4B (MoE) | UD-Q4_K_M   | **1.08×** | **1.01×** | **1.03×**  | **1.52×**  |
+| Qwen3.6-27B           | Q4_K_M      | **1.09×** | 0.99×     | 0.98×      | **1.30×**  |
+| Qwen3-30B-A3B (MoE)   | Q4_K_M      | 0.95×     | 0.95×     | 0.92×      | **1.17×**  |
+| Gemma-4-31B           | UD-Q5_K_XL⁴ | 0.98×     | 0.91×     | 0.92×      | **1.24×**  |
+| Ornith-1.0-35B        | Q4_K_M⁵     | 0.89×     | 1.00×     | **1.01×**  | **1.57×**  |
+| Qwen3.6-35B-A3B (MoE) | UD-IQ3_S⁶   | 0.90×     | 0.89×     | 0.90×      | **1.38×**  |
+| Qwen3.6-35B-A3B (MoE) | UD-Q4_K_M   | **1.02×** | 0.99×     | 0.99×      | **1.57×**  |
 
-¹ The Q6_K `pp512` cell is a re-measure. The sweep run read 0.98× and an
-immediate re-run of the same binary read 1.23× — infr's default prefill is
-run-to-run nondeterministic in its tier/chunk choice (a known open issue), and
-this small-model row has the widest spread of any in the table. Treat ±5% on
-`pp512` as noise everywhere; this row's spread is larger than that.
+**`pp4@d4096` — the multi-turn serve shape — is now a WIN on every row in the
+table**, 1.07× to 2.23×. It used to carry three losses (Llama-3.2-1B 0.96×,
+Gemma-4-31B 0.84×, Qwen3-14B Q8_0 0.92×); the int8 dp4a GEMV rollout closed all
+three (footnotes ³ and ⁷). The remaining losses are concentrated in **decode**,
+where int8 buys the least (decode is weight-bandwidth bound, and the
+per-dispatch activation-quantize is dead weight at one row).
+
+¹ **Q6_K now decodes on the int8 tier too** (`f82d74e` + `de987d7`). It was the
+last format still unpacking its `ql`/`qh` bit-planes **byte-at-a-time** (8 scalar
+`rb()` loads per 32-element sub-block, where every other k-quant already read
+aligned u32s and masked in-register) — and it was the only format badly LOSING at
+decode (Qwen3-14B-Q6_K: 44.3 int8 vs 58.9 f32 t/s, **−25%**). Those two facts
+were the same fact. A word-parallel `wdec` rewrite (funnel-shifted `ru32u` word
+loads — Q6_K's 210-byte stride is 2 mod 4, so it needs the stitch — plus a SWAR
+`q−32` rebias) is **bit-identical** to the old byte loop and inverted the result:
+decode 44.3 → **64.3 t/s**, now BEATING f32's 58.4; prefill `pp4@d4096` 137.9 →
+**183.6** (+34%). Unpack ALU, not memory bandwidth, was the wall.
 
 ² **MTP speculative decode is currently DISABLED — see "MTP is parked" below.**
 These rows are the models' ORDINARY (non-speculative) numbers, which is how the
@@ -316,108 +330,46 @@ only covered the SWA `ring_past` case — so the op fell through to the scalar
 whole-prompt verify is the only shape that reliably lands `kv_len` within one
 tile-pad of the cache's row capacity.
 
-³ **Q2_K now decodes on the int8-activation tier by default on AMD**
-(`43806da`): tg128 0.74× → **0.81×**, tg64@d4096 0.72× → **0.78×**, and
-`pp4@d4096` 0.98× → **1.17×** (a loss turned into a win). This is the same trade
-llama.cpp takes — their `ggml_vk_should_use_mmvq` returns true for every quant
-type on AMD at `k >= 2048`, carving out only Q6_K (2-byte alignment, an
-Intel-only win) and Q8_0 (GCN only) — so matching it is parity, not a quality
-regression. infr's tier is **per-(dtype, vendor) with every entry measured on
-infr's own kernels** rather than inherited from llama.cpp's table (the two
-engines' kernels have different overheads, so a win on one does not imply a win
-on the other). It is also **symmetric**: any dtype on the int8 decode tier takes
-int8 in the MTP verify batch too — `mmv_int8_decode_dtypes` is the single source
-of truth both gates read, and a unit guard asserts they agree across every
-vendor × env combination. That symmetry is exactly the constraint footnote ²'s
-Q5_K attempt violated.
+³ **The int8-activation decode tier.** Quantizing the *activations* to int8 and
+integer-dotting them against the raw weight codes (`dotPacked4x8AccSatEXT`, the
+`mmvq` shape) avoids dequantizing weights to f32 at all. On AMD the tier is now
+default-on for **Q2_K, Q4_K, Q6_K, Q4_0, Q5_0, Q5_1, IQ4_NL**; **ordinary prefill
+takes it for every integer dtype** (all 12). This row (Qwen3-14B Q2_K) is what it
+bought at 2 bits: tg128 0.74× → **0.81×**, tg64@d4096 0.72× → **0.78×**,
+`pp4@d4096` 0.98× → **1.56×**.
 
-**Q4_K is deliberately NOT on the tier on AMD** — the throughput half of this is
-now FIXED, the correctness half is not, so it stays off by default. What was
-fixed: the old **−9.6%** (14B Q4_K_M tg64 78.5 → 71.0 t/s) is root-caused and
-closed. (1) infr's m=1 kernel unpacked Q4_K **byte-at-a-time**, where llama.cpp
-(and infr's own `mrow` kernel) read **aligned u32s** and nibble-mask 4 weights
-at a time; switching `native_mmv_mw.comp`'s Q4_K `dpsub` to the same
-word-parallel load measured **+5.8%, bit-identical output** (`mmv_mw_parity`).
-(2) A dispatch-shape sweep over `INFR_MMV_MW_WARPS` (rows/block) — llama.cpp
-runs Q4_K mmvq on AMD non-GCN at `rm_kq_int=1` (one output row per workgroup,
-single-subgroup reduce), infr had only ever tried {4, 8} warps/block — found
-WARPS=1 the clear winner over the full {1, 2, 4, 8, 16} sweep: 14B Q4_K_M tg64
-78.3 → **80.1 t/s (+2.3%)**, tg128 78.0 → 79.8, tg64@d4096 68.2 → 69.3. Int8
-Q4_K now genuinely beats infr's own f32 path.
+The single most useful thing learned here: **int8's value is row-count
+dependent, and the two directions are independent policies.** The cost of the
+tier is a per-dispatch activation-quantize pass; the benefit is the unpack ALU it
+saves. At m=1 (decode) the quantize is dead weight amortized over one row, so a
+dtype with a cheap unpack (Q8_0 — at 8 bits the stored byte already IS the dp4a
+operand) *loses*. At m≥3 (prefill) it amortizes hard and every integer dtype
+wins, by +21% to +67%. So a dtype can lose decode and win prefill by a mile, and
+infr ships two separate policy sets to say so — `mmv_int8_decode_dtypes` (m=1)
+and `mrow_int8_prefill_dtypes` (m≥3), in `crates/infr-vulkan/src/adapter.rs`.
+Conflating them is what used to keep Q3_K/Q5_K/Q6_K's large prefill wins
+unreachable: they were tied to an off-by-default decode tier.
 
-It still isn't shipped as the AMD default, because flipping it breaks
-`mtp_spec_matches_target_only_greedy`: infr's `mrow` kernel (m≥3 verify batch)
-has taken Q4_K int8 **unconditionally** since before this policy table existed
-(see the wart noted below), so turning on the m=1 decode tier makes BOTH streams
-int8 for the first time — and they still disagree on the occasional greedy
-token. The two kernels are different code (warp-per-row `subgroupAdd` vs
-row-tile accumulation); both quantize activations identically and dot the same
-integers per sub-block, but the cross-sub-block **summation order** differs, the
-same reassociation class `mmv_mw_parity` already tolerates at 5e-3 for
-throughput purposes — apparently wide enough here to flip an argmax across
-streams often enough to fail in 64 tokens. This is not a regression introduced
-by the fixes above: it reproduces on the pre-fix code too via the pre-existing
-`INFR_MMV_MW=1` escape, which nobody had run against the MTP symmetry test
-before. The lesson: **"both streams int8" is necessary but not sufficient for
-token-identity** — it also needs the two kernels bit-identical at the same
-position, and `mmv_mw`/`mrow` aren't. Making them so (e.g. porting `mmv_mw` to
-`mrow`'s row-tile accumulation, or vice versa) is a real kernel project, left
-open. Until then the fix + WARPS=1 stay reachable via
-`INFR_MMV_MW=1 INFR_MMV_MW_WARPS=1` for A/B measurement on non-MTP workloads,
-where the win is real (14B Q4_K_M: tg128 0.92× → 0.94×, tg64@d4096 0.87× →
-0.89×, both still short of llama.cpp parity but a real step, not a forced one).
-Q3_K stays off on AMD as **unmeasured** (no suitable model in the validated
-cache) — left off rather than assumed. **Q6_K was subsequently measured and
-rejected** (a later session, once a Q6_K model was cached):
-`native_mmv_mrow.comp`'s FMT_Q6K unpack was byte-at-a-time too (same bug
-class as Q4_K above), rewritten to a word-parallel `wdec` (bit-identical,
-proved by exhaustive byte-lane simulation plus
-`mmv_row1_bit_identical`/`mmv_mw_parity`), which closed the decode loss (14B
-Q6_K: 44.3 → ~61-64 t/s int8, now **beating** f32's 58.4) and widened the
-already-shipped prefill win (`pp4@d4096` 137.9 → ~183-184 vs 72.8 f32).
-Throughput fixed, but flipping it into the AMD decode-tier default still
-fails `mtp_spec_matches_target_only_greedy` — not a bit-identity bug (passes)
-and not a coherence cliff (three `gpu_seam_matches_cpu_*` golden tests,
-including one whose lm_head IS Q6_K, all stay coherent) but plain
-int8-activation quantization noise flipping a close-margin greedy token
-often enough across ~64 generated tokens on the MTP model. See
-`mmv_int8_decode_dtypes`'s doc in `crates/infr-vulkan/src/adapter.rs` for the
-full isolation record. Q6_K stays off the decode/MTP-verify tier; its prefill
-win ships unconditionally via `mrow_int8_prefill_dtypes`, unaffected by this.
+Every entry is **measured on infr's own kernels**, not inherited from
+llama.cpp's table — the two engines have different kernel overheads, so a win on
+one does not imply a win on the other. (llama.cpp's `ggml_vk_should_use_mmvq`
+returns true for every quant on AMD at `k >= 2048`, carving out only Q6_K and
+Q8_0, so taking this trade is parity with the oracle, not a quality regression.)
 
-**Former wart, now CLOSED**: Q4_K/Q6_K/IQ4_XS used to take the int8 `mrow`
-kernel at m≥3 **unconditionally**, while their m=1 decode stayed f32-exact on
-AMD — the same decode/verify asymmetry described above, pre-dating the policy
-table, live on every Q4_K/Q6_K/IQ4_XS MTP run. The fix is NOT "make m=1 int8
-too" (that was tried and rejected above — `mmv_mw`/`mrow` don't agree
-bit-for-bit at the same position even when both are int8) — it's recognizing
-that **ordinary prefill and MTP verify are different consumers with different
-constraints**, and the old code conflated them into one "m≥3" bucket. Only
-MTP-verify has a bit-identity contract to protect (it must match plain decode,
-`mtp_spec_matches_target_only_greedy`'s bar); ordinary prefill has no such
-partner and never needed to inherit verify's caution.
-`infr_core::graph::Graph::mtp_verify` (set only by the MTP driver's `run_verify`/
-`run_verify_full` batched forward, `crates/infr-llama/src/mtp/mod.rs`) threads
-that distinction down to kernel selection: `infr_vulkan::adapter::
-mrow_int8_dtype_ok(caps, dt, verify)` now takes an explicit `verify` flag and
-gates MTP-verify to the EXACT decode dtype set (`mmv_int8_decode_dtypes`) —
-Q6_K/IQ4_XS's verify batch now correctly falls back to f32-exact, matching
-their f32 decode — while ordinary prefill reads a SEPARATE, unconditional
-policy (`mrow_int8_dtype_ok`'s `verify: false` arm /
-`mrow_int8_prefill_dtypes`) that additionally unlocks Q3_K and Q5_K's prefill
-win (previously unreachable by default because it was tied to their off-by-
-default decode tier). `int8_decode_and_mrow_tiers_agree_on_policy_dtypes`
-(`crates/infr-vulkan/src/adapter.rs`) now asserts the STRONGER invariant across
-every dtype: decode int8 ⟺ MTP-verify int8, with no exemptions.
+**Q3_K stays OFF at decode** — and this is an accuracy result, not a perf one.
+Flipping it broke `gpu_seam_matches_cpu_qwen3_q2k` into **degenerate** output
+(`<think>` repeated to the token limit against the oracle's coherent answer).
+Cause: **GGUFs are mixed** — unsloth's Qwen3-0.6B-**Q2_K** file carries Q3_K
+tensors — so a "Q3_K" flip silently moved a 0.6B model's layers to int8, where
+accumulated quantization error is worst, and it fell off a coherence cliff. The
+cliff was then isolated to the *decode* side specifically: the same test run
+PREFILL-int8-only stays coherent and matches the CPU oracle token-for-token,
+while DECODE-int8-only reproduces the divergence exactly. So Q3_K's prefill win
+ships and its decode tier does not. **Q5_K** is off at decode on a plain
+throughput call (−1.4% decode, +45% prefill); its accuracy was never in
+question. Re-attempting Q3_K decode needs the accuracy question answered
+(per-tensor-role gating? a size floor?), not a re-measure.
 
-Before shipping Q3_K's prefill default, this session isolated whether the
-historical Q3_K accuracy cliff (below) was a decode-tier or prefill-tier
-problem, since the two are now independently switchable: `gpu_seam_matches_cpu_
-qwen3_q2k` run PREFILL-int8-only stayed coherent (bit-for-bit the passing CPU-
-oracle-matching golden); the SAME test run DECODE-int8-only reproduced the
-exact historical divergent output. The cliff is conclusively decode-side —
-Q3_K's ordinary-prefill int8 is safe and now default-on; its decode tier stays
-off pending its own measurement.
 
 ⁴ Gemma-4-31B (21.9 GiB weights on the 24 GB card) runs **fully resident,
 including at depth**, after two placement slices: try-resident-first dense
@@ -429,6 +381,12 @@ of 5.5). The d4096 row went 0.08× → 0.90× (28 vs 31 t/s). The same slice als
 reuses empty KV slots instead of forking a duplicate (`f74556c` — was silently
 wasting a full KV per session, 6.25 GiB on a 14B), and lifted the gemma-family
 multi-turn rows (12B `pp4@d4096` 1.40× → 1.66×: less dead KV to re-scan).
+
+This row's `pp4@d4096` was the table's worst loss at 0.84×; it is now **1.24×**,
+a win. That came from Q5_K's ordinary-prefill int8 tier (footnote ³) — this is a
+Q5_K_XL file, and Q5_K's prefill win (+45%) was previously unreachable because it
+was gated behind an off-by-default *decode* tier. Splitting the two policies
+banked it. Decode (0.91×/0.92×) is still a loss and is still the open work.
 
 ⁵ Ornith-35B's `pp512` 0.89× is the DeltaNet **scan** kernel: 4.6× slower than
 llama.cpp's fused GDN (31.3 vs 6.8 ms per 512 tokens), plus `expert_down` at ~13
@@ -459,7 +417,7 @@ table's three `pp4@d4096` LOSSES. Q8_0/Q4_0/Q5_0/Q4_1/Q5_1/IQ4_NL now have
 ones-dot against `sact`). Measured on Qwen3-14B (7900 XTX), int8 vs the f32
 GEMV that shipped before, **ordinary prefill** (`pp4@d4096`): Q4_0 **+66.9%**,
 Q5_0 **+64.0%**, Q5_1 **+42.2%**, Q4_1 **+32.9%**, Q8_0 **+28.8%** (128 → 158
-t/s — this row: 0.92× → **1.13×**), IQ4_NL **+20.7%**. **Decode** (`tg64`) is a
+t/s — this row: 0.92× → **1.18×**), IQ4_NL **+20.7%**. **Decode** (`tg64`) is a
 separate policy and splits: Q5_0 **+16.8%**, Q4_0 **+10.5%**, IQ4_NL **+6.3%**,
 Q5_1 **+6.1%** are default-ON; **Q8_0 −4.2%, and Q4_1 a wash, are default-OFF**
 (prefill-only). Q8_0's decode loss is structural, not a wart to fix — at 8 bits
@@ -518,26 +476,33 @@ correct; re-enabling MTP means making it pass again, which needs an accuracy
 mitigation (e.g. re-verify in f32 when the top-2 logit margin is tight), not
 faster kernels.
 
-**Where infr loses.** Three places, all understood:
+**Where infr loses.** Both prefill columns are now clean — `pp4@d4096` wins on
+every row, and `pp512` loses on only four. **Essentially all remaining losses are
+decode**, which is the honest summary of the int8 campaign: it was a prefill
+lever, and it has been pulled.
 
-- **Mid/large dense + Qwen MoE decode** (Q4_K_M rows) — the memory-bandwidth wall
-  is the residual here, but it is a smaller wall than we thought: decode GEMVs
-  run at 77–88% of DRAM peak, yet that figure was measured on the f32-activation
-  kernels, and these rows are partly **ALU-bound**. The int8 tier (footnote ³)
-  closed much of the gap; what remains is kernel shape. Correct full-expert
-  routing separately costs the Qwen MoEs some prefill batch efficiency.
-- **Qwen3-14B Q2_K decode** — improved by the int8-activation tier (footnote ³);
-  the residual is GEMV kernel shape, not the precision policy.
-- **Ornith-35B prefill** (0.89×) and **the IQ3_S MoE** (0.90×) — the DeltaNet
-  scan kernel (footnote ⁵) and the grid i-quant path (footnote ⁶), both known
-  kernel projects.
+- **Qwen3-14B Q2_K decode** (0.81× / **0.78×**) — the worst row in the table by a
+  clear margin, and the one to fix next. The int8 tier (footnote ³) lifted it
+  from 0.74×/0.72× but did not close it; the residual is GEMV kernel shape, not
+  the precision policy.
+- **Mid/large dense + Qwen MoE decode** (0.89–0.99×, a broad shallow band across
+  the 8B–35B Q4_K_M rows) — decode GEMVs run at 77–88% of DRAM peak, so this is
+  substantially the memory-bandwidth wall. But that figure was measured on
+  f32-activation kernels, and the int8 results prove these rows are *partly*
+  ALU-bound too. What remains is kernel shape. Correct full-expert routing
+  separately costs the Qwen MoEs some prefill batch efficiency (30B-A3B `pp512`
+  0.95×).
+- **Ornith-35B prefill** (0.89×) and **the IQ3_S MoE** (0.90× across the board) —
+  the DeltaNet scan kernel (footnote ⁵) and the grid i-quant path (footnote ⁶),
+  both known kernel projects, neither touched by the int8 work.
+- **BF16 decode** (0.87× / 0.93×) — the one non-integer row, and therefore the one
+  the int8 tier cannot help by construction. Nothing to unpack, no weight codes to
+  integer-dot.
+- **Llama-3.2-1B `tg64@d4096`** (0.89–0.90×) — an isolated small-model row with no
+  story beyond kernel shape; its prefill columns are wins.
 
-Two isolated rows also sit just under parity with no story beyond noise:
-Llama-3.2-1B Q4_K_M (0.96–0.99× across the board) and Gemma-4-31B, whose
-`pp4@d4096` 0.84× is the deepest multi-turn row in the table.
-
-**DiffusionGemma** (`dg-step`) beats the reference fork at 1.18× (52.5 vs 46.5
-t/s e2e at matched-ish 24/23 steps).
+**DiffusionGemma** (`dg-step`) beats the reference fork at 1.23× (this sweep;
+previously 1.18×).
 
 **Ternary-Bonsai (Q2_0) — infr is the only engine that runs these on a GPU.**
 llama.cpp merged the **Q2_0** weight dtype (GGML type 42) but shipped **no GPU

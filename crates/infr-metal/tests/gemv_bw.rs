@@ -163,30 +163,38 @@ fn synth_iq4nl(n_elem: usize, seed: u32) -> Vec<u8> {
 // Chained bench: K identical GEMVs over K DISTINCT weight copies in ONE graph (one command
 // buffer) — the per-cb commit+wait overhead amortizes away and the number reflects the
 // in-decode-chain cost. Distinct weights so the stream is not cache-resident.
-fn bench_chained(dtype: DType, wbytes: &[u8], in_f: usize, out_f: usize, bpw: f64, label: &str) {
+fn bench_chained_m(
+    dtype: DType,
+    wbytes: &[u8],
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    bpw: f64,
+    label: &str,
+) {
     let be = MetalBackend::new().unwrap();
     let k = 8usize;
-    let xs: Vec<f32> = (0..in_f).map(|i| (i % 7) as f32 * 0.01).collect();
+    let xs: Vec<f32> = (0..m * in_f).map(|i| (i % 7) as f32 * 0.01).collect();
 
     let mut g = Graph::new();
-    let x = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+    let x = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
     let ws: Vec<_> = (0..k)
         .map(|_| g.weight(TensorDesc::new(vec![out_f, in_f], dtype)))
         .collect();
-    let dst = g.output(TensorDesc::new(vec![1, out_f], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
     for w in &ws {
         g.push(Op::Linear {
             x,
             weight: *w,
             dst,
-            m: 1,
+            m: m as u32,
             in_f: in_f as u32,
             out_f: out_f as u32,
             w_off: 0,
         });
     }
 
-    let xb = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    let xb = be.alloc(m * in_f * 4, BufferUsage::Activations).unwrap();
     be.upload(xb.as_ref(), bytemuck::cast_slice(&xs)).unwrap();
     let mut wbs = Vec::new();
     for _ in 0..k {
@@ -194,7 +202,7 @@ fn bench_chained(dtype: DType, wbytes: &[u8], in_f: usize, out_f: usize, bpw: f6
         be.upload(wb.as_ref(), wbytes).unwrap();
         wbs.push(wb);
     }
-    let ob = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+    let ob = be.alloc(m * out_f * 4, BufferUsage::Activations).unwrap();
 
     let mut binds = Bindings::new();
     binds.bind(x, xb.as_ref());
@@ -212,11 +220,15 @@ fn bench_chained(dtype: DType, wbytes: &[u8], in_f: usize, out_f: usize, bpw: f6
     let dt = t0.elapsed().as_secs_f64() / (reps * k) as f64;
     let bytes = (out_f * in_f) as f64 * bpw / 8.0;
     println!(
-        "{label}: {out_f}x{in_f} chained -> {:.3} ms/gemv, {:.1} GB/s (stream {:.1} MB)",
+        "{label}: m={m} {out_f}x{in_f} chained -> {:.3} ms/gemv, {:.1} GB/s (stream {:.1} MB)",
         dt * 1e3,
         bytes / dt / 1e9,
         bytes / 1e6
     );
+}
+
+fn bench_chained(dtype: DType, wbytes: &[u8], in_f: usize, out_f: usize, bpw: f64, label: &str) {
+    bench_chained_m(dtype, wbytes, 1, in_f, out_f, bpw, label);
 }
 
 #[test]
@@ -238,6 +250,29 @@ fn gemv_bandwidth_gemma_shapes() {
     bench_chained(DType::Q8_0, &w8, 1152, 65536, 8.5, "q8_0 head/4");
     let wiq4 = synth_iq4nl(6912 * 1152, 15);
     bench_chained(DType::Iq4Nl, &wiq4, 1152, 6912, 4.5, "iq4_nl gate/up");
+    for m in 2..=8 {
+        bench_chained_m(
+            DType::Iq4Nl,
+            &wiq4,
+            m,
+            1152,
+            6912,
+            4.5,
+            "iq4_nl gate/up multirow",
+        );
+    }
+    let wiq4rt = synth_iq4nl(6911 * 1152, 18);
+    for m in 2..=8 {
+        bench_chained_m(
+            DType::Iq4Nl,
+            &wiq4rt,
+            m,
+            1152,
+            6911,
+            4.5,
+            "iq4_nl gate/up multirow rt",
+        );
+    }
     let wiq4d = synth_iq4nl(1152 * 6912, 17);
     bench_chained(DType::Iq4Nl, &wiq4d, 6912, 1152, 4.5, "iq4_nl down");
     let wiq4h = synth_iq4nl(65536 * 1152, 16);

@@ -914,6 +914,20 @@ fn linear_iq4nl_gemv_matches_dequant_reference() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn linear_iq4nl_multirow_matches_dequant_reference() {
+    let (m, in_f, out_f) = (8usize, 256usize, 94usize);
+    check_quant_linear_parity(DType::Iq4Nl, synth_iq4nl(out_f * in_f, 118), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq4nl_small_multirow_matches_dequant_reference() {
+    let (m, in_f, out_f) = (4usize, 256usize, 128usize);
+    check_quant_linear_parity(DType::Iq4Nl, synth_iq4nl(out_f * in_f, 117), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn linear_add_fusion_iq4nl_parity() {
     let (in_f, out_f) = (512usize, 384usize);
     check_linear_add_fusion(DType::Iq4Nl, synth_iq4nl(out_f * in_f, 120), in_f, out_f);

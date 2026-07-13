@@ -202,6 +202,16 @@ mod tests {
     }
 
     #[test]
+    fn iq4nl_small_multirow_prefers_rt() {
+        assert!(!prefer_iq4nl_rt("linear_iq4nl", 1));
+        for m in 2..=4 {
+            assert!(prefer_iq4nl_rt("linear_iq4nl", m));
+        }
+        assert!(!prefer_iq4nl_rt("linear_iq4nl", 5));
+        assert!(!prefer_iq4nl_rt("linear_q4_0", 2));
+    }
+
+    #[test]
     #[ignore = "requires a Metal GPU"]
     fn replay_gpu_decode_ops_observe_dynamic_inputs() {
         let be = MetalBackend::new().expect("Metal backend");
@@ -648,6 +658,10 @@ fn sample_split_groups(n: usize) -> Option<usize> {
 
 fn sample_split_shape(n: usize, top_k: usize) -> Option<(usize, usize)> {
     sample_split_groups(n).map(|groups| (groups, groups * top_k.min(64)))
+}
+
+fn prefer_iq4nl_rt(kern: &str, m: usize) -> bool {
+    kern == "linear_iq4nl" && (2..=4).contains(&m)
 }
 
 /// Classify the GPU-resident decode tail ops that may appear on an otherwise replayable graph.
@@ -2149,7 +2163,11 @@ impl MetalBackend {
                     // stream ONCE at GEMM rate; the row-tiled shape re-streams at ~1/3 the
                     // bandwidth: 140 ms vs ~45 ms per 8B verify forward). m == 1 keeps the
                     // exact-f32 GEMV (decode's precision contract).
+                    // IQ4_NL is the measured exception at m=2..4: its non-linear codebook keeps
+                    // the mostly-empty CMM tile decode-bound, while RT reuses each decoded block
+                    // across rows. Gemma 6912x1152 measured 39%/25%/8% faster; CMM wins at m=5.
                     let cmm_ok = m >= 2
+                        && !prefer_iq4nl_rt(qw.kern, m)
                         && out_f % 64 == 0
                         && self
                             .pipelines

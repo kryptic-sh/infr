@@ -2862,6 +2862,43 @@ fn argmax_f32_matches_cpu() {
         );
         assert_eq!(got[0].to_bits() as usize, peak, "argmax n={n}");
     }
+
+    let n = 151_936usize;
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![n], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![1], DType::F32));
+    g.push(Op::Argmax {
+        x,
+        dst,
+        n: n as u32,
+        rows: 1,
+    });
+    let mut xs = vec![-1.0f32; n];
+    xs[17] = 10.0;
+    xs[90_210] = 10.0;
+    let got = run(
+        &MetalBackend::new().unwrap(),
+        &g,
+        &[(x, f32_bytes(&xs))],
+        dst,
+        1,
+    );
+    assert_eq!(got[0].to_bits(), 17, "argmax must keep the lowest tie");
+
+    xs.fill(f32::NEG_INFINITY);
+    xs[90_210] = -1e35;
+    let got = run(
+        &MetalBackend::new().unwrap(),
+        &g,
+        &[(x, f32_bytes(&xs))],
+        dst,
+        1,
+    );
+    assert_eq!(
+        got[0].to_bits() as usize,
+        90_210,
+        "argmax must cover the full finite f32 range",
+    );
 }
 
 // sample_f32: temperature + top-k + top-p stochastic pick, with the uniform

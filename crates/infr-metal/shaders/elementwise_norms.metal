@@ -173,7 +173,7 @@ kernel void argmax_f32(device const float* logits [[buffer(0)]],
                        uint t [[thread_position_in_threadgroup]]) {
     threadgroup float sval[256];
     threadgroup uint  sidx[256];
-    float best = -1e30f;
+    float best = -INFINITY;
     uint bi = 0u;
     for (uint i = t; i < p.n; i += 256u) {
         if (logits[i] > best) { best = logits[i]; bi = i; }
@@ -185,6 +185,71 @@ kernel void argmax_f32(device const float* logits [[buffer(0)]],
         if (t < s && sval[t + s] > sval[t]) {
             sval[t] = sval[t + s];
             sidx[t] = sidx[t + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t == 0u) { out_id[0] = sidx[0]; }
+}
+
+struct ArgmaxSplitParams { uint n; uint chunk; };
+kernel void argmax_f32_stage1(device const float* logits [[buffer(0)]],
+                              device float*       out_val [[buffer(1)]],
+                              device uint*        out_idx [[buffer(2)]],
+                              constant ArgmaxSplitParams& p [[buffer(3)]],
+                              uint t [[thread_position_in_threadgroup]],
+                              uint group [[threadgroup_position_in_grid]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    uint base = group * p.chunk;
+    uint end = min(base + p.chunk, p.n);
+    float best = -INFINITY;
+    uint bi = base;
+    for (uint i = base + t; i < end; i += 256u) {
+        float v = logits[i];
+        if (v > best || (v == best && i < bi)) { best = v; bi = i; }
+    }
+    sval[t] = best;
+    sidx[t] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s /= 2u) {
+        if (t < s) {
+            float v = sval[t + s];
+            uint i = sidx[t + s];
+            if (v > sval[t] || (v == sval[t] && i < sidx[t])) {
+                sval[t] = v;
+                sidx[t] = i;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (t == 0u) { out_val[group] = sval[0]; out_idx[group] = sidx[0]; }
+}
+
+kernel void argmax_f32_stage2(device const float* values [[buffer(0)]],
+                              device const uint*  indices [[buffer(1)]],
+                              device uint*        out_id  [[buffer(2)]],
+                              constant ArgmaxParams& p    [[buffer(3)]],
+                              uint t [[thread_position_in_threadgroup]]) {
+    threadgroup float sval[256];
+    threadgroup uint  sidx[256];
+    float best = -INFINITY;
+    uint bi = 0u;
+    for (uint i = t; i < p.n; i += 256u) {
+        float v = values[i];
+        uint idx = indices[i];
+        if (v > best || (v == best && idx < bi)) { best = v; bi = idx; }
+    }
+    sval[t] = best;
+    sidx[t] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 0u; s /= 2u) {
+        if (t < s) {
+            float v = sval[t + s];
+            uint i = sidx[t + s];
+            if (v > sval[t] || (v == sval[t] && i < sidx[t])) {
+                sval[t] = v;
+                sidx[t] = i;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

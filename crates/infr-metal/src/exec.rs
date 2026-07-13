@@ -158,6 +158,14 @@ mod tests {
     }
 
     #[test]
+    fn argmax_split_policy_only_targets_vocab_scale_inputs() {
+        assert_eq!(argmax_split_groups(151_936), Some(38));
+        assert_eq!(argmax_split_groups(32_768), Some(8));
+        assert_eq!(argmax_split_groups(8_192), None);
+        assert_eq!(argmax_split_groups(4_099), None);
+    }
+
+    #[test]
     #[ignore = "requires a Metal GPU"]
     fn replay_gpu_decode_ops_observe_dynamic_inputs() {
         let be = MetalBackend::new().expect("Metal backend");
@@ -581,6 +589,12 @@ fn metal_embed_gather_kern(dt: DType) -> Option<&'static str> {
         DType::Iq4Xs => Some("embed_gather_iq4xs"),
         _ => None,
     }
+}
+
+const ARGMAX_SPLIT_CHUNK: usize = 4096;
+
+fn argmax_split_groups(n: usize) -> Option<usize> {
+    (n > 8192).then(|| n.div_ceil(ARGMAX_SPLIT_CHUNK))
 }
 
 /// Classify the GPU-resident decode tail ops that may appear on an otherwise replayable graph.
@@ -2705,9 +2719,36 @@ impl MetalBackend {
                 }
                 let bx = self.ensure_device(r, x);
                 let bd = self.dev_dst(r, dst, 1);
-                let pso = self.pipelines.get("argmax_f32")?;
-                let p = n.to_ne_bytes().to_vec();
-                self.encode_tg_w(r, &pso, &[bx.as_ref(), bd.as_ref()], 1 << 1, &p, 256, 256);
+                if let Some(groups) = argmax_split_groups(n as usize) {
+                    let values = self.scratch_buf(groups, 9);
+                    let indices = self.scratch_buf(groups, 10);
+                    let mut p = n.to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(ARGMAX_SPLIT_CHUNK as u32).to_ne_bytes());
+                    let stage1 = self.pipelines.get("argmax_f32_stage1")?;
+                    self.encode_tg_w(
+                        r,
+                        &stage1,
+                        &[bx.as_ref(), values.as_ref(), indices.as_ref()],
+                        (1 << 1) | (1 << 2),
+                        &p,
+                        groups * 256,
+                        256,
+                    );
+                    let stage2 = self.pipelines.get("argmax_f32_stage2")?;
+                    self.encode_tg_w(
+                        r,
+                        &stage2,
+                        &[values.as_ref(), indices.as_ref(), bd.as_ref()],
+                        1 << 2,
+                        &(groups as u32).to_ne_bytes(),
+                        256,
+                        256,
+                    );
+                } else {
+                    let pso = self.pipelines.get("argmax_f32")?;
+                    let p = n.to_ne_bytes().to_vec();
+                    self.encode_tg_w(r, &pso, &[bx.as_ref(), bd.as_ref()], 1 << 1, &p, 256, 256);
+                }
                 r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::ArgmaxProb { .. } => {

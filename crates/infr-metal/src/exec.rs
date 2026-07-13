@@ -130,6 +130,20 @@ mod tests {
             Some(false),
         );
     }
+
+    #[test]
+    fn embed_gather_msl_reads_raw_i32_ids() {
+        let src = include_str!("../shaders/embed_gather.metal");
+        assert_eq!(
+            src.matches("device const int*").count(),
+            3,
+            "quant, f16, and bf16 gather entry points must share the raw-i32 ID ABI",
+        );
+        assert!(
+            !src.contains("device const float*  ids"),
+            "numeric-f32 IDs require a host mirror and cannot be replayed",
+        );
+    }
 }
 
 /// Where a tensor's current value lives. GPU ops keep their results on the device and only pay a
@@ -2229,10 +2243,9 @@ impl MetalBackend {
             // wider (Q4_1/Q5_1/Q2_K/Q3_K/Q5_K have factored-only Metal decode): those return
             // Unsupported here and fail loudly rather than silently gathering garbage.
             //
-            // `ids` reaches the device as f32 NUMERIC token ids: the graph declares it I32, the
-            // host mirror widens it via bytes_to_f32, and `ensure_device` uploads that f32
-            // vector (an EmbedGather graph never records a tape — replay_shape rejects the op —
-            // so the mirror is always the source; the kernels read `device const float*`).
+            // `ids` stays in its bound raw-I32 buffer. That buffer is stable across per-token
+            // replay, and its bytes also match the uint token ID written by Argmax/Sample when
+            // the runner aliases sampler output to the next gather input.
             Op::EmbedGather {
                 ids,
                 table,
@@ -2249,7 +2262,7 @@ impl MetalBackend {
                 })?;
                 let (rows_u, ne_u) = (rows as usize, ne as usize);
                 let bt = metal_buf(bindings.get(table).expect("metal backend: unbound Weight"));
-                let bi = self.ensure_device(r, ids);
+                let bi = metal_buf(bindings.get(ids).expect("metal backend: unbound token IDs"));
                 let bd = self.dev_dst(r, dst, rows_u * ne_u);
                 let pso = self.pipelines.get(kern)?;
                 let mut p = rows.to_ne_bytes().to_vec();
@@ -2258,7 +2271,7 @@ impl MetalBackend {
                 self.encode_tg_w(
                     r,
                     &pso,
-                    &[&bt.raw, bi.as_ref(), bd.as_ref()],
+                    &[&bt.raw, &bi.raw, bd.as_ref()],
                     1 << 2,
                     &p,
                     rows_u * 32,

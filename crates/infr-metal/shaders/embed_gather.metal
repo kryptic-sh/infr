@@ -7,11 +7,9 @@
 // the GEMV/RT/CMM family uses (defined in linear.metal, which MUST precede this file in the MSL
 // concatenation), so the dequant math is bit-identical to the linear path by construction.
 //
-// `ids` is bound as f32 NUMERIC token ids: the Metal executor's host mirror widens the graph's
-// I32 input via bytes_to_f32 and `ensure_device` uploads that f32 vector (a graph containing
-// Op::EmbedGather never records a replay tape — replay_shape rejects it — so the per-execute
-// mirror is always the source). Token ids < 2^24 are exact in f32. (Vulkan reads the raw i32
-// buffer instead; the representations differ per backend by design.)
+// `ids` is the graph's raw I32 input buffer. Keeping the native representation lets a recorded
+// decode tape read the host's current token upload directly, and matches the uint bit pattern
+// written by Op::Argmax / Op::Sample when their output aliases the next gather's input.
 //
 // `scale` bakes Gemma's sqrt(n_embd) embed scaling (1.0 elsewhere).
 struct EmbedGatherParams {
@@ -25,7 +23,7 @@ struct EmbedGatherParams {
 // n_embd % 32 == 0, and GGUF rows are whole blocks of the stored format).
 #define EMBED_GATHER_KERNEL(NAME, DEC)                                                            \
 kernel void NAME(device const uchar*  codes [[buffer(0)]],                                       \
-                 device const float*  ids   [[buffer(1)]],                                       \
+                 device const int*    ids   [[buffer(1)]],                                       \
                  device float*        dst   [[buffer(2)]],                                       \
                  constant EmbedGatherParams& p [[buffer(3)]],                                    \
                  uint gid [[thread_position_in_grid]]) {                                         \
@@ -55,7 +53,7 @@ EMBED_GATHER_KERNEL(embed_gather_iq4xs, DEC16_IQ4XS)
 
 // f16 table: contiguous half rows, dequant is a plain widen.
 kernel void embed_gather_f16(device const half*   table [[buffer(0)]],
-                             device const float*  ids   [[buffer(1)]],
+                             device const int*    ids   [[buffer(1)]],
                              device float*        dst   [[buffer(2)]],
                              constant EmbedGatherParams& p [[buffer(3)]],
                              uint gid [[thread_position_in_grid]]) {
@@ -69,7 +67,7 @@ kernel void embed_gather_f16(device const half*   table [[buffer(0)]],
 
 // bf16 table: top 16 bits of the f32; dequant is a lossless << 16 (same as dequant_bf16_f16).
 kernel void embed_gather_bf16(device const ushort* table [[buffer(0)]],
-                              device const float*  ids   [[buffer(1)]],
+                              device const int*    ids   [[buffer(1)]],
                               device float*        dst   [[buffer(2)]],
                               constant EmbedGatherParams& p [[buffer(3)]],
                               uint gid [[thread_position_in_grid]]) {

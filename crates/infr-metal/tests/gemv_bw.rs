@@ -149,6 +149,17 @@ fn quantize_q8_0(w: &[f32]) -> Vec<u8> {
     out
 }
 
+fn synth_iq4nl(n_elem: usize, seed: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 32) {
+        let mut blk = vec![0u8; 18];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.004).to_le_bytes());
+        blk[2..18].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 16));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
 // Chained bench: K identical GEMVs over K DISTINCT weight copies in ONE graph (one command
 // buffer) — the per-cb commit+wait overhead amortizes away and the number reflects the
 // in-decode-chain cost. Distinct weights so the stream is not cache-resident.
@@ -225,4 +236,10 @@ fn gemv_bandwidth_gemma_shapes() {
         .collect();
     let w8 = quantize_q8_0(&wf);
     bench_chained(DType::Q8_0, &w8, 1152, 65536, 8.5, "q8_0 head/4");
+    let wiq4 = synth_iq4nl(6912 * 1152, 15);
+    bench_chained(DType::Iq4Nl, &wiq4, 1152, 6912, 4.5, "iq4_nl gate/up");
+    let wiq4d = synth_iq4nl(1152 * 6912, 17);
+    bench_chained(DType::Iq4Nl, &wiq4d, 6912, 1152, 4.5, "iq4_nl down");
+    let wiq4h = synth_iq4nl(65536 * 1152, 16);
+    bench_chained(DType::Iq4Nl, &wiq4h, 1152, 65536, 4.5, "iq4_nl head");
 }

@@ -2353,7 +2353,7 @@ impl MetalBackend {
                             // already saturate and keep NSG=1.
                             let rpg = match qw.kern {
                                 "linear_q4k" | "linear_q6k" => 2usize,
-                                "linear_q8_0" | "linear_q5_0" | "linear_q4_0" => 4,
+                                "linear_q8_0" | "linear_q5_0" | "linear_q4_0" | "linear_iq4nl" => 4,
                                 _ => 1,
                             };
                             let groups = out_f.div_ceil(rpg);
@@ -2390,6 +2390,7 @@ impl MetalBackend {
                                 "linear_q8_0" => "linear_q8_0_add",
                                 "linear_q5_0" => "linear_q5_0_add",
                                 "linear_q4_0" => "linear_q4_0_add",
+                                "linear_iq4nl" => "linear_iq4nl_add",
                                 "linear_q4k_ks" => "linear_q4k_ks_add",
                                 "linear_q6k_ks" => "linear_q6k_ks_add",
                                 "linear_q8_0_ks" => "linear_q8_0_ks_add",

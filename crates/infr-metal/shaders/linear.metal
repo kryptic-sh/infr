@@ -1129,6 +1129,85 @@ kernel void linear_q6k_mrv(device const float*  x     [[buffer(0)]],
         rp * 32u + lane, lane, 0, red);
 }
 
+// Decode GEMV for NATIVE IQ4_NL (18 B / 32-element blocks). Each simdgroup computes four
+// output rows and reuses its eight activation values across them. The lane's eight nibbles are
+// loaded as four aligned ushorts and unpacked in registers; only the codebook lookups remain
+// scalar because Metal has no integer packed-dot intrinsic for the non-linear values.
+template<int EPI, uint NSG, typename PT>
+inline void linear_iq4nl_body(device const float*  x,
+                              device const uchar*  codes,
+                              device float*        dst,
+                              device const float*  res,
+                              constant PT& p,
+                              float wgt, bool zeroacc,
+                              uint gid, uint lane,
+                              ushort sgitg, threadgroup float* red) {
+    uint first_row = (gid / (32u * NSG)) * 4u;
+    if (first_row >= p.out_f) return;
+    uint nb = p.in_f >> 5;
+    ulong row_b = (ulong)nb * 18ul;
+    uint nrows = min(4u, p.out_f - first_row);
+
+    uint ix = lane >> 2;
+    uint il = (lane & 3u) * 8u;
+    bool hi = il >= 16u;
+    uint jq = hi ? il - 16u : il;
+
+    float yl[8];
+    float sumf[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device const float* yb = x + (sgitg * 8u + ix) * 32u + il;
+
+    for (uint ib = sgitg * 8u + ix; ib < nb; ib += NSG * 8u) {
+        for (uint i = 0; i < 8u; i++) yl[i] = yb[i];
+        for (uint row = 0; row < 4u; row++) {
+            device const uchar* blk =
+                codes + (ulong)(first_row + min(row, nrows - 1u)) * row_b + (ulong)ib * 18ul;
+            device const ushort* b16 = (device const ushort*)blk;
+            device const ushort* qsp = (device const ushort*)(blk + 2u + jq);
+            uint w0 = (uint)qsp[0] | ((uint)qsp[1] << 16);
+            uint w1 = (uint)qsp[2] | ((uint)qsp[3] << 16);
+            uint q40 = hi ? (w0 >> 4) & 0x0F0F0F0Fu : w0 & 0x0F0F0F0Fu;
+            uint q41 = hi ? (w1 >> 4) & 0x0F0F0F0Fu : w1 & 0x0F0F0F0Fu;
+            float sumq = kvalues_iq4nl_f[(q40 >> 0u) & 0xFu] * yl[0]
+                + kvalues_iq4nl_f[(q40 >> 8u) & 0xFu] * yl[1]
+                + kvalues_iq4nl_f[(q40 >> 16u) & 0xFu] * yl[2]
+                + kvalues_iq4nl_f[(q40 >> 24u) & 0xFu] * yl[3]
+                + kvalues_iq4nl_f[(q41 >> 0u) & 0xFu] * yl[4]
+                + kvalues_iq4nl_f[(q41 >> 8u) & 0xFu] * yl[5]
+                + kvalues_iq4nl_f[(q41 >> 16u) & 0xFu] * yl[6]
+                + kvalues_iq4nl_f[(q41 >> 24u) & 0xFu] * yl[7];
+            sumf[row] += (float)as_type<half>(b16[0]) * sumq;
+        }
+        yb += NSG * 8u * 32u;
+    }
+    GEMV_EPILOGUE_N(4u, nrows)
+}
+
+kernel void linear_iq4nl(device const float*  x     [[buffer(0)]],
+                         device const uchar*  codes [[buffer(1)]],
+                         device const uchar*  scm   [[buffer(2)]],
+                         device const uchar*  dd    [[buffer(3)]],
+                         device float*        dst   [[buffer(4)]],
+                         constant QLinParams& p     [[buffer(5)]],
+                         uint gid  [[thread_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4];
+    linear_iq4nl_body<0, 1>(x, codes, dst, x, p, 0.0f, false, gid, lane, 0, red);
+}
+
+kernel void linear_iq4nl_add(device const float*  x     [[buffer(0)]],
+                             device const uchar*  codes [[buffer(1)]],
+                             device const uchar*  scm   [[buffer(2)]],
+                             device const uchar*  dd    [[buffer(3)]],
+                             device float*        dst   [[buffer(4)]],
+                             device const float*  res   [[buffer(5)]],
+                             constant QLinParams& p     [[buffer(6)]],
+                             uint gid  [[thread_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4];
+    linear_iq4nl_body<1, 1>(x, codes, dst, res, p, 0.0f, false, gid, lane, 0, red);
+}
+
 // Decode GEMV for NATIVE Q8_0 (34 B / 32-elem blocks), mul_mv shape (ported from llama.cpp's
 // kernel_mul_mv_q8_0_f32): each simdgroup computes FOUR output rows (N_R0_Q8_0); lanes fold as
 // 8 blocks in flight x 4 threads per block (8 quants each), activations load once into registers

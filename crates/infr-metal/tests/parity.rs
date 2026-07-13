@@ -893,6 +893,32 @@ fn synth_iq4xs(n_elem: usize, seed: u32) -> Vec<u8> {
     out
 }
 
+fn synth_iq4nl(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 32, 0);
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 32) {
+        let mut blk = vec![0u8; 18];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.004).to_le_bytes());
+        blk[2..18].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 16));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq4nl_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    check_quant_linear_parity(DType::Iq4Nl, synth_iq4nl(out_f * in_f, 121), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_iq4nl_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Iq4Nl, synth_iq4nl(out_f * in_f, 120), in_f, out_f);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_iq4xs_matches_dequant_reference() {

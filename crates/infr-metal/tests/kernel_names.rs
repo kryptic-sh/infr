@@ -41,6 +41,13 @@ const KERNEL_PREFIXES: &[&str] = &[
 ];
 
 #[test]
+fn iq4nl_has_a_native_four_row_decode_body() {
+    let src = include_str!("../shaders/linear.metal");
+    assert!(src.contains("inline void linear_iq4nl_body"));
+    assert!(src.contains("kernel void linear_iq4nl_add"));
+}
+
+#[test]
 #[ignore = "requires a Metal GPU"]
 fn every_dispatchable_kernel_exists_in_the_library() {
     let src = include_str!("../src/exec.rs");

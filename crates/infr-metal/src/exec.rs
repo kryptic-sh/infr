@@ -32,6 +32,106 @@ pub(crate) struct QuiWeight {
     dshift: u32,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infr_core::tensor::TensorDesc;
+
+    #[test]
+    fn replay_gpu_decode_op_eligibility() {
+        let mut g = infr_core::graph::Graph::new();
+        let logits = g.input(TensorDesc::new(vec![128], DType::F32));
+        let uniform = g.input(TensorDesc::new(vec![64], DType::F32));
+        let ids = g.input(TensorDesc::new(vec![2], DType::I32));
+        let q4k = g.weight(TensorDesc::new(vec![8, 256], DType::Q4K));
+        let q5k = g.weight(TensorDesc::new(vec![8, 256], DType::Q5K));
+        let token = g.output(TensorDesc::new(vec![1], DType::F32));
+        let gathered = g.output(TensorDesc::new(vec![2, 256], DType::F32));
+
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::Argmax {
+                    x: logits,
+                    dst: token,
+                    n: 128,
+                    rows: 1,
+                },
+                &g,
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::Argmax {
+                    x: logits,
+                    dst: token,
+                    n: 128,
+                    rows: 2,
+                },
+                &g,
+            ),
+            Some(false),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::Sample {
+                    x: logits,
+                    u: uniform,
+                    dst: token,
+                    n: 128,
+                    top_k: 40,
+                    temp: 0.8,
+                    top_p: 0.95,
+                },
+                &g,
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::EmbedGather {
+                    ids,
+                    table: q4k,
+                    dst: gathered,
+                    rows: 1,
+                    ne: 256,
+                    scale: 1.0,
+                },
+                &g,
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::EmbedGather {
+                    ids,
+                    table: q4k,
+                    dst: gathered,
+                    rows: 2,
+                    ne: 256,
+                    scale: 1.0,
+                },
+                &g,
+            ),
+            Some(false),
+        );
+        assert_eq!(
+            replay_gpu_decode_op_supported(
+                &Op::EmbedGather {
+                    ids,
+                    table: q5k,
+                    dst: gathered,
+                    rows: 1,
+                    ne: 256,
+                    scale: 1.0,
+                },
+                &g,
+            ),
+            Some(false),
+        );
+    }
+}
+
 /// Where a tensor's current value lives. GPU ops keep their results on the device and only pay a
 /// CPU↔GPU round-trip when a host-side op (or the final write-back) actually needs the bytes.
 #[derive(Clone, Copy, PartialEq)]
@@ -175,6 +275,34 @@ fn replay_fp(g: &infr_core::graph::Graph, bindings: &Bindings) -> u64 {
     h
 }
 
+fn metal_embed_gather_kern(dt: DType) -> Option<&'static str> {
+    match dt {
+        DType::F16 => Some("embed_gather_f16"),
+        DType::Bf16 => Some("embed_gather_bf16"),
+        DType::Q8_0 => Some("embed_gather_q8_0"),
+        DType::Q4_0 => Some("embed_gather_q4_0"),
+        DType::Q5_0 => Some("embed_gather_q5_0"),
+        DType::Q4K => Some("embed_gather_q4k"),
+        DType::Q6K => Some("embed_gather_q6k"),
+        DType::Iq4Nl => Some("embed_gather_iq4nl"),
+        DType::Iq4Xs => Some("embed_gather_iq4xs"),
+        _ => None,
+    }
+}
+
+/// Classify the GPU-resident decode tail ops that may appear on an otherwise replayable graph.
+/// `None` leaves the op to the main replay-shape match; `Some(false)` is an explicit rejection.
+fn replay_gpu_decode_op_supported(op: &Op, g: &infr_core::graph::Graph) -> Option<bool> {
+    match op {
+        Op::Argmax { rows, .. } => Some(*rows == 1),
+        Op::Sample { .. } => Some(true),
+        Op::EmbedGather { table, rows, .. } => {
+            Some(*rows == 1 && metal_embed_gather_kern(g.desc(*table).dtype).is_some())
+        }
+        _ => None,
+    }
+}
+
 /// Is this graph the decode shape the replay tape supports? Every op must be one the recorder
 /// handles fully on-device, attention must be the rows=1 f16 shape with a dynamic-pos kernel
 /// instantiation (hd 64/128), and a QkNormRope must exist to name the positions buffer.
@@ -183,6 +311,12 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
     let mut has_rope = false;
     let mut has_attn = false;
     for op in &g.ops {
+        if let Some(supported) = replay_gpu_decode_op_supported(op, g) {
+            if !supported {
+                return false;
+            }
+            continue;
+        }
         match op {
             Op::RmsNorm { .. }
             | Op::RmsNormAdd { .. }
@@ -2108,22 +2242,11 @@ impl MetalBackend {
                 scale,
             } => {
                 let dt = g.desc(table).dtype;
-                let kern = match dt {
-                    DType::F16 => "embed_gather_f16",
-                    DType::Bf16 => "embed_gather_bf16",
-                    DType::Q8_0 => "embed_gather_q8_0",
-                    DType::Q4_0 => "embed_gather_q4_0",
-                    DType::Q5_0 => "embed_gather_q5_0",
-                    DType::Q4K => "embed_gather_q4k",
-                    DType::Q6K => "embed_gather_q6k",
-                    DType::Iq4Nl => "embed_gather_iq4nl",
-                    DType::Iq4Xs => "embed_gather_iq4xs",
-                    other => {
-                        return Err(Error::Unsupported(format!(
-                            "Metal Op::EmbedGather: no native gather kernel for {other:?}"
-                        )));
-                    }
-                };
+                let kern = metal_embed_gather_kern(dt).ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "Metal Op::EmbedGather: no native gather kernel for {dt:?}"
+                    ))
+                })?;
                 let (rows_u, ne_u) = (rows as usize, ne as usize);
                 let bt = metal_buf(bindings.get(table).expect("metal backend: unbound Weight"));
                 let bi = self.ensure_device(r, ids);

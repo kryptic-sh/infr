@@ -316,6 +316,112 @@ mod tests {
         assert_eq!(u32::from_le_bytes(token_bytes), 3);
         be.download(greedy_buf.as_ref(), &mut token_bytes).unwrap();
         assert_eq!(u32::from_le_bytes(token_bytes), 0);
+
+        let mut chain_bindings = Bindings::new();
+        chain_bindings.bind(rope_x, rope_x_buf.as_ref());
+        chain_bindings.bind(positions, positions_buf.as_ref());
+        chain_bindings.bind(q, q_buf.as_ref());
+        chain_bindings.bind(k_cache, k_buf.as_ref());
+        chain_bindings.bind(v_cache, v_buf.as_ref());
+        chain_bindings.bind(ids, ids_buf.as_ref());
+        chain_bindings.bind(table, table_buf.as_ref());
+        chain_bindings.bind(gathered, gathered_buf.as_ref());
+        chain_bindings.bind(logits, logits_buf.as_ref());
+        chain_bindings.bind(uniform, uniform_buf.as_ref());
+        chain_bindings.bind(sampled, ids_buf.as_ref());
+        chain_bindings.bind(greedy, greedy_buf.as_ref());
+
+        uniform_values[0] = 0.01;
+        uniform_values[1] = 0.99;
+        uniform_values[2] = 0.01;
+        be.upload(uniform_buf.as_ref(), bytemuck::cast_slice(&uniform_values))
+            .unwrap();
+        be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[6i32]))
+            .unwrap();
+        be.upload(positions_buf.as_ref(), bytemuck::cast_slice(&[0i32]))
+            .unwrap();
+
+        let chain_plan = be.compile(&g).unwrap();
+        let ids = be
+            .execute_chain(chain_plan.as_ref(), &chain_bindings, 3)
+            .unwrap()
+            .expect("Metal replay must support device-side token chains");
+        assert_eq!(ids, vec![0, 3, 0]);
+
+        be.download(gathered_buf.as_ref(), &mut gathered_bytes)
+            .unwrap();
+        assert_eq!(
+            bytemuck::cast_slice::<u8, f32>(&gathered_bytes)[0],
+            3.0,
+            "the third replay must gather the second replay's sampled ID",
+        );
+        be.download(positions_buf.as_ref(), &mut token_bytes)
+            .unwrap();
+        assert_eq!(i32::from_le_bytes(token_bytes), 2);
+
+        let mut unsupported = Graph::new();
+        let bad_rope_x = unsupported.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        let bad_positions = unsupported.input(TensorDesc::new(vec![1], DType::I32));
+        let bad_rope_dst = unsupported.internal(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        unsupported.push(Op::Rope {
+            x: bad_rope_x,
+            positions: bad_positions,
+            dst: bad_rope_dst,
+            rows: 1,
+            n_head: 1,
+            head_dim: 64,
+            rope_dim: 64,
+            theta: 10_000.0,
+            freq_factors: None,
+            x_stride: 0,
+        });
+        let bad_ids = unsupported.input(TensorDesc::new(vec![1], DType::I32));
+        let bad_table = unsupported.weight(TensorDesc::new(vec![8, 64], DType::F16));
+        let bad_gathered = unsupported.output(TensorDesc::new(vec![1, 64], DType::F32));
+        unsupported.push(Op::EmbedGather {
+            ids: bad_ids,
+            table: bad_table,
+            dst: bad_gathered,
+            rows: 1,
+            ne: 64,
+            scale: 1.0,
+        });
+        let bad_logits = unsupported.input(TensorDesc::new(vec![128], DType::F32));
+        let bad_uniform = unsupported.input(TensorDesc::new(vec![64], DType::F32));
+        let bad_sampled = unsupported.output(TensorDesc::new(vec![1], DType::F32));
+        unsupported.push(Op::Sample {
+            x: bad_logits,
+            u: bad_uniform,
+            dst: bad_sampled,
+            n: 128,
+            top_k: 4,
+            temp: 1.0,
+            top_p: 1.0,
+        });
+        be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[6i32]))
+            .unwrap();
+        let mut bad_bindings = Bindings::new();
+        bad_bindings.bind(bad_rope_x, rope_x_buf.as_ref());
+        bad_bindings.bind(bad_positions, positions_buf.as_ref());
+        bad_bindings.bind(bad_ids, ids_buf.as_ref());
+        bad_bindings.bind(bad_table, table_buf.as_ref());
+        bad_bindings.bind(bad_gathered, gathered_buf.as_ref());
+        bad_bindings.bind(bad_logits, logits_buf.as_ref());
+        bad_bindings.bind(bad_uniform, uniform_buf.as_ref());
+        bad_bindings.bind(bad_sampled, ids_buf.as_ref());
+        let bad_plan = be.compile(&unsupported).unwrap();
+        assert!(
+            be.execute_chain(bad_plan.as_ref(), &bad_bindings, 3)
+                .unwrap()
+                .is_none(),
+            "a graph without a replayable decode shape cannot chain",
+        );
+        be.download(ids_buf.as_ref(), &mut token_bytes).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(token_bytes),
+            6,
+            "declining a chain must not execute any graph side effects",
+        );
     }
 }
 
@@ -943,71 +1049,65 @@ impl MetalBackend {
         }
     }
 
+    fn encode_tape(&self, cb: &metal::CommandBufferRef, tape: &Tape) {
+        // CONCURRENT dispatch: with the serial type every dispatch implicitly orders after the
+        // previous one. Explicit barriers below preserve only the actual RAW/WAW/WAR hazards.
+        let enc = cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+        let mut written: Vec<*const c_void> = Vec::with_capacity(8);
+        let mut read: Vec<*const c_void> = Vec::with_capacity(24);
+        let mut touched: Vec<&MtlBuffer> = Vec::with_capacity(32);
+        for e in &tape.entries {
+            let is_w = |i: usize| e.wmask & (1u32 << i.min(31)) != 0;
+            let hazard = e.bufs.iter().enumerate().any(|(i, b)| {
+                let p = b.as_ptr() as *const c_void;
+                written.contains(&p) || (is_w(i) && read.contains(&p))
+            });
+            if hazard {
+                let refs: Vec<&metal::ResourceRef> = touched
+                    .iter()
+                    .map(|b| b.as_ref() as &metal::ResourceRef)
+                    .collect();
+                enc.memory_barrier_with_resources(&refs);
+                written.clear();
+                read.clear();
+                touched.clear();
+            }
+            for (i, b) in e.bufs.iter().enumerate() {
+                let p = b.as_ptr() as *const c_void;
+                if is_w(i) {
+                    written.push(p);
+                } else {
+                    read.push(p);
+                }
+                if !touched.iter().any(|t| t.as_ptr() as *const c_void == p) {
+                    touched.push(b);
+                }
+            }
+            enc.set_compute_pipeline_state(&e.pso);
+            for (i, b) in e.bufs.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), e.offs[i]);
+            }
+            if !e.params.is_empty() {
+                enc.set_bytes(
+                    e.bufs.len() as u64,
+                    e.params.len() as u64,
+                    e.params.as_ptr() as *const c_void,
+                );
+            }
+            let cap = e.pso.max_total_threads_per_threadgroup() as usize;
+            let tg = if e.tg == 0 { cap } else { e.tg.min(cap) }.min(e.threads.max(1)) as u64;
+            enc.dispatch_threads(MTLSize::new(e.threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
+        }
+        enc.end_encoding();
+    }
+
     /// Re-encode a recorded tape: one command buffer, the flat dispatch list, commit + wait.
     /// This IS the per-token decode cost on the replay path — no graph walk, no host mirror,
     /// no allocation.
     fn replay_tape(&self, tape: &Tape) {
         objc::rc::autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();
-            // CONCURRENT dispatch: with the serial type every dispatch implicitly orders after
-            // the previous one, which costs ~1 µs of pipeline drain per dispatch on runs of
-            // INDEPENDENT work (decode's q/k/v GEMVs, the two KV writes). Ordering here comes
-            // from explicit barriers, placed exactly where the recorded write masks show a
-            // hazard: this dispatch reads or writes a buffer someone wrote since the last
-            // barrier (RAW/WAW), or writes one someone read (WAR). Un-annotated entries
-            // (wmask = MAX) count every buffer as written — serialized, never under-fenced.
-            let enc =
-                cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
-            let mut written: Vec<*const c_void> = Vec::with_capacity(8);
-            let mut read: Vec<*const c_void> = Vec::with_capacity(24);
-            // Every buffer touched since the last barrier (owned refs into the tape entries) —
-            // the resource list the barrier fences.
-            let mut touched: Vec<&MtlBuffer> = Vec::with_capacity(32);
-            for e in &tape.entries {
-                let is_w = |i: usize| e.wmask & (1u32 << i.min(31)) != 0;
-                let hazard = e.bufs.iter().enumerate().any(|(i, b)| {
-                    let p = b.as_ptr() as *const c_void;
-                    written.contains(&p) || (is_w(i) && read.contains(&p))
-                });
-                if hazard {
-                    // Barrier over every buffer touched since the last one: prior dispatches'
-                    // accesses to those resources complete before anything encoded after.
-                    let refs: Vec<&metal::ResourceRef> = touched
-                        .iter()
-                        .map(|b| b.as_ref() as &metal::ResourceRef)
-                        .collect();
-                    enc.memory_barrier_with_resources(&refs);
-                    written.clear();
-                    read.clear();
-                    touched.clear();
-                }
-                for (i, b) in e.bufs.iter().enumerate() {
-                    let p = b.as_ptr() as *const c_void;
-                    if is_w(i) {
-                        written.push(p);
-                    } else {
-                        read.push(p);
-                    }
-                    if !touched.iter().any(|t| t.as_ptr() as *const c_void == p) {
-                        touched.push(b);
-                    }
-                }
-                enc.set_compute_pipeline_state(&e.pso);
-                for (i, b) in e.bufs.iter().enumerate() {
-                    enc.set_buffer(i as u64, Some(b), e.offs[i]);
-                }
-                if !e.params.is_empty() {
-                    enc.set_bytes(
-                        e.bufs.len() as u64,
-                        e.params.len() as u64,
-                        e.params.as_ptr() as *const c_void,
-                    );
-                }
-                let cap = e.pso.max_total_threads_per_threadgroup() as usize;
-                let tg = if e.tg == 0 { cap } else { e.tg.min(cap) }.min(e.threads.max(1)) as u64;
-                enc.dispatch_threads(MTLSize::new(e.threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
-            }
-            enc.end_encoding();
+            self.encode_tape(cb, tape);
             let t0 = self.profiling.then(std::time::Instant::now);
             cb.commit();
             cb.wait_until_completed();
@@ -1106,6 +1206,29 @@ impl MetalBackend {
         }
     }
 
+    fn replay_capable(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
+        if self.counter_set.is_some() || !replay_shape(g, bindings) {
+            return false;
+        }
+        let Some((kern, need)) = g.ops.iter().find_map(|op| match op {
+            Op::Attention {
+                head_dim: hd @ (64 | 128 | 256),
+                k_cache,
+                ..
+            } => Some((
+                dyn_attnvec_kern(g.desc(*k_cache).dtype, *hd as usize),
+                if *hd == 256 { 512 } else { 1024 },
+            )),
+            _ => None,
+        }) else {
+            return false;
+        };
+        self.pipelines
+            .get(kern)
+            .map(|pl| pl.max_total_threads_per_threadgroup() >= need)
+            .unwrap_or(false)
+    }
+
     pub(crate) fn execute_graph(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
         let g = &plan
             .as_any()
@@ -1119,30 +1242,10 @@ impl MetalBackend {
         // subsequent token takes this path. The dynamic-pos vector kernel REQUIRES its full
         // 1024-thread threadgroup (same silent-clamp hazard as the split kernels), so recording is
         // gated on its pipeline cap — a capped device (CI paravirtual) keeps the per-token path.
-        let dyn_cap_ok = || -> bool {
-            let kern = g.ops.iter().find_map(|op| match op {
-                Op::Attention {
-                    head_dim: hd @ (64 | 128 | 256),
-                    k_cache,
-                    ..
-                } => Some((
-                    dyn_attnvec_kern(g.desc(*k_cache).dtype, *hd as usize),
-                    // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
-                    if *hd == 256 { 512 } else { 1024 },
-                )),
-                _ => None,
-            });
-            kern.is_some_and(|(kn, need)| {
-                self.pipelines
-                    .get(kn)
-                    .map(|pl| pl.max_total_threads_per_threadgroup() >= need)
-                    .unwrap_or(false)
-            })
-        };
         // Counter profiling is per-op analysis: the tape would replay decode tokens without
         // walking ops (only the RECORDED token would ever be attributed — every per-token op
         // reading would silently be a sample of one), so it is disabled under PROFILE=3.
-        if self.counter_set.is_none() && replay_shape(g, bindings) && dyn_cap_ok() {
+        if self.replay_capable(g, bindings) {
             let fp = replay_fp(g, bindings);
             if let Some(tape) = self.replay.lock().unwrap().as_ref() {
                 if tape.fp == fp {
@@ -1160,6 +1263,128 @@ impl MetalBackend {
         // Wrap the whole forward in one autorelease pool: the batched command buffers/encoders are
         // retained owned handles, so we drain the pool once per forward instead of once per op.
         objc::rc::autoreleasepool(|| self.run_graph(g, bindings, false).map(|_| ()))
+    }
+
+    pub(crate) fn execute_graph_chain(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        n: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        if n == 0 || n > 64 || self.counter_set.is_some() {
+            return Ok(None);
+        }
+        let Some(g) = plan
+            .as_any()
+            .downcast_ref::<infr_core::backend::GraphPlan>()
+            .map(|p| &p.graph)
+        else {
+            return Ok(None);
+        };
+        if !self.replay_capable(g, bindings) {
+            return Ok(None);
+        }
+        let positions = g.ops.iter().find_map(|op| match op {
+            Op::QkNormRope { positions, .. } | Op::Rope { positions, .. } => Some(*positions),
+            _ => None,
+        });
+        let feed = g.ops.iter().find_map(|op| match op {
+            Op::EmbedGather { ids, .. } => Some(*ids),
+            _ => None,
+        });
+        let sampled = g
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Sample { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .or_else(|| {
+                g.ops.iter().find_map(|op| match op {
+                    Op::Argmax { dst, .. } => Some(*dst),
+                    _ => None,
+                })
+            });
+        let (Some(positions), Some(feed), Some(sampled)) = (positions, feed, sampled) else {
+            return Ok(None);
+        };
+        let (Some(pos_buf), Some(feed_buf), Some(sampled_buf)) = (
+            bindings.get(positions),
+            bindings.get(feed),
+            bindings.get(sampled),
+        ) else {
+            return Ok(None);
+        };
+        let pos_buf = metal_buf(pos_buf);
+        let feed_buf = metal_buf(feed_buf);
+        let sampled_buf = metal_buf(sampled_buf);
+        if feed_buf.raw.as_ptr() != sampled_buf.raw.as_ptr() {
+            return Ok(None);
+        }
+
+        let fp = replay_fp(g, bindings);
+        let mut ids = Vec::with_capacity(n);
+        let tape_ready = self
+            .replay
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|t| t.fp == fp);
+        if !tape_ready {
+            self.execute_graph(plan, bindings)?;
+            let recorded = self
+                .replay
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|t| t.fp == fp);
+            if !recorded {
+                return Ok(None);
+            }
+            let id = unsafe { *(sampled_buf.raw.contents() as *const u32) };
+            ids.push(id);
+        }
+
+        let remaining = n - ids.len();
+        if remaining == 0 {
+            return Ok(Some(ids));
+        }
+        let result = self.device.new_buffer(
+            (remaining * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let advance = self.pipelines.get("advance_position_i32")?;
+        let guard = self.replay.lock().unwrap();
+        let tape = guard.as_ref().expect("chain checked recorded tape");
+        objc::rc::autoreleasepool(|| {
+            let cb = self.queue.new_command_buffer();
+            for i in 0..remaining {
+                if !ids.is_empty() || i > 0 {
+                    let enc = cb.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(&advance);
+                    enc.set_buffer(0, Some(&pos_buf.raw), 0);
+                    enc.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                    enc.end_encoding();
+                }
+                self.encode_tape(cb, tape);
+                let blit = cb.new_blit_command_encoder();
+                blit.copy_from_buffer(&sampled_buf.raw, 0, &result, (i * 4) as u64, 4);
+                blit.end_encoding();
+            }
+            let t0 = self.profiling.then(std::time::Instant::now);
+            cb.commit();
+            cb.wait_until_completed();
+            if let Some(t0) = t0 {
+                let mut pr = self.prof.lock().unwrap();
+                pr.add_dispatch(t0.elapsed());
+                pr.add_forward();
+            }
+        });
+        let chained = unsafe {
+            std::slice::from_raw_parts(result.contents() as *const u32, remaining).to_vec()
+        };
+        ids.extend(chained);
+        Ok(Some(ids))
     }
 
     fn run_graph(

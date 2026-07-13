@@ -343,6 +343,15 @@ impl Backend for MetalBackend {
         self.execute_graph(plan, bindings)
     }
 
+    fn execute_chain(
+        &self,
+        plan: &dyn Plan,
+        bindings: &Bindings,
+        n: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        self.execute_graph_chain(plan, bindings, n)
+    }
+
     fn sync(&self) -> Result<()> {
         Ok(())
     }

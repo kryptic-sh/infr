@@ -1,4 +1,8 @@
 // ---- elementwise ----
+kernel void advance_position_i32(device int* position [[buffer(0)]]) {
+    position[0] += 1;
+}
+
 kernel void add_f32(device const float* a   [[buffer(0)]],
                     device const float* b   [[buffer(1)]],
                     device float*       dst [[buffer(2)]],

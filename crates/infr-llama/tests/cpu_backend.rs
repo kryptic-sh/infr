@@ -730,6 +730,34 @@ fn metal_spec_decode_matches_target_only_greedy() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_decode_chain_matches_per_token_greedy() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::SeamModel::load(&path, None).expect("model load");
+    let prompt = model
+        .render_chat("Explain why the sky is blue in two sentences.")
+        .expect("render chat");
+
+    std::env::set_var("INFR_DECODE_CHAIN", "1");
+    let mut per_token = String::new();
+    model
+        .generate_metal(&prompt, 32, |p| per_token.push_str(p))
+        .expect("per-token greedy");
+
+    std::env::set_var("INFR_DECODE_CHAIN", "8");
+    let mut chained = String::new();
+    model
+        .generate_metal(&prompt, 32, |p| chained.push_str(p))
+        .expect("chained greedy");
+
+    std::env::remove_var("INFR_DECODE_CHAIN");
+    std::env::remove_var("INFR_TEMP");
+    assert_eq!(chained, per_token, "chained Metal decode diverged");
+}
+
 /// Metal twin of [`gpu_seam_multi_slot_prefix_sharing`]: the same interleaved-conversation
 /// contract through `DenseMetalSession`'s slot pool — fork shares the one weight upload
 /// (Arc), seeding is the backend-generic `copy_buffer`, and every slot switch re-records the

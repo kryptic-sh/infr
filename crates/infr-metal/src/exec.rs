@@ -212,6 +212,15 @@ mod tests {
     }
 
     #[test]
+    fn counter_profiles_use_selected_linear_kernel_for_every_row_count() {
+        assert_eq!(
+            counter_linear_label(true, "linear_q5k_cmm"),
+            Some("linear_q5k_cmm"),
+        );
+        assert_eq!(counter_linear_label(false, "linear_q5k_cmm"), None);
+    }
+
+    #[test]
     #[ignore = "requires a Metal GPU"]
     fn replay_gpu_decode_ops_observe_dynamic_inputs() {
         let be = MetalBackend::new().expect("Metal backend");
@@ -662,6 +671,10 @@ fn sample_split_shape(n: usize, top_k: usize) -> Option<(usize, usize)> {
 
 fn prefer_iq4nl_rt(kern: &str, m: usize) -> bool {
     kern == "linear_iq4nl" && (2..=4).contains(&m)
+}
+
+fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static str> {
+    enabled.then_some(kern)
 }
 
 /// Classify the GPU-resident decode tail ops that may appear on an otherwise replayable graph.
@@ -2209,6 +2222,9 @@ impl MetalBackend {
                     if let (true, Some(kn), 0) = ((2..=8).contains(&m), mr_kern, w_off) {
                         let pso = self.pipelines.get(kn)?;
                         let sgs = out_f.div_ceil(2) * m;
+                        if let Some(label) = counter_linear_label(self.counter_set.is_some(), kn) {
+                            r.cur_op = label;
+                        }
                         self.encode_tg_off(
                             r,
                             &pso,
@@ -2269,6 +2285,11 @@ impl MetalBackend {
                             kp.extend_from_slice(&(ks_split as u32).to_ne_bytes());
                             kp.extend_from_slice(&(kchunk as u32).to_ne_bytes());
                             let pso = self.pipelines.get(ks_kern)?;
+                            if let Some(label) =
+                                counter_linear_label(self.counter_set.is_some(), ks_kern)
+                            {
+                                r.cur_op = label;
+                            }
                             self.encode_tg_off(
                                 r,
                                 &pso,
@@ -2287,6 +2308,11 @@ impl MetalBackend {
                             let rp_pso = self.pipelines.get("cmm_ks_reduce")?;
                             let mut rp = ((m * out_f) as u32).to_ne_bytes().to_vec();
                             rp.extend_from_slice(&(ks_split as u32).to_ne_bytes());
+                            if let Some(label) =
+                                counter_linear_label(self.counter_set.is_some(), "cmm_ks_reduce")
+                            {
+                                r.cur_op = label;
+                            }
                             self.encode_w(
                                 r,
                                 &rp_pso,
@@ -2300,6 +2326,11 @@ impl MetalBackend {
                         }
                         // Reads f32 x directly (casts to f16 while staging) — no cast pass.
                         let pso = self.pipelines.get(cmm_kern)?;
+                        if let Some(label) =
+                            counter_linear_label(self.counter_set.is_some(), cmm_kern)
+                        {
+                            r.cur_op = label;
+                        }
                         self.encode_tg_off(
                             r,
                             &pso,
@@ -2324,6 +2355,11 @@ impl MetalBackend {
                         ));
                         let cast = self.pipelines.get("cast_f32_f16")?;
                         let n = (m * in_f) as u32;
+                        if let Some(label) =
+                            counter_linear_label(self.counter_set.is_some(), "cast_f32_f16")
+                        {
+                            r.cur_op = label;
+                        }
                         self.encode_w(
                             r,
                             &cast,
@@ -2333,6 +2369,11 @@ impl MetalBackend {
                             m * in_f,
                         );
                         let pso = self.pipelines.get(hmm_kern)?;
+                        if let Some(label) =
+                            counter_linear_label(self.counter_set.is_some(), hmm_kern)
+                        {
+                            r.cur_op = label;
+                        }
                         self.encode_tg_off(
                             r,
                             &pso,
@@ -2427,8 +2468,10 @@ impl MetalBackend {
                             let bres = self.ensure_device(r, res);
                             let bfd = self.dev_dst(r, fdst, out_f);
                             let pso = self.pipelines.get(fk)?;
-                            if self.counter_set.is_some() && m == 1 {
-                                r.cur_op = fk;
+                            if let Some(label) =
+                                counter_linear_label(self.counter_set.is_some(), fk)
+                            {
+                                r.cur_op = label;
                             }
                             self.encode_tg_off(
                                 r,
@@ -2450,8 +2493,9 @@ impl MetalBackend {
                             return Ok(());
                         }
                         let pso = self.pipelines.get(kern)?;
-                        if self.counter_set.is_some() && m == 1 {
-                            r.cur_op = kern;
+                        if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern)
+                        {
+                            r.cur_op = label;
                         }
                         self.encode_tg_off(
                             r,
@@ -2473,8 +2517,10 @@ impl MetalBackend {
                     // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
                     let bw = self.weight_buf(weight, g, bindings)?;
                     let pso = self.pipelines.get("linear_f32")?;
-                    if self.counter_set.is_some() && m == 1 {
-                        r.cur_op = "linear_f32";
+                    if let Some(label) =
+                        counter_linear_label(self.counter_set.is_some(), "linear_f32")
+                    {
+                        r.cur_op = label;
                     }
                     self.encode_tg_off(
                         r,

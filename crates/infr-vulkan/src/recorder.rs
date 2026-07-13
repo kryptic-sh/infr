@@ -2541,7 +2541,7 @@ impl<'a> Recorder<'a> {
         // request. Gate is exactly the decode hidden-norm shape — prefill (rows>1) already fills
         // the GPU with row-workgroups, and the per-head Q/K/V norms (rows=n_head, small dim) would
         // just idle 3/4 of the lanes, so both keep the 256-thread build.
-        let wide = rows == 1 && dim >= 2048 && dim % 4 == 0;
+        let wide = rows == 1 && dim >= 2048 && dim.is_multiple_of(4);
         let k = if wide {
             self.be
                 .kernel_sg("rmsnorm_wide", crate::gemm::rmsnorm_wide_spv(), 3, 12, 32)

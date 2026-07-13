@@ -200,7 +200,23 @@ fn native_id_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Op
     }
     // Heavy K-quant decodes only (Q6_K/Q5_K): the extra unpack ALU is where wave32 + subgroupAdd's
     // lower register/barrier overhead nets out. Q4_K's tree id kernel already saturates (SG regressed).
-    if !matches!(dtype, Q6K | Q5K) {
+    //
+    // IQ3_S joins on the SAME band and the same NR=2 default: its expert DOWN projection is exactly
+    // the out_f≈2048 shape the band was cut for, and the grid codebook makes it the heaviest unpack
+    // of the set. NR rows/workgroup also amortizes `grid_init()`'s per-workgroup LDS staging of the
+    // codebook, which the one-row-per-workgroup tree kernel pays in full for every output row —
+    // measured on Qwen3.6-35B-A3B-UD-IQ3_S tg64: native_idm_iq3s 42.0 → 34.8ms, tg128 135.6 → 137.5.
+    //
+    // IQ2_S is deliberately NOT here. Its expert gate/up is the mirrored shape (in_f=2048,
+    // out_f=512), and out_f=512 both falls under this band AND is where the SG route loses badly:
+    // forced on (MINOUT=512), native_idm_iq2s went 49.8 → 117.2ms (NR=2) / 85.8ms (NR=4) / 86.8ms
+    // (NR=8), dragging tg128 136 → 121-127. A 32-lane workgroup has to stage the same 8 KB table
+    // with half the tree kernel's threads, and 8 KB of LDS on a single-wave workgroup collapses
+    // occupancy — the staging amortization NR buys never pays that back. Eliminating the staging
+    // (codebook in an L2-resident BUFFER instead of per-workgroup LDS) is the real fix for the
+    // gate/up shape and is NOT what this tier does; ablating grid_init() outright measured
+    // native_idm_iq2s 49.8 → 23.3ms, i.e. ~50ms of a 505ms decode still on the table.
+    if !matches!(dtype, Q6K | Q5K | Iq3S) {
         return None;
     }
     // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).

@@ -980,6 +980,28 @@ fn main() {
             "native_idm_q5k_sg8",
             &["-DFMT_Q5K", "-DNR=8"],
         ),
+        // IQ3_S SG id variant: the Qwen3.6-35B-A3B UD-IQ3_S quant stores the expert DOWN projection
+        // as IQ3_S at the same out_f≈2048 shape the Q5_K/Q6_K band was cut for, and the grid
+        // codebook is the heaviest unpack of the set — NR rows/workgroup ALSO amortizes
+        // grid_init()'s per-workgroup LDS staging, which the one-row-per-workgroup tree kernel pays
+        // for every output row (A/B-confirmed a win: native_idm_iq3s 42.0 → 34.8ms). IQ2_S is
+        // deliberately absent — its mirrored gate/up shape (out_f=512) LOSES badly on this tier;
+        // see native_id_sg_choice's doc for the measured numbers. NR ∈ {2,4,8}.
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg2",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=2"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg4",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=4"],
+        ),
+        (
+            "native_gemv_id_multi_sg",
+            "native_idm_iq3s_sg8",
+            &["-DFMT_IQ3S", "-DUSE_GRID", "-DNR=8"],
+        ),
         ("moe_accumulate", "moe_accumulate", &[]),
         ("moe_accumulate_scaled", "moe_accumulate_scaled", &[]),
         ("native_mmv_id_q4k", "native_mmv_id_q4k", &[]),

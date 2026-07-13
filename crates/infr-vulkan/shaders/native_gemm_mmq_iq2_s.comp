@@ -5,8 +5,9 @@
 // grid index (8 bits `qs` + 2 `qh` bits) selects a u64 (two u32s) of eight |code| bytes from the
 // 1024-entry IQ2S grid and a per-8-element sign byte flips each element. The signed product
 // sgn8(bv)·(±1) IS a small int8 — the dp4a operand — and the 4-bit scale nibble covers 16
-// elements, so BLK=16 (HALF the activation's 32-block, same granularity split as Q2_K/Q3_K's
-// mmq). SYMMETRIC (no min term): no `sact` binding.
+// elements. The k-loop nevertheless runs at BLK=32 (the ACTIVATION's quant block), staging the two
+// 16-element scale sub-blocks together and folding each into `acc` under its own scale — see the
+// BLK comment below for why. SYMMETRIC (no min term): no `sact` binding.
 //
 // The 8 KB grid table is staged into `shared` memory once per workgroup (grid_init() from the
 // generated native_grids.glsl — the same per-invocation-scratch fix the grid decode GEMVs
@@ -15,7 +16,7 @@
 // exclusion recorded predates that fix (see MOE_MMQ_DTYPES's EXCLUSIONS doc).
 // Block (82 bytes): [half d][u8 qs[32]][u8 signs[32]][u8 qh[8]][u8 scales[8]].
 // Ground-truthed against infr-gguf's dequant.rs IQ2_S reference and native_decode.glsl's
-// FMT_IQ2S dq/dqblk. Requires n%64, k%16.
+// FMT_IQ2S dq/dqblk. Requires n%64, k%32.
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -30,8 +31,19 @@ const uint BM = BM_TILE; // row tile — 64 default, EXPERT_GRID batched-MoE cal
                          // override smaller (e.g. 32) to fit small per-expert row counts
 
 const uint BN = 64u;
-const uint BLK = 16u;       // IQ2_S scale sub-block granularity (one 4-bit nibble per 16)
-const uint WPB = BLK / 4u;  // 4 packed-int8 u32 words per 16-block
+// BLK is the activation's 32-block, NOT IQ2_S's 16-element scale sub-block: each k-loop pass
+// stages TWO consecutive 16-sub-blocks (the `lo`/`hi` halves) and applies their two scale nibbles
+// to two separate dp4a partial sums. IQ2_S's scale granularity is 16, and iterating at 16 (what
+// this kernel used to do) made it the ONLY mmq expert kernel running k/16 passes where q4k/q6k/
+// iq3_s/iq4_xs run k/32 — i.e. DOUBLE the barriers, scale staging, `dact` loads and per-pass index
+// arithmetic for identical dp4a work. That fixed per-pass overhead, not the grid gather, was the
+// bulk of the 80.7ms vs Q4_K's 46.1ms expert_gateup gap at pp512 (Qwen3.6-35B-A3B-UD-IQ3_S).
+//
+// The merge is exact: a 32-block start is 32-aligned and the expert stride / k are 256-multiples,
+// so `si = (gstart>>4)&15` is always EVEN. Hence the two halves share one `ib32 = si/2` AND one
+// scale BYTE (low nibble = sub-block si, high nibble = si+1) — one `rb` now serves both scales.
+const uint BLK = 32u;
+const uint WPB = BLK / 4u;  // 8 packed-int8 u32 words per 32-block (two 16-elem sub-blocks)
 const uint TM = 4u;
 const uint TN = 4u;
 const uint THREADS = (BM / TM) * (BN / TN); // 256
@@ -67,7 +79,8 @@ layout(binding = 3) writeonly buffer CB { float c[]; };         // [m, n]
 
 shared uint As[BM * SP];
 shared uint Bs[BN * SP];
-shared float Bdl[BN];
+shared float Bdl[BN]; // scale of the LO 16-elem sub-block (words 0..3 of the pass)
+shared float Bdh[BN]; // scale of the HI 16-elem sub-block (words 4..7)
 
 #ifdef PAGED
 uint nw_base = 0u; // this expert's arena WORD base (set once in main from the LUT)
@@ -80,7 +93,6 @@ float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 
 void main() {
     grid_init(); // barrier inside — must precede the (workgroup-uniform) early return below
-    uint nsub = pc.k / BLK;       // 16-element sub-blocks along k
     uint nblk32 = pc.k / 32u;     // activation 32-blocks along k
     uint kw = pc.k / 4u;
     uint tilesN = pc.n / BN;
@@ -111,44 +123,63 @@ void main() {
     [[unroll]] for (uint i = 0u; i < TM; i++)
         [[unroll]] for (uint j = 0u; j < TN; j++) acc[i][j] = 0.0;
 
-    for (uint sub = 0u; sub < nsub; sub++) {
-        uint blk32 = sub >> 1u; // the 32-block this 16-sub-block lives in (for dact)
+#ifdef EXPERT_GRID
+    // Dead-row mask — see native_gemm_mmq_q4k.comp for the full rationale. A tile is only skipped
+    // WHOLESALE above (first row past the segment); inside a PARTIAL tile the rows past `rowEnd`
+    // still ran the full dp4a loop and had their results thrown away by the clipped store. On the
+    // 256-expert × top-8 pool this model ships (Qwen3.6-35B-A3B: ~16 routed rows/expert at pp512)
+    // even the BM=32 `_xp32` tile the recorder already picks is HALF dead rows.
+    //
+    // Thread→row is `tr = li / (BN/TN)`, so `live` is uniform across each 8-row-per-wave stripe —
+    // fully-dead waves retire the loop body instead of diverging. Staging and BOTH barriers stay
+    // UNCONDITIONAL: every invocation must reach every barrier, and dead threads still stage the
+    // As/Bs/Bdl the live ones read (and grid_init()'s shared table above).
+    bool live = (wgRow + tr * TM) < rowEnd;
+#else
+    const bool live = true;
+#endif
+
+    for (uint blk = 0u; blk < nblk32; blk++) {
         // stage activations: BM rows × WPB packed words (rows ≥ m read garbage, output ignored)
         for (uint idx = li; idx < BM * WPB; idx += THREADS) {
             uint r = idx / WPB;
             uint p = idx % WPB;
-            As[r * SP + p] = qa[(wgRow + r) * kw + sub * WPB + p];
+            As[r * SP + p] = qa[(wgRow + r) * kw + blk * WPB + p];
         }
-        // per-col scale d·(0.5+sc4)·0.25 for this 16-sub-block: `si` (the sub-block's index
-        // within its 256-elem superblock) derived from the COLUMN's own element offset (same
-        // k%16-but-not-%256 lesson as native_gemm_mmq_q3_k's `si`).
+        // per-col scales d·(0.5+sc4)·0.25 for BOTH 16-sub-blocks of this 32-block. `si` (the
+        // sub-block's index within its 256-elem superblock) is derived from the COLUMN's own
+        // element offset (the k%16-but-not-%256 lesson from native_gemm_mmq_q3_k's `si`) and is
+        // EVEN here (32-aligned start, 256-multiple stride) — so ONE scale byte holds both
+        // nibbles: low = sub-block si, high = si+1.
         for (uint cc = li; cc < BN; cc += THREADS) {
-            uint gstart = wbase + (wgCol + cc) * pc.k + sub * BLK;
+            uint gstart = wbase + (wgCol + cc) * pc.k + blk * BLK;
             uint bd = (gstart / 256u) * 82u;
             uint si = (gstart >> 4u) & 15u;
             float d = f16tof32(ru16(bd));
             uint sc = rb(bd + 74u + si / 2u);
-            uint nib = ((si & 1u) == 0u) ? (sc & 0xFu) : (sc >> 4u);
-            Bdl[cc] = d * (0.5 + float(nib)) * 0.25;
+            Bdl[cc] = d * (0.5 + float(sc & 0xFu)) * 0.25;
+            Bdh[cc] = d * (0.5 + float(sc >> 4u)) * 0.25;
         }
         // stage weights: BN cols × WPB words — 10-bit grid index → shared grid u32 (four signed
-        // |code| bytes) → per-byte sign flip → packed int8. Word p covers j = (p&1)*4 .. +3 of
-        // 8-element sign group l = (si&1)*2 + p/2, so ONE grid gather + one sign nibble serve
-        // all 4 bytes.
+        // |code| bytes) → per-byte sign flip → packed int8. Words 0..3 cover the LO 16-sub-block
+        // (si), words 4..7 the HI one (si+1); within a sub-block, word `pw` covers j = (pw&1)*4
+        // .. +3 of 8-element sign group l = (si&1)*2 + pw/2, so ONE grid gather + one sign nibble
+        // still serve all 4 bytes. Both halves share `bd` and `ib32` (si is even).
         for (uint idx = li; idx < BN * WPB; idx += THREADS) {
             uint cc = idx / WPB;
             uint p = idx % WPB;
-            uint gstart = wbase + (wgCol + cc) * pc.k + sub * BLK;
+            uint gstart = wbase + (wgCol + cc) * pc.k + blk * BLK;
             uint bd = (gstart / 256u) * 82u;
-            uint si = (gstart >> 4u) & 15u;
+            uint si = ((gstart >> 4u) & 15u) + (p >> 2u); // +1 for the hi sub-block
+            uint pw = p & 3u;                             // word index within that sub-block
             uint ib32 = si / 2u;
-            uint l = (si & 1u) * 2u + p / 2u;
-            uint hi4 = (p & 1u) * 4u; // j base of this word within the sign group
+            uint l = (si & 1u) * 2u + pw / 2u;
+            uint hi4 = (pw & 1u) * 4u; // j base of this word within the sign group
             uint qsb = rb(bd + 2u + ib32 * 4u + l);
             uint qh = rb(bd + 66u + ib32);
             uint grididx = qsb | ((qh << (8u - 2u * l)) & 0x300u);
             uint signs = rb(bd + 2u + 32u + ib32 * 4u + l) >> hi4;
-            int gw = int(G_IQ2S[2u * grididx + (p & 1u)]);
+            int gw = int(G_IQ2S[2u * grididx + (pw & 1u)]);
             uint packed = 0u;
             [[unroll]] for (uint b = 0u; b < 4u; b++) {
                 int q = bitfieldExtract(gw, int(8u * b), 8);
@@ -159,27 +190,50 @@ void main() {
         }
         barrier();
 
-        int qsum[TM][TN];
+        if (live) {
+        // Two partial sums — the lo/hi 16-sub-blocks carry DIFFERENT scale nibbles, so they can
+        // only be folded into `acc` separately (one shared `dact` serves both: the activation's
+        // quant block is the 32-block).
+        int qlo[TM][TN];
+        int qhi[TM][TN];
         [[unroll]] for (uint i = 0u; i < TM; i++)
-            [[unroll]] for (uint j = 0u; j < TN; j++) qsum[i][j] = 0;
-        [[unroll]] for (uint p = 0u; p < WPB; p++) {
+            [[unroll]] for (uint j = 0u; j < TN; j++) { qlo[i][j] = 0; qhi[i][j] = 0; }
+        [[unroll]] for (uint p = 0u; p < WPB / 2u; p++) {
             int av[TM];
             int bv[TN];
             [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * SP + p]);
             [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * SP + p]);
             [[unroll]] for (uint i = 0u; i < TM; i++)
                 [[unroll]] for (uint j = 0u; j < TN; j++)
-                    qsum[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsum[i][j]);
+                    qlo[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qlo[i][j]);
+        }
+        [[unroll]] for (uint p = WPB / 2u; p < WPB; p++) {
+            int av[TM];
+            int bv[TN];
+            [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * SP + p]);
+            [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * SP + p]);
+            [[unroll]] for (uint i = 0u; i < TM; i++)
+                [[unroll]] for (uint j = 0u; j < TN; j++)
+                    qhi[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qhi[i][j]);
         }
 
         float dval[TM];
         [[unroll]] for (uint i = 0u; i < TM; i++)
-            dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]);
+            dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + blk]);
+        // Folded into `acc` as TWO SEQUENTIAL adds (lo then hi), NOT as a fused
+        // `dval*(dl*qlo + dh*qhi)`: the two 16-sub-blocks used to be consecutive iterations of the
+        // BLK=16 k-loop, each doing exactly this `acc += dval*d*qsum`. Keeping them sequential
+        // preserves that summation order EXACTLY, so the merged kernel stays BIT-IDENTICAL to the
+        // pre-merge one (`dval` is the same for both halves — one dact per 32-block — so there is
+        // no other ordering difference). Fusing them reassociates; this does not.
         [[unroll]] for (uint j = 0u; j < TN; j++) {
             float dl = Bdl[tc * TN + j];
+            float dh = Bdh[tc * TN + j];
             [[unroll]] for (uint i = 0u; i < TM; i++) {
-                acc[i][j] += dval[i] * dl * float(qsum[i][j]);
+                acc[i][j] += dval[i] * dl * float(qlo[i][j]);
+                acc[i][j] += dval[i] * dh * float(qhi[i][j]);
             }
+        }
         }
         // Placed AFTER the shared-scale reads above (Bdl), not after the qsum loop: every shared
         // read of this iteration (As/Bs in qsum AND the per-col scales here) must complete before

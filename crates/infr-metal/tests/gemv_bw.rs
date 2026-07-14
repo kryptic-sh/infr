@@ -140,6 +140,22 @@ fn q5k_swar_probe() {
     bench_chained(DType::Q5K, &wq5k, 1152, 65536, 5.5, "q5k head");
 }
 
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f16_native_probe() {
+    let (in_f, out_f) = (1152usize, 65536usize);
+    let wf: Vec<f32> = (0..out_f * in_f).map(|i| (i % 13) as f32 * 0.01).collect();
+    let w16: Vec<u8> = wf
+        .into_iter()
+        .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+        .collect();
+
+    std::env::set_var("INFR_METAL_NO_F16_NATIVE", "1");
+    bench_chained(DType::F16, &w16, in_f, out_f, 32.0, "f16 cached-f32");
+    std::env::remove_var("INFR_METAL_NO_F16_NATIVE");
+    bench_chained(DType::F16, &w16, in_f, out_f, 16.0, "f16 native");
+}
+
 fn synth_q5_0(n_elem: usize, seed: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for blk_i in 0..(n_elem / 32) {

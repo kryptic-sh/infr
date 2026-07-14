@@ -2514,27 +2514,51 @@ impl MetalBackend {
                         );
                     }
                 } else {
-                    // f16/f32/bf16 weight: dequant-to-f32 device buffer, cached.
-                    let bw = self.weight_buf(weight, g, bindings)?;
-                    let pso = self.pipelines.get("linear_f32")?;
-                    if let Some(label) =
-                        counter_linear_label(self.counter_set.is_some(), "linear_f32")
-                    {
+                    let f16_native =
+                        wdt == DType::F16 && std::env::var("INFR_METAL_NO_F16_NATIVE").is_err();
+                    let (kern, elem_bytes) = match wdt {
+                        DType::F16 if f16_native => ("linear_f16", 2u64),
+                        _ => ("linear_f32", 4u64),
+                    };
+                    let pso = self.pipelines.get(kern)?;
+                    if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern) {
                         r.cur_op = label;
                     }
-                    self.encode_tg_off(
-                        r,
-                        &pso,
-                        &[
-                            (bx.as_ref(), 0),
-                            (bw.as_ref(), w_off as u64 * 4),
-                            (bd.as_ref(), 0),
-                        ],
-                        1 << 2,
-                        &p,
-                        m * out_f * 32,
-                        32,
-                    );
+                    if f16_native {
+                        // Read the uploaded GGUF half buffer directly. Besides halving the weight
+                        // stream, this avoids a same-size host read plus a 2x f32 cache allocation.
+                        let bw =
+                            metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
+                        self.encode_tg_off(
+                            r,
+                            &pso,
+                            &[
+                                (bx.as_ref(), 0),
+                                (&bw.raw, w_off as u64 * elem_bytes),
+                                (bd.as_ref(), 0),
+                            ],
+                            1 << 2,
+                            &p,
+                            m * out_f * 32,
+                            32,
+                        );
+                    } else {
+                        // f32/bf16 weight: dequant-to-f32 device buffer, cached.
+                        let bw = self.weight_buf(weight, g, bindings)?;
+                        self.encode_tg_off(
+                            r,
+                            &pso,
+                            &[
+                                (bx.as_ref(), 0),
+                                (bw.as_ref(), w_off as u64 * elem_bytes),
+                                (bd.as_ref(), 0),
+                            ],
+                            1 << 2,
+                            &p,
+                            m * out_f * 32,
+                            32,
+                        );
+                    }
                 }
                 r.loc[dst.0 as usize] = Loc::Device;
             }

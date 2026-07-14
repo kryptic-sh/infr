@@ -22,6 +22,26 @@ kernel void linear_f32(device const float* x   [[buffer(0)]],
     if (lane == 0u) dst[sg] = acc;
 }
 
+// Native f16-weight twin of linear_f32. Activations and accumulation stay f32; only the bound
+// weight stream is half-width, matching the GGUF value exactly without a host f16->f32 cache.
+kernel void linear_f16(device const float* x   [[buffer(0)]],
+                       device const half*  w   [[buffer(1)]],
+                       device float*       dst [[buffer(2)]],
+                       constant LinearParams& p [[buffer(3)]],
+                       uint gid [[thread_position_in_grid]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.m * p.out_f) return;
+    uint r = sg / p.out_f;
+    uint o = sg % p.out_f;
+    device const float* xr = x + (ulong)r * p.in_f;
+    device const half* wo = w + (ulong)o * p.in_f;
+    float acc = 0.0f;
+    for (uint i = lane; i < p.in_f; i += 32u) acc += xr[i] * (float)wo[i];
+    acc = simd_sum(acc);
+    if (lane == 0u) dst[sg] = acc;
+}
+
 // ---- Linear over a NATIVE quantized weight. Two on-device forms:
 //
 // * FACTORED (`dequant_factored`): bit-packed 4/6/8-bit codes + one (sc, m) i16 pair per

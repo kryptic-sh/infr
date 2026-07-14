@@ -89,9 +89,28 @@ pub(crate) fn no_template_err() -> anyhow::Error {
 
 /// Whether a Vulkan device is available — a cheap probe (creates and drops a backend). Lets callers
 /// (and tests) decide between the GPU and CPU paths, or skip GPU-only work when there's no device.
+///
+/// PANICS when `INFR_DEV` is set and that device cannot be opened. An EXPLICIT device request is a
+/// demand, not a hint: the GPU seam tests gate on this probe and self-skip when it is false, so a
+/// failing/absent `INFR_DEV` device used to make the whole GPU suite skip SILENTLY and still report
+/// "ok" — `INFR_DEV=Vulkan9 cargo test` returned "1 passed" in 0.02 s. A vacuous green on the exact
+/// runs we most need to trust (a survey pinning a specific GPU) is worse than a crash, so refuse.
+/// An UNSET `INFR_DEV` on a GPU-less box keeps returning false and skipping, exactly as before.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn gpu_available() -> bool {
-    VulkanBackend::new().is_ok()
+    match VulkanBackend::new() {
+        Ok(_) => true,
+        Err(e) => {
+            if let Ok(dev) = std::env::var("INFR_DEV") {
+                panic!(
+                    "INFR_DEV={dev} was requested but that Vulkan device could not be opened: {e}\n\
+                     Refusing to silently fall back / skip: an explicit device is a demand, not a \
+                     hint. Unset INFR_DEV to run on the default device (or on the CPU)."
+                );
+            }
+            false
+        }
+    }
 }
 
 /// Locate the Qwen3-0.6B Q4_K_M GGUF in the HF Hub cache (or `INFR_TEST_MODEL`) for the model-backed

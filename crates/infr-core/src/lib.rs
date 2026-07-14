@@ -14,8 +14,8 @@ pub mod progress;
 pub mod tensor;
 
 pub use backend::{
-    Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan, COOPMAT_TILE_16,
-    COOPMAT_TILE_8,
+    integrated_ubatch_rows, Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan,
+    COOPMAT_TILE_16, COOPMAT_TILE_8,
 };
 pub use error::{Error, Result};
 pub use graph::{Activation, AttnMask, Graph, Op, TensorDecl, TensorKind};

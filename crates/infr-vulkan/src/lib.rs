@@ -67,6 +67,32 @@ unsafe fn as_vk_buf(b: &dyn Buffer) -> &VkBuffer {
     &*(b as *const dyn Buffer as *const () as *const VkBuffer)
 }
 
+// ── device class (process-global) ─────────────────────────────────────────────
+
+/// The class of the Vulkan device this PROCESS opened — see [`device_class`].
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceClass {
+    /// `deviceType == INTEGRATED_GPU` (see [`Capabilities::integrated`]).
+    pub integrated: bool,
+    /// Compute units, or 0 = unknown (see [`Capabilities::compute_units`]).
+    pub compute_units: u32,
+}
+
+/// Set ONCE by the first [`VulkanBackend::new`] in the process.
+static DEVICE_CLASS: std::sync::OnceLock<DeviceClass> = std::sync::OnceLock::new();
+
+/// The class of the Vulkan device this process opened, or `None` when no Vulkan backend has been
+/// constructed (a CPU/Metal run, or a GPU-less box).
+///
+/// A PROCESS-GLOBAL because its one consumer, the seam's `ubatch_rows`, is itself a process-global
+/// funnel: the prefill loop, the activation reserve, and the SWA ring sizing must all agree on ONE
+/// chunk height, and they are reached from call sites that hold no backend handle. Same shape and
+/// lifetime as the seam's existing `PINNED_UBATCH`. A multi-GPU process mixing an iGPU and a dGPU
+/// would pin whichever opened first; infr opens exactly one device per process today.
+pub fn device_class() -> Option<DeviceClass> {
+    DEVICE_CLASS.get().copied()
+}
+
 // ── shared GPU state ──────────────────────────────────────────────────────────
 
 /// Device-local VRAM snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
@@ -1206,6 +1232,27 @@ impl VulkanBackend {
             sg_pref
         };
 
+        // ── integrated GPU + compute-unit count ───────────────────────────────────────────────
+        // An iGPU/APU is NOT just "a slow discrete card": it is forced onto the non-coopmat kernel
+        // tier (RDNA2/Raphael enumerates no cooperative matrix at all) AND carries ~1/50th the
+        // compute, so a prefill chunk sized for a 96-CU card becomes a single multi-SECOND command
+        // buffer — past the ~10 s `gfx`-ring watchdog it is a GPU reset, not merely slow. Detect the
+        // device class here and let the seam bound its per-submit work (`Capabilities::integrated`).
+        let integrated = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU;
+        // Best-effort CU count (AMD only; 0 = unknown). `VK_AMD_shader_core_properties` is a
+        // properties2 pNext, so it needs no device-extension ENABLE — only that the driver
+        // advertises it, hence the `has_ext` guard (chaining an unsupported struct is UB).
+        let compute_units = if has_ext(c"VK_AMD_shader_core_properties") {
+            let mut sc = vk::PhysicalDeviceShaderCorePropertiesAMD::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sc);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut p2) };
+            sc.shader_engine_count
+                * sc.shader_arrays_per_engine_count
+                * sc.compute_units_per_shader_array
+        } else {
+            0
+        };
+
         let caps = Capabilities {
             name: device_name,
             f16: has_f16,
@@ -1221,6 +1268,8 @@ impl VulkanBackend {
             subgroup_max,
             sg_pref,
             vendor_intel,
+            integrated,
+            compute_units,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
             max_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
             unified_memory: false, // discrete GPU
@@ -1241,6 +1290,14 @@ impl VulkanBackend {
             // (identity on full-context caches), so SWA layers may get window-sized ring caches.
             kv_swa_ring: true,
         };
+
+        // Publish the device class BEFORE any caller can size a prefill chunk against it (the seam
+        // reads this in `ubatch_rows`, which runs on the first session/KV allocation — strictly
+        // after `VulkanBackend::new` returns).
+        let _ = DEVICE_CLASS.set(DeviceClass {
+            integrated: caps.integrated,
+            compute_units: caps.compute_units,
+        });
 
         // One-line device banner (stderr) — the first thing to check on a portability bug report:
         // which GPU was picked and which kernel tiers are live. `y`/`n` per capability + the
@@ -1269,6 +1326,21 @@ impl VulkanBackend {
             caps.sg_pref,
             caps.max_shared_memory_bytes / 1024,
         );
+        // Integrated GPUs take a DIFFERENT prefill chunk (watchdog headroom — see
+        // `Capabilities::integrated`), so say so out loud: it is the first thing to check when an
+        // iGPU run hangs or prefills slowly. Silent on every discrete device (nothing changed).
+        if caps.integrated {
+            eprintln!(
+                "[infr] GPU: INTEGRATED (cu:{}) — prefill chunk capped to {} rows to stay under \
+                 the ~10s GPU watchdog; INFR_UBATCH overrides",
+                if caps.compute_units > 0 {
+                    caps.compute_units.to_string()
+                } else {
+                    "?".to_string()
+                },
+                infr_core::integrated_ubatch_rows(caps.compute_units),
+            );
+        }
 
         // ── gpu-allocator ──────────────────────────────────────────────────────
         let allocator = Allocator::new(&AllocatorCreateDesc {

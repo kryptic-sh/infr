@@ -109,6 +109,24 @@ pub struct Capabilities {
     /// dp4a tier default-on, `sg_pref = 16`) — NOT detected from subgroup sizes (some Xe2 SKUs
     /// report `subgroup_min` 8, others 16, so size-sniffing would misclassify).
     pub vendor_intel: bool,
+    /// `VkPhysicalDeviceProperties.deviceType == INTEGRATED_GPU` — an iGPU/APU sharing the CPU's
+    /// memory controller and carrying one to two ORDERS OF MAGNITUDE less compute than the
+    /// discrete cards every dispatch shape here is tuned for (a Ryzen 9950X3D's RDNA2 iGPU is
+    /// ~2 CU against a 7900 XTX's 96).
+    ///
+    /// The load-bearing consequence is the GPU WATCHDOG, not throughput: amdgpu resets a `gfx`-ring
+    /// job that runs past ~10 s (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`), and infr
+    /// submits ONE command buffer per forward pass — so a whole prefill chunk is a SINGLE watchdog
+    /// job. A default 1024-row chunk measures 0.78-1.12 s of GPU on a 7900 XTX in the NON-COOPMAT
+    /// tier an iGPU is forced onto (RDNA2 has no cooperative matrix), which at the ~32x slowdown
+    /// calibrated from a real iGPU run lands at 25-36 s — a guaranteed TDR. Devices that set this
+    /// get a smaller default prefill chunk (see the seam's `ubatch_rows`), the one knob that
+    /// bounds per-submit GPU time. Discrete devices leave it false and every shape stays as tuned.
+    pub integrated: bool,
+    /// Shader/compute-unit count when the device advertises one (`VK_AMD_shader_core_properties`),
+    /// else 0 = UNKNOWN. ADVISORY only — it scales the `integrated` chunk budget where present.
+    /// Never gate correctness on it: most drivers report nothing.
+    pub compute_units: u32,
     pub max_buffer_bytes: u64,
     /// `maxComputeSharedMemorySize` — the per-workgroup shared-memory budget. Vulkan only guarantees
     /// 16 KB; RADV gives 64 KB, NVIDIA 48 KB, MoltenVK/mobile often 32 KB. The flash-attention tile
@@ -159,6 +177,39 @@ pub struct Capabilities {
     /// full context (see the seam's SWA ring sizing). Backends whose kernels index rows directly
     /// by position (Metal) leave this false and get full-context allocations for every layer.
     pub kv_swa_ring: bool,
+}
+
+/// The DEFAULT prefill chunk (rows) for an INTEGRATED GPU with `cu` compute units (0 = unknown).
+///
+/// WHY a separate default at all: the GPU watchdog is per-SUBMIT, and infr submits one command
+/// buffer per forward pass — so a prefill chunk is a single indivisible watchdog job. The chunk
+/// height is therefore the ONLY knob that bounds it.
+///
+/// Where the numbers come from (measured, 7900 XTX under `INFR_NO_COOPMAT=1` — the exact kernel
+/// tier an iGPU is forced onto, since RDNA2 enumerates no cooperative matrix):
+///   * Qwen3-8B  Q4_K_M, one 512-row prefill chunk: 363 ms of GPU.
+///   * gemma-3-12b Q4_K_M, same: 505 ms.
+///   * The iGPU:dGPU slowdown on that tier CALIBRATES to ~32x from a real iGPU datapoint
+///     (gemma-3-12b decode: 345 ms/tok observed on the iGPU vs 10.7 ms/tok here).
+///
+/// So a 512-row chunk is 12-16 s on the iGPU and a default 1024-row chunk is 25-36 s — both past
+/// the ~10 s `gfx`-ring timeout. 128 rows puts the same chunk at ~3-4 s, a >2x margin, and is the
+/// reference point below (the surveyed iGPU is a ~2-CU RDNA2 Raphael part).
+///
+/// Scaling: linear in CU count where the driver reports one, so a beefier iGPU (a 12-CU 780M) is
+/// not needlessly throttled, clamped to the discrete default so this can only ever SHRINK the
+/// chunk. An unknown CU count takes the conservative floor.
+pub fn integrated_ubatch_rows(cu: u32) -> usize {
+    /// The surveyed iGPU (RDNA2 Raphael/Mendocino) — the part the 128-row figure is calibrated on.
+    const BASE_CU: u32 = 2;
+    /// Watchdog-safe chunk at BASE_CU (see above).
+    const BASE_ROWS: usize = 128;
+    /// Never exceed the discrete default — this is a hardening cap, not a tuning knob.
+    const MAX_ROWS: usize = 1024;
+    if cu == 0 {
+        return BASE_ROWS; // unknown: assume the weakest part we have measured
+    }
+    (BASE_ROWS * (cu as usize).div_ceil(BASE_CU as usize).max(1)).clamp(BASE_ROWS, MAX_ROWS)
 }
 
 impl Capabilities {
@@ -401,5 +452,42 @@ pub trait Backend: Send + Sync {
             sampled_out,
         );
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The integrated chunk policy. The load-bearing property is the CEILING: this may only ever
+    /// SHRINK the discrete default (1024), never grow it — it is a watchdog guard, not a tuning
+    /// knob — and it must never return 0 (a zero-row prefill chunk would not terminate).
+    #[test]
+    fn integrated_ubatch_rows_is_a_bounded_shrink() {
+        // Unknown CU count (the common case: only AMD reports one) takes the conservative floor —
+        // the ~2-CU RDNA2 iGPU the 128-row figure is calibrated on.
+        assert_eq!(integrated_ubatch_rows(0), 128);
+        assert_eq!(integrated_ubatch_rows(2), 128); // the calibrated part
+        assert_eq!(integrated_ubatch_rows(1), 128); // never below the floor
+                                                    // Linear in CU count, so a beefier iGPU is not needlessly throttled.
+        assert_eq!(integrated_ubatch_rows(4), 256);
+        assert_eq!(integrated_ubatch_rows(12), 768); // Radeon 780M class
+                                                     // ...but clamped at the DISCRETE default: this can only shrink the chunk, never grow it.
+        assert_eq!(integrated_ubatch_rows(16), 1024);
+        assert_eq!(integrated_ubatch_rows(64), 1024);
+        assert_eq!(integrated_ubatch_rows(u32::MAX), 1024);
+        for cu in [0, 1, 2, 3, 7, 8, 33, 96, 1024, u32::MAX] {
+            let r = integrated_ubatch_rows(cu);
+            assert!((128..=1024).contains(&r), "cu={cu} -> {r} out of bounds");
+        }
+    }
+
+    /// A DISCRETE GPU must be untouched by any of this: `integrated` defaults false, so the seam's
+    /// `default_ubatch_rows` takes its 1024 branch and no tuned dGPU shape moves.
+    #[test]
+    fn discrete_is_the_default() {
+        let caps = Capabilities::default();
+        assert!(!caps.integrated);
+        assert_eq!(caps.compute_units, 0);
     }
 }

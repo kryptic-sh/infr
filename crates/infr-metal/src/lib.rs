@@ -218,6 +218,13 @@ impl Backend for MetalBackend {
             subgroup_max: 0,
             sg_pref: 0, // Vulkan-only shader-pick field; Metal exec arms pick their own kernels
             vendor_intel: false,
+            // Apple GPUs ARE integrated in the memory sense (`unified_memory` below says so), but
+            // `integrated` here means "submits must stay under a GPU watchdog TDR" — the Vulkan/
+            // amdgpu `gfx`-ring reset this guards against. Metal has no equivalent for compute and
+            // an Apple GPU is nowhere near the ~2-CU class the smaller prefill chunk is calibrated
+            // for, so leave it false and keep Metal's chunk exactly as tuned.
+            integrated: false,
+            compute_units: 0,
             max_buffer_bytes: self.device.max_buffer_length(),
             // Metal's per-threadgroup memory limit (MTLDevice.maxThreadgroupMemoryLength) — the
             // analogue of Vulkan's maxComputeSharedMemorySize (typically 32 KB, 64 KB on Apple GPUs).

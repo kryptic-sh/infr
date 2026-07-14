@@ -267,15 +267,36 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
     FIXED + rows * per_row * 5 / 4
 }
 
-/// Batched-prefill micro-batch: rows per prefill chunk (INFR_UBATCH, default 1024). ONE reader
-/// funnel — the prefill loop, the activation reserve, and the SWA ring sizing below all derive
-/// from this, because the ring's correctness bound is "window + one whole prefill chunk".
+/// Batched-prefill micro-batch: rows per prefill chunk (INFR_UBATCH, default 1024 — but see
+/// [`default_ubatch_rows`] for the INTEGRATED-GPU default). ONE reader funnel — the prefill loop,
+/// the activation reserve, and the SWA ring sizing below all derive from this, because the ring's
+/// correctness bound is "window + one whole prefill chunk".
 pub(crate) fn ubatch_rows() -> usize {
     std::env::var("INFR_UBATCH")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&v| v > 0)
-        .unwrap_or_else(|| PINNED_UBATCH.get().copied().unwrap_or(1024))
+        .unwrap_or_else(|| {
+            PINNED_UBATCH
+                .get()
+                .copied()
+                .unwrap_or_else(default_ubatch_rows)
+        })
+}
+
+/// The prefill chunk when neither INFR_UBATCH nor the placement sweep pinned one: 1024 rows, EXCEPT
+/// on an integrated GPU, where a chunk that big is a single multi-second command buffer and trips
+/// the ~10 s GPU watchdog (`ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST`). See
+/// [`infr_core::integrated_ubatch_rows`] for the measurements behind the smaller default.
+///
+/// A DISCRETE device (and a CPU/Metal run, where no Vulkan backend was constructed and
+/// `device_class()` is `None`) takes the 1024 branch — byte-identical to before this existed, so
+/// no tuned dGPU shape moves.
+fn default_ubatch_rows() -> usize {
+    match infr_vulkan::device_class() {
+        Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
+        _ => 1024,
+    }
 }
 
 /// Prefill chunk (rows) for a sequence SHARING the GPU with other in-flight sequences

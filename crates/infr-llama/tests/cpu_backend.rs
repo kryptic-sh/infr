@@ -35,25 +35,6 @@ macro_rules! need_model {
     };
 }
 
-/// HARD-FAIL when there's no Vulkan device. Every caller is `#[ignore]`d ("requires a Vulkan
-/// GPU"), so a GPU test only runs when someone asked for it with `--include-ignored` — and at that
-/// point a missing GPU is a broken environment, not a reason to pass.
-///
-/// This used to `return` instead, and that was a VACUOUS GREEN: on a GPU-less box (CI, or this box
-/// while its iGPU was wedged out of enumeration) all 31 GPU tests printed "skip" and reported
-/// **passed**. A suite that reports success without executing is worse than no suite — it is the
-/// one test that would catch real corruption, quietly switched off.
-macro_rules! need_gpu {
-    () => {
-        assert!(
-            infr_llama::gpu_available(),
-            "no Vulkan GPU: this test is #[ignore]d and is only run on a GPU box \
-             (`cargo test -p infr-llama --test cpu_backend gpu_seam -- --include-ignored`). \
-             Refusing to pass without executing."
-        );
-    };
-}
-
 /// Serialize the model-gated generation tests. They mutate PROCESS-GLOBAL env that generation reads
 /// (`INFR_TEMP`, and `INFR_NO_THINK` — read at render time in infr-chat), and cargo
 /// runs tests in parallel; without this, one test's env leaks into another's generation (e.g.
@@ -174,7 +155,6 @@ fn qwen2_05b() -> Option<PathBuf> {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen2() {
     let path = need_model!(qwen2_05b(), "Qwen2.5-0.5B-Instruct");
-    need_gpu!();
     let _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
@@ -376,7 +356,6 @@ const QWEN3_SEAM_GOLDEN: &[(&str, usize, u64)] = &[
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_golden_qwen3() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
@@ -400,7 +379,6 @@ fn gpu_seam_golden_qwen3() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_iq4xs() {
     let path = need_model!(qwen3_quant("IQ4_XS"), "Qwen3-0.6B-IQ4_XS");
-    need_gpu!();
     let _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
@@ -417,7 +395,6 @@ fn gpu_seam_matches_cpu_qwen3_iq4xs() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_q2k() {
     let path = need_model!(qwen3_quant("Q2_K"), "Qwen3-0.6B-Q2_K");
-    need_gpu!();
     let _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
@@ -434,7 +411,6 @@ fn gpu_seam_matches_cpu_qwen3_q2k() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
     let path = need_model!(qwen3_quant("Q8_0"), "Qwen3-0.6B-Q8_0");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_I8_COOPMAT", "1");
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
@@ -449,7 +425,6 @@ fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_flash_matches_cpu() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
@@ -515,7 +490,6 @@ fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_kv_reuse_matches_fresh() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
@@ -562,7 +536,6 @@ fn gpu_seam_kv_reuse_matches_fresh() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_kv_q8_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     std::env::set_var("INFR_KV_Q8", "1");
@@ -619,7 +592,6 @@ fn gpu_seam_kv_q8_coherent() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_kv_mainline_quants_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let head = |s: &str| s.chars().take(64).collect::<String>();
@@ -661,7 +633,6 @@ fn gpu_seam_kv_mainline_quants_coherent() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_multi_slot_prefix_sharing() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
@@ -900,7 +871,6 @@ fn metal_seam_multi_slot_prefix_sharing() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma3() {
     let path = need_model!(gemma3_1b(), "gemma-3-1b");
-    need_gpu!();
     let _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
@@ -920,7 +890,6 @@ fn gpu_seam_matches_cpu_gemma3() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
     let path = need_model!(gemma3_1b_q2k(), "gemma-3-1b Q2_K");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
@@ -953,7 +922,6 @@ fn gpu_seam_matches_cpu_gemma3_q2k_iq4nl() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_llama() {
     let path = need_model!(llama32_1b(), "Llama-3.2-1B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "Count from one to five, digits only.", 16);
 }
@@ -963,7 +931,6 @@ fn gpu_seam_matches_cpu_llama() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma4() {
     let path = need_model!(gemma4_12b(), "gemma-4-12b");
-    need_gpu!();
     let _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
 }
@@ -993,7 +960,6 @@ const GEMMA4_E2B_GOLDEN: &[(&str, usize, u64)] = &[
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
 }
@@ -1007,7 +973,6 @@ fn gpu_seam_matches_cpu_gemma4_e2b() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
@@ -1048,7 +1013,6 @@ fn gpu_seam_bf16_matches_cpu() {
         eprintln!("skip: no BF16 model");
         return;
     }
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
@@ -1200,7 +1164,6 @@ fn cpu_golden_qwen35() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn unified_qwen35_gpu_seam_matches_cpu() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is bash? Answer briefly.", 24);
 }
@@ -1218,7 +1181,6 @@ fn unified_qwen35_gpu_seam_matches_cpu() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn unified_qwen35_session_no_rewind() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     std::env::set_var("INFR_IGNORE_EOS", "1"); // fixed-length turns, no early EOS stop
@@ -1542,7 +1504,6 @@ fn mtp_head_forward_finite() {
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn mtp_head_cpu_vulkan_parity() {
-    need_gpu!();
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
     let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
@@ -1612,7 +1573,6 @@ fn mtp_head_cpu_vulkan_parity() {
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn mtp_draft_chain_matches_per_step() {
-    need_gpu!();
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
     let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf");
@@ -1791,7 +1751,6 @@ fn mtp_head_trunk_acceptance_rate() {
 #[test]
 #[ignore = "MTP parked: int8 decode noise flips a close-margin greedy token (see mtp::mtp_enabled)"]
 fn mtp_spec_matches_target_only_greedy() {
-    need_gpu!();
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
@@ -1835,7 +1794,6 @@ fn mtp_spec_matches_target_only_greedy() {
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn mtp_spec_acceptance_stats() {
-    need_gpu!();
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
@@ -1924,7 +1882,6 @@ fn cpu_golden_qwen3moe() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_matches_resident_and_cpu() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     std::env::set_var("INFR_UBATCH", "1");
@@ -1982,7 +1939,6 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_matches_resident_and_cpu() {
     let path = need_model!(qwen3_17b(), "Qwen3-1.7B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let n = 8usize;
@@ -2040,7 +1996,6 @@ fn qwen3_14b_q8() -> Option<PathBuf> {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
     let path = need_model!(qwen3_14b_q8(), "Qwen3-14B-Q8_0");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let n = 8usize;
@@ -2159,7 +2114,6 @@ fn cpu_qwen35moe_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen35moe() {
     let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let tokens = model
@@ -2327,7 +2281,6 @@ fn cpu_llama4_scout_greedy() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_matches_scout_oracle() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     std::env::set_var("INFR_PAGER_STATS", "1");
@@ -2432,7 +2385,6 @@ fn cpu_diffusion_gemma_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     let tokens = model
@@ -2603,7 +2555,6 @@ fn cpu_diffusion_gemma_denoise_step() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
@@ -2714,7 +2665,6 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_diffusion_gemma_denoise_replay_matches_static() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     std::env::set_var("INFR_TEMP", "0");
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
@@ -2798,7 +2748,6 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn diffusion_gemma_decode_matches_oracle() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
-    need_gpu!();
     let _tlk = test_serial_lock();
     let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
     assert!(

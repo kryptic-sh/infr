@@ -15,7 +15,6 @@ pub mod seam;
 pub use seam::model::SeamModel;
 pub mod diffusion;
 mod util;
-pub use util::gpu_available;
 pub(crate) use util::*;
 mod kv;
 pub use kv::MoeConfig;

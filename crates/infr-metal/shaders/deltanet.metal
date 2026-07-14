@@ -58,13 +58,54 @@ kernel void deltanet_gates_f32(device const float* b       [[buffer(0)]],
 }
 
 #define DN_VPT 4u
+struct DeltaNetNormParams { uint rows; uint nk; uint kd; float eps; };
+
+// Multi-row norm prep: one simdgroup per token/key-head computes q/k L2 norms once,
+// instead of repeating both reductions for every value-head state column.
+template<uint KPL>
+kernel void deltanet_norm_f32_t(device const float* q      [[buffer(0)]],
+                                device const float* k      [[buffer(1)]],
+                                device float*       q_norm [[buffer(2)]],
+                                device float*       k_norm [[buffer(3)]],
+                                constant DeltaNetNormParams& p [[buffer(4)]],
+                                uint tgpig [[threadgroup_position_in_grid]],
+                                uint lane  [[thread_index_in_simdgroup]],
+                                uint sgid  [[simdgroup_index_in_threadgroup]]) {
+    uint i = tgpig * DN_VPT + sgid;
+    if (i >= p.rows * p.nk) return;
+    ulong base = (ulong)i * p.kd + lane * KPL;
+    float qv[KPL], kv[KPL];
+    float sq = 0.0f, sk = 0.0f;
+#pragma unroll
+    for (uint j = 0; j < KPL; j++) {
+        qv[j] = q[base + j];
+        kv[j] = k[base + j];
+        sq += qv[j] * qv[j];
+        sk += kv[j] * kv[j];
+    }
+    float qn = sqrt(simd_sum(sq) + p.eps);
+    float kn = sqrt(simd_sum(sk) + p.eps);
+    float qscale = rsqrt((float)p.kd);
+#pragma unroll
+    for (uint j = 0; j < KPL; j++) {
+        q_norm[base + j] = qv[j] / qn * qscale;
+        k_norm[base + j] = kv[j] / kn;
+    }
+}
+
+typedef decltype(deltanet_norm_f32_t<4>) deltanet_norm_f32_k;
+template [[host_name("deltanet_norm_k1")]] kernel deltanet_norm_f32_k deltanet_norm_f32_t<1>;
+template [[host_name("deltanet_norm_k2")]] kernel deltanet_norm_f32_k deltanet_norm_f32_t<2>;
+template [[host_name("deltanet_norm_k4")]] kernel deltanet_norm_f32_k deltanet_norm_f32_t<4>;
+template [[host_name("deltanet_norm_k8")]] kernel deltanet_norm_f32_k deltanet_norm_f32_t<8>;
+
 // KPL (k entries per lane, = kd/32) is a COMPILE-TIME template parameter: with a runtime
 // bound the ls[]/qv[]/kv[] arrays are runtime-indexed, the compiler cannot promote them to
 // registers, and the "register-resident" state silently spills to thread-private memory —
 // measured 1.7x SLOWER than the old threadgroup-staged shape (507 ms vs 302 per qwen35
 // prefill). Unrolled at fixed KPL the arrays genuinely live in registers: 185 ms, 1.6x
 // faster than the old shape.
-template<uint KPL, bool PREPARED_GATES>
+template<uint KPL, bool PREPARED_GATES, bool PREPARED_NORM>
 kernel void deltanet_f32_t(device const float* q       [[buffer(0)]],
                          device const float* k       [[buffer(1)]],
                          device const float* v       [[buffer(2)]],
@@ -102,15 +143,19 @@ kernel void deltanet_f32_t(device const float* q       [[buffer(0)]],
         for (uint j = 0; j < KPL; j++) {
             qv[j] = q[qb + j];
             kv[j] = k[qb + j];
-            sq += qv[j] * qv[j];
-            sk += kv[j] * kv[j];
+            if (!PREPARED_NORM) {
+                sq += qv[j] * qv[j];
+                sk += kv[j] * kv[j];
+            }
         }
-        float qn = sqrt(simd_sum(sq) + p.eps);
-        float kn = sqrt(simd_sum(sk) + p.eps);
+        if (!PREPARED_NORM) {
+            float qn = sqrt(simd_sum(sq) + p.eps);
+            float kn = sqrt(simd_sum(sk) + p.eps);
 #pragma unroll
-        for (uint j = 0; j < KPL; j++) {
-            qv[j] = qv[j] / qn * qscale;
-            kv[j] = kv[j] / kn;
+            for (uint j = 0; j < KPL; j++) {
+                qv[j] = qv[j] / qn * qscale;
+                kv[j] = kv[j] / kn;
+            }
         }
         float beta, decay;
         if (PREPARED_GATES) {
@@ -151,12 +196,16 @@ kernel void deltanet_f32_t(device const float* q       [[buffer(0)]],
     for (uint j = 0; j < KPL; j++) S[(ulong)(lane * KPL + j) * p.vd + d] = ls[j];
 }
 
-typedef decltype(deltanet_f32_t<4, false>) deltanet_f32_k;
-template [[host_name("deltanet_f32_k1")]] kernel deltanet_f32_k deltanet_f32_t<1, false>;
-template [[host_name("deltanet_f32_k2")]] kernel deltanet_f32_k deltanet_f32_t<2, false>;
-template [[host_name("deltanet_f32_k4")]] kernel deltanet_f32_k deltanet_f32_t<4, false>;
-template [[host_name("deltanet_f32_k8")]] kernel deltanet_f32_k deltanet_f32_t<8, false>;
-template [[host_name("deltanet_gates_k1")]] kernel deltanet_f32_k deltanet_f32_t<1, true>;
-template [[host_name("deltanet_gates_k2")]] kernel deltanet_f32_k deltanet_f32_t<2, true>;
-template [[host_name("deltanet_gates_k4")]] kernel deltanet_f32_k deltanet_f32_t<4, true>;
-template [[host_name("deltanet_gates_k8")]] kernel deltanet_f32_k deltanet_f32_t<8, true>;
+typedef decltype(deltanet_f32_t<4, false, false>) deltanet_f32_k;
+template [[host_name("deltanet_f32_k1")]] kernel deltanet_f32_k deltanet_f32_t<1, false, false>;
+template [[host_name("deltanet_f32_k2")]] kernel deltanet_f32_k deltanet_f32_t<2, false, false>;
+template [[host_name("deltanet_f32_k4")]] kernel deltanet_f32_k deltanet_f32_t<4, false, false>;
+template [[host_name("deltanet_f32_k8")]] kernel deltanet_f32_k deltanet_f32_t<8, false, false>;
+template [[host_name("deltanet_gates_k1")]] kernel deltanet_f32_k deltanet_f32_t<1, true, false>;
+template [[host_name("deltanet_gates_k2")]] kernel deltanet_f32_k deltanet_f32_t<2, true, false>;
+template [[host_name("deltanet_gates_k4")]] kernel deltanet_f32_k deltanet_f32_t<4, true, false>;
+template [[host_name("deltanet_gates_k8")]] kernel deltanet_f32_k deltanet_f32_t<8, true, false>;
+template [[host_name("deltanet_prepared_k1")]] kernel deltanet_f32_k deltanet_f32_t<1, true, true>;
+template [[host_name("deltanet_prepared_k2")]] kernel deltanet_f32_k deltanet_f32_t<2, true, true>;
+template [[host_name("deltanet_prepared_k4")]] kernel deltanet_f32_k deltanet_f32_t<4, true, true>;
+template [[host_name("deltanet_prepared_k8")]] kernel deltanet_f32_k deltanet_f32_t<8, true, true>;

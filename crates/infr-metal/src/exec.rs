@@ -226,6 +226,16 @@ mod tests {
     }
 
     #[test]
+    fn deltanet_msl_has_hoisted_qk_norm() {
+        let src = include_str!("../shaders/deltanet.metal");
+        assert!(contains_tokens(src, "kernel void deltanet_norm_f32_t"));
+        assert!(contains_tokens(src, "host_name(\"deltanet_prepared_k4\")"));
+        // Q/k prep first wins at 8 rows; 4 rows measured neutral because it stays inline.
+        assert!(!prefer_deltanet_norm_prep(4));
+        assert!(prefer_deltanet_norm_prep(8));
+    }
+
+    #[test]
     fn argmax_split_policy_only_targets_vocab_scale_inputs() {
         assert_eq!(argmax_split_groups(151_936), Some(38));
         assert_eq!(argmax_split_groups(32_768), Some(8));
@@ -742,6 +752,10 @@ fn prefer_rmsnorm_vec4(rows: usize, dim: usize) -> bool {
 }
 
 fn prefer_deltanet_gate_prep(rows: usize) -> bool {
+    rows >= 8
+}
+
+fn prefer_deltanet_norm_prep(rows: usize) -> bool {
     rows >= 8
 }
 
@@ -4456,15 +4470,22 @@ impl MetalBackend {
                         // promotion needs the fixed bound) — pick the instantiation.
                         let gate_prep = prefer_deltanet_gate_prep(rr)
                             && std::env::var("INFR_METAL_NO_DN_GATE_PREP").is_err();
-                        let dn_kern: &'static str = match (gate_prep, kd / 32) {
-                            (false, 1) => "deltanet_f32_k1",
-                            (false, 2) => "deltanet_f32_k2",
-                            (false, 4) => "deltanet_f32_k4",
-                            (false, _) => "deltanet_f32_k8",
-                            (true, 1) => "deltanet_gates_k1",
-                            (true, 2) => "deltanet_gates_k2",
-                            (true, 4) => "deltanet_gates_k4",
-                            (true, _) => "deltanet_gates_k8",
+                        let norm_prep = gate_prep
+                            && prefer_deltanet_norm_prep(rr)
+                            && std::env::var("INFR_METAL_NO_DN_NORM_PREP").is_err();
+                        let dn_kern: &'static str = match (gate_prep, norm_prep, kd / 32) {
+                            (false, _, 1) => "deltanet_f32_k1",
+                            (false, _, 2) => "deltanet_f32_k2",
+                            (false, _, 4) => "deltanet_f32_k4",
+                            (false, _, _) => "deltanet_f32_k8",
+                            (true, false, 1) => "deltanet_gates_k1",
+                            (true, false, 2) => "deltanet_gates_k2",
+                            (true, false, 4) => "deltanet_gates_k4",
+                            (true, false, _) => "deltanet_gates_k8",
+                            (true, true, 1) => "deltanet_prepared_k1",
+                            (true, true, 2) => "deltanet_prepared_k2",
+                            (true, true, 4) => "deltanet_prepared_k4",
+                            (true, true, _) => "deltanet_prepared_k8",
                         };
                         let fits = self
                             .pipelines
@@ -4483,6 +4504,14 @@ impl MetalBackend {
                                 self.scratch_buf(rr * nv * 2, 15)
                             } else {
                                 bb.clone()
+                            };
+                            let (scan_q, scan_k) = if norm_prep {
+                                (
+                                    self.scratch_buf(rr * nk * kd, 16),
+                                    self.scratch_buf(rr * nk * kd, 17),
+                                )
+                            } else {
+                                (bq.clone(), bk.clone())
                             };
                             let bd = self.dev_dst(r, dst, rr * nv * vd);
                             let sbuf = metal_buf(sb);
@@ -4515,12 +4544,34 @@ impl MetalBackend {
                                     rr * nv,
                                 );
                             }
+                            if norm_prep {
+                                let norm_kern = match kd / 32 {
+                                    1 => "deltanet_norm_k1",
+                                    2 => "deltanet_norm_k2",
+                                    4 => "deltanet_norm_k4",
+                                    _ => "deltanet_norm_k8",
+                                };
+                                let npso = self.pipelines.get(norm_kern)?;
+                                let mut np = (rr as u32).to_ne_bytes().to_vec();
+                                np.extend_from_slice(&(nk as u32).to_ne_bytes());
+                                np.extend_from_slice(&(kd as u32).to_ne_bytes());
+                                np.extend_from_slice(&eps.to_ne_bytes());
+                                self.encode_tg_w(
+                                    r,
+                                    &npso,
+                                    &[bq.as_ref(), bk.as_ref(), scan_q.as_ref(), scan_k.as_ref()],
+                                    (1 << 2) | (1 << 3),
+                                    &np,
+                                    (rr * nk).div_ceil(4) * 128,
+                                    128,
+                                );
+                            }
                             self.encode_tg_w(
                                 r,
                                 &pso,
                                 &[
-                                    bq.as_ref(),
-                                    bk.as_ref(),
+                                    scan_q.as_ref(),
+                                    scan_k.as_ref(),
                                     bv.as_ref(),
                                     bb.as_ref(),
                                     ba.as_ref(),

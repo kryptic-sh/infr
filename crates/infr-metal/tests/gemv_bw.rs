@@ -184,6 +184,7 @@ fn bf16_rt_probe() {
         })
         .collect();
 
+    std::env::set_var("INFR_METAL_NO_BF16_CMM", "1");
     for m in [2usize, 4, 8, 16, 32] {
         std::env::set_var("INFR_METAL_NO_BF16_RT", "1");
         bench_chained_m(
@@ -205,6 +206,34 @@ fn bf16_rt_probe() {
             16.0 * m.div_ceil(8) as f64,
             "bf16 rt",
         );
+    }
+    std::env::remove_var("INFR_METAL_NO_BF16_CMM");
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn bf16_cmm_probe() {
+    let (in_f, out_f) = (1152usize, 8192usize);
+    let w16: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| {
+            let v = (i % 13) as f32 * 0.01;
+            ((v.to_bits() >> 16) as u16).to_le_bytes()
+        })
+        .collect();
+
+    for m in [16usize, 32] {
+        std::env::set_var("INFR_METAL_NO_BF16_CMM", "1");
+        bench_chained_m(
+            DType::Bf16,
+            &w16,
+            m,
+            in_f,
+            out_f,
+            16.0 * m.div_ceil(8) as f64,
+            "bf16 rt",
+        );
+        std::env::remove_var("INFR_METAL_NO_BF16_CMM");
+        bench_chained_m(DType::Bf16, &w16, m, in_f, out_f, 16.0, "bf16 cmm");
     }
 }
 

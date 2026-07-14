@@ -585,9 +585,41 @@ fn linear_woff_bf16_rt() {
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_woff_bf16_rt_multirow() {
-    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let (in_f, slices) = (256usize, [96usize, 80, 80]);
     let wf = rand_f32(256 * in_f, 356);
     check_linear_woff(DType::Bf16, bf16_bytes(&wf), 32, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_bf16_cmm() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 357);
+    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 40, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_bf16_cmm_preserves_wide_finite_weights() {
+    let (m, in_f, out_f) = (16usize, 32usize, 64usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![out_f, in_f], DType::Bf16));
+    let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+    g.push(Op::Linear {
+        x,
+        weight: w,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+    let bound = vec![
+        (x, f32_bytes(&vec![2.0f32.powi(-14); m * in_f])),
+        (w, bf16_bytes(&vec![65536.0; out_f * in_f])),
+    ];
+    assert_parity(&g, &bound, dst, m * out_f, 1e-3);
 }
 
 #[test]

@@ -2529,6 +2529,22 @@ impl MetalBackend {
                             .get("linear_f16_cmm")?
                             .max_total_threads_per_threadgroup()
                             >= 128;
+                    let bf16_cmm = bf16_native
+                        && m >= 16
+                        && out_f % 64 == 0
+                        && std::env::var("INFR_METAL_NO_BF16_CMM").is_err()
+                        && self
+                            .pipelines
+                            .get("linear_bf16_cmm")?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
+                    let native_cmm = if f16_cmm {
+                        Some("linear_f16_cmm")
+                    } else if bf16_cmm {
+                        Some("linear_bf16_cmm")
+                    } else {
+                        None
+                    };
                     let f16_rt = f16_native
                         && (2..16).contains(&m)
                         && std::env::var("INFR_METAL_NO_F16_RT").is_err();
@@ -2547,10 +2563,10 @@ impl MetalBackend {
                         DType::Bf16 if bf16_native => ("linear_bf16", 2u64),
                         _ => ("linear_f32", 4u64),
                     };
-                    if f16_cmm {
-                        let cmm = self.pipelines.get("linear_f16_cmm")?;
+                    if let Some(cmm_kern) = native_cmm {
+                        let cmm = self.pipelines.get(cmm_kern)?;
                         if let Some(label) =
-                            counter_linear_label(self.counter_set.is_some(), "linear_f16_cmm")
+                            counter_linear_label(self.counter_set.is_some(), cmm_kern)
                         {
                             r.cur_op = label;
                         }

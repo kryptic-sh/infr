@@ -294,7 +294,7 @@ RT_KERNEL(linear_bf16_rt, DEC16_BF16)
 // so every tile takes the MMA path. Requires out_f % 64 == 0 and in_f % 32 == 0; other shapes
 // fall back to the per-simdgroup HGEMM.
 #define CMM_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
-#define CMM_KERNEL(NAME, DEC)                                                                     \
+#define CMM_KERNEL_TYPED(NAME, DEC, WTYPE, WMAT, XTYPE, XVEC, XMAT)                             \
 kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
                  device const uchar*  codes [[buffer(1)]],                                       \
                  device const uchar*  scm   [[buffer(2)]],                                       \
@@ -315,9 +315,9 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     uint tid = sgid * 32u + lane;                                                                 \
     uint nr1 = min(32u, p.m - rt);                                                                \
                                                                                                   \
-    threadgroup float shraw[2048];  /* 8 KB: sa(4K half) + sb(2K half); reused f32 for stores */  \
-    threadgroup half* sa = (threadgroup half*)shraw;                                              \
-    threadgroup half* sb = ((threadgroup half*)shraw) + 2048u;                                    \
+    threadgroup float shraw[2048];  /* 8 KB: 4K sa + 4K sb; reused f32 for stores */              \
+    threadgroup WTYPE* sa = (threadgroup WTYPE*)shraw;                                            \
+    threadgroup XTYPE* sb = (threadgroup XTYPE*)(shraw + 1024u);                                  \
                                                                                                   \
     uint lr0 = tid >> 1;                 /* weight (output) row 0..63 */                          \
     uint il0 = tid & 1u;                 /* which 16-element half of the 32-K step */             \
@@ -325,8 +325,8 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     uint iyk = (tid & 3u) * 8u;          /* k offset within the 32-K step */                      \
     uint lr1c = min(lr1, nr1 - 1u);      /* clamp token loads to the matrix edge */               \
                                                                                                   \
-    simdgroup_half8x8 ma[4];                                                                      \
-    simdgroup_half8x8 mb[2];                                                                      \
+    WMAT ma[4];                                                                                   \
+    XMAT mb[2];                                                                                   \
     simdgroup_float8x8 mc[8];                                                                     \
     CMM_UNROLL(uint i = 0; i < 8u; i++) mc[i] = simdgroup_float8x8(0.0f);                         \
                                                                                                   \
@@ -348,19 +348,19 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
             uint lx = lr0 & 7u;                                                                   \
             CMM_UNROLL(uint i = 0; i < 16u; i++) {                                                \
                 uint sx = 2u * il0 + (i >> 3);                                                    \
-                sa[64u * (8u * sx + sy) + 8u * (i & 7u) + lx] = (half)wk[i];                      \
+                sa[64u * (8u * sx + sy) + 8u * (i & 7u) + lx] = (WTYPE)wk[i];                     \
             }                                                                                     \
         }                                                                                         \
-        {   /* stage B: 8 activations per thread, two vectorized f32->f16 half4 stores */         \
+        {   /* stage B: 8 activations per thread, two vectorized stores */                       \
             uint ib = 4u * (tid & 3u) + (lr1 >> 3);                                               \
             uint ly = lr1 & 7u;                                                                   \
-            threadgroup half4* sb4 = (threadgroup half4*)(sb + 64u * ib + 8u * ly);               \
-            sb4[0] = half4(yv0);                                                                  \
-            sb4[1] = half4(yv1);                                                                  \
+            threadgroup XVEC* sb4 = (threadgroup XVEC*)(sb + 64u * ib + 8u * ly);                 \
+            sb4[0] = XVEC(yv0);                                                                   \
+            sb4[1] = XVEC(yv1);                                                                   \
         }                                                                                         \
         threadgroup_barrier(mem_flags::mem_threadgroup);                                          \
-        threadgroup const half* lsma = sa + 4u * 64u * (sgid & 1u);                               \
-        threadgroup const half* lsmb = sb + 2u * 64u * (sgid >> 1);                               \
+        threadgroup const WTYPE* lsma = sa + 4u * 64u * (sgid & 1u);                              \
+        threadgroup const XTYPE* lsmb = sb + 2u * 64u * (sgid >> 1);                              \
         CMM_UNROLL(uint ik = 0; ik < 4u; ik++) {                                                  \
             simdgroup_barrier(mem_flags::mem_none);                                               \
             CMM_UNROLL(uint i = 0; i < 4u; i++) simdgroup_load(ma[i], lsma + 64u * i, 8);         \
@@ -395,6 +395,11 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
         }                                                                                         \
     }                                                                                             \
 }
+
+#define CMM_KERNEL(NAME, DEC)                                                                     \
+    CMM_KERNEL_TYPED(NAME, DEC, half, simdgroup_half8x8, half, half4, simdgroup_half8x8)
+#define CMM_BF16_KERNEL(NAME, DEC)                                                                \
+    CMM_KERNEL_TYPED(NAME, DEC, bfloat, simdgroup_bfloat8x8, float, float4, simdgroup_float8x8)
 
 // Split-K cooperative GEMM for SMALL-m deep-k shapes (a chat turn's short suffix prefill,
 // speculative verify's k+1 rows): at m <= 15 the plain tile launches only out_f/64
@@ -556,6 +561,7 @@ CMM_KERNEL(linear_iq2s_cmm, DEC16_IQ2S)
 CMM_KERNEL(linear_iq2xs_cmm, DEC16_IQ2XS)
 CMM_KERNEL(linear_q6k_cmm, DEC16_Q6K)
 CMM_KERNEL(linear_f16_cmm, DEC16_F16)
+CMM_BF16_KERNEL(linear_bf16_cmm, DEC16_BF16)
 
 HGEMM_KERNEL(linear_quik4_hmm, DEC16_K4)
 HGEMM_KERNEL(linear_quik6_hmm, DEC16_K6)

@@ -108,7 +108,9 @@ fn regular_cmm_unrolls_its_fixed_tile_loops() {
     );
     let compact = despace(src);
     let cmm = compact
-        .split_once(&despace("#define CMM_KERNEL(NAME, DEC)"))
+        .split_once(&despace(
+            "#define CMM_KERNEL_TYPED(NAME, DEC, WTYPE, WMAT, XTYPE, XVEC, XMAT)",
+        ))
         .unwrap()
         .1
         .split_once(&despace("#define CMMKS_KERNEL(NAME, DEC)"))
@@ -177,6 +179,16 @@ fn bf16_multirow_linear_uses_the_exact_row_tile() {
     let exec = include_str!("../src/exec.rs");
     asserts_token_seq(exec, "let bf16_rt = bf16_native && m >= 2");
     asserts_token_seq(exec, "Some(\"linear_bf16_rt\")");
+}
+
+#[test]
+fn bf16_large_multirow_linear_uses_the_cooperative_tile() {
+    let shader = include_str!("../shaders/moe.metal");
+    asserts_token_seq(shader, "CMM_BF16_KERNEL(linear_bf16_cmm, DEC16_BF16)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "let bf16_cmm = bf16_native && m >= 16");
+    asserts_token_seq(exec, "Some(\"linear_bf16_cmm\")");
 }
 
 // The two below test the TRIPWIRE ITSELF. A guard nobody has watched fail is not a guard: it can

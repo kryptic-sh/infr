@@ -2518,6 +2518,8 @@ impl MetalBackend {
                         wdt == DType::F16 && std::env::var("INFR_METAL_NO_F16_NATIVE").is_err();
                     let f32_native =
                         wdt == DType::F32 && std::env::var("INFR_METAL_NO_F32_NATIVE").is_err();
+                    let bf16_native =
+                        wdt == DType::Bf16 && std::env::var("INFR_METAL_NO_BF16_NATIVE").is_err();
                     let f16_cmm = f16_native
                         && m >= 16
                         && out_f % 64 == 0
@@ -2533,6 +2535,7 @@ impl MetalBackend {
                     let (kern, elem_bytes) = match wdt {
                         DType::F16 if f16_native => ("linear_f16", 2u64),
                         DType::F32 if f32_native => ("linear_f32", 4u64),
+                        DType::Bf16 if bf16_native => ("linear_bf16", 2u64),
                         _ => ("linear_f32", 4u64),
                     };
                     if f16_cmm {
@@ -2589,7 +2592,7 @@ impl MetalBackend {
                             m.div_ceil(8) * out_f * 32,
                             32,
                         );
-                    } else if f16_native || f32_native {
+                    } else if f16_native || f32_native || bf16_native {
                         // Read uploaded float weights directly. F16 also halves the stream; both
                         // avoid a host read and redundant f32 device-cache allocation.
                         let bw =

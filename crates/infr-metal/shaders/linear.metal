@@ -42,6 +42,28 @@ kernel void linear_f16(device const float* x   [[buffer(0)]],
     if (lane == 0u) dst[sg] = acc;
 }
 
+// Native bf16-weight GEMV without requiring Metal bfloat support: GGUF BF16 stores the top 16
+// bits of each f32, so widening is the exact integer shift used by the CPU and gather kernels.
+kernel void linear_bf16(device const float*  x   [[buffer(0)]],
+                        device const ushort* w   [[buffer(1)]],
+                        device float*        dst [[buffer(2)]],
+                        constant LinearParams& p [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    uint sg = gid / 32u;
+    if (sg >= p.m * p.out_f) return;
+    uint r = sg / p.out_f;
+    uint o = sg % p.out_f;
+    device const float* xr = x + (ulong)r * p.in_f;
+    device const ushort* wo = w + (ulong)o * p.in_f;
+    float acc = 0.0f;
+    for (uint i = lane; i < p.in_f; i += 32u) {
+        acc += xr[i] * as_type<float>((uint)wo[i] << 16u);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) dst[sg] = acc;
+}
+
 // ---- Linear over a NATIVE quantized weight. Two on-device forms:
 //
 // * FACTORED (`dequant_factored`): bit-packed 4/6/8-bit codes + one (sc, m) i16 pair per

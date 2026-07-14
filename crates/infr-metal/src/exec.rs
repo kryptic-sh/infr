@@ -2525,6 +2525,9 @@ impl MetalBackend {
                             .get("linear_f16_cmm")?
                             .max_total_threads_per_threadgroup()
                             >= 128;
+                    let f16_rt = f16_native
+                        && (2..16).contains(&m)
+                        && std::env::var("INFR_METAL_NO_F16_RT").is_err();
                     let (kern, elem_bytes) = match wdt {
                         DType::F16 if f16_native => ("linear_f16", 2u64),
                         _ => ("linear_f32", 4u64),
@@ -2555,6 +2558,33 @@ impl MetalBackend {
                             &cp,
                             m.div_ceil(32) * (out_f / 64) * 128,
                             128,
+                        );
+                    } else if f16_rt {
+                        let rt = self.pipelines.get("linear_f16_rt")?;
+                        if let Some(label) =
+                            counter_linear_label(self.counter_set.is_some(), "linear_f16_rt")
+                        {
+                            r.cur_op = label;
+                        }
+                        let bw =
+                            metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
+                        let dummy = self.scratch_buf(1, 14);
+                        let mut rp = p.clone();
+                        rp.extend_from_slice(&0u32.to_ne_bytes());
+                        self.encode_tg_off(
+                            r,
+                            &rt,
+                            &[
+                                (bx.as_ref(), 0),
+                                (&bw.raw, w_off as u64 * elem_bytes),
+                                (dummy.as_ref(), 0),
+                                (dummy.as_ref(), 0),
+                                (bd.as_ref(), 0),
+                            ],
+                            1 << 4,
+                            &rp,
+                            m.div_ceil(8) * out_f * 32,
+                            32,
                         );
                     } else if f16_native {
                         // Read the uploaded GGUF half buffer directly. Besides halving the weight

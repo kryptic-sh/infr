@@ -3893,9 +3893,18 @@ pub(crate) fn execute_chain(
     };
     // A chain is ONE submit of `n` back-to-back decode steps, and the GPU hang watchdog is armed
     // per submit — so the chain length is bounded by the same measured budget as the forward-pass
-    // splitter. No-op on a device that never splits (every discrete GPU); on a slow integrated one
-    // it collapses to short chains, or to 1, rather than a multi-second command buffer.
-    let n = n.min(replay.recorded.max_chain());
+    // splitter. DECLINE the chain rather than shortening it: the caller draws one sampling uniform
+    // per chained step BEFORE calling (`Backend::max_decode_chain` is what it clamps with), so a
+    // backend that quietly returned fewer ids than it was asked for would leave the RNG stream
+    // advanced past the tokens it produced. Returning None hands the caller back to its per-token
+    // path, which re-draws for the position it actually reaches.
+    //
+    // Normally unreachable — the caller's own clamp already collapses the chain to 1 on any
+    // splitting device — but the cap is re-tuned from measurement (`observe_forward`) and can flip
+    // under a concurrent request between that clamp and this call.
+    if n > replay.recorded.max_chain() {
+        return Ok(None);
+    }
     // The chunk decodes positions p0+1 ..= p0+n (params[0] = the last decoded position).
     let p0 = read_pos0(be_, replay.params.as_ref())?;
     replay.recorded.replay_n(n).map_err(|e| be(e.to_string()))?;

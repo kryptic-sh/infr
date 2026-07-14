@@ -221,7 +221,7 @@ fn bf16_cmm_probe() {
         })
         .collect();
 
-    for m in [16usize, 32] {
+    for m in [6usize, 8, 12, 16, 32] {
         std::env::set_var("INFR_METAL_NO_BF16_CMM", "1");
         bench_chained_m(
             DType::Bf16,

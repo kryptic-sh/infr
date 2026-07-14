@@ -603,7 +603,15 @@ fn linear_woff_bf16_gemv() {
 fn linear_woff_bf16_rt() {
     let (in_f, slices) = (256usize, [128usize, 64, 64]);
     let wf = rand_f32(256 * in_f, 355);
-    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 8, in_f, &slices, false, 1e-3);
+    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 4, in_f, &slices, false, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_woff_bf16_cmm_small() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 361);
+    check_linear_woff(DType::Bf16, bf16_bytes(&wf), 6, in_f, &slices, false, 1e-3);
 }
 
 #[test]

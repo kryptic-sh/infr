@@ -2530,7 +2530,7 @@ impl MetalBackend {
                             .max_total_threads_per_threadgroup()
                             >= 128;
                     let bf16_cmm = bf16_native
-                        && m >= 16
+                        && m >= 6
                         && out_f % 64 == 0
                         && std::env::var("INFR_METAL_NO_BF16_CMM").is_err()
                         && self

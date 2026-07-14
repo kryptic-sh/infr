@@ -202,12 +202,12 @@ fn bf16_multirow_linear_uses_the_exact_row_tile() {
 }
 
 #[test]
-fn bf16_large_multirow_linear_uses_the_cooperative_tile() {
+fn bf16_aligned_multirow_linear_uses_the_cooperative_tile() {
     let shader = include_str!("../shaders/moe.metal");
     asserts_token_seq(shader, "CMM_BF16_KERNEL(linear_bf16_cmm, DEC16_BF16)");
 
     let exec = include_str!("../src/exec.rs");
-    asserts_token_seq(exec, "let bf16_cmm = bf16_native && m >= 16");
+    asserts_token_seq(exec, "let bf16_cmm = bf16_native && m >= 6");
     asserts_token_seq(exec, "Some(\"linear_bf16_cmm\")");
 }
 

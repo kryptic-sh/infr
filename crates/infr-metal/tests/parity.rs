@@ -2873,12 +2873,27 @@ fn deltanet_parity() {
     assert_close(&cpu[1], &mtl[1], 1e-4, "deltanet state");
 }
 
-// Prepared multi-row scan at the qwen3-next head shape: the state must carry across rows exactly
-// while the gate and q/k prep dispatches feed the token-serial device kernel.
+// Multi-row scan at the qwen3-next head shape: the state must carry across rows exactly (the
+// device kernel loops rows with each lane owning its state column).
+//
+// Run at rows on BOTH sides of the q/k-norm-prep gate (`prefer_deltanet_norm_prep`, rows >= 8),
+// because that gate picks a DIFFERENT KERNEL: at 8 rows a separate pass normalizes q/k into
+// scratch and `deltanet_prepared_*` consumes it, while below 8 the scan normalizes inline
+// (`deltanet_gates_*`). One row count exercises one of those and says nothing about the other.
 #[test]
 #[ignore = "requires a Metal GPU"]
-fn deltanet_multirow_parity() {
-    let (rows, nv, nk, kd, vd) = (8usize, 4usize, 2usize, 128usize, 128usize);
+fn deltanet_multirow_parity_inline_norm() {
+    deltanet_multirow_case(5); // below the gate: inline normalization, no scratch
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn deltanet_multirow_parity_prepared_norm() {
+    deltanet_multirow_case(8); // at the gate: the hoisted q/k norm pass feeds the scan
+}
+
+fn deltanet_multirow_case(rows: usize) {
+    let (nv, nk, kd, vd) = (4usize, 2usize, 128usize, 128usize);
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));
     let k = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));
@@ -2920,8 +2935,18 @@ fn deltanet_multirow_parity() {
     let reads = [(dst, rows * nv * vd), (state, nv * kd * vd)];
     let cpu = run_multi(&CpuBackend::new(), &g, &bound, &reads);
     let mtl = run_multi(&MetalBackend::new().expect("metal"), &g, &bound, &reads);
-    assert_close(&cpu[0], &mtl[0], 1e-4, "deltanet multirow dst");
-    assert_close(&cpu[1], &mtl[1], 1e-4, "deltanet multirow state");
+    assert_close(
+        &cpu[0],
+        &mtl[0],
+        1e-4,
+        &format!("deltanet multirow dst (rows={rows})"),
+    );
+    assert_close(
+        &cpu[1],
+        &mtl[1],
+        1e-4,
+        &format!("deltanet multirow state (rows={rows})"),
+    );
 }
 
 // Multi-row conv: the rolling state shifts once per row and survives to the next.

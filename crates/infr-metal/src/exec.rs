@@ -197,6 +197,13 @@ mod tests {
     }
 
     #[test]
+    fn gated_rmsnorm_msl_fuses_silu_on_store() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("kernel void gated_rmsnorm_f32"));
+        assert!(src.contains("float silu = z / (1.0f + exp(-z))"));
+    }
+
+    #[test]
     fn argmax_split_policy_only_targets_vocab_scale_inputs() {
         assert_eq!(argmax_split_groups(151_936), Some(38));
         assert_eq!(argmax_split_groups(32_768), Some(8));
@@ -258,6 +265,19 @@ mod tests {
             theta: 10_000.0,
             freq_factors: None,
             x_stride: 0,
+        });
+
+        let norm_weight = g.weight(TensorDesc::new(vec![64], DType::F32));
+        let norm_dst = g.internal(TensorDesc::new(vec![1, 1, 64], DType::F32));
+        g.push(Op::GatedRmsNorm {
+            x: rope_x,
+            weight: norm_weight,
+            gate: rope_x,
+            dst: norm_dst,
+            rows: 1,
+            n_head: 1,
+            head_dim: 64,
+            eps: 1e-6,
         });
 
         let q = g.input(TensorDesc::new(vec![1, 1, 64], DType::F32));
@@ -323,11 +343,13 @@ mod tests {
         let table_values: Vec<u16> = (0..8)
             .flat_map(|row| std::iter::repeat_n(half::f16::from_f32(row as f32).to_bits(), 64))
             .collect();
+        let norm_weight_values = [1.0f32; 64];
         let logits_values: Vec<f32> = (0..128).map(|i| -(i as f32) * 0.1).collect();
         let mut uniform_values = [0.0f32; 64];
         uniform_values[0] = 0.01;
 
         let rope_x_buf = alloc(&zeros_f32);
+        let norm_weight_buf = alloc(bytemuck::cast_slice(&norm_weight_values));
         let positions_buf = alloc(bytemuck::cast_slice(&[0i32]));
         let q_buf = alloc(&zeros_f32);
         let k_buf = alloc(&zeros_f16_cache);
@@ -342,6 +364,7 @@ mod tests {
 
         let mut bindings = Bindings::new();
         bindings.bind(rope_x, rope_x_buf.as_ref());
+        bindings.bind(norm_weight, norm_weight_buf.as_ref());
         bindings.bind(positions, positions_buf.as_ref());
         bindings.bind(q, q_buf.as_ref());
         bindings.bind(k_cache, k_buf.as_ref());
@@ -408,6 +431,7 @@ mod tests {
 
         let mut chain_bindings = Bindings::new();
         chain_bindings.bind(rope_x, rope_x_buf.as_ref());
+        chain_bindings.bind(norm_weight, norm_weight_buf.as_ref());
         chain_bindings.bind(positions, positions_buf.as_ref());
         chain_bindings.bind(q, q_buf.as_ref());
         chain_bindings.bind(k_cache, k_buf.as_ref());
@@ -739,7 +763,11 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             // qwen35 (Qwen3-Next) decode ops: all pos-independent, on-device, recurrent state
             // updated in the BOUND buffer — tape-safe when the arm's device gate holds (the
             // host fallbacks can't tape, so the gates mirror the arms').
-            Op::QkNorm { .. } | Op::Scale { .. } | Op::Copy { .. } | Op::CopyStrided { .. } => {}
+            Op::QkNorm { .. }
+            | Op::GatedRmsNorm { .. }
+            | Op::Scale { .. }
+            | Op::Copy { .. }
+            | Op::CopyStrided { .. } => {}
             Op::Conv1dSilu { state, kernel, .. } => {
                 if *kernel > 8
                     || std::env::var("INFR_METAL_NODELTA").is_ok()
@@ -2079,6 +2107,37 @@ impl MetalBackend {
                     &pso,
                     &[bx.as_ref(), bw.as_ref(), bd.as_ref()],
                     1 << 2,
+                    &p,
+                    rows * nh * 32,
+                    32,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::GatedRmsNorm {
+                x,
+                weight,
+                gate,
+                dst,
+                rows,
+                n_head,
+                head_dim,
+                eps,
+            } => {
+                let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
+                let bx = self.ensure_device(r, x);
+                let bw = self.weight_buf(weight, g, bindings)?;
+                let bg = self.ensure_device(r, gate);
+                let bd = self.dev_dst(r, dst, rows * nh * hd);
+                let pso = self.pipelines.get("gated_rmsnorm_f32")?;
+                let mut p = (rows as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&(nh as u32).to_ne_bytes());
+                p.extend_from_slice(&(hd as u32).to_ne_bytes());
+                p.extend_from_slice(&eps.to_ne_bytes());
+                self.encode_tg_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bw.as_ref(), bg.as_ref(), bd.as_ref()],
+                    1 << 3,
                     &p,
                     rows * nh * 32,
                     32,
@@ -4552,15 +4611,6 @@ impl MetalBackend {
                 // silent wrong-output run rather than pretending to support it blind.
                 return Err(Error::Unsupported(
                     "Metal Op::MoeSharedExpertAdd (qwen35moe shared expert) not yet implemented"
-                        .into(),
-                ));
-            }
-            Op::GatedRmsNorm { .. } => {
-                // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate) — landed on
-                // CPU + Vulkan only so far (`Capabilities::gated_rmsnorm` is false here, so the
-                // runner never emits this for Metal); fails loudly rather than pretending.
-                return Err(Error::Unsupported(
-                    "Metal Op::GatedRmsNorm (qwen35 DeltaNet z-gate fusion) not yet implemented"
                         .into(),
                 ));
             }

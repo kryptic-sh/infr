@@ -246,10 +246,8 @@ impl Backend for MetalBackend {
             // draft loop keeps the host `top1_softmax` logits-download path on Metal. See the
             // Op::ArgmaxProb exec arm's Unsupported note.
             argmax_prob: false,
-            // No fused rmsnorm+gate kernel yet (Vulkan-only so far, qwen35 decode-fusion
-            // campaign) — the runner keeps the split QkNorm→GatedAct pair on Metal. See the
-            // Op::GatedRmsNorm exec arm's Unsupported note.
-            gated_rmsnorm: false,
+            // One 32-lane per-head reduction with the SiLU gate folded into its store pass.
+            gated_rmsnorm: true,
             // Metal's KV kernels index rows directly by position — no ring mapping; the runner
             // keeps full-context KV allocations for SWA layers here.
             kv_swa_ring: false,

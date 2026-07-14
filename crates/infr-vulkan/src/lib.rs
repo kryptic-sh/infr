@@ -226,7 +226,13 @@ impl VulkanShared {
 impl Drop for VulkanShared {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.device.device_wait_idle();
+            // Also the pipeline cache's TRIPWIRE verdict (see `pcache.rs`): VK_ERROR_DEVICE_LOST is
+            // STICKY — once the device is lost every call returns it — so this one drain doubles as
+            // "did this run hang the GPU?", with no flag to thread through every submit site.
+            let device_lost = matches!(
+                self.device.device_wait_idle(),
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            );
             // Destroy the cached linear kernel (pipeline/layouts/shader/pool) if built.
             if let Some(k) = self.linear_kernel.get() {
                 crate::linear::destroy_linear_kernel(&self.device, k);
@@ -237,9 +243,10 @@ impl Drop for VulkanShared {
                 }
             }
             // Persist the pipeline cache (final save — the debounced mid-run saves may have
-            // missed the tail) and destroy it.
+            // missed the tail) and destroy it. On a LOST device this discards the file instead of
+            // saving it, and either way it disarms this process's tripwire marker.
             if let Some(pc) = &self.pcache {
-                pc.save(&self.device, self.pipeline_cache);
+                pc.finish(&self.device, self.pipeline_cache, device_lost);
             }
             self.device
                 .destroy_pipeline_cache(self.pipeline_cache, None);

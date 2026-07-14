@@ -30,6 +30,35 @@
 //! valid-looking file over garbage. The checksum above would catch that; the fsync keeps it from
 //! happening at all.
 //!
+//! ── THE TRIPWIRE ──────────────────────────────────────────────────────────────────────────────
+//!
+//! None of the above can catch the failure that actually happened: a blob that is perfectly
+//! WELL-FORMED but contains a shader binary that HANGS THE GPU. (Real incident: a hung
+//! `native_idm_q5k_sg2` sat in this file and was re-seeded on every launch, so a 35B MoE returned
+//! all-zero logits or a device-lost — surviving reboots, reproducing at CI-green commits, and
+//! ignoring every code knob, because the poison was on DISK, not in the tree.) A checksum sees
+//! only the bytes we wrote, and they are exactly the bytes we wrote. RADV already hashes its own
+//! cache entries and drops damaged ones, so corruption was never the mechanism.
+//!
+//! So instead of validating the CONTENT, watch what HAPPENS after we hand it to the driver — the
+//! same dirty-bit trick a filesystem uses:
+//!
+//! 1. When a run seeds the driver from a loaded blob, drop a marker file next to it.
+//! 2. On a clean exit (device NOT lost), delete the marker.
+//! 3. If a marker from a DEAD process is found at startup, that run seeded from this blob and then
+//!    died without a clean exit. The blob is not trustworthy: delete it and recompile.
+//!
+//! That closes the loop the incident was stuck in — a poisoned blob hangs the GPU, the run dies
+//! with a lost device, the marker survives, and the NEXT launch throws the blob away. One slow
+//! start instead of a hang that reproduces forever.
+//!
+//! The false positive is deliberate and cheap: any unclean death (a crash, a power cut, SIGKILL)
+//! discards a perfectly good cache and costs one cold pipeline build. The asymmetry is total —
+//! the other mistake is an undebuggable GPU hang, so we take the recompile every time.
+//!
+//! Markers are PER-PID and a marker is only stale if its process is GONE, so a second `infr`
+//! running concurrently (a `serve` alongside a CLI run) is not mistaken for a crashed one.
+//!
 //! `INFR_NO_PIPELINE_CACHE=1` disables persistence (the in-process cache handle still works).
 
 use ash::vk;
@@ -82,6 +111,20 @@ pub(crate) struct PcachePersist {
     last_save: Mutex<Instant>,
 }
 
+/// Suffix for a tripwire marker: `<cache file>.seeded.<pid>`. See the module doc.
+const MARKER_EXT: &str = "seeded";
+
+/// Is `pid` still running? `kill(pid, 0)` delivers no signal and only asks the kernel whether the
+/// process exists: `Ok` = alive, `EPERM` = alive but not ours (a foreign process reusing the pid —
+/// treat as alive, i.e. do NOT discard the cache on it), anything else (`ESRCH`) = gone.
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: `kill` with signal 0 performs only an existence/permission check.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl PcachePersist {
     /// `~/.cache/infr/vk-pipeline-cache-{vendor:08x}-{device:08x}.bin` (XDG-aware) — keyed per
@@ -106,10 +149,79 @@ impl PcachePersist {
         })
     }
 
+    /// This process's tripwire marker: `<cache file>.seeded.<pid>`.
+    fn marker(&self) -> PathBuf {
+        self.path
+            .with_extension(format!("{MARKER_EXT}.{}", std::process::id()))
+    }
+
+    /// TRIPWIRE, step 3 (see the module doc): a marker left behind by a process that is GONE means
+    /// that run seeded from this blob and then died without a clean exit — a hung GPU is exactly
+    /// how that happens, and the blob is the prime suspect. Discard it and recompile.
+    ///
+    /// Markers whose process is still ALIVE belong to a concurrently-running `infr` and are left
+    /// alone. Returns true when the cache was discarded (for the test; the caller doesn't care).
+    fn discard_if_a_seeded_run_died(&self) -> bool {
+        let Some(dir) = self.path.parent() else {
+            return false;
+        };
+        let Some(stem) = self.path.file_name().and_then(|s| s.to_str()) else {
+            return false;
+        };
+        // `foo.bin` -> markers are `foo.seeded.<pid>` (with_extension replaces `.bin`).
+        let prefix = format!(
+            "{}.{MARKER_EXT}.",
+            stem.strip_suffix(".bin").unwrap_or(stem)
+        );
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let mut dirty = false;
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(pid) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<i32>() else {
+                continue;
+            };
+            if pid_alive(pid) {
+                continue; // a concurrent infr, not a corpse
+            }
+            let _ = std::fs::remove_file(e.path());
+            dirty = true;
+        }
+        if dirty {
+            eprintln!(
+                "[infr] a previous run seeded the GPU pipeline cache and then died without a clean \
+                 exit (a hung GPU does exactly that, and a cached shader binary is the prime \
+                 suspect) — discarding {} and recompiling. This costs one slow start.",
+                self.path.display()
+            );
+            let _ = std::fs::remove_file(&self.path);
+        }
+        dirty
+    }
+
     /// Read + validate the persisted blob. Any mismatch (magic, fingerprint, driver version,
     /// truncation, or a payload that fails its checksum) returns `None` — the stale/damaged file
     /// is simply replaced by the next save, at the cost of one cold pipeline build.
+    ///
+    /// TRIPWIRE, steps 1+3: sweeps dead processes' markers first (which may discard the blob), and
+    /// ARMS this process's marker if it does end up seeding the driver from the file.
     pub(crate) fn load(&self) -> Option<Vec<u8>> {
+        self.discard_if_a_seeded_run_died();
+        let payload = self.load_validated()?;
+        // Armed BEFORE the payload reaches `vkCreatePipelineCache` — if that call is what hangs
+        // the GPU, the marker has to already be on disk for the next launch to find.
+        let _ = std::fs::File::create(self.marker());
+        Some(payload)
+    }
+
+    /// The envelope checks alone (no tripwire) — split out so the unit tests can exercise them
+    /// without a live process's marker bookkeeping.
+    fn load_validated(&self) -> Option<Vec<u8>> {
         let data = std::fs::read(&self.path).ok()?;
         if data.len() < HEADER_LEN || &data[..8] != MAGIC {
             return None;
@@ -178,6 +290,40 @@ impl PcachePersist {
             let _ = std::fs::remove_file(&tmp);
         }
         *self.last_save.lock().unwrap() = Instant::now();
+    }
+
+    /// TRIPWIRE, step 2 (see the module doc): the run is over. `device_lost` is the verdict.
+    ///
+    /// * **Device NOT lost** — a clean exit. Save the cache and disarm the marker.
+    /// * **Device LOST** — this run hung the GPU. Do NOT save (the live cache holds whatever
+    ///   binary just hung it, and persisting it is how the poison propagates to the next launch),
+    ///   and DELETE the on-disk blob outright, because if we seeded from it, it is the suspect. The
+    ///   marker goes too: the file it accused is already gone.
+    ///
+    /// Note this fires on a lost device whether or not we seeded from disk this run — a hang from
+    /// a freshly-compiled pipeline is just as unsafe to persist.
+    pub(crate) fn finish(&self, device: &ash::Device, cache: vk::PipelineCache, device_lost: bool) {
+        if device_lost {
+            eprintln!(
+                "[infr] the GPU device was lost during this run — discarding the pipeline cache {} \
+                 rather than persisting a shader binary that may be what hung it.",
+                self.path.display()
+            );
+            self.discard();
+        } else {
+            self.save(device, cache);
+        }
+        self.disarm();
+    }
+
+    /// Delete the on-disk blob (not the in-process cache handle, which the driver still owns).
+    fn discard(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+
+    /// Clear this process's tripwire marker — "I seeded from that blob and I came back alive".
+    fn disarm(&self) {
+        let _ = std::fs::remove_file(self.marker());
     }
 
     /// Debounced save for mid-run persistence (called after each NEW pipeline lands) — covers
@@ -292,5 +438,92 @@ mod tests {
         assert!(p.load().is_none(), "old envelope version must be rejected");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE TRIPWIRE. A blob that hangs the GPU is perfectly well-formed, so no envelope check can
+    /// see it — the only evidence is that the run which SEEDED from it never came back. These are
+    /// the three states that distinguishes.
+    #[test]
+    fn tripwire_discards_a_blob_whose_seeded_run_died() {
+        let dir = std::env::temp_dir().join(format!("infr-pcache-trip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.bin");
+        const UUID: [u8; 16] = [3u8; 16];
+        let p = PcachePersist {
+            path: path.clone(),
+            driver_version: 5,
+            cache_uuid: UUID,
+            last_save: Mutex::new(Instant::now()),
+        };
+        let payload: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        let write_good = || {
+            let mut out = Vec::new();
+            out.extend_from_slice(MAGIC);
+            out.extend_from_slice(&SHADER_SET_FINGERPRINT.to_le_bytes());
+            out.extend_from_slice(&5u32.to_le_bytes());
+            out.extend_from_slice(&UUID);
+            out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            out.extend_from_slice(&fnv1a(&payload).to_le_bytes());
+            out.extend_from_slice(&payload);
+            std::fs::write(&path, &out).unwrap();
+        };
+        let marker_for = |pid: u32| path.with_extension(format!("{MARKER_EXT}.{pid}"));
+
+        // 1. No marker: an ordinary run loads the blob — and ARMS its own marker before handing
+        //    the payload to the driver, so a hang from here on is attributable.
+        write_good();
+        assert_eq!(p.load().as_deref(), Some(&payload[..]), "clean blob loads");
+        assert!(p.marker().exists(), "loading must arm the tripwire");
+
+        // 2. A marker from a DEAD process: that run seeded from this blob and never exited
+        //    cleanly. The blob is the suspect — discard it, and the load reports a cache miss.
+        let dead = spawn_and_reap();
+        std::fs::write(marker_for(dead), b"").unwrap();
+        write_good();
+        assert!(
+            p.load().is_none(),
+            "a blob whose seeded run died must NOT be handed back to the driver"
+        );
+        assert!(!path.exists(), "the suspect blob is deleted");
+        assert!(!marker_for(dead).exists(), "the corpse's marker is swept");
+
+        // 3. A marker from a LIVE process (a concurrent `infr` — a serve alongside a CLI run) is
+        //    NOT a corpse. It must not cost the other process its cache.
+        write_good();
+        let live = marker_for(std::process::id());
+        std::fs::write(&live, b"").unwrap();
+        assert_eq!(
+            p.load().as_deref(),
+            Some(&payload[..]),
+            "a concurrent live run's marker must not discard the cache"
+        );
+        assert!(path.exists(), "the blob survives a live marker");
+
+        // 4. The device-lost arm of `finish`: discard the blob rather than persist whatever binary
+        //    just hung the GPU, then disarm. (These are the two calls `finish` makes on that path;
+        //    `finish` itself needs a live `vk::Device`, which a unit test has no business creating.)
+        write_good();
+        p.discard();
+        p.disarm();
+        assert!(
+            !path.exists(),
+            "a run that lost the device discards the blob"
+        );
+        assert!(!p.marker().exists(), "and disarms its marker");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pid that is guaranteed DEAD (spawned and reaped), for the corpse case above. Reusing a
+    /// just-reaped pid is theoretically possible but the kernel hands out pids sequentially, so it
+    /// will not happen within this test.
+    fn spawn_and_reap() -> u32 {
+        let mut c = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = c.id();
+        c.wait().expect("reap");
+        assert!(!pid_alive(pid as i32), "the reaped child must be gone");
+        pid
     }
 }

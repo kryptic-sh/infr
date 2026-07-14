@@ -1311,6 +1311,7 @@ dependencies = [
  "infr-gguf",
  "infr-prof",
  "infr-prof-rt",
+ "libc",
  "memmap2",
  "rayon",
  "thiserror 2.0.18",

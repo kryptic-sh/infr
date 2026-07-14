@@ -290,6 +290,30 @@ fn f32_native_cold_probe() {
 
 #[test]
 #[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f32_cmm_probe() {
+    let (in_f, out_f) = (1152usize, 8192usize);
+    let w32: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| ((i % 13) as f32 * 0.01).to_le_bytes())
+        .collect();
+
+    for m in [16usize, 32] {
+        std::env::set_var("INFR_METAL_NO_F32_CMM", "1");
+        bench_chained_m(
+            DType::F32,
+            &w32,
+            m,
+            in_f,
+            out_f,
+            32.0 * m as f64,
+            "f32 native-gemv",
+        );
+        std::env::remove_var("INFR_METAL_NO_F32_CMM");
+        bench_chained_m(DType::F32, &w32, m, in_f, out_f, 32.0, "f32 cmm");
+    }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
 fn f16_cmm_probe() {
     let (m, in_f, out_f) = (32usize, 1152usize, 8192usize);
     let w16: Vec<u8> = (0..out_f * in_f)

@@ -294,7 +294,7 @@ RT_KERNEL(linear_bf16_rt, DEC16_BF16)
 // so every tile takes the MMA path. Requires out_f % 64 == 0 and in_f % 32 == 0; other shapes
 // fall back to the per-simdgroup HGEMM.
 #define CMM_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
-#define CMM_KERNEL_TYPED(NAME, DEC, WTYPE, WMAT, XTYPE, XVEC, XMAT)                             \
+#define CMM_KERNEL_TYPED(NAME, DEC, WTYPE, WMAT, XTYPE, XVEC, XMAT, SHWORDS, SBOFF)             \
 kernel void NAME(device const float*  x     [[buffer(0)]],                                       \
                  device const uchar*  codes [[buffer(1)]],                                       \
                  device const uchar*  scm   [[buffer(2)]],                                       \
@@ -315,9 +315,9 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
     uint tid = sgid * 32u + lane;                                                                 \
     uint nr1 = min(32u, p.m - rt);                                                                \
                                                                                                   \
-    threadgroup float shraw[2048];  /* 8 KB: 4K sa + 4K sb; reused f32 for stores */              \
+    threadgroup float shraw[SHWORDS];                                                             \
     threadgroup WTYPE* sa = (threadgroup WTYPE*)shraw;                                            \
-    threadgroup XTYPE* sb = (threadgroup XTYPE*)(shraw + 1024u);                                  \
+    threadgroup XTYPE* sb = (threadgroup XTYPE*)(shraw + SBOFF);                                  \
                                                                                                   \
     uint lr0 = tid >> 1;                 /* weight (output) row 0..63 */                          \
     uint il0 = tid & 1u;                 /* which 16-element half of the 32-K step */             \
@@ -397,9 +397,11 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
 }
 
 #define CMM_KERNEL(NAME, DEC)                                                                     \
-    CMM_KERNEL_TYPED(NAME, DEC, half, simdgroup_half8x8, half, half4, simdgroup_half8x8)
+    CMM_KERNEL_TYPED(NAME, DEC, half, simdgroup_half8x8, half, half4, simdgroup_half8x8, 2048, 1024)
 #define CMM_BF16_KERNEL(NAME, DEC)                                                                \
-    CMM_KERNEL_TYPED(NAME, DEC, bfloat, simdgroup_bfloat8x8, float, float4, simdgroup_float8x8)
+    CMM_KERNEL_TYPED(NAME, DEC, bfloat, simdgroup_bfloat8x8, float, float4, simdgroup_float8x8, 2048, 1024)
+#define CMM_F32_KERNEL(NAME, DEC)                                                                 \
+    CMM_KERNEL_TYPED(NAME, DEC, float, simdgroup_float8x8, float, float4, simdgroup_float8x8, 3072, 2048)
 
 // Split-K cooperative GEMM for SMALL-m deep-k shapes (a chat turn's short suffix prefill,
 // speculative verify's k+1 rows): at m <= 15 the plain tile launches only out_f/64
@@ -562,6 +564,7 @@ CMM_KERNEL(linear_iq2xs_cmm, DEC16_IQ2XS)
 CMM_KERNEL(linear_q6k_cmm, DEC16_Q6K)
 CMM_KERNEL(linear_f16_cmm, DEC16_F16)
 CMM_BF16_KERNEL(linear_bf16_cmm, DEC16_BF16)
+CMM_F32_KERNEL(linear_f32_cmm, DEC16_F32)
 
 HGEMM_KERNEL(linear_quik4_hmm, DEC16_K4)
 HGEMM_KERNEL(linear_quik6_hmm, DEC16_K6)

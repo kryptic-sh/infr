@@ -2538,10 +2538,21 @@ impl MetalBackend {
                             .get("linear_bf16_cmm")?
                             .max_total_threads_per_threadgroup()
                             >= 128;
+                    let f32_cmm = f32_native
+                        && m >= 16
+                        && out_f % 64 == 0
+                        && std::env::var("INFR_METAL_NO_F32_CMM").is_err()
+                        && self
+                            .pipelines
+                            .get("linear_f32_cmm")?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
                     let native_cmm = if f16_cmm {
                         Some("linear_f16_cmm")
                     } else if bf16_cmm {
                         Some("linear_bf16_cmm")
+                    } else if f32_cmm {
+                        Some("linear_f32_cmm")
                     } else {
                         None
                     };

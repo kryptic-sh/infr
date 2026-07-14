@@ -95,6 +95,11 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
     _Pragma("clang loop unroll(full)")                                                            \
     for (uint i = 0; i < 16u; i++) wk[i] = as_type<float>((uint)bp[i] << 16u);
 
+#define DEC16_F32(wk)                                                                             \
+    device const float* fp = (device const float*)codes + (ulong)bi * 16ul;                       \
+    _Pragma("clang loop unroll(full)")                                                            \
+    for (uint i = 0; i < 16u; i++) wk[i] = fp[i];
+
 // factored, 4-bit codes: one uint2 = 8 bytes = one 16-element block, code k at bits 4k.
 #define DEC16_K4(wk)                                                                              \
     short2 s = ((device const short2*)scm)[bi];                                                   \

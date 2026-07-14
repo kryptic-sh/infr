@@ -667,7 +667,7 @@ fn linear_woff_f16_rt() {
 fn linear_woff_f16_cmm() {
     let (in_f, slices) = (256usize, [128usize, 64, 64]);
     let wf = rand_f32(256 * in_f, 351);
-    check_linear_woff(DType::F16, f16_bytes(&wf), 40, in_f, &slices, true, 1e-3);
+    check_linear_woff(DType::F16, f16_bytes(&wf), 40, in_f, &slices, false, 1e-3);
 }
 
 #[test]
@@ -808,7 +808,7 @@ fn linear_bf16_parity() {
 fn linear_f16_cmm_parity() {
     let (m, in_f, out_f) = (40usize, 256usize, 128usize);
     let wf = rand_f32(out_f * in_f, 230);
-    check_quant_linear_parity_impl(DType::F16, f16_bytes(&wf), m, in_f, out_f, 1e-3, true);
+    check_quant_linear_parity_impl(DType::F16, f16_bytes(&wf), m, in_f, out_f, 1e-3, false);
 }
 
 // Quantized Linear: Metal dequants the weight to f32 (via infr_gguf) and matmuls. Compare to a

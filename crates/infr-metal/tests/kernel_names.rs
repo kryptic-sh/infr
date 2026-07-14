@@ -131,7 +131,7 @@ fn f16_linear_reads_the_bound_weight_directly() {
 #[test]
 fn f16_multirow_linear_uses_the_cooperative_tile() {
     let shader = include_str!("../shaders/moe.metal");
-    asserts_token_seq(shader, "CMM_KERNEL(linear_f16_cmm, DEC16_F16)");
+    asserts_token_seq(shader, "CMM_F16_KERNEL(linear_f16_cmm, DEC16_F16)");
 
     let exec = include_str!("../src/exec.rs");
     asserts_token_seq(exec, "let f16_cmm = f16_native && m >= 16");

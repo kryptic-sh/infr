@@ -399,6 +399,8 @@ kernel void NAME(device const float*  x     [[buffer(0)]],                      
 
 #define CMM_KERNEL(NAME, DEC)                                                                     \
     CMM_KERNEL_TYPED(NAME, DEC, half, simdgroup_half8x8, half, half4, simdgroup_half8x8, 2048, 1024)
+#define CMM_F16_KERNEL(NAME, DEC)                                                                 \
+    CMM_KERNEL_TYPED(NAME, DEC, half, simdgroup_half8x8, float, float4, simdgroup_float8x8, 2048, 1024)
 #define CMM_BF16_KERNEL(NAME, DEC)                                                                \
     CMM_KERNEL_TYPED(NAME, DEC, bfloat, simdgroup_bfloat8x8, float, float4, simdgroup_float8x8, 2048, 1024)
 #define CMM_F32_KERNEL(NAME, DEC)                                                                 \
@@ -563,7 +565,7 @@ CMM_KERNEL(linear_iq3s_cmm, DEC16_IQ3S)
 CMM_KERNEL(linear_iq2s_cmm, DEC16_IQ2S)
 CMM_KERNEL(linear_iq2xs_cmm, DEC16_IQ2XS)
 CMM_KERNEL(linear_q6k_cmm, DEC16_Q6K)
-CMM_KERNEL(linear_f16_cmm, DEC16_F16)
+CMM_F16_KERNEL(linear_f16_cmm, DEC16_F16)
 CMM_BF16_KERNEL(linear_bf16_cmm, DEC16_BF16)
 CMM_F32_KERNEL(linear_f32_cmm, DEC16_F32)
 

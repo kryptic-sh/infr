@@ -2873,12 +2873,12 @@ fn deltanet_parity() {
     assert_close(&cpu[1], &mtl[1], 1e-4, "deltanet state");
 }
 
-// Multi-row scan at the qwen3-next head shape: the state must carry across rows exactly (the
-// device kernel loops rows with each lane owning its state column).
+// Prepared multi-row scan at the qwen3-next head shape: the state must carry across rows exactly
+// while the gate and q/k prep dispatches feed the token-serial device kernel.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn deltanet_multirow_parity() {
-    let (rows, nv, nk, kd, vd) = (5usize, 4usize, 2usize, 128usize, 128usize);
+    let (rows, nv, nk, kd, vd) = (8usize, 4usize, 2usize, 128usize, 128usize);
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));
     let k = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));

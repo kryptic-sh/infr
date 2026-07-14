@@ -181,28 +181,30 @@ pub struct Capabilities {
 
 /// The DEFAULT prefill chunk (rows) for an INTEGRATED GPU with `cu` compute units (0 = unknown).
 ///
-/// WHY a separate default at all: the GPU watchdog is per-SUBMIT, and infr submits one command
-/// buffer per forward pass — so a prefill chunk is a single indivisible watchdog job. The chunk
-/// height is therefore the ONLY knob that bounds it.
+/// This bounds the cost of ONE DISPATCH, which is the one thing a backend cannot split: the GPU
+/// hang watchdog kills a whole submit, and a submit can be cut into more command buffers (that is
+/// [`Backend::submit_dispatch_cap`]'s job), but a single dispatch is indivisible, so its own
+/// runtime has to stay well inside the budget on its own.
 ///
-/// Where the numbers come from (measured, 7900 XTX under `INFR_NO_COOPMAT=1` — the exact kernel
-/// tier an iGPU is forced onto, since RDNA2 enumerates no cooperative matrix):
-///   * Qwen3-8B  Q4_K_M, one 512-row prefill chunk: 363 ms of GPU.
-///   * gemma-3-12b Q4_K_M, same: 505 ms.
-///   * The iGPU:dGPU slowdown on that tier CALIBRATES to ~32x from a real iGPU datapoint
-///     (gemma-3-12b decode: 345 ms/tok observed on the iGPU vs 10.7 ms/tok here).
+/// It is NOT the watchdog bound. It used to be sold as one, and that was measured WRONG on the
+/// surveyed 2-CU RDNA2 part (Ryzen 9 9950X3D / RAPHAEL_MENDOCINO), where a Qwen3-8B Q4_K_M
+/// prefill chunk is one command buffer of 757 dispatches and 684 barriers, and its GPU time is
+/// nearly FLAT in the row count:
 ///
-/// So a 512-row chunk is 12-16 s on the iGPU and a default 1024-row chunk is 25-36 s — both past
-/// the ~10 s `gfx`-ring timeout. 128 rows puts the same chunk at ~3-4 s, a >2x margin, and is the
-/// reference point below (the surveyed iGPU is a ~2-CU RDNA2 Raphael part).
+///   rows |   8    |  16    |  32    |  64    | 128
+///   ─────┼────────┼────────┼────────┼────────┼───────
+///   time | 1163ms | 1199ms | 1861ms | 2047ms | 2048ms
 ///
-/// Scaling: linear in CU count where the driver reports one, so a beefier iGPU (a 12-CU 780M) is
-/// not needlessly throttled, clamped to the discrete default so this can only ever SHRINK the
-/// chunk. An unknown CU count takes the conservative floor.
+/// A 16x cut in rows buys 1.76x of submit time and bottoms out around 1.15 s, because what the
+/// forward actually costs on a 2-CU part is per-dispatch launch + barrier overhead and one sweep
+/// of the model's weights — neither of which shrinks with rows. Since that part kills a submit at
+/// ~2.06 s, NO row cap can put a whole-forward command buffer safely under the watchdog. Shrinking
+/// rows here to dodge a TDR is cargo cult; splitting the submit is the fix.
 pub fn integrated_ubatch_rows(cu: u32) -> usize {
     /// The surveyed iGPU (RDNA2 Raphael/Mendocino) — the part the 128-row figure is calibrated on.
     const BASE_CU: u32 = 2;
-    /// Watchdog-safe chunk at BASE_CU (see above).
+    /// Rows at BASE_CU: the largest chunk whose heaviest single dispatch (`native_gemm_mmq_q6k`,
+    /// measured at 15.0 ms/dispatch here) stays two orders of magnitude inside the watchdog.
     const BASE_ROWS: usize = 128;
     /// Never exceed the discrete default — this is a hardening cap, not a tuning knob.
     const MAX_ROWS: usize = 1024;
@@ -211,6 +213,86 @@ pub fn integrated_ubatch_rows(cu: u32) -> usize {
     }
     (BASE_ROWS * (cu as usize).div_ceil(BASE_CU as usize).max(1)).clamp(BASE_ROWS, MAX_ROWS)
 }
+
+/// Target GPU time for ONE submit, in nanoseconds — the budget the submit splitter aims at.
+///
+/// The surveyed iGPU kills a submit at ~2.06 s (measured: a job submitted at T is ring-reset at
+/// T+2.06 s, and its fence is force-signaled so the wait even returns "successfully"). 250 ms
+/// leaves an ~8x margin, which absorbs the run-to-run jitter that made the un-split 2.05 s forward
+/// a coin flip against that budget.
+pub const SUBMIT_BUDGET_NS: u64 = 250_000_000;
+
+/// Initial cap on DISPATCHES PER SUBMIT for a device that has not been measured yet — the value
+/// that has to protect the very first forward, before [`submit_cap_from_measurement`] has anything
+/// to go on. `0` = unlimited (never split).
+///
+/// Discrete GPUs get 0: a whole forward there is tens of milliseconds, two orders of magnitude
+/// inside any watchdog, and splitting it would only add barriers and submit overhead to the tuned
+/// path. Integrated GPUs get a real cap, because they are the parts whose forward is measured in
+/// SECONDS.
+///
+/// 128 comes from the surveyed 2-CU part: 757 dispatches ≈ 2.05 s ⇒ ~2.7 ms/dispatch ⇒ 128
+/// dispatches ≈ 0.35 s, inside [`SUBMIT_BUDGET_NS`] with room to spare. It is deliberately NOT
+/// scaled by CU count: a bigger iGPU takes proportionally more rows (`integrated_ubatch_rows`), so
+/// its per-dispatch cost lands in the same place, and the same dispatch count lands in the same
+/// segment time. Whatever this gets wrong on an unsurveyed part, the measured feedback loop in
+/// [`submit_cap_from_measurement`] corrects after one forward.
+///
+/// PRIOR ART (independent confirmation of both the diagnosis and the shape of the fix):
+/// llama.cpp's Vulkan backend splits its graph the same way, and its comment says the same thing —
+/// "On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid
+/// this" (ggml-vulkan.cpp). It submits on `submitted_nodes >= max_nodes_per_submit` (100, every
+/// device) OR on a per-submit FLOP budget that scales with the CU count
+/// (`2e9 * shader_core_count` for a non-GCN AMD part under 24 CUs — i.e. ~4 GFLOP/submit on this
+/// 2-CU iGPU). Bounding WORK per submit rather than dispatches is the more general form of this
+/// and would also stay correct if a caller forced a much larger `INFR_UBATCH` on an iGPU (each
+/// dispatch then gets heavier while the count stays put); today that case is caught one forward
+/// late by the measured loop instead. Worth adopting if this ever needs to be tighter.
+pub fn initial_submit_dispatch_cap(integrated: bool) -> usize {
+    if integrated {
+        128
+    } else {
+        0
+    }
+}
+
+/// The measured feedback loop behind the submit splitter: given how long the last forward's
+/// dispatches ACTUALLY took on this device (`elapsed_ns` across `dispatches` of them), return the
+/// dispatch cap that would have put each submit at [`SUBMIT_BUDGET_NS`]. `0` = unlimited.
+///
+/// This is what makes the splitter hardware-agnostic instead of a table of magic numbers: it does
+/// not care whether the GPU is a 2-CU iGPU, a 96-CU dGPU, or something that does not exist yet —
+/// it divides the budget by the per-dispatch cost this device just demonstrated. A fast GPU
+/// produces a cap far larger than any forward's dispatch count, which never splits anything (and
+/// is reported as unlimited); a slow one converges to segments of ~[`SUBMIT_BUDGET_NS`].
+pub fn submit_cap_from_measurement(elapsed_ns: u64, dispatches: usize) -> usize {
+    /// Never split below this — a submit is not free, and a cap this small means something other
+    /// than dispatch cost (a first-forward pipeline compile, a stalled host) dominated the sample.
+    const MIN_CAP: usize = 16;
+    /// A cap at or above this covers any forward we record, so it means "never split".
+    const UNLIMITED_ABOVE: usize = 1 << 20;
+    if dispatches == 0 || elapsed_ns == 0 {
+        return 0;
+    }
+    let ns_per_dispatch = (elapsed_ns / dispatches as u64).max(1);
+    let cap = (SUBMIT_BUDGET_NS / ns_per_dispatch) as usize;
+    if cap >= UNLIMITED_ABOVE {
+        0
+    } else {
+        cap.max(MIN_CAP)
+    }
+}
+
+/// A forward this slow (whole pass, nanoseconds) is close enough to a GPU hang watchdog to be
+/// worth splitting even on a device we did NOT pre-classify as needing it.
+///
+/// This is the ONLY thing that can put a never-split device (every discrete GPU — see
+/// [`initial_submit_dispatch_cap`]) onto the splitting path, and it is deliberately far above any
+/// healthy discrete forward (tens of ms) so that the tuned discrete path is never touched by the
+/// feedback loop, no matter how many dispatches a model's graph happens to have. What it DOES
+/// cover is the case the CU-count heuristics cannot know about: a discrete GPU slow enough — or a
+/// model big enough — that a forward pass lands in watchdog territory anyway.
+pub const SUBMIT_DANGER_NS: u64 = 1_000_000_000;
 
 impl Capabilities {
     /// The full 16x16x16 f16 coopmat kernel set is live (`coopmat_f16 == COOPMAT_TILE_16`) —
@@ -387,6 +469,24 @@ pub trait Backend: Send + Sync {
     ) -> Result<Option<Vec<u32>>> {
         Ok(None)
     }
+
+    /// The longest chain [`Backend::execute_chain`] may be asked for on this device.
+    ///
+    /// A chain is ONE submit carrying `n` back-to-back decode steps, and a GPU's hang watchdog is
+    /// armed per SUBMIT — so on a slow device an unbounded chain is a device-lost waiting to
+    /// happen (on the surveyed 2-CU integrated part a decode step is ~213 ms, so the default chain
+    /// of 8 would be ~1.7 s in a single command buffer, against a device that kills a job at
+    /// ~2.06 s).
+    ///
+    /// The CALLER must clamp with this before it commits to `n` — not `execute_chain` itself,
+    /// because the runner draws one sampling uniform per chained step BEFORE the call, so a
+    /// backend that quietly shortened the chain would advance the RNG stream further than the
+    /// tokens it returned consumed. Default `usize::MAX`: no bound (every backend whose forward is
+    /// nowhere near a watchdog, which is all of them except a slow iGPU).
+    fn max_decode_chain(&self) -> usize {
+        usize::MAX
+    }
+
     fn sync(&self) -> Result<()>;
 
     /// Whether the currently loaded model is running any MoE expert layer through a paged VRAM
@@ -480,6 +580,72 @@ mod tests {
             let r = integrated_ubatch_rows(cu);
             assert!((128..=1024).contains(&r), "cu={cu} -> {r} out of bounds");
         }
+    }
+
+    /// The submit splitter's pre-measurement default. The load-bearing property is that a DISCRETE
+    /// GPU never splits: a dGPU forward is tens of milliseconds, nowhere near a hang watchdog, and
+    /// splitting it would only add barriers and submits to a tuned path.
+    #[test]
+    fn initial_submit_cap_splits_only_integrated() {
+        assert_eq!(initial_submit_dispatch_cap(false), 0); // discrete: never split
+        assert_eq!(initial_submit_dispatch_cap(true), 128); // integrated: the measured default
+    }
+
+    /// The measured feedback loop. The property that matters is that the cap it returns puts a
+    /// segment inside the budget on whatever device produced the sample.
+    #[test]
+    fn submit_cap_tracks_measured_dispatch_cost() {
+        // The surveyed 2-CU iGPU: 757 dispatches, ~2.05 s ⇒ ~2.7 ms/dispatch. The cap it yields
+        // must hold a segment inside the 250 ms budget...
+        let cap = submit_cap_from_measurement(2_050_000_000, 757);
+        assert!(cap > 0, "a 2 s forward must be split");
+        let ns_per_dispatch = 2_050_000_000u64 / 757;
+        assert!(
+            cap as u64 * ns_per_dispatch <= SUBMIT_BUDGET_NS,
+            "cap {cap} x {ns_per_dispatch}ns overruns the budget"
+        );
+        // ...and must cut that forward into a handful of segments, not one and not hundreds.
+        assert!((2..=32).contains(&757usize.div_ceil(cap)), "cap={cap}");
+
+        // A discrete GPU (same graph, ~30 ms) yields a cap so far above the forward's own
+        // dispatch count that nothing is ever split — and the danger gate in the caller keeps it
+        // formally unlimited anyway (see `submit_danger_threshold_is_far_above_a_healthy_forward`).
+        let dcap = submit_cap_from_measurement(30_000_000, 757);
+        assert!(
+            dcap > 757,
+            "a 30 ms forward must never be split (cap={dcap})"
+        );
+        // A truly trivial per-dispatch cost reports "unlimited" outright.
+        assert_eq!(submit_cap_from_measurement(1_000, 757), 0);
+
+        // Degenerate samples never produce a nonsense cap.
+        assert_eq!(submit_cap_from_measurement(0, 757), 0);
+        assert_eq!(submit_cap_from_measurement(2_050_000_000, 0), 0);
+        // A pathologically slow sample still never splits below the floor (submits are not free).
+        assert!(submit_cap_from_measurement(u64::MAX / 2, 4) >= 16);
+    }
+
+    /// The danger threshold is what keeps the feedback loop OFF a healthy discrete GPU: a forward
+    /// has to be genuinely watchdog-adjacent before a never-split device starts splitting. Phrased
+    /// against real forward timings rather than the bare constants, which is what actually matters.
+    #[test]
+    fn submit_danger_threshold_is_far_above_a_healthy_forward() {
+        // Healthy discrete forwards (measured order of magnitude: tens of ms) stay well clear...
+        for healthy_ns in [5_000_000u64, 30_000_000, 100_000_000, 250_000_000] {
+            assert!(
+                healthy_ns < SUBMIT_DANGER_NS,
+                "{healthy_ns}ns must not look dangerous"
+            );
+        }
+        // ...while the forward that actually caused the device-lost is over the line. (`black_box`
+        // keeps these comparisons off clippy's `assertions_on_constants`: the property is about
+        // the constants' RELATIONSHIP, which is exactly what a reader needs pinned down.)
+        let danger = std::hint::black_box(SUBMIT_DANGER_NS);
+        let budget = std::hint::black_box(SUBMIT_BUDGET_NS);
+        assert!(std::hint::black_box(2_050_000_000u64) >= danger);
+        // And the threshold is above the per-submit budget it guards (a submit that merely wants
+        // splitting is not the same thing as a device that must start splitting).
+        assert!(danger > budget);
     }
 
     /// A DISCRETE GPU must be untouched by any of this: `integrated` defaults false, so the seam's

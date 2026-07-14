@@ -3743,7 +3743,14 @@ pub(crate) fn generate_dense_backend(
         // `req` None (run/bench/tests) constructs nothing.
         let _gp = req.and_then(|r| r.gate_pass());
         if can_chain && pos + 1 >= prompt.len() && pos + 1 == cur.len() && logits_out.is_none() {
-            let n = chain_n.min(max_new - out.len()).min(64);
+            // Clamped by the backend's watchdog budget too: a chain is one submit of `n` decode
+            // steps, and on a slow device that submit has to stay short (see
+            // `Backend::max_decode_chain`). Clamped HERE, before the per-step sampling uniforms
+            // below are drawn, so the RNG stream advances by exactly the steps we run.
+            let n = chain_n
+                .min(max_new - out.len())
+                .min(64)
+                .min(be.max_decode_chain());
             if n >= 2 {
                 let step_t0 = std::time::Instant::now();
                 // Seed the shared id slot with the token to feed (the previous chunk's last

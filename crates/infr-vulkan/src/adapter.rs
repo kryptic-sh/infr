@@ -3891,6 +3891,11 @@ pub(crate) fn execute_chain(
     let (true, Some(ring)) = (replay.self_advancing, replay.ring.as_ref()) else {
         return Ok(None);
     };
+    // A chain is ONE submit of `n` back-to-back decode steps, and the GPU hang watchdog is armed
+    // per submit — so the chain length is bounded by the same measured budget as the forward-pass
+    // splitter. No-op on a device that never splits (every discrete GPU); on a slow integrated one
+    // it collapses to short chains, or to 1, rather than a multi-second command buffer.
+    let n = n.min(replay.recorded.max_chain());
     // The chunk decodes positions p0+1 ..= p0+n (params[0] = the last decoded position).
     let p0 = read_pos0(be_, replay.params.as_ref())?;
     replay.recorded.replay_n(n).map_err(|e| be(e.to_string()))?;
@@ -4134,9 +4139,61 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let mut pool: ScratchPool = HashMap::new();
     let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
     let mut pstream = PagedStream::default();
+
+    // ── submit splitter ───────────────────────────────────────────────────────────────────────
+    // The GPU hang watchdog is armed per SUBMIT, so recording the whole forward into ONE command
+    // buffer makes the whole forward one indivisible watchdog job. That is fine on a discrete GPU
+    // (tens of ms) and fatal on a slow integrated one, where a Qwen3-8B prefill chunk is ~2.05 s
+    // of GPU against a device that kills a job at ~2.06 s. `cap` (0 = unlimited, the discrete
+    // default) bounds the dispatches per command buffer; segments are submitted WITHOUT waiting
+    // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
+    // only the watchdog's view changes, from one long job to several short ones.
+    let cap = be_.submit_dispatch_cap();
+    let t_forward = std::time::Instant::now();
+    let mut submitted_dispatches = 0usize;
+    /// In-flight segments allowed at once. Each one pins a command buffer plus its descriptor
+    /// pools until the GPU is done reading them, and the devices that split are exactly the
+    /// memory-tight ones — letting every segment of a forward pile up (6+ on a Qwen3-8B prefill
+    /// chunk) is what made RADV report `Not enough memory for command submission` on the 2-CU
+    /// iGPU under the validation layer. Two keeps the pipeline full — the CPU records segment
+    /// N+1 while the GPU chews N — at a bounded, constant cost.
+    const MAX_INFLIGHT: usize = 2;
+    // Submitted-but-unwaited segments, oldest first. They hold command buffers/descriptor pools
+    // the GPU is still reading, so they must outlive every buffer they reference — `transient`,
+    // `pool` and the scratch arena all live to the end of this function, and the drain below
+    // happens before any of them drop.
+    let mut segments: std::collections::VecDeque<crate::recorder::PendingSegment> =
+        std::collections::VecDeque::new();
     for (op_idx, op) in graph.ops.iter().enumerate() {
         if skip_op.contains(&op_idx) {
             continue;
+        }
+        // Split BETWEEN ops, never inside one: a single op can lower to several dispatches that
+        // share transient scratch, and the hazard tracking that orders them is per-recorder.
+        // Crossing the cap therefore closes the segment at the next op boundary.
+        if cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap) {
+            let seg = rec
+                .take()
+                .expect("segment always Some between ops")
+                .finish_nowait()
+                .map_err(|e| be(e.to_string()))?;
+            submitted_dispatches += seg.dispatches();
+            segments.push_back(seg);
+            // Retire the oldest in-flight segment once the window is full. Queue execution is
+            // FIFO, so by the time we are recording segment N+2 the GPU has almost always already
+            // finished N — in steady state this fence is already signaled and the wait is free.
+            while segments.len() > MAX_INFLIGHT {
+                let old = segments.pop_front().expect("len > MAX_INFLIGHT >= 0");
+                old.wait().map_err(|e| be(e.to_string()))?;
+            }
+            let fresh = be_.recorder()?;
+            // Hazard tracking is per-recorder and starts empty, so cross-segment RAW/WAR ordering
+            // (every layer reads the residual stream the previous segment wrote) is invisible to
+            // it and MUST be seeded explicitly. `vkCmdPipelineBarrier`'s scope spans submission
+            // order on the queue, so this one barrier orders the whole segment after everything
+            // already submitted.
+            fresh.seed_barrier();
+            rec = Some(fresh);
         }
         if let Op::MoeFfn { gate_exps, .. } = op {
             let gbuf = resolve(&scratch, bindings, *gate_exps)?;
@@ -4225,14 +4282,19 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         transient.extend([c.args, c.pm, c.pl, c.pacc]);
     }
     transient.extend(pool.into_values());
-    rec.take()
-        .expect("segment always Some at loop end")
-        .finish()
-        .map_err(|e| be(e.to_string()))?;
+    let last = rec.take().expect("segment always Some at loop end");
+    submitted_dispatches += last.dispatches();
+    last.finish().map_err(|e| be(e.to_string()))?;
     // The blocking finish above already waited the queue idle — draining just releases the
     // pipelined segments' command buffers/fences (every buffer they referenced outlives this
     // call: pooled scratch in `transient`, ring/tape/arenas on the session).
+    for seg in segments {
+        seg.wait().map_err(|e| be(e.to_string()))?;
+    }
     pstream.drain()?;
+    // Feed this forward back into the splitter: `finish` waited the queue idle, so the elapsed
+    // time now covers every segment's GPU execution. See `VulkanBackend::observe_forward`.
+    be_.observe_forward(t_forward.elapsed(), submitted_dispatches);
     Ok(())
 }
 

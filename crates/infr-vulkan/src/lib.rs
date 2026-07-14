@@ -33,7 +33,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -148,6 +148,22 @@ struct VulkanShared {
     /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
     /// (it also sees other processes' VRAM).
     device_used: AtomicU64,
+    /// SUBMIT SPLITTER: the most dispatches `execute_static` will record into one command buffer
+    /// before submitting it and opening the next (`0` = unlimited, never split).
+    ///
+    /// The GPU hang watchdog is armed per SUBMIT, so a forward pass recorded as one command buffer
+    /// is one indivisible watchdog job. On a 2-CU integrated part that job is ~2.05 s of real GPU
+    /// work and the device kills it at ~2.06 s — a margin so thin it was a coin flip, which is the
+    /// `ring gfx_0.0.0 timeout` -> `VK_ERROR_DEVICE_LOST` this exists to prevent. Splitting the
+    /// SAME work across N command buffers divides the per-job duration by N without removing any
+    /// work: the segments still run back-to-back on the queue (`finish_nowait`, no host sync), the
+    /// watchdog just gets N short jobs to watch instead of one long one.
+    ///
+    /// Seeded from `infr_core::initial_submit_dispatch_cap` (unlimited on discrete — a dGPU
+    /// forward is tens of ms and must not pay for barriers it does not need) and then RE-TUNED
+    /// from measurement after every forward (`infr_core::submit_cap_from_measurement`), so the
+    /// bound tracks whatever the device actually is rather than a table of magic numbers.
+    submit_dispatch_cap: AtomicUsize,
     /// Memory type index for DIRECT-TO-VRAM weight writes (Resizable BAR), or `None` when the
     /// device doesn't expose one. See [`probe_rebar_type`]: it is a
     /// `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` type sitting on the device's LARGEST
@@ -760,13 +776,19 @@ impl VulkanBackend {
         };
 
         // ── compute queue family ───────────────────────────────────────────────
+        // The first COMPUTE-capable family. On amdgpu this is the universal (graphics) family, so
+        // the work lands on the `gfx` ring. Moving it to a compute-ONLY family (the `comp` rings)
+        // was tried and is strictly WORSE on the surveyed integrated part: the same ~2 s forward
+        // that is an intermittent device-lost on `gfx` is a DETERMINISTIC one on `comp` (measured
+        // 4/4 runs), i.e. the compute ring's effective hang budget there is TIGHTER, not the 60 s
+        // its module-parameter default advertises. The submit splitter is what actually bounds the
+        // job (see `VulkanShared::submit_dispatch_cap`); the ring choice is not a lever.
         let qf_props =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
         let queue_family_index = qf_props
             .iter()
-            .enumerate()
-            .find(|(_, p)| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            .map(|(i, _)| i as u32)
+            .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .map(|i| i as u32)
             .ok_or_else(|| be("no compute queue family found"))?;
 
         // ── probe device extensions ────────────────────────────────────────────
@@ -1326,19 +1348,33 @@ impl VulkanBackend {
             caps.sg_pref,
             caps.max_shared_memory_bytes / 1024,
         );
-        // Integrated GPUs take a DIFFERENT prefill chunk (watchdog headroom — see
-        // `Capabilities::integrated`), so say so out loud: it is the first thing to check when an
-        // iGPU run hangs or prefills slowly. Silent on every discrete device (nothing changed).
+        // Submit splitter (see `VulkanShared::submit_dispatch_cap`): the initial, pre-measurement
+        // cap. `INFR_SUBMIT_DISPATCHES` overrides it (`0` = never split) — the kill switch if this
+        // ever misjudges a device.
+        let submit_dispatch_cap = match std::env::var("INFR_SUBMIT_DISPATCHES") {
+            Ok(v) => v.parse::<usize>().map_err(|e| {
+                be(format!(
+                    "INFR_SUBMIT_DISPATCHES: expected a dispatch count (0 = never split): {e}"
+                ))
+            })?,
+            Err(_) => infr_core::initial_submit_dispatch_cap(caps.integrated),
+        };
+        // Integrated GPUs run a DIFFERENT shape of forward (smaller prefill chunk, and the whole
+        // pass split across several submits so no single command buffer can trip the GPU's hang
+        // watchdog), so say so out loud: it is the first thing to check when an iGPU run hangs or
+        // prefills slowly. Silent on every discrete device (nothing changed there).
         if caps.integrated {
             eprintln!(
-                "[infr] GPU: INTEGRATED (cu:{}) — prefill chunk capped to {} rows to stay under \
-                 the ~10s GPU watchdog; INFR_UBATCH overrides",
+                "[infr] GPU: INTEGRATED (cu:{}) — prefill chunk {} rows, forward split every {} \
+                 dispatches to stay under the GPU hang watchdog; INFR_UBATCH / \
+                 INFR_SUBMIT_DISPATCHES override",
                 if caps.compute_units > 0 {
                     caps.compute_units.to_string()
                 } else {
                     "?".to_string()
                 },
                 infr_core::integrated_ubatch_rows(caps.compute_units),
+                submit_dispatch_cap,
             );
         }
 
@@ -1399,11 +1435,51 @@ impl VulkanBackend {
                 pcache,
                 weight_pb: Mutex::new(None),
                 device_used: AtomicU64::new(0),
+                submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 rebar_type,
                 weights_direct: AtomicBool::new(false),
                 staging_ring: Mutex::new(None),
             }),
         })
+    }
+
+    /// The submit splitter's current cap — see `VulkanShared::submit_dispatch_cap`. `0` =
+    /// unlimited (record the whole forward into one command buffer, the discrete default).
+    pub(crate) fn submit_dispatch_cap(&self) -> usize {
+        self.shared.submit_dispatch_cap.load(Ordering::Relaxed)
+    }
+
+    /// Feed a completed forward's measurement back into the submit splitter: `elapsed` of wall
+    /// across `dispatches` dispatches, measured with the queue drained at both ends. Re-tunes the
+    /// cap so the NEXT forward's segments land inside `infr_core::SUBMIT_BUDGET_NS` on whatever
+    /// device this actually is — the loop that makes the splitter hardware-agnostic instead of a
+    /// table of per-GPU constants.
+    ///
+    /// The cap only ever RATCHETS DOWN within a process. A forward's wall time is a noisy sample
+    /// (a cold pipeline compile, a busy host, a first-touch page fault all inflate it), and the
+    /// asymmetry of the two mistakes is total: too small a cap costs a few extra submits, too
+    /// large a cap costs a device-lost. So a slow sample tightens the bound and a fast one is
+    /// simply ignored.
+    pub(crate) fn observe_forward(&self, elapsed: std::time::Duration, dispatches: usize) {
+        let ns = elapsed.as_nanos() as u64;
+        let cur = self.submit_dispatch_cap();
+        // A device that has never split (every discrete GPU) only starts splitting if a forward
+        // actually lands in watchdog territory — see `infr_core::SUBMIT_DANGER_NS`. Without this,
+        // the measured cap (finite, just very large) would eventually split a big enough graph on
+        // a perfectly healthy dGPU, which is a tuned path this has no business touching.
+        if cur == 0 && ns < infr_core::SUBMIT_DANGER_NS {
+            return;
+        }
+        let want = infr_core::submit_cap_from_measurement(ns, dispatches);
+        if want == 0 {
+            return; // measurement says "no split needed"; never loosen an existing cap on it
+        }
+        let next = if cur == 0 { want } else { cur.min(want) };
+        if next != cur {
+            self.shared
+                .submit_dispatch_cap
+                .store(next, Ordering::Relaxed);
+        }
     }
 
     /// Begin a "loading weights" progress bar covering `total_bytes` (pass `None` for an
@@ -2303,6 +2379,20 @@ impl Backend for VulkanBackend {
 
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
         adapter::execute(self, plan, bindings)
+    }
+
+    /// See `Backend::max_decode_chain`. A device that needs its FORWARD split into several
+    /// submits (`submit_dispatch_cap` — every integrated part measured so far) cannot also afford
+    /// to pack several decode steps into one: a decode graph is hundreds of dispatches, i.e.
+    /// already at or past that cap on its own, so the honest bound there is a chain of ONE. A
+    /// device that never splits (every discrete GPU) keeps the unbounded default, and the tuned
+    /// chained-decode fast path is untouched.
+    fn max_decode_chain(&self) -> usize {
+        if self.submit_dispatch_cap() == 0 {
+            usize::MAX
+        } else {
+            1
+        }
     }
 
     fn execute_chain(

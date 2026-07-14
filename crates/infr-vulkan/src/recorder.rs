@@ -287,6 +287,10 @@ pub struct Recorder<'a> {
     t0: std::time::Instant,
     /// See [`Self::suppress_sync`]: while set, `sync` accumulates hazards without emitting.
     suppress: std::cell::Cell<bool>,
+    /// Dispatches recorded into THIS command buffer so far (counted at the `stamp` chokepoint).
+    /// The submit splitter reads it to decide when the segment has grown to the device's cap —
+    /// see `VulkanShared::submit_dispatch_cap` and `adapter::execute_static`.
+    dispatches: std::cell::Cell<usize>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -378,7 +382,13 @@ impl<'a> Recorder<'a> {
             persistent,
             t0: std::time::Instant::now(),
             suppress: std::cell::Cell::new(false),
+            dispatches: std::cell::Cell::new(0),
         })
+    }
+
+    /// Dispatches recorded into this command buffer so far — the submit splitter's trigger.
+    pub fn dispatches(&self) -> usize {
+        self.dispatches.get()
     }
 
     /// Disjoint-batch barrier suppression: while ON, recorded dispatches accumulate hazard state
@@ -472,6 +482,10 @@ impl<'a> Recorder<'a> {
     /// longer stamp by hand (use [`label_next`](Self::label_next) to override a too-generic
     /// kernel name).
     fn stamp(&self, label: &'static str) {
+        // Every dispatch funnels through here, so this is also where the recorder counts them —
+        // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF2
+        // is on.
+        self.dispatches.set(self.dispatches.get() + 1);
         if !self.prof2 {
             return;
         }
@@ -6556,6 +6570,7 @@ impl<'a> Recorder<'a> {
     /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
+        let dispatches = self.dispatches.get();
         if self.prof || self.prof2 {
             let shared = std::sync::Arc::clone(&self.be.shared);
             self.finish()?;
@@ -6564,6 +6579,7 @@ impl<'a> Recorder<'a> {
                 fence: None,
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
+                dispatches,
             });
         }
         let device = &self.be.shared.device;
@@ -6586,6 +6602,7 @@ impl<'a> Recorder<'a> {
             fence: Some(fence),
             cmd: self.cmd,
             pools: self.pools.borrow().clone(),
+            dispatches,
         })
     }
 
@@ -6632,6 +6649,7 @@ impl<'a> Recorder<'a> {
             shared: std::sync::Arc::clone(&self.be.shared),
             cmd: self.cmd,
             pools: self.pools.borrow().clone(),
+            dispatches: self.dispatches.get(),
         })
     }
 
@@ -6718,13 +6736,37 @@ pub struct RecordedCmd {
     shared: std::sync::Arc<crate::VulkanShared>,
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
+    /// Dispatches in ONE replay of this recording. `replay_n(n)` puts `n` copies of them into a
+    /// single submit, so this is what bounds a chain against the GPU hang watchdog — see
+    /// `Self::max_chain`.
+    dispatches: usize,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl RecordedCmd {
+    /// The longest chain `replay_n` may be given on this device: `n` copies of the recording go
+    /// into ONE submit, and the GPU hang watchdog is armed per submit, so an unbounded chain is
+    /// the same device-lost trap the forward-pass splitter exists to close (on the surveyed 2-CU
+    /// iGPU a decode step is ~213 ms, so the old ceiling of 64 would have been ~13.6 s in a single
+    /// command buffer). Bounded by the SAME measured dispatch cap the splitter uses; `usize::MAX`
+    /// (no bound) on a device that never splits, which is every discrete GPU.
+    pub fn max_chain(&self) -> usize {
+        let cap = self
+            .shared
+            .submit_dispatch_cap
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cap == 0 || self.dispatches == 0 {
+            return usize::MAX;
+        }
+        // Always at least one: a single decode step is indivisible, and it is short enough on
+        // every device we have measured.
+        (cap / self.dispatches).max(1)
+    }
+
     /// Resubmit the recorded command buffer `n` times in ONE queue submission (legal via
     /// SIMULTANEOUS_USE) and wait once — the chained decode's n back-to-back iterations. The
-    /// recording's leading global barrier orders consecutive iterations.
+    /// recording's leading global barrier orders consecutive iterations. Callers must clamp `n` to
+    /// [`Self::max_chain`] — see `adapter::execute_chain`.
     pub fn replay_n(&self, n: usize) -> Result<()> {
         let device = &self.shared.device;
         let cmds = vec![self.cmd; n];
@@ -6787,6 +6829,16 @@ pub struct PendingSegment {
     fence: Option<vk::Fence>,
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
+    /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
+    /// `VulkanBackend::observe_forward`.
+    dispatches: usize,
+}
+
+impl PendingSegment {
+    /// Dispatches recorded into this segment's command buffer.
+    pub fn dispatches(&self) -> usize {
+        self.dispatches
+    }
 }
 
 impl PendingSegment {

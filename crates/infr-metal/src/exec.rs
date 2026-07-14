@@ -236,6 +236,15 @@ mod tests {
     }
 
     #[test]
+    fn conv1d_msl_has_parallel_prefill_passes() {
+        let src = include_str!("../shaders/deltanet.metal");
+        assert!(contains_tokens(src, "kernel void conv1d_silu_par_f32"));
+        assert!(contains_tokens(src, "kernel void conv1d_shift_f32"));
+        assert!(!prefer_conv1d_parallel(2, 4));
+        assert!(prefer_conv1d_parallel(3, 4));
+    }
+
+    #[test]
     fn argmax_split_policy_only_targets_vocab_scale_inputs() {
         assert_eq!(argmax_split_groups(151_936), Some(38));
         assert_eq!(argmax_split_groups(32_768), Some(8));
@@ -901,6 +910,10 @@ fn prefer_deltanet_gate_prep(rows: usize) -> bool {
 
 fn prefer_deltanet_norm_prep(rows: usize) -> bool {
     rows >= 8
+}
+
+fn prefer_conv1d_parallel(rows: usize, kernel: usize) -> bool {
+    rows >= kernel.saturating_sub(1).max(2)
 }
 
 fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static str> {
@@ -4537,18 +4550,41 @@ impl MetalBackend {
                         let i = state.0 as usize;
                         r.dev[i] = Some(Arc::new(sbuf.raw.clone()));
                         r.loc[i] = Loc::Device;
-                        let pso = self.pipelines.get("conv1d_silu_f32")?;
                         let mut p = (rr as u32).to_ne_bytes().to_vec();
                         p.extend_from_slice(&(cc as u32).to_ne_bytes());
                         p.extend_from_slice(&(kk as u32).to_ne_bytes());
-                        self.encode_w(
-                            r,
-                            &pso,
-                            &[bx.as_ref(), bw.as_ref(), &sbuf.raw, bd.as_ref()],
-                            (1 << 2) | (1 << 3),
-                            &p,
-                            cc,
-                        );
+                        let parallel = prefer_conv1d_parallel(rr, kk)
+                            && std::env::var("INFR_METAL_NO_CONV1D_PAR").is_err();
+                        if parallel {
+                            let pso = self.pipelines.get("conv1d_silu_par_f32")?;
+                            self.encode_w(
+                                r,
+                                &pso,
+                                &[bx.as_ref(), bw.as_ref(), &sbuf.raw, bd.as_ref()],
+                                1 << 3,
+                                &p,
+                                rr * cc,
+                            );
+                            let shift = self.pipelines.get("conv1d_shift_f32")?;
+                            self.encode_w(
+                                r,
+                                &shift,
+                                &[bx.as_ref(), &sbuf.raw],
+                                1 << 1,
+                                &p,
+                                (kk - 1) * cc,
+                            );
+                        } else {
+                            let pso = self.pipelines.get("conv1d_silu_f32")?;
+                            self.encode_w(
+                                r,
+                                &pso,
+                                &[bx.as_ref(), bw.as_ref(), &sbuf.raw, bd.as_ref()],
+                                (1 << 2) | (1 << 3),
+                                &p,
+                                cc,
+                            );
+                        }
                         r.loc[dst.0 as usize] = Loc::Device;
                         return Ok(());
                     }

@@ -29,6 +29,51 @@ kernel void conv1d_silu_f32(device const float* x     [[buffer(0)]],
     for (uint j = 0; j + 1 < kk; j++) state[j * p.channels + ch] = st[j];
 }
 
+// Multi-row pass 1: each output reads its causal window from the virtual sequence
+// [old state | x], so all rows*channels elements are independent.
+kernel void conv1d_silu_par_f32(device const float* x     [[buffer(0)]],
+                                device const float* w     [[buffer(1)]],
+                                device const float* state [[buffer(2)]],
+                                device float*       dst   [[buffer(3)]],
+                                constant ConvSiluParams& p [[buffer(4)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows * p.channels) return;
+    uint t = gid / p.channels;
+    uint ch = gid % p.channels;
+    uint km1 = p.kwidth - 1u;
+    float acc = 0.0f;
+    if (t >= km1) {
+        ulong base = (ulong)(t - km1) * p.channels + ch;
+        for (uint k = 0; k < p.kwidth; k++) {
+            acc += x[base + (ulong)k * p.channels] * w[ch * p.kwidth + k];
+        }
+    } else {
+        for (uint k = 0; k < p.kwidth; k++) {
+            uint i = t + k;
+            float xv;
+            if (i < km1) {
+                xv = state[i * p.channels + ch];
+            } else {
+                xv = x[(i - km1) * p.channels + ch];
+            }
+            acc += xv * w[ch * p.kwidth + k];
+        }
+    }
+    dst[gid] = acc / (1.0f + exp(-acc));
+}
+
+// Multi-row pass 2: rows >= K-1, so the final K-1 inputs directly become state.
+kernel void conv1d_shift_f32(device const float* x [[buffer(0)]],
+                             device float* state   [[buffer(1)]],
+                             constant ConvSiluParams& p [[buffer(2)]],
+                             uint gid [[thread_position_in_grid]]) {
+    uint km1 = p.kwidth - 1u;
+    if (gid >= km1 * p.channels) return;
+    uint k = gid / p.channels;
+    uint ch = gid % p.channels;
+    state[gid] = x[(p.rows - km1 + k) * p.channels + ch];
+}
+
 // One SIMDGROUP per (value-dim d, value-head h) — the llama.cpp kernel_gated_delta_net
 // parallelization. The simdgroup's 32 lanes split the k-dim (KPL = kd/32 state entries per
 // lane, register-resident ls[] for the WHOLE chunk — the old shape re-read the state column

@@ -1149,6 +1149,7 @@ pub(crate) fn generate_dense_metal(
     prompt: &[u32],
     max_new: usize,
     on_token: impl FnMut(u32),
+    req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_metal_session(
         mtl,
@@ -1162,6 +1163,7 @@ pub(crate) fn generate_dense_metal(
         &mut None,
         prompt.len() + max_new + 1,
         None,
+        req,
     )
 }
 
@@ -1183,6 +1185,7 @@ pub(crate) fn generate_dense_metal_session(
     state: &mut Option<SeamKv>,
     want_ctx: usize,
     constraint: Option<&mut crate::grammar::Constraint>,
+    req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_backend(
         mtl,
@@ -1208,7 +1211,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         None,
-        None,
+        req,
     )
 }
 

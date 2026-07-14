@@ -721,7 +721,7 @@ fn metal_spec_decode_matches_target_only_greedy() {
     {
         let mut sess = target.metal_session(1024).expect("target-only session");
         target
-            .generate_metal_session(&mut sess, &prompt, 64, |p| plain.push_str(p))
+            .generate_metal_session(&mut sess, &prompt, 64, None, |p| plain.push_str(p))
             .expect("target-only greedy");
     }
 
@@ -756,13 +756,13 @@ fn metal_decode_chain_matches_per_token_greedy() {
     std::env::set_var("INFR_DECODE_CHAIN", "1");
     let mut per_token = String::new();
     model
-        .generate_metal(&prompt, 32, |p| per_token.push_str(p))
+        .generate_metal(&prompt, 32, None, |p| per_token.push_str(p))
         .expect("per-token greedy");
 
     std::env::set_var("INFR_DECODE_CHAIN", "8");
     let mut chained = String::new();
     model
-        .generate_metal(&prompt, 32, |p| chained.push_str(p))
+        .generate_metal(&prompt, 32, None, |p| chained.push_str(p))
         .expect("chained greedy");
 
     std::env::remove_var("INFR_DECODE_CHAIN");
@@ -787,13 +787,13 @@ fn metal_decode_chain_matches_per_token_sampling() {
     std::env::set_var("INFR_DECODE_CHAIN", "1");
     let mut per_token = String::new();
     model
-        .generate_metal(&prompt, 32, |p| per_token.push_str(p))
+        .generate_metal(&prompt, 32, None, |p| per_token.push_str(p))
         .expect("per-token sampling");
 
     std::env::set_var("INFR_DECODE_CHAIN", "8");
     let mut chained = String::new();
     model
-        .generate_metal(&prompt, 32, |p| chained.push_str(p))
+        .generate_metal(&prompt, 32, None, |p| chained.push_str(p))
         .expect("chained sampling");
 
     for var in [
@@ -828,18 +828,18 @@ fn metal_seam_multi_slot_prefix_sharing() {
 
     let mut ta = String::new();
     let sa = model
-        .generate_metal_session(&mut sess, &pa, 8, |p| ta.push_str(p))
+        .generate_metal_session(&mut sess, &pa, 8, None, |p| ta.push_str(p))
         .expect("conv A");
     assert!(sa.n_prompt > 0);
 
     // Conversation B: different question, same system prefix → new slot seeded from A's.
     let mut tb = String::new();
     let sb = model
-        .generate_metal_session(&mut sess, &pb, 8, |p| tb.push_str(p))
+        .generate_metal_session(&mut sess, &pb, 8, None, |p| tb.push_str(p))
         .expect("conv B");
     let mut fresh_b = String::new();
     model
-        .generate_metal(&pb, 8, |p| fresh_b.push_str(p))
+        .generate_metal(&pb, 8, None, |p| fresh_b.push_str(p))
         .expect("fresh B");
     assert_eq!(
         tb.trim(),
@@ -858,11 +858,11 @@ fn metal_seam_multi_slot_prefix_sharing() {
     let pa2 = format!("{pa}{ta} And the capital of Spain is");
     let mut ta2 = String::new();
     let sa2 = model
-        .generate_metal_session(&mut sess, &pa2, 8, |p| ta2.push_str(p))
+        .generate_metal_session(&mut sess, &pa2, 8, None, |p| ta2.push_str(p))
         .expect("conv A turn 2");
     let mut fresh_a2 = String::new();
     model
-        .generate_metal(&pa2, 8, |p| fresh_a2.push_str(p))
+        .generate_metal(&pa2, 8, None, |p| fresh_a2.push_str(p))
         .expect("fresh A2");
     assert_eq!(
         ta2.trim(),

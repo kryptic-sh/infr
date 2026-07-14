@@ -946,9 +946,10 @@ impl SeamModel {
         session: &mut DenseMetalSession,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        self.generate_metal_session_constrained(session, prompt, max_new, None, on_piece)
+        self.generate_metal_session_constrained(session, prompt, max_new, None, req, on_piece)
     }
 
     /// [`generate_metal_session`](Self::generate_metal_session) with an optional llguidance
@@ -960,6 +961,7 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
         constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let enc = self
@@ -982,6 +984,7 @@ impl SeamModel {
             &mut session.pool.slots[slot],
             session.max_ctx,
             constraint,
+            req,
         )?;
         Ok(stats)
     }
@@ -995,6 +998,7 @@ impl SeamModel {
         &self,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let enc = self
@@ -1014,6 +1018,7 @@ impl SeamModel {
             &prompt_tokens,
             max_new,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+            req,
         )?;
         Ok(stats)
     }
@@ -1092,6 +1097,7 @@ impl SeamModel {
             &mut session.pool.slots[t_slot],
             session.max_ctx,
             None,
+            None, // req: internal spec/DG path, greedy
         )?;
         let prompt_secs = t0.elapsed().as_secs_f64();
         let mut t_next = *first.first().ok_or_else(|| anyhow!("empty first token"))?;
@@ -1138,6 +1144,7 @@ impl SeamModel {
                 &mut draft_session.pool.slots[d_slot],
                 draft_session.max_ctx,
                 None,
+                None, // req: internal spec/DG path, greedy
             )?;
             // Verify: one batched target forward over [t_next, cand..]; row i's argmax is the
             // target's choice after consuming everything up to and including suffix row i.
@@ -1242,6 +1249,7 @@ impl SeamModel {
             session.pool.single(),
             session.max_ctx,
             None,
+            None, // req: internal spec/DG path, greedy
         )?;
         Ok(stats)
     }

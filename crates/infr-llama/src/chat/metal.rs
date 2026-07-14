@@ -82,7 +82,7 @@ impl ChatModel for MetalSeamChat {
         // (No INFR_METAL_PROFILE suppression: the Metal backend reads it at CONSTRUCTION —
         // which happens inside this first generate — so unsetting it here would disable
         // profiling for the whole session, not just the warmup.)
-        self.generate("Hi", 2, &mut |_| {})?;
+        self.generate("Hi", 2, None, &mut |_| {})?;
         // Drop the warmup tokens so the first real prompt prefills clean slots from row 0
         // instead of forking off a garbage prefix.
         if let Some(s) = &mut self.session {
@@ -95,12 +95,17 @@ impl ChatModel for MetalSeamChat {
         &mut self,
         prompt: &str,
         max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         // MTP (INFR_MTP=1 on a qwen35 head-bearing GGUF): the draft-verify-catchup loop over the
         // Metal trunk + head, instead of the plain session decode. The committed stream is the
         // target's greedy stream (the same invariant Vulkan MTP holds), so the two are
         // token-identical — pinned by the greedy-equivalence check in the CLI validation.
+        //
+        // `req` is deliberately NOT threaded here: the MTP driver is greedy-only (see
+        // `mtp::mtp_enabled`'s doc and `generate_mtp_spec_metal`), so per-request sampling has
+        // nowhere to land. The Vulkan twin drops it on the same branch for the same reason.
         if self.wants_mtp()? {
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
             return crate::mtp::generate_mtp_spec_metal(&self.model, head, prompt, max_new, |p| {
@@ -108,10 +113,13 @@ impl ChatModel for MetalSeamChat {
             });
         }
         self.ensure_session()?;
-        self.model
-            .generate_metal_session(self.session.as_mut().unwrap(), prompt, max_new, |p| {
-                on_piece(p)
-            })
+        self.model.generate_metal_session(
+            self.session.as_mut().unwrap(),
+            prompt,
+            max_new,
+            req,
+            |p| on_piece(p),
+        )
     }
 
     fn generate_constrained(
@@ -119,6 +127,7 @@ impl ChatModel for MetalSeamChat {
         prompt: &str,
         max_new: usize,
         constraint: &mut crate::grammar::Constraint,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         self.ensure_session()?;
@@ -127,6 +136,7 @@ impl ChatModel for MetalSeamChat {
             prompt,
             max_new,
             Some(constraint),
+            req,
             |p| on_piece(p),
         )
     }
@@ -187,7 +197,7 @@ impl ChatModel for SpecMetalChat {
     fn warmup(&mut self) -> Result<()> {
         // Compile BOTH models' pipelines now (a spec round drives target prefill, draft decode,
         // and the batched verify) so serve's first request doesn't pay two cold starts.
-        self.generate("Hi", 2, &mut |_| {})?;
+        self.generate("Hi", 2, None, &mut |_| {})?;
         // Drop the warmup tokens so the first real prompt prefills clean slots from row 0.
         if let Some(s) = &mut self.target_session {
             s.reset_cache();
@@ -202,6 +212,9 @@ impl ChatModel for SpecMetalChat {
         &mut self,
         prompt: &str,
         max_new: usize,
+        // Speculative decode is GREEDY-ONLY (`generate_metal_spec` asserts INFR_TEMP=0 — the
+        // accept rule requires the target's argmax), so per-request sampling has nowhere to land.
+        _req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         self.ensure_sessions()?;

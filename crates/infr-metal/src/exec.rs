@@ -179,6 +179,24 @@ mod tests {
     }
 
     #[test]
+    fn rmsnorm_has_vec4_decode_entrypoint() {
+        let src = include_str!("../shaders/elementwise_norms.metal");
+        assert!(src.contains("kernel void rmsnorm_vec4_f32"));
+        assert!(src.contains("device const float4* x"));
+        assert!(src.contains("device const float4* w"));
+        assert!(src.contains("device float4*       dst"));
+    }
+
+    #[test]
+    fn rmsnorm_vec4_policy_only_targets_wide_decode_rows() {
+        assert!(prefer_rmsnorm_vec4(1, 2048));
+        assert!(prefer_rmsnorm_vec4(4, 5376));
+        assert!(!prefer_rmsnorm_vec4(5, 5376));
+        assert!(!prefer_rmsnorm_vec4(1, 1152));
+        assert!(!prefer_rmsnorm_vec4(1, 2049));
+    }
+
+    #[test]
     fn argmax_split_policy_only_targets_vocab_scale_inputs() {
         assert_eq!(argmax_split_groups(151_936), Some(38));
         assert_eq!(argmax_split_groups(32_768), Some(8));
@@ -671,6 +689,10 @@ fn sample_split_shape(n: usize, top_k: usize) -> Option<(usize, usize)> {
 
 fn prefer_iq4nl_rt(kern: &str, m: usize) -> bool {
     kern == "linear_iq4nl" && (2..=4).contains(&m)
+}
+
+fn prefer_rmsnorm_vec4(rows: usize, dim: usize) -> bool {
+    rows <= 4 && dim >= 2048 && dim.is_multiple_of(4)
 }
 
 fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static str> {
@@ -1927,13 +1949,22 @@ impl MetalBackend {
                 // Decode (few rows): the WIDE kernel — 8 simdgroups per row; the 32-lane form
                 // is latency-bound on dim/32 serial loads (~20 us/launch at dim 1152). Prefill
                 // keeps one simdgroup per row (the rows themselves fill the GPU).
+                let vec4 = std::env::var_os("INFR_METAL_NO_RMSNORM_VEC4").is_none()
+                    && prefer_rmsnorm_vec4(rows, dim)
+                    && self
+                        .pipelines
+                        .get("rmsnorm_vec4_f32")
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
+                        .unwrap_or(false);
                 let wide = rows <= 4
                     && self
                         .pipelines
                         .get("rmsnorm_wide_f32")
                         .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
                         .unwrap_or(false);
-                let pso = self.pipelines.get(if wide {
+                let pso = self.pipelines.get(if vec4 {
+                    "rmsnorm_vec4_f32"
+                } else if wide {
                     "rmsnorm_wide_f32"
                 } else {
                     "rmsnorm_f32"
@@ -1941,7 +1972,7 @@ impl MetalBackend {
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(dim as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
-                let tgw = if wide { 256 } else { 32 };
+                let tgw = if vec4 || wide { 256 } else { 32 };
                 self.encode_tg_w(
                     r,
                     &pso,

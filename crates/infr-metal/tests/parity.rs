@@ -1534,6 +1534,44 @@ fn rmsnorm_parity() {
     assert_parity(&g, &bound, dst, rows * dim, 1e-5);
 }
 
+fn check_rmsnorm_parity(rows: usize, dim: usize, seed: u64) {
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows, dim], DType::F32));
+    let w = g.weight(TensorDesc::new(vec![dim], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows, dim], DType::F32));
+    g.push(Op::RmsNorm {
+        x,
+        weight: w,
+        dst,
+        rows: rows as u32,
+        dim: dim as u32,
+        eps: 1e-6,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(rows * dim, seed))),
+        (w, f32_bytes(&rand_f32(dim, seed + 1))),
+    ];
+    assert_parity(&g, &bound, dst, rows * dim, 1e-5);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn rmsnorm_vec4_decode_shape_parity() {
+    check_rmsnorm_parity(1, 5376, 101);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn rmsnorm_vec4_multirow_gate_parity() {
+    check_rmsnorm_parity(4, 2048, 103);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn rmsnorm_scalar_fallback_shape_parity() {
+    check_rmsnorm_parity(1, 2049, 105);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn qknorm_parity() {

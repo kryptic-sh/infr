@@ -156,6 +156,28 @@ fn f16_native_probe() {
     bench_chained(DType::F16, &w16, in_f, out_f, 16.0, "f16 native");
 }
 
+#[test]
+#[ignore = "requires a Metal GPU; evidence probe, not a correctness test"]
+fn f16_cmm_probe() {
+    let (m, in_f, out_f) = (32usize, 1152usize, 8192usize);
+    let w16: Vec<u8> = (0..out_f * in_f)
+        .flat_map(|i| half::f16::from_f32((i % 13) as f32 * 0.01).to_le_bytes())
+        .collect();
+
+    std::env::set_var("INFR_METAL_NO_F16_CMM", "1");
+    bench_chained_m(
+        DType::F16,
+        &w16,
+        m,
+        in_f,
+        out_f,
+        16.0 * m as f64,
+        "f16 native-gemv",
+    );
+    std::env::remove_var("INFR_METAL_NO_F16_CMM");
+    bench_chained_m(DType::F16, &w16, m, in_f, out_f, 16.0, "f16 cmm");
+}
+
 fn synth_q5_0(n_elem: usize, seed: u32) -> Vec<u8> {
     let mut out = Vec::new();
     for blk_i in 0..(n_elem / 32) {

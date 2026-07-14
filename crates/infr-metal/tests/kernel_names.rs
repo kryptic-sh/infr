@@ -126,6 +126,16 @@ fn f16_linear_reads_the_bound_weight_directly() {
     asserts_token_seq(exec, "DType::F16 if f16_native => (\"linear_f16\", 2u64)");
 }
 
+#[test]
+fn f16_multirow_linear_uses_the_cooperative_tile() {
+    let shader = include_str!("../shaders/moe.metal");
+    asserts_token_seq(shader, "CMM_KERNEL(linear_f16_cmm, DEC16_F16)");
+
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "let f16_cmm = f16_native && m >= 16");
+    asserts_token_seq(exec, "self.pipelines.get(\"linear_f16_cmm\")");
+}
+
 // The two below test the TRIPWIRE ITSELF. A guard nobody has watched fail is not a guard: it can
 // rot into a tautology (matching something that is always present) and nothing would say so.
 

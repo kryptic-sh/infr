@@ -553,6 +553,7 @@ CMM_KERNEL(linear_iq3s_cmm, DEC16_IQ3S)
 CMM_KERNEL(linear_iq2s_cmm, DEC16_IQ2S)
 CMM_KERNEL(linear_iq2xs_cmm, DEC16_IQ2XS)
 CMM_KERNEL(linear_q6k_cmm, DEC16_Q6K)
+CMM_KERNEL(linear_f16_cmm, DEC16_F16)
 
 HGEMM_KERNEL(linear_quik4_hmm, DEC16_K4)
 HGEMM_KERNEL(linear_quik6_hmm, DEC16_K6)

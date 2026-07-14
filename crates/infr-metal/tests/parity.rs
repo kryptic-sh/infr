@@ -560,6 +560,14 @@ fn linear_woff_f16_gemv() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn linear_woff_f16_cmm() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    let wf = rand_f32(256 * in_f, 351);
+    check_linear_woff(DType::F16, f16_bytes(&wf), 40, in_f, &slices, true, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn linear_woff_q8_0_coop_gemm() {
     let (in_f, slices) = (256usize, [128usize, 64, 64]);
     let wf = rand_f32(256 * in_f, 36);
@@ -665,6 +673,14 @@ fn linear_f16_parity() {
         (w, f16_bytes(&rand_f32(out_f * in_f, 23))),
     ];
     assert_parity(&g, &bound, dst, m * out_f, 1e-3);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_f16_cmm_parity() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    let wf = rand_f32(out_f * in_f, 230);
+    check_quant_linear_parity_impl(DType::F16, f16_bytes(&wf), m, in_f, out_f, 1e-3, true);
 }
 
 // Quantized Linear: Metal dequants the weight to f32 (via infr_gguf) and matmuls. Compare to a

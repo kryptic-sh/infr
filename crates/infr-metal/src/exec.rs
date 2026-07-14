@@ -2516,19 +2516,56 @@ impl MetalBackend {
                 } else {
                     let f16_native =
                         wdt == DType::F16 && std::env::var("INFR_METAL_NO_F16_NATIVE").is_err();
+                    let f16_cmm = f16_native
+                        && m >= 16
+                        && out_f % 64 == 0
+                        && std::env::var("INFR_METAL_NO_F16_CMM").is_err()
+                        && self
+                            .pipelines
+                            .get("linear_f16_cmm")?
+                            .max_total_threads_per_threadgroup()
+                            >= 128;
                     let (kern, elem_bytes) = match wdt {
                         DType::F16 if f16_native => ("linear_f16", 2u64),
                         _ => ("linear_f32", 4u64),
                     };
-                    let pso = self.pipelines.get(kern)?;
-                    if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern) {
-                        r.cur_op = label;
-                    }
-                    if f16_native {
+                    if f16_cmm {
+                        let cmm = self.pipelines.get("linear_f16_cmm")?;
+                        if let Some(label) =
+                            counter_linear_label(self.counter_set.is_some(), "linear_f16_cmm")
+                        {
+                            r.cur_op = label;
+                        }
+                        let bw =
+                            metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
+                        let dummy = self.scratch_buf(1, 14);
+                        let mut cp = p.clone();
+                        cp.extend_from_slice(&0u32.to_ne_bytes());
+                        self.encode_tg_off(
+                            r,
+                            &cmm,
+                            &[
+                                (bx.as_ref(), 0),
+                                (&bw.raw, w_off as u64 * elem_bytes),
+                                (dummy.as_ref(), 0),
+                                (dummy.as_ref(), 0),
+                                (bd.as_ref(), 0),
+                            ],
+                            1 << 4,
+                            &cp,
+                            m.div_ceil(32) * (out_f / 64) * 128,
+                            128,
+                        );
+                    } else if f16_native {
                         // Read the uploaded GGUF half buffer directly. Besides halving the weight
                         // stream, this avoids a same-size host read plus a 2x f32 cache allocation.
                         let bw =
                             metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
+                        let pso = self.pipelines.get(kern)?;
+                        if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern)
+                        {
+                            r.cur_op = label;
+                        }
                         self.encode_tg_off(
                             r,
                             &pso,
@@ -2545,6 +2582,11 @@ impl MetalBackend {
                     } else {
                         // f32/bf16 weight: dequant-to-f32 device buffer, cached.
                         let bw = self.weight_buf(weight, g, bindings)?;
+                        let pso = self.pipelines.get(kern)?;
+                        if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern)
+                        {
+                            r.cur_op = label;
+                        }
                         self.encode_tg_off(
                             r,
                             &pso,

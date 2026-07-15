@@ -128,6 +128,12 @@ struct VulkanShared {
     caps: Capabilities,
     /// VK_EXT_memory_budget enabled → `vram()` can report live free bytes (else total only).
     has_mem_budget: bool,
+    /// `maxMemoryAllocationSize` — the largest single `vkAllocateMemory` this device accepts
+    /// (`VkPhysicalDeviceMaintenance3Properties`, ~4 GiB on RADV). The weight arena
+    /// (`reserve_weights`) splits its up-front reservation into blocks no larger than this, since a
+    /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
+    /// (the Vulkan-guaranteed floor) if the device reports 0.
+    max_mem_alloc_size: u64,
     /// `VK_KHR_push_descriptor` loader, when the device supports it — every dispatch's
     /// descriptor binding then records via `cmd_push_descriptor_set` (recorder.rs
     /// `bind_descriptors`) instead of a pooled `alloc_set` + `update_descriptor_sets` +
@@ -612,30 +618,42 @@ struct ArenaBlock {
     cursor: u64,
 }
 
-/// Pre-reserved VRAM for load-once weights: one big block sized to the model (plus modest overflow
-/// blocks if the estimate underflows), bump-allocated since weights are never individually freed.
-/// Reserving the whole model up front guarantees it fits contiguously and frees in one shot.
+/// Pre-reserved VRAM for load-once weights: N big blocks sized to the model (each ≤
+/// `maxMemoryAllocationSize` — a whole multi-GiB model can't be one `vkAllocateMemory`), bump-
+/// allocated since weights are never individually freed. Reserving the whole model up front makes
+/// it OWN its VRAM the instant the load starts and frees it in one shot.
 /// MoE-ready: a future expert-streaming mode can hold a second arena/pool and evict experts into it
 /// without disturbing the dense arena.
 struct WeightArena {
     mem_type: u32,
     blocks: Vec<ArenaBlock>,
+    /// Index of the block `bump` is currently filling. Weights bump sequentially and a single
+    /// tensor never straddles a block boundary, so once a tensor doesn't fit the current block the
+    /// cursor advances to the next PRE-RESERVED block (its tail is left as slack) — and only when
+    /// every reserved block is exhausted does `bump` grow a fresh overflow block. Monotonic: it
+    /// never revisits an earlier block. (The old single-`blocks.last()` bump stranded every
+    /// pre-reserved block but the last, double-committing VRAM — see `reserve_weights`.)
+    cur: usize,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl WeightArena {
-    /// Whether a `size`-at-`align` bump fits the newest block WITHOUT growing an overflow block —
-    /// i.e. whether [`bump`](Self::bump) would commit new device memory. The budget guard checks
-    /// this before bumping so only real new commitments are charged against the budget.
+    /// Whether a `size`-at-`align` bump fits some ALREADY-COMMITTED block (the current one or a
+    /// later pre-reserved one) WITHOUT growing a fresh overflow block — i.e. whether
+    /// [`bump`](Self::bump) would commit new device memory. The budget guard checks this before
+    /// bumping so only real new commitments are charged against the budget.
     fn fits(&self, size: u64, align: u64) -> bool {
-        self.blocks.last().is_some_and(|b| {
-            let off = b.cursor.div_ceil(align) * align;
-            off + size <= b.size
-        })
+        self.blocks[self.cur.min(self.blocks.len())..]
+            .iter()
+            .any(|b| {
+                let off = b.cursor.div_ceil(align) * align;
+                off + size <= b.size
+            })
     }
 
-    /// Bump-allocate `size` bytes at `align` from the newest block, growing with an overflow block
-    /// if it won't fit (the new block's bytes are charged to `used` — the budget guard's fallback
+    /// Bump-allocate `size` bytes at `align`. Walks the pre-reserved blocks from `cur` forward,
+    /// placing the tensor in the first that fits (advancing `cur` past any it overruns); if none
+    /// fit, grows a fresh overflow block (its bytes charged to `used` — the budget guard's fallback
     /// accounting). Returns the device memory + offset to bind a buffer to.
     fn bump(
         &mut self,
@@ -644,12 +662,21 @@ impl WeightArena {
         align: u64,
         used: &AtomicU64,
     ) -> Result<(vk::DeviceMemory, u64)> {
-        if let Some(b) = self.blocks.last_mut() {
+        // Try the current block, then walk forward through the remaining pre-reserved blocks.
+        while self.cur < self.blocks.len() {
+            let b = &mut self.blocks[self.cur];
             let off = b.cursor.div_ceil(align) * align;
             if off + size <= b.size {
                 b.cursor = off + size;
                 return Ok((b.memory, off));
             }
+            // Doesn't fit here. Advance to the next pre-reserved block if there is one; otherwise
+            // drop out and grow an overflow block below.
+            if self.cur + 1 < self.blocks.len() {
+                self.cur += 1;
+                continue;
+            }
+            break;
         }
         let bs = size.max(ARENA_OVERFLOW_BLOCK);
         let memory = unsafe {
@@ -667,6 +694,7 @@ impl WeightArena {
             size: bs,
             cursor: size,
         });
+        self.cur = self.blocks.len() - 1;
         Ok((memory, 0))
     }
 
@@ -1335,9 +1363,20 @@ impl VulkanBackend {
         // Query base limits + the subgroup-size range together via properties2 (the coopmat GEMM
         // pins requiredSubgroupSize=32, so the fallback ladder needs to know whether 32 is in range).
         let mut sgsize_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
-        let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sgsize_props);
+        // Maintenance3 (core in Vulkan 1.1) carries `maxMemoryAllocationSize` — the weight arena
+        // splits its up-front reservation into blocks no larger than this.
+        let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
+        let mut props2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut sgsize_props)
+            .push_next(&mut maint3_props);
         unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
         let props = props2.properties;
+        // 0 = not reported → fall back to the Vulkan-guaranteed floor (2^30 = 1 GiB).
+        let max_mem_alloc_size = if maint3_props.max_memory_allocation_size == 0 {
+            1 << 30
+        } else {
+            maint3_props.max_memory_allocation_size
+        };
         let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -1621,6 +1660,7 @@ impl VulkanBackend {
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 caps,
                 has_mem_budget,
+                max_mem_alloc_size,
                 push_descriptor,
                 weight_arena: Mutex::new(None),
                 linear_kernel: std::sync::OnceLock::new(),
@@ -1708,6 +1748,53 @@ impl VulkanBackend {
             None => false,
         };
         self.shared.weights_direct.store(direct, Ordering::Relaxed);
+
+        // ── VRAM UP FRONT: pre-reserve the whole resident weight set as a bump arena ────────────
+        // Committing the footprint in a few big blocks (instead of dribbling one dedicated
+        // VkDeviceMemory per tensor) makes the model OWN its VRAM the instant the load starts — no
+        // window where another process can grab VRAM mid-load and no slow per-tensor climb in
+        // `mem_info_vram_used`. Every subsequent `Weights` alloc sub-allocates from the arena
+        // (`make_buf_ex`). Gated hard — reserve ONLY when:
+        //   * total is known (an indeterminate load can't be sized), and
+        //   * the model is FULLY RESIDENT: a paged-MoE (`moe_paged`) or dense-STREAMED
+        //     (`dense_paged`) model DELIBERATELY keeps most weights OUT of VRAM, and `total` here
+        //     counts the whole footprint — arena-ing it would reserve the entire model and OOM, or
+        //     make streamed placeholders land in the arena and corrupt. The pager was already
+        //     installed by `vulkan_moe_binder` before this scope opens, so these read true now, and
+        //   * NOT the direct-to-VRAM (ReBAR) path: those weights get their own mapped dedicated
+        //     allocations in `make_buf_ex` and never touch the arena — a reservation would just
+        //     double-commit the VRAM, and
+        //   * DISCRETE only: on a unified-memory part the device-local heap is a synthetic carveout
+        //     smaller than total DDR, and the per-tensor path's `uma_overflow_type` spill is what
+        //     places bytes on the other heap once it fills. A single big arena block can't spill
+        //     mid-block, so a resident UMA model over the carveout would just fail the reserve and
+        //     fall back anyway; reserving up front on shared DDR buys nothing (same memory, and the
+        //     "another process grabs it" race doesn't bite a shared pool the same way). Leave UMA
+        //     on the per-tensor spill path, which is already correct.
+        // On ANY failure `reserve_weights` rolls back to no arena and the per-tensor path takes over
+        // — the reservation is a pure optimization, never a load-blocker. `INFR_NO_WEIGHT_ARENA=1`
+        // forces that per-tensor fallback (an escape hatch for a fragmented heap where one big
+        // up-front block fails but many small allocs still succeed; also the A/B knob for the
+        // up-front-commit measurement).
+        let arena_off =
+            std::env::var("INFR_NO_WEIGHT_ARENA").is_ok_and(|v| !v.is_empty() && v != "0");
+        let arena_free = self.shared.weight_arena.lock().unwrap().is_none();
+        if let Some(total) = total_bytes {
+            if !arena_off
+                && arena_free
+                && !direct
+                && !self.shared.caps.unified_memory
+                && !self.moe_paged()
+                && !self.dense_paged()
+            {
+                if let Err(e) = self.reserve_weights(total) {
+                    eprintln!(
+                        "[infr] weight arena reservation failed ({e}); \
+                         falling back to per-tensor weight allocation"
+                    );
+                }
+            }
+        }
 
         let pb = infr_core::progress::bar(
             total_bytes,
@@ -1887,11 +1974,26 @@ impl VulkanBackend {
     }
 
     /// Pre-reserve `total` bytes of device-local VRAM as a bump arena for load-once weights, so the
-    /// whole model's weight memory is committed up front (one contiguous block, freed in one shot)
+    /// whole model's weight memory is committed up front (a few big blocks, freed in one shot)
     /// instead of dribbled out per-tensor. Subsequent `BufferUsage::Weights` allocs sub-allocate
     /// from it. Call once after the footprint check, before uploading weights. On failure (e.g. no
-    /// contiguous block available) leaves no arena → callers fall back to the per-tensor path.
+    /// contiguous block available) rolls back every block it took and leaves NO arena → callers
+    /// fall back to the per-tensor path (which no-ReBAR / tight-VRAM / UMA machines rely on).
+    ///
+    /// `total` cannot be one `vkAllocateMemory` for any real model — `maxMemoryAllocationSize` is
+    /// ~4 GiB on RADV, and a 9 GiB (let alone 21.9 GiB) model exceeds it. So the reservation is
+    /// split into N blocks each ≤ `max_mem_alloc_size`; the bump allocator sub-allocates a weight
+    /// across the block boundary transparently (`WeightArena::bump` never straddles a block — it
+    /// starts a fresh block when a tensor won't fit the current one, and grows overflow blocks if
+    /// the estimate underflows).
     pub fn reserve_weights(&self, total: u64) -> Result<()> {
+        self.reserve_weights_capped(total, self.shared.max_mem_alloc_size)
+    }
+
+    /// [`reserve_weights`](Self::reserve_weights) with an explicit per-block cap — the production
+    /// path passes `max_mem_alloc_size`; tests pass a tiny cap to exercise the multi-block split
+    /// without committing multiple GiB of real VRAM.
+    fn reserve_weights_capped(&self, total: u64, block_cap: u64) -> Result<()> {
         // Probe a weight-shaped buffer for its memory-type bits + alignment (identical for every
         // weight buffer, since they all share BUFFER_USAGE).
         let probe = unsafe {
@@ -1910,26 +2012,62 @@ impl VulkanBackend {
         let mem_type = self
             .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
             .ok_or_else(|| be("no DEVICE_LOCAL memory type for weights"))?;
-        let block = total.max(req.alignment).next_multiple_of(req.alignment);
-        self.check_vram_budget(block)?;
-        let memory = unsafe {
-            self.shared.device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(block)
-                    .memory_type_index(mem_type),
-                None,
-            )
+        let align = req.alignment.max(1);
+        let total = total.next_multiple_of(align).max(align);
+        // Budget-check the WHOLE reservation up front — the point of reserving is to own the entire
+        // footprint, so refuse loudly here if it doesn't fit rather than after committing some
+        // blocks (the caller then falls back to per-tensor, which fails the same way tensor by
+        // tensor, but this keeps the up-front commitment honest).
+        self.check_vram_budget(total)?;
+
+        // Largest single allocation the device accepts, aligned down to the buffer alignment (an
+        // alloc slightly under the cap is safest — the exact limit can fail on a fragmented heap).
+        let block_cap = (block_cap / align * align).max(align);
+
+        let mut blocks: Vec<ArenaBlock> = Vec::new();
+        let mut remaining = total;
+        while remaining > 0 {
+            // Each block ≤ block_cap; the tail block is exactly the remainder.
+            let bs = remaining.min(block_cap);
+            let memory = match unsafe {
+                self.shared.device.allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(bs)
+                        .memory_type_index(mem_type),
+                    None,
+                )
+            } {
+                Ok(m) => m,
+                Err(e) => {
+                    // Roll back everything already committed and leave NO arena so the caller falls
+                    // back to the per-tensor path (never a partial arena — that would silently cap
+                    // the resident set at what happened to allocate).
+                    for b in &blocks {
+                        unsafe { self.shared.device.free_memory(b.memory, None) };
+                    }
+                    let taken: u64 = blocks.iter().map(|b| b.size).sum();
+                    if taken > 0 {
+                        self.shared.device_used.fetch_sub(taken, Ordering::Relaxed);
+                    }
+                    return Err(be(format!(
+                        "reserve_weights block {bs} bytes (of {total} total, {} blocks placed): {e}",
+                        blocks.len()
+                    )));
+                }
+            };
+            self.shared.device_used.fetch_add(bs, Ordering::Relaxed);
+            blocks.push(ArenaBlock {
+                memory,
+                size: bs,
+                cursor: 0,
+            });
+            remaining -= bs;
         }
-        .map_err(|e| be(format!("reserve_weights {block} bytes: {e}")))?;
-        self.shared.device_used.fetch_add(block, Ordering::Relaxed);
 
         *self.shared.weight_arena.lock().unwrap() = Some(WeightArena {
             mem_type,
-            blocks: vec![ArenaBlock {
-                memory,
-                size: block,
-                cursor: 0,
-            }],
+            blocks,
+            cur: 0,
         });
         Ok(())
     }
@@ -2808,6 +2946,84 @@ mod tests {
             .expect("re-download");
         assert_eq!(
             back0[1], 1u8,
+            "first arena buffer corrupted by later allocs"
+        );
+    }
+
+    /// Weight arena, MULTI-BLOCK reservation: reserve a `total` LARGER than one block (forcing the
+    /// up-front split in `reserve_weights_capped` to place several blocks), assert `blocks.len() > 1`
+    /// with distinct memory handles, then sub-allocate weight buffers that straddle the block
+    /// boundary and round-trip bytes through each — proving cross-block sub-allocation is
+    /// byte-correct. Uses a tiny per-block cap so the test commits only a few MiB, not GiB.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn weight_arena_multi_block() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        // Cap each block at 1 MiB and reserve 3.5 MiB → at least 4 blocks placed up front.
+        const CAP: u64 = 1024 * 1024;
+        const TOTAL: u64 = 7 * 512 * 1024; // 3.5 MiB
+        be.reserve_weights_capped(TOTAL, CAP)
+            .expect("reserve_weights_capped");
+        {
+            let arena = be.shared.weight_arena.lock().unwrap();
+            let a = arena.as_ref().expect("arena reserved");
+            assert!(
+                a.blocks.len() > 1,
+                "expected a multi-block reservation, got {} block(s)",
+                a.blocks.len()
+            );
+            // Every block's device memory handle must be distinct.
+            for i in 0..a.blocks.len() {
+                for j in (i + 1)..a.blocks.len() {
+                    assert_ne!(
+                        a.blocks[i].memory, a.blocks[j].memory,
+                        "arena blocks {i} and {j} share device memory"
+                    );
+                }
+            }
+            // The placed capacity must cover the whole request.
+            let placed: u64 = a.blocks.iter().map(|b| b.size).sum();
+            assert!(placed >= TOTAL, "placed {placed} < requested {TOTAL}");
+        }
+        // Sub-allocate several ~700 KiB weights: each is smaller than a 1 MiB block but the sequence
+        // forces `bump` to start fresh blocks (a weight never straddles a block), walking across the
+        // reserved blocks and into an overflow block. Round-trip each to prove the binding is valid.
+        let sizes = [
+            700 * 1024usize,
+            700 * 1024,
+            700 * 1024,
+            700 * 1024,
+            700 * 1024,
+        ];
+        let mut bufs = Vec::new();
+        for (bi, &sz) in sizes.iter().enumerate() {
+            let data: Vec<u8> = (0..sz)
+                .map(|i| (i as u8).wrapping_add(bi as u8 * 17))
+                .collect();
+            let buf = be
+                .alloc(sz, BufferUsage::Weights)
+                .expect("arena weight alloc");
+            be.upload(buf.as_ref(), &data).expect("upload");
+            let mut back = vec![0u8; sz];
+            be.download(buf.as_ref(), &mut back).expect("download");
+            assert_eq!(
+                back, data,
+                "arena buffer {bi} (size {sz}) round-trip mismatch"
+            );
+            bufs.push(buf);
+        }
+        // All coexist in distinct regions — re-check the first after the later allocs.
+        let mut back0 = vec![0u8; sizes[0]];
+        be.download(bufs[0].as_ref(), &mut back0)
+            .expect("re-download");
+        assert_eq!(
+            back0[3], 3u8,
             "first arena buffer corrupted by later allocs"
         );
     }

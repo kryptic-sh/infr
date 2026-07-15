@@ -121,8 +121,8 @@ fn run_config(
     if let Some((slots, _)) = paged {
         let gate_sb = gate_stride / 64 * 18;
         let down_sb = down_stride / 64 * 18;
-        let mut gp = GpuPager::new(be, n_expert, slots, gate_sb).unwrap();
-        let mut dp = GpuPager::new(be, n_expert, slots, down_sb).unwrap();
+        let mut gp = GpuPager::new(be, n_expert, slots, gate_sb, true).unwrap();
+        let mut dp = GpuPager::new(be, n_expert, slots, down_sb, true).unwrap();
         let staging = be
             .alloc_uninit(gate_sb.max(down_sb), BufferUsage::Staging)
             .unwrap();
@@ -174,7 +174,8 @@ fn run_config(
                 qa.as_ref(),
                 qda.as_ref(),
                 None, // Q2_0 is symmetric — no `sact`
-                gp.arena_buffer(),
+                gp.arena_addr(),
+                gp.slot_bytes() as u32,
                 gp.lut_buffer(),
                 0,
                 counts.as_ref(),
@@ -222,7 +223,8 @@ fn run_config(
             dqa.as_ref(),
             dda.as_ref(),
             None,
-            dp.arena_buffer(),
+            dp.arena_addr(),
+            dp.slot_bytes() as u32,
             dp.lut_buffer(),
             0,
             counts.as_ref(),

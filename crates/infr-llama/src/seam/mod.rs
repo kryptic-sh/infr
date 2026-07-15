@@ -629,17 +629,13 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .map(|&(_, sb, nb)| (sb * nb) as u64)
                 .sum::<u64>()
                 .max(1);
-            // Per-pool ceiling: each pool's arena is ONE SSBO binding, capped by the smaller of the
-            // paged kernels' u32 word reach (16 GiB) and the device's maxStorageBufferRange (4 GiB
-            // on RADV — found empirically: Scout's auto budget wanted a 7.6 GiB down arena, and
-            // reads past the binding range came back as garbage → NaN logits → sentinel router ids).
-            // `GpuPager::new` hard-errors past this; clamping here keeps an oversized budget usable
-            // instead of fatal. Applied PER POOL (their expert sizes differ — Scout: gate/up 13.8 MB
-            // vs down 18 MB — so a shared count dragged to the largest pool's cap strands budget the
-            // smaller pools could hold as real hit rate; see `MoePoolSpec`'s doc). Splitting a pool
-            // across several arena buffers (or u64 shader addressing where the device allows bigger
-            // buffers) is the lift that raises the cap.
-            let arena_cap = infr_vulkan::pager::GpuPager::max_arena_bytes(vk);
+            // No per-pool arena ceiling: each MoE pool is a `bufferDeviceAddress` buffer read by
+            // pointer, so it is NOT capped by one SSBO binding's maxStorageBufferRange (~4 GiB on
+            // RADV) the way it was when the arena was a bound SSBO. A pool now holds as many experts
+            // as its budget share allows — the whole point of the u64 addressing lift. The only
+            // backstop is the alloc-time VRAM budget guard (`GpuPager::new` -> `alloc_arena_bda`);
+            // the proportional split below never over-subscribes VRAM because it partitions
+            // `pager_budget_bytes`, which the caller derived from the remaining VRAM.
             let pools: Vec<infr_vulkan::pager::MoePoolSpec> = pool_blocks
                 .iter()
                 .map(|&(role, sb, nb)| {
@@ -656,20 +652,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     // that layer that must be simultaneously resident (the within-batch safety
                     // invariant — see `infr_core::pager::Pager::new`'s doc). Decode's rows=1 needs
                     // only `n_used`, but the batched bound subsumes it and `n_expert` slots is tiny
-                    // next to any real budget (Scout: 16 x ~18 MB per role).
+                    // next to any real budget (Scout: 16 x ~18 MB per role). Capped at `nb` (no
+                    // point holding more slots than the pool has distinct experts).
                     let floor = n_expert.min(nb).max(1);
-                    let cap = ((arena_cap / sb as u64) as usize).max(1);
                     let budget_slots = ((share / sb as u64) as usize).clamp(floor, nb);
-                    if budget_slots > cap {
-                        eprintln!(
-                            "MoE pager: clamping a pool's {budget_slots} -> {cap} slots (per-pool \
-                         arena capped by the device's storage-buffer range / u32 word addressing)"
-                        );
-                    }
                     infr_vulkan::pager::MoePoolSpec {
                         role,
                         slot_bytes: sb,
-                        n_slots: budget_slots.min(cap),
+                        n_slots: budget_slots,
                     }
                 })
                 .collect();

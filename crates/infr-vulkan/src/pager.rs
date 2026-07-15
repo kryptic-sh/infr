@@ -12,16 +12,16 @@
 //! (`infr-llama`'s seam / this crate's `adapter.rs`) packs a `BlockId` from `(layer, role,
 //! expert_id)` and calls [`GpuPager::ensure_resident`] with that block's mmap'd tensor bytes
 //! before dispatching the id-indexed GEMV/GEMM through the LUT hop (the `PAGED` branch in
-//! `shaders/native_gemv_id.comp` / `native_gemv_id_multi.comp`: `nw_base = lut[ids[slot]]`, a
-//! u32-WORD arena base added at the shader's final `nw[]` indexing step — see the `lut_host`
-//! field's doc for why a word base and not a slot index). A FUTURE dense layer-streaming policy
+//! `shaders/native_gemv_id.comp` / `native_gemv_id_multi.comp`: `slot = lut[ids[slot]]`, scaled
+//! onto the arena's 64-bit device address as `arena_addr + slot * slot_bytes` — see the `lut_host`
+//! field's doc and `shaders/native_arena_ref.glsl`). A FUTURE dense layer-streaming policy
 //! (NOT implemented here — see the task doc) would reuse this exact struct with `BlockId =
 //! layer_idx`, `slot_bytes` = one layer's weight size, and a schedule-driven (not LRU) `touch`
 //! order (a dense decode visits layers in a fixed known order, so it can exact-prefetch layer
 //! `l+1` while `l` runs) — nothing in the arena/LUT/upload core below assumes MoE or LRU.
 //!
 //! # LUT
-//! The host keeps an `n_blocks`-entry mirror of per-slot arena WORD bases
+//! The host keeps an `n_blocks`-entry mirror of per-block resident SLOT INDICES
 //! (`infr_core::pager::NOT_RESIDENT` for an absent block). The paged EXECUTION path never reads a
 //! live device LUT: each (layer, role) batch freezes its `n_expert`-entry window into the
 //! session's append-only LUT tape ([`MoePagerSession::lut_window`]) at record time, so staging
@@ -51,22 +51,26 @@ use super::{as_vk_buf, be, VulkanBackend};
 pub struct GpuPager {
     pager: Pager,
     slot_bytes: usize,
-    /// `slot_bytes / 4` — the per-slot stride in u32 WORDS, the unit the device LUT speaks (see
-    /// `lut_host`'s doc). Cached to avoid re-dividing on every miss.
-    words_per_slot: u32,
-    /// Device-local arena: `n_slots * slot_bytes`, one contiguous buffer bound as `array<u32>`.
+    /// Device-local arena: `n_slots * slot_bytes`, one contiguous buffer. For a MoE pool this is a
+    /// `bufferDeviceAddress` buffer the paged kernels read through a 64-bit pointer (see
+    /// [`Self::arena_addr`]); for the dense-streaming pool it is still bound as an `array<u32>`
+    /// SSBO (its kernels bake a u32 element offset — the 4 GiB cap still applies there).
     arena: Box<dyn Buffer>,
+    /// This arena's 64-bit `VkDeviceAddress` when it was allocated as a `bufferDeviceAddress`
+    /// buffer (MoE pools), else `0` (the dense-streaming pool, which addresses its SSBO arena by
+    /// element offset and never needs a pointer). The MoE paged kernels compute a slot's byte
+    /// address as `arena_addr + lut[...] * slot_bytes`, so this is the base the LUT slot index is
+    /// scaled onto.
+    arena_addr: u64,
     /// Host-visible LUT mirror (mutated in place, re-uploaded on change) + the device buffer it's
-    /// pushed to. `n_blocks` entries, each the resident block's arena base offset in u32 WORDS
-    /// (`slot_index * words_per_slot`) — NOT the raw slot index. The paged GEMV shaders add this
-    /// word base at their final `nw[]` indexing step (`NW(i)` in `native_decode.glsl`), keeping
-    /// every other offset they compute WITHIN one expert. A slot-index LUT + in-shader
-    /// `index * stride` multiply — the original design — wraps u32 in ELEMENT space once
-    /// `slot_index * stride` crosses 4.29e9 (Scout: 41.9M elements/expert overflows at slot
-    /// ≥ ~102), which surfaced as coherent-but-wrong output the moment a real VRAM budget gave
-    /// the cache more than ~100 slots. Word-space bases push the ceiling to a 16 GiB arena
-    /// (u32 words), enforced in [`GpuPager::new`]; true u64 shader addressing is the lift that
-    /// removes that cap entirely.
+    /// pushed to. `n_blocks` entries, each the resident block's SLOT INDEX
+    /// (`infr_core::pager::NOT_RESIDENT` for an absent block). The paged MoE kernels read this slot
+    /// index (through the session's frozen tape window) and compute the slot's byte address as
+    /// `arena_addr + uint64_t(slot) * slot_bytes` in 64-bit — the multiply that used to wrap u32 in
+    /// element space (Scout: 41.9M elements/expert overflowed at slot ≥ ~102, the original
+    /// coherent-but-wrong bug) is now done on the device address, so no arena size overflows it.
+    /// The dense-streaming pool keeps this mirror coherent but never reads it (its dispatch bakes
+    /// the slot into a weight element offset instead).
     lut_host: Vec<u32>,
     lut_dev: Box<dyn Buffer>,
     lut_dirty: bool,
@@ -81,39 +85,47 @@ impl GpuPager {
     /// MoE experts of one model are uniform per role, so this is exact, not a worst-case pad).
     /// Must be u32-aligned (`% 4 == 0`) — the LUT addresses slots in u32 words.
     ///
-    /// Errors if the arena exceeds what one SSBO binding can address: the smaller of the paged
-    /// kernels' u32 word reach (16 GiB — `nw[]` is indexed by a u32 word offset) and the device's
-    /// `maxStorageBufferRange`/`maxBufferSize` (4 GiB on RADV/RDNA3 — the binding range AND the
-    /// single-VkBuffer size are both ~u32 BYTES there, the binding ceiling most desktop drivers
-    /// share). Silently exceeding either wraps/out-of-ranges reads into coherent-but-wrong output
-    /// — exactly the corruption class this design exists to prevent. Callers sizing `n_slots`
-    /// from a VRAM budget should clamp below [`GpuPager::max_arena_bytes`] first (see the seam's
-    /// placement policy) — this check is the backstop, not the policy. Splitting a role across
-    /// several arena buffers (or true u64 shader addressing where the device allows bigger
-    /// buffers) is the lift that raises this cap.
+    /// `arena_bda`: allocate the arena as a `bufferDeviceAddress` buffer (MoE pools — the paged
+    /// kernels read it through a 64-bit pointer, so it may be as large as VRAM allows, no cap). The
+    /// dense-streaming pool passes `false`: its arena is bound as a plain SSBO and its kernels bake
+    /// a u32 element offset, so it is still capped at [`GpuPager::max_arena_bytes`] (one SSBO
+    /// binding's `maxStorageBufferRange`, ~4 GiB on RADV) — exceeding it silently out-of-ranges the
+    /// reads into coherent-but-wrong output, so `new` hard-errors above the cap on that path.
+    /// Callers sizing `n_slots` from a VRAM budget on the SSBO path should clamp below the cap
+    /// first (see the dense placement policy) — this check is the backstop, not the policy.
     pub fn new(
         vk: &VulkanBackend,
         n_blocks: usize,
         n_slots: usize,
         slot_bytes: usize,
+        arena_bda: bool,
     ) -> Result<Self> {
         assert!(n_slots > 0, "GpuPager needs at least one slot");
         assert!(
             slot_bytes.is_multiple_of(4),
-            "GpuPager slot_bytes must be u32-aligned (the LUT speaks u32 words)"
+            "GpuPager slot_bytes must be u32-aligned (the arena is read as u32 words)"
         );
-        let arena_bytes = n_slots as u64 * slot_bytes as u64;
-        let cap = Self::max_arena_bytes(vk);
-        if arena_bytes > cap {
-            return Err(be(format!(
-                "GpuPager arena of {n_slots} x {slot_bytes} B = {:.2} GiB exceeds the \
-                 per-arena addressing cap of {:.2} GiB (min of the paged kernels' u32 word \
-                 reach and this device's maxStorageBufferRange) — clamp n_slots",
-                arena_bytes as f64 / (1u64 << 30) as f64,
-                cap as f64 / (1u64 << 30) as f64,
-            )));
-        }
-        let arena = vk.alloc_uninit(n_slots * slot_bytes, BufferUsage::Weights)?;
+        let (arena, arena_addr) = if arena_bda {
+            // Pointer-addressed: no per-arena binding cap — a pool spans as much VRAM as the budget
+            // allows (the alloc-time VRAM budget guard is the only backstop).
+            vk.alloc_arena_bda(n_slots * slot_bytes)?
+        } else {
+            let arena_bytes = n_slots as u64 * slot_bytes as u64;
+            let cap = Self::max_arena_bytes(vk);
+            if arena_bytes > cap {
+                return Err(be(format!(
+                    "GpuPager SSBO arena of {n_slots} x {slot_bytes} B = {:.2} GiB exceeds the \
+                     per-arena addressing cap of {:.2} GiB (this device's maxStorageBufferRange) — \
+                     clamp n_slots",
+                    arena_bytes as f64 / (1u64 << 30) as f64,
+                    cap as f64 / (1u64 << 30) as f64,
+                )));
+            }
+            (
+                vk.alloc_uninit(n_slots * slot_bytes, BufferUsage::Weights)?,
+                0u64,
+            )
+        };
         let lut_dev = vk.alloc_uninit(n_blocks.max(1) * 4, BufferUsage::Staging)?;
         let lut_host = vec![NOT_RESIDENT; n_blocks.max(1)];
         // Seed the device LUT with the same all-absent state (arena/LUT start coherent).
@@ -121,20 +133,26 @@ impl GpuPager {
         Ok(Self {
             pager: Pager::new(n_slots),
             slot_bytes,
-            words_per_slot: (slot_bytes / 4) as u32,
             arena,
+            arena_addr,
             lut_host,
             lut_dev,
             lut_dirty: false,
         })
     }
 
-    /// Largest arena (bytes) one [`GpuPager`] can address on this device: the smaller of the
-    /// paged kernels' u32 WORD reach (16 GiB) and the device's storage-buffer binding range
-    /// (4 GiB on RADV — see [`GpuPager::new`]'s doc). The placement policy divides its budget by
-    /// per-slot bytes and clamps to `max_arena_bytes / slot_bytes` slots per role.
+    /// Largest SSBO arena (bytes) one [`GpuPager`] can bind on this device: the storage-buffer
+    /// binding range (`maxStorageBufferRange`, 4 GiB on RADV). Only the dense-streaming pool is
+    /// bound by this (its kernels read the arena as a plain SSBO); a MoE pool is pointer-addressed
+    /// (`arena_bda = true`) and has no such cap.
     pub fn max_arena_bytes(vk: &VulkanBackend) -> u64 {
-        (u32::MAX as u64 * 4).min(vk.caps().max_buffer_bytes)
+        vk.caps().max_buffer_bytes
+    }
+
+    /// The arena's 64-bit `VkDeviceAddress` (MoE pools; `0` for the SSBO dense pool). The paged
+    /// kernels take this as a push constant and add `lut_slot * slot_bytes` to reach an expert.
+    pub fn arena_addr(&self) -> u64 {
+        self.arena_addr
     }
 
     pub fn n_slots(&self) -> usize {
@@ -216,8 +234,9 @@ impl GpuPager {
                     }
                 }
                 if let Some(v) = self.lut_host.get_mut(id as usize) {
-                    // Word base, not slot index — see `lut_host`'s doc.
-                    *v = slot * self.words_per_slot;
+                    // Slot index — the shader scales it onto the arena's 64-bit base address (see
+                    // `lut_host`'s doc).
+                    *v = slot;
                 }
                 self.lut_dirty = true;
                 Ok(self.slot_bytes)
@@ -289,7 +308,8 @@ impl GpuPager {
                     }
                 }
                 if let Some(v) = self.lut_host.get_mut(id as usize) {
-                    *v = slot * self.words_per_slot;
+                    // Slot index (dense pool keeps this coherent but never reads it).
+                    *v = slot;
                 }
                 self.lut_dirty = true;
                 Ok((slot, self.slot_bytes))
@@ -332,10 +352,9 @@ impl GpuPager {
                     }
                 }
                 if let Some(v) = self.lut_host.get_mut(id as usize) {
-                    // The LUT stores the slot's arena WORD base, not the slot index — see
-                    // `lut_host`'s doc. `new()` proved slot * words_per_slot fits u32 for every
-                    // slot in this arena.
-                    *v = slot * self.words_per_slot;
+                    // The LUT stores the resident slot INDEX; the shader scales it onto the arena's
+                    // 64-bit base address — see `lut_host`'s doc.
+                    *v = slot;
                 }
                 self.lut_dirty = true;
                 Ok(slot)
@@ -518,8 +537,8 @@ pub struct MoePagerSession {
     /// `adapter::execute_paged_moe`'s rotation). Sized by [`MoePagerLayout::ring_bytes`].
     ring: Box<dyn Buffer>,
     ring_half_bytes: usize,
-    /// LUT tape: an append-only run of frozen per-(layer, role) LUT windows (`n_expert` u32 word
-    /// bases each, written by [`Self::lut_window`]). Dispatches read `tape[window + local_id]`
+    /// LUT tape: an append-only run of frozen per-(layer, role) LUT windows (`n_expert` u32 slot
+    /// indices each, written by [`Self::lut_window`]). Dispatches read `tape[window + local_id]`
     /// instead of the live pool LUT, so host-side staging for LATER layers can keep mutating the
     /// mirror while EARLIER layers' recorded-but-in-flight dispatches still read a consistent
     /// view — the in-flight-LUT rule that a single mutable device LUT cannot satisfy once
@@ -591,7 +610,8 @@ impl MoePagerSession {
             pools.push(Pool {
                 role: spec.role,
                 slot_bytes: spec.slot_bytes,
-                pager: GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?,
+                // MoE pools are pointer-addressed (`bufferDeviceAddress`) — no per-arena SSBO cap.
+                pager: GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes, true)?,
             });
             staging_bytes = staging_bytes.max(spec.slot_bytes);
         }
@@ -814,7 +834,7 @@ impl MoePagerSession {
         Ok(local_ids.len())
     }
 
-    /// Freeze `buf_id`'s layer LUT window — `n_expert` word bases starting at its `layer_base`,
+    /// Freeze `buf_id`'s layer LUT window — `n_expert` slot indices starting at its `layer_base`,
     /// copied from the pool's host mirror into the tape at `*tape_cursor` — and return the tape
     /// word offset the layer's dispatches pass as `lut_base` (`lut[base + local_id]`). Must be
     /// called AFTER every `stage_role` call for that (layer, role) batch completed (the
@@ -870,6 +890,18 @@ impl MoePagerSession {
     /// first — this panics on an unregistered buffer).
     pub fn arena(&self, buf_id: usize) -> &dyn Buffer {
         self.pool_of(buf_id).pager.arena_buffer()
+    }
+
+    /// `buf_id`'s pool arena's 64-bit `VkDeviceAddress` — the base the paged kernels scale the LUT
+    /// slot index onto (`arena_addr + slot * slot_bytes`). Passed to the shader as a push constant.
+    pub fn arena_addr(&self, buf_id: usize) -> u64 {
+        self.pool_of(buf_id).pager.arena_addr()
+    }
+
+    /// `buf_id`'s pool per-slot byte stride — the multiplier the paged kernels apply to the LUT
+    /// slot index (see [`Self::arena_addr`]).
+    pub fn slot_bytes(&self, buf_id: usize) -> usize {
+        self.pool_of(buf_id).slot_bytes
     }
 
     /// [`Self::arena`]'s LUT twin.
@@ -1003,7 +1035,9 @@ impl DensePagerSession {
         for spec in layout.pools {
             max_slot = max_slot.max(spec.slot_bytes);
             pools.push(DensePool {
-                pager: GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes)?,
+                // Dense-streaming pool: arena is a plain SSBO (u32 element offsets), so it keeps
+                // the `maxStorageBufferRange` cap — `arena_bda = false`.
+                pager: GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes, false)?,
                 spec,
             });
         }

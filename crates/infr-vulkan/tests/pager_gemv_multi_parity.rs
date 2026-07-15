@@ -88,8 +88,8 @@ fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
     let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
     be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
 
-    let mut gate_pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes).unwrap();
-    let mut up_pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes).unwrap();
+    let mut gate_pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes, true).unwrap();
+    let mut up_pager = GpuPager::new(&be, n_expert, n_expert, stride_bytes, true).unwrap();
     let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
 
     let n_used = 3usize;
@@ -126,7 +126,8 @@ fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
     // adapter passes a frozen tape-window base here — `lut[base + local_id]`).
     rec.linear_native_id_multi_paged(
         DType::Q8_0,
-        gate_pager.arena_buffer(),
+        gate_pager.arena_addr(),
+        gate_pager.slot_bytes() as u32,
         gate_pager.lut_buffer(),
         ids_buf.as_ref(),
         n_used,
@@ -140,7 +141,8 @@ fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
     );
     rec.linear_native_id_multi_paged(
         DType::Q8_0,
-        up_pager.arena_buffer(),
+        up_pager.arena_addr(),
+        up_pager.slot_bytes() as u32,
         up_pager.lut_buffer(),
         ids_buf.as_ref(),
         n_used,

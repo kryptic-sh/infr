@@ -128,6 +128,15 @@ pub struct Capabilities {
     /// Never gate correctness on it: most drivers report nothing.
     pub compute_units: u32,
     pub max_buffer_bytes: u64,
+    /// `VkPhysicalDeviceVulkan12Features.bufferDeviceAddress` — the device can hand a shader a
+    /// 64-bit `VkDeviceAddress` for a buffer (`GL_EXT_buffer_reference`), so a kernel may read a
+    /// buffer LARGER than `maxStorageBufferRange` (one SSBO binding's ~4 GiB reach on RADV). infr's
+    /// paged-MoE expert arena REQUIRES this: a per-role pool now spans as much VRAM as the budget
+    /// allows, addressed by a raw pointer rather than a bound SSBO. Core in Vulkan 1.2, so every
+    /// real 1.3 target sets it — the Vulkan backend hard-errors at init when it is absent rather
+    /// than keeping a u32 fallback. Backends without a device-address concept (CPU/Metal) leave
+    /// this false; nothing there reads it.
+    pub buffer_device_address: bool,
     /// `maxComputeSharedMemorySize` — the per-workgroup shared-memory budget. Vulkan only guarantees
     /// 16 KB; RADV gives 64 KB, NVIDIA 48 KB, MoltenVK/mobile often 32 KB. The flash-attention tile
     /// height is picked to fit this (and flash is skipped entirely if even the smallest tile won't).

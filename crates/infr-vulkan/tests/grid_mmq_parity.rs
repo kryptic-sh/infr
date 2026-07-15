@@ -336,8 +336,8 @@ fn grid_mmq_paged_expert_gemm_matches_host_under_eviction() {
         .map(|b| infr_gguf::dequant::dequant_block(DType::Iq3S, b).unwrap())
         .collect();
 
-    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes).unwrap();
-    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes).unwrap();
+    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes, true).unwrap();
+    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes, true).unwrap();
     let staging = be
         .alloc_uninit(gate_slot_bytes.max(down_slot_bytes), BufferUsage::Staging)
         .unwrap();
@@ -429,7 +429,8 @@ fn grid_mmq_paged_expert_gemm_matches_host_under_eviction() {
             qa.as_ref(),
             qda.as_ref(),
             None,
-            gate_pager.arena_buffer(),
+            gate_pager.arena_addr(),
+            gate_pager.slot_bytes() as u32,
             gate_pager.lut_buffer(),
             0,
             counts.as_ref(),
@@ -455,7 +456,8 @@ fn grid_mmq_paged_expert_gemm_matches_host_under_eviction() {
             dqa.as_ref(),
             dda.as_ref(),
             None,
-            down_pager.arena_buffer(),
+            down_pager.arena_addr(),
+            down_pager.slot_bytes() as u32,
             down_pager.lut_buffer(),
             0,
             counts.as_ref(),

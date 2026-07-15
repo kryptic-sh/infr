@@ -1033,12 +1033,19 @@ impl VulkanBackend {
         let mut sgsize_feat = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
         let mut coopmat_feat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut intdot_feat = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+        // Buffer-device-address: lets a shader read a buffer via a 64-bit `VkDeviceAddress`
+        // (`GL_EXT_buffer_reference`), bypassing one SSBO binding's `maxStorageBufferRange` (~4 GiB
+        // on RADV). infr's paged-MoE expert arena REQUIRES it — a per-role pool now spans as much
+        // VRAM as the budget allows, addressed by a raw pointer. Core in Vulkan 1.2, so it is
+        // hard-required below (not an opt-in ladder like coopmat).
+        let mut bda_feat = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
         let mut feat2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut f16_feat)
             .push_next(&mut memmodel_feat)
             .push_next(&mut sgsize_feat)
             .push_next(&mut coopmat_feat)
-            .push_next(&mut intdot_feat);
+            .push_next(&mut intdot_feat)
+            .push_next(&mut bda_feat);
         unsafe { instance.get_physical_device_features2(physical_device, &mut feat2) };
         // Core Vulkan 1.0 feature (no extension struct — `get_physical_device_features2` always
         // populates the chain's base `.features`). Several KV-cache dequant/attention shaders
@@ -1050,6 +1057,32 @@ impl VulkanBackend {
         // `shaderIntegerDotProduct` one fixed below — detected via caps but never chained into
         // `device_ci`, so vkCreateShaderModule for those kernels violated the VUID under validation.
         let has_int16 = feat2.features.shader_int16 != 0;
+        // Read AFTER the `feat2.features` access above: `feat2` holds a mutable borrow of every
+        // pushed feature struct (incl. `bda_feat`) until its last use, so the pushed structs can
+        // only be read once `feat2` itself is done being touched.
+        let has_bda = bda_feat.buffer_device_address != 0;
+        // Hard requirement, not a fallback: the paged-MoE arena is addressed by a 64-bit device
+        // pointer, so a device that cannot hand out one has no 64-bit address space for infr to
+        // use. bufferDeviceAddress is core in Vulkan 1.2 and this backend targets 1.3, so on any
+        // real target this never fires — it is the clean guard for a driver/portability layer that
+        // somehow omits it, failing at init with a clear message instead of miscompiling a shader.
+        if !has_bda {
+            let p = unsafe { instance.get_physical_device_properties(physical_device) };
+            let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            let (major, minor, patch) = (
+                vk::api_version_major(p.api_version),
+                vk::api_version_minor(p.api_version),
+                vk::api_version_patch(p.api_version),
+            );
+            return Err(be(format!(
+                "this GPU/driver does not support bufferDeviceAddress (the 64-bit shader address \
+                 space), which infr's paged-MoE arena requires — {name} / Vulkan \
+                 {major}.{minor}.{patch}. bufferDeviceAddress is core in Vulkan 1.2; update the \
+                 driver or use a device that exposes it."
+            )));
+        }
         let has_f16 = f16_feat.shader_float16 != 0;
         let has_memmodel = memmodel_feat.vulkan_memory_model != 0;
         let has_memmodel_dev = memmodel_feat.vulkan_memory_model_device_scope != 0;
@@ -1328,6 +1361,11 @@ impl VulkanBackend {
         // Chained below only when `has_i8_dot` — see the ext_ptrs comment above.
         let mut intdot_ci = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
             .shader_integer_dot_product(true);
+        // Buffer-device-address — hard-required above, so always enabled (the paged-MoE arena is
+        // addressed by a `VkDeviceAddress`). Core in 1.2, promoted from VK_KHR_buffer_device_address,
+        // so it needs no device extension on a 1.3 device — only the feature enable.
+        let mut bda_ci =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
 
         // Core 1.0 features (shaderInt16 — see the probe comment above): passed via
         // `enabled_features`, NOT a pNext-chained `PhysicalDeviceFeatures2` (the two are mutually
@@ -1343,7 +1381,8 @@ impl VulkanBackend {
             .push_next(&mut storage16_ci)
             .push_next(&mut storage8_ci)
             .push_next(&mut memmodel_ci)
-            .push_next(&mut sgsize_ci);
+            .push_next(&mut sgsize_ci)
+            .push_next(&mut bda_ci);
         if has_i8_dot {
             device_ci = device_ci.push_next(&mut intdot_ci);
         }
@@ -1497,6 +1536,7 @@ impl VulkanBackend {
             integrated,
             compute_units,
             max_buffer_bytes: props.limits.max_storage_buffer_range as u64,
+            buffer_device_address: has_bda,
             max_shared_memory_bytes: props.limits.max_compute_shared_memory_size,
             // An INTEGRATED_GPU has no VRAM to be separate FROM: its "device-local" heap is system
             // DDR reached through the GART (proven on RADV RAPHAEL_MENDOCINO — see `vram_info`,
@@ -1619,7 +1659,10 @@ impl VulkanBackend {
             device: device.clone(),
             physical_device,
             debug_settings: Default::default(),
-            buffer_device_address: false,
+            // Every gpu-allocator allocation gets VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, which the
+            // paged-MoE arena buffer (created with SHADER_DEVICE_ADDRESS usage) requires before it
+            // can be bound. Harmless for all other buffers. `has_bda` is hard-required above.
+            buffer_device_address: true,
             allocation_sizes: Default::default(),
         })
         .map_err(|e| be(format!("gpu_allocator::Allocator::new: {e}")))?;
@@ -2152,7 +2195,24 @@ impl VulkanBackend {
     }
 
     fn make_buf(&self, size: usize, location: MemoryLocation, label: &str) -> Result<VkBuffer> {
-        self.make_buf_ex(size, location, label, false)
+        self.make_buf_ex(size, location, label, false, false)
+    }
+
+    /// Allocate the paged-MoE expert arena as a `bufferDeviceAddress` buffer and return it with its
+    /// 64-bit `VkDeviceAddress`. Unlike a plain SSBO arena (capped at `maxStorageBufferRange`), the
+    /// paged expert kernels read this through a `GL_EXT_buffer_reference` pointer, so it may be as
+    /// large as VRAM allows. Always a dedicated GpuOnly allocation, budget-guarded like any weight;
+    /// the `SHADER_DEVICE_ADDRESS` usage + the allocator's DEVICE_ADDRESS memory flag are what let
+    /// `get_buffer_device_address` succeed.
+    pub fn alloc_arena_bda(&self, bytes: usize) -> Result<(Box<dyn Buffer>, u64)> {
+        let buf = self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "moe-arena", true, true)?;
+        let handle = buf.buffer;
+        let addr = unsafe {
+            self.shared
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(handle))
+        };
+        Ok((Box::new(buf) as Box<dyn Buffer>, addr))
     }
 
     /// [`make_buf`](Self::make_buf) with an explicit dedicated-allocation override. Post-load
@@ -2171,10 +2231,24 @@ impl VulkanBackend {
         location: MemoryLocation,
         label: &str,
         force_dedicated: bool,
+        device_address: bool,
     ) -> Result<VkBuffer> {
+        // `device_address` (the paged-MoE arena only): add SHADER_DEVICE_ADDRESS so the buffer can
+        // be handed to a shader as a 64-bit pointer. Its backing memory gets the matching
+        // DEVICE_ADDRESS alloc flag from gpu-allocator (built with `buffer_device_address: true`),
+        // so this buffer must take the gpu-allocator path below — never the weight bump arena or
+        // the ReBAR mapped path, whose manual `allocate_memory` does not set that flag. The
+        // "moe-arena" label steers it clear of both (they key on label == "weights").
+        let usage = if device_address {
+            vk::BufferUsageFlags::from_raw(
+                BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+            )
+        } else {
+            BUFFER_USAGE
+        };
         let buf_ci = vk::BufferCreateInfo::default()
             .size(size as u64)
-            .usage(BUFFER_USAGE)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
         let buffer = unsafe { self.shared.device.create_buffer(&buf_ci, None) }
@@ -2202,7 +2276,13 @@ impl VulkanBackend {
                                 "[infr] direct-to-VRAM weight alloc failed ({e}); \
                                  falling back to the staging ring for the rest of this load"
                             );
-                            return self.make_buf_ex(size, location, label, force_dedicated);
+                            return self.make_buf_ex(
+                                size,
+                                location,
+                                label,
+                                force_dedicated,
+                                device_address,
+                            );
                         }
                     }
                 }

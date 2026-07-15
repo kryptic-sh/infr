@@ -355,8 +355,8 @@ fn paged_mmq_expert_gemm_matches_host_under_eviction() {
     let gate_host: Vec<Vec<f32>> = gate_banks.iter().map(|b| deq_q2_k(b)).collect();
     let down_host: Vec<Vec<f32>> = down_banks.iter().map(|b| deq_q3_k(b)).collect();
 
-    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes).unwrap();
-    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes).unwrap();
+    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes, true).unwrap();
+    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes, true).unwrap();
     let staging = be
         .alloc_uninit(gate_slot_bytes.max(down_slot_bytes), BufferUsage::Staging)
         .unwrap();
@@ -439,7 +439,8 @@ fn paged_mmq_expert_gemm_matches_host_under_eviction() {
         qa.as_ref(),
         qda.as_ref(),
         None, // Q2_K self-computes its min term in-shader — no `sact` binding
-        gate_pager.arena_buffer(),
+        gate_pager.arena_addr(),
+        gate_pager.slot_bytes() as u32,
         gate_pager.lut_buffer(),
         0, // single "layer": layer_base 0, local id == global id
         counts.as_ref(),
@@ -465,7 +466,8 @@ fn paged_mmq_expert_gemm_matches_host_under_eviction() {
         dqa.as_ref(),
         dda.as_ref(),
         None, // Q3_K is symmetric — no min term, no `sact`
-        down_pager.arena_buffer(),
+        down_pager.arena_addr(),
+        down_pager.slot_bytes() as u32,
         down_pager.lut_buffer(),
         0,
         counts.as_ref(),
@@ -566,8 +568,8 @@ fn paged_mmq_expert_gemm_new_formats_matches_host() {
     let gate_host: Vec<Vec<f32>> = gate_banks.iter().map(|b| deq_q4_1(b)).collect();
     let down_host: Vec<Vec<f32>> = down_banks.iter().map(|b| deq_iq4_xs(b)).collect();
 
-    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes).unwrap();
-    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes).unwrap();
+    let mut gate_pager = GpuPager::new(&be, n_expert, 3, gate_slot_bytes, true).unwrap();
+    let mut down_pager = GpuPager::new(&be, n_expert, 3, down_slot_bytes, true).unwrap();
     let staging = be
         .alloc_uninit(gate_slot_bytes.max(down_slot_bytes), BufferUsage::Staging)
         .unwrap();
@@ -643,7 +645,8 @@ fn paged_mmq_expert_gemm_new_formats_matches_host() {
         qa.as_ref(),
         qda.as_ref(),
         Some(qsa.as_ref()), // Q4_1 is min-carrying — binds `sact`
-        gate_pager.arena_buffer(),
+        gate_pager.arena_addr(),
+        gate_pager.slot_bytes() as u32,
         gate_pager.lut_buffer(),
         0,
         counts.as_ref(),
@@ -669,7 +672,8 @@ fn paged_mmq_expert_gemm_new_formats_matches_host() {
         dqa.as_ref(),
         dda.as_ref(),
         None, // IQ4_XS is symmetric — no min term, no `sact`
-        down_pager.arena_buffer(),
+        down_pager.arena_addr(),
+        down_pager.slot_bytes() as u32,
         down_pager.lut_buffer(),
         0,
         counts.as_ref(),

@@ -5736,7 +5736,8 @@ impl<'a> Recorder<'a> {
         qa: &dyn Buffer,
         dact: &dyn Buffer,
         sact: Option<&dyn Buffer>,
-        arena: &dyn Buffer,
+        arena_addr: u64,
+        slot_bytes: u32,
         lut: &dyn Buffer,
         lut_base: usize,
         counts: &dyn Buffer,
@@ -5936,20 +5937,28 @@ impl<'a> Recorder<'a> {
                  IQ3_S/MXFP4/NVFP4)"
             ),
         };
-        let kern = self.be.kernel(name, spv, nb, 16);
-        let mut push = [0u8; 16];
+        let kern = self.be.kernel(name, spv, nb, 28);
+        let mut push = [0u8; 28];
         // pc.m unused in the PAGED build (slot bases come from the LUT); pc.w_base carries the
         // layer's LUT window base.
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(lut_base as u32).to_ne_bytes());
+        // Arena base address (lo/hi) + per-slot byte stride: the `-DPAGED` mmq shader reads the
+        // arena by device address (native_arena_ref.glsl), not through the old WB binding.
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&slot_bytes.to_ne_bytes());
         let gx = (rows.div_ceil(bm) * (n / 64)) as u32;
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if let Some(sa) = sact {
             bufs.push(Self::vkb(sa));
         }
+        // The old arena WB binding is now unread by the shader (arena is device-address addressed);
+        // its descriptor slot takes a harmless filler (`lut` — a valid, small, read-only buffer),
+        // keeping the binding count and every subsequent binding number unchanged.
         bufs.extend_from_slice(&[
-            Self::vkb(arena),
+            Self::vkb(lut),
             Self::vkb(lut),
             Self::vkb(counts),
             Self::vkb(offsets),
@@ -6109,7 +6118,8 @@ impl<'a> Recorder<'a> {
     pub fn linear_native_id_paged(
         &self,
         dtype: infr_core::DType,
-        w: &dyn Buffer,
+        arena_addr: u64,
+        slot_bytes: u32,
         lut: &dyn Buffer,
         ids: &dyn Buffer,
         slot: usize,
@@ -6124,21 +6134,28 @@ impl<'a> Recorder<'a> {
         let name =
             crate::linear::native_id_paged_kernel_name(dtype).expect("native id paged kernel");
         let spv = crate::gemm::native_id_paged_build_spv(dtype).expect("native id paged spv");
-        let k = self.be.kernel(name, spv, 5, 20);
-        let mut push = [0u8; 20];
+        let k = self.be.kernel(name, spv, 5, 32);
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(slot as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(lut_base as u32).to_ne_bytes());
+        // Arena base address (lo/hi) + per-slot byte stride: the `-DPAGED` shader reads the arena
+        // by device address, not through binding 0 (see native_arena_ref.glsl).
+        push[20..24].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&slot_bytes.to_ne_bytes());
         // Binding order MUST match the shader's `-DPAGED` layout (`native_gemv_id.comp`) AND keep
         // `y` last: `dispatch3`'s hazard tracking treats the tail `n_out` buffers as writes and
         // everything before as reads (one contiguous split) — `y` bound before `lut` would get
-        // mis-tracked as a read, silently dropping the barrier a later dispatch needs.
+        // mis-tracked as a read, silently dropping the barrier a later dispatch needs. Binding 0
+        // (the old arena SSBO) is now unread by the shader; it takes a harmless filler (`lut`
+        // again — a valid, small, read-only buffer) so the descriptor set stays fully written.
         self.dispatch_wide(
             k,
             &[
-                Self::vkb(w),
+                Self::vkb(lut),
                 Self::vkb(x),
                 Self::vkb(ids),
                 Self::vkb(lut),
@@ -6158,7 +6175,8 @@ impl<'a> Recorder<'a> {
     pub fn linear_native_id_multi_paged(
         &self,
         dtype: infr_core::DType,
-        w: &dyn Buffer,
+        arena_addr: u64,
+        slot_bytes: u32,
         lut: &dyn Buffer,
         ids: &dyn Buffer,
         n_used: usize,
@@ -6170,17 +6188,21 @@ impl<'a> Recorder<'a> {
         out_f: usize,
         rows: usize,
     ) {
-        let mut push = [0u8; 24];
+        let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(lut_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(x_per_slot as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(rows as u32).to_ne_bytes());
+        // Arena base address (lo/hi) + per-slot byte stride — see `linear_native_id_paged`.
+        push[24..28].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        push[32..36].copy_from_slice(&slot_bytes.to_ne_bytes());
         // `y` last — see `linear_native_id_paged`'s doc on why binding order matters for
-        // `dispatch3`'s hazard tracking (this is the same fix, for the multi-slot variant).
+        // `dispatch3`'s hazard tracking. Binding 0 (old arena SSBO) is unread; `lut` fills it.
         let bufs = [
-            Self::vkb(w),
+            Self::vkb(lut),
             Self::vkb(x),
             Self::vkb(ids),
             Self::vkb(lut),
@@ -6189,7 +6211,7 @@ impl<'a> Recorder<'a> {
         let name =
             crate::linear::native_idm_paged_kernel_name(dtype).expect("native idm paged kernel");
         let spv = crate::gemm::native_idm_paged_build_spv(dtype).expect("native idm paged spv");
-        let k = self.be.kernel(name, spv, 5, 24);
+        let k = self.be.kernel(name, spv, 5, 36);
         self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
     }
 

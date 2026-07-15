@@ -76,7 +76,7 @@ fn paged_gemv_matches_host_reference_under_eviction_churn() {
     be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
 
     // 2 slots for 5 experts: every step past the first two is an eviction.
-    let mut pager = GpuPager::new(&be, n_expert, 2, stride_bytes).unwrap();
+    let mut pager = GpuPager::new(&be, n_expert, 2, stride_bytes, true).unwrap();
     let staging = be.alloc_uninit(stride_bytes, BufferUsage::Staging).unwrap();
 
     let ids_buf = be.alloc(4, BufferUsage::Activations).unwrap();
@@ -98,7 +98,8 @@ fn paged_gemv_matches_host_reference_under_eviction_churn() {
         // `lut_base = 0`: this synthetic single-layer bank's local ids ARE its LUT indices.
         rec.linear_native_id_paged(
             DType::Q8_0,
-            pager.arena_buffer(),
+            pager.arena_addr(),
+            pager.slot_bytes() as u32,
             pager.lut_buffer(),
             ids_buf.as_ref(),
             0,

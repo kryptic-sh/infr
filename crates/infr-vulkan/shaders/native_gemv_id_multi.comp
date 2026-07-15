@@ -23,10 +23,23 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // `rows`: total dispatched-should-be workgroup count is rows*n_used*out_f — needed ONLY to bound-
 // check the flat index against a padding workgroup from a possibly-2-D dispatch grid (see main()).
+// -DPAGED extends the push constant with the arena's 64-bit base address (lo/hi) + per-slot byte
+// stride — see native_arena_ref.glsl; `stride` stays repurposed as the LUT window base.
+#ifdef PAGED
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+    uint arena_lo; uint arena_hi; uint slot_bytes;
+} pc;
+#else
 layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
 } pc;
+#endif
+// PAGED reads the arena by device address (native_arena_ref.glsl), not binding 0 — the descriptor
+// slot takes a harmless filler on the Rust side, so binding numbers below match both builds.
+#ifndef PAGED
 layout(binding = 0) readonly buffer WB { uint nw[]; };
+#endif
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
 // -DPAGED: see native_gemv_id.comp's doc comment — same LUT hop, same zero-cost-when-off contract.
@@ -44,11 +57,11 @@ layout(binding = 3) buffer YB { float y_buf[]; };
 shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
 
 #ifdef PAGED
-// Arena-slot WORD base for every nw[] read — see native_gemv_id.comp's nw_base doc: the LUT
-// stores the slot's u32-WORD base offset (host-baked), NOT an index this shader multiplies by
-// `stride` (an ELEMENT-space multiply that wraps u32 past ~102 Scout-sized slots).
-uint nw_base = 0u;
-#define NW(i) nw[nw_base + (i)]
+// Arena read via 64-bit device address (see native_arena_ref.glsl): the LUT stores the SLOT INDEX
+// and `nw_ptr` (set in main) is the slot's byte address; NW() dereferences it. Replaces the u32
+// word-base SSBO read whose element-space multiply wrapped past ~102 Scout-sized slots.
+#include "native_arena_ref.glsl"
+#define NW(i) arena_word(i)
 #endif
 
 #include "native_decode.glsl"
@@ -79,7 +92,8 @@ void main() {
     // the host points `stride` at a run of per-expert word bases for exactly this layer — a
     // write-once window in the session's LUT tape (see `MoePagerSession::lut_window` for why
     // in-flight segments must read a frozen copy, not the live pool LUT).
-    nw_base = lut[pc.stride + ids[slot_global]];
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(lut[pc.stride + ids[slot_global]]) * uint64_t(pc.slot_bytes);
     uint wbase = o * pc.in_f;
 #else
     uint wbase = ids[slot_global] * pc.stride + o * pc.in_f;

@@ -318,6 +318,7 @@ impl Backend for CpuBackend {
             integrated: false,
             compute_units: 0,
             max_buffer_bytes: u64::MAX,
+            buffer_device_address: false, // CPU interpreter has no device-address concept
             max_shared_memory_bytes: u32::MAX, // scalar interpreter: no shared-memory tiling
             unified_memory: true,
             // The interpreter reads the baked `pos`/`kv_len` from the graph ops, so the decode graph

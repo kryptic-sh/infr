@@ -4829,7 +4829,8 @@ fn execute_paged_moe<'a>(
                     pool[&qa].as_ref(),
                     pool[&qda].as_ref(),
                     gate_needs_sact.then(|| pool[&qsa].as_ref()),
-                    sess.arena(gate_id),
+                    sess.arena_addr(gate_id),
+                    sess.slot_bytes(gate_id) as u32,
                     sess.tape(),
                     gate_w as usize,
                     pool[&counts].as_ref(),
@@ -4852,7 +4853,8 @@ fn execute_paged_moe<'a>(
                         pool[&qa].as_ref(),
                         pool[&qda].as_ref(),
                         up_needs_sact.then(|| pool[&qsa].as_ref()),
-                        sess.arena(up_id),
+                        sess.arena_addr(up_id),
+                        sess.slot_bytes(up_id) as u32,
                         sess.tape(),
                         up_w as usize,
                         pool[&counts].as_ref(),
@@ -4921,7 +4923,8 @@ fn execute_paged_moe<'a>(
                     pool[&dqa].as_ref(),
                     pool[&dda].as_ref(),
                     down_needs_sact.then(|| pool[&dsa].as_ref()),
-                    sess.arena(down_id),
+                    sess.arena_addr(down_id),
+                    sess.slot_bytes(down_id) as u32,
                     sess.tape(),
                     down_w as usize,
                     pool[&counts].as_ref(),
@@ -4969,7 +4972,8 @@ fn execute_paged_moe<'a>(
         let sess = guard.as_ref().expect("checked above");
         rec2.linear_native_id_multi_paged(
             gdt,
-            sess.arena(gate_id),
+            sess.arena_addr(gate_id),
+            sess.slot_bytes(gate_id) as u32,
             sess.tape(),
             pool[&ids_key].as_ref(),
             n_used,
@@ -4984,7 +4988,8 @@ fn execute_paged_moe<'a>(
         if let Some(ubuf) = &ubuf {
             rec2.linear_native_id_multi_paged(
                 udt,
-                sess.arena(up_id),
+                sess.arena_addr(up_id),
+                sess.slot_bytes(up_id) as u32,
                 sess.tape(),
                 pool[&ids_key].as_ref(),
                 n_used,
@@ -5056,7 +5061,8 @@ fn execute_paged_moe<'a>(
         let sess = guard.as_ref().expect("checked above");
         rec2.linear_native_id_multi_paged(
             ddt,
-            sess.arena(down_id),
+            sess.arena_addr(down_id),
+            sess.slot_bytes(down_id) as u32,
             sess.tape(),
             pool[&ids_key].as_ref(),
             n_used,

@@ -17,8 +17,23 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// -DPAGED extends the push constant with the arena's 64-bit base address (split lo/hi to dodge the
+// 8-byte alignment a uint64_t member would force) + the per-slot byte stride — see
+// native_arena_ref.glsl. `slot` still selects the id; `stride` is repurposed as the LUT window base.
+#ifdef PAGED
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint slot; uint stride;
+    uint arena_lo; uint arena_hi; uint slot_bytes;
+} pc;
+#else
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint slot; uint stride; } pc;
+#endif
+// PAGED reads the arena by device address (native_arena_ref.glsl), not through binding 0 — the
+// descriptor slot is left for a harmless filler on the Rust side, so binding numbers below are
+// unchanged between builds.
+#ifndef PAGED
 layout(binding = 0) readonly buffer WB { uint nw[]; };
+#endif
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
 // `y_buf` (the sole write) is always the LAST binding in either build. `Recorder::dispatch3`'s
@@ -37,16 +52,12 @@ layout(binding = 3) buffer YB { float y_buf[]; };
 shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
 
 #ifdef PAGED
-// Arena-slot WORD base for every nw[] read (set once in main from the LUT). The LUT stores the
-// slot's base offset in u32 WORDS — NOT a slot index the shader multiplies by `stride`: that
-// multiply is in ELEMENTS and wraps u32 past a few dozen ~14 MB slots (Scout: stride = 41.9M
-// elements/expert overflows at slot ≥ ~102 — a coherent-but-wrong bug the resident build can
-// never hit, its expert index maxing at n_expert-1). The within-expert element offsets stay
-// small (≤ one expert's span, fits u32 for any real model); only the arena reach rides this
-// word base, added at the final NW() indexing step inside native_decode.glsl. Host guarantees
-// the arena's total word count fits u32 (≤ 16 GiB/role — see GpuPager's slot-cap guard).
-uint nw_base = 0u;
-#define NW(i) nw[nw_base + (i)]
+// Arena read via 64-bit device address (see native_arena_ref.glsl): `nw_ptr` is set once in main
+// to this slot's base, and NW() dereferences it. The LUT now stores the SLOT INDEX; the byte
+// address is computed with a 64-bit multiply, so no arena size overflows it (the u32 element-space
+// multiply this replaces was the Scout slot-≥-102 coherent-but-wrong bug).
+#include "native_arena_ref.glsl"
+#define NW(i) arena_word(i)
 #endif
 
 #include "native_decode.glsl"
@@ -68,11 +79,12 @@ void main() {
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;
 #ifdef PAGED
-    // WORD base from the LUT (see nw_base's doc); wbase keeps only the small within-expert
-    // element offset. `pc.stride` is repurposed in this build as the LUT WINDOW base and `ids`
-    // holds layer-LOCAL expert ids — same contract as native_gemv_id_multi.comp's PAGED build
-    // (see its comment for the tape-window rationale).
-    nw_base = lut[pc.stride + ids[pc.slot]];
+    // Slot base BYTE address from the LUT slot index (see native_arena_ref.glsl); wbase keeps only
+    // the small within-expert element offset. `pc.stride` is repurposed in this build as the LUT
+    // WINDOW base and `ids` holds layer-LOCAL expert ids — same contract as
+    // native_gemv_id_multi.comp's PAGED build (see its comment for the tape-window rationale).
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(lut[pc.stride + ids[pc.slot]]) * uint64_t(pc.slot_bytes);
     uint wbase = o * pc.in_f;
 #else
     uint wbase = ids[pc.slot] * pc.stride + o * pc.in_f;

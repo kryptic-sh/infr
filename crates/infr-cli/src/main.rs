@@ -177,14 +177,17 @@ impl DeviceOpts {
 /// its `is_err` guard), so a flag the user passed wins and the rest fall back to the chat defaults.
 #[derive(clap::Args)]
 struct SamplingOpts {
-    /// Sampling temperature (0 = greedy/argmax). Sets INFR_TEMP. Default: 0.6 (chat).
+    /// Sampling temperature (0 = greedy/argmax). Sets INFR_TEMP. Default: the model's recommended
+    /// value (arch-family table + any generation_config.json beside the model) — e.g. 0.6 for
+    /// Qwen3, 1.0 for Gemma; 0.6 fallback. The startup banner prints the effective value.
     #[arg(long, value_name = "T")]
     temp: Option<f32>,
-    /// Top-k: keep only the k most-likely tokens. Sets INFR_TOP_K. Default: 20 (chat).
+    /// Top-k: keep only the k most-likely tokens (0 = keep all). Sets INFR_TOP_K. Default:
+    /// model-recommended (e.g. 20 for Qwen3, 64 for Gemma, off for Llama).
     #[arg(long = "top-k", value_name = "K")]
     top_k: Option<usize>,
     /// Top-p (nucleus): keep the smallest set whose probability mass ≥ p. Sets INFR_TOP_P.
-    /// Default: 0.95 (chat).
+    /// Default: model-recommended (e.g. 0.95 for Qwen3/Gemma, 0.9 for Llama).
     #[arg(long = "top-p", value_name = "P")]
     top_p: Option<f32>,
     /// RNG seed for reproducible sampling. Sets INFR_SEED. Unset = seeded from the clock.
@@ -740,8 +743,10 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
     // — `SeamModel::load` + the CPU/Vulkan/Metal sessions drive any `Config` arch (including
     // `MixerW::DeltaNet`) — so there is no qwen35-only branch (the old bespoke seam and its
     // env-gated escape hatch were deleted once the unified path was validated; issue #30).
-    // Chat-default sampling for every backend (the bespoke branch reads the same envs below).
-    set_default_sampling_env();
+    // Model-aware chat sampling for every backend (arch-family table + generation_config sibling;
+    // a user `--temp`/`--top-k`/`--top-p` already in the env wins). The bespoke branch reads the
+    // same envs below.
+    apply_model_sampling_defaults(&gguf);
     let model: Box<dyn infr_llama::chat::ChatModel + '_> = if is_dg {
         // diffusion-gemma (Phase 3/D): the entropy-bound block-diffusion loop
         // (`infr_llama::diffusion`) over a persistent session — Vulkan by default, CPU under
@@ -3004,16 +3009,99 @@ fn cmd_compare(
 /// tests stay deterministic). For chat UX, run/serve set the qwen3-recommended defaults when the
 /// user hasn't — pure greedy makes thinking models degenerate. Mirrors the bespoke
 /// `Llama::set_sampling(0.6, 20, 0.95)` defaults.
-fn set_default_sampling_env() {
+fn set_default_sampling_env(temp: f32, top_k: usize, top_p: f32) {
     if std::env::var("INFR_TEMP").is_err() {
-        std::env::set_var("INFR_TEMP", "0.6");
+        std::env::set_var("INFR_TEMP", temp.to_string());
     }
     if std::env::var("INFR_TOP_K").is_err() {
-        std::env::set_var("INFR_TOP_K", "20");
+        std::env::set_var("INFR_TOP_K", top_k.to_string());
     }
     if std::env::var("INFR_TOP_P").is_err() {
-        std::env::set_var("INFR_TOP_P", "0.95");
+        std::env::set_var("INFR_TOP_P", top_p.to_string());
     }
+}
+
+/// Architecture-family recommended sampling `(temp, top_k, top_p)` — the published per-family
+/// defaults (`top_k = 0` = keep-all, i.e. top_k disabled). infr enables `<think>` by default, so
+/// the Qwen3.x row uses its THINKING recommendation. An unknown arch falls back to the neutral
+/// chat default the whole engine used before this table existed.
+fn arch_sampling(arch: &str) -> (f32, usize, f32) {
+    use infr_llama::arch::*;
+    match arch {
+        // Qwen3.x thinking rec (Qwen team): temp 0.6 / top_k 20 / top_p 0.95.
+        QWEN3 | QWEN3_MOE | QWEN35 | QWEN35_MOE => (0.6, 20, 0.95),
+        // Qwen2/2.5 rec: a touch hotter, tighter nucleus.
+        QWEN2 => (0.7, 20, 0.8),
+        // Gemma (Google): higher temp, wide top_k.
+        GEMMA3 | GEMMA4 | DIFFUSION_GEMMA => (1.0, 64, 0.95),
+        // Meta Llama 3.x / 4 default generation_config: temp 0.6, top_p 0.9, top_k off.
+        LLAMA | LLAMA4 => (0.6, 0, 0.9),
+        _ => (0.6, 20, 0.95),
+    }
+}
+
+/// Per-field sampling override from a `generation_config.json` sitting BESIDE the model (the HF
+/// convention — the model's OWN recommended generation params). Present for full-repo checkouts,
+/// absent for the GGUF-only distributions `infr pull` fetches (then the [`arch_sampling`] table
+/// drives). Each field is independent — a config that sets only `temperature` overrides just that.
+fn generation_config_sampling(gguf: &std::path::Path) -> (Option<f32>, Option<usize>, Option<f32>) {
+    let Some(path) = gguf.parent().map(|d| d.join("generation_config.json")) else {
+        return (None, None, None);
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (None, None, None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (None, None, None);
+    };
+    (
+        v.get("temperature")
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32),
+        v.get("top_k").and_then(|x| x.as_u64()).map(|x| x as usize),
+        v.get("top_p").and_then(|x| x.as_f64()).map(|x| x as f32),
+    )
+}
+
+/// The model-aware sampling defaults for `gguf`: the [`arch_sampling`] family table, with any
+/// [`generation_config_sampling`] sibling override applied per field. Returns `(temp, top_k, top_p,
+/// source_label)` — the label is for the CLI banner so the effective sampler is never a mystery.
+fn model_sampling_defaults(gguf: &std::path::Path) -> (f32, usize, f32, String) {
+    let arch = infr_llama::arch::arch_of(gguf);
+    let (mut t, mut k, mut p) = arch
+        .as_deref()
+        .map(arch_sampling)
+        .unwrap_or((0.6, 20, 0.95));
+    let mut src = arch.clone().unwrap_or_else(|| "default".to_string());
+    let (gt, gk, gp) = generation_config_sampling(gguf);
+    if gt.is_some() || gk.is_some() || gp.is_some() {
+        src = format!("{}+generation_config", arch.as_deref().unwrap_or("default"));
+    }
+    if let Some(x) = gt {
+        t = x;
+    }
+    if let Some(x) = gk {
+        k = x;
+    }
+    if let Some(x) = gp {
+        p = x;
+    }
+    (t, k, p, src)
+}
+
+/// Fill unset `INFR_TEMP`/`INFR_TOP_K`/`INFR_TOP_P` with the model's recommended sampling (see
+/// [`model_sampling_defaults`]) and print a one-line banner of the EFFECTIVE sampler — a `--temp`/
+/// `--top-k`/`--top-p` the user passed is already in the env (via `SamplingOpts::resolve`), so it
+/// wins and shows through here. Shared by `run` and `serve`.
+fn apply_model_sampling_defaults(gguf: &std::path::Path) {
+    let (t, k, p, src) = model_sampling_defaults(gguf);
+    set_default_sampling_env(t, k, p);
+    eprintln!(
+        "[sampling: temp={} top_k={} top_p={} ({src}); --temp/--top-k/--top-p to override]",
+        std::env::var("INFR_TEMP").unwrap_or_default(),
+        std::env::var("INFR_TOP_K").unwrap_or_default(),
+        std::env::var("INFR_TOP_P").unwrap_or_default(),
+    );
 }
 
 fn cmd_serve(model: &str, addr: &str, parallel: usize) -> anyhow::Result<()> {
@@ -3033,7 +3121,7 @@ fn cmd_serve(model: &str, addr: &str, parallel: usize) -> anyhow::Result<()> {
     let is_vulkan =
         !is_dg && std::env::var("INFR_METAL").is_err() && std::env::var("INFR_CPU").is_err();
 
-    set_default_sampling_env();
+    apply_model_sampling_defaults(&gguf);
 
     // ── the CONCURRENT path: dense/MoE/qwen35 on the Vulkan seam ────────────────────────────────
     // N KV slots off ONE weight upload, round-robin on the GPU at token granularity. This is the
@@ -3132,5 +3220,25 @@ fn cmd_serve(model: &str, addr: &str, parallel: usize) -> anyhow::Result<()> {
         let rt = tokio::runtime::Runtime::new()?;
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
         rt.block_on(infr_server::serve(generator, model_id, sockaddr, 1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infr_llama::arch::*;
+
+    #[test]
+    fn arch_sampling_table_is_family_specific() {
+        // Qwen3.x thinking rec; also the fallback for any unknown arch.
+        assert_eq!(arch_sampling(QWEN3), (0.6, 20, 0.95));
+        assert_eq!(arch_sampling(QWEN35_MOE), (0.6, 20, 0.95));
+        assert_eq!(arch_sampling("some-future-arch"), (0.6, 20, 0.95));
+        // Qwen2/2.5 runs hotter with a tighter nucleus.
+        assert_eq!(arch_sampling(QWEN2), (0.7, 20, 0.8));
+        // Gemma: high temp, wide top_k.
+        assert_eq!(arch_sampling(GEMMA4), (1.0, 64, 0.95));
+        // Llama: top_k off (0 = keep all), top_p 0.9.
+        assert_eq!(arch_sampling(LLAMA), (0.6, 0, 0.9));
     }
 }

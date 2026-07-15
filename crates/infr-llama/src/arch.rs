@@ -68,6 +68,19 @@ pub const TRANSFORMER: &[&str] = &[
     DIFFUSION_GEMMA,
 ];
 
+/// Read `general.architecture` from a GGUF WITHOUT a full model load (mirrors
+/// [`crate::diffusion::is_diffusion_gemma`]'s cheap peek) — lets `infr run`/`serve` pick
+/// architecture-aware sampling defaults before paying a `SeamModel::load`. `None` if the file
+/// can't be opened or carries no architecture key.
+pub fn arch_of(path: &std::path::Path) -> Option<String> {
+    use infr_core::WeightSource;
+    infr_gguf::Gguf::open(path).ok().and_then(|g| {
+        g.metadata()
+            .str("general.architecture")
+            .map(|s| s.to_string())
+    })
+}
+
 /// Every architecture infr runs, across both paths.
 pub const ALL: &[&str] = &[
     LLAMA,

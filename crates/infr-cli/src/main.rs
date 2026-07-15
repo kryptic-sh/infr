@@ -164,6 +164,74 @@ impl DeviceOpts {
     }
 }
 
+/// The shared SAMPLING flags for `run`/`serve` — the sibling of [`DeviceOpts`]. Same front-end
+/// pattern: every field funnels through a process-global env var (`INFR_TEMP`/`INFR_TOP_K`/
+/// `INFR_TOP_P`/`INFR_SEED`/`INFR_MAX_NEW`/`INFR_NO_THINK`) that the decode loop reads, so
+/// [`resolve`](SamplingOpts::resolve) publishes the envs and the piecemeal setters go away.
+///
+/// NOT on `bench`: bench pins greedy (`INFR_TEMP=0`) so its numbers are deterministic, so exposing
+/// sampling there would be misleading. On `serve` these are the SERVER DEFAULTS — a per-request
+/// OpenAI field (`temperature`/`top_p`/…) still overrides them via `GenParams::from_request`.
+///
+/// `resolve` is called BEFORE `set_default_sampling_env` (which only fills a knob left unset, via
+/// its `is_err` guard), so a flag the user passed wins and the rest fall back to the chat defaults.
+#[derive(clap::Args)]
+struct SamplingOpts {
+    /// Sampling temperature (0 = greedy/argmax). Sets INFR_TEMP. Default: 0.6 (chat).
+    #[arg(long, value_name = "T")]
+    temp: Option<f32>,
+    /// Top-k: keep only the k most-likely tokens. Sets INFR_TOP_K. Default: 20 (chat).
+    #[arg(long = "top-k", value_name = "K")]
+    top_k: Option<usize>,
+    /// Top-p (nucleus): keep the smallest set whose probability mass ≥ p. Sets INFR_TOP_P.
+    /// Default: 0.95 (chat).
+    #[arg(long = "top-p", value_name = "P")]
+    top_p: Option<f32>,
+    /// RNG seed for reproducible sampling. Sets INFR_SEED. Unset = seeded from the clock.
+    #[arg(long, value_name = "N")]
+    seed: Option<u64>,
+    /// Max tokens to generate per reply. Sets INFR_MAX_NEW. (No short flag: `-n` is taken by
+    /// bench's `--n-gen` and serve's `--parallel`.)
+    #[arg(long = "max-new", value_name = "N")]
+    max_new: Option<usize>,
+    /// Force reasoning OFF for models that emit `<think>` (sets INFR_NO_THINK=1). Thinking is on by
+    /// default where the template supports it.
+    #[arg(long = "no-think", conflicts_with = "think")]
+    no_think: bool,
+    /// Force reasoning ON, overriding an inherited INFR_NO_THINK (sets INFR_NO_THINK=0).
+    #[arg(long)]
+    think: bool,
+}
+
+impl SamplingOpts {
+    /// Publish the passed flags to the sampling env vars. Only a flag the user actually set touches
+    /// the environment, so an unset knob is left for `set_default_sampling_env`/the reader default.
+    fn resolve(&self) {
+        if let Some(t) = self.temp {
+            std::env::set_var("INFR_TEMP", t.to_string());
+        }
+        if let Some(k) = self.top_k {
+            std::env::set_var("INFR_TOP_K", k.to_string());
+        }
+        if let Some(p) = self.top_p {
+            std::env::set_var("INFR_TOP_P", p.to_string());
+        }
+        if let Some(s) = self.seed {
+            std::env::set_var("INFR_SEED", s.to_string());
+        }
+        if let Some(m) = self.max_new {
+            std::env::set_var("INFR_MAX_NEW", m.to_string());
+        }
+        // `--no-think`/`--think` are mutually exclusive (clap `conflicts_with`); each maps to the
+        // existing INFR_NO_THINK grammar (`=1` off, `=0`/unset on — see infr-chat template.rs).
+        if self.no_think {
+            std::env::set_var("INFR_NO_THINK", "1");
+        } else if self.think {
+            std::env::set_var("INFR_NO_THINK", "0");
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Download + cache a model (`org/repo[:quant]` from HuggingFace, or a path to a `.gguf`).
@@ -175,6 +243,8 @@ enum Cmd {
         message: Option<String>,
         #[command(flatten)]
         device: DeviceOpts,
+        #[command(flatten)]
+        sampling: SamplingOpts,
     },
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
@@ -203,6 +273,9 @@ enum Cmd {
         /// unset); see the shared `DeviceOpts` flags below.
         #[command(flatten)]
         device: DeviceOpts,
+        /// Sampling flags are the SERVER DEFAULTS — a per-request OpenAI field still overrides them.
+        #[command(flatten)]
+        sampling: SamplingOpts,
     },
     /// Benchmark prefill/decode tok/s — same interface as llama.cpp's `llama-bench` (-p/-n/-d/-r),
     /// so the two are directly comparable. Prefill (pp) when -n 0; decode (tg) when -p 0.
@@ -408,8 +481,12 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             model,
             message,
             device,
+            sampling,
         } => {
             device.resolve()?;
+            // Before cmd_run's set_default_sampling_env: a flag the user passed is now already in
+            // the env, so the default-filler's `is_err` guard leaves it alone.
+            sampling.resolve();
             cmd_run(&model, message.as_deref())
         }
         Cmd::Serve {
@@ -417,8 +494,10 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             addr,
             parallel,
             device,
+            sampling,
         } => {
             device.resolve()?;
+            sampling.resolve();
             cmd_serve(&model, &addr, parallel)
         }
         Cmd::Bench {

@@ -48,7 +48,7 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
     let store = Store::discover()?;
     // Ask HF for the current commit + concrete gguf filename. If the API is unreachable (offline),
     // serve whatever is cached rather than failing.
-    let (commit, filename) = match repo_info(repo, sel) {
+    let (commit, filename, siblings) = match repo_info(repo, sel) {
         Ok(x) => x,
         Err(e) => {
             return match store.resolve_repo(repo, sel) {
@@ -62,14 +62,17 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
     };
 
     let repo_dir = store.repo_dir(repo);
+    let blobs = repo_dir.join("blobs");
     // Up to date when the snapshot for THIS commit already links a present blob for `filename`.
     let link = repo_dir.join("snapshots").join(&commit).join(&filename);
     if link.exists() {
         info!("hf:{repo}:{filename} already up to date ({commit})");
+        // Still ensure companions — a snapshot pulled before this feature won't have them yet.
+        if let Some(snap) = link.parent() {
+            fetch_companions(repo, &blobs, snap, &siblings);
+        }
         return Ok(link);
     }
-
-    let blobs = repo_dir.join("blobs");
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
     // The commit moved but the FILE may be byte-identical (e.g. the repo only added a sibling like an
     // mmproj). Blobs are content-addressed by sha256, so if the file's sha is already cached we just
@@ -91,6 +94,9 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
     let _ = fs::remove_file(&link); // replace a stale/dangling link
     symlink(format!("../../blobs/{hex}"), &link).map_err(Error::from)?;
     debug!("linked {link:?} -> blobs/{hex}");
+    if let Some(snap) = link.parent() {
+        fetch_companions(repo, &blobs, snap, &siblings);
+    }
     Ok(link)
 }
 
@@ -143,7 +149,7 @@ fn pull_repo(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
     }
 
     // Resolve the repo's main commit + the concrete gguf filename for `sel` via the HF model API.
-    let (commit, filename) = repo_info(repo, sel)?;
+    let (commit, filename, siblings) = repo_info(repo, sel)?;
     info!("Pulling hf:{repo}:{filename}");
 
     let repo_dir = store.repo_dir(repo);
@@ -161,11 +167,14 @@ fn pull_repo(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
     symlink(format!("../../blobs/{hex}"), &link).map_err(Error::from)?;
     debug!("linked {link:?} -> blobs/{hex}");
     let _ = blob;
+    fetch_companions(repo, &blobs, &snap, &siblings);
     Ok(link)
 }
 
-/// Query the HF model API for `repo`: return `(commit_sha, gguf_filename)` for selector `sel`.
-fn repo_info(repo: &str, sel: Option<&str>) -> Result<(String, String)> {
+/// Query the HF model API for `repo`: return `(commit_sha, gguf_filename, sibling_filenames)` for
+/// selector `sel`. The sibling list lets the caller fetch companion files (see [`fetch_companions`])
+/// without a second API round-trip.
+fn repo_info(repo: &str, sel: Option<&str>) -> Result<(String, String, Vec<String>)> {
     let url = format!("https://huggingface.co/api/models/{repo}");
     debug!("GET {url}");
     let mut req = http_client()?.get(&url);
@@ -202,7 +211,43 @@ fn repo_info(repo: &str, sel: Option<&str>) -> Result<(String, String)> {
             None => format!("no .gguf files found in {repo}"),
         })
     })?;
-    Ok((info.sha, file))
+    Ok((info.sha, file, names))
+}
+
+/// Small non-GGUF sibling files worth caching NEXT TO the GGUF. `generation_config.json` carries the
+/// model's own recommended sampling (temperature/top_k/top_p) — the CLI reads it beside the model to
+/// seed `infr run`/`serve` defaults (see infr-cli's `model_sampling_defaults`). Kept deliberately
+/// tiny: only files the engine actually consumes belong here.
+const COMPANIONS: &[&str] = &["generation_config.json"];
+
+/// Download any [`COMPANIONS`] the repo lists into `snap` (the GGUF's snapshot dir, so they sit
+/// beside it), content-addressed + symlinked exactly like the GGUF. Idempotent (skips a present
+/// link) and STRICTLY NON-FATAL: a companion that's absent, unlisted, or fails to download never
+/// fails the model pull — it's a convenience, not a requirement. `siblings` is the repo file list
+/// already fetched by [`repo_info`], so an absent companion costs zero network calls.
+fn fetch_companions(repo: &str, blobs: &Path, snap: &Path, siblings: &[String]) {
+    for &name in COMPANIONS {
+        if !siblings.iter().any(|s| s == name) {
+            continue; // repo doesn't ship it
+        }
+        let link = snap.join(name);
+        if link.exists() {
+            continue; // already cached
+        }
+        let url = format!("https://huggingface.co/{repo}/resolve/main/{name}");
+        let dl =
+            http_client().and_then(|c| download_to_blob(&c, &url, token().as_deref(), blobs, name));
+        match dl {
+            Ok((_, hex, _)) => {
+                let _ = fs::remove_file(&link);
+                match symlink(format!("../../blobs/{hex}"), &link) {
+                    Ok(()) => info!("hf:{repo}: cached companion {name}"),
+                    Err(e) => debug!("hf:{repo}: companion {name} symlink failed: {e}"),
+                }
+            }
+            Err(e) => debug!("hf:{repo}: companion {name} not cached ({e})"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

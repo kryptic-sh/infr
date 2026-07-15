@@ -948,21 +948,19 @@ pub(crate) fn vulkan_moe_binder<'a>(
         };
         if let (Some(mut budget), false) = (budget, eligible.is_empty()) {
             // Pools keyed by (dtype, stride); blocks assigned ids in layer order per pool.
-            let mut pools: Vec<(infr_core::DType, usize, u64, usize)> = Vec::new(); // (dt, stride, elems_per_slot, n_blocks)
+            let mut pools: Vec<(infr_core::DType, usize, usize)> = Vec::new(); // (dt, stride, n_blocks)
             let mut planned: Vec<(Vec<String>, usize, u32)> = Vec::new(); // (comps, pool, block_id)
             for (comps, dt, raw, _numel) in &eligible {
-                let (blk_e, blk_b) = infr_gguf::block_layout(*dt);
                 let stride = stride_of(*dt, *raw);
-                let eps = (stride / blk_b * blk_e) as u64;
-                let pool = match pools.iter().position(|&(d, s, ..)| d == *dt && s == stride) {
+                let pool = match pools.iter().position(|&(d, s, _)| d == *dt && s == stride) {
                     Some(i) => i,
                     None => {
-                        pools.push((*dt, stride, eps, 0));
+                        pools.push((*dt, stride, 0));
                         pools.len() - 1
                     }
                 };
-                let block_id = pools[pool].3 as u32;
-                pools[pool].3 += 1;
+                let block_id = pools[pool].2 as u32;
+                pools[pool].2 += 1;
                 planned.push((comps.clone(), pool, block_id));
             }
             // The pinned upload ring lives in the same VRAM the arenas do — subtract it first.
@@ -970,31 +968,29 @@ pub(crate) fn vulkan_moe_binder<'a>(
             budget = budget.saturating_sub(ring_bytes as u64);
             let total_bytes: u64 = pools
                 .iter()
-                .map(|&(_, s, _, nb)| (s * nb) as u64)
+                .map(|&(_, s, nb)| (s * nb) as u64)
                 .sum::<u64>()
                 .max(1);
-            let arena_cap = infr_vulkan::pager::GpuPager::max_arena_bytes(vk);
             let specs: Vec<infr_vulkan::pager::DensePoolSpec> = pools
                 .iter()
-                .map(|&(_, stride, eps, nb)| {
+                .map(|&(_, stride, nb)| {
                     // Proportional budget split (byte share == access share: every block is read
                     // exactly once per sweep). Floor 2 slots so the next block's upload can
                     // overlap the previous block's dispatch instead of serializing on one slot.
+                    // `n_slots` is bounded ONLY by the VRAM budget share and this floor: the pool
+                    // arena is a `bufferDeviceAddress` buffer read purely by 64-bit pointer (see
+                    // `DensePagerSession`), NEVER bound as a descriptor, so BOTH pre-BDA caps are
+                    // gone — no `maxStorageBufferRange` binding ceiling and no u32 element-reach
+                    // limit. A single pool may span well past 4 GiB (matching the paged-MoE arena,
+                    // e.g. Scout's 6.57 GB role pools).
                     let share =
                         (budget as u128 * (stride * nb) as u128 / total_bytes as u128) as u64;
                     let floor = 2.min(nb).max(1);
-                    // Caps: one SSBO binding per arena (device range), AND the kernels' u32
-                    // ELEMENT reach — `n_slots * elems_per_slot + one block's numel` must fit
-                    // u32 (a Q4_K pool's elements outnumber its bytes 1.78:1, so this cap can
-                    // bind before the byte cap does).
-                    let cap_bytes = ((arena_cap / stride as u64) as usize).max(1);
-                    let cap_elems = ((u32::MAX as u64 / eps).saturating_sub(1) as usize).max(1);
                     let budget_slots = ((share / stride as u64) as usize).clamp(floor, nb);
                     infr_vulkan::pager::DensePoolSpec {
                         slot_bytes: stride,
-                        n_slots: budget_slots.min(cap_bytes).min(cap_elems),
+                        n_slots: budget_slots,
                         n_blocks: nb,
-                        elems_per_slot: eps,
                     }
                 })
                 .collect();

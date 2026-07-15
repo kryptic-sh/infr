@@ -2627,6 +2627,31 @@ fn main() {
             }
         })
         .collect();
+    // STREAMED twins for dense weight layer-streaming (see src/pager.rs `DensePagerSession`): the
+    // `-DSTREAMED` build reads the weight from a `bufferDeviceAddress` arena pool (native_arena_ref
+    // .glsl) instead of a bound SSBO, lifting the ~4 GiB `maxStorageBufferRange` cap one SSBO
+    // binding imposes. Streamed dense Linears (any m) route through native_gemv's rows loop — the
+    // fused-add peephole filters streamed weights out (adapter.rs), so only the NON-residual base
+    // builds need a twin. Additive: the default (non-STREAMED) build is byte-identical (the define
+    // only activates #ifdef arms that expand to nothing when off). See native_gemv.comp.
+    const STREAMED_SOURCES: &[&str] = &["native_gemv"];
+    let builds: Vec<(String, String, Vec<String>)> = builds
+        .into_iter()
+        .flat_map(|(src_stem, dst_stem, defines)| {
+            if STREAMED_SOURCES.contains(&src_stem.as_str())
+                && !defines.iter().any(|d| d == "-DUSE_RES")
+            {
+                let mut sd = defines.clone();
+                sd.push("-DSTREAMED".to_string());
+                vec![
+                    (src_stem.clone(), dst_stem.clone(), defines),
+                    (src_stem, format!("{dst_stem}_streamed"), sd),
+                ]
+            } else {
+                vec![(src_stem, dst_stem, defines)]
+            }
+        })
+        .collect();
     for (src_stem, dst_stem, defines) in &builds {
         let src = format!("shaders/{src_stem}.comp");
         let dst = format!("{out}/{dst_stem}.spv");

@@ -958,15 +958,20 @@ fn lower_op(
     // invalidates the memo by construction.
     mmv_memo: &mut Option<(TensorId, usize, usize)>,
     dummy: &dyn Buffer,
-    // Dense layer streaming (see `pager::DensePagerSession`): `Some((arena, elem_base))` when
-    // this op is an `Op::Linear` whose weight is a streamed block — the weight binds the pool's
-    // ARENA buffer instead of the (4-byte placeholder) bound at the TensorId, and `elem_base`
-    // (the resident slot's element offset) adds to the op's own `w_off`. Every other op — and
+    // Dense layer streaming (see `pager::DensePagerSession`): `Some(arena_addr)` when this op is an
+    // `Op::Linear` whose weight is a streamed block — `arena_addr` is the resident slot's arena base
+    // BYTE address. The pool arena is a `bufferDeviceAddress` buffer read purely by 64-bit pointer
+    // (NOT a bound SSBO), so the ~4 GiB `maxStorageBufferRange` cap is gone entirely (no descriptor
+    // binds it). The op lowers through the single streamed GEMV with the op's own `w_off` (a
+    // fused-QKV slice offset, usually 0) riding on top — a short-circuit that bypasses the resident
+    // GEMM/mmv selection below (streamed weights only ever dispatch the ONE converted kernel, which
+    // is what makes dropping the pool caps safe). The ring→arena copy hazard is ordered explicitly
+    // by `arena_stream_barrier` at the staging site (see `stage_dense_linear`). Every other op — and
     // every non-streamed model — passes `None` (zero change). Only the `Op::Linear` arm reads it;
     // the seam's placement guarantees a streamed weight's dtype rides the offset-capable native
     // paths (`native_dense_supported`) and never the fused-residual peephole (filtered by
     // `execute_static` before the loop).
-    wsub: Option<(&dyn Buffer, usize)>,
+    wsub: Option<u64>,
 ) -> Result<()> {
     let memo_prev = mmv_memo.take();
     let r = |id: TensorId| resolve(scratch, bindings, id);
@@ -1053,23 +1058,24 @@ fn lower_op(
             }
             let (w, xb, y) = (r(*weight)?, r(*x)?, r(*dst)?);
             let dt = graph.desc(*weight).dtype;
-            // Dense layer streaming: the weight is the pool ARENA at the staged slot's element
-            // base (see the `wsub` param doc) — the op's own `w_off` (a fused-qkv slice offset,
-            // usually 0) rides on top, exactly the stacked-MoE-tensor convention every offset
-            // path below already implements.
-            let (w, w_off) = match wsub {
-                Some((arena, elem_base)) => {
-                    // Placement guarantees an offset-capable dtype (the f16/f32 fallback arms and
-                    // `matmul_proj` take no weight offset) — a violation here would silently read
-                    // arena slot 0's bytes as this weight.
-                    if !native_dense_supported(dt) {
-                        return Err(be("vulkan adapter: streamed Linear weight of a dtype \
-                                       without offset-capable kernels"));
-                    }
-                    (arena, w_off + elem_base)
+            // Dense layer streaming: the weight lives in a `bufferDeviceAddress` arena pool (see
+            // the `wsub` param doc). Short-circuit to the single streamed GEMV — it reads the arena
+            // by 64-bit address (`arena_addr`), with the op's own `w_off` (a fused-qkv slice offset,
+            // usually 0) riding on top as a within-slot element offset. This deliberately bypasses
+            // the resident GEMM/mmv selection below: routing EVERY streamed Linear (any m) through
+            // one converted kernel is what lets the seam drop the pool caps safely (a >4 GiB pool
+            // is only ever read by this cap-free kernel, never an unconverted SSBO one). The rows
+            // loop handles m>1 (streaming is already a memory-bound fallback — see the recorder doc).
+            if let Some(arena_addr) = wsub {
+                // Placement guarantees an offset-capable native dtype (the f16/f32 fallback arms
+                // take no weight offset) — a violation here would read the wrong arena bytes.
+                if !native_dense_supported(dt) {
+                    return Err(be("vulkan adapter: streamed Linear weight of a dtype \
+                                   without offset-capable kernels"));
                 }
-                None => (w, w_off),
-            };
+                rec.linear_native_streamed(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
+                return Ok(());
+            }
             // `w_off` (fused-QKV slices) only rides the offset-capable native paths — the runner
             // gates fusion on `native_dense_supported`, so the f16/f32 fallbacks never see it.
             if w_off != 0 && !native_dense_supported(dt) {
@@ -4301,9 +4307,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     .as_ref()
                     .is_some_and(|s| s.is_streamed(wid));
                 if streamed {
-                    let elem_base = stage_dense_linear(be_, &mut rec, &mut pstream, wid)?;
-                    let guard = be_.dense_pager().lock().unwrap();
-                    let sess = guard.as_ref().expect("dense_paged() checked above");
+                    let arena_addr = stage_dense_linear(be_, &mut rec, &mut pstream, wid)?;
                     lower_op(
                         be_,
                         graph,
@@ -4320,7 +4324,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         &mut pool,
                         &mut mmv_memo,
                         dummy.as_ref(),
-                        Some((sess.arena(wid)?, elem_base)),
+                        Some(arena_addr),
                     )?;
                     continue;
                 }
@@ -4465,16 +4469,22 @@ fn sync_stream<'a>(
 /// Ensure a streamed dense Linear weight (`wid` — see `pager::buffer_identity`) is resident,
 /// staging a miss through the session ring into the ambient segment and rotating the stream
 /// (pipelined `finish_nowait` + fenced ring-half swap, exactly `rotate_stream`'s contract) when
-/// the current half can't hold it. Returns the slot's weight ELEMENT base for the dispatch's
-/// `w_off`. Progress is guaranteed: a ring half holds at least the largest pool slot (asserted
-/// at session construction).
+/// the current half can't hold it. Returns the resident slot's arena base BYTE address for the
+/// streamed dispatch (see `DensePagerSession::stage`). Progress is guaranteed: a ring half holds
+/// at least the largest pool slot (asserted at session construction).
 fn stage_dense_linear<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
     wid: usize,
-) -> Result<usize> {
+) -> Result<u64> {
     loop {
+        // WAR: order any prior streamed dispatch's arena read (a 64-bit pointer read, invisible to
+        // the buffer hazard tracker) before the ring→arena copy this `stage` may record into a
+        // re-used slot. Emitted before the copy; harmless on a hit (no copy recorded).
+        rec.as_ref()
+            .expect("segment always Some between ops")
+            .arena_stream_barrier();
         let staged = {
             let mut guard = be_.dense_pager().lock().unwrap();
             let sess = guard
@@ -4489,7 +4499,14 @@ fn stage_dense_linear<'a>(
             )?
         };
         match staged {
-            Some(elem_base) => return Ok(elem_base),
+            Some(arena_addr) => {
+                // RAW: order the ring→arena copy just recorded before the streamed dispatch that
+                // reads the slot by pointer (see `Recorder::arena_stream_barrier`).
+                rec.as_ref()
+                    .expect("segment always Some between ops")
+                    .arena_stream_barrier();
+                return Ok(arena_addr);
+            }
             None => rotate_stream(be_, rec, ps)?,
         }
     }

@@ -51,16 +51,17 @@ use super::{as_vk_buf, be, VulkanBackend};
 pub struct GpuPager {
     pager: Pager,
     slot_bytes: usize,
-    /// Device-local arena: `n_slots * slot_bytes`, one contiguous buffer. For a MoE pool this is a
-    /// `bufferDeviceAddress` buffer the paged kernels read through a 64-bit pointer (see
-    /// [`Self::arena_addr`]); for the dense-streaming pool it is still bound as an `array<u32>`
-    /// SSBO (its kernels bake a u32 element offset — the 4 GiB cap still applies there).
+    /// Device-local arena: `n_slots * slot_bytes`, one contiguous buffer. Both the MoE pools AND
+    /// the dense-streaming pools allocate this as a `bufferDeviceAddress` buffer their paged/streamed
+    /// kernels read through a 64-bit pointer (see [`Self::arena_addr`]) — no `maxStorageBufferRange`
+    /// cap. The `arena_bda = false` (plain SSBO, u32 element offsets) path remains available for a
+    /// caller that opts into it, but no production pool does today.
     arena: Box<dyn Buffer>,
     /// This arena's 64-bit `VkDeviceAddress` when it was allocated as a `bufferDeviceAddress`
-    /// buffer (MoE pools), else `0` (the dense-streaming pool, which addresses its SSBO arena by
-    /// element offset and never needs a pointer). The MoE paged kernels compute a slot's byte
-    /// address as `arena_addr + lut[...] * slot_bytes`, so this is the base the LUT slot index is
-    /// scaled onto.
+    /// buffer (MoE pools and dense-streaming pools), else `0` (the plain-SSBO path). The MoE paged
+    /// kernels compute a slot's byte address as `arena_addr + lut[...] * slot_bytes`; the dense
+    /// streamed kernels take the resident slot's full base address `arena_addr + slot * slot_bytes`
+    /// (host-computed in [`DensePagerSession::stage`]) directly as a push constant.
     arena_addr: u64,
     /// Host-visible LUT mirror (mutated in place, re-uploaded on change) + the device buffer it's
     /// pushed to. `n_blocks` entries, each the resident block's SLOT INDEX
@@ -987,15 +988,15 @@ pub struct DenseSource {
 
 /// One dense pool's fixed layout: every block in it shares `slot_bytes` (the PADDED stride —
 /// a multiple of 4 (u32 arena) AND of the pool dtype's block byte size, so a slot base is always
-/// a whole number of quant blocks) and `elems_per_slot` (the stride in LOGICAL elements — the
-/// `w_off` unit; `slot_bytes / block_bytes * block_elems`, computed by the seam which owns the
-/// dtype tables). The seam caps `n_slots` so `n_slots * elems_per_slot + block numel` fits the
-/// kernels' u32 element reach — [`DensePagerSession::stage`] debug-asserts it.
+/// a whole number of quant blocks). The arena is a `bufferDeviceAddress` buffer read by 64-bit
+/// pointer (see [`DensePagerSession`]), so `n_slots` is bounded only by the VRAM budget share (and
+/// the seam's floor) — there is NO per-arena `maxStorageBufferRange` cap and NO u32 element-reach
+/// cap (a slot's base byte address is computed in 64-bit; the op's `w_off` element offset rides on
+/// top within the kernel). Contrast the resident/SSBO path, which those two caps DID bind.
 pub struct DensePoolSpec {
     pub slot_bytes: usize,
     pub n_slots: usize,
     pub n_blocks: usize,
-    pub elems_per_slot: u64,
 }
 
 struct DensePool {
@@ -1030,14 +1031,24 @@ pub struct DensePagerSession {
 
 impl DensePagerSession {
     pub fn new(vk: &VulkanBackend, layout: DensePagerLayout) -> Result<Self> {
+        // The streamed kernels read the arena by 64-bit device address (native_arena_ref.glsl), so
+        // BDA is required. It is probed and hard-errored globally at init (lib.rs, `caps()
+        // .buffer_device_address`); assert here so a future refactor that lands a dense session on a
+        // BDA-less device fails loudly rather than allocating an un-addressable arena.
+        debug_assert!(
+            vk.caps().buffer_device_address,
+            "dense streaming needs bufferDeviceAddress (BDA arena)"
+        );
         let mut pools = Vec::with_capacity(layout.pools.len());
         let mut max_slot = 4usize;
         for spec in layout.pools {
             max_slot = max_slot.max(spec.slot_bytes);
             pools.push(DensePool {
-                // Dense-streaming pool: arena is a plain SSBO (u32 element offsets), so it keeps
-                // the `maxStorageBufferRange` cap — `arena_bda = false`.
-                pager: GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes, false)?,
+                // Dense-streaming pool: the arena is a `bufferDeviceAddress` buffer the streamed
+                // kernels read through a 64-bit pointer (`arena_bda = true`), so it may span as
+                // much VRAM as the budget allows — no `maxStorageBufferRange` cap (the pre-BDA
+                // ~4 GiB-per-pool ceiling this lifts), no u32 element-reach cap.
+                pager: GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes, true)?,
                 spec,
             });
         }
@@ -1098,18 +1109,21 @@ impl DensePagerSession {
     }
 
     /// Ensure `buf_id`'s block is resident, staging a miss through `rec`-recorded ring→arena
-    /// copies at `half_base + *cursor`. Returns the block's arena WEIGHT ELEMENT BASE (the value
-    /// the dispatch adds to the op's own `w_off`), or `None` when the current ring half can't
-    /// hold the miss — the caller rotates the ring (pipelined submit) and re-calls. Residency
-    /// rides the exact cyclic-sweep policy (`infr_core::pager::Pager::schedule`); one block = one
-    /// touch batch (the epoch guard protects it across the caller's rotations).
+    /// copies at `half_base + *cursor`. Returns the resident slot's arena base BYTE address (the
+    /// streamed dispatch sets `nw_ptr` to it and adds the op's own `w_off` element offset on top —
+    /// see native_arena_ref.glsl and [`crate::recorder::Recorder::linear_native_streamed`]), or
+    /// `None` when the current ring half can't hold the miss — the caller rotates the ring
+    /// (pipelined submit) and re-calls. The address is computed in 64-bit, so no arena size
+    /// overflows it (the u32 element-reach the SSBO path needed is gone). Residency rides the exact
+    /// cyclic-sweep policy (`infr_core::pager::Pager::schedule`); one block = one touch batch (the
+    /// epoch guard protects it across the caller's rotations).
     pub fn stage(
         &mut self,
         rec: &crate::recorder::Recorder<'_>,
         half_base: usize,
         cursor: &mut usize,
         buf_id: usize,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<u64>> {
         let Self {
             pools,
             sources,
@@ -1139,24 +1153,11 @@ impl DensePagerSession {
             pool.pager
                 .schedule_staged(rec, ring.as_ref(), half_base + *cursor, id, &seg_refs)?;
         *cursor += consumed;
-        let elem_base = slot as u64 * pool.spec.elems_per_slot;
-        // The seam's slot cap guarantees this (see `DensePoolSpec::elems_per_slot`); a violation
-        // here means coherent-but-wrong u32 wraparound in the kernel, so assert loudly.
-        debug_assert!(
-            elem_base + pool.spec.elems_per_slot <= u32::MAX as u64,
-            "dense pager: slot element base overflows the kernels' u32 element reach"
-        );
-        Ok(Some(elem_base as usize))
-    }
-
-    /// The arena buffer `buf_id`'s pool dispatches against (callers gate on [`Self::is_streamed`]
-    /// first — errors on an unregistered buffer).
-    pub fn arena(&self, buf_id: usize) -> Result<&dyn Buffer> {
-        let (pool, _) = self
-            .sources
-            .get(&buf_id)
-            .ok_or_else(|| be("dense pager: arena lookup on an unregistered buffer"))?;
-        Ok(self.pools[*pool].pager.arena_buffer())
+        // Slot base BYTE address = arena base + slot * slot_bytes, in 64-bit (the BDA arena's
+        // `arena_addr()`; the streamed kernel dereferences this pointer). No cap: the multiply and
+        // the address are 64-bit, so an arena of any size the VRAM budget allows is addressable.
+        let addr = pool.pager.arena_addr() + slot as u64 * pool.spec.slot_bytes as u64;
+        Ok(Some(addr))
     }
 
     pub fn ring_half_bytes(&self) -> usize {

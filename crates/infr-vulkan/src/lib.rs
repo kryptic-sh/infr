@@ -1057,6 +1057,14 @@ impl VulkanBackend {
         // `shaderIntegerDotProduct` one fixed below — detected via caps but never chained into
         // `device_ci`, so vkCreateShaderModule for those kernels violated the VUID under validation.
         let has_int16 = feat2.features.shader_int16 != 0;
+        // Same 08740 class as `shaderInt16` above, for 64-bit integer arithmetic: the BDA arena
+        // helper `native_arena_ref.glsl` (paged-MoE `-DPAGED` builds AND dense-streaming
+        // `-DSTREAMED` builds) composes a 64-bit slot address from lo/hi u32 halves
+        // (`uint64_t(hi) << 32 | uint64_t(lo)`, `GL_EXT_shader_explicit_arithmetic_types_int64`),
+        // which emits SPIR-V's `Int64` capability — so `shaderInt64` MUST be enabled on the device
+        // or vkCreateShaderModule for those kernels violates the VUID under validation. Core 1.0
+        // feature; RADV/desktop support it universally, probed here for portability devices.
+        let has_int64 = feat2.features.shader_int64 != 0;
         // Read AFTER the `feat2.features` access above: `feat2` holds a mutable borrow of every
         // pushed feature struct (incl. `bda_feat`) until its last use, so the pushed structs can
         // only be read once `feat2` itself is done being touched.
@@ -1372,7 +1380,9 @@ impl VulkanBackend {
         // exclusive per the spec; this device_ci never chains `PhysicalDeviceFeatures2` itself, only
         // extension-specific feature structs, so `enabled_features` is the correct, conflict-free
         // slot for it).
-        let core_features = vk::PhysicalDeviceFeatures::default().shader_int16(has_int16);
+        let core_features = vk::PhysicalDeviceFeatures::default()
+            .shader_int16(has_int16)
+            .shader_int64(has_int64);
         let mut device_ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&queue_ci))
             .enabled_extension_names(&ext_ptrs)

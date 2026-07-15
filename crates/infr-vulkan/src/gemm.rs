@@ -145,6 +145,58 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
     })
 }
 
+/// `-DSTREAMED` twin of the non-residual [`native_build_spv`] (kernel-cache name + SPIR-V): the
+/// dense layer-streaming GEMV reads the weight from a `bufferDeviceAddress` arena pool by 64-bit
+/// address (native_arena_ref.glsl) instead of a bound SSBO, lifting the ~4 GiB
+/// `maxStorageBufferRange` cap. All streamed dense Linears (any m) route through this one kernel's
+/// rows loop — see [`crate::recorder::Recorder::linear_native_streamed`] and
+/// [`crate::pager::DensePagerSession`]. `None` for a dtype without a native GEMV build.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_streamed_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match dtype {
+        Q8_0 => v!("native_q8_0_streamed"),
+        Bf16 => v!("native_bf16_streamed"),
+        Q4_0 => v!("native_q4_0_streamed"),
+        Q4_1 => v!("native_q4_1_streamed"),
+        Q5_0 => v!("native_q5_0_streamed"),
+        Q5_1 => v!("native_q5_1_streamed"),
+        Q2K => v!("native_q2k_streamed"),
+        Q3K => v!("native_q3k_streamed"),
+        Q4K => v!("native_q4k_streamed"),
+        Q5K => v!("native_q5k_streamed"),
+        Q6K => v!("native_q6k_streamed"),
+        Iq4Nl => v!("native_iq4nl_streamed"),
+        Iq4Xs => v!("native_iq4xs_streamed"),
+        Mxfp4 => v!("native_mxfp4_streamed"),
+        Nvfp4 => v!("native_nvfp4_streamed"),
+        Tq1_0 => v!("native_tq1_0_streamed"),
+        Tq2_0 => v!("native_tq2_0_streamed"),
+        Q2_0 => v!("native_q2_0_streamed"),
+        Iq2Xxs => v!("native_iq2xxs_streamed"),
+        Iq2Xs => v!("native_iq2xs_streamed"),
+        Iq2S => v!("native_iq2s_streamed"),
+        Iq3Xxs => v!("native_iq3xxs_streamed"),
+        Iq3S => v!("native_iq3s_streamed"),
+        Iq1S => v!("native_iq1s_streamed"),
+        Iq1M => v!("native_iq1m_streamed"),
+        _ => None,
+    }
+}
+
 /// SPIR-V + kernel-cache name for the multi-output-row decode GEMV (`RM` rows/workgroup, bit-
 /// identical per row to the RM=1 native GEMV). Only the K-quant formats that dominate decode
 /// (Q4_K/Q6_K) have RM builds; everything else stays on the RM=1 path. `rm` is 2 or 4.

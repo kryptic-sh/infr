@@ -2059,6 +2059,60 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Dense layer-streaming GEMV (`native_gemv.comp -DSTREAMED`): `y = x·Wᵀ` where the weight
+    /// lives in a `bufferDeviceAddress` arena pool (see [`crate::pager::DensePagerSession`])
+    /// addressed by `arena_addr` — the resident slot's base BYTE address — NOT a bound SSBO. This
+    /// lifts the ~4 GiB `maxStorageBufferRange` cap the resident/SSBO GEMV binding has. `w_base` is
+    /// the op's own WITHIN-slot element offset (a fused-QKV slice, usually 0), added to the
+    /// per-output index exactly as the resident path does. All streamed dense Linears (any m) route
+    /// here — the rows loop handles m>1 (re-streaming the weight per row: correct, and streaming is
+    /// already a memory-bound fallback where kernel micro-optimization is dominated by PCIe/residency
+    /// cost).
+    ///
+    /// The arena is read purely by the `arena_addr` push constant — it is NEVER bound as a
+    /// descriptor (a WHOLE_SIZE binding of a multi-GiB arena would re-impose `maxStorageBufferRange`
+    /// and trip a descriptor-range VUID, exactly what pins the SSBO path at ~4 GiB). Binding 0 (the
+    /// resident build's weight SSBO) takes a small read-only FILLER (`x`) so the descriptor set
+    /// stays fully written — same convention as the MoE `-DPAGED` dispatch, which fills binding 0
+    /// with `lut`, not the giant arena (see [`Self::linear_native_id_paged`]). The ring→arena copy
+    /// vs pointer-read hazard is ordered explicitly by [`Self::arena_stream_barrier`] at the staging
+    /// site (the pointer read is invisible to the buffer hazard tracker).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("gemv_streamed", rows, in_f, out_f);
+        let (name, spv) =
+            crate::gemm::native_streamed_build_spv(dtype).expect("native streamed GEMV spv");
+        let k = self.be.kernel(name, spv, 3, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        // Arena base BYTE address (lo/hi split — a uvec2 avoids the 8-byte push alignment a
+        // uint64_t member forces; see native_arena_ref.glsl). `w_base` rides on top unchanged.
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        // Binding 0 = `x` (small filler, unread by the STREAMED shader); 1 = x; 2 = y (the sole
+        // write, kept LAST so `dispatch_wide`'s tail-n_out split marks it the write).
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
     /// Multi-row native GEMV (`2 <= rows <= 8`): the GEMV's out_f-wide cooperative-over-K grid,
     /// each workgroup decoding a weight sub-block ONCE and dotting it against every row — the
     /// spec-decode verify / short-suffix-prefill shape, where the single-M-tile coopmat GEMM
@@ -5070,6 +5124,42 @@ impl<'a> Recorder<'a> {
                 self.cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[mb],
+                &[],
+                &[],
+            );
+        }
+        *self.barriers.borrow_mut() += 1;
+    }
+
+    /// Full COMPUTE↔TRANSFER memory+execution barrier for the dense-streaming BDA arena. The
+    /// streamed GEMV reads the arena by 64-bit pointer (native_arena_ref.glsl), so the buffer-based
+    /// hazard tracker (`sync`) never sees the read — the ordering MUST be recorded explicitly around
+    /// the ring→arena staging copies, the way the paged MoE flow orders its own pointer-read arena.
+    /// Bracketing each miss's copy with this barrier gives both directions in one primitive:
+    ///   • RAW — the ring→arena copy (`TRANSFER_WRITE`) is visible to the reading dispatch
+    ///     (`SHADER_READ`) [`TRANSFER`→`COMPUTE_SHADER`];
+    ///   • WAR — a prior dispatch's arena read (`SHADER_READ`) completes before a later copy
+    ///     overwrites that slot (`TRANSFER_WRITE`) [`COMPUTE_SHADER`→`TRANSFER`].
+    /// Streaming is PCIe/residency-bound, so the extra barrier per staged block is noise.
+    pub fn arena_stream_barrier(&self) {
+        let mb = vk::MemoryBarrier::default()
+            .src_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            )
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            );
+        unsafe {
+            self.be.shared.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[mb],
                 &[],

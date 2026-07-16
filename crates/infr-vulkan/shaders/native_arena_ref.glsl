@@ -22,4 +22,18 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Are
 uint64_t nw_ptr = 0ul; // this expert's arena base byte address (set once in main from the LUT slot)
 
 uint64_t arena_base(uint lo, uint hi) { return (uint64_t(hi) << 32) | uint64_t(lo); }
-uint arena_word(uint wi) { return ArenaWords(nw_ptr).v[wi]; }
+// Word read, shaped for the GLOBAL_LOAD saddr form: the byte offset is computed fully in 32-bit
+// and added to the (wave-uniform) base pointer BEFORE the cast, and the deref index is the
+// constant 0 — NIR then sees `iadd(uniform64, u2u64(divergent32))`, which ACO selects as a
+// scalar-base global_load (64-bit base in SGPRs, one 32-bit VGPR offset). The former
+// `ArenaWords(nw_ptr).v[wi]` promoted the index to 64-bit inside the deref, defeating saddr:
+// every load materialized its own 64-bit VGPR address via a v_add_co/v_add_co_ci pair (measured
+// ~1.5 carry-adds per load on the Q6K streamed warp GEMM — the 2.2x flag-on regression vs the
+// descriptor-bound twin, which gets base+offset addressing for free from the SGPR descriptor).
+// `nw_ptr` is wave-uniform by construction (push constants, or a LUT slot picked by workgroup id)
+// but it lives in a mutable global, which NIR's divergence analysis treats as divergent — that
+// alone blocks saddr selection. subgroupBroadcastFirst is the standard uniformity hint; ACO CSEs
+// the readfirstlane across all inlined calls.
+uint arena_word(uint wi) {
+    return ArenaWords(nw_ptr + uint64_t(wi << 2u)).v[0];
+}

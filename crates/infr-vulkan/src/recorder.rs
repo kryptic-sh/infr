@@ -3084,6 +3084,43 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `-DSTREAMED` twin of [`Self::embed_gather`] (slice A5 build-variant: see
+    /// `crate::gemm::embed_gather_streamed_build_spv`). The token-embedding table is read from a
+    /// resident `bufferDeviceAddress` arena instead of a bound SSBO — binding 0 (the resident
+    /// build's weight SSBO) takes a harmless FILLER (`ids`) since the arena is never bound as a
+    /// descriptor. Not wired into any production dispatch yet; exists so a parity test can
+    /// exercise the `_streamed` SPV directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn embed_gather_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        ids: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: usize,
+        ne: usize,
+        scale: f32,
+    ) {
+        let (name, spv) =
+            crate::gemm::embed_gather_streamed_build_spv(dtype).expect("embed_gather streamed spv");
+        let k = self.be.kernel(name, spv, 3, 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&scale.to_ne_bytes());
+        // Arena base BYTE address (lo/hi split — a uvec2 avoids the 8-byte push alignment a
+        // uint64_t member forces; see native_arena_ref.glsl), appended LAST.
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(ids), Self::vkb(ids), Self::vkb(dst)],
+            1,
+            &push,
+            rows as u32,
+        );
+    }
+
     /// Int8 dp4a decode GEMV (m=1): `y = x·Wᵀ` with `x` pre-quantized via [`Self::quant_q8`]
     /// (qa/dact/sact). NUM_ROWS=2 — one workgroup per 2 consecutive outputs (`ceil(out_f/2)`
     /// grid), the activation block read once for both. `w_base` = element offset (fused-QKV

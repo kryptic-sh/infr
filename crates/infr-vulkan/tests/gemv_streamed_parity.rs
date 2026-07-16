@@ -1117,3 +1117,117 @@ fn fma_gemm_streamed_matches_resident() {
         println!("ok: {}", trimmed.name);
     }
 }
+
+// ─── token-embedding gather family — slice A5 ──────────────────────────────────────────────────
+// Op::EmbedGather's signature (table + ids -> dst, gathering NON-CONTIGUOUS rows rather than
+// computing a dot product) doesn't fit run_case's weight/x/y shape, so this is a bespoke runner —
+// same resident-vs-streamed-at-two-offsets double-leg shape as run_case, mirroring the id-family
+// tests' bespoke style above. Ids are non-trivial (out of order, includes row 0 AND a high row
+// index) so a broken row-stride multiply can't pass by accident the way an all-zero id would.
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn embed_gather_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (n_table_rows, ne, rows) = (16usize, 256usize, 4usize);
+    let scale = 0.5f32;
+    let ids: [i32; 4] = [3, 0, 7, 12];
+    let ids_buf = be.alloc(rows * 4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+        .unwrap();
+
+    for dtype in [DType::Q4K, DType::Q6K, DType::Q8_0, DType::F16] {
+        let w_bytes = weight_bytes_for(dtype, n_table_rows * ne);
+        let table = synth_weight_bytes(w_bytes, ne * 13 + n_table_rows);
+        let y_buf = be.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+
+        // ── Resident: table in its own bound SSBO ─────────────────────────────────────────────
+        let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+        be.upload(w_buf.as_ref(), &table).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.embed_gather(
+            dtype,
+            w_buf.as_ref(),
+            ids_buf.as_ref(),
+            y_buf.as_ref(),
+            rows,
+            ne,
+            scale,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; rows * ne * 4];
+        be.download(y_buf.as_ref(), &mut out).unwrap();
+        let resident = bits(&out);
+        assert!(
+            resident.iter().any(|&b| b != 0),
+            "embed_gather dtype={dtype:?}: resident output is all zeros — the case is not \
+             exercising the kernel"
+        );
+
+        // ── Streamed leg 1: arena offset 0 ────────────────────────────────────────────────────
+        let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+        be.upload(arena0.as_ref(), &table).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.embed_gather_streamed(
+            dtype,
+            addr0,
+            ids_buf.as_ref(),
+            y_buf.as_ref(),
+            rows,
+            ne,
+            scale,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; rows * ne * 4];
+        be.download(y_buf.as_ref(), &mut out).unwrap();
+        let streamed_at0 = bits(&out);
+        for (i, (&r, &s)) in resident.iter().zip(streamed_at0.iter()).enumerate() {
+            assert_eq!(
+                r,
+                s,
+                "embed_gather dtype={dtype:?}: streamed@0 differs from resident at out {i}: {} \
+                 vs {} (bits {r:#010x} vs {s:#010x})",
+                f32::from_bits(r),
+                f32::from_bits(s)
+            );
+        }
+
+        // ── Streamed leg 2: the SAME table parked at a non-zero offset in a bigger arena ──────
+        // Mirrors the resident-BDA layout (one arena, many tensors); the prefix is filled with
+        // DIFFERENT bytes so a twin that ignores the offset reads visibly wrong data.
+        let off = nonzero_off(dtype);
+        let mut backing = synth_weight_bytes(off, 0xBAD);
+        backing.extend_from_slice(&table);
+        let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+        be.upload(arena1.as_ref(), &backing).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.embed_gather_streamed(
+            dtype,
+            addr1 + off as u64,
+            ids_buf.as_ref(),
+            y_buf.as_ref(),
+            rows,
+            ne,
+            scale,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; rows * ne * 4];
+        be.download(y_buf.as_ref(), &mut out).unwrap();
+        let streamed_atoff = bits(&out);
+        for (i, (&r, &s)) in resident.iter().zip(streamed_atoff.iter()).enumerate() {
+            assert_eq!(
+                r,
+                s,
+                "embed_gather dtype={dtype:?}: streamed@nonzero-offset differs from resident at \
+                 out {i}: {} vs {} — the twin is ignoring its arena base offset, which breaks \
+                 every tensor but the first in a shared arena",
+                f32::from_bits(r),
+                f32::from_bits(s)
+            );
+        }
+        println!("ok: embed_gather dtype={dtype:?}");
+    }
+}

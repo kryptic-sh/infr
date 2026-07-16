@@ -2659,6 +2659,9 @@ fn main() {
             "native_gemv_mrow" | "native_gemv_sg" | "native_gemv_rm" | "native_gemv_rm_v2" => {
                 no_res
             }
+            // Token-embedding gather (Op::EmbedGather): reads the GGUF table via the shared NW()
+            // chokepoint, same as native_gemv. Every format variant gets a twin.
+            "embed_gather" => true,
             // The int8 dp4a GEMV family. Same additive/non-residual reasoning as the dequant GEMVs
             // above; these carry their own decode (not native_decode.glsl's), so each declares the
             // `NW(i)` chokepoint locally — see native_mmv.comp.

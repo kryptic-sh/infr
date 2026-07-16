@@ -5,10 +5,29 @@
 // selects the format). `ids` is the i32 token-id input — the host uploads 4 bytes per token
 // instead of a dequantized f32 embedding row.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// -DSTREAMED (resident-BDA): the token-embedding table is read from the arena pool by 64-bit device
+// address instead of a bound SSBO — same convention as native_gemv.comp's STREAMED arm. `ids`
+// selects the row within THIS table (no per-expert stride to repurpose, unlike native_gemv_id's
+// stacked-expert form), so `arena_lo`/`arena_hi` alone carry the table's arena base BYTE address
+// (see native_arena_ref.glsl), appended LAST so the non-STREAMED layout above is untouched. The
+// default (non-STREAMED) build stays byte-identical to before this arm existed.
+#ifdef STREAMED
+layout(push_constant) uniform PC {
+    uint rows; uint ne; float scale; uint arena_lo; uint arena_hi;
+} pc;
+#else
 layout(push_constant) uniform PC { uint rows; uint ne; float scale; } pc;
+#endif
+#ifndef STREAMED
 layout(binding = 0) readonly buffer WB { uint nw[]; };  // raw GGUF table bytes (padded u32)
+#endif
 layout(binding = 1) readonly buffer IB { int ids[]; };
 layout(binding = 2) writeonly buffer YB { float y_buf[]; };
+
+#ifdef STREAMED
+#include "native_arena_ref.glsl"
+#define NW(i) arena_word(i)
+#endif
 
 #include "native_decode.glsl"
 
@@ -16,6 +35,9 @@ void main() {
     uint row = gl_WorkGroupID.x;
     if (row >= pc.rows) { return; }
     uint t = gl_LocalInvocationID.x;
+#ifdef STREAMED
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident table base byte address; NO slot multiply
+#endif
     uint base = uint(ids[row]) * pc.ne; // table element offset of this token's row
     uint nsub = pc.ne / 32u;
     for (uint s = t; s < nsub; s += 64u) {

@@ -1807,6 +1807,45 @@ pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static
         _ => return None,
     })
 }
+/// `-DSTREAMED` twin of [`embed_gather_build_spv`] (kernel-cache name + SPIR-V) — the token-
+/// embedding table read from a `bufferDeviceAddress` arena instead of a bound SSBO, same
+/// convention as [`native_streamed_build_spv`]. Slice A5 build-variant only; parity-test entry,
+/// not dispatched in production.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn embed_gather_streamed_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match dtype {
+        Q8_0 => v!("embed_gather_q8_0_streamed"),
+        Bf16 => v!("embed_gather_bf16_streamed"),
+        F16 => v!("embed_gather_f16_streamed"),
+        Q4_0 => v!("embed_gather_q4_0_streamed"),
+        Q4_1 => v!("embed_gather_q4_1_streamed"),
+        Q5_0 => v!("embed_gather_q5_0_streamed"),
+        Q5_1 => v!("embed_gather_q5_1_streamed"),
+        Q2K => v!("embed_gather_q2k_streamed"),
+        Q3K => v!("embed_gather_q3k_streamed"),
+        Q4K => v!("embed_gather_q4k_streamed"),
+        Q5K => v!("embed_gather_q5k_streamed"),
+        Q6K => v!("embed_gather_q6k_streamed"),
+        Iq4Nl => v!("embed_gather_iq4nl_streamed"),
+        Iq4Xs => v!("embed_gather_iq4xs_streamed"),
+        Q2_0 => v!("embed_gather_q2_0_streamed"),
+        _ => None,
+    }
+}
 /// Kernel-cache name for the embedding-row gather.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn embed_gather_kernel_name(dtype: infr_core::DType) -> &'static str {

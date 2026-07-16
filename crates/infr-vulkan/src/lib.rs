@@ -1988,6 +1988,10 @@ impl VulkanBackend {
                 && !self.shared.caps.unified_memory
                 && !self.moe_paged()
                 && !self.dense_paged()
+                // Resident-BDA routes every Weights alloc into its own arena (`bda_weight_alloc`)
+                // — pre-reserving the SSBO arena too would commit the model's footprint TWICE and
+                // trip the VRAM guard mid-load (caught live on Qwen3-30B-A3B).
+                && !resident_bda_enabled()
             {
                 if let Err(e) = self.reserve_weights(total) {
                     eprintln!(
@@ -2380,7 +2384,12 @@ impl VulkanBackend {
         let mut guard = self.bda_weight_arena.lock().unwrap();
         let arena = guard.get_or_insert_with(BdaWeightArena::default);
 
-        if let Some(b) = arena.blocks.last_mut() {
+        // First-fit over ALL open blocks, not just the last: a big tensor opens an exact-size
+        // (fully consumed) block, so last-block-only would strand every earlier block's tail and
+        // open a fresh `BDA_BLOCK_MIN` block for EACH tiny tensor that follows a big one — ~64 MiB
+        // stranded per norm gamma, GiBs across a model's layers (caught live: Qwen3-30B-A3B
+        // tripped the VRAM guard flag-on while fitting comfortably flag-off).
+        for b in arena.blocks.iter_mut() {
             let off = b.cursor.div_ceil(BDA_WEIGHT_ALIGN) * BDA_WEIGHT_ALIGN;
             if off + want <= b.size {
                 b.cursor = off + want;

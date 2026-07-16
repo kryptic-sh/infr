@@ -241,6 +241,21 @@ fn native_id_sg_choice(dtype: infr_core::DType, in_f: usize, out_f: usize) -> Op
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
+/// Converts an element-space per-expert stride to the per-expert BYTE stride the STREAMED
+/// (resident-BDA arena) id-indexed/expert-grid kernels apply on the 64-bit pointer (`nw_ptr +=
+/// uint64_t(ex) * uint64_t(pc.m)` / `arena + uint64_t(ids[slot]) * uint64_t(stride)`) — see
+/// `native_gemv_id.comp`'s and the `native_gemm_mmq_*.comp` family's `#elif defined(STREAMED)`
+/// docs. `stride` is always a whole number of the dtype's GGUF blocks (weight strides never split
+/// a block), so `stride_bytes = stride / block_elems * block_bytes` is exact.
+fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
+    let (block_elems, block_bytes) = infr_gguf::block_layout(dtype);
+    debug_assert!(
+        stride.is_multiple_of(block_elems),
+        "expert stride {stride} is not a whole number of {dtype:?} blocks ({block_elems} elems/block)"
+    );
+    ((stride / block_elems) * block_bytes) as u32
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
@@ -6968,6 +6983,12 @@ impl<'a> Recorder<'a> {
         n_expert: usize,
         n_used: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.matmul_mmq_experts_streamed(
+                dtype, stage, qa, dact, sact, arena_addr, w_base, stride, counts, offsets, c, rows,
+                k, n, n_expert, n_used,
+            );
+        }
         // NB: the profiler label is the CALLER'S stage (gate_up vs down), not the kernel name —
         // the same `native_gemm_mmq_*_xp` kernel serves both roles, so the auto kernel-name
         // label would merge them (and inferring the stage from dtype mislabeled DG's down-proj
@@ -7213,6 +7234,269 @@ impl<'a> Recorder<'a> {
         }
         bufs.extend_from_slice(&[
             Self::vkb(w),
+            Self::vkb(counts),
+            Self::vkb(offsets),
+            Self::vkb(c),
+        ]);
+        self.dispatch3(kern, &bufs, 1, &push, gx, n_expert as u32, 1);
+    }
+
+    /// `-DSTREAMED` twin of [`Self::matmul_mmq_experts`]: the stacked expert bank lives at
+    /// `arena_addr` in a resident BDA arena instead of a bound SSBO. Mirrors the resident arm's
+    /// EXACT tile-choice logic (`small_tile`/`wide_bn`/`bm`/`bn` and the dtype match) one-for-one,
+    /// swapped to the `_streamed` SPV getters — kept as a literal parallel match (not a shared
+    /// table) so the resident arm's tile selection stays untouched and diff-reviewable against this
+    /// one. `pc.m` is REPURPOSED under `-DSTREAMED` as the per-expert BYTE stride applied on the
+    /// pointer (`nw_ptr += uint64_t(ex) * uint64_t(pc.m)`, see the shaders' `#elif
+    /// defined(STREAMED)` EXPERT_GRID arm) — [`expert_stride_bytes`] converts the caller's
+    /// element-space `stride` using the dtype's GGUF block layout. `w_base` passes through
+    /// unchanged (the small within-bank element offset the shader still adds). Binding layout is
+    /// IDENTICAL to the resident arm's — the vacated weight-SSBO slot takes a small FILLER (`qa`,
+    /// same convention as [`Self::matmul_mmq_streamed`]) so binding count/order never drifts
+    /// between the two builds. Push layout matches the shaders' STREAMED PC struct: `m(=stride
+    /// bytes), n, k, w_base, arena_lo, arena_hi`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq_experts_streamed(
+        &self,
+        dtype: infr_core::DType,
+        stage: &'static str,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: Option<&dyn Buffer>,
+        arena_addr: u64,
+        w_base: usize,
+        stride: usize,
+        counts: &dyn Buffer,
+        offsets: &dyn Buffer,
+        c: &dyn Buffer,
+        rows: usize,
+        k: usize,
+        n: usize,
+        n_expert: usize,
+        n_used: usize,
+    ) {
+        self.label_next(stage);
+        let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
+        let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
+        let wide_bn = n.is_multiple_of(128)
+            && (small_tile || k <= MOE_EXPERT_WIDE_BN_MAX_K)
+            && matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K);
+        let bm: usize = if small_tile { 32 } else { 64 };
+        let bn: usize = if wide_bn { 128 } else { 64 };
+        let (name, spv, nb): (_, _, usize) = match (dtype, small_tile) {
+            (infr_core::DType::Q4K, false) if wide_bn => (
+                "native_gemm_mmq_q4k_xp128_streamed",
+                crate::gemm::native_gemm_mmq_q4k_xp128_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Q4K, false) => (
+                "native_gemm_mmq_q4k_xp_streamed",
+                crate::gemm::native_gemm_mmq_q4k_xp_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Q4K, true) if wide_bn => (
+                "native_gemm_mmq_q4k_xp32w_streamed",
+                crate::gemm::native_gemm_mmq_q4k_xp32w_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Q4K, true) => (
+                "native_gemm_mmq_q4k_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q4k_xp32_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Q6K, false) if wide_bn => (
+                "native_gemm_mmq_q6k_xp128_streamed",
+                crate::gemm::native_gemm_mmq_q6k_xp128_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q6K, false) => (
+                "native_gemm_mmq_q6k_xp_streamed",
+                crate::gemm::native_gemm_mmq_q6k_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q6K, true) if wide_bn => (
+                "native_gemm_mmq_q6k_xp32w_streamed",
+                crate::gemm::native_gemm_mmq_q6k_xp32w_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q6K, true) => (
+                "native_gemm_mmq_q6k_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q6k_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q8_0, false) => (
+                "native_gemm_mmq_q8_0_xp_streamed",
+                crate::gemm::native_gemm_mmq_q8_0_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q8_0, true) => (
+                "native_gemm_mmq_q8_0_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q8_0_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q5_0, false) => (
+                "native_gemm_mmq_q5_0_xp_streamed",
+                crate::gemm::native_gemm_mmq_q5_0_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q5_0, true) => (
+                "native_gemm_mmq_q5_0_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q5_0_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q5K, false) => (
+                "native_gemm_mmq_q5k_xp_streamed",
+                crate::gemm::native_gemm_mmq_q5k_xp_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Q5K, true) => (
+                "native_gemm_mmq_q5k_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q5k_xp32_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Q5_1, false) => (
+                "native_gemm_mmq_q5_1_xp_streamed",
+                crate::gemm::native_gemm_mmq_q5_1_xp_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Q5_1, true) => (
+                "native_gemm_mmq_q5_1_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q5_1_xp32_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Q2K, false) => (
+                "native_gemm_mmq_q2_k_xp_streamed",
+                crate::gemm::native_gemm_mmq_q2_k_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q2K, true) => (
+                "native_gemm_mmq_q2_k_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q2_k_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q3K, false) => (
+                "native_gemm_mmq_q3_k_xp_streamed",
+                crate::gemm::native_gemm_mmq_q3_k_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q3K, true) => (
+                "native_gemm_mmq_q3_k_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q3_k_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q4_0, false) => (
+                "native_gemm_mmq_q4_0_xp_streamed",
+                crate::gemm::native_gemm_mmq_q4_0_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q4_0, true) => (
+                "native_gemm_mmq_q4_0_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q4_0_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q4_1, false) => (
+                "native_gemm_mmq_q4_1_xp_streamed",
+                crate::gemm::native_gemm_mmq_q4_1_xp_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Q4_1, true) => (
+                "native_gemm_mmq_q4_1_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q4_1_xp32_streamed_spv(),
+                7,
+            ),
+            (infr_core::DType::Iq4Nl, false) => (
+                "native_gemm_mmq_iq4_nl_xp_streamed",
+                crate::gemm::native_gemm_mmq_iq4_nl_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Iq4Nl, true) => (
+                "native_gemm_mmq_iq4_nl_xp32_streamed",
+                crate::gemm::native_gemm_mmq_iq4_nl_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Iq4Xs, false) => (
+                "native_gemm_mmq_iq4_xs_xp_streamed",
+                crate::gemm::native_gemm_mmq_iq4_xs_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Iq4Xs, true) => (
+                "native_gemm_mmq_iq4_xs_xp32_streamed",
+                crate::gemm::native_gemm_mmq_iq4_xs_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Iq2S, false) => (
+                "native_gemm_mmq_iq2_s_xp_streamed",
+                crate::gemm::native_gemm_mmq_iq2_s_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Iq2S, true) => (
+                "native_gemm_mmq_iq2_s_xp32_streamed",
+                crate::gemm::native_gemm_mmq_iq2_s_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Iq3S, false) => (
+                "native_gemm_mmq_iq3_s_xp_streamed",
+                crate::gemm::native_gemm_mmq_iq3_s_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Iq3S, true) => (
+                "native_gemm_mmq_iq3_s_xp32_streamed",
+                crate::gemm::native_gemm_mmq_iq3_s_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Mxfp4, false) => (
+                "native_gemm_mmq_mxfp4_xp_streamed",
+                crate::gemm::native_gemm_mmq_mxfp4_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Mxfp4, true) => (
+                "native_gemm_mmq_mxfp4_xp32_streamed",
+                crate::gemm::native_gemm_mmq_mxfp4_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Nvfp4, false) => (
+                "native_gemm_mmq_nvfp4_xp_streamed",
+                crate::gemm::native_gemm_mmq_nvfp4_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Nvfp4, true) => (
+                "native_gemm_mmq_nvfp4_xp32_streamed",
+                crate::gemm::native_gemm_mmq_nvfp4_xp32_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q2_0, false) => (
+                "native_gemm_mmq_q2_0_xp_streamed",
+                crate::gemm::native_gemm_mmq_q2_0_xp_streamed_spv(),
+                6,
+            ),
+            (infr_core::DType::Q2_0, true) => (
+                "native_gemm_mmq_q2_0_xp32_streamed",
+                crate::gemm::native_gemm_mmq_q2_0_xp32_streamed_spv(),
+                6,
+            ),
+            _ => unreachable!(
+                "batched MoE expert GEMM (streamed): the MOE_MMQ_DTYPES set only (Q4_0/Q4_1/Q4_K/\
+                 Q5_K/Q6_K/Q8_0/Q5_0/Q5_1/Q2_K/Q3_K/Q2_0/IQ4_NL/IQ4_XS/IQ2_S/IQ3_S/MXFP4/NVFP4)"
+            ),
+        };
+        let kern = self.be.kernel(name, spv, nb, 24);
+        let mut push = [0u8; 24];
+        let stride_bytes = expert_stride_bytes(dtype, stride);
+        push[0..4].copy_from_slice(&stride_bytes.to_ne_bytes()); // pc.m = per-expert BYTE stride
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let gx = (rows.div_ceil(bm) * (n / bn)) as u32;
+        let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
+        if let Some(sa) = sact {
+            bufs.push(Self::vkb(sa));
+        }
+        // The vacated weight-SSBO slot takes a small FILLER (`qa`) — same convention as
+        // `matmul_mmq_streamed`'s dense twin; the arena is read by device address, not this slot.
+        bufs.extend_from_slice(&[
+            Self::vkb(qa),
             Self::vkb(counts),
             Self::vkb(offsets),
             Self::vkb(c),
@@ -7535,6 +7819,21 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            let stride_bytes = expert_stride_bytes(dtype, stride);
+            return self.linear_native_id_streamed(
+                dtype,
+                arena_addr,
+                stride_bytes,
+                ids,
+                slot,
+                x,
+                y,
+                rows,
+                in_f,
+                out_f,
+            );
+        }
         self.label_gemv("gemv_id", rows, in_f, out_f);
         let name = crate::linear::native_id_kernel_name(dtype).expect("native id kernel");
         let spv = crate::gemm::native_id_build_spv(dtype).expect("native id spv");
@@ -7579,6 +7878,22 @@ impl<'a> Recorder<'a> {
         out_f: usize,
         rows: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            let stride_bytes = expert_stride_bytes(dtype, stride);
+            return self.linear_native_id_multi_streamed(
+                dtype,
+                arena_addr,
+                stride_bytes,
+                ids,
+                n_used,
+                x,
+                x_per_slot,
+                y,
+                in_f,
+                out_f,
+                rows,
+            );
+        }
         // `rows` (push[20..24]) is used by the shader ONLY to bound-check the flat workgroup index
         // against the padding workgroups a possibly-2-D dispatch grid can add (see
         // native_gemv_id_multi.comp/native_gemv_id_multi_sg.comp's main()) — the addressing math
@@ -7619,8 +7934,8 @@ impl<'a> Recorder<'a> {
     /// `arena_addr` in a resident BDA arena; `stride_bytes` is the per-expert BYTE stride the
     /// shader applies on the 64-bit pointer (`nw_ptr = arena + u64(ids[slot]) * u64(stride_bytes)`)
     /// — the u32 element-space `ids*stride` multiply this replaces wraps past 2^32 elements.
-    /// Binding 0 (the resident weight SSBO) takes a small FILLER (`x`). Not wired into any
-    /// production dispatch yet.
+    /// Binding 0 (the resident weight SSBO) takes a small FILLER (`x`). [`Self::linear_native_id`]
+    /// forks here when its weight buffer is arena-allocated (`w.device_addr()`).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_id_streamed(
         &self,
@@ -7660,7 +7975,8 @@ impl<'a> Recorder<'a> {
     /// `crate::gemm::native_idm_streamed_build_spv`). Same BYTE-stride-on-the-pointer convention
     /// as [`Self::linear_native_id_streamed`]. Mirrors the resident dispatcher's SG routing (m=1
     /// decode, Q6_K/Q5_K/IQ3_S projection band) so a parity test comparing the two at the same
-    /// shape lands on the same kernel. Not wired into any production dispatch yet.
+    /// shape lands on the same kernel. [`Self::linear_native_id_multi`] forks here when its weight
+    /// buffer is arena-allocated (`w.device_addr()`).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_id_multi_streamed(
         &self,
@@ -7865,6 +8181,21 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            let stride_bytes = expert_stride_bytes(infr_core::DType::Q4K, stride);
+            return self.linear_mmv_id_multi_q4k_streamed(
+                arena_addr,
+                stride_bytes,
+                qa,
+                dact,
+                sact,
+                ids,
+                n_used,
+                y,
+                in_f,
+                out_f,
+            );
+        }
         let k = self.be.kernel(
             "native_mmv_id_q4k",
             crate::gemm::native_mmv_id_q4k_spv(),
@@ -7894,8 +8225,9 @@ impl<'a> Recorder<'a> {
 
     /// `-DSTREAMED` twin of [`Self::linear_mmv_id_multi_q4k`] (slice A4 build-variant: see
     /// `crate::gemm::native_mmv_id_q4k_streamed_spv`). Same BYTE-stride-on-the-pointer convention
-    /// as [`Self::linear_native_id_streamed`]; binding 0 takes a small FILLER (`qa`). Not wired
-    /// into any production dispatch yet.
+    /// as [`Self::linear_native_id_streamed`]; binding 0 takes a small FILLER (`qa`).
+    /// [`Self::linear_mmv_id_multi_q4k`] forks here when its weight buffer is arena-allocated
+    /// (`w.device_addr()`).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_mmv_id_multi_q4k_streamed(
         &self,

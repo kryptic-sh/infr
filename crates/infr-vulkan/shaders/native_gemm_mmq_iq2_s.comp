@@ -61,9 +61,9 @@ layout(push_constant) uniform PC {
 #elif defined(STREAMED)
 // -DSTREAMED (resident-BDA): the stacked weight tensor lives in a resident BDA arena at the 64-bit
 // base passed as arena_lo/arena_hi — same rb() pointer read as PAGED but with NO LUT and NO slot
-// stride (the base already points at THIS tensor; pc.w_base keeps its element-offset meaning,
-// including the EXPERT_GRID per-expert stride multiply). Additive: non-STREAMED builds are
-// byte-identical.
+// stride (the base already points at THIS tensor). Under EXPERT_GRID, pc.m is the per-expert
+// BYTE stride applied on the pointer; pc.w_base keeps only the small within-bank element offset.
+// Additive: non-STREAMED builds are byte-identical.
 layout(push_constant) uniform PC {
     uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
 } pc;
@@ -133,6 +133,12 @@ void main() {
     nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
              + uint64_t(lut[pc.w_base + ex]) * uint64_t(pc.slot_bytes);
     uint wbase = 0u;
+#elif defined(STREAMED)
+    // Expert base scaled onto the 64-bit pointer — pc.m is REPURPOSED as the per-expert BYTE
+    // stride in this build (same convention as native_gemv_id.comp's STREAMED arm); pc.w_base
+    // keeps its small within-bank element offset. Kills the u32 `ex * stride` element multiply.
+    nw_ptr += uint64_t(ex) * uint64_t(pc.m);
+    uint wbase = pc.w_base;
 #else
     uint wbase = pc.w_base + ex * pc.m;
 #endif

@@ -21,9 +21,10 @@ tracing.workspace = true
 indicatif.workspace = true
 rayon.workspace = true
 libc.workspace = true
+# GGUF block layout (`block_layout`) — recorder.rs's resident-BDA streamed dispatch converts
+# element-space expert strides to the per-expert BYTE stride the STREAMED shaders' pointer
+# arithmetic needs; single source of truth with the GGUF loader instead of a second hand-kept table.
+infr-gguf.workspace = true
 
 [dev-dependencies]
 memmap2.workspace = true
-# host dequant reference for the MoE id-GEMV/mmq parity tests (synthetic quant banks vs
-# `infr_gguf::dequant::dequant_block`)
-infr-gguf.workspace = true

@@ -3408,6 +3408,355 @@ pub(crate) fn native_gemm_mmq_nvfp4_xpg32_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 
+// STREAMED (`-DSTREAMED`) twins of the expert-grid `_xp*` getters above — the
+// resident-BDA fork of `matmul_mmq_experts` (see recorder.rs) reads the stacked expert
+// bank from a `bufferDeviceAddress` arena instead of a bound SSBO; `pc.m` is repurposed as
+// the per-expert BYTE stride under this build (see the shaders' `#elif defined(STREAMED)`
+// EXPERT_GRID arm). PAGED builds never get a twin (STREAMED is the LUT-less resident form
+// of the same arena read) — same exclusion build.rs applies to the dense family.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4k_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q4k_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4k_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q4k_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4k_xp32w_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q4k_xp32w_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4k_xp128_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q4k_xp128_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q6k_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q6k_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q6k_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q6k_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q6k_xp32w_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q6k_xp32w_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q6k_xp128_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q6k_xp128_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q8_0_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q8_0_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q8_0_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q8_0_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q5_0_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q5_0_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q5_0_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q5_0_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q5k_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q5k_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q5k_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q5k_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q5_1_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q5_1_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q5_1_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q5_1_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q2_k_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q2_k_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q2_k_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q2_k_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q3_k_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q3_k_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q3_k_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q3_k_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_0_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q4_0_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_0_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q4_0_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q2_0_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q2_0_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q2_0_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q2_0_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq2_s_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq2_s_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq2_s_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq2_s_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq3_s_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq3_s_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq3_s_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq3_s_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_1_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q4_1_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_q4_1_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_q4_1_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_nl_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq4_nl_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_nl_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq4_nl_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_xs_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq4_xs_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_iq4_xs_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_iq4_xs_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_mxfp4_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_mxfp4_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_mxfp4_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_mxfp4_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_nvfp4_xp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_nvfp4_xp_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_nvfp4_xp32_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_mmq_nvfp4_xp32_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn quant_q8_gather_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quant_q8_gather.spv"));

@@ -2407,3 +2407,355 @@ fn resident_bda_bound_subrange_bind() {
     );
     println!("ok: resident-BDA sub-range descriptor bind (rmsnorm gamma at non-zero offset)");
 }
+
+// ─── resident-BDA routing proof — MoE expert-grid path (slice A6b-3) ──────────────────────────
+// Same intent as `resident_bda_linear_route_dispatches_streamed` above, extended to the MoE
+// expert-grid families: proves `linear_native_id_multi`/`linear_mmv_id_multi_q4k`/
+// `matmul_mmq_experts` fork to their `_streamed` twins when the weight is arena-allocated. Each
+// arena leg is placed at a NON-ZERO offset by allocating a garbage tensor first (same trick as
+// `resident_bda_bound_subrange_bind`) — id 0 / offset 0 would pass even if the byte-stride scaling
+// this campaign added were completely broken (see the id-family module doc above).
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn resident_bda_id_route_dispatches_streamed() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+
+    // out_f=2048 clears `native_id_sg_choice`'s default MINOUT band so Q6K's rows==1 leg actually
+    // takes the SG route (not just the tree kernel) — Q4K never qualifies for SG regardless of
+    // out_f, so it stays on the tree kernel at every row count tested here.
+    let (in_f, out_f, n_expert, n_used) = (256usize, 2048usize, 4usize, 3usize);
+
+    for dtype in [DType::Q4K, DType::Q6K] {
+        let bank = synth_bank(dtype, in_f, out_f, n_expert);
+
+        // Garbage tensor first: every `bda_weight_alloc_for_test` call after this in the test's
+        // arena block lands at a non-zero byte offset.
+        let garbage = be.bda_weight_alloc_for_test(4096).unwrap();
+        be.upload(garbage.as_ref(), &synth_weight_bytes(4096, 0xBAD))
+            .unwrap();
+        let w_bda = be.bda_weight_alloc_for_test(bank.bytes.len()).unwrap();
+        assert!(
+            w_bda.device_addr().is_some(),
+            "bda_weight_alloc_for_test must report Some(device_addr)"
+        );
+        be.upload(w_bda.as_ref(), &bank.bytes).unwrap();
+
+        let w_buf = be.alloc(bank.bytes.len(), BufferUsage::Weights).unwrap();
+        be.upload(w_buf.as_ref(), &bank.bytes).unwrap();
+
+        // ── linear_native_id_multi: rows=1 (Q6K → SG route, Q4K → tree) and rows=2 (tree, both) ──
+        for rows in [1usize, 2usize] {
+            // Permuted, distinct, non-zero ids per row (n_used of n_expert experts).
+            let ids: Vec<u32> = if rows == 1 {
+                vec![3, 1, 2]
+            } else {
+                vec![3, 1, 2, 2, 3, 1]
+            };
+            assert_eq!(ids.len(), rows * n_used);
+            let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+                .unwrap();
+            let x = synth_x(rows * in_f);
+            let x_buf = be.alloc(rows * in_f * 4, BufferUsage::Activations).unwrap();
+            be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+            let y_elems = rows * n_used * out_f;
+
+            let resident = {
+                let y_buf = be.alloc(y_elems * 4, BufferUsage::Activations).unwrap();
+                let rec = be.recorder().unwrap();
+                rec.linear_native_id_multi(
+                    dtype,
+                    w_buf.as_ref(),
+                    ids_buf.as_ref(),
+                    n_used,
+                    bank.stride_elems,
+                    x_buf.as_ref(),
+                    false,
+                    y_buf.as_ref(),
+                    in_f,
+                    out_f,
+                    rows,
+                );
+                rec.finish().unwrap();
+                let mut out = vec![0u8; y_elems * 4];
+                be.download(y_buf.as_ref(), &mut out).unwrap();
+                bits(&out)
+            };
+            assert!(
+                resident.iter().any(|&b| b != 0),
+                "linear_native_id_multi dtype={dtype:?} rows={rows}: resident output is all zeros"
+            );
+
+            let routed = {
+                let y_buf = be.alloc(y_elems * 4, BufferUsage::Activations).unwrap();
+                let rec = be.recorder().unwrap();
+                rec.linear_native_id_multi(
+                    dtype,
+                    w_bda.as_ref(),
+                    ids_buf.as_ref(),
+                    n_used,
+                    bank.stride_elems,
+                    x_buf.as_ref(),
+                    false,
+                    y_buf.as_ref(),
+                    in_f,
+                    out_f,
+                    rows,
+                );
+                rec.finish().unwrap();
+                let mut out = vec![0u8; y_elems * 4];
+                be.download(y_buf.as_ref(), &mut out).unwrap();
+                bits(&out)
+            };
+            assert_eq!(
+                resident, routed,
+                "linear_native_id_multi dtype={dtype:?} rows={rows}: resident-BDA route diverged \
+                 from the SSBO reference"
+            );
+            println!("ok: resident-BDA route linear_native_id_multi dtype={dtype:?} rows={rows}");
+        }
+
+        // ── linear_mmv_id_multi_q4k (Q4K only — the only dtype this kernel covers) ──────────────
+        if dtype == DType::Q4K {
+            let ids: [u32; 3] = [3, 1, 2];
+            let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+            be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+                .unwrap();
+            let q = quantize_x(&be, 1, in_f);
+            let y_elems = n_used * out_f;
+
+            let resident = {
+                let y_buf = be.alloc(y_elems * 4, BufferUsage::Activations).unwrap();
+                let rec = be.recorder().unwrap();
+                rec.linear_mmv_id_multi_q4k(
+                    w_buf.as_ref(),
+                    q.qa.as_ref(),
+                    q.dact.as_ref(),
+                    q.sact.as_ref(),
+                    ids_buf.as_ref(),
+                    n_used,
+                    bank.stride_elems,
+                    y_buf.as_ref(),
+                    in_f,
+                    out_f,
+                );
+                rec.finish().unwrap();
+                let mut out = vec![0u8; y_elems * 4];
+                be.download(y_buf.as_ref(), &mut out).unwrap();
+                bits(&out)
+            };
+            assert!(
+                resident.iter().any(|&b| b != 0),
+                "linear_mmv_id_multi_q4k: resident output is all zeros"
+            );
+
+            let routed = {
+                let y_buf = be.alloc(y_elems * 4, BufferUsage::Activations).unwrap();
+                let rec = be.recorder().unwrap();
+                rec.linear_mmv_id_multi_q4k(
+                    w_bda.as_ref(),
+                    q.qa.as_ref(),
+                    q.dact.as_ref(),
+                    q.sact.as_ref(),
+                    ids_buf.as_ref(),
+                    n_used,
+                    bank.stride_elems,
+                    y_buf.as_ref(),
+                    in_f,
+                    out_f,
+                );
+                rec.finish().unwrap();
+                let mut out = vec![0u8; y_elems * 4];
+                be.download(y_buf.as_ref(), &mut out).unwrap();
+                bits(&out)
+            };
+            assert_eq!(
+                resident, routed,
+                "linear_mmv_id_multi_q4k: resident-BDA route diverged from the SSBO reference"
+            );
+            println!("ok: resident-BDA route linear_mmv_id_multi_q4k dtype={dtype:?}");
+        }
+    }
+}
+
+/// One expert-grid tile-selection variant to exercise in
+/// `resident_bda_mmq_experts_route_dispatches_streamed`: `n` picks BN (64 vs the 128-wide twin)
+/// and `rows_param`/`n_used` (equal, so `avg_rows == rows_param` — see `matmul_mmq_experts`'s
+/// `avg_rows` calc) picks BM via the `small_tile` threshold (`MOE_EXPERT_SMALL_TILE_AVG_ROWS`).
+struct MmqVariant {
+    label: &'static str,
+    n: usize,
+    rows_param: usize,
+}
+
+// ─── resident-BDA routing proof — batched MoE expert GEMM (slice A6b-3) ───────────────────────
+// `matmul_mmq_experts`'s EXPERT_GRID tile selection picks one of four kernels
+// (`_xp`/`_xp32`/`_xp128`/`_xp32w`); all four get exercised below (n_expert=4, n_used=n_expert so
+// `avg_rows` reads directly as `rows_param`) to prove the resident→streamed fork holds across the
+// whole selection, not just the default tile. Only the REAL packed C rows are compared — rows past
+// the last expert's segment are never written by the EXPERT_GRID kernel (the per-row `rr >=
+// rowEnd` clip in the shader), so they hold whatever was in the two independently-allocated output
+// buffers before the dispatch, which is not guaranteed equal (an earlier slice hit exactly this).
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn resident_bda_mmq_experts_route_dispatches_streamed() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+
+    let k = 256usize;
+    let n_expert = 4usize;
+    // Bucket layout: 4 experts, a few packed rows each, contiguous (no gaps) — offsets[e] =
+    // running sum of counts[..e]. Real packed row count R = 10.
+    let counts: [u32; 4] = [3, 2, 4, 1];
+    let offsets: [u32; 4] = [0, 3, 5, 9];
+    let real_rows: usize = counts.iter().map(|&c| c as usize).sum();
+    // Generous padding past the last expert's segment for the EXPERT_GRID kernels' bounded
+    // overread (up to BM-1 rows past a segment end, discarded) — see `Op::MoeFfn`'s `npad` doc in
+    // adapter.rs for the production analogue.
+    let row_pad = real_rows + 128;
+
+    let counts_buf = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+    be.upload(counts_buf.as_ref(), bytemuck::cast_slice(&counts))
+        .unwrap();
+    let offsets_buf = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
+    be.upload(offsets_buf.as_ref(), bytemuck::cast_slice(&offsets))
+        .unwrap();
+    // Shared packed activations: k is the same for every dtype/variant below, so one quant pass
+    // covers all of them.
+    let q = quantize_x(&be, row_pad, k);
+
+    // `_xp`/`_xp32` (BN=64) and `_xp128`/`_xp32w` (BN=128) each need their own weight bank (the
+    // per-expert stride depends on n) — built once per `n` below and shared by the two `rows_param`
+    // legs (small_tile true/false) that reuse it.
+    let variants = [
+        MmqVariant {
+            label: "xp (default BM=64/BN=64)",
+            n: 64,
+            rows_param: 100,
+        },
+        MmqVariant {
+            label: "xp32 (small-tile BM=32/BN=64)",
+            n: 64,
+            rows_param: 8,
+        },
+        MmqVariant {
+            label: "xp128 (BM=64/BN=128 wide)",
+            n: 128,
+            rows_param: 100,
+        },
+        MmqVariant {
+            label: "xp32w (small-tile BM=32/BN=128 wide)",
+            n: 128,
+            rows_param: 8,
+        },
+    ];
+
+    for dtype in [DType::Q4K, DType::Q6K] {
+        let needs_sact = infr_core::tensor::moe_mmq_needs_sact(dtype);
+        let sact: Option<&Buf2> = needs_sact.then(|| q.sact.as_ref());
+
+        // One bank per distinct `n` used below (64 and 128), each uploaded to an ordinary SSBO and
+        // to a garbage-prefixed arena tensor.
+        let mut banks: std::collections::HashMap<usize, (Bank, Box<Buf>, Box<Buf>)> =
+            std::collections::HashMap::new();
+        for n in [64usize, 128usize] {
+            let bank = synth_bank(dtype, k, n, n_expert);
+            let w_buf = be.alloc(bank.bytes.len(), BufferUsage::Weights).unwrap();
+            be.upload(w_buf.as_ref(), &bank.bytes).unwrap();
+            // Garbage-first so this bank's arena tensor lands at a non-zero byte offset.
+            let garbage = be.bda_weight_alloc_for_test(4096).unwrap();
+            be.upload(garbage.as_ref(), &synth_weight_bytes(4096, 0xBAD))
+                .unwrap();
+            let w_bda = be.bda_weight_alloc_for_test(bank.bytes.len()).unwrap();
+            assert!(
+                w_bda.device_addr().is_some(),
+                "bda_weight_alloc_for_test must report Some(device_addr)"
+            );
+            be.upload(w_bda.as_ref(), &bank.bytes).unwrap();
+            banks.insert(n, (bank, w_buf, w_bda));
+        }
+
+        for v in &variants {
+            let (bank, w_buf, w_bda) = banks.get(&v.n).unwrap();
+            let real = real_rows * v.n;
+
+            let resident = {
+                let c_buf = be
+                    .alloc(row_pad * v.n * 4, BufferUsage::Activations)
+                    .unwrap();
+                let rec = be.recorder().unwrap();
+                rec.matmul_mmq_experts(
+                    dtype,
+                    "test_expert_gateup",
+                    q.qa.as_ref(),
+                    q.dact.as_ref(),
+                    sact,
+                    w_buf.as_ref(),
+                    0,
+                    bank.stride_elems,
+                    counts_buf.as_ref(),
+                    offsets_buf.as_ref(),
+                    c_buf.as_ref(),
+                    v.rows_param,
+                    k,
+                    v.n,
+                    n_expert,
+                    n_expert, // n_used == n_expert so avg_rows reads as rows_param directly
+                );
+                rec.finish().unwrap();
+                let mut out = vec![0u8; row_pad * v.n * 4];
+                be.download(c_buf.as_ref(), &mut out).unwrap();
+                bits(&out)[..real].to_vec()
+            };
+            assert!(
+                resident.iter().any(|&b| b != 0),
+                "matmul_mmq_experts dtype={dtype:?} variant={}: resident output is all zeros",
+                v.label
+            );
+
+            let routed = {
+                let c_buf = be
+                    .alloc(row_pad * v.n * 4, BufferUsage::Activations)
+                    .unwrap();
+                let rec = be.recorder().unwrap();
+                rec.matmul_mmq_experts(
+                    dtype,
+                    "test_expert_gateup",
+                    q.qa.as_ref(),
+                    q.dact.as_ref(),
+                    sact,
+                    w_bda.as_ref(),
+                    0,
+                    bank.stride_elems,
+                    counts_buf.as_ref(),
+                    offsets_buf.as_ref(),
+                    c_buf.as_ref(),
+                    v.rows_param,
+                    k,
+                    v.n,
+                    n_expert,
+                    n_expert,
+                );
+                rec.finish().unwrap();
+                let mut out = vec![0u8; row_pad * v.n * 4];
+                be.download(c_buf.as_ref(), &mut out).unwrap();
+                bits(&out)[..real].to_vec()
+            };
+            assert_eq!(
+                resident, routed,
+                "matmul_mmq_experts dtype={dtype:?} variant={}: resident-BDA route diverged from \
+                 the SSBO reference",
+                v.label
+            );
+            println!(
+                "ok: resident-BDA route matmul_mmq_experts dtype={dtype:?} variant={}",
+                v.label
+            );
+        }
+    }
+}

@@ -38,6 +38,24 @@ uint ru32u(uint bo) {
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 int sgn8(uint byte) { return int(byte) - int(byte >= 128u ? 256u : 0u); }
 
+// Load four consecutive u32s starting at BYTE offset `bo` (any alignment) as a uvec4 —
+// == uvec4(ru32u(bo), ru32u(bo+4), ru32u(bo+8), ru32u(bo+12)), bit-identical. The point is the
+// read shape under -DSTREAMED: the four aligned words come from ONE NW4 (fused global_load_b128,
+// saddr base — see native_arena_ref.glsl) instead of per-word scalar NW() loads the vectorizer
+// can't fuse (distinct arena_word pointers), which lowered a run of ru32u/rb() reads to many
+// unfused global_load_b32. A +N-misaligned block funnels in one neighbor word (the tail). Aligned
+// blocks (sh==0) skip the funnel entirely. Used by the odd-stride native dqblk formats (Q3_K,
+// Q4_0, Q5_0/1, IQ4_NL) to get the descriptor path's b128 vectorization on the arena path too;
+// word-aligned formats (Q2_K, Q4_K/Q5_K/Q6_K, IQ4_XS) call NW4 directly.
+uvec4 rw4(uint bo) {
+    uint wb = bo >> 2u; uint sh = (bo & 3u) << 3u;
+    uvec4 a = NW4(wb);
+    if (sh == 0u) { return a; }
+    uint t = NW(wb + 4u);
+    return uvec4((a.x >> sh) | (a.y << (32u - sh)), (a.y >> sh) | (a.z << (32u - sh)),
+                 (a.z >> sh) | (a.w << (32u - sh)), (a.w >> sh) | (t << (32u - sh)));
+}
+
 // USE_GRID builds stage their codebook tables into `shared` memory once per workgroup
 // (grid_init() in the generated native_grids.glsl — see build.rs's gen_grids for why const-array
 // indexing is a per-invocation-scratch catastrophe on RADV/ACO). Every includer runs `GRID_INIT;`
@@ -153,8 +171,13 @@ float dq(uint g) {
 void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 32u) * 18u;
     float d = f16tof32(ru16(bd));
+    // b128 the 16 qs bytes (4 words at bd+2) as one rw4 quad instead of 16 scalar rb() loads.
+    // Same bytes — bit-identical. Low nibbles -> v[0..16), high nibbles -> v[16..32).
+    uvec4 q = rw4(bd + 2u);
     for (uint w = 0u; w < 32u; w++) {
-        uint nib = (w < 16u) ? (rb(bd + 2u + w) & 0xFu) : (rb(bd + 2u + w - 16u) >> 4u);
+        uint jj = (w < 16u) ? w : (w - 16u);
+        uint byteq = (q[jj >> 2u] >> ((jj & 3u) * 8u)) & 0xFFu;
+        uint nib = (w < 16u) ? (byteq & 0xFu) : (byteq >> 4u);
         v[w] = d * (float(nib) - 8.0);
     }
 }
@@ -248,11 +271,14 @@ void dqblk(uint gstart, out float v[32]) {
     float dl1 = d * float(sb1 & 0xFu); float ml1 = dmin * float(sb1 >> 4u);
     uint shift = 2u * ((p0 % 128u) / 32u);
     uint qw = (bd + 16u + 32u * (p0 / 128u)) >> 2u; // 84-byte blocks are word-aligned; +16+32n too
+    // b128 the 8 quant words as two NW4 quads — the streamed arena path gets the descriptor path's
+    // buffer_load_b128 instead of 8 unfused scalar NW() loads. Same words — bit-identical.
+    uvec4 qA = NW4(qw); uvec4 qB = NW4(qw + 4u);
     for (uint w8 = 0u; w8 < 8u; w8++) {
         // Hoist the plane shift to a single packed op: one shift+mask isolates all four 2-bit
         // codes, then a per-element bitfieldExtract (1 op) replaces the >>8b >>shift &3 chain.
         // Same integers, same v[w] expression — bit-identical to the per-element form.
-        uint q4 = (NW(qw + w8) >> shift) & 0x03030303u;
+        uint q4 = (((w8 < 4u) ? qA[w8] : qB[w8 - 4u]) >> shift) & 0x03030303u;
         for (uint b = 0u; b < 4u; b++) {
             uint w = w8 * 4u + b;
             uint q2 = bitfieldExtract(q4, int(8u * b), 2);
@@ -292,8 +318,8 @@ float dq(uint g) {
 void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 256u) * 110u; uint p0 = gstart % 256u;
     float d_all = f16tof32(ru16(bd + 108u));
-    // ru32u (2 word loads + funnel) instead of ru32b (4 byte-extract chains) — same value.
-    uint a0 = ru32u(bd + 96u); uint a1 = ru32u(bd + 100u); uint a2 = ru32u(bd + 104u);
+    // rw4 (one NW4 b128 + funnel) instead of three scalar ru32u — same words, bit-identical.
+    uvec4 sc = rw4(bd + 96u); uint a0 = sc.x; uint a1 = sc.y; uint a2 = sc.z;
     uint k1 = 0x03030303u; uint k2 = 0x0f0f0f0fu; uint tmp = a2;
     uint aux[4];
     aux[2] = ((a0 >> 4u) & k2) | (((tmp >> 4u) & k1) << 4u);
@@ -310,6 +336,11 @@ void dqblk(uint gstart, out float v[32]) {
     uint shift = 2u * jj;
     uint jg = 4u * n + jj;
     uint qb = bd + 32u + 32u * n;
+    // b128 the 8 low-2-bit words and the 8 hmask words as two rw4 quads each (fused NW4 + funnel)
+    // instead of two per-word ru32u loads per element — the streamed arena path's big regressor.
+    // Same words as ru32u(qb+w8*4) / ru32u(bd+w8*4) — bit-identical.
+    uvec4 qL0 = rw4(qb); uvec4 qL1 = rw4(qb + 16u);
+    uvec4 hM0 = rw4(bd); uvec4 hM1 = rw4(bd + 16u);
     for (uint w8 = 0u; w8 < 8u; w8++) {
         // Packed plane extraction: one shift+mask isolates the four 2-bit codes, one
         // shift+mask+shl turns the four hmask bits into the packed +4 plane, one OR merges —
@@ -317,8 +348,10 @@ void dqblk(uint gstart, out float v[32]) {
         // bitfieldExtract. XOR 0x04 flips the +4 plane so a SIGNED 3-bit extract yields q-4
         // directly ((q^4) as s3 == q-4 for q in 0..7), dropping the per-element -4.0 subtract.
         // float(int(q-4)) == float(q)-4.0 exactly (small integers) — bit-identical.
-        uint q4 = ((ru32u(qb + w8 * 4u) >> shift) & 0x03030303u)
-            | (((ru32u(bd + w8 * 4u) >> jg) & 0x01010101u) << 2u);
+        uint qlo = (w8 < 4u) ? qL0[w8] : qL1[w8 - 4u];
+        uint hbits = (w8 < 4u) ? hM0[w8] : hM1[w8 - 4u];
+        uint q4 = ((qlo >> shift) & 0x03030303u)
+            | (((hbits >> jg) & 0x01010101u) << 2u);
         int q4s = int(q4 ^ 0x04040404u);
         for (uint b = 0u; b < 4u; b++) {
             uint w = w8 * 4u + b;
@@ -627,8 +660,11 @@ void dqblk(uint gstart, out float v[32]) {
     uint hi = (scales_h >> (2u * ib)) & 3u;
     float dl = d * float(int(lo | (hi << 4u)) - 32);
     uint qw = (bd + 8u + 16u * ib) >> 2u;
+    // b128 the 4 qs words as one NW4 quad (word-aligned: 136%4==0, +8, stride 16) instead of 4
+    // scalar NW() loads — the streamed arena path's fusion. Same words — bit-identical.
+    uvec4 qv = NW4(qw);
     for (uint w4 = 0u; w4 < 4u; w4++) {
-        uint q = NW(qw + w4);
+        uint q = qv[w4];
         for (uint b = 0u; b < 4u; b++) {
             uint byte = (q >> (8u * b)) & 0xFFu;
             uint j = w4 * 4u + b;

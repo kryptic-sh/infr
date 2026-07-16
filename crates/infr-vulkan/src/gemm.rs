@@ -1498,6 +1498,98 @@ pub(crate) fn native_gemm_mmq_dense_streamed_spv(
         _ => return None,
     })
 }
+/// `-DSTREAMED` twin SPIR-V of `linear_f16` (slice A4; see the shader's
+/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f16_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin SPIR-V of `linear_f16_noext` (slice A4; see the shader's
+/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f16_noext_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16_noext_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin SPIR-V of `linear_bf16` (slice A4; see the shader's
+/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_bf16_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin SPIR-V of `linear_f32r` (slice A4; see the shader's
+/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin SPIR-V of `linear_f32r_mrow8` (slice A4; see the shader's
+/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_mrow8_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_mrow8_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin SPIR-V of `linear_f32r_mrow4_v4` (slice A4; see the shader's
+/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_mrow4_v4_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/linear_f32r_mrow4_v4_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin SPIR-V of `linear_f32r_mrow8_v4` (slice A4; see the shader's
+/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_mrow8_v4_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/linear_f32r_mrow8_v4_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin SPIR-V of `linear_res` (slice A4; see the shader's
+/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_res_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_res_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin of [`native_gemm_fma_build_spv`] (kernel-cache name + SPIR-V). Slice A4;
+/// parity-test entry, not dispatched in production.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_fma_streamed_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match dtype {
+        F16 => spv!("native_gemm_fma_f16_streamed"),
+        Bf16 => spv!("native_gemm_fma_bf16_streamed"),
+        F32 => spv!("native_gemm_fma_f32_streamed"),
+        _ => return None,
+    })
+}
 /// SPIR-V for the non-coopmat float-weight prefill GEMM (the "fma-warp" tier, see
 /// `native_gemm_fma.comp`): shared-memory fma warptile for f16/bf16/f32 weights on devices
 /// without a usable f16 coopmat (adapter.rs `nc_fma`). Returns `(kernel_cache_name, spv)`;

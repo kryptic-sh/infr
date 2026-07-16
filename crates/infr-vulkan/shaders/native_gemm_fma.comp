@@ -40,9 +40,29 @@ const uint SAK = BK + 1u; // +1 word pad de-conflicts the strided column reads
 const uint SBK = BK + 1u;
 
 layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+// -DSTREAMED (resident-BDA): the weight words are read through a 64-bit buffer_reference into
+// the resident arena (base = arena_lo/arena_hi appended LAST) instead of the bound SSBO; w_base
+// keeps its element-offset meaning. Additive: the non-STREAMED build is byte-identical.
+#ifdef STREAMED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+#else
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
+#endif
 layout(binding = 0) readonly buffer AB { float a[]; };  // [m, k] f32 activations
+#ifndef STREAMED
 layout(binding = 1) readonly buffer WB { uint nw[]; };  // [n, k] raw f16/bf16/f32 words
+#endif
+#ifdef STREAMED
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { uint v[]; };
+uint64_t w_ptr = 0ul;
+#define NWD(i) ArenaW(w_ptr).v[i]
+#else
+#define NWD(i) nw[i]
+#endif
 layout(binding = 2) writeonly buffer CB { float c[]; }; // [ceil(m/64)*64, n]
 
 shared float As[BM * SAK];
@@ -53,20 +73,23 @@ shared float Bs[BN * SBK];
 // (a bf16 fused-QKV slice offset is only guaranteed 32-element aligned) trivially correct.
 #ifdef FMT_F16
 float wload(uint e) {
-    uint w = nw[e >> 1u];
+    uint w = NWD(e >> 1u);
     return unpackHalf2x16(w)[e & 1u];
 }
 #elif defined(FMT_BF16)
 float wload(uint e) {
-    uint w = nw[e >> 1u];
+    uint w = NWD(e >> 1u);
     uint h = (e & 1u) == 0u ? (w & 0xffffu) : (w >> 16u);
     return uintBitsToFloat(h << 16u);
 }
 #else // FMT_F32
-float wload(uint e) { return uintBitsToFloat(nw[e]); }
+float wload(uint e) { return uintBitsToFloat(NWD(e)); }
 #endif
 
 void main() {
+#ifdef STREAMED
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+#endif
     uint tilesN = pc.n / BN;
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;

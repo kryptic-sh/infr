@@ -982,3 +982,138 @@ fn mmv_id_q4k_streamed_matches_resident() {
     }
     println!("ok: mmv_id_q4k");
 }
+
+// ─── float-weight linear family — slice A4 ─────────────────────────────────────────────────────
+// These kernels read TYPED weight arrays (float16_t / float / vec4), so their STREAMED arms use
+// typed buffer_references instead of the uint-word NW() seam — parity across each type proves the
+// typed pointer reads decode identically to the bound-SSBO loads.
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn float_linear_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f) = (256usize, 8usize);
+
+    // (name, dtype, rows) — rows>1 exercises linear_f32's mrow/vec4 routing on both sides.
+    for rows in [1usize, 4] {
+        let x = synth_x(rows * in_f);
+        let x_buf = be.alloc(rows * in_f * 4, BufferUsage::Activations).unwrap();
+        be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+        for dtype in [DType::F16, DType::Bf16, DType::F32] {
+            let c = run_case(
+                &be,
+                format!("float linear dtype={dtype:?} rows={rows}"),
+                dtype,
+                in_f,
+                out_f,
+                rows * out_f,
+                &|rec, w, _x, y| match dtype {
+                    DType::F16 => rec.linear(w, x_buf.as_ref(), y, rows, in_f, out_f),
+                    DType::Bf16 => rec.linear_bf16(w, x_buf.as_ref(), y, rows, in_f, out_f),
+                    DType::F32 => rec.linear_f32(w, x_buf.as_ref(), y, rows, in_f, out_f),
+                    _ => unreachable!(),
+                },
+                &|rec, addr, _x, y| match dtype {
+                    DType::F16 => rec.linear_streamed(addr, x_buf.as_ref(), y, rows, in_f, out_f),
+                    DType::Bf16 => {
+                        rec.linear_bf16_streamed(addr, x_buf.as_ref(), y, rows, in_f, out_f)
+                    }
+                    DType::F32 => {
+                        rec.linear_f32_streamed(addr, x_buf.as_ref(), y, rows, in_f, out_f)
+                    }
+                    _ => unreachable!(),
+                },
+            );
+            assert_case(&c);
+            println!("ok: {}", c.name);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn f16_noext_and_res_streamed_match_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f, rows) = (256usize, 8usize, 1usize);
+    let x = synth_x(in_f);
+    let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let res: Vec<f32> = (0..out_f).map(|i| (i as f32) * 0.25 - 1.0).collect();
+    let res_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(res_buf.as_ref(), bytemuck::cast_slice(&res))
+        .unwrap();
+
+    let c = run_case(
+        &be,
+        "linear_f16_noext".to_string(),
+        DType::F16,
+        in_f,
+        out_f,
+        out_f,
+        &|rec, w, _x, y| rec.linear_f16_noext(w, x_buf.as_ref(), y, rows, in_f, out_f),
+        &|rec, addr, _x, y| {
+            rec.linear_f16_noext_streamed(addr, x_buf.as_ref(), y, rows, in_f, out_f)
+        },
+    );
+    assert_case(&c);
+    println!("ok: {}", c.name);
+
+    let c = run_case(
+        &be,
+        "linear_res (fused residual)".to_string(),
+        DType::F16,
+        in_f,
+        out_f,
+        out_f,
+        &|rec, w, _x, y| rec.linear_add(w, x_buf.as_ref(), res_buf.as_ref(), y, rows, in_f, out_f),
+        &|rec, addr, _x, y| {
+            rec.linear_add_streamed(addr, x_buf.as_ref(), res_buf.as_ref(), y, rows, in_f, out_f)
+        },
+    );
+    assert_case(&c);
+    println!("ok: {}", c.name);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn fma_gemm_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // n%64, k%32; m=8 pads C to 64 rows (compare the real rows only, like the mmq test).
+    let (m, k, n) = (8usize, 256usize, 64usize);
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+    let a_buf = be.alloc(m * k * 4, BufferUsage::Activations).unwrap();
+    be.upload(a_buf.as_ref(), bytemuck::cast_slice(&a)).unwrap();
+    let c_rows = m.div_ceil(64) * 64;
+
+    for dtype in [DType::F16, DType::Bf16, DType::F32] {
+        let c = run_case(
+            &be,
+            format!("fma gemm dtype={dtype:?}"),
+            dtype,
+            k,
+            n,
+            c_rows * n,
+            &|rec, w, _x, y| rec.matmul_fma(dtype, a_buf.as_ref(), w, 0, y, m, k, n),
+            &|rec, addr, _x, y| rec.matmul_fma_streamed(dtype, a_buf.as_ref(), addr, 0, y, m, k, n),
+        );
+        let real = m * n;
+        let trimmed = Case {
+            name: c.name,
+            resident: c.resident[..real].to_vec(),
+            streamed_at0: c.streamed_at0[..real].to_vec(),
+            streamed_atoff: c.streamed_atoff[..real].to_vec(),
+        };
+        assert_case(&trimmed);
+        println!("ok: {}", trimmed.name);
+    }
+}

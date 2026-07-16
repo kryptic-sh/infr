@@ -3,8 +3,31 @@
 // K with a shared tree-reduce (the f32 twin of linear_f16). The thread-per-output linear_f32 keeps
 // the eager path, but a decode-hot GEMV with few outputs (the qwen3moe router: 2048→128 per layer)
 // launches only out_f/64 workgroups there — this shape launches out_f workgroups instead.
+#ifdef STREAMED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
+// -DSTREAMED (resident-BDA): the weight is read through a 64-bit buffer_reference into the
+// resident arena (base = arena_lo/arena_hi) instead of a bound SSBO — see native_gemv.comp's
+// header for the campaign rationale. The reference is vec4-typed under VEC4 (16-byte loads
+// preserved; every arena tensor offset is 256-aligned so the pointer alignment holds). Additive:
+// the non-STREAMED build is byte-identical.
+#ifdef STREAMED
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint arena_lo; uint arena_hi;
+} pc;
+#ifdef VEC4
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ArenaW { vec4 v[]; };
+layout(binding = 1) readonly buffer XB { vec4 x[]; };      // [rows, in/4]
+#else
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { float v[]; };
+layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
+#endif
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+#else
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; } pc;
 #ifdef VEC4
 layout(binding = 0) readonly buffer WB { vec4 w[]; };      // [out, in/4] f32 vec4
@@ -12,6 +35,8 @@ layout(binding = 1) readonly buffer XB { vec4 x[]; };      // [rows, in/4]
 #else
 layout(binding = 0) readonly buffer WB { float w[]; };     // [out, in] f32
 layout(binding = 1) readonly buffer XB { float x[]; };     // [rows, in]
+#endif
+#define WV(i) w[i]
 #endif
 layout(binding = 2) buffer YB { float y[]; };              // [rows, out]
 
@@ -35,11 +60,14 @@ void main() {
     uint o = unit % pc.out_f;
     uint r0 = (unit / pc.out_f) * uint(MROW);
     uint t = gl_LocalInvocationID.x;
+#ifdef STREAMED
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+#endif
     uint wbase = o * nv;
     vec4 acc[MROW];
     for (uint j = 0u; j < uint(MROW); j++) { acc[j] = vec4(0.0); }
     for (uint i = t; i < nv; i += 64u) {
-        vec4 wv = w[wbase + i];
+        vec4 wv = WV(wbase + i);
         for (uint j = 0u; j < uint(MROW); j++) {
             uint r = r0 + j;
             if (r < pc.rows) { acc[j] += wv * x[r * nv + i]; }
@@ -78,11 +106,14 @@ void main() {
     uint o = unit % pc.out_f;
     uint r0 = (unit / pc.out_f) * uint(MROW);
     uint t = gl_LocalInvocationID.x;
+#ifdef STREAMED
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+#endif
     uint wbase = o * pc.in_f;
     float acc[MROW];
     for (uint j = 0u; j < uint(MROW); j++) { acc[j] = 0.0; }
     for (uint i = t; i < pc.in_f; i += 64u) {
-        float wv = w[wbase + i];
+        float wv = WV(wbase + i);
         for (uint j = 0u; j < uint(MROW); j++) {
             uint r = r0 + j;
             if (r < pc.rows) { acc[j] += wv * x[r * pc.in_f + i]; }
@@ -113,10 +144,13 @@ void main() {
     uint o = unit % pc.out_f;
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;
+#ifdef STREAMED
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+#endif
     uint wbase = o * pc.in_f;
     uint xbase = r * pc.in_f;
     float acc = 0.0;
-    for (uint i = t; i < pc.in_f; i += 64u) { acc += w[wbase + i] * x[xbase + i]; }
+    for (uint i = t; i < pc.in_f; i += 64u) { acc += WV(wbase + i) * x[xbase + i]; }
     red[t] = acc;
     barrier();
     for (uint stride = 32u; stride > 0u; stride /= 2u) {

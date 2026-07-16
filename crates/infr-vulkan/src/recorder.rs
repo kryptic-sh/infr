@@ -914,6 +914,230 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `-DSTREAMED` twin of [`Self::linear`] (f16 weight via a typed 64-bit buffer_reference;
+    /// slice A4). Binding 0 takes a FILLER (`x`). Parity-test entry, not dispatched in production.
+    pub fn linear_streamed(
+        &self,
+        arena_addr: u64,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("lin_f16_streamed", rows, in_f, out_f);
+        let k = self.be.kernel(
+            "linear_f16_streamed",
+            crate::gemm::linear_f16_streamed_spv(),
+            3,
+            20,
+        );
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::linear_f16_noext`] (slice A4). Parity-test entry.
+    pub fn linear_f16_noext_streamed(
+        &self,
+        arena_addr: u64,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("lin_f16_noext_streamed", rows, in_f, out_f);
+        let k = self.be.kernel(
+            "linear_f16_noext_streamed",
+            crate::gemm::linear_f16_noext_streamed_spv(),
+            3,
+            20,
+        );
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
+    /// bf16-weight GEMV `y = x·Wᵀ` (`linear_bf16.comp`) — recorder-level twin of the eager
+    /// `ops::linear_bf16` (which owns its host round-trip); exists so the streamed parity test can
+    /// drive the resident kernel in a recorded submit. Plain 1-D grid (the shader does no 2-D
+    /// index recovery).
+    pub fn linear_bf16(
+        &self,
+        w: &dyn Buffer,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("lin_bf16", rows, in_f, out_f);
+        let k = self
+            .be
+            .kernel("linear_bf16", crate::gemm::linear_bf16_spv(), 3, 12);
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        self.dispatch(
+            k,
+            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
+    /// `-DSTREAMED` twin of the bf16 GEMV (`linear_bf16.comp`; slice A4). Parity-test entry.
+    pub fn linear_bf16_streamed(
+        &self,
+        arena_addr: u64,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("lin_bf16_streamed", rows, in_f, out_f);
+        let k = self.be.kernel(
+            "linear_bf16_streamed",
+            crate::gemm::linear_bf16_streamed_spv(),
+            3,
+            20,
+        );
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        // linear_bf16's grid is NOT dispatch_wide-recovered in the shader (plain gl_WorkGroupID.x)
+        // — mirror the resident call shape: rows*out_f 1-D groups.
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::linear_f32`] (slice A4) — mirrors the resident dispatcher's
+    /// mrow/vec4 variant routing (same env escapes) so parity comparisons land on the same
+    /// kernel. Parity-test entry, not dispatched in production.
+    pub fn linear_f32_streamed(
+        &self,
+        arena_addr: u64,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
+        let use_mrow = rows > 1 && std::env::var("INFR_NO_F32_MROW").is_err();
+        let use_v4 = use_mrow && in_f.is_multiple_of(4) && std::env::var("INFR_NO_F32_V4").is_err();
+        let (name, spv, groups) = if use_v4 && rows <= 4 {
+            (
+                "linear_f32r_mrow4_v4_streamed",
+                crate::gemm::linear_f32r_mrow4_v4_streamed_spv(),
+                (out_f * rows.div_ceil(4)) as u32,
+            )
+        } else if use_v4 {
+            (
+                "linear_f32r_mrow8_v4_streamed",
+                crate::gemm::linear_f32r_mrow8_v4_streamed_spv(),
+                (out_f * rows.div_ceil(8)) as u32,
+            )
+        } else if use_mrow {
+            (
+                "linear_f32r_mrow8_streamed",
+                crate::gemm::linear_f32r_mrow8_streamed_spv(),
+                (out_f * rows.div_ceil(8)) as u32,
+            )
+        } else {
+            (
+                "linear_f32r_streamed",
+                crate::gemm::linear_f32r_streamed_spv(),
+                (rows * out_f) as u32,
+            )
+        };
+        let k = self.be.kernel(name, spv, 3, 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::linear_add`] (fused-residual f16 GEMV, `linear_res.comp`;
+    /// slice A4). Parity-test entry, not dispatched in production.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_add_streamed(
+        &self,
+        arena_addr: u64,
+        x: &dyn Buffer,
+        residual: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let k = self.be.kernel(
+            "linear_res_streamed",
+            crate::gemm::linear_res_streamed_spv(),
+            4,
+            20,
+        );
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(x),
+                Self::vkb(x),
+                Self::vkb(residual),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
     /// E2B per-layer inp_gate: fused f32 GEMV + GELU activation * strided up-read.
     /// `dst[r,o] = gelu(sum_k x[r,k] * w[o,k]) * up[up_off + r*up_stride + o]`.
     /// Scalar MROW=4 kernel, bit-identical to separate Linear(f32) + GatedAct(gelu, stride).
@@ -1878,6 +2102,42 @@ impl<'a> Recorder<'a> {
         }
         bufs.extend_from_slice(&[Self::vkb(qa), Self::vkb(c)]);
         self.dispatch(kern, &bufs, 1, &push, groups);
+    }
+
+    /// `-DSTREAMED` twin of [`Self::matmul_fma`] (slice A4: see
+    /// `crate::gemm::native_gemm_fma_streamed_build_spv`). The weight-SSBO slot (binding 1) takes
+    /// a FILLER (`a`). Parity-test entry, not dispatched in production.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_fma_streamed(
+        &self,
+        dtype: infr_core::DType,
+        a: &dyn Buffer,
+        arena_addr: u64,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (name, spv) = crate::gemm::native_gemm_fma_streamed_build_spv(dtype)
+            .expect("matmul_fma_streamed: dtype gated by native_gemm_fma_streamed_build_spv");
+        self.label_gemm(name, m, k, n);
+        let kern = self.be.kernel(name, spv, 3, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(a), Self::vkb(a), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
     }
 
     /// Non-coopmat float-weight prefill GEMM (the "fma-warp" tier): `c = a·W[w_base]ᵀ`, `a` f32

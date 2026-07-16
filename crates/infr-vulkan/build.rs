@@ -2675,6 +2675,12 @@ fn main() {
             | "native_gemv_id_multi"
             | "native_gemv_id_multi_sg"
             | "native_mmv_id_q4k" => !defines.iter().any(|d| d == "-DPAGED"),
+            // The float-weight resident family: the dedicated f16/bf16/f32 linear GEMVs (typed
+            // buffer_reference reads — see linear_f16.comp's STREAMED doc) and the non-coopmat
+            // fma prefill GEMM. linear_res IS the fused-residual f16 GEMV file, included since
+            // the resident-BDA endgame deletes every bound-SSBO weight path.
+            "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32" | "linear_f32r"
+            | "linear_res" | "native_gemm_fma" => true,
             _ => false,
         }
     };

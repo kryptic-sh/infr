@@ -37,3 +37,19 @@ uint64_t arena_base(uint lo, uint hi) { return (uint64_t(hi) << 32) | uint64_t(l
 uint arena_word(uint wi) {
     return ArenaWords(nw_ptr + uint64_t(wi << 2u)).v[0];
 }
+
+// Wide 4-word read. The descriptor-bound twin's `nw[i]` array lets ACO's load/store vectorizer
+// fuse four adjacent reads into one buffer_load_b128; the scalar `arena_word` above can't be fused
+// (each call is a distinct ArenaW4(base+off).v[0] pointer, so the vectorizer can't prove adjacency)
+// and lowers to four global_load_b32 — 4x the load instructions, which on the bandwidth/latency-
+// bound decode GEMV was the whole streamed-vs-resident gap. Here the four v[0..3] are CONSTANT
+// indices off ONE pointer, so the vectorizer fuses them into a global_load_b128, while the base is
+// still built as `nw_ptr + (wbase<<2)` in 32-bit offset form (saddr scalar base, no v_add_co).
+// Requires the word base to be dword-aligned (all Q6K ql/qh word offsets are); b128 needs only
+// dword alignment on RDNA, matching buffer_reference_align.
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW4 { uint v[4]; };
+uvec4 arena_word4(uint wbase) {
+    ArenaW4 p = ArenaW4(nw_ptr + uint64_t(wbase << 2u));
+    return uvec4(p.v[0], p.v[1], p.v[2], p.v[3]);
+}
+#define NW4(wbase) arena_word4(wbase)

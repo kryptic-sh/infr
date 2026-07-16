@@ -18,6 +18,12 @@
 #ifndef NW
 #define NW(i) nw[i]
 #endif
+// Wide 4-word read (see native_arena_ref.glsl). Non-streamed builds read the SSBO array directly;
+// ACO's vectorizer already fuses the four adjacent nw[] loads into one buffer_load_b128, so this is
+// the same code the scalar path generated — the macro only gives the streamed arena the same shape.
+#ifndef NW4
+#define NW4(wbase) uvec4(nw[(wbase)], nw[(wbase) + 1u], nw[(wbase) + 2u], nw[(wbase) + 3u])
+#endif
 
 uint rb(uint bo) { return (NW(bo >> 2u) >> ((bo & 3u) << 3u)) & 0xFFu; }
 uint ru16(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u); }
@@ -332,8 +338,12 @@ void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once fo
     // directly visible in prefill GEMM throughput.
     uint qw = (bd + 16u + (sub / 2u) * 32u) >> 2u;
     uint nsh = ((sub & 1u) == 0u) ? 0u : 4u;
+    // b128 the two qs quads (qw is 16B-aligned: 144%16==0, +16, sub-stride 32). Matches the
+    // descriptor path's buffer_load_b128; the streamed NW4 keeps a saddr base. Same words as
+    // NW(qw+w8) — bit-identical.
+    uvec4 qA = NW4(qw); uvec4 qB = NW4(qw + 4u);
     for (uint w8 = 0u; w8 < 8u; w8++) {
-        uint q = NW(qw + w8) >> nsh;
+        uint q = ((w8 < 4u) ? qA[w8] : qB[w8 - 4u]) >> nsh;
         for (uint b = 0u; b < 4u; b++) {
             v[w8 * 4u + b] = dl * float((q >> (8u * b)) & 0xFu) - mm;
         }
@@ -385,9 +395,13 @@ void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once fo
     // the GEMV landed at 737 GB/s (77% of peak). Q8_0, whose decode is ~4 ops/elem (ALU
     // effectively free), hits 863 GB/s (90%) through this SAME kernel — that gap was the ALU,
     // and this cuts it to ~5 ops/elem.
+    // b128 the qs/qh quads (176%16==0, qh at +16, qs at +48 => qw/hw 16B-aligned). Matches the
+    // descriptor path's buffer_load_b128; streamed NW4 keeps a saddr base. Bit-identical words.
+    uvec4 qA = NW4(qw); uvec4 qB = NW4(qw + 4u);
+    uvec4 hA = NW4(hw); uvec4 hB = NW4(hw + 4u);
     for (uint w8 = 0u; w8 < 8u; w8++) {
-        uint q = NW(qw + w8) >> nsh;
-        uint h = NW(hw + w8) >> hsh;
+        uint q = ((w8 < 4u) ? qA[w8] : qB[w8 - 4u]) >> nsh;
+        uint h = ((w8 < 4u) ? hA[w8] : hB[w8 - 4u]) >> hsh;
         uint packed = (q & 0x0F0F0F0Fu) | ((h & 0x01010101u) << 4u);
         for (uint b = 0u; b < 4u; b++) {
             uint val = bitfieldExtract(packed, int(8u * b), 5);
@@ -439,28 +453,35 @@ void dqblk(uint gstart, out float v[32]) {  // hf/og/d constant; hoist branch, o
     // load, so the base+w8 word index and the halved odd-block load count both cut address ALU.
     uint qwb = qoff >> 2u; uint qsh = (qoff & 3u) << 3u;
     uint qhb = qhoff >> 2u; uint hsh = (qhoff & 3u) << 3u;
-    if (qsh == 0u) {   // even block: fully word-aligned (qsh==0 <=> hsh==0)
+    // Pull the 8 ql + 8 qh words as four b128 quads (see NW4). Same words as NW(base+w8), so the
+    // funnel integers below are identical — bit-identical to the scalar form.
+    uvec4 qA = NW4(qwb); uvec4 qB = NW4(qwb + 4u);
+    uvec4 hA = NW4(qhb); uvec4 hB = NW4(qhb + 4u);
+    if (qsh == 0u) {   // even block: fully word-aligned (qsh==0 <=> hsh==0), no funnel
         for (uint w8 = 0u; w8 < 8u; w8++) {
-            uint q = NW(qwb + w8) >> nsh;
-            uint h = NW(qhb + w8) >> qshift;
+            uint q = ((w8 < 4u) ? qA[w8] : qB[w8 - 4u]) >> nsh;
+            uint h = ((w8 < 4u) ? hA[w8] : hB[w8 - 4u]) >> qshift;
             float dsc = (w8 < 4u) ? dsc0 : dsc1;
             for (uint b = 0u; b < 4u; b++) {
                 uint qq = ((q >> (8u * b)) & 0xFu) | (((h >> (8u * b)) & 3u) << 4u);
                 v[w8 * 4u + b] = dsc * (float(qq) - 32.0);
             }
         }
-    } else {           // odd block: +2 misaligned, funnel a sliding neighbor pair
-        uint qprev = NW(qwb); uint hprev = NW(qhb);
+    } else {           // odd block: +2 misaligned, funnel a sliding neighbor (word 8 is the tail)
+        uint qtail = NW(qwb + 8u); uint htail = NW(qhb + 8u);
         for (uint w8 = 0u; w8 < 8u; w8++) {
-            uint qnext = NW(qwb + w8 + 1u); uint hnext = NW(qhb + w8 + 1u);
-            uint q = ((qprev >> qsh) | (qnext << (32u - qsh))) >> nsh;
-            uint h = ((hprev >> hsh) | (hnext << (32u - hsh))) >> qshift;
+            uint qcur = (w8 < 4u) ? qA[w8] : qB[w8 - 4u];
+            uint hcur = (w8 < 4u) ? hA[w8] : hB[w8 - 4u];
+            uint w1 = w8 + 1u;
+            uint qnxt = (w1 < 4u) ? qA[w1] : ((w1 < 8u) ? qB[w1 - 4u] : qtail);
+            uint hnxt = (w1 < 4u) ? hA[w1] : ((w1 < 8u) ? hB[w1 - 4u] : htail);
+            uint q = ((qcur >> qsh) | (qnxt << (32u - qsh))) >> nsh;
+            uint h = ((hcur >> hsh) | (hnxt << (32u - hsh))) >> qshift;
             float dsc = (w8 < 4u) ? dsc0 : dsc1;
             for (uint b = 0u; b < 4u; b++) {
                 uint qq = ((q >> (8u * b)) & 0xFu) | (((h >> (8u * b)) & 3u) << 4u);
                 v[w8 * 4u + b] = dsc * (float(qq) - 32.0);
             }
-            qprev = qnext; hprev = hnext;
         }
     }
 }

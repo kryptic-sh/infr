@@ -242,6 +242,19 @@ device-appropriate base — available VRAM for the expert cache, the free-VRAM K
 capacity for the Vulkan context (`INFR_CACHE=80%`, `INFR_CTX=50%`; on the
 CPU/Metal chat paths a ctx-`%` resolves against the model's trained context).
 
+**Resident-BDA weight arena** — `INFR_RESIDENT_BDA=1` (opt-in, default off)
+routes every weight allocation into one `bufferDeviceAddress` arena and has the
+kernels read their weights by 64-bit device address instead of through
+per-tensor SSBO descriptor bindings — dense projection weights and MoE expert
+banks read via `-DSTREAMED` kernel twins, sub-tensors via sub-range descriptor
+binds, and the paged expert cache composes on top unchanged. The addressing
+change is bitwise-identical to the default descriptor path across the whole
+model zoo (dense, MoE, qwen35/DeltaNet, DiffusionGemma, and the paged Scout
+experts — proven by the `gpu_seam` goldens and the streamed-parity suites), and
+runs at-or-faster than the default path on RDNA3 (7900 XTX) on the dense and
+qwen3-MoE paths. Default stays off; enable it to exercise the BDA addressing
+path.
+
 ## Validated models & performance
 
 Everything below is **validated on an AMD Radeon RX 7900 XTX** (RDNA3, 24 GB,

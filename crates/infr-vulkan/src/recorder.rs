@@ -2461,6 +2461,147 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `-DSTREAMED` twin of [`Self::linear_mmv`] (slice A2 build-variant: see
+    /// `crate::gemm::native_mmv_streamed_build_spv`). Same arena-by-address convention as
+    /// [`Self::linear_native_streamed`] — binding 0 (the resident build's weight SSBO) takes a
+    /// small FILLER (`qa`) since the arena is never bound as a descriptor. Not wired into any
+    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("mmv_streamed", 1, in_f, out_f);
+        let (name, spv) =
+            crate::gemm::native_mmv_streamed_build_spv(dtype).expect("native mmv streamed spv");
+        let k = self.be.kernel(name, spv, 5, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(qa),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (out_f as u32).div_ceil(2),
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::linear_mmv_mrow`] (slice A2 build-variant: see
+    /// `crate::gemm::native_mmv_mrow_streamed_variant_spv`). Mirrors the resident dispatcher's
+    /// o4/m4/m16 routing EXACTLY (same env escapes) so a parity test comparing the two at the same
+    /// shape lands on the same layout variant. Non-residual only. Not wired into any production
+    /// dispatch yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_mrow_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        debug_assert!((1..=16).contains(&rows));
+        self.label_gemv("mmvr_streamed", rows, in_f, out_f);
+        let o4 = in_f < 2048 && std::env::var("INFR_NO_MMV_O4").is_err();
+        let m4 = rows <= 4 && std::env::var("INFR_NO_MMV_M4").is_err();
+        let (name, spv) = if rows > 8 {
+            crate::gemm::native_mmv_mrow_streamed_m16_spv(dtype)
+                .expect("native mmv mrow m16 streamed spv")
+        } else {
+            crate::gemm::native_mmv_mrow_streamed_variant_spv(dtype, o4, m4)
+                .expect("native mmv mrow streamed spv")
+        };
+        let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
+        let k = self.be.kernel(name, spv, 5, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(qa),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::linear_mmv_mw`] (slice A2 build-variant: see
+    /// `crate::gemm::native_mmv_mw_streamed_build_spv`). Non-residual only. Not wired into any
+    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_mw_streamed(
+        &self,
+        dtype: infr_core::DType,
+        warps: u32,
+        arena_addr: u64,
+        w_base: usize,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("mmv_mw_streamed", 1, in_f, out_f);
+        let (name, spv) = crate::gemm::native_mmv_mw_streamed_build_spv(dtype, warps, self.sg16())
+            .expect("native mmv_mw streamed spv");
+        let k = self.be.kernel_sg(name, spv, 5, 24, self.sgp());
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(qa),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (out_f as u32).div_ceil(warps),
+        );
+    }
+
     /// Multi-row int8 dp4a GEMV (`1 <= rows <= 16`): [`Self::linear_native_mrow`]'s shape with
     /// `native_mmv.comp`'s integer-dot math — the weight sub-block is unpacked once into packed
     /// int8 words and dp4a'd against every row's pre-quantized activation block (`qa`/`dact`/

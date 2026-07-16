@@ -44,8 +44,20 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // Same push layout as native_gemv/native_mmv (w_base = element offset for fused-QKV slices).
+// -DSTREAMED (see native_gemv.comp's header for the full rationale): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
+// w_base keeps its within-tensor element-offset meaning. Additive: the non-STREAMED build is
+// byte-identical.
+#ifdef STREAMED
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+#else
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
+#endif
+#ifndef STREAMED
 layout(binding = 0) readonly buffer WB { uint nw[]; };          // raw GGUF weight bytes (padded u32)
+#endif
 // int8 activations as uvec4 (in_f % 32 == 0 -> every sub-block is two aligned uvec4s): 2 wide
 // loads per (row, sub-block) instead of 8 scalar u32 ones - the inner loop is load-issue heavy
 // (8 qa loads + 8 dp4a per row per output).
@@ -68,7 +80,16 @@ const uint MR = uint(MRV);
 const uint MAX_SG = 8u;                  // 64 threads / min 8-wide subgroup
 shared float part[2u * MR * MAX_SG];     // one partial per (output, row, subgroup)
 
-uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+// Weight-word read chokepoint — see native_mmv.comp for why this family declares its own `NW(i)`
+// instead of inheriting native_decode.glsl's.
+#ifdef STREAMED
+#include "native_arena_ref.glsl"
+#define NW(i) arena_word(i)
+#else
+#define NW(i) nw[i]
+#endif
+
+uint rb(uint byte) { return (NW(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 // Shared by Q6_K and Q3_K's wdec (both re-bias an unsigned scale byte to signed) — unconditional
@@ -80,17 +101,18 @@ int sgn8(uint b) { return int(b) - ((b > 127u) ? 256 : 0); }
 // Unaligned u32 via two word loads + funnel shift — same helper as native_mmv_mw.comp's FMT_Q3K.
 // Q3_K's 110-byte blocks are only 2-aligned. Q6_K's 210-byte blocks are ALSO only 2-aligned (210 %
 // 4 == 2), so every odd-indexed super-block's `bd` sits at a byte offset that is 2 mod 4, not 0 —
-// unlike Q4_K (144 % 4 == 0) and Q5_K (176 % 4 == 0), a plain `nw[byte >> 2]` load is illegal here
-// for anything computed as an offset from `bd` (ql/qh planes both inherit `bd`'s parity). This
-// funnel-shift load is what makes the FMT_Q6K word-parallel unpack below correct at BOTH parities
-// instead of silently misreading every other super-block. The legacy `_0`-family strides are ALL
-// odd-word too — Q8_0 34 B, Q5_0 22 B, Q4_0/IQ4_NL 18 B, every one `% 4 == 2` — so they need it as
-// well (their `_1` twins, Q4_1 20 B and Q5_1 24 B, are word-aligned and use plain `nw[]` loads).
+// unlike Q4_K (144 % 4 == 0) and Q5_K (176 % 4 == 0), a single word-aligned `NW(byte >> 2)` load is
+// illegal here for anything computed as an offset from `bd` (ql/qh planes both inherit `bd`'s
+// parity). This funnel-shift load is what makes the FMT_Q6K word-parallel unpack below correct at
+// BOTH parities instead of silently misreading every other super-block. The legacy `_0`-family
+// strides are ALL odd-word too — Q8_0 34 B, Q5_0 22 B, Q4_0/IQ4_NL 18 B, every one `% 4 == 2` — so
+// they need it as well (their `_1` twins, Q4_1 20 B and Q5_1 24 B, are word-aligned and use plain
+// single-word `NW()` loads).
 uint ru32u(uint byte) {
-    uint w0 = nw[byte >> 2u];
+    uint w0 = NW(byte >> 2u);
     uint sh = (byte & 3u) << 3u;
     if (sh == 0u) { return w0; }
-    return (w0 >> sh) | (nw[(byte >> 2u) + 1u] << (32u - sh));
+    return (w0 >> sh) | (NW((byte >> 2u) + 1u) << (32u - sh));
 }
 #endif
 
@@ -123,7 +145,7 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint qword = (bd + 16u + (sub >> 1u) * 32u) >> 2u;
     bool lo = (sub & 1u) == 0u;
     for (uint j = 0u; j < 8u; j++) {
-        uint w = nw[qword + j];
+        uint w = NW(qword + j);
         qp[j] = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
     }
 }
@@ -158,8 +180,8 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint qhword = (bd + 16u) >> 2u; // qh base: right after scales, reused for every sub-block
     bool lo = (sub & 1u) == 0u;
     for (uint j = 0u; j < 8u; j++) {
-        uint wl = nw[qlword + j];
-        uint wh = nw[qhword + j];
+        uint wl = NW(qlword + j);
+        uint wh = NW(qhword + j);
         uint nib = lo ? (wl & 0x0F0F0F0Fu) : ((wl >> 4u) & 0x0F0F0F0Fu);
         uint bit5 = ((wh >> sub) & 0x01010101u) << 4u;
         qp[j] = nib | bit5;
@@ -277,7 +299,7 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     f1 = 0.0;
     uint qw = (bd + 8u + 16u * ib) >> 2u;
     for (uint j = 0u; j < 4u; j++) {
-        uint q = nw[qw + j];              // qs[4j..4j+3]
+        uint q = NW(qw + j);              // qs[4j..4j+3]
         uint wl = 0u; uint wh = 0u;
         for (uint b = 0u; b < 4u; b++) {
             uint qbyte = (q >> (8u * b)) & 0xFFu;
@@ -385,7 +407,7 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     f1 = -f16tof32(ru16(bd + 2u));
     uint qw = (bd + 4u) >> 2u;
     for (uint j = 0u; j < 4u; j++) {
-        uint w = nw[qw + j];
+        uint w = NW(qw + j);
         qp[j] = w & 0x0F0F0F0Fu;
         qp[j + 4u] = (w >> 4u) & 0x0F0F0F0Fu;
     }
@@ -403,10 +425,10 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 32u) * 24u;
     f0 = f16tof32(ru16(bd));
     f1 = -f16tof32(ru16(bd + 2u));
-    uint qh = nw[(bd + 4u) >> 2u];
+    uint qh = NW((bd + 4u) >> 2u);
     uint qw = (bd + 8u) >> 2u;
     for (uint j = 0u; j < 4u; j++) {
-        uint w = nw[qw + j];
+        uint w = NW(qw + j);
         qp[j] = (w & 0x0F0F0F0Fu) | (qh_spread(qh, j * 4u) << 4u);
         qp[j + 4u] = ((w >> 4u) & 0x0F0F0F0Fu) | (qh_spread(qh, 16u + j * 4u) << 4u);
     }
@@ -467,7 +489,7 @@ void wdec2k(uint gelem, out uint qp[8], out float dl0, out float ml0, out float 
     uint shift = 2u * ((p0 % 128u) / 32u);
     uint qw = (bd + 16u + 32u * (p0 / 128u)) >> 2u; // aligned word base of this run's 2-bit codes
     for (uint j = 0u; j < 8u; j++) {
-        qp[j] = (nw[qw + j] >> shift) & 0x03030303u; // four 2-bit codes, one per byte (0..3)
+        qp[j] = (NW(qw + j) >> shift) & 0x03030303u; // four 2-bit codes, one per byte (0..3)
     }
 }
 #endif
@@ -485,6 +507,9 @@ void main() {
     // padding workgroup's out-of-range o0 for every lane).
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u;
     uint t = gl_LocalInvocationID.x;
+#ifdef STREAMED
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+#endif
     uint ot = t >> 4u;               // which of the 4 outputs this lane serves
     uint sl = t & 15u;               // K sub-lane within the output's 16
     uint nsub = pc.in_f / 32u;
@@ -588,6 +613,9 @@ void main() {
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
     if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
+#ifdef STREAMED
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+#endif
     uint nsub = pc.in_f / 32u;
     uint in_fq = pc.in_f >> 4u;      // activation row stride in packed uvec4s
     uint wb0 = pc.w_base + o0 * pc.in_f;

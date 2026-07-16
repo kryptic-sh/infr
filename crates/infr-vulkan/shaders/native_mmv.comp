@@ -14,8 +14,20 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // Same push layout as native_gemv (w_base = element offset for fused-QKV slices / stacked experts).
+// -DSTREAMED (see native_gemv.comp's header for the full rationale): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
+// w_base keeps its within-tensor element-offset meaning. Additive: the non-STREAMED build is
+// byte-identical.
+#ifdef STREAMED
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+#else
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
+#endif
+#ifndef STREAMED
 layout(binding = 0) readonly buffer WB { uint nw[]; };          // raw GGUF weight bytes (padded u32)
+#endif
 layout(binding = 1) readonly buffer QA { uint qa[]; };          // int8 activation, packed 4/u32 [nblk*8]
 layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [nblk]
 layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [nblk]
@@ -28,7 +40,19 @@ layout(binding = 4) buffer YB { float y_buf[]; };
 
 shared float red[2u * 64u];
 
-uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+// Weight-word read chokepoint. This family carries its OWN dp4a decode (it does not include
+// native_decode.glsl), so it declares the same `NW(i)` seam locally: every weight read below —
+// `rb()`'s byte extraction and the direct word loads in the per-format decoders — funnels through
+// it, which is what lets -DSTREAMED reroute the whole file to arena pointer reads by redefining a
+// single macro.
+#ifdef STREAMED
+#include "native_arena_ref.glsl"
+#define NW(i) arena_word(i)
+#else
+#define NW(i) nw[i]
+#endif
+
+uint rb(uint byte) { return (NW(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 
@@ -127,7 +151,7 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     uint qw = (bd + 8u + 16u * ib) >> 2u;   // word-aligned qs base for this sub-block
     int dp = 0;
     for (uint j = 0u; j < 4u; j++) {
-        uint q = nw[qw + j];               // qs[4j..4j+3]
+        uint q = NW(qw + j);               // qs[4j..4j+3]
         uint wl = 0u; uint wh = 0u;        // gathered int8 codebook values (low / high nibbles)
         for (uint b = 0u; b < 4u; b++) {
             uint qbyte = (q >> (8u * b)) & 0xFFu;
@@ -152,6 +176,9 @@ void main() {
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
     if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
+#ifdef STREAMED
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+#endif
     uint nsub = pc.in_f / 32u;
     uint wb0 = pc.w_base + o0 * pc.in_f;
     bool has1 = (o0 + 1u) < pc.out_f; // workgroup-uniform tail guard (odd out_f)

@@ -32,8 +32,20 @@
 #endif
 layout(local_size_x = WARPS * SG, local_size_y = 1, local_size_z = 1) in;
 
+// -DSTREAMED (see native_gemv.comp's header for the full rationale): the weight is read from the
+// arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
+// w_base keeps its within-tensor element-offset meaning. Additive: the non-STREAMED build is
+// byte-identical.
+#ifdef STREAMED
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+#else
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
+#endif
+#ifndef STREAMED
 layout(binding = 0) readonly buffer WB { uint nw[]; };          // raw GGUF weight bytes (padded u32)
+#endif
 layout(binding = 1) readonly buffer QA { uint qa[]; };          // int8 activation, packed 4/u32 [nblk*8]
 layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [nblk]
 layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [nblk]
@@ -44,17 +56,26 @@ layout(binding = 5) buffer YB { float y_buf[]; };
 layout(binding = 4) buffer YB { float y_buf[]; };
 #endif
 
-uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+// Weight-word read chokepoint — see native_mmv.comp for why this family declares its own `NW(i)`
+// instead of inheriting native_decode.glsl's.
+#ifdef STREAMED
+#include "native_arena_ref.glsl"
+#define NW(i) arena_word(i)
+#else
+#define NW(i) nw[i]
+#endif
+
+uint rb(uint byte) { return (NW(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 #ifdef FMT_Q3K
 // Unaligned u32 via two word loads + funnel shift (same as native_decode.glsl's ru32u — Q3_K's
 // 110-byte blocks are only 2-aligned). #ifdef-guarded so the pre-existing Q4K/Q6K SPIR-V stays
 // byte-identical.
 uint ru32u(uint byte) {
-    uint w0 = nw[byte >> 2u];
+    uint w0 = NW(byte >> 2u);
     uint sh = (byte & 3u) << 3u;
     if (sh == 0u) { return w0; }
-    return (w0 >> sh) | (nw[(byte >> 2u) + 1u] << (32u - sh));
+    return (w0 >> sh) | (NW((byte >> 2u) + 1u) << (32u - sh));
 }
 #endif
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
@@ -86,7 +107,7 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     bool lo = (sub & 1u) == 0u;
     int dp = 0;
     for (uint j = 0u; j < 8u; j++) {
-        uint w = nw[qword + j];
+        uint w = NW(qword + j);
         uint qp = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
         dp = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp);
     }
@@ -113,8 +134,8 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     bool lo = (sub & 1u) == 0u;
     int dp = 0;
     for (uint j = 0u; j < 8u; j++) {
-        uint wl = nw[qlword + j];
-        uint wh = nw[qhword + j];
+        uint wl = NW(qlword + j);
+        uint wh = NW(qhword + j);
         uint nib = lo ? (wl & 0x0F0F0F0Fu) : ((wl >> 4u) & 0x0F0F0F0Fu);
         uint bit5 = ((wh >> sub) & 0x01010101u) << 4u;
         uint qp = nib | bit5;
@@ -178,7 +199,7 @@ float dpsub(uint gelem, uint qaw[8], float da, float sa) {
     int dp0 = 0; int dp1 = 0;   // Σ q·qa per 16-elem scale group
     int s0 = 0;  int s1 = 0;    // Σ qa per 16-elem scale group (dp4a vs packed ones)
     for (uint j = 0u; j < 8u; j++) {
-        uint qp = (nw[qw + j] >> shift) & 0x03030303u; // four 2-bit codes, one per byte (0..3)
+        uint qp = (NW(qw + j) >> shift) & 0x03030303u; // four 2-bit codes, one per byte (0..3)
         if (j < 4u) {
             dp0 = dotPacked4x8AccSatEXT(int(qp), int(qaw[j]), dp0);
             s0 = dotPacked4x8AccSatEXT(0x01010101, int(qaw[j]), s0);
@@ -243,6 +264,9 @@ void main() {
     // early return below is safe before subgroupAdd (all SG lanes of a subgroup share it).
     uint o = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(WARPS) + sg;
     if (o >= pc.out_f) { return; }
+#ifdef STREAMED
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+#endif
     uint nsub = pc.in_f / 32u;
     uint wb = pc.w_base + o * pc.in_f;
     float acc = 0.0;

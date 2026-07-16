@@ -2659,6 +2659,10 @@ fn main() {
             "native_gemv_mrow" | "native_gemv_sg" | "native_gemv_rm" | "native_gemv_rm_v2" => {
                 no_res
             }
+            // The int8 dp4a GEMV family. Same additive/non-residual reasoning as the dequant GEMVs
+            // above; these carry their own decode (not native_decode.glsl's), so each declares the
+            // `NW(i)` chokepoint locally — see native_mmv.comp.
+            "native_mmv" | "native_mmv_mrow" | "native_mmv_mw" => no_res,
             _ => false,
         }
     };

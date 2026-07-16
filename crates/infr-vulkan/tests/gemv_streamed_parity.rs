@@ -367,3 +367,260 @@ fn w_base_composes_with_arena_offset() {
     }
     println!("ok: w_base composes with a non-zero arena offset");
 }
+
+// ─── int8 dp4a (MMV) family — slice A2 ─────────────────────────────────────────────────────────
+// Same resident-vs-streamed bitwise contract as the dequant GEMVs above, with one extra input
+// stage: the activation is pre-quantized ONCE by quant_q8 (qa/dact/sact) and both legs read the
+// SAME quantized buffers, so any difference is the weight path, never the activation path.
+
+/// Quantized-activation buffers for `rows` rows of `in_f` f32s, produced on-GPU by `quant_q8`.
+struct QAct {
+    qa: Box<Buf2>,
+    dact: Box<Buf2>,
+    sact: Box<Buf2>,
+}
+type Buf2 = dyn infr_core::backend::Buffer;
+
+fn quantize_x(be: &VulkanBackend, rows: usize, in_f: usize) -> QAct {
+    let x: Vec<f32> = (0..rows * in_f)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.05 + ((i / in_f) as f32) * 0.01)
+        .collect();
+    let x_buf = be.alloc(rows * in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let nblk = in_f / 32;
+    let qa = be.alloc(rows * in_f, BufferUsage::Activations).unwrap();
+    let dact = be.alloc(rows * nblk * 2, BufferUsage::Activations).unwrap();
+    let sact = be.alloc(rows * nblk * 2, BufferUsage::Activations).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.quant_q8(
+        x_buf.as_ref(),
+        qa.as_ref(),
+        dact.as_ref(),
+        sact.as_ref(),
+        rows,
+        in_f,
+    );
+    rec.finish().unwrap();
+    QAct { qa, dact, sact }
+}
+
+/// Resident + both streamed legs for an int8-dp4a kernel; returns the three output-bit vectors.
+#[allow(clippy::too_many_arguments)]
+fn run_mmv_case(
+    be: &VulkanBackend,
+    name: String,
+    dtype: DType,
+    in_f: usize,
+    out_f: usize,
+    out_elems: usize,
+    q: &QAct,
+    dispatch_res: &dyn Fn(&infr_vulkan::Recorder, &Buf2, &Buf2),
+    dispatch_str: &dyn Fn(&infr_vulkan::Recorder, u64, &Buf2),
+) -> Case {
+    let w_bytes = weight_bytes_for(dtype, in_f * out_f);
+    let w = synth_weight_bytes(w_bytes, in_f * 31 + out_f);
+    let y_buf = be.alloc(out_elems * 4, BufferUsage::Activations).unwrap();
+
+    let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+    be.upload(w_buf.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    dispatch_res(&rec, w_buf.as_ref(), y_buf.as_ref());
+    rec.finish().unwrap();
+    let mut out = vec![0u8; out_elems * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let resident = bits(&out);
+
+    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+    be.upload(arena0.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    dispatch_str(&rec, addr0, y_buf.as_ref());
+    rec.finish().unwrap();
+    let mut out = vec![0u8; out_elems * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let streamed_at0 = bits(&out);
+
+    let off = nonzero_off(dtype);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&w);
+    let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena1.as_ref(), &backing).unwrap();
+    let rec = be.recorder().unwrap();
+    dispatch_str(&rec, addr1 + off as u64, y_buf.as_ref());
+    rec.finish().unwrap();
+    let mut out = vec![0u8; out_elems * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let streamed_atoff = bits(&out);
+
+    let _ = q; // the qa/dact/sact buffers are shared by both legs via the dispatch closures
+    Case {
+        name,
+        resident,
+        streamed_at0,
+        streamed_atoff,
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn mmv_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f) = (256usize, 8usize);
+    let q = quantize_x(&be, 1, in_f);
+    for dtype in [DType::Q4K, DType::Q6K, DType::Iq4Xs] {
+        let c = run_mmv_case(
+            &be,
+            format!("mmv dtype={dtype:?}"),
+            dtype,
+            in_f,
+            out_f,
+            out_f,
+            &q,
+            &|rec, w, y| {
+                rec.linear_mmv(
+                    dtype,
+                    w,
+                    0,
+                    q.qa.as_ref(),
+                    q.dact.as_ref(),
+                    q.sact.as_ref(),
+                    y,
+                    in_f,
+                    out_f,
+                )
+            },
+            &|rec, addr, y| {
+                rec.linear_mmv_streamed(
+                    dtype,
+                    addr,
+                    0,
+                    q.qa.as_ref(),
+                    q.dact.as_ref(),
+                    q.sact.as_ref(),
+                    y,
+                    in_f,
+                    out_f,
+                )
+            },
+        );
+        assert_case(&c);
+        println!("ok: {}", c.name);
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn mmv_mrow_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // in_f=256 exercises the OUTS4 layout (in_f < 2048), in_f=2048 the base 2-output layout;
+    // rows 1/4 hit the m4 tier, 8 the MR=8 tier, 12 the -DMRV=16 tier. Q3_K covers the
+    // funnel-shift (2-aligned block) load path.
+    for in_f in [256usize, 2048] {
+        let out_f = 8usize;
+        for dtype in [DType::Q4K, DType::Q6K, DType::Q3K, DType::Q8_0] {
+            for rows in [1usize, 4, 8, 12] {
+                let q = quantize_x(&be, rows, in_f);
+                let c = run_mmv_case(
+                    &be,
+                    format!("mmv_mrow dtype={dtype:?} rows={rows} in_f={in_f}"),
+                    dtype,
+                    in_f,
+                    out_f,
+                    rows * out_f,
+                    &q,
+                    &|rec, w, y| {
+                        rec.linear_mmv_mrow(
+                            dtype,
+                            w,
+                            0,
+                            q.qa.as_ref(),
+                            q.dact.as_ref(),
+                            q.sact.as_ref(),
+                            None,
+                            y,
+                            rows,
+                            in_f,
+                            out_f,
+                        )
+                    },
+                    &|rec, addr, y| {
+                        rec.linear_mmv_mrow_streamed(
+                            dtype,
+                            addr,
+                            0,
+                            q.qa.as_ref(),
+                            q.dact.as_ref(),
+                            q.sact.as_ref(),
+                            y,
+                            rows,
+                            in_f,
+                            out_f,
+                        )
+                    },
+                );
+                assert_case(&c);
+                println!("ok: {}", c.name);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn mmv_mw_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f) = (256usize, 8usize);
+    let q = quantize_x(&be, 1, in_f);
+    for dtype in [DType::Q4K, DType::Q6K, DType::Q2K, DType::Q3K, DType::Q5K] {
+        for warps in [4u32, 8] {
+            let c = run_mmv_case(
+                &be,
+                format!("mmv_mw dtype={dtype:?} warps={warps}"),
+                dtype,
+                in_f,
+                out_f,
+                out_f,
+                &q,
+                &|rec, w, y| {
+                    rec.linear_mmv_mw(
+                        dtype,
+                        warps,
+                        w,
+                        0,
+                        q.qa.as_ref(),
+                        q.dact.as_ref(),
+                        q.sact.as_ref(),
+                        None,
+                        y,
+                        in_f,
+                        out_f,
+                    )
+                },
+                &|rec, addr, y| {
+                    rec.linear_mmv_mw_streamed(
+                        dtype,
+                        warps,
+                        addr,
+                        0,
+                        q.qa.as_ref(),
+                        q.dact.as_ref(),
+                        q.sact.as_ref(),
+                        y,
+                        in_f,
+                        out_f,
+                    )
+                },
+            );
+            assert_case(&c);
+            println!("ok: {}", c.name);
+        }
+    }
+}

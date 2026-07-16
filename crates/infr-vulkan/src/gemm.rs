@@ -1306,6 +1306,45 @@ pub(crate) fn native_gemm_mmq_dense_spv(
         _ => return None,
     })
 }
+/// `-DSTREAMED` twin of [`native_gemm_mmq_dense_spv`] (kernel-cache name + SPIR-V) — the tiled
+/// dp4a GEMM's weight read from a `bufferDeviceAddress` arena instead of a bound SSBO. Slice A3
+/// build-variant only: nothing dispatches this yet
+/// ([`crate::recorder::Recorder::matmul_mmq_streamed`] exists purely so parity tests can exercise
+/// it). The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
+/// when the expert router grows an `arena: Option<u64>` arm at integration time.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_mmq_dense_streamed_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q4K => spv!("native_gemm_mmq_q4k_streamed"),
+        Q6K => spv!("native_gemm_mmq_q6k_streamed"),
+        Q8_0 => spv!("native_gemm_mmq_q8_0_streamed"),
+        Q5_0 => spv!("native_gemm_mmq_q5_0_streamed"),
+        Q5K => spv!("native_gemm_mmq_q5k_streamed"),
+        Q5_1 => spv!("native_gemm_mmq_q5_1_streamed"),
+        Q2K => spv!("native_gemm_mmq_q2_k_streamed"),
+        Q3K => spv!("native_gemm_mmq_q3_k_streamed"),
+        Q4_0 => spv!("native_gemm_mmq_q4_0_streamed"),
+        Q4_1 => spv!("native_gemm_mmq_q4_1_streamed"),
+        Iq4Nl => spv!("native_gemm_mmq_iq4_nl_streamed"),
+        Iq4Xs => spv!("native_gemm_mmq_iq4_xs_streamed"),
+        Iq2S => spv!("native_gemm_mmq_iq2_s_streamed"),
+        Iq3S => spv!("native_gemm_mmq_iq3_s_streamed"),
+        Mxfp4 => spv!("native_gemm_mmq_mxfp4_streamed"),
+        Nvfp4 => spv!("native_gemm_mmq_nvfp4_streamed"),
+        Q2_0 => spv!("native_gemm_mmq_q2_0_streamed"),
+        _ => return None,
+    })
+}
 /// SPIR-V for the non-coopmat float-weight prefill GEMM (the "fma-warp" tier, see
 /// `native_gemm_fma.comp`): shared-memory fma warptile for f16/bf16/f32 weights on devices
 /// without a usable f16 coopmat (adapter.rs `nc_fma`). Returns `(kernel_cache_name, spv)`;

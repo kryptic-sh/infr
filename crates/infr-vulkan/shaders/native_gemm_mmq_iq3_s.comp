@@ -48,12 +48,21 @@ layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
     uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; uint slot_bytes;
 } pc;
+#elif defined(STREAMED)
+// -DSTREAMED (resident-BDA): the stacked weight tensor lives in a resident BDA arena at the 64-bit
+// base passed as arena_lo/arena_hi — same rb() pointer read as PAGED but with NO LUT and NO slot
+// stride (the base already points at THIS tensor; pc.w_base keeps its element-offset meaning,
+// including the EXPERT_GRID per-expert stride multiply). Additive: non-STREAMED builds are
+// byte-identical.
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
 #else
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 #endif
 layout(binding = 0) readonly buffer QA { uint qa[]; };          // [m, k/4] packed int8 activations
 layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, k/32]
-#ifndef PAGED
+#if !defined(PAGED) && !defined(STREAMED)
 layout(binding = 2) readonly buffer WB { uint nw[]; };          // stacked IQ3_S weight bytes
 #endif
 #ifdef PAGED
@@ -81,7 +90,7 @@ shared uint As[BM * SP];
 shared uint Bs[BN * SP];
 shared float Bdl[BN];
 
-#ifdef PAGED
+#if defined(PAGED) || defined(STREAMED)
 // Arena read via 64-bit device address (see native_arena_ref.glsl): `nw_ptr` (set in main) is
 // this expert's slot byte base; rb() reads a byte through it. The LUT stores the SLOT INDEX,
 // scaled onto the arena base with a 64-bit multiply (replaces the u32 word-base SSBO read).
@@ -94,6 +103,9 @@ uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 
 void main() {
+#ifdef STREAMED
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address; NO LUT/slot multiply
+#endif
     grid_init(); // barrier inside — must precede the (workgroup-uniform) early return below
     uint nblk = pc.k / BLK;
     uint kw = pc.k / 4u;

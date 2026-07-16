@@ -2663,6 +2663,10 @@ fn main() {
             // above; these carry their own decode (not native_decode.glsl's), so each declares the
             // `NW(i)` chokepoint locally — see native_mmv.comp.
             "native_mmv" | "native_mmv_mrow" | "native_mmv_mw" => no_res,
+            // The tiled dp4a expert-GEMM family (base + every EXPERT_GRID tile variant). The
+            // `-DPAGED` builds already read the arena by device address (LUT/slot form) and never
+            // get a `_streamed` twin — STREAMED is the LUT-less resident form of the same read.
+            stem if stem.starts_with("native_gemm_mmq_") => !defines.iter().any(|d| d == "-DPAGED"),
             _ => false,
         }
     };

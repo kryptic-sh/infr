@@ -624,3 +624,90 @@ fn mmv_mw_streamed_matches_resident() {
         }
     }
 }
+
+// ─── tiled dp4a expert GEMM (MMQ) family — slice A3 ────────────────────────────────────────────
+// Dense (non-EXPERT_GRID) parity per dtype. The `_xp*` EXPERT_GRID streamed twins are covered by
+// composition: streamed-xp differs from resident-xp ONLY in the rb() weight source (proven here
+// per dtype) and from streamed-dense ONLY in the EXPERT_GRID row/stride logic (proven by the
+// existing resident `_xp` adapter tests — that logic is the SHARED #else arm of both compiles).
+// The xp streamed dispatch lands with the expert router's `arena: Option<u64>` arm at integration.
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn mmq_dense_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // n%64, k%32 (and k%256 so every K-quant super-block is whole); m=8 pads the C tile to 64 rows.
+    let (m, k, n) = (8usize, 256usize, 64usize);
+    let q = quantize_x(&be, m, k);
+    let c_rows = m.div_ceil(64) * 64;
+    for dtype in [
+        DType::Q4K,
+        DType::Q6K,
+        DType::Q8_0,
+        DType::Q5_0,
+        DType::Q5K,
+        DType::Q5_1,
+        DType::Q2K,
+        DType::Q3K,
+        DType::Q4_0,
+        DType::Q4_1,
+        DType::Iq4Nl,
+        DType::Iq4Xs,
+        DType::Iq2S,
+        DType::Iq3S,
+        DType::Q2_0,
+    ] {
+        let c = run_mmv_case(
+            &be,
+            format!("mmq dense dtype={dtype:?}"),
+            dtype,
+            k,
+            n,
+            c_rows * n,
+            &q,
+            &|rec, w, y| {
+                rec.matmul_mmq(
+                    dtype,
+                    q.qa.as_ref(),
+                    q.dact.as_ref(),
+                    q.sact.as_ref(),
+                    w,
+                    0,
+                    y,
+                    m,
+                    k,
+                    n,
+                )
+            },
+            &|rec, addr, y| {
+                rec.matmul_mmq_streamed(
+                    dtype,
+                    q.qa.as_ref(),
+                    q.dact.as_ref(),
+                    q.sact.as_ref(),
+                    addr,
+                    0,
+                    y,
+                    m,
+                    k,
+                    n,
+                )
+            },
+        );
+        // Padded C rows (m..c_rows) hold garbage from staged-garbage activations in BOTH legs, and
+        // the two legs' garbage can differ (the pad rows read whatever followed qa). Compare only
+        // the real m rows.
+        let real = m * n;
+        let trimmed = Case {
+            name: c.name,
+            resident: c.resident[..real].to_vec(),
+            streamed_at0: c.streamed_at0[..real].to_vec(),
+            streamed_atoff: c.streamed_atoff[..real].to_vec(),
+        };
+        assert_case(&trimmed);
+        println!("ok: {}", trimmed.name);
+    }
+}

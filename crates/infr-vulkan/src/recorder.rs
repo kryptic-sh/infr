@@ -1839,6 +1839,47 @@ impl<'a> Recorder<'a> {
         self.dispatch(kern, &bufs, 1, &push, groups);
     }
 
+    /// `-DSTREAMED` twin of [`Self::matmul_mmq`] (slice A3 build-variant: see
+    /// `crate::gemm::native_gemm_mmq_dense_streamed_spv`). Same arena-by-address convention as
+    /// [`Self::linear_native_streamed`] — the resident build's weight SSBO slot takes a small
+    /// FILLER (`qa`) since the arena is never bound as a descriptor. Not wired into any production
+    /// dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_mmq_streamed(
+        &self,
+        dtype: infr_core::DType,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        arena_addr: u64,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (name, spv) = crate::gemm::native_gemm_mmq_dense_streamed_spv(dtype)
+            .expect("matmul_mmq_streamed: dtype gated by native_gemm_mmq_dense_streamed_spv");
+        let needs_sact = infr_core::tensor::moe_mmq_needs_sact(dtype);
+        self.label_gemm(name, m, k, n);
+        let nb = if needs_sact { 5 } else { 4 };
+        let kern = self.be.kernel(name, spv, nb, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
+        if needs_sact {
+            bufs.push(Self::vkb(sact));
+        }
+        bufs.extend_from_slice(&[Self::vkb(qa), Self::vkb(c)]);
+        self.dispatch(kern, &bufs, 1, &push, groups);
+    }
+
     /// Non-coopmat float-weight prefill GEMM (the "fma-warp" tier): `c = a·W[w_base]ᵀ`, `a` f32
     /// activations, `w` raw f16/bf16/f32 words read NATIVELY (bf16 keeps its full exponent
     /// range — bits shifted `<<16` into f32 registers, no f16 clamp and no upconverted weight

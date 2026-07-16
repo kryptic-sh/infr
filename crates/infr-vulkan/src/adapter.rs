@@ -1609,7 +1609,7 @@ fn lower_op(
                             out_f,
                             splits,
                             a16.is_some(),
-                            None,
+                            w.device_addr(),
                         );
                     } else if let Some(k16) = &a16 {
                         rec.matmul_native_f16a(
@@ -1621,10 +1621,20 @@ fn lower_op(
                             m,
                             in_f,
                             out_f,
-                            None,
+                            w.device_addr(),
                         );
                     } else {
-                        rec.matmul_native_off(dt, xb, w, w_off, out, m, in_f, out_f, None);
+                        rec.matmul_native_off(
+                            dt,
+                            xb,
+                            w,
+                            w_off,
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                            w.device_addr(),
+                        );
                     }
                 } else {
                     // F16 deep-k narrow-n → SPLIT-K warptile (DG slice-7 comparative
@@ -1666,10 +1676,12 @@ fn lower_op(
                             out_f,
                             splits,
                             false,
-                            None,
+                            w.device_addr(),
                         );
                     } else {
-                        // f16 coopmat GEMM (dummy scales/mins unused at bits=16).
+                        // f16 coopmat GEMM (dummy scales/mins unused at bits=16). `matmul_proj`
+                        // internally forks on `wq.device_addr()` (see its recorder doc) — no
+                        // threading needed here.
                         rec.matmul_proj(xb, w, dummy, dummy, out, m, in_f, out_f, 16, 0);
                     }
                 }

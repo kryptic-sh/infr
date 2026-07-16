@@ -2430,6 +2430,19 @@ impl VulkanBackend {
         })
     }
 
+    /// Test-support hook: sub-allocate a resident-BDA weight tensor via [`Self::bda_weight_alloc`]
+    /// directly, bypassing `INFR_RESIDENT_BDA`/[`resident_bda_enabled`]'s process-global gate — the
+    /// same "construct the arena alloc directly, not via env" approach
+    /// `resident_bda_weight_arena_roundtrip` (this module's own `#[cfg(test)]`) uses, exposed as
+    /// `pub` so an external `tests/*.rs` integration binary (which only links the crate's public
+    /// API, never its private items) can build a buffer whose `device_addr()` reports `Some` and
+    /// drive dispatch routing on it. Boxed as `Box<dyn Buffer>` since [`VkBuffer`] itself is
+    /// private.
+    pub fn bda_weight_alloc_for_test(&self, size: usize) -> Result<Box<dyn Buffer>> {
+        self.bda_weight_alloc(size)
+            .map(|b| Box::new(b) as Box<dyn Buffer>)
+    }
+
     /// [`make_buf`](Self::make_buf) with an explicit dedicated-allocation override. Post-load
     /// memory hygiene: `force_dedicated` bypasses gpu-allocator's general (sub-allocating)
     /// memory blocks entirely, so a TRANSIENT buffer frees its `VkDeviceMemory` fully on drop.

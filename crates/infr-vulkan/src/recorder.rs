@@ -805,7 +805,10 @@ impl<'a> Recorder<'a> {
         self.sgp() == 16
     }
 
-    /// `y[rows,out] = x[rows,in] · Wᵀ` (W stored `[out,in]`).
+    /// `y[rows,out] = x[rows,in] · Wᵀ` (W stored `[out,in]`). Resident-BDA route: `w.device_addr()`
+    /// `Some` means `w` is a sub-tensor of a `bufferDeviceAddress` arena block (see
+    /// `Buffer::device_addr`'s doc) that must never be bound as a descriptor — fork to the
+    /// `-DSTREAMED` twin, addressing the weight by its 64-bit pointer instead.
     pub fn linear(
         &self,
         w: &dyn Buffer,
@@ -815,6 +818,9 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.linear_streamed(arena_addr, x, y, rows, in_f, out_f);
+        }
         self.label_gemv("lin_f16", rows, in_f, out_f);
         let k = self
             .be
@@ -845,6 +851,9 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.linear_f16_noext_streamed(arena_addr, x, y, rows, in_f, out_f);
+        }
         self.label_gemv("lin_f16_noext", rows, in_f, out_f);
         let k = self.be.kernel(
             "linear_f16_noext",
@@ -879,6 +888,9 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.linear_f32_streamed(arena_addr, x, y, rows, in_f, out_f);
+        }
         self.label_gemv("lin_f32", rows, in_f, out_f);
         // Prefill (rows>1): the ROW-TILED f32 GEMM reads each weight once per 8 rows (grid
         // out_f·ceil(rows/8)) instead of once per row — bit-identical, cuts the F32-projection
@@ -1008,6 +1020,9 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.linear_bf16_streamed(arena_addr, x, y, rows, in_f, out_f);
+        }
         self.label_gemv("lin_bf16", rows, in_f, out_f);
         let k = self
             .be
@@ -1246,6 +1261,10 @@ impl<'a> Recorder<'a> {
         bits: u32,
         blk_shift: u32,
     ) {
+        if let Some(arena_addr) = wq.device_addr() {
+            return self
+                .matmul_proj_streamed(a, arena_addr, scales, mins, c, m, k, n, bits, blk_shift);
+        }
         // Warp tile (BM=64,BN=256, 256 threads / 8 warps — matches llama.cpp's AMD-RADV large
         // warptile; the extra warps hide W-dequant latency). Wins big for M≥768 (low/mid ctx:
         // 4k+21% 8k+19% 16k+5%); at very small M (32k chunk≈500) its wide N tile still loses to the
@@ -1370,10 +1389,13 @@ impl<'a> Recorder<'a> {
         m: usize,
         k: usize,
         n: usize,
-        // `Some(arena_addr)` = the weight is a streamed dense block: read the -DSTREAMED twin of the
-        // picked tile by 64-bit arena address (native_arena_ref.glsl) instead of the bound SSBO. The
-        // resident tile selection is unchanged — only the weight SOURCE differs. See adapter.rs
-        // `streamed_prefill_gemm`. `None` everywhere else (resident weights, MoE, tests).
+        // `Some(arena_addr)` = the weight is EITHER a dense-pager streamed block (see adapter.rs
+        // `streamed_prefill_gemm`) OR a resident `INFR_RESIDENT_BDA` sub-tensor (the adapter threads
+        // `w.device_addr()` straight through for the latter — see the `Op::Linear` arm): either way,
+        // read the -DSTREAMED twin of the picked tile by 64-bit arena address
+        // (native_arena_ref.glsl) instead of the bound SSBO. The resident tile selection is
+        // unchanged — only the weight SOURCE differs. `None` for an ordinary resident SSBO weight
+        // (MoE, tests, `INFR_RESIDENT_BDA` unset).
         arena: Option<u64>,
     ) {
         // Large-warptile variant (8-warp BM=64×BN=256): 4× the math per staged A-row / decoded
@@ -2234,6 +2256,9 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.matmul_mmq_streamed(dtype, qa, dact, sact, arena_addr, w_base, c, m, k, n);
+        }
         let (name, spv) = crate::gemm::native_gemm_mmq_dense_spv(dtype)
             .expect("matmul_mmq: dtype gated by native_gemm_mmq_dense_spv");
         let needs_sact = infr_core::tensor::moe_mmq_needs_sact(dtype);
@@ -2352,6 +2377,9 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.matmul_fma_streamed(dtype, a, arena_addr, w_base, c, m, k, n);
+        }
         let (name, spv) = crate::gemm::native_gemm_fma_build_spv(dtype)
             .expect("matmul_fma: dtype gated by native_gemm_fma_build_spv");
         self.label_gemm(name, m, k, n);
@@ -2609,6 +2637,16 @@ impl<'a> Recorder<'a> {
 
     /// Native-block dequant GEMV reading the weight from element offset `w_base` — lets one stacked
     /// MoE expert tensor serve all experts (`w_base = expert_id * out_f * in_f`).
+    ///
+    /// Resident-BDA route (`w.device_addr()` is `Some`): no single `_streamed` twin mirrors this
+    /// dispatcher's own SG → variant → RM → plain precedence the way [`Self::linear_add_native`]'s
+    /// twin ([`Self::linear_add_native_streamed`]) does — each branch's kernel has its OWN
+    /// `_streamed` twin instead (see [`Self::linear_native_sg_streamed`],
+    /// [`Self::linear_native_rm_v2_streamed`], [`Self::linear_native_rm_streamed`],
+    /// [`Self::linear_native_streamed`]), built per-kernel in slice A1. This fork replicates the
+    /// SAME precedence by hand, calling each streamed twin at the exact point its resident
+    /// counterpart would fire — the build tables are 1:1 mirrored (verified against `gemm.rs`), so
+    /// every branch reachable here has a streamed kernel to route to.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_off(
         &self,
@@ -2621,6 +2659,45 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            if rows == 1 {
+                if let Some(nr) = native_sg_choice(dtype, in_f, out_f) {
+                    if crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
+                        .is_some()
+                    {
+                        self.linear_native_sg_streamed(
+                            dtype, arena_addr, w_base, x, y, in_f, out_f, nr,
+                        );
+                        return;
+                    }
+                }
+                let variant = if std::env::var("INFR_NO_GEMV_REG").is_ok() {
+                    None
+                } else {
+                    std::env::var("INFR_GEMV_VARIANT")
+                        .ok()
+                        .or_else(|| Some("reg".to_string()))
+                };
+                if let Some(ref v) = variant {
+                    if crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, false).is_some() {
+                        self.linear_native_rm_v2_streamed(
+                            v, dtype, arena_addr, w_base, x, y, in_f, out_f,
+                        );
+                        return;
+                    }
+                }
+                if let Some(rm) = native_rm_choice(dtype, out_f) {
+                    if crate::gemm::native_rm_streamed_build_spv(dtype, false, rm).is_some() {
+                        self.linear_native_rm_streamed(
+                            dtype, arena_addr, w_base, x, y, in_f, out_f, rm,
+                        );
+                        return;
+                    }
+                }
+            }
+            self.linear_native_streamed(dtype, arena_addr, w_base, x, y, rows, in_f, out_f);
+            return;
+        }
         // Reassociation-tolerant subgroup route (m=1 decode, latency-starved projection band) —
         // takes precedence over the bit-identical RM path where it saturates DRAM better.
         if rows == 1 {
@@ -2788,6 +2865,10 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         debug_assert!((2..=8).contains(&rows));
+        if let Some(arena_addr) = w.device_addr() {
+            return self
+                .linear_native_mrow_streamed(dtype, arena_addr, w_base, x, y, rows, in_f, out_f);
+        }
         self.label_gemv("mrow", rows, in_f, out_f);
         let name = crate::gemm::native_mrow_kernel_name(dtype);
         let spv = crate::gemm::native_mrow_build_spv(dtype).expect("native mrow spv");
@@ -3060,8 +3141,12 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_mmv_mw`] (slice A2 build-variant: see
-    /// `crate::gemm::native_mmv_mw_streamed_build_spv`). Non-residual only. Not wired into any
-    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    /// `crate::gemm::native_mmv_mw_streamed_build_spv`). `residual`: fused `y = residual + x·Wᵀ`,
+    /// same convention as the resident fn — the `_res_streamed` SPV already exists in the build
+    /// table (see `native_mmv_mw_streamed_build_spv`'s `res` column), this wrapper just wasn't
+    /// exposing it until the resident-BDA routing fork in [`Self::linear_mmv_mw`] needed it (a
+    /// non-unified-mmv-row1 GPU can reach the fused-add peephole on a wave32-native device with a
+    /// resident-BDA weight).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_mmv_mw_streamed(
         &self,
@@ -3072,15 +3157,18 @@ impl<'a> Recorder<'a> {
         qa: &dyn Buffer,
         dact: &dyn Buffer,
         sact: &dyn Buffer,
+        residual: Option<&dyn Buffer>,
         y: &dyn Buffer,
         in_f: usize,
         out_f: usize,
     ) {
         self.label_gemv("mmv_mw_streamed", 1, in_f, out_f);
+        let res = residual.is_some();
         let (name, spv) =
-            crate::gemm::native_mmv_mw_streamed_build_spv(dtype, false, warps, self.sg16())
+            crate::gemm::native_mmv_mw_streamed_build_spv(dtype, res, warps, self.sg16())
                 .expect("native mmv_mw streamed spv");
-        let k = self.be.kernel_sg(name, spv, 5, 24, self.sgp());
+        let nbind = if res { 6 } else { 5 };
+        let k = self.be.kernel_sg(name, spv, nbind, 24, self.sgp());
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&1u32.to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -3088,19 +3176,17 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[
-                Self::vkb(qa),
-                Self::vkb(qa),
-                Self::vkb(dact),
-                Self::vkb(sact),
-                Self::vkb(y),
-            ],
-            1,
-            &push,
-            (out_f as u32).div_ceil(warps),
-        );
+        let mut bufs = vec![
+            Self::vkb(qa),
+            Self::vkb(qa),
+            Self::vkb(dact),
+            Self::vkb(sact),
+        ];
+        if let Some(r) = residual {
+            bufs.push(Self::vkb(r));
+        }
+        bufs.push(Self::vkb(y));
+        self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(warps));
     }
 
     /// Multi-row int8 dp4a GEMV (`1 <= rows <= 16`): [`Self::linear_native_mrow`]'s shape with
@@ -3136,6 +3222,11 @@ impl<'a> Recorder<'a> {
             residual.is_none() || rows == 1,
             "fused residual is decode-only (rows=1)"
         );
+        if let Some(arena_addr) = w.device_addr() {
+            return self.linear_mmv_mrow_streamed(
+                dtype, arena_addr, w_base, qa, dact, sact, residual, y, rows, in_f, out_f,
+            );
+        }
         self.label_gemv("mmvr", rows, in_f, out_f);
         // Small-in_f shape (in_f < 2048 → fewer than 64 32-elem sub-blocks): the 2-output wg
         // leaves 64−nsub lanes idle (E2B's in_f=1536: 25% dead, single loop iteration) — the
@@ -3200,6 +3291,10 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self
+                .linear_add_native_streamed(dtype, arena_addr, x, residual, y, rows, in_f, out_f);
+        }
         let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -3351,6 +3446,9 @@ impl<'a> Recorder<'a> {
         ne: usize,
         scale: f32,
     ) {
+        if let Some(arena_addr) = table.device_addr() {
+            return self.embed_gather_streamed(dtype, arena_addr, ids, dst, rows, ne, scale);
+        }
         let name = crate::gemm::embed_gather_kernel_name(dtype);
         let spv = crate::gemm::embed_gather_build_spv(dtype).expect("embed_gather spv");
         let k = self.be.kernel(name, spv, 3, 12);
@@ -3421,6 +3519,10 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self
+                .linear_mmv_streamed(dtype, arena_addr, w_base, qa, dact, sact, y, in_f, out_f);
+        }
         self.label_gemv("mmv", 1, in_f, out_f);
         let name = crate::gemm::native_mmv_kernel_name(dtype, false);
         let spv = crate::gemm::native_mmv_build_spv(dtype, false).expect("native mmv spv");
@@ -3460,6 +3562,11 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.linear_add_mmv_streamed(
+                dtype, arena_addr, qa, dact, sact, residual, y, in_f, out_f,
+            );
+        }
         let name = crate::gemm::native_mmv_kernel_name(dtype, true);
         let spv = crate::gemm::native_mmv_build_spv(dtype, true).expect("native mmv res spv");
         let k = self.be.kernel(name, spv, 6, 16);
@@ -3549,6 +3656,11 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.linear_mmv_mw_streamed(
+                dtype, warps, arena_addr, w_base, qa, dact, sact, residual, y, in_f, out_f,
+            );
+        }
         self.label_gemv("mmv", 1, in_f, out_f);
         let res = residual.is_some();
         let (name, spv) = crate::gemm::native_mmv_mw_build_spv(dtype, res, warps, self.sg16())
@@ -3630,6 +3742,9 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if let Some(arena_addr) = w.device_addr() {
+            return self.linear_add_streamed(arena_addr, x, residual, y, rows, in_f, out_f);
+        }
         let k = self
             .be
             .kernel("linear_res", crate::gemm::linear_res_spv(), 4, 12);

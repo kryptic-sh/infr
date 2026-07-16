@@ -614,6 +614,7 @@ fn mmv_mw_streamed_matches_resident() {
                         q.qa.as_ref(),
                         q.dact.as_ref(),
                         q.sact.as_ref(),
+                        None,
                         y,
                         in_f,
                         out_f,
@@ -2036,4 +2037,283 @@ fn linear_mmv_mrow_residual_streamed_matches_resident() {
     );
     assert_case(&c);
     println!("ok: {}", c.name);
+}
+
+// ─── resident-BDA routing proof — dense model path integration ────────────────────────────────
+// Every other test in this file drives a `_streamed` twin DIRECTLY with a raw `u64` address —
+// proving the twin's math, not that anything routes to it. This test proves the wiring: it calls
+// the RESIDENT entry point (`linear_native_off`/`linear_mmv`/`matmul_mmq`/`embed_gather`) with a
+// weight buffer built via `bda_weight_alloc_for_test` (the same "construct the arena alloc
+// directly, not via env" approach `resident_bda_weight_arena_roundtrip` uses in lib.rs's own
+// tests) — a `device_addr()`-reporting sub-tensor, exactly what `INFR_RESIDENT_BDA=1` produces.
+// Each resident fn's internal `if let Some(arena_addr) = w.device_addr() { ... }` fork must catch
+// this and dispatch the `_streamed` kernel; if it forgot, `Self::vkb(w)` would either trip its
+// debug_assert (debug build) or silently mis-bind the whole arena block as a WHOLE_SIZE
+// descriptor (release build). Compared bitwise against the SAME resident fn called with an
+// ordinary bound-SSBO weight holding identical bytes.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn resident_bda_linear_route_dispatches_streamed() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+
+    // ── linear_native_off (Q4_K, m=1 decode GEMV) ─────────────────────────────────────────────
+    {
+        let dtype = DType::Q4K;
+        let (in_f, out_f) = (256usize, 64usize);
+        let w_bytes = weight_bytes_for(dtype, in_f * out_f);
+        let w = synth_weight_bytes(w_bytes, 401);
+        let x = synth_x(in_f);
+        let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+        be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+        let resident = {
+            let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+            be.upload(w_buf.as_ref(), &w).unwrap();
+            let y_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.linear_native_off(
+                dtype,
+                w_buf.as_ref(),
+                0,
+                x_buf.as_ref(),
+                y_buf.as_ref(),
+                1,
+                in_f,
+                out_f,
+            );
+            rec.finish().unwrap();
+            let mut out = vec![0u8; out_f * 4];
+            be.download(y_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+        assert!(
+            resident.iter().any(|&b| b != 0),
+            "linear_native_off: resident output is all zeros"
+        );
+
+        let routed = {
+            let w_bda = be.bda_weight_alloc_for_test(w_bytes).unwrap();
+            assert!(
+                w_bda.device_addr().is_some(),
+                "bda_weight_alloc_for_test must report Some(device_addr)"
+            );
+            be.upload(w_bda.as_ref(), &w).unwrap();
+            let y_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.linear_native_off(
+                dtype,
+                w_bda.as_ref(),
+                0,
+                x_buf.as_ref(),
+                y_buf.as_ref(),
+                1,
+                in_f,
+                out_f,
+            );
+            rec.finish().unwrap();
+            let mut out = vec![0u8; out_f * 4];
+            be.download(y_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+        assert_eq!(
+            resident, routed,
+            "linear_native_off: resident-BDA route diverged from the SSBO reference"
+        );
+        println!("ok: resident-BDA route linear_native_off dtype={dtype:?}");
+    }
+
+    // ── linear_mmv (Q4_K int8 dp4a decode GEMV) ───────────────────────────────────────────────
+    {
+        let dtype = DType::Q4K;
+        let (in_f, out_f) = (256usize, 8usize);
+        let w_bytes = weight_bytes_for(dtype, in_f * out_f);
+        let w = synth_weight_bytes(w_bytes, 402);
+        let q = quantize_x(&be, 1, in_f);
+
+        let resident = {
+            let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+            be.upload(w_buf.as_ref(), &w).unwrap();
+            let y_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.linear_mmv(
+                dtype,
+                w_buf.as_ref(),
+                0,
+                q.qa.as_ref(),
+                q.dact.as_ref(),
+                q.sact.as_ref(),
+                y_buf.as_ref(),
+                in_f,
+                out_f,
+            );
+            rec.finish().unwrap();
+            let mut out = vec![0u8; out_f * 4];
+            be.download(y_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+        assert!(
+            resident.iter().any(|&b| b != 0),
+            "linear_mmv: resident output is all zeros"
+        );
+
+        let routed = {
+            let w_bda = be.bda_weight_alloc_for_test(w_bytes).unwrap();
+            assert!(w_bda.device_addr().is_some());
+            be.upload(w_bda.as_ref(), &w).unwrap();
+            let y_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.linear_mmv(
+                dtype,
+                w_bda.as_ref(),
+                0,
+                q.qa.as_ref(),
+                q.dact.as_ref(),
+                q.sact.as_ref(),
+                y_buf.as_ref(),
+                in_f,
+                out_f,
+            );
+            rec.finish().unwrap();
+            let mut out = vec![0u8; out_f * 4];
+            be.download(y_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+        assert_eq!(
+            resident, routed,
+            "linear_mmv: resident-BDA route diverged from the SSBO reference"
+        );
+        println!("ok: resident-BDA route linear_mmv dtype={dtype:?}");
+    }
+
+    // ── matmul_mmq (Q4_K tiled dp4a prefill GEMM) ─────────────────────────────────────────────
+    {
+        let dtype = DType::Q4K;
+        let (m, k, n) = (8usize, 256usize, 64usize);
+        let w_bytes = weight_bytes_for(dtype, k * n);
+        let w = synth_weight_bytes(w_bytes, 403);
+        let q = quantize_x(&be, m, k);
+        let c_rows = m.div_ceil(64) * 64;
+
+        let resident = {
+            let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+            be.upload(w_buf.as_ref(), &w).unwrap();
+            let c_buf = be.alloc(c_rows * n * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.matmul_mmq(
+                dtype,
+                q.qa.as_ref(),
+                q.dact.as_ref(),
+                q.sact.as_ref(),
+                w_buf.as_ref(),
+                0,
+                c_buf.as_ref(),
+                m,
+                k,
+                n,
+            );
+            rec.finish().unwrap();
+            let mut out = vec![0u8; c_rows * n * 4];
+            be.download(c_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+        assert!(
+            resident.iter().any(|&b| b != 0),
+            "matmul_mmq: resident output is all zeros"
+        );
+
+        let routed = {
+            let w_bda = be.bda_weight_alloc_for_test(w_bytes).unwrap();
+            assert!(w_bda.device_addr().is_some());
+            be.upload(w_bda.as_ref(), &w).unwrap();
+            let c_buf = be.alloc(c_rows * n * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.matmul_mmq(
+                dtype,
+                q.qa.as_ref(),
+                q.dact.as_ref(),
+                q.sact.as_ref(),
+                w_bda.as_ref(),
+                0,
+                c_buf.as_ref(),
+                m,
+                k,
+                n,
+            );
+            rec.finish().unwrap();
+            let mut out = vec![0u8; c_rows * n * 4];
+            be.download(c_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+        assert_eq!(
+            resident, routed,
+            "matmul_mmq: resident-BDA route diverged from the SSBO reference"
+        );
+        println!("ok: resident-BDA route matmul_mmq dtype={dtype:?}");
+    }
+
+    // ── embed_gather (Q4_K token-embedding gather) ────────────────────────────────────────────
+    {
+        let dtype = DType::Q4K;
+        let (n_table_rows, ne, rows) = (16usize, 256usize, 4usize);
+        let scale = 0.5f32;
+        let ids: [i32; 4] = [3, 0, 7, 12];
+        let ids_buf = be.alloc(rows * 4, BufferUsage::Activations).unwrap();
+        be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+            .unwrap();
+        let w_bytes = weight_bytes_for(dtype, n_table_rows * ne);
+        let table = synth_weight_bytes(w_bytes, 404);
+
+        let resident = {
+            let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+            be.upload(w_buf.as_ref(), &table).unwrap();
+            let y_buf = be.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.embed_gather(
+                dtype,
+                w_buf.as_ref(),
+                ids_buf.as_ref(),
+                y_buf.as_ref(),
+                rows,
+                ne,
+                scale,
+            );
+            rec.finish().unwrap();
+            let mut out = vec![0u8; rows * ne * 4];
+            be.download(y_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+        assert!(
+            resident.iter().any(|&b| b != 0),
+            "embed_gather: resident output is all zeros"
+        );
+
+        let routed = {
+            let w_bda = be.bda_weight_alloc_for_test(w_bytes).unwrap();
+            assert!(w_bda.device_addr().is_some());
+            be.upload(w_bda.as_ref(), &table).unwrap();
+            let y_buf = be.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.embed_gather(
+                dtype,
+                w_bda.as_ref(),
+                ids_buf.as_ref(),
+                y_buf.as_ref(),
+                rows,
+                ne,
+                scale,
+            );
+            rec.finish().unwrap();
+            let mut out = vec![0u8; rows * ne * 4];
+            be.download(y_buf.as_ref(), &mut out).unwrap();
+            bits(&out)
+        };
+        assert_eq!(
+            resident, routed,
+            "embed_gather: resident-BDA route diverged from the SSBO reference"
+        );
+        println!("ok: resident-BDA route embed_gather dtype={dtype:?}");
+    }
 }

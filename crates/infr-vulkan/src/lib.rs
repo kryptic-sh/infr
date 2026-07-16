@@ -318,6 +318,16 @@ enum Backing {
         /// being polluted by the bytes it already spilled elsewhere.
         spilled: bool,
     },
+    /// A logical BYTE RANGE of a [`BdaWeightArena`] block's single big `vk::Buffer` (`INFR_RESIDENT_BDA=1`
+    /// resident weight sub-tensors — see [`VulkanBackend::bda_weight_alloc`]). Unlike every other
+    /// variant, `VkBuffer::buffer` here is NOT this handle's own object: it is the block's buffer,
+    /// shared byte-for-byte with every other sub-tensor carved from the same block, and with the
+    /// block's own keepalive copy. The `Arc` is what keeps the block (and therefore its memory and
+    /// buffer handle) alive for as long as any sub-tensor referencing it is alive; dropping this
+    /// variant frees NOTHING — no `destroy_buffer`, no memory free — that happens exactly once, when
+    /// the last `Arc<BdaBlockHandle>` clone (the arena's own, or the last live sub-tensor's) drops
+    /// and `BdaBlockHandle::buf`'s ordinary `VkBuffer::drop` runs.
+    BdaSub(Arc<BdaBlockHandle>),
 }
 
 struct VkBuffer {
@@ -331,6 +341,12 @@ struct VkBuffer {
     /// by [`Backing::Vram`], which owns its `VkDeviceMemory` outright.
     mem_size: u64,
     location: MemoryLocation,
+    /// Byte offset of this tensor's logical range within `buffer` — `0` for every buffer except a
+    /// resident-BDA weight sub-tensor (`Backing::BdaSub`, see [`BdaWeightArena`]), where several
+    /// `VkBuffer` handles share ONE big `vk::Buffer` (the arena block) and this field is what tells
+    /// them apart. Every upload/download/fill site that touches `buffer` at a byte offset must add
+    /// this in, and [`Buffer::device_addr`] is `block_base_addr + sub_offset`.
+    sub_offset: usize,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -344,6 +360,14 @@ impl VkBuffer {
             Backing::Pooled(a) => a.mapped_ptr().map(|p| p.as_ptr() as *mut u8),
             Backing::Arena => None,
             Backing::Vram { ptr, .. } => Some(*ptr),
+            // Defensive, not currently reachable: `bda_weight_alloc`'s blocks are plain `GpuOnly`
+            // dedicated allocations (never host-mapped), so `buf.mapped_ptr()` is `None` today. If a
+            // future block ever WERE host-visible, offsetting by `sub_offset` here is what keeps
+            // every "can I just memcpy?" call site (`upload`/`fill_buf`) correct without change.
+            Backing::BdaSub(block) => block
+                .buf
+                .mapped_ptr()
+                .map(|p| unsafe { p.add(self.sub_offset) }),
         }
     }
 }
@@ -380,9 +404,21 @@ impl Drop for VkBuffer {
                     self.shared.device.free_memory(*memory, None);
                 }
                 Backing::Arena => {}
+                // Shares the block's `vk::Buffer` handle byte-for-byte with every other sub-tensor
+                // and the block's own keepalive copy — this handle owns NEITHER the buffer object
+                // NOR its memory, only an `Arc` clone. Dropping the `Arc` (below, implicitly, when
+                // `self.backing` itself drops) is the whole of this handle's cleanup; the actual
+                // `destroy_buffer`/memory-free happens once, inside `BdaBlockHandle::buf`'s own
+                // `VkBuffer::drop`, when the last clone goes away.
+                Backing::BdaSub(_) => {}
             }
-            // Arena memory belongs to the arena block; only destroy the buffer handle here.
-            self.shared.device.destroy_buffer(self.buffer, None);
+            // Every OTHER variant owns `self.buffer` outright and must destroy it here. A `BdaSub`
+            // handle's `buffer` is an alias of the block's — destroying it here would destroy the
+            // block out from under every other sub-tensor still referencing it (and double-free when
+            // the block's own `VkBuffer` later drops), so it is the one variant that skips this.
+            if !matches!(self.backing, Backing::BdaSub(_)) {
+                self.shared.device.destroy_buffer(self.buffer, None);
+            }
         }
     }
 }
@@ -397,6 +433,12 @@ impl Buffer for VkBuffer {
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+    fn device_addr(&self) -> Option<u64> {
+        match &self.backing {
+            Backing::BdaSub(block) => Some(block.base_addr + self.sub_offset as u64),
+            _ => None,
+        }
     }
 }
 
@@ -706,6 +748,83 @@ impl WeightArena {
     }
 }
 
+// ── resident-BDA weight arena (INFR_RESIDENT_BDA) ──────────────────────────────
+//
+// Allocation-side plumbing for moving resident weights out of per-tensor SSBOs and into big BDA
+// arena blocks — the same `bufferDeviceAddress` scheme the paged-MoE/dense-streaming kernels
+// already read weights through (see `pager.rs`, `alloc_arena_bda`), just applied to the RESIDENT
+// path instead of a paged/streamed one. Nothing in `adapter.rs`/`recorder.rs`'s dispatch logic
+// reads a sub-tensor's `device_addr()` yet — that wiring is a following slice. Default OFF
+// (`INFR_RESIDENT_BDA` unset): `make_alloc` never calls into any of this, so behavior is unchanged.
+
+/// `INFR_RESIDENT_BDA=1` — opt in to sub-allocating resident weight tensors from
+/// [`BdaWeightArena`] blocks instead of the plain per-tensor / [`WeightArena`] paths. Read once and
+/// cached: flipping the env var mid-process would split one model load's tensors across two
+/// allocation strategies, which nothing downstream (a sub-tensor's `Drop`/`device_addr`) expects to
+/// handle. Default OFF — zero behavior change anywhere in this crate.
+fn resident_bda_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("INFR_RESIDENT_BDA").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+/// Byte alignment for resident-BDA weight sub-tensors within a block. Sub-tensors share one buffer
+/// object rather than getting their own `VkMemoryRequirements`, so this is a fixed constant rather
+/// than a probed one — 256 comfortably covers every access width a weight-reading shader uses (the
+/// widest today is a 16-byte vec4 load) with headroom to spare for future wider kernels.
+const BDA_WEIGHT_ALIGN: u64 = 256;
+
+/// Minimum size for a resident-BDA arena block (see [`VulkanBackend::bda_weight_alloc`]). Blocks
+/// are opened ON DEMAND — one per call that outgrows the current block's remainder — so without a
+/// floor a run of small tensors would each pay for a separate dedicated `vkAllocateMemory`. Reuses
+/// [`ARENA_OVERFLOW_BLOCK`]'s size: the same "big enough to amortize, small enough not to waste"
+/// reasoning applies unchanged.
+const BDA_BLOCK_MIN: u64 = ARENA_OVERFLOW_BLOCK;
+
+/// Keepalive + addressing info for one [`BdaWeightArena`] block: a single dedicated
+/// `bufferDeviceAddress` buffer (exactly what [`VulkanBackend::alloc_arena_bda`] builds) that
+/// resident weight tensors bump-allocate BYTE RANGES within, never separate buffer objects (see
+/// [`Backing::BdaSub`]). Held behind an `Arc` so a sub-tensor's `VkBuffer` can keep the block (and
+/// therefore its memory and buffer handle) alive without owning it: the block is destroyed by
+/// `buf`'s own `Drop` exactly once, when the last `Arc` clone — the arena's own plus every live
+/// sub-tensor's — goes away. Never stored directly on `VulkanShared` (see
+/// `VulkanBackend::bda_weight_arena`'s doc for why: `buf` holds an `Arc<VulkanShared>` clone, so
+/// that would form a reference cycle and leak the whole device, exactly the bug
+/// `backend_drop_frees_device_after_moe_pager` guards against for `moe_pager`/`dense_pager`).
+struct BdaBlockHandle {
+    /// The whole block's buffer: a `force_dedicated`, `device_address` allocation
+    /// (`Backing::Pooled`), built by `make_buf_ex` exactly like `alloc_arena_bda`'s paged-MoE arena.
+    buf: VkBuffer,
+    /// `vkGetBufferDeviceAddress(buf.buffer)` — this block's byte-0 device address. A sub-tensor's
+    /// `Buffer::device_addr` is `base_addr + sub_offset`.
+    base_addr: u64,
+}
+
+/// One [`BdaWeightArena`] block: the shared keepalive handle plus its live bump cursor. Split apart
+/// from `BdaBlockHandle` so the cursor can be mutated (behind `VulkanBackend::bda_weight_arena`'s
+/// `Mutex`) while sub-tensors hold their own `Arc` clone of the handle without needing `&mut`
+/// through it.
+struct BdaArenaBlock {
+    handle: Arc<BdaBlockHandle>,
+    /// This block's total capacity in bytes (`<= max_mem_alloc_size`).
+    size: u64,
+    /// Next free byte offset (pre-alignment). Monotonic — sub-tensors are never freed individually.
+    cursor: u64,
+}
+
+/// `INFR_RESIDENT_BDA=1` weight sub-allocator (see [`resident_bda_enabled`]). Unlike [`WeightArena`]
+/// (which pre-reserves the WHOLE model's footprint up front via `reserve_weights`), blocks here are
+/// created ON DEMAND as `bda_weight_alloc` calls outgrow the current block — this slice is pure
+/// allocation/upload plumbing and doesn't thread a loader's total through this path; an up-front
+/// version can be layered on top of the same block/bump primitives later. Each block is capped at
+/// `max_mem_alloc_size` (same reasoning as `WeightArena`'s block cap: a whole multi-GiB model can't
+/// be one `vkAllocateMemory`); a tensor never straddles a block boundary — one that doesn't fit the
+/// current block's remainder opens a fresh one.
+#[derive(Default)]
+struct BdaWeightArena {
+    blocks: Vec<BdaArenaBlock>,
+}
+
 // ── VulkanBackend ─────────────────────────────────────────────────────────────
 
 /// Vulkan device + allocator + pipeline cache.
@@ -734,6 +853,16 @@ pub struct VulkanBackend {
     /// arena/ring buffers free first; owned by the backend HANDLE, never `VulkanShared` — the Arc
     /// cycle lesson on `moe_pager`'s doc applies unchanged).
     dense_pager: crate::pager::DensePagerCell,
+    /// `INFR_RESIDENT_BDA=1` resident-weight sub-allocator (see [`BdaWeightArena`],
+    /// [`resident_bda_enabled`]) — `None` until the first resident-BDA weight alloc under the flag;
+    /// `make_alloc` routes `BufferUsage::Weights` here instead of `make_buf` when it is set.
+    ///
+    /// Same drop-ordering/ownership story as `moe_pager`/`dense_pager` above and for the identical
+    /// reason: each block's `BdaBlockHandle::buf` holds its own `Arc<VulkanShared>` clone, so
+    /// parking this arena ON `VulkanShared` would form the same reference cycle that leaked the
+    /// whole device for a paged-MoE session before `moe_pager` was moved off it — see
+    /// `backend_drop_frees_device_after_moe_pager`.
+    bda_weight_arena: Mutex<Option<BdaWeightArena>>,
     shared: Arc<VulkanShared>,
 }
 
@@ -1709,6 +1838,7 @@ impl VulkanBackend {
         Ok(Self {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
+            bda_weight_arena: Mutex::new(None),
             shared: Arc::new(VulkanShared {
                 _entry: entry,
                 instance,
@@ -2200,6 +2330,7 @@ impl VulkanBackend {
             size,
             mem_size: requirements.size,
             location: MemoryLocation::GpuOnly,
+            sub_offset: 0,
         })
     }
 
@@ -2222,6 +2353,81 @@ impl VulkanBackend {
                 .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(handle))
         };
         Ok((Box::new(buf) as Box<dyn Buffer>, addr))
+    }
+
+    /// Sub-allocate `size` bytes for a resident weight tensor from the `INFR_RESIDENT_BDA` arena
+    /// (see [`BdaWeightArena`], [`resident_bda_enabled`]). Bump-allocates within the current block
+    /// at [`BDA_WEIGHT_ALIGN`]; when the request doesn't fit the current block's remainder, opens a
+    /// fresh dedicated block (never splitting a tensor across two blocks — the same rule
+    /// `WeightArena::bump` follows for the plain SSBO arena). Returns a `VkBuffer` that shares the
+    /// block's single `vk::Buffer` handle (`Backing::BdaSub`) with `sub_offset` set to this tensor's
+    /// offset within it — see that variant's doc for why the handle must never be bound as a
+    /// descriptor at its full range.
+    fn bda_weight_alloc(&self, size: usize) -> Result<VkBuffer> {
+        let want = (size as u64).max(1).next_multiple_of(BDA_WEIGHT_ALIGN);
+        let mut guard = self.bda_weight_arena.lock().unwrap();
+        let arena = guard.get_or_insert_with(BdaWeightArena::default);
+
+        if let Some(b) = arena.blocks.last_mut() {
+            let off = b.cursor.div_ceil(BDA_WEIGHT_ALIGN) * BDA_WEIGHT_ALIGN;
+            if off + want <= b.size {
+                b.cursor = off + want;
+                return Ok(VkBuffer {
+                    shared: Arc::clone(&self.shared),
+                    buffer: b.handle.buf.buffer,
+                    backing: Backing::BdaSub(Arc::clone(&b.handle)),
+                    size,
+                    mem_size: 0,
+                    location: MemoryLocation::GpuOnly,
+                    sub_offset: off as usize,
+                });
+            }
+        }
+
+        // The current block (if any) has no room: open a fresh dedicated block sized to the
+        // request, floored at `BDA_BLOCK_MIN` and capped at `max_mem_alloc_size` — a whole
+        // multi-GiB model can't be one `vkAllocateMemory`, same reasoning as `WeightArena`'s block
+        // cap. A single tensor bigger than the cap can't be placed at all; report it rather than
+        // silently truncating.
+        let block_bytes = want.max(BDA_BLOCK_MIN).min(self.shared.max_mem_alloc_size);
+        if want > block_bytes {
+            return Err(be(format!(
+                "resident-BDA weight tensor ({want} bytes) exceeds max_mem_alloc_size ({} bytes) \
+                 — cannot fit in a single arena block",
+                self.shared.max_mem_alloc_size
+            )));
+        }
+        let block_buf = self.make_buf_ex(
+            block_bytes as usize,
+            MemoryLocation::GpuOnly,
+            "resident-bda",
+            true,
+            true,
+        )?;
+        let buffer = block_buf.buffer;
+        let base_addr = unsafe {
+            self.shared
+                .device
+                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+        };
+        let handle = Arc::new(BdaBlockHandle {
+            buf: block_buf,
+            base_addr,
+        });
+        arena.blocks.push(BdaArenaBlock {
+            handle: Arc::clone(&handle),
+            size: block_bytes,
+            cursor: want,
+        });
+        Ok(VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::BdaSub(handle),
+            size,
+            mem_size: 0,
+            location: MemoryLocation::GpuOnly,
+            sub_offset: 0,
+        })
     }
 
     /// [`make_buf`](Self::make_buf) with an explicit dedicated-allocation override. Post-load
@@ -2338,6 +2544,7 @@ impl VulkanBackend {
                             size,
                             mem_size: requirements.size,
                             location,
+                            sub_offset: 0,
                         });
                     }
                     Err(e) => {
@@ -2447,13 +2654,17 @@ impl VulkanBackend {
             size,
             mem_size: requirements.size,
             location,
+            sub_offset: 0,
         })
     }
 
     /// Fill a buffer with the repeated byte `byte` (0x00 = zero-init, 0xFF = poison). Host-visible
     /// buffers are memset through the mapped pointer (no submit); device-local buffers use
-    /// `vkCmdFillBuffer` via a one-shot submit. Each `VkBuffer` owns a distinct `vk::Buffer` handle
-    /// addressing its region from offset 0 (arena buffers included), so filling `[0, size)` is correct.
+    /// `vkCmdFillBuffer` via a one-shot submit. Every OTHER `VkBuffer` owns a distinct `vk::Buffer`
+    /// handle addressing its region from offset 0 (plain `WeightArena` buffers included), so filling
+    /// `[0, size)` of the handle is correct; a resident-BDA sub-tensor (`Backing::BdaSub`) instead
+    /// shares its block's ONE big handle, so the fill must start at `buf.sub_offset` or it would
+    /// clobber whatever tensor happens to sit at the block's byte 0.
     fn fill_buf(&self, buf: &VkBuffer, byte: u8) -> Result<()> {
         if let Some(ptr) = buf.mapped_ptr() {
             unsafe { std::ptr::write_bytes(ptr, byte, buf.size) };
@@ -2462,9 +2673,10 @@ impl VulkanBackend {
             let size = (buf.size / 4 * 4) as u64; // vkCmdFillBuffer requires a 4-byte multiple
             if size > 0 {
                 let vkbuf = buf.buffer;
+                let off = buf.sub_offset as u64;
                 let shared = Arc::clone(&self.shared);
                 self.one_shot(move |cmd| unsafe {
-                    shared.device.cmd_fill_buffer(cmd, vkbuf, 0, size, word);
+                    shared.device.cmd_fill_buffer(cmd, vkbuf, off, size, word);
                 })?;
             }
         }
@@ -2486,22 +2698,22 @@ impl VulkanBackend {
             .iter()
             .map(|&b| self.make_alloc(b, usage))
             .collect::<Result<_>>()?;
-        let mut dev: Vec<(vk::Buffer, u64)> = Vec::new();
+        let mut dev: Vec<(vk::Buffer, u64, u64)> = Vec::new();
         for buf in &bufs {
             if let Some(ptr) = buf.mapped_ptr() {
                 unsafe { std::ptr::write_bytes(ptr, 0u8, buf.size) };
             } else {
                 let size = (buf.size / 4 * 4) as u64; // vkCmdFillBuffer requires a 4-byte multiple
                 if size > 0 {
-                    dev.push((buf.buffer, size));
+                    dev.push((buf.buffer, buf.sub_offset as u64, size));
                 }
             }
         }
         if !dev.is_empty() {
             let shared = Arc::clone(&self.shared);
             self.one_shot(move |cmd| unsafe {
-                for (b, size) in dev {
-                    shared.device.cmd_fill_buffer(cmd, b, 0, size, 0);
+                for (b, off, size) in dev {
+                    shared.device.cmd_fill_buffer(cmd, b, off, size, 0);
                 }
             })?;
         }
@@ -2514,6 +2726,17 @@ impl VulkanBackend {
     /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
     /// progress bar. Zero/poison filling is applied by the callers.
     fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
+        // `INFR_RESIDENT_BDA=1` (default OFF): resident weight tensors sub-allocate from the BDA
+        // arena instead of the ReBAR / `WeightArena` / gpu-allocator paths inside `make_buf` — see
+        // `bda_weight_alloc`. Every other `BufferUsage` (and the flag OFF) is byte-for-byte the old
+        // behavior below.
+        if usage == BufferUsage::Weights && resident_bda_enabled() {
+            let buf = self.bda_weight_alloc(bytes)?;
+            if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
+                pb.inc(bytes as u64);
+            }
+            return Ok(buf);
+        }
         let (location, label) = match usage {
             BufferUsage::Weights => (MemoryLocation::GpuOnly, "weights"),
             BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
@@ -2544,7 +2767,13 @@ impl VulkanBackend {
     ///
     /// Uploads are not awaited here; [`WeightProgress::drop`] drains the ring, which happens long
     /// before any forward is submitted.
-    fn upload_staged_ring(&self, dst_buf: vk::Buffer, src: &[u8]) -> Result<()> {
+    ///
+    /// `dst_base` is added to every chunk's destination offset — `0` for an ordinary weight buffer
+    /// (the tensor owns `dst_buf` outright, so its region starts at byte 0), or a resident-BDA
+    /// sub-tensor's `sub_offset` when `dst_buf` is actually a whole arena BLOCK shared with other
+    /// tensors (see [`Backing::BdaSub`]) — without it every such tensor would land at the block's
+    /// byte 0 and overwrite whatever the previous tensor wrote there.
+    fn upload_staged_ring(&self, dst_buf: vk::Buffer, dst_base: u64, src: &[u8]) -> Result<()> {
         let device = &self.shared.device;
         let mut guard = self.shared.staging_ring.lock().unwrap();
         if guard.is_none() {
@@ -2590,7 +2819,7 @@ impl VulkanBackend {
                     dst_buf,
                     &[vk::BufferCopy {
                         src_offset: 0,
-                        dst_offset: off as u64,
+                        dst_offset: dst_base + off as u64,
                         size: n as u64,
                     }],
                 );
@@ -2783,7 +3012,7 @@ impl Backend for VulkanBackend {
         // (and for a tensor larger than the ring's slot on a non-load path) it is a single
         // synchronous copy.
         if self.shared.weight_pb.lock().unwrap().is_some() {
-            return self.upload_staged_ring(vk_dst.buffer, src);
+            return self.upload_staged_ring(vk_dst.buffer, vk_dst.sub_offset as u64, src);
         }
 
         let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_staging")?;
@@ -2794,13 +3023,16 @@ impl Backend for VulkanBackend {
 
         let stg_buf = staging.buffer;
         let dst_buf = vk_dst.buffer;
+        // `dst.sub_offset` — 0 for every ordinary buffer; a resident-BDA sub-tensor's offset within
+        // its block's shared `vk::Buffer` otherwise (see `Backing::BdaSub`).
+        let dst_off = vk_dst.sub_offset as u64;
         let size = src.len() as u64;
         // Clone the Arc so the closure is independent of `self`.
         let shared = Arc::clone(&self.shared);
         self.one_shot(move |cmd| {
             let region = vk::BufferCopy {
                 src_offset: 0,
-                dst_offset: 0,
+                dst_offset: dst_off,
                 size,
             };
             unsafe {
@@ -2841,11 +3073,14 @@ impl Backend for VulkanBackend {
 
             let src_buf = vk_src.buffer;
             let stg_buf = staging.buffer;
+            // `src.sub_offset` — see `upload`'s `dst_off`; a resident-BDA sub-tensor reads from its
+            // offset within the block's shared `vk::Buffer`, not from byte 0.
+            let src_off = vk_src.sub_offset as u64;
             let size = dst.len() as u64;
             let shared = Arc::clone(&self.shared);
             self.one_shot(move |cmd| {
                 let region = vk::BufferCopy {
-                    src_offset: 0,
+                    src_offset: src_off,
                     dst_offset: 0,
                     size,
                 };
@@ -3122,6 +3357,83 @@ mod tests {
         assert_eq!(
             back0[3], 3u8,
             "first arena buffer corrupted by later allocs"
+        );
+    }
+
+    /// Resident-BDA weight arena (`INFR_RESIDENT_BDA`): sub-allocate three odd-sized weight buffers
+    /// directly from `bda_weight_alloc` (bypassing the env flag / `resident_bda_enabled`'s
+    /// process-global `OnceLock` entirely, so this test can't race other tests that touch
+    /// `BufferUsage::Weights` in the same process), and verify:
+    ///   * every sub-tensor reports `Some(device_addr)`,
+    ///   * addresses are 256-byte aligned and strictly increasing within the (single, since the
+    ///     three sizes together are far under `BDA_BLOCK_MIN`) block,
+    ///   * distinct byte patterns uploaded to each round-trip intact — proving the `sub_offset`
+    ///     plumbing on both `upload` (staged one-shot path, no weight-load scope open) and
+    ///     `download`,
+    ///   * a plain `Activations` alloc through the ordinary `Backend::alloc` path still reports
+    ///     `device_addr() == None` — the flag only ever affects `Weights` allocs routed through
+    ///     `bda_weight_alloc`, never anything else.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn resident_bda_weight_arena_roundtrip() {
+        let be = match VulkanBackend::new() {
+            Ok(b) => b,
+            Err(_) => {
+                eprintln!("skip: no Vulkan GPU");
+                return;
+            }
+        };
+        let sizes = [1000usize, 4096, 300_000];
+        let mut addrs = Vec::new();
+        let mut bufs = Vec::new();
+        for (bi, &sz) in sizes.iter().enumerate() {
+            let data: Vec<u8> = (0..sz)
+                .map(|i| (i as u8).wrapping_add(bi as u8 * 53))
+                .collect();
+            let buf = be.bda_weight_alloc(sz).expect("bda_weight_alloc");
+            let addr = buf
+                .device_addr()
+                .expect("resident-BDA sub-tensor must report Some(device_addr)");
+            assert_eq!(
+                addr % 256,
+                0,
+                "sub-tensor {bi} device_addr {addr:#x} is not 256-byte aligned"
+            );
+            if let Some(&prev) = addrs.last() {
+                assert!(
+                    addr > prev,
+                    "sub-tensor {bi} device_addr {addr:#x} did not increase past the previous \
+                     tensor's {prev:#x}"
+                );
+            }
+            addrs.push(addr);
+
+            be.upload(&buf, &data).expect("upload");
+            let mut back = vec![0u8; sz];
+            be.download(&buf, &mut back).expect("download");
+            assert_eq!(
+                back, data,
+                "sub-tensor {bi} (size {sz}) round-trip mismatch"
+            );
+            bufs.push(buf);
+        }
+        // All three coexist in distinct byte ranges of the same block — re-check the first after
+        // the later uploads landed, proving they didn't overlap/clobber it.
+        let mut back0 = vec![0u8; sizes[0]];
+        be.download(&bufs[0], &mut back0).expect("re-download");
+        assert_eq!(
+            back0[1], 1u8,
+            "first sub-tensor corrupted by later resident-BDA allocs"
+        );
+
+        // A plain Activations alloc is unaffected by any of this — never routed through
+        // `bda_weight_alloc`, so it must report no device address.
+        let act = be
+            .alloc(64, BufferUsage::Activations)
+            .expect("Activations alloc");
+        assert!(
+            act.device_addr().is_none(),
+            "an ordinary Activations buffer must not report a device_addr"
         );
     }
 

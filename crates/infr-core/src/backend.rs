@@ -355,6 +355,16 @@ pub trait Buffer: Send + Sync {
     /// Downcast hook so a backend can recover its concrete buffer type from a `&dyn Buffer`
     /// bound by the model (every buffer a backend sees was allocated by itself).
     fn as_any(&self) -> &dyn std::any::Any;
+    /// `Some(addr)` when this buffer's contents live inside a `bufferDeviceAddress` arena block at
+    /// device address `addr` (a resident-weight sub-tensor — see `infr-vulkan`'s
+    /// `INFR_RESIDENT_BDA`), rather than being its own independently-bound buffer object. A shader
+    /// MUST read such a buffer through its 64-bit device address; it must NEVER be bound as a
+    /// descriptor at its full range (`(0, WHOLE_SIZE)`) — that binding describes the WHOLE arena
+    /// block, not this tensor's byte range within it. `None` (the default) for every ordinary
+    /// buffer, which is every buffer today.
+    fn device_addr(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A compiled, ready-to-run graph (pipelines + command buffers for Vulkan, an op schedule for CPU).

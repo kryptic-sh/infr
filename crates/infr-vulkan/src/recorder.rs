@@ -774,7 +774,23 @@ impl<'a> Recorder<'a> {
         }
     }
 
+    /// `&dyn Buffer` → raw `vk::Buffer` handle — the SOLE choke point every dispatch call site in
+    /// this file goes through before a buffer lands in `bind_descriptors`'s `(0, WHOLE_SIZE)`
+    /// descriptor bindings. A resident-BDA sub-tensor (`Buffer::device_addr` returns `Some`) must
+    /// never be bound that way — it is a logical byte range of a shared multi-GiB arena block, and a
+    /// WHOLE_SIZE bind would describe the whole block, not the tensor (see `Buffer::device_addr`'s
+    /// doc and `Backing::BdaSub`). Caught here, at the earliest possible point, rather than as a
+    /// wrong-data bug downstream: nothing in `adapter.rs` reads `device_addr()` yet (that wiring is
+    /// a following slice), so today this only fires if `INFR_RESIDENT_BDA=1` is set and a forward
+    /// still runs the OLD per-tensor descriptor-bind dispatch — exactly the accidental-bind case
+    /// this exists to catch. Every filler/activation/scale buffer this file binds is ordinary (`None`),
+    /// so the assertion is silent in normal operation.
     fn vkb(b: &dyn Buffer) -> vk::Buffer {
+        debug_assert!(
+            b.device_addr().is_none(),
+            "bound a resident-BDA sub-tensor as a whole-range descriptor — read it via \
+             device_addr() instead, never via bind_descriptors' (0, WHOLE_SIZE)"
+        );
         unsafe { as_vk_buf(b) }.buffer
     }
 

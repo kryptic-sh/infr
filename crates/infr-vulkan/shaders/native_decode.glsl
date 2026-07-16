@@ -311,6 +311,20 @@ uvec2 k4(uint i, uint sb) {
     uint mn = (rb(sb + i + 4u) >> 4u) | ((rb(sb + i) >> 6u) << 4u);
     return uvec2(sc, mn);
 }
+// k4 on the in-register 16-byte block header (hdr = NW4 of the block base: hdr.x = d|dmin,
+// hdr.y/z/w = scales[12]). Same bytes k4 reads through rb() — bit-identical — but from registers:
+// under -DSTREAMED each rb() is its own un-fusable BDA deref (measured: 6 scalar global_load_b32
+// per dqblk on the Q4K warp GEMM, where the descriptor twin's header reads fuse to b32/b64/b96),
+// so the caller loads the header ONCE as a b128 quad and extracts here. byte b of word w is
+// bitfieldExtract(w, 8b, 8).
+uint k4b(uint w, uint b) { return bitfieldExtract(w, int(b << 3u), 8); }
+uvec2 k4w(uint i, uvec4 hdr) {
+    if (i < 4u) { return uvec2(k4b(hdr.y, i) & 63u, k4b(hdr.z, i) & 63u); }
+    uint j = i - 4u;
+    uint sc = (k4b(hdr.w, j) & 0xFu) | ((k4b(hdr.y, j) >> 6u) << 4u);
+    uint mn = (k4b(hdr.w, j) >> 4u) | ((k4b(hdr.z, j) >> 6u) << 4u);
+    return uvec2(sc, mn);
+}
 #endif
 
 #if defined(FMT_Q4K)
@@ -329,8 +343,11 @@ float dq(uint g) {
 void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once for the sub-block.
     uint sblk = gstart / 32u; uint super = sblk / 8u; uint sub = sblk % 8u;
     uint bd = super * 144u;
-    float d = f16tof32(ru16(bd)); float dmin = f16tof32(ru16(bd + 2u));
-    uvec2 k = k4(sub, bd + 4u);
+    // One b128 header quad (bd is 16B-aligned: 144%16==0) instead of byte-chokepoint rb()/ru16()
+    // reads — same bytes, bit-identical (see k4w).
+    uvec4 hdr = NW4(bd >> 2u);
+    float d = f16tof32(hdr.x); float dmin = f16tof32(hdr.x >> 16u);
+    uvec2 k = k4w(sub, hdr);
     float dl = d * float(k.x); float mm = dmin * float(k.y);
     // Word-parallel qs: block byte offsets are 4-aligned (144%4==0, qs at +16, sub-row stride 32)
     // — load 8 whole u32s instead of 32 rb() byte-extract chains; nibble select hoisted (constant
@@ -370,8 +387,10 @@ float dq(uint g) {
 void dqblk(uint gstart, out float v[32]) {  // decode d/dmin/6-bit scale once for the sub-block.
     uint sblk = gstart / 32u; uint super = sblk / 8u; uint sub = sblk % 8u;
     uint bd = super * 176u;
-    float d = f16tof32(ru16(bd)); float dmin = f16tof32(ru16(bd + 2u));
-    uvec2 k = k4(sub, bd + 4u);
+    // One b128 header quad (bd is 16B-aligned: 176%16==0) — same bytes, bit-identical (see k4w).
+    uvec4 hdr = NW4(bd >> 2u);
+    float d = f16tof32(hdr.x); float dmin = f16tof32(hdr.x >> 16u);
+    uvec2 k = k4w(sub, hdr);
     float dl = d * float(k.x); float mm = dmin * float(k.y);
     // Word-parallel qs+qh: block byte offsets are 4-aligned (176%4==0, qh at +16, qs at +48) —
     // 16 whole-u32 loads instead of 64 rb() byte-extract chains, nibble/high-bit selects hoisted

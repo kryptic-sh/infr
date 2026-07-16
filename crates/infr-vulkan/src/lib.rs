@@ -832,6 +832,11 @@ struct BdaArenaBlock {
 /// sub-tensor's own `(sub_offset, range)` rather than the whole block's `(0, WHOLE_SIZE)`, which is
 /// what makes it safe for the small unforked weight consumers (norm gammas, biases, rope tables)
 /// that have no `-DSTREAMED` twin to read this arena the same way they'd read any ordinary buffer.
+///
+/// Addressing invariant (audited): the 64-bit promotion protects the arena/expert BASE; intra-tensor
+/// offsets remain u32 — each addressing unit (one dense tensor / one per-expert slice) must stay
+/// < 4 Gi elements and < 4 GiB bytes; enforced today by model reality, revisit for >4 GiB single
+/// tensors.
 #[derive(Default)]
 struct BdaWeightArena {
     blocks: Vec<BdaArenaBlock>,
@@ -2285,6 +2290,14 @@ impl VulkanBackend {
     ///
     /// The caller owns `buffer` and must destroy it if this returns `Err`. Budget-guarded and
     /// charged to `device_used` (or `uma_spilled` when `spilled`) like any other allocation.
+    ///
+    /// `device_address` must mirror the buffer's `SHADER_DEVICE_ADDRESS` usage: when the buffer was
+    /// created with that usage (a paged-MoE `alloc_arena_bda` / resident-BDA `bda_weight_alloc`
+    /// block that spilled onto the UMA overflow heap), its backing memory MUST carry the
+    /// `DEVICE_ADDRESS` alloc flag too, or binding it violates
+    /// VUID-VkMemoryAllocateInfo-flags-03331 (validation error / a bogus 64-bit `device_addr()`).
+    /// This is the manual mirror of the flag gpu-allocator sets on its own path (it was built with
+    /// `buffer_device_address: true`). Every non-device_address caller passes `false`.
     fn alloc_vram_mapped(
         &self,
         buffer: vk::Buffer,
@@ -2292,18 +2305,20 @@ impl VulkanBackend {
         requirements: &vk::MemoryRequirements,
         ty: u32,
         spilled: bool,
+        device_address: bool,
     ) -> Result<VkBuffer> {
         self.check_vram_budget(requirements.size)?;
 
-        let memory = unsafe {
-            self.shared.device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(requirements.size)
-                    .memory_type_index(ty),
-                None,
-            )
+        let mut flags_info =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(ty);
+        if device_address {
+            alloc_info = alloc_info.push_next(&mut flags_info);
         }
-        .map_err(|e| be(format!("rebar allocate_memory({}): {e}", requirements.size)))?;
+        let memory = unsafe { self.shared.device.allocate_memory(&alloc_info, None) }
+            .map_err(|e| be(format!("rebar allocate_memory({}): {e}", requirements.size)))?;
 
         let ptr = match unsafe {
             self.shared
@@ -2514,7 +2529,14 @@ impl VulkanBackend {
             if let Some(ty) = self.shared.rebar_type {
                 // Only if the buffer's requirements actually permit that memory type.
                 if requirements.memory_type_bits & (1 << ty) != 0 {
-                    match self.alloc_vram_mapped(buffer, size, &requirements, ty, false) {
+                    match self.alloc_vram_mapped(
+                        buffer,
+                        size,
+                        &requirements,
+                        ty,
+                        false,
+                        device_address,
+                    ) {
                         Ok(b) => return Ok(b),
                         Err(e) => {
                             // Out of host-visible VRAM (or map failed): fall through to the normal
@@ -2632,7 +2654,14 @@ impl VulkanBackend {
                     // straight back to here, and RADV would accept the allocation anyway and hand
                     // the failure to the next submit as a device-lost — the exact thing this
                     // spill exists to prevent).
-                    return match self.alloc_vram_mapped(buffer, size, &requirements, ty, true) {
+                    return match self.alloc_vram_mapped(
+                        buffer,
+                        size,
+                        &requirements,
+                        ty,
+                        true,
+                        device_address,
+                    ) {
                         Ok(b) => Ok(b),
                         Err(e) => {
                             // `alloc_vram_mapped` leaves the buffer to us on failure.
@@ -3004,11 +3033,16 @@ impl Backend for VulkanBackend {
         // Safety: every buffer from this backend is a VkBuffer.
         let (s, d) = unsafe { (as_vk_buf(src), as_vk_buf(dst)) };
         let (sb, db) = (s.buffer, d.buffer);
+        // `sub_offset` — 0 for every ordinary buffer (all of today's callers pass KV/state
+        // Activations buffers, whose handle IS the tensor), but a resident-BDA sub-tensor shares
+        // its block's `vk::Buffer` and lives at its offset within it (see `Backing::BdaSub`), so
+        // fold each side's `sub_offset` in the same way `upload`/`download`/`fill_buf` do.
+        let (src_off, dst_off) = (s.sub_offset as u64, d.sub_offset as u64);
         // one_shot's queue_wait_idle provides the ordering fence vs prior/following work.
         self.one_shot(move |cmd| unsafe {
             let region = vk::BufferCopy {
-                src_offset: 0,
-                dst_offset: 0,
+                src_offset: src_off,
+                dst_offset: dst_off,
                 size: bytes as u64,
             };
             self.shared.device.cmd_copy_buffer(cmd, sb, db, &[region]);

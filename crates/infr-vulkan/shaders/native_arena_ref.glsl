@@ -1,5 +1,7 @@
-// Buffer-device-address (BDA) access to the paged-MoE expert arena. Included ONLY by the `-DPAGED`
-// builds of the expert kernels (native_gemv_id(_multi).comp and every native_gemm_mmq_*.comp).
+// Buffer-device-address (BDA) access to the resident expert arena. Included by every expert kernel
+// build that reads weights by device address rather than a bound SSBO — both the `-DPAGED` (paged
+// expert pool) and `-DSTREAMED` (streamed dense/expert prefill, e.g. native_gemm_warp.comp:162)
+// variants of native_gemv_id(_multi).comp and the native_gemm_mmq_*.comp / native_mmv*.comp family.
 //
 // The arena is a device-local buffer created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS, addressed
 // by its 64-bit VkDeviceAddress rather than a bound SSBO. A single SSBO binding caps at

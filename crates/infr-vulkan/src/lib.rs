@@ -327,6 +327,12 @@ enum Backing {
     /// variant frees NOTHING — no `destroy_buffer`, no memory free — that happens exactly once, when
     /// the last `Arc<BdaBlockHandle>` clone (the arena's own, or the last live sub-tensor's) drops
     /// and `BdaBlockHandle::buf`'s ordinary `VkBuffer::drop` runs.
+    ///
+    /// Descriptor binds of a sub-tensor (`recorder::Recorder::vkb`) are legal as long as they carry
+    /// this tensor's own `(sub_offset, range)`, never `(0, WHOLE_SIZE)` — the latter describes the
+    /// whole shared block, not the tensor. A big matmul weight is instead read through its 64-bit
+    /// `device_addr()` by a `-DSTREAMED` shader twin, required once the range would exceed
+    /// `maxStorageBufferRange`/4 GiB and preferred for the big matmul families regardless.
     BdaSub(Arc<BdaBlockHandle>),
 }
 
@@ -820,6 +826,12 @@ struct BdaArenaBlock {
 /// `max_mem_alloc_size` (same reasoning as `WeightArena`'s block cap: a whole multi-GiB model can't
 /// be one `vkAllocateMemory`); a tensor never straddles a block boundary — one that doesn't fit the
 /// current block's remainder opens a fresh one.
+///
+/// Sub-tensors CAN be bound as descriptors (unlike the paged-MoE/dense-streaming `alloc_arena_bda`
+/// blocks, which are only ever read by device address): `recorder::Recorder::vkb` binds each
+/// sub-tensor's own `(sub_offset, range)` rather than the whole block's `(0, WHOLE_SIZE)`, which is
+/// what makes it safe for the small unforked weight consumers (norm gammas, biases, rope tables)
+/// that have no `-DSTREAMED` twin to read this arena the same way they'd read any ordinary buffer.
 #[derive(Default)]
 struct BdaWeightArena {
     blocks: Vec<BdaArenaBlock>,

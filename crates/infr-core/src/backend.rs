@@ -357,11 +357,16 @@ pub trait Buffer: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
     /// `Some(addr)` when this buffer's contents live inside a `bufferDeviceAddress` arena block at
     /// device address `addr` (a resident-weight sub-tensor — see `infr-vulkan`'s
-    /// `INFR_RESIDENT_BDA`), rather than being its own independently-bound buffer object. A shader
-    /// MUST read such a buffer through its 64-bit device address; it must NEVER be bound as a
-    /// descriptor at its full range (`(0, WHOLE_SIZE)`) — that binding describes the WHOLE arena
-    /// block, not this tensor's byte range within it. `None` (the default) for every ordinary
-    /// buffer, which is every buffer today.
+    /// `INFR_RESIDENT_BDA`), rather than being its own independently-bound buffer object. A big
+    /// matmul weight reads such a buffer through its 64-bit device address via a `-DSTREAMED` shader
+    /// twin instead of a descriptor bind — required once the tensor's range would exceed
+    /// `maxStorageBufferRange`/4 GiB, and the preferred path for the big matmul families regardless.
+    /// A small weight tensor with no streamed twin (a norm gamma, bias, or rope table) may instead
+    /// be BOUND as a descriptor: the bind must cover only this tensor's own `(sub_offset, range)`,
+    /// never `(0, WHOLE_SIZE)` — a `WHOLE_SIZE` bind describes the WHOLE arena block, not this
+    /// tensor's byte range within it (see `infr-vulkan`'s `Recorder::vkb`, the sole choke point that
+    /// builds such binds correctly). `None` (the default) for every ordinary buffer, which is every
+    /// buffer today outside `INFR_RESIDENT_BDA=1`.
     fn device_addr(&self) -> Option<u64> {
         None
     }

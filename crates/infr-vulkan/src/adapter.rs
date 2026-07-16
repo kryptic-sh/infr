@@ -3944,7 +3944,10 @@ pub(crate) fn execute_chain(
     be_.download(ring.as_ref(), &mut rbytes)?;
     let ring_u32: &[u32] = bytemuck::cast_slice(&rbytes);
     let ids = (1..=n as u32)
-        .map(|i| ring_u32[((p0 + i) & 63) as usize])
+        // `p0` can be the `-1i32 as u32` sentinel from `read_pos0` (no prior decode yet); the `&
+        // 63` mask below is applied AFTER the add, so wrapping is the arithmetically correct sum
+        // — only the non-wrapping `+` panics in debug on the sentinel.
+        .map(|i| ring_u32[(p0.wrapping_add(i) & 63) as usize])
         .collect();
     Ok(Some(ids))
 }

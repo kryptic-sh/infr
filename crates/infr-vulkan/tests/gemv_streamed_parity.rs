@@ -2317,3 +2317,93 @@ fn resident_bda_linear_route_dispatches_streamed() {
         println!("ok: resident-BDA route embed_gather dtype={dtype:?}");
     }
 }
+
+// ─── resident-BDA sub-range descriptor bind ────────────────────────────────────────────────────
+// `rmsnorm`'s gamma has no `-DSTREAMED` twin (it is a small resident weight, unlike the big matmul
+// families above), so a resident-BDA gamma is BOUND as a descriptor via `Recorder::vkb`, never read
+// through `device_addr()`. This allocates TWO tensors back-to-back from the same arena block, so the
+// SECOND lands at a NON-ZERO byte offset: the first is garbage that must never be read by the second
+// tensor's dispatch. If `vkb` ever regressed to binding `(0, WHOLE_SIZE)` — the whole shared block,
+// not the tensor's own `(sub_offset, range)` — the kernel would read the garbage tensor's bytes
+// (which sit at the block's byte 0) instead of the real gamma, and the output would diverge from an
+// ordinary-buffer reference computed over the identical gamma bytes.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn resident_bda_bound_subrange_bind() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+
+    let (rows, dim) = (2usize, 64usize);
+    let eps = 1e-5f32;
+    let x = synth_x(rows * dim);
+    let x_buf = be.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    // Known, finite gamma bytes — rmsnorm's gamma is consumed directly as f32 (no dequant), so
+    // `synth_weight_bytes`'s low-byte-range NaN-avoidance trick doesn't apply here.
+    let gamma: Vec<f32> = (0..dim).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+    let gamma_bytes: &[u8] = bytemuck::cast_slice(&gamma);
+
+    // ── First BDA tensor: garbage occupying the block's front (sub_offset 0) — must never be read
+    let garbage_bda = be.bda_weight_alloc_for_test(1024).unwrap();
+    let garbage: Vec<u8> = (0..1024u32).map(|i| (i % 256) as u8).collect();
+    be.upload(garbage_bda.as_ref(), &garbage).unwrap();
+
+    // ── Second BDA tensor: the real gamma, forced to a non-zero offset by the alloc above ───────
+    let gamma_bda = be.bda_weight_alloc_for_test(gamma_bytes.len()).unwrap();
+    assert!(
+        gamma_bda.device_addr().is_some(),
+        "bda_weight_alloc_for_test must report Some(device_addr)"
+    );
+    be.upload(gamma_bda.as_ref(), gamma_bytes).unwrap();
+
+    let bda_out = {
+        let y_buf = be.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.rmsnorm(
+            x_buf.as_ref(),
+            gamma_bda.as_ref(),
+            y_buf.as_ref(),
+            rows,
+            dim,
+            eps,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; rows * dim * 4];
+        be.download(y_buf.as_ref(), &mut out).unwrap();
+        bits(&out)
+    };
+    assert!(
+        bda_out.iter().any(|&b| b != 0),
+        "rmsnorm: resident-BDA output is all zeros"
+    );
+
+    let ordinary_out = {
+        let gamma_buf = be.alloc(gamma_bytes.len(), BufferUsage::Weights).unwrap();
+        be.upload(gamma_buf.as_ref(), gamma_bytes).unwrap();
+        let y_buf = be.alloc(rows * dim * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.rmsnorm(
+            x_buf.as_ref(),
+            gamma_buf.as_ref(),
+            y_buf.as_ref(),
+            rows,
+            dim,
+            eps,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; rows * dim * 4];
+        be.download(y_buf.as_ref(), &mut out).unwrap();
+        bits(&out)
+    };
+
+    assert_eq!(
+        bda_out, ordinary_out,
+        "rmsnorm: resident-BDA gamma bind diverged from the ordinary-buffer reference — vkb's \
+         sub-range descriptor bind is broken (bound the whole arena block instead of the tensor's \
+         own byte range)"
+    );
+    println!("ok: resident-BDA sub-range descriptor bind (rmsnorm gamma at non-zero offset)");
+}

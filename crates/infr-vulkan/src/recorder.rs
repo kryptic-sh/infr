@@ -14,7 +14,7 @@ use ash::vk;
 use infr_core::{backend::Buffer, error::Result};
 
 use super::ops::ComputeKernel;
-use super::{as_vk_buf, be, VulkanBackend};
+use super::{as_vk_buf, be, Backing, VulkanBackend};
 
 /// Output rows computed per workgroup by the subgroup decode GEMV (`mul_mat_vec_q.comp`); must match
 /// the shader's `NUM_ROWS`.
@@ -588,7 +588,7 @@ impl<'a> Recorder<'a> {
     fn dispatch(
         &self,
         k: ComputeKernel,
-        buffers: &[vk::Buffer],
+        buffers: &[vk::DescriptorBufferInfo],
         n_out: usize,
         push: &[u8],
         groups: u32,
@@ -616,7 +616,7 @@ impl<'a> Recorder<'a> {
     fn dispatch_wide(
         &self,
         k: ComputeKernel,
-        buffers: &[vk::Buffer],
+        buffers: &[vk::DescriptorBufferInfo],
         n_out: usize,
         push: &[u8],
         n: u32,
@@ -644,24 +644,16 @@ impl<'a> Recorder<'a> {
     /// small-m shapes (many-op graphs where GPU busy time is small — PERF.md class 4). Falls back
     /// to the pooled alloc_set + update_descriptor_sets + cmd_bind_descriptor_sets sequence when
     /// the extension is unavailable; `k.ds_layout` was built to match (see `ops.rs`).
-    fn bind_descriptors(&self, k: ComputeKernel, buffers: &[vk::Buffer]) {
+    fn bind_descriptors(&self, k: ComputeKernel, buffers: &[vk::DescriptorBufferInfo]) {
         let device = &self.be.shared.device;
         unsafe { device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline) };
-        let infos: Vec<vk::DescriptorBufferInfo> = buffers
-            .iter()
-            .map(|&buffer| vk::DescriptorBufferInfo {
-                buffer,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
         if let Some(pd) = &self.be.shared.push_descriptor {
             let ds_writes: Vec<vk::WriteDescriptorSet> = (0..buffers.len())
                 .map(|i| {
                     vk::WriteDescriptorSet::default()
                         .dst_binding(i as u32)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&infos[i..i + 1])
+                        .buffer_info(&buffers[i..i + 1])
                 })
                 .collect();
             unsafe {
@@ -681,7 +673,7 @@ impl<'a> Recorder<'a> {
                         .dst_set(set)
                         .dst_binding(i as u32)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .buffer_info(&infos[i..i + 1])
+                        .buffer_info(&buffers[i..i + 1])
                 })
                 .collect();
             unsafe {
@@ -705,7 +697,7 @@ impl<'a> Recorder<'a> {
     fn dispatch_indirect(
         &self,
         k: ComputeKernel,
-        buffers: &[vk::Buffer],
+        buffers: &[vk::DescriptorBufferInfo],
         n_out: usize,
         push: &[u8],
         args: vk::Buffer,
@@ -718,10 +710,11 @@ impl<'a> Recorder<'a> {
         self.stamp(k.name);
         let split = buffers.len() - n_out;
         let (reads, writes) = buffers.split_at(split);
-        let mut all_reads: Vec<vk::Buffer> = reads.to_vec();
+        let write_bufs: Vec<vk::Buffer> = writes.iter().map(|i| i.buffer).collect();
+        let mut all_reads: Vec<vk::Buffer> = reads.iter().map(|i| i.buffer).collect();
         all_reads.push(args);
         self.indirect_pending.set(true);
-        self.sync(&all_reads, writes, false);
+        self.sync(&all_reads, &write_bufs, false);
         self.indirect_pending.set(false);
         self.bind_descriptors(k, buffers);
         let device = &self.be.shared.device;
@@ -743,7 +736,7 @@ impl<'a> Recorder<'a> {
     fn dispatch3(
         &self,
         k: ComputeKernel,
-        buffers: &[vk::Buffer],
+        buffers: &[vk::DescriptorBufferInfo],
         n_out: usize,
         push: &[u8],
         gx: u32,
@@ -756,7 +749,9 @@ impl<'a> Recorder<'a> {
         // buffers (e.g. rope x==y) so a RAW from a prior op is still seen.
         let split = buffers.len() - n_out;
         let (reads, writes) = buffers.split_at(split);
-        self.sync(reads, writes, false);
+        let read_bufs: Vec<vk::Buffer> = reads.iter().map(|i| i.buffer).collect();
+        let write_bufs: Vec<vk::Buffer> = writes.iter().map(|i| i.buffer).collect();
+        self.sync(&read_bufs, &write_bufs, false);
         self.bind_descriptors(k, buffers);
         let device = &self.be.shared.device;
 
@@ -774,23 +769,53 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    /// `&dyn Buffer` → raw `vk::Buffer` handle — the SOLE choke point every dispatch call site in
-    /// this file goes through before a buffer lands in `bind_descriptors`'s `(0, WHOLE_SIZE)`
-    /// descriptor bindings. A resident-BDA sub-tensor (`Buffer::device_addr` returns `Some`) must
-    /// never be bound that way — it is a logical byte range of a shared multi-GiB arena block, and a
-    /// WHOLE_SIZE bind would describe the whole block, not the tensor (see `Buffer::device_addr`'s
-    /// doc and `Backing::BdaSub`). Caught here, at the earliest possible point, rather than as a
-    /// wrong-data bug downstream: nothing in `adapter.rs` reads `device_addr()` yet (that wiring is
-    /// a following slice), so today this only fires if `INFR_RESIDENT_BDA=1` is set and a forward
-    /// still runs the OLD per-tensor descriptor-bind dispatch — exactly the accidental-bind case
-    /// this exists to catch. Every filler/activation/scale buffer this file binds is ordinary (`None`),
-    /// so the assertion is silent in normal operation.
-    fn vkb(b: &dyn Buffer) -> vk::Buffer {
+    /// `&dyn Buffer` → `vk::DescriptorBufferInfo` — the SOLE choke point every dispatch call site in
+    /// this file goes through before a buffer lands in a descriptor binding. An ordinary buffer
+    /// binds `(offset=0, range=WHOLE_SIZE)` as always. A resident-BDA sub-tensor (`Buffer::device_addr`
+    /// returns `Some`) is a logical byte range of a shared multi-GiB arena block — a `WHOLE_SIZE`
+    /// bind would describe the whole BLOCK, not the tensor, so instead this binds the tensor's own
+    /// `(sub_offset, range)`. The range is padded up to the next 256-byte word (some kernels read
+    /// weight bytes as packed u32 words via the byte chokepoint `rb()`, which would clip the last
+    /// partial word at a tight `range = size`) and clamped to the block's own end so it never reads
+    /// past the arena's real allocation — the 256-byte pad can't run into a LATER tensor's data
+    /// either, since the bump allocator aligns every sub-tensor start to that same 256 bytes. Every
+    /// range fits `u32` (checked below): a tensor whose range would exceed 4 GiB cannot be bound at
+    /// all (`maxStorageBufferRange` caps it) and must go via the `-DSTREAMED` device-address twin
+    /// instead — see `Buffer::device_addr`'s doc and `Backing::BdaSub`.
+    fn vkb(b: &dyn Buffer) -> vk::DescriptorBufferInfo {
+        let vb = unsafe { as_vk_buf(b) };
+        let Backing::BdaSub(block) = &vb.backing else {
+            return vk::DescriptorBufferInfo {
+                buffer: vb.buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+            };
+        };
+        let block_len = block.buf.size as u64;
+        let range = (vb.size as u64)
+            .next_multiple_of(256)
+            .min(block_len - vb.sub_offset as u64);
         debug_assert!(
-            b.device_addr().is_none(),
-            "bound a resident-BDA sub-tensor as a whole-range descriptor — read it via \
-             device_addr() instead, never via bind_descriptors' (0, WHOLE_SIZE)"
+            range <= u32::MAX as u64,
+            "resident-BDA sub-tensor range ({range} bytes) exceeds 4 GiB — this tensor must be \
+             read through its 64-bit device_addr() via a -DSTREAMED twin, never bound as a \
+             descriptor"
         );
+        vk::DescriptorBufferInfo {
+            buffer: vb.buffer,
+            offset: vb.sub_offset as u64,
+            range,
+        }
+    }
+
+    /// `&dyn Buffer` → raw `vk::Buffer` handle, for the few call sites that consume the handle with
+    /// EXPLICIT byte offsets rather than a descriptor binding: `dispatch_indirect`'s `args` buffer
+    /// (`vkCmdDispatchIndirect`), [`Self::copy`] (`vkCmdCopyBuffer`), and [`Self::zero`]
+    /// (`vkCmdFillBuffer`). Unlike `vkb`, no sub-range is encoded in the return value — each of
+    /// those call sites is responsible for adding the buffer's `sub_offset` into its own offset
+    /// arithmetic (a resident-BDA sub-tensor's logical byte 0 lives at `sub_offset` within the
+    /// shared arena block; `args` is always ordinary scratch, so `dispatch_indirect` skips it).
+    fn vk_handle(b: &dyn Buffer) -> vk::Buffer {
         unsafe { as_vk_buf(b) }.buffer
     }
 
@@ -807,8 +832,11 @@ impl<'a> Recorder<'a> {
 
     /// `y[rows,out] = x[rows,in] · Wᵀ` (W stored `[out,in]`). Resident-BDA route: `w.device_addr()`
     /// `Some` means `w` is a sub-tensor of a `bufferDeviceAddress` arena block (see
-    /// `Buffer::device_addr`'s doc) that must never be bound as a descriptor — fork to the
-    /// `-DSTREAMED` twin, addressing the weight by its 64-bit pointer instead.
+    /// `Buffer::device_addr`'s doc) — always fork to the `-DSTREAMED` twin here rather than binding
+    /// it, addressing the weight by its 64-bit pointer instead. This big-matmul weight family is
+    /// exactly the case a bind can't cover unconditionally (a fused/wide weight's range can exceed
+    /// `maxStorageBufferRange`/4 GiB), so streamed stays the required/preferred path regardless of
+    /// `Self::vkb`'s sub-range bind support for the small unforked weight consumers elsewhere.
     pub fn linear(
         &self,
         w: &dyn Buffer,
@@ -2803,13 +2831,16 @@ impl<'a> Recorder<'a> {
     /// cost).
     ///
     /// The arena is read purely by the `arena_addr` push constant — it is NEVER bound as a
-    /// descriptor (a WHOLE_SIZE binding of a multi-GiB arena would re-impose `maxStorageBufferRange`
-    /// and trip a descriptor-range VUID, exactly what pins the SSBO path at ~4 GiB). Binding 0 (the
-    /// resident build's weight SSBO) takes a small read-only FILLER (`x`) so the descriptor set
-    /// stays fully written — same convention as the MoE `-DPAGED` dispatch, which fills binding 0
-    /// with `lut`, not the giant arena (see [`Self::linear_native_id_paged`]). The ring→arena copy
-    /// vs pointer-read hazard is ordered explicitly by [`Self::arena_stream_barrier`] at the staging
-    /// site (the pointer read is invisible to the buffer hazard tracker).
+    /// descriptor (a `WHOLE_SIZE` binding of this multi-GiB pager arena would re-impose
+    /// `maxStorageBufferRange` and trip a descriptor-range VUID, exactly what pins the SSBO path at
+    /// ~4 GiB — unlike the smaller `INFR_RESIDENT_BDA` weight arena's sub-tensors, whose tight
+    /// `(sub_offset, range)` binds via `Self::vkb` stay well under the cap and are bound routinely).
+    /// Binding 0 (the resident build's weight SSBO) takes a small read-only FILLER (`x`) so the
+    /// descriptor set stays fully written — same convention as the MoE `-DPAGED` dispatch, which
+    /// fills binding 0 with `lut`, not the giant arena (see [`Self::linear_native_id_paged`]). The
+    /// ring→arena copy vs pointer-read hazard is ordered explicitly by
+    /// [`Self::arena_stream_barrier`] at the staging site (the pointer read is invisible to the
+    /// buffer hazard tracker).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_streamed(
         &self,
@@ -5426,7 +5457,7 @@ impl<'a> Recorder<'a> {
             ],
             3,
             &p1,
-            Self::vkb(args),
+            Self::vk_handle(args),
             0,
         );
 
@@ -5546,16 +5577,25 @@ impl<'a> Recorder<'a> {
         // preceding label's bucket. Distinct from the `copy_strided` compute kernel.
         self.stamp("copy_buffer");
         let device = &self.be.shared.device;
-        self.sync(&[Self::vkb(src)], &[Self::vkb(dst)], true);
+        // `cmd_copy_buffer` takes raw handles + explicit byte offsets, not a descriptor — go
+        // through `vk_handle`, not `vkb` (whose sub-range `DescriptorBufferInfo` doesn't apply
+        // here). A resident-BDA sub-tensor's logical byte 0 sits at `sub_offset` within its shared
+        // arena block, so that offset joins the caller's — for every ordinary buffer it is 0 and
+        // this is the plain copy it always was.
+        let src_h = Self::vk_handle(src);
+        let dst_h = Self::vk_handle(dst);
+        let src_sub = unsafe { as_vk_buf(src) }.sub_offset;
+        let dst_sub = unsafe { as_vk_buf(dst) }.sub_offset;
+        self.sync(&[src_h], &[dst_h], true);
         self.dirty_transfer.set(true);
         unsafe {
             device.cmd_copy_buffer(
                 self.cmd,
-                Self::vkb(src),
-                Self::vkb(dst),
+                src_h,
+                dst_h,
                 &[vk::BufferCopy {
-                    src_offset: src_offset as u64,
-                    dst_offset: dst_offset as u64,
+                    src_offset: (src_offset + src_sub) as u64,
+                    dst_offset: (dst_offset + dst_sub) as u64,
                     size: bytes as u64,
                 }],
             );
@@ -6735,12 +6775,19 @@ impl<'a> Recorder<'a> {
     pub fn zero(&self, buf: &dyn Buffer, n: usize) {
         // Transfer chokepoint (see `copy`): previously an un-stamped blind spot.
         self.stamp("zero_fill");
-        self.sync(&[], &[Self::vkb(buf)], true);
+        // `cmd_fill_buffer` takes a raw handle + explicit byte offset, not a descriptor — go
+        // through `vk_handle`, not `vkb`. The fill starts at the buffer's `sub_offset` (0 for every
+        // ordinary buffer): a resident-BDA sub-tensor shares its arena block's handle, and a fill
+        // at byte 0 would clobber whatever tensor sits at the block's front — same rule as
+        // `fill_buf`'s arena arm in lib.rs.
+        let buf_h = Self::vk_handle(buf);
+        let sub = unsafe { as_vk_buf(buf) }.sub_offset;
+        self.sync(&[], &[buf_h], true);
         unsafe {
             self.be
                 .shared
                 .device
-                .cmd_fill_buffer(self.cmd, Self::vkb(buf), 0, (n * 4) as u64, 0);
+                .cmd_fill_buffer(self.cmd, buf_h, sub as u64, (n * 4) as u64, 0);
         }
     }
 

@@ -11,6 +11,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : require
+#ifdef STREAMED
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -27,9 +31,25 @@ const uint CMS_N = WN / 16u;  // 4
 const uint SAK = BK + 8u;
 const uint SBK = BK + 8u;     // Bs is [BN][BK]
 
+// -DSTREAMED (resident-BDA): the weight is read through a 64-bit buffer_reference into the
+// resident arena (base = arena_lo/arena_hi) instead of a bound SSBO — see linear_f32.comp's
+// header for the campaign rationale. Additive: the non-STREAMED build is byte-identical.
+#ifdef STREAMED
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint bits; uint blk_shift; uint arena_lo; uint arena_hi;
+} pc;
+#else
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint bits; uint blk_shift; } pc;
+#endif
 layout(binding = 0) readonly buffer ABuf { float a[]; };       // [M, K] f32 activations
+#ifdef STREAMED
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW { uint v[]; };
+uint64_t w_ptr = 0ul;
+#define WQ(i) ArenaW(w_ptr).v[i]
+#else
 layout(binding = 1) readonly buffer WBuf { uint wq[]; };       // weights: f16 (2/uint) or quant idx
+#define WQ(i) wq[i]
+#endif
 layout(binding = 2) readonly buffer SBuf { float16_t scales[]; };
 layout(binding = 3) readonly buffer MBuf { float16_t mins[]; };
 layout(binding = 4) writeonly buffer CBuf { float c[]; };
@@ -39,15 +59,18 @@ shared float16_t Bs[BN * SBK];
 
 // dequantize weight element g (global index into [N,K] = out*K + in)
 float dqf(uint g) {
-    if (pc.bits == 16u) { return unpackHalf2x16(wq[g >> 1u])[g & 1u]; }
+    if (pc.bits == 16u) { return unpackHalf2x16(WQ(g >> 1u))[g & 1u]; }
     uint q;
-    if (pc.bits == 4u) { q = (wq[g >> 3u] >> ((g & 7u) * 4u)) & 0xFu; }
-    else { q = (wq[g >> 2u] >> ((g & 3u) * 8u)) & 0xFFu; }
+    if (pc.bits == 4u) { q = (WQ(g >> 3u) >> ((g & 7u) * 4u)) & 0xFu; }
+    else { q = (WQ(g >> 2u) >> ((g & 3u) * 8u)) & 0xFFu; }
     uint blk = g >> pc.blk_shift;
     return float(scales[blk]) * float(q) + float(mins[blk]);
 }
 
 void main() {
+#ifdef STREAMED
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo); // resident tensor base byte address
+#endif
     uint tilesN = pc.n / BN;
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;

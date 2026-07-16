@@ -1264,6 +1264,66 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `-DSTREAMED` twin of [`Self::matmul_proj`] (the coopmat f16/repacked-quant projection GEMM:
+    /// see `gemm_proj.comp`'s STREAMED doc). Same arena-by-address convention as
+    /// [`Self::matmul_mmq_streamed`] — the resident build's weight-SSBO slot (binding 1) takes a
+    /// harmless FILLER (`a`) since the arena is never bound as a descriptor. Not wired into any
+    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_proj_streamed(
+        &self,
+        a: &dyn Buffer,
+        arena_addr: u64,
+        scales: &dyn Buffer,
+        mins: &dyn Buffer,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+        bits: u32,
+        blk_shift: u32,
+    ) {
+        // Same M/N routing as matmul_proj — see its comment for the warp-tile rationale.
+        let warp = m >= 768 && n.is_multiple_of(256);
+        let (name, spv, tiles_n) = if warp {
+            (
+                "gemm_proj_warp_streamed",
+                crate::gemm::gemm_proj_warp_streamed_spv(),
+                n / 256,
+            )
+        } else {
+            (
+                "gemm_proj_streamed",
+                crate::gemm::gemm_proj_streamed_spv(),
+                n / 64,
+            )
+        };
+        self.label_gemm(name, m, k, n);
+        let kern = self.be.kernel_sg(name, spv, 5, 28, 32);
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&bits.to_ne_bytes());
+        push[16..20].copy_from_slice(&blk_shift.to_ne_bytes());
+        push[20..24].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let groups = (m.div_ceil(64) * tiles_n) as u32; // both kernels use BM=64
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(a),
+                Self::vkb(a),
+                Self::vkb(scales),
+                Self::vkb(mins),
+                Self::vkb(c),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// Native-block projection GEMM `c = a · Wᵀ` for prefill: raw GGUF blocks dequantized in-shader
     /// during coopmat tiled staging (decode-once per weight element, reused across the 64-row tile).
     /// `c` is allocated `ceil(m/64)*64` rows. Requires `n%64==0`, `k%32==0`.

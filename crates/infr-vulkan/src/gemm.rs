@@ -2555,6 +2555,22 @@ pub(crate) fn gemm_proj_spv() -> &'static [u32] {
 pub(crate) fn gemm_proj_warp_spv() -> &'static [u32] {
     GEMM_PROJ_WARP_SPV.get_or_init(|| spv_words(GEMM_PROJ_WARP_SPV_BYTES))
 }
+/// `-DSTREAMED` twin SPIR-V of `gemm_proj` (the coopmat f16/repacked-quant projection GEMM, weight
+/// read through a typed 64-bit buffer_reference — see the shader's STREAMED doc). Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn gemm_proj_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin SPIR-V of `gemm_proj_warp` (same STREAMED convention as `gemm_proj`).
+/// Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn gemm_proj_warp_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the subgroup-reduction flash-decoding pass-1 (split-K) kernel. Used by the recorder.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_partial_spv() -> &'static [u32] {

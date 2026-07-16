@@ -2690,6 +2690,10 @@ fn main() {
             // the linear family above (see conv1d_silu.comp's STREAMED doc). Every variant of
             // these sources gets a twin.
             "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" | "e2b_proj" => true,
+            // The coopmat f16/repacked-quant projection GEMM (prefill C=A·Wᵀ): the quant arms ride
+            // along on the shared WQ() seam — see gemm_proj.comp's STREAMED doc. gemm_proj_mmq is
+            // test-only (a deletion candidate) and does NOT get a twin here.
+            "gemm_proj" | "gemm_proj_warp" => true,
             _ => false,
         }
     };

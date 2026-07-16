@@ -1589,3 +1589,114 @@ fn e2b_proj_streamed_matches_resident() {
     assert_case(&c);
     println!("ok: {}", c.name);
 }
+
+// ─── coopmat projection GEMM (gemm_proj / gemm_proj_warp) — this slice ────────────────────────
+// f16-weight (bits=16) parity only: bits=4/8 route through the SAME dqf()/WQ() chokepoint as the
+// f16 arm (see gemm_proj.comp), so this proves the seam for every bits value; the quant-math
+// itself (vs a CPU reference) is already covered resident-only by recorder.rs's
+// matmul_proj_matches_cpu.
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn gemm_proj_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // n%64==0, k%32==0; m=8 < 768 keeps BOTH legs on the non-warp gemm_proj kernel (matmul_proj /
+    // matmul_proj_streamed share the same `warp = m>=768 && n%256==0` gate).
+    let (m, k, n) = (8usize, 256usize, 64usize);
+    let wbits = 16u32;
+    let blk_shift = 0u32;
+    let mpad = m.div_ceil(64) * 64;
+
+    let a = synth_x(m * k);
+    let a_buf = be.alloc(m * k * 4, BufferUsage::Activations).unwrap();
+    be.upload(a_buf.as_ref(), bytemuck::cast_slice(&a)).unwrap();
+    // bits=16 never reads scales/mins (dqf's f16 arm short-circuits before touching them) — small
+    // non-empty dummies, same convention as recorder.rs's matmul_proj_matches_cpu.
+    let dummy_scales = be.alloc(4, BufferUsage::Activations).unwrap();
+    let dummy_mins = be.alloc(4, BufferUsage::Activations).unwrap();
+    let c_buf = be.alloc(mpad * n * 4, BufferUsage::Activations).unwrap();
+
+    let w_bytes = weight_bytes_for(DType::F16, k * n);
+    let w = synth_weight_bytes(w_bytes, k * 31 + n);
+
+    // ── Resident: weight in its own bound SSBO ────────────────────────────────────────────────
+    let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+    be.upload(w_buf.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.matmul_proj(
+        a_buf.as_ref(),
+        w_buf.as_ref(),
+        dummy_scales.as_ref(),
+        dummy_mins.as_ref(),
+        c_buf.as_ref(),
+        m,
+        k,
+        n,
+        wbits,
+        blk_shift,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; mpad * n * 4];
+    be.download(c_buf.as_ref(), &mut out).unwrap();
+    let resident = bits(&out);
+
+    // ── Streamed leg 1: arena offset 0 ────────────────────────────────────────────────────────
+    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+    be.upload(arena0.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.matmul_proj_streamed(
+        a_buf.as_ref(),
+        addr0,
+        dummy_scales.as_ref(),
+        dummy_mins.as_ref(),
+        c_buf.as_ref(),
+        m,
+        k,
+        n,
+        wbits,
+        blk_shift,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; mpad * n * 4];
+    be.download(c_buf.as_ref(), &mut out).unwrap();
+    let streamed_at0 = bits(&out);
+
+    // ── Streamed leg 2: the SAME weight parked at a non-zero offset in a bigger arena ─────────
+    let off = nonzero_off(DType::F16);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&w);
+    let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena1.as_ref(), &backing).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.matmul_proj_streamed(
+        a_buf.as_ref(),
+        addr1 + off as u64,
+        dummy_scales.as_ref(),
+        dummy_mins.as_ref(),
+        c_buf.as_ref(),
+        m,
+        k,
+        n,
+        wbits,
+        blk_shift,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; mpad * n * 4];
+    be.download(c_buf.as_ref(), &mut out).unwrap();
+    let streamed_atoff = bits(&out);
+
+    // C is allocated ceil(m/64)*64 padded rows; compare only the m real rows (same trim pattern as
+    // the mmq/fma parity cases — C is row-major so the first m*n elements are exactly rows 0..m).
+    let real = m * n;
+    let c = Case {
+        name: format!("gemm_proj bits={wbits}"),
+        resident: resident[..real].to_vec(),
+        streamed_at0: streamed_at0[..real].to_vec(),
+        streamed_atoff: streamed_atoff[..real].to_vec(),
+    };
+    assert_case(&c);
+    println!("ok: {}", c.name);
+}

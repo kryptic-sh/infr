@@ -57,17 +57,43 @@ float dq(uint g) {
     return f16tof32(ru16(bd)) * float(sgn8(rb(bd + 2u + g % 32u)));
 }
 #define HAVE_DQBLK
-// Word-parallel qs: one unaligned u32 covers 4 bytes (34-byte blocks aren't word-aligned), and a
-// SIGNED bitfieldExtract per element replaces the rb() byte-extract + sgn8 select chain — the
-// byte-serial form left the Q8_0 decode GEMV at ~600-690 GB/s (llama.cpp's runs ~850-900).
+// Word-parallel qs: the 32-byte qs body is pulled as two b128 quads (NW4) instead of eight per-word
+// ru32u loads, and a SIGNED bitfieldExtract per element replaces the rb() byte-extract + sgn8 select
+// chain — the byte-serial form left the Q8_0 decode GEMV at ~600-690 GB/s (llama.cpp's runs ~850-900).
 // bitfieldExtract(int, 8b, 8) IS the signed byte value — same integers, bit-identical.
+//
+// The b128 quads matter under -DSTREAMED: there each NW() is a scalar 64-bit BDA load that the
+// vectorizer can't fuse (distinct arena_word pointers), so the old eight ru32u calls lowered to up to
+// 16 unfused global_load_b32 per block — the streamed Q8_0 GEMV ran ~67% slower per dispatch than the
+// descriptor-bound twin. NW4 reads four CONSTANT-index words off ONE pointer (fused global_load_b128,
+// saddr base — see native_arena_ref.glsl), matching the descriptor path. The qs body starts at byte
+// bd+2, so its word alignment flips with block parity: an ODD block (bd%4==2) has bd+2 word-aligned
+// (qsh==0, read the quad words directly); an EVEN block (bd%4==0) is +2 misaligned (qsh==16, funnel a
+// sliding neighbor word, word 8 the tail). Same funnel integers as the old ru32u form — bit-identical.
 void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 32u) * 34u;
     float d = f16tof32(ru16(bd));
-    for (uint w8 = 0u; w8 < 8u; w8++) {
-        int q4 = int(ru32u(bd + 2u + w8 * 4u));
-        for (uint b = 0u; b < 4u; b++) {
-            v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+    uint qoff = bd + 2u;              // qs base byte
+    uint qwb = qoff >> 2u;            // qs base word
+    uint qsh = (qoff & 3u) << 3u;     // funnel shift: 0 (odd block, aligned) or 16 (even block, +2)
+    uvec4 qA = NW4(qwb); uvec4 qB = NW4(qwb + 4u);
+    if (qsh == 0u) {                  // aligned: word w8 IS ru32u(qoff + w8*4)
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            int q4 = int((w8 < 4u) ? qA[w8] : qB[w8 - 4u]);
+            for (uint b = 0u; b < 4u; b++) {
+                v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+            }
+        }
+    } else {                         // +2 misaligned: funnel each word with its neighbor
+        uint qtail = NW(qwb + 8u);
+        for (uint w8 = 0u; w8 < 8u; w8++) {
+            uint qcur = (w8 < 4u) ? qA[w8] : qB[w8 - 4u];
+            uint w1 = w8 + 1u;
+            uint qnxt = (w1 < 4u) ? qA[w1] : ((w1 < 8u) ? qB[w1 - 4u] : qtail);
+            int q4 = int((qcur >> qsh) | (qnxt << (32u - qsh)));
+            for (uint b = 0u; b < 4u; b++) {
+                v[w8 * 4u + b] = d * float(bitfieldExtract(q4, int(8u * b), 8));
+            }
         }
     }
 }

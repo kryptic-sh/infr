@@ -30,14 +30,24 @@ layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
     uint arena_lo; uint arena_hi; uint slot_bytes;
 } pc;
+#elif defined(STREAMED)
+// -DSTREAMED (resident-BDA): the stacked role tensor lives in a resident BDA arena at the 64-bit
+// base passed as arena_lo/arena_hi. No LUT — the expert base is `ids[slot_global]` scaled by
+// `stride`, REPURPOSED in this build as the per-expert BYTE stride and applied on the 64-bit
+// pointer (see native_gemv_id.comp's STREAMED doc). Additive: non-STREAMED builds byte-identical.
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+    uint arena_lo; uint arena_hi;
+} pc;
 #else
 layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
 } pc;
 #endif
-// PAGED reads the arena by device address (native_arena_ref.glsl), not binding 0 — the descriptor
-// slot takes a harmless filler on the Rust side, so binding numbers below match both builds.
-#ifndef PAGED
+// PAGED/STREAMED read the arena by device address (native_arena_ref.glsl), not binding 0 — the
+// descriptor slot takes a harmless filler on the Rust side, so binding numbers below match all
+// builds.
+#if !defined(PAGED) && !defined(STREAMED)
 layout(binding = 0) readonly buffer WB { uint nw[]; };
 #endif
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
@@ -56,10 +66,11 @@ layout(binding = 3) buffer YB { float y_buf[]; };
 
 shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
 
-#ifdef PAGED
-// Arena read via 64-bit device address (see native_arena_ref.glsl): the LUT stores the SLOT INDEX
-// and `nw_ptr` (set in main) is the slot's byte address; NW() dereferences it. Replaces the u32
-// word-base SSBO read whose element-space multiply wrapped past ~102 Scout-sized slots.
+#if defined(PAGED) || defined(STREAMED)
+// Arena read via 64-bit device address (see native_arena_ref.glsl): the LUT (PAGED) or `ids`
+// (STREAMED) picks the expert, `nw_ptr` (set in main) is its byte address via a 64-bit multiply;
+// NW() dereferences it. Replaces the u32 word-base SSBO read whose element-space multiply wrapped
+// past ~102 Scout-sized slots.
 #include "native_arena_ref.glsl"
 #define NW(i) arena_word(i)
 #endif
@@ -95,6 +106,12 @@ void main() {
     // live pool LUT).
     nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
              + uint64_t(lut[pc.stride + ids[slot_global]]) * uint64_t(pc.slot_bytes);
+    uint wbase = o * pc.in_f;
+#elif defined(STREAMED)
+    // Expert base BYTE address straight from `ids` (no LUT); `pc.stride` is the per-expert BYTE
+    // stride in this build. wbase keeps only the small within-expert element offset.
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(ids[slot_global]) * uint64_t(pc.stride);
     uint wbase = o * pc.in_f;
 #else
     uint wbase = ids[slot_global] * pc.stride + o * pc.in_f;

@@ -711,3 +711,274 @@ fn mmq_dense_streamed_matches_resident() {
         println!("ok: {}", trimmed.name);
     }
 }
+
+// ─── id-indexed resident expert family — slice A4 ──────────────────────────────────────────────
+// The load-bearing difference from the earlier sections: the STREAMED build REPURPOSES `stride`
+// as the per-expert BYTE stride applied on the 64-bit pointer (`nw_ptr = arena + u64(ids[slot]) *
+// u64(stride_bytes)`), replacing the resident u32 element-space multiply that wraps past 2^32
+// elements. So every case here selects a NON-ZERO expert id — an id of 0 would pass even if the
+// stride scaling were completely broken.
+
+/// A stacked bank of `n_expert` experts (each `in_f`×`out_f` of `dtype`), the per-expert byte
+/// stride, and an ids buffer on the GPU.
+struct Bank {
+    bytes: Vec<u8>,
+    stride_bytes: usize,
+    stride_elems: usize,
+}
+
+fn synth_bank(dtype: DType, in_f: usize, out_f: usize, n_expert: usize) -> Bank {
+    let stride_elems = in_f * out_f;
+    let stride_bytes = weight_bytes_for(dtype, stride_elems);
+    let bytes = synth_weight_bytes(stride_bytes * n_expert, in_f * 7 + out_f);
+    Bank {
+        bytes,
+        stride_bytes,
+        stride_elems,
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn id_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f, n_expert) = (256usize, 8usize, 4usize);
+    let x = synth_x(in_f);
+    let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let ids_buf = be.alloc(4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[2u32]))
+        .unwrap();
+
+    // F16 exercises the float NW decode — floats never had a streamed build before this campaign.
+    for dtype in [DType::Q4K, DType::Q6K, DType::Q8_0, DType::F16] {
+        let bank = synth_bank(dtype, in_f, out_f, n_expert);
+        let y_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+
+        let w_buf = be.alloc(bank.bytes.len(), BufferUsage::Weights).unwrap();
+        be.upload(w_buf.as_ref(), &bank.bytes).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native_id(
+            dtype,
+            w_buf.as_ref(),
+            ids_buf.as_ref(),
+            0,
+            bank.stride_elems,
+            x_buf.as_ref(),
+            y_buf.as_ref(),
+            1,
+            in_f,
+            out_f,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; out_f * 4];
+        be.download(y_buf.as_ref(), &mut out).unwrap();
+        let resident = bits(&out);
+        assert!(
+            resident.iter().any(|&b| b != 0),
+            "id dtype={dtype:?}: resident output is all zeros"
+        );
+
+        // Streamed at a non-zero arena offset (the offset-0 leg is subsumed: expert id 2 already
+        // proves base + non-trivial byte offset addressing).
+        let off = nonzero_off(dtype);
+        let mut backing = synth_weight_bytes(off, 0xBAD);
+        backing.extend_from_slice(&bank.bytes);
+        let (arena, addr) = be.alloc_arena_bda(backing.len()).unwrap();
+        be.upload(arena.as_ref(), &backing).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native_id_streamed(
+            dtype,
+            addr + off as u64,
+            bank.stride_bytes as u32,
+            ids_buf.as_ref(),
+            0,
+            x_buf.as_ref(),
+            y_buf.as_ref(),
+            1,
+            in_f,
+            out_f,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; out_f * 4];
+        be.download(y_buf.as_ref(), &mut out).unwrap();
+        let streamed = bits(&out);
+        for (i, (&r, &s)) in resident.iter().zip(streamed.iter()).enumerate() {
+            assert_eq!(
+                r,
+                s,
+                "id dtype={dtype:?} out {i}: streamed {} != resident {} — expert-id byte-stride \
+                 scaling or arena offset broken",
+                f32::from_bits(s),
+                f32::from_bits(r)
+            );
+        }
+        println!("ok: id dtype={dtype:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn idm_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f, n_expert, n_used) = (256usize, 8usize, 4usize, 4usize);
+    let x = synth_x(in_f);
+    let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    // Permuted, all-distinct ids: a stride bug scrambles WHICH expert each slot reads, so outputs
+    // land wrong even when every expert is resident.
+    let ids_buf = be.alloc(n_used * 4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[2u32, 0, 3, 1]))
+        .unwrap();
+
+    // Q6K takes the SG route on both sides (native_id_sg_choice); Q4K/Q8_0/F16 the tree kernel.
+    for dtype in [DType::Q4K, DType::Q6K, DType::Q8_0, DType::F16] {
+        let bank = synth_bank(dtype, in_f, out_f, n_expert);
+        let y_buf = be
+            .alloc(n_used * out_f * 4, BufferUsage::Activations)
+            .unwrap();
+
+        let w_buf = be.alloc(bank.bytes.len(), BufferUsage::Weights).unwrap();
+        be.upload(w_buf.as_ref(), &bank.bytes).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native_id_multi(
+            dtype,
+            w_buf.as_ref(),
+            ids_buf.as_ref(),
+            n_used,
+            bank.stride_elems,
+            x_buf.as_ref(),
+            false,
+            y_buf.as_ref(),
+            in_f,
+            out_f,
+            1,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; n_used * out_f * 4];
+        be.download(y_buf.as_ref(), &mut out).unwrap();
+        let resident = bits(&out);
+        assert!(
+            resident.iter().any(|&b| b != 0),
+            "idm dtype={dtype:?}: resident output is all zeros"
+        );
+
+        let off = nonzero_off(dtype);
+        let mut backing = synth_weight_bytes(off, 0xBAD);
+        backing.extend_from_slice(&bank.bytes);
+        let (arena, addr) = be.alloc_arena_bda(backing.len()).unwrap();
+        be.upload(arena.as_ref(), &backing).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.linear_native_id_multi_streamed(
+            dtype,
+            addr + off as u64,
+            bank.stride_bytes as u32,
+            ids_buf.as_ref(),
+            n_used,
+            x_buf.as_ref(),
+            false,
+            y_buf.as_ref(),
+            in_f,
+            out_f,
+            1,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; n_used * out_f * 4];
+        be.download(y_buf.as_ref(), &mut out).unwrap();
+        let streamed = bits(&out);
+        for (i, (&r, &s)) in resident.iter().zip(streamed.iter()).enumerate() {
+            assert_eq!(
+                r,
+                s,
+                "idm dtype={dtype:?} out {i} (slot {}): streamed {} != resident {}",
+                i / out_f,
+                f32::from_bits(s),
+                f32::from_bits(r)
+            );
+        }
+        println!("ok: idm dtype={dtype:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn mmv_id_q4k_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (in_f, out_f, n_expert, n_used) = (256usize, 8usize, 4usize, 4usize);
+    let dtype = DType::Q4K;
+    let q = quantize_x(&be, 1, in_f);
+    let ids_buf = be.alloc(n_used * 4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&[2u32, 0, 3, 1]))
+        .unwrap();
+    let bank = synth_bank(dtype, in_f, out_f, n_expert);
+    let y_buf = be
+        .alloc(n_used * out_f * 4, BufferUsage::Activations)
+        .unwrap();
+
+    let w_buf = be.alloc(bank.bytes.len(), BufferUsage::Weights).unwrap();
+    be.upload(w_buf.as_ref(), &bank.bytes).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.linear_mmv_id_multi_q4k(
+        w_buf.as_ref(),
+        q.qa.as_ref(),
+        q.dact.as_ref(),
+        q.sact.as_ref(),
+        ids_buf.as_ref(),
+        n_used,
+        bank.stride_elems,
+        y_buf.as_ref(),
+        in_f,
+        out_f,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; n_used * out_f * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let resident = bits(&out);
+    assert!(
+        resident.iter().any(|&b| b != 0),
+        "mmv_id_q4k: resident output is all zeros"
+    );
+
+    let off = nonzero_off(dtype);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&bank.bytes);
+    let (arena, addr) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena.as_ref(), &backing).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.linear_mmv_id_multi_q4k_streamed(
+        addr + off as u64,
+        bank.stride_bytes as u32,
+        q.qa.as_ref(),
+        q.dact.as_ref(),
+        q.sact.as_ref(),
+        ids_buf.as_ref(),
+        n_used,
+        y_buf.as_ref(),
+        in_f,
+        out_f,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; n_used * out_f * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let streamed = bits(&out);
+    for (i, (&r, &s)) in resident.iter().zip(streamed.iter()).enumerate() {
+        assert_eq!(
+            r,
+            s,
+            "mmv_id_q4k out {i} (slot {}): streamed {} != resident {}",
+            i / out_f,
+            f32::from_bits(s),
+            f32::from_bits(r)
+        );
+    }
+    println!("ok: mmv_id_q4k");
+}

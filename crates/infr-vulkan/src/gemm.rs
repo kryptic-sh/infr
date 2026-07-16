@@ -672,6 +672,159 @@ pub(crate) fn native_idm_sg_build_spv(
     }
 }
 
+/// `-DSTREAMED` twin of the single-slot id-indexed native GEMV lookup (kernel-cache name + SPIR-V) —
+/// the stacked expert tensor read from a `bufferDeviceAddress` arena; `stride` becomes the
+/// per-expert BYTE stride applied on the 64-bit pointer (no LUT). Slice A4 build-variant only;
+/// parity-test entry, not dispatched in production.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_id_streamed_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match dtype {
+        Q8_0 => v!("native_id_q8_0_streamed"),
+        Q4_0 => v!("native_id_q4_0_streamed"),
+        Q4_1 => v!("native_id_q4_1_streamed"),
+        Q5_0 => v!("native_id_q5_0_streamed"),
+        Q5_1 => v!("native_id_q5_1_streamed"),
+        Q2K => v!("native_id_q2k_streamed"),
+        Q3K => v!("native_id_q3k_streamed"),
+        Q4K => v!("native_id_q4k_streamed"),
+        Q5K => v!("native_id_q5k_streamed"),
+        Q6K => v!("native_id_q6k_streamed"),
+        Iq4Nl => v!("native_id_iq4nl_streamed"),
+        Iq4Xs => v!("native_id_iq4xs_streamed"),
+        Mxfp4 => v!("native_id_mxfp4_streamed"),
+        Nvfp4 => v!("native_id_nvfp4_streamed"),
+        Tq1_0 => v!("native_id_tq1_0_streamed"),
+        Tq2_0 => v!("native_id_tq2_0_streamed"),
+        Q2_0 => v!("native_id_q2_0_streamed"),
+        Iq2Xxs => v!("native_id_iq2xxs_streamed"),
+        Iq2Xs => v!("native_id_iq2xs_streamed"),
+        Iq2S => v!("native_id_iq2s_streamed"),
+        Iq3Xxs => v!("native_id_iq3xxs_streamed"),
+        Iq3S => v!("native_id_iq3s_streamed"),
+        Iq1S => v!("native_id_iq1s_streamed"),
+        Iq1M => v!("native_id_iq1m_streamed"),
+        Bf16 => v!("native_id_bf16_streamed"),
+        F16 => v!("native_id_f16_streamed"),
+        F32 => v!("native_id_f32_streamed"),
+        _ => None,
+    }
+}
+/// `-DSTREAMED` twin of the multi-slot id-indexed native GEMV lookup (kernel-cache name + SPIR-V) —
+/// the stacked expert tensor read from a `bufferDeviceAddress` arena; `stride` becomes the
+/// per-expert BYTE stride applied on the 64-bit pointer (no LUT). Slice A4 build-variant only;
+/// parity-test entry, not dispatched in production.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_idm_streamed_build_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match dtype {
+        Q8_0 => v!("native_idm_q8_0_streamed"),
+        Q4_0 => v!("native_idm_q4_0_streamed"),
+        Q4_1 => v!("native_idm_q4_1_streamed"),
+        Q5_0 => v!("native_idm_q5_0_streamed"),
+        Q5_1 => v!("native_idm_q5_1_streamed"),
+        Q2K => v!("native_idm_q2k_streamed"),
+        Q3K => v!("native_idm_q3k_streamed"),
+        Q4K => v!("native_idm_q4k_streamed"),
+        Q5K => v!("native_idm_q5k_streamed"),
+        Q6K => v!("native_idm_q6k_streamed"),
+        Iq4Nl => v!("native_idm_iq4nl_streamed"),
+        Iq4Xs => v!("native_idm_iq4xs_streamed"),
+        Mxfp4 => v!("native_idm_mxfp4_streamed"),
+        Nvfp4 => v!("native_idm_nvfp4_streamed"),
+        Tq1_0 => v!("native_idm_tq1_0_streamed"),
+        Tq2_0 => v!("native_idm_tq2_0_streamed"),
+        Q2_0 => v!("native_idm_q2_0_streamed"),
+        Iq2Xxs => v!("native_idm_iq2xxs_streamed"),
+        Iq2Xs => v!("native_idm_iq2xs_streamed"),
+        Iq2S => v!("native_idm_iq2s_streamed"),
+        Iq3Xxs => v!("native_idm_iq3xxs_streamed"),
+        Iq3S => v!("native_idm_iq3s_streamed"),
+        Iq1S => v!("native_idm_iq1s_streamed"),
+        Iq1M => v!("native_idm_iq1m_streamed"),
+        Bf16 => v!("native_idm_bf16_streamed"),
+        F16 => v!("native_idm_f16_streamed"),
+        F32 => v!("native_idm_f32_streamed"),
+        _ => None,
+    }
+}
+/// `-DSTREAMED` twin of [`native_idm_sg_build_spv`] (kernel-cache name + SPIR-V). Slice A4
+/// build-variant only; parity-test entry, not dispatched in production.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_idm_sg_streamed_build_spv(
+    dtype: infr_core::DType,
+    nr: u32,
+    sg16: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, nr, sg16) {
+        (Q6K, 2, false) => v!("native_idm_q6k_sg2_streamed"),
+        (Q6K, 4, false) => v!("native_idm_q6k_sg4_streamed"),
+        (Q6K, 8, false) => v!("native_idm_q6k_sg8_streamed"),
+        (Q6K, 2, true) => v!("native_idm_q6k_sg2_sg16_streamed"),
+        (Q6K, 4, true) => v!("native_idm_q6k_sg4_sg16_streamed"),
+        (Q6K, 8, true) => v!("native_idm_q6k_sg8_sg16_streamed"),
+        (Q5K, 2, false) => v!("native_idm_q5k_sg2_streamed"),
+        (Q5K, 4, false) => v!("native_idm_q5k_sg4_streamed"),
+        (Q5K, 8, false) => v!("native_idm_q5k_sg8_streamed"),
+        (Q5K, 2, true) => v!("native_idm_q5k_sg2_sg16_streamed"),
+        (Q5K, 4, true) => v!("native_idm_q5k_sg4_sg16_streamed"),
+        (Q5K, 8, true) => v!("native_idm_q5k_sg8_sg16_streamed"),
+        (Iq3S, 2, false) => v!("native_idm_iq3s_sg2_streamed"),
+        (Iq3S, 4, false) => v!("native_idm_iq3s_sg4_streamed"),
+        (Iq3S, 8, false) => v!("native_idm_iq3s_sg8_streamed"),
+        (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_sg16_streamed"),
+        (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_sg16_streamed"),
+        (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_sg16_streamed"),
+        _ => None,
+    }
+}
+/// `-DSTREAMED` twin of [`native_mmv_id_q4k_spv`]. Slice A4 build-variant only; parity-test
+/// entry, not dispatched in production.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_mmv_id_q4k_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_mmv_id_q4k_streamed.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the int8 dp4a decode GEMV (m=1, NUM_ROWS=2, `native_mmv.comp`). `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

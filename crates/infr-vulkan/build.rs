@@ -2667,6 +2667,14 @@ fn main() {
             // `-DPAGED` builds already read the arena by device address (LUT/slot form) and never
             // get a `_streamed` twin — STREAMED is the LUT-less resident form of the same read.
             stem if stem.starts_with("native_gemm_mmq_") => !defines.iter().any(|d| d == "-DPAGED"),
+            // The id-indexed resident expert family. STREAMED repurposes `stride` as the
+            // per-expert BYTE stride applied on the 64-bit pointer (ids picks the expert, no
+            // LUT), killing the u32 element-space multiply's overflow reach; same PAGED
+            // exclusion.
+            "native_gemv_id"
+            | "native_gemv_id_multi"
+            | "native_gemv_id_multi_sg"
+            | "native_mmv_id_q4k" => !defines.iter().any(|d| d == "-DPAGED"),
             _ => false,
         }
     };

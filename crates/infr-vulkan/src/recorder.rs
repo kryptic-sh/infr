@@ -6689,6 +6689,96 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
     }
 
+    /// `-DSTREAMED` twin of [`Self::linear_native_id`] (slice A4 build-variant: see
+    /// `crate::gemm::native_id_streamed_build_spv`). The stacked expert tensor lives at
+    /// `arena_addr` in a resident BDA arena; `stride_bytes` is the per-expert BYTE stride the
+    /// shader applies on the 64-bit pointer (`nw_ptr = arena + u64(ids[slot]) * u64(stride_bytes)`)
+    /// — the u32 element-space `ids*stride` multiply this replaces wraps past 2^32 elements.
+    /// Binding 0 (the resident weight SSBO) takes a small FILLER (`x`). Not wired into any
+    /// production dispatch yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_id_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        stride_bytes: u32,
+        ids: &dyn Buffer,
+        slot: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        self.label_gemv("gemv_id_streamed", rows, in_f, out_f);
+        let (name, spv) =
+            crate::gemm::native_id_streamed_build_spv(dtype).expect("native id streamed spv");
+        let k = self.be.kernel(name, spv, 4, 28);
+        let mut push = [0u8; 28];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(slot as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&stride_bytes.to_ne_bytes());
+        push[20..24].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(ids), Self::vkb(y)],
+            1,
+            &push,
+            (rows * out_f) as u32,
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::linear_native_id_multi`] (slice A4 build-variant: see
+    /// `crate::gemm::native_idm_streamed_build_spv`). Same BYTE-stride-on-the-pointer convention
+    /// as [`Self::linear_native_id_streamed`]. Mirrors the resident dispatcher's SG routing (m=1
+    /// decode, Q6_K/Q5_K/IQ3_S projection band) so a parity test comparing the two at the same
+    /// shape lands on the same kernel. Not wired into any production dispatch yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_id_multi_streamed(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        stride_bytes: u32,
+        ids: &dyn Buffer,
+        n_used: usize,
+        x: &dyn Buffer,
+        x_per_slot: bool,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        rows: usize,
+    ) {
+        let mut push = [0u8; 32];
+        push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&stride_bytes.to_ne_bytes());
+        push[16..20].copy_from_slice(&(x_per_slot as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let bufs = [Self::vkb(x), Self::vkb(x), Self::vkb(ids), Self::vkb(y)];
+        if rows == 1 {
+            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f) {
+                if let Some((name, spv)) =
+                    crate::gemm::native_idm_sg_streamed_build_spv(dtype, nr, self.sg16())
+                {
+                    let k = self.be.kernel_sg(name, spv, 4, 32, self.sgp());
+                    let groups = (n_used * out_f.div_ceil(nr as usize)) as u32;
+                    self.dispatch_wide(k, &bufs, 1, &push, groups);
+                    return;
+                }
+            }
+        }
+        let (name, spv) =
+            crate::gemm::native_idm_streamed_build_spv(dtype).expect("native idm streamed spv");
+        let k = self.be.kernel(name, spv, 4, 32);
+        self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
+    }
+
     /// [`linear_native_id`]'s paged twin: `w` is a `GpuPager` arena (fixed uniform slots, not one
     /// contiguous per-expert tensor) and `lut` a run of per-expert resident SLOT INDICES for
     /// exactly this layer — the kernel sets `nw_ptr = arena_base + uint64_t(lut[lut_base +
@@ -6865,6 +6955,53 @@ impl<'a> Recorder<'a> {
             k,
             &[
                 Self::vkb(w),
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(ids),
+                Self::vkb(y),
+            ],
+            1,
+            &push,
+            (n_used * out_f) as u32,
+        );
+    }
+
+    /// `-DSTREAMED` twin of [`Self::linear_mmv_id_multi_q4k`] (slice A4 build-variant: see
+    /// `crate::gemm::native_mmv_id_q4k_streamed_spv`). Same BYTE-stride-on-the-pointer convention
+    /// as [`Self::linear_native_id_streamed`]; binding 0 takes a small FILLER (`qa`). Not wired
+    /// into any production dispatch yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_id_multi_q4k_streamed(
+        &self,
+        arena_addr: u64,
+        stride_bytes: u32,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        ids: &dyn Buffer,
+        n_used: usize,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let k = self.be.kernel(
+            "native_mmv_id_q4k_streamed",
+            crate::gemm::native_mmv_id_q4k_streamed_spv(),
+            6,
+            24,
+        );
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&stride_bytes.to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        self.dispatch_wide(
+            k,
+            &[
+                Self::vkb(qa),
                 Self::vkb(qa),
                 Self::vkb(dact),
                 Self::vkb(sact),

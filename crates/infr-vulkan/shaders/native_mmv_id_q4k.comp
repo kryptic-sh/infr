@@ -10,8 +10,20 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_integer_dot_product : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+// -DSTREAMED (resident-BDA): the stacked expert tensor lives in a resident BDA arena at the 64-bit
+// base passed as arena_lo/arena_hi; the expert base is `ids[slot]` scaled by `stride`, REPURPOSED
+// as the per-expert BYTE stride on the 64-bit pointer (see native_gemv_id.comp's STREAMED doc).
+// Additive: the non-STREAMED build is byte-identical.
+#ifdef STREAMED
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint arena_lo; uint arena_hi;
+} pc;
+#else
 layout(push_constant) uniform PC { uint in_f; uint out_f; uint n_used; uint stride; } pc;
+#endif
+#ifndef STREAMED
 layout(binding = 0) readonly buffer WB { uint nw[]; };          // stacked Q4_K weight bytes (padded u32)
+#endif
 layout(binding = 1) readonly buffer QA { uint qa[]; };          // int8 activation, packed 4/u32 [nblk*8]
 layout(binding = 2) readonly buffer DA { float16_t dact[]; };   // per-block scale [nblk]
 layout(binding = 3) readonly buffer SA { float16_t sact[]; };   // per-block Σ dequant a [nblk]
@@ -20,7 +32,14 @@ layout(binding = 5) buffer YB { float y_buf[]; };
 
 shared float red[64];
 
+// Weight-byte read chokepoint — this file carries its own Q4_K dp4a decode (not
+// native_decode.glsl), so it declares the arena seam locally like the native_mmv family.
+#ifdef STREAMED
+#include "native_arena_ref.glsl"
+uint rb(uint byte) { return (arena_word(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
+#else
 uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
+#endif
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 // Q4_K 6-bit scale/min for sub-block i from the 12-byte scales field at sb.
@@ -40,7 +59,15 @@ void main() {
     uint slot = unit / pc.out_f;
     uint o = unit - slot * pc.out_f;
     uint t = gl_LocalInvocationID.x;
+#ifdef STREAMED
+    // Expert base BYTE address straight from `ids`; `pc.stride` is the per-expert BYTE stride in
+    // this build. wbase keeps only the small within-expert element offset.
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(ids[slot]) * uint64_t(pc.stride);
+    uint wbase = o * pc.in_f;                         // element offset, multiple of 256
+#else
     uint wbase = ids[slot] * pc.stride + o * pc.in_f; // element offset, multiple of 256
+#endif
     uint nsub = pc.in_f / 32u;                        // 32-element sub-blocks (= activation blocks)
     float acc = 0.0;
     for (uint s = t; s < nsub; s += 64u) {

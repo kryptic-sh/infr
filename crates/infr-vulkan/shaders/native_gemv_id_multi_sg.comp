@@ -28,16 +28,34 @@ layout(local_size_x = SG, local_size_y = 1, local_size_z = 1) in;
 
 // `rows`: total dispatched-should-be workgroup count is rows*n_used*ceil(out_f/NR) — needed ONLY
 // to bound-check the flat index against a padding workgroup from a possibly-2-D dispatch grid.
+// -DSTREAMED (resident-BDA): the stacked role tensor lives in a resident BDA arena at the 64-bit
+// base passed as arena_lo/arena_hi; the expert base is `ids[slot_global]` scaled by `stride`,
+// REPURPOSED as the per-expert BYTE stride on the 64-bit pointer (see native_gemv_id.comp's
+// STREAMED doc). Additive: the non-STREAMED build is byte-identical.
+#ifdef STREAMED
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
+    uint arena_lo; uint arena_hi;
+} pc;
+#else
 layout(push_constant) uniform PC {
     uint in_f; uint out_f; uint n_used; uint stride; uint x_per_slot; uint rows;
 } pc;
+#endif
+#ifndef STREAMED
 layout(binding = 0) readonly buffer WB { uint nw[]; };
+#endif
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 layout(binding = 2) readonly buffer IDB { uint ids[]; };
 layout(binding = 3) buffer YB { float y_buf[]; };
 
 #ifndef NR
 #define NR 2
+#endif
+
+#ifdef STREAMED
+#include "native_arena_ref.glsl"
+#define NW(i) arena_word(i)
 #endif
 
 #include "native_decode.glsl"
@@ -74,7 +92,16 @@ void main() {
     uint slot_global = unit / og;                    // (row, slot) flattened — see native_gemv_id_multi
     uint o0 = (unit - slot_global * og) * uint(NR);  // first output row this workgroup owns
     uint row = slot_global / pc.n_used;
+#ifdef STREAMED
+    // Expert base BYTE address straight from `ids`; `pc.stride` is the per-expert BYTE stride in
+    // this build. wexp keeps only the small within-expert element offset (0 — the pointer IS the
+    // expert base).
+    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
+             + uint64_t(ids[slot_global]) * uint64_t(pc.stride);
+    uint wexp = 0u;
+#else
     uint wexp = ids[slot_global] * pc.stride;
+#endif
     uint xbase = (pc.x_per_slot != 0u ? slot_global * pc.in_f : row * pc.in_f);
     uint nsub = pc.in_f / 32u;
     float acc[NR];

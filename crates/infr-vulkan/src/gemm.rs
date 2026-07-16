@@ -1644,6 +1644,20 @@ pub(crate) fn native_gemm_i8cm_q8_0_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// `-DSTREAMED` twin of [`native_gemm_i8cm_q8_0_spv`]: the raw Q8_0 weight bytes read through an
+/// inline 64-bit buffer_reference into the resident arena instead of the bound binding-2 SSBO —
+/// see the shader's STREAMED doc. Parity-test entry (the `-DROW_SCALE` twin
+/// `native_gemm_i8cm_q8_0_rowscale_streamed.spv` also compiles — same `rb()`/`NW()` seam, only the
+/// activation-scale binding differs — but isn't wired into Rust yet; covered by composition).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_i8cm_q8_0_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/native_gemm_i8cm_q8_0_streamed.spv"
+    ));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V + cache name for the row-wise (whole-K) activation quant pass — int8-coopmat GEMM
 /// "Idea 2" measurement variant (see `quant_q8_row.comp`), gated behind `INFR_I8_ROW_SCALE=1`.
 /// `sg16` selects the `-DSG=16` twin (`caps.sg_pref == 16`).
@@ -1738,6 +1752,17 @@ pub(crate) fn native_gemm_warp_bf16cm_n128_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn repack_q8_to_f8_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/repack_q8_to_f8.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// `-DSTREAMED` twin of [`repack_q8_to_f8_spv`]: the Q8_0 source is read through
+/// `native_arena_ref.glsl`'s `NW()` chokepoint (this file already includes `native_decode.glsl`,
+/// same as `native_gemm_warp`) into the resident arena instead of the bound binding-0 SSBO. The
+/// E4M3 output buffer (binding 1) is a derived scratch buffer and stays bound in both builds — see
+/// the shader's STREAMED doc. Parity-test entry.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn repack_q8_to_f8_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/repack_q8_to_f8_streamed.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

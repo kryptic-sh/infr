@@ -2635,12 +2635,16 @@ fn main() {
     //   * native_gemv — decode/small-m GEMV (any-m rows loop). Non-residual only: the fused-add
     //     peephole filters streamed weights out (adapter.rs), so no USE_RES twin is needed.
     //   * native_gemm / native_gemm_warp — the prefill coopmat-dequant GEMM family (base 64×64 and
-    //     the 8-warp warptile: wide/NARROW_N/A_GLOBAL/SPLIT_K/BM* × every quant format). A streamed
-    //     dense prefill Linear routes through the SAME tile the resident path picks, just
-    //     arena-addressed (adapter.rs `streamed_prefill_gemm`). EXCLUDED: -DBF16CM and the `_cm8`
-    //     (-DCM_M=8) coopmat variants (opt-in, RDNA4/Intel — the streamed dense path never
-    //     dispatches them) and -DFMT_F16 (floats aren't streamed — they upload resident), so no dead
-    //     twins are compiled.
+    //     the 8-warp warptile: wide/NARROW_N/A_GLOBAL/SPLIT_K/BM* × every quant format, plus the
+    //     opt-in -DBF16CM / `_cm8` (-DCM_M=8) coopmat variants and the -DFMT_F16 split-K build). A
+    //     streamed dense prefill Linear routes through the SAME tile the resident path picks, just
+    //     arena-addressed (adapter.rs `streamed_prefill_gemm`). Previously EXCLUDED BF16CM/CM_M=8/
+    //     FMT_F16 as opt-in-only or float-upload-only — re-audited: none of the three change the
+    //     weight-READ source. BF16CM/CM_M only retype/resize the coopmat A/B fragment (CMTYPE /
+    //     CM_M/CM_N), and FMT_F16's dq/dqblk (native_decode.glsl) route through the exact same
+    //     ru16->rb->NW() chokepoint every other format uses — so all three compile a working
+    //     `_streamed` twin off the STREAMED arm this file already carries. Every native_gemm /
+    //     native_gemm_warp variant now gets a twin.
     //   * native_gemv_mrow / native_gemv_sg / native_gemv_rm / native_gemv_rm_v2 — the resident
     //     decode-GEMV tuning family (spec-decode multi-row, subgroup-reduce projection band,
     //     multi-output-row, and its experimental variants). Same additive guard as native_gemv; same
@@ -2649,13 +2653,10 @@ fn main() {
     //     twin expansion above (this closure runs AFTER it), so both the SG=32 and SG=16 builds get
     //     their own `_streamed` twin by construction — no separate SG16 handling needed here.
     let wants_streamed_twin = |src_stem: &str, defines: &[String]| -> bool {
-        let excluded = defines
-            .iter()
-            .any(|d| d == "-DBF16CM" || d == "-DCM_M=8" || d == "-DFMT_F16");
         let no_res = !defines.iter().any(|d| d == "-DUSE_RES");
         match src_stem {
             "native_gemv" => no_res,
-            "native_gemm" | "native_gemm_warp" => !excluded,
+            "native_gemm" | "native_gemm_warp" => true,
             "native_gemv_mrow" | "native_gemv_sg" | "native_gemv_rm" | "native_gemv_rm_v2" => {
                 no_res
             }
@@ -2694,6 +2695,17 @@ fn main() {
             // along on the shared WQ() seam — see gemm_proj.comp's STREAMED doc. gemm_proj_mmq is
             // test-only (a deletion candidate) and does NOT get a twin here.
             "gemm_proj" | "gemm_proj_warp" => true,
+            // int8-coopmat Q8_0 prefill GEMM (INFR_I8_COOPMAT=1 measurement kernel, base +
+            // -DROW_SCALE): the raw Q8_0 weight byte read (a local `rb()`/`NW()` chokepoint, not
+            // native_decode.glsl's) gets the same inline-buffer_reference seam as gemm_proj — see
+            // native_gemm_i8cm_q8_0.comp's STREAMED doc. Both defines only affect the ACTIVATION
+            // scale source, never the weight binding.
+            "native_gemm_i8cm_q8_0" => true,
+            // Load-time Q8_0->E4M3 repack (feeds the -DPREPACK fp8-coopmat GEMM's prepacked weight
+            // buffer): reads the Q8_0 source via the same native_decode.glsl NW() chokepoint as
+            // native_gemm_warp — see repack_q8_to_f8.comp's STREAMED doc. The E4M3 output buffer
+            // (binding 1) is a derived scratch buffer the arena doesn't own, so it stays bound.
+            "repack_q8_to_f8" => true,
             _ => false,
         }
     };

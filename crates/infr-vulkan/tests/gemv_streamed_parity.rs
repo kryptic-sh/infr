@@ -1700,3 +1700,174 @@ fn gemm_proj_streamed_matches_resident() {
     assert_case(&c);
     println!("ok: {}", c.name);
 }
+
+// ─── int8-coopmat Q8_0 prefill GEMM (native_gemm_i8cm_q8_0) — this slice ───────────────────────
+// Measurement kernel, gated behind INFR_I8_COOPMAT=1 + `caps.i8_coopmat()` (16x16x16 int8 WMMA —
+// DETECTION ONLY at the Capabilities level, per its doc). The env toggle alone is a no-op on
+// hardware/driver that doesn't detect the config: the adapter never routes here, so dispatching the
+// kernel by hand (as this test does) would just prove nothing on a box without the coopmat shape —
+// self-skip instead of silently passing vacuously.
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn i8cm_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    if !be.capabilities().i8_coopmat() {
+        eprintln!("skip: no 16x16x16 i8 coopmat on this device");
+        return;
+    }
+    // n%16, k%32 (see the shader header); m=8 keeps everything inside one BM=128 workgroup row-tile
+    // (gr < pc.m zero-guards the rest, so C only ever needs m*n reals — no pad-row garbage to trim).
+    let (m, k, n) = (8usize, 256usize, 64usize);
+    let q = quantize_x(&be, m, k);
+
+    let w_bytes = weight_bytes_for(DType::Q8_0, k * n);
+    let w = synth_weight_bytes(w_bytes, k * 31 + n);
+    let c_buf = be.alloc(m * n * 4, BufferUsage::Activations).unwrap();
+
+    // ── Resident: weight in its own bound SSBO ────────────────────────────────────────────────
+    let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+    be.upload(w_buf.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.matmul_i8cm_q8_0(
+        q.qa.as_ref(),
+        q.dact.as_ref(),
+        w_buf.as_ref(),
+        0,
+        c_buf.as_ref(),
+        m,
+        k,
+        n,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; m * n * 4];
+    be.download(c_buf.as_ref(), &mut out).unwrap();
+    let resident = bits(&out);
+
+    // ── Streamed leg 1: arena offset 0 ────────────────────────────────────────────────────────
+    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+    be.upload(arena0.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.matmul_i8cm_q8_0_streamed(
+        q.qa.as_ref(),
+        q.dact.as_ref(),
+        addr0,
+        0,
+        c_buf.as_ref(),
+        m,
+        k,
+        n,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; m * n * 4];
+    be.download(c_buf.as_ref(), &mut out).unwrap();
+    let streamed_at0 = bits(&out);
+
+    // ── Streamed leg 2: the SAME weight parked at a non-zero offset in a bigger arena ─────────
+    let off = nonzero_off(DType::Q8_0);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&w);
+    let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena1.as_ref(), &backing).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.matmul_i8cm_q8_0_streamed(
+        q.qa.as_ref(),
+        q.dact.as_ref(),
+        addr1 + off as u64,
+        0,
+        c_buf.as_ref(),
+        m,
+        k,
+        n,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; m * n * 4];
+    be.download(c_buf.as_ref(), &mut out).unwrap();
+    let streamed_atoff = bits(&out);
+
+    let c = Case {
+        name: "i8cm_q8_0".to_string(),
+        resident,
+        streamed_at0,
+        streamed_atoff,
+    };
+    assert_case(&c);
+    println!("ok: {}", c.name);
+}
+
+// ─── load-time Q8_0->E4M3 repack (repack_q8_to_f8) — this slice ───────────────────────────────
+// Not a GEMV/GEMM: the kernel's whole job IS the output, so parity here means the two OUTPUT byte
+// buffers (resident-read repack vs streamed-read repack) must be byte-identical — there is no
+// separate "real answer" to check either against, only that both legs decode the SAME Q8_0 source
+// bytes into the SAME E4M3 bytes. Defensively gated on `caps.f8_coopmat()` even though the kernel
+// itself does no coopmat math: `floate4m3_t` storage (GL_EXT_float_e4m3) needs the same fp8 device
+// support the coopmat tier detects, and the shader's own header notes this path is
+// "compile-checked only" on hardware without it.
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn repack_streamed_matches_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    if !be.capabilities().f8_coopmat() {
+        eprintln!("skip: no f8 coopmat / float8 storage on this device");
+        return;
+    }
+    let (n, k) = (64usize, 256usize); // k%32==0 (one 32-elem Q8_0 block per repack thread)
+    let w_bytes = weight_bytes_for(DType::Q8_0, n * k);
+    let w = synth_weight_bytes(w_bytes, k * 31 + n);
+    let w8_bytes = n * k; // [n, k] E4M3, 1 byte/elem
+
+    // ── Resident: Q8_0 source in its own bound SSBO ───────────────────────────────────────────
+    let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+    be.upload(w_buf.as_ref(), &w).unwrap();
+    let w8_buf = be.alloc(w8_bytes, BufferUsage::Activations).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.repack_q8_to_f8(w_buf.as_ref(), 0, w8_buf.as_ref(), n, k);
+    rec.finish().unwrap();
+    let mut resident = vec![0u8; w8_bytes];
+    be.download(w8_buf.as_ref(), &mut resident).unwrap();
+    assert!(
+        resident.iter().any(|&b| b != 0),
+        "repack: resident w8 output is all zeros — the case is not exercising the kernel"
+    );
+
+    // ── Streamed leg 1: arena offset 0 ────────────────────────────────────────────────────────
+    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+    be.upload(arena0.as_ref(), &w).unwrap();
+    let w8_buf0 = be.alloc(w8_bytes, BufferUsage::Activations).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.repack_q8_to_f8_streamed(addr0, 0, w8_buf0.as_ref(), n, k);
+    rec.finish().unwrap();
+    let mut streamed_at0 = vec![0u8; w8_bytes];
+    be.download(w8_buf0.as_ref(), &mut streamed_at0).unwrap();
+    assert_eq!(
+        resident, streamed_at0,
+        "repack: streamed@0 w8 output differs from resident, byte-for-byte"
+    );
+
+    // ── Streamed leg 2: the SAME Q8_0 source parked at a non-zero offset, garbage prefix ──────
+    let off = nonzero_off(DType::Q8_0);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&w);
+    let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena1.as_ref(), &backing).unwrap();
+    let w8_buf1 = be.alloc(w8_bytes, BufferUsage::Activations).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.repack_q8_to_f8_streamed(addr1 + off as u64, 0, w8_buf1.as_ref(), n, k);
+    rec.finish().unwrap();
+    let mut streamed_atoff = vec![0u8; w8_bytes];
+    be.download(w8_buf1.as_ref(), &mut streamed_atoff).unwrap();
+    assert_eq!(
+        resident, streamed_atoff,
+        "repack: streamed@nonzero-offset w8 output differs from resident — the twin is ignoring \
+         its arena base offset"
+    );
+
+    println!("ok: repack_q8_to_f8 streamed");
+}

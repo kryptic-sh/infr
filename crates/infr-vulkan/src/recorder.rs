@@ -1784,6 +1784,50 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// `-DSTREAMED` twin of [`Self::matmul_i8cm_q8_0`]: the raw Q8_0 weight bytes read through an
+    /// inline 64-bit buffer_reference into the resident arena (`native_gemm_i8cm_q8_0.comp`'s
+    /// STREAMED doc) instead of the bound binding-2 SSBO. The resident build's weight-SSBO slot
+    /// takes a harmless FILLER (`qa`) since the arena is never bound as a descriptor — same
+    /// convention as [`Self::matmul_proj_streamed`]. Not wired into any production dispatch yet;
+    /// exists so a parity test can exercise the `_streamed` SPV directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_i8cm_q8_0_streamed(
+        &self,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        arena_addr: u64,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        self.label_gemm("native_gemm_i8cm_q8_0_streamed", m, k, n);
+        let kern = self.be.kernel_sg(
+            "native_gemm_i8cm_q8_0_streamed",
+            crate::gemm::native_gemm_i8cm_q8_0_streamed_spv(),
+            4,
+            24,
+            32,
+        );
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        // BM=128 (see the shader header): one workgroup covers 128 rows x 16 cols.
+        let groups = (m.div_ceil(128) * (n / 16)) as u32;
+        self.dispatch(
+            kern,
+            &[Self::vkb(qa), Self::vkb(dact), Self::vkb(qa), Self::vkb(c)],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// "Idea 2" measurement variant of `matmul_i8cm_q8_0`: `dact_row` is ONE f16 scale per row
     /// (whole-K, from `quant_q8_row`) instead of per-32-block — coarser precision, but lets the
     /// shader pull the activation scale out of its per-block sum. Gated by `INFR_I8_ROW_SCALE=1`
@@ -2024,6 +2068,37 @@ impl<'a> Recorder<'a> {
         let total_blocks = ((n * k) / 32) as u32;
         let groups = total_blocks.div_ceil(256);
         self.dispatch_wide(kern, &[Self::vkb(w), Self::vkb(w8)], 1, &push, groups);
+    }
+
+    /// `-DSTREAMED` twin of [`Self::repack_q8_to_f8`]: the Q8_0 source is read through
+    /// `native_arena_ref.glsl`'s `NW()` chokepoint into the resident arena instead of the bound
+    /// binding-0 SSBO (`repack_q8_to_f8.comp`'s STREAMED doc). The vacated binding-0 slot takes a
+    /// harmless FILLER (`w8`, the only other buffer this dispatch touches) since the arena is never
+    /// bound as a descriptor. Not wired into any production dispatch yet; exists so a parity test
+    /// can exercise the `_streamed` SPV directly.
+    pub fn repack_q8_to_f8_streamed(
+        &self,
+        arena_addr: u64,
+        w_base: usize,
+        w8: &dyn Buffer,
+        n: usize,
+        k: usize,
+    ) {
+        let kern = self.be.kernel(
+            "repack_q8_to_f8_streamed",
+            crate::gemm::repack_q8_to_f8_streamed_spv(),
+            2,
+            20,
+        );
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let total_blocks = ((n * k) / 32) as u32;
+        let groups = total_blocks.div_ceil(256);
+        self.dispatch_wide(kern, &[Self::vkb(w8), Self::vkb(w8)], 1, &push, groups);
     }
 
     /// Row-wise (whole-K) fp8 (E4M3) activation quantize pass — the activation-scaling step for

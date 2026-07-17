@@ -2623,13 +2623,17 @@ fn main() {
     // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a
     // `bufferDeviceAddress` arena pool (native_arena_ref.glsl) instead of a bound SSBO, lifting the
     // ~4 GiB `maxStorageBufferRange` cap one SSBO binding imposes. `wants_streamed_twin` marks the
-    // families that get a STREAMED build; `keep_resident` (below) marks the few whose bound-SSBO
-    // build is STILL dispatched (production conv1d/e2b, mechanism-(b)) — every eager-runner /
-    // parity-recorder consumer that used to justify a resident build for native_gemv(_sg/_rm/_rm_v2)
-    // or linear_f16/linear_bf16 is gone (retired alongside the resident paths themselves), so those
-    // families dropped out of `keep_resident` too. For every other family STREAMED is now the SOLE
-    // weight build — the bound-SSBO "resident" build is no longer emitted. The list below still
-    // enumerates which families qualify:
+    // families that get a STREAMED build; `mechanism_b_resident` (below) marks the few whose
+    // bound-SSBO build is STILL dispatched — every eager-runner / parity-recorder / production
+    // consumer that used to justify a resident build for native_gemv(_sg/_rm/_rm_v2),
+    // linear_f16/linear_bf16, or conv1d_silu(_par)/e2b_gate is gone (retired alongside the resident
+    // paths themselves — production's `Recorder::conv1d_silu`/`conv1d_silu_batch`/`e2b_gate` now
+    // resolve the weight's own BDA address and dispatch the STREAMED build directly, same as every
+    // other ported family), so those families dropped out of the resident whitelist too. For every
+    // other family STREAMED is now the SOLE weight build — the bound-SSBO "resident" build is no
+    // longer emitted, and the only families with a genuinely-live resident build left are the
+    // mechanism-(b) ones (below), which is why the whitelist is named for that. The list below
+    // still enumerates which families qualify for a STREAMED twin at all:
     //   * native_gemv / native_gemv_mrow / native_gemv_sg / native_gemv_rm / native_gemv_rm_v2 —
     //     decode/small-m GEMV family (any-m rows loop, spec-decode multi-row, subgroup-reduce
     //     projection band, multi-output-row, and its experimental variants). Both plain and
@@ -2693,8 +2697,11 @@ fn main() {
             // sequential and batch-pass-1 variants — conv1d_shift never reads the weight) and
             // gemma4 E2B's per-layer fused inp_gate GEMV. Same typed buffer_reference seam as the
             // linear family above (see conv1d_silu.comp's STREAMED doc). Every variant of these
-            // sources gets a twin. (e2b_proj — the per-layer PROJ counterpart — is gone entirely:
-            // see the base builds list above.)
+            // sources gets a twin; NOT in `mechanism_b_resident` below — production's
+            // `Recorder::conv1d_silu`/`conv1d_silu_batch`/`e2b_gate` now resolve the weight's own
+            // BDA address and dispatch this STREAMED build directly (the old bound-SSBO resident
+            // build is dead), same as linear_f16/linear_bf16 above. (e2b_proj — the per-layer PROJ
+            // counterpart — is gone entirely: see the base builds list above.)
             "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" => true,
             // The coopmat f16/repacked-quant projection GEMM (prefill C=A·Wᵀ): the quant arms ride
             // along on the shared WQ() seam — see gemm_proj.comp's STREAMED doc.
@@ -2716,36 +2723,39 @@ fn main() {
     // Resident-BDA endgame: for every twin family the recorder now dispatches STREAMED-only
     // (weights read by 64-bit device address), the resident (non-`-DSTREAMED`) build is dead — the
     // `_streamed` twin is the SOLE weight build, emitted under the base (unsuffixed) name (see the
-    // `else` arm below). `keep_resident` is the whitelist of twin-family builds whose RESIDENT SPV
-    // is still genuinely dispatched (bound-descriptor read), so it must keep compiling alongside the
-    // SUFFIXED streamed twin instead:
-    //   * conv1d_silu / conv1d_silu_par / e2b_gate — production dispatches the RESIDENT kernel
-    //     (their `_streamed` twin is the parity-test entry, not the production path).
-    //   * mechanism-(b): the standalone mmq Q4_K/Q6_K, the int8/fp8-coopmat GEMMs, the Q8_0→E4M3
-    //     repack, and native_gemm_warp's `_cm8`/`_bf16cm` coopmat tiles all bind a `BdaSub`
-    //     sub-range via vkb and read through the bound descriptor — their resident build IS live.
-    // native_gemv/_sg/_rm/_rm_v2 and linear_f16/linear_bf16 used to be here too (the eager
-    // `VulkanBackend::linear_native`/`linear_{f16,bf16}` and the `Recorder::linear_native_{sg,rm,
-    // rm_v2}` parity dispatchers bound the weight as an SSBO), but every one of those callers is
-    // gone — the STREAMED twin was ALREADY the sole production route (`linear_native_streamed` and
-    // its `_sg`/`_rm`/`_rm_v2` siblings, `Recorder::linear_streamed`/`linear_bf16_streamed`), so
-    // dropping `keep_resident` for them just stops compiling the now-dead bound-SSBO half. Everything
-    // else in a twin family (the dense/expert coopmat GEMM tiles, the mmv/mrow/id float and dequant
-    // GEMVs, embed_gather, gemm_proj, native_gemm_fma) was ALREADY STREAMED-only.
-    let keep_resident = |src: &str, defines: &[String]| -> bool {
+    // `else` arm below). `mechanism_b_resident` is the whitelist of twin-family builds whose
+    // RESIDENT SPV is still genuinely dispatched (bound-descriptor read), so it must keep compiling
+    // alongside the SUFFIXED streamed twin instead. Every surviving entry is mechanism-(b): the
+    // standalone mmq Q4_K/Q6_K, the int8/fp8-coopmat GEMMs, the Q8_0→E4M3 repack, and
+    // native_gemm_warp's `_cm8`/`_bf16cm` coopmat tiles all bind a `BdaSub` sub-range via vkb and
+    // read through the bound descriptor — their resident build IS live, which is why the whitelist
+    // is named for that mechanism (nothing else qualifies any more). native_gemv/_sg/_rm/_rm_v2,
+    // linear_f16/linear_bf16, and conv1d_silu/conv1d_silu_par/e2b_gate used to be here too (the
+    // eager `VulkanBackend::linear_native`/`linear_{f16,bf16}`, the `Recorder::linear_native_{sg,
+    // rm,rm_v2}` parity dispatchers, and production's own `Recorder::conv1d_silu`/
+    // `conv1d_silu_batch`/`e2b_gate` all bound the weight as an SSBO), but every one of those
+    // callers is gone — the STREAMED twin is now the sole route everywhere
+    // (`linear_native_streamed` and its `_sg`/`_rm`/`_rm_v2` siblings,
+    // `Recorder::linear_streamed`/`linear_bf16_streamed`, and `Recorder::conv1d_silu`/
+    // `conv1d_silu_batch`/`e2b_gate` themselves now resolve `device_addr()` and delegate to their
+    // own `_streamed` twin), so dropping them from this whitelist just stops compiling the now-dead
+    // bound-SSBO half. Everything else in a twin family (the dense/expert coopmat GEMM tiles, the
+    // mmv/mrow/id float and dequant GEMVs, embed_gather, gemm_proj, native_gemm_fma) was ALREADY
+    // STREAMED-only.
+    let mechanism_b_resident = |src: &str, defines: &[String]| -> bool {
         match src {
-            "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" => true,
             "native_gemm_i8cm_q8_0" | "repack_q8_to_f8" => true,
             "native_gemm_warp" => defines.iter().any(|d| d == "-DCM_M=8" || d == "-DBF16CM"),
             "native_gemm_mmq_q4k" | "native_gemm_mmq_q6k" => defines.is_empty(),
             _ => false,
         }
     };
-    // Dead `_streamed` twins (#75): a few `keep_resident` families keep their bound-descriptor
-    // resident build but nothing ever dispatches the arena-addressed twin. `native_gemm_warp`'s
-    // native-coopmat `_cm8`/`_bf16cm` tiles are read straight from the resident SPV by
-    // `Recorder::matmul_native_cm8` (and its bf16cm sibling) — never through the `native_gemm_spv`
-    // arena map — so their STREAMED twin was compiled but unreachable. Emit resident-only for them.
+    // Dead `_streamed` twins (#75): a few `mechanism_b_resident` families keep their
+    // bound-descriptor resident build but nothing ever dispatches the arena-addressed twin.
+    // `native_gemm_warp`'s native-coopmat `_cm8`/`_bf16cm` tiles are read straight from the
+    // resident SPV by `Recorder::matmul_native_cm8` (and its bf16cm sibling) — never through the
+    // `native_gemm_spv` arena map — so their STREAMED twin was compiled but unreachable. Emit
+    // resident-only for them.
     let dead_streamed_twin = |src: &str, defines: &[String]| -> bool {
         src == "native_gemm_warp" && defines.iter().any(|d| d == "-DCM_M=8" || d == "-DBF16CM")
     };
@@ -2757,7 +2767,7 @@ fn main() {
             }
             let mut sd = defines.clone();
             sd.push("-DSTREAMED".to_string());
-            if keep_resident(&src_stem, &defines) {
+            if mechanism_b_resident(&src_stem, &defines) {
                 if dead_streamed_twin(&src_stem, &defines) {
                     // Resident is dispatched directly; the STREAMED twin has no caller — drop it.
                     vec![(src_stem, dst_stem, defines)]

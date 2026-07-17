@@ -1817,9 +1817,6 @@ const DELTANET_NORM_SPV_BYTES: &[u8] =
 const DELTANET_GATES_SEQ_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_gates_seq.spv"));
 const DELTANET_SEQ_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deltanet_seq.spv"));
-const CONV1D_SILU_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
-const CONV1D_SILU_PAR_SPV_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par.spv"));
 const CONV1D_SHIFT_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_shift.spv"));
 const COPY_STRIDED_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/copy_strided.spv"));
 const MUL_SIGMOID_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mul_sigmoid.spv"));
@@ -2651,37 +2648,30 @@ pub(crate) fn deltanet_chunked_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(DELTANET_CHUNKED_SPV_BYTES))
 }
-/// SPIR-V for the causal depthwise conv1d + SiLU step (qwen35/Qwen3.5 SSM input conv).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn conv1d_silu_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(CONV1D_SILU_SPV_BYTES))
-}
-/// SPIR-V for the BATCH depthwise conv1d+SiLU (pass 1: all outputs in parallel).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn conv1d_silu_par_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(CONV1D_SILU_PAR_SPV_BYTES))
-}
-/// SPIR-V for the BATCH depthwise conv1d history rebuild (pass 2).
+/// SPIR-V for the BATCH depthwise conv1d history rebuild (pass 2; never reads the weight, so it
+/// has no STREAMED twin — the same build serves both the sequential and batch conv paths).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn conv1d_shift_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(CONV1D_SHIFT_SPV_BYTES))
 }
-/// `-DSTREAMED` twin SPIR-V of `conv1d_silu` (the qwen35 SSM input conv weight read through a
-/// typed 64-bit buffer_reference — see the shader's STREAMED doc). Parity-test entry.
+/// The qwen35 SSM input conv, one token (`conv1d_silu.comp`; weight read through a typed 64-bit
+/// buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the bound-SSBO
+/// resident build died with `Recorder::conv1d_silu`'s own resident dispatch, its sole consumer).
+/// Production entry: [`crate::recorder::Recorder::conv1d_silu`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn conv1d_silu_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_streamed.spv"));
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// `-DSTREAMED` twin SPIR-V of `conv1d_silu_par` (BATCH pass 1; same STREAMED convention as
-/// `conv1d_silu`). Parity-test entry.
+/// BATCH pass 1 of the qwen35 SSM input conv (`conv1d_silu_par.comp`; same STREAMED convention as
+/// `conv1d_silu`) — the ONLY weight build (the bound-SSBO resident build died with
+/// `Recorder::conv1d_silu_batch`'s own resident dispatch, its sole consumer). Production entry:
+/// [`crate::recorder::Recorder::conv1d_silu_batch`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn conv1d_silu_par_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par_streamed.spv"));
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -2728,23 +2718,28 @@ pub(crate) fn rope_spv() -> &'static [u32] {
     static ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ROPE_SPV.get_or_init(|| spv_words(ROPE_SPV_BYTES))
 }
-/// SPIR-V for E2B per-layer inp_gate fused GEMV+GELU+strided-multiply kernel.
+/// SPIR-V for E2B per-layer inp_gate fused GEMV+GELU+strided-multiply kernel. Used ONLY by the
+/// test-only eager `VulkanBackend::e2b_gate` (ops.rs) — a standalone Staging-buffer harness that
+/// predates the resident-BDA weight system and was left as-is by that port (not weight-related in
+/// the arena sense). Now that `e2b_gate.comp`'s resident build is gone (see build.rs's
+/// `mechanism_b_resident`), this returns the SAME bytes as [`e2b_gate_streamed_spv`] — the eager
+/// caller still binds `w` as a plain SSBO and passes the pre-STREAMED 20-byte push-constant
+/// layout (no arena address), which no longer matches this shader's STREAMED ABI.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn e2b_gate_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/e2b_gate.spv"))))
 }
-/// `-DSTREAMED` twin SPIR-V of `e2b_gate` (weight read through a typed 64-bit buffer_reference —
-/// see the shader's STREAMED doc). Parity-test entry.
+/// gemma4 E2B's per-layer fused inp_gate GEMV (`e2b_gate.comp`; weight read through a typed
+/// 64-bit buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the
+/// bound-SSBO resident build died with `Recorder::e2b_gate`'s own resident dispatch, its sole
+/// production consumer). Production entry: [`crate::recorder::Recorder::e2b_gate`]. See
+/// [`e2b_gate_spv`]'s doc for the one surviving (now-mismatched) bound-SSBO caller.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn e2b_gate_streamed_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/e2b_gate.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| {
-        spv_words(include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/e2b_gate_streamed.spv"
-        )))
-    })
+    S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for fused QkNormRope reading from interleaved q+g buffer (qwen35 CopyStrided elim).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

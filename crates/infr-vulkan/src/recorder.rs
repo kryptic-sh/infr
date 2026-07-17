@@ -1118,6 +1118,8 @@ impl<'a> Recorder<'a> {
     /// E2B per-layer inp_gate: fused f32 GEMV + GELU activation * strided up-read.
     /// `dst[r,o] = gelu(sum_k x[r,k] * w[o,k]) * up[up_off + r*up_stride + o]`.
     /// Scalar MROW=4 kernel, bit-identical to separate Linear(f32) + GatedAct(gelu, stride).
+    /// Resident-BDA route: `w.device_addr()` `Some` forks to the `-DSTREAMED` twin (the only
+    /// weight build — see [`Self::e2b_gate_streamed`]'s doc).
     pub fn e2b_gate(
         &self,
         w: &dyn Buffer,
@@ -1130,29 +1132,17 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        let k = self
-            .be
-            .kernel("e2b_gate", crate::gemm::e2b_gate_spv(), 4, 20);
-        let mut push = [0u8; 20];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(up_off as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(up_stride as u32).to_ne_bytes());
-        let groups = out_f as u32 * (m as u32).div_ceil(4);
-        self.dispatch_wide(
-            k,
-            &[Self::vkb(w), Self::vkb(x), Self::vkb(up), Self::vkb(y)],
-            1,
-            &push,
-            groups,
-        );
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: e2b_gate requires a u64 BDA device address");
+        self.e2b_gate_streamed(arena_addr, x, up, up_off, up_stride, y, m, in_f, out_f);
     }
 
-    /// `-DSTREAMED` twin of [`Self::e2b_gate`] (weight read through a typed 64-bit
-    /// buffer_reference — see `shaders/e2b_gate.comp`'s STREAMED doc). Binding 0 (the resident
-    /// build's weight SSBO) takes a harmless FILLER (`x`). Parity-test entry, not dispatched in
-    /// production.
+    /// Arena-addressed body of [`Self::e2b_gate`] (weight read through a typed 64-bit
+    /// buffer_reference — see `shaders/e2b_gate.comp`'s STREAMED doc). Binding 0 (the old
+    /// resident build's weight SSBO) takes a harmless FILLER (`x`). Production routes here
+    /// through [`Self::e2b_gate`] (the weight's own BDA address); parity tests call it directly
+    /// with an explicit arena address.
     pub fn e2b_gate_streamed(
         &self,
         arena_addr: u64,
@@ -5250,6 +5240,8 @@ impl<'a> Recorder<'a> {
 
     /// Causal depthwise conv1d + SiLU, one token (qwen35 SSM input conv). The per-channel history
     /// `state` `[(kconv-1)*cc]` is updated in place; `out` is `[cc]`. See shaders/conv1d_silu.comp.
+    /// Resident-BDA route: `w.device_addr()` `Some` forks to the `-DSTREAMED` twin (the only
+    /// weight build — see [`Self::conv1d_silu_streamed`]'s doc).
     pub fn conv1d_silu(
         &self,
         qkv: &dyn Buffer,
@@ -5260,25 +5252,10 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
-        let kern = self
-            .be
-            .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 12);
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
-        self.dispatch(
-            kern,
-            &[
-                Self::vkb(qkv),
-                Self::vkb(w),
-                Self::vkb(state),
-                Self::vkb(out),
-            ],
-            2, // state (in/out) + out
-            &push,
-            (cc as u32).div_ceil(256),
-        );
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: conv1d_silu requires a u64 BDA device address");
+        self.conv1d_silu_streamed(qkv, arena_addr, state, out, rows, cc, kconv);
     }
 
     /// BATCH depthwise conv1d + SiLU (rows ≥ kconv-1): pass 1 computes ALL rows·cc outputs in
@@ -5286,6 +5263,9 @@ impl<'a> Recorder<'a> {
     /// one by one, shuffling the history each token); pass 2 rebuilds the history from the last
     /// kconv-1 input rows. The recorder's hazard tracking orders pass 2 after pass 1 (pass 1
     /// reads the old state pass 2 overwrites). See shaders/conv1d_silu_par.comp / conv1d_shift.comp.
+    /// Resident-BDA route: `w.device_addr()` `Some` forks pass 1 to the `-DSTREAMED` twin (the
+    /// only weight build — see [`Self::conv1d_silu_batch_streamed`]'s doc); pass 2 never reads the
+    /// weight, so it is unaffected.
     pub fn conv1d_silu_batch(
         &self,
         qkv: &dyn Buffer,
@@ -5296,41 +5276,17 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
-        debug_assert!(rows >= kconv - 1, "conv1d_silu_batch needs rows ≥ kconv-1");
-        let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
-        let k1 = self
-            .be
-            .kernel("conv1d_silu_par", crate::gemm::conv1d_silu_par_spv(), 4, 12);
-        self.dispatch(
-            k1,
-            &[
-                Self::vkb(qkv),
-                Self::vkb(w),
-                Self::vkb(state),
-                Self::vkb(out),
-            ],
-            1, // out only (state is read-only here)
-            &push,
-            ((rows * cc) as u32).div_ceil(256),
-        );
-        let k2 = self
-            .be
-            .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12);
-        self.dispatch(
-            k2,
-            &[Self::vkb(qkv), Self::vkb(state)],
-            1, // state out
-            &push,
-            (((kconv - 1) * cc) as u32).div_ceil(256),
-        );
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: conv1d_silu_batch requires a u64 BDA device address");
+        self.conv1d_silu_batch_streamed(qkv, arena_addr, state, out, rows, cc, kconv);
     }
 
-    /// `-DSTREAMED` twin of [`Self::conv1d_silu`] (the qwen35 SSM input conv; see
-    /// `shaders/conv1d_silu.comp`'s STREAMED doc). Binding 1 (the resident build's weight SSBO)
-    /// takes a harmless FILLER (`qkv`). Parity-test entry, not dispatched in production.
+    /// Arena-addressed body of [`Self::conv1d_silu`] (the qwen35 SSM input conv weight read
+    /// through a typed 64-bit buffer_reference — see `shaders/conv1d_silu.comp`'s STREAMED doc).
+    /// Binding 1 (the old resident build's weight SSBO) takes a harmless FILLER (`qkv`).
+    /// Production routes here through [`Self::conv1d_silu`] (the weight's own BDA address);
+    /// parity tests call it directly with an explicit arena address.
     pub fn conv1d_silu_streamed(
         &self,
         qkv: &dyn Buffer,
@@ -5367,10 +5323,12 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// `-DSTREAMED` twin of [`Self::conv1d_silu_batch`]'s pass-1 dispatch (see
+    /// Arena-addressed body of [`Self::conv1d_silu_batch`]'s pass-1 dispatch (see
     /// `shaders/conv1d_silu_par.comp`'s STREAMED doc). Pass 2 (`conv1d_shift`) never reads the
-    /// weight, so it stays the resident dispatch unchanged — both legs share it. Binding 1 takes
-    /// a harmless FILLER (`qkv`). Parity-test entry, not dispatched in production.
+    /// weight, so it stays the same dispatch regardless of the weight's residency — both legs
+    /// share it. Binding 1 takes a harmless FILLER (`qkv`). Production routes here through
+    /// [`Self::conv1d_silu_batch`] (the weight's own BDA address); parity tests call it directly
+    /// with an explicit arena address.
     pub fn conv1d_silu_batch_streamed(
         &self,
         qkv: &dyn Buffer,

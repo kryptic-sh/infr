@@ -4,10 +4,11 @@
 //!
 //! * RESIDENT-VS-STREAMED (`run_case`/`run_mmv_case` + `assert_case`, most tests below): for
 //!   families a resident (bound-SSBO) build is STILL compiled for (production dispatches it, or an
-//!   eager/parity caller binds the weight directly — see build.rs's `keep_resident`), this proves
-//!   the streamed twin computes BIT-IDENTICALLY to it. The two builds differ only in where `NW(i)`
-//!   sources its word from — the dequant math and the accumulation order in `native_decode.glsl`
-//!   are the same code — so anything short of bitwise equality is a bug, not a tolerance question.
+//!   eager/parity caller binds the weight directly — see build.rs's `mechanism_b_resident`), this
+//!   proves the streamed twin computes BIT-IDENTICALLY to it. The two builds differ only in where
+//!   `NW(i)` sources its word from — the dequant math and the accumulation order in
+//!   `native_decode.glsl` are the same code — so anything short of bitwise equality is a bug, not a
+//!   tolerance question.
 //! * OFFSET-INVARIANCE (`run_case_offset_invariant`/`run_mmv_case_offset_invariant` +
 //!   `assert_offset_invariant`): for families whose resident build no longer exists (retired
 //!   alongside the eager/parity-recorder callers that were its sole consumers — the streamed twin
@@ -192,8 +193,8 @@ fn assert_case(c: &Case) {
 /// The result of an offset-invariance case: the streamed kernel's output bits at arena offset 0
 /// and at a non-zero offset (same weight bytes, different address) — no resident leg. Used for
 /// kernel families whose bound-SSBO resident build no longer exists (retired alongside its sole
-/// eager/parity-recorder caller — see build.rs's `keep_resident`), so the ONLY thing left to prove
-/// is that the streamed kernel itself doesn't hardcode arena offset 0.
+/// eager/parity-recorder caller — see build.rs's `mechanism_b_resident`), so the ONLY thing left
+/// to prove is that the streamed kernel itself doesn't hardcode arena offset 0.
 struct OffsetCase {
     /// Human name for the failure message.
     name: String,
@@ -1348,16 +1349,21 @@ fn embed_gather_streamed_matches_resident() {
 
 // ─── model-specific float-weight kernels — qwen35 conv1d + gemma4 E2B ─────────────────────────
 // Same typed buffer_reference seam as the float-weight linear family (slice A4); these are
-// per-model fused kernels rather than a generic GEMV shape, so each gets a bespoke runner.
+// per-model fused kernels rather than a generic GEMV shape (conv1d_silu needs a bespoke runner
+// for its stateful third input; e2b_gate fits `run_case_offset_invariant`).
 
-/// conv1d_silu (single-token) and conv1d_silu_par (BATCH pass 1, via conv1d_silu_batch) both read
-/// the per-channel conv kernel `wconv` through the SAME typed seam. Neither shape fits `run_case`
-/// — there's a THIRD input, the per-channel history `state`, that is read AND written in place —
-/// so `state` is re-uploaded to its initial value before EACH leg (resident, streamed@0,
-/// streamed@nonzero-offset) to keep the legs from drifting off each other's mutated history.
+/// `conv1d_silu`/`conv1d_silu_batch` are BDA wrappers — each is just a `device_addr()` fork onto
+/// the SAME streamed kernel this test drives directly (see those `Recorder` fns' doc), so a
+/// resident-vs-streamed compare here was always vacuous once the port landed. Offset-invariance is
+/// the real assertion. `conv1d_silu` (single-token) and `conv1d_silu_par` (BATCH pass 1, via
+/// `conv1d_silu_batch`) both read the per-channel conv kernel `wconv` through the SAME typed seam.
+/// Neither shape fits `run_case_offset_invariant` — there's a THIRD input, the per-channel history
+/// `state`, that is read AND written in place — so `state` is re-uploaded to its initial value
+/// before EACH leg (streamed@0, streamed@nonzero-offset) to keep the legs from drifting off each
+/// other's mutated history.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn conv1d_silu_streamed_matches_resident() {
+fn conv1d_silu_streamed_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1393,22 +1399,6 @@ fn conv1d_silu_streamed_matches_resident() {
         };
 
         let state_buf = fresh_state(&be);
-        let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
-        be.upload(w_buf.as_ref(), &w).unwrap();
-        let rec = be.recorder().unwrap();
-        rec.conv1d_silu(
-            qkv_buf.as_ref(),
-            w_buf.as_ref(),
-            state_buf.as_ref(),
-            out_buf.as_ref(),
-            1,
-            cc,
-            kconv,
-        );
-        rec.finish().unwrap();
-        let resident = download(&be);
-
-        let state_buf = fresh_state(&be);
         let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
         be.upload(arena0.as_ref(), &w).unwrap();
         let rec = be.recorder().unwrap();
@@ -1422,7 +1412,7 @@ fn conv1d_silu_streamed_matches_resident() {
             kconv,
         );
         rec.finish().unwrap();
-        let streamed_at0 = download(&be);
+        let at0 = download(&be);
 
         let state_buf = fresh_state(&be);
         let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
@@ -1438,15 +1428,14 @@ fn conv1d_silu_streamed_matches_resident() {
             kconv,
         );
         rec.finish().unwrap();
-        let streamed_atoff = download(&be);
+        let atoff = download(&be);
 
-        let c = Case {
+        let c = OffsetCase {
             name: "conv1d_silu (single-token)".to_string(),
-            resident,
-            streamed_at0,
-            streamed_atoff,
+            at0,
+            atoff,
         };
-        assert_case(&c);
+        assert_offset_invariant(&c);
         println!("ok: {}", c.name);
     }
 
@@ -1473,22 +1462,6 @@ fn conv1d_silu_streamed_matches_resident() {
         };
 
         let state_buf = fresh_state(&be);
-        let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
-        be.upload(w_buf.as_ref(), &w).unwrap();
-        let rec = be.recorder().unwrap();
-        rec.conv1d_silu_batch(
-            qkv_buf.as_ref(),
-            w_buf.as_ref(),
-            state_buf.as_ref(),
-            out_buf.as_ref(),
-            rows,
-            cc,
-            kconv,
-        );
-        rec.finish().unwrap();
-        let resident = download(&be);
-
-        let state_buf = fresh_state(&be);
         let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
         be.upload(arena0.as_ref(), &w).unwrap();
         let rec = be.recorder().unwrap();
@@ -1502,7 +1475,7 @@ fn conv1d_silu_streamed_matches_resident() {
             kconv,
         );
         rec.finish().unwrap();
-        let streamed_at0 = download(&be);
+        let at0 = download(&be);
 
         let state_buf = fresh_state(&be);
         let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
@@ -1518,26 +1491,28 @@ fn conv1d_silu_streamed_matches_resident() {
             kconv,
         );
         rec.finish().unwrap();
-        let streamed_atoff = download(&be);
+        let atoff = download(&be);
 
-        let c = Case {
+        let c = OffsetCase {
             name: "conv1d_silu_par (batch)".to_string(),
-            resident,
-            streamed_at0,
-            streamed_atoff,
+            at0,
+            atoff,
         };
-        assert_case(&c);
+        assert_offset_invariant(&c);
         println!("ok: {}", c.name);
     }
 }
 
-/// E2B per-layer inp_gate: fused f32 GEMV + GELU * strided up-read. Fits `run_case`'s weight/x/y
-/// shape (the extra `up` buffer is captured by the dispatch closures, same trick the float-linear
-/// tests use for their externally-sized multi-row `x`). `up_off` is non-zero and `up_stride` is
-/// wider than `out_f`, so a twin that drops either would read the wrong slice of `up`.
+/// `e2b_gate` is a BDA wrapper — just a `device_addr()` fork onto the SAME streamed kernel this
+/// test drives directly (see `Recorder::e2b_gate`'s doc), so a resident-vs-streamed compare here
+/// was always vacuous once the port landed. Offset-invariance is the real assertion. Fits
+/// `run_case_offset_invariant`'s weight/x/y shape (the extra `up` buffer is captured by the
+/// dispatch closure, same trick the float-linear tests use for their externally-sized multi-row
+/// `x`). `up_off` is non-zero and `up_stride` is wider than `out_f`, so a twin that drops either
+/// would read the wrong slice of `up`.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn e2b_gate_streamed_matches_resident() {
+fn e2b_gate_streamed_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1558,26 +1533,13 @@ fn e2b_gate_streamed_matches_resident() {
     be.upload(up_buf.as_ref(), bytemuck::cast_slice(&up))
         .unwrap();
 
-    let c = run_case(
+    let c = run_case_offset_invariant(
         &be,
         "e2b_gate".to_string(),
         dtype,
         in_f,
         out_f,
         m * out_f,
-        &|rec, w, _x, y| {
-            rec.e2b_gate(
-                w,
-                x_buf.as_ref(),
-                up_buf.as_ref(),
-                up_off,
-                up_stride,
-                y,
-                m,
-                in_f,
-                out_f,
-            )
-        },
         &|rec, addr, _x, y| {
             rec.e2b_gate_streamed(
                 addr,
@@ -1592,7 +1554,7 @@ fn e2b_gate_streamed_matches_resident() {
             )
         },
     );
-    assert_case(&c);
+    assert_offset_invariant(&c);
     println!("ok: {}", c.name);
 }
 

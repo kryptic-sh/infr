@@ -416,29 +416,6 @@ impl VulkanBackend {
         self.run_kernel(k, &[gate, up], n, &push, (n as u32).div_ceil(64))
     }
 
-    /// E2B inp_gate fused GEMV+GELU+strided-multiply (for testing/debugging).
-    pub fn e2b_gate(
-        &self,
-        w: &[f32],
-        x: &[f32],
-        up: &[f32],
-        up_off: usize,
-        up_stride: usize,
-        m: usize,
-        in_f: usize,
-        out_f: usize,
-    ) -> Result<Vec<f32>> {
-        let k = self.kernel("e2b_gate", crate::gemm::e2b_gate_spv(), 4, 20);
-        let mut push = [0u8; 20];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(up_off as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(up_stride as u32).to_ne_bytes());
-        let groups = out_f as u32 * (m as u32).div_ceil(4);
-        self.run_kernel(k, &[w, x, up], m * out_f, &push, groups)
-    }
-
     /// Elementwise add: `y[i] = a[i] + b[i]`.
     pub fn add(&self, a: &[f32], b: &[f32], n: usize) -> Result<Vec<f32>> {
         let k = self.kernel("add", crate::gemm::add_spv(), 3, 4);

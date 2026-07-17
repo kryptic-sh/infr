@@ -3229,7 +3229,10 @@ mod ssm_tests {
         }
 
         let xb = dev(&be, &qkv);
-        let wb = dev(&be, &w);
+        // `rec.conv1d_silu` resolves the weight's own BDA device address (resident-BDA — see that
+        // fn's doc), so `wb` must be a real `BufferUsage::Weights` allocation, not a plain
+        // activation buffer (which has no `device_addr()`).
+        let wb = be.upload_weight(&w).unwrap();
         let sbuf = dev(&be, &state0);
         let ob = be.alloc(cc * 4, BufferUsage::Activations).unwrap();
         let rec = be.recorder().unwrap();

@@ -24,6 +24,11 @@
 #ifndef NW4
 #define NW4(wbase) uvec4(nw[(wbase)], nw[(wbase) + 1u], nw[(wbase) + 2u], nw[(wbase) + 3u])
 #endif
+// Wide 2-word read (see native_arena_ref.glsl's NW2) — non-streamed builds read the SSBO array
+// directly; ACO's vectorizer fuses the adjacent pair into one buffer_load_b64.
+#ifndef NW2
+#define NW2(wbase) uvec2(nw[(wbase)], nw[(wbase) + 1u])
+#endif
 
 uint rb(uint bo) { return (NW(bo >> 2u) >> ((bo & 3u) << 3u)) & 0xFFu; }
 uint ru16(uint bo) { return rb(bo) | (rb(bo + 1u) << 8u); }
@@ -54,6 +59,19 @@ uvec4 rw4(uint bo) {
     uint t = NW(wb + 4u);
     return uvec4((a.x >> sh) | (a.y << (32u - sh)), (a.y >> sh) | (a.z << (32u - sh)),
                  (a.z >> sh) | (a.w << (32u - sh)), (a.w >> sh) | (t << (32u - sh)));
+}
+
+// Pair twin of rw4: two consecutive u32s at BYTE offset `bo` (any alignment) —
+// == uvec2(ru32u(bo), ru32u(bo+4)), bit-identical. Aligned pairs are one fused b64 (NW2);
+// a +2-misaligned pair funnels the 3 covering words out of one b128 (NW4) — one load either
+// way, where two ru32u calls issued up to 4 unfused scalar loads under -DSTREAMED. The grid
+// i-quants (IQ3_S/IQ3_XXS/IQ2_XS) read exactly such an 8-byte qs pair per 32-elem sub-block;
+// their 2-mod-4 block strides make the pair aligned on odd blocks, +2-misaligned on even.
+uvec2 rw2(uint bo) {
+    uint wb = bo >> 2u; uint sh = (bo & 3u) << 3u;
+    if (sh == 0u) { return NW2(wb); }
+    uvec4 a = NW4(wb);
+    return uvec2((a.x >> sh) | (a.y << (32u - sh)), (a.y >> sh) | (a.z << (32u - sh)));
 }
 
 // USE_GRID builds stage their codebook tables into `shared` memory once per workgroup
@@ -814,8 +832,9 @@ void dqblk(uint gstart, out float v[32]) {
     uint sc = rb(bd + 66u + ib32);
     float dl0 = d * (0.5 + float(sc & 0xFu)) * 0.25;
     float dl1 = d * (0.5 + float(sc >> 4u)) * 0.25;
-    uint qsw = ru32u(bd + 2u + ib32 * 8u);          // qs16[l] for l=0,1
-    uint qsw2 = ru32u(bd + 2u + ib32 * 8u + 4u);    // qs16[l] for l=2,3
+    uvec2 qp2 = rw2(bd + 2u + ib32 * 8u);           // fused qs pair (see rw2)
+    uint qsw = qp2.x;                               // qs16[l] for l=0,1
+    uint qsw2 = qp2.y;                              // qs16[l] for l=2,3
     for (uint l = 0u; l < 4u; l++) {
         uint qs16 = ((l < 2u ? qsw : qsw2) >> (16u * (l & 1u))) & 0xFFFFu;
         uint grid_idx = qs16 & 511u;
@@ -895,8 +914,9 @@ void dqblk(uint gstart, out float v[32]) {
     float d = f16tof32(ru16(bd));
     uint aux32 = ru32u(bd + 66u + 4u * ib32);
     float db = d * (0.5 + float(aux32 >> 28u)) * 0.5;
-    uint qs8a = ru32u(bd + 2u + ib32 * 8u);        // grid-index bytes 0..3 (l=0,1)
-    uint qs8b = ru32u(bd + 2u + ib32 * 8u + 4u);   // grid-index bytes 4..7 (l=2,3)
+    uvec2 qp2 = rw2(bd + 2u + ib32 * 8u);          // fused qs pair (see rw2)
+    uint qs8a = qp2.x;                             // grid-index bytes 0..3 (l=0,1)
+    uint qs8b = qp2.y;                             // grid-index bytes 4..7 (l=2,3)
     for (uint l = 0u; l < 4u; l++) {
         uint pairw = (l < 2u) ? qs8a : qs8b;
         uint g1_idx = (pairw >> (16u * (l & 1u))) & 0xFFu;
@@ -938,8 +958,9 @@ void dqblk(uint gstart, out float v[32]) {
     uint sc = rb(bd + 106u + pair);
     float db = (grp == 1u) ? (d * (1.0 + 2.0 * float(sc >> 4u))) : (d * (1.0 + 2.0 * float(sc & 0xFu)));
     uint qh = rb(bd + 66u + pair * 2u + grp);
-    uint qs8a = ru32u(bd + 2u + pair * 16u + grp * 8u);        // qs bytes 0..3 (l=0,1)
-    uint qs8b = ru32u(bd + 2u + pair * 16u + grp * 8u + 4u);   // qs bytes 4..7 (l=2,3)
+    uvec2 qp2 = rw2(bd + 2u + pair * 16u + grp * 8u);          // fused qs pair (see rw2)
+    uint qs8a = qp2.x;                                         // qs bytes 0..3 (l=0,1)
+    uint qs8b = qp2.y;                                         // qs bytes 4..7 (l=2,3)
     uint sg4 = ru32u(bd + 74u + pair * 8u + grp * 4u);         // signs bytes for l=0..3
     for (uint l = 0u; l < 4u; l++) {
         uint pairw = (l < 2u) ? qs8a : qs8b;

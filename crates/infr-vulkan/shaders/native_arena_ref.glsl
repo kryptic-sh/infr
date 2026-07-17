@@ -54,3 +54,14 @@ uvec4 arena_word4(uint wbase) {
     return uvec4(p.v[0], p.v[1], p.v[2], p.v[3]);
 }
 #define NW4(wbase) arena_word4(wbase)
+
+// Wide 2-word read — the b64 twin of NW4, for formats whose natural fused unit is an 8-byte qs
+// PAIR (the grid i-quants: IQ3_S/IQ3_XXS/IQ2_XS read two adjacent qs words per 32-elem sub-block).
+// Same shape: two CONSTANT indices off ONE pointer fuse into a global_load_b64 with a saddr base,
+// where two separate arena_word() calls stay two unfused global_load_b32.
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ArenaW2 { uint v[2]; };
+uvec2 arena_word2(uint wbase) {
+    ArenaW2 p = ArenaW2(nw_ptr + uint64_t(wbase << 2u));
+    return uvec2(p.v[0], p.v[1]);
+}
+#define NW2(wbase) arena_word2(wbase)

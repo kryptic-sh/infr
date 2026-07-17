@@ -1072,8 +1072,8 @@ fn lower_op(
                 }
                 if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
                     streamed_prefill_gemm(
-                        be_, graph, dt, arena_addr, w, w_off, xb, y, dst, m, in_f, out_f, rec,
-                        pool, transient,
+                        be_, graph, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
+                        transient,
                     )?;
                 } else {
                     rec.linear_native_streamed(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
@@ -1561,6 +1561,9 @@ fn lower_op(
                     // stage shrinks LDS to Bs-only → occupancy 2→3 wgs/WGP → ~1.5x on the 8B
                     // prefill shapes (o proj 29→44 TF). Pool pad rows may hold stale garbage;
                     // GEMM rows are independent, and dst pad rows are never read.
+                    let w_addr = w
+                        .device_addr()
+                        .expect("resident-BDA weight: dense Linear requires a u64 BDA address");
                     let use_ag = out_f % 128 == 0
                         && in_f % 32 == 0
                         && crate::gemm::native_gemm_warp_ag_build_spv(dt).is_some()
@@ -1594,7 +1597,7 @@ fn lower_op(
                         rec.matmul_native_splitk(
                             dt,
                             a,
-                            w,
+                            w_addr,
                             w_off,
                             pool[&pk].as_ref(),
                             out,
@@ -1603,32 +1606,20 @@ fn lower_op(
                             out_f,
                             splits,
                             a16.is_some(),
-                            w.device_addr(),
                         );
                     } else if let Some(k16) = &a16 {
                         rec.matmul_native_f16a(
                             dt,
                             pool[k16].as_ref(),
-                            w,
+                            w_addr,
                             w_off,
                             out,
                             m,
                             in_f,
                             out_f,
-                            w.device_addr(),
                         );
                     } else {
-                        rec.matmul_native_off(
-                            dt,
-                            xb,
-                            w,
-                            w_off,
-                            out,
-                            m,
-                            in_f,
-                            out_f,
-                            w.device_addr(),
-                        );
+                        rec.matmul_native_off(dt, xb, w_addr, w_off, out, m, in_f, out_f);
                     }
                 } else {
                     // F16 deep-k narrow-n → SPLIT-K warptile (DG slice-7 comparative
@@ -1658,10 +1649,13 @@ fn lower_op(
                     {
                         let mpad = m.div_ceil(64) * 64;
                         let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
+                        let w_addr = w.device_addr().expect(
+                            "resident-BDA weight: F16 split-K Linear requires a u64 BDA address",
+                        );
                         rec.matmul_native_splitk(
                             dt,
                             xb,
-                            w,
+                            w_addr,
                             w_off,
                             pool[&pk].as_ref(),
                             out,
@@ -1670,7 +1664,6 @@ fn lower_op(
                             out_f,
                             splits,
                             false,
-                            w.device_addr(),
                         );
                     } else {
                         // f16 coopmat GEMM. `matmul_proj` internally forks on `wq.device_addr()`
@@ -4515,10 +4508,9 @@ fn streamed_gemm_applies(
 /// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
 /// warp prefill arm (see the `is_gemm` block in `lower_op`): the SAME tile selection (A_GLOBAL
 /// f16-A cast, narrow-n split-K, or the direct tile) and the SAME padded-dst dance, but the weight
-/// is read from the pool arena by 64-bit address (`arena_addr`) — the recorder methods swap to the
-/// `-DSTREAMED` twin of whatever tile they pick and bind the activation as the binding-1 filler, so
-/// the arena is NEVER a bound descriptor. `w` is the streamed weight placeholder (passed through but
-/// unread by the twins — the tile pick needs only shape/caps). `w_off` (a fused-QKV slice offset)
+/// is read from the pool arena by 64-bit address (`arena_addr`) — the recorder methods pass the
+/// address to whatever tile they pick and bind the activation as the binding-1 filler, so the
+/// arena is NEVER a bound descriptor. `w_off` (a fused-QKV slice offset)
 /// rides on top as a within-slot element offset. The ring→arena copy is already ordered before this
 /// dispatch by `stage_dense_linear`'s RAW `arena_stream_barrier` (same slot, same segment).
 #[allow(clippy::too_many_arguments)]
@@ -4527,7 +4519,6 @@ fn streamed_prefill_gemm(
     graph: &Graph,
     dt: infr_core::DType,
     arena_addr: u64,
-    w: &dyn Buffer,
     w_off: usize,
     xb: &dyn Buffer,
     y: &dyn Buffer,
@@ -4553,7 +4544,6 @@ fn streamed_prefill_gemm(
         Some(t) => t.as_ref(),
         None => y,
     };
-    let arena = Some(arena_addr);
     // A_GLOBAL: cast A to f16 once and let the warptiles coopMatLoad it from global (drops the As
     // stage — the occupancy win). Same gate as the resident arm.
     let use_ag = out_f.is_multiple_of(128)
@@ -4585,7 +4575,7 @@ fn streamed_prefill_gemm(
         rec.matmul_native_splitk(
             dt,
             a,
-            w,
+            arena_addr,
             w_off,
             pool[&pk].as_ref(),
             out,
@@ -4594,12 +4584,20 @@ fn streamed_prefill_gemm(
             out_f,
             splits,
             a16.is_some(),
-            arena,
         );
     } else if let Some(k16) = &a16 {
-        rec.matmul_native_f16a(dt, pool[k16].as_ref(), w, w_off, out, m, in_f, out_f, arena);
+        rec.matmul_native_f16a(
+            dt,
+            pool[k16].as_ref(),
+            arena_addr,
+            w_off,
+            out,
+            m,
+            in_f,
+            out_f,
+        );
     } else {
-        rec.matmul_native_off(dt, xb, w, w_off, out, m, in_f, out_f, arena);
+        rec.matmul_native_off(dt, xb, arena_addr, w_off, out, m, in_f, out_f);
     }
     if let Some(t) = tmp {
         rec.copy(t.as_ref(), 0, y, 0, m * out_f * eb);

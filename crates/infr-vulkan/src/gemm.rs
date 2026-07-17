@@ -25,8 +25,8 @@ include!(concat!(env!("OUT_DIR"), "/native_gemm_map.rs"));
 
 /// Kernel-cache NAME of the multi-row native GEMV (m = 2..8 — the spec-decode verify /
 /// short-suffix-prefill shape) for `dtype`, or `None` for formats without an mrow build (they keep
-/// the tiled GEMM route). Availability + name oracle: the resident bound-SSBO build is gone, so the
-/// `_streamed` twin (native_mrow_spv) is the sole weight build that dispatches.
+/// the tiled GEMM route). Availability + name oracle; the SPIR-V (the sole, arena-addressed weight
+/// build) is loaded via [`native_mrow_spv`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
@@ -200,11 +200,11 @@ pub(crate) fn native_streamed_build_spv(
     }
 }
 
-/// `-DSTREAMED` twin of [`native_mrow_build_spv`] (kernel-cache name + SPIR-V) — the multi-row
-/// GEMV's weight read from a `bufferDeviceAddress` arena instead of a bound SSBO. Slice A1 build-
-/// variant only: nothing dispatches this yet ([`crate::recorder::Recorder::linear_native_mrow_streamed`]
-/// exists purely so parity tests can exercise it — see `tests/gemv_streamed_parity.rs`). `None` for
-/// a dtype without an mrow build.
+/// SPIR-V (kernel-cache name + words) for [`native_mrow_build_spv`]'s pick — the multi-row GEMV's
+/// weight read from a `bufferDeviceAddress` arena; the sole weight build. Production dispatches it
+/// via [`crate::recorder::Recorder::linear_native_mrow`]; parity tests call the streamed entry
+/// directly with an explicit arena address (`tests/gemv_streamed_parity.rs`). `None` for a dtype
+/// without an mrow build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mrow_spv(dtype: infr_core::DType) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
@@ -560,10 +560,10 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
     })
 }
 
-/// `-DSTREAMED` twin of the single-slot id-indexed native GEMV lookup (kernel-cache name + SPIR-V) —
-/// the stacked expert tensor read from a `bufferDeviceAddress` arena; `stride` becomes the
-/// per-expert BYTE stride applied on the 64-bit pointer (no LUT). Slice A4 build-variant only;
-/// parity-test entry, not dispatched in production.
+/// The single-slot id-indexed native GEMV (kernel-cache name + SPIR-V) — the stacked expert
+/// tensor read from a `bufferDeviceAddress` arena; `stride` becomes the per-expert BYTE stride
+/// applied on the 64-bit pointer (no LUT); the sole weight build. Dispatched via
+/// [`crate::recorder::Recorder::linear_native_id`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_id_build_spv(
     dtype: infr_core::DType,
@@ -611,10 +611,10 @@ pub(crate) fn native_id_build_spv(
         _ => None,
     }
 }
-/// `-DSTREAMED` twin of the multi-slot id-indexed native GEMV lookup (kernel-cache name + SPIR-V) —
-/// the stacked expert tensor read from a `bufferDeviceAddress` arena; `stride` becomes the
-/// per-expert BYTE stride applied on the 64-bit pointer (no LUT). Slice A4 build-variant only;
-/// parity-test entry, not dispatched in production.
+/// The multi-slot id-indexed native GEMV (kernel-cache name + SPIR-V) — the stacked expert
+/// tensor read from a `bufferDeviceAddress` arena; `stride` becomes the per-expert BYTE stride
+/// applied on the 64-bit pointer (no LUT); the sole weight build. Production dispatches it via
+/// [`crate::recorder::Recorder::linear_native_id_multi`] (resident MoE decode).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_idm_build_spv(
     dtype: infr_core::DType,
@@ -662,8 +662,9 @@ pub(crate) fn native_idm_build_spv(
         _ => None,
     }
 }
-/// The `-DSTREAMED` subgroup multi-slot id GEMV (kernel-cache name + SPIR-V); the sole weight build
-/// for this family. Slice A4 build-variant; parity-test entry, not dispatched in production.
+/// The subgroup multi-slot id GEMV (kernel-cache name + SPIR-V); the sole weight build for this
+/// family. Production dispatches it via [`crate::recorder::Recorder::linear_native_id_multi`]'s
+/// SG routing (m=1 Q5K/Q6K/IQ3S projection band).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_idm_sg_build_spv(
     dtype: infr_core::DType,
@@ -704,15 +705,16 @@ pub(crate) fn native_idm_sg_build_spv(
         _ => None,
     }
 }
-/// The `-DSTREAMED` id-indexed int8 Q4_K decode GEMV; the sole weight build for this variant.
-/// Slice A4 build-variant; parity-test entry, not dispatched in production.
+/// The id-indexed int8 Q4_K decode GEMV; the sole weight build for this variant. Env-gated
+/// measurement entry ([`crate::recorder::Recorder::linear_mmv_id_multi_q4k`]) + parity tests.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_id_q4k_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_mmv_id_q4k.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// SPIR-V for the int8 dp4a decode GEMV (m=1, NUM_ROWS=2, `native_mmv.comp`). `None` = format
+/// Kernel-cache NAME + availability for the int8 dp4a decode GEMV (m=1, NUM_ROWS=2,
+/// `native_mmv.comp`); the SPIR-V lives in [`native_mmv_spv`]. `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static str> {
@@ -798,7 +800,8 @@ pub(crate) fn native_mmv_mw_build_spv(
         _ => None,
     }
 }
-/// SPIR-V for the multi-row int8 dp4a GEMV (m = 2..8, `native_mmv_mrow.comp`). `None` = format
+/// Kernel-cache NAME + availability for the multi-row int8 dp4a GEMV (m = 2..8,
+/// `native_mmv_mrow.comp`); the SPIR-V lives in [`native_mmv_mrow_variant_spv`]. `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv_mrow`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
@@ -916,10 +919,10 @@ pub(crate) fn native_mmv_mrow_variant_name(
         _ => return None,
     })
 }
-/// SPIR-V for the rows 9..=16 multi-row int8 dp4a GEMV tier (`-DMRV=16`, 2-output layout — no
-/// OUTS4 twin: the tier is gated to >= 8M-element weights, whose in_f is comfortably >= 2048).
-/// `None` = format not covered (same coverage as [`native_mmv_mrow_build_spv`]; those shapes stay
-/// on the split-K GEMM tile).
+/// Kernel-cache NAME for the rows 9..=16 multi-row int8 dp4a GEMV tier (`-DMRV=16`, 2-output layout
+/// — no OUTS4 twin: the tier is gated to >= 8M-element weights, whose in_f is comfortably >= 2048);
+/// the SPIR-V lives in [`native_mmv_mrow_m16_spv`]. `None` = format not covered (same coverage as
+/// [`native_mmv_mrow_build_spv`]; those shapes stay on the split-K GEMM tile).
 pub(crate) fn native_mmv_mrow_m16_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
@@ -1077,8 +1080,9 @@ pub(crate) fn native_mmv_mrow_variant_spv(
         _ => None,
     }
 }
-/// `-DSTREAMED` twin of [`native_mmv_mrow_m16_name`] (kernel-cache name + SPIR-V) — the rows
-/// 9..=16 tier. Slice A2 build-variant only; parity-test entry, not dispatched in production.
+/// SPIR-V (kernel-cache name + words) for [`native_mmv_mrow_m16_name`]'s pick — the rows 9..=16
+/// tier; the sole weight build. Production dispatches it via
+/// [`crate::recorder::Recorder::linear_mmv_mrow`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_m16_spv(
     dtype: infr_core::DType,
@@ -1196,10 +1200,9 @@ pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 /// The `-DSTREAMED` dense tiled dp4a (mmq) GEMM (kernel-cache name + SPIR-V) — the weight read from
-/// a `bufferDeviceAddress` arena; the sole weight build for the dense mmq set. Slice A3
-/// build-variant only: nothing dispatches this yet
-/// ([`crate::recorder::Recorder::matmul_mmq_streamed`] exists purely so parity tests can exercise
-/// it). The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
+/// a `bufferDeviceAddress` arena; the sole weight build for the dense mmq set. Production
+/// dispatches it via [`crate::recorder::Recorder::matmul_mmq`]; parity tests call
+/// [`crate::recorder::Recorder::matmul_mmq_streamed`] directly with an explicit arena address. The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
 /// when the expert router grows an `arena: Option<u64>` arm at integration time.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_dense_spv(
@@ -1298,8 +1301,8 @@ pub(crate) fn linear_res_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// `-DSTREAMED` twin of [`native_gemm_fma_build_spv`] (kernel-cache name + SPIR-V). Slice A4;
-/// parity-test entry, not dispatched in production.
+/// SPIR-V (kernel-cache name + words) for [`native_gemm_fma_build_spv`]'s pick; the sole weight
+/// build — production dispatches it via [`crate::recorder::Recorder::matmul_fma`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_fma_spv(
     dtype: infr_core::DType,
@@ -1321,7 +1324,8 @@ pub(crate) fn native_gemm_fma_spv(
 }
 /// SPIR-V for the non-coopmat float-weight prefill GEMM (the "fma-warp" tier, see
 /// `native_gemm_fma.comp`): shared-memory fma warptile for f16/bf16/f32 weights on devices
-/// without a usable f16 coopmat (adapter.rs `nc_fma`). Returns `(kernel_cache_name, spv)`;
+/// without a usable f16 coopmat (adapter.rs `nc_fma`). Returns the kernel-cache NAME (SPIR-V via
+/// [`native_gemm_fma_spv`]);
 /// `None` for any other dtype.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_fma_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
@@ -1519,7 +1523,8 @@ pub(crate) fn moe_topk_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// SPIR-V for the embedding-row gather+dequant (`Op::EmbedGather`). `None` = format has no
+/// Kernel-cache NAME + availability for the embedding-row gather+dequant (`Op::EmbedGather`); the
+/// SPIR-V lives in [`embed_gather_spv`]. `None` = format has no
 /// build (grid-table IQ formats) — the runner then keeps the host embed path.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
@@ -1548,10 +1553,10 @@ pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static
         _ => return None,
     })
 }
-/// `-DSTREAMED` twin of [`embed_gather_build_spv`] (kernel-cache name + SPIR-V) — the token-
-/// embedding table read from a `bufferDeviceAddress` arena instead of a bound SSBO, same
-/// convention as [`native_streamed_build_spv`]. Slice A5 build-variant only; parity-test entry,
-/// not dispatched in production.
+/// SPIR-V (kernel-cache name + words) for [`embed_gather_build_spv`]'s pick — the token-embedding
+/// table read from a `bufferDeviceAddress` arena, same convention as [`native_streamed_build_spv`];
+/// the sole weight build. Production dispatches it via
+/// [`crate::recorder::Recorder::embed_gather`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn embed_gather_spv(dtype: infr_core::DType) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
@@ -1711,8 +1716,8 @@ pub(crate) fn moe_weight_scale_spv() -> &'static [u32] {
 /// Kernel-cache NAME of the LARGE-WARPTILE native-block prefill GEMM (8-warp BM=64×BN=256,
 /// gemm_proj_warp structure with in-shader native dequant) for `dtype`, or `None` if only the hot
 /// formats are compiled (the caller falls back to the 64×64 `native_gemm` kernel). Availability +
-/// name only — the arena-addressed `_streamed` twin is what actually dispatches (weights are read
-/// by 64-bit device address; no resident SSBO tile is loaded).
+/// kernel-cache NAME only — the SPIR-V is loaded via [`native_gemm_spv`]; the weight is read by
+/// 64-bit device address from the arena, so no resident SSBO tile is bound.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
@@ -1738,7 +1743,7 @@ pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'st
     })
 }
 
-/// SPIR-V for the NARROW-N warptile (BN=128/BK=64) — same math per thread, 2× the workgroups; the
+/// Kernel-cache NAME for the NARROW-N warptile (BN=128/BK=64) — same math per thread, 2× the workgroups; the
 /// occupancy fix for n=1024/2048 GEMMs. `None` for formats without a warp build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
@@ -1889,7 +1894,7 @@ pub(crate) fn native_gemm_warp_n128_ag_bm16_build_spv(
     })
 }
 
-/// SPIR-V for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
+/// Kernel-cache NAME for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;

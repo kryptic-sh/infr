@@ -2812,12 +2812,12 @@ fn main() {
     // mmq / int8-coopmat, dispatched through their own getters).
     let mut gemm_names: Vec<String> = builds
         .iter()
-        .filter_map(|(_, dst, defines)| {
-            (dst.starts_with("native_gemm")
+        .filter(|(_, dst, defines)| {
+            dst.starts_with("native_gemm")
                 && !dst.ends_with("_streamed")
-                && defines.iter().any(|d| d == "-DSTREAMED"))
-            .then(|| dst.clone())
+                && defines.iter().any(|d| d == "-DSTREAMED")
         })
+        .map(|(_, dst, _)| dst.clone())
         .collect();
     gemm_names.sort();
     gemm_names.dedup();

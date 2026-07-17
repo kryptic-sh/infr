@@ -901,8 +901,9 @@ impl<'a> Recorder<'a> {
         self.linear_f32_streamed(arena_addr, x, y, rows, in_f, out_f);
     }
 
-    /// `-DSTREAMED` twin of [`Self::linear`] (f16 weight via a typed 64-bit buffer_reference;
-    /// slice A4). Binding 0 takes a FILLER (`x`). Parity-test entry, not dispatched in production.
+    /// Arena-addressed body of [`Self::linear`] (f16 weight via a typed 64-bit buffer_reference).
+    /// Binding 0 takes a FILLER (`x`). Production routes here through [`Self::linear`] (the
+    /// weight's own BDA address); parity tests call it directly with an explicit arena address.
     pub fn linear_streamed(
         &self,
         arena_addr: u64,
@@ -1019,9 +1020,10 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// `-DSTREAMED` twin of [`Self::linear_f32`] (slice A4) — mirrors the resident dispatcher's
-    /// mrow/vec4 variant routing (same env escapes) so parity comparisons land on the same
-    /// kernel. Parity-test entry, not dispatched in production.
+    /// Arena-addressed body of [`Self::linear_f32`] — mirrors the eager dispatcher's mrow/vec4
+    /// variant routing (same env escapes) so parity comparisons land on the same kernel.
+    /// Production routes here through [`Self::linear_f32`] (the weight's own BDA address); parity
+    /// tests call it directly with an explicit arena address.
     pub fn linear_f32_streamed(
         &self,
         arena_addr: u64,
@@ -1075,8 +1077,9 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// `-DSTREAMED` twin of [`Self::linear_add`] (fused-residual f16 GEMV, `linear_res.comp`;
-    /// slice A4). Parity-test entry, not dispatched in production.
+    /// Arena-addressed body of [`Self::linear_add`] (fused-residual f16 GEMV, `linear_res.comp`).
+    /// Production routes here through [`Self::linear_add`] (the weight's own BDA address); parity
+    /// tests call it directly with an explicit arena address.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_streamed(
         &self,
@@ -1255,7 +1258,10 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        self.matmul_native_off(dtype, a, w, 0, c, m, k, n, None);
+        let w_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: matmul_native requires a u64 BDA device address");
+        self.matmul_native_off(dtype, a, w_addr, 0, c, m, k, n);
     }
 
     /// Native-block tiled coopmat GEMM reading the weight from element offset `w_base` — lets one
@@ -1266,18 +1272,16 @@ impl<'a> Recorder<'a> {
         &self,
         dtype: infr_core::DType,
         a: &dyn Buffer,
-        w: &dyn Buffer,
+        // The weight's 64-bit base address: a resident weight's own BDA address
+        // (`w.device_addr()`), or a dense-pager streamed block's slot base in the pager arena (see
+        // adapter.rs `streamed_prefill_gemm`). The picked tile reads the weight by this address
+        // (native_arena_ref.glsl); it is never bound as a descriptor.
+        w_addr: u64,
         w_base: usize,
         c: &dyn Buffer,
         m: usize,
         k: usize,
         n: usize,
-        // Explicit override for the weight's 64-bit arena address: `Some(arena_addr)` = a
-        // dense-pager streamed block (see adapter.rs `streamed_prefill_gemm`), whose bytes live in
-        // the pager arena, not in `w`. `None` = read `w`'s own BDA address (`w.device_addr()`), the
-        // resident-weight case. Either way the -DSTREAMED twin of the picked tile reads the weight
-        // by 64-bit address (native_arena_ref.glsl); it is never bound as a descriptor.
-        arena: Option<u64>,
     ) {
         // Large-warptile variant (8-warp BM=64×BN=256): 4× the math per staged A-row / decoded
         // W-column vs the 64×64 tile, and the extra warps hide the dequant latency. Needs k%32;
@@ -1333,14 +1337,9 @@ impl<'a> Recorder<'a> {
             _ => crate::linear::native_gemm_kernel_name(dtype),
         };
         self.label_gemm(name, m, k, n);
-        // The weight is read by its 64-bit address: an explicit streamed-block `arena` override, or
-        // else the resident weight's own BDA address. Swap to the -DSTREAMED twin of the SAME tile,
-        // append the arena base to the push, and bind `a` as the binding-1 filler (the twin reads
-        // the weight by address, never an SSBO — the arena is NEVER bound as a descriptor).
-        let arena_addr = arena.or_else(|| w.device_addr()).expect(
-            "resident-BDA weight: matmul_native_off requires a BDA weight or an explicit arena \
-             address",
-        );
+        // The weight is read by its 64-bit address (`w_addr`): the SAME tile the name pick chose,
+        // arena base appended to the push, `a` bound as the binding-1 filler (the kernel reads the
+        // weight by address, never an SSBO — the arena is NEVER bound as a descriptor).
         let (kname, kspv) = crate::gemm::native_gemm_spv(name);
         let push_size: u32 = 24;
         let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
@@ -1353,8 +1352,8 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
         let groups = (m.div_ceil(64) * groups_n) as u32;
         self.dispatch(
             kern,
@@ -1416,15 +1415,13 @@ impl<'a> Recorder<'a> {
         &self,
         dtype: infr_core::DType,
         a16: &dyn Buffer,
-        w: &dyn Buffer,
+        // The weight's 64-bit base address — see `matmul_native_off`'s `w_addr` doc.
+        w_addr: u64,
         w_base: usize,
         c: &dyn Buffer,
         m: usize,
         k: usize,
         n: usize,
-        // Explicit override for the weight's 64-bit arena address — see `matmul_native_off`'s
-        // `arena` doc; `None` reads `w`'s own BDA address.
-        arena: Option<u64>,
     ) {
         // The BN=128 (n128) ag tile beats the BN=256 (wide) ag tile on EVERY shape this decision
         // can reach, measured on RDNA3 (7900 XTX): the wide tile's WN=64 → 2×4 = 8 accumulator
@@ -1488,13 +1485,8 @@ impl<'a> Recorder<'a> {
             )
         };
         self.label_gemm(name, m, k, n);
-        // Weight read by 64-bit address (explicit streamed block, else the resident weight's own
-        // BDA address): -DSTREAMED twin of the picked A_GLOBAL tile, arena base appended to the
-        // push, `a16` doubles as the binding-1 filler.
-        let arena_addr = arena.or_else(|| w.device_addr()).expect(
-            "resident-BDA weight: matmul_native_f16a requires a BDA weight or an explicit arena \
-             address",
-        );
+        // Weight read by its 64-bit address (`w_addr`): the picked A_GLOBAL tile, arena base
+        // appended to the push, `a16` doubles as the binding-1 filler.
         let (kname, kspv) = crate::gemm::native_gemm_spv(name);
         let push_size: u32 = 24;
         let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
@@ -1503,8 +1495,8 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
         let groups = (m.div_ceil(bm) * (n / bn)) as u32;
         self.dispatch(
             kern,
@@ -1526,7 +1518,9 @@ impl<'a> Recorder<'a> {
         &self,
         dtype: infr_core::DType,
         a: &dyn Buffer,
-        w: &dyn Buffer,
+        // The weight's 64-bit base address — see `matmul_native_off`'s `w_addr` doc. Only the
+        // k-partial GEMM reads the weight; the reduce pass (partials→c) is unchanged.
+        w_addr: u64,
         w_base: usize,
         partials: &dyn Buffer,
         c: &dyn Buffer,
@@ -1535,10 +1529,6 @@ impl<'a> Recorder<'a> {
         n: usize,
         splits: usize,
         a_is_f16: bool,
-        // Explicit override for the weight's 64-bit arena address — see `matmul_native_off`'s
-        // `arena` doc; `None` reads `w`'s own BDA address. Only the k-partial GEMM reads the
-        // weight; the reduce pass (partials→c) is unchanged.
-        arena: Option<u64>,
     ) {
         // NB: `dense_small_m_row_tile_bench` also probed a BM=32 tile here (mirroring
         // `matmul_native_f16a`'s small-m gate) and found a NET LOSS across the whole m≈4-64
@@ -1555,13 +1545,8 @@ impl<'a> Recorder<'a> {
             crate::gemm::native_gemm_warp_sk_build_spv(dtype).expect("split-k name")
         };
         self.label_gemm(name, m, k, n);
-        // Weight read by 64-bit address (explicit streamed block, else the resident weight's own
-        // BDA address): -DSTREAMED twin of the picked split-K tile, arena base appended AFTER the
-        // splits/mpad fields, `a` doubles as the binding-1 filler.
-        let arena_addr = arena.or_else(|| w.device_addr()).expect(
-            "resident-BDA weight: matmul_native_splitk requires a BDA weight or an explicit arena \
-             address",
-        );
+        // Weight read by its 64-bit address (`w_addr`): the picked split-K tile, arena base
+        // appended AFTER the splits/mpad fields, `a` doubles as the binding-1 filler.
         let (kname, kspv) = crate::gemm::native_gemm_spv(name);
         let push_size: u32 = 32;
         let mpad = m.div_ceil(64) * 64;
@@ -1573,8 +1558,8 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(splits as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(mpad as u32).to_ne_bytes());
-        push[24..28].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[28..32].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(w_addr as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
         let groups = ((mpad / 64) * (n / 128) * splits) as u32;
         self.dispatch(
             kern,
@@ -2169,9 +2154,10 @@ impl<'a> Recorder<'a> {
         self.dispatch(kern, &bufs, 1, &push, groups);
     }
 
-    /// `-DSTREAMED` twin of [`Self::matmul_fma`] (slice A4: see
-    /// `crate::gemm::native_gemm_fma_spv`). The weight-SSBO slot (binding 1) takes
-    /// a FILLER (`a`). Parity-test entry, not dispatched in production.
+    /// Arena-addressed body of [`Self::matmul_fma`] (see `crate::gemm::native_gemm_fma_spv`).
+    /// The vacated binding-1 slot takes a FILLER (`a`). Production routes here through
+    /// [`Self::matmul_fma`] (the weight's own BDA address); parity tests call it directly with an
+    /// explicit arena address.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_fma_streamed(
         &self,
@@ -6307,49 +6293,18 @@ impl<'a> Recorder<'a> {
         n_expert: usize,
         n_used: usize,
     ) {
+        // The stacked expert bank is read from its resident-BDA arena address, never a bound SSBO.
+        // `pc.m` is REPURPOSED as the per-expert BYTE stride applied on the pointer
+        // (`nw_ptr += uint64_t(ex) * uint64_t(pc.m)`, see the shaders' STREAMED EXPERT_GRID arm) —
+        // [`expert_stride_bytes`] converts the caller's element-space `stride` using the dtype's
+        // GGUF block layout. `w_base` passes through unchanged (the small within-bank element
+        // offset the shader still adds). The vacated weight-SSBO slot takes a small FILLER (`qa`,
+        // same convention as [`Self::matmul_mmq`]) so the binding count/order matches the shader's
+        // layout. Push layout matches the shaders' STREAMED PC struct: `m(=stride bytes), n, k,
+        // w_base, arena_lo, arena_hi`.
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: matmul_mmq_experts requires a u64 BDA device address");
-        self.matmul_mmq_experts_streamed(
-            dtype, stage, qa, dact, sact, arena_addr, w_base, stride, counts, offsets, c, rows, k,
-            n, n_expert, n_used,
-        );
-    }
-
-    /// `-DSTREAMED` twin of [`Self::matmul_mmq_experts`]: the stacked expert bank lives at
-    /// `arena_addr` in a resident BDA arena instead of a bound SSBO. Mirrors the resident arm's
-    /// EXACT tile-choice logic (`small_tile`/`wide_bn`/`bm`/`bn` and the dtype match) one-for-one,
-    /// swapped to the `_streamed` SPV getters — kept as a literal parallel match (not a shared
-    /// table) so the resident arm's tile selection stays untouched and diff-reviewable against this
-    /// one. `pc.m` is REPURPOSED under `-DSTREAMED` as the per-expert BYTE stride applied on the
-    /// pointer (`nw_ptr += uint64_t(ex) * uint64_t(pc.m)`, see the shaders' `#elif
-    /// defined(STREAMED)` EXPERT_GRID arm) — [`expert_stride_bytes`] converts the caller's
-    /// element-space `stride` using the dtype's GGUF block layout. `w_base` passes through
-    /// unchanged (the small within-bank element offset the shader still adds). Binding layout is
-    /// IDENTICAL to the resident arm's — the vacated weight-SSBO slot takes a small FILLER (`qa`,
-    /// same convention as [`Self::matmul_mmq_streamed`]) so binding count/order never drifts
-    /// between the two builds. Push layout matches the shaders' STREAMED PC struct: `m(=stride
-    /// bytes), n, k, w_base, arena_lo, arena_hi`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_mmq_experts_streamed(
-        &self,
-        dtype: infr_core::DType,
-        stage: &'static str,
-        qa: &dyn Buffer,
-        dact: &dyn Buffer,
-        sact: Option<&dyn Buffer>,
-        arena_addr: u64,
-        w_base: usize,
-        stride: usize,
-        counts: &dyn Buffer,
-        offsets: &dyn Buffer,
-        c: &dyn Buffer,
-        rows: usize,
-        k: usize,
-        n: usize,
-        n_expert: usize,
-        n_used: usize,
-    ) {
         self.label_next(stage);
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
@@ -9040,7 +8995,7 @@ mod tests {
         rec.matmul_native_splitk(
             infr_core::DType::F16,
             ba.as_ref(),
-            bw.as_ref(),
+            bw.device_addr().unwrap(),
             0,
             pk.as_ref(),
             bc.as_ref(),
@@ -9049,7 +9004,6 @@ mod tests {
             n,
             splits,
             false,
-            None,
         );
         rec.finish().unwrap();
         let mut bytes = vec![0u8; mpad * n * 4];
@@ -9164,13 +9118,12 @@ mod tests {
             rec.matmul_native_f16a(
                 infr_core::DType::Iq4Nl,
                 a16.as_ref(),
-                bw.as_ref(),
+                bw.device_addr().unwrap(),
                 0,
                 bc.as_ref(),
                 m,
                 k,
                 n,
-                None,
             );
             rec.finish().unwrap();
         }
@@ -9187,7 +9140,7 @@ mod tests {
             rec.matmul_native_splitk(
                 infr_core::DType::Iq4Nl,
                 ab,
-                bw.as_ref(),
+                bw.device_addr().unwrap(),
                 0,
                 pk.as_ref(),
                 bc.as_ref(),
@@ -9196,7 +9149,6 @@ mod tests {
                 n,
                 splits,
                 a_is_f16,
-                None,
             );
             rec.finish().unwrap();
             check(bc.as_ref(), n, label);

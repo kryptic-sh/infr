@@ -229,13 +229,12 @@ fn qwen3_8b_gemm_shapes_bench() {
                         rec.matmul_native_f16a(
                             infr_core::DType::Q4K,
                             a16.as_ref(),
-                            w.as_ref(),
+                            w.device_addr().unwrap(),
                             0,
                             c.as_ref(),
                             m,
                             k,
                             n,
-                            None,
                         );
                     } else {
                         rec.matmul_native(
@@ -307,7 +306,16 @@ fn wide_square_occupancy_sweep() {
         std::env::set_var("INFR_GEMM_WIDE_TILE", "1");
         let us = time(&|rec| {
             rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
-            rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n, None);
+            rec.matmul_native_f16a(
+                dt,
+                a16.as_ref(),
+                w.device_addr().unwrap(),
+                0,
+                c.as_ref(),
+                m,
+                k,
+                n,
+            );
         });
         std::env::remove_var("INFR_GEMM_WIDE_TILE");
         println!(
@@ -318,7 +326,16 @@ fn wide_square_occupancy_sweep() {
         // n128 ag (BN=128 → 2× workgroups) — the new default
         let us = time(&|rec| {
             rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
-            rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n, None);
+            rec.matmul_native_f16a(
+                dt,
+                a16.as_ref(),
+                w.device_addr().unwrap(),
+                0,
+                c.as_ref(),
+                m,
+                k,
+                n,
+            );
         });
         println!(
             "[{label:>5}] [{k}x{n}] n128_ag      {us:7.1} us  {:5.1} TF",
@@ -335,7 +352,7 @@ fn wide_square_occupancy_sweep() {
                 rec.matmul_native_splitk(
                     dt,
                     a16.as_ref(),
-                    w.as_ref(),
+                    w.device_addr().unwrap(),
                     0,
                     pk.as_ref(),
                     c.as_ref(),
@@ -344,7 +361,6 @@ fn wide_square_occupancy_sweep() {
                     n,
                     splits,
                     true,
-                    None,
                 );
             });
             println!(
@@ -400,7 +416,16 @@ fn wide_n128_crossover_sweep() {
                 std::env::set_var("INFR_GEMM_WIDE_TILE", "1");
             }
             let f = |rec: &infr_vulkan::Recorder| {
-                rec.matmul_native_f16a(dt, a16.as_ref(), w.as_ref(), 0, c.as_ref(), m, k, n, None);
+                rec.matmul_native_f16a(
+                    dt,
+                    a16.as_ref(),
+                    w.device_addr().unwrap(),
+                    0,
+                    c.as_ref(),
+                    m,
+                    k,
+                    n,
+                );
             };
             let rec = be.recorder().unwrap();
             f(&rec);
@@ -1309,13 +1334,12 @@ fn dense_small_m_row_tile_bench() {
                 rec.matmul_native_f16a(
                     dtype,
                     a16.as_ref(),
-                    w.as_ref(),
+                    w.device_addr().unwrap(),
                     0,
                     c.as_ref(),
                     m,
                     k_,
                     n_,
-                    None,
                 );
                 rec.finish().unwrap(); // warmup (pipeline compile)
                 let t0 = std::time::Instant::now();
@@ -1324,13 +1348,12 @@ fn dense_small_m_row_tile_bench() {
                     rec.matmul_native_f16a(
                         dtype,
                         a16.as_ref(),
-                        w.as_ref(),
+                        w.device_addr().unwrap(),
                         0,
                         c.as_ref(),
                         m,
                         k_,
                         n_,
-                        None,
                     );
                 }
                 rec.finish().unwrap();
@@ -1383,7 +1406,7 @@ fn dense_small_m_row_tile_bench() {
                 rec.matmul_native_splitk(
                     dtype,
                     a16.as_ref(),
-                    w.as_ref(),
+                    w.device_addr().unwrap(),
                     0,
                     partials.as_ref(),
                     c.as_ref(),
@@ -1392,7 +1415,6 @@ fn dense_small_m_row_tile_bench() {
                     n_,
                     splits,
                     true,
-                    None,
                 );
                 rec.finish().unwrap(); // warmup (pipeline compile)
                 let t0 = std::time::Instant::now();
@@ -1401,7 +1423,7 @@ fn dense_small_m_row_tile_bench() {
                     rec.matmul_native_splitk(
                         dtype,
                         a16.as_ref(),
-                        w.as_ref(),
+                        w.device_addr().unwrap(),
                         0,
                         partials.as_ref(),
                         c.as_ref(),
@@ -1410,7 +1432,6 @@ fn dense_small_m_row_tile_bench() {
                         n_,
                         splits,
                         true,
-                        None,
                     );
                 }
                 rec.finish().unwrap();
@@ -1496,13 +1517,12 @@ fn bm16_crossover_bench() {
                 rec.matmul_native_f16a(
                     dtype,
                     a16.as_ref(),
-                    w.as_ref(),
+                    w.device_addr().unwrap(),
                     0,
                     c.as_ref(),
                     m,
                     k_,
                     n_,
-                    None,
                 );
                 rec.finish().unwrap(); // warmup (pipeline compile)
                 let t0 = std::time::Instant::now();
@@ -1511,13 +1531,12 @@ fn bm16_crossover_bench() {
                     rec.matmul_native_f16a(
                         dtype,
                         a16.as_ref(),
-                        w.as_ref(),
+                        w.device_addr().unwrap(),
                         0,
                         c.as_ref(),
                         m,
                         k_,
                         n_,
-                        None,
                     );
                 }
                 rec.finish().unwrap();

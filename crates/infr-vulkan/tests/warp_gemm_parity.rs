@@ -62,7 +62,7 @@ fn warp_ag_isa_probe() {
             rec.matmul_native_splitk(
                 dtype,
                 a_buf.as_ref(),
-                arena0.as_ref(), // filler: the explicit `Some(addr)` arena is what's read
+                addr,
                 0,
                 part_buf.as_ref(),
                 c_buf.as_ref(),
@@ -71,20 +71,9 @@ fn warp_ag_isa_probe() {
                 n,
                 splits,
                 true,
-                Some(addr),
             );
         } else {
-            rec.matmul_native_f16a(
-                dtype,
-                a_buf.as_ref(),
-                arena0.as_ref(),
-                0,
-                c_buf.as_ref(),
-                m,
-                k,
-                n,
-                Some(addr),
-            );
+            rec.matmul_native_f16a(dtype, a_buf.as_ref(), addr, 0, c_buf.as_ref(), m, k, n);
         }
         rec.finish().unwrap();
         let mut out = vec![0u8; m * n * 4];

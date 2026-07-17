@@ -28,7 +28,7 @@ include!(concat!(env!("OUT_DIR"), "/native_gemm_map.rs"));
 /// the tiled GEMM route). Availability + name oracle; the SPIR-V (the sole, arena-addressed weight
 /// build) is loaded via [`native_mrow_spv`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
         Q8_0 => "native_mrow_q8_0",
@@ -50,11 +50,11 @@ pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static 
 }
 
 /// The dense layer-streaming decode GEMV (kernel-cache name + SPIR-V): reads the weight from a
-/// `bufferDeviceAddress` arena pool by 64-bit address (native_arena_ref.glsl) instead of a bound
+/// `bufferDeviceAddress` arena pool by 64-bit address (native_weight_addr.glsl) instead of a bound
 /// SSBO — the ONLY weight build for this family (the bound-SSBO resident build died with the eager
 /// `VulkanBackend::linear_native` / `Recorder::linear_native_{sg,rm,rm_v2}` callers that were its
 /// sole consumers). All streamed dense Linears (any m) route through this one kernel's rows loop —
-/// see [`crate::recorder::Recorder::linear_native_streamed`] and [`crate::pager::DensePagerSession`].
+/// see [`crate::recorder::Recorder::linear_native_at`] and [`crate::pager::DensePagerSession`].
 /// `res`: production dispatches fused-residual GEMVs too (the decode Linear+Add fusion,
 /// [`crate::recorder::Recorder::linear_add_native`]), so both arms are load-bearing. `None` for a
 /// dtype without a native GEMV build.
@@ -130,10 +130,10 @@ pub(crate) fn native_streamed_build_spv(
     }
 }
 
-/// SPIR-V (kernel-cache name + words) for [`native_mrow_build_spv`]'s pick — the multi-row GEMV's
+/// SPIR-V (kernel-cache name + words) for [`native_mrow_kernel_name`]'s pick — the multi-row GEMV's
 /// weight read from a `bufferDeviceAddress` arena; the sole weight build. Production dispatches it
 /// via [`crate::recorder::Recorder::linear_native_mrow`]; parity tests call the streamed entry
-/// directly with an explicit arena address (`tests/gemv_streamed_parity.rs`). `None` for a dtype
+/// directly with an explicit arena address (`tests/weight_addr_parity.rs`). `None` for a dtype
 /// without an mrow build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mrow_spv(dtype: infr_core::DType) -> Option<(&'static str, &'static [u32])> {
@@ -174,7 +174,7 @@ pub(crate) fn native_mrow_spv(dtype: infr_core::DType) -> Option<(&'static str, 
 /// is 2 or 4; `res`: `linear_add_native`'s fallback route (RM=1..8 out_f band, reached when the SG
 /// route and the default "reg" variant route both miss — e.g. `INFR_NO_GEMV_REG`) dispatches this
 /// table with `res = true`, so the residual arm is load-bearing for
-/// [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity convenience. Only
+/// [`crate::recorder::Recorder::linear_add_native_at`], not just a parity convenience. Only
 /// the K-quant formats that dominate decode (Q4_K/Q6_K) have RM builds; everything else stays on
 /// the RM=1 path.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -214,7 +214,7 @@ pub(crate) fn native_rm_streamed_build_spv(
 /// given variant + dtype + res combination. `res`: `linear_add_native`'s default route (the "reg"
 /// variant, `INFR_GEMV_VARIANT`/`INFR_NO_GEMV_REG` escapes aside) dispatches THIS table with
 /// `res = true`, so the residual arm is load-bearing for
-/// [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity convenience.
+/// [`crate::recorder::Recorder::linear_add_native_at`], not just a parity convenience.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_rm_v2_streamed_build_spv(
     variant: &str,
@@ -256,7 +256,7 @@ pub(crate) fn native_rm_v2_streamed_build_spv(
 /// build (on Q4_K the tree/RM kernel already saturates — SG regressed). `nr` ∈ {2,4,8}; `res`:
 /// `linear_add_native`'s SG route ([`crate::recorder::Recorder::linear_add_native`]) dispatches this
 /// with `res = true` before ever falling to RM, so the residual arm is load-bearing for
-/// [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity convenience. `sg16`
+/// [`crate::recorder::Recorder::linear_add_native_at`], not just a parity convenience. `sg16`
 /// selects the `-DSG=16` twin (Intel, `caps.sg_pref == 16` — pass false everywhere else for the
 /// byte-identical SG=32 build).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -545,7 +545,7 @@ pub(crate) fn native_mmv_id_q4k_spv() -> &'static [u32] {
 /// `native_mmv.comp`); the SPIR-V lives in [`native_mmv_spv`]. `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static str> {
+pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -567,7 +567,7 @@ pub(crate) fn native_mmv_build_spv(dtype: infr_core::DType, res: bool) -> Option
 /// opt-in elsewhere). `warps` ∈ {4, 8}. `sg16` selects the `-DSG=16` twin (`caps.sg_pref == 16`).
 /// `None` for formats/warp counts without a build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mw_build_spv(
+pub(crate) fn native_mmv_mw_kernel_name(
     dtype: infr_core::DType,
     res: bool,
     warps: u32,
@@ -632,7 +632,7 @@ pub(crate) fn native_mmv_mw_build_spv(
 /// `native_mmv_mrow.comp`); the SPIR-V lives in [`native_mmv_mrow_variant_spv`]. `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv_mrow`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -661,7 +661,7 @@ pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'sta
 /// `m4=true`; see `Recorder::linear_mmv_mrow`'s gates and its doc on the rows=1 decode/verify
 /// unification).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_variant_name(
+pub(crate) fn native_mmv_mrow_variant_kernel_name(
     dtype: infr_core::DType,
     o4: bool,
     m4: bool,
@@ -750,8 +750,8 @@ pub(crate) fn native_mmv_mrow_variant_name(
 /// Kernel-cache NAME for the rows 9..=16 multi-row int8 dp4a GEMV tier (`-DMRV=16`, 2-output layout
 /// — no OUTS4 twin: the tier is gated to >= 8M-element weights, whose in_f is comfortably >= 2048);
 /// the SPIR-V lives in [`native_mmv_mrow_m16_spv`]. `None` = format not covered (same coverage as
-/// [`native_mmv_mrow_build_spv`]; those shapes stay on the split-K GEMM tile).
-pub(crate) fn native_mmv_mrow_m16_name(dtype: infr_core::DType) -> Option<&'static str> {
+/// [`native_mmv_mrow_kernel_name`]; those shapes stay on the split-K GEMM tile).
+pub(crate) fn native_mmv_mrow_m16_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -774,13 +774,13 @@ pub(crate) fn native_mmv_mrow_m16_name(dtype: infr_core::DType) -> Option<&'stat
         _ => return None,
     })
 }
-/// `-DSTREAMED` twin of [`native_mmv_build_spv`] (kernel-cache name + SPIR-V) — the int8 dp4a
+/// `-DSTREAMED` twin of [`native_mmv_kernel_name`] (kernel-cache name + SPIR-V) — the int8 dp4a
 /// decode GEMV's weight read from a `bufferDeviceAddress` arena instead of a bound SSBO. `res`
-/// mirrors [`native_mmv_build_spv`]'s residual arm: `linear_add_mmv`
+/// mirrors [`native_mmv_kernel_name`]'s residual arm: `linear_add_mmv`
 /// ([`crate::recorder::Recorder::linear_add_mmv`]) dispatches this table with `res = true` for its
 /// fused-residual int8 decode GEMV, so the residual twin
-/// ([`crate::recorder::Recorder::linear_add_mmv_streamed`]) is load-bearing, not just a parity-test
-/// convenience like the plain arm ([`crate::recorder::Recorder::linear_mmv_streamed`]).
+/// ([`crate::recorder::Recorder::linear_add_mmv_at`]) is load-bearing, not just a parity-test
+/// convenience like the plain arm ([`crate::recorder::Recorder::linear_mmv_at`]).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_spv(
     dtype: infr_core::DType,
@@ -808,12 +808,12 @@ pub(crate) fn native_mmv_spv(
         _ => None,
     }
 }
-/// `-DSTREAMED` twin of [`native_mmv_mrow_variant_name`] (kernel-cache name + SPIR-V), covering the
-/// rows<=8 layout matrix (`o4`/`m4`/`res`). `res` mirrors [`native_mmv_mrow_variant_name`]'s residual
+/// `-DSTREAMED` twin of [`native_mmv_mrow_variant_kernel_name`] (kernel-cache name + SPIR-V), covering the
+/// rows<=8 layout matrix (`o4`/`m4`/`res`). `res` mirrors [`native_mmv_mrow_variant_kernel_name`]'s residual
 /// arm — build-declared ONLY at `m4 = true` (the decode Linear+Add fusion always dispatches this
 /// shader at `rows = 1`, which forces `m4 = true`; see [`crate::recorder::Recorder::linear_mmv_mrow`]'s
 /// doc) and NEVER for `Iq4Xs` (no `-DUSE_RES` build exists for that dtype in this family). `res =
-/// true` is load-bearing for [`crate::recorder::Recorder::linear_mmv_mrow_streamed`]'s residual
+/// true` is load-bearing for [`crate::recorder::Recorder::linear_mmv_mrow_at`]'s residual
 /// path, not just a parity-test convenience.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_variant_spv(
@@ -908,7 +908,7 @@ pub(crate) fn native_mmv_mrow_variant_spv(
         _ => None,
     }
 }
-/// SPIR-V (kernel-cache name + words) for [`native_mmv_mrow_m16_name`]'s pick — the rows 9..=16
+/// SPIR-V (kernel-cache name + words) for [`native_mmv_mrow_m16_kernel_name`]'s pick — the rows 9..=16
 /// tier; the sole weight build. Production dispatches it via
 /// [`crate::recorder::Recorder::linear_mmv_mrow`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -943,8 +943,8 @@ pub(crate) fn native_mmv_mrow_m16_spv(
         _ => None,
     }
 }
-/// `-DSTREAMED` twin of [`native_mmv_mw_build_spv`] (kernel-cache name + SPIR-V) — the multi-warp
-/// int8 dp4a decode GEMV. `res` mirrors [`native_mmv_mw_build_spv`]'s residual arm, present at every
+/// `-DSTREAMED` twin of [`native_mmv_mw_kernel_name`] (kernel-cache name + SPIR-V) — the multi-warp
+/// int8 dp4a decode GEMV. `res` mirrors [`native_mmv_mw_kernel_name`]'s residual arm, present at every
 /// `(dtype, warps, sg16)` combination the resident table has (Intel's default-on `mmv_mw_choice`
 /// route dispatches the residual arm for its decode Linear+Add fusion — see
 /// [`crate::recorder::Recorder::linear_mmv_mw`] — so the twin isn't just a parity-test convenience).
@@ -1030,7 +1030,7 @@ pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
 /// The `-DSTREAMED` dense tiled dp4a (mmq) GEMM (kernel-cache name + SPIR-V) — the weight read from
 /// a `bufferDeviceAddress` arena; the sole weight build for the dense mmq set. Production
 /// dispatches it via [`crate::recorder::Recorder::matmul_mmq`]; parity tests call
-/// [`crate::recorder::Recorder::matmul_mmq_streamed`] directly with an explicit arena address. The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
+/// [`crate::recorder::Recorder::matmul_mmq_at`] directly with an explicit arena address. The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
 /// when the expert router grows an `arena: Option<u64>` arm at integration time.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_dense_spv(
@@ -1068,7 +1068,7 @@ pub(crate) fn native_gemm_mmq_dense_spv(
 /// The f16-weight decode GEMV (`linear_f16.comp`; weight read through a typed 64-bit
 /// buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the bound-SSBO
 /// resident build died with the eager `VulkanBackend::linear_f16` caller, its sole consumer).
-/// Production entry: [`crate::recorder::Recorder::linear_streamed`].
+/// Production entry: [`crate::recorder::Recorder::linear_at`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_f16_streamed_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
@@ -1086,7 +1086,7 @@ pub(crate) fn linear_f16_noext_spv() -> &'static [u32] {
 /// The bf16-weight decode GEMV (`linear_bf16.comp`; weight read through a typed 64-bit
 /// buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the bound-SSBO
 /// resident build died with the eager `VulkanBackend::linear_bf16` caller, its sole consumer).
-/// Production entry: [`crate::recorder::Recorder::linear_bf16_streamed`].
+/// Production entry: [`crate::recorder::Recorder::linear_bf16_at`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_bf16_streamed_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
@@ -1133,7 +1133,7 @@ pub(crate) fn linear_res_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// SPIR-V (kernel-cache name + words) for [`native_gemm_fma_build_spv`]'s pick; the sole weight
+/// SPIR-V (kernel-cache name + words) for [`native_gemm_fma_kernel_name`]'s pick; the sole weight
 /// build — production dispatches it via [`crate::recorder::Recorder::matmul_fma`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_fma_spv(
@@ -1160,7 +1160,7 @@ pub(crate) fn native_gemm_fma_spv(
 /// [`native_gemm_fma_spv`]);
 /// `None` for any other dtype.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_fma_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_gemm_fma_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
         F16 => "native_gemm_fma_f16",
@@ -1239,7 +1239,7 @@ pub(crate) fn native_gemm_f8cm_q8_0_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V for the fp8-coopmat GEMM's NARROW_N tile (BM=64xBN=128, BK=64) — the occupancy fix for
-/// n%128 (not n%256) shapes, mirroring `native_gemm_warp_n128_build_spv`.
+/// n%128 (not n%256) shapes, mirroring `native_gemm_warp_n128_kernel_name`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_f8cm_q8_0_n128_spv() -> &'static [u32] {
     const BYTES: &[u8] =
@@ -1312,7 +1312,7 @@ pub(crate) fn repack_q8_to_f8_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 /// `-DSTREAMED` twin of [`repack_q8_to_f8_spv`]: the Q8_0 source is read through
-/// `native_arena_ref.glsl`'s `NW()` chokepoint (this file already includes `native_decode.glsl`,
+/// `native_weight_addr.glsl`'s `NW()` chokepoint (this file already includes `native_decode.glsl`,
 /// same as `native_gemm_warp`) into the resident arena instead of the bound binding-0 SSBO. The
 /// E4M3 output buffer (binding 1) is a derived scratch buffer and stays bound in both builds — see
 /// the shader's STREAMED doc. Parity-test entry.
@@ -1359,7 +1359,7 @@ pub(crate) fn moe_topk_spv() -> &'static [u32] {
 /// SPIR-V lives in [`embed_gather_spv`]. `None` = format has no
 /// build (grid-table IQ formats) — the runner then keeps the host embed path.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn embed_gather_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -1385,7 +1385,7 @@ pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static
         _ => return None,
     })
 }
-/// SPIR-V (kernel-cache name + words) for [`embed_gather_build_spv`]'s pick — the token-embedding
+/// SPIR-V (kernel-cache name + words) for [`embed_gather_kernel_name`]'s pick — the token-embedding
 /// table read from a `bufferDeviceAddress` arena, same convention as [`native_streamed_build_spv`];
 /// the sole weight build. Production dispatches it via
 /// [`crate::recorder::Recorder::embed_gather`].
@@ -1551,7 +1551,7 @@ pub(crate) fn moe_weight_scale_spv() -> &'static [u32] {
 /// kernel-cache NAME only — the SPIR-V is loaded via [`native_gemm_spv`]; the weight is read by
 /// 64-bit device address from the arena, so no resident SSBO tile is bound.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_gemm_warp_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -1578,7 +1578,7 @@ pub(crate) fn native_gemm_warp_build_spv(dtype: infr_core::DType) -> Option<&'st
 /// Kernel-cache NAME for the NARROW-N warptile (BN=128/BK=64) — same math per thread, 2× the workgroups; the
 /// occupancy fix for n=1024/2048 GEMMs. `None` for formats without a warp build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_n128_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_gemm_warp_n128_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -1638,7 +1638,7 @@ pub(crate) fn native_gemm_warp_cm8_build_spv(
 /// 2 to 3 workgroups/WGP, which is worth ~1.5x on the 8B prefill shapes (29→44 TF on the o
 /// projection). Name+SPIR-V per tile so `kernel_sg` caches distinct pipelines.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_ag_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_gemm_warp_ag_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
         Iq4Nl => "native_gemm_warp_iq4nl_ag",
@@ -1656,7 +1656,9 @@ pub(crate) fn native_gemm_warp_ag_build_spv(dtype: infr_core::DType) -> Option<&
 
 /// NARROW_N (BN=128) + A_GLOBAL.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_n128_ag_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_gemm_warp_n128_ag_kernel_name(
+    dtype: infr_core::DType,
+) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
         Iq4Nl => "native_gemm_warp_iq4nl_n128_ag",
@@ -1674,7 +1676,7 @@ pub(crate) fn native_gemm_warp_n128_ag_build_spv(dtype: infr_core::DType) -> Opt
 
 /// SPLIT_K (NARROW_N tile) + A_GLOBAL.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_sk_ag_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_gemm_warp_sk_ag_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     Some(match dtype {
         Iq4Nl => "native_gemm_warp_iq4nl_sk_ag",
@@ -1690,13 +1692,13 @@ pub(crate) fn native_gemm_warp_sk_ag_build_spv(dtype: infr_core::DType) -> Optio
     })
 }
 
-/// BM=32 row-tile variant of [`native_gemm_warp_n128_ag_build_spv`] — see the recorder's
+/// BM=32 row-tile variant of [`native_gemm_warp_n128_ag_kernel_name`] — see the recorder's
 /// `DENSE_SMALL_TILE_MAX_M` doc. Only the formats MTP verify's qwen35-4B-UD-Q4_K_XL run actually
 /// hits (Q4_K/Q5_K/Q6_K/Q8_0) are built. NOT built for the sk_ag (split-K) family —
 /// `dense_small_m_row_tile_bench` measured a net LOSS there (split-K's own `splits` dimension
 /// already fills the device; see `matmul_native_splitk`'s doc).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_n128_ag_bm32_build_spv(
+pub(crate) fn native_gemm_warp_n128_ag_bm32_kernel_name(
     dtype: infr_core::DType,
 ) -> Option<&'static str> {
     use infr_core::DType::*;
@@ -1709,11 +1711,11 @@ pub(crate) fn native_gemm_warp_n128_ag_bm32_build_spv(
     })
 }
 
-/// BM=16 row-tile variant of [`native_gemm_warp_n128_ag_build_spv`] — one coopmat M-frag floor,
+/// BM=16 row-tile variant of [`native_gemm_warp_n128_ag_kernel_name`] — one coopmat M-frag floor,
 /// see the recorder's `DENSE_SMALL_TILE_MAX_M16` doc. Same format coverage as the BM=32 variant
 /// (Q4_K/Q5_K/Q6_K/Q8_0), no sk_ag family.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_n128_ag_bm16_build_spv(
+pub(crate) fn native_gemm_warp_n128_ag_bm16_kernel_name(
     dtype: infr_core::DType,
 ) -> Option<&'static str> {
     use infr_core::DType::*;
@@ -1728,7 +1730,7 @@ pub(crate) fn native_gemm_warp_n128_ag_bm16_build_spv(
 
 /// Kernel-cache NAME for the SPLIT-K narrow warptile (NARROW_N + a k-split grid dimension writing partials).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_warp_sk_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_gemm_warp_sk_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{

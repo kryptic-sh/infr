@@ -13,7 +13,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // Dense layer streaming (see pager.rs `DensePagerSession`): the weight is read from the arena pool
 // by 64-bit device address instead of a bound SSBO — `w_base` keeps its within-slot element-offset
 // meaning (the op's own fused-QKV slice offset), while `arena_lo`/`arena_hi` carry the resident
-// slot's arena base BYTE address (see native_arena_ref.glsl). This lifts the ~4 GiB
+// slot's arena base BYTE address (see native_weight_addr.glsl). This lifts the ~4 GiB
 // maxStorageBufferRange cap a bound SSBO arena has.
 layout(push_constant) uniform PC {
     uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
@@ -28,7 +28,7 @@ layout(binding = 2) buffer YB { float y_buf[]; };
 
 shared float red[64];
 
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 
 #include "native_decode.glsl"
@@ -50,7 +50,7 @@ void main() {
     uint o = unit % pc.out_f;
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint wbase = pc.w_base + o * pc.in_f;
     uint xbase = r * pc.in_f;
     uint nsub = pc.in_f / 32u;

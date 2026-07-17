@@ -19,7 +19,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // -DPAGED extends the push constant with the arena's 64-bit base address (split lo/hi to dodge the
 // 8-byte alignment a uint64_t member would force) + the per-slot byte stride — see
-// native_arena_ref.glsl. `slot` still selects the id; `stride` is repurposed as the LUT window base.
+// native_weight_addr.glsl. `slot` still selects the id; `stride` is repurposed as the LUT window base.
 #ifdef PAGED
 layout(push_constant) uniform PC {
     uint rows; uint in_f; uint out_f; uint slot; uint stride;
@@ -38,7 +38,7 @@ layout(push_constant) uniform PC {
 #else
 layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint slot; uint stride; } pc;
 #endif
-// PAGED/STREAMED read the arena by device address (native_arena_ref.glsl), not through binding 0 —
+// PAGED/STREAMED read the arena by device address (native_weight_addr.glsl), not through binding 0 —
 // the descriptor slot is left for a harmless filler on the Rust side, so binding numbers below are
 // unchanged between builds.
 #if !defined(PAGED) && !defined(STREAMED)
@@ -62,12 +62,12 @@ layout(binding = 3) buffer YB { float y_buf[]; };
 shared float part[8];   // one partial per subgroup (64 threads / min 8-wide subgroup = 8 max)
 
 #if defined(PAGED) || defined(STREAMED)
-// Arena read via 64-bit device address (see native_arena_ref.glsl): `nw_ptr` is set once in main
+// Arena read via 64-bit device address (see native_weight_addr.glsl): `w_addr` is set once in main
 // to this slot's base, and NW() dereferences it. PAGED: the LUT stores the SLOT INDEX; the byte
 // address is computed with a 64-bit multiply, so no arena size overflows it (the u32 element-space
 // multiply this replaces was the Scout slot-≥-102 coherent-but-wrong bug). STREAMED: no LUT, the
 // same 64-bit multiply on `ids[...]` directly.
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 #endif
 
@@ -90,17 +90,17 @@ void main() {
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;
 #ifdef PAGED
-    // Slot base BYTE address from the LUT slot index (see native_arena_ref.glsl); wbase keeps only
+    // Slot base BYTE address from the LUT slot index (see native_weight_addr.glsl); wbase keeps only
     // the small within-expert element offset. `pc.stride` is repurposed in this build as the LUT
     // WINDOW base and `ids` holds layer-LOCAL expert ids — same contract as
     // native_gemv_id_multi.comp's PAGED build (see its comment for the tape-window rationale).
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
              + uint64_t(lut[pc.stride + ids[pc.slot]]) * uint64_t(pc.slot_bytes);
     uint wbase = o * pc.in_f;
 #elif defined(STREAMED)
     // Expert base BYTE address straight from `ids` (no LUT); `pc.stride` is the per-expert BYTE
     // stride in this build. wbase keeps only the small within-expert element offset.
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
              + uint64_t(ids[pc.slot]) * uint64_t(pc.stride);
     uint wbase = o * pc.in_f;
 #else

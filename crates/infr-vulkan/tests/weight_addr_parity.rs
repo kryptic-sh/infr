@@ -1,26 +1,27 @@
-//! Proves the decode-GEMV / weight-read kernels' `-DSTREAMED` builds (weight read through a
-//! `bufferDeviceAddress` arena pointer) are correct — in two forms, depending on whether the family
-//! still has a genuinely-dispatched bound-SSBO twin:
+//! Proves the decode-GEMV / weight-read kernels correctly read their weight by 64-bit device
+//! address (`native_weight_addr.glsl`) — i.e. that passing an explicit `arena_addr` base, at any
+//! byte offset, decodes the right bytes. Two forms, depending on whether the family still has a
+//! genuinely-dispatched bound-SSBO twin:
 //!
-//! * RESIDENT-VS-STREAMED (`run_case`/`run_mmv_case` + `assert_case`, most tests below): for
-//!   families a resident (bound-SSBO) build is STILL compiled for (production dispatches it, or an
-//!   eager/parity caller binds the weight directly — see build.rs's `mechanism_b_resident`), this
-//!   proves the streamed twin computes BIT-IDENTICALLY to it. The two builds differ only in where
-//!   `NW(i)` sources its word from — the dequant math and the accumulation order in
-//!   `native_decode.glsl` are the same code — so anything short of bitwise equality is a bug, not a
-//!   tolerance question.
+//! * RESIDENT-VS-BDA (`run_case`/`run_mmv_case` + `assert_case`, most tests below): for families a
+//!   resident (bound-SSBO) build is STILL compiled for (production dispatches it, or an eager/parity
+//!   caller binds the weight directly — see build.rs's `mechanism_b_resident`, the `-DSTREAMED` dual
+//!   sources), this proves the address-addressed build computes BIT-IDENTICALLY to it. The two
+//!   builds differ only in where `NW(i)` sources its word from — the dequant math and the
+//!   accumulation order in `native_decode.glsl` are the same code — so anything short of bitwise
+//!   equality is a bug, not a tolerance question.
 //! * OFFSET-INVARIANCE (`run_case_offset_invariant`/`run_mmv_case_offset_invariant` +
 //!   `assert_offset_invariant`): for families whose resident build no longer exists (retired
-//!   alongside the eager/parity-recorder callers that were its sole consumers — the streamed twin
-//!   was ALREADY the only thing production ever dispatched, so a resident compare would either not
-//!   compile or just re-derive the same streamed result from itself), this drops the resident leg
-//!   and instead runs the SAME streamed kernel twice — once with its weight at arena offset 0, once
-//!   with the identical bytes parked behind a garbage prefix at a non-zero offset — asserting the
-//!   two outputs match bit-for-bit.
+//!   alongside the eager/parity-recorder callers that were its sole consumers — the address-
+//!   addressed build was ALREADY the only thing production ever dispatched, so a resident compare
+//!   would either not compile or just re-derive the same result from itself), this drops the
+//!   resident leg and instead runs the SAME kernel twice — once with its weight at arena offset 0,
+//!   once with the identical bytes parked behind a garbage prefix at a non-zero offset — asserting
+//!   the two outputs match bit-for-bit.
 //!
 //! Either way, the second, load-bearing assertion is the NON-ZERO ARENA OFFSET: the resident-BDA
 //! integration places every tensor at its own byte offset inside ONE multi-GiB arena and passes
-//! `arena_addr + tensor_off` as the kernel's base. A twin that only works at offset 0 would pass a
+//! `arena_addr + tensor_off` as the kernel's base. A build that only works at offset 0 would pass a
 //! naive parity test and then read garbage for every tensor but the first, so each case is run
 //! twice — once at offset 0, once at a non-zero offset — and both legs must agree (with the
 //! resident result, or with each other, per the form above).
@@ -34,7 +35,7 @@
 //! vacuously, hiding the very mis-addressing this test exists to catch), and a wrong address still
 //! yields visibly different finite floats.
 //!
-//! Run: `cargo test -p infr-vulkan --test gemv_streamed_parity -- --ignored --nocapture`
+//! Run: `cargo test -p infr-vulkan --test weight_addr_parity -- --ignored --nocapture`
 use infr_core::backend::{Backend, BufferUsage};
 use infr_core::DType;
 use infr_vulkan::VulkanBackend;
@@ -277,7 +278,7 @@ fn assert_offset_invariant(c: &OffsetCase) {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn mrow_streamed_offset_invariant() {
+fn mrow_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -293,7 +294,7 @@ fn mrow_streamed_offset_invariant() {
                 out_f,
                 rows * out_f,
                 &|rec, addr, x, y| {
-                    rec.linear_native_mrow_streamed(dtype, addr, 0, x, y, rows, in_f, out_f)
+                    rec.linear_native_mrow_at(dtype, addr, 0, x, y, rows, in_f, out_f)
                 },
             );
             assert_offset_invariant(&c);
@@ -304,7 +305,7 @@ fn mrow_streamed_offset_invariant() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn rm_streamed_offset_invariant() {
+fn rm_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -319,9 +320,7 @@ fn rm_streamed_offset_invariant() {
                 in_f,
                 out_f,
                 out_f,
-                &|rec, addr, x, y| {
-                    rec.linear_native_rm_streamed(dtype, addr, 0, x, y, in_f, out_f, rm)
-                },
+                &|rec, addr, x, y| rec.linear_native_rm_at(dtype, addr, 0, x, y, in_f, out_f, rm),
             );
             assert_offset_invariant(&c);
             println!("ok: {}", c.name);
@@ -331,7 +330,7 @@ fn rm_streamed_offset_invariant() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn sg_streamed_offset_invariant() {
+fn sg_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -346,7 +345,7 @@ fn sg_streamed_offset_invariant() {
             in_f,
             out_f,
             out_f,
-            &|rec, addr, x, y| rec.linear_native_sg_streamed(dtype, addr, 0, x, y, in_f, out_f, nr),
+            &|rec, addr, x, y| rec.linear_native_sg_at(dtype, addr, 0, x, y, in_f, out_f, nr),
         );
         assert_offset_invariant(&c);
         println!("ok: {}", c.name);
@@ -355,7 +354,7 @@ fn sg_streamed_offset_invariant() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn rm_v2_streamed_offset_invariant() {
+fn rm_v2_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -377,7 +376,7 @@ fn rm_v2_streamed_offset_invariant() {
             out_f,
             out_f,
             &|rec, addr, x, y| {
-                rec.linear_native_rm_v2_streamed(variant, dtype, addr, 0, x, y, in_f, out_f)
+                rec.linear_native_rm_v2_at(variant, dtype, addr, 0, x, y, in_f, out_f)
             },
         );
         assert_offset_invariant(&c);
@@ -414,7 +413,7 @@ fn w_base_composes_with_arena_offset() {
     let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
     be.upload(arena0.as_ref(), &w).unwrap();
     let rec = be.recorder().unwrap();
-    rec.linear_native_rm_streamed(
+    rec.linear_native_rm_at(
         dtype,
         addr0,
         stride_elems,
@@ -440,7 +439,7 @@ fn w_base_composes_with_arena_offset() {
     let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
     be.upload(arena1.as_ref(), &backing).unwrap();
     let rec = be.recorder().unwrap();
-    rec.linear_native_rm_streamed(
+    rec.linear_native_rm_at(
         dtype,
         addr1 + off as u64,
         stride_elems,
@@ -606,7 +605,7 @@ fn run_mmv_case_offset_invariant(
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn mmv_streamed_offset_invariant() {
+fn mmv_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -623,7 +622,7 @@ fn mmv_streamed_offset_invariant() {
             out_f,
             &q,
             &|rec, addr, y| {
-                rec.linear_mmv_streamed(
+                rec.linear_mmv_at(
                     dtype,
                     addr,
                     0,
@@ -643,7 +642,7 @@ fn mmv_streamed_offset_invariant() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn mmv_mrow_streamed_offset_invariant() {
+fn mmv_mrow_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -665,7 +664,7 @@ fn mmv_mrow_streamed_offset_invariant() {
                     rows * out_f,
                     &q,
                     &|rec, addr, y| {
-                        rec.linear_mmv_mrow_streamed(
+                        rec.linear_mmv_mrow_at(
                             dtype,
                             addr,
                             0,
@@ -689,7 +688,7 @@ fn mmv_mrow_streamed_offset_invariant() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn mmv_mw_streamed_matches_resident() {
+fn mmv_mw_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -722,7 +721,7 @@ fn mmv_mw_streamed_matches_resident() {
                     )
                 },
                 &|rec, addr, y| {
-                    rec.linear_mmv_mw_streamed(
+                    rec.linear_mmv_mw_at(
                         dtype,
                         warps,
                         addr,
@@ -752,7 +751,7 @@ fn mmv_mw_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn mmq_dense_streamed_matches_resident() {
+fn mmq_dense_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -801,7 +800,7 @@ fn mmq_dense_streamed_matches_resident() {
                 )
             },
             &|rec, addr, y| {
-                rec.matmul_mmq_streamed(
+                rec.matmul_mmq_at(
                     dtype,
                     q.qa.as_ref(),
                     q.dact.as_ref(),
@@ -832,7 +831,7 @@ fn mmq_dense_streamed_matches_resident() {
 
 // ─── id-indexed resident expert family — slice A4 ──────────────────────────────────────────────
 // The load-bearing difference from the earlier sections: the STREAMED build REPURPOSES `stride`
-// as the per-expert BYTE stride applied on the 64-bit pointer (`nw_ptr = arena + u64(ids[slot]) *
+// as the per-expert BYTE stride applied on the 64-bit pointer (`w_addr = arena + u64(ids[slot]) *
 // u64(stride_bytes)`), replacing the resident u32 element-space multiply that wraps past 2^32
 // elements. So every case here selects a NON-ZERO expert id — an id of 0 would pass even if the
 // stride scaling were completely broken.
@@ -858,7 +857,7 @@ fn synth_bank(dtype: DType, in_f: usize, out_f: usize, n_expert: usize) -> Bank 
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn id_streamed_matches_resident() {
+fn id_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -908,7 +907,7 @@ fn id_streamed_matches_resident() {
         let (arena, addr) = be.alloc_arena_bda(backing.len()).unwrap();
         be.upload(arena.as_ref(), &backing).unwrap();
         let rec = be.recorder().unwrap();
-        rec.linear_native_id_streamed(
+        rec.linear_native_id_at(
             dtype,
             addr + off as u64,
             bank.stride_bytes as u32,
@@ -940,7 +939,7 @@ fn id_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn idm_streamed_matches_resident() {
+fn idm_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -993,7 +992,7 @@ fn idm_streamed_matches_resident() {
         let (arena, addr) = be.alloc_arena_bda(backing.len()).unwrap();
         be.upload(arena.as_ref(), &backing).unwrap();
         let rec = be.recorder().unwrap();
-        rec.linear_native_id_multi_streamed(
+        rec.linear_native_id_multi_at(
             dtype,
             addr + off as u64,
             bank.stride_bytes as u32,
@@ -1026,7 +1025,7 @@ fn idm_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn mmv_id_q4k_streamed_matches_resident() {
+fn mmv_id_q4k_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1072,7 +1071,7 @@ fn mmv_id_q4k_streamed_matches_resident() {
     let (arena, addr) = be.alloc_arena_bda(backing.len()).unwrap();
     be.upload(arena.as_ref(), &backing).unwrap();
     let rec = be.recorder().unwrap();
-    rec.linear_mmv_id_multi_q4k_streamed(
+    rec.linear_mmv_id_multi_q4k_at(
         addr + off as u64,
         bank.stride_bytes as u32,
         q.qa.as_ref(),
@@ -1111,7 +1110,7 @@ fn mmv_id_q4k_streamed_matches_resident() {
 /// resident-vs-streamed compare here was always vacuous. Offset-invariance is the real assertion.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn float_linear_streamed_offset_invariant() {
+fn float_linear_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1133,13 +1132,9 @@ fn float_linear_streamed_offset_invariant() {
                 out_f,
                 rows * out_f,
                 &|rec, addr, _x, y| match dtype {
-                    DType::F16 => rec.linear_streamed(addr, x_buf.as_ref(), y, rows, in_f, out_f),
-                    DType::Bf16 => {
-                        rec.linear_bf16_streamed(addr, x_buf.as_ref(), y, rows, in_f, out_f)
-                    }
-                    DType::F32 => {
-                        rec.linear_f32_streamed(addr, x_buf.as_ref(), y, rows, in_f, out_f)
-                    }
+                    DType::F16 => rec.linear_at(addr, x_buf.as_ref(), y, rows, in_f, out_f),
+                    DType::Bf16 => rec.linear_bf16_at(addr, x_buf.as_ref(), y, rows, in_f, out_f),
+                    DType::F32 => rec.linear_f32_at(addr, x_buf.as_ref(), y, rows, in_f, out_f),
                     _ => unreachable!(),
                 },
             );
@@ -1151,7 +1146,7 @@ fn float_linear_streamed_offset_invariant() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn f16_noext_and_res_streamed_match_resident() {
+fn f16_noext_and_res_match_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1173,9 +1168,7 @@ fn f16_noext_and_res_streamed_match_resident() {
         out_f,
         out_f,
         &|rec, w, _x, y| rec.linear_f16_noext(w, x_buf.as_ref(), y, rows, in_f, out_f),
-        &|rec, addr, _x, y| {
-            rec.linear_f16_noext_streamed(addr, x_buf.as_ref(), y, rows, in_f, out_f)
-        },
+        &|rec, addr, _x, y| rec.linear_f16_noext_at(addr, x_buf.as_ref(), y, rows, in_f, out_f),
     );
     assert_case(&c);
     println!("ok: {}", c.name);
@@ -1189,7 +1182,7 @@ fn f16_noext_and_res_streamed_match_resident() {
         out_f,
         &|rec, w, _x, y| rec.linear_add(w, x_buf.as_ref(), res_buf.as_ref(), y, rows, in_f, out_f),
         &|rec, addr, _x, y| {
-            rec.linear_add_streamed(addr, x_buf.as_ref(), res_buf.as_ref(), y, rows, in_f, out_f)
+            rec.linear_add_at(addr, x_buf.as_ref(), res_buf.as_ref(), y, rows, in_f, out_f)
         },
     );
     assert_case(&c);
@@ -1198,7 +1191,7 @@ fn f16_noext_and_res_streamed_match_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn fma_gemm_streamed_matches_resident() {
+fn fma_gemm_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1219,7 +1212,7 @@ fn fma_gemm_streamed_matches_resident() {
             n,
             c_rows * n,
             &|rec, w, _x, y| rec.matmul_fma(dtype, a_buf.as_ref(), w, 0, y, m, k, n),
-            &|rec, addr, _x, y| rec.matmul_fma_streamed(dtype, a_buf.as_ref(), addr, 0, y, m, k, n),
+            &|rec, addr, _x, y| rec.matmul_fma_at(dtype, a_buf.as_ref(), addr, 0, y, m, k, n),
         );
         let real = m * n;
         let trimmed = Case {
@@ -1242,7 +1235,7 @@ fn fma_gemm_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn embed_gather_streamed_matches_resident() {
+fn embed_gather_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1286,7 +1279,7 @@ fn embed_gather_streamed_matches_resident() {
         let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
         be.upload(arena0.as_ref(), &table).unwrap();
         let rec = be.recorder().unwrap();
-        rec.embed_gather_streamed(
+        rec.embed_gather_at(
             dtype,
             addr0,
             ids_buf.as_ref(),
@@ -1319,7 +1312,7 @@ fn embed_gather_streamed_matches_resident() {
         let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
         be.upload(arena1.as_ref(), &backing).unwrap();
         let rec = be.recorder().unwrap();
-        rec.embed_gather_streamed(
+        rec.embed_gather_at(
             dtype,
             addr1 + off as u64,
             ids_buf.as_ref(),
@@ -1363,7 +1356,7 @@ fn embed_gather_streamed_matches_resident() {
 /// other's mutated history.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn conv1d_silu_streamed_offset_invariant() {
+fn conv1d_silu_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1402,7 +1395,7 @@ fn conv1d_silu_streamed_offset_invariant() {
         let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
         be.upload(arena0.as_ref(), &w).unwrap();
         let rec = be.recorder().unwrap();
-        rec.conv1d_silu_streamed(
+        rec.conv1d_silu_at(
             qkv_buf.as_ref(),
             addr0,
             state_buf.as_ref(),
@@ -1418,7 +1411,7 @@ fn conv1d_silu_streamed_offset_invariant() {
         let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
         be.upload(arena1.as_ref(), &backing).unwrap();
         let rec = be.recorder().unwrap();
-        rec.conv1d_silu_streamed(
+        rec.conv1d_silu_at(
             qkv_buf.as_ref(),
             addr1 + off as u64,
             state_buf.as_ref(),
@@ -1465,7 +1458,7 @@ fn conv1d_silu_streamed_offset_invariant() {
         let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
         be.upload(arena0.as_ref(), &w).unwrap();
         let rec = be.recorder().unwrap();
-        rec.conv1d_silu_batch_streamed(
+        rec.conv1d_silu_batch_at(
             qkv_buf.as_ref(),
             addr0,
             state_buf.as_ref(),
@@ -1481,7 +1474,7 @@ fn conv1d_silu_streamed_offset_invariant() {
         let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
         be.upload(arena1.as_ref(), &backing).unwrap();
         let rec = be.recorder().unwrap();
-        rec.conv1d_silu_batch_streamed(
+        rec.conv1d_silu_batch_at(
             qkv_buf.as_ref(),
             addr1 + off as u64,
             state_buf.as_ref(),
@@ -1512,7 +1505,7 @@ fn conv1d_silu_streamed_offset_invariant() {
 /// would read the wrong slice of `up`.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn e2b_gate_streamed_offset_invariant() {
+fn e2b_gate_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1541,7 +1534,7 @@ fn e2b_gate_streamed_offset_invariant() {
         out_f,
         m * out_f,
         &|rec, addr, _x, y| {
-            rec.e2b_gate_streamed(
+            rec.e2b_gate_at(
                 addr,
                 x_buf.as_ref(),
                 up_buf.as_ref(),
@@ -1563,13 +1556,13 @@ fn e2b_gate_streamed_offset_invariant() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn gemm_proj_streamed_matches_resident() {
+fn gemm_proj_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
     };
     // n%64==0, k%32==0; m=8 < 768 keeps BOTH legs on the non-warp gemm_proj kernel (matmul_proj /
-    // matmul_proj_streamed share the same `warp = m>=768 && n%256==0` gate).
+    // matmul_proj_at share the same `warp = m>=768 && n%256==0` gate).
     let (m, k, n) = (8usize, 256usize, 64usize);
     let mpad = m.div_ceil(64) * 64;
 
@@ -1595,7 +1588,7 @@ fn gemm_proj_streamed_matches_resident() {
     let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
     be.upload(arena0.as_ref(), &w).unwrap();
     let rec = be.recorder().unwrap();
-    rec.matmul_proj_streamed(a_buf.as_ref(), addr0, c_buf.as_ref(), m, k, n);
+    rec.matmul_proj_at(a_buf.as_ref(), addr0, c_buf.as_ref(), m, k, n);
     rec.finish().unwrap();
     let mut out = vec![0u8; mpad * n * 4];
     be.download(c_buf.as_ref(), &mut out).unwrap();
@@ -1608,7 +1601,7 @@ fn gemm_proj_streamed_matches_resident() {
     let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
     be.upload(arena1.as_ref(), &backing).unwrap();
     let rec = be.recorder().unwrap();
-    rec.matmul_proj_streamed(a_buf.as_ref(), addr1 + off as u64, c_buf.as_ref(), m, k, n);
+    rec.matmul_proj_at(a_buf.as_ref(), addr1 + off as u64, c_buf.as_ref(), m, k, n);
     rec.finish().unwrap();
     let mut out = vec![0u8; mpad * n * 4];
     be.download(c_buf.as_ref(), &mut out).unwrap();
@@ -1636,7 +1629,7 @@ fn gemm_proj_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn i8cm_streamed_matches_resident() {
+fn i8cm_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1677,7 +1670,7 @@ fn i8cm_streamed_matches_resident() {
     let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
     be.upload(arena0.as_ref(), &w).unwrap();
     let rec = be.recorder().unwrap();
-    rec.matmul_i8cm_q8_0_streamed(
+    rec.matmul_i8cm_q8_0_at(
         q.qa.as_ref(),
         q.dact.as_ref(),
         addr0,
@@ -1699,7 +1692,7 @@ fn i8cm_streamed_matches_resident() {
     let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
     be.upload(arena1.as_ref(), &backing).unwrap();
     let rec = be.recorder().unwrap();
-    rec.matmul_i8cm_q8_0_streamed(
+    rec.matmul_i8cm_q8_0_at(
         q.qa.as_ref(),
         q.dact.as_ref(),
         addr1 + off as u64,
@@ -1735,7 +1728,7 @@ fn i8cm_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn repack_streamed_matches_resident() {
+fn repack_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1768,7 +1761,7 @@ fn repack_streamed_matches_resident() {
     be.upload(arena0.as_ref(), &w).unwrap();
     let w8_buf0 = be.alloc(w8_bytes, BufferUsage::Activations).unwrap();
     let rec = be.recorder().unwrap();
-    rec.repack_q8_to_f8_streamed(addr0, 0, w8_buf0.as_ref(), n, k);
+    rec.repack_q8_to_f8_at(addr0, 0, w8_buf0.as_ref(), n, k);
     rec.finish().unwrap();
     let mut streamed_at0 = vec![0u8; w8_bytes];
     be.download(w8_buf0.as_ref(), &mut streamed_at0).unwrap();
@@ -1785,7 +1778,7 @@ fn repack_streamed_matches_resident() {
     be.upload(arena1.as_ref(), &backing).unwrap();
     let w8_buf1 = be.alloc(w8_bytes, BufferUsage::Activations).unwrap();
     let rec = be.recorder().unwrap();
-    rec.repack_q8_to_f8_streamed(addr1 + off as u64, 0, w8_buf1.as_ref(), n, k);
+    rec.repack_q8_to_f8_at(addr1 + off as u64, 0, w8_buf1.as_ref(), n, k);
     rec.finish().unwrap();
     let mut streamed_atoff = vec![0u8; w8_bytes];
     be.download(w8_buf1.as_ref(), &mut streamed_atoff).unwrap();
@@ -1816,14 +1809,14 @@ fn synth_residual(n: usize) -> Vec<f32> {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn linear_add_native_streamed_matches_resident() {
+fn linear_add_native_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
     };
     // out_f=2048, in_f%32==0: Q6_K lands on the SG route (`native_sg_choice`) and Q4_K on the
     // default "reg" RM-variant route (`native_rm_v2_streamed_build_spv`'s res arm) — see
-    // recorder.rs's `linear_add_native`/`linear_add_native_streamed` routing precedence. Both are
+    // recorder.rs's `linear_add_native`/`linear_add_native_at` routing precedence. Both are
     // exercised here rather than falling through to the plain-GEMV arm.
     let (in_f, out_f) = (256usize, 2048usize);
     let res = synth_residual(out_f);
@@ -1841,7 +1834,7 @@ fn linear_add_native_streamed_matches_resident() {
             out_f,
             &|rec, w, x, y| rec.linear_add_native(dtype, w, x, res_buf.as_ref(), y, 1, in_f, out_f),
             &|rec, addr, x, y| {
-                rec.linear_add_native_streamed(dtype, addr, x, res_buf.as_ref(), y, 1, in_f, out_f)
+                rec.linear_add_native_at(dtype, addr, x, res_buf.as_ref(), y, 1, in_f, out_f)
             },
         );
         assert_case(&c);
@@ -1851,7 +1844,7 @@ fn linear_add_native_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn linear_add_mmv_streamed_matches_resident() {
+fn linear_add_mmv_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1886,7 +1879,7 @@ fn linear_add_mmv_streamed_matches_resident() {
             )
         },
         &|rec, addr, y| {
-            rec.linear_add_mmv_streamed(
+            rec.linear_add_mmv_at(
                 dtype,
                 addr,
                 q.qa.as_ref(),
@@ -1905,7 +1898,7 @@ fn linear_add_mmv_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn linear_mmv_mrow_residual_streamed_matches_resident() {
+fn linear_mmv_mrow_residual_matches_resident() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -1944,7 +1937,7 @@ fn linear_mmv_mrow_residual_streamed_matches_resident() {
             )
         },
         &|rec, addr, y| {
-            rec.linear_mmv_mrow_streamed(
+            rec.linear_mmv_mrow_at(
                 dtype,
                 addr,
                 0,
@@ -1966,7 +1959,7 @@ fn linear_mmv_mrow_residual_streamed_matches_resident() {
 // ─── resident-BDA routing proof — dense model path integration ────────────────────────────────
 // Every other test in this file drives a `_streamed` twin DIRECTLY with a raw `u64` address —
 // proving the twin's math, not that anything routes to it. This test proves the wiring: it calls
-// the RESIDENT entry point (`linear_native_off`/`linear_mmv`/`matmul_mmq`/`embed_gather`) with a
+// the RESIDENT entry point (`linear_native`/`linear_mmv`/`matmul_mmq`/`embed_gather`) with a
 // weight buffer built via `bda_weight_alloc_for_test` (the same "construct the arena alloc
 // directly, not via env" approach `resident_bda_weight_arena_roundtrip` uses in lib.rs's own
 // tests) — a `device_addr()`-reporting sub-tensor, exactly what `INFR_RESIDENT_BDA=1` produces.
@@ -1977,13 +1970,13 @@ fn linear_mmv_mrow_residual_streamed_matches_resident() {
 // ordinary bound-SSBO weight holding identical bytes.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn resident_bda_linear_route_dispatches_streamed() {
+fn resident_bda_linear_route_dispatches() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
     };
 
-    // ── linear_native_off (Q4_K, m=1 decode GEMV) ─────────────────────────────────────────────
+    // ── linear_native (Q4_K, m=1 decode GEMV) ─────────────────────────────────────────────
     {
         let dtype = DType::Q4K;
         let (in_f, out_f) = (256usize, 64usize);
@@ -1998,7 +1991,7 @@ fn resident_bda_linear_route_dispatches_streamed() {
             be.upload(w_buf.as_ref(), &w).unwrap();
             let y_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
             let rec = be.recorder().unwrap();
-            rec.linear_native_off(
+            rec.linear_native(
                 dtype,
                 w_buf.as_ref(),
                 0,
@@ -2015,7 +2008,7 @@ fn resident_bda_linear_route_dispatches_streamed() {
         };
         assert!(
             resident.iter().any(|&b| b != 0),
-            "linear_native_off: resident output is all zeros"
+            "linear_native: resident output is all zeros"
         );
 
         let routed = {
@@ -2027,7 +2020,7 @@ fn resident_bda_linear_route_dispatches_streamed() {
             be.upload(w_bda.as_ref(), &w).unwrap();
             let y_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
             let rec = be.recorder().unwrap();
-            rec.linear_native_off(
+            rec.linear_native(
                 dtype,
                 w_bda.as_ref(),
                 0,
@@ -2044,9 +2037,9 @@ fn resident_bda_linear_route_dispatches_streamed() {
         };
         assert_eq!(
             resident, routed,
-            "linear_native_off: resident-BDA route diverged from the SSBO reference"
+            "linear_native: resident-BDA route diverged from the SSBO reference"
         );
-        println!("ok: resident-BDA route linear_native_off dtype={dtype:?}");
+        println!("ok: resident-BDA route linear_native dtype={dtype:?}");
     }
 
     // ── linear_mmv (Q4_K int8 dp4a decode GEMV) ───────────────────────────────────────────────
@@ -2341,7 +2334,7 @@ fn resident_bda_bound_subrange_bind() {
 // this campaign added were completely broken (see the id-family module doc above).
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn resident_bda_id_route_dispatches_streamed() {
+fn resident_bda_id_route_dispatches() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -2525,7 +2518,7 @@ struct MmqVariant {
 // buffers before the dispatch, which is not guaranteed equal (an earlier slice hit exactly this).
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn resident_bda_mmq_experts_route_dispatches_streamed() {
+fn resident_bda_mmq_experts_route_dispatches() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;

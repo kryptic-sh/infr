@@ -46,7 +46,7 @@ layout(binding = 2) buffer YB { float y_buf[]; };
 #define NR 2
 #endif
 
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 
 #include "native_decode.glsl"
@@ -62,7 +62,7 @@ float dqsub(uint gstart, uint xoff) {
 
 void main() {
     uint lane = gl_SubgroupInvocationID; // 0..SG-1
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
     // why no extra bounds check is needed here (the existing `o < pc.out_f` guards already cover
     // a padding workgroup's out-of-range o0).

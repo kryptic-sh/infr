@@ -44,7 +44,7 @@ layout(binding = 3) buffer YB { float y_buf[]; };
 #define NR 2
 #endif
 
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 
 #include "native_decode.glsl"
@@ -83,7 +83,7 @@ void main() {
     uint row = slot_global / pc.n_used;
     // Expert base BYTE address straight from `ids`; `pc.stride` is the per-expert BYTE stride.
     // wexp keeps only the small within-expert element offset (0 — the pointer IS the expert base).
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
              + uint64_t(ids[slot_global]) * uint64_t(pc.stride);
     uint wexp = 0u;
     uint xbase = (pc.x_per_slot != 0u ? slot_global * pc.in_f : row * pc.in_f);

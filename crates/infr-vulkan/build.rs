@@ -250,7 +250,7 @@ fn main() {
         ),
         ("e2b_gate", "e2b_gate", &[]),
         // e2b_proj (fused E2B per-layer proj GEMV+RMSNorm+Add) landed but was NEVER wired into
-        // production — the E2B proj side runs unfused; only tests/gemv_streamed_parity.rs's
+        // production — the E2B proj side runs unfused; only tests/weight_addr_parity.rs's
         // `e2b_proj_streamed_matches_resident` dispatched it (both the resident and streamed
         // builds), and that test is deleted along with it — there's no surviving entry point left
         // to exercise. Both builds and the shader itself (shaders/e2b_proj.comp) are gone too.
@@ -2621,7 +2621,7 @@ fn main() {
         })
         .collect();
     // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a
-    // `bufferDeviceAddress` arena pool (native_arena_ref.glsl) instead of a bound SSBO, lifting the
+    // `bufferDeviceAddress` arena pool (native_weight_addr.glsl) instead of a bound SSBO, lifting the
     // ~4 GiB `maxStorageBufferRange` cap one SSBO binding imposes. `wants_streamed_twin` marks the
     // families that get a STREAMED build; `mechanism_b_resident` (below) marks the few whose
     // bound-SSBO build is STILL dispatched — every eager-runner / parity-recorder / production
@@ -2735,13 +2735,20 @@ fn main() {
     // rm,rm_v2}` parity dispatchers, and production's own `Recorder::conv1d_silu`/
     // `conv1d_silu_batch`/`e2b_gate` all bound the weight as an SSBO), but every one of those
     // callers is gone — the STREAMED twin is now the sole route everywhere
-    // (`linear_native_streamed` and its `_sg`/`_rm`/`_rm_v2` siblings,
-    // `Recorder::linear_streamed`/`linear_bf16_streamed`, and `Recorder::conv1d_silu`/
+    // (`linear_native_at` and its `_sg`/`_rm`/`_rm_v2` siblings,
+    // `Recorder::linear_at`/`linear_bf16_at`, and `Recorder::conv1d_silu`/
     // `conv1d_silu_batch`/`e2b_gate` themselves now resolve `device_addr()` and delegate to their
     // own `_streamed` twin), so dropping them from this whitelist just stops compiling the now-dead
     // bound-SSBO half. Everything else in a twin family (the dense/expert coopmat GEMM tiles, the
     // mmv/mrow/id float and dequant GEMVs, embed_gather, gemm_proj, native_gemm_fma) was ALREADY
     // STREAMED-only.
+    // NOTE: `-DSTREAMED` is the ONLY reason the source of a dual family compiles twice, so it names
+    // a real second build for EXACTLY these mechanism-(b) entries — the 5 emitted `_streamed` twins
+    // (native_gemm_i8cm_q8_0 base + `_rowscale`, native_gemm_mmq_q4k/_q6k standalone, repack_q8_to_f8;
+    // native_gemm_warp's cm8/bf16cm are whitelisted but resident-ONLY via `dead_streamed_twin`, so
+    // they carry no twin). Elsewhere the define rides unconditionally on the sole build. Once these
+    // dual sources lose their resident builds, `-DSTREAMED` becomes unconditional everywhere and
+    // folds away with them — which is why it is NOT renamed/removed in isolation.
     let mechanism_b_resident = |src: &str, defines: &[String]| -> bool {
         match src {
             "native_gemm_i8cm_q8_0" | "repack_q8_to_f8" => true,

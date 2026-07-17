@@ -74,9 +74,9 @@ shared float part[2u * MR * MAX_SG];     // one partial per (output, row, subgro
 
 // Weight-word read chokepoint — see native_mmv.comp for why this family declares its own `NW(i)`
 // instead of inheriting native_decode.glsl's.
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
-// Wide 4-word read: NW4 (b128, saddr) comes from native_arena_ref.glsl. The dp4a wdec loads then
+// Wide 4-word read: NW4 (b128, saddr) comes from native_weight_addr.glsl. The dp4a wdec loads then
 // issue one b128 instead of four b32 — the streamed-vs-resident decode gap. Same words —
 // bit-identical.
 #ifndef NW4
@@ -558,7 +558,7 @@ void main() {
     // padding workgroup's out-of-range o0 for every lane).
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u;
     uint t = gl_LocalInvocationID.x;
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint ot = t >> 4u;               // which of the 4 outputs this lane serves
     uint sl = t & 15u;               // K sub-lane within the output's 16
     uint nsub = pc.in_f / 32u;
@@ -662,7 +662,7 @@ void main() {
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
     if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint nsub = pc.in_f / 32u;
     uint in_fq = pc.in_f >> 4u;      // activation row stride in packed uvec4s
     uint wb0 = pc.w_base + o0 * pc.in_f;

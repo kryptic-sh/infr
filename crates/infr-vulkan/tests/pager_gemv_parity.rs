@@ -1,5 +1,5 @@
 //! Proves the MoE expert pager's LUT indirection (`infr_vulkan::pager::GpuPager` +
-//! `native_gemv_id_*_paged` shaders, `nw_ptr = arena_base + uint64_t(lut[expert_id]) *
+//! `native_gemv_id_*_paged` shaders, `w_addr = arena_base + uint64_t(lut[expert_id]) *
 //! slot_bytes` slot-index addressing) computes the SAME GEMV a host
 //! reference does, across a token sequence that churns the cache (more distinct experts than
 //! slots — every step but the first two is a miss that evicts the LRU resident expert). This is

@@ -18,13 +18,13 @@
 #ifndef NW
 #define NW(i) nw[i]
 #endif
-// Wide 4-word read (see native_arena_ref.glsl). Non-streamed builds read the SSBO array directly;
+// Wide 4-word read (see native_weight_addr.glsl). Non-streamed builds read the SSBO array directly;
 // ACO's vectorizer already fuses the four adjacent nw[] loads into one buffer_load_b128, so this is
 // the same code the scalar path generated — the macro only gives the streamed arena the same shape.
 #ifndef NW4
 #define NW4(wbase) uvec4(nw[(wbase)], nw[(wbase) + 1u], nw[(wbase) + 2u], nw[(wbase) + 3u])
 #endif
-// Wide 2-word read (see native_arena_ref.glsl's NW2) — non-streamed builds read the SSBO array
+// Wide 2-word read (see native_weight_addr.glsl's NW2) — non-streamed builds read the SSBO array
 // directly; ACO's vectorizer fuses the adjacent pair into one buffer_load_b64.
 #ifndef NW2
 #define NW2(wbase) uvec2(nw[(wbase)], nw[(wbase) + 1u])
@@ -46,7 +46,7 @@ int sgn8(uint byte) { return int(byte) - int(byte >= 128u ? 256u : 0u); }
 // Load four consecutive u32s starting at BYTE offset `bo` (any alignment) as a uvec4 —
 // == uvec4(ru32u(bo), ru32u(bo+4), ru32u(bo+8), ru32u(bo+12)), bit-identical. The point is the
 // read shape under -DSTREAMED: the four aligned words come from ONE NW4 (fused global_load_b128,
-// saddr base — see native_arena_ref.glsl) instead of per-word scalar NW() loads the vectorizer
+// saddr base — see native_weight_addr.glsl) instead of per-word scalar NW() loads the vectorizer
 // can't fuse (distinct arena_word pointers), which lowered a run of ru32u/rb() reads to many
 // unfused global_load_b32. A +N-misaligned block funnels in one neighbor word (the tail). Aligned
 // blocks (sh==0) skip the funnel entirely. Used by the odd-stride native dqblk formats (Q3_K,
@@ -114,7 +114,7 @@ float dq(uint g) {
 // vectorizer can't fuse (distinct arena_word pointers), so the old eight ru32u calls lowered to up to
 // 16 unfused global_load_b32 per block — the streamed Q8_0 GEMV ran ~67% slower per dispatch than the
 // descriptor-bound twin. NW4 reads four CONSTANT-index words off ONE pointer (fused global_load_b128,
-// saddr base — see native_arena_ref.glsl), matching the descriptor path. The qs body starts at byte
+// saddr base — see native_weight_addr.glsl), matching the descriptor path. The qs body starts at byte
 // bd+2, so its word alignment flips with block parity: an ODD block (bd%4==2) has bd+2 word-aligned
 // (qsh==0, read the quad words directly); an EVEN block (bd%4==0) is +2 misaligned (qsh==16, funnel a
 // sliding neighbor word, word 8 the tail). Same funnel integers as the old ru32u form — bit-identical.

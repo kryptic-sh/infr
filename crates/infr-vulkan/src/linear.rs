@@ -112,7 +112,7 @@ pub fn moe_expert_dtype_ok(dtype: infr_core::DType) -> bool {
 }
 
 /// [`native_id_kernel_name`]'s paged twin (`infr_vulkan::pager::GpuPager` build — one extra LUT
-/// hop, `nw_ptr = arena_base + uint64_t(lut[expert_id]) * slot_bytes` (a resident slot index
+/// hop, `w_addr = arena_base + uint64_t(lut[expert_id]) * slot_bytes` (a resident slot index
 /// scaled onto the arena's 64-bit device address), see `shaders/native_gemv_id.comp`'s `-DPAGED`
 /// doc comment).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -289,10 +289,10 @@ pub fn native_gemm_kernel_name(dtype: infr_core::DType) -> &'static str {
 /// The MoE *stacked/id-indexed* path (`native_id_*`/`native_idm_*`) covers this whole set PLUS
 /// F16/F32 (float expert banks); use [`native_id_kernel_name`] for that.
 /// Formats the `embed_gather` kernel family covers (`Op::EmbedGather` — see
-/// `gemm::embed_gather_build_spv`). The runner gates the token-ids input path on this.
+/// `gemm::embed_gather_kernel_name`). The runner gates the token-ids input path on this.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn embed_gather_supported(dtype: infr_core::DType) -> bool {
-    crate::gemm::embed_gather_build_spv(dtype).is_some()
+    crate::gemm::embed_gather_kernel_name(dtype).is_some()
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]

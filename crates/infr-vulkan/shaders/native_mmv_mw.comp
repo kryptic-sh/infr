@@ -50,9 +50,9 @@ layout(binding = 4) buffer YB { float y_buf[]; };
 
 // Weight-word read chokepoint — see native_mmv.comp for why this family declares its own `NW(i)`
 // instead of inheriting native_decode.glsl's.
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
-// Wide 4-word read: NW4 (b128, saddr) comes from native_arena_ref.glsl, letting the dp4a weight
+// Wide 4-word read: NW4 (b128, saddr) comes from native_weight_addr.glsl, letting the dp4a weight
 // loads issue one b128 instead of four b32 — the streamed-vs-resident decode gap (see the arena ref
 // doc). Same words as NW(base+j) — bit-identical.
 #ifndef NW4
@@ -261,7 +261,7 @@ void main() {
     // early return below is safe before subgroupAdd (all SG lanes of a subgroup share it).
     uint o = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(WARPS) + sg;
     if (o >= pc.out_f) { return; }
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint nsub = pc.in_f / 32u;
     uint wb = pc.w_base + o * pc.in_f;
     float acc = 0.0;

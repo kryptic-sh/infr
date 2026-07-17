@@ -443,7 +443,7 @@ fn mmv_decode_enabled() -> bool {
 /// [`mmv_int8_decode_dtypes`], so the A/B escapes stay symmetric too. `INFR_MMV_MW_WARPS` ∈
 /// {1,2,4,8,16} only affects Intel now (AMD's decode tier no longer reads WARPS — see
 /// [`unified_mmv_row1`]); {1,2,16} are Q4_K-only dispatch-shape sweep builds (see
-/// `native_mmv_mw_build_spv`), not shipped for Q6_K/Q2_K/Q3_K/Q5_K.
+/// `native_mmv_mw_kernel_name`), not shipped for Q6_K/Q2_K/Q3_K/Q5_K.
 ///
 /// **Q5_K** — a NEW int8 arm this session; it previously had no int8 kernel in EITHER stream, which
 /// is why the historical Q5_K attempt (verify-int8 / decode-f32-exact) broke MTP token-identity.
@@ -705,16 +705,16 @@ fn mmv_mw_choice(
     //
     // Intel keeps the mmv_mw gate. sg16=false probe: the SG=16 twin set is identical per (dtype,
     // res, warps), so base existence is the correct gate on every device. {1,2,16} are Q4_K-only
-    // dispatch-shape sweep builds (see README footnote 3 / native_mmv_mw_build_spv) — not part of
+    // dispatch-shape sweep builds (see README footnote 3 / native_mmv_mw_kernel_name) — not part of
     // the shipped {4,8} policy set for Q6_K/Q2_K/Q3_K, only reachable via INFR_MMV_MW_WARPS.
     let have_spv = if unified_mmv_row1(caps) {
         // Same (o4, m4=true, res=false) probe the rows=1 dispatch resolves — see
         // `Recorder::linear_mmv_mrow`'s variant selection (decode is always m4, and every dtype
         // with a plain build has the o4/res twins too).
-        crate::gemm::native_mmv_mrow_variant_name(dt, in_f < 2048, true, false).is_some()
+        crate::gemm::native_mmv_mrow_variant_kernel_name(dt, in_f < 2048, true, false).is_some()
     } else {
         matches!(warps, 1 | 2 | 4 | 8 | 16)
-            && crate::gemm::native_mmv_mw_build_spv(dt, false, warps, false).is_some()
+            && crate::gemm::native_mmv_mw_kernel_name(dt, false, warps, false).is_some()
     };
     have_spv.then_some(warps)
 }
@@ -960,7 +960,7 @@ fn lower_op(
     // arena-addressed: a genuine prefill chunk (`streamed_gemm_applies`) routes through the SAME
     // coopmat-warp GEMM tile the resident path would pick (`streamed_prefill_gemm` → the -DSTREAMED
     // twins of native_gemm/native_gemm_warp), while decode/small-m keep the single streamed GEMV
-    // (`linear_native_streamed`) — the arena-addressed kernels are the ONLY ones a >4 GiB pool ever
+    // (`linear_native_at`) — the arena-addressed kernels are the ONLY ones a >4 GiB pool ever
     // dispatches, which is what makes dropping the caps safe. `w_off` (a fused-QKV slice offset,
     // usually 0) rides on top as a within-slot element offset in both. The ring→arena copy hazard is
     // ordered explicitly by `arena_stream_barrier` at the staging site (`stage_dense_linear`) — the
@@ -1076,7 +1076,7 @@ fn lower_op(
                         transient,
                     )?;
                 } else {
-                    rec.linear_native_streamed(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
+                    rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
                 }
                 return Ok(());
             }
@@ -1154,7 +1154,7 @@ fn lower_op(
                         && be_.caps().i8_dot
                         && in_f % 32 == 0
                         && in_f * out_f >= MMV_MIN_ELEMS
-                        && crate::gemm::native_mmv_build_spv(dt, true).is_some()
+                        && crate::gemm::native_mmv_kernel_name(dt, true).is_some()
                     {
                         let nblk = in_f / 32;
                         let qa = pooled(pool, be_, "mmv_qa", in_f)?;
@@ -1211,7 +1211,7 @@ fn lower_op(
             let mmv_gate = be_.caps().i8_dot
                 && in_f * out_f >= 8 << 20
                 && out_f < 65536
-                && crate::gemm::native_mmv_mrow_build_spv(dt).is_some()
+                && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
                 && mrow_int8_dtype_ok(be_.caps(), dt, graph.mtp_verify)
                 && std::env::var("INFR_NO_MMV").is_err();
             // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
@@ -1224,11 +1224,11 @@ fn lower_op(
             let mrow16 = (9..=16).contains(&m)
                 && out_f <= 8192
                 && mmv_gate
-                && crate::gemm::native_mmv_mrow_m16_name(dt).is_some()
+                && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
                 && std::env::var("INFR_NO_MROW16").is_err();
             if ((2..=4).contains(&m) || ((5..=8).contains(&m) && out_f <= 8192) || mrow16)
                 && in_f % 32 == 0
-                && crate::gemm::native_mrow_build_spv(dt).is_some()
+                && crate::gemm::native_mrow_kernel_name(dt).is_some()
                 && std::env::var("INFR_NO_MROW").is_err()
             {
                 // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
@@ -1299,7 +1299,7 @@ fn lower_op(
             // dispatch on a device that lacks VK_KHR_cooperative_matrix segfaults on some
             // drivers). `!caps.f16_coopmat` routes to the NON-COOPMAT GEMM tier below (`nc_mmq`/
             // `nc_fma` — real tiled GEMMs with no coopmat SPIR-V), and only past that to the
-            // scalar `else` arms (`linear_native_off`/`linear`/`linear_f32` — the SAME scalar
+            // scalar `else` arms (`linear_native`/`linear`/`linear_f32` — the SAME scalar
             // dequant-in-shader kernels the m==1 decode GEMV already uses, generalized to
             // `rows=m`; they dispatch `rows*out_f` (or row-tiled) workgroups with no upper bound
             // on `rows`, so they are a drop-in, just without any weight-reuse-across-rows win).
@@ -1342,7 +1342,8 @@ fn lower_op(
                 && !be_.caps().f16_coopmat()
                 && std::env::var("INFR_NO_MMQ_FALLBACK").is_err();
             let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
-            let nc_fma = nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_build_spv(dt).is_some();
+            let nc_fma =
+                nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_kernel_name(dt).is_some();
             if is_gemm {
                 // GEMM writes ceil(m/64)*64 rows. Internal `dst` is row-padded → write direct;
                 // a non-Internal dst (e.g. the lm_head `logits` Output, unpadded) gets a padded
@@ -1368,7 +1369,7 @@ fn lower_op(
                 // ne=1152 projections sat on scalar mmq at ~10 TF under the old n%256 gate).
                 // INFR_NO_MMQ also skips mmq for A/B.
                 let warp_ok = out_f % 128 == 0
-                    && crate::gemm::native_gemm_warp_build_spv(dt).is_some()
+                    && crate::gemm::native_gemm_warp_kernel_name(dt).is_some()
                     && std::env::var("INFR_NO_GEMM_WARP").is_err();
                 // int8 cooperative-matrix (WMMA) prefill GEMM — MEASUREMENT path, Q8_0 only
                 // (crates/infr-vulkan/shaders/native_gemm_i8cm_q8_0.comp). `caps.i8_coopmat` is
@@ -1566,7 +1567,7 @@ fn lower_op(
                         .expect("resident-BDA weight: dense Linear requires a u64 BDA address");
                     let use_ag = out_f % 128 == 0
                         && in_f % 32 == 0
-                        && crate::gemm::native_gemm_warp_ag_build_spv(dt).is_some()
+                        && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
                         && std::env::var("INFR_NO_GEMM_WARP").is_err();
                     let a16 = if use_ag {
                         let mpad = m.div_ceil(64) * 64;
@@ -1587,7 +1588,7 @@ fn lower_op(
                     } else {
                         1
                     };
-                    if splits > 1 && crate::gemm::native_gemm_warp_sk_build_spv(dt).is_some() {
+                    if splits > 1 && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some() {
                         let mpad = m.div_ceil(64) * 64;
                         let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
                         let a: &dyn Buffer = match &a16 {
@@ -1644,7 +1645,7 @@ fn lower_op(
                     };
                     if matches!(dt, infr_core::DType::F16)
                         && splits > 1
-                        && crate::gemm::native_gemm_warp_sk_build_spv(dt).is_some()
+                        && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some()
                         && std::env::var("INFR_NO_GEMM_WARP").is_err()
                     {
                         let mpad = m.div_ceil(64) * 64;
@@ -1786,7 +1787,7 @@ fn lower_op(
                     && be_.caps().i8_dot
                     && in_f % 32 == 0
                     && in_f * out_f >= MMV_MIN_ELEMS
-                    && crate::gemm::native_mmv_build_spv(dt, false).is_some()
+                    && crate::gemm::native_mmv_kernel_name(dt, false).is_some()
                 {
                     let nblk = in_f / 32;
                     let qa = pooled(pool, be_, "mmv_qa", in_f)?;
@@ -1812,7 +1813,7 @@ fn lower_op(
                         out_f,
                     );
                 } else {
-                    rec.linear_native_off(dt, w, w_off, xb, y, m, in_f, out_f);
+                    rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
             } else if matches!(dt, infr_core::DType::F32) {
                 // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj): the seam
@@ -3408,7 +3409,7 @@ fn lower_op(
                 let rdt = graph.desc(*router).dtype;
                 let rw = r(*router)?;
                 if native_dense_supported(rdt) {
-                    rec.linear_native(rdt, rw, rxb, logits.as_ref(), rows, ne, n_expert);
+                    rec.linear_native(rdt, rw, 0, rxb, logits.as_ref(), rows, ne, n_expert);
                 } else if matches!(rdt, infr_core::DType::F32) {
                     rec.linear_f32(rw, rxb, logits.as_ref(), rows, ne, n_expert);
                 } else {
@@ -3673,7 +3674,7 @@ fn lower_op(
             let rdt = graph.desc(*router).dtype;
             let rw = r(*router)?;
             if native_dense_supported(rdt) {
-                rec.linear_native(rdt, rw, rxb, logits.get(pool), rows, ne, n_expert);
+                rec.linear_native(rdt, rw, 0, rxb, logits.get(pool), rows, ne, n_expert);
             } else if matches!(rdt, infr_core::DType::F32) {
                 // qwen3moe ships the router (ffn_gate_inp) as F32 — the f16 GEMV would read its
                 // bytes as f16 garbage and route to arbitrary experts.
@@ -4548,7 +4549,7 @@ fn streamed_prefill_gemm(
     // stage — the occupancy win). Same gate as the resident arm.
     let use_ag = out_f.is_multiple_of(128)
         && in_f.is_multiple_of(32)
-        && crate::gemm::native_gemm_warp_ag_build_spv(dt).is_some()
+        && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
         && std::env::var("INFR_NO_GEMM_WARP").is_err();
     let a16 = if use_ag {
         let mpad = m.div_ceil(64) * 64;
@@ -4565,7 +4566,7 @@ fn streamed_prefill_gemm(
     } else {
         1
     };
-    if splits > 1 && crate::gemm::native_gemm_warp_sk_build_spv(dt).is_some() {
+    if splits > 1 && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some() {
         let mpad = m.div_ceil(64) * 64;
         let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
         let a: &dyn Buffer = match &a16 {
@@ -4720,7 +4721,7 @@ fn stage_and_window<'a>(
 /// session's tape (`lut[window + local_id]` — see `MoePagerSession::lut_window`), never the live
 /// pool LUT, which later layers' staging keeps mutating while earlier recorded work is still in
 /// flight. The arena itself is BDA-addressed (`48ad9c1`): the paged dispatches deref it by 64-bit
-/// pointer (`native_arena_ref.glsl`) and deliberately never bind it as a descriptor (binding 0
+/// pointer (`native_weight_addr.glsl`) and deliberately never bind it as a descriptor (binding 0
 /// takes a small `lut` filler instead), so the generic buffer hazard tracker (`Recorder::sync`)
 /// never sees the read and cannot order it against the ring→arena staging copies on its own.
 /// Ordering is instead explicit, mirroring the dense streamer's `arena_stream_barrier` (`36bcbf5`):
@@ -4819,7 +4820,7 @@ fn execute_paged_moe<'a>(
         let rw = r(*router)?;
         let rdt = graph.desc(*router).dtype;
         if native_dense_supported(rdt) {
-            rc.linear_native(rdt, rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
+            rc.linear_native(rdt, rw, 0, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
         } else if matches!(rdt, infr_core::DType::F32) {
             rc.linear_f32(rw, rxb, pool[&logits].as_ref(), rows, ne, n_expert);
         } else {

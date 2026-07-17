@@ -27,7 +27,7 @@ shared float red[64];
 
 // Weight-byte read chokepoint — this file carries its own Q4_K dp4a decode (not
 // native_decode.glsl), so it declares the arena seam locally like the native_mmv family.
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 uint rb(uint byte) { return (arena_word(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
@@ -50,7 +50,7 @@ void main() {
     uint t = gl_LocalInvocationID.x;
     // Expert base BYTE address straight from `ids`; `pc.stride` is the per-expert BYTE stride.
     // wbase keeps only the small within-expert element offset.
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi)
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi)
              + uint64_t(ids[slot]) * uint64_t(pc.stride);
     uint wbase = o * pc.in_f;                         // element offset, multiple of 256
     uint nsub = pc.in_f / 32u;                        // 32-element sub-blocks (= activation blocks)

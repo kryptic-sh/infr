@@ -117,7 +117,7 @@ const uint SBK = BK + 8u;     // Bs is [BN][BK]
 
 // w_base: element offset into the weight grid (for stacked MoE experts: expert_id * out_f * in_f).
 // -DSTREAMED (dense layer streaming, see pager.rs `DensePagerSession` and native_gemm.comp's arm):
-// the weight is read from the arena pool by 64-bit device address (native_arena_ref.glsl) instead
+// the weight is read from the arena pool by 64-bit device address (native_weight_addr.glsl) instead
 // of the bound binding-1 SSBO — `arena_lo`/`arena_hi` (appended LAST so the split-K fields keep
 // their offsets) carry the resident slot's base BYTE address; the NW(i) chokepoint in
 // native_decode's dqblk is redefined to read the arena, the only weight-source change. Composes
@@ -159,7 +159,7 @@ shared CMTYPE As[BM * SAK];
 shared CMTYPE Bs[BN * SBK];
 
 #ifdef STREAMED
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 #endif
 
@@ -167,7 +167,7 @@ shared CMTYPE Bs[BN * SBK];
 
 void main() {
 #ifdef STREAMED
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
 #endif
     uint tilesN = pc.n / BN;
 #ifdef SPLIT_K

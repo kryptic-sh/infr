@@ -83,7 +83,7 @@
 // -DSTREAMED (resident-BDA): the raw Q8_0 weight bytes are read through a 64-bit buffer_reference
 // into the resident arena (base = arena_lo/arena_hi) instead of the bound binding-2 SSBO — same
 // campaign convention as gemm_proj_warp.comp's WQ() seam. Inline buffer_reference (this file has
-// no native_decode.glsl / native_arena_ref.glsl include to hang a shared macro off): `rb()`'s
+// no native_decode.glsl / native_weight_addr.glsl include to hang a shared macro off): `rb()`'s
 // underlying word read is rerouted through `NW(i)`, the ONLY place this file reads `nw[]`, so
 // every caller of `rb`/`ru16` (the Bs weight-byte staging and the per-block Ws scale) automatically
 // rides the arena. Additive: the non-STREAMED build is byte-identical.

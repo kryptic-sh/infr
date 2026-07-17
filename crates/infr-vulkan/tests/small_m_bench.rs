@@ -59,6 +59,7 @@ fn small_m_linear_bench() {
                 rec.linear_native(
                     infr_core::DType::Q4K,
                     w.as_ref(),
+                    0,
                     a.as_ref(),
                     c.as_ref(),
                     m,
@@ -136,6 +137,7 @@ fn mrow_matches_single_row_gemv() {
         rec.linear_native(
             infr_core::DType::Q4K,
             w.as_ref(),
+            0,
             x.as_ref(),
             y_ref.as_ref(),
             m,

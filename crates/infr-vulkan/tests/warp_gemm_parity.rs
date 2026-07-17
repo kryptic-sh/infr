@@ -1,5 +1,5 @@
 //! Bitwise parity for the Q4K warp GEMM A_GLOBAL pairs (n128_ag and sk_ag, resident vs
-//! `-DSTREAMED` twin) — the prefill-hot tile variants gemv_streamed_parity.rs doesn't cover.
+//! `-DSTREAMED` twin) — the prefill-hot tile variants weight_addr_parity.rs doesn't cover.
 //! Born as the resident-BDA perf campaign's ISA probe and kept for the coverage; it still doubles
 //! as the ISA-dump vehicle: RADV_DEBUG=shaders MESA_SHADER_CACHE_DISABLE=true <bin> --ignored
 //! 2> isa.txt (move ~/.cache/infr/vk-pipeline-cache-*.bin aside first).

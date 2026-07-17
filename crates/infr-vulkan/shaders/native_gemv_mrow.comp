@@ -37,7 +37,7 @@ const uint MR = 8u;
 const uint MAX_SG = 8u;             // 64 threads / min 8-wide subgroup
 shared float part[MR * MAX_SG];     // one partial per (row, subgroup)
 
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 
 #include "native_decode.glsl"
@@ -49,7 +49,7 @@ void main() {
     uint o = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // grid = out_f: one wg/output
     if (o >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint wbase = pc.w_base + o * pc.in_f;
     uint nsub = pc.in_f / 32u;
     uint in_f4 = pc.in_f >> 2u;

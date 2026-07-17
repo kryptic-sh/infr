@@ -40,7 +40,7 @@ layout(binding = 2) buffer YB { float y_buf[]; };
 #define RM 2
 #endif
 
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 
 #include "native_decode.glsl"
@@ -77,7 +77,7 @@ shared float red[64];
 void main() {
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(RM);
     uint t = gl_LocalInvocationID.x;
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint nsub = pc.in_f / 32u;
     float acc[RM];
     [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) { acc[rr] = 0.0; }

@@ -6,7 +6,7 @@
 // instead of a dequantized f32 embedding row.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // Resident-BDA (STREAMED is the only weight build): the token-embedding table is read from the
-// arena pool by 64-bit device address (native_arena_ref.glsl). `ids` selects the row within THIS
+// arena pool by 64-bit device address (native_weight_addr.glsl). `ids` selects the row within THIS
 // table (no per-expert stride to repurpose, unlike native_gemv_id's stacked-expert form), so
 // `arena_lo`/`arena_hi` carry the table's arena base BYTE address.
 layout(push_constant) uniform PC {
@@ -15,7 +15,7 @@ layout(push_constant) uniform PC {
 layout(binding = 1) readonly buffer IB { int ids[]; };
 layout(binding = 2) writeonly buffer YB { float y_buf[]; };
 
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 
 #include "native_decode.glsl"
@@ -24,7 +24,7 @@ void main() {
     uint row = gl_WorkGroupID.x;
     if (row >= pc.rows) { return; }
     uint t = gl_LocalInvocationID.x;
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident table base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident table base byte address; NO slot multiply
     uint base = uint(ids[row]) * pc.ne; // table element offset of this token's row
     uint nsub = pc.ne / 32u;
     for (uint s = t; s < nsub; s += 64u) {

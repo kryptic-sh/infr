@@ -19,7 +19,7 @@ const uint BK = 32u;
 // Streamed (dense layer streaming, see pager.rs `DensePagerSession`): the weight is read from the
 // arena pool by 64-bit device address instead of a bound SSBO — `w_base` keeps its element-offset
 // meaning (a fused-QKV slice offset), while `arena_lo`/`arena_hi` carry the resident slot's arena
-// base BYTE address (native_arena_ref.glsl). Mirrors native_gemv.comp's arm exactly: weight reads
+// base BYTE address (native_weight_addr.glsl). Mirrors native_gemv.comp's arm exactly: weight reads
 // funnel through native_decode's NW(i) chokepoint, so redefining NW to arena_word is the only
 // weight-source change.
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; } pc;
@@ -29,14 +29,14 @@ layout(binding = 2) writeonly buffer CBuf { float c[]; };
 shared float16_t As[BM * BK];
 shared float16_t Bs[BK * BN];
 
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 
 #include "native_decode.glsl"
 
 void main() {
     GRID_INIT; // barrier inside — must run in uniform control flow before any dqblk()
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint tilesN = pc.n / BN;
     uint wgRow = (gl_WorkGroupID.x / tilesN) * BM;
     uint wgCol = (gl_WorkGroupID.x % tilesN) * BN;

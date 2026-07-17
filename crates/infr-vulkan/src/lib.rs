@@ -1007,7 +1007,7 @@ impl VulkanBackend {
         // `device_ci`, so vkCreateShaderModule for those kernels violated the VUID under validation.
         let has_int16 = feat2.features.shader_int16 != 0;
         // Same 08740 class as `shaderInt16` above, for 64-bit integer arithmetic: the BDA arena
-        // helper `native_arena_ref.glsl` (paged-MoE `-DPAGED` builds AND dense-streaming
+        // helper `native_weight_addr.glsl` (paged-MoE `-DPAGED` builds AND dense-streaming
         // `-DSTREAMED` builds) composes a 64-bit slot address from lo/hi u32 halves
         // (`uint64_t(hi) << 32 | uint64_t(lo)`, `GL_EXT_shader_explicit_arithmetic_types_int64`),
         // which emits SPIR-V's `Int64` capability — so `shaderInt64` MUST be enabled on the device

@@ -30,7 +30,7 @@
 // -DSTREAMED (resident-BDA): the Q8_0 SOURCE weight is read through a 64-bit buffer_reference into
 // the resident arena (base = arena_lo/arena_hi) instead of the bound binding-0 SSBO — same
 // convention as native_gemm_warp.comp's STREAMED doc (this file already includes native_decode.glsl,
-// so it rides the SAME native_arena_ref.glsl / NW() chokepoint, not an inline one). The E4M3 output
+// so it rides the SAME native_weight_addr.glsl / NW() chokepoint, not an inline one). The E4M3 output
 // buffer (binding 1) is a derived scratch buffer the arena doesn't own, so it stays bound in both
 // builds. Additive: the non-STREAMED build is byte-identical.
 #ifdef STREAMED
@@ -53,7 +53,7 @@ layout(binding = 0) readonly buffer WBuf { uint nw[]; };          // Q8_0 weight
 layout(binding = 1) writeonly buffer W8Buf { floate4m3_t w8[]; }; // [n, k] E4M3, block scale baked in
 
 #ifdef STREAMED
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 #endif
 
@@ -62,7 +62,7 @@ layout(binding = 1) writeonly buffer W8Buf { floate4m3_t w8[]; }; // [n, k] E4M3
 
 void main() {
 #ifdef STREAMED
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address
 #endif
     uint totalBlocks = (pc.n * pc.k) / 32u;
     uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;

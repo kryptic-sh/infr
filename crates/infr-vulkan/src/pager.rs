@@ -14,7 +14,7 @@
 //! before dispatching the id-indexed GEMV/GEMM through the LUT hop (the `PAGED` branch in
 //! `shaders/native_gemv_id.comp` / `native_gemv_id_multi.comp`: `slot = lut[ids[slot]]`, scaled
 //! onto the arena's 64-bit device address as `arena_addr + slot * slot_bytes` — see the `lut_host`
-//! field's doc and `shaders/native_arena_ref.glsl`). A FUTURE dense layer-streaming policy
+//! field's doc and `shaders/native_weight_addr.glsl`). A FUTURE dense layer-streaming policy
 //! (NOT implemented here — see the task doc) would reuse this exact struct with `BlockId =
 //! layer_idx`, `slot_bytes` = one layer's weight size, and a schedule-driven (not LRU) `touch`
 //! order (a dense decode visits layers in a fixed known order, so it can exact-prefetch layer
@@ -83,7 +83,7 @@ impl GpuPager {
     /// `slot_bytes`: one block's PADDED byte size (the largest block the model will ever page —
     /// MoE experts of one model are uniform per role, so this is exact, not a worst-case pad).
     /// Must be u32-aligned (`% 4 == 0`) — the arena is read back a word at a time (see
-    /// `shaders/native_arena_ref.glsl`'s `arena_word`).
+    /// `shaders/native_weight_addr.glsl`'s `arena_word`).
     ///
     /// The arena always allocates as a `bufferDeviceAddress` buffer, read through a 64-bit
     /// pointer, so it may be as large as VRAM allows — no `maxStorageBufferRange` cap (both the
@@ -1001,7 +1001,7 @@ pub struct DensePagerSession {
 
 impl DensePagerSession {
     pub fn new(vk: &VulkanBackend, layout: DensePagerLayout) -> Result<Self> {
-        // The streamed kernels read the arena by 64-bit device address (native_arena_ref.glsl), so
+        // The streamed kernels read the arena by 64-bit device address (native_weight_addr.glsl), so
         // BDA is required. It is probed and hard-errored globally at init (lib.rs, `caps()
         // .buffer_device_address`); assert here so a future refactor that lands a dense session on a
         // BDA-less device fails loudly rather than allocating an un-addressable arena.
@@ -1080,8 +1080,8 @@ impl DensePagerSession {
 
     /// Ensure `buf_id`'s block is resident, staging a miss through `rec`-recorded ring→arena
     /// copies at `half_base + *cursor`. Returns the resident slot's arena base BYTE address (the
-    /// streamed dispatch sets `nw_ptr` to it and adds the op's own `w_off` element offset on top —
-    /// see native_arena_ref.glsl and [`crate::recorder::Recorder::linear_native_streamed`]), or
+    /// streamed dispatch sets `w_addr` to it and adds the op's own `w_off` element offset on top —
+    /// see native_weight_addr.glsl and [`crate::recorder::Recorder::linear_native_at`]), or
     /// `None` when the current ring half can't hold the miss — the caller rotates the ring
     /// (pipelined submit) and re-calls. The address is computed in 64-bit, so no arena size
     /// overflows it (the u32 element-reach the SSBO path needed is gone). Residency rides the exact

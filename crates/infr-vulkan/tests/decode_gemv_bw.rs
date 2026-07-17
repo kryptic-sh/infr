@@ -112,7 +112,16 @@ fn decode_gemv_bw() {
         let run_once = |mode: &str| -> Vec<f32> {
             cfg(mode);
             let rec = be.recorder().unwrap();
-            rec.linear_native(dt, ws[0].as_ref(), x.as_ref(), y.as_ref(), 1, in_f, out_f);
+            rec.linear_native(
+                dt,
+                ws[0].as_ref(),
+                0,
+                x.as_ref(),
+                y.as_ref(),
+                1,
+                in_f,
+                out_f,
+            );
             rec.finish().unwrap();
             read(y.as_ref(), out_f)
         };
@@ -148,6 +157,7 @@ fn decode_gemv_bw() {
                     rec.linear_native(
                         dt,
                         ws[r % n_w].as_ref(),
+                        0,
                         x.as_ref(),
                         y.as_ref(),
                         1,

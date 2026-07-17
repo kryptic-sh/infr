@@ -37,7 +37,7 @@ shared float red[2u * 64u];
 // `rb()`'s byte extraction and the direct word loads in the per-format decoders — funnels through
 // it, which is what lets the file reroute weight reads to arena pointer reads by redefining a
 // single macro.
-#include "native_arena_ref.glsl"
+#include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
 
 uint rb(uint byte) { return (NW(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFFu; }
@@ -164,7 +164,7 @@ void main() {
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
     if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
-    nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint nsub = pc.in_f / 32u;
     uint wb0 = pc.w_base + o0 * pc.in_f;
     bool has1 = (o0 + 1u) < pc.out_f; // workgroup-uniform tail guard (odd out_f)

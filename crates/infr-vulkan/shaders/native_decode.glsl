@@ -74,6 +74,18 @@ uvec2 rw2(uint bo) {
     return uvec2((a.x >> sh) | (a.y << (32u - sh)), (a.y >> sh) | (a.z << (32u - sh)));
 }
 
+// Single-u32 twin of rw2: one unaligned u32 at BYTE offset `bo` — == ru32u(bo), bit-identical —
+// from ONE fused b64 (NW2) plus a branchless funnel-select. ru32u's aligned arm is already a
+// single load, but its misaligned arm issues TWO scalar loads and the alignment branch diverges
+// within a wave whenever neighboring lanes sit in blocks of opposite parity (every odd-stride
+// format); this form is one load and no divergent load path either way. The select (not a shift
+// by 32-sh, which is undefined at sh==0) keeps the aligned result exact.
+uint rw1(uint bo) {
+    uint wb = bo >> 2u; uint sh = (bo & 3u) << 3u;
+    uvec2 a = NW2(wb);
+    return (sh == 0u) ? a.x : ((a.x >> sh) | (a.y << (32u - sh)));
+}
+
 // USE_GRID builds stage their codebook tables into `shared` memory once per workgroup
 // (grid_init() in the generated native_grids.glsl — see build.rs's gen_grids for why const-array
 // indexing is a per-invocation-scratch catastrophe on RADV/ACO). Every includer runs `GRID_INIT;`
@@ -871,12 +883,35 @@ float dq(uint g) {
 void dqblk(uint gstart, out float v[32]) {
     uint bd = (gstart / 256u) * 82u; uint ib32 = (gstart % 256u) / 32u;
     float d = f16tof32(ru16(bd));
+#ifdef STREAMED
+    // Wide-fetch restructure (STREAMED only — the descriptor twin's rb()/ru32u already vectorize
+    // and get SGPR-descriptor addressing for free; don't perturb its codegen). IQ2_S has no
+    // adjacent qs word-PAIR to fuse (d@0, qs@2+4i, signs@34+4i, qh@66+i, sc@74+i — all mutually
+    // non-adjacent), so instead each field is fetched as ONE fused load: the qs and sign words via
+    // branchless rw1 (b64), and qh+sc — exactly 2 words apart — out of ONE b128 window anchored to
+    // END at the sc word (`NW4(scw-3)`, so tail[1] is the qh word and tail[3] the sc word). The
+    // END anchor is load-bearing for bounds: expert banks are bump-allocated at 256-byte alignment
+    // and a bank whose size is an exact 256-multiple sits FLUSH with its dedicated block's end
+    // (e.g. 128x 2048x768 IQ2_S banks = 64487424 bytes % 256 == 0), so a window anchored at the
+    // qh word could read up to 7 bytes past the VkBuffer on the last block; word-granular reads
+    // of needed bytes are always inside align4(size) <= block size. Same bytes as the scalar
+    // rb()/ru32u chain — bit-identical. 8 scalar global_load_b32 -> 4 fused loads (b32+b64+b64+b128).
+    uint scb = bd + 74u + ib32;                      // sc byte address
+    uint scw = scb >> 2u;                            // sc word; qh word is exactly scw - 2
+    uvec4 tail = NW4(scw - 3u);
+    uint bsh = (scb & 3u) << 3u;                     // qh/sc share the in-word byte lane (8 apart)
+    uint qh = (tail[1] >> bsh) & 0xFFu;
+    uint sc = (tail[3] >> bsh) & 0xFFu;
+    uint qs4 = rw1(bd + 2u + ib32 * 4u);             // qs[l] for l=0..3
+    uint sg4 = rw1(bd + 2u + 32u + ib32 * 4u);       // sign bytes for l=0..3
+#else
     uint qh = rb(bd + 66u + ib32);
     uint sc = rb(bd + 74u + ib32);
-    float dl0 = d * (0.5 + float(sc & 0xFu)) * 0.25;
-    float dl1 = d * (0.5 + float(sc >> 4u)) * 0.25;
     uint qs4 = ru32u(bd + 2u + ib32 * 4u);          // qs[l] for l=0..3
     uint sg4 = ru32u(bd + 2u + 32u + ib32 * 4u);    // sign bytes for l=0..3
+#endif
+    float dl0 = d * (0.5 + float(sc & 0xFu)) * 0.25;
+    float dl1 = d * (0.5 + float(sc >> 4u)) * 0.25;
     for (uint l = 0u; l < 4u; l++) {
         uint grid_idx = ((qs4 >> (8u * l)) & 0xFFu) | ((qh << (8u - 2u * l)) & 0x300u);
         uint signs = (sg4 >> (8u * l)) & 0xFFu;

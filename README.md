@@ -242,18 +242,16 @@ device-appropriate base — available VRAM for the expert cache, the free-VRAM K
 capacity for the Vulkan context (`INFR_CACHE=80%`, `INFR_CTX=50%`; on the
 CPU/Metal chat paths a ctx-`%` resolves against the model's trained context).
 
-**Resident-BDA weight arena** — default on; `INFR_RESIDENT_BDA=0` opts out
-(temporary escape hatch, removal tracked in #73). Routes every weight
-allocation into one `bufferDeviceAddress` arena and has the kernels read their
-weights by 64-bit device address instead of through per-tensor SSBO descriptor
-bindings — dense projection weights and MoE expert banks read via `-DSTREAMED`
-kernel twins, sub-tensors via sub-range descriptor binds, and the paged expert
-cache composes on top unchanged. The addressing change is bitwise-identical to
-the old u32-SSBO descriptor path across the whole model zoo (dense, MoE,
+**Resident-BDA weight arena** — always on; it is the only weight path. Routes
+every weight allocation into one `bufferDeviceAddress` arena and has the kernels
+read their weights by 64-bit device address instead of through per-tensor SSBO
+descriptor bindings — dense projection weights and MoE expert banks read via
+`-DSTREAMED` kernel twins, sub-tensors via sub-range descriptor binds, and the
+paged expert cache composes on top unchanged. The addressing is bitwise-identical
+to the retired u32-SSBO descriptor path across the whole model zoo (dense, MoE,
 qwen35/DeltaNet, DiffusionGemma, and the paged Scout experts — proven by the
 `gpu_seam` goldens and the streamed-parity suites), and runs at-or-faster than
-that path on RDNA3 (7900 XTX) on the dense and qwen3-MoE paths. Set
-`INFR_RESIDENT_BDA=0` to fall back to the u32-SSBO descriptor path.
+that path on RDNA3 (7900 XTX) on the dense and qwen3-MoE paths.
 
 ## Validated models & performance
 

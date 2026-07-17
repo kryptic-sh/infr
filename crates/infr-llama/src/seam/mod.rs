@@ -1132,8 +1132,24 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 return Ok((placeholder, dt));
             }
         }
-        // Ordinary (non-paged, non-streamed) weight: the whole tensor is one addressing unit.
-        check_bda_element_cap(name, "tensor", numel)?;
+        // Ordinary (non-paged, non-streamed) weight. A RESIDENT stacked expert bank addresses ONE
+        // per-expert slice at a time (the arena kernels index `arena + expert * stride`), exactly
+        // like the paged path above — so its whole-bank element count may legitimately exceed 2^32
+        // while each per-expert slice must not. This used to take the conservative WHOLE-tensor cap
+        // because the flag-off resident id kernels did whole-bank u32 element math; those kernels
+        // are gone (weights are u64 BDA-addressed only), so the slice cap is now correct. Every
+        // non-expert weight is still one whole-tensor addressing unit.
+        if moe_role_of(name).is_some() {
+            let n_expert = cfg
+                .moe
+                .as_ref()
+                .expect("an expert-bank tensor implies an MoE config")
+                .n_expert
+                .max(1);
+            check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
+        } else {
+            check_bda_element_cap(name, "tensor", numel)?;
+        }
         let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
         // alloc_uninit: the `upload` right below writes the buffer's FULL extent (it is sized to
         // exactly `padded.len()`), so the calloc contract's zero-fill is dead work — and an
@@ -1613,5 +1629,28 @@ mod bda_cap_tests {
         // At the cap and above it fail LOUDLY (u32 index would wrap) rather than corrupt output.
         assert!(check_bda_element_cap("t", "tensor", BDA_ELEMENT_UNIT_MAX).is_err());
         assert!(check_bda_element_cap("t", "per-expert slice", BDA_ELEMENT_UNIT_MAX + 7).is_err());
+    }
+
+    #[test]
+    fn element_cap_resident_expert_bank_uses_per_slice() {
+        // A RESIDENT stacked expert bank whose WHOLE-bank element count clears 2^32 but whose
+        // per-expert slice stays legal: the binder's `moe_role_of(name)` branch checks the
+        // per-expert slice (arena kernels index `arena + expert * stride`), NOT the whole bank —
+        // the same relaxation the paged path already made. This is the invariant that branch relies
+        // on, and the flag-off resident id kernels that once forced the conservative whole-bank
+        // count are gone (weights are u64 BDA-addressed only).
+        let n_expert = 512usize;
+        let slice = 9_000_000usize; // < 2^32
+        let whole = n_expert * slice; // 4.608e9 > 2^32
+        assert!(whole > BDA_ELEMENT_UNIT_MAX && slice < BDA_ELEMENT_UNIT_MAX);
+        // The old WHOLE-bank cap would (wrongly) reject this legal resident bank...
+        assert!(check_bda_element_cap("blk.0.ffn_up_exps.weight", "tensor", whole).is_err());
+        // ...but the per-expert-slice cap the resident-bank path now applies accepts it.
+        check_bda_element_cap(
+            "blk.0.ffn_up_exps.weight",
+            "per-expert slice",
+            whole / n_expert,
+        )
+        .expect("resident expert bank per-slice must pass");
     }
 }

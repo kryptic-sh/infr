@@ -38,25 +38,31 @@ fn warp_ag_isa_probe() {
         .alloc(splits * mpad * n * 4, BufferUsage::Activations)
         .unwrap();
 
-    let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
-    be.upload(w_buf.as_ref(), &w).unwrap();
-    let (arena, addr) = be.alloc_arena_bda(w_bytes).unwrap();
-    be.upload(arena.as_ref(), &w).unwrap();
+    // OFFSET-INVARIANCE (weights are u64 BDA-addressed only — no resident SSBO leg to compare):
+    // leg A reads the weight at arena offset 0, leg B reads the SAME weight parked at a NON-ZERO
+    // offset inside a bigger arena behind a garbage prefix. Both dispatch the `-DSTREAMED` twin and
+    // read the weight by 64-bit address; a kernel that dropped the arena base offset would read the
+    // garbage prefix and diverge — the mutation the offset leg exists to kill.
+    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+    be.upload(arena0.as_ref(), &w).unwrap();
+    // Non-zero offset leg: a 256-aligned garbage prefix (arena blocks are 256-aligned, so the
+    // weight base stays aligned for the kernel's uvec4 loads), then the identical weight bytes.
+    let off = 256usize;
+    let mut backing = synth_bytes(off, 99);
+    backing.extend_from_slice(&w);
+    let (arena1, base1) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena1.as_ref(), &backing).unwrap();
+    let addr1 = base1 + off as u64;
 
     let mut outs: Vec<Vec<u8>> = Vec::new();
-    // n128_ag resident, n128_ag streamed, sk_ag resident, sk_ag streamed
-    for (sk, ar) in [
-        (false, None),
-        (false, Some(addr)),
-        (true, None),
-        (true, Some(addr)),
-    ] {
+    // n128_ag @0, n128_ag @nonzero-offset, sk_ag @0, sk_ag @nonzero-offset
+    for (sk, addr) in [(false, addr0), (false, addr1), (true, addr0), (true, addr1)] {
         let rec = be.recorder().unwrap();
         if sk {
             rec.matmul_native_splitk(
                 dtype,
                 a_buf.as_ref(),
-                w_buf.as_ref(),
+                arena0.as_ref(), // filler: the explicit `Some(addr)` arena is what's read
                 0,
                 part_buf.as_ref(),
                 c_buf.as_ref(),
@@ -65,19 +71,19 @@ fn warp_ag_isa_probe() {
                 n,
                 splits,
                 true,
-                ar,
+                Some(addr),
             );
         } else {
             rec.matmul_native_f16a(
                 dtype,
                 a_buf.as_ref(),
-                w_buf.as_ref(),
+                arena0.as_ref(),
                 0,
                 c_buf.as_ref(),
                 m,
                 k,
                 n,
-                ar,
+                Some(addr),
             );
         }
         rec.finish().unwrap();
@@ -85,11 +91,11 @@ fn warp_ag_isa_probe() {
         be.download(c_buf.as_ref(), &mut out).unwrap();
         assert!(
             out.iter().any(|&b| b != 0),
-            "all-zero output (sk={sk} ar={ar:?})"
+            "all-zero output (sk={sk} addr={addr:#x})"
         );
         outs.push(out);
     }
-    assert_eq!(outs[0], outs[1], "n128_ag streamed != resident (bitwise)");
-    assert_eq!(outs[2], outs[3], "sk_ag streamed != resident (bitwise)");
-    println!("ok: q4k n128_ag + sk_ag streamed pairs bitwise-match resident");
+    assert_eq!(outs[0], outs[1], "n128_ag @nonzero-offset != @0 (bitwise)");
+    assert_eq!(outs[2], outs[3], "sk_ag @nonzero-offset != @0 (bitwise)");
+    println!("ok: q4k n128_ag + sk_ag streamed offset-invariant (0 vs nonzero)");
 }

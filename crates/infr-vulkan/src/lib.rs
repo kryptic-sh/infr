@@ -33,7 +33,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -139,9 +139,6 @@ struct VulkanShared {
     /// `bind_descriptors`) instead of a pooled `alloc_set` + `update_descriptor_sets` +
     /// `cmd_bind_descriptor_sets` per op. `None` falls back to the pooled path.
     push_descriptor: Option<ash::khr::push_descriptor::Device>,
-    /// Pre-reserved bump arena for load-once weights (see `reserve_weights`). `None` until reserved;
-    /// weight allocs then sub-allocate from it instead of the gpu-allocator.
-    weight_arena: Mutex<Option<WeightArena>>,
     /// Lazily-built, reused compute pipeline for the linear op (see `linear.rs`).
     linear_kernel: std::sync::OnceLock<crate::linear::LinearKernel>,
     /// Generic cache of compute kernels by name (see `ops.rs`).
@@ -176,11 +173,6 @@ struct VulkanShared {
     /// from measurement after every forward (`infr_core::submit_cap_from_measurement`), so the
     /// bound tracks whatever the device actually is rather than a table of magic numbers.
     submit_dispatch_cap: AtomicUsize,
-    /// Memory type index for DIRECT-TO-VRAM weight writes (Resizable BAR), or `None` when the
-    /// device doesn't expose one. See [`probe_rebar_type`]: it is a
-    /// `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` type sitting on the device's LARGEST
-    /// device-local heap — i.e. the whole of VRAM is host-visible, not just a 256 MiB BAR window.
-    rebar_type: Option<u32>,
     /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
     /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
     /// is full. See [`probe_uma_overflow_type`] for why counting that heap in the budget is not
@@ -191,12 +183,7 @@ struct VulkanShared {
     /// exactly "would this push the device-local heap past its declared size", so it must not see
     /// the bytes already diverted. Always 0 on a discrete GPU.
     uma_spilled: AtomicU64,
-    /// Whether the CURRENT weight load writes straight into VRAM through `rebar_type`. Decided
-    /// once per load in `weight_progress_scope` (needs `rebar_type` AND enough room on its heap
-    /// for the model), so a ReBAR-less box — or a model too big for the host-visible heap —
-    /// cleanly takes the staging-ring path instead. Only meaningful while a weight scope is open.
-    weights_direct: AtomicBool,
-    /// Reused staging ring for the NON-direct weight path (see [`StagingRing`]). Built lazily on
+    /// Reused staging ring for weight uploads (see [`StagingRing`]). Built lazily on
     /// the first staged weight upload of a load and torn down with the weight scope.
     staging_ring: Mutex<Option<StagingRing>>,
 }
@@ -275,10 +262,6 @@ impl Drop for VulkanShared {
             // Destroy command pool.
             let pool = *self.cmd_pool.lock().unwrap();
             self.device.destroy_command_pool(pool, None);
-            // Free the weight arena's device memory before destroying the device.
-            if let Some(arena) = self.weight_arena.lock().unwrap().as_mut() {
-                arena.destroy(&self.device);
-            }
             // Drop the allocator *before* destroying the device.
             ManuallyDrop::drop(&mut self.allocator);
             self.device.destroy_device(None);
@@ -292,34 +275,25 @@ impl Drop for VulkanShared {
 /// How a `VkBuffer`'s device memory is owned.
 enum Backing {
     /// A gpu-allocator sub-allocation — freed back to the allocator on drop (transient buffers,
-    /// host-visible staging/readback, and weights when no arena is reserved).
+    /// host-visible staging/readback).
     Pooled(ManuallyDrop<Allocation>),
-    /// Bump-allocated from the [`WeightArena`]. The arena block owns the memory; on drop the buffer
-    /// only destroys its own handle (the block frees the memory when the arena drops).
-    Arena,
-    /// A DEDICATED `VkDeviceMemory` this buffer owns outright, allocated from the ReBAR memory type
-    /// (`VulkanShared::rebar_type`) and PERSISTENTLY MAPPED: device-local VRAM that the host can
-    /// write through directly. This is the fast weight-load path — `upload` memcpys the GGUF bytes
-    /// straight into VRAM with no staging buffer, no `vkCmdCopyBuffer` and no queue stall. Freed
-    /// (unmapped + `vkFreeMemory`) on drop.
-    ///
-    /// Allocated per weight tensor rather than from one big arena because
-    /// `maxMemoryAllocationSize` is ~4 GiB on RADV — a single block for a 9 GiB (let alone
-    /// 21.9 GiB) model is impossible, and a chunked arena would strand the tail of every block.
-    /// Per-tensor `vkAllocateMemory` measured ~14 ms across a whole 443-tensor load, so there is
-    /// nothing to win by pooling here.
+    /// A DEDICATED `VkDeviceMemory` this buffer owns outright, PERSISTENTLY MAPPED — today only the
+    /// UNIFIED-MEMORY overflow spill (`spilled: true`, see `probe_uma_overflow_type`): a GpuOnly
+    /// buffer placed on the non-device-local heap once the synthetic device-local heap is full.
+    /// `upload` memcpys straight through the mapped pointer. Freed (unmapped + `vkFreeMemory`) on
+    /// drop.
     Vram {
         memory: vk::DeviceMemory,
         ptr: *mut u8,
-        /// True when this is a UNIFIED-MEMORY SPILL (see `probe_uma_overflow_type`) rather than a
-        /// ReBAR weight: the memory came from the non-device-local overflow heap, so it is charged
-        /// to `VulkanShared::uma_spilled` instead of `device_used`. Keeping the two counters apart
-        /// is what lets the spill decision ask "is the DEVICE-LOCAL heap full?" without the answer
-        /// being polluted by the bytes it already spilled elsewhere.
+        /// True when this is a UNIFIED-MEMORY SPILL (see `probe_uma_overflow_type`): the memory came
+        /// from the non-device-local overflow heap, so it is charged to `VulkanShared::uma_spilled`
+        /// instead of `device_used`. Keeping the two counters apart is what lets the spill decision
+        /// ask "is the DEVICE-LOCAL heap full?" without the answer being polluted by the bytes it
+        /// already spilled elsewhere.
         spilled: bool,
     },
-    /// A logical BYTE RANGE of a [`BdaWeightArena`] block's single big `vk::Buffer` (`INFR_RESIDENT_BDA=1`
-    /// resident weight sub-tensors — see [`VulkanBackend::bda_weight_alloc`]). Unlike every other
+    /// A logical BYTE RANGE of a [`BdaWeightArena`] block's single big `vk::Buffer` (resident weight
+    /// sub-tensors — see [`VulkanBackend::bda_weight_alloc`]). Unlike every other
     /// variant, `VkBuffer::buffer` here is NOT this handle's own object: it is the block's buffer,
     /// shared byte-for-byte with every other sub-tensor carved from the same block, and with the
     /// block's own keepalive copy. The `Arc` is what keeps the block (and therefore its memory and
@@ -364,7 +338,6 @@ impl VkBuffer {
     fn mapped_ptr(&self) -> Option<*mut u8> {
         match &self.backing {
             Backing::Pooled(a) => a.mapped_ptr().map(|p| p.as_ptr() as *mut u8),
-            Backing::Arena => None,
             Backing::Vram { ptr, .. } => Some(*ptr),
             // Defensive, not currently reachable: `bda_weight_alloc`'s blocks are plain `GpuOnly`
             // dedicated allocations (never host-mapped), so `buf.mapped_ptr()` is `None` today. If a
@@ -385,8 +358,7 @@ impl Drop for VkBuffer {
             match &mut self.backing {
                 Backing::Pooled(alloc) => {
                     let alloc = ManuallyDrop::take(alloc);
-                    // Keep the budget guard's fallback accounting balanced (arena buffers don't own
-                    // their memory — the arena block stays counted until the backend drops).
+                    // Keep the budget guard's fallback accounting balanced.
                     if self.location == MemoryLocation::GpuOnly {
                         self.shared
                             .device_used
@@ -394,9 +366,9 @@ impl Drop for VkBuffer {
                     }
                     self.shared.allocator.lock().unwrap().free(alloc).ok();
                 }
-                // A dedicated VkDeviceMemory we own outright: either a ReBAR weight (device-local)
-                // or a UMA spill (the overflow heap). Both are charged to the budget guard at
-                // allocation (see `make_buf_ex`) — balance the counter each was charged to.
+                // A dedicated VkDeviceMemory we own outright — today only the UMA overflow spill
+                // (`spilled: true`). Charged to the budget guard at allocation (see `make_buf_ex`) —
+                // balance the counter it was charged to.
                 Backing::Vram {
                     memory, spilled, ..
                 } => {
@@ -409,7 +381,6 @@ impl Drop for VkBuffer {
                     self.shared.device.unmap_memory(*memory);
                     self.shared.device.free_memory(*memory, None);
                 }
-                Backing::Arena => {}
                 // Shares the block's `vk::Buffer` handle byte-for-byte with every other sub-tensor
                 // and the block's own keepalive copy — this handle owns NEITHER the buffer object
                 // NOR its memory, only an `Arc` clone. Dropping the `Arc` (below, implicitly, when
@@ -461,67 +432,10 @@ const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
 );
 
-/// Overflow arena blocks (only allocated if the reserved block underflows the estimate) stay modest
-/// so a tiny estimate miss can't waste a whole second model-sized block.
+/// On-demand block size floor for a resident-BDA arena block (see [`BdaWeightArena`]) — big enough
+/// to amortize a dedicated `vkAllocateMemory` across a run of small tensors, small enough not to
+/// waste much on the tail.
 const ARENA_OVERFLOW_BLOCK: u64 = 64 * 1024 * 1024;
-
-/// Find the memory type for DIRECT-TO-VRAM weight writes ("Resizable BAR") — OPT-IN, see below.
-///
-/// The target is a `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` memory type on the device's
-/// LARGEST device-local heap: real VRAM the host can write straight through, so `upload` can
-/// memcpy a weight in with no staging buffer, no `vkCmdCopyBuffer` and no fence. Requiring the
-/// LARGEST device-local heap is what distinguishes true ReBAR from the legacy 256 MiB BAR window
-/// (without ReBAR, RADV still exposes a `DEVICE_LOCAL | HOST_VISIBLE` type, but on a separate tiny
-/// heap — allocating a 9 GiB model from it would exhaust it and silently spill into system RAM).
-///
-/// ## Why this is OFF by default: it is SLOWER than the staging ring. MEASURED, not assumed.
-///
-/// It is the obvious "one pass instead of two" optimization, and it loses. On a 7900 XTX
-/// (PCIe 4.0 x16), Qwen3-14B-Q4_K_M (~9 GiB of weights), warm page cache:
-///
-/// | weight-upload path                        | `upload` self | effective  | total load |
-/// |-------------------------------------------|---------------|------------|------------|
-/// | direct-to-VRAM, single-threaded memcpy     | 1.02 s        |  8.8 GB/s  | 2.01 s     |
-/// | direct-to-VRAM, parallel memcpy            | ~0.62 s       | ~14.5 GB/s | 1.57 s     |
-/// | reused staging ring ([`StagingRing`])      | 0.50 s        | ~18 GB/s   | 1.42 s     |
-///
-/// The catch is WHERE the host's stores land. Writing to ReBAR VRAM puts every byte on the PCIe
-/// bus AT MEMCPY TIME, through a write-combined mapping — one core saturates at ~8.8 GB/s, and even
-/// all cores together can't beat the link. The staging ring's memcpy instead lands in ordinary
-/// system RAM at full speed (~18 GB/s), and the PCIe crossing is done afterwards by the DMA
-/// engine — which OVERLAPS with the host filling the next chunk. So the "extra" copy is free: it
-/// buys you the ability to hide the bus behind the memcpy. Two overlapped passes beat one
-/// serialized pass over a slower bus.
-///
-/// Kept because it is a genuine win on hardware where the host↔device link is NOT the bottleneck
-/// (integrated/UMA GPUs, where "VRAM" is system RAM and the DMA is a pointless extra copy), and
-/// because it is the natural path for a future load that wants to skip host staging entirely.
-/// `INFR_REBAR=1` opts in; the default is the ring on every device.
-fn probe_rebar_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u32> {
-    if !std::env::var("INFR_REBAR").is_ok_and(|v| !v.is_empty() && v != "0") {
-        return None;
-    }
-    let want = vk::MemoryPropertyFlags::DEVICE_LOCAL
-        | vk::MemoryPropertyFlags::HOST_VISIBLE
-        | vk::MemoryPropertyFlags::HOST_COHERENT;
-    // The heap holding the bulk of VRAM.
-    let vram_heap = (0..mp.memory_heap_count)
-        .filter(|&h| {
-            mp.memory_heaps[h as usize]
-                .flags
-                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-        })
-        .max_by_key(|&h| mp.memory_heaps[h as usize].size)?;
-    (0..mp.memory_type_count).find(|&i| {
-        let t = mp.memory_types[i as usize];
-        t.property_flags.contains(want) && t.heap_index == vram_heap
-    })
-}
-
-/// The size of the heap backing memory type `ty`.
-fn heap_size_of(mp: &vk::PhysicalDeviceMemoryProperties, ty: u32) -> u64 {
-    mp.memory_heaps[mp.memory_types[ty as usize].heap_index as usize].size
-}
 
 /// The UMA OVERFLOW memory type: a host-visible type on a NON-device-local heap. `None` on a
 /// discrete GPU (never probed) and on any UMA part that doesn't expose one.
@@ -633,8 +547,7 @@ fn copy_to_mapped(src: &[u8], dst: *mut u8) {
     });
 }
 
-/// A ring of REUSED, fixed-size staging buffers — the DEFAULT weight-upload path on every device
-/// (it measured faster than writing straight into ReBAR VRAM; see [`probe_rebar_type`]).
+/// A ring of REUSED, fixed-size staging buffers — the weight-upload path on every device.
 ///
 /// The old path allocated a fresh DEDICATED staging buffer as large as each tensor, memcpy'd into
 /// it, submitted a copy, then `vkQueueWaitIdle`'d and freed it — per tensor. That serialized the
@@ -659,125 +572,13 @@ struct StagingRing {
 const RING_SLOTS: usize = 4;
 const RING_SLOT_BYTES: usize = 32 * 1024 * 1024;
 
-/// One large device-local memory block the weight arena bump-allocates from.
-struct ArenaBlock {
-    memory: vk::DeviceMemory,
-    size: u64,
-    cursor: u64,
-}
-
-/// Pre-reserved VRAM for load-once weights: N big blocks sized to the model (each ≤
-/// `maxMemoryAllocationSize` — a whole multi-GiB model can't be one `vkAllocateMemory`), bump-
-/// allocated since weights are never individually freed. Reserving the whole model up front makes
-/// it OWN its VRAM the instant the load starts and frees it in one shot.
-/// MoE-ready: a future expert-streaming mode can hold a second arena/pool and evict experts into it
-/// without disturbing the dense arena.
-struct WeightArena {
-    mem_type: u32,
-    blocks: Vec<ArenaBlock>,
-    /// Index of the block `bump` is currently filling. Weights bump sequentially and a single
-    /// tensor never straddles a block boundary, so once a tensor doesn't fit the current block the
-    /// cursor advances to the next PRE-RESERVED block (its tail is left as slack) — and only when
-    /// every reserved block is exhausted does `bump` grow a fresh overflow block. Monotonic: it
-    /// never revisits an earlier block. (The old single-`blocks.last()` bump stranded every
-    /// pre-reserved block but the last, double-committing VRAM — see `reserve_weights`.)
-    cur: usize,
-}
-
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-impl WeightArena {
-    /// Whether a `size`-at-`align` bump fits some ALREADY-COMMITTED block (the current one or a
-    /// later pre-reserved one) WITHOUT growing a fresh overflow block — i.e. whether
-    /// [`bump`](Self::bump) would commit new device memory. The budget guard checks this before
-    /// bumping so only real new commitments are charged against the budget.
-    fn fits(&self, size: u64, align: u64) -> bool {
-        self.blocks[self.cur.min(self.blocks.len())..]
-            .iter()
-            .any(|b| {
-                let off = b.cursor.div_ceil(align) * align;
-                off + size <= b.size
-            })
-    }
-
-    /// Bump-allocate `size` bytes at `align`. Walks the pre-reserved blocks from `cur` forward,
-    /// placing the tensor in the first that fits (advancing `cur` past any it overruns); if none
-    /// fit, grows a fresh overflow block (its bytes charged to `used` — the budget guard's fallback
-    /// accounting). Returns the device memory + offset to bind a buffer to.
-    fn bump(
-        &mut self,
-        device: &ash::Device,
-        size: u64,
-        align: u64,
-        used: &AtomicU64,
-    ) -> Result<(vk::DeviceMemory, u64)> {
-        // Try the current block, then walk forward through the remaining pre-reserved blocks.
-        while self.cur < self.blocks.len() {
-            let b = &mut self.blocks[self.cur];
-            let off = b.cursor.div_ceil(align) * align;
-            if off + size <= b.size {
-                b.cursor = off + size;
-                return Ok((b.memory, off));
-            }
-            // Doesn't fit here. Advance to the next pre-reserved block if there is one; otherwise
-            // drop out and grow an overflow block below.
-            if self.cur + 1 < self.blocks.len() {
-                self.cur += 1;
-                continue;
-            }
-            break;
-        }
-        let bs = size.max(ARENA_OVERFLOW_BLOCK);
-        let memory = unsafe {
-            device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(bs)
-                    .memory_type_index(self.mem_type),
-                None,
-            )
-        }
-        .map_err(|e| be(format!("arena overflow allocate_memory({bs}): {e}")))?;
-        used.fetch_add(bs, Ordering::Relaxed);
-        self.blocks.push(ArenaBlock {
-            memory,
-            size: bs,
-            cursor: size,
-        });
-        self.cur = self.blocks.len() - 1;
-        Ok((memory, 0))
-    }
-
-    /// Free all blocks. Must be called before `destroy_device`.
-    unsafe fn destroy(&mut self, device: &ash::Device) {
-        for b in self.blocks.drain(..) {
-            device.free_memory(b.memory, None);
-        }
-    }
-}
-
-// ── resident-BDA weight arena (INFR_RESIDENT_BDA) ──────────────────────────────
+// ── resident-BDA weight arena ──────────────────────────────────────────────────
 //
-// Allocation-side plumbing for moving resident weights out of per-tensor SSBOs and into big BDA
-// arena blocks — the same `bufferDeviceAddress` scheme the paged-MoE/dense-streaming kernels
-// already read weights through (see `pager.rs`, `alloc_arena_bda`), just applied to the RESIDENT
-// path instead of a paged/streamed one. Default ON (see [`resident_bda_enabled`]): every
-// `BufferUsage::Weights` alloc routes through here; `INFR_RESIDENT_BDA=0` is the escape hatch back
-// to the u32-SSBO paths, slated for removal with them (U4b, #73).
-
-/// Sub-allocate resident weight tensors from [`BdaWeightArena`] blocks (the 64-bit device-address
-/// weight path) instead of the plain per-tensor / [`WeightArena`] SSBO paths. Read once and cached:
-/// flipping the env var mid-process would split one model load's tensors across two allocation
-/// strategies, which nothing downstream (a sub-tensor's `Drop`/`device_addr`) expects to handle.
-///
-/// DEFAULT ON since this commit. `INFR_RESIDENT_BDA=0` (or an empty value) is a temporary escape
-/// hatch back to the old u32-SSBO descriptor path, slated for removal together with those u32 paths
-/// (U4b, #73). Only an explicit falsy value ("0" or empty) opts out; any other value keeps the
-/// default on.
-fn resident_bda_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("INFR_RESIDENT_BDA").map_or(true, |v| !v.is_empty() && v != "0")
-    })
-}
+// Allocation-side plumbing for resident weights: they live in big BDA arena blocks addressed by
+// 64-bit device address — the same `bufferDeviceAddress` scheme the paged-MoE/dense-streaming
+// kernels already read weights through (see `pager.rs`, `alloc_arena_bda`), applied to the RESIDENT
+// path. This is the ONLY weight path: every `BufferUsage::Weights` alloc routes through here (see
+// `make_alloc`).
 
 /// Byte alignment for resident-BDA weight sub-tensors within a block. Sub-tensors share one buffer
 /// object rather than getting their own `VkMemoryRequirements`, so this is a fixed constant rather
@@ -831,14 +632,12 @@ struct BdaArenaBlock {
     cursor: u64,
 }
 
-/// `INFR_RESIDENT_BDA=1` weight sub-allocator (see [`resident_bda_enabled`]). Unlike [`WeightArena`]
-/// (which pre-reserves the WHOLE model's footprint up front via `reserve_weights`), blocks here are
-/// created ON DEMAND as `bda_weight_alloc` calls outgrow the current block — this slice is pure
-/// allocation/upload plumbing and doesn't thread a loader's total through this path; an up-front
-/// version can be layered on top of the same block/bump primitives later. Each block is capped at
-/// `max_mem_alloc_size` (same reasoning as `WeightArena`'s block cap: a whole multi-GiB model can't
-/// be one `vkAllocateMemory`); a tensor never straddles a block boundary — one that doesn't fit the
-/// current block's remainder opens a fresh one.
+/// The resident-weight sub-allocator (the ONLY weight path — see `make_alloc`). Blocks are created
+/// ON DEMAND as `bda_weight_alloc` calls outgrow the current block; this is pure allocation/upload
+/// plumbing and doesn't thread a loader's total through this path, so an up-front-sized version can
+/// be layered on the same block/bump primitives later. Each block is capped at `max_mem_alloc_size`
+/// (a whole multi-GiB model can't be one `vkAllocateMemory`); a tensor never straddles a block
+/// boundary — one that doesn't fit the current block's remainder opens a fresh one.
 ///
 /// Sub-tensors CAN be bound as descriptors (unlike the paged-MoE/dense-streaming `alloc_arena_bda`
 /// blocks, which are only ever read by device address): `recorder::Recorder::vkb` binds each
@@ -883,9 +682,8 @@ pub struct VulkanBackend {
     /// arena/ring buffers free first; owned by the backend HANDLE, never `VulkanShared` — the Arc
     /// cycle lesson on `moe_pager`'s doc applies unchanged).
     dense_pager: crate::pager::DensePagerCell,
-    /// `INFR_RESIDENT_BDA=1` resident-weight sub-allocator (see [`BdaWeightArena`],
-    /// [`resident_bda_enabled`]) — `None` until the first resident-BDA weight alloc under the flag;
-    /// `make_alloc` routes `BufferUsage::Weights` here instead of `make_buf` when it is set.
+    /// Resident-weight sub-allocator (see [`BdaWeightArena`]) — `None` until the first weight alloc;
+    /// `make_alloc` routes every `BufferUsage::Weights` here (the sole weight path).
     ///
     /// Same drop-ordering/ownership story as `moe_pager`/`dense_pager` above and for the identical
     /// reason: each block's `BdaBlockHandle::buf` holds its own `Arc<VulkanShared>` clone, so
@@ -981,12 +779,10 @@ pub struct WeightProgress {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for WeightProgress {
     fn drop(&mut self) {
-        // Drain the staging ring FIRST: on the non-ReBAR path its copies are still in flight (we
-        // fence per slot instead of stalling the queue per tensor), and the weights must be fully
-        // resident before the loader records a forward. No-op on the direct-to-VRAM path, which
-        // never builds a ring.
+        // Drain the staging ring FIRST: its copies are still in flight (we fence per slot instead
+        // of stalling the queue per tensor), and the weights must be fully resident before the
+        // loader records a forward.
         self.shared.drain_staging_ring();
-        self.shared.weights_direct.store(false, Ordering::Relaxed);
         if let Some(pb) = self.shared.weight_pb.lock().unwrap().take() {
             pb.finish_and_clear();
         }
@@ -1853,11 +1649,7 @@ impl VulkanBackend {
         let push_descriptor =
             has_push_descriptor.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
 
-        // Direct-to-VRAM weight writes (Resizable BAR), if this device exposes the memory type.
-        // Probed once here; whether a given LOAD actually uses it is decided in
-        // `weight_progress_scope` (it also has to fit).
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let rebar_type = probe_rebar_type(&mem_props);
         // Probed for UMA parts ONLY — on a discrete card the non-device-local heap is host RAM
         // across PCIe and must never receive a GpuOnly buffer (see `probe_uma_overflow_type`).
         let uma_overflow_type = caps
@@ -1882,7 +1674,6 @@ impl VulkanBackend {
                 has_mem_budget,
                 max_mem_alloc_size,
                 push_descriptor,
-                weight_arena: Mutex::new(None),
                 linear_kernel: std::sync::OnceLock::new(),
                 kernels: Mutex::new(HashMap::new()),
                 pipeline_cache,
@@ -1890,10 +1681,8 @@ impl VulkanBackend {
                 weight_pb: Mutex::new(None),
                 device_used: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
-                rebar_type,
                 uma_overflow_type,
                 uma_spilled: AtomicU64::new(0),
-                weights_direct: AtomicBool::new(false),
                 staging_ring: Mutex::new(None),
             }),
         })
@@ -1944,82 +1733,10 @@ impl VulkanBackend {
     /// so a model loader cannot forget it; it only has to open the scope once. The returned guard
     /// finishes and clears the bar on drop, so the bar's lifetime is the loader's scope.
     fn weight_progress_scope(&self, total_bytes: Option<u64>) -> WeightProgress {
-        // Pick the weight-upload path for THIS load, from the device's actual memory properties.
-        //
-        // The DEFAULT is the reused, pipelined staging ring — it is both faster than direct-to-VRAM
-        // writes and available on every device (see `probe_rebar_type` for the measurements).
-        //
-        // Direct-to-VRAM (ReBAR, opt-in via INFR_REBAR=1) additionally requires:
-        //   * a DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type on the main VRAM heap
-        //     (`probe_rebar_type` — absent when ReBAR is off in the BIOS), and
-        //   * enough room on that heap for the model. `total_bytes` is the loader's weight
-        //     footprint; if it doesn't fit we take the ring rather than allocate until the heap
-        //     gives out. Unknown total (`None`) → assume it fits; a mid-load failure still falls
-        //     back gracefully (see `make_buf_ex`).
-        let direct = match self.shared.rebar_type {
-            Some(ty) => {
-                let mp = unsafe {
-                    self.shared
-                        .instance
-                        .get_physical_device_memory_properties(self.shared.physical_device)
-                };
-                total_bytes.is_none_or(|t| t <= heap_size_of(&mp, ty))
-            }
-            None => false,
-        };
-        self.shared.weights_direct.store(direct, Ordering::Relaxed);
-
-        // ── VRAM UP FRONT: pre-reserve the whole resident weight set as a bump arena ────────────
-        // Committing the footprint in a few big blocks (instead of dribbling one dedicated
-        // VkDeviceMemory per tensor) makes the model OWN its VRAM the instant the load starts — no
-        // window where another process can grab VRAM mid-load and no slow per-tensor climb in
-        // `mem_info_vram_used`. Every subsequent `Weights` alloc sub-allocates from the arena
-        // (`make_buf_ex`). Gated hard — reserve ONLY when:
-        //   * total is known (an indeterminate load can't be sized), and
-        //   * the model is FULLY RESIDENT: a paged-MoE (`moe_paged`) or dense-STREAMED
-        //     (`dense_paged`) model DELIBERATELY keeps most weights OUT of VRAM, and `total` here
-        //     counts the whole footprint — arena-ing it would reserve the entire model and OOM, or
-        //     make streamed placeholders land in the arena and corrupt. The pager was already
-        //     installed by `vulkan_moe_binder` before this scope opens, so these read true now, and
-        //   * NOT the direct-to-VRAM (ReBAR) path: those weights get their own mapped dedicated
-        //     allocations in `make_buf_ex` and never touch the arena — a reservation would just
-        //     double-commit the VRAM, and
-        //   * DISCRETE only: on a unified-memory part the device-local heap is a synthetic carveout
-        //     smaller than total DDR, and the per-tensor path's `uma_overflow_type` spill is what
-        //     places bytes on the other heap once it fills. A single big arena block can't spill
-        //     mid-block, so a resident UMA model over the carveout would just fail the reserve and
-        //     fall back anyway; reserving up front on shared DDR buys nothing (same memory, and the
-        //     "another process grabs it" race doesn't bite a shared pool the same way). Leave UMA
-        //     on the per-tensor spill path, which is already correct.
-        // On ANY failure `reserve_weights` rolls back to no arena and the per-tensor path takes over
-        // — the reservation is a pure optimization, never a load-blocker. `INFR_NO_WEIGHT_ARENA=1`
-        // forces that per-tensor fallback (an escape hatch for a fragmented heap where one big
-        // up-front block fails but many small allocs still succeed; also the A/B knob for the
-        // up-front-commit measurement).
-        let arena_off =
-            std::env::var("INFR_NO_WEIGHT_ARENA").is_ok_and(|v| !v.is_empty() && v != "0");
-        let arena_free = self.shared.weight_arena.lock().unwrap().is_none();
-        if let Some(total) = total_bytes {
-            if !arena_off
-                && arena_free
-                && !direct
-                && !self.shared.caps.unified_memory
-                && !self.moe_paged()
-                && !self.dense_paged()
-                // Resident-BDA routes every Weights alloc into its own arena (`bda_weight_alloc`)
-                // — pre-reserving the SSBO arena too would commit the model's footprint TWICE and
-                // trip the VRAM guard mid-load (caught live on Qwen3-30B-A3B).
-                && !resident_bda_enabled()
-            {
-                if let Err(e) = self.reserve_weights(total) {
-                    eprintln!(
-                        "[infr] weight arena reservation failed ({e}); \
-                         falling back to per-tensor weight allocation"
-                    );
-                }
-            }
-        }
-
+        // Weights are read by 64-bit device address and sub-allocate from the BDA arena
+        // (`bda_weight_alloc`, opened lazily on the first `Weights` alloc); there is no separate
+        // up-front SSBO reservation or ReBAR direct-write path to arm here. The upload path is the
+        // reused, pipelined staging ring (`upload_staged_ring`) on every device.
         let pb = infr_core::progress::bar(
             total_bytes,
             "loading weights",
@@ -2197,109 +1914,10 @@ impl VulkanBackend {
         })
     }
 
-    /// Pre-reserve `total` bytes of device-local VRAM as a bump arena for load-once weights, so the
-    /// whole model's weight memory is committed up front (a few big blocks, freed in one shot)
-    /// instead of dribbled out per-tensor. Subsequent `BufferUsage::Weights` allocs sub-allocate
-    /// from it. Call once after the footprint check, before uploading weights. On failure (e.g. no
-    /// contiguous block available) rolls back every block it took and leaves NO arena → callers
-    /// fall back to the per-tensor path (which no-ReBAR / tight-VRAM / UMA machines rely on).
-    ///
-    /// `total` cannot be one `vkAllocateMemory` for any real model — `maxMemoryAllocationSize` is
-    /// ~4 GiB on RADV, and a 9 GiB (let alone 21.9 GiB) model exceeds it. So the reservation is
-    /// split into N blocks each ≤ `max_mem_alloc_size`; the bump allocator sub-allocates a weight
-    /// across the block boundary transparently (`WeightArena::bump` never straddles a block — it
-    /// starts a fresh block when a tensor won't fit the current one, and grows overflow blocks if
-    /// the estimate underflows).
-    pub fn reserve_weights(&self, total: u64) -> Result<()> {
-        self.reserve_weights_capped(total, self.shared.max_mem_alloc_size)
-    }
-
-    /// [`reserve_weights`](Self::reserve_weights) with an explicit per-block cap — the production
-    /// path passes `max_mem_alloc_size`; tests pass a tiny cap to exercise the multi-block split
-    /// without committing multiple GiB of real VRAM.
-    fn reserve_weights_capped(&self, total: u64, block_cap: u64) -> Result<()> {
-        // Probe a weight-shaped buffer for its memory-type bits + alignment (identical for every
-        // weight buffer, since they all share BUFFER_USAGE).
-        let probe = unsafe {
-            self.shared.device.create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(4096)
-                    .usage(BUFFER_USAGE)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-        }
-        .map_err(|e| be(format!("arena probe buffer: {e}")))?;
-        let req = unsafe { self.shared.device.get_buffer_memory_requirements(probe) };
-        unsafe { self.shared.device.destroy_buffer(probe, None) };
-
-        let mem_type = self
-            .find_memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            .ok_or_else(|| be("no DEVICE_LOCAL memory type for weights"))?;
-        let align = req.alignment.max(1);
-        let total = total.next_multiple_of(align).max(align);
-        // Budget-check the WHOLE reservation up front — the point of reserving is to own the entire
-        // footprint, so refuse loudly here if it doesn't fit rather than after committing some
-        // blocks (the caller then falls back to per-tensor, which fails the same way tensor by
-        // tensor, but this keeps the up-front commitment honest).
-        self.check_vram_budget(total)?;
-
-        // Largest single allocation the device accepts, aligned down to the buffer alignment (an
-        // alloc slightly under the cap is safest — the exact limit can fail on a fragmented heap).
-        let block_cap = (block_cap / align * align).max(align);
-
-        let mut blocks: Vec<ArenaBlock> = Vec::new();
-        let mut remaining = total;
-        while remaining > 0 {
-            // Each block ≤ block_cap; the tail block is exactly the remainder.
-            let bs = remaining.min(block_cap);
-            let memory = match unsafe {
-                self.shared.device.allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(bs)
-                        .memory_type_index(mem_type),
-                    None,
-                )
-            } {
-                Ok(m) => m,
-                Err(e) => {
-                    // Roll back everything already committed and leave NO arena so the caller falls
-                    // back to the per-tensor path (never a partial arena — that would silently cap
-                    // the resident set at what happened to allocate).
-                    for b in &blocks {
-                        unsafe { self.shared.device.free_memory(b.memory, None) };
-                    }
-                    let taken: u64 = blocks.iter().map(|b| b.size).sum();
-                    if taken > 0 {
-                        self.shared.device_used.fetch_sub(taken, Ordering::Relaxed);
-                    }
-                    return Err(be(format!(
-                        "reserve_weights block {bs} bytes (of {total} total, {} blocks placed): {e}",
-                        blocks.len()
-                    )));
-                }
-            };
-            self.shared.device_used.fetch_add(bs, Ordering::Relaxed);
-            blocks.push(ArenaBlock {
-                memory,
-                size: bs,
-                cursor: 0,
-            });
-            remaining -= bs;
-        }
-
-        *self.shared.weight_arena.lock().unwrap() = Some(WeightArena {
-            mem_type,
-            blocks,
-            cur: 0,
-        });
-        Ok(())
-    }
-
-    /// Bind `buffer` to a fresh, PERSISTENTLY MAPPED dedicated allocation of memory type `ty`. Two
-    /// callers, distinguished by `spilled`: the ReBAR weight path (`false` — device-local VRAM the
-    /// host can write through) and the UMA overflow spill (`true` — the non-device-local heap of a
-    /// unified-memory part). See [`Backing::Vram`].
+    /// Bind `buffer` to a fresh, PERSISTENTLY MAPPED dedicated allocation of memory type `ty`. The
+    /// UNIFIED-MEMORY overflow spill (`spilled == true` — the non-device-local heap of a UMA part),
+    /// the sole caller today. See [`Backing::Vram`]. (`spilled == false` is still threaded for the
+    /// budget-accounting split described below, in case a device-local mapped caller returns.)
     ///
     /// The caller owns `buffer` and must destroy it if this returns `Err`. Budget-guarded and
     /// charged to `device_used` (or `uma_spilled` when `spilled`) like any other allocation.
@@ -2399,11 +2017,10 @@ impl VulkanBackend {
         Ok((Box::new(buf) as Box<dyn Buffer>, addr))
     }
 
-    /// Sub-allocate `size` bytes for a resident weight tensor from the `INFR_RESIDENT_BDA` arena
-    /// (see [`BdaWeightArena`], [`resident_bda_enabled`]). Bump-allocates within the current block
-    /// at [`BDA_WEIGHT_ALIGN`]; when the request doesn't fit the current block's remainder, opens a
-    /// fresh dedicated block (never splitting a tensor across two blocks — the same rule
-    /// `WeightArena::bump` follows for the plain SSBO arena). Returns a `VkBuffer` that shares the
+    /// Sub-allocate `size` bytes for a resident weight tensor from the BDA arena (see
+    /// [`BdaWeightArena`]). Bump-allocates within the current block at [`BDA_WEIGHT_ALIGN`]; when the
+    /// request doesn't fit the current block's remainder, opens a fresh dedicated block (never
+    /// splitting a tensor across two blocks). Returns a `VkBuffer` that shares the
     /// block's single `vk::Buffer` handle (`Backing::BdaSub`) with `sub_offset` set to this tensor's
     /// offset within it — see that variant's doc for why the handle must never be bound as a
     /// descriptor at its full range.
@@ -2495,8 +2112,7 @@ impl VulkanBackend {
     }
 
     /// Test-support hook: sub-allocate a resident-BDA weight tensor via [`Self::bda_weight_alloc`]
-    /// directly, bypassing `INFR_RESIDENT_BDA`/[`resident_bda_enabled`]'s process-global gate — the
-    /// same "construct the arena alloc directly, not via env" approach
+    /// directly — the same "construct the arena alloc directly" approach
     /// `resident_bda_weight_arena_roundtrip` (this module's own `#[cfg(test)]`) uses, exposed as
     /// `pub` so an external `tests/*.rs` integration binary (which only links the crate's public
     /// API, never its private items) can build a buffer whose `device_addr()` reports `Some` and
@@ -2525,12 +2141,11 @@ impl VulkanBackend {
         force_dedicated: bool,
         device_address: bool,
     ) -> Result<VkBuffer> {
-        // `device_address` (the paged-MoE arena only): add SHADER_DEVICE_ADDRESS so the buffer can
-        // be handed to a shader as a 64-bit pointer. Its backing memory gets the matching
-        // DEVICE_ADDRESS alloc flag from gpu-allocator (built with `buffer_device_address: true`),
-        // so this buffer must take the gpu-allocator path below — never the weight bump arena or
-        // the ReBAR mapped path, whose manual `allocate_memory` does not set that flag. The
-        // "moe-arena" label steers it clear of both (they key on label == "weights").
+        // `device_address` (the paged-MoE / resident-BDA arena blocks): add SHADER_DEVICE_ADDRESS
+        // so the buffer can be handed to a shader as a 64-bit pointer. Its backing memory needs the
+        // matching DEVICE_ADDRESS alloc flag — gpu-allocator sets it (built with
+        // `buffer_device_address: true`) on the pooled path below, and the UMA-overflow spill passes
+        // it through to `alloc_vram_mapped` explicitly.
         let usage = if device_address {
             vk::BufferUsageFlags::from_raw(
                 BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
@@ -2547,97 +2162,6 @@ impl VulkanBackend {
             .map_err(|e| be(format!("create_buffer: {e}")))?;
 
         let requirements = unsafe { self.shared.device.get_buffer_memory_requirements(buffer) };
-
-        // ── ReBAR fast path: a weight, during a load that chose direct-to-VRAM writes ──────────
-        // Allocate this tensor's VRAM from the host-visible device-local type and map it, so
-        // `upload` can memcpy the GGUF bytes straight in (no staging, no copy cmd, no stall).
-        // The memory is device-local, so it is budget-guarded and accounted exactly like a GpuOnly
-        // allocation — this changes WHERE weights are allocated from, not how much VRAM they take.
-        if label == "weights" && self.shared.weights_direct.load(Ordering::Relaxed) {
-            if let Some(ty) = self.shared.rebar_type {
-                // Only if the buffer's requirements actually permit that memory type.
-                if requirements.memory_type_bits & (1 << ty) != 0 {
-                    match self.alloc_vram_mapped(
-                        buffer,
-                        size,
-                        &requirements,
-                        ty,
-                        false,
-                        device_address,
-                    ) {
-                        Ok(b) => return Ok(b),
-                        Err(e) => {
-                            // Out of host-visible VRAM (or map failed): fall through to the normal
-                            // allocator rather than failing the load — the staging path still works.
-                            unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                            self.shared.weights_direct.store(false, Ordering::Relaxed);
-                            eprintln!(
-                                "[infr] direct-to-VRAM weight alloc failed ({e}); \
-                                 falling back to the staging ring for the rest of this load"
-                            );
-                            return self.make_buf_ex(
-                                size,
-                                location,
-                                label,
-                                force_dedicated,
-                                device_address,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Load-once weights (label "weights") bind into the pre-reserved bump arena when one exists
-        // — the whole model's VRAM is reserved up front (see `reserve_weights`). Everything else
-        // (transient activations, host-visible staging/readback, and weights with no arena) uses the
-        // gpu-allocator below.
-        if label == "weights" {
-            let mut arena = self.shared.weight_arena.lock().unwrap();
-            if let Some(a) = arena.as_mut() {
-                // A bump that fits the reserved block commits no NEW device memory (the block was
-                // budget-checked at reserve time); an overflow block does — guard it first.
-                if !a.fits(requirements.size, requirements.alignment) {
-                    if let Err(e) =
-                        self.check_vram_budget(requirements.size.max(ARENA_OVERFLOW_BLOCK))
-                    {
-                        unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                        return Err(e);
-                    }
-                }
-                match a.bump(
-                    &self.shared.device,
-                    requirements.size,
-                    requirements.alignment,
-                    &self.shared.device_used,
-                ) {
-                    Ok((memory, offset)) => {
-                        unsafe {
-                            self.shared
-                                .device
-                                .bind_buffer_memory(buffer, memory, offset)
-                        }
-                        .map_err(|e| {
-                            unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                            be(format!("arena bind_buffer_memory: {e}"))
-                        })?;
-                        return Ok(VkBuffer {
-                            shared: Arc::clone(&self.shared),
-                            buffer,
-                            backing: Backing::Arena,
-                            size,
-                            mem_size: requirements.size,
-                            location,
-                            sub_offset: 0,
-                        });
-                    }
-                    Err(e) => {
-                        unsafe { self.shared.device.destroy_buffer(buffer, None) };
-                        return Err(e);
-                    }
-                }
-            }
-        }
 
         // Large buffers (KV cache, big weights) get a DEDICATED exact-size VkDeviceMemory; otherwise
         // they sub-allocate into gpu-allocator's 256MB blocks and waste the remainder (e.g. 3×67MB
@@ -2817,11 +2341,10 @@ impl VulkanBackend {
     /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
     /// progress bar. Zero/poison filling is applied by the callers.
     fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
-        // Resident-BDA (default ON, `INFR_RESIDENT_BDA=0` opts out): resident weight tensors
-        // sub-allocate from the BDA arena instead of the ReBAR / `WeightArena` / gpu-allocator paths
-        // inside `make_buf` — see `bda_weight_alloc`. Every other `BufferUsage` (and the escape
-        // hatch off) is byte-for-byte the old behavior below.
-        if usage == BufferUsage::Weights && resident_bda_enabled() {
+        // Weights are addressed exclusively by 64-bit device address: every `BufferUsage::Weights`
+        // alloc sub-allocates from the BDA arena (`bda_weight_alloc`), the ONE weight path. Every
+        // other `BufferUsage` takes the gpu-allocator path in `make_buf` below.
+        if usage == BufferUsage::Weights {
             let buf = self.bda_weight_alloc(bytes)?;
             if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
                 pb.inc(bytes as u64);
@@ -2829,18 +2352,18 @@ impl VulkanBackend {
             return Ok(buf);
         }
         let (location, label) = match usage {
-            BufferUsage::Weights => (MemoryLocation::GpuOnly, "weights"),
+            BufferUsage::Weights => unreachable!("Weights routed to bda_weight_alloc above"),
             BufferUsage::Activations => (MemoryLocation::GpuOnly, "activations"),
             BufferUsage::Staging => (MemoryLocation::CpuToGpu, "staging"),
             BufferUsage::Readback => (MemoryLocation::GpuToCpu, "readback"),
-            // GpuToCpu = HOST_VISIBLE|HOST_CACHED system RAM (never the ReBAR device-local
-            // host-visible heap CpuToGpu prefers) — the point of the class is NOT living in VRAM.
+            // GpuToCpu = HOST_VISIBLE|HOST_CACHED system RAM — the point of the class is NOT
+            // living in VRAM.
             BufferUsage::HostWeights => (MemoryLocation::GpuToCpu, "host-weights"),
         };
         let buf = self.make_buf(bytes, location, label)?;
-        // Advance the weight-load progress bar (if active) — the single funnel every weight upload
-        // passes through, so no loader can forget to account for a tensor.
-        if matches!(usage, BufferUsage::Weights | BufferUsage::HostWeights) {
+        // Advance the weight-load progress bar for host-weights too (the single funnel every
+        // weight upload passes through, so no loader can forget to account for a tensor).
+        if matches!(usage, BufferUsage::HostWeights) {
             if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
                 pb.inc(bytes as u64);
             }
@@ -3091,13 +2614,11 @@ impl Backend for VulkanBackend {
         }
 
         // ── Direct write: any PERSISTENTLY MAPPED destination ─────────────────────────────────
-        // Host-visible staging/readback buffers as before, AND — the big one — ReBAR weights
-        // (`Backing::Vram`): device-local VRAM the host writes straight through. One pass over the
-        // bytes, no staging buffer, no `vkCmdCopyBuffer`, no queue stall. The memory is
-        // HOST_COHERENT (see `probe_rebar_type`) so no explicit flush is needed, and the host
-        // writes are made visible to the device by the implicit host-write domain operation that
-        // `vkQueueSubmit` performs — every weight is written long before the first forward is
-        // submitted.
+        // Host-visible staging/readback buffers, AND a UMA overflow-spill buffer (`Backing::Vram`):
+        // the host writes straight through the mapped pointer. One pass over the bytes, no staging
+        // buffer, no `vkCmdCopyBuffer`, no queue stall. The memory is HOST_COHERENT so no explicit
+        // flush is needed, and the host writes are made visible to the device by the implicit
+        // host-write domain operation that `vkQueueSubmit` performs.
         if let Some(ptr) = vk_dst.mapped_ptr() {
             copy_to_mapped(src, ptr);
             return Ok(());
@@ -3335,131 +2856,8 @@ mod tests {
         assert_eq!(select_coopmat_shape([(32, 32, 16)], true), None);
     }
 
-    /// Weight arena: reserve a small arena, allocate several `Weights` buffers from it (forcing both
-    /// the reserved block and at least one overflow block), and verify each round-trips bytes through
-    /// the staging copy path — proving arena buffers bind to valid, distinct memory regions.
-    #[test]
-    #[ignore = "requires a Vulkan-capable GPU"]
-    fn weight_arena_roundtrip() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
-        };
-        // Reserve only 1 MB so the later allocations spill into an overflow block.
-        be.reserve_weights(1024 * 1024).expect("reserve_weights");
-        let sizes = [4096usize, 256 * 1024, 4 * 1024 * 1024]; // last forces an overflow block
-        let mut bufs = Vec::new();
-        for (bi, &sz) in sizes.iter().enumerate() {
-            let data: Vec<u8> = (0..sz)
-                .map(|i| (i as u8).wrapping_add(bi as u8 * 31))
-                .collect();
-            let buf = be
-                .alloc(sz, BufferUsage::Weights)
-                .expect("arena weight alloc");
-            be.upload(buf.as_ref(), &data).expect("upload");
-            let mut back = vec![0u8; sz];
-            be.download(buf.as_ref(), &mut back).expect("download");
-            assert_eq!(
-                back, data,
-                "arena buffer {bi} (size {sz}) round-trip mismatch"
-            );
-            bufs.push(buf);
-        }
-        // All three buffers coexist (distinct memory) — re-download the first and re-check.
-        let mut back0 = vec![0u8; sizes[0]];
-        be.download(bufs[0].as_ref(), &mut back0)
-            .expect("re-download");
-        assert_eq!(
-            back0[1], 1u8,
-            "first arena buffer corrupted by later allocs"
-        );
-    }
-
-    /// Weight arena, MULTI-BLOCK reservation: reserve a `total` LARGER than one block (forcing the
-    /// up-front split in `reserve_weights_capped` to place several blocks), assert `blocks.len() > 1`
-    /// with distinct memory handles, then sub-allocate weight buffers that straddle the block
-    /// boundary and round-trip bytes through each — proving cross-block sub-allocation is
-    /// byte-correct. Uses a tiny per-block cap so the test commits only a few MiB, not GiB.
-    #[test]
-    #[ignore = "requires a Vulkan-capable GPU"]
-    fn weight_arena_multi_block() {
-        let be = match VulkanBackend::new() {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("skip: no Vulkan GPU");
-                return;
-            }
-        };
-        // Cap each block at 1 MiB and reserve 3.5 MiB → at least 4 blocks placed up front.
-        const CAP: u64 = 1024 * 1024;
-        const TOTAL: u64 = 7 * 512 * 1024; // 3.5 MiB
-        be.reserve_weights_capped(TOTAL, CAP)
-            .expect("reserve_weights_capped");
-        {
-            let arena = be.shared.weight_arena.lock().unwrap();
-            let a = arena.as_ref().expect("arena reserved");
-            assert!(
-                a.blocks.len() > 1,
-                "expected a multi-block reservation, got {} block(s)",
-                a.blocks.len()
-            );
-            // Every block's device memory handle must be distinct.
-            for i in 0..a.blocks.len() {
-                for j in (i + 1)..a.blocks.len() {
-                    assert_ne!(
-                        a.blocks[i].memory, a.blocks[j].memory,
-                        "arena blocks {i} and {j} share device memory"
-                    );
-                }
-            }
-            // The placed capacity must cover the whole request.
-            let placed: u64 = a.blocks.iter().map(|b| b.size).sum();
-            assert!(placed >= TOTAL, "placed {placed} < requested {TOTAL}");
-        }
-        // Sub-allocate several ~700 KiB weights: each is smaller than a 1 MiB block but the sequence
-        // forces `bump` to start fresh blocks (a weight never straddles a block), walking across the
-        // reserved blocks and into an overflow block. Round-trip each to prove the binding is valid.
-        let sizes = [
-            700 * 1024usize,
-            700 * 1024,
-            700 * 1024,
-            700 * 1024,
-            700 * 1024,
-        ];
-        let mut bufs = Vec::new();
-        for (bi, &sz) in sizes.iter().enumerate() {
-            let data: Vec<u8> = (0..sz)
-                .map(|i| (i as u8).wrapping_add(bi as u8 * 17))
-                .collect();
-            let buf = be
-                .alloc(sz, BufferUsage::Weights)
-                .expect("arena weight alloc");
-            be.upload(buf.as_ref(), &data).expect("upload");
-            let mut back = vec![0u8; sz];
-            be.download(buf.as_ref(), &mut back).expect("download");
-            assert_eq!(
-                back, data,
-                "arena buffer {bi} (size {sz}) round-trip mismatch"
-            );
-            bufs.push(buf);
-        }
-        // All coexist in distinct regions — re-check the first after the later allocs.
-        let mut back0 = vec![0u8; sizes[0]];
-        be.download(bufs[0].as_ref(), &mut back0)
-            .expect("re-download");
-        assert_eq!(
-            back0[3], 3u8,
-            "first arena buffer corrupted by later allocs"
-        );
-    }
-
-    /// Resident-BDA weight arena (`INFR_RESIDENT_BDA`): sub-allocate three odd-sized weight buffers
-    /// directly from `bda_weight_alloc` (bypassing the env flag / `resident_bda_enabled`'s
-    /// process-global `OnceLock` entirely, so this test can't race other tests that touch
-    /// `BufferUsage::Weights` in the same process), and verify:
+    /// Resident-BDA weight arena: sub-allocate three odd-sized weight buffers directly from
+    /// `bda_weight_alloc`, and verify:
     ///   * every sub-tensor reports `Some(device_addr)`,
     ///   * addresses are 256-byte aligned and strictly increasing within the (single, since the
     ///     three sizes together are far under `BDA_BLOCK_MIN`) block,
@@ -3467,8 +2865,7 @@ mod tests {
     ///     plumbing on both `upload` (staged one-shot path, no weight-load scope open) and
     ///     `download`,
     ///   * a plain `Activations` alloc through the ordinary `Backend::alloc` path still reports
-    ///     `device_addr() == None` — the flag only ever affects `Weights` allocs routed through
-    ///     `bda_weight_alloc`, never anything else.
+    ///     `device_addr() == None` — only `Weights` allocs route through `bda_weight_alloc`.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn resident_bda_weight_arena_roundtrip() {

@@ -1071,11 +1071,21 @@ fn lower_op(
                                    without offset-capable kernels"));
                 }
                 if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
+                    // The tiled prefill GEMM can't be output-row chunked (see the resident-GEMM
+                    // guard above) — a breaching streamed lm_head at m>16 fails loudly here.
+                    if crate::recorder::bda_weight_breaches(dt, in_f, out_f) {
+                        return Err(be(format!(
+                            "vulkan adapter: streamed output-projection GEMM (m={m}, in_f={in_f}, \
+                             out_f={out_f}, {dt:?}) reads a >= 2^32-element weight — chunked \
+                             dispatch covers only m=1 decode and the per-row GEMV (issue #77)."
+                        )));
+                    }
                     streamed_prefill_gemm(
                         be_, graph, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
                         transient,
                     )?;
                 } else {
+                    // GEMV path — chunk-covered inside `linear_native_at` for a breaching weight.
                     rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
                 }
                 return Ok(());
@@ -1344,6 +1354,21 @@ fn lower_op(
             let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
             let nc_fma =
                 nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_kernel_name(dt).is_some();
+            // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
+            // (decode m=1, or the per-input-row GEMV) — the tiled coopmat/nc GEMMs below decode a
+            // 64-row weight tile that can't be split into single input rows, so a breach on this
+            // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
+            // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
+            if (is_gemm || nc_mmq || nc_fma)
+                && crate::recorder::bda_weight_breaches(dt, in_f, out_f)
+            {
+                return Err(be(format!(
+                    "vulkan adapter: output-projection tiled GEMM (m={m}, in_f={in_f}, \
+                     out_f={out_f}, {dt:?}) reads a >= 2^32-element weight — chunked dispatch \
+                     covers only m=1 decode and the per-row GEMV (issue #77). This is a multi-row \
+                     lm_head (speculative verify / all-position logits) on a big-vocab model."
+                )));
+            }
             if is_gemm {
                 // GEMM writes ceil(m/64)*64 rows. Internal `dst` is row-padded → write direct;
                 // a non-Internal dst (e.g. the lm_head `logits` Output, unpadded) gets a padded
@@ -1733,7 +1758,12 @@ fn lower_op(
                 // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
                 // Wave32-native GPUs take the multi-warp dp4a route first (`mmv_mw_choice`); AMD
                 // falls through to the scalar GEMV (default) or the old mmv (INFR_MMV_DECODE=1).
-                let mw = if m == 1 {
+                // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
+                // (`linear_native`, the `else` below) but NOT on this multi-warp int8 dp4a mmv
+                // route — route a breaching weight to the chunked path rather than wrap its u32
+                // index (issue #77). Only lm_head/embed can breach; the tier skipped here matters
+                // only for a 256k-vocab model's single vocab GEMV.
+                let mw = if m == 1 && !crate::recorder::bda_weight_breaches(dt, in_f, out_f) {
                     mmv_mw_choice(be_.caps(), dt, in_f, out_f)
                 } else {
                     None
@@ -1788,6 +1818,12 @@ fn lower_op(
                     && in_f % 32 == 0
                     && in_f * out_f >= MMV_MIN_ELEMS
                     && crate::gemm::native_mmv_kernel_name(dt, false).is_some()
+                    // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
+                    // (`linear_native`, below) but NOT on this int8 dp4a mmv tier — route a
+                    // breaching weight to the chunked path rather than wrap its u32 index (issue
+                    // #77). Only lm_head/embed can breach, and the perf tier they skip here matters
+                    // only for a 256k-vocab model's single vocab GEMV.
+                    && !crate::recorder::bda_weight_breaches(dt, in_f, out_f)
                 {
                     let nblk = in_f / 32;
                     let qa = pooled(pool, be_, "mmv_qa", in_f)?;

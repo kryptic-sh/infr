@@ -251,6 +251,188 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
     bytes as u32
 }
 
+/// The u32 addressing-unit caps a single dense weight (or one output-row chunk of it) must stay
+/// under: `< 2^32` ELEMENTS (in-kernel element/word indices are u32 — see native_weight_addr.glsl)
+/// AND `< 2^32` BYTES (the `wi << 2` word→byte offset inside `arena_word` is also u32). Chunked
+/// dispatch (see [`Recorder::dispatch_gemv_chunked`]) splits an over-cap dense output projection
+/// (lm_head / embed) into output-row ranges each strictly under BOTH — the DISPATCH-level answer to
+/// a `>= 2^32`-element tensor that does NOT widen any in-kernel index (widening per-element indices
+/// to u64 was measured at a 2.4x RDNA3 regression — see the resident-BDA campaign). Both default to
+/// `2^32`; `INFR_BDA_CHUNK_ELEMS` / `INFR_BDA_CHUNK_BYTES` lower them to FORCE a normal model's
+/// lm_head/embed to split so the always-1-chunk path can be proven bitwise-identical to the split
+/// one on real hardware. `0` = uninitialised; a first read seeds it from the env (idempotent).
+const BDA_CHUNK_UNIT_MAX: u64 = 1 << 32;
+static BDA_CHUNK_ELEM_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BDA_CHUNK_BYTE_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn cap_from_env(cell: &std::sync::atomic::AtomicU64, var: &str) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = cell.load(Relaxed);
+    if v != 0 {
+        return v;
+    }
+    // Uninitialised: seed once from the env (default = the real u32 cap). Concurrent first-readers
+    // parse the same value and store it, so the race is benign.
+    let seeded = std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n >= 2) // a cap < 2 can never fit even one row → treat as unset
+        .unwrap_or(BDA_CHUNK_UNIT_MAX);
+    cell.store(seeded, Relaxed);
+    seeded
+}
+
+fn bda_chunk_elem_cap() -> u64 {
+    #[cfg(test)]
+    if let Some((e, _)) = test_chunk_cap_override() {
+        return e;
+    }
+    cap_from_env(&BDA_CHUNK_ELEM_CAP, "INFR_BDA_CHUNK_ELEMS")
+}
+
+fn bda_chunk_byte_cap() -> u64 {
+    #[cfg(test)]
+    if let Some((_, b)) = test_chunk_cap_override() {
+        return b;
+    }
+    cap_from_env(&BDA_CHUNK_BYTE_CAP, "INFR_BDA_CHUNK_BYTES")
+}
+
+// In-process cap override for the chunked-vs-unchunked GPU parity test (recorder `mod tests`).
+// Scoped to the calling thread (recording is synchronous on the test thread), so it is race-free
+// under parallel test execution and cannot be seen by any other test. Compiled only under
+// `cfg(test)` — production reads the env/atomic caps and pays nothing.
+#[cfg(test)]
+thread_local! {
+    static TEST_CHUNK_CAP: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+fn test_chunk_cap_override() -> Option<(u64, u64)> {
+    TEST_CHUNK_CAP.with(|c| c.get())
+}
+#[cfg(test)]
+fn with_bda_chunk_caps<R>(elem_cap: u64, byte_cap: u64, f: impl FnOnce() -> R) -> R {
+    let prev = TEST_CHUNK_CAP.with(|c| c.replace(Some((elem_cap, byte_cap))));
+    let r = f();
+    TEST_CHUNK_CAP.with(|c| c.set(prev));
+    r
+}
+
+/// Whether a `[out_f, in_f]` dense weight read at within-tensor element offset `w_base` breaches
+/// either u32 addressing cap and therefore needs chunked dispatch. Cheap (two multiplies + two
+/// relaxed atomic loads, no allocation, no env syscall after the first call) so it sits on the
+/// decode hot path in front of the LITERAL original single dispatch — the always-on chunk loop runs
+/// exactly one iteration (this returns `false`) for every current model.
+fn bda_gemv_needs_chunk(dtype: infr_core::DType, in_f: usize, out_f: usize, w_base: usize) -> bool {
+    let (block_elems, block_bytes) = infr_gguf::block_layout(dtype);
+    let whole_elems = w_base as u64 + (out_f as u64) * (in_f as u64);
+    // Row bytes are exact only when a row is a whole number of blocks (always true for a real weight
+    // row); if it somehow isn't, fall back to the element cap alone rather than mis-estimate bytes.
+    let whole_bytes = if in_f.is_multiple_of(block_elems) {
+        (out_f as u64) * ((in_f / block_elems) as u64) * (block_bytes as u64)
+    } else {
+        0
+    };
+    whole_elems >= bda_chunk_elem_cap() || whole_bytes >= bda_chunk_byte_cap()
+}
+
+/// Whether a `[out_f, in_f]` dense weight breaches a u32 addressing cap (at slice offset 0). The
+/// tiled-GEMM prefill tiers (coopmat / nc_mmq / nc_fma / streamed_prefill_gemm) cannot be
+/// output-row chunked the way the GEMV can (their 64-row M-tile is not decomposable into single
+/// input rows), so a breaching weight on those paths — a multi-row lm_head, i.e. MTP speculative
+/// verify or an all-position-logits request on a big-vocab model — must fail LOUDLY rather than
+/// wrap. The adapter guards the GEMM dispatch with this. (Decode m=1 and the per-row GEMV ARE
+/// chunk-covered — see [`Recorder::dispatch_gemv_chunked`].)
+pub(crate) fn bda_weight_breaches(dtype: infr_core::DType, in_f: usize, out_f: usize) -> bool {
+    bda_gemv_needs_chunk(dtype, in_f, out_f, 0)
+}
+
+/// The maximum output-row count of a `[out_f, in_f]` weight per addressing unit. See [`OutRowChunk`].
+const BDA_CHUNK_ROW_ALIGN: usize = 64;
+
+/// One contiguous run of output rows (weight rows / vocab logits) that a chunked dense GEMV
+/// dispatches together, plus the BYTE offset of its first row from the tensor's base address (added
+/// to the 64-bit arena base so the kernel's per-output element index stays chunk-local and u32).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutRowChunk {
+    /// First output row (element index into `out_f`) — always a multiple of [`BDA_CHUNK_ROW_ALIGN`]
+    /// so the f32 output/activation binding offset `o0 * 4` meets any device's
+    /// `minStorageBufferOffsetAlignment` (Vulkan spec max 256 bytes).
+    o0: usize,
+    /// Number of output rows in this chunk.
+    n: usize,
+    /// Byte offset of row `o0` from the tensor base (`chunk_base = tensor.device_addr() + byte_off`).
+    byte_off: u64,
+}
+
+/// Split the `out_f` output rows of a `[out_f, in_f]` dense weight into dispatch chunks each
+/// strictly under BOTH the element cap (`elem_cap`) and the byte cap (`byte_cap`). Returns a single
+/// whole-tensor chunk (`o0=0, n=out_f, byte_off=0`) whenever the tensor already fits — the
+/// zero-cost path for every current model. Chunk starts are [`BDA_CHUNK_ROW_ALIGN`]-aligned.
+///
+/// Errors (never loops forever) when a SINGLE output row already breaches a cap — `in_f >= elem_cap`
+/// or one row `>= byte_cap`, or a forced cap so small it can't hold even one aligned group of rows.
+/// A nonzero `w_base` (a fused-QKV slice offset) on a breaching tensor is rejected: the chunk base
+/// folds into the 64-bit arena address, leaving `w_base` for the shader's per-output index, and
+/// mixing a breaching tensor with a nonzero slice offset is not wired (no such tensor exists — only
+/// lm_head/embed breach, and they carry `w_base == 0`).
+fn bda_out_f_chunks(
+    dtype: infr_core::DType,
+    in_f: usize,
+    out_f: usize,
+    w_base: usize,
+    elem_cap: u64,
+    byte_cap: u64,
+) -> std::result::Result<Vec<OutRowChunk>, String> {
+    let (block_elems, block_bytes) = infr_gguf::block_layout(dtype);
+    if !in_f.is_multiple_of(block_elems) {
+        return Err(format!(
+            "chunk-split: in_f {in_f} is not a whole number of {dtype:?} blocks ({block_elems})"
+        ));
+    }
+    let row_elems = in_f as u64;
+    let row_bytes = ((in_f / block_elems) * block_bytes) as u64;
+    let whole_elems = w_base as u64 + (out_f as u64) * row_elems;
+    let whole_bytes = (out_f as u64) * row_bytes;
+    if whole_elems < elem_cap && whole_bytes < byte_cap {
+        return Ok(vec![OutRowChunk {
+            o0: 0,
+            n: out_f,
+            byte_off: 0,
+        }]);
+    }
+    if w_base != 0 {
+        return Err(format!(
+            "chunk-split: a breaching weight with a nonzero slice offset (w_base={w_base}) is \
+             unsupported — the chunk base folds into the 64-bit arena address"
+        ));
+    }
+    // Rows per chunk under each cap (strict `<`), then floored to the row alignment so every chunk
+    // start keeps the output/x binding offset device-aligned. A zero row size (impossible for a
+    // real weight — guarded only so the division can't trap) imposes no limit.
+    let by_elem = (elem_cap - 1).checked_div(row_elems).unwrap_or(u64::MAX);
+    let by_byte = (byte_cap - 1).checked_div(row_bytes).unwrap_or(u64::MAX);
+    let max_rows = (by_elem.min(by_byte) as usize) / BDA_CHUNK_ROW_ALIGN * BDA_CHUNK_ROW_ALIGN;
+    if max_rows == 0 {
+        return Err(format!(
+            "chunk-split: a single dense output row (in_f={in_f}, {row_bytes} bytes, {dtype:?}) \
+             cannot be split under the addressing caps (elems {elem_cap}, bytes {byte_cap}) — this \
+             tensor needs a wider addressing scheme, not chunking"
+        ));
+    }
+    let mut chunks = Vec::with_capacity(out_f.div_ceil(max_rows));
+    let mut o0 = 0usize;
+    while o0 < out_f {
+        chunks.push(OutRowChunk {
+            o0,
+            n: max_rows.min(out_f - o0),
+            byte_off: (o0 as u64) * row_bytes,
+        });
+        o0 += max_rows;
+    }
+    Ok(chunks)
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
@@ -815,6 +997,112 @@ impl<'a> Recorder<'a> {
             buffer: vb.buffer,
             offset: vb.sub_offset as u64,
             range,
+        }
+    }
+
+    /// [`Self::vkb`] with a leading f32-element offset, for binding one OUTPUT-row sub-range of an
+    /// ordinary activation buffer (`x` / residual / `y`) during chunked dense dispatch (see
+    /// [`Self::dispatch_gemv_chunked`]). The byte offset stays 256-byte aligned by construction —
+    /// chunk starts are [`BDA_CHUNK_ROW_ALIGN`]-aligned and, at m>1, `in_f`/`out_f` are asserted
+    /// multiples of that alignment — so it meets any device's `minStorageBufferOffsetAlignment`
+    /// (Vulkan spec max 256). `elem_off == 0` reproduces [`Self::vkb`] exactly for an ordinary
+    /// buffer, keeping the no-chunk fast path byte-identical. Never called on a resident-BDA weight
+    /// sub-tensor (those are read by 64-bit address, not bound).
+    fn vkb_off(b: &dyn Buffer, elem_off: usize) -> vk::DescriptorBufferInfo {
+        let vb = unsafe { as_vk_buf(b) };
+        debug_assert!(
+            !matches!(vb.backing, Backing::BdaSub(_)),
+            "vkb_off is for ordinary activation buffers, not resident-BDA weight sub-tensors"
+        );
+        vk::DescriptorBufferInfo {
+            buffer: vb.buffer,
+            offset: (elem_off as u64) * 4,
+            range: vk::WHOLE_SIZE,
+        }
+    }
+
+    /// Chunked twin of one `dispatch_wide` GEMV: when a `[out_f, in_f]` dense weight (lm_head /
+    /// embed) breaches a u32 addressing cap, split the dispatch into output-row chunks — each under
+    /// BOTH caps, its weight read from the pre-offset base `arena_addr + chunk.byte_off` (u64 base,
+    /// u32 in-kernel indices, NO widening) — and, at m>1, into single input rows so every
+    /// sub-dispatch writes a CONTIGUOUS slice of `y` bound at its own offset. Bitwise-identical to
+    /// the single big dispatch: each output row's dot-product reduction is independent of how the
+    /// output rows are partitioned across dispatches. The caller has already ruled out the no-chunk
+    /// case with [`bda_gemv_needs_chunk`], so this only runs on a genuinely over-cap projection.
+    /// `residual` present ⇒ the fused-add binding order `[filler, x, residual, y]`; absent ⇒
+    /// `[filler, x, y]`. `grid(chunk_n)` gives the workgroup count for a `chunk_n`-row chunk at ONE
+    /// input row. `push` carries `in_f` (`[4..8]`) and `w_base` (`[12..16]`) unchanged; this
+    /// overwrites `rows` (`[0..4]` → 1), `out_f` (`[8..12]`) and the arena base (`[16..24]`).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_gemv_chunked(
+        &self,
+        k: ComputeKernel,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        residual: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+        mut push: [u8; 24],
+        grid: impl Fn(u32) -> u32,
+    ) {
+        let chunks = bda_out_f_chunks(
+            dtype,
+            in_f,
+            out_f,
+            w_base,
+            bda_chunk_elem_cap(),
+            bda_chunk_byte_cap(),
+        )
+        .expect(
+            "chunked dense GEMV reached an un-chunkable weight — the load-time addressing guard \
+             (check_bda_element_cap / bda_weight_alloc) should have rejected it",
+        );
+        if rows > 1 {
+            // Per-row binding offsets (r*in_f for x, r*out_f for y/residual) must stay
+            // 256-byte aligned; the chunk-start alignment only covers o0.
+            assert!(
+                in_f.is_multiple_of(BDA_CHUNK_ROW_ALIGN)
+                    && out_f.is_multiple_of(BDA_CHUNK_ROW_ALIGN),
+                "chunked dense GEMV at m>1 needs in_f/out_f multiples of {BDA_CHUNK_ROW_ALIGN} to \
+                 keep every per-row binding offset device-aligned (in_f={in_f}, out_f={out_f})"
+            );
+        }
+        if std::env::var("INFR_DEBUG_BDA_CHUNK").is_ok() {
+            eprintln!(
+                "[infr] dispatch_gemv_chunked {dtype:?} rows={rows} in_f={in_f} out_f={out_f} \
+                 -> {} chunks (caps: elems {}, bytes {})",
+                chunks.len(),
+                bda_chunk_elem_cap(),
+                bda_chunk_byte_cap()
+            );
+        }
+        push[0..4].copy_from_slice(&1u32.to_ne_bytes()); // each sub-dispatch is a single input row
+        for r in 0..rows {
+            for c in &chunks {
+                let base = arena_addr + c.byte_off;
+                push[8..12].copy_from_slice(&(c.n as u32).to_ne_bytes());
+                push[16..20].copy_from_slice(&(base as u32).to_ne_bytes());
+                push[20..24].copy_from_slice(&((base >> 32) as u32).to_ne_bytes());
+                let out_off = r * out_f + c.o0;
+                let xb = Self::vkb_off(x, r * in_f);
+                let yb = Self::vkb_off(y, out_off);
+                match residual {
+                    Some(res) => self.dispatch_wide(
+                        k,
+                        &[Self::vkb(x), xb, Self::vkb_off(res, out_off), yb],
+                        1,
+                        &push,
+                        grid(c.n as u32),
+                    ),
+                    None => {
+                        self.dispatch_wide(k, &[Self::vkb(x), xb, yb], 1, &push, grid(c.n as u32))
+                    }
+                }
+            }
         }
     }
 
@@ -2310,6 +2598,26 @@ impl<'a> Recorder<'a> {
         // uint64_t member forces; see native_weight_addr.glsl). `w_base` rides on top unchanged.
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        // Chunked dispatch when the weight breaches a u32 addressing cap (a `>= 2^32`-element
+        // lm_head/embed); the always-on check is `false` for every current model, taking the
+        // literal single dispatch below unchanged.
+        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base) {
+            self.dispatch_gemv_chunked(
+                k,
+                dtype,
+                arena_addr,
+                w_base,
+                x,
+                None,
+                y,
+                rows,
+                in_f,
+                out_f,
+                push,
+                |n| n,
+            );
+            return;
+        }
         // Binding 0 = `x` (small filler, unread by the STREAMED shader); 1 = x; 2 = y (the sole
         // write, kept LAST so `dispatch_wide`'s tail-n_out split marks it the write).
         self.dispatch_wide(
@@ -2411,6 +2719,23 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base) {
+            self.dispatch_gemv_chunked(
+                k,
+                dtype,
+                arena_addr,
+                w_base,
+                x,
+                None,
+                y,
+                1,
+                in_f,
+                out_f,
+                push,
+                |n| n.div_ceil(nr),
+            );
+            return;
+        }
         self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
@@ -2447,6 +2772,23 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base) {
+            self.dispatch_gemv_chunked(
+                k,
+                dtype,
+                arena_addr,
+                w_base,
+                x,
+                None,
+                y,
+                1,
+                in_f,
+                out_f,
+                push,
+                |n| n.div_ceil(rm),
+            );
+            return;
+        }
         self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
@@ -2483,6 +2825,23 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        if bda_gemv_needs_chunk(dtype, in_f, out_f, w_base) {
+            self.dispatch_gemv_chunked(
+                k,
+                dtype,
+                arena_addr,
+                w_base,
+                x,
+                None,
+                y,
+                1,
+                in_f,
+                out_f,
+                push,
+                |n| n.div_ceil(2),
+            );
+            return;
+        }
         self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
@@ -2805,15 +3164,49 @@ impl<'a> Recorder<'a> {
         let arena_addr = table
             .device_addr()
             .expect("resident-BDA weight: embed_gather requires a u64 BDA embedding table address");
-        self.embed_gather_at(dtype, arena_addr, ids, dst, rows, ne, scale);
+        // A table whose element count `>= 2^32` (a 256k-vocab frontier model) would wrap the
+        // shader's u32 `ids*ne` row base — pass the row byte stride so it folds `ids` into the
+        // 64-bit table base instead (issue #77). Every current table fits u32 → `row_bytes = 0` →
+        // the shader keeps its original element-offset path, byte-identical (incl. gemma's
+        // non-word-aligned quant rows, which the 64-bit fold could not honor). The fold requires a
+        // word-aligned row stride, asserted loudly ONLY when it actually engages.
+        let (block_elems, block_bytes) = infr_gguf::block_layout(dtype);
+        assert!(
+            ne.is_multiple_of(block_elems),
+            "embed_gather: table row (ne={ne}) is not a whole number of {dtype:?} blocks ({block_elems})"
+        );
+        let row_stride = (ne / block_elems) * block_bytes;
+        let vocab = table.len_bytes() / row_stride.max(1);
+        // Fold when the table's element count reaches the addressing cap (the `ids*ne` u32 base
+        // would wrap). Driving this off `bda_chunk_elem_cap` — not a hardcoded 2^32 — lets
+        // `INFR_BDA_CHUNK_ELEMS` force the fold path on a normal model, so the forced-chunking proof
+        // exercises BOTH the lm_head GEMV split and this embed fold in one run.
+        let row_bytes = if (vocab as u64) * (ne as u64) >= bda_chunk_elem_cap() {
+            assert!(
+                row_stride.is_multiple_of(4),
+                "embed_gather: a >= 2^32-element {dtype:?} table (vocab={vocab}, ne={ne}) has a \
+                 non-word-aligned row stride ({row_stride} bytes) — the 64-bit-based gather it needs \
+                 would misalign the buffer_reference reads; this table is unsupported"
+            );
+            row_stride as u32
+        } else {
+            0 // fits u32: keep the original element-offset gather path
+        };
+        if row_bytes != 0 && std::env::var("INFR_DEBUG_BDA_CHUNK").is_ok() {
+            eprintln!(
+                "[infr] embed_gather {dtype:?} vocab={vocab} ne={ne} -> 64-bit row-base fold \
+                 (row_bytes={row_bytes})"
+            );
+        }
+        self.embed_gather_at(dtype, arena_addr, ids, dst, rows, ne, scale, row_bytes);
     }
 
     /// `-DSTREAMED` twin of [`Self::embed_gather`] (slice A5 build-variant: see
     /// `crate::gemm::embed_gather_spv`). The token-embedding table is read from a
     /// resident `bufferDeviceAddress` arena instead of a bound SSBO — binding 0 (the resident
     /// build's weight SSBO) takes a harmless FILLER (`ids`) since the arena is never bound as a
-    /// descriptor. Not wired into any production dispatch yet; exists so a parity test can
-    /// exercise the `_streamed` SPV directly.
+    /// descriptor. `row_bytes` is the mode selector (0 = element-offset gather for a u32-fitting
+    /// table; nonzero = 64-bit row-base fold for a `>= 2^32`-element table — see the `.comp` PC doc).
     #[allow(clippy::too_many_arguments)]
     pub fn embed_gather_at(
         &self,
@@ -2824,17 +3217,19 @@ impl<'a> Recorder<'a> {
         rows: usize,
         ne: usize,
         scale: f32,
+        row_bytes: u32,
     ) {
         let (name, spv) = crate::gemm::embed_gather_spv(dtype).expect("embed_gather streamed spv");
-        let k = self.be.kernel(name, spv, 3, 20);
-        let mut push = [0u8; 20];
+        let k = self.be.kernel(name, spv, 3, 24);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&scale.to_ne_bytes());
         // Arena base BYTE address (lo/hi split — a uvec2 avoids the 8-byte push alignment a
-        // uint64_t member forces; see native_weight_addr.glsl), appended LAST.
+        // uint64_t member forces; see native_weight_addr.glsl), appended before row_bytes.
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&row_bytes.to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(ids), Self::vkb(ids), Self::vkb(dst)],
@@ -7691,6 +8086,161 @@ impl Drop for PendingSegment {
 }
 
 #[cfg(test)]
+mod chunk_math_tests {
+    //! Pure geometry tests for the chunked-dispatch split (`bda_out_f_chunks`) — no GPU. Proves the
+    //! output-row chunking stays under both u32 addressing caps, covers every row exactly once,
+    //! keeps chunk starts binding-offset aligned, and fails loudly (never loops) on an un-chunkable
+    //! single row. This is the math a `>= 2^32`-element lm_head/embed relies on to run at all.
+    use super::{bda_out_f_chunks, OutRowChunk, BDA_CHUNK_ROW_ALIGN};
+    use infr_core::DType;
+
+    const CAP: u64 = 1 << 32; // the production element/byte cap
+
+    fn assert_covers(
+        chunks: &[OutRowChunk],
+        out_f: usize,
+        in_f: usize,
+        dtype: DType,
+        byte_cap: u64,
+    ) {
+        let (be, bb) = infr_gguf::block_layout(dtype);
+        let row_bytes = ((in_f / be) * bb) as u64;
+        // Contiguous, gap-free cover of [0, out_f) with aligned, cap-respecting chunks.
+        let mut next = 0usize;
+        for c in chunks {
+            assert_eq!(c.o0, next, "chunks must be contiguous");
+            assert_eq!(
+                c.o0 % BDA_CHUNK_ROW_ALIGN,
+                0,
+                "chunk start must be row-aligned"
+            );
+            assert_eq!(
+                c.byte_off,
+                (c.o0 as u64) * row_bytes,
+                "byte_off = o0 * row_bytes"
+            );
+            assert!(c.n >= 1);
+            assert!(
+                (c.n as u64) * (in_f as u64) < CAP,
+                "chunk elements under the cap"
+            );
+            assert!(
+                (c.n as u64) * row_bytes < byte_cap,
+                "chunk bytes under the cap"
+            );
+            next += c.n;
+        }
+        assert_eq!(
+            next, out_f,
+            "chunks must cover every output row exactly once"
+        );
+    }
+
+    #[test]
+    fn whole_tensor_is_one_chunk_at_production_caps() {
+        // A real 151936-vocab x 5120 lm_head (778M elems, ~1.5 GiB Q4_K) fits under both caps: one
+        // chunk, byte_off 0 — byte-identical to the unchunked dispatch. Every shipping model.
+        let c = bda_out_f_chunks(DType::Q4K, 5120, 151936, 0, CAP, CAP).unwrap();
+        assert_eq!(
+            c,
+            vec![OutRowChunk {
+                o0: 0,
+                n: 151936,
+                byte_off: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn breaching_lm_head_splits_and_covers() {
+        // 262144-vocab x 16384 hidden = 4.295G elems (> 2^32) at Q4_K (~2.3 GiB, under the byte
+        // cap): the first plausible real breach. Must split on element boundaries and cover fully.
+        let (in_f, out_f) = (16384, 262144);
+        let c = bda_out_f_chunks(DType::Q4K, in_f, out_f, 0, CAP, CAP).unwrap();
+        assert!(c.len() >= 2, "a 4.3G-element tensor must split");
+        assert_covers(&c, out_f, in_f, DType::Q4K, CAP);
+    }
+
+    #[test]
+    fn exact_cap_and_one_below() {
+        // `< cap` is strict: a whole-tensor element count of exactly 2^32 splits; 2^32 - align does
+        // not. Use F16 (1 elem/row-unit) with in_f == align so out_f is the element count / align.
+        let in_f = BDA_CHUNK_ROW_ALIGN; // 64
+        let at_cap = (CAP / in_f as u64) as usize; // out_f * in_f == 2^32 exactly
+        let split = bda_out_f_chunks(DType::F16, in_f, at_cap, 0, CAP, u64::MAX).unwrap();
+        assert!(split.len() >= 2, "exactly-at-cap must split");
+        assert_covers(&split, at_cap, in_f, DType::F16, u64::MAX);
+        // One aligned group of rows below the cap still fits in a single chunk.
+        let below = bda_out_f_chunks(DType::F16, in_f, at_cap - in_f, 0, CAP, u64::MAX).unwrap();
+        assert_eq!(below.len(), 1);
+    }
+
+    #[test]
+    fn one_over_cap_splits() {
+        let in_f = 1024usize;
+        let out_f = (CAP / in_f as u64) as usize + 1; // one row past 2^32 elements
+        let c = bda_out_f_chunks(DType::F16, in_f, out_f, 0, CAP, u64::MAX).unwrap();
+        assert!(c.len() >= 2);
+        assert_covers(&c, out_f, in_f, DType::F16, u64::MAX);
+    }
+
+    #[test]
+    fn non_divisible_row_count_has_remainder_tail() {
+        // A forced-small cap that yields max_rows = 640, out_f = 2000 → 640,640,640,80.
+        let (in_f, out_f) = (1024usize, 2000usize);
+        let elem_cap = 640 * 1024 + 5; // by_elem floor(645/1024*... )-> 640 rows
+        let c = bda_out_f_chunks(DType::F16, in_f, out_f, 0, elem_cap as u64, u64::MAX).unwrap();
+        assert_covers(&c, out_f, in_f, DType::F16, u64::MAX);
+        assert_eq!(
+            c.last().unwrap().n,
+            out_f % 640,
+            "the tail chunk is the remainder"
+        );
+        assert!(c.last().unwrap().n < 640);
+    }
+
+    #[test]
+    fn byte_cap_binds_before_element_cap_for_f16() {
+        // F16 is 2 bytes/elem, so the 4 GiB byte cap trips at 2^31 elements — half the element cap.
+        // With the element cap lifted, chunking is driven purely by bytes.
+        let (in_f, out_f) = (2048usize, 1_500_000usize); // 3.07G elems, 6.14 GiB
+        let c = bda_out_f_chunks(DType::F16, in_f, out_f, 0, u64::MAX, CAP).unwrap();
+        assert!(
+            c.len() >= 2,
+            "the byte cap must force a split even below the element cap"
+        );
+        assert_covers(&c, out_f, in_f, DType::F16, CAP);
+    }
+
+    #[test]
+    fn single_row_too_big_errors_no_infinite_loop() {
+        // A single row that already breaches (in_f itself past the element cap) is un-chunkable —
+        // it must Err, not loop forever trying to fit a zero-row chunk.
+        let huge_in_f = (CAP as usize) + 4096; // one row >= 2^32 elements
+        assert!(bda_out_f_chunks(DType::F16, huge_in_f, 10, 0, CAP, u64::MAX).is_err());
+        // Same guard under a forced-tiny cap smaller than one aligned group of rows.
+        assert!(bda_out_f_chunks(DType::F16, 4096, 10, 0, 4096, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn nonzero_slice_offset_on_breach_errors() {
+        // A breaching tensor with a nonzero within-tensor slice offset (fused-QKV) is unsupported —
+        // no such tensor exists (only lm_head/embed breach, at w_base 0), and the chunk base folds
+        // into the arena address, so mixing the two must fail loudly rather than mis-address.
+        let out_f = (CAP / 1024) as usize + 1;
+        assert!(bda_out_f_chunks(DType::F16, 1024, out_f, 512, CAP, u64::MAX).is_err());
+        // A nonzero offset on a NON-breaching tensor is fine (the common fused-QKV case).
+        assert!(bda_out_f_chunks(DType::F16, 1024, 4096, 512, CAP, CAP).is_ok());
+    }
+
+    #[test]
+    fn in_f_not_block_multiple_errors() {
+        // A row that isn't a whole number of blocks would mis-map byte offsets — reject.
+        assert!(bda_out_f_chunks(DType::Q4K, 100, 4096, 0, CAP, CAP).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
@@ -8903,6 +9453,141 @@ mod tests {
             );
             rec.finish().unwrap();
             check(bc.as_ref(), n, label);
+        }
+    }
+
+    // ── chunked dense GEMV parity (issue #77) ────────────────────────────────────────────────────
+    // Proves the DISPATCH-level output-row chunking (`dispatch_gemv_chunked`) is BITWISE-identical
+    // to the single unchunked dispatch of the SAME kernel — the whole guarantee that lets a
+    // `>= 2^32`-element lm_head/embed run without widening any in-kernel index. Forces chunking on a
+    // small synthetic weight via the thread-local cap override (`with_bda_chunk_caps`), so it needs
+    // no `>4 GiB` tensor. Runs under the validation layer with zero VUIDs (same as the sibling
+    // weight_addr_parity suite). Covers m=1 (decode, the always-run path) and m>1 (the per-input-row
+    // decompose), a remainder tail (non-divisible row count), and the non-zero arena offset.
+    fn synth_w_bytes(n: usize, seed: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| {
+                let h = (i.wrapping_mul(2654435761) ^ seed.wrapping_mul(40503)) >> 7;
+                (h % 0x40) as u8
+            })
+            .collect()
+    }
+
+    /// One chunked-vs-unchunked leg: dispatch `linear_native_at` unchunked (production caps) and
+    /// chunked (a forced elem cap of ~`chunk_rows` rows) against the SAME arena weight, return both
+    /// output-bit vectors. `arena_prefix` parks the weight behind a garbage prefix at a non-zero
+    /// arena offset (exercises the folded chunk base + the address split together).
+    fn chunked_gemv_bits(
+        be: &VulkanBackend,
+        dtype: infr_core::DType,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+        chunk_rows: usize,
+        arena_prefix: usize,
+    ) -> (Vec<u32>, Vec<u32>) {
+        use infr_core::backend::BufferUsage;
+        let (be_blk, bb) = infr_gguf::block_layout(dtype);
+        let w_bytes = (in_f * out_f) / be_blk * bb;
+        let w = synth_w_bytes(w_bytes, in_f * 31 + out_f * 7 + rows);
+        let x: Vec<f32> = (0..rows * in_f)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
+        let x_buf = be.alloc(rows * in_f * 4, BufferUsage::Activations).unwrap();
+        be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        // Weight parked at a block-aligned, 256-aligned non-zero offset in a shared arena.
+        let prefix = arena_prefix.div_ceil(bb.max(256)) * bb.max(256);
+        let prefix = prefix.div_ceil(256) * 256;
+        let mut backing = synth_w_bytes(prefix, 0xBAD);
+        backing.extend_from_slice(&w);
+        let (arena, addr0) = be.alloc_arena_bda(backing.len()).unwrap();
+        be.upload(arena.as_ref(), &backing).unwrap();
+        let addr = addr0 + prefix as u64;
+
+        let run = |chunked: bool| -> Vec<u32> {
+            let y = be
+                .alloc(rows * out_f * 4, BufferUsage::Activations)
+                .unwrap();
+            let rec = be.recorder().unwrap();
+            let go = || {
+                rec.linear_native_at(
+                    dtype,
+                    addr,
+                    0,
+                    x_buf.as_ref(),
+                    y.as_ref(),
+                    rows,
+                    in_f,
+                    out_f,
+                )
+            };
+            if chunked {
+                // Force ~chunk_rows rows/chunk (byte cap left wide so the element cap drives it).
+                with_bda_chunk_caps((chunk_rows * in_f + 1) as u64, u64::MAX, go);
+            } else {
+                go();
+            }
+            rec.finish().unwrap();
+            let mut out = vec![0u8; rows * out_f * 4];
+            be.download(y.as_ref(), &mut out).unwrap();
+            bytemuck::cast_slice::<u8, u32>(&out).to_vec()
+        };
+        (run(false), run(true))
+    }
+
+    fn assert_chunk_parity(
+        be: &VulkanBackend,
+        dtype: infr_core::DType,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+        chunk_rows: usize,
+        off: usize,
+    ) {
+        // Sanity: this shape MUST actually split under the forced cap (else the test proves nothing).
+        let chunks = bda_out_f_chunks(
+            dtype,
+            in_f,
+            out_f,
+            0,
+            (chunk_rows * in_f + 1) as u64,
+            u64::MAX,
+        )
+        .unwrap();
+        assert!(
+            chunks.len() >= 2,
+            "{dtype:?} r{rows} {in_f}x{out_f}: forced cap did not split (got {} chunk)",
+            chunks.len()
+        );
+        let (unchunked, chunked) = chunked_gemv_bits(be, dtype, rows, in_f, out_f, chunk_rows, off);
+        assert!(
+            unchunked.iter().any(|&b| b != 0),
+            "{dtype:?} r{rows} {in_f}x{out_f}: unchunked output is all zeros — kernel not exercised"
+        );
+        assert_eq!(
+            unchunked,
+            chunked,
+            "{dtype:?} r{rows} {in_f}x{out_f} chunk_rows={chunk_rows} off={off}: chunked dispatch \
+             ({} chunks) is NOT bitwise-identical to the unchunked dispatch",
+            chunks.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn chunked_dense_gemv_matches_unchunked() {
+        let be = VulkanBackend::new().unwrap();
+        for dtype in [
+            infr_core::DType::Q4K,
+            infr_core::DType::Q6K,
+            infr_core::DType::Q8_0,
+        ] {
+            // m=1 decode, even split (256 rows → 4×64) at arena offset 0.
+            assert_chunk_parity(&be, dtype, 1, 512, 256, 64, 0);
+            // m=1 decode, REMAINDER tail (200 rows → 64,64,64,8), non-zero arena offset.
+            assert_chunk_parity(&be, dtype, 1, 512, 200, 64, 4096);
+            // m>1 (per-input-row decompose), out_f 64-aligned, non-zero offset.
+            assert_chunk_parity(&be, dtype, 3, 512, 256, 64, 8192);
         }
     }
 }

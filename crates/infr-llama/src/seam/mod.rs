@@ -450,6 +450,23 @@ fn check_bda_element_cap(name: &str, unit: &str, elems: usize) -> AResult<()> {
     Ok(())
 }
 
+/// The dense weights whose ONLY GPU consumers are the chunk-covered dispatches (issue #77): the
+/// output projection's decode GEMV and `Op::EmbedGather`, both of which split a `>= 2^32`-element
+/// tensor into output-row chunks at dispatch time (`infr_vulkan`'s `dispatch_gemv_chunked` /
+/// `embed_gather`, u64 per-row base). These may exceed the u32 ELEMENT cap; every OTHER dense
+/// tensor keeps the loud whole-tensor `check_bda_element_cap`, and the 4 GiB BYTE cap in
+/// `bda_weight_alloc` still bounds the single contiguous allocation for ALL of them (so an
+/// over-cap table must be low-bpw enough to fit — a quantized frontier 256k-vocab lm_head).
+/// `output.weight` = the untied lm_head; `token_embd.weight` = the input embedding (and the TIED
+/// lm_head, read by both `Op::EmbedGather` and the lm_head `Op::Linear`);
+/// `per_layer_token_embd.weight` = gemma4-E2B's per-layer gather table.
+fn chunk_covered_dense_tensor(name: &str) -> bool {
+    matches!(
+        name,
+        "output.weight" | "token_embd.weight" | "per_layer_token_embd.weight"
+    )
+}
+
 /// Decide this model's MoE expert placement, install the pager session when the decision pages
 /// (FIRST load only), and return the Vulkan weight binder that implements it. Shared by every
 /// Vulkan weight-uploading session — [`generate_dense_vulkan_session`] and the DiffusionGemma
@@ -1147,6 +1164,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .n_expert
                 .max(1);
             check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
+        } else if chunk_covered_dense_tensor(name) {
+            // lm_head / embedding tables (issue #77): read ONLY by chunk-covered dispatches (the
+            // output projection's decode GEMV + Op::EmbedGather), which split a >= 2^32-element
+            // tensor into output-row chunks at DISPATCH, so the whole-tensor element cap no longer
+            // applies. `bda_weight_alloc`'s 4 GiB BYTE cap still bounds the single contiguous
+            // allocation (this over-cap table must fit — a quantized 256k-vocab lm_head), and a
+            // multi-row lm_head GEMM (MTP verify / all-position logits) is still caught loudly at
+            // dispatch (the adapter's tiled-GEMM breach guard). Every OTHER dense tensor below
+            // keeps the loud whole-tensor element cap.
         } else {
             check_bda_element_cap(name, "tensor", numel)?;
         }
@@ -1608,7 +1634,30 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 
 #[cfg(test)]
 mod bda_cap_tests {
-    use super::{check_bda_element_cap, BDA_ELEMENT_UNIT_MAX};
+    use super::{check_bda_element_cap, chunk_covered_dense_tensor, BDA_ELEMENT_UNIT_MAX};
+
+    #[test]
+    fn chunk_covered_names_are_exactly_lm_head_and_embed() {
+        // Only the output projection / embedding tables (chunk-covered, issue #77) may exceed the
+        // element cap — the binder skips check_bda_element_cap for exactly these.
+        for n in [
+            "output.weight",
+            "token_embd.weight",
+            "per_layer_token_embd.weight",
+        ] {
+            assert!(chunk_covered_dense_tensor(n), "{n} must be chunk-covered");
+        }
+        // A per-layer projection / norm / bias is NOT — it keeps the loud whole-tensor element cap
+        // (and never breaches anyway: its element count is orders of magnitude under 2^32).
+        for n in [
+            "blk.0.attn_q.weight",
+            "blk.10.ffn_down.weight",
+            "output_norm.weight",
+            "blk.0.ffn_gate_exps.weight",
+        ] {
+            assert!(!chunk_covered_dense_tensor(n), "{n} must stay capped");
+        }
+    }
 
     #[test]
     fn element_cap_accepts_realistic_and_boundary_below() {

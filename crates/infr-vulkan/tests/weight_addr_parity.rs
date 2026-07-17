@@ -1287,6 +1287,7 @@ fn embed_gather_matches_resident() {
             rows,
             ne,
             scale,
+            0, // u32-fitting table → original element-offset gather path (issue #77)
         );
         rec.finish().unwrap();
         let mut out = vec![0u8; rows * ne * 4];
@@ -1320,6 +1321,7 @@ fn embed_gather_matches_resident() {
             rows,
             ne,
             scale,
+            0, // u32-fitting table → original element-offset gather path (issue #77)
         );
         rec.finish().unwrap();
         let mut out = vec![0u8; rows * ne * 4];

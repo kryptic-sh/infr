@@ -7,11 +7,7 @@
 
 use ash::vk;
 
-use infr_core::{
-    backend::{Buffer, BufferUsage},
-    error::Result,
-    Backend,
-};
+use infr_core::{backend::BufferUsage, error::Result, Backend};
 
 use super::{as_vk_buf, be, VulkanBackend};
 
@@ -154,7 +150,7 @@ pub(crate) fn destroy_compute_kernel(device: &ash::Device, k: &ComputeKernel) {
     }
 }
 
-/// Set-0 descriptor binding for the one-shot eager runners (`run_kernel`, `linear_wbuf`, and
+/// Set-0 descriptor binding for the one-shot eager runners (`run_kernel` and
 /// gemm.rs's eager/bench GEMMs). A [`ComputeKernel`]'s set layout carries PUSH_DESCRIPTOR_KHR
 /// whenever the device has `VK_KHR_push_descriptor`, and such a layout must never be passed to
 /// `vkAllocateDescriptorSets` (VUID-VkDescriptorSetAllocateInfo-pSetLayouts-00308) — so this
@@ -367,118 +363,6 @@ impl VulkanBackend {
         let mut out_bytes = vec![0u8; out_len * 4];
         self.download(out.as_ref(), &mut out_bytes)?;
         Ok(bytemuck::cast_slice(&out_bytes).to_vec())
-    }
-
-    /// Eager GEMV against a PERSISTENT weight buffer (binding 0): `y[rows,out] = x[rows,in] · Wᵀ`.
-    /// Unlike `run_kernel`, the weight is not re-uploaded — only the activation x (staging) and y
-    /// (readback). `groups` is the workgroup count (cooperative-over-K kernels dispatch `rows*out`).
-    /// Shared by the f16 / bf16 eager linears; the f32 `linear` keeps its own (thread-per-output)
-    /// path. See module note: one submit per call, for the hybrid (CPU-interleaved) decode path.
-    fn linear_wbuf(
-        &self,
-        k: ComputeKernel,
-        groups: u32,
-        w_buf: &dyn Buffer,
-        x: &[f32],
-        rows: usize,
-        in_f: usize,
-        out_f: usize,
-        push: &[u8],
-    ) -> Result<Vec<f32>> {
-        assert_eq!(x.len(), rows * in_f, "x must be rows*in");
-        let x_bytes: &[u8] = bytemuck::cast_slice(x);
-        let buf_x = self.alloc(x_bytes.len().max(4), BufferUsage::Staging)?;
-        let buf_y = self.alloc((rows * out_f * 4).max(4), BufferUsage::Readback)?;
-        self.upload(buf_x.as_ref(), x_bytes)?;
-
-        let vk_bufs = [
-            unsafe { as_vk_buf(w_buf) }.buffer,
-            unsafe { as_vk_buf(buf_x.as_ref()) }.buffer,
-            unsafe { as_vk_buf(buf_y.as_ref()) }.buffer,
-        ];
-        let binding = self.eager_bind(&k, &vk_bufs)?;
-
-        let shared = &self.shared;
-        self.one_shot(|cmd| unsafe {
-            shared
-                .device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
-            binding.bind(shared, cmd, k.pipeline_layout);
-            shared.device.cmd_push_constants(
-                cmd,
-                k.pipeline_layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                push,
-            );
-            shared.device.cmd_dispatch(cmd, groups, 1, 1);
-        })?;
-        let mut y = vec![0u8; rows * out_f * 4];
-        self.download(buf_y.as_ref(), &mut y)?;
-        Ok(bytemuck::cast_slice(&y).to_vec())
-    }
-
-    /// 12-byte `(rows, in_f, out_f)` push for the f16/bf16 eager GEMVs.
-    fn gemv_push12(rows: usize, in_f: usize, out_f: usize) -> [u8; 12] {
-        let mut p = [0u8; 12];
-        p[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
-        p[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        p[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        p
-    }
-
-    /// Eager f16-weight GEMV: `w_buf` holds `W[out,in]` as f16 (see [`Self::upload_weight_f16`]).
-    pub fn linear_f16(
-        &self,
-        w_buf: &dyn Buffer,
-        x: &[f32],
-        rows: usize,
-        in_f: usize,
-        out_f: usize,
-    ) -> Result<Vec<f32>> {
-        let k = self.kernel("linear_f16_eager", crate::gemm::linear_f16_spv(), 3, 12);
-        let push = Self::gemv_push12(rows, in_f, out_f);
-        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f, &push)
-    }
-
-    /// Eager bf16-weight GEMV: `w_buf` holds `W[out,in]` as bf16 (see [`Self::upload_weight_bf16`]).
-    pub fn linear_bf16(
-        &self,
-        w_buf: &dyn Buffer,
-        x: &[f32],
-        rows: usize,
-        in_f: usize,
-        out_f: usize,
-    ) -> Result<Vec<f32>> {
-        let k = self.kernel("linear_bf16_eager", crate::gemm::linear_bf16_spv(), 3, 12);
-        let push = Self::gemv_push12(rows, in_f, out_f);
-        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f, &push)
-    }
-
-    /// Eager native-block GEMV: `w_buf` holds `W[out,in]` as raw GGUF quant blocks (padded to u32;
-    /// see [`crate::linear::pad_to_u32_align`]). In-shader dequant, no host dequant. `dtype` must be a
-    /// quant format with the native pipeline (see [`crate::linear::native_dense_supported`]).
-    pub fn linear_native(
-        &self,
-        dtype: infr_core::DType,
-        w_buf: &dyn Buffer,
-        x: &[f32],
-        rows: usize,
-        in_f: usize,
-        out_f: usize,
-    ) -> Result<Vec<f32>> {
-        let k = self.kernel(
-            crate::linear::native_kernel_name(dtype, false),
-            crate::gemm::native_build_spv(dtype, false).expect("native GEMV spv"),
-            3,
-            16,
-        );
-        // push: (rows, in_f, out_f, w_base=0) — dense weight, no expert offset.
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        self.linear_wbuf(k, (rows * out_f) as u32, w_buf, x, rows, in_f, out_f, &push)
     }
 
     /// RMSNorm over rows: `y[r,i] = x[r,i] / sqrt(mean(x[r]^2)+eps) * w[i]`.

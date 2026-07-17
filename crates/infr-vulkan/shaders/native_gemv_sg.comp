@@ -27,20 +27,13 @@
 #endif
 layout(local_size_x = SG, local_size_y = 1, local_size_z = 1) in;
 
-// -DSTREAMED (see native_gemv.comp's header for the full rationale): the weight is read from the
+// Resident-BDA (see native_gemv.comp's header for the full rationale): the weight is read from the
 // arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
-// w_base keeps its within-slot element-offset meaning. Additive: the non-STREAMED build is
-// byte-identical.
-#ifdef STREAMED
+// w_base keeps its within-slot element-offset meaning. The ONLY weight build (the bound-SSBO
+// resident twin died with the eager `Recorder::linear_native_sg` caller, its sole consumer).
 layout(push_constant) uniform PC {
     uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
 } pc;
-#else
-layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
-#endif
-#ifndef STREAMED
-layout(binding = 0) readonly buffer WB { uint nw[]; };
-#endif
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 #ifdef USE_RES
 layout(binding = 2) readonly buffer RB2 { float r_buf[]; };
@@ -53,10 +46,8 @@ layout(binding = 2) buffer YB { float y_buf[]; };
 #define NR 2
 #endif
 
-#ifdef STREAMED
 #include "native_arena_ref.glsl"
 #define NW(i) arena_word(i)
-#endif
 
 #include "native_decode.glsl"
 
@@ -71,9 +62,7 @@ float dqsub(uint gstart, uint xoff) {
 
 void main() {
     uint lane = gl_SubgroupInvocationID; // 0..SG-1
-#ifdef STREAMED
     nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
-#endif
     // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
     // why no extra bounds check is needed here (the existing `o < pc.out_f` guards already cover
     // a padding workgroup's out-of-range o0).

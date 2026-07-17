@@ -10,20 +10,13 @@
 // Decode-only (activation rows==1); the tiled GEMM / plain GEMV still serve rows>1.
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-// -DSTREAMED (see native_gemv.comp's header for the full rationale): the weight is read from the
+// Resident-BDA (see native_gemv.comp's header for the full rationale): the weight is read from the
 // arena pool by 64-bit device address instead of a bound SSBO — arena_lo/arena_hi appended LAST,
-// w_base keeps its within-slot element-offset meaning. Additive: the non-STREAMED build is
-// byte-identical.
-#ifdef STREAMED
+// w_base keeps its within-slot element-offset meaning. The ONLY weight build (the bound-SSBO
+// resident twin died with the eager `Recorder::linear_native_rm` caller, its sole consumer).
 layout(push_constant) uniform PC {
     uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
 } pc;
-#else
-layout(push_constant) uniform PC { uint rows; uint in_f; uint out_f; uint w_base; } pc;
-#endif
-#ifndef STREAMED
-layout(binding = 0) readonly buffer WB { uint nw[]; };
-#endif
 layout(binding = 1) readonly buffer XB { float x_buf[]; };
 #ifdef USE_RES
 layout(binding = 2) readonly buffer RB2 { float r_buf[]; };
@@ -38,10 +31,8 @@ layout(binding = 2) buffer YB { float y_buf[]; };
 
 shared float red[64];
 
-#ifdef STREAMED
 #include "native_arena_ref.glsl"
 #define NW(i) arena_word(i)
-#endif
 
 #include "native_decode.glsl"
 
@@ -62,9 +53,7 @@ void main() {
     // no extra bounds check needed here, only the index recovery.
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(RM);
     uint t = gl_LocalInvocationID.x;
-#ifdef STREAMED
     nw_ptr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
-#endif
     uint nsub = pc.in_f / 32u;
     float acc[RM];
     [[unroll]] for (uint rr = 0u; rr < uint(RM); rr++) { acc[rr] = 0.0; }

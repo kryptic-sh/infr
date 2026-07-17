@@ -100,7 +100,7 @@ const DENSE_SMALL_TILE_MAX_M16: usize = 16;
 /// The RM variant packs RM output rows into one workgroup (RM× the in-flight weight streams per
 /// wave) to feed enough MLP at low `out_f`, where the RM=1 grid (out_f workgroups) is too shallow
 /// to hide DRAM latency — the big GEMVs (lm_head/gate+up, out_f ≥ ~16k) already saturate on RM=1
-/// so they stay there. Only Q4_K/Q6_K have RM builds ([`crate::gemm::native_rm_build_spv`]).
+/// so they stay there. Only Q4_K/Q6_K have RM builds ([`crate::gemm::native_rm_streamed_build_spv`]).
 /// Tunable for A/B: `INFR_NO_GEMV_RM` forces the RM=1 path; `INFR_GEMV_RM`=2|4 forces the factor;
 /// `INFR_GEMV_RM_MAXOUT` overrides the out_f gate.
 fn native_rm_choice(dtype: infr_core::DType, out_f: usize) -> Option<u32> {
@@ -883,9 +883,10 @@ impl<'a> Recorder<'a> {
 
     /// f32-weight GEMV `y = x·Wᵀ` — full-precision projection weights (gemma4 E2B's per-layer
     /// inp_gate/proj and qwen3moe's router ship as F32; reading them through the f16 kernel
-    /// produced garbage). Reuses the eager path's thread-per-output `linear_f32` kernel
-    /// (dispatch = ceil(rows·out_f/64) groups of 64 threads) — these weights are small, so the
-    /// simple kernel is fine.
+    /// produced garbage). Dispatches the `linear_f32r` family (see
+    /// [`Self::linear_f32_streamed`]'s mrow/vec4 tile pick) — these weights are small, so the
+    /// simple kernels are fine. (The old eager thread-per-output `linear_f32.comp` is deleted;
+    /// see build.rs's note where its entry used to live.)
     pub fn linear_f32(
         &self,
         w: &dyn Buffer,
@@ -2234,111 +2235,6 @@ impl<'a> Recorder<'a> {
         self.linear_native_off(dtype, w, 0, x, y, rows, in_f, out_f);
     }
 
-    /// Resident direct dispatch of the reassociation-tolerant subgroup+NUM_ROWS decode GEMV
-    /// (`native_gemv_sg.comp`) for a caller that already knows `dtype`/`nr` have a build (bypasses
-    /// [`native_sg_choice`]'s shape heuristic — [`Self::linear_native_off`] uses that heuristic for
-    /// production routing; this is the explicit entry point, same dispatch shape). `m=1` decode
-    /// only. Added alongside [`Self::linear_native_sg_streamed`] so parity tests can pick the exact
-    /// resident kernel a `_streamed` twin should match, without depending on the heuristic.
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear_native_sg(
-        &self,
-        dtype: infr_core::DType,
-        w: &dyn Buffer,
-        w_base: usize,
-        x: &dyn Buffer,
-        y: &dyn Buffer,
-        in_f: usize,
-        out_f: usize,
-        nr: u32,
-    ) {
-        self.label_gemv("gemv_sg", 1, in_f, out_f);
-        let (name, spv) =
-            crate::gemm::native_sg_build_spv(dtype, false, nr, self.sg16()).expect("native sg spv");
-        let k = self.be.kernel_sg(name, spv, 3, 16, self.sgp());
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            (out_f as u32).div_ceil(nr),
-        );
-    }
-
-    /// Resident direct dispatch of the multi-output-row decode GEMV (`native_gemv_rm.comp`) for a
-    /// caller that already knows `dtype`/`rm` have a build (bypasses [`native_rm_choice`]'s
-    /// heuristic — same dispatch shape [`Self::linear_native_off`] uses internally). `m=1` decode
-    /// only. Added alongside [`Self::linear_native_rm_streamed`] so parity tests can pick the exact
-    /// resident kernel a `_streamed` twin should match.
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear_native_rm(
-        &self,
-        dtype: infr_core::DType,
-        w: &dyn Buffer,
-        w_base: usize,
-        x: &dyn Buffer,
-        y: &dyn Buffer,
-        in_f: usize,
-        out_f: usize,
-        rm: u32,
-    ) {
-        self.label_gemv("gemv_rm", 1, in_f, out_f);
-        let (name, spv) =
-            crate::gemm::native_rm_build_spv(dtype, false, rm).expect("native rm spv");
-        let k = self.be.kernel(name, spv, 3, 16);
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            (out_f as u32).div_ceil(rm),
-        );
-    }
-
-    /// Resident direct dispatch of an experimental RM kernel variant (`native_gemv_rm_v2.comp`),
-    /// same shape [`Self::linear_native_off`] uses internally under `INFR_GEMV_VARIANT`. `m=1`
-    /// decode only, `RM=2` fixed. Added alongside [`Self::linear_native_rm_v2_streamed`] so parity
-    /// tests can pick the exact resident kernel a `_streamed` twin should match.
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear_native_rm_v2(
-        &self,
-        variant: &str,
-        dtype: infr_core::DType,
-        w: &dyn Buffer,
-        w_base: usize,
-        x: &dyn Buffer,
-        y: &dyn Buffer,
-        in_f: usize,
-        out_f: usize,
-    ) {
-        self.label_gemv("gemv_rm_v2", 1, in_f, out_f);
-        let (name, spv) =
-            crate::gemm::native_rm_variant_spv(variant, dtype, false).expect("native rm_v2 spv");
-        let k = self.be.kernel(name, spv, 3, 16);
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&1u32.to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[Self::vkb(w), Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            (out_f as u32).div_ceil(2),
-        );
-    }
-
     /// Native-block dequant GEMV reading the weight from element offset `w_base` — lets one stacked
     /// MoE expert tensor serve all experts (`w_base = expert_id * out_f * in_f`).
     ///
@@ -3146,74 +3042,6 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             rows as u32,
-        );
-    }
-
-    /// E2B per-layer proj: fused f32 GEMV + RMSNorm + in-place add.
-    /// `h[r,o] += rmsnorm(sum_k x[r,k] * w[o,k]) * pn[o]`. 256 threads/workgroup, one wg per row.
-    pub fn e2b_proj(
-        &self,
-        x: &dyn Buffer,  // [m, in_f] plg input
-        w: &dyn Buffer,  // [out_f, in_f] proj weight f32
-        pn: &dyn Buffer, // [out_f] post_norm weight
-        h: &dyn Buffer,  // [m, out_f] hidden (read+write)
-        m: usize,
-        in_f: usize,
-        out_f: usize,
-        eps: f32,
-    ) {
-        let k = self
-            .be
-            .kernel_sg("e2b_proj", crate::gemm::e2b_proj_spv(), 4, 16, 32);
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(w), Self::vkb(pn), Self::vkb(h)],
-            1,
-            &push,
-            m as u32, // one workgroup per row
-        );
-    }
-
-    /// `-DSTREAMED` twin of [`Self::e2b_proj`] (weight read through a typed 64-bit
-    /// buffer_reference — see `shaders/e2b_proj.comp`'s STREAMED doc). Binding 1 (the resident
-    /// build's weight SSBO) takes a harmless FILLER (`x`). Parity-test entry, not dispatched in
-    /// production.
-    pub fn e2b_proj_streamed(
-        &self,
-        x: &dyn Buffer,  // [m, in_f] plg input
-        arena_addr: u64, // proj weight arena base address [out_f, in_f] f32
-        pn: &dyn Buffer, // [out_f] post_norm weight
-        h: &dyn Buffer,  // [m, out_f] hidden (read+write)
-        m: usize,
-        in_f: usize,
-        out_f: usize,
-        eps: f32,
-    ) {
-        let k = self.be.kernel_sg(
-            "e2b_proj_streamed",
-            crate::gemm::e2b_proj_streamed_spv(),
-            4,
-            24,
-            32,
-        );
-        let mut push = [0u8; 24];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&eps.to_ne_bytes());
-        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(x), Self::vkb(pn), Self::vkb(h)],
-            1,
-            &push,
-            m as u32, // one workgroup per row
         );
     }
 

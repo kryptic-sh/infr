@@ -1,14 +1,28 @@
-//! Proves each decode-GEMV kernel's `-DSTREAMED` twin (weight read through a
-//! `bufferDeviceAddress` arena pointer) computes BIT-IDENTICALLY to its resident twin (weight read
-//! through a bound SSBO). The two builds differ only in where `NW(i)` sources its word from — the
-//! dequant math and the accumulation order in `native_decode.glsl` are the same code — so anything
-//! short of bitwise equality is a bug, not a tolerance question.
+//! Proves the decode-GEMV / weight-read kernels' `-DSTREAMED` builds (weight read through a
+//! `bufferDeviceAddress` arena pointer) are correct — in two forms, depending on whether the family
+//! still has a genuinely-dispatched bound-SSBO twin:
 //!
-//! The second, load-bearing assertion is the NON-ZERO ARENA OFFSET: the resident-BDA integration
-//! places every tensor at its own byte offset inside ONE multi-GiB arena and passes
+//! * RESIDENT-VS-STREAMED (`run_case`/`run_mmv_case` + `assert_case`, most tests below): for
+//!   families a resident (bound-SSBO) build is STILL compiled for (production dispatches it, or an
+//!   eager/parity caller binds the weight directly — see build.rs's `keep_resident`), this proves
+//!   the streamed twin computes BIT-IDENTICALLY to it. The two builds differ only in where `NW(i)`
+//!   sources its word from — the dequant math and the accumulation order in `native_decode.glsl`
+//!   are the same code — so anything short of bitwise equality is a bug, not a tolerance question.
+//! * OFFSET-INVARIANCE (`run_case_offset_invariant`/`run_mmv_case_offset_invariant` +
+//!   `assert_offset_invariant`): for families whose resident build no longer exists (retired
+//!   alongside the eager/parity-recorder callers that were its sole consumers — the streamed twin
+//!   was ALREADY the only thing production ever dispatched, so a resident compare would either not
+//!   compile or just re-derive the same streamed result from itself), this drops the resident leg
+//!   and instead runs the SAME streamed kernel twice — once with its weight at arena offset 0, once
+//!   with the identical bytes parked behind a garbage prefix at a non-zero offset — asserting the
+//!   two outputs match bit-for-bit.
+//!
+//! Either way, the second, load-bearing assertion is the NON-ZERO ARENA OFFSET: the resident-BDA
+//! integration places every tensor at its own byte offset inside ONE multi-GiB arena and passes
 //! `arena_addr + tensor_off` as the kernel's base. A twin that only works at offset 0 would pass a
 //! naive parity test and then read garbage for every tensor but the first, so each case is run
-//! twice — once at offset 0, once at a non-zero offset — and both must match the resident result.
+//! twice — once at offset 0, once at a non-zero offset — and both legs must agree (with the
+//! resident result, or with each other, per the form above).
 //!
 //! WEIGHT BYTES: deliberately NOT a faithful quantization of any target tensor. Parity only needs
 //! both paths to decode the SAME bytes; what float those bytes mean is irrelevant. Every byte is
@@ -175,9 +189,94 @@ fn assert_case(c: &Case) {
     }
 }
 
+/// The result of an offset-invariance case: the streamed kernel's output bits at arena offset 0
+/// and at a non-zero offset (same weight bytes, different address) — no resident leg. Used for
+/// kernel families whose bound-SSBO resident build no longer exists (retired alongside its sole
+/// eager/parity-recorder caller — see build.rs's `keep_resident`), so the ONLY thing left to prove
+/// is that the streamed kernel itself doesn't hardcode arena offset 0.
+struct OffsetCase {
+    /// Human name for the failure message.
+    name: String,
+    /// Bits of the streamed dispatch's output at arena offset 0.
+    at0: Vec<u32>,
+    /// Bits of the streamed dispatch's output at a non-zero offset, weight bytes UNCHANGED.
+    atoff: Vec<u32>,
+}
+
+/// Runs one streamed kernel twice — once with its weight at arena offset 0, once with the SAME
+/// weight bytes parked behind a garbage-filled prefix at a non-zero offset — and returns both
+/// output-bit vectors. Mirrors [`run_case`]'s streamed legs exactly (same synth weight/x, same
+/// non-zero-offset construction); it just drops the resident leg `run_case` also captures.
+#[allow(clippy::too_many_arguments)]
+fn run_case_offset_invariant(
+    be: &VulkanBackend,
+    name: String,
+    dtype: DType,
+    in_f: usize,
+    out_f: usize,
+    out_elems: usize,
+    dispatch_str: &DispatchStr,
+) -> OffsetCase {
+    let w_elems = in_f * out_f;
+    let w_bytes = weight_bytes_for(dtype, w_elems);
+    let w = synth_weight_bytes(w_bytes, in_f * 31 + out_f);
+
+    let x = synth_x(in_f);
+    let x_buf = be.alloc(in_f * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+    let y_buf = be.alloc(out_elems * 4, BufferUsage::Activations).unwrap();
+
+    // ── Leg 1: arena offset 0 ──────────────────────────────────────────────────────────────────
+    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+    be.upload(arena0.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    dispatch_str(&rec, addr0, x_buf.as_ref(), y_buf.as_ref());
+    rec.finish().unwrap();
+    let mut out = vec![0u8; out_elems * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let at0 = bits(&out);
+
+    // ── Leg 2: the SAME weight bytes parked at a non-zero offset in a bigger arena ────────────
+    // The prefix is filled with DIFFERENT bytes, so a kernel that ignores the offset and reads
+    // from the arena base produces a visibly wrong result instead of accidentally matching.
+    let off = nonzero_off(dtype);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&w);
+    let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena1.as_ref(), &backing).unwrap();
+    let rec = be.recorder().unwrap();
+    dispatch_str(&rec, addr1 + off as u64, x_buf.as_ref(), y_buf.as_ref());
+    rec.finish().unwrap();
+    let mut out = vec![0u8; out_elems * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let atoff = bits(&out);
+
+    OffsetCase { name, at0, atoff }
+}
+
+fn assert_offset_invariant(c: &OffsetCase) {
+    assert!(
+        c.at0.iter().any(|&b| b != 0),
+        "{}: streamed@0 output is all zeros — the case is not exercising the kernel",
+        c.name
+    );
+    for (i, (&a, &b)) in c.at0.iter().zip(c.atoff.iter()).enumerate() {
+        assert_eq!(
+            a,
+            b,
+            "{}: streamed@nonzero-offset differs from streamed@0 at out {i}: {} vs {} (bits \
+             {a:#010x} vs {b:#010x}) — the kernel is ignoring its arena base offset, which breaks \
+             every tensor but the first in a shared arena",
+            c.name,
+            f32::from_bits(a),
+            f32::from_bits(b)
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn mrow_streamed_matches_resident() {
+fn mrow_streamed_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -185,19 +284,18 @@ fn mrow_streamed_matches_resident() {
     let (in_f, out_f) = (256usize, 8usize);
     for dtype in [DType::Q8_0, DType::Q4K, DType::Q6K] {
         for rows in [2usize, 4, 8] {
-            let c = run_case(
+            let c = run_case_offset_invariant(
                 &be,
                 format!("mrow dtype={dtype:?} rows={rows}"),
                 dtype,
                 in_f,
                 out_f,
                 rows * out_f,
-                &|rec, w, x, y| rec.linear_native_mrow(dtype, w, 0, x, y, rows, in_f, out_f),
                 &|rec, addr, x, y| {
                     rec.linear_native_mrow_streamed(dtype, addr, 0, x, y, rows, in_f, out_f)
                 },
             );
-            assert_case(&c);
+            assert_offset_invariant(&c);
             println!("ok: {}", c.name);
         }
     }
@@ -205,7 +303,7 @@ fn mrow_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn rm_streamed_matches_resident() {
+fn rm_streamed_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -213,19 +311,18 @@ fn rm_streamed_matches_resident() {
     let (in_f, out_f) = (256usize, 8usize);
     for dtype in [DType::Q4K, DType::Q6K] {
         for rm in [2u32, 4] {
-            let c = run_case(
+            let c = run_case_offset_invariant(
                 &be,
                 format!("rm dtype={dtype:?} rm={rm}"),
                 dtype,
                 in_f,
                 out_f,
                 out_f,
-                &|rec, w, x, y| rec.linear_native_rm(dtype, w, 0, x, y, in_f, out_f, rm),
                 &|rec, addr, x, y| {
                     rec.linear_native_rm_streamed(dtype, addr, 0, x, y, in_f, out_f, rm)
                 },
             );
-            assert_case(&c);
+            assert_offset_invariant(&c);
             println!("ok: {}", c.name);
         }
     }
@@ -233,7 +330,7 @@ fn rm_streamed_matches_resident() {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn sg_streamed_matches_resident() {
+fn sg_streamed_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -241,24 +338,23 @@ fn sg_streamed_matches_resident() {
     let (in_f, out_f) = (256usize, 8usize);
     let dtype = DType::Q6K; // the only dtype with an SG build
     for nr in [2u32, 4, 8] {
-        let c = run_case(
+        let c = run_case_offset_invariant(
             &be,
             format!("sg dtype={dtype:?} nr={nr}"),
             dtype,
             in_f,
             out_f,
             out_f,
-            &|rec, w, x, y| rec.linear_native_sg(dtype, w, 0, x, y, in_f, out_f, nr),
             &|rec, addr, x, y| rec.linear_native_sg_streamed(dtype, addr, 0, x, y, in_f, out_f, nr),
         );
-        assert_case(&c);
+        assert_offset_invariant(&c);
         println!("ok: {}", c.name);
     }
 }
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn rm_v2_streamed_matches_resident() {
+fn rm_v2_streamed_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -272,19 +368,18 @@ fn rm_v2_streamed_matches_resident() {
         ("wg128", DType::Q4K),
         ("reg", DType::Q4K),
     ] {
-        let c = run_case(
+        let c = run_case_offset_invariant(
             &be,
             format!("rm_v2 variant={variant} dtype={dtype:?}"),
             dtype,
             in_f,
             out_f,
             out_f,
-            &|rec, w, x, y| rec.linear_native_rm_v2(variant, dtype, w, 0, x, y, in_f, out_f),
             &|rec, addr, x, y| {
                 rec.linear_native_rm_v2_streamed(variant, dtype, addr, 0, x, y, in_f, out_f)
             },
         );
-        assert_case(&c);
+        assert_offset_invariant(&c);
         println!("ok: {}", c.name);
     }
 }
@@ -293,7 +388,8 @@ fn rm_v2_streamed_matches_resident() {
 /// stacked tensor (fused QKV slices, a stacked MoE expert bank) serve several logical weights, and
 /// the resident-BDA layout composes it WITH the arena base offset (`arena_addr + tensor_off` as the
 /// base, `w_base` as the slice within that tensor). Both must apply, so this checks a non-zero
-/// `w_base` against a non-zero arena offset.
+/// `w_base` against a non-zero arena offset — same weight bytes, streamed twice (arena offset 0 vs
+/// a non-zero offset behind a garbage prefix), `w_base` held constant across both legs.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn w_base_composes_with_arena_offset() {
@@ -313,37 +409,13 @@ fn w_base_composes_with_arena_offset() {
     be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
     let y_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
 
-    let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
-    be.upload(w_buf.as_ref(), &w).unwrap();
-    let rec = be.recorder().unwrap();
-    rec.linear_native_rm(
-        dtype,
-        w_buf.as_ref(),
-        stride_elems,
-        x_buf.as_ref(),
-        y_buf.as_ref(),
-        in_f,
-        out_f,
-        2,
-    );
-    rec.finish().unwrap();
-    let mut out = vec![0u8; out_f * 4];
-    be.download(y_buf.as_ref(), &mut out).unwrap();
-    let resident = bits(&out);
-    assert!(
-        resident.iter().any(|&b| b != 0),
-        "resident w_base output is all zeros"
-    );
-
-    let off = nonzero_off(dtype);
-    let mut backing = synth_weight_bytes(off, 0xBAD);
-    backing.extend_from_slice(&w);
-    let (arena, addr) = be.alloc_arena_bda(backing.len()).unwrap();
-    be.upload(arena.as_ref(), &backing).unwrap();
+    // ── Leg 1: arena offset 0, w_base selects the second stacked "expert" ─────────────────────
+    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+    be.upload(arena0.as_ref(), &w).unwrap();
     let rec = be.recorder().unwrap();
     rec.linear_native_rm_streamed(
         dtype,
-        addr + off as u64,
+        addr0,
         stride_elems,
         x_buf.as_ref(),
         y_buf.as_ref(),
@@ -354,15 +426,41 @@ fn w_base_composes_with_arena_offset() {
     rec.finish().unwrap();
     let mut out = vec![0u8; out_f * 4];
     be.download(y_buf.as_ref(), &mut out).unwrap();
-    let streamed = bits(&out);
+    let at0 = bits(&out);
+    assert!(
+        at0.iter().any(|&b| b != 0),
+        "w_base@offset-0 output is all zeros"
+    );
 
-    for (i, (&r, &s)) in resident.iter().zip(streamed.iter()).enumerate() {
+    // ── Leg 2: the SAME weight bytes at a non-zero arena offset, SAME w_base ──────────────────
+    let off = nonzero_off(dtype);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&w);
+    let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena1.as_ref(), &backing).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.linear_native_rm_streamed(
+        dtype,
+        addr1 + off as u64,
+        stride_elems,
+        x_buf.as_ref(),
+        y_buf.as_ref(),
+        in_f,
+        out_f,
+        2,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; out_f * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let atoff = bits(&out);
+
+    for (i, (&a, &b)) in at0.iter().zip(atoff.iter()).enumerate() {
         assert_eq!(
-            r,
-            s,
-            "w_base+arena_off: streamed differs from resident at out {i}: {} vs {}",
-            f32::from_bits(r),
-            f32::from_bits(s)
+            a,
+            b,
+            "w_base+arena_off: streamed@nonzero-offset differs from streamed@0 at out {i}: {} vs {}",
+            f32::from_bits(a),
+            f32::from_bits(b)
         );
     }
     println!("ok: w_base composes with a non-zero arena offset");
@@ -460,9 +558,54 @@ fn run_mmv_case(
     }
 }
 
+/// Offset-invariance twin of [`run_mmv_case`] for the int8-dp4a family: no resident leg, just the
+/// streamed kernel run at arena offset 0 and at a non-zero offset (same weight bytes). Used by the
+/// `linear_mmv`/`linear_mmv_mrow` cases — both are BDA wrappers whose "resident" arm was already
+/// just a `device_addr()` fork onto the SAME streamed kernel (see those fns' doc), making the old
+/// resident-vs-streamed compare vacuous; this asserts the thing that was never actually checked.
+#[allow(clippy::too_many_arguments)]
+fn run_mmv_case_offset_invariant(
+    be: &VulkanBackend,
+    name: String,
+    dtype: DType,
+    in_f: usize,
+    out_f: usize,
+    out_elems: usize,
+    q: &QAct,
+    dispatch_str: &dyn Fn(&infr_vulkan::Recorder, u64, &Buf2),
+) -> OffsetCase {
+    let w_bytes = weight_bytes_for(dtype, in_f * out_f);
+    let w = synth_weight_bytes(w_bytes, in_f * 31 + out_f);
+    let y_buf = be.alloc(out_elems * 4, BufferUsage::Activations).unwrap();
+
+    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
+    be.upload(arena0.as_ref(), &w).unwrap();
+    let rec = be.recorder().unwrap();
+    dispatch_str(&rec, addr0, y_buf.as_ref());
+    rec.finish().unwrap();
+    let mut out = vec![0u8; out_elems * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let at0 = bits(&out);
+
+    let off = nonzero_off(dtype);
+    let mut backing = synth_weight_bytes(off, 0xBAD);
+    backing.extend_from_slice(&w);
+    let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
+    be.upload(arena1.as_ref(), &backing).unwrap();
+    let rec = be.recorder().unwrap();
+    dispatch_str(&rec, addr1 + off as u64, y_buf.as_ref());
+    rec.finish().unwrap();
+    let mut out = vec![0u8; out_elems * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let atoff = bits(&out);
+
+    let _ = q; // the qa/dact/sact buffers are shared by both legs via the dispatch closure
+    OffsetCase { name, at0, atoff }
+}
+
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn mmv_streamed_matches_resident() {
+fn mmv_streamed_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -470,7 +613,7 @@ fn mmv_streamed_matches_resident() {
     let (in_f, out_f) = (256usize, 8usize);
     let q = quantize_x(&be, 1, in_f);
     for dtype in [DType::Q4K, DType::Q6K, DType::Iq4Xs] {
-        let c = run_mmv_case(
+        let c = run_mmv_case_offset_invariant(
             &be,
             format!("mmv dtype={dtype:?}"),
             dtype,
@@ -478,19 +621,6 @@ fn mmv_streamed_matches_resident() {
             out_f,
             out_f,
             &q,
-            &|rec, w, y| {
-                rec.linear_mmv(
-                    dtype,
-                    w,
-                    0,
-                    q.qa.as_ref(),
-                    q.dact.as_ref(),
-                    q.sact.as_ref(),
-                    y,
-                    in_f,
-                    out_f,
-                )
-            },
             &|rec, addr, y| {
                 rec.linear_mmv_streamed(
                     dtype,
@@ -505,14 +635,14 @@ fn mmv_streamed_matches_resident() {
                 )
             },
         );
-        assert_case(&c);
+        assert_offset_invariant(&c);
         println!("ok: {}", c.name);
     }
 }
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn mmv_mrow_streamed_matches_resident() {
+fn mmv_mrow_streamed_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -525,7 +655,7 @@ fn mmv_mrow_streamed_matches_resident() {
         for dtype in [DType::Q4K, DType::Q6K, DType::Q3K, DType::Q8_0] {
             for rows in [1usize, 4, 8, 12] {
                 let q = quantize_x(&be, rows, in_f);
-                let c = run_mmv_case(
+                let c = run_mmv_case_offset_invariant(
                     &be,
                     format!("mmv_mrow dtype={dtype:?} rows={rows} in_f={in_f}"),
                     dtype,
@@ -533,21 +663,6 @@ fn mmv_mrow_streamed_matches_resident() {
                     out_f,
                     rows * out_f,
                     &q,
-                    &|rec, w, y| {
-                        rec.linear_mmv_mrow(
-                            dtype,
-                            w,
-                            0,
-                            q.qa.as_ref(),
-                            q.dact.as_ref(),
-                            q.sact.as_ref(),
-                            None,
-                            y,
-                            rows,
-                            in_f,
-                            out_f,
-                        )
-                    },
                     &|rec, addr, y| {
                         rec.linear_mmv_mrow_streamed(
                             dtype,
@@ -564,7 +679,7 @@ fn mmv_mrow_streamed_matches_resident() {
                         )
                     },
                 );
-                assert_case(&c);
+                assert_offset_invariant(&c);
                 println!("ok: {}", c.name);
             }
         }
@@ -990,35 +1105,32 @@ fn mmv_id_q4k_streamed_matches_resident() {
 // typed buffer_references instead of the uint-word NW() seam — parity across each type proves the
 // typed pointer reads decode identically to the bound-SSBO loads.
 
+/// `linear`/`linear_bf16`/`linear_f32` are BDA wrappers — each is just a `device_addr()` fork onto
+/// the SAME streamed kernel this test drives directly (see those `Recorder` fns' doc), so a
+/// resident-vs-streamed compare here was always vacuous. Offset-invariance is the real assertion.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn float_linear_streamed_matches_resident() {
+fn float_linear_streamed_offset_invariant() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
     };
     let (in_f, out_f) = (256usize, 8usize);
 
-    // (name, dtype, rows) — rows>1 exercises linear_f32's mrow/vec4 routing on both sides.
+    // (name, dtype, rows) — rows>1 exercises linear_f32's mrow/vec4 routing.
     for rows in [1usize, 4] {
         let x = synth_x(rows * in_f);
         let x_buf = be.alloc(rows * in_f * 4, BufferUsage::Activations).unwrap();
         be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
 
         for dtype in [DType::F16, DType::Bf16, DType::F32] {
-            let c = run_case(
+            let c = run_case_offset_invariant(
                 &be,
                 format!("float linear dtype={dtype:?} rows={rows}"),
                 dtype,
                 in_f,
                 out_f,
                 rows * out_f,
-                &|rec, w, _x, y| match dtype {
-                    DType::F16 => rec.linear(w, x_buf.as_ref(), y, rows, in_f, out_f),
-                    DType::Bf16 => rec.linear_bf16(w, x_buf.as_ref(), y, rows, in_f, out_f),
-                    DType::F32 => rec.linear_f32(w, x_buf.as_ref(), y, rows, in_f, out_f),
-                    _ => unreachable!(),
-                },
                 &|rec, addr, _x, y| match dtype {
                     DType::F16 => rec.linear_streamed(addr, x_buf.as_ref(), y, rows, in_f, out_f),
                     DType::Bf16 => {
@@ -1030,7 +1142,7 @@ fn float_linear_streamed_matches_resident() {
                     _ => unreachable!(),
                 },
             );
-            assert_case(&c);
+            assert_offset_invariant(&c);
             println!("ok: {}", c.name);
         }
     }
@@ -1480,114 +1592,6 @@ fn e2b_gate_streamed_matches_resident() {
             )
         },
     );
-    assert_case(&c);
-    println!("ok: {}", c.name);
-}
-
-/// E2B per-layer proj: fused f32 GEMV + RMSNorm + in-place add (`h += ...`). `h` is read AND
-/// written, so — like the conv1d test above — it must be reset to its initial value before EACH
-/// leg; reusing it directly across legs would accumulate the previous leg's write on top.
-#[test]
-#[ignore = "requires a Vulkan GPU"]
-fn e2b_proj_streamed_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
-        eprintln!("skip: no Vulkan device");
-        return;
-    };
-    let dtype = DType::F32;
-    let (m, in_f, out_f) = (4usize, 64usize, 8usize);
-    let eps = 1e-6f32;
-
-    let w_bytes = weight_bytes_for(dtype, in_f * out_f);
-    let w = synth_weight_bytes(w_bytes, in_f * 31 + out_f);
-
-    let x = synth_x(m * in_f);
-    let x_buf = be.alloc(m * in_f * 4, BufferUsage::Activations).unwrap();
-    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
-
-    let pn: Vec<f32> = (0..out_f).map(|i| 0.5 + (i as f32) * 0.1).collect();
-    let pn_buf = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
-    be.upload(pn_buf.as_ref(), bytemuck::cast_slice(&pn))
-        .unwrap();
-
-    let h0: Vec<f32> = (0..m * out_f)
-        .map(|i| ((i % 9) as f32 - 4.0) * 0.02)
-        .collect();
-    let h_buf = be.alloc(m * out_f * 4, BufferUsage::Activations).unwrap();
-    let fresh_h = |be: &VulkanBackend| {
-        be.upload(h_buf.as_ref(), bytemuck::cast_slice(&h0))
-            .unwrap();
-    };
-    let download = |be: &VulkanBackend| {
-        let mut out = vec![0u8; m * out_f * 4];
-        be.download(h_buf.as_ref(), &mut out).unwrap();
-        bits(&out)
-    };
-
-    fresh_h(&be);
-    let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
-    be.upload(w_buf.as_ref(), &w).unwrap();
-    let rec = be.recorder().unwrap();
-    rec.e2b_proj(
-        x_buf.as_ref(),
-        w_buf.as_ref(),
-        pn_buf.as_ref(),
-        h_buf.as_ref(),
-        m,
-        in_f,
-        out_f,
-        eps,
-    );
-    rec.finish().unwrap();
-    let resident = download(&be);
-    assert!(
-        resident.iter().any(|&b| b != 0),
-        "e2b_proj: resident output is all zeros"
-    );
-
-    fresh_h(&be);
-    let (arena0, addr0) = be.alloc_arena_bda(w_bytes).unwrap();
-    be.upload(arena0.as_ref(), &w).unwrap();
-    let rec = be.recorder().unwrap();
-    rec.e2b_proj_streamed(
-        x_buf.as_ref(),
-        addr0,
-        pn_buf.as_ref(),
-        h_buf.as_ref(),
-        m,
-        in_f,
-        out_f,
-        eps,
-    );
-    rec.finish().unwrap();
-    let streamed_at0 = download(&be);
-
-    let off = nonzero_off(dtype);
-    let mut backing = synth_weight_bytes(off, 0xBAD);
-    backing.extend_from_slice(&w);
-    fresh_h(&be);
-    let (arena1, addr1) = be.alloc_arena_bda(backing.len()).unwrap();
-    be.upload(arena1.as_ref(), &backing).unwrap();
-    let rec = be.recorder().unwrap();
-    rec.e2b_proj_streamed(
-        x_buf.as_ref(),
-        addr1 + off as u64,
-        pn_buf.as_ref(),
-        h_buf.as_ref(),
-        m,
-        in_f,
-        out_f,
-        eps,
-    );
-    rec.finish().unwrap();
-    let streamed_atoff = download(&be);
-
-    let c = Case {
-        name: "e2b_proj".to_string(),
-        resident,
-        streamed_at0,
-        streamed_atoff,
-    };
     assert_case(&c);
     println!("ok: {}", c.name);
 }

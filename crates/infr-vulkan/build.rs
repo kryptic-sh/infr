@@ -229,7 +229,13 @@ fn main() {
         // unpackHalf2x16 (core GLSL) instead of a float16_t SSBO read.
         ("linear_f16_noext", "linear_f16_noext", &[]),
         ("linear_bf16", "linear_bf16", &[]),
-        ("linear_f32", "linear_f32", &[]),
+        // `linear_f32.comp` (the eager thread-per-output f32 GEMV) is GONE from this list: its sole
+        // consumer was the now-deleted eager `VulkanBackend::linear` (linear.rs) — production's f32
+        // Linear was ALREADY routing through the separate `linear_f32r` family below (rows>1 mrow/
+        // vec4 tiles + a plain rows<=1 arm), never through `linear_f32.comp`. So unlike
+        // linear_f16/linear_bf16 (whose `-DSTREAMED` twin IS the live production kernel), both of
+        // `linear_f32`'s builds were dead — same as `e2b_proj` below, just not called out in the
+        // audit by name.
         ("linear_f32r", "linear_f32r", &[]),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
         (
@@ -243,7 +249,11 @@ fn main() {
             &["-DMROW=8", "-DVEC4"],
         ),
         ("e2b_gate", "e2b_gate", &[]),
-        ("e2b_proj", "e2b_proj", &[]),
+        // e2b_proj (fused E2B per-layer proj GEMV+RMSNorm+Add) landed but was NEVER wired into
+        // production — the E2B proj side runs unfused; only tests/gemv_streamed_parity.rs's
+        // `e2b_proj_streamed_matches_resident` dispatched it (both the resident and streamed
+        // builds), and that test is deleted along with it — there's no surviving entry point left
+        // to exercise. Both builds and the shader itself (shaders/e2b_proj.comp) are gone too.
         ("matmul_f32", "matmul_f32", &[]),
         ("linear_res", "linear_res", &[]),
         ("attention", "attention", &[]),
@@ -2614,16 +2624,26 @@ fn main() {
     // `bufferDeviceAddress` arena pool (native_arena_ref.glsl) instead of a bound SSBO, lifting the
     // ~4 GiB `maxStorageBufferRange` cap one SSBO binding imposes. `wants_streamed_twin` marks the
     // families that get a STREAMED build; `keep_resident` (below) marks the few whose bound-SSBO
-    // build is STILL dispatched (eager ops, parity recorders, production conv1d/e2b, mechanism-(b)).
-    // For every other family STREAMED is now the SOLE weight build — the bound-SSBO "resident" build
-    // is no longer emitted (slice U4b2). The list below still enumerates which families qualify:
-    //   * native_gemv — decode/small-m GEMV (any-m rows loop). Both plain and -DUSE_RES builds get
-    //     a twin: production DOES dispatch fused-residual GEMVs on resident weights (the decode
-    //     Linear+Add fusion — recorder.rs `linear_add_native`), and the resident-BDA endgame needs
-    //     every bound-SSBO weight path covered, residual or not. The STREAMED arm only reroutes the
-    //     weight-word chokepoint (NW), which is independent of the USE_RES residual-buffer binding
-    //     shuffle — see native_gemv.comp's binding layout (WB dropped under STREAMED; RB2/YB shift
-    //     is driven purely by USE_RES, unaffected by STREAMED).
+    // build is STILL dispatched (production conv1d/e2b, mechanism-(b)) — every eager-runner /
+    // parity-recorder consumer that used to justify a resident build for native_gemv(_sg/_rm/_rm_v2)
+    // or linear_f16/linear_bf16 is gone (retired alongside the resident paths themselves), so those
+    // families dropped out of `keep_resident` too. For every other family STREAMED is now the SOLE
+    // weight build — the bound-SSBO "resident" build is no longer emitted. The list below still
+    // enumerates which families qualify:
+    //   * native_gemv / native_gemv_mrow / native_gemv_sg / native_gemv_rm / native_gemv_rm_v2 —
+    //     decode/small-m GEMV family (any-m rows loop, spec-decode multi-row, subgroup-reduce
+    //     projection band, multi-output-row, and its experimental variants). Both plain and
+    //     -DUSE_RES builds get a twin: production DOES dispatch fused-residual GEMVs on resident
+    //     weights (the decode Linear+Add fusion — recorder.rs `linear_add_native`), and the
+    //     resident-BDA endgame needs every bound-SSBO weight path covered, residual or not
+    //     (`native_gemv_mrow` itself has no `-DUSE_RES` build today — the multi-row spec-decode path
+    //     never fuses a residual — so the guard is a no-op there). The STREAMED arm only reroutes
+    //     the weight-word chokepoint (NW), which is independent of the USE_RES residual-buffer
+    //     binding shuffle — see native_gemv.comp's binding layout (WB dropped under STREAMED; RB2/YB
+    //     shift is driven purely by USE_RES, unaffected by STREAMED). `native_gemv_sg` also rides
+    //     the SG16 twin expansion above (this closure runs AFTER it), so both the SG=32 and SG=16
+    //     builds get their own `_streamed` twin by construction — no separate SG16 handling needed
+    //     here.
     //   * native_gemm / native_gemm_warp — the prefill coopmat-dequant GEMM family (base 64×64 and
     //     the 8-warp warptile: wide/NARROW_N/A_GLOBAL/SPLIT_K/BM* × every quant format, plus the
     //     opt-in -DBF16CM / `_cm8` (-DCM_M=8) coopmat variants and the -DFMT_F16 split-K build). A
@@ -2635,15 +2655,6 @@ fn main() {
     //     ru16->rb->NW() chokepoint every other format uses — so all three compile a working
     //     `_streamed` twin off the STREAMED arm this file already carries. Every native_gemm /
     //     native_gemm_warp variant now gets a twin.
-    //   * native_gemv_mrow / native_gemv_sg / native_gemv_rm / native_gemv_rm_v2 — the resident
-    //     decode-GEMV tuning family (spec-decode multi-row, subgroup-reduce projection band,
-    //     multi-output-row, and its experimental variants). Same additive guard as native_gemv,
-    //     including the -DUSE_RES arms (`native_gemv_mrow` itself has none declared today — the
-    //     multi-row spec-decode path never fuses a residual — so lifting the guard is a no-op there;
-    //     `_sg`/`_rm`/`_rm_v2` all have real `_res` builds and now get streamed twins for them too).
-    //     `native_gemv_sg` also rides the SG16 twin expansion above (this closure runs AFTER it), so
-    //     both the SG=32 and SG=16 builds get their own `_streamed` twin by construction — no
-    //     separate SG16 handling needed here.
     let wants_streamed_twin = |src_stem: &str, defines: &[String]| -> bool {
         match src_stem {
             "native_gemv" => true,
@@ -2670,18 +2681,21 @@ fn main() {
             | "native_gemv_id_multi"
             | "native_gemv_id_multi_sg"
             | "native_mmv_id_q4k" => !defines.iter().any(|d| d == "-DPAGED"),
-            // The float-weight resident family: the dedicated f16/bf16/f32 linear GEMVs (typed
-            // buffer_reference reads — see linear_f16.comp's STREAMED doc) and the non-coopmat
-            // fma prefill GEMM. linear_res IS the fused-residual f16 GEMV file, included since
+            // The float-weight resident family: the dedicated f16/bf16 linear GEMVs (typed
+            // buffer_reference reads — see linear_f16.comp's STREAMED doc), the mrow/vec4-tiled
+            // `linear_f32r` family, and the non-coopmat fma prefill GEMM. `linear_f32.comp` (the
+            // eager thread-per-output f32 GEMV) is NOT here — see the base builds list above for why
+            // it's gone entirely. linear_res IS the fused-residual f16 GEMV file, included since
             // the resident-BDA endgame deletes every bound-SSBO weight path.
-            "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32" | "linear_f32r"
-            | "linear_res" | "native_gemm_fma" => true,
+            "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32r" | "linear_res"
+            | "native_gemm_fma" => true,
             // Model-specific float-weight kernels: qwen35's SSM depthwise conv1d+SiLU (both the
             // sequential and batch-pass-1 variants — conv1d_shift never reads the weight) and
-            // gemma4 E2B's per-layer fused gate/proj GEMVs. Same typed buffer_reference seam as
-            // the linear family above (see conv1d_silu.comp's STREAMED doc). Every variant of
-            // these sources gets a twin.
-            "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" | "e2b_proj" => true,
+            // gemma4 E2B's per-layer fused inp_gate GEMV. Same typed buffer_reference seam as the
+            // linear family above (see conv1d_silu.comp's STREAMED doc). Every variant of these
+            // sources gets a twin. (e2b_proj — the per-layer PROJ counterpart — is gone entirely:
+            // see the base builds list above.)
+            "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" => true,
             // The coopmat f16/repacked-quant projection GEMM (prefill C=A·Wᵀ): the quant arms ride
             // along on the shared WQ() seam — see gemm_proj.comp's STREAMED doc.
             "gemm_proj" | "gemm_proj_warp" => true,
@@ -2699,30 +2713,28 @@ fn main() {
             _ => false,
         }
     };
-    // Resident-BDA endgame (slice U4b2): for every twin family the recorder now dispatches
-    // STREAMED-only (weights read by 64-bit device address), the resident (non-`-DSTREAMED`) build
-    // is dead — the `_streamed` twin is the SOLE weight build. `keep_resident` is the whitelist of
-    // twin-family builds whose RESIDENT SPV is still genuinely dispatched (bound-descriptor read),
-    // so it must keep compiling alongside the streamed twin:
-    //   * native_gemv / native_gemv_sg / native_gemv_rm / native_gemv_rm_v2 — the eager
-    //     `VulkanBackend::linear_native` (ops.rs) and the `linear_native_{sg,rm,rm_v2}` parity
-    //     recorders bind the weight as an SSBO and dispatch the resident kernel.
-    //   * conv1d_silu / conv1d_silu_par / e2b_gate / e2b_proj — production dispatches the RESIDENT
-    //     kernel (their `_streamed` twin is the parity-test entry, not the production path).
-    //   * linear_f16 / linear_bf16 — the eager `VulkanBackend::linear_{f16,bf16}` GEMVs.
+    // Resident-BDA endgame: for every twin family the recorder now dispatches STREAMED-only
+    // (weights read by 64-bit device address), the resident (non-`-DSTREAMED`) build is dead — the
+    // `_streamed` twin is the SOLE weight build, emitted under the base (unsuffixed) name (see the
+    // `else` arm below). `keep_resident` is the whitelist of twin-family builds whose RESIDENT SPV
+    // is still genuinely dispatched (bound-descriptor read), so it must keep compiling alongside the
+    // SUFFIXED streamed twin instead:
+    //   * conv1d_silu / conv1d_silu_par / e2b_gate — production dispatches the RESIDENT kernel
+    //     (their `_streamed` twin is the parity-test entry, not the production path).
     //   * mechanism-(b): the standalone mmq Q4_K/Q6_K, the int8/fp8-coopmat GEMMs, the Q8_0→E4M3
     //     repack, and native_gemm_warp's `_cm8`/`_bf16cm` coopmat tiles all bind a `BdaSub`
     //     sub-range via vkb and read through the bound descriptor — their resident build IS live.
-    // Everything else in a twin family (the dense/expert coopmat GEMM tiles, the mmv/mrow/id float
-    // and dequant GEMVs, embed_gather, gemm_proj, native_gemm_fma) is STREAMED-only now.
+    // native_gemv/_sg/_rm/_rm_v2 and linear_f16/linear_bf16 used to be here too (the eager
+    // `VulkanBackend::linear_native`/`linear_{f16,bf16}` and the `Recorder::linear_native_{sg,rm,
+    // rm_v2}` parity dispatchers bound the weight as an SSBO), but every one of those callers is
+    // gone — the STREAMED twin was ALREADY the sole production route (`linear_native_streamed` and
+    // its `_sg`/`_rm`/`_rm_v2` siblings, `Recorder::linear_streamed`/`linear_bf16_streamed`), so
+    // dropping `keep_resident` for them just stops compiling the now-dead bound-SSBO half. Everything
+    // else in a twin family (the dense/expert coopmat GEMM tiles, the mmv/mrow/id float and dequant
+    // GEMVs, embed_gather, gemm_proj, native_gemm_fma) was ALREADY STREAMED-only.
     let keep_resident = |src: &str, defines: &[String]| -> bool {
         match src {
-            "native_gemv" | "native_gemv_sg" | "native_gemv_rm" | "native_gemv_rm_v2" => true,
-            "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" | "e2b_proj" => true,
-            "linear_f16" | "linear_bf16" => true,
-            // The eager f32 dense linear (`linear.rs` LinearKernel / `linear_spv()`) binds its
-            // weight SSBO and dispatches the resident build.
-            "linear_f32" => true,
+            "conv1d_silu" | "conv1d_silu_par" | "e2b_gate" => true,
             "native_gemm_i8cm_q8_0" | "repack_q8_to_f8" => true,
             "native_gemm_warp" => defines.iter().any(|d| d == "-DCM_M=8" || d == "-DBF16CM"),
             "native_gemm_mmq_q4k" | "native_gemm_mmq_q6k" => defines.is_empty(),

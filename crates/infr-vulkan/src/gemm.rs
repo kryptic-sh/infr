@@ -49,22 +49,33 @@ pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static 
     })
 }
 
-/// Build-compiled native-block dequant GEMV SPIR-V for `(dtype, residual)`, or `None` if `dtype`
-/// is not a native-block quant format. One match arm per quant format.
+/// The dense layer-streaming decode GEMV (kernel-cache name + SPIR-V): reads the weight from a
+/// `bufferDeviceAddress` arena pool by 64-bit address (native_arena_ref.glsl) instead of a bound
+/// SSBO — the ONLY weight build for this family (the bound-SSBO resident build died with the eager
+/// `VulkanBackend::linear_native` / `Recorder::linear_native_{sg,rm,rm_v2}` callers that were its
+/// sole consumers). All streamed dense Linears (any m) route through this one kernel's rows loop —
+/// see [`crate::recorder::Recorder::linear_native_streamed`] and [`crate::pager::DensePagerSession`].
+/// `res`: production dispatches fused-residual GEMVs too (the decode Linear+Add fusion,
+/// [`crate::recorder::Recorder::linear_add_native`]), so both arms are load-bearing. `None` for a
+/// dtype without a native GEMV build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'static [u32]> {
+pub(crate) fn native_streamed_build_spv(
+    dtype: infr_core::DType,
+    res: bool,
+) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
-    // Each arm lazily decodes its own build-compiled .spv (a fresh `static` per block).
     macro_rules! v {
         ($name:literal) => {{
             static S: OnceLock<Vec<u32>> = OnceLock::new();
-            S.get_or_init(|| {
-                spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-            })
-            .as_slice()
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
         }};
     }
-    Some(match (dtype, res) {
+    match (dtype, res) {
         (Q8_0, false) => v!("native_q8_0"),
         (Q8_0, true) => v!("native_q8_0_res"),
         (Bf16, false) => v!("native_bf16"),
@@ -115,87 +126,6 @@ pub(crate) fn native_build_spv(dtype: infr_core::DType, res: bool) -> Option<&'s
         (Iq1S, true) => v!("native_iq1s_res"),
         (Iq1M, false) => v!("native_iq1m"),
         (Iq1M, true) => v!("native_iq1m_res"),
-        _ => return None,
-    })
-}
-
-/// `-DSTREAMED` twin of [`native_build_spv`] (kernel-cache name + SPIR-V): the dense layer-streaming
-/// GEMV reads the weight from a `bufferDeviceAddress` arena pool by 64-bit address
-/// (native_arena_ref.glsl) instead of a bound SSBO, lifting the ~4 GiB `maxStorageBufferRange` cap.
-/// All streamed dense Linears (any m) route through this one kernel's rows loop — see
-/// [`crate::recorder::Recorder::linear_native_streamed`] and [`crate::pager::DensePagerSession`].
-/// `res` mirrors [`native_build_spv`]'s residual arm — production dispatches fused-residual GEMVs on
-/// resident weights (the decode Linear+Add fusion, [`crate::recorder::Recorder::linear_add_native`]),
-/// so the resident-BDA endgame needs the `-DUSE_RES` twin too, not just the plain one. `None` for a
-/// dtype without a native GEMV build.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_streamed_build_spv(
-    dtype: infr_core::DType,
-    res: bool,
-) -> Option<(&'static str, &'static [u32])> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            let s = S
-                .get_or_init(|| {
-                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-                })
-                .as_slice();
-            Some(($name, s))
-        }};
-    }
-    match (dtype, res) {
-        (Q8_0, false) => v!("native_q8_0_streamed"),
-        (Q8_0, true) => v!("native_q8_0_res_streamed"),
-        (Bf16, false) => v!("native_bf16_streamed"),
-        (Bf16, true) => v!("native_bf16_res_streamed"),
-        (Q4_0, false) => v!("native_q4_0_streamed"),
-        (Q4_0, true) => v!("native_q4_0_res_streamed"),
-        (Q4_1, false) => v!("native_q4_1_streamed"),
-        (Q4_1, true) => v!("native_q4_1_res_streamed"),
-        (Q5_0, false) => v!("native_q5_0_streamed"),
-        (Q5_0, true) => v!("native_q5_0_res_streamed"),
-        (Q5_1, false) => v!("native_q5_1_streamed"),
-        (Q5_1, true) => v!("native_q5_1_res_streamed"),
-        (Q2K, false) => v!("native_q2k_streamed"),
-        (Q2K, true) => v!("native_q2k_res_streamed"),
-        (Q3K, false) => v!("native_q3k_streamed"),
-        (Q3K, true) => v!("native_q3k_res_streamed"),
-        (Q4K, false) => v!("native_q4k_streamed"),
-        (Q4K, true) => v!("native_q4k_res_streamed"),
-        (Q5K, false) => v!("native_q5k_streamed"),
-        (Q5K, true) => v!("native_q5k_res_streamed"),
-        (Q6K, false) => v!("native_q6k_streamed"),
-        (Q6K, true) => v!("native_q6k_res_streamed"),
-        (Iq4Nl, false) => v!("native_iq4nl_streamed"),
-        (Iq4Nl, true) => v!("native_iq4nl_res_streamed"),
-        (Iq4Xs, false) => v!("native_iq4xs_streamed"),
-        (Iq4Xs, true) => v!("native_iq4xs_res_streamed"),
-        (Mxfp4, false) => v!("native_mxfp4_streamed"),
-        (Mxfp4, true) => v!("native_mxfp4_res_streamed"),
-        (Nvfp4, false) => v!("native_nvfp4_streamed"),
-        (Nvfp4, true) => v!("native_nvfp4_res_streamed"),
-        (Tq1_0, false) => v!("native_tq1_0_streamed"),
-        (Tq1_0, true) => v!("native_tq1_0_res_streamed"),
-        (Tq2_0, false) => v!("native_tq2_0_streamed"),
-        (Tq2_0, true) => v!("native_tq2_0_res_streamed"),
-        (Q2_0, false) => v!("native_q2_0_streamed"),
-        (Q2_0, true) => v!("native_q2_0_res_streamed"),
-        (Iq2Xxs, false) => v!("native_iq2xxs_streamed"),
-        (Iq2Xxs, true) => v!("native_iq2xxs_res_streamed"),
-        (Iq2Xs, false) => v!("native_iq2xs_streamed"),
-        (Iq2Xs, true) => v!("native_iq2xs_res_streamed"),
-        (Iq2S, false) => v!("native_iq2s_streamed"),
-        (Iq2S, true) => v!("native_iq2s_res_streamed"),
-        (Iq3Xxs, false) => v!("native_iq3xxs_streamed"),
-        (Iq3Xxs, true) => v!("native_iq3xxs_res_streamed"),
-        (Iq3S, false) => v!("native_iq3s_streamed"),
-        (Iq3S, true) => v!("native_iq3s_res_streamed"),
-        (Iq1S, false) => v!("native_iq1s_streamed"),
-        (Iq1S, true) => v!("native_iq1s_res_streamed"),
-        (Iq1M, false) => v!("native_iq1m_streamed"),
-        (Iq1M, true) => v!("native_iq1m_res_streamed"),
         _ => None,
     }
 }
@@ -238,11 +168,17 @@ pub(crate) fn native_mrow_spv(dtype: infr_core::DType) -> Option<(&'static str, 
     }
 }
 
-/// SPIR-V + kernel-cache name for the multi-output-row decode GEMV (`RM` rows/workgroup, bit-
-/// identical per row to the RM=1 native GEMV). Only the K-quant formats that dominate decode
-/// (Q4_K/Q6_K) have RM builds; everything else stays on the RM=1 path. `rm` is 2 or 4.
+/// The multi-output-row decode GEMV (`RM` rows/workgroup, bit-identical per row to the RM=1 native
+/// GEMV) — kernel-cache name + SPIR-V, the ONLY weight build for this family (the bound-SSBO
+/// resident build died with the eager `Recorder::linear_native_rm` caller, its sole consumer). `rm`
+/// is 2 or 4; `res`: `linear_add_native`'s fallback route (RM=1..8 out_f band, reached when the SG
+/// route and the default "reg" variant route both miss — e.g. `INFR_NO_GEMV_REG`) dispatches this
+/// table with `res = true`, so the residual arm is load-bearing for
+/// [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity convenience. Only
+/// the K-quant formats that dominate decode (Q4_K/Q6_K) have RM builds; everything else stays on
+/// the RM=1 path.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_rm_build_spv(
+pub(crate) fn native_rm_streamed_build_spv(
     dtype: infr_core::DType,
     res: bool,
     rm: u32,
@@ -272,47 +208,15 @@ pub(crate) fn native_rm_build_spv(
     }
 }
 
-/// `-DSTREAMED` twin of [`native_rm_build_spv`] (kernel-cache name + SPIR-V). `rm` is 2 or 4; `res`
-/// mirrors [`native_rm_build_spv`]'s residual arm: `linear_add_native`'s fallback route (RM=1..8
-/// out_f band, reached when the SG route and the default "reg" variant route both miss — e.g.
-/// `INFR_NO_GEMV_REG`) dispatches this table with `res = true`, so the residual twin is load-bearing
-/// for [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity-test convenience
-/// like the plain arm ([`crate::recorder::Recorder::linear_native_rm_streamed`]).
+/// SPIR-V + kernel name for an experimental RM kernel variant (env-gated, default OFF) — the ONLY
+/// weight build for this family (the bound-SSBO resident build died with the eager
+/// `Recorder::linear_native_rm_v2` caller, its sole consumer). Returns (kernel_name, spv) for the
+/// given variant + dtype + res combination. `res`: `linear_add_native`'s default route (the "reg"
+/// variant, `INFR_GEMV_VARIANT`/`INFR_NO_GEMV_REG` escapes aside) dispatches THIS table with
+/// `res = true`, so the residual arm is load-bearing for
+/// [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity convenience.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_rm_streamed_build_spv(
-    dtype: infr_core::DType,
-    res: bool,
-    rm: u32,
-) -> Option<(&'static str, &'static [u32])> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            let s = S
-                .get_or_init(|| {
-                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-                })
-                .as_slice();
-            Some(($name, s))
-        }};
-    }
-    match (dtype, res, rm) {
-        (Q4K, false, 2) => v!("native_q4k_rm2_streamed"),
-        (Q4K, true, 2) => v!("native_q4k_rm2_res_streamed"),
-        (Q4K, false, 4) => v!("native_q4k_rm4_streamed"),
-        (Q4K, true, 4) => v!("native_q4k_rm4_res_streamed"),
-        (Q6K, false, 2) => v!("native_q6k_rm2_streamed"),
-        (Q6K, true, 2) => v!("native_q6k_rm2_res_streamed"),
-        (Q6K, false, 4) => v!("native_q6k_rm4_streamed"),
-        (Q6K, true, 4) => v!("native_q6k_rm4_res_streamed"),
-        _ => None,
-    }
-}
-
-/// SPIR-V + kernel name for an experimental RM kernel variant (env-gated, default OFF).
-/// Returns (kernel_name, spv) for the given variant + dtype + res combination.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_rm_variant_spv(
+pub(crate) fn native_rm_v2_streamed_build_spv(
     variant: &str,
     dtype: infr_core::DType,
     res: bool,
@@ -344,53 +248,19 @@ pub(crate) fn native_rm_variant_spv(
     }
 }
 
-/// `-DSTREAMED` twin of [`native_rm_variant_spv`] (kernel-cache name + SPIR-V). `res` mirrors
-/// [`native_rm_variant_spv`]'s residual arm: `linear_add_native`'s default route (the "reg" variant,
-/// `INFR_GEMV_VARIANT`/`INFR_NO_GEMV_REG` escapes aside) dispatches THIS table with `res = true`, so
-/// the residual twin is load-bearing for [`crate::recorder::Recorder::linear_add_native_streamed`],
-/// not just a parity-test convenience like the plain arm
-/// ([`crate::recorder::Recorder::linear_native_rm_v2_streamed`]).
+/// The reassociation-tolerant subgroup+NUM_ROWS decode GEMV (`native_gemv_sg.comp`, one pinned
+/// subgroup per workgroup + subgroupAdd) — kernel-cache name + SPIR-V, the ONLY weight build for
+/// this family (the bound-SSBO resident build died with the eager `Recorder::linear_native_sg`
+/// caller, its sole consumer). NOT bit-identical to the tree GEMV — reordered accumulation; the
+/// caller must gate to the projection band and re-bless any changed golden. Only Q6_K has an SG
+/// build (on Q4_K the tree/RM kernel already saturates — SG regressed). `nr` ∈ {2,4,8}; `res`:
+/// `linear_add_native`'s SG route ([`crate::recorder::Recorder::linear_add_native`]) dispatches this
+/// with `res = true` before ever falling to RM, so the residual arm is load-bearing for
+/// [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity convenience. `sg16`
+/// selects the `-DSG=16` twin (Intel, `caps.sg_pref == 16` — pass false everywhere else for the
+/// byte-identical SG=32 build).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_rm_v2_streamed_build_spv(
-    variant: &str,
-    dtype: infr_core::DType,
-    res: bool,
-) -> Option<(&'static str, &'static [u32])> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            let s = S
-                .get_or_init(|| {
-                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-                })
-                .as_slice();
-            Some(($name, s))
-        }};
-    }
-    match (variant, dtype, res) {
-        ("sg", Q4K, false) => v!("native_q4k_rm2_sg_streamed"),
-        ("sg", Q4K, true) => v!("native_q4k_rm2_sg_res_streamed"),
-        ("sg", Q6K, false) => v!("native_q6k_rm2_sg_streamed"),
-        ("sg", Q6K, true) => v!("native_q6k_rm2_sg_res_streamed"),
-        ("dbuf", Q4K, false) => v!("native_q4k_rm2_dbuf_streamed"),
-        ("dbuf", Q4K, true) => v!("native_q4k_rm2_dbuf_res_streamed"),
-        ("wg128", Q4K, false) => v!("native_q4k_rm2_wg128_streamed"),
-        ("wg128", Q4K, true) => v!("native_q4k_rm2_wg128_res_streamed"),
-        ("reg", Q4K, false) => v!("native_q4k_rm2_reg_streamed"),
-        ("reg", Q4K, true) => v!("native_q4k_rm2_reg_res_streamed"),
-        _ => None,
-    }
-}
-
-/// SPIR-V + kernel-cache name for the reassociation-tolerant subgroup+NUM_ROWS decode GEMV
-/// (`native_gemv_sg.comp`, one pinned subgroup per workgroup + subgroupAdd). NOT bit-identical to
-/// the tree GEMV — reordered accumulation; the caller must gate to the projection band and
-/// re-bless any changed golden. Only Q6_K has an SG build (on Q4_K the tree/RM kernel already
-/// saturates — SG regressed). `nr` ∈ {2,4,8}. `sg16` selects the `-DSG=16` twin (Intel,
-/// `caps.sg_pref == 16` — pass false everywhere else for the byte-identical SG=32 build).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_sg_build_spv(
+pub(crate) fn native_sg_streamed_build_spv(
     dtype: infr_core::DType,
     res: bool,
     nr: u32,
@@ -421,48 +291,6 @@ pub(crate) fn native_sg_build_spv(
         (Q6K, true, 4, true) => v!("native_q6k_sg4_res_sg16"),
         (Q6K, false, 8, true) => v!("native_q6k_sg8_sg16"),
         (Q6K, true, 8, true) => v!("native_q6k_sg8_res_sg16"),
-        _ => None,
-    }
-}
-
-/// `-DSTREAMED` twin of [`native_sg_build_spv`] (kernel-cache name + SPIR-V). `nr` ∈ {2,4,8}; `res`
-/// mirrors [`native_sg_build_spv`]'s residual arm — `linear_add_native`'s SG route
-/// ([`crate::recorder::Recorder::linear_add_native`]) dispatches this with `res = true` before ever
-/// falling to RM, so the residual twin is load-bearing for
-/// [`crate::recorder::Recorder::linear_add_native_streamed`], not just a parity-test convenience
-/// like the plain arm ([`crate::recorder::Recorder::linear_native_sg_streamed`]).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_sg_streamed_build_spv(
-    dtype: infr_core::DType,
-    res: bool,
-    nr: u32,
-    sg16: bool,
-) -> Option<(&'static str, &'static [u32])> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            let s = S
-                .get_or_init(|| {
-                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-                })
-                .as_slice();
-            Some(($name, s))
-        }};
-    }
-    match (dtype, res, nr, sg16) {
-        (Q6K, false, 2, false) => v!("native_q6k_sg2_streamed"),
-        (Q6K, true, 2, false) => v!("native_q6k_sg2_res_streamed"),
-        (Q6K, false, 4, false) => v!("native_q6k_sg4_streamed"),
-        (Q6K, true, 4, false) => v!("native_q6k_sg4_res_streamed"),
-        (Q6K, false, 8, false) => v!("native_q6k_sg8_streamed"),
-        (Q6K, true, 8, false) => v!("native_q6k_sg8_res_streamed"),
-        (Q6K, false, 2, true) => v!("native_q6k_sg2_sg16_streamed"),
-        (Q6K, true, 2, true) => v!("native_q6k_sg2_res_sg16_streamed"),
-        (Q6K, false, 4, true) => v!("native_q6k_sg4_sg16_streamed"),
-        (Q6K, true, 4, true) => v!("native_q6k_sg4_res_sg16_streamed"),
-        (Q6K, false, 8, true) => v!("native_q6k_sg8_sg16_streamed"),
-        (Q6K, true, 8, true) => v!("native_q6k_sg8_res_sg16_streamed"),
         _ => None,
     }
 }
@@ -1237,11 +1065,13 @@ pub(crate) fn native_gemm_mmq_dense_spv(
         _ => return None,
     })
 }
-/// `-DSTREAMED` twin SPIR-V of `linear_f16` (slice A4; see the shader's
-/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+/// The f16-weight decode GEMV (`linear_f16.comp`; weight read through a typed 64-bit
+/// buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the bound-SSBO
+/// resident build died with the eager `VulkanBackend::linear_f16` caller, its sole consumer).
+/// Production entry: [`crate::recorder::Recorder::linear_streamed`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_f16_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16_streamed.spv"));
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -1253,11 +1083,13 @@ pub(crate) fn linear_f16_noext_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
-/// `-DSTREAMED` twin SPIR-V of `linear_bf16` (slice A4; see the shader's
-/// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
+/// The bf16-weight decode GEMV (`linear_bf16.comp`; weight read through a typed 64-bit
+/// buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the bound-SSBO
+/// resident build died with the eager `VulkanBackend::linear_bf16` caller, its sole consumer).
+/// Production entry: [`crate::recorder::Recorder::linear_bf16_streamed`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn linear_bf16_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16_streamed.spv"));
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -2000,8 +1832,6 @@ const GELU_MUL_FUSED_SPV_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gelu_mul_fused.spv"));
 const STORE_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/store_f16.spv"));
 const ROPE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rope.spv"));
-const LINEAR_F16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
-const LINEAR_BF16_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
 const ATTENTION_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention.spv"));
 const ATTN_COMBINE_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attn_combine.spv"));
 const ATTENTION_KV_SPV_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention_kv.spv"));
@@ -2898,23 +2728,11 @@ pub(crate) fn rope_spv() -> &'static [u32] {
     static ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ROPE_SPV.get_or_init(|| spv_words(ROPE_SPV_BYTES))
 }
-/// SPIR-V for the f16-weight GEMV (`y=x·Wᵀ`).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f16_spv() -> &'static [u32] {
-    static LINEAR_F16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    LINEAR_F16_SPV.get_or_init(|| spv_words(LINEAR_F16_SPV_BYTES))
-}
 /// SPIR-V for E2B per-layer inp_gate fused GEMV+GELU+strided-multiply kernel.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn e2b_gate_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/e2b_gate.spv"))))
-}
-/// SPIR-V for E2B per-layer proj: fused f32 GEMV+RMSNorm+Add kernel.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn e2b_proj_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/e2b_proj.spv"))))
 }
 /// `-DSTREAMED` twin SPIR-V of `e2b_gate` (weight read through a typed 64-bit buffer_reference —
 /// see the shader's STREAMED doc). Parity-test entry.
@@ -2925,18 +2743,6 @@ pub(crate) fn e2b_gate_streamed_spv() -> &'static [u32] {
         spv_words(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/e2b_gate_streamed.spv"
-        )))
-    })
-}
-/// `-DSTREAMED` twin SPIR-V of `e2b_proj` (same STREAMED convention as `e2b_gate`). Parity-test
-/// entry.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn e2b_proj_streamed_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| {
-        spv_words(include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/e2b_proj_streamed.spv"
         )))
     })
 }
@@ -2961,12 +2767,6 @@ pub(crate) fn qk_norm_rope_interleaved_dyn_spv() -> &'static [u32] {
             "/qk_norm_rope_interleaved_dyn.spv"
         )))
     })
-}
-/// SPIR-V for the bf16-weight GEMV (`y=x·Wᵀ`).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_bf16_spv() -> &'static [u32] {
-    static LINEAR_BF16_SPV: OnceLock<Vec<u32>> = OnceLock::new();
-    LINEAR_BF16_SPV.get_or_init(|| spv_words(LINEAR_BF16_SPV_BYTES))
 }
 /// SPIR-V for the online-softmax GQA attention (hd<=128).
 #[cfg_attr(infr_profile, infr_prof::instrument)]

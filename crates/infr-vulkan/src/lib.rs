@@ -139,8 +139,6 @@ struct VulkanShared {
     /// `bind_descriptors`) instead of a pooled `alloc_set` + `update_descriptor_sets` +
     /// `cmd_bind_descriptor_sets` per op. `None` falls back to the pooled path.
     push_descriptor: Option<ash::khr::push_descriptor::Device>,
-    /// Lazily-built, reused compute pipeline for the linear op (see `linear.rs`).
-    linear_kernel: std::sync::OnceLock<crate::linear::LinearKernel>,
     /// Generic cache of compute kernels by name (see `ops.rs`).
     kernels: Mutex<HashMap<&'static str, crate::ops::ComputeKernel>>,
     /// Device pipeline cache, seeded from disk at init and persisted back (see `pcache.rs`) so
@@ -242,10 +240,6 @@ impl Drop for VulkanShared {
                 self.device.device_wait_idle(),
                 Err(vk::Result::ERROR_DEVICE_LOST)
             );
-            // Destroy the cached linear kernel (pipeline/layouts/shader/pool) if built.
-            if let Some(k) = self.linear_kernel.get() {
-                crate::linear::destroy_linear_kernel(&self.device, k);
-            }
             if let Ok(map) = self.kernels.lock() {
                 for k in map.values() {
                     crate::ops::destroy_compute_kernel(&self.device, k);
@@ -1674,7 +1668,6 @@ impl VulkanBackend {
                 has_mem_budget,
                 max_mem_alloc_size,
                 push_descriptor,
-                linear_kernel: std::sync::OnceLock::new(),
                 kernels: Mutex::new(HashMap::new()),
                 pipeline_cache,
                 pcache,

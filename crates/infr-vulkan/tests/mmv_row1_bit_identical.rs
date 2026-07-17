@@ -7,7 +7,7 @@
 //! `rows=1` (decode) or `rows=2..16` (verify) — see `native_mmv_mrow.comp`'s header. A row's
 //! result depends only on its own `qa`/`dact`/`sact` slice, never on `rows`, so this test proves
 //! decode-shape (rows=1) and verify-shape (rows=3) agree bit-for-bit, for every dtype on the
-//! int8-decode/mrow tier — the set `native_mmv_mrow_variant_spv` builds a `-DUSE_RES` rows=1 twin
+//! int8-decode/mrow tier — the set `native_mmv_mrow_variant_name` builds a `-DUSE_RES` rows=1 twin
 //! for: the k-quants (Q4_K, Q6_K, Q2_K, Q3_K, Q5_K) AND the legacy 32-block family (Q8_0, Q4_0,
 //! Q5_0, Q4_1, Q5_1, IQ4_NL). The legacy formats belong here for exactly the same reason Q5_K does
 //! — several of them ship PREFILL-only (`mrow_int8_prefill_dtypes`) with their decode tier off on a

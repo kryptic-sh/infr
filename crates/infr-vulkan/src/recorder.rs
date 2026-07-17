@@ -946,8 +946,8 @@ impl<'a> Recorder<'a> {
     ) {
         self.label_gemv("lin_f16_noext_streamed", rows, in_f, out_f);
         let k = self.be.kernel(
-            "linear_f16_noext_streamed",
-            crate::gemm::linear_f16_noext_streamed_spv(),
+            "linear_f16_noext",
+            crate::gemm::linear_f16_noext_spv(),
             3,
             20,
         );
@@ -1036,26 +1036,26 @@ impl<'a> Recorder<'a> {
         let use_v4 = use_mrow && in_f.is_multiple_of(4) && std::env::var("INFR_NO_F32_V4").is_err();
         let (name, spv, groups) = if use_v4 && rows <= 4 {
             (
-                "linear_f32r_mrow4_v4_streamed",
-                crate::gemm::linear_f32r_mrow4_v4_streamed_spv(),
+                "linear_f32r_mrow4_v4",
+                crate::gemm::linear_f32r_mrow4_v4_spv(),
                 (out_f * rows.div_ceil(4)) as u32,
             )
         } else if use_v4 {
             (
-                "linear_f32r_mrow8_v4_streamed",
-                crate::gemm::linear_f32r_mrow8_v4_streamed_spv(),
+                "linear_f32r_mrow8_v4",
+                crate::gemm::linear_f32r_mrow8_v4_spv(),
                 (out_f * rows.div_ceil(8)) as u32,
             )
         } else if use_mrow {
             (
-                "linear_f32r_mrow8_streamed",
-                crate::gemm::linear_f32r_mrow8_streamed_spv(),
+                "linear_f32r_mrow8",
+                crate::gemm::linear_f32r_mrow8_spv(),
                 (out_f * rows.div_ceil(8)) as u32,
             )
         } else {
             (
-                "linear_f32r_streamed",
-                crate::gemm::linear_f32r_streamed_spv(),
+                "linear_f32r",
+                crate::gemm::linear_f32r_spv(),
                 (rows * out_f) as u32,
             )
         };
@@ -1088,12 +1088,9 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        let k = self.be.kernel(
-            "linear_res_streamed",
-            crate::gemm::linear_res_streamed_spv(),
-            4,
-            20,
-        );
+        let k = self
+            .be
+            .kernel("linear_res", crate::gemm::linear_res_spv(), 4, 20);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -1223,17 +1220,9 @@ impl<'a> Recorder<'a> {
         // Same M/N routing as matmul_proj — see its comment for the warp-tile rationale.
         let warp = m >= 768 && n.is_multiple_of(256);
         let (name, spv, tiles_n) = if warp {
-            (
-                "gemm_proj_warp_streamed",
-                crate::gemm::gemm_proj_warp_streamed_spv(),
-                n / 256,
-            )
+            ("gemm_proj_warp", crate::gemm::gemm_proj_warp_spv(), n / 256)
         } else {
-            (
-                "gemm_proj_streamed",
-                crate::gemm::gemm_proj_streamed_spv(),
-                n / 64,
-            )
+            ("gemm_proj", crate::gemm::gemm_proj_spv(), n / 64)
         };
         self.label_gemm(name, m, k, n);
         let kern = self.be.kernel_sg(name, spv, 3, 20, 32);
@@ -1314,7 +1303,7 @@ impl<'a> Recorder<'a> {
         } else {
             None
         };
-        // Resident tile NAME the arena-addressed `_streamed` twin keys off (`native_gemm_streamed_spv`
+        // Resident tile NAME the arena-addressed `_streamed` twin keys off (`native_gemm_spv`
         // below) — the pick stays 1:1 with the resident tables, but nothing binds a resident SSBO.
         let name = match (warp, dtype) {
             (Some(256), infr_core::DType::Bf16) => "native_gemm_warp_bf16",
@@ -1352,7 +1341,7 @@ impl<'a> Recorder<'a> {
             "resident-BDA weight: matmul_native_off requires a BDA weight or an explicit arena \
              address",
         );
-        let (kname, kspv) = crate::gemm::native_gemm_streamed_spv(name);
+        let (kname, kspv) = crate::gemm::native_gemm_spv(name);
         let push_size: u32 = 24;
         let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
         let groups_n = match warp {
@@ -1506,7 +1495,7 @@ impl<'a> Recorder<'a> {
             "resident-BDA weight: matmul_native_f16a requires a BDA weight or an explicit arena \
              address",
         );
-        let (kname, kspv) = crate::gemm::native_gemm_streamed_spv(name);
+        let (kname, kspv) = crate::gemm::native_gemm_spv(name);
         let push_size: u32 = 24;
         let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
         let mut push = [0u8; 24];
@@ -1573,7 +1562,7 @@ impl<'a> Recorder<'a> {
             "resident-BDA weight: matmul_native_splitk requires a BDA weight or an explicit arena \
              address",
         );
-        let (kname, kspv) = crate::gemm::native_gemm_streamed_spv(name);
+        let (kname, kspv) = crate::gemm::native_gemm_spv(name);
         let push_size: u32 = 32;
         let mpad = m.div_ceil(64) * 64;
         let kern = self.be.kernel_sg(kname, kspv, 3, push_size, 32);
@@ -2114,7 +2103,7 @@ impl<'a> Recorder<'a> {
     /// (adapter.rs `nc_mmq`: no usable f16 coopmat, packed int8 dot present — Intel Arc/ANV).
     /// Same kernels/conventions as [`Self::matmul_mmq_q4k`]/[`Self::matmul_mmq_q6k`] (which it
     /// delegates to for those dtypes' names), extended to the full dense build set
-    /// (`native_gemm_mmq_dense_streamed_spv`): activations pre-quantized via `quant_q8`, `c` is
+    /// (`native_gemm_mmq_dense_spv`): activations pre-quantized via `quant_q8`, `c` is
     /// `ceil(m/64)*64` rows, requires `n%64`, `k%32`. `sact` (the per-32-block Σx term) is
     /// always passed but bound ONLY for the min-carrying dtypes
     /// (`infr_core::tensor::moe_mmq_needs_sact` — the same SSOT the `_xp` expert dispatch uses;
@@ -2140,7 +2129,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::matmul_mmq`] (slice A3 build-variant: see
-    /// `crate::gemm::native_gemm_mmq_dense_streamed_spv`). Same arena-by-address convention as
+    /// `crate::gemm::native_gemm_mmq_dense_spv`). Same arena-by-address convention as
     /// [`Self::linear_native_streamed`] — the resident build's weight SSBO slot takes a small
     /// FILLER (`qa`) since the arena is never bound as a descriptor. Not wired into any production
     /// dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
@@ -2158,8 +2147,8 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        let (name, spv) = crate::gemm::native_gemm_mmq_dense_streamed_spv(dtype)
-            .expect("matmul_mmq_streamed: dtype gated by native_gemm_mmq_dense_streamed_spv");
+        let (name, spv) = crate::gemm::native_gemm_mmq_dense_spv(dtype)
+            .expect("matmul_mmq_streamed: dtype gated by native_gemm_mmq_dense_spv");
         let needs_sact = infr_core::tensor::moe_mmq_needs_sact(dtype);
         self.label_gemm(name, m, k, n);
         let nb = if needs_sact { 5 } else { 4 };
@@ -2181,7 +2170,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::matmul_fma`] (slice A4: see
-    /// `crate::gemm::native_gemm_fma_streamed_build_spv`). The weight-SSBO slot (binding 1) takes
+    /// `crate::gemm::native_gemm_fma_spv`). The weight-SSBO slot (binding 1) takes
     /// a FILLER (`a`). Parity-test entry, not dispatched in production.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_fma_streamed(
@@ -2195,8 +2184,8 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        let (name, spv) = crate::gemm::native_gemm_fma_streamed_build_spv(dtype)
-            .expect("matmul_fma_streamed: dtype gated by native_gemm_fma_streamed_build_spv");
+        let (name, spv) = crate::gemm::native_gemm_fma_spv(dtype)
+            .expect("matmul_fma_streamed: dtype gated by native_gemm_fma_spv");
         self.label_gemm(name, m, k, n);
         let kern = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
@@ -2515,7 +2504,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_native_mrow`] (slice A1 build-variant: see
-    /// `crate::gemm::native_mrow_streamed_build_spv`). Same arena-by-address convention as
+    /// `crate::gemm::native_mrow_spv`). Same arena-by-address convention as
     /// [`Self::linear_native_streamed`] — binding 0 (the resident build's weight SSBO) takes a
     /// small FILLER (`x`) since the arena is never bound as a descriptor. Not wired into any
     /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
@@ -2533,8 +2522,7 @@ impl<'a> Recorder<'a> {
     ) {
         debug_assert!((2..=8).contains(&rows));
         self.label_gemv("mrow_streamed", rows, in_f, out_f);
-        let (name, spv) =
-            crate::gemm::native_mrow_streamed_build_spv(dtype).expect("native mrow streamed spv");
+        let (name, spv) = crate::gemm::native_mrow_spv(dtype).expect("native mrow streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
@@ -2662,7 +2650,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_mmv`] (slice A2 build-variant: see
-    /// `crate::gemm::native_mmv_streamed_build_spv`). Same arena-by-address convention as
+    /// `crate::gemm::native_mmv_spv`). Same arena-by-address convention as
     /// [`Self::linear_native_streamed`] — binding 0 (the resident build's weight SSBO) takes a
     /// small FILLER (`qa`) since the arena is never bound as a descriptor. Not wired into any
     /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
@@ -2680,8 +2668,8 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         self.label_gemv("mmv_streamed", 1, in_f, out_f);
-        let (name, spv) = crate::gemm::native_mmv_streamed_build_spv(dtype, false)
-            .expect("native mmv streamed spv");
+        let (name, spv) =
+            crate::gemm::native_mmv_spv(dtype, false).expect("native mmv streamed spv");
         let k = self.be.kernel(name, spv, 5, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&1u32.to_ne_bytes());
@@ -2706,7 +2694,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_mmv_mrow`] (slice A2 build-variant: see
-    /// `crate::gemm::native_mmv_mrow_streamed_variant_spv`). Mirrors the resident dispatcher's
+    /// `crate::gemm::native_mmv_mrow_variant_spv`). Mirrors the resident dispatcher's
     /// o4/m4/m16 routing EXACTLY (same env escapes) so a parity test comparing the two at the same
     /// shape lands on the same layout variant. `residual`: fused `y = residual + x·Wᵀ`, same
     /// legality rule as the resident dispatcher (`rows == 1` only — asserted; never legal at the
@@ -2738,10 +2726,9 @@ impl<'a> Recorder<'a> {
         let m4 = rows <= 4 && std::env::var("INFR_NO_MMV_M4").is_err();
         let res = residual.is_some();
         let (name, spv) = if rows > 8 {
-            crate::gemm::native_mmv_mrow_streamed_m16_spv(dtype)
-                .expect("native mmv mrow m16 streamed spv")
+            crate::gemm::native_mmv_mrow_m16_spv(dtype).expect("native mmv mrow m16 streamed spv")
         } else {
-            crate::gemm::native_mmv_mrow_streamed_variant_spv(dtype, o4, m4, res)
+            crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
                 .expect("native mmv mrow streamed spv")
         };
         let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
@@ -2768,9 +2755,9 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_mmv_mw`] (slice A2 build-variant: see
-    /// `crate::gemm::native_mmv_mw_streamed_build_spv`). `residual`: fused `y = residual + x·Wᵀ`,
+    /// `crate::gemm::native_mmv_mw_spv`). `residual`: fused `y = residual + x·Wᵀ`,
     /// same convention as the resident fn — the `_res_streamed` SPV already exists in the build
-    /// table (see `native_mmv_mw_streamed_build_spv`'s `res` column), this wrapper just wasn't
+    /// table (see `native_mmv_mw_spv`'s `res` column), this wrapper just wasn't
     /// exposing it until the resident-BDA routing fork in [`Self::linear_mmv_mw`] needed it (a
     /// non-unified-mmv-row1 GPU can reach the fused-add peephole on a wave32-native device with a
     /// resident-BDA weight).
@@ -2791,9 +2778,8 @@ impl<'a> Recorder<'a> {
     ) {
         self.label_gemv("mmv_mw_streamed", 1, in_f, out_f);
         let res = residual.is_some();
-        let (name, spv) =
-            crate::gemm::native_mmv_mw_streamed_build_spv(dtype, res, warps, self.sg16())
-                .expect("native mmv_mw streamed spv");
+        let (name, spv) = crate::gemm::native_mmv_mw_spv(dtype, res, warps, self.sg16())
+            .expect("native mmv_mw streamed spv");
         let nbind = if res { 6 } else { 5 };
         let k = self.be.kernel_sg(name, spv, nbind, 24, self.sgp());
         let mut push = [0u8; 24];
@@ -2980,7 +2966,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::embed_gather`] (slice A5 build-variant: see
-    /// `crate::gemm::embed_gather_streamed_build_spv`). The token-embedding table is read from a
+    /// `crate::gemm::embed_gather_spv`). The token-embedding table is read from a
     /// resident `bufferDeviceAddress` arena instead of a bound SSBO — binding 0 (the resident
     /// build's weight SSBO) takes a harmless FILLER (`ids`) since the arena is never bound as a
     /// descriptor. Not wired into any production dispatch yet; exists so a parity test can
@@ -2996,8 +2982,7 @@ impl<'a> Recorder<'a> {
         ne: usize,
         scale: f32,
     ) {
-        let (name, spv) =
-            crate::gemm::embed_gather_streamed_build_spv(dtype).expect("embed_gather streamed spv");
+        let (name, spv) = crate::gemm::embed_gather_spv(dtype).expect("embed_gather streamed spv");
         let k = self.be.kernel(name, spv, 3, 20);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
@@ -3082,8 +3067,8 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         self.label_gemv("mmv_add_streamed", 1, in_f, out_f);
-        let (name, spv) = crate::gemm::native_mmv_streamed_build_spv(dtype, true)
-            .expect("native mmv res streamed spv");
+        let (name, spv) =
+            crate::gemm::native_mmv_spv(dtype, true).expect("native mmv res streamed spv");
         let k = self.be.kernel(name, spv, 6, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&1u32.to_ne_bytes());
@@ -6375,193 +6360,193 @@ impl<'a> Recorder<'a> {
         let bn: usize = if wide_bn { 128 } else { 64 };
         let (name, spv, nb): (_, _, usize) = match (dtype, small_tile) {
             (infr_core::DType::Q4K, false) if wide_bn => (
-                "native_gemm_mmq_q4k_xp128_streamed",
-                crate::gemm::native_gemm_mmq_q4k_xp128_streamed_spv(),
+                "native_gemm_mmq_q4k_xp128",
+                crate::gemm::native_gemm_mmq_q4k_xp128_spv(),
                 7,
             ),
             (infr_core::DType::Q4K, false) => (
-                "native_gemm_mmq_q4k_xp_streamed",
-                crate::gemm::native_gemm_mmq_q4k_xp_streamed_spv(),
+                "native_gemm_mmq_q4k_xp",
+                crate::gemm::native_gemm_mmq_q4k_xp_spv(),
                 7,
             ),
             (infr_core::DType::Q4K, true) if wide_bn => (
-                "native_gemm_mmq_q4k_xp32w_streamed",
-                crate::gemm::native_gemm_mmq_q4k_xp32w_streamed_spv(),
+                "native_gemm_mmq_q4k_xp32w",
+                crate::gemm::native_gemm_mmq_q4k_xp32w_spv(),
                 7,
             ),
             (infr_core::DType::Q4K, true) => (
-                "native_gemm_mmq_q4k_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q4k_xp32_streamed_spv(),
+                "native_gemm_mmq_q4k_xp32",
+                crate::gemm::native_gemm_mmq_q4k_xp32_spv(),
                 7,
             ),
             (infr_core::DType::Q6K, false) if wide_bn => (
-                "native_gemm_mmq_q6k_xp128_streamed",
-                crate::gemm::native_gemm_mmq_q6k_xp128_streamed_spv(),
+                "native_gemm_mmq_q6k_xp128",
+                crate::gemm::native_gemm_mmq_q6k_xp128_spv(),
                 6,
             ),
             (infr_core::DType::Q6K, false) => (
-                "native_gemm_mmq_q6k_xp_streamed",
-                crate::gemm::native_gemm_mmq_q6k_xp_streamed_spv(),
+                "native_gemm_mmq_q6k_xp",
+                crate::gemm::native_gemm_mmq_q6k_xp_spv(),
                 6,
             ),
             (infr_core::DType::Q6K, true) if wide_bn => (
-                "native_gemm_mmq_q6k_xp32w_streamed",
-                crate::gemm::native_gemm_mmq_q6k_xp32w_streamed_spv(),
+                "native_gemm_mmq_q6k_xp32w",
+                crate::gemm::native_gemm_mmq_q6k_xp32w_spv(),
                 6,
             ),
             (infr_core::DType::Q6K, true) => (
-                "native_gemm_mmq_q6k_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q6k_xp32_streamed_spv(),
+                "native_gemm_mmq_q6k_xp32",
+                crate::gemm::native_gemm_mmq_q6k_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Q8_0, false) => (
-                "native_gemm_mmq_q8_0_xp_streamed",
-                crate::gemm::native_gemm_mmq_q8_0_xp_streamed_spv(),
+                "native_gemm_mmq_q8_0_xp",
+                crate::gemm::native_gemm_mmq_q8_0_xp_spv(),
                 6,
             ),
             (infr_core::DType::Q8_0, true) => (
-                "native_gemm_mmq_q8_0_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q8_0_xp32_streamed_spv(),
+                "native_gemm_mmq_q8_0_xp32",
+                crate::gemm::native_gemm_mmq_q8_0_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Q5_0, false) => (
-                "native_gemm_mmq_q5_0_xp_streamed",
-                crate::gemm::native_gemm_mmq_q5_0_xp_streamed_spv(),
+                "native_gemm_mmq_q5_0_xp",
+                crate::gemm::native_gemm_mmq_q5_0_xp_spv(),
                 6,
             ),
             (infr_core::DType::Q5_0, true) => (
-                "native_gemm_mmq_q5_0_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q5_0_xp32_streamed_spv(),
+                "native_gemm_mmq_q5_0_xp32",
+                crate::gemm::native_gemm_mmq_q5_0_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Q5K, false) => (
-                "native_gemm_mmq_q5k_xp_streamed",
-                crate::gemm::native_gemm_mmq_q5k_xp_streamed_spv(),
+                "native_gemm_mmq_q5k_xp",
+                crate::gemm::native_gemm_mmq_q5k_xp_spv(),
                 7,
             ),
             (infr_core::DType::Q5K, true) => (
-                "native_gemm_mmq_q5k_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q5k_xp32_streamed_spv(),
+                "native_gemm_mmq_q5k_xp32",
+                crate::gemm::native_gemm_mmq_q5k_xp32_spv(),
                 7,
             ),
             (infr_core::DType::Q5_1, false) => (
-                "native_gemm_mmq_q5_1_xp_streamed",
-                crate::gemm::native_gemm_mmq_q5_1_xp_streamed_spv(),
+                "native_gemm_mmq_q5_1_xp",
+                crate::gemm::native_gemm_mmq_q5_1_xp_spv(),
                 7,
             ),
             (infr_core::DType::Q5_1, true) => (
-                "native_gemm_mmq_q5_1_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q5_1_xp32_streamed_spv(),
+                "native_gemm_mmq_q5_1_xp32",
+                crate::gemm::native_gemm_mmq_q5_1_xp32_spv(),
                 7,
             ),
             (infr_core::DType::Q2K, false) => (
-                "native_gemm_mmq_q2_k_xp_streamed",
-                crate::gemm::native_gemm_mmq_q2_k_xp_streamed_spv(),
+                "native_gemm_mmq_q2_k_xp",
+                crate::gemm::native_gemm_mmq_q2_k_xp_spv(),
                 6,
             ),
             (infr_core::DType::Q2K, true) => (
-                "native_gemm_mmq_q2_k_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q2_k_xp32_streamed_spv(),
+                "native_gemm_mmq_q2_k_xp32",
+                crate::gemm::native_gemm_mmq_q2_k_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Q3K, false) => (
-                "native_gemm_mmq_q3_k_xp_streamed",
-                crate::gemm::native_gemm_mmq_q3_k_xp_streamed_spv(),
+                "native_gemm_mmq_q3_k_xp",
+                crate::gemm::native_gemm_mmq_q3_k_xp_spv(),
                 6,
             ),
             (infr_core::DType::Q3K, true) => (
-                "native_gemm_mmq_q3_k_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q3_k_xp32_streamed_spv(),
+                "native_gemm_mmq_q3_k_xp32",
+                crate::gemm::native_gemm_mmq_q3_k_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Q4_0, false) => (
-                "native_gemm_mmq_q4_0_xp_streamed",
-                crate::gemm::native_gemm_mmq_q4_0_xp_streamed_spv(),
+                "native_gemm_mmq_q4_0_xp",
+                crate::gemm::native_gemm_mmq_q4_0_xp_spv(),
                 6,
             ),
             (infr_core::DType::Q4_0, true) => (
-                "native_gemm_mmq_q4_0_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q4_0_xp32_streamed_spv(),
+                "native_gemm_mmq_q4_0_xp32",
+                crate::gemm::native_gemm_mmq_q4_0_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Q4_1, false) => (
-                "native_gemm_mmq_q4_1_xp_streamed",
-                crate::gemm::native_gemm_mmq_q4_1_xp_streamed_spv(),
+                "native_gemm_mmq_q4_1_xp",
+                crate::gemm::native_gemm_mmq_q4_1_xp_spv(),
                 7,
             ),
             (infr_core::DType::Q4_1, true) => (
-                "native_gemm_mmq_q4_1_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q4_1_xp32_streamed_spv(),
+                "native_gemm_mmq_q4_1_xp32",
+                crate::gemm::native_gemm_mmq_q4_1_xp32_spv(),
                 7,
             ),
             (infr_core::DType::Iq4Nl, false) => (
-                "native_gemm_mmq_iq4_nl_xp_streamed",
-                crate::gemm::native_gemm_mmq_iq4_nl_xp_streamed_spv(),
+                "native_gemm_mmq_iq4_nl_xp",
+                crate::gemm::native_gemm_mmq_iq4_nl_xp_spv(),
                 6,
             ),
             (infr_core::DType::Iq4Nl, true) => (
-                "native_gemm_mmq_iq4_nl_xp32_streamed",
-                crate::gemm::native_gemm_mmq_iq4_nl_xp32_streamed_spv(),
+                "native_gemm_mmq_iq4_nl_xp32",
+                crate::gemm::native_gemm_mmq_iq4_nl_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Iq4Xs, false) => (
-                "native_gemm_mmq_iq4_xs_xp_streamed",
-                crate::gemm::native_gemm_mmq_iq4_xs_xp_streamed_spv(),
+                "native_gemm_mmq_iq4_xs_xp",
+                crate::gemm::native_gemm_mmq_iq4_xs_xp_spv(),
                 6,
             ),
             (infr_core::DType::Iq4Xs, true) => (
-                "native_gemm_mmq_iq4_xs_xp32_streamed",
-                crate::gemm::native_gemm_mmq_iq4_xs_xp32_streamed_spv(),
+                "native_gemm_mmq_iq4_xs_xp32",
+                crate::gemm::native_gemm_mmq_iq4_xs_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Iq2S, false) => (
-                "native_gemm_mmq_iq2_s_xp_streamed",
-                crate::gemm::native_gemm_mmq_iq2_s_xp_streamed_spv(),
+                "native_gemm_mmq_iq2_s_xp",
+                crate::gemm::native_gemm_mmq_iq2_s_xp_spv(),
                 6,
             ),
             (infr_core::DType::Iq2S, true) => (
-                "native_gemm_mmq_iq2_s_xp32_streamed",
-                crate::gemm::native_gemm_mmq_iq2_s_xp32_streamed_spv(),
+                "native_gemm_mmq_iq2_s_xp32",
+                crate::gemm::native_gemm_mmq_iq2_s_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Iq3S, false) => (
-                "native_gemm_mmq_iq3_s_xp_streamed",
-                crate::gemm::native_gemm_mmq_iq3_s_xp_streamed_spv(),
+                "native_gemm_mmq_iq3_s_xp",
+                crate::gemm::native_gemm_mmq_iq3_s_xp_spv(),
                 6,
             ),
             (infr_core::DType::Iq3S, true) => (
-                "native_gemm_mmq_iq3_s_xp32_streamed",
-                crate::gemm::native_gemm_mmq_iq3_s_xp32_streamed_spv(),
+                "native_gemm_mmq_iq3_s_xp32",
+                crate::gemm::native_gemm_mmq_iq3_s_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Mxfp4, false) => (
-                "native_gemm_mmq_mxfp4_xp_streamed",
-                crate::gemm::native_gemm_mmq_mxfp4_xp_streamed_spv(),
+                "native_gemm_mmq_mxfp4_xp",
+                crate::gemm::native_gemm_mmq_mxfp4_xp_spv(),
                 6,
             ),
             (infr_core::DType::Mxfp4, true) => (
-                "native_gemm_mmq_mxfp4_xp32_streamed",
-                crate::gemm::native_gemm_mmq_mxfp4_xp32_streamed_spv(),
+                "native_gemm_mmq_mxfp4_xp32",
+                crate::gemm::native_gemm_mmq_mxfp4_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Nvfp4, false) => (
-                "native_gemm_mmq_nvfp4_xp_streamed",
-                crate::gemm::native_gemm_mmq_nvfp4_xp_streamed_spv(),
+                "native_gemm_mmq_nvfp4_xp",
+                crate::gemm::native_gemm_mmq_nvfp4_xp_spv(),
                 6,
             ),
             (infr_core::DType::Nvfp4, true) => (
-                "native_gemm_mmq_nvfp4_xp32_streamed",
-                crate::gemm::native_gemm_mmq_nvfp4_xp32_streamed_spv(),
+                "native_gemm_mmq_nvfp4_xp32",
+                crate::gemm::native_gemm_mmq_nvfp4_xp32_spv(),
                 6,
             ),
             (infr_core::DType::Q2_0, false) => (
-                "native_gemm_mmq_q2_0_xp_streamed",
-                crate::gemm::native_gemm_mmq_q2_0_xp_streamed_spv(),
+                "native_gemm_mmq_q2_0_xp",
+                crate::gemm::native_gemm_mmq_q2_0_xp_spv(),
                 6,
             ),
             (infr_core::DType::Q2_0, true) => (
-                "native_gemm_mmq_q2_0_xp32_streamed",
-                crate::gemm::native_gemm_mmq_q2_0_xp32_streamed_spv(),
+                "native_gemm_mmq_q2_0_xp32",
+                crate::gemm::native_gemm_mmq_q2_0_xp32_spv(),
                 6,
             ),
             _ => unreachable!(
@@ -6972,7 +6957,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_native_id`] (slice A4 build-variant: see
-    /// `crate::gemm::native_id_streamed_build_spv`). The stacked expert tensor lives at
+    /// `crate::gemm::native_id_build_spv`). The stacked expert tensor lives at
     /// `arena_addr` in a resident BDA arena; `stride_bytes` is the per-expert BYTE stride the
     /// shader applies on the 64-bit pointer (`nw_ptr = arena + u64(ids[slot]) * u64(stride_bytes)`)
     /// — the u32 element-space `ids*stride` multiply this replaces wraps past 2^32 elements.
@@ -6993,8 +6978,7 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         self.label_gemv("gemv_id_streamed", rows, in_f, out_f);
-        let (name, spv) =
-            crate::gemm::native_id_streamed_build_spv(dtype).expect("native id streamed spv");
+        let (name, spv) = crate::gemm::native_id_build_spv(dtype).expect("native id streamed spv");
         let k = self.be.kernel(name, spv, 4, 28);
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
@@ -7014,7 +6998,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_native_id_multi`] (slice A4 build-variant: see
-    /// `crate::gemm::native_idm_streamed_build_spv`). Same BYTE-stride-on-the-pointer convention
+    /// `crate::gemm::native_idm_build_spv`). Same BYTE-stride-on-the-pointer convention
     /// as [`Self::linear_native_id_streamed`]. Mirrors the resident dispatcher's SG routing (m=1
     /// decode, Q6_K/Q5_K/IQ3_S projection band) so a parity test comparing the two at the same
     /// shape lands on the same kernel. [`Self::linear_native_id_multi`] forks here when its weight
@@ -7047,7 +7031,7 @@ impl<'a> Recorder<'a> {
         if rows == 1 {
             if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f) {
                 if let Some((name, spv)) =
-                    crate::gemm::native_idm_sg_streamed_build_spv(dtype, nr, self.sg16())
+                    crate::gemm::native_idm_sg_build_spv(dtype, nr, self.sg16())
                 {
                     let k = self.be.kernel_sg(name, spv, 4, 32, self.sgp());
                     let groups = (n_used * out_f.div_ceil(nr as usize)) as u32;
@@ -7057,7 +7041,7 @@ impl<'a> Recorder<'a> {
             }
         }
         let (name, spv) =
-            crate::gemm::native_idm_streamed_build_spv(dtype).expect("native idm streamed spv");
+            crate::gemm::native_idm_build_spv(dtype).expect("native idm streamed spv");
         let k = self.be.kernel(name, spv, 4, 32);
         self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
     }
@@ -7242,7 +7226,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DSTREAMED` twin of [`Self::linear_mmv_id_multi_q4k`] (slice A4 build-variant: see
-    /// `crate::gemm::native_mmv_id_q4k_streamed_spv`). Same BYTE-stride-on-the-pointer convention
+    /// `crate::gemm::native_mmv_id_q4k_spv`). Same BYTE-stride-on-the-pointer convention
     /// as [`Self::linear_native_id_streamed`]; binding 0 takes a small FILLER (`qa`).
     /// [`Self::linear_mmv_id_multi_q4k`] forks here when its weight buffer is arena-allocated
     /// (`w.device_addr()`).
@@ -7261,8 +7245,8 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         let k = self.be.kernel(
-            "native_mmv_id_q4k_streamed",
-            crate::gemm::native_mmv_id_q4k_streamed_spv(),
+            "native_mmv_id_q4k",
+            crate::gemm::native_mmv_id_q4k_spv(),
             6,
             24,
         );

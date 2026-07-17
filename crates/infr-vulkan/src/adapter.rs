@@ -711,7 +711,7 @@ fn mmv_mw_choice(
         // Same (o4, m4=true, res=false) probe the rows=1 dispatch resolves — see
         // `Recorder::linear_mmv_mrow`'s variant selection (decode is always m4, and every dtype
         // with a plain build has the o4/res twins too).
-        crate::gemm::native_mmv_mrow_variant_spv(dt, in_f < 2048, true, false).is_some()
+        crate::gemm::native_mmv_mrow_variant_name(dt, in_f < 2048, true, false).is_some()
     } else {
         matches!(warps, 1 | 2 | 4 | 8 | 16)
             && crate::gemm::native_mmv_mw_build_spv(dt, false, warps, false).is_some()
@@ -1224,7 +1224,7 @@ fn lower_op(
             let mrow16 = (9..=16).contains(&m)
                 && out_f <= 8192
                 && mmv_gate
-                && crate::gemm::native_mmv_mrow_m16_spv(dt).is_some()
+                && crate::gemm::native_mmv_mrow_m16_name(dt).is_some()
                 && std::env::var("INFR_NO_MROW16").is_err();
             if ((2..=4).contains(&m) || ((5..=8).contains(&m) && out_f <= 8192) || mrow16)
                 && in_f % 32 == 0

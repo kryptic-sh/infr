@@ -18,15 +18,15 @@ fn spv_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-// Generated `native_gemm_streamed_spv(name) -> &'static [u32]`: resident dense-GEMM kernel name to
+// Generated `native_gemm_spv(name) -> &'static [u32]`: resident dense-GEMM kernel name to
 // its `-DSTREAMED` arena-addressed twin (see build.rs and the Recorder's `matmul_native_*` streamed
 // remap). Uses `spv_words`/`OnceLock` from this module scope.
-include!(concat!(env!("OUT_DIR"), "/native_streamed_gemm_map.rs"));
+include!(concat!(env!("OUT_DIR"), "/native_gemm_map.rs"));
 
 /// Kernel-cache NAME of the multi-row native GEMV (m = 2..8 — the spec-decode verify /
 /// short-suffix-prefill shape) for `dtype`, or `None` for formats without an mrow build (they keep
 /// the tiled GEMM route). Availability + name oracle: the resident bound-SSBO build is gone, so the
-/// `_streamed` twin (native_mrow_streamed_build_spv) is the sole weight build that dispatches.
+/// `_streamed` twin (native_mrow_spv) is the sole weight build that dispatches.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mrow_build_spv(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
@@ -206,9 +206,7 @@ pub(crate) fn native_streamed_build_spv(
 /// exists purely so parity tests can exercise it — see `tests/gemv_streamed_parity.rs`). `None` for
 /// a dtype without an mrow build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mrow_streamed_build_spv(
-    dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
+pub(crate) fn native_mrow_spv(dtype: infr_core::DType) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -222,20 +220,20 @@ pub(crate) fn native_mrow_streamed_build_spv(
         }};
     }
     match dtype {
-        Q8_0 => v!("native_mrow_q8_0_streamed"),
-        Bf16 => v!("native_mrow_bf16_streamed"),
-        Q4_0 => v!("native_mrow_q4_0_streamed"),
-        Q4_1 => v!("native_mrow_q4_1_streamed"),
-        Q5_0 => v!("native_mrow_q5_0_streamed"),
-        Q5_1 => v!("native_mrow_q5_1_streamed"),
-        Q2K => v!("native_mrow_q2k_streamed"),
-        Q3K => v!("native_mrow_q3k_streamed"),
-        Q4K => v!("native_mrow_q4k_streamed"),
-        Q5K => v!("native_mrow_q5k_streamed"),
-        Q6K => v!("native_mrow_q6k_streamed"),
-        Iq4Nl => v!("native_mrow_iq4nl_streamed"),
-        Iq4Xs => v!("native_mrow_iq4xs_streamed"),
-        Q2_0 => v!("native_mrow_q2_0_streamed"),
+        Q8_0 => v!("native_mrow_q8_0"),
+        Bf16 => v!("native_mrow_bf16"),
+        Q4_0 => v!("native_mrow_q4_0"),
+        Q4_1 => v!("native_mrow_q4_1"),
+        Q5_0 => v!("native_mrow_q5_0"),
+        Q5_1 => v!("native_mrow_q5_1"),
+        Q2K => v!("native_mrow_q2k"),
+        Q3K => v!("native_mrow_q3k"),
+        Q4K => v!("native_mrow_q4k"),
+        Q5K => v!("native_mrow_q5k"),
+        Q6K => v!("native_mrow_q6k"),
+        Iq4Nl => v!("native_mrow_iq4nl"),
+        Iq4Xs => v!("native_mrow_iq4xs"),
+        Q2_0 => v!("native_mrow_q2_0"),
         _ => None,
     }
 }
@@ -567,7 +565,7 @@ pub(crate) fn native_idm_paged_build_spv(dtype: infr_core::DType) -> Option<&'st
 /// per-expert BYTE stride applied on the 64-bit pointer (no LUT). Slice A4 build-variant only;
 /// parity-test entry, not dispatched in production.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_id_streamed_build_spv(
+pub(crate) fn native_id_build_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
@@ -583,33 +581,33 @@ pub(crate) fn native_id_streamed_build_spv(
         }};
     }
     match dtype {
-        Q8_0 => v!("native_id_q8_0_streamed"),
-        Q4_0 => v!("native_id_q4_0_streamed"),
-        Q4_1 => v!("native_id_q4_1_streamed"),
-        Q5_0 => v!("native_id_q5_0_streamed"),
-        Q5_1 => v!("native_id_q5_1_streamed"),
-        Q2K => v!("native_id_q2k_streamed"),
-        Q3K => v!("native_id_q3k_streamed"),
-        Q4K => v!("native_id_q4k_streamed"),
-        Q5K => v!("native_id_q5k_streamed"),
-        Q6K => v!("native_id_q6k_streamed"),
-        Iq4Nl => v!("native_id_iq4nl_streamed"),
-        Iq4Xs => v!("native_id_iq4xs_streamed"),
-        Mxfp4 => v!("native_id_mxfp4_streamed"),
-        Nvfp4 => v!("native_id_nvfp4_streamed"),
-        Tq1_0 => v!("native_id_tq1_0_streamed"),
-        Tq2_0 => v!("native_id_tq2_0_streamed"),
-        Q2_0 => v!("native_id_q2_0_streamed"),
-        Iq2Xxs => v!("native_id_iq2xxs_streamed"),
-        Iq2Xs => v!("native_id_iq2xs_streamed"),
-        Iq2S => v!("native_id_iq2s_streamed"),
-        Iq3Xxs => v!("native_id_iq3xxs_streamed"),
-        Iq3S => v!("native_id_iq3s_streamed"),
-        Iq1S => v!("native_id_iq1s_streamed"),
-        Iq1M => v!("native_id_iq1m_streamed"),
-        Bf16 => v!("native_id_bf16_streamed"),
-        F16 => v!("native_id_f16_streamed"),
-        F32 => v!("native_id_f32_streamed"),
+        Q8_0 => v!("native_id_q8_0"),
+        Q4_0 => v!("native_id_q4_0"),
+        Q4_1 => v!("native_id_q4_1"),
+        Q5_0 => v!("native_id_q5_0"),
+        Q5_1 => v!("native_id_q5_1"),
+        Q2K => v!("native_id_q2k"),
+        Q3K => v!("native_id_q3k"),
+        Q4K => v!("native_id_q4k"),
+        Q5K => v!("native_id_q5k"),
+        Q6K => v!("native_id_q6k"),
+        Iq4Nl => v!("native_id_iq4nl"),
+        Iq4Xs => v!("native_id_iq4xs"),
+        Mxfp4 => v!("native_id_mxfp4"),
+        Nvfp4 => v!("native_id_nvfp4"),
+        Tq1_0 => v!("native_id_tq1_0"),
+        Tq2_0 => v!("native_id_tq2_0"),
+        Q2_0 => v!("native_id_q2_0"),
+        Iq2Xxs => v!("native_id_iq2xxs"),
+        Iq2Xs => v!("native_id_iq2xs"),
+        Iq2S => v!("native_id_iq2s"),
+        Iq3Xxs => v!("native_id_iq3xxs"),
+        Iq3S => v!("native_id_iq3s"),
+        Iq1S => v!("native_id_iq1s"),
+        Iq1M => v!("native_id_iq1m"),
+        Bf16 => v!("native_id_bf16"),
+        F16 => v!("native_id_f16"),
+        F32 => v!("native_id_f32"),
         _ => None,
     }
 }
@@ -618,7 +616,7 @@ pub(crate) fn native_id_streamed_build_spv(
 /// per-expert BYTE stride applied on the 64-bit pointer (no LUT). Slice A4 build-variant only;
 /// parity-test entry, not dispatched in production.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_idm_streamed_build_spv(
+pub(crate) fn native_idm_build_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
@@ -634,40 +632,40 @@ pub(crate) fn native_idm_streamed_build_spv(
         }};
     }
     match dtype {
-        Q8_0 => v!("native_idm_q8_0_streamed"),
-        Q4_0 => v!("native_idm_q4_0_streamed"),
-        Q4_1 => v!("native_idm_q4_1_streamed"),
-        Q5_0 => v!("native_idm_q5_0_streamed"),
-        Q5_1 => v!("native_idm_q5_1_streamed"),
-        Q2K => v!("native_idm_q2k_streamed"),
-        Q3K => v!("native_idm_q3k_streamed"),
-        Q4K => v!("native_idm_q4k_streamed"),
-        Q5K => v!("native_idm_q5k_streamed"),
-        Q6K => v!("native_idm_q6k_streamed"),
-        Iq4Nl => v!("native_idm_iq4nl_streamed"),
-        Iq4Xs => v!("native_idm_iq4xs_streamed"),
-        Mxfp4 => v!("native_idm_mxfp4_streamed"),
-        Nvfp4 => v!("native_idm_nvfp4_streamed"),
-        Tq1_0 => v!("native_idm_tq1_0_streamed"),
-        Tq2_0 => v!("native_idm_tq2_0_streamed"),
-        Q2_0 => v!("native_idm_q2_0_streamed"),
-        Iq2Xxs => v!("native_idm_iq2xxs_streamed"),
-        Iq2Xs => v!("native_idm_iq2xs_streamed"),
-        Iq2S => v!("native_idm_iq2s_streamed"),
-        Iq3Xxs => v!("native_idm_iq3xxs_streamed"),
-        Iq3S => v!("native_idm_iq3s_streamed"),
-        Iq1S => v!("native_idm_iq1s_streamed"),
-        Iq1M => v!("native_idm_iq1m_streamed"),
-        Bf16 => v!("native_idm_bf16_streamed"),
-        F16 => v!("native_idm_f16_streamed"),
-        F32 => v!("native_idm_f32_streamed"),
+        Q8_0 => v!("native_idm_q8_0"),
+        Q4_0 => v!("native_idm_q4_0"),
+        Q4_1 => v!("native_idm_q4_1"),
+        Q5_0 => v!("native_idm_q5_0"),
+        Q5_1 => v!("native_idm_q5_1"),
+        Q2K => v!("native_idm_q2k"),
+        Q3K => v!("native_idm_q3k"),
+        Q4K => v!("native_idm_q4k"),
+        Q5K => v!("native_idm_q5k"),
+        Q6K => v!("native_idm_q6k"),
+        Iq4Nl => v!("native_idm_iq4nl"),
+        Iq4Xs => v!("native_idm_iq4xs"),
+        Mxfp4 => v!("native_idm_mxfp4"),
+        Nvfp4 => v!("native_idm_nvfp4"),
+        Tq1_0 => v!("native_idm_tq1_0"),
+        Tq2_0 => v!("native_idm_tq2_0"),
+        Q2_0 => v!("native_idm_q2_0"),
+        Iq2Xxs => v!("native_idm_iq2xxs"),
+        Iq2Xs => v!("native_idm_iq2xs"),
+        Iq2S => v!("native_idm_iq2s"),
+        Iq3Xxs => v!("native_idm_iq3xxs"),
+        Iq3S => v!("native_idm_iq3s"),
+        Iq1S => v!("native_idm_iq1s"),
+        Iq1M => v!("native_idm_iq1m"),
+        Bf16 => v!("native_idm_bf16"),
+        F16 => v!("native_idm_f16"),
+        F32 => v!("native_idm_f32"),
         _ => None,
     }
 }
 /// The `-DSTREAMED` subgroup multi-slot id GEMV (kernel-cache name + SPIR-V); the sole weight build
 /// for this family. Slice A4 build-variant; parity-test entry, not dispatched in production.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_idm_sg_streamed_build_spv(
+pub(crate) fn native_idm_sg_build_spv(
     dtype: infr_core::DType,
     nr: u32,
     sg16: bool,
@@ -685,33 +683,32 @@ pub(crate) fn native_idm_sg_streamed_build_spv(
         }};
     }
     match (dtype, nr, sg16) {
-        (Q6K, 2, false) => v!("native_idm_q6k_sg2_streamed"),
-        (Q6K, 4, false) => v!("native_idm_q6k_sg4_streamed"),
-        (Q6K, 8, false) => v!("native_idm_q6k_sg8_streamed"),
-        (Q6K, 2, true) => v!("native_idm_q6k_sg2_sg16_streamed"),
-        (Q6K, 4, true) => v!("native_idm_q6k_sg4_sg16_streamed"),
-        (Q6K, 8, true) => v!("native_idm_q6k_sg8_sg16_streamed"),
-        (Q5K, 2, false) => v!("native_idm_q5k_sg2_streamed"),
-        (Q5K, 4, false) => v!("native_idm_q5k_sg4_streamed"),
-        (Q5K, 8, false) => v!("native_idm_q5k_sg8_streamed"),
-        (Q5K, 2, true) => v!("native_idm_q5k_sg2_sg16_streamed"),
-        (Q5K, 4, true) => v!("native_idm_q5k_sg4_sg16_streamed"),
-        (Q5K, 8, true) => v!("native_idm_q5k_sg8_sg16_streamed"),
-        (Iq3S, 2, false) => v!("native_idm_iq3s_sg2_streamed"),
-        (Iq3S, 4, false) => v!("native_idm_iq3s_sg4_streamed"),
-        (Iq3S, 8, false) => v!("native_idm_iq3s_sg8_streamed"),
-        (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_sg16_streamed"),
-        (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_sg16_streamed"),
-        (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_sg16_streamed"),
+        (Q6K, 2, false) => v!("native_idm_q6k_sg2"),
+        (Q6K, 4, false) => v!("native_idm_q6k_sg4"),
+        (Q6K, 8, false) => v!("native_idm_q6k_sg8"),
+        (Q6K, 2, true) => v!("native_idm_q6k_sg2_sg16"),
+        (Q6K, 4, true) => v!("native_idm_q6k_sg4_sg16"),
+        (Q6K, 8, true) => v!("native_idm_q6k_sg8_sg16"),
+        (Q5K, 2, false) => v!("native_idm_q5k_sg2"),
+        (Q5K, 4, false) => v!("native_idm_q5k_sg4"),
+        (Q5K, 8, false) => v!("native_idm_q5k_sg8"),
+        (Q5K, 2, true) => v!("native_idm_q5k_sg2_sg16"),
+        (Q5K, 4, true) => v!("native_idm_q5k_sg4_sg16"),
+        (Q5K, 8, true) => v!("native_idm_q5k_sg8_sg16"),
+        (Iq3S, 2, false) => v!("native_idm_iq3s_sg2"),
+        (Iq3S, 4, false) => v!("native_idm_iq3s_sg4"),
+        (Iq3S, 8, false) => v!("native_idm_iq3s_sg8"),
+        (Iq3S, 2, true) => v!("native_idm_iq3s_sg2_sg16"),
+        (Iq3S, 4, true) => v!("native_idm_iq3s_sg4_sg16"),
+        (Iq3S, 8, true) => v!("native_idm_iq3s_sg8_sg16"),
         _ => None,
     }
 }
 /// The `-DSTREAMED` id-indexed int8 Q4_K decode GEMV; the sole weight build for this variant.
 /// Slice A4 build-variant; parity-test entry, not dispatched in production.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_id_q4k_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/native_mmv_id_q4k_streamed.spv"));
+pub(crate) fn native_mmv_id_q4k_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_mmv_id_q4k.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -833,7 +830,7 @@ pub(crate) fn native_mmv_mrow_build_spv(dtype: infr_core::DType) -> Option<&'sta
 /// `m4=true`; see `Recorder::linear_mmv_mrow`'s gates and its doc on the rows=1 decode/verify
 /// unification).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_variant_spv(
+pub(crate) fn native_mmv_mrow_variant_name(
     dtype: infr_core::DType,
     o4: bool,
     m4: bool,
@@ -923,7 +920,7 @@ pub(crate) fn native_mmv_mrow_variant_spv(
 /// OUTS4 twin: the tier is gated to >= 8M-element weights, whose in_f is comfortably >= 2048).
 /// `None` = format not covered (same coverage as [`native_mmv_mrow_build_spv`]; those shapes stay
 /// on the split-K GEMM tile).
-pub(crate) fn native_mmv_mrow_m16_spv(dtype: infr_core::DType) -> Option<&'static str> {
+pub(crate) fn native_mmv_mrow_m16_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -954,7 +951,7 @@ pub(crate) fn native_mmv_mrow_m16_spv(dtype: infr_core::DType) -> Option<&'stati
 /// ([`crate::recorder::Recorder::linear_add_mmv_streamed`]) is load-bearing, not just a parity-test
 /// convenience like the plain arm ([`crate::recorder::Recorder::linear_mmv_streamed`]).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_streamed_build_spv(
+pub(crate) fn native_mmv_spv(
     dtype: infr_core::DType,
     res: bool,
 ) -> Option<(&'static str, &'static [u32])> {
@@ -971,24 +968,24 @@ pub(crate) fn native_mmv_streamed_build_spv(
         }};
     }
     match (dtype, res) {
-        (Q4K, false) => v!("native_mmv_q4k_streamed"),
-        (Q4K, true) => v!("native_mmv_q4k_res_streamed"),
-        (Q6K, false) => v!("native_mmv_q6k_streamed"),
-        (Q6K, true) => v!("native_mmv_q6k_res_streamed"),
-        (Iq4Xs, false) => v!("native_mmv_iq4xs_streamed"),
-        (Iq4Xs, true) => v!("native_mmv_iq4xs_res_streamed"),
+        (Q4K, false) => v!("native_mmv_q4k"),
+        (Q4K, true) => v!("native_mmv_q4k_res"),
+        (Q6K, false) => v!("native_mmv_q6k"),
+        (Q6K, true) => v!("native_mmv_q6k_res"),
+        (Iq4Xs, false) => v!("native_mmv_iq4xs"),
+        (Iq4Xs, true) => v!("native_mmv_iq4xs_res"),
         _ => None,
     }
 }
-/// `-DSTREAMED` twin of [`native_mmv_mrow_variant_spv`] (kernel-cache name + SPIR-V), covering the
-/// rows<=8 layout matrix (`o4`/`m4`/`res`). `res` mirrors [`native_mmv_mrow_variant_spv`]'s residual
+/// `-DSTREAMED` twin of [`native_mmv_mrow_variant_name`] (kernel-cache name + SPIR-V), covering the
+/// rows<=8 layout matrix (`o4`/`m4`/`res`). `res` mirrors [`native_mmv_mrow_variant_name`]'s residual
 /// arm — build-declared ONLY at `m4 = true` (the decode Linear+Add fusion always dispatches this
 /// shader at `rows = 1`, which forces `m4 = true`; see [`crate::recorder::Recorder::linear_mmv_mrow`]'s
 /// doc) and NEVER for `Iq4Xs` (no `-DUSE_RES` build exists for that dtype in this family). `res =
 /// true` is load-bearing for [`crate::recorder::Recorder::linear_mmv_mrow_streamed`]'s residual
 /// path, not just a parity-test convenience.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_streamed_variant_spv(
+pub(crate) fn native_mmv_mrow_variant_spv(
     dtype: infr_core::DType,
     o4: bool,
     m4: bool,
@@ -1007,83 +1004,83 @@ pub(crate) fn native_mmv_mrow_streamed_variant_spv(
         }};
     }
     match (dtype, o4, m4, res) {
-        (Q4K, false, false, false) => v!("native_mmv_mrow_q4k_streamed"),
-        (Q4K, false, true, false) => v!("native_mmv_mrow_q4k_m4_streamed"),
-        (Q4K, true, false, false) => v!("native_mmv_mrow_q4k_o4_streamed"),
-        (Q4K, true, true, false) => v!("native_mmv_mrow_q4k_o4_m4_streamed"),
-        (Q4K, false, true, true) => v!("native_mmv_mrow_q4k_m4_res_streamed"),
-        (Q4K, true, true, true) => v!("native_mmv_mrow_q4k_o4_m4_res_streamed"),
-        (Q6K, false, false, false) => v!("native_mmv_mrow_q6k_streamed"),
-        (Q6K, false, true, false) => v!("native_mmv_mrow_q6k_m4_streamed"),
-        (Q6K, true, false, false) => v!("native_mmv_mrow_q6k_o4_streamed"),
-        (Q6K, true, true, false) => v!("native_mmv_mrow_q6k_o4_m4_streamed"),
-        (Q6K, false, true, true) => v!("native_mmv_mrow_q6k_m4_res_streamed"),
-        (Q6K, true, true, true) => v!("native_mmv_mrow_q6k_o4_m4_res_streamed"),
-        (Iq4Xs, false, false, false) => v!("native_mmv_mrow_iq4xs_streamed"),
-        (Iq4Xs, false, true, false) => v!("native_mmv_mrow_iq4xs_m4_streamed"),
-        (Iq4Xs, true, false, false) => v!("native_mmv_mrow_iq4xs_o4_streamed"),
-        (Iq4Xs, true, true, false) => v!("native_mmv_mrow_iq4xs_o4_m4_streamed"),
-        (Q2K, false, false, false) => v!("native_mmv_mrow_q2k_streamed"),
-        (Q2K, false, true, false) => v!("native_mmv_mrow_q2k_m4_streamed"),
-        (Q2K, true, false, false) => v!("native_mmv_mrow_q2k_o4_streamed"),
-        (Q2K, true, true, false) => v!("native_mmv_mrow_q2k_o4_m4_streamed"),
-        (Q2K, false, true, true) => v!("native_mmv_mrow_q2k_m4_res_streamed"),
-        (Q2K, true, true, true) => v!("native_mmv_mrow_q2k_o4_m4_res_streamed"),
-        (Q3K, false, false, false) => v!("native_mmv_mrow_q3k_streamed"),
-        (Q3K, false, true, false) => v!("native_mmv_mrow_q3k_m4_streamed"),
-        (Q3K, true, false, false) => v!("native_mmv_mrow_q3k_o4_streamed"),
-        (Q3K, true, true, false) => v!("native_mmv_mrow_q3k_o4_m4_streamed"),
-        (Q3K, false, true, true) => v!("native_mmv_mrow_q3k_m4_res_streamed"),
-        (Q3K, true, true, true) => v!("native_mmv_mrow_q3k_o4_m4_res_streamed"),
-        (Q5K, false, false, false) => v!("native_mmv_mrow_q5k_streamed"),
-        (Q5K, false, true, false) => v!("native_mmv_mrow_q5k_m4_streamed"),
-        (Q5K, true, false, false) => v!("native_mmv_mrow_q5k_o4_streamed"),
-        (Q5K, true, true, false) => v!("native_mmv_mrow_q5k_o4_m4_streamed"),
-        (Q5K, false, true, true) => v!("native_mmv_mrow_q5k_m4_res_streamed"),
-        (Q5K, true, true, true) => v!("native_mmv_mrow_q5k_o4_m4_res_streamed"),
-        (Q8_0, false, false, false) => v!("native_mmv_mrow_q8_0_streamed"),
-        (Q8_0, false, true, false) => v!("native_mmv_mrow_q8_0_m4_streamed"),
-        (Q8_0, true, false, false) => v!("native_mmv_mrow_q8_0_o4_streamed"),
-        (Q8_0, true, true, false) => v!("native_mmv_mrow_q8_0_o4_m4_streamed"),
-        (Q8_0, false, true, true) => v!("native_mmv_mrow_q8_0_m4_res_streamed"),
-        (Q8_0, true, true, true) => v!("native_mmv_mrow_q8_0_o4_m4_res_streamed"),
-        (Q4_0, false, false, false) => v!("native_mmv_mrow_q4_0_streamed"),
-        (Q4_0, false, true, false) => v!("native_mmv_mrow_q4_0_m4_streamed"),
-        (Q4_0, true, false, false) => v!("native_mmv_mrow_q4_0_o4_streamed"),
-        (Q4_0, true, true, false) => v!("native_mmv_mrow_q4_0_o4_m4_streamed"),
-        (Q4_0, false, true, true) => v!("native_mmv_mrow_q4_0_m4_res_streamed"),
-        (Q4_0, true, true, true) => v!("native_mmv_mrow_q4_0_o4_m4_res_streamed"),
-        (Q5_0, false, false, false) => v!("native_mmv_mrow_q5_0_streamed"),
-        (Q5_0, false, true, false) => v!("native_mmv_mrow_q5_0_m4_streamed"),
-        (Q5_0, true, false, false) => v!("native_mmv_mrow_q5_0_o4_streamed"),
-        (Q5_0, true, true, false) => v!("native_mmv_mrow_q5_0_o4_m4_streamed"),
-        (Q5_0, false, true, true) => v!("native_mmv_mrow_q5_0_m4_res_streamed"),
-        (Q5_0, true, true, true) => v!("native_mmv_mrow_q5_0_o4_m4_res_streamed"),
-        (Q4_1, false, false, false) => v!("native_mmv_mrow_q4_1_streamed"),
-        (Q4_1, false, true, false) => v!("native_mmv_mrow_q4_1_m4_streamed"),
-        (Q4_1, true, false, false) => v!("native_mmv_mrow_q4_1_o4_streamed"),
-        (Q4_1, true, true, false) => v!("native_mmv_mrow_q4_1_o4_m4_streamed"),
-        (Q4_1, false, true, true) => v!("native_mmv_mrow_q4_1_m4_res_streamed"),
-        (Q4_1, true, true, true) => v!("native_mmv_mrow_q4_1_o4_m4_res_streamed"),
-        (Q5_1, false, false, false) => v!("native_mmv_mrow_q5_1_streamed"),
-        (Q5_1, false, true, false) => v!("native_mmv_mrow_q5_1_m4_streamed"),
-        (Q5_1, true, false, false) => v!("native_mmv_mrow_q5_1_o4_streamed"),
-        (Q5_1, true, true, false) => v!("native_mmv_mrow_q5_1_o4_m4_streamed"),
-        (Q5_1, false, true, true) => v!("native_mmv_mrow_q5_1_m4_res_streamed"),
-        (Q5_1, true, true, true) => v!("native_mmv_mrow_q5_1_o4_m4_res_streamed"),
-        (Iq4Nl, false, false, false) => v!("native_mmv_mrow_iq4nl_streamed"),
-        (Iq4Nl, false, true, false) => v!("native_mmv_mrow_iq4nl_m4_streamed"),
-        (Iq4Nl, true, false, false) => v!("native_mmv_mrow_iq4nl_o4_streamed"),
-        (Iq4Nl, true, true, false) => v!("native_mmv_mrow_iq4nl_o4_m4_streamed"),
-        (Iq4Nl, false, true, true) => v!("native_mmv_mrow_iq4nl_m4_res_streamed"),
-        (Iq4Nl, true, true, true) => v!("native_mmv_mrow_iq4nl_o4_m4_res_streamed"),
+        (Q4K, false, false, false) => v!("native_mmv_mrow_q4k"),
+        (Q4K, false, true, false) => v!("native_mmv_mrow_q4k_m4"),
+        (Q4K, true, false, false) => v!("native_mmv_mrow_q4k_o4"),
+        (Q4K, true, true, false) => v!("native_mmv_mrow_q4k_o4_m4"),
+        (Q4K, false, true, true) => v!("native_mmv_mrow_q4k_m4_res"),
+        (Q4K, true, true, true) => v!("native_mmv_mrow_q4k_o4_m4_res"),
+        (Q6K, false, false, false) => v!("native_mmv_mrow_q6k"),
+        (Q6K, false, true, false) => v!("native_mmv_mrow_q6k_m4"),
+        (Q6K, true, false, false) => v!("native_mmv_mrow_q6k_o4"),
+        (Q6K, true, true, false) => v!("native_mmv_mrow_q6k_o4_m4"),
+        (Q6K, false, true, true) => v!("native_mmv_mrow_q6k_m4_res"),
+        (Q6K, true, true, true) => v!("native_mmv_mrow_q6k_o4_m4_res"),
+        (Iq4Xs, false, false, false) => v!("native_mmv_mrow_iq4xs"),
+        (Iq4Xs, false, true, false) => v!("native_mmv_mrow_iq4xs_m4"),
+        (Iq4Xs, true, false, false) => v!("native_mmv_mrow_iq4xs_o4"),
+        (Iq4Xs, true, true, false) => v!("native_mmv_mrow_iq4xs_o4_m4"),
+        (Q2K, false, false, false) => v!("native_mmv_mrow_q2k"),
+        (Q2K, false, true, false) => v!("native_mmv_mrow_q2k_m4"),
+        (Q2K, true, false, false) => v!("native_mmv_mrow_q2k_o4"),
+        (Q2K, true, true, false) => v!("native_mmv_mrow_q2k_o4_m4"),
+        (Q2K, false, true, true) => v!("native_mmv_mrow_q2k_m4_res"),
+        (Q2K, true, true, true) => v!("native_mmv_mrow_q2k_o4_m4_res"),
+        (Q3K, false, false, false) => v!("native_mmv_mrow_q3k"),
+        (Q3K, false, true, false) => v!("native_mmv_mrow_q3k_m4"),
+        (Q3K, true, false, false) => v!("native_mmv_mrow_q3k_o4"),
+        (Q3K, true, true, false) => v!("native_mmv_mrow_q3k_o4_m4"),
+        (Q3K, false, true, true) => v!("native_mmv_mrow_q3k_m4_res"),
+        (Q3K, true, true, true) => v!("native_mmv_mrow_q3k_o4_m4_res"),
+        (Q5K, false, false, false) => v!("native_mmv_mrow_q5k"),
+        (Q5K, false, true, false) => v!("native_mmv_mrow_q5k_m4"),
+        (Q5K, true, false, false) => v!("native_mmv_mrow_q5k_o4"),
+        (Q5K, true, true, false) => v!("native_mmv_mrow_q5k_o4_m4"),
+        (Q5K, false, true, true) => v!("native_mmv_mrow_q5k_m4_res"),
+        (Q5K, true, true, true) => v!("native_mmv_mrow_q5k_o4_m4_res"),
+        (Q8_0, false, false, false) => v!("native_mmv_mrow_q8_0"),
+        (Q8_0, false, true, false) => v!("native_mmv_mrow_q8_0_m4"),
+        (Q8_0, true, false, false) => v!("native_mmv_mrow_q8_0_o4"),
+        (Q8_0, true, true, false) => v!("native_mmv_mrow_q8_0_o4_m4"),
+        (Q8_0, false, true, true) => v!("native_mmv_mrow_q8_0_m4_res"),
+        (Q8_0, true, true, true) => v!("native_mmv_mrow_q8_0_o4_m4_res"),
+        (Q4_0, false, false, false) => v!("native_mmv_mrow_q4_0"),
+        (Q4_0, false, true, false) => v!("native_mmv_mrow_q4_0_m4"),
+        (Q4_0, true, false, false) => v!("native_mmv_mrow_q4_0_o4"),
+        (Q4_0, true, true, false) => v!("native_mmv_mrow_q4_0_o4_m4"),
+        (Q4_0, false, true, true) => v!("native_mmv_mrow_q4_0_m4_res"),
+        (Q4_0, true, true, true) => v!("native_mmv_mrow_q4_0_o4_m4_res"),
+        (Q5_0, false, false, false) => v!("native_mmv_mrow_q5_0"),
+        (Q5_0, false, true, false) => v!("native_mmv_mrow_q5_0_m4"),
+        (Q5_0, true, false, false) => v!("native_mmv_mrow_q5_0_o4"),
+        (Q5_0, true, true, false) => v!("native_mmv_mrow_q5_0_o4_m4"),
+        (Q5_0, false, true, true) => v!("native_mmv_mrow_q5_0_m4_res"),
+        (Q5_0, true, true, true) => v!("native_mmv_mrow_q5_0_o4_m4_res"),
+        (Q4_1, false, false, false) => v!("native_mmv_mrow_q4_1"),
+        (Q4_1, false, true, false) => v!("native_mmv_mrow_q4_1_m4"),
+        (Q4_1, true, false, false) => v!("native_mmv_mrow_q4_1_o4"),
+        (Q4_1, true, true, false) => v!("native_mmv_mrow_q4_1_o4_m4"),
+        (Q4_1, false, true, true) => v!("native_mmv_mrow_q4_1_m4_res"),
+        (Q4_1, true, true, true) => v!("native_mmv_mrow_q4_1_o4_m4_res"),
+        (Q5_1, false, false, false) => v!("native_mmv_mrow_q5_1"),
+        (Q5_1, false, true, false) => v!("native_mmv_mrow_q5_1_m4"),
+        (Q5_1, true, false, false) => v!("native_mmv_mrow_q5_1_o4"),
+        (Q5_1, true, true, false) => v!("native_mmv_mrow_q5_1_o4_m4"),
+        (Q5_1, false, true, true) => v!("native_mmv_mrow_q5_1_m4_res"),
+        (Q5_1, true, true, true) => v!("native_mmv_mrow_q5_1_o4_m4_res"),
+        (Iq4Nl, false, false, false) => v!("native_mmv_mrow_iq4nl"),
+        (Iq4Nl, false, true, false) => v!("native_mmv_mrow_iq4nl_m4"),
+        (Iq4Nl, true, false, false) => v!("native_mmv_mrow_iq4nl_o4"),
+        (Iq4Nl, true, true, false) => v!("native_mmv_mrow_iq4nl_o4_m4"),
+        (Iq4Nl, false, true, true) => v!("native_mmv_mrow_iq4nl_m4_res"),
+        (Iq4Nl, true, true, true) => v!("native_mmv_mrow_iq4nl_o4_m4_res"),
         _ => None,
     }
 }
-/// `-DSTREAMED` twin of [`native_mmv_mrow_m16_spv`] (kernel-cache name + SPIR-V) — the rows
+/// `-DSTREAMED` twin of [`native_mmv_mrow_m16_name`] (kernel-cache name + SPIR-V) — the rows
 /// 9..=16 tier. Slice A2 build-variant only; parity-test entry, not dispatched in production.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_streamed_m16_spv(
+pub(crate) fn native_mmv_mrow_m16_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
@@ -1099,18 +1096,18 @@ pub(crate) fn native_mmv_mrow_streamed_m16_spv(
         }};
     }
     match dtype {
-        Q4K => v!("native_mmv_mrow_q4k_m16_streamed"),
-        Q6K => v!("native_mmv_mrow_q6k_m16_streamed"),
-        Iq4Xs => v!("native_mmv_mrow_iq4xs_m16_streamed"),
-        Q2K => v!("native_mmv_mrow_q2k_m16_streamed"),
-        Q3K => v!("native_mmv_mrow_q3k_m16_streamed"),
-        Q5K => v!("native_mmv_mrow_q5k_m16_streamed"),
-        Q8_0 => v!("native_mmv_mrow_q8_0_m16_streamed"),
-        Q4_0 => v!("native_mmv_mrow_q4_0_m16_streamed"),
-        Q5_0 => v!("native_mmv_mrow_q5_0_m16_streamed"),
-        Q4_1 => v!("native_mmv_mrow_q4_1_m16_streamed"),
-        Q5_1 => v!("native_mmv_mrow_q5_1_m16_streamed"),
-        Iq4Nl => v!("native_mmv_mrow_iq4nl_m16_streamed"),
+        Q4K => v!("native_mmv_mrow_q4k_m16"),
+        Q6K => v!("native_mmv_mrow_q6k_m16"),
+        Iq4Xs => v!("native_mmv_mrow_iq4xs_m16"),
+        Q2K => v!("native_mmv_mrow_q2k_m16"),
+        Q3K => v!("native_mmv_mrow_q3k_m16"),
+        Q5K => v!("native_mmv_mrow_q5k_m16"),
+        Q8_0 => v!("native_mmv_mrow_q8_0_m16"),
+        Q4_0 => v!("native_mmv_mrow_q4_0_m16"),
+        Q5_0 => v!("native_mmv_mrow_q5_0_m16"),
+        Q4_1 => v!("native_mmv_mrow_q4_1_m16"),
+        Q5_1 => v!("native_mmv_mrow_q5_1_m16"),
+        Iq4Nl => v!("native_mmv_mrow_iq4nl_m16"),
         _ => None,
     }
 }
@@ -1120,7 +1117,7 @@ pub(crate) fn native_mmv_mrow_streamed_m16_spv(
 /// route dispatches the residual arm for its decode Linear+Add fusion — see
 /// [`crate::recorder::Recorder::linear_mmv_mw`] — so the twin isn't just a parity-test convenience).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mw_streamed_build_spv(
+pub(crate) fn native_mmv_mw_spv(
     dtype: infr_core::DType,
     res: bool,
     warps: u32,
@@ -1139,48 +1136,48 @@ pub(crate) fn native_mmv_mw_streamed_build_spv(
         }};
     }
     match (dtype, res, warps, sg16) {
-        (Q4K, false, 1, false) => v!("native_mmv_mw_q4k_w1_streamed"),
-        (Q4K, true, 1, false) => v!("native_mmv_mw_q4k_w1_res_streamed"),
-        (Q4K, false, 2, false) => v!("native_mmv_mw_q4k_w2_streamed"),
-        (Q4K, true, 2, false) => v!("native_mmv_mw_q4k_w2_res_streamed"),
-        (Q4K, false, 16, false) => v!("native_mmv_mw_q4k_w16_streamed"),
-        (Q4K, true, 16, false) => v!("native_mmv_mw_q4k_w16_res_streamed"),
-        (Q4K, false, 4, false) => v!("native_mmv_mw_q4k_w4_streamed"),
-        (Q4K, true, 4, false) => v!("native_mmv_mw_q4k_w4_res_streamed"),
-        (Q4K, false, 8, false) => v!("native_mmv_mw_q4k_w8_streamed"),
-        (Q4K, true, 8, false) => v!("native_mmv_mw_q4k_w8_res_streamed"),
-        (Q6K, false, 4, false) => v!("native_mmv_mw_q6k_w4_streamed"),
-        (Q6K, true, 4, false) => v!("native_mmv_mw_q6k_w4_res_streamed"),
-        (Q6K, false, 8, false) => v!("native_mmv_mw_q6k_w8_streamed"),
-        (Q6K, true, 8, false) => v!("native_mmv_mw_q6k_w8_res_streamed"),
-        (Q2K, false, 4, false) => v!("native_mmv_mw_q2k_w4_streamed"),
-        (Q2K, true, 4, false) => v!("native_mmv_mw_q2k_w4_res_streamed"),
-        (Q2K, false, 8, false) => v!("native_mmv_mw_q2k_w8_streamed"),
-        (Q2K, true, 8, false) => v!("native_mmv_mw_q2k_w8_res_streamed"),
-        (Q3K, false, 4, false) => v!("native_mmv_mw_q3k_w4_streamed"),
-        (Q3K, true, 4, false) => v!("native_mmv_mw_q3k_w4_res_streamed"),
-        (Q3K, false, 8, false) => v!("native_mmv_mw_q3k_w8_streamed"),
-        (Q3K, true, 8, false) => v!("native_mmv_mw_q3k_w8_res_streamed"),
-        (Q4K, false, 4, true) => v!("native_mmv_mw_q4k_w4_sg16_streamed"),
-        (Q4K, true, 4, true) => v!("native_mmv_mw_q4k_w4_res_sg16_streamed"),
-        (Q4K, false, 8, true) => v!("native_mmv_mw_q4k_w8_sg16_streamed"),
-        (Q4K, true, 8, true) => v!("native_mmv_mw_q4k_w8_res_sg16_streamed"),
-        (Q6K, false, 4, true) => v!("native_mmv_mw_q6k_w4_sg16_streamed"),
-        (Q6K, true, 4, true) => v!("native_mmv_mw_q6k_w4_res_sg16_streamed"),
-        (Q6K, false, 8, true) => v!("native_mmv_mw_q6k_w8_sg16_streamed"),
-        (Q6K, true, 8, true) => v!("native_mmv_mw_q6k_w8_res_sg16_streamed"),
-        (Q2K, false, 4, true) => v!("native_mmv_mw_q2k_w4_sg16_streamed"),
-        (Q2K, true, 4, true) => v!("native_mmv_mw_q2k_w4_res_sg16_streamed"),
-        (Q2K, false, 8, true) => v!("native_mmv_mw_q2k_w8_sg16_streamed"),
-        (Q2K, true, 8, true) => v!("native_mmv_mw_q2k_w8_res_sg16_streamed"),
-        (Q3K, false, 4, true) => v!("native_mmv_mw_q3k_w4_sg16_streamed"),
-        (Q3K, true, 4, true) => v!("native_mmv_mw_q3k_w4_res_sg16_streamed"),
-        (Q3K, false, 8, true) => v!("native_mmv_mw_q3k_w8_sg16_streamed"),
-        (Q3K, true, 8, true) => v!("native_mmv_mw_q3k_w8_res_sg16_streamed"),
-        (Q5K, false, 4, false) => v!("native_mmv_mw_q5k_w4_streamed"),
-        (Q5K, true, 4, false) => v!("native_mmv_mw_q5k_w4_res_streamed"),
-        (Q5K, false, 8, false) => v!("native_mmv_mw_q5k_w8_streamed"),
-        (Q5K, true, 8, false) => v!("native_mmv_mw_q5k_w8_res_streamed"),
+        (Q4K, false, 1, false) => v!("native_mmv_mw_q4k_w1"),
+        (Q4K, true, 1, false) => v!("native_mmv_mw_q4k_w1_res"),
+        (Q4K, false, 2, false) => v!("native_mmv_mw_q4k_w2"),
+        (Q4K, true, 2, false) => v!("native_mmv_mw_q4k_w2_res"),
+        (Q4K, false, 16, false) => v!("native_mmv_mw_q4k_w16"),
+        (Q4K, true, 16, false) => v!("native_mmv_mw_q4k_w16_res"),
+        (Q4K, false, 4, false) => v!("native_mmv_mw_q4k_w4"),
+        (Q4K, true, 4, false) => v!("native_mmv_mw_q4k_w4_res"),
+        (Q4K, false, 8, false) => v!("native_mmv_mw_q4k_w8"),
+        (Q4K, true, 8, false) => v!("native_mmv_mw_q4k_w8_res"),
+        (Q6K, false, 4, false) => v!("native_mmv_mw_q6k_w4"),
+        (Q6K, true, 4, false) => v!("native_mmv_mw_q6k_w4_res"),
+        (Q6K, false, 8, false) => v!("native_mmv_mw_q6k_w8"),
+        (Q6K, true, 8, false) => v!("native_mmv_mw_q6k_w8_res"),
+        (Q2K, false, 4, false) => v!("native_mmv_mw_q2k_w4"),
+        (Q2K, true, 4, false) => v!("native_mmv_mw_q2k_w4_res"),
+        (Q2K, false, 8, false) => v!("native_mmv_mw_q2k_w8"),
+        (Q2K, true, 8, false) => v!("native_mmv_mw_q2k_w8_res"),
+        (Q3K, false, 4, false) => v!("native_mmv_mw_q3k_w4"),
+        (Q3K, true, 4, false) => v!("native_mmv_mw_q3k_w4_res"),
+        (Q3K, false, 8, false) => v!("native_mmv_mw_q3k_w8"),
+        (Q3K, true, 8, false) => v!("native_mmv_mw_q3k_w8_res"),
+        (Q4K, false, 4, true) => v!("native_mmv_mw_q4k_w4_sg16"),
+        (Q4K, true, 4, true) => v!("native_mmv_mw_q4k_w4_res_sg16"),
+        (Q4K, false, 8, true) => v!("native_mmv_mw_q4k_w8_sg16"),
+        (Q4K, true, 8, true) => v!("native_mmv_mw_q4k_w8_res_sg16"),
+        (Q6K, false, 4, true) => v!("native_mmv_mw_q6k_w4_sg16"),
+        (Q6K, true, 4, true) => v!("native_mmv_mw_q6k_w4_res_sg16"),
+        (Q6K, false, 8, true) => v!("native_mmv_mw_q6k_w8_sg16"),
+        (Q6K, true, 8, true) => v!("native_mmv_mw_q6k_w8_res_sg16"),
+        (Q2K, false, 4, true) => v!("native_mmv_mw_q2k_w4_sg16"),
+        (Q2K, true, 4, true) => v!("native_mmv_mw_q2k_w4_res_sg16"),
+        (Q2K, false, 8, true) => v!("native_mmv_mw_q2k_w8_sg16"),
+        (Q2K, true, 8, true) => v!("native_mmv_mw_q2k_w8_res_sg16"),
+        (Q3K, false, 4, true) => v!("native_mmv_mw_q3k_w4_sg16"),
+        (Q3K, true, 4, true) => v!("native_mmv_mw_q3k_w4_res_sg16"),
+        (Q3K, false, 8, true) => v!("native_mmv_mw_q3k_w8_sg16"),
+        (Q3K, true, 8, true) => v!("native_mmv_mw_q3k_w8_res_sg16"),
+        (Q5K, false, 4, false) => v!("native_mmv_mw_q5k_w4"),
+        (Q5K, true, 4, false) => v!("native_mmv_mw_q5k_w4_res"),
+        (Q5K, false, 8, false) => v!("native_mmv_mw_q5k_w8"),
+        (Q5K, true, 8, false) => v!("native_mmv_mw_q5k_w8_res"),
         _ => None,
     }
 }
@@ -1205,7 +1202,7 @@ pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
 /// it). The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
 /// when the expert router grows an `arena: Option<u64>` arm at integration time.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_dense_streamed_spv(
+pub(crate) fn native_gemm_mmq_dense_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
     macro_rules! spv {
@@ -1219,21 +1216,21 @@ pub(crate) fn native_gemm_mmq_dense_streamed_spv(
     Some(match dtype {
         Q4K => spv!("native_gemm_mmq_q4k_streamed"),
         Q6K => spv!("native_gemm_mmq_q6k_streamed"),
-        Q8_0 => spv!("native_gemm_mmq_q8_0_streamed"),
-        Q5_0 => spv!("native_gemm_mmq_q5_0_streamed"),
-        Q5K => spv!("native_gemm_mmq_q5k_streamed"),
-        Q5_1 => spv!("native_gemm_mmq_q5_1_streamed"),
-        Q2K => spv!("native_gemm_mmq_q2_k_streamed"),
-        Q3K => spv!("native_gemm_mmq_q3_k_streamed"),
-        Q4_0 => spv!("native_gemm_mmq_q4_0_streamed"),
-        Q4_1 => spv!("native_gemm_mmq_q4_1_streamed"),
-        Iq4Nl => spv!("native_gemm_mmq_iq4_nl_streamed"),
-        Iq4Xs => spv!("native_gemm_mmq_iq4_xs_streamed"),
-        Iq2S => spv!("native_gemm_mmq_iq2_s_streamed"),
-        Iq3S => spv!("native_gemm_mmq_iq3_s_streamed"),
-        Mxfp4 => spv!("native_gemm_mmq_mxfp4_streamed"),
-        Nvfp4 => spv!("native_gemm_mmq_nvfp4_streamed"),
-        Q2_0 => spv!("native_gemm_mmq_q2_0_streamed"),
+        Q8_0 => spv!("native_gemm_mmq_q8_0"),
+        Q5_0 => spv!("native_gemm_mmq_q5_0"),
+        Q5K => spv!("native_gemm_mmq_q5k"),
+        Q5_1 => spv!("native_gemm_mmq_q5_1"),
+        Q2K => spv!("native_gemm_mmq_q2_k"),
+        Q3K => spv!("native_gemm_mmq_q3_k"),
+        Q4_0 => spv!("native_gemm_mmq_q4_0"),
+        Q4_1 => spv!("native_gemm_mmq_q4_1"),
+        Iq4Nl => spv!("native_gemm_mmq_iq4_nl"),
+        Iq4Xs => spv!("native_gemm_mmq_iq4_xs"),
+        Iq2S => spv!("native_gemm_mmq_iq2_s"),
+        Iq3S => spv!("native_gemm_mmq_iq3_s"),
+        Mxfp4 => spv!("native_gemm_mmq_mxfp4"),
+        Nvfp4 => spv!("native_gemm_mmq_nvfp4"),
+        Q2_0 => spv!("native_gemm_mmq_q2_0"),
         _ => return None,
     })
 }
@@ -1248,8 +1245,8 @@ pub(crate) fn linear_f16_streamed_spv() -> &'static [u32] {
 /// `-DSTREAMED` twin SPIR-V of `linear_f16_noext` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f16_noext_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16_noext_streamed.spv"));
+pub(crate) fn linear_f16_noext_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16_noext.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -1264,54 +1261,47 @@ pub(crate) fn linear_bf16_streamed_spv() -> &'static [u32] {
 /// `-DSTREAMED` twin SPIR-V of `linear_f32r` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f32r_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_streamed.spv"));
+pub(crate) fn linear_f32r_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// `-DSTREAMED` twin SPIR-V of `linear_f32r_mrow8` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f32r_mrow8_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_mrow8_streamed.spv"));
+pub(crate) fn linear_f32r_mrow8_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_mrow8.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// `-DSTREAMED` twin SPIR-V of `linear_f32r_mrow4_v4` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f32r_mrow4_v4_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/linear_f32r_mrow4_v4_streamed.spv"
-    ));
+pub(crate) fn linear_f32r_mrow4_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_mrow4_v4.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// `-DSTREAMED` twin SPIR-V of `linear_f32r_mrow8_v4` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f32r_mrow8_v4_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/linear_f32r_mrow8_v4_streamed.spv"
-    ));
+pub(crate) fn linear_f32r_mrow8_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_mrow8_v4.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// `-DSTREAMED` twin SPIR-V of `linear_res` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_res_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_res_streamed.spv"));
+pub(crate) fn linear_res_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_res.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// `-DSTREAMED` twin of [`native_gemm_fma_build_spv`] (kernel-cache name + SPIR-V). Slice A4;
 /// parity-test entry, not dispatched in production.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_fma_streamed_build_spv(
+pub(crate) fn native_gemm_fma_spv(
     dtype: infr_core::DType,
 ) -> Option<(&'static str, &'static [u32])> {
     macro_rules! spv {
@@ -1323,9 +1313,9 @@ pub(crate) fn native_gemm_fma_streamed_build_spv(
     }
     use infr_core::DType::*;
     Some(match dtype {
-        F16 => spv!("native_gemm_fma_f16_streamed"),
-        Bf16 => spv!("native_gemm_fma_bf16_streamed"),
-        F32 => spv!("native_gemm_fma_f32_streamed"),
+        F16 => spv!("native_gemm_fma_f16"),
+        Bf16 => spv!("native_gemm_fma_bf16"),
+        F32 => spv!("native_gemm_fma_f32"),
         _ => return None,
     })
 }
@@ -1563,9 +1553,7 @@ pub(crate) fn embed_gather_build_spv(dtype: infr_core::DType) -> Option<&'static
 /// convention as [`native_streamed_build_spv`]. Slice A5 build-variant only; parity-test entry,
 /// not dispatched in production.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn embed_gather_streamed_build_spv(
-    dtype: infr_core::DType,
-) -> Option<(&'static str, &'static [u32])> {
+pub(crate) fn embed_gather_spv(dtype: infr_core::DType) -> Option<(&'static str, &'static [u32])> {
     use infr_core::DType::*;
     macro_rules! v {
         ($name:literal) => {{
@@ -1579,21 +1567,21 @@ pub(crate) fn embed_gather_streamed_build_spv(
         }};
     }
     match dtype {
-        Q8_0 => v!("embed_gather_q8_0_streamed"),
-        Bf16 => v!("embed_gather_bf16_streamed"),
-        F16 => v!("embed_gather_f16_streamed"),
-        Q4_0 => v!("embed_gather_q4_0_streamed"),
-        Q4_1 => v!("embed_gather_q4_1_streamed"),
-        Q5_0 => v!("embed_gather_q5_0_streamed"),
-        Q5_1 => v!("embed_gather_q5_1_streamed"),
-        Q2K => v!("embed_gather_q2k_streamed"),
-        Q3K => v!("embed_gather_q3k_streamed"),
-        Q4K => v!("embed_gather_q4k_streamed"),
-        Q5K => v!("embed_gather_q5k_streamed"),
-        Q6K => v!("embed_gather_q6k_streamed"),
-        Iq4Nl => v!("embed_gather_iq4nl_streamed"),
-        Iq4Xs => v!("embed_gather_iq4xs_streamed"),
-        Q2_0 => v!("embed_gather_q2_0_streamed"),
+        Q8_0 => v!("embed_gather_q8_0"),
+        Bf16 => v!("embed_gather_bf16"),
+        F16 => v!("embed_gather_f16"),
+        Q4_0 => v!("embed_gather_q4_0"),
+        Q4_1 => v!("embed_gather_q4_1"),
+        Q5_0 => v!("embed_gather_q5_0"),
+        Q5_1 => v!("embed_gather_q5_1"),
+        Q2K => v!("embed_gather_q2k"),
+        Q3K => v!("embed_gather_q3k"),
+        Q4K => v!("embed_gather_q4k"),
+        Q5K => v!("embed_gather_q5k"),
+        Q6K => v!("embed_gather_q6k"),
+        Iq4Nl => v!("embed_gather_iq4nl"),
+        Iq4Xs => v!("embed_gather_iq4xs"),
+        Q2_0 => v!("embed_gather_q2_0"),
         _ => None,
     }
 }
@@ -2064,16 +2052,16 @@ pub(crate) fn quant_q8_spv() -> &'static [u32] {
 /// `-DSTREAMED` twin SPIR-V of `gemm_proj` (the coopmat f16 projection GEMM, weight read through a
 /// typed 64-bit buffer_reference — see the shader's STREAMED doc). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn gemm_proj_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_streamed.spv"));
+pub(crate) fn gemm_proj_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 /// `-DSTREAMED` twin SPIR-V of `gemm_proj_warp` (same STREAMED convention as `gemm_proj`).
 /// Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn gemm_proj_warp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp_streamed.spv"));
+pub(crate) fn gemm_proj_warp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_proj_warp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
@@ -2514,344 +2502,236 @@ pub(crate) fn native_gemm_mmq_nvfp4_xpg32_spv() -> &'static [u32] {
 // EXPERT_GRID arm). PAGED builds never get a twin (STREAMED is the LUT-less resident form
 // of the same arena read) — same exclusion build.rs applies to the dense family.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4k_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q4k_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q4k_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4k_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q4k_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q4k_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4k_xp32w_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q4k_xp32w_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q4k_xp32w_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp32w.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4k_xp128_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q4k_xp128_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q4k_xp128_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4k_xp128.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q6k_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q6k_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q6k_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q6k_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q6k_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q6k_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q6k_xp32w_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q6k_xp32w_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q6k_xp32w_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp32w.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q6k_xp128_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q6k_xp128_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q6k_xp128_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q6k_xp128.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q8_0_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q8_0_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q8_0_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q8_0_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q8_0_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q8_0_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q8_0_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q8_0_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5_0_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q5_0_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q5_0_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_0_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5_0_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q5_0_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q5_0_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_0_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5k_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q5k_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q5k_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5k_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5k_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q5k_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q5k_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5k_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5_1_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q5_1_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q5_1_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_1_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q5_1_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q5_1_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q5_1_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q5_1_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q2_k_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q2_k_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q2_k_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_k_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q2_k_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q2_k_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q2_k_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_k_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q3_k_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q3_k_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q3_k_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q3_k_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q3_k_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q3_k_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q3_k_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q3_k_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4_0_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q4_0_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q4_0_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4_0_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q4_0_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q4_0_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_0_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q2_0_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q2_0_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q2_0_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_0_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q2_0_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q2_0_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q2_0_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q2_0_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq2_s_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_iq2_s_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_iq2_s_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq2_s_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_iq2_s_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_iq2_s_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq2_s_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq3_s_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_iq3_s_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_iq3_s_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq3_s_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq3_s_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_iq3_s_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_iq3_s_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq3_s_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4_1_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q4_1_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q4_1_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_q4_1_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_q4_1_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_q4_1_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_q4_1_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq4_nl_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_iq4_nl_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_iq4_nl_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_nl_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq4_nl_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_iq4_nl_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_iq4_nl_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_nl_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq4_xs_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_iq4_xs_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_iq4_xs_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_xs_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_iq4_xs_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_iq4_xs_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_iq4_xs_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_iq4_xs_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_mxfp4_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_mxfp4_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_mxfp4_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_mxfp4_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_mxfp4_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_mxfp4_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_mxfp4_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_mxfp4_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_nvfp4_xp_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_nvfp4_xp_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_nvfp4_xp_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_nvfp4_xp.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_mmq_nvfp4_xp32_streamed_spv() -> &'static [u32] {
-    const BYTES: &[u8] = include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/native_gemm_mmq_nvfp4_xp32_streamed.spv"
-    ));
+pub(crate) fn native_gemm_mmq_nvfp4_xp32_spv() -> &'static [u32] {
+    const BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/native_gemm_mmq_nvfp4_xp32.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }

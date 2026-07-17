@@ -914,13 +914,10 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.label_gemv("lin_f16_streamed", rows, in_f, out_f);
-        let k = self.be.kernel(
-            "linear_f16_streamed",
-            crate::gemm::linear_f16_streamed_spv(),
-            3,
-            20,
-        );
+        self.label_gemv("lin_f16", rows, in_f, out_f);
+        let k = self
+            .be
+            .kernel("linear_f16", crate::gemm::linear_f16_spv(), 3, 20);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -997,13 +994,10 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        self.label_gemv("lin_bf16_streamed", rows, in_f, out_f);
-        let k = self.be.kernel(
-            "linear_bf16_streamed",
-            crate::gemm::linear_bf16_streamed_spv(),
-            3,
-            20,
-        );
+        self.label_gemv("lin_bf16", rows, in_f, out_f);
+        let k = self
+            .be
+            .kernel("linear_bf16", crate::gemm::linear_bf16_spv(), 3, 20);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -1155,12 +1149,9 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        let k = self.be.kernel(
-            "e2b_gate_streamed",
-            crate::gemm::e2b_gate_streamed_spv(),
-            4,
-            28,
-        );
+        let k = self
+            .be
+            .kernel("e2b_gate", crate::gemm::e2b_gate_spv(), 4, 28);
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -5277,12 +5268,9 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
-        let kern = self.be.kernel(
-            "conv1d_silu_streamed",
-            crate::gemm::conv1d_silu_streamed_spv(),
-            4,
-            20,
-        );
+        let kern = self
+            .be
+            .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 20);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
@@ -5329,12 +5317,9 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let k1 = self.be.kernel(
-            "conv1d_silu_par_streamed",
-            crate::gemm::conv1d_silu_par_streamed_spv(),
-            4,
-            20,
-        );
+        let k1 = self
+            .be
+            .kernel("conv1d_silu_par", crate::gemm::conv1d_silu_par_spv(), 4, 20);
         self.dispatch(
             k1,
             &[

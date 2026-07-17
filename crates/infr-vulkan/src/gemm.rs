@@ -1070,7 +1070,7 @@ pub(crate) fn native_gemm_mmq_dense_spv(
 /// resident build died with the eager `VulkanBackend::linear_f16` caller, its sole consumer).
 /// Production entry: [`crate::recorder::Recorder::linear_at`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_f16_streamed_spv() -> &'static [u32] {
+pub(crate) fn linear_f16_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f16.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
@@ -1088,7 +1088,7 @@ pub(crate) fn linear_f16_noext_spv() -> &'static [u32] {
 /// resident build died with the eager `VulkanBackend::linear_bf16` caller, its sole consumer).
 /// Production entry: [`crate::recorder::Recorder::linear_bf16_at`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn linear_bf16_streamed_spv() -> &'static [u32] {
+pub(crate) fn linear_bf16_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_bf16.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
@@ -2662,7 +2662,7 @@ pub(crate) fn conv1d_shift_spv() -> &'static [u32] {
 /// resident build died with `Recorder::conv1d_silu`'s own resident dispatch, its sole consumer).
 /// Production entry: [`crate::recorder::Recorder::conv1d_silu`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn conv1d_silu_streamed_spv() -> &'static [u32] {
+pub(crate) fn conv1d_silu_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
@@ -2672,7 +2672,7 @@ pub(crate) fn conv1d_silu_streamed_spv() -> &'static [u32] {
 /// `Recorder::conv1d_silu_batch`'s own resident dispatch, its sole consumer). Production entry:
 /// [`crate::recorder::Recorder::conv1d_silu_batch`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn conv1d_silu_par_streamed_spv() -> &'static [u32] {
+pub(crate) fn conv1d_silu_par_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu_par.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
@@ -2720,25 +2720,12 @@ pub(crate) fn rope_spv() -> &'static [u32] {
     static ROPE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
     ROPE_SPV.get_or_init(|| spv_words(ROPE_SPV_BYTES))
 }
-/// SPIR-V for E2B per-layer inp_gate fused GEMV+GELU+strided-multiply kernel. Used ONLY by the
-/// test-only eager `VulkanBackend::e2b_gate` (ops.rs) — a standalone Staging-buffer harness that
-/// predates the resident-BDA weight system and was left as-is by that port (not weight-related in
-/// the arena sense). Now that `e2b_gate.comp`'s resident build is gone (see build.rs's
-/// `mechanism_b_resident`), this returns the SAME bytes as [`e2b_gate_streamed_spv`] — the eager
-/// caller still binds `w` as a plain SSBO and passes the pre-STREAMED 20-byte push-constant
-/// layout (no arena address), which no longer matches this shader's STREAMED ABI.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn e2b_gate_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/e2b_gate.spv"))))
-}
 /// gemma4 E2B's per-layer fused inp_gate GEMV (`e2b_gate.comp`; weight read through a typed
 /// 64-bit buffer_reference — see the shader's STREAMED doc) — the ONLY weight build (the
 /// bound-SSBO resident build died with `Recorder::e2b_gate`'s own resident dispatch, its sole
-/// production consumer). Production entry: [`crate::recorder::Recorder::e2b_gate`]. See
-/// [`e2b_gate_spv`]'s doc for the one surviving (now-mismatched) bound-SSBO caller.
+/// production consumer). Production entry: [`crate::recorder::Recorder::e2b_gate`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn e2b_gate_streamed_spv() -> &'static [u32] {
+pub(crate) fn e2b_gate_spv() -> &'static [u32] {
     const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/e2b_gate.spv"));
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))

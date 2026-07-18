@@ -327,3 +327,321 @@ fn kv_isa_probe() {
     assert_legs("isa-probe f16", &l);
     println!("ok: kv_isa_probe (dispatched attention_kv_bda)");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// #74 slice 2 — flash-decoding split-K (`attn_partial`) bound-vs-pointer parity.
+//
+// The split-K partial pass (`attention_kv_split`) reads K/V as `f16vec4` (or planar-Q8 words). The
+// `-DKV_BDA` twin (`attention_kv_split_at`) must read BIT-IDENTICALLY through `k_addr`/`v_addr`: the
+// f16 vec4 is a single `KV2` b64 read (two u32 words unpacked back to the vec4), Q8 stays scalar
+// `kv_word`. Same three legs as the scalar test — bound, pointer@0, pointer@nonzero-offset — plus a
+// RING-WRAP case (a cache shorter than kv_len so `RROW(j)=j%rcap` recycles rows, exercising the
+// wrapped-index device-address math) and a rows-batched (`attn_partial_mrows_c256`) case.
+
+/// `n` planar-Q8 bytes: codes[n] + scales[n/32] (f16). `n` = cache elements (one side).
+fn q8_bytes(elems: usize) -> usize {
+    assert_eq!(
+        elems % 32,
+        0,
+        "q8 cache must be a whole number of 32-elem blocks"
+    );
+    elems + (elems / 32) * 2
+}
+
+/// Synth bytes for one KV side holding `elems` cache elements (f16 or planar-Q8).
+fn side_data_n(elems: usize, q8: bool, seed: usize) -> Vec<u8> {
+    if q8 {
+        synth_bytes(q8_bytes(elems), seed)
+    } else {
+        synth_f16(elems, seed)
+    }
+}
+
+struct SplitCase {
+    kv_len: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rows: usize,
+    /// Rows physically present in the cache buffer. `< kv_len` ⇒ a ring cache: keys wrap via
+    /// `RROW(j)=j%cap_rows`, and `cap` (the push) is set to the ring's element count.
+    cap_rows: usize,
+    batched: bool,
+}
+
+/// Runs the three addressing legs for one split-K case and returns the combined `o` outputs.
+fn run_split(be: &VulkanBackend, c: &SplitCase, k_q8: bool, v_q8: bool) -> Legs {
+    let SplitCase {
+        kv_len,
+        nh,
+        nkv,
+        hd,
+        rows,
+        cap_rows,
+        batched,
+    } = *c;
+    let ring = cap_rows < kv_len;
+    let cache_elems = cap_rows * nkv * hd;
+    // `cap` push: planar-Q8 needs the scales-region base (= total elements) always; f16 sets it only
+    // for a ring cache (the ring capacity), 0 for a full-context cache (identity `RROW`).
+    let cap = if k_q8 || v_q8 || ring { cache_elems } else { 0 };
+    let scale = 0.0f32; // default 1/sqrt(hd)
+    let window = 0usize;
+    let pos = kv_len - rows; // decode suffix: row i attends up to pos+i (< kv_len)
+                             // chunk/n_chunks mirror the adapter: batched clamps to 256, else the ~32-chunk decode policy;
+                             // both cases below choose kv_len so n_chunks > 1.
+    let chunk = if batched {
+        256
+    } else {
+        (kv_len / 32).clamp(64, 512)
+    };
+    let n_chunks = kv_len.div_ceil(chunk);
+    assert!(
+        n_chunks > 1,
+        "case must split into >1 chunk to exercise the grid"
+    );
+
+    let q = synth_f16(rows * nh * hd, 101);
+    let q_buf = be.alloc(q.len(), BufferUsage::Activations).unwrap();
+    be.upload(q_buf.as_ref(), &q).unwrap();
+    let o_bytes = rows * nh * hd * 4;
+
+    let kd = side_data_n(cache_elems, k_q8, 11);
+    let vd = side_data_n(cache_elems, v_q8, 23);
+
+    // Scratch (shared across the three legs — fully written each dispatch before the combine reads).
+    let pm = be
+        .alloc(rows * nh * n_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pl = be
+        .alloc(rows * nh * n_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pacc = be
+        .alloc(rows * nh * n_chunks * hd * 4, BufferUsage::Activations)
+        .unwrap();
+
+    let one_leg = |k_addr: Option<(u64, u64)>,
+                   kb: &dyn infr_core::backend::Buffer,
+                   vb: &dyn infr_core::backend::Buffer|
+     -> Vec<u32> {
+        let o_buf = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        match k_addr {
+            Some((ka, va)) => rec.attention_kv_split_at(
+                q_buf.as_ref(),
+                kb,
+                vb,
+                ka,
+                va,
+                o_buf.as_ref(),
+                pm.as_ref(),
+                pl.as_ref(),
+                pacc.as_ref(),
+                rows,
+                pos,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                chunk,
+                n_chunks,
+                scale,
+                window,
+                None,
+                k_q8,
+                v_q8,
+                cap,
+                batched,
+            ),
+            None => rec.attention_kv_split(
+                q_buf.as_ref(),
+                kb,
+                vb,
+                o_buf.as_ref(),
+                pm.as_ref(),
+                pl.as_ref(),
+                pacc.as_ref(),
+                rows,
+                pos,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                chunk,
+                n_chunks,
+                scale,
+                window,
+                None,
+                k_q8,
+                v_q8,
+                cap,
+                batched,
+            ),
+        }
+        rec.finish().unwrap();
+        let mut out = vec![0u8; o_bytes];
+        be.download(o_buf.as_ref(), &mut out).unwrap();
+        bits(&out)
+    };
+
+    // ── Leg A: bound SSBOs ────────────────────────────────────────────────────────────────────
+    let kbuf = be.alloc(kd.len(), BufferUsage::KvCache).unwrap();
+    let vbuf = be.alloc(vd.len(), BufferUsage::KvCache).unwrap();
+    be.upload(kbuf.as_ref(), &kd).unwrap();
+    be.upload(vbuf.as_ref(), &vd).unwrap();
+    let bound = one_leg(None, kbuf.as_ref(), vbuf.as_ref());
+
+    // ── Leg B: pointer read at arena offset 0 ─────────────────────────────────────────────────
+    let ka0 = kbuf
+        .device_addr()
+        .expect("KvCache K must expose a device address");
+    let va0 = vbuf
+        .device_addr()
+        .expect("KvCache V must expose a device address");
+    let at0 = one_leg(Some((ka0, va0)), kbuf.as_ref(), vbuf.as_ref());
+
+    // ── Leg C: pointer read, same bytes behind a garbage prefix ───────────────────────────────
+    let mut kback = synth_bytes(OFF, 0xBAD);
+    kback.extend_from_slice(&kd);
+    let mut vback = synth_bytes(OFF, 0xBEEF);
+    vback.extend_from_slice(&vd);
+    let kbuf2 = be.alloc(kback.len(), BufferUsage::KvCache).unwrap();
+    let vbuf2 = be.alloc(vback.len(), BufferUsage::KvCache).unwrap();
+    be.upload(kbuf2.as_ref(), &kback).unwrap();
+    be.upload(vbuf2.as_ref(), &vback).unwrap();
+    let ka = kbuf2.device_addr().unwrap() + OFF as u64;
+    let va = vbuf2.device_addr().unwrap() + OFF as u64;
+    let atoff = one_leg(Some((ka, va)), kbuf2.as_ref(), vbuf2.as_ref());
+
+    Legs { bound, at0, atoff }
+}
+
+/// f16 split-K: decode (rows=1) at hd=128 (the b64 fast path) and hd=64, full-context + ring-wrap.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn attn_partial_bda_matches_bound_f16() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let cases = [
+        // hd=128 decode, full context (hd4==32 4-key fast path).
+        SplitCase {
+            kv_len: 200,
+            nh: 8,
+            nkv: 2,
+            hd: 128,
+            rows: 1,
+            cap_rows: 200,
+            batched: false,
+        },
+        // hd=64 decode, full context (general per-key loop + hd4<=32 V).
+        SplitCase {
+            kv_len: 300,
+            nh: 8,
+            nkv: 8,
+            hd: 64,
+            rows: 1,
+            cap_rows: 300,
+            batched: false,
+        },
+        // RING-WRAP: cache holds 96 rows, 200 keys attended ⇒ RROW wraps (window=0, so bound and
+        // BDA both recycle rows identically — the point is the wrapped device-address math matches).
+        SplitCase {
+            kv_len: 200,
+            nh: 4,
+            nkv: 4,
+            hd: 128,
+            rows: 1,
+            cap_rows: 96,
+            batched: false,
+        },
+    ];
+    for c in &cases {
+        let l = run_split(&be, c, false, false);
+        let name = format!(
+            "f16 split kv={} nh={} nkv={} hd={} rows={} cap_rows={}",
+            c.kv_len, c.nh, c.nkv, c.hd, c.rows, c.cap_rows
+        );
+        assert_legs(&name, &l);
+        println!("ok: {name}");
+    }
+}
+
+/// Planar-Q8 split-K (K-only, V-only, both) — each side reads its own k_addr/v_addr via kv_word.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn attn_partial_bda_matches_bound_q8() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // hd=128, full-context (cap_rows == kv_len ⇒ RROW identity); Q8 is decode-only (rows==1).
+    let c = SplitCase {
+        kv_len: 256,
+        nh: 8,
+        nkv: 2,
+        hd: 128,
+        rows: 1,
+        cap_rows: 256,
+        batched: false,
+    };
+    for (k_q8, v_q8) in [(true, false), (false, true), (true, true)] {
+        let l = run_split(&be, &c, k_q8, v_q8);
+        let name = format!("q8(k={k_q8},v={v_q8}) split kv={} hd={}", c.kv_len, c.hd);
+        assert_legs(&name, &l);
+        println!("ok: {name}");
+    }
+}
+
+/// Rows-batched split-K (`attn_partial_mrows_c256`): 4 query rows, one K/V stream, chunk=256.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn attn_partial_mrows_bda_matches_bound() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // rows>=2, hd<=128, chunk<=256, non-ring, f16 — the recorder's batched debug_assert.
+    let c = SplitCase {
+        kv_len: 400,
+        nh: 8,
+        nkv: 2,
+        hd: 128,
+        rows: 4,
+        cap_rows: 400,
+        batched: true,
+    };
+    let l = run_split(&be, &c, false, false);
+    let name = format!(
+        "mrows split kv={} nh={} hd={} rows={}",
+        c.kv_len, c.nh, c.hd, c.rows
+    );
+    assert_legs(&name, &l);
+    println!("ok: {name}");
+}
+
+/// ISA-dump vehicle for the split-K `-DKV_BDA` build: dispatch `attn_partial_bda` (hd=128, the b64
+/// fast path). Under `RADV_DEBUG=shaders` confirm BOTH (1) K/V loads use a scalar/saddr base + a
+/// 32-bit VGPR offset (no per-load `v_add_co_u32`/`v_addc` 64-bit address build), and (2) the f16
+/// vec4 reads fuse to `global_load_b128`/`b64` (NOT four `global_load_short_d16`).
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn attn_partial_isa_probe() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let c = SplitCase {
+        kv_len: 256,
+        nh: 8,
+        nkv: 2,
+        hd: 128,
+        rows: 1,
+        cap_rows: 256,
+        batched: false,
+    };
+    let l = run_split(&be, &c, false, false);
+    assert_legs("isa-probe attn_partial f16", &l);
+    println!("ok: attn_partial_isa_probe (dispatched attn_partial_bda)");
+}

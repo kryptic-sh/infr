@@ -2433,26 +2433,61 @@ fn lower_op(
                         });
                     }
                     let ctx = dyn_args.iter().find(|c| key(c)).unwrap();
-                    rec.attention_kv_split_dynac(
-                        r(*q)?,
-                        r(*k_cache)?,
-                        r(*v_cache)?,
-                        r(*dst)?,
-                        ctx.pm.as_ref(),
-                        ctx.pl.as_ref(),
-                        ctx.pacc.as_ref(),
-                        *params,
-                        ctx.args.as_ref(),
-                        nh,
-                        nkv,
-                        hd,
-                        chunk,
-                        n_chunks,
-                        pscale,
-                        window,
-                        kv_q8,
-                        cap,
-                    );
+                    // KV u64/BDA (#74 slice 2): fork the HOT record-once decode split-K read to the
+                    // pointer twin when both KV caches expose a device address (they always do — this
+                    // is the resident decode path, KV is never the dequant scratch here) and
+                    // INFR_NO_KV_BDA is unset. The caches persist across replay, so their addresses
+                    // are stable in the baked push. Bit-identical to the bound dispatch.
+                    let kb = r(*k_cache)?;
+                    let vb = r(*v_cache)?;
+                    match (
+                        crate::gemm::kv_bda_disabled(),
+                        kb.device_addr(),
+                        vb.device_addr(),
+                    ) {
+                        (false, Some(ka), Some(va)) => rec.attention_kv_split_dynac_at(
+                            r(*q)?,
+                            kb,
+                            vb,
+                            ka,
+                            va,
+                            r(*dst)?,
+                            ctx.pm.as_ref(),
+                            ctx.pl.as_ref(),
+                            ctx.pacc.as_ref(),
+                            *params,
+                            ctx.args.as_ref(),
+                            nh,
+                            nkv,
+                            hd,
+                            chunk,
+                            n_chunks,
+                            pscale,
+                            window,
+                            kv_q8,
+                            cap,
+                        ),
+                        _ => rec.attention_kv_split_dynac(
+                            r(*q)?,
+                            kb,
+                            vb,
+                            r(*dst)?,
+                            ctx.pm.as_ref(),
+                            ctx.pl.as_ref(),
+                            ctx.pacc.as_ref(),
+                            *params,
+                            ctx.args.as_ref(),
+                            nh,
+                            nkv,
+                            hd,
+                            chunk,
+                            n_chunks,
+                            pscale,
+                            window,
+                            kv_q8,
+                            cap,
+                        ),
+                    }
                 } else {
                     // KV u64/BDA (#74 slice 1): fork the record-once decode read to the pointer twin
                     // when both KV buffers expose a device address and INFR_NO_KV_BDA is unset. The
@@ -2862,30 +2897,66 @@ fn lower_op(
                         Some(k) => pool[k].as_ref(),
                         None => r(*v_cache)?,
                     };
-                    rec.attention_kv_split(
-                        r(*q)?,
-                        kcb,
-                        vcb,
-                        r(*dst)?,
-                        pool[&pm].as_ref(),
-                        pool[&pl].as_ref(),
-                        pool[&pacc].as_ref(),
-                        rows,
-                        pos,
-                        kv_len,
-                        nh,
-                        nkv,
-                        hd,
-                        chunk,
-                        n_chunks,
-                        *scale,
-                        window,
-                        canvas_lo,
-                        k_q8_eff,
-                        v_q8_eff,
-                        cap,
-                        batched_attn,
-                    );
+                    // KV u64/BDA (#74 slice 2): fork the split-K partial read to the pointer twin when
+                    // both KV buffers expose a device address and INFR_NO_KV_BDA is unset. `kcb`/`vcb`
+                    // may be the dequant scratch (rows>1 quantized KV) — those lack an address and fall
+                    // through to the bound arm. Bit-identical to the bound dispatch.
+                    match (
+                        crate::gemm::kv_bda_disabled(),
+                        kcb.device_addr(),
+                        vcb.device_addr(),
+                    ) {
+                        (false, Some(ka), Some(va)) => rec.attention_kv_split_at(
+                            r(*q)?,
+                            kcb,
+                            vcb,
+                            ka,
+                            va,
+                            r(*dst)?,
+                            pool[&pm].as_ref(),
+                            pool[&pl].as_ref(),
+                            pool[&pacc].as_ref(),
+                            rows,
+                            pos,
+                            kv_len,
+                            nh,
+                            nkv,
+                            hd,
+                            chunk,
+                            n_chunks,
+                            *scale,
+                            window,
+                            canvas_lo,
+                            k_q8_eff,
+                            v_q8_eff,
+                            cap,
+                            batched_attn,
+                        ),
+                        _ => rec.attention_kv_split(
+                            r(*q)?,
+                            kcb,
+                            vcb,
+                            r(*dst)?,
+                            pool[&pm].as_ref(),
+                            pool[&pl].as_ref(),
+                            pool[&pacc].as_ref(),
+                            rows,
+                            pos,
+                            kv_len,
+                            nh,
+                            nkv,
+                            hd,
+                            chunk,
+                            n_chunks,
+                            *scale,
+                            window,
+                            canvas_lo,
+                            k_q8_eff,
+                            v_q8_eff,
+                            cap,
+                            batched_attn,
+                        ),
+                    }
                 } else {
                     let window = match mask {
                         AttnMask::Causal => 0,

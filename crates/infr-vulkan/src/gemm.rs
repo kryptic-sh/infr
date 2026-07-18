@@ -2966,6 +2966,27 @@ dyn_spv!(attn_partial_kq8_spv, "attn_partial_kq8");
 dyn_spv!(attn_partial_vq8_spv, "attn_partial_vq8");
 dyn_spv!(attn_partial_dyn_q8_spv, "attn_partial_dyn_q8");
 dyn_spv!(attn_partial_dynac_q8_spv, "attn_partial_dynac_q8");
+// KV-cache u64/BDA twins (#74, slice 2): the `-DKV_BDA` builds of the flash-decoding split-K
+// partial family — K/V read by 64-bit device address (kv_addr.glsl; wide KV2 b64 for the f16 vec4
+// loads, scalar kv_word for Q8) instead of bound SSBOs. Bound twins above stay for kv_addr_parity.rs;
+// production forks here via Recorder::attention_kv_split_at / _dyn_at / _dynac_at.
+dyn_spv!(attn_partial_bda_spv, "attn_partial_bda");
+dyn_spv!(attn_partial_nohd_bda_spv, "attn_partial_nohd_bda");
+dyn_spv!(attn_partial_kq8_bda_spv, "attn_partial_kq8_bda");
+dyn_spv!(attn_partial_vq8_bda_spv, "attn_partial_vq8_bda");
+dyn_spv!(attn_partial_q8_bda_spv, "attn_partial_q8_bda");
+dyn_spv!(attn_partial_dyn_bda_spv, "attn_partial_dyn_bda");
+dyn_spv!(attn_partial_dyn_nohd_bda_spv, "attn_partial_dyn_nohd_bda");
+dyn_spv!(attn_partial_dynac_bda_spv, "attn_partial_dynac_bda");
+dyn_spv!(
+    attn_partial_dynac_nohd_bda_spv,
+    "attn_partial_dynac_nohd_bda"
+);
+dyn_spv!(attn_partial_dynac_q8_bda_spv, "attn_partial_dynac_q8_bda");
+dyn_spv!(
+    attn_partial_mrows_c256_bda_spv,
+    "attn_partial_mrows_c256_bda"
+);
 dyn_spv!(dequant_q8_f16_spv, "dequant_q8_f16");
 /// SPIR-V for the SELF-CHUNKING record-once split-K decode partial (adaptive chunk from the live
 /// kv_len; workgroups past the live range early-exit with a zero-weight header).

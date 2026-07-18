@@ -67,6 +67,63 @@ fn main() {
             "attn_partial_dynac_q8",
             &["-DKQ8", "-DVQ8", "-DUSE_PARAMS", "-DSELF_CHUNK"],
         ),
+        // KV-cache u64/BDA twins (#74, slice 2): `-DKV_BDA` reads the K/V cache by 64-bit device
+        // address (kv_addr.glsl, wide KV2 b64 for the f16 vec4 loads / scalar kv_word for Q8) instead
+        // of bound SSBOs at bindings 1/2 — the flash-decoding mirror of slice 1's scalar attention_kv.
+        // The bound builds above stay compiled so kv_addr_parity.rs can compare bound-vs-pointer bit-
+        // for-bit; production forks to these when the KV buffers report a device address (see
+        // Recorder::attention_kv_split_at / _dynac_at and adapter.rs) unless INFR_NO_KV_BDA.
+        ("attn_partial", "attn_partial_bda", &["-DKV_BDA"]),
+        (
+            "attn_partial",
+            "attn_partial_nohd_bda",
+            &["-DNO_HD_SPEC", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_kq8_bda",
+            &["-DKQ8", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_vq8_bda",
+            &["-DVQ8", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_q8_bda",
+            &["-DKQ8", "-DVQ8", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_dyn_bda",
+            &["-DUSE_PARAMS", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_dyn_nohd_bda",
+            &["-DUSE_PARAMS", "-DNO_HD_SPEC", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_dynac_bda",
+            &["-DUSE_PARAMS", "-DSELF_CHUNK", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_dynac_nohd_bda",
+            &["-DUSE_PARAMS", "-DSELF_CHUNK", "-DNO_HD_SPEC", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial",
+            "attn_partial_dynac_q8_bda",
+            &["-DKQ8", "-DVQ8", "-DUSE_PARAMS", "-DSELF_CHUNK", "-DKV_BDA"],
+        ),
+        (
+            "attn_partial_mrows",
+            "attn_partial_mrows_c256_bda",
+            &["-DSC_MAX=256u", "-DKV_BDA"],
+        ),
         ("attn_qk", "attn_qk", &[]),
         ("attn_qk_warp", "attn_qk_warp", &[]),
         ("attn_flash", "attn_flash", &[]),

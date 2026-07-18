@@ -20,7 +20,16 @@ layout(push_constant) uniform PC {
     // at absolute positions pos..pos+rows-1. gl_WorkGroupID.y picks the row; each row's causal end
     // is pos+row+1. A 1D dispatch with rows=1, pos=kv_len-1 is EXACTLY the old decode behavior.
     uint pos; uint rows;
+#ifdef KV_BDA
+    // -DKV_BDA build (#74 slice 2): K/V cache base device addresses, uvec2-split (avoids 8-byte push
+    // align) — see kv_addr.glsl. K binding 1 / V binding 2 become INERT (bound only for the store→read
+    // hazard edge, never read here); every KVEC4/VVEC4 reads through k_addr/v_addr instead.
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+#endif
 } pc;
+#ifdef KV_BDA
+#include "kv_addr.glsl"
+#endif
 layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] as vec4
 // PLANAR Q8_0 KV cache (per-side): codes int8[cap] then scales f16[cap/32] (see store_q8), read as
 // `uint` words — each `f16vec4` load becomes ONE aligned u32 (4 codes) + one scale word shared by the
@@ -29,6 +38,19 @@ layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] a
 // A planar-Q8 vec4 at vec4-index i4 (elements 4*i4..+3): word i4 = 4 packed int8 codes; the block's
 // f16 scale is at scale-word cap/4 + block/2 (block = 4*i4/32 = i4/8), lane picked by block&1.
 #ifdef KQ8
+#ifdef KV_BDA
+// Planar-Q8 K by device address: the code word (`ku[i4]`) and the block scale are single u32 words,
+// so each reads through kv_word (one global_load_b32) off k_addr — the wide KV2/KV4 reads are for the
+// f16 vec4 loads below, not the already-scalar Q8 words. Mirrors attention_kv.comp's -DKV_BDA dq8k.
+vec4 kvec4(uint i4) {
+    int cw = int(kv_word(k_addr, i4));
+    uint bk = i4 >> 3u;
+    float d = unpackHalf2x16(kv_word(k_addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
+}
+#define KVEC4(i) kvec4(i)
+#else
 layout(binding = 1) readonly buffer KB { uint ku[]; };
 vec4 kvec4(uint i4) {
     int cw = int(ku[i4]);
@@ -38,11 +60,34 @@ vec4 kvec4(uint i4) {
                     bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
 }
 #define KVEC4(i) kvec4(i)
+#endif
+#else
+#ifdef KV_BDA
+// f16 K by device address: one `f16vec4` (8 bytes) = two adjacent u32 words = ONE KV2 read (a single
+// global_load_b64 with a saddr scalar base), NOT four kv_half calls (four unfused global_load_b16 —
+// the bandwidth regression this whole slice exists to avoid). Word base = vec4-index << 1; the two
+// words carry f16 lanes {0,1} and {2,3}, unpacked back to the vec4 the bound `vec4(k4[i])` returns.
+vec4 kread4(uint i4) {
+    uvec2 w = KV2(k_addr, i4 << 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+#define KVEC4(i) kread4(i)
 #else
 layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
 #define KVEC4(i) vec4(k4[i])
 #endif
+#endif
 #ifdef VQ8
+#ifdef KV_BDA
+vec4 vvec4(uint i4) {
+    int cw = int(kv_word(v_addr, i4));
+    uint bk = i4 >> 3u;
+    float d = unpackHalf2x16(kv_word(v_addr, (pc.cap >> 2u) + (bk >> 1u)))[bk & 1u];
+    return d * vec4(bitfieldExtract(cw, 0, 8), bitfieldExtract(cw, 8, 8),
+                    bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
+}
+#define VVEC4(i) vvec4(i)
+#else
 layout(binding = 2) readonly buffer VB { uint vu[]; };
 vec4 vvec4(uint i4) {
     int cw = int(vu[i4]);
@@ -52,9 +97,19 @@ vec4 vvec4(uint i4) {
                     bitfieldExtract(cw, 16, 8), bitfieldExtract(cw, 24, 8));
 }
 #define VVEC4(i) vvec4(i)
+#endif
+#else
+#ifdef KV_BDA
+// f16 V by device address — same KV2 b64 read shape as f16 K above, off v_addr.
+vec4 vread4(uint i4) {
+    uvec2 w = KV2(v_addr, i4 << 1u);
+    return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y));
+}
+#define VVEC4(i) vread4(i)
 #else
 layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
 #define VVEC4(i) vec4(v4[i])
+#endif
 #endif
 #ifdef USE_PARAMS
 // Record-once decode: kv_len comes from a host-updated params SSBO so the buffer replays across
@@ -75,6 +130,13 @@ shared vec4 vsh[32];   // one subgroup's V partial, summed into the other (full-
 
 void main() {
     uint t = gl_LocalInvocationIndex;
+#ifdef KV_BDA
+    // Wave-uniform K/V cache base pointers, set ONCE (kv_addr.glsl). Every KVEC4/VVEC4 adds a u32
+    // element/word offset to these before the uint64_t cast → saddr scalar-base loads (no per-load
+    // 64-bit carry-add) and, for f16, a fused b64.
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+#endif
     uint hd = pc.hd;
     uint hd4 = hd >> 2u;
     // Workgroup ID ordered so the g query heads sharing a (kv-head, chunk) are CONSECUTIVE — the

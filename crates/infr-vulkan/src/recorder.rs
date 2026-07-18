@@ -4617,9 +4617,103 @@ impl<'a> Recorder<'a> {
     /// Flash-decoding attention (q_len==1): split the KV range into `n_chunks` chunks of `chunk`,
     /// compute per-chunk softmax partials in parallel (`pm`/`pl`/`pacc`), then combine into `o`.
     /// Parallelizes attention across `nh*n_chunks` workgroups so it stays fast at long context.
-    #[allow(clippy::too_many_arguments)]
+    /// Bound-SSBO K/V reads (bindings 1/2). See [`Self::attention_kv_split_at`] for the #74-slice-2
+    /// pointer-read twin.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_kv_split(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        rows: usize,
+        pos: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+        canvas_lo: Option<usize>,
+        k_q8: bool,
+        v_q8: bool,
+        cap: usize,
+        batched: bool,
+    ) {
+        self.attention_kv_split_impl(
+            q, kc, vc, o, pm, pl, pacc, rows, pos, kv_len, nh, nkv, hd, chunk, n_chunks, scale,
+            window, canvas_lo, k_q8, v_q8, cap, batched, None,
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::attention_kv_split`] (#74 slice 2): the flash-decoding partial pass
+    /// reads the K/V cache by 64-bit device address (`k_addr`/`v_addr`, kv_addr.glsl) instead of the
+    /// bound SSBOs at slots 1/2. Bit-identical to the bound build (proven by kv_addr_parity.rs). `kc`/
+    /// `vc` stay BOUND at 1/2 as INERT descriptors the `-DKV_BDA` shader never reads — solely so
+    /// `Recorder::sync`'s hazard tracker still orders this read after the KV store's write (a BDA read
+    /// is invisible to the descriptor tracker). The combine pass (pass 2) reads no KV and is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split_at(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        k_addr: u64,
+        v_addr: u64,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        rows: usize,
+        pos: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+        canvas_lo: Option<usize>,
+        k_q8: bool,
+        v_q8: bool,
+        cap: usize,
+        batched: bool,
+    ) {
+        self.attention_kv_split_impl(
+            q,
+            kc,
+            vc,
+            o,
+            pm,
+            pl,
+            pacc,
+            rows,
+            pos,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            canvas_lo,
+            k_q8,
+            v_q8,
+            cap,
+            batched,
+            Some((k_addr, v_addr)),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_kv_split_impl(
         &self,
         q: &dyn Buffer,
         kc: &dyn Buffer,
@@ -4659,15 +4753,41 @@ impl<'a> Recorder<'a> {
         // gates on rows/kv_len/hd (see the adapter's `batched_attn`) and MUST pass chunk <= 256.
         // Mutually exclusive with `canvas_lo` (the adapter's `batched_attn` gate excludes Canvas).
         batched: bool,
+        // #74 slice 2: Some((k_addr, v_addr)) routes pass 1's K/V reads through the `-DKV_BDA`
+        // attn_partial twins (kv_addr.glsl device-address reads); None keeps the bound-SSBO bindings.
+        // kc/vc stay bound at slots 1/2 either way for the store→read hazard edge.
+        kv_addr: Option<(u64, u64)>,
     ) {
-        // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32)
+        let bda = kv_addr.is_some();
+        // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32). Each
+        // f16 variant has a `_bda` twin selected when `kv_addr` is Some (device-address K/V reads).
         let (p1name, p1spv) = match (k_q8, v_q8) {
             (false, false) if crate::gemm::attn_hd_spec_disabled() => {
-                ("attn_partial_nohd", crate::gemm::attn_partial_nohd_spv())
+                if bda {
+                    (
+                        "attn_partial_nohd_bda",
+                        crate::gemm::attn_partial_nohd_bda_spv(),
+                    )
+                } else {
+                    ("attn_partial_nohd", crate::gemm::attn_partial_nohd_spv())
+                }
             }
+            (false, false) if bda => ("attn_partial_bda", crate::gemm::attn_partial_bda_spv()),
             (false, false) => ("attn_partial", crate::gemm::attn_partial_spv()),
+            (true, false) if bda => (
+                "attn_partial_kq8_bda",
+                crate::gemm::attn_partial_kq8_bda_spv(),
+            ),
             (true, false) => ("attn_partial_kq8", crate::gemm::attn_partial_kq8_spv()),
+            (false, true) if bda => (
+                "attn_partial_vq8_bda",
+                crate::gemm::attn_partial_vq8_bda_spv(),
+            ),
             (false, true) => ("attn_partial_vq8", crate::gemm::attn_partial_vq8_spv()),
+            (true, true) if bda => (
+                "attn_partial_q8_bda",
+                crate::gemm::attn_partial_q8_bda_spv(),
+            ),
             (true, true) => ("attn_partial_q8", crate::gemm::attn_partial_q8_spv()),
         };
         // Rows-BATCHED pass 1 (INFR_MROWS_ATTN=1 [+ INFR_MROWS_CHUNK=256], OFF by default): one
@@ -4683,15 +4803,25 @@ impl<'a> Recorder<'a> {
         // no cross-lane reductions), which is how llama.cpp wins that cell (1056 t/s).
         debug_assert!(!batched || (chunk <= 256 && hd <= 128 && !k_q8 && !v_q8 && rows >= 2));
         let (p1name, p1spv) = if batched {
-            (
-                "attn_partial_mrows_c256",
-                crate::gemm::attn_partial_mrows_c256_spv(),
-            )
+            if bda {
+                (
+                    "attn_partial_mrows_c256_bda",
+                    crate::gemm::attn_partial_mrows_c256_bda_spv(),
+                )
+            } else {
+                (
+                    "attn_partial_mrows_c256",
+                    crate::gemm::attn_partial_mrows_c256_spv(),
+                )
+            }
         } else {
             (p1name, p1spv)
         };
-        let k1 = self.be.kernel_sg(p1name, p1spv, 6, 44, 32);
-        let mut p1 = [0u8; 44];
+        // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
+        // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
+        let plen: usize = if bda { 60 } else { 44 };
+        let k1 = self.be.kernel_sg(p1name, p1spv, 6, plen as u32, 32);
+        let mut p1 = [0u8; 60];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
@@ -4714,6 +4844,12 @@ impl<'a> Recorder<'a> {
             canvas_lo.map(|lo| lo as u32 + 1).unwrap_or(0)
         };
         p1[40..44].copy_from_slice(&rows_field.to_ne_bytes());
+        if let Some((k_addr, v_addr)) = kv_addr {
+            p1[44..48].copy_from_slice(&(k_addr as u32).to_ne_bytes());
+            p1[48..52].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
+            p1[52..56].copy_from_slice(&(v_addr as u32).to_ne_bytes());
+            p1[56..60].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
+        }
         // Batched: workgroup y = 4-row group; per-row: y = row.
         let gy = if batched { rows.div_ceil(4) } else { rows };
         self.dispatch3(
@@ -4727,7 +4863,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(pacc),
             ],
             3,
-            &p1,
+            &p1[..plen],
             (nh * n_chunks) as u32,
             gy as u32,
             1,
@@ -4999,7 +5135,51 @@ impl<'a> Recorder<'a> {
         window: usize,
     ) {
         self.attention_kv_split_dyn_inner(
-            q, kc, vc, o, pm, pl, pacc, params, nh, nkv, hd, chunk, n_chunks, scale, window,
+            q, kc, vc, o, pm, pl, pacc, params, nh, nkv, hd, chunk, n_chunks, scale, window, None,
+        )
+    }
+
+    /// `-DKV_BDA` twin of [`Self::attention_kv_split_dyn`] (#74 slice 2): the plain record-once
+    /// split-K partial pass reading K/V by 64-bit device address. Bit-identical to the bound build;
+    /// `kc`/`vc` stay bound at slots 1/2 as inert descriptors for the store→read hazard edge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split_dyn_at(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        k_addr: u64,
+        v_addr: u64,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        params: &dyn Buffer,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+    ) {
+        self.attention_kv_split_dyn_inner(
+            q,
+            kc,
+            vc,
+            o,
+            pm,
+            pl,
+            pacc,
+            params,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            Some((k_addr, v_addr)),
         )
     }
 
@@ -5051,27 +5231,120 @@ impl<'a> Recorder<'a> {
         n_chunks: usize,
         scale: f32,
         window: usize,
+        q8: bool,
+        cap: usize,
+    ) {
+        self.attention_kv_split_dynac_impl(
+            q, kc, vc, o, pm, pl, pacc, params, args, nh, nkv, hd, chunk, n_chunks, scale, window,
+            q8, cap, None,
+        );
+    }
+
+    /// `-DKV_BDA` twin of [`Self::attention_kv_split_dynac`] (#74 slice 2) — the HOTTEST decode read
+    /// path (record-once replay). Pass 1 reads K/V by 64-bit device address (`k_addr`/`v_addr`);
+    /// `kc`/`vc` stay bound at slots 1/2 as inert descriptors purely for the store→read hazard edge.
+    /// Bit-identical to the bound build. The caches persist across replay, so their addresses are
+    /// stable in the baked push.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_split_dynac_at(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        k_addr: u64,
+        v_addr: u64,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        params: &dyn Buffer,
+        args: &dyn Buffer,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
+        q8: bool,
+        cap: usize,
+    ) {
+        self.attention_kv_split_dynac_impl(
+            q,
+            kc,
+            vc,
+            o,
+            pm,
+            pl,
+            pacc,
+            params,
+            args,
+            nh,
+            nkv,
+            hd,
+            chunk,
+            n_chunks,
+            scale,
+            window,
+            q8,
+            cap,
+            Some((k_addr, v_addr)),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_kv_split_dynac_impl(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        o: &dyn Buffer,
+        pm: &dyn Buffer,
+        pl: &dyn Buffer,
+        pacc: &dyn Buffer,
+        params: &dyn Buffer,
+        args: &dyn Buffer,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        chunk: usize,
+        n_chunks: usize,
+        scale: f32,
+        window: usize,
         // Q8_0 KV cache (K==V==q8): coalesced planar Q8 read variant. `false` = f16 cache.
         q8: bool,
         // Planar Q8 scales region base = total cache elements (`cap`). Unused when `q8` is false.
         cap: usize,
+        // #74 slice 2: Some((k_addr, v_addr)) selects the `-DKV_BDA` twins; None keeps bound SSBOs.
+        kv_addr: Option<(u64, u64)>,
     ) {
+        let bda = kv_addr.is_some();
         // pass 1: self-chunking partials, workgroup count from `args` (the caller records ONE
         // `attn_live_prologue` per (nh, chunk, window) key — kv_len is identical for every layer
         // of a token, so the args buffer is shared across same-key attention ops instead of
-        // re-derived per layer).
-        let (p1name, p1spv) = if q8 {
-            (
+        // re-derived per layer). Each f16 variant has a `_bda` device-address twin.
+        let (p1name, p1spv) = match (q8, crate::gemm::attn_hd_spec_disabled(), bda) {
+            (true, _, false) => (
                 "attn_partial_dynac_q8",
                 crate::gemm::attn_partial_dynac_q8_spv(),
-            )
-        } else if crate::gemm::attn_hd_spec_disabled() {
-            (
+            ),
+            (true, _, true) => (
+                "attn_partial_dynac_q8_bda",
+                crate::gemm::attn_partial_dynac_q8_bda_spv(),
+            ),
+            (false, true, false) => (
                 "attn_partial_dynac_nohd",
                 crate::gemm::attn_partial_dynac_nohd_spv(),
-            )
-        } else {
-            ("attn_partial_dynac", crate::gemm::attn_partial_dynac_spv())
+            ),
+            (false, true, true) => (
+                "attn_partial_dynac_nohd_bda",
+                crate::gemm::attn_partial_dynac_nohd_bda_spv(),
+            ),
+            (false, false, false) => ("attn_partial_dynac", crate::gemm::attn_partial_dynac_spv()),
+            (false, false, true) => (
+                "attn_partial_dynac_bda",
+                crate::gemm::attn_partial_dynac_bda_spv(),
+            ),
         };
         // attn_partial.comp's `layout(push_constant) uniform PC {...}` block is declared
         // UNCONDITIONALLY (11 x 4-byte members = 44 bytes) — `pos`/`rows` (offsets 36..44) are
@@ -5082,8 +5355,10 @@ impl<'a> Recorder<'a> {
         // 10069 — confirmed firing on the 7900 XTX under validation layers: "push constant buffer
         // Block with range [0, 44] which is outside the VkPushConstantRange of [0, 36]"). The
         // range must cover the full declared block; the trailing 8 bytes stay zero and unread.
-        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 44, 32);
-        let mut p1 = [0u8; 44];
+        // BDA push grows to 60 (k_lo/k_hi/v_lo/v_hi at 44..60); bound stays 44. n_buf stays 7.
+        let plen: usize = if bda { 60 } else { 44 };
+        let k1 = self.be.kernel_sg(p1name, p1spv, 7, plen as u32, 32);
+        let mut p1 = [0u8; 60];
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -5092,6 +5367,12 @@ impl<'a> Recorder<'a> {
         p1[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         p1[28..32].copy_from_slice(&scale.to_ne_bytes());
         p1[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        if let Some((k_addr, v_addr)) = kv_addr {
+            p1[44..48].copy_from_slice(&(k_addr as u32).to_ne_bytes());
+            p1[48..52].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
+            p1[52..56].copy_from_slice(&(v_addr as u32).to_ne_bytes());
+            p1[56..60].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
+        }
         self.dispatch_indirect(
             k1,
             &[
@@ -5104,7 +5385,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(pacc),
             ],
             3,
-            &p1,
+            &p1[..plen],
             Self::vk_handle(args),
             0,
         );
@@ -5155,21 +5436,32 @@ impl<'a> Recorder<'a> {
         n_chunks: usize,
         scale: f32,
         window: usize,
+        // #74 slice 2: Some((k_addr, v_addr)) selects the `-DKV_BDA` twins; None keeps bound SSBOs.
+        kv_addr: Option<(u64, u64)>,
     ) {
-        let (p1name, p1spv) = if crate::gemm::attn_hd_spec_disabled() {
-            (
+        let bda = kv_addr.is_some();
+        let (p1name, p1spv) = match (crate::gemm::attn_hd_spec_disabled(), bda) {
+            (true, false) => (
                 "attn_partial_dyn_nohd",
                 crate::gemm::attn_partial_dyn_nohd_spv(),
-            )
-        } else {
-            ("attn_partial_dyn", crate::gemm::attn_partial_dyn_spv())
+            ),
+            (true, true) => (
+                "attn_partial_dyn_nohd_bda",
+                crate::gemm::attn_partial_dyn_nohd_bda_spv(),
+            ),
+            (false, false) => ("attn_partial_dyn", crate::gemm::attn_partial_dyn_spv()),
+            (false, true) => (
+                "attn_partial_dyn_bda",
+                crate::gemm::attn_partial_dyn_bda_spv(),
+            ),
         };
         // Same fix as `attention_kv_split_dynac` above: attn_partial.comp's PC block is always 44
-        // bytes; a shorter declared range (32, here) fails
+        // bytes (60 under -DKV_BDA); a shorter declared range fails
         // VUID-VkComputePipelineCreateInfo-layout-10069 even though `cap`/`pos`/`rows` are dead
         // code in this (`-DUSE_PARAMS`, no `-DSELF_CHUNK`) variant.
-        let k1 = self.be.kernel_sg(p1name, p1spv, 7, 44, 32);
-        let mut p1 = [0u8; 44];
+        let plen: usize = if bda { 60 } else { 44 };
+        let k1 = self.be.kernel_sg(p1name, p1spv, 7, plen as u32, 32);
+        let mut p1 = [0u8; 60];
         // [0..4] kv_len: unused (from params)
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
@@ -5178,6 +5470,12 @@ impl<'a> Recorder<'a> {
         p1[20..24].copy_from_slice(&(n_chunks as u32).to_ne_bytes());
         p1[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         p1[28..32].copy_from_slice(&scale.to_ne_bytes());
+        if let Some((k_addr, v_addr)) = kv_addr {
+            p1[44..48].copy_from_slice(&(k_addr as u32).to_ne_bytes());
+            p1[48..52].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
+            p1[52..56].copy_from_slice(&(v_addr as u32).to_ne_bytes());
+            p1[56..60].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
+        }
         self.dispatch(
             k1,
             &[
@@ -5190,7 +5488,7 @@ impl<'a> Recorder<'a> {
                 Self::vkb(pacc),
             ],
             3,
-            &p1,
+            &p1[..plen],
             (nh * n_chunks) as u32,
         );
         // pass 2: combine (structure-only, unchanged from the push-constant path)

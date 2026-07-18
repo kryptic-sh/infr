@@ -17,10 +17,29 @@ layout(push_constant) uniform PC {
     uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
     uint cap;   // unused (f16 only) — kept so the push layout matches attn_partial
     uint pos; uint rows;
+#ifdef KV_BDA
+    // -DKV_BDA build (#74 slice 2): K/V cache base device addresses, uvec2-split. K/V bindings 1/2
+    // become INERT (bound only for the store→read hazard edge) — reads go through k_addr/v_addr.
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+#endif
 } pc;
+#ifdef KV_BDA
+#include "kv_addr.glsl"
+#endif
 layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] as vec4
+#ifdef KV_BDA
+// f16 K/V by device address: one f16vec4 (8 B) = one KV2 read (global_load_b64), unpacked to a vec4 —
+// the drop-in for the bound `vec4(k4[i])` / `vec4(v4[i])`. Word base = vec4-index << 1.
+vec4 kread4(uint i4) { uvec2 w = KV2(k_addr, i4 << 1u); return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)); }
+vec4 vread4(uint i4) { uvec2 w = KV2(v_addr, i4 << 1u); return vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)); }
+#define KVEC4(i) kread4(i)
+#define VVEC4(i) vread4(i)
+#else
 layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };    // cache [kv_len, nkv, hd] as vec4
 layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
+#define KVEC4(i) vec4(k4[i])
+#define VVEC4(i) vec4(v4[i])
+#endif
 layout(binding = 3) buffer PM { float pm[]; };               // [rows*nh, n_chunks]
 layout(binding = 4) buffer PL { float pl[]; };               // [rows*nh, n_chunks]
 layout(binding = 5) buffer PACC { float pacc[]; };           // [rows*nh, n_chunks, hd]
@@ -37,6 +56,10 @@ shared vec4 vsh[RB * 32u];  // subgroup-1 V partials: 2KB
 
 void main() {
     uint t = gl_LocalInvocationIndex;
+#ifdef KV_BDA
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+#endif
     uint hd = pc.hd;
     uint hd4 = hd >> 2u;
     uint g = pc.nh / pc.nkv;
@@ -73,7 +96,7 @@ void main() {
     // the whole row group.
     vec4 lmax = vec4(-3.0e38);
     for (uint j = j0 + sg; j < j1; j += nsg) {
-        vec4 kv = (lane < hd4) ? vec4(k4[(j * pc.nkv + kvh) * hd4 + lane]) : vec4(0.0);
+        vec4 kv = (lane < hd4) ? KVEC4((j * pc.nkv + kvh) * hd4 + lane) : vec4(0.0);
         vec4 d = subgroupAdd(vec4(
                      dot(qreg[0], kv), dot(qreg[1], kv), dot(qreg[2], kv), dot(qreg[3], kv)))
             * scale;
@@ -129,7 +152,7 @@ void main() {
         uint base = kvh * hd4 + lane;
         uint stride = pc.nkv * hd4;
         for (uint j = j0 + sg; j < j1; j += nsg) {
-            vec4 vv = vec4(v4[j * stride + base]);
+            vec4 vv = VVEC4(j * stride + base);
             acc[0] += sc[0u * SC + (j - j0)] * vv;
             acc[1] += sc[1u * SC + (j - j0)] * vv;
             acc[2] += sc[2u * SC + (j - j0)] * vv;

@@ -100,6 +100,37 @@ fn q5k_reconstructs_four_codes_per_word() {
 }
 
 #[test]
+fn q4k_q5k_use_wide_headers_only_for_cooperative_prefill() {
+    let linear = include_str!("../shaders/linear.metal");
+    asserts_token_seq(linear, "inline uint4 load_k4_header");
+    asserts_token_seq(linear, "inline uint2 decode_k4_scale_min");
+    asserts_token_seq(linear, "template<bool WIDE> inline void decode16_q4k");
+    asserts_token_seq(linear, "template<bool WIDE> inline void decode16_q5k");
+    asserts_token_seq(linear, "#define DEC16_Q4K(wk) decode16_q4k<false>");
+    asserts_token_seq(linear, "#define DEC16_Q5K(wk) decode16_q5k<false>");
+
+    let moe = include_str!("../shaders/moe.metal");
+    asserts_token_seq(moe, "CMM_KERNEL(linear_q4k_cmm, DEC16_Q4K_WIDE)");
+    asserts_token_seq(moe, "CMM_KERNEL(linear_q5k_cmm, DEC16_Q5K_WIDE)");
+    let compact = despace(moe);
+    assert_eq!(compact.matches("DEC16_Q4K_WIDE").count(), 1);
+    assert_eq!(compact.matches("DEC16_Q5K_WIDE").count(), 1);
+
+    asserts_token_seq(moe, "GEMV_KERNEL(linear_q5k, DEC16_Q5K)");
+    asserts_token_seq(moe, "RT_KERNEL(linear_q4k_rt, DEC16_Q4K)");
+    asserts_token_seq(moe, "RT_KERNEL(linear_q5k_rt, DEC16_Q5K)");
+    asserts_token_seq(moe, "CMMKS_KERNEL(linear_q4k_cmm_ks, DEC16_Q4K)");
+    asserts_token_seq(moe, "CMMKS_KERNEL(linear_q5k_cmm_ks, DEC16_Q5K)");
+    asserts_token_seq(moe, "HGEMM_KERNEL(linear_q4k_hmm, DEC16_Q4K)");
+    asserts_token_seq(moe, "HGEMM_KERNEL(linear_q5k_hmm, DEC16_Q5K)");
+    asserts_token_seq(moe, "MOE_CMM_KERNEL(linear_q4k_cmm_id, DEC16_Q4K");
+    asserts_token_seq(moe, "MOE_CMM_KERNEL(linear_q4k_cmm_id_w, DEC16_Q4K");
+
+    let gather = include_str!("../shaders/embed_gather.metal");
+    asserts_token_seq(gather, "EMBED_GATHER_KERNEL(embed_gather_q4k, DEC16_Q4K)");
+}
+
+#[test]
 fn regular_cmm_unrolls_its_fixed_tile_loops() {
     let src = include_str!("../shaders/moe.metal");
     asserts_token_seq(

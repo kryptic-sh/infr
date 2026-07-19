@@ -152,41 +152,73 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
         wk[q * 4u + 3u] = scale * (float)cq.w + mn;                                               \
     }
 
+// Q4_K/Q5_K blocks and resident weight bases are 16-byte aligned. Cooperative prefill benefits
+// from one header quad; scalar decode keeps the narrow loads to avoid the measured tg regression.
+inline uint4 load_k4_header(device const uchar* blk) {
+    return *(device const uint4*)blk;
+}
+
+inline uint k4_header_byte(uint word, uint byte_index) {
+    return (word >> (byte_index * 8u)) & 0xFFu;
+}
+
+inline uint2 decode_k4_scale_min(uint i, uint4 hdr) {
+    if (i < 4u) {
+        return uint2(k4_header_byte(hdr.y, i) & 63u,
+                     k4_header_byte(hdr.z, i) & 63u);
+    }
+    uint j = i - 4u;
+    uint sc = (k4_header_byte(hdr.w, j) & 0x0Fu)
+        | ((k4_header_byte(hdr.y, j) >> 6u) << 4u);
+    uint mn = (k4_header_byte(hdr.w, j) >> 4u)
+        | ((k4_header_byte(hdr.z, j) >> 6u) << 4u);
+    return uint2(sc, mn);
+}
+
 // NATIVE Q4_K block (144 B / 256 elems): [f16 d][f16 dmin][12 B 6-bit scales][128 B nibbles].
 // 16-block `sub` within the 256-block: quarter j = sub/4 (qs bytes j*32..), low/high nibble half
 // `hi`, and which 16 of the 32 l-values `l0`. Scale/min pair via get_scale_min_k4(2j + hi).
 // scm/dd are unused (dummy bindings). 144 % 4 == 0, so uint loads stay aligned.
-#define DEC16_Q4K(wk)                                                                             \
-    device const uchar* blk = codes + (ulong)(bi >> 4) * 144ul;                                   \
-    uint sub = bi & 15u;                                                                          \
-    uint j = sub >> 2;                                                                            \
-    uint hi = (sub >> 1) & 1u;                                                                    \
-    uint l0 = (sub & 1u) * 16u;                                                                   \
-    uint dm = *(device const uint*)blk;                                                           \
-    float d = (float)as_type<half>((ushort)(dm & 0xFFFFu));                                       \
-    float dmin = (float)as_type<half>((ushort)(dm >> 16));                                        \
-    device const uchar* scb = blk + 4u;                                                           \
-    uint jj = 2u * j + hi;                                                                        \
-    uint sc6, m6;                                                                                 \
-    if (jj < 4u) {                                                                                \
-        sc6 = scb[jj] & 63u;                                                                      \
-        m6 = scb[jj + 4u] & 63u;                                                                  \
-    } else {                                                                                      \
-        sc6 = (scb[jj + 4u] & 0x0Fu) | ((scb[jj - 4u] >> 6) << 4);                                \
-        m6 = (scb[jj + 4u] >> 4) | ((scb[jj] >> 6) << 4);                                         \
-    }                                                                                             \
-    /* high nibble stays in place (values 16x) and the scale absorbs the /16 — no per-element  */ \
-    /* shift/select, just a mask (the reference dequantize_q4_K trick)                         */ \
-    float scale = (hi != 0u ? d * (1.0f / 16.0f) : d) * (float)sc6;                               \
-    float mn = -(dmin * (float)m6);                                                               \
-    uint nibmask = hi != 0u ? 0xF0F0F0F0u : 0x0F0F0F0Fu;                                          \
-    device const uint* qw4 = (device const uint*)(blk + 16u + j * 32u + l0);                      \
-    for (uint w = 0; w < 4u; w++) {                                                               \
-        uint u = qw4[w] & nibmask;                                                                \
-        for (uint k2 = 0; k2 < 4u; k2++) {                                                        \
-            wk[w * 4u + k2] = scale * (float)((u >> (8u * k2)) & 0xFFu) + mn;                     \
-        }                                                                                         \
+template<bool WIDE>
+inline void decode16_q4k(device const uchar* codes, uint bi, thread float* wk) {
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 144ul;
+    uint sub = bi & 15u;
+    uint j = sub >> 2;
+    uint hi = (sub >> 1) & 1u;
+    uint l0 = (sub & 1u) * 16u;
+    uint jj = 2u * j + hi;
+    uint dm;
+    uint2 sm;
+    if (WIDE) {
+        uint4 hdr = load_k4_header(blk);
+        dm = hdr.x;
+        sm = decode_k4_scale_min(jj, hdr);
+    } else {
+        dm = *(device const uint*)blk;
+        device const uchar* scb = blk + 4u;
+        if (jj < 4u) {
+            sm = uint2(scb[jj] & 63u, scb[jj + 4u] & 63u);
+        } else {
+            sm.x = (scb[jj + 4u] & 0x0Fu) | ((scb[jj - 4u] >> 6u) << 4u);
+            sm.y = (scb[jj + 4u] >> 4u) | ((scb[jj] >> 6u) << 4u);
+        }
     }
+    float d = (float)as_type<half>((ushort)(dm & 0xFFFFu));
+    float dmin = (float)as_type<half>((ushort)(dm >> 16));
+    float scale = (hi != 0u ? d * (1.0f / 16.0f) : d) * (float)sm.x;
+    float mn = -(dmin * (float)sm.y);
+    uint nibmask = hi != 0u ? 0xF0F0F0F0u : 0x0F0F0F0Fu;
+    device const uint* qw4 = (device const uint*)(blk + 16u + j * 32u + l0);
+    for (uint w = 0; w < 4u; w++) {
+        uint u = qw4[w] & nibmask;
+        for (uint k2 = 0; k2 < 4u; k2++) {
+            wk[w * 4u + k2] = scale * (float)((u >> (8u * k2)) & 0xFFu) + mn;
+        }
+    }
+}
+
+#define DEC16_Q4K(wk) decode16_q4k<false>(codes, bi, wk);
+#define DEC16_Q4K_WIDE(wk) decode16_q4k<true>(codes, bi, wk);
 
 // NATIVE Q6_K block (210 B / 256 elems): [128 B ql][64 B qh][16 x i8 scales][f16 d].
 // 16-block `sub`: half h6 = sub/8 (128 elems each), then group off = (sub%8 / 2)*32 with
@@ -237,41 +269,52 @@ struct QLinParams { uint m; uint in_f; uint out_f; uint dshift; };
 // [128 B qs]. 5.5 bpw streamed vs the factored form's ~8. Same two-level (d,dmin)+(sc,m) scale as
 // Q4_K (get_scale_min_k4), plus a 5th bit per element from the qh plane: sub-block s uses qh bit
 // (1 << s). code = nibble + 16*qh_bit; value = d*sc*code - dmin*m — bit-exact vs dequant_block.
-#define DEC16_Q5K(wk)                                                                             \
-    device const uchar* blk = codes + (ulong)(bi >> 4) * 176ul;                                   \
-    uint sub = bi & 15u;                                                                          \
-    uint s = sub >> 1u;                                                                           \
-    uint j = s >> 1u;                                                                             \
-    bool is_low = (s & 1u) == 0u;                                                                 \
-    uint l0 = (sub & 1u) * 16u;                                                                   \
-    uint dm = *(device const uint*)blk;                                                           \
-    float d = (float)as_type<half>((ushort)(dm & 0xFFFFu));                                       \
-    float dmin = (float)as_type<half>((ushort)(dm >> 16));                                        \
-    device const uchar* scb = blk + 4u;                                                           \
-    uint sc6, m6;                                                                                 \
-    if (s < 4u) {                                                                                 \
-        sc6 = scb[s] & 63u;                                                                       \
-        m6 = scb[s + 4u] & 63u;                                                                   \
-    } else {                                                                                      \
-        sc6 = (scb[s + 4u] & 0x0Fu) | ((scb[s - 4u] >> 6) << 4);                                  \
-        m6 = (scb[s + 4u] >> 4) | ((scb[s] >> 6) << 4);                                           \
-    }                                                                                             \
-    float scale = d * (float)sc6;                                                                 \
-    float mn = -(dmin * (float)m6);                                                               \
-    device const uchar* qh = blk + 16u + l0;                                                      \
-    device const uchar* qs = blk + 48u + j * 32u + l0;                                            \
-    device const uint* qh4 = (device const uint*)qh;                                               \
-    device const uint* qs4 = (device const uint*)qs;                                               \
-    uint qshift = is_low ? 0u : 4u;                                                               \
-    for (uint k = 0u; k < 4u; k++) {                                                              \
-        uint q = qs4[k] >> qshift;                                                                 \
-        uint h = qh4[k] >> s;                                                                      \
-        uint packed = (q & 0x0F0F0F0Fu) | ((h & 0x01010101u) << 4u);                              \
-        wk[4u * k]      = scale * (float)(packed & 0x1Fu) + mn;                                   \
-        wk[4u * k + 1u] = scale * (float)((packed >> 8u) & 0x1Fu) + mn;                            \
-        wk[4u * k + 2u] = scale * (float)((packed >> 16u) & 0x1Fu) + mn;                           \
-        wk[4u * k + 3u] = scale * (float)(packed >> 24u) + mn;                                    \
+template<bool WIDE>
+inline void decode16_q5k(device const uchar* codes, uint bi, thread float* wk) {
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 176ul;
+    uint sub = bi & 15u;
+    uint s = sub >> 1u;
+    uint j = s >> 1u;
+    bool is_low = (s & 1u) == 0u;
+    uint l0 = (sub & 1u) * 16u;
+    uint dm;
+    uint2 sm;
+    if (WIDE) {
+        uint4 hdr = load_k4_header(blk);
+        dm = hdr.x;
+        sm = decode_k4_scale_min(s, hdr);
+    } else {
+        dm = *(device const uint*)blk;
+        device const uchar* scb = blk + 4u;
+        if (s < 4u) {
+            sm = uint2(scb[s] & 63u, scb[s + 4u] & 63u);
+        } else {
+            sm.x = (scb[s + 4u] & 0x0Fu) | ((scb[s - 4u] >> 6u) << 4u);
+            sm.y = (scb[s + 4u] >> 4u) | ((scb[s] >> 6u) << 4u);
+        }
     }
+    float d = (float)as_type<half>((ushort)(dm & 0xFFFFu));
+    float dmin = (float)as_type<half>((ushort)(dm >> 16));
+    float scale = d * (float)sm.x;
+    float mn = -(dmin * (float)sm.y);
+    device const uchar* qh = blk + 16u + l0;
+    device const uchar* qs = blk + 48u + j * 32u + l0;
+    device const uint* qh4 = (device const uint*)qh;
+    device const uint* qs4 = (device const uint*)qs;
+    uint qshift = is_low ? 0u : 4u;
+    for (uint k = 0u; k < 4u; k++) {
+        uint q = qs4[k] >> qshift;
+        uint h = qh4[k] >> s;
+        uint packed = (q & 0x0F0F0F0Fu) | ((h & 0x01010101u) << 4u);
+        wk[4u * k] = scale * (float)(packed & 0x1Fu) + mn;
+        wk[4u * k + 1u] = scale * (float)((packed >> 8u) & 0x1Fu) + mn;
+        wk[4u * k + 2u] = scale * (float)((packed >> 16u) & 0x1Fu) + mn;
+        wk[4u * k + 3u] = scale * (float)(packed >> 24u) + mn;
+    }
+}
+
+#define DEC16_Q5K(wk) decode16_q5k<false>(codes, bi, wk);
+#define DEC16_Q5K_WIDE(wk) decode16_q5k<true>(codes, bi, wk);
 
 // NATIVE Q4_0 block (18 B / 32 elems): [f16 d][16 B nibbles] — 4.5 bpw streamed vs the
 // factored form's ~6.1. Element e < 16 is the low nibble of qs[e], e >= 16 the high nibble of

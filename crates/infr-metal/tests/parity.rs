@@ -726,6 +726,21 @@ fn linear_woff_q4k_coop_gemm() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn linear_woff_q5k_coop_gemm() {
+    let (in_f, slices) = (256usize, [128usize, 64, 64]);
+    check_linear_woff(
+        DType::Q5K,
+        synth_q5k(256 * in_f, 124),
+        40,
+        in_f,
+        &slices,
+        true,
+        1e-3,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn linear_woff_q6k_gemv() {
     let (in_f, slices) = (256usize, [128usize, 64, 64]);
     check_linear_woff(

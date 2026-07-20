@@ -462,6 +462,12 @@ pub trait Backend: Send + Sync {
     }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
+    /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan
+    /// `INFR_KV_OVERFLOW` path): how many `BufferUsage::KvCache` buffers landed in device-local VRAM
+    /// vs spilled to system RAM. The runner calls this ONCE, right after the per-layer KV allocation
+    /// loop, so the user sees the resident/spilled split. Default no-op (backends without host spill,
+    /// or with the flag off, print nothing).
+    fn kv_overflow_report(&self) {}
     /// Open a weight-load progress scope: while the returned guard lives, this backend's weight
     /// allocations (`BufferUsage::Weights`/`HostWeights`) advance a visible progress display;
     /// dropping the guard finishes and clears it. The ticking lives in each backend's `alloc`, so

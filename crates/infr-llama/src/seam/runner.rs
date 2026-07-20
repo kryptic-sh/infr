@@ -725,6 +725,9 @@ pub(crate) fn generate_dense_backend(
                     .map_err(|e| anyhow!("{e}"))?,
             );
         }
+        // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
+        // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
+        be.kv_overflow_report();
 
         // ── per-step IO buffers ────────────────────────────────────────────────────────
         let hidden_buf = be

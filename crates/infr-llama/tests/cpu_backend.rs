@@ -2893,3 +2893,132 @@ fn diffusion_gemma_decode_matches_oracle() {
         "decoded answer doesn't mention Paris: {text:?}"
     );
 }
+
+// ─── Multi-GPU Slice 1: data-parallel two-models-two-devices ──────────────────────
+//
+// The end-to-end proof that the model-level device pool works: two independent Qwen3-0.6B seam
+// sessions, one pinned to Vulkan0 and one to Vulkan1, generate greedily AT THE SAME TIME on the two
+// physical GPUs. Each session owns its OWN backend/device (`vulkan_session_default_on`), so weights
+// + KV never cross devices. We assert:
+//   * each session bound the device it was pinned to (device_name matches the enumeration),
+//   * both produce coherent greedy output (both answer "Paris"), concurrently,
+//   * the Vulkan1 (iGPU on this box) session's VRAM DROPS after it loads — its weights/KV landed on
+//     device 1, not device 0 (confirmed programmatically here; `rocm-smi` confirms it live).
+//
+// `#[ignore]` (needs real GPUs) and self-skips when fewer than two Vulkan devices are present, so it
+// is a no-op on a single-GPU box. Run on the two-GPU box with:
+//   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend two_models_two_devices \
+//     -- --include-ignored --nocapture
+#[test]
+#[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
+fn two_models_two_devices_concurrent() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let devices = infr_vulkan::VulkanBackend::enumerate_devices().expect("enumerate devices");
+    if devices.len() < 2 {
+        eprintln!(
+            "skip: two_models_two_devices needs >=2 Vulkan devices (found {})",
+            devices.len()
+        );
+        return;
+    }
+    let _tlk = test_serial_lock();
+    // Deterministic + no <think> span, so the answer settles on "Paris" within a few tokens.
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_NO_THINK", "1");
+
+    /// One session's outcome, carried back out of its thread.
+    struct DevOut {
+        dev: usize,
+        name: String,
+        text: String,
+        avail_before: u64,
+        avail_after: u64,
+        live: bool,
+    }
+
+    // Run device 0 and device 1 CONCURRENTLY — the whole point is two models live on two GPUs at
+    // once. Each thread loads its own model + opens its session on its pinned device (nothing
+    // crosses the thread/device boundary).
+    let run_on = |dev: usize| {
+        let path = path.clone();
+        std::thread::spawn(move || -> DevOut {
+            let model = infr_llama::SeamModel::load(&path, None).expect("load");
+            let mut sess = model
+                .vulkan_session_default_on(Some(dev))
+                .expect("open pinned session");
+            let name = sess.device_name();
+            let before = sess.vram();
+            let prompt = model
+                .render_chat("What is the capital of France? Reply with just the city name.")
+                .expect("render");
+            let mut text = String::new();
+            model
+                .generate_vulkan_session(&mut sess, &prompt, 32, None, |p| text.push_str(p))
+                .expect("generate");
+            let after = sess.vram();
+            DevOut {
+                dev,
+                name,
+                text,
+                avail_before: before.available,
+                avail_after: after.available,
+                live: before.live && after.live,
+            }
+        })
+    };
+
+    let h0 = run_on(0);
+    let h1 = run_on(1);
+    let out0 = h0.join().expect("device 0 thread");
+    let out1 = h1.join().expect("device 1 thread");
+
+    for o in [&out0, &out1] {
+        eprintln!(
+            "Vulkan{} [{}]: VRAM avail {:.2} -> {:.2} GiB (live={}); text = {:?}",
+            o.dev,
+            o.name,
+            o.avail_before as f64 / (1u64 << 30) as f64,
+            o.avail_after as f64 / (1u64 << 30) as f64,
+            o.live,
+            o.text
+        );
+    }
+
+    // Each session bound exactly the device it was pinned to.
+    assert_eq!(
+        out0.name, devices[0].name,
+        "Vulkan0 session bound the wrong device"
+    );
+    assert_eq!(
+        out1.name, devices[1].name,
+        "Vulkan1 session bound the wrong device"
+    );
+    assert_ne!(
+        out0.name, out1.name,
+        "the two sessions must be on distinct physical devices"
+    );
+
+    // Both produce coherent greedy output, concurrently.
+    assert!(
+        out0.text.contains("Paris"),
+        "Vulkan0 output not coherent: {:?}",
+        out0.text
+    );
+    assert!(
+        out1.text.contains("Paris"),
+        "Vulkan1 output not coherent: {:?}",
+        out1.text
+    );
+
+    // The Vulkan1 session's weights + KV landed on device 1: its available VRAM dropped after load.
+    // Only assert when the driver reports a LIVE budget (VK_EXT_memory_budget); otherwise the
+    // snapshot is total-only and can't move (still printed above for the record).
+    if out1.live {
+        assert!(
+            out1.avail_after < out1.avail_before,
+            "Vulkan1 available VRAM did not drop ({} -> {}) — weights/KV did not land on device 1",
+            out1.avail_before,
+            out1.avail_after
+        );
+    }
+}

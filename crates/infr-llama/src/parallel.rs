@@ -111,8 +111,26 @@ impl ParallelSeam {
         n_slots: usize,
         want_ctx: Option<infr_core::SizeSpec>,
     ) -> Result<Self> {
+        Self::new_on(None, model, n_slots, want_ctx)
+    }
+
+    /// [`new`](Self::new) pinned to physical device `dev`: `Some(idx)` binds `VulkanN`
+    /// ([`infr_vulkan::VulkanBackend::new_on`], bypassing `INFR_DEV`/the discrete-default rule),
+    /// `None` is the default device (byte-identical to `new`). This is what lets `infr multi` host
+    /// several concurrent-slot engines side by side, each on its own GPU: the whole engine (weights,
+    /// N KV slots, recorder) lives on the ONE backend this constructs, so nothing crosses devices.
+    pub fn new_on(
+        dev: Option<usize>,
+        model: SeamModel,
+        n_slots: usize,
+        want_ctx: Option<infr_core::SizeSpec>,
+    ) -> Result<Self> {
         let n_slots = n_slots.max(1);
-        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        let vk = match dev {
+            Some(idx) => infr_vulkan::VulkanBackend::new_on(idx)
+                .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
+            None => infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?,
+        };
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx);
         let mut engine = Self {
             model,
@@ -207,6 +225,14 @@ impl ParallelSeam {
 
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
+    }
+
+    /// The physical device this engine's backend bound (e.g. the discrete GPU or the iGPU). Used by
+    /// `infr multi` to print the model→device routing table — two engines pinned to different
+    /// indices report different names.
+    pub fn device_name(&self) -> String {
+        use infr_core::backend::Backend;
+        self.vk.capabilities().name
     }
 
     pub fn model(&self) -> &SeamModel {

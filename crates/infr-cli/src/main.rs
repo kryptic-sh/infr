@@ -284,6 +284,38 @@ enum Cmd {
         #[command(flatten)]
         sampling: SamplingOpts,
     },
+    /// Host SEVERAL models at once, each pinned to a physical GPU, on ONE OpenAI-compatible server
+    /// (routed by model name). Data-parallel multi-device serving: `infr multi qwen@Vulkan0
+    /// gemma@Vulkan1` runs the two models concurrently on the two GPUs — a request naming a model is
+    /// dispatched to the generator on that model's device. Each spec is `MODEL[@VulkanN]` (a `.gguf`
+    /// path or an `org/repo[:quant]` HF ref, optionally with a device suffix); omit `@VulkanN` to
+    /// round-robin the specs across the enumerated Vulkan devices. Vulkan seam only (the concurrent
+    /// engine) — `INFR_CPU`/`INFR_METAL`/diffusion-gemma models aren't hosted here.
+    Multi {
+        /// Model specs `MODEL[@VulkanN]`, one per hosted model. At least one; devices without a
+        /// suffix are assigned round-robin over the enumerated GPUs.
+        #[arg(num_args = 1.., required = true, value_name = "MODEL[@VulkanN]")]
+        models: Vec<String>,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Concurrent generation slots PER MODEL (each slot owns a full KV cache on that model's
+        /// device). Defaults to 1: the iGPU shares system RAM and the demo hosts small models, so a
+        /// modest per-model default keeps two models on two devices well inside memory. The
+        /// cross-model concurrency (one request per model at once, on different GPUs) is what proves
+        /// the device pool; raise this to add within-model concurrency.
+        #[arg(
+            long = "parallel",
+            visible_alias = "np",
+            short = 'n',
+            default_value_t = 1,
+            value_name = "N"
+        )]
+        parallel: usize,
+        /// Per-slot context window (shared size grammar `8192`/`256k`/`50%`); applies to every hosted
+        /// model. Unset = each model's VRAM-fit default on its own device.
+        #[arg(long, value_name = "CTX")]
+        ctx: Option<String>,
+    },
     /// Benchmark prefill/decode tok/s — same interface as llama.cpp's `llama-bench` (-p/-n/-d/-r),
     /// so the two are directly comparable. Prefill (pp) when -n 0; decode (tg) when -p 0.
     Bench {
@@ -508,6 +540,12 @@ fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
             sampling.resolve();
             cmd_serve(&model, &addr, parallel)
         }
+        Cmd::Multi {
+            models,
+            addr,
+            parallel,
+            ctx,
+        } => cmd_multi(&models, &addr, parallel, ctx.as_deref()),
         Cmd::Bench {
             model,
             n_prompt,
@@ -3274,10 +3312,180 @@ fn cmd_serve(model: &str, addr: &str, parallel: usize) -> anyhow::Result<()> {
     }
 }
 
+/// Split a `MODEL[@VulkanN]` spec into (model_ref, Option<device_index>). The device suffix is the
+/// text after the LAST `@` when it is `VulkanN` (case-insensitive) or bare digits; anything else is
+/// treated as part of the model reference (so an `@` inside a path or HF ref is left alone). Returns
+/// an error for an `@`-suffix that looks device-shaped but isn't a valid index.
+fn parse_model_spec(spec: &str) -> anyhow::Result<(&str, Option<usize>)> {
+    let Some(at) = spec.rfind('@') else {
+        return Ok((spec, None));
+    };
+    let (head, tail) = (&spec[..at], &spec[at + 1..]);
+    let lower = tail.to_ascii_lowercase();
+    let digits = lower.strip_prefix("vulkan").unwrap_or(&lower);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        let idx: usize = digits
+            .parse()
+            .map_err(|_| anyhow!("invalid device suffix `@{tail}` in `{spec}`"))?;
+        Ok((head, Some(idx)))
+    } else {
+        // Not a device suffix (e.g. an `@` inside the ref) — keep the whole thing as the model.
+        Ok((spec, None))
+    }
+}
+
+/// `infr multi` — host several models at once, each pinned to a physical GPU, on ONE OpenAI server
+/// routed by model name. Data-parallel multi-device serving (Slice 1 of the multi-GPU campaign):
+/// each model is a self-contained concurrent-slot [`ParallelSeam`] on its OWN backend/device
+/// (`new_on`), so nothing crosses devices; the server dispatches a request to the generator for the
+/// model it names. Graceful shutdown drains EVERY device (the server aborts all in-flight requests,
+/// then each generator — and its backend — drops as `serve_multi` returns).
+fn cmd_multi(
+    specs: &[String],
+    addr: &str,
+    parallel: usize,
+    ctx: Option<&str>,
+) -> anyhow::Result<()> {
+    let sockaddr: std::net::SocketAddr = addr.parse().context("invalid --addr")?;
+    let parallel = parallel.max(1);
+
+    // `infr multi` is the VULKAN concurrent engine only — the reference backends have no multi-slot
+    // engine and no device pool to spread across. Refuse the reference-backend envs up front rather
+    // than silently ignoring them.
+    if std::env::var("INFR_CPU").is_ok() || std::env::var("INFR_METAL").is_ok() {
+        anyhow::bail!(
+            "`infr multi` hosts models on the Vulkan device pool; unset INFR_CPU/INFR_METAL \
+             (the CPU/Metal reference backends have no multi-slot engine)"
+        );
+    }
+
+    // `--ctx` shares the size grammar with the rest of the CLI; validate once, apply to every model.
+    let want_ctx = match ctx {
+        Some(c) => {
+            let spec = infr_core::parse_size(c)
+                .ok_or_else(|| anyhow!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)"))?;
+            Some(spec)
+        }
+        None => None,
+    };
+
+    // Enumerate the device pool once: for validation, round-robin assignment of specs that omit a
+    // device, and the routing table's device names.
+    let devices = infr_vulkan::VulkanBackend::enumerate_devices().map_err(|e| anyhow!("{e}"))?;
+    if devices.is_empty() {
+        anyhow::bail!("no Vulkan physical devices found (see `infr devices`)");
+    }
+
+    // Load each model on its assigned device. Sequential on purpose: two concurrent multi-GiB weight
+    // uploads to two devices would spike total memory; one at a time is the safe order (the iGPU
+    // shares system RAM). Each `ParallelSeam::new_on` prints its own device selection + warmup line.
+    let mut entries: Vec<(
+        String,
+        std::sync::Arc<dyn infr_server::ChatGenerator>,
+        usize,
+    )> = Vec::with_capacity(specs.len());
+    let mut routing: Vec<(String, usize, String)> = Vec::with_capacity(specs.len());
+    let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (i, spec) in specs.iter().enumerate() {
+        let (model_ref, dev_opt) = parse_model_spec(spec)?;
+        // Round-robin the pool for specs without an explicit device.
+        let dev = dev_opt.unwrap_or(i % devices.len());
+        if dev >= devices.len() {
+            anyhow::bail!(
+                "`{spec}` asks for Vulkan{dev} but this system has {} device(s) (see `infr devices`)",
+                devices.len()
+            );
+        }
+        let (gguf, tok) = resolve(model_ref)?;
+        if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
+            anyhow::bail!(
+                "`{model_ref}` is a diffusion-gemma model, which `infr multi` does not host \
+                 (no multi-slot engine); serve it on its own with `infr serve`"
+            );
+        }
+        // Sampling defaults are process-global; apply the FIRST model's so the banner is honest, and
+        // note that all hosted models share them (a per-model override would need per-request fields).
+        if i == 0 {
+            apply_model_sampling_defaults(&gguf);
+        }
+
+        // A stable, unique wire id: the file stem, disambiguated by device when two specs collide
+        // (e.g. the same model hosted twice on two GPUs — the demo).
+        let stem = gguf
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model")
+            .to_string();
+        let mut model_id = stem.clone();
+        if !used_ids.insert(model_id.clone()) {
+            model_id = format!("{stem}@Vulkan{dev}");
+            // Extremely unlikely second collision (same model, same device, twice): number it.
+            let mut n = 2;
+            while !used_ids.insert(model_id.clone()) {
+                model_id = format!("{stem}@Vulkan{dev}#{n}");
+                n += 1;
+            }
+        }
+
+        eprintln!(
+            "[multi] loading {model_id} on Vulkan{dev} ({})",
+            devices[dev].name
+        );
+        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let engine =
+            infr_llama::parallel::ParallelSeam::new_on(Some(dev), loaded, parallel, want_ctx)?;
+        let n_slots = engine.n_slots();
+        let dev_name = engine.device_name();
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
+            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine)?);
+        routing.push((model_id.clone(), dev, dev_name));
+        entries.push((model_id, generator, n_slots));
+    }
+
+    // Print the model → device routing so the demo shows exactly which model landed on which GPU.
+    println!(
+        "\ninfr multi: {} model(s) on http://{sockaddr}  (OpenAI /v1)",
+        entries.len()
+    );
+    println!("  routing (model -> device):");
+    for (id, dev, name) in &routing {
+        println!("    {id}  ->  Vulkan{dev} ({name})");
+    }
+    println!();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(infr_server::serve_multi(entries, sockaddr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use infr_llama::arch::*;
+
+    #[test]
+    fn model_spec_parses_device_suffix() {
+        assert_eq!(
+            parse_model_spec("qwen.gguf@Vulkan1").unwrap(),
+            ("qwen.gguf", Some(1))
+        );
+        assert_eq!(
+            parse_model_spec("qwen.gguf@vulkan0").unwrap(),
+            ("qwen.gguf", Some(0))
+        );
+        // Bare-digit suffix also accepted.
+        assert_eq!(
+            parse_model_spec("qwen.gguf@2").unwrap(),
+            ("qwen.gguf", Some(2))
+        );
+        // No suffix.
+        assert_eq!(parse_model_spec("qwen.gguf").unwrap(), ("qwen.gguf", None));
+        // An `@` that isn't device-shaped (e.g. a revision) is left as part of the ref.
+        assert_eq!(
+            parse_model_spec("org/repo@main").unwrap(),
+            ("org/repo@main", None)
+        );
+    }
 
     #[test]
     fn arch_sampling_table_is_family_specific() {

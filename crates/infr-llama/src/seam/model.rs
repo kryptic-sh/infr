@@ -45,6 +45,19 @@ struct SlotPool {
     tick: u64,
 }
 
+/// Open a Vulkan backend on physical device `dev`: `Some(idx)` pins `VulkanN`
+/// ([`infr_vulkan::VulkanBackend::new_on`], bypassing `INFR_DEV`/the discrete-default rule for the
+/// multi-device path), `None` is the historical default ([`infr_vulkan::VulkanBackend::new`],
+/// byte-identical to before). The single funnel every seam-session constructor uses so the pinned
+/// and default paths stay in lockstep.
+fn open_backend(dev: Option<usize>) -> Result<infr_vulkan::VulkanBackend> {
+    match dev {
+        Some(idx) => infr_vulkan::VulkanBackend::new_on(idx)
+            .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}")),
+        None => infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}")),
+    }
+}
+
 /// A persistent Vulkan seam session (see [`SeamModel::vulkan_session`]): owns the backend and the
 /// conversation [`SlotPool`].
 pub struct DenseVulkanSession {
@@ -59,6 +72,22 @@ impl DenseVulkanSession {
     /// warmup generation so the first real prompt starts from clean slots.
     pub fn reset_cache(&mut self) {
         self.pool.reset_cache();
+    }
+
+    /// The name of the physical device this session's backend bound (e.g. the discrete GPU or the
+    /// iGPU). Multi-device introspection: two sessions pinned to different indices report different
+    /// names — the proof that a model-level device pool actually placed each session on its own GPU.
+    pub fn device_name(&self) -> String {
+        self.vk.capabilities().name
+    }
+
+    /// Live VRAM snapshot for THIS session's device (see [`infr_vulkan::VramInfo`]). Used to confirm
+    /// where a session's weights + KV actually landed: snapshot `available` before/after the first
+    /// generation and the drop is this device's allocation (on the iGPU that is system RAM — its
+    /// heaps are unified). The discrete/iGPU split is visible because each session owns its OWN
+    /// backend/device, so the snapshot is per-device, never a global sum.
+    pub fn vram(&self) -> infr_vulkan::VramInfo {
+        self.vk.vram()
     }
 }
 
@@ -280,7 +309,20 @@ impl SeamModel {
     /// [`generate_vulkan_session`](Self::generate_vulkan_session) call prefill only the suffix
     /// that differs from the previous turn (ChatSession-style KV reuse on the agnostic seam).
     pub fn vulkan_session(&self, max_ctx: usize) -> Result<DenseVulkanSession> {
-        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        self.vulkan_session_on(None, max_ctx)
+    }
+
+    /// [`vulkan_session`](Self::vulkan_session) pinned to physical device `dev`
+    /// (`Some(idx)` = `VulkanN`, bypassing `INFR_DEV`/the discrete-default rule; `None` = the
+    /// default device, byte-identical to `vulkan_session`). The multi-device foundation: two
+    /// sessions built on different indices hold two live backends, each owning its own weights + KV
+    /// on its own GPU — data-parallel hosting at the session level (Slice 1).
+    pub fn vulkan_session_on(
+        &self,
+        dev: Option<usize>,
+        max_ctx: usize,
+    ) -> Result<DenseVulkanSession> {
+        let vk = open_backend(dev)?;
         Ok(DenseVulkanSession {
             vk,
             pool: SlotPool::new(),
@@ -295,7 +337,15 @@ impl SeamModel {
     /// (INFR_CTX → `vulkan_session(ctx)`) are NEVER clamped; the Vulkan allocation budget
     /// guard still fails a truly-oversized one cleanly at alloc time.
     pub fn vulkan_session_default(&self) -> Result<DenseVulkanSession> {
-        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        self.vulkan_session_default_on(None)
+    }
+
+    /// [`vulkan_session_default`](Self::vulkan_session_default) pinned to physical device `dev`
+    /// (`Some(idx)` = `VulkanN`; `None` = the default device, byte-identical). Each device's own
+    /// VRAM budget clamps its own default context — a session on the weak iGPU gets a window sized
+    /// to the iGPU's memory, independent of the discrete card's.
+    pub fn vulkan_session_default_on(&self, dev: Option<usize>) -> Result<DenseVulkanSession> {
+        let vk = open_backend(dev)?;
         let max_ctx = self.clamp_default_ctx(&vk, self.cfg.n_ctx_train);
         Ok(DenseVulkanSession {
             vk,
@@ -310,7 +360,18 @@ impl SeamModel {
     /// [`vulkan_session_default`]'s clamp, scaled by `frac`; unlike an explicit token count the
     /// result is inherently within budget, and the alloc-time guard stays the backstop.
     pub fn vulkan_session_frac(&self, frac: f64) -> Result<DenseVulkanSession> {
-        let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
+        self.vulkan_session_frac_on(None, frac)
+    }
+
+    /// [`vulkan_session_frac`](Self::vulkan_session_frac) pinned to physical device `dev`
+    /// (`Some(idx)` = `VulkanN`; `None` = the default device, byte-identical). The fraction is of
+    /// the pinned device's own free-VRAM KV capacity.
+    pub fn vulkan_session_frac_on(
+        &self,
+        dev: Option<usize>,
+        frac: f64,
+    ) -> Result<DenseVulkanSession> {
+        let vk = open_backend(dev)?;
         // A pure recurrent-state arch has no per-token KV to size a fraction of — fall back to
         // the trained context (same shape as the default path's `kv_per_tok == 0` escape).
         let fit = self.kv_fit_ctx(&vk).unwrap_or(self.cfg.n_ctx_train);

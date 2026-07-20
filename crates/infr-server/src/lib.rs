@@ -492,46 +492,98 @@ pub struct DeltaPayload {
 // App state
 // ---------------------------------------------------------------------------
 
-/// Shared server state.
+/// One hosted model: its wire id, its generator, and its OWN admission semaphore.
 ///
-/// `engine` is an `Option<Arc<dyn ChatGenerator>>` so the router can be constructed without a live
-/// model (used in tests and for the /health + /v1/models endpoints which need no generation). It is
-/// an `Arc`, NOT an `Arc<Mutex<_>>`: generation runs concurrently and the generator synchronises
-/// itself (see [`ChatGenerator`]'s `&self` contract).
+/// `engine` is an `Option<Arc<dyn ChatGenerator>>` so an entry can exist without a live model (the
+/// headless test/`/v1/models` state). It is an `Arc`, NOT an `Arc<Mutex<_>>`: generation runs
+/// concurrently and the generator synchronises itself (see [`ChatGenerator`]'s `&self` contract).
 ///
-/// `slots` is the ADMISSION control — one permit per KV slot (`--parallel N`). A request takes a
-/// permit for the whole of its generation and returns it at the end, so at most N generate
-/// concurrently and the N+1'th QUEUES (tokio's semaphore is FIFO, so it queues fairly) rather than
-/// being rejected. This is the only thing that bounds in-flight work; the generator's own slot pool
-/// is sized to match.
+/// `slots` is PER-MODEL admission control — one permit per KV slot (`--parallel N`). A request
+/// takes a permit for the whole of its generation and returns it at the end, so at most N generate
+/// concurrently on THAT model and the N+1'th QUEUES (tokio's semaphore is FIFO) rather than being
+/// rejected. Per-model (not global) is the point of the multi-model server: a model on the discrete
+/// GPU and a model on the iGPU each admit their own N independently — one busy model never starves
+/// another that lives on a different device.
 #[derive(Clone)]
-pub struct AppState {
-    pub engine: Option<Arc<dyn ChatGenerator>>,
-    pub model_id: Arc<str>,
+struct ModelEntry {
+    id: Arc<str>,
+    engine: Option<Arc<dyn ChatGenerator>>,
     slots: Arc<Semaphore>,
 }
 
+/// Shared server state — a non-empty, ordered set of hosted [`ModelEntry`]s. A request is routed to
+/// the entry whose `id` matches its `model` field; an unknown/empty `model` falls to the DEFAULT
+/// (the first entry). The single-model server is just the one-entry case, so its behaviour — and the
+/// hot path — is byte-identical to before this became multi-model.
+#[derive(Clone)]
+pub struct AppState {
+    /// Invariant: non-empty. `models[0]` is the default route.
+    models: Arc<Vec<ModelEntry>>,
+}
+
 impl AppState {
-    /// Wrap a loaded generator for production use with `n_parallel` concurrent slots.
+    /// Wrap a single loaded generator for production use with `n_parallel` concurrent slots — the
+    /// single-model server (the overwhelming common case). Equivalent to a one-entry
+    /// [`multi`](Self::multi).
     pub fn new(
         generator: Arc<dyn ChatGenerator>,
         model_id: impl Into<String>,
         n_parallel: usize,
     ) -> Self {
         Self {
-            engine: Some(generator),
-            model_id: Arc::from(model_id.into().as_str()),
-            slots: Arc::new(Semaphore::new(n_parallel.max(1))),
+            models: Arc::new(vec![ModelEntry {
+                id: Arc::from(model_id.into().as_str()),
+                engine: Some(generator),
+                slots: Arc::new(Semaphore::new(n_parallel.max(1))),
+            }]),
+        }
+    }
+
+    /// Host SEVERAL models at once, each with its OWN generator and per-model slot count. Each
+    /// `(model_id, generator, n_parallel)` becomes a routable entry; the FIRST is the default route
+    /// (used for a request with an unknown or empty `model`). This is the multi-device host: pass a
+    /// generator pinned to each physical GPU and the server routes by model name — see `infr multi`.
+    ///
+    /// Panics if `entries` is empty (the state invariant is a non-empty model set); the CLI never
+    /// calls it with none.
+    pub fn multi(entries: Vec<(String, Arc<dyn ChatGenerator>, usize)>) -> Self {
+        assert!(
+            !entries.is_empty(),
+            "AppState::multi needs at least one model"
+        );
+        let models = entries
+            .into_iter()
+            .map(|(id, gen, n)| ModelEntry {
+                id: Arc::from(id.as_str()),
+                engine: Some(gen),
+                slots: Arc::new(Semaphore::new(n.max(1))),
+            })
+            .collect();
+        Self {
+            models: Arc::new(models),
         }
     }
 
     /// No-engine state — for /health, /v1/models, and serialisation tests.
     pub fn headless(model_id: impl Into<String>) -> Self {
         Self {
-            engine: None,
-            model_id: Arc::from(model_id.into().as_str()),
-            slots: Arc::new(Semaphore::new(1)),
+            models: Arc::new(vec![ModelEntry {
+                id: Arc::from(model_id.into().as_str()),
+                engine: None,
+                slots: Arc::new(Semaphore::new(1)),
+            }]),
         }
+    }
+
+    /// Route a request's `model` field to a hosted entry: an exact id match, else the default
+    /// (first) entry — mirroring OpenAI servers, which never 404 on the model name. Returns a clone
+    /// of the entry's `Arc` handles (cheap) so the caller owns them across the `spawn_blocking`.
+    fn route(&self, requested: &str) -> ModelEntry {
+        self.models
+            .iter()
+            .find(|m| &*m.id == requested)
+            .unwrap_or(&self.models[0])
+            .clone()
     }
 }
 
@@ -560,10 +612,30 @@ pub async fn serve(
     addr: SocketAddr,
     n_parallel: usize,
 ) -> anyhow::Result<()> {
-    let state = AppState::new(generator, model_id, n_parallel);
+    serve_state(AppState::new(generator, model_id, n_parallel), addr).await
+}
+
+/// Start the server hosting SEVERAL models at once, each routed by its `model_id` and admitted with
+/// its own `n_parallel` slot count (`entries[0]` is the default route). This is the multi-device
+/// host (`infr multi`): each generator can be pinned to a different physical GPU, and the server
+/// dispatches a request to the generator for the model it names. Graceful shutdown drains EVERY
+/// model's in-flight requests before any backend drops (the axum layer stops accepting, then each
+/// generation returns at its next abort poll — see [`shutdown_latched`]); when `serve_multi`
+/// returns, the runtime drops and every backend's device is destroyed in turn.
+pub async fn serve_multi(
+    entries: Vec<(String, Arc<dyn ChatGenerator>, usize)>,
+    addr: SocketAddr,
+) -> anyhow::Result<()> {
+    serve_state(AppState::multi(entries), addr).await
+}
+
+/// Bind + run the axum server over a fully-built [`AppState`] (single- or multi-model). The one
+/// place the listener, the graceful-shutdown latch, and `axum::serve` live.
+async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
+    let n_models = state.models.len();
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, %n_parallel, "infr-server listening");
+    tracing::info!(%addr, %n_models, "infr-server listening");
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_latched())
         .await?;
@@ -600,11 +672,15 @@ async fn health_handler() -> StatusCode {
 async fn models_handler(State(state): State<AppState>) -> Json<ModelsResponse> {
     Json(ModelsResponse {
         object: "list",
-        data: vec![ModelCard {
-            id: state.model_id.to_string(),
-            object: "model",
-            owned_by: "local",
-        }],
+        data: state
+            .models
+            .iter()
+            .map(|m| ModelCard {
+                id: m.id.to_string(),
+                object: "model",
+                owned_by: "local",
+            })
+            .collect(),
     })
 }
 
@@ -624,13 +700,17 @@ async fn chat_completions_handler(
     let messages: Vec<ChatMessage> = req.messages.iter().map(dto_to_engine).collect();
     let tools_json: Option<String> = req.tools.as_ref().map(|v| v.to_string());
     let tool_choice: Option<String> = req.tool_choice.as_ref().and_then(tool_choice_str);
-    let model_id = state.model_id.to_string();
+    // Route to the hosted model named in the request (exact id), else the default (first) entry.
+    // The response `model` field echoes the entry ACTUALLY served, not the raw request string, so a
+    // client that omitted/mis-named the model sees which one answered.
+    let entry = state.route(&req.model);
+    let model_id = entry.id.to_string();
     let cid = make_id();
     let created = unix_ts();
 
     if req.stream {
         streaming(
-            state,
+            entry,
             messages,
             tools_json,
             tool_choice,
@@ -642,7 +722,7 @@ async fn chat_completions_handler(
         .await
     } else {
         non_streaming(
-            state,
+            entry,
             messages,
             tools_json,
             tool_choice,
@@ -661,7 +741,7 @@ async fn chat_completions_handler(
 
 #[allow(clippy::too_many_arguments)]
 async fn non_streaming(
-    state: AppState,
+    entry: ModelEntry,
     messages: Vec<ChatMessage>,
     tools_json: Option<String>,
     tool_choice: Option<String>,
@@ -670,15 +750,16 @@ async fn non_streaming(
     model_id: String,
     created: i64,
 ) -> Response {
-    // Wait for a free slot. With `--parallel N`, the (N+1)'th concurrent request queues HERE — in
-    // the async runtime, holding no thread — and is admitted FIFO as soon as one finishes.
-    let Ok(permit) = state.slots.clone().acquire_owned().await else {
+    // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
+    // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
+    // soon as one of that model's generations finishes. A different model's slots are independent.
+    let Ok(permit) = entry.slots.clone().acquire_owned().await else {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "server shutting down".into(),
         );
     };
-    let engine_arc = state.engine.clone();
+    let engine_arc = entry.engine.clone();
     let cid_blk = cid.clone();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -774,7 +855,7 @@ async fn non_streaming(
 
 #[allow(clippy::too_many_arguments)]
 async fn streaming(
-    state: AppState,
+    entry: ModelEntry,
     messages: Vec<ChatMessage>,
     tools_json: Option<String>,
     tool_choice: Option<String>,
@@ -792,16 +873,16 @@ async fn streaming(
     // (a few thousand short strings, worst case), which is the right trade.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
 
-    // Same admission gate as the non-streaming path — the (N+1)'th concurrent stream queues here.
-    // Taken BEFORE the SSE response is returned, so a queued client simply waits for its first byte
-    // rather than being handed an open-but-silent stream.
-    let Ok(permit) = state.slots.clone().acquire_owned().await else {
+    // Same per-model admission gate as the non-streaming path — the (N+1)'th concurrent stream to
+    // this model queues here. Taken BEFORE the SSE response is returned, so a queued client simply
+    // waits for its first byte rather than being handed an open-but-silent stream.
+    let Ok(permit) = entry.slots.clone().acquire_owned().await else {
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "server shutting down".into(),
         );
     };
-    let engine_arc = state.engine.clone();
+    let engine_arc = entry.engine.clone();
     // Clone sender + strings for use inside the on_delta callback closure.
     let tx_cb = tx.clone();
     let cid_cb = cid.clone();
@@ -1063,6 +1144,96 @@ mod tests {
         assert_eq!(card["id"], "test-model");
         assert_eq!(card["object"], "model");
         assert_eq!(card["owned_by"], "local");
+    }
+
+    /// A stub generator that streams back exactly one content delta naming the model it belongs to,
+    /// so a routing test can prove WHICH generator answered.
+    struct EchoGen(&'static str);
+    impl ChatGenerator for EchoGen {
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools_json: Option<&str>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<Finish> {
+            on_delta(Delta::Content(format!("from:{}", self.0)));
+            Ok(Finish::Stop)
+        }
+    }
+
+    fn multi_router() -> Router {
+        let a: Arc<dyn ChatGenerator> = Arc::new(EchoGen("alpha"));
+        let b: Arc<dyn ChatGenerator> = Arc::new(EchoGen("beta"));
+        build_router(AppState::multi(vec![
+            ("alpha".into(), a, 2),
+            ("beta".into(), b, 2),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn multi_models_are_all_listed() {
+        let resp = multi_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<&str> = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["alpha", "beta"]);
+    }
+
+    /// A request naming `beta` must be answered by beta's generator; an unknown name falls to the
+    /// default (first-listed `alpha`). This is the whole multi-model routing contract.
+    async fn chat_model_field(router: Router, requested: &str) -> (String, String) {
+        let body =
+            format!(r#"{{"model":"{requested}","messages":[{{"role":"user","content":"hi"}}]}}"#);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (
+            json["model"].as_str().unwrap().to_string(),
+            json["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn request_routes_to_named_model() {
+        let (model, content) = chat_model_field(multi_router(), "beta").await;
+        assert_eq!(model, "beta");
+        assert_eq!(content, "from:beta");
+    }
+
+    #[tokio::test]
+    async fn unknown_model_falls_to_default() {
+        let (model, content) = chat_model_field(multi_router(), "does-not-exist").await;
+        assert_eq!(model, "alpha");
+        assert_eq!(content, "from:alpha");
     }
 
     // --- ChatRequest serde round-trip tests --------------------------------

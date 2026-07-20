@@ -29,6 +29,11 @@ pub struct DenseSeamChat {
     /// turn on the SAME VkDevice/allocator/pipeline-cache instead of constructing a new one each
     /// time (previously: two full Vulkan backends for a single-turn `INFR_MTP=1` run).
     mtp_vk: Option<infr_vulkan::VulkanBackend>,
+    /// Physical device this chat's session pins: `Some(idx)` = `VulkanN` (the multi-device path,
+    /// `new_on`), `None` = the default device (`new`, byte-identical to before). Threaded into
+    /// [`ensure_session`](Self::ensure_session) and [`ensure_mtp_backend`](Self::ensure_mtp_backend)
+    /// so the whole model — weights, KV, MTP trunk/head — lands on the one chosen GPU.
+    dev: Option<usize>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -40,6 +45,21 @@ impl DenseSeamChat {
             mtp_head: None,
             mtp_checked: false,
             mtp_vk: None,
+            dev: None,
+        }
+    }
+
+    /// [`new`](Self::new) pinned to physical device `idx` (`VulkanN`) — the multi-device `infr run`
+    /// / serialised-serve path. Everything this chat allocates lands on that GPU. `new` (the default
+    /// device) is unchanged.
+    pub fn new_on(model: SeamModel, idx: usize) -> Self {
+        Self {
+            model,
+            session: None,
+            mtp_head: None,
+            mtp_checked: false,
+            mtp_vk: None,
+            dev: Some(idx),
         }
     }
 
@@ -92,9 +112,13 @@ impl DenseSeamChat {
                 .ok()
                 .and_then(|v| infr_core::parse_size(&v));
             self.session = Some(match user_ctx {
-                Some(infr_core::SizeSpec::Bytes(ctx)) => self.model.vulkan_session(ctx as usize)?,
-                Some(infr_core::SizeSpec::Percent(f)) => self.model.vulkan_session_frac(f)?,
-                None => self.model.vulkan_session_default()?,
+                Some(infr_core::SizeSpec::Bytes(ctx)) => {
+                    self.model.vulkan_session_on(self.dev, ctx as usize)?
+                }
+                Some(infr_core::SizeSpec::Percent(f)) => {
+                    self.model.vulkan_session_frac_on(self.dev, f)?
+                }
+                None => self.model.vulkan_session_default_on(self.dev)?,
             });
         }
         Ok(())
@@ -105,10 +129,12 @@ impl DenseSeamChat {
     /// construct its own per-call backend.
     fn ensure_mtp_backend(&mut self) -> Result<()> {
         if self.mtp_vk.is_none() {
-            self.mtp_vk = Some(
-                infr_vulkan::VulkanBackend::new()
+            self.mtp_vk = Some(match self.dev {
+                Some(idx) => infr_vulkan::VulkanBackend::new_on(idx)
+                    .map_err(|e| anyhow::anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
+                None => infr_vulkan::VulkanBackend::new()
                     .map_err(|e| anyhow::anyhow!("vulkan init: {e}"))?,
-            );
+            });
         }
         Ok(())
     }

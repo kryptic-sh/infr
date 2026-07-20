@@ -17,7 +17,7 @@
 //!
 //! Run: `cargo test -p infr-vulkan --test interconnect_probe -- --ignored --nocapture`
 use infr_core::backend::{Backend, BufferUsage};
-use infr_vulkan::{DeviceInfo, VulkanBackend};
+use infr_vulkan::{DeviceInfo, P2pHandleType, VulkanBackend};
 use std::time::Instant;
 
 const MIB: usize = 1024 * 1024;
@@ -204,4 +204,197 @@ fn interconnect_probe() {
         rt_us / 4.0
     );
     eprintln!("\n[interconnect] done — see numbers above for the tensor/expert-parallel decision");
+}
+
+/// Slice-1 baseline numbers this P2P slice is measured against (Slice-0 `interconnect_probe`,
+/// RX 7900 XTX ↔ 9950X3D iGPU): effective host-bounce cross-device throughput and per-hop latency.
+const HOST_BOUNCE_GBS: f64 = 3.82;
+const HOST_BOUNCE_HOP_US: f64 = 33.0;
+
+/// Move `block` bytes producer→consumer through SHARED external memory (no host bounce) and verify
+/// they arrive byte-correct; return a one-line bandwidth+latency report or the exact rejection.
+///
+/// Mechanism: the producer allocates+exports a buffer (`handle_type`), uploads a known pattern into
+/// it and `sync()`s (host-side ordering — the write is fully flushed before the consumer reads); the
+/// consumer IMPORTS the fd (its buffer now aliases the producer's physical bytes) and pulls them with
+/// a device-side `copy_buffer` (imported alias → consumer-local), which is the real P2P read over
+/// PCIe. Correctness is asserted; bandwidth/latency are measured from the consumer's copies.
+fn p2p_move(
+    producer: &VulkanBackend,
+    consumer: &VulkanBackend,
+    handle_type: P2pHandleType,
+    block: usize,
+    label: &str,
+) -> Result<String, String> {
+    let export = producer
+        .p2p_export(block, handle_type)
+        .map_err(|e| format!("{label}: export failed: {e}"))?;
+
+    // Seed the shared buffer on the PRODUCER with a real pattern (not zeros — a zero-page shortcut
+    // would not prove the bytes actually crossed the device boundary).
+    let seed: Vec<u8> = (0..block)
+        .map(|k| (k as u8).wrapping_mul(37).wrapping_add(11))
+        .collect();
+    producer
+        .upload(export.buffer(), &seed)
+        .map_err(|e| format!("{label}: producer upload failed: {e}"))?;
+    producer
+        .sync()
+        .map_err(|e| format!("{label}: producer sync failed: {e}"))?;
+
+    // Import on the CONSUMER — its buffer now aliases the producer's memory over PCIe.
+    let imported = consumer
+        .p2p_import(&export)
+        .map_err(|e| format!("{label}: import REJECTED: {e}"))?;
+
+    // Consumer-local landing buffer; the consumer pulls the shared bytes into it.
+    let local = consumer
+        .alloc_uninit(block, BufferUsage::Weights)
+        .map_err(|e| format!("{label}: consumer local alloc failed: {e}"))?;
+
+    // Correctness FIRST: one pull, then read back on the consumer and compare every byte.
+    consumer
+        .copy_buffer(imported.as_ref(), local.as_ref(), block)
+        .map_err(|e| format!("{label}: consumer copy failed: {e}"))?;
+    consumer
+        .sync()
+        .map_err(|e| format!("{label}: consumer sync failed: {e}"))?;
+    let mut check = vec![0u8; block];
+    consumer
+        .download(local.as_ref(), &mut check)
+        .map_err(|e| format!("{label}: consumer download failed: {e}"))?;
+    if check != seed {
+        let first_bad = (0..block).find(|&i| check[i] != seed[i]).unwrap_or(0);
+        return Err(format!(
+            "{label}: CROSS-DEVICE BYTES CORRUPTED at offset {first_bad}: got {:#04x}, want {:#04x} \
+             (import succeeded but the alias does not read the producer's memory correctly)",
+            check[first_bad], seed[first_bad]
+        ));
+    }
+
+    // ── sustained bandwidth: consumer pulls the whole block over PCIe, N times ────────────────
+    let iters = 5;
+    let t = Instant::now();
+    for _ in 0..iters {
+        consumer
+            .copy_buffer(imported.as_ref(), local.as_ref(), block)
+            .map_err(|e| format!("{label}: bw copy failed: {e}"))?;
+    }
+    consumer
+        .sync()
+        .map_err(|e| format!("{label}: bw sync failed: {e}"))?;
+    let bw = gbs(block * iters, t.elapsed().as_secs_f64());
+
+    // ── single-hop latency: a small shared buffer, one consumer pull ─────────────────────────
+    let small = 4096usize;
+    let small_export = producer
+        .p2p_export(small, handle_type)
+        .map_err(|e| format!("{label}: small export failed: {e}"))?;
+    producer
+        .upload(small_export.buffer(), &vec![0x7Eu8; small])
+        .map_err(|e| format!("{label}: small upload failed: {e}"))?;
+    producer.sync().ok();
+    let small_import = consumer
+        .p2p_import(&small_export)
+        .map_err(|e| format!("{label}: small import failed: {e}"))?;
+    let small_local = consumer
+        .alloc_uninit(small, BufferUsage::Weights)
+        .map_err(|e| format!("{label}: small local alloc failed: {e}"))?;
+    // warmup
+    consumer
+        .copy_buffer(small_import.as_ref(), small_local.as_ref(), small)
+        .ok();
+    consumer.sync().ok();
+    let rt_iters = 200;
+    let t = Instant::now();
+    for _ in 0..rt_iters {
+        consumer
+            .copy_buffer(small_import.as_ref(), small_local.as_ref(), small)
+            .map_err(|e| format!("{label}: latency copy failed: {e}"))?;
+    }
+    consumer.sync().ok();
+    let hop_us = t.elapsed().as_secs_f64() * 1e6 / rt_iters as f64;
+
+    Ok(format!(
+        "{label}: bytes OK ✓  {bw:.2} GB/s ({:.2}x host-bounce)  {hop_us:.1} µs/hop ({:.2}x)",
+        bw / HOST_BOUNCE_GBS,
+        HOST_BOUNCE_HOP_US / hop_us,
+    ))
+}
+
+#[test]
+#[ignore = "requires ≥2 Vulkan devices with external-memory support; P2P transport spike, prints numbers"]
+fn p2p_external_memory_probe() {
+    let Ok(devs) = VulkanBackend::enumerate_devices() else {
+        eprintln!("skip: no Vulkan");
+        return;
+    };
+    let Some((d_idx, i_idx)) = dgpu_igpu(&devs) else {
+        eprintln!("skip: need both a discrete and an integrated GPU");
+        return;
+    };
+
+    let dgpu = VulkanBackend::new_on(d_idx).expect("build dGPU backend");
+    let igpu = VulkanBackend::new_on(i_idx).expect("build iGPU backend");
+
+    eprintln!("\n── host-LESS cross-device P2P (external-memory export/import) ──");
+    for (label, be) in [("dGPU", &dgpu), ("iGPU", &igpu)] {
+        eprintln!(
+            "  {label}: p2p dma-buf={}  opaque-fd={}",
+            be.p2p_supported(P2pHandleType::DmaBuf),
+            be.p2p_supported(P2pHandleType::OpaqueFd),
+        );
+    }
+    eprintln!(
+        "  baseline (Slice 0, host-bounce): {HOST_BOUNCE_GBS:.2} GB/s effective, \
+         ~{HOST_BOUNCE_HOP_US:.0} µs/hop"
+    );
+
+    let block = 256 * MIB;
+    // The direction the campaign cares about most first: export dGPU VRAM, import on the iGPU (the
+    // iGPU reads the discrete card's VRAM directly over PCIe). Then the reverse, then opaque-fd.
+    let runs = [
+        (
+            &dgpu,
+            &igpu,
+            P2pHandleType::DmaBuf,
+            "dma-buf  dGPU-VRAM → iGPU  (iGPU reads dGPU VRAM)",
+        ),
+        (
+            &igpu,
+            &dgpu,
+            P2pHandleType::DmaBuf,
+            "dma-buf  iGPU-mem  → dGPU  (dGPU reads iGPU/system RAM)",
+        ),
+        (
+            &dgpu,
+            &igpu,
+            P2pHandleType::OpaqueFd,
+            "opaque-fd dGPU-VRAM → iGPU (cross-device opaque-fd probe)",
+        ),
+    ];
+
+    let mut any_ok = false;
+    eprintln!("\n── P2P transfer (256 MiB, verified byte-correct across the device boundary) ──");
+    for (producer, consumer, ht, label) in runs {
+        match p2p_move(producer, consumer, ht, block, label) {
+            Ok(report) => {
+                any_ok = true;
+                eprintln!("  {report}");
+            }
+            Err(why) => eprintln!("  {label}: {why}"),
+        }
+    }
+
+    eprintln!(
+        "\n[p2p] done — a '✓' line beating {HOST_BOUNCE_GBS:.2} GB/s means host-less P2P is the \
+         viable cross-device transport on this box; a rejection line is the equally-valid finding \
+         that this handle type/direction is not usable on RADV here."
+    );
+    // At least ONE path must have moved bytes correctly for the capability to be real; a total
+    // rejection is reported above (not silently swallowed) and is itself the deliverable finding.
+    assert!(
+        any_ok,
+        "no P2P path moved bytes correctly — see the per-run rejection lines above"
+    );
 }

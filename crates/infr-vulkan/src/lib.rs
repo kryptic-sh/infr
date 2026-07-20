@@ -14,10 +14,12 @@ mod gemm;
 pub mod linear;
 mod matmul;
 mod ops;
+pub mod p2p;
 pub mod pager;
 mod pcache;
 mod recorder;
 
+pub use p2p::{P2pExport, P2pHandleType};
 pub use recorder::{FlashStage, RecordedCmd, Recorder};
 
 /// Shared-memory bytes consumed per query row of a flash-attention prefill tile
@@ -139,6 +141,15 @@ struct VulkanShared {
     /// `bind_descriptors`) instead of a pooled `alloc_set` + `update_descriptor_sets` +
     /// `cmd_bind_descriptor_sets` per op. `None` falls back to the pooled path.
     push_descriptor: Option<ash::khr::push_descriptor::Device>,
+    /// `VK_KHR_external_memory_fd` loader (`vkGetMemoryFdKHR` / `vkGetMemoryFdPropertiesKHR`), when
+    /// the device enabled it. `Some` is the gate for the host-less cross-device P2P transport (a
+    /// buffer's memory exported as an fd on one backend and imported on another — see `p2p.rs`).
+    /// `None` on any device/driver without the extension, in which case no P2P path is offered and
+    /// the default single-device behaviour is unchanged.
+    external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    /// True when this device enabled `VK_EXT_external_memory_dma_buf`, so the P2P export/import may
+    /// use the dma-buf handle type (the cross-GPU-portable one on Linux) in addition to opaque-fd.
+    has_dma_buf: bool,
     /// Generic cache of compute kernels by name (see `ops.rs`).
     kernels: Mutex<HashMap<&'static str, crate::ops::ComputeKernel>>,
     /// Device pipeline cache, seeded from disk at init and persisted back (see `pcache.rs`) so
@@ -317,6 +328,19 @@ enum Backing {
     /// `device_addr()` by a `-DSTREAMED` shader twin, required once the range would exceed
     /// `maxStorageBufferRange`/4 GiB and preferred for the big matmul families regardless.
     BdaSub(Arc<BdaBlockHandle>),
+    /// A DEDICATED `VkDeviceMemory` allocated with an EXTERNAL handle type (dma-buf / opaque-fd) —
+    /// the cross-device P2P path (see `p2p.rs`). Two flavours share this variant. On the EXPORT
+    /// side (device A) the memory is allocated with `VkExportMemoryAllocateInfo` and its fd handed
+    /// out by `vkGetMemoryFdKHR`; this buffer keeps the underlying pages alive for device B. On the
+    /// IMPORT side (device B) the memory is allocated with `VkImportMemoryFdInfoKHR`, ALIASING
+    /// device A's physical bytes — reads/writes here go straight to A's memory over PCIe, no host
+    /// copy.
+    ///
+    /// Never host-mapped (`mapped_ptr` = `None`, so `upload`/`download` use the staging path).
+    /// Freed with a plain `vkFreeMemory` on drop (no unmap). Deliberately OUTSIDE the VRAM budget
+    /// accounting: this is a gated probe/transport capability, not wired into any model path, and
+    /// the import side aliases memory already owned by the exporting backend.
+    External { memory: vk::DeviceMemory },
 }
 
 struct VkBuffer {
@@ -364,6 +388,9 @@ impl VkBuffer {
                 .buf
                 .mapped_ptr()
                 .map(|p| unsafe { p.add(self.sub_offset) }),
+            // External P2P memory is never host-mapped — reads/writes route through the staging
+            // copy path (device A owns the pages; device B aliases them over PCIe).
+            Backing::External { .. } => None,
         }
     }
 }
@@ -405,6 +432,13 @@ impl Drop for VkBuffer {
                 // `destroy_buffer`/memory-free happens once, inside `BdaBlockHandle::buf`'s own
                 // `VkBuffer::drop`, when the last clone goes away.
                 Backing::BdaSub(_) => {}
+                // A dedicated external-memory allocation (P2P export or import). Never host-mapped,
+                // so no unmap — just free the memory. On the export side this releases device A's
+                // pages once no importer still references the underlying dma-buf/fd (each side owns
+                // an independent `VkDeviceMemory` over the same pages, freed independently).
+                Backing::External { memory } => {
+                    self.shared.device.free_memory(*memory, None);
+                }
             }
             // Every OTHER variant owns `self.buffer` outright and must destroy it here. A `BdaSub`
             // handle's `buffer` is an alias of the block's — destroying it here would destroy the
@@ -1189,6 +1223,17 @@ impl VulkanBackend {
         let has_bf16_ext = has_ext(c"VK_KHR_shader_bfloat16");
         let has_subgroup_ext = has_ext(c"VK_KHR_shader_subgroup_extended_types");
         let has_mem_budget = has_ext(c"VK_EXT_memory_budget");
+        // External-memory (host-LESS cross-device P2P): export a buffer's memory as an fd on one
+        // device and import it on another so device B reads/writes device A's physical bytes over
+        // PCIe with no host bounce (see `p2p.rs`). `VK_KHR_external_memory` is core in Vulkan 1.1
+        // (this backend targets 1.3), so the `VkExternalMemoryBufferCreateInfo` /
+        // `VkExportMemoryAllocateInfo` / `VkImportMemoryFdInfoKHR` structs need no extension enable —
+        // only the fd op extension (`vkGetMemoryFdKHR`/`vkGetMemoryFdPropertiesKHR`) and, for the
+        // dma-buf handle type (the cross-GPU-portable one on Linux), `VK_EXT_external_memory_dma_buf`.
+        // Both are GATED: a device lacking them simply reports no P2P support (`caps` below), the
+        // default single-device path is untouched, and no P2P handle type is offered.
+        let has_ext_mem_fd = has_ext(c"VK_KHR_external_memory_fd");
+        let has_ext_mem_dma_buf = has_ext(c"VK_EXT_external_memory_dma_buf");
         // Lets every dispatch bind its buffers with one `cmd_push_descriptor_set` recorded
         // straight into the command buffer instead of `alloc_set` (pool allocate) +
         // `update_descriptor_sets` (a separate driver call) + `cmd_bind_descriptor_sets` per op —
@@ -1512,6 +1557,14 @@ impl VulkanBackend {
         // dp4a tier — the small model's shapes never hit it, hence the bug staying latent).
         if has_i8_dot {
             ext_ptrs.push(c"VK_KHR_shader_integer_dot_product".as_ptr());
+        }
+        // External-memory fd ops + dma-buf handle type for the cross-device P2P transport (gated —
+        // see the probe above). `VK_KHR_external_memory` itself is core in 1.1 and needs no enable.
+        if has_ext_mem_fd {
+            ext_ptrs.push(c"VK_KHR_external_memory_fd".as_ptr());
+        }
+        if has_ext_mem_dma_buf {
+            ext_ptrs.push(c"VK_EXT_external_memory_dma_buf".as_ptr());
         }
         // A portability (layered) device REQUIRES VK_KHR_portability_subset to be enabled when
         // it advertises it (Vulkan valid-usage rule); MoltenVK does.
@@ -1873,6 +1926,12 @@ impl VulkanBackend {
         let push_descriptor =
             has_push_descriptor.then(|| ash::khr::push_descriptor::Device::new(&instance, &device));
 
+        // External-memory fd loader (`vkGetMemoryFdKHR`/`vkGetMemoryFdPropertiesKHR`) — present only
+        // when the device extension was enabled above. `Some` here is the sole gate the P2P path
+        // checks (`p2p.rs`); `None` = this backend offers no host-less cross-device transport.
+        let external_memory_fd =
+            has_ext_mem_fd.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
+
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         // Probed for UMA parts ONLY — on a discrete card the non-device-local heap is host RAM
         // across PCIe and must never receive a GpuOnly buffer (see `probe_uma_overflow_type`).
@@ -1901,6 +1960,8 @@ impl VulkanBackend {
                 has_mem_budget,
                 max_mem_alloc_size,
                 push_descriptor,
+                external_memory_fd,
+                has_dma_buf: has_ext_mem_dma_buf,
                 kernels: Mutex::new(HashMap::new()),
                 pipeline_cache,
                 pcache,

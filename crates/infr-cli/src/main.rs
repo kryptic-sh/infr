@@ -239,6 +239,10 @@ impl SamplingOpts {
 enum Cmd {
     /// Download + cache a model (`org/repo[:quant]` from HuggingFace, or a path to a `.gguf`).
     Pull { model: String },
+    /// List the Vulkan physical devices infr can see — index, name, type, VRAM — marking the
+    /// device the default (no `--dev`) path binds. The index is the `--dev VulkanN` / `INFR_DEV`
+    /// handle. Reports each device's external-memory extensions (GPU↔GPU / dma-buf feasibility).
+    Devices,
     /// Interactive terminal chat (auto-pulls if missing).
     Run {
         model: String,
@@ -480,6 +484,7 @@ fn main() -> anyhow::Result<()> {
 fn dispatch(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model),
+        Cmd::Devices => cmd_devices(),
         Cmd::Run {
             model,
             message,
@@ -586,6 +591,52 @@ fn resolve(model: &str) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
         .map(|d| d.join("tokenizer.json"))
         .filter(|p| p.exists());
     Ok((gguf, tok))
+}
+
+/// `infr devices` — enumerate the Vulkan physical devices (index/name/type/VRAM), mark the default
+/// pick, and report external-memory extensions so the multi-GPU campaign can see the P2P surface.
+fn cmd_devices() -> anyhow::Result<()> {
+    let devs = infr_vulkan::VulkanBackend::enumerate_devices().map_err(|e| anyhow!("{e}"))?;
+    if devs.is_empty() {
+        println!("no Vulkan physical devices found");
+        return Ok(());
+    }
+    println!(
+        "{} Vulkan device(s) (select with `--dev VulkanN` / `INFR_DEV=VulkanN`):\n",
+        devs.len()
+    );
+    for d in &devs {
+        let mark = if d.is_default_pick {
+            "  <- default"
+        } else {
+            ""
+        };
+        // Bytes → GiB with one decimal (matches the backend's fmt_bytes feel; local to avoid a dep).
+        let vram = format!("{:.1} GiB", d.vram_bytes as f64 / (1u64 << 30) as f64);
+        println!(
+            "  Vulkan{}: {} [{}, {} device-local]{}",
+            d.index, d.name, d.device_type, vram, mark
+        );
+        let mut ext = Vec::new();
+        if d.external_memory {
+            ext.push("external_memory");
+        }
+        if d.external_memory_fd {
+            ext.push("external_memory_fd");
+        }
+        if d.external_memory_dma_buf {
+            ext.push("external_memory_dma_buf");
+        }
+        println!(
+            "           external-memory: {}",
+            if ext.is_empty() {
+                "none".to_string()
+            } else {
+                ext.join(", ")
+            }
+        );
+    }
+    Ok(())
 }
 
 fn cmd_pull(model: &str) -> anyhow::Result<()> {

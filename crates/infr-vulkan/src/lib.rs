@@ -577,6 +577,36 @@ fn fmt_bytes(b: u64) -> String {
     }
 }
 
+/// Human-readable Vulkan device class for the enumeration listing.
+fn device_type_str(t: vk::PhysicalDeviceType) -> &'static str {
+    match t {
+        vk::PhysicalDeviceType::DISCRETE_GPU => "discrete",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "integrated",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => "virtual",
+        vk::PhysicalDeviceType::CPU => "cpu",
+        _ => "other",
+    }
+}
+
+/// A physical device as seen by [`VulkanBackend::enumerate_devices`]. `index` is the `VulkanN` /
+/// `INFR_DEV` / [`VulkanBackend::new_on`] handle. The `external_memory*` flags report whether the
+/// device could, in principle, participate in a host-less GPU↔GPU transfer (dma-buf / fd import) —
+/// the P2P feasibility signal for the multi-GPU campaign; they do NOT imply a P2P path is wired.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub index: usize,
+    pub name: String,
+    pub device_type: &'static str,
+    pub integrated: bool,
+    /// Sum of DEVICE_LOCAL heap sizes (a UMA part reports its GTT-backed heap here).
+    pub vram_bytes: u64,
+    /// True for the device `VulkanBackend::new()` would bind today (INFR_DEV, else discrete, else 0).
+    pub is_default_pick: bool,
+    pub external_memory: bool,
+    pub external_memory_fd: bool,
+    pub external_memory_dma_buf: bool,
+}
+
 /// Copy `src` into a persistently-mapped destination, in PARALLEL for large buffers.
 ///
 /// For a ReBAR weight the destination is write-combined VRAM across PCIe, where a single core
@@ -894,7 +924,138 @@ impl VulkanBackend {
         Ok(())
     }
 
+    /// The historical default-device rule, EXACTLY preserved: honor `INFR_DEV=VulkanN` (the CLI's
+    /// `--dev`, matching llama.cpp's naming) if set, else the first `DISCRETE_GPU`, else device 0.
+    /// An out-of-range / unparseable `INFR_DEV` is a hard error (silently running on a different GPU
+    /// than asked produces plausible-but-wrong numbers). Split out of `new()` so `new_on` can bypass
+    /// it, and so the behavior is a single named unit.
+    fn pick_default_device(
+        instance: &ash::Instance,
+        pdevices: &[vk::PhysicalDevice],
+    ) -> Result<vk::PhysicalDevice> {
+        match std::env::var("INFR_DEV") {
+            Ok(spec) => {
+                let s = spec.trim();
+                let idx_str = s
+                    .strip_prefix("Vulkan")
+                    .or_else(|| s.strip_prefix("vulkan"));
+                let idx: usize = idx_str.unwrap_or(s).parse().map_err(|_| {
+                    be(format!(
+                        "INFR_DEV/--dev: expected `VulkanN` (e.g. Vulkan0, Vulkan1), got `{spec}`"
+                    ))
+                })?;
+                pdevices.get(idx).copied().ok_or_else(|| {
+                    let names: Vec<String> = pdevices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &pd)| {
+                            let p = unsafe { instance.get_physical_device_properties(pd) };
+                            let n = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
+                                .to_string_lossy()
+                                .into_owned();
+                            format!("Vulkan{i}={n}")
+                        })
+                        .collect();
+                    be(format!(
+                        "INFR_DEV/--dev `{spec}`: no such Vulkan device (this system has {}: {})",
+                        pdevices.len(),
+                        names.join(", ")
+                    ))
+                })
+            }
+            Err(_) => Ok(pdevices
+                .iter()
+                .copied()
+                .find(|&pd| {
+                    let p = unsafe { instance.get_physical_device_properties(pd) };
+                    p.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+                })
+                .unwrap_or(pdevices[0])),
+        }
+    }
+
+    /// Enumerate ALL Vulkan physical devices WITHOUT building a backend (a cheap instance +
+    /// `enumerate_physical_devices`, torn down before returning). Feeds the `infr devices` listing
+    /// and the interconnect probe. Each entry's `index` is the `VulkanN` / `INFR_DEV` / `new_on`
+    /// handle. Also reports the external-memory extensions each device exposes — the P2P /
+    /// host-less-transfer feasibility signal the multi-GPU campaign needs.
+    pub fn enumerate_devices() -> Result<Vec<DeviceInfo>> {
+        Self::reject_on_apple()?;
+        let entry =
+            unsafe { ash::Entry::load() }.map_err(|e| be(format!("ash::Entry::load: {e}")))?;
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+        let instance = unsafe {
+            entry.create_instance(
+                &vk::InstanceCreateInfo::default().application_info(&app_info),
+                None,
+            )
+        }
+        .map_err(|e| be(format!("create_instance: {e}")))?;
+
+        let result = (|| -> Result<Vec<DeviceInfo>> {
+            let pdevices = unsafe { instance.enumerate_physical_devices() }
+                .map_err(|e| be(format!("enumerate_physical_devices: {e}")))?;
+            let default_pick = Self::pick_default_device(&instance, &pdevices).ok();
+            let mut out = Vec::with_capacity(pdevices.len());
+            for (index, &pd) in pdevices.iter().enumerate() {
+                let p = unsafe { instance.get_physical_device_properties(pd) };
+                let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                let mp = unsafe { instance.get_physical_device_memory_properties(pd) };
+                let vram_bytes: u64 = (0..mp.memory_heap_count as usize)
+                    .filter(|&h| {
+                        mp.memory_heaps[h]
+                            .flags
+                            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+                    })
+                    .map(|h| mp.memory_heaps[h].size)
+                    .sum();
+                let exts = unsafe { instance.enumerate_device_extension_properties(pd) }
+                    .unwrap_or_default();
+                let has = |name: &CStr| {
+                    exts.iter()
+                        .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
+                };
+                out.push(DeviceInfo {
+                    index,
+                    name,
+                    device_type: device_type_str(p.device_type),
+                    integrated: p.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU,
+                    vram_bytes,
+                    is_default_pick: default_pick == Some(pd),
+                    external_memory: has(c"VK_KHR_external_memory"),
+                    external_memory_fd: has(c"VK_KHR_external_memory_fd"),
+                    external_memory_dma_buf: has(c"VK_EXT_external_memory_dma_buf"),
+                });
+            }
+            Ok(out)
+        })();
+        unsafe { instance.destroy_instance(None) };
+        result
+    }
+
+    /// Default-device constructor: pick `INFR_DEV` if set, else the first discrete GPU (else device
+    /// 0). Byte-identical to the historical single-device path. See [`new_on`](Self::new_on) to pin a
+    /// SPECIFIC physical-device index (the multi-device entry point).
     pub fn new() -> Result<Self> {
+        Self::new_selected(None)
+    }
+
+    /// Construct a backend pinned to physical-device `index` (enumeration order, matching
+    /// [`enumerate_devices`](Self::enumerate_devices) and `INFR_DEV=VulkanN`), IGNORING the
+    /// `INFR_DEV` env and the discrete-default rule. This is the multi-device foundation: two
+    /// backends built with different indices can be held live simultaneously (each owns its own
+    /// instance + logical device + allocator), enabling later tensor/expert-parallel slices. An
+    /// out-of-range `index` is a hard error, never a silent fallback.
+    ///
+    /// `new()` (the default path) is unchanged — a caller that does not opt into multi-device sees
+    /// exactly today's behavior.
+    pub fn new_on(index: usize) -> Result<Self> {
+        Self::new_selected(Some(index))
+    }
+
+    fn new_selected(explicit_index: Option<usize>) -> Result<Self> {
         // Apple: the Vulkan backend is DELIBERATELY unsupported (the only Vulkan on Apple is
         // MoltenVK, which lacks features this backend depends on — e.g. `bufferDeviceAddress` for
         // the paged MoE arena — and is slower than talking to Metal directly). infr ships a NATIVE
@@ -939,45 +1100,52 @@ impl VulkanBackend {
         if pdevices.is_empty() {
             return Err(be("no Vulkan physical devices"));
         }
-        let physical_device = match std::env::var("INFR_DEV") {
-            Ok(spec) => {
-                let s = spec.trim();
-                let idx_str = s
-                    .strip_prefix("Vulkan")
-                    .or_else(|| s.strip_prefix("vulkan"));
-                let idx: usize = idx_str.unwrap_or(s).parse().map_err(|_| {
-                    be(format!(
-                        "INFR_DEV/--dev: expected `VulkanN` (e.g. Vulkan0, Vulkan1), got `{spec}`"
-                    ))
-                })?;
-                *pdevices.get(idx).ok_or_else(|| {
-                    let names: Vec<String> = pdevices
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &pd)| {
-                            let p = unsafe { instance.get_physical_device_properties(pd) };
-                            let n = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }
-                                .to_string_lossy()
-                                .into_owned();
-                            format!("Vulkan{i}={n}")
-                        })
-                        .collect();
-                    be(format!(
-                        "INFR_DEV/--dev `{spec}`: no such Vulkan device (this system has {}: {})",
-                        pdevices.len(),
-                        names.join(", ")
-                    ))
-                })?
-            }
-            Err(_) => pdevices
-                .iter()
-                .copied()
-                .find(|&pd| {
-                    let p = unsafe { instance.get_physical_device_properties(pd) };
-                    p.device_type == vk::PhysicalDeviceType::DISCRETE_GPU
+
+        // Make enumeration VISIBLE (the campaign asked for it): one line per physical device at
+        // init — index (the `VulkanN` / `INFR_DEV` / `new_on` handle), name, class, device-local
+        // heap. Silent-picking one GPU on a multi-GPU box is exactly what hid device selection.
+        for (i, &pd) in pdevices.iter().enumerate() {
+            let p = unsafe { instance.get_physical_device_properties(pd) };
+            let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }.to_string_lossy();
+            let mp = unsafe { instance.get_physical_device_memory_properties(pd) };
+            let dev_local: u64 = (0..mp.memory_heap_count as usize)
+                .filter(|&h| {
+                    mp.memory_heaps[h]
+                        .flags
+                        .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
                 })
-                .unwrap_or(pdevices[0]),
+                .map(|h| mp.memory_heaps[h].size)
+                .sum();
+            eprintln!(
+                "[infr] vulkan device Vulkan{i}: {name} ({}, {})",
+                device_type_str(p.device_type),
+                fmt_bytes(dev_local),
+            );
+        }
+
+        // Explicit index (`new_on`) wins outright and bypasses the env/discrete rule — the
+        // multi-device path. `None` = the historical default, byte-for-byte unchanged below.
+        let physical_device = match explicit_index {
+            Some(idx) => *pdevices.get(idx).ok_or_else(|| {
+                be(format!(
+                    "VulkanBackend::new_on({idx}): no such Vulkan device (this system has {})",
+                    pdevices.len()
+                ))
+            })?,
+            None => Self::pick_default_device(&instance, &pdevices)?,
         };
+
+        // Selection log: which of the enumerated devices this backend actually bound.
+        {
+            let p = unsafe { instance.get_physical_device_properties(physical_device) };
+            let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }.to_string_lossy();
+            let idx = pdevices.iter().position(|&pd| pd == physical_device);
+            eprintln!(
+                "[infr] vulkan: selected {}{name} ({})",
+                idx.map(|i| format!("Vulkan{i}=")).unwrap_or_default(),
+                device_type_str(p.device_type),
+            );
+        }
 
         // ── compute queue family ───────────────────────────────────────────────
         // The first COMPUTE-capable family. On amdgpu this is the universal (graphics) family, so

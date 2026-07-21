@@ -259,6 +259,67 @@ mod tests {
     }
 
     #[test]
+    fn sample_top_k_clamps_to_group_cap() {
+        assert_eq!(sample_top_k(20), 20);
+        assert_eq!(sample_top_k(64), 64);
+        // A top_k past the shader's per-group SAMPLE_KMAX must clamp so the packed stage-1 param
+        // and the scratch sizing agree (no out-of-bounds device write).
+        assert_eq!(sample_top_k(100), 64);
+        // The candidate count in `sample_split_shape` is derived from the SAME clamp.
+        assert_eq!(sample_split_shape(151_936, 100), Some((38, 38 * 64)));
+    }
+
+    #[test]
+    fn softmax_tier_needs_full_256_wide_group() {
+        assert_eq!(softmax_tier(256), SoftmaxTier::Wide);
+        assert_eq!(softmax_tier(1024), SoftmaxTier::Wide);
+        // A capacity-capped device can't run the 256-wide cross-lane reduction correctly.
+        assert_eq!(softmax_tier(255), SoftmaxTier::HostScalar);
+        assert_eq!(softmax_tier(0), SoftmaxTier::HostScalar);
+    }
+
+    #[test]
+    fn qui_linear_kerns_match_legacy_arms() {
+        // Every base `weight_qui` can produce. The single registry must map each base × suffix to
+        // the SAME kernel name the old parallel match arms did: `base + suffix` for hmm/cmm/rt on
+        // all 16, and the same for cmm_ks EXCEPT iq4xs/iq4nl which the old `_ =>` arm sent to
+        // `linear_quik8_cmm_ks` (a latent mismatch preserved verbatim, not fixed here).
+        let bases = [
+            "linear_quik4",
+            "linear_quik6",
+            "linear_quik8",
+            "linear_q4k",
+            "linear_q5k",
+            "linear_q6k",
+            "linear_q8_0",
+            "linear_q5_0",
+            "linear_q4_0",
+            "linear_iq4xs",
+            "linear_iq4nl",
+            "linear_iq2xxs",
+            "linear_iq3xxs",
+            "linear_iq3s",
+            "linear_iq2s",
+            "linear_iq2xs",
+        ];
+        for base in bases {
+            let k = qui_linear_kerns(base)
+                .unwrap_or_else(|| panic!("no registry entry for base {base}"));
+            assert_eq!(k.hmm, format!("{base}_hmm").as_str());
+            assert_eq!(k.cmm, format!("{base}_cmm").as_str());
+            assert_eq!(k.rt, format!("{base}_rt").as_str());
+            let expected_cmm_ks = if base == "linear_iq4xs" || base == "linear_iq4nl" {
+                "linear_quik8_cmm_ks".to_string()
+            } else {
+                format!("{base}_cmm_ks")
+            };
+            assert_eq!(k.cmm_ks, expected_cmm_ks.as_str());
+        }
+        // An unknown base is a loud registry miss, never a silent quik8 default.
+        assert!(qui_linear_kerns("linear_q3k").is_none());
+    }
+
+    #[test]
     fn iq4nl_small_multirow_prefers_rt() {
         assert!(!prefer_iq4nl_rt("linear_iq4nl", 1));
         for m in 2..=4 {
@@ -739,12 +800,95 @@ fn sample_split_groups(n: usize) -> Option<usize> {
     (n > 8192).then(|| n.div_ceil(SAMPLE_SPLIT_CHUNK))
 }
 
+/// Per-group candidate cap the split sampler's stage-1 writes (`SAMPLE_KMAX` in the shader). The
+/// scratch sizing AND the packed stage-1 `top_k` param MUST both use this clamped value: stage-1
+/// writes `min(top_k, 64)` candidates per group into a `min(top_k, 64)`-per-group buffer, so a
+/// `top_k > 64` caller that packed the RAW k while the buffer was sized clamped would drive an
+/// out-of-bounds device write. Clamp once, here, and use it for both.
+fn sample_top_k(top_k: usize) -> usize {
+    top_k.min(64)
+}
+
 fn sample_split_shape(n: usize, top_k: usize) -> Option<(usize, usize)> {
-    sample_split_groups(n).map(|groups| (groups, groups * top_k.min(64)))
+    sample_split_groups(n).map(|groups| (groups, groups * sample_top_k(top_k)))
+}
+
+/// Which softmax path a device can run. `softmax_wide_f32` needs its full 256-lane threadgroup for
+/// the cross-lane max/sum reductions; `encode_tg_w` silently clamps the launch to the pipeline cap,
+/// so on a capacity-capped device (CI paravirtual) the wide kernel would reduce over `red[8]` slots
+/// its <256 launched lanes never wrote. When the 256-wide group doesn't fit, compute the softmax on
+/// the host instead of silently returning garbage.
+#[derive(Debug, PartialEq, Eq)]
+enum SoftmaxTier {
+    Wide,
+    HostScalar,
+}
+
+fn softmax_tier(cap: usize) -> SoftmaxTier {
+    if cap >= 256 {
+        SoftmaxTier::Wide
+    } else {
+        SoftmaxTier::HostScalar
+    }
 }
 
 fn prefer_iq4nl_rt(kern: &str, m: usize) -> bool {
     kern == "linear_iq4nl" && (2..=4).contains(&m)
+}
+
+/// The cooperative / row-tiled kernel variants a factored-or-native quant `Linear` can dispatch,
+/// all derived from ONE canonical base per `QuiWeight::kern`. Every base has a real `_hmm`/`_cmm`/
+/// `_rt` shader kernel, so those derive as `base + suffix`; a base absent from this registry is a
+/// REGISTRY error (a new dtype wired into `weight_qui` without its Linear kernels), never the old
+/// silent `_ => "linear_quik8_*"` default that would read foreign-packed codes as quik8.
+///
+/// `cmm_ks` is the lone irregular column: the old split-K match omitted `iq4xs`/`iq4nl`, so they
+/// fell to `linear_quik8_cmm_ks`. That verbatim behavior is preserved here (the two override cells)
+/// — it is a pre-existing latent mismatch flagged for review, deliberately NOT changed in this
+/// behavior-preserving pass even though `linear_iq4xs_cmm_ks`/`linear_iq4nl_cmm_ks` exist.
+struct QuiLinearKerns {
+    hmm: &'static str,
+    cmm: &'static str,
+    cmm_ks: &'static str,
+    rt: &'static str,
+}
+
+fn qui_linear_kerns(base: &str) -> Option<QuiLinearKerns> {
+    macro_rules! kset {
+        ($b:literal) => {
+            QuiLinearKerns {
+                hmm: concat!($b, "_hmm"),
+                cmm: concat!($b, "_cmm"),
+                cmm_ks: concat!($b, "_cmm_ks"),
+                rt: concat!($b, "_rt"),
+            }
+        };
+    }
+    Some(match base {
+        "linear_quik4" => kset!("linear_quik4"),
+        "linear_quik6" => kset!("linear_quik6"),
+        "linear_quik8" => kset!("linear_quik8"),
+        "linear_q4k" => kset!("linear_q4k"),
+        "linear_q5k" => kset!("linear_q5k"),
+        "linear_q6k" => kset!("linear_q6k"),
+        "linear_q8_0" => kset!("linear_q8_0"),
+        "linear_q5_0" => kset!("linear_q5_0"),
+        "linear_q4_0" => kset!("linear_q4_0"),
+        "linear_iq4xs" => QuiLinearKerns {
+            cmm_ks: "linear_quik8_cmm_ks",
+            ..kset!("linear_iq4xs")
+        },
+        "linear_iq4nl" => QuiLinearKerns {
+            cmm_ks: "linear_quik8_cmm_ks",
+            ..kset!("linear_iq4nl")
+        },
+        "linear_iq2xxs" => kset!("linear_iq2xxs"),
+        "linear_iq3xxs" => kset!("linear_iq3xxs"),
+        "linear_iq3s" => kset!("linear_iq3s"),
+        "linear_iq2s" => kset!("linear_iq2s"),
+        "linear_iq2xs" => kset!("linear_iq2xs"),
+        _ => return None,
+    })
 }
 
 fn prefer_rmsnorm_vec4(rows: usize, dim: usize) -> bool {
@@ -799,7 +943,16 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
             | Op::Add { .. }
             // Qwen2 q/k/v bias: pos-independent elementwise over a bound weight — replay-safe.
             | Op::AddBias { .. } => {}
-            Op::QkNormRope { .. } | Op::Rope { .. } => has_rope = true,
+            Op::QkNormRope { .. } => has_rope = true,
+            // Plain llama-family Rope must NOT tape. The `rope_f32` shader reads a `device const
+            // float* pos` buffer (buffer(1)); the arm binds it via `ensure_device`, a FRESH f32
+            // buffer widened from the host mirror at record time — so a recorded tape freezes
+            // token-0's angle while the seam rewrites the LIVE i32 positions buffer between
+            // replays. QkNormRope reads the bound i32 buffer directly and stays replay-valid, but
+            // plain Rope has no i32 `rope_f32` variant to bind the live buffer to (adding one is a
+            // new, GPU-unverifiable shader). So exclude Rope from replay and keep such graphs
+            // (llama-family plain Rope + f16 KV) on the correct per-token walk.
+            Op::Rope { .. } => return false,
             // qwen35 (Qwen3-Next) decode ops: all pos-independent, on-device, recurrent state
             // updated in the BOUND buffer — tape-safe when the arm's device gate holds (the
             // host fallbacks can't tape, so the gates mirror the arms').
@@ -2020,26 +2173,28 @@ impl MetalBackend {
                 // keeps one simdgroup per row (the rows themselves fill the GPU).
                 // `var(..).is_err()` (not `var_os(..).is_none()`) to match every other
                 // INFR_METAL_NO_* kill-switch in this file — one spelling for one meaning.
-                let vec4 = std::env::var("INFR_METAL_NO_RMSNORM_VEC4").is_err()
-                    && prefer_rmsnorm_vec4(rows, dim)
-                    && self
-                        .pipelines
-                        .get("rmsnorm_vec4_f32")
-                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
-                        .unwrap_or(false);
-                let wide = rows <= 4
-                    && self
-                        .pipelines
-                        .get("rmsnorm_wide_f32")
-                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
-                        .unwrap_or(false);
-                let pso = self.pipelines.get(if vec4 {
-                    "rmsnorm_vec4_f32"
-                } else if wide {
-                    "rmsnorm_wide_f32"
+                // Fetch each wide candidate PSO once and reuse it for the dispatch (the cap read
+                // and the launch shared two lookups before). `.ok().filter(cap)` reproduces the
+                // old `get(..).map(cap>=256).unwrap_or(false)` — a get error or a sub-cap pipeline
+                // both degrade to the next tier, never propagate.
+                let vec4_pso = (std::env::var("INFR_METAL_NO_RMSNORM_VEC4").is_err()
+                    && prefer_rmsnorm_vec4(rows, dim))
+                .then(|| self.pipelines.get("rmsnorm_vec4_f32").ok())
+                .flatten()
+                .filter(|pl| pl.max_total_threads_per_threadgroup() >= 256);
+                let wide_pso = (rows <= 4)
+                    .then(|| self.pipelines.get("rmsnorm_wide_f32").ok())
+                    .flatten()
+                    .filter(|pl| pl.max_total_threads_per_threadgroup() >= 256);
+                let vec4 = vec4_pso.is_some();
+                let wide = wide_pso.is_some();
+                let pso = if let Some(pl) = vec4_pso {
+                    pl
+                } else if let Some(pl) = wide_pso {
+                    pl
                 } else {
-                    "rmsnorm_f32"
-                })?;
+                    self.pipelines.get("rmsnorm_f32")?
+                };
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(dim as u32).to_ne_bytes());
                 p.extend_from_slice(&eps.to_ne_bytes());
@@ -2101,22 +2256,55 @@ impl MetalBackend {
                     "Metal Op::Softmax: scale_buf is Vulkan-only, unimplemented here"
                 );
                 let (rows, dim) = (rows as usize, dim as usize);
-                let bx = self.ensure_device(r, x);
-                let bd = self.dev_dst(r, dst, rows * dim);
-                let pso = self.pipelines.get("softmax_wide_f32")?;
-                let mut p = (rows as u32).to_ne_bytes().to_vec();
-                p.extend_from_slice(&(dim as u32).to_ne_bytes());
-                p.extend_from_slice(&scale.to_ne_bytes());
-                self.encode_tg_w(
-                    r,
-                    &pso,
-                    &[bx.as_ref(), bd.as_ref()],
-                    1 << 1,
-                    &p,
-                    rows * 256,
-                    256,
-                );
-                r.loc[dst.0 as usize] = Loc::Device;
+                // Gate on the wide kernel's threadgroup cap (see `softmax_tier`); fall back to a
+                // per-row host scalar softmax — bit-for-bit the `softmax_wide_f32` math (max over
+                // x*scale, sum exp(x*scale - m0), divide) — when the 256-wide group doesn't fit,
+                // mirroring the RmsNormAdd host fallback rather than reading uninitialized slots.
+                let wide_pso = self.pipelines.get("softmax_wide_f32").ok();
+                let cap = wide_pso
+                    .as_ref()
+                    .map(|pl| pl.max_total_threads_per_threadgroup() as usize)
+                    .unwrap_or(0);
+                if let (SoftmaxTier::Wide, Some(pso)) = (softmax_tier(cap), &wide_pso) {
+                    let bx = self.ensure_device(r, x);
+                    let bd = self.dev_dst(r, dst, rows * dim);
+                    let mut p = (rows as u32).to_ne_bytes().to_vec();
+                    p.extend_from_slice(&(dim as u32).to_ne_bytes());
+                    p.extend_from_slice(&scale.to_ne_bytes());
+                    self.encode_tg_w(
+                        r,
+                        pso,
+                        &[bx.as_ref(), bd.as_ref()],
+                        1 << 1,
+                        &p,
+                        rows * 256,
+                        256,
+                    );
+                    r.loc[dst.0 as usize] = Loc::Device;
+                } else {
+                    self.ensure_host(r, g, x);
+                    let xs = &r.vals[x.0 as usize];
+                    let mut ds = vec![0f32; rows * dim];
+                    for ri in 0..rows {
+                        let xrow = &xs[ri * dim..(ri + 1) * dim];
+                        let mut m0 = f32::NEG_INFINITY;
+                        for &v in xrow {
+                            m0 = m0.max(v * scale);
+                        }
+                        let mut sum = 0.0f32;
+                        for i in 0..dim {
+                            let e = (xrow[i] * scale - m0).exp();
+                            ds[ri * dim + i] = e;
+                            sum += e;
+                        }
+                        let inv = 1.0 / sum;
+                        for v in &mut ds[ri * dim..(ri + 1) * dim] {
+                            *v *= inv;
+                        }
+                    }
+                    r.vals[dst.0 as usize] = ds;
+                    r.loc[dst.0 as usize] = Loc::Host;
+                }
             }
             Op::QkNorm {
                 x,
@@ -2198,7 +2386,9 @@ impl MetalBackend {
             } => {
                 let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
                 let bx = self.ensure_device(r, x);
-                let bd = self.dev_dst(r, dst, m * out_f);
+                // `dev_dst` is deferred into each dispatch branch below: the fused-residual
+                // peephole writes the absorbed Add's dst via its OWN `dev_dst` and never touches
+                // this one, so allocating it up front left a dead per-op buffer on that path.
                 let mut p = (m as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(in_f as u32).to_ne_bytes());
                 p.extend_from_slice(&(out_f as u32).to_ne_bytes());
@@ -2265,42 +2455,17 @@ impl MetalBackend {
                     // tiles indexed by simdgroup_index_in_threadgroup), so it is gated on the
                     // pipeline's own thread cap — see the Attention arm for why that cap can
                     // drop below the kernel's need — and degrades to the row-tiled kernel.
-                    let hmm_kern = match qw.kern {
-                        "linear_quik4" => "linear_quik4_hmm",
-                        "linear_quik6" => "linear_quik6_hmm",
-                        "linear_q4k" => "linear_q4k_hmm",
-                        "linear_q6k" => "linear_q6k_hmm",
-                        "linear_q5k" => "linear_q5k_hmm",
-                        "linear_q8_0" => "linear_q8_0_hmm",
-                        "linear_q5_0" => "linear_q5_0_hmm",
-                        "linear_q4_0" => "linear_q4_0_hmm",
-                        "linear_iq4xs" => "linear_iq4xs_hmm",
-                        "linear_iq4nl" => "linear_iq4nl_hmm",
-                        "linear_iq2xxs" => "linear_iq2xxs_hmm",
-                        "linear_iq3xxs" => "linear_iq3xxs_hmm",
-                        "linear_iq3s" => "linear_iq3s_hmm",
-                        "linear_iq2s" => "linear_iq2s_hmm",
-                        "linear_iq2xs" => "linear_iq2xs_hmm",
-                        _ => "linear_quik8_hmm",
-                    };
-                    let cmm_kern = match qw.kern {
-                        "linear_quik4" => "linear_quik4_cmm",
-                        "linear_quik6" => "linear_quik6_cmm",
-                        "linear_q4k" => "linear_q4k_cmm",
-                        "linear_q6k" => "linear_q6k_cmm",
-                        "linear_q5k" => "linear_q5k_cmm",
-                        "linear_q8_0" => "linear_q8_0_cmm",
-                        "linear_q5_0" => "linear_q5_0_cmm",
-                        "linear_q4_0" => "linear_q4_0_cmm",
-                        "linear_iq4xs" => "linear_iq4xs_cmm",
-                        "linear_iq4nl" => "linear_iq4nl_cmm",
-                        "linear_iq2xxs" => "linear_iq2xxs_cmm",
-                        "linear_iq3xxs" => "linear_iq3xxs_cmm",
-                        "linear_iq3s" => "linear_iq3s_cmm",
-                        "linear_iq2s" => "linear_iq2s_cmm",
-                        "linear_iq2xs" => "linear_iq2xs_cmm",
-                        _ => "linear_quik8_cmm",
-                    };
+                    // One canonical registry for every `_hmm`/`_cmm`/`_cmm_ks`/`_rt` variant (see
+                    // `qui_linear_kerns`) — a base with no entry is a loud registry error, not a
+                    // silent quik8 default reading foreign-packed codes.
+                    let kerns = qui_linear_kerns(qw.kern).ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "metal Linear: no kernel registry entry for base {}",
+                            qw.kern
+                        ))
+                    })?;
+                    let hmm_kern = kerns.hmm;
+                    let cmm_kern = kerns.cmm;
                     // Prefer the cooperative 32x64 threadgroup tile; per-simdgroup HGEMM covers
                     // the out_f % 64 != 0 leftovers, and both need the full 128-thread group.
                     // m >= 2 (not 16): small multi-row batches — a chat turn's short suffix
@@ -2312,21 +2477,25 @@ impl MetalBackend {
                     // IQ4_NL is the measured exception at m=2..4: its non-linear codebook keeps
                     // the mostly-empty CMM tile decode-bound, while RT reuses each decoded block
                     // across rows. Gemma 6912x1152 measured 39%/25%/8% faster; CMM wins at m=5.
-                    let cmm_ok = m >= 2
-                        && !prefer_iq4nl_rt(qw.kern, m)
-                        && out_f % 64 == 0
-                        && self
-                            .pipelines
-                            .get(cmm_kern)?
-                            .max_total_threads_per_threadgroup()
-                            >= 128;
-                    let hmm_ok = m >= 16
-                        && out_f % 16 == 0
-                        && self
-                            .pipelines
-                            .get(hmm_kern)?
-                            .max_total_threads_per_threadgroup()
-                            >= 128;
+                    // Fetch each candidate PSO ONCE (the cap read and the later dispatch share it),
+                    // preserving the original `?` propagation: `get` only runs — and can only
+                    // error — when the shape pre-conditions hold, exactly as before.
+                    let cmm_pso = if m >= 2 && !prefer_iq4nl_rt(qw.kern, m) && out_f % 64 == 0 {
+                        Some(self.pipelines.get(cmm_kern)?)
+                    } else {
+                        None
+                    };
+                    let cmm_ok = cmm_pso
+                        .as_ref()
+                        .is_some_and(|pl| pl.max_total_threads_per_threadgroup() >= 128);
+                    let hmm_pso = if m >= 16 && out_f % 16 == 0 {
+                        Some(self.pipelines.get(hmm_kern)?)
+                    } else {
+                        None
+                    };
+                    let hmm_ok = hmm_pso
+                        .as_ref()
+                        .is_some_and(|pl| pl.max_total_threads_per_threadgroup() >= 128);
                     p.extend_from_slice(&qw.dshift.to_ne_bytes());
                     // Multi-row mul_mv GEMV for m = 2..8 K-quant shapes (speculative verify,
                     // short suffix prefills): weight bytes hoisted to registers and reused
@@ -2354,6 +2523,7 @@ impl MetalBackend {
                         };
                     if let (true, Some(kn), 0) = ((2..=8).contains(&m), mr_kern, w_off) {
                         let pso = self.pipelines.get(kn)?;
+                        let bd = self.dev_dst(r, dst, m * out_f);
                         let sgs = out_f.div_ceil(2) * m;
                         if let Some(label) = counter_linear_label(self.counter_set.is_some(), kn) {
                             r.cur_op = label;
@@ -2390,22 +2560,7 @@ impl MetalBackend {
                             1
                         };
                         if ks_split > 1 {
-                            let ks_kern = match qw.kern {
-                                "linear_quik4" => "linear_quik4_cmm_ks",
-                                "linear_quik6" => "linear_quik6_cmm_ks",
-                                "linear_q4k" => "linear_q4k_cmm_ks",
-                                "linear_q6k" => "linear_q6k_cmm_ks",
-                                "linear_q5k" => "linear_q5k_cmm_ks",
-                                "linear_q8_0" => "linear_q8_0_cmm_ks",
-                                "linear_q5_0" => "linear_q5_0_cmm_ks",
-                                "linear_q4_0" => "linear_q4_0_cmm_ks",
-                                "linear_iq2xxs" => "linear_iq2xxs_cmm_ks",
-                                "linear_iq3xxs" => "linear_iq3xxs_cmm_ks",
-                                "linear_iq3s" => "linear_iq3s_cmm_ks",
-                                "linear_iq2s" => "linear_iq2s_cmm_ks",
-                                "linear_iq2xs" => "linear_iq2xs_cmm_ks",
-                                _ => "linear_quik8_cmm_ks",
-                            };
+                            let ks_kern = kerns.cmm_ks;
                             let kchunk = (in_f / 32 / ks_split).max(1) * 32;
                             // ceil to cover the tail: ksplit*kchunk must reach in_f
                             let kchunk = if kchunk * ks_split < in_f {
@@ -2439,6 +2594,7 @@ impl MetalBackend {
                                 128,
                             );
                             let rp_pso = self.pipelines.get("cmm_ks_reduce")?;
+                            let bd = self.dev_dst(r, dst, m * out_f);
                             let mut rp = ((m * out_f) as u32).to_ne_bytes().to_vec();
                             rp.extend_from_slice(&(ks_split as u32).to_ne_bytes());
                             if let Some(label) =
@@ -2458,7 +2614,9 @@ impl MetalBackend {
                             return Ok(());
                         }
                         // Reads f32 x directly (casts to f16 while staging) — no cast pass.
-                        let pso = self.pipelines.get(cmm_kern)?;
+                        // `cmm_ok` implies `cmm_pso` is `Some` (both come from the same fetch).
+                        let pso = cmm_pso.expect("cmm_ok implies a fetched cmm PSO");
+                        let bd = self.dev_dst(r, dst, m * out_f);
                         if let Some(label) =
                             counter_linear_label(self.counter_set.is_some(), cmm_kern)
                         {
@@ -2480,12 +2638,11 @@ impl MetalBackend {
                             128,
                         );
                     } else if hmm_ok {
-                        // Prefill GEMM runs on half fragments (see `HGEMM_KERNEL`): cast x to a
-                        // transient f16 buffer first, then one GEMM dispatch reads it.
-                        let xh = Arc::new(self.device.new_buffer(
-                            (m * in_f * 2).max(4) as u64,
-                            MTLResourceOptions::StorageModeShared,
-                        ));
+                        // Prefill GEMM runs on half fragments (see `HGEMM_KERNEL`): cast x to an
+                        // f16 scratch first, then one GEMM dispatch reads it. Pooled by (size,tag)
+                        // — the cast fully overwrites it, so zero-init is irrelevant.
+                        let xh = self.scratch_buf((m * in_f * 2).max(4).div_ceil(4), 21);
+                        let bd = self.dev_dst(r, dst, m * out_f);
                         let cast = self.pipelines.get("cast_f32_f16")?;
                         let n = (m * in_f) as u32;
                         if let Some(label) =
@@ -2496,12 +2653,13 @@ impl MetalBackend {
                         self.encode_w(
                             r,
                             &cast,
-                            &[bx.as_ref(), &xh],
+                            &[bx.as_ref(), xh.as_ref()],
                             1 << 1,
                             &n.to_ne_bytes(),
                             m * in_f,
                         );
-                        let pso = self.pipelines.get(hmm_kern)?;
+                        // `hmm_ok` implies `hmm_pso` is `Some` (same fetch).
+                        let pso = hmm_pso.expect("hmm_ok implies a fetched hmm PSO");
                         if let Some(label) =
                             counter_linear_label(self.counter_set.is_some(), hmm_kern)
                         {
@@ -2524,25 +2682,7 @@ impl MetalBackend {
                         );
                     } else {
                         let (kern, threads, tgw): (&'static str, usize, usize) = if m > 1 {
-                            let rt = match qw.kern {
-                                "linear_quik4" => "linear_quik4_rt",
-                                "linear_quik6" => "linear_quik6_rt",
-                                "linear_q4k" => "linear_q4k_rt",
-                                "linear_q6k" => "linear_q6k_rt",
-                                "linear_q5k" => "linear_q5k_rt",
-                                "linear_q8_0" => "linear_q8_0_rt",
-                                "linear_q5_0" => "linear_q5_0_rt",
-                                "linear_q4_0" => "linear_q4_0_rt",
-                                "linear_iq4xs" => "linear_iq4xs_rt",
-                                "linear_iq4nl" => "linear_iq4nl_rt",
-                                "linear_iq2xxs" => "linear_iq2xxs_rt",
-                                "linear_iq3xxs" => "linear_iq3xxs_rt",
-                                "linear_iq3s" => "linear_iq3s_rt",
-                                "linear_iq2s" => "linear_iq2s_rt",
-                                "linear_iq2xs" => "linear_iq2xs_rt",
-                                _ => "linear_quik8_rt",
-                            };
-                            (rt, m.div_ceil(8) * out_f * 32, 32)
+                            (kerns.rt, m.div_ceil(8) * out_f * 32, 32)
                         } else {
                             // The native mul_mv-shape GEMVs cover TWO output rows per simdgroup
                             // (FOUR for Q8_0/Q5_0). Small/mid row counts underfill the GPU with
@@ -2625,6 +2765,8 @@ impl MetalBackend {
                             r.loc[fdst.0 as usize] = Loc::Device;
                             return Ok(());
                         }
+                        // Deferred past the fused check above (which returns early via `bfd`).
+                        let bd = self.dev_dst(r, dst, m * out_f);
                         let pso = self.pipelines.get(kern)?;
                         if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern)
                         {
@@ -2647,48 +2789,60 @@ impl MetalBackend {
                         );
                     }
                 } else {
+                    // dev_dst deferred here (see the quant branch): every native-float sub-path
+                    // below writes it, none returns before it.
+                    let bd = self.dev_dst(r, dst, m * out_f);
                     let f16_native =
                         wdt == DType::F16 && std::env::var("INFR_METAL_NO_F16_NATIVE").is_err();
                     let f32_native =
                         wdt == DType::F32 && std::env::var("INFR_METAL_NO_F32_NATIVE").is_err();
                     let bf16_native =
                         wdt == DType::Bf16 && std::env::var("INFR_METAL_NO_BF16_NATIVE").is_err();
-                    let f16_cmm = f16_native
+                    // Fetch each candidate cmm PSO ONCE; the cap read and the dispatch share it
+                    // (the three are mutually exclusive by `wdt`). `?` still only fires when the
+                    // shape pre-conditions hold, exactly as the old `&& get(..)?` chain did.
+                    let f16_cmm_pso = if f16_native
                         && m >= 8
                         && out_f % 64 == 0
                         && std::env::var("INFR_METAL_NO_F16_CMM").is_err()
-                        && self
-                            .pipelines
-                            .get("linear_f16_cmm")?
-                            .max_total_threads_per_threadgroup()
-                            >= 128;
-                    let bf16_cmm = bf16_native
-                        && m >= 6
-                        && out_f % 64 == 0
-                        && std::env::var("INFR_METAL_NO_BF16_CMM").is_err()
-                        && self
-                            .pipelines
-                            .get("linear_bf16_cmm")?
-                            .max_total_threads_per_threadgroup()
-                            >= 128;
-                    let f32_cmm = f32_native
-                        && m >= 8
-                        && out_f % 64 == 0
-                        && std::env::var("INFR_METAL_NO_F32_CMM").is_err()
-                        && self
-                            .pipelines
-                            .get("linear_f32_cmm")?
-                            .max_total_threads_per_threadgroup()
-                            >= 128;
-                    let native_cmm = if f16_cmm {
-                        Some("linear_f16_cmm")
-                    } else if bf16_cmm {
-                        Some("linear_bf16_cmm")
-                    } else if f32_cmm {
-                        Some("linear_f32_cmm")
+                    {
+                        Some(self.pipelines.get("linear_f16_cmm")?)
                     } else {
                         None
                     };
+                    let bf16_cmm_pso = if bf16_native
+                        && m >= 6
+                        && out_f % 64 == 0
+                        && std::env::var("INFR_METAL_NO_BF16_CMM").is_err()
+                    {
+                        Some(self.pipelines.get("linear_bf16_cmm")?)
+                    } else {
+                        None
+                    };
+                    let f32_cmm_pso = if f32_native
+                        && m >= 8
+                        && out_f % 64 == 0
+                        && std::env::var("INFR_METAL_NO_F32_CMM").is_err()
+                    {
+                        Some(self.pipelines.get("linear_f32_cmm")?)
+                    } else {
+                        None
+                    };
+                    let cap_ok =
+                        |p: &Option<ComputePipelineState>| -> Option<ComputePipelineState> {
+                            p.clone()
+                                .filter(|pl| pl.max_total_threads_per_threadgroup() >= 128)
+                        };
+                    let native_cmm: Option<(&'static str, ComputePipelineState)> =
+                        if let Some(pl) = cap_ok(&f16_cmm_pso) {
+                            Some(("linear_f16_cmm", pl))
+                        } else if let Some(pl) = cap_ok(&bf16_cmm_pso) {
+                            Some(("linear_bf16_cmm", pl))
+                        } else if let Some(pl) = cap_ok(&f32_cmm_pso) {
+                            Some(("linear_f32_cmm", pl))
+                        } else {
+                            None
+                        };
                     let f16_rt = f16_native
                         && (2..16).contains(&m)
                         && std::env::var("INFR_METAL_NO_F16_RT").is_err();
@@ -2712,8 +2866,7 @@ impl MetalBackend {
                         DType::Bf16 if bf16_native => ("linear_bf16", 2u64),
                         _ => ("linear_f32", 4u64),
                     };
-                    if let Some(cmm_kern) = native_cmm {
-                        let cmm = self.pipelines.get(cmm_kern)?;
+                    if let Some((cmm_kern, cmm)) = native_cmm {
                         if let Some(label) =
                             counter_linear_label(self.counter_set.is_some(), cmm_kern)
                         {
@@ -2895,17 +3048,16 @@ impl MetalBackend {
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
                 // Decode: the WIDE kernel — see `rmsnorm_wide_f32` (a decode row launches only
                 // n_head simdgroups on the 32-lane form and serializes head_dim/32 loads).
-                let wide = rows <= 4
-                    && self
-                        .pipelines
-                        .get("qknormrope_wide_f32")
-                        .map(|pl| pl.max_total_threads_per_threadgroup() >= 256)
-                        .unwrap_or(false);
-                let pso = self.pipelines.get(if wide {
-                    "qknormrope_wide_f32"
-                } else {
-                    "qknormrope_f32"
-                })?;
+                // Fetch the wide PSO once (cap read + dispatch shared two lookups before).
+                let wide_pso = (rows <= 4)
+                    .then(|| self.pipelines.get("qknormrope_wide_f32").ok())
+                    .flatten()
+                    .filter(|pl| pl.max_total_threads_per_threadgroup() >= 256);
+                let wide = wide_pso.is_some();
+                let pso = match wide_pso {
+                    Some(pl) => pl,
+                    None => self.pipelines.get("qknormrope_f32")?,
+                };
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
@@ -3042,7 +3194,10 @@ impl MetalBackend {
                     let values = self.scratch_buf(candidates, 11);
                     let indices = self.scratch_buf(candidates, 12);
                     let mut p1 = n.to_ne_bytes().to_vec();
-                    p1.extend_from_slice(&top_k.to_ne_bytes());
+                    // Clamp to match the scratch sizing (`sample_split_shape`) — stage-1 writes
+                    // `k` candidates per group into a `k`-per-group buffer; passing the raw
+                    // `top_k > 64` here would over-write past `candidates`.
+                    p1.extend_from_slice(&(sample_top_k(top_k as usize) as u32).to_ne_bytes());
                     p1.extend_from_slice(&(SAMPLE_SPLIT_CHUNK as u32).to_ne_bytes());
                     let stage1 = self.pipelines.get("sample_f32_stage1")?;
                     self.encode_tg_w(
@@ -3563,21 +3718,20 @@ impl MetalBackend {
                     }
                 }
                 let ne = kv_len * nkv * hd;
+                // f16 dequant scratch, pooled by (size, tag) rather than freshly allocated per
+                // layer per token (the pool amortizes across every layer at a given depth; the
+                // dequant fully overwrites `ne` elements, so zero-init is irrelevant). Distinct
+                // K/V tags so both sides stay live simultaneously. This static-decode path never
+                // tapes, and the serial walk's automatic hazard tracking serializes reuse.
                 let ks: Option<Arc<MtlBuffer>> = if prep(kdt) {
-                    let s = Arc::new(self.device.new_buffer(
-                        (ne * 2).max(4) as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    ));
+                    let s = self.scratch_buf((ne * 2).max(4).div_ceil(4), 18);
                     self.dequant_kv_f16(r, kdt, &kbuf.raw, &s, ne)?;
                     Some(s)
                 } else {
                     None
                 };
                 let vs: Option<Arc<MtlBuffer>> = if prep(vdt) {
-                    let s = Arc::new(self.device.new_buffer(
-                        (ne * 2).max(4) as u64,
-                        MTLResourceOptions::StorageModeShared,
-                    ));
+                    let s = self.scratch_buf((ne * 2).max(4).div_ceil(4), 19);
                     self.dequant_kv_f16(r, vdt, &vbuf.raw, &s, ne)?;
                     Some(s)
                 } else {
@@ -3627,12 +3781,16 @@ impl MetalBackend {
                         p.extend_from_slice(&window.to_ne_bytes());
                         p.extend_from_slice(&pos.to_ne_bytes());
                         let n = rows * nh * hd;
-                        let qh = Arc::new(self.device.new_buffer(
-                            (n * 2).max(4) as u64,
-                            MTLResourceOptions::StorageModeShared,
-                        ));
+                        // Pooled q-cast scratch (cast overwrites all `n`); tag 20 for the q8 path.
+                        let qh = self.scratch_buf((n * 2).max(4).div_ceil(4), 20);
                         let cast = self.pipelines.get("cast_f32_f16")?;
-                        self.encode(r, &cast, &[bq.as_ref(), &qh], &(n as u32).to_ne_bytes(), n);
+                        self.encode(
+                            r,
+                            &cast,
+                            &[bq.as_ref(), qh.as_ref()],
+                            &(n as u32).to_ne_bytes(),
+                            n,
+                        );
                         self.encode_tg(
                             r,
                             &pso,
@@ -3878,13 +4036,16 @@ impl MetalBackend {
                     // Cast q to a transient f16 buffer (one pass), then one flash dispatch:
                     // one simdgroup per (8-query tile, head).
                     let n = rows * nh * hd;
-                    let qh =
-                        Arc::new(self.device.new_buffer(
-                            (n * 2).max(4) as u64,
-                            MTLResourceOptions::StorageModeShared,
-                        ));
+                    // Pooled q-cast scratch (cast overwrites all `n`); tag 22 for the f16 flash.
+                    let qh = self.scratch_buf((n * 2).max(4).div_ceil(4), 22);
                     let cast = self.pipelines.get("cast_f32_f16")?;
-                    self.encode(r, &cast, &[bq.as_ref(), &qh], &(n as u32).to_ne_bytes(), n);
+                    self.encode(
+                        r,
+                        &cast,
+                        &[bq.as_ref(), qh.as_ref()],
+                        &(n as u32).to_ne_bytes(),
+                        n,
+                    );
                     // flash2 runs 4 cooperating simdgroups per (query tile, head) threadgroup
                     let tgw = if flash2 { 128 } else { 32 };
                     self.encode_tg(

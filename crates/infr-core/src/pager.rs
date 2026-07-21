@@ -139,6 +139,13 @@ impl Pager {
         self.resident.len()
     }
 
+    /// Number of entries in the `epoch` map — test-only, to assert eviction keeps it bounded by
+    /// `n_slots` rather than growing per distinct BlockId ever touched.
+    #[cfg(test)]
+    pub(crate) fn epoch_len(&self) -> usize {
+        self.epoch.len()
+    }
+
     pub fn slot_of(&self, id: BlockId) -> Option<u32> {
         self.resident.get(&id).copied()
     }
@@ -242,6 +249,10 @@ impl Pager {
             .resident
             .remove(&victim)
             .expect("every lru entry has a resident mapping");
+        // Drop the victim's epoch entry too — otherwise `epoch` is the one pager structure not
+        // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
+        // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
+        self.epoch.remove(&victim);
         self.stats.evictions += 1;
         (vslot, Some(victim))
     }
@@ -530,6 +541,39 @@ mod tests {
         for id in [7u32, 8, 9] {
             assert!(p.slot_of(id).is_some(), "batch sibling {id} was evicted");
         }
+    }
+
+    /// Eviction must drop the victim's `epoch` entry, so `epoch` stays bounded by `n_slots` (never
+    /// growing an entry per distinct BlockId ever touched). Exercised via the test-only
+    /// `epoch_len()` accessor.
+    #[test]
+    fn eviction_drops_the_victim_epoch_entry() {
+        let mut p = Pager::new(2);
+        p.touch(1); // slot 0
+        p.touch(2); // slot 1, full
+                    // 3 evicts 1 (LRU); 1's epoch entry must go with it.
+        assert_eq!(
+            p.touch(3),
+            Resolution::Miss {
+                slot: 0,
+                evicted: Some(1)
+            }
+        );
+        assert!(p.slot_of(1).is_none());
+        // epoch tracks only the two currently-resident blocks (2 and 3), not the evicted 1.
+        assert_eq!(p.epoch_len(), 2);
+        assert!(p.epoch_len() <= p.n_slots());
+        // Churn many more distinct ids through the 2-slot cache: epoch stays bounded, not linear
+        // in the number of distinct ids ever seen.
+        for id in 100..200u32 {
+            p.touch(id);
+        }
+        assert!(
+            p.epoch_len() <= p.n_slots(),
+            "epoch grew past n_slots ({} > {})",
+            p.epoch_len(),
+            p.n_slots()
+        );
     }
 
     #[test]

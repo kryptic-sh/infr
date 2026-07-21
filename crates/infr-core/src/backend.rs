@@ -12,10 +12,22 @@
 //! 3. `execute(plan, bindings)` allocates the graph's `Internal` scratch, runs the ops, and
 //!    writes results into the bound `Output` buffers. `Internal`/`Output` scratch is transient.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::graph::Graph;
 use crate::tensor::TensorId;
-use std::collections::HashMap;
+
+/// Bounds-check a [`Backend::copy_buffer`] prefix request: the copied prefix (`bytes`) must fit
+/// inside the source buffer (`src_len`). Returns a `Backend` error rather than letting a downstream
+/// slice/download panic on an oversize `bytes`. Extracted as a pure helper so the check is unit-
+/// testable without standing up a full mock backend.
+pub(crate) fn check_copy_bytes(bytes: usize, src_len: usize) -> Result<()> {
+    if bytes > src_len {
+        return Err(Error::backend(format!(
+            "copy_buffer: requested prefix of {bytes} bytes exceeds source buffer of {src_len} bytes"
+        )));
+    }
+    Ok(())
+}
 
 /// The 16x16x16 (M,N,K) cooperative-matrix tile every production coopmat shader is built for
 /// (RADV/RDNA3+, NVIDIA — every `coopmat<...,16,16,...>` declaration across
@@ -414,28 +426,37 @@ impl Plan for GraphPlan {
 /// Binds a [`Graph`]'s `Input`/`Weight`/`Output` handles to concrete backend buffers for one
 /// `execute`. The model holds the buffers; this only borrows them, so re-binding per step is cheap
 /// and the graph/plan is reused across steps without recompilation.
+///
+/// Backed by a `Vec` indexed by `TensorId.0` (a DENSE `u32` handle into one graph's tensor list),
+/// not a `HashMap` — `bind`/`get` are then hash-free O(1), which matters because decode rebinds
+/// every step. `bind`/`get` semantics are identical to the old map: `get` on an unbound (or
+/// never-grown-to) id returns `None`, and re-binding an id overwrites.
 #[derive(Default)]
 pub struct Bindings<'a> {
-    map: HashMap<TensorId, &'a dyn Buffer>,
+    /// `slots[id.0] = Some(buf)` for a bound handle, `None` for unbound. Grows on demand to the
+    /// highest id bound (bounded by the graph's tensor count).
+    slots: Vec<Option<&'a dyn Buffer>>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Bindings<'a> {
     pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
+        Self { slots: Vec::new() }
     }
 
     /// Bind a graph handle to a buffer the model owns.
     pub fn bind(&mut self, id: TensorId, buf: &'a dyn Buffer) -> &mut Self {
-        self.map.insert(id, buf);
+        let i = id.0 as usize;
+        if i >= self.slots.len() {
+            self.slots.resize(i + 1, None);
+        }
+        self.slots[i] = Some(buf);
         self
     }
 
     /// Look up a bound buffer (backend uses this while executing).
     pub fn get(&self, id: TensorId) -> Option<&'a dyn Buffer> {
-        self.map.get(&id).copied()
+        self.slots.get(id.0 as usize).copied().flatten()
     }
 }
 
@@ -481,12 +502,15 @@ pub trait Backend: Send + Sync {
     }
     /// Copy the first `bytes` of `src` into the start of `dst` (both buffers this backend's).
     /// The KV prefix-sharing primitive: a new chat slot seeds its cache from another slot's
-    /// common prefix instead of re-prefilling it. Default is a host bounce (download the whole
-    /// src, upload the prefix) — correct everywhere; backends override with a device-side copy.
+    /// common prefix instead of re-prefilling it. Default is a host bounce (download ONLY the
+    /// prefix, then upload it) — correct everywhere; backends override with a device-side copy.
+    /// Errors (rather than panics) if `bytes` exceeds `src`'s length.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
-        let mut tmp = vec![0u8; src.len_bytes()];
+        check_copy_bytes(bytes, src.len_bytes())?;
+        // Only the prefix crosses the bus — NOT the whole (potentially `max_ctx`) `src` buffer.
+        let mut tmp = vec![0u8; bytes];
         self.download(src, &mut tmp)?;
-        self.upload(dst, &tmp[..bytes])
+        self.upload(dst, &tmp)
     }
 
     // ---- execution (compile once per shape, execute per token/step) ----
@@ -693,5 +717,118 @@ mod tests {
         let caps = Capabilities::default();
         assert!(!caps.integrated);
         assert_eq!(caps.compute_units, 0);
+    }
+
+    /// The `copy_buffer` bounds-check helper: an oversize prefix errors instead of panicking, and
+    /// any prefix up to the source length is accepted.
+    #[test]
+    fn check_copy_bytes_rejects_oversize_prefix() {
+        assert!(check_copy_bytes(0, 16).is_ok());
+        assert!(check_copy_bytes(16, 16).is_ok()); // whole buffer is a valid prefix
+        assert!(check_copy_bytes(8, 16).is_ok());
+        assert!(check_copy_bytes(17, 16).is_err()); // one past the end
+        assert!(check_copy_bytes(usize::MAX, 16).is_err());
+    }
+
+    /// A host-backed mock backend just large enough to exercise the DEFAULT `copy_buffer`: it must
+    /// transfer ONLY the requested prefix (not the whole `src`) and it must NOT panic on an oversize
+    /// `bytes` — it returns an `Err`.
+    struct MockBuffer(std::sync::Mutex<Vec<u8>>);
+    impl Buffer for MockBuffer {
+        fn len_bytes(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Records how many bytes the last `download` was asked for, to prove the whole `src` never
+    /// crosses the bus for a small prefix copy.
+    struct MockBackend {
+        last_download_len: std::sync::Mutex<usize>,
+    }
+    impl Backend for MockBackend {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn alloc(&self, bytes: usize, _usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+            Ok(Box::new(MockBuffer(std::sync::Mutex::new(vec![
+                0u8;
+                bytes
+            ]))))
+        }
+        fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
+            let dst = dst.as_any().downcast_ref::<MockBuffer>().unwrap();
+            dst.0.lock().unwrap()[..src.len()].copy_from_slice(src);
+            Ok(())
+        }
+        fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
+            *self.last_download_len.lock().unwrap() = dst.len();
+            let src = src.as_any().downcast_ref::<MockBuffer>().unwrap();
+            dst.copy_from_slice(&src.0.lock().unwrap()[..dst.len()]);
+            Ok(())
+        }
+        fn compile(&self, _graph: &Graph) -> Result<Box<dyn Plan>> {
+            unimplemented!()
+        }
+        fn execute(&self, _plan: &dyn Plan, _bindings: &Bindings) -> Result<()> {
+            unimplemented!()
+        }
+        fn sync(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn copy_buffer_default_copies_only_the_prefix() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new((0u8..64).collect()));
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0xAAu8; 64]));
+
+        be.copy_buffer(&src, &dst, 8).unwrap();
+        // Only the 8-byte prefix crossed the bus — NOT the whole 64-byte source.
+        assert_eq!(*be.last_download_len.lock().unwrap(), 8);
+        let out = dst.0.lock().unwrap();
+        assert_eq!(&out[..8], &[0, 1, 2, 3, 4, 5, 6, 7]); // prefix copied
+        assert!(out[8..].iter().all(|&b| b == 0xAA)); // tail untouched
+    }
+
+    #[test]
+    fn bindings_vec_backed_get_matches_old_map_semantics() {
+        // Distinguishable lengths so `get` can be checked to return the exact buffer bound.
+        let a = MockBuffer(std::sync::Mutex::new(vec![0u8; 4]));
+        let b = MockBuffer(std::sync::Mutex::new(vec![0u8; 8]));
+        let c = MockBuffer(std::sync::Mutex::new(vec![0u8; 16]));
+        let mut binds = Bindings::new();
+        // Sparse, out-of-order binds (as a real graph does — handles aren't bound in id order).
+        binds.bind(TensorId(5), &a).bind(TensorId(2), &b);
+        // Bound ids resolve to the exact buffer; the gap (ids 0,1,3,4) and any id past the
+        // high-water mark are None — identical to the old HashMap miss.
+        assert_eq!(binds.get(TensorId(5)).unwrap().len_bytes(), 4);
+        assert_eq!(binds.get(TensorId(2)).unwrap().len_bytes(), 8);
+        assert!(binds.get(TensorId(0)).is_none());
+        assert!(binds.get(TensorId(3)).is_none());
+        assert!(binds.get(TensorId(99)).is_none());
+        // Re-binding an id overwrites (identical to the old HashMap::insert semantics).
+        binds.bind(TensorId(5), &c);
+        assert_eq!(binds.get(TensorId(5)).unwrap().len_bytes(), 16);
+    }
+
+    #[test]
+    fn copy_buffer_default_errors_on_oversize_bytes() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new(vec![0u8; 16]));
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0u8; 64]));
+        // 32 > src's 16 bytes: an Err, not a panic, and nothing was downloaded.
+        assert!(be.copy_buffer(&src, &dst, 32).is_err());
+        assert_eq!(*be.last_download_len.lock().unwrap(), 0);
     }
 }

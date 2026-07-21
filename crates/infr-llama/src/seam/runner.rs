@@ -133,6 +133,10 @@ fn bind_layer_io<'a>(
 /// that are pure in `(backend caps, gguf, config, env)`. Run ONCE at cold session init (the result
 /// is stashed in `SeamKv` and reused via `Arc` on warm calls / forks) instead of every request.
 fn session_stable(be: &dyn Backend, g: &Gguf, c: &Config) -> AResult<SessionStable> {
+    // Capabilities are a per-backend invariant; query ONCE (each call clones an owned struct with a
+    // heap `String name`) and read fields off the cached copy — this function otherwise queried the
+    // backend 8× per build.
+    let caps = be.capabilities();
     // Per-layer presence of an explicit V projection. gemma4 full-attention layers omit it (V = the
     // raw K projection); every layer of every other model has one.
     let has_wv: Vec<bool> = (0..c.n_layer)
@@ -199,7 +203,7 @@ fn session_stable(be: &dyn Backend, g: &Gguf, c: &Config) -> AResult<SessionStab
     // dense "shared expert" branch, separate from the MoE bank) and its dense n_ff=2112 out_f clears
     // neither warp-tile gate on its own (%256 nor %128) so it fell to the slower mmq path — fused
     // out_f=2*2112=4224 clears %128. See `FfnW::DiffusionMoe::fused_gu`.
-    let fuse_gu = fuse_gu_decision(be.capabilities().combined_gu, g, c);
+    let fuse_gu = fuse_gu_decision(caps.combined_gu, g, c);
     // Combined QKV: one [qrow+2·kvrow, ne] weight → prefill runs ONE wide GEMM (the separate
     // q/k/v GEMMs are narrow-n and underfill a big GPU — the pp512 sweep's dominant cost), and
     // decode keeps three offset GEMVs into the same buffer (`Op::Linear.w_off`), so its dispatch
@@ -210,7 +214,7 @@ fn session_stable(be: &dyn Backend, g: &Gguf, c: &Config) -> AResult<SessionStab
     // GGUFs (e.g. Qwen3-8B Q4_K_M: v = 18×Q4K + 18×Q6K) fail the uniform-dtype gate and keep the
     // split form. INFR_NO_QKV_FUSE forces the split form for A/B (default unset = fuse; the split
     // form is bit-identical — same dots, same fixed-order sums).
-    let fuse_qkv = fuse_qkv_decision(be.capabilities().combined_gu, g, c);
+    let fuse_qkv = fuse_qkv_decision(caps.combined_gu, g, c);
     // Batched-prefill eligibility for MoE: every layer's expert banks must have a dp4a-mmq kernel
     // (`MOE_MMQ_DTYPES`) — see the decode_start call site's comment for the full rationale.
     let moe_mmq_ok = |d: Option<DType>| d.is_some_and(infr_core::tensor::moe_mmq_ok);
@@ -340,6 +344,9 @@ pub(crate) fn generate_dense_backend(
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
+    // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
+    // struct with a heap `String name`) and read fields off the cached copy below.
+    let caps = be.capabilities();
     let (ne, nh) = (c.n_embd, c.n_head);
     // gemma4: per-layer SWA/full dims differ; size shared scratch + KV by the max over layers.
     let max_hd = c.max_head_dim();
@@ -381,8 +388,7 @@ pub(crate) fn generate_dense_backend(
     // backends that track hazards (Vulkan). `Op::GatedRmsNorm` collapses the pair into one
     // dispatch with bit-identical math (same reduction, elementwise gate multiply added on
     // store). INFR_NO_GATED_RMSNORM forces the split form for A/B (default unset = fuse).
-    let fuse_gated_rmsnorm =
-        be.capabilities().gated_rmsnorm && std::env::var("INFR_NO_GATED_RMSNORM").is_err();
+    let fuse_gated_rmsnorm = caps.gated_rmsnorm && std::env::var("INFR_NO_GATED_RMSNORM").is_err();
 
     // GPU embed gather (Op::EmbedGather, task #28): the host feeds token IDS (4 bytes each) and
     // the device gathers+dequantizes the embedding rows from the resident quantized table —
@@ -391,7 +397,7 @@ pub(crate) fn generate_dense_backend(
     // reuse the already-uploaded lm_head buffer (same tensor); untied models upload token_embd
     // once more (extra VRAM = its on-disk size). INFR_NO_GPU_EMBED forces the host path (A/B).
     let untied_lm = g.tensors().iter().any(|t| t.name == "output.weight");
-    let gpu_embed = be.capabilities().embed_gather
+    let gpu_embed = caps.embed_gather
         && c.n_embd.is_multiple_of(32)
         && g.tensors()
             .iter()
@@ -484,7 +490,7 @@ pub(crate) fn generate_dense_backend(
     // Everything downstream (alloc, graph decl, rewind guard, fork/seed) derives from this ONE
     // flag; the env set is stable for the process, so warm sessions always recompute the same
     // value their buffers were sized with.
-    let kv_ring = be.capabilities().kv_swa_ring
+    let kv_ring = caps.kv_swa_ring
         && crate::seam::kv_ring_wanted(c)
         && matches!(k_fmt, DType::F16 | DType::Q8_0)
         && matches!(v_fmt, DType::F16 | DType::Q8_0);
@@ -1090,7 +1096,7 @@ pub(crate) fn generate_dense_backend(
         && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
         && constraint.is_none()
         && !penalize
-        && be.capabilities().gpu_sample
+        && caps.gpu_sample
         && std::env::var("INFR_NO_GPU_SAMPLE").is_err();
 
     let build = |batch: usize,
@@ -3371,7 +3377,7 @@ pub(crate) fn generate_dense_backend(
         // argmax; INFR_NO_GPU_MTP_ACCEPT narrows to just this path).
         let gpu_verify_ids = verify_ids.is_some()
             && constraint.is_none()
-            && be.capabilities().argmax_rows
+            && caps.argmax_rows
             && std::env::var("INFR_NO_GPU_ARGMAX").is_err()
             && std::env::var("INFR_NO_GPU_MTP_ACCEPT").is_err();
         let t_vbuild0 = std::time::Instant::now();
@@ -3747,7 +3753,7 @@ pub(crate) fn generate_dense_backend(
     // (then-never-used) replay plan's persistent scratch/self-advancing params machinery at all.
     // Dense layer streaming forces static per-execute decode for the same replay-can't-express-it
     // reason (per-token ring staging + per-slot weight offsets — see `Backend::dense_paged`).
-    let dyn_replay = be.capabilities().decode_replay
+    let dyn_replay = caps.decode_replay
         && !be.moe_paged()
         && !be.dense_paged()
         && std::env::var("INFR_SEAM_NO_REPLAY").is_err()

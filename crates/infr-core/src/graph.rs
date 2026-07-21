@@ -749,6 +749,13 @@ pub struct Graph {
     /// for prefill by ALSO unlocking it for MTP verify — which is what broke token-identity. See
     /// `infr_vulkan::adapter`'s `mrow_int8_dtype_ok` for the consumer.
     pub mtp_verify: bool,
+    /// Memoized [`Self::in_place_inputs`] — a graph invariant (which KV-cache `Input`s the ops
+    /// mutate in place), computed lazily on first query and reused. `execute` calls it PER TOKEN;
+    /// without this it re-scanned every op and re-allocated a `HashSet` each call. Interior-mutable
+    /// (`OnceLock`) so it fills through a shared `&Graph` (the plan holds the graph immutably).
+    /// Not part of the graph's identity — cloning carries a filled cache along if present, and an
+    /// empty one refills once on the clone's first query.
+    in_place_cache: std::sync::OnceLock<std::collections::HashSet<TensorId>>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -762,23 +769,29 @@ impl Graph {
     /// being rediscovered per backend: an eager-load backend (like the CPU interpreter) skips loading
     /// these into its working store + skips writing them back (they're mutated directly), avoiding
     /// O(max_ctx) copies per step.
-    pub fn in_place_inputs(&self) -> std::collections::HashSet<TensorId> {
-        let mut set = std::collections::HashSet::new();
-        for op in &self.ops {
-            match op {
-                Op::WriteKv { cache, .. } => {
-                    set.insert(*cache);
+    ///
+    /// The set is a graph INVARIANT (the ops never change after compile), so it is computed once and
+    /// MEMOIZED — `execute` queries it per token and must not re-scan every op / re-alloc a
+    /// `HashSet` each call. Returns a borrow of the cached set.
+    pub fn in_place_inputs(&self) -> &std::collections::HashSet<TensorId> {
+        self.in_place_cache.get_or_init(|| {
+            let mut set = std::collections::HashSet::new();
+            for op in &self.ops {
+                match op {
+                    Op::WriteKv { cache, .. } => {
+                        set.insert(*cache);
+                    }
+                    Op::Attention {
+                        k_cache, v_cache, ..
+                    } => {
+                        set.insert(*k_cache);
+                        set.insert(*v_cache);
+                    }
+                    _ => {}
                 }
-                Op::Attention {
-                    k_cache, v_cache, ..
-                } => {
-                    set.insert(*k_cache);
-                    set.insert(*v_cache);
-                }
-                _ => {}
             }
-        }
-        set
+            set
+        })
     }
 
     fn decl(&mut self, desc: TensorDesc, kind: TensorKind) -> TensorId {
@@ -918,5 +931,59 @@ mod tests {
         let mut g = Graph::new();
         let w = g.weight(TensorDesc::new(vec![4], DType::F32));
         assert_eq!(g.kind(w), TensorKind::Weight);
+    }
+
+    /// `in_place_inputs` must report exactly the KV-cache handles the ops mutate in place
+    /// (`WriteKv`'s `cache`, `Attention`'s `k_cache`/`v_cache`) — the set the CPU/Metal `execute`
+    /// use to skip the O(max_ctx) working-store round-trip — and must be MEMOIZED (computed once,
+    /// the same set handed back per token) rather than rescanned/re-allocated per call.
+    #[test]
+    fn in_place_inputs_is_the_kv_set_and_memoized() {
+        let t = |n: u32| TensorId(n);
+        let mut g = Graph::new();
+        g.push(Op::WriteKv {
+            src: t(5),
+            cache: t(6),
+            rows: 1,
+            row_stride: 8,
+            pos: 0,
+        });
+        g.push(Op::Attention {
+            q: t(7),
+            k_cache: t(6),
+            v_cache: t(8),
+            dst: t(9),
+            rows: 1,
+            kv_len: 1,
+            n_head: 1,
+            n_kv: 1,
+            head_dim: 8,
+            scale: 1.0,
+            mask: AttnMask::Causal,
+            pos: 0,
+        });
+        // A non-KV op must NOT contribute any in-place input.
+        g.push(Op::Add {
+            a: t(9),
+            b: t(9),
+            dst: t(9),
+            n: 8,
+        });
+
+        let want: std::collections::HashSet<TensorId> = [t(6), t(8)].into_iter().collect();
+        let first = g.in_place_inputs();
+        assert_eq!(first, &want);
+
+        // Memoized: a second query returns the SAME cached set (same address), never recomputed.
+        let first_ptr = first as *const _;
+        let second = g.in_place_inputs();
+        assert_eq!(second, &want);
+        assert_eq!(
+            second as *const _, first_ptr,
+            "set was recomputed, not cached"
+        );
+
+        // A clone with an already-filled cache carries the same set (byte-identical semantics).
+        assert_eq!(g.clone().in_place_inputs(), &want);
     }
 }

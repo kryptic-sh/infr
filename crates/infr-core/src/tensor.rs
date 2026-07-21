@@ -263,6 +263,31 @@ mod moe_mmq_drift_tests {
         }
     }
 
+    /// [`MOE_MMQ_PAGED_DTYPES`] "mirrors `MOE_MMQ_DTYPES` IN FULL" (see its doc: the pager is the
+    /// SOLE MoE offload mechanism, so any mmq dtype can end up paged). A subset check alone lets a
+    /// dtype added to `MOE_MMQ_DTYPES` but NOT the paged list stay green while silently regressing
+    /// that dtype's paged prefill to the slow id-GEMV path. Assert SET EQUALITY so that drift fails
+    /// the build: every `MOE_MMQ_DTYPES` member must also have a paged (`_xpg`) build listed. If a
+    /// future format is deliberately unpaged, remove it here with an explicit exclusion set rather
+    /// than leaving the gap silent.
+    #[test]
+    fn paged_dtypes_equal_mmq_dtypes() {
+        for d in MOE_MMQ_DTYPES {
+            assert!(
+                MOE_MMQ_PAGED_DTYPES.contains(d),
+                "{d:?} is in MOE_MMQ_DTYPES but has no paged (_xpg) build in MOE_MMQ_PAGED_DTYPES \
+                 — its paged prefill would silently fall back to the slow id-GEMV path"
+            );
+        }
+        // Symmetric with `paged_dtypes_subset_of_mmq_dtypes`: the two directions together pin the
+        // lists to EXACTLY the same set (also catches a size drift if a dupe ever slipped a guard).
+        assert_eq!(
+            MOE_MMQ_PAGED_DTYPES.len(),
+            MOE_MMQ_DTYPES.len(),
+            "MOE_MMQ_PAGED_DTYPES and MOE_MMQ_DTYPES must be the same set"
+        );
+    }
+
     /// No duplicate entries in any of the three lists — a dupe wouldn't break `contains`-based
     /// lookups but would signal a copy-paste mistake at the point a format was added.
     #[test]

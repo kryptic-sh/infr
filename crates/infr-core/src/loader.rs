@@ -20,7 +20,10 @@ impl MetaValue {
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             MetaValue::U64(v) => Some(*v),
-            MetaValue::I64(v) => Some(*v as u64),
+            // A NEGATIVE `I64` is NOT a valid unsigned count/size — reject it (`None`) rather than
+            // wrapping (`-1 as u64` == `u64::MAX`), which would drive a downstream alloc/loop into
+            // OOM/overflow instead of a clean "invalid field" rejection.
+            MetaValue::I64(v) => u64::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -83,4 +86,25 @@ pub trait WeightSource: Send + Sync {
     fn tensor_bytes(&self, name: &str) -> Result<&[u8]>;
     /// Embedded jinja chat template, if present.
     fn chat_template(&self) -> Option<&str>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `as_u64` must reject a NEGATIVE `I64` (a count/size field can't be negative) instead of
+    /// wrapping it into a huge `u64` that drives a downstream alloc/loop into OOM.
+    #[test]
+    fn as_u64_rejects_negative_i64() {
+        assert_eq!(MetaValue::I64(-1).as_u64(), None);
+        assert_eq!(MetaValue::I64(i64::MIN).as_u64(), None);
+        // A non-negative `I64` still reads through unchanged.
+        assert_eq!(MetaValue::I64(0).as_u64(), Some(0));
+        assert_eq!(MetaValue::I64(42).as_u64(), Some(42));
+        assert_eq!(MetaValue::I64(i64::MAX).as_u64(), Some(i64::MAX as u64));
+        // A native `U64` is untouched (including values above `i64::MAX`).
+        assert_eq!(MetaValue::U64(u64::MAX).as_u64(), Some(u64::MAX));
+        // Non-integer variants stay `None`.
+        assert_eq!(MetaValue::Bool(true).as_u64(), None);
+    }
 }

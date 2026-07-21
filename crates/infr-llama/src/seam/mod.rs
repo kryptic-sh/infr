@@ -1620,6 +1620,221 @@ pub(crate) fn generate_dense_vulkan_tp(
     )
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Expert parallelism (MoE) — shard the experts across devices. See `infr_vulkan::ep`.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Parse the `INFR_EXPERT_PARALLEL` device list (`Vulkan0,Vulkan1,…`) into physical device indices,
+/// or `None` when unset. Sibling of [`parse_tensor_parallel_devices`]; needs >=2 devices for a real
+/// expert split (a single device is the identity, used only as the correctness reference).
+pub fn parse_expert_parallel_devices() -> AResult<Option<Vec<usize>>> {
+    let Some(spec) = std::env::var_os("INFR_EXPERT_PARALLEL") else {
+        return Ok(None);
+    };
+    let spec = spec.to_string_lossy();
+    let mut devs = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let idx = part
+            .strip_prefix("Vulkan")
+            .unwrap_or(part)
+            .parse::<usize>()
+            .map_err(|_| {
+                anyhow!("INFR_EXPERT_PARALLEL: '{part}' is not VulkanN or a device index")
+            })?;
+        devs.push(idx);
+    }
+    if devs.is_empty() {
+        return Err(anyhow!(
+            "INFR_EXPERT_PARALLEL='{spec}' lists no devices; unset it to run single-device"
+        ));
+    }
+    Ok(Some(devs))
+}
+
+/// Whether `name` is a stacked expert-bank weight (`ffn_{gate,up,down}_exps` or fused
+/// `ffn_gate_up_exps`) — the ONLY tensors Expert Parallelism shards; everything else is replicated.
+fn is_expert_bank(name: &str) -> bool {
+    name.ends_with("ffn_gate_exps.weight")
+        || name.ends_with("ffn_up_exps.weight")
+        || name.ends_with("ffn_down_exps.weight")
+        || name.ends_with("ffn_gate_up_exps.weight")
+}
+
+/// A device-aware [`BindWeight`] for Expert Parallelism: the stacked expert banks
+/// (`ffn_{gate,up,down}_exps`) are split by EXPERT — rank `r` of `world` gets the contiguous band
+/// `[r·E/W, (r+1)·E/W)` (each per-expert slice is `nbytes/n_expert`, block-aligned, so a whole-band
+/// cut never splits a quant block) and uploads ONLY that band; every other weight (router,
+/// attention, norms, embeddings, the LM head) is REPLICATED to every rank. Each slice/replica is
+/// padded to u32 alignment and uploaded to its rank's device, returned as an
+/// `infr_vulkan::EpBuffer`.
+fn expert_parallel_binder<'a>(
+    ep: &'a infr_vulkan::ExpertParallelBackend,
+    cfg: &'a Config,
+) -> Box<BindWeight<'a>> {
+    let world = ep.world();
+    let n_expert = cfg.moe.as_ref().map(|m| m.n_expert).unwrap_or(0).max(1);
+    Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
+        if is_expert_bank(name) {
+            // Split the bank by expert. The stacked bank is `n_expert` contiguous per-expert slices
+            // (the arena kernels index `arena + expert·stride`), so band `[r·nl, (r+1)·nl)` is a
+            // contiguous byte range and its per-expert element cap is `numel/n_expert`.
+            let total = tb.len();
+            if !total.is_multiple_of(n_expert) {
+                return Err(anyhow!(
+                    "ep: expert bank '{name}' {total} bytes not divisible by n_expert={n_expert}"
+                ));
+            }
+            let stride_bytes = total / n_expert;
+            if !n_expert.is_multiple_of(world) {
+                return Err(anyhow!(
+                    "ep: n_expert={n_expert} not divisible by world {world}"
+                ));
+            }
+            let nl = n_expert / world;
+            check_bda_element_cap(name, "per-expert slice", numel / n_expert)?;
+            let mut bufs = Vec::with_capacity(world);
+            for r in 0..world {
+                let start = r * nl * stride_bytes;
+                let slice = &tb[start..start + nl * stride_bytes];
+                let padded = infr_vulkan::linear::pad_to_u32_align(slice);
+                let buf = ep
+                    .rank(r)
+                    .alloc_uninit(padded.len(), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                ep.rank(r)
+                    .upload(buf.as_ref(), &padded)
+                    .map_err(|e| anyhow!("{e}"))?;
+                bufs.push(buf);
+            }
+            Ok((infr_vulkan::EpBuffer::wrap(bufs), dt))
+        } else {
+            // Replicated: the full padded tensor on every rank. Mirror the resident binder's
+            // per-expert-slice / chunk-covered / whole-tensor element-cap policy for non-bank
+            // weights (a replicated router is a whole tensor; lm_head/token_embd are chunk-covered).
+            if chunk_covered_dense_tensor(name) {
+                // no whole-tensor cap (dispatch-chunked reads)
+            } else {
+                check_bda_element_cap(name, "tensor", numel)?;
+            }
+            let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+            let mut bufs = Vec::with_capacity(world);
+            for r in 0..world {
+                let buf = ep
+                    .rank(r)
+                    .alloc_uninit(padded.len(), BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                ep.rank(r)
+                    .upload(buf.as_ref(), &padded)
+                    .map_err(|e| anyhow!("{e}"))?;
+                bufs.push(buf);
+            }
+            Ok((infr_vulkan::EpBuffer::wrap(bufs), dt))
+        }
+    })
+}
+
+/// Multi-GPU EXPERT-PARALLEL (MoE) generation — the model's experts are split across the `devices`
+/// (rank `r` owns experts `[r·E/W, (r+1)·E/W)`), the router + attention + norms run replicated on
+/// every rank, each rank computes only its band's experts, and one P2P all-reduce per MoE layer
+/// combines the partial expert outputs. The output equals the single-device MoE to reduction-order
+/// tolerance (token-identical greedy). qwen3moe (split gate/up, softmax, no shared expert) in v1.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_moe_vulkan_ep(
+    devices: &[usize],
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    let Some(moe) = cfg.moe.as_ref() else {
+        return Err(anyhow!(
+            "INFR_EXPERT_PARALLEL needs a routed-expert (MoE) model — this is a dense model (use \
+             INFR_TENSOR_PARALLEL or INFR_PIPELINE)"
+        ));
+    };
+    if cfg.qwen35 {
+        return Err(anyhow!(
+            "INFR_EXPERT_PARALLEL does not yet support qwen35 (DeltaNet recurrent-state replication \
+             is a separate slice)"
+        ));
+    }
+    if cfg.shexp_ff > 0 {
+        return Err(anyhow!(
+            "INFR_EXPERT_PARALLEL v1 does not yet place a SHARED expert (qwen35moe / llama4 \
+             MoeSharedExpertAdd) — only routed-only MoE (qwen3moe). Shared-expert placement is a \
+             separate slice"
+        ));
+    }
+    if cfg.n_embd_per_layer > 0 {
+        return Err(anyhow!(
+            "INFR_EXPERT_PARALLEL does not support gemma E2B per-layer embeddings"
+        ));
+    }
+    if cfg.diffusion_gemma {
+        return Err(anyhow!(
+            "INFR_EXPERT_PARALLEL does not support diffusion-gemma"
+        ));
+    }
+    let mut backends = Vec::with_capacity(devices.len());
+    for &idx in devices {
+        backends.push(
+            infr_vulkan::VulkanBackend::new_on(idx)
+                .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
+        );
+    }
+    let names = backends
+        .iter()
+        .map(|b| {
+            use infr_core::backend::Backend;
+            b.capabilities().name
+        })
+        .collect::<Vec<_>>();
+    let use_p2p = std::env::var_os("INFR_EP_HOST").is_none();
+    let ep = infr_vulkan::ExpertParallelBackend::new(backends, moe.n_expert, use_p2p)
+        .map_err(|e| anyhow!("{e}"))?;
+    let nl = ep.experts_per_device();
+    eprintln!(
+        "expert-parallel: {}-way expert split ({} experts, {} used/token → {nl} experts/device):",
+        devices.len(),
+        moe.n_expert,
+        moe.n_used,
+    );
+    for (di, &idx) in devices.iter().enumerate() {
+        eprintln!(
+            "  Vulkan{idx} ({}): rank {di} — experts [{}..{}) ({nl} of {})",
+            names[di],
+            di * nl,
+            (di + 1) * nl,
+            moe.n_expert,
+        );
+    }
+    let bind = expert_parallel_binder(&ep, cfg);
+    generate_dense_backend(
+        &ep,
+        &*bind,
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        &mut None,
+        prompt.len() + max_new + 1,
+        None, // constraint
+        None, // verify
+        None, // verify_ids
+        None, // logits_out
+        None, // h_out
+        None, // denoise_req
+        None, // req
+    )
+}
+
 /// Metal seam runner: the SAME dense forward as [`generate_dense_cpu`], on the reference Metal
 /// backend through the agnostic [`Graph`]. Weights are uploaded to Metal buffers in their NATIVE
 /// GGUF dtype (the backend dequantizes lazily in its own `bytes_to_f32`, exactly like the CPU

@@ -1355,6 +1355,15 @@ pub(crate) fn moe_topk_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the expert-parallel (multi-GPU EP) band remap — rewrite router-selected GLOBAL expert
+/// ids into this rank's LOCAL expert-shard indices (out-of-band → id 0, weight 0). See
+/// `Op::MoeFfn`'s `ep_band` and `moe_ep_band_remap.comp`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn moe_ep_band_remap_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/moe_ep_band_remap.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// Kernel-cache NAME + availability for the embedding-row gather+dequant (`Op::EmbedGather`); the
 /// SPIR-V lives in [`embed_gather_spv`]. `None` = format has no
 /// build (grid-table IQ formats) — the runner then keeps the host embed path.

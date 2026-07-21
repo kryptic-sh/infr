@@ -471,6 +471,17 @@ pub enum Op {
         /// `weight_before_ffn`); the two differ through the SiLU nonlinearity. Folded into the
         /// gate/up activations on CPU (`silu(w·gate)·(w·up)`), exact since gate/up are linear.
         weight_before: bool,
+        /// Expert-parallel (multi-GPU EP) band: `Some((base, n_local))` means the bound expert banks
+        /// (`gate_exps`/`up_exps`/`down_exps`) hold ONLY this rank's contiguous expert shard
+        /// `[base, base+n_local)` (of the global `n_expert`), so the op routes GLOBALLY (full
+        /// `router`/`n_expert` top-k, replicated across ranks) but computes only its owned experts —
+        /// the assignments to other ranks' experts are dropped (weight 0). The producing MoE output
+        /// (`dst`) is then a PARTIAL that the EP backend all-reduces (sums) across ranks to the full
+        /// weighted top-k output. `None` (the DEFAULT) = ordinary single-device MoE over all
+        /// `n_expert` experts, byte-identical to before this field existed. Set only by
+        /// `infr_vulkan::ExpertParallelBackend`'s per-rank graph lowering; every model builder and
+        /// the CPU/Metal reference interpreters leave it `None` (EP is a Vulkan-only path).
+        ep_band: Option<(u32, u32)>,
     },
     /// Depthwise causal 1-D conv over `channels` followed by SiLU (qwen35 gated DeltaNet).
     /// Processes `rows` tokens sequentially, carrying the rolling history in `state` across rows and

@@ -3644,6 +3644,7 @@ fn lower_op(
             gating,
             norm_w,
             weight_before,
+            ep_band,
         } => {
             // Router gating (softmax vs sigmoid) and renormalization are `moe_topk` push-constant
             // flags — see its shader doc. `weight_before` (llama4: the routing weight scales the
@@ -3661,6 +3662,18 @@ fn lower_op(
                 *n_used as usize,
                 *n_ff_exp as usize,
             );
+            // Expert-parallel (multi-GPU EP) band: under EP this rank's bound expert banks
+            // (`gate_exps`/`up_exps`/`down_exps`) hold ONLY experts `[ep_lo, ep_lo+n_expert_local)`
+            // of the global `n_expert`. The router GEMV + `moe_topk` below still run over the FULL
+            // `n_expert` (the router weight is replicated, so every rank makes the identical global
+            // top-k selection); a `moe_ep_band_remap` right after top-k rewrites the selected ids
+            // into this rank's LOCAL shard indices (out-of-band → id 0, weight 0) so the expert
+            // GEMV/GEMM stages index the local bank (`n_expert_local` distinct experts) and the
+            // weighted combine drops the assignments this rank doesn't own. The EP backend then
+            // all-reduces every rank's partial `dst`. `None` (single-device) ⇒ `n_expert_local ==
+            // n_expert`, no remap ⇒ byte-identical to before this field existed.
+            let (ep_lo, n_expert_local) =
+                ep_band.map_or((0u32, n_expert), |(b, nl)| (b, nl as usize));
             // Fused gate_up_exps stores BOTH roles per expert ([ne, 2*nff, n_expert]) — the id-native
             // dtype check below reads `up_exps` too, but the call site binds it to the SAME handle as
             // `gate_exps` when fused (never separately read), so the dtype check still holds.
@@ -3776,9 +3789,11 @@ fn lower_op(
                 let logits = alu(rows * n_expert * 4)?;
                 let ids = alu(n_pairs * 4)?;
                 let wts = alu(n_pairs * 4)?;
-                let counts = al(n_expert)?; // zeroed below (bucket_count accumulates)
-                let offsets = alu(n_expert * 4)?;
-                let fill = alu(n_expert * 4)?;
+                // Bucket arrays index the LOCAL expert shard under EP (ids are remapped to
+                // `[0, n_expert_local)` right after top-k); `n_expert_local == n_expert` off EP.
+                let counts = al(n_expert_local)?; // zeroed below (bucket_count accumulates)
+                let offsets = alu(n_expert_local * 4)?;
+                let fill = alu(n_expert_local * 4)?;
                 let bucket_rows = alu(n_pairs * 4)?;
                 let bucket_wts = alu(n_pairs * 4)?;
                 let inv_pos = alu(n_pairs * 4)?;
@@ -3823,9 +3838,26 @@ fn lower_op(
                     gating_u32,
                     *norm_w,
                 );
-                rec.zero(counts.as_ref(), n_expert);
+                // EP: rewrite the global top-k ids into this rank's local shard indices before the
+                // bucket sort (out-of-band → id 0, weight 0 — those assignments bucket harmlessly
+                // and the weighted combine drops them). No-op off EP.
+                if ep_band.is_some() {
+                    rec.moe_ep_band_remap(
+                        ids.as_ref(),
+                        wts.as_ref(),
+                        n_pairs,
+                        ep_lo,
+                        ep_lo + n_expert_local as u32,
+                    );
+                }
+                rec.zero(counts.as_ref(), n_expert_local);
                 rec.moe_bucket_count(ids.as_ref(), counts.as_ref(), n_pairs);
-                rec.moe_bucket_scan(counts.as_ref(), offsets.as_ref(), fill.as_ref(), n_expert);
+                rec.moe_bucket_scan(
+                    counts.as_ref(),
+                    offsets.as_ref(),
+                    fill.as_ref(),
+                    n_expert_local,
+                );
                 // Per-expert down_scale (diffusion-gemma) is baked into `bucket_wts` HERE (the
                 // scatter already has the expert id in hand to index it) rather than as a separate
                 // post-GEMM pass — `moe_scatter_reduce` then needs no changes at all, and the
@@ -3883,7 +3915,7 @@ fn lower_op(
                     rows,
                     ne,
                     gu_width,
-                    n_expert,
+                    n_expert_local,
                     n_used,
                 );
                 if let Some(ue) = ue {
@@ -3906,7 +3938,7 @@ fn lower_op(
                         rows,
                         ne,
                         nff,
-                        n_expert,
+                        n_expert_local,
                         n_used,
                     );
                     rec.suppress_sync(false);
@@ -3978,7 +4010,7 @@ fn lower_op(
                     rows,
                     nff,
                     ne,
-                    n_expert,
+                    n_expert_local,
                     n_used,
                 );
                 rec.moe_scatter_reduce(
@@ -4091,6 +4123,18 @@ fn lower_op(
                 gating_u32,
                 *norm_w,
             );
+            // EP: rewrite the global top-k ids into this rank's local shard indices (out-of-band →
+            // id 0, weight 0). The id-indexed GEMVs below then read the local bank; the weighted
+            // `moe_accumulate` drops the zero-weight (out-of-band) slots. No-op off EP.
+            if ep_band.is_some() {
+                rec.moe_ep_band_remap(
+                    ids.get(pool),
+                    wts.get(pool),
+                    n_slots,
+                    ep_lo,
+                    ep_lo + n_expert_local as u32,
+                );
+            }
             let n_act = n_slots * nff;
             if let Some(gubuf) = &gubuf {
                 // Fused per-role expert GEMV: ONE dispatch over all rows' [ne, 2*nff] expert slices.
@@ -5171,6 +5215,9 @@ fn execute_paged_moe<'a>(
         gating,
         norm_w,
         weight_before,
+        // The paged executor is never reached under Expert Parallelism: the EP binder shards expert
+        // banks RESIDENT across devices (no pager), so a paged MoE layer is always full-expert.
+        ep_band: _,
     } = op
     else {
         unreachable!("execute_paged_moe only ever called for an Op::MoeFfn");
@@ -7126,6 +7173,7 @@ mod tests {
                 gating: infr_core::graph::MoeGating::Softmax,
                 norm_w: true,
                 weight_before: false,
+                ep_band: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -7159,6 +7207,222 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Expert parallelism (`crate::ep::ExpertParallelBackend`): a 2-device EXPERT split of the SAME
+    /// tiny qwen3moe-shaped `MoeFfn` as `moe_ffn_graph_matches_host` must match BOTH the host
+    /// reference AND the 1-device (world=1) EP run — token/logit-identical to reduction-order
+    /// tolerance. This is the correctness proof for the EP mechanism (per-band expert compute + the
+    /// `moe_ep_band_remap` local-id rewrite + the P2P/all-reduce combine) that runs on TINY synthetic
+    /// experts, so it exercises the whole 2-device path WITHOUT the memory pressure of a real 30B MoE
+    /// on this box's weak iGPU (which device-losts on the amdgpu submission-memory limit replicating a
+    /// 30B model — a hardware limit, not an EP-logic one; see `expert_parallel_matches_single_device`
+    /// in infr-llama for the full-model integration test). Covers rows=1/4 (the small-m id-GEMV
+    /// expert path) AND rows=16 (the batched dp4a `matmul_mmq_experts` path — its `n_expert_local`
+    /// bucket dims + bucket-0 drop of out-of-band assignments). `n_expert=4`, world=2 → 2 experts on
+    /// each device.
+    #[test]
+    #[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
+    fn ep_matches_single_device_synthetic() {
+        let Ok(devs) = VulkanBackend::enumerate_devices() else {
+            return; // no Vulkan — self-skip
+        };
+        if devs.len() < 2 {
+            eprintln!("skip: ep_matches_single_device_synthetic needs >=2 Vulkan devices");
+            return;
+        }
+        let (d0, d1) = (devs[0].index, devs[1].index);
+        // ne=256 so rows=16 exercises the batched dp4a `matmul_mmq_experts` path (it needs the wider
+        // GEMM shape — the tiny ne=32 of `moe_ffn_graph_matches_host` only ever hits the small-m
+        // id-GEMV path); rows=1/4 stay on the small-m path. n_expert=4, world=2 → 2 experts/device.
+        let (ne, n_expert, n_used, nff) = (256usize, 4usize, 2usize, 256usize);
+        let scale = 1.3f32;
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5;
+        // Distinct per-expert router rows so top-k selection is unambiguous (the two devices must
+        // agree bit-for-bit on which experts each token routes to — the whole EP premise).
+        let router: Vec<f32> = (0..n_expert * ne)
+            .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+            .collect();
+        let gate: Vec<f32> = (0..n_expert * nff * ne).map(|i| f(i, 0.017)).collect();
+        let up: Vec<f32> = (0..n_expert * nff * ne).map(|i| f(i, 0.023)).collect();
+        let down: Vec<f32> = (0..n_expert * ne * nff).map(|i| f(i, 0.029)).collect();
+        let (rq, gq, uq, dq) = (q8_0(&router), q8_0(&gate), q8_0(&up), q8_0(&down));
+        let (rd, gd, ud, dd) = (deq_q8(&rq), deq_q8(&gq), deq_q8(&uq), deq_q8(&dq));
+        let dot = |w: &[f32], v: &[f32]| w.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+        let silu = |z: f32| z / (1.0 + (-z).exp());
+
+        // Run the tiny MoE through an ExpertParallelBackend over `devices` (world=1 = the identity
+        // reference; world=2 = the real expert split). Weights: gate/up/down SHARDED by expert
+        // across the ranks, router/x REPLICATED; the MoE `dst` is an internal `sub` (all-reduced),
+        // copied to the graph output. Returns the downloaded output.
+        let run_ep = |devices: &[usize], x: &[f32], rows: usize| -> Vec<f32> {
+            let world = devices.len();
+            let mut backends = Vec::with_capacity(world);
+            for &idx in devices {
+                backends.push(VulkanBackend::new_on(idx).expect("vulkan new_on"));
+            }
+            let ep = crate::ep::ExpertParallelBackend::new(backends, n_expert, true)
+                .expect("ep backend");
+            // Shard a stacked expert bank by expert across the ranks (contiguous per-expert slices).
+            let shard = |full: &[u8]| -> Box<dyn crate::Buffer> {
+                let stride = full.len() / n_expert;
+                let nl = n_expert / world;
+                let bufs: Vec<Box<dyn crate::Buffer>> = (0..world)
+                    .map(|r| {
+                        let slice = &full[r * nl * stride..(r + 1) * nl * stride];
+                        let b = ep
+                            .rank(r)
+                            .alloc_uninit(slice.len(), BufferUsage::Weights)
+                            .unwrap();
+                        ep.rank(r).upload(b.as_ref(), slice).unwrap();
+                        b
+                    })
+                    .collect();
+                crate::ep::EpBuffer::wrap(bufs)
+            };
+            // Replicate a buffer (same bytes on every rank) through the EP backend's alloc.
+            let repl = |bytes: &[u8], usage| {
+                let b = ep.alloc(bytes.len(), usage).unwrap();
+                ep.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+            let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q8_0));
+            let sub = g.internal(TensorDesc::new(vec![rows, ne], DType::F32));
+            let yi = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gi,
+                up_exps: ui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: sub,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale,
+                act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                ep_band: None, // set per-rank by the EP lowering
+            });
+            g.push(Op::Copy {
+                src: sub,
+                src_off: 0,
+                dst: yi,
+                dst_off: 0,
+                n: (rows * ne) as u32,
+            });
+            let xb = repl(bytemuck::cast_slice(x), BufferUsage::Activations);
+            let rb = repl(&rq, BufferUsage::Weights);
+            let gb = shard(&gq);
+            let ub = shard(&uq);
+            let db = shard(&dq);
+            let yb = ep.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+            let plan = ep.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            bind.bind(ri, rb.as_ref());
+            bind.bind(gi, gb.as_ref());
+            bind.bind(ui, ub.as_ref());
+            bind.bind(di, db.as_ref());
+            bind.bind(yi, yb.as_ref());
+            ep.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; rows * ne];
+            ep.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            got
+        };
+
+        for &rows in &[1usize, 4usize, 16usize] {
+            let x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) + 0.05).collect();
+            // Host reference (same as moe_ffn_graph_matches_host): full-expert weighted top-k sum.
+            let mut want = vec![0f32; rows * ne];
+            for t in 0..rows {
+                let xr = &x[t * ne..(t + 1) * ne];
+                let logits: Vec<f32> = (0..n_expert)
+                    .map(|e| dot(&rd[e * ne..(e + 1) * ne], xr))
+                    .collect();
+                let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+                let psum: f32 = probs.iter().sum();
+                probs.iter_mut().for_each(|p| *p /= psum);
+                let mut idx: Vec<usize> = (0..n_expert).collect();
+                idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                idx.truncate(n_used);
+                let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+                for &e in &idx {
+                    let gs = e * nff * ne;
+                    let ds = e * ne * nff;
+                    let actv: Vec<f32> = (0..nff)
+                        .map(|j| {
+                            let g = dot(&gd[gs + j * ne..gs + (j + 1) * ne], xr);
+                            let u = dot(&ud[gs + j * ne..gs + (j + 1) * ne], xr);
+                            silu(g) * u
+                        })
+                        .collect();
+                    let w_e = probs[e] / wsum * scale;
+                    for i in 0..ne {
+                        want[t * ne + i] += w_e * dot(&dd[ds + i * nff..ds + (i + 1) * nff], &actv);
+                    }
+                }
+            }
+
+            let got1 = run_ep(&[d0], &x, rows); // world=1: single-device (identity band, no reduce)
+            let got2 = run_ep(&[d0, d1], &x, rows); // world=2: real 2-device expert split
+                                                    // THE EP correctness bar: the 2-device expert split reproduces the single-device MoE
+                                                    // (same runner path; world=1 is the identity lowering). Holds for BOTH the small-m
+                                                    // id-GEMV path (rows=1/4) and the batched dp4a path (rows=16), so it validates the
+                                                    // per-band compute + `moe_ep_band_remap` local-id rewrite + the P2P/all-reduce combine
+                                                    // on both. Reduction-order tolerance (the cross-rank sum reassociates the weighted
+                                                    // accumulate).
+            for i in 0..rows * ne {
+                assert!(
+                    (got2[i] - got1[i]).abs() < 3e-3,
+                    "ep world=2 (expert split across two GPUs) diverged from world=1 (single-device) \
+                     rows={rows} at {i}: 2-dev {} vs 1-dev {} — the band remap / expert shard / \
+                     all-reduce is not reproducing the single-device weighted expert sum",
+                    got2[i],
+                    got1[i]
+                );
+            }
+            // For the small-m id-GEMV path (rows <= moe_small_m_threshold()) the underlying expert
+            // math is bit-accurate to the host reference too, so pin the ACTUAL values — not just
+            // self-consistency. (The batched dp4a path's Q8_0 gate/up carries its own quant slack vs
+            // this exact-arithmetic host reference — a property of that kernel, orthogonal to EP,
+            // which single-vs-single above already isolates; the batched EP correctness is the
+            // world-2-vs-world-1 identity asserted for all rows above.)
+            if rows <= 8 {
+                for i in 0..rows * ne {
+                    assert!(
+                        (got1[i] - want[i]).abs() < 3e-3,
+                        "ep small-m mismatch vs host rows={rows} at {i}: got {} want {}",
+                        got1[i],
+                        want[i]
+                    );
+                }
+            }
+            eprintln!(
+                "[ep-synth] rows={rows}: 2-device expert split matches single-device \
+                 (max |Δ| 2dev-vs-1dev={:.2e})",
+                (0..rows * ne)
+                    .map(|i| (got2[i] - got1[i]).abs())
+                    .fold(0f32, f32::max)
+            );
+        }
+        assert_ne!(
+            devs[0].name, devs[1].name,
+            "the two devices must be distinct physical GPUs"
+        );
     }
 
     /// diffusion-gemma's `MoeFfn` shape: a SEPARATE `router_x` (not `x`), a FUSED `gate_up_exps`
@@ -7245,6 +7509,7 @@ mod tests {
             gating: infr_core::graph::MoeGating::Softmax,
             norm_w: true,
             weight_before: false,
+            ep_band: None,
         });
         let mk = |bytes: &[u8], usage| {
             let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -7364,6 +7629,7 @@ mod tests {
                 gating: infr_core::graph::MoeGating::Sigmoid,
                 norm_w: false,
                 weight_before: true,
+                ep_band: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -7492,6 +7758,7 @@ mod tests {
                 gating: infr_core::graph::MoeGating::Sigmoid,
                 norm_w: false,
                 weight_before: true,
+                ep_band: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8206,6 +8473,7 @@ mod tests {
                 gating: infr_core::graph::MoeGating::Softmax,
                 norm_w: true,
                 weight_before: false,
+                ep_band: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8354,6 +8622,7 @@ mod tests {
                 gating: infr_core::graph::MoeGating::Softmax,
                 norm_w: true,
                 weight_before: false,
+                ep_band: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8489,6 +8758,7 @@ mod tests {
                 gating: infr_core::graph::MoeGating::Softmax,
                 norm_w: true,
                 weight_before: false,
+                ep_band: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8618,6 +8888,7 @@ mod tests {
                 gating: infr_core::graph::MoeGating::Softmax,
                 norm_w: true,
                 weight_before: false,
+                ep_band: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8751,6 +9022,7 @@ mod tests {
                 gating: infr_core::graph::MoeGating::Softmax,
                 norm_w: true,
                 weight_before: false,
+                ep_band: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();
@@ -8923,6 +9195,7 @@ mod tests {
                 gating: infr_core::graph::MoeGating::Softmax,
                 norm_w: true,
                 weight_before: false,
+                ep_band: None,
             });
             let mk = |bytes: &[u8], usage| {
                 let b = be_.alloc(bytes.len(), usage).unwrap();

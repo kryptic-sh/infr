@@ -3936,6 +3936,7 @@ impl MetalBackend {
                 gating,
                 norm_w,
                 weight_before,
+                ep_band: _, // EP is a Vulkan-only path; Metal always runs full-expert
             } => {
                 // The Metal MoE path implements only softmax gating + top-k renorm + output-
                 // weighting; llama4's sigmoid/no-renorm/weight-before-FFN routing is CPU-only (see

@@ -2486,6 +2486,10 @@ fn main() {
         // llama4 weight-before-FFN: in-place per-row scale of gate/up outputs by the routing
         // weight (see Op::MoeFfn's `weight_before`).
         ("moe_weight_scale", "moe_weight_scale", &[]),
+        // Expert-parallel (multi-GPU EP) band remap: rewrite router-selected GLOBAL expert ids into
+        // this rank's LOCAL expert-shard indices (out-of-band → id 0, weight 0). See Op::MoeFfn's
+        // `ep_band`.
+        ("moe_ep_band_remap", "moe_ep_band_remap", &[]),
         // Native-block prefill GEMMs: one .spv per quant format (coopmat tiled, no residual).
         ("native_gemm_warp", "native_gemm_warp_q4k", &["-DFMT_Q4K"]),
         ("native_gemm_warp", "native_gemm_warp_q6k", &["-DFMT_Q6K"]),

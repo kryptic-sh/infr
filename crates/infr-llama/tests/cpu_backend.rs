@@ -3184,3 +3184,80 @@ fn tensor_parallel_matches_single_device() {
         devs[1].name,
     );
 }
+
+// Expert parallelism (MoE): a 2-device EXPERT split must produce the SAME tokens as the single-device
+// MoE. The reference is the EP path itself on a SINGLE rank (`[d0]`, world=1): the band is the whole
+// expert set (the id remap is the identity, no all-reduce), the same runner path (host-embed + static
+// execute), so it exercises single-device expert compute. The two-rank run splits the stacked expert
+// banks across the devices (each holds ~half the experts), routes GLOBALLY on the replicated router,
+// computes only its band, and all-reduces the partial MoE outputs per layer. Ideally token-identical;
+// the cross-rank sum reassociates the per-expert weighted accumulate vs a single-device accumulate, so
+// a mismatch (if any) must stay at reduction-order tolerance — asserted as token-identity, which
+// greedy decode holds in practice. `INFR_MOE_SMALL_M=64` forces the id-indexed small-m expert path for
+// both the short prefill and decode so the run is deterministic and light. Run:
+//   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend \
+//     expert_parallel_matches_single_device -- --include-ignored --nocapture
+#[test]
+#[ignore = "requires TWO Vulkan GPUs + the Qwen3-30B-A3B MoE model: run with --include-ignored on a multi-GPU box"]
+fn expert_parallel_matches_single_device() {
+    let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    let devs = infr_vulkan::VulkanBackend::enumerate_devices().expect("enumerate devices");
+    if devs.len() < 2 {
+        eprintln!(
+            "skip: expert_parallel_matches_single_device needs >=2 Vulkan devices (found {})",
+            devs.len()
+        );
+        return;
+    }
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_NO_THINK", "1");
+    // Force the id-indexed small-m expert path for both prefill and decode (light + deterministic).
+    std::env::set_var("INFR_MOE_SMALL_M", "64");
+
+    let model = infr_llama::SeamModel::load(&path, None).expect("load");
+    let prompt = model
+        .render_chat("What is the capital of France? Reply with just the city name.")
+        .expect("render");
+    let enc = model.encode(&prompt).expect("encode");
+    let n = 16;
+    let d0 = devs[0].index;
+    let d1 = devs[1].index;
+
+    // Reference: the SAME EP runner path on ONE rank (whole-band identity, no shard, no all-reduce).
+    eprintln!("\n[ep] reference: single-rank [Vulkan{d0}]");
+    let ref_ids = model
+        .generate_ep_ids(&[d0], &enc, n, |_| {})
+        .expect("single-rank ep gen");
+
+    // Split the experts across BOTH devices, all-reduce the partial MoE output per layer.
+    eprintln!("[ep] 2-way expert split: [Vulkan{d0}, Vulkan{d1}]");
+    let split_ids = model
+        .generate_ep_ids(&[d0, d1], &enc, n, |_| {})
+        .expect("two-rank ep gen");
+
+    assert_eq!(
+        ref_ids, split_ids,
+        "expert-parallel output diverged from single-device beyond reduction-order tolerance — the \
+         expert shard / band remap / all-reduce is not summing the same weighted expert products"
+    );
+
+    // Coherent greedy output across the two-device expert shard.
+    let text = model.decode(&split_ids).expect("decode split ids");
+    eprintln!("[ep] split output: {text:?}");
+    assert!(
+        text.contains("Paris"),
+        "two-device expert-parallel output not coherent: {text:?}"
+    );
+    assert_ne!(
+        devs[0].name, devs[1].name,
+        "the two devices must be distinct physical GPUs"
+    );
+    eprintln!(
+        "[ep] PASS — {}-token 2-way EXPERT split across Vulkan{d0} ({}) + Vulkan{d1} ({}) matches \
+         single-device",
+        split_ids.len(),
+        devs[0].name,
+        devs[1].name,
+    );
+}

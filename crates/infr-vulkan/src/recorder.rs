@@ -6853,6 +6853,35 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Expert-parallel (multi-GPU EP) band remap: after the replicated router `moe_topk`, rewrite
+    /// this rank's copy of the GLOBAL top-k `ids` into LOCAL expert-shard indices for the band
+    /// `[lo, hi)` (`id-lo` in-band; `0` out-of-band) and zero the out-of-band `wts`, so THIS rank's
+    /// expert GEMVs/GEMMs compute only its owned experts and the weighted combine drops the rest.
+    /// `n = rows * n_used` packed (token, slot) assignments. Both buffers are read-modify-write. See
+    /// `moe_ep_band_remap.comp` and `Op::MoeFfn`'s `ep_band`.
+    pub fn moe_ep_band_remap(
+        &self,
+        ids: &dyn Buffer,
+        wts: &dyn Buffer,
+        n: usize,
+        lo: u32,
+        hi: u32,
+    ) {
+        let k = self.be.kernel(
+            "moe_ep_band_remap",
+            crate::gemm::moe_ep_band_remap_spv(),
+            2,
+            12,
+        );
+        let mut push = [0u8; 12];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&lo.to_ne_bytes());
+        push[8..12].copy_from_slice(&hi.to_ne_bytes());
+        // ids + wts are both read-modify-write — bind both in the WRITE slots (n_out = 2) so the
+        // downstream expert GEMVs get a RAW barrier against this rewrite.
+        self.dispatch(k, &[Self::vkb(ids), Self::vkb(wts)], 2, &push, n as u32);
+    }
+
     /// llama4 weight-before-FFN: in-place per-row scale `y[row*width+i] *= w[row]` — applied to the
     /// gate/up projection OUTPUT (before the activation), exact-equivalent to the CPU's
     /// input-side fold since gate/up are linear (see `Op::MoeFfn`'s `weight_before` doc and the

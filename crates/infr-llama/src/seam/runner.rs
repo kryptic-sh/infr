@@ -2304,6 +2304,7 @@ pub(crate) fn generate_dense_backend(
                         gating: mc.gating,
                         norm_w: mc.norm_w,
                         weight_before: mc.weight_before,
+                        ep_band: None, // set per-rank by ExpertParallelBackend's lowering
                     });
                     if let Some(MoeSharedW {
                         gate_inp,
@@ -2534,6 +2535,7 @@ pub(crate) fn generate_dense_backend(
                         gating: mc.gating,
                         norm_w: mc.norm_w,
                         weight_before: mc.weight_before,
+                        ep_band: None, // diffusion-gemma is not an EP arch (Vulkan single-device)
                     });
                     g.push(Op::RmsNorm {
                         x: moe_out,

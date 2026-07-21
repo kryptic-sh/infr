@@ -1529,6 +1529,7 @@ impl Backend for CpuBackend {
                     gating,
                     norm_w,
                     weight_before,
+                    ep_band: _, // EP is a Vulkan-only path; the CPU reference always runs full-expert
                 } => {
                     let (ne, n_expert, n_used, nffx) = (
                         ne as usize,

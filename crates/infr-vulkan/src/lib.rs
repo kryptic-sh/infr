@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 mod adapter;
+pub mod ep;
 mod gemm;
 pub mod linear;
 mod matmul;
@@ -23,6 +24,7 @@ pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
 
+pub use ep::{EpBuffer, ExpertParallelBackend};
 pub use p2p::{P2pExport, P2pHandleType};
 pub use pipeline::{PipelineBackend, PipelineBuffer};
 pub use recorder::{FlashStage, RecordedCmd, Recorder};

@@ -874,6 +874,33 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Multi-GPU EXPERT PARALLELISM (MoE): `INFR_EXPERT_PARALLEL=Vulkan0,Vulkan1` SPLITS the model's
+    // experts across the listed devices (rank r owns experts [r·E/W, (r+1)·E/W)); the router +
+    // attention run replicated on every rank, each computes only its band's experts, and one P2P
+    // all-reduce per MoE layer combines the partial expert outputs — a capacity split + parallel
+    // expert compute. One-shot, MoE models only; output equals single-device to reduction-order
+    // tolerance. Unset ⇒ the normal persistent-session chat below (byte-for-byte unchanged).
+    if let Some(devices) = infr_llama::seam::parse_expert_parallel_devices()? {
+        let Some(msg) = message else {
+            anyhow::bail!(
+                "INFR_EXPERT_PARALLEL runs one-shot: pass a message, e.g. \
+                 INFR_EXPERT_PARALLEL=Vulkan0,Vulkan1 infr run {model} \"your prompt\""
+            );
+        };
+        if is_dg
+            || std::env::var_os("INFR_CPU").is_some()
+            || std::env::var_os("INFR_METAL").is_some()
+        {
+            anyhow::bail!("INFR_EXPERT_PARALLEL is a Vulkan MoE path — not compatible with INFR_CPU / INFR_METAL / diffusion-gemma");
+        }
+        apply_model_sampling_defaults(&gguf);
+        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let rendered = loaded.render_chat(msg)?;
+        let out = loaded.generate_moe_vulkan_ep(&devices, &rendered, max_new)?;
+        println!("{out}");
+        return Ok(());
+    }
+
     // Build the per-backend generation primitive (`ChatModel`), then wrap it in the ONE shared `Chat`
     // (infr_llama::model) that owns history + `<think>`-stripping and drives the single REPL below:
     // INFR_CPU (dense/MoE/qwen35 on the agnostic compute graph, no Vulkan/VRAM), Vulkan/Metal GPU,

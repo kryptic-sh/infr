@@ -78,6 +78,7 @@ fn moe_layer_wall() {
             gating: infr_core::graph::MoeGating::Softmax,
             norm_w: true,
             weight_before: false,
+            ep_band: None,
         });
         cur = dst;
     }

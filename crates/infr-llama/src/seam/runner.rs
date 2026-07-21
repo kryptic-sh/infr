@@ -5,7 +5,9 @@
 use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
-use super::weights::{AttnW, DeltaW, FfnW, LayerW, MixerW, MoeSharedW, SeamKv, SeamWeights};
+use super::weights::{
+    AttnW, DeltaW, FfnW, LayerW, MixerW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
+};
 use super::{common_prefix_len, e2b_ipl_rows, kv_fmt_bytes, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
 use crate::{Config, GenStats, PerLayerEmbd};
@@ -62,6 +64,180 @@ pub(crate) fn fuse_qkv_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool
                 && c.layer_n_kv(l) == c.n_kv
                 && c.has_own_kv(l)
         })
+}
+
+/// Range-check externally-supplied token ids against the vocabulary BEFORE they index the
+/// embedding table (`tok as usize * n_embd`). An out-of-vocab id would otherwise slice the table
+/// out of bounds and panic; surface a clean error instead. Only caller-supplied ids (prompt,
+/// denoise canvas) can be arbitrary — generated ids are always sampling/grammar-bounded to
+/// `< vocab`, so the decode loop never needs this.
+fn validate_token_ids(ids: &[u32], vocab: usize) -> AResult<()> {
+    if let Some(&bad) = ids.iter().find(|&&t| t as usize >= vocab) {
+        return Err(anyhow!(
+            "token id {bad} out of range for vocab size {vocab}"
+        ));
+    }
+    Ok(())
+}
+
+/// Which prompt/generated tokens' KV rows are materialized (resident) after a generation turn —
+/// the token list recorded in `SeamKv::cached` for the next turn's prefix diff.
+///
+/// `cur` is the fed-token stream (`prompt` followed by the generated tokens; `cur[pos]` is the
+/// token fed at absolute sequence position `pos`). `last_written` is the highest position whose
+/// KV row was actually WRITTEN by a kept token this turn — `None` when nothing was fed (an empty
+/// prompt, or a `max_new == 0` single-token prompt whose only token is the un-fed frontier).
+///
+/// Excluded by construction: the final sampled token (pushed to `out` but never fed back, so its
+/// KV row does not exist), the `max_new == 0` frontier token (the decode loop breaks before
+/// feeding it), and any grammar-forced tokens queued past the frontier that a break left un-fed.
+/// Recording any of those would make the next turn's prefix reuse (`common_prefix_len == plen`,
+/// `start = plen`) attend a stale/zero KV row and corrupt the output. Kept identical to the old
+/// `prompt ++ out[..out.len()-1]` teardown on every run where that was already correct.
+fn resident_after_gen(cur: &[u32], last_written: Option<usize>) -> Vec<u32> {
+    match last_written {
+        Some(p) => cur[..(p + 1).min(cur.len())].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// Bind the per-layer IO + weights shared by EVERY decode/prefill/verify/denoise execution: the
+/// gemma4 `rope_freqs` Input (when present), each layer's K/V cache pair, and the flat weight list
+/// (declaration == upload order). Extracted so the four bind sites (denoise, verify, record-once,
+/// per-token) can never drift — a forgotten bind here (e.g. `rope_freqs`) is a live unbound-Input
+/// panic at execute. The caller still binds the per-site pieces (hidden/tok_ids, positions,
+/// logits, sampling/h-tap/ipl/SC handles).
+#[allow(clippy::type_complexity)]
+fn bind_layer_io<'a>(
+    b: &mut Bindings<'a>,
+    h: &DecodeHandles,
+    n_layer: usize,
+    rf_buf: &'a Option<(Box<dyn Buffer>, usize)>,
+    kbufs: &'a [Box<dyn Buffer>],
+    vbufs: &'a [Box<dyn Buffer>],
+    wbufs: &'a [Box<dyn Buffer>],
+) {
+    if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
+        b.bind(rid, rb.as_ref());
+    }
+    for l in 0..n_layer {
+        b.bind(h.k_cache[l], kbufs[l].as_ref());
+        b.bind(h.v_cache[l], vbufs[l].as_ref());
+    }
+    for (i, wid) in h.weights.iter().enumerate() {
+        b.bind(*wid, wbufs[i].as_ref());
+    }
+}
+
+/// Compute the [`SessionStable`] derivations — the per-layer tensor scans + real `load_tensor_dequant`s
+/// that are pure in `(backend caps, gguf, config, env)`. Run ONCE at cold session init (the result
+/// is stashed in `SeamKv` and reused via `Arc` on warm calls / forks) instead of every request.
+fn session_stable(be: &dyn Backend, g: &Gguf, c: &Config) -> AResult<SessionStable> {
+    // Per-layer presence of an explicit V projection. gemma4 full-attention layers omit it (V = the
+    // raw K projection); every layer of every other model has one.
+    let has_wv: Vec<bool> = (0..c.n_layer)
+        .map(|l| {
+            g.tensors()
+                .iter()
+                .any(|t| t.name == format!("blk.{l}.attn_v.weight"))
+        })
+        .collect();
+    // gemma4 per-layer output scale (`layer_output_scale.weight`, a single scalar multiplying the
+    // layer output before the next layer). Read host-side; applied as an `Op::Scale`. diffusion-
+    // gemma ships TWO per-layer scalars (encoder for the prompt, decoder for the canvas); Phase 1
+    // is the encoder-only causal prefill, so it reads `enc_layer_output_scale` — the decoder
+    // scalar is unused until the canvas denoise graph (Phase 2+).
+    let out_scale_name = if c.diffusion_gemma {
+        "enc_layer_output_scale"
+    } else {
+        "layer_output_scale"
+    };
+    let out_scale: Vec<Option<f32>> = (0..c.n_layer)
+        .map(|l| {
+            let name = format!("blk.{l}.{out_scale_name}.weight");
+            if g.tensors().iter().any(|t| t.name == name) {
+                crate::load_tensor_dequant(g, &name)
+                    .ok()
+                    .and_then(|(v, _)| v.first().copied())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // diffusion-gemma's DECODER per-layer scalar (`layer_output_scale`, the canvas-denoise twin
+    // of `out_scale`'s encoder-named array above) — read unconditionally alongside it (both are
+    // tiny [1]-tensors, negligible host cost) so the denoise graph (`build`'s `denoise` flag) can
+    // select it without re-deriving the name. `None`/empty for every non-diffusion-gemma model
+    // (never read there).
+    let dec_out_scale: Vec<Option<f32>> = (0..c.n_layer)
+        .map(|l| {
+            let name = format!("blk.{l}.layer_output_scale.weight");
+            if g.tensors().iter().any(|t| t.name == name) {
+                crate::load_tensor_dequant(g, &name)
+                    .ok()
+                    .and_then(|(v, _)| v.first().copied())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`): applied on
+    // full-attention layers only (SWA layers use plain RoPE). Bound as a per-step f32 Input.
+    let rope_freqs: Option<Vec<f32>> =
+        if c.gemma4 && g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
+            Some(crate::load_tensor_dequant(g, "rope_freqs.weight").map(|(v, _)| v)?)
+        } else {
+            None
+        };
+    // Combined gate+up FFN weights (one GEMV/GEMM + GatedActFused instead of two Linears +
+    // GatedAct — the bespoke path's fused-gu shape, ~1 dispatch/layer off the decode hot loop).
+    // Requires the backend to opt in (Vulkan; the CPU keeps zero-copy separate tensors) AND every
+    // dense layer's gate/up to share a dtype (the concat is one [2*nff, ne] tensor). The decision
+    // is global so the upload order and `build`'s handle declarations always agree. NOT gated on
+    // `c.moe.is_none()`: a pure MoE arch (qwen3moe) has no `ffn_gate.weight`/`ffn_up.weight` tensors
+    // at all, so the `.all()` below is false for it regardless; diffusion-gemma DOES carry both (its
+    // dense "shared expert" branch, separate from the MoE bank) and its dense n_ff=2112 out_f clears
+    // neither warp-tile gate on its own (%256 nor %128) so it fell to the slower mmq path — fused
+    // out_f=2*2112=4224 clears %128. See `FfnW::DiffusionMoe::fused_gu`.
+    let fuse_gu = fuse_gu_decision(be.capabilities().combined_gu, g, c);
+    // Combined QKV: one [qrow+2·kvrow, ne] weight → prefill runs ONE wide GEMM (the separate
+    // q/k/v GEMMs are narrow-n and underfill a big GPU — the pp512 sweep's dominant cost), and
+    // decode keeps three offset GEMVs into the same buffer (`Op::Linear.w_off`), so its dispatch
+    // count is unchanged. Needs every layer to own all three projections in ONE native-supported
+    // dtype (gemma4's V-less full layers keep the split form), uniform dims (the offsets are
+    // baked once), and a backend that opted into combined weights.
+    // NOTE: llama.cpp's Q4_K_M etc. bump attn_v to Q6_K on alternating layers, so mixed-precision
+    // GGUFs (e.g. Qwen3-8B Q4_K_M: v = 18×Q4K + 18×Q6K) fail the uniform-dtype gate and keep the
+    // split form. INFR_NO_QKV_FUSE forces the split form for A/B (default unset = fuse; the split
+    // form is bit-identical — same dots, same fixed-order sums).
+    let fuse_qkv = fuse_qkv_decision(be.capabilities().combined_gu, g, c);
+    // Batched-prefill eligibility for MoE: every layer's expert banks must have a dp4a-mmq kernel
+    // (`MOE_MMQ_DTYPES`) — see the decode_start call site's comment for the full rationale.
+    let moe_mmq_ok = |d: Option<DType>| d.is_some_and(infr_core::tensor::moe_mmq_ok);
+    let moe_batched_ok = c.moe.is_some() && {
+        let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
+        if c.dual_moe() {
+            (0..c.n_layer).all(|l| {
+                moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_up_exps.weight")))
+                    && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+            })
+        } else {
+            (0..c.n_layer).all(|l| {
+                moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_exps.weight")))
+                    && moe_mmq_ok(dt(format!("blk.{l}.ffn_up_exps.weight")))
+                    && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
+            })
+        }
+    };
+    Ok(SessionStable {
+        has_wv,
+        out_scale,
+        dec_out_scale,
+        rope_freqs,
+        fuse_gu,
+        fuse_qkv,
+        moe_batched_ok,
+    })
 }
 
 /// Handles into one freshly-built decode graph that the driver re-binds each step.
@@ -182,84 +358,23 @@ pub(crate) fn generate_dense_backend(
     let e2b = c.n_embd_per_layer > 0;
     let npl = c.n_embd_per_layer;
 
-    // Per-layer presence of an explicit V projection. gemma4 full-attention layers omit it (V = the
-    // raw K projection); every layer of every other model has one.
-    let has_wv: Vec<bool> = (0..c.n_layer)
-        .map(|l| {
-            g.tensors()
-                .iter()
-                .any(|t| t.name == format!("blk.{l}.attn_v.weight"))
-        })
-        .collect();
-    // gemma4 per-layer output scale (`layer_output_scale.weight`, a single scalar multiplying the
-    // layer output before the next layer). Read host-side; applied as an `Op::Scale`. diffusion-
-    // gemma ships TWO per-layer scalars (encoder for the prompt, decoder for the canvas); Phase 1
-    // is the encoder-only causal prefill, so it reads `enc_layer_output_scale` — the decoder
-    // scalar is unused until the canvas denoise graph (Phase 2+).
-    let out_scale_name = if c.diffusion_gemma {
-        "enc_layer_output_scale"
-    } else {
-        "layer_output_scale"
+    // Session-stable derivations (per-layer tensor scans + real dequants, all pure in
+    // `(caps, g, c, env)`): computed ONCE at cold init, stashed in `SeamKv`, and reused via `Arc`
+    // on every warm call / fork instead of re-running the O(n_layer × n_tensors) scans + the
+    // gemma4/diffusion `load_tensor_dequant`s per request. `has_wv`/`out_scale`/`dec_out_scale`/
+    // `rope_freqs`/`fuse_gu`/`fuse_qkv`/`moe_batched_ok` all live here — see `SessionStable`.
+    let stable: std::sync::Arc<SessionStable> = match state.as_ref() {
+        Some(kv) => std::sync::Arc::clone(&kv.stable),
+        None => std::sync::Arc::new(session_stable(be, g, c)?),
     };
-    let out_scale: Vec<Option<f32>> = (0..c.n_layer)
-        .map(|l| {
-            let name = format!("blk.{l}.{out_scale_name}.weight");
-            if g.tensors().iter().any(|t| t.name == name) {
-                crate::load_tensor_dequant(g, &name)
-                    .ok()
-                    .and_then(|(v, _)| v.first().copied())
-            } else {
-                None
-            }
-        })
-        .collect();
-    // diffusion-gemma's DECODER per-layer scalar (`layer_output_scale`, the canvas-denoise twin
-    // of `out_scale`'s encoder-named array above) — read unconditionally alongside it (both are
-    // tiny [1]-tensors, negligible host cost) so the denoise graph (`build`'s `denoise` flag) can
-    // select it without re-deriving the name. `None`/empty for every non-diffusion-gemma model
-    // (never read there).
-    let dec_out_scale: Vec<Option<f32>> = (0..c.n_layer)
-        .map(|l| {
-            let name = format!("blk.{l}.layer_output_scale.weight");
-            if g.tensors().iter().any(|t| t.name == name) {
-                crate::load_tensor_dequant(g, &name)
-                    .ok()
-                    .and_then(|(v, _)| v.first().copied())
-            } else {
-                None
-            }
-        })
-        .collect();
-    // gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`): applied on
-    // full-attention layers only (SWA layers use plain RoPE). Bound as a per-step f32 Input.
-    let rope_freqs: Option<Vec<f32>> =
-        if gemma4 && g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
-            Some(crate::load_tensor_dequant(g, "rope_freqs.weight").map(|(v, _)| v)?)
-        } else {
-            None
-        };
-    // Combined gate+up FFN weights (one GEMV/GEMM + GatedActFused instead of two Linears +
-    // GatedAct — the bespoke path's fused-gu shape, ~1 dispatch/layer off the decode hot loop).
-    // Requires the backend to opt in (Vulkan; the CPU keeps zero-copy separate tensors) AND every
-    // dense layer's gate/up to share a dtype (the concat is one [2*nff, ne] tensor). The decision
-    // is global so the upload order and `build`'s handle declarations always agree. NOT gated on
-    // `c.moe.is_none()`: a pure MoE arch (qwen3moe) has no `ffn_gate.weight`/`ffn_up.weight` tensors
-    // at all, so the `.all()` below is false for it regardless; diffusion-gemma DOES carry both (its
-    // dense "shared expert" branch, separate from the MoE bank) and its dense n_ff=2112 out_f clears
-    // neither warp-tile gate on its own (%256 nor %128) so it fell to the slower mmq path — fused
-    // out_f=2*2112=4224 clears %128. See `FfnW::DiffusionMoe::fused_gu`.
-    let fuse_gu = fuse_gu_decision(be.capabilities().combined_gu, g, c);
-    // Combined QKV: one [qrow+2·kvrow, ne] weight → prefill runs ONE wide GEMM (the separate
-    // q/k/v GEMMs are narrow-n and underfill a big GPU — the pp512 sweep's dominant cost), and
-    // decode keeps three offset GEMVs into the same buffer (`Op::Linear.w_off`), so its dispatch
-    // count is unchanged. Needs every layer to own all three projections in ONE native-supported
-    // dtype (gemma4's V-less full layers keep the split form), uniform dims (the offsets are
-    // baked once), and a backend that opted into combined weights.
-    // NOTE: llama.cpp's Q4_K_M etc. bump attn_v to Q6_K on alternating layers, so mixed-precision
-    // GGUFs (e.g. Qwen3-8B Q4_K_M: v = 18×Q4K + 18×Q6K) fail the uniform-dtype gate and keep the
-    // split form. INFR_NO_QKV_FUSE forces the split form for A/B (default unset = fuse; the split
-    // form is bit-identical — same dots, same fixed-order sums).
-    let fuse_qkv = fuse_qkv_decision(be.capabilities().combined_gu, g, c);
+    // Local views into the session-stable derivations (the code below reads these under their
+    // original names; `rope_freqs` is read directly as `stable.rope_freqs` at its two sites).
+    let has_wv = &stable.has_wv;
+    let out_scale = &stable.out_scale;
+    let dec_out_scale = &stable.dec_out_scale;
+    let fuse_gu = stable.fuse_gu;
+    let fuse_qkv = stable.fuse_qkv;
+    let moe_batched_ok = stable.moe_batched_ok;
 
     // qwen35 DeltaNet silu-gated RMSNorm fusion (decode op-fusion campaign): QkNorm's per-head
     // rmsnorm write is immediately read-after-write by the z-gate GatedAct — a real barrier on
@@ -736,7 +851,7 @@ pub(crate) fn generate_dense_backend(
         let pos_buf = be
             .alloc(4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
-        let rf_buf = match &rope_freqs {
+        let rf_buf = match &stable.rope_freqs {
             Some(rf) => {
                 let b = be
                     .alloc(rf.len() * 4, BufferUsage::Staging)
@@ -766,6 +881,7 @@ pub(crate) fn generate_dense_backend(
                 wspecs,
                 rf_buf,
             }),
+            stable: std::sync::Arc::clone(&stable),
             kbufs,
             vbufs,
             k_fmt,
@@ -788,6 +904,9 @@ pub(crate) fn generate_dense_backend(
     }
     let SeamKv {
         weights,
+        // The session-stable derivations are already read via the `stable` local above (cloned
+        // from this same Arc, or freshly computed on the cold path).
+        stable: _,
         kbufs,
         vbufs,
         k_fmt: _,
@@ -821,6 +940,17 @@ pub(crate) fn generate_dense_backend(
             prompt.len(),
             max_new
         ));
+    }
+    // Ordinary (non-denoise) generation needs a non-empty prompt (the `.min(prompt.len()-1)`
+    // prefix-diff below would underflow on empty, and there'd be nothing to sample the first
+    // token from), and every prompt id indexes the embedding table directly — range-check both
+    // once here so an out-of-vocab id is a clean error, not an OOB slice panic. Denoise carries
+    // no prompt (it validates its canvas separately below).
+    if denoise_req.is_none() {
+        if prompt.is_empty() {
+            return Err(anyhow!("empty prompt: nothing to generate from"));
+        }
+        validate_token_ids(prompt, c.vocab)?;
     }
     // Phase-2 DiffusionGemma denoise: capture the prompt length BEFORE the ordinary prefix-diff
     // logic below runs (a denoise call's `prompt`/`max_new` are empty/0 — see `DenoiseReq`'s
@@ -868,7 +998,10 @@ pub(crate) fn generate_dense_backend(
             0
         }
     } else {
-        common_prefix_len(cached, prompt).min(prompt.len() - 1)
+        // `saturating_sub(1)` guards the empty-prompt underflow defensively; the early guard
+        // above already rejects an empty non-denoise prompt, so for any real call this is the
+        // plain `prompt.len() - 1` (leave ≥1 prompt token to sample the first logits from).
+        common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1))
     };
     // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
     // positions older than `cached.len() - rows_l` were recycled by newer writes. Re-prefilling
@@ -2773,6 +2906,9 @@ pub(crate) fn generate_dense_backend(
         // the temp_inv premultiply on the gpu_sc path — while `exec` absorbs the SC math itself.
         let time_diffusion = std::env::var("INFR_DIFFUSION_TIME").is_ok();
         let canvas = req.canvas_tokens;
+        // Canvas ids index the embedding table (`tok * n_embd`) below — range-check once so an
+        // out-of-vocab id is a clean error, not an OOB slice panic.
+        validate_token_ids(canvas, c.vocab)?;
         let cc = canvas.len();
         let p = denoise_p;
         if p + cc > max_ctx {
@@ -3019,16 +3155,15 @@ pub(crate) fn generate_dense_backend(
         let mut db = Bindings::new();
         db.bind(dcache.dh.hidden, dcache.hidden_buf.as_ref());
         db.bind(dcache.dh.positions, dcache.pos_buf.as_ref());
-        if let (Some(rid), Some((rb, _))) = (dcache.dh.rope_freqs, &rf_buf) {
-            db.bind(rid, rb.as_ref());
-        }
-        for l in 0..c.n_layer {
-            db.bind(dcache.dh.k_cache[l], kbufs[l].as_ref());
-            db.bind(dcache.dh.v_cache[l], vbufs[l].as_ref());
-        }
-        for (i, wid) in dcache.dh.weights.iter().enumerate() {
-            db.bind(*wid, wbufs[i].as_ref());
-        }
+        bind_layer_io(
+            &mut db,
+            &dcache.dh,
+            c.n_layer,
+            rf_buf,
+            &kbufs[..],
+            &vbufs[..],
+            &wbufs[..],
+        );
         if plan_sc {
             if dyn_sc {
                 // Vulkan perf: the SC input is the OTHER ping slot (this call's write target is
@@ -3268,16 +3403,15 @@ pub(crate) fn generate_dense_backend(
         let mut vb = Bindings::new();
         vb.bind(vh.hidden, vf_hidden_buf.as_ref());
         vb.bind(vh.positions, vf_pos_buf.as_ref());
-        if let (Some(rid), Some((rb, _))) = (vh.rope_freqs, &rf_buf) {
-            vb.bind(rid, rb.as_ref());
-        }
-        for l in 0..c.n_layer {
-            vb.bind(vh.k_cache[l], kbufs[l].as_ref());
-            vb.bind(vh.v_cache[l], vbufs[l].as_ref());
-        }
-        for (i, wid) in vh.weights.iter().enumerate() {
-            vb.bind(*wid, wbufs[i].as_ref());
-        }
+        bind_layer_io(
+            &mut vb,
+            &vh,
+            c.n_layer,
+            rf_buf,
+            &kbufs[..],
+            &vbufs[..],
+            &wbufs[..],
+        );
         vb.bind(
             vh.logits.expect("verify build has logits"),
             vf_logits_buf.as_ref(),
@@ -3432,22 +3566,8 @@ pub(crate) fn generate_dense_backend(
     // chunk through the paged id-GEMV instead was measured SLOWER than per-token — 14.7 vs
     // 27.6 t/s pp512 — the giant uncoalesced multi-row GEMV loses more to cache-hostile weight
     // re-reads than it saves in readbacks.)
-    let moe_mmq_ok = |d: Option<DType>| d.is_some_and(infr_core::tensor::moe_mmq_ok);
-    let moe_batched_ok = c.moe.is_some() && {
-        let dt = |n: String| g.tensors().iter().find(|t| t.name == n).map(|t| t.dtype);
-        if c.dual_moe() {
-            (0..c.n_layer).all(|l| {
-                moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_up_exps.weight")))
-                    && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
-            })
-        } else {
-            (0..c.n_layer).all(|l| {
-                moe_mmq_ok(dt(format!("blk.{l}.ffn_gate_exps.weight")))
-                    && moe_mmq_ok(dt(format!("blk.{l}.ffn_up_exps.weight")))
-                    && moe_mmq_ok(dt(format!("blk.{l}.ffn_down_exps.weight")))
-            })
-        }
-    };
+    // `moe_batched_ok` (this `MOE_MMQ_DTYPES` eligibility scan) is a session-stable derivation —
+    // computed once in `session_stable` and read here off `stable`.
     let decode_start = if prompt.len() - start > 2 && (c.moe.is_none() || moe_batched_ok) {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
         // start..plen-1; rows 0..start are reused from the session cache) — in UBATCH CHUNKS.
@@ -3561,22 +3681,20 @@ pub(crate) fn generate_dense_backend(
                 }
             }
             pf_b.bind(pf_h.positions, pf_pos_buf.as_ref());
-            // gemma4's proportional-RoPE divisors are a graph input too — bind them (the per-token
-            // decode loop below does the same). Without this the batched graph has an unbound
-            // `rope_freqs` Input and panics.
-            if let (Some(rid), Some((rb, _))) = (pf_h.rope_freqs, &rf_buf) {
-                pf_b.bind(rid, rb.as_ref());
-            }
             if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &pf_ipl_buf) {
                 pf_b.bind(pid, ib.as_ref());
             }
-            for l in 0..c.n_layer {
-                pf_b.bind(pf_h.k_cache[l], kbufs[l].as_ref());
-                pf_b.bind(pf_h.v_cache[l], vbufs[l].as_ref());
-            }
-            for (i, wid) in pf_h.weights.iter().enumerate() {
-                pf_b.bind(*wid, wbufs[i].as_ref());
-            }
+            // gemma4's proportional-RoPE divisors + the K/V caches + the weights (`bind_layer_io`):
+            // without the `rope_freqs` bind the batched graph has a live unbound Input and panics.
+            bind_layer_io(
+                &mut pf_b,
+                &pf_h,
+                c.n_layer,
+                rf_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &wbufs[..],
+            );
             debug_assert!(
                 pf_h.logits.is_none(),
                 "headless prefill build has no logits"
@@ -3638,7 +3756,7 @@ pub(crate) fn generate_dense_backend(
         // skips building the then-unused replay plan). Keeps this gate a strict subset of the
         // adapter's eligibility.
         && !c.diffusion_gemma
-        && (qk_norm || rope_freqs.is_none())
+        && (qk_norm || stable.rope_freqs.is_none())
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
         // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16
         // prepass with a standalone WriteKv that has no dyn kernel) — EXCEPT coupled Q8_0
@@ -3675,19 +3793,18 @@ pub(crate) fn generate_dense_backend(
             }
         }
         b.bind(h.positions, pos_buf.as_ref());
-        if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
-            b.bind(rid, rb.as_ref());
-        }
         if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
             b.bind(pid, ib.as_ref());
         }
-        for l in 0..c.n_layer {
-            b.bind(h.k_cache[l], kbufs[l].as_ref());
-            b.bind(h.v_cache[l], vbufs[l].as_ref());
-        }
-        for (i, wid) in h.weights.iter().enumerate() {
-            b.bind(*wid, wbufs[i].as_ref());
-        }
+        bind_layer_io(
+            &mut b,
+            &h,
+            c.n_layer,
+            rf_buf,
+            &kbufs[..],
+            &vbufs[..],
+            &wbufs[..],
+        );
         b.bind(
             h.logits.expect("decode build has logits"),
             logits_buf.as_ref(),
@@ -3732,6 +3849,12 @@ pub(crate) fn generate_dense_backend(
         && std::env::var("INFR_NO_GPU_POS").is_err();
     let end = prompt.len() + max_new;
     let mut pos = decode_start;
+    // Highest absolute position whose KV row was actually WRITTEN by a kept token this call — the
+    // single source of truth for the teardown's `cached` (see `resident_after_gen`). Seeded to the
+    // last already-resident position: rows `0..decode_start` are live from the session-cache reuse
+    // (`start`) plus the batched prefill (which fills through `plen-2`), so the highest is
+    // `decode_start - 1` (`None` when nothing is resident yet). Bumped after every executed step.
+    let mut last_written: Option<usize> = decode_start.checked_sub(1);
     while pos < end {
         // `max_new == 0` (prefill-only: bench pp, session cache warming) must still FEED the
         // prompt: models without a batched-prefill path (MoE with non-Q4_K expert banks, E2B
@@ -3828,6 +3951,13 @@ pub(crate) fn generate_dense_backend(
                         }
                     }
                     decode_t += step_t0.elapsed();
+                    // The chain fed positions `pos..pos+fed-1` with kept tokens (`cur[pos]` then
+                    // each accepted sampled id); the final sampled id was pushed but never fed, so
+                    // its row isn't written — `pos + fed - 1` is the last materialized position.
+                    // Matches the old `prompt ++ out[..out.len()-1]` teardown on every chain case.
+                    if fed > 0 {
+                        last_written = Some(pos + fed - 1);
+                    }
                     if stop {
                         break;
                     }
@@ -3844,13 +3974,18 @@ pub(crate) fn generate_dense_backend(
             be.upload(dec_ids_buf.as_ref(), bytemuck::cast_slice(&[tok as i32]))
                 .map_err(|e| anyhow!("{e}"))?;
         } else {
-            // embed (gemma scales by √n_embd; qwen3/llama identity)
-            let emb: Vec<f32> = token_embd.get()[tok * ne..tok * ne + ne]
-                .iter()
-                .map(|&x| x * embed_scale)
-                .collect();
-            be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
-                .map_err(|e| anyhow!("{e}"))?;
+            // embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
+            // table slice is already the row to upload — hand it straight to the backend rather
+            // than allocating a throwaway `Vec<f32>` per token to copy it.
+            let row = &token_embd.get()[tok * ne..tok * ne + ne];
+            if embed_scale == 1.0 {
+                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else {
+                let emb: Vec<f32> = row.iter().map(|&x| x * embed_scale).collect();
+                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
         }
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;
@@ -3920,19 +4055,18 @@ pub(crate) fn generate_dense_backend(
                 }
             }
             b.bind(h.positions, pos_buf.as_ref());
-            if let (Some(rid), Some((rb, _))) = (h.rope_freqs, &rf_buf) {
-                b.bind(rid, rb.as_ref());
-            }
             if let (Some(pid), Some(ib)) = (h.pl_tok_in, &ipl_buf) {
                 b.bind(pid, ib.as_ref());
             }
-            for l in 0..c.n_layer {
-                b.bind(h.k_cache[l], kbufs[l].as_ref());
-                b.bind(h.v_cache[l], vbufs[l].as_ref());
-            }
-            for (i, wid) in h.weights.iter().enumerate() {
-                b.bind(*wid, wbufs[i].as_ref());
-            }
+            bind_layer_io(
+                &mut b,
+                &h,
+                c.n_layer,
+                rf_buf,
+                &kbufs[..],
+                &vbufs[..],
+                &wbufs[..],
+            );
             b.bind(
                 h.logits.expect("decode build has logits"),
                 logits_buf.as_ref(),
@@ -3951,6 +4085,12 @@ pub(crate) fn generate_dense_backend(
             be.execute(plan.as_ref(), &b).map_err(|e| anyhow!("{e}"))?;
             exec_el = t_exec.elapsed();
         }
+        // This step wrote `cur[pos]`'s KV row (a prompt token, a fed generated token, or a fed
+        // grammar-forced token — all kept). The final sampled token and any forced tokens queued
+        // past the frontier are pushed AFTER this and never re-enter the loop, so they stay
+        // excluded from `last_written` — the fix for the `max_new==0` frontier and the
+        // constrained-break unfed-forced-token cache-corruption cases.
+        last_written = Some(pos);
         if std::env::var("INFR_PROF_DEC").is_ok() && pos + 1 >= prompt.len() {
             dec_setup += setup_el;
             dec_exec += exec_el;
@@ -4082,15 +4222,14 @@ pub(crate) fn generate_dense_backend(
             dec_exec.as_secs_f64() * 1e3 / decode_n as f64,
         );
     }
-    // Record what the KV cache now holds for the next turn's prefix diff. `out` includes any
-    // sampled EOS (its KV row was written before the loop broke)... it was PUSHED to out before
-    // the break, and its KV is written only when fed back — the EOS is never fed, so the cache
-    // holds prompt + generated-minus-last-fed. Conservative: cache prompt + all fed tokens; the
-    // final sampled token's row is NOT materialized, so exclude it.
-    *cached = prompt.to_vec();
-    if !out.is_empty() {
-        cached.extend_from_slice(&out[..out.len() - 1]);
-    }
+    // Record what the KV cache now holds for the next turn's prefix diff, straight from the
+    // per-step `last_written` bookkeeping (`resident_after_gen`): exactly the tokens whose KV rows
+    // were actually written by a kept token. This excludes the final sampled token (pushed to
+    // `out` but never fed back), the `max_new == 0` un-fed frontier (the loop breaks before
+    // feeding it — recording it corrupted the next "session cache warming" turn), and any
+    // grammar-forced tokens queued past the frontier that a break left un-fed. On every run where
+    // the old `prompt ++ out[..out.len()-1]` was already correct this is byte-identical to it.
+    *cached = resident_after_gen(&cur, last_written);
     let stats = GenStats {
         // The tokens actually PREFILLED this call (the un-cached suffix) — the TTFT-honest count.
         n_prompt: prompt.len() - start,
@@ -4099,4 +4238,93 @@ pub(crate) fn generate_dense_backend(
         decode_secs: decode_t.as_secs_f64(),
     };
     Ok((out, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resident_after_gen, validate_token_ids};
+
+    // ── resident_after_gen: which tokens' KV rows are recorded as materialized ────────────────
+    //
+    // The runner tracks `last_written` = the highest position whose KV row was actually written
+    // by a kept token. These tests pin the slicing decision for the scenarios the audit flagged.
+
+    #[test]
+    fn resident_max_new_zero_excludes_unfed_frontier() {
+        // max_new == 0: every prompt token is fed EXCEPT the frontier (pos = plen-1), whose KV
+        // row is never written (the loop breaks before feeding it). cur == prompt; the last
+        // written position is plen-2. Must record prompt[..plen-1], NOT the full prompt (the old
+        // `*cached = prompt.to_vec()` bug that corrupted the next session-cache-warming turn).
+        let prompt = [10u32, 11, 12, 13];
+        let plen = prompt.len();
+        let cached = resident_after_gen(&prompt, Some(plen - 2));
+        assert_eq!(cached, &prompt[..plen - 1]);
+    }
+
+    #[test]
+    fn resident_single_token_prompt_max_new_zero_is_empty() {
+        // A 1-token prompt with max_new == 0: the sole token is the un-fed frontier, nothing is
+        // written this call. `last_written` is None → empty (prompt[..0]).
+        let prompt = [42u32];
+        assert!(resident_after_gen(&prompt, None).is_empty());
+    }
+
+    #[test]
+    fn resident_normal_gen_excludes_last_sampled() {
+        // A normal decode: the last sampled token is pushed to `out` but never fed, so
+        // cur == prompt ++ out[..out.len()-1] and last_written == cur.len()-1. Result must equal
+        // the old `prompt ++ out[..out.len()-1]` exactly (no behavior change on correct runs).
+        let prompt = [1u32, 2, 3];
+        let out = [4u32, 5, 6]; // 6 is the final sampled token, never fed back
+        let mut cur = prompt.to_vec();
+        cur.extend_from_slice(&out[..out.len() - 1]);
+        let last = cur.len() - 1;
+        let cached = resident_after_gen(&cur, Some(last));
+        let mut expect = prompt.to_vec();
+        expect.extend_from_slice(&out[..out.len() - 1]);
+        assert_eq!(cached, expect);
+    }
+
+    #[test]
+    fn resident_constrained_break_excludes_unfed_forced() {
+        // A grammar-forced span emitted several tokens at the frontier then broke; none were fed
+        // (their KV rows don't exist). cur == prompt ++ prev_fed ++ forced, but last_written
+        // points at the frontier (the last fed token), so the forced tokens are excluded.
+        let prompt = [1u32, 2];
+        let prev_fed = [7u32]; // an earlier accepted+fed generated token
+        let forced = [20u32, 21, 22]; // pushed to cur+out at the frontier, then break — never fed
+        let mut cur = prompt.to_vec();
+        cur.extend_from_slice(&prev_fed);
+        let last = cur.len() - 1; // frontier = last fed token's position
+        cur.extend_from_slice(&forced);
+        let cached = resident_after_gen(&cur, Some(last));
+        let mut expect = prompt.to_vec();
+        expect.extend_from_slice(&prev_fed);
+        assert_eq!(cached, expect);
+    }
+
+    #[test]
+    fn resident_clamps_to_cur_len() {
+        // Defensive: an over-large `last_written` never slices past `cur`.
+        assert_eq!(resident_after_gen(&[1, 2, 3], Some(99)), vec![1, 2, 3]);
+    }
+
+    // ── validate_token_ids: OOB embedding-table slicing → clean error, not a panic ────────────
+
+    #[test]
+    fn validate_token_ids_accepts_in_range() {
+        assert!(validate_token_ids(&[0, 1, 2, 99], 100).is_ok());
+        assert!(validate_token_ids(&[], 100).is_ok());
+    }
+
+    #[test]
+    fn validate_token_ids_rejects_out_of_vocab() {
+        let err = validate_token_ids(&[0, 1, 100], 100).unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn validate_token_ids_rejects_far_out_of_vocab() {
+        assert!(validate_token_ids(&[u32::MAX], 100).is_err());
+    }
 }

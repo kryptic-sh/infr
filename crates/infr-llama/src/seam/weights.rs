@@ -137,10 +137,33 @@ pub(super) struct LayerW {
     pub(super) pl_post_norm: Option<TensorId>,
 }
 
+/// Session-stable derivations that are pure in `(backend caps, gguf, config, env)` and therefore
+/// identical on every (warm) call for a given session — computed ONCE at cold init and reused
+/// (via `Arc`) on warm calls and forks instead of re-running the per-layer tensor scans / real
+/// `load_tensor_dequant`s every request. See `runner::session_stable`.
+pub(crate) struct SessionStable {
+    /// Per-layer presence of an explicit V projection (gemma4 full-attention layers omit it).
+    pub(super) has_wv: Vec<bool>,
+    /// gemma4 per-layer output scalar (`layer_output_scale` / `enc_layer_output_scale`), dequanted.
+    pub(super) out_scale: Vec<Option<f32>>,
+    /// diffusion-gemma DECODER per-layer output scalar (`layer_output_scale`), dequanted.
+    pub(super) dec_out_scale: Vec<Option<f32>>,
+    /// gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`), dequanted.
+    pub(super) rope_freqs: Option<Vec<f32>>,
+    /// Combined gate+up FFN upload decision.
+    pub(super) fuse_gu: bool,
+    /// Combined QKV upload decision.
+    pub(super) fuse_qkv: bool,
+    /// Whether the MoE expert banks all have a dp4a-mmq kernel (batched-prefill eligibility).
+    pub(super) moe_batched_ok: bool,
+}
+
 pub(crate) struct SeamKv {
     /// The uploaded weights, SHARED across slots (Arc): forking a new conversation slot costs
     /// only its KV + IO buffers, never a re-upload.
     pub(super) weights: std::sync::Arc<SeamWeights>,
+    /// Session-stable pure derivations (see [`SessionStable`]) — shared across warm calls + forks.
+    pub(super) stable: std::sync::Arc<SessionStable>,
     pub(super) kbufs: Vec<Box<dyn Buffer>>,
     pub(super) vbufs: Vec<Box<dyn Buffer>>,
     /// KV cache element dtypes, chosen per-side (K and V independent). Fork/seed reuse them so a
@@ -371,6 +394,7 @@ impl SeamKv {
         }
         Ok(SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
+            stable: std::sync::Arc::clone(&self.stable),
             kbufs,
             vbufs,
             k_fmt: self.k_fmt,

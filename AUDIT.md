@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **116** — 0 🔴, 20 🟠, 96 🟡.
+- **Remaining open:** **109** — 0 🔴, 18 🟠, 91 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -108,23 +108,37 @@ parked path).
   `with_prof2_suppressed` / a `ChatModel::render` default / one
   `should_use_mtp(cfg)` de-duplicate the four backends (fixing the `wants_mtp`
   drift).
+- **`infr-llama` seam/runner (all 7 findings)** — TDD, +9 tests. A new
+  `last_written` tracker (the highest KV-written sequence position) + a pure
+  `resident_after_gen` helper make the prefix cache record **exactly** the
+  tokens whose KV rows exist: the `max_new==0` frontier and any unfed
+  grammar-forced tokens are now excluded (were cached as resident → stale-KV
+  corruption next turn), while a normal run reproduces the old
+  `prompt ++ out[..len-1]` result (byte-identical, no logits/golden path
+  touched). Empty non-denoise prompt errors instead of underflow-panicking;
+  prompt/canvas token ids are validated `< vocab` (`validate_token_ids`);
+  session-stable derivations are cached on `SeamKv` (`SessionStable`) instead of
+  recomputed per warm call; host-embed skips the per-token `Vec` when
+  `embed_scale==1`; `bind_layer_io` de-duplicates all 5 KV+ weight bind sites.
+  _Deferred:_ the `build` 11-positional-bool param-soup (a call-site-wide
+  refactor with a transposed-arg risk, zero correctness gain).
 
 ### Highest-priority (production default paths)
 
-| #      | Sev | Location                              | Issue                                                                                                                            |
-| ------ | --- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                             |
-| ~~2~~  | ✅  | `infr-llama chat/mod.rs`              | ~~Generate error orphans the user turn~~ — **FIXED** (`Err` arm pops the user turn).                                             |
-| ~~3~~  | ✅  | `infr-server lib.rs`                  | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                                      |
-| ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                                       |
-| 5      | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV. |
-| 6      | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx.      |
-| 7      | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                              |
-| ~~8~~  | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                                               |
-| 9      | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                        |
-| ~~10~~ | ✅  | `infr-gguf lib.rs`                    | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).                             |
-| ~~11~~ | ✅  | `infr-cli main.rs`                    | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).                              |
-| 12     | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).                   |
+| #      | Sev | Location                              | Issue                                                                                                                       |
+| ------ | --- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| ~~1~~  | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                        |
+| ~~2~~  | ✅  | `infr-llama chat/mod.rs`              | ~~Generate error orphans the user turn~~ — **FIXED** (`Err` arm pops the user turn).                                        |
+| ~~3~~  | ✅  | `infr-server lib.rs`                  | ~~Streaming swallows errors as `stop`~~ — **FIXED** (error frame + panic-safe `DoneGuard`).                                 |
+| ~~4~~  | ✅  | `infr-server lib.rs`                  | ~~No per-request cancellation~~ — **FIXED** (cancel latch → `req.abort()` frees the slot).                                  |
+| ~~5~~  | ✅  | `infr-llama runner.rs`                | ~~Prefix-cache records unmaterialized KV rows~~ — **FIXED** (`last_written` tracker + `resident_after_gen`).                |
+| 6      | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx. |
+| 7      | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                         |
+| ~~8~~  | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                                          |
+| 9      | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                   |
+| ~~10~~ | ✅  | `infr-gguf lib.rs`                    | ~~Corrupt GGUF `pos+n` overflow panic~~ — **FIXED** (`checked_add`/`checked_mul` → `Error::Loader`).                        |
+| ~~11~~ | ✅  | `infr-cli main.rs`                    | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).                         |
+| 12     | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).              |
 
 Other 🟠 majors span host-hot-path churn (recorder per-dispatch `env::var` +
 `Vec` allocs; adapter MoE `counts` double-zero), prefill perf (`gemm_proj`
@@ -586,53 +600,6 @@ weighted highest._
    embarrassingly-parallel `fill[]=0` reset into the 1-lane scan kernel, forcing
    the scatter pass to wait on the scan for a zero it doesn't depend on — split
    the reset out (parallel clear / `vkCmdFillBuffer`).
-
-## infr-llama/src/seam/runner.rs
-
-1. **🟠
-   `runner.rs:3743,4084 — `max_new==0`records the un-materialized frontier token in`cached`.**
-   The loop breaks once `pos+1>=prompt.len()`, so the frontier `pos=plen-1`'s KV
-   row is never written (comment 3740-3742 confirms "frontier stays un-fed"),
-   yet teardown does `*cached=prompt.to_vec()` (full prompt). The named "session
-   cache warming" case (3736): next turn computes `common_prefix_len==plen`,
-   sets `start=plen`, and attention over position `plen-1` reads an
-   unwritten/stale KV row → corrupt output. _Fix:_ at `max_new==0` record
-   `cached=prompt[..plen-1]`.
-2. **🟠
-   `runner.rs:3989,4086 — grammar-forced tokens pushed to `out`/`cur`then`break`
-   are cached but their KV never written.** The constrained branch pushes each
-   `step` token _before_ the stop check (plain path pushes _after_); KV is
-   written lazily only when a token is later fed as `cur[pos]`. On an immediate
-   break the just-pushed tokens are unfed, but teardown caches `out[..len-1]`
-   including them → next-turn prefix reuse (serve tool-calling, multi-turn)
-   attends stale/zero KV. _Fix:_ advance `cached` only by tokens whose KV was
-   actually fed.
-3. **🟡 `runner.rs:871 — `prompt.len()-1` underflows on an empty prompt** (debug
-   panic / release wrap masked by `.min`). _Fix:_ `saturating_sub(1)` / early
-   error.
-4. **🟡 `runner.rs:187-262,3436 — session-stable derivations recomputed every
-   warm call** (before the `if state.is_none()` gate): `has_wv` per-layer tensor
-   scans, `out_scale`/`dec_out_scale` per-layer `load_tensor_dequant` (real
-   dequant for gemma4/diffusion), `rope_freqs` dequant,
-   `fuse_*_decision`/`moe_batched_ok` O(n*layer×n_tensors) `find`+`format!` —
-   all pure in `(g,cfg,caps)` yet repeated per serve request. \_Fix:* compute
-   once, stash in `SeamKv`.
-5. **🟡
-   `runner.rs:3848 — host-embed decode allocs a throwaway `Vec<f32>`per token even when`embed_scale==1.0`**
-   (qwen3/llama): `.map(|x| x*scale).collect()` copies an already-f32 table
-   slice. _Fix:_ upload the slice directly when scale==1.
-6. **🟡 `runner.rs:3025,3274,3684,3929 — KV+weights bind loop duplicated 4×**
-   (denoise/verify/record-once/per-token); a forgotten bind (e.g. `rope_freqs`,
-   per the 3564 warning) is a live unbound-Input panic. Also `build`'s 11
-   positional bool/Option params let a transposed pair type-check, and the
-   `denoise` doc (911) "Never true for any caller" is contradicted by the
-   denoise site passing `true` (2948). _Fix:_ `bind_layer_io` helper + options
-   struct + fix the stale doc.
-7. **🟡
-   `runner.rs:2845,3203,3506,3845 — prompt/canvas token ids not range-checked before `tok
-   as usize \* ne` embedding-table slicing** → OOB slice panic on an
-   out-of-vocab id instead of a handled error. _Fix:_ validate `tok < vocab`
-   once.
 
 ## infr-llama/src/seam/mod.rs
 

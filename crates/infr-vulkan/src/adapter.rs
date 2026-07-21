@@ -720,8 +720,10 @@ fn mmv_mw_choice(
     // the shipped {4,8} policy set for Q6_K/Q2_K/Q3_K, only reachable via INFR_MMV_MW_WARPS.
     let have_spv = if unified_mmv_row1(caps) {
         // Same (o4, m4=true, res=false) probe the rows=1 dispatch resolves — see
-        // `Recorder::linear_mmv_mrow`'s variant selection (decode is always m4, and every dtype
-        // with a plain build has the o4/res twins too).
+        // `Recorder::linear_mmv_mrow`'s variant selection (decode is always m4). This probes the
+        // NON-residual build only; the o4/m4 twins exist for every plain-build dtype, but the `_res`
+        // twin does NOT (Iq4Xs has none — see `native_mmv_mrow_res_supported`), so a residual decode
+        // must consult that predicate, not assume a plain build implies a res build.
         crate::gemm::native_mmv_mrow_variant_kernel_name(dt, in_f < 2048, true, false).is_some()
     } else {
         matches!(warps, 1 | 2 | 4 | 8 | 16)

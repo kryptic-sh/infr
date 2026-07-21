@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **71** — 0 🔴, 11 🟠, 60 🟡. (1 🟠 — `make_compute_kernel`
+- **Remaining open:** **64** — 0 🔴, 10 🟠, 54 🟡. (1 🟠 — `make_compute_kernel`
   OOM→Result — is explicitly **deferred**, not open work; see the ops.rs
   section.)
 
@@ -198,6 +198,19 @@ parked path).
   `expert_bytes`/`pager_stats_enabled`/`stats_suffix` de-duplicate the two
   sessions. #2 (make_compute_kernel OOM→Result) deferred — 155 call sites across
   127 `()`-returning fns; panic messages improved instead.
+- **`infr-vulkan` gemm + matmul + linear (all 7 findings)** — TDD, +4 tests,
+  **gpu_seam byte-identity verified** (GEMV row1/mrow/mw, MoE id-gemv
+  real-dims + new-formats all match host). Every `*_kernel_name` gate now
+  DELEGATES to its `*_build_spv`/`*_spv` source (id/idm/mmv/mw/mrow/embed) so a
+  name and its shader can't drift into a mid-inference panic — each table was
+  diffed identical before delegating and a drift-guard test asserts equality
+  across all dtypes; `Iq4Xs` gets an explicit `native_mmv_mrow_res_supported`
+  predicate (no phantom residual panic) + the false adapter comment fixed;
+  `matmul_f32` is `#[doc(hidden)]` with the per-call `println!` gone and shape
+  math overflow-checked; push constants use `to_le_bytes` (matching the shader
+  contract); the no-op `v!` macro and the re-inlined `spv_words` are removed;
+  `moe_expert_floor_covers_dense_set` derives from `native_dense_dtypes()` (+ an
+  exhaustive-`DType` guard).
 
 ### Highest-priority (production default paths)
 
@@ -233,9 +246,9 @@ detail per module below.
 - **`assert!`/`.expect()`/`panic!` on recoverable input** (unregistered pager
   buffers, `GpuPager::new`, `Op::Copy` src_off, `make_compute_kernel` OOM, GGUF
   parse, `Op::Sample` `top_k==0`) — should return `Err`.
-- **Name-table vs SPV-table drift guarded only at runtime by `.expect()`**
-  across `gemm.rs`/`linear.rs` and Metal `exec.rs` — a missing dtype =
-  mid-inference panic.
+- **Name-table vs SPV-table drift guarded only at runtime by `.expect()`** —
+  FIXED in vulkan `gemm.rs`/`linear.rs` (name gates now delegate to the SPV
+  source); still open in Metal `exec.rs`.
 - **Per-render / per-warm-call recomputation** (jinja env rebuild,
   session-stable seam derivations, capabilities clone, GGUF re-parse ×5 in the
   CLI).
@@ -254,50 +267,6 @@ _6 of 7 findings fixed (see Resolved log); the one below is **DEFERRED**._
    disproportionate to a rare OOM path. Interim: the panic messages now name the
    kernel + flag it as a recoverable alloc failure. A full `Result`-ification of
    the recorder dispatch surface is its own focused effort.
-
-## infr-vulkan/src/gemm.rs + matmul.rs + linear.rs
-
-1. **🟠 `linear.rs:32` vs `gemm.rs:396` (and mmv/idm/embed pairs) — kernel-NAME
-   gate and SPIR-V loader are hand-duplicated tables, often in different files,
-   reconciled only at runtime via `.expect()`.** Recorder gates on
-   `linear::native_id_kernel_name(dt).is_some()` (`recorder.rs:6816`) but loads
-   via `gemm::native_id_build_spv(dt).expect(…)` (`8076`). Same for
-   `native_idm_*`, `native_mmv*`, `embed_gather`. A dtype added to the name
-   table but not the spv twin (or paged twin) turns a decode into a
-   **mid-inference panic** instead of a compile error; only id/idm have a
-   partial drift test (and it checks names, not spv). _Fix:_ make
-   `*_kernel_name` delegate to `*_build_spv().map(|(n,_)|n)`, or generate both
-   from one dtype→literal table.
-2. **🟡 `gemm.rs:645` vs `819-908` — `Iq4Xs` is advertised int8-mrow-eligible
-   (`native_mmv_mrow_kernel_name(Iq4Xs)=Some`) but has no `_res` variant arm**,
-   so `linear_mmv_mrow_at(…,res).expect()` (`recorder.rs:2946`) would panic on a
-   residual Iq4Xs decode. Unreachable only because `mmv_int8_decode_dtypes`
-   excludes Iq4Xs; the adapter comment (`723`) "every dtype with a plain build
-   has the o4/res twins" is false for Iq4Xs. _Fix:_ build the `_res` variants or
-   make the res-legality predicate explicit + fix the comment.
-3. **🟡 `matmul.rs:292` — `pub fn matmul_f32` unconditionally `println!`s
-   per-call timing and rebuilds all Vulkan objects (shader/layout/pipeline/pool)
-   every call** (none cached, unlike `kernel_sg`). Any repeat caller eats full
-   pipeline creation + pollutes stdout. _Fix:_ gate the print behind a
-   flag/delete; cache the pipeline or mark `#[doc(hidden)]` one-shot.
-4. **🟡 `matmul.rs:169,287,57` — unchecked `usize` products (`m*n*4`, `m*k`,
-   `k*n`) + `usize→u32` workgroup truncation in a `pub` GPU entry.** A
-   large-but- plausible shape wraps silently (undersized alloc → OOB dispatch /
-   truncated grid → wrong result). _Fix:_ `checked_mul`→`Err`, or document the
-   ceiling.
-5. **🟡 `matmul.rs:216`, `gemm.rs` `run_gemm` — push constants use `to_ne_bytes`
-   while the comment promises "little-endian u32".** Latent (correct on LE
-   targets only). _Fix:_ `to_le_bytes()` to match the GPU-side contract.
-6. **🟡 `gemm.rs` (25 sites) — no-op `macro_rules! v { ($n:literal)=>{{$n}} }`
-   wraps string literals in the name-only tables**, pure indirection existing
-   only to make them resemble the spv tables. _Fix:_ return the literals
-   directly. (`matmul.rs:24` similarly re-inlines `gemm::spv_words`'s byte→word
-   decode — reuse the shared helper.)
-7. **🟡 `linear.rs:413` — `moe_expert_floor_covers_dense_set` iterates a
-   hand-written dtype list**, so a dtype added to `native_dense_supported` but
-   not the list escapes the drift guard (the sibling test correctly derives from
-   `MOE_MMQ_DTYPES`). _Fix:_ derive from `native_dense_supported`/canonical
-   enum.
 
 ## infr-vulkan/src/{tp,tp_allreduce,tp_sem,pipeline,ep,p2p}.rs (gated multi-GPU)
 

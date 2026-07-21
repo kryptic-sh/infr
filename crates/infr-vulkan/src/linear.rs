@@ -30,73 +30,18 @@ use super::VulkanBackend;
 /// bytes into the arena, so both float variants exist.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_id_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
-    use infr_core::DType::*;
-    Some(match dtype {
-        Q8_0 => "native_id_q8_0",
-        Q4_0 => "native_id_q4_0",
-        Q4_1 => "native_id_q4_1",
-        Q5_0 => "native_id_q5_0",
-        Q5_1 => "native_id_q5_1",
-        Q2K => "native_id_q2k",
-        Q3K => "native_id_q3k",
-        Q4K => "native_id_q4k",
-        Q5K => "native_id_q5k",
-        Q6K => "native_id_q6k",
-        Iq4Nl => "native_id_iq4nl",
-        Iq4Xs => "native_id_iq4xs",
-        Mxfp4 => "native_id_mxfp4",
-        Nvfp4 => "native_id_nvfp4",
-        Tq1_0 => "native_id_tq1_0",
-        Tq2_0 => "native_id_tq2_0",
-        Q2_0 => "native_id_q2_0",
-        Iq2Xxs => "native_id_iq2xxs",
-        Iq2Xs => "native_id_iq2xs",
-        Iq2S => "native_id_iq2s",
-        Iq3Xxs => "native_id_iq3xxs",
-        Iq3S => "native_id_iq3s",
-        Iq1S => "native_id_iq1s",
-        Iq1M => "native_id_iq1m",
-        Bf16 => "native_id_bf16",
-        F16 => "native_id_f16",
-        F32 => "native_id_f32",
-        _ => return None,
-    })
+    // Delegate to the SPIR-V source of truth so the recorder's `is_some()` gate and its
+    // `native_id_build_spv().expect()` load can never disagree — a name-table-only dtype used to be
+    // a mid-inference panic (see AUDIT #1). The name is `build_spv`'s first tuple field.
+    crate::gemm::native_id_build_spv(dtype).map(|(name, _)| name)
 }
 
 /// Kernel cache name for the multi-slot id-indexed native GEMV; `None` for formats without it.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_idm_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
-    use infr_core::DType::*;
-    Some(match dtype {
-        Q8_0 => "native_idm_q8_0",
-        Q4_0 => "native_idm_q4_0",
-        Q4_1 => "native_idm_q4_1",
-        Q5_0 => "native_idm_q5_0",
-        Q5_1 => "native_idm_q5_1",
-        Q2K => "native_idm_q2k",
-        Q3K => "native_idm_q3k",
-        Q4K => "native_idm_q4k",
-        Q5K => "native_idm_q5k",
-        Q6K => "native_idm_q6k",
-        Iq4Nl => "native_idm_iq4nl",
-        Iq4Xs => "native_idm_iq4xs",
-        Mxfp4 => "native_idm_mxfp4",
-        Nvfp4 => "native_idm_nvfp4",
-        Tq1_0 => "native_idm_tq1_0",
-        Tq2_0 => "native_idm_tq2_0",
-        Q2_0 => "native_idm_q2_0",
-        Iq2Xxs => "native_idm_iq2xxs",
-        Iq2Xs => "native_idm_iq2xs",
-        Iq2S => "native_idm_iq2s",
-        Iq3Xxs => "native_idm_iq3xxs",
-        Iq3S => "native_idm_iq3s",
-        Iq1S => "native_idm_iq1s",
-        Iq1M => "native_idm_iq1m",
-        Bf16 => "native_idm_bf16",
-        F16 => "native_idm_f16",
-        F32 => "native_idm_f32",
-        _ => return None,
-    })
+    // Delegate to the SPIR-V source of truth so the gate and the loaded shader can never drift
+    // (see AUDIT #1 and [`native_id_kernel_name`]).
+    crate::gemm::native_idm_build_spv(dtype).map(|(name, _)| name)
 }
 
 /// Whether the Vulkan MoE expert paths can dispatch a bank of this dtype AT ALL — the id-indexed
@@ -295,36 +240,22 @@ pub fn embed_gather_supported(dtype: infr_core::DType) -> bool {
     crate::gemm::embed_gather_kernel_name(dtype).is_some()
 }
 
+/// The canonical set of dtypes with the full dense native-block pipeline — the SINGLE SOURCE for
+/// [`native_dense_supported`] (a `.contains` over this) and, crucially, the iteration set the MoE-
+/// floor drift guard (`moe_expert_floor_covers_dense_set`) walks. Adding a format here therefore
+/// enrolls it in that guard automatically — a dtype can no longer become dense-supported yet slip
+/// past the "does the MoE id-GEMV floor cover it?" check (AUDIT #7).
+pub fn native_dense_dtypes() -> &'static [infr_core::DType] {
+    use infr_core::DType::*;
+    &[
+        Bf16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2K, Q3K, Q4K, Q5K, Q6K, Iq4Nl, Iq4Xs, Mxfp4, Nvfp4,
+        Tq1_0, Tq2_0, Q2_0, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq1S, Iq1M,
+    ]
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
-    use infr_core::DType::*;
-    matches!(
-        dtype,
-        Bf16 | Q8_0
-            | Q4_0
-            | Q4_1
-            | Q5_0
-            | Q5_1
-            | Q2K
-            | Q3K
-            | Q4K
-            | Q5K
-            | Q6K
-            | Iq4Nl
-            | Iq4Xs
-            | Mxfp4
-            | Nvfp4
-            | Tq1_0
-            | Tq2_0
-            | Q2_0
-            | Iq2Xxs
-            | Iq2Xs
-            | Iq2S
-            | Iq3Xxs
-            | Iq3S
-            | Iq1S
-            | Iq1M
-    )
+    native_dense_dtypes().contains(&dtype)
 }
 
 /// Pad raw GGUF block bytes to the next multiple of 4 for upload as `array<u32>`.
@@ -412,16 +343,17 @@ mod tests {
     /// twins. Pure name-table lookups, no GPU.
     #[test]
     fn moe_expert_floor_covers_dense_set() {
-        use infr_core::DType::{self, *};
-        let all: &[DType] = &[
-            Bf16, F16, F32, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2K, Q3K, Q4K, Q5K, Q6K, Iq4Nl, Iq4Xs,
-            Mxfp4, Nvfp4, Tq1_0, Tq2_0, Q2_0, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq1S, Iq1M,
-        ];
-        for &d in all {
-            assert!(
-                d == F16 || d == F32 || native_dense_supported(d),
-                "{d:?} listed here but not dense-supported — update this test's set"
-            );
+        use infr_core::DType::{F16, F32};
+        // Derive the iteration set from `native_dense_dtypes` (the SINGLE SOURCE behind
+        // `native_dense_supported`) plus the two float-bank forms — a newly dense-supported dtype is
+        // now covered here automatically, it can't escape the guard by being absent from a
+        // hand-written list (AUDIT #7).
+        let all = native_dense_dtypes()
+            .iter()
+            .copied()
+            .chain([F16, F32])
+            .collect::<Vec<_>>();
+        for &d in &all {
             assert!(
                 moe_expert_dtype_ok(d),
                 "{d:?} is dense-supported but the MoE expert floor rejects it"
@@ -432,6 +364,142 @@ mod tests {
                 "{d:?} has resident id kernels but no paged twins"
             );
         }
+    }
+
+    /// Canonical enumeration of every `DType` variant, used by the drift guards below to mean
+    /// literally "for EVERY dtype". [`all_dtypes_is_exhaustive`] pins it exhaustive: adding a variant
+    /// to the enum breaks that test's compile until it's listed here, so this can't silently omit a
+    /// new dtype.
+    const ALL_DTYPES: &[infr_core::DType] = {
+        use infr_core::DType::*;
+        &[
+            F32, F16, Bf16, I32, U32, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, Iq1S,
+            Iq1M, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq4Nl, Iq4Xs, Tq1_0, Tq2_0, Q2_0, Mxfp4,
+            Nvfp4, Turbo2, Turbo3, Turbo4,
+        ]
+    };
+
+    #[test]
+    fn all_dtypes_is_exhaustive() {
+        use infr_core::DType::*;
+        // Exhaustive match — a new DType variant makes this fail to COMPILE until both this arm and
+        // ALL_DTYPES are updated, keeping ALL_DTYPES a true canonical enumeration.
+        fn _covered(d: infr_core::DType) {
+            match d {
+                F32 | F16 | Bf16 | I32 | U32 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K
+                | Q4K | Q5K | Q6K | Iq1S | Iq1M | Iq2Xxs | Iq2Xs | Iq2S | Iq3Xxs | Iq3S | Iq4Nl
+                | Iq4Xs | Tq1_0 | Tq2_0 | Q2_0 | Mxfp4 | Nvfp4 | Turbo2 | Turbo3 | Turbo4 => {}
+            }
+        }
+        // Count sanity: the arm above and ALL_DTYPES must list the same number of variants.
+        assert_eq!(ALL_DTYPES.len(), 32);
+    }
+
+    /// AUDIT #1 drift guard: for EVERY `DType`, each `*_kernel_name` gate the recorder tests with
+    /// `is_some()` returns EXACTLY the name its `*_build_spv` twin loads with `expect()`. The
+    /// delegation makes this true by construction; the test pins it so a future edit that re-forks
+    /// the tables (or a paged twin that goes out of sync) fails in CI, not mid-inference. Pure
+    /// name/`&[u32]`-pointer lookups — no GPU.
+    #[test]
+    fn kernel_name_gate_matches_spv_source() {
+        use crate::gemm;
+        for &d in ALL_DTYPES {
+            // id / idm families (name table in this module, spv in gemm).
+            assert_eq!(
+                native_id_kernel_name(d),
+                gemm::native_id_build_spv(d).map(|(n, _)| n),
+                "native_id gate vs spv disagree for {d:?}"
+            );
+            assert_eq!(
+                native_idm_kernel_name(d),
+                gemm::native_idm_build_spv(d).map(|(n, _)| n),
+                "native_idm gate vs spv disagree for {d:?}"
+            );
+            // Paged twins: the gate returns a name, the spv returns words — so pin availability
+            // parity (the recorder gates on the name, loads the paged spv).
+            assert_eq!(
+                native_id_paged_kernel_name(d).is_some(),
+                gemm::native_id_paged_build_spv(d).is_some(),
+                "native_id_paged gate vs spv availability disagree for {d:?}"
+            );
+            assert_eq!(
+                native_idm_paged_kernel_name(d).is_some(),
+                gemm::native_idm_paged_build_spv(d).is_some(),
+                "native_idm_paged gate vs spv availability disagree for {d:?}"
+            );
+            // embed_gather family (both in gemm).
+            assert_eq!(
+                gemm::embed_gather_kernel_name(d),
+                gemm::embed_gather_spv(d).map(|(n, _)| n),
+                "embed_gather gate vs spv disagree for {d:?}"
+            );
+            // mmv families.
+            for res in [false, true] {
+                assert_eq!(
+                    gemm::native_mmv_kernel_name(d, res),
+                    gemm::native_mmv_spv(d, res).map(|(n, _)| n),
+                    "native_mmv gate vs spv disagree for {d:?} res={res}"
+                );
+            }
+            assert_eq!(
+                gemm::native_mmv_mrow_kernel_name(d),
+                gemm::native_mmv_mrow_variant_spv(d, false, false, false).map(|(n, _)| n),
+                "native_mmv_mrow gate vs spv disagree for {d:?}"
+            );
+            assert_eq!(
+                gemm::native_mmv_mrow_m16_kernel_name(d),
+                gemm::native_mmv_mrow_m16_spv(d).map(|(n, _)| n),
+                "native_mmv_mrow_m16 gate vs spv disagree for {d:?}"
+            );
+            for o4 in [false, true] {
+                for m4 in [false, true] {
+                    for res in [false, true] {
+                        assert_eq!(
+                            gemm::native_mmv_mrow_variant_kernel_name(d, o4, m4, res),
+                            gemm::native_mmv_mrow_variant_spv(d, o4, m4, res).map(|(n, _)| n),
+                            "native_mmv_mrow_variant gate vs spv disagree {d:?} o4={o4} m4={m4} res={res}"
+                        );
+                    }
+                }
+            }
+            for &warps in &[1u32, 2, 4, 8, 16] {
+                for res in [false, true] {
+                    for sg16 in [false, true] {
+                        assert_eq!(
+                            gemm::native_mmv_mw_kernel_name(d, res, warps, sg16),
+                            gemm::native_mmv_mw_spv(d, res, warps, sg16).map(|(n, _)| n),
+                            "native_mmv_mw gate vs spv disagree {d:?} res={res} warps={warps} sg16={sg16}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// AUDIT #2: Iq4Xs is mrow-eligible (`native_mmv_mrow_kernel_name` = Some) but has NO fused-
+    /// residual build — the res-legality predicate must report that, and the variant table must
+    /// agree, so `linear_mmv_mrow_at`'s residual assert catches an illegal residual Iq4Xs decode at
+    /// the boundary instead of panicking in the SPV `expect()`.
+    #[test]
+    fn iq4xs_reports_no_mrow_residual() {
+        use crate::gemm;
+        use infr_core::DType::{Iq4Xs, Q4K};
+        assert!(
+            gemm::native_mmv_mrow_kernel_name(Iq4Xs).is_some(),
+            "Iq4Xs should still be plain-mrow eligible"
+        );
+        assert!(
+            !gemm::native_mmv_mrow_res_supported(Iq4Xs),
+            "Iq4Xs has no _res mrow build — predicate must say so"
+        );
+        assert!(
+            gemm::native_mmv_mrow_variant_spv(Iq4Xs, false, true, true).is_none(),
+            "Iq4Xs _res variant must not exist"
+        );
+        // A dtype that DOES have the residual build reports true, so the predicate isn't vacuously
+        // false for everyone.
+        assert!(gemm::native_mmv_mrow_res_supported(Q4K));
+        assert!(gemm::native_mmv_mrow_variant_spv(Q4K, false, true, true).is_some());
     }
 
     #[test]

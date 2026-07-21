@@ -11,7 +11,7 @@ use infr_core::{backend::BufferUsage, error::Result, Backend};
 use super::{as_vk_buf, VulkanBackend};
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn spv_words(bytes: &[u8]) -> Vec<u32> {
+pub(crate) fn spv_words(bytes: &[u8]) -> Vec<u32> {
     bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -546,21 +546,9 @@ pub(crate) fn native_mmv_id_q4k_spv() -> &'static [u32] {
 /// has no int-dot build (falls back to the dequant `native_gemv`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_kernel_name(dtype: infr_core::DType, res: bool) -> Option<&'static str> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            $name
-        }};
-    }
-    Some(match (dtype, res) {
-        (Q4K, false) => v!("native_mmv_q4k"),
-        (Q4K, true) => v!("native_mmv_q4k_res"),
-        (Q6K, false) => v!("native_mmv_q6k"),
-        (Q6K, true) => v!("native_mmv_q6k_res"),
-        (Iq4Xs, false) => v!("native_mmv_iq4xs"),
-        (Iq4Xs, true) => v!("native_mmv_iq4xs_res"),
-        _ => return None,
-    })
+    // Delegate to the SPIR-V source of truth so the name gate and the loaded shader can never
+    // drift apart (a name-table-only dtype was a mid-inference `expect()` panic; see AUDIT #1).
+    native_mmv_spv(dtype, res).map(|(name, _)| name)
 }
 /// SPIR-V + cache name for the multi-warp int8 dp4a decode GEMV (`native_mmv_mw.comp`, warp-per-row
 /// subgroupAdd, `warps` rows/block). Gated by the adapter's `mmv_mw_choice` (default-on Intel,
@@ -573,87 +561,26 @@ pub(crate) fn native_mmv_mw_kernel_name(
     warps: u32,
     sg16: bool,
 ) -> Option<&'static str> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            Some($name)
-        }};
-    }
-    match (dtype, res, warps, sg16) {
-        // Dispatch-shape sweep builds (Q4_K only, WARPS ∈ {1,2,16} — no sg16 twin, AMD-only probe).
-        (Q4K, false, 1, false) => v!("native_mmv_mw_q4k_w1"),
-        (Q4K, true, 1, false) => v!("native_mmv_mw_q4k_w1_res"),
-        (Q4K, false, 2, false) => v!("native_mmv_mw_q4k_w2"),
-        (Q4K, true, 2, false) => v!("native_mmv_mw_q4k_w2_res"),
-        (Q4K, false, 16, false) => v!("native_mmv_mw_q4k_w16"),
-        (Q4K, true, 16, false) => v!("native_mmv_mw_q4k_w16_res"),
-        (Q4K, false, 4, false) => v!("native_mmv_mw_q4k_w4"),
-        (Q4K, true, 4, false) => v!("native_mmv_mw_q4k_w4_res"),
-        (Q4K, false, 8, false) => v!("native_mmv_mw_q4k_w8"),
-        (Q4K, true, 8, false) => v!("native_mmv_mw_q4k_w8_res"),
-        (Q6K, false, 4, false) => v!("native_mmv_mw_q6k_w4"),
-        (Q6K, true, 4, false) => v!("native_mmv_mw_q6k_w4_res"),
-        (Q6K, false, 8, false) => v!("native_mmv_mw_q6k_w8"),
-        (Q6K, true, 8, false) => v!("native_mmv_mw_q6k_w8_res"),
-        (Q2K, false, 4, false) => v!("native_mmv_mw_q2k_w4"),
-        (Q2K, true, 4, false) => v!("native_mmv_mw_q2k_w4_res"),
-        (Q2K, false, 8, false) => v!("native_mmv_mw_q2k_w8"),
-        (Q2K, true, 8, false) => v!("native_mmv_mw_q2k_w8_res"),
-        (Q3K, false, 4, false) => v!("native_mmv_mw_q3k_w4"),
-        (Q3K, true, 4, false) => v!("native_mmv_mw_q3k_w4_res"),
-        (Q3K, false, 8, false) => v!("native_mmv_mw_q3k_w8"),
-        (Q3K, true, 8, false) => v!("native_mmv_mw_q3k_w8_res"),
-        (Q4K, false, 4, true) => v!("native_mmv_mw_q4k_w4_sg16"),
-        (Q4K, true, 4, true) => v!("native_mmv_mw_q4k_w4_res_sg16"),
-        (Q4K, false, 8, true) => v!("native_mmv_mw_q4k_w8_sg16"),
-        (Q4K, true, 8, true) => v!("native_mmv_mw_q4k_w8_res_sg16"),
-        (Q6K, false, 4, true) => v!("native_mmv_mw_q6k_w4_sg16"),
-        (Q6K, true, 4, true) => v!("native_mmv_mw_q6k_w4_res_sg16"),
-        (Q6K, false, 8, true) => v!("native_mmv_mw_q6k_w8_sg16"),
-        (Q6K, true, 8, true) => v!("native_mmv_mw_q6k_w8_res_sg16"),
-        (Q2K, false, 4, true) => v!("native_mmv_mw_q2k_w4_sg16"),
-        (Q2K, true, 4, true) => v!("native_mmv_mw_q2k_w4_res_sg16"),
-        (Q2K, false, 8, true) => v!("native_mmv_mw_q2k_w8_sg16"),
-        (Q2K, true, 8, true) => v!("native_mmv_mw_q2k_w8_res_sg16"),
-        (Q3K, false, 4, true) => v!("native_mmv_mw_q3k_w4_sg16"),
-        (Q3K, true, 4, true) => v!("native_mmv_mw_q3k_w4_res_sg16"),
-        (Q3K, false, 8, true) => v!("native_mmv_mw_q3k_w8_sg16"),
-        (Q3K, true, 8, true) => v!("native_mmv_mw_q3k_w8_res_sg16"),
-        // Q5_K: NEW int8 decode arm — {plain,res} x WARPS{4,8}, no sg16 twin (AMD-only
-        // measurement; add an Intel SG=16 build before ever defaulting it on there).
-        (Q5K, false, 4, false) => v!("native_mmv_mw_q5k_w4"),
-        (Q5K, true, 4, false) => v!("native_mmv_mw_q5k_w4_res"),
-        (Q5K, false, 8, false) => v!("native_mmv_mw_q5k_w8"),
-        (Q5K, true, 8, false) => v!("native_mmv_mw_q5k_w8_res"),
-        _ => None,
-    }
+    // Delegate to the SPIR-V source of truth so gate and shader can never drift (AUDIT #1).
+    native_mmv_mw_spv(dtype, res, warps, sg16).map(|(name, _)| name)
 }
 /// Kernel-cache NAME + availability for the multi-row int8 dp4a GEMV (m = 2..8,
 /// `native_mmv_mrow.comp`); the SPIR-V lives in [`native_mmv_mrow_variant_spv`]. `None` = format
 /// has no int-dot build (falls back to the dequant `native_gemv_mrow`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            $name
-        }};
-    }
-    Some(match dtype {
-        Q4K => v!("native_mmv_mrow_q4k"),
-        Q6K => v!("native_mmv_mrow_q6k"),
-        Iq4Xs => v!("native_mmv_mrow_iq4xs"),
-        Q2K => v!("native_mmv_mrow_q2k"),
-        Q3K => v!("native_mmv_mrow_q3k"),
-        Q5K => v!("native_mmv_mrow_q5k"),
-        Q8_0 => v!("native_mmv_mrow_q8_0"),
-        Q4_0 => v!("native_mmv_mrow_q4_0"),
-        Q5_0 => v!("native_mmv_mrow_q5_0"),
-        Q4_1 => v!("native_mmv_mrow_q4_1"),
-        Q5_1 => v!("native_mmv_mrow_q5_1"),
-        Iq4Nl => v!("native_mmv_mrow_iq4nl"),
-        _ => return None,
-    })
+    // The plain (o4=false, m4=false, res=false) build IS this table's entry; delegate to the
+    // SPIR-V source of truth so the availability gate can never drift from the shader (AUDIT #1).
+    native_mmv_mrow_variant_spv(dtype, false, false, false).map(|(name, _)| name)
+}
+/// Whether the multi-row int8 dp4a GEMV family has a fused-residual (`-DUSE_RES`) build for `dtype`.
+/// The residual arm is only ever declared at `m4 = true` (decode is always `rows == 1`), so this
+/// probes exactly that build. Iq4Xs is the sole mrow-eligible dtype WITHOUT a `_res` twin, which is
+/// why `linear_mmv_mrow_at` and the adapter must consult this predicate before dispatching a
+/// residual mrow decode (AUDIT #2) rather than assuming a plain build implies a res build.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_mmv_mrow_res_supported(dtype: infr_core::DType) -> bool {
+    native_mmv_mrow_variant_spv(dtype, false, true, true).is_some()
 }
 /// SPIR-V for a multi-row int8 dp4a GEMV layout variant: `o4` = the small-in_f 4-outputs ×
 /// 16-K-lanes workgroup split (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4), `res` =
@@ -667,112 +594,16 @@ pub(crate) fn native_mmv_mrow_variant_kernel_name(
     m4: bool,
     res: bool,
 ) -> Option<&'static str> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            $name
-        }};
-    }
-    Some(match (dtype, o4, m4, res) {
-        (Q4K, false, false, false) => v!("native_mmv_mrow_q4k"),
-        (Q4K, false, true, false) => v!("native_mmv_mrow_q4k_m4"),
-        (Q4K, true, false, false) => v!("native_mmv_mrow_q4k_o4"),
-        (Q4K, true, true, false) => v!("native_mmv_mrow_q4k_o4_m4"),
-        (Q4K, false, true, true) => v!("native_mmv_mrow_q4k_m4_res"),
-        (Q4K, true, true, true) => v!("native_mmv_mrow_q4k_o4_m4_res"),
-        (Q6K, false, false, false) => v!("native_mmv_mrow_q6k"),
-        (Q6K, false, true, false) => v!("native_mmv_mrow_q6k_m4"),
-        (Q6K, true, false, false) => v!("native_mmv_mrow_q6k_o4"),
-        (Q6K, true, true, false) => v!("native_mmv_mrow_q6k_o4_m4"),
-        (Q6K, false, true, true) => v!("native_mmv_mrow_q6k_m4_res"),
-        (Q6K, true, true, true) => v!("native_mmv_mrow_q6k_o4_m4_res"),
-        (Iq4Xs, false, false, false) => v!("native_mmv_mrow_iq4xs"),
-        (Iq4Xs, false, true, false) => v!("native_mmv_mrow_iq4xs_m4"),
-        (Iq4Xs, true, false, false) => v!("native_mmv_mrow_iq4xs_o4"),
-        (Iq4Xs, true, true, false) => v!("native_mmv_mrow_iq4xs_o4_m4"),
-        (Q2K, false, false, false) => v!("native_mmv_mrow_q2k"),
-        (Q2K, false, true, false) => v!("native_mmv_mrow_q2k_m4"),
-        (Q2K, true, false, false) => v!("native_mmv_mrow_q2k_o4"),
-        (Q2K, true, true, false) => v!("native_mmv_mrow_q2k_o4_m4"),
-        (Q2K, false, true, true) => v!("native_mmv_mrow_q2k_m4_res"),
-        (Q2K, true, true, true) => v!("native_mmv_mrow_q2k_o4_m4_res"),
-        (Q3K, false, false, false) => v!("native_mmv_mrow_q3k"),
-        (Q3K, false, true, false) => v!("native_mmv_mrow_q3k_m4"),
-        (Q3K, true, false, false) => v!("native_mmv_mrow_q3k_o4"),
-        (Q3K, true, true, false) => v!("native_mmv_mrow_q3k_o4_m4"),
-        (Q3K, false, true, true) => v!("native_mmv_mrow_q3k_m4_res"),
-        (Q3K, true, true, true) => v!("native_mmv_mrow_q3k_o4_m4_res"),
-        (Q5K, false, false, false) => v!("native_mmv_mrow_q5k"),
-        (Q5K, false, true, false) => v!("native_mmv_mrow_q5k_m4"),
-        (Q5K, true, false, false) => v!("native_mmv_mrow_q5k_o4"),
-        (Q5K, true, true, false) => v!("native_mmv_mrow_q5k_o4_m4"),
-        (Q5K, false, true, true) => v!("native_mmv_mrow_q5k_m4_res"),
-        (Q5K, true, true, true) => v!("native_mmv_mrow_q5k_o4_m4_res"),
-        (Q8_0, false, false, false) => v!("native_mmv_mrow_q8_0"),
-        (Q8_0, false, true, false) => v!("native_mmv_mrow_q8_0_m4"),
-        (Q8_0, true, false, false) => v!("native_mmv_mrow_q8_0_o4"),
-        (Q8_0, true, true, false) => v!("native_mmv_mrow_q8_0_o4_m4"),
-        (Q8_0, false, true, true) => v!("native_mmv_mrow_q8_0_m4_res"),
-        (Q8_0, true, true, true) => v!("native_mmv_mrow_q8_0_o4_m4_res"),
-        (Q4_0, false, false, false) => v!("native_mmv_mrow_q4_0"),
-        (Q4_0, false, true, false) => v!("native_mmv_mrow_q4_0_m4"),
-        (Q4_0, true, false, false) => v!("native_mmv_mrow_q4_0_o4"),
-        (Q4_0, true, true, false) => v!("native_mmv_mrow_q4_0_o4_m4"),
-        (Q4_0, false, true, true) => v!("native_mmv_mrow_q4_0_m4_res"),
-        (Q4_0, true, true, true) => v!("native_mmv_mrow_q4_0_o4_m4_res"),
-        (Q5_0, false, false, false) => v!("native_mmv_mrow_q5_0"),
-        (Q5_0, false, true, false) => v!("native_mmv_mrow_q5_0_m4"),
-        (Q5_0, true, false, false) => v!("native_mmv_mrow_q5_0_o4"),
-        (Q5_0, true, true, false) => v!("native_mmv_mrow_q5_0_o4_m4"),
-        (Q5_0, false, true, true) => v!("native_mmv_mrow_q5_0_m4_res"),
-        (Q5_0, true, true, true) => v!("native_mmv_mrow_q5_0_o4_m4_res"),
-        (Q4_1, false, false, false) => v!("native_mmv_mrow_q4_1"),
-        (Q4_1, false, true, false) => v!("native_mmv_mrow_q4_1_m4"),
-        (Q4_1, true, false, false) => v!("native_mmv_mrow_q4_1_o4"),
-        (Q4_1, true, true, false) => v!("native_mmv_mrow_q4_1_o4_m4"),
-        (Q4_1, false, true, true) => v!("native_mmv_mrow_q4_1_m4_res"),
-        (Q4_1, true, true, true) => v!("native_mmv_mrow_q4_1_o4_m4_res"),
-        (Q5_1, false, false, false) => v!("native_mmv_mrow_q5_1"),
-        (Q5_1, false, true, false) => v!("native_mmv_mrow_q5_1_m4"),
-        (Q5_1, true, false, false) => v!("native_mmv_mrow_q5_1_o4"),
-        (Q5_1, true, true, false) => v!("native_mmv_mrow_q5_1_o4_m4"),
-        (Q5_1, false, true, true) => v!("native_mmv_mrow_q5_1_m4_res"),
-        (Q5_1, true, true, true) => v!("native_mmv_mrow_q5_1_o4_m4_res"),
-        (Iq4Nl, false, false, false) => v!("native_mmv_mrow_iq4nl"),
-        (Iq4Nl, false, true, false) => v!("native_mmv_mrow_iq4nl_m4"),
-        (Iq4Nl, true, false, false) => v!("native_mmv_mrow_iq4nl_o4"),
-        (Iq4Nl, true, true, false) => v!("native_mmv_mrow_iq4nl_o4_m4"),
-        (Iq4Nl, false, true, true) => v!("native_mmv_mrow_iq4nl_m4_res"),
-        (Iq4Nl, true, true, true) => v!("native_mmv_mrow_iq4nl_o4_m4_res"),
-        _ => return None,
-    })
+    // Delegate to the SPIR-V source of truth so gate and shader can never drift (AUDIT #1).
+    native_mmv_mrow_variant_spv(dtype, o4, m4, res).map(|(name, _)| name)
 }
 /// Kernel-cache NAME for the rows 9..=16 multi-row int8 dp4a GEMV tier (`-DMRV=16`, 2-output layout
 /// — no OUTS4 twin: the tier is gated to >= 8M-element weights, whose in_f is comfortably >= 2048);
 /// the SPIR-V lives in [`native_mmv_mrow_m16_spv`]. `None` = format not covered (same coverage as
 /// [`native_mmv_mrow_kernel_name`]; those shapes stay on the split-K GEMM tile).
 pub(crate) fn native_mmv_mrow_m16_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            $name
-        }};
-    }
-    Some(match dtype {
-        Q4K => v!("native_mmv_mrow_q4k_m16"),
-        Q6K => v!("native_mmv_mrow_q6k_m16"),
-        Iq4Xs => v!("native_mmv_mrow_iq4xs_m16"),
-        Q2K => v!("native_mmv_mrow_q2k_m16"),
-        Q3K => v!("native_mmv_mrow_q3k_m16"),
-        Q5K => v!("native_mmv_mrow_q5k_m16"),
-        Q8_0 => v!("native_mmv_mrow_q8_0_m16"),
-        Q4_0 => v!("native_mmv_mrow_q4_0_m16"),
-        Q5_0 => v!("native_mmv_mrow_q5_0_m16"),
-        Q4_1 => v!("native_mmv_mrow_q4_1_m16"),
-        Q5_1 => v!("native_mmv_mrow_q5_1_m16"),
-        Iq4Nl => v!("native_mmv_mrow_iq4nl_m16"),
-        _ => return None,
-    })
+    // Delegate to the SPIR-V source of truth so gate and shader can never drift (AUDIT #1).
+    native_mmv_mrow_m16_spv(dtype).map(|(name, _)| name)
 }
 /// `-DSTREAMED` twin of [`native_mmv_kernel_name`] (kernel-cache name + SPIR-V) — the int8 dp4a
 /// decode GEMV's weight read from a `bufferDeviceAddress` arena instead of a bound SSBO. `res`
@@ -1369,30 +1200,9 @@ pub(crate) fn moe_ep_band_remap_spv() -> &'static [u32] {
 /// build (grid-table IQ formats) — the runner then keeps the host embed path.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn embed_gather_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            $name
-        }};
-    }
-    Some(match dtype {
-        Q8_0 => v!("embed_gather_q8_0"),
-        Bf16 => v!("embed_gather_bf16"),
-        F16 => v!("embed_gather_f16"),
-        Q4_0 => v!("embed_gather_q4_0"),
-        Q4_1 => v!("embed_gather_q4_1"),
-        Q5_0 => v!("embed_gather_q5_0"),
-        Q5_1 => v!("embed_gather_q5_1"),
-        Q2K => v!("embed_gather_q2k"),
-        Q3K => v!("embed_gather_q3k"),
-        Q4K => v!("embed_gather_q4k"),
-        Q5K => v!("embed_gather_q5k"),
-        Q6K => v!("embed_gather_q6k"),
-        Iq4Nl => v!("embed_gather_iq4nl"),
-        Iq4Xs => v!("embed_gather_iq4xs"),
-        Q2_0 => v!("embed_gather_q2_0"),
-        _ => return None,
-    })
+    // Delegate to the SPIR-V source of truth so the gate and the loaded shader can never drift
+    // (a name-table-only dtype was a mid-inference `expect()` panic; see AUDIT #1).
+    embed_gather_spv(dtype).map(|(name, _)| name)
 }
 /// SPIR-V (kernel-cache name + words) for [`embed_gather_kernel_name`]'s pick — the token-embedding
 /// table read from a `bufferDeviceAddress` arena, same convention as [`native_streamed_build_spv`];
@@ -1562,24 +1372,19 @@ pub(crate) fn moe_weight_scale_spv() -> &'static [u32] {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            $name
-        }};
-    }
     Some(match dtype {
-        Bf16 => v!("native_gemm_warp_bf16"),
-        Iq4Nl => v!("native_gemm_warp_iq4nl"),
-        Iq4Xs => v!("native_gemm_warp_iq4xs"),
-        Q2K => v!("native_gemm_warp_q2k"),
-        Q3K => v!("native_gemm_warp_q3k"),
-        Q5_0 => v!("native_gemm_warp_q5_0"),
-        Q5_1 => v!("native_gemm_warp_q5_1"),
-        Q4_0 => v!("native_gemm_warp_q4_0"),
-        Q4K => v!("native_gemm_warp_q4k"),
-        Q5K => v!("native_gemm_warp_q5k"),
-        Q6K => v!("native_gemm_warp_q6k"),
-        Q8_0 => v!("native_gemm_warp_q8_0"),
+        Bf16 => "native_gemm_warp_bf16",
+        Iq4Nl => "native_gemm_warp_iq4nl",
+        Iq4Xs => "native_gemm_warp_iq4xs",
+        Q2K => "native_gemm_warp_q2k",
+        Q3K => "native_gemm_warp_q3k",
+        Q5_0 => "native_gemm_warp_q5_0",
+        Q5_1 => "native_gemm_warp_q5_1",
+        Q4_0 => "native_gemm_warp_q4_0",
+        Q4K => "native_gemm_warp_q4k",
+        Q5K => "native_gemm_warp_q5k",
+        Q6K => "native_gemm_warp_q6k",
+        Q8_0 => "native_gemm_warp_q8_0",
         _ => return None,
     })
 }
@@ -1589,24 +1394,19 @@ pub(crate) fn native_gemm_warp_kernel_name(dtype: infr_core::DType) -> Option<&'
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_n128_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            $name
-        }};
-    }
     Some(match dtype {
-        Bf16 => v!("native_gemm_warp_bf16_n128"),
-        Iq4Nl => v!("native_gemm_warp_iq4nl_n128"),
-        Iq4Xs => v!("native_gemm_warp_iq4xs_n128"),
-        Q2K => v!("native_gemm_warp_q2k_n128"),
-        Q3K => v!("native_gemm_warp_q3k_n128"),
-        Q5_0 => v!("native_gemm_warp_q5_0_n128"),
-        Q5_1 => v!("native_gemm_warp_q5_1_n128"),
-        Q4_0 => v!("native_gemm_warp_q4_0_n128"),
-        Q4K => v!("native_gemm_warp_q4k_n128"),
-        Q5K => v!("native_gemm_warp_q5k_n128"),
-        Q6K => v!("native_gemm_warp_q6k_n128"),
-        Q8_0 => v!("native_gemm_warp_q8_0_n128"),
+        Bf16 => "native_gemm_warp_bf16_n128",
+        Iq4Nl => "native_gemm_warp_iq4nl_n128",
+        Iq4Xs => "native_gemm_warp_iq4xs_n128",
+        Q2K => "native_gemm_warp_q2k_n128",
+        Q3K => "native_gemm_warp_q3k_n128",
+        Q5_0 => "native_gemm_warp_q5_0_n128",
+        Q5_1 => "native_gemm_warp_q5_1_n128",
+        Q4_0 => "native_gemm_warp_q4_0_n128",
+        Q4K => "native_gemm_warp_q4k_n128",
+        Q5K => "native_gemm_warp_q5k_n128",
+        Q6K => "native_gemm_warp_q6k_n128",
+        Q8_0 => "native_gemm_warp_q8_0_n128",
         _ => return None,
     })
 }
@@ -1741,25 +1541,20 @@ pub(crate) fn native_gemm_warp_n128_ag_bm16_kernel_name(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_warp_sk_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
     use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            $name
-        }};
-    }
     Some(match dtype {
         // F16 weights are floats, not quants (native_dense_supported is false) — this sk build
         // exists ONLY for the adapter's targeted deep-k narrow-n F16 route (the DiffusionGemma
         // SC soft-embedding GEMM); see the matching arm in `matmul_native_splitk`.
-        F16 => v!("native_gemm_warp_f16_sk"),
-        Iq4Nl => v!("native_gemm_warp_iq4nl_sk"),
-        Iq4Xs => v!("native_gemm_warp_iq4xs_sk"),
-        Q2K => v!("native_gemm_warp_q2k_sk"),
-        Q3K => v!("native_gemm_warp_q3k_sk"),
-        Q4_0 => v!("native_gemm_warp_q4_0_sk"),
-        Q4K => v!("native_gemm_warp_q4k_sk"),
-        Q5K => v!("native_gemm_warp_q5k_sk"),
-        Q6K => v!("native_gemm_warp_q6k_sk"),
-        Q8_0 => v!("native_gemm_warp_q8_0_sk"),
+        F16 => "native_gemm_warp_f16_sk",
+        Iq4Nl => "native_gemm_warp_iq4nl_sk",
+        Iq4Xs => "native_gemm_warp_iq4xs_sk",
+        Q2K => "native_gemm_warp_q2k_sk",
+        Q3K => "native_gemm_warp_q3k_sk",
+        Q4_0 => "native_gemm_warp_q4_0_sk",
+        Q4K => "native_gemm_warp_q4k_sk",
+        Q5K => "native_gemm_warp_q5k_sk",
+        Q6K => "native_gemm_warp_q6k_sk",
+        Q8_0 => "native_gemm_warp_q8_0_sk",
         _ => return None,
     })
 }
@@ -3420,9 +3215,9 @@ impl VulkanBackend {
         let binding = self.eager_bind(&kern, &bufs).unwrap();
 
         let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[0..4].copy_from_slice(&(m as u32).to_le_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_le_bytes());
         let (gx, gy) = ((n / 64) as u32, (m / 64) as u32);
 
         let dispatch = || {
@@ -3471,9 +3266,9 @@ impl VulkanBackend {
         ];
         let binding = self.eager_bind(&kern, &bufs).unwrap();
         let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[0..4].copy_from_slice(&(m as u32).to_le_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_le_bytes());
         let (gx, gy) = ((n / 128) as u32, (m / 128) as u32);
         let dispatch = || {
             let shared = &self.shared;
@@ -3518,9 +3313,9 @@ impl VulkanBackend {
         ];
         let binding = self.eager_bind(&kern, &bufs).unwrap();
         let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(kp as u32).to_ne_bytes());
+        push[0..4].copy_from_slice(&(m as u32).to_le_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        push[8..12].copy_from_slice(&(kp as u32).to_le_bytes());
         let (gx, gy) = ((n / 64) as u32, (m / 64) as u32);
         let dispatch = || {
             let shared = &self.shared;
@@ -3578,9 +3373,9 @@ impl VulkanBackend {
         let binding = self.eager_bind(&kern, &bufs)?;
 
         let mut push = [0u8; 12];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[0..4].copy_from_slice(&(m as u32).to_le_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_le_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_le_bytes());
 
         let shared = &self.shared;
         self.one_shot(|cmd| unsafe {

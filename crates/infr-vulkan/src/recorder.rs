@@ -3374,6 +3374,13 @@ impl<'a> Recorder<'a> {
             residual.is_none() || rows == 1,
             "fused residual is decode-only (rows=1)"
         );
+        // Explicit res-legality gate (AUDIT #2): not every mrow-eligible dtype has a fused-residual
+        // build (Iq4Xs has none). Assert on the predicate so an illegal residual decode is caught
+        // here with a clear message rather than in the SPV `expect()` below.
+        debug_assert!(
+            residual.is_none() || crate::gemm::native_mmv_mrow_res_supported(dtype),
+            "no fused-residual mrow build for {dtype:?} — dtype is decode-eligible but res-illegal"
+        );
         self.label_gemv("mmvr_streamed", rows, in_f, out_f);
         let o4 = in_f < 2048 && std::env::var("INFR_NO_MMV_O4").is_err();
         let m4 = rows <= 4 && std::env::var("INFR_NO_MMV_M4").is_err();

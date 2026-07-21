@@ -124,6 +124,18 @@ impl VulkanBackend {
             }
     }
 
+    /// Can this device order a cross-device dependency with an EXPORTED/IMPORTED timeline/binary
+    /// semaphore (`VK_KHR_external_semaphore_fd`)? When every rank in a tensor-parallel group says
+    /// yes, the all-reduce waits on a peer's GPU-side signal with no host round-trip
+    /// (`AllReduceMode::P2pSemaphore`); otherwise the P2P data path is ordered by the host fence.
+    ///
+    /// v1 returns `false` (the host-fence all-reduce is the correctness deliverable; the
+    /// external-semaphore optimization is wired behind this probe). Flipping this on requires the
+    /// device to enable `VK_KHR_external_semaphore` + `_fd` and a semaphore-signalling submit path.
+    pub fn external_semaphore_supported(&self) -> bool {
+        self.shared.external_semaphore_fd.is_some()
+    }
+
     /// Allocate a `size`-byte device-local buffer on THIS backend (device A) whose backing memory is
     /// EXPORTABLE as `handle_type`, and export it as an fd. The returned [`P2pExport`] owns the
     /// device-A buffer (upload into it via [`P2pExport::buffer`]) and the fd; import it on another

@@ -956,6 +956,59 @@ impl SeamModel {
         Ok(generated)
     }
 
+    /// Multi-GPU TENSOR-PARALLEL (dense) twin of [`generate_dense_vulkan`](Self::generate_dense_vulkan):
+    /// each layer's weight matrices are SHARDED across the physical `devices` (column-parallel
+    /// q/k/v/gate/up, row-parallel o/down), every device computes its shard and the partials are
+    /// all-reduced per attention + per FFN. Output equals single-device to reduction-order tolerance.
+    /// Dense models only. `devices` of length 1 is the identity (single-rank) reference.
+    pub fn generate_dense_vulkan_tp(
+        &self,
+        devices: &[usize],
+        prompt: &str,
+        max_new: usize,
+    ) -> Result<String> {
+        let enc = self
+            .tokenizer
+            .encode(prompt, false)
+            .map_err(|e| anyhow!("encode: {e}"))?;
+        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let (generated, _stats) = crate::seam::generate_dense_vulkan_tp(
+            devices,
+            &self.gguf,
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |_| {},
+        )?;
+        self.tokenizer
+            .decode(&generated, true)
+            .map_err(|e| anyhow!("decode: {e}"))
+    }
+
+    /// Token-id twin of [`generate_dense_vulkan_tp`](Self::generate_dense_vulkan_tp) — raw ids for
+    /// the `tensor_parallel_matches_single_device` correctness check (single-rank vs multi-rank).
+    pub fn generate_tp_ids(
+        &self,
+        devices: &[usize],
+        prompt_tokens: &[u32],
+        max_new: usize,
+        on_id: impl FnMut(u32),
+    ) -> Result<Vec<u32>> {
+        let (generated, _stats) = crate::seam::generate_dense_vulkan_tp(
+            devices,
+            &self.gguf,
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            prompt_tokens,
+            max_new,
+            on_id,
+        )?;
+        Ok(generated)
+    }
+
     /// Token-level bench on the Vulkan seam, llama-bench-comparable: ONE weight upload (a
     /// persistent session) + an untimed pipeline warmup, then per rep — reset the KV, warm it to
     /// `depth` (untimed), and time ONE metric: `pg` = a whole (P prefill + G decode) turn,

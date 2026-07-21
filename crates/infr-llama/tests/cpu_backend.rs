@@ -3106,3 +3106,81 @@ fn pipeline_matches_single_device() {
         devs[1].name,
     );
 }
+
+// ─── Multi-GPU TENSOR PARALLELISM: correctness = single-device-identical ──────────────────────
+//
+// Shards EACH transformer layer's weight matrices across TWO physical GPUs (column-parallel
+// q/k/v/gate/up, row-parallel o/down; KV sharded by head), each device computing its shard and the
+// partials all-reduced (P2P dma-buf) per attention + per FFN. The KEY correctness claim: the sharded
+// forward equals the same model run WITHOUT a split.
+//
+// The reference is the TP path itself on a SINGLE rank (`[d0]`, world=1): the lowering is the
+// identity (shard factor 1, no all-reduce), the same runner code path (host-embed + static execute),
+// so it exercises exactly the single-device compute. The two-rank run adds the weight shard + the
+// per-layer all-reduce. Ideally token-identical; the O/down all-reduce reassociates the reduction vs
+// a single wide GEMV, so a mismatch (if any) must stay at reduction-order tolerance — asserted as
+// token-identity, which greedy decode over a small model holds in practice. Run:
+//   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend \
+//     tensor_parallel_matches_single_device -- --include-ignored --nocapture
+#[test]
+#[ignore = "requires TWO Vulkan GPUs: run with --include-ignored on a multi-GPU box"]
+fn tensor_parallel_matches_single_device() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let devs = infr_vulkan::VulkanBackend::enumerate_devices().expect("enumerate devices");
+    if devs.len() < 2 {
+        eprintln!(
+            "skip: tensor_parallel_matches_single_device needs >=2 Vulkan devices (found {})",
+            devs.len()
+        );
+        return;
+    }
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    std::env::set_var("INFR_NO_THINK", "1");
+
+    let model = infr_llama::SeamModel::load(&path, None).expect("load");
+    let prompt = model
+        .render_chat("What is the capital of France? Reply with just the city name.")
+        .expect("render");
+    let enc = model.encode(&prompt).expect("encode");
+    let n = 24;
+    let d0 = devs[0].index;
+    let d1 = devs[1].index;
+
+    // Reference: the SAME TP runner path on ONE rank (identity lowering, no shard, no all-reduce).
+    eprintln!("\n[tp] reference: single-rank [Vulkan{d0}]");
+    let ref_ids = model
+        .generate_tp_ids(&[d0], &enc, n, |_| {})
+        .expect("single-rank tp gen");
+
+    // Shard each layer's weights across BOTH devices, all-reduce per attention + per FFN.
+    eprintln!("[tp] 2-way weight split: [Vulkan{d0}, Vulkan{d1}]");
+    let split_ids = model
+        .generate_tp_ids(&[d0, d1], &enc, n, |_| {})
+        .expect("two-rank tp gen");
+
+    assert_eq!(
+        ref_ids, split_ids,
+        "tensor-parallel output diverged from single-device beyond reduction-order tolerance — the \
+         weight shard / all-reduce is not summing the same partial products"
+    );
+
+    // Coherent greedy output across the two-device shard.
+    let text = model.decode(&split_ids).expect("decode split ids");
+    eprintln!("[tp] split output: {text:?}");
+    assert!(
+        text.contains("Paris"),
+        "two-device tensor-parallel output not coherent: {text:?}"
+    );
+    assert_ne!(
+        devs[0].name, devs[1].name,
+        "the two devices must be distinct physical GPUs"
+    );
+    eprintln!(
+        "[tp] PASS — {}-token 2-way weight split across Vulkan{d0} ({}) + Vulkan{d1} ({}) matches \
+         single-device",
+        split_ids.len(),
+        devs[0].name,
+        devs[1].name,
+    );
+}

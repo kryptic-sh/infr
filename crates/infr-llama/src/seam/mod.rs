@@ -1352,6 +1352,274 @@ pub(crate) fn generate_dense_vulkan_pipeline(
     )
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Tensor parallelism (dense) — Megatron-style intra-op weight sharding. See `infr_vulkan::tp`.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// Parse the `INFR_TENSOR_PARALLEL` device list (`Vulkan0,Vulkan1,…`) into physical device indices,
+/// or `None` when unset. Sibling of [`parse_pipeline_devices`]; needs >=2 devices for a real split.
+pub fn parse_tensor_parallel_devices() -> AResult<Option<Vec<usize>>> {
+    let Some(spec) = std::env::var_os("INFR_TENSOR_PARALLEL") else {
+        return Ok(None);
+    };
+    let spec = spec.to_string_lossy();
+    let mut devs = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let idx = part
+            .strip_prefix("Vulkan")
+            .unwrap_or(part)
+            .parse::<usize>()
+            .map_err(|_| {
+                anyhow!("INFR_TENSOR_PARALLEL: '{part}' is not VulkanN or a device index")
+            })?;
+        devs.push(idx);
+    }
+    if devs.len() < 2 {
+        return Err(anyhow!(
+            "INFR_TENSOR_PARALLEL needs >=2 devices for a weight split (got '{spec}'); \
+             unset it to run single-device"
+        ));
+    }
+    Ok(Some(devs))
+}
+
+/// The tensor-parallel device role of a weight (by GGUF tensor name), plus its INNER dim `in_f` (for
+/// the row-parallel byte stride). `None` = replicated (norms, biases, embeddings, the LM head).
+///
+/// Column-parallel (sliced by output rows): q/k/v/gate/up. Row-parallel (sliced by input columns):
+/// attn_output / ffn_down.
+fn tp_weight_role(name: &str, cfg: &Config) -> Option<(infr_vulkan::TpRole, usize)> {
+    let layer = name
+        .strip_prefix("blk.")
+        .and_then(|r| r.split('.').next())
+        .and_then(|s| s.parse::<usize>().ok());
+    let l = layer?;
+    let after = name.rsplit('.').nth(1)?; // e.g. "attn_q" from "blk.3.attn_q.weight"
+    let ne = cfg.n_embd;
+    let qrow = cfg.n_head * cfg.layer_head_dim(l);
+    let nff = cfg.layer_n_ff(l);
+    match after {
+        "attn_q" | "attn_k" | "attn_v" => Some((infr_vulkan::TpRole::Column, ne)),
+        "ffn_gate" | "ffn_up" => Some((infr_vulkan::TpRole::Column, ne)),
+        "attn_output" => Some((infr_vulkan::TpRole::Row, qrow)),
+        "ffn_down" => Some((infr_vulkan::TpRole::Row, nff)),
+        _ => None, // attn_norm/ffn_norm/q_norm/k_norm/biases → replicated
+    }
+}
+
+/// Column slice: rank `r` of `world` takes the contiguous output-row band
+/// `[r·out_f/W, (r+1)·out_f/W)` of a row-major `[out_f, in_f]` tensor. Quant-block-safe: blocks tile
+/// along `in_f` (within a row), so a whole-row band never cuts a block.
+fn tp_slice_column(
+    bytes: &[u8],
+    dt: DType,
+    in_f: usize,
+    r: usize,
+    world: usize,
+) -> AResult<Vec<u8>> {
+    let (be, bb) = infr_gguf::block_layout(dt);
+    if !in_f.is_multiple_of(be) {
+        return Err(anyhow!(
+            "tp column slice: in_f={in_f} not a multiple of block {be}"
+        ));
+    }
+    let row_bytes = (in_f / be) * bb;
+    if !bytes.len().is_multiple_of(row_bytes) {
+        return Err(anyhow!(
+            "tp column slice: {} bytes not a multiple of row {row_bytes}",
+            bytes.len()
+        ));
+    }
+    let out_f = bytes.len() / row_bytes;
+    if !out_f.is_multiple_of(world) {
+        return Err(anyhow!(
+            "tp column slice: out_f={out_f} not divisible by world {world}"
+        ));
+    }
+    let rows = out_f / world;
+    let start = r * rows * row_bytes;
+    Ok(bytes[start..start + rows * row_bytes].to_vec())
+}
+
+/// Row slice: rank `r` takes the input-column band `[r·in_f/W, (r+1)·in_f/W)` of every one of the
+/// `out_f` rows and re-packs them contiguously into a `[out_f, in_f/W]` tensor. Needs `in_f/W`
+/// block-aligned so each per-row band is a whole number of quant blocks.
+fn tp_slice_row(bytes: &[u8], dt: DType, in_f: usize, r: usize, world: usize) -> AResult<Vec<u8>> {
+    let (be, bb) = infr_gguf::block_layout(dt);
+    if !in_f.is_multiple_of(be * world) {
+        return Err(anyhow!(
+            "tp row slice: in_f={in_f} not divisible by world·block ({world}·{be}) — the input-column \
+             split must land on quant-block boundaries"
+        ));
+    }
+    let row_bytes = (in_f / be) * bb;
+    if !bytes.len().is_multiple_of(row_bytes) {
+        return Err(anyhow!(
+            "tp row slice: {} bytes not a multiple of row {row_bytes}",
+            bytes.len()
+        ));
+    }
+    let out_f = bytes.len() / row_bytes;
+    let band_bytes = ((in_f / world) / be) * bb;
+    let col_off = r * band_bytes;
+    let mut out = Vec::with_capacity(out_f * band_bytes);
+    for row in 0..out_f {
+        let s = row * row_bytes + col_off;
+        out.extend_from_slice(&bytes[s..s + band_bytes]);
+    }
+    Ok(out)
+}
+
+/// A device-aware [`BindWeight`] for tensor parallelism: q/k/v/gate/up are COLUMN-sliced (output
+/// rows), attn_output/ffn_down are ROW-sliced (input columns) and each rank uploads only its slice;
+/// norms/biases/embeddings/lm_head are REPLICATED to every rank. Each slice is padded to u32
+/// alignment and uploaded to its rank's device, returned as an `infr_vulkan::TpBuffer` carrying the
+/// device role the TP lowering reads.
+fn tensor_parallel_binder<'a>(
+    tp: &'a infr_vulkan::TensorParallelBackend,
+    cfg: &'a Config,
+) -> Box<BindWeight<'a>> {
+    let world = tp.world();
+    Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
+        check_bda_element_cap(name, "tensor", numel)?;
+        match tp_weight_role(name, cfg) {
+            Some((role, in_f)) => {
+                let mut bufs = Vec::with_capacity(world);
+                for r in 0..world {
+                    let slice = match role {
+                        infr_vulkan::TpRole::Column => tp_slice_column(&tb, dt, in_f, r, world)?,
+                        infr_vulkan::TpRole::Row => tp_slice_row(&tb, dt, in_f, r, world)?,
+                        infr_vulkan::TpRole::Replicated => tb.to_vec(),
+                    };
+                    let padded = infr_vulkan::linear::pad_to_u32_align(&slice);
+                    let buf = tp
+                        .rank(r)
+                        .alloc_uninit(padded.len(), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    tp.rank(r)
+                        .upload(buf.as_ref(), &padded)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    bufs.push(buf);
+                }
+                Ok((infr_vulkan::TpBuffer::weight(role, bufs), dt))
+            }
+            None => {
+                // Replicated: the full padded tensor on every rank.
+                let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
+                let mut bufs = Vec::with_capacity(world);
+                for r in 0..world {
+                    let buf = tp
+                        .rank(r)
+                        .alloc_uninit(padded.len(), BufferUsage::Weights)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    tp.rank(r)
+                        .upload(buf.as_ref(), &padded)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    bufs.push(buf);
+                }
+                Ok((infr_vulkan::TpBuffer::replica(bufs), dt))
+            }
+        }
+    })
+}
+
+/// Multi-GPU TENSOR-PARALLEL (dense) generation — each transformer layer's weight matrices are
+/// SHARDED across the `devices` (column-parallel q/k/v/gate/up, row-parallel o/down), each device
+/// computes its shard and the partials are all-reduced (P2P dma-buf) per attention + per FFN. The
+/// output equals the single-device forward to reduction-order tolerance. Dense attention models only.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn generate_dense_vulkan_tp(
+    devices: &[usize],
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    if cfg.moe.is_some() {
+        return Err(anyhow!(
+            "INFR_TENSOR_PARALLEL supports dense models only; this is an MoE model (expert \
+             parallelism is a separate slice)"
+        ));
+    }
+    if cfg.qwen35 {
+        return Err(anyhow!(
+            "INFR_TENSOR_PARALLEL does not support qwen35 (DeltaNet recurrent-state sharding is a \
+             separate slice)"
+        ));
+    }
+    if cfg.n_embd_per_layer > 0 {
+        return Err(anyhow!(
+            "INFR_TENSOR_PARALLEL does not support gemma E2B per-layer embeddings"
+        ));
+    }
+    if cfg.diffusion_gemma {
+        return Err(anyhow!(
+            "INFR_TENSOR_PARALLEL does not support diffusion-gemma"
+        ));
+    }
+    let mut backends = Vec::with_capacity(devices.len());
+    for &idx in devices {
+        backends.push(
+            infr_vulkan::VulkanBackend::new_on(idx)
+                .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
+        );
+    }
+    let names = backends
+        .iter()
+        .map(|b| {
+            use infr_core::backend::Backend;
+            b.capabilities().name
+        })
+        .collect::<Vec<_>>();
+    let use_p2p = std::env::var_os("INFR_TP_HOST").is_none();
+    let tp =
+        infr_vulkan::TensorParallelBackend::new(backends, cfg.n_head, cfg.n_kv, cfg.n_ff, use_p2p)
+            .map_err(|e| anyhow!("{e}"))?;
+    eprintln!(
+        "tensor-parallel: {}-way weight split (n_head={}, n_kv={}, n_ff={}):",
+        devices.len(),
+        cfg.n_head,
+        cfg.n_kv,
+        cfg.n_ff
+    );
+    for (di, &idx) in devices.iter().enumerate() {
+        eprintln!(
+            "  Vulkan{idx} ({}): rank {di} — {}/{} heads, {}/{} kv-heads, {}/{} ffn per matrix",
+            names[di],
+            cfg.n_head / devices.len(),
+            cfg.n_head,
+            cfg.n_kv / devices.len(),
+            cfg.n_kv,
+            cfg.n_ff / devices.len(),
+            cfg.n_ff,
+        );
+    }
+    let bind = tensor_parallel_binder(&tp, cfg);
+    generate_dense_backend(
+        &tp,
+        &*bind,
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        &mut None,
+        prompt.len() + max_new + 1,
+        None, // constraint
+        None, // verify
+        None, // verify_ids
+        None, // logits_out
+        None, // h_out
+        None, // denoise_req
+        None, // req
+    )
+}
+
 /// Metal seam runner: the SAME dense forward as [`generate_dense_cpu`], on the reference Metal
 /// backend through the agnostic [`Graph`]. Weights are uploaded to Metal buffers in their NATIVE
 /// GGUF dtype (the backend dequantizes lazily in its own `bytes_to_f32`, exactly like the CPU

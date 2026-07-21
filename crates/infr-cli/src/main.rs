@@ -848,6 +848,32 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Multi-GPU TENSOR PARALLELISM: `INFR_TENSOR_PARALLEL=Vulkan0,Vulkan1` SHARDS each layer's weight
+    // matrices across the listed devices (column-parallel q/k/v/gate/up, row-parallel o/down) with a
+    // P2P all-reduce per attention + per FFN — the single-stream decode speedup (splits the weight
+    // GEMV). One-shot, dense models only; output equals single-device to reduction-order tolerance.
+    // Unset ⇒ the normal persistent-session chat below (byte-for-byte unchanged).
+    if let Some(devices) = infr_llama::seam::parse_tensor_parallel_devices()? {
+        let Some(msg) = message else {
+            anyhow::bail!(
+                "INFR_TENSOR_PARALLEL runs one-shot: pass a message, e.g. \
+                 INFR_TENSOR_PARALLEL=Vulkan0,Vulkan1 infr run {model} \"your prompt\""
+            );
+        };
+        if is_dg
+            || std::env::var_os("INFR_CPU").is_some()
+            || std::env::var_os("INFR_METAL").is_some()
+        {
+            anyhow::bail!("INFR_TENSOR_PARALLEL is a Vulkan dense path — not compatible with INFR_CPU / INFR_METAL / diffusion-gemma");
+        }
+        apply_model_sampling_defaults(&gguf);
+        let loaded = infr_llama::SeamModel::load(&gguf, tok.as_deref())?;
+        let rendered = loaded.render_chat(msg)?;
+        let out = loaded.generate_dense_vulkan_tp(&devices, &rendered, max_new)?;
+        println!("{out}");
+        return Ok(());
+    }
+
     // Build the per-backend generation primitive (`ChatModel`), then wrap it in the ONE shared `Chat`
     // (infr_llama::model) that owns history + `<think>`-stripping and drives the single REPL below:
     // INFR_CPU (dense/MoE/qwen35 on the agnostic compute graph, no Vulkan/VRAM), Vulkan/Metal GPU,

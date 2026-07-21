@@ -19,10 +19,14 @@ pub mod pager;
 mod pcache;
 pub mod pipeline;
 mod recorder;
+pub mod tp;
+pub mod tp_allreduce;
 
 pub use p2p::{P2pExport, P2pHandleType};
 pub use pipeline::{PipelineBackend, PipelineBuffer};
 pub use recorder::{FlashStage, RecordedCmd, Recorder};
+pub use tp::{TensorParallelBackend, TpBuffer, TpRole};
+pub use tp_allreduce::{AllReduce, AllReduceMode};
 
 /// Shared-memory bytes consumed per query row of a flash-attention prefill tile
 /// (`Ss` + `Ps` + `Os` + softmax state, at `BN=64` / `HD=128`). The tile height is chosen so
@@ -152,6 +156,12 @@ struct VulkanShared {
     /// True when this device enabled `VK_EXT_external_memory_dma_buf`, so the P2P export/import may
     /// use the dma-buf handle type (the cross-GPU-portable one on Linux) in addition to opaque-fd.
     has_dma_buf: bool,
+    /// `VK_KHR_external_semaphore_fd` loader — exports/imports a semaphore fd so a tensor-parallel
+    /// all-reduce can order a peer's read after this device's GPU-side signal with no host round-trip
+    /// (`AllReduceMode::P2pSemaphore`). `None` = the all-reduce uses the host fence (`queue_wait_idle`)
+    /// instead. v1 leaves this `None` (the host-fence all-reduce is the correctness deliverable; the
+    /// external-semaphore optimization is wired behind `external_semaphore_supported`).
+    external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
     /// Generic cache of compute kernels by name (see `ops.rs`).
     kernels: Mutex<HashMap<&'static str, crate::ops::ComputeKernel>>,
     /// Device pipeline cache, seeded from disk at init and persisted back (see `pcache.rs`) so
@@ -1964,6 +1974,9 @@ impl VulkanBackend {
                 push_descriptor,
                 external_memory_fd,
                 has_dma_buf: has_ext_mem_dma_buf,
+                // v1: not yet enabled at device creation — the all-reduce uses the host fence. Phase 2
+                // enables VK_KHR_external_semaphore(+_fd) and builds this loader for the zero-stall path.
+                external_semaphore_fd: None,
                 kernels: Mutex::new(HashMap::new()),
                 pipeline_cache,
                 pcache,

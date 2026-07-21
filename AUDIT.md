@@ -25,7 +25,10 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 - **Remaining: 5 — and all actionable fixes are DONE.** 0 🔴, 2 🟠, 3 🟡, every
   one either a documented **deferral** or requiring hardware not on this box:
   - 🟠 a Mac-only latent metal wrong-kernel dispatch (iq4xs/iq4nl) — needs an
-    Apple GPU to verify + re-point;
+    Apple GPU to verify + re-point (tracked in
+    [#80](https://github.com/kryptic-sh/infr/issues/80); the slice-23 metal
+    fixes themselves are GPU-verified in
+    [#81](https://github.com/kryptic-sh/infr/issues/81));
   - 🟠 `make_compute_kernel` OOM→`Result` — deferred (a 155-call-site
     `()`→`Result` migration disproportionate to a rare OOM path; panic messages
     improved);
@@ -446,6 +449,7 @@ byte-for-byte in the fix and flagged for a Mac to verify+fix._
    `linear_quik8_cmm_ks`, though their own `linear_iq4xs_cmm_ks`/
    `linear_iq4nl_cmm_ks` kernels exist** — so at m≥2/m≥5 with deep-k and
    `out_f%64==0` the wrong (quik8) kernel decodes their codes. Latent +
-   Metal-only
-   - preserved (not a regression); needs an Apple GPU to confirm and re-point
-     the two registry cells to the correct kernels.
+   Metal-only; preserved (not a regression). **Tracked in
+   [#80](https://github.com/kryptic-sh/infr/issues/80)** (cc @digitaloten) — an
+   Apple GPU re-points the two registry cells. The slice-23 metal fixes are
+   GPU-verified in [#81](https://github.com/kryptic-sh/infr/issues/81).

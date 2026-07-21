@@ -324,7 +324,7 @@ pub(crate) fn q6k_pack(wbytes: &[u8], in_f: usize, out_f: usize) -> Q6kPack {
 }
 
 /// The GEMM half over a prebuilt [`Q6kPackGroup`] — 8 output rows × all `m` activations. Same
-/// integer core as `vec_dot_q6k_batch_avx512bw` (dpbusd on biased codes, `-32·bsum16` split as
+/// integer core as `vec_dot_q6k_batch_vnni` (dpbusd on biased codes, `-32·bsum16` split as
 /// `-16·bsum16` per pair lane — exact) and the same per-super-block f32 sequence
 /// (`(d · q8.d) · isum`), so results are bit-identical to the batch/single kernels.
 #[cfg(target_arch = "x86_64")]

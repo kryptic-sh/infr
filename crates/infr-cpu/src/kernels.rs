@@ -13,6 +13,7 @@ use infr_gguf::dequant::{k4, rdf16};
 /// instead of re-summing q8 values per row.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(in_f % 256, 0, "vec_dot_q4k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") {
@@ -170,6 +171,7 @@ unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// sub-blocks of 16 (int8 scales).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q6k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(in_f % 256, 0, "vec_dot_q6k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") {
@@ -309,7 +311,8 @@ unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             for (ci, q6_col) in [q6_c0, q6_c2, q6_c4, q6_c6].iter().enumerate() {
                 let q8_ymm = _mm256_loadu_si256(q8b[base + ci * 32..].as_ptr() as *const __m256i);
 
-                // maddubs: q6_u8 (0–63) × q8_i8 (±127) → 16×i16 pair-sums (max ±8001 < 32767).
+                // maddubs: q6_u8 (0–63) × q8_i8 → 16×i16 pair-sums. Each pair sums two adjacent
+                // products, so the bound is 2·63·127 = 16002 (min −16128 at q8 = −128), < 32767.
                 // madd with 1: widen 16×i16 → 8×i32 (pairs summed).
                 let prod = _mm256_maddubs_epi16(*q6_col, q8_ymm);
                 let sum32 = _mm256_madd_epi16(prod, ones_i16);
@@ -459,6 +462,11 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q8_0(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_q8_0: in_f must be a multiple of 256"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") {
@@ -574,6 +582,7 @@ unsafe fn vec_dot_q8_0_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q5k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(in_f % 256, 0, "vec_dot_q5k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") {
@@ -812,26 +821,26 @@ fn vec_dot_q4k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]
     }
 }
 
+/// Decode one Q4_K weight row into the batch kernels' shared scratch: per-block `d`/`dmin`, the
+/// eight `sc`/`m` sub-block scales, and nibble-expanded `q4_flat` in the pair-interleaved layout
+/// `flat[b*256 + k*64 .. +64] = [lo_nib(sub-block 2k) (32 B), hi_nib(sub-block 2k+1) (32 B)]`,
+/// directly loadable as a ymm/zmm per pair `k`. This is the exact decode the AVX2/AVX512BW/VNNI
+/// Q4_K batch kernels shared verbatim — factored out so the nibble-unpack lives in one place.
+/// Bit-identical by construction: only integer/f16 decode, no float reduction.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-unsafe fn vec_dot_q4k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+#[inline]
+unsafe fn q4k_decode_row(
+    row: &[u8],
+    nb: usize,
+    d_arr: &mut [f32],
+    dmin_arr: &mut [f32],
+    sc_arr: &mut [[u32; 8]],
+    m_arr: &mut [[u32; 8]],
+    q4_flat: &mut [u8],
+) {
     use std::arch::x86_64::*;
-    let m = q8s.len();
-    let nb = in_f / 256;
     let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
-    let ones = _mm256_set1_epi16(1i16);
-
-    // Pre-expand nibbles into flat[b*256..b*256+256] once.
-    // Layout: flat[b*256 + s*32 .. b*256 + s*32 + 32] = expanded q4 for sub-block s.
-    // For pair k: flat[b*256 + k*64..b*256 + k*64 + 32] = lo nibbles (sub-block 2k),
-    //             flat[b*256 + k*64 + 32..b*256 + k*64 + 64] = hi nibbles (sub-block 2k+1).
-    let mut d_arr = vec![0f32; nb];
-    let mut dmin_arr = vec![0f32; nb];
-    let mut sc_arr = vec![[0u32; 8]; nb];
-    let mut m_arr = vec![[0u32; 8]; nb];
-    let mut q4_flat = vec![0u8; nb * 256];
-
     for b in 0..nb {
         let blk = &row[b * 144..b * 144 + 144];
         d_arr[b] = rdf16(&blk[0..2]);
@@ -853,6 +862,33 @@ unsafe fn vec_dot_q4k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             _mm256_storeu_si256(flat[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi_nib);
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q4k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let ones = _mm256_set1_epi16(1i16);
+
+    // Pre-expand nibbles into flat[b*256..b*256+256] once (see q4k_decode_row for the layout).
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![[0u32; 8]; nb];
+    let mut m_arr = vec![[0u32; 8]; nb];
+    let mut q4_flat = vec![0u8; nb * 256];
+
+    q4k_decode_row(
+        row,
+        nb,
+        &mut d_arr,
+        &mut dmin_arr,
+        &mut sc_arr,
+        &mut m_arr,
+        &mut q4_flat,
+    );
 
     // Per-token dots: load pre-expanded q4 ymm + q8 ymm, maddubs → madd → hadd.
     // Accumulation order identical to single-token AVX2 kernel → bit-identical result.
@@ -886,37 +922,25 @@ unsafe fn vec_dot_q4k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
     use std::arch::x86_64::*;
     let m = q8s.len();
     let nb = in_f / 256;
-    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
     let ones512 = _mm512_set1_epi16(1i16);
 
-    // Pre-expand nibbles (same layout as AVX2 batch): flat[b*256 + k*64..+64] =
-    // [lo_nib_2k (32 B), hi_nib_2k+1 (32 B)], directly loadable as a zmm per pair k.
+    // Pre-expand nibbles (same layout as AVX2 batch, see q4k_decode_row): flat[b*256 + k*64..+64]
+    // = [lo_nib_2k (32 B), hi_nib_2k+1 (32 B)], directly loadable as a zmm per pair k.
     let mut d_arr = vec![0f32; nb];
     let mut dmin_arr = vec![0f32; nb];
     let mut sc_arr = vec![[0u32; 8]; nb];
     let mut m_arr = vec![[0u32; 8]; nb];
     let mut q4_flat = vec![0u8; nb * 256];
 
-    for b in 0..nb {
-        let blk = &row[b * 144..b * 144 + 144];
-        d_arr[b] = rdf16(&blk[0..2]);
-        dmin_arr[b] = rdf16(&blk[2..4]);
-        let scales = &blk[4..16];
-        let qs = &blk[16..144];
-        for s in 0..8usize {
-            let (sc, mv) = k4(s, scales);
-            sc_arr[b][s] = sc;
-            m_arr[b][s] = mv;
-        }
-        let flat = &mut q4_flat[b * 256..b * 256 + 256];
-        for k in 0..4usize {
-            let nibbles = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
-            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
-            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
-            _mm256_storeu_si256(flat[k * 64..].as_mut_ptr() as *mut __m256i, lo_nib);
-            _mm256_storeu_si256(flat[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi_nib);
-        }
-    }
+    q4k_decode_row(
+        row,
+        nb,
+        &mut d_arr,
+        &mut dmin_arr,
+        &mut sc_arr,
+        &mut m_arr,
+        &mut q4_flat,
+    );
 
     // Per-token: one zmm load per pair (64 pre-expanded bytes) + one zmm q8 load.
     // maddubs512 → madd512 → split ymm → hadd×2. Identical to single-token avx512bw kernel.
@@ -961,34 +985,23 @@ unsafe fn vec_dot_q4k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
     use std::arch::x86_64::*;
     let m = q8s.len();
     let nb = in_f / 256;
-    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
 
+    // Pre-expand nibbles (same layout as AVX2 batch, see q4k_decode_row).
     let mut d_arr = vec![0f32; nb];
     let mut dmin_arr = vec![0f32; nb];
     let mut sc_arr = vec![[0u32; 8]; nb];
     let mut m_arr = vec![[0u32; 8]; nb];
     let mut q4_flat = vec![0u8; nb * 256];
 
-    for b in 0..nb {
-        let blk = &row[b * 144..b * 144 + 144];
-        d_arr[b] = rdf16(&blk[0..2]);
-        dmin_arr[b] = rdf16(&blk[2..4]);
-        let scales = &blk[4..16];
-        let qs = &blk[16..144];
-        for s in 0..8usize {
-            let (sc, mv) = k4(s, scales);
-            sc_arr[b][s] = sc;
-            m_arr[b][s] = mv;
-        }
-        let flat = &mut q4_flat[b * 256..b * 256 + 256];
-        for k in 0..4usize {
-            let nibbles = _mm256_loadu_si256(qs[k * 32..].as_ptr() as *const __m256i);
-            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
-            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
-            _mm256_storeu_si256(flat[k * 64..].as_mut_ptr() as *mut __m256i, lo_nib);
-            _mm256_storeu_si256(flat[k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi_nib);
-        }
-    }
+    q4k_decode_row(
+        row,
+        nb,
+        &mut d_arr,
+        &mut dmin_arr,
+        &mut sc_arr,
+        &mut m_arr,
+        &mut q4_flat,
+    );
 
     for r in 0..m {
         let q8 = &q8s[r];
@@ -1022,6 +1035,11 @@ unsafe fn vec_dot_q4k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 /// the single-token kernel. The weight row is decoded ONCE; per-token work is the integer dot only.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_q4k_batch: in_f must be a multiple of 256"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
@@ -1286,6 +1304,11 @@ pub(crate) fn vec_dot_q4k_batch2(
     out_a: &mut [f32],
     out_b: &mut [f32],
 ) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_q4k_batch2: in_f must be a multiple of 256"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
@@ -1609,6 +1632,11 @@ unsafe fn vec_dot_q4k_batch8_ilv_vnni(
 /// reuse over single-row, 4× over 2-row. Falls back to 8× `vec_dot_q4k_batch` on older CPUs.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs: [&mut [f32]; 8]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_q4k_batch8: in_f must be a multiple of 256"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
@@ -1816,7 +1844,7 @@ unsafe fn vec_dot_q6k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw,avx512vnni")]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+unsafe fn vec_dot_q6k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     use std::arch::x86_64::*;
     let m = q8s.len();
     let nb = in_f / 256;
@@ -1980,10 +2008,15 @@ unsafe fn vec_dot_q6k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_q6k_batch: in_f must be a multiple of 256"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
-            return unsafe { vec_dot_q6k_batch_avx512bw(row, q8s, in_f, out) };
+            return unsafe { vec_dot_q6k_batch_vnni(row, q8s, in_f, out) };
         }
         if is_x86_feature_detected!("avx2") {
             return unsafe { vec_dot_q6k_batch_avx2(row, q8s, in_f, out) };
@@ -2138,6 +2171,11 @@ unsafe fn vec_dot_q8_0_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: 
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q8_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_q8_0_batch: in_f must be a multiple of 256"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") {
@@ -2391,6 +2429,11 @@ unsafe fn vec_dot_q5k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_q5k_batch: in_f must be a multiple of 256"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw") {
@@ -2912,13 +2955,28 @@ pub(crate) fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
     s
 }
 
-/// `Σ bf16_weight·x` (bf16 = top 16 bits of f32).
+/// `Σ bf16_weight·x` (bf16 = top 16 bits of f32). Uses 8 independent accumulators — the same
+/// chunked structure as [`dot`]/[`dot_f16`] — so the reduction isn't a latency-bound FMA chain
+/// (the old single serial accumulator was several× slower on the bf16-weight hot path). NOTE:
+/// the 8-lane summation order differs from that serial chain, so this is NOT bit-identical to the
+/// previous `dot_bf16`; it now matches `dot`/`dot_f16` bit-for-bit for the same bf16-rounded
+/// weights (a legitimate float reorder, not a numeric bug).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
-    let mut s = 0f32;
-    for (i, &xi) in x.iter().enumerate() {
+    let mut acc = [0f32; 8];
+    let n = x.len();
+    let chunks = n / 8;
+    for c in 0..chunks {
+        for (j, ac) in acc.iter_mut().enumerate() {
+            let i = c * 8 + j;
+            let wv = f32::from_bits((u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]) as u32) << 16);
+            *ac = wv.mul_add(x[i], *ac);
+        }
+    }
+    let mut s: f32 = acc.iter().sum();
+    for i in chunks * 8..n {
         let wv = f32::from_bits((u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]) as u32) << 16);
-        s = wv.mul_add(xi, s);
+        s = wv.mul_add(x[i], s);
     }
     s
 }
@@ -2930,6 +2988,7 @@ pub(crate) fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
 #[inline]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot: a and b must have equal length");
     let n = a.len().min(b.len());
     let chunks = n / 8;
     let mut acc = [0f32; 8];
@@ -3359,7 +3418,126 @@ mod kernel_tests {
             .iter()
             .map(|&v| f32::from_bits((v.to_bits() >> 16) << 16))
             .collect();
-        assert!(rel_err(dot_bf16(&wbytes, &x), dot(&wref, &x)) < 1e-4);
+        // dot_bf16 now uses the same 8-accumulator chunked structure as `dot`, so on the same
+        // bf16-rounded weights it is bit-identical to `dot` — not merely close.
+        assert_eq!(
+            dot_bf16(&wbytes, &x).to_bits(),
+            dot(&wref, &x).to_bits(),
+            "dot_bf16 must match dot's 8-accumulator reduction bit-for-bit",
+        );
+    }
+
+    // #1: dot_bf16 must reproduce an explicit 8-accumulator reference (the new structure) and
+    // that reduction order must differ from the old single serial accumulator on this vector —
+    // documenting that the bf16 result changed bit-for-bit (a legitimate float reorder).
+    #[test]
+    fn bf16_dot_is_8_accumulator_reorder() {
+        let n = 2050; // many chunks + a tail so lane grouping actually reorders the sum
+        let x = det_x(n, 11);
+        let wf = det_x(n, 12);
+        let wbytes: Vec<u8> = wf
+            .iter()
+            .flat_map(|&v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let wref: Vec<f32> = wf
+            .iter()
+            .map(|&v| f32::from_bits((v.to_bits() >> 16) << 16))
+            .collect();
+
+        // Explicit 8-lane reference (mirrors dot/dot_f16).
+        let mut acc = [0f32; 8];
+        let chunks = n / 8;
+        for c in 0..chunks {
+            for (j, ac) in acc.iter_mut().enumerate() {
+                let i = c * 8 + j;
+                *ac = wref[i].mul_add(x[i], *ac);
+            }
+        }
+        let mut want = acc.iter().sum::<f32>();
+        for i in chunks * 8..n {
+            want = wref[i].mul_add(x[i], want);
+        }
+
+        // Old serial single-accumulator reference (what dot_bf16 used to compute).
+        let mut serial = 0f32;
+        for i in 0..n {
+            serial = wref[i].mul_add(x[i], serial);
+        }
+
+        assert_eq!(
+            dot_bf16(&wbytes, &x).to_bits(),
+            want.to_bits(),
+            "dot_bf16 must equal the 8-accumulator reference bit-for-bit",
+        );
+        assert_ne!(
+            want.to_bits(),
+            serial.to_bits(),
+            "8-accumulator reorder must differ from the old serial chain (bf16 golden shifts)",
+        );
+    }
+
+    // #2: the 256-block debug_assert fires when in_f is not a multiple of 256 (debug builds).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must be a multiple of 256")]
+    fn q4k_non_multiple_of_256_debug_asserts() {
+        let q8 = quantize_q8(&det_x(256, 1));
+        let w = det_bytes(144, 2);
+        let _ = vec_dot_q4k(&w, &q8, 200); // 200 % 256 != 0
+    }
+
+    // #4: q4k_decode_row reproduces the inline scalar decode bit-for-bit on a sample row.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4k_decode_row_matches_scalar_decode() {
+        if !is_x86_feature_detected!("avx2") {
+            return; // helper is avx2-gated; nothing to check on this host
+        }
+        let nb = 3usize;
+        let mut row = det_bytes(nb * 144, 99);
+        for b in 0..nb {
+            put_f16(&mut row[b * 144..b * 144 + 2], 0.05);
+            put_f16(&mut row[b * 144 + 2..b * 144 + 4], 0.015);
+        }
+        let mut d_arr = vec![0f32; nb];
+        let mut dmin_arr = vec![0f32; nb];
+        let mut sc_arr = vec![[0u32; 8]; nb];
+        let mut m_arr = vec![[0u32; 8]; nb];
+        let mut q4_flat = vec![0u8; nb * 256];
+        unsafe {
+            q4k_decode_row(
+                &row,
+                nb,
+                &mut d_arr,
+                &mut dmin_arr,
+                &mut sc_arr,
+                &mut m_arr,
+                &mut q4_flat,
+            );
+        }
+        for b in 0..nb {
+            let blk = &row[b * 144..b * 144 + 144];
+            assert_eq!(d_arr[b].to_bits(), rdf16(&blk[0..2]).to_bits());
+            assert_eq!(dmin_arr[b].to_bits(), rdf16(&blk[2..4]).to_bits());
+            let scales = &blk[4..16];
+            let qs = &blk[16..144];
+            for s in 0..8usize {
+                let (sc, mv) = k4(s, scales);
+                assert_eq!(sc_arr[b][s], sc, "sc mismatch b={b} s={s}");
+                assert_eq!(m_arr[b][s], mv, "m mismatch b={b} s={s}");
+                let hi = s % 2 == 1;
+                let half = s / 2;
+                let qbyte = &qs[half * 32..half * 32 + 32];
+                for l in 0..32 {
+                    let want = if hi { qbyte[l] >> 4 } else { qbyte[l] & 0xF };
+                    assert_eq!(
+                        q4_flat[b * 256 + s * 32 + l],
+                        want,
+                        "flat b={b} s={s} l={l}"
+                    );
+                }
+            }
+        }
     }
 
     // ── Batch kernel bit-identity tests ──────────────────────────────────────

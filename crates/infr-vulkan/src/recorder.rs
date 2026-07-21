@@ -548,7 +548,10 @@ impl<'a> Recorder<'a> {
         const MAX_TS: u32 = Recorder::<'_>::MAX_TS;
         // No per-op profiling on the persistent (replayed) path — the recorder is dropped after
         // recording, so it can't report timestamps for replays.
-        let prof2 = std::env::var("INFR_PROF2").is_ok() && !persistent;
+        // `prof2_suppressed` is the non-env suppression path (see `infr_prof_rt`): benches /
+        // warmups toggle it around untimed work instead of mutating the `INFR_PROF2` env var.
+        let prof2 =
+            std::env::var("INFR_PROF2").is_ok() && !persistent && !infr_prof_rt::prof2_suppressed();
         let prof2_shapes = prof2 && std::env::var("INFR_PROF2_SHAPES").is_ok();
         let query_pool = if prof2 {
             let qp = unsafe {

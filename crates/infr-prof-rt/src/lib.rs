@@ -194,6 +194,27 @@ pub fn gpu_reset() {
     GPU.lock().unwrap().clear();
 }
 
+/// Runtime "suppress per-op GPU profiling" flag — the non-env replacement for the old
+/// `INFR_PROF2` env unset/restore dance (which mutated a process-global table around a
+/// rayon-parallel forward: a data race, and `set_var` is `unsafe` under edition 2024). Set true
+/// around untimed warmup / cache-warming work whose dispatches must not pollute the profile; the
+/// Vulkan recorder ANDs [`prof2_suppressed`] into its `INFR_PROF2` construction check, so those
+/// submits record no timestamps. A plain `AtomicBool`: set/cleared on the thread that spawns and
+/// joins the parallel region, so its writes happen-before the workers' reads.
+static PROF2_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Set the [`PROF2_SUPPRESSED`] flag, returning the PRIOR value so the caller can restore it
+/// (supports nesting). See [`prof2_suppressed`].
+pub fn set_prof2_suppressed(v: bool) -> bool {
+    PROF2_SUPPRESSED.swap(v, Relaxed)
+}
+
+/// Whether per-op GPU profiling is currently suppressed (see [`set_prof2_suppressed`]). The Vulkan
+/// recorder reads this at construction alongside `INFR_PROF2`.
+pub fn prof2_suppressed() -> bool {
+    PROF2_SUPPRESSED.load(Relaxed)
+}
+
 /// Open a span for `site` on the current thread. Returns an RAII guard; span closes when the
 /// guard drops (any exit path). Must be strictly LIFO per thread — guaranteed because the guard
 /// is a local of the instrumented fn.

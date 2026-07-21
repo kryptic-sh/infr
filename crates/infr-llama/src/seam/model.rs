@@ -3,7 +3,7 @@
 use crate::*;
 use anyhow::{anyhow, Result};
 use infr_chat::{render_chat_jinja, render_chat_user};
-use infr_core::backend::{Backend, BufferUsage};
+use infr_core::backend::Backend;
 use infr_cpu::CpuBackend;
 use infr_gguf::Gguf;
 use std::path::Path;
@@ -27,6 +27,10 @@ pub struct SeamModel {
     token_embd: std::sync::OnceLock<Vec<f32>>,
     per_layer_embd: Option<PerLayerEmbd>,
     tokenizer: Tokenizer,
+    /// Memoized resident weight footprint (a full tensor-metadata scan). The session-open clamp
+    /// path recomputes this 2-3× (`kv_fit_ctx` → `kv_fit_ctx_fmt`, the auto-q8 re-probe, then the
+    /// clamp log line) — cache it so the scan runs once per model. See [`SeamModel::footprint`].
+    footprint: std::sync::OnceLock<crate::weights::WeightFootprint>,
 }
 
 /// The conversation SLOTS a persistent GPU seam session owns: up to `INFR_KV_SLOTS` (default 4)
@@ -43,6 +47,26 @@ struct SlotPool {
     slots: Vec<Option<crate::seam::SeamKv>>,
     last_used: Vec<u64>,
     tick: u64,
+}
+
+/// Pure continuation-slot selection (the "this conversation continuing" arm of [`SlotPool::pick`],
+/// and the twin of [`crate::parallel`]'s `pick_continuation`). Given `(slot_idx, prefix_score,
+/// cached_len)` per candidate slot and `prompt_len`, pick the qualifying slot with the LONGEST
+/// reusable prefix — a slot qualifies when the prompt EXTENDS its cache (`score == cached_len`) or
+/// EQUALS it (`score == prompt_len`), and its score is positive. Returns the winning `slot_idx`, or
+/// `None` if no slot qualifies. Handing out the shorter of two prefix-matching slots (the old
+/// `find`-first behavior) is merely correct — the runner just re-prefills more suffix than needed.
+///
+/// Split out as a pure fn so this decision is unit-testable without a live backend / KV slots.
+fn pick_continuation(
+    candidates: impl IntoIterator<Item = (usize, usize, usize)>,
+    prompt_len: usize,
+) -> Option<usize> {
+    candidates
+        .into_iter()
+        .filter(|&(_, score, cached)| score > 0 && (score == cached || score == prompt_len))
+        .max_by_key(|&(_, score, _)| score)
+        .map(|(idx, _, _)| idx)
 }
 
 /// Open a Vulkan backend on physical device `dev`: `Some(idx)` pins `VulkanN`
@@ -158,13 +182,17 @@ impl SlotPool {
         }
         let score =
             |st: &Option<crate::seam::SeamKv>| st.as_ref().map_or(0, |s| s.prefix_score(prompt));
-        // A slot whose cache the prompt EXTENDS (or equals) is this conversation continuing.
-        if let Some(i) = (0..self.slots.len()).find(|&i| {
-            self.slots[i].as_ref().is_some_and(|s| {
-                let p = s.prefix_score(prompt);
-                p > 0 && (p == s.cached_len() || p == prompt.len())
-            })
-        }) {
+        // A slot whose cache the prompt EXTENDS (or equals) is this conversation continuing — pick
+        // the one with the LONGEST reusable prefix, not merely the first (see `pick_continuation`).
+        let cont = pick_continuation(
+            (0..self.slots.len()).filter_map(|i| {
+                self.slots[i]
+                    .as_ref()
+                    .map(|s| (i, s.prefix_score(prompt), s.cached_len()))
+            }),
+            prompt.len(),
+        );
+        if let Some(i) = cont {
             self.last_used[i] = self.tick;
             return Ok(i);
         }
@@ -306,7 +334,16 @@ impl SeamModel {
             token_embd: std::sync::OnceLock::new(),
             per_layer_embd,
             tokenizer,
+            footprint: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The model's resident weight footprint, computed once and memoized (see the `footprint`
+    /// field). `WeightFootprint` is `Copy`, so callers get it by value.
+    fn footprint(&self) -> crate::weights::WeightFootprint {
+        *self
+            .footprint
+            .get_or_init(|| crate::weights::weight_footprint(&self.gguf))
     }
 
     /// Open a persistent Vulkan seam session: weights uploaded ONCE, the KV cache sized to
@@ -445,7 +482,7 @@ impl SeamModel {
                 return want;
             }
             let vram = vk.vram();
-            let fp = crate::weights::weight_footprint(&self.gguf);
+            let fp = self.footprint();
             eprintln!(
                 "ctx clamp: default context {want} -> {fit} to fit VRAM (weights {:.2} GiB vs \
                  {:.2} GiB available{}); set INFR_CTX to override",
@@ -524,7 +561,7 @@ impl SeamModel {
         if kv_per_tok == 0 {
             return None;
         }
-        let fp = crate::weights::weight_footprint(&self.gguf);
+        let fp = self.footprint();
         let free = vram
             .available
             .saturating_sub(fp.dense + fp.expert + act_headroom);
@@ -586,11 +623,7 @@ impl SeamModel {
         req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let slot = session.pool.pick(&session.vk, &self.cfg, &prompt_tokens)?;
@@ -875,11 +908,7 @@ impl SeamModel {
     /// compiled + executed by `VulkanBackend`; greedy tokens are detokenized. Same graph, two
     /// backends — this is the end-to-end dense CPU↔GPU parity path.
     pub fn generate_dense_vulkan(&self, prompt: &str, max_new: usize) -> Result<String> {
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let vk = infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan(
             &vk,
@@ -934,11 +963,7 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
     ) -> Result<String> {
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_pipeline(
             devices,
             &self.gguf,
@@ -987,11 +1012,7 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
     ) -> Result<String> {
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_tp(
             devices,
             &self.gguf,
@@ -1040,11 +1061,7 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
     ) -> Result<String> {
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_moe_vulkan_ep(
             devices,
             &self.gguf,
@@ -1125,23 +1142,18 @@ impl SeamModel {
         };
         // Untimed work must stay out of the INFR_PROF2 profile: the warmup turn's m7 batched
         // rows and the depth warm's huge prefill would otherwise dominate/pollute the per-shape
-        // aggregate for the tiny timed shape (recorders read the env at construction, so
-        // suppressing it around a run() disables their timestamps entirely). Same pattern as
-        // DenseSeamChat::warmup. `gpu_reset` additionally drops anything profiled before the
-        // timed reps (e.g. session-init submits) from the exit aggregate.
+        // aggregate for the tiny timed shape (recorders read the suppression flag at construction,
+        // so suppressing around a run() disables their timestamps entirely). Same pattern as
+        // DenseSeamChat::warmup. Routes through `with_prof2_suppressed` — an AtomicBool flag, NOT
+        // an `INFR_PROF2` env mutation, so it never races the rayon-parallel forward inside `run`
+        // (env is a process-wide table; `set_var` is `unsafe` under edition 2024). `gpu_reset`
+        // additionally drops anything profiled before the timed reps (e.g. session-init submits)
+        // from the exit aggregate.
         let unprofiled = |prompt_len: usize,
                           gen: usize,
                           state: &mut Option<crate::seam::SeamKv>|
          -> Result<crate::GenStats> {
-            let prof2 = std::env::var_os("INFR_PROF2");
-            if prof2.is_some() {
-                std::env::remove_var("INFR_PROF2");
-            }
-            let r = run(prompt_len, gen, state);
-            if let Some(v) = prof2 {
-                std::env::set_var("INFR_PROF2", v);
-            }
-            r
+            crate::with_prof2_suppressed(|| run(prompt_len, gen, state))
         };
         // Untimed warmup: uploads the weights and compiles every pipeline the timed reps hit.
         unprofiled(8, 2, &mut state)?;
@@ -1215,11 +1227,7 @@ impl SeamModel {
         req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let slot = session.pool.pick(&session.mtl, &self.cfg, &prompt_tokens)?;
@@ -1252,11 +1260,7 @@ impl SeamModel {
         req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mtl = infr_metal::MetalBackend::new().map_err(|e| anyhow!("metal init: {e}"))?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
@@ -1314,11 +1318,7 @@ impl SeamModel {
             }
             bi as u32
         };
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let mut committed: Vec<u32> = enc.get_ids().to_vec();
+        let mut committed: Vec<u32> = self.encode(prompt)?;
         let n_prompt = committed.len();
 
         // Conversation slots, like the plain session chat: pick the best-prefix slot in BOTH
@@ -1353,6 +1353,13 @@ impl SeamModel {
         let prompt_secs = t0.elapsed().as_secs_f64();
         let mut t_next = *first.first().ok_or_else(|| anyhow!("empty first token"))?;
         let mut out: Vec<u32> = Vec::new();
+        // Persistent verify feed (= committed ++ this round's candidates). Reused across rounds:
+        // each round syncs only the tokens committed SINCE the last round (`feed_committed_len`
+        // tracks the committed prefix already in `feed`) then appends the fresh candidates, so the
+        // total copy work is O(generation) rather than the O(n²) of cloning all of `committed`
+        // every verify round.
+        let mut feed: Vec<u32> = Vec::new();
+        let mut feed_committed_len = 0usize;
         let ignore_eos = std::env::var("INFR_IGNORE_EOS").is_ok();
         let t1 = std::time::Instant::now();
         // Adaptive draft length: k tracks recent acceptance (EMA) — code-shaped output
@@ -1398,8 +1405,12 @@ impl SeamModel {
                 None,
             )?;
             // Verify: one batched target forward over [t_next, cand..]; row i's argmax is the
-            // target's choice after consuming everything up to and including suffix row i.
-            let mut feed = committed.clone();
+            // target's choice after consuming everything up to and including suffix row i. Rebuild
+            // `feed` = committed ++ cand WITHOUT re-cloning committed: drop last round's candidate
+            // tail, append only the newly-committed tokens, then this round's candidates.
+            feed.truncate(feed_committed_len);
+            feed.extend_from_slice(&committed[feed_committed_len..]);
+            feed_committed_len = committed.len();
             feed.extend_from_slice(&cand);
             if feed.len() + 1 > session.max_ctx {
                 break; // context full: the committed stream is still exact
@@ -1533,11 +1544,7 @@ impl SeamModel {
         req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        let enc = self
-            .tokenizer
-            .encode(prompt, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         // Stream each generated token: incrementally detokenize and emit the new suffix.
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
@@ -1616,21 +1623,10 @@ impl DiffusionGemmaCpuSession {
     /// continues the session (ChatSession-style prefix reuse), matching every other session on
     /// this seam.
     pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
+        let bind = crate::seam::cpu_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &|_name, tb, dt, _n| match tb {
-                crate::seam::WBytes::Mmap(tb) => Ok((self.be.map_weight(tb), dt)),
-                crate::seam::WBytes::Owned(v) => {
-                    let buf = self
-                        .be
-                        .alloc(v.len().max(1), BufferUsage::Weights)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    self.be
-                        .upload(buf.as_ref(), &v)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    Ok((buf, dt))
-                }
-            },
+            &*bind,
             &model.gguf,
             &model.cfg,
             model.embd(),
@@ -1667,21 +1663,10 @@ impl DiffusionGemmaCpuSession {
     ) -> Result<Vec<f32>> {
         let mut out_logits = Vec::new();
         let mut reduced = None; // CPU never requests the GPU reducer (`u: None` below) — stays `None`
+        let bind = crate::seam::cpu_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &|_name, tb, dt, _n| match tb {
-                crate::seam::WBytes::Mmap(tb) => Ok((self.be.map_weight(tb), dt)),
-                crate::seam::WBytes::Owned(v) => {
-                    let buf = self
-                        .be
-                        .alloc(v.len().max(1), BufferUsage::Weights)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    self.be
-                        .upload(buf.as_ref(), &v)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    Ok((buf, dt))
-                }
-            },
+            &*bind,
             &model.gguf,
             &model.cfg,
             model.embd(),
@@ -1832,18 +1817,10 @@ impl DiffusionGemmaVulkanSession {
 impl DiffusionGemmaMetalSession {
     /// [`DiffusionGemmaCpuSession::prefill`]'s Metal twin.
     pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
+        let bind = crate::seam::metal_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &|_name, tb, dt, _n| {
-                let buf = self
-                    .be
-                    .alloc(tb.len().max(1), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                self.be
-                    .upload(buf.as_ref(), &tb)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok((buf, dt))
-            },
+            &*bind,
             &model.gguf,
             &model.cfg,
             model.embd(),
@@ -1874,18 +1851,10 @@ impl DiffusionGemmaMetalSession {
     ) -> Result<Vec<f32>> {
         let mut out_logits = Vec::new();
         let mut reduced = None; // Metal never requests the GPU reducer (`u: None` below, Phase D — Vulkan only for this slice)
+        let bind = crate::seam::metal_upload_bind(&self.be);
         crate::seam::generate_dense_backend(
             &self.be,
-            &|_name, tb, dt, _n| {
-                let buf = self
-                    .be
-                    .alloc(tb.len().max(1), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                self.be
-                    .upload(buf.as_ref(), &tb)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok((buf, dt))
-            },
+            &*bind,
             &model.gguf,
             &model.cfg,
             model.embd(),
@@ -2019,12 +1988,17 @@ pub(crate) fn spec_accept_stochastic(
         } else {
             // Degenerate: q_i == p_i pointwise on p_i's support, so the residual is empty, yet the
             // coin still rejected (only possible if x itself sat outside p_i's support, p_x == 0).
-            // Fall back to p_i's own top choice so the cycle always makes forward progress.
+            // Fall back to p_i's own top choice so the cycle always makes forward progress. p_i
+            // itself being EMPTY is a caller contract violation (a truncated target distribution
+            // always has ≥1 entry) — panic with a clear message rather than silently emit token 0.
             p_dists[i]
                 .iter()
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|&(id, _)| id)
-                .unwrap_or(0)
+                .expect(
+                    "spec_accept_stochastic: p_dists[i] is empty — a truncated target \
+                     distribution must carry at least one entry",
+                )
         };
         return (i, next);
     }
@@ -2090,6 +2064,20 @@ mod spec_accept_tests {
 #[cfg(test)]
 mod spec_accept_stochastic_tests {
     use super::{residual_dist, spec_accept_stochastic};
+
+    #[test]
+    #[should_panic(expected = "p_dists[i] is empty")]
+    fn empty_target_distribution_panics_not_token_zero() {
+        // Degenerate caller contract violation: p_dists[0] is EMPTY. Then p_x == 0 ⇒ ratio 0 ⇒ the
+        // coin always rejects; the residual is empty (no p mass); and p_dists[0] has no top choice.
+        // The old fallback silently returned token id 0 — now it must panic with a clear message
+        // instead of emitting a possibly-invalid token.
+        let cand = [5u32];
+        let q_dists = vec![vec![(5u32, 1.0f32)]];
+        let p_dists = vec![vec![], vec![(10u32, 1.0f32)]]; // len == cand.len() + 1
+        let mut rng = 1u64;
+        let _ = spec_accept_stochastic(&cand, &q_dists, &p_dists, &mut rng);
+    }
 
     #[test]
     fn identical_p_q_always_accepts() {
@@ -2172,5 +2160,39 @@ mod spec_accept_stochastic_tests {
         let b = spec_accept_stochastic(&cand, &q_dists, &p_dists, &mut rng_b);
         assert_eq!(a, b, "same seed must reproduce the same accept decision");
         assert_eq!(rng_a, rng_b, "same seed must reproduce the same rng stream");
+    }
+}
+
+#[cfg(test)]
+mod pick_continuation_tests {
+    use super::pick_continuation;
+
+    #[test]
+    fn picks_longest_prefix_not_first() {
+        // Two slots both continue (prompt extends their cache: score == cached_len); slot 2 has the
+        // LONGER reusable prefix, so it must win even though slot 0 appears first. Slot 1 is a
+        // different conversation (score below both its cache and prompt_len).
+        let candidates = [
+            (0usize, 20usize, 20usize), // extends: score 20 == cached 20
+            (1, 5, 40),                 // no: 5 != 40 and 5 != 100
+            (2, 60, 60),                // extends: score 60 == cached 60 (longest)
+        ];
+        assert_eq!(pick_continuation(candidates, 100), Some(2));
+    }
+
+    #[test]
+    fn accepts_exact_equal_prompt() {
+        // score == prompt_len (the prompt EQUALS the cache) qualifies even when cached_len differs.
+        let candidates = [(7usize, 30usize, 50usize)];
+        assert_eq!(pick_continuation(candidates, 30), Some(7));
+    }
+
+    #[test]
+    fn none_when_no_slot_qualifies() {
+        // A partial-but-diverged prefix (score < cached_len and < prompt_len) does not continue.
+        let candidates = [(0usize, 10usize, 40usize), (1, 0, 0)];
+        assert_eq!(pick_continuation(candidates, 100), None);
+        // Empty candidate set.
+        assert_eq!(pick_continuation(std::iter::empty(), 100), None);
     }
 }

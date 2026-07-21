@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **102** — 0 🔴, 16 🟠, 86 🟡.
+- **Remaining open:** **96** — 0 🔴, 16 🟠, 80 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -135,6 +135,18 @@ parked path).
   from an `impl Deref`; and `parse_device_list` / `run_dense_oneshot` /
   `dense_multi_gpu_guard` / `cpu_upload_bind`/`metal_upload_bind` de-duplicate
   the multi-GPU + backend-bind boilerplate.
+- **`infr-llama` seam/model+weights+sc (all 6 findings)** — TDD, +5 tests.
+  `SlotPool::pick` now picks the longest-prefix slot (was first-match, via a
+  pure `pick_continuation`); `bench_vulkan`'s unsafe `INFR_PROF2` env race is
+  gone — suppression is a non-env `AtomicBool` in infr-prof-rt that the recorder
+  reads (also fixes the warmup callers); `generate_metal_spec` reuses a
+  persistent `feed` buffer (was O(n²) `committed.clone()` per round);
+  `weight_footprint` is memoized on `SeamModel` (one scan/open);
+  `spec_accept_stochastic` `.expect()`s the empty-distribution contract instead
+  of emitting a bogus token 0; the ~8 `tokenizer.encode` sites and the
+  DiffusionGemma upload closures route through shared helpers. No logits/golden
+  path touched. **infr-llama's seam core is now fully cleared** (only the parked
+  MTP slice remains in this crate).
 
 ### Highest-priority (production default paths)
 
@@ -170,8 +182,6 @@ detail per module below.
 - **`assert!`/`.expect()`/`panic!` on recoverable input** (unregistered pager
   buffers, `GpuPager::new`, `Op::Copy` src_off, `make_compute_kernel` OOM, GGUF
   parse, `Op::Sample` `top_k==0`) — should return `Err`.
-- **First-match-not-longest-prefix slot pick** duplicated in `seam/model.rs` and
-  `parallel.rs` (wasted prefill).
 - **Name-table vs SPV-table drift guarded only at runtime by `.expect()`**
   across `gemm.rs`/`linear.rs` and Metal `exec.rs` — a missing dtype =
   mid-inference panic.
@@ -615,40 +625,6 @@ weighted highest._
    embarrassingly-parallel `fill[]=0` reset into the 1-lane scan kernel, forcing
    the scatter pass to wait on the scan for a zero it doesn't depend on — split
    the reset out (parallel clear / `vkCmdFillBuffer`).
-
-## infr-llama/src/seam/{model,weights,sc}.rs
-
-1. **🟡 `model.rs:157 — `SlotPool::pick` extend-branch returns the FIRST
-   matching slot, not the longest-prefix one** (the struct doc claims longest).
-   If two slots are both prefixes of `prompt`, it hands out the shorter → the
-   runner re-prefills more suffix than needed (`start=common_prefix_len`, runner
-   `871`). Correctness fine, wasted prefill. _Fix:_ `max_by_key(prefix_score)`
-   over the extend-satisfying slots.
-2. **🟡
-   `model.rs:1116 — `bench_vulkan` mutates process-global env (`remove_var`/`set_var`on`INFR_PROF2`)
-   around a rayon-parallel forward.** Env is a process-wide table read by rayon
-   workers at construction → a data race if anything else touches env
-   concurrently (and `set_var` is `unsafe` under edition 2024). _Fix:_ thread a
-   "suppress profiling" flag / `AtomicBool` instead of toggling the env var.
-3. **🟡 `model.rs:1382 — `generate_metal_spec`clones the entire`committed`
-   history every verify round** (`feed=committed.clone()`), O(n²) copied token
-   ids over a long generation for no functional need. _Fix:_ persistent `feed`
-   buffer + truncate after verify.
-4. **🟡 `model.rs:432,455,511 — `weight_footprint(&gguf)` recomputed 2-3× per
-   session-open** on the clamp path (`kv_fit_ctx` → `kv_fit_ctx_fmt` →
-   `weight_footprint`, again for the log line) — each a full tensor-metadata
-   scan. _Fix:_ compute once, pass it in / memoize on `SeamModel`.
-5. **🟡
-   `model.rs:1998 — `spec_accept_stochastic`degenerate fallback emits token id`0`**
-   (`.map(...).unwrap_or(0)`) when the residual and `p_dists[i]` are both empty
-   — a silent possibly-invalid token instead of an error. Unreachable today but
-   the guard is written as if reachable. _Fix:_ error / `.expect()` it.
-6. **🟡 DRY — tokenizer-encode boilerplate + upload closures duplicated.** The
-   `tokenizer.encode(...).get_ids().to_vec()` pattern recurs ~9× across the
-   `generate_*`/`prefill_*` entries though `encode` (`model.rs:639`) already
-   does it; the DiffusionGemma Metal (`1812`/`1854`) and CPU (`1598`/`1649`)
-   `prefill`/ `denoise` pairs hold byte-identical weight-upload closures. _Fix:_
-   route through `self.encode`; hoist one `*_upload_bind()` per backend.
 
 ## infr-llama/src/mtp/{mod,backends}.rs (MTP spec-decode, parked/opt-in)
 

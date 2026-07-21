@@ -171,7 +171,10 @@ impl VulkanBackend {
         sem: &TpExportSemaphore,
         value: u64,
     ) -> Result<vk::CommandBuffer> {
-        let cmd = self.tp_record_copies(&[(src, dst, bytes)])?;
+        // Publish: copy into the exported buffer, then RELEASE its queue-family ownership to
+        // QUEUE_FAMILY_EXTERNAL so the peer device may acquire + read it (the EXCLUSIVE external
+        // buffer needs the ownership transfer — see `p2p.rs`).
+        let cmd = self.tp_record_copies(&[(src, dst, bytes)], &[], &[dst])?;
         let cmds = [cmd];
         let sems = [sem.sem];
         let vals = [value];
@@ -180,12 +183,15 @@ impl VulkanBackend {
             .command_buffers(&cmds)
             .signal_semaphores(&sems)
             .push_next(&mut tl);
-        unsafe {
+        if let Err(e) = unsafe {
             self.shared
                 .device
                 .queue_submit(self.shared.queue, &[submit], vk::Fence::null())
+        } {
+            // Submit failed → the cmd never runs; free it so it does not leak the shared pool.
+            self.tp_free_cmds(&[cmd]);
+            return Err(be(format!("tp_submit_copy_signal queue_submit: {e}")));
         }
-        .map_err(|e| be(format!("tp_submit_copy_signal queue_submit: {e}")))?;
         Ok(cmd)
     }
 
@@ -198,7 +204,10 @@ impl VulkanBackend {
         copies: &[(&dyn Buffer, &dyn Buffer, usize)],
         waits: &[(&TpImportSemaphore, u64)],
     ) -> Result<vk::CommandBuffer> {
-        let cmd = self.tp_record_copies(copies)?;
+        // Gather: ACQUIRE each imported (peer-exported) buffer from QUEUE_FAMILY_EXTERNAL before the
+        // copies read it (the src side of every copy is a cross-device imported buffer).
+        let acquire: Vec<&dyn Buffer> = copies.iter().map(|(s, _, _)| *s).collect();
+        let cmd = self.tp_record_copies(copies, &acquire, &[])?;
         let cmds = [cmd];
         let wait_sems: Vec<vk::Semaphore> = waits.iter().map(|(s, _)| s.sem).collect();
         let wait_vals: Vec<u64> = waits.iter().map(|(_, v)| *v).collect();
@@ -212,22 +221,76 @@ impl VulkanBackend {
             .wait_semaphores(&wait_sems)
             .wait_dst_stage_mask(&wait_stages)
             .push_next(&mut tl);
-        unsafe {
+        if let Err(e) = unsafe {
             self.shared
                 .device
                 .queue_submit(self.shared.queue, &[submit], vk::Fence::null())
+        } {
+            self.tp_free_cmds(&[cmd]);
+            return Err(be(format!("tp_submit_copies_wait queue_submit: {e}")));
         }
-        .map_err(|e| be(format!("tp_submit_copies_wait queue_submit: {e}")))?;
         Ok(cmd)
     }
 
-    /// Allocate + record a one-time command buffer that copies each `(src, dst, bytes)`. Not
-    /// submitted here — the caller submits it with the semaphores it wants.
+    /// Host-fence PUBLISH copy (`src → export`) + a release of `export` to QUEUE_FAMILY_EXTERNAL,
+    /// submitted and DRAINED (`queue_wait_idle`) here, freeing the command buffer on every path. The
+    /// host-fence / pipeline transports use this (no external semaphore); the release still satisfies
+    /// the EXCLUSIVE external buffer's ownership-transfer requirement.
+    pub fn p2p_publish_copy(
+        &self,
+        src: &dyn Buffer,
+        export: &dyn Buffer,
+        bytes: usize,
+    ) -> Result<()> {
+        let cmd = self.tp_record_copies(&[(src, export, bytes)], &[], &[export])?;
+        self.tp_submit_wait_free(cmd, "p2p_publish_copy")
+    }
+
+    /// Host-fence GATHER copy: ACQUIRE `imported` from QUEUE_FAMILY_EXTERNAL then copy
+    /// `imported → dst`, submitted + drained here, freeing the command buffer on every path.
+    pub fn p2p_gather_copy(
+        &self,
+        imported: &dyn Buffer,
+        dst: &dyn Buffer,
+        bytes: usize,
+    ) -> Result<()> {
+        let cmd = self.tp_record_copies(&[(imported, dst, bytes)], &[imported], &[])?;
+        self.tp_submit_wait_free(cmd, "p2p_gather_copy")
+    }
+
+    /// Submit `cmd` with no semaphores, wait the queue idle, and free `cmd` — used by the host-fence
+    /// barriered copies. Frees the command buffer on the submit-error path too (no leak).
+    fn tp_submit_wait_free(&self, cmd: vk::CommandBuffer, what: &str) -> Result<()> {
+        let cmds = [cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+        let r = unsafe {
+            self.shared
+                .device
+                .queue_submit(self.shared.queue, &[submit], vk::Fence::null())
+        };
+        if let Err(e) = r {
+            self.tp_free_cmds(&[cmd]);
+            return Err(be(format!("{what} queue_submit: {e}")));
+        }
+        let wait = self.tp_queue_wait_idle();
+        self.tp_free_cmds(&[cmd]);
+        wait
+    }
+
+    /// Allocate + record a one-time command buffer that copies each `(src, dst, bytes)`, optionally
+    /// wrapped in cross-device queue-family ownership transfers: each buffer in `acquire_external` is
+    /// ACQUIRED from `QUEUE_FAMILY_EXTERNAL` before the copies (an imported peer buffer being read),
+    /// and each in `release_external` is RELEASED to `QUEUE_FAMILY_EXTERNAL` after them (an exported
+    /// buffer just written, handed to a peer). Not submitted here — the caller submits it with the
+    /// semaphores/fence it wants. Frees the command buffer on any record error (no leak).
     fn tp_record_copies(
         &self,
         copies: &[(&dyn Buffer, &dyn Buffer, usize)],
+        acquire_external: &[&dyn Buffer],
+        release_external: &[&dyn Buffer],
     ) -> Result<vk::CommandBuffer> {
         let device = &self.shared.device;
+        let qf = self.shared.queue_family_index;
         let pool = *self.shared.cmd_pool.lock().unwrap();
         let cmd = unsafe {
             device.allocate_command_buffers(
@@ -238,27 +301,85 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| be(format!("tp_record_copies allocate: {e}")))?[0];
-        unsafe {
-            device
-                .begin_command_buffer(
-                    cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .map_err(|e| be(format!("tp_record_copies begin: {e}")))?;
-            for &(src, dst, bytes) in copies {
-                // Safety: every buffer from this backend is a VkBuffer.
-                let (s, d) = (as_vk_buf(src), as_vk_buf(dst));
-                let region = vk::BufferCopy {
-                    src_offset: s.sub_offset as u64,
-                    dst_offset: d.sub_offset as u64,
-                    size: bytes as u64,
-                };
-                device.cmd_copy_buffer(cmd, s.buffer, d.buffer, &[region]);
+        // Any record error past this point must free `cmd` before returning (else it leaks the pool).
+        let record = || -> Result<()> {
+            unsafe {
+                device
+                    .begin_command_buffer(
+                        cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(|e| be(format!("tp_record_copies begin: {e}")))?;
+                // ── acquire imported peer buffers from EXTERNAL (before the reads) ────────────────
+                if !acquire_external.is_empty() {
+                    let barriers: Vec<vk::BufferMemoryBarrier> = acquire_external
+                        .iter()
+                        .map(|b| {
+                            vk::BufferMemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::empty())
+                                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                                .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                                .dst_queue_family_index(qf)
+                                .buffer(as_vk_buf(*b).buffer)
+                                .offset(0)
+                                .size(vk::WHOLE_SIZE)
+                        })
+                        .collect();
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &barriers,
+                        &[],
+                    );
+                }
+                for &(src, dst, bytes) in copies {
+                    // Safety: every buffer from this backend is a VkBuffer.
+                    let (s, d) = (as_vk_buf(src), as_vk_buf(dst));
+                    let region = vk::BufferCopy {
+                        src_offset: s.sub_offset as u64,
+                        dst_offset: d.sub_offset as u64,
+                        size: bytes as u64,
+                    };
+                    device.cmd_copy_buffer(cmd, s.buffer, d.buffer, &[region]);
+                }
+                // ── release exported buffers to EXTERNAL (after the writes) ───────────────────────
+                if !release_external.is_empty() {
+                    let barriers: Vec<vk::BufferMemoryBarrier> = release_external
+                        .iter()
+                        .map(|b| {
+                            vk::BufferMemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::empty())
+                                .src_queue_family_index(qf)
+                                .dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                                .buffer(as_vk_buf(*b).buffer)
+                                .offset(0)
+                                .size(vk::WHOLE_SIZE)
+                        })
+                        .collect();
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &barriers,
+                        &[],
+                    );
+                }
+                device
+                    .end_command_buffer(cmd)
+                    .map_err(|e| be(format!("tp_record_copies end: {e}")))?;
             }
-            device
-                .end_command_buffer(cmd)
-                .map_err(|e| be(format!("tp_record_copies end: {e}")))?;
+            Ok(())
+        };
+        if let Err(e) = record() {
+            self.tp_free_cmds(&[cmd]);
+            return Err(e);
         }
         Ok(cmd)
     }

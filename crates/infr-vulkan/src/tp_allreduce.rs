@@ -54,6 +54,58 @@ pub enum AllReduceMode {
     Host,
 }
 
+/// Element size (bytes) of a boundary/activation dtype — the single shared helper for the
+/// tensor-parallel and expert-parallel boundary sizing (hoisted out of `tp.rs`/`ep.rs`, which had
+/// byte-identical copies). Boundary tensors are plain f32 activations, so this is just the element
+/// size (`block_layout` reports `(1, bytes)` for the scalar float dtypes).
+pub(crate) fn dtype_bytes(dt: DType) -> usize {
+    let (elems, bytes) = infr_gguf::block_layout(dt);
+    bytes / elems.max(1)
+}
+
+/// Element count of a `bytes`-byte boundary in `dtype`, rejecting any boundary the reduce Add chain
+/// can't sum. The reduce is compiled over the f32 elementwise `add` shader (see
+/// [`build_reduce_graph`]), so an f16 (or any non-f32) boundary would have that f32 Add read raw
+/// halves as garbage — reject it CLEANLY at construction instead of mis-summing (or hard-erroring
+/// later in [`AllReduce::reduce`] via the `elems != bytes/4` mismatch). Carrying a true f16 Add chain
+/// is deferred until the reduce graph gains an f16 `add`; today f32 is the only correct boundary.
+pub(crate) fn allreduce_elems(bytes: usize, dtype: DType) -> Result<usize> {
+    if dtype != DType::F32 {
+        return Err(be(format!(
+            "tp all-reduce: boundary dtype {dtype:?} is unsupported — the reduce Add chain is \
+             f32-only, so only an f32 boundary can be all-reduced (an f16 boundary would sum raw \
+             halves as garbage)"
+        )));
+    }
+    let esize = dtype_bytes(dtype); // 4 for f32
+    if bytes == 0 || !bytes.is_multiple_of(esize) {
+        return Err(be(format!(
+            "tp all-reduce: boundary size {bytes} is not a positive multiple of {esize} ({dtype:?})"
+        )));
+    }
+    Ok(bytes / esize)
+}
+
+/// Require every boundary tensor to be the SAME byte size and return it. The transport compiles ONE
+/// reduce plan of a fixed `elems`, and [`AllReduce::reduce`] requires `elems == self.elems` exactly,
+/// so sizing to the `max` of differing boundaries would silently break a model whose row-parallel
+/// boundaries differ in width. Holds trivially today (every boundary is `[tokens, n_embd]`); this
+/// makes the assumption explicit and fails loudly if a future model violates it.
+pub(crate) fn uniform_boundary_bytes(sizes: &[usize]) -> Result<usize> {
+    let mut it = sizes.iter().copied();
+    let first = it.next().unwrap_or(0);
+    for s in it {
+        if s != first {
+            return Err(be(format!(
+                "tp all-reduce: boundary tensors differ in size ({first} vs {s} bytes) — the \
+                 single reduce transport requires all boundaries be the same width (per-size \
+                 transports are not implemented)"
+            )));
+        }
+    }
+    Ok(first)
+}
+
 /// The per-rank all-reduce transport for ONE boundary size, set up once and reused every layer.
 pub struct AllReduce {
     mode: AllReduceMode,
@@ -82,8 +134,10 @@ pub struct AllReduce {
     /// The reduce graph's tensor handles: `sub` (own partial, in/out) + one scratch input per peer.
     sub_tid: TensorId,
     scratch_tids: Vec<TensorId>,
-    /// Host bounce scratch (Host mode only).
-    host_buf: std::sync::Mutex<Vec<u8>>,
+    /// Host-bounce scratch, ONE buffer per producer rank (Host mode only). Each producer is
+    /// downloaded ONCE into `host_bufs[p]` then uploaded to every peer's scratch, instead of
+    /// re-downloading the same producer `W-1` times (the dominant PCIe read otherwise multiplied).
+    host_bufs: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 // The P2P exports/imports are Send/Sync under the same whole-backend discipline as the buffers.
@@ -96,17 +150,13 @@ impl AllReduce {
         self.mode
     }
 
-    /// Build the all-reduce transport over `ranks` for a boundary of `bytes` f32 bytes. Sets up the
-    /// P2P export/import ring (when every rank supports dma-buf and `use_p2p`) + per-rank scratches +
-    /// the per-rank Add-chain reduce plan.
-    pub fn new(ranks: &[VulkanBackend], bytes: usize, use_p2p: bool) -> Result<Self> {
+    /// Build the all-reduce transport over `ranks` for a boundary of `bytes` bytes in `dtype`. Sets
+    /// up the P2P export/import ring (when every rank supports dma-buf and `use_p2p`) + per-rank
+    /// scratches + the per-rank Add-chain reduce plan. `dtype` MUST be f32 (the reduce Add is f32);
+    /// any other boundary is rejected up front by [`allreduce_elems`].
+    pub fn new(ranks: &[VulkanBackend], bytes: usize, dtype: DType, use_p2p: bool) -> Result<Self> {
         let w = ranks.len();
-        if bytes == 0 || !bytes.is_multiple_of(4) {
-            return Err(be(format!(
-                "tp all-reduce: boundary size {bytes} is not a positive multiple of 4 (f32)"
-            )));
-        }
-        let elems = bytes / 4;
+        let elems = allreduce_elems(bytes, dtype)?;
 
         // ── choose the data + sync mode ────────────────────────────────────────────────────────
         let all_dma = use_p2p && ranks.iter().all(|b| b.p2p_supported(P2pHandleType::DmaBuf));
@@ -260,7 +310,7 @@ impl AllReduce {
             reduce_plans,
             sub_tid,
             scratch_tids,
-            host_buf: std::sync::Mutex::new(vec![0u8; bytes]),
+            host_bufs: std::sync::Mutex::new((0..w).map(|_| vec![0u8; bytes]).collect()),
         })
     }
 
@@ -307,54 +357,73 @@ impl AllReduce {
         // Strictly-increasing timeline value for this all-reduce (first call = 1 > initial 0).
         let v = self.step.fetch_add(1, Ordering::SeqCst) + 1;
 
-        // ── PUBLISH (no host wait): each rank copies its partial → its export buffer, signalling its
-        //    timeline semaphore = v when the copy completes. ──────────────────────────────────────
+        // Collected submitted command buffers. EVERY buffer pushed here was SUCCESSFULLY submitted
+        // (a failed submit frees its own cmd inside `tp_submit_*`), so on ANY outcome we must wait
+        // for them to complete and free them — a mid-loop `?` must not abandon in-flight GPU work or
+        // leak the long-lived pool's command buffers (finding: tp_sem error-path leaks).
         let mut pub_cmds: Vec<(usize, vk::CommandBuffer)> = Vec::with_capacity(w);
-        for p in 0..w {
-            let ex = self.exports[p].as_ref().expect("p2p export");
-            let sem = self.export_sems[p].as_ref().expect("export sem");
-            let cmd = ranks[p].tp_submit_copy_signal(
-                bufs[p].as_ref(),
-                ex.buffer(),
-                self.bytes,
-                sem,
-                v,
-            )?;
-            pub_cmds.push((p, cmd));
-        }
-
-        // ── GATHER (no host wait): each rank copies every peer's export → its scratch, its submit
-        //    WAITING GPU-side on the peer's semaphore ≥ v (so it can't read a partial before it is
-        //    published). ──────────────────────────────────────────────────────────────────────────
         let mut gat_cmds: Vec<(usize, vk::CommandBuffer)> = Vec::with_capacity(w);
-        #[allow(clippy::needless_range_loop)]
-        // r indexes ranks, imported[r]/scratch[r]/import_sems[r]
-        for r in 0..w {
-            let mut copies: Vec<(&dyn Buffer, &dyn Buffer, usize)> = Vec::with_capacity(w - 1);
-            let mut waits: Vec<(&TpImportSemaphore, u64)> = Vec::with_capacity(w - 1);
+
+        let mut submit = || -> Result<()> {
+            // ── PUBLISH (no host wait): each rank copies its partial → its export buffer, signalling
+            //    its timeline semaphore = v when the copy completes (+ releases the export to
+            //    QUEUE_FAMILY_EXTERNAL for the cross-device read). ──────────────────────────────────
             for p in 0..w {
-                if p == r {
-                    continue;
-                }
-                let imp = self.imported[r][p].as_ref().expect("p2p import");
-                let sc = self.scratch[r][p].as_ref().expect("scratch");
-                copies.push((imp.as_ref(), sc.as_ref(), self.bytes));
-                waits.push((self.import_sems[r][p].as_ref().expect("import sem"), v));
+                let ex = self.exports[p].as_ref().expect("p2p export");
+                let sem = self.export_sems[p].as_ref().expect("export sem");
+                let cmd = ranks[p].tp_submit_copy_signal(
+                    bufs[p].as_ref(),
+                    ex.buffer(),
+                    self.bytes,
+                    sem,
+                    v,
+                )?;
+                pub_cmds.push((p, cmd));
             }
-            let cmd = ranks[r].tp_submit_copies_wait(&copies, &waits)?;
-            gat_cmds.push((r, cmd));
-        }
+
+            // ── GATHER (no host wait): each rank acquires + copies every peer's export → its scratch,
+            //    its submit WAITING GPU-side on the peer's semaphore ≥ v (so it can't read a partial
+            //    before it is published). ─────────────────────────────────────────────────────────
+            #[allow(clippy::needless_range_loop)]
+            // r indexes ranks, imported[r]/scratch[r]/import_sems[r]
+            for r in 0..w {
+                let mut copies: Vec<(&dyn Buffer, &dyn Buffer, usize)> = Vec::with_capacity(w - 1);
+                let mut waits: Vec<(&TpImportSemaphore, u64)> = Vec::with_capacity(w - 1);
+                for p in 0..w {
+                    if p == r {
+                        continue;
+                    }
+                    let imp = self.imported[r][p].as_ref().expect("p2p import");
+                    let sc = self.scratch[r][p].as_ref().expect("scratch");
+                    copies.push((imp.as_ref(), sc.as_ref(), self.bytes));
+                    waits.push((self.import_sems[r][p].as_ref().expect("import sem"), v));
+                }
+                let cmd = ranks[r].tp_submit_copies_wait(&copies, &waits)?;
+                gat_cmds.push((r, cmd));
+            }
+            Ok(())
+        };
+        let outcome = submit();
 
         // ── residual host wait: one queue_wait_idle per rank (the memory barrier for the reduce
-        //    read). All cross-device ordering already happened GPU-side above. ─────────────────────
+        //    read + the point past which the collected cmds are complete and free-able). All
+        //    cross-device ordering already happened GPU-side above. Run this on EVERY outcome so an
+        //    error mid-submit still drains + frees what was already submitted. ─────────────────────
+        let mut wait_err: Option<infr_core::error::Error> = None;
         for rank in ranks {
-            rank.tp_queue_wait_idle()?;
+            if let Err(e) = rank.tp_queue_wait_idle() {
+                wait_err.get_or_insert(e);
+            }
         }
         for (p, cmd) in pub_cmds {
             ranks[p].tp_free_cmds(&[cmd]);
         }
         for (r, cmd) in gat_cmds {
             ranks[r].tp_free_cmds(&[cmd]);
+        }
+        outcome?;
+        if let Some(e) = wait_err {
+            return Err(e);
         }
 
         // ── reduce: each rank sums own + all peers' scratches into its own partial. ──────────────
@@ -370,14 +439,14 @@ impl AllReduce {
         bufs: &[Box<dyn Buffer>],
     ) -> Result<()> {
         let w = ranks.len();
-        // ── publish: each rank copies its partial into its exported buffer ─────────────────────
+        // ── publish: each rank copies its partial into its exported buffer, then RELEASES that
+        //    buffer's queue-family ownership to QUEUE_FAMILY_EXTERNAL (the cross-device read). ─────
         for p in 0..w {
             let ex = self.exports[p].as_ref().expect("p2p export");
-            ranks[p].copy_buffer(bufs[p].as_ref(), ex.buffer(), self.bytes)?;
-            ranks[p].sync()?;
+            ranks[p].p2p_publish_copy(bufs[p].as_ref(), ex.buffer(), self.bytes)?;
         }
-        // ── gather: each rank reads every peer's published buffer into a local scratch ─────────
-        // (Reads only — the peers' exports are not modified, so this is race-free after publish.)
+        // ── gather: each rank ACQUIRES every peer's exported buffer from QUEUE_FAMILY_EXTERNAL then
+        //    reads it into a local scratch. (Reads only — race-free after publish.) ───────────────
         #[allow(clippy::needless_range_loop)]
         // r indexes ranks, imported[r] and scratch[r] together
         for r in 0..w {
@@ -387,28 +456,35 @@ impl AllReduce {
                 }
                 let imp = self.imported[r][p].as_ref().expect("p2p import");
                 let sc = self.scratch[r][p].as_ref().expect("scratch");
-                ranks[r].copy_buffer(imp.as_ref(), sc.as_ref(), self.bytes)?;
-                ranks[r].sync()?;
+                ranks[r].p2p_gather_copy(imp.as_ref(), sc.as_ref(), self.bytes)?;
             }
         }
         // ── reduce: each rank sums own + all peers' scratches into its own partial ──────────────
         self.run_reduce_plans(ranks, bufs)
     }
 
-    /// Host-bounce fallback: each rank downloads every peer's partial through host RAM.
+    /// Host-bounce fallback: download each producer's partial through host RAM ONCE, then upload it
+    /// to every peer's scratch — instead of re-downloading each producer `W-1` times (the dominant
+    /// PCIe read). Same summed bytes, same order, so the reduced value is unchanged.
     fn reduce_host(&self, ranks: &[VulkanBackend], bufs: &[Box<dyn Buffer>]) -> Result<()> {
         let w = ranks.len();
+        let mut host = self.host_bufs.lock().expect("tp host bufs poisoned");
+        // ── download each producer once ────────────────────────────────────────────────────────
+        for p in 0..w {
+            ranks[p].download(bufs[p].as_ref(), &mut host[p])?;
+        }
+        // ── fan each producer's bytes out to every other rank's scratch ────────────────────────
+        #[allow(clippy::needless_range_loop)] // r indexes ranks AND scratch[r] together
         for r in 0..w {
             for p in 0..w {
                 if p == r {
                     continue;
                 }
-                let mut host = self.host_buf.lock().expect("tp host buf poisoned");
-                ranks[p].download(bufs[p].as_ref(), &mut host)?;
                 let sc = self.scratch[r][p].as_ref().expect("scratch");
-                ranks[r].upload(sc.as_ref(), &host)?;
+                ranks[r].upload(sc.as_ref(), &host[p])?;
             }
         }
+        drop(host);
         self.run_reduce_plans(ranks, bufs)
     }
 
@@ -454,4 +530,45 @@ fn build_reduce_graph(elems: usize, world: usize) -> (Graph, TensorId, Vec<Tenso
         });
     }
     (g, sub, scratch_tids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dtype_bytes_scalar_floats() {
+        assert_eq!(dtype_bytes(DType::F32), 4);
+        assert_eq!(dtype_bytes(DType::F16), 2);
+        assert_eq!(dtype_bytes(DType::Bf16), 2);
+    }
+
+    #[test]
+    fn allreduce_elems_f32_ok() {
+        // elems derived from the boundary dtype's element size, not a hardwired /4.
+        assert_eq!(allreduce_elems(4096, DType::F32).unwrap(), 1024);
+        assert_eq!(allreduce_elems(4, DType::F32).unwrap(), 1);
+    }
+
+    #[test]
+    fn allreduce_elems_rejects_zero_and_unaligned() {
+        assert!(allreduce_elems(0, DType::F32).is_err());
+        assert!(allreduce_elems(6, DType::F32).is_err()); // not a multiple of 4
+    }
+
+    #[test]
+    fn allreduce_elems_rejects_non_f32_boundary() {
+        // An f16 boundary is cleanly rejected at construction (the reduce Add chain is f32-only) —
+        // no longer a mysterious `numel != bytes/4` hard-error inside reduce().
+        let err = allreduce_elems(4096, DType::F16).unwrap_err();
+        assert!(format!("{err}").contains("f32"), "err was: {err}");
+        assert!(allreduce_elems(4096, DType::Bf16).is_err());
+    }
+
+    #[test]
+    fn uniform_boundary_bytes_agrees_or_rejects() {
+        assert_eq!(uniform_boundary_bytes(&[4096, 4096, 4096]).unwrap(), 4096);
+        assert_eq!(uniform_boundary_bytes(&[]).unwrap(), 0);
+        assert!(uniform_boundary_bytes(&[4096, 2048]).is_err());
+    }
 }

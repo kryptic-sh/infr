@@ -203,8 +203,9 @@ struct VulkanShared {
     /// `VK_KHR_external_semaphore_fd` loader — exports/imports a semaphore fd so a tensor-parallel
     /// all-reduce can order a peer's read after this device's GPU-side signal with no host round-trip
     /// (`AllReduceMode::P2pSemaphore`). `None` = the all-reduce uses the host fence (`queue_wait_idle`)
-    /// instead. v1 leaves this `None` (the host-fence all-reduce is the correctness deliverable; the
-    /// external-semaphore optimization is wired behind `external_semaphore_supported`).
+    /// instead. `Some` whenever the device enabled the extension, in which case the semaphore-ordered
+    /// all-reduce path is LIVE (see `external_semaphore_supported`); a device that can't import a
+    /// cross-device semaphore falls back to the host fence.
     external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
     /// Generic cache of compute kernels by name (see `ops.rs`).
     kernels: Mutex<HashMap<&'static str, crate::ops::ComputeKernel>>,

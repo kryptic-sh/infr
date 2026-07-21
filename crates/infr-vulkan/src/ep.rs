@@ -87,13 +87,6 @@ impl EpBuffer {
     }
 }
 
-/// Element size (bytes) of a boundary activation dtype — the MoE `dst` partials are f32/f16
-/// activations, so this is just the element size.
-fn ep_dtype_bytes(dt: infr_core::tensor::DType) -> usize {
-    let (elems, bytes) = infr_gguf::block_layout(dt);
-    bytes / elems.max(1)
-}
-
 impl Buffer for EpBuffer {
     fn len_bytes(&self) -> usize {
         self.bufs[0].len_bytes()
@@ -309,7 +302,8 @@ impl ExpertParallelBackend {
         // ── per-rank sub-graphs (each MoeFfn's ep_band set to the rank's band) + compile ──────────
         let nl = self.n_expert / w; // experts per band
         let mut segments = Vec::with_capacity(bounds.len());
-        let mut reduce_bytes = 0usize;
+        let mut sizes: Vec<usize> = Vec::new();
+        let mut reduce_dtype = infr_core::tensor::DType::F32;
         let mut lo = 0usize;
         for (si, &hi) in bounds.iter().enumerate() {
             // The reduce boundary for this segment is the cut op's (MoeFfn) dst — None for the last.
@@ -322,8 +316,9 @@ impl ExpertParallelBackend {
                 None
             };
             if let Some(tid) = reduce {
-                let bytes = lowered.desc(tid).numel() * ep_dtype_bytes(lowered.desc(tid).dtype);
-                reduce_bytes = reduce_bytes.max(bytes);
+                let desc = lowered.desc(tid);
+                reduce_dtype = desc.dtype;
+                sizes.push(desc.numel() * crate::tp_allreduce::dtype_bytes(desc.dtype));
             }
             // Ops this segment needs bound.
             let mut needed: HashSet<TensorId> = HashSet::new();
@@ -361,9 +356,12 @@ impl ExpertParallelBackend {
         }
 
         // ── per-rank persistent boundary buffers (one set per distinct MoE `dst` tid) ──────────────
+        // All MoE `dst` boundaries share the reused scratch tid + size; the single reduce transport
+        // requires them equal (asserted), not silently `max`-ed.
         let mut boundary_bufs: HashMap<TensorId, Vec<Box<dyn Buffer>>> = HashMap::new();
         for &tid in &boundary {
-            let bytes = lowered.desc(tid).numel() * ep_dtype_bytes(lowered.desc(tid).dtype);
+            let bytes = lowered.desc(tid).numel()
+                * crate::tp_allreduce::dtype_bytes(lowered.desc(tid).dtype);
             let mut bufs = Vec::with_capacity(w);
             for r in 0..w {
                 bufs.push(self.ranks[r].alloc(bytes, BufferUsage::Activations)?);
@@ -371,7 +369,8 @@ impl ExpertParallelBackend {
             boundary_bufs.insert(tid, bufs);
         }
 
-        let allreduce = AllReduce::new(&self.ranks, reduce_bytes, self.use_p2p)?;
+        let reduce_bytes = crate::tp_allreduce::uniform_boundary_bytes(&sizes)?;
+        let allreduce = AllReduce::new(&self.ranks, reduce_bytes, reduce_dtype, self.use_p2p)?;
         Ok(Prepared {
             lowered,
             segments,

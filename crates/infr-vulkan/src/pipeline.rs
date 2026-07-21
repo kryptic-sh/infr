@@ -44,6 +44,7 @@
 //! per-device kernels (the same [`VulkanBackend`] code on each device), only the boundary residual
 //! crosses via a value-preserving copy.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -129,6 +130,21 @@ fn as_pipe(buf: &dyn Buffer) -> Result<&PipelineBuffer> {
         .ok_or_else(|| be("pipeline: a buffer bound to a PipelineBackend was not a PipelineBuffer"))
 }
 
+/// For each tensor, the device index of the LAST op (in graph order) that wrote it, given each op's
+/// written tensors paired with the device it runs on. The residual handoff must copy a cut tensor
+/// from the device that ACTUALLY last wrote it — not blindly from the previous segment's device — so
+/// a replicated op-written tensor that was produced, then skipped a segment, is handed off from its
+/// true producer (else the consumer reads stale bytes on that device's replica).
+fn last_writer_devices(op_writes: &[(Vec<TensorId>, usize)]) -> HashMap<TensorId, usize> {
+    let mut m = HashMap::new();
+    for (writes, dev) in op_writes {
+        for &t in writes {
+            m.insert(t, *dev);
+        }
+    }
+    m
+}
+
 /// The residual-handoff transport between two devices. Built once (per plan boundary) and reused
 /// every step: the tiny `[tokens × n_embd]` residual is copied producer→consumer here.
 enum Handoff {
@@ -149,8 +165,10 @@ struct Segment {
     plan: Box<dyn Plan>,
     /// Ops in this segment, by index into the full graph — used to build the per-device outputs.
     op_range: (usize, usize),
-    /// Cut tensors to hand off from the PREVIOUS segment's device into this one, before running.
-    cut: Vec<(TensorId, Handoff)>,
+    /// Cut tensors to hand off into this segment before running: `(tensor, producer_device,
+    /// handoff)`. `producer_device` is the device that LAST wrote the tensor (its true source), not
+    /// necessarily the immediately-previous segment's device.
+    cut: Vec<(TensorId, usize, Handoff)>,
 }
 
 /// The compiled + partitioned form of a graph, cached in the plan on first execute (bindings — and
@@ -345,17 +363,17 @@ impl PipelineBackend {
 
             // ── cut tensors into this segment ────────────────────────────────────────────────
             // A REPLICATED bound tensor written by an earlier op and read by an op in THIS segment
-            // must be handed off from the previous segment's device. (The residual `hidden`.)
-            let cut = if let Some(prev) = segments.last() {
-                let prev_dev = prev.device;
-                // tensors written on device <= prev_dev
-                let mut written_before: std::collections::HashSet<TensorId> =
-                    std::collections::HashSet::new();
-                for op in &graph.ops[..start] {
-                    for t in op.io().1 {
-                        written_before.insert(t);
-                    }
-                }
+            // must be handed off from the device that LAST wrote it (its true producer, tracked via
+            // `last_writer_devices`) — NOT blindly from the previous segment's device, which is wrong
+            // for any replicated op-written tensor produced, then skipped a segment, then read later.
+            let cut = if !segments.is_empty() {
+                // (tensor's last-writer device) over all ops before this segment.
+                let op_writes: Vec<(Vec<TensorId>, usize)> = graph.ops[..start]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, op)| (op.io().1, op_dev[i]))
+                    .collect();
+                let last_writer = last_writer_devices(&op_writes);
                 // tensors read in this segment
                 let mut read_here: std::collections::HashSet<TensorId> =
                     std::collections::HashSet::new();
@@ -365,17 +383,23 @@ impl PipelineBackend {
                     }
                 }
                 let mut cuts = Vec::new();
-                for t in written_before.intersection(&read_here) {
-                    let Some(buf) = bindings.get(*t) else {
+                for &t in &read_here {
+                    let Some(&producer) = last_writer.get(&t) else {
+                        continue; // not written before this segment (a fresh input / read-only)
+                    };
+                    let Some(buf) = bindings.get(t) else {
                         continue;
                     };
                     let pb = as_pipe(buf)?;
                     if !pb.is_replicated() {
                         continue; // single-device tensors don't cross (they're layer-local)
                     }
+                    if producer == d {
+                        continue; // already resident on this device's replica (no handoff needed)
+                    }
                     let bytes = pb.len_bytes();
-                    let ho = self.build_handoff(prev_dev, d, bytes)?;
-                    cuts.push((*t, ho));
+                    let ho = self.build_handoff(producer, d, bytes)?;
+                    cuts.push((t, producer, ho));
                 }
                 cuts
             } else {
@@ -440,12 +464,13 @@ impl PipelineBackend {
         let bytes = pb.len_bytes();
         match ho {
             Handoff::P2p { export, imported } => {
-                // producer replica → shared export (producer-local), then imported alias →
-                // consumer replica (the PCIe read). Each copy_buffer fences via queue_wait_idle.
-                self.backends[producer].copy_buffer(src, export.buffer(), bytes)?;
-                self.backends[producer].sync()?;
-                self.backends[consumer].copy_buffer(imported.as_ref(), dst, bytes)?;
-                self.backends[consumer].sync()?;
+                // producer replica → shared export (producer-local), RELEASING the export to
+                // QUEUE_FAMILY_EXTERNAL; then ACQUIRE the imported alias from EXTERNAL and read it →
+                // consumer replica (the PCIe read). The QF ownership transfer satisfies the EXCLUSIVE
+                // external buffer's cross-family requirement (the queue_wait_idle fence alone does
+                // not); each helper submits + drains + frees its own command buffer.
+                self.backends[producer].p2p_publish_copy(src, export.buffer(), bytes)?;
+                self.backends[consumer].p2p_gather_copy(imported.as_ref(), dst, bytes)?;
             }
             Handoff::Host { scratch } => {
                 let mut host = scratch.lock().expect("handoff scratch poisoned");
@@ -582,13 +607,11 @@ impl Backend for PipelineBackend {
         }
         let prep = guard.as_ref().expect("prepared just set");
 
-        let mut prev_dev: Option<usize> = None;
         for seg in &prep.segments {
-            // Hand the residual off from the previous segment (already run + synced) into this one.
-            if let Some(prev) = prev_dev {
-                for (t, ho) in &seg.cut {
-                    self.transfer(*t, prev, seg.device, ho, bindings)?;
-                }
+            // Hand each cut tensor off from the device that LAST wrote it (already run + synced —
+            // op_dev is monotonic, so every producer's segment precedes this one) into this segment.
+            for (t, producer, ho) in &seg.cut {
+                self.transfer(*t, *producer, seg.device, ho, bindings)?;
             }
             // Per-device bindings: resolve every bound tensor to this device's buffer/replica.
             let d = seg.device;
@@ -607,7 +630,6 @@ impl Backend for PipelineBackend {
             }
             self.backends[d].execute(seg.plan.as_ref(), &sub)?;
             self.backends[d].sync()?;
-            prev_dev = Some(d);
         }
         Ok(())
     }
@@ -623,5 +645,44 @@ impl Backend for PipelineBackend {
         for b in &self.backends {
             b.kv_overflow_report();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_writer_is_the_most_recent_producer_device() {
+        let t = |n: u32| TensorId(n);
+        // Op sequence (writes, device):
+        //   op0 writes t10 on device 0
+        //   op1 writes t11 on device 0
+        //   op2 writes t10 on device 1   (re-writes t10 — device 1 is now its last writer)
+        //   op3 writes t12 on device 1
+        let op_writes = vec![
+            (vec![t(10)], 0usize),
+            (vec![t(11)], 0usize),
+            (vec![t(10)], 1usize),
+            (vec![t(12)], 1usize),
+        ];
+        let m = last_writer_devices(&op_writes);
+        assert_eq!(m.get(&t(10)), Some(&1)); // last writer wins (device 1), NOT the first (0)
+        assert_eq!(m.get(&t(11)), Some(&0));
+        assert_eq!(m.get(&t(12)), Some(&1));
+        assert_eq!(m.get(&t(99)), None); // never written
+    }
+
+    #[test]
+    fn last_writer_handoff_source_is_producer_not_prev_segment() {
+        // The bug this guards: a tensor written on device 0, skipped over the device-1 segment, then
+        // read on device 2 must hand off from device 0 (its producer), not device 1 (prev segment).
+        let t = |n: u32| TensorId(n);
+        let op_writes = vec![
+            (vec![t(1)], 0usize), // producer of t1 = device 0
+            (vec![t(2)], 1usize), // a device-1 op that does NOT touch t1
+        ];
+        let m = last_writer_devices(&op_writes);
+        assert_eq!(m.get(&t(1)), Some(&0));
     }
 }

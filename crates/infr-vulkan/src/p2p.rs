@@ -16,9 +16,18 @@
 //! Device A writes the shared buffer, device B reads it — an ordering the caller establishes with
 //! HOST-SIDE sync: `A.upload(...); A.sync();` (the backend's `upload`/`copy_buffer` submit through
 //! `one_shot`, whose `queue_wait_idle` is a full fence) completes and flushes A's writes before B's
-//! submit is recorded. This is the simplest CORRECT scheme. A zero-host-stall optimization would
-//! replace it with `VK_KHR_external_semaphore_fd` (export a semaphore signalled by A, wait on it on
-//! B, no host round-trip) — noted, not built here; correctness is the deliverable.
+//! submit is recorded. This is the simplest CORRECT scheme. A zero-host-stall optimization replaces
+//! it with `VK_KHR_external_semaphore_fd` (export a semaphore signalled by A, wait on it on B, no
+//! host round-trip) — see [`crate::tp_sem`].
+//!
+//! ## Queue-family ownership (EXCLUSIVE external buffers)
+//! The export/import buffers are created `SharingMode::EXCLUSIVE` (each backend has a single queue
+//! family, so `CONCURRENT` — which needs ≥2 distinct family indices — is not available). A buffer
+//! whose backing memory is written by device A's queue family and read by device B's therefore needs
+//! an explicit queue-family ownership transfer through `VK_QUEUE_FAMILY_EXTERNAL`: the transport
+//! (`tp_sem` / the host-fence and pipeline copies) RELEASES the exported buffer to
+//! `QUEUE_FAMILY_EXTERNAL` after A's write and ACQUIRES the imported buffer from it before B's read,
+//! satisfying the spec's cross-family requirement (the host fence alone does not).
 //!
 //! ## fd ownership
 //! [`P2pExport`] owns the exported fd and closes it on drop. Each [`import`](VulkanBackend::p2p_import)
@@ -74,6 +83,12 @@ pub struct P2pExport {
     mem_size: u64,
     /// Logical byte length the caller asked for (`<= mem_size`).
     size: usize,
+    /// The memory-type INDEX the exporter (device A) placed the backing allocation on. Threaded to
+    /// the importer so a same-driver import (`OPAQUE_FD`, and `DmaBuf` when the exporter's type is
+    /// importable) binds the EXPORTER's type rather than blindly picking the lowest allowed bit —
+    /// the lowest bit can be a host-visible/uncached type the exporter never used, spuriously
+    /// rejecting a valid cross-device import.
+    mem_type: u32,
     handle_type: P2pHandleType,
 }
 
@@ -129,9 +144,11 @@ impl VulkanBackend {
     /// yes, the all-reduce waits on a peer's GPU-side signal with no host round-trip
     /// (`AllReduceMode::P2pSemaphore`); otherwise the P2P data path is ordered by the host fence.
     ///
-    /// v1 returns `false` (the host-fence all-reduce is the correctness deliverable; the
-    /// external-semaphore optimization is wired behind this probe). Flipping this on requires the
-    /// device to enable `VK_KHR_external_semaphore` + `_fd` and a semaphore-signalling submit path.
+    /// This returns `true` whenever the device enabled `VK_KHR_external_semaphore_fd`, i.e. the
+    /// semaphore-ordered all-reduce path is LIVE (not gated off) on such a device — the all-reduce
+    /// selects [`AllReduceMode::P2pSemaphore`] and orders the peer read GPU-side. A device/driver
+    /// that cannot import a cross-device `OPAQUE_FD` semaphore reports the exact failure and the
+    /// all-reduce falls back to the host fence (`AllReduceMode::P2pHostFence`).
     pub fn external_semaphore_supported(&self) -> bool {
         self.shared.external_semaphore_fd.is_some()
     }
@@ -239,6 +256,7 @@ impl VulkanBackend {
             fd,
             mem_size: req.size,
             size,
+            mem_type: ty,
             handle_type,
         })
     }
@@ -327,7 +345,15 @@ impl VulkanBackend {
                 export.handle_type, req.memory_type_bits
             )));
         }
-        let ty = allowed.trailing_zeros();
+        // Prefer the EXPORTER's memory-type index when it is among the allowed set (it names the type
+        // the memory actually lives on — required to match for a same-driver import); otherwise fall
+        // back to the lowest allowed bit. Picking the lowest bit unconditionally can select a type
+        // the exporter never used and spuriously reject the import.
+        let ty = if export.mem_type < 32 && (allowed & (1u32 << export.mem_type)) != 0 {
+            export.mem_type
+        } else {
+            allowed.trailing_zeros()
+        };
 
         // ── import + bind ────────────────────────────────────────────────────────────────────
         let mut import_info = vk::ImportMemoryFdInfoKHR::default()

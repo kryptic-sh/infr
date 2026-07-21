@@ -470,10 +470,13 @@ impl TensorParallelBackend {
             }
         }
 
-        // ── resize sharded scratch + weight decls, promote boundary tensors to Input ───────────
+        // ── resize sharded scratch + weight + KV decls, promote boundary tensors to Input ──────
         // A sharded scratch tensor's buffer is `numel/W` (the rank's feature slice); a column/row
-        // weight's bound buffer is `numel/W` (the rank's weight slice). Shrink both decls to match
-        // the buffers the binder/backend actually provide, so the sub-backend's size math agrees.
+        // weight's bound buffer is `numel/W` (the rank's weight slice); a per-rank KV shard's bound
+        // buffer is `numel/W` (the rank's heads' KV — `alloc(KvCache)` splits `bytes/W`). Shrink all
+        // three decls to match the buffers the binder/backend actually provide, so the sub-backend's
+        // size math agrees AND any KV-capacity/overflow guard reading `desc.numel()`/`row_stride`
+        // sees the true per-rank capacity (not W× it).
         for (i, decl) in lowered.tensors.iter_mut().enumerate() {
             let tid = TensorId(i as u32);
             if boundary.contains(&tid) {
@@ -490,7 +493,9 @@ impl TensorParallelBackend {
                 );
             let sharded_scratch =
                 decl.kind == TensorKind::Internal && state.get(&tid) == Some(&Shard::Sharded);
-            if sharded_weight || sharded_scratch {
+            // A per-rank KV shard (bound TpBuffer of kind Kv) — its decl was left full-width.
+            let sharded_kv = bindings.get(tid).map(Self::is_kv).unwrap_or(false);
+            if sharded_weight || sharded_scratch || sharded_kv {
                 let n = decl.desc.numel();
                 if !n.is_multiple_of(w) {
                     return Err(be(format!(
@@ -550,19 +555,25 @@ impl TensorParallelBackend {
 
         // ── boundary persistent buffers (one per rank) + the all-reduce transport ──────────────
         // Every boundary tensor is the SAME `sub` reused across layers with identical size, so one
-        // set of per-rank buffers + one all-reduce transport serves them all.
+        // set of per-rank buffers + one all-reduce transport serves them all. The all-reduce compiles
+        // ONE reduce plan and `reduce` requires `elems == self.elems` exactly, so all boundaries MUST
+        // be the same byte size (asserted here, not silently `max`-ed) and the same dtype.
         let mut boundary_bufs: HashMap<TensorId, Vec<Box<dyn Buffer>>> = HashMap::new();
-        let mut reduce_bytes = 0usize;
+        let mut sizes: Vec<usize> = Vec::with_capacity(boundary.len());
+        let mut reduce_dtype = DType::F32;
         for &tid in &boundary {
-            let bytes = lowered.desc(tid).numel() * dtype_bytes(lowered.desc(tid).dtype);
-            reduce_bytes = reduce_bytes.max(bytes);
+            let desc = lowered.desc(tid);
+            reduce_dtype = desc.dtype;
+            let bytes = desc.numel() * crate::tp_allreduce::dtype_bytes(desc.dtype);
+            sizes.push(bytes);
             let mut bufs = Vec::with_capacity(w);
             for r in 0..w {
                 bufs.push(self.ranks[r].alloc(bytes, BufferUsage::Activations)?);
             }
             boundary_bufs.insert(tid, bufs);
         }
-        let allreduce = AllReduce::new(&self.ranks, reduce_bytes, self.use_p2p)?;
+        let reduce_bytes = crate::tp_allreduce::uniform_boundary_bytes(&sizes)?;
+        let allreduce = AllReduce::new(&self.ranks, reduce_bytes, reduce_dtype, self.use_p2p)?;
 
         Ok(Prepared {
             lowered,
@@ -608,12 +619,6 @@ fn require(cond: bool, op: usize, msg: &str) -> Result<()> {
     } else {
         Err(be(format!("tp: op {op}: {msg}")))
     }
-}
-
-fn dtype_bytes(dt: DType) -> usize {
-    let (elems, bytes) = infr_gguf::block_layout(dt);
-    // Boundary tensors are always f32/f16 activations, so this is just the element size.
-    bytes / elems.max(1)
 }
 
 impl Backend for TensorParallelBackend {

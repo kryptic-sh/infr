@@ -116,6 +116,11 @@ void main() {
                             gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint b = 0u; b < 2u; b++) {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
+                // Direct global K read: kvend is NOT BC-rounded → the last column tile reads kv rows
+                // past kv_len. A direct coopMatLoad can't mask per column; the over-read is bounded by
+                // the K/V ROW CAPACITY and the extra columns are masked to -1e30 in the softmax below.
+                // (This kernel is dispatched only from the gpu_seam/bench harness, which allocates K/V
+                // with +128 pad rows for exactly this read — see run_flash_reg_bytes.)
                 coopMatLoad(B, KMAT, (kv0 + warp_c * 32u + b * 16u) * nkvhd + kvh * HD + kf, nkvhd,
                             gl_CooperativeMatrixLayoutColumnMajor);
                 [[unroll]] for (uint a = 0u; a < 2u; a++) sacc[a][b] = coopMatMulAdd(A[a], B, sacc[a][b]);
@@ -166,6 +171,8 @@ void main() {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Pm;
                 coopMatLoad(Pm, Psh, (sg * 16u) * BC + bc, BC, gl_CooperativeMatrixLayoutRowMajor);
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Vm;
+                // Direct global V read: same bounded over-read as the K load above — rows past kv_len
+                // stay inside the row-capacity allocation and carry a 0 P weight (Psh masked).
                 coopMatLoad(Vm, VMAT, (kv0 + bc) * nkvhd + kvh * HD + ct * 16u, nkvhd,
                             gl_CooperativeMatrixLayoutRowMajor);
                 pacc = coopMatMulAdd(Pm, Vm, pacc);

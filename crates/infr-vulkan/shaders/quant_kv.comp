@@ -125,8 +125,10 @@ void main() {
     wf16(bo + 2u, vmin);
     uint qh = 0u;
     for (uint j = 0u; j < 16u; j++) {
-        int xi0 = int((x[j] - vmin) * id + 0.5);
-        int xi1 = int((x[j + 16u] - vmin) * id + 0.5);
+        // clamp to [0,31] to match the Q4_0/Q4_1/Q5_0 siblings. Byte-identical here (can't exceed 31:
+        // (x-vmin)*id <= (vmax-vmin)*id = 31), but keeps the severe 0-not-31 wrap trap out defensively.
+        int xi0 = clamp(int((x[j] - vmin) * id + 0.5), 0, 31);
+        int xi1 = clamp(int((x[j + 16u] - vmin) * id + 0.5), 0, 31);
         STB(bo + 8u + j, (xi0 & 0xF) | ((xi1 & 0xF) << 4));
         qh |= (uint(xi0 & 0x10) >> 4) << j;
         qh |= (uint(xi1 & 0x10) >> 4) << (j + 16u);

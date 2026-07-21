@@ -8,8 +8,6 @@
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
-const uint MAXS = 16u;
-
 layout(push_constant) uniform PC { uint mpad; uint nh; uint hd; uint n_splits; } pc;
 layout(binding = 0) readonly buffer POB { float po[]; }; // [n_splits, mpad, nh, hd]
 layout(binding = 1) readonly buffer PMB { float pm[]; }; // [n_splits, mpad, nh]

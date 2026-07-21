@@ -180,6 +180,12 @@ void main() {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
                 coopMatLoad(A, q, (qr0 + sg * 16u) * pc.nh * hd + h * hd + kf,
                             pc.nh * hd, gl_CooperativeMatrixLayoutRowMajor);
+                // Direct global K read (default arm): kvend is NOT BN-rounded, so the last column
+                // tile reads kv rows past kv_len. Unlike the -DSTAGE arm above (which guards the shmem
+                // copy with `kv0+kvl < kv_len`), a direct coopMatLoad can't mask per column — the
+                // over-read is instead bounded by the K/V ROW CAPACITY (the recorder gates flash on
+                // kv_len.div_ceil(64)*64 <= att_cap_rows) and the extra columns are masked to -1e30
+                // in the softmax below (masked positions contribute nothing).
                 coopMatLoad(B, KMAT, (kv0 + ctile) * pc.nkv * hd + kvh * hd + kf,
                             pc.nkv * hd, gl_CooperativeMatrixLayoutColumnMajor);
                 acc = coopMatMulAdd(A, B, acc);
@@ -267,6 +273,8 @@ void main() {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
                 coopMatLoad(A, Ps, (sg * 16u) * BN + kf, BN,
                             gl_CooperativeMatrixLayoutRowMajor);
+                // Direct global V read (default arm): same bounded over-read as the K load above —
+                // rows past kv_len stay inside the row-capacity allocation and carry a 0 P weight.
                 coopMatLoad(B, VMAT, (kv0 + kf) * pc.nkv * hd + kvh * hd + ct,
                             pc.nkv * hd, gl_CooperativeMatrixLayoutRowMajor);
                 acc = coopMatMulAdd(A, B, acc);

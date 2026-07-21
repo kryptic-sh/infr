@@ -4347,6 +4347,13 @@ impl<'a> Recorder<'a> {
         } else {
             ("attn_pv", crate::gemm::attn_pv_spv(), 64u32)
         };
+        // attn_pv{,_warp}.comp derive `tilesN = hd/BN` as a comment-only precondition: hd<BN
+        // div-by-zeros, a non-multiple hd truncates and never covers the top dims. All shipped head
+        // dims are BN-multiples (64/128/256), so this never fires — it pins the invariant at dispatch.
+        debug_assert!(
+            hdu.is_multiple_of(pv_bn),
+            "attn_pv: hd ({hdu}) must be a multiple of BN ({pv_bn}); tilesN=hd/BN would truncate dims / div-by-zero"
+        );
         let kpv = self.be.kernel_sg(pv_name, pv_spv, 3, 28, 32);
         let mut pp = [0u8; 28];
         pp[0..4].copy_from_slice(&mpad.to_ne_bytes());
@@ -5778,6 +5785,9 @@ impl<'a> Recorder<'a> {
         // (m <= 8) keeps per-row. If the m >= 12-at-depth band ever matters, route here on
         // (rows, kv_len) — or better, build the LDS-staged K-TILE kernel (per-thread full dots,
         // no cross-lane reductions), which is how llama.cpp wins that cell (1056 t/s).
+        // The batched kernel is built `attn_partial_mrows_c256` (-DSC_MAX=256u): its `sc[RB*SC]`
+        // score slab holds only SC=256 keys/row, so a chunk > 256 would overrun `sc` (nothing clamps
+        // the `sc[i*SC + (j-j0)]` write index in-shader). Pin chunk <= 256 = SC_MAX here.
         debug_assert!(!batched || (chunk <= 256 && hd <= 128 && !k_q8 && !v_q8 && rows >= 2));
         let (p1name, p1spv) = if batched {
             if bda {
@@ -5851,6 +5861,13 @@ impl<'a> Recorder<'a> {
             .be
             .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
         let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
+        // attn_combine.comp splits hd as `hdt = hd/ntile`; a non-divisor ntile drops the top
+        // hd-ntile*hdt dims (left uninitialized). ntile is 4 only when hd%4==0, else 1, so hd%ntile==0
+        // always holds — this pins that invariant at the call site (never fires for shipped hd).
+        debug_assert!(
+            hd.is_multiple_of(ntile as usize),
+            "attn_combine: hd ({hd}) must be a multiple of ntile ({ntile}); hdt=hd/ntile would drop dims"
+        );
         let mut p2 = [0u8; 16];
         p2[0..4].copy_from_slice(&((rows * nh) as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -6375,6 +6392,13 @@ impl<'a> Recorder<'a> {
             16,
         );
         let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
+        // attn_combine.comp splits hd as `hdt = hd/ntile`; a non-divisor ntile drops the top
+        // hd-ntile*hdt dims (left uninitialized). ntile is 4 only when hd%4==0, else 1, so hd%ntile==0
+        // always holds — this pins that invariant at the call site (never fires for shipped hd).
+        debug_assert!(
+            hd.is_multiple_of(ntile as usize),
+            "attn_combine: hd ({hd}) must be a multiple of ntile ({ntile}); hdt=hd/ntile would drop dims"
+        );
         let mut p2 = [0u8; 16];
         p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -6473,6 +6497,13 @@ impl<'a> Recorder<'a> {
             .be
             .kernel("attn_combine", crate::gemm::attn_combine_spv(), 4, 16);
         let ntile = if hd.is_multiple_of(4) { 4u32 } else { 1u32 };
+        // attn_combine.comp splits hd as `hdt = hd/ntile`; a non-divisor ntile drops the top
+        // hd-ntile*hdt dims (left uninitialized). ntile is 4 only when hd%4==0, else 1, so hd%ntile==0
+        // always holds — this pins that invariant at the call site (never fires for shipped hd).
+        debug_assert!(
+            hd.is_multiple_of(ntile as usize),
+            "attn_combine: hd ({hd}) must be a multiple of ntile ({ntile}); hdt=hd/ntile would drop dims"
+        );
         let mut p2 = [0u8; 16];
         p2[0..4].copy_from_slice(&(nh as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(hd as u32).to_ne_bytes());

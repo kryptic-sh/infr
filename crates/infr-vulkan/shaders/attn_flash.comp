@@ -68,6 +68,12 @@ void main() {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
                 coopMatLoad(A, q, (qr0 + sg * 16u) * pc.nh * hd + h * hd + kf,
                             pc.nh * hd, gl_CooperativeMatrixLayoutRowMajor);
+                // Direct global K read: the kv0 loop is NOT BN-rounded, so the last 64-wide column
+                // tile reads kv rows [kvend, ceil(kvend/BN)*BN) past kv_len. A direct coopMatLoad
+                // can't guard per-column (only the -DSTAGE arms can, via the shmem copy) — the
+                // over-read is bounded by the K/V ROW CAPACITY (recorder gates flash on
+                // kv_len.div_ceil(64)*64 <= att_cap_rows, so the padded tile stays inside the
+                // allocation) and the over-read columns are masked to -1e30 in the softmax below.
                 coopMatLoad(B, k, (kv0 + ctile) * pc.nkv * hd + kvh * hd + kf,
                             pc.nkv * hd, gl_CooperativeMatrixLayoutColumnMajor);
                 acc = coopMatMulAdd(A, B, acc);
@@ -113,6 +119,8 @@ void main() {
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
                 coopMatLoad(A, Ps, (sg * 16u) * BN + kf, BN,
                             gl_CooperativeMatrixLayoutRowMajor);
+                // Direct global V read: same bounded over-read as the K load above (rows past kv_len
+                // stay inside the row-capacity allocation; their P weight is 0 → no contribution).
                 coopMatLoad(B, v, (kv0 + kf) * pc.nkv * hd + kvh * hd + ct,
                             pc.nkv * hd, gl_CooperativeMatrixLayoutRowMajor);
                 acc = coopMatMulAdd(A, B, acc);
@@ -126,6 +134,12 @@ void main() {
     for (uint i = li; i < BM * hd; i += gl_WorkGroupSize.x) {
         uint r = i / hd;
         uint d = i % hd;
+        // PRECONDITION: `o`/`q` are allocated at the BM-aligned `mpad` row count (the recorder pads
+        // them), so every tile row `qr0+r` is in-bounds. The store therefore covers ALL BM rows —
+        // padding rows included — which keeps this kernel bit-identical to the staged/split-K paths
+        // (they also write every tile row). A future caller that sized `o`/`q` to a non-BM-aligned
+        // `q_len` would need a `qr0+r < pc.q_len` guard here (as attn_nc_fa.comp:228 has) AND the
+        // matching guard on the other flash kernels so the paths stay in agreement.
         float l = lrow[r];
         o[(qr0 + r) * pc.nh * hd + h * hd + d] = (l > 0.0) ? Os[i] / l : 0.0;
     }

@@ -2779,7 +2779,15 @@ fn lower_op(
                     .unwrap_or(24);
                 let flash_geom = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && hd == 128
-                    && kv_len <= att_cap_rows
+                    // The flash kernels read K/V in BN=64 column tiles, so the last tile over-reads up
+                    // to kv_len.div_ceil(64)*64 rows (masked in softmax, but a real global read the
+                    // direct coopMatLoad arm can't guard). Require the PADDED read width to fit the
+                    // cache's row capacity — the flash analogue of `cap_short` below (nonfa's 256-row
+                    // guard). Byte-identical to the old `kv_len <= att_cap_rows` whenever att_cap_rows
+                    // is 64-aligned / has >=64 slack (the golden ctx sizes); only a tightly-sized,
+                    // non-64-aligned cache (e.g. MTP whole-prompt verify) reroutes to the safe split-K
+                    // path instead of over-reading past the allocation.
+                    && kv_len.div_ceil(64) * 64 <= att_cap_rows
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
                     && be_.caps().f16_coopmat()

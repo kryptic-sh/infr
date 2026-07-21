@@ -22,10 +22,11 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **27** — 0 🔴, 6 🟠, 21 🟡. (4 findings are explicitly
-  **deferred**, not open work: the 🟠 `make_compute_kernel` OOM→Result and three
-  🟡 shader/dp4a DRY refactors — each risks the byte-identity gate or the
-  recorded stream; see their sections.)
+- **Remaining open:** **23** — 0 🔴, 6 🟠, 17 🟡, in just 3 modules
+  (`infr-metal` `exec.rs`, the gated multi-GPU, and the parked MTP). (4 findings
+  are explicitly **deferred**, not open work: the 🟠 `make_compute_kernel`
+  OOM→Result and three 🟡 shader/dp4a DRY refactors — each risks the
+  byte-identity gate or the recorded stream; see their sections.)
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -280,6 +281,16 @@ parked path).
   (bit-identical, verified through the real AVX512BW path); the Q6_K maddubs
   comment is corrected. **infr-cpu is fully cleared.** \_Deferred:* the
   batch-kernel per-call scratch-alloc reduction (a dedicated perf change).
+- **`infr-prof` + `infr-prof-rt` (all 4 findings)** — TDD, +tests; profiling
+  side-channel, no inference/golden impact (the `#[instrument]` macro only
+  expands under the non-default `infr_profile` cfg). `should_skip` matches the
+  attribute path structurally via `syn` (`infr_prof::skip`, incl. the `cfg_attr`
+  form, excluding `doc` attrs); module `cfg`-skip fires only for exactly `test`/
+  `all(...,test,...)` (not `not(test)`/`feature="test-*"`); the GPU-report sort
+  uses `total_cmp` (NaN-safe); a real `[dropped]` aggregate surfaces over-cap
+  sites; the intentional per-thread-table retention is documented.
+  (`iquant_grids.rs` + `infr-engine` were audited **clean** — pure tables / a
+  re-export shim.)
 
 ### Highest-priority (production default paths)
 
@@ -520,38 +531,3 @@ items below are latent acceptance-rate/perf bugs, not output corruption._
    And `2200` the Linear arm allocates `dev_dst` up front that the
    fused-residual peephole leaves dead. _Fix:_ one `(base → {suffix → kernel})`
    table so a miss is a registry error; defer `dev_dst` past the fused check.
-
-## infr-core/iquant_grids.rs · infr-engine · infr-prof · infr-prof-rt
-
-_`iquant_grids.rs` is **clean** — pure `static` arrays, compile-time-checked
-lengths, no accessor/index/unsafe; callers index within the declared bounds.
-`infr-engine` is **clean** — a pure re-export shim. `infr-prof-rt`
-disabled-build overhead is correctly zero, the lock-free collector is sound, and
-recursion/self-time accounting is correct (all verified). Findings are in the
-prof crates only:_
-
-1. **🟡
-   `infr-prof/lib.rs:86 — `should_skip`substring-matches`"infr_prof"`+`"skip"`
-   over the whole stringified attribute, incl. doc comments.** A fn whose doc
-   says e.g. "see infr*prof to skip hot leaves" is silently un-instrumented;
-   substring matching also can't tell `infr_prof::skip` from an unrelated
-   `skip`. `visit_item_mod_mut` (`129`) similarly skips any module whose attr
-   string `contains("test")` — wrongly dropping instrumentation from
-   `#[cfg(not(test))]` and
-   `feature="test-*"` modules. \_Fix:* match the attribute path/`cfg`meta structurally, exclude`doc`.
-2. **🟡
-   `infr-prof-rt/lib.rs:324 — GPU-report sort `partial_cmp(...).unwrap()`panics on a NaN`us`**
-   (bad timestamp delta) inside the `atexit` reporter, aborting at process
-   shutdown. _Fix:_ `total_cmp`. (Recurs across the codebase — see the
-   `diffusion.rs`/`cli`/`prof` NaN-sort findings; a shared `by_desc_f64`
-   comparator would kill the whole class.)
-3. **🟡
-   `infr-prof-rt/lib.rs:34,280 — the documented `[dropped]` bucket for over-`MAX_SITES`
-   sites is not implemented** — such sites get `count==0` and are
-   `retain`-filtered away, vanishing silently rather than being surfaced. _Fix:_
-   emit a real count-only `[dropped]` aggregate, or correct the doc.
-4. **🟡
-   `infr-prof-rt/lib.rs:132 — per-thread `AccumTable`(192 KiB) is pushed to the global`tables`
-   vec and never deregistered** → unbounded growth (+ reporter iteration cost)
-   with transient threads. Acceptable if thread count stays bounded (typical
-   here); otherwise prune dead `Weak` entries in `collect`.

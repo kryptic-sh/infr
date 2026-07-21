@@ -34,6 +34,13 @@ use std::time::Instant;
 /// (reported as `[dropped]`). 8192 * 24 B = 192 KiB per thread — cheap for a profiling build.
 const MAX_SITES: usize = 8192;
 
+/// Enter count for span sites whose id landed at or past [`MAX_SITES`] (never timed, no
+/// per-thread slot). Surfaced by [`collect`] as one count-only `[dropped]` aggregate row so
+/// over-cap activity is visible instead of vanishing silently. A real `fetch_add` (not the
+/// single-writer store used for slots) since any thread may hit it — but it is the cold path
+/// (only reached once a build has >8192 distinct instrumented sites), so the cost is irrelevant.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
 /// One static per instrumented `fn`, created by the `#[infr_prof::instrument]` expansion.
 /// The id is assigned lazily on first call (relaxed fast path, mutex slow path).
 pub struct Site {
@@ -128,6 +135,17 @@ struct ThreadProf {
 
 impl ThreadProf {
     fn new() -> Self {
+        // Register this thread's 192 KiB table in the global vec and NEVER deregister it. This
+        // is intentional: rayon/spin workers park (they never unwind their TLS), so the exit
+        // reporter must still be able to read a parked worker's table — a `Weak` that dropped
+        // when the thread parked would lose that data. The `tables` vec therefore grows by one
+        // Arc per thread that ever runs instrumented code and is retained for the process
+        // lifetime. That is bounded here: this engine uses fixed-size rayon pools plus the main
+        // thread, so the count is small and constant. CAVEAT: a workload that spawns unbounded
+        // *transient* threads would grow this vec without bound (and lengthen the reporter's
+        // per-thread scan). If that ever becomes a real pattern, switch `tables` to hold
+        // `Weak<AccumTable>` and prune upgrades that fail in `collect` — accepting that a
+        // transient thread's data is lost once it fully exits.
         let table = Arc::new(AccumTable::new());
         global().tables.lock().unwrap().push(table.clone());
         ThreadProf {
@@ -269,6 +287,10 @@ impl Drop for Guard {
                 if outermost {
                     add(&slot.total_ns, elapsed);
                 }
+            } else {
+                // Over the site cap: no slot exists to time this into. Count it so the exit
+                // report can surface a single `[dropped]` aggregate instead of losing it.
+                DROPPED.fetch_add(1, Relaxed);
             }
         });
     }
@@ -309,6 +331,17 @@ fn collect() -> (Vec<Row>, usize, u64) {
     }
     rows.retain(|r| r.count > 0);
     rows.sort_by_key(|r| std::cmp::Reverse(r.self_ns));
+    // Surface over-cap sites (idx >= MAX_SITES) as one count-only aggregate. self_ns == 0 keeps
+    // it last in the self-time ordering; it is always present in the JSON.
+    let dropped = DROPPED.load(Relaxed);
+    if dropped > 0 {
+        rows.push(Row {
+            name: "[dropped]".to_string(),
+            count: dropped,
+            total_ns: 0,
+            self_ns: 0,
+        });
+    }
     (rows, n_threads, wall_ns)
 }
 
@@ -342,7 +375,10 @@ pub fn report() {
     }
     let (rows, n_threads, wall_ns) = collect();
     let mut gpu: Vec<(String, f64, u64)> = GPU.lock().unwrap().clone();
-    gpu.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    // total_cmp, not partial_cmp().unwrap(): a bad timestamp delta can yield a NaN `us`, and
+    // panicking here would abort the whole process from inside the atexit reporter. total_cmp
+    // is a total order (NaN sorts deterministically) so the report always prints.
+    gpu.sort_by(|a, b| b.1.total_cmp(&a.1));
     if rows.is_empty() && gpu.is_empty() {
         return;
     }
@@ -454,8 +490,14 @@ fn write_json(
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process-global site registry (`global().names`), so one
+    /// test padding `names` up to `MAX_SITES` can never make another test's sites register past
+    /// the cap. Held across each such test's registration + `collect`.
+    static REG_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn nesting_and_recursion() {
+        let _reg = REG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static OUTER: Site = Site::new("m", "outer");
         static INNER: Site = Site::new("m", "inner");
         static REC: Site = Site::new("m", "rec");
@@ -492,5 +534,52 @@ mod tests {
         // double-counted); self sums each level's own ~2ms.
         assert!(rec.total_ns >= 6_000_000 && rec.total_ns < 11_000_000);
         assert!(rec.self_ns >= 6_000_000 && rec.self_ns <= rec.total_ns);
+    }
+
+    #[test]
+    fn gpu_sort_total_cmp_no_nan_panic() {
+        // Same comparator report() uses. A NaN `us` (bad timestamp delta) must NOT panic —
+        // partial_cmp().unwrap() would abort the atexit reporter; total_cmp is a total order.
+        let mut gpu: Vec<(String, f64, u64)> = vec![
+            ("a".to_string(), 1.0, 1),
+            ("nan".to_string(), f64::NAN, 1),
+            ("b".to_string(), 2.0, 1),
+        ];
+        gpu.sort_by(|a, b| b.1.total_cmp(&a.1));
+        assert_eq!(gpu.len(), 3);
+    }
+
+    #[test]
+    fn dropped_bucket_counts_over_cap() {
+        let _reg = REG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Pad the registry to the cap so the next site's id lands at MAX_SITES (over-cap), then
+        // restore it so serialized sibling tests still register below the cap.
+        let saved_len = {
+            let mut names = global().names.lock().unwrap();
+            let saved = names.len();
+            if names.len() < MAX_SITES {
+                names.resize(MAX_SITES, ("", ""));
+            }
+            saved
+        };
+        static OVER: Site = Site::new("m", "over_cap");
+        let before = DROPPED.load(Relaxed);
+        {
+            let _g = enter(&OVER);
+        }
+        assert_eq!(
+            DROPPED.load(Relaxed),
+            before + 1,
+            "one over-cap enter must bump the dropped counter"
+        );
+        // collect() surfaces the aggregate as a single count-only `[dropped]` row.
+        let (rows, _, _) = collect();
+        let d = rows
+            .iter()
+            .find(|r| r.name == "[dropped]")
+            .expect("[dropped] row present");
+        assert!(d.count >= 1 && d.total_ns == 0 && d.self_ns == 0);
+        // Restore the registry (drops the padding and OVER's over-cap registration).
+        global().names.lock().unwrap().truncate(saved_len);
     }
 }

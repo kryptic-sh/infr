@@ -165,7 +165,7 @@ fn f16_aligned_multirow_linear_uses_the_cooperative_tile() {
     asserts_token_seq(shader, "CMM_F16_KERNEL(linear_f16_cmm, DEC16_F16)");
 
     let exec = include_str!("../src/exec.rs");
-    asserts_token_seq(exec, "let f16_cmm = f16_native && m >= 8");
+    asserts_token_seq(exec, "f16_native && m >= 8");
     asserts_token_seq(exec, "self.pipelines.get(\"linear_f16_cmm\")");
 }
 
@@ -195,8 +195,8 @@ fn f32_aligned_multirow_linear_uses_the_cooperative_tile() {
     asserts_token_seq(shader, "CMM_F32_KERNEL(linear_f32_cmm, DEC16_F32)");
 
     let exec = include_str!("../src/exec.rs");
-    asserts_token_seq(exec, "let f32_cmm = f32_native && m >= 8");
-    asserts_token_seq(exec, "Some(\"linear_f32_cmm\")");
+    asserts_token_seq(exec, "f32_native && m >= 8");
+    asserts_token_seq(exec, "self.pipelines.get(\"linear_f32_cmm\")");
 }
 
 #[test]
@@ -238,8 +238,8 @@ fn bf16_aligned_multirow_linear_uses_the_cooperative_tile() {
     asserts_token_seq(shader, "CMM_BF16_KERNEL(linear_bf16_cmm, DEC16_BF16)");
 
     let exec = include_str!("../src/exec.rs");
-    asserts_token_seq(exec, "let bf16_cmm = bf16_native && m >= 6");
-    asserts_token_seq(exec, "Some(\"linear_bf16_cmm\")");
+    asserts_token_seq(exec, "bf16_native && m >= 6");
+    asserts_token_seq(exec, "self.pipelines.get(\"linear_bf16_cmm\")");
 }
 
 // The two below test the TRIPWIRE ITSELF. A guard nobody has watched fail is not a guard: it can
@@ -274,11 +274,18 @@ fn every_dispatchable_kernel_exists_in_the_library() {
         let Some(end) = rest.find('"') else { break };
         let lit = &rest[..end];
         rest = &rest[end + 1..];
+        // Kernel-SHAPED literals that are NOT dispatch targets. `linear_q3k` appears only in a
+        // negative registry assertion (`qui_linear_kerns("linear_q3k").is_none()` — q3k has no
+        // Metal kernel, the test proves the registry returns None rather than a silent quik8
+        // default). It is never dispatched, so exclude it by exact name; a real missing kernel
+        // still trips.
+        const NOT_DISPATCHED: &[&str] = &["linear_q3k"];
         if !lit.is_empty()
             && lit
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
             && KERNEL_PREFIXES.iter().any(|p| lit.starts_with(p))
+            && !NOT_DISPATCHED.contains(&lit)
             && !names.iter().any(|n| n == lit)
         {
             names.push(lit.to_string());

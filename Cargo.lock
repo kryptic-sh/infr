@@ -1221,6 +1221,7 @@ dependencies = [
  "dirs",
  "indicatif",
  "infr-core",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

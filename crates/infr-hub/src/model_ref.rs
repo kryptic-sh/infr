@@ -35,7 +35,9 @@ impl ModelRef {
             .unwrap_or(s);
         let (repo, sel) = match body.split_once(':') {
             Some((r, sel)) if !sel.is_empty() => (r, Some(sel.to_owned())),
-            _ => (body, None),
+            // A lone trailing `:` (`org/repo:`) has an empty selector — strip the colon so it does
+            // not leak into the repo name (which would 404 on every resolve URL).
+            _ => (body.strip_suffix(':').unwrap_or(body), None),
         };
         if is_repo(repo) {
             Ok(ModelRef::Repo {
@@ -121,6 +123,20 @@ mod tests {
                 ModelRef::Path(PathBuf::from(p))
             );
         }
+    }
+
+    #[test]
+    fn trailing_colon_stripped() {
+        // `org/repo:` — empty selector, the colon must NOT stay in the repo name.
+        assert_eq!(
+            ModelRef::parse("org/repo:").unwrap(),
+            repo("org/repo", None)
+        );
+        // With the legacy prefix too.
+        assert_eq!(
+            ModelRef::parse("hf:org/repo:").unwrap(),
+            repo("org/repo", None)
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::{
     fs,
     io::{Read, Write},
     os::unix::fs::symlink,
+    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
 };
 use tracing::{debug, info};
@@ -63,50 +64,57 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
 
     let repo_dir = store.repo_dir(repo);
     let blobs = repo_dir.join("blobs");
-    // Up to date when the snapshot for THIS commit already links a present blob for `filename`.
-    let link = repo_dir.join("snapshots").join(&commit).join(&filename);
-    if link.exists() {
+    let snap = repo_dir.join("snapshots").join(&commit);
+    // A sharded GGUF needs its WHOLE `-NNNNN-of-MMMMM` set — one shard fails at load.
+    let shards = crate::store::shard_set(&filename);
+    let primary = snap.join(&shards[0]);
+    // Up to date when THIS commit's snapshot already links every present shard blob.
+    if shards.iter().all(|f| snap.join(f).exists()) {
         info!("hf:{repo}:{filename} already up to date ({commit})");
         // Still ensure companions — a snapshot pulled before this feature won't have them yet.
-        if let Some(snap) = link.parent() {
-            fetch_companions(repo, &blobs, snap, &siblings);
-        }
-        return Ok(link);
+        fetch_companions(repo, &blobs, &snap, &siblings);
+        return Ok(primary);
     }
+
+    // Repoint refs/main + (re)build the snapshot. `fetch_and_link` content-addresses each shard, so a
+    // commit that only moved a sibling (file bytes unchanged) relinks the cached blob — no re-download.
+    info!("Updating hf:{repo}:{filename} → {commit}");
+    write_text(&repo_dir.join("refs").join("main"), &commit)?;
+    fs::create_dir_all(&snap).map_err(Error::from)?;
+    for f in &shards {
+        fetch_and_link(&blobs, &snap, repo, f)?;
+    }
+    fetch_companions(repo, &blobs, &snap, &siblings);
+    Ok(primary)
+}
+
+/// Download one file (or reuse its content-addressed blob) into `snap` as a symlink into `blobs`.
+/// Returns the snapshot symlink path. HEADs for the LFS sha256 so a present blob is relinked without
+/// a download and a fresh download is verified against it.
+fn fetch_and_link(blobs: &Path, snap: &Path, repo: &str, filename: &str) -> Result<PathBuf> {
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
-    // The commit moved but the FILE may be byte-identical (e.g. the repo only added a sibling like an
-    // mmproj). Blobs are content-addressed by sha256, so if the file's sha is already cached we just
-    // relink — no multi-GB re-download. A HEAD gives the LFS sha (`X-Linked-Etag`) without the body,
-    // which also lets the download verify the body against it.
-    let want = head_lfs_sha(repo, &filename).ok().flatten();
+    let want = head_lfs_sha(repo, filename).ok().flatten();
     let hex = match &want {
         Some(sha) if blobs.join(sha).exists() => {
-            info!("hf:{repo}:{filename} content unchanged; relinking → {commit}");
+            debug!("hf:{repo}:{filename} blob already present; linking → {sha}");
             sha.clone()
         }
         _ => {
-            info!("Updating hf:{repo}:{filename} → {commit}");
             download_to_blob(
                 &http_client()?,
                 &url,
                 token().as_deref(),
-                &blobs,
-                &filename,
+                blobs,
+                filename,
                 want.as_deref(),
             )?
             .1
         }
     };
-
-    // Repoint refs/main + create the new commit's snapshot symlink (old snapshots are left in place).
-    write_text(&repo_dir.join("refs").join("main"), &commit)?;
-    fs::create_dir_all(link.parent().unwrap()).map_err(Error::from)?;
+    let link = snap.join(filename);
     let _ = fs::remove_file(&link); // replace a stale/dangling link
     symlink(format!("../../blobs/{hex}"), &link).map_err(Error::from)?;
     debug!("linked {link:?} -> blobs/{hex}");
-    if let Some(snap) = link.parent() {
-        fetch_companions(repo, &blobs, snap, &siblings);
-    }
     Ok(link)
 }
 
@@ -174,39 +182,24 @@ fn pull_repo(repo: &str, sel: Option<&str>) -> Result<PathBuf> {
 
     let repo_dir = store.repo_dir(repo);
     let blobs = repo_dir.join("blobs");
-    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
-    // Fetch the expected LFS sha256 (GGUFs are LFS) so the download is (a) skipped when the
-    // content-addressed blob is already on disk and (b) verified against it. A non-LFS file or a HEAD
-    // failure yields None → the download proceeds unverified (best-effort).
-    let want = head_lfs_sha(repo, &filename).ok().flatten();
-    let hex = match &want {
-        Some(sha) if blobs.join(sha).exists() => {
-            debug!("hf:{repo}:{filename} blob already present; linking → {sha}");
-            sha.clone()
-        }
-        _ => {
-            download_to_blob(
-                &http_client()?,
-                &url,
-                token().as_deref(),
-                &blobs,
-                &filename,
-                want.as_deref(),
-            )?
-            .1
-        }
-    };
-
     // Write the HF Hub pointers: refs/main = commit, snapshots/<commit>/<file> -> ../../blobs/<sha>.
     write_text(&repo_dir.join("refs").join("main"), &commit)?;
     let snap = repo_dir.join("snapshots").join(&commit);
     fs::create_dir_all(&snap).map_err(Error::from)?;
-    let link = snap.join(&filename);
-    let _ = fs::remove_file(&link); // replace a stale/dangling link
-    symlink(format!("../../blobs/{hex}"), &link).map_err(Error::from)?;
-    debug!("linked {link:?} -> blobs/{hex}");
+    // A sharded GGUF (`-NNNNN-of-MMMMM`) needs its WHOLE set downloaded/linked — a lone shard 1 fails
+    // at load. A non-sharded file is a singleton set.
+    let shards = crate::store::shard_set(&filename);
+    if shards.len() > 1 {
+        info!(
+            "hf:{repo}:{filename} is a {}-shard split; fetching all",
+            shards.len()
+        );
+    }
+    for f in &shards {
+        fetch_and_link(&blobs, &snap, repo, f)?;
+    }
     fetch_companions(repo, &blobs, &snap, &siblings);
-    Ok(link)
+    Ok(snap.join(&shards[0]))
 }
 
 /// Query the HF model API for `repo`: return `(commit_sha, gguf_filename, sibling_filenames)` for
@@ -322,16 +315,46 @@ fn download_to_blob(
     } else {
         debug!("no expected sha256 for {label}; download will not be integrity-checked");
     }
-    let tmp = blobs.join(format!(".dl-{}", sanitise(label)));
+    let stem = sanitise(label);
+    let tmp = blobs.join(format!(".dl-{stem}"));
+    let meta = blobs.join(format!(".dl-{stem}.meta")); // stored If-Range validator for the partial
+
+    // Serialize concurrent pulls of the SAME blob (auto-pull racing a manual `pull`, two `run`s).
+    // An advisory `flock` on a per-blob lockfile is chosen over unique-per-process temp names ON
+    // PURPOSE: it PRESERVES resume — the one shared temp keeps accumulating across processes instead
+    // of each starting a fresh partial from byte 0. The lock releases when `_lock` drops.
+    let _lock = FileLock::acquire(&blobs.join(format!(".dl-{stem}.lock")))?;
+    // Re-check the content-addressed short-circuit now that we hold the lock: a racing process may
+    // have finished this exact blob while we waited.
+    if let Some(sha) = expected_sha {
+        let blob = blobs.join(sha);
+        if blob.exists() {
+            let size = fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+            return Ok((blob, sha.to_string(), size));
+        }
+    }
+
     let have = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    // Validator captured when THIS partial was first written; only meaningful with bytes on disk.
+    let validator = (have > 0)
+        .then(|| fs::read_to_string(&meta).ok())
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     debug!("GET {url}{}", if have > 0 { " (resume)" } else { "" });
     let mut req = client.get(url);
     if let Some(t) = bearer {
         req = req.bearer_auth(t);
     }
-    if have > 0 {
-        req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
+    // Resume with `If-Range`: if the object changed since the partial was written, the server
+    // ignores the Range and sends a full 200 → we restart clean instead of splicing new bytes onto a
+    // stale prefix (an undetectable corruption without the end-of-body sha check).
+    if let Some((range, if_range)) = resume_headers(have, validator.as_deref()) {
+        req = req.header(reqwest::header::RANGE, range);
+        if let Some(v) = if_range {
+            req = req.header(reqwest::header::IF_RANGE, v);
+        }
     }
     let resp = req
         .send()
@@ -347,29 +370,47 @@ fn download_to_blob(
     let remaining = resp.content_length();
     let total = remaining.map(|r| if resuming { have + r } else { r });
 
-    let mut hasher = Sha256::new();
+    // Persist the validator for a FUTURE resume — before streaming, so an interrupt mid-body still
+    // leaves a usable `If-Range` for the next attempt. On a 206 the stored validator still matches
+    // (the server accepted it), so only refresh it on a fresh/200 body.
+    if !resuming {
+        match response_validator(resp.headers()) {
+            Some(v) => {
+                let _ = fs::write(&meta, v);
+            }
+            None => {
+                let _ = fs::remove_file(&meta);
+            }
+        }
+    }
+
     let mut file = if resuming {
-        hash_file(&tmp, &mut hasher)?; // fold the bytes already on disk into the digest
         info!("resuming {label} at {have} bytes");
         fs::OpenOptions::new()
             .append(true)
             .open(&tmp)
             .map_err(Error::from)?
     } else {
-        fs::File::create(&tmp).map_err(Error::from)? // truncates any stale partial
+        fs::File::create(&tmp).map_err(Error::from)? // truncates any stale partial (changed object)
     };
     let start = if resuming { have } else { 0 };
 
     let pb = progress::bar(total, label, Unit::Bytes);
     pb.set_position(start);
 
-    if let Err(e) = stream_into(resp, &mut file, &mut hasher, &pb) {
+    if let Err(e) = stream_into(resp, &mut file, &pb) {
         pb.abandon_with_message(format!("⚠ {label} interrupted (resumable)"));
         return Err(Error::Other(format!(
             "download failed (partial kept for resume): {e}"
         )));
     }
+    drop(file); // flush + close before re-reading for the digest
 
+    // Hash the COMPLETE file ONCE at the end. The old code folded the on-disk prefix into the digest
+    // on every resume (O(K·size) over K flaky-link retries); since the whole body is sha-verified
+    // here anyway, a single final pass is equivalent and cheaper.
+    let mut hasher = Sha256::new();
+    hash_file(&tmp, &mut hasher)?;
     let hex: String = hasher
         .finalize()
         .iter()
@@ -382,14 +423,72 @@ fn download_to_blob(
     if let Err(e) = verify_sha(label, &hex, expected_sha) {
         pb.abandon_with_message(format!("⚠ {label} sha256 mismatch"));
         let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&meta);
         return Err(e);
     }
     pb.finish_with_message(format!("✓ {label} ({} MiB)", size / (1024 * 1024)));
 
     let blob = blobs.join(&hex); // HF blob name = bare sha256 hex
     fs::rename(&tmp, &blob).map_err(Error::from)?;
+    let _ = fs::remove_file(&meta); // partial committed; validator no longer needed
     info!("Saved blob: {blob:?}");
     Ok((blob, hex, size))
+}
+
+/// Build the resume request directives: the `Range` value and an optional `If-Range` value. Returns
+/// `None` when there is nothing on disk to resume (`have == 0`). `If-Range` is omitted when no
+/// validator was stored (a partial from before this feature) — the server may then splice, but the
+/// end-of-download sha256 verification still catches it.
+fn resume_headers(have: u64, validator: Option<&str>) -> Option<(String, Option<String>)> {
+    if have == 0 {
+        return None;
+    }
+    Some((format!("bytes={have}-"), validator.map(str::to_string)))
+}
+
+/// The value to persist as the `If-Range` validator for a partial: the strong `ETag` if present,
+/// else `Last-Modified`. Either is an opaque object identity the server compares on the next resume.
+fn response_validator(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::ETAG)
+        .or_else(|| headers.get(reqwest::header::LAST_MODIFIED))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// An advisory exclusive `flock` on a lockfile, released when dropped. Serializes concurrent
+/// downloads of the same blob so two processes can't interleave writes into the shared temp.
+struct FileLock {
+    _file: fs::File,
+}
+
+impl FileLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(Error::from)?;
+        // Blocks until any other holder releases. `flock` is process-associated and auto-releases if
+        // the holder dies (crash-safe — no stale lock).
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(Error::Other(format!(
+                "flock {path:?}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(FileLock { _file: file })
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // Closing the fd releases the lock; the explicit unlock is belt-and-suspenders.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Assert the downloaded digest `hex` matches the `expected` LFS sha256 (case-insensitive). `None`
@@ -417,11 +516,11 @@ fn hash_file(path: &Path, hasher: &mut Sha256) -> Result<()> {
     Ok(())
 }
 
-/// Stream the response body into `file`, updating the digest and progress bar.
+/// Stream the response body into `file`, advancing the progress bar. The digest is computed in a
+/// single final pass over the completed file (see [`download_to_blob`]), not here.
 fn stream_into(
     mut resp: Response,
     file: &mut fs::File,
-    hasher: &mut Sha256,
     pb: &ProgressBar,
 ) -> std::result::Result<(), std::io::Error> {
     let mut buf = [0u8; 1 << 16];
@@ -430,7 +529,6 @@ fn stream_into(
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
         file.write_all(&buf[..n])?;
         pb.inc(n as u64);
     }
@@ -480,6 +578,61 @@ mod tests {
         assert!(!is_sha256(&"g".repeat(64))); // non-hex
         assert!(!is_sha256("d41d8cd98f00b204e9800998ecf8427e")); // md5 (32 chars)
         assert!(!is_sha256(""));
+    }
+
+    #[test]
+    fn resume_headers_build() {
+        // Nothing on disk → no resume directives.
+        assert_eq!(resume_headers(0, Some("etag")), None);
+        assert_eq!(resume_headers(0, None), None);
+        // Bytes on disk with a stored validator → Range + If-Range.
+        assert_eq!(
+            resume_headers(100, Some("\"abc\"")),
+            Some(("bytes=100-".to_string(), Some("\"abc\"".to_string())))
+        );
+        // Bytes but no validator (pre-feature partial) → Range only.
+        assert_eq!(
+            resume_headers(100, None),
+            Some(("bytes=100-".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn response_validator_prefers_etag() {
+        use reqwest::header::{HeaderMap, HeaderValue, ETAG, LAST_MODIFIED};
+        let mut h = HeaderMap::new();
+        assert_eq!(response_validator(&h), None);
+        h.insert(
+            LAST_MODIFIED,
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(
+            response_validator(&h).as_deref(),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        );
+        h.insert(ETAG, HeaderValue::from_static("\"deadbeef\""));
+        assert_eq!(response_validator(&h).as_deref(), Some("\"deadbeef\""));
+    }
+
+    #[test]
+    fn file_lock_is_exclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("blob.lock");
+        let guard = FileLock::acquire(&path).unwrap();
+        // A second exclusive lock on the same file (separate fd) must NOT be grantable while held.
+        let other = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_ne!(rc, 0, "second flock should fail while the first is held");
+        // After the first releases, the lock is grantable again.
+        drop(guard);
+        let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "flock should succeed once the holder drops");
+        unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_UN) };
     }
 
     #[test]

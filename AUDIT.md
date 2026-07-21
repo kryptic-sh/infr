@@ -17,30 +17,47 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 ## Summary
 
-**157 verified findings across 24 module slices: 1 🔴 critical, 33 🟠 major, 123
-🟡 minor.** No finding was accepted on an agent's word — each was re-read
-against the source by the coordinator; two agent-flagged "MAJOR"s (the Q5_1
-clamp in the shader and CPU quantizers) were **downgraded** to defensive-only
-after verifying the overflow is unreachable, and one MTP off-by-one is marked
-**PLAUSIBLE** (real code smell, could not fully confirm the position convention
-without running the parked path).
+**Living ledger — findings are pruned from this file as their fix lands on
+`main` (TDD, one module slice at a time).**
+
+- **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
+  major, 123 🟡 minor).
+- **Remaining open:** **151** — 0 🔴, 29 🟠, 122 🟡.
+
+No finding was accepted on an agent's word — each was re-read against the source
+by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
+CPU quantizers) were **downgraded** to defensive-only after verifying the
+overflow is unreachable, and one MTP off-by-one is marked **PLAUSIBLE** (real
+code smell, could not fully confirm the position convention without running the
+parked path).
+
+### Resolved (landed on `main`)
+
+- **`infr-hub` (all 6 findings)** — TDD, +10 tests. `1263bcc` verifies
+  downloaded blobs against HF's expected LFS sha256 (the 🔴 critical); the slice
+  adds `If-Range` resume (no stale-partial splice), an advisory `flock`
+  serializing concurrent pulls, full split-shard (`-NNNNN-of-MMMMM`)
+  download/relink, one shared `pick_gguf` selection for download+cache (kills
+  the re-download loop) that excludes `mmproj`/float-master fallbacks,
+  `refs/main` snapshot preference, trailing-colon ref parsing, and verify-once
+  hashing.
 
 ### Highest-priority (production default paths)
 
-| #   | Sev | Location                              | Issue                                                                                                                                                     |
-| --- | --- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | 🔴  | `infr-hub pull.rs:316`                | Downloaded blob **never sha256-verified** vs HF's expected digest — violates the repo's own `verify-gguf-downloads` rule; corruption/MITM links silently. |
-| 2   | 🟠  | `infr-llama chat/mod.rs:186`          | Generate error leaves an **orphaned user turn** → next turn has two consecutive user messages, permanent history corruption.                              |
-| 3   | 🟠  | `infr-server lib.rs:953`              | Streaming path **swallows generation errors as a clean `stop`**; a closure panic hangs strict SSE clients (no `[DONE]`).                                  |
-| 4   | 🟠  | `infr-server lib.rs:874`              | **No per-request cancellation** — a disconnected stream holds its GPU slot to `max_tokens`, blocking `--parallel` queue.                                  |
-| 5   | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV.                          |
-| 6   | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx.                               |
-| 7   | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                                                       |
-| 8   | 🟠  | `infr-llama sampling.rs:339`          | Repeat penalty applied **per-occurrence, not per-distinct-token** — diverges from the llama.cpp semantics it claims to match.                             |
-| 9   | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                                                 |
-| 10  | 🟠  | `infr-gguf lib.rs:80`                 | Corrupt GGUF length prefix → **`pos+n` overflow panics** instead of a clean loader error (untrusted input).                                               |
-| 11  | 🟠  | `infr-cli main.rs:120`                | `--dev` **can't override an inherited `INFR_CPU`/`INFR_METAL`** → silent wrong-device runs; reader precedence inconsistent across commands.               |
-| 12  | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).                                            |
+| #     | Sev | Location                              | Issue                                                                                                                                       |
+| ----- | --- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| ~~1~~ | ✅  | `infr-hub`                            | ~~Downloaded blob never sha256-verified~~ — **FIXED** (`1263bcc`, + full hub slice).                                                        |
+| 2     | 🟠  | `infr-llama chat/mod.rs:186`          | Generate error leaves an **orphaned user turn** → next turn has two consecutive user messages, permanent history corruption.                |
+| 3     | 🟠  | `infr-server lib.rs:953`              | Streaming path **swallows generation errors as a clean `stop`**; a closure panic hangs strict SSE clients (no `[DONE]`).                    |
+| 4     | 🟠  | `infr-server lib.rs:874`              | **No per-request cancellation** — a disconnected stream holds its GPU slot to `max_tokens`, blocking `--parallel` queue.                    |
+| 5     | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV.            |
+| 6     | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx.                 |
+| 7     | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                                         |
+| 8     | 🟠  | `infr-llama sampling.rs:339`          | Repeat penalty applied **per-occurrence, not per-distinct-token** — diverges from the llama.cpp semantics it claims to match.               |
+| 9     | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                                   |
+| 10    | 🟠  | `infr-gguf lib.rs:80`                 | Corrupt GGUF length prefix → **`pos+n` overflow panics** instead of a clean loader error (untrusted input).                                 |
+| 11    | 🟠  | `infr-cli main.rs:120`                | `--dev` **can't override an inherited `INFR_CPU`/`INFR_METAL`** → silent wrong-device runs; reader precedence inconsistent across commands. |
+| 12    | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).                              |
 
 Other 🟠 majors span host-hot-path churn (recorder per-dispatch `env::var` +
 `Vec` allocs; adapter MoE `counts` double-zero), prefill perf (`gemm_proj`
@@ -381,11 +398,11 @@ weighted highest._
    `attn_partial` gets from `sc[1024]`+`chunk≤512`. Opt-in `INFR_MROWS_ATTN`
    path. _Fix:_ static-assert/document `chunk≤SC_MAX` or clamp the write index.
 6. **🟡 `quant_kv.comp:128` (defensive) — `FMT_Q5_1` omits the `clamp(…,0,31)`
-   the Q4_0/Q4_1/Q5_0 arms apply.** Unlike Q5_0's asymmetric `x*id+16.5` (which
+   the Q4_0/Q4_1/Q5_0 arms apply.** Unlike Q5*0's asymmetric `x*id+16.5` (which
    can genuinely round to 32.5), Q5_1's `(x-vmin)*id` is bounded by `vmax` so it
    can't reach 32 barring impossible fp error — so this is a
    robustness/consistency nit, not a live bug, but matching the siblings removes
-   the latent trap. _Fix:_ `clamp(int((x-vmin)*id+0.5),0,31)`.
+   the latent trap. \_Fix:* `clamp(int((x-vmin)*id+0.5),0,31)`.
 7. **🟡 perf/DRY — 32-lane redundant recompute + copy-pasted softmax.**
    `attn_combine.comp:36,40` recompute `mm`/`l` over all `nch` identically in
    every one of 32 lanes (32× partial-array traffic; scales poorly as chunks
@@ -530,8 +547,8 @@ weighted highest._
    warm call** (before the `if state.is_none()` gate): `has_wv` per-layer tensor
    scans, `out_scale`/`dec_out_scale` per-layer `load_tensor_dequant` (real
    dequant for gemma4/diffusion), `rope_freqs` dequant,
-   `fuse_*_decision`/`moe_batched_ok` O(n_layer×n_tensors) `find`+`format!` —
-   all pure in `(g,cfg,caps)` yet repeated per serve request. _Fix:_ compute
+   `fuse_*_decision`/`moe_batched_ok` O(n*layer×n_tensors) `find`+`format!` —
+   all pure in `(g,cfg,caps)` yet repeated per serve request. \_Fix:* compute
    once, stash in `SeamKv`.
 5. **🟡
    `runner.rs:3848 — host-embed decode allocs a throwaway `Vec<f32>`per token even when`embed_scale==1.0`**
@@ -558,10 +575,10 @@ weighted highest._
    `chunk_covered_dense_tensor` (1178) and `expert_parallel_binder` (1714) skip
    `check_bda_element_cap` for `output.weight`/`token_embd.weight` (read only by
    dispatch-chunked ops, #77, may exceed 2³² elems — "quantized 256k-vocab
-   lm_head"), but `tensor_parallel_binder` (1484) / `pipeline_binder` (1237)
+   lm*head"), but `tensor_parallel_binder` (1484) / `pipeline_binder` (1237)
    call it unconditionally on the full `numel` before replication → a
    large-vocab model that runs single-device/EP is hard-rejected under
-   `INFR_TENSOR_PARALLEL`/ `INFR_PIPELINE`. _Fix:_ mirror EP — exempt
+   `INFR_TENSOR_PARALLEL`/ `INFR_PIPELINE`. \_Fix:* mirror EP — exempt
    `chunk_covered_dense_tensor(name)`.
 2. **🟠
    `mod.rs:327,345 — process-wide `PINNED_UBATCH`/`PINNED_KV_Q8` `OnceLock`s
@@ -650,9 +667,9 @@ weighted highest._
    out-of-trie token. _Fix:_ force every id `≥vocab` to `-inf` (mask the tail).
 3. **🟡 `grammar.rs:155 — constrained decoding silently ignores the `Sampler`**
    (temp/top-p/seed): `constrained_step` always `argmax`es within the mask. A
-   request setting temperature/top_p/seed with `tool_choice:"required"` gets
+   request setting temperature/top*p/seed with `tool_choice:"required"` gets
    deterministic greedy output with no diagnostic. Defensible for tool-call
-   determinism but an undocumented divergence. _Fix:_ sample within the masked
+   determinism but an undocumented divergence. \_Fix:* sample within the masked
    distribution using the same `Sampler`/`rng`, or document the greedy behavior.
 4. **🟡 `sampling.rs:298 — `seed | 1` collapses adjacent seeds to identical
    streams** (`2k` and `2k+1` map to the same xorshift state) → "different seed,
@@ -685,10 +702,10 @@ items below are latent acceptance-rate/perf bugs, not output corruption._
    `t*{n*past..n_past+accepted}`should therefore land at head positions`n_past..`, i.e. `start_pos=n_past`. The `+1`stores`(t*{i-1},h\_{i-2})`at position`i`(wrong RoPE + stale`h`) and leaves the draft's stale row at `n_past`un-rewritten. Doesn't break token-identity (VERIFY only commits trunk-confirmed tokens) and is untested (the only multi-cycle test is`#[ignore]`d while MTP is parked) — I could not fully trace prime's convention to confirm, so **verify against `speculative.cpp`+ re-measure α** before changing. *Fix (if confirmed):* pass`n_past`, not `n_past+1`.
 2. **🟠 `mtp/mod.rs:1867 — `catch_up` computes + downloads a full vocab-wide
    logits row it discards every cycle.** It calls `sess.forward()` and drops the
-   result, but `forward` always builds the non-fused graph with the lm_head
+   result, but `forward` always builds the non-fused graph with the lm*head
    `Op::Linear [rows,vocab]` as an `Output` and downloads `rows*vocab` f32. For
    catch-up only the `WriteKv` ops matter — the `rows×n_embd×151936` GEMM +
-   readback is pure waste per spec cycle. _Fix:_ a `want_logits:false`/KV-only
+   readback is pure waste per spec cycle. \_Fix:* a `want_logits:false`/KV-only
    forward variant that omits the lm_head Linear + its download.
 3. **🟡 `mtp/mod.rs:2536 — `pending_h` handed to the next cycle's draft is one
    step stale** vs the init handoff (`h_{n_past+accepted-1}` for
@@ -702,14 +719,14 @@ items below are latent acceptance-rate/perf bugs, not output corruption._
    otherwise-unvalidated state. _Fix:_ `ensure!(m>=cand.len()+1,…)`.
 5. **🟡 perf/DRY — per-call staging allocs + duplicated builders/glue.**
    `forward`/ `forward_draft`/`draft_chain` alloc all staging/readback buffers
-   fresh per call (5 allocs/step × n_max/cycle) — pool on the session.
+   fresh per call (5 allocs/step × n*max/cycle) — pool on the session.
    `build_mtp_graph` (`409`) and `build_mtp_draft_chain_graph` (`864`) copy the
    ~150-line qwen35 layer op emission verbatim; `forward`/`forward_draft`
    duplicate the alloc/upload/bind/execute glue; the per-backend weight-bind
    closures are duplicated between the session constructors and the driver
    (`1372`, `backends.rs:132`). Also (`2489`) the leading-state flags
    (`leading_h`/`leading_id`/`leading_dist`) must stay present-or-absent in
-   lock-step with no enforcement. _Fix:_ `emit_mtp_layer` helper, shared
+   lock-step with no enforcement. \_Fix:* `emit_mtp_layer` helper, shared
    upload/bind helper, per-backend `mtp_bind_weight(be)`, and a single
    `Option<Leading{…}>` enum for the leading state.
 
@@ -825,22 +842,23 @@ agent verified and correctly ruled that out.)_
 3. **🟡 `kernels.rs:1819 — `vec_dot_q6k_batch_avx512bw` is misnamed** — it's
    `target_feature(avx512bw,avx512vnni)` and built on `_mm512_dpbusd_epi32`
    (VNNI), dispatched only when VNNI is present. An AVX512BW-without-VNNI CPU
-   falls to the AVX2 path (256-bit) for Q6_K batch (unlike Q4_K/Q5_K/Q8_0). Name
-   misleads dispatch reasoning. _Fix:_ rename `_vnni`; add a real avx512bw Q6_K
+   falls to the AVX2 path (256-bit) for Q6*K batch (unlike Q4_K/Q5_K/Q8_0). Name
+   misleads dispatch reasoning. \_Fix:* rename `_vnni`; add a real avx512bw Q6_K
    path if that HW matters.
 4. **🟡 `kernels.rs:835,1642 — DRY + per-call scratch allocs.** The
    144-byte-block decode/nibble-unpack sequence is copy-pasted ~10× across the
-   Q4_K batch kernels (and Q5_K/Q6_K analogs); each `_batch*` call
+   Q4*K batch kernels (and Q5_K/Q6_K analogs); each `_batch*` call
    heap-allocates fresh `d_arr`/`sc_arr`/`*_flat` (+ `ilv=vec![0u8;nb*2048]`) —
-   churn inside the matmul row loop that dominates at small `m` (decode). _Fix:_
-   `#[inline]` `q4k_decode_row(...)` helper; caller-provided/thread-local
-   reusable scratch (or route small-`m` to the single-token kernels).
+   churn inside the matmul row loop that dominates at small `m` (decode).
+   \_Fix:* `#[inline]` `q4k_decode_row(...)` helper;
+   caller-provided/thread-local reusable scratch (or route small-`m` to the
+   single-token kernels).
 5. **🟡
    `kernels.rs:312 (doc) — Q6_K maddubs pair-sum bound comment says `±8001`**
    but `maddubs` sums two adjacent products → true bound `2·63·127=16002`
    (`-16128`). No bug (still < i16 max) but the comment records half the real
-   headroom, misleading anyone re-deriving the no-overflow guarantee (the Q4_K
-   analog `100` is correct). _Fix:_ correct to `16002`/`-16128`.
+   headroom, misleading anyone re-deriving the no-overflow guarantee (the Q4*K
+   analog `100` is correct). \_Fix:* correct to `16002`/`-16128`.
 
 ## infr-cpu/src/{lib,pool,turbo,repack,kvquant,moe}.rs
 
@@ -862,8 +880,8 @@ agent verified and correctly ruled that out.)_
    (catastrophic full-scale error). Verified NOT reachable in practice —
    `d=(max-min)/31` makes the max element exactly 31, and reaching 32 needs
    ~1.6% error while f16 rounding of `d` gives ~0.05% — so this is a
-   robustness/consistency nit, not a live bug (same as the shader Q5_1). Worth
-   fixing because the failure mode is severe and every sibling clamps. _Fix:_
+   robustness/consistency nit, not a live bug (same as the shader Q5*1). Worth
+   fixing because the failure mode is severe and every sibling clamps. \_Fix:*
    `.min(31)` before masking.
 4. **🟡 `lib.rs:201 — `q4k_pack_for`/`q6k_pack_for` do a non-atomic
    check-then-insert.** The lock drops between `get` and re-lock `insert`, so
@@ -876,9 +894,9 @@ agent verified and correctly ruled that out.)_
    `CopyStrided` (`1486`) clone the _entire_ source to copy a sub-slice;
    `Op::DeltaNet` (`2148`) clones `kf_raw`/`vf_raw` even on the strided path
    that only reads `qf_raw`; and the execute prologue (`395`) zero-fills every
-   Internal/Output buffer (incl. the vocab×rows lm_head logits, per token)
+   Internal/Output buffer (incl. the vocab×rows lm*head logits, per token)
    though most op arms immediately overwrite `vals[dst]` with a fresh `Vec`.
-   _Fix:_ borrow `&vals[src]` when `src!=dst`; clone only the aliasing/strided
+   \_Fix:* borrow `&vals[src]` when `src!=dst`; clone only the aliasing/strided
    cases; pre-zero only read-before-write tensors.
 6. **🟡
    `lib.rs:989 (doc/parity) — `WriteKv`Q8_0 uses`round_ties_even`while the comment cites llama.cpp's`roundf`**
@@ -963,12 +981,12 @@ agent verified and correctly ruled that out.)_
    (`Option`/clap `value_source`).
 6. **🟡 DRY/YAGNI —
    `main.rs:918/3341 the DG→Metal→CPU→Vulkan `Box<dyn ChatModel>` funnel is
-   written twice** (the 3341 comment even says "same selection as cmd_run") —
+   written twice** (the 3341 comment even says "same selection as cmd*run") —
    exactly where the precedence bug can diverge; `Backend`/
    `ResolvedDevice`/`resolve`'s whole return (`61`), `print_run_stats` (`767`),
    and `bench -b/--batch-size` (`339`) are all dead, masked by
    `#![allow(dead_code)]`/ `unused_variables`; and the GGUF header is parsed ~5×
-   per invocation (`820/917/ 973/1207/1835`). _Fix:_ `build_chat_model(...)`
+   per invocation (`820/917/ 973/1207/1835`). \_Fix:* `build_chat_model(...)`
    helper; delete the dead surface; parse GGUF metadata once and pass
    arch/DG/eos down.
 
@@ -990,7 +1008,7 @@ agent verified and correctly ruled that out.)_
    numel with two f16→f32 + two muls each) → a third numel loop for `sc*qv+mn`;
    the same f16 super-scale is re-converted 256× per K-quant block. The
    factored/unified split exists for the GPU compact path but the CPU host path
-   (model load / token_embd dequant, `infr-cpu/lib.rs:262`) pays it all. _Fix:_
+   (model load / token*embd dequant, `infr-cpu/lib.rs:262`) pays it all. \_Fix:*
    a direct single-pass affine expansion hoisting `dd.to_f32()` per dblk + `scm`
    per 16-block, no `sc`/`mn` materialization.
 3. **🟡 `lib.rs:186,364,382,396,402 — malformed-header hardening.** Attacker-
@@ -1053,52 +1071,6 @@ agent verified and correctly ruled that out.)_
    _forced_-tool request to "auto" instead of 400. _Fix:_ pass the borrowed
    `&Value`; distinguish absent from unparseable and error.
 
-## infr-hub/src/{pull,store,model_ref}.rs
-
-1. **🔴 `pull.rs:316 — the downloaded blob is NEVER verified against HF's
-   expected sha256.** `download_to_blob` hashes the body only to _name_ the blob
-   (`blobs.join(&hex)`), then renames + symlinks — the digest is never compared
-   to the authoritative LFS sha (available via `X-Linked-Etag`, already fetched
-   by `head_blob_sha`). Any corruption — truncated body under a 200, a spliced
-   resume, a `size==0` short read — produces a self-consistent blob named by its
-   own wrong digest and links it as the real model. **Directly violates the
-   repo's `verify-gguf-downloads` rule** ("sha256 the blob first"). _Fix:_
-   assert `hex == expected_lfs_sha` after `finalize()`, before `rename`;
-   delete + error on mismatch.
-2. **🟠 `pull.rs:276 — resume sends `Range`with no`If-Range`.** The temp is
-   keyed only on filename; a partial from an older version of a
-   since-republished file gets a 206 of the _new_ bytes appended onto the _old_
-   prefix → spliced corrupt file (undetectable given #1). _Fix:_ send
-   `If-Range:<etag>` so a changed object returns a full 200 (clean restart).
-3. **🟠 `pull.rs:268 — concurrent pulls of the same file share one temp path
-   with no lock.** Two processes (auto-pull racing a manual `pull`, two `run`s)
-   both open `blobs/.dl-<label>` and interleave `write_all` → corrupt bytes +
-   garbage sha; the resume `metadata(&tmp).len()` is TOCTOU. _Fix:_ unique temp
-   suffix (PID/random) or a per-blob `flock`.
-4. **🟠 `store.rs:142,157 — sharded GGUFs: only the first shard is downloaded.**
-   `pick_gguf` returns a single `…-00001-of-00003.gguf` (`Loose`) and
-   `pull_repo` fetches only that + `COMPANIONS`; shards 2..N are never pulled,
-   so the model resolves to a snapshot with only shard 1 and fails at load.
-   _Fix:_ detect `-NNNNN-of-MMMMM` and pull/link the whole shard set.
-5. **🟠 `store.rs:49 vs 94 — `resolve_repo`and`pick_gguf` use divergent
-   selection → re-download every run.** `pick_gguf` has a "first `.gguf` when
-   default+no-match" fallback that `resolve_repo` lacks, so a repo whose sole
-   GGUF has a non-standard name downloads once but `resolve_repo` returns `None`
-   (judged "not cached") and re-pulls multi-GB every invocation
-   (`download_to_blob` has no "blob already present" short-circuit). _Fix:_
-   share one selection routine. (Also `store.rs:109`: the "first `.gguf`"
-   fallback can pick `mmproj-model-f16` /an F16 master as the weights — exclude
-   known non-weight names.)
-6. \**🟡 robustness/perf — `model_ref.rs:36` a trailing-colon ref `org/repo:`
-   keeps the colon in the repo name → every URL 404s (`_` arm should strip a
-   lone `:`); `pull.rs:121` the HEAD `etag` fallback yields a non-sha md5 that
-   defeats the relink fast-path (and would be wrong if ever trusted as a sha);
-   `pull.rs:295` every resume re-hashes the whole partial from byte 0 (O(K·size)
-   on flaky links); `store.rs:53` `resolve_repo` returns an arbitrary snapshot,
-   ignoring `refs/main`. *Fix:\* strip trailing `:`; accept only `x-linked-etag`
-   as an LFS sha; verify-once at end instead of re-hashing; prefer the
-   `refs/main` snapshot.
-
 ## infr-chat/src/{stream,tools,template}.rs
 
 1. **🟠
@@ -1149,11 +1121,11 @@ prof crates only:_
 1. **🟡
    `infr-prof/lib.rs:86 — `should_skip`substring-matches`"infr_prof"`+`"skip"`
    over the whole stringified attribute, incl. doc comments.** A fn whose doc
-   says e.g. "see infr_prof to skip hot leaves" is silently un-instrumented;
+   says e.g. "see infr*prof to skip hot leaves" is silently un-instrumented;
    substring matching also can't tell `infr_prof::skip` from an unrelated
    `skip`. `visit_item_mod_mut` (`129`) similarly skips any module whose attr
    string `contains("test")` — wrongly dropping instrumentation from
-   `#[cfg(not(test))]` and `feature="test-*"` modules. _Fix:_ match the
+   `#[cfg(not(test))]` and `feature="test-*"` modules. \_Fix:* match the
    attribute path/`cfg` meta structurally, exclude `doc`.
 2. **🟡
    `infr-prof-rt/lib.rs:324 — GPU-report sort `partial_cmp(...).unwrap()`panics on a NaN`us`**

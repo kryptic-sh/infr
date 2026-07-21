@@ -44,30 +44,65 @@ impl Store {
     }
 
     /// Resolve a cached GGUF for `repo` selecting `sel` (a quant like `Q4_K_M`, or an explicit
-    /// `*.gguf` filename; `None` → [`DEFAULT_QUANT`]). Scans the repo's `snapshots/*/` dirs and
-    /// returns the snapshot path (a symlink into `blobs/`) whose blob is present.
+    /// `*.gguf` filename; `None` → [`DEFAULT_QUANT`]). Uses the SAME selection routine as the
+    /// download path ([`pick_gguf`]) so a repo that downloaded once is judged cached on the next
+    /// run (a divergence otherwise re-pulls multi-GB every invocation). Snapshots are tried in
+    /// [`refs/main`][Self::ordered_snapshots] order first. A sharded GGUF only counts as cached when
+    /// the WHOLE shard set is present (a lone shard 1 fails at load), and its blobs must not be
+    /// dangling (garbage-collected).
     pub fn resolve_repo(&self, repo: &str, sel: Option<&str>) -> Option<PathBuf> {
-        let snaps = self.repo_dir(repo).join("snapshots");
-        let sel = sel.unwrap_or(DEFAULT_QUANT);
-        let mut fallback: Option<PathBuf> = None;
-        for snap in fs::read_dir(&snaps).ok()?.flatten() {
-            for f in fs::read_dir(snap.path()).into_iter().flatten().flatten() {
-                let name = f.file_name().to_string_lossy().into_owned();
-                if !name.to_lowercase().ends_with(".gguf") {
-                    continue;
-                }
-                let p = f.path();
-                if !p.exists() {
-                    continue; // dangling symlink (blob garbage-collected)
-                }
-                match gguf_match(&name, sel) {
-                    Match::Exact => return Some(p),
-                    Match::Loose => fallback = fallback.or(Some(p)),
-                    Match::No => {}
-                }
+        for snap in self.ordered_snapshots(repo) {
+            let names: Vec<String> = fs::read_dir(&snap)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.to_lowercase().ends_with(".gguf"))
+                .collect();
+            let Some(chosen) = pick_gguf(&names, sel) else {
+                continue;
+            };
+            // Every shard of the chosen file must be present (and non-dangling) to be usable; hand
+            // back the canonical first shard (what a GGUF loader opens), matching the download path.
+            let set = shard_set(&chosen);
+            if set.iter().all(|f| snap.join(f).exists()) {
+                return Some(snap.join(&set[0]));
             }
         }
-        fallback
+        None
+    }
+
+    /// Snapshot dirs for `repo`, the one named by `refs/main` FIRST (when present), then the rest.
+    /// HF leaves stale snapshots in place across commits, so preferring `refs/main` avoids returning
+    /// an arbitrary older snapshot for the current model.
+    fn ordered_snapshots(&self, repo: &str) -> Vec<PathBuf> {
+        let dir = self.repo_dir(repo);
+        let snaps = dir.join("snapshots");
+        let main = fs::read_to_string(dir.join("refs").join("main"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let mut out = Vec::new();
+        if let Some(commit) = &main {
+            let p = snaps.join(commit);
+            if p.is_dir() {
+                out.push(p);
+            }
+        }
+        for e in fs::read_dir(&snaps).into_iter().flatten().flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let is_main = main
+                .as_deref()
+                .zip(p.file_name().and_then(|n| n.to_str()))
+                .is_some_and(|(c, n)| c == n);
+            if !is_main {
+                out.push(p);
+            }
+        }
+        out
     }
 
     /// If the referenced model already exists locally, return its GGUF path.
@@ -89,24 +124,116 @@ enum Match {
 }
 
 /// Pick the best `.gguf` from `names` for selector `sel` (quant or filename; `None` → default quant).
+/// The SINGLE selection routine shared by the download path ([`repo_info`][crate::pull]) and the
+/// cache-hit path ([`Store::resolve_repo`]) — they must agree or a downloaded model reads as "not
+/// cached" and re-pulls every run.
+///
 /// Exact match wins; else a loose (substring) match; else — only for the *default* quant (no explicit
-/// selector) — the first `.gguf` (matches llama.cpp's "fall back to the first file" behavior).
+/// selector) — a fallback file (llama.cpp's "fall back to the first file"). The fallback NEVER picks
+/// an `mmproj*` sidecar (a vision projector, not the LM weights) and prefers a real quant over an
+/// `F16`/`F32`/`BF16` master when both are present.
 pub(crate) fn pick_gguf(names: &[String], sel: Option<&str>) -> Option<String> {
     let want = sel.unwrap_or(DEFAULT_QUANT);
     let mut loose: Option<&String> = None;
-    let mut first: Option<&String> = None;
+    let mut fallback_quant: Option<&String> = None; // a non-mmproj, non-float-master gguf
+    let mut fallback_any: Option<&String> = None; // any non-mmproj gguf (incl. F16 masters)
     for n in names {
         if !n.to_lowercase().ends_with(".gguf") {
             continue;
         }
-        first = first.or(Some(n));
         match gguf_match(n, want) {
             Match::Exact => return Some(n.clone()),
             Match::Loose => loose = loose.or(Some(n)),
             Match::No => {}
         }
+        if is_mmproj(n) {
+            continue; // never a weights fallback
+        }
+        fallback_any = fallback_any.or(Some(n));
+        if !is_float_master(n) {
+            fallback_quant = fallback_quant.or(Some(n));
+        }
     }
-    loose.or(if sel.is_none() { first } else { None }).cloned()
+    if let Some(l) = loose {
+        return Some(l.clone());
+    }
+    if sel.is_none() {
+        return fallback_quant.or(fallback_any).cloned();
+    }
+    None
+}
+
+/// True for an `mmproj` sidecar (multimodal projector: `mmproj-model-f16.gguf`, `mmproj-*.gguf`) —
+/// never the language-model weights, so it must not be served as the model.
+fn is_mmproj(name: &str) -> bool {
+    name.to_lowercase()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .starts_with("mmproj")
+}
+
+/// True when the file is a full-precision master (`F16`/`F32`/`BF16` on a token boundary) rather than
+/// a real quant — deprioritised in the default fallback (a quant is what `infr run` wants).
+fn is_float_master(name: &str) -> bool {
+    matches!(gguf_match(name, "f16"), Match::Exact | Match::Loose)
+        || matches!(gguf_match(name, "f32"), Match::Exact | Match::Loose)
+        || matches!(gguf_match(name, "bf16"), Match::Exact | Match::Loose)
+}
+
+/// A parsed `-NNNNN-of-MMMMM.gguf` shard suffix (llama.cpp's split naming).
+#[derive(Debug, PartialEq, Eq)]
+struct Shard {
+    /// Everything before `-NNNNN-of-MMMMM.gguf`.
+    base: String,
+    /// Total shard count (`MMMMM`).
+    total: u32,
+    /// Zero-pad width of the index/total fields (usually 5).
+    width: usize,
+}
+
+/// Parse a `<base>-NNNNN-of-MMMMM.gguf` shard filename. `None` when `fname` is not a shard.
+fn parse_shard(fname: &str) -> Option<Shard> {
+    let stem = fname.strip_suffix(".gguf").or_else(|| {
+        fname
+            .to_lowercase()
+            .ends_with(".gguf")
+            .then(|| &fname[..fname.len() - 5])
+    })?;
+    let (left, total_s) = stem.rsplit_once("-of-")?;
+    let (base, idx_s) = left.rsplit_once('-')?;
+    if total_s.is_empty()
+        || idx_s.is_empty()
+        || !total_s.bytes().all(|b| b.is_ascii_digit())
+        || !idx_s.bytes().all(|b| b.is_ascii_digit())
+        || total_s.len() != idx_s.len()
+    {
+        return None;
+    }
+    Some(Shard {
+        base: base.to_string(),
+        total: total_s.parse().ok()?,
+        width: total_s.len(),
+    })
+}
+
+/// The FULL set of shard filenames for `chosen` (all `-00001-of-MMMMM` … `-MMMMM-of-MMMMM`), in
+/// order. A non-sharded file returns just `[chosen]`. All must be present for the model to load.
+pub(crate) fn shard_set(chosen: &str) -> Vec<String> {
+    match parse_shard(chosen) {
+        Some(s) if s.total >= 1 => (1..=s.total)
+            .map(|i| {
+                format!(
+                    "{}-{:0width$}-of-{:0width$}.gguf",
+                    s.base,
+                    i,
+                    s.total,
+                    width = s.width
+                )
+            })
+            .collect(),
+        _ => vec![chosen.to_string()],
+    }
 }
 
 /// Match a cached `.gguf` filename against a selector (an explicit `*.gguf` name, or a quant).
@@ -248,6 +375,93 @@ mod tests {
         );
         // A quant that is a strict prefix of another must not match it.
         assert_eq!(pick_gguf(&names, Some("Q4_K")), None);
+    }
+
+    #[test]
+    fn parse_shard_pattern() {
+        let s = parse_shard("model-Q4_K_M-00001-of-00003.gguf").unwrap();
+        assert_eq!(s.base, "model-Q4_K_M");
+        assert_eq!(s.total, 3);
+        assert_eq!(s.width, 5);
+        // Not a shard.
+        assert_eq!(parse_shard("model-Q4_K_M.gguf"), None);
+        // Mismatched field widths / non-numeric → not a shard.
+        assert_eq!(parse_shard("m-1-of-003.gguf"), None);
+        assert_eq!(parse_shard("m-000ab-of-00003.gguf"), None);
+    }
+
+    #[test]
+    fn shard_set_enumerates_full_set() {
+        assert_eq!(
+            shard_set("m-Q4_K_M-00001-of-00003.gguf"),
+            vec![
+                "m-Q4_K_M-00001-of-00003.gguf",
+                "m-Q4_K_M-00002-of-00003.gguf",
+                "m-Q4_K_M-00003-of-00003.gguf",
+            ]
+        );
+        // A non-shard file is its own singleton set.
+        assert_eq!(shard_set("m-Q4_K_M.gguf"), vec!["m-Q4_K_M.gguf"]);
+    }
+
+    #[test]
+    fn pick_gguf_excludes_mmproj_from_fallback() {
+        // Repo ships an oddly-named weights file next to an mmproj projector. The default fallback
+        // must pick the weights, never the mmproj.
+        let names: Vec<String> = ["mmproj-model-f16.gguf", "weird-weights.gguf"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            pick_gguf(&names, None).as_deref(),
+            Some("weird-weights.gguf")
+        );
+        // mmproj alone, no real weights → no fallback rather than the projector.
+        assert_eq!(
+            pick_gguf(&["mmproj-model-f16.gguf".to_string()], None),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_gguf_prefers_quant_over_f16_master() {
+        // Listing order F16-first must still yield the quant for the default selector.
+        let names: Vec<String> = ["model-F16.gguf", "model-oddquant.gguf"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            pick_gguf(&names, None).as_deref(),
+            Some("model-oddquant.gguf")
+        );
+        // Only an F16 master present → it is served (better than nothing).
+        assert_eq!(
+            pick_gguf(&["only-F16.gguf".to_string()], None).as_deref(),
+            Some("only-F16.gguf")
+        );
+    }
+
+    #[test]
+    fn resolve_prefers_refs_main_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path();
+        // Two snapshots each with the same-named gguf; refs/main points at `new`.
+        fake_hf(hub, "u/r", "old", "model-Q4_K_M.gguf", "oldblob");
+        fake_hf(hub, "u/r", "new", "model-Q4_K_M.gguf", "newblob");
+        // fake_hf sets refs/main to the last commit written; assert it wins.
+        let store = store_at(hub.to_path_buf());
+        let got = store.resolve_repo("u/r", None).unwrap();
+        assert!(got.to_string_lossy().contains("snapshots/new/"));
+    }
+
+    #[test]
+    fn resolve_incomplete_shard_set_is_not_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path();
+        // Only shard 1 of 2 present → not usable, must resolve to None (triggering a re-pull).
+        fake_hf(hub, "u/r", "c", "m-Q4_K_M-00001-of-00002.gguf", "aa");
+        let store = store_at(hub.to_path_buf());
+        assert_eq!(store.resolve_repo("u/r", Some("Q4_K_M")), None);
     }
 
     #[test]

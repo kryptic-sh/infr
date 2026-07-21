@@ -2159,33 +2159,45 @@ impl Backend for CpuBackend {
                     let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
                     let xs = vals[x.0 as usize].clone(); // [rows, channels]
                     let ws = weight(w); // [channels, kernel] row-major (per-channel kernel)
-                    let st = &mut vals[state.0 as usize]; // [(kernel-1), channels], oldest row first
-                    let mut out = vec![0f32; rr * cc];
-                    // Process the rows in sequence, carrying the rolling history across tokens.
-                    for t in 0..rr {
-                        let xt = &xs[t * cc..t * cc + cc];
-                        for ch in 0..cc {
-                            // window = [history rows.. , current x]; tap j uses weight[ch*kk + j].
-                            let mut acc = 0f32;
-                            for j in 0..kk - 1 {
-                                acc += st[j * cc + ch] * ws[ch * kk + j];
-                            }
-                            acc += xt[ch] * ws[ch * kk + (kk - 1)];
-                            out[t * cc + ch] = acc / (1.0 + (-acc).exp()); // silu
-                        }
-                        // shift history (drop oldest, append raw x).
-                        for j in 0..kk.saturating_sub(2) {
+                                        // Gate (perf only — both paths are bit-identical): only pay the pool spin-up on
+                                        // real prefill. Decode (rr==1) and tiny batches keep the serial shift-register
+                                        // loop, mirroring the Vulkan/Metal `rr >= (kk-1).max(2)` gate.
+                    if rr >= (kk - 1).max(2) {
+                        // Parallel path: reformulate over the virtual `[state ‖ x]` sequence so every
+                        // output row is independent (see `conv1d_silu`). Snapshot state up front, run
+                        // the pool, then write the rebuilt history back.
+                        let st = &mut vals[state.0 as usize];
+                        let out = conv1d_silu(self.pool(), &xs, &ws, st, rr, cc, kk);
+                        vals[dst.0 as usize] = out;
+                    } else {
+                        let st = &mut vals[state.0 as usize]; // [(kernel-1), channels], oldest row first
+                        let mut out = vec![0f32; rr * cc];
+                        // Process the rows in sequence, carrying the rolling history across tokens.
+                        for t in 0..rr {
+                            let xt = &xs[t * cc..t * cc + cc];
                             for ch in 0..cc {
-                                st[j * cc + ch] = st[(j + 1) * cc + ch];
+                                // window = [history rows.. , current x]; tap j uses weight[ch*kk + j].
+                                let mut acc = 0f32;
+                                for j in 0..kk - 1 {
+                                    acc += st[j * cc + ch] * ws[ch * kk + j];
+                                }
+                                acc += xt[ch] * ws[ch * kk + (kk - 1)];
+                                out[t * cc + ch] = acc / (1.0 + (-acc).exp()); // silu
+                            }
+                            // shift history (drop oldest, append raw x).
+                            for j in 0..kk.saturating_sub(2) {
+                                for ch in 0..cc {
+                                    st[j * cc + ch] = st[(j + 1) * cc + ch];
+                                }
+                            }
+                            if kk >= 2 {
+                                for ch in 0..cc {
+                                    st[(kk - 2) * cc + ch] = xt[ch];
+                                }
                             }
                         }
-                        if kk >= 2 {
-                            for ch in 0..cc {
-                                st[(kk - 2) * cc + ch] = xt[ch];
-                            }
-                        }
+                        vals[dst.0 as usize] = out;
                     }
-                    vals[dst.0 as usize] = out;
                 }
                 Op::DeltaNet {
                     q,
@@ -2347,9 +2359,154 @@ impl Backend for CpuBackend {
     }
 }
 
+/// Depthwise causal conv (fixed per-channel kernel of width `kk`) followed by SiLU, over a rolling
+/// history `st` carried across token batches. Returns the `[rows, channels]` output and REBUILDS
+/// `st` in place to the trailing `km1 = kk-1` history rows.
+///
+/// Parallel reformulation (the whole trick): the conv is depthwise + causal with a fixed kernel, so
+/// every output reads only the VIRTUAL sequence `[state ‖ x]` and all `rr*cc` outputs are
+/// independent — the row loop parallelizes with no cross-row state. With
+/// `virtual[i][ch] = state_init[i*cc+ch]` for `i < km1` else `xs[(i-km1)*cc+ch]`,
+/// `out[t*cc+ch] = silu(Σ_{j=0}^{kk-1} virtual[t+j][ch] * ws[ch*kk+j])`, and the new history is the
+/// trailing `km1` virtual rows: `new_state[j*cc+ch] = virtual[rr+j][ch]`.
+///
+/// Bit-identity vs the serial shift-register loop: at serial step `t` the shifted `st[j]` equals
+/// `virtual[t+j]` (`j in 0..km1`) and the current `xt` equals `virtual[t+km1]`, so accumulating the
+/// taps in the SAME ascending `j` order (0..kk) reproduces the serial float accumulation
+/// float-for-float. The state rebuild is a pure copy (no arithmetic), so it is trivially identical.
+/// Handles `kk == 1` (km1=0, no history: `out[t]=silu(xs[t]*w[0])`) and `rr < km1` (the rebuild
+/// reads leftover old state via the `i < km1` branch of `virtual`).
+fn conv1d_silu(
+    pool: &pool::SpinPool,
+    xs: &[f32],
+    ws: &[f32],
+    st: &mut [f32],
+    rows: usize,
+    channels: usize,
+    kernel: usize,
+) -> Vec<f32> {
+    let (rr, cc, kk) = (rows, channels, kernel);
+    let km1 = kk - 1;
+    // Snapshot the incoming history so the parallel closure can read it immutably while we rebuild
+    // `st` afterward.
+    let state_init = st.to_vec();
+    let virt = |i: usize, ch: usize| -> f32 {
+        if i < km1 {
+            state_init[i * cc + ch]
+        } else {
+            xs[(i - km1) * cc + ch]
+        }
+    };
+    let mut out = vec![0f32; rr * cc];
+    // Chunk `out` by output ROW (chunk == cc → chunk index `t` is the row index). Pure scheduling,
+    // math unchanged → bit-identical; grain of 4 matches the sibling row-parallel ops.
+    pool.for_chunks_mut(&mut out, cc, 4, &|t, orow| {
+        for ch in 0..cc {
+            // Taps summed in ASCENDING j (0..kk) to match the serial accumulation order exactly.
+            let mut acc = 0f32;
+            for j in 0..kk {
+                acc += virt(t + j, ch) * ws[ch * kk + j];
+            }
+            orow[ch] = acc / (1.0 + (-acc).exp()); // silu
+        }
+    });
+    // Rebuild the rolling history = trailing km1 virtual rows (pure copy, no arithmetic).
+    for j in 0..km1 {
+        for ch in 0..cc {
+            st[j * cc + ch] = virt(rr + j, ch);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Naive serial reference: a byte-for-byte copy of the ORIGINAL shift-register conv loop. The
+    // parallel `conv1d_silu` reformulation must reproduce both `out` and the rebuilt `state` exactly.
+    fn conv1d_silu_ref(
+        xs: &[f32],
+        ws: &[f32],
+        st: &mut [f32],
+        rr: usize,
+        cc: usize,
+        kk: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; rr * cc];
+        for t in 0..rr {
+            let xt = &xs[t * cc..t * cc + cc];
+            for ch in 0..cc {
+                let mut acc = 0f32;
+                for j in 0..kk - 1 {
+                    acc += st[j * cc + ch] * ws[ch * kk + j];
+                }
+                acc += xt[ch] * ws[ch * kk + (kk - 1)];
+                out[t * cc + ch] = acc / (1.0 + (-acc).exp());
+            }
+            for j in 0..kk.saturating_sub(2) {
+                for ch in 0..cc {
+                    st[j * cc + ch] = st[(j + 1) * cc + ch];
+                }
+            }
+            if kk >= 2 {
+                for ch in 0..cc {
+                    st[(kk - 2) * cc + ch] = xt[ch];
+                }
+            }
+        }
+        out
+    }
+
+    // The parallel `conv1d_silu` reformulation must be BIT-IDENTICAL (exact f32 equality) to the
+    // naive serial reference for BOTH the output and the rebuilt state, across a matrix of
+    // (rows, kernel, channels) that spans: real-prefill sizes, decode (rr==1), rr == kk-1, a case
+    // with rr < kk-1 (rebuild reads leftover old state), kk==1 (no history), kk==2, small channel
+    // counts, and a large channel count that forces the pool's multi-chunk path.
+    #[test]
+    fn conv1d_silu_bit_identical_to_serial() {
+        // Deterministic pseudo-random pattern (no RNG): a cheap hashed ramp in [-1, 1).
+        let pat = |seed: usize, i: usize| -> f32 {
+            let h = (i
+                .wrapping_mul(2654435761)
+                .wrapping_add(seed.wrapping_mul(40503)))
+                & 0xffff;
+            (h as f32 / 32768.0) - 1.0
+        };
+        let be = CpuBackend::new();
+        let pool = be.pool();
+        for &(rr, kk) in &[
+            (8usize, 4usize),
+            (1, 4),
+            (3, 4),
+            (16, 4),
+            (5, 1),
+            (2, 2),
+            (2, 4),
+        ] {
+            for &cc in &[40usize, 512] {
+                let km1 = kk - 1;
+                let xs: Vec<f32> = (0..rr * cc).map(|i| pat(1, i)).collect();
+                let ws: Vec<f32> = (0..cc * kk).map(|i| pat(2, i)).collect();
+                let st0: Vec<f32> = (0..km1 * cc).map(|i| pat(3, i)).collect();
+
+                let mut st_ref = st0.clone();
+                let out_ref = conv1d_silu_ref(&xs, &ws, &mut st_ref, rr, cc, kk);
+
+                let mut st_par = st0.clone();
+                let out_par = conv1d_silu(pool, &xs, &ws, &mut st_par, rr, cc, kk);
+
+                assert_eq!(
+                    out_par, out_ref,
+                    "output mismatch at rr={rr} kk={kk} cc={cc}"
+                );
+                assert_eq!(
+                    st_par, st_ref,
+                    "rebuilt state mismatch at rr={rr} kk={kk} cc={cc}"
+                );
+            }
+        }
+    }
 
     // #1: `sample_token` must not panic when top_k == 0 (the "disable top-k" sentinel) and must
     // return a valid in-range token. Regression for the `select_nth_unstable_by(k - 1)` underflow.

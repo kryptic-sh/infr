@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **44** — 0 🔴, 6 🟠, 38 🟡. (4 findings are explicitly
+- **Remaining open:** **38** — 0 🔴, 6 🟠, 32 🟡. (4 findings are explicitly
   **deferred**, not open work: the 🟠 `make_compute_kernel` OOM→Result and three
   🟡 shader/dp4a DRY refactors — each risks the byte-identity gate or the
   recorded stream; see their sections.)
@@ -228,7 +228,10 @@ parked path).
   pass, run serially). The direct `coopMatLoad` K/V over-read past `kv_len` is
   made SAFE by tightening the host `flash_geom` gate to `kv_len.div_ceil(64)*64
   <=
-  att*cap_rows`(a non-ring KV cache allocates non-64-aligned rows; flash reads 64-aligned tiles) — the masked over-read columns contribute nothing;`attn_flash.comp`documents the mpad precondition (keeps writing all BM rows to stay bit-identical with the staged/split-K paths — a store guard there was reverted after it broke the STAGE==direct golden); host debug-asserts guard`attn_pv` `tilesN`, `attn_combine` `ntile`, and `attn_partial_mrows` `chunk`; `quant_kv`Q5_1 gets the`clamp(0,31)`(never triggers); dead`MAXS`removed. \_Pre-existing note:* the flash parity LIB tests race on process-global`INFR_FLASH*\*`env under parallel cargo threads — pass with`--test-threads=1`.
+  att*cap_rows`(a non-ring KV cache allocates non-64-aligned rows; flash reads 64-aligned tiles) — the masked over-read columns contribute nothing;`attn_flash.comp`documents the mpad precondition (keeps writing all BM rows to stay bit-identical with the staged/split-K paths — a store guard there was reverted after it broke the STAGE==direct golden); host debug-asserts guard`attn_pv` `tilesN`, `attn_combine` `ntile`, and `attn_partial_mrows` `chunk`; `quant_kv`Q5_1 gets the`clamp(0,31)`(never triggers); dead`MAXS`removed.
+  \_Pre-existing note:* the flash parity LIB tests race on
+  process-global`INFR_FLASH*\*`env under parallel cargo threads — pass
+  with`--test-threads=1`.
 - **`infr-vulkan` GEMM/GEMV shaders (7 of 8; #6 dp4a DRY deferred)** —
   **gpu_seam byte-identity verified** (`weight_addr`/`gemm_proj` 28,
   `sample_topk`, MoE-mmq, `nc_gemm` all match host). `gemm_proj.comp` now stages
@@ -242,6 +245,18 @@ parked path).
   gather is two-pass so a threshold tie can't evict a strictly-greater logit;
   and the superseded `gemm_dp4a`/`gemm_coopmat` probe kernels are removed
   (grep-proven never dispatched).
+- **`infr-core` (all 6 findings)** — TDD, +8 tests, **gpu_seam smoke verified**
+  (kv*addr/MoE/GEMM/pager goldens byte-identical). `copy_buffer` downloads only
+  the requested prefix (was the whole `src`) + returns `Err` on oversize (was a
+  panic); `MetaValue::as_u64` uses `try_from` (negative → `None`, not
+  `u64::MAX`); `in_place_inputs` is memoized on `Graph` (was an O(ops) rescan
+  per token on the execute path); the paged-dtype drift test asserts
+  set-EQUALITY; `pager` `take_slot` prunes the `epoch` entry (now bounded by
+  `n_slots`); `Bindings` is a `Vec<Option<&dyn Buffer>>` (hash-free, fully
+  contained, semantics identical) and the seam caches `capabilities()`
+  once/build. \_Deferred:* `capabilities()→&Capabilities` (the multi-GPU
+  wrappers build a mutated caps copy per call — a borrow would change when caps
+  are computed).
 
 ### Highest-priority (production default paths)
 
@@ -562,44 +577,6 @@ agent verified and correctly ruled that out.)_
    backend's dequant, but if bit-identity to llama / a GPU kernel is expected,
    goldens diverge. _Fix:_ make code+comment agree on the intended rounding +
    parity target.
-
-## infr-core/src/{graph,backend,tensor,loader,pager}.rs
-
-1. **🟡
-   `backend.rs:486 — `copy_buffer`default downloads the ENTIRE`src`to copy only`bytes`, and panics if `bytes>src.len_bytes()`.**
-   This is the KV prefix-share primitive; the default (CPU/Metal, no override)
-   zero-allocs + transfers the whole `max_ctx` KV cache to copy a small prefix,
-   and `&tmp[..bytes]` panics on an oversize `bytes` instead of erroring. _Fix:_
-   download only the first `bytes` (`vec![0u8;bytes]`), bounds-check
-   `bytes<=src.len_bytes()`.
-2. **🟡
-   `loader.rs:23 — `MetaValue::as_u64`wraps a negative`I64`into a huge`u64`**
-   (`I64(-1)→u64::MAX`); a count/size field (block/expert counts, ctx len) read
-   this way drives a downstream alloc/loop into OOM/overflow instead of a clean
-   "invalid field" rejection. _Fix:_ `u64::try_from(*v).ok()`.
-3. **🟡
-   `graph.rs:765 — `in_place_inputs`rebuilds a`HashSet`+ rescans all ops per call, and`execute`
-   calls it per token** (`infr-cpu/lib.rs:392`, `infr-metal/exec.rs:1583`) — a
-   per-token O(ops) scan + heap alloc of a graph-invariant. _Fix:_ compute once,
-   cache in `GraphPlan`/memoize on `Graph`.
-4. **🟡 `tensor.rs:184 — `MOE_MMQ_PAGED_DTYPES`"mirrors`MOE_MMQ_DTYPES` IN FULL"
-   but the drift test only checks subset, not equality.** Adding a dtype to
-   `MOE_MMQ_DTYPES` without the paged list keeps the test green while silently
-   regressing that dtype's paged prefill to the slow id-GEMV path — the exact
-   failure the doc forbids. _Fix:_ assert set-equality (or derive paged = full
-   minus an explicit exclusion set).
-5. **🟡 `pager.rs:98 — `epoch` map entries never removed on eviction.**
-   `take_slot` drops the victim from `resident`/`lru` but not `epoch`, so
-   `epoch` accumulates an entry per distinct `BlockId` ever touched (the one
-   pager structure not sized to `n_slots`). Bounded by key space, not a true
-   leak, but stale entries could in principle mask an id across `cur_epoch`
-   wraparound. _Fix:_ drop the victim's `epoch` entry in `take_slot`.
-6. **🟡 perf — `backend.rs:445` `capabilities()` returns an owned struct (heap
-   `String name`) by value, cloned 8+×/build in `runner.rs`; `backend.rs:417`
-   `Bindings` keys buffers by `HashMap<TensorId,…>` though `TensorId` is a dense
-   `u32` index** (a `Vec<Option<&dyn Buffer>>` gives hash-free O(1), relevant
-   since decode rebinds every step). _Fix:_ query capabilities once/build (or
-   return `&Capabilities`); back `Bindings` with a `Vec` indexed by `id.0`.
 
 ## infr-core/iquant_grids.rs · infr-engine · infr-prof · infr-prof-rt
 

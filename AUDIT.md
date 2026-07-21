@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **38** — 0 🔴, 6 🟠, 32 🟡. (4 findings are explicitly
+- **Remaining open:** **32** — 0 🔴, 6 🟠, 26 🟡. (4 findings are explicitly
   **deferred**, not open work: the 🟠 `make_compute_kernel` OOM→Result and three
   🟡 shader/dp4a DRY refactors — each risks the byte-identity gate or the
   recorded stream; see their sections.)
@@ -257,6 +257,17 @@ parked path).
   once/build. \_Deferred:* `capabilities()→&Capabilities` (the multi-GPU
   wrappers build a mutated caps copy per call — a borrow would change when caps
   are computed).
+- **`infr-cpu` lib/pool/turbo/kvquant/moe (all 6 findings)** — TDD, +6 tests;
+  byte-identity confirmed by the CPU tests + the CPU↔GPU `seam_op_parity`
+  (11/11, incl. copystrided/deltanet/rope) + full-model `gpu_seam_matches_cpu`.
+  `Op::Sample` treats `top_k==0` as no-truncation (was a `k-1` underflow panic);
+  `weight_cache` is keyed on `(addr,len,dtype)` (no stale-address collision on
+  model reload); `q5_1_block` clamps to 0..31; the q4k/q6k pack cache re-checks
+  under the insert lock (no double-repack under parallel serve); the `Rope`/
+  `Copy`/`CopyStrided`/`DeltaNet` op arms borrow instead of clone; the `WriteKv`
+  Q8 rounding comment is corrected (no golden pins those bytes). _Deferred:_
+  skipping the execute-prologue zero-fill (needs a per-tensor read-before-write
+  dataflow pass — `CopyStrided`/`RmsNormAdd` dsts require it).
 
 ### Highest-priority (production default paths)
 
@@ -532,51 +543,6 @@ agent verified and correctly ruled that out.)_
    (`-16128`). No bug (still < i16 max) but the comment records half the real
    headroom, misleading anyone re-deriving the no-overflow guarantee (the Q4*K
    analog `100` is correct). \_Fix:* correct to `16002`/`-16128`.
-
-## infr-cpu/src/{lib,pool,turbo,repack,kvquant,moe}.rs
-
-1. **🟡 `lib.rs:1398 — `Op::Sample`panics when`top_k==0`.**
-   `k=(top_k).min(len)`; with `top_k==0` (the common "disable top-k" sentinel)
-   `k=0`, `if k<len` is taken, and `select_nth_unstable_by(k-1)` underflows →
-   `usize::MAX` pivot → panic. _Fix:_ guard `k>=1 && k<len`, or treat `top_k==0`
-   as no-truncation (`k=len`).
-2. **🟡 `lib.rs:168,411 — `weight_cache` keyed by raw buffer address, never
-   invalidated.** Key = `cpu_buf(buf) as usize`, entries live for the backend's
-   lifetime. On a reused `CpuBackend` (serve model reload) a freed weight's
-   address can be reallocated to a _different_ weight → the closure returns the
-   previous model's dequant f32 with no length/content check; also grows
-   unbounded across reloads. _Fix:_ key on `(addr,len,dtype)` and/or clear on
-   binding change / scope to one `execute`.
-3. **🟡
-   `kvquant.rs:98 (defensive) — `q5_1_block`omits the`clamp(0,31)` its siblings (`q4_0`/`q4_1`/`q5_0`)
-   apply.** If the code ever reached 32 the pack yields **0 instead of 31**
-   (catastrophic full-scale error). Verified NOT reachable in practice —
-   `d=(max-min)/31` makes the max element exactly 31, and reaching 32 needs
-   ~1.6% error while f16 rounding of `d` gives ~0.05% — so this is a
-   robustness/consistency nit, not a live bug (same as the shader Q5*1). Worth
-   fixing because the failure mode is severe and every sibling clamps. \_Fix:*
-   `.min(31)` before masking.
-4. **🟡 `lib.rs:201 — `q4k_pack_for`/`q6k_pack_for` do a non-atomic
-   check-then-insert.** The lock drops between `get` and re-lock `insert`, so
-   two parallel-serve threads can both miss, both build the expensive repack,
-   and both `guard.1 += bytes` — double repack + inflated byte accumulator
-   drifting past `INFR_CPU_REPACK_MB` (no eviction). _Fix:_ re-check `get` under
-   the insert lock; add bytes only when the key was absent.
-5. **🟡 perf — hot-path clones/allocs in `lib.rs` op arms.** `Op::Rope` (`826`)
-   clones the input twice (`xs.clone()` then `out=xs.clone()`); `Op::Copy`/
-   `CopyStrided` (`1486`) clone the _entire_ source to copy a sub-slice;
-   `Op::DeltaNet` (`2148`) clones `kf_raw`/`vf_raw` even on the strided path
-   that only reads `qf_raw`; and the execute prologue (`395`) zero-fills every
-   Internal/Output buffer (incl. the vocab×rows lm*head logits, per token)
-   though most op arms immediately overwrite `vals[dst]` with a fresh `Vec`.
-   \_Fix:* borrow `&vals[src]` when `src!=dst`; clone only the aliasing/strided
-   cases; pre-zero only read-before-write tensors.
-6. **🟡
-   `lib.rs:989 (doc/parity) — `WriteKv`Q8_0 uses`round_ties_even`while the comment cites llama.cpp's`roundf`**
-   (half-away-from-zero); halfway activations differ. Self-consistent with this
-   backend's dequant, but if bit-identity to llama / a GPU kernel is expected,
-   goldens diverge. _Fix:_ make code+comment agree on the intended rounding +
-   parity target.
 
 ## infr-core/iquant_grids.rs · infr-engine · infr-prof · infr-prof-rt
 

@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **128** — 0 🔴, 23 🟠, 105 🟡.
+- **Remaining open:** **123** — 0 🔴, 22 🟠, 101 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -85,6 +85,18 @@ parked path).
   forced-tool retry now `reset_kv`s the session first (new no-op default
   `ChatModel::reset_kv` + Vulkan/Metal overrides). _Deferred:_ parse-GGUF- once
   (a large cross-crate API change, out of proportion to a 🟡).
+- **`infr-chat` (all 5 findings)** — TDD, +14 tests. Streaming holdback now
+  stops the content region at the earliest tool-call opener across every dialect
+  `finish()` parses (Hermes `<tool_call>`, pipe `<|tool_call>`, and a
+  whitespace-leading bare-`{` confirmed via `parse_bare_json_call`), so
+  non-Hermes calls no longer leak as content **and** duplicate as a ToolCall —
+  while ordinary content with a stray brace is preserved. The pipe arg-parser
+  now translates JSON escapes (incl. `\uXXXX` surrogate pairs), keeps
+  `inf`/`NaN` as strings (not `0`), uses `from_utf8_lossy` for keys, and strips
+  a dangling `<|tool_call>` opener. The minijinja `Environment` is cached per
+  template source (was rebuilt every render); `bos_token_id` falls back to `""`
+  not `2` (EOS on Llama); `emit` scans via resumable cursors (was O(n²));
+  `remove_spans` de-duplicates the two parsers.
 
 ### Highest-priority (production default paths)
 
@@ -941,44 +953,6 @@ agent verified and correctly ruled that out.)_
    `u32` index** (a `Vec<Option<&dyn Buffer>>` gives hash-free O(1), relevant
    since decode rebinds every step). _Fix:_ query capabilities once/build (or
    return `&Capabilities`); back `Bindings` with a `Vec` indexed by `id.0`.
-
-## infr-chat/src/{stream,tools,template}.rs
-
-1. **🟠
-   `stream.rs:71 — streaming holdback only recognizes the Hermes `<tool_call>`opener, but`finish()`
-   parses every dialect → non-Hermes tool calls leak as content AND duplicate as
-   ToolCall.** `emit` gates content on `TL="<tool_call>"` only; the pipe form
-   `<|tool_call>…<tool_call|>` (gemma4/E2B/DiffusionGemma) has no `<tool_call>`
-   substring and bare-JSON Llama-3 has no marker, so their whole markup streams
-   as `Delta::Content` — then `finish()`'s `parse_any_tool_calls` also emits
-   `Delta::ToolCall`. The user sees raw tool-call text _and_ the call fires.
-   _Fix:_ in `emit`, stop the content region at whichever of `<tool_call>` /
-   `<|tool_call>` / bare-`{` opener appears first, matching `finish()`'s dialect
-   set.
-2. **🟡 `tools.rs:127,159,97 — the hand-rolled pipe/`<|tool_call>` arg parser
-   corrupts values** (the sole path for gemma4/E2B/DG args): `\n`/`\t`/`\uXXXX`
-   escapes become the literal letters `n`/`t`/`uXXXX` (`131`); `inf`/`NaN`
-   barewords coerce to `0` via `from_f64→None→unwrap_or(0)` (`163`); non-UTF-8
-   object keys collapse to `""` and overwrite each other (`97`); an unterminated
-   `<|tool_call>` leaves the opener markup in `clean` (`189`). _Fix:_ translate
-   standard JSON escapes; fall back to `String` for non-finite;
-   `from_utf8_lossy` keys; strip/span the dangling opener to EOT.
-3. **🟡 `template.rs:179 — a fresh minijinja `Environment` is built and the chat
-   template re-parsed on every render** (per request/turn under `serve`, for an
-   unchanging GGUF template — not free for large HF tool templates). _Fix:_
-   cache a compiled template keyed by the source (`OnceCell`/LRU).
-4. **🟡 `template.rs:127 — `bos_token_id`defaults to`2`** when metadata is
-   absent, but `2` is EOS for Llama-family GGUFs → a missing-metadata model
-   injects the EOS string at prompt head. _Fix:_ derive from the tokenizer's
-   actual BOS or fail loud, don't hardcode `2`.
-5. **🟡 perf/DRY — `stream.rs:68` `emit` re-scans the whole accumulated buffer
-   (`find` from offset 0 for every marker) on every pushed piece → O(n²)** over
-   a response (cache found marker offsets, resume from a cursor);
-   `tools.rs:178 vs 242` the two parsers duplicate the span-collect +
-   reverse-`replace_range` + trim machinery (extract `remove_spans`);
-   `tools.rs:441` `normalize_messages` is a field-by-field rebuild equivalent to
-   `messages.to_vec()` and its "flattens content arrays" doc never fires. _Fix:_
-   as noted.
 
 ## infr-core/iquant_grids.rs · infr-engine · infr-prof · infr-prof-rt
 

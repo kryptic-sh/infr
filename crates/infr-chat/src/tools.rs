@@ -63,6 +63,31 @@ pub struct ToolCall {
 const TC_OPEN: &str = "<|tool_call>";
 const TC_CLOSE: &str = "<tool_call|>";
 
+/// Read exactly 4 hex digits from `s` at `i` into a code point; `None` if fewer than 4 remain or a
+/// digit is non-hex.
+fn read_hex4(s: &[u8], i: usize) -> Option<u32> {
+    if i + 4 > s.len() {
+        return None;
+    }
+    let mut v = 0u32;
+    for k in 0..4 {
+        v = v * 16 + (s[i + k] as char).to_digit(16)?;
+    }
+    Some(v)
+}
+
+/// Remove the given byte `spans` (non-overlapping, on char boundaries) from `text`. Sorted then
+/// excised back-to-front so earlier indices stay valid — the shared removal machinery both
+/// tool-call parsers use.
+fn remove_spans(text: &str, mut spans: Vec<(usize, usize)>) -> String {
+    spans.sort_unstable_by_key(|&(start, _)| start);
+    let mut out = text.to_owned();
+    for (start, end) in spans.into_iter().rev() {
+        out.replace_range(start..end, "");
+    }
+    out
+}
+
 /// Recursive-descent value parser — mirrors `_parse_value` in the Python shim.
 ///
 /// `s` has already had `<|"|>` replaced with `"`.
@@ -94,8 +119,7 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
                     Some(p) => i + p,
                     None => return (Value::Object(obj), i),
                 };
-                let raw_key = std::str::from_utf8(&s[i..colon])
-                    .unwrap_or("")
+                let raw_key = String::from_utf8_lossy(&s[i..colon])
                     .trim()
                     .trim_matches('"')
                     .trim_matches('\'')
@@ -126,16 +150,55 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
         }
         q @ b'"' | q @ b'\'' => {
             i += 1;
-            let mut buf = Vec::new();
+            let mut buf: Vec<u8> = Vec::new();
             while i < s.len() {
-                if s[i] == b'\\' && i + 1 < s.len() {
-                    buf.push(s[i + 1]);
+                let b = s[i];
+                if b == b'\\' && i + 1 < s.len() {
+                    let esc = s[i + 1];
                     i += 2;
-                } else if s[i] == q {
+                    match esc {
+                        b'n' => buf.push(b'\n'),
+                        b't' => buf.push(b'\t'),
+                        b'r' => buf.push(b'\r'),
+                        b'"' => buf.push(b'"'),
+                        b'\'' => buf.push(b'\''),
+                        b'\\' => buf.push(b'\\'),
+                        b'/' => buf.push(b'/'),
+                        b'b' => buf.push(0x08),
+                        b'f' => buf.push(0x0C),
+                        b'u' => {
+                            if let Some(cp) = read_hex4(s, i) {
+                                i += 4;
+                                // High surrogate → consume the following `\uXXXX` low surrogate.
+                                let ch = if (0xD800..=0xDBFF).contains(&cp)
+                                    && s.get(i) == Some(&b'\\')
+                                    && s.get(i + 1) == Some(&b'u')
+                                {
+                                    match read_hex4(s, i + 2) {
+                                        Some(lo) if (0xDC00..=0xDFFF).contains(&lo) => {
+                                            i += 6;
+                                            let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                            char::from_u32(c).unwrap_or('\u{FFFD}')
+                                        }
+                                        _ => char::from_u32(cp).unwrap_or('\u{FFFD}'),
+                                    }
+                                } else {
+                                    char::from_u32(cp).unwrap_or('\u{FFFD}')
+                                };
+                                let mut tmp = [0u8; 4];
+                                buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+                            } else {
+                                buf.push(b'u'); // malformed `\u` — keep the letter
+                            }
+                        }
+                        // Unknown escape: drop the backslash, keep the escaped byte.
+                        other => buf.push(other),
+                    }
+                } else if b == q {
                     i += 1;
                     break;
                 } else {
-                    buf.push(s[i]);
+                    buf.push(b);
                     i += 1;
                 }
             }
@@ -149,7 +212,8 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
                 .position(|&b| matches!(b, b',' | b'}' | b']'))
                 .unwrap_or(s.len() - i);
             let j = i + j_rel;
-            let tok = std::str::from_utf8(&s[i..j]).unwrap_or("").trim();
+            let tok = String::from_utf8_lossy(&s[i..j]);
+            let tok = tok.trim();
             i = j;
             match tok {
                 "true" => (Value::Bool(true), i),
@@ -159,10 +223,12 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
                     if let Ok(n) = tok.parse::<i64>() {
                         (Value::Number(n.into()), i)
                     } else if let Ok(f) = tok.parse::<f64>() {
-                        (
-                            Value::Number(serde_json::Number::from_f64(f).unwrap_or(0.into())),
-                            i,
-                        )
+                        // `from_f64` returns None only for non-finite (`inf`/`NaN`), which JSON
+                        // can't represent — keep those as the literal string, don't coerce to 0.
+                        match serde_json::Number::from_f64(f) {
+                            Some(num) => (Value::Number(num), i),
+                            None => (Value::String(tok.to_owned()), i),
+                        }
                     } else {
                         (Value::String(tok.to_owned()), i)
                     }
@@ -177,7 +243,6 @@ fn parse_value(s: &[u8], mut i: usize) -> (Value, usize) {
 /// - the parsed [`ToolCall`] list.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let mut calls = Vec::new();
-    let mut clean = text.to_owned();
 
     // Work on the original text for finding blocks; collect spans to remove.
     let mut search_from = 0usize;
@@ -187,6 +252,9 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         let open_abs = search_from + open_pos;
         let body_start = open_abs + TC_OPEN.len();
         let Some(close_rel) = text[body_start..].find(TC_CLOSE) else {
+            // Unterminated opener: strip the dangling markup through end-of-text so it can't leak
+            // into `clean` as raw `<|tool_call>…`.
+            spans.push((open_abs, text.len()));
             break;
         };
         let body = &text[body_start..body_start + close_rel];
@@ -219,11 +287,7 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         calls.push(ToolCall { name, arguments });
     }
 
-    // Remove spans in reverse order so indices stay valid
-    for (start, end) in spans.into_iter().rev() {
-        clean.replace_range(start..end, "");
-    }
-    clean = strip_markers(&clean);
+    let clean = strip_markers(&remove_spans(text, spans));
     (clean, calls)
 }
 
@@ -257,10 +321,7 @@ pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
             spans.push((open_abs, close_abs));
         }
     }
-    let mut clean = text.to_owned();
-    for (start, end) in spans.into_iter().rev() {
-        clean.replace_range(start..end, "");
-    }
+    let clean = remove_spans(text, spans);
     (clean.trim().to_owned(), calls)
 }
 
@@ -352,7 +413,7 @@ pub fn parse_any_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
 /// Llama-3.x dialect: the whole body is one JSON object `{"name": .., "parameters"|"arguments":
 /// {..}}` (the template literally instructs 'respond with JSON for a function call' in exactly
 /// this format). Anything else — prose, JSON missing "name", arrays — is not a call.
-fn parse_bare_json_call(text: &str) -> Option<ToolCall> {
+pub(crate) fn parse_bare_json_call(text: &str) -> Option<ToolCall> {
     let t = text.trim();
     if !t.starts_with('{') || !t.ends_with('}') {
         return None;
@@ -433,22 +494,14 @@ pub fn split_think(text: &str) -> (String, String) {
 // Message normalisation
 // ---------------------------------------------------------------------------
 
-/// Normalise a slice of [`ChatMessage`]s for feeding into the chat template.
+/// Copy inbound [`ChatMessage`]s for feeding into the chat template.
 ///
-/// - Flattens content arrays to plain text.
-/// - Preserves `tool_calls`, `tool_call_id`, `name` (the agentic round-trip).
-/// - Returns new owned `ChatMessage` values.
+/// Currently a straight clone — every field (`content`, `tool_calls`, `tool_call_id`, `name`) is
+/// carried through verbatim for the agentic round-trip. Kept as a named seam so any future
+/// normalisation (e.g. flattening multimodal content arrays, which live upstream today) has one
+/// place to land.
 pub fn normalize_messages(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    messages
-        .iter()
-        .map(|m| ChatMessage {
-            role: m.role.clone(),
-            content: m.content.clone(),
-            tool_calls: m.tool_calls.clone(),
-            tool_call_id: m.tool_call_id.clone(),
-            name: m.name.clone(),
-        })
-        .collect()
+    messages.to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -718,5 +771,61 @@ mod tests {
         let (clean, calls) = parse_any_tool_calls(text);
         assert!(calls.is_empty());
         assert_eq!(clean, text);
+    }
+
+    // --- parse_value corruption fixes ------------------------------------
+
+    #[test]
+    fn parse_tool_calls_translates_json_escapes() {
+        let text = r#"<|tool_call>call:write{content:<|"|>a\nb\tcA<|"|>}<tool_call|>"#;
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["content"], json!("a\nb\tcA"));
+    }
+
+    #[test]
+    fn parse_tool_calls_surrogate_pair_escape() {
+        // 😀 == U+1F600 (😀)
+        let text = r#"<|tool_call>call:emoji{c:<|"|>😀<|"|>}<tool_call|>"#;
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls[0].arguments["c"], json!("\u{1F600}"));
+    }
+
+    #[test]
+    fn parse_tool_calls_non_finite_becomes_string() {
+        let text = r#"<|tool_call>call:f{a:inf,b:NaN}<tool_call|>"#;
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls[0].arguments["a"], json!("inf"));
+        assert_eq!(calls[0].arguments["b"], json!("NaN"));
+    }
+
+    #[test]
+    fn parse_tool_calls_multibyte_key_preserved() {
+        let text = r#"<|tool_call>call:f{café:<|"|>x<|"|>}<tool_call|>"#;
+        let (_, calls) = parse_tool_calls(text);
+        assert_eq!(calls[0].arguments["café"], json!("x"));
+    }
+
+    #[test]
+    fn parse_tool_calls_dangling_opener_stripped() {
+        // Unterminated `<|tool_call>` (no close) must not leak opener markup into `clean`.
+        let text = "Answer text.<|tool_call>call:foo{x:1}";
+        let (clean, calls) = parse_tool_calls(text);
+        assert!(calls.is_empty());
+        assert!(
+            !clean.contains("tool_call"),
+            "dangling opener leaked: {clean:?}"
+        );
+        assert!(clean.contains("Answer text"));
+    }
+
+    #[test]
+    fn remove_spans_matches_manual_removal() {
+        assert_eq!(
+            remove_spans("abcDEFghiJKLmno", vec![(3, 6), (9, 12)]),
+            "abcghimno"
+        );
+        assert_eq!(remove_spans("hello", vec![]), "hello");
+        assert_eq!(remove_spans("xyz", vec![(0, 3)]), "");
     }
 }

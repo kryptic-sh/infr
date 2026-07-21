@@ -2,6 +2,9 @@
 //! embedded `tokenizer.chat_template` (a Jinja2 string). The single source of truth — every prompt
 //! path funnels through [`render_chat_jinja`].
 
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource; // brings `Gguf::metadata()` into scope
 use infr_gguf::Gguf;
@@ -9,6 +12,80 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::ChatMessage;
+
+/// Compiled-environment cache keyed by the raw template source. A GGUF's chat template never
+/// changes across a process, but `serve` re-renders it on every request/turn — building the
+/// minijinja `Environment` and re-parsing the (often large, HF tool-calling) template each time is
+/// pure waste. Keyed by source so distinct templates don't collide; entry count is bounded by the
+/// number of distinct templates loaded (one per model), so no eviction is needed.
+type SharedEnv = Arc<minijinja::Environment<'static>>;
+static ENV_CACHE: LazyLock<Mutex<HashMap<String, SharedEnv>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Build a minijinja `Environment` with the full infr jinja surface (pycompat, `raise_exception`,
+/// `strftime_now`, `tojson` with `indent=`) and the given chat template compiled under `"chat"`.
+fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinja::Error> {
+    let mut env = minijinja::Environment::new();
+    // HF chat templates lean on Python str/dict/list methods (`.get`, `.items`, `.strip`, …) that
+    // minijinja core doesn't implement — pycompat supplies them (e.g. gemma4's tool-calling template).
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_function(
+        "raise_exception",
+        |msg: String| -> std::result::Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        },
+    );
+    // `strftime_now(format)` — llama.cpp-minja parity: Llama-3.x templates stamp
+    // `Today Date: {{ strftime_now("%d %b %Y") }}` (guarded by `is defined`, so defining it
+    // switches those templates from their hardcoded fallback date to the real one).
+    env.add_function("strftime_now", |fmt: String| {
+        chrono::Local::now().format(&fmt).to_string()
+    });
+    // `tojson` with the optional `indent=` kwarg (Llama-3.x uses `tojson(indent=4)` for the tool
+    // definitions; Qwen-family uses the bare compact form). Not minijinja's built-in `json` filter:
+    // that one HTML-escapes (`<` → `<`), which llama.cpp/HF renders don't.
+    env.add_filter(
+        "tojson",
+        |v: minijinja::Value,
+         kwargs: minijinja::value::Kwargs|
+         -> Result<String, minijinja::Error> {
+            let indent: Option<usize> = kwargs.get("indent")?;
+            kwargs.assert_all_used()?;
+            let out = match indent {
+                Some(n) => {
+                    let pad = " ".repeat(n);
+                    let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+                    let mut buf = Vec::new();
+                    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+                    serde::Serialize::serialize(&v, &mut ser)
+                        .ok()
+                        .and_then(|()| String::from_utf8(buf).ok())
+                }
+                None => serde_json::to_string(&v).ok(),
+            };
+            // Unserializable values degrade to "null" (pre-existing lenient behavior).
+            Ok(out.unwrap_or_else(|| "null".to_owned()))
+        },
+    );
+    env.add_template_owned("chat", template.to_owned())?;
+    Ok(env)
+}
+
+/// Fetch (or build + cache) the compiled `Environment` for `template`.
+fn cached_env(template: &str) -> Result<SharedEnv, minijinja::Error> {
+    if let Some(env) = ENV_CACHE.lock().unwrap().get(template) {
+        return Ok(env.clone());
+    }
+    let env: SharedEnv = Arc::new(build_env(template)?);
+    ENV_CACHE
+        .lock()
+        .unwrap()
+        .insert(template.to_owned(), env.clone());
+    Ok(env)
+}
 
 /// Why a chat-template render failed — so serve/CLI callers can surface the ACTUAL jinja error
 /// (e.g. a template construct the renderer doesn't support) instead of a generic "no template".
@@ -124,12 +201,15 @@ fn render_core(
         .metadata()
         .str("tokenizer.chat_template")
         .ok_or(TemplateError::NoTemplate)?;
-    let bos_id = gguf
+    // BOS: use the metadata id if present, else fall back to the tokenizer's own BOS token — never
+    // a hardcoded id (the old `2` default is EOS for Llama-family GGUFs, so a missing-metadata
+    // model would inject the EOS string at the prompt head).
+    let bos = gguf
         .metadata()
         .get("tokenizer.ggml.bos_token_id")
         .and_then(MetaValue::as_u64)
-        .unwrap_or(2) as u32;
-    let bos = tokenizer.id_to_token(bos_id).unwrap_or_default();
+        .and_then(|id| tokenizer.id_to_token(id as u32))
+        .unwrap_or_default();
     let eos_s = tokenizer.id_to_token(eos).unwrap_or_default();
     // Thinking is ON by default for every model whose template supports it — the key is simply
     // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5)
@@ -176,52 +256,7 @@ pub fn render_template(
     add_generation_prompt: bool,
     enable_thinking: bool,
 ) -> Result<String, minijinja::Error> {
-    let mut env = minijinja::Environment::new();
-    // HF chat templates lean on Python str/dict/list methods (`.get`, `.items`, `.strip`, …) that
-    // minijinja core doesn't implement — pycompat supplies them (e.g. gemma4's tool-calling template).
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    env.add_function(
-        "raise_exception",
-        |msg: String| -> std::result::Result<String, minijinja::Error> {
-            Err(minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                msg,
-            ))
-        },
-    );
-    // `strftime_now(format)` — llama.cpp-minja parity: Llama-3.x templates stamp
-    // `Today Date: {{ strftime_now("%d %b %Y") }}` (guarded by `is defined`, so defining it
-    // switches those templates from their hardcoded fallback date to the real one).
-    env.add_function("strftime_now", |fmt: String| {
-        chrono::Local::now().format(&fmt).to_string()
-    });
-    // `tojson` with the optional `indent=` kwarg (Llama-3.x uses `tojson(indent=4)` for the tool
-    // definitions; Qwen-family uses the bare compact form). Not minijinja's built-in `json` filter:
-    // that one HTML-escapes (`<` → `<`), which llama.cpp/HF renders don't.
-    env.add_filter(
-        "tojson",
-        |v: minijinja::Value,
-         kwargs: minijinja::value::Kwargs|
-         -> Result<String, minijinja::Error> {
-            let indent: Option<usize> = kwargs.get("indent")?;
-            kwargs.assert_all_used()?;
-            let out = match indent {
-                Some(n) => {
-                    let pad = " ".repeat(n);
-                    let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
-                    let mut buf = Vec::new();
-                    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
-                    serde::Serialize::serialize(&v, &mut ser)
-                        .ok()
-                        .and_then(|()| String::from_utf8(buf).ok())
-                }
-                None => serde_json::to_string(&v).ok(),
-            };
-            // Unserializable values degrade to "null" (pre-existing lenient behavior).
-            Ok(out.unwrap_or_else(|| "null".to_owned()))
-        },
-    );
-    env.add_template("chat", template)?;
+    let env = cached_env(template)?;
     let tmpl = env
         .get_template("chat")
         .expect("template was just added under this name");
@@ -244,4 +279,38 @@ pub fn render_chat_user(
     user: &str,
 ) -> Option<String> {
     render_chat_jinja(gguf, tokenizer, eos, &[("user", user)], true)
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    const TMPL: &str =
+        "{% for m in messages %}{{ m.role }}:{{ m.content }}\n{% endfor %}bos={{ bos_token }}";
+
+    fn msgs() -> Vec<Value> {
+        vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "yo"}),
+        ]
+    }
+
+    #[test]
+    fn cache_returns_identical_renders() {
+        // Rendering the same template twice (second hits the compiled-env cache) is byte-identical.
+        let a = render_template(TMPL, msgs(), Value::Null, "<s>", "</s>", true, true).unwrap();
+        let b = render_template(TMPL, msgs(), Value::Null, "<s>", "</s>", true, true).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, "user:hi\nassistant:yo\nbos=<s>");
+    }
+
+    #[test]
+    fn cache_is_keyed_by_source() {
+        // A distinct template source must not collide with a previously-cached one.
+        let other = "ONLY:{{ messages[0].content }}";
+        let a = render_template(TMPL, msgs(), Value::Null, "<s>", "</s>", true, true).unwrap();
+        let b = render_template(other, msgs(), Value::Null, "<s>", "</s>", true, true).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(b, "ONLY:hi");
+    }
 }

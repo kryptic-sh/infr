@@ -22,9 +22,11 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **58** — 0 🔴, 9 🟠, 49 🟡. (2 findings are explicitly
-  **deferred**, not open work: the 🟠 `make_compute_kernel` OOM→Result — see the
-  ops.rs section — and a 🟡 shader-pair DRY merge — see the shaders section.)
+- **Remaining open:** **51** — 0 🔴, 8 🟠, 43 🟡. (3 findings are explicitly
+  **deferred**, not open work: the 🟠 `make_compute_kernel` OOM→Result, a 🟡
+  shader-pair DRY merge, and a 🟡 `attn_combine` subgroup-reduce/flash-refactor
+  — each risks the byte-identity gate or the recorded stream; see their
+  sections.)
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -222,6 +224,20 @@ parked path).
   `subgroupInclusiveAdd` (sg32-pinned, within tolerance); `moe_bucket_scan`
   drops the fused `fill[]=0` (zeroed by a separate overlapping dispatch — MoE
   goldens byte-identical).
+- **`infr-vulkan` attention/flash shaders (7 of 8; #7 deferred)** — **gpu_seam
+  verified** (flash stage/warp/coopmat/matches-cpu + kv*addr + kv_q8 goldens
+  pass, run serially). The direct `coopMatLoad` K/V over-read past `kv_len` is
+  made SAFE by tightening the host `flash_geom` gate to
+  `kv_len.div_ceil(64)*64 <= att_cap_rows` (a non-ring KV cache allocates
+  non-64-aligned rows; flash reads 64-aligned tiles) — the masked over-read
+  columns contribute nothing; `attn_flash.comp` documents the mpad precondition
+  (keeps writing all BM rows to stay bit-identical with the staged/split-K paths
+  — a store guard there was reverted after it broke the STAGE==direct golden);
+  host debug-asserts guard `attn_pv` `tilesN`, `attn_combine` `ntile`, and
+  `attn_partial_mrows` `chunk`; `quant_kv` Q5_1 gets the `clamp(0,31)` (never
+  triggers); dead `MAXS` removed. \_Pre-existing note:* the flash parity LIB
+  tests race on process-global `INFR_FLASH_*` env under parallel cargo threads —
+  pass with `--test-threads=1`.
 
 ### Highest-priority (production default paths)
 
@@ -341,58 +357,17 @@ weighted highest._
 
 ## infr-vulkan/shaders — attention / flash / KV / softmax
 
-1. **🟠 `attn_flash.comp:71,116` (also `attn_flash_partial:183,270`,
-   `attn_flash_warp:188,301`, `attn_flash_reg:119,169`) — direct `coopMatLoad`
-   reads K/V rows past `kv_len` with no bounds guard.**
-   `kvend=min(kv_len,qmax+1)` isn't rounded to `BN=64`, so the last 64-wide
-   column tile over-reads global K/V. Numerically safe (scores masked at `87`),
-   but a genuine OOB _global read_ unless K/V is capacity/`BN`-multiple
-   allocated — and the `-DSTAGE` arms guard exactly this (`kv0+kvl<kv_len`)
-   while the direct arms don't (author-acknowledged asymmetry). _Fix:_ add the
-   `kv0+col<kv_len` clamp to the direct path, or document/enforce `BN`-multiple
-   K/V allocation + rely on `robustBufferAccess2`.
-2. **🟡 `attn_flash.comp:126` — output store unguarded on padding query rows.**
-   `o[(qr0+r)*…]` runs for all `r<BM`; if `q`/`o` are sized to a
-   non-`BM`-aligned `q_len`, tile rows `≥q_len` OOB-read `q` and OOB-write `o`.
-   `attn_nc_fa.comp:228` guards the identical store with `if (gr<q_len)`. _Fix:_
-   add `if (qr0+r<q_len)` or state the mpad precondition.
-3. **🟡 `attn_pv_warp.comp:49` (`BN=128`) / `attn_pv.comp:43` (`BN=64`) —
-   `tilesN=hd/BN` is a comment-only precondition → div-by-zero / dropped dims.**
-   hd=64 gives `tilesN=0` → division by zero at `50`; a non-multiple hd
-   (e.g. 80) truncates and never covers the top dims. _Fix:_ validate `hd%BN==0`
-   at dispatch or `max(1u,hd/BN)` + dim tail.
-4. **🟡 `attn_combine.comp:24` — output dims dropped when `ntile ∤ hd`.**
-   `hdt= hd/ntile` truncates; the union across tiles covers only `ntile*hdt`,
-   leaving the top `hd-ntile*hdt` output dims uninitialized. _Fix:_ assert
-   `hd%ntile==0` or give the last tile the remainder. (Also: `n_chunks` is never
-   bounded vs `wexp[1024]` at `37` — same root as the adapter static-`n_chunks`
-   finding.)
-5. **🟡 `attn_partial_mrows.comp:52` — `sc[RB*SC]` overruns if a chunk exceeds
-   `SC`** (nothing clamps `pc.chunk≤SC`); the `SC_MAX=256` build lacks the guard
-   `attn_partial` gets from `sc[1024]`+`chunk≤512`. Opt-in `INFR_MROWS_ATTN`
-   path. _Fix:_ static-assert/document `chunk≤SC_MAX` or clamp the write index.
-6. **🟡 `quant_kv.comp:128` (defensive) — `FMT_Q5_1` omits the `clamp(…,0,31)`
-   the Q4_0/Q4_1/Q5_0 arms apply.** Unlike Q5*0's asymmetric
-   `x*id+16.5`(which can genuinely round to 32.5), Q5_1's`(x-vmin)_id`is bounded by`vmax`
-   so it can't reach 32 barring impossible fp error — so this is a
-   robustness/consistency nit, not a live bug, but matching the siblings removes
-   the latent trap. \_Fix:_ `clamp(int((x-vmin)*id+0.5),0,31)`.
-7. **🟡 perf/DRY — 32-lane redundant recompute + copy-pasted softmax.**
-   `attn_combine.comp:36,40` recompute `mm`/`l` over all `nch` identically in
-   every one of 32 lanes (32× partial-array traffic; scales poorly as chunks
-   grow). The causal-mask + online-softmax rescale block is copy-pasted across 5
-   flash kernels (`attn_flash:80`, `_partial:193`, `_warp:203`, `_reg:130`,
-   `nc_fa:162`) with subtle layout diffs — only `nc_fa:181` has the `-1e29`
-   all-dead-block guard, so a numerics fix drifts. Ring `RROW`/`rcap` + Q8/f16
-   vec4 readers likewise duplicated across decode kernels. _Fix:_
-   subgroup-reduce `mm`/`l`; factor the mask/rescale + ring readers into a
-   shared `.glsl` include so the all-dead guard stays consistent.
-8. **🟡 `softmax.comp:28` — `shared float part[8]` assumes `gl_NumSubgroups≤8`
-   (256/32) with no `requiredSubgroupSize`.** On a device enumerating 16-lane
-   subgroups for this pipeline, `gl_SubgroupID` reaches 15 → overruns `part`.
-   Safe on wave32/64 RADV but unpinned. _Fix:_ pin `requiredSubgroupSize=32` (as
-   decode kernels do) or size `part[16]`. (`attn_flash_combine.comp:11` also has
-   a dead `const uint MAXS` — delete.)
+_7 of 8 findings fixed (see Resolved log); the one below is **DEFERRED**._
+
+1. **🟡 perf/DRY** — `attn_combine.comp:36,40` recompute `mm`/`l` over all `nch`
+   in every one of 32 lanes; the causal-mask + online-softmax rescale block is
+   copy-pasted across 5 flash kernels; ring `RROW`/`rcap` + Q8/f16 vec4 readers
+   are duplicated. _Deferred:_ `attn_combine` is dispatched WITHOUT a pinned
+   subgroup size, so a `subgroupMax`/`subgroupAdd` reduce would be wrong on a
+   16-lane device without adding `requiredSubgroupSize=32` (a host pipeline
+   change with portability risk), and the `l` (weighted-sum) reduce is only
+   within-tolerance, not byte-identical — both risk the byte-identity gate. The
+   flash mask/rescale include-refactor would perturb the 5 kernels' numerics.
 
 ## infr-vulkan/shaders — GEMM / GEMV / MoE-expert matmul
 

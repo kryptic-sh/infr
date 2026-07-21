@@ -54,15 +54,54 @@ impl<'a> TokenEmbd<'a> {
     }
 
     /// The dequantized `[vocab, n_embd]` row-major table — dequantized on first call, cached after.
-    /// `Config::from_gguf` already validated the tensor exists at load, so this can only fail on a
-    /// corrupt/truncated GGUF.
-    pub(crate) fn get(&self) -> &'a [f32] {
-        self.cell.get_or_init(|| {
-            crate::quant::load_tensor_dequant(self.gguf, "token_embd.weight")
-                .expect("token_embd.weight: validated at load by Config::from_gguf")
-                .0
-        })
+    /// `Config::from_gguf` already validated the tensor exists at load, but a truncated/corrupt GGUF
+    /// can still fail the dequant here (the first host gather, lazily). FALLIBLE so that a real
+    /// non-programmer input surfaces a clear error at the call site instead of aborting the process.
+    pub(crate) fn get(&self) -> AResult<&'a [f32]> {
+        if let Some(v) = self.cell.get() {
+            return Ok(v);
+        }
+        let (v, _) =
+            crate::quant::load_tensor_dequant(self.gguf, "token_embd.weight").map_err(|e| {
+                anyhow!("token_embd.weight: dequant failed (corrupt/truncated GGUF?): {e}")
+            })?;
+        // Race-safe cache fill: another thread may have won the init; `set` drops ours if so, then
+        // `get` returns whichever value stuck (get_or_init semantics without a fallible init).
+        let _ = self.cell.set(v);
+        Ok(self
+            .cell
+            .get()
+            .expect("cell was just set or already initialized"))
     }
+}
+
+/// The CPU seam weight binder, hoisted so the CPU runner and every CPU `verify_*` entry share one
+/// copy: map an mmap slice zero-copy; alloc+upload owned bytes (the combined gate+up concat — never
+/// produced for CPU since `combined_gu` is false there, but stays correct if it ever is).
+fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
+    Box::new(move |_name, tb, dt, _n| match tb {
+        WBytes::Mmap(tb) => Ok((be.map_weight(tb), dt)),
+        WBytes::Owned(v) => {
+            let buf = be
+                .alloc(v.len().max(1), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(buf.as_ref(), &v).map_err(|e| anyhow!("{e}"))?;
+            Ok((buf, dt))
+        }
+    })
+}
+
+/// The Metal seam weight binder (raw native-dtype upload; the backend dequantizes lazily), hoisted
+/// so the Metal session runner and `verify_dense_metal2` share one copy.
+#[cfg(target_os = "macos")]
+fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
+    Box::new(move |_name, tb, dt, _n| {
+        let buf = be
+            .alloc(tb.len().max(1), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+        Ok((buf, dt))
+    })
 }
 
 // ─── Qwen3 dense CPU decode runner ───────────────────────────────────────────────
@@ -90,22 +129,10 @@ pub(crate) fn generate_dense_cpu(
     // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a zero-copy weight binder
     // (maps each tensor straight from the GGUF mmap — no alloc, no memcpy).
     let cpu_be = CpuBackend::new();
+    let bind = cpu_upload_bind(&cpu_be);
     generate_dense_backend(
         &cpu_be,
-        &|_name, tb, dt, _n| match tb {
-            WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
-            // Owned bytes (combined gate+up) never reach the CPU binder — combined_gu is false —
-            // but stay correct if they ever do.
-            WBytes::Owned(v) => {
-                let buf = cpu_be
-                    .alloc(v.len().max(1), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                cpu_be
-                    .upload(buf.as_ref(), &v)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok((buf, dt))
-            }
-        },
+        &bind,
         g,
         cfg,
         token_embd,
@@ -180,9 +207,18 @@ pub(crate) fn generate_dense_vulkan_session(
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
     // baton is released before the runner starts stepping. See `StepGate`.
-    let bind = {
+    //
+    // A WARM call (`state.is_some()`) has every weight already resident, and the runner never calls
+    // `bind_weight` again (see the `state.is_none()` init block in `generate_dense_backend`), so
+    // building the full `vulkan_moe_binder` — which re-reads INFR_CACHE/env and allocs a Box — is
+    // pure per-turn waste. Skip it: a no-op binder that errors loudly if the invariant ever breaks.
+    let warm_binder: Box<BindWeight<'_>> =
+        Box::new(|name: &str, _tb, _dt, _n| Err(anyhow!("warm session must not re-bind {name}")));
+    let bind = if state.is_some() {
+        warm_binder
+    } else {
         let _gp = req.and_then(|r| r.gate_pass());
-        vulkan_moe_binder(vk, g, cfg, state.is_none(), want_ctx)?
+        vulkan_moe_binder(vk, g, cfg, true, want_ctx)?
     };
     let out = generate_dense_backend(
         vk, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
@@ -277,10 +313,7 @@ pub(crate) fn ubatch_rows() -> usize {
         .and_then(|v| v.parse().ok())
         .filter(|&v| v > 0)
         .unwrap_or_else(|| {
-            PINNED_UBATCH
-                .get()
-                .copied()
-                .unwrap_or_else(default_ubatch_rows)
+            with_placement_pins(|p| p.ubatch.get().copied()).unwrap_or_else(default_ubatch_rows)
         })
 }
 
@@ -318,41 +351,98 @@ pub(crate) fn ubatch_rows_parallel() -> usize {
         .unwrap_or(256)
 }
 
-/// Placement-pinned prefill chunk (rows): set ONCE by the dense try-resident sweep when a smaller
-/// chunk is what makes a big model fully resident (see `vulkan_moe_binder`'s dense tier —
-/// residency at a 512-row chunk decodes ~10x faster than streaming at the PCIe ceiling). Read by
-/// [`ubatch_rows`] when INFR_UBATCH is unset, so the prefill loop, the activation reserve, and
-/// the SWA ring sizing all agree on the same height. Set BEFORE the runner's first KV allocation
-/// (placement runs first in the same call), never changed after.
-static PINNED_UBATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Placement-pinned auto-q8 KV: set ONCE when the placement ladder chooses a Q8_0 KV cache to
-/// keep a session RESIDENT (dense try-resident tier in [`vulkan_moe_binder`]) or to avoid
-/// shrinking a DEFAULT context (`SeamModel::clamp_default_ctx`) — the "q8 KV" rung between the
-/// SWA ring and ctx-clamp/weight-streaming rungs of the VRAM placement ladder. Read by the
-/// runner's per-side KV-format selection (and by every KV-footprint estimate) ONLY when the
-/// user set none of INFR_KV_TYPE_K / INFR_KV_TYPE_V / INFR_KV_Q8 — an explicit setting always
-/// wins, in both directions (an explicit `f16` forces f16 and the placement falls through to
-/// the next rung). Policy, deliberately conservative:
-///   - BOTH sides go q8_0 (the existing coherence-tested replayable config — coupled Q8 keeps
-///     record-once decode replay; llama.cpp guidance says keep K >= V precision, and q8/q8
-///     satisfies it symmetrically);
-///   - never auto-picks anything BELOW q8_0 (the low-bit/turbo formats trade real quality and
-///     stay explicit opt-ins).
+/// The two placement decisions the VRAM ladder pins for a session and then keeps STABLE for its
+/// whole lifetime (set before the first KV allocation, never changed after — warm calls and rebuilt
+/// graphs must agree with the buffers they were sized with):
+///   - `ubatch`: the pinned prefill chunk (rows) when the dense try-resident sweep found a smaller
+///     chunk is what makes a big model fully resident (residency at a 512-row chunk decodes ~10x
+///     faster than streaming at the PCIe ceiling — see `vulkan_moe_binder`'s dense tier). Read by
+///     [`ubatch_rows`] when INFR_UBATCH is unset, so the prefill loop, the activation reserve, and
+///     the SWA ring sizing all agree on the same height.
+///   - `kv_q8`: auto-q8 KV, chosen to keep a session RESIDENT (dense try-resident tier) or to avoid
+///     shrinking a DEFAULT context (`SeamModel::clamp_default_ctx`) — the "q8 KV" rung of the VRAM
+///     ladder. Read by the runner's per-side KV-format selection (and every KV-footprint estimate)
+///     ONLY when the user set none of INFR_KV_TYPE_K / INFR_KV_TYPE_V / INFR_KV_Q8 — an explicit
+///     setting always wins, both directions. Policy: BOTH sides go q8_0 (coupled Q8 keeps
+///     record-once decode replay and satisfies K>=V symmetrically); never below q8_0.
 ///
-/// Like [`PINNED_UBATCH`], set before the session's first KV allocation and never changed —
-/// warm calls and rebuilt graphs must agree with the buffers they were sized with.
-static PINNED_KV_Q8: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
-/// Whether the placement ladder pinned auto-q8 KV for this process (see [`PINNED_KV_Q8`]).
-pub(crate) fn kv_auto_q8() -> bool {
-    PINNED_KV_Q8.get().is_some()
+/// These were process-global `OnceLock`s, which LEAKED across models in a multi-model process
+/// (`infr multi` hosts N models, each its own `DenseVulkanSession`, and the server runs their
+/// generations CONCURRENTLY): a second model's `.set()` was a silent no-op, so it inherited model
+/// A's pinned chunk height / q8 decision — which may not fit B's VRAM. They now live PER SESSION
+/// (owned by `DenseVulkanSession`, entered via [`PlacementScope`] around each placement + generate),
+/// so each model's ladder decision is isolated.
+#[derive(Default)]
+pub(crate) struct PlacementPins {
+    ubatch: std::sync::OnceLock<usize>,
+    kv_q8: std::sync::OnceLock<()>,
 }
 
-/// Pin auto-q8 KV from outside this module (the default-ctx clamp path in `model.rs`); the
-/// binder's own rung sets [`PINNED_KV_Q8`] directly. Idempotent (OnceLock).
+thread_local! {
+    /// The session whose placement pins the current thread's `ubatch_rows`/`kv_auto_q8` reads and
+    /// writes resolve against — set by [`PlacementScope`] for the duration of a placement + runner
+    /// call. `None` outside any scope (the one-shot `generate_dense_*`, CPU/Metal, tests), which
+    /// falls back to [`FALLBACK_PINS`].
+    static CURRENT_PINS: std::cell::RefCell<Option<std::sync::Arc<PlacementPins>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Process-wide fallback pins for callers with no active [`PlacementScope`] (one-shot run/bench,
+/// CPU/Metal, tests). Those paths host a SINGLE model per process, so a process-global is correct
+/// there and byte-identical to the old two-`OnceLock` behavior.
+static FALLBACK_PINS: std::sync::OnceLock<std::sync::Arc<PlacementPins>> =
+    std::sync::OnceLock::new();
+
+/// Run `f` against the current thread's session pins (or the process fallback when no session scope
+/// is active). The single reader/writer funnel for both placement pins.
+fn with_placement_pins<R>(f: impl FnOnce(&PlacementPins) -> R) -> R {
+    CURRENT_PINS.with(|c| match c.borrow().as_ref() {
+        Some(p) => f(p),
+        None => f(FALLBACK_PINS.get_or_init(|| std::sync::Arc::new(PlacementPins::default()))),
+    })
+}
+
+/// RAII guard binding `pins` as the current thread's placement scope. Every seam entry that runs a
+/// placement decision or a runner step for a session (`DenseVulkanSession::generate*`, the
+/// default-ctx clamp) enters one around its work so the free-function readers
+/// ([`ubatch_rows`]/[`kv_auto_q8`]) resolve against THAT session's pins. Restores the previous
+/// scope on drop (scopes may nest — the clamp runs inside session construction).
+pub(crate) struct PlacementScope {
+    prev: Option<std::sync::Arc<PlacementPins>>,
+}
+
+impl PlacementScope {
+    pub(crate) fn enter(pins: std::sync::Arc<PlacementPins>) -> Self {
+        let prev = CURRENT_PINS.with(|c| c.borrow_mut().replace(pins));
+        Self { prev }
+    }
+}
+
+impl Drop for PlacementScope {
+    fn drop(&mut self) {
+        CURRENT_PINS.with(|c| *c.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Pin the placement prefill chunk (rows) for the current session scope. Idempotent (OnceLock).
+fn pin_ubatch(rows: usize) {
+    with_placement_pins(|p| {
+        let _ = p.ubatch.set(rows);
+    });
+}
+
+/// Whether the placement ladder pinned auto-q8 KV for the current session scope (see
+/// [`PlacementPins`]).
+pub(crate) fn kv_auto_q8() -> bool {
+    with_placement_pins(|p| p.kv_q8.get().is_some())
+}
+
+/// Pin auto-q8 KV for the current session scope (the default-ctx clamp path in `model.rs`, and the
+/// binder's own dense rung). Idempotent (OnceLock).
 pub(crate) fn pin_kv_auto_q8() {
-    let _ = PINNED_KV_Q8.set(());
+    with_placement_pins(|p| {
+        let _ = p.kv_q8.set(());
+    });
 }
 
 /// Opt-in KV overflow to system RAM (`INFR_KV_OVERFLOW=1`): the Vulkan backend places the KV
@@ -409,6 +499,40 @@ pub(crate) fn kv_rows_at(
 /// identical to the full-context cache. Global (non-SWA) layers keep full `want_ctx` rows.
 pub(crate) fn kv_rows(cfg: &Config, l: usize, want_ctx: usize, ring: bool) -> usize {
     kv_rows_at(cfg, l, want_ctx, ring, ubatch_rows())
+}
+
+/// KV-cache footprint ESTIMATE summed over all layers at chunk height `ubatch` and side format:
+/// `q8` prices BOTH sides Q8_0 (34 B / 32-elem block, `next_multiple_of(4)`, mirroring
+/// [`kv_fmt_bytes`]), else f16 (2 B/elem); +64 rows/layer slop. The ONE pricing helper the dense
+/// placement sweep AND the MoE expert-placement budget share, so both reserve exactly the cache the
+/// runner will allocate — including a pinned auto-q8 cache. (The MoE path used to hard-code f16
+/// `*2*2` regardless, over-reserving ~2× under auto-q8 and forcing avoidable expert paging.)
+pub(crate) fn kv_bytes_estimate(
+    cfg: &Config,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    q8: bool,
+) -> u64 {
+    (0..cfg.n_layer)
+        .map(|l| {
+            let elems = (cfg.layer_n_kv(l) * cfg.layer_head_dim(l)) as u64
+                * (kv_rows_at(cfg, l, want_ctx, ring, ubatch) as u64 + 64);
+            kv_pair_bytes(elems, q8)
+        })
+        .sum()
+}
+
+/// K+V byte footprint for ONE layer at `elems` per-side elements (rows × n_kv × head_dim): both
+/// sides Q8_0 (34 B / 32-elem block, rounded to a u32 multiple — mirrors [`kv_fmt_bytes`]) when
+/// `q8`, else both f16 (2 B/elem). The pure per-layer core of [`kv_bytes_estimate`], honoring the
+/// q8 flag so the dense sweep and the MoE budget price a pinned auto-q8 cache at ~half the bytes.
+fn kv_pair_bytes(elems: u64, q8: bool) -> u64 {
+    if q8 {
+        2 * (elems / 32 * 34).next_multiple_of(4)
+    } else {
+        2 * 2 * elems
+    }
 }
 
 /// Config/env-level gate for SWA ring KV sizing, shared by the runner's allocation and the
@@ -550,12 +674,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a
                 // mostly-SWA model's KV prices far below n_layer * ctx. +64 rows/layer slop.
                 let ring = kv_ring_wanted(cfg);
-                let kv_bytes: u64 = (0..cfg.n_layer)
-                    .map(|l| {
-                        (cfg.layer_n_kv(l) * cfg.layer_head_dim(l) * 2 * 2) as u64
-                            * (kv_rows(cfg, l, want_ctx, ring) as u64 + 64)
-                    })
-                    .sum::<u64>();
+                // Route through the shared q8-aware helper (the dense placement path already does),
+                // so a pinned auto-q8 KV cache is priced at ~half the bytes instead of the old
+                // hard-coded f16 `*2*2` — which over-reserved ~2× and forced avoidable expert paging.
+                let kv_bytes: u64 =
+                    kv_bytes_estimate(cfg, want_ctx, ring, ubatch_rows(), kv_auto_q8());
                 // 2 GiB: covers activation scratch (pooled, but per-tag sizes scale with n_embd/
                 // n_ff and this budget calc's `fp`/`kv_bytes` are estimates, not the exact bytes
                 // `alloc`/gpu-allocator's 256 MiB block granularity ends up committing) plus the
@@ -831,19 +954,8 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // decision below shares (try-resident, the chunk sweeps, the auto-q8 rung, the streaming
         // budget), so they all price exactly the allocation the runner will make. `q8` prices
         // BOTH sides Q8_0 (34 bytes / 32 elems, mirroring `kv_fmt_bytes`); false = f16 (2 B/elem).
-        let kv_total_at = |ubatch: usize, q8: bool| -> u64 {
-            (0..cfg.n_layer)
-                .map(|l| {
-                    let elems = (cfg.layer_n_kv(l) * cfg.layer_head_dim(l)) as u64
-                        * (kv_rows_at(cfg, l, want_ctx, ring, ubatch) as u64 + 64);
-                    if q8 {
-                        2 * (elems / 32 * 34).next_multiple_of(4)
-                    } else {
-                        2 * 2 * elems
-                    }
-                })
-                .sum()
-        };
+        let kv_total_at =
+            |ubatch: usize, q8: bool| -> u64 { kv_bytes_estimate(cfg, want_ctx, ring, ubatch, q8) };
         // Does weights + KV + the honest activation reserve fit live VRAM at this (chunk, fmt)?
         let fits = |ubatch: usize, q8: bool| {
             fp.total() + kv_total_at(ubatch, q8) + dense_act_reserve_at(cfg, want_ctx, ubatch)
@@ -866,7 +978,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // (whole-chunk logits/gate_up scratch scale with rows) and the SWA ring rows
         // (window + chunk). Resident-with-a-512-row-chunk decodes ~10x faster than streaming at
         // the PCIe ceiling (gemma-4-31B @ d4096: 27.6 vs 2.9 t/s), so trading prefill chunk
-        // height for residency is strictly the right call. Pinned process-wide (PINNED_UBATCH)
+        // height for residency is strictly the right call. Pinned per-session (`PlacementPins`)
         // so the prefill loop and the runner's ring sizing use exactly the priced height; an
         // explicit INFR_UBATCH disables the sweep (the user's height is authoritative). Runs
         // BEFORE the auto-q8 rung below: a shorter prefill chunk costs only some prefill
@@ -875,7 +987,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if !resident && std::env::var("INFR_UBATCH").is_err() && cache_override.is_none() {
             for cand in [512usize, 256, 128] {
                 if fits(cand, kv_auto_q8()) {
-                    let _ = PINNED_UBATCH.set(cand);
+                    pin_ubatch(cand);
                     // Re-read through the pin (a racing earlier set wins — use whatever stuck).
                     if fits(ubatch_rows(), kv_auto_q8()) {
                         eprintln!(
@@ -894,7 +1006,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // f16 KV missed residency at every chunk height, but a Q8_0 cache (roughly HALF the KV
         // bytes) might fit — placing RESIDENT with q8 KV beats the remaining rungs by an order
         // of magnitude (streaming decodes at the PCIe ceiling; the explicit-ctx path never
-        // clamps). Gates: the user set NO KV format (see `PINNED_KV_Q8`'s policy doc — explicit
+        // clamps). Gates: the user set NO KV format (see `PlacementPins`'s policy doc — explicit
         // settings always win, both sides go q8_0, never below q8), no INFR_CACHE override
         // (that's the deterministic force-streaming hook), and the runner's own q8 layout gate
         // (32-elem block alignment; this binder is the Vulkan path, a native q8-KV backend —
@@ -915,9 +1027,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
             }
             for cand in cands {
                 if fits(cand, true) {
-                    let _ = PINNED_KV_Q8.set(());
+                    pin_kv_auto_q8();
                     if cand != ubatch_rows() {
-                        let _ = PINNED_UBATCH.set(cand);
+                        pin_ubatch(cand);
                     }
                     // Re-read through the pins (racing earlier sets win — use whatever stuck).
                     if kv_auto_q8() && fits(ubatch_rows(), true) {
@@ -963,7 +1075,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 // if no chunk reaches that, take the floor — 128 rows, the maximum-budget
                 // choice. An explicit INFR_UBATCH is authoritative and skips the sweep; the
                 // INFR_CACHE tier above is untouched (its budget is the caller's, not derived
-                // from the reserve). Pinned via PINNED_UBATCH like the residency sweep, so the
+                // from the reserve). Pinned via `PlacementPins` like the residency sweep, so the
                 // prefill loop, the runner's ring sizing, and this budget all agree.
                 let q8 = kv_auto_q8();
                 let base = fp.total() - streamable_resident;
@@ -990,7 +1102,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                         .find(|&c| covers(budget_at(c)))
                         .unwrap_or(*cands.last().expect("cands is never empty"));
                     if pick != ub_now {
-                        let _ = PINNED_UBATCH.set(pick);
+                        pin_ubatch(pick);
                     }
                 }
                 Some(budget_at(ubatch_rows()))
@@ -1201,29 +1313,120 @@ pub(crate) fn vulkan_moe_binder<'a>(
     }))
 }
 
-/// Parse the `INFR_PIPELINE` device list (`Vulkan0,Vulkan1,…`) into physical device indices, or
-/// `None` when the flag is unset. An empty/garbage list errors loudly.
-pub fn parse_pipeline_devices() -> AResult<Option<Vec<usize>>> {
-    let Some(spec) = std::env::var_os("INFR_PIPELINE") else {
-        return Ok(None);
-    };
-    let spec = spec.to_string_lossy();
+/// Open one Vulkan backend per physical device index (the shared front of every multi-GPU
+/// `generate_*` wrapper). Errors name the failing `VulkanN`.
+fn open_vulkan_devices(devices: &[usize]) -> AResult<Vec<infr_vulkan::VulkanBackend>> {
+    devices
+        .iter()
+        .map(|&idx| {
+            infr_vulkan::VulkanBackend::new_on(idx)
+                .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))
+        })
+        .collect()
+}
+
+/// The arch guards the DENSE multi-GPU paths (pipeline, tensor-parallel) share: they cover
+/// dense-attention Qwen3/Llama/Gemma only, rejecting MoE / qwen35 DeltaNet / gemma-E2B /
+/// diffusion-gemma with a clear per-flag message (`label` = the env var). Expert parallelism has
+/// its own guard (it REQUIRES MoE).
+fn dense_multi_gpu_guard(cfg: &Config, label: &str) -> AResult<()> {
+    if cfg.moe.is_some() {
+        return Err(anyhow!(
+            "{label} supports dense models only; this is an MoE model — use INFR_EXPERT_PARALLEL"
+        ));
+    }
+    if cfg.qwen35 {
+        return Err(anyhow!(
+            "{label} does not support qwen35 (DeltaNet recurrent-state placement is a separate slice)"
+        ));
+    }
+    if cfg.n_embd_per_layer > 0 {
+        return Err(anyhow!(
+            "{label} does not support gemma E2B per-layer embeddings"
+        ));
+    }
+    if cfg.diffusion_gemma {
+        return Err(anyhow!("{label} does not support diffusion-gemma"));
+    }
+    Ok(())
+}
+
+/// Drive `generate_dense_backend` as a ONE-SHOT (single conversation, no slot pool): fresh `None`
+/// state, `want_ctx = prompt + max_new + 1`, and the eight trailing hooks (constraint / verify /
+/// verify_ids / logits_out / h_out / denoise_req / req) all unused. The shared tail of the
+/// multi-GPU `generate_*` wrappers.
+fn run_dense_oneshot(
+    be: &dyn Backend,
+    bind: &BindWeight<'_>,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend(
+        be,
+        bind,
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        &mut None,
+        prompt.len() + max_new + 1,
+        None, // constraint
+        None, // verify
+        None, // verify_ids
+        None, // logits_out
+        None, // h_out
+        None, // denoise_req
+        None, // req
+    )
+}
+
+/// Parse a multi-GPU device spec (`Vulkan0,Vulkan1,…` — a bare index `N` is also accepted) into
+/// physical device indices, requiring at least `min`. `label` is the env-var name used in error
+/// messages. The PURE core of the `parse_*_devices` env readers (unit-tested directly).
+fn parse_device_spec(spec: &str, min: usize, label: &str) -> AResult<Vec<usize>> {
     let mut devs = Vec::new();
     for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let idx = part
             .strip_prefix("Vulkan")
             .unwrap_or(part)
             .parse::<usize>()
-            .map_err(|_| anyhow!("INFR_PIPELINE: '{part}' is not VulkanN or a device index"))?;
+            .map_err(|_| anyhow!("{label}: '{part}' is not VulkanN or a device index"))?;
         devs.push(idx);
     }
-    if devs.len() < 2 {
+    if devs.len() < min {
         return Err(anyhow!(
-            "INFR_PIPELINE needs >=2 devices for a layer split (got '{spec}'); \
+            "{label} needs >={min} device(s) for a real split (got '{spec}'); \
              unset it to run single-device"
         ));
     }
-    Ok(Some(devs))
+    Ok(devs)
+}
+
+/// Read env var `label`, parsing its device list via [`parse_device_spec`] (requiring `min`), or
+/// `None` when the var is unset. The shared body of the three `parse_*_devices` entry points.
+fn parse_device_list(label: &str, min: usize) -> AResult<Option<Vec<usize>>> {
+    let Some(spec) = std::env::var_os(label) else {
+        return Ok(None);
+    };
+    Ok(Some(parse_device_spec(
+        &spec.to_string_lossy(),
+        min,
+        label,
+    )?))
+}
+
+/// Parse the `INFR_PIPELINE` device list (`Vulkan0,Vulkan1,…`) into physical device indices, or
+/// `None` when the flag is unset. Needs >=2 devices for a layer split; garbage errors loudly.
+pub fn parse_pipeline_devices() -> AResult<Option<Vec<usize>>> {
+    parse_device_list("INFR_PIPELINE", 2)
 }
 
 /// A device-aware [`BindWeight`] for the multi-GPU pipeline: each weight is placed on the device
@@ -1234,7 +1437,12 @@ pub fn parse_pipeline_devices() -> AResult<Option<Vec<usize>>> {
 /// tiers of [`vulkan_moe_binder`] are out of scope).
 fn pipeline_binder<'a>(pb: &'a infr_vulkan::PipelineBackend) -> Box<BindWeight<'a>> {
     Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
-        check_bda_element_cap(name, "tensor", numel)?;
+        // lm_head / embedding tables (issue #77) are read only by dispatch-chunked ops, so they may
+        // legitimately exceed the u32 element cap — mirror the resident/EP binders and exempt them
+        // (a large/quantized-vocab lm_head must not hard-reject a model that runs single-device/EP).
+        if !chunk_covered_dense_tensor(name) {
+            check_bda_element_cap(name, "tensor", numel)?;
+        }
         let d = pb.device_for_weight(name);
         let padded = infr_vulkan::linear::pad_to_u32_align(&tb);
         let buf = pb
@@ -1268,33 +1476,8 @@ pub(crate) fn generate_dense_vulkan_pipeline(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    if cfg.moe.is_some() {
-        return Err(anyhow!(
-            "INFR_PIPELINE (layer-split) supports dense models only; this is an MoE model \
-             (expert-bank per-layer placement is a separate slice)"
-        ));
-    }
-    if cfg.qwen35 {
-        return Err(anyhow!(
-            "INFR_PIPELINE does not yet support qwen35 (DeltaNet recurrent-state placement is a \
-             separate slice)"
-        ));
-    }
-    if cfg.n_embd_per_layer > 0 {
-        return Err(anyhow!(
-            "INFR_PIPELINE does not yet support gemma E2B per-layer embeddings"
-        ));
-    }
-    if cfg.diffusion_gemma {
-        return Err(anyhow!("INFR_PIPELINE does not support diffusion-gemma"));
-    }
-    let mut backends = Vec::with_capacity(devices.len());
-    for &idx in devices {
-        backends.push(
-            infr_vulkan::VulkanBackend::new_on(idx)
-                .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
-        );
-    }
+    dense_multi_gpu_guard(cfg, "INFR_PIPELINE")?;
+    let backends = open_vulkan_devices(devices)?;
     let layer_map = infr_vulkan::PipelineBackend::balanced_layer_map(cfg.n_layer, backends.len());
     // Placement report: how many layers landed on each physical device.
     let names = backends
@@ -1330,25 +1513,8 @@ pub(crate) fn generate_dense_vulkan_pipeline(
         }
     }
     let bind = pipeline_binder(&pb);
-    generate_dense_backend(
-        &pb,
-        &*bind,
-        g,
-        cfg,
-        token_embd,
-        ple,
-        prompt,
-        max_new,
-        on_token,
-        &mut None,
-        prompt.len() + max_new + 1,
-        None, // constraint
-        None, // verify
-        None, // verify_ids
-        None, // logits_out
-        None, // h_out
-        None, // denoise_req
-        None, // req
+    run_dense_oneshot(
+        &pb, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token,
     )
 }
 
@@ -1359,28 +1525,7 @@ pub(crate) fn generate_dense_vulkan_pipeline(
 /// Parse the `INFR_TENSOR_PARALLEL` device list (`Vulkan0,Vulkan1,…`) into physical device indices,
 /// or `None` when unset. Sibling of [`parse_pipeline_devices`]; needs >=2 devices for a real split.
 pub fn parse_tensor_parallel_devices() -> AResult<Option<Vec<usize>>> {
-    let Some(spec) = std::env::var_os("INFR_TENSOR_PARALLEL") else {
-        return Ok(None);
-    };
-    let spec = spec.to_string_lossy();
-    let mut devs = Vec::new();
-    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let idx = part
-            .strip_prefix("Vulkan")
-            .unwrap_or(part)
-            .parse::<usize>()
-            .map_err(|_| {
-                anyhow!("INFR_TENSOR_PARALLEL: '{part}' is not VulkanN or a device index")
-            })?;
-        devs.push(idx);
-    }
-    if devs.len() < 2 {
-        return Err(anyhow!(
-            "INFR_TENSOR_PARALLEL needs >=2 devices for a weight split (got '{spec}'); \
-             unset it to run single-device"
-        ));
-    }
-    Ok(Some(devs))
+    parse_device_list("INFR_TENSOR_PARALLEL", 2)
 }
 
 /// The tensor-parallel device role of a weight (by GGUF tensor name), plus its INNER dim `in_f` (for
@@ -1481,7 +1626,13 @@ fn tensor_parallel_binder<'a>(
 ) -> Box<BindWeight<'a>> {
     let world = tp.world();
     Box::new(move |name: &str, tb: WBytes, dt: DType, numel: usize| {
-        check_bda_element_cap(name, "tensor", numel)?;
+        // lm_head / embedding tables (issue #77) are read only by dispatch-chunked ops, so they may
+        // legitimately exceed the u32 element cap — mirror the resident/EP binders and exempt them
+        // (they are replicated below, never sharded, so the whole-tensor cap would wrongly reject a
+        // large/quantized-vocab lm_head that runs fine single-device/EP).
+        if !chunk_covered_dense_tensor(name) {
+            check_bda_element_cap(name, "tensor", numel)?;
+        }
         match tp_weight_role(name, cfg) {
             Some((role, in_f)) => {
                 let mut bufs = Vec::with_capacity(world);
@@ -1538,35 +1689,8 @@ pub(crate) fn generate_dense_vulkan_tp(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    if cfg.moe.is_some() {
-        return Err(anyhow!(
-            "INFR_TENSOR_PARALLEL supports dense models only; this is an MoE model (expert \
-             parallelism is a separate slice)"
-        ));
-    }
-    if cfg.qwen35 {
-        return Err(anyhow!(
-            "INFR_TENSOR_PARALLEL does not support qwen35 (DeltaNet recurrent-state sharding is a \
-             separate slice)"
-        ));
-    }
-    if cfg.n_embd_per_layer > 0 {
-        return Err(anyhow!(
-            "INFR_TENSOR_PARALLEL does not support gemma E2B per-layer embeddings"
-        ));
-    }
-    if cfg.diffusion_gemma {
-        return Err(anyhow!(
-            "INFR_TENSOR_PARALLEL does not support diffusion-gemma"
-        ));
-    }
-    let mut backends = Vec::with_capacity(devices.len());
-    for &idx in devices {
-        backends.push(
-            infr_vulkan::VulkanBackend::new_on(idx)
-                .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
-        );
-    }
+    dense_multi_gpu_guard(cfg, "INFR_TENSOR_PARALLEL")?;
+    let backends = open_vulkan_devices(devices)?;
     let names = backends
         .iter()
         .map(|b| {
@@ -1598,25 +1722,8 @@ pub(crate) fn generate_dense_vulkan_tp(
         );
     }
     let bind = tensor_parallel_binder(&tp, cfg);
-    generate_dense_backend(
-        &tp,
-        &*bind,
-        g,
-        cfg,
-        token_embd,
-        ple,
-        prompt,
-        max_new,
-        on_token,
-        &mut None,
-        prompt.len() + max_new + 1,
-        None, // constraint
-        None, // verify
-        None, // verify_ids
-        None, // logits_out
-        None, // h_out
-        None, // denoise_req
-        None, // req
+    run_dense_oneshot(
+        &tp, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token,
     )
 }
 
@@ -1628,27 +1735,7 @@ pub(crate) fn generate_dense_vulkan_tp(
 /// or `None` when unset. Sibling of [`parse_tensor_parallel_devices`]; needs >=2 devices for a real
 /// expert split (a single device is the identity, used only as the correctness reference).
 pub fn parse_expert_parallel_devices() -> AResult<Option<Vec<usize>>> {
-    let Some(spec) = std::env::var_os("INFR_EXPERT_PARALLEL") else {
-        return Ok(None);
-    };
-    let spec = spec.to_string_lossy();
-    let mut devs = Vec::new();
-    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let idx = part
-            .strip_prefix("Vulkan")
-            .unwrap_or(part)
-            .parse::<usize>()
-            .map_err(|_| {
-                anyhow!("INFR_EXPERT_PARALLEL: '{part}' is not VulkanN or a device index")
-            })?;
-        devs.push(idx);
-    }
-    if devs.is_empty() {
-        return Err(anyhow!(
-            "INFR_EXPERT_PARALLEL='{spec}' lists no devices; unset it to run single-device"
-        ));
-    }
-    Ok(Some(devs))
+    parse_device_list("INFR_EXPERT_PARALLEL", 1)
 }
 
 /// Whether `name` is a stacked expert-bank weight (`ffn_{gate,up,down}_exps` or fused
@@ -1779,13 +1866,7 @@ pub(crate) fn generate_moe_vulkan_ep(
             "INFR_EXPERT_PARALLEL does not support diffusion-gemma"
         ));
     }
-    let mut backends = Vec::with_capacity(devices.len());
-    for &idx in devices {
-        backends.push(
-            infr_vulkan::VulkanBackend::new_on(idx)
-                .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
-        );
-    }
+    let backends = open_vulkan_devices(devices)?;
     let names = backends
         .iter()
         .map(|b| {
@@ -1813,25 +1894,8 @@ pub(crate) fn generate_moe_vulkan_ep(
         );
     }
     let bind = expert_parallel_binder(&ep, cfg);
-    generate_dense_backend(
-        &ep,
-        &*bind,
-        g,
-        cfg,
-        token_embd,
-        ple,
-        prompt,
-        max_new,
-        on_token,
-        &mut None,
-        prompt.len() + max_new + 1,
-        None, // constraint
-        None, // verify
-        None, // verify_ids
-        None, // logits_out
-        None, // h_out
-        None, // denoise_req
-        None, // req
+    run_dense_oneshot(
+        &ep, &*bind, g, cfg, token_embd, ple, prompt, max_new, on_token,
     )
 }
 
@@ -1890,13 +1954,7 @@ pub(crate) fn generate_dense_metal_session(
 ) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_backend(
         mtl,
-        &|_name, tb, dt, _n| {
-            let buf = mtl
-                .alloc(tb.len().max(1), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            mtl.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
-            Ok((buf, dt))
-        },
+        &metal_upload_bind(mtl),
         g,
         cfg,
         token_embd,
@@ -1937,13 +1995,7 @@ pub(crate) fn verify_dense_metal2(
     let mut logits = Vec::new();
     let (_, stats) = generate_dense_backend(
         mtl,
-        &|_name, tb, dt, _n| {
-            let buf = mtl
-                .alloc(tb.len().max(1), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            mtl.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
-            Ok((buf, dt))
-        },
+        &metal_upload_bind(mtl),
         g,
         cfg,
         token_embd,
@@ -1981,18 +2033,7 @@ pub(crate) fn verify_dense_cpu(
     let mut state = None;
     generate_dense_backend(
         &cpu_be,
-        &|_name, tb, dt, _n| match tb {
-            WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
-            WBytes::Owned(v) => {
-                let buf = cpu_be
-                    .alloc(v.len().max(1), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                cpu_be
-                    .upload(buf.as_ref(), &v)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok((buf, dt))
-            }
-        },
+        &cpu_upload_bind(&cpu_be),
         g,
         cfg,
         token_embd,
@@ -2031,18 +2072,7 @@ pub(crate) fn verify_dense_cpu_with_h(
     let mut state = None;
     generate_dense_backend(
         &cpu_be,
-        &|_name, tb, dt, _n| match tb {
-            WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
-            WBytes::Owned(v) => {
-                let buf = cpu_be
-                    .alloc(v.len().max(1), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                cpu_be
-                    .upload(buf.as_ref(), &v)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok((buf, dt))
-            }
-        },
+        &cpu_upload_bind(&cpu_be),
         g,
         cfg,
         token_embd,
@@ -2083,18 +2113,7 @@ pub(crate) fn verify_rows_cpu_with_h(
     let mut state = None;
     generate_dense_backend(
         &cpu_be,
-        &|_name, tb, dt, _n| match tb {
-            WBytes::Mmap(tb) => Ok((cpu_be.map_weight(tb), dt)),
-            WBytes::Owned(v) => {
-                let buf = cpu_be
-                    .alloc(v.len().max(1), BufferUsage::Weights)
-                    .map_err(|e| anyhow!("{e}"))?;
-                cpu_be
-                    .upload(buf.as_ref(), &v)
-                    .map_err(|e| anyhow!("{e}"))?;
-                Ok((buf, dt))
-            }
-        },
+        &cpu_upload_bind(&cpu_be),
         g,
         cfg,
         token_embd,
@@ -2171,7 +2190,6 @@ pub(crate) enum WBytes {
     Owned(Vec<u8>),
 }
 
-#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl std::ops::Deref for WBytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
@@ -2346,5 +2364,97 @@ mod bda_cap_tests {
             whole / n_expert,
         )
         .expect("resident expert bank per-slice must pass");
+    }
+
+    #[test]
+    fn tp_pipeline_cap_exempts_chunk_covered_enforces_others() {
+        // The TP and pipeline binders now gate the whole-tensor cap on `!chunk_covered_dense_tensor`
+        // (mirroring EP/resident) — model that exact decision: a >= 2^32-element lm_head / embedding
+        // table is EXEMPT (dispatch-chunked reads), a normal huge non-chunk-covered tensor is caught.
+        let over_cap = BDA_ELEMENT_UNIT_MAX + 1;
+        for chunked in [
+            "output.weight",
+            "token_embd.weight",
+            "per_layer_token_embd.weight",
+        ] {
+            assert!(chunk_covered_dense_tensor(chunked));
+            // The binder's gate: `if !chunk_covered_dense_tensor(name) { check_bda_element_cap(..) }`
+            // — chunk-covered means the cap is SKIPPED, so an over-cap table binds fine.
+            if !chunk_covered_dense_tensor(chunked) {
+                check_bda_element_cap(chunked, "tensor", over_cap).expect("unreachable");
+            }
+        }
+        // A normal (non-chunk-covered) tensor over the cap is still rejected loudly under both.
+        assert!(!chunk_covered_dense_tensor("blk.0.attn_q.weight"));
+        assert!(check_bda_element_cap("blk.0.attn_q.weight", "tensor", over_cap).is_err());
+    }
+}
+
+#[cfg(test)]
+mod seam_helper_tests {
+    use super::{kv_pair_bytes, parse_device_spec, PlacementPins, PlacementScope};
+
+    #[test]
+    fn parse_device_spec_accepts_vulkan_and_bare_indices() {
+        assert_eq!(
+            parse_device_spec("Vulkan0,Vulkan1", 2, "INFR_TP").unwrap(),
+            vec![0, 1]
+        );
+        // Bare indices and whitespace/empty segments are tolerated.
+        assert_eq!(
+            parse_device_spec(" 0 , 1 ,2, ", 1, "INFR_TP").unwrap(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn parse_device_spec_rejects_garbage_and_too_few() {
+        // Non-numeric / non-VulkanN part.
+        assert!(parse_device_spec("Vulkan0,foo", 2, "INFR_TP").is_err());
+        // Fewer than `min` devices.
+        assert!(parse_device_spec("Vulkan0", 2, "INFR_TP").is_err());
+        assert!(parse_device_spec("", 1, "INFR_EP").is_err());
+        // Exactly `min` passes.
+        assert!(parse_device_spec("Vulkan3", 1, "INFR_EP").is_ok());
+    }
+
+    #[test]
+    fn kv_pair_bytes_honors_q8_flag() {
+        // q8 prices K+V at ~half the f16 bytes (34 B / 32-elem block vs 2 B/elem, ×2 sides).
+        let elems = 32_000u64;
+        let f16 = kv_pair_bytes(elems, false);
+        let q8 = kv_pair_bytes(elems, true);
+        assert_eq!(f16, 2 * 2 * elems); // 128_000
+        assert_eq!(q8, 2 * (elems / 32 * 34)); // 68_000, already u32-aligned
+        assert!(
+            q8 < f16 && q8 * 2 > f16,
+            "q8 must be ~half of f16, not equal"
+        );
+    }
+
+    #[test]
+    fn placement_pins_are_per_scope_not_process_global() {
+        // The multi-model fix: two independent sessions' pins are isolated. Session A pins a chunk
+        // and q8; inside A's scope the readers see them, and OUTSIDE any scope (or in a fresh
+        // session B's scope) they are unset — the old process-global `OnceLock` leaked A's decision
+        // into B (a silent no-op `.set()`).
+        let a = std::sync::Arc::new(PlacementPins::default());
+        let b = std::sync::Arc::new(PlacementPins::default());
+        {
+            let _sa = PlacementScope::enter(a.clone());
+            super::pin_ubatch(512);
+            super::pin_kv_auto_q8();
+            assert!(super::kv_auto_q8(), "A's scope sees its own q8 pin");
+            assert_eq!(a.ubatch.get().copied(), Some(512));
+        }
+        {
+            let _sb = PlacementScope::enter(b.clone());
+            assert!(!super::kv_auto_q8(), "B must NOT inherit A's q8 pin");
+            assert_eq!(
+                b.ubatch.get().copied(),
+                None,
+                "B must NOT inherit A's chunk"
+            );
+        }
     }
 }

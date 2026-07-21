@@ -64,6 +64,11 @@ pub struct DenseVulkanSession {
     vk: infr_vulkan::VulkanBackend,
     pool: SlotPool,
     max_ctx: usize,
+    /// This session's OWN placement pins (see [`crate::seam::PlacementPins`]): per-session so a
+    /// multi-model process never leaks one model's pinned chunk / auto-q8 decision into another.
+    /// Entered as the current [`crate::seam::PlacementScope`] around the default-ctx clamp (at
+    /// construction) and every generation.
+    pins: std::sync::Arc<crate::seam::PlacementPins>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -327,6 +332,7 @@ impl SeamModel {
             vk,
             pool: SlotPool::new(),
             max_ctx,
+            pins: std::sync::Arc::new(crate::seam::PlacementPins::default()),
         })
     }
 
@@ -346,11 +352,17 @@ impl SeamModel {
     /// to the iGPU's memory, independent of the discrete card's.
     pub fn vulkan_session_default_on(&self, dev: Option<usize>) -> Result<DenseVulkanSession> {
         let vk = open_backend(dev)?;
+        // The clamp's auto-q8 rung may pin this session's KV format — do it under THIS session's
+        // placement scope so the decision lands on its own pins, not a process-global cell.
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = self.clamp_default_ctx(&vk, self.cfg.n_ctx_train);
+        drop(scope);
         Ok(DenseVulkanSession {
             vk,
             pool: SlotPool::new(),
             max_ctx,
+            pins,
         })
     }
 
@@ -372,14 +384,18 @@ impl SeamModel {
         frac: f64,
     ) -> Result<DenseVulkanSession> {
         let vk = open_backend(dev)?;
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        let scope = crate::seam::PlacementScope::enter(pins.clone());
         // A pure recurrent-state arch has no per-token KV to size a fraction of — fall back to
         // the trained context (same shape as the default path's `kv_per_tok == 0` escape).
         let fit = self.kv_fit_ctx(&vk).unwrap_or(self.cfg.n_ctx_train);
+        drop(scope);
         let max_ctx = ((fit as f64 * frac) as usize).max(1024);
         Ok(DenseVulkanSession {
             vk,
             pool: SlotPool::new(),
             max_ctx,
+            pins,
         })
     }
 
@@ -395,7 +411,7 @@ impl SeamModel {
             return want; // pure recurrent-state arch: no per-token KV to size.
         };
         if fit < want {
-            // Auto-q8 KV rung, clamp flavor (see `crate::seam::PINNED_KV_Q8` for the policy):
+            // Auto-q8 KV rung, clamp flavor (see `crate::seam::PlacementPins` for the policy):
             // before shrinking the DEFAULT context below the trained window, try a Q8_0 KV
             // cache — roughly half the bytes per token. Only a FULL rescue pins q8 (fit at q8
             // reaches `want`); a partial rescue keeps the predictable f16 cache and clamps as
@@ -586,6 +602,9 @@ impl SeamModel {
         // token. EOS ends almost every reply long before this cap; an over-long PROMPT still
         // errors cleanly in the runner (its `prompt + gen + 1 > max_ctx` guard stays).
         let max_new = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        // Resolve `ubatch_rows`/`kv_auto_q8` against THIS session's pins (warm calls must agree
+        // with the buffers placement sized) — never a process-global cell shared across models.
+        let _scope = crate::seam::PlacementScope::enter(session.pins.clone());
         let (_generated, stats) = crate::seam::generate_dense_vulkan_session(
             &session.vk,
             &self.gguf,
@@ -619,9 +638,9 @@ impl SeamModel {
     ///
     /// Lazy on purpose: the Vulkan/Metal dense path uploads `token_embd.weight` to the device in
     /// its native dtype and never calls this, so it must not pay the dequant (~4s / ~3.1 GiB on
-    /// Qwen3-14B). `Config::from_gguf` validated the tensor exists at load, so the dequant here
-    /// can only fail on a corrupt/truncated file.
-    pub fn token_embd(&self) -> &[f32] {
+    /// Qwen3-14B). `Config::from_gguf` validated the tensor exists at load; a truncated/corrupt file
+    /// can still fail the dequant here, so this is FALLIBLE (see [`crate::seam::TokenEmbd::get`]).
+    pub fn token_embd(&self) -> Result<&[f32]> {
         self.embd().get()
     }
 
@@ -810,6 +829,7 @@ impl SeamModel {
             be: vk,
             state: None,
             max_ctx,
+            pins: std::sync::Arc::new(crate::seam::PlacementPins::default()),
         })
     }
 
@@ -1574,6 +1594,9 @@ pub struct DiffusionGemmaVulkanSession {
     be: infr_vulkan::VulkanBackend,
     state: Option<crate::seam::SeamKv>,
     max_ctx: usize,
+    /// This session's OWN placement pins (see [`crate::seam::PlacementPins`]) — DG binds through
+    /// the shared `vulkan_moe_binder`, so its placement decisions must stay per-session too.
+    pins: std::sync::Arc<crate::seam::PlacementPins>,
 }
 
 /// [`DiffusionGemmaVulkanSession`]'s Metal twin (Phase D — see
@@ -1696,6 +1719,7 @@ impl DiffusionGemmaVulkanSession {
     /// `ffn_gate_up_exps` bank pages under `Role::Gate` and its mixed Q5_0/Q8_0 down banks split
     /// into per-byte-size pools (see `infr_vulkan::pager`'s MoE-session doc).
     pub fn prefill(&mut self, model: &SeamModel, tokens: &[u32]) -> Result<()> {
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         let bind = crate::seam::vulkan_moe_binder(
             &self.be,
             &model.gguf,
@@ -1750,6 +1774,7 @@ impl DiffusionGemmaVulkanSession {
     ) -> Result<crate::seam::DenoiseOutcome> {
         let mut out_logits = Vec::new();
         let mut reduced = None;
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         // The shared placement-aware binder (see `prefill`): only ever CALLED when this denoise
         // is the session's first load (no prior `prefill` — a direct-denoise test), where it must
         // make the same placement decision prefill would have.

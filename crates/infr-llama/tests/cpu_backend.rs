@@ -1425,7 +1425,7 @@ fn prime_head<'a>(
         g,
         model.config(),
         head,
-        model.token_embd(),
+        model.token_embd().unwrap(),
         max_ctx,
     )
     .expect("MtpHeadSession::new_cpu");
@@ -1533,7 +1533,7 @@ fn mtp_head_cpu_vulkan_parity() {
         &g,
         model.config(),
         &head,
-        model.token_embd(),
+        model.token_embd().unwrap(),
         max_ctx,
     )
     .expect("MtpHeadSession::new_vulkan");
@@ -1591,7 +1591,7 @@ fn mtp_draft_chain_matches_per_step() {
         &g,
         model.config(),
         &head,
-        model.token_embd(),
+        model.token_embd().unwrap(),
         max_ctx,
     )
     .expect("MtpHeadSession::new_vulkan");

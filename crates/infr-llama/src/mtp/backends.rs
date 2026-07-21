@@ -139,7 +139,7 @@ pub fn generate_mtp_spec_vulkan_timed_on(
         Ok((buf, dt))
     };
     let mut head_sess =
-        MtpHeadSession::new_vulkan(vk, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
+        MtpHeadSession::new_vulkan(vk, model.gguf(), cfg, head, model.token_embd()?, max_ctx)?;
     generate_mtp_spec_core(
         vk,
         bind,
@@ -174,7 +174,7 @@ pub fn generate_mtp_spec_metal_timed(
         Ok((buf, dt))
     };
     let mut head_sess =
-        MtpHeadSession::new_metal(&mtl, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
+        MtpHeadSession::new_metal(&mtl, model.gguf(), cfg, head, model.token_embd()?, max_ctx)?;
     generate_mtp_spec_core(
         &mtl,
         bind,
@@ -212,7 +212,7 @@ pub fn generate_mtp_spec_cpu_timed(
         }
     };
     let mut head_sess =
-        MtpHeadSession::new_cpu(&cpu, model.gguf(), cfg, head, model.token_embd(), max_ctx)?;
+        MtpHeadSession::new_cpu(&cpu, model.gguf(), cfg, head, model.token_embd()?, max_ctx)?;
     generate_mtp_spec_core(
         &cpu,
         bind,

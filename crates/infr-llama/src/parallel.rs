@@ -118,6 +118,12 @@ pub struct ParallelSeam {
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
     max_ctx: usize,
+    /// This model's OWN placement pins (pinned prefill chunk / auto-q8 KV — see
+    /// [`crate::seam::PlacementPins`]). Per-engine so a multi-model host (`infr multi` runs N of
+    /// these concurrently) never leaks one model's ladder decision to another. Entered as the
+    /// current [`crate::seam::PlacementScope`] around placement (construction/warmup) and every
+    /// request's decode; concurrent requests on THIS engine all point at this one shared cell.
+    pins: Arc<crate::seam::PlacementPins>,
 }
 
 impl ParallelSeam {
@@ -151,6 +157,11 @@ impl ParallelSeam {
                 .map_err(|e| anyhow!("vulkan init (Vulkan{idx}): {e}"))?,
             None => infr_vulkan::VulkanBackend::new().map_err(|e| anyhow!("vulkan init: {e}"))?,
         };
+        // This engine's own placement pins, entered as the current scope for the whole
+        // placement phase (the clamp inside `vulkan_slot_ctx` + the `init_slots` warmup, which is
+        // where the binder pins the prefill chunk / auto-q8 KV). See `PlacementPins`.
+        let pins = Arc::new(crate::seam::PlacementPins::default());
+        let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx);
         let mut engine = Self {
             model,
@@ -164,8 +175,10 @@ impl ParallelSeam {
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
             max_ctx,
+            pins,
         };
         engine.init_slots(n_slots)?;
+        drop(scope);
         Ok(engine)
     }
 
@@ -393,6 +406,9 @@ impl ParallelSeam {
         let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
+        // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls
+        // must agree with the buffers placement sized). Concurrent requests share the one cell.
+        let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         let (_ids, stats) = crate::seam::generate_dense_vulkan_session(
             &self.vk,
             self.model.gguf(),

@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **109** — 0 🔴, 18 🟠, 91 🟡.
+- **Remaining open:** **102** — 0 🔴, 16 🟠, 86 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -122,6 +122,19 @@ parked path).
   `embed_scale==1`; `bind_layer_io` de-duplicates all 5 KV+ weight bind sites.
   _Deferred:_ the `build` 11-positional-bool param-soup (a call-site-wide
   refactor with a transposed-arg risk, zero correctness gain).
+- **`infr-llama` seam/mod (all 7 findings)** — TDD, +5 tests. TP/pipeline
+  binders exempt `chunk_covered_dense_tensor` (`lm_head`/`token_embd`) from the
+  BDA element cap (a large-vocab model no longer hard-rejects under
+  `INFR_TENSOR_PARALLEL`/`INFR_PIPELINE`); the process-global `PINNED_UBATCH`/
+  `PINNED_KV_Q8` `OnceLock`s become per-session `PlacementPins` via a
+  thread-scoped RAII guard (multi-model `infr multi` no longer leaks model A's
+  chunk-height/q8 decision to model B; single-model falls back to the old
+  behavior byte-identically); MoE KV placement estimate honors auto-q8;
+  `TokenEmbd::get` is fallible (corrupt GGUF → error, not `.expect()`); warm
+  sessions skip the unused `vulkan_moe_binder`; a fn-instrument macro is removed
+  from an `impl Deref`; and `parse_device_list` / `run_dense_oneshot` /
+  `dense_multi_gpu_guard` / `cpu_upload_bind`/`metal_upload_bind` de-duplicate
+  the multi-GPU + backend-bind boilerplate.
 
 ### Highest-priority (production default paths)
 
@@ -140,12 +153,14 @@ parked path).
 | ~~11~~ | ✅  | `infr-cli main.rs`                    | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).                         |
 | 12     | 🟠  | `infr-metal exec.rs:2836`             | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode).              |
 
-Other 🟠 majors span host-hot-path churn (recorder per-dispatch `env::var` +
-`Vec` allocs; adapter MoE `counts` double-zero), prefill perf (`gemm_proj`
-uncoalesced + non-saddr weight reads), resource leaks (`lib.rs` device/instance
-on error paths), `seam/mod` (large-vocab lm_head rejected under TP/pipeline;
-process-global model pins), and the gated multi-GPU / parked-MTP features (kept
-lower-urgency, flagged as such). Full detail per module below.
+The remaining 🟠 majors are all in **infr-vulkan** and **infr-metal**:
+host-hot-path churn (recorder per-dispatch `env::var` + `Vec` allocs; adapter
+MoE `counts` double-zero), prefill perf (`gemm_proj` uncoalesced + non-saddr
+weight reads), the vulkan `lib.rs` device/instance leak on error paths, the
+shader correctness items (`attn_combine wexp`, `dg_eb_sample` argmax tie-break),
+the `ops.rs` kernel-cache leak, the metal `Op::Rope` replay bug, plus the gated
+multi-GPU / parked-MTP features (kept lower-urgency, flagged as such). Full
+detail per module below.
 
 ### Cross-cutting themes
 
@@ -600,54 +615,6 @@ weighted highest._
    embarrassingly-parallel `fill[]=0` reset into the 1-lane scan kernel, forcing
    the scatter pass to wait on the scan for a zero it doesn't depend on — split
    the reset out (parallel clear / `vkCmdFillBuffer`).
-
-## infr-llama/src/seam/mod.rs
-
-1. **🟠
-   `mod.rs:1484,1237 — TP and pipeline binders apply the whole-tensor BDA element cap to `lm_head`/`token_embd`,
-   which the resident + EP binders deliberately exempt.**
-   `chunk_covered_dense_tensor` (1178) and `expert_parallel_binder` (1714) skip
-   `check_bda_element_cap` for `output.weight`/`token_embd.weight` (read only by
-   dispatch-chunked ops, #77, may exceed 2³² elems — "quantized 256k-vocab
-   lm*head"), but `tensor_parallel_binder` (1484) / `pipeline_binder` (1237)
-   call it unconditionally on the full `numel` before replication → a
-   large-vocab model that runs single-device/EP is hard-rejected under
-   `INFR_TENSOR_PARALLEL`/ `INFR_PIPELINE`. \_Fix:* mirror EP — exempt
-   `chunk_covered_dense_tensor(name)`.
-2. **🟠
-   `mod.rs:327,345 — process-wide `PINNED_UBATCH`/`PINNED_KV_Q8` `OnceLock`s
-   leak placement decisions across models in a multi-model process.** Set once
-   per process on first-load placement; a second model's `.set()` is a silent
-   no-op, so `ubatch_rows()`/`kv_auto_q8()` (+ runner KV sizing) apply model A's
-   pinned chunk height / q8 decision to model B — may not fit B's VRAM or forces
-   unwanted q8 KV. The "set once" invariant is per-model but the storage is
-   global (the multi-model serve path is real). _Fix:_ move the pins into
-   per-session state (`SeamKv`/ `SeamModel`), or key/reset per model load.
-3. **🟡 `mod.rs:553 — MoE expert-placement KV estimate hard-codes f16 (`*2*2`)
-   even when auto-q8 KV is pinned** (the dense path honors `kv_auto_q8` via
-   `kv_total_at`, MoE doesn't) → over-reserves ~2×, potentially forcing
-   avoidable expert paging. Safe direction, wastes residency. _Fix:_ route MoE
-   `kv_bytes` through the `kv_auto_q8`-aware helper.
-4. **🟡 `mod.rs:59 — `TokenEmbd::get` `.expect()`s on a truncated/corrupt GGUF
-   at inference time** (returns `&[f32]`, can't surface an error) — a real
-   non-programmer input aborts the process, lazily on first host gather. _Fix:_
-   validate/dequant at load, or make `get` fallible.
-5. **🟡
-   `mod.rs:183 — warm `generate_dense_vulkan_session`still builds a full`vulkan_moe_binder`
-   Box the runner never invokes** (weights already resident, 622-630) —
-   per-warm-turn alloc + `cache_override`/env re-reads, pure waste. _Fix:_ skip
-   binder construction when `state.is_some()`.
-6. **🟡 `mod.rs:2174 — `#[cfg_attr(infr_profile,
-   infr_prof::instrument)]`on an`impl Deref`block, not a`fn`** — a
-   function-instrumentation macro on a trivially-hot `deref` (every weight
-   bind): dead at best, a profiling-build hazard at worst. _Fix:_ remove it.
-7. **🟡 DRY — `mod.rs:1206/1361/1630` three byte-identical `parse_*_devices`
-   (`VulkanN` parse, differ only in env name/error/min-check);
-   `mod.rs:1261/1531/ 1743` four multi-GPU `generate_*` wrappers duplicate the
-   arch guards + backend construction + the 8-`None` `generate_dense_backend`
-   tail; `mod.rs:95/1893` the CPU/Metal upload-binder closure copied across 4/3
-   sites.** _Fix:_ `parse_device_list(env,min,label)`, `run_dense_oneshot(...)`,
-   and `cpu_bind`/`metal_bind` constructors.
 
 ## infr-llama/src/seam/{model,weights,sc}.rs
 

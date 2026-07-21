@@ -451,7 +451,7 @@ pub(crate) fn generate_dense_backend(
             Some("f16") | Some("F16") => DType::F16,
             // unset/unknown → legacy INFR_KV_Q8 alias (both sides q8) or f16.
             _ if std::env::var("INFR_KV_Q8").is_ok() && kv_align_ok && kv_q8_backend => DType::Q8_0,
-            // Placement-pinned auto-q8 (see `crate::seam::PINNED_KV_Q8`): the Vulkan placement
+            // Placement-pinned auto-q8 (see `crate::seam::PlacementPins`): the Vulkan placement
             // chose a q8 cache to stay resident / keep the default ctx. Vulkan-gated — the pin
             // is a Vulkan placement decision and must not leak into a CPU/Metal session (e.g.
             // the CPU oracle of a parity test) running in the same process. The pin is only ever
@@ -2976,7 +2976,7 @@ pub(crate) fn generate_dense_backend(
         // instead (see `build`'s SC subgraph); on CPU it's completed below exactly as Phase A.
         let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let mut hidden_host: Vec<f32> = Vec::with_capacity(cc * ne);
-        let token_embd = token_embd.get(); // host embed gather → materialize the table
+        let token_embd = token_embd.get()?; // host embed gather → materialize the table
         for &tok in canvas {
             let base = tok as usize * ne;
             hidden_host.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
@@ -3333,7 +3333,7 @@ pub(crate) fn generate_dense_backend(
         let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
         let mut vf_hidden: Vec<f32> = Vec::with_capacity(m * ne);
-        let token_embd = token_embd.get(); // host embed gather → materialize the table
+        let token_embd = token_embd.get()?; // host embed gather → materialize the table
         for &tok in &prompt[start..] {
             let base = tok as usize * ne;
             vf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * vf_scale));
@@ -3621,7 +3621,7 @@ pub(crate) fn generate_dense_backend(
                 b
             } else {
                 let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
-                let token_embd = token_embd.get(); // host embed gather → materialize the table
+                let token_embd = token_embd.get()?; // host embed gather → materialize the table
                 for &tok in &prompt[cstart..cend] {
                     let base = tok as usize * ne;
                     pf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
@@ -3977,7 +3977,7 @@ pub(crate) fn generate_dense_backend(
             // embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
             // table slice is already the row to upload — hand it straight to the backend rather
             // than allocating a throwaway `Vec<f32>` per token to copy it.
-            let row = &token_embd.get()[tok * ne..tok * ne + ne];
+            let row = &token_embd.get()?[tok * ne..tok * ne + ne];
             if embed_scale == 1.0 {
                 be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
                     .map_err(|e| anyhow!("{e}"))?;

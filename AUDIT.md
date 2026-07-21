@@ -22,11 +22,10 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **51** — 0 🔴, 8 🟠, 43 🟡. (3 findings are explicitly
-  **deferred**, not open work: the 🟠 `make_compute_kernel` OOM→Result, a 🟡
-  shader-pair DRY merge, and a 🟡 `attn_combine` subgroup-reduce/flash-refactor
-  — each risks the byte-identity gate or the recorded stream; see their
-  sections.)
+- **Remaining open:** **44** — 0 🔴, 6 🟠, 38 🟡. (4 findings are explicitly
+  **deferred**, not open work: the 🟠 `make_compute_kernel` OOM→Result and three
+  🟡 shader/dp4a DRY refactors — each risks the byte-identity gate or the
+  recorded stream; see their sections.)
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -227,17 +226,22 @@ parked path).
 - **`infr-vulkan` attention/flash shaders (7 of 8; #7 deferred)** — **gpu_seam
   verified** (flash stage/warp/coopmat/matches-cpu + kv*addr + kv_q8 goldens
   pass, run serially). The direct `coopMatLoad` K/V over-read past `kv_len` is
-  made SAFE by tightening the host `flash_geom` gate to
-  `kv_len.div_ceil(64)*64 <= att_cap_rows` (a non-ring KV cache allocates
-  non-64-aligned rows; flash reads 64-aligned tiles) — the masked over-read
-  columns contribute nothing; `attn_flash.comp` documents the mpad precondition
-  (keeps writing all BM rows to stay bit-identical with the staged/split-K paths
-  — a store guard there was reverted after it broke the STAGE==direct golden);
-  host debug-asserts guard `attn_pv` `tilesN`, `attn_combine` `ntile`, and
-  `attn_partial_mrows` `chunk`; `quant_kv` Q5_1 gets the `clamp(0,31)` (never
-  triggers); dead `MAXS` removed. \_Pre-existing note:* the flash parity LIB
-  tests race on process-global `INFR_FLASH_*` env under parallel cargo threads —
-  pass with `--test-threads=1`.
+  made SAFE by tightening the host `flash_geom` gate to `kv_len.div_ceil(64)*64
+  <=
+  att*cap_rows`(a non-ring KV cache allocates non-64-aligned rows; flash reads 64-aligned tiles) — the masked over-read columns contribute nothing;`attn_flash.comp`documents the mpad precondition (keeps writing all BM rows to stay bit-identical with the staged/split-K paths — a store guard there was reverted after it broke the STAGE==direct golden); host debug-asserts guard`attn_pv` `tilesN`, `attn_combine` `ntile`, and `attn_partial_mrows` `chunk`; `quant_kv`Q5_1 gets the`clamp(0,31)`(never triggers); dead`MAXS`removed. \_Pre-existing note:* the flash parity LIB tests race on process-global`INFR_FLASH*\*`env under parallel cargo threads — pass with`--test-threads=1`.
+- **`infr-vulkan` GEMM/GEMV shaders (7 of 8; #6 dp4a DRY deferred)** —
+  **gpu_seam byte-identity verified** (`weight_addr`/`gemm_proj` 28,
+  `sample_topk`, MoE-mmq, `nc_gemm` all match host). `gemm_proj.comp` now stages
+  weights k-inner (coalesced global loads) and reads the arena through
+  `native_weight_addr.glsl` so the compiler selects the scalar-base **saddr**
+  `global_load` instead of the divergent-index 64-bit deref (the documented
+  ~2.2× streamed regressor) — both bit-verified identical; the padded-C store
+  contract is documented (all callers pad); `native_gemv_rm_v2` `reg_part` is
+  sized `THREADS/16` (was OOB under WG128) + dead `tot` gone;
+  `native_mmv_mrow`'s unused `part[]` is `#ifndef OUTS4`; `moe_sample` top-k
+  gather is two-pass so a threshold tie can't evict a strictly-greater logit;
+  and the superseded `gemm_dp4a`/`gemm_coopmat` probe kernels are removed
+  (grep-proven never dispatched).
 
 ### Highest-priority (production default paths)
 
@@ -256,14 +260,11 @@ parked path).
 | ~~11~~ | ✅  | `infr-cli main.rs`                 | ~~`--dev` can't override inherited backend env~~ — **FIXED** (clears siblings; unified precedence).            |
 | 12     | 🟠  | `infr-metal exec.rs:2836`          | `Op::Rope` snapshots positions on the replay tape → **frozen RoPE after token 0** (llama-family Metal decode). |
 
-The remaining 🟠 majors are all in **infr-vulkan** and **infr-metal**:
-host-hot-path churn (recorder per-dispatch `env::var` + `Vec` allocs; adapter
-MoE `counts` double-zero), prefill perf (`gemm_proj` uncoalesced + non-saddr
-weight reads), the vulkan `lib.rs` device/instance leak on error paths, the
-shader correctness items (`attn_combine wexp`, `dg_eb_sample` argmax tie-break),
-the `ops.rs` kernel-cache leak, the metal `Op::Rope` replay bug, plus the gated
-multi-GPU / parked-MTP features (kept lower-urgency, flagged as such). Full
-detail per module below.
+The 6 remaining 🟠 majors: the metal `Op::Rope` replay-tape bug (#12, the last
+open production major); the gated multi-GPU `p2p` `EXCLUSIVE` sharing + F32-only
+all-reduce; the parked-MTP `catch_up` off-by-one + wasted-logits; and the
+deferred `make_compute_kernel` OOM→Result. Everything else below is 🟡. Full
+detail per module.
 
 ### Cross-cutting themes
 
@@ -371,58 +372,17 @@ _7 of 8 findings fixed (see Resolved log); the one below is **DEFERRED**._
 
 ## infr-vulkan/shaders — GEMM / GEMV / MoE-expert matmul
 
-1. **🟠 `gemm_proj.comp:61-63 — f16-A projection GEMM stages weights with N as
-   the inner index → every warp's global loads stride by K (uncoalesced).**
-   Consecutive lanes read `wf((wgCol+cc)*k + (k0+r))` `k` elements apart → 32
-   cache lines/load. The large-warptile twin `gemm_proj_warp.comp:73`
-   deliberately swaps to k-inner ("k contiguous → coalesced"); this 64×64 kernel
-   never got the fix. _Fix:_ stage with k inner like the warp twin (adjust `Bs`
-   layout + `coopMatLoad`).
-2. **🟠 `gemm_proj.comp:28` (& `gemm_proj_warp.comp:39`) — arena weights read
-   via `#define WQ(i) ArenaW(w_ptr).v[i]`, the exact divergent-index-in-64-bit
-   deref that `native_weight_addr.glsl:35` documents as the ~2.2x streamed
-   regressor** (per-load `v_add_co`/`v_add_co_ci`, defeats ACO saddr scalar-base
-   `global_load`). Both f16 projection GEMMs use it instead of the
-   `arena_word`/byte-offset idiom the whole native path was rewritten to. _Fix:_
-   read through the `native_weight_addr.glsl` helpers so the loads select saddr
-   like the native twins.
-3. **🟡 `native_gemm.comp:87` — full 64-row tile stored unconditionally while A
-   staging guards `gr<pc.m`**; rows `[m, tileEnd)` are OOB `coopMatStore` writes
-   unless C is allocated `ceil(m/64)*64` rows (also the `qa`/`dact` reads at
-   `native_gemm_mmq_q8_0.comp:137,174`). The `gemm_proj.comp:6` header states
-   this padded-C contract; `native_gemm` relies on it silently. _Fix:_ document
-   it or guard the store rows against `pc.m` (as the `EXPERT_GRID` mmq path
-   does).
-4. **🟡 `native_gemv_rm_v2.comp:70` — `shared float reg_part[2]` overflows under
-   `-DVARIANT_REG -DVARIANT_WG128`** (128-thread wg = 4 wave32 subgroups →
-   writes idx 2,3 OOB); plus dead `tot` load + barrier at `128`. Env-gated
-   default-OFF tuning file. _Fix:_ size by `THREADS/minSubgroupSize` (`[8]`),
-   delete dead `tot`.
-5. **🟡 `native_mmv_mrow.comp:73` — `shared float part[…]` (512 B) declared
-   unconditionally but unused in the `-DOUTS4` build** (which reduces via
-   `part4`), needlessly cutting LDS-limited occupancy on the shape OUTS4
-   targets. _Fix:_ move `part` inside the non-OUTS4 branch.
-6. **🟡 DRY — int8 dp4a decode helpers copy-pasted across the mmv/mmq family.**
-   `rb`/`ru16`/`f16tof32`/`k4` + per-format `dpsub`/`wdec` re-declared in
-   `native_mmv.comp:43`, `native_mmv_mw.comp:62`, `native_mmv_id_q4k.comp:31`,
-   `native_mmv_mrow.comp:86` and each `native_gemm_mmq_*`; the `KV_IQ4NL_W`
-   table + `kv_iq4nl()` duplicated verbatim in ≥4 files. The dequant path
-   already funnels through shared `native_decode.glsl` — the dp4a path didn't
-   get the same treatment. _Fix:_ factor a shared `native_dp4a.glsl` (+ hoist
-   the IQ4NL table).
-7. **🟡 `moe_sample.comp:78` — top-k gather caps at `k` in nondeterministic
-   atomic order, so a threshold-key tie can evict a strictly-greater logit.**
-   Bit-exact `f2ui` ties give a strictly-greater logit `slot≥k` (discarded)
-   while an equal-to-threshold value fills a low slot → not the true top-k.
-   Rare + sampling-only, but nondeterministic. _Fix:_ min-replacement gather, or
-   gather all `≥thresh` then select top-k by value.
-8. **🟡 YAGNI — measurement/stub kernels shipped in the build set.**
-   `gemm_dp4a.comp` (self-described "RAW dp4a GEMM ceiling probe … no scales")
-   and `gemm_coopmat.comp` ("v1 … assumes M,N,K multiples of 16, partial-tile
-   handling added next") are superseded by `native_gemm_mmq_*`/`gemm_*_warp` yet
-   still compiled; likewise the whole default-OFF `native_gemv_rm_v2` variant
-   matrix (`build.rs:820`). _Fix:_ confirm none are dispatched and drop / gate
-   behind a dev-only build flag to shrink the pipeline set.
+_7 of 8 findings fixed (see Resolved log); the one below is **DEFERRED**._
+
+1. **🟡 DRY — the int8 dp4a decode helpers (`rb`/`ru16`/`f16tof32`/`k4` +
+   per-format `dpsub`/`wdec`) are copy-pasted across the `native_mmv*` +
+   `native_gemm_mmq_*` shaders; the `KV_IQ4NL_W` table duplicated ≥4×.**
+   _Deferred:_ the helper SETS differ per file (each activates exactly one
+   `FMT_*`; `k4` only in Q4K/Q5K, odd-stride readers only in some), spread
+   across ~15 mmq + 4 mmv shaders. A shared `native_dp4a.glsl` include would
+   have to reconcile those conditional blocks + add build.rs include wiring, and
+   any textual drift risks the compiled SPV on the byte-identity-critical
+   GEMM/MoE goldens.
 
 ## infr-vulkan/shaders — norm / rope / activation / sampling / MoE-routing / misc
 

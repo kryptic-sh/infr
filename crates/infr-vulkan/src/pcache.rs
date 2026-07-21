@@ -23,8 +23,9 @@
 //!   so this layer is defense-in-depth against a less careful driver, not a load-bearing fix for
 //!   any failure observed on RADV.)
 //!
-//! Writes are atomic AND durable: the payload is written to a per-pid temp file, `fsync`ed, then
-//! `rename`d over the target, and the directory entry is `fsync`ed too. `rename` alone is only
+//! Writes are atomic AND durable: the payload is written to a unique per-save temp file
+//! (`<cache>.tmp.<pid>.<seq>`, so two concurrent saves in one process never share a path), `fsync`ed,
+//! then `rename`d over the target, and the directory entry is `fsync`ed too. `rename` alone is only
 //! atomic with respect to a concurrent READER — on a crash/power-loss it can leave the new name
 //! pointing at an inode whose data blocks were never flushed (ext4 delayed allocation), i.e. a
 //! valid-looking file over garbage. The checksum above would catch that; the fsync keeps it from
@@ -56,18 +57,34 @@
 //! discards a perfectly good cache and costs one cold pipeline build. The asymmetry is total —
 //! the other mistake is an undebuggable GPU hang, so we take the recompile every time.
 //!
-//! Markers are PER-PID and a marker is only stale if its process is GONE, so a second `infr`
-//! running concurrently (a `serve` alongside a CLI run) is not mistaken for a crashed one.
+//! Markers are keyed PER-BACKEND-INSTANCE (`<cache>.seeded.<pid>-<nonce>`) and a marker is only
+//! stale if its PROCESS is GONE, so neither a second `infr` running concurrently (a `serve`
+//! alongside a CLI run) NOR a sibling backend in the same process (an MTP bench loop) is mistaken
+//! for a crashed one — and one backend's clean drop only disarms ITS OWN marker, never a live
+//! sibling's.
 //!
 //! `INFR_NO_PIPELINE_CACHE=1` disables persistence (the in-process cache handle still works).
 
 use ash::vk;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 include!(concat!(env!("OUT_DIR"), "/shader_fingerprint.rs"));
+
+/// Monotonic per-process sequence for save temp files (`<cache>.tmp.<pid>.<seq>`). Two threads
+/// saving concurrently (a `serve` compiling different kernels) must never write+rename the SAME
+/// temp path, or one's write/fsync races the other's rename → a torn write or a failed rename.
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic per-process sequence handed to each [`PcachePersist`] as its tripwire-marker nonce.
+/// Two backends built on the SAME device in ONE process (an `infr bench` MTP loop, a CPU/Vulkan
+/// parity run) must get DISTINCT markers: keying the marker by PID alone let the first backend's
+/// clean `disarm()` delete the shared marker while a sibling was still live, so a later unclean
+/// death then left a poisoned blob uncaught — the exact case the tripwire exists for.
+static PCACHE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Envelope version. Bumped from `INFRVPC1` when the payload checksum was added — an old file has
 /// no checksum field, and its `1` magic makes `load` reject it outright (one free recompile).
@@ -108,10 +125,13 @@ pub(crate) struct PcachePersist {
     /// considers valid-ish — undefined behavior, i.e. a hung ring, not an error. Cheap to check,
     /// so check it.
     cache_uuid: [u8; 16],
+    /// Per-backend-instance nonce (from [`PCACHE_NONCE`]) folded into this instance's tripwire
+    /// marker name so sibling backends in one process own DISTINCT markers — see the module doc.
+    nonce: u64,
     last_save: Mutex<Instant>,
 }
 
-/// Suffix for a tripwire marker: `<cache file>.seeded.<pid>`. See the module doc.
+/// Suffix for a tripwire marker: `<cache file>.seeded.<pid>-<nonce>`. See the module doc.
 const MARKER_EXT: &str = "seeded";
 
 /// Is `pid` still running? `kill(pid, 0)` delivers no signal and only asks the kernel whether the
@@ -145,14 +165,31 @@ impl PcachePersist {
             )),
             driver_version: props.driver_version,
             cache_uuid: props.pipeline_cache_uuid,
+            nonce: PCACHE_NONCE.fetch_add(1, Ordering::Relaxed),
             last_save: Mutex::new(Instant::now()),
         })
     }
 
-    /// This process's tripwire marker: `<cache file>.seeded.<pid>`.
+    /// This backend instance's tripwire marker: `<cache file>.seeded.<pid>-<nonce>`. The nonce
+    /// keeps sibling backends in one process from sharing (and prematurely disarming) one marker.
     fn marker(&self) -> PathBuf {
-        self.path
-            .with_extension(format!("{MARKER_EXT}.{}", std::process::id()))
+        self.path.with_extension(format!(
+            "{MARKER_EXT}.{}-{}",
+            std::process::id(),
+            self.nonce
+        ))
+    }
+
+    /// A UNIQUE temp path for one `save`: `<cache>.tmp.<pid>.<seq>`. The per-process [`SAVE_SEQ`]
+    /// makes two concurrent saves in one process write DISTINCT files, so neither clobbers the
+    /// other's in-flight bytes before its own rename. An associated fn (not a method) so the unit
+    /// test can assert distinct names without a full instance.
+    fn tmp_path(cache_path: &std::path::Path) -> PathBuf {
+        cache_path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// TRIPWIRE, step 3 (see the module doc): a marker left behind by a process that is GONE means
@@ -168,7 +205,7 @@ impl PcachePersist {
         let Some(stem) = self.path.file_name().and_then(|s| s.to_str()) else {
             return false;
         };
-        // `foo.bin` -> markers are `foo.seeded.<pid>` (with_extension replaces `.bin`).
+        // `foo.bin` -> markers are `foo.seeded.<pid>-<nonce>` (with_extension replaces `.bin`).
         let prefix = format!(
             "{}.{MARKER_EXT}.",
             stem.strip_suffix(".bin").unwrap_or(stem)
@@ -180,10 +217,12 @@ impl PcachePersist {
         for e in entries.flatten() {
             let name = e.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(pid) = name.strip_prefix(&prefix) else {
+            let Some(tag) = name.strip_prefix(&prefix) else {
                 continue;
             };
-            let Ok(pid) = pid.parse::<i32>() else {
+            // `<pid>-<nonce>`: the pid is what determines liveness; the nonce only distinguishes
+            // sibling backends of the same pid. (`split` also accepts a legacy bare `<pid>`.)
+            let Ok(pid) = tag.split('-').next().unwrap_or(tag).parse::<i32>() else {
                 continue;
             };
             if pid_alive(pid) {
@@ -275,9 +314,7 @@ impl PcachePersist {
         out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
         out.extend_from_slice(&fnv1a(&blob).to_le_bytes());
         out.extend_from_slice(&blob);
-        let tmp = self
-            .path
-            .with_extension(format!("tmp.{}", std::process::id()));
+        let tmp = Self::tmp_path(&self.path);
         if write_durable(&tmp, &out).is_ok() && std::fs::rename(&tmp, &self.path).is_ok() {
             // The rename itself is a directory metadata change: sync the directory so the new
             // entry survives a crash too (the payload it points at is already on disk).
@@ -363,6 +400,7 @@ mod tests {
             path: path.clone(),
             driver_version: 7,
             cache_uuid: UUID,
+            nonce: 0,
             last_save: Mutex::new(Instant::now()),
         };
         let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
@@ -453,6 +491,7 @@ mod tests {
             path: path.clone(),
             driver_version: 5,
             cache_uuid: UUID,
+            nonce: 0,
             last_save: Mutex::new(Instant::now()),
         };
         let payload: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
@@ -510,6 +549,73 @@ mod tests {
             "a run that lost the device discards the blob"
         );
         assert!(!p.marker().exists(), "and disarms its marker");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Finding #6: two saves in one process must use DISTINCT temp files, or a concurrent pair
+    /// (a `serve` compiling different kernels) torn-writes/failed-renames over each other.
+    #[test]
+    fn save_temp_paths_are_unique() {
+        let path = std::env::temp_dir().join("infr-pcache-tmp-uniq/cache.bin");
+        let a = PcachePersist::tmp_path(&path);
+        let b = PcachePersist::tmp_path(&path);
+        assert_ne!(a, b, "two save temp paths in one process must differ");
+        // Both still land beside the target and carry the pid (so a cross-process collision is
+        // impossible too) and the unique sequence.
+        for t in [&a, &b] {
+            let name = t.file_name().unwrap().to_str().unwrap();
+            assert!(
+                name.starts_with("cache.tmp."),
+                "temp name {name} keeps the <cache>.tmp.<pid>.<seq> shape"
+            );
+        }
+    }
+
+    /// Finding #7: sibling backends in ONE process (distinct nonces on the same cache path) own
+    /// SEPARATE tripwire markers — so one backend's clean `disarm()` never deletes a live
+    /// sibling's marker, and a still-armed sibling that later dies uncleanly is still caught.
+    #[test]
+    fn sibling_markers_are_independent() {
+        let dir = std::env::temp_dir().join(format!("infr-pcache-sib-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.bin");
+        let mk = |nonce: u64| PcachePersist {
+            path: path.clone(),
+            driver_version: 1,
+            cache_uuid: [0u8; 16],
+            nonce,
+            last_save: Mutex::new(Instant::now()),
+        };
+        let p1 = mk(0);
+        let p2 = mk(1);
+        assert_ne!(
+            p1.marker(),
+            p2.marker(),
+            "sibling backends must not share a marker"
+        );
+
+        // Arm both, then disarm ONLY p1: p2's marker must survive (the bug was p1's disarm
+        // deleting the shared marker out from under a live p2).
+        std::fs::File::create(p1.marker()).unwrap();
+        std::fs::File::create(p2.marker()).unwrap();
+        p1.disarm();
+        assert!(!p1.marker().exists(), "p1 disarms its OWN marker");
+        assert!(p2.marker().exists(), "p2's marker must survive p1's disarm");
+
+        // A dead process's new-format `<pid>-<nonce>` marker is still swept by the tripwire.
+        let dead = spawn_and_reap();
+        let dead_marker = path.with_extension(format!("{MARKER_EXT}.{dead}-3"));
+        std::fs::write(&dead_marker, b"").unwrap();
+        p2.discard_if_a_seeded_run_died();
+        assert!(
+            !dead_marker.exists(),
+            "a dead backend's <pid>-<nonce> marker is swept"
+        );
+        assert!(
+            p2.marker().exists(),
+            "the live sibling's marker is left alone by the sweep"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

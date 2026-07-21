@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **84** — 0 🔴, 13 🟠, 71 🟡.
+- **Remaining open:** **77** — 0 🔴, 12 🟠, 65 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -172,6 +172,18 @@ parked path).
   `INFR_FLASH_MIN_ROWS` is read once; and
   `split_k_plan`/`native_warp_gemm`/`with_padded_dst` de-duplicate the three
   GEMM tiers (identical tile/split decisions).
+- **`infr-vulkan` lib + pcache (all 7 findings)** — TDD, +5 tests, **gpu_seam
+  byte-identity verified** (BDA weight-addr 26, attention/KV 15, MoE, GEMM). An
+  `InstanceCleanup` RAII guard (disarmed before `Ok`) frees the device/instance/
+  cmd-pool on every recoverable `new_selected` error path (was leaked for
+  process life on the CPU-fallback path); device-local zero-init rounds the fill
+  up (`fill_span`) so a non-4-multiple buffer's tail can't leak recycled VRAM;
+  the write-only `uma_spilled` counter is removed;
+  `alloc_arena_bda`/`bda_weight_alloc` reuse the already-stored `own_addr` (no
+  re-query); the UMA-spill path skips its duplicate VRAM budget check; and
+  `pcache` uses a unique temp suffix + a per-instance nonce on the
+  poison-tripwire marker (no cross-thread/backend collisions). Success/alloc
+  path byte-identical.
 
 ### Highest-priority (production default paths)
 
@@ -215,50 +227,6 @@ detail per module below.
   CLI).
 
 <!-- SLICES APPENDED BELOW AS THEY ARE VERIFIED -->
-
-## infr-vulkan/src/lib.rs + pcache.rs
-
-1. **🟠 `lib.rs:1740` (also `1344`,`1768`,`1893`) — `VkInstance`+`VkDevice`(+cmd
-   pool) leaked on every `new_selected` error path after `create_device`
-   (`1681`).** `ash::Instance`/`Device` have no `Drop` (only
-   `VulkanShared::Drop` frees them). The subgroup-32 rejection at `1740` is a
-   _recoverable_ path (seam catches `Err` → CPU fallback) yet a whole logical
-   device + instance + pool leak for process life. _Fix:_ run the post-device
-   body in a closure that destroys what it built on `Err` (as
-   `enumerate_devices` already does), or move the subgroup/env validation before
-   `create_device`.
-2. **🟡 `lib.rs:2732` — device-local zero-init truncates to a 4-byte multiple**,
-   leaving the trailing 1-3 bytes of a non-multiple-of-4 buffer holding recycled
-   VRAM — violating `Backend::alloc`'s stated "zero-init so recycled VRAM can't
-   leak" guarantee (`3055`). Latent today (all tensor sizes are 4-aligned) but
-   the guarantee is unconditional. _Fix:_ round the fill up to cover the tail
-   (backing allocation is aligned larger, so in-bounds) or memset the tail.
-3. **🟡 `lib.rs:217/436/2348` — `uma_spilled` is write-only** (`fetch_add`/
-   `fetch_sub` only; no `.load` anywhere). The doc at `221`/`583` claims
-   "budgeting is `device_used`/`uma_spilled`" but every budget path reads only
-   `device_used`. Dead accounting + inaccurate invariant. _Fix:_ drop the
-   counter or actually consume it.
-4. **🟡 `lib.rs:2440,2520` — redundant `get_buffer_device_address` re-query.**
-   `alloc_arena_bda`/`bda_weight_alloc` call `make_buf_ex(device_address=true)`
-   which already queries + stores `VkBuffer::own_addr` (`2702`), then
-   immediately re-query the same handle. _Fix:_ read
-   `buf.own_addr`/`buf.device_addr()`.
-5. **🟡 `lib.rs:2612 & 2312` — UMA-spill runs the VRAM budget check (+ driver
-   query) twice** (`make_buf_ex` then `alloc_vram_mapped(budget_check=true)`), a
-   third memory-property round-trip on top of `device_local_room`'s. _Fix:_ pass
-   `budget_check=false` from the spill branch.
-6. **🟡 `pcache.rs:278` — `save()` temp file `tmp.{pid}` collides between
-   concurrent saves in one process.** `persist_pipeline_cache` runs after every
-   compile with no lock over the write; two threads compiling different kernels
-   (concurrent `serve`) write+rename the same path → torn write / failed rename.
-   Self-heals via checksum but is a real file race. _Fix:_ unique temp suffix or
-   serialize `save`.
-7. **🟡 `pcache.rs:153,325` — poison tripwire marker keyed by PID only.** When
-   one process builds multiple backends on the same device (`infr bench` MTP
-   loops, CPU/Vulkan parity), the first backend's clean drop `disarm()`s the
-   shared marker while a sibling is still live; a later unclean death then
-   leaves a poisoned blob uncaught — the exact case the tripwire exists for.
-   _Fix:_ key the marker per backend instance (PID + per-`PcachePersist` nonce).
 
 ## infr-vulkan/src/ops.rs + pager.rs
 

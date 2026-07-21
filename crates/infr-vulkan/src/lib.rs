@@ -250,15 +250,10 @@ struct VulkanShared {
     /// via its device address — the KV read seam is 100% `bufferDeviceAddress`, so the bytes may
     /// live off-device with no shader change). See [`Self::alloc_kv_host`].
     host_overflow_type: Option<u32>,
-    /// Bytes this process has placed on the UMA OVERFLOW heap (`uma_overflow_type`). Counted apart
-    /// from `device_used`, which stays "bytes on the DEVICE-LOCAL heaps" — the spill decision is
-    /// exactly "would this push the device-local heap past its declared size", so it must not see
-    /// the bytes already diverted. Always 0 on a discrete GPU.
-    uma_spilled: AtomicU64,
     /// VRAM-first KV-overflow placement tally (`INFR_KV_OVERFLOW`): how many `BufferUsage::KvCache`
     /// buffers landed in device-local VRAM vs spilled to system RAM, and their byte totals. Purely
     /// for the one-shot placement banner (`kv_overflow_report`) so the user sees the resident/spilled
-    /// split; the actual budgeting is `device_used` / `uma_spilled`. All 0 when the flag is off.
+    /// split; the actual budgeting is `device_used` alone. All 0 when the flag is off.
     kv_vram_bufs: AtomicU64,
     kv_vram_bytes: AtomicU64,
     kv_host_bufs: AtomicU64,
@@ -362,10 +357,11 @@ enum Backing {
         memory: vk::DeviceMemory,
         ptr: *mut u8,
         /// True when this is a UNIFIED-MEMORY SPILL (see `probe_uma_overflow_type`): the memory came
-        /// from the non-device-local overflow heap, so it is charged to `VulkanShared::uma_spilled`
-        /// instead of `device_used`. Keeping the two counters apart is what lets the spill decision
-        /// ask "is the DEVICE-LOCAL heap full?" without the answer being polluted by the bytes it
-        /// already spilled elsewhere.
+        /// from the non-device-local overflow heap, so it is NOT charged to `device_used` (the
+        /// budget guard's device-local tally) — leaving the spill decision to ask "is the
+        /// DEVICE-LOCAL heap full?" without the answer being polluted by the bytes it already
+        /// spilled elsewhere. A `false` (device-local mapped) buffer is charged to `device_used`
+        /// like any other GpuOnly allocation.
         spilled: bool,
     },
     /// A logical BYTE RANGE of a [`BdaWeightArena`] block's single big `vk::Buffer` (resident weight
@@ -467,17 +463,17 @@ impl Drop for VkBuffer {
                     self.shared.allocator.lock().unwrap().free(alloc).ok();
                 }
                 // A dedicated VkDeviceMemory we own outright — today only the UMA overflow spill
-                // (`spilled: true`). Charged to the budget guard at allocation (see `make_buf_ex`) —
-                // balance the counter it was charged to.
+                // (`spilled: true`). Only a device-local mapped buffer (`spilled: false`) is charged
+                // to `device_used` at allocation (see `make_buf_ex`) — a UMA spill lives off the
+                // device-local heap and is never counted there — so balance that same charge here.
                 Backing::Vram {
                     memory, spilled, ..
                 } => {
-                    let counter = if *spilled {
-                        &self.shared.uma_spilled
-                    } else {
-                        &self.shared.device_used
-                    };
-                    counter.fetch_sub(self.mem_size, Ordering::Relaxed);
+                    if !*spilled {
+                        self.shared
+                            .device_used
+                            .fetch_sub(self.mem_size, Ordering::Relaxed);
+                    }
                     self.shared.device.unmap_memory(*memory);
                     self.shared.device.free_memory(*memory, None);
                 }
@@ -619,8 +615,8 @@ const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
 /// Free bytes on the DEVICE-LOCAL heaps alone — what the UMA spill decision keys off (unlike
 /// [`vram_info`]'s UMA figure, which spans every heap). Live VK_EXT_memory_budget when present, so
 /// a device-local heap another process has filled reads as full here too; otherwise the heap size
-/// minus this process's tracked device-local bytes (`device_used`; spilled bytes are charged to
-/// `uma_spilled` and correctly excluded).
+/// minus this process's tracked device-local bytes (`device_used`; UMA-spilled bytes never touch
+/// `device_used`, so they are correctly excluded).
 fn device_local_room(s: &VulkanShared) -> u64 {
     let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
     let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
@@ -665,6 +661,18 @@ fn fmt_bytes(b: u64) -> String {
         b if b >= KIB => format!("{:.1} KiB", b as f64 / KIB as f64),
         b => format!("{b} B"),
     }
+}
+
+/// Byte span a device-local `vkCmdFillBuffer` must cover to fully zero-init (calloc contract) a
+/// buffer whose LOGICAL size is `logical_size`. `vkCmdFillBuffer` requires a 4-byte-multiple size,
+/// so round UP — the old `size / 4 * 4` truncation left the trailing 1-3 bytes of a
+/// non-multiple-of-4 buffer holding recycled VRAM, violating `Backend::alloc`'s zero-init
+/// guarantee. The backing buffer is CREATED at this same rounded size (see `make_buf_ex` /
+/// `alloc_kv_host`), so the rounded fill stays in-bounds (`dstOffset + size <= buffer size`).
+/// Identity for any 4-aligned size — every current tensor is 4-aligned, so the fill is byte-for-
+/// byte what it was before this rounding existed.
+fn fill_span(logical_size: usize) -> u64 {
+    (logical_size as u64).next_multiple_of(4)
 }
 
 /// Human-readable Vulkan device class for the enumeration listing.
@@ -1167,6 +1175,46 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| be(format!("create_instance: {e}")))?;
+
+        // RAII cleanup for the partially-built device. `ash::Instance`/`Device` have NO `Drop`
+        // (only `VulkanShared::Drop` frees them), so every `Err`/`?` return below this point would
+        // otherwise leak the `VkInstance` — and, once they exist, the `VkDevice` + command pool —
+        // for the whole process life. That is a RECOVERABLE path (the seam catches the `Err` and
+        // falls back to CPU), so the leak is permanent per launch: the subgroup-32 rejection, the
+        // `INFR_SG`/`INFR_SUBMIT_DISPATCHES` env guards, `!has_bda`, a failed `create_command_pool`
+        // or allocator build all return here. Mirror `enumerate_devices`, which destroys its
+        // instance unconditionally on the way out. Holds independent handle CLONES (ash handles are
+        // trivially copyable and their `Drop` is a no-op), so the success path — which DISARMS this
+        // just before the originals move into `VulkanShared` — is byte-for-byte unchanged and never
+        // double-frees.
+        struct InstanceCleanup {
+            instance: ash::Instance,
+            device: Option<ash::Device>,
+            pool: vk::CommandPool,
+            armed: bool,
+        }
+        impl Drop for InstanceCleanup {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                unsafe {
+                    if let Some(device) = &self.device {
+                        if self.pool != vk::CommandPool::null() {
+                            device.destroy_command_pool(self.pool, None);
+                        }
+                        device.destroy_device(None);
+                    }
+                    self.instance.destroy_instance(None);
+                }
+            }
+        }
+        let mut cleanup = InstanceCleanup {
+            instance: instance.clone(),
+            device: None,
+            pool: vk::CommandPool::null(),
+            armed: true,
+        };
 
         // ── physical device: `INFR_DEV` if set, else prefer discrete ──────────
         // `INFR_DEV=VulkanN` (set by the CLI's `--dev`) pins the Nth device in ENUMERATION order,
@@ -1711,6 +1759,9 @@ impl VulkanBackend {
 
         let device = unsafe { instance.create_device(physical_device, &device_ci, None) }
             .map_err(|e| be(format!("create_device: {e}")))?;
+        // Register the device so any Err below (subgroup-32/env guards, allocator build) destroys
+        // it instead of leaking it — see `InstanceCleanup` above.
+        cleanup.device = Some(device.clone());
 
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
@@ -1724,6 +1775,8 @@ impl VulkanBackend {
             )
         }
         .map_err(|e| be(format!("create_command_pool: {e}")))?;
+        // Register the pool too, so a later Err frees it alongside the device.
+        cleanup.pool = cmd_pool;
 
         // ── capabilities ───────────────────────────────────────────────────────
         // Query base limits + the subgroup-size range together via properties2 (the coopmat GEMM
@@ -2025,6 +2078,10 @@ impl VulkanBackend {
         // host-visible type (system RAM over PCIe). Only the opt-in KV-overflow path uses it.
         let host_overflow_type = probe_uma_overflow_type(&mem_props);
 
+        // Success: the instance/device/pool now move into `VulkanShared` (which owns their
+        // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
+        cleanup.armed = false;
+
         Ok(Self {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
@@ -2053,7 +2110,6 @@ impl VulkanBackend {
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 uma_overflow_type,
                 host_overflow_type,
-                uma_spilled: AtomicU64::new(0),
                 kv_vram_bufs: AtomicU64::new(0),
                 kv_vram_bytes: AtomicU64::new(0),
                 kv_host_bufs: AtomicU64::new(0),
@@ -2316,7 +2372,8 @@ impl VulkanBackend {
     /// budget-accounting split described below, in case a device-local mapped caller returns.)
     ///
     /// The caller owns `buffer` and must destroy it if this returns `Err`. Budget-guarded and
-    /// charged to `device_used` (or `uma_spilled` when `spilled`) like any other allocation.
+    /// charged to `device_used` like any other allocation UNLESS `spilled` (a UMA-overflow buffer
+    /// lives off the device-local heap and is deliberately not counted against it).
     ///
     /// `device_address` must mirror the buffer's `SHADER_DEVICE_ADDRESS` usage: when the buffer was
     /// created with that usage (a paged-MoE `alloc_arena_bda` / resident-BDA `bda_weight_alloc`
@@ -2374,13 +2431,13 @@ impl VulkanBackend {
             return Err(be(format!("rebar bind_buffer_memory: {e}")));
         }
 
-        // Charge the counter this allocation's heap belongs to (see `VulkanShared::uma_spilled`).
-        if spilled {
-            &self.shared.uma_spilled
-        } else {
-            &self.shared.device_used
+        // Charge the device-local budget tally — UNLESS this is a UMA/host spill, which lives off
+        // the device-local heap and must not count against it (balanced in `VkBuffer::drop`).
+        if !spilled {
+            self.shared
+                .device_used
+                .fetch_add(requirements.size, Ordering::Relaxed);
         }
-        .fetch_add(requirements.size, Ordering::Relaxed);
 
         // Mirror `make_buf_ex`'s own-address computation: `device_address` here means the caller
         // already added `SHADER_DEVICE_ADDRESS` to the buffer's usage AND (just above) chained the
@@ -2422,8 +2479,8 @@ impl VulkanBackend {
     /// heap ⇒ bit-identical logits to a VRAM KV cache, at PCIe bandwidth.
     ///
     /// This is SYSTEM RAM, not VRAM, so it does NOT go through the device-local budget guard
-    /// (`budget_check == false`) and is charged to `uma_spilled`, not `device_used` — leaving the
-    /// VRAM guard to protect only the weights + activations that actually live on-device. Requires
+    /// (`budget_check == false`) and is NOT charged to `device_used` (`spilled == true`) — leaving
+    /// the VRAM guard to protect only the weights + activations that live on-device. Requires
     /// `host_overflow_type` (present on RDNA3 = the GTT host-visible type); the caller has already
     /// checked the flag, so a missing type here is a hard error rather than a silent VRAM fallback.
     fn alloc_kv_host(&self, size: usize) -> Result<VkBuffer> {
@@ -2437,8 +2494,10 @@ impl VulkanBackend {
         let usage = vk::BufferUsageFlags::from_raw(
             BUFFER_USAGE.as_raw() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
         );
+        // 4-byte-rounded create size (`fill_span`) — matches `make_buf_ex`; identity for any
+        // 4-aligned `size` (all current KV buffers), keeps device-local zero-init in-bounds.
         let buf_ci = vk::BufferCreateInfo::default()
-            .size(size as u64)
+            .size(fill_span(size))
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { self.shared.device.create_buffer(&buf_ci, None) }
@@ -2452,7 +2511,7 @@ impl VulkanBackend {
                     .to_string(),
             ));
         }
-        // spilled=true (charged to uma_spilled, not device_used), device_address=true,
+        // spilled=true (NOT charged to device_used), device_address=true,
         // budget_check=false (this is system RAM). On Err, `alloc_vram_mapped` leaves the buffer
         // to us.
         self.alloc_vram_mapped(buffer, size, &requirements, ty, true, true, false)
@@ -2467,12 +2526,11 @@ impl VulkanBackend {
     /// `get_buffer_device_address` succeed.
     pub fn alloc_arena_bda(&self, bytes: usize) -> Result<(Box<dyn Buffer>, u64)> {
         let buf = self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "moe-arena", true, true)?;
-        let handle = buf.buffer;
-        let addr = unsafe {
-            self.shared
-                .device
-                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(handle))
-        };
+        // `make_buf_ex(device_address=true)` already queried + stored this handle's address in
+        // `own_addr` — reuse it rather than issuing a second identical `get_buffer_device_address`.
+        let addr = buf
+            .own_addr
+            .expect("moe-arena built with device_address=true carries an own_addr");
         Ok((Box::new(buf) as Box<dyn Buffer>, addr))
     }
 
@@ -2548,11 +2606,11 @@ impl VulkanBackend {
             true,
         )?;
         let buffer = block_buf.buffer;
-        let base_addr = unsafe {
-            self.shared
-                .device
-                .get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
-        };
+        // `make_buf_ex(device_address=true)` already stored the block's address in `own_addr`;
+        // reuse it instead of a second identical `get_buffer_device_address`.
+        let base_addr = block_buf
+            .own_addr
+            .expect("resident-bda block built with device_address=true carries an own_addr");
         let handle = Arc::new(BdaBlockHandle {
             buf: block_buf,
             base_addr,
@@ -2616,8 +2674,11 @@ impl VulkanBackend {
         } else {
             BUFFER_USAGE
         };
+        // Created at the 4-byte-rounded size (`fill_span`) so the device-local zero-init can cover
+        // the whole logical extent — see `fill_span`. Identity for any 4-aligned `size` (all current
+        // tensors), so `requirements.size`/the address are unchanged on every live path.
         let buf_ci = vk::BufferCreateInfo::default()
-            .size(size as u64)
+            .size(fill_span(size))
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
@@ -2676,7 +2737,10 @@ impl VulkanBackend {
                         ty,
                         true,
                         device_address,
-                        true,
+                        // budget_check=false: the identical `check_vram_budget(requirements.size)`
+                        // at the top of `make_buf_ex` already ran for this GpuOnly buffer — don't
+                        // repeat it (and its memory-property driver round-trip) here.
+                        false,
                     ) {
                         Ok(b) => Ok(b),
                         Err(e) => {
@@ -2760,7 +2824,7 @@ impl VulkanBackend {
             unsafe { std::ptr::write_bytes(ptr, byte, buf.size) };
         } else {
             let word = u32::from_ne_bytes([byte; 4]);
-            let size = (buf.size / 4 * 4) as u64; // vkCmdFillBuffer requires a 4-byte multiple
+            let size = fill_span(buf.size); // round UP to a 4-byte multiple: cover the whole extent
             if size > 0 {
                 let vkbuf = buf.buffer;
                 let off = buf.sub_offset as u64;
@@ -2793,7 +2857,7 @@ impl VulkanBackend {
             if let Some(ptr) = buf.mapped_ptr() {
                 unsafe { std::ptr::write_bytes(ptr, 0u8, buf.size) };
             } else {
-                let size = (buf.size / 4 * 4) as u64; // vkCmdFillBuffer requires a 4-byte multiple
+                let size = fill_span(buf.size); // round UP to a 4-byte multiple: cover the whole extent
                 if size > 0 {
                     dev.push((buf.buffer, buf.sub_offset as u64, size));
                 }
@@ -3390,6 +3454,45 @@ fn select_coopmat_shape(
 mod tests {
     use super::*;
     use infr_core::Backend;
+
+    /// Finding #2: the device-local zero-init fill must cover the WHOLE logical extent, not the old
+    /// `size / 4 * 4` truncation that left the trailing 1-3 bytes of a non-multiple-of-4 buffer
+    /// holding recycled VRAM. `fill_span` rounds UP to the 4-byte multiple `vkCmdFillBuffer` needs,
+    /// and the buffer is CREATED at that same span so the fill stays in-bounds.
+    #[test]
+    fn fill_span_covers_the_whole_buffer() {
+        // 4-aligned sizes are unchanged (identity) — every current tensor, so the fill is
+        // byte-for-byte what it was.
+        for aligned in [0usize, 4, 8, 64, 4096] {
+            assert_eq!(
+                fill_span(aligned),
+                aligned as u64,
+                "4-aligned size is identity"
+            );
+        }
+        // Non-multiple-of-4 sizes round UP and FULLY cover the logical extent (never truncate).
+        for size in [1usize, 2, 3, 5, 6, 7, 13, 4095] {
+            let span = fill_span(size);
+            assert!(
+                span >= size as u64,
+                "fill must reach the last byte of size {size}"
+            );
+            assert!(
+                span - size as u64 <= 3,
+                "rounds up by at most 3 bytes (size {size})"
+            );
+            assert_eq!(
+                span % 4,
+                0,
+                "vkCmdFillBuffer size must be a 4-byte multiple"
+            );
+            // The key regression guard: the OLD truncation would drop the tail.
+            assert!(
+                span > (size / 4 * 4) as u64,
+                "must not truncate the tail of size {size}"
+            );
+        }
+    }
 
     /// `INFR_DEV` index resolution (no GPU needed). Now the SINGLE device-selection env, it can hold
     /// `metal`/`cpu` — the Vulkan reader must TOLERATE those (fall back to the discrete default,

@@ -3980,8 +3980,14 @@ pub(crate) fn generate_dense_backend(
             if let Some(cst) = constraint.as_deref_mut() {
                 // Grammar-forced span (serve's tool_choice "required"/named): the shared
                 // llguidance step. Empty step ⇒ the constrained span ended.
-                let (step, done) = crate::grammar::constrained_step(cst, &mut logits, &c.eos_ids)
-                    .map_err(|e| anyhow!("{e}"))?;
+                let (step, done) = crate::grammar::constrained_step(
+                    cst,
+                    &mut logits,
+                    &c.eos_ids,
+                    sampler,
+                    &mut rng,
+                )
+                .map_err(|e| anyhow!("{e}"))?;
                 decode_t += step_t0.elapsed();
                 if step.is_empty() {
                     break;

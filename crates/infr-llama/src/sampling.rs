@@ -294,7 +294,11 @@ impl Drop for GatePass<'_> {
 /// how many other requests are in flight.
 pub(crate) fn resolve_seed(req: Option<&RequestCtx>) -> u64 {
     match req.and_then(|r| r.sampling.seed) {
-        Some(s) => s | 1, // xorshift64 state must be nonzero
+        // xorshift64 state must be nonzero, but `s | 1` collapses adjacent seeds (`2k` and `2k+1`
+        // map to the SAME odd state → "different seed, same result"). Only the degenerate `0` needs
+        // remapping; every other seed passes through untouched so distinct seeds stay distinct.
+        Some(0) => 0x9E37_79B9_7F4A_7C15,
+        Some(s) => s,
         None => seed_rng(),
     }
 }
@@ -336,7 +340,14 @@ impl Penalties {
     /// `penalties` sampler: repeat (multiplicative, sign-aware) then presence/frequency (additive).
     pub(crate) fn apply(&self, logits: &mut [f32]) {
         if self.repeat != 1.0 && self.last_n > 0 {
+            // llama.cpp's `penalties` sampler scales each DISTINCT id in the window ONCE — a token
+            // repeated K times must be divided by `repeat`, not `repeat^K`. The raw `recent` deque
+            // holds duplicates, so dedup it: penalize a given id the first time it is seen only.
+            let mut seen = std::collections::HashSet::with_capacity(self.recent.len());
             for &t in &self.recent {
+                if !seen.insert(t) {
+                    continue;
+                }
                 let l = &mut logits[t as usize];
                 *l = if *l > 0.0 {
                     *l / self.repeat
@@ -407,6 +418,108 @@ pub(crate) fn argmax(v: &[f32]) -> usize {
     bi
 }
 
+/// A `(logit, id)` node ordered by logit for the top-p max-heap — the `top_k==0` path pops ids in
+/// descending-logit order lazily instead of sorting the whole (~150K) vocab. `total_cmp` gives a
+/// total order over floats (so `-inf` masked logits sort last, never into the nucleus).
+struct HeapItem {
+    key: f32,
+    idx: usize,
+}
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.key.total_cmp(&other.key) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for HeapItem {}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.total_cmp(&other.key)
+    }
+}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Build the truncated, normalized sampling support shared by [`sample_logits`] and
+/// [`truncated_dist`]: top-k select, temperature softmax, normalize, then the top-p (nucleus)
+/// cutoff. Returns `(idx, probs)` — parallel, descending by logit, ALREADY truncated to the
+/// nucleus, with `probs` normalized over the selected support (so it sums to ≤1, the nucleus mass).
+/// The caller performs the final draw (bit-pinned) or hands the pairs out; keeping the draw OUT of
+/// here is what preserves the existing sampler's exact float ops.
+///
+/// `temp` is clamped to a positive value (callers only reach this for `temp>0`; the clamp is a
+/// div-by-zero guard). When `top_k==0` the support is the whole vocab, but instead of sorting all
+/// of it the nucleus is popped from a max-heap only as deep as `top_p` requires.
+fn truncated_softmax(
+    logits: &[f32],
+    temp: f32,
+    top_k: usize,
+    top_p: f32,
+) -> (Vec<usize>, Vec<f32>) {
+    let n = logits.len();
+    let temp = if temp > 0.0 { temp } else { 1.0 };
+    let k = if top_k == 0 { n } else { top_k.min(n) };
+    if k < n {
+        // Bounded top-k: partition to the top k, then sort only those k (cheap).
+        let cmp = |a: &usize, b: &usize| {
+            logits[*b]
+                .partial_cmp(&logits[*a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
+        idx.truncate(k);
+        idx.sort_unstable_by(cmp); // descending by logit
+        let maxl = logits[idx[0]];
+        let mut probs: Vec<f32> = idx
+            .iter()
+            .map(|&i| ((logits[i] - maxl) / temp).exp())
+            .collect();
+        let sum: f32 = probs.iter().sum();
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+        // nucleus: smallest prefix whose cumulative prob reaches top_p
+        let mut cum = 0.0;
+        let mut cutoff = probs.len();
+        for (j, &p) in probs.iter().enumerate() {
+            cum += p;
+            if cum >= top_p {
+                cutoff = j + 1;
+                break;
+            }
+        }
+        idx.truncate(cutoff);
+        probs.truncate(cutoff);
+        (idx, probs)
+    } else {
+        // top_k==0: softmax denominator over ALL logits (O(n) scan, no sort), then pop the nucleus
+        // prefix from a max-heap — only as deep as top_p needs, avoiding the full-vocab sort.
+        let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
+        let mut heap: std::collections::BinaryHeap<HeapItem> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| HeapItem { key: l, idx: i })
+            .collect();
+        let mut idx = Vec::new();
+        let mut probs = Vec::new();
+        let mut cum = 0.0;
+        while let Some(HeapItem { key, idx: i }) = heap.pop() {
+            let p = ((key - maxl) / temp).exp() / sum;
+            idx.push(i);
+            probs.push(p);
+            cum += p;
+            if cum >= top_p {
+                break;
+            }
+        }
+        (idx, probs)
+    }
+}
+
 /// Sample a token id from `logits` per `s`. Greedy if `temp<=0`/`top_k==1`; else temperature +
 /// top-k + top-p (nucleus). `rng` is an xorshift64 state advanced in place.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -414,48 +527,20 @@ pub(crate) fn sample_logits(logits: &[f32], s: Sampler, rng: &mut u64) -> u32 {
     if s.temp <= 0.0 || s.top_k == 1 {
         return argmax(logits) as u32;
     }
-    let n = logits.len();
-    let k = if s.top_k == 0 { n } else { s.top_k.min(n) };
-    let cmp = |a: &usize, b: &usize| {
-        logits[*b]
-            .partial_cmp(&logits[*a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    };
-    let mut idx: Vec<usize> = (0..n).collect();
-    if k < n {
-        idx.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
-        idx.truncate(k);
-    }
-    idx.sort_unstable_by(cmp); // descending by logit
-    let maxl = logits[idx[0]];
-    let mut probs: Vec<f32> = idx
-        .iter()
-        .map(|&i| ((logits[i] - maxl) / s.temp).exp())
-        .collect();
-    let sum: f32 = probs.iter().sum();
-    for p in probs.iter_mut() {
-        *p /= sum;
-    }
-    // nucleus: smallest prefix whose cumulative prob reaches top_p
-    let mut cum = 0.0;
-    let mut cutoff = probs.len();
-    for (j, &p) in probs.iter().enumerate() {
-        cum += p;
-        if cum >= s.top_p {
-            cutoff = j + 1;
-            break;
-        }
-    }
-    let total: f32 = probs[..cutoff].iter().sum();
+    let (idx, probs) = truncated_softmax(logits, s.temp, s.top_k, s.top_p);
+    // Final bit-pinned draw against the (un-renormalized) nucleus `probs`, scaled by their `total`.
+    // Identical arithmetic to the pre-refactor inline draw; the `total` scaling means we never
+    // renormalize `probs` a second time here (that footgun stays out of the hot path).
+    let total: f32 = probs.iter().sum();
     let r = next_uniform(rng) * total;
     let mut acc = 0.0;
-    for j in 0..cutoff {
-        acc += probs[j];
+    for (j, &p) in probs.iter().enumerate() {
+        acc += p;
         if r <= acc {
             return idx[j] as u32;
         }
     }
-    idx[cutoff - 1] as u32
+    idx[idx.len() - 1] as u32
 }
 
 /// Temperature + top-k + top-p (nucleus) truncated distribution over `logits`, returned as
@@ -472,43 +557,13 @@ pub(crate) fn sample_logits(logits: &[f32], s: Sampler, rng: &mut u64) -> u32 {
 /// truncated out of a distribution simply has probability 0 in it.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn truncated_dist(logits: &[f32], s: Sampler) -> Vec<(u32, f32)> {
-    let n = logits.len();
-    let k = if s.top_k == 0 { n } else { s.top_k.min(n) };
-    let cmp = |a: &usize, b: &usize| {
-        logits[*b]
-            .partial_cmp(&logits[*a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    };
-    let mut idx: Vec<usize> = (0..n).collect();
-    if k < n {
-        idx.select_nth_unstable_by(k - 1, cmp);
-        idx.truncate(k);
-    }
-    idx.sort_unstable_by(cmp); // descending by logit
-    let maxl = logits[idx[0]];
-    let temp = if s.temp > 0.0 { s.temp } else { 1.0 }; // this fn is only meaningful for temp>0
-                                                        // callers; guard div-by-zero regardless
-    let mut probs: Vec<f32> = idx
-        .iter()
-        .map(|&i| ((logits[i] - maxl) / temp).exp())
-        .collect();
-    let sum: f32 = probs.iter().sum();
-    for p in probs.iter_mut() {
-        *p /= sum;
-    }
-    let mut cum = 0.0;
-    let mut cutoff = probs.len();
-    for (j, &p) in probs.iter().enumerate() {
-        cum += p;
-        if cum >= s.top_p {
-            cutoff = j + 1;
-            break;
-        }
-    }
-    let total: f32 = probs[..cutoff].iter().sum();
-    idx[..cutoff]
-        .iter()
-        .zip(probs[..cutoff].iter())
+    // Same support selection as `sample_logits`, but renormalized to sum to 1 over the nucleus (a
+    // proper distribution) rather than collapsed into one draw. The nucleus renorm happens ONCE,
+    // here, against the helper's `probs` — no coupled `cutoff`/`total` invariant to keep in sync.
+    let (idx, probs) = truncated_softmax(logits, s.temp, s.top_k, s.top_p);
+    let total: f32 = probs.iter().sum();
+    idx.iter()
+        .zip(probs.iter())
         .map(|(&i, &p)| (i as u32, p / total))
         .collect()
 }
@@ -569,8 +624,10 @@ mod tests {
             assert_eq!(Sampler::resolve(Some(&a)).temp, 0.0, "A must keep temp 0");
             assert_eq!(Sampler::resolve(Some(&b)).temp, 1.5, "B must keep temp 1.5");
         }
-        assert_eq!(resolve_seed(Some(&a)), 42 | 1);
-        assert_eq!(resolve_seed(Some(&b)), 7 | 1);
+        // Finding 4: seeds now pass through untouched (only the degenerate 0 is remapped), so a
+        // request's seed is no longer collapsed onto an adjacent one.
+        assert_eq!(resolve_seed(Some(&a)), 42);
+        assert_eq!(resolve_seed(Some(&b)), 7);
 
         // The abort latch (stop sequences) is per-sequence too: A hitting its stop string must not
         // halt B.
@@ -632,6 +689,169 @@ mod tests {
         assert!(Penalties::resolve(Some(&plain)).is_none());
         assert!(Penalties::resolve(Some(&penalized)).is_some());
         assert!(Penalties::resolve(None).is_none());
+    }
+
+    /// **Finding 1 — repeat penalty is per-DISTINCT-token, not per-occurrence.** llama.cpp's
+    /// `penalties` sampler divides a repeated token's positive logit by `repeat` exactly ONCE, no
+    /// matter how many times it appears in the window. The old code walked the raw `recent` deque
+    /// (with duplicates), so a token seen K times was scaled `repeat^K` — this fails under that bug.
+    #[test]
+    fn repeat_penalty_is_per_distinct_token_not_per_occurrence() {
+        let ctx = RequestCtx::new(RequestSampling {
+            repeat_penalty: 2.0,
+            repeat_last_n: 64,
+            ..Default::default()
+        });
+        let mut p = Penalties::resolve(Some(&ctx)).expect("penalty active");
+        for _ in 0..3 {
+            p.observe(5); // id 5 appears THREE times in the window
+        }
+        p.observe(7); // id 7 once
+        let mut logits = vec![0.0f32; 8];
+        logits[5] = 8.0;
+        logits[7] = 4.0;
+        p.apply(&mut logits);
+        // id 5 penalized ONCE: 8/2 = 4  (the per-occurrence bug would give 8 / 2^3 = 1).
+        assert_eq!(logits[5], 4.0, "distinct id must be penalized exactly once");
+        assert_eq!(logits[7], 2.0, "id seen once: 4/2 = 2");
+    }
+
+    /// **Finding 4 — adjacent seeds must produce distinct streams.** `seed | 1` collapsed `2k` and
+    /// `2k+1` onto the same odd xorshift state, so seeds 2 and 3 drew identical tokens. Only the
+    /// degenerate seed 0 is remapped now; every other seed passes through untouched.
+    #[test]
+    fn adjacent_seeds_produce_distinct_streams() {
+        let logits: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin()).collect();
+        let s = Sampler {
+            temp: 1.0,
+            top_k: 8,
+            top_p: 0.95,
+        };
+        let draw = |seed: u64| -> Vec<u32> {
+            let ctx = RequestCtx::new(RequestSampling {
+                temp: Some(1.0),
+                seed: Some(seed),
+                ..Default::default()
+            });
+            let mut rng = resolve_seed(Some(&ctx));
+            (0..16)
+                .map(|_| sample_logits(&logits, s, &mut rng))
+                .collect()
+        };
+        assert_ne!(
+            draw(2),
+            draw(3),
+            "adjacent seeds must differ (old `seed|1` collapsed 2 and 3 to the same stream)"
+        );
+        // Seed 0 (xorshift's forbidden zero state) still works and stays deterministic.
+        assert_eq!(draw(0), draw(0), "seed 0 must be usable and reproducible");
+        assert_ne!(
+            resolve_seed_of(0),
+            0,
+            "seed 0 must be remapped off the zero state"
+        );
+    }
+
+    fn resolve_seed_of(seed: u64) -> u64 {
+        let ctx = RequestCtx::new(RequestSampling {
+            seed: Some(seed),
+            ..Default::default()
+        });
+        resolve_seed(Some(&ctx))
+    }
+
+    /// **Finding 5 (characterization) — the `top_k==0` heap/partial-select refactor must return the
+    /// SAME token as the old full-vocab sort.** A pinned, distinct-logit vector across several seeds
+    /// is compared against a byte-for-byte copy of the pre-refactor algorithm (`reference_full_sort`
+    /// below). If the optimization ever changes the sampled token this fails.
+    #[test]
+    fn top_k_zero_matches_reference_full_sort() {
+        let logits: Vec<f32> = (0..300).map(|i| (i as f32) * 0.05).collect();
+        let s = Sampler {
+            temp: 0.8,
+            top_k: 0,
+            top_p: 0.9,
+        };
+        for seed in [1u64, 2, 42, 12345, 99_999] {
+            let mut rng = seed;
+            let got = sample_logits(&logits, s, &mut rng);
+            let mut rng_ref = seed;
+            let want = reference_full_sort(&logits, s, &mut rng_ref);
+            assert_eq!(
+                got, want,
+                "seed {seed}: top_k==0 refactor changed the sampled token"
+            );
+        }
+    }
+
+    /// **Finding 6 (characterization) — the `top_k>0` path (default sampling) must be byte-identical
+    /// after routing through the shared `truncated_softmax` helper.** Same oracle, with a real top-k.
+    #[test]
+    fn top_k_path_matches_reference_full_sort() {
+        let logits: Vec<f32> = (0..300).map(|i| ((i as f32) * 0.031).sin() * 4.0).collect();
+        let s = Sampler {
+            temp: 0.7,
+            top_k: 20,
+            top_p: 0.95,
+        };
+        for seed in [1u64, 2, 42, 12345, 99_999] {
+            let mut rng = seed;
+            let got = sample_logits(&logits, s, &mut rng);
+            let mut rng_ref = seed;
+            let want = reference_full_sort(&logits, s, &mut rng_ref);
+            assert_eq!(
+                got, want,
+                "seed {seed}: top_k path drifted from the reference"
+            );
+        }
+    }
+
+    /// The pre-refactor `sample_logits` body, verbatim — the oracle the refactor is pinned against.
+    fn reference_full_sort(logits: &[f32], s: Sampler, rng: &mut u64) -> u32 {
+        if s.temp <= 0.0 || s.top_k == 1 {
+            return argmax(logits) as u32;
+        }
+        let n = logits.len();
+        let k = if s.top_k == 0 { n } else { s.top_k.min(n) };
+        let cmp = |a: &usize, b: &usize| {
+            logits[*b]
+                .partial_cmp(&logits[*a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        let mut idx: Vec<usize> = (0..n).collect();
+        if k < n {
+            idx.select_nth_unstable_by(k - 1, cmp);
+            idx.truncate(k);
+        }
+        idx.sort_unstable_by(cmp);
+        let maxl = logits[idx[0]];
+        let mut probs: Vec<f32> = idx
+            .iter()
+            .map(|&i| ((logits[i] - maxl) / s.temp).exp())
+            .collect();
+        let sum: f32 = probs.iter().sum();
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+        let mut cum = 0.0;
+        let mut cutoff = probs.len();
+        for (j, &p) in probs.iter().enumerate() {
+            cum += p;
+            if cum >= s.top_p {
+                cutoff = j + 1;
+                break;
+            }
+        }
+        let total: f32 = probs[..cutoff].iter().sum();
+        let r = next_uniform(rng) * total;
+        let mut acc = 0.0;
+        for j in 0..cutoff {
+            acc += probs[j];
+            if r <= acc {
+                return idx[j] as u32;
+            }
+        }
+        idx[cutoff - 1] as u32
     }
 
     /// The baton is mutually exclusive (only one sequence records on the GPU at a time) and FIFO

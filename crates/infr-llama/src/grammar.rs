@@ -69,6 +69,15 @@ pub fn build_tok_env(tokenizer: &Tokenizer, vocab: usize, eos_ids: &[u32]) -> Re
     Ok(Arc::new(NonCanonicalEnv(env)))
 }
 
+/// Force every id at or beyond `vocab` to -inf. Those ids sit past the token trie, so they can
+/// never be grammar-legal, yet a padded-vocab model's logits row is wider than `vocab`. Split out
+/// so the tail-masking is unit-testable without a live tokenizer/matcher.
+fn mask_padding_tail(logits: &mut [f32], vocab: usize) {
+    for l in logits.iter_mut().skip(vocab) {
+        *l = f32::NEG_INFINITY;
+    }
+}
+
 /// A live grammar constraint over a decode. Cheap-ish to construct (parser build); one per request.
 pub struct Constraint {
     matcher: Matcher,
@@ -100,6 +109,11 @@ impl Constraint {
                 *l = f32::NEG_INFINITY;
             }
         }
+        // Padded-vocab GGUFs give a logits row WIDER than the token trie (`logits.len() > vocab`).
+        // Those tail ids have no trie entry, so the mask can never allow them — but the loop above
+        // stops at `vocab`, leaving them finite. Force them to -inf so a downstream full-slice
+        // argmax/sample can't emit an out-of-grammar, out-of-trie token (fail CLOSED, not open).
+        mask_padding_tail(logits, self.vocab);
         Ok(())
     }
 
@@ -144,9 +158,15 @@ impl Constraint {
 
 /// One CONSTRAINED decode step over `logits`: drain llguidance's deterministically-forced tokens
 /// first (no sampling — the intended flow, keeps compute_mask/consume consistent); otherwise mask
-/// the logits and pick the most-probable grammar-legal token with validate-before-commit (the
-/// healed mask can be a SUPERSET on the non-canonical GGUF tokenizer bridge — a rejected candidate
-/// is dropped and re-picked, never failed). EOS terminates only in an accepting state.
+/// the logits and pick a grammar-legal token with validate-before-commit (the healed mask can be a
+/// SUPERSET on the non-canonical GGUF tokenizer bridge — a rejected candidate is dropped and
+/// re-picked, never failed). EOS terminates only in an accepting state.
+///
+/// The free token is drawn with the SAME [`Sampler`]/`rng` the unconstrained decode path uses, so a
+/// request that sets `temperature`/`top_p`/`seed` alongside `tool_choice` is honoured instead of
+/// being silently forced to greedy. At `temp<=0` [`sample_logits`](crate::sampling::sample_logits)
+/// collapses to `argmax`, so the deterministic tool-call path is byte-for-byte unchanged; a masked
+/// (-inf) token has probability 0 in the softmax, so sampling can never leave the grammar.
 ///
 /// Returns `(tokens emitted this step, grammar finished)`; an EMPTY step means the constrained
 /// span is done (accepting EOS or mask exhausted). ONE implementation shared by the bespoke
@@ -156,6 +176,8 @@ pub fn constrained_step(
     c: &mut Constraint,
     logits: &mut [f32],
     eos_ids: &[u32],
+    sampler: crate::sampling::Sampler,
+    rng: &mut u64,
 ) -> Result<(Vec<u32>, bool)> {
     let forced = c.forced();
     if !forced.is_empty() {
@@ -165,7 +187,7 @@ pub fn constrained_step(
     }
     c.apply_mask(logits)?;
     loop {
-        let cand = crate::sampling::argmax(logits) as u32;
+        let cand = crate::sampling::sample_logits(logits, sampler, rng);
         if !logits[cand as usize].is_finite() {
             return Ok((Vec::new(), true)); // mask exhausted — nothing grammar-legal left
         }
@@ -285,6 +307,119 @@ mod tests {
     }
     fn dirs_home() -> Option<PathBuf> {
         std::env::var_os("HOME").map(PathBuf::from)
+    }
+
+    /// **Finding 2 — `apply_mask` must fail CLOSED past `vocab`.** On a padded-vocab model the
+    /// logits row is wider than the token trie; ids `>= vocab` have no trie entry and must be forced
+    /// to -inf so a downstream full-slice argmax can't emit an out-of-grammar token. Tests the tail
+    /// masker directly (no live matcher needed).
+    #[test]
+    fn padding_tail_is_masked_to_neg_inf() {
+        let mut logits = vec![1.0f32; 10];
+        mask_padding_tail(&mut logits, 6);
+        for (i, &l) in logits.iter().enumerate() {
+            if i < 6 {
+                assert_eq!(l, 1.0, "id {i} within vocab must be untouched");
+            } else {
+                assert!(
+                    l.is_infinite() && l.is_sign_negative(),
+                    "id {i} beyond vocab must be -inf"
+                );
+            }
+        }
+        // vocab >= len is a no-op (no padding tail).
+        let mut exact = vec![2.0f32; 4];
+        mask_padding_tail(&mut exact, 4);
+        assert!(exact.iter().all(|&l| l == 2.0));
+    }
+
+    /// **Finding 3 — constrained decoding honours the `Sampler`.** At `temp==0` `constrained_step`
+    /// stays deterministic (greedy within the mask); at `temp>0` with a fixed seed it draws — and a
+    /// masked token has probability 0, so every emitted token is still grammar-legal. Model-gated
+    /// (needs the real GGUF tokenizer); self-skips when the model isn't cached.
+    #[test]
+    fn constrained_step_honours_sampler_and_stays_in_grammar() {
+        let Some(path) = qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B not cached");
+            return;
+        };
+        let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+        let cfg = crate::Config::from_gguf(&g).expect("config");
+        let tok = crate::build_tokenizer(&g).expect("tokenizer");
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"],
+                },
+            },
+        }]);
+
+        // Deterministic (temp==0) run — collapses to greedy within the mask.
+        let run = |sampler: crate::sampling::Sampler, seed: u64| -> Vec<u32> {
+            let env = build_tok_env(&tok, cfg.vocab, &[cfg.eos]).expect("tok env");
+            let grammar = forced_tool_call_grammar(&tools).expect("grammar");
+            let mut c = Constraint::new(env, grammar).expect("constraint");
+            let mut rng = seed;
+            let mut out = Vec::new();
+            for _ in 0..40 {
+                if c.stopped() {
+                    break;
+                }
+                let mut logits: Vec<f32> =
+                    (0..cfg.vocab).map(|i| (i as f32 * 0.01).sin()).collect();
+                let (step, done) =
+                    constrained_step(&mut c, &mut logits, &[cfg.eos], sampler, &mut rng)
+                        .expect("constrained step");
+                if step.is_empty() {
+                    break;
+                }
+                out.extend(step);
+                if done {
+                    break;
+                }
+            }
+            out
+        };
+
+        let greedy = crate::sampling::Sampler {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        // temp==0 is deterministic regardless of seed.
+        assert_eq!(
+            run(greedy, 1),
+            run(greedy, 999),
+            "temp==0 must stay greedy/deterministic"
+        );
+
+        // temp>0, seeded: reproducible, AND every emitted token is grammar-legal (a masked token
+        // could never be drawn). We re-validate the run against a fresh grammar to prove the tokens
+        // stayed inside the constraint.
+        let sampled = crate::sampling::Sampler {
+            temp: 1.2,
+            top_k: 0,
+            top_p: 0.95,
+        };
+        let a = run(sampled, 12345);
+        let b = run(sampled, 12345);
+        assert_eq!(a, b, "a seeded temp>0 constrained run must be reproducible");
+        let env = build_tok_env(&tok, cfg.vocab, &[cfg.eos]).expect("tok env");
+        let grammar = forced_tool_call_grammar(&tools).expect("grammar");
+        let mut check = Constraint::new(env, grammar).expect("constraint");
+        for &t in &a {
+            if t == cfg.eos {
+                continue;
+            }
+            assert!(
+                check.try_accept(t).expect("try_accept"),
+                "sampled token {t} escaped the grammar mask"
+            );
+        }
     }
 
     /// End-to-end: build the TokEnv from a real GGUF tokenizer, build the forced tool-call grammar,

@@ -22,7 +22,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining open:** **151** — 0 🔴, 29 🟠, 122 🟡.
+- **Remaining open:** **145** — 0 🔴, 28 🟠, 117 🟡.
 
 No finding was accepted on an agent's word — each was re-read against the source
 by the coordinator; two agent-flagged "MAJOR"s (the Q5_1 clamp in the shader and
@@ -41,6 +41,15 @@ parked path).
   the re-download loop) that excludes `mmproj`/float-master fallbacks,
   `refs/main` snapshot preference, trailing-colon ref parsing, and verify-once
   hashing.
+- **`infr-llama` sampling + grammar (all 6 findings)** — TDD, +8 tests incl.
+  byte-identity characterization guards on the default greedy/top-k paths.
+  Repeat penalty is now per-distinct-token (was `repeat^K`); grammar
+  `apply_mask` masks the padded-vocab tail to `-inf`; constrained decoding
+  honors the `Sampler` (greedy at temp==0, stays inside the grammar mask);
+  `seed|1` no longer collapses adjacent seeds; the `top_k==0` path uses a heap
+  instead of a ~150K full sort; `truncated_dist`/`sample_logits` share one
+  `truncated_softmax` helper. _Follow-up noted:_ `seed_rng()` (INFR_SEED path)
+  has the same latent `|1` — deferred to avoid perturbing INFR_SEED determinism.
 
 ### Highest-priority (production default paths)
 
@@ -53,7 +62,7 @@ parked path).
 | 5     | 🟠  | `infr-llama runner.rs:3743,3989`      | Prefix-cache records **KV rows never materialized** (`max_new==0` frontier; grammar-forced tokens) → next turn attends stale KV.            |
 | 6     | 🟠  | `infr-vulkan adapter.rs:2997`         | Static split-K attn bounds chunk _size_ not _count_ → `n_chunks>1024` **overruns `attn_combine` `wexp[1024]`** at huge ctx.                 |
 | 7     | 🟠  | `infr-vulkan ops.rs:229`              | Kernel-cache double-checked lock **double-compiles + leaks a pipeline** under concurrent first use.                                         |
-| 8     | 🟠  | `infr-llama sampling.rs:339`          | Repeat penalty applied **per-occurrence, not per-distinct-token** — diverges from the llama.cpp semantics it claims to match.               |
+| ~~8~~ | ✅  | `infr-llama sampling.rs`              | ~~Repeat penalty per-occurrence~~ — **FIXED** (`70bbe4e`; now per-distinct-token).                                                          |
 | 9     | 🟠  | `infr-vulkan shaders dg_eb_sample:61` | argmax reduce **drops the lower-index tie-break** → diverges from host on ties (feeds diffusion goldens).                                   |
 | 10    | 🟠  | `infr-gguf lib.rs:80`                 | Corrupt GGUF length prefix → **`pos+n` overflow panics** instead of a clean loader error (untrusted input).                                 |
 | 11    | 🟠  | `infr-cli main.rs:120`                | `--dev` **can't override an inherited `INFR_CPU`/`INFR_METAL`** → silent wrong-device runs; reader precedence inconsistent across commands. |
@@ -398,11 +407,11 @@ weighted highest._
    `attn_partial` gets from `sc[1024]`+`chunk≤512`. Opt-in `INFR_MROWS_ATTN`
    path. _Fix:_ static-assert/document `chunk≤SC_MAX` or clamp the write index.
 6. **🟡 `quant_kv.comp:128` (defensive) — `FMT_Q5_1` omits the `clamp(…,0,31)`
-   the Q4_0/Q4_1/Q5_0 arms apply.** Unlike Q5*0's asymmetric `x*id+16.5` (which
-   can genuinely round to 32.5), Q5_1's `(x-vmin)*id` is bounded by `vmax` so it
-   can't reach 32 barring impossible fp error — so this is a
+   the Q4_0/Q4_1/Q5_0 arms apply.** Unlike Q5*0's asymmetric
+   `x*id+16.5`(which can genuinely round to 32.5), Q5_1's`(x-vmin)_id`is bounded by`vmax`
+   so it can't reach 32 barring impossible fp error — so this is a
    robustness/consistency nit, not a live bug, but matching the siblings removes
-   the latent trap. \_Fix:* `clamp(int((x-vmin)*id+0.5),0,31)`.
+   the latent trap. \_Fix:_ `clamp(int((x-vmin)*id+0.5),0,31)`.
 7. **🟡 perf/DRY — 32-lane redundant recompute + copy-pasted softmax.**
    `attn_combine.comp:36,40` recompute `mm`/`l` over all `nch` identically in
    every one of 32 lanes (32× partial-array traffic; scales poorly as chunks
@@ -649,47 +658,6 @@ weighted highest._
    `prefill`/ `denoise` pairs hold byte-identical weight-upload closures. _Fix:_
    route through `self.encode`; hoist one `*_upload_bind()` per backend.
 
-## infr-llama/src/{config,sampling,grammar,tokenizer}.rs
-
-1. **🟠 `sampling.rs:339 — repeat penalty applied per-occurrence, not
-   per-distinct-token, diverging from the llama.cpp semantics it claims to
-   match.** `apply` iterates the raw `recent` VecDeque (holds duplicates), so a
-   token appearing K times in the window is scaled K times (`l/repeat^K`) —
-   while the code already maintains a distinct `counts` map (used correctly for
-   presence/frequency at `349`). llama.cpp applies `repeat_penalty` once per
-   distinct id. The error compounds fastest on the degenerate loop repeat
-   penalty exists to fight. _Fix:_ penalize each distinct id in the window once
-   (drive off `counts`' keys).
-2. **🟡 `grammar.rs:97 — `apply_mask`fails OPEN for logits beyond`self.vocab`.**
-   `n=logits.len().min(vocab)` + `.take(n)`, so on a padded-vocab GGUF
-   (`logits.len()>vocab`) ids in `[vocab, len)` are never set to `-inf` and
-   `constrained_step`'s full-slice `argmax` can emit an out-of-grammar,
-   out-of-trie token. _Fix:_ force every id `≥vocab` to `-inf` (mask the tail).
-3. **🟡 `grammar.rs:155 — constrained decoding silently ignores the `Sampler`**
-   (temp/top-p/seed): `constrained_step` always `argmax`es within the mask. A
-   request setting temperature/top*p/seed with `tool_choice:"required"` gets
-   deterministic greedy output with no diagnostic. Defensible for tool-call
-   determinism but an undocumented divergence. \_Fix:* sample within the masked
-   distribution using the same `Sampler`/`rng`, or document the greedy behavior.
-4. **🟡 `sampling.rs:298 — `seed | 1` collapses adjacent seeds to identical
-   streams** (`2k` and `2k+1` map to the same xorshift state) → "different seed,
-   same result." _Fix:_ map only the degenerate `s==0` to a nonzero const,
-   preserve all others.
-5. **🟡
-   `sampling.rs:418 — full-vocab alloc + full `sort_unstable`per token when`top_k==0
-   && temp>0`.** `k=n` skips truncation, so `(0..n).collect()` (150K+ for Qwen)
-   is sorted every token on the host-sampling path. Default `top_k=20` avoids
-   it, but disabling top-k with temperature hits O(V log V)+O(V)/token. _Fix:_
-   partial/heap select over the nucleus prefix; reuse a scratch `idx` buffer.
-6. **🟡 DRY/fragility — `sampling.rs:474` `truncated_dist` duplicates
-   `sample_logits`'s top-k/softmax/nucleus body** (~40 lines; only the _final
-   draw_ needs the bit-pinned float ops, not the truncation math). And the
-   nucleus renorm (`449`) draws against un-renormalized `probs` in a
-   coupled-invariant that silently breaks if `cutoff`/`total` are edited apart
-   or `probs` reused. _Fix:_ factor one "build truncated normalized
-   `(idx,probs,cutoff)`" helper; renormalize once and draw against
-   `next_uniform()`.
-
 ## infr-llama/src/mtp/{mod,backends}.rs (MTP spec-decode, parked/opt-in)
 
 _`INFR_MTP` is opt-in and token-identity is VERIFY-guarded, so the correctness
@@ -703,9 +671,8 @@ items below are latent acceptance-rate/perf bugs, not output corruption._
 2. **🟠 `mtp/mod.rs:1867 — `catch_up` computes + downloads a full vocab-wide
    logits row it discards every cycle.** It calls `sess.forward()` and drops the
    result, but `forward` always builds the non-fused graph with the lm*head
-   `Op::Linear [rows,vocab]` as an `Output` and downloads `rows*vocab` f32. For
-   catch-up only the `WriteKv` ops matter — the `rows×n_embd×151936` GEMM +
-   readback is pure waste per spec cycle. \_Fix:* a `want_logits:false`/KV-only
+   `Op::Linear [rows,vocab]` as an `Output` and downloads
+   `rows*vocab`f32. For catch-up only the`WriteKv`ops matter — the`rows×n_embd×151936`GEMM + readback is pure waste per spec cycle. \_Fix:* a`want_logits:false`/KV-only
    forward variant that omits the lm_head Linear + its download.
 3. **🟡 `mtp/mod.rs:2536 — `pending_h` handed to the next cycle's draft is one
    step stale** vs the init handoff (`h_{n_past+accepted-1}` for
@@ -847,12 +814,9 @@ agent verified and correctly ruled that out.)_
    path if that HW matters.
 4. **🟡 `kernels.rs:835,1642 — DRY + per-call scratch allocs.** The
    144-byte-block decode/nibble-unpack sequence is copy-pasted ~10× across the
-   Q4*K batch kernels (and Q5_K/Q6_K analogs); each `_batch*` call
-   heap-allocates fresh `d_arr`/`sc_arr`/`*_flat` (+ `ilv=vec![0u8;nb*2048]`) —
-   churn inside the matmul row loop that dominates at small `m` (decode).
-   \_Fix:* `#[inline]` `q4k_decode_row(...)` helper;
-   caller-provided/thread-local reusable scratch (or route small-`m` to the
-   single-token kernels).
+   Q4*K batch kernels (and Q5_K/Q6_K analogs); each
+   `\_batch*`call heap-allocates fresh`d_arr`/`sc_arr`/`*\_flat`(+`ilv=vec![0u8;nb*2048]`) — churn inside the matmul row loop that dominates at small `m`(decode). \_Fix:*`#[inline]` `q4k_decode_row(...)` helper; caller-provided/thread-local reusable scratch (or route small-`m`
+   to the single-token kernels).
 5. **🟡
    `kernels.rs:312 (doc) — Q6_K maddubs pair-sum bound comment says `±8001`**
    but `maddubs` sums two adjacent products → true bound `2·63·127=16002`
@@ -1125,8 +1089,8 @@ prof crates only:_
    substring matching also can't tell `infr_prof::skip` from an unrelated
    `skip`. `visit_item_mod_mut` (`129`) similarly skips any module whose attr
    string `contains("test")` — wrongly dropping instrumentation from
-   `#[cfg(not(test))]` and `feature="test-*"` modules. \_Fix:* match the
-   attribute path/`cfg` meta structurally, exclude `doc`.
+   `#[cfg(not(test))]` and
+   `feature="test-*"` modules. \_Fix:* match the attribute path/`cfg`meta structurally, exclude`doc`.
 2. **🟡
    `infr-prof-rt/lib.rs:324 — GPU-report sort `partial_cmp(...).unwrap()`panics on a NaN`us`**
    (bad timestamp delta) inside the `atexit` reporter, aborting at process

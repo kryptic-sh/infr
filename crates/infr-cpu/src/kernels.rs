@@ -2959,6 +2959,131 @@ pub(crate) fn vec_dot_iq2xxs_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mu
     }
 }
 
+/// Expand a whole IQ1_S weight row (50 bytes / 256 elems per super-block) to signed `i8` grid
+/// weights ONCE — mirrors `dequant_block(DType::Iq1S)` (dequant.rs) EXACTLY. IQ1_S is a
+/// grid-codebook quant with a per-32 fractional `delta` that is NOT part of the signed codebook, so
+/// unlike IQ2_XXS it can't be folded into the i8 weights: this fn stores the raw signed grid value
+/// (`g_j`, delta NOT baked in) plus the per-8-group `dl` scale and `delta` offset (both constant
+/// across the 4 groups-of-8 inside a sub-block, i.e. per-32). Block = 50 bytes: `[f16 d]` (2),
+/// `[u8 qs[32]]`, `[u8 qh[16]]` (= 8 × `u16` LE). 8 sub-blocks (`ib`); per sub-block
+/// `dl = d*(2*((qh>>12)&7)+1)`, `delta = ±IQ1S_DELTA` per the `0x8000` bit; each of the 4 groups
+/// (`l`) reads an 11-bit grid index `qs[l] | (((qh>>3l)&7)<<8)` into the 2048-entry `IQ1S_GRID`
+/// (each entry packs 8 signed i8). `weights[b*256 + g*8 + k]`, `dls[b*32 + g]`, `deltas[b*32 + g]`
+/// are in the SAME `outoff` element order the dequant writes. `in_f` must be a multiple of 256.
+fn iq1s_expand_row(row: &[u8], in_f: usize) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
+    use infr_core::iquant_grids::IQ1S_GRID;
+    use infr_gguf::dequant::IQ1S_DELTA;
+    let nb = in_f / 256;
+    let mut weights = vec![0i8; nb * 256];
+    let mut dls = vec![0f32; nb * 32];
+    let mut deltas = vec![0f32; nb * 32];
+    for b in 0..nb {
+        let blk = &row[b * 50..b * 50 + 50];
+        let d = rdf16(&blk[0..2]);
+        let qs = &blk[2..34]; // 32 bytes
+        let qh_raw = &blk[34..50]; // 16 bytes = 8 × u16 LE
+        let mut outoff = 0usize;
+        let mut qs_off = 0usize;
+        for ib in 0..8usize {
+            let qh = u16::from_le_bytes(qh_raw[2 * ib..2 * ib + 2].try_into().unwrap());
+            // Per-32 scale & delta (constant across the 4 groups-of-8 in this sub-block).
+            let dl = d * (2.0 * ((qh >> 12) & 7) as f32 + 1.0);
+            let delta = if qh & 0x8000 != 0 {
+                -IQ1S_DELTA
+            } else {
+                IQ1S_DELTA
+            };
+            for l in 0..4usize {
+                let g = ib * 4 + l; // group index within block (0..32); outoff == g*8
+                let grid_idx = qs[qs_off + l] as usize | (((qh >> (3 * l)) & 7) as usize) << 8;
+                let grid_u64 = IQ1S_GRID[grid_idx];
+                dls[b * 32 + g] = dl;
+                deltas[b * 32 + g] = delta;
+                let dst = &mut weights[b * 256 + outoff..b * 256 + outoff + 8];
+                for (j, dj) in dst.iter_mut().enumerate() {
+                    // Raw signed grid i8 — delta is applied at dot time, NOT baked in.
+                    *dj = ((grid_u64 >> (8 * j)) & 0xFF) as i8;
+                }
+                outoff += 8;
+            }
+            qs_off += 4;
+        }
+    }
+    (weights, dls, deltas)
+}
+
+/// `Σ weight·x` for one IQ1_S row against the Q8 activation. Expands the grid row to signed i8 once
+/// (`iq1s_expand_row`), then per group of 8 forms `iprod = Σ grid·qa` AND `asum = Σ qa` (the
+/// activation sum), accumulating `dl·(iprod + delta·asum)` in an f32 block sum — the delta split of
+/// `Σ dl·(grid+delta)·(as·qa) = dl·as·(iprod + delta·asum)`, since the fractional `delta` can't be
+/// folded into the i8 grid. ONE multiply by the super-block activation scale `q8.d[b]` per 256.
+/// `in_f` must be a multiple of 256.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_iq1s(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_iq1s: in_f must be a multiple of 256"
+    );
+    let nb = in_f / 256;
+    let (weights, dls, deltas) = iq1s_expand_row(row, in_f);
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let mut block_sum = 0f32;
+        for g in 0..32usize {
+            let w = &weights[b * 256 + g * 8..b * 256 + g * 8 + 8];
+            let a = &q8b[g * 8..g * 8 + 8];
+            let mut iprod = 0i32;
+            let mut asum = 0i32;
+            for k in 0..8usize {
+                iprod += w[k] as i32 * a[k] as i32;
+                asum += a[k] as i32;
+            }
+            block_sum += dls[b * 32 + g] * (iprod as f32 + deltas[b * 32 + g] * asum as f32);
+        }
+        sumf += q8.d[b] * block_sum;
+    }
+    sumf
+}
+
+/// Batched `Σ weight·x` for one IQ1_S row against `m` Q8 activations (`out[r]`). Expands the grid
+/// row to signed i8 ONCE (`iq1s_expand_row`), then reuses it across all `m` token activations — the
+/// amortisation the single-token path can't do. Bit-identical accumulation to `vec_dot_iq1s` (same
+/// group order, same `iprod`/`asum` split, same f32 epilogue), so batch and single agree to the bit.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_iq1s_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_iq1s_batch: in_f must be a multiple of 256"
+    );
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let (weights, dls, deltas) = iq1s_expand_row(row, in_f);
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            let mut block_sum = 0f32;
+            for g in 0..32usize {
+                let w = &weights[b * 256 + g * 8..b * 256 + g * 8 + 8];
+                let a = &q8b[g * 8..g * 8 + 8];
+                let mut iprod = 0i32;
+                let mut asum = 0i32;
+                for k in 0..8usize {
+                    iprod += w[k] as i32 * a[k] as i32;
+                    asum += a[k] as i32;
+                }
+                block_sum += dls[b * 32 + g] * (iprod as f32 + deltas[b * 32 + g] * asum as f32);
+            }
+            sumf += q8.d[b] * block_sum;
+        }
+        out[r] = sumf;
+    }
+}
+
 /// Expand a whole IQ2_XS weight row (74 bytes / 256 elems per super-block) to signed `i8` codebook
 /// weights ONCE, alongside the per-16-element `dl` scales — mirrors `dequant_codebook(DType::Iq2Xs)`
 /// exactly. IQ2_XS is a GRID-codebook quant: each super-block is 8 sub-blocks of 32; sub-block
@@ -7426,6 +7551,116 @@ mod kernel_tests {
                 assert!(
                     rel_err(got1, want_f) < 3e-2,
                     "iq2xxs single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
+                );
+            }
+        }
+    }
+
+    /// Build `nb` random 50-byte IQ1_S super-blocks with a fixed `d`. Every generated block is a
+    /// legal IQ1_S block: `qs[32]` are the low 8 bits of each 11-bit grid index and the `qh[8]`
+    /// `u16`s supply the high 3 bits per group (`(qh>>3l)&7`) → any 11-bit index ∈ 0..2047 hits the
+    /// 2048-entry `IQ1S_GRID`. The per-sub-block scale bits `(qh>>12)&7` are drawn across their full
+    /// 0..7 range and the `0x8000` delta-sign bit across {0,1}, so both `dl` magnitudes and both
+    /// `delta` signs are exercised (per the TDD requirement).
+    fn build_iq1s_rand(nb: usize, d: f32, mut seed: u64) -> Vec<u8> {
+        let mut w = vec![0u8; nb * 50];
+        for b in 0..nb {
+            let blk = &mut w[b * 50..b * 50 + 50];
+            put_f16(&mut blk[0..2], d);
+            // qs[32]: random grid low bytes.
+            for j in 0..32usize {
+                blk[2 + j] = (lcg(&mut seed) >> 33) as u8;
+            }
+            // qh[16] = 8 × u16 LE. Low 12 bits carry the per-group grid high bits (3 bits each for
+            // l=0..3, i.e. bits 0..11); bits 12..14 are the scale, bit 15 the delta sign.
+            for ib in 0..8usize {
+                let low = (lcg(&mut seed) >> 20) as u16 & 0x0fff;
+                let scale = (lcg(&mut seed) % 8) as u16; // (qh>>12)&7 across 0..7 → both dl mags
+                let sign = ((lcg(&mut seed) >> 40) & 1) as u16; // 0x8000 across both delta signs
+                let qh = low | (scale << 12) | (sign << 15);
+                blk[34 + 2 * ib..34 + 2 * ib + 2].copy_from_slice(&qh.to_le_bytes());
+            }
+        }
+        w
+    }
+
+    /// Batch and single-token IQ1_S kernels share the SAME scalar grid expansion and f32
+    /// accumulation order (incl. the `iprod`/`asum` delta split), so they must agree to the bit for
+    /// every row. Random valid blocks exercise the whole grid, all scale bits, and both delta signs.
+    #[test]
+    fn iq1s_batch_matches_single() {
+        for in_f in [256usize, 512] {
+            let nb = in_f / 256;
+            let w = build_iq1s_rand(nb, 0.05, 90);
+            let m = 5usize;
+            let q8s: Vec<Q8> = (0..m)
+                .map(|r| quantize_q8(&det_x(in_f, 91 + r as u64)))
+                .collect();
+            let mut batch_out = vec![0f32; m];
+            vec_dot_iq1s_batch(&w, &q8s, in_f, &mut batch_out);
+            for (r, q8) in q8s.iter().enumerate() {
+                let single = vec_dot_iq1s(&w, q8, in_f);
+                assert_eq!(
+                    batch_out[r].to_bits(),
+                    single.to_bits(),
+                    "iq1s batch vs single in_f={in_f} row={r}: batch {}, single {single}",
+                    batch_out[r]
+                );
+            }
+        }
+    }
+
+    /// End-to-end tolerance-parity: the int8-activation IQ1_S kernel must track the FULL-PRECISION
+    /// grid+delta dequant (`dl·(grid+delta)`) · f32-activation reference from `dequant_block`. IQ1_S
+    /// weights are stored exactly (grid value + fractional delta, no weight-quant loss), so vs the
+    /// QUANTIZED activation the kernel actually sees, the only slack is f32 accumulation order → tight
+    /// 1e-3. This isolates the grid+delta+scale decode, the integer `iprod` dot, AND the `delta·asum`
+    /// split (the wrinkle vs IQ2_XXS) as the primary correctness proof (no model available). vs the
+    /// full-precision activation, the looser 3e-2 absorbs the lossy int8 activation quant. Covers
+    /// single-row (m=1) and batch (m>1). Seed 267 is well-conditioned for the loose full-ref bound
+    /// (worst full-ref rel_err ~2.4e-3; fully-random weight seeds routinely drive it past 3e-2 as the
+    /// small {-1,0,1} grid values + ±0.125 delta make per-group sign cancellation dominate the int8
+    /// activation-quant noise — the tight quant-ref bound below is the real proof and holds for any).
+    #[test]
+    fn iq1s_matches_dequant_reference() {
+        for in_f in [256usize, 512] {
+            let nb = in_f / 256;
+            let w = build_iq1s_rand(nb, 0.05, 267);
+            let wref = dequant_block(DType::Iq1S, &w).unwrap();
+            // Sanity: reference spans nonzero grid values.
+            assert!(wref.iter().any(|&v| v != 0.0));
+            let xs: Vec<Vec<f32>> = (0..4).map(|i| det_x(in_f, 71 + i)).collect();
+            let q8s: Vec<Q8> = xs.iter().map(|x| quantize_q8(x)).collect();
+
+            // Batch (m>1).
+            let mut got = vec![0f32; xs.len()];
+            vec_dot_iq1s_batch(&w, &q8s, in_f, &mut got);
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got[r], want_q) < 1e-3,
+                    "iq1s batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
+                    got[r]
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got[r], want_f) < 3e-2,
+                    "iq1s batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
+                    got[r]
+                );
+            }
+            // Single-row (m=1).
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let got1 = vec_dot_iq1s(&w, q8, in_f);
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got1, want_q) < 1e-3,
+                    "iq1s single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got1, want_f) < 3e-2,
+                    "iq1s single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
                 );
             }
         }

@@ -288,11 +288,9 @@ mod tests {
     }
 
     #[test]
-    fn qui_linear_kerns_match_legacy_arms() {
+    fn qui_linear_kerns_are_format_matched() {
         // Every base `weight_qui` can produce. The single registry must map each base × suffix to
-        // the SAME kernel name the old parallel match arms did: `base + suffix` for hmm/cmm/rt on
-        // all 16, and the same for cmm_ks EXCEPT iq4xs/iq4nl which the old `_ =>` arm sent to
-        // `linear_quik8_cmm_ks` (a latent mismatch preserved verbatim, not fixed here).
+        // the format-matched kernel name for all four cooperative/row-tiled variants.
         let bases = [
             "linear_quik4",
             "linear_quik6",
@@ -319,11 +317,7 @@ mod tests {
             assert_eq!(k.hmm, format!("{base}_hmm").as_str());
             assert_eq!(k.cmm, format!("{base}_cmm").as_str());
             assert_eq!(k.rt, format!("{base}_rt").as_str());
-            let expected_cmm_ks = if base == "linear_iq4xs" || base == "linear_iq4nl" {
-                "linear_quik8_cmm_ks".to_string()
-            } else {
-                format!("{base}_cmm_ks")
-            };
+            let expected_cmm_ks = format!("{base}_cmm_ks");
             assert_eq!(k.cmm_ks, expected_cmm_ks.as_str());
         }
         // Q2_K/Q3_K are now NATIVE (their `linear_q2k`/`linear_q3k` decode kernels exist), so the
@@ -857,10 +851,6 @@ fn prefer_iq4nl_rt(kern: &str, m: usize) -> bool {
 /// REGISTRY error (a new dtype wired into `weight_qui` without its Linear kernels), never the old
 /// silent `_ => "linear_quik8_*"` default that would read foreign-packed codes as quik8.
 ///
-/// `cmm_ks` is the lone irregular column: the old split-K match omitted `iq4xs`/`iq4nl`, so they
-/// fell to `linear_quik8_cmm_ks`. That verbatim behavior is preserved here (the two override cells)
-/// — it is a pre-existing latent mismatch flagged for review, deliberately NOT changed in this
-/// behavior-preserving pass even though `linear_iq4xs_cmm_ks`/`linear_iq4nl_cmm_ks` exist.
 struct QuiLinearKerns {
     hmm: &'static str,
     cmm: &'static str,
@@ -891,14 +881,8 @@ fn qui_linear_kerns(base: &str) -> Option<QuiLinearKerns> {
         "linear_q8_0" => kset!("linear_q8_0"),
         "linear_q5_0" => kset!("linear_q5_0"),
         "linear_q4_0" => kset!("linear_q4_0"),
-        "linear_iq4xs" => QuiLinearKerns {
-            cmm_ks: "linear_quik8_cmm_ks",
-            ..kset!("linear_iq4xs")
-        },
-        "linear_iq4nl" => QuiLinearKerns {
-            cmm_ks: "linear_quik8_cmm_ks",
-            ..kset!("linear_iq4nl")
-        },
+        "linear_iq4xs" => kset!("linear_iq4xs"),
+        "linear_iq4nl" => kset!("linear_iq4nl"),
         "linear_iq2xxs" => kset!("linear_iq2xxs"),
         "linear_iq3xxs" => kset!("linear_iq3xxs"),
         "linear_iq3s" => kset!("linear_iq3s"),

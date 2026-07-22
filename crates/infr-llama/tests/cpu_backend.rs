@@ -926,6 +926,93 @@ fn gpu_seam_matches_cpu_llama() {
     seam_vulkan_matches_cpu(&path, "Count from one to five, digits only.", 16);
 }
 
+/// Plain Llama RoPE must produce the same multi-token continuation through Metal's default decode
+/// replay and its forced-static path. This specifically guards against replaying token 0's baked
+/// RoPE position on later decode steps; static Metal is the same-precision oracle.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_llama_replay_matches_static() {
+    let path = need_model!(llama32_1b(), "Llama-3.2-1B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let model = infr_llama::SeamModel::load(&path, None).expect("model load");
+    let prompt = model
+        .render_chat("Count from one to five, digits only.")
+        .expect("render chat");
+
+    let run_metal = |no_replay: bool| {
+        if no_replay {
+            std::env::set_var("INFR_SEAM_NO_REPLAY", "1");
+        } else {
+            std::env::remove_var("INFR_SEAM_NO_REPLAY");
+        }
+        let mut out = String::new();
+        model
+            .generate_metal(&prompt, 16, None, |p| out.push_str(p))
+            .expect("metal generation");
+        std::env::remove_var("INFR_SEAM_NO_REPLAY");
+        out
+    };
+
+    let replay = run_metal(false);
+    let statc = run_metal(true);
+    std::env::remove_var("INFR_TEMP");
+    assert_eq!(
+        replay, statc,
+        "Metal replay diverged from static Llama decode"
+    );
+}
+
+/// The audit's pooled Metal scratch buffers must remain coherent when attention repeatedly reuses
+/// them across layers and tokens. Exercise the coupled-Q8 q-cast and the decoupled-KV dequant
+/// prepasses on a prompt wide enough to enter prefill attention before continuing through decode.
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_kv_scratch_paths_are_coherent() {
+    const EXPECTED: u64 = 0xef91_912b_db14_c7fd;
+    let path = need_model!(llama32_1b(), "Llama-3.2-1B");
+    let _tlk = test_serial_lock();
+    std::env::set_var("INFR_TEMP", "0");
+    let prompt =
+        "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
+    for (k, v) in [
+        ("q8_0", "q8_0"),
+        ("f16", "q4_1"),
+        ("f16", "q5_0"),
+        ("f16", "q5_1"),
+        ("bf16", "bf16"),
+        ("f16", "turbo2"),
+        ("f16", "turbo3"),
+        ("f16", "turbo4"),
+    ] {
+        std::env::set_var("INFR_KV_TYPE_K", k);
+        std::env::set_var("INFR_KV_TYPE_V", v);
+        let model = infr_llama::SeamModel::load(&path, None).expect("model load");
+        let rendered = model.render_chat(&prompt).expect("render chat");
+        let mut out = String::new();
+        model
+            .generate_metal(&rendered, 16, None, |p| out.push_str(p))
+            .expect("metal generation");
+        assert!(
+            !out.trim().is_empty(),
+            "Metal K={k} V={v} produced no output"
+        );
+        assert!(
+            !is_degenerate(&out),
+            "Metal K={k} V={v} output degenerate: {:?}",
+            out.chars().take(64).collect::<String>()
+        );
+        assert_eq!(
+            fnv1a(&out),
+            EXPECTED,
+            "Metal K={k} V={v} generation changed: {out:?}"
+        );
+    }
+    for var in ["INFR_TEMP", "INFR_KV_TYPE_K", "INFR_KV_TYPE_V"] {
+        std::env::remove_var(var);
+    }
+}
+
 /// gemma4 (heterogeneous head dims 256/512, V-norm, freq_factors, softcap) through the Vulkan seam.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
@@ -1083,6 +1170,9 @@ fn gemma3_1b_q2k() -> Option<PathBuf> {
 // ─── Llama (plain interleaved RoPE, no qk-norm) ────────────────────────────────
 
 fn llama32_1b() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("INFR_TEST_LLAMA") {
+        return Some(PathBuf::from(p));
+    }
     find_gguf(
         "unsloth--Llama-3.2-1B-Instruct-GGUF",
         "Llama-3.2-1B-Instruct-Q8_0.gguf",

@@ -1103,6 +1103,21 @@ fn linear_iq4nl_small_multirow_matches_dequant_reference() {
 
 #[test]
 #[ignore = "requires a Metal GPU"]
+fn linear_iq4nl_split_k_matches_dequant_reference() {
+    let (m, in_f, out_f) = (5usize, 256usize, 64usize);
+    check_quant_linear_parity_impl(
+        DType::Iq4Nl,
+        synth_iq4nl(out_f * in_f, 124),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
 fn linear_add_fusion_iq4nl_parity() {
     let (in_f, out_f) = (512usize, 384usize);
     check_linear_add_fusion(DType::Iq4Nl, synth_iq4nl(out_f * in_f, 120), in_f, out_f);
@@ -1113,6 +1128,21 @@ fn linear_add_fusion_iq4nl_parity() {
 fn linear_iq4xs_matches_dequant_reference() {
     let (m, in_f, out_f) = (2usize, 256usize, 96usize);
     check_quant_linear_parity(DType::Iq4Xs, synth_iq4xs(out_f * in_f, 122), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq4xs_split_k_matches_dequant_reference() {
+    let (m, in_f, out_f) = (2usize, 256usize, 64usize);
+    check_quant_linear_parity_impl(
+        DType::Iq4Xs,
+        synth_iq4xs(out_f * in_f, 125),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
 }
 
 #[test]
@@ -3275,6 +3305,50 @@ fn sample_f32_vocab_split_matches_cpu() {
         });
         assert_id_parity(&g, &[(x, f32_bytes(&xs)), (u, f32_bytes(&[uu]))], dst, 1);
     }
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn sample_f32_vocab_split_clamps_large_top_k() {
+    let n = 151_936usize;
+    let xs: Vec<f32> = rand_f32(n, 126).iter().map(|v| v * 8.0).collect();
+    let sample = |top_k| {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![n], DType::F32));
+        let u = g.input(TensorDesc::new(vec![1], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![1], DType::F32));
+        g.push(Op::Sample {
+            x,
+            u,
+            dst,
+            n: n as u32,
+            top_k,
+            temp: 1.0,
+            top_p: 1.0,
+        });
+        (g, x, u, dst)
+    };
+    let (mtl_g, mtl_x, mtl_u, mtl_dst) = sample(100);
+    let (cpu_g, cpu_x, cpu_u, cpu_dst) = sample(64);
+    let mtl = run(
+        &MetalBackend::new().expect("metal backend"),
+        &mtl_g,
+        &[(mtl_x, f32_bytes(&xs)), (mtl_u, f32_bytes(&[0.999]))],
+        mtl_dst,
+        1,
+    );
+    let cpu = run(
+        &CpuBackend::new(),
+        &cpu_g,
+        &[(cpu_x, f32_bytes(&xs)), (cpu_u, f32_bytes(&[0.999]))],
+        cpu_dst,
+        1,
+    );
+    assert_eq!(
+        mtl[0].to_bits(),
+        cpu[0].to_bits(),
+        "top_k=100 must match the effective top_k=64 CPU reference"
+    );
 }
 
 // embed_gather_*: dst[r, :] = dequant(table[ids[r], :]) * scale, gathering the

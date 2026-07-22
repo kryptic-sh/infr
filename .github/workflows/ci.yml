@@ -92,7 +92,11 @@ jobs:
   #                                          non-256-in_f arch that caught Q8_0
   #   unsloth/Qwen3-0.6B-GGUF     (379 MB) — dense; also drives the cpu_kv_*
   #                                          coherence + quant-sweep tests
-  #   unsloth/Qwen3.5-0.8B-GGUF   (508 MB) — gated-DeltaNet (qwen35) golden
+  # Qwen3.5-0.8B (gated-DeltaNet) is intentionally NOT downloaded: its longer
+  # greedy generation is FP-sensitive, so the exact-token golden hash is not
+  # portable across CPU microarchitectures (coherent but different tokens on the
+  # runner vs the dev box). gemma3/qwen3 are short + stable enough to reproduce
+  # bit-for-bit; with the model absent, cpu_golden_qwen35 self-skips (need_model!).
   cpu-goldens:
     name: cargo test (CPU goldens, real models)
     runs-on: ubuntu-26.04
@@ -113,13 +117,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-cpu-goldens-gemma3-1b_qwen3-06b_qwen35-08b-q4km-v1
+          key: hf-cpu-goldens-gemma3-1b_qwen3-06b-q4km-v2
       - name: Download golden GGUFs (single file per repo)
         run: |
           pipx install huggingface_hub
           hf download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
           hf download unsloth/Qwen3-0.6B-GGUF   Qwen3-0.6B-Q4_K_M.gguf
-          hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf
       # Release build: these run real CPU inference (the f32 reference backend),
       # which is far too slow to time out in debug. Single-threaded because the
       # goldens mutate process-global generation env under a shared lock.

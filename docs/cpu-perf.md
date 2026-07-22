@@ -114,7 +114,13 @@ produced in a way that looks like garbage is a bug, not a precision flip.
   allocation + copy traffic.
 - **Impact:** moderate prefill win; removes allocator pressure.
 - **Precision:** bit-identical.
-- **Status:** TODO
+- **Status:** DEFERRED — measured negligible. 9B has 18 DeltaNet layers × ~12 MB
+  (q/k/v) clones = ~216 MB memcpy per 512-tok prefill ≈ **~0.1%** of a ~4.7 s
+  prefill; transient allocs are freed immediately (no RSS concern) and decode is
+  rr=1 (nothing to clone). Not worth the disjoint-`vals`-accessor complexity /
+  unsafe borrow-splitting. Revisit only if a profile flags DeltaNet allocation,
+  or fold into a broader `vals` accessor refactor if one is done for another
+  reason.
 
 ### 4. Native int8 dot: **Q4_0** — _medium_
 

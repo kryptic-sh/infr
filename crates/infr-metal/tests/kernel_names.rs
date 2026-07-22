@@ -276,9 +276,10 @@ fn every_dispatchable_kernel_exists_in_the_library() {
         rest = &rest[end + 1..];
         // Kernel-SHAPED literals that are NOT dispatch targets. `linear_q2k`/`linear_q3k` used to
         // live here (no native kernel; they appeared only in a negative registry assertion), but
-        // both are now NATIVE with real `linear_q2k`/`linear_q3k` decode kernels in the library, so
-        // they ARE dispatched and must resolve like any other name — nothing to exclude.
-        const NOT_DISPATCHED: &[&str] = &[];
+        // both are now NATIVE with real decode kernels in the library, so they ARE dispatched and
+        // resolve like any other name. `linear_quik_bogus` is the deliberately-fake base in
+        // exec.rs's `qui_linear_kerns` loud-miss assertion — never a real kernel, exclude it.
+        const NOT_DISPATCHED: &[&str] = &["linear_quik_bogus"];
         if !lit.is_empty()
             && lit
                 .chars()

@@ -117,9 +117,9 @@ jobs:
       - name: Download golden GGUFs (single file per repo)
         run: |
           pipx install huggingface_hub
-          huggingface-cli download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
-          huggingface-cli download unsloth/Qwen3-0.6B-GGUF   Qwen3-0.6B-Q4_K_M.gguf
-          huggingface-cli download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf
+          hf download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
+          hf download unsloth/Qwen3-0.6B-GGUF   Qwen3-0.6B-Q4_K_M.gguf
+          hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf
       # Release build: these run real CPU inference (the f32 reference backend),
       # which is far too slow to time out in debug. Single-threaded because the
       # goldens mutate process-global generation env under a shared lock.

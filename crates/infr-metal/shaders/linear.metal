@@ -507,6 +507,83 @@ inline float ue4m3_to_fp32_msl(uint x) {
         wk[k + 8u] = d * kvalues_mxfp4_f[(qs[k] >> 4) & 0xFu];                                    \
     }
 
+// NATIVE Q2_0 block (18 B / 64 elems): [f16 d][16 B qs] — Bonsai ternary, 2 bits/elem packed
+// sequentially. value = d * (q - 1), q in 0..3. Element j maps to byte qs[j/4], shift (j%4)*2
+// (fully sequential, NO nibble interleave). The 64-elem block spans FOUR DEC16 chunks, so
+// bi >> 2 is the block and (bi & 3) picks the 16-element chunk covering global-in-block indices
+// (bi&3)*16 .. +16. Bit-for-bit dequantize_row_q2_0 / vec_dot_q2_0_batch_scalar.
+#define DEC16_Q2_0(wk)                                                                            \
+    device const uchar* blk = codes + (ulong)(bi >> 2) * 18ul;                                    \
+    float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));                     \
+    device const uchar* qs = blk + 2u;                                                            \
+    uint g0 = (bi & 3u) * 16u;                                                                     \
+    for (uint e = 0; e < 16u; e++) {                                                              \
+        uint g = g0 + e;                                                                          \
+        uint q = (qs[g >> 2] >> ((g & 3u) * 2u)) & 3u;                                            \
+        wk[e] = d * ((float)q - 1.0f);                                                            \
+    }
+
+// NATIVE TQ2_0 block (66 B / 256 elems): [64 B qs][f16 d] — ternary, 2 bits/elem. value =
+// d * (q - 1), q in 0..3. Two 32-byte chunks: for chunk in 0..2, l in 0..4, m in 0..32 → element
+// chunk*128 + l*32 + m, sourced from qs[chunk*32 + m] >> (l*2). The 256-elem block spans SIXTEEN
+// DEC16 chunks (bi & 15 selects the 16-element chunk, bi >> 4 the block); each element's
+// (chunk,l,m) is recovered from its global-in-block index. Bit-for-bit dequantize_row_tq2_0 /
+// vec_dot_tq2_0_scalar.
+#define DEC16_TQ2_0(wk)                                                                           \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 66ul;                                    \
+    device const uchar* qs = blk;                                                                 \
+    float d = (float)as_type<half>((ushort)(blk[64] | ((ushort)blk[65] << 8)));                   \
+    uint g0 = (bi & 15u) * 16u;                                                                    \
+    for (uint e = 0; e < 16u; e++) {                                                              \
+        uint g = g0 + e;                                                                          \
+        uint chunk = g >> 7;                                                                      \
+        uint rem = g & 127u;                                                                      \
+        uint l = rem >> 5;                                                                        \
+        uint m = rem & 31u;                                                                       \
+        uint q = (qs[chunk * 32u + m] >> (l * 2u)) & 3u;                                          \
+        wk[e] = d * ((float)q - 1.0f);                                                            \
+    }
+
+// Base-3 place values for the TQ1_0 5-digits-per-byte packing (llama.cpp pow3).
+constant uint kpow3_tq1[6] = {1u, 3u, 9u, 27u, 81u, 243u};
+
+// NATIVE TQ1_0 block (54 B / 256 elems): [48 B qs][4 B qh][f16 d] — ternary base-3, 5 digits per
+// byte. digit = (((byte * pow3[n]) & 0xFF) * 3) >> 8, in {0,1,2}; value = d * (digit - 1). Three
+// element segments (mirroring the CPU scalar exactly):
+//   * elems 0..160  : qs[0..32], 5 passes → element n*32 + m, source byte qs[m], pass n = g/32
+//   * elems 160..240: qs[32..48], 5 passes → element 160 + n*16 + m, source qs[32+m], n = g'/16
+//   * elems 240..256: qh[0..4], 4 passes → element 240 + n*4 + j, source qh[j], n = g''/4
+// The 256-elem block spans SIXTEEN DEC16 chunks (bi & 15 picks the chunk, bi >> 4 the block); each
+// element's (segment, pass, source-byte) is recovered from its global-in-block index. The u8
+// wrapping-multiply (`& 0xFF`) mirrors the CPU `wrapping_mul`. Bit-for-bit dequantize_row_tq1_0 /
+// vec_dot_tq1_0_scalar.
+#define DEC16_TQ1_0(wk)                                                                           \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 54ul;                                    \
+    device const uchar* qs = blk;                                                                 \
+    device const uchar* qh = blk + 48u;                                                           \
+    float d = (float)as_type<half>((ushort)(blk[52] | ((ushort)blk[53] << 8)));                   \
+    uint g0 = (bi & 15u) * 16u;                                                                    \
+    for (uint e = 0; e < 16u; e++) {                                                              \
+        uint g = g0 + e;                                                                          \
+        uint n;                                                                                   \
+        uint bt;                                                                                  \
+        if (g < 160u) {                                                                           \
+            n = g >> 5;                                                                           \
+            bt = (uint)qs[g & 31u];                                                               \
+        } else if (g < 240u) {                                                                    \
+            uint g2 = g - 160u;                                                                   \
+            n = g2 >> 4;                                                                          \
+            bt = (uint)qs[32u + (g2 & 15u)];                                                      \
+        } else {                                                                                  \
+            uint g3 = g - 240u;                                                                   \
+            n = g3 >> 2;                                                                          \
+            bt = (uint)qh[g3 & 3u];                                                               \
+        }                                                                                         \
+        uint prod = (bt * kpow3_tq1[n]) & 0xFFu;                                                  \
+        uint digit = (prod * 3u) >> 8u;                                                           \
+        wk[e] = d * ((float)digit - 1.0f);                                                        \
+    }
+
 // NATIVE IQ2_XXS block (66 B / 256 elems): [f16 d][64 B qs]. 2.06 bpw. 8 sub-blocks of 32 elems;
 // each sub-block's 8 qs bytes are aux0 (four 8-bit grid indices into IQ2XXS_GRID[256]) + aux1
 // (four 7-bit sign indices into KSIGNS_IQ2XS, and a 4-bit scale magnitude in the top nibble).

@@ -98,7 +98,10 @@ produced in a way that looks like garbage is a bug, not a precision flip.
 - **Impact:** real prefill **and** decode win expected.
 - **Precision:** bit-identical (same per-head float order; state rebuild is a
   copy).
-- **Status:** TODO
+- **Status:** DONE (`9595bf3`). `deltanet_scan` helper, one pool task per head.
+  Bit-identical (parity test, exact f32). **Qwen3.5-9B Q4_K_M prefill pp512
+  67.3→109.8 t/s (+63%)**; decode flat (10.3→10.4, DRAM-bound at rows=1). The
+  big prefill win of the campaign so far.
 
 ### 3. DeltaNet input-clone elimination — _medium_
 

@@ -246,6 +246,7 @@ fn ggml_type_to_dtype(t: u32) -> Result<DType> {
         39 => Ok(DType::Mxfp4),  // GGML_TYPE_MXFP4: 32 elems, 17 bytes/block
         40 => Ok(DType::Nvfp4),  // GGML_TYPE_NVFP4: 64 elems, 36 bytes/block
         42 => Ok(DType::Q2_0),   // GGML_TYPE_Q2_0: 64 elems, 18 bytes/block (Bonsai ternary)
+        36 => Ok(DType::I2S), // GGML_TYPE_I2_S (microsoft/BitNet): ternary 2bpw + per-tensor f32 scale
         _ => Err(Error::Unsupported(format!("ggml type {t}"))),
     }
 }
@@ -311,6 +312,11 @@ pub fn block_layout(dtype: DType) -> (usize, usize) {
         DType::Tq2_0 => (256, 66),
         // block_q2_0: half d + QK2_0/4 = 2+16 = 18 bytes; QK2_0=64 (Bonsai ternary, 2.25 bpw)
         DType::Q2_0 => (64, 18),
+        // i2_s (BitNet ternary): 4 elements per byte (2 bits each). This block figure covers ONLY
+        // the packed codes — the format also carries a SINGLE per-tensor f32 scale after all codes,
+        // which the block model can't express; `tensor_nbytes` special-cases I2S to add those 4
+        // bytes so the mmap slice includes the scale (and `dequant_codebook` reads it from the tail).
+        DType::I2S => (4, 1),
         // FP4 quants
         // block_mxfp4: uint8 e + QK_MXFP4/2 = 1+16 = 17 bytes; QK_MXFP4=32
         DType::Mxfp4 => (32, 17),
@@ -328,6 +334,14 @@ pub fn block_layout(dtype: DType) -> (usize, usize) {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
+    // i2_s stores `numel/4` bytes of 2-bit ternary codes followed by ONE per-tensor f32 scale (see
+    // `DType::I2S`). The scale is part of the tensor's data region (ggml rounds the next tensor's
+    // offset up to `general.alignment`, so the on-disk stride is `numel/4 + 4` padded to 32B, but
+    // the readable tensor bytes end after the scale). Size the slice to include it so
+    // `dequant_codebook` can read the scale from the tail.
+    if dtype == DType::I2S {
+        return numel / 4 + 4;
+    }
     let (be, bb) = block_layout(dtype);
     (numel / be) * bb
 }

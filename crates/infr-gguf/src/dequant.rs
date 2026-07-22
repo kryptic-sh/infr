@@ -464,6 +464,7 @@ pub fn is_codebook_quant(d: infr_core::DType) -> bool {
             | Q2_0
             | Mxfp4
             | Nvfp4
+            | I2S
     )
 }
 
@@ -1072,6 +1073,35 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
             }
             out
         }
+        // ── I2S (BitNet i2_s): ternary {-1,0,+1}, 2 bits/elem + ONE per-tensor f32 scale ────────
+        // Layout (microsoft/BitNet, quantize_i2_s / ggml_vec_dot_i2_i8_s, x86 build): `numel/4`
+        // packed bytes, then a trailing f32 `scale`. Codes are packed INTERLEAVED in 128-element
+        // groups: element `e = i*128 + j` (natural row-major order) → byte `i*32 + (j%32)`, in the
+        // 2-bit field at shift `6 - 2*(j/32)`. Code `q ∈ {0,1,2}` maps to `q-1 ∈ {-1,0,+1}` and
+        // `y = (q-1) * scale`. (Rows never split a 128-group: every ne0 in these GGUFs is a
+        // multiple of 128.) Verified against the real 2B-4T model: scale ≈ absmax, ~50% zeros.
+        I2S => {
+            // The slice is `numel/4` packed bytes + a 4-byte f32 scale at the tail (see
+            // `tensor_nbytes`). Recover numel from the packed-code length.
+            let packed = bytes.len().saturating_sub(4);
+            let numel = packed * 4;
+            let scale = f32::from_le_bytes([
+                bytes[packed],
+                bytes[packed + 1],
+                bytes[packed + 2],
+                bytes[packed + 3],
+            ]);
+            let mut out = vec![0.0f32; numel];
+            for e in 0..numel {
+                let i = e / 128;
+                let j = e % 128;
+                let byte = bytes[i * 32 + (j % 32)];
+                let shift = 6 - 2 * (j / 32);
+                let code = (byte >> shift) & 3;
+                out[e] = (code as f32 - 1.0) * scale;
+            }
+            out
+        }
         other => unimplemented!("codebook dequant for {other:?} not yet implemented"),
     }
 }
@@ -1400,6 +1430,58 @@ mod dequant_tests {
                 y[i]
             );
         }
+    }
+
+    // ── I2S (BitNet i2_s) ────────────────────────────────────────────────────────
+    // Layout: `numel/4` packed bytes (2 bits/elem, interleaved in 128-elem groups) + a trailing
+    // f32 scale. Element `e = i*128+j` → byte `i*32 + j%32`, field shift `6 - 2*(j/32)`; code
+    // q∈{0,1,2} → (q-1)*scale. One 128-elem group here (32 packed bytes + 4-byte scale = 36 bytes).
+    // byte[0]'s four 2-bit fields (hi→lo) govern elements 0, 32, 64, 96; bytes[1..32]=0x55 sets
+    // every other element's field to code 1 (→ 0). Ref: microsoft/BitNet quantize_i2_s / dot.
+    #[test]
+    fn i2s_single_group() {
+        let mut block = vec![0u8; 36];
+        // byte[0] = 0b00_01_10_00: elem0=code0(-1), elem32=code1(0), elem64=code2(+1), elem96=code0(-1)
+        block[0] = 0b00_01_10_00;
+        for b in &mut block[1..32] {
+            *b = 0x55; // 0b01_01_01_01 → all fields code 1 → 0
+        }
+        let scale = 2.0_f32;
+        block[32..36].copy_from_slice(&scale.to_le_bytes());
+        let y = dequant_codebook(infr_core::DType::I2S, &block);
+        assert_eq!(y.len(), 128);
+        assert!(
+            (y[0] - (-2.0)).abs() < 1e-6,
+            "i2s elem0 expected -2.0, got {}",
+            y[0]
+        );
+        assert!(
+            (y[32] - 0.0).abs() < 1e-6,
+            "i2s elem32 expected 0.0, got {}",
+            y[32]
+        );
+        assert!(
+            (y[64] - 2.0).abs() < 1e-6,
+            "i2s elem64 expected 2.0, got {}",
+            y[64]
+        );
+        assert!(
+            (y[96] - (-2.0)).abs() < 1e-6,
+            "i2s elem96 expected -2.0, got {}",
+            y[96]
+        );
+        // every other element decodes to code 1 → 0
+        for (e, v) in y.iter().enumerate() {
+            if e == 0 || e == 32 || e == 64 || e == 96 {
+                continue;
+            }
+            assert!(v.abs() < 1e-6, "i2s elem{e} expected 0.0, got {v}");
+        }
+        // Round-trip via the public dequant_block entry (mirrors what the seam calls at load).
+        let y2 = dequant_block(infr_core::DType::I2S, &block).unwrap();
+        assert_eq!(y2.len(), 128);
+        assert!(y2.iter().all(|v| v.is_finite()));
+        assert_eq!(y, y2);
     }
 
     // ── IQ2_XXS ─────────────────────────────────────────────────────────────────

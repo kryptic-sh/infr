@@ -311,9 +311,11 @@ impl Config {
             // applied AFTER rope (see `kq_l2norm` below), not via the qwen3-style QkNormRope.
             // bitnet (BitNet b1.58) is the llama skeleton + SubLN (two extra RMSNorms, gated by
             // `sub_norm` below) — no learned q/k-norm, like llama/qwen2.
-            crate::arch::LLAMA | crate::arch::LLAMA4 | crate::arch::QWEN2 | crate::arch::BITNET => {
-                false
-            }
+            crate::arch::LLAMA
+            | crate::arch::LLAMA4
+            | crate::arch::QWEN2
+            | crate::arch::BITNET
+            | crate::arch::BITNET_B158 => false,
             crate::arch::QWEN3
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
@@ -340,11 +342,11 @@ impl Config {
         // bitnet, like qwen2, uses NEOX rope (llama.cpp maps LLM_ARCH_BITNET to LLAMA_ROPE_TYPE_NEOX)
         // and its GGUF keeps attn_q/attn_k in HF rotate-half order — permute the rows at load so the
         // no-qknorm interleaved `Op::Rope` reproduces NEOX (see the `permute_qk_neox` field doc).
-        let permute_qk_neox = arch == crate::arch::QWEN2 || arch == crate::arch::BITNET;
+        let permute_qk_neox = arch == crate::arch::QWEN2 || crate::arch::is_bitnet(&arch);
         // bitnet (BitNet b1.58) SubLN: two extra RMSNorms per layer — `attn_sub_norm` on the
         // concatenated-heads attention output BEFORE the o-projection, and `ffn_sub_norm` on the
         // FFN intermediate BEFORE `ffn_down`. Gates both the extra weight loads and the graph ops.
-        let sub_norm = arch == crate::arch::BITNET;
+        let sub_norm = crate::arch::is_bitnet(&arch);
         // llama4 (Scout etc.): shares the llama attention skeleton (NORM/interleaved rope, no bias,
         // converter-permuted q/k) but adds a 16-expert sigmoid top-1 MoE + iRoPE (per-layer NoPE) +
         // a weightless post-rope Q/K L2-norm. All the divergent semantics are HARDCODED for `llama4`

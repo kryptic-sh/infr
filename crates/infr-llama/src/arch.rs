@@ -60,6 +60,19 @@ pub const DIFFUSION_GEMMA: &str = "diffusion-gemma";
 /// (`src/models/bitnet.cpp`): the FFN activation is SiLU (`LLM_FFN_SILU`/`LLM_FFN_PAR`), NOT
 /// squared-ReLU. Ships TQ2_0 ternary weights (native on CPU + Vulkan) — this is an arch-only add.
 pub const BITNET: &str = "bitnet";
+/// Microsoft's official BitNet-b1.58 GGUFs (`microsoft/bitnet-b1.58-2B-4T-gguf`) declare
+/// `general.architecture = "bitnet-b1.58"` and prefix EVERY metadata key with it
+/// (`bitnet-b1.58.block_count`, …). Behaviorally identical to [`BITNET`] (same llama+SubLN
+/// skeleton); the only reason it's a distinct string is that the metadata prefix must match the
+/// file, so `Config::from_gguf` keeps `arch` verbatim for key lookups and treats this as bitnet via
+/// [`is_bitnet`]. These files ship i2_s ternary weights (host-dequant → f16 at load).
+pub const BITNET_B158: &str = "bitnet-b1.58";
+
+/// True for either BitNet arch string ([`BITNET`] or [`BITNET_B158`]) — the two are behaviorally
+/// identical (llama skeleton + SubLN, NEOX rope); they differ only in the metadata key prefix.
+pub fn is_bitnet(arch: &str) -> bool {
+    arch == BITNET || arch == BITNET_B158
+}
 
 /// What `Config::from_gguf` — the shared TRANSFORMER-skeleton path — accepts, MINUS `QWEN35`
 /// (kept as its own match arm since `is_qwen35` gates a handful of qwen35-only fields — see
@@ -75,6 +88,7 @@ pub const TRANSFORMER: &[&str] = &[
     GEMMA4,
     DIFFUSION_GEMMA,
     BITNET,
+    BITNET_B158,
 ];
 
 /// Read `general.architecture` from a GGUF WITHOUT a full model load (mirrors
@@ -101,6 +115,7 @@ pub const ALL: &[&str] = &[
     GEMMA4,
     DIFFUSION_GEMMA,
     BITNET,
+    BITNET_B158,
     QWEN35,
     QWEN35_MOE,
 ];

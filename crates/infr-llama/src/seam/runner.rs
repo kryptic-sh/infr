@@ -575,7 +575,39 @@ pub(crate) fn generate_dense_backend(
                     infr_gguf::nbytes(dt, c.n_embd)
                 }
             };
-            let (bytes, dt, numel) = if let [name] = names {
+            let (bytes, dt, numel) = if info(names[0])?.dtype == DType::I2S {
+                // BitNet i2_s carries a per-TENSOR trailing f32 scale and an interleaved 128-group
+                // packing (see `DType::I2S`) — neither composes with the per-row weight streaming
+                // the seam does (permute_rows / row_bytes / the CPU Op::Linear all assume one quant
+                // block per weight row, and the GPU has no i2_s kernel). Host-dequant to f16 ONCE
+                // here; every downstream stage then treats it as a plain f16 weight. The f16
+                // footprint (numel*2) is exactly what `weights::tensor_resident_bytes` already
+                // prices for a non-`native_dense_supported` dtype, so the VRAM budget stays honest.
+                let mut cat: Vec<u8> = Vec::new();
+                let mut numel = 0usize;
+                for name in names {
+                    let i = info(name)?;
+                    if i.dtype != DType::I2S {
+                        return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
+                    }
+                    numel += i.shape.iter().product::<usize>();
+                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let f32v = crate::dequant_block(DType::I2S, &tb).map_err(|e| anyhow!("{e}"))?;
+                    let f16: Vec<u8> = f32v
+                        .iter()
+                        .flat_map(|&x| infr_gguf::dequant::f32_to_f16_sat(x).to_le_bytes())
+                        .collect();
+                    match qk_perm_heads(name) {
+                        Some(heads) => cat.extend_from_slice(&permute_rows(
+                            &f16,
+                            heads,
+                            row_bytes(name, DType::F16),
+                        )),
+                        None => cat.extend_from_slice(&f16),
+                    }
+                }
+                (WBytes::Owned(cat), DType::F16, numel)
+            } else if let [name] = names {
                 let i = info(name)?;
                 let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
                 let numel = i.shape.iter().product();

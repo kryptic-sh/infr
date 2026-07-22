@@ -4424,6 +4424,159 @@ fn vec_dot_q4_1_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
     }
 }
 
+/// Batched Q5_1 dot at native 32-block granularity. Q5_1 is the AFFINE sibling of Q5_0: the same
+/// 32-weight, 5-bit block (4 nibble bits from `qs` + 1 high bit from `qh`, `code ∈ 0..31`), but
+/// `y = d_w·q5 + m_w` (like Q4_1's `+m`, NOT Q5_0's `−16` offset; a separate per-block f16 `m` min
+/// is added). Per activation block (`a_i ≈ as·qa_i`, `Q8x32` carries `as` and `bsum = Σqa_i`):
+/// `Σy·x = Σ(d_w·q5_i + m_w)·a_i = as·( d_w·Σ(q5_i·qa_i) + m_w·Σqa_i ) = as·( d_w·iprod + m_w·bsum )`.
+/// Block stride is 24 bytes (`[f16 d][f16 m][u8 qh[4]][u8 qs[16]]`); the `qh` 5th-bit assembly is
+/// identical to [`vec_dot_q5_0_32_batch`] (per `dequant_block`'s Q5_1 case). Reuses the same `Q8x32`
+/// activation unchanged; `iprod` is the identical `maddubs/dpbusd` unsigned·signed dot.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_q5_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_q5_1_32_batch_vnni(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q5_1_32_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_q5_1_32_batch_scalar(row, q8s, in_f, out);
+}
+
+/// Expand one weight row's Q5_1 codes (5-bit, 0..31, the UNSIGNED values) into a flat `[nb*32]` u8
+/// buffer ONCE per row — the affine analogue of [`q5_0_expand_codes`] (`d` AND `m` per block, block
+/// stride 24, `qh` at byte 4, `qs` at byte 8). Returns `(flat, d_arr, m_arr)`; `flat[b*32 + j]` =
+/// code j of block b (j 0..15 = lo nibbles + `xh0` high bit, 16..31 = hi nibbles + `xh1` high bit).
+#[cfg(target_arch = "x86_64")] // only the x86 SIMD kernels call this — dead code on aarch64
+#[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn q5_1_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    let mut flat = vec![0u8; nb * 32];
+    let mut d_arr = vec![0f32; nb];
+    let mut m_arr = vec![0f32; nb];
+    for b in 0..nb {
+        let blk = &row[b * bpr..b * bpr + bpr];
+        d_arr[b] = rdf16(&blk[0..2]);
+        m_arr[b] = rdf16(&blk[2..4]);
+        let qh = u32::from_le_bytes(blk[4..8].try_into().unwrap());
+        let qs = &blk[8..24];
+        let f = &mut flat[b * 32..b * 32 + 32];
+        for j in 0..16 {
+            let xh0 = ((qh >> j) << 4) & 0x10;
+            let xh1 = (qh >> (j + 12)) & 0x10;
+            f[j] = (qs[j] as u32 & 0x0F | xh0) as u8;
+            f[j + 16] = (qs[j] as u32 >> 4 | xh1) as u8;
+        }
+    }
+    (flat, d_arr, m_arr)
+}
+
+/// AVX2 kernel for `vec_dot_q5_1_32_batch`: codes pre-expanded once, one `maddubs(code_u8, q8_s8)`
+/// block dot per (row, block) — codes ≤31 × |q8| ≤127 can't saturate the i16 pair sums.
+/// Bit-identical to the scalar oracle (integer dot exact; the affine per-block f32 accumulation
+/// expression `as·(d·iprod + m·bsum)` and order are unchanged). Mirrors [`vec_dot_q5_0_32_batch_avx2`]
+/// with `+m·bsum` in place of `−16·bsum`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q5_1_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 24usize;
+    let ones = _mm256_set1_epi16(1i16);
+    let (flat, d_arr, m_arr) = q5_1_expand_codes(row, nb, bpr);
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
+            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let prod = _mm256_maddubs_epi16(code, q8v);
+            let sum32 = _mm256_madd_epi16(prod, ones);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += q8.d[b] * (d_arr[b] * iprod as f32 + m_arr[b] * q8.bsum[b] as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX512-VNNI kernel for `vec_dot_q5_1_32_batch`: two blocks per zmm, `dpbusd` in place of the
+/// maddubs+madd pair (see the AVX2 variant's bit-identity note; the two per-block f32 adds stay
+/// SEPARATE and in scalar order). Mirrors [`vec_dot_q5_0_32_batch_vnni`] with the affine form.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni,avx512vl")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q5_1_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 24usize;
+    let pairs = nb / 2;
+    let (flat, d_arr, m_arr) = q5_1_expand_codes(row, nb, bpr);
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for k in 0..pairs {
+            let (b0, b1) = (2 * k, 2 * k + 1);
+            let code_z = _mm512_loadu_si512(flat[b0 * 32..].as_ptr() as *const __m512i);
+            let qx_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), code_z, qx_z);
+            let lo_ymm = _mm512_castsi512_si256(sum32_z);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+            let iprod0 = hadd_i32_ymm(lo_ymm);
+            let iprod1 = hadd_i32_ymm(hi_ymm);
+            sumf += q8.d[b0] * (d_arr[b0] * iprod0 as f32 + m_arr[b0] * q8.bsum[b0] as f32);
+            sumf += q8.d[b1] * (d_arr[b1] * iprod1 as f32 + m_arr[b1] * q8.bsum[b1] as f32);
+        }
+        if nb % 2 == 1 {
+            let b = nb - 1;
+            let code = _mm256_loadu_si256(flat[b * 32..].as_ptr() as *const __m256i);
+            let q8v = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), code, q8v);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += q8.d[b] * (d_arr[b] * iprod as f32 + m_arr[b] * q8.bsum[b] as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// Scalar oracle for `vec_dot_q5_1_32_batch` (also the non-x86 path). Affine `as·(d·iprod + m·bsum)`
+/// with Q5_0's 5-bit (4 nibble + 1 high) code assembly.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn vec_dot_q5_1_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    let nb = in_f / 32;
+    let bpr = 24usize; // f16 d (2B) + f16 m (2B) + u32 qh (4B) + 16 × packed-nibble qs
+    let mut d_arr = vec![0f32; nb];
+    let mut m_arr = vec![0f32; nb];
+    for b in 0..nb {
+        d_arr[b] = rdf16(&row[b * bpr..b * bpr + 2]);
+        m_arr[b] = rdf16(&row[b * bpr + 2..b * bpr + 4]);
+    }
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let blk = &row[b * bpr..b * bpr + bpr];
+            let qh = u32::from_le_bytes(blk[4..8].try_into().unwrap());
+            let qs = &blk[8..24];
+            let q8b = &q8.qs[b * 32..b * 32 + 32];
+            let mut iprod = 0i32;
+            for j in 0..16 {
+                let xh0 = ((qh >> j) << 4) & 0x10;
+                let xh1 = (qh >> (j + 12)) & 0x10;
+                let code0 = ((qs[j] as u32 & 0x0F) | xh0) as i32;
+                let code1 = ((qs[j] as u32 >> 4) | xh1) as i32;
+                iprod += code0 * q8b[j] as i32 + code1 * q8b[j + 16] as i32;
+            }
+            sumf += q8.d[b] * (d_arr[b] * iprod as f32 + m_arr[b] * q8.bsum[b] as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
 /// Batched IQ4_NL dot at native 32-block granularity. IQ4_NL is the FLAT cousin of IQ4_XS: the same
 /// signed 16-entry `KVALUES_IQ4NL` codebook, but ONE f16 scale `d` per 32-weight block and NO
 /// super-block / per-sub-block `(ls−32)` scales (pure codebook, no affine offset). So it wires
@@ -5230,6 +5383,136 @@ mod kernel_tests {
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "q4_1_32 single in_f={in_f} row={r}: got {}, want {want}",
+                    one[0]
+                );
+            }
+        }
+    }
+
+    /// Build `nb` real 24-byte Q5_1 blocks: fixed per-block `d`/`m`, random `qh`+`qs` (both nibble
+    /// halves AND the 5th `qh` bit exercised). `d`/`m` land weights at Q4_0 scale so the
+    /// int8-activation dot tracks the full-precision reference within a tight tolerance.
+    fn build_q5_1(nb: usize, d: f32, m: f32, seed: u64) -> Vec<u8> {
+        let mut w = det_bytes(nb * 24, seed);
+        for k in 0..nb {
+            put_f16(&mut w[k * 24..k * 24 + 2], d);
+            put_f16(&mut w[k * 24 + 2..k * 24 + 4], m);
+        }
+        w
+    }
+
+    /// Count Q5_1 codes that exceed 15 (i.e. the `qh` 5th bit is set) across a built row — used to
+    /// prove the tests actually exercise the high bit, not just the low nibble.
+    fn q5_1_codes_over_15(w: &[u8], nb: usize) -> usize {
+        let mut n = 0usize;
+        for k in 0..nb {
+            let blk = &w[k * 24..k * 24 + 24];
+            let qh = u32::from_le_bytes(blk[4..8].try_into().unwrap());
+            let qs = &blk[8..24];
+            for j in 0..16 {
+                let xh0 = ((qh >> j) << 4) & 0x10;
+                let xh1 = (qh >> (j + 12)) & 0x10;
+                let c0 = (qs[j] as u32 & 0x0F) | xh0;
+                let c1 = (qs[j] as u32 >> 4) | xh1;
+                n += (c0 > 15) as usize + (c1 > 15) as usize;
+            }
+        }
+        n
+    }
+
+    /// SIMD (VNNI/AVX2, whichever this host has) must match the Q5_1 scalar oracle bit-for-bit: the
+    /// integer dot is exact and the affine per-block f32 accumulation order is identical. 96
+    /// blocks-odd exercises the VNNI pair-plus-tail path. `qh`+`qs` are fully random, so both nibble
+    /// halves and the 5th (`qh`) bit are exercised (asserted via `q5_1_codes_over_15`).
+    #[test]
+    fn q5_1_32_simd_bit_identical_to_scalar() {
+        for in_f in [96usize, 256, 704] {
+            let nb = in_f / 32;
+            let m = 5usize;
+            let w = build_q5_1(nb, 0.02, -0.01, 111);
+            // The 5th bit must actually fire somewhere, else the qh-assembly path is untested.
+            assert!(
+                q5_1_codes_over_15(&w, nb) > 0,
+                "q5_1_32 in_f={in_f}: no code exceeded 15 — qh 5th bit never exercised"
+            );
+            let q8s: Vec<Q8x32> = (0..m)
+                .map(|r| quantize_q8_32(&det_x(in_f, 112 + r as u64)))
+                .collect();
+            let mut simd_out = vec![0f32; m];
+            vec_dot_q5_1_32_batch(&w, &q8s, in_f, &mut simd_out);
+            let mut scalar_out = vec![0f32; m];
+            vec_dot_q5_1_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
+            for r in 0..m {
+                assert_eq!(
+                    simd_out[r].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "q5_1_32 in_f={in_f} row={r}: simd {}, scalar {}",
+                    simd_out[r],
+                    scalar_out[r]
+                );
+            }
+            // Single-row (m=1) dispatch must agree too.
+            for r in 0..m {
+                let mut one = [0f32; 1];
+                vec_dot_q5_1_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                assert_eq!(
+                    one[0].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "q5_1_32 single in_f={in_f} row={r}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end tolerance-parity for the Q5_1 native-block int8 kernel: the int8-quantized-
+    /// activation dot must track the FULL-PRECISION `d*q5 + m`-dequant · f32-activation reference.
+    /// int8 activation quant is lossy, so this is a tolerance (not bit-identity). Covers the batch
+    /// (m>1) and single-row (m=1) entries, several in_f, both nibble halves + the 5th `qh` bit.
+    #[test]
+    fn q5_1_32_matches_dequant_reference() {
+        for in_f in [96usize, 256, 512] {
+            let nb = in_f / 32;
+            let w = build_q5_1(nb, 0.03, -0.02, 120);
+            let wref = dequant_block(DType::Q5_1, &w).unwrap();
+            // Both nibble halves decode to varying values (decode exercises lo AND hi).
+            assert!(wref[..16].iter().any(|&v| v != wref[0]));
+            assert!(wref[16..32].iter().any(|&v| v != wref[16]));
+            // And the 5th bit must fire (codes > 15 → the qh-assembly path is verified vs dequant).
+            assert!(
+                q5_1_codes_over_15(&w, nb) > 0,
+                "q5_1_32 ref in_f={in_f}: no code exceeded 15 — qh 5th bit never exercised"
+            );
+            // Full-precision activations (NOT the quantized ones) → proves end-to-end accuracy.
+            let xs: Vec<Vec<f32>> = (0..4).map(|i| det_x(in_f, 121 + i)).collect();
+            let q8s: Vec<Q8x32> = xs.iter().map(|x| quantize_q8_32(x)).collect();
+
+            // Batch entry (m>1). Tight 1e-3 vs the QUANTIZED activation the kernel actually sees
+            // (isolates integer-dot correctness), plus a looser 2e-2 vs the full-precision
+            // activation (absorbs the lossy int8 activation quant).
+            let mut got = vec![0f32; xs.len()];
+            vec_dot_q5_1_32_batch(&w, &q8s, in_f, &mut got);
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let want_q = dot(&wref, &dequant_q8_32(q8));
+                assert!(
+                    rel_err(got[r], want_q) < 1e-3,
+                    "q5_1_32 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
+                    got[r]
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got[r], want_f) < 2e-2,
+                    "q5_1_32 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
+                    got[r]
+                );
+            }
+            // Single-row entry (m=1): one activation block-set, one-element out.
+            for (r, x) in xs.iter().enumerate() {
+                let mut one = [0f32; 1];
+                vec_dot_q5_1_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                let want = dot(&wref, x);
+                assert!(
+                    rel_err(one[0], want) < 2e-2,
+                    "q5_1_32 single in_f={in_f} row={r}: got {}, want {want}",
                     one[0]
                 );
             }

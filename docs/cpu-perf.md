@@ -22,18 +22,33 @@ acceptance):
 | native int8 **Q4_1** (`f4738a1`)   | Qwen3-0.6B Q4_1   | +138% (2.4×) | +243% (3.4×)      |
 | native int8 **IQ4_NL** (`0ef8366`) | Qwen3-0.6B IQ4_NL | +47%         | +253% (3.5×)      |
 
-**Native-int8 quant coverage is now complete for every common format:** all
-K-quants (Q2/Q3/Q4/Q5/Q6_K), all legacy-round (Q4_0/Q4_1/Q5_0/Q8_0), and the IQ4
-codebook family (IQ4_XS/IQ4_NL). Each precision flip was coherence-verified
-token-identical to the independent Vulkan int8 path.
+### Full CPU↔Vulkan native-quant parity (unit-test-verified — no models)
 
-Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Remaining
-follow-ups: the **IQ1/IQ2/IQ3 grid-codebook** quants (`IQ2_XXS/XS/S`,
-`IQ3_XXS/S`, `IQ1_*`) — niche, and the hardest kernels (per-element grid-table
-lookup + sign-packing); only mixed-quant UD models are available locally, which
-limits the measurable end-to-end signal. `Q5_1` (no local model). #8 (f16/bf16,
-low priority — bandwidth already optimal). #9 (blocked on `perf`). #10 (fusion,
-structural). Plus a VNNI **batch** variant for IQ4_XS.
+CPU now has a native int8 kernel for **every format Vulkan has a native mmq
+kernel for**. The six below close the last of the gap; none has a small
+supported-arch GGUF for an end-to-end coherence check (IQ2*S/IQ3_S are
+big-model-only; Q5_1/Q2_0 legacy; MXFP4=gpt-oss, whose \_architecture*
+infr-llama doesn't implement; NVFP4 bleeding-edge). Gate for these =
+**bit-identical SIMD↔ scalar + tolerance-parity to the exact `dequant_block`
+(tight 1e-3 vs the quantized-activation dot)** — strong on the math, no
+coherence generation.
+
+| Format  | commit    | notes                             |
+| ------- | --------- | --------------------------------- |
+| `Q5_1`  | `e7465ed` | affine, Q5_0 5-bit + Q4_1 min     |
+| `Q2_0`  | `3f7c79e` | Bonsai ternary, 64-block, 2×Q8x32 |
+| `MXFP4` | `29ee2e5` | IQ4_NL + E8M0 scale (gpt-oss)     |
+| `NVFP4` | `06cc0ef` | MXFP4 codebook + per-16 UE4M3     |
+| `IQ2_S` | `8e616c3` | grid-codebook, expand-row-once    |
+| `IQ3_S` | `34fd4f2` | grid-codebook, per-32 scale       |
+
+Formats Vulkan itself does NOT natively handle (`IQ2_XXS/XS`, `IQ3_XXS`,
+`IQ1_*`, `TQ1_0/TQ2_0`) stay on the shared dequant path on both backends — no
+parity gap.
+
+Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Remaining: #8
+(f16/bf16, low priority — bandwidth already optimal), #9 (blocked on `perf`),
+#10 (fusion, structural), and a VNNI **batch** variant for IQ4_XS.
 
 ## Context: two regimes, two different bottlenecks
 
@@ -221,14 +236,14 @@ produced in a way that looks like garbage is a bug, not a precision flip.
     (`KVALUES_IQ4NL` pshufb + abs/sign dot, `Q8x32` activation). Coherent/
     token-identical. **Qwen3-0.6B IQ4_NL: decode 34.3→50.5 t/s (+47%), prefill
     124.5→439.6 t/s (+253%).**
-  - **Grid-codebook family** (`IQ2_XXS/XS/S`, `IQ3_XXS/S`, `IQ1_*`) — TODO,
-    hardest tier: per-element grid-table lookup (`infr_core::iquant_grids`) +
-    sign-packing (`apply_signs`/`KMASK`). Niche formats; only mixed-quant UD
-    models are available locally (`UD-IQ2_XXS`, `UD-IQ3_XXS`), so the end-to-end
-    bench signal is diluted (most tensors are already-covered quants). Skeleton:
-    expand grid → signed i8 weights, reuse the IQ4_XS signed ×int8 dot with
-    per-sub-block float scales.
-  - `Q5_1` — TODO (affine clone of Q5_0/Q4_1; no local model).
+  - `Q5_1` **DONE** (`e7465ed`), `Q2_0` **DONE** (`3f7c79e`), `MXFP4` **DONE**
+    (`29ee2e5`), `NVFP4` **DONE** (`06cc0ef`), `IQ2_S` **DONE** (`8e616c3`),
+    `IQ3_S` **DONE** (`34fd4f2`) — see the "Full parity" section at the top. The
+    grid kernels (IQ2*S/IQ3_S) expand the grid row to signed i8 once (scalar
+    gather + `apply_signs`) then reuse the IQ4_XS per-sub-block scale × int-dot,
+    amortized across the batch. Vulkan does not natively handle `IQ2_XXS/XS`,
+    `IQ3_XXS`, or `IQ1*\*`, so those are not a parity gap (shared dequant path
+    on both backends).
 
 ### 8. f16 / bf16 native AVX-512-FP16/BF16 dot — _medium_
 

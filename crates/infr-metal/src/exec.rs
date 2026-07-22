@@ -339,6 +339,16 @@ mod tests {
     }
 
     #[test]
+    fn q5k_row_tile_policy_is_limited_to_four_rows() {
+        for m in [1usize, 2, 3, 5] {
+            assert!(!prefer_q5k_rt("linear_q5k", m, true));
+        }
+        assert!(prefer_q5k_rt("linear_q5k", 4, true));
+        assert!(!prefer_q5k_rt("linear_q5k", 4, false));
+        assert!(!prefer_q5k_rt("linear_q4k", 4, true));
+    }
+
+    #[test]
     fn counter_profiles_use_selected_linear_kernel_for_every_row_count() {
         assert_eq!(
             counter_linear_label(true, "linear_q5k_cmm"),
@@ -843,6 +853,10 @@ fn softmax_tier(cap: usize) -> SoftmaxTier {
 
 fn prefer_iq4nl_rt(kern: &str, m: usize) -> bool {
     kern == "linear_iq4nl" && (2..=4).contains(&m)
+}
+
+fn prefer_q5k_rt(kern: &str, m: usize, enabled: bool) -> bool {
+    enabled && kern == "linear_q5k" && m == 4
 }
 
 /// The cooperative / row-tiled kernel variants a factored-or-native quant `Linear` can dispatch,
@@ -2487,10 +2501,18 @@ impl MetalBackend {
                     // IQ4_NL is the measured exception at m=2..4: its non-linear codebook keeps
                     // the mostly-empty CMM tile decode-bound, while RT reuses each decoded block
                     // across rows. Gemma 6912x1152 measured 39%/25%/8% faster; CMM wins at m=5.
+                    // Q5_K is another exception at exactly m=4: RT cuts the affected Qwen3.5
+                    // profile bucket by 22% and improves pp4 by 6.1%. Other row counts remain on
+                    // their existing routes; INFR_METAL_NO_Q5K_RT restores CMM for A/B.
                     // Fetch each candidate PSO ONCE (the cap read and the later dispatch share it),
                     // preserving the original `?` propagation: `get` only runs — and can only
                     // error — when the shape pre-conditions hold, exactly as before.
-                    let cmm_pso = if m >= 2 && !prefer_iq4nl_rt(qw.kern, m) && out_f % 64 == 0 {
+                    let q5k_rt = std::env::var("INFR_METAL_NO_Q5K_RT").is_err();
+                    let cmm_pso = if m >= 2
+                        && !prefer_iq4nl_rt(qw.kern, m)
+                        && !prefer_q5k_rt(qw.kern, m, q5k_rt)
+                        && out_f % 64 == 0
+                    {
                         Some(self.pipelines.get(cmm_kern)?)
                     } else {
                         None

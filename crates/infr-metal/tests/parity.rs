@@ -1019,22 +1019,30 @@ fn linear_q5k_gemv_matches_dequant_reference() {
     check_quant_linear_parity(DType::Q5K, synth_q5k(out_f * in_f, 121), m, in_f, out_f);
 }
 
-// Native Q5_K (this PR) — the m=1/m=2 tests above now exercise the native GEMV/RT; these add the
-// f16 GEMM routes (cmm at m=4, hmm at m=18) and the fused-QKV w_off slice.
+// Native Q5_K: m=4 uses the exact-f32 row tile; m=18 uses the f16 cooperative GEMM route. The
+// fused-QKV test below covers sliced weight offsets separately.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q5k_gemm_matches_dequant_reference() {
-    for (m, in_f, out_f) in [(4usize, 512usize, 128usize), (18, 512, 128)] {
-        check_quant_linear_parity_impl(
-            DType::Q5K,
-            synth_q5k(out_f * in_f, 122),
-            m,
-            in_f,
-            out_f,
-            2.5e-3,
-            true,
-        );
-    }
+    let (in_f, out_f) = (512usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Q5K,
+        synth_q5k(out_f * in_f, 122),
+        4,
+        in_f,
+        out_f,
+        1e-3,
+        false,
+    );
+    check_quant_linear_parity_impl(
+        DType::Q5K,
+        synth_q5k(out_f * in_f, 122),
+        18,
+        in_f,
+        out_f,
+        2.5e-3,
+        true,
+    );
 }
 
 #[test]

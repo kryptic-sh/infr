@@ -127,9 +127,15 @@ pub(super) enum MixerW {
 pub(super) struct LayerW {
     pub(super) attn_norm: TensorId, // the mixer INPUT norm (applies to any mixer type)
     pub(super) mixer: MixerW,
+    /// bitnet (BitNet b1.58) SubLN: RMSNorm on the concatenated-heads attention output BEFORE the
+    /// o-projection (`AttnW::wo`). `Some` only when `Config::sub_norm` (bitnet); `None` elsewhere.
+    pub(super) attn_sub_norm: Option<TensorId>,
     pub(super) post_attn: Option<TensorId>,
     pub(super) ffn_norm: TensorId,
     pub(super) ffn: FfnW,
+    /// bitnet SubLN: RMSNorm on the FFN intermediate (`[n_ff]`) BEFORE `ffn_down`. `Some` only for
+    /// bitnet; `None` elsewhere.
+    pub(super) ffn_sub_norm: Option<TensorId>,
     pub(super) post_ffw: Option<TensorId>,
     // gemma4 E2B per-layer input embedding: inp_gate, proj, post_norm.
     pub(super) pl_inp_gate: Option<TensorId>,

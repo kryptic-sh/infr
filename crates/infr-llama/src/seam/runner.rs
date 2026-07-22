@@ -656,6 +656,12 @@ pub(crate) fn generate_dense_backend(
             if !is_delta {
                 wload(&[&p("attn_output.weight")])?;
             }
+            // bitnet SubLN: the attention-output RMSNorm sits BETWEEN the attention op and `wo` in
+            // the graph, but load order is arbitrary as long as `wpush` mirrors it — kept right
+            // after `attn_output` (its logical neighbor). `[n_embd]`, resident (small f32 norm).
+            if c.sub_norm && !is_delta {
+                wload(&[&p("attn_sub_norm.weight")])?;
+            }
             if gemma {
                 wload(&[&p("post_attention_norm.weight")])?;
             }
@@ -714,6 +720,12 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("ffn_gate.weight")])?;
                 wload(&[&p("ffn_up.weight")])?;
                 wload(&[&p("ffn_down.weight")])?;
+            }
+            // bitnet SubLN: the FFN-intermediate RMSNorm (`[n_ff]`) applied BEFORE `ffn_down` in the
+            // graph; loaded here to mirror the `wpush` order below. Only bitnet is dense-gated AND
+            // `sub_norm`, so this never fires on a MoE/dual-FFN layer.
+            if c.sub_norm {
+                wload(&[&p("ffn_sub_norm.weight")])?;
             }
             if gemma {
                 wload(&[&p("post_ffw_norm.weight")])?;
@@ -1290,6 +1302,14 @@ pub(crate) fn generate_dense_backend(
                     wo,
                 })
             };
+            // bitnet SubLN attention-output norm — mirrors the `wload` push right after
+            // `attn_output.weight` (loaded under the same `c.sub_norm && !is_delta` gate; bitnet
+            // has no DeltaNet layers, so `is_delta` is always false there).
+            let attn_sub_norm = if c.sub_norm && !is_delta {
+                Some(wpush(&mut g, &mut weights))
+            } else {
+                None
+            };
             let post_attn = if gemma {
                 Some(wpush(&mut g, &mut weights))
             } else {
@@ -1356,6 +1376,12 @@ pub(crate) fn generate_dense_backend(
                     wdown: wpush(&mut g, &mut weights),
                 }
             };
+            // bitnet SubLN FFN-intermediate norm — mirrors the `wload` push right after `ffn_down`.
+            let ffn_sub_norm = if c.sub_norm {
+                Some(wpush(&mut g, &mut weights))
+            } else {
+                None
+            };
             let post_ffw = if gemma {
                 Some(wpush(&mut g, &mut weights))
             } else {
@@ -1373,9 +1399,11 @@ pub(crate) fn generate_dense_backend(
             lw.push(LayerW {
                 attn_norm,
                 mixer,
+                attn_sub_norm,
                 post_attn,
                 ffn_norm,
                 ffn,
+                ffn_sub_norm,
                 post_ffw,
                 pl_inp_gate,
                 pl_proj,
@@ -2307,6 +2335,19 @@ pub(crate) fn generate_dense_backend(
                         gate_block_width: (2 * hd) as u32, // query+gate block per head
                     });
                 }
+                // bitnet SubLN: RMSNorm the concatenated-heads attention output (`attn`, width
+                // `qrow` = n_head*head_dim = n_embd) BEFORE the o-projection — matches llama.cpp's
+                // `build_bitnet` (`attn_sub_norm` applied to `cur` right before `build_lora_mm(wo)`).
+                if let Some(asn) = lw.attn_sub_norm {
+                    g.push(Op::RmsNorm {
+                        x: attn,
+                        weight: asn,
+                        dst: attn,
+                        rows: batch as u32,
+                        dim: qrow as u32,
+                        eps,
+                    });
+                }
                 g.push(Op::Linear {
                     x: attn,
                     weight: aw.wo,
@@ -2361,6 +2402,18 @@ pub(crate) fn generate_dense_backend(
                         nff: nff_l as u32,
                         act,
                     });
+                    // bitnet SubLN: RMSNorm the FFN intermediate (`actbuf`, width `nff_l`) BEFORE
+                    // the down projection — matches llama.cpp `build_bitnet`'s `ffn_sub_norm`.
+                    if let Some(fsn) = lw.ffn_sub_norm {
+                        g.push(Op::RmsNorm {
+                            x: actbuf,
+                            weight: fsn,
+                            dst: actbuf,
+                            rows: batch as u32,
+                            dim: nff_l as u32,
+                            eps,
+                        });
+                    }
                     g.push(Op::Linear {
                         x: actbuf,
                         weight: wdown,
@@ -2402,6 +2455,18 @@ pub(crate) fn generate_dense_backend(
                         gate_stride: 0,
                         gate_block_width: 0,
                     });
+                    // bitnet SubLN: RMSNorm the FFN intermediate BEFORE the down projection (see the
+                    // `FfnW::DenseFused` arm above; same `ffn_sub_norm` from llama.cpp `build_bitnet`).
+                    if let Some(fsn) = lw.ffn_sub_norm {
+                        g.push(Op::RmsNorm {
+                            x: actbuf,
+                            weight: fsn,
+                            dst: actbuf,
+                            rows: batch as u32,
+                            dim: nff_l as u32,
+                            eps,
+                        });
+                    }
                     g.push(Op::Linear {
                         x: actbuf,
                         weight: wdown,

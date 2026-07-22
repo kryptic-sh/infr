@@ -3261,3 +3261,118 @@ fn expert_parallel_matches_single_device() {
         devs[1].name,
     );
 }
+
+// ─── BitNet b1.58 (bitnet: llama skeleton + SubLN, ternary TQ2_0 weights) ──────────
+//
+// `general.architecture == "bitnet"` (see `arch::BITNET`). BitNet b1.58 is the llama decoder
+// (RMSNorm, NEOX rope like qwen2 → `Config::permute_qk_neox`, no qk-norm, no attention bias, tied
+// lm_head, gated SwiGLU/SiLU FFN) plus SubLN's two extra RMSNorms (`Config::sub_norm`):
+// `attn_sub_norm` on the concatenated-heads attention output BEFORE the o-projection, and
+// `ffn_sub_norm` on the FFN intermediate BEFORE `ffn_down`. Verified against llama.cpp's
+// `build_bitnet` (`src/models/bitnet.cpp`) — the FFN activation is SiLU, NOT squared-ReLU.
+
+fn bitnet_b1_58_large() -> Option<PathBuf> {
+    find_gguf(
+        "gianni-cor--bitnet_b1_58-large-TQ2_0",
+        "bitnet_b1_58-large-TQ2_0.gguf",
+    )
+}
+
+/// bitnet arch recognition + config parse: `Config::from_gguf` must accept `arch == "bitnet"`,
+/// set the SubLN flag (`sub_norm`) and the NEOX row-permute (`permute_qk_neox`), and NOT enable any
+/// of the qk-norm / qkv-bias / gemma / moe / qwen35 gates. The FFN stays dense-gated (`moe` None).
+#[test]
+fn cpu_bitnet_config() {
+    let path = need_model!(bitnet_b1_58_large(), "bitnet_b1_58-large");
+    let g = infr_gguf::Gguf::open(&path).expect("open bitnet gguf");
+    assert_eq!(
+        g.metadata().str("general.architecture"),
+        Some("bitnet"),
+        "fixture is not the bitnet GGUF"
+    );
+    let cfg = infr_llama::Config::from_gguf(&g).expect("Config::from_gguf must accept arch=bitnet");
+    assert!(cfg.sub_norm, "bitnet must set Config::sub_norm (SubLN)");
+    assert!(
+        cfg.permute_qk_neox,
+        "bitnet uses NEOX rope (like qwen2) — must permute q/k rows at load"
+    );
+    assert!(!cfg.qk_norm, "bitnet has no learned q/k-norm");
+    assert!(!cfg.qkv_bias, "bitnet has no attention bias");
+    assert!(!cfg.gemma && !cfg.gemma4, "bitnet is not a gemma variant");
+    assert!(!cfg.qwen35, "bitnet is not qwen35");
+    assert!(cfg.moe.is_none(), "bitnet is a dense (non-MoE) model");
+    // Confirmed from the GGUF metadata dump.
+    assert_eq!(cfg.n_layer, 24);
+    assert_eq!(cfg.n_head, 16);
+    assert_eq!(cfg.n_kv, 16, "bitnet-large is MHA (no GQA)");
+    assert_eq!(cfg.head_dim, 96, "key_length=96");
+    assert_eq!(cfg.n_ff, 4096);
+    assert_eq!(cfg.n_embd, 1536);
+}
+
+/// CPU-only: bitnet's causal prompt prefill (SubLN + ternary TQ2_0 weights) produces finite logits
+/// AND coherent geography — "The capital of France is" must rank " Paris" as the #1 next token. BOS
+/// is prepended (the GGUF sets `add_bos_token=true`; base-model completion needs it or the tiny 0.7B
+/// model degenerates). A real correctness gate on the two sub-norm placements + the NEOX permute.
+#[test]
+fn cpu_bitnet_prefill_paris() {
+    let path = need_model!(bitnet_b1_58_large(), "bitnet_b1_58-large");
+    let _tlk = test_serial_lock();
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let cfg = model.config();
+    assert!(cfg.sub_norm);
+    let mut tokens = model.encode("The capital of France is").expect("encode");
+    tokens.insert(0, 1); // BOS
+    let last = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    assert_eq!(last.len(), cfg.vocab, "logits shape");
+    assert!(
+        last.iter().all(|v| v.is_finite()),
+        "non-finite logit in the bitnet prefill output"
+    );
+    let top = top_k(&last, 5);
+    let decoded: Vec<String> = top
+        .iter()
+        .map(|&(id, _)| model.decode(&[id as u32]).unwrap_or_default())
+        .collect();
+    eprintln!("bitnet top-5: {decoded:?}");
+    assert_eq!(
+        top[0].0, 3681,
+        "bitnet must predict ' Paris' (id 3681) as the top next token, got {:?} — a wrong SubLN \
+         placement or rope permute breaks this",
+        decoded[0]
+    );
+}
+
+/// bitnet's causal prompt prefill through the Vulkan seam vs the CPU oracle (both run TQ2_0
+/// natively). Bit-identical isn't expected (CPU f32 vs Vulkan f16), so this locks the #1 next token
+/// AND a tight whole-vocab cosine — the same shape as the other GPU-seam parity tests.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_bitnet() {
+    let path = need_model!(bitnet_b1_58_large(), "bitnet_b1_58-large");
+    let _tlk = test_serial_lock();
+    let model = infr_llama::SeamModel::load(&path, None).expect("cpu load");
+    let mut tokens = model.encode("The capital of France is").expect("encode");
+    tokens.insert(0, 1); // BOS
+    let cpu_last = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    let gpu_last = model
+        .prefill_logits_vulkan(&tokens)
+        .expect("vulkan prefill");
+    assert!(
+        gpu_last.iter().all(|v| v.is_finite()),
+        "non-finite logit in the Vulkan bitnet prefill output"
+    );
+    let (cpu_top, gpu_top) = (top_k(&cpu_last, 5), top_k(&gpu_last, 5));
+    eprintln!("cpu top-5: {cpu_top:?}\nvulkan top-5: {gpu_top:?}");
+    assert_eq!(
+        cpu_top[0].0, gpu_top[0].0,
+        "CPU/Vulkan top token diverged: cpu={:?} vulkan={:?}",
+        cpu_top[0], gpu_top[0]
+    );
+    let cos = cosine(&cpu_last, &gpu_last);
+    eprintln!("cpu/vulkan whole-vocab cosine: {cos}");
+    assert!(
+        cos > 0.99,
+        "CPU/Vulkan last-row logits diverged: cosine={cos}"
+    );
+}

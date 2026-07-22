@@ -331,6 +331,39 @@ fn synth_q5_1(n_elem: usize, seed: u32) -> Vec<u8> {
     out
 }
 
+// Well-formed MXFP4 blocks (17 B / 32 elems: [u8 E8M0 exponent][16 B nibbles]). The E8M0 byte is
+// a shared exponent `d = 2^(e-128)`; keeping e ∈ {124..132} bounds d to 2^-4..2^4 so the decoded
+// codebook×scale products stay well inside f32 (no overflow) while still exercising the E8M0 decode
+// across the band. Any nibble payload decodes to finite values (KVALUES_MXFP4 codebook). Parity
+// compares Metal's Linear against dequant of these SAME bytes.
+fn synth_mxfp4(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 32, 0, "MXFP4 blocks are 32 elems");
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 32) {
+        let mut blk = vec![0u8; 17];
+        blk[0] = 124 + (blk_i % 9) as u8; // E8M0 exponent, moderate band 124..=132
+        blk[1..17].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 16)); // nibbles
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+// Well-formed NVFP4 blocks (36 B / 64 elems: [u8 scales[4]][32 B nibbles]). The four bytes are
+// UE4M3 per-16-element sub-block scales; 0x3A/0x3C/0x3E/0x40 decode to 0.625/0.75/0.875/1.0 (all
+// moderate, none the 0x00/0x7F zero-flush cases), exercising four DISTINCT sub-block scales per
+// block. Any nibble payload decodes to finite values (shared KVALUES_MXFP4 codebook).
+fn synth_nvfp4(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 64, 0, "NVFP4 blocks are 64 elems");
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 64) {
+        let mut blk = vec![0u8; 36];
+        blk[0..4].copy_from_slice(&[0x3A, 0x3C, 0x3E, 0x40]); // 4 × UE4M3 sub-block scales
+        blk[4..36].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 32)); // nibbles
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
 // A deterministic LCG byte stream — arbitrary but reproducible payload for the k-quant nibble
 // fields (which decode to finite values for *any* byte pattern).
 fn lcg_bytes(mut seed: u32, n: usize) -> Vec<u8> {
@@ -1095,6 +1128,101 @@ fn linear_q5_1_coop_gemm_matches_dequant_reference() {
 fn linear_add_fusion_q5_1_parity() {
     let (in_f, out_f) = (512usize, 384usize);
     check_linear_add_fusion(DType::Q5_1, synth_q5_1(out_f * in_f, 117), in_f, out_f);
+}
+
+// Native MXFP4: E8M0 shared-exponent 4-bit codebook (17 B / 32-elem blocks), the codebook sibling
+// of NVFP4. Same coverage set as the other native codebook quants — GEMV (out_f=94 clamps tail
+// rows), half-fragment GEMM, coop-GEMM, Linear+Add fusion — validating DEC16_MXFP4 against
+// dequantize_row_mxfp4 on real Metal CI (reference dequants the SAME bytes).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_mxfp4_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    check_quant_linear_parity(DType::Mxfp4, synth_mxfp4(out_f * in_f, 130), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_mxfp4_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity_impl(
+        DType::Mxfp4,
+        synth_mxfp4(out_f * in_f, 131),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_mxfp4_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Mxfp4,
+        synth_mxfp4(out_f * in_f, 132),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_mxfp4_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Mxfp4, synth_mxfp4(out_f * in_f, 133), in_f, out_f);
+}
+
+// Native NVFP4: four UE4M3 per-16-element sub-block scales sharing MXFP4's codebook (36 B / 64-elem
+// blocks). in_f must be a multiple of 64 (one 64-elem block). Same coverage set — GEMV, GEMM,
+// coop-GEMM, Linear+Add fusion — validating DEC16_NVFP4 against dequantize_row_nvfp4 on real Metal.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_nvfp4_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    check_quant_linear_parity(DType::Nvfp4, synth_nvfp4(out_f * in_f, 134), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_nvfp4_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity_impl(
+        DType::Nvfp4,
+        synth_nvfp4(out_f * in_f, 135),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_nvfp4_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Nvfp4,
+        synth_nvfp4(out_f * in_f, 136),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_nvfp4_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Nvfp4, synth_nvfp4(out_f * in_f, 137), in_f, out_f);
 }
 
 // Native Q8_0 half-fragment GEMM (m=18 → the hmm route; out_f % 64 != 0 keeps cmm out).

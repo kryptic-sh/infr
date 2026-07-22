@@ -1089,16 +1089,18 @@ fn llama32_1b() -> Option<PathBuf> {
     )
 }
 
-// Captured + verified coherent: "Paris! France is a country in Western Europe", a brave-knight
-// short story (Sir Kaelan, "gentle wonder and a touch of melancholy"). Re-blessed twice: dense
-// Q5_0 Linear onto the int8 kernel, then the attention-SIMD reassociation (numerics policy =
-// match-or-beat llama.cpp CPU precision; coherence re-verified each time).
+// Captured + verified coherent: "The capital of France is Paris. 😊", a brave-knight short story
+// ("The rain in Silverwood always tasted of regret"). Re-blessed THREE times: dense Q5_0 Linear
+// onto the int8 kernel, then the attention-SIMD reassociation, then the Q8_0 sub-256-in_f fix
+// (gemma3-1b's 1152-dim projections are Q8_0, whose CPU dot previously TRUNCATED to 1024 elems —
+// see vec_dot_q8_0 routing). The corrected output is token-identical to the Vulkan backend
+// (independent int8 impl), so this bless fixes a wrong golden, not a precision drift.
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xbafb15f4284f726a),
+    ("The capital of France is", 32, 0xe5a37ab078db3a2c),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0xb14f3d608ccb1823,
+        0x28e39d5dd5b5f858,
     ),
 ];
 

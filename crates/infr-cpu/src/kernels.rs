@@ -9310,4 +9310,68 @@ mod kernel_tests {
             }
         }
     }
+
+    /// Regression: Q8_0 is a NATIVE 32-block weight, so a tensor's `in_f` can be a multiple of 32
+    /// but NOT 256 (gemma3-1b's attention projections are 1152 = 36×32 = 4.5×256). The `Op::Linear`
+    /// dispatch used to route Q8_0 through the 256-superblock `quantize_q8` path, whose
+    /// `nb = in_f/256` truncates to `floor(1152/256)*256 = 1024` elements — silently dropping the
+    /// last 128 (~11%) of every dot. The fix routes such tensors to the native 32-block
+    /// `vec_dot_q8_0_32_batch` (the kernel the dispatch now invokes for both the m==1 single-row
+    /// slice and the m>1 batch). The dispatch method lives on the graph executor and is awkward to
+    /// drive from a unit test, so this exercises the routed kernel directly at in_f=1152, plus a
+    /// 256-aligned case to confirm the fast path is unchanged, and asserts the sub-256 tail the old
+    /// path dropped is numerically significant (so the bug was real, not cosmetic).
+    #[test]
+    fn q8_0_dispatch_sub256_in_f_1152() {
+        for &in_f in &[1152usize, 256usize] {
+            let nb = in_f / 32;
+            let mut w = det_bytes(nb * 34, 77);
+            for k in 0..nb {
+                put_f16(&mut w[k * 34..k * 34 + 2], 0.03);
+            }
+            let wref = dequant_block(DType::Q8_0, &w).unwrap();
+            assert_eq!(wref.len(), in_f);
+
+            let m = 4usize;
+            let xs: Vec<Vec<f32>> = (0..m).map(|r| det_x(in_f, 300 + r as u64)).collect();
+            let q8s: Vec<Q8x32> = xs.iter().map(|x| quantize_q8_32(x)).collect();
+
+            // m>1 batch entry: the arm the dispatch's `else if q8_0_blk32` branch calls.
+            let mut got_batch = vec![0f32; m];
+            vec_dot_q8_0_32_batch(&w, &q8s, in_f, &mut got_batch);
+
+            for (r, q8) in q8s.iter().enumerate() {
+                // full-precision weight · the int8 activation the kernel actually sees.
+                let want = dot(&wref, &dequant_q8_32(q8));
+                assert!(
+                    rel_err(got_batch[r], want) < 1e-3,
+                    "q8_0 in_f={in_f} batch row {r}: got {}, want {want}",
+                    got_batch[r],
+                );
+
+                // m==1 entry: the dispatch quantizes a single row and passes a 1-element slice —
+                // must equal the batch result for that row (same kernel, one token).
+                let mut got1 = [0f32];
+                vec_dot_q8_0_32_batch(&w, std::slice::from_ref(q8), in_f, &mut got1);
+                assert_eq!(
+                    got1[0].to_bits(),
+                    got_batch[r].to_bits(),
+                    "q8_0 in_f={in_f} m==1 row {r} diverges from batch",
+                );
+            }
+
+            // Prove the old truncation mattered: at in_f=1152 a dot over only the first 1024
+            // elements (what the 256-block `nb = in_f/256` path summed) differs from the full dot
+            // by far more than the 1e-3 tolerance above.
+            if in_f == 1152 {
+                let x = &xs[0];
+                let full = dot(&wref, x);
+                let trunc = dot(&wref[..1024], &x[..1024]);
+                assert!(
+                    rel_err(trunc, full) > 1e-2,
+                    "expected sub-256 tail to be significant: full {full}, trunc {trunc}",
+                );
+            }
+        }
+    }
 }

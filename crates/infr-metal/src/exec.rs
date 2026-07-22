@@ -358,6 +358,17 @@ mod tests {
     }
 
     #[test]
+    fn attention_flash_policy_reuses_kv_at_four_rows() {
+        assert!(prefer_attention_flash(true, 4, 16, 4096, 128, true));
+        assert!(!prefer_attention_flash(true, 3, 16, 4096, 128, true));
+        assert!(!prefer_attention_flash(true, 1, 64, 4096, 128, true));
+        assert!(!prefer_attention_flash(true, 4, 16, 63, 128, true));
+        assert!(!prefer_attention_flash(false, 4, 16, 4096, 128, true));
+        assert!(!prefer_attention_flash(true, 4, 16, 4096, 128, false));
+        assert!(!prefer_attention_flash(true, 4, 16, 4096, 256, false));
+    }
+
+    #[test]
     #[ignore = "requires a Metal GPU"]
     fn replay_gpu_decode_ops_observe_dynamic_inputs() {
         let be = MetalBackend::new().expect("Metal backend");
@@ -920,6 +931,22 @@ fn prefer_deltanet_norm_prep(rows: usize) -> bool {
 
 fn prefer_conv1d_parallel(rows: usize, kernel: usize) -> bool {
     rows >= kernel.saturating_sub(1).max(2)
+}
+
+fn prefer_attention_flash(
+    f16: bool,
+    rows: usize,
+    n_head: usize,
+    kv_len: usize,
+    head_dim: usize,
+    flash2_ok: bool,
+) -> bool {
+    let launch_wide = rows * n_head >= 128;
+    let launch_four = rows == 4 && rows * n_head >= 64 && flash2_ok;
+    f16 && (launch_wide || launch_four)
+        && kv_len >= 64
+        && head_dim.is_multiple_of(8)
+        && (head_dim <= 128 || flash2_ok)
 }
 
 fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static str> {
@@ -3980,11 +4007,7 @@ impl MetalBackend {
                 });
                 // hd > 128 has no single-simdgroup flash fallback (its register accumulator
                 // tops out at 128), so the wide gate only opens there when flash2 itself can run.
-                let flash = f16
-                    && rows * nh >= 128
-                    && kv_len >= 64
-                    && hd % 8 == 0
-                    && (hd <= 128 || flash2_ok);
+                let flash = prefer_attention_flash(f16, rows, nh, kv_len, hd, flash2_ok);
                 let split = !flash && (rows * nh < 128 || kv_len >= 128);
                 let flash2 = flash && flash2_ok;
                 // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup

@@ -2348,6 +2348,38 @@ fn attention_flash2_hd128_matches_reference() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
 }
 
+// Four-row deep prefill reuses each K/V tile across the query rows through cooperative flash.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_flash2_four_row_prefill_matches_reference() {
+    let (rows, kv_len, nh, nkv, hd, pos) = (4usize, 136usize, 16usize, 8usize, 128usize, 131usize);
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: infr_core::graph::AttnMask::Causal,
+        pos: pos as u32,
+    });
+    let bound = vec![
+        (q, f32_bytes(&rand_f32(rows * nh * hd, 601))),
+        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 602))),
+        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 603))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
+}
+
 // hd=256 (gemma): the cooperative flash instantiation with 8 O fragments per simdgroup.
 #[test]
 #[ignore = "requires a Metal GPU"]

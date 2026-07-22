@@ -352,6 +352,25 @@ impl Gguf {
         // SAFETY: the file is not modified while this Mmap is live.
         let mmap = unsafe { Mmap::map(&file) }?;
 
+        // Best-effort madvise hints. All are advisory: `advise()` returns an
+        // `io::Result`, but a rejected/unsupported hint must never fail the load —
+        // weight correctness does not depend on any hint landing, so we swallow errors.
+        // NOTE: we deliberately do NOT use `Advice::Sequential`. Decode re-reads the
+        // ENTIRE model every token, so `MADV_SEQUENTIAL`'s drop-behind eviction would
+        // throw away pages we need on the very next token — wrong for this access
+        // pattern. Only `WillNeed`/`HugePage` fit.
+        #[cfg(unix)]
+        {
+            // Populate/readahead the whole mapping into the page cache now, front-loading
+            // the weight read at load instead of faulting it in lazily on the first token.
+            let _ = mmap.advise(memmap2::Advice::WillNeed);
+            // Linux only: request 2 MB transparent huge pages to cut dTLB page-walks over
+            // the multi-GB sequential weight stream. On file-backed mmaps this is frequently
+            // a no-op (THP-for-filesystem is not always enabled) — hence best-effort.
+            #[cfg(target_os = "linux")]
+            let _ = mmap.advise(memmap2::Advice::HugePage);
+        }
+
         // All parsing happens in this block so the borrow of `mmap` ends
         // before we move `mmap` into the returned struct.
         let (metadata, tensors, data_region_start) = {
@@ -634,6 +653,28 @@ mod tests {
 
         // chat_template absent → None
         assert!(gguf.chat_template().is_none());
+    }
+
+    // ── madvise hints are transparent ─────────────────────────────────────────
+
+    /// The best-effort `madvise` hints applied to the weight mmap in `Gguf::open`
+    /// (`WillNeed`, and `HugePage` on Linux) must not change what the mapping reads
+    /// back. Open the fixture and assert the tensor bytes are byte-for-byte identical
+    /// to the raw tensor-data region of the source buffer — i.e. the hint is a no-op
+    /// on observable content. This is the only path that exercises the advise() calls.
+    #[test]
+    fn madvise_hints_are_transparent() {
+        let bytes = build_fixture();
+        let tmp = write_temp_gguf(&bytes);
+        let gguf = Gguf::open(tmp.path()).expect("open fixture");
+
+        // tensor0 is F32 [4] at data offset 0 → the last 16 bytes of the buffer.
+        let expected = &bytes[bytes.len() - 16..];
+        let data = gguf.tensor_bytes("tensor0").expect("tensor_bytes");
+        assert_eq!(
+            data, expected,
+            "mmap read must be byte-for-byte with the source"
+        );
     }
 
     // ── malformed / truncated header hardening ────────────────────────────────

@@ -29,10 +29,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    act_fn, dot, dot_bf16, dot_f16, vec_dot_iq4xs, vec_dot_iq4xs_batch, vec_dot_q4_0_32_batch,
-    vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8, vec_dot_q5_0_32_batch,
-    vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k, vec_dot_q6k_batch, vec_dot_q8_0,
-    vec_dot_q8_0_batch,
+    act_fn, dot, dot_bf16, dot_f16, vec_dot_iq4xs, vec_dot_iq4xs_batch, vec_dot_q2k,
+    vec_dot_q2k_batch, vec_dot_q4_0_32_batch, vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2,
+    vec_dot_q4k_batch8, vec_dot_q5_0_32_batch, vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k,
+    vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_batch,
 };
 use moe::{expert_acts_kind, expert_gemm_range, ActsKind, ExpertActs};
 use quant::{quantize_q8, quantize_q8_32, Q8x32, Q8};
@@ -687,7 +687,12 @@ impl Backend for CpuBackend {
                         let xrow = &xs[..in_f];
                         let q8 = matches!(
                             dt,
-                            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K | DType::Iq4Xs
+                            DType::Q4K
+                                | DType::Q6K
+                                | DType::Q8_0
+                                | DType::Q5K
+                                | DType::Iq4Xs
+                                | DType::Q2K
                         )
                         .then(|| quantize_q8(xrow));
                         // Q4_0 uses the native-32-block int8 activation (Q8x32), not the
@@ -703,6 +708,7 @@ impl Backend for CpuBackend {
                                 DType::Q6K => vec_dot_q6k(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q8_0 => vec_dot_q8_0(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q5K => vec_dot_q5k(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q2K => vec_dot_q2k(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq4Xs => vec_dot_iq4xs(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q4_0 => {
                                     vec_dot_q4_0_32_batch(
@@ -734,7 +740,12 @@ impl Backend for CpuBackend {
                         // the indexed collect, bit-identical.
                         let q8s: Vec<Q8> = if matches!(
                             dt,
-                            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K | DType::Iq4Xs
+                            DType::Q4K
+                                | DType::Q6K
+                                | DType::Q8_0
+                                | DType::Q5K
+                                | DType::Iq4Xs
+                                | DType::Q2K
                         ) {
                             self.pool()
                                 .collect(m, &|r| quantize_q8(&xs[r * in_f..r * in_f + in_f]))
@@ -879,6 +890,7 @@ impl Backend for CpuBackend {
                                     DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
                                     DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
                                     DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
+                                    DType::Q2K => vec_dot_q2k_batch(row, &q8s, in_f, chunk),
                                     DType::Iq4Xs => vec_dot_iq4xs_batch(row, &q8s, in_f, chunk),
                                     DType::F32 => {
                                         let w32: &[f32] = bytemuck::cast_slice(row);

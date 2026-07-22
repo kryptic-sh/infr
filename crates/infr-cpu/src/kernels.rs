@@ -166,6 +166,183 @@ unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     sumf
 }
 
+/// `Σ weight·x` for one Q2_K row (84 bytes / 256 elems) against the Q8 activation. Q2_K is an
+/// AFFINE k-quant like Q4_K — weight value is `d·scale·q2 − dmin·min` — but with 2-bit codes, a
+/// 4-bit unsigned scale AND 4-bit unsigned min per PER-16-element sub-block (16 of them, vs Q4_K's
+/// 8 per-32). Same `Σ scale·(Σ q2·qa) − min·(Σ qa)` shape as Q4_K; the min correction uses the
+/// activation's per-16 sub-block sums (`q8.bsums16`, not the per-32 `bsums` Q4_K uses). Dispatches
+/// avx512bw → avx2 → scalar.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_q2k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    debug_assert_eq!(in_f % 256, 0, "vec_dot_q2k: in_f must be a multiple of 256");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") {
+            // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_q2k_avx512bw(row, q8, in_f) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q2k_avx2(row, q8, in_f) };
+        }
+    }
+    vec_dot_q2k_scalar(row, q8, in_f)
+}
+
+/// Scalar fallback for `vec_dot_q2k`; also used on non-x86 targets. Traverses the 16 per-16-element
+/// sub-blocks in the EXACT order `dequant_block(DType::Q2K)` does (`n`×`shift`×`half`), so element
+/// `is*16 + l` maps to the same `(sub-block, code)` the dequant reference produces. Uses
+/// `q8.bsums16` for the `sm` (min) correction.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn vec_dot_q2k_scalar(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    for b in 0..nb {
+        let blk = &row[b * 84..b * 84 + 84];
+        let scales = &blk[0..16];
+        let qs = &blk[16..80];
+        let d = rdf16(&blk[80..82]);
+        let dmin = rdf16(&blk[82..84]);
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let (mut sd, mut sm) = (0i32, 0i32);
+        // 16 sub-blocks of 16, consumed in the dequant reference's traversal order.
+        let mut is = 0usize;
+        let mut qoff = 0usize;
+        for _n in 0..2 {
+            let mut shift = 0u32;
+            for _j in 0..4 {
+                for half in 0..2 {
+                    let sc = scales[is];
+                    let scale = (sc & 0xF) as i32;
+                    let minv = (sc >> 4) as i32;
+                    let qbyte = &qs[qoff + half * 16..qoff + half * 16 + 16];
+                    let q8s = &q8b[is * 16..is * 16 + 16];
+                    let mut iprod = 0i32;
+                    for l in 0..16 {
+                        let q2 = ((qbyte[l] >> shift) & 3) as i32;
+                        iprod += q2 * q8s[l] as i32;
+                    }
+                    sd += scale * iprod;
+                    sm += minv * q8.bsums16[b * 16 + is];
+                    is += 1;
+                }
+                shift += 2;
+            }
+            qoff += 32;
+        }
+        sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
+    }
+    sumf
+}
+
+/// AVX2 kernel for `vec_dot_q2k`: one 32-byte `qs` chunk (per `n` half) serves all 4 shifts. For
+/// shift-index `k` the byte-wise `(qs >> 2k) & 3` (running 16-bit shift + mask, same cross-byte-safe
+/// trick Q6_K uses) aligns EXACTLY with `q8b[n*128 + k*32 .. +32]` — 32 elements = sub-block
+/// `8n+2k` (low 16) + `8n+2k+1` (high 16). `maddubs(q2_u8, q8_i8) → madd(1)` then split the ymm into
+/// two 16-elem sub-block dots. The `sm` (min) term is an order-free i32 sum over `q8.bsums16`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q2k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    let mask_03 = _mm256_set1_epi8(0x03_u8 as i8);
+    let ones = _mm256_set1_epi16(1i16);
+    for b in 0..nb {
+        let blk = &row[b * 84..b * 84 + 84];
+        let scales = &blk[0..16];
+        let qs = &blk[16..80];
+        let d = rdf16(&blk[80..82]);
+        let dmin = rdf16(&blk[82..84]);
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        let mut sd = 0i32;
+        for n in 0..2usize {
+            // 32 code bytes shared by the 4 shifts (sub-blocks 8n..8n+8).
+            let mut cur = _mm256_loadu_si256(qs[n * 32..].as_ptr() as *const __m256i);
+            for k in 0..4usize {
+                // (cur & 3) = the 2-bit codes at the current shift, one per byte (0–3).
+                let q2 = _mm256_and_si256(cur, mask_03);
+                let q8v = _mm256_loadu_si256(q8b[n * 128 + k * 32..].as_ptr() as *const __m256i);
+                // maddubs: u8(0–3) × i8 → 16×i16 pair-sums (max |pair| = 2·3·127 = 762, no overflow).
+                let prod = _mm256_maddubs_epi16(q2, q8v);
+                let sum32 = _mm256_madd_epi16(prod, ones);
+                // Lower 128 = elements 0..15 (sub-block 8n+2k); upper 128 = 16..31 (sub-block 8n+2k+1).
+                let iprod_lo = hadd_i32_xmm(_mm256_castsi256_si128(sum32));
+                let iprod_hi = hadd_i32_xmm(_mm256_extracti128_si256::<1>(sum32));
+                let is0 = 8 * n + 2 * k;
+                sd += (scales[is0] & 0xF) as i32 * iprod_lo
+                    + (scales[is0 + 1] & 0xF) as i32 * iprod_hi;
+                // Advance to the next 2-bit field. 16-bit lane shift is safe: masking with 0x03
+                // discards any cross-byte bleed (see the Q6_K `qh_sr2` note).
+                cur = _mm256_srli_epi16(cur, 2);
+            }
+        }
+        // sm (min correction) — order-free i32 sum over the per-16 activation sub-block sums.
+        let mut sm = 0i32;
+        for is in 0..16usize {
+            sm += (scales[is] >> 4) as i32 * q8.bsums16[b * 16 + is];
+        }
+        sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
+    }
+    sumf
+}
+
+/// AVX-512BW kernel for `vec_dot_q2k`: both `n` halves' 32-byte `qs` chunks are contiguous (64 B),
+/// so one zmm holds them. For each shift-index `k`, `(qs_zmm >> 2k) & 3` yields 64 codes — lower 256
+/// = `n=0` (sub-blocks `2k`,`2k+1`), upper 256 = `n=1` (`8+2k`,`8+2k+1`). The matching q8 bytes
+/// (`q8b[k*32..]` for `n=0`, `q8b[128+k*32..]` for `n=1`) are non-contiguous → 2 ymm loads + insert.
+/// One `maddubs512 → madd512` covers 64 elements; the 16×i32 result splits into four 16-elem dots.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q2k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = in_f / 256;
+    let mut sumf = 0f32;
+    let mask_03 = _mm512_set1_epi8(0x03_u8 as i8);
+    let ones512 = _mm512_set1_epi16(1i16);
+    for b in 0..nb {
+        let blk = &row[b * 84..b * 84 + 84];
+        let scales = &blk[0..16];
+        let qs = &blk[16..80];
+        let d = rdf16(&blk[80..82]);
+        let dmin = rdf16(&blk[82..84]);
+        let q8b = &q8.qs[b * 256..b * 256 + 256];
+        // qs[0..64] = both n halves contiguous → one zmm.
+        let mut cur = _mm512_loadu_si512(qs.as_ptr() as *const __m512i);
+        let mut sd = 0i32;
+        for k in 0..4usize {
+            let q2 = _mm512_and_si512(cur, mask_03);
+            // q8 for n=0 (lower 256) and n=1 (upper 256), 32 bytes each, non-contiguous.
+            let q8_lo = _mm256_loadu_si256(q8b[k * 32..].as_ptr() as *const __m256i);
+            let q8_hi = _mm256_loadu_si256(q8b[128 + k * 32..].as_ptr() as *const __m256i);
+            let q8_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8_lo), q8_hi);
+            let prod = _mm512_maddubs_epi16(q2, q8_z);
+            let sum32 = _mm512_madd_epi16(prod, ones512);
+            // Lower ymm = n=0 (sub-blocks 2k, 2k+1); upper ymm = n=1 (sub-blocks 8+2k, 8+2k+1).
+            let lo_ymm = _mm512_castsi512_si256(sum32);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
+            let iprod_n0_0 = hadd_i32_xmm(_mm256_castsi256_si128(lo_ymm));
+            let iprod_n0_1 = hadd_i32_xmm(_mm256_extracti128_si256::<1>(lo_ymm));
+            let iprod_n1_0 = hadd_i32_xmm(_mm256_castsi256_si128(hi_ymm));
+            let iprod_n1_1 = hadd_i32_xmm(_mm256_extracti128_si256::<1>(hi_ymm));
+            let is0 = 2 * k; // n=0
+            let is1 = 8 + 2 * k; // n=1
+            sd += (scales[is0] & 0xF) as i32 * iprod_n0_0
+                + (scales[is0 + 1] & 0xF) as i32 * iprod_n0_1
+                + (scales[is1] & 0xF) as i32 * iprod_n1_0
+                + (scales[is1 + 1] & 0xF) as i32 * iprod_n1_1;
+            cur = _mm512_srli_epi16(cur, 2);
+        }
+        let mut sm = 0i32;
+        for is in 0..16usize {
+            sm += (scales[is] >> 4) as i32 * q8.bsums16[b * 16 + is];
+        }
+        sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
+    }
+    sumf
+}
+
 /// `Σ weight·x` for one Q6_K row (210 bytes / 256 elems). Dispatches to the best SIMD path
 /// available at runtime (avx512bw → avx2 → scalar). Weight value is `d·sc·(q6−32)` over 16
 /// sub-blocks of 16 (int8 scales).
@@ -2754,6 +2931,265 @@ pub(crate) fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     vec_dot_q5k_batch_scalar(row, q8s, in_f, out);
 }
 
+/// Scalar Q2_K batch: decode the weight row's 2-bit codes into natural element order ONCE (into
+/// `q2_flat[b*256 + is*16 + l]`, matching `q8b` layout) plus per-16 sub-block scale/min arrays,
+/// then run the integer dot against every one of the `m` Q8 activations. Bit-identical to
+/// `vec_dot_q2k_scalar` (same `is=0..16` accumulation order, same `sm` via `bsums16`).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn vec_dot_q2k_batch_scalar(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![0i32; nb * 16];
+    let mut min_arr = vec![0i32; nb * 16];
+    let mut q2_flat = vec![0u8; nb * 256];
+    for b in 0..nb {
+        let blk = &row[b * 84..b * 84 + 84];
+        let scales = &blk[0..16];
+        let qs = &blk[16..80];
+        d_arr[b] = rdf16(&blk[80..82]);
+        dmin_arr[b] = rdf16(&blk[82..84]);
+        let mut is = 0usize;
+        let mut qoff = 0usize;
+        for _n in 0..2 {
+            let mut shift = 0u32;
+            for _j in 0..4 {
+                for half in 0..2 {
+                    let sc = scales[is];
+                    sc_arr[b * 16 + is] = (sc & 0xF) as i32;
+                    min_arr[b * 16 + is] = (sc >> 4) as i32;
+                    let qbyte = &qs[qoff + half * 16..qoff + half * 16 + 16];
+                    let dst = &mut q2_flat[b * 256 + is * 16..b * 256 + is * 16 + 16];
+                    for l in 0..16 {
+                        dst[l] = (qbyte[l] >> shift) & 3;
+                    }
+                    is += 1;
+                }
+                shift += 2;
+            }
+            qoff += 32;
+        }
+    }
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let (mut sd, mut sm) = (0i32, 0i32);
+            let flat = &q2_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for is in 0..16usize {
+                let f = &flat[is * 16..is * 16 + 16];
+                let a = &q8b[is * 16..is * 16 + 16];
+                let mut iprod = 0i32;
+                for l in 0..16 {
+                    iprod += f[l] as i32 * a[l] as i32;
+                }
+                sd += sc_arr[b * 16 + is] * iprod;
+                sm += min_arr[b * 16 + is] * q8.bsums16[b * 16 + is];
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX2 Q2_K batch: same decode-once flat buffer as the scalar path; per token, each 32-byte flat
+/// chunk `c` holds two 16-elem sub-blocks (`2c` lo, `2c+1` hi) aligned with `q8b[c*32..]`. One
+/// `maddubs → madd` → split ymm gives both sub-block dots. Integer dot is order-free and the
+/// epilogue matches scalar → bit-identical.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q2k_batch_avx2(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let ones = _mm256_set1_epi16(1i16);
+    let (d_arr, dmin_arr, sc_arr, min_arr, q2_flat) = q2k_decode_row(row, nb);
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let mut sd = 0i32;
+            let flat = &q2_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for c in 0..8usize {
+                let f = _mm256_loadu_si256(flat[c * 32..].as_ptr() as *const __m256i);
+                let a = _mm256_loadu_si256(q8b[c * 32..].as_ptr() as *const __m256i);
+                let prod = _mm256_maddubs_epi16(f, a);
+                let sum32 = _mm256_madd_epi16(prod, ones);
+                let iprod_lo = hadd_i32_xmm(_mm256_castsi256_si128(sum32));
+                let iprod_hi = hadd_i32_xmm(_mm256_extracti128_si256::<1>(sum32));
+                sd += sc_arr[b * 16 + 2 * c] * iprod_lo + sc_arr[b * 16 + 2 * c + 1] * iprod_hi;
+            }
+            let mut sm = 0i32;
+            for is in 0..16usize {
+                sm += min_arr[b * 16 + is] * q8.bsums16[b * 16 + is];
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX-512BW Q2_K batch: process sub-block quads via zmm (64 contiguous flat + q8 bytes = pair of
+/// 32-byte chunks `2cp`,`2cp+1` → sub-blocks `4cp..4cp+4`). `maddubs512 → madd512`, split to four
+/// 16-elem dots. Bit-identical to the scalar path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q2k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let ones512 = _mm512_set1_epi16(1i16);
+    let (d_arr, dmin_arr, sc_arr, min_arr, q2_flat) = q2k_decode_row(row, nb);
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let mut sd = 0i32;
+            let flat = &q2_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for cp in 0..4usize {
+                let f = _mm512_loadu_si512(flat[cp * 64..].as_ptr() as *const __m512i);
+                let a = _mm512_loadu_si512(q8b[cp * 64..].as_ptr() as *const __m512i);
+                let prod = _mm512_maddubs_epi16(f, a);
+                let sum32 = _mm512_madd_epi16(prod, ones512);
+                let lo_ymm = _mm512_castsi512_si256(sum32);
+                let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
+                let ip0 = hadd_i32_xmm(_mm256_castsi256_si128(lo_ymm));
+                let ip1 = hadd_i32_xmm(_mm256_extracti128_si256::<1>(lo_ymm));
+                let ip2 = hadd_i32_xmm(_mm256_castsi256_si128(hi_ymm));
+                let ip3 = hadd_i32_xmm(_mm256_extracti128_si256::<1>(hi_ymm));
+                let base = b * 16 + 4 * cp;
+                sd += sc_arr[base] * ip0
+                    + sc_arr[base + 1] * ip1
+                    + sc_arr[base + 2] * ip2
+                    + sc_arr[base + 3] * ip3;
+            }
+            let mut sm = 0i32;
+            for is in 0..16usize {
+                sm += min_arr[b * 16 + is] * q8.bsums16[b * 16 + is];
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX512-VNNI variant of [`vec_dot_q2k_batch_avx512bw`]: `_mm512_dpbusd_epi32` fuses the
+/// maddubs+madd pair into ONE u8×s8→i32 dot-accumulate. Bit-identical — the codes (0–3) × |q8| ≤127
+/// never saturated maddubs' i16 either, so the i32 lanes hold the same per-4-byte-group sums, and
+/// the hadd/scale order is unchanged.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_q2k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let m = q8s.len();
+    let nb = in_f / 256;
+    let (d_arr, dmin_arr, sc_arr, min_arr, q2_flat) = q2k_decode_row(row, nb);
+    for r in 0..m {
+        let q8 = &q8s[r];
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let mut sd = 0i32;
+            let flat = &q2_flat[b * 256..b * 256 + 256];
+            let q8b = &q8.qs[b * 256..b * 256 + 256];
+            for cp in 0..4usize {
+                let f = _mm512_loadu_si512(flat[cp * 64..].as_ptr() as *const __m512i);
+                let a = _mm512_loadu_si512(q8b[cp * 64..].as_ptr() as *const __m512i);
+                let sum32 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), f, a);
+                let lo_ymm = _mm512_castsi512_si256(sum32);
+                let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
+                let ip0 = hadd_i32_xmm(_mm256_castsi256_si128(lo_ymm));
+                let ip1 = hadd_i32_xmm(_mm256_extracti128_si256::<1>(lo_ymm));
+                let ip2 = hadd_i32_xmm(_mm256_castsi256_si128(hi_ymm));
+                let ip3 = hadd_i32_xmm(_mm256_extracti128_si256::<1>(hi_ymm));
+                let base = b * 16 + 4 * cp;
+                sd += sc_arr[base] * ip0
+                    + sc_arr[base + 1] * ip1
+                    + sc_arr[base + 2] * ip2
+                    + sc_arr[base + 3] * ip3;
+            }
+            let mut sm = 0i32;
+            for is in 0..16usize {
+                sm += min_arr[b * 16 + is] * q8.bsums16[b * 16 + is];
+            }
+            sumf += q8.d[b] * (d_arr[b] * sd as f32 - dmin_arr[b] * sm as f32);
+        }
+        out[r] = sumf;
+    }
+}
+
+/// Decode a Q2_K weight row ONCE for the batch kernels: 2-bit codes into natural element order
+/// (`q2_flat[b*256 + is*16 + l]`, mirroring `q8b`), plus per-16 sub-block `scale`/`min` and the
+/// `d`/`dmin` super-block scales. Traversal order matches `dequant_block(DType::Q2K)` exactly.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::type_complexity)]
+fn q2k_decode_row(row: &[u8], nb: usize) -> (Vec<f32>, Vec<f32>, Vec<i32>, Vec<i32>, Vec<u8>) {
+    let mut d_arr = vec![0f32; nb];
+    let mut dmin_arr = vec![0f32; nb];
+    let mut sc_arr = vec![0i32; nb * 16];
+    let mut min_arr = vec![0i32; nb * 16];
+    let mut q2_flat = vec![0u8; nb * 256];
+    for b in 0..nb {
+        let blk = &row[b * 84..b * 84 + 84];
+        let scales = &blk[0..16];
+        let qs = &blk[16..80];
+        d_arr[b] = rdf16(&blk[80..82]);
+        dmin_arr[b] = rdf16(&blk[82..84]);
+        let mut is = 0usize;
+        let mut qoff = 0usize;
+        for _n in 0..2 {
+            let mut shift = 0u32;
+            for _j in 0..4 {
+                for half in 0..2 {
+                    let sc = scales[is];
+                    sc_arr[b * 16 + is] = (sc & 0xF) as i32;
+                    min_arr[b * 16 + is] = (sc >> 4) as i32;
+                    let qbyte = &qs[qoff + half * 16..qoff + half * 16 + 16];
+                    let dst = &mut q2_flat[b * 256 + is * 16..b * 256 + is * 16 + 16];
+                    for l in 0..16 {
+                        dst[l] = (qbyte[l] >> shift) & 3;
+                    }
+                    is += 1;
+                }
+                shift += 2;
+            }
+            qoff += 32;
+        }
+    }
+    (d_arr, dmin_arr, sc_arr, min_arr, q2_flat)
+}
+
+/// Batch Q2_K dot: `out[r] = vec_dot_q2k(row, &q8s[r], in_f)` for all r, bit-identical to the
+/// single-token kernel. The weight row is decoded ONCE; per-token work is the integer dot only.
+/// Dispatches VNNI → avx512bw → avx2 → scalar.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_q2k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 256,
+        0,
+        "vec_dot_q2k_batch: in_f must be a multiple of 256"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+            return unsafe { vec_dot_q2k_batch_vnni(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx512bw") {
+            return unsafe { vec_dot_q2k_batch_avx512bw(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_q2k_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_q2k_batch_scalar(row, q8s, in_f, out);
+}
+
 /// Batched Q8_0 dot at native 32-block granularity: `y = d_w·qw` exactly (no min term — the i8 sign
 /// already encodes it, see `dequant_block`'s Q8_0 case), so `Σy·x = d_w·Σ(qw·x) ≈ d_w·d8·Σ(qw·q8)`.
 /// The weight row's per-block `d_w` is read once, then dotted against every one of the `count` token
@@ -4043,6 +4479,133 @@ mod kernel_tests {
                 assert!(
                     rel_err(got1, want_f) < 2e-2,
                     "iq4xs single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
+                );
+            }
+        }
+    }
+
+    /// Build `nb` fully-random 84-byte Q2_K super-blocks with fixed `d`/`dmin` — every scale nibble
+    /// (0–15), min nibble (0–15) and 2-bit code (0–3) is exercised. Any byte pattern is a legal
+    /// Q2_K block. Used by the bit-identity oracle test.
+    fn build_q2k_rand(nb: usize, d: f32, dmin: f32, seed: u64) -> Vec<u8> {
+        let mut w = det_bytes(nb * 84, seed);
+        for b in 0..nb {
+            put_f16(&mut w[b * 84 + 80..b * 84 + 82], d);
+            put_f16(&mut w[b * 84 + 82..b * 84 + 84], dmin);
+        }
+        w
+    }
+
+    /// Build well-conditioned Q2_K blocks: ZERO-CENTERED weights, the same trick that makes the
+    /// Q4_0 sibling's `d·(q−8)` robust. With `dmin = d`, `scale ∈ {2,4}` and `min = 1.5·scale`,
+    /// the weight is `d·scale·q2 − d·min = d·scale·(q2 − 1.5)` — zero-mean over q2 ∈ {0,1,2,3}. That
+    /// gives the dot a robust magnitude (no pathological sign cancellation), so the int8-activation
+    /// result tracks the full-precision reference within the loose rel tolerance. Codes (`qs`) stay
+    /// random (0–3); fully-random scales/mins (mostly-positive weights) make the dot small and the
+    /// loose bound flaky, which is why the bit-identity test — not this one — owns the full range.
+    fn build_q2k_wc(nb: usize, d: f32, seed: u64) -> Vec<u8> {
+        let mut w = det_bytes(nb * 84, seed ^ 0x9E37);
+        let mut s = seed;
+        for b in 0..nb {
+            let blk = &mut w[b * 84..b * 84 + 84];
+            for is in 0..16usize {
+                let scale = 2 + 2 * ((lcg(&mut s) >> 40) % 2); // {2, 4}
+                let minv = scale * 3 / 2; // {3, 6} = 1.5·scale → zero-mean weight
+                blk[is] = (scale | (minv << 4)) as u8;
+            }
+            // qs[16..80] stays random → codes 0..3.
+            put_f16(&mut blk[80..82], d); // d
+            put_f16(&mut blk[82..84], d); // dmin = d (required for the zero-centering algebra)
+        }
+        w
+    }
+
+    /// The SIMD dispatch (whatever tier this CPU has) must be BIT-IDENTICAL to the scalar oracle for
+    /// both the single-token and batch Q2_K kernels: the per-sub-block dot is an integer sum (exact,
+    /// order-free) and the `q8.d·(d·sd − dmin·sm)` epilogue is shared, so every tier collapses to the
+    /// same bits. Full-random scale/min/code range. Trivial on non-x86 (dispatch == scalar).
+    #[test]
+    fn q2k_simd_bit_identical_to_scalar() {
+        for in_f in [256usize, 512, 768] {
+            let nb = in_f / 256;
+            let w = build_q2k_rand(nb, 0.05, 0.015, 60);
+            let m = 5usize;
+            let q8s: Vec<Q8> = (0..m)
+                .map(|r| quantize_q8(&det_x(in_f, 61 + r as u64)))
+                .collect();
+            // Single-token: SIMD dispatch vs scalar oracle.
+            for (r, q8) in q8s.iter().enumerate() {
+                let simd = vec_dot_q2k(&w, q8, in_f);
+                let scalar = vec_dot_q2k_scalar(&w, q8, in_f);
+                assert_eq!(
+                    simd.to_bits(),
+                    scalar.to_bits(),
+                    "q2k single in_f={in_f} row={r}: simd {simd}, scalar {scalar}"
+                );
+            }
+            // Batch: SIMD dispatch vs scalar oracle.
+            let mut simd_out = vec![0f32; m];
+            vec_dot_q2k_batch(&w, &q8s, in_f, &mut simd_out);
+            let mut scalar_out = vec![0f32; m];
+            vec_dot_q2k_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
+            for r in 0..m {
+                assert_eq!(
+                    simd_out[r].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "q2k batch in_f={in_f} row={r}: simd {}, scalar {}",
+                    simd_out[r],
+                    scalar_out[r]
+                );
+            }
+        }
+    }
+
+    /// End-to-end tolerance-parity: the int8-activation Q2_K kernel must track the full-precision
+    /// affine dequant (`d·scale·q2 − dmin·min`) · f32-activation reference. Q2_K weights are computed
+    /// exactly by the kernel (no weight-quant loss beyond what `dequant_block` also applies), so vs
+    /// the QUANTIZED activation the kernel sees the only slack is f32 accumulation order → tight 1e-3
+    /// (isolates integer-dot correctness, as the Q4_0/IQ4_XS siblings do). vs the full-precision
+    /// activation, the looser 2e-2 absorbs the lossy int8 activation quant. Covers m=1 and m>1.
+    #[test]
+    fn q2k_matches_dequant_reference() {
+        for in_f in [256usize, 512, 768] {
+            let nb = in_f / 256;
+            let w = build_q2k_wc(nb, 0.05, 62);
+            let wref = dequant_block(DType::Q2K, &w).unwrap();
+            // Sanity: reference actually spans nonzero weights.
+            assert!(wref.iter().any(|&v| v != 0.0));
+            let xs: Vec<Vec<f32>> = (0..4).map(|i| det_x(in_f, 63 + i)).collect();
+            let q8s: Vec<Q8> = xs.iter().map(|x| quantize_q8(x)).collect();
+
+            // Batch (m>1).
+            let mut got = vec![0f32; xs.len()];
+            vec_dot_q2k_batch(&w, &q8s, in_f, &mut got);
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got[r], want_q) < 1e-3,
+                    "q2k batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
+                    got[r]
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got[r], want_f) < 2e-2,
+                    "q2k batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
+                    got[r]
+                );
+            }
+            // Single-row (m=1).
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let got1 = vec_dot_q2k(&w, q8, in_f);
+                let want_q = dot(&wref, &dequant_q8(q8));
+                assert!(
+                    rel_err(got1, want_q) < 1e-3,
+                    "q2k single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got1, want_f) < 2e-2,
+                    "q2k single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
                 );
             }
         }

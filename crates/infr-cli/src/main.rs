@@ -2004,6 +2004,53 @@ fn print_bench_avg(samples: &[f64], label: &str, depth: usize, tag: &str, reps: 
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetalBenchMetric {
+    Prompt,
+    Decode,
+    Turn,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetalBenchShape {
+    max_ctx: usize,
+    depth_warm_prompt: Option<usize>,
+    measured_prompt: usize,
+    measured_gen: usize,
+    tokens: usize,
+    metric: MetalBenchMetric,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn metal_bench_shape(
+    n_prompt: usize,
+    n_gen: usize,
+    depth: usize,
+    pg: Option<(usize, usize)>,
+) -> MetalBenchShape {
+    let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
+    let depth_warm_prompt = (depth > 0).then_some(depth + 1);
+    let (measured_prompt, measured_gen, tokens, metric) = if let Some((p, g)) = pg {
+        (depth + p, g, p + g, MetalBenchMetric::Turn)
+    } else if n_gen > 0 {
+        (depth + 1, n_gen, n_gen, MetalBenchMetric::Decode)
+    } else {
+        // The runner batches all but the final prompt token. Include that frontier token so the
+        // timed graph contains exactly `n_prompt` rows.
+        (depth + n_prompt + 1, 0, n_prompt, MetalBenchMetric::Prompt)
+    };
+    MetalBenchShape {
+        max_ctx: depth + p_eff.max(1) + g_eff + 16,
+        depth_warm_prompt,
+        measured_prompt,
+        measured_gen,
+        tokens,
+        metric,
+    }
+}
+
 /// Metal twin of [`cmd_bench_cpu`]: same pp/tg/pg + depth methodology on the Apple-GPU seam
 /// backend (`SeamModel::bench_metal`). On non-macOS this arm is unreachable (the backend crate
 /// compiles to nothing), so the whole body is cfg-gated.
@@ -2026,40 +2073,40 @@ fn cmd_bench_metal(
     #[cfg(target_os = "macos")]
     {
         let model = infr_llama::SeamModel::load(gguf, tok)?;
-        let measure_tg = pg.is_none() && n_gen > 0;
+        let shape = metal_bench_shape(n_prompt, n_gen, depth, pg);
         // ONE session for warmup + every rep: backend, uploaded weights, compiled pipelines and
         // the dequant/repack weight caches persist (each rep still measures a full prefill —
-        // `bench_metal` resets the materialized tokens). A fresh backend per rep re-paid those
+        // the depth warm resets the materialized tokens). A fresh backend per rep re-paid those
         // one-time costs inside the measurement.
-        let ctx = pg.map(|(p, g)| p + g).unwrap_or(if measure_tg {
-            depth.max(1) + n_gen
-        } else {
-            n_prompt
-        }) + 2;
-        let mut sess = model.metal_session(ctx)?;
+        let mut sess = model.metal_session(shape.max_ctx)?;
         // One untimed warmup: page-cache the mmap + build the weight caches + compile pipelines.
-        let _ = model.bench_metal(
-            &mut sess,
-            depth.max(1),
-            if measure_tg || pg.is_some() { 1 } else { 0 },
-        );
+        let _ = model.bench_metal(&mut sess, 8, 2, true, false);
         let mut samples = Vec::with_capacity(reps);
         for _ in 0..reps {
-            let ts = if let Some((p, g)) = pg {
-                let s = model.bench_metal(&mut sess, p, g)?;
-                (p + g) as f64 / (s.prompt_secs + s.decode_secs)
-            } else if measure_tg {
-                let s = model.bench_metal(&mut sess, depth.max(1), n_gen)?;
-                n_gen as f64 / s.decode_secs
+            let reset_measured = if let Some(warm_prompt) = shape.depth_warm_prompt {
+                let _ = model.bench_metal(&mut sess, warm_prompt, 0, true, false)?;
+                false
             } else {
-                let s = model.bench_metal(&mut sess, n_prompt, 0)?;
-                n_prompt as f64 / s.prompt_secs
+                true
             };
+            let s = model.bench_metal(
+                &mut sess,
+                shape.measured_prompt,
+                shape.measured_gen,
+                reset_measured,
+                true,
+            )?;
+            let secs = match shape.metric {
+                MetalBenchMetric::Prompt => s.prompt_secs,
+                MetalBenchMetric::Decode => s.decode_secs,
+                MetalBenchMetric::Turn => s.prompt_secs + s.decode_secs,
+            };
+            let ts = shape.tokens as f64 / secs.max(1e-9);
             samples.push(ts);
         }
         let label = if let Some((p, g)) = pg {
             format!("pg{p}+{g}")
-        } else if measure_tg {
+        } else if shape.metric == MetalBenchMetric::Decode {
             format!("tg{n_gen}")
         } else {
             format!("pp{n_prompt}")
@@ -3589,6 +3636,40 @@ fn cmd_multi(
 mod tests {
     use super::*;
     use infr_llama::arch::*;
+
+    #[test]
+    fn metal_prefill_bench_materializes_depth_and_times_exact_rows() {
+        let shallow = metal_bench_shape(4, 0, 0, None);
+        assert_eq!(shallow.depth_warm_prompt, None);
+        assert_eq!(shallow.measured_prompt, 5);
+        assert_eq!(shallow.measured_gen, 0);
+        assert_eq!(shallow.tokens, 4);
+        assert_eq!(shallow.metric, MetalBenchMetric::Prompt);
+
+        let deep = metal_bench_shape(4, 0, 4096, None);
+        assert_eq!(deep.depth_warm_prompt, Some(4097));
+        assert_eq!(deep.measured_prompt, 4101);
+        assert_eq!(deep.measured_gen, 0);
+        assert_eq!(deep.tokens, 4);
+        assert_eq!(deep.metric, MetalBenchMetric::Prompt);
+    }
+
+    #[test]
+    fn metal_decode_and_turn_benches_preserve_depth_prefix() {
+        let decode = metal_bench_shape(0, 128, 4096, None);
+        assert_eq!(decode.depth_warm_prompt, Some(4097));
+        assert_eq!(decode.measured_prompt, 4097);
+        assert_eq!(decode.measured_gen, 128);
+        assert_eq!(decode.tokens, 128);
+        assert_eq!(decode.metric, MetalBenchMetric::Decode);
+
+        let turn = metal_bench_shape(0, 0, 4096, Some((32, 16)));
+        assert_eq!(turn.depth_warm_prompt, Some(4097));
+        assert_eq!(turn.measured_prompt, 4128);
+        assert_eq!(turn.measured_gen, 16);
+        assert_eq!(turn.tokens, 48);
+        assert_eq!(turn.metric, MetalBenchMetric::Turn);
+    }
 
     #[test]
     fn model_spec_parses_device_suffix() {

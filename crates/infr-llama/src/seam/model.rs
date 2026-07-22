@@ -1486,19 +1486,25 @@ impl SeamModel {
     /// Runs through a persistent [`DenseMetalSession`] so backend, uploaded weights, compiled
     /// pipelines, and the dequant/repack weight caches all survive across reps — a fresh backend
     /// per rep re-paid every one-time cost inside the measurement (a factored-format checkpoint
-    /// re-repacked hundreds of MB per rep). The materialized tokens reset each call, so every
-    /// rep still measures a FULL prefill (llama-bench keeps one context across reps the same way).
+    /// re-repacked hundreds of MB per rep). `reset_tokens` starts a fresh repetition; leaving it
+    /// false preserves a preceding untimed depth warm so the next call measures only its suffix.
+    /// `profile` controls whether this call contributes to the backend's profiler summary.
     #[cfg(target_os = "macos")]
     pub fn bench_metal(
         &self,
         session: &mut DenseMetalSession,
         n_prompt: usize,
         n_gen: usize,
+        reset_tokens: bool,
+        profile: bool,
     ) -> Result<crate::GenStats> {
         let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
-        if let Some(s) = session.pool.single().as_mut() {
-            s.reset_tokens();
+        if reset_tokens {
+            if let Some(s) = session.pool.single().as_mut() {
+                s.reset_tokens();
+            }
         }
+        let _profile_guard = (!profile).then(|| session.mtl.suppress_profiling());
         let (_, stats) = crate::seam::generate_dense_metal_session(
             &session.mtl,
             &self.gguf,

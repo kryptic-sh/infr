@@ -61,6 +61,35 @@ impl infr_core::backend::Buffer for MetalBuffer {
     }
 }
 
+#[derive(Default)]
+struct ProfileGate {
+    suppressions: std::sync::atomic::AtomicUsize,
+}
+
+impl ProfileGate {
+    fn enabled(&self, configured: bool) -> bool {
+        configured && self.suppressions.load(std::sync::atomic::Ordering::Relaxed) == 0
+    }
+
+    fn suppress(&self) -> ProfileSuppression<'_> {
+        self.suppressions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ProfileSuppression { gate: self }
+    }
+}
+
+struct ProfileSuppression<'a> {
+    gate: &'a ProfileGate,
+}
+
+impl Drop for ProfileSuppression<'_> {
+    fn drop(&mut self) {
+        self.gate
+            .suppressions
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct MetalBackend {
     device: Device,
     queue: CommandQueue,
@@ -93,6 +122,7 @@ pub struct MetalBackend {
     /// in-context (no per-op flush distortion). `None` when the device lacks stage-boundary
     /// sampling or the timestamp counter set.
     pub(crate) counter_set: Option<metal::CounterSet>,
+    profile_gate: ProfileGate,
     /// One (cpu_ns, gpu_ticks) correlation taken at init — with a second one at resolve time,
     /// the ratio converts GPU-clock ticks to nanoseconds (the domains drift only with clock
     /// rate changes; a long baseline keeps the estimate stable).
@@ -155,11 +185,30 @@ impl MetalBackend {
             profiling: std::env::var("INFR_METAL_PROFILE").is_ok(),
             prof_ops: std::env::var("INFR_METAL_PROFILE").as_deref() == Ok("2"),
             counter_set,
+            profile_gate: ProfileGate::default(),
             ts_base,
             prof: std::sync::Mutex::new(profile::Profile::default()),
             replay: std::sync::Mutex::new(None),
             scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Temporarily exclude work from the configured profiler. Benchmark setup uses this so
+    /// pipeline warmup and depth materialization do not contaminate measured forwards.
+    pub fn suppress_profiling(&self) -> impl Drop + '_ {
+        self.profile_gate.suppress()
+    }
+
+    pub(crate) fn profiling_enabled(&self) -> bool {
+        self.profile_gate.enabled(self.profiling)
+    }
+
+    pub(crate) fn active_counter_set(&self) -> Option<&metal::CounterSetRef> {
+        if self.profiling_enabled() {
+            self.counter_set.as_deref()
+        } else {
+            None
+        }
     }
 }
 
@@ -366,4 +415,28 @@ fn metal_buf(b: &dyn infr_core::backend::Buffer) -> &MetalBuffer {
     b.as_any()
         .downcast_ref::<MetalBuffer>()
         .expect("metal backend: buffer is not a MetalBuffer (mixed backends?)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProfileGate;
+
+    #[test]
+    fn profile_gate_restores_nested_suppression() {
+        let gate = ProfileGate::default();
+        assert!(gate.enabled(true));
+
+        {
+            let _outer = gate.suppress();
+            assert!(!gate.enabled(true));
+            {
+                let _inner = gate.suppress();
+                assert!(!gate.enabled(true));
+            }
+            assert!(!gate.enabled(true));
+        }
+
+        assert!(gate.enabled(true));
+        assert!(!gate.enabled(false));
+    }
 }

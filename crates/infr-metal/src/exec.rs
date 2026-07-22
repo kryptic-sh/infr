@@ -1237,7 +1237,7 @@ impl MetalBackend {
             let tg = (pso.max_total_threads_per_threadgroup() as usize).min(threads.max(1)) as u64;
             enc.dispatch_threads(MTLSize::new(threads as u64, 1, 1), MTLSize::new(tg, 1, 1));
             enc.end_encoding();
-            let t0 = self.profiling.then(std::time::Instant::now);
+            let t0 = self.profiling_enabled().then(std::time::Instant::now);
             cb.commit();
             cb.wait_until_completed();
             if let Some(t0) = t0 {
@@ -1334,7 +1334,7 @@ impl MetalBackend {
             // Counter profiling: every encoder carries a stage-boundary timestamp pair, so each
             // op's GPU time is measured IN CONTEXT (the batch still commits once). The walk ends
             // the encoder between ops; everything an op encodes lands in its encoder(s).
-            r.enc = Some(if let Some(set) = self.counter_set.as_ref() {
+            r.enc = Some(if let Some(set) = self.active_counter_set() {
                 const CSB_CAP: u64 = 4096;
                 if r.csb.is_none() {
                     let d = metal::CounterSampleBufferDescriptor::new();
@@ -1450,7 +1450,7 @@ impl MetalBackend {
         objc::rc::autoreleasepool(|| {
             let cb = self.queue.new_command_buffer();
             self.encode_tape(cb, tape);
-            let t0 = self.profiling.then(std::time::Instant::now);
+            let t0 = self.profiling_enabled().then(std::time::Instant::now);
             cb.commit();
             cb.wait_until_completed();
             if let Some(t0) = t0 {
@@ -1467,7 +1467,7 @@ impl MetalBackend {
             enc.end_encoding();
         }
         if let Some(cb) = r.cb.take() {
-            let t0 = self.profiling.then(std::time::Instant::now);
+            let t0 = self.profiling_enabled().then(std::time::Instant::now);
             cb.commit();
             cb.wait_until_completed();
             if let Some(t0) = t0 {
@@ -1549,7 +1549,7 @@ impl MetalBackend {
     }
 
     fn replay_capable(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
-        if self.counter_set.is_some() || !replay_shape(g, bindings) {
+        if self.active_counter_set().is_some() || !replay_shape(g, bindings) {
             return false;
         }
         let Some((kern, need)) = g.ops.iter().find_map(|op| match op {
@@ -1613,7 +1613,7 @@ impl MetalBackend {
         bindings: &Bindings,
         n: usize,
     ) -> Result<Option<Vec<u32>>> {
-        if n == 0 || n > 64 || self.counter_set.is_some() {
+        if n == 0 || n > 64 || self.active_counter_set().is_some() {
             return Ok(None);
         }
         let Some(g) = plan
@@ -1713,7 +1713,7 @@ impl MetalBackend {
                 blit.copy_from_buffer(&sampled_buf.raw, 0, &result, (i * 4) as u64, 4);
                 blit.end_encoding();
             }
-            let t0 = self.profiling.then(std::time::Instant::now);
+            let t0 = self.profiling_enabled().then(std::time::Instant::now);
             cb.commit();
             cb.wait_until_completed();
             if let Some(t0) = t0 {
@@ -1842,7 +1842,7 @@ impl MetalBackend {
             }
         }
 
-        if self.profiling {
+        if self.profiling_enabled() {
             for (idx, op) in g.ops.iter().enumerate() {
                 if r.skip.contains(&idx) {
                     continue;
@@ -1857,7 +1857,7 @@ impl MetalBackend {
                 }
                 // Counter mode: seal this op's encoder (the command buffer stays open) so the
                 // next op's dispatches land in their own sampled encoder.
-                if self.counter_set.is_some() {
+                if self.active_counter_set().is_some() {
                     if let Some(e) = r.enc.take() {
                         e.end_encoding();
                     }
@@ -1872,7 +1872,7 @@ impl MetalBackend {
                     None
                 };
                 let mut pr = self.prof.lock().unwrap();
-                let name = if self.counter_set.is_some() {
+                let name = if self.active_counter_set().is_some() {
                     r.cur_op
                 } else {
                     op_name(op)

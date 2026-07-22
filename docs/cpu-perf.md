@@ -47,13 +47,13 @@ coherence generation.
 | `IQ1_S`   | `93e3225` | 1-bit, `dl·(iprod + delta·asum)`  |
 | `IQ1_M`   | `c70111f` | 1-bit, d-in-scales, per-8 delta   |
 
-The grid/codebook set (IQ2*XXS/XS/S, IQ3_XXS/S, IQ1_S/M) uses the
-expand-row-once → signed-i8 → per-group int dot pattern; each mirrors
-`dequant_codebook` and is gated on a **tight 1e-3** tolerance vs the exact
-decode. Coherence: `IQ3_XXS` is token-identical to the GPU native path;
-`IQ2_XXS` matches leading tokens; the 1-bit `IQ1*\*` are chaotic at the noise
-floor (int8/f32/CPU/GPU all diverge — the 1e-3 math check is the correctness
-gate).
+The grid/codebook set (`IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ3_XXS`/`IQ3_S`,
+`IQ1_S`/`IQ1_M`) uses the expand-row-once → signed-i8 → per-group int dot
+pattern; each mirrors `dequant_codebook` and is gated on a **tight 1e-3**
+tolerance vs the exact decode. Coherence: `IQ3_XXS` is token-identical to the
+GPU native path; `IQ2_XXS` matches leading tokens; the 1-bit `IQ1_S`/`IQ1_M` are
+chaotic at the noise floor (int8/f32/CPU/GPU all diverge — the 1e-3 math check
+is the correctness gate).
 
 **CPU now natively handles every weight quant except ternary**
 (`TQ1_0`/`TQ2_0`).

@@ -364,6 +364,50 @@ fn synth_nvfp4(n_elem: usize, seed: u32) -> Vec<u8> {
     out
 }
 
+// Well-formed Q2_0 blocks (18 B / 64 elems: [f16 d][16 B qs]) — Bonsai ternary, 2 bits/elem packed
+// sequentially, value = d*(q - 1). Any qs payload decodes to finite values; only d must be a sane
+// f16. Parity compares Metal's Linear against a reference dequant of these SAME bytes.
+fn synth_q2_0(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 64, 0, "Q2_0 blocks are 64 elems");
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 64) {
+        let mut blk = vec![0u8; 18];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.05).to_le_bytes()); // d
+        blk[2..18].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 16)); // 2-bit codes
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+// Well-formed TQ2_0 blocks (66 B / 256 elems: [64 B qs][f16 d]) — ternary, 2 bits/elem, value =
+// d*(q - 1). Any qs payload decodes to finite values; only d must be a sane f16.
+fn synth_tq2_0(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0, "TQ2_0 blocks are 256 elems");
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 66];
+        blk[0..64].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 64)); // 2-bit codes
+        blk[64..66].copy_from_slice(&half::f16::from_f32(0.05).to_le_bytes()); // d
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+// Well-formed TQ1_0 blocks (54 B / 256 elems: [48 B qs][4 B qh][f16 d]) — ternary base-3, 5 digits
+// per byte, value = d*(digit - 1). Any qs/qh payload decodes to finite digits in {0,1,2}; only d
+// must be a sane f16. Parity exercises the fiddly base-3 element→byte mapping against dequant.
+fn synth_tq1_0(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0, "TQ1_0 blocks are 256 elems");
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 54];
+        blk[0..52].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 52)); // qs[48] + qh[4]
+        blk[52..54].copy_from_slice(&half::f16::from_f32(0.05).to_le_bytes()); // d
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
 // A deterministic LCG byte stream — arbitrary but reproducible payload for the k-quant nibble
 // fields (which decode to finite values for *any* byte pattern).
 fn lcg_bytes(mut seed: u32, n: usize) -> Vec<u8> {
@@ -1223,6 +1267,148 @@ fn linear_nvfp4_coop_gemm_matches_dequant_reference() {
 fn linear_add_fusion_nvfp4_parity() {
     let (in_f, out_f) = (512usize, 384usize);
     check_linear_add_fusion(DType::Nvfp4, synth_nvfp4(out_f * in_f, 137), in_f, out_f);
+}
+
+// Native Q2_0: Bonsai ternary (18 B / 64-elem blocks), value = d*(q - 1). 64-elem block so in_f is
+// a multiple of 64. Same coverage set — GEMV (out_f=94 clamps tail rows), half-fragment GEMM,
+// coop-GEMM, Linear+Add fusion — validating DEC16_Q2_0 against dequantize_row_q2_0 on real Metal CI
+// (reference dequants the SAME 18-byte blocks).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q2_0_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 128usize, 94usize);
+    check_quant_linear_parity(DType::Q2_0, synth_q2_0(out_f * in_f, 140), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q2_0_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 128usize, 96usize);
+    check_quant_linear_parity_impl(
+        DType::Q2_0,
+        synth_q2_0(out_f * in_f, 141),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q2_0_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 320usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Q2_0,
+        synth_q2_0(out_f * in_f, 142),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_q2_0_parity() {
+    let (in_f, out_f) = (320usize, 384usize);
+    check_linear_add_fusion(DType::Q2_0, synth_q2_0(out_f * in_f, 143), in_f, out_f);
+}
+
+// Native TQ2_0: ternary 2-bit (66 B / 256-elem blocks), value = d*(q - 1). 256-elem block so in_f
+// is a multiple of 256. Same coverage set validating DEC16_TQ2_0 against dequantize_row_tq2_0.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_tq2_0_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    check_quant_linear_parity(DType::Tq2_0, synth_tq2_0(out_f * in_f, 144), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_tq2_0_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity_impl(
+        DType::Tq2_0,
+        synth_tq2_0(out_f * in_f, 145),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_tq2_0_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 512usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Tq2_0,
+        synth_tq2_0(out_f * in_f, 146),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_tq2_0_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Tq2_0, synth_tq2_0(out_f * in_f, 147), in_f, out_f);
+}
+
+// Native TQ1_0: ternary base-3, 5 digits per byte (54 B / 256-elem blocks), value = d*(digit - 1).
+// 256-elem block so in_f is a multiple of 256. The fiddliest decode — the base-3 element→byte
+// mapping (three segments qs[0..32]/qs[32..48]/qh[0..4]) is validated against dequantize_row_tq1_0
+// bit-for-bit on real Metal CI. Same coverage set: GEMV, GEMM, coop-GEMM, Linear+Add fusion.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_tq1_0_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    check_quant_linear_parity(DType::Tq1_0, synth_tq1_0(out_f * in_f, 148), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_tq1_0_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity_impl(
+        DType::Tq1_0,
+        synth_tq1_0(out_f * in_f, 149),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_tq1_0_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 512usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Tq1_0,
+        synth_tq1_0(out_f * in_f, 150),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_tq1_0_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Tq1_0, synth_tq1_0(out_f * in_f, 151), in_f, out_f);
 }
 
 // Native Q8_0 half-fragment GEMM (m=18 → the hmm route; out_f % 64 != 0 keeps cmm out).

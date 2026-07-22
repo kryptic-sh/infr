@@ -307,6 +307,9 @@ mod tests {
             "linear_q4_1",
             "linear_mxfp4",
             "linear_nvfp4",
+            "linear_q2_0",
+            "linear_tq2_0",
+            "linear_tq1_0",
             "linear_iq4xs",
             "linear_iq4nl",
             "linear_iq2xxs",
@@ -825,6 +828,9 @@ fn metal_embed_gather_kern(dt: DType) -> Option<&'static str> {
         DType::Q5_1 => Some("embed_gather_q5_1"),
         DType::Mxfp4 => Some("embed_gather_mxfp4"),
         DType::Nvfp4 => Some("embed_gather_nvfp4"),
+        DType::Q2_0 => Some("embed_gather_q2_0"),
+        DType::Tq2_0 => Some("embed_gather_tq2_0"),
+        DType::Tq1_0 => Some("embed_gather_tq1_0"),
         DType::Q4K => Some("embed_gather_q4k"),
         DType::Q6K => Some("embed_gather_q6k"),
         DType::Iq4Nl => Some("embed_gather_iq4nl"),
@@ -924,6 +930,9 @@ fn qui_linear_kerns(base: &str) -> Option<QuiLinearKerns> {
         "linear_q4_1" => kset!("linear_q4_1"),
         "linear_mxfp4" => kset!("linear_mxfp4"),
         "linear_nvfp4" => kset!("linear_nvfp4"),
+        "linear_q2_0" => kset!("linear_q2_0"),
+        "linear_tq2_0" => kset!("linear_tq2_0"),
+        "linear_tq1_0" => kset!("linear_tq1_0"),
         "linear_iq4xs" => kset!("linear_iq4xs"),
         "linear_iq4nl" => kset!("linear_iq4nl"),
         "linear_iq2xxs" => kset!("linear_iq2xxs"),
@@ -2024,8 +2033,8 @@ impl MetalBackend {
                  {dt:?} has no native Metal kernel, so its weights are cached at f32 (4-8x the \
                  quantized size) and the total no longer fits — proceeding would corrupt \
                  silently. Use a natively-supported quantization (Q4_K_M / Q6_K / Q8_0 / Q5_0 / \
-                 Q4_0 / Q5_1 / Q4_1 / MXFP4 / NVFP4) or run this checkpoint on the CPU backend \
-                 (INFR_DEV=cpu).",
+                 Q4_0 / Q5_1 / Q4_1 / MXFP4 / NVFP4 / Q2_0 / TQ1_0 / TQ2_0) or run this \
+                 checkpoint on the CPU backend (INFR_DEV=cpu).",
                 used as f64 / (1u64 << 30) as f64,
                 want as f64 / (1u64 << 30) as f64,
                 budget as f64 / (1u64 << 30) as f64,
@@ -2085,6 +2094,9 @@ impl MetalBackend {
             DType::Q4_1 => Some("linear_q4_1"),
             DType::Mxfp4 => Some("linear_mxfp4"),
             DType::Nvfp4 => Some("linear_nvfp4"),
+            DType::Q2_0 => Some("linear_q2_0"),
+            DType::Tq2_0 => Some("linear_tq2_0"),
+            DType::Tq1_0 => Some("linear_tq1_0"),
             DType::Iq4Xs => Some("linear_iq4xs"),
             DType::Iq4Nl => Some("linear_iq4nl"),
             DType::Iq2Xxs => Some("linear_iq2xxs"),
@@ -2478,6 +2490,9 @@ impl MetalBackend {
                             | DType::Iq3S
                             | DType::Mxfp4
                             | DType::Nvfp4
+                            | DType::Q2_0
+                            | DType::Tq2_0
+                            | DType::Tq1_0
                     )
                 {
                     // Native quant: decode the compact factored weight inline — no f32 blow-up.
@@ -2510,6 +2525,9 @@ impl MetalBackend {
                         "linear_q4_1" => (e / 32 * 20, 0, 0),
                         "linear_mxfp4" => (e / 32 * 17, 0, 0),
                         "linear_nvfp4" => (e / 64 * 36, 0, 0),
+                        "linear_q2_0" => (e / 64 * 18, 0, 0),
+                        "linear_tq2_0" => (e / 256 * 66, 0, 0),
+                        "linear_tq1_0" => (e / 256 * 54, 0, 0),
                         "linear_iq4xs" => (e / 256 * 136, 0, 0),
                         "linear_iq2xxs" => (e / 256 * 66, 0, 0),
                         "linear_iq3xxs" => (e / 256 * 98, 0, 0),

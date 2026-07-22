@@ -136,7 +136,14 @@ produced in a way that looks like garbage is a bug, not a precision flip.
   bound error; the Q4_0 gpu_seam golden is a sanctioned **precision-flip
   re-bless** (`--include-ignored`), and the new CPU path should match the GPU
   int8 result, not the old f32.
-- **Status:** TODO
+- **Status:** DONE (`6e7decd`). `vec_dot_q4_0_32_batch` (scalar + AVX2 + VNNI),
+  cloned from Q5_0 (18-byte block, offset 8, no 5th bit); reuses `Q8x32`. Wired
+  into decode + prefill (decode had no Q4_0 kernel before). **No golden
+  changed** and no re-bless needed — CPU greedy output is coherent and
+  **token-identical to the independent Vulkan int8 path** ("…is **Paris**.").
+  SIMD bit-identical to the scalar oracle; tolerance-parity vs full-precision
+  dequant. **Qwen3-0.6B Q4_0 CPU: decode 28.7→69.6 t/s (+142%), prefill
+  128.7→435.9 t/s (+239%).**
 
 ### 5. Native int8 dot: **IQ4_XS** — _medium_
 

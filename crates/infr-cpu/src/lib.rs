@@ -29,15 +29,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    act_fn, dot, dot_bf16, dot_f16, vec_dot_iq1s, vec_dot_iq1s_batch, vec_dot_iq2s,
-    vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch, vec_dot_iq2xxs, vec_dot_iq2xxs_batch,
-    vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs, vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch,
-    vec_dot_iq4xs, vec_dot_iq4xs_batch, vec_dot_mxfp4_32_batch, vec_dot_nvfp4_batch,
-    vec_dot_q2_0_batch, vec_dot_q2k, vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch,
-    vec_dot_q4_0_32_batch, vec_dot_q4_1_32_batch, vec_dot_q4k, vec_dot_q4k_batch,
-    vec_dot_q4k_batch2, vec_dot_q4k_batch8, vec_dot_q5_0_32_batch, vec_dot_q5_1_32_batch,
-    vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k, vec_dot_q6k_batch, vec_dot_q8_0,
-    vec_dot_q8_0_batch,
+    act_fn, dot, dot_bf16, dot_f16, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
+    vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch,
+    vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs,
+    vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
+    vec_dot_mxfp4_32_batch, vec_dot_nvfp4_batch, vec_dot_q2_0_batch, vec_dot_q2k,
+    vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
+    vec_dot_q4_1_32_batch, vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8,
+    vec_dot_q5_0_32_batch, vec_dot_q5_1_32_batch, vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k,
+    vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_batch,
 };
 use moe::{expert_acts_kind, expert_gemm_range, ActsKind, ExpertActs};
 use quant::{quantize_q8, quantize_q8_32, Q8x32, Q8};
@@ -701,6 +701,7 @@ impl Backend for CpuBackend {
                                 | DType::Iq2Xs
                                 | DType::Iq2Xxs
                                 | DType::Iq1S
+                                | DType::Iq1M
                                 | DType::Iq3S
                                 | DType::Iq3Xxs
                                 | DType::Q2K
@@ -736,6 +737,7 @@ impl Backend for CpuBackend {
                                 DType::Iq2Xs => vec_dot_iq2xs(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq2Xxs => vec_dot_iq2xxs(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq1S => vec_dot_iq1s(row, q8.as_ref().unwrap(), in_f),
+                                DType::Iq1M => vec_dot_iq1m(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq3S => vec_dot_iq3s(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq3Xxs => vec_dot_iq3xxs(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q4_0 => {
@@ -821,6 +823,7 @@ impl Backend for CpuBackend {
                                 | DType::Iq2Xs
                                 | DType::Iq2Xxs
                                 | DType::Iq1S
+                                | DType::Iq1M
                                 | DType::Iq3S
                                 | DType::Iq3Xxs
                                 | DType::Q2K
@@ -1050,6 +1053,7 @@ impl Backend for CpuBackend {
                                     DType::Iq2Xs => vec_dot_iq2xs_batch(row, &q8s, in_f, chunk),
                                     DType::Iq2Xxs => vec_dot_iq2xxs_batch(row, &q8s, in_f, chunk),
                                     DType::Iq1S => vec_dot_iq1s_batch(row, &q8s, in_f, chunk),
+                                    DType::Iq1M => vec_dot_iq1m_batch(row, &q8s, in_f, chunk),
                                     DType::Iq3S => vec_dot_iq3s_batch(row, &q8s, in_f, chunk),
                                     DType::Iq3Xxs => vec_dot_iq3xxs_batch(row, &q8s, in_f, chunk),
                                     DType::F32 => {

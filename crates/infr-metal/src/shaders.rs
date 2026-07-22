@@ -66,6 +66,8 @@ fn iquant_grids_msl() -> String {
     emit_grid(&mut s, "ulong", "IQ2S_GRID", &ig::IQ2S_GRID, "ul");
     emit_grid(&mut s, "uint", "IQ3XXS_GRID", &ig::IQ3XXS_GRID, "u");
     emit_grid(&mut s, "uint", "IQ3S_GRID", &ig::IQ3S_GRID, "u");
+    // IQ1_S / IQ1_M share the 2048-entry IQ1S_GRID (u64: 8 signed i8 each).
+    emit_grid(&mut s, "ulong", "IQ1S_GRID", &ig::IQ1S_GRID, "ul");
     s
 }
 

@@ -317,6 +317,8 @@ mod tests {
             "linear_iq3s",
             "linear_iq2s",
             "linear_iq2xs",
+            "linear_iq1s",
+            "linear_iq1m",
         ];
         for base in bases {
             let k = qui_linear_kerns(base)
@@ -940,6 +942,8 @@ fn qui_linear_kerns(base: &str) -> Option<QuiLinearKerns> {
         "linear_iq3s" => kset!("linear_iq3s"),
         "linear_iq2s" => kset!("linear_iq2s"),
         "linear_iq2xs" => kset!("linear_iq2xs"),
+        "linear_iq1s" => kset!("linear_iq1s"),
+        "linear_iq1m" => kset!("linear_iq1m"),
         _ => return None,
     })
 }
@@ -2104,6 +2108,8 @@ impl MetalBackend {
             DType::Iq3S => Some("linear_iq3s"),
             DType::Iq2S => Some("linear_iq2s"),
             DType::Iq2Xs => Some("linear_iq2xs"),
+            DType::Iq1S => Some("linear_iq1s"),
+            DType::Iq1M => Some("linear_iq1m"),
             _ => None,
         };
         if let Some(kern) = native_kern {
@@ -2488,6 +2494,8 @@ impl MetalBackend {
                             | DType::Iq2Xs
                             | DType::Iq2S
                             | DType::Iq3S
+                            | DType::Iq1S
+                            | DType::Iq1M
                             | DType::Mxfp4
                             | DType::Nvfp4
                             | DType::Q2_0
@@ -2534,6 +2542,8 @@ impl MetalBackend {
                         "linear_iq3s" => (e / 256 * 110, 0, 0),
                         "linear_iq2s" => (e / 256 * 82, 0, 0),
                         "linear_iq2xs" => (e / 256 * 74, 0, 0),
+                        "linear_iq1s" => (e / 256 * 50, 0, 0),
+                        "linear_iq1m" => (e / 256 * 56, 0, 0),
                         "linear_iq4nl" => (e / 32 * 18, 0, 0),
                         "linear_quik4" => (e / 2, e / 4, dd_off),
                         "linear_quik6" => (e / 4 * 3, e / 4, dd_off),

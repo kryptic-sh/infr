@@ -1809,6 +1809,93 @@ fn linear_iq3s_matches_dequant_reference() {
     iq_parity_suite(DType::Iq3S, 110, 0.002, 430);
 }
 
+// IQ1_S (1.56 bpw): block = [f16 d][32 B qs][16 B qh = 8 u16], 50 B / 256 elems. Every qs byte plus
+// the 3 qh high-bits form an 11-bit index into IQ1S_GRID[2048], so ALL random bytes are in-range
+// grid indices; per-sub-block dl (qh bits 12..14) and delta sign (qh bit 15) vary across the random
+// qh. Weight is dl*(grid + delta) with an ADDITIVE delta=±0.125 — the native DEC16_IQ1S must match
+// that, not a sign codebook. dl reaches d*(2*7+1)=15*d and grid values are ±1, so a small d keeps
+// synthetic magnitudes realistic.
+fn synth_iq1s(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0);
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 50];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.03).to_le_bytes());
+        blk[2..50].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 48));
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+// IQ1_M (1.75 bpw): block = [32 B qs][16 B qh][8 B scales], 56 B / 256 elems. There is NO separate d
+// — it is a f16 assembled from the TOP nibbles of the four u16 scales, so random scale bytes would
+// yield a garbage/NaN d. Set d deliberately: its four nibbles go into the four scale-u16 top nibbles
+// (bits 12..15), and the low 12 bits (the four 3-bit dl fields) plus all qs/qh (grid index + delta
+// sign) are randomized. Every grid index is 11-bit ⇒ in range. dequant_block reads exactly those
+// top nibbles back into d.
+fn synth_iq1m(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0);
+    let d_bits = half::f16::from_f32(0.03).to_bits();
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 56];
+        // qs[0..32] + qh[32..48] — random, all valid.
+        blk[0..48].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 48));
+        // scales[48..56]: top nibble of each u16 carries a nibble of d, low 12 bits are the varied
+        // 3-bit dl fields.
+        let low = lcg_bytes(seed.wrapping_add(0x9e37).wrapping_add(blk_i as u32), 8);
+        for i in 0..4usize {
+            let nib = (d_bits >> (4 * i)) & 0xf;
+            let lo12 = ((low[2 * i] as u16) | ((low[2 * i + 1] as u16) << 8)) & 0x0fff;
+            let scw = (nib << 12) | lo12;
+            blk[48 + 2 * i..48 + 2 * i + 2].copy_from_slice(&scw.to_le_bytes());
+        }
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+// Same coverage as `iq_parity_suite` (GEMV m=1, RT m=2, cmm m=4, hmm m=18, fused-QKV w_off), but the
+// IQ1 synth builders differ per format (IQ1_M packs d into trailing scales), so take the builder as
+// a closure. Tolerances match the signed-codebook reassociation the other grid i-quants document.
+fn iq1_parity_suite(dtype: DType, seed: u32, synth: impl Fn(usize, u32) -> Vec<u8>) {
+    for (m, in_f, out_f) in [(1usize, 256usize, 96usize), (2, 256, 96)] {
+        check_quant_linear_parity_tol(dtype, synth(out_f * in_f, seed), m, in_f, out_f, 5e-3);
+    }
+    for (m, in_f, out_f) in [(4usize, 512usize, 128usize), (18, 512, 128)] {
+        check_quant_linear_parity_impl(
+            dtype,
+            synth(out_f * in_f, seed + 1),
+            m,
+            in_f,
+            out_f,
+            2.5e-3,
+            true,
+        );
+    }
+    check_linear_woff(
+        dtype,
+        synth(256 * 256, seed + 2),
+        1,
+        256,
+        &[128usize, 64, 64],
+        false,
+        1e-3,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq1s_matches_dequant_reference() {
+    iq1_parity_suite(DType::Iq1S, 440, synth_iq1s);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_iq1m_matches_dequant_reference() {
+    iq1_parity_suite(DType::Iq1M, 450, synth_iq1m);
+}
+
 // K-quants are the formats real checkpoints actually ship. Exercise the Metal dequant path
 // (`weight_buf` → `dequant_block`) for Q4_K and Q6_K, same dequant-reference comparison as Q8_0.
 #[test]

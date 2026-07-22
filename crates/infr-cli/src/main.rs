@@ -2555,6 +2555,14 @@ fn parse_llama_cli_gen_rate(output: &str) -> Option<f64> {
     last
 }
 
+fn compare_infr_dev(dev: &str) -> &str {
+    if dev.eq_ignore_ascii_case("MTL0") {
+        "metal"
+    } else {
+        dev
+    }
+}
+
 /// One model's infr-vs-llama.cpp bench harness: resolves the shared model ref once and shells
 /// out to `infr bench --json` / `llama-bench -o json` with MATCHED flags. Both the deep
 /// coding-agent scenarios (`cmd_compare`) and the multi-model survey (`cmd_compare_sweep`) run
@@ -2654,7 +2662,12 @@ impl ModelBench {
         c.arg("bench")
             .arg(&self.model)
             .args(["-r", &self.reps.to_string()]);
-        c.args(["--ngl", &self.ngl.to_string(), "--dev", &self.dev]);
+        c.args([
+            "--ngl",
+            &self.ngl.to_string(),
+            "--dev",
+            compare_infr_dev(&self.dev),
+        ]);
         if self.threads > 0 {
             c.args(["-t", &self.threads.to_string()]);
         }
@@ -3655,6 +3668,15 @@ mod tests {
             resolve_backend(None, BackendEnv::default()).unwrap(),
             Backend::Vulkan(None)
         );
+    }
+
+    #[test]
+    fn compare_translates_llama_metal_device_for_infr() {
+        assert_eq!(compare_infr_dev("MTL0"), "metal");
+        assert_eq!(compare_infr_dev("mtl0"), "metal");
+        assert_eq!(compare_infr_dev("Vulkan1"), "Vulkan1");
+        assert_eq!(compare_infr_dev("metal"), "metal");
+        assert_eq!(compare_infr_dev("cpu"), "cpu");
     }
 
     #[test]

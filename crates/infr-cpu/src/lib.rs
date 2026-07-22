@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    act_fn, dot, dot_bf16, dot_f16, vec_dot_iq4xs, vec_dot_iq4xs_batch, vec_dot_q2k,
-    vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
+    act_fn, dot, dot_bf16, dot_f16, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
+    vec_dot_q2k, vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
     vec_dot_q4_1_32_batch, vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8,
     vec_dot_q5_0_32_batch, vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k, vec_dot_q6k_batch,
     vec_dot_q8_0, vec_dot_q8_0_batch,
@@ -697,10 +697,11 @@ impl Backend for CpuBackend {
                                 | DType::Q3K
                         )
                         .then(|| quantize_q8(xrow));
-                        // Q4_0/Q4_1 use the native-32-block int8 activation (Q8x32), not the
+                        // Q4_0/Q4_1/IQ4_NL use the native-32-block int8 activation (Q8x32), not the
                         // 256-superblock Q8; quantize the single activation row once.
                         let q8_32: Option<[Q8x32; 1]> =
-                            matches!(dt, DType::Q4_0 | DType::Q4_1).then(|| [quantize_q8_32(xrow)]);
+                            matches!(dt, DType::Q4_0 | DType::Q4_1 | DType::Iq4Nl)
+                                .then(|| [quantize_q8_32(xrow)]);
                         // Spin-pool, 16 output rows per claimed task (decode's per-row dot is
                         // ~µs-scale; per-row claims would be all cursor contention).
                         self.pool().for_chunks_mut(&mut out, 1, 16, &|o, dst_o| {
@@ -724,6 +725,15 @@ impl Backend for CpuBackend {
                                 }
                                 DType::Q4_1 => {
                                     vec_dot_q4_1_32_batch(
+                                        row,
+                                        q8_32.as_ref().unwrap(),
+                                        in_f,
+                                        dst_o,
+                                    );
+                                    return;
+                                }
+                                DType::Iq4Nl => {
+                                    vec_dot_iq4nl_32_batch(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -903,6 +913,18 @@ impl Backend for CpuBackend {
                             self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                 let row = &wbytes[o * bpr..o * bpr + bpr];
                                 vec_dot_q4_1_32_batch(row, &q8s32, in_f, chunk);
+                            });
+                        } else if dt == DType::Iq4Nl && in_f.is_multiple_of(32) {
+                            // IQ4_NL (flat 32-block codebook cousin of IQ4_XS: ONE f16 `d` per
+                            // 32-weight block, signed KVALUES codebook, no super-block scales):
+                            // previously fell through to the dequant+f32 fallback below. Reuse the
+                            // Q8x32-activation batch kernel with the codebook signed-dot.
+                            let q8s32: Vec<Q8x32> = self
+                                .pool()
+                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
+                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                let row = &wbytes[o * bpr..o * bpr + bpr];
+                                vec_dot_iq4nl_32_batch(row, &q8s32, in_f, chunk);
                             });
                         } else {
                             // Grain 8: at lm_head shape this loop is 262k one-row chunks; per-row

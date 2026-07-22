@@ -721,6 +721,69 @@ constant uint kpow3_tq1[6] = {1u, 3u, 9u, 27u, 81u, 243u};
         }                                                                                          \
     }
 
+// NATIVE IQ1_S block (50 B / 256 elems): [f16 d][32 B qs][16 B qh = 8 u16]. 1.56 bpw. 8 sub-blocks
+// of 32; each sub-block's u16 qh carries a 3-bit scale (bits 12..14 → dl = d*(2*sc+1)), a sign bit
+// (0x8000 → delta = ±IQ1S_DELTA=0.125), and four 3-bit high parts that extend each of the 4 qs
+// bytes into an 11-bit IQ1S_GRID[2048] index. UNLIKE the other grids the weight is dl*(grid+delta):
+// delta is an ADDITIVE fractional term baked in here (there is no sign codebook). A 16-element group
+// spans two 8-value grid entries. Generated IQ1S_GRID ⇒ bit-exact vs dequant_block (dequant_row_iq1_s).
+#define DEC16_IQ1S(wk)                                                                            \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 50ul;                                    \
+    float d = (float)as_type<half>((ushort)(blk[0] | ((ushort)blk[1] << 8)));                     \
+    uint g = (uint)(bi & 15ul);                                                                   \
+    uint sib = g >> 1u;                                                                           \
+    device const uchar* qs = blk + 2u + sib * 4u;                                                 \
+    uint qh = (uint)blk[34u + 2u * sib] | ((uint)blk[35u + 2u * sib] << 8);                       \
+    float dl = d * (2.0f * (float)((qh >> 12) & 7u) + 1.0f);                                       \
+    float delta = (qh & 0x8000u) ? -0.125f : 0.125f;                                              \
+    uint lbase = (g & 1u) * 2u;                                                                    \
+    for (uint li = 0u; li < 2u; li++) {                                                           \
+        uint l = lbase + li;                                                                      \
+        ulong grid = IQ1S_GRID[(uint)qs[l] | (((qh >> (3u * l)) & 7u) << 8u)];                    \
+        for (uint j = 0u; j < 8u; j++) {                                                          \
+            char gv = (char)((grid >> (8u * j)) & 0xFFu);                                         \
+            wk[li * 8u + j] = dl * ((float)gv + delta);                                           \
+        }                                                                                         \
+    }
+
+// NATIVE IQ1_M block (56 B / 256 elems): [32 B qs][16 B qh][8 B scales]. 1.75 bpw. NO separate d —
+// it is a f16 assembled from the top nibbles of the four u16 scales. 8 sub-blocks of 32; each
+// sub-block's scale u16 sc[ib/2] holds two 3-bit scales (dl1 for l=0,1 at bit 6*(ib%2); dl2 for
+// l=2,3 at +3). The 11-bit IQ1S_GRID index is qs[l] | 3 high bits from the qh byte (l>>1); the
+// delta sign is that qh byte's 0x08 (l even) / 0x80 (l odd) bit → ±IQ1S_DELTA. Weight = dl*(grid+
+// delta), delta ADDITIVE and baked here. Generated IQ1S_GRID ⇒ bit-exact vs dequantize_row_iq1_m.
+#define DEC16_IQ1M(wk)                                                                            \
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 56ul;                                    \
+    device const uchar* sc = blk + 48u;                                                           \
+    uint sc0 = (uint)sc[0] | ((uint)sc[1] << 8);                                                  \
+    uint sc1 = (uint)sc[2] | ((uint)sc[3] << 8);                                                  \
+    uint sc2 = (uint)sc[4] | ((uint)sc[5] << 8);                                                  \
+    uint sc3 = (uint)sc[6] | ((uint)sc[7] << 8);                                                  \
+    ushort d_bits =                                                                               \
+        (ushort)((sc0 >> 12) | ((sc1 >> 8) & 0x00f0u) | ((sc2 >> 4) & 0x0f00u) | (sc3 & 0xf000u));\
+    float d = (float)as_type<half>(d_bits);                                                       \
+    uint g = (uint)(bi & 15ul);                                                                   \
+    uint sib = g >> 1u;                                                                           \
+    device const uchar* qs = blk + sib * 4u;                                                      \
+    device const uchar* qh = blk + 32u + sib * 2u;                                                \
+    uint scw = (sib < 2u) ? sc0 : ((sib < 4u) ? sc1 : ((sib < 6u) ? sc2 : sc3));                  \
+    uint shbase = 6u * (sib & 1u);                                                                \
+    float dl1 = d * (2.0f * (float)((scw >> shbase) & 7u) + 1.0f);                                \
+    float dl2 = d * (2.0f * (float)((scw >> (shbase + 3u)) & 7u) + 1.0f);                         \
+    uint lbase = (g & 1u) * 2u;                                                                   \
+    for (uint li = 0u; li < 2u; li++) {                                                           \
+        uint l = lbase + li;                                                                      \
+        uint qhb = (uint)qh[l >> 1u];                                                             \
+        uint idx = (uint)qs[l] | ((qhb << (8u - 4u * (l & 1u))) & 0x700u);                        \
+        float delta = (qhb & ((l & 1u) ? 0x80u : 0x08u)) ? -0.125f : 0.125f;                      \
+        float dl = (l < 2u) ? dl1 : dl2;                                                          \
+        ulong grid = IQ1S_GRID[idx];                                                              \
+        for (uint j = 0u; j < 8u; j++) {                                                          \
+            char gv = (char)((grid >> (8u * j)) & 0xFFu);                                         \
+            wk[li * 8u + j] = dl * ((float)gv + delta);                                           \
+        }                                                                                         \
+    }
+
 // NATIVE Q8_0 block (34 B / 32 elems): [f16 d][32 x i8]. 8.5 bpw streamed vs the factored
 // form's ~10.2 (codes + scm + dd) — the decode GEMV is bound on exactly this stream. 34 % 4 != 0,
 // so d assembles from bytes and the quants are char loads (same convention as Q6_K's byte loads).

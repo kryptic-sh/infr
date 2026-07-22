@@ -26,9 +26,9 @@ acceptance):
 
 CPU now has a native int8 kernel for **every format Vulkan has a native mmq
 kernel for**. The six below close the last of the gap; none has a small
-supported-arch GGUF for an end-to-end coherence check (IQ2*S/IQ3_S are
-big-model-only; Q5_1/Q2_0 legacy; MXFP4=gpt-oss, whose \_architecture*
-infr-llama doesn't implement; NVFP4 bleeding-edge). Gate for these =
+supported-arch GGUF for an end-to-end coherence check (`IQ2_S`/`IQ3_S` are
+big-model-only; `Q5_1`/`Q2_0` legacy; `MXFP4`=gpt-oss, whose architecture
+infr-llama doesn't implement; `NVFP4` bleeding-edge). Gate for these =
 **bit-identical SIMD↔ scalar + tolerance-parity to the exact `dequant_block`
 (tight 1e-3 vs the quantized-activation dot)** — strong on the math, no
 coherence generation.
@@ -239,7 +239,7 @@ produced in a way that looks like garbage is a bug, not a precision flip.
   - `Q5_1` **DONE** (`e7465ed`), `Q2_0` **DONE** (`3f7c79e`), `MXFP4` **DONE**
     (`29ee2e5`), `NVFP4` **DONE** (`06cc0ef`), `IQ2_S` **DONE** (`8e616c3`),
     `IQ3_S` **DONE** (`34fd4f2`) — see the "Full parity" section at the top. The
-    grid kernels (IQ2*S/IQ3_S) expand the grid row to signed i8 once (scalar
+    grid kernels (`IQ2_S`/`IQ3_S`) expand the grid row to signed i8 once (scalar
     gather + `apply_signs`) then reuse the IQ4_XS per-sub-block scale × int-dot,
     amortized across the batch. Vulkan does not natively handle `IQ2_XXS/XS`,
     `IQ3_XXS`, or `IQ1*\*`, so those are not a parity gap (shared dequant path

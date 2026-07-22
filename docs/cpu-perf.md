@@ -33,22 +33,59 @@ infr-llama doesn't implement; `NVFP4` bleeding-edge). Gate for these =
 (tight 1e-3 vs the quantized-activation dot)** — strong on the math, no
 coherence generation.
 
-| Format  | commit    | notes                             |
-| ------- | --------- | --------------------------------- |
-| `Q5_1`  | `e7465ed` | affine, Q5_0 5-bit + Q4_1 min     |
-| `Q2_0`  | `3f7c79e` | Bonsai ternary, 64-block, 2×Q8x32 |
-| `MXFP4` | `29ee2e5` | IQ4_NL + E8M0 scale (gpt-oss)     |
-| `NVFP4` | `06cc0ef` | MXFP4 codebook + per-16 UE4M3     |
-| `IQ2_S` | `8e616c3` | grid-codebook, expand-row-once    |
-| `IQ3_S` | `34fd4f2` | grid-codebook, per-32 scale       |
+| Format    | commit    | notes                             |
+| --------- | --------- | --------------------------------- |
+| `Q5_1`    | `e7465ed` | affine, Q5_0 5-bit + Q4_1 min     |
+| `Q2_0`    | `3f7c79e` | Bonsai ternary, 64-block, 2×Q8x32 |
+| `MXFP4`   | `29ee2e5` | IQ4_NL + E8M0 scale (gpt-oss)     |
+| `NVFP4`   | `06cc0ef` | MXFP4 codebook + per-16 UE4M3     |
+| `IQ2_S`   | `8e616c3` | grid-codebook, expand-row-once    |
+| `IQ3_S`   | `34fd4f2` | grid-codebook, per-32 scale       |
+| `IQ2_XXS` | `aa07a2f` | grid, KSIGNS lookup, coherence ✓  |
+| `IQ3_XXS` | `e97a913` | grid, token-identical to GPU ✓    |
+| `IQ2_XS`  | `7e0fb1d` | grid, 9-bit index (unit-test)     |
+| `IQ1_S`   | `93e3225` | 1-bit, `dl·(iprod + delta·asum)`  |
+| `IQ1_M`   | `c70111f` | 1-bit, d-in-scales, per-8 delta   |
 
-Formats Vulkan itself does NOT natively handle (`IQ2_XXS/XS`, `IQ3_XXS`,
-`IQ1_*`, `TQ1_0/TQ2_0`) stay on the shared dequant path on both backends — no
-parity gap.
+The grid/codebook set (IQ2*XXS/XS/S, IQ3_XXS/S, IQ1_S/M) uses the
+expand-row-once → signed-i8 → per-group int dot pattern; each mirrors
+`dequant_codebook` and is gated on a **tight 1e-3** tolerance vs the exact
+decode. Coherence: `IQ3_XXS` is token-identical to the GPU native path;
+`IQ2_XXS` matches leading tokens; the 1-bit `IQ1*\*` are chaotic at the noise
+floor (int8/f32/CPU/GPU all diverge — the 1e-3 math check is the correctness
+gate).
 
-Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Remaining: #8
-(f16/bf16, low priority — bandwidth already optimal), #9 (blocked on `perf`),
-#10 (fusion, structural), and a VNNI **batch** variant for IQ4_XS.
+**CPU now natively handles every weight quant except ternary**
+(`TQ1_0`/`TQ2_0`).
+
+Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Remaining: `TQ1_0`/
+`TQ2_0` (CPU), #8 (f16/bf16, low priority), #9 (blocked on `perf`), #10
+(fusion), VNNI batch for IQ4_XS.
+
+## Cross-backend fast-kernel coverage audit
+
+Native (in-shader / int8) fast kernels vs the dequant→f16/f32 fallback, per
+weight quant format. ✅ = native fast path, ❌ = falls back to dequant.
+
+| Format               | CPU | Vulkan | Metal |
+| -------------------- | :-: | :----: | :---: |
+| Q4_0 Q5_0 Q8_0       | ✅  |   ✅   |  ✅   |
+| Q4_K Q5_K Q6_K       | ✅  |   ✅   |  ✅   |
+| IQ4_NL IQ4_XS        | ✅  |   ✅   |  ✅   |
+| IQ2_XXS IQ2_XS IQ2_S | ✅  |   ✅   |  ✅   |
+| IQ3_XXS IQ3_S        | ✅  |   ✅   |  ✅   |
+| Q4_1 Q5_1            | ✅  |   ✅   |  ❌   |
+| Q2_K Q3_K            | ✅  |   ✅   |  ❌   |
+| IQ1_S IQ1_M          | ✅  |   ✅   |  ❌   |
+| MXFP4 NVFP4          | ✅  |   ✅   |  ❌   |
+| Q2_0 (ternary-ish)   | ✅  |   ✅   |  ❌   |
+| TQ1_0 TQ2_0          | ❌  |   ✅   |  ❌   |
+
+- **Vulkan: complete** — native for every weight quant format.
+- **CPU: only ternary left** — `TQ1_0`/`TQ2_0` (BitNet/TriLM-style) fall to f32.
+- **Metal: 11 formats on dequant→f16** — most impactful are **`Q2_K`/`Q3_K`**
+  (common small-model quants), then `Q4_1`/`Q5_1`, `IQ1_S`/`IQ1_M`, `MXFP4`/
+  `NVFP4`, `Q2_0`. (Float `F16`/`F32`/`BF16` are native on all three.)
 
 ## Context: two regimes, two different bottlenecks
 

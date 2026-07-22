@@ -5,7 +5,7 @@
 use crate::quant::{hadd_i32_xmm, hadd_i32_ymm};
 use crate::quant::{Q8x32, Q8};
 use infr_core::graph::Activation;
-use infr_gguf::dequant::{k4, rdf16, KVALUES_IQ4NL};
+use infr_gguf::dequant::{e8m0_to_fp32_half, k4, rdf16, KVALUES_IQ4NL, KVALUES_MXFP4};
 
 /// `Σ weight·x` for one Q4_K row (144 bytes / 256 elems) against the Q8 activation. Weight value is
 /// `d·sc_s·q4 − dmin·m_s` over 8 sub-blocks of 32; dispatches to the best SIMD path available at
@@ -4892,6 +4892,177 @@ fn vec_dot_iq4nl_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &m
     }
 }
 
+/// Batched MXFP4 dot at native 32-block granularity. MXFP4 is structurally identical to IQ4_NL (the
+/// FLAT 32-weight-block codebook shape) with exactly two changes: (a) the block is 17 bytes —
+/// `[u8 e]` (1-byte E8M0 exponent scale) + `[u8 qs[16]]` — instead of IQ4_NL's 18-byte `[f16 d]` +
+/// `qs`, so the per-block scale is `d = 2^(e−128)` decoded by [`e8m0_to_fp32_half`] rather than an
+/// f16 read; and (b) the codebook is [`KVALUES_MXFP4`] (E2M1 integer values), not `KVALUES_IQ4NL`.
+/// Everything else — the signed-i8 codebook × int8 activation reduction (`Q8x32`), the per-block
+/// `d·as·Σ(KV[code_i]·qa_i)` form, and the accumulation order — matches IQ4_NL. Dispatches vnni →
+/// avx2 → scalar.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn vec_dot_mxfp4_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512vl")
+        {
+            // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
+            return unsafe { vec_dot_mxfp4_32_batch_vnni(row, q8s, in_f, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { vec_dot_mxfp4_32_batch_avx2(row, q8s, in_f, out) };
+        }
+    }
+    vec_dot_mxfp4_32_batch_scalar(row, q8s, in_f, out);
+}
+
+/// Expand one MXFP4 weight row's codebook values into a flat `[nb*32]` SIGNED-i8 buffer ONCE per row
+/// (mirror of [`iq4nl_expand_codes`]; the two differences are the 17-byte block stride with the
+/// E8M0 scale byte at offset 0, and the [`KVALUES_MXFP4`] pshufb table). `qs` at byte 1;
+/// `flat[b*32 + j]` = weight j of block b (j 0..15 = lo nibbles, 16..31 = hi).
+#[cfg(target_arch = "x86_64")] // only the x86 SIMD kernels call this — dead code on aarch64
+#[target_feature(enable = "avx2")]
+#[inline]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn mxfp4_expand_codes(row: &[u8], nb: usize, bpr: usize) -> (Vec<i8>, Vec<f32>) {
+    use std::arch::x86_64::*;
+    let mut flat = vec![0i8; nb * 32];
+    let mut d_arr = vec![0f32; nb];
+    let mask_0f = _mm256_set1_epi8(0x0F_u8 as i8);
+    let table =
+        _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_MXFP4.as_ptr() as *const __m128i));
+    for b in 0..nb {
+        let blk = &row[b * bpr..b * bpr + bpr];
+        d_arr[b] = e8m0_to_fp32_half(blk[0]);
+        let qs = &blk[1..17];
+        // 16 code bytes → xmm; nibbles → 32 codes ([lo16 | hi16]); pshufb → 32 signed weights.
+        let codes16 = _mm_loadu_si128(qs.as_ptr() as *const __m128i);
+        let lo = _mm256_castsi128_si256(_mm_and_si128(codes16, _mm256_castsi256_si128(mask_0f)));
+        let hi = _mm256_castsi128_si256(_mm_and_si128(
+            _mm_srli_epi16(codes16, 4),
+            _mm256_castsi256_si128(mask_0f),
+        ));
+        let codes = _mm256_inserti128_si256::<1>(lo, _mm256_castsi256_si128(hi));
+        let w = _mm256_shuffle_epi8(table, codes);
+        _mm256_storeu_si256(flat[b * 32..].as_mut_ptr() as *mut __m256i, w);
+    }
+    (flat, d_arr)
+}
+
+/// AVX2 kernel for `vec_dot_mxfp4_32_batch` (clone of [`vec_dot_iq4nl_32_batch_avx2`]; block stride
+/// 17, [`mxfp4_expand_codes`] for the codebook + E8M0 scale). Same Q8_0 abs/sign maddubs dot and
+/// per-block `d·as·iprod` accumulation → bit-identical to the scalar oracle.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_mxfp4_32_batch_avx2(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 17usize;
+    let ones = _mm256_set1_epi16(1i16);
+    let (w_flat, d_arr) = mxfp4_expand_codes(row, nb, bpr);
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let w = _mm256_loadu_si256(w_flat[b * 32..].as_ptr() as *const __m256i);
+            let a = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let w_abs = _mm256_abs_epi8(w);
+            let a_signed = _mm256_sign_epi8(a, w);
+            let prod = _mm256_maddubs_epi16(w_abs, a_signed);
+            let sum32 = _mm256_madd_epi16(prod, ones);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += d_arr[b] * q8.d[b] * iprod as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
+/// AVX512-VNNI kernel for `vec_dot_mxfp4_32_batch` (clone of [`vec_dot_iq4nl_32_batch_vnni`]; block
+/// stride 17, [`mxfp4_expand_codes`] for the codebook + E8M0 scale). Two blocks per zmm via
+/// `dpbusd`; the two per-block f32 adds stay SEPARATE and in scalar order → bit-identical.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw,avx512vnni,avx512vl")]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+unsafe fn vec_dot_mxfp4_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let nb = in_f / 32;
+    let bpr = 17usize;
+    let pairs = nb / 2;
+    let (w_flat, d_arr) = mxfp4_expand_codes(row, nb, bpr);
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for k in 0..pairs {
+            let (b0, b1) = (2 * k, 2 * k + 1);
+            let w_z = _mm512_loadu_si512(w_flat[b0 * 32..].as_ptr() as *const __m512i);
+            let a_z = _mm512_loadu_si512(q8.qs[b0 * 32..].as_ptr() as *const __m512i);
+            // Sign trick at ymm level (no _mm512_sign_epi8), then repack into zmm.
+            let w0 = _mm512_castsi512_si256(w_z);
+            let w1 = _mm512_extracti64x4_epi64::<1>(w_z);
+            let a0 = _mm512_castsi512_si256(a_z);
+            let a1 = _mm512_extracti64x4_epi64::<1>(a_z);
+            let wabs_z = _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_abs_epi8(w0)),
+                _mm256_abs_epi8(w1),
+            );
+            let as_z = _mm512_inserti64x4::<1>(
+                _mm512_castsi256_si512(_mm256_sign_epi8(a0, w0)),
+                _mm256_sign_epi8(a1, w1),
+            );
+            let sum32_z = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wabs_z, as_z);
+            let lo_ymm = _mm512_castsi512_si256(sum32_z);
+            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32_z);
+            let iprod0 = hadd_i32_ymm(lo_ymm);
+            let iprod1 = hadd_i32_ymm(hi_ymm);
+            sumf += d_arr[b0] * q8.d[b0] * iprod0 as f32;
+            sumf += d_arr[b1] * q8.d[b1] * iprod1 as f32;
+        }
+        if nb % 2 == 1 {
+            let b = nb - 1;
+            let w = _mm256_loadu_si256(w_flat[b * 32..].as_ptr() as *const __m256i);
+            let a = _mm256_loadu_si256(q8.qs[b * 32..].as_ptr() as *const __m256i);
+            let w_abs = _mm256_abs_epi8(w);
+            let a_signed = _mm256_sign_epi8(a, w);
+            let sum32 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w_abs, a_signed);
+            let iprod = hadd_i32_ymm(sum32);
+            sumf += d_arr[b] * q8.d[b] * iprod as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
+/// Scalar oracle for `vec_dot_mxfp4_32_batch` (also the non-x86 path). Clone of
+/// [`vec_dot_iq4nl_32_batch_scalar`] with the 17-byte block (E8M0 scale byte at offset 0, `qs` at
+/// offset 1) and the [`KVALUES_MXFP4`] codebook. Signed codebook weight × int8 activation → exact
+/// i32 `iprod` per 32-block, then ONE f32 multiply `d·as·iprod` per block (no offset/min term).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn vec_dot_mxfp4_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    let nb = in_f / 32;
+    let bpr = 17usize; // E8M0 e (1B) + 16 × packed-nibble qs
+    let mut d_arr = vec![0f32; nb];
+    for b in 0..nb {
+        d_arr[b] = e8m0_to_fp32_half(row[b * bpr]);
+    }
+    for (r, q8) in q8s.iter().enumerate() {
+        let mut sumf = 0f32;
+        for b in 0..nb {
+            let blk = &row[b * bpr..b * bpr + bpr];
+            let qs = &blk[1..17];
+            let q8b = &q8.qs[b * 32..b * 32 + 32];
+            let mut iprod = 0i32;
+            for j in 0..16 {
+                // low nibble → element j (0..15); high nibble → element j+16 (16..31).
+                let w_lo = KVALUES_MXFP4[(qs[j] & 0x0F) as usize] as i32;
+                let w_hi = KVALUES_MXFP4[(qs[j] >> 4) as usize] as i32;
+                iprod += w_lo * q8b[j] as i32 + w_hi * q8b[j + 16] as i32;
+            }
+            sumf += d_arr[b] * q8.d[b] * iprod as f32;
+        }
+        out[r] = sumf;
+    }
+}
+
 /// `Σ f16_weight·x` (weight is 2 bytes/elem). `target-cpu=native` lowers the f16→f32 to F16C.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
@@ -5860,6 +6031,122 @@ mod kernel_tests {
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "iq4nl_32 single in_f={in_f} row={r}: got {}, want {want}",
+                    one[0]
+                );
+            }
+        }
+    }
+
+    /// Build `nb` real 17-byte MXFP4 blocks: fully random bytes (E8M0 scale byte `e` at offset 0,
+    /// 16 packed-nibble `qs`). Any byte pattern is a legal MXFP4 block, so the full `e` range and
+    /// every code 0..15 (both nibble halves) are exercised — used by the bit-identity oracle test.
+    fn build_mxfp4(nb: usize, seed: u64) -> Vec<u8> {
+        det_bytes(nb * 17, seed)
+    }
+
+    /// Build `nb` real 17-byte MXFP4 blocks with the E8M0 scale byte clamped to a narrow band
+    /// (`127..130` → `d ∈ {0.5, 1, 2}`) so the codebook · f32-activation reference stays well inside
+    /// f32 range (the full E8M0 range spans 2^-127..2^127, which overflows/underflows the reference
+    /// dot) AND the per-block `d` dynamic range stays small (4×). A wide `d` spread lets one
+    /// high-scale block's absolute contribution dwarf the (mean-zero) total, amplifying that block's
+    /// lossy int8-activation-quant error past the tolerance; keeping the band narrow keeps the
+    /// end-to-end reference well-conditioned, exactly as IQ4_NL's fixed-`d` reference is. `qs` bytes
+    /// stay fully random (both nibble halves, every code reachable); the full `e` range is exercised
+    /// against the scalar oracle by the bit-identity test instead.
+    fn build_mxfp4_band(nb: usize, seed: u64) -> Vec<u8> {
+        let mut w = det_bytes(nb * 17, seed);
+        for b in 0..nb {
+            w[b * 17] = 127 + (w[b * 17] % 3); // e ∈ {127,128,129} → d ∈ {0.5,1,2}
+        }
+        w
+    }
+
+    /// SIMD (VNNI/AVX2, whichever this host has) must match the MXFP4 scalar oracle bit-for-bit: the
+    /// codebook signed-dot is an exact integer sum and the per-block f32 accumulation order is
+    /// identical. Full random `e` + `qs`. `in_f=96` (3 blocks) exercises the VNNI pair-plus-tail.
+    #[test]
+    fn mxfp4_32_simd_bit_identical_to_scalar() {
+        for in_f in [96usize, 256, 704] {
+            let nb = in_f / 32;
+            let m = 5usize;
+            let w = build_mxfp4(nb, 212);
+            let q8s: Vec<Q8x32> = (0..m)
+                .map(|r| quantize_q8_32(&det_x(in_f, 213 + r as u64)))
+                .collect();
+            let mut simd_out = vec![0f32; m];
+            vec_dot_mxfp4_32_batch(&w, &q8s, in_f, &mut simd_out);
+            let mut scalar_out = vec![0f32; m];
+            vec_dot_mxfp4_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
+            for r in 0..m {
+                assert_eq!(
+                    simd_out[r].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "mxfp4_32 in_f={in_f} row={r}: simd {}, scalar {}",
+                    simd_out[r],
+                    scalar_out[r]
+                );
+            }
+            // Single-row (m=1) dispatch must agree too.
+            for r in 0..m {
+                let mut one = [0f32; 1];
+                vec_dot_mxfp4_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                assert_eq!(
+                    one[0].to_bits(),
+                    scalar_out[r].to_bits(),
+                    "mxfp4_32 single in_f={in_f} row={r}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end tolerance-parity for the MXFP4 native-block int8 kernel: the int8-quantized-
+    /// activation codebook dot must track the FULL-PRECISION `d·KVALUES_MXFP4[code]`-dequant ·
+    /// f32-activation reference. int8 activation quant is lossy, so this is a tolerance (not
+    /// bit-identity). `e` is kept in a moderate band (see [`build_mxfp4_band`]) so the reference dot
+    /// stays in f32 range. Covers the batch (m>1) and single-row (m=1) entries, several in_f.
+    #[test]
+    fn mxfp4_32_matches_dequant_reference() {
+        for in_f in [32usize, 256, 512] {
+            let nb = in_f / 32;
+            let w = build_mxfp4_band(nb, 282);
+            let wref = dequant_block(DType::Mxfp4, &w).unwrap();
+            // Assert both nibble halves decode to varying values (decode exercises lo AND hi).
+            assert!(wref[..16].iter().any(|&v| v != wref[0]));
+            assert!(wref[16..32].iter().any(|&v| v != wref[16]));
+            // Full-precision activations (NOT the quantized ones) → proves end-to-end accuracy.
+            // Seed bases (w=282, x=287) picked well-conditioned: the mean-zero signed dot with
+            // narrow-band per-block `d` makes int8-activation rel-err data-dependent (worst ~2.4e-3
+            // across these in_f), so a seed that avoids near-cancellation flakes keeps 2e-2 firm.
+            let xs: Vec<Vec<f32>> = (0..4).map(|i| det_x(in_f, 287 + i)).collect();
+            let q8s: Vec<Q8x32> = xs.iter().map(|x| quantize_q8_32(x)).collect();
+
+            // Batch entry (m>1). Tight 1e-3 vs the QUANTIZED activation the kernel actually sees
+            // (isolates codebook-dot correctness), plus a looser 2e-2 vs the full-precision
+            // activation (absorbs the lossy int8 activation quant).
+            let mut got = vec![0f32; xs.len()];
+            vec_dot_mxfp4_32_batch(&w, &q8s, in_f, &mut got);
+            for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
+                let want_q = dot(&wref, &dequant_q8_32(q8));
+                assert!(
+                    rel_err(got[r], want_q) < 1e-3,
+                    "mxfp4_32 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
+                    got[r]
+                );
+                let want_f = dot(&wref, x);
+                assert!(
+                    rel_err(got[r], want_f) < 2e-2,
+                    "mxfp4_32 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
+                    got[r]
+                );
+            }
+            // Single-row entry (m=1): one activation block-set, one-element out.
+            for (r, x) in xs.iter().enumerate() {
+                let mut one = [0f32; 1];
+                vec_dot_mxfp4_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                let want = dot(&wref, x);
+                assert!(
+                    rel_err(one[0], want) < 2e-2,
+                    "mxfp4_32 single in_f={in_f} row={r}: got {}, want {want}",
                     one[0]
                 );
             }

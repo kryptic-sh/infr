@@ -275,12 +275,13 @@ produced in a way that looks like garbage is a bug, not a precision flip.
     124.5→439.6 t/s (+253%).**
   - `Q5_1` **DONE** (`e7465ed`), `Q2_0` **DONE** (`3f7c79e`), `MXFP4` **DONE**
     (`29ee2e5`), `NVFP4` **DONE** (`06cc0ef`), `IQ2_S` **DONE** (`8e616c3`),
-    `IQ3_S` **DONE** (`34fd4f2`) — see the "Full parity" section at the top. The
-    grid kernels (`IQ2_S`/`IQ3_S`) expand the grid row to signed i8 once (scalar
-    gather + `apply_signs`) then reuse the IQ4_XS per-sub-block scale × int-dot,
-    amortized across the batch. Vulkan does not natively handle `IQ2_XXS/XS`,
-    `IQ3_XXS`, or `IQ1*\*`, so those are not a parity gap (shared dequant path
-    on both backends).
+    `IQ3_S` **DONE** (`34fd4f2`), and the full grid/codebook set `IQ2_XXS`
+    (`aa07a2f`), `IQ2_XS` (`7e0fb1d`), `IQ3_XXS` (`e97a913`), `IQ1_S`
+    (`93e3225`), `IQ1_M` (`c70111f`) — all **DONE** (Vulkan already had native
+    kernels for these; this closed the CPU side). See the "Full parity" section
+    and the coverage audit at the top. The grid kernels expand the grid row to
+    signed i8 once (scalar gather + `apply_signs`) then reuse the IQ4_XS
+    per-sub-block scale × int-dot, amortized across the batch.
 
 ### 8. f16 / bf16 native AVX-512-FP16/BF16 dot — _medium_
 

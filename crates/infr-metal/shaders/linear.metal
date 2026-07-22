@@ -316,6 +316,72 @@ inline void decode16_q5k(device const uchar* codes, uint bi, thread float* wk) {
 #define DEC16_Q5K(wk) decode16_q5k<false>(codes, bi, wk);
 #define DEC16_Q5K_WIDE(wk) decode16_q5k<true>(codes, bi, wk);
 
+// NATIVE Q2_K block (84 B / 256 elems): [u8 scales[16]][u8 qs[64]][f16 d][f16 dmin]. 2.5 bpw.
+// AFFINE like Q4_K, but 16 sub-blocks of 16 with a 4-bit UNSIGNED scale AND 4-bit UNSIGNED min
+// packed in one byte per sub-block: scale=(scales[is]&0xF), min=(scales[is]>>4). The 2-bit code
+// q2 is read from qs in the dequant reference's `n x shift x half` traversal, so for the 16-block
+// counter `sub` (== `is`): n=sub/8, j=(sub/2)%4 -> shift=2j, half=sub&1 selecting which 16 of the
+// 32-byte qs quarter (qoff=n*32). value = d*scale*q2 - dmin*min — bit-exact vs dequant_block /
+// vec_dot_q2k_scalar (crates/infr-cpu/src/kernels.rs).
+inline void decode16_q2k(device const uchar* codes, uint bi, thread float* wk) {
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 84ul;
+    uint sub = bi & 15u;
+    float d    = (float)as_type<half>((ushort)(blk[80] | ((ushort)blk[81] << 8)));
+    float dmin = (float)as_type<half>((ushort)(blk[82] | ((ushort)blk[83] << 8)));
+    uint scb = blk[sub];
+    float scale = d * (float)(scb & 0xFu);
+    float mn = -(dmin * (float)(scb >> 4));
+    uint n = sub >> 3;
+    uint j = (sub >> 1) & 3u;
+    uint hf = sub & 1u;
+    uint shift = 2u * j;
+    device const uchar* qb = blk + 16u + n * 32u + hf * 16u;
+    for (uint l = 0; l < 16u; l++) wk[l] = scale * (float)((qb[l] >> shift) & 3u) + mn;
+}
+
+#define DEC16_Q2K(wk) decode16_q2k(codes, bi, wk);
+
+// NATIVE Q3_K block (110 B / 256 elems): [u8 hmask[32]][u8 qs[64]][u8 scales[12]][f16 d]. 3.44 bpw.
+// SIGNED like Q6_K: 16 sub-blocks of 16, each a signed 6-bit scale (sc6-32) times a signed offset
+// code (q3-4). The 16 x 6-bit scales are packed in 12 bytes via llama.cpp's aux bit-shuffle
+// (ported EXACTLY from q3k_scales / dequant_block, ggml dequantize_row_q3_K). The 3-bit code q3 is
+// 2 low bits from qs (same `n x shift x half` traversal as Q2_K) plus 1 high bit from an hmask
+// bit-plane: for the 16-block counter `sub` (== `is`) the plane bit is m = 1 << (n*4 + j) (8 planes
+// per superblock, 4 per n). value = d*(sc6-32)*(q3-4) — bit-exact vs vec_dot_q3k_scalar.
+inline void decode16_q3k(device const uchar* codes, uint bi, thread float* wk) {
+    device const uchar* blk = codes + (ulong)(bi >> 4) * 110ul;
+    uint sub = bi & 15u;
+    device const uchar* sr = blk + 96u;
+    uint a0 = (uint)sr[0] | ((uint)sr[1] << 8) | ((uint)sr[2] << 16) | ((uint)sr[3] << 24);
+    uint a1 = (uint)sr[4] | ((uint)sr[5] << 8) | ((uint)sr[6] << 16) | ((uint)sr[7] << 24);
+    uint a2 = (uint)sr[8] | ((uint)sr[9] << 8) | ((uint)sr[10] << 16) | ((uint)sr[11] << 24);
+    const uint kmask1 = 0x03030303u;
+    const uint kmask2 = 0x0f0f0f0fu;
+    uint tmp = a2;
+    uint aux[4];
+    aux[2] = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (a0 & kmask2) | ((tmp & kmask1) << 4);
+    aux[1] = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    int sc6 = (int)(char)((aux[sub >> 2] >> ((sub & 3u) * 8u)) & 0xFFu) - 32;
+    float d = (float)as_type<half>((ushort)(blk[108] | ((ushort)blk[109] << 8)));
+    float scale = d * (float)sc6;
+    uint n = sub >> 3;
+    uint j = (sub >> 1) & 3u;
+    uint hf = sub & 1u;
+    uint shift = 2u * j;
+    uint m = 1u << (n * 4u + j);
+    device const uchar* qb = blk + 32u + n * 32u + hf * 16u;
+    device const uchar* hb = blk + hf * 16u;
+    for (uint l = 0; l < 16u; l++) {
+        uint low2 = (qb[l] >> shift) & 3u;
+        uint high = (hb[l] & m) != 0u ? 4u : 0u;
+        wk[l] = scale * ((float)(int)(low2 | high) - 4.0f);
+    }
+}
+
+#define DEC16_Q3K(wk) decode16_q3k(codes, bi, wk);
+
 // NATIVE Q4_0 block (18 B / 32 elems): [f16 d][16 B nibbles] — 4.5 bpw streamed vs the
 // factored form's ~6.1. Element e < 16 is the low nibble of qs[e], e >= 16 the high nibble of
 // qs[e-16]; value = d * (q - 8), exact per element.

@@ -274,12 +274,11 @@ fn every_dispatchable_kernel_exists_in_the_library() {
         let Some(end) = rest.find('"') else { break };
         let lit = &rest[..end];
         rest = &rest[end + 1..];
-        // Kernel-SHAPED literals that are NOT dispatch targets. `linear_q3k` appears only in a
-        // negative registry assertion (`qui_linear_kerns("linear_q3k").is_none()` — q3k has no
-        // Metal kernel, the test proves the registry returns None rather than a silent quik8
-        // default). It is never dispatched, so exclude it by exact name; a real missing kernel
-        // still trips.
-        const NOT_DISPATCHED: &[&str] = &["linear_q3k"];
+        // Kernel-SHAPED literals that are NOT dispatch targets. `linear_q2k`/`linear_q3k` used to
+        // live here (no native kernel; they appeared only in a negative registry assertion), but
+        // both are now NATIVE with real `linear_q2k`/`linear_q3k` decode kernels in the library, so
+        // they ARE dispatched and must resolve like any other name — nothing to exclude.
+        const NOT_DISPATCHED: &[&str] = &[];
         if !lit.is_empty()
             && lit
                 .chars()

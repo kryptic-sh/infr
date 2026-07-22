@@ -37,8 +37,8 @@ use kernels::{
     vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
     vec_dot_q4_1_32_batch, vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8,
     vec_dot_q5_0_32_batch, vec_dot_q5_1_32_batch, vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k,
-    vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_batch, vec_dot_tq1_0, vec_dot_tq1_0_batch,
-    vec_dot_tq2_0, vec_dot_tq2_0_batch,
+    vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, vec_dot_tq1_0,
+    vec_dot_tq1_0_batch, vec_dot_tq2_0, vec_dot_tq2_0_batch,
 };
 use moe::{expert_acts_kind, expert_gemm_range, ActsKind, ExpertActs};
 use quant::{quantize_q8, quantize_q8_32, Q8x32, Q8};
@@ -691,7 +691,13 @@ impl Backend for CpuBackend {
                     // f16/bf16/f32 dots, else fall back to dequant-to-f32 + dot. All fan out over rows.
                     if m == 1 {
                         let xrow = &xs[..in_f];
-                        let q8 = matches!(
+                        // Q8_0 is a NATIVE 32-block weight, so its `in_f` can be a multiple of 32
+                        // but not 256 (e.g. gemma3-1b's 1152-dim projections). The 256-superblock
+                        // Q8 activation path silently drops the sub-256 tail, so route those to the
+                        // native 32-block Q8x32 kernel instead. Every other quant routed through Q8
+                        // has a 256-element weight block, so its `in_f` is always 256-aligned.
+                        let q8_0_blk32 = dt == DType::Q8_0 && !in_f.is_multiple_of(256);
+                        let q8 = (matches!(
                             dt,
                             DType::Q4K
                                 | DType::Q6K
@@ -709,11 +715,12 @@ impl Backend for CpuBackend {
                                 | DType::Q3K
                                 | DType::Tq2_0
                                 | DType::Tq1_0
-                        )
-                        .then(|| quantize_q8(xrow));
-                        // Q4_0/Q4_1/IQ4_NL use the native-32-block int8 activation (Q8x32), not the
-                        // 256-superblock Q8; quantize the single activation row once.
-                        let q8_32: Option<[Q8x32; 1]> = matches!(
+                        ) && !q8_0_blk32)
+                            .then(|| quantize_q8(xrow));
+                        // Q4_0/Q4_1/IQ4_NL (and sub-256 Q8_0) use the native-32-block int8
+                        // activation (Q8x32), not the 256-superblock Q8; quantize the single
+                        // activation row once.
+                        let q8_32: Option<[Q8x32; 1]> = (matches!(
                             dt,
                             DType::Q4_0
                                 | DType::Q4_1
@@ -722,8 +729,8 @@ impl Backend for CpuBackend {
                                 | DType::Mxfp4
                                 | DType::Nvfp4
                                 | DType::Q2_0
-                        )
-                        .then(|| [quantize_q8_32(xrow)]);
+                        ) || q8_0_blk32)
+                            .then(|| [quantize_q8_32(xrow)]);
                         // Spin-pool, 16 output rows per claimed task (decode's per-row dot is
                         // ~µs-scale; per-row claims would be all cursor contention).
                         self.pool().for_chunks_mut(&mut out, 1, 16, &|o, dst_o| {
@@ -731,7 +738,18 @@ impl Backend for CpuBackend {
                             dst_o[0] = match dt {
                                 DType::Q4K => vec_dot_q4k(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q6K => vec_dot_q6k(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q8_0 => vec_dot_q8_0(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q8_0 => {
+                                    if q8_0_blk32 {
+                                        vec_dot_q8_0_32_batch(
+                                            row,
+                                            q8_32.as_ref().unwrap(),
+                                            in_f,
+                                            dst_o,
+                                        );
+                                        return;
+                                    }
+                                    vec_dot_q8_0(row, q8.as_ref().unwrap(), in_f)
+                                }
                                 DType::Q5K => vec_dot_q5k(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q2K => vec_dot_q2k(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q3K => vec_dot_q3k(row, q8.as_ref().unwrap(), in_f),
@@ -817,25 +835,31 @@ impl Backend for CpuBackend {
                         // Parallel: at m=256 canvas rows this collect was ~0.7 ms of SERIAL work
                         // per Linear (31 threads idle) — rows are independent, order preserved by
                         // the indexed collect, bit-identical.
-                        let q8s: Vec<Q8> = if matches!(
-                            dt,
-                            DType::Q4K
-                                | DType::Q6K
-                                | DType::Q8_0
-                                | DType::Q5K
-                                | DType::Iq4Xs
-                                | DType::Iq2S
-                                | DType::Iq2Xs
-                                | DType::Iq2Xxs
-                                | DType::Iq1S
-                                | DType::Iq1M
-                                | DType::Iq3S
-                                | DType::Iq3Xxs
-                                | DType::Q2K
-                                | DType::Q3K
-                                | DType::Tq2_0
-                                | DType::Tq1_0
-                        ) {
+                        // Q8_0 is a native 32-block weight: a sub-256 `in_f` (e.g. gemma3-1b's
+                        // 1152-dim projections) must take the 32-block Q8x32 path below, not the
+                        // 256-superblock Q8 batch kernel (which drops the sub-256 tail). Skip
+                        // building the wasteful 256-block activation in that case.
+                        let q8_0_blk32 = dt == DType::Q8_0 && !in_f.is_multiple_of(256);
+                        let q8s: Vec<Q8> = if !q8_0_blk32
+                            && matches!(
+                                dt,
+                                DType::Q4K
+                                    | DType::Q6K
+                                    | DType::Q8_0
+                                    | DType::Q5K
+                                    | DType::Iq4Xs
+                                    | DType::Iq2S
+                                    | DType::Iq2Xs
+                                    | DType::Iq2Xxs
+                                    | DType::Iq1S
+                                    | DType::Iq1M
+                                    | DType::Iq3S
+                                    | DType::Iq3Xxs
+                                    | DType::Q2K
+                                    | DType::Q3K
+                                    | DType::Tq2_0
+                                    | DType::Tq1_0
+                            ) {
                             self.pool()
                                 .collect(m, &|r| quantize_q8(&xs[r * in_f..r * in_f + in_f]))
                         } else {
@@ -944,6 +968,18 @@ impl Backend for CpuBackend {
                                     });
                                 }
                             }
+                        } else if q8_0_blk32 {
+                            // Q8_0 weight with a sub-256 `in_f` (multiple of 32 but not 256): the
+                            // 256-superblock Q8 batch kernel would truncate the tail, so use the
+                            // native 32-block Q8x32-activation batch kernel instead. `in_f % 32 == 0`
+                            // always holds for a Q8_0 (32-block) weight.
+                            let q8s32: Vec<Q8x32> = self
+                                .pool()
+                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
+                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                let row = &wbytes[o * bpr..o * bpr + bpr];
+                                vec_dot_q8_0_32_batch(row, &q8s32, in_f, chunk);
+                            });
                         } else if dt == DType::Q5_0 && in_f.is_multiple_of(32) {
                             // Dense-layer Q5_0 (DG stores 16 of its 30 dense ffn_down weights as
                             // Q5_0): reuse the MoE path's Q8x32-activation batch kernel. This

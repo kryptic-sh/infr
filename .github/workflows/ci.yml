@@ -75,6 +75,56 @@ jobs:
       - run: cargo nextest run --workspace --locked
       - run: cargo test --doc --workspace --locked
 
+  # CPU generation goldens against REAL models. The `cpu_golden_*` /
+  # `cpu_kv_*` tests in `infr-llama/tests/cpu_backend.rs` self-skip when the
+  # GGUF isn't in the HF cache (see the `need_model!` macro), so on a bare
+  # runner they always no-op — which is exactly how a real arch-correctness bug
+  # (the Q8_0 sub-256 truncation that changed gemma-3-1b's output) slipped past
+  # CI. This job downloads a SMALL representative set of goldens into the
+  # standard HuggingFace hub cache (`~/.cache/huggingface/hub/models--<org>--
+  # <repo>/snapshots/<commit>/<file>` — the exact layout `find_gguf` reads),
+  # caches them across runs, and runs the CPU suite so those goldens actually
+  # execute and their hashes are asserted. Runs in parallel with the other jobs.
+  #
+  # Model set (Q4_K_M, ~1.7 GB total) — one per distinct architecture family
+  # with a CPU golden, deliberately excluding the multi-GB MoE / big models:
+  #   unsloth/gemma-3-1b-it-GGUF  (769 MB) — dense SWA/GeGLU, hd=256; the
+  #                                          non-256-in_f arch that caught Q8_0
+  #   unsloth/Qwen3-0.6B-GGUF     (379 MB) — dense; also drives the cpu_kv_*
+  #                                          coherence + quant-sweep tests
+  #   unsloth/Qwen3.5-0.8B-GGUF   (508 MB) — gated-DeltaNet (qwen35) golden
+  cpu-goldens:
+    name: cargo test (CPU goldens, real models)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install glslc (shaderc)
+        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
+      # Cache the downloaded GGUFs across runs. The key encodes the exact model
+      # set + quant, so it only re-downloads when that list changes (bump the
+      # `-v1` suffix if you change the models below).
+      - name: Cache golden model GGUFs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cpu-goldens-gemma3-1b_qwen3-06b_qwen35-08b-q4km-v1
+      - name: Download golden GGUFs (single file per repo)
+        run: |
+          pipx install huggingface_hub
+          huggingface-cli download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
+          huggingface-cli download unsloth/Qwen3-0.6B-GGUF   Qwen3-0.6B-Q4_K_M.gguf
+          huggingface-cli download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf
+      # Release build: these run real CPU inference (the f32 reference backend),
+      # which is far too slow to time out in debug. Single-threaded because the
+      # goldens mutate process-global generation env under a shared lock.
+      - run: cargo test --release -p infr-llama --test cpu_backend --locked -- --test-threads=1
+
   build:
     name: cargo build --release
     runs-on: ubuntu-26.04

@@ -18,11 +18,22 @@ acceptance):
 | native int8 **Q4_0** (`6e7decd`)   | Qwen3-0.6B Q4_0   | +142% (2.4×) | +239% (3.4×)      |
 | native int8 **IQ4_XS** (`304dd42`) | Qwen3-0.6B IQ4_XS | +156% (2.6×) | +320% (4.2×)      |
 | native int8 **Q2_K** (`1e90613`)   | Qwen3-0.6B Q2_K   | +29%         | +71%              |
+| native int8 **Q3_K** (`d559984`)   | Qwen3-0.6B Q3_K_M | +185% (2.9×) | +199% (3.0×)      |
+| native int8 **Q4_1** (`f4738a1`)   | Qwen3-0.6B Q4_1   | +138% (2.4×) | +243% (3.4×)      |
+| native int8 **IQ4_NL** (`0ef8366`) | Qwen3-0.6B IQ4_NL | +47%         | +253% (3.5×)      |
 
-Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Follow-ups: the
-rest of the quant coverage (#6 Q3_K, #7 IQ2/IQ3 + Q4_1/Q5_1 — pattern proven,
-gated on local models), #8 (f16/bf16, low priority), #9 (blocked on `perf`), #10
-(fusion, structural).
+**Native-int8 quant coverage is now complete for every common format:** all
+K-quants (Q2/Q3/Q4/Q5/Q6_K), all legacy-round (Q4_0/Q4_1/Q5_0/Q8_0), and the IQ4
+codebook family (IQ4_XS/IQ4_NL). Each precision flip was coherence-verified
+token-identical to the independent Vulkan int8 path.
+
+Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Remaining
+follow-ups: the **IQ1/IQ2/IQ3 grid-codebook** quants (`IQ2_XXS/XS/S`,
+`IQ3_XXS/S`, `IQ1_*`) — niche, and the hardest kernels (per-element grid-table
+lookup + sign-packing); only mixed-quant UD models are available locally, which
+limits the measurable end-to-end signal. `Q5_1` (no local model). #8 (f16/bf16,
+low priority — bandwidth already optimal). #9 (blocked on `perf`). #10 (fusion,
+structural). Plus a VNNI **batch** variant for IQ4_XS.
 
 ## Context: two regimes, two different bottlenecks
 
@@ -197,19 +208,27 @@ produced in a way that looks like garbage is a bug, not a precision flip.
       decode 35.4→100.9 t/s (+185%), prefill 198.2→592.8 t/s (+199%).** With
       this the whole **K-quant family is native** (Q2_K/Q3_K/Q4_K/Q5_K/Q6_K).
 
-### 7. Native int8 dot: IQ2/IQ3 family (`IQ4_NL`, `IQ2_XXS/XS/S`, `IQ3_XXS/S`) — _high (volume)_
+### 7. Native int8 dot: legacy affine + IQ codebook + grid family — _medium → high_
 
-- The remaining uncovered formats; codebook/grid decode is fiddlier. Land as a
-  mini-campaign, one dtype per slice, only after #4–#6 prove the pattern.
-- **Precision:** precision-flip re-bless per dtype.
-- **Status:** TODO (follow-up). The pattern is now **proven across all three
-  quant families** — legacy-round (Q4*0), IQ-codebook (IQ4_XS), and K-quant
-  affine (Q2_K) — so each remaining format is a mechanical clone of the nearest
-  landed kernel: `Q4_1`/`Q5_1` → Q4_0/Q5_0 (affine legacy); `IQ4_NL` → IQ4_XS
-  (same codebook, 32-block);
-  `IQ2*\_`/`IQ3\_\_`→ the grid-codebook decoders in`infr-gguf` + the IQ4_XS
-  signed-dot skeleton. Gated on having a local GGUF per format for the coherence
-  check (the dev box lacks Q3_K / IQ2 / IQ3 models).
+- The remaining uncovered formats, in ascending difficulty.
+- **Precision:** precision-flip per dtype, coherence-verified vs the Vulkan int8
+  path before acceptance.
+- **Status:**
+  - `Q4_1` **DONE** (`f4738a1`): affine clone of Q4_0 (`y = d·q4 + m`,
+    `as·(d·iprod + m·bsum)`). Coherent/token-identical to Vulkan. **Qwen3-0.6B
+    Q4_1: decode 28.7→68.2 t/s (+138%), prefill 129.2→442.6 t/s (+243%).**
+  - `IQ4_NL` **DONE** (`0ef8366`): flat 32-block codebook cousin of IQ4_XS
+    (`KVALUES_IQ4NL` pshufb + abs/sign dot, `Q8x32` activation). Coherent/
+    token-identical. **Qwen3-0.6B IQ4_NL: decode 34.3→50.5 t/s (+47%), prefill
+    124.5→439.6 t/s (+253%).**
+  - **Grid-codebook family** (`IQ2_XXS/XS/S`, `IQ3_XXS/S`, `IQ1_*`) — TODO,
+    hardest tier: per-element grid-table lookup (`infr_core::iquant_grids`) +
+    sign-packing (`apply_signs`/`KMASK`). Niche formats; only mixed-quant UD
+    models are available locally (`UD-IQ2_XXS`, `UD-IQ3_XXS`), so the end-to-end
+    bench signal is diluted (most tensors are already-covered quants). Skeleton:
+    expand grid → signed i8 weights, reuse the IQ4_XS signed ×int8 dot with
+    per-sub-block float scales.
+  - `Q5_1` — TODO (affine clone of Q5_0/Q4_1; no local model).
 
 ### 8. f16 / bf16 native AVX-512-FP16/BF16 dot — _medium_
 

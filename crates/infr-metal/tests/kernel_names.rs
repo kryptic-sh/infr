@@ -131,6 +131,13 @@ fn q4k_q5k_use_wide_headers_only_for_cooperative_prefill() {
 }
 
 #[test]
+fn q5k_four_row_can_prefer_the_existing_row_tile() {
+    let exec = include_str!("../src/exec.rs");
+    asserts_token_seq(exec, "std::env::var(\"INFR_METAL_NO_Q5K_RT\").is_err()");
+    asserts_token_seq(exec, "prefer_q5k_rt(qw.kern, m, q5k_rt)");
+}
+
+#[test]
 fn regular_cmm_unrolls_its_fixed_tile_loops() {
     let src = include_str!("../shaders/moe.metal");
     asserts_token_seq(

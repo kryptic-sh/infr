@@ -164,7 +164,14 @@ produced in a way that looks like garbage is a bug, not a precision flip.
 - K-quant super-block formats with packed scales; more decode work than Q4_0 but
   same int8-activation regime. One slice each.
 - **Precision:** precision-flip re-bless per dtype.
-- **Status:** TODO
+- **Status:** Q2_K **DONE** (`1e90613`). `vec_dot_q2k` / `_batch` (scalar + AVX2
+  - AVX-512BW + VNNI), modeled on affine Q4_K; 2-bit codes, per-16 sub-blocks,
+    min-correction via the existing `q8.bsums16`. Coherent + token-identical to
+    Vulkan int8 ("…is Paris."); no golden changed; SIMD bit-identical to scalar.
+    **Qwen3-0.6B Q2_K CPU: decode 25.2→32.5 t/s (+29%), prefill 127.9→218.5 t/s
+    (+71%).** Q3_K **TODO** (no local Q3_K model on the box for the coherence
+    gate; Q3_K is non-affine — `d·(sc6−32)·(q3−4)`, 3-bit with hmask high bits —
+    so it templates off Q6_K's signed path, not Q4_K).
 
 ### 7. Native int8 dot: IQ2/IQ3 family (`IQ4_NL`, `IQ2_XXS/XS/S`, `IQ3_XXS/S`) — _high (volume)_
 

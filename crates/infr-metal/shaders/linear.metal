@@ -451,6 +451,62 @@ constant float kvalues_iq4nl_f[16] = {
     uint h4 = (bi & 1u) * 4u;                                                                     \
     for (uint k = 0; k < 16u; k++) wk[k] = d * kvalues_iq4nl_f[(qs[k] >> h4) & 0xFu];
 
+// MXFP4 / NVFP4 shared 16-entry signed integer codebook (E2M1 values ×2). Bit-for-bit
+// infr_gguf::dequant::KVALUES_MXFP4 = [0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12].
+constant float kvalues_mxfp4_f[16] = {
+    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+    0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f,
+};
+
+// E8M0 shared-exponent byte → f32, HALVED (2^(e-128)). Bit-for-bit
+// infr_gguf::dequant::e8m0_to_fp32_half: e<2 → from_bits(0x00200000 << e); else from_bits((e-1)<<23).
+inline float e8m0_to_fp32_half_msl(uint e) {
+    return (e < 2u) ? as_type<float>(0x00200000u << e) : as_type<float>((e - 1u) << 23);
+}
+
+// UE4M3 byte (unsigned, 4 exp bits bias=7, 3 mantissa bits) → f32, HALVED. Bit-for-bit
+// infr_gguf::dequant::ue4m3_to_fp32. Powers of two are built by bit construction (not exp2) so the
+// scale is EXACT — every product below is a power-of-two exponent shift of an exact mantissa.
+inline float ue4m3_to_fp32_msl(uint x) {
+    if (x == 0u || x == 0x7Fu) return 0.0f;
+    int e = (int)((x >> 3) & 0xFu);
+    float man = (float)(x & 0x7u);
+    float raw;
+    if (e == 0) {
+        raw = man * as_type<float>((uint)(127 - 9) << 23);                     // man * 2^-9
+    } else {
+        raw = (1.0f + man / 8.0f) * as_type<float>((uint)(e - 7 + 127) << 23); // (1+man/8)*2^(e-7)
+    }
+    return raw * 0.5f;
+}
+
+// NATIVE MXFP4 block (17 B / 32 elems): [u8 e][16 B nibbles]. E8M0 shared exponent + E2M1 codebook;
+// value = e8m0_to_fp32_half(e) * kvalues_mxfp4[q4]. Low nibble of qs[k] → element k (0..15), high
+// nibble → element k+16 — the SAME nibble layout as IQ4_NL, so the 32-elem block spans two DEC16
+// chunks (bi & 1 picks the half). Bit-for-bit dequantize_row_mxfp4 / vec_dot_mxfp4_32_batch_scalar.
+#define DEC16_MXFP4(wk)                                                                           \
+    device const uchar* blk = codes + (ulong)(bi >> 1) * 17ul;                                    \
+    float d = e8m0_to_fp32_half_msl((uint)blk[0]);                                                \
+    device const uchar* qs = blk + 1u;                                                            \
+    uint h4 = (bi & 1u) * 4u;                                                                      \
+    for (uint k = 0; k < 16u; k++) wk[k] = d * kvalues_mxfp4_f[(qs[k] >> h4) & 0xFu];
+
+// NATIVE NVFP4 block (36 B / 64 elems): [u8 scales[4]][32 B nibbles]. Four 16-element sub-blocks,
+// each with its own UE4M3 scale; value = ue4m3_to_fp32(scales[s]) * kvalues_mxfp4[q4]. Within
+// sub-block s the 8 code bytes are qs[s*8..s*8+8]: low nibble of qs[s*8+j] → element s*16+j (0..7),
+// high nibble → element s*16+j+8 (8..15). Each DEC16 chunk of 16 IS exactly one sub-block, so
+// bi & 3 selects the sub-block and bi >> 2 the 64-elem block. Bit-for-bit dequantize_row_nvfp4 /
+// vec_dot_nvfp4_batch_scalar.
+#define DEC16_NVFP4(wk)                                                                           \
+    device const uchar* blk = codes + (ulong)(bi >> 2) * 36ul;                                    \
+    uint s = (uint)(bi & 3u);                                                                      \
+    float d = ue4m3_to_fp32_msl((uint)blk[s]);                                                    \
+    device const uchar* qs = blk + 4u + s * 8u;                                                   \
+    for (uint k = 0; k < 8u; k++) {                                                               \
+        wk[k]      = d * kvalues_mxfp4_f[qs[k] & 0xFu];                                           \
+        wk[k + 8u] = d * kvalues_mxfp4_f[(qs[k] >> 4) & 0xFu];                                    \
+    }
+
 // NATIVE IQ2_XXS block (66 B / 256 elems): [f16 d][64 B qs]. 2.06 bpw. 8 sub-blocks of 32 elems;
 // each sub-block's 8 qs bytes are aux0 (four 8-bit grid indices into IQ2XXS_GRID[256]) + aux1
 // (four 7-bit sign indices into KSIGNS_IQ2XS, and a 4-bit scale magnitude in the top nibble).

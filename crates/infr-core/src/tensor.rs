@@ -35,6 +35,13 @@ pub enum DType {
     // ternary quants
     Tq1_0,
     Tq2_0,
+    /// BitNet i2_s (microsoft/BitNet, ggml type 36): ternary {-1,0,+1} weights packed 2 bits per
+    /// element (4/byte) with ONE per-TENSOR f32 scale stored after the packed codes (NOT a per-block
+    /// scale). Element `e` (natural row-major order) lives in byte `(e/128)*32 + (e%128)%32`, bit
+    /// field `6 - 2*((e%128)/32)`; code `q∈{0,1,2}` → `(q-1)·scale`. No native kernel yet — the seam
+    /// host-dequants it to f16 at weight load (see `is_codebook_quant`), so it never reaches a
+    /// backend as I2S; only [`crate::DType`]-exhaustive matches and the GGUF loader see this variant.
+    I2S,
     /// Bonsai ternary (llama.cpp GGML_TYPE_Q2_0 = 42): 64-elem blocks, 18 B = f16 d + 16 B of
     /// 2-bit codes (2.25 bpw); w = (q - 1) · d, q ∈ {0,1,2,3} → {-d, 0, +d, +2d}.
     Q2_0,

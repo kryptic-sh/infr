@@ -4834,6 +4834,15 @@ unsafe fn vec_dot_q8_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    // Native 32-block weight: `nb = in_f / 32` covers the whole row only when 32-aligned. This
+    // guard is the 32-block sibling of the `in_f % 256` asserts on the K-quant kernels — it turns
+    // a mis-route (e.g. a non-32-multiple `in_f`, or a wrongly-dispatched dtype) into a loud debug
+    // panic instead of a silent truncated dot (the Q8_0-on-256-block bug class).
+    debug_assert_eq!(
+        in_f % 32,
+        0,
+        "vec_dot_q8_0_32_batch: in_f must be a multiple of 32"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw")
@@ -4975,6 +4984,11 @@ unsafe fn vec_dot_q8_0_32_batch_avx512bw(row: &[u8], q8s: &[Q8x32], in_f: usize,
 /// `Σy·x = d_w·(Σcode·x − 16·Σx) ≈ d_w·d8·(Σcode·q8 − 16·bsum)`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 32,
+        0,
+        "vec_dot_q5_0_32_batch: in_f must be a multiple of 32"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw")
@@ -5264,6 +5278,11 @@ fn vec_dot_q5_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 /// without the 5th (`qh`) bit and with offset 8 not 16; block stride is 18 bytes not 22.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 32,
+        0,
+        "vec_dot_q4_0_32_batch: in_f must be a multiple of 32"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw")
@@ -5406,6 +5425,12 @@ fn vec_dot_q4_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 /// Block stride is 18 bytes (`[f16 d][u8 qs[16]]`); code `j` is `(qs[j/4] >> ((j%4)*2)) & 3`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q2_0_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    // Q2_0 is a 64-weight block (two 32-elem activation sub-blocks): `nb = in_f / 64`.
+    debug_assert_eq!(
+        in_f % 64,
+        0,
+        "vec_dot_q2_0_batch: in_f must be a multiple of 64"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw")
@@ -5548,6 +5573,11 @@ fn vec_dot_q2_0_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [
 /// activation as Q4_0 unchanged; `iprod` is the identical `maddubs/dpbusd` unsigned·signed dot.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 32,
+        0,
+        "vec_dot_q4_1_32_batch: in_f must be a multiple of 32"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw")
@@ -5694,6 +5724,11 @@ fn vec_dot_q4_1_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 /// activation unchanged; `iprod` is the identical `maddubs/dpbusd` unsigned·signed dot.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q5_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 32,
+        0,
+        "vec_dot_q5_1_32_batch: in_f must be a multiple of 32"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw")
@@ -5846,6 +5881,11 @@ fn vec_dot_q5_1_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 /// trick. No `bsum` term (no offset). Dispatches vnni → avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_iq4nl_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 32,
+        0,
+        "vec_dot_iq4nl_32_batch: in_f must be a multiple of 32"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw")
@@ -6019,6 +6059,11 @@ fn vec_dot_iq4nl_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &m
 /// avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_mxfp4_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    debug_assert_eq!(
+        in_f % 32,
+        0,
+        "vec_dot_mxfp4_32_batch: in_f must be a multiple of 32"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw")
@@ -6195,6 +6240,12 @@ fn vec_dot_mxfp4_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &m
 /// `in_f` must be a multiple of 64. Dispatches vnni → avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_nvfp4_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+    // NVFP4 is a 64-weight block (two 32-elem activation sub-blocks): `nb = in_f / 64`.
+    debug_assert_eq!(
+        in_f % 64,
+        0,
+        "vec_dot_nvfp4_batch: in_f must be a multiple of 64"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx512bw")
@@ -9307,6 +9358,273 @@ mod kernel_tests {
                     got_all[i][r],
                     want[i][r],
                 );
+            }
+        }
+    }
+
+    /// Regression: Q8_0 is a NATIVE 32-block weight, so a tensor's `in_f` can be a multiple of 32
+    /// but NOT 256 (gemma3-1b's attention projections are 1152 = 36×32 = 4.5×256). The `Op::Linear`
+    /// dispatch used to route Q8_0 through the 256-superblock `quantize_q8` path, whose
+    /// `nb = in_f/256` truncates to `floor(1152/256)*256 = 1024` elements — silently dropping the
+    /// last 128 (~11%) of every dot. The fix routes such tensors to the native 32-block
+    /// `vec_dot_q8_0_32_batch` (the kernel the dispatch now invokes for both the m==1 single-row
+    /// slice and the m>1 batch). The dispatch method lives on the graph executor and is awkward to
+    /// drive from a unit test, so this exercises the routed kernel directly at in_f=1152, plus a
+    /// 256-aligned case to confirm the fast path is unchanged, and asserts the sub-256 tail the old
+    /// path dropped is numerically significant (so the bug was real, not cosmetic).
+    #[test]
+    fn q8_0_dispatch_sub256_in_f_1152() {
+        for &in_f in &[1152usize, 256usize] {
+            let nb = in_f / 32;
+            let mut w = det_bytes(nb * 34, 77);
+            for k in 0..nb {
+                put_f16(&mut w[k * 34..k * 34 + 2], 0.03);
+            }
+            let wref = dequant_block(DType::Q8_0, &w).unwrap();
+            assert_eq!(wref.len(), in_f);
+
+            let m = 4usize;
+            let xs: Vec<Vec<f32>> = (0..m).map(|r| det_x(in_f, 300 + r as u64)).collect();
+            let q8s: Vec<Q8x32> = xs.iter().map(|x| quantize_q8_32(x)).collect();
+
+            // m>1 batch entry: the arm the dispatch's `else if q8_0_blk32` branch calls.
+            let mut got_batch = vec![0f32; m];
+            vec_dot_q8_0_32_batch(&w, &q8s, in_f, &mut got_batch);
+
+            for (r, q8) in q8s.iter().enumerate() {
+                // full-precision weight · the int8 activation the kernel actually sees.
+                let want = dot(&wref, &dequant_q8_32(q8));
+                assert!(
+                    rel_err(got_batch[r], want) < 1e-3,
+                    "q8_0 in_f={in_f} batch row {r}: got {}, want {want}",
+                    got_batch[r],
+                );
+
+                // m==1 entry: the dispatch quantizes a single row and passes a 1-element slice —
+                // must equal the batch result for that row (same kernel, one token).
+                let mut got1 = [0f32];
+                vec_dot_q8_0_32_batch(&w, std::slice::from_ref(q8), in_f, &mut got1);
+                assert_eq!(
+                    got1[0].to_bits(),
+                    got_batch[r].to_bits(),
+                    "q8_0 in_f={in_f} m==1 row {r} diverges from batch",
+                );
+            }
+
+            // Prove the old truncation mattered: at in_f=1152 a dot over only the first 1024
+            // elements (what the 256-block `nb = in_f/256` path summed) differs from the full dot
+            // by far more than the 1e-3 tolerance above.
+            if in_f == 1152 {
+                let x = &xs[0];
+                let full = dot(&wref, x);
+                let trunc = dot(&wref[..1024], &x[..1024]);
+                assert!(
+                    rel_err(trunc, full) > 1e-2,
+                    "expected sub-256 tail to be significant: full {full}, trunc {trunc}",
+                );
+            }
+        }
+    }
+
+    // ── Op::Linear dispatch: awkward-in_f coverage for EVERY weight quant dtype ───────────────
+    //
+    // The Q8_0 bug lived in the `Op::Linear` DISPATCH (lib.rs), not in a kernel: the executor
+    // picked the 256-superblock `quantize_q8` activation for a NATIVE 32-block Q8_0 weight, and
+    // `quantize_q8`/`vec_dot_q8_0`'s `nb = in_f/256` then silently dropped the sub-256 tail
+    // (gemma3-1b's `in_f = 1152 = 4.5×256` → summed only 1024/1152 ≈ 89%). The kernel-direct
+    // tests above cannot see a *routing* mistake — only driving the real graph executor can. This
+    // test builds a small `Op::Linear` graph per dtype and runs it through the actual
+    // `CpuBackend::execute` path at a format-valid but non-256 (or non-super-block) `in_f`, for
+    // BOTH the m==1 (single-row) and m>1 (batch) dispatch arms, and checks the output against the
+    // full-precision `dequant_block`·f32-activation reference. The only error source is the lossy
+    // int8 activation quant, so the tolerance is 2e-2 of the output's dynamic range — a ~11%
+    // truncation shifts every output far past that.
+    //
+    // Confirmed to catch the class: on the pre-fix code, Q8_0 @ in_f=1152 routes to
+    // `quantize_q8` + `vec_dot_q8_0` (256-block), which sum `floor(1152/256)*256 = 1024` elements
+    // — every output deviates ~11% (≫ the 2e-2 bound) so the test fails. (In debug it also trips
+    // the `in_f % 256` assert now on `vec_dot_q8_0`.) Post-fix it routes to the 32-block
+    // `vec_dot_q8_0_32_batch` and passes.
+    #[test]
+    fn op_linear_dispatch_awkward_in_f_all_quants() {
+        use crate::CpuBackend;
+        use infr_core::backend::{Backend, Bindings, BufferUsage};
+        use infr_core::graph::{Graph, Op};
+        use infr_core::tensor::TensorDesc;
+
+        // f32 reference: out[r*out_f + o] = Σ_k x[r*in_f+k] · w[o*in_f+k].
+        fn ref_linear(x: &[f32], w: &[f32], m: usize, in_f: usize, out_f: usize) -> Vec<f32> {
+            let mut out = vec![0f32; m * out_f];
+            for r in 0..m {
+                for o in 0..out_f {
+                    out[r * out_f + o] =
+                        dot(&w[o * in_f..o * in_f + in_f], &x[r * in_f..r * in_f + in_f]);
+                }
+            }
+            out
+        }
+
+        // Drive ONE Op::Linear through the real CPU graph executor and read the Output back.
+        fn run_linear(
+            dtype: DType,
+            wbytes: &[u8],
+            xs: &[f32],
+            m: usize,
+            in_f: usize,
+            out_f: usize,
+        ) -> Vec<f32> {
+            let mut g = Graph::new();
+            let x = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+            let w = g.weight(TensorDesc::new(vec![out_f, in_f], dtype));
+            let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+            g.push(Op::Linear {
+                x,
+                weight: w,
+                dst,
+                m: m as u32,
+                in_f: in_f as u32,
+                out_f: out_f as u32,
+                w_off: 0,
+            });
+            let be = CpuBackend::new();
+            let alloc_upload = |bytes: &[u8]| -> Box<dyn infr_core::backend::Buffer> {
+                let b = be
+                    .alloc(bytes.len().max(4), BufferUsage::Activations)
+                    .unwrap();
+                be.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let xb = alloc_upload(bytemuck::cast_slice(xs));
+            let wb = alloc_upload(wbytes);
+            let ob = be
+                .alloc((m * out_f * 4).max(4), BufferUsage::Activations)
+                .unwrap();
+            let mut binds = Bindings::new();
+            binds.bind(x, xb.as_ref());
+            binds.bind(w, wb.as_ref());
+            binds.bind(dst, ob.as_ref());
+            let plan = be.compile(&g).unwrap();
+            be.execute(plan.as_ref(), &binds).unwrap();
+            let mut bytes = vec![0u8; m * out_f * 4];
+            be.download(ob.as_ref(), &mut bytes).unwrap();
+            bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+        }
+
+        // Valid GGUF bytes for `tb` format-blocks (the whole [out_f, in_f] tensor is just a flat run
+        // of blocks). Reuses the per-dtype block builders the kernel tests already validate; the
+        // few "legacy" formats without a helper are trivial (fixed f16 scale + random codes).
+        fn synth(dtype: DType, tb: usize) -> Vec<u8> {
+            let put_scale = |bpb: usize, doff: usize, dval: f32, seed: u64| -> Vec<u8> {
+                let mut w = det_bytes(tb * bpb, seed);
+                for k in 0..tb {
+                    put_f16(&mut w[k * bpb + doff..k * bpb + doff + 2], dval);
+                }
+                w
+            };
+            match dtype {
+                DType::Q4_0 => put_scale(18, 0, 0.03, 501),
+                DType::Q5_0 => put_scale(22, 0, 0.03, 502),
+                DType::Q8_0 => put_scale(34, 0, 0.03, 503),
+                DType::Q2_0 => put_scale(18, 0, 0.03, 504),
+                DType::Q6K => put_scale(210, 208, 0.04, 505),
+                DType::Q4K => {
+                    let mut w = det_bytes(tb * 144, 506);
+                    for k in 0..tb {
+                        put_f16(&mut w[k * 144..k * 144 + 2], 0.05);
+                        put_f16(&mut w[k * 144 + 2..k * 144 + 4], 0.015);
+                    }
+                    w
+                }
+                DType::Q5K => {
+                    let mut w = det_bytes(tb * 176, 507);
+                    for k in 0..tb {
+                        put_f16(&mut w[k * 176..k * 176 + 2], 0.05);
+                        put_f16(&mut w[k * 176 + 2..k * 176 + 4], 0.01);
+                    }
+                    w
+                }
+                DType::Q4_1 => build_q4_1(tb, 0.02, -0.01, 508),
+                DType::Q5_1 => build_q5_1(tb, 0.02, -0.01, 509),
+                DType::Q2K => build_q2k_rand(tb, 0.05, 0.015, 510),
+                DType::Q3K => build_q3k_rand(tb, 0.05, 511),
+                DType::Iq4Nl => build_iq4nl(tb, 0.02, 512),
+                DType::Iq4Xs => build_iq4xs_rand(tb, 0.05, 513),
+                DType::Iq2S => build_iq2s_rand(tb, 0.05, 514),
+                DType::Iq2Xs => build_iq2xs_rand(tb, 0.05, 515),
+                DType::Iq2Xxs => build_iq2xxs_rand(tb, 0.05, 516),
+                DType::Iq3S => build_iq3s_rand(tb, 0.05, 517),
+                DType::Iq3Xxs => build_iq3xxs_rand(tb, 0.05, 518),
+                DType::Iq1S => build_iq1s_rand(tb, 0.05, 519),
+                DType::Iq1M => build_iq1m_rand(tb, 0.05, 520),
+                DType::Tq1_0 => build_tq1_0_rand(tb, 0.05, 521),
+                DType::Tq2_0 => build_tq2_0_rand(tb, 0.05, 522),
+                // `_band` variants clamp the per-block exponent/scale to a narrow range: the
+                // fully-random `e`/UE4M3 byte spans 2^±127, which overflows the f32 reference dot.
+                DType::Mxfp4 => build_mxfp4_band(tb, 523),
+                DType::Nvfp4 => build_nvfp4_band(tb, 524),
+                other => panic!("synth: unhandled dtype {other:?}"),
+            }
+        }
+
+        // (dtype, weight-block elems, awkward in_f set). Every in_f is a whole number of weight
+        // blocks (format-valid) but deliberately NOT super-block-friendly — the exact shape that
+        // exposed the Q8_0 mis-route: 1152/320 are ×32 not ×256; 128/320 are ×64 not ×256.
+        let cases: &[(DType, usize, &[usize])] = &[
+            // 32-block quants → Q8x32 activation; in_f ×32 but not ×256.
+            (DType::Q4_0, 32, &[1152, 320]),
+            (DType::Q4_1, 32, &[1152, 320]),
+            (DType::Q5_0, 32, &[1152, 320]),
+            (DType::Q5_1, 32, &[1152, 320]),
+            (DType::Q8_0, 32, &[1152, 320]),
+            (DType::Iq4Nl, 32, &[1152, 320]),
+            (DType::Mxfp4, 32, &[1152, 320]),
+            // 64-block quants → Q8x32 activation, 2 sub-blocks/block; in_f ×64 but not ×256.
+            (DType::Q2_0, 64, &[128, 320]),
+            (DType::Nvfp4, 64, &[128, 320]),
+            // 256-block quants → Q8 super-block activation; both in_f are ×256 (all valid).
+            (DType::Q4K, 256, &[256, 512]),
+            (DType::Q5K, 256, &[256, 512]),
+            (DType::Q6K, 256, &[256, 512]),
+            (DType::Q2K, 256, &[256, 512]),
+            (DType::Q3K, 256, &[256, 512]),
+            (DType::Iq4Xs, 256, &[256, 512]),
+            (DType::Iq2S, 256, &[256, 512]),
+            (DType::Iq2Xs, 256, &[256, 512]),
+            (DType::Iq2Xxs, 256, &[256, 512]),
+            (DType::Iq3S, 256, &[256, 512]),
+            (DType::Iq3Xxs, 256, &[256, 512]),
+            (DType::Iq1S, 256, &[256, 512]),
+            (DType::Iq1M, 256, &[256, 512]),
+            (DType::Tq1_0, 256, &[256, 512]),
+            (DType::Tq2_0, 256, &[256, 512]),
+        ];
+
+        // out_f = 13: odd and > 8, so the m>1 arm exercises Q4_K/Q6_K's 8-row batch group PLUS the
+        // 2-row pair and the odd single-row remainder tails.
+        let out_f = 13usize;
+        for &(dtype, blk, in_fs) in cases {
+            for &in_f in in_fs {
+                let tb = out_f * (in_f / blk);
+                let wbytes = synth(dtype, tb);
+                let wref = dequant_block(dtype, &wbytes).unwrap();
+                assert_eq!(wref.len(), out_f * in_f, "{dtype:?}: dequant length");
+                for &m in &[1usize, 5] {
+                    let xs = det_x(m * in_f, 900 + in_f as u64 + m as u64);
+                    let got = run_linear(dtype, &wbytes, &xs, m, in_f, out_f);
+                    let reference = ref_linear(&xs, &wref, m, in_f, out_f);
+                    // Absolute tolerance = 2e-2 × the output's dynamic range: robust to isolated
+                    // near-zero (cancelled) outputs, yet a truncated/mis-routed dot moves the
+                    // large-magnitude outputs by a big fraction of that range and is caught.
+                    let scale = reference.iter().fold(1e-3f32, |a, &v| a.max(v.abs()));
+                    for (i, (&g_i, &r_i)) in got.iter().zip(reference.iter()).enumerate() {
+                        let diff = (g_i - r_i).abs();
+                        assert!(
+                            diff <= 2e-2 * scale,
+                            "{dtype:?} in_f={in_f} m={m} out[{i}]: got {g_i}, want {r_i} (|diff| {diff} > {})",
+                            2e-2 * scale,
+                        );
+                    }
+                }
             }
         }
     }

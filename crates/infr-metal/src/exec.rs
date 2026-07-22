@@ -297,6 +297,8 @@ mod tests {
             "linear_quik8",
             "linear_q4k",
             "linear_q5k",
+            "linear_q2k",
+            "linear_q3k",
             "linear_q6k",
             "linear_q8_0",
             "linear_q5_0",
@@ -318,8 +320,12 @@ mod tests {
             let expected_cmm_ks = format!("{base}_cmm_ks");
             assert_eq!(k.cmm_ks, expected_cmm_ks.as_str());
         }
-        // An unknown base is a loud registry miss, never a silent quik8 default.
-        assert!(qui_linear_kerns("linear_q3k").is_none());
+        // Q2_K/Q3_K are now NATIVE (their `linear_q2k`/`linear_q3k` decode kernels exist), so the
+        // registry resolves them like every other native K-quant.
+        assert!(qui_linear_kerns("linear_q2k").is_some());
+        assert!(qui_linear_kerns("linear_q3k").is_some());
+        // An unknown base is still a loud registry miss, never a silent quik8 default.
+        assert!(qui_linear_kerns("linear_quik_bogus").is_none());
     }
 
     #[test]
@@ -869,6 +875,8 @@ fn qui_linear_kerns(base: &str) -> Option<QuiLinearKerns> {
         "linear_quik8" => kset!("linear_quik8"),
         "linear_q4k" => kset!("linear_q4k"),
         "linear_q5k" => kset!("linear_q5k"),
+        "linear_q2k" => kset!("linear_q2k"),
+        "linear_q3k" => kset!("linear_q3k"),
         "linear_q6k" => kset!("linear_q6k"),
         "linear_q8_0" => kset!("linear_q8_0"),
         "linear_q5_0" => kset!("linear_q5_0"),
@@ -1998,14 +2006,17 @@ impl MetalBackend {
         if let Some(w) = self.qui_cache.lock().unwrap().get(&key) {
             return w.clone();
         }
-        // INFR_METAL_NO_KQUANT_NATIVE routes Q5_K back through the factored quik path (A/B + escape
-        // hatch). Only Q5_K nativizes: it reuses Q4_K's cheap 6-bit scale extraction, so the
-        // narrower 5.5-bpw stream wins; Q3_K/Q2_K native measured SLOWER (their scale-decode ALU —
-        // Q3_K's aux-shuffle — costs more than the factored path's precomputed scales save).
+        // INFR_METAL_NO_KQUANT_NATIVE routes the non-Q4_K/Q6_K K-quants (Q5_K/Q2_K/Q3_K) back
+        // through the factored quik path (A/B + escape hatch). Q5_K reuses Q4_K's cheap 6-bit scale
+        // extraction; Q2_K is affine (per-16 4-bit scale+min) and Q3_K is signed (per-16 6-bit
+        // aux-shuffled scale + hmask high bit) — all decode the raw GGUF block so the narrower
+        // stream (2.5 / 3.44 bpw) is what the decode GEMV is bound on, no host repack.
         let kq_native = std::env::var("INFR_METAL_NO_KQUANT_NATIVE").is_err();
         let native_kern = match g.desc(id).dtype {
             DType::Q4K => Some("linear_q4k"),
             DType::Q5K if kq_native => Some("linear_q5k"),
+            DType::Q2K if kq_native => Some("linear_q2k"),
+            DType::Q3K if kq_native => Some("linear_q3k"),
             DType::Q6K => Some("linear_q6k"),
             DType::Q8_0 => Some("linear_q8_0"),
             DType::Q5_0 => Some("linear_q5_0"),
@@ -2424,6 +2435,8 @@ impl MetalBackend {
                         "linear_q4k" => (e / 256 * 144, 0, 0),
                         "linear_q6k" => (e / 256 * 210, 0, 0),
                         "linear_q5k" => (e / 256 * 176, 0, 0),
+                        "linear_q2k" => (e / 256 * 84, 0, 0),
+                        "linear_q3k" => (e / 256 * 110, 0, 0),
                         "linear_q8_0" => (e / 32 * 34, 0, 0),
                         "linear_q5_0" => (e / 32 * 22, 0, 0),
                         "linear_q4_0" => (e / 32 * 18, 0, 0),

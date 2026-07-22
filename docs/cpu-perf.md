@@ -10,12 +10,12 @@ CPU inference splits hard by batch size, and the cache/bandwidth story is
 different in each:
 
 - **Decode (`m == 1`) is DRAM-bandwidth-bound.** A real model's weights are GBs
-  (Q4*K 9B ≈ 5 GB; even a Q2_K 0.6B ≈ 180 MB) — all **≫ L3**. Every weight is
-  read \_exactly once per token*, streamed contiguously from RAM. On a
-  sequential stream the hardware prefetcher already saturates the memory
-  controllers, so the only lever that scales decode is **fewer bytes streamed**
-  (native quantization) plus **TLB** relief (hugepages). Software prefetch of
-  weights is a wash here — the HW prefetcher already predicts the stream.
+  (`Q4_K` 9B ≈ 5 GB; even a `Q2_K` 0.6B ≈ 180 MB) — all **≫ L3**. Every weight
+  is read once per token, streamed contiguously from RAM. On a sequential stream
+  the hardware prefetcher already saturates the memory controllers, so the only
+  lever that scales decode is **fewer bytes streamed** (native quantization)
+  plus **TLB** relief (hugepages). Software prefetch of weights is a wash here —
+  the HW prefetcher already predicts the stream.
 - **Prefill (`m > 1`) is compute + cache-reuse-bound.** Weights still stream,
   but each weight row is reused across `m` activation columns, so keeping the
   activation tile resident in L1/L2 is the lever. This is where blocking / tile
@@ -103,10 +103,10 @@ correctness before benching.
 
 ### 4. Native int8 dot: **Q4_0** — _medium_
 
-- **What:** Q4*0 currently falls to `bytes_to_f32` dequant + f32 dot (the slow
-  `*
-  =>`fallback). Add native int8-activation kernels (scalar/AVX2/AVX-512BW/VNNI + batch/batch8) and wire into both the`m==1`and`m>1`
-  dispatch, mirroring Q8_0 and the GPU's native Q4_0 kernel.
+- **What:** `Q4_0` currently falls to `bytes_to_f32` dequant + f32 dot (the slow
+  catch-all fallback). Add native int8-activation kernels
+  (scalar/AVX2/AVX-512BW/VNNI + batch/batch8) and wire into both the `m==1` and
+  `m>1` dispatch, mirroring `Q8_0` and the GPU's native Q4_0 kernel.
 - **Why:** Q4_0 is ubiquitous; the GPU already has a native kernel. First and
   simplest of the uncovered formats.
 - **Impact:** large on Q4_0 models (decode + prefill); kills the f32 fan-out.
@@ -131,7 +131,7 @@ correctness before benching.
 - **Precision:** precision-flip re-bless per dtype.
 - **Status:** TODO
 
-### 7. Native int8 dot: **IQ2/IQ3 family** (IQ4*NL, IQ2_XXS/XS/S, IQ3_XXS/S) — \_high (volume)*
+### 7. Native int8 dot: IQ2/IQ3 family (`IQ4_NL`, `IQ2_XXS/XS/S`, `IQ3_XXS/S`) — _high (volume)_
 
 - The remaining uncovered formats; codebook/grid decode is fiddlier. Land as a
   mini-campaign, one dtype per slice, only after #4–#6 prove the pattern.

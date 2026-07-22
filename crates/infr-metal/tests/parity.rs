@@ -300,6 +300,37 @@ fn synth_q5_0(n_elem: usize, seed: u32) -> Vec<u8> {
     out
 }
 
+// Well-formed Q4_1 blocks (20 B / 32 elems: [f16 d][f16 m][16 B nibbles]) — the AFFINE sibling of
+// Q4_0 (value = d*q + m). Any nibble payload decodes to finite values; only d and m must be sane
+// f16. The parity test compares Metal's Linear against a reference dequant of these SAME bytes.
+fn synth_q4_1(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 32, 0, "Q4_1 blocks are 32 elems");
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 32) {
+        let mut blk = vec![0u8; 20];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.04).to_le_bytes()); // d
+        blk[2..4].copy_from_slice(&half::f16::from_f32(-0.3).to_le_bytes()); // m
+        blk[4..20].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 16)); // nibbles
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+// Well-formed Q5_1 blocks (24 B / 32 elems: [f16 d][f16 m][4 B qh][16 B nibbles]) — the AFFINE
+// sibling of Q5_0 (value = d*q + m, 5-bit code). Any qh/nibble payload decodes to finite values.
+fn synth_q5_1(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 32, 0, "Q5_1 blocks are 32 elems");
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 32) {
+        let mut blk = vec![0u8; 24];
+        blk[0..2].copy_from_slice(&half::f16::from_f32(0.04).to_le_bytes()); // d
+        blk[2..4].copy_from_slice(&half::f16::from_f32(-0.3).to_le_bytes()); // m
+        blk[4..24].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 20)); // qh + nibbles
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
 // A deterministic LCG byte stream — arbitrary but reproducible payload for the k-quant nibble
 // fields (which decode to finite values for *any* byte pattern).
 fn lcg_bytes(mut seed: u32, n: usize) -> Vec<u8> {
@@ -969,6 +1000,101 @@ fn linear_add_fusion_q4_0_parity() {
     let (in_f, out_f) = (512usize, 384usize);
     let wf = rand_f32(out_f * in_f, 105);
     check_linear_add_fusion(DType::Q4_0, quantize_q4_0(&wf), in_f, out_f);
+}
+
+// Native Q4_1: AFFINE sibling of Q4_0 (value = d*q + m). GEMV (four rows per simdgroup, out_f=94
+// exercises clamped tail rows), HGEMM, coop-GEMM, and the Linear+Add fusion. Reference is the CPU
+// dequant of the SAME 20-byte blocks, so real Metal CI validates the DEC16_Q4_1 / linear_q4_1_body
+// decode against dequantize_row_q4_1 numerically.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q4_1_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    check_quant_linear_parity(DType::Q4_1, synth_q4_1(out_f * in_f, 110), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q4_1_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity_impl(
+        DType::Q4_1,
+        synth_q4_1(out_f * in_f, 111),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q4_1_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Q4_1,
+        synth_q4_1(out_f * in_f, 112),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_q4_1_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Q4_1, synth_q4_1(out_f * in_f, 113), in_f, out_f);
+}
+
+// Native Q5_1: AFFINE sibling of Q5_0 (value = d*q + m, 5-bit code). Same coverage set — GEMV,
+// HGEMM, coop-GEMM, Linear+Add fusion — validating DEC16_Q5_1 / linear_q5_1_body against
+// dequantize_row_q5_1 on real Metal CI.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q5_1_gemv_matches_dequant_reference() {
+    let (m, in_f, out_f) = (1usize, 256usize, 94usize);
+    check_quant_linear_parity(DType::Q5_1, synth_q5_1(out_f * in_f, 114), m, in_f, out_f);
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q5_1_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (18usize, 256usize, 96usize);
+    check_quant_linear_parity_impl(
+        DType::Q5_1,
+        synth_q5_1(out_f * in_f, 115),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_q5_1_coop_gemm_matches_dequant_reference() {
+    let (m, in_f, out_f) = (40usize, 256usize, 128usize);
+    check_quant_linear_parity_impl(
+        DType::Q5_1,
+        synth_q5_1(out_f * in_f, 116),
+        m,
+        in_f,
+        out_f,
+        1e-3,
+        true,
+    );
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn linear_add_fusion_q5_1_parity() {
+    let (in_f, out_f) = (512usize, 384usize);
+    check_linear_add_fusion(DType::Q5_1, synth_q5_1(out_f * in_f, 117), in_f, out_f);
 }
 
 // Native Q8_0 half-fragment GEMM (m=18 → the hmm route; out_f % 64 != 0 keeps cmm out).

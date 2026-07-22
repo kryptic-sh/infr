@@ -303,6 +303,8 @@ mod tests {
             "linear_q8_0",
             "linear_q5_0",
             "linear_q4_0",
+            "linear_q5_1",
+            "linear_q4_1",
             "linear_iq4xs",
             "linear_iq4nl",
             "linear_iq2xxs",
@@ -727,7 +729,13 @@ fn linear_add_peephole(
         }
         if !matches!(
             g.desc(*weight).dtype,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5_0 | DType::Q4_0
+            DType::Q4K
+                | DType::Q6K
+                | DType::Q8_0
+                | DType::Q5_0
+                | DType::Q4_0
+                | DType::Q5_1
+                | DType::Q4_1
         ) {
             continue;
         }
@@ -811,6 +819,8 @@ fn metal_embed_gather_kern(dt: DType) -> Option<&'static str> {
         DType::Q8_0 => Some("embed_gather_q8_0"),
         DType::Q4_0 => Some("embed_gather_q4_0"),
         DType::Q5_0 => Some("embed_gather_q5_0"),
+        DType::Q4_1 => Some("embed_gather_q4_1"),
+        DType::Q5_1 => Some("embed_gather_q5_1"),
         DType::Q4K => Some("embed_gather_q4k"),
         DType::Q6K => Some("embed_gather_q6k"),
         DType::Iq4Nl => Some("embed_gather_iq4nl"),
@@ -906,6 +916,8 @@ fn qui_linear_kerns(base: &str) -> Option<QuiLinearKerns> {
         "linear_q8_0" => kset!("linear_q8_0"),
         "linear_q5_0" => kset!("linear_q5_0"),
         "linear_q4_0" => kset!("linear_q4_0"),
+        "linear_q5_1" => kset!("linear_q5_1"),
+        "linear_q4_1" => kset!("linear_q4_1"),
         "linear_iq4xs" => kset!("linear_iq4xs"),
         "linear_iq4nl" => kset!("linear_iq4nl"),
         "linear_iq2xxs" => kset!("linear_iq2xxs"),
@@ -2006,7 +2018,7 @@ impl MetalBackend {
                  {dt:?} has no native Metal kernel, so its weights are cached at f32 (4-8x the \
                  quantized size) and the total no longer fits — proceeding would corrupt \
                  silently. Use a natively-supported quantization (Q4_K_M / Q6_K / Q8_0 / Q5_0 / \
-                 Q4_0) or run this checkpoint on the CPU backend (INFR_DEV=cpu).",
+                 Q4_0 / Q5_1 / Q4_1) or run this checkpoint on the CPU backend (INFR_DEV=cpu).",
                 used as f64 / (1u64 << 30) as f64,
                 want as f64 / (1u64 << 30) as f64,
                 budget as f64 / (1u64 << 30) as f64,
@@ -2062,6 +2074,8 @@ impl MetalBackend {
             DType::Q8_0 => Some("linear_q8_0"),
             DType::Q5_0 => Some("linear_q5_0"),
             DType::Q4_0 => Some("linear_q4_0"),
+            DType::Q5_1 => Some("linear_q5_1"),
+            DType::Q4_1 => Some("linear_q4_1"),
             DType::Iq4Xs => Some("linear_iq4xs"),
             DType::Iq4Nl => Some("linear_iq4nl"),
             DType::Iq2Xxs => Some("linear_iq2xxs"),
@@ -2481,6 +2495,8 @@ impl MetalBackend {
                         "linear_q8_0" => (e / 32 * 34, 0, 0),
                         "linear_q5_0" => (e / 32 * 22, 0, 0),
                         "linear_q4_0" => (e / 32 * 18, 0, 0),
+                        "linear_q5_1" => (e / 32 * 24, 0, 0),
+                        "linear_q4_1" => (e / 32 * 20, 0, 0),
                         "linear_iq4xs" => (e / 256 * 136, 0, 0),
                         "linear_iq2xxs" => (e / 256 * 66, 0, 0),
                         "linear_iq3xxs" => (e / 256 * 98, 0, 0),
@@ -2752,7 +2768,8 @@ impl MetalBackend {
                             // already saturate and keep NSG=1.
                             let rpg = match qw.kern {
                                 "linear_q4k" | "linear_q6k" => 2usize,
-                                "linear_q8_0" | "linear_q5_0" | "linear_q4_0" | "linear_iq4nl" => 4,
+                                "linear_q8_0" | "linear_q5_0" | "linear_q4_0" | "linear_q5_1"
+                                | "linear_q4_1" | "linear_iq4nl" => 4,
                                 _ => 1,
                             };
                             let groups = out_f.div_ceil(rpg);
@@ -2766,6 +2783,8 @@ impl MetalBackend {
                                 "linear_q8_0" if in_f >= 2048 => Some("linear_q8_0_ks"),
                                 "linear_q5_0" if in_f >= 2048 => Some("linear_q5_0_ks"),
                                 "linear_q4_0" if in_f >= 2048 => Some("linear_q4_0_ks"),
+                                "linear_q5_1" if in_f >= 2048 => Some("linear_q5_1_ks"),
+                                "linear_q4_1" if in_f >= 2048 => Some("linear_q4_1_ks"),
                                 _ => None,
                             };
                             let ks = groups <= 4096
@@ -2789,12 +2808,16 @@ impl MetalBackend {
                                 "linear_q8_0" => "linear_q8_0_add",
                                 "linear_q5_0" => "linear_q5_0_add",
                                 "linear_q4_0" => "linear_q4_0_add",
+                                "linear_q5_1" => "linear_q5_1_add",
+                                "linear_q4_1" => "linear_q4_1_add",
                                 "linear_iq4nl" => "linear_iq4nl_add",
                                 "linear_q4k_ks" => "linear_q4k_ks_add",
                                 "linear_q6k_ks" => "linear_q6k_ks_add",
                                 "linear_q8_0_ks" => "linear_q8_0_ks_add",
                                 "linear_q5_0_ks" => "linear_q5_0_ks_add",
                                 "linear_q4_0_ks" => "linear_q4_0_ks_add",
+                                "linear_q5_1_ks" => "linear_q5_1_ks_add",
+                                "linear_q4_1_ks" => "linear_q4_1_ks_add",
                                 _ => "linear_q6k_add",
                             };
                             let bres = self.ensure_device(r, res);

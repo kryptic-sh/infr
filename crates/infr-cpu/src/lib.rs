@@ -29,9 +29,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    act_fn, dot, dot_bf16, dot_f16, vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2,
-    vec_dot_q4k_batch8, vec_dot_q5_0_32_batch, vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k,
-    vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_batch,
+    act_fn, dot, dot_bf16, dot_f16, vec_dot_q4_0_32_batch, vec_dot_q4k, vec_dot_q4k_batch,
+    vec_dot_q4k_batch2, vec_dot_q4k_batch8, vec_dot_q5_0_32_batch, vec_dot_q5k, vec_dot_q5k_batch,
+    vec_dot_q6k, vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_batch,
 };
 use moe::{expert_acts_kind, expert_gemm_range, ActsKind, ExpertActs};
 use quant::{quantize_q8, quantize_q8_32, Q8x32, Q8};
@@ -686,6 +686,10 @@ impl Backend for CpuBackend {
                         let xrow = &xs[..in_f];
                         let q8 = matches!(dt, DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q5K)
                             .then(|| quantize_q8(xrow));
+                        // Q4_0 uses the native-32-block int8 activation (Q8x32), not the
+                        // 256-superblock Q8; quantize the single activation row once.
+                        let q8_32: Option<[Q8x32; 1]> =
+                            (dt == DType::Q4_0).then(|| [quantize_q8_32(xrow)]);
                         // Spin-pool, 16 output rows per claimed task (decode's per-row dot is
                         // ~µs-scale; per-row claims would be all cursor contention).
                         self.pool().for_chunks_mut(&mut out, 1, 16, &|o, dst_o| {
@@ -695,6 +699,15 @@ impl Backend for CpuBackend {
                                 DType::Q6K => vec_dot_q6k(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q8_0 => vec_dot_q8_0(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q5K => vec_dot_q5k(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q4_0 => {
+                                    vec_dot_q4_0_32_batch(
+                                        row,
+                                        q8_32.as_ref().unwrap(),
+                                        in_f,
+                                        dst_o,
+                                    );
+                                    return;
+                                }
                                 DType::F32 => dot(bytemuck::cast_slice(row), xrow),
                                 DType::F16 => dot_f16(row, xrow),
                                 DType::Bf16 => dot_bf16(row, xrow),
@@ -837,6 +850,17 @@ impl Backend for CpuBackend {
                             self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                 let row = &wbytes[o * bpr..o * bpr + bpr];
                                 vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
+                            });
+                        } else if dt == DType::Q4_0 && in_f.is_multiple_of(32) {
+                            // Q4_0 (same 32-block int8-activation regime as Q5_0, minus the 5th
+                            // bit and with offset 8): previously fell through to the dequant+f32
+                            // fallback below. Reuse the Q8x32-activation batch kernel.
+                            let q8s32: Vec<Q8x32> = self
+                                .pool()
+                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
+                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                let row = &wbytes[o * bpr..o * bpr + bpr];
+                                vec_dot_q4_0_32_batch(row, &q8s32, in_f, chunk);
                             });
                         } else {
                             // Grain 8: at lm_head shape this loop is 262k one-row chunks; per-row

@@ -37,7 +37,7 @@ use kernels::{
     vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
     vec_dot_q4_1_32_batch, vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8,
     vec_dot_q5_0_32_batch, vec_dot_q5_1_32_batch, vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k,
-    vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_batch,
+    vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_batch, vec_dot_tq2_0, vec_dot_tq2_0_batch,
 };
 use moe::{expert_acts_kind, expert_gemm_range, ActsKind, ExpertActs};
 use quant::{quantize_q8, quantize_q8_32, Q8x32, Q8};
@@ -706,6 +706,7 @@ impl Backend for CpuBackend {
                                 | DType::Iq3Xxs
                                 | DType::Q2K
                                 | DType::Q3K
+                                | DType::Tq2_0
                         )
                         .then(|| quantize_q8(xrow));
                         // Q4_0/Q4_1/IQ4_NL use the native-32-block int8 activation (Q8x32), not the
@@ -740,6 +741,7 @@ impl Backend for CpuBackend {
                                 DType::Iq1M => vec_dot_iq1m(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq3S => vec_dot_iq3s(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq3Xxs => vec_dot_iq3xxs(row, q8.as_ref().unwrap(), in_f),
+                                DType::Tq2_0 => vec_dot_tq2_0(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q4_0 => {
                                     vec_dot_q4_0_32_batch(
                                         row,
@@ -828,6 +830,7 @@ impl Backend for CpuBackend {
                                 | DType::Iq3Xxs
                                 | DType::Q2K
                                 | DType::Q3K
+                                | DType::Tq2_0
                         ) {
                             self.pool()
                                 .collect(m, &|r| quantize_q8(&xs[r * in_f..r * in_f + in_f]))
@@ -1056,6 +1059,7 @@ impl Backend for CpuBackend {
                                     DType::Iq1M => vec_dot_iq1m_batch(row, &q8s, in_f, chunk),
                                     DType::Iq3S => vec_dot_iq3s_batch(row, &q8s, in_f, chunk),
                                     DType::Iq3Xxs => vec_dot_iq3xxs_batch(row, &q8s, in_f, chunk),
+                                    DType::Tq2_0 => vec_dot_tq2_0_batch(row, &q8s, in_f, chunk),
                                     DType::F32 => {
                                         let w32: &[f32] = bytemuck::cast_slice(row);
                                         for r in 0..m {

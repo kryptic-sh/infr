@@ -9,13 +9,13 @@
 //! `docs/rocm-plan.md` for the full roadmap.
 
 #[cfg(all(target_os = "linux", feature = "rocm"))]
-mod ffi;
-#[cfg(all(target_os = "linux", feature = "rocm"))]
-mod kernels;
+mod backend;
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 mod exec;
 #[cfg(all(target_os = "linux", feature = "rocm"))]
-mod backend;
+mod ffi;
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+mod kernels;
 
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 pub use backend::{RocmBackend, RocmBuffer};

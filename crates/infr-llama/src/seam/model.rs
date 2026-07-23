@@ -1239,7 +1239,11 @@ impl SeamModel {
     #[cfg(all(target_os = "linux", feature = "rocm"))]
     pub fn rocm_session(&self, max_ctx: usize) -> Result<DenseRocmSession> {
         let rocm = infr_rocm::RocmBackend::new().map_err(|e| anyhow!("rocm init: {e}"))?;
-        Ok(DenseRocmSession { rocm, pool: SlotPool::new(), max_ctx })
+        Ok(DenseRocmSession {
+            rocm,
+            pool: SlotPool::new(),
+            max_ctx,
+        })
     }
 
     /// Open a persistent ROCm seam session: returns an error when the `rocm` feature is not

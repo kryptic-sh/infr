@@ -7,10 +7,10 @@
 //! without the feature the constructor returns a clean error message.
 
 use super::ChatModel;
+use crate::{GenStats, SeamModel};
+
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 use crate::seam::model::DenseRocmSession;
-#[cfg(all(target_os = "linux", feature = "rocm"))]
-use crate::{GenStats, SeamModel};
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 use anyhow::Result;
 
@@ -25,7 +25,10 @@ pub struct RocmSeamChat {
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 impl RocmSeamChat {
     pub fn new(model: SeamModel) -> Result<Self> {
-        Ok(Self { model, session: None })
+        Ok(Self {
+            model,
+            session: None,
+        })
     }
 
     fn ensure_session(&mut self) -> Result<()> {
@@ -44,40 +47,77 @@ impl RocmSeamChat {
 
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 impl ChatModel for RocmSeamChat {
-    fn render_model(&self) -> &SeamModel { &self.model }
-    fn reset_kv(&mut self) { if let Some(s) = &mut self.session { s.reset_cache(); } }
+    fn render_model(&self) -> &SeamModel {
+        &self.model
+    }
+
+    fn reset_kv(&mut self) {
+        if let Some(s) = &mut self.session {
+            s.reset_cache();
+        }
+    }
+
     fn warmup(&mut self) -> Result<()> {
         self.generate("Hi", 2, None, &mut |_| {})?;
-        if let Some(s) = &mut self.session { s.reset_cache(); }
+        if let Some(s) = &mut self.session {
+            s.reset_cache();
+        }
         Ok(())
     }
-    fn generate(&mut self, _prompt: &str, _max_new: usize, _req: Option<&crate::sampling::RequestCtx>, _on_piece: &mut dyn FnMut(&str)) -> Result<GenStats> {
+
+    fn generate(
+        &mut self,
+        _prompt: &str,
+        _max_new: usize,
+        _req: Option<&crate::sampling::RequestCtx>,
+        _on_piece: &mut dyn FnMut(&str),
+    ) -> Result<GenStats> {
         self.ensure_session()?;
+        // The ROCm dense seam runner (`generate_dense_rocm`) is not yet implemented —
+        // this path is wired for session management only. Phase 2 will add the runner.
         anyhow::bail!("ROCm dense generation not yet implemented — session is active (Phase 2)")
     }
 }
 
 // ── Placeholder (feature not active) ─────────────────────────────────────────
 
+/// ROCm seam backend placeholder — returns a clean error from `new()` so the CLI
+/// can surface it as a build-time feature gate.
 #[cfg(not(all(target_os = "linux", feature = "rocm")))]
 pub struct RocmSeamChat {
     #[allow(dead_code)]
-    model: crate::SeamModel,
+    _model: SeamModel,
 }
 
 #[cfg(not(all(target_os = "linux", feature = "rocm")))]
 impl RocmSeamChat {
-    pub fn new(_model: crate::SeamModel) -> anyhow::Result<Self> {
-        anyhow::bail!("ROCm backend not compiled — build with `cargo build --features rocm` on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md Phase 0)")
+    pub fn new(_model: SeamModel) -> anyhow::Result<Self> {
+        anyhow::bail!(
+            "ROCm backend not compiled — build with `cargo build --features rocm` \
+             on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md Phase 0)"
+        )
     }
 }
 
 #[cfg(not(all(target_os = "linux", feature = "rocm")))]
 impl ChatModel for RocmSeamChat {
-    fn render_model(&self) -> &crate::SeamModel { &self.model }
+    fn render_model(&self) -> &SeamModel {
+        unreachable!("RocmSeamChat placeholder")
+    }
+
     fn reset_kv(&mut self) {}
-    fn warmup(&mut self) -> anyhow::Result<()> { Ok(()) }
-    fn generate(&mut self, _prompt: &str, _max_new: usize, _req: Option<&crate::sampling::RequestCtx>, _on_piece: &mut dyn FnMut(&str)) -> anyhow::Result<crate::GenStats> {
+
+    fn warmup(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn generate(
+        &mut self,
+        _prompt: &str,
+        _max_new: usize,
+        _req: Option<&crate::sampling::RequestCtx>,
+        _on_piece: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<GenStats> {
         unreachable!("RocmSeamChat::generate: backend not compiled")
     }
 }

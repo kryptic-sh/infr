@@ -58,8 +58,8 @@ const HIP_PARTS: &[&str] = &[
 
 const RMSNORM: &str = r#"
 extern "C" __global__ void rmsnorm(
-    const __half* __restrict__ x,    // [rows, dim]
-    const __half* __restrict__ weight,// [dim]
+    const float* __restrict__ x,     // [rows, dim] — F32 activation
+    const __half* __restrict__ weight,// [dim] — dequantized F16
     float* __restrict__ dst,         // [rows, dim]
     int rows,
     int dim,
@@ -68,25 +68,25 @@ extern "C" __global__ void rmsnorm(
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
     float ss = 0.0f;
-    const __half* xr = x + row * dim;
+    const float* xr = x + row * dim;
     for (int i = 0; i < dim; i++) {
-        float v = __half2float(xr[i]);
+        float v = xr[i];
         ss += v * v;
     }
     ss /= (float)dim;
     float rms = 1.0f / sqrtf(ss + eps);
     float* d = dst + row * dim;
     for (int i = 0; i < dim; i++) {
-        d[i] = __half2float(xr[i]) * rms * __half2float(weight[i]);
+        d[i] = xr[i] * rms * __half2float(weight[i]);
     }
 }
 "#;
 
 const RMSNORM_ADD: &str = r#"
 extern "C" __global__ void rmsnorm_add(
-    const __half* __restrict__ x,      // [rows, dim]
-    const __half* __restrict__ weight, // [dim]
-    float* __restrict__ dst,           // [rows, dim] read + write in-place
+    const float* __restrict__ x,      // [rows, dim] — F32 activation
+    const __half* __restrict__ weight, // [dim] — dequantized F16 weight
+    float* __restrict__ dst,           // [rows, dim] read + write in-place (F32)
     int rows,
     int dim,
     float eps
@@ -94,16 +94,16 @@ extern "C" __global__ void rmsnorm_add(
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
     float ss = 0.0f;
-    const __half* xr = x + row * dim;
+    const float* xr = x + row * dim;
     for (int i = 0; i < dim; i++) {
-        float v = __half2float(xr[i]);
+        float v = xr[i];
         ss += v * v;
     }
     ss /= (float)dim;
     float rms = 1.0f / sqrtf(ss + eps);
     float* d = dst + row * dim;
     for (int i = 0; i < dim; i++) {
-        d[i] += __half2float(xr[i]) * rms * __half2float(weight[i]);
+        d[i] += xr[i] * rms * __half2float(weight[i]);
     }
 }
 "#;

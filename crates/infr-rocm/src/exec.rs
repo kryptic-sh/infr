@@ -44,7 +44,25 @@ fn read_bytes(b: &crate::RocmBuffer, stream: ffi::hipStream_t) -> Vec<u8> {
 }
 
 fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Result<Vec<f32>> {
-    dequant::dequant_block(dtype, bytes).map_err(|e| be(format!("dequant {dtype:?} weight: {e}")))
+    match dtype {
+        DType::F32 => {
+            // Raw f32 bytes — reinterpret directly.
+            let f32s: &[f32] = bytemuck::cast_slice(bytes);
+            Ok(f32s.to_vec())
+        }
+        DType::F16 => {
+            // Raw f16 bytes — convert each half to f32.
+            let f16s: &[u16] = bytemuck::cast_slice(bytes);
+            Ok(f16s.iter().map(|&b| half::f16::from_bits(b).to_f32()).collect())
+        }
+        DType::I32 => {
+            // Bias / position tensor — bitcast i32 to f32.
+            let i32s: &[i32] = bytemuck::cast_slice(bytes);
+            Ok(i32s.iter().map(|&v| f32::from_bits(v as u32)).collect())
+        }
+        _ => dequant::dequant_block(dtype, bytes)
+            .map_err(|e| be(format!("dequant {dtype:?} weight: {e}"))),
+    }
 }
 
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
@@ -131,7 +149,8 @@ impl<'a> ExecCtx<'a> {
     }
 
     fn zero_dev(&self, n: usize) -> crate::RocmBuffer {
-        crate::RocmBuffer::alloc_zero(n.max(1), self.stream)
+        // Allocate in BYTES — n is ELEMENTS of f32 (4 bytes each).
+        crate::RocmBuffer::alloc_zero((n * 4).max(1), self.stream)
     }
 
     fn host_vals(&mut self, id: TensorId, g: &Graph, bindings: &Bindings) -> Result<&[f32]> {
@@ -163,22 +182,30 @@ impl<'a> ExecCtx<'a> {
         id: TensorId,
         g: &Graph,
         bindings: &Bindings,
-    ) -> Result<&crate::RocmBuffer> {
+    ) -> Result<*mut c_void> {
         let i = id.0 as usize;
-        if self.dev[i].is_none() {
-            let decl = &g.tensors[i];
-            let host = self.host_vals(id, g, bindings)?;
-            let numel = decl.desc.numel();
-            let dev = if host.is_empty() {
-                self.zero_dev(numel)
-            } else {
-                // Copy to owned vec so the mutable borrow from host_vals is dropped
-                let owned = host.to_vec();
-                self.f32_dev(&owned)
-            };
-            self.dev[i] = Some(dev);
+        if let Some(ref db) = self.dev[i] {
+            return Ok(db.ptr);
         }
-        Ok(self.dev[i].as_ref().unwrap())
+        // For Input/Weight tensors, use the bound buffer directly (no host download).
+        let decl = &g.tensors[i];
+        let ptr = match decl.kind {
+            TensorKind::Input | TensorKind::Weight => {
+                let b = rocm_buf(bindings.get(id).expect("rocm: unbound Input/Weight"));
+                let p = b.ptr;
+                // Track in dev so subsequent accesses find it.
+                self.dev[i] = Some(crate::RocmBuffer { ptr: p, len: b.len, owned: false });
+                p
+            }
+            TensorKind::Internal | TensorKind::Output => {
+                // Not yet produced — allocate a zero-filled buffer.
+                let db = self.zero_dev(decl.desc.numel());
+                let p = db.ptr;
+                self.dev[i] = Some(db);
+                p
+            }
+        };
+        Ok(ptr)
     }
 
     fn set_dev(&mut self, id: TensorId, data: &[f32]) {
@@ -201,6 +228,7 @@ impl<'a> ExecCtx<'a> {
             }
         }
         let dt = g.desc(id).dtype;
+        eprintln!("[rocm] dequant weight id={i} dtype={dt:?} bytes={nbytes}", i=id.0, dt=dt, nbytes=b.len);
         let raw = read_bytes(b, self.stream);
         let f32s = bytes_to_f32(&raw, dt)?;
         let f16_bytes = f32_to_f16_bytes(&f32s);
@@ -244,11 +272,20 @@ pub fn execute_graph(
         stream,
     };
 
-    for op in &g.ops {
+    for (idx, op) in g.ops.iter().enumerate() {
+        eprintln!("[rocm] op {idx}/{len}: {kind}", idx = idx, len = g.ops.len(), kind = op.kind());
         run_op(op, g, bindings, pipelines, &mut ctx)?;
+        // Sync + check for async errors after each op during bringup.
+        let rc = unsafe { ffi::hipStreamSynchronize(stream) };
+        if rc != HIP_SUCCESS {
+            return Err(be(format!("sync after op {idx} ({kind}): rc={rc}", idx=idx, kind=op.kind())));
+        }
     }
 
-    // Write back Outputs + mutated f32 Inputs
+    // Sync after all ops
+    eprintln!("[rocm] syncing stream...");
+    let rc = unsafe { ffi::hipStreamSynchronize(stream) };
+    eprintln!("[rocm] sync done (rc={rc})");
     let direct = g.in_place_inputs();
     for (i, decl) in g.tensors.iter().enumerate() {
         let id = TensorId(i as u32);

@@ -4,9 +4,7 @@
 //! Compiled only when `cfg(all(target_os = "linux", feature = "rocm"))`.
 
 use crate::exec;
-use crate::ffi::{
-    self, HIPRTC_SUCCESS, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS,
-};
+use crate::ffi::{self, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS};
 use crate::kernels::Pipelines;
 use infr_core::backend::{
     Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan, ProgressScope,
@@ -38,7 +36,7 @@ unsafe impl Sync for RocmBuffer {}
 
 impl RocmBuffer {
     /// Allocate `bytes` of device memory with `hipMalloc`. Zero-initialized (calloc contract).
-    pub fn alloc(bytes: usize, stream: ffi::hipStream_t) -> Self {
+    pub fn alloc(bytes: usize, _stream: ffi::hipStream_t) -> Self {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         if bytes > 0 {
             let rc = unsafe { ffi::hipMalloc(&mut ptr, bytes) };

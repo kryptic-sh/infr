@@ -7,12 +7,15 @@
 //! On first use each kernel name is fetched via `hipModuleGetFunction` and cached in a
 //! `HashMap`. The module is compiled once at backend init via `hiprtcCompileProgram`.
 
-use crate::be;
 use crate::ffi;
-use infr_core::error::Result;
+use infr_core::error::{Error, Result};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, CString};
 use std::sync::Mutex;
+
+fn be(msg: impl std::fmt::Display) -> Error {
+    Error::backend(msg)
+}
 
 // ── Kernel source ────────────────────────────────────────────────────────────
 

@@ -3,20 +3,21 @@
 //! Quantized weight tensors are dequantized to f16 on the host on first touch and
 //! cached by the raw device-pointer address of their bound buffer.
 
-use crate::be;
-use crate::ffi::{
-    self, HIPRTC_SUCCESS, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS,
-};
+use crate::ffi::{self, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS};
 use crate::kernels::Pipelines;
 use half::f16;
 use infr_core::backend::{Bindings, GraphPlan, Plan};
-use infr_core::error::Result;
-use infr_core::graph::{AttnMask, Graph, Op, TensorId, TensorKind};
-use infr_core::tensor::DType;
+use infr_core::error::{Error, Result};
+use infr_core::graph::{AttnMask, Graph, Op, TensorKind};
+use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
+
+fn be(msg: impl std::fmt::Display) -> Error {
+    Error::backend(msg)
+}
 
 fn rocm_buf(b: &dyn infr_core::backend::Buffer) -> &crate::RocmBuffer {
     b.as_any()
@@ -47,8 +48,12 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Result<Vec<f32>> {
 }
 
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
-    let f16s: Vec<f16> = v.iter().map(|x| f16::from_f32(*x)).collect();
-    bytemuck::cast_slice::<f16, u8>(&f16s).to_vec()
+    let mut out = Vec::with_capacity(v.len() * 2);
+    for x in v {
+        let h = f16::from_f32(*x);
+        out.extend_from_slice(&h.to_bits().to_le_bytes());
+    }
+    out
 }
 
 // ── Kernel dispatch helpers ──────────────────────────────────────────────────
@@ -163,10 +168,13 @@ impl<'a> ExecCtx<'a> {
         if self.dev[i].is_none() {
             let decl = &g.tensors[i];
             let host = self.host_vals(id, g, bindings)?;
+            let numel = decl.desc.numel();
             let dev = if host.is_empty() {
-                self.zero_dev(decl.desc.numel())
+                self.zero_dev(numel)
             } else {
-                self.f32_dev(host)
+                // Copy to owned vec so the mutable borrow from host_vals is dropped
+                let owned = host.to_vec();
+                self.f32_dev(&owned)
             };
             self.dev[i] = Some(dev);
         }
@@ -230,8 +238,8 @@ pub fn execute_graph(
         .graph;
     let n = g.tensors.len();
     let mut ctx = ExecCtx {
-        dev: vec![None; n],
-        vals: vec![None; n],
+        dev: (0..n).map(|_| None).collect(),
+        vals: (0..n).map(|_| None).collect(),
         weight_cache,
         stream,
     };
@@ -393,8 +401,6 @@ fn run_op(
             scale_buf,
         } => {
             ctx.ensure_device(x, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * dim as usize);
-            let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             let s = if let Some(sid) = scale_buf {
                 ctx.host_vals(sid, g, bindings)?
                     .first()
@@ -403,6 +409,9 @@ fn run_op(
             } else {
                 scale
             };
+            let dd = ctx.zero_dev(rows as usize * dim as usize);
+            let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
+            let dd_ptr = dd.ptr;
             dispatch_1d(
                 pipelines,
                 ctx.stream,
@@ -410,8 +419,8 @@ fn run_op(
                 rows,
                 256,
                 args![
-                    arg_ptr(bx.ptr),
-                    arg_ptr(dd.ptr),
+                    arg_ptr(bx_ptr),
+                    arg_ptr(dd_ptr),
                     arg_i32(rows as i32),
                     arg_i32(dim as i32),
                     arg_f32(s),
@@ -494,41 +503,54 @@ fn run_op(
             rows,
             n_head,
             head_dim,
+            rope_dim,
             theta,
-            use_neox,
             freq_factors,
-            freq_base,
+            x_stride: _x_stride,
         } => {
             ctx.ensure_device(x, g, bindings)?;
             ctx.ensure_device(positions, g, bindings)?;
-            let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
-            let bp = ctx.dev[positions.0 as usize].as_ref().unwrap();
-            let ff = freq_factors.map(|fid| {
-                let _ = ctx.ensure_device(fid, g, bindings);
+            let ff_ptr = if let Some(fid) = freq_factors {
+                ctx.ensure_device(fid, g, bindings)?;
                 ctx.dev[fid.0 as usize].as_ref().unwrap().ptr
-            });
-            let ff_ptr = ff.unwrap_or(std::ptr::null_mut());
-            let rope_a = |p: *mut c_void| {
-                args![
-                    arg_ptr(p),
-                    arg_ptr(bp.ptr),
+            } else {
+                std::ptr::null_mut()
+            };
+            // Re-fetch after ensure_device calls (borrow lifetime)
+            let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
+            let bp_ptr = ctx.dev[positions.0 as usize].as_ref().unwrap().ptr;
+            let rope_args = args![
+                arg_ptr(bx_ptr),
+                arg_ptr(bp_ptr),
+                arg_ptr(ff_ptr),
+                arg_i32(rows as i32),
+                arg_i32(n_head as i32),
+                arg_i32(head_dim as i32),
+                arg_i32(rope_dim as i32),
+                arg_f32(theta),
+            ];
+            if dst == x {
+                dispatch_1d(pipelines, ctx.stream, "rope", rows, 256, rope_args)?;
+            } else {
+                let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
+                unsafe {
+                    ffi::hipMemcpyDtoD(
+                        dd.ptr,
+                        bx_ptr,
+                        dd.len.min(ctx.dev[x.0 as usize].as_ref().unwrap().len),
+                    );
+                }
+                let dst_args = args![
+                    arg_ptr(dd.ptr),
+                    arg_ptr(bp_ptr),
                     arg_ptr(ff_ptr),
                     arg_i32(rows as i32),
                     arg_i32(n_head as i32),
                     arg_i32(head_dim as i32),
+                    arg_i32(rope_dim as i32),
                     arg_f32(theta),
-                    arg_i32(use_neox as i32),
-                    arg_f32(freq_base),
-                ]
-            };
-            if dst == x {
-                dispatch_1d(pipelines, ctx.stream, "rope", rows, 256, rope_a(bx.ptr))?;
-            } else {
-                let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
-                unsafe {
-                    ffi::hipMemcpyDtoD(dd.ptr, bx.ptr, dd.len.min(bx.len));
-                }
-                dispatch_1d(pipelines, ctx.stream, "rope", rows, 256, rope_a(dd.ptr))?;
+                ];
+                dispatch_1d(pipelines, ctx.stream, "rope", rows, 256, dst_args)?;
                 ctx.dev[dst.0 as usize] = Some(dd);
             }
         }
@@ -540,62 +562,62 @@ fn run_op(
             rows,
             n_head,
             head_dim,
+            rope_dim,
             eps,
             theta,
-            use_neox,
             freq_factors,
-            freq_base,
             x_stride,
         } => {
             let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
             ctx.ensure_device(x, g, bindings)?;
             ctx.ensure_device(positions, g, bindings)?;
-            let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
-            let bp = ctx.dev[positions.0 as usize].as_ref().unwrap();
-            let ff = freq_factors.map(|fid| {
-                let _ = ctx.ensure_device(fid, g, bindings);
+            let ff_ptr = if let Some(fid) = freq_factors {
+                ctx.ensure_device(fid, g, bindings)?;
                 ctx.dev[fid.0 as usize].as_ref().unwrap().ptr
-            });
-            let ff_ptr = ff.unwrap_or(std::ptr::null_mut());
+            } else {
+                std::ptr::null_mut()
+            };
+            let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
+            let bp_ptr = ctx.dev[positions.0 as usize].as_ref().unwrap().ptr;
             let total = rows * n_head;
-            let qnr_a = |p: *mut c_void| {
-                args![
-                    arg_ptr(p),
+            let qnr_args = args![
+                arg_ptr(bx_ptr),
+                arg_ptr(wptr),
+                arg_ptr(bp_ptr),
+                arg_ptr(ff_ptr),
+                arg_i32(rows as i32),
+                arg_i32(n_head as i32),
+                arg_i32(head_dim as i32),
+                arg_i32(rope_dim as i32),
+                arg_f32(eps),
+                arg_f32(theta),
+                arg_i32(x_stride as i32),
+            ];
+            if dst == x {
+                dispatch_1d(pipelines, ctx.stream, "qk_norm_rope", total, 256, qnr_args)?;
+            } else {
+                let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
+                unsafe {
+                    ffi::hipMemcpyDtoD(
+                        dd.ptr,
+                        bx_ptr,
+                        dd.len.min(ctx.dev[x.0 as usize].as_ref().unwrap().len),
+                    );
+                }
+                let dst_args = args![
+                    arg_ptr(dd.ptr),
                     arg_ptr(wptr),
-                    arg_ptr(bp.ptr),
+                    arg_ptr(bp_ptr),
                     arg_ptr(ff_ptr),
                     arg_i32(rows as i32),
                     arg_i32(n_head as i32),
                     arg_i32(head_dim as i32),
+                    arg_i32(rope_dim as i32),
                     arg_f32(eps),
                     arg_f32(theta),
-                    arg_i32(use_neox as i32),
-                    arg_f32(freq_base),
                     arg_i32(x_stride as i32),
-                ]
-            };
-            if dst == x {
-                dispatch_1d(
-                    pipelines,
-                    ctx.stream,
-                    "qk_norm_rope",
-                    total,
-                    256,
-                    qnr_a(bx.ptr),
-                )?;
-            } else {
-                let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
-                unsafe {
-                    ffi::hipMemcpyDtoD(dd.ptr, bx.ptr, dd.len.min(bx.len));
-                }
-                dispatch_1d(
-                    pipelines,
-                    ctx.stream,
-                    "qk_norm_rope",
-                    total,
-                    256,
-                    qnr_a(dd.ptr),
-                )?;
+                ];
+                dispatch_1d(pipelines, ctx.stream, "qk_norm_rope", total, 256, dst_args)?;
                 ctx.dev[dst.0 as usize] = Some(dd);
             }
         }
@@ -604,9 +626,7 @@ fn run_op(
             cache,
             pos,
             rows,
-            n_kv,
-            head_dim,
-            src_stride,
+            row_stride,
         } => {
             ctx.ensure_device(src, g, bindings)?;
             let bs = ctx.dev[src.0 as usize].as_ref().unwrap();
@@ -622,9 +642,7 @@ fn run_op(
                     arg_ptr(bc.ptr),
                     arg_i32(pos as i32),
                     arg_i32(rows as i32),
-                    arg_i32(n_kv as i32),
-                    arg_i32(head_dim as i32),
-                    arg_i32(src_stride as i32),
+                    arg_i32(row_stride as i32),
                 ],
             )?;
         }
@@ -934,11 +952,12 @@ fn run_op(
             table,
             dst,
             rows,
-            dim,
+            ne,
+            scale: _scale,
         } => {
             let wptr = ctx.dequant_weight_or_cache(table, g, bindings)?;
             ctx.ensure_device(ids, g, bindings)?;
-            let dd = ctx.zero_dev(rows as usize * dim as usize);
+            let dd = ctx.zero_dev(rows as usize * ne as usize);
             let bid = ctx.dev[ids.0 as usize].as_ref().unwrap();
             dispatch_1d(
                 pipelines,
@@ -951,7 +970,8 @@ fn run_op(
                     arg_ptr(wptr),
                     arg_ptr(dd.ptr),
                     arg_i32(rows as i32),
-                    arg_i32(dim as i32),
+                    arg_i32(ne as i32),
+                    arg_f32(_scale),
                 ],
             )?;
             ctx.dev[dst.0 as usize] = Some(dd);
@@ -1041,12 +1061,17 @@ fn run_op(
             };
 
             let dd = ctx.zero_dev(neu);
-            let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             let at: i32 = match act {
                 infr_core::graph::Activation::Silu => 0,
                 infr_core::graph::Activation::Gelu => 1,
                 infr_core::graph::Activation::Sigmoid => 2,
             };
+            // Pre-fetch down_scale values to avoid borrowing ctx inside the loop
+            let dsc_vals: Vec<f32> = match down_scale {
+                Some(sid) => ctx.host_vals(sid, g, bindings)?.to_vec(),
+                None => vec![1.0f32; n_expert as usize],
+            };
+            let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
             for &(ei, prob) in &top_k {
                 let w = prob / sum_w * scale;
                 let eo = ei * nfu * neu;
@@ -1057,13 +1082,7 @@ fn run_op(
                     unsafe { (uw_ptr as *mut u8).add(eo * 2) as *mut c_void }
                 };
                 let ds = unsafe { (dw_ptr as *mut u8).add(eo * 2) as *mut c_void };
-                let dsc = down_scale
-                    .and_then(|sid| {
-                        ctx.host_vals(sid, g, bindings)
-                            .ok()
-                            .and_then(|h| h.get(ei).copied())
-                    })
-                    .unwrap_or(0.0);
+                let dsc = dsc_vals.get(ei).copied().unwrap_or(1.0);
                 dispatch_1d(
                     pipelines,
                     ctx.stream,

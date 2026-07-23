@@ -138,8 +138,8 @@ unsafe impl Send for RocmBackend {}
 unsafe impl Sync for RocmBackend {}
 
 impl RocmBackend {
-    /// Create a new ROCm backend, enumerating the first available HIP device.
-    pub fn new() -> Result<Self> {
+    /// Create a new ROCm backend on the given device index.
+    pub fn new(device_id: c_int) -> Result<Self> {
         let mut count: c_int = 0;
         let rc = unsafe { ffi::hipGetDeviceCount(&mut count) };
         if rc != HIP_SUCCESS {
@@ -148,8 +148,13 @@ impl RocmBackend {
         if count == 0 {
             return Err(be("no HIP-capable devices found"));
         }
+        if device_id >= count {
+            return Err(be(format!(
+                "HIP device {device_id} out of range (count={count})"
+            )));
+        }
 
-        let device: c_int = 0; // First device
+        let device: c_int = device_id;
         let rc = unsafe { ffi::hipSetDevice(device) };
         if rc != HIP_SUCCESS {
             return Err(be(format!("hipSetDevice({device}): rc={rc}")));

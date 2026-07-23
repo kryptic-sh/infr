@@ -20,14 +20,16 @@ use anyhow::Result;
 pub struct RocmSeamChat {
     model: SeamModel,
     session: Option<DenseRocmSession>,
+    dev_idx: u32,
 }
 
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 impl RocmSeamChat {
-    pub fn new(model: SeamModel) -> Result<Self> {
+    pub fn new(model: SeamModel, dev_idx: u32) -> Result<Self> {
         Ok(Self {
             model,
             session: None,
+            dev_idx,
         })
     }
 
@@ -39,7 +41,7 @@ impl RocmSeamChat {
                 .and_then(|v| infr_core::parse_size(&v))
                 .map(|s| s.resolve(train as u64) as usize)
                 .unwrap_or(train);
-            self.session = Some(self.model.rocm_session(max_ctx)?);
+            self.session = Some(self.model.rocm_session(max_ctx, self.dev_idx)?);
         }
         Ok(())
     }
@@ -91,7 +93,7 @@ pub struct RocmSeamChat {
 
 #[cfg(not(all(target_os = "linux", feature = "rocm")))]
 impl RocmSeamChat {
-    pub fn new(_model: SeamModel) -> anyhow::Result<Self> {
+    pub fn new(_model: SeamModel, _dev_idx: u32) -> anyhow::Result<Self> {
         anyhow::bail!(
             "ROCm backend not compiled — build with `cargo build --features rocm` \
              on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md Phase 0)"

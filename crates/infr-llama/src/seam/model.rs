@@ -1237,8 +1237,9 @@ impl SeamModel {
     /// Open a persistent ROCm seam session: weights uploaded ONCE, KV sized to `max_ctx`,
     /// later calls prefill only the un-cached suffix.
     #[cfg(all(target_os = "linux", feature = "rocm"))]
-    pub fn rocm_session(&self, max_ctx: usize) -> Result<DenseRocmSession> {
-        let rocm = infr_rocm::RocmBackend::new().map_err(|e| anyhow!("rocm init: {e}"))?;
+    pub fn rocm_session(&self, max_ctx: usize, dev_idx: u32) -> Result<DenseRocmSession> {
+        let rocm = infr_rocm::RocmBackend::new(dev_idx as i32)
+            .map_err(|e| anyhow!("rocm init: {e}"))?;
         Ok(DenseRocmSession {
             rocm,
             pool: SlotPool::new(),
@@ -1249,7 +1250,7 @@ impl SeamModel {
     /// Open a persistent ROCm seam session: returns an error when the `rocm` feature is not
     /// active — the CLI surfaces it as a feature-gate message.
     #[cfg(not(all(target_os = "linux", feature = "rocm")))]
-    pub fn rocm_session(&self, _max_ctx: usize) -> Result<DenseRocmSession> {
+    pub fn rocm_session(&self, _max_ctx: usize, _dev_idx: u32) -> Result<DenseRocmSession> {
         anyhow::bail!(
             "ROCm backend not compiled — build with `cargo build --features rocm` \
              on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md Phase 0)"

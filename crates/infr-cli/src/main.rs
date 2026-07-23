@@ -67,8 +67,9 @@ enum Backend {
     Metal,
     /// The CPU reference backend (`INFR_DEV=cpu`).
     Cpu,
-    /// AMD GPU through the ROCm/HIP stack (`INFR_DEV=rocm`).
-    Rocm,
+    /// AMD GPU through the ROCm/HIP stack (`INFR_DEV=rocm` or `INFR_DEV=rocm:N`).
+    /// `Some("rocm1")` pins a device index; `None` = device 0.
+    Rocm(Option<String>),
 }
 
 /// A snapshot of the process-global env vars that select a backend, so the backend DECISION
@@ -106,8 +107,8 @@ fn parse_dev_spec(d: &str) -> anyhow::Result<Backend> {
         Ok(Backend::Metal)
     } else if lower == "cpu" {
         Ok(Backend::Cpu)
-    } else if lower == "rocm" {
-        Ok(Backend::Rocm)
+    } else if lower == "rocm" || lower.starts_with("rocm") && lower.len() > 4 {
+        Ok(Backend::Rocm(Some(d.trim().to_string())))
     } else {
         anyhow::bail!("expected a Vulkan GPU like `Vulkan0`/`Vulkan1`, `metal`, `cpu`, or `rocm`");
     }
@@ -197,7 +198,8 @@ impl DeviceOpts {
                 Backend::Vulkan(None) => std::env::remove_var("INFR_DEV"),
                 Backend::Metal => std::env::set_var("INFR_DEV", "metal"),
                 Backend::Cpu => std::env::set_var("INFR_DEV", "cpu"),
-                Backend::Rocm => std::env::set_var("INFR_DEV", "rocm"),
+                Backend::Rocm(Some(d)) => std::env::set_var("INFR_DEV", d),
+                Backend::Rocm(None) => std::env::set_var("INFR_DEV", "rocm"),
             }
         }
         // `--ctx` shares the size grammar (`8192`, `256k`, `50%`) with INFR_CTX, which it sets; a
@@ -859,7 +861,7 @@ fn build_chat_model(
             match backend {
                 Backend::Cpu => "cpu backend",
                 Backend::Metal => "metal backend",
-                Backend::Rocm => "rocm backend",
+                Backend::Rocm(_) => "rocm backend",
                 Backend::Vulkan(_) => "vulkan seam",
             }
         );
@@ -867,7 +869,7 @@ fn build_chat_model(
         return Ok(match backend {
             Backend::Cpu => Box::new(infr_llama::chat::DiffusionGemmaChat::new_cpu(loaded)),
             Backend::Metal => Box::new(infr_llama::chat::DiffusionGemmaChat::new_metal(loaded)),
-            Backend::Rocm => {
+            Backend::Rocm(_) => {
                 // Phase 0: diffusion-gemma on ROCm is not yet implemented.
                 anyhow::bail!(
                     "ROCm diffusion-gemma not yet implemented — \
@@ -877,13 +879,18 @@ fn build_chat_model(
             Backend::Vulkan(_) => Box::new(infr_llama::chat::DiffusionGemmaChat::new(loaded)),
         });
     }
-    match backend {
-        Backend::Rocm => {
+    match &backend {
+        Backend::Rocm(rocm_spec) => {
+            let dev_idx = rocm_spec
+                .as_deref()
+                .map(|s| parse_rocm_device(s))
+                .unwrap_or(0);
             eprintln!(
                 "[rocm backend — dense/MoE forward on AMD GPU via ROCm/HIP, persistent KV session]"
             );
             Ok(Box::new(infr_llama::chat::RocmSeamChat::new(
                 infr_llama::SeamModel::load(gguf, tok)?,
+                dev_idx,
             )?))
         }
         Backend::Metal => {
@@ -1863,7 +1870,7 @@ fn cmd_bench(
         );
     }
     // ROCm: Phase 0 — the backend scaffold exists but kernels aren't written yet.
-    if matches!(backend, Backend::Rocm) {
+    if matches!(backend, Backend::Rocm(_)) {
         anyhow::bail!(
             "ROCm bench not yet implemented — the ROCm/HIP backend is under construction \
              (docs/rocm-plan.md Phase 0); bench is available via Vulkan, Metal, or CPU"
@@ -2636,6 +2643,15 @@ fn compare_infr_dev(dev: &str) -> &str {
     } else {
         dev
     }
+}
+
+/// Parse a ROCm device spec (`rocm0`, `rocm1`, …, or bare `rocm`) into a device index.
+fn parse_rocm_device(spec: &str) -> u32 {
+    let lower = spec.to_ascii_lowercase();
+    lower
+        .strip_prefix("rocm")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 /// One model's infr-vs-llama.cpp bench harness: resolves the shared model ref once and shells

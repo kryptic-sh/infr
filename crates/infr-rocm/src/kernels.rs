@@ -826,21 +826,10 @@ impl Pipelines {
         }
 
         // Compile for the current device's arch. Default flags: f16 support + fast math.
-        let gfx_arch = {
-            let mut props: ffi::hipDeviceProp_t = unsafe { std::mem::zeroed() };
-            unsafe { ffi::hipGetDeviceProperties(&mut props, device) };
-            let name_bytes: Vec<u8> = props
-                .gcn_arch_name
-                .iter()
-                .take_while(|b| **b != 0)
-                .map(|b| *b as u8)
-                .collect();
-            String::from_utf8_lossy(&name_bytes).to_string()
-        };
-        let arch_flag = format!("--gpu-architecture={gfx_arch}");
-        let arch_c = CString::new(arch_flag.as_str()).unwrap();
+        // Compile without --gpu-architecture: hiprtc auto-detects the device
+        // from the active hipSetDevice context.
         let std_flag = CString::new("-std=c++17").unwrap();
-        let opts: [*const c_char; 2] = [arch_c.as_ptr(), std_flag.as_ptr()];
+        let opts: [*const c_char; 1] = [std_flag.as_ptr()];
         let rc = unsafe { ffi::hiprtcCompileProgram(prog, opts.len() as i32, opts.as_ptr()) };
         if rc != ffi::HIPRTC_SUCCESS {
             // Fetch the compile log for diagnostics

@@ -1987,6 +1987,47 @@ pub(crate) fn generate_dense_metal_session(
     )
 }
 
+/// Persistent-session ROCm seam runner — the ROCm twin of
+/// [`generate_dense_metal_session`]: weights upload once, KV cache persists across turns.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn generate_dense_rocm_session(
+    rocm: &infr_rocm::RocmBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    constraint: Option<&mut crate::grammar::Constraint>,
+    req: Option<&crate::sampling::RequestCtx>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend(
+        rocm,
+        &rocm_upload_bind(rocm),
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        state,
+        want_ctx,
+        constraint,
+        None,
+        None,
+        None,
+        None,
+        None,
+        req,
+    )
+}
+
 /// Speculative VERIFY on the Metal seam: one batched forward of `tokens`' un-cached suffix with
 /// the LM head on every suffix row. Returns the [m, vocab] logits plus the graph-execute
 /// seconds, and leaves the session's KV + `cached` covering all of `tokens` — the caller

@@ -141,11 +141,12 @@ pub struct hipDeviceProp_t {
     pub major: c_int,
     pub minor: c_int,
     pub arch: hipDeviceArch_t,
-    pub gcn_arch: c_int,
+    // ── padding: the real hipDeviceProp_tR0600 has many fields (~808 bytes)
+    //     between arch (ends at 352) and gcnArchName (at offset 1160).
+    _pad1: [u8; 808],
     pub gcn_arch_name: [c_char; 256],
-    // Pad so the struct matches what hipGetDeviceProperties expects —
-    // the real struct is ~800 bytes; this subset is enough for our use.
-    _pad: [u8; 128],
+    // Trailing pad to match sizeof(hipDeviceProp_tR0600) = 1472.
+    _pad2: [u8; 56],
 }
 
 #[repr(C)]

@@ -61,34 +61,15 @@ single-scale int dot. Full parity with Vulkan's native set.
 
 Deferred: #3 (DeltaNet clones — measured ~0.1%, negligible). Remaining: #8
 (f16/bf16, low priority), #9 (blocked on `perf`), #10 (fusion), VNNI batch for
-IQ4_XS. **Metal** is the only backend with quant gaps (see audit).
+IQ4_XS.
 
-## Cross-backend fast-kernel coverage audit
+## Cross-backend fast-kernel coverage
 
-Native (in-shader / int8) fast kernels vs the dequant→f16/f32 fallback, per
-weight quant format. ✅ = native fast path, ❌ = falls back to dequant.
-
-| Format               | CPU | Vulkan | Metal |
-| -------------------- | :-: | :----: | :---: |
-| Q4_0 Q5_0 Q8_0       | ✅  |   ✅   |  ✅   |
-| Q4_K Q5_K Q6_K       | ✅  |   ✅   |  ✅   |
-| IQ4_NL IQ4_XS        | ✅  |   ✅   |  ✅   |
-| IQ2_XXS IQ2_XS IQ2_S | ✅  |   ✅   |  ✅   |
-| IQ3_XXS IQ3_S        | ✅  |   ✅   |  ✅   |
-| Q4_1 Q5_1            | ✅  |   ✅   |  ❌   |
-| Q2_K Q3_K            | ✅  |   ✅   |  ❌   |
-| IQ1_S IQ1_M          | ✅  |   ✅   |  ❌   |
-| MXFP4 NVFP4          | ✅  |   ✅   |  ❌   |
-| Q2_0 (ternary-ish)   | ✅  |   ✅   |  ❌   |
-| TQ1_0 TQ2_0          | ✅  |   ✅   |  ❌   |
-
-- **CPU: complete** — native for every weight quant format (ternary `TQ1_0`
-  `6336df3`/`b7a4201` closed the last gap; TriLM-3.9B TQ2_0 prefill 16.5→131.9
-  t/s ≈ 8×).
-- **Vulkan: complete** — native for every weight quant format.
-- **Metal: 11 formats on dequant→f16** — most impactful are **`Q2_K`/`Q3_K`**
-  (common small-model quants), then `Q4_1`/`Q5_1`, `IQ1_S`/`IQ1_M`, `MXFP4`/
-  `NVFP4`, `Q2_0`. (Float `F16`/`F32`/`BF16` are native on all three.)
+CPU, Vulkan, and Metal now each have a native fast kernel for **every** weight
+quant format infr supports (24/24) — no format falls back to dequant→float on
+any backend. The full matrix and per-backend decode strategy moved to its own
+doc: **`docs/kernels.md`**. (CPU closed its last gap with ternary `TQ1_0`
+`6336df3`/`b7a4201`; TriLM-3.9B TQ2_0 prefill 16.5→131.9 t/s ≈ 8×.)
 
 ## Context: two regimes, two different bottlenecks
 

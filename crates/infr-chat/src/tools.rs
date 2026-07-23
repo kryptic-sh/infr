@@ -2,7 +2,7 @@
 //! `<|tool_call>…<tool_call|>` block parsing, and inbound message normalisation. Pure logic, no IO.
 //!
 //! Reference: `~/Projects/scratch/dgemma-openai-server.py` (Python shim).
-//! Token formats: docs/PLAN.md "DiffusionGemma spec".
+//! Token formats: docs/plan.md "DiffusionGemma spec".
 
 use serde_json::Value;
 
@@ -553,7 +553,7 @@ mod tests {
 
     #[test]
     fn parse_tool_calls_bash_single_arg() {
-        // Format from docs/PLAN.md: strings wrapped in <|"|>…<|"|>
+        // Format from docs/plan.md: strings wrapped in <|"|>…<|"|>
         let text = r#"<|tool_call>call:bash{command:<|"|>ls<|"|>}<tool_call|>"#;
         let (clean, calls) = parse_tool_calls(text);
         assert_eq!(calls.len(), 1);

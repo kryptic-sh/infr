@@ -1257,7 +1257,7 @@ impl<'a> Recorder<'a> {
     /// `cmd_push_descriptor_set` call — no host-side descriptor-pool allocation or
     /// `vkUpdateDescriptorSets` syscall, which the pooled path below pays on EVERY dispatch. That
     /// per-dispatch churn measured as a real chunk of the host-side (non-GPU-timestamped) gap at
-    /// small-m shapes (many-op graphs where GPU busy time is small — PERF.md class 4). Falls back
+    /// small-m shapes (many-op graphs where GPU busy time is small — perf.md class 4). Falls back
     /// to the pooled alloc_set + update_descriptor_sets + cmd_bind_descriptor_sets sequence when
     /// the extension is unavailable; `k.ds_layout` was built to match (see `ops.rs`).
     fn bind_descriptors(&self, k: ComputeKernel, buffers: &[vk::DescriptorBufferInfo]) {
@@ -3970,7 +3970,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// Row-wise softmax: `y[r,:] = softmax(x[r,:] * scale)` over `dim` columns, one workgroup per
-    /// row (diffusion-gemma's in-graph self-conditioning — see docs/DIFFUSIONGEMMA.md's Phase-B
+    /// row (diffusion-gemma's in-graph self-conditioning — see docs/diffusion-gemma.md's Phase-B
     /// and the reference's `dg_canvas_embed`). Same 256-thread subgroup-reduction shape as
     /// `rmsnorm` — `dim` here is the vocab, so the cooperative reduction matters just as much.
     pub fn softmax(&self, x: &dyn Buffer, y: &dyn Buffer, rows: usize, dim: usize, scale: f32) {
@@ -3988,7 +3988,7 @@ impl<'a> Recorder<'a> {
     /// host-updated via a tiny 4-byte `upload` between calls) instead of a push constant — the
     /// DiffusionGemma denoise self-conditioning path uses this to vary the softmax temperature
     /// every step on a plan compiled/cached ONCE (see `Op::Softmax::scale_buf`'s doc and
-    /// docs/DIFFUSIONGEMMA.md's Phase-B). `USE_SCALE_BUF`-compiled variant of the same shader.
+    /// docs/diffusion-gemma.md's Phase-B). `USE_SCALE_BUF`-compiled variant of the same shader.
     pub fn softmax_dyn(
         &self,
         x: &dyn Buffer,
@@ -5710,7 +5710,7 @@ impl<'a> Recorder<'a> {
         n_chunks: usize,
         scale: f32,
         window: usize,
-        // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md, `AttnMask::Canvas`): every row
+        // DiffusionGemma canvas denoise (docs/diffusion-gemma.md, `AttnMask::Canvas`): every row
         // attends the SAME fixed bidirectional `[lo, kv_len)`, overriding BOTH the per-row causal
         // end (`qpos1 = pos+row+1` → `kv_len`) and the sliding-window `lo` formula. Rides the
         // shader's otherwise-dead `rows` push-constant slot (see `attn_partial.comp`: the
@@ -7684,7 +7684,7 @@ impl<'a> Recorder<'a> {
         self.dispatch(k, &[Self::vkb(logits), Self::vkb(out_id)], 1, &push, 1);
     }
 
-    /// DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): fused per-canvas-row entropy-bound
+    /// DiffusionGemma perf slice 3 (docs/diffusion-gemma.md): fused per-canvas-row entropy-bound
     /// sampler reduction — argmax/entropy/CDF-sample over `[rows, dim]` logits, one workgroup per
     /// row. `u` is `rows` host-drawn uniform `[0,1)` floats (the CDF-inversion target draw).
     /// Writes `argmax_out`/`entropy_out`/`sampled_out` (each `[rows]`) — only those tiny arrays

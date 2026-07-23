@@ -2054,9 +2054,9 @@ pub(crate) fn verify_dense_cpu(
     Ok(logits)
 }
 
-/// [`verify_dense_cpu`]'s MTP Phase 1 twin (issue #33, docs/MTP.md): ALSO captures the LM-head
+/// [`verify_dense_cpu`]'s MTP Phase 1 twin (issue #33, docs/mtp.md): ALSO captures the LM-head
 /// input rows (`h_out` — `DecodeHandles::h_out`'s doc) alongside the logits, for the
-/// `lm_head(h_row) == logits_row` consistency check `docs/MTP.md`'s Phase 1 validation calls for.
+/// `lm_head(h_row) == logits_row` consistency check `docs/mtp.md`'s Phase 1 validation calls for.
 /// Returns `(logits, h)`, both `[vocab]`/`[n_embd]` for the last prompt token.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_cpu_with_h(
@@ -2096,7 +2096,7 @@ pub(crate) fn verify_dense_cpu_with_h(
 /// [`verify_dense_cpu_with_h`]'s ALL-ROWS twin (MTP Phase 2, issue #33): rides the speculative-
 /// VERIFY batched forward (the `verify` param, not `logits_out`) so `h`/`logits` cover EVERY one of
 /// `tokens`, not just the last — the shape `crate::mtp::catch_up` needs to prime the head's KV over
-/// a whole prompt in one call (`docs/MTP.md`'s `process()` runs after every target ubatch, not just
+/// a whole prompt in one call (`docs/mtp.md`'s `process()` runs after every target ubatch, not just
 /// the sampled row). Dense non-MoE models only (mirrors the VERIFY branch's own guard). Returns
 /// `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

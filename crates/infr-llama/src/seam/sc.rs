@@ -19,13 +19,13 @@ pub(super) struct DenoiseCache {
     /// `build`'s doc). Always `false` on CPU (its graph never varies with SC). A DIFFERENT
     /// graph shape from the no-SC plan (extra ops + an extra weight/input), so it's part of the
     /// cache key: step 0 (no SC) and steps 1+ (SC on) hit two separate cached plans instead of one
-    /// runtime-gated plan — see docs/DIFFUSIONGEMMA.md's Phase-B "two-plan" note.
+    /// runtime-gated plan — see docs/diffusion-gemma.md's Phase-B "two-plan" note.
     pub(super) sc: bool,
     pub(super) plan: Box<dyn Plan>,
     pub(super) dh: DecodeHandles,
     pub(super) hidden_buf: Box<dyn Buffer>,
     pub(super) pos_buf: Box<dyn Buffer>,
-    /// Perf (Vulkan — docs/DIFFUSIONGEMMA.md's Phase-B "sc round-trip" elimination): `None` on
+    /// Perf (Vulkan — docs/diffusion-gemma.md's Phase-B "sc round-trip" elimination): `None` on
     /// Vulkan, which binds `dh.logits` to `SeamKv::sc_ping` (a session-persistent ping-pong pair)
     /// instead of a buffer owned by this per-plan cache — see the denoise call site. `Some` on
     /// Metal/CPU, which keep the original per-plan-owned output buffer.
@@ -51,7 +51,7 @@ pub(super) struct SelfCondWeights {
     pub(super) emb16: Vec<u16>,
 }
 
-/// DiffusionGemma self-conditioning block (Phase 2 — see docs/DIFFUSIONGEMMA.md's "Self-
+/// DiffusionGemma self-conditioning block (Phase 2 — see docs/diffusion-gemma.md's "Self-
 /// conditioning is ON by default" and the reference's `dg_canvas_embed`): given the PREVIOUS
 /// step's raw canvas logits `[cc, vocab]`, returns the additive signal `sc_sig` (`[cc, ne]`) the
 /// caller adds to the scaled canvas embedding before the weightless rms-norm.
@@ -230,7 +230,7 @@ pub(super) fn build_sc_embt(
     Ok(std::sync::Arc::from(buf))
 }
 
-/// Phase-2 DiffusionGemma canvas-denoise request (see docs/DIFFUSIONGEMMA.md): short-circuits
+/// Phase-2 DiffusionGemma canvas-denoise request (see docs/diffusion-gemma.md): short-circuits
 /// `generate_dense_backend` into ONE forward over the `canvas_tokens.len()` canvas rows, reusing
 /// the session's already-prefilled prompt KV (rows `0..P`, `P = state.cached.len()` — the prior
 /// causal prefill call's materialized prompt). Mirrors the `verify` early-return below (same
@@ -250,7 +250,7 @@ pub(crate) struct DenoiseReq<'a> {
     /// GPU reducer ran this call (`reduced` comes back `Some`), in which case this is left empty
     /// (no full download — see `u`'s doc).
     pub out_logits: &'a mut Vec<f32>,
-    /// Perf slice 3 (docs/DIFFUSIONGEMMA.md): `Some` when the caller wants THIS step's raw logits
+    /// Perf slice 3 (docs/diffusion-gemma.md): `Some` when the caller wants THIS step's raw logits
     /// reduced on-GPU into {argmax, entropy, sampled} instead of downloaded whole (see
     /// `Backend::eb_sample_reduce`) — `Some(u)` where `u` is `canvas_tokens.len()` host-drawn
     /// uniform `[0,1)` floats (the seeded CDF-inversion draw, `Rng::next_f32_01` per canvas row).
@@ -267,7 +267,7 @@ pub(crate) struct DenoiseReq<'a> {
     pub reduced: &'a mut Option<EbReduced>,
 }
 
-/// Perf slice 3 (docs/DIFFUSIONGEMMA.md, `Backend::eb_sample_reduce`): one denoise step's sampler
+/// Perf slice 3 (docs/diffusion-gemma.md, `Backend::eb_sample_reduce`): one denoise step's sampler
 /// state reduced entirely on-GPU, one entry per canvas row — the `argmax`/`entropy`/`sampled`
 /// triple `diffusion.rs::denoise_block`'s host `per_pos` closure used to compute from the FULL
 /// downloaded `[C, vocab]` logits. Mirrors that closure's math exactly (NOT bit-identical — see

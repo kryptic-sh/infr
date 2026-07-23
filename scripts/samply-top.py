@@ -3,7 +3,7 @@
 of a samply profile, symbolicating native frames with addr2line (samply itself only
 symbolicates in its UI).
 
-Headless companion to `samply record` for CPU perf attribution — see docs/PERF.md's
+Headless companion to `samply record` for CPU perf attribution — see docs/perf.md's
 "CPU profiling (samply)". Zero dependencies beyond python3 + binutils addr2line.
 
     samply record --save-only -o prof.json.gz -- ./target/release/infr bench ...

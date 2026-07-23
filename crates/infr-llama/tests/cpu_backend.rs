@@ -1244,7 +1244,7 @@ fn cpu_golden_qwen35() {
 // ─── qwen35 on the UNIFIED shared-transformer path ─────────────────────────────────
 //
 // `Config::from_gguf` accepts `arch == "qwen35"` and `seam`'s layer loop has a `MixerW::DeltaNet`
-// branch (see `docs/QWEN35.md`) — so `SeamModel::load` on a qwen35 GGUF drives the SAME shared
+// branch (see `docs/qwen35.md`) — so `SeamModel::load` on a qwen35 GGUF drives the SAME shared
 // runner every other arch uses, and production routing (`infr run`/`serve`/`bench` in infr-cli)
 // sends qwen35 through this path unconditionally.
 
@@ -1261,7 +1261,7 @@ fn unified_qwen35_gpu_seam_matches_cpu() {
 }
 
 /// qwen35's gated-DeltaNet recurrent state is an APPEND-ONLY summary — it can't rewind to an
-/// arbitrary shared prefix the way a real KV cache can (see docs/QWEN35.md and the no-rewind rule
+/// arbitrary shared prefix the way a real KV cache can (see docs/qwen35.md and the no-rewind rule
 /// in `seam::generate_dense_backend`). On the unified Vulkan session (`vulkan_session` /
 /// `generate_vulkan_session`, the seam twin of `gpu_seam_kv_reuse_matches_fresh`):
 ///   (a) a prompt that EXACTLY EXTENDS the previous turn's fed sequence continues the recurrent
@@ -1332,7 +1332,7 @@ fn unified_qwen35_session_no_rewind() {
 
 // ─── MTP (multi-token prediction) speculative decoding — Phase 1 (issue #33) ────────────────
 //
-// See docs/MTP.md. Phase 1 only parses `{arch}.nextn_predict_layers` into `Config` (splitting the
+// See docs/mtp.md. Phase 1 only parses `{arch}.nextn_predict_layers` into `Config` (splitting the
 // GGUF's `block_count` into trunk + head) and loads/shape-checks the head's own tensors — no MTP
 // forward yet, so these tests validate LOADING + the `h`-tap primitive Phase 2 needs, not drafting.
 
@@ -1346,7 +1346,7 @@ fn qwen35_4b_mtp() -> Option<PathBuf> {
 /// a gated-DeltaNet layer and fail on missing `ssm_*` tensors — see `Config::n_layer_nextn`'s doc).
 /// `mtp::load_mtp_head` must then find every required head tensor and correctly report the three
 /// optional `nextn.*` fallback tensors ABSENT — this shipped GGUF's live path is 100% fallback to
-/// the main model's `token_embd`/`output`/`output_norm` (see `docs/MTP.md`'s confirmed dump).
+/// the main model's `token_embd`/`output`/`output_norm` (see `docs/mtp.md`'s confirmed dump).
 #[test]
 fn mtp_gguf_loads() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
@@ -1391,7 +1391,7 @@ fn mtp_gguf_loads() {
         head.shared_head_norm.as_ref().map(|t| &t.shape)
     );
 
-    // Confirmed dump (docs/MTP.md): the shipped GGUF omits `embed_tokens`/`shared_head_head` (so
+    // Confirmed dump (docs/mtp.md): the shipped GGUF omits `embed_tokens`/`shared_head_head` (so
     // those fall back to the main model's `token_embd`/tied lm_head) but DOES ship its own
     // `shared_head_norm` (unlike the other two, this one is NOT a fallback in this GGUF).
     assert!(head.embed_tokens.is_none(), "confirmed absent in this GGUF");
@@ -1401,7 +1401,7 @@ fn mtp_gguf_loads() {
     );
     assert!(
         head.shared_head_norm.is_some(),
-        "confirmed PRESENT in this GGUF (docs/MTP.md)"
+        "confirmed PRESENT in this GGUF (docs/mtp.md)"
     );
 }
 
@@ -1491,13 +1491,13 @@ fn h_tap_matches_lm_head() {
 
 // ─── MTP Phase 2: the head forward + the draft loop (issue #33) ─────────────────────────────
 //
-// See docs/MTP.md. Phase 2 builds the head's own 1-layer forward + the catch_up/draft driver
+// See docs/mtp.md. Phase 2 builds the head's own 1-layer forward + the catch_up/draft driver
 // primitives (`crate::mtp`) — these tests drive the ACTUAL 4B MTP GGUF's head, not just load it.
 
 /// Prime a fresh [`infr_llama::mtp::MtpHeadSession`] over `prompt_tokens`: prefill the TRUNK on the
 /// CPU backend (capturing `h` for every prompt row via the Phase-1 VERIFY tap), then `catch_up` the
 /// head over the whole prompt in one call. Returns the session plus `(last_token, pending_h)` —
-/// `draft`'s starting point (`docs/MTP.md`'s `process()`/`pending_h` handoff).
+/// `draft`'s starting point (`docs/mtp.md`'s `process()`/`pending_h` handoff).
 fn prime_head<'a>(
     model: &'a infr_llama::SeamModel,
     head: &infr_llama::mtp::MtpHeadWeights,
@@ -1522,7 +1522,7 @@ fn prime_head<'a>(
     )
     .expect("MtpHeadSession::new_cpu");
 
-    // docs/MTP.md's process(): the head decodes the SAME tokens with `h` shifted right by one
+    // docs/mtp.md's process(): the head decodes the SAME tokens with `h` shifted right by one
     // (`embd[i] = h_tgt[i-1]`); row 0 has no predecessor in a fresh session, so it's paired with a
     // zero `pending_h` (`speculative.cpp`'s `pending_h` starts zero-initialized — see
     // `common_speculative_impl_draft_mtp`'s ctor, `pending_h.assign(n_seq, vector<float>(n_embd,
@@ -1540,7 +1540,7 @@ fn prime_head<'a>(
 
 /// The head forward, end to end, on the real 4B MTP GGUF: prefill a short prompt on the TRUNK
 /// (capturing `h` via the Phase-1 tap), `catch_up` the head over it, then `draft` 6 tokens
-/// (`--spec-draft-n-max 6`, matching `docs/MTP.md`'s oracle run). Asserts every logits row is
+/// (`--spec-draft-n-max 6`, matching `docs/mtp.md`'s oracle run). Asserts every logits row is
 /// finite (no NaN/Inf — the eh_proj concat layout is exactly the kind of bug that would show up as
 /// garbage here) and prints the drafted ids + top-1 probabilities.
 #[test]
@@ -1722,7 +1722,7 @@ fn mtp_draft_chain_matches_per_step() {
     }
 }
 
-/// Oracle-invariant fallback (`docs/MTP.md`'s validation ladder — capturing the oracle's OWN
+/// Oracle-invariant fallback (`docs/mtp.md`'s validation ladder — capturing the oracle's OWN
 /// verbose drafted-token trace proved impractical: llama.cpp's `SPC_DBG`/`SPC_TRC` macros gate on
 /// `common_log`'s verbosity, not a dedicated spec-debug env var, and piping a live CPU generation's
 /// stderr for a handful of draft steps is a lot of process-control machinery for what this simpler
@@ -1730,7 +1730,7 @@ fn mtp_draft_chain_matches_per_step() {
 /// measure how often the trunk's argmax agrees with what the head drafted — the PER-STEP acceptance
 /// probability `alpha` a real spec-verify pass would see (stops at the first mismatch, like a real
 /// verify). For `n_max=6` and i.i.d. per-step acceptance `alpha`, expected tokens/cycle is `(1 -
-/// alpha^7) / (1 - alpha)`; solving that for the oracle's captured 2.0x (`docs/MTP.md`) gives
+/// alpha^7) / (1 - alpha)`; solving that for the oracle's captured 2.0x (`docs/mtp.md`) gives
 /// `alpha ≈ 0.5`, not a flat 60-80% — this test reports the measured per-prompt rate (averaged over
 /// a couple of short prompts to dilute single-prompt noise) against that ~0.5 reference rather than
 /// hard-gating on a specific number (still a coarse sanity check, not a benchmark).
@@ -1820,13 +1820,13 @@ fn mtp_head_trunk_acceptance_rate() {
 
 // ─── MTP Phase 3: the self-speculative generation loop (issue #33) ──────────────────────────────
 //
-// See docs/MTP.md. Phase 3 wires the head into a full generation loop (`crate::mtp::
+// See docs/mtp.md. Phase 3 wires the head into a full generation loop (`crate::mtp::
 // generate_mtp_spec_vulkan`) on the production Vulkan seam — these tests drive THAT loop, not the
 // head primitives directly (Phase 2's tests above already cover those in isolation).
 
 /// **The Phase 3 hard bar**: self-speculative MTP decoding must be output-IDENTICAL to plain
 /// target-only greedy decoding on the SAME (real, production) Vulkan seam — the spec ≡
-/// target-greedy invariant `docs/MTP.md`'s own oracle run holds ("byte-identical output"). No
+/// target-greedy invariant `docs/mtp.md`'s own oracle run holds ("byte-identical output"). No
 /// tolerance, no golden hash — a real string equality on a real generation. If this fails, the
 /// accept/commit/KV logic is wrong (see `crate::mtp::generate_mtp_spec_vulkan`'s doc on the
 /// KV-overwrite/no-rewind semantics it relies on) — debug that, don't relax this assertion.
@@ -2198,7 +2198,7 @@ fn cpu_golden_gemma4_e2b() {
 // expert on EVERY layer) ──────────────────────────────────────────────────────────────────────
 //
 // `general.architecture == "qwen35moe"` — the routed-expert sibling of dense `qwen35` (see
-// `docs/QWEN35.md` + `arch::QWEN35_MOE`'s doc). 256 experts / 8 used / 512-wide, plus a
+// `docs/qwen35.md` + `arch::QWEN35_MOE`'s doc). 256 experts / 8 used / 512-wide, plus a
 // Qwen2-MoE-style shared expert (`ffn_*_shexp`, sigmoid-gated via `ffn_gate_inp_shexp`) — both on
 // EVERY layer (DeltaNet and full-attention alike, confirmed against the actual GGUF tensor list
 // and llama.cpp's `qwen35moe.cpp::build_layer_ffn`). UD-Q4_K_M chosen over the smaller UD-IQ*
@@ -2469,7 +2469,7 @@ fn gemma4_12b() -> Option<PathBuf> {
 // Phase 1 scope only: Config + weight loading + a CAUSAL PROMPT PREFILL through the unified
 // runner (dual FFN — dense GeGLU ∥ 128-expert MoE with a fused gate_up_exps + per-expert down
 // scale, encoder-scalar per-layer output, heterogeneous per-layer attn dims). No canvas/denoise —
-// see docs/DIFFUSIONGEMMA.md. 26B-A4B Q4_K_M is large (16 GB); a CPU prefill of ~16 tokens takes
+// see docs/diffusion-gemma.md. 26B-A4B Q4_K_M is large (16 GB); a CPU prefill of ~16 tokens takes
 // on the order of a minute.
 
 fn diffusion_gemma_model() -> Option<PathBuf> {
@@ -2598,7 +2598,7 @@ fn gpu_seam_matches_cpu_diffusion_gemma() {
 //
 // One bidirectional forward over the C canvas rows, reusing the prompt KV Phase 1's causal
 // prefill already wrote (encoder scalars, rows 0..P) — decoder scalars, the `AttnMask::Canvas`
-// bidirectional mask, and (optionally) self-conditioning. See docs/DIFFUSIONGEMMA.md.
+// bidirectional mask, and (optionally) self-conditioning. See docs/diffusion-gemma.md.
 
 /// CPU-only: prefill a short prompt, then ONE denoise forward over an all-mask canvas
 /// (`sc_logits=None`, matching the reference's step-0 zero-SC gate). Also proves the WriteKv
@@ -2742,7 +2742,7 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
         .expect("vulkan session");
     vk_session.prefill(&model, &tokens).expect("vulkan prefill");
     let t1 = std::time::Instant::now();
-    // `u: None` opts out of the perf-slice-3 GPU reducer (docs/DIFFUSIONGEMMA.md) — this test
+    // `u: None` opts out of the perf-slice-3 GPU reducer (docs/diffusion-gemma.md) — this test
     // wants the FULL `[canvas_len, vocab]` array back for its row-by-row cosine comparison below,
     // not just the reduced {argmax, entropy, sampled}.
     let gpu_outcome = vk_session
@@ -2904,7 +2904,7 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
 //
 // The full block-diffusion decode (`infr_llama::diffusion::diffusion_generate`) driven on the
 // Vulkan session, for the same chat-templated prompt the oracle (`llama-diffusion-cli`) was run
-// on (see docs/DIFFUSIONGEMMA.md's "Oracle reference outputs"). NOT a token-identical check (a
+// on (see docs/diffusion-gemma.md's "Oracle reference outputs"). NOT a token-identical check (a
 // 128-expert top-8 MoE model's CPU-vs-Vulkan routing legitimately diverges — the same class of
 // divergence `gpu_seam_matches_cpu_diffusion_gemma[_denoise]` above already calibrate against);
 // this asserts the DECODED TEXT is coherent (contains "Paris") and prints both texts + step/block
@@ -2971,7 +2971,7 @@ fn diffusion_gemma_decode_matches_oracle() {
     );
     println!("infr   text: {text:?}");
     // Oracle reference (CPU, `-p \"What is the capital of France?\" -n 64 -s 42 --temp 0`, captured
-    // 2026-07-05 — see docs/DIFFUSIONGEMMA.md): 10 EB steps, 1 block, thinking span then "The
+    // 2026-07-05 — see docs/diffusion-gemma.md): 10 EB steps, 1 block, thinking span then "The
     // capital of France is Paris."
     println!(
         "oracle text: \"<|channel>thought\\nThe user is asking for the capital of France.\\n    \

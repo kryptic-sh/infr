@@ -157,7 +157,7 @@ O(kv_len) chain:
 - **`attention_*`** — the lean one-simdgroup-per-(query, head) kernel for
   short-context leftovers.
 - **`attention_canvas_*` / `attention_canvas32_*`** (Phase D, DiffusionGemma
-  denoise, `AttnMask::Canvas` — see `docs/DIFFUSIONGEMMA.md`) — every row
+  denoise, `AttnMask::Canvas` — see `docs/diffusion-gemma.md`) — every row
   attends the SAME fixed bidirectional `[lo, kv_len)` regardless of its own
   position, which none of the kernels above can express (they all derive their
   bound from `pos + row_index`). A dedicated `ATTNSPLIT_CANVAS_KERNEL` family
@@ -234,19 +234,19 @@ MoE decode tapes (the device expert path resolves all data dependence on-GPU),
 and so does the llama arch (`Op::Rope` reads the bound positions buffer,
 replay-safe by construction).
 
-**The tape is a per-backend cache matched on a `(op-sequence,
-bound-buffer-address)` fingerprint, and it is invalidated on `compile()`.** That
-invalidation is load-bearing correctness, not hygiene: the fingerprint can
-COLLIDE across independent compile+execute calls once the allocator reuses a
-freed buffer's address, which would replay a structurally-stale tape (garbage /
-zeroed output). Only the seam's decode loop — which compiles its plan ONCE and
-executes it per token — keeps a live tape; any code that recompiles a
-decode-shaped graph with fresh IO buffers (the MTP head, which rebuilt a
-rows==1 rope+attention graph every draft step) records afresh instead. This was
-a real bug: the MTP head intermittently replayed a stale zeroed tape, dropping
-its draft acceptance from 0.82 to 0.26 with no error anywhere. When repeated-
-compile GPU output is intermittently zero/garbage, suspect the tape fingerprint
-FIRST.
+**The tape is a per-backend cache matched on a
+`(op-sequence, bound-buffer-address)` fingerprint, and it is invalidated on
+`compile()`.** That invalidation is load-bearing correctness, not hygiene: the
+fingerprint can COLLIDE across independent compile+execute calls once the
+allocator reuses a freed buffer's address, which would replay a
+structurally-stale tape (garbage / zeroed output). Only the seam's decode loop —
+which compiles its plan ONCE and executes it per token — keeps a live tape; any
+code that recompiles a decode-shaped graph with fresh IO buffers (the MTP head,
+which rebuilt a rows==1 rope+attention graph every draft step) records afresh
+instead. This was a real bug: the MTP head intermittently replayed a stale
+zeroed tape, dropping its draft acceptance from 0.82 to 0.26 with no error
+anywhere. When repeated- compile GPU output is intermittently zero/garbage,
+suspect the tape fingerprint FIRST.
 
 ## Linear attention (DeltaNet / Qwen3-Next)
 
@@ -336,9 +336,9 @@ quantized Linear every (format × kernel shape) pair including partial tiles, th
 small-m split-K regime at real verify shapes, and deep-coupled quant-KV
 attention at kv_len=2048; attention covers
 unsplit/split8/split32/flash/flash2/vec, sliding windows at both tile and block
-granularity, partial query tiles, the retained hd=72/96 routes, and the
-hd=256 rows==1 short-kv `attnsplit` + hd=256 partial-rope (`freq_base` 1e7)
-cases the MTP head decode exercises (which nothing taped ever reaches).
+granularity, partial query tiles, the retained hd=72/96 routes, and the hd=256
+rows==1 short-kv `attnsplit` + hd=256 partial-rope (`freq_base` 1e7) cases the
+MTP head decode exercises (which nothing taped ever reaches).
 `tests/kernel_names.rs` — the missing-kernel tripwire: every kernel-shaped
 literal in exec.rs must resolve in the compiled library (the cap-check fallback
 otherwise turns a vanished kernel into silent perf loss — it happened once, 3×
@@ -410,7 +410,7 @@ a new evidence class or new hardware:
   (cross-backend), amplified on Metal only because f16 alpha (0.82) is below the
   Vulkan reference (~0.95). No Metal-side lever; measured and handed back.
 - DiffusionGemma batched MoE (Phase D left this unbuilt, see
-  `docs/DIFFUSIONGEMMA.md`): the fused `ffn_gate_up_exps`/`ffn_down_exps` layout
-  doesn't fit the device MoE kernels' assumed shape, so DG's MoE FFN still runs
-  a per-token host loop on Metal — the biggest remaining DG perf gap, and too
-  large to build blind (needs hardware to iterate against).
+  `docs/diffusion-gemma.md`): the fused `ffn_gate_up_exps`/`ffn_down_exps`
+  layout doesn't fit the device MoE kernels' assumed shape, so DG's MoE FFN
+  still runs a per-token host loop on Metal — the biggest remaining DG perf gap,
+  and too large to build blind (needs hardware to iterate against).

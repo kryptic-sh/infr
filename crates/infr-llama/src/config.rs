@@ -52,7 +52,7 @@ pub struct Config {
     /// gemma4: adds per-layer heterogeneous head dims (the `*_swa` fields), a weightless RMSNorm on V,
     /// attention scale 1.0 (no 1/√d — QK-norm handles magnitude), a final logit softcap, and
     /// proportional RoPE (freq_factors) on the full-attention layers. `true` for gemma4 AND
-    /// diffusion-gemma (its backbone is gemma4's, verbatim — see `docs/DIFFUSIONGEMMA.md`); use
+    /// diffusion-gemma (its backbone is gemma4's, verbatim — see `docs/diffusion-gemma.md`); use
     /// `diffusion_gemma` below to gate the DIFFERENCES (dual FFN, encoder/decoder output scalars).
     pub gemma4: bool,
     /// diffusion-gemma (block text-diffusion MoE on the gemma4 backbone): `true` only for
@@ -74,7 +74,7 @@ pub struct Config {
     /// mask_token_id`). Unused until the denoise decode loop (Phase 3). `0` for every other model.
     pub mask_token_id: u32,
     /// diffusion-gemma: the entropy-bound sampler's parameters (Phase 3 — see
-    /// `docs/DIFFUSIONGEMMA.md`'s "Decode loop" section and `diffusion_generate_entropy_bound` in
+    /// `docs/diffusion-gemma.md`'s "Decode loop" section and `diffusion_generate_entropy_bound` in
     /// the reference `examples/diffusion/diffusion.cpp`). Parsed from `diffusion.eb_*` GGUF
     /// metadata with the reference's own fallbacks (`diffusion-cli.cpp`'s `meta_f`/`meta_i`
     /// defaults) when a key is absent. All zero/unused for every non-diffusion-gemma model.
@@ -114,7 +114,7 @@ pub struct Config {
     /// qwen35: attention layers sit at `i` where `(i+1) % full_attn_interval == 0`; every other
     /// layer is gated-DeltaNet linear attention. `0` for every non-qwen35 model (never read).
     pub full_attn_interval: usize,
-    /// qwen35 SSM (gated-DeltaNet) dims — see `docs/QWEN35.md`. `0` for non-qwen35 models.
+    /// qwen35 SSM (gated-DeltaNet) dims — see `docs/qwen35.md`. `0` for non-qwen35 models.
     pub ssm_d_conv: usize,
     pub ssm_d_state: usize,
     pub ssm_d_inner: usize,
@@ -128,9 +128,9 @@ pub struct Config {
     pub rope_sections: [u32; 4],
     /// qwen35 attention layers pack `q` and an output SIGMOID gate INTERLEAVED per head in
     /// `attn_q` (`[h0 q(hd) | h0 gate(hd) | h1 q | h1 gate | …]`, NOT two contiguous blocks) —
-    /// the one real trap in `docs/QWEN35.md`. `true` only for qwen35.
+    /// the one real trap in `docs/qwen35.md`. `true` only for qwen35.
     pub attn_out_gate: bool,
-    /// MTP/NextN (Qwen3.5/3.6, issue #33 — see `docs/MTP.md`): the number of extra decoder blocks
+    /// MTP/NextN (Qwen3.5/3.6, issue #33 — see `docs/mtp.md`): the number of extra decoder blocks
     /// `{arch}.block_count` includes BEYOND the trunk (`{arch}.nextn_predict_layers`). `n_layer`
     /// above is already the TRUNK count (`block_count - n_layer_nextn`) — every existing field/
     /// helper on this `Config` keeps working unmodified. `0` for every model without an MTP head
@@ -278,7 +278,7 @@ impl Config {
             && self.full_attn_interval > 0
             && (il + 1).is_multiple_of(self.full_attn_interval)
     }
-    /// qwen35 gated-DeltaNet derived dims (see `docs/QWEN35.md`) — ports of the old seam's `Cfg`
+    /// qwen35 gated-DeltaNet derived dims (see `docs/qwen35.md`) — ports of the old seam's `Cfg`
     /// helpers of the same name, now living on the shared `Config`.
     pub fn q35_num_k_heads(&self) -> usize {
         self.ssm_n_group
@@ -321,7 +321,7 @@ impl Config {
             | crate::arch::GEMMA3
             | crate::arch::GEMMA4
             | crate::arch::DIFFUSION_GEMMA => true,
-            // qwen35's full-attention layers are qk-normed like qwen3/gemma (see `docs/QWEN35.md`).
+            // qwen35's full-attention layers are qk-normed like qwen3/gemma (see `docs/qwen35.md`).
             // Kept as its own match arm (rather than folded into `arch::TRANSFORMER` above) because
             // `is_qwen35` gates a handful of qwen35-only fields below it; the error message renders
             // both lists so the supported set can't drift from the match arms above. `QWEN35_MOE`
@@ -354,7 +354,7 @@ impl Config {
         let llama4 = arch == crate::arch::LLAMA4;
         let diffusion_gemma = arch == crate::arch::DIFFUSION_GEMMA;
         // diffusion-gemma's backbone IS gemma4's (heterogeneous per-layer dims, V-norm,
-        // freq_factors, softcap) verbatim — see docs/DIFFUSIONGEMMA.md — so it folds into the same
+        // freq_factors, softcap) verbatim — see docs/diffusion-gemma.md — so it folds into the same
         // gate as every other gemma4-shared parse below. `diffusion_gemma` gates only what's
         // actually different (dual FFN, canvas/mask fields, encoder-scalar tensor name).
         let gemma4 = arch == crate::arch::GEMMA4 || diffusion_gemma;
@@ -374,7 +374,7 @@ impl Config {
         let qwen35 = arch == crate::arch::QWEN35 || qwen35_moe;
         let mk = |k: &str| format!("{arch}.{k}");
         let n_layer_all = meta_u64(g, &mk("block_count")).context("block_count")? as usize;
-        // MTP/NextN (Qwen3.5/3.6, issue #33 — see docs/MTP.md): `{arch}.nextn_predict_layers`
+        // MTP/NextN (Qwen3.5/3.6, issue #33 — see docs/mtp.md): `{arch}.nextn_predict_layers`
         // extra decoder block(s) appended AFTER the trunk — `block_count` INCLUDES them. Ported
         // from the reference loader's `hparams.n_layer_nextn`
         // (`llama.cpp/src/models/qwen35.cpp::load_arch_hparams`). The confirmed 4B MTP GGUF sets
@@ -397,7 +397,7 @@ impl Config {
         if n_layer_nextn > 1 {
             bail!(
                 "qwen35 MTP: nextn_predict_layers={n_layer_nextn} > 1 not supported (the \
-                 reference implementation caps at a single MTP block — see docs/MTP.md)",
+                 reference implementation caps at a single MTP block — see docs/mtp.md)",
             );
         }
         if n_layer_nextn >= n_layer_all {

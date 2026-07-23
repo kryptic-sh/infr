@@ -3614,7 +3614,7 @@ fn copy_parity() {
     assert_parity(&g, &bound, dst, n, 0.0);
 }
 
-// ---- DiffusionGemma canvas denoise (Phase D — docs/DIFFUSIONGEMMA.md, `AttnMask::Canvas`) ----
+// ---- DiffusionGemma canvas denoise (Phase D — docs/diffusion-gemma.md, `AttnMask::Canvas`) ----
 // Metal's blind implementation (attention_canvas*/attention_canvas32* in attention.metal, see
 // exec.rs's `canvas_lo` routing) checked against the CPU reference — the SAME numeric-parity
 // contract every other attention tier in this file gets. Unlike a bare "doesn't return

@@ -2,7 +2,7 @@
 //! [`backend::Backend`] (GPU), [`loader::WeightSource`] (format), plus the
 //! [`graph::Graph`]/[`tensor`] vocabulary the model layer builds against.
 //!
-//! Nothing here is GPU- or model-specific. See docs/PLAN.md.
+//! Nothing here is GPU- or model-specific. See docs/plan.md.
 
 pub mod backend;
 pub mod error;

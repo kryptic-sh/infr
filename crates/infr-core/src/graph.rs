@@ -2,7 +2,7 @@
 //!
 //! The model layer builds a [`Graph`] — an explicit, ordered list of semantic [`Op`]s over
 //! typed [`TensorId`] handles — and a [`crate::backend::Backend`] compiles + executes it
-//! however it likes (Vulkan SPIR-V, CPU loops, CUDA, ROCm, Metal, MLX). See docs/PLAN.md
+//! however it likes (Vulkan SPIR-V, CPU loops, CUDA, ROCm, Metal, MLX). See docs/plan.md
 //! "The backend abstraction".
 //!
 //! ## Why an op-list, not a pure DAG
@@ -30,7 +30,7 @@ pub enum AttnMask {
     /// Causal sliding-window attention with the given window size (in tokens).
     SlidingWindow(usize),
     /// DiffusionGemma canvas denoise mask (bidirectional, NOT causal — see
-    /// `docs/DIFFUSIONGEMMA.md`'s "Seam extensions" and the reference
+    /// `docs/diffusion-gemma.md`'s "Seam extensions" and the reference
     /// `llm_graph_input_attn_diffusion_decode::set_input` in `diffusion-gemma.cpp`): EVERY query
     /// row attends the SAME fixed range `[lo, kv_len)` regardless of its own row index — `pos`/
     /// per-row causal bounds are ignored entirely. `lo = 0` on full-attention layers (every
@@ -130,7 +130,7 @@ pub enum Op {
         w_off: u32,
     },
     /// Row-wise softmax: `dst[r, :] = softmax(x[r, :] * scale)` over `dim` columns, `rows` rows.
-    /// diffusion-gemma's in-graph self-conditioning (see `docs/DIFFUSIONGEMMA.md`'s Phase-B and
+    /// diffusion-gemma's in-graph self-conditioning (see `docs/diffusion-gemma.md`'s Phase-B and
     /// the reference's `dg_canvas_embed`): softmaxes the previous step's canvas logits over the
     /// FULL vocab before the soft-embedding matmul. `scale` is baked in so a temperature that
     /// changes per call doesn't need a separate `Scale` op ahead of this one — production code
@@ -169,7 +169,7 @@ pub enum Op {
     },
     /// Fused per-head RMSNorm + SiLU gate multiply: `QkNorm` immediately followed by an
     /// `Op::GatedAct` (`Activation::Silu`) consuming QkNorm's own output (qwen35's DeltaNet
-    /// silu-gated RMSNorm — see docs/QWEN35.md). One pass: for each of `rows * n_head` heads,
+    /// silu-gated RMSNorm — see docs/qwen35.md). One pass: for each of `rows * n_head` heads,
     /// `dst[i] = (x[i] * rms_scale * weight[i]) * silu(gate[i])` where `rms_scale =
     /// 1/sqrt(mean_head(x^2) + eps)` and `i` ranges over the head's `head_dim` elements. `gate` is
     /// a same-shape `[rows, n_head*head_dim]` buffer, indexed by the SAME flat element position as
@@ -313,7 +313,7 @@ pub enum Op {
     /// Broadcast elementwise multiply: `dst[r*n+c] = x[r*n+c] * vec[c]` for `r` in `0..rows`, `c`
     /// in `0..n` — the multiplicative twin of [`Op::AddBias`]. `vec` is a length-`n` weight
     /// (diffusion-gemma's router input scale `ffn_gate_inp.scale`, applied to the router's
-    /// rmsnorm-noscale'd input before the router `Linear`; see `docs/DIFFUSIONGEMMA.md`).
+    /// rmsnorm-noscale'd input before the router `Linear`; see `docs/diffusion-gemma.md`).
     MulVec {
         x: TensorId,
         vec: TensorId,
@@ -422,7 +422,7 @@ pub enum Op {
         n: u32,
     },
     /// Mixture-of-experts FFN for a single token row (qwen3moe; diffusion-gemma's MoE branch — see
-    /// `docs/DIFFUSIONGEMMA.md`). The router (`Linear` of `router_x[ne] → n_expert`) is softmaxed,
+    /// `docs/diffusion-gemma.md`). The router (`Linear` of `router_x[ne] → n_expert`) is softmaxed,
     /// the top-`n_used` experts selected, their softmax weights renormalized, and each runs a gated
     /// FFN on `x` (`act(gate·x) * (up·x)`, then `down·`); the outputs are summed weighted by the
     /// renormalized weights × `scale` into `dst[ne]` (the residual contribution).

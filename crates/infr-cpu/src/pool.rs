@@ -70,7 +70,7 @@ pub(crate) struct SpinPool {
 /// regrows on jobs arriving mid-spin, so the ceiling can be generous. `INFR_CPU_SPIN` overrides.
 static SPIN_LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
-// per-call leaf, too small to probe (see docs/PERF.md)
+// per-call leaf, too small to probe (see docs/perf.md)
 #[cfg_attr(infr_profile, infr_prof::skip)]
 fn spin_limit() -> u32 {
     *SPIN_LIMIT.get_or_init(|| {

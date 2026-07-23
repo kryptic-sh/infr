@@ -3,7 +3,7 @@
 //! Reference: `~/Projects/llama.cpp/ggml/src/ggml-vulkan/` and its `vulkan-shaders/*.comp`
 //! (reuse the tuned quant matmul / dequant / attention shaders). Enable device features
 //! `VK_KHR_cooperative_matrix`, `shaderFloat16`, `VK_KHR_16bit_storage`,
-//! `VK_KHR_shader_subgroup_extended_types`. See docs/PLAN.md.
+//! `VK_KHR_shader_subgroup_extended_types`. See docs/plan.md.
 #![allow(dead_code)]
 // GPU kernel record/dispatch APIs bind many distinct buffers (weights, scales, activations,
 // scratch) — wide signatures are inherent here, not a refactor smell.
@@ -3390,7 +3390,7 @@ impl Backend for VulkanBackend {
         self.dense_pager.lock().unwrap().is_some()
     }
 
-    /// DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): one eager dispatch of
+    /// DiffusionGemma perf slice 3 (docs/diffusion-gemma.md): one eager dispatch of
     /// `dg_eb_sample` + a synchronous wait (`Recorder::finish`) — this isn't part of a cached
     /// [`Plan`], it runs once per denoise step right after that step's forward `execute()`, on
     /// the same `logits` buffer the forward just wrote (still GPU-resident).

@@ -5,7 +5,7 @@ use std::process::Command;
 fn main() {
     // INFR_PROFILE=1 at build time -> cfg(infr_profile) -> #[cfg_attr(infr_profile,
     // infr_prof::instrument)] annotations become live and inject profiling spans into every fn.
-    // Default builds get NO cfg and zero profiling code. See docs/PERF.md.
+    // Default builds get NO cfg and zero profiling code. See docs/perf.md.
     println!("cargo:rerun-if-env-changed=INFR_PROFILE");
     println!("cargo:rustc-check-cfg=cfg(infr_profile)");
     if std::env::var("INFR_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0") {
@@ -2469,7 +2469,7 @@ fn main() {
         ("argmax_prob", "argmax_prob_part", &[]),
         ("argmax_prob", "argmax_prob", &["-DPASS2"]),
         ("moe_sample", "moe_sample", &[]),
-        // DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): fused per-row entropy-bound
+        // DiffusionGemma perf slice 3 (docs/diffusion-gemma.md): fused per-row entropy-bound
         // sampler reduction — argmax/entropy/CDF-sample over [rows, vocab] logits on-GPU.
         ("dg_eb_sample", "dg_eb_sample", &[]),
         ("moe_bucket_count", "moe_bucket_count", &[]),

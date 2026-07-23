@@ -59,7 +59,7 @@ pub(crate) fn make_compute_kernel(
         panic!(
             "create_shader_module failed for kernel {name:?}: {e} — recoverable driver/alloc \
              failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel build does not yet \
-             thread Result (see AUDIT.md ops.rs finding 2)"
+             thread Result (see docs/audit.md ops.rs finding 2)"
         )
     });
 
@@ -84,7 +84,7 @@ pub(crate) fn make_compute_kernel(
             panic!(
                 "create_descriptor_set_layout failed for kernel {name:?}: {e} — recoverable \
                  driver/alloc failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel \
-                 build does not yet thread Result (see AUDIT.md ops.rs finding 2)"
+                 build does not yet thread Result (see docs/audit.md ops.rs finding 2)"
             )
         });
 
@@ -102,7 +102,7 @@ pub(crate) fn make_compute_kernel(
             panic!(
                 "create_pipeline_layout failed for kernel {name:?}: {e} — recoverable driver/alloc \
                  failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel build does not \
-                 yet thread Result (see AUDIT.md ops.rs finding 2)"
+                 yet thread Result (see docs/audit.md ops.rs finding 2)"
             )
         });
 
@@ -162,7 +162,7 @@ pub(crate) fn make_compute_kernel(
         panic!(
             "create_descriptor_pool failed for kernel {name:?}: {e} — recoverable driver/alloc \
              failure (e.g. OUT_OF_DEVICE_MEMORY) during kernel compile; kernel build does not yet \
-             thread Result (see AUDIT.md ops.rs finding 2)"
+             thread Result (see docs/audit.md ops.rs finding 2)"
         )
     });
 

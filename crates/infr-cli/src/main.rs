@@ -1,5 +1,5 @@
 //! `infr` CLI — `pull` / `run` / `serve`, all over the same engine + backend.
-//! See docs/PLAN.md "Product surface".
+//! See docs/plan.md "Product surface".
 
 use clap::{Parser, Subcommand};
 
@@ -845,7 +845,7 @@ fn build_chat_model(
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
     let backend = selected_backend()?;
     if is_dg {
-        // diffusion-gemma (Phase 3/D, docs/DIFFUSIONGEMMA.md): the entropy-bound block-diffusion
+        // diffusion-gemma (Phase 3/D, docs/diffusion-gemma.md): the entropy-bound block-diffusion
         // loop over a persistent session — Vulkan by default, CPU under INFR_DEV=cpu, Metal under
         // INFR_DEV=metal (the non-macOS build still compiles the Metal arm; `DiffusionGemmaChat::generate`
         // errors clearly at runtime there).
@@ -914,7 +914,7 @@ fn cmd_run(model: &str, message: Option<&str>) -> anyhow::Result<()> {
             .unwrap_or(d)
     };
     let (gguf, tok) = resolve(model)?;
-    // diffusion-gemma (block text-diffusion, Phase 3 — docs/DIFFUSIONGEMMA.md): a cheap arch peek
+    // diffusion-gemma (block text-diffusion, Phase 3 — docs/diffusion-gemma.md): a cheap arch peek
     // (no full SeamModel load) so the default token budget below and the ChatModel selection further
     // down can both branch on it. -n/max_new drives `blocks = ceil(n_predict / canvas_length)`
     // (256-token canvas) rather than autoregressive tokens, so the AR default of 2048 would run 8
@@ -1181,7 +1181,7 @@ const DG_VISUAL_COLS: usize = 120;
 use std::io::{IsTerminal, Write as _};
 
 /// `INFR_DIFFUSION_VISUAL` live denoise canvas view for `infr run` (diffusion-gemma only — see
-/// `docs/DIFFUSIONGEMMA.md`, ports the UX idea of the oracle's `--diffusion-visual` without
+/// `docs/diffusion-gemma.md`, ports the UX idea of the oracle's `--diffusion-visual` without
 /// depending on it): per step, decode the block's CURRENT canvas fresh with a throwaway tokenizer
 /// ([`OaiRenderer::decode_ids`] — cheap, ≤ canvas_len tokens, no GPU work), render accepted
 /// (committed) runs as normal text and not-yet-accepted (still renoising — this sampler has no
@@ -1788,7 +1788,7 @@ fn cmd_bench(
     } else {
         selected_backend()?
     };
-    // diffusion-gemma (Phase 4/D, docs/DIFFUSIONGEMMA.md): llama-bench has no diffusion mode, so
+    // diffusion-gemma (Phase 4/D, docs/diffusion-gemma.md): llama-bench has no diffusion mode, so
     // `infr bench` measures infr's OWN decode shape (block prefill + canvas denoise, see
     // `cmd_bench_diffusion_gemma`'s doc) instead of routing through the AR pp/tg arms below.
     if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
@@ -1878,7 +1878,7 @@ fn cmd_bench(
 /// [`infr_llama::mtp::generate_mtp_spec_vulkan_timed`] on a synthetic text prompt sized to match
 /// `-p`/`-d` (the same "repeat a fixed sentence to ~N tokens" convention used below —
 /// the MTP driver takes a rendered PROMPT, not raw token ids, unlike `bench_vulkan`'s dummy-id
-/// arm), once per rep (no persistent MTP session yet — `docs/MTP.md`'s Phase 3 doc on
+/// arm), once per rep (no persistent MTP session yet — `docs/mtp.md`'s Phase 3 doc on
 /// `generate_mtp_spec_vulkan`'s per-call fresh trunk+head — so each rep re-pays the full weight
 /// upload; keep `-r` small for this arm), and aggregates the per-cycle draft/verify/catchup wall
 /// time into phase shares + the accept rate (alpha) via [`infr_llama::mtp::MtpTiming`].
@@ -2180,7 +2180,7 @@ fn cmd_bench_cpu(
 }
 
 /// Aggregated result of one diffusion-gemma decode measurement (Phase 4/E,
-/// `docs/DIFFUSIONGEMMA.md`): the same numbers `cmd_bench_diffusion_gemma` prints, factored out of
+/// `docs/diffusion-gemma.md`): the same numbers `cmd_bench_diffusion_gemma` prints, factored out of
 /// [`dg_bench_run`] so the compare arm (`ModelBench::dg_infr`) can read them directly instead of
 /// scraping this command's own stdout. `pp_ts`/`gen_ts`/`parallel_ts`/`steps` are already averaged
 /// over `reps`; `last_np`/`last_ng` are the LAST rep's actual prompt/gen token counts (matches
@@ -2200,7 +2200,7 @@ struct DgBenchResult {
     last_ng: usize,
 }
 
-/// Core diffusion-gemma decode loop (Phase 4, `docs/DIFFUSIONGEMMA.md`): drives
+/// Core diffusion-gemma decode loop (Phase 4, `docs/diffusion-gemma.md`): drives
 /// `crate::diffusion::diffusion_generate` directly over a persistent
 /// `DiffusionGemmaCpuSession`/`DiffusionGemmaVulkanSession` — the SAME primitive
 /// `DiffusionGemmaChat::generate` (run/serve) uses — rather than going through the generic
@@ -2219,7 +2219,7 @@ struct DgBenchResult {
 /// full `canvas_length`-token canvas per step, so besides the naive "committed tokens / decode
 /// secs" rate this also reports the oracle's own "in-step parallel" rate
 /// (`canvas_length * steps / decode_secs`, see the reference runs captured in
-/// `docs/DIFFUSIONGEMMA.md`) — the number that actually reflects how much forward-pass work ran.
+/// `docs/diffusion-gemma.md`) — the number that actually reflects how much forward-pass work ran.
 /// `-n 0` measures prefill only (pp, like every other arch's `-n 0`).
 ///
 /// `--pg` has no diffusion-shaped meaning (a denoise block isn't an ingest-then-reply AR turn) —
@@ -2406,7 +2406,7 @@ fn dg_bench_run(
     })
 }
 
-/// diffusion-gemma bench (Phase 4, `docs/DIFFUSIONGEMMA.md`): llama-bench has no diffusion mode
+/// diffusion-gemma bench (Phase 4, `docs/diffusion-gemma.md`): llama-bench has no diffusion mode
 /// (no llama.cpp comparison possible via `llama-bench` — this is infr-only reporting; `infr
 /// compare`'s DG arm instead shells `llama-diffusion-cli` from the fork directly, see
 /// `ModelBench::llama_diffusion`), so this drives [`dg_bench_run`] and formats its result. See
@@ -2625,7 +2625,7 @@ struct ModelBench {
     /// model in-process (`dg_bench_run`) rather than shelling out, so it needs this the same way
     /// `cmd_bench`/`cmd_run` do (see `resolve`'s doc comment).
     tok_path: Option<PathBuf>,
-    /// arch=diffusion-gemma (Phase 4/E, `docs/DIFFUSIONGEMMA.md`): gates the DG rows in
+    /// arch=diffusion-gemma (Phase 4/E, `docs/diffusion-gemma.md`): gates the DG rows in
     /// `cmd_compare`/`cmd_compare_sweep` — no upstream-merged `llama-bench` support exists for
     /// this arch, so it takes a completely different pair of measurement paths (`dg_infr` +
     /// `llama_diffusion`) instead of the standard `infr`/`llama` pp/tg arms.
@@ -2655,7 +2655,7 @@ impl ModelBench {
         // gets the matching `-hf`/`--hf-file` (or `-m` for a local path). Pull once up front so
         // `--offline` holds.
         let (resolved, tok_path) = resolve(model)?;
-        // diffusion-gemma (Phase 4/E, docs/DIFFUSIONGEMMA.md): the arch's PR isn't merged into
+        // diffusion-gemma (Phase 4/E, docs/diffusion-gemma.md): the arch's PR isn't merged into
         // mainline llama.cpp, so `llama-bench` can't run it — but the reference fork at
         // `~/Projects/mxaddict/llama.cpp-dg` builds `llama-diffusion-cli`, which IS a usable
         // oracle (see `ModelBench::llama_diffusion`/`llama_diffusion_cli_path`). `is_dg` routes
@@ -3055,11 +3055,11 @@ fn parse_llama_diffusion_cli_output(output: &str) -> Option<DgLlamaResult> {
 }
 
 /// diffusion-gemma's fixed decode length for the compare arm (Phase 4/E) — mirrors the oracle
-/// invocation quoted in `docs/DIFFUSIONGEMMA.md` (`-n 256`), so numbers seen here line up with
+/// invocation quoted in `docs/diffusion-gemma.md` (`-n 256`), so numbers seen here line up with
 /// numbers already captured there.
 const DG_N_GEN: usize = 256;
 
-/// diffusion-gemma's compare arm (Phase 4/E, `docs/DIFFUSIONGEMMA.md`): shared by
+/// diffusion-gemma's compare arm (Phase 4/E, `docs/diffusion-gemma.md`): shared by
 /// `cmd_compare`/`cmd_compare_sweep` at the point their old hard bail on `arch=diffusion-gemma`
 /// used to sit (`ModelBench::new` no longer bails — see `is_dg`'s doc comment). Runs BOTH tools'
 /// DG decode once at a fixed `-n 256` and returns the raw measurements; callers format their own

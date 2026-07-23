@@ -1,4 +1,4 @@
-//! MTP (multi-token prediction) head weights + forward for qwen35 (issue #33 — see `docs/MTP.md`).
+//! MTP (multi-token prediction) head weights + forward for qwen35 (issue #33 — see `docs/mtp.md`).
 //!
 //! Phase 1 scope: locate + shape-check the tensors the head's 1-layer graph needs (`load_mtp_head`
 //! below) — no ops, no forward.
@@ -6,7 +6,7 @@
 //! Phase 2 scope (this module's second half): the head's 1-layer forward as its own backend-generic
 //! `Graph` (`build_mtp_graph`, ported op-for-op from `seam.rs`'s qwen35 full-attention-layer
 //! emission — see that function's doc for the exact line citations) plus the two engine-level driver
-//! primitives `docs/MTP.md` specifies (`catch_up`/`draft`, porting `common/speculative.cpp`'s
+//! primitives `docs/mtp.md` specifies (`catch_up`/`draft`, porting `common/speculative.cpp`'s
 //! `common_speculative_impl_draft_mtp`). NO target-loop integration yet (Phase 3) — `MtpHeadSession`
 //! is a standalone session over the head's OWN 1-layer KV, driven by tokens/h-rows the CALLER
 //! supplies (from the trunk's `h_out` tap — Phase 1).
@@ -14,7 +14,7 @@
 //! The head layer sits at GGUF index `blk.{n_layer}` (`Config::n_layer` is already the TRUNK
 //! count — see `Config::n_layer_nextn`'s doc), one index past the trunk's last layer, and carries
 //! a FULL qwen35 attention-layer tensor set (same names/shapes/interleaved-q+gate layout as a
-//! trunk full-attention layer, `docs/QWEN35.md`) plus the `nextn.*` bridging tensors.
+//! trunk full-attention layer, `docs/qwen35.md`) plus the `nextn.*` bridging tensors.
 
 use anyhow::{anyhow, bail, Result};
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
@@ -33,7 +33,7 @@ pub type MtpTensor = TensorInfo;
 
 /// The qwen35 MTP head's tensors (see the module doc). Every required field here EXISTED in the
 /// GGUF and had the expected shape at [`load_mtp_head`] time; the three `Option` fields are the
-/// ones the reference allows to fall back to the main model's tensors when absent (`docs/MTP.md`'s
+/// ones the reference allows to fall back to the main model's tensors when absent (`docs/mtp.md`'s
 /// confirmed dump: the shipped 4B GGUF omits `embed_tokens`/`shared_head_head` — those two fall
 /// back — but DOES ship its own `shared_head_norm`).
 pub struct MtpHeadWeights {
@@ -55,12 +55,12 @@ pub struct MtpHeadWeights {
     pub ffn_down: MtpTensor,
     // ── NextN bridge (the tensors that make this an MTP head, not just another trunk layer) ──
     /// `[2*n_embd, n_embd]`: projects `concat(rmsnorm(embed(t)), rmsnorm(h_target))` down to
-    /// `n_embd` before the layer's own attention (see `docs/MTP.md`'s forward pseudocode).
+    /// `n_embd` before the layer's own attention (see `docs/mtp.md`'s forward pseudocode).
     pub eh_proj: MtpTensor,
     pub enorm: MtpTensor,
     pub hnorm: MtpTensor,
     /// Falls back to the main model's `token_embd.weight` when absent (the shipped 4B GGUF has no
-    /// `nextn.embed_tokens` — see `docs/MTP.md`'s confirmed dump).
+    /// `nextn.embed_tokens` — see `docs/mtp.md`'s confirmed dump).
     pub embed_tokens: Option<MtpTensor>,
     /// Falls back to the main model's (tied) lm_head when absent.
     pub shared_head_head: Option<MtpTensor>,
@@ -214,7 +214,7 @@ pub fn load_mtp_head(g: &Gguf, cfg: &crate::Config) -> Result<MtpHeadWeights> {
     })
 }
 
-// ─── Phase 2: the head forward + the draft primitives (issue #33 — see `docs/MTP.md`) ──────────
+// ─── Phase 2: the head forward + the draft primitives (issue #33 — see `docs/mtp.md`) ──────────
 
 /// A weight binder in the shape `seam.rs`'s (module-private) `BindWeight` uses: turns a
 /// native-dtype GGUF tensor into a backend buffer + the effective dtype it now holds. Named here
@@ -256,7 +256,7 @@ fn main_token_embd(g: &Gguf, ne: usize, vocab: usize) -> Result<MtpTensor> {
 }
 
 /// Resolve the head's OWN embedding table (`nextn.embed_tokens`, dequantized) when the GGUF ships
-/// one — `None` when it doesn't (the shipped 4B GGUF: `docs/MTP.md`'s confirmed dump), in which
+/// one — `None` when it doesn't (the shipped 4B GGUF: `docs/mtp.md`'s confirmed dump), in which
 /// case the caller passes the main model's already-dequantized `token_embd` straight to
 /// [`MtpHeadSession::new_cpu`]/[`new_vulkan`] instead.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -272,7 +272,7 @@ pub fn resolve_own_embed_table(g: &Gguf, head: &MtpHeadWeights) -> Result<Option
 /// SAME binder shape `seam.rs`'s `BindWeight` uses (zero-copy mmap on CPU, padded upload on
 /// Vulkan — see `MtpHeadSession::new_cpu`/`new_vulkan`), so the head's tensors land in memory
 /// exactly like the trunk's do. Falls back to the main model's `output_norm`/tied lm_head for the
-/// two optional NextN tensors that are absent (`docs/MTP.md`'s confirmed dump — `shared_head_norm`
+/// two optional NextN tensors that are absent (`docs/mtp.md`'s confirmed dump — `shared_head_norm`
 /// IS present in the shipped 4B GGUF, so only the lm_head fallback fires there in practice).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn upload_mtp_head_bufs(
@@ -393,7 +393,7 @@ struct MtpHandles {
 }
 
 /// Build the MTP head's 1-layer forward graph for `rows` `(token, h_target)` pairs starting at
-/// absolute KV position `start_pos` (`docs/MTP.md`'s forward pseudocode):
+/// absolute KV position `start_pos` (`docs/mtp.md`'s forward pseudocode):
 /// ```text
 /// e = rmsnorm(embed(t), enorm);  h = rmsnorm(h_target, hnorm)
 /// x = eh_proj @ concat([e; h])                    # eh_proj: [2ne, ne] (in=2ne, out=ne)
@@ -1324,13 +1324,13 @@ fn build_mtp_draft_chain_graph(
 }
 
 /// A live MTP head: the head's OWN uploaded weights + its OWN 1-layer KV (independent of the
-/// trunk's — `docs/MTP.md`'s driver section), driven by `forward`/`catch_up`/`draft`. Borrows the
+/// trunk's — `docs/mtp.md`'s driver section), driven by `forward`/`catch_up`/`draft`. Borrows the
 /// backend and the host embedding table for its lifetime (mirrors `seam.rs`'s session
 /// structs) — construct via [`new_cpu`](Self::new_cpu) / [`new_vulkan`](Self::new_vulkan).
 ///
 /// Not cached like `DenoiseCache` (`seam.rs`): `Op::Attention::kv_len` and `Op::WriteKv::pos`
 /// are BAKED into the graph at build time (there's no dynamic-`kv_len` binding in this IR — see
-/// `docs/MTP.md`'s IR), and both change on essentially every `catch_up`/`draft` call (`draft`
+/// `docs/mtp.md`'s IR), and both change on essentially every `catch_up`/`draft` call (`draft`
 /// advances `kv_len` by one every step). A shape-keyed cache would almost always miss, so
 /// `forward` rebuilds + recompiles a fresh graph every call instead — exactly the trunk's default
 /// per-token rebuild path for callers that don't opt into `decode_replay`. Phase 3 can revisit if
@@ -1499,10 +1499,10 @@ impl<'a> MtpHeadSession<'a> {
     }
 
     /// One head forward over `rows = tokens.len()` `(token, h_target)` pairs at absolute KV
-    /// positions `start_pos..start_pos+rows` (`docs/MTP.md`'s forward pseudocode — see
+    /// positions `start_pos..start_pos+rows` (`docs/mtp.md`'s forward pseudocode — see
     /// `build_mtp_graph`'s doc for the op-level port). Returns `(logits [rows*vocab], h_mtp
     /// [rows*ne])`. `WriteKv` OVERWRITES any existing rows at these positions (a re-draft's next
-    /// `catch_up`/`draft` at the same positions is expected to do exactly this — `docs/MTP.md`'s
+    /// `catch_up`/`draft` at the same positions is expected to do exactly this — `docs/mtp.md`'s
     /// driver section, last paragraph).
     pub fn forward(
         &mut self,
@@ -1898,11 +1898,11 @@ impl<'a> MtpHeadSession<'a> {
 
 /// llama.cpp's default `--spec-draft-p-min` (`common/common.h:329`'s
 /// `common_params_speculative_draft::p_min = 0.0f`) — i.e. `n_max` alone bounds a draft run unless
-/// the caller raises it. Matches `docs/MTP.md`'s captured oracle run (no `--spec-draft-p-min` flag
+/// the caller raises it. Matches `docs/mtp.md`'s captured oracle run (no `--spec-draft-p-min` flag
 /// was passed for the 2.0x number).
 pub const DEFAULT_P_MIN: f32 = 0.0;
 
-/// The MTP catch-up hook (`docs/MTP.md`'s `process()`, `speculative.cpp:1354-1470`'s single-head
+/// The MTP catch-up hook (`docs/mtp.md`'s `process()`, `speculative.cpp:1354-1470`'s single-head
 /// branch): re-syncs the head's own KV to the target's committed rows after EVERY target
 /// prefill/decode ubatch. `tokens[i]` pairs with `h_rows[i]` — the CALLER does the "shift `h` right
 /// by one + splice in the previous call's `pending_h`" (`speculative.cpp:1396-1417`'s `h_tgt`
@@ -1923,7 +1923,7 @@ pub fn catch_up(
     Ok(())
 }
 
-/// The MTP draft loop (`docs/MTP.md`'s `draft()`, `speculative.cpp:1472-1621`'s single-head, non-
+/// The MTP draft loop (`docs/mtp.md`'s `draft()`, `speculative.cpp:1472-1621`'s single-head, non-
 /// chained, non-mem-shared branch): self-chaining greedy decode over the head's OWN KV, ONE row per
 /// step. Starts at `(id_last, pending_h)` at absolute position `n_past` (the reference's
 /// `dp.n_past`/`dp.id_last` — the first UNCOMMITTED position and the last committed token); each
@@ -1931,7 +1931,7 @@ pub fn catch_up(
 /// at the next position (`speculative.cpp:1542`'s `h_row = llama_get_embeddings_nextn_ith(ctx_dft,
 /// ...)`), so the head's KV grows by exactly the rows drafted. Stops at the first row whose top-1
 /// probability is `< p_min` (`speculative.cpp:1556`) or once `n_max` tokens are drafted
-/// (`speculative.cpp:1570`) — plain greedy argmax either way (temp=0 throughout `docs/MTP.md`'s
+/// (`speculative.cpp:1570`) — plain greedy argmax either way (temp=0 throughout `docs/mtp.md`'s
 /// validated oracle run; the reference's draft sampler is `top_k=10` but only ever reads
 /// `data[0]`). Returns `(token, top1_prob)` pairs so a caller can inspect confidence without a
 /// second pass; re-drafting from the same `n_past` OVERWRITES the head's KV at those positions
@@ -2025,7 +2025,7 @@ fn top1_softmax(logits: &[f32]) -> (u32, f32) {
 
 // ─── Phase 3: the MTP self-speculative generation loop + run/serve wiring (issue #33) ───────────
 
-/// llama.cpp's oracle run used `--spec-draft-n-max 6` (`docs/MTP.md`) — the max candidates drafted
+/// llama.cpp's oracle run used `--spec-draft-n-max 6` (`docs/mtp.md`) — the max candidates drafted
 /// per cycle before a batched verify.
 pub const DEFAULT_N_MAX: usize = 6;
 
@@ -2213,7 +2213,7 @@ fn run_prime_last(
 
 /// Cumulative per-phase wall time + accept-rate counters over one [`generate_mtp_spec_vulkan_timed`]
 /// run (issue #33, phase 4 — `infr bench`/`infr compare`'s perf-bottleneck visibility pass: this is
-/// the struct return `docs/MTP.md`'s `INFR_MTP_TIME` per-cycle `eprintln!`s are refactored to feed,
+/// the struct return `docs/mtp.md`'s `INFR_MTP_TIME` per-cycle `eprintln!`s are refactored to feed,
 /// instead of the caller scraping stderr). `draft_secs`/`verify_secs`/`catchup_secs` sum every
 /// cycle's three timed sections (the SAME three the `[mtp cycle N]` debug line prints); the one-time
 /// prompt-prime VERIFY forward is deliberately excluded — it's already `GenStats::prompt_secs`, not
@@ -2329,7 +2329,7 @@ fn argmax_row(row: &[f32]) -> u32 {
 /// the standard speculative-sampling acceptance rule (Leviathan & Kalman 2023 / Chen et al. 2023),
 /// which provably preserves the TARGET's sampling distribution instead of forcing pure greedy.
 /// This is the fix for Qwen3.5/3.6 (thinking models) degenerating under MTP's old greedy-only
-/// accept rule — see `docs/MTP.md` / issue #33's follow-up. Perf tradeoff: `temp > 0` can't use
+/// accept rule — see `docs/mtp.md` / issue #33's follow-up. Perf tradeoff: `temp > 0` can't use
 /// either GPU-resident id-only fast path (verify's `Op::Argmax` or draft's fused
 /// `Op::ArgmaxProb`) — the ratio/residual test needs each row's FULL truncated distribution, not
 /// just an argmax id — so it downloads the full `[vocab]` logits row on every draft step AND every

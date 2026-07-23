@@ -2327,7 +2327,7 @@ impl MetalBackend {
                 r.loc[dst.0 as usize] = Loc::Host;
             }
             // Row-wise softmax (diffusion-gemma's in-graph self-conditioning — see
-            // docs/DIFFUSIONGEMMA.md's Phase-B). UNVERIFIED on real Metal hardware — added blind,
+            // docs/diffusion-gemma.md's Phase-B). UNVERIFIED on real Metal hardware — added blind,
             // mirroring `softmax.comp` (see that shader's doc + `softmax_wide_f32`'s doc).
             Op::Softmax {
                 x,
@@ -3693,7 +3693,7 @@ impl MetalBackend {
                 let vbuf = metal_buf(bindings.get(v_cache).expect("metal: unbound v_cache"));
                 let bq = self.ensure_device(r, q);
                 let bd = self.dev_dst(r, dst, rows * nh * hd);
-                // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md, `AttnMask::Canvas`):
+                // DiffusionGemma canvas denoise (docs/diffusion-gemma.md, `AttnMask::Canvas`):
                 // EVERY row attends the SAME fixed bidirectional `[lo, kv_len)`, ignoring its own
                 // causal position entirely. `window` stays meaningless for it (the dedicated
                 // canvas kernel below never reads the field) — extract `lo` separately and route
@@ -3982,7 +3982,7 @@ impl MetalBackend {
                 // so it was dropped.)
                 // Prepassed quant KV reads an f16 scratch, so it takes the f16 attention path too.
                 let f16 = g.desc(k_cache).dtype == DType::F16 || prep_active;
-                // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md, `AttnMask::Canvas`):
+                // DiffusionGemma canvas denoise (docs/diffusion-gemma.md, `AttnMask::Canvas`):
                 // route straight to the dedicated split-KV canvas kernel (`ATTNSPLIT_CANVAS_KERNEL`
                 // in attention.metal) instead of the flash/vec/plain routing below — none of those
                 // tiers can express a bound that's the SAME for every row regardless of its own

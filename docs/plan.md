@@ -7,7 +7,7 @@
 > refactor it anticipated has since shipped: the op-list IR + `Backend` trait
 > live in `crates/infr-core` (`graph.rs`, `backend.rs`) and run on CPU
 > (`infr-cpu`), Vulkan (`infr-vulkan`), and Metal (`infr-metal`). Current perf
-> state: [`docs/PERF.md`](PERF.md).
+> state: [`docs/perf.md`](perf.md).
 
 Pure-Rust LLM inference engine. Vulkan-first, designed to run on any mainstream
 GPU. The only non-Rust surface is the GPU driver (called through thin Rust FFI)
@@ -165,7 +165,7 @@ infr/
 │   └── main.rs         # the `infr` CLI: pull / run / serve  (clap subcommands)
 ├── bin/
 │   └── smoke           # dev: f16 coop-matrix matmul on the GPU vs CPU reference
-├── PLAN.md
+├── plan.md
 ├── README.md
 └── LICENSE
 ```
@@ -277,11 +277,11 @@ diffusion decode loop is still future work. Status as of 2026-06-29:
 7. ✅ **Attention + MoE** — GQA + SWA + full-attn; qwen3moe routing/gather.
 8. ✅ **Diffusion decode** — canvas denoise loop (DiffusionGemma). CPU + Vulkan
    shipped; Metal code-complete but hardware-unvalidated. See
-   [`docs/DIFFUSIONGEMMA.md`](DIFFUSIONGEMMA.md).
+   [`docs/diffusion-gemma.md`](diffusion-gemma.md).
 9. ✅ **`infr run`** — terminal chat (streaming, reasoning split).
 10. ✅ **`infr serve`** — axum OpenAI server (streaming, tool-call bridge).
 11. 🔄 **Perf pass** — ongoing (coopmat/dp4a tuning, record-once decode, KV
-    layout); see [`docs/PERF.md`](PERF.md).
+    layout); see [`docs/perf.md`](perf.md).
 12. ✅ **Backend-agnostic refactor + second backend** — DONE. The op-list seam
     (`crates/infr-core`) runs on CPU (`infr-cpu`), Vulkan (`infr-vulkan`), and
     Metal (`infr-metal`); CUDA / ROCm / MLX remain future backends behind the
@@ -318,14 +318,14 @@ DiffusionGemma; MTP for qwen35.
    weak). Med-high effort + a weaker oracle → do after MLA.
 
 MTP extension that unlocks several of the above (esp. Ornith's Gemma4 variants):
-gemma4 mem-shared MTP mode (see [`MTP.md`](MTP.md) "Later").
+gemma4 mem-shared MTP mode (see [`mtp.md`](mtp.md) "Later").
 
 ---
 
 ## Vulkan / GPU features to investigate
 
 Leads surfaced from the 2026-07 RDNA4 coopmat exploration (RX 9060 XT / Navi 44,
-Mesa 26.1.4). Context on what's already been ruled out: `docs/PERF.md` "Coopmat
+Mesa 26.1.4). Context on what's already been ruled out: `docs/perf.md` "Coopmat
 operand tiers" — on coopmat **v1**, no operand swap (fp8/bf16/int8) beats f16
 for these GEMMs. The items below are NOT yet tried.
 
@@ -373,7 +373,7 @@ for these GEMMs. The items below are NOT yet tried.
    it lands, it could route the decode GEMVs through the matrix unit. Nothing to
    do until RADV ships it.
 3. **bf16-coopmat rate on a future Mesa** — RDNA4's `bfloat16_t` WMMA currently
-   runs ~12-27% slower than `float16_t` on the same kernel (see `docs/PERF.md`);
+   runs ~12-27% slower than `float16_t` on the same kernel (see `docs/perf.md`);
    likely RADV codegen immaturity for the newer path. Re-check on a future Mesa:
    if it reaches f16 rate, native bf16 (already built, opt-in
    `INFR_BF16_COOPMAT`) becomes a free-accuracy default for bf16 models.

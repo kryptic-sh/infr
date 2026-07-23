@@ -1,5 +1,5 @@
 //! Qwen3.5 / Qwen3.6 (arch `qwen35`): hybrid gated-DeltaNet linear-attention + gated
-//! full-attention. See `docs/QWEN35.md`.
+//! full-attention. See `docs/qwen35.md`.
 //!
 //! NOT Qwen3-Next: llama.cpp's `qwen3next` is a SIBLING arch whose DeltaNet V heads broadcast in
 //! a different pattern — Qwen3-Next blocks them (`[k0_v0, k0_v1, k1_v2, k1_v3]`) while Qwen3.5

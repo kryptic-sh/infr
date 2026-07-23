@@ -128,7 +128,7 @@ kernel void rmsnorm_vec4_f32(device const float4* x   [[buffer(0)]],
 }
 
 // Row-wise softmax: dst[r,:] = softmax(x[r,:] * scale), one threadgroup (8 simdgroups) per row —
-// diffusion-gemma's in-graph self-conditioning (see docs/DIFFUSIONGEMMA.md's Phase-B and the
+// diffusion-gemma's in-graph self-conditioning (see docs/diffusion-gemma.md's Phase-B and the
 // reference's `dg_canvas_embed`). Same wide-launch shape as `rmsnorm_wide_f32` since the row width
 // (vocab) is large. NOTE: unlike the rest of this backend, this kernel is UNVERIFIED on real
 // Metal hardware (added blind, following the CPU/Vulkan implementations — see infr-vulkan's

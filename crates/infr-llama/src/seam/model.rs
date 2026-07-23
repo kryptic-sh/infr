@@ -781,7 +781,7 @@ impl SeamModel {
     /// DiffusionGemma Phase-1 validation: a causal prefill of `tokens` on the CPU reference
     /// backend, returning the LAST token's raw logits (`[vocab]`, pre-softmax, post-softcap). Not
     /// specific to diffusion-gemma — works for any arch on this seam — but this is its only
-    /// caller today (see `docs/DIFFUSIONGEMMA.md`).
+    /// caller today (see `docs/diffusion-gemma.md`).
     pub fn prefill_logits_cpu(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         crate::seam::verify_dense_cpu(
             &self.gguf,
@@ -793,7 +793,7 @@ impl SeamModel {
     }
 
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s MTP Phase 1 twin (issue #33,
-    /// docs/MTP.md): ALSO returns the LM-head INPUT row (post-`output_norm`, pre-lm_head) for the
+    /// docs/mtp.md): ALSO returns the LM-head INPUT row (post-`output_norm`, pre-lm_head) for the
     /// same last-prompt-token row the logits came from — the `h_p` primitive Phase 2's MTP driver
     /// needs, validated here via `lm_head(h) == logits`. Returns `(logits, h)`.
     pub fn prefill_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
@@ -809,7 +809,7 @@ impl SeamModel {
     /// [`prefill_logits_and_h_cpu`](Self::prefill_logits_and_h_cpu)'s ALL-ROWS twin (MTP Phase 2,
     /// issue #33): returns the LM-head input row for EVERY one of `tokens`, not just the last — the
     /// shape `crate::mtp::catch_up` needs to prime the head's KV over a whole prompt in one call
-    /// (`docs/MTP.md`'s `process()` hook runs after every target ubatch, not just the sampled row).
+    /// (`docs/mtp.md`'s `process()` hook runs after every target ubatch, not just the sampled row).
     /// Dense non-MoE models only. Returns `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
     pub fn verify_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
         crate::seam::verify_rows_cpu_with_h(
@@ -836,7 +836,7 @@ impl SeamModel {
     }
 
     /// Open a Phase-2 DiffusionGemma denoise session on the CPU reference backend (see
-    /// `docs/DIFFUSIONGEMMA.md`): [`prefill`](DiffusionGemmaCpuSession::prefill) causally
+    /// `docs/diffusion-gemma.md`): [`prefill`](DiffusionGemmaCpuSession::prefill) causally
     /// prefills the prompt ONCE (encoder scalars, KV rows `0..P`), then repeated
     /// [`denoise`](DiffusionGemmaCpuSession::denoise) calls forward the C-row canvas (decoder
     /// scalars, the bidirectional `Canvas` mask) against the SAME session — each call OVERWRITES
@@ -867,7 +867,7 @@ impl SeamModel {
     }
 
     /// [`diffusion_gemma_vulkan_session`](Self::diffusion_gemma_vulkan_session)'s Metal twin
-    /// (Phase D — see docs/DIFFUSIONGEMMA.md's Metal note). The denoise path
+    /// (Phase D — see docs/diffusion-gemma.md's Metal note). The denoise path
     /// (`generate_dense_backend`'s `denoise_req` branch) is backend-generic, so this is exactly
     /// the Vulkan constructor with Metal's own weight-upload closure.
     #[cfg(target_os = "macos")]
@@ -1592,7 +1592,7 @@ impl SeamModel {
 }
 
 /// A persistent CPU-reference session for DiffusionGemma's two-pass forward (Phase 2 — see
-/// docs/DIFFUSIONGEMMA.md and [`SeamModel::diffusion_gemma_cpu_session`]). Model-independent (like
+/// docs/diffusion-gemma.md and [`SeamModel::diffusion_gemma_cpu_session`]). Model-independent (like
 /// [`DenseVulkanSession`]/[`DenseMetalSession`]) — `prefill`/`denoise` take the `&SeamModel` per
 /// call instead of borrowing it at construction, so a [`crate::chat::ChatModel`] can hold both an
 /// owned `SeamModel` and a persistent session side by side (Phase 3 — no self-referential borrow).
@@ -1744,7 +1744,7 @@ impl DiffusionGemmaVulkanSession {
     }
 
     /// [`DiffusionGemmaCpuSession::denoise`]'s Vulkan twin. Perf slice 3
-    /// (docs/DIFFUSIONGEMMA.md): when `u` is `Some`, this asks `generate_dense_backend` to try the
+    /// (docs/diffusion-gemma.md): when `u` is `Some`, this asks `generate_dense_backend` to try the
     /// GPU entropy-bound sampler reducer on this step's logits (see
     /// [`crate::seam::DenoiseOutcome`]) — `sample_temp_inv` is THIS step's sampler temperature
     /// divisor (`denoise_block`'s local `temp_inv`, distinct from `temp_inv` above, which is the

@@ -1257,6 +1257,54 @@ impl SeamModel {
         )
     }
 
+    /// Greedy generation on the ROCm seam through a persistent session (see
+    /// [`rocmsession`](Self::rocmsession)). `stats.n_prompt` reports the tokens actually
+    /// PREFILLED (the un-cached suffix) — the TTFT-honest count.
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    pub fn generate_rocm_session(
+        &self,
+        session: &mut DenseRocmSession,
+        prompt: &str,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_rocm_session_constrained(session, prompt, max_new, None, req, on_piece)
+    }
+
+    /// [`generate_rocm_session`](Self::generate_rocm_session) with an optional llguidance
+    /// grammar constraint (serve's forced tool_choice) applied to the decode.
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    pub fn generate_rocm_session_constrained(
+        &self,
+        session: &mut DenseRocmSession,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let slot = session.pool.pick(&session.rocm, &self.cfg, &prompt_tokens)?;
+        let (_generated, stats) = crate::seam::generate_dense_rocm_session(
+            &session.rocm,
+            &self.gguf,
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |id| crate::util::stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+            &mut session.pool.slots[slot],
+            session.max_ctx,
+            constraint,
+            req,
+        )?;
+        Ok(stats)
+    }
+
     /// Greedy generation on the Metal seam through a persistent session (see
     /// [`metal_session`](Self::metal_session)). `stats.n_prompt` reports the tokens actually
     /// PREFILLED (the un-cached suffix) — the TTFT-honest count.

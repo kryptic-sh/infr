@@ -69,15 +69,15 @@ impl ChatModel for RocmSeamChat {
 
     fn generate(
         &mut self,
-        _prompt: &str,
-        _max_new: usize,
-        _req: Option<&crate::sampling::RequestCtx>,
-        _on_piece: &mut dyn FnMut(&str),
+        prompt: &str,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
         self.ensure_session()?;
-        // The ROCm dense seam runner (`generate_dense_rocm`) is not yet implemented —
-        // this path is wired for session management only. Phase 2 will add the runner.
-        anyhow::bail!("ROCm dense generation not yet implemented — session is active (Phase 2)")
+        let session = self.session.as_mut().unwrap();
+        self.model
+            .generate_rocm_session(session, prompt, max_new, req, on_piece)
     }
 }
 

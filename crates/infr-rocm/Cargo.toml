@@ -17,3 +17,8 @@ bytemuck.workspace = true
 
 [dev-dependencies]
 infr-cpu.workspace = true
+
+[[example]]
+name = "smoke_test"
+path = "examples/smoke_test.rs"
+required-features = ["rocm"]

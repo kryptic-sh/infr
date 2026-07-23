@@ -204,19 +204,18 @@ extern "C" __global__ void rope(
     int rows,
     int n_head,
     int head_dim,
-    float theta,
-    int use_neox,
-    float freq_base
+    int rope_dim,                       // first rope_dim elements get RoPE
+    float theta
 ) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
     int pos = positions[row];
     float* xr = x + row * n_head * head_dim;
-    int half = head_dim / 2;
+    int half = rope_dim / 2;
     for (int h = 0; h < n_head; h++) {
         float* xh = xr + h * head_dim;
         for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
+            float freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
             if (freq_factors != nullptr) {
                 freq *= freq_factors[i];
             }
@@ -241,10 +240,9 @@ extern "C" __global__ void qk_norm_rope(
     int rows,
     int n_head,
     int head_dim,
+    int rope_dim,                       // first rope_dim elements get RoPE
     float eps,
     float theta,
-    int use_neox,
-    float freq_base,
     int x_stride
 ) {
     int head = blockIdx.x * blockDim.x + threadIdx.x;
@@ -266,10 +264,10 @@ extern "C" __global__ void qk_norm_rope(
     for (int i = 0; i < head_dim; i++) {
         x[off + i] = x[off + i] * rms * __half2float(weight[i]);
     }
-    // rope
-    int half = head_dim / 2;
+    // rope — only the first rope_dim elements
+    int half = rope_dim / 2;
     for (int i = 0; i < half; i++) {
-        float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
+        float freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
         if (freq_factors != nullptr) {
             freq *= freq_factors[i];
         }
@@ -523,17 +521,16 @@ extern "C" __global__ void write_kv(
     __half* __restrict__ cache,     // [kv_len_max, n_kv, head_dim]
     int row_offset,                 // pos in cache to write to
     int rows,
-    int n_kv,
-    int head_dim,
-    int src_stride                  // per-row stride in src (0 = packed)
+    int cache_stride,               // per-row elements in cache (= n_kv * head_dim)
+    int src_stride                  // per-row stride in src (0 = packed = cache_stride)
 ) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
-    int effective_stride = (src_stride > 0) ? src_stride : (n_kv * head_dim);
+    int effective_src_stride = (src_stride > 0) ? src_stride : cache_stride;
     int cache_row = row_offset + row;
-    const float* sr = src + row * effective_stride;
-    __half* cr = cache + cache_row * n_kv * head_dim;
-    for (int i = 0; i < n_kv * head_dim; i++) {
+    const float* sr = src + row * effective_src_stride;
+    __half* cr = cache + cache_row * cache_stride;
+    for (int i = 0; i < cache_stride; i++) {
         cr[i] = __float2half(sr[i]);
     }
 }

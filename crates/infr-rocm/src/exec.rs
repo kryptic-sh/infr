@@ -228,24 +228,32 @@ impl<'a> ExecCtx<'a> {
             }
         }
         let dt = g.desc(id).dtype;
-        eprintln!("[rocm] dequant weight id={i} dtype={dt:?} bytes={nbytes}", i=id.0, dt=dt, nbytes=b.len);
         let raw = read_bytes(b, self.stream);
         let f32s = bytes_to_f32(&raw, dt)?;
         let f16_bytes = f32_to_f16_bytes(&f32s);
         let dq = self.f16_dev(&f16_bytes);
         let ptr = dq.ptr;
+        let len = dq.len;
         {
             let mut cache = self.weight_cache.lock().unwrap();
+            // Cache owns the device memory (owned: true)
             cache.insert(
                 key,
                 crate::RocmBuffer {
                     ptr: dq.ptr,
                     len: dq.len,
-                    owned: false,
+                    owned: true,
                 },
             );
         }
-        self.dev[i] = Some(dq);
+        // Store a non-owned reference in dev so ctx.drop doesn't free it.
+        // Prevent dq from dropping (cache owns the allocation now).
+        std::mem::forget(dq);
+        self.dev[i] = Some(crate::RocmBuffer {
+            ptr,
+            len,
+            owned: false,
+        });
         Ok(ptr)
     }
 }
@@ -273,7 +281,6 @@ pub fn execute_graph(
     };
 
     for (idx, op) in g.ops.iter().enumerate() {
-        eprintln!("[rocm] op {idx}/{len}: {kind}", idx = idx, len = g.ops.len(), kind = op.kind());
         run_op(op, g, bindings, pipelines, &mut ctx)?;
         // Sync + check for async errors after each op during bringup.
         let rc = unsafe { ffi::hipStreamSynchronize(stream) };
@@ -283,9 +290,7 @@ pub fn execute_graph(
     }
 
     // Sync after all ops
-    eprintln!("[rocm] syncing stream...");
     let rc = unsafe { ffi::hipStreamSynchronize(stream) };
-    eprintln!("[rocm] sync done (rc={rc})");
     let direct = g.in_place_inputs();
     for (i, decl) in g.tensors.iter().enumerate() {
         let id = TensorId(i as u32);
@@ -680,6 +685,7 @@ fn run_op(
                     arg_i32(pos as i32),
                     arg_i32(rows as i32),
                     arg_i32(row_stride as i32),
+                    arg_i32(0),      // src_stride (0 = packed = row_stride)
                 ],
             )?;
         }

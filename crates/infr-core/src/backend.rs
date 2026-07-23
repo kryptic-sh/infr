@@ -20,7 +20,7 @@ use crate::tensor::TensorId;
 /// inside the source buffer (`src_len`). Returns a `Backend` error rather than letting a downstream
 /// slice/download panic on an oversize `bytes`. Extracted as a pure helper so the check is unit-
 /// testable without standing up a full mock backend.
-pub(crate) fn check_copy_bytes(bytes: usize, src_len: usize) -> Result<()> {
+pub fn check_copy_bytes(bytes: usize, src_len: usize) -> Result<()> {
     if bytes > src_len {
         return Err(Error::backend(format!(
             "copy_buffer: requested prefix of {bytes} bytes exceeds source buffer of {src_len} bytes"

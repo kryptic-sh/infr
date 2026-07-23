@@ -285,6 +285,40 @@ impl DenseMetalSession {
     }
 }
 
+/// ROCm seam session — the AMD-GPU twin of [`DenseMetalSession`]: owns the
+/// backend and the conversation [`SlotPool`], so every later
+/// [`SeamModel::generate_rocm_session`] call prefills only the suffix that differs from its
+/// slot's previous turn, and concurrent conversations (serve) each keep their own KV slot off
+/// the one shared weight upload.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+pub struct DenseRocmSession {
+    pub(crate) rocm: infr_rocm::RocmBackend,
+    pub(crate) pool: SlotPool,
+    pub(crate) max_ctx: usize,
+}
+
+/// ROCm seam session placeholder — an empty stub for when the `rocm` feature is not active.
+/// The CLI surfaces the feature gate via [`SeamModel::rocm_session`].
+#[cfg(not(all(target_os = "linux", feature = "rocm")))]
+pub struct DenseRocmSession {
+    _max_ctx: usize,
+}
+
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+impl DenseRocmSession {
+    /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
+    /// warmup generation so the first real prompt starts from clean slots.
+    pub fn reset_cache(&mut self) {
+        self.pool.reset_cache();
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "rocm")))]
+impl DenseRocmSession {
+    /// Forget every slot's materialized tokens (buffers stay — discards warmup).
+    pub fn reset_cache(&mut self) {}
+}
+
 /// Estimated KV-cache bytes per element for one side (K or V), from the same env override the
 /// runner honors (`INFR_KV_TYPE_K/V`, legacy `INFR_KV_Q8`). ESTIMATE ONLY — the runner
 /// additionally gates each format on backend/alignment and falls back to f16, so a gated-out
@@ -1198,6 +1232,87 @@ impl SeamModel {
             pool: SlotPool::new(),
             max_ctx,
         })
+    }
+
+    /// Open a persistent ROCm seam session: weights uploaded ONCE, KV sized to `max_ctx`,
+    /// later calls prefill only the un-cached suffix.
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    pub fn rocm_session(&self, max_ctx: usize, dev_idx: u32) -> Result<DenseRocmSession> {
+        let rocm =
+            infr_rocm::RocmBackend::new(dev_idx as i32).map_err(|e| anyhow!("rocm init: {e}"))?;
+        Ok(DenseRocmSession {
+            rocm,
+            pool: SlotPool::new(),
+            max_ctx,
+        })
+    }
+
+    /// Open a persistent ROCm seam session: returns an error when the `rocm` feature is not
+    /// active — the CLI surfaces it as a feature-gate message.
+    #[cfg(not(all(target_os = "linux", feature = "rocm")))]
+    pub fn rocm_session(&self, _max_ctx: usize, _dev_idx: u32) -> Result<DenseRocmSession> {
+        anyhow::bail!(
+            "ROCm backend not compiled — build with `cargo build --features rocm` \
+             on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md Phase 0)"
+        )
+    }
+
+    /// Greedy generation on the ROCm seam through a persistent session (see
+    /// [`rocmsession`](Self::rocmsession)). `stats.n_prompt` reports the tokens actually
+    /// PREFILLED (the un-cached suffix) — the TTFT-honest count.
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    pub fn generate_rocm_session(
+        &self,
+        session: &mut DenseRocmSession,
+        prompt: &str,
+        max_new: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_rocm_session_constrained(session, prompt, max_new, None, req, on_piece)
+    }
+
+    /// [`generate_rocm_session`](Self::generate_rocm_session) with an optional llguidance
+    /// grammar constraint (serve's forced tool_choice) applied to the decode.
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    pub fn generate_rocm_session_constrained(
+        &self,
+        session: &mut DenseRocmSession,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
+        mut on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
+        let mut acc: Vec<u32> = Vec::new();
+        let mut printed = 0usize;
+        let slot = session
+            .pool
+            .pick(&session.rocm, &self.cfg, &prompt_tokens)?;
+        let (_generated, stats) = crate::seam::generate_dense_rocm_session(
+            &session.rocm,
+            &self.gguf,
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            &prompt_tokens,
+            max_new,
+            |id| {
+                crate::util::stream_token(
+                    &self.tokenizer,
+                    &mut acc,
+                    &mut printed,
+                    id,
+                    &mut on_piece,
+                )
+            },
+            &mut session.pool.slots[slot],
+            session.max_ctx,
+            constraint,
+            req,
+        )?;
+        Ok(stats)
     }
 
     /// Greedy generation on the Metal seam through a persistent session (see

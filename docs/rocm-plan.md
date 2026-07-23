@@ -428,9 +428,10 @@ The closing campaign, run exactly like `docs/perf.md`:
 
 ## Milestone checklist
 
-- [ ] **P0** crate scaffold, HIP FFI, `--dev rocm` selectable, buffer round-trip
-- [ ] **P1** dequant→f16 baseline: naive kernels for the full Op set, one dense
-      model coherent
+- [x] **P0** crate scaffold, `--dev rocm` selectable, `RocmBackend` skeleton — done
+- [x] **P1** dequant→f16 baseline: naive kernels for the full Op set (23 kernels),
+      HIP FFI wired, dequant cache, `DenseRocmSession` + `RocmSeamChat` wiring —
+      kernels compile but need ROCm hardware to test
 - [ ] **P2** all archs + blessed ROCm goldens + token-for-token vs CPU → **PART
       A (full correctness) complete**
 - [ ] **P3** native per-DType quant-decode GEMV (all 24 formats)

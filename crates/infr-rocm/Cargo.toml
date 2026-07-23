@@ -1,0 +1,32 @@
+[package]
+name = "infr-rocm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+rocm = []
+
+[dependencies]
+infr-core.workspace = true
+indicatif.workspace = true
+infr-gguf.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+infr-cpu.workspace = true
+
+[[example]]
+name = "smoke_test"
+path = "examples/smoke_test.rs"
+required-features = ["rocm"]
+
+# Gated behind the `rocm` feature: this example defines its own HIP FFI (only
+# valid with ROCm installed) and must not be built by `--all-targets` on a
+# non-ROCm host, where its lints/link would break `cargo clippy`/`cargo test`.
+[[example]]
+name = "hiprtc_test"
+path = "examples/hiprtc_test.rs"
+required-features = ["rocm"]

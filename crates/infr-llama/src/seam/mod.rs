@@ -104,6 +104,19 @@ fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
     })
 }
 
+/// The ROCm seam weight binder — twin of [`metal_upload_bind`]: raw native-dtype upload;
+/// the backend dequantizes lazily.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+fn rocm_upload_bind(be: &infr_rocm::RocmBackend) -> Box<BindWeight<'_>> {
+    Box::new(move |_name, tb, dt, _n| {
+        let buf = be
+            .alloc(tb.len().max(1), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+        Ok((buf, dt))
+    })
+}
+
 // ─── Qwen3 dense CPU decode runner ───────────────────────────────────────────────
 //
 // Builds the n=1 decode Graph and drives it through `CpuBackend`, one token at a time, for BOTH
@@ -1955,6 +1968,47 @@ pub(crate) fn generate_dense_metal_session(
     generate_dense_backend(
         mtl,
         &metal_upload_bind(mtl),
+        g,
+        cfg,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        state,
+        want_ctx,
+        constraint,
+        None,
+        None,
+        None,
+        None,
+        None,
+        req,
+    )
+}
+
+/// Persistent-session ROCm seam runner — the ROCm twin of
+/// [`generate_dense_metal_session`]: weights upload once, KV cache persists across turns.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn generate_dense_rocm_session(
+    rocm: &infr_rocm::RocmBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    constraint: Option<&mut crate::grammar::Constraint>,
+    req: Option<&crate::sampling::RequestCtx>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend(
+        rocm,
+        &rocm_upload_bind(rocm),
         g,
         cfg,
         token_embd,

@@ -12,6 +12,7 @@ infr-core.workspace = true
 infr-chat.workspace = true
 infr-vulkan.workspace = true
 infr-metal.workspace = true
+infr-rocm.workspace = true
 infr-gguf.workspace = true
 infr-cpu.workspace = true
 serde_json.workspace = true
@@ -23,3 +24,6 @@ anyhow.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 tokenizers = { workspace = true }
+
+[features]
+rocm = ["infr-rocm/rocm"]

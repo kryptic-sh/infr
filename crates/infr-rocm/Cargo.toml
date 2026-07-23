@@ -1,0 +1,19 @@
+[package]
+name = "infr-rocm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+rocm = []
+
+[dependencies]
+infr-core.workspace = true
+indicatif.workspace = true
+infr-gguf.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+infr-cpu.workspace = true

@@ -285,6 +285,17 @@ impl DenseMetalSession {
     }
 }
 
+/// ROCm seam session placeholder — returns a clean "not yet implemented" error from
+/// [`SeamModel::rocmsession`] so the CLI can surface the feature gate.
+pub struct DenseRocmSession {
+    _max_ctx: usize,
+}
+
+impl DenseRocmSession {
+    /// Forget every slot's materialized tokens (buffers stay — discards warmup).
+    pub fn reset_cache(&mut self) {}
+}
+
 /// Estimated KV-cache bytes per element for one side (K or V), from the same env override the
 /// runner honors (`INFR_KV_TYPE_K/V`, legacy `INFR_KV_Q8`). ESTIMATE ONLY — the runner
 /// additionally gates each format on backend/alignment and falls back to f16, so a gated-out
@@ -1198,6 +1209,17 @@ impl SeamModel {
             pool: SlotPool::new(),
             max_ctx,
         })
+    }
+
+    /// Open a persistent ROCm seam session: weights uploaded ONCE, KV sized to `max_ctx`,
+    /// later calls prefill only the un-cached suffix. Returns an error until the HIP FFI
+    /// is wired and the `rocm` feature is active — the CLI surfaces it as a feature-gate message.
+    pub fn rocm_session(&self, _max_ctx: usize) -> Result<DenseRocmSession> {
+        // Phase 0: RocmBackend only exists behind `cfg(all(target_os = "linux", feature = "rocm"))`.
+        anyhow::bail!(
+            "ROCm backend not compiled — build with `cargo build --features rocm` \
+             on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md Phase 0)"
+        )
     }
 
     /// Greedy generation on the Metal seam through a persistent session (see

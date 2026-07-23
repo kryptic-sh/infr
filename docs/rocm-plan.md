@@ -428,7 +428,8 @@ The closing campaign, run exactly like `docs/perf.md`:
 
 ## Milestone checklist
 
-- [ ] **P0** crate scaffold, HIP FFI, `--dev rocm` selectable, buffer round-trip
+- [x] **P0** crate scaffold, `--dev rocm` selectable, `RocmBackend` skeleton — HIP
+      FFI evaluation pending (requires ROCm install on dev box)
 - [ ] **P1** dequant→f16 baseline: naive kernels for the full Op set, one dense
       model coherent
 - [ ] **P2** all archs + blessed ROCm goldens + token-for-token vs CPU → **PART

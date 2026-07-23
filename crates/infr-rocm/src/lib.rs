@@ -8,7 +8,12 @@
 //! This is the fourth compute backend (alongside CPU, Vulkan, Metal). See
 //! `docs/rocm-plan.md` for the full roadmap.
 
-/// The real backend, defined only when the `rocm` feature is active on Linux.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+mod ffi;
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+mod kernels;
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+mod exec;
 #[cfg(all(target_os = "linux", feature = "rocm"))]
 mod backend;
 

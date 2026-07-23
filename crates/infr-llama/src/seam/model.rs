@@ -285,12 +285,35 @@ impl DenseMetalSession {
     }
 }
 
-/// ROCm seam session placeholder — returns a clean "not yet implemented" error from
-/// [`SeamModel::rocmsession`] so the CLI can surface the feature gate.
+/// ROCm seam session — the AMD-GPU twin of [`DenseMetalSession`]: owns the
+/// backend and the conversation [`SlotPool`], so every later
+/// [`SeamModel::generate_rocm_session`] call prefills only the suffix that differs from its
+/// slot's previous turn, and concurrent conversations (serve) each keep their own KV slot off
+/// the one shared weight upload.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+pub struct DenseRocmSession {
+    pub(crate) rocm: infr_rocm::RocmBackend,
+    pub(crate) pool: SlotPool,
+    pub(crate) max_ctx: usize,
+}
+
+/// ROCm seam session placeholder — an empty stub for when the `rocm` feature is not active.
+/// The CLI surfaces the feature gate via [`SeamModel::rocm_session`].
+#[cfg(not(all(target_os = "linux", feature = "rocm")))]
 pub struct DenseRocmSession {
     _max_ctx: usize,
 }
 
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+impl DenseRocmSession {
+    /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
+    /// warmup generation so the first real prompt starts from clean slots.
+    pub fn reset_cache(&mut self) {
+        self.pool.reset_cache();
+    }
+}
+
+#[cfg(not(all(target_os = "linux", feature = "rocm")))]
 impl DenseRocmSession {
     /// Forget every slot's materialized tokens (buffers stay — discards warmup).
     pub fn reset_cache(&mut self) {}
@@ -1212,10 +1235,17 @@ impl SeamModel {
     }
 
     /// Open a persistent ROCm seam session: weights uploaded ONCE, KV sized to `max_ctx`,
-    /// later calls prefill only the un-cached suffix. Returns an error until the HIP FFI
-    /// is wired and the `rocm` feature is active — the CLI surfaces it as a feature-gate message.
+    /// later calls prefill only the un-cached suffix.
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    pub fn rocm_session(&self, max_ctx: usize) -> Result<DenseRocmSession> {
+        let rocm = infr_rocm::RocmBackend::new().map_err(|e| anyhow!("rocm init: {e}"))?;
+        Ok(DenseRocmSession { rocm, pool: SlotPool::new(), max_ctx })
+    }
+
+    /// Open a persistent ROCm seam session: returns an error when the `rocm` feature is not
+    /// active — the CLI surfaces it as a feature-gate message.
+    #[cfg(not(all(target_os = "linux", feature = "rocm")))]
     pub fn rocm_session(&self, _max_ctx: usize) -> Result<DenseRocmSession> {
-        // Phase 0: RocmBackend only exists behind `cfg(all(target_os = "linux", feature = "rocm"))`.
         anyhow::bail!(
             "ROCm backend not compiled — build with `cargo build --features rocm` \
              on a Linux machine with ROCm/HIP installed (docs/rocm-plan.md Phase 0)"

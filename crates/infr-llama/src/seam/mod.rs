@@ -104,6 +104,19 @@ fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
     })
 }
 
+/// The ROCm seam weight binder — twin of [`metal_upload_bind`]: raw native-dtype upload;
+/// the backend dequantizes lazily.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+fn rocm_upload_bind(be: &infr_rocm::RocmBackend) -> Box<BindWeight<'_>> {
+    Box::new(move |_name, tb, dt, _n| {
+        let buf = be
+            .alloc(tb.len().max(1), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        be.upload(buf.as_ref(), &tb).map_err(|e| anyhow!("{e}"))?;
+        Ok((buf, dt))
+    })
+}
+
 // ─── Qwen3 dense CPU decode runner ───────────────────────────────────────────────
 //
 // Builds the n=1 decode Graph and drives it through `CpuBackend`, one token at a time, for BOTH

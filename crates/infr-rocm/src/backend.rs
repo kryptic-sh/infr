@@ -1,124 +1,176 @@
 //! The ROCm/HIP backend — mirrors `infr-metal`'s structure: backend struct, buffer,
-//! and the `Backend` trait impl. For Phase 0 (scaffolding) this is a skeleton that
-//! constructs, allocs, uploads/downloads, and syncs. Real kernels come in Phase 1.
+//! and the `Backend` trait impl.
 //!
 //! Compiled only when `cfg(all(target_os = "linux", feature = "rocm"))`.
 
-use infr_core::backend::{Backend, Bindings, BufferUsage, Capabilities, GraphPlan, Plan};
+use crate::exec;
+use crate::ffi::{self, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS};
+use crate::kernels::Pipelines;
+use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan, ProgressScope};
 use infr_core::error::{Error, Result};
 use infr_core::graph::Graph;
+use std::ffi::{c_int, c_void};
+use std::sync::{Arc, Mutex};
 
-fn be(msg: impl std::fmt::Display) -> Error {
-    Error::backend(msg)
-}
+fn be(msg: impl std::fmt::Display) -> Error { Error::backend(msg) }
 
-/// A device buffer allocated with `hipMalloc`.
+// ── RocmBuffer ───────────────────────────────────────────────────────────────
+
 pub struct RocmBuffer {
-    // TODO: fill in with a HIP device pointer + byte length once the FFI is wired.
-    _len: usize,
+    pub(crate) ptr: *mut c_void,
+    pub(crate) len: usize,
+    pub(crate) owned: bool,
 }
 
-impl infr_core::backend::Buffer for RocmBuffer {
-    fn len_bytes(&self) -> usize {
-        self._len
-    }
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-// HIP device pointers are Send/Sync (they identify a VRAM region, not a CPU address).
 unsafe impl Send for RocmBuffer {}
 unsafe impl Sync for RocmBuffer {}
 
-/// The ROCm/HIP compute backend.
-pub struct RocmBackend {
-    // TODO: device handle, stream, module (once HIP FFI is wired).
+impl RocmBuffer {
+    pub fn alloc(bytes: usize, _stream: ffi::hipStream_t) -> Self {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        if bytes > 0 {
+            let rc = unsafe { ffi::hipMalloc(&mut ptr, bytes) };
+            if rc != HIP_SUCCESS { panic!("hipMalloc({bytes}): rc={rc}"); }
+            unsafe { ffi::hipMemset(ptr, 0, bytes); }
+        }
+        Self { ptr, len: bytes, owned: true }
+    }
+    pub fn alloc_zero(bytes: usize, stream: ffi::hipStream_t) -> Self { Self::alloc(bytes, stream) }
+    pub fn upload(&mut self, src: &[u8], _stream: ffi::hipStream_t) {
+        if src.is_empty() || self.ptr.is_null() { return; }
+        let n = src.len().min(self.len);
+        let rc = unsafe { ffi::hipMemcpy(self.ptr, src.as_ptr() as *const c_void, n, HIP_MEMCPY_HOST_TO_DEVICE) };
+        if rc != HIP_SUCCESS { panic!("hipMemcpy H2D: rc={rc}"); }
+    }
 }
 
-// The backend owns streams and device handles which are Send/Sync.
+impl Buffer for RocmBuffer {
+    fn len_bytes(&self) -> usize { self.len }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+impl Drop for RocmBuffer {
+    fn drop(&mut self) { if self.owned && !self.ptr.is_null() { unsafe { ffi::hipFree(self.ptr); } } }
+}
+
+// ── RocmBackend ──────────────────────────────────────────────────────────────
+
+pub struct RocmBackend {
+    device: c_int,
+    stream: ffi::hipStream_t,
+    pipelines: Pipelines,
+    pub(crate) weight_cache: Mutex<std::collections::HashMap<usize, RocmBuffer>>,
+    weight_pb: Arc<Mutex<Option<indicatif::ProgressBar>>>,
+}
+
 unsafe impl Send for RocmBackend {}
 unsafe impl Sync for RocmBackend {}
 
 impl RocmBackend {
-    /// Create a new ROCm backend, enumerating the first available HIP device.
     pub fn new() -> Result<Self> {
-        // TODO: HIP device enumeration, stream creation (Phase 0 HIP FFI eval).
-        Err(be(
-            "ROCm backend not yet implemented — HIP FFI is pending (Phase 0)",
-        ))
+        let mut count: c_int = 0;
+        let rc = unsafe { ffi::hipGetDeviceCount(&mut count) };
+        if rc != HIP_SUCCESS { return Err(be(format!("hipGetDeviceCount: rc={rc}"))); }
+        if count == 0 { return Err(be("no HIP-capable devices found")); }
+        let device: c_int = 0;
+        let rc = unsafe { ffi::hipSetDevice(device) };
+        if rc != HIP_SUCCESS { return Err(be(format!("hipSetDevice({device}): rc={rc}"))); }
+        let mut stream: ffi::hipStream_t = std::ptr::null_mut();
+        let rc = unsafe { ffi::hipStreamCreate(&mut stream) };
+        if rc != HIP_SUCCESS { return Err(be(format!("hipStreamCreate: rc={rc}"))); }
+        let pipelines = Pipelines::build(device)?;
+        Ok(Self { device, stream, pipelines, weight_cache: Mutex::new(std::collections::HashMap::new()), weight_pb: Arc::new(Mutex::new(None)) })
+    }
+    fn prop(&self) -> ffi::hipDeviceProp_t {
+        let mut props: ffi::hipDeviceProp_t = unsafe { std::mem::zeroed() };
+        unsafe { ffi::hipGetDeviceProperties(&mut props, self.device) };
+        props
     }
 }
 
 impl Backend for RocmBackend {
-    fn name(&self) -> &str {
-        "rocm"
-    }
-
+    fn name(&self) -> &str { "rocm" }
     fn capabilities(&self) -> Capabilities {
+        let props = self.prop();
         Capabilities {
-            name: "AMD ROCm/HIP".into(),
-            f16: true,
-            coopmat_f16: None,
-            f8: false,
-            coopmat_f8: None,
-            i8: false,
-            i8_dot: false,
-            coopmat_i8: None,
-            bf16: false,
-            coopmat_bf16: None,
-            subgroup_min: 0,
-            subgroup_max: 0,
-            sg_pref: 0,
-            vendor_intel: false,
-            integrated: false,
-            compute_units: 0,
-            buffer_device_address: false,
-            max_shared_memory_bytes: 65536,
-            unified_memory: false,
-            // ── correctness-dial: start with NOTHING fused ──
-            decode_replay: false,
-            combined_gu: false,
-            embed_gather: false,
-            gpu_sample: false,
-            argmax_rows: false,
-            argmax_prob: false,
-            gated_rmsnorm: false,
-            kv_swa_ring: false,
+            name: "AMD ROCm/HIP".into(), f16: true, coopmat_f16: None, f8: false, coopmat_f8: None,
+            i8: false, i8_dot: false, coopmat_i8: None, bf16: false, coopmat_bf16: None,
+            subgroup_min: 0, subgroup_max: 0, sg_pref: 0, vendor_intel: false, integrated: false,
+            compute_units: props.multi_processor_count as u32, buffer_device_address: false,
+            max_shared_memory_bytes: props.shared_mem_per_block as u32, unified_memory: false,
+            decode_replay: false, combined_gu: false, embed_gather: false, gpu_sample: false,
+            argmax_rows: false, argmax_prob: false, gated_rmsnorm: false, kv_swa_ring: false,
         }
     }
-
-    fn alloc(
-        &self,
-        bytes: usize,
-        _usage: BufferUsage,
-    ) -> Result<Box<dyn infr_core::backend::Buffer>> {
-        // TODO: hipMalloc + hipMemset (calloc contract).
-        let _ = bytes;
-        Err(be("ROCm alloc not yet implemented"))
+    fn alloc(&self, bytes: usize, _usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        let buf = RocmBuffer::alloc(bytes, self.stream);
+        if matches!(_usage, BufferUsage::Weights | BufferUsage::HostWeights) {
+            if let Some(pb) = self.weight_pb.lock().unwrap().as_ref() { pb.inc(bytes as u64); }
+        }
+        Ok(Box::new(buf))
     }
-
-    fn upload(&self, _dst: &dyn infr_core::backend::Buffer, _src: &[u8]) -> Result<()> {
-        // TODO: hipMemcpy H2D.
-        Err(be("ROCm upload not yet implemented"))
+    fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        if bytes > 0 {
+            let rc = unsafe { ffi::hipMalloc(&mut ptr, bytes) };
+            if rc != HIP_SUCCESS { return Err(be(format!("hipMalloc: rc={rc}"))); }
+        }
+        if matches!(usage, BufferUsage::Weights | BufferUsage::HostWeights) {
+            if let Some(pb) = self.weight_pb.lock().unwrap().as_ref() { pb.inc(bytes as u64); }
+        }
+        Ok(Box::new(RocmBuffer { ptr, len: bytes, owned: true }))
     }
-
-    fn download(&self, _src: &dyn infr_core::backend::Buffer, _dst: &mut [u8]) -> Result<()> {
-        // TODO: hipMemcpy D2H.
-        Err(be("ROCm download not yet implemented"))
+    fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
+        let buf = dst.as_any().downcast_ref::<RocmBuffer>().expect("rocm: not a RocmBuffer");
+        if src.is_empty() || buf.ptr.is_null() { return Ok(()); }
+        let n = src.len().min(buf.len);
+        let rc = unsafe { ffi::hipMemcpy(buf.ptr, src.as_ptr() as *const c_void, n, HIP_MEMCPY_HOST_TO_DEVICE) };
+        if rc != HIP_SUCCESS { return Err(be(format!("hipMemcpy H2D: rc={rc}"))); }
+        Ok(())
     }
-
-    fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
-        Ok(GraphPlan::boxed(graph))
+    fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
+        let buf = src.as_any().downcast_ref::<RocmBuffer>().expect("rocm: not a RocmBuffer");
+        if dst.is_empty() || buf.ptr.is_null() { return Ok(()); }
+        let n = dst.len().min(buf.len);
+        let rc = unsafe { ffi::hipMemcpy(dst.as_mut_ptr() as *mut c_void, buf.ptr, n, HIP_MEMCPY_DEVICE_TO_HOST) };
+        if rc != HIP_SUCCESS { return Err(be(format!("hipMemcpy D2H: rc={rc}"))); }
+        unsafe { ffi::hipStreamSynchronize(self.stream) };
+        Ok(())
     }
-
-    fn execute(&self, _plan: &dyn Plan, _bindings: &Bindings) -> Result<()> {
-        // TODO: walk graph, dispatch kernels, stream sync (Phase 1+).
-        Err(be("ROCm execute not yet implemented"))
+    fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> { Ok(GraphPlan::boxed(graph)) }
+    fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
+        exec::execute_graph(&self.pipelines, &self.weight_cache, self.stream, plan, bindings)
     }
-
     fn sync(&self) -> Result<()> {
-        // TODO: hipStreamSynchronize / hipDeviceSynchronize.
-        Err(be("ROCm sync not yet implemented"))
+        let rc = unsafe { ffi::hipStreamSynchronize(self.stream) };
+        if rc != HIP_SUCCESS { return Err(be(format!("hipStreamSynchronize: rc={rc}"))); }
+        Ok(())
+    }
+    fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
+        infr_core::backend::check_copy_bytes(bytes, src.len_bytes())?;
+        let sb = src.as_any().downcast_ref::<RocmBuffer>().expect("rocm: not RocmBuffer");
+        let db = dst.as_any().downcast_ref::<RocmBuffer>().expect("rocm: not RocmBuffer");
+        let rc = unsafe { ffi::hipMemcpyDtoD(db.ptr, sb.ptr, bytes) };
+        if rc != HIP_SUCCESS { return Err(be(format!("hipMemcpyDtoD: rc={rc}"))); }
+        Ok(())
+    }
+    fn weight_progress(&self, total_bytes: Option<u64>) -> Box<dyn ProgressScope> {
+        struct RocmProgress { pb: Arc<Mutex<Option<indicatif::ProgressBar>>> }
+        impl ProgressScope for RocmProgress {}
+        impl Drop for RocmProgress { fn drop(&mut self) { if let Some(pb) = self.pb.lock().unwrap().take() { pb.finish_and_clear(); } } }
+        let pb = total_bytes.map(|total| {
+            let style = indicatif::ProgressStyle::with_template("  {spinner} ROCm weights {bytes}/{total_bytes} [{elapsed_precise}] {msg}").unwrap();
+            let pb = indicatif::ProgressBar::new(total);
+            pb.set_style(style);
+            pb
+        });
+        *self.weight_pb.lock().unwrap() = pb;
+        Box::new(RocmProgress { pb: self.weight_pb.clone() })
+    }
+}
+
+impl Drop for RocmBackend {
+    fn drop(&mut self) {
+        if !self.stream.is_null() { unsafe { ffi::hipStreamSynchronize(self.stream); ffi::hipStreamDestroy(self.stream); } }
     }
 }

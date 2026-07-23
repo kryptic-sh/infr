@@ -31,7 +31,7 @@ pub(super) enum FfnW {
     },
     /// diffusion-gemma's per-layer dual FFN: a dense GeGLU branch (the "shared expert") ∥ a
     /// 128-expert MoE branch (fused `gate_up_exps` + per-expert `down_exps` scale), summed and
-    /// sandwich-normed. See the FFN wiring in `docs/DIFFUSIONGEMMA.md`. `LayerW::ffn_norm` is the
+    /// sandwich-normed. See the FFN wiring in `docs/diffusion-gemma.md`. `LayerW::ffn_norm` is the
     /// dense branch's INPUT norm and `LayerW::post_ffw` the shared FINAL norm (both reused as-is —
     /// every gemma model already carries them); the fields below are the pieces unique to the
     /// dual-FFN block.
@@ -100,7 +100,7 @@ pub(super) struct AttnW {
     pub(super) wo: TensorId,
 }
 
-/// qwen35 gated-DeltaNet linear-attention mixer weights (see `docs/QWEN35.md`). Unlike `AttnW` this
+/// qwen35 gated-DeltaNet linear-attention mixer weights (see `docs/qwen35.md`). Unlike `AttnW` this
 /// mixer owns no KV cache — its recurrent state (a rolling conv history + the DeltaNet `S` matrix)
 /// is session state, held in the SAME `kbufs`/`vbufs` slots a KV-caching layer would use (see
 /// `SeamKv` and the state-buffer alloc in `generate_dense_backend`).
@@ -201,7 +201,7 @@ pub(crate) struct SeamKv {
     /// CPU (it never sets it) and for every non-diffusion-gemma caller. `Arc` so `fork()`
     /// shares it with forked conversation slots for free — mirrors `self_cond_w`.
     pub(super) sc_embt: Option<std::sync::Arc<dyn Buffer>>,
-    /// Perf (Vulkan only — see docs/DIFFUSIONGEMMA.md's Phase-B "sc round-trip" elimination):
+    /// Perf (Vulkan only — see docs/diffusion-gemma.md's Phase-B "sc round-trip" elimination):
     /// ping-pong pair of persistent `[cc*vocab]` device buffers backing the denoise loop's canvas
     /// logits, so the previous step's raw output is already GPU-resident for this step's
     /// self-conditioning softmax input — no host download+reupload. Session-lifetime: `cc`/vocab
@@ -449,7 +449,7 @@ impl SeamKv {
     ///
     /// qwen35: a no-op. The gated-DeltaNet recurrent state is a single fixed-size summary of
     /// EVERY token fed so far — there's no "first `p` tokens' worth" of it to slice out and copy
-    /// the way a real per-position KV cache allows (see `docs/QWEN35.md` and the no-rewind rule in
+    /// the way a real per-position KV cache allows (see `docs/qwen35.md` and the no-rewind rule in
     /// `generate_dense_backend`). Leaving `self.cached` empty (this slot's `fork()` already zeroed
     /// its state) is the CORRECT fallback: the next call on this slot fully re-prefills, exactly
     /// like the single-slot session's divergent-prompt reset.

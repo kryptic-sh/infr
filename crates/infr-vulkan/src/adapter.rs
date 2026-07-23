@@ -1149,7 +1149,7 @@ fn lower_op(
             );
         }
         // Row-wise softmax over `dim` columns (diffusion-gemma's in-graph self-conditioning — see
-        // docs/DIFFUSIONGEMMA.md's Phase-B and the reference's `dg_canvas_embed`). `scale_buf`
+        // docs/diffusion-gemma.md's Phase-B and the reference's `dg_canvas_embed`). `scale_buf`
         // (Some only on the DiffusionGemma denoise SC path — see its doc in `infr_core::graph`)
         // reads the scale from a device buffer instead of the push-constant `scale` field, so this
         // cached/replayed plan can vary the softmax temperature every step without rebuilding.
@@ -2905,7 +2905,7 @@ fn lower_op(
                 // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
                 // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
                 // require both to be Internal.
-                // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md): bidirectional, fixed
+                // DiffusionGemma canvas denoise (docs/diffusion-gemma.md): bidirectional, fixed
                 // `[lo, kv_len)` reach per row — neither the flash kernel (Causal-only, already
                 // excluded above) nor `attention_prefill_nonfa`'s per-row causal-end window
                 // understand that shape, so gate BOTH off it and force the split-K path below
@@ -7591,7 +7591,7 @@ mod tests {
     /// diffusion-gemma's `MoeFfn` shape: a SEPARATE `router_x` (not `x`), a FUSED `gate_up_exps`
     /// tensor (gate rows first, up rows second per expert), and a per-expert `down_scale`. Same
     /// host-reference-vs-seam structure as `moe_ffn_graph_matches_host`, extended for the three
-    /// new fields (see `docs/DIFFUSIONGEMMA.md` and the `Op::MoeFfn` doc comment).
+    /// new fields (see `docs/diffusion-gemma.md` and the `Op::MoeFfn` doc comment).
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn moe_ffn_fused_scaled_matches_host() {

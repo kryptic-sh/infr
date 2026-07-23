@@ -6,7 +6,7 @@
 #   scripts/perf-sweep.sh model1.gguf ...          # Vulkan (default backend)
 #
 # Pass the SAME model list every time — the archive is only comparable when the
-# rows line up. r=3, idle machine, nothing else on the GPU (see docs/PERF.md).
+# rows line up. r=3, idle machine, nothing else on the GPU (see docs/perf.md).
 set -euo pipefail
 [ $# -ge 1 ] || { echo "usage: [INFR_METAL=1] $0 <model.gguf>..." >&2; exit 1; }
 

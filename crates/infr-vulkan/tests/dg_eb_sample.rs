@@ -1,4 +1,4 @@
-// DiffusionGemma perf slice 3 (docs/DIFFUSIONGEMMA.md): validates the fused GPU entropy-bound
+// DiffusionGemma perf slice 3 (docs/diffusion-gemma.md): validates the fused GPU entropy-bound
 // sampler reduction (`dg_eb_sample.comp` / `Backend::eb_sample_reduce`) against a host reference
 // that's a straight port of `diffusion.rs::denoise_block`'s `per_pos` closure — same math, same
 // iteration order — so a divergence here means the GPU kernel, not the host sampler, is wrong.

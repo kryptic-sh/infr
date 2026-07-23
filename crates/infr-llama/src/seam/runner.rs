@@ -267,10 +267,10 @@ pub(super) struct DecodeHandles {
     // `None` for headless builds (`logits_rows == 0` — the batched-prefill chunks, whose logits
     // nothing consumes); `Some` everywhere else.
     logits: Option<TensorId>,
-    // MTP Phase 1 (issue #33, docs/MTP.md): the LM-head INPUT — the same rows `logits` was
+    // MTP Phase 1 (issue #33, docs/mtp.md): the LM-head INPUT — the same rows `logits` was
     // computed from, one op earlier (post-`output_norm`, pre-`w_lm`). `Some` only when `build`
     // was called with `h_tap: true`; `None` for every ordinary caller (no extra op, no extra
-    // download). This is the primitive Phase 2's MTP head needs (`h_p` in `docs/MTP.md`'s forward
+    // download). This is the primitive Phase 2's MTP head needs (`h_p` in `docs/mtp.md`'s forward
     // pseudocode) — Phase 1 only exposes the tap, no head graph reads it yet.
     h_out: Option<TensorId>,
     // GPU embed gather (`use_ids` on `build`): the I32 token-id Input the driver binds instead
@@ -321,11 +321,11 @@ pub(crate) fn generate_dense_backend(
     // MoE-incompatible — see its guard below) this rides the existing rows==1 per-token loop, so
     // it works for MoE/diffusion-gemma models too.
     mut logits_out: Option<&mut Vec<f32>>,
-    // MTP Phase 1 (issue #33, docs/MTP.md): captures the LM-head INPUT rows (post-`output_norm`,
+    // MTP Phase 1 (issue #33, docs/mtp.md): captures the LM-head INPUT rows (post-`output_norm`,
     // pre-`w_lm` — `DecodeHandles::h_out`'s doc) for the SAME row(s) `logits_out`/`verify` came
     // from: `[ne]` for the per-token decode loop's frontier row, `[m * ne]` for speculative
     // VERIFY's `m` rows. `None` everywhere else (no extra op, no extra download — see `h_tap`'s
-    // doc on `build`). This is Phase 2's MTP driver primitive (`h_p` in `docs/MTP.md`); Phase 1
+    // doc on `build`). This is Phase 2's MTP driver primitive (`h_p` in `docs/mtp.md`); Phase 1
     // only exposes it for validation (`lm_head(h_row) == logits_row`).
     mut h_out: Option<&mut Vec<f32>>,
     // Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc). `None` everywhere else.
@@ -647,7 +647,7 @@ pub(crate) fn generate_dense_backend(
         };
         for l in 0..c.n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
-            // qwen35 gated-DeltaNet linear-attention layer (see docs/QWEN35.md): a wholly different
+            // qwen35 gated-DeltaNet linear-attention layer (see docs/qwen35.md): a wholly different
             // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
             wload(&[&p("attn_norm.weight")])?;
@@ -707,7 +707,7 @@ pub(crate) fn generate_dense_backend(
             wload(&[&p(ffn_norm_name)])?;
             if c.dual_moe() {
                 // Dual FFN: dense GeGLU (n_ff=2112) ∥ 128-expert MoE (fused gate_up_exps + a
-                // per-expert down scale), summed — see docs/DIFFUSIONGEMMA.md's FFN wiring. Shared
+                // per-expert down scale), summed — see docs/diffusion-gemma.md's FFN wiring. Shared
                 // by diffusion-gemma and the autoregressive gemma4 MoE (26B-A4B); identical tensors.
                 // `fuse_gu`: one concatenated [2*nff,ne] gate+up tensor (see the comment at its
                 // definition) instead of two separate n_ff=2112 tensors.
@@ -792,7 +792,7 @@ pub(crate) fn generate_dense_backend(
         // diffusion-gemma: top-level self-conditioning gated MLP. LOADED (occupies a weight-buffer
         // slot like any other tensor) but NOT READ by any Op this phase — Phase 1 is the
         // encoder-only causal prefill, which runs with self-conditioning permanently off (see
-        // docs/DIFFUSIONGEMMA.md); the canvas denoise graph (Phase 2+) is the first reader.
+        // docs/diffusion-gemma.md); the canvas denoise graph (Phase 2+) is the first reader.
         // Loaded BEFORE the e2b block (mutually exclusive with it — no model is both) so the
         // `debug_assert_eq!` below, which indexes `wspecs` directly, isn't straddled by a later
         // `wload` call (the closure's mutable borrow of `wspecs` would conflict with that read).
@@ -1087,13 +1087,13 @@ pub(crate) fn generate_dense_backend(
     // `logits_rows == 0` builds a HEADLESS graph (no logits Output, no LM-head tail at all) —
     // the batched-prefill chunks, whose logits nothing consumes (task #27).
     // `denoise`: build the DiffusionGemma canvas-denoise variant of this layer stack instead of
-    // the ordinary causal forward — see docs/DIFFUSIONGEMMA.md's "Seam extensions". `batch` is the
+    // the ordinary causal forward — see docs/diffusion-gemma.md's "Seam extensions". `batch` is the
     // canvas length C, `start_pos` the prompt length P (unchanged meaning: WriteKv still lands at
     // row P, Attention's kv_len is still `start_pos+batch` = P+C, positions are still bound
     // per-row P..P+C-1 by the caller) — ONLY the attention mask and the per-layer output scalar
     // change. Never true for any existing caller (all pass `false`).
     // `gpu_sc`: Phase-B/D perf, DiffusionGemma in-graph self-conditioning (see
-    // docs/DIFFUSIONGEMMA.md's Phase-B and the reference's `dg_canvas_embed`) — `None` for every
+    // docs/diffusion-gemma.md's Phase-B and the reference's `dg_canvas_embed`) — `None` for every
     // ordinary caller (CPU denoise included: it keeps the Phase-A host `diffusion_self_cond`
     // path, so `hidden` is already the fully-baked residual). `Some(sc_on)` from the Vulkan AND
     // Metal denoise call sites: `hidden` there holds the RAW scaled canvas embedding (no SC add, no
@@ -1105,7 +1105,7 @@ pub(crate) fn generate_dense_backend(
     // (`DecodeHandles::h_out`) — see that field's doc. `false` for every existing call site;
     // `true` only from the decode loop / speculative-VERIFY call sites below when the caller
     // passed `h_out: Some(_)` to `generate_dense_backend`.
-    // `dyn_sc_scale` (Vulkan-only perf, docs/DIFFUSIONGEMMA.md's Phase-B "sc round-trip"
+    // `dyn_sc_scale` (Vulkan-only perf, docs/diffusion-gemma.md's Phase-B "sc round-trip"
     // elimination): only meaningful when `gpu_sc == Some(true)`. `true` declares an EXTRA 1-element
     // Input (`DecodeHandles::temp_inv`) and wires it as the SC subgraph's `Op::Softmax::scale_buf`
     // instead of baking `scale: 1.0` — the denoise call site uploads a 4-byte scalar there each
@@ -1559,7 +1559,7 @@ pub(crate) fn generate_dense_backend(
         let plg = g.internal(f32d(batch * npl.max(1)));
         let plp = g.internal(f32d(batch * ne));
 
-        // diffusion-gemma dual-FFN scratch (see docs/DIFFUSIONGEMMA.md's FFN wiring): the dense
+        // diffusion-gemma dual-FFN scratch (see docs/diffusion-gemma.md's FFN wiring): the dense
         // branch's own output (`d_out`, before summing with the MoE branch), the router's own
         // input row (`router_tmp` — a DIFFERENT normalization of `attn_out` than either FFN
         // branch reads), the MoE branch's input (`moe_in`) and raw output (`moe_out`). Harmlessly
@@ -1573,7 +1573,7 @@ pub(crate) fn generate_dense_backend(
         // Harmlessly allocated (but unused) on every other arch, like the scratch above.
         let shexp_gate = g.internal(f32d(batch));
 
-        // qwen35 attention out-gate scratch (the interleaved q+gate trap — see docs/QWEN35.md):
+        // qwen35 attention out-gate scratch (the interleaved q+gate trap — see docs/qwen35.md):
         // `qg` holds the RAW `attn_q` projection (`[batch, nh*2*hd]`, q and gate interleaved per
         // head); `gate_a` holds the split-out gate, packed like `q` (`[batch, nh*hd]`), consumed by
         // the post-attention `GatedAct(Sigmoid)`. Unused (but harmlessly allocated) on every other
@@ -1581,7 +1581,7 @@ pub(crate) fn generate_dense_backend(
         let qg = g.internal(f32d(batch * max_qrow * 2));
         let _gate_a = g.internal(f32d(batch * max_qrow));
 
-        // qwen35 gated-DeltaNet mixer scratch (see docs/QWEN35.md), reused across every DeltaNet
+        // qwen35 gated-DeltaNet mixer scratch (see docs/qwen35.md), reused across every DeltaNet
         // layer exactly like `hn`/`sub` above (qwen35's SSM dims are uniform across layers, unlike
         // gemma4's per-layer varying attention dims). `.max(1)`-guarded so a non-qwen35 model (every
         // q35_* dim is 0) still gets a valid, harmlessly-tiny allocation.
@@ -1684,7 +1684,7 @@ pub(crate) fn generate_dense_backend(
             };
 
         // Phase-B perf: DiffusionGemma in-graph canvas embedding (ported from the reference's
-        // `dg_canvas_embed` in diffusion-gemma.cpp — see docs/DIFFUSIONGEMMA.md's Phase-B).
+        // `dg_canvas_embed` in diffusion-gemma.cpp — see docs/diffusion-gemma.md's Phase-B).
         // `hidden` at this point holds ONLY the raw scaled canvas embedding
         // (`embed(tok)·√n_embd`, no SC add, no norm — the host caller uploads exactly that
         // instead of the Phase-A fully-baked residual). Runs BEFORE the layer loop below, which
@@ -1826,7 +1826,7 @@ pub(crate) fn generate_dense_backend(
             // ones-vector handle on llama4 rope layers, `None` on NoPE layers and every other model.
             let nope = c.is_nope_layer(l);
             let l2norm = if nope { None } else { qk_ones };
-            // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md): every canvas query attends
+            // DiffusionGemma canvas denoise (docs/diffusion-gemma.md): every canvas query attends
             // the SAME fixed bidirectional range `[lo, kv_len)` — `lo = 0` on full-attention
             // layers (every prompt + canvas key visible), `lo = max(0, P-(n_swa-1))` on SWA
             // layers (only the last `n_swa-1` prompt positions, but every canvas key — canvas
@@ -1866,7 +1866,7 @@ pub(crate) fn generate_dense_backend(
             let own_kv = c.has_own_kv(l);
             let kv_src = c.kv_src_layer(l);
             if let MixerW::DeltaNet(dw) = &lw.mixer {
-                // gated-DeltaNet linear attention (see docs/QWEN35.md) — no KV cache; the
+                // gated-DeltaNet linear attention (see docs/qwen35.md) — no KV cache; the
                 // recurrent state lives in `k_cache[l]`/`v_cache[l]` (repurposed as
                 // conv_state/s_state, see the matching alloc in `generate_dense_backend`).
                 g.push(Op::Linear {
@@ -2077,7 +2077,7 @@ pub(crate) fn generate_dense_backend(
                 } else if c.attn_out_gate {
                     // qwen35 attention layers pack q + a SIGMOID output gate INTERLEAVED per head in
                     // `attn_q` (`[h0 q(hd) | h0 gate(hd) | h1 q | h1 gate | …]`, NOT two contiguous
-                    // blocks — see docs/QWEN35.md). Project into `qg` (width 2*qrow) then split each
+                    // blocks — see docs/qwen35.md). Project into `qg` (width 2*qrow) then split each
                     // head's two halves into the packed `q` / `gate_a` scratch.
                     g.push(Op::Linear {
                         x: hn,
@@ -2859,7 +2859,7 @@ pub(crate) fn generate_dense_backend(
             // gemma4: scale the whole layer output by the per-layer scalar before the next layer.
             // DiffusionGemma denoise reads the DECODER scalar (`layer_output_scale`) instead of
             // the encoder one baked into `out_scale` for every other diffusion-gemma phase (the
-            // causal prompt prefill) — see docs/DIFFUSIONGEMMA.md.
+            // causal prompt prefill) — see docs/diffusion-gemma.md.
             let layer_scale = if denoise {
                 dec_out_scale[l]
             } else {
@@ -3019,7 +3019,7 @@ pub(crate) fn generate_dense_backend(
                 "denoise: prompt {p} + canvas {cc} exceeds the session KV capacity {max_ctx}"
             ));
         }
-        // Phase-B perf: in-graph self-conditioning on Vulkan (see docs/DIFFUSIONGEMMA.md's
+        // Phase-B perf: in-graph self-conditioning on Vulkan (see docs/diffusion-gemma.md's
         // Phase-B and the reference's `dg_canvas_embed`) — Phase D widened this to Metal too:
         // `Op::Softmax`'s wide kernel handles the [C, vocab] shape unmodified (a plain grid-stride
         // loop, no row/dim limit) and `sc_embT`'s `DType::F16` weight already flows through
@@ -3032,7 +3032,7 @@ pub(crate) fn generate_dense_backend(
         // The plan shape only varies with SC on the gpu_sc path (CPU's graph never changes;
         // `sc_on` there is purely a host-side input difference) — see `DenoiseCache::sc`'s doc.
         let plan_sc = gpu_sc && sc_on;
-        // Perf (Vulkan only — docs/DIFFUSIONGEMMA.md's Phase-B "sc round-trip" elimination): a
+        // Perf (Vulkan only — docs/diffusion-gemma.md's Phase-B "sc round-trip" elimination): a
         // session-persistent ping-pong pair of GPU buffers (`SeamKv::sc_ping`) stands in for
         // `DenoiseCache`'s per-plan `logits_buf`/`sc_logits_buf`. The previous call's LM-head
         // output is ALREADY resident in one of the pair (it's the very buffer that call
@@ -3334,7 +3334,7 @@ pub(crate) fn generate_dense_backend(
         let exec_secs = t_exec0.elapsed().as_secs_f64();
 
         let t_dl0 = std::time::Instant::now();
-        // Perf slice 3 (docs/DIFFUSIONGEMMA.md): try the GPU entropy-bound sampler reducer on
+        // Perf slice 3 (docs/diffusion-gemma.md): try the GPU entropy-bound sampler reducer on
         // THIS step's freshly-written logits before falling back to the full `[cc, vocab]`
         // download — see `EbReduced`'s doc. `req.u` is `None` for CPU/Metal (they never reach
         // this branch's Vulkan-only `use_ping` path anyway) and for Vulkan callers that opt out.
@@ -3456,7 +3456,7 @@ pub(crate) fn generate_dense_backend(
         be.upload(vf_pos_buf.as_ref(), bytemuck::cast_slice(&vf_positions))
             .map_err(|e| anyhow!("{e}"))?;
         // MTP Phase 1 (issue #33): VERIFY already runs the LM head on every one of the `m` rows —
-        // exactly the rows the MTP catch-up driver needs `h` for (docs/MTP.md's `process()`).
+        // exactly the rows the MTP catch-up driver needs `h` for (docs/mtp.md's `process()`).
         // `h_tap` piggybacks on the SAME graph/execute, just an extra Output + download.
         let want_h = h_out.is_some();
         // Phase-4 MTP profiling (issue #33, INFR_MTP_TIME=1): split VERIFY's own wall time into
@@ -3763,7 +3763,7 @@ pub(crate) fn generate_dense_backend(
             // samples from its own fresh logits — so the LM-head tail (whole-chunk output_norm,
             // last-row Copy, vocab-wide Linear, Softcap) is skipped per chunk. On a 262k-vocab
             // model that drops a vocab×n_embd GEMV + a [chunk, n_embd] RmsNorm per chunk.
-            // MTP h-tap gap (Phase 2 TODO, docs/MTP.md): the chunked BATCHED-PREFILL path never
+            // MTP h-tap gap (Phase 2 TODO, docs/mtp.md): the chunked BATCHED-PREFILL path never
             // taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring that
             // requires this path to carry `logits_rows == pf_m` on demand, which Phase 2 will
             // add alongside the actual head forward.

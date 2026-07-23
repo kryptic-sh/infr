@@ -2,7 +2,7 @@
 //! channel/tool-call parsing, the reasoning/content delta splitter). The load-pipeline/session
 //! orchestration this crate originally stubbed out (the `Engine` struct) is now the unified
 //! transformer runner in `infr-llama` (`SeamModel` + the per-backend `ChatModel` impls, see
-//! `docs/DIFFUSIONGEMMA.md` and `docs/QWEN35.md`) — every arch, including DiffusionGemma, is built
+//! `docs/diffusion-gemma.md` and `docs/qwen35.md`) — every arch, including DiffusionGemma, is built
 //! on it, so there is no separate "engine" seam left to implement here.
 //!
 //! Reference for chat/channel/tool behavior: `~/Projects/scratch/dgemma-openai-server.py`.

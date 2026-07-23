@@ -1,7 +1,7 @@
 //! The compute backend seam — the ONLY device-aware trait. Everything above is generic over it.
 //!
 //! Object-safe on purpose so the engine can hold `Arc<dyn Backend>` and stay blind to whether
-//! Vulkan / CPU / CUDA / ROCm / Metal / MLX is underneath. See docs/PLAN.md.
+//! Vulkan / CPU / CUDA / ROCm / Metal / MLX is underneath. See docs/plan.md.
 //!
 //! ## Execution model
 //!
@@ -578,7 +578,7 @@ pub trait Backend: Send + Sync {
         false
     }
 
-    /// Perf (DiffusionGemma denoise, perf slice 3 — docs/DIFFUSIONGEMMA.md): fused per-canvas-row
+    /// Perf (DiffusionGemma denoise, perf slice 3 — docs/diffusion-gemma.md): fused per-canvas-row
     /// entropy-bound sampler reduction over raw `[rows, dim]` logits, avoiding a full `[rows,
     /// dim]` host download. `u` is `rows` host-drawn uniform `[0,1)` floats (the seeded
     /// CDF-inversion target draw — reproducibility rides the SAME host RNG as the CPU sampler,

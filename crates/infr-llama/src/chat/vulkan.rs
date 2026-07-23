@@ -11,7 +11,7 @@ use anyhow::Result;
 ///
 /// This is the default `infr run`/`infr serve` path for EVERY arch including qwen35 (Phase 3
 /// cutover — see the matching comment at both CLI call sites), so it's also where MTP mode
-/// (issue #33, `docs/MTP.md`) lives: `mtp_head` is `Some` once resolved+loaded, built lazily on
+/// (issue #33, `docs/mtp.md`) lives: `mtp_head` is `Some` once resolved+loaded, built lazily on
 /// the first [`generate`](ChatModel::generate) call when [`wants_mtp`](Self::wants_mtp) is true
 /// (opt-in `INFR_MTP=1`, and only for a qwen35 GGUF that actually ships an MTP head —
 /// `Config::n_layer_nextn`'s doc). `INFR_MTP` unset/`0`, or a GGUF without an MTP head:
@@ -64,7 +64,7 @@ impl DenseSeamChat {
     }
 
     /// MTP mode is opt-in (`INFR_MTP=1`) and Vulkan-only this phase (the invariant test + the
-    /// oracle comparison in `docs/MTP.md` are both pinned on Vulkan — CPU/Metal MTP is
+    /// oracle comparison in `docs/mtp.md` are both pinned on Vulkan — CPU/Metal MTP is
     /// unimplemented, not merely untested; `DenseSeamChat` IS always Vulkan, so no backend gate
     /// is needed here beyond the GGUF check). Memoized after the first call (`mtp_checked`) so a
     /// non-MTP GGUF doesn't re-parse its `Config` every turn.

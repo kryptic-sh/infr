@@ -75,7 +75,7 @@ enum DgBackend {
     Metal,
 }
 
-/// diffusion-gemma (Phase 3/D — block text-diffusion, see `docs/DIFFUSIONGEMMA.md` and
+/// diffusion-gemma (Phase 3/D — block text-diffusion, see `docs/diffusion-gemma.md` and
 /// `crate::diffusion`): the entropy-bound decode loop over a persistent session, Vulkan by
 /// default, or the CPU/Metal reference backends under `INFR_CPU`/`INFR_METAL` (Phase D added the
 /// Metal DG session — macOS only; the non-macOS build still compiles `new_metal`, `generate`

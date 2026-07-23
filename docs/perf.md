@@ -1,4 +1,4 @@
-# PERF.md — the performance optimization playbook
+# perf.md — the performance optimization playbook
 
 How to make infr faster, written for an agent (or human) picking up the perf
 campaign. The reference target is llama.cpp on the same GPU: every number we
@@ -51,13 +51,13 @@ infr compare --sweep <models...> --sweep-depth 4096
 Rules that exist because we got burned:
 
 - **One benchmark at a time.** Concurrent GPU work skews both sides.
-- **Cool-down between manual runs.** When running multiple `infr bench`
-  commands back to back (e.g. A/B testing kernel variants), insert a 60s+ sleep
-  between runs so the GPU cools to idle temperature. A hot GPU from a prior run
-  can depress the next run's numbers by 2-8% — enough to reverse a winning
-  variant. This applies to manual bench calls; `infr compare --sweep` already
-  serializes internally but the multi-model chip heating is its own problem (see
-  Archiving sweeps below).
+- **Cool-down between manual runs.** When running multiple `infr bench` commands
+  back to back (e.g. A/B testing kernel variants), insert a 60s+ sleep between
+  runs so the GPU cools to idle temperature. A hot GPU from a prior run can
+  depress the next run's numbers by 2-8% — enough to reverse a winning variant.
+  This applies to manual bench calls; `infr compare --sweep` already serializes
+  internally but the multi-model chip heating is its own problem (see Archiving
+  sweeps below).
 - **r=2 is noisy.** A "regression" that appears at r=2 may be variance —
   re-measure with r=3+ and compare against the historical range before reacting.
   Never auto-revert; diagnose first.
@@ -72,7 +72,7 @@ Rules that exist because we got burned:
 - **DiffusionGemma sweeps differently.** `arch=diffusion-gemma` has no upstream
   `llama-bench` support, so its sweep row comes from the reference fork's
   `llama-diffusion-cli` instead (see the README's Compare section and
-  `docs/DIFFUSIONGEMMA.md`) and prints `dg-step`/`dg-e2e` instead of
+  `docs/diffusion-gemma.md`) and prints `dg-step`/`dg-e2e` instead of
   pp512/tg128/tg64@d/mtp128. Only `dg-step` (in-step-parallel throughput) feeds
   the ranked "BIGGEST GAPS" summary — `dg-e2e` is informational because the two
   implementations' entropy-bound samplers run different step counts for the same

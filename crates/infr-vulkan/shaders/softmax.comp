@@ -1,6 +1,6 @@
 #version 460
 // Row-wise softmax: y[r,:] = softmax(x[r,:] * scale), one workgroup per row. diffusion-gemma's
-// in-graph self-conditioning (see docs/DIFFUSIONGEMMA.md's Phase-B and the reference's
+// in-graph self-conditioning (see docs/diffusion-gemma.md's Phase-B and the reference's
 // `dg_canvas_embed`): softmaxes the previous step's canvas logits over the FULL vocab before the
 // soft-embedding matmul. Same 256-thread subgroup-reduction shape as `rmsnorm.comp` — `dim` here
 // is the vocab (hundreds of thousands wide), so the cooperative reduction matters just as much.

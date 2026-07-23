@@ -264,7 +264,7 @@ void main() {
     // Small-m static path: workgroup y picks the query row (1D dispatch → row 0 = old decode);
     // this row's causal END is its absolute position + 1 (mirrors attention_kv's per-row bound).
     uint row = gl_WorkGroupID.y;
-    // DiffusionGemma canvas denoise (docs/DIFFUSIONGEMMA.md): `pc.rows` is otherwise DEAD in this
+    // DiffusionGemma canvas denoise (docs/diffusion-gemma.md): `pc.rows` is otherwise DEAD in this
     // shader (the dispatch grid already encodes the row via gl_WorkGroupID.y, so nothing here
     // ever needed the row COUNT) — repurposed as `canvas_lo+1` (0 = disabled) by
     // `attention_kv_split`. When set, EVERY row attends the SAME fixed bidirectional range

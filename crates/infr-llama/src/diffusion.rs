@@ -2,7 +2,7 @@
 //! [`crate::seam::model::DiffusionGemmaCpuSession`] or its Vulkan twin through the small
 //! [`DiffusionSession`] trait). Ports `diffusion_generate_entropy_bound` + `run_turn`'s block loop
 //! from the oracle reference (`~/Projects/mxaddict/llama.cpp-dg/examples/diffusion/diffusion.cpp`
-//! and `diffusion-cli.cpp`) — see `docs/DIFFUSIONGEMMA.md`'s "Decode loop" section. Line refs in
+//! and `diffusion-cli.cpp`) — see `docs/diffusion-gemma.md`'s "Decode loop" section. Line refs in
 //! comments below point at `diffusion.cpp`'s `diffusion_generate_entropy_bound` (the sampler) and
 //! `diffusion-cli.cpp`'s `run_turn` (the block/commit/trim loop), both read 2026-07-05.
 //!
@@ -20,7 +20,7 @@ use rayon::prelude::*;
 /// The two DiffusionGemma sessions' shared shape (Phase 2, `seam/model.rs`): causal prefill of the
 /// committed prefix, then a canvas denoise forward. One decode loop below drives either backend.
 ///
-/// Perf slice 3 (docs/DIFFUSIONGEMMA.md): `sample_temp_inv`/`u` let a Vulkan session try the GPU
+/// Perf slice 3 (docs/diffusion-gemma.md): `sample_temp_inv`/`u` let a Vulkan session try the GPU
 /// entropy-bound sampler reducer for THIS step (see [`DenoiseOutcome`]) — `sample_temp_inv` is the
 /// CURRENT step's sampler temperature divisor (`denoise_block`'s local `temp_inv`, NOT the 4th
 /// arg, which is the PREVIOUS step's self-conditioning divisor) and `u` is `canvas_tokens.len()`
@@ -320,7 +320,7 @@ fn denoise_block(
 
         // Pre-draw the step's randomness single-threaded BEFORE the reduction (host or GPU), so
         // the result doesn't depend on thread scheduling (`diffusion.cpp:576-580`) — moved ahead
-        // of the `denoise` call itself (perf slice 3, docs/DIFFUSIONGEMMA.md): a Vulkan session
+        // of the `denoise` call itself (perf slice 3, docs/diffusion-gemma.md): a Vulkan session
         // needs `u` uploaded ALONGSIDE this step's forward dispatch to run the GPU reducer, but
         // this is still the exact same RNG draw, in the exact same order, as before the move —
         // nothing else touches `rng` between the old and new call sites within a step.
@@ -349,7 +349,7 @@ fn denoise_block(
                 //
                 // Perf (profiled via samply: this loop's `exp`/`ln` calls — glibc's correctly-rounded
                 // expf/logf helper, `f32subf64x` — were >25% of ALL sampled thread-time on a 256-row
-                // canvas × 262144-vocab step, dwarfing every GPU kernel's share; see docs/PERF.md's
+                // canvas × 262144-vocab step, dwarfing every GPU kernel's share; see docs/perf.md's
                 // class-5 "host-in-the-loop" entry — the motivation for slice 3's GPU reducer below).
                 // The original computed `exp(raw*temp_inv - m)` TWICE per vocab element (once to
                 // accumulate `z_sum`, again — bit-for-bit the same value, since `exp` is a pure

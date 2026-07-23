@@ -1,5 +1,5 @@
 #version 460
-// DiffusionGemma entropy-bound sampler reduction (perf slice 3, docs/DIFFUSIONGEMMA.md): fuses
+// DiffusionGemma entropy-bound sampler reduction (perf slice 3, docs/diffusion-gemma.md): fuses
 // `diffusion.rs::denoise_block`'s per-canvas-row host closure (`per_pos`) into ONE GPU pass per
 // row, so the driver downloads `[rows]`-sized argmax/entropy/sampled arrays instead of the raw
 // `[rows, dim]` logits (dim = vocab, ~262144 — a >10000x smaller readback). One workgroup (256

@@ -167,7 +167,7 @@ ATTNSPLIT_KERNEL(attnsplit32_f32, float, 32u, 128u)
 ATTNSPLIT_KERNEL(attnsplit32_f16kv, half, 32u, 128u)
 
 // ---- Canvas split-KV attention (DiffusionGemma denoise, `AttnMask::Canvas` —
-// docs/DIFFUSIONGEMMA.md): EVERY row attends the SAME fixed bidirectional `[lo, kv_len)` reach,
+// docs/diffusion-gemma.md): EVERY row attends the SAME fixed bidirectional `[lo, kv_len)` reach,
 // unlike ATTNSPLIT_KERNEL above (and every other kernel in this file), which derives a per-row
 // causal end from `pos + ti` and an optional sliding-window `lo`. Repurposing ATTNSPLIT_KERNEL's
 // fields with a sentinel would risk colliding with a genuine non-canvas dispatch (both would see

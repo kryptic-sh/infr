@@ -50,7 +50,7 @@ pub const QWEN35_MOE: &str = "qwen35moe";
 /// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
 /// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN
 /// (dense GeGLU ∥ 128-expert MoE, summed) and encoder/decoder per-layer output scalars. See
-/// `docs/DIFFUSIONGEMMA.md`.
+/// `docs/diffusion-gemma.md`.
 pub const DIFFUSION_GEMMA: &str = "diffusion-gemma";
 /// BitNet b1.58 (1bitLLM): the llama skeleton (NEOX rope like qwen2 — GGUF q/k stay in HF order,
 /// so the loader permutes rows via `Config::permute_qk_neox`; no qk-norm, no attention bias, tied

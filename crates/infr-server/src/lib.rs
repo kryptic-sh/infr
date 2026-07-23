@@ -1,7 +1,7 @@
 //! OpenAI-compatible HTTP server (axum + SSE). Talks only to `infr-engine` — never the GPU.
 //!
 //! Reference for the wire mapping (streaming, `reasoning_content`, tool_calls): the working
-//! shim at `~/Projects/scratch/dgemma-openai-server.py`. See docs/PLAN.md "server".
+//! shim at `~/Projects/scratch/dgemma-openai-server.py`. See docs/plan.md "server".
 //!
 //! Routes:
 //!   GET  /health                -> 200 OK
@@ -62,7 +62,7 @@ impl Finish {
 /// Generation backend the server drives — it never knows the model/GPU underneath. Implemented by
 /// the CLI's per-arch adapters (`infr-cli`'s `ParallelGenerator` over `infr_llama::ParallelSeam` for
 /// the Vulkan seam; `SeamGenerator` wraps any `infr_llama::ChatModel` for the rest, including
-/// `DiffusionGemmaChat` — see `docs/DIFFUSIONGEMMA.md`).
+/// `DiffusionGemmaChat` — see `docs/diffusion-gemma.md`).
 ///
 /// [`GenParams`] carries the request's PER-REQUEST sampling config (temperature/top_p/top_k/seed/
 /// penalties/stop/max_tokens). Every field is an `Option` whose `None` means "inherit the process

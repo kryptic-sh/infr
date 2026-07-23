@@ -9,7 +9,7 @@ use super::{
     generate_mtp_spec_core, BindWeightFn, MtpHeadSession, MtpHeadWeights, MtpTiming, DEFAULT_N_MAX,
 };
 
-/// The MTP self-speculative generation loop (issue #33, Phase 3 — see `docs/MTP.md`'s driver
+/// The MTP self-speculative generation loop (issue #33, Phase 3 — see `docs/mtp.md`'s driver
 /// section and `crate::seam::model::SeamModel::generate_metal_spec`, whose two-model draft/verify/
 /// commit shape this mirrors for a SINGLE self-speculating trunk on the Vulkan production
 /// backend). **Greedy only** (temp 0) — the commit/accept invariant below only holds at temp 0;
@@ -18,7 +18,7 @@ use super::{
 /// No cross-turn KV reuse: every call builds a FRESH trunk session + [`MtpHeadSession`] and
 /// re-prefills the WHOLE (rendered, multi-turn-inclusive) prompt from scratch. `DenseSeamChat`'s
 /// non-MTP path keeps a persistent per-conversation `DenseVulkanSession`; MTP's
-/// win is DECODE throughput (the thing `docs/MTP.md`'s 2.0x oracle number measures), not prefill
+/// win is DECODE throughput (the thing `docs/mtp.md`'s 2.0x oracle number measures), not prefill
 /// reuse, so trading a little prefill cost for a MUCH simpler (and correct) session lifetime is
 /// the pragmatic call this phase makes — a real persistent MTP session hits a self-referential-
 /// struct problem ([`MtpHeadSession`] borrows the backend + embedding table it's built from) that
@@ -28,7 +28,7 @@ use super::{
 /// loop around the target decode, adapted to infr's own VERIFY primitive)
 /// 1. **Prime** (once): a single batched VERIFY forward over the WHOLE prompt captures `h` for
 ///    EVERY prompt row in one shot (no chunked-prefill h gap for the prompt sizes this phase
-///    validates — a genuinely huge prompt would need the lazy-priming fallback `docs/MTP.md`
+///    validates — a genuinely huge prompt would need the lazy-priming fallback `docs/mtp.md`
 ///    sanctions instead: "MTP attention over a partial-history KV degrades gracefully"). `catch_up`
 ///    primes the head over the whole prompt — mirrors `mtp_head_forward_finite`'s `prime_head` test
 ///    helper exactly (`shifted_h[0]` zero, `pending_h` = the last row).
@@ -55,7 +55,7 @@ use super::{
 /// driver (`SeamModel::generate_metal_spec`'s own doc: "Rollback is the session prefix-diff:
 /// rejected rows just get overwritten by the next round's suffix prefill"). qwen35's gated-
 /// DeltaNet layers can't rewind that way (an append-only recurrent summary, not a per-position
-/// cache — `docs/QWEN35.md`): the SAME `generate_dense_backend` prefix-diff logic that reuses
+/// cache — `docs/qwen35.md`): the SAME `generate_dense_backend` prefix-diff logic that reuses
 /// dense KV rows falls back to a FULL reprefill from position 0 whenever a cycle's committed
 /// stream doesn't EXACTLY extend the trunk's cached tokens (`seam.rs`'s `start`
 /// computation, the `c.qwen35` branch) — i.e. every partial/zero-accept cycle pays a full
@@ -63,7 +63,7 @@ use super::{
 /// reuse (predates MTP; it would bite ANY qwen35 speculative scheme, draft-model or MTP), not
 /// something this phase introduces — see `INFR_MTP_TIME=1`'s per-cycle report for its measured
 /// cost, and the accompanying report for whether it's the dominant cost. The head's OWN KV has no
-/// such issue: `MtpHeadSession`'s attention layer is an ordinary per-position cache (`docs/MTP.md`),
+/// such issue: `MtpHeadSession`'s attention layer is an ordinary per-position cache (`docs/mtp.md`),
 /// so `catch_up` only ever (re)writes the newly-committed rows, never the whole history.
 ///
 /// ## Perf instrumentation (`INFR_MTP_TIME=1`)

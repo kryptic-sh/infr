@@ -37,6 +37,12 @@ the `infr` inference engine. The top-level project overview lives in the root
 
 ## Roadmaps & history
 
+- [rocm-plan.md](rocm-plan.md) — phased plan for a native ROCm/HIP AMD GPU
+  backend (`infr-rocm`): correctness-first (all models × quants) then a fast
+  kernel per model × quant. Not yet built.
+- [cuda-plan.md](cuda-plan.md) — phased plan for a native CUDA NVIDIA GPU
+  backend (`infr-cuda`), sibling of the ROCm plan; Tensor Cores / cuBLASLt /
+  CUDA Graphs, validated on remote NVIDIA hardware. Not yet built.
 - [plan.md](plan.md) — the original master project plan (historical). Most of it
   shipped against autoregressive decoders; kept for context.
 - [train.md](train.md) — LLM training support plan (not yet built).

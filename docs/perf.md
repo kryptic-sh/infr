@@ -6,6 +6,63 @@ care about is a **ratio** (`infr t/s ÷ llama.cpp t/s`) on matched flags. The
 campaign goal is ≥1.0x on every supported model × quant, prefill and decode,
 without ever sacrificing correctness.
 
+## Hardware contention — exclusive device access (READ FIRST)
+
+The single most important operational rule, above the perf loop itself:
+
+> **One process/agent at a time may use the CPU or GPU.** Any work that touches
+> a compute device — a build, a test run, a benchmark, an `infr run`/`serve`, a
+> profile — holds that device **exclusively for its whole duration**. Never run
+> two such tasks concurrently, whether you are a human, an agent, or an
+> orchestrator fanning out subagents. The device is a single mutex; take it,
+> finish, release, then start the next.
+
+Why it is non-negotiable:
+
+- **Benchmarks are only valid in isolation.** Concurrent device work skews both
+  sides of every ratio — thermally (a chip warmed by a neighbouring job reads
+  2-8% low) and through contention (shared memory bandwidth, SM/CU occupancy). A
+  "regression" measured next to other device work is an artifact, not a finding.
+- **The GPU can wedge.** On UMA/integrated parts two big models running at once
+  exhaust GTT and wedge the device; a job killed mid-submit leaves an unkillable
+  D-state task holding the GPU until reboot (see `docs/igpu.md`). Serial,
+  patient device use is also a stability requirement, not only a measurement
+  one.
+
+The rules that follow from it:
+
+1. **Serialize ALL device work.** Benches, profiles, `infr run`/`serve`, GPU/CPU
+   test suites, and the release builds that feed them — one at a time. This is
+   broader than "one benchmark at a time": a compile racing a bench, or two test
+   runs, contend just as badly.
+2. **Perf/bench slices are strictly serial — never two at once.** Including the
+   A and B of an A/B variant comparison. (This is the loop's "do not do two
+   slices at once", made explicit.)
+3. **Coding/edit agents may parallelize (max 2); device work may not.** You may
+   fan out subagents that only read or edit source. But the moment a task
+   compiles, tests, benches, profiles, or runs a model it must be the ONLY one
+   doing so. Delegated **perf agents run ONE at a time**; delegated coding
+   agents **at most two**, and neither may bench/run a model concurrently with
+   the other.
+4. **Never background a device job.** No background `cargo test` / `cargo bench`
+   / `infr run` — run it in the foreground with a generous `timeout` so it
+   cannot outlive its turn or overlap the next task. (Backgrounding non-device
+   work is fine.)
+5. **Never `timeout`/SIGTERM a GPU job mid-submit.** On some devices (integrated
+   AMD especially) a kill during a submit leaves an unkillable D-state task in
+   `dma_fence_wait` holding the GPU, dropped from enumeration until reboot
+   (`docs/igpu.md`). Give device runs a generous `timeout` and never wrap them
+   in a tool call that can time out first.
+6. **Cool down between manual bench runs.** 60s+ between back-to-back
+   `infr bench` A/B runs so the GPU returns to idle temperature — a hot GPU
+   depresses the next run 2-8%, enough to reverse a winning variant.
+   (`infr compare --sweep` serializes internally, but a multi-model sweep still
+   heats the chip; re-probe a flagged row SOLO on an idle device before calling
+   a regression — see "Archiving sweeps".)
+7. **Validate correctness first, then bench** — parity + goldens before any
+   timing (also step 5 of the loop). A correctness run is device work too:
+   serialize it like everything else.
+
 ## The loop
 
 Every perf slice follows the same shape. Do not skip steps, and do not do two

@@ -1517,3 +1517,194 @@ fn softcap_matches_cpu() {
         "Softcap diverges from CPU reference (wrong cap formula / tanh): {e:e}"
     );
 }
+
+// ── All-weight-quant Linear parity sweep (Slice 10, docs/rocm-plan.md Part A) ─────────────────────
+//
+// The ROCm Linear path dequantizes ANY weight quant to f32 via the shared
+// `infr_gguf::dequant::dequant_block`, rounds to f16, then runs the f32-accumulating `linear_f16`
+// GEMV (kernels.rs). So every weight quant format is supported by construction — the only per-format
+// risk is a bad block-byte assumption or an odd block stride. This sweep proves each of the 24 real
+// WEIGHT quant formats decodes and GEMVs in agreement with `infr_cpu::CpuBackend` running the SAME
+// one-op graph (CPU dequants the same bytes with `dequant_block` + an f32 matmul). Because both
+// backends share the SAME decoder, the ONLY error source is the ROCm side's f16 weight rounding
+// (the GEMV accumulates in f32), so tolerances are the ~2e-2 rel bound the Q4_K test uses, tightened
+// per format where the f16 rounding lands well inside it.
+//
+// EXCLUDED (not weight quants): F32/F16/Bf16/I32/U32 (dense, covered by `linear_f16_matches_cpu`);
+// I2S (BitNet i2_s — host-converted to f16 at weight load, never reaches a backend as I2S, so ROCm
+// only ever sees f16; validated end-to-end in the plan's BitNet run, not here); Turbo2/3/4 (KV-cache
+// -only formats, never GGUF weights).
+
+/// Deterministic LCG byte stream — an arbitrary but reproducible payload for quant code/nibble
+/// fields, which decode to FINITE values for ANY byte pattern (only the f16 scale slots must be
+/// sane). Ported from the Metal parity suite's `lcg_bytes`.
+fn lcg_bytes(mut seed: u32, n: usize) -> Vec<u8> {
+    (0..n)
+        .map(|_| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 16) as u8
+        })
+        .collect()
+}
+
+/// Synthesize a valid block-quantized weight of `n_elem` elements for a format whose only
+/// "must be finite" fields are one or two f16 scale slots at fixed block offsets: LCG-random code
+/// bytes (finite-decoding for any pattern) with each `(offset, value)` in `scales` written as a
+/// little-endian f16. Covers 21 of the 24 formats; MXFP4/NVFP4/IQ1_M have non-f16 scale encodings
+/// and get bespoke builders below. Block byte layouts cross-checked against
+/// `infr_gguf::block_layout` and the `dequant_block` decoders.
+fn synth_q(
+    n_elem: usize,
+    block_elems: usize,
+    bpb: usize,
+    seed: u32,
+    scales: &[(usize, f32)],
+) -> Vec<u8> {
+    assert_eq!(
+        n_elem % block_elems,
+        0,
+        "n_elem not a multiple of block size"
+    );
+    let mut out = Vec::with_capacity((n_elem / block_elems) * bpb);
+    for blk_i in 0..(n_elem / block_elems) {
+        let mut blk = lcg_bytes(seed ^ blk_i as u32, bpb);
+        for &(off, v) in scales {
+            blk[off..off + 2].copy_from_slice(&half::f16::from_f32(v).to_le_bytes());
+        }
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+/// MXFP4 (32e / 17B): `[u8 E8M0 exponent][16B nibbles]`. The E8M0 byte is a shared exponent
+/// `d = 2^(e-127)`; keep `e ∈ {124..=132}` so `d` stays in `2^-3..2^5` — decoded products stay well
+/// inside f32 while still exercising the E8M0 decode across a band. Nibbles LCG (KVALUES_MXFP4).
+fn synth_mxfp4(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 32, 0, "MXFP4 blocks are 32 elems");
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 32) {
+        let mut blk = lcg_bytes(seed ^ blk_i as u32, 17);
+        blk[0] = 124 + (blk_i % 9) as u8; // E8M0 exponent, moderate band
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+/// NVFP4 (64e / 36B): `[u8 UE4M3 sub-scale[4]][32B nibbles]`. The four bytes are per-16-element
+/// UE4M3 scales; 0x3A/0x3C/0x3E/0x40 decode to 0.625/0.75/0.875/1.0 (moderate, none the zero-flush
+/// corners), exercising four distinct sub-block scales. Nibbles LCG (shared KVALUES_MXFP4).
+fn synth_nvfp4(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 64, 0, "NVFP4 blocks are 64 elems");
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 64) {
+        let mut blk = lcg_bytes(seed ^ blk_i as u32, 36);
+        blk[0..4].copy_from_slice(&[0x3A, 0x3C, 0x3E, 0x40]);
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+/// IQ1_M (256e / 56B): `[32B qs][16B qh][8B scales]` with NO separate `d` — `d` is a f16 assembled
+/// from the TOP nibbles of the four u16 scale words, so random scale bytes would yield a garbage/NaN
+/// `d`. Set `d` deliberately (its four nibbles → the four scale-word top nibbles, bits 12..15); the
+/// low 12 bits (four 3-bit `dl` fields) plus all qs/qh (11-bit grid index + delta sign) are LCG.
+/// Ported from the Metal parity suite's `synth_iq1m`.
+fn synth_iq1m(n_elem: usize, seed: u32) -> Vec<u8> {
+    assert_eq!(n_elem % 256, 0, "IQ1_M blocks are 256 elems");
+    let d_bits = half::f16::from_f32(0.03).to_bits();
+    let mut out = Vec::new();
+    for blk_i in 0..(n_elem / 256) {
+        let mut blk = vec![0u8; 56];
+        blk[0..48].copy_from_slice(&lcg_bytes(seed ^ blk_i as u32, 48)); // qs + qh
+        let low = lcg_bytes(seed.wrapping_add(0x9e37).wrapping_add(blk_i as u32), 8);
+        for i in 0..4usize {
+            let nib = (d_bits >> (4 * i)) & 0xf;
+            let lo12 = ((low[2 * i] as u16) | ((low[2 * i + 1] as u16) << 8)) & 0x0fff;
+            let scw = (nib << 12) | lo12;
+            blk[48 + 2 * i..48 + 2 * i + 2].copy_from_slice(&scw.to_le_bytes());
+        }
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+/// Sweep EVERY real weight quant format (24) through a one-`Op::Linear` graph on `RocmBackend` vs
+/// `infr_cpu::CpuBackend` and assert per-format parity. See the module comment above for what this
+/// covers and why the tolerance is the f16-weight-rounding bound.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn all_quant_linear_matches_cpu() {
+    if rocm().is_none() {
+        return;
+    }
+    let cpu = infr_cpu::CpuBackend::new();
+    // n = out_f*in_f = 2048 is divisible by every block size (32 / 64 / 256), so one dimension set
+    // covers all formats. m=2 exercises the multi-row GEMV.
+    let (m, in_f, out_f) = (2usize, 256usize, 8usize);
+    let n = out_f * in_f;
+    let x = gen(m * in_f, 5);
+
+    // (dtype, weight bytes, rel tol, label). Block layouts / byte offsets from `block_layout` and the
+    // `dequant_block` decoders; the f16 `d` (and dmin/m) magnitudes mirror the Metal parity synths so
+    // synthetic weight magnitudes stay realistic (esp. the signed-codebook i-quants that cancel).
+    #[rustfmt::skip]
+    let cases: Vec<(DType, Vec<u8>, f32, &str)> = vec![
+        // ── legacy round quants ──
+        (DType::Q4_0, synth_q(n, 32, 18, 201, &[(0, 0.04)]),              6e-3, "Q4_0"),
+        (DType::Q4_1, synth_q(n, 32, 20, 202, &[(0, 0.04), (2, -0.30)]), 6e-3, "Q4_1"),
+        (DType::Q5_0, synth_q(n, 32, 22, 203, &[(0, 0.04)]),              6e-3, "Q5_0"),
+        (DType::Q5_1, synth_q(n, 32, 24, 204, &[(0, 0.04), (2, -0.30)]), 6e-3, "Q5_1"),
+        (DType::Q8_0, synth_q(n, 32, 34, 205, &[(0, 0.01)]),              1e-2, "Q8_0"),
+        // ── k-quants (d/dmin/scale offsets differ per format; Q2_K's scales sit at the block TAIL) ──
+        (DType::Q2K, synth_q(n, 256, 84, 206, &[(80, 0.05), (82, 0.10)]), 2e-2, "Q2_K"),
+        (DType::Q3K, synth_q(n, 256, 110, 207, &[(108, 0.03)]),           2e-2, "Q3_K"),
+        (DType::Q4K, synth_q(n, 256, 144, 208, &[(0, 0.05), (2, 0.10)]),  2e-2, "Q4_K"),
+        (DType::Q5K, synth_q(n, 256, 176, 209, &[(0, 0.05), (2, 0.10)]),  2e-2, "Q5_K"),
+        (DType::Q6K, synth_q(n, 256, 210, 210, &[(208, 0.03)]),           2e-2, "Q6_K"),
+        // ── i-quants (codebook / grid): signed values cancel in the dot, so keep the ~2e-2 bound ──
+        (DType::Iq4Nl,  synth_q(n, 32, 18, 211, &[(0, 0.004)]),  6e-3, "IQ4_NL"),
+        (DType::Iq4Xs,  synth_q(n, 256, 136, 212, &[(0, 0.06)]), 2e-2, "IQ4_XS"),
+        (DType::Iq2Xxs, synth_q(n, 256, 66, 213, &[(0, 0.015)]), 2e-2, "IQ2_XXS"),
+        (DType::Iq2Xs,  synth_q(n, 256, 74, 214, &[(0, 0.015)]), 2e-2, "IQ2_XS"),
+        (DType::Iq2S,   synth_q(n, 256, 82, 215, &[(0, 0.015)]), 2e-2, "IQ2_S"),
+        (DType::Iq3Xxs, synth_q(n, 256, 98, 216, &[(0, 0.008)]), 2e-2, "IQ3_XXS"),
+        (DType::Iq3S,   synth_q(n, 256, 110, 217, &[(0, 0.002)]), 2e-2, "IQ3_S"),
+        (DType::Iq1S,   synth_q(n, 256, 50, 218, &[(0, 0.03)]),  2e-2, "IQ1_S"),
+        (DType::Iq1M,   synth_iq1m(n, 219),                      2e-2, "IQ1_M"),
+        // ── ternary quants (d at block TAIL for TQ*, head for Q2_0) ──
+        (DType::Tq1_0, synth_q(n, 256, 54, 220, &[(52, 0.05)]), 2e-2, "TQ1_0"),
+        (DType::Tq2_0, synth_q(n, 256, 66, 221, &[(64, 0.05)]), 2e-2, "TQ2_0"),
+        (DType::Q2_0,  synth_q(n, 64, 18, 222, &[(0, 0.05)]),   6e-3, "Q2_0"),
+        // ── fp4 quants (non-f16 scale encodings) ──
+        (DType::Mxfp4, synth_mxfp4(n, 223), 2e-2, "MXFP4"),
+        (DType::Nvfp4, synth_nvfp4(n, 224), 2e-2, "NVFP4"),
+    ];
+
+    let mut failures = Vec::new();
+    for (dt, wbytes, tol, label) in cases {
+        // Fresh ROCm backend per format: `dequant_weight_or_cache` keys the dequantized-weight cache
+        // by the weight's raw device pointer, and a weight buffer freed at the end of one case can
+        // have its VRAM address recycled by the next — a stale cache hit would feed the previous
+        // format's dequantized rows. (The same hazard the embed_gather test documents.)
+        let be = rocm().unwrap();
+        let c = run_linear(&cpu, &x, &wbytes, dt, m, in_f, out_f);
+        let r = run_linear(&be, &x, &wbytes, dt, m, in_f, out_f);
+        let e = maxerr(&c, &r);
+        let ref_mag = maxabs(&c).max(1e-3);
+        let rel = e / ref_mag;
+        println!("Linear[{label:7}] max_err={e:e} max|ref|={ref_mag:e} rel={rel:e} tol={tol:e}");
+        // Vacuity: a silently-zero output must not masquerade as agreement.
+        assert!(
+            ref_mag > 1e-3,
+            "Linear[{label}] reference is all-zero — test is vacuous"
+        );
+        if rel >= tol {
+            failures.push(format!("{label}: rel={rel:e} >= tol={tol:e} (abs={e:e})"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "weight-quant Linear parity failures:\n  {}",
+        failures.join("\n  ")
+    );
+}

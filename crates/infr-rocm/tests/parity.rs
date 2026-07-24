@@ -201,6 +201,142 @@ fn linear_q4k_matches_cpu() {
     );
 }
 
+// ── Int8-activation dp4a GEMV (Phase 4) vs the CPU f32 reference ──────────────
+//
+// The default `Op::Linear` path for Q4_K/Q6_K/Q8_0 now quantizes the activation row to int8 and
+// integer-dots (`__builtin_amdgcn_sdot4`) against the native weight codes, applying the weight
+// block scale AFTER the accumulation. This is a SANCTIONED PRECISION FLIP (int8 activation is
+// lossy), so parity is checked against the CPU f32 reference within an int8 tolerance (the dot
+// averages the per-element ~1/127 quant error down to well under the bound). Every case uses m=2 to
+// exercise the multi-row (`mrow`) grid and carries a vacuity guard (a silently-zero output must not
+// masquerade as agreement). Setting `INFR_ROCM_NO_I8` would route the Phase-3 f16 path instead.
+
+/// Build `blocks` valid Q8_0 blocks (34 B = [f16 d][int8 qs[32]]) with a finite small scale and
+/// patterned signed codes.
+fn q80_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 34];
+    for blk in 0..blocks {
+        let base = blk * 34;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(0.02).to_le_bytes());
+        for j in 0..32 {
+            // signed int8 codes spanning a representative range.
+            w[base + 2 + j] = (((blk * 7 + j * 5) % 251) as i32 - 125) as i8 as u8;
+        }
+    }
+    w
+}
+
+/// Build `blocks` valid Q6_K blocks (210 B = [ql 128][qh 64][int8 scales 16][f16 d]) with a finite
+/// small `d`, a benign in-range int8 sub-block scale, and patterned ql/qh.
+fn q6k_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 210];
+    for (i, byte) in w.iter_mut().enumerate() {
+        *byte = ((i * 37 + 11) & 0xFF) as u8;
+    }
+    for blk in 0..blocks {
+        let base = blk * 210;
+        // 16 int8 sub-block scales — a small positive constant keeps decode in a sane range.
+        for s in 0..16 {
+            w[base + 192 + s] = 8i8 as u8;
+        }
+        // f16 d in the last 2 bytes.
+        w[base + 208..base + 210].copy_from_slice(&half::f16::from_f32(0.03).to_le_bytes());
+    }
+    w
+}
+
+/// Build `blocks` valid Q4_K blocks (144 B) — same construction as `linear_q4k_matches_cpu`.
+fn q4k_blocks(blocks: usize) -> Vec<u8> {
+    let mut w = vec![0u8; blocks * 144];
+    for (i, byte) in w.iter_mut().enumerate() {
+        *byte = ((i * 37 + 11) & 0xFF) as u8;
+    }
+    for blk in 0..blocks {
+        let base = blk * 144;
+        w[base..base + 2].copy_from_slice(&half::f16::from_f32(0.375).to_le_bytes());
+        w[base + 2..base + 4].copy_from_slice(&half::f16::from_f32(-0.125).to_le_bytes());
+    }
+    w
+}
+
+/// Shared int8-GEMV parity check: ROCm int8 `Linear` vs the CPU f32 reference, m=2, within `tol`.
+fn check_i8_linear(w_bytes: &[u8], dt: DType, in_f: usize, out_f: usize, tol: f32, label: &str) {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let m = 2usize;
+    let x = gen(m * in_f, 5);
+    let c = run_linear(&cpu, &x, w_bytes, dt, m, in_f, out_f);
+    let r = run_linear(&be, &x, w_bytes, dt, m, in_f, out_f);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "Linear-i8 {label} max_err={e:e} max|ref|={ref_mag:e} rel={:e} (tol={tol:e})",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "{label} int8 reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < tol,
+        "{label} int8 GEMV diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+// Shapes: in_f=512 (2 super-blocks per output row → exercises the per-row weight offset AND the
+// multi-super accumulation, which a single-super in_f=256 case would NOT catch), out_f=8 (distinct
+// per-row weights → catches a kernel that drops the output-row offset and reads row 0 for every o).
+const I8_IN_F: usize = 512;
+const I8_OUT_F: usize = 8;
+
+/// Q8_0 int8 GEMV: weight is near-lossless (only the activation is int8), so the tolerance is tight.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q80_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 32;
+    check_i8_linear(
+        &q80_blocks(blocks),
+        DType::Q8_0,
+        I8_IN_F,
+        I8_OUT_F,
+        1.5e-2,
+        "Q8_0",
+    );
+}
+
+/// Q4_K int8 GEMV: 4-bit weight + int8 activation; tolerance absorbs both.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q4k_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &q4k_blocks(blocks),
+        DType::Q4K,
+        I8_IN_F,
+        I8_OUT_F,
+        3e-2,
+        "Q4_K",
+    );
+}
+
+/// Q6_K int8 GEMV: 6-bit weight + int8 activation.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_i8_q6k_matches_cpu() {
+    let blocks = (I8_OUT_F * I8_IN_F) / 256;
+    check_i8_linear(
+        &q6k_blocks(blocks),
+        DType::Q6K,
+        I8_IN_F,
+        I8_OUT_F,
+        3e-2,
+        "Q6_K",
+    );
+}
+
 // ── EmbedGather (gather + dequant embedding rows, ×scale) vs CPU ─────────────
 
 /// Run a single-`Op::EmbedGather` graph on `be`: `dst[r, :] = dequant(table[ids[r], :]) * scale`.

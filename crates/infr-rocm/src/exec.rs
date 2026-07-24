@@ -84,6 +84,23 @@ fn native_decode_fmt(dt: DType) -> Option<(usize, usize, &'static str, &'static 
     }
 }
 
+/// Int8-activation dp4a GEMV kernel (Phase 4) for a covered dtype: `(bytes_per_block, kernel)`.
+/// The activation row is quantized to int8 once (`quant_i8_32`) and integer-dotted against the
+/// decoded weight codes (scale-after) — dropping the Phase-3 per-element f16 round-trip. Returns
+/// `None` for uncovered formats (they keep the Phase-3 native decode / dequant→f16 fallback), or
+/// when `INFR_ROCM_NO_I8` selects the Phase-3 path for A/B benchmarking.
+fn native_i8_fmt(dt: DType) -> Option<(usize, &'static str)> {
+    if std::env::var_os("INFR_ROCM_NO_I8").is_some() {
+        return None;
+    }
+    match dt {
+        DType::Q8_0 => Some((34, "linear_i8_q80")),
+        DType::Q4K => Some((144, "linear_i8_q4k")),
+        DType::Q6K => Some((210, "linear_i8_q6k")),
+        _ => None,
+    }
+}
+
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -115,6 +132,44 @@ fn dispatch_1d(
             func,
             grid_x,
             1,
+            1,
+            block_size,
+            1,
+            1,
+            0,
+            stream,
+            arg_ptrs.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != HIP_SUCCESS {
+        return Err(be(format!("hipModuleLaunchKernel({kernel_name}): rc={rc}")));
+    }
+    Ok(())
+}
+
+/// Launch `kernel_name` with an explicit `(grid_x, grid_y)` grid of `block_size`-thread blocks.
+/// Used by the int8 GEMV, whose grid is (out_f output rows, m activation rows).
+fn dispatch_grid(
+    pipelines: &Pipelines,
+    stream: ffi::hipStream_t,
+    kernel_name: &'static str,
+    grid_x: u32,
+    grid_y: u32,
+    block_size: u32,
+    args: Vec<Vec<u8>>,
+) -> Result<()> {
+    let func = pipelines.get(kernel_name)?;
+    let mut storage = args;
+    let mut arg_ptrs: Vec<*mut c_void> = Vec::with_capacity(storage.len());
+    for ab in storage.iter_mut() {
+        arg_ptrs.push(ab.as_mut_ptr() as *mut c_void);
+    }
+    let rc = unsafe {
+        ffi::hipModuleLaunchKernel(
+            func,
+            grid_x,
+            grid_y,
             1,
             block_size,
             1,
@@ -443,7 +498,65 @@ fn run_op(
             out_f,
             w_off,
         } => {
-            if let Some((qpb, bpb, kname, _)) = native_decode_fmt(g.desc(weight).dtype) {
+            let wdt = g.desc(weight).dtype;
+            if let (Some((qpb, bpb, _, _)), Some((bpb_i8, i8_kernel))) =
+                (native_decode_fmt(wdt), native_i8_fmt(wdt))
+            {
+                // Int8-activation dp4a decode (Phase 4): quantize the `m×in_f` activation to int8
+                // ONCE (`quant_i8_32`, per-32-block scale), then integer-dot against the decoded
+                // weight codes (scale-after) via `linear_i8_*`. Drops the Phase-3 per-element f16
+                // round-trip → decode is no longer ALU-bound. `bpb == bpb_i8` (same weight layout);
+                // the bound quant buffer is pre-advanced past `w_off`, a whole number of output
+                // rows × `in_f` (a multiple of `qpb`), so `(w_off/qpb)*bpb` is exact.
+                debug_assert_eq!(bpb, bpb_i8);
+                let wptr = ctx.ensure_device(weight, g, bindings)?;
+                ctx.ensure_device(x, g, bindings)?;
+                let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
+                let mu = m as usize;
+                let inu = in_f as usize;
+                let ou = out_f as usize;
+                let nb = inu / 32; // in_f is 32-aligned for every covered format
+                                   // int8 activation codes + per-32-block scales (freed when the op
+                                   // returns; hipFree syncs, so the async GEMV has completed by then).
+                let qx = crate::RocmBuffer::alloc((mu * inu).max(1), ctx.stream);
+                let xs = crate::RocmBuffer::alloc((mu * nb * 4).max(1), ctx.stream);
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "quant_i8_32",
+                    (mu * nb) as u32,
+                    256,
+                    args![
+                        arg_ptr(bx_ptr),
+                        arg_ptr(qx.ptr),
+                        arg_ptr(xs.ptr),
+                        arg_i32(m as i32),
+                        arg_i32(in_f as i32),
+                    ],
+                )?;
+                let dd = ctx.zero_dev(mu * ou);
+                let blk_off = (w_off as usize / qpb) * bpb;
+                let wptr_off = unsafe { (wptr as *mut u8).add(blk_off) as *mut c_void };
+                // Grid = (out_f, m): one wave32 block per (output row, activation row).
+                dispatch_grid(
+                    pipelines,
+                    ctx.stream,
+                    i8_kernel,
+                    out_f,
+                    m,
+                    32,
+                    args![
+                        arg_ptr(qx.ptr),
+                        arg_ptr(xs.ptr),
+                        arg_ptr(wptr_off),
+                        arg_ptr(dd.ptr),
+                        arg_i32(m as i32),
+                        arg_i32(in_f as i32),
+                        arg_i32(out_f as i32),
+                    ],
+                )?;
+                ctx.dev[dst.0 as usize] = Some(dd);
+            } else if let Some((qpb, bpb, kname, _)) = native_decode_fmt(wdt) {
                 // Native in-kernel decode: read the RAW quant bytes (no f16 cache → VRAM drops).
                 // The bound quant buffer is pre-advanced past `w_off`; `w_off` is always a whole
                 // number of output rows × `in_f`, hence a multiple of `qpb`, so the block offset

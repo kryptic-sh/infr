@@ -234,8 +234,13 @@ impl Backend for RocmBackend {
             coopmat_f16: None,
             f8: false,
             coopmat_f8: None,
-            i8: false,
-            i8_dot: false,
+            // Phase 4: int8-activation dp4a decode GEMV is the default path for the covered
+            // formats (Q4_K/Q6_K/Q8_0), quantizing the activation row to int8 and integer-dotting
+            // (V_DOT4/`__builtin_amdgcn_sdot4`) against the native weight codes. These caps are
+            // informational for the seam runner (it does not branch on them), but flipped to report
+            // the backend honestly. `coopmat_i8` stays None (WMMA int8 is Phase 5).
+            i8: true,
+            i8_dot: true,
             coopmat_i8: None,
             bf16: false,
             coopmat_bf16: None,

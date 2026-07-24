@@ -57,6 +57,7 @@ const HIP_PARTS: &[&str] = &[
     DELTANET,
     MOE_SHARED_EXPERT_ADD,
     NATIVE_DECODE,
+    INT8_DECODE,
 ];
 
 const RMSNORM: &str = r#"
@@ -990,6 +991,224 @@ GEN_EMBED(q4k)
 GEN_EMBED(q6k)
 "#;
 
+// ── Int8-activation dp4a decode GEMV (Phase 4) ───────────────────────────────
+//
+// The Phase-3 NATIVE_DECODE GEMV above is bit-faithful to the old f16 cache, but it pays a
+// per-element f16 round-trip (`__half2float(__float2half(...))`) inside the hot dot loop — pure
+// ALU that made small-model decode ALU-bound (regressed to ~1.9 t/s vs the old f16-cache ~4.5).
+//
+// This path drops the f16 round-trip entirely: the activation row is quantized to int8 ONCE (per
+// 32-elem block, scale = amax/127), then integer-dotted against the decoded weight codes via
+// `__builtin_amdgcn_sdot4` (V_DOT4_I32_I8 on gfx1100 — 4 signed int8 MACs / instruction). The
+// per-block weight scale (and the Q4_K/Q6_K min) is applied to the int32 accumulator AFTER the
+// integer dot — the "scale-after is free" mmq principle (each lane owns its own accumulator), the
+// same reasoning as Vulkan's dp4a `mmq` and the CPU VNNI dots. This is a SANCTIONED PRECISION FLIP:
+// int8 activation quantization is lossy, so the output differs (within tolerance) from the
+// bit-faithful f16 path — the ROCm goldens are re-blessed after a coherence check (docs/perf.md).
+//
+// Grid: one block per (output-row `o`, m-row `row`); block = 32 threads (one RDNA3 wave32). The 32
+// threads stride over the input's 32-elem blocks, each accumulates an f32 partial, then a wave
+// shuffle reduces to lane 0. The int8 activation is quantized once per row (`quant_i8_32`) and
+// REUSED across all `out_f` output rows AND — for m>1 (the `mrow` analogue) — the single quant pass
+// covers every row, so the activation quant cost amortizes over the whole GEMV.
+//
+// Covered formats: Q8_0, Q4_K, Q6_K (the Q4_K_M set). `rf16b`/`k4` are defined in NATIVE_DECODE
+// (this part is assembled after it). Uncovered formats keep the Phase-3 / dequant→f16 fallback.
+const INT8_DECODE: &str = r#"
+// Quantize x[m, in_f] to int8 qx[m, in_f] with a per-32-block scale xs[m, in_f/32].
+// scale = amax/127 (llama.cpp/GPU convention: `roundf`, half-away-from-zero). One thread / 32-block.
+extern "C" __global__ void quant_i8_32(
+    const float* __restrict__ x,
+    signed char* __restrict__ qx,
+    float* __restrict__ xs,
+    int m,
+    int in_f
+) {
+    int nblk = m * (in_f >> 5);
+    int blk = blockIdx.x * blockDim.x + threadIdx.x;
+    if (blk >= nblk) return;
+    const float* xr = x + (long)blk * 32;
+    float amax = 0.0f;
+    for (int j = 0; j < 32; j++) { float a = fabsf(xr[j]); if (a > amax) amax = a; }
+    float s = amax / 127.0f;
+    float inv = (s > 0.0f) ? (1.0f / s) : 0.0f;
+    signed char* qr = qx + (long)blk * 32;
+    for (int j = 0; j < 32; j++) {
+        float v = roundf(xr[j] * inv);
+        if (v > 127.0f) v = 127.0f;
+        if (v < -127.0f) v = -127.0f;
+        qr[j] = (signed char)v;
+    }
+    xs[blk] = s;
+}
+
+// Reduce an f32 partial across a 32-lane wave to lane 0 (reads only higher, always-active lanes).
+static __device__ __forceinline__ float wave_sum32(float v) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down(v, off);
+    return v;
+}
+
+// 4×int8 signed dot-accumulate: `c + Σ a.i8[k]·b.i8[k]` — the V_DOT4_I32_I8 (dp4a) primitive.
+// The natural spelling is `__builtin_amdgcn_sdot4`, but that builtin requires the `dot1-insts` target
+// feature, which hiprtc does NOT reliably enable for gfx1100: comgr's per-process DEFAULT feature set
+// is nondeterministic — the SAME source + `--gpu-architecture=gfx1100` compiles WITH the dot feature
+// in one process and WITHOUT it in another (observed: parity test process has it, the model/seam
+// process does not), and the builtin then fails to codegen ("needs target feature dot1-insts").
+// Forcing the feature on per-function via a `target` attribute either mangles the extern-"C" kernel
+// symbol (hipModuleGetFunction not-found) or miscompiles the cross-feature call (runtime garbage).
+// So this uses the portable scalar idiom below: it compiles in EVERY process, is bit-stable, and clang
+// still lowers it to V_DOT4 when the module happens to have the dot feature. The decode win comes from
+// dropping the Phase-3 per-element f16 round-trip (the ALU-bound cost), not the single instruction.
+static __device__ __forceinline__ int idot4(int a, int b, int c) {
+    // Extract each 8-bit lane with a right-shift + `signed char` cast (well-defined sign extension;
+    // a signed LEFT-shift into the sign bit would be UB and the optimizer miscompiles it), then MAC.
+    // clang lowers this idiom to V_DOT4_I32_I8 when the module's target features include the dot
+    // instructions, and to plain integer MADs otherwise — either way the Phase-3 per-element f16
+    // round-trip (the ALU-bound cost) is gone.
+    for (int k = 0; k < 4; k++) {
+        int av = (int)(signed char)(a >> (k * 8));
+        int bv = (int)(signed char)(b >> (k * 8));
+        c += av * bv;
+    }
+    return c;
+}
+
+// ── Q8_0: 32 elems / 34 bytes = [half d][int8 qs[32]]; value = d * qs (signed int8). ──
+extern "C" __global__ void linear_i8_q80(
+    const signed char* __restrict__ qx,   // [m, in_f]
+    const float* __restrict__ xs,          // [m, in_f/32]
+    const unsigned char* __restrict__ w,   // raw Q8_0 weight bytes (pre-advanced past w_off)
+    float* __restrict__ dst,               // [m, out_f]
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        const unsigned char* b = w + ((long)o * nb + blk) * 34;
+        float d = rf16b(b);
+        const unsigned char* wq = b + 2;   // 32 signed int8 codes
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0;
+        for (int k = 0; k < 8; k++) {
+            const unsigned char* q = wq + k * 4;
+            int wpack = (int)q[0] | ((int)q[1] << 8) | ((int)q[2] << 16) | ((int)q[3] << 24);
+            idot = idot4(xp[k], wpack, idot);
+        }
+        acc += d * xsr[blk] * (float)idot;
+    }
+    acc = wave_sum32(acc);
+    if (tid == 0) dst[(long)row * out_f + o] = acc;
+}
+
+// ── Q4_K: 256 elems / 144 bytes; sub-block 32; code 0..15; value = d·sc·code + dmin·(−mm). ──
+extern "C" __global__ void linear_i8_q4k(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    int spr = nb >> 3;             // Q4_K super-blocks (256 elems) per output row
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);   // global super-block for (output row o, this 32-block)
+        int s = blk & 7;           // sub-block 0..7 (== the 32-block)
+        const unsigned char* b = w + (long)super * 144;
+        float d = rf16b(b);
+        float dmin = rf16b(b + 2);
+        const unsigned char* scales = b + 4;
+        const unsigned char* qs = b + 16;
+        int sc, mm; k4(scales, s, &sc, &mm);
+        const unsigned char* qbase = qs + (s >> 1) * 32;   // nibble byte base
+        int hi = s & 1;                                    // high nibble for odd sub-blocks
+        const int* xp = (const int*)(qxr + blk * 32);
+        int idot = 0, isum = 0;
+        for (int k = 0; k < 8; k++) {
+            const unsigned char* q = qbase + k * 4;
+            int wpack;
+            if (hi) {
+                wpack = (int)(q[0] >> 4) | ((int)(q[1] >> 4) << 8)
+                      | ((int)(q[2] >> 4) << 16) | ((int)(q[3] >> 4) << 24);
+            } else {
+                wpack = (int)(q[0] & 0xF) | ((int)(q[1] & 0xF) << 8)
+                      | ((int)(q[2] & 0xF) << 16) | ((int)(q[3] & 0xF) << 24);
+            }
+            idot = idot4(xp[k], wpack, idot);
+            isum = idot4(xp[k], 0x01010101, isum);
+        }
+        float sx = xsr[blk];
+        acc += (d * (float)sc) * sx * (float)idot + (dmin * (float)(-mm)) * sx * (float)isum;
+    }
+    acc = wave_sum32(acc);
+    if (tid == 0) dst[(long)row * out_f + o] = acc;
+}
+
+// ── Q6_K: 256 elems / 210 bytes; sub-block 16 (int8 scale); code 0..63; value = d·s·code + d·(−32s). ──
+extern "C" __global__ void linear_i8_q6k(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    int m, int in_f, int out_f
+) {
+    int o = blockIdx.x, row = blockIdx.y, tid = threadIdx.x;
+    int nb = in_f >> 5;
+    int spr = nb >> 3;             // Q6_K super-blocks (256 elems) per output row
+    const signed char* qxr = qx + (long)row * in_f;
+    const float* xsr = xs + (long)row * nb;
+    float acc = 0.0f;
+    for (int blk = tid; blk < nb; blk += 32) {
+        long super = (long)o * spr + (blk >> 3);   // global super-block for (output row o, this 32-block)
+        int w32 = blk & 7;         // which 32-block within the super
+        const unsigned char* b = w + (long)super * 210;
+        const unsigned char* ql = b;
+        const unsigned char* qh = b + 128;
+        const signed char* scales = (const signed char*)(b + 192);
+        float d = rf16b(b + 208);
+        float sx = xsr[blk];
+        // The 32-block spans two 16-element sub-blocks, each with its own int8 scale.
+        for (int hh = 0; hh < 2; hh++) {
+            int sub16 = w32 * 2 + hh;      // 0..15
+            int sc = (int)scales[sub16];
+            int within0 = sub16 * 16;      // first element (0..255)
+            int half = within0 >> 7;       // 0..1 (which 128-half)
+            int o127 = within0 & 127;
+            int region = o127 >> 5;        // 0..3
+            int l0 = o127 & 31;            // 0 or 16 within the region
+            int qlo = half * 64;
+            int qho = half * 32;
+            const int* xp = (const int*)(qxr + blk * 32 + hh * 16);
+            int idot = 0, isum = 0;
+            for (int k = 0; k < 4; k++) {  // 4 groups of 4 = 16
+                int code[4];
+                for (int r = 0; r < 4; r++) {
+                    int l = l0 + k * 4 + r;
+                    int c;
+                    if (region == 0)      c = (ql[qlo + l] & 0x0F)       | ((qh[qho + l] & 3) << 4);
+                    else if (region == 1) c = (ql[qlo + 32 + l] & 0x0F)  | (((qh[qho + l] >> 2) & 3) << 4);
+                    else if (region == 2) c = (ql[qlo + l] >> 4)         | (((qh[qho + l] >> 4) & 3) << 4);
+                    else                  c = (ql[qlo + 32 + l] >> 4)    | (((qh[qho + l] >> 6) & 3) << 4);
+                    code[r] = c;
+                }
+                int wpack = code[0] | (code[1] << 8) | (code[2] << 16) | (code[3] << 24);
+                idot = idot4(xp[k], wpack, idot);
+                isum = idot4(xp[k], 0x01010101, isum);
+            }
+            acc += (d * (float)sc) * sx * (float)idot + (d * (float)(-32 * sc)) * sx * (float)isum;
+        }
+    }
+    acc = wave_sum32(acc);
+    if (tid == 0) dst[(long)row * out_f + o] = acc;
+}
+"#;
+
 // ── Module cache ─────────────────────────────────────────────────────────────
 
 /// Compiled HIP module + kernel-function cache.
@@ -1025,9 +1244,11 @@ impl Pipelines {
             return Err(be(format!("hiprtcCreateProgram: rc={rc}")));
         }
 
-        // Compile for the current device's arch. Default flags: f16 support + fast math.
-        // Compile without --gpu-architecture: hiprtc auto-detects the device
-        // from the active hipSetDevice context.
+        // Compile without --gpu-architecture: hiprtc auto-detects the device from the active
+        // hipSetDevice context. The int8 dp4a dot is written as a portable scalar idiom (not the
+        // `sdot4` builtin), so no optional target feature (`dot1-insts`) needs to be pinned — the
+        // plain auto-detect target compiles it in every launch context. `_device` is accepted for
+        // call-site symmetry; the active device is already selected before `build`.
         let std_flag = CString::new("-std=c++17").unwrap();
         let opts: [*const c_char; 1] = [std_flag.as_ptr()];
         let rc = unsafe { ffi::hiprtcCompileProgram(prog, opts.len() as i32, opts.as_ptr()) };

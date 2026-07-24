@@ -1394,3 +1394,126 @@ fn conv1d_reused_x_state_matches_cpu() {
         "Conv1dSilu reused-x state diverges from CPU reference (stale host cache of x): {e:e}"
     );
 }
+
+// ── AddBias (qwen2/2.5 QKV projection bias) vs CPU ───────────────────────────
+
+/// `Op::AddBias` (`dst[r, j] = x[r, j] + bias[j]`) is the qwen2/qwen2.5 QKV-projection bias add —
+/// the op that distinguishes the qwen2 attention block from the bias-free qwen3/llama path. The
+/// `bias` is a bound Weight (qwen2 ships it F32); the ROCm `add_bias` kernel and the CPU reference
+/// both read it as f32, so parity is bit-exact. Multi-row (prefill) input so the per-row broadcast
+/// of the shared bias vector is exercised. Single-op parity vs `infr_cpu::CpuBackend`, vacuity
+/// guarded against a silently-zero output.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn add_bias_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, n) = (4usize, 96usize); // rows > 1 → per-row broadcast of the shared bias
+    let x = gen(rows * n, 3);
+    let bias_f32 = gen(n, 19);
+    let bias_bytes: &[u8] = bytemuck::cast_slice(&bias_f32);
+    let run = |b: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let xid = g.input(f32d(rows * n));
+        let bid = g.weight(TensorDesc::new(vec![n], DType::F32)); // qwen2 bias is a bound F32 weight
+        let dst = g.output(f32d(rows * n));
+        g.push(Op::AddBias {
+            x: xid,
+            bias: bid,
+            dst,
+            rows: rows as u32,
+            n: n as u32,
+        });
+        let plan = b.compile(&g).expect("compile");
+        let xb = b.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+        b.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let bb = b
+            .alloc(bias_bytes.len(), BufferUsage::Weights)
+            .expect("bias");
+        b.upload(bb.as_ref(), bias_bytes).unwrap();
+        let ob = b.alloc(rows * n * 4, BufferUsage::Readback).expect("out");
+        let mut bd = Bindings::new();
+        bd.bind(xid, xb.as_ref());
+        bd.bind(bid, bb.as_ref());
+        bd.bind(dst, ob.as_ref());
+        b.execute(plan.as_ref(), &bd).expect("execute");
+        let mut o = vec![0f32; rows * n];
+        b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+    let c = run(&cpu);
+    let r = run(&be);
+    let e = maxerr(&c, &r);
+    let mag = maxabs(&c).max(1e-6);
+    println!("AddBias max_err={e:e} max|ref|={mag:e}");
+    assert!(mag > 1e-3, "AddBias reference all-zero — test is vacuous");
+    assert!(
+        e < 1e-5,
+        "AddBias diverges from CPU reference (bias broadcast / dtype): {e:e}"
+    );
+}
+
+// ── Softcap (gemma4 attn-logit / final-logit soft cap) vs CPU ────────────────
+
+/// `Op::Softcap` (`dst[i] = cap * tanh(x[i] / cap)`) is the gemma-family logit soft-cap applied to
+/// attention scores and final logits — a gemma4-distinctive op absent from the qwen3/llama path. The
+/// input spans both the linear regime (|x| ≪ cap) and the saturating tail (|x| ≫ cap) so the tanh
+/// curvature is exercised, not just the identity middle. The ROCm `softcap` kernel uses `tanhf` and
+/// the CPU reference uses `f32::tanh`, both in f32, so parity is tight. Single-op parity vs
+/// `infr_cpu::CpuBackend`, vacuity guarded.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn softcap_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let n = 512usize;
+    let cap = 30.0f32; // gemma's attn-logit softcap magnitude
+                       // Values spanning [-4*cap, 4*cap]: linear near 0, saturating in the tails.
+    let x: Vec<f32> = (0..n)
+        .map(|i| ((i as f32 / n as f32) - 0.5) * 8.0 * cap)
+        .collect();
+    let run = |b: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let xid = g.input(f32d(n));
+        let dst = g.output(f32d(n));
+        g.push(Op::Softcap {
+            x: xid,
+            dst,
+            cap,
+            n: n as u32,
+        });
+        let plan = b.compile(&g).expect("compile");
+        let xb = b.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+        b.upload(xb.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+        let ob = b.alloc(n * 4, BufferUsage::Readback).expect("out");
+        let mut bd = Bindings::new();
+        bd.bind(xid, xb.as_ref());
+        bd.bind(dst, ob.as_ref());
+        b.execute(plan.as_ref(), &bd).expect("execute");
+        let mut o = vec![0f32; n];
+        b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+    let c = run(&cpu);
+    let r = run(&be);
+    let e = maxerr(&c, &r);
+    let mag = maxabs(&c).max(1e-6);
+    println!("Softcap cap={cap} max_err={e:e} max|ref|={mag:e}");
+    assert!(mag > 1e-3, "Softcap reference all-zero — test is vacuous");
+    // The saturating tail must actually be reached (|out| approaches cap), else the test is
+    // exercising only the near-identity middle.
+    assert!(
+        mag > 0.9 * cap,
+        "Softcap did not reach the saturating tail — test is under-exercised"
+    );
+    assert!(
+        e < 1e-3,
+        "Softcap diverges from CPU reference (wrong cap formula / tanh): {e:e}"
+    );
+}

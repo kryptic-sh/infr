@@ -43,7 +43,7 @@ pub struct SeamModel {
 /// callers (run/bench/spec drivers) stay on one slot. Backend-agnostic: fork and seed go through
 /// `&dyn Backend` (`copy_buffer` is the seeding primitive), so the Vulkan and Metal sessions
 /// share this policy verbatim.
-struct SlotPool {
+pub(crate) struct SlotPool {
     slots: Vec<Option<crate::seam::SeamKv>>,
     last_used: Vec<u64>,
     tick: u64,

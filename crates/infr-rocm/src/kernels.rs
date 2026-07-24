@@ -803,7 +803,9 @@ unsafe impl Sync for Pipelines {}
 
 impl Pipelines {
     /// Compile the assembled HIP source via hiprtc and load the resulting module.
-    pub fn build(device: c_int) -> Result<Self> {
+    // `_device` is accepted for call-site symmetry with the other backends; the active device is
+    // already selected via `hipSetDevice` before `build`, and hiprtc targets the arch via options.
+    pub fn build(_device: c_int) -> Result<Self> {
         let src = hip_source();
         let csrc = CString::new(src).map_err(|e| be(format!("kernel source NUL-byte: {e}")))?;
         let mut prog: ffi::hiprtcProgram = std::ptr::null_mut();

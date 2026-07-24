@@ -428,10 +428,19 @@ The closing campaign, run exactly like `docs/perf.md`:
 
 ## Milestone checklist
 
-- [x] **P0** crate scaffold, `--dev rocm` selectable, `RocmBackend` skeleton — done
-- [x] **P1** dequant→f16 baseline: naive kernels for the full Op set (23 kernels),
-      HIP FFI wired, dequant cache, `DenseRocmSession` + `RocmSeamChat` wiring —
-      kernels compile but need ROCm hardware to test
+- [x] **P0** crate scaffold, `--dev rocm` selectable, `RocmBackend` skeleton —
+      done
+- [x] **P1** dequant→f16 baseline: naive kernels for the full Op set (23
+      kernels), HIP FFI wired, dequant cache, `DenseRocmSession` +
+      `RocmSeamChat` wiring — **validated on the RX 7900 XTX (gfx1100)**: dense
+      Qwen3-0.6B Q4_K_M generates coherent text on `INFR_DEV=rocm`. Correctness
+      gate landed (`crates/infr-rocm/tests/parity.rs`, `#[ignore]`/GPU):
+      calloc-contract alloc, upload→download byte-identity, and
+      single-`Op::Linear` GEMV parity vs the CPU reference for F16 + Q4_K.
+      Backend-layer fixes: `hipMemset` rc checked, `alloc` OOM returns `Err` (no
+      panic), `copy_buffer` bounds-checks the destination. Feature-build link
+      wiring: `crates/infr-rocm/build.rs` (`$ROCM_PATH/lib`) + `infr-cli` `rocm`
+      feature passthrough.
 - [ ] **P2** all archs + blessed ROCm goldens + token-for-token vs CPU → **PART
       A (full correctness) complete**
 - [ ] **P3** native per-DType quant-decode GEMV (all 24 formats)

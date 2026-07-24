@@ -9,6 +9,11 @@ repository.workspace = true
 name = "infr"
 path = "src/main.rs"
 
+[features]
+# Enable the native ROCm/HIP backend (`INFR_DEV=rocm`); forwards to infr-llama's
+# gate. Off by default so the CLI builds without ROCm installed.
+rocm = ["infr-llama/rocm"]
+
 [dependencies]
 infr-core.workspace = true
 infr-vulkan.workspace = true

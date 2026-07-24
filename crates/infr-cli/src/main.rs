@@ -881,10 +881,7 @@ fn build_chat_model(
     }
     match &backend {
         Backend::Rocm(rocm_spec) => {
-            let dev_idx = rocm_spec
-                .as_deref()
-                .map(|s| parse_rocm_device(s))
-                .unwrap_or(0);
+            let dev_idx = rocm_spec.as_deref().map(parse_rocm_device).unwrap_or(0);
             eprintln!(
                 "[rocm backend — dense/MoE forward on AMD GPU via ROCm/HIP, persistent KV session]"
             );

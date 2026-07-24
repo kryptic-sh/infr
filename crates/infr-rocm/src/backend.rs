@@ -35,25 +35,58 @@ unsafe impl Send for RocmBuffer {}
 unsafe impl Sync for RocmBuffer {}
 
 impl RocmBuffer {
-    /// Allocate `bytes` of device memory with `hipMalloc`. Zero-initialized (calloc contract).
-    pub fn alloc(bytes: usize, _stream: ffi::hipStream_t) -> Self {
+    /// Allocate `bytes` of **zero-initialized** device memory (calloc contract), returning
+    /// `Err` if `hipMalloc` (OOM) or the `hipMemset` zero-fill fails — both are recoverable,
+    /// never a panic. A failed `hipMemset` MUST error: silently handing back uninitialized VRAM
+    /// breaks the calloc contract (`infr_core::backend::Backend::alloc`) and yields the classic
+    /// CPU-works/GPU-garbage trap.
+    pub fn try_alloc(bytes: usize, _stream: ffi::hipStream_t) -> Result<Self> {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         if bytes > 0 {
             let rc = unsafe { ffi::hipMalloc(&mut ptr, bytes) };
             if rc != HIP_SUCCESS {
-                panic!("hipMalloc({bytes}): rc={rc}");
+                return Err(be(format!("hipMalloc({bytes}): rc={rc}")));
             }
-            // Zero-init (calloc contract)
-            unsafe { ffi::hipMemset(ptr, 0, bytes) };
+            // Zero-init (calloc contract) — a failed memset is fatal, not ignorable.
+            let rc = unsafe { ffi::hipMemset(ptr, 0, bytes) };
+            if rc != HIP_SUCCESS {
+                unsafe { ffi::hipFree(ptr) };
+                return Err(be(format!("hipMemset({bytes}): rc={rc}")));
+            }
         }
-        Self {
+        Ok(Self {
             ptr,
             len: bytes,
             owned: true,
-        }
+        })
     }
 
-    /// Allocate zero-initialized device memory (calloc contract via hipMalloc + hipMemset).
+    /// Allocate device memory WITHOUT zero-init, returning `Err` on `hipMalloc` failure (OOM).
+    /// Only for buffers whose full extent is written before any read (e.g. weights uploaded
+    /// immediately).
+    pub fn try_alloc_uninit(bytes: usize, _stream: ffi::hipStream_t) -> Result<Self> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        if bytes > 0 {
+            let rc = unsafe { ffi::hipMalloc(&mut ptr, bytes) };
+            if rc != HIP_SUCCESS {
+                return Err(be(format!("hipMalloc({bytes}): rc={rc}")));
+            }
+        }
+        Ok(Self {
+            ptr,
+            len: bytes,
+            owned: true,
+        })
+    }
+
+    /// Zero-initialized device memory, panicking on failure. Convenience for the exec-internal
+    /// scratch path (activations/intermediates) where a fallible signature would ripple through
+    /// every op; the recoverable trait-level entry points use [`try_alloc`](Self::try_alloc).
+    pub fn alloc(bytes: usize, stream: ffi::hipStream_t) -> Self {
+        Self::try_alloc(bytes, stream).expect("hipMalloc/hipMemset (exec scratch)")
+    }
+
+    /// Alias for [`alloc`](Self::alloc) — zero-initialized device memory (calloc contract).
     pub fn alloc_zero(bytes: usize, stream: ffi::hipStream_t) -> Self {
         Self::alloc(bytes, stream)
     }
@@ -78,6 +111,9 @@ impl RocmBuffer {
     }
 
     /// Download device bytes to host.
+    // `stream` is an opaque HIP handle passed straight to the driver, not a Rust-dereferenced
+    // pointer — the not_unsafe_ptr_arg_deref lint doesn't apply to a handle-passing helper.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn download(&self, dst: &mut [u8], stream: ffi::hipStream_t) {
         if dst.is_empty() || self.ptr.is_null() {
             return;
@@ -225,7 +261,8 @@ impl Backend for RocmBackend {
     }
 
     fn alloc(&self, bytes: usize, _usage: BufferUsage) -> Result<Box<dyn Buffer>> {
-        let buf = RocmBuffer::alloc(bytes, self.stream);
+        // Zero-init (calloc contract); OOM or a failed zero-fill returns Err (recoverable).
+        let buf = RocmBuffer::try_alloc(bytes, self.stream)?;
         // Advance weight progress bar for weight/host-weight allocations
         if matches!(_usage, BufferUsage::Weights | BufferUsage::HostWeights) {
             if let Some(pb) = self.weight_pb.lock().unwrap().as_ref() {
@@ -236,24 +273,14 @@ impl Backend for RocmBackend {
     }
 
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
-        // Skip zero-init for weight buffers (they get uploaded immediately).
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        if bytes > 0 {
-            let rc = unsafe { ffi::hipMalloc(&mut ptr, bytes) };
-            if rc != HIP_SUCCESS {
-                return Err(be(format!("hipMalloc: rc={rc}")));
-            }
-        }
+        // Skip zero-init for weight buffers (they get uploaded immediately); OOM returns Err.
+        let buf = RocmBuffer::try_alloc_uninit(bytes, self.stream)?;
         if matches!(usage, BufferUsage::Weights | BufferUsage::HostWeights) {
             if let Some(pb) = self.weight_pb.lock().unwrap().as_ref() {
                 pb.inc(bytes as u64);
             }
         }
-        Ok(Box::new(RocmBuffer {
-            ptr,
-            len: bytes,
-            owned: true,
-        }))
+        Ok(Box::new(buf))
     }
 
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
@@ -327,7 +354,10 @@ impl Backend for RocmBackend {
     }
 
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
+        // Bound-check BOTH ends: a `bytes > dst.len_bytes()` `hipMemcpyDtoD` is a device-side
+        // out-of-bounds write (VRAM corruption), just as `bytes > src` is an OOB read.
         infr_core::backend::check_copy_bytes(bytes, src.len_bytes())?;
+        infr_core::backend::check_copy_bytes(bytes, dst.len_bytes())?;
         let src_buf = src
             .as_any()
             .downcast_ref::<RocmBuffer>()

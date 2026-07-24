@@ -2,6 +2,15 @@
 //! Build: `cargo build --release --features rocm -p infr-rocm --example smoke_test`
 //! Run: `LD_LIBRARY_PATH=/opt/rocm/lib ./target/release/examples/smoke_test`
 
+// A throwaway bringup tool with its own hand-rolled HIP FFI: keep the C type names and the full
+// binding surface (some entries unused here), and don't style-lint the ad-hoc kernel-launch code.
+#![allow(
+    non_camel_case_types,
+    dead_code,
+    clippy::needless_range_loop,
+    clippy::manual_div_ceil
+)]
+
 use std::ffi::{c_char, c_int, c_void, CString};
 
 // Minimal FFI subset

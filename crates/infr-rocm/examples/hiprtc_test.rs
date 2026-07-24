@@ -1,4 +1,9 @@
 //! Quick test: compile a trivial HIP kernel via hiprtc to verify the toolchain.
+
+// A throwaway bringup tool with its own hand-rolled hiprtc FFI: keep the C type names and the
+// full binding surface even though some entries are unused here.
+#![allow(non_camel_case_types, dead_code)]
+
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::ptr;
 

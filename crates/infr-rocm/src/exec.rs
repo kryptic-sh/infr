@@ -88,7 +88,7 @@ fn dispatch_1d(
     args: Vec<Vec<u8>>,
 ) -> Result<()> {
     let func = pipelines.get(kernel_name)?;
-    let grid_x = (total_threads + block_size - 1) / block_size;
+    let grid_x = total_threads.div_ceil(block_size);
     let mut storage = args;
     let mut arg_ptrs: Vec<*mut c_void> = Vec::with_capacity(storage.len());
     for ab in storage.iter_mut() {
@@ -119,9 +119,6 @@ fn arg_ptr(p: *mut c_void) -> Vec<u8> {
     (p as u64).to_le_bytes().to_vec()
 }
 fn arg_i32(v: i32) -> Vec<u8> {
-    v.to_le_bytes().to_vec()
-}
-fn arg_u32(v: u32) -> Vec<u8> {
     v.to_le_bytes().to_vec()
 }
 fn arg_f32(v: f32) -> Vec<u8> {
@@ -300,8 +297,8 @@ pub fn execute_graph(
         }
     }
 
-    // Sync after all ops
-    let rc = unsafe { ffi::hipStreamSynchronize(stream) };
+    // Sync after all ops (the final checked sync below re-syncs after writeback).
+    unsafe { ffi::hipStreamSynchronize(stream) };
     let direct = g.in_place_inputs();
     for (i, decl) in g.tensors.iter().enumerate() {
         let id = TensorId(i as u32);

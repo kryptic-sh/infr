@@ -3,6 +3,11 @@
 //! Compiled only when `cfg(all(target_os = "linux", feature = "rocm"))`. Every function
 //! returns its natural error code; the caller checks against the success constant (0).
 
+// The type aliases deliberately keep HIP's C spelling (`hipStream_t`, `hipMemcpyKind`, …) so
+// this module reads 1:1 against the HIP headers; and the binding surface intentionally declares
+// the full set of entry points / constants even though later phases consume some of them.
+#![allow(non_camel_case_types, dead_code)]
+
 use std::ffi::{c_char, c_int, c_void};
 
 // ── libamdhip64 ──────────────────────────────────────────────────────────────

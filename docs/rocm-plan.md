@@ -441,9 +441,16 @@ The closing campaign, run exactly like `docs/perf.md`:
       panic), `copy_buffer` bounds-checks the destination. Feature-build link
       wiring: `crates/infr-rocm/build.rs` (`$ROCM_PATH/lib`) + `infr-cli` `rocm`
       feature passthrough.
-- [ ] **P2** all archs + blessed ROCm goldens + token-for-token vs CPU → **PART
-      A (full correctness) complete**
-- [ ] **P3** native per-DType quant-decode GEMV (all 24 formats)
+- [x] **P2** blessed ROCm gpu_seam gate + token-for-token vs CPU across the
+      validated archs (Qwen3, Gemma-3, qwen35/DeltaNet, llama, qwen2.5,
+      gemma4-E2B, BitNet i2_s) and all 24 weight quant formats (op-level parity)
+      → **PART A correctness complete for every arch that fits VRAM.** The
+      big-model archs that OOM under the naive f16 weight cache
+      (gemma4-dense-12B, gemma4-MoE-26B, llama4 Scout; diffusion-gemma is also
+      not yet wired) are deferred to after **P3**, which drops the f16 residency
+      so they fit.
+- [ ] **P3** native per-DType quant-decode GEMV (all 24 formats) — also unblocks
+      the OOMing big-model archs above
 - [ ] **P4** int8/dp4a decode + multi-row GEMV
 - [ ] **P5** WMMA/MFMA (or rocBLAS) prefill GEMM + tiering tree
 - [ ] **P6** flash + split-KV attention + KV quant

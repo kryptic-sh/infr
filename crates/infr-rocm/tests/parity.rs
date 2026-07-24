@@ -478,3 +478,153 @@ fn moe_ffn_matches_cpu() {
         );
     }
 }
+
+// ── Rope (ggml NORM interleaved RoPE, packed + strided) vs CPU ────────────────
+
+/// Run a single-`Op::Rope` graph on `be` and return the FULL output buffer (length = `x.len()`).
+/// `x` is the raw input: packed `[rows, n_head, head_dim]` when `x_stride == 0`, else a wider
+/// `[rows, x_stride]` row buffer whose per-row `n_head*head_dim` query slice packs at the row
+/// start. `positions` is an I32 tensor. `dst != x`, so the backend copies the (possibly strided)
+/// source and rotates in place — the rotated query lands at `row*x_stride + h*head_dim`.
+#[allow(clippy::too_many_arguments)]
+fn run_rope(
+    be: &dyn Backend,
+    x: &[f32],
+    positions: &[i32],
+    rows: usize,
+    n_head: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    theta: f32,
+    x_stride: usize,
+) -> Vec<f32> {
+    let mut g = Graph::new();
+    let xid = g.input(f32d(x.len()));
+    let pid = g.input(TensorDesc::new(vec![positions.len()], DType::I32));
+    let dst = g.output(f32d(x.len()));
+    g.push(Op::Rope {
+        x: xid,
+        positions: pid,
+        dst,
+        rows: rows as u32,
+        n_head: n_head as u32,
+        head_dim: head_dim as u32,
+        rope_dim: rope_dim as u32,
+        theta,
+        freq_factors: None,
+        x_stride: x_stride as u32,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let xb = be.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+    be.upload(xb.as_ref(), bytemuck::cast_slice(x)).unwrap();
+    let pbytes: &[u8] = bytemuck::cast_slice(positions);
+    let pb = be
+        .alloc(pbytes.len(), BufferUsage::Activations)
+        .expect("pos");
+    be.upload(pb.as_ref(), pbytes).unwrap();
+    let ob = be.alloc(x.len() * 4, BufferUsage::Readback).expect("out");
+    let mut b = Bindings::new();
+    b.bind(xid, xb.as_ref());
+    b.bind(pid, pb.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut o = vec![0f32; x.len()];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// `Op::Rope` (the no-qk-norm llama-family INTERLEAVED rotation) must match the CPU reference for
+/// BOTH a packed input and a NON-trivial `x_stride`. The pre-fix kernel had three defects any of
+/// which this catches: (1) split-half (NEOX) pairing instead of interleaved (2p, 2p+1), (2) the
+/// dropped `x_stride` — a strided view read the wrong elements — plus a `dst != x` copy that
+/// grabbed a packed prefix regardless of stride, and (3) `freq *= freq_factors` (the wrong
+/// direction). The strided case is the qwen35 q+g shape: the rotated query is a slice inside a
+/// wider row buffer; a stride-blind kernel rotates the poison tail as extra heads and diverges.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn rope_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, n_head, head_dim, rope_dim) = (3usize, 2usize, 8usize, 8usize);
+    let theta = 10000.0f32;
+    let positions: Vec<i32> = vec![1, 7, 4]; // non-zero + distinct per row so RoPE actually rotates
+    let hw = n_head * head_dim; // packed per-row width
+    let np = rows * hw;
+    let packed = gen(np, 6); // logical query, packed [rows, n_head, head_dim]
+
+    // ── (a) packed input (x_stride = 0 / natural) ──
+    let c = run_rope(
+        &cpu, &packed, &positions, rows, n_head, head_dim, rope_dim, theta, 0,
+    );
+    let r = run_rope(
+        &be, &packed, &positions, rows, n_head, head_dim, rope_dim, theta, 0,
+    );
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-6);
+    println!(
+        "Rope packed max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "Rope packed reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 1e-3,
+        "Rope packed diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+
+    // ── (b) NON-trivial x_stride: query slice inside a wider row buffer (qwen35 q+g shape) ──
+    // Each row is `stride` wide; the query packs at the row start, the tail is POISON the kernel
+    // must never touch. The CPU reference is the SAME query packed (CPU Op::Rope is packed-only),
+    // so parity holds on the logical query values regardless of the wider ROCm layout.
+    let stride = hw * 2; // double-width row, like the interleaved q+g buffer
+    let mut wide = vec![0f32; rows * stride];
+    for row in 0..rows {
+        for i in 0..hw {
+            wide[row * stride + i] = packed[row * hw + i];
+        }
+        for j in hw..stride {
+            wide[row * stride + j] = 1000.0 + (row * stride + j) as f32; // large, distinctive poison
+        }
+    }
+    let rs = run_rope(
+        &be, &wide, &positions, rows, n_head, head_dim, rope_dim, theta, stride,
+    );
+    // Extract the packed roped query out of each strided row.
+    let mut rs_packed = vec![0f32; np];
+    for row in 0..rows {
+        for i in 0..hw {
+            rs_packed[row * hw + i] = rs[row * stride + i];
+        }
+    }
+    let e2 = maxerr(&c, &rs_packed);
+    let ref_mag2 = maxabs(&c).max(1e-6);
+    println!(
+        "Rope strided(stride={stride}) max_err={e2:e} max|ref|={ref_mag2:e} rel={:e}",
+        e2 / ref_mag2
+    );
+    assert!(
+        ref_mag2 > 1e-3,
+        "Rope strided reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e2 / ref_mag2 < 1e-3,
+        "Rope strided diverges from CPU reference (x_stride dropped?): abs={e2:e} rel={:e}",
+        e2 / ref_mag2
+    );
+    // The poison tail must survive untouched: a stride-correct kernel only rotates the query slice.
+    for row in 0..rows {
+        for j in hw..stride {
+            let idx = row * stride + j;
+            assert!(
+                (rs[idx] - wide[idx]).abs() < 1e-6,
+                "rope touched the strided-row tail at {idx} — kernel read/wrote outside the query slice"
+            );
+        }
+    }
+}

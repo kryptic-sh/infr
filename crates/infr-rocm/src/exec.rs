@@ -556,7 +556,7 @@ fn run_op(
             rope_dim,
             theta,
             freq_factors,
-            x_stride: _x_stride,
+            x_stride,
         } => {
             ctx.ensure_device(x, g, bindings)?;
             ctx.ensure_device(positions, g, bindings)?;
@@ -569,20 +569,32 @@ fn run_op(
             // Re-fetch after ensure_device calls (borrow lifetime)
             let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
             let bp_ptr = ctx.dev[positions.0 as usize].as_ref().unwrap().ptr;
-            let rope_args = args![
-                arg_ptr(bx_ptr),
-                arg_ptr(bp_ptr),
-                arg_ptr(ff_ptr),
-                arg_i32(rows as i32),
-                arg_i32(n_head as i32),
-                arg_i32(head_dim as i32),
-                arg_i32(rope_dim as i32),
-                arg_f32(theta),
-            ];
+            // Per-row stride in elements (0 = packed n_head*head_dim). Mirrors the fused
+            // qk_norm_rope stride convention: heads stay packed within a strided row.
+            let stride_elems = if x_stride > 0 {
+                x_stride as usize
+            } else {
+                n_head as usize * head_dim as usize
+            };
             if dst == x {
+                let rope_args = args![
+                    arg_ptr(bx_ptr),
+                    arg_ptr(bp_ptr),
+                    arg_ptr(ff_ptr),
+                    arg_i32(rows as i32),
+                    arg_i32(n_head as i32),
+                    arg_i32(head_dim as i32),
+                    arg_i32(rope_dim as i32),
+                    arg_f32(theta),
+                    arg_i32(x_stride as i32),
+                ];
                 dispatch_1d(pipelines, ctx.stream, "rope", rows, 256, rope_args)?;
             } else {
-                let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
+                // Copy the FULL (possibly strided) source so both the pass-through dims and the
+                // inter-row gaps survive, then rotate in place. A packed input (x_stride == 0)
+                // allocs the natural rows*n_head*head_dim; a strided view needs rows*stride so the
+                // kernel's off = row*stride + h*head_dim stays in bounds for every row.
+                let dd = ctx.zero_dev(rows as usize * stride_elems);
                 unsafe {
                     ffi::hipMemcpyDtoD(
                         dd.ptr,
@@ -599,6 +611,7 @@ fn run_op(
                     arg_i32(head_dim as i32),
                     arg_i32(rope_dim as i32),
                     arg_f32(theta),
+                    arg_i32(x_stride as i32),
                 ];
                 dispatch_1d(pipelines, ctx.stream, "rope", rows, 256, dst_args)?;
                 ctx.dev[dst.0 as usize] = Some(dd);

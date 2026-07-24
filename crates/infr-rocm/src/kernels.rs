@@ -198,34 +198,42 @@ extern "C" __global__ void qk_norm(
 
 const ROPE: &str = r#"
 extern "C" __global__ void rope(
-    float* __restrict__ x,              // [rows, n_head, head_dim] — mutated in-place
+    float* __restrict__ x,              // [rows, n_head, head_dim] or strided — mutated in-place
     const int* __restrict__ positions,  // [rows]
     const float* __restrict__ freq_factors, // optional (null = unused)
     int rows,
     int n_head,
     int head_dim,
     int rope_dim,                       // first rope_dim elements get RoPE
-    float theta
+    float theta,
+    int x_stride       // per-row stride in elements; 0 = packed (n_head * head_dim)
 ) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
     int pos = positions[row];
-    float* xr = x + row * n_head * head_dim;
+    // Per-row stride: 0 = packed. Heads stay packed within a strided row (off = h*head_dim),
+    // mirroring the fused qk_norm_rope kernel's stride convention. Non-zero x_stride selects a
+    // rotated slice out of a wider row buffer without a preceding gather (qwen35's q+g case).
+    int stride = (x_stride > 0) ? x_stride : (n_head * head_dim);
+    float* xr = x + row * stride;
     int half = rope_dim / 2;
     for (int h = 0; h < n_head; h++) {
         float* xh = xr + h * head_dim;
-        for (int i = 0; i < half; i++) {
-            float freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
+        for (int p = 0; p < half; p++) {
+            // ggml NORM RoPE: INTERLEAVED pairs (2p, 2p+1) — matches infr-cpu Op::Rope, the Metal
+            // `rope_f32` kernel, and the Vulkan `rope` shader. (The NEOX split-half rotation lives
+            // in the fused qk_norm_rope kernel; the two styles are NOT interchangeable.)
+            float freq = 1.0f / powf(theta, (float)(2 * p) / (float)rope_dim);
             if (freq_factors != nullptr) {
-                freq *= freq_factors[i];
+                freq /= freq_factors[p]; // Gemma proportional RoPE divides the per-pair angle
             }
             float angle = (float)pos * freq;
             float c = cosf(angle);
             float s = sinf(angle);
-            float x0 = xh[i];
-            float x1 = xh[i + half];
-            xh[i]       = x0 * c - x1 * s;
-            xh[i + half] = x0 * s + x1 * c;
+            float x0 = xh[2 * p];
+            float x1 = xh[2 * p + 1];
+            xh[2 * p]     = x0 * c - x1 * s;
+            xh[2 * p + 1] = x0 * s + x1 * c;
         }
     }
 }

@@ -685,30 +685,42 @@ const CONV1D_SILU: &str = r#"
 extern "C" __global__ void conv1d_silu(
     const float* __restrict__ x,       // [rows, channels]
     const __half* __restrict__ weight, // [channels, kernel]
-    float* __restrict__ state,         // [(kernel-1), channels] — mutated in-place
+    const float* __restrict__ state,   // [(kernel-1), channels] — read-only history
     float* __restrict__ dst,           // [rows, channels]
     int rows,
     int channels,
     int kernel
 ) {
+    // Depthwise causal conv over the VIRTUAL sequence seq = [state ‖ x]: the (kernel-1)
+    // warmup columns of `state` (oldest first) followed by the `rows` input columns. For
+    // output row `t` the causal window is seq[t .. t+kernel-1]; the current token uses the
+    // last tap weight[c, kernel-1], the history taps use the earlier weights. Every
+    // (row, channel) is independent — no cross-row carry inside the kernel — so multi-row
+    // prefill is correct. The updated state (trailing kernel-1 columns of seq) is written
+    // HOST-SIDE in execute() after the kernel. `state` is read-only here (no in-place race).
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
+    int km1 = kernel - 1;
     for (int c = 0; c < channels; c++) {
         float acc = 0.0f;
         const __half* wc = weight + c * kernel;
-        // history contributions
-        for (int j = 0; j < (int)(kernel - 1); j++) {
-            acc += state[j * channels + c] * __half2float(wc[j]);
+        for (int k = 0; k < kernel; k++) {
+            int i = row + k; // index into the virtual [state ‖ x] sequence
+            float xv;
+            if (i < km1) {
+                xv = state[i * channels + c]; // warmup history column
+            } else {
+                xv = x[(i - km1) * channels + c]; // input column
+            }
+            acc += xv * __half2float(wc[k]);
         }
-        // current token contribution
-        acc += x[row * channels + c] * __half2float(wc[kernel - 1]);
         // SiLU
         float v = acc / (1.0f + expf(-acc));
         dst[row * channels + c] = v;
     }
 }
-// State update is done HOST-SIDE in execute() after the kernel: shift history,
-// append current x row.
+// State update is done HOST-SIDE in execute() after the kernel: the returned state is the
+// trailing kernel-1 columns of the virtual [state ‖ x] sequence.
 "#;
 
 const DELTANET: &str = r#"

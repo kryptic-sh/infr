@@ -1237,23 +1237,26 @@ fn run_op(
                     arg_i32(kernel as i32),
                 ],
             )?;
-            // Host-side state shift
+            // Host-side state update: the returned state is the trailing `km1` columns of the
+            // virtual sequence seq = [state ‖ x] (km1 warmup columns then `rows` input columns),
+            // i.e. new_state[j] = seq[rows + j] for j in 0..km1. This chains correctly for any
+            // `rows`: for `rows >= km1` all km1 columns come from the last km1 input rows; for
+            // `rows < km1` the leading entries carry over from the old state tail. For `rows == 1`
+            // it reduces to the old "drop oldest, append x[0]" shift (decode is bit-identical).
             let km1 = (kernel - 1) as usize;
             let ch = channels as usize;
+            let rows_u = rows as usize;
             let hs = ctx.host_vals(state, g, bindings)?.to_vec();
             let hx = ctx.host_vals(x, g, bindings)?.to_vec();
-            let mut ns = hs.clone();
-            for r in 0..(rows as usize) {
-                for j in 0..km1.saturating_sub(1) {
-                    for c in 0..ch {
-                        ns[j * ch + c] = hs[(j + 1) * ch + c];
-                    }
-                }
-                if km1 > 0 {
-                    let last = km1 - 1;
-                    for c in 0..ch {
-                        ns[last * ch + c] = hx[r * ch + c];
-                    }
+            let mut ns = vec![0f32; km1 * ch];
+            for j in 0..km1 {
+                let idx = rows_u + j; // virtual-sequence index of new_state column j
+                for c in 0..ch {
+                    ns[j * ch + c] = if idx < km1 {
+                        hs[idx * ch + c] // still inside the old state tail
+                    } else {
+                        hx[(idx - km1) * ch + c] // an input column
+                    };
                 }
             }
             ctx.set_dev(state, &ns);

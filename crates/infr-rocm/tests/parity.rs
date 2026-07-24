@@ -786,3 +786,129 @@ fn qk_norm_rope_matches_cpu() {
         e / ref_mag
     );
 }
+
+// ── Conv1dSilu (depthwise causal conv + SiLU, rolling state) vs CPU ───────────
+
+/// Run a single-`Op::Conv1dSilu` graph on `be` and return BOTH the downloaded output
+/// `[rows, channels]` AND the updated `state` `[(kernel-1), channels]`. `state` is bound as an
+/// F32 Input so the op mutates it in place; the backend must write the trailing `kernel-1`
+/// columns of the virtual `[state ‖ x]` sequence back to that buffer (verified by downloading it
+/// after execute — the same in-place-state-persistence contract as `seam_op_parity`'s state test).
+/// `weight` uploads as raw F16 bytes (dequantized on first touch), so CPU (f16→f32) and ROCm
+/// (f16 as-is) see identical kernel taps.
+fn run_conv1d_silu(
+    be: &dyn Backend,
+    x: &[f32],
+    weight_f16: &[u8],
+    state_init: &[f32],
+    rows: usize,
+    channels: usize,
+    kernel: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let km1 = kernel - 1;
+    let mut g = Graph::new();
+    let xid = g.input(f32d(rows * channels));
+    let wid = g.weight(TensorDesc::new(vec![channels * kernel], DType::F16));
+    let sid = g.input(f32d(km1 * channels)); // F32 Input → mutated in place, read back after
+    let dst = g.output(f32d(rows * channels));
+    g.push(Op::Conv1dSilu {
+        x: xid,
+        weight: wid,
+        state: sid,
+        dst,
+        rows: rows as u32,
+        channels: channels as u32,
+        kernel: kernel as u32,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let xb = be.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+    be.upload(xb.as_ref(), bytemuck::cast_slice(x)).unwrap();
+    let wb = be.alloc(weight_f16.len(), BufferUsage::Weights).expect("w");
+    be.upload(wb.as_ref(), weight_f16).unwrap();
+    let sb = be
+        .alloc(state_init.len() * 4, BufferUsage::Activations)
+        .expect("state");
+    be.upload(sb.as_ref(), bytemuck::cast_slice(state_init))
+        .unwrap();
+    let ob = be
+        .alloc(rows * channels * 4, BufferUsage::Readback)
+        .expect("out");
+    let mut b = Bindings::new();
+    b.bind(xid, xb.as_ref());
+    b.bind(wid, wb.as_ref());
+    b.bind(sid, sb.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut out = vec![0f32; rows * channels];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut out))
+        .unwrap();
+    let mut ns = vec![0f32; km1 * channels];
+    be.download(sb.as_ref(), bytemuck::cast_slice_mut(&mut ns))
+        .unwrap();
+    (out, ns)
+}
+
+/// `Op::Conv1dSilu` (qwen35's depthwise causal 1-D conv + SiLU, rolling `state`) must match the CPU
+/// reference for a MULTI-ROW (prefill) input with a NON-trivial initial `state` — BOTH the output
+/// AND the updated state. The pre-fix ROCm kernel applied the SAME unchanged `state` to every one of
+/// the `rows` output rows (no per-row window advance) and the host shift chained from the ORIGINAL
+/// `x` for each row, so for `rows > 1` both the conv outputs and the returned state were wrong (only
+/// `rows == 1` decode was correct) — one of the two bugs making qwen35 prefill incoherent. This runs
+/// the SAME single-op graph on `RocmBackend` and `infr_cpu::CpuBackend`; it fails loudly without the
+/// fix. Correct semantics: convolve the virtual sequence `[state ‖ x]` per (row, channel), and the
+/// returned state is that sequence's trailing `kernel-1` columns.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn conv1d_silu_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, channels, kernel) = (6usize, 32usize, 4usize); // rows > 1 (prefill), rows > kernel-1
+    let km1 = kernel - 1;
+
+    let x = gen(rows * channels, 6);
+    // Per-channel kernel [channels, kernel], F16 bytes (CPU dequants f16→f32, ROCm reads f16 as-is).
+    let wf32 = gen(channels * kernel, 7);
+    let w_bytes: Vec<u8> = wf32
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+    // NON-trivial initial state (exercises the cross-row warmup carry — a zeroed state would hide
+    // the "state applied to every row unchanged" bug on the first km1 rows).
+    let state_init = gen(km1 * channels, 13);
+
+    let (c_out, c_state) = run_conv1d_silu(&cpu, &x, &w_bytes, &state_init, rows, channels, kernel);
+    let (r_out, r_state) = run_conv1d_silu(&be, &x, &w_bytes, &state_init, rows, channels, kernel);
+
+    let eo = maxerr(&c_out, &r_out);
+    let out_mag = maxabs(&c_out).max(1e-6);
+    let es = maxerr(&c_state, &r_state);
+    let st_mag = maxabs(&c_state).max(1e-6);
+    println!(
+        "Conv1dSilu multirow(rows={rows}) out max_err={eo:e} max|ref|={out_mag:e} rel={:e} | state max_err={es:e} max|ref|={st_mag:e} rel={:e}",
+        eo / out_mag,
+        es / st_mag
+    );
+    // Guard against a silently-zero output/state masquerading as agreement.
+    assert!(
+        out_mag > 1e-3,
+        "Conv1dSilu output reference is all-zero — test is vacuous"
+    );
+    assert!(
+        st_mag > 1e-3,
+        "Conv1dSilu state reference is all-zero — test is vacuous"
+    );
+    assert!(
+        eo / out_mag < 2e-3,
+        "Conv1dSilu multirow output diverges from CPU reference (per-row window not advanced?): abs={eo:e} rel={:e}",
+        eo / out_mag
+    );
+    // The updated state is a pure gather from `[state ‖ x]` (no arithmetic), so f16 weight rounding
+    // does not touch it — the returned state must match the CPU reference near-exactly.
+    assert!(
+        es / st_mag < 1e-5,
+        "Conv1dSilu multirow updated state diverges from CPU reference (host chain from original x?): abs={es:e} rel={:e}",
+        es / st_mag
+    );
+}

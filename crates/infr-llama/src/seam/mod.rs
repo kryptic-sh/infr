@@ -2232,6 +2232,44 @@ pub(crate) fn verify_dense_vulkan(
     Ok(logits)
 }
 
+/// [`verify_dense_cpu`]'s ROCm twin — the same one-shot causal prefill through the ROCm seam, for
+/// the CPU/ROCm cross-backend parity check (`docs/rocm-plan.md` Phase 2). i2_s/TQ2_0 BitNet weights
+/// host-dequant to f16 at bind, so this runs the model f16 exactly like the Vulkan twin.
+#[cfg(all(target_os = "linux", feature = "rocm"))]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn verify_dense_rocm(
+    rocm: &infr_rocm::RocmBackend,
+    g: &Gguf,
+    cfg: &Config,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+) -> AResult<Vec<f32>> {
+    let mut logits = Vec::new();
+    let mut state = None;
+    generate_dense_backend(
+        rocm,
+        &rocm_upload_bind(rocm),
+        g,
+        cfg,
+        token_embd,
+        ple,
+        tokens,
+        1,
+        |_| {},
+        &mut state,
+        tokens.len() + 2,
+        None,
+        None,
+        None,
+        Some(&mut logits),
+        None,
+        None,
+        None,
+    )?;
+    Ok(logits)
+}
+
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it
 /// on `be` (CPU reference or Vulkan). `bind_weight` turns each native-dtype GGUF tensor into a
 /// backend buffer: the CPU maps it zero-copy from the mmap; the GPU pads + uploads it to VRAM. This

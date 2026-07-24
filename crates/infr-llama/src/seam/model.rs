@@ -869,6 +869,24 @@ impl SeamModel {
         )
     }
 
+    /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s ROCm twin, for the CPU/ROCm cross-backend
+    /// parity check (`docs/rocm-plan.md` Phase 2). Used by the BitNet model-level gate, whose base
+    /// weights are not portable to a token-for-token greedy compare, so it locks the last-row logits
+    /// (top token + whole-vocab cosine) exactly like the Vulkan BitNet gate.
+    #[cfg(all(target_os = "linux", feature = "rocm"))]
+    pub fn prefill_logits_rocm(&self, tokens: &[u32], dev_idx: u32) -> Result<Vec<f32>> {
+        let rocm =
+            infr_rocm::RocmBackend::new(dev_idx as i32).map_err(|e| anyhow!("rocm init: {e}"))?;
+        crate::seam::verify_dense_rocm(
+            &rocm,
+            &self.gguf,
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            tokens,
+        )
+    }
+
     /// Open a Phase-2 DiffusionGemma denoise session on the CPU reference backend (see
     /// `docs/diffusion-gemma.md`): [`prefill`](DiffusionGemmaCpuSession::prefill) causally
     /// prefills the prompt ONCE (encoder scalars, KV rows `0..P`), then repeated

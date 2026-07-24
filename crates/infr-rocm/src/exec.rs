@@ -1278,6 +1278,8 @@ fn run_op(
             n_vhead,
             head_k,
             head_v,
+            eps,
+            src_stride,
             ..
         } => {
             ctx.ensure_device(q, g, bindings)?;
@@ -1316,6 +1318,8 @@ fn run_op(
                     arg_i32(n_vhead as i32),
                     arg_i32(head_k as i32),
                     arg_i32(head_v as i32),
+                    arg_f32(eps),
+                    arg_i32(src_stride as i32),
                 ],
             )?;
             ctx.dev[dst.0 as usize] = Some(dd);

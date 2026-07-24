@@ -912,3 +912,225 @@ fn conv1d_silu_matches_cpu() {
         es / st_mag
     );
 }
+
+// ── DeltaNet (gated linear-attention recurrence, persistent S state) vs CPU ──
+
+/// Run a single-`Op::DeltaNet` graph on `be` and return BOTH the downloaded output
+/// `[rows, n_vhead*head_v]` AND the mutated recurrent state `[n_vhead, head_k, head_v]`. `state` is
+/// bound as an F32 Input the op mutates IN PLACE (read back after execute — the persistent-state
+/// contract: qwen35's DeltaNet-S survives across `execute` calls). `a_coef`/`dt_bias` upload as raw
+/// F16 bytes (CPU dequants f16→f32, ROCm reads f16 as-is, so both see identical per-head scalars).
+#[allow(clippy::too_many_arguments)]
+fn run_deltanet(
+    be: &dyn Backend,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    bcoef: &[f32],
+    acoef_in: &[f32],
+    a_coef_f16: &[u8],
+    dt_bias_f16: &[u8],
+    state_init: &[f32],
+    rows: usize,
+    n_vhead: usize,
+    n_khead: usize,
+    head_k: usize,
+    head_v: usize,
+    eps: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut g = Graph::new();
+    let qid = g.input(f32d(rows * n_khead * head_k));
+    let kid = g.input(f32d(rows * n_khead * head_k));
+    let vid = g.input(f32d(rows * n_vhead * head_v));
+    let bid = g.input(f32d(rows * n_vhead));
+    let aid = g.input(f32d(rows * n_vhead));
+    let acid = g.weight(TensorDesc::new(vec![n_vhead], DType::F16));
+    let dtid = g.weight(TensorDesc::new(vec![n_vhead], DType::F16));
+    let sid = g.input(f32d(n_vhead * head_k * head_v)); // F32 Input → mutated in place, read back
+    let dst = g.output(f32d(rows * n_vhead * head_v));
+    g.push(Op::DeltaNet {
+        q: qid,
+        k: kid,
+        v: vid,
+        b: bid,
+        a: aid,
+        a_coef: acid,
+        dt_bias: dtid,
+        state: sid,
+        dst,
+        rows: rows as u32,
+        n_vhead: n_vhead as u32,
+        n_khead: n_khead as u32,
+        head_k: head_k as u32,
+        head_v: head_v as u32,
+        eps,
+        src_stride: 0,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let up_f32 = |data: &[f32], usage| {
+        let b = be.alloc(data.len() * 4, usage).expect("alloc f32");
+        be.upload(b.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        b
+    };
+    let up_bytes = |data: &[u8], usage| {
+        let b = be.alloc(data.len(), usage).expect("alloc bytes");
+        be.upload(b.as_ref(), data).unwrap();
+        b
+    };
+    let qb = up_f32(q, BufferUsage::Activations);
+    let kb = up_f32(k, BufferUsage::Activations);
+    let vb = up_f32(v, BufferUsage::Activations);
+    let bb = up_f32(bcoef, BufferUsage::Activations);
+    let ab = up_f32(acoef_in, BufferUsage::Activations);
+    let acb = up_bytes(a_coef_f16, BufferUsage::Weights);
+    let dtb = up_bytes(dt_bias_f16, BufferUsage::Weights);
+    let sb = up_f32(state_init, BufferUsage::Activations);
+    let ob = be
+        .alloc(rows * n_vhead * head_v * 4, BufferUsage::Readback)
+        .expect("out");
+    let mut bnd = Bindings::new();
+    bnd.bind(qid, qb.as_ref());
+    bnd.bind(kid, kb.as_ref());
+    bnd.bind(vid, vb.as_ref());
+    bnd.bind(bid, bb.as_ref());
+    bnd.bind(aid, ab.as_ref());
+    bnd.bind(acid, acb.as_ref());
+    bnd.bind(dtid, dtb.as_ref());
+    bnd.bind(sid, sb.as_ref());
+    bnd.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &bnd).expect("execute");
+    let mut out = vec![0f32; rows * n_vhead * head_v];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut out))
+        .unwrap();
+    let mut ns = vec![0f32; n_vhead * head_k * head_v];
+    be.download(sb.as_ref(), bytemuck::cast_slice_mut(&mut ns))
+        .unwrap();
+    (out, ns)
+}
+
+/// `Op::DeltaNet` (qwen35's gated-DeltaNet linear-attention recurrence) must match the CPU reference
+/// (`infr_cpu` `deltanet_scan`) for BOTH the output AND the mutated persistent `S` state, on a
+/// MULTI-ROW (prefill) input with a NON-trivial initial `S` — the token recurrence carries `S`
+/// sequentially across rows, so a per-row-independent or mis-sequenced kernel is wrong for rows>1.
+/// Uses GQA (`n_khead < n_vhead`) so the value→key head mapping is exercised, and injects large
+/// `a` values so the decay's softplus is pushed into its overflow regime.
+///
+/// The pre-fix ROCm kernel had four divergences any of which this catches: (1) the state was stored
+/// TRANSPOSED (`S[d*head_k+k]`) so the mutated-state readback disagreed with the CPU `[head_k,
+/// head_v]` layout; (2) GQA used `vh/(n_vhead/n_khead)` (grouped) instead of the CPU/qwen35
+/// INTERLEAVED `vh % n_khead`, so every value head past the first group read the wrong q/k; (3) the
+/// decay used the naive `log(1+exp(z))` softplus, which overflows to +inf for large z and (with
+/// a_coef<0) collapses decay to 0, silently wiping the state every token; (4) `eps` was hardcoded.
+/// It also runs a decode (rows==1) case. Fails loudly without the fix; guarded against vacuous
+/// all-zero agreement.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn deltanet_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let eps = 1e-6f32;
+    // Two shapes: a small GQA case (nk=2 < nv=4 — exercises the interleaved value→key head map),
+    // and the REAL qwen35-0.8B DeltaNet shape (nv=nk=16, head_k=head_v=128) to rule out any
+    // large-dim / long-reduction divergence at the size the model actually runs.
+    for &(n_vhead, n_khead, head_k, head_v) in
+        &[(4usize, 2usize, 8usize, 8usize), (16, 16, 128, 128)]
+    {
+        // Per-head scalars: a_coef modestly NEGATIVE (the sign that makes an overflowing softplus
+        // collapse decay to zero), dt_bias small. F16 like the seam's dequant path.
+        let acoef_f32: Vec<f32> = (0..n_vhead).map(|h| -0.02 * (1.0 + h as f32)).collect();
+        let dtbias_f32: Vec<f32> = gen(n_vhead, 71);
+        let a_coef_f16: Vec<u8> = acoef_f32
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let dt_bias_f16: Vec<u8> = dtbias_f32
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+
+        for &rows in &[5usize, 1usize] {
+            let q = gen(rows * n_khead * head_k, 6);
+            let k = gen(rows * n_khead * head_k, 9);
+            let v = gen(rows * n_vhead * head_v, 12);
+            let bcoef = gen(rows * n_vhead, 15);
+            // `a`: mostly small, but a couple large-z entries so softplus(z) overflows the naive form
+            // (z ~ 100 → exp(z) is +inf) while stable softplus stays finite (sp ≈ z, decay ≈ exp(ac·z)).
+            let mut acoef_in = gen(rows * n_vhead, 18);
+            acoef_in[0] = 100.0;
+            if rows * n_vhead > n_vhead {
+                acoef_in[n_vhead] = 100.0;
+            }
+            // NON-trivial initial S state (a zeroed S would hide the transposed-layout bug entirely).
+            let state_init = gen(n_vhead * head_k * head_v, 21);
+
+            let (c_out, c_state) = {
+                // The CPU backend mutates `state` in place too — run it through the SAME single-op graph.
+                run_deltanet(
+                    &cpu,
+                    &q,
+                    &k,
+                    &v,
+                    &bcoef,
+                    &acoef_in,
+                    &a_coef_f16,
+                    &dt_bias_f16,
+                    &state_init,
+                    rows,
+                    n_vhead,
+                    n_khead,
+                    head_k,
+                    head_v,
+                    eps,
+                )
+            };
+            let (r_out, r_state) = run_deltanet(
+                &be,
+                &q,
+                &k,
+                &v,
+                &bcoef,
+                &acoef_in,
+                &a_coef_f16,
+                &dt_bias_f16,
+                &state_init,
+                rows,
+                n_vhead,
+                n_khead,
+                head_k,
+                head_v,
+                eps,
+            );
+
+            let eo = maxerr(&c_out, &r_out);
+            let out_mag = maxabs(&c_out).max(1e-6);
+            let es = maxerr(&c_state, &r_state);
+            let st_mag = maxabs(&c_state).max(1e-6);
+            println!(
+            "DeltaNet nv={n_vhead} nk={n_khead} kd={head_k} vd={head_v} rows={rows} out max_err={eo:e} max|ref|={out_mag:e} rel={:e} | state max_err={es:e} max|ref|={st_mag:e} rel={:e}",
+            eo / out_mag,
+            es / st_mag
+        );
+            // Guard against a silently-zero output/state masquerading as agreement.
+            assert!(
+                out_mag > 1e-3,
+                "DeltaNet rows={rows} output reference is all-zero — test is vacuous"
+            );
+            assert!(
+                st_mag > 1e-3,
+                "DeltaNet rows={rows} state reference is all-zero — test is vacuous"
+            );
+            assert!(
+            eo / out_mag < 2e-2,
+            "DeltaNet rows={rows} output diverges from CPU reference (GQA map / softplus / sequencing?): abs={eo:e} rel={:e}",
+            eo / out_mag
+        );
+            assert!(
+            es / st_mag < 2e-2,
+            "DeltaNet rows={rows} mutated state diverges from CPU reference (transposed layout / decay?): abs={es:e} rel={:e}",
+            es / st_mag
+        );
+        }
+    }
+}

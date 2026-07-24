@@ -724,81 +724,90 @@ extern "C" __global__ void conv1d_silu(
 "#;
 
 const DELTANET: &str = r#"
+// Gated-DeltaNet linear-attention recurrence (qwen35). One thread per VALUE head; the token
+// scan is inherently SEQUENTIAL (state S carries across the `rows` tokens, mutated in place),
+// but value heads are fully independent — thread `vh` owns state slice `state[vh*head_k*head_v..]`
+// and its own output columns. Matches infr-cpu `deltanet_scan` EXACTLY (within f32 tolerance):
+//   - state layout is [n_vhead, head_k, head_v], row-major `S[k*head_v + d]` (NOT transposed),
+//   - GQA is the INTERLEAVED `kh = vh % n_khead` tiling (qwen35, not the qwen3next grouping),
+//   - the decay uses the NUMERICALLY-STABLE softplus `max(z,0)+log1p(exp(-|z|))` (the naive
+//     `log(1+exp(z))` overflows to +inf for large z; with a_coef<0 that collapses decay to 0 and
+//     silently wipes the state every token → incoherent output),
+//   - `eps` is the caller's value (not a hardcoded constant),
+//   - `src_stride>0` fuses q|k|v into one source buffer (q at row offset 0, k at n_khead*head_k,
+//     v at 2*n_khead*head_k, per-row stride `src_stride`) — the decode strided path.
+// The per-value-dim COLUMN reformulation needs NO per-head scratch arrays (the old `sk[256]`/
+// `delta[256]` capped head_v at 256 with a silent OOB): each value dim `d` owns state column
+// S[:,d], and kv[d]/delta[d]/out[d] all touch only that column, so decay→kv→delta→update→out
+// fuse per-column with head_k/head_v unbounded.
 extern "C" __global__ void deltanet(
-    const float* __restrict__ q,         // [rows, n_khead * head_k]
-    const float* __restrict__ k,         // [rows, n_khead * head_k]
-    const float* __restrict__ v,         // [rows, n_vhead * head_v]
+    const float* __restrict__ q,         // [rows, n_khead*head_k] (or fused src when src_stride>0)
+    const float* __restrict__ k,         // [rows, n_khead*head_k]
+    const float* __restrict__ v,         // [rows, n_vhead*head_v]
     const float* __restrict__ b,         // [rows, n_vhead]
     const float* __restrict__ a,         // [rows, n_vhead]
     const __half* __restrict__ a_coef,   // [n_vhead]
     const __half* __restrict__ dt_bias,  // [n_vhead]
     float* __restrict__ state,           // [n_vhead, head_k, head_v] — mutated in-place
-    float* __restrict__ dst,             // [rows, n_vhead * head_v]
+    float* __restrict__ dst,             // [rows, n_vhead*head_v]
     int rows,
     int n_khead,
     int n_vhead,
     int head_k,
-    int head_v
+    int head_v,
+    float eps,
+    int src_stride                       // >0: q/k/v are slices of one buffer with this row stride
 ) {
-    // Process one value head at a time
     int vh = blockIdx.x * blockDim.x + threadIdx.x;
-    if (vh >= (int)n_vhead) return;
-    // GQA: value head vh uses q/k head vh / (n_vhead / n_khead)
-    int kh = vh / (n_vhead / n_khead);
+    if (vh >= n_vhead) return;
+    // GQA: value head vh uses q/k head vh % n_khead (interleaved tiling — matches CPU/Metal).
+    int kh = vh % n_khead;
     float ac = __half2float(a_coef[vh]);
     float dtb = __half2float(dt_bias[vh]);
+    float qscale = rsqrtf((float)head_k);
+
+    // Row strides + within-row offsets for the fused (src_stride>0) vs packed (==0) layouts.
+    int qrow = (src_stride > 0) ? src_stride : n_khead * head_k;
+    int krow = (src_stride > 0) ? src_stride : n_khead * head_k;
+    int vrow = (src_stride > 0) ? src_stride : n_vhead * head_v;
+    int koff = (src_stride > 0) ? n_khead * head_k : 0;
+    int voff = (src_stride > 0) ? 2 * n_khead * head_k : 0;
+    const float* qbase = q;
+    const float* kbase = (src_stride > 0) ? q : k;   // fused: k shares q's buffer
+    const float* vbase = (src_stride > 0) ? q : v;
+
+    float* S = state + (long)vh * head_k * head_v;
     for (int r = 0; r < rows; r++) {
-        // q, k rows
-        const float* qr = q + r * n_khead * head_k + kh * head_k;
-        const float* kr = k + r * n_khead * head_k + kh * head_k;
-        const float* vr = v + r * n_vhead * head_v + vh * head_v;
-        float br = b[r * n_vhead + vh];
-        float ar = a[r * n_vhead + vh];
-        // L2 norm q, k
-        float qn = 0.0f, kn = 0.0f;
-        for (int i = 0; i < (int)head_k; i++) { qn += qr[i] * qr[i]; kn += kr[i] * kr[i]; }
-        qn = 1.0f / sqrtf(qn + 1e-6f);
-        kn = 1.0f / sqrtf(kn + 1e-6f);
-        // beta, decay
-        float beta = 1.0f / (1.0f + expf(-br));
-        float decay = expf(ac * logf(1.0f + expf(ar + dtb)));
-        // state *= decay (naive: O(head_k * head_v) per head per row)
-        float* Sv = state + vh * head_k * head_v;
-        for (int i = 0; i < (int)(head_k * head_v); i++) {
-            Sv[i] *= decay;
-        }
-        // compute delta
-        // S^T k: (head_v x head_k) * (head_k) = (head_v)
-        float sk[256]; // max head_v (typically 128)
-        for (int j = 0; j < (int)head_v; j++) {
-            float s = 0.0f;
-            for (int i = 0; i < (int)head_k; i++) {
-                s += Sv[j * head_k + i] * kr[i] * kn;
+        const float* qr = qbase + (long)r * qrow + kh * head_k;
+        const float* kr = kbase + (long)r * krow + koff + kh * head_k;
+        const float* vr = vbase + (long)r * vrow + voff + vh * head_v;
+        // L2 norms over head_k (q also scaled by 1/sqrt(head_k)); reciprocal so we multiply below.
+        float qsum = 0.0f, ksum = 0.0f;
+        for (int i = 0; i < head_k; i++) { qsum += qr[i] * qr[i]; ksum += kr[i] * kr[i]; }
+        float qn = 1.0f / sqrtf(qsum + eps);
+        float kn = 1.0f / sqrtf(ksum + eps);
+        float beta = 1.0f / (1.0f + expf(-b[r * n_vhead + vh]));
+        // decay = exp(a_coef * softplus(a + dt_bias)); STABLE softplus (no overflow).
+        float z = a[r * n_vhead + vh] + dtb;
+        float sp = fmaxf(z, 0.0f) + log1pf(expf(-fabsf(z)));
+        float decay = expf(ac * sp);
+        float* dr = dst + (long)r * n_vhead * head_v + (long)vh * head_v;
+        // Per value dim d (independent state column S[:,d]): decay → kv → delta → update → out.
+        for (int d = 0; d < head_v; d++) {
+            float kv = 0.0f;
+            for (int kk = 0; kk < head_k; kk++) {
+                float s = S[kk * head_v + d] * decay;   // S *= decay
+                S[kk * head_v + d] = s;
+                kv += s * (kr[kk] * kn);                // kv[d] = k_normᵀ S[:,d]
             }
-            sk[j] = s;
-        }
-        // delta = (v_norm - sk) * beta
-        float delta[256];
-        float vnorm = 0.0f;
-        for (int j = 0; j < (int)head_v; j++) {
-            delta[j] = (vr[j] - sk[j]) * beta;
-        }
-        // S += k_norm ⊗ delta: (head_k) * (head_v) outer product
-        for (int i = 0; i < (int)head_k; i++) {
-            float ki = kr[i] * kn;
-            for (int j = 0; j < (int)head_v; j++) {
-                Sv[j * head_k + i] += ki * delta[j];
+            float delta = (vr[d] - kv) * beta;
+            float o = 0.0f;
+            for (int kk = 0; kk < head_k; kk++) {
+                float s = S[kk * head_v + d] + (kr[kk] * kn) * delta;  // S += k_norm ⊗ delta
+                S[kk * head_v + d] = s;
+                o += s * (qr[kk] * qn * qscale);        // out[d] = q_normᵀ S[:,d]
             }
-        }
-        // dst = S^T q_norm
-        float qscale = 1.0f / sqrtf((float)head_k);
-        float* dr = dst + r * n_vhead * head_v + vh * head_v;
-        for (int j = 0; j < (int)head_v; j++) {
-            float s = 0.0f;
-            for (int i = 0; i < (int)head_k; i++) {
-                s += Sv[j * head_k + i] * qr[i] * qn * qscale;
-            }
-            dr[j] = s;
+            dr[d] = o;
         }
     }
 }

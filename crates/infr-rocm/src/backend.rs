@@ -144,6 +144,73 @@ impl Buffer for RocmBuffer {
     }
 }
 
+// ── BufferPool ───────────────────────────────────────────────────────────────
+
+/// Round a byte request up to its pool bucket. Distinct-but-close sizes share a bucket so a
+/// prefill (m=N) row and a decode (m=1) row of the same op don't fragment the free-list too
+/// finely; 256 B granularity keeps waste ≤ 256 B/alloc while the same graph replayed every
+/// decode step maps to the exact same buckets → perfect reuse, zero churn.
+pub(crate) fn bucket_bytes(bytes: usize) -> usize {
+    const GRAN: usize = 256;
+    bytes.max(1).div_ceil(GRAN) * GRAN
+}
+
+/// A free-list of reusable device scratch allocations, keyed by bucket byte size. Op scratch
+/// (`zero_dev` / transient GEMV buffers) is drawn from here and returned at end-of-forward
+/// instead of `hipMalloc`/`hipFree`'d per op — on a blocking stream each malloc/free implicitly
+/// syncs the device, so the per-op allocation churn (not the explicit sync) was the decode
+/// bottleneck. The pool lives on the backend, so it persists across decode replay steps and the
+/// hot loop allocates nothing after the first pass.
+pub(crate) struct BufferPool {
+    free: std::collections::HashMap<usize, Vec<*mut c_void>>,
+}
+
+// The pool holds raw device pointers (VRAM regions, not CPU addresses) — Send/Sync like RocmBuffer.
+unsafe impl Send for BufferPool {}
+unsafe impl Sync for BufferPool {}
+
+impl BufferPool {
+    pub(crate) fn new() -> Self {
+        Self {
+            free: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Get a device pointer for `bucket` bytes (already rounded via [`bucket_bytes`]): reuse a
+    /// free one if present, else `hipMalloc` a fresh bucket-sized allocation. Panics on OOM — the
+    /// exec-internal scratch path, like [`RocmBuffer::alloc`], is infallible by contract.
+    pub(crate) fn take(&mut self, bucket: usize) -> *mut c_void {
+        if let Some(v) = self.free.get_mut(&bucket) {
+            if let Some(p) = v.pop() {
+                return p;
+            }
+        }
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { ffi::hipMalloc(&mut ptr, bucket) };
+        if rc != HIP_SUCCESS {
+            panic!("BufferPool hipMalloc({bucket}): rc={rc}");
+        }
+        ptr
+    }
+
+    /// Return a pointer to its bucket free-list for reuse by the next op / forward pass.
+    pub(crate) fn give(&mut self, bucket: usize, ptr: *mut c_void) {
+        self.free.entry(bucket).or_default().push(ptr);
+    }
+}
+
+impl Drop for BufferPool {
+    fn drop(&mut self) {
+        for (_, v) in self.free.drain() {
+            for p in v {
+                if !p.is_null() {
+                    unsafe { ffi::hipFree(p) };
+                }
+            }
+        }
+    }
+}
+
 impl Drop for RocmBuffer {
     fn drop(&mut self) {
         if self.owned && !self.ptr.is_null() {
@@ -165,6 +232,9 @@ pub struct RocmBackend {
     /// Dequantized-weight cache: bound-buffer device address → f16 device buffer.
     /// Single-generation lifetime (one backend per generation); keys are stable.
     pub(crate) weight_cache: Mutex<std::collections::HashMap<usize, RocmBuffer>>,
+    /// Reusable op-scratch pool (see [`BufferPool`]). Persists across `execute` calls so the
+    /// decode replay loop draws from the free-list instead of `hipMalloc`/`hipFree` per op.
+    pub(crate) pool: Mutex<BufferPool>,
     /// Active weight-load progress bar.
     weight_pb: Arc<Mutex<Option<indicatif::ProgressBar>>>,
 }
@@ -209,6 +279,7 @@ impl RocmBackend {
             stream,
             pipelines,
             weight_cache: Mutex::new(std::collections::HashMap::new()),
+            pool: Mutex::new(BufferPool::new()),
             weight_pb: Arc::new(Mutex::new(None)),
         })
     }
@@ -344,6 +415,7 @@ impl Backend for RocmBackend {
         exec::execute_graph(
             &self.pipelines,
             &self.weight_cache,
+            &self.pool,
             self.stream,
             plan,
             bindings,

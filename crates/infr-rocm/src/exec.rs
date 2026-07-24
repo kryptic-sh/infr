@@ -5,6 +5,7 @@
 //! Uncovered quantized weight tensors are dequantized to f16 on the host on first touch and
 //! cached by the raw device-pointer address of their bound buffer.
 
+use crate::backend::{bucket_bytes, BufferPool};
 use crate::ffi::{self, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS};
 use crate::kernels::Pipelines;
 use half::f16;
@@ -30,6 +31,14 @@ fn rocm_buf(b: &dyn infr_core::backend::Buffer) -> &crate::RocmBuffer {
 fn read_bytes(b: &crate::RocmBuffer, stream: ffi::hipStream_t) -> Vec<u8> {
     let mut v = vec![0u8; b.len];
     if b.len > 0 {
+        // Sync the work stream BEFORE the readback: with the per-op sync removed, this is the
+        // barrier that guarantees every queued async kernel/memset that produced `b` has retired
+        // before we copy it to the host — independent of HIP's (per-thread vs legacy) default-stream
+        // mode. This is one of the only two sync points kept on the hot path (host readbacks + the
+        // final writeback barrier).
+        unsafe {
+            ffi::hipStreamSynchronize(stream);
+        }
         unsafe {
             ffi::hipMemcpy(
                 v.as_mut_ptr() as *mut c_void,
@@ -37,9 +46,6 @@ fn read_bytes(b: &crate::RocmBuffer, stream: ffi::hipStream_t) -> Vec<u8> {
                 b.len,
                 HIP_MEMCPY_DEVICE_TO_HOST,
             );
-        }
-        unsafe {
-            ffi::hipStreamSynchronize(stream);
         }
     }
     v
@@ -202,19 +208,53 @@ struct ExecCtx<'a> {
     dev: Vec<Option<crate::RocmBuffer>>,
     vals: Vec<Option<Vec<f32>>>,
     weight_cache: &'a Mutex<HashMap<usize, crate::RocmBuffer>>,
+    /// Reusable device-scratch pool (persists across `execute` calls on the backend).
+    pool: &'a Mutex<BufferPool>,
+    /// Pool draws made this forward pass: `(ptr, bucket_bytes)`, returned to `pool` on `Drop`
+    /// (both the success path and any early-error return) so nothing is `hipFree`'d per op.
+    pooled: Vec<(*mut c_void, usize)>,
     stream: ffi::hipStream_t,
 }
 
 impl<'a> ExecCtx<'a> {
     fn f16_dev(&self, data: &[u8]) -> crate::RocmBuffer {
+        // The dequant→f16 weight cache is long-lived (backend lifetime), NOT per-forward scratch,
+        // so it allocates directly and is owned by `weight_cache` — never routed through the pool.
         let mut buf = crate::RocmBuffer::alloc(data.len().max(1), self.stream);
         buf.upload(data, self.stream);
         buf
     }
 
-    fn zero_dev(&self, n: usize) -> crate::RocmBuffer {
-        // Allocate in BYTES — n is ELEMENTS of f32 (4 bytes each).
-        crate::RocmBuffer::alloc_zero((n * 4).max(1), self.stream)
+    /// Draw a `bytes`-byte scratch buffer from the pool. When `zero`, the reused region is cleared
+    /// with an ASYNC memset (calloc contract, no host sync) — required for accumulators and
+    /// partial-write outputs (`Copy`/`CopyStrided`/MoE dst/unproduced tensors). Fully-written
+    /// outputs (GEMV / elementwise) pass `zero = false` and skip the clear. The returned
+    /// `RocmBuffer` is `owned: false` (its `Drop` is a no-op); the allocation is returned to the
+    /// pool via `ExecCtx::Drop`. `len` is the LOGICAL byte length (≤ bucket), so downstream
+    /// `min(len, …)` copy clamps stay correct.
+    fn pool_buf(&mut self, bytes: usize, zero: bool) -> crate::RocmBuffer {
+        let len = bytes.max(1);
+        let bucket = bucket_bytes(len);
+        let ptr = self.pool.lock().unwrap().take(bucket);
+        if zero {
+            let rc = unsafe { ffi::hipMemsetAsync(ptr, 0, len, self.stream) };
+            debug_assert_eq!(rc, HIP_SUCCESS, "hipMemsetAsync(pool zero-on-reuse)");
+        }
+        self.pooled.push((ptr, bucket));
+        crate::RocmBuffer {
+            ptr,
+            len,
+            owned: false,
+        }
+    }
+
+    /// Zeroed scratch for `n` f32 ELEMENTS (calloc contract). Pooled + async-cleared. Every op
+    /// `dst` uses this: the async memset is near-free (no host sync) and keeping the calloc
+    /// contract universal guarantees the goldens can't move on a partial-write op. Genuinely
+    /// fully-overwritten transient scratch (the int8 `qx`/`xs`, the aliased-copy clone) instead
+    /// calls [`pool_buf`](Self::pool_buf) with `zero = false` to skip even that memset.
+    fn zero_dev(&mut self, n: usize) -> crate::RocmBuffer {
+        self.pool_buf((n * 4).max(1), true)
     }
 
     fn host_vals(&mut self, id: TensorId, g: &Graph, bindings: &Bindings) -> Result<&[f32]> {
@@ -280,15 +320,19 @@ impl<'a> ExecCtx<'a> {
     /// a full DtoD clone of the source so the kernel reads a stable snapshot (the read window can't
     /// be clobbered by the in-place write). Returns `None` when `src != dst` (the common case), and
     /// the caller reads `src` directly. Both `src` and `dst` must already be on device.
-    fn stage_if_aliased(&self, src: TensorId, dst: TensorId) -> Option<crate::RocmBuffer> {
+    fn stage_if_aliased(&mut self, src: TensorId, dst: TensorId) -> Option<crate::RocmBuffer> {
         if src.0 != dst.0 {
             return None;
         }
-        let sb = self.dev[src.0 as usize].as_ref().unwrap();
-        let tmp = crate::RocmBuffer::alloc(sb.len.max(1), self.stream);
-        if sb.len > 0 {
+        let (sptr, slen) = {
+            let sb = self.dev[src.0 as usize].as_ref().unwrap();
+            (sb.ptr, sb.len)
+        };
+        // Fully overwritten by the DtoD clone below → un-cleared pool scratch.
+        let tmp = self.pool_buf(slen.max(1), false);
+        if slen > 0 {
             unsafe {
-                ffi::hipMemcpyDtoD(tmp.ptr, sb.ptr, sb.len);
+                ffi::hipMemcpyDtoD(tmp.ptr, sptr, slen);
             }
         }
         Some(tmp)
@@ -340,11 +384,25 @@ impl<'a> ExecCtx<'a> {
     }
 }
 
+impl Drop for ExecCtx<'_> {
+    fn drop(&mut self) {
+        // Return every pool draw to the free-list (success OR early-error path). The pooled
+        // `RocmBuffer`s stored in `dev` are `owned: false`, so their own `Drop` frees nothing —
+        // this is the sole owner of the reuse lifetime. The caller has already synced the stream
+        // before we drop on the success path; on an error path the backend is being torn down.
+        let mut pool = self.pool.lock().unwrap();
+        for (ptr, bucket) in self.pooled.drain(..) {
+            pool.give(bucket, ptr);
+        }
+    }
+}
+
 // ── Main execute walk ────────────────────────────────────────────────────────
 
 pub fn execute_graph(
     pipelines: &Pipelines,
     weight_cache: &Mutex<HashMap<usize, crate::RocmBuffer>>,
+    pool: &Mutex<BufferPool>,
     stream: ffi::hipStream_t,
     plan: &dyn Plan,
     bindings: &Bindings,
@@ -359,23 +417,24 @@ pub fn execute_graph(
         dev: (0..n).map(|_| None).collect(),
         vals: (0..n).map(|_| None).collect(),
         weight_cache,
+        pool,
+        pooled: Vec::new(),
         stream,
     };
 
-    for (idx, op) in g.ops.iter().enumerate() {
+    // No per-op sync: the whole op list queues on ONE stream, which serializes device work, so
+    // intra-graph producer→consumer ordering holds without a host round-trip. The only syncs are
+    // (a) inside `read_bytes`/`host_vals`, immediately before a host readback, and (b) the single
+    // barrier below, before the cross-stream writeback DtoD + the final checked sync. With the
+    // allocation churn gone (buffer pool), those per-op `hipMalloc`/`hipFree`/`hipStreamSynchronize`
+    // device syncs — the real decode bottleneck — are all off the hot path.
+    for op in g.ops.iter() {
         run_op(op, g, bindings, pipelines, &mut ctx)?;
-        // Sync + check for async errors after each op during bringup.
-        let rc = unsafe { ffi::hipStreamSynchronize(stream) };
-        if rc != HIP_SUCCESS {
-            return Err(be(format!(
-                "sync after op {idx} ({kind}): rc={rc}",
-                idx = idx,
-                kind = op.kind()
-            )));
-        }
     }
 
-    // Sync after all ops (the final checked sync below re-syncs after writeback).
+    // Barrier all queued op work before the writeback: the writeback `hipMemcpyDtoD` runs on the
+    // NULL stream, which is NOT ordered against our non-default work stream, so it must observe a
+    // completed stream first.
     unsafe { ffi::hipStreamSynchronize(stream) };
     let direct = g.in_place_inputs();
     for (i, decl) in g.tensors.iter().enumerate() {
@@ -516,10 +575,13 @@ fn run_op(
                 let inu = in_f as usize;
                 let ou = out_f as usize;
                 let nb = inu / 32; // in_f is 32-aligned for every covered format
-                                   // int8 activation codes + per-32-block scales (freed when the op
-                                   // returns; hipFree syncs, so the async GEMV has completed by then).
-                let qx = crate::RocmBuffer::alloc((mu * inu).max(1), ctx.stream);
-                let xs = crate::RocmBuffer::alloc((mu * nb * 4).max(1), ctx.stream);
+                                   // int8 activation codes + per-32-block scales, drawn from the
+                                   // scratch pool (no per-op malloc/free). Both are fully written by
+                                   // `quant_i8_32` before the GEMV reads them → un-cleared (`out`).
+                                   // They stay live in the pool until end-of-forward, so the async
+                                   // GEMV that reads them is never racing a reuse.
+                let qx = ctx.pool_buf((mu * inu).max(1), false);
+                let xs = ctx.pool_buf((mu * nb * 4).max(1), false);
                 dispatch_1d(
                     pipelines,
                     ctx.stream,
@@ -872,10 +934,10 @@ fn run_op(
             pos,
         } => {
             ctx.ensure_device(q, g, bindings)?;
+            let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
             let bq = ctx.dev[q.0 as usize].as_ref().unwrap();
             let bk = rocm_buf(bindings.get(k_cache).expect("rocm: unbound K cache"));
             let bv = rocm_buf(bindings.get(v_cache).expect("rocm: unbound V cache"));
-            let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
             let (mt, swa): (i32, i32) = match mask {
                 AttnMask::Causal => (0, 0),
                 AttnMask::SlidingWindow(w) => (1, w as i32),

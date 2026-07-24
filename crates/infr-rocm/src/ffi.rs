@@ -33,6 +33,14 @@ extern "C" {
     ) -> c_int;
     /// Fill `count` bytes of device memory with `value`.
     pub fn hipMemset(dst: *mut c_void, value: c_int, count: usize) -> c_int;
+    /// Fill `count` bytes of device memory with `value`, asynchronously on `stream`
+    /// (no implicit device sync — the buffer-pool zero-on-reuse primitive).
+    pub fn hipMemsetAsync(
+        dst: *mut c_void,
+        value: c_int,
+        count: usize,
+        stream: hipStream_t,
+    ) -> c_int;
     /// Create a non-blocking stream.
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> c_int;
     /// Block until all work on `stream` finishes.

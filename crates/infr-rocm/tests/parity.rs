@@ -16,7 +16,7 @@
 #![cfg(all(target_os = "linux", feature = "rocm"))]
 
 use infr_core::backend::{Backend, Bindings, BufferUsage};
-use infr_core::graph::{Graph, Op};
+use infr_core::graph::{Activation, Graph, MoeGating, Op};
 use infr_core::tensor::TensorDesc;
 use infr_core::DType;
 use infr_rocm::RocmBackend;
@@ -199,4 +199,141 @@ fn linear_q4k_matches_cpu() {
         ref_mag > 1e-3,
         "Q4_K reference is all-zero — test is vacuous"
     );
+}
+
+// ── MoeFfn (router GEMV → gating → top-k → expert FFN → weighted sum) vs CPU ──
+
+/// f16 little-endian bytes for an f32 slice (expert weight banks upload as raw f16).
+fn f16_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|&x| half::f16::from_f32(x).to_bits().to_le_bytes())
+        .collect()
+}
+
+/// Run a single-`Op::MoeFfn` graph on `be` and return the downloaded f32 output `[rows, ne]`.
+/// `router` is F32 `[n_expert, ne]`; the gate/up/down expert banks are F16 (gate/up are
+/// `[n_expert, n_ff_exp, ne]`, down is `[n_expert, ne, n_ff_exp]`, row-major). `router_x` is
+/// bound to the SAME handle as `x` (the qwen3moe convention).
+#[allow(clippy::too_many_arguments)]
+fn run_moe(
+    be: &dyn Backend,
+    x: &[f32],
+    router_f32: &[f32],
+    gate_f16: &[u8],
+    up_f16: &[u8],
+    down_f16: &[u8],
+    rows: usize,
+    ne: usize,
+    n_expert: usize,
+    n_used: usize,
+    n_ff_exp: usize,
+    gating: MoeGating,
+    norm_w: bool,
+) -> Vec<f32> {
+    let mut g = Graph::new();
+    let xid = g.input(f32d(rows * ne));
+    let rid = g.weight(TensorDesc::new(vec![n_expert * ne], DType::F32));
+    let gid = g.weight(TensorDesc::new(vec![n_expert * n_ff_exp * ne], DType::F16));
+    let uid = g.weight(TensorDesc::new(vec![n_expert * n_ff_exp * ne], DType::F16));
+    let did = g.weight(TensorDesc::new(vec![n_expert * ne * n_ff_exp], DType::F16));
+    let dst = g.output(f32d(rows * ne));
+    g.push(Op::MoeFfn {
+        x: xid,
+        router_x: xid,
+        router: rid,
+        gate_exps: gid,
+        up_exps: uid,
+        down_exps: did,
+        down_scale: None,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: n_ff_exp as u32,
+        scale: 1.0,
+        act: Activation::Silu,
+        gating,
+        norm_w,
+        weight_before: false,
+        fused_gate_up: false,
+        ep_band: None,
+    });
+    let plan = be.compile(&g).expect("compile");
+
+    let up = |desc_bytes: &[u8], usage| {
+        let b = be.alloc(desc_bytes.len(), usage).expect("alloc");
+        be.upload(b.as_ref(), desc_bytes).unwrap();
+        b
+    };
+    let xb = up(bytemuck::cast_slice(x), BufferUsage::Activations);
+    let rb = up(bytemuck::cast_slice(router_f32), BufferUsage::Weights);
+    let gb = up(gate_f16, BufferUsage::Weights);
+    let ub = up(up_f16, BufferUsage::Weights);
+    let db = up(down_f16, BufferUsage::Weights);
+    let ob = be.alloc(rows * ne * 4, BufferUsage::Readback).expect("out");
+
+    let mut b = Bindings::new();
+    b.bind(xid, xb.as_ref());
+    b.bind(rid, rb.as_ref());
+    b.bind(gid, gb.as_ref());
+    b.bind(uid, ub.as_ref());
+    b.bind(did, db.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+
+    let mut o = vec![0f32; rows * ne];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// Small synthetic MoE (F32 router + F16 experts): the ROCm router GEMV → gating → top-k →
+/// renorm → per-expert gated FFN → weighted-sum path must match the CPU reference. Exercises
+/// the softmax+renorm (qwen3moe) path and the sigmoid+no-renorm gating path.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn moe_ffn_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, ne, n_expert, n_used, n_ff_exp) = (2usize, 128usize, 4usize, 2usize, 64usize);
+
+    let x = gen(rows * ne, 3);
+    // Distinct salts per bank so router logits are well-separated (deterministic top-k).
+    let router = gen(n_expert * ne, 9);
+    let gate = f16_bytes(&gen(n_expert * n_ff_exp * ne, 11));
+    let up = f16_bytes(&gen(n_expert * n_ff_exp * ne, 17));
+    let down = f16_bytes(&gen(n_expert * ne * n_ff_exp, 23));
+
+    for (gating, norm_w, label) in [
+        (MoeGating::Softmax, true, "softmax+renorm"),
+        (MoeGating::Sigmoid, false, "sigmoid+no-renorm"),
+    ] {
+        let c = run_moe(
+            &cpu, &x, &router, &gate, &up, &down, rows, ne, n_expert, n_used, n_ff_exp, gating,
+            norm_w,
+        );
+        let r = run_moe(
+            &be, &x, &router, &gate, &up, &down, rows, ne, n_expert, n_used, n_ff_exp, gating,
+            norm_w,
+        );
+        let e = maxerr(&c, &r);
+        let ref_mag = maxabs(&c).max(1e-6);
+        println!(
+            "MoeFfn [{label}] max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+            e / ref_mag
+        );
+        // Guard against a silently-zero output masquerading as agreement (the pre-fix bug
+        // produced garbage/zeros because the router weight was never applied).
+        assert!(
+            ref_mag > 1e-3,
+            "MoeFfn [{label}] reference is all-zero — test is vacuous"
+        );
+        assert!(
+            e / ref_mag < 2e-2,
+            "MoeFfn [{label}] diverges from CPU reference: abs={e:e} rel={:e}",
+            e / ref_mag
+        );
+    }
 }

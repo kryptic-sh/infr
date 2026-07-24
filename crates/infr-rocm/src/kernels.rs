@@ -625,17 +625,25 @@ extern "C" __global__ void moe_ffn_expert(
     int n_ff_exp,
     int act_type,   // 0=SiLU, 1=GeLU, 2=Sigmoid
     float weight,   // routing weight for this expert
-    float down_scale // per-expert down-projection output scale (0 = no scale)
+    float down_scale, // per-expert down-projection output scale (1 = no scale)
+    int weight_before // 1 = apply `weight` to the gate/up inputs (llama4); 0 = to the output
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     // gate: [n_ff_exp]
     if (i < (int)n_ff_exp) {
+        // `weight_before` (llama4): fold the routing weight into the gate/up projections
+        // (silu(w·gate)·(w·up)) instead of scaling the down-projection output — the two
+        // differ through the nonlinearity, so it cannot be a single output scalar.
+        float wg = weight_before ? weight : 1.0f;
+        float wo = weight_before ? 1.0f : weight;
         // compute gate[i] and up[i]
         float g = 0.0f, u = 0.0f;
         for (int j = 0; j < (int)ne; j++) {
             g += x[j] * __half2float(gate_w[i * ne + j]);
             u += x[j] * __half2float(up_w[i * ne + j]);
         }
+        g *= wg;
+        u *= wg;
         // activation
         float a;
         if (act_type == 0) {
@@ -646,7 +654,7 @@ extern "C" __global__ void moe_ffn_expert(
         } else {
             a = 1.0f / (1.0f + expf(-g));
         }
-        float h = a * u * weight;
+        float h = a * u * wo * down_scale;
         // down projection: accumulate into dst
         const __half* dr = down_w + i; // column i of down_w (row-major: down_w[*, i])
         // Actually down_w is [ne, n_ff_exp], so column i has stride n_ff_exp

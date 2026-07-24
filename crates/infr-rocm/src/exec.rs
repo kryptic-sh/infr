@@ -1066,12 +1066,14 @@ fn run_op(
             act,
             gating,
             norm_w,
-            weight_before: _wb,
+            weight_before,
             fused_gate_up,
             ep_band: _ep,
         } => {
-            ctx.ensure_device(x, g, bindings)?;
-            let _rw = ctx.dequant_weight_or_cache(router, g, bindings)?;
+            // Router weight [n_expert, ne] (dequantized to f16 and cached — the SAME handle
+            // fed to the GEMV below; the previous code discarded it and softmaxed the raw
+            // router_x row, selecting bogus "expert" indices out past the expert banks).
+            let rw = ctx.dequant_weight_or_cache(router, g, bindings)?;
             let gw_ptr = ctx.dequant_weight_or_cache(gate_exps, g, bindings)?;
             let uw_ptr = if fused_gate_up {
                 gw_ptr
@@ -1080,79 +1082,131 @@ fn run_op(
             };
             let dw_ptr = ctx.dequant_weight_or_cache(down_exps, g, bindings)?;
 
-            let router_out = if router_x != x {
-                ctx.host_vals(router_x, g, bindings)?.to_vec()
-            } else {
-                ctx.host_vals(x, g, bindings)?.to_vec()
-            };
-
-            let nu = n_used as usize;
             let neu = ne as usize;
+            let nexp = n_expert as usize;
+            let nu = n_used as usize;
             let nfu = n_ff_exp as usize;
 
-            let probs: Vec<f32> = match gating {
-                infr_core::graph::MoeGating::Softmax => {
-                    let max = router_out.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let exps: Vec<f32> = router_out.iter().map(|v| (v - max).exp()).collect();
-                    let sum: f32 = exps.iter().sum();
-                    exps.iter().map(|v| v / sum).collect()
-                }
-                infr_core::graph::MoeGating::Sigmoid => router_out
-                    .iter()
-                    .map(|v| 1.0 / (1.0 + (-v).exp()))
-                    .collect(),
-            };
-            let mut idx: Vec<(usize, f32)> = probs.iter().copied().enumerate().collect();
-            idx.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let top_k: Vec<(usize, f32)> = idx.into_iter().take(nu).collect();
-            let sum_w: f32 = if norm_w {
-                top_k.iter().map(|(_, w)| w).sum::<f32>().max(1e-9)
+            // `x` (and `router_x`, usually the same handle) carry `rows` token rows of `ne`.
+            let x_ptr = ctx.ensure_device(x, g, bindings)?;
+            let rx_ptr = if router_x != x {
+                ctx.ensure_device(router_x, g, bindings)?
             } else {
-                1.0
+                x_ptr
+            };
+            let rows = g.desc(x).numel() / neu;
+
+            // Per-expert down-projection output scale (diffusion-gemma); 1.0 = none.
+            let dsc_vals: Vec<f32> = match down_scale {
+                Some(sid) => ctx.host_vals(sid, g, bindings)?.to_vec(),
+                None => vec![1.0f32; nexp],
             };
 
-            let dd = ctx.zero_dev(neu);
+            // Router logits = router · router_x, one dot per expert: reuse the linear_f16
+            // GEMV to produce [rows, n_expert], then read them back for host-side gating.
+            let logits_dev = ctx.zero_dev(rows * nexp);
+            dispatch_1d(
+                pipelines,
+                ctx.stream,
+                "linear_f16",
+                (rows as u32) * 256,
+                256,
+                args![
+                    arg_ptr(rx_ptr),
+                    arg_ptr(rw),
+                    arg_ptr(logits_dev.ptr),
+                    arg_i32(rows as i32),
+                    arg_i32(ne as i32),
+                    arg_i32(n_expert as i32),
+                ],
+            )?;
+            unsafe {
+                ffi::hipStreamSynchronize(ctx.stream);
+            }
+            let logits_all: Vec<f32> = {
+                let raw = read_bytes(&logits_dev, ctx.stream);
+                bytemuck::cast_slice::<u8, f32>(&raw).to_vec()
+            };
+
             let at: i32 = match act {
                 infr_core::graph::Activation::Silu => 0,
                 infr_core::graph::Activation::Gelu => 1,
                 infr_core::graph::Activation::Sigmoid => 2,
             };
-            // Pre-fetch down_scale values to avoid borrowing ctx inside the loop
-            let dsc_vals: Vec<f32> = match down_scale {
-                Some(sid) => ctx.host_vals(sid, g, bindings)?.to_vec(),
-                None => vec![1.0f32; n_expert as usize],
+            let wb_flag: i32 = if weight_before { 1 } else { 0 };
+            // Per-expert byte strides in the (f16) expert banks. Fused gate/up packs BOTH
+            // roles per expert as [2*n_ff_exp, ne] (gate rows first, up second), so its expert
+            // stride is DOUBLE the split-tensor stride.
+            let ge_stride = if fused_gate_up {
+                2 * nfu * neu
+            } else {
+                nfu * neu
             };
-            let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
-            for &(ei, prob) in &top_k {
-                let w = prob / sum_w * scale;
-                let eo = ei * nfu * neu;
-                let gs = unsafe { (gw_ptr as *mut u8).add(eo * 2) as *mut c_void };
-                let us = if fused_gate_up {
-                    unsafe { (gw_ptr as *mut u8).add((eo + nfu * neu) * 2) as *mut c_void }
-                } else {
-                    unsafe { (uw_ptr as *mut u8).add(eo * 2) as *mut c_void }
+
+            let dd = ctx.zero_dev(rows * neu);
+            for row in 0..rows {
+                let logits = &logits_all[row * nexp..row * nexp + nexp];
+                // Gating: softmax over experts (qwen3moe/…) or per-expert sigmoid (llama4).
+                let probs: Vec<f32> = match gating {
+                    infr_core::graph::MoeGating::Softmax => {
+                        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let exps: Vec<f32> = logits.iter().map(|v| (v - max).exp()).collect();
+                        let sum: f32 = exps.iter().sum();
+                        exps.iter().map(|v| v / sum).collect()
+                    }
+                    infr_core::graph::MoeGating::Sigmoid => {
+                        logits.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect()
+                    }
                 };
-                let ds = unsafe { (dw_ptr as *mut u8).add(eo * 2) as *mut c_void };
-                let dsc = dsc_vals.get(ei).copied().unwrap_or(1.0);
-                dispatch_1d(
-                    pipelines,
-                    ctx.stream,
-                    "moe_ffn_expert",
-                    n_ff_exp,
-                    256,
-                    args![
-                        arg_ptr(bx.ptr),
-                        arg_ptr(gs),
-                        arg_ptr(us),
-                        arg_ptr(ds),
-                        arg_ptr(dd.ptr),
-                        arg_i32(ne as i32),
-                        arg_i32(n_ff_exp as i32),
-                        arg_i32(at),
-                        arg_f32(w),
-                        arg_f32(dsc),
-                    ],
-                )?;
+                let mut idx: Vec<usize> = (0..nexp).collect();
+                idx.sort_unstable_by(|&a, &b| {
+                    probs[b]
+                        .partial_cmp(&probs[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                idx.truncate(nu);
+                // `norm_w`: renormalize the selected weights to sum to 1 before scaling
+                // (softmax MoE); llama4 uses the raw sigmoid prob × scale (no renorm).
+                let wsum: f32 = if norm_w {
+                    idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20)
+                } else {
+                    1.0
+                };
+                let x_row = unsafe { (x_ptr as *mut u8).add(row * neu * 4) as *mut c_void };
+                let dst_row = unsafe { (dd.ptr as *mut u8).add(row * neu * 4) as *mut c_void };
+                for &ei in &idx {
+                    let w = probs[ei] / wsum * scale;
+                    let gs = unsafe { (gw_ptr as *mut u8).add(ei * ge_stride * 2) as *mut c_void };
+                    let us = if fused_gate_up {
+                        unsafe {
+                            (gw_ptr as *mut u8).add((ei * ge_stride + nfu * neu) * 2) as *mut c_void
+                        }
+                    } else {
+                        unsafe { (uw_ptr as *mut u8).add(ei * nfu * neu * 2) as *mut c_void }
+                    };
+                    let ds = unsafe { (dw_ptr as *mut u8).add(ei * neu * nfu * 2) as *mut c_void };
+                    let dsc = dsc_vals.get(ei).copied().unwrap_or(1.0);
+                    dispatch_1d(
+                        pipelines,
+                        ctx.stream,
+                        "moe_ffn_expert",
+                        n_ff_exp,
+                        256,
+                        args![
+                            arg_ptr(x_row),
+                            arg_ptr(gs),
+                            arg_ptr(us),
+                            arg_ptr(ds),
+                            arg_ptr(dst_row),
+                            arg_i32(ne as i32),
+                            arg_i32(n_ff_exp as i32),
+                            arg_i32(at),
+                            arg_f32(w),
+                            arg_f32(dsc),
+                            arg_i32(wb_flag),
+                        ],
+                    )?;
+                }
             }
             ctx.dev[dst.0 as usize] = Some(dd);
         }

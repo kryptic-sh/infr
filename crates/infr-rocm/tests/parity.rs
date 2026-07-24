@@ -628,3 +628,161 @@ fn rope_matches_cpu() {
         }
     }
 }
+
+// ── QkNormRope (fused per-head RMSNorm + NEOX split-half RoPE, strided q+g) vs CPU ──
+
+/// Run a single-`Op::QkNormRope` graph on `be` and return the downloaded PACKED f32 output
+/// `[rows, n_head, head_dim]`. `x` is the raw input: packed `[rows, n_head, head_dim]` when
+/// `x_stride == 0`, else a wider `[rows, x_stride]` row buffer whose per-head query slice packs at
+/// `row*x_stride + h*(x_stride/n_head)` (the qwen35 interleaved q+g layout). `weight` is the F16
+/// per-head RMSNorm weight `[head_dim]`; `positions` is an I32 tensor.
+#[allow(clippy::too_many_arguments)]
+fn run_qk_norm_rope(
+    be: &dyn Backend,
+    x: &[f32],
+    weight_f16: &[u8],
+    positions: &[i32],
+    rows: usize,
+    n_head: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    theta: f32,
+    eps: f32,
+    x_stride: usize,
+) -> Vec<f32> {
+    let mut g = Graph::new();
+    let xid = g.input(f32d(x.len()));
+    let wid = g.weight(TensorDesc::new(vec![head_dim], DType::F16));
+    let pid = g.input(TensorDesc::new(vec![positions.len()], DType::I32));
+    let dst = g.output(f32d(rows * n_head * head_dim));
+    g.push(Op::QkNormRope {
+        x: xid,
+        weight: wid,
+        positions: pid,
+        dst,
+        rows: rows as u32,
+        n_head: n_head as u32,
+        head_dim: head_dim as u32,
+        rope_dim: rope_dim as u32,
+        theta,
+        eps,
+        freq_factors: None,
+        x_stride: x_stride as u32,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let xb = be.alloc(x.len() * 4, BufferUsage::Activations).expect("x");
+    be.upload(xb.as_ref(), bytemuck::cast_slice(x)).unwrap();
+    let wb = be.alloc(weight_f16.len(), BufferUsage::Weights).expect("w");
+    be.upload(wb.as_ref(), weight_f16).unwrap();
+    let pbytes: &[u8] = bytemuck::cast_slice(positions);
+    let pb = be
+        .alloc(pbytes.len(), BufferUsage::Activations)
+        .expect("pos");
+    be.upload(pb.as_ref(), pbytes).unwrap();
+    let ob = be
+        .alloc(rows * n_head * head_dim * 4, BufferUsage::Readback)
+        .expect("out");
+    let mut b = Bindings::new();
+    b.bind(xid, xb.as_ref());
+    b.bind(wid, wb.as_ref());
+    b.bind(pid, pb.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut o = vec![0f32; rows * n_head * head_dim];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// `Op::QkNormRope` (fused per-head RMSNorm + NEOX split-half RoPE) must match the CPU reference for
+/// a MULTI-ROW (prefill) input with a NON-trivial `x_stride` — the qwen35 interleaved q+g layout
+/// where each attention head is a strided slice of a wider `[q | gate]` row buffer. The pre-fix
+/// kernel indexed the per-head base as `r*x_stride + h*head_dim` (packed head stride) instead of
+/// `h*(x_stride/n_head)`, AND wrote the rotation in place into a packed-size buffer while indexing
+/// it with the strided stride — an out-of-bounds read/write past the buffer on rows > 1 that MAFFs
+/// on-device (qwen35 prefill op 67). It also divided the RoPE angle by the wrong `freq_factors`
+/// direction. This test runs the SAME graph on `RocmBackend` and `infr_cpu::CpuBackend` and compares
+/// the packed outputs; it fails loudly without the fix.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn qk_norm_rope_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, n_head, head_dim, rope_dim) = (4usize, 3usize, 8usize, 8usize);
+    let theta = 10000.0f32;
+    let eps = 1e-6f32;
+    let positions: Vec<i32> = vec![0, 1, 5, 9]; // distinct per row so RoPE actually rotates
+    let hw = n_head * head_dim; // packed per-row query width
+
+    // Per-head RMSNorm weight [head_dim], F16 (non-trivial so the norm scale is observable).
+    let wf32 = gen(head_dim, 31);
+    let weight_f16: Vec<u8> = wf32
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(1.0 + v).to_bits().to_le_bytes())
+        .collect();
+
+    // Interleaved q+g row: stride = n_head * 2 * head_dim, head h at `h*2*head_dim`, query = first
+    // head_dim of the head block, the trailing head_dim is POISON (the gate half) the kernel must
+    // never read. Mirrors qwen35's attn q+g buffer (x_stride = nh*2*hd).
+    let head_stride = 2 * head_dim;
+    let stride = n_head * head_stride;
+    let qpacked = gen(rows * hw, 6); // logical per-head queries, packed [rows, n_head, head_dim]
+    let mut wide = vec![0f32; rows * stride];
+    for row in 0..rows {
+        for h in 0..n_head {
+            for i in 0..head_dim {
+                wide[row * stride + h * head_stride + i] =
+                    qpacked[(row * n_head + h) * head_dim + i];
+            }
+            // poison the gate half of each head block
+            for i in head_dim..head_stride {
+                wide[row * stride + h * head_stride + i] = 1000.0 + (row * stride + h) as f32;
+            }
+        }
+    }
+
+    let c = run_qk_norm_rope(
+        &cpu,
+        &wide,
+        &weight_f16,
+        &positions,
+        rows,
+        n_head,
+        head_dim,
+        rope_dim,
+        theta,
+        eps,
+        stride,
+    );
+    let r = run_qk_norm_rope(
+        &be,
+        &wide,
+        &weight_f16,
+        &positions,
+        rows,
+        n_head,
+        head_dim,
+        rope_dim,
+        theta,
+        eps,
+        stride,
+    );
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-6);
+    println!(
+        "QkNormRope strided(stride={stride}) max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    // Guard against a silently-zero output masquerading as agreement.
+    assert!(
+        ref_mag > 1e-3,
+        "QkNormRope reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 2e-3,
+        "QkNormRope strided diverges from CPU reference (OOB head stride / packed-vs-strided?): abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}

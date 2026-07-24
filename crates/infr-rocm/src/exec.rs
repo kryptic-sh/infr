@@ -643,11 +643,18 @@ fn run_op(
             let bx_ptr = ctx.dev[x.0 as usize].as_ref().unwrap().ptr;
             let bp_ptr = ctx.dev[positions.0 as usize].as_ref().unwrap().ptr;
             let total = rows * n_head;
+            // Output is ALWAYS a fresh PACKED [rows, n_head, head_dim] buffer: the kernel reads the
+            // (possibly strided/interleaved q+g) input and writes the packed query — so no in-place
+            // rotation and no strided-source copy (the old copy grabbed a packed prefix of a wider
+            // row and then indexed it with the strided stride → out-of-bounds on multi-row prefill).
+            // Matches infr-cpu QkNormRope, which always produces a fresh packed `out`.
+            let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
             let qnr_args = args![
                 arg_ptr(bx_ptr),
                 arg_ptr(wptr),
                 arg_ptr(bp_ptr),
                 arg_ptr(ff_ptr),
+                arg_ptr(dd.ptr),
                 arg_i32(rows as i32),
                 arg_i32(n_head as i32),
                 arg_i32(head_dim as i32),
@@ -656,33 +663,8 @@ fn run_op(
                 arg_f32(theta),
                 arg_i32(x_stride as i32),
             ];
-            if dst == x {
-                dispatch_1d(pipelines, ctx.stream, "qk_norm_rope", total, 256, qnr_args)?;
-            } else {
-                let dd = ctx.zero_dev(rows as usize * n_head as usize * head_dim as usize);
-                unsafe {
-                    ffi::hipMemcpyDtoD(
-                        dd.ptr,
-                        bx_ptr,
-                        dd.len.min(ctx.dev[x.0 as usize].as_ref().unwrap().len),
-                    );
-                }
-                let dst_args = args![
-                    arg_ptr(dd.ptr),
-                    arg_ptr(wptr),
-                    arg_ptr(bp_ptr),
-                    arg_ptr(ff_ptr),
-                    arg_i32(rows as i32),
-                    arg_i32(n_head as i32),
-                    arg_i32(head_dim as i32),
-                    arg_i32(rope_dim as i32),
-                    arg_f32(eps),
-                    arg_f32(theta),
-                    arg_i32(x_stride as i32),
-                ];
-                dispatch_1d(pipelines, ctx.stream, "qk_norm_rope", total, 256, dst_args)?;
-                ctx.dev[dst.0 as usize] = Some(dd);
-            }
+            dispatch_1d(pipelines, ctx.stream, "qk_norm_rope", total, 256, qnr_args)?;
+            ctx.dev[dst.0 as usize] = Some(dd);
         }
         Op::WriteKv {
             src,

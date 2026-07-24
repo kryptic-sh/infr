@@ -241,17 +241,18 @@ extern "C" __global__ void rope(
 
 const QK_NORM_ROPE: &str = r#"
 extern "C" __global__ void qk_norm_rope(
-    float* __restrict__ x,              // [rows, n_head, head_dim] — mutated in-place
+    const float* __restrict__ x,        // input: [rows, x_stride] strided OR [rows, n_head*head_dim] packed
     const __half* __restrict__ weight,  // [head_dim]
     const int* __restrict__ positions,  // [rows]
     const float* __restrict__ freq_factors, // optional
+    float* __restrict__ dst,            // OUTPUT: always packed [rows, n_head, head_dim]
     int rows,
     int n_head,
     int head_dim,
     int rope_dim,                       // first rope_dim elements get RoPE
     float eps,
     float theta,
-    int x_stride
+    int x_stride       // per-row stride in elements; 0 = packed (n_head * head_dim)
 ) {
     int head = blockIdx.x * blockDim.x + threadIdx.x;
     int total_heads = rows * n_head;
@@ -259,33 +260,39 @@ extern "C" __global__ void qk_norm_rope(
     int r = head / n_head;
     int h = head % n_head;
     int pos = positions[r];
-    int stride = (x_stride > 0) ? x_stride : (n_head * head_dim);
-    int off = r * stride + h * head_dim;
-    // rmsnorm
+    // Read base: strided input packs each head into an `x_stride/n_head`-wide block (query is the
+    // first head_dim elements), matching the qwen35 interleaved q+g buffer. Packed input (x_stride
+    // == 0) reads the natural head slice. Write base is ALWAYS the packed [rows, n_head, head_dim]
+    // slot — mirrors infr-cpu QkNormRope and the Metal `qknormrope_f32` kernel.
+    int head_stride = (x_stride > 0) ? (x_stride / n_head) : head_dim;
+    int xoff = (x_stride > 0) ? (r * x_stride + h * head_stride) : (head * head_dim);
+    int doff = head * head_dim;
+    // rmsnorm over the head_dim query slice
     float ss = 0.0f;
     for (int i = 0; i < head_dim; i++) {
-        float v = x[off + i];
+        float v = x[xoff + i];
         ss += v * v;
     }
     ss /= (float)head_dim;
     float rms = 1.0f / sqrtf(ss + eps);
-    for (int i = 0; i < head_dim; i++) {
-        x[off + i] = x[off + i] * rms * __half2float(weight[i]);
+    // Pass-through dims [rope_dim, head_dim): normed (× weight), no rotation.
+    for (int i = rope_dim; i < head_dim; i++) {
+        dst[doff + i] = x[xoff + i] * rms * __half2float(weight[i]);
     }
-    // rope — only the first rope_dim elements
+    // rope (NEOX split-half pairs (i, i+half)) on the first rope_dim elements, from normed values.
     int half = rope_dim / 2;
     for (int i = 0; i < half; i++) {
         float freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
         if (freq_factors != nullptr) {
-            freq *= freq_factors[i];
+            freq /= freq_factors[i]; // proportional RoPE divides the per-pair angle (matches CPU/Metal)
         }
         float angle = (float)pos * freq;
         float c = cosf(angle);
         float s = sinf(angle);
-        float x0 = x[off + i];
-        float x1 = x[off + i + half];
-        x[off + i]       = x0 * c - x1 * s;
-        x[off + i + half] = x0 * s + x1 * c;
+        float a = x[xoff + i]        * rms * __half2float(weight[i]);
+        float b = x[xoff + i + half] * rms * __half2float(weight[i + half]);
+        dst[doff + i]        = a * c - b * s;
+        dst[doff + i + half] = a * s + b * c;
     }
 }
 "#;

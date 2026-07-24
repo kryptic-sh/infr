@@ -1026,25 +1026,29 @@ pub(crate) fn generate_dense_backend(
         if pfx == cached.len() && pfx < prompt.len() {
             pfx
         } else {
-            if !cached.is_empty() {
-                let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
-                let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
-                for l in 0..c.n_layer {
-                    if !c.is_qwen35_attn_layer(l) {
-                        be.upload(
-                            kbufs[l].as_ref(),
-                            bytemuck::cast_slice(&vec![0f32; conv_elems]),
-                        )
-                        .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(
-                            vbufs[l].as_ref(),
-                            bytemuck::cast_slice(&vec![0f32; s_elems]),
-                        )
-                        .map_err(|e| anyhow!("{e}"))?;
-                    }
+            // Non-extending prompt (divergent / identical resend / first-ever call): the append-only
+            // recurrent state can't rewind to an arbitrary prefix, so zero every DeltaNet layer's
+            // conv/S state and re-prefill from scratch. ALWAYS zero — a stateful backend's warmup
+            // generation (CPU is a no-op, but ROCm/Vulkan run a throwaway "Hi") dirties these
+            // persistent buffers while leaving `cached` empty, so an `is_empty` guard here would
+            // wrongly skip the reset and the first real prompt would inherit the warmup's state.
+            let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
+            let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
+            for l in 0..c.n_layer {
+                if !c.is_qwen35_attn_layer(l) {
+                    be.upload(
+                        kbufs[l].as_ref(),
+                        bytemuck::cast_slice(&vec![0f32; conv_elems]),
+                    )
+                    .map_err(|e| anyhow!("{e}"))?;
+                    be.upload(
+                        vbufs[l].as_ref(),
+                        bytemuck::cast_slice(&vec![0f32; s_elems]),
+                    )
+                    .map_err(|e| anyhow!("{e}"))?;
                 }
-                cached.clear();
             }
+            cached.clear();
             0
         }
     } else {

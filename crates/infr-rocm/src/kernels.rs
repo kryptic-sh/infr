@@ -351,11 +351,14 @@ extern "C" __global__ void gated_act(
     for (int i = 0; i < nff; i++) {
         float g;
         if (gate_block_width > 0) {
-            // Interleaved: block of (query then gate) repeating
-            int block = i / gate_block_width;
-            int offset_in_block = i % gate_block_width;
-            int block_start = block * (gate_block_width * 2);
-            g = gate[gate_off + block_start + gate_block_width + offset_in_block];
+            // Interleaved qg row: per head a [query(headw) | gate(headw)] block, so the full
+            // per-head block is `gate_block_width` wide and the gate half starts at `headw`.
+            // Output index `i` addresses the PACKED gate (headw per head); map it to the strided
+            // gate half. Matches infr-cpu's GatedAct (headw = gate_block_width / 2).
+            int headw = gate_block_width / 2;
+            int head = i / headw;
+            int off = i % headw;
+            g = gate[gate_off + head * gate_block_width + headw + off];
         } else {
             g = gate[gate_off + i];
         }

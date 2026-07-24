@@ -1134,3 +1134,263 @@ fn deltanet_matches_cpu() {
         }
     }
 }
+
+// ── GatedAct interleaved output gate (qwen35 attn_out_gate) vs CPU ────────────
+
+/// The qwen35 attention output gate reads its per-head SIGMOID gate from the INTERLEAVED q+gate
+/// projection `qg` (`[rows, nh*(2*hd)]`, each head a `[query(hd) | gate(hd)]` block) via
+/// `gate_stride = nh*2*hd` / `gate_block_width = 2*hd`, and multiplies `sigmoid(gate)` into the
+/// packed attention output `up` (`[rows, nh*hd]`). The bug (kernel used `gate_block_width` directly
+/// as the head width instead of `gate_block_width/2`) read the WRONG half of each block, corrupting
+/// the gate — the divergence that made qwen35 emit only `<think>` on ROCm. Single-op parity vs CPU.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn gated_act_interleaved_gate_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd) = (3usize, 4usize, 8usize);
+    let nff = nh * hd; // packed output width
+    let gate_w = nh * 2 * hd; // interleaved q+gate row width
+    let qg = gen(rows * gate_w, 3);
+    let up = gen(rows * nff, 8);
+    let run = |b: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let gid = g.input(f32d(rows * gate_w));
+        let uid = g.input(f32d(rows * nff));
+        let dst = g.output(f32d(rows * nff));
+        g.push(Op::GatedAct {
+            gate: gid,
+            up: uid,
+            dst,
+            rows: rows as u32,
+            nff: nff as u32,
+            act: Activation::Sigmoid,
+            up_off: 0,
+            up_stride: 0,
+            gate_stride: gate_w as u32,
+            gate_block_width: (2 * hd) as u32,
+        });
+        let plan = b.compile(&g).expect("compile");
+        let gb = b
+            .alloc(qg.len() * 4, BufferUsage::Activations)
+            .expect("gate");
+        b.upload(gb.as_ref(), bytemuck::cast_slice(&qg)).unwrap();
+        let ub = b.alloc(up.len() * 4, BufferUsage::Activations).expect("up");
+        b.upload(ub.as_ref(), bytemuck::cast_slice(&up)).unwrap();
+        let ob = b.alloc(rows * nff * 4, BufferUsage::Readback).expect("out");
+        let mut bd = Bindings::new();
+        bd.bind(gid, gb.as_ref());
+        bd.bind(uid, ub.as_ref());
+        bd.bind(dst, ob.as_ref());
+        b.execute(plan.as_ref(), &bd).expect("execute");
+        let mut o = vec![0f32; rows * nff];
+        b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+    let c = run(&cpu);
+    let r = run(&be);
+    let e = maxerr(&c, &r);
+    let mag = maxabs(&c).max(1e-3);
+    println!("GatedAct interleaved gate max_err={e:e} max|ref|={mag:e}");
+    assert!(mag > 1e-3, "GatedAct reference all-zero — test is vacuous");
+    assert!(
+        e / mag < 1e-3,
+        "GatedAct interleaved gate diverges from CPU reference (wrong strided-gate index): abs={e:e}"
+    );
+}
+
+// ── Copy / CopyStrided partial update into a pre-existing dst vs CPU ──────────
+
+/// `Copy`/`CopyStrided` write only a slice/strided rows of `dst` and MUST preserve the rest — `dst`
+/// is a real, full-extent tensor (the CPU reference copies into a pre-sized `vals[dst]`). The bug
+/// re-allocated a fresh ZEROED, wrong-sized `dst` per call, dropping prior content and any strided
+/// gap. Here op 1 fills `dst` with a pattern, then a strided op (`dst_stride > n`, leaving gaps)
+/// overwrites some rows — the gaps must retain the pattern. Parity vs CPU.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn copy_strided_partial_update_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, n, dst_stride) = (2usize, 2usize, 4usize);
+    let numel = rows * dst_stride; // 8; strided rows [0,1],[4,5], gaps [2,3],[6,7]
+    let pat = gen(numel, 2); // prior content that the gaps MUST preserve
+    let src2 = gen(rows * n, 5); // strided source
+    let run = |b: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let pid = g.input(f32d(numel));
+        let sid = g.input(f32d(rows * n));
+        let dst = g.output(f32d(numel));
+        // 1) fill dst with the prior pattern (full-extent Copy)
+        g.push(Op::Copy {
+            src: pid,
+            src_off: 0,
+            dst,
+            dst_off: 0,
+            n: numel as u32,
+        });
+        // 2) partial strided update — the gaps (dst_stride > n) must retain the pattern
+        g.push(Op::CopyStrided {
+            src: sid,
+            src_off: 0,
+            src_stride: n as u32,
+            dst,
+            dst_off: 0,
+            dst_stride: dst_stride as u32,
+            rows: rows as u32,
+            n: n as u32,
+        });
+        let plan = b.compile(&g).expect("compile");
+        let pb = b
+            .alloc(pat.len() * 4, BufferUsage::Activations)
+            .expect("pat");
+        b.upload(pb.as_ref(), bytemuck::cast_slice(&pat)).unwrap();
+        let sb = b
+            .alloc(src2.len() * 4, BufferUsage::Activations)
+            .expect("src");
+        b.upload(sb.as_ref(), bytemuck::cast_slice(&src2)).unwrap();
+        let ob = b.alloc(numel * 4, BufferUsage::Readback).expect("out");
+        let mut bd = Bindings::new();
+        bd.bind(pid, pb.as_ref());
+        bd.bind(sid, sb.as_ref());
+        bd.bind(dst, ob.as_ref());
+        b.execute(plan.as_ref(), &bd).expect("execute");
+        let mut o = vec![0f32; numel];
+        b.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+            .unwrap();
+        o
+    };
+    let c = run(&cpu);
+    let r = run(&be);
+    // Vacuity: the reference must actually exercise BOTH a preserved gap and an overwritten row.
+    assert_eq!(
+        c[2], pat[2],
+        "reference gap not preserved — test setup wrong"
+    );
+    assert_eq!(
+        c[0], src2[0],
+        "reference strided row not written — test setup wrong"
+    );
+    let e = maxerr(&c, &r);
+    println!("Copy/CopyStrided partial-update max_err={e:e}");
+    assert!(
+        e < 1e-6,
+        "Copy/CopyStrided partial update diverges from CPU reference (lost prior dst content): {e:e}"
+    );
+}
+
+// ── Conv1dSilu rolling-state update across a REUSED x tensor vs CPU ───────────
+
+/// Two `Conv1dSilu` ops in one graph share the SAME `x` handle, which is rewritten between them
+/// (mirrors the seam's per-DeltaNet-layer `dn_qkvbuf` reuse). The host-side rolling-state update
+/// must read `x`'s CURRENT device content — the bug read it through a per-tensor-id host cache, so
+/// the second conv's state update saw the FIRST conv's stale `x`, corrupting the carried conv
+/// history for every DeltaNet layer past the first (qwen35 decoded one token then stalled). Compare
+/// the second op's mutated state to CPU.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn conv1d_reused_x_state_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, channels, kernel) = (3usize, 8usize, 4usize);
+    let km1 = kernel - 1;
+    let wf32 = gen(channels * kernel, 7);
+    let weight_f16: Vec<u8> = wf32
+        .iter()
+        .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+    let pat1 = gen(rows * channels, 2);
+    let pat2 = gen(rows * channels, 9); // the DIFFERENT content the 2nd conv must actually see
+    let s1_init = gen(km1 * channels, 11);
+    let s2_init = gen(km1 * channels, 13);
+    // Returns the SECOND conv's mutated state (the one the stale-cache bug corrupts).
+    let run = |b: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let p1 = g.input(f32d(rows * channels));
+        let p2 = g.input(f32d(rows * channels));
+        let x = g.internal(f32d(rows * channels)); // shared, rewritten between the two convs
+        let wid = g.weight(TensorDesc::new(vec![channels * kernel], DType::F16));
+        let s1 = g.input(f32d(km1 * channels));
+        let s2 = g.input(f32d(km1 * channels));
+        let d1 = g.output(f32d(rows * channels));
+        let d2 = g.output(f32d(rows * channels));
+        let conv = |xh, sh, dh| Op::Conv1dSilu {
+            x: xh,
+            weight: wid,
+            state: sh,
+            dst: dh,
+            rows: rows as u32,
+            channels: channels as u32,
+            kernel: kernel as u32,
+        };
+        g.push(Op::Copy {
+            src: p1,
+            src_off: 0,
+            dst: x,
+            dst_off: 0,
+            n: (rows * channels) as u32,
+        });
+        g.push(conv(x, s1, d1));
+        g.push(Op::Copy {
+            src: p2,
+            src_off: 0,
+            dst: x,
+            dst_off: 0,
+            n: (rows * channels) as u32,
+        });
+        g.push(conv(x, s2, d2));
+        let plan = b.compile(&g).expect("compile");
+        let up = |data: &[f32], usage| {
+            let buf = b.alloc(data.len() * 4, usage).expect("alloc");
+            b.upload(buf.as_ref(), bytemuck::cast_slice(data)).unwrap();
+            buf
+        };
+        let p1b = up(&pat1, BufferUsage::Activations);
+        let p2b = up(&pat2, BufferUsage::Activations);
+        let wb = b.alloc(weight_f16.len(), BufferUsage::Weights).expect("w");
+        b.upload(wb.as_ref(), &weight_f16).unwrap();
+        let s1b = up(&s1_init, BufferUsage::Activations);
+        let s2b = up(&s2_init, BufferUsage::Activations);
+        let d1b = b
+            .alloc(rows * channels * 4, BufferUsage::Readback)
+            .expect("d1");
+        let d2b = b
+            .alloc(rows * channels * 4, BufferUsage::Readback)
+            .expect("d2");
+        let mut bd = Bindings::new();
+        bd.bind(p1, p1b.as_ref());
+        bd.bind(p2, p2b.as_ref());
+        bd.bind(wid, wb.as_ref());
+        bd.bind(s1, s1b.as_ref());
+        bd.bind(s2, s2b.as_ref());
+        bd.bind(d1, d1b.as_ref());
+        bd.bind(d2, d2b.as_ref());
+        b.execute(plan.as_ref(), &bd).expect("execute");
+        let mut ns2 = vec![0f32; km1 * channels];
+        b.download(s2b.as_ref(), bytemuck::cast_slice_mut(&mut ns2))
+            .unwrap();
+        ns2
+    };
+    let c = run(&cpu);
+    let r = run(&be);
+    // Vacuity: the 2nd conv's state MUST differ from its init (it rolled in pat2's tail).
+    assert!(
+        maxerr(&c, &s2_init) > 1e-3,
+        "reference 2nd-conv state unchanged — test is vacuous"
+    );
+    let e = maxerr(&c, &r);
+    println!(
+        "Conv1dSilu reused-x state max_err={e:e} max|ref|={:e}",
+        maxabs(&c)
+    );
+    assert!(
+        e < 1e-3,
+        "Conv1dSilu reused-x state diverges from CPU reference (stale host cache of x): {e:e}"
+    );
+}

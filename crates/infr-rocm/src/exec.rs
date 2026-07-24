@@ -135,13 +135,6 @@ struct ExecCtx<'a> {
 }
 
 impl<'a> ExecCtx<'a> {
-    fn f32_dev(&self, data: &[f32]) -> crate::RocmBuffer {
-        let bytes = bytemuck::cast_slice::<f32, u8>(data);
-        let mut buf = crate::RocmBuffer::alloc(bytes.len().max(1), self.stream);
-        buf.upload(bytes, self.stream);
-        buf
-    }
-
     fn f16_dev(&self, data: &[u8]) -> crate::RocmBuffer {
         let mut buf = crate::RocmBuffer::alloc(data.len().max(1), self.stream);
         buf.upload(data, self.stream);
@@ -212,8 +205,22 @@ impl<'a> ExecCtx<'a> {
         Ok(ptr)
     }
 
-    fn set_dev(&mut self, id: TensorId, data: &[f32]) {
-        self.dev[id.0 as usize] = Some(self.f32_dev(data));
+    /// For an in-place `Copy`/`CopyStrided` where `src == dst`, return a temp device buffer holding
+    /// a full DtoD clone of the source so the kernel reads a stable snapshot (the read window can't
+    /// be clobbered by the in-place write). Returns `None` when `src != dst` (the common case), and
+    /// the caller reads `src` directly. Both `src` and `dst` must already be on device.
+    fn stage_if_aliased(&self, src: TensorId, dst: TensorId) -> Option<crate::RocmBuffer> {
+        if src.0 != dst.0 {
+            return None;
+        }
+        let sb = self.dev[src.0 as usize].as_ref().unwrap();
+        let tmp = crate::RocmBuffer::alloc(sb.len.max(1), self.stream);
+        if sb.len > 0 {
+            unsafe {
+                ffi::hipMemcpyDtoD(tmp.ptr, sb.ptr, sb.len);
+            }
+        }
+        Some(tmp)
     }
 
     fn dequant_weight_or_cache(
@@ -942,8 +949,19 @@ fn run_op(
             n,
         } => {
             ctx.ensure_device(src, g, bindings)?;
-            let dd = ctx.zero_dev((dst_off + n) as usize);
-            let bs = ctx.dev[src.0 as usize].as_ref().unwrap();
+            // `dst` is a PRE-EXISTING tensor: `Copy` writes only the [dst_off, dst_off+n) slice and
+            // must preserve the rest (matches the CPU reference, which copies into `vals[dst]`).
+            // `ensure_device` allocates the full tensor extent (`numel`, zero-filled) if `dst` is
+            // unproduced, or returns the already-produced buffer — never a wrong-sized fresh zero.
+            ctx.ensure_device(dst, g, bindings)?;
+            let dst_ptr = ctx.dev[dst.0 as usize].as_ref().unwrap().ptr;
+            // Aliasing (src == dst): stage the source through a temp so the in-place copy can't
+            // race the read (the CPU reference clones the read window for the same reason).
+            let staged = ctx.stage_if_aliased(src, dst);
+            let src_ptr = staged
+                .as_ref()
+                .map(|b| b.ptr)
+                .unwrap_or_else(|| ctx.dev[src.0 as usize].as_ref().unwrap().ptr);
             dispatch_1d(
                 pipelines,
                 ctx.stream,
@@ -951,14 +969,13 @@ fn run_op(
                 n,
                 256,
                 args![
-                    arg_ptr(bs.ptr),
+                    arg_ptr(src_ptr),
                     arg_i32(src_off as i32),
-                    arg_ptr(dd.ptr),
+                    arg_ptr(dst_ptr),
                     arg_i32(dst_off as i32),
                     arg_i32(n as i32),
                 ],
             )?;
-            ctx.dev[dst.0 as usize] = Some(dd);
         }
         Op::CopyStrided {
             src,
@@ -971,9 +988,17 @@ fn run_op(
             n,
         } => {
             ctx.ensure_device(src, g, bindings)?;
-            let dd =
-                ctx.zero_dev(rows as usize * (dst_off as usize + n as usize + dst_stride as usize));
-            let bs = ctx.dev[src.0 as usize].as_ref().unwrap();
+            // See `Op::Copy`: write the strided rows in place into the full-extent, content-
+            // preserving `dst` buffer instead of a wrong-sized fresh zero. The old
+            // `rows*(dst_off+n+dst_stride)` sizing did not match a real row-major tensor and
+            // dropped prior content on a partial/scatter update.
+            ctx.ensure_device(dst, g, bindings)?;
+            let dst_ptr = ctx.dev[dst.0 as usize].as_ref().unwrap().ptr;
+            let staged = ctx.stage_if_aliased(src, dst);
+            let src_ptr = staged
+                .as_ref()
+                .map(|b| b.ptr)
+                .unwrap_or_else(|| ctx.dev[src.0 as usize].as_ref().unwrap().ptr);
             dispatch_1d(
                 pipelines,
                 ctx.stream,
@@ -981,17 +1006,16 @@ fn run_op(
                 rows,
                 256,
                 args![
-                    arg_ptr(bs.ptr),
+                    arg_ptr(src_ptr),
                     arg_i32(src_off as i32),
                     arg_i32(src_stride as i32),
-                    arg_ptr(dd.ptr),
+                    arg_ptr(dst_ptr),
                     arg_i32(dst_off as i32),
                     arg_i32(dst_stride as i32),
                     arg_i32(rows as i32),
                     arg_i32(n as i32),
                 ],
             )?;
-            ctx.dev[dst.0 as usize] = Some(dd);
         }
         Op::EmbedGather {
             ids,
@@ -1246,8 +1270,20 @@ fn run_op(
             let km1 = (kernel - 1) as usize;
             let ch = channels as usize;
             let rows_u = rows as usize;
-            let hs = ctx.host_vals(state, g, bindings)?.to_vec();
-            let hx = ctx.host_vals(x, g, bindings)?.to_vec();
+            // Read the OLD state and the conv input DIRECTLY from their device buffers — NOT via
+            // `host_vals`, which caches by tensor id. `x` (`dn_qkvbuf`) and `state` (`k_cache[l]`)
+            // are REUSED across every DeltaNet layer, so a cached read would hand back an earlier
+            // layer's stale content and corrupt the rolling conv history for all deeper layers
+            // (the first layer would carry correctly, later ones would not — the classic
+            // "layer 0 fine, layer 2 diverges in decode" symptom).
+            let hs = {
+                let bst = ctx.dev[state.0 as usize].as_ref().unwrap();
+                bytes_to_f32(&read_bytes(bst, ctx.stream), DType::F32)?
+            };
+            let hx = {
+                let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
+                bytes_to_f32(&read_bytes(bx, ctx.stream), DType::F32)?
+            };
             let mut ns = vec![0f32; km1 * ch];
             for j in 0..km1 {
                 let idx = rows_u + j; // virtual-sequence index of new_state column j
@@ -1259,7 +1295,24 @@ fn run_op(
                     };
                 }
             }
-            ctx.set_dev(state, &ns);
+            // Persist the rolling conv history IN PLACE into the bound (persistent) `state` buffer.
+            // `state` is an in-place Input (`k_cache[l]`, repurposed as conv state): the end-of-graph
+            // writeback skips in-place inputs, so `set_dev`-ing a FRESH buffer here would drop the
+            // update and the history would never reach the next graph — the decode conv would read a
+            // stale/zero history and diverge after the first token. Write the bound buffer directly.
+            let sb = ctx.dev[state.0 as usize].as_ref().unwrap();
+            let bytes = bytemuck::cast_slice::<f32, u8>(&ns);
+            let n = bytes.len().min(sb.len);
+            if n > 0 {
+                unsafe {
+                    ffi::hipMemcpy(
+                        sb.ptr,
+                        bytes.as_ptr() as *const c_void,
+                        n,
+                        HIP_MEMCPY_HOST_TO_DEVICE,
+                    );
+                }
+            }
             ctx.dev[dst.0 as usize] = Some(dd);
         }
 

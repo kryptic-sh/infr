@@ -479,7 +479,8 @@ extern "C" __global__ void embed_gather(
     const __half* __restrict__ table, // [vocab, dim]
     float* __restrict__ dst,          // [rows, dim]
     int rows,
-    int dim
+    int dim,
+    float scale                       // per-op embedding scale (sqrt(n_embd) for Gemma; 1.0 otherwise)
 ) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
@@ -487,7 +488,7 @@ extern "C" __global__ void embed_gather(
     const __half* tr = table + id * dim;
     float* dr = dst + row * dim;
     for (int i = 0; i < dim; i++) {
-        dr[i] = __half2float(tr[i]);
+        dr[i] = __half2float(tr[i]) * scale;
     }
 }
 "#;

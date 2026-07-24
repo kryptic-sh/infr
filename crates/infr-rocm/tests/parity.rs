@@ -201,6 +201,147 @@ fn linear_q4k_matches_cpu() {
     );
 }
 
+// ── EmbedGather (gather + dequant embedding rows, ×scale) vs CPU ─────────────
+
+/// Run a single-`Op::EmbedGather` graph on `be`: `dst[r, :] = dequant(table[ids[r], :]) * scale`.
+/// `ids` is an I32 input (token ids); `table` uploads as its raw native `table_dtype` bytes.
+/// Returns the downloaded f32 output `[rows, ne]`.
+fn run_embed_gather(
+    be: &dyn Backend,
+    ids: &[i32],
+    table_bytes: &[u8],
+    table_dtype: DType,
+    vocab: usize,
+    ne: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let rows = ids.len();
+    let mut g = Graph::new();
+    let ids_id = g.input(TensorDesc::new(vec![rows], DType::I32));
+    let tbl = g.weight(TensorDesc::new(vec![vocab * ne], table_dtype));
+    let dst = g.output(f32d(rows * ne));
+    g.push(Op::EmbedGather {
+        ids: ids_id,
+        table: tbl,
+        dst,
+        rows: rows as u32,
+        ne: ne as u32,
+        scale,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let ids_bytes: &[u8] = bytemuck::cast_slice(ids);
+    let ib = be
+        .alloc(ids_bytes.len(), BufferUsage::Activations)
+        .expect("ids");
+    be.upload(ib.as_ref(), ids_bytes).unwrap();
+    let tb = be
+        .alloc(table_bytes.len(), BufferUsage::Weights)
+        .expect("table");
+    be.upload(tb.as_ref(), table_bytes).unwrap();
+    let ob = be.alloc(rows * ne * 4, BufferUsage::Readback).expect("out");
+    let mut b = Bindings::new();
+    b.bind(ids_id, ib.as_ref());
+    b.bind(tbl, tb.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut o = vec![0f32; rows * ne];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// EmbedGather with a NON-1.0 scale (Gemma's sqrt(n_embd)): the scale must be applied on-device.
+/// The pre-fix bug dropped the scale entirely (the HIP kernel had no `scale` param), so a Gemma
+/// model's token embeddings came out unscaled — this test would fail loudly against the CPU
+/// reference (`v * scale`). Covers an F16 table and a Q4_K table.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_matches_cpu() {
+    if rocm().is_none() {
+        return;
+    }
+    let cpu = infr_cpu::CpuBackend::new();
+    let ids = [0i32, 3, 5, 1, 5, 2];
+
+    // ── F16 table ──
+    // Fresh backend per case: `dequant_weight_or_cache` keys the dequantized-weight cache by the
+    // table's raw device pointer, and a table buffer freed at the end of one case can have its VRAM
+    // address recycled by the next case's table — a stale cache hit would then feed the wrong
+    // dequantized rows. Real models never hit this (weights are long-lived), but back-to-back
+    // single-op test cases do; a per-case backend gives each an empty cache.
+    {
+        let be = rocm().unwrap();
+        let (vocab, ne) = (6usize, 8usize);
+        let scale = (ne as f32).sqrt(); // non-1.0, mirrors Gemma's embed scaling
+        let tf32 = gen(vocab * ne, 41);
+        let t_bytes: Vec<u8> = tf32
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let c = run_embed_gather(&cpu, &ids, &t_bytes, DType::F16, vocab, ne, scale);
+        let r = run_embed_gather(&be, &ids, &t_bytes, DType::F16, vocab, ne, scale);
+        let e = maxerr(&c, &r);
+        let ref_mag = maxabs(&c).max(1e-6);
+        println!(
+            "EmbedGather F16 scale={scale:e} max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+            e / ref_mag
+        );
+        assert!(
+            ref_mag > 1e-3,
+            "EmbedGather F16 reference is all-zero — test is vacuous"
+        );
+        assert!(
+            e / ref_mag < 1e-3,
+            "EmbedGather F16 diverges from CPU reference: abs={e:e} rel={:e}",
+            e / ref_mag
+        );
+    }
+
+    // ── Q4_K table (ne must be a multiple of 256 = one super-block per row) ──
+    {
+        let be = rocm().unwrap();
+        let (vocab, ne) = (6usize, 256usize); // vocab > max(ids)=5
+        let scale = (ne as f32).sqrt();
+        let blocks = (vocab * ne) / 256; // one block per vocab row
+        let mut t_bytes = vec![0u8; blocks * 144];
+        for (i, byte) in t_bytes.iter_mut().enumerate() {
+            *byte = ((i * 37 + 11) & 0xFF) as u8;
+        }
+        // Q4_K super-block = d(2) + dmin(2) + scales(12) + qs(128). Set the f16 d/dmin slots to
+        // finite small values, and the 12 packed 6-bit sub-block scale/min bytes to a benign
+        // constant. Random bytes in those scale nibbles hit adversarial corners where the two
+        // independent Q4_K decoders (infr-cpu ref vs infr-gguf device dequant) diverge on a
+        // handful of raw elements — a dot product (the linear test) averages that away, but a raw
+        // per-element gather exposes it. A benign, in-range sub-scale keeps both decoders in lock-
+        // step so the comparison isolates the embed gather + on-device SCALE, not quant corners.
+        for blk in 0..blocks {
+            let base = blk * 144;
+            t_bytes[base..base + 2].copy_from_slice(&half::f16::from_f32(0.375).to_le_bytes());
+            t_bytes[base + 2..base + 4].copy_from_slice(&half::f16::from_f32(-0.125).to_le_bytes());
+            for b in t_bytes[base + 4..base + 16].iter_mut() {
+                *b = 0x11;
+            }
+        }
+        let c = run_embed_gather(&cpu, &ids, &t_bytes, DType::Q4K, vocab, ne, scale);
+        let r = run_embed_gather(&be, &ids, &t_bytes, DType::Q4K, vocab, ne, scale);
+        let e = maxerr(&c, &r);
+        let ref_mag = maxabs(&c).max(1e-3);
+        println!(
+            "EmbedGather Q4_K scale={scale:e} max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+            e / ref_mag
+        );
+        assert!(
+            ref_mag > 1e-3,
+            "EmbedGather Q4_K reference is all-zero — test is vacuous"
+        );
+        assert!(
+            e / ref_mag < 2e-2,
+            "EmbedGather Q4_K diverges from CPU reference: abs={e:e} rel={:e}",
+            e / ref_mag
+        );
+    }
+}
+
 // ── MoeFfn (router GEMV → gating → top-k → expert FFN → weighted sum) vs CPU ──
 
 /// f16 little-endian bytes for an f32 slice (expert weight banks upload as raw f16).

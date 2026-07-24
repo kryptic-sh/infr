@@ -1004,7 +1004,7 @@ fn run_op(
             dst,
             rows,
             ne,
-            scale: _scale,
+            scale,
         } => {
             let wptr = ctx.dequant_weight_or_cache(table, g, bindings)?;
             ctx.ensure_device(ids, g, bindings)?;
@@ -1022,7 +1022,7 @@ fn run_op(
                     arg_ptr(dd.ptr),
                     arg_i32(rows as i32),
                     arg_i32(ne as i32),
-                    arg_f32(_scale),
+                    arg_f32(scale),
                 ],
             )?;
             ctx.dev[dst.0 as usize] = Some(dd);

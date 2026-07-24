@@ -1,8 +1,10 @@
 //! HIP kernel-source assembly and hiprtc compilation.
 //!
-//! Each kernel is a `__global__` function taking device pointers. All operate on f16 or f32
-//! buffers — quantized weights are dequantized to f16 on the host BEFORE they reach a kernel
-//! (see `exec.rs`'s dequant cache), so the kernels stay format-agnostic and simple.
+//! Each kernel is a `__global__` function taking device pointers. Most operate on f16 or f32
+//! buffers — uncovered quantized weights are dequantized to f16 on the host BEFORE they reach a
+//! kernel (see `exec.rs`'s dequant cache), so those kernels stay format-agnostic and simple. The
+//! `NATIVE_DECODE` kernels (Phase 3, Q4_K/Q6_K/Q8_0) are the exception: they read the RAW quant
+//! bytes and decode each block in-kernel, so no f16 cache is materialized (VRAM ≈ quant_size).
 //!
 //! On first use each kernel name is fetched via `hipModuleGetFunction` and cached in a
 //! `HashMap`. The module is compiled once at backend init via `hiprtcCompileProgram`.
@@ -54,6 +56,7 @@ const HIP_PARTS: &[&str] = &[
     CONV1D_SILU,
     DELTANET,
     MOE_SHARED_EXPERT_ADD,
+    NATIVE_DECODE,
 ];
 
 const RMSNORM: &str = r#"
@@ -835,6 +838,156 @@ extern "C" __global__ void moe_shared_expert_add(
         dr[i] = mr[i] + g * sr[i];
     }
 }
+"#;
+
+// ── Native in-kernel quant-decode GEMV / EmbedGather (Phase 3) ────────────────
+//
+// These kernels read the RAW quantized weight bytes and decode each block ON THE FLY,
+// so a quantized weight never materializes as an f16 cache in VRAM (VRAM ≈ quant_size
+// only) AND decode streams the compact quant bytes (the dominant decode bandwidth
+// lever, docs/cpu-perf.md). Covered formats: Q4_K, Q6_K, Q8_0 (the set a Q4_K_M GGUF
+// uses; F16 is already native via `linear_f16`).
+//
+// BIT-FAITHFULNESS to the dequant→f16 cache path (so the blessed goldens do NOT move):
+// each element is decoded to the EXACT f32 the host `infr_gguf::dequant::dequant_block`
+// produces — same operation order, `sc * code + mn`, with `sc`/`mn` derived identically
+// — then rounded to f16 (`__float2half`) exactly as the old CPU dequant cache did
+// (`half::f16::from_f32`), and read back as f32 (`__half2float`) exactly as the old
+// `linear_f16`/`embed_gather` kernels read the cached f16. The f32 dequant expression is
+// compiled with `fp contract(off)` so it is NEVER fused into an FMA — the host reference
+// (Rust) does not fuse, and an FMA's single-rounding intermediate could flip the f16
+// round and move a golden. The accumulation loop keeps the default contraction so it
+// matches `linear_f16`'s accumulation exactly.
+const NATIVE_DECODE: &str = r#"
+// Read a little-endian f16 (2 bytes) → f32. Byte-wise assembly avoids any alignment
+// assumption on the block pointer; the union type-pun is the portable bits→__half path.
+__device__ __forceinline__ float rf16b(const unsigned char* p) {
+    union { unsigned short u; __half h; } cvt;
+    cvt.u = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
+    return __half2float(cvt.h);
+}
+
+// Reproduce the host dequant's f32 value `sc*code + mn` WITHOUT FMA contraction, then
+// round to f16 and back to f32 — the exact value the old dequant→f16 cache fed the GEMV.
+__device__ __forceinline__ float fin(float sc, int code, float mn) {
+#pragma clang fp contract(off)
+    float val = sc * (float)code + mn;
+    return __half2float(__float2half(val));
+}
+
+// ── Q8_0: 32 elems / 34 bytes = [half d][int8 qs[32]]; y = d*q8 (code = q8+128). ──
+__device__ __forceinline__ float deq_q80(const unsigned char* w, long i) {
+    long blk = i >> 5;              // / 32
+    int within = (int)(i & 31);
+    const unsigned char* b = w + blk * 34;
+    float d = rf16b(b);
+    int code = (int)((signed char)b[2 + within]) + 128; // biased +128 (dequant_block)
+    return fin(d, code, d * (float)(-128));             // sc = d*1, mn = d*(-128)
+}
+
+// get_scale_min_k4: 6-bit scale `sc` + min `mm` for sub-block s (0..8) of a Q4_K block.
+__device__ __forceinline__ void k4(const unsigned char* q, int s, int* sc, int* mm) {
+    if (s < 4) {
+        *sc = q[s] & 63;
+        *mm = q[s + 4] & 63;
+    } else {
+        *sc = (q[s + 4] & 0x0F) | ((q[s - 4] >> 6) << 4);
+        *mm = (q[s + 4] >> 4)   | ((q[s]     >> 6) << 4);
+    }
+}
+
+// ── Q4_K: 256 elems / 144 bytes = [half d][half dmin][u8 scales[12]][u8 qs[128]]. ──
+// Element `within`'s 16/32-block scale index is `within/32` (0..7); the nibble comes
+// from qs[(s/2)*32 + within%32], low nibble for even s, high nibble for odd s.
+__device__ __forceinline__ float deq_q4k(const unsigned char* w, long i) {
+    long blk = i >> 8;             // / 256
+    int within = (int)(i & 255);
+    const unsigned char* b = w + blk * 144;
+    float d = rf16b(b);
+    float dmin = rf16b(b + 2);
+    const unsigned char* scales = b + 4;
+    const unsigned char* qs = b + 16;
+    int s = within >> 5;           // sub-block 0..7
+    int sc, mm;
+    k4(scales, s, &sc, &mm);
+    int p = within & 31;
+    int nib_base = (s >> 1) * 32 + p;
+    int code = (s & 1) ? (qs[nib_base] >> 4) : (qs[nib_base] & 0x0F);
+    return fin(d * (float)sc, code, dmin * (float)(-mm));
+}
+
+// ── Q6_K: 256 elems / 210 bytes = [u8 ql[128]][u8 qh[64]][int8 scales[16]][half d]. ──
+// Scale index is `within/16` (0..15); the 6-bit code = 4 low bits (ql) + 2 high bits (qh),
+// with the ql/qh byte + shift chosen by the region `(within%128)/32`.
+__device__ __forceinline__ float deq_q6k(const unsigned char* w, long i) {
+    long blk = i >> 8;             // / 256
+    int within = (int)(i & 255);
+    const unsigned char* b = w + blk * 210;
+    const unsigned char* ql = b;
+    const unsigned char* qh = b + 128;
+    const signed char* scales = (const signed char*)(b + 192);
+    float d = rf16b(b + 208);
+    int s = (int)scales[within >> 4];   // scale index = within / 16
+    int half = within >> 7;             // / 128
+    int o = within & 127;
+    int region = o >> 5;                // 0..3
+    int l = o & 31;
+    int qlo = half * 64;
+    int qho = half * 32;
+    int code;
+    if (region == 0)      code = (ql[qlo + l] & 0x0F)      | ((qh[qho + l] & 3) << 4);
+    else if (region == 1) code = (ql[qlo + 32 + l] & 0x0F) | (((qh[qho + l] >> 2) & 3) << 4);
+    else if (region == 2) code = (ql[qlo + l] >> 4)        | (((qh[qho + l] >> 4) & 3) << 4);
+    else                  code = (ql[qlo + 32 + l] >> 4)   | (((qh[qho + l] >> 6) & 3) << 4);
+    return fin(d * (float)s, code, d * (float)(-32 * s));
+}
+
+// GEMV `dst[m, out_f] = x[m, in_f] · decode(w)[out_f, in_f]ᵀ`. One block per m-row, threads
+// stride over out_f (mirrors `linear_f16`); the weight buffer is pre-advanced past `w_off`
+// on the host so element (o, i) is global index `o*in_f + i`. Accumulation is in i-order —
+// identical to `linear_f16` — so the f32 sum is bit-stable against the cache path.
+#define GEN_LINEAR(SUFFIX) \
+extern "C" __global__ void linear_##SUFFIX( \
+    const float* __restrict__ x, \
+    const unsigned char* __restrict__ w, \
+    float* __restrict__ dst, \
+    int m, int in_f, int out_f) { \
+    int row = blockIdx.x; \
+    int tid = threadIdx.x; \
+    const float* xr = x + row * in_f; \
+    for (int o = tid; o < out_f; o += blockDim.x) { \
+        float acc = 0.0f; \
+        long base = (long)o * in_f; \
+        for (int i = 0; i < in_f; i++) { \
+            acc += xr[i] * deq_##SUFFIX(w, base + i); \
+        } \
+        dst[row * out_f + o] = acc; \
+    } \
+}
+
+// EmbedGather: `dst[r, :] = decode(table[ids[r], :]) * scale`. One thread per row.
+#define GEN_EMBED(SUFFIX) \
+extern "C" __global__ void embed_##SUFFIX( \
+    const int* __restrict__ ids, \
+    const unsigned char* __restrict__ table, \
+    float* __restrict__ dst, \
+    int rows, int dim, float scale) { \
+    int row = blockIdx.x * blockDim.x + threadIdx.x; \
+    if (row >= rows) return; \
+    int id = ids[row]; \
+    long base = (long)id * dim; \
+    float* dr = dst + row * dim; \
+    for (int i = 0; i < dim; i++) { \
+        dr[i] = deq_##SUFFIX(table, base + i) * scale; \
+    } \
+}
+
+GEN_LINEAR(q80)
+GEN_LINEAR(q4k)
+GEN_LINEAR(q6k)
+GEN_EMBED(q80)
+GEN_EMBED(q4k)
+GEN_EMBED(q6k)
 "#;
 
 // ── Module cache ─────────────────────────────────────────────────────────────

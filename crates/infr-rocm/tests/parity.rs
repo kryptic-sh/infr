@@ -1520,9 +1520,11 @@ fn softcap_matches_cpu() {
 
 // ── All-weight-quant Linear parity sweep (Slice 10, docs/rocm-plan.md Part A) ─────────────────────
 //
-// The ROCm Linear path dequantizes ANY weight quant to f32 via the shared
-// `infr_gguf::dequant::dequant_block`, rounds to f16, then runs the f32-accumulating `linear_f16`
-// GEMV (kernels.rs). So every weight quant format is supported by construction — the only per-format
+// The ROCm Linear path handles each weight quant one of two ways: Q4_K/Q6_K/Q8_0 are decoded
+// IN-KERNEL from their raw bytes (Phase 3 native decode, `native_decode_fmt`), every other quant is
+// dequantized to f32 via the shared `infr_gguf::dequant::dequant_block`, rounded to f16, then run
+// through the f32-accumulating `linear_f16` GEMV (kernels.rs). Both paths round the weight to f16 and
+// accumulate in f32, so every weight quant format is supported by construction — the only per-format
 // risk is a bad block-byte assumption or an odd block stride. This sweep proves each of the 24 real
 // WEIGHT quant formats decodes and GEMVs in agreement with `infr_cpu::CpuBackend` running the SAME
 // one-op graph (CPU dequants the same bytes with `dequant_block` + an f32 matmul). Because both
@@ -1706,5 +1708,116 @@ fn all_quant_linear_matches_cpu() {
         failures.is_empty(),
         "weight-quant Linear parity failures:\n  {}",
         failures.join("\n  ")
+    );
+}
+
+// ── Native in-kernel quant-decode GEMV / EmbedGather (Slice 12, Phase 3) ──────────────────────────
+//
+// Q4_K / Q6_K / Q8_0 route through the NATIVE in-kernel decode path (`native_decode_fmt` →
+// `linear_q4k`/`linear_q6k`/`linear_q80` and `embed_q4k`/`embed_q6k`/`embed_q80`): the GEMV reads the
+// RAW quant bytes and decodes each block on the fly, so no f16 cache is materialized in VRAM. The
+// decode is bit-faithful to the old dequant→f16 cache (same `sc*code + mn`, contract-off, then round
+// to f16), so parity vs `infr_cpu::CpuBackend` (which dequants the same bytes with `dequant_block`)
+// holds within the f16-weight-rounding tolerance — exactly as the cached path did. `linear_q4k`/the
+// Q4_K `embed_gather` and the `all_quant_linear` sweep already exercise these three under the native
+// router; the tests below add the explicit per-format Q6_K/Q8_0 coverage the plan calls for.
+
+/// Q6_K weight through the native `linear_q6k` in-kernel decode GEMV vs the CPU reference.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_q6k_native_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    // Q6_K super-block = 256 elems / 210 bytes; in_f a multiple of 256.
+    let (m, in_f, out_f) = (2usize, 256usize, 4usize);
+    let n = out_f * in_f;
+    // Valid Q6_K blocks: LCG code/scale bytes (finite for any pattern), f16 `d` at byte 208 set sane.
+    let w_bytes = synth_q(n, 256, 210, 310, &[(208, 0.03)]);
+    let x = gen(m * in_f, 5);
+    let c = run_linear(&cpu, &x, &w_bytes, DType::Q6K, m, in_f, out_f);
+    let r = run_linear(&be, &x, &w_bytes, DType::Q6K, m, in_f, out_f);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "Linear Q6_K (native) max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "Q6_K reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 2e-2,
+        "Linear Q6_K native decode diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+/// Q8_0 weight through the native `linear_q80` in-kernel decode GEMV vs the CPU reference. Q8_0 is
+/// near-lossless (int8 blocks), so the f16-weight-rounding tolerance is tight.
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn linear_q80_native_matches_cpu() {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    // Q8_0 block = 32 elems / 34 bytes; in_f a multiple of 32.
+    let (m, in_f, out_f) = (2usize, 256usize, 4usize);
+    let n = out_f * in_f;
+    let w_bytes = synth_q(n, 32, 34, 311, &[(0, 0.02)]);
+    let x = gen(m * in_f, 5);
+    let c = run_linear(&cpu, &x, &w_bytes, DType::Q8_0, m, in_f, out_f);
+    let r = run_linear(&be, &x, &w_bytes, DType::Q8_0, m, in_f, out_f);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "Linear Q8_0 (native) max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "Q8_0 reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 1e-2,
+        "Linear Q8_0 native decode diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+/// Q8_0 embedding table through the native `embed_q80` in-kernel decode gather (×scale) vs CPU. Q8_0
+/// has no sub-block scales — just `d` + int8 codes — so the per-element gather is a clean check of
+/// the native decode + on-device embed scale (the token_embd bank that must NOT be f16-cached).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn embed_gather_q80_native_matches_cpu() {
+    if rocm().is_none() {
+        return;
+    }
+    let cpu = infr_cpu::CpuBackend::new();
+    let ids = [0i32, 3, 5, 1, 5, 2];
+    let be = rocm().unwrap();
+    let (vocab, ne) = (6usize, 256usize); // ne a multiple of 32; vocab > max(ids)
+    let scale = (ne as f32).sqrt(); // non-1.0 (Gemma-style) — must be applied on-device
+    let t_bytes = synth_q(vocab * ne, 32, 34, 312, &[(0, 0.02)]);
+    let c = run_embed_gather(&cpu, &ids, &t_bytes, DType::Q8_0, vocab, ne, scale);
+    let r = run_embed_gather(&be, &ids, &t_bytes, DType::Q8_0, vocab, ne, scale);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "EmbedGather Q8_0 (native) scale={scale:e} max_err={e:e} max|ref|={ref_mag:e} rel={:e}",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "EmbedGather Q8_0 reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < 1e-2,
+        "EmbedGather Q8_0 native decode diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
     );
 }

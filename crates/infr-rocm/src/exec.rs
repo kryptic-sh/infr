@@ -1,6 +1,8 @@
 //! Graph execution: walk ops → resolve bound buffers → dispatch HIP kernels.
 //!
-//! Quantized weight tensors are dequantized to f16 on the host on first touch and
+//! Covered quant formats (Q4_K/Q6_K/Q8_0, see `native_decode_fmt`) are decoded in-kernel
+//! from their RAW bytes on the `Linear`/`EmbedGather` paths — no f16 cache, VRAM ≈ quant_size.
+//! Uncovered quantized weight tensors are dequantized to f16 on the host on first touch and
 //! cached by the raw device-pointer address of their bound buffer.
 
 use crate::ffi::{self, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS};
@@ -65,6 +67,20 @@ fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Result<Vec<f32>> {
         }
         _ => dequant::dequant_block(dtype, bytes)
             .map_err(|e| be(format!("dequant {dtype:?} weight: {e}"))),
+    }
+}
+
+/// Formats decoded natively in-kernel (Phase 3): the GEMV / EmbedGather reads the RAW quant
+/// bytes and decodes each block on the fly, so no f16 cache is materialized in VRAM. Returns
+/// `(elems_per_block, bytes_per_block, linear_kernel, embed_kernel)` for a covered dtype, else
+/// `None` (uncovered formats keep the dequant→f16 fallback). The decode is bit-faithful to the
+/// old cache path (see `kernels.rs` NATIVE_DECODE), so goldens do not move.
+fn native_decode_fmt(dt: DType) -> Option<(usize, usize, &'static str, &'static str)> {
+    match dt {
+        DType::Q8_0 => Some((32, 34, "linear_q80", "embed_q80")),
+        DType::Q4K => Some((256, 144, "linear_q4k", "embed_q4k")),
+        DType::Q6K => Some((256, 210, "linear_q6k", "embed_q6k")),
+        _ => None,
     }
 }
 
@@ -427,27 +443,56 @@ fn run_op(
             out_f,
             w_off,
         } => {
-            let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
-            ctx.ensure_device(x, g, bindings)?;
-            let dd = ctx.zero_dev(m as usize * out_f as usize);
-            let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
-            let wptr_off = unsafe { (wptr as *mut u8).add(w_off as usize * 2) as *mut c_void };
-            dispatch_1d(
-                pipelines,
-                ctx.stream,
-                "linear_f16",
-                m * 256,
-                256,
-                args![
-                    arg_ptr(bx.ptr),
-                    arg_ptr(wptr_off),
-                    arg_ptr(dd.ptr),
-                    arg_i32(m as i32),
-                    arg_i32(in_f as i32),
-                    arg_i32(out_f as i32),
-                ],
-            )?;
-            ctx.dev[dst.0 as usize] = Some(dd);
+            if let Some((qpb, bpb, kname, _)) = native_decode_fmt(g.desc(weight).dtype) {
+                // Native in-kernel decode: read the RAW quant bytes (no f16 cache → VRAM drops).
+                // The bound quant buffer is pre-advanced past `w_off`; `w_off` is always a whole
+                // number of output rows × `in_f`, hence a multiple of `qpb`, so the block offset
+                // `(w_off / qpb) * bpb` is exact.
+                let wptr = ctx.ensure_device(weight, g, bindings)?;
+                ctx.ensure_device(x, g, bindings)?;
+                let dd = ctx.zero_dev(m as usize * out_f as usize);
+                let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
+                let blk_off = (w_off as usize / qpb) * bpb;
+                let wptr_off = unsafe { (wptr as *mut u8).add(blk_off) as *mut c_void };
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    kname,
+                    m * 256,
+                    256,
+                    args![
+                        arg_ptr(bx.ptr),
+                        arg_ptr(wptr_off),
+                        arg_ptr(dd.ptr),
+                        arg_i32(m as i32),
+                        arg_i32(in_f as i32),
+                        arg_i32(out_f as i32),
+                    ],
+                )?;
+                ctx.dev[dst.0 as usize] = Some(dd);
+            } else {
+                let wptr = ctx.dequant_weight_or_cache(weight, g, bindings)?;
+                ctx.ensure_device(x, g, bindings)?;
+                let dd = ctx.zero_dev(m as usize * out_f as usize);
+                let bx = ctx.dev[x.0 as usize].as_ref().unwrap();
+                let wptr_off = unsafe { (wptr as *mut u8).add(w_off as usize * 2) as *mut c_void };
+                dispatch_1d(
+                    pipelines,
+                    ctx.stream,
+                    "linear_f16",
+                    m * 256,
+                    256,
+                    args![
+                        arg_ptr(bx.ptr),
+                        arg_ptr(wptr_off),
+                        arg_ptr(dd.ptr),
+                        arg_i32(m as i32),
+                        arg_i32(in_f as i32),
+                        arg_i32(out_f as i32),
+                    ],
+                )?;
+                ctx.dev[dst.0 as usize] = Some(dd);
+            }
         }
         Op::Softmax {
             x,
@@ -1025,14 +1070,24 @@ fn run_op(
             ne,
             scale,
         } => {
-            let wptr = ctx.dequant_weight_or_cache(table, g, bindings)?;
+            let (kname, wptr) =
+                if let Some((_, _, _, embed_k)) = native_decode_fmt(g.desc(table).dtype) {
+                    // Native decode of the embedding table — avoids caching the whole (large) table
+                    // as f16 in VRAM (the token_embd bank is a major VRAM cost on big models).
+                    (embed_k, ctx.ensure_device(table, g, bindings)?)
+                } else {
+                    (
+                        "embed_gather",
+                        ctx.dequant_weight_or_cache(table, g, bindings)?,
+                    )
+                };
             ctx.ensure_device(ids, g, bindings)?;
             let dd = ctx.zero_dev(rows as usize * ne as usize);
             let bid = ctx.dev[ids.0 as usize].as_ref().unwrap();
             dispatch_1d(
                 pipelines,
                 ctx.stream,
-                "embed_gather",
+                kname,
                 rows,
                 256,
                 args![

@@ -337,6 +337,75 @@ fn linear_i8_q6k_matches_cpu() {
     );
 }
 
+// ── Matrix-core (WMMA) int8 prefill GEMM (Phase 5) vs the CPU f32 reference ──
+//
+// For `m > 1` (prefill) the default `Op::Linear` path for Q4_K/Q6_K/Q8_0 routes to the RDNA3 wave32
+// int8 matrix core (`wmma_i8_*`, one 16×16 output tile per wave). The activation quant and weight
+// codes are IDENTICAL to the Phase-4 GEMV, so parity is the same int8 tolerance vs the CPU f32
+// reference. Shapes deliberately break the 16-tile alignment on BOTH edges: `m` is NOT a multiple of
+// 16 (row-edge masking) and `out_f` is NOT a multiple of 16 (column-edge masking + guarded weight
+// decode). `in_f = 512` gives 2 super-blocks / output row (Q4_K/Q6_K) — exercises the per-super
+// offset AND the multi-block scale-after accumulation. Every case carries a vacuity guard. Setting
+// `INFR_ROCM_NO_WMMA` would route the Phase-4 dp4a GEMV instead.
+
+/// Shared WMMA prefill parity check: ROCm int8 `Linear` (m>1 → WMMA) vs the CPU f32 reference.
+/// `m = 18` (16 + 2 → two row tiles, last partially masked); `out_f = 40` (32 + 8 → three column
+/// tiles, last partially masked).
+fn check_wmma_linear(
+    w_bytes_for: impl Fn(usize) -> Vec<u8>,
+    dt: DType,
+    qpb: usize,
+    tol: f32,
+    label: &str,
+) {
+    let Some(be) = rocm() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (m, in_f, out_f) = (18usize, 512usize, 40usize);
+    let blocks = (out_f * in_f) / qpb;
+    let w_bytes = w_bytes_for(blocks);
+    let x = gen(m * in_f, 5);
+    let c = run_linear(&cpu, &x, &w_bytes, dt, m, in_f, out_f);
+    let r = run_linear(&be, &x, &w_bytes, dt, m, in_f, out_f);
+    let e = maxerr(&c, &r);
+    let ref_mag = maxabs(&c).max(1e-3);
+    println!(
+        "WMMA-i8 {label} m={m} out_f={out_f} max_err={e:e} max|ref|={ref_mag:e} rel={:e} (tol={tol:e})",
+        e / ref_mag
+    );
+    assert!(
+        ref_mag > 1e-3,
+        "{label} WMMA reference is all-zero — test is vacuous"
+    );
+    assert!(
+        e / ref_mag < tol,
+        "{label} WMMA prefill GEMM diverges from CPU reference: abs={e:e} rel={:e}",
+        e / ref_mag
+    );
+}
+
+/// Q8_0 WMMA prefill GEMM (near-lossless weight → tight int8-activation tolerance).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q80_matches_cpu() {
+    check_wmma_linear(q80_blocks, DType::Q8_0, 32, 1.5e-2, "Q8_0");
+}
+
+/// Q4_K WMMA prefill GEMM (4-bit weight + int8 activation, per-32 sub-block scale + min).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q4k_matches_cpu() {
+    check_wmma_linear(q4k_blocks, DType::Q4K, 256, 3e-2, "Q4_K");
+}
+
+/// Q6_K WMMA prefill GEMM (6-bit weight, per-16 sub-block int8 scale — 1 K-tile per scale-block).
+#[test]
+#[ignore = "requires a ROCm GPU"]
+fn wmma_q6k_matches_cpu() {
+    check_wmma_linear(q6k_blocks, DType::Q6K, 256, 3e-2, "Q6_K");
+}
+
 // ── EmbedGather (gather + dequant embedding rows, ×scale) vs CPU ─────────────
 
 /// Run a single-`Op::EmbedGather` graph on `be`: `dst[r, :] = dequant(table[ids[r], :]) * scale`.

@@ -107,6 +107,25 @@ fn native_i8_fmt(dt: DType) -> Option<(usize, &'static str)> {
     }
 }
 
+/// Matrix-core (WMMA) int8 prefill GEMM kernel (Phase 5) for a covered dtype. Routed only for
+/// `m > 1` (prefill); decode (`m == 1`) stays on the `linear_i8_*` GEMV, which WMMA can't help.
+/// Same int8 precision as `native_i8_fmt` (identical activation quant + weight codes), so it is the
+/// closest possible to the Phase-4 blessed goldens. `INFR_ROCM_NO_WMMA` forces the GEMV path for
+/// A/B benchmarking. Returns `None` when the int8 path itself is disabled (`INFR_ROCM_NO_I8`).
+fn native_wmma_fmt(dt: DType) -> Option<&'static str> {
+    if std::env::var_os("INFR_ROCM_NO_WMMA").is_some()
+        || std::env::var_os("INFR_ROCM_NO_I8").is_some()
+    {
+        return None;
+    }
+    match dt {
+        DType::Q8_0 => Some("wmma_i8_q80"),
+        DType::Q4K => Some("wmma_i8_q4k"),
+        DType::Q6K => Some("wmma_i8_q6k"),
+        _ => None,
+    }
+}
+
 fn f32_to_f16_bytes(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 2);
     for x in v {
@@ -599,24 +618,52 @@ fn run_op(
                 let dd = ctx.zero_dev(mu * ou);
                 let blk_off = (w_off as usize / qpb) * bpb;
                 let wptr_off = unsafe { (wptr as *mut u8).add(blk_off) as *mut c_void };
-                // Grid = (out_f, m): one wave32 block per (output row, activation row).
-                dispatch_grid(
-                    pipelines,
-                    ctx.stream,
-                    i8_kernel,
-                    out_f,
-                    m,
-                    32,
-                    args![
-                        arg_ptr(qx.ptr),
-                        arg_ptr(xs.ptr),
-                        arg_ptr(wptr_off),
-                        arg_ptr(dd.ptr),
-                        arg_i32(m as i32),
-                        arg_i32(in_f as i32),
-                        arg_i32(out_f as i32),
-                    ],
-                )?;
+                match (m > 1).then(|| native_wmma_fmt(wdt)).flatten() {
+                    Some(wmma_kernel) => {
+                        // Prefill (m>1): matrix-core int8 GEMM. Grid = (ceil(out_f/16), ceil(m/16)),
+                        // one wave32 block per 16×16 output tile — a weight column is decoded once
+                        // per 16 rows (vs once per row in the GEMV). Same int8 codes/scales, so the
+                        // numerics track the Phase-4 GEMV to within f32 accumulation order.
+                        dispatch_grid(
+                            pipelines,
+                            ctx.stream,
+                            wmma_kernel,
+                            out_f.div_ceil(16),
+                            m.div_ceil(16),
+                            32,
+                            args![
+                                arg_ptr(qx.ptr),
+                                arg_ptr(xs.ptr),
+                                arg_ptr(wptr_off),
+                                arg_ptr(dd.ptr),
+                                arg_i32(m as i32),
+                                arg_i32(in_f as i32),
+                                arg_i32(out_f as i32),
+                            ],
+                        )?;
+                    }
+                    None => {
+                        // Decode (m==1) or WMMA disabled: the dp4a GEMV. Grid = (out_f, m): one
+                        // wave32 block per (output row, activation row).
+                        dispatch_grid(
+                            pipelines,
+                            ctx.stream,
+                            i8_kernel,
+                            out_f,
+                            m,
+                            32,
+                            args![
+                                arg_ptr(qx.ptr),
+                                arg_ptr(xs.ptr),
+                                arg_ptr(wptr_off),
+                                arg_ptr(dd.ptr),
+                                arg_i32(m as i32),
+                                arg_i32(in_f as i32),
+                                arg_i32(out_f as i32),
+                            ],
+                        )?;
+                    }
+                }
                 ctx.dev[dst.0 as usize] = Some(dd);
             } else if let Some((qpb, bpb, kname, _)) = native_decode_fmt(wdt) {
                 // Native in-kernel decode: read the RAW quant bytes (no f16 cache → VRAM drops).

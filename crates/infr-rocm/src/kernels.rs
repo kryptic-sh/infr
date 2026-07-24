@@ -58,6 +58,7 @@ const HIP_PARTS: &[&str] = &[
     MOE_SHARED_EXPERT_ADD,
     NATIVE_DECODE,
     INT8_DECODE,
+    WMMA_PREFILL,
 ];
 
 const RMSNORM: &str = r#"
@@ -1206,6 +1207,228 @@ extern "C" __global__ void linear_i8_q6k(
     }
     acc = wave_sum32(acc);
     if (tid == 0) dst[(long)row * out_f + o] = acc;
+}
+"#;
+
+// ── Matrix-core (WMMA) int8 prefill GEMM (Phase 5) ───────────────────────────
+//
+// The Phase-4 `linear_i8_*` GEMV grids one wave32 block per (output row `o`, activation row) — so a
+// weight column is DECODED ONCE PER ACTIVATION ROW. For prefill (m>1) that redundant decode is the
+// ceiling. These kernels move prefill onto the RDNA3 wave32 matrix cores
+// (`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32`, signed int8 → int32, `16x16x16`): one wave32 block
+// computes a 16(m-rows)×16(out_f) output tile, so a weight column is decoded ONCE PER 16 ROWS (16×
+// fewer decodes at m≥16). The activation is the SAME int8 quantization (`quant_i8_32`) the GEMV uses,
+// and the integer dot is EXACT — this is the identical int8 precision as the Phase-4 prefill, only
+// the f32 scale-after accumulation ORDER over blocks differs, so the goldens are the closest possible
+// to the Phase-4 blessed state (verified on-device, not assumed).
+//
+// Fragment layout (RDNA3 wave32, empirically confirmed by `examples/wmma_probe`):
+//   * A fragment: lane l feeds row (l%16) of the M×K tile — 16 K-values packed 4×int8/int32 (i4v).
+//   * B fragment: lane l feeds col (l%16) of the K×N tile — 16 K-values packed the same way.
+//   * D/C accumulator: 8 int32/lane; element e of lane l is output (row = 2*e + l/16, col = l%16).
+// int8 is SIGNED (neg_a = neg_b = true); unsigned would 256× the result (probe-verified).
+//
+// The per-format weight code + block-scale/min extraction mirrors the parity-tested `linear_i8_*`
+// exactly (same `k4`/`rf16b`, same nibble/region math), so the codes fed to the matrix core are
+// bit-identical to the GEMV. The Q4_K/Q6_K min term (`dmin·(−mm)·Σqx` / `d·(−32s)·Σqx`) is produced
+// by a second WMMA against an all-ones B fragment — its int32 result is `Σ_k qx[row][k]` for the
+// output row, exactly the `isum` the GEMV computes — then scaled after. Q8_0 has no min term.
+//
+// Tiles are one wave32 each; grid = (ceil(out_f/16), ceil(m/16)). `in_f` is always 32-aligned for
+// the covered formats, so K needs no padding; m and out_f edges are masked (out-of-range rows/cols
+// load zero and skip the store). No LDS: each lane loads its own row/column from global (the naive,
+// correctness-first tiling — occupancy/LDS tuning is a later Phase-5 lever).
+const WMMA_PREFILL: &str = r#"
+typedef int i4v __attribute__((ext_vector_type(4)));
+typedef int i8v __attribute__((ext_vector_type(8)));
+
+// Signed int8 16x16x16 matrix multiply-accumulate (wave32). neg_a/neg_b=true → signed operands.
+static __device__ __forceinline__ i8v wmma_dot(i4v a, i4v b, i8v c) {
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+}
+
+// Pack 16 signed-int8 codes (byte 0 = lowest K) from a contiguous buffer into an i4v K-fragment.
+static __device__ __forceinline__ i4v pack16(const signed char* p) {
+    i4v v;
+    v[0] = *(const int*)(p + 0);
+    v[1] = *(const int*)(p + 4);
+    v[2] = *(const int*)(p + 8);
+    v[3] = *(const int*)(p + 12);
+    return v;
+}
+
+// Load the A K-fragment (16 int8 of activation row `row_in` at absolute element offset `koff`),
+// or zero if this lane's input row is past the m-edge. `koff` already includes `row_in*in_f`.
+static __device__ __forceinline__ i4v load_a(const signed char* qx, int row_in, int m, long koff) {
+    if (row_in >= m) return (i4v){0, 0, 0, 0};
+    return pack16(qx + koff);
+}
+
+// ── Q8_0 prefill: 32 elems/block = 2 K-tiles, scale d, no min. ──
+extern "C" __global__ void wmma_i8_q80(
+    const signed char* __restrict__ qx,   // [m, in_f]
+    const float* __restrict__ xs,          // [m, nblk]
+    const unsigned char* __restrict__ w,   // raw Q8_0 bytes (pre-advanced)
+    float* __restrict__ dst,               // [m, out_f]
+    int m, int in_f, int out_f
+) {
+    int lane = threadIdx.x;
+    int half = lane >> 4;
+    int col = blockIdx.x * 16 + (lane & 15);   // output feature o
+    int row_in = blockIdx.y * 16 + (lane & 15); // A-fragment input row
+    int nblk = in_f >> 5;
+    float acc[8]; for (int e = 0; e < 8; e++) acc[e] = 0.0f;
+    signed char wc[32];
+    for (int blk = 0; blk < nblk; blk++) {
+        float wsc = 0.0f;
+        if (col < out_f) {
+            const unsigned char* b = w + ((long)col * nblk + blk) * 34;
+            wsc = rf16b(b);
+            for (int j = 0; j < 32; j++) wc[j] = (signed char)b[2 + j];
+        } else {
+            for (int j = 0; j < 32; j++) wc[j] = 0;
+        }
+        long arow = (long)row_in * in_f + (long)blk * 32;
+        i8v dotacc = {0,0,0,0,0,0,0,0};
+        for (int kt = 0; kt < 2; kt++) {
+            i4v a = load_a(qx, row_in, m, arow + kt * 16);
+            i4v b = pack16(wc + kt * 16);
+            dotacc = wmma_dot(a, b, dotacc);
+        }
+        for (int e = 0; e < 8; e++) {
+            int re = blockIdx.y * 16 + 2 * e + half;
+            float axs = (re < m) ? xs[(long)re * nblk + blk] : 0.0f;
+            acc[e] += axs * wsc * (float)dotacc[e];
+        }
+    }
+    for (int e = 0; e < 8; e++) {
+        int re = blockIdx.y * 16 + 2 * e + half;
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[e];
+    }
+}
+
+// ── Q4_K prefill: 256/super-block, 8 sub-blocks of 32 (= 2 K-tiles each), scale d·sc + min dmin·(−mm). ──
+extern "C" __global__ void wmma_i8_q4k(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    int m, int in_f, int out_f
+) {
+    int lane = threadIdx.x;
+    int half = lane >> 4;
+    int col = blockIdx.x * 16 + (lane & 15);
+    int row_in = blockIdx.y * 16 + (lane & 15);
+    int nblk = in_f >> 5;
+    int spr = nblk >> 3;              // super-blocks per output row
+    float acc[8]; for (int e = 0; e < 8; e++) acc[e] = 0.0f;
+    signed char wc[32];
+    const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101};
+    for (int blk = 0; blk < nblk; blk++) {
+        float wsc = 0.0f, wmn = 0.0f;
+        if (col < out_f) {
+            long super = (long)col * spr + (blk >> 3);
+            int s = blk & 7;
+            const unsigned char* b = w + super * 144;
+            float d = rf16b(b), dmin = rf16b(b + 2);
+            int sc, mm; k4(b + 4, s, &sc, &mm);
+            wsc = d * (float)sc;
+            wmn = dmin * (float)(-mm);
+            const unsigned char* qbase = (b + 16) + (s >> 1) * 32;
+            int hi = s & 1;
+            for (int p = 0; p < 32; p++)
+                wc[p] = (signed char)(hi ? (qbase[p] >> 4) : (qbase[p] & 0x0F));
+        } else {
+            for (int p = 0; p < 32; p++) wc[p] = 0;
+        }
+        long arow = (long)row_in * in_f + (long)blk * 32;
+        i8v dotacc = {0,0,0,0,0,0,0,0};
+        i8v sumacc = {0,0,0,0,0,0,0,0};
+        for (int kt = 0; kt < 2; kt++) {
+            i4v a = load_a(qx, row_in, m, arow + kt * 16);
+            i4v b = pack16(wc + kt * 16);
+            dotacc = wmma_dot(a, b, dotacc);
+            sumacc = wmma_dot(a, ones, sumacc);
+        }
+        for (int e = 0; e < 8; e++) {
+            int re = blockIdx.y * 16 + 2 * e + half;
+            float axs = (re < m) ? xs[(long)re * nblk + blk] : 0.0f;
+            acc[e] += axs * (wsc * (float)dotacc[e] + wmn * (float)sumacc[e]);
+        }
+    }
+    for (int e = 0; e < 8; e++) {
+        int re = blockIdx.y * 16 + 2 * e + half;
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[e];
+    }
+}
+
+// ── Q6_K prefill: 256/super-block, 16 sub-blocks of 16 (= 1 K-tile each), int8 scale, code 0..63. ──
+extern "C" __global__ void wmma_i8_q6k(
+    const signed char* __restrict__ qx,
+    const float* __restrict__ xs,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ dst,
+    int m, int in_f, int out_f
+) {
+    int lane = threadIdx.x;
+    int half = lane >> 4;
+    int col = blockIdx.x * 16 + (lane & 15);
+    int row_in = blockIdx.y * 16 + (lane & 15);
+    int nblk = in_f >> 5;
+    int spr = nblk >> 3;
+    int n16 = in_f >> 4;             // 16-element sub-blocks (one WMMA K-tile each)
+    float acc[8]; for (int e = 0; e < 8; e++) acc[e] = 0.0f;
+    signed char wc[16];
+    const i4v ones = {0x01010101, 0x01010101, 0x01010101, 0x01010101};
+    for (int sb = 0; sb < n16; sb++) {
+        int blk32 = sb >> 1;         // 32-block index → the activation scale block
+        float wsc = 0.0f, wmn = 0.0f;
+        if (col < out_f) {
+            long super = (long)col * spr + (blk32 >> 3);
+            int w32 = blk32 & 7;
+            int hh = sb & 1;
+            int sub16 = w32 * 2 + hh;    // 0..15 within the super-block
+            const unsigned char* b = w + super * 210;
+            const unsigned char* ql = b;
+            const unsigned char* qh = b + 128;
+            const signed char* scales = (const signed char*)(b + 192);
+            float d = rf16b(b + 208);
+            int sc = (int)scales[sub16];
+            wsc = d * (float)sc;
+            wmn = d * (float)(-32 * sc);
+            int within0 = sub16 * 16;
+            int h128 = within0 >> 7;
+            int o127 = within0 & 127;
+            int region = o127 >> 5;
+            int l0 = o127 & 31;
+            int qlo = h128 * 64, qho = h128 * 32;
+            for (int r = 0; r < 16; r++) {
+                int l = l0 + r;
+                int c;
+                if (region == 0)      c = (ql[qlo + l] & 0x0F)      | ((qh[qho + l] & 3) << 4);
+                else if (region == 1) c = (ql[qlo + 32 + l] & 0x0F) | (((qh[qho + l] >> 2) & 3) << 4);
+                else if (region == 2) c = (ql[qlo + l] >> 4)        | (((qh[qho + l] >> 4) & 3) << 4);
+                else                  c = (ql[qlo + 32 + l] >> 4)   | (((qh[qho + l] >> 6) & 3) << 4);
+                wc[r] = (signed char)c;
+            }
+        } else {
+            for (int r = 0; r < 16; r++) wc[r] = 0;
+        }
+        long koff = (long)row_in * in_f + (long)sb * 16;
+        i4v a = load_a(qx, row_in, m, koff);
+        i4v b = pack16(wc);
+        i8v dotacc = wmma_dot(a, b, (i8v){0,0,0,0,0,0,0,0});
+        i8v sumacc = wmma_dot(a, ones, (i8v){0,0,0,0,0,0,0,0});
+        for (int e = 0; e < 8; e++) {
+            int re = blockIdx.y * 16 + 2 * e + half;
+            float axs = (re < m) ? xs[(long)re * nblk + blk32] : 0.0f;
+            acc[e] += axs * (wsc * (float)dotacc[e] + wmn * (float)sumacc[e]);
+        }
+    }
+    for (int e = 0; e < 8; e++) {
+        int re = blockIdx.y * 16 + 2 * e + half;
+        if (re < m && col < out_f) dst[(long)re * out_f + col] = acc[e];
+    }
 }
 "#;
 

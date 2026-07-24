@@ -8,6 +8,7 @@ use crate::ffi::{self, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP
 use crate::kernels::Pipelines;
 use infr_core::backend::{
     Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan, ProgressScope,
+    COOPMAT_TILE_16,
 };
 use infr_core::error::{Error, Result};
 use infr_core::graph::Graph;
@@ -309,10 +310,12 @@ impl Backend for RocmBackend {
             // formats (Q4_K/Q6_K/Q8_0), quantizing the activation row to int8 and integer-dotting
             // (V_DOT4/`__builtin_amdgcn_sdot4`) against the native weight codes. These caps are
             // informational for the seam runner (it does not branch on them), but flipped to report
-            // the backend honestly. `coopmat_i8` stays None (WMMA int8 is Phase 5).
+            // the backend honestly. Phase 5: prefill (m>1) runs on the RDNA3 wave32 int8 matrix
+            // core (`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32`), so `coopmat_i8` reports the real
+            // 16×16×16 tile.
             i8: true,
             i8_dot: true,
-            coopmat_i8: None,
+            coopmat_i8: Some(COOPMAT_TILE_16),
             bf16: false,
             coopmat_bf16: None,
             subgroup_min: 0,

@@ -30,3 +30,10 @@ required-features = ["rocm"]
 name = "hiprtc_test"
 path = "examples/hiprtc_test.rs"
 required-features = ["rocm"]
+
+# Gated for the same reason as the others: defines its own HIP FFI and exercises
+# the RDNA3 WMMA matrix-core builtins (the Phase-5 de-risking probe).
+[[example]]
+name = "wmma_probe"
+path = "examples/wmma_probe.rs"
+required-features = ["rocm"]

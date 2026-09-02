@@ -9766,6 +9766,10 @@ mod kernel_tests {
     /// family `0.0` — those kernels are BIT-IDENTICAL to their scalar twins. `1e-5` is ~40x
     /// headroom over the worst, and mutation-checked: at `1e-9` the avx512bw arms fail, and
     /// scoring one format against another format's scalar kernel fails outright.
+    ///
+    /// Gated like the tests that read it: every SIMD tier compared here is an x86 one, so on
+    /// aarch64 this constant has no users and `-D dead_code` says so.
+    #[cfg(target_arch = "x86_64")]
     const TIER_TOL: f32 = 1e-5;
 
     #[cfg(target_arch = "x86_64")]

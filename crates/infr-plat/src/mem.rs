@@ -52,17 +52,10 @@ pub fn available() -> Option<Available> {
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let host = parse_mem_available(&text)?;
-        Some(match cgroup_headroom() {
-            Some(limited) if limited < host => Available {
-                bytes: limited,
-                source: Source::LinuxCgroupClamped,
-            },
-            _ => Available {
-                bytes: host,
-                source: Source::LinuxMemAvailable,
-            },
-        })
+        Some(apply_cgroup_clamp(
+            parse_mem_available(&text)?,
+            cgroup_headroom(),
+        ))
     }
     #[cfg(windows)]
     {
@@ -74,6 +67,27 @@ pub fn available() -> Option<Available> {
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         None
+    }
+}
+
+/// Pick between the host figure and a cgroup's headroom, and say which was taken.
+///
+/// Split out and pure because the alternative is comparing two separate reads of `MemAvailable`,
+/// which is a live number: it moves between them, so an equality assertion on it fails by a page
+/// at random. Here every case is reachable from a literal.
+#[cfg(any(target_os = "linux", test))]
+fn apply_cgroup_clamp(host: u64, cgroup: Option<u64>) -> Available {
+    // Only a limit that actually BINDS is reported as one — otherwise `LinuxCgroupClamped` would
+    // appear whenever a cgroup merely exists, which is always, and stop meaning anything.
+    match cgroup {
+        Some(limited) if limited < host => Available {
+            bytes: limited,
+            source: Source::LinuxCgroupClamped,
+        },
+        _ => Available {
+            bytes: host,
+            source: Source::LinuxMemAvailable,
+        },
     }
 }
 
@@ -223,26 +237,62 @@ mod tests {
         );
     }
 
-    /// The provenance must be a real answer rather than a constant: on a machine with no cgroup
-    /// cap the figure is the unclamped host one, and it agrees with what the file says.
+    /// Every branch of the clamp, from literals — including the two that are easy to get wrong:
+    /// a limit that does not bind must NOT be reported as a clamp, and an equal one is not a
+    /// clamp either.
+    #[test]
+    fn a_cgroup_limit_is_reported_only_when_it_binds() {
+        const HOST: u64 = 8 << 30;
+
+        assert_eq!(
+            apply_cgroup_clamp(HOST, None),
+            Available {
+                bytes: HOST,
+                source: Source::LinuxMemAvailable
+            }
+        );
+        assert_eq!(
+            apply_cgroup_clamp(HOST, Some(2 << 30)),
+            Available {
+                bytes: 2 << 30,
+                source: Source::LinuxCgroupClamped
+            },
+            "a binding limit wins, and says so"
+        );
+        assert_eq!(
+            apply_cgroup_clamp(HOST, Some(64 << 30)),
+            Available {
+                bytes: HOST,
+                source: Source::LinuxMemAvailable
+            },
+            "a limit above the host figure is not a clamp"
+        );
+        assert_eq!(
+            apply_cgroup_clamp(HOST, Some(HOST)),
+            Available {
+                bytes: HOST,
+                source: Source::LinuxMemAvailable
+            },
+            "an equal limit takes nothing away, so it is not a clamp either"
+        );
+    }
+
+    /// The live probe reports one of the Linux sources — not, say, the Windows one — and its
+    /// figure is the one its own source claims. Deliberately no equality against a second read of
+    /// `/proc/meminfo`: that number moves between reads.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_source_matches_the_figure() {
+    fn the_live_probe_reports_a_linux_source() {
         let got = available().expect("linux always has /proc/meminfo");
-        let host = parse_mem_available(&std::fs::read_to_string("/proc/meminfo").expect("meminfo"))
-            .expect("MemAvailable");
-        match got.source {
-            // Unclamped: the reported figure IS the host figure, not something else.
-            Source::LinuxMemAvailable => assert_eq!(got.bytes, host),
-            // Clamped: the clamp only ever binds downward.
-            Source::LinuxCgroupClamped => assert!(
-                got.bytes < host,
-                "a clamp that did not reduce the figure must not be reported as one: \
-                 {} vs host {host}",
-                got.bytes
+        assert!(
+            matches!(
+                got.source,
+                Source::LinuxMemAvailable | Source::LinuxCgroupClamped
             ),
-            other => panic!("linux must not report {other:?}"),
-        }
+            "linux must not report {:?}",
+            got.source
+        );
+        assert!(got.bytes > 0);
     }
 
     /// Every platform without a probe says so, rather than inventing a number.

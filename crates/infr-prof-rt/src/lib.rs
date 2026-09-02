@@ -564,7 +564,9 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
+        let recursion_started = std::time::Instant::now();
         rec(2);
+        let recursion_elapsed = recursion_started.elapsed().as_nanos() as u64;
 
         let (rows, _, _) = collect();
         let get = |n: &str| rows.iter().find(|r| r.name == format!("m::{n}")).unwrap();
@@ -578,9 +580,18 @@ mod tests {
         assert!(outer.self_ns < outer.total_ns);
         assert!(inner.total_ns >= 5_000_000);
         assert!(outer.total_ns >= inner.total_ns);
-        // recursion: inclusive total counted once at the outermost frame (~6ms, not ~12ms
-        // double-counted); self sums each level's own ~2ms.
-        assert!(rec.total_ns >= 6_000_000 && rec.total_ns < 11_000_000);
+        // Recursion: the inclusive total is counted ONCE at the outermost frame, so it can never
+        // exceed the wall time of the `rec(2)` call it nests inside. Counting each of the three
+        // levels would report about three times that. Bounding against the MEASURED elapsed time
+        // rather than a constant is what makes this hold on a loaded runner: a fixed ceiling is an
+        // assertion about how fast the machine sleeps, and `thread::sleep` overshoots freely.
+        assert!(
+            rec.total_ns <= recursion_elapsed,
+            "inclusive total {} ns exceeds the {} ns the call itself took — levels double-counted",
+            rec.total_ns,
+            recursion_elapsed
+        );
+        assert!(rec.total_ns >= 6_000_000);
         assert!(rec.self_ns >= 6_000_000 && rec.self_ns <= rec.total_ns);
     }
 

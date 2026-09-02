@@ -20,7 +20,7 @@
 //! so where the platforms genuinely differ, the difference is in the API or in the doc comment
 //! rather than sanded off:
 //!
-//! - [`mem::available_bytes`] is clamped by the cgroup limit on Linux, unclamped on Windows, and
+//! - [`mem::available`] is clamped by the cgroup limit on Linux, unclamped on Windows, and
 //!   absent on macOS — [`mem::Available`] reports which, because sizing an arena from an
 //!   unclamped figure inside a container is an OOM kill.
 //! - [`lock::FileLock`] is advisory on Unix and mandatory on Windows. It promises the weaker of

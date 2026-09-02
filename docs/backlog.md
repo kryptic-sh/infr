@@ -2704,6 +2704,25 @@ add the bound as an explicit `bail!` on the Rust side so a future ceiling is
 refused rather than silently exceeded. See [qwen38.md](qwen38.md) for the models
 that need it.
 
+### B70 — `cargo doc` does not build the workspace cleanly (2026-09-02)
+
+**Tag:** drive-by · **Blocked on:** nothing; it is a pile of small edits
+
+`RUSTDOCFLAGS='-D rustdoc::broken_intra_doc_links' cargo doc --workspace --no-deps`
+fails. 23 distinct unresolved links and 11 warnings about public documentation
+pointing at private items, spread across `infr-core`, `infr-cpu`, `infr-prof-rt`
+and `infr-vulkan` — `infr_core::prof::OpProf`, `Backend::submit_dispatch_cap`,
+`TensorKind::Input`, several `KernelCache::*`, and a handful of bare
+`[16]`/`[32]`/`[64]` that are array sizes rustdoc read as links.
+
+None of it affects compilation and none is in `infr-plat`, which builds clean
+under that flag — this was found while checking that the new crate's docs
+resolve. Recorded rather than fixed because it is unrelated to the platform seam
+and would have made that diff much larger.
+
+Worth pairing with a CI job once the links are fixed, since nothing currently
+stops the next one being added.
+
 ### B68 — the Metal backend is gated on the host OS, not on itself (2026-09-02)
 
 **Tag:** infr-plat residual · **Blocked on:** a decision between the two options

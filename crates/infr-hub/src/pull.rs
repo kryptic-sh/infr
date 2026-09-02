@@ -14,6 +14,7 @@ use indicatif::MultiProgress;
 use infr_core::config::Config;
 use infr_core::error::{Error, Result};
 use infr_core::progress;
+use infr_plat::link::link_blob;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     fs,
@@ -281,30 +282,6 @@ pub(crate) fn blob_link_target(rel: &str, hex: &str) -> String {
     target.push_str("blobs/");
     target.push_str(hex);
     target
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn link_blob(target: impl AsRef<Path>, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn link_blob(target: impl AsRef<Path>, link: &Path) -> std::io::Result<()> {
-    let target = target.as_ref();
-    match std::os::windows::fs::symlink_file(target, link) {
-        Ok(()) => Ok(()),
-        Err(symlink_err) => {
-            let source = link.parent().unwrap_or_else(|| Path::new("")).join(target);
-            fs::hard_link(&source, link).map_err(|hard_link_err| {
-                std::io::Error::new(
-                    hard_link_err.kind(),
-                    format!(
-                        "symlink_file {link:?} -> {target:?} failed: {symlink_err}; hard_link fallback from {source:?} failed: {hard_link_err}"
-                    ),
-                )
-            })
-        }
-    }
 }
 
 /// True when `name` may be `join`ed onto a local directory without escaping it: non-empty, relative,

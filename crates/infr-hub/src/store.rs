@@ -312,7 +312,7 @@ mod tests {
         fs::write(blobs.join(sha), b"fake gguf bytes").unwrap();
         let link = snap.join(file);
         fs::create_dir_all(link.parent().unwrap()).unwrap();
-        crate::pull::link_blob(crate::pull::blob_link_target(file, sha), &link).unwrap();
+        infr_plat::link::link_blob(crate::pull::blob_link_target(file, sha), &link).unwrap();
         fs::create_dir_all(dir.join("refs")).unwrap();
         fs::write(dir.join("refs").join("main"), commit).unwrap();
     }

@@ -29,5 +29,6 @@
 //!   than misreporting a live process as dead.
 
 pub mod fileio;
+pub mod link;
 pub mod paths;
 pub mod proc;

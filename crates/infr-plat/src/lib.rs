@@ -29,3 +29,4 @@
 //!   than misreporting a live process as dead.
 
 pub mod paths;
+pub mod proc;

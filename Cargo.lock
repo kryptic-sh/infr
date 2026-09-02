@@ -1171,7 +1171,6 @@ dependencies = [
  "infr-plat",
  "infr-prof",
  "infr-prof-rt",
- "libc",
  "tempfile",
  "thiserror 2.0.18",
  "toml",

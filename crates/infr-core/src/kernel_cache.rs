@@ -78,6 +78,7 @@
 //! is a TOTAL no-op: it never creates the cache directory,
 //! never reads, never writes, never sweeps. Every method returns the miss/OK answer immediately.
 
+use infr_plat::proc::pid_alive;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -130,27 +131,6 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
 /// `$HOME` resolution — the part that was Unix-only — lives in one place.
 pub fn cache_dir() -> Option<PathBuf> {
     infr_plat::paths::cache_dir()
-}
-
-/// Is `pid` still running? `kill(pid, 0)` delivers no signal and only asks the kernel whether the
-/// process exists: `Ok` = alive, `EPERM` = alive but not ours (a foreign process reusing the pid —
-/// treat as alive, i.e. do NOT discard the cache on it), anything else (`ESRCH`) = gone.
-#[cfg(unix)]
-fn pid_alive(pid: i32) -> bool {
-    // SAFETY: `kill` with signal 0 performs only an existence/permission check.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// Without a cheap liveness probe the tripwire cannot tell a corpse from a concurrent run, and
-/// guessing WRONG discards a live process's cache. Report "alive" — the sweep then never fires,
-/// which loses the tripwire but never misbehaves. (No such target ships today; this keeps
-/// `infr-core` buildable everywhere.)
-#[cfg(not(unix))]
-fn pid_alive(_pid: i32) -> bool {
-    true
 }
 
 /// One persisted compiled-artifact file: where it lives, what key it must match, and this

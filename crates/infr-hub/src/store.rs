@@ -59,6 +59,23 @@ fn hub_dir(
     Some(cache_home?.join("huggingface").join("hub"))
 }
 
+/// The OS-native cache an older infr may have written, or `None` to stay on `standard`.
+///
+/// Split out of `Store::legacy_hub_dir` so the decision is testable from literals: it takes the
+/// OS-native base rather than reading it, and does no logging.
+fn legacy_redirect(
+    standard: &Path,
+    named_by_env: bool,
+    os_cache_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if named_by_env || standard.exists() {
+        return None;
+    }
+    os_cache_home
+        .map(|b| b.join("huggingface").join("hub"))
+        .filter(|p| p != standard && p.is_dir())
+}
+
 impl Store {
     /// Locate the Hugging Face hub cache, agreeing with `huggingface_hub` on every platform:
     /// `$HF_HUB_CACHE`, else `$HUGGINGFACE_HUB_CACHE`, else `$HF_HOME/hub`, else
@@ -75,15 +92,24 @@ impl Store {
     /// A cache an older infr left in the OS-native location is still honoured when the standard
     /// one does not exist yet — see `Self::legacy_hub_dir`.
     pub fn discover() -> Result<Self> {
+        let hf_hub_cache = std::env::var_os("HF_HUB_CACHE");
+        let legacy_var = std::env::var_os("HUGGINGFACE_HUB_CACHE");
+        let hf_home = std::env::var_os("HF_HOME");
+        // A variable that NAMES a cache is the user's answer, and the migration below must not
+        // second-guess it — pointing `HF_HOME` at an empty directory means "use this one", not
+        // "go and find my old one".
+        let named_by_env = [&hf_hub_cache, &legacy_var, &hf_home]
+            .iter()
+            .any(|v| v.as_ref().is_some_and(|s| !s.is_empty()));
         let hub = hub_dir(
-            std::env::var_os("HF_HUB_CACHE"),
-            std::env::var_os("HUGGINGFACE_HUB_CACHE"),
-            std::env::var_os("HF_HOME"),
+            hf_hub_cache,
+            legacy_var,
+            hf_home,
             infr_plat::paths::cache_home(),
         )
         .ok_or_else(|| Error::Other("cannot determine cache directory".into()))?;
         Ok(Store {
-            hub: Self::legacy_hub_dir(hub),
+            hub: Self::legacy_hub_dir(hub, named_by_env),
         })
     }
 
@@ -95,13 +121,9 @@ impl Store {
     /// without looking would leave those models on disk, unseen, and re-download them. The
     /// redirect is one-way and conditional, so a fresh install and anyone already on the standard
     /// path are unaffected, and it disappears by itself once the standard directory exists.
-    fn legacy_hub_dir(standard: PathBuf) -> PathBuf {
-        if standard.exists() {
-            return standard;
-        }
-        let Some(legacy) = infr_plat::paths::os_cache_home()
-            .map(|b| b.join("huggingface").join("hub"))
-            .filter(|p| *p != standard && p.is_dir())
+    fn legacy_hub_dir(standard: PathBuf, named_by_env: bool) -> PathBuf {
+        let Some(legacy) =
+            legacy_redirect(&standard, named_by_env, infr_plat::paths::os_cache_home())
         else {
             return standard;
         };
@@ -604,6 +626,36 @@ mod tests {
                 store.hub,
             );
         }
+    }
+
+    /// The one-way migration is a guess about where an OLD infr left files, so it applies only
+    /// when nothing else answered the question. A variable naming a cache IS an answer — pointing
+    /// `HF_HOME` at an empty directory must use that directory, not go hunting for the old one.
+    #[test]
+    fn an_env_named_cache_beats_the_legacy_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let os_cache = tmp.path().join("os");
+        fs::create_dir_all(os_cache.join("huggingface").join("hub")).unwrap();
+        let standard = tmp.path().join("fresh").join("huggingface").join("hub");
+        assert!(
+            !standard.exists(),
+            "the standard location must not exist yet"
+        );
+
+        assert_eq!(
+            legacy_redirect(&standard, false, Some(os_cache.clone())),
+            Some(os_cache.join("huggingface").join("hub")),
+            "with nothing else naming a cache, the old one is honoured"
+        );
+        assert_eq!(
+            legacy_redirect(&standard, true, Some(os_cache.clone())),
+            None,
+            "an env-named cache is the answer; do not redirect off it"
+        );
+        // And the migration retires itself: once the standard directory exists it is never
+        // consulted, whatever is left in the OS-native one.
+        fs::create_dir_all(&standard).unwrap();
+        assert_eq!(legacy_redirect(&standard, false, Some(os_cache)), None);
     }
 
     #[test]

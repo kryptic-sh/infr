@@ -17,14 +17,19 @@ env:
   # to surface upstream incompatibility early. Mirrors the krypt / tikr baseline.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
-# Mostly Linux: infr is a Vulkan-first engine. `glslc` (shaderc) compiles the
-# compute shaders at build time, and the dp4a shaders need a recent glslc
-# (GL_EXT_integer_dot_product) — Ubuntu 24.04 ships shaderc 2023.8 which is too
-# old, so we pin ubuntu-26.04 (shaderc 2025+). The GPU integration tests are
-# #[ignore]'d (they need a real Vulkan device); CI builds + runs the CPU suite.
-# ash loads Vulkan at runtime via dlopen, so no libvulkan is needed to build.
-# The `test-macos` job additionally builds on Apple Silicon and runs the
-# reference Metal backend's parity suite against a real Metal device.
+# infr builds on Linux, macOS and Windows, and `clippy` + `test` run natively on
+# all three (see `docs/ci-matrix.md`). Every runner needs `glslc` — shaderc's GLSL
+# compiler — because `infr-vulkan/build.rs` compiles the compute shaders to SPIR-V
+# at build time with no prebuilt fallback; `.github/actions/install-glslc` is the
+# one place that knows how per platform. ash dlopens Vulkan at runtime, so no
+# libvulkan is needed to BUILD, and the GPU integration tests are `#[ignore]`d
+# (they need a real device) — CI runs the CPU suite.
+#
+# What stays single-platform, and why: `cpu-goldens` asserts exact-token hashes
+# that are not reproducible across CPU microarchitectures (commit 273f8d4), so
+# fanning it out would multiply a known-flaky check; `build` is a release-profile
+# smoke test the matrix already covers in debug; `test-macos` runs the Metal
+# parity suite, which needs a real Metal device and `--include-ignored`.
 
 jobs:
   fmt:
@@ -41,12 +46,16 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: cargo clippy
-    runs-on: ubuntu-26.04
+    name: cargo clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform's lint failure must not hide the other two's.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-15, windows-2025]
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/install-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -57,12 +66,15 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    name: cargo test
-    runs-on: ubuntu-26.04
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-15, windows-2025]
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/install-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -102,8 +114,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/install-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -133,8 +144,7 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/install-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -149,21 +159,21 @@ jobs:
   # jobs skip (they never build `infr-metal`). Catches Op-signature drift before
   # the expensive `test-macos` runner. Drop this job if it ever proves flaky.
   metal-check:
-    name: cargo check (infr-metal, Apple target)
+    name: cargo clippy (infr-metal, Apple target)
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: sudo apt-get update && sudo apt-get install -y glslc
+      - uses: ./.github/actions/install-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           target: aarch64-apple-darwin
+          components: clippy
           cache: false
       - run: rustup update --no-self-update stable
       - run: rustup target add aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p infr-metal --all-targets --locked --target aarch64-apple-darwin
+      - run: cargo clippy -p infr-metal --all-targets --locked --target aarch64-apple-darwin -- -D warnings
 
   # macOS / Metal: the Linux jobs above never build `infr-metal` (it is
   # `#![cfg(target_os = "macos")]`). This job builds the workspace on an
@@ -180,8 +190,7 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
-      - name: Install glslc (shaderc)
-        run: brew install shaderc
+      - uses: ./.github/actions/install-glslc
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable

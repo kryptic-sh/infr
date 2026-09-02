@@ -1,4 +1,16 @@
 # Build for the host CPU so the scalar dequant/matvec loops autovectorize to AVX2/AVX-512
 # (the CPU backend leans on this; the binary is then specific to this machine's ISA).
-[build]
+#
+# Keyed on the dev/CI Linux triple rather than set under `[build]`, because `[build]
+# rustflags` reaches cross-target builds too — and there `target-cpu=native` names the
+# HOST's CPU, which the cross compiler rejects: `cargo check --target
+# aarch64-apple-darwin` then emits a wall of "'znver5' is not a recognized processor for
+# this target" that buries the real diagnostics.
+#
+# Deliberately NOT repeated for `aarch64-apple-darwin` / `x86_64-pc-windows-*`: a
+# `[target.<triple>]` table applies whenever that triple is the BUILD target, so an
+# Apple arm would fire on the Linux → Apple cross-lint and put the noise straight back.
+# Native macOS and Windows runners give up `target-cpu=native` as the price; neither
+# measures performance.
+[target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=native"]

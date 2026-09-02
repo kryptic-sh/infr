@@ -1,0 +1,42 @@
+name: Install glslc
+description: >
+  Put `glslc` on PATH. `infr-vulkan/build.rs` shells out to it for every compute
+  shader, with no prebuilt-SPIR-V fallback, so it is a hard build requirement on
+  every platform — not a Vulkan-runtime concern.
+
+runs:
+  using: composite
+  steps:
+    # Ubuntu 24.04 ships shaderc 2023.8, which predates GL_EXT_integer_dot_product
+    # and cannot compile the dp4a shaders; ubuntu-26.04 carries shaderc 2025+.
+    - name: Install glslc (apt)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y glslc
+
+    - name: Install glslc (Homebrew)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install shaderc
+
+    # No standalone shaderc package on Windows; glslc ships inside the Vulkan SDK,
+    # whose installer does not add its Bin directory to PATH.
+    - name: Install glslc (Vulkan SDK)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        choco install vulkan-sdk --no-progress -y
+        $bin = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
+          Sort-Object Name -Descending |
+          ForEach-Object { Join-Path $_.FullName 'Bin' } |
+          Where-Object { Test-Path (Join-Path $_ 'glslc.exe') } |
+          Select-Object -First 1
+        if (-not $bin) { throw 'glslc.exe not found under C:\VulkanSDK' }
+        Add-Content -Path $env:GITHUB_PATH -Value $bin
+
+    # An install step that quietly no-ops would surface as an inscrutable build.rs
+    # panic several minutes later, on whichever job happened to build infr-vulkan
+    # first. Fail here instead, where the message names the cause.
+    - name: Verify glslc is on PATH
+      shell: bash
+      run: glslc --version

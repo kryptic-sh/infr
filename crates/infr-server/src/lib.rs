@@ -3,14 +3,14 @@
 //! Reference for the wire mapping (streaming, `reasoning_content`, tool_calls): the working
 //! shim at `~/Projects/scratch/dgemma-openai-server.py`. See docs/plan.md "server".
 //!
-//! Routes (`auth` = gated by `serve.api_key` when one is configured — see [`auth_gate`]):
+//! Routes (`auth` = gated by `serve.api_key` when one is configured — see `auth_gate`):
 //!   GET  /health                -> 200 OK                                              (open)
 //!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
-//! (tokens — see [`clamp_max_tokens`]) and `serve.request_timeout_secs` (wall clock — see
-//! [`request_timeout`]). Both are `serve.*` config, never read from the environment here.
+//! (tokens — see `clamp_max_tokens`) and `serve.request_timeout_secs` (wall clock — see
+//! `request_timeout`). Both are `serve.*` config, never read from the environment here.
 //!
 //! Delta mapping:
 //!   `Delta::Reasoning`  -> `delta.reasoning_content`
@@ -131,7 +131,7 @@ pub struct ChatRequest {
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
     /// OpenAI `tool_choice`: `"auto"` | `"required"` | `"none"` | `{"type":"function","function":
-    /// {"name":..}}`. Normalised to a string (the function name for a named choice) by [`tool_choice_str`].
+    /// {"name":..}}`. Normalised to a string (the function name for a named choice) by `tool_choice_str`.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
     #[serde(default)]
@@ -1060,7 +1060,7 @@ impl ModelEntry {
     }
 }
 
-/// Shared server state — a non-empty, ordered set of hosted [`ModelEntry`]s. A request is routed to
+/// Shared server state — a non-empty, ordered set of hosted `ModelEntry`s. A request is routed to
 /// the entry whose `id` matches its `model` field; an unknown/empty `model` falls to the DEFAULT
 /// (the first entry). The single-model server is just the one-entry case, so its behaviour — and the
 /// hot path — is byte-identical to before this became multi-model.
@@ -1189,7 +1189,7 @@ pub async fn serve(
 /// host (`infr multi`): each generator can be pinned to a different physical GPU, and the server
 /// dispatches a request to the generator for the model it names. Graceful shutdown drains EVERY
 /// model's in-flight requests before any backend drops (the axum layer stops accepting, then each
-/// generation returns at its next abort poll — see [`shutdown_latched`]); when `serve_multi`
+/// generation returns at its next abort poll — see `shutdown_latched`); when `serve_multi`
 /// returns, the runtime drops and every backend's device is destroyed in turn.
 pub async fn serve_multi(
     entries: Vec<(String, Arc<dyn ChatGenerator>, usize)>,

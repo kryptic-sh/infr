@@ -6,7 +6,7 @@
 //! # Data path — host-LESS P2P dma-buf
 //!
 //! Each rank `p` publishes its partial into an EXPORTED device-local buffer `E_p`
-//! ([`VulkanBackend::p2p_export`]); every other rank imports `E_p` ([`p2p_import`]) so it can read
+//! ([`VulkanBackend::p2p_export`]); every other rank imports `E_p` ([`VulkanBackend::p2p_import`]) so it can read
 //! `p`'s VRAM directly over PCIe (no host bounce — the campaign measured 12.9-27.2 GB/s vs 3.82
 //! host-bounce). A rank then copies each peer's published partial into a local scratch and sums
 //! `own + Σ peers` with an on-device `Op::Add` chain. The reduction is a FIXED rank-order sum, so it
@@ -153,7 +153,7 @@ impl AllReduce {
     /// Build the all-reduce transport over `ranks` for a boundary of `bytes` bytes in `dtype`. Sets
     /// up the P2P export/import ring (when every rank supports dma-buf and `use_p2p`) + per-rank
     /// scratches + the per-rank Add-chain reduce plan. `dtype` MUST be f32 (the reduce Add is f32);
-    /// any other boundary is rejected up front by [`allreduce_elems`].
+    /// any other boundary is rejected up front by `allreduce_elems`.
     pub fn new(ranks: &[VulkanBackend], bytes: usize, dtype: DType, use_p2p: bool) -> Result<Self> {
         let w = ranks.len();
         let elems = allreduce_elems(bytes, dtype)?;

@@ -16,7 +16,7 @@
 //!
 //! Three layers enforce that, and a fourth catches what none of them can:
 //!
-//! - **The KEY.** [`open`](KernelCache::open) takes an opaque byte string that is compared
+//! - **The KEY.** `open` (`KernelCache::open`) takes an opaque byte string that is compared
 //!   VERBATIM on load. The caller folds in everything that would make an old artifact wrong:
 //!   Vulkan carries `driverVersion ++ pipelineCacheUUID ++ SHADER_SET_FINGERPRINT`. A mismatch
 //!   discards the file WHOLESALE, which is also why the key is not a hash we compute for the
@@ -28,13 +28,13 @@
 //! - **The CHECKSUM.** FNV-1a over the payload, verified on load, because `rename` is atomic only
 //!   with respect to a concurrent READER: on a crash/power-loss it can publish a name over data
 //!   blocks that were never flushed (ext4 delayed allocation), i.e. a valid-looking file over
-//!   garbage. [`store`](KernelCache::store) `fsync`s to keep that from happening at all; the
+//!   garbage. `store` (`KernelCache::store`) `fsync`s to keep that from happening at all; the
 //!   checksum is what catches it if it happens anyway.
 //! - **The TRIPWIRE** — see below.
 //!
 //! # Durability
 //!
-//! [`store`](KernelCache::store) writes to a UNIQUE per-save temp path (`<path>.tmp.<pid>.<seq>`,
+//! `store` (`KernelCache::store`) writes to a UNIQUE per-save temp path (`<path>.tmp.<pid>.<seq>`,
 //! from a monotonic per-process counter, so two concurrent saves never share a path and neither
 //! clobbers the other's in-flight bytes), `fsync`s the file, `rename`s it over the target, then
 //! `fsync`s the DIRECTORY so the new entry survives a crash too.
@@ -52,9 +52,9 @@
 //! same dirty-bit trick a filesystem uses:
 //!
 //! 1. When a run seeds a driver from a loaded blob, drop a marker file next to it
-//!    ([`load`](KernelCache::load) arms it BEFORE returning the payload, so a hang in the very call
+//!    (`load` / `KernelCache::load` arms it BEFORE returning the payload, so a hang in the very call
 //!    that consumes it is still attributable).
-//! 2. On a clean exit, delete the marker ([`disarm`](KernelCache::disarm)).
+//! 2. On a clean exit, delete the marker (`disarm` / `KernelCache::disarm`).
 //! 3. If a marker from a DEAD process is found at startup, that run seeded from this blob and then
 //!    died without a clean exit. The blob is not trustworthy: delete it and recompile.
 //!
@@ -69,7 +69,7 @@
 //! Markers are keyed PER-INSTANCE (`<path>.seeded.<pid>-<nonce>`) and a marker is only stale if its
 //! PROCESS is GONE, so neither a second `infr` running concurrently (a `serve` alongside a CLI run)
 //! NOR a sibling backend in the same process (an MTP bench loop, a Vulkan+CPU parity run) is
-//! mistaken for a crashed one — and one instance's clean [`disarm`](KernelCache::disarm) only
+//! mistaken for a crashed one — and one instance's clean `disarm` (`KernelCache::disarm`) only
 //! removes ITS OWN marker, never a live sibling's.
 //!
 //! # Disabled

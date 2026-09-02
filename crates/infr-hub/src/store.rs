@@ -73,7 +73,7 @@ impl Store {
     /// `huggingface_hub/constants.py`).
     ///
     /// A cache an older infr left in the OS-native location is still honoured when the standard
-    /// one does not exist yet — see [`Self::legacy_hub_dir`].
+    /// one does not exist yet — see `Self::legacy_hub_dir`.
     pub fn discover() -> Result<Self> {
         let hub = hub_dir(
             std::env::var_os("HF_HUB_CACHE"),
@@ -122,10 +122,10 @@ impl Store {
     }
 
     /// Resolve a cached GGUF for `repo` selecting `sel` (a quant like `Q4_K_M`, or an explicit
-    /// `*.gguf` filename; `None` → [`DEFAULT_QUANT`]). Uses the SAME selection routine as the
-    /// download path ([`pick_gguf`]) so a repo that downloaded once is judged cached on the next
+    /// `*.gguf` filename; `None` → `DEFAULT_QUANT`). Uses the SAME selection routine as the
+    /// download path (`pick_gguf`) so a repo that downloaded once is judged cached on the next
     /// run (a divergence otherwise re-pulls multi-GB every invocation). Snapshots are tried in
-    /// [`refs/main`][Self::ordered_snapshots] order first. A sharded GGUF only counts as cached when
+    /// `refs/main` (`Self::ordered_snapshots`) order first. A sharded GGUF only counts as cached when
     /// the WHOLE shard set is present (a lone shard 1 fails at load), and its blobs must not be
     /// dangling (garbage-collected).
     pub fn resolve_repo(&self, repo: &str, sel: Option<&str>) -> Option<PathBuf> {

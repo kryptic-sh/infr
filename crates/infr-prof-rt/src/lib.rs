@@ -20,7 +20,7 @@
 //!
 //! It ALSO hosts the process-wide **per-op device aggregate** ([`gpu_add`] / [`gpu_reset`]): every
 //! backend's per-op profiler folds its per-forward/per-submit rows in here through the shared
-//! reporter ([`infr_core::prof::OpProf`]), and the exit report prints them as a separate device
+//! reporter (`infr_core::prof::OpProf`), and the exit report prints them as a separate device
 //! section (and a `"gpu"` array in the `INFR_PROF_OUT` JSON). This path is runtime-gated
 //! (`INFR_PROF_OPS` / `INFR_PROF_OPS`, via `prof.per_op()`), not build-gated — in a default build with
 //! the knob set, the exit report contains only the device section; in an `INFR_PROFILE=1` build it
@@ -201,7 +201,7 @@ static GPU: Mutex<Vec<(String, f64, u64)>> = Mutex::new(Vec::new());
 /// report (idempotent) so a default build with only the runtime knob set still prints the
 /// aggregate.
 ///
-/// Call this through [`infr_core::prof::OpProf::flush`], not directly — that is what keeps every
+/// Call this through `infr_core::prof::OpProf::flush`, not directly — that is what keeps every
 /// backend's label grammar, sort order and units consistent.
 pub fn gpu_add(label: &str, us: f64, count: u64) {
     let _ = global(); // ensure the atexit report hook exists
@@ -230,7 +230,7 @@ pub fn gpu_reset() {
 /// joins the parallel region, so its writes happen-before the workers' reads.
 static PROFILING_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 
-/// Set the [`PROFILING_SUPPRESSED`] flag, returning the PRIOR value so the caller can restore it
+/// Set the `PROFILING_SUPPRESSED` flag, returning the PRIOR value so the caller can restore it
 /// (supports nesting). See [`profiling_suppressed`].
 pub fn set_profiling_suppressed(v: bool) -> bool {
     PROFILING_SUPPRESSED.swap(v, Relaxed)

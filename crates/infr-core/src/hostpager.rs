@@ -8,10 +8,10 @@
 //! must not serialize against each other or against a fill.
 //!
 //! # Soundness
-//! One `Mutex` guards ALL residency state (the [`Pager`], the per-block [`SlotState`]); the arena
+//! One `Mutex` guards ALL residency state (the [`Pager`], the per-block `SlotState`); the arena
 //! bytes are outside it, reached only through raw pointers under these rules:
 //!
-//! - **A slot is written only by the thread that put its block into [`SlotState::Loading`]**, which
+//! - **A slot is written only by the thread that put its block into `SlotState::Loading`**, which
 //!   happens under the lock, on a miss, for a block that thread has just pinned. A pinned block
 //!   cannot be evicted, so no other thread can be handed the same slot meanwhile.
 //! - **A slot is read only through a [`Pin`]**, which exists only for a block that is `Ready` and
@@ -453,7 +453,7 @@ impl HostPager {
     ///   copied out. The arena fills once;
     /// - otherwise: read STRAIGHT into `dst`, residency untouched.
     ///
-    /// The "has missed before" condition is the admission doorkeeper ([`Inner::missed_once`]) and it
+    /// The "has missed before" condition is the admission doorkeeper (`Inner::missed_once`) and it
     /// is what keeps the arena from filling with the tier above's permanently-resident prefix.
     ///
     /// That last case is why this exists. Admitting by eviction would spend the copy AND evict a

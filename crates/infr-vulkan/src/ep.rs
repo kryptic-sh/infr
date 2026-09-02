@@ -48,7 +48,7 @@
 //! long as `W | n_expert`, experts RESIDENT (no pager) on each rank. Deferred: shared-expert
 //! placement (qwen35moe / llama4 `MoeSharedExpertAdd`), the paged expert path, DeltaNet-MoE /
 //! gemma4-MoE / Scout, and compute/comms overlap. The GPU-resident decode-replay / embed-gather /
-//! gpu-sample fast paths are turned OFF via [`capabilities`] so the runner takes the static
+//! gpu-sample fast paths are turned OFF via [`infr_core::backend::Backend::capabilities`] so the runner takes the static
 //! host-embed + host-sample per-token `execute` path (keeps the residual `hidden` a bound Input the
 //! segment executor hands through) — the same lever pipeline/TP use.
 

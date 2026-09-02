@@ -1272,7 +1272,7 @@ fn read_line_interruptible(line: &mut String) -> anyhow::Result<usize> {
     Ok(buf.len())
 }
 
-/// Run one chat turn through the shared [`Chat`]: stream pieces via the `<think>` renderer, then
+/// Run one chat turn through the shared [`infr_llama::chat::Chat`]: stream pieces via the `<think>` renderer, then
 /// print the prefill/decode stats line. `visual: Some` (diffusion-gemma, `INFR_DIFFUSION_VISUAL`
 /// set, stdout a tty) drives the turn through `turn_with_step_hook` instead, so the live canvas
 /// view redraws in a reserved terminal region while a block denoises; `None` is the exact
@@ -1365,7 +1365,7 @@ use std::io::{IsTerminal, Write as _};
 /// `INFR_DIFFUSION_VISUAL` live denoise canvas view for `infr run` (diffusion-gemma only — see
 /// `docs/diffusion-gemma.md`, ports the UX idea of the oracle's `--diffusion-visual` without
 /// depending on it): per step, decode the block's CURRENT canvas fresh with a throwaway tokenizer
-/// ([`OaiRenderer::decode_ids`] — cheap, ≤ canvas_len tokens, no GPU work), render accepted
+/// ([`infr_llama::chat::OaiRenderer::decode_ids`] — cheap, ≤ canvas_len tokens, no GPU work), render accepted
 /// (committed) runs as normal text and not-yet-accepted (still renoising — this sampler has no
 /// literal mask token, see `crate::diffusion`'s module doc) runs as a dim `·` placeholder, and
 /// redraw a fixed-height region in place (cursor-up + erase, DEC synchronized-update framing) so
@@ -1629,12 +1629,12 @@ fn metal_chat_model(
     }
 }
 
-/// Serve adapter for the seam-backed [`ChatModel`]s (qwen35 on any backend, dense/MoE on the
+/// Serve adapter for the seam-backed [`infr_llama::chat::ChatModel`]s (qwen35 on any backend, dense/MoE on the
 /// Vulkan seam or the CPU/Metal reference): renders the FULL OpenAI conversation — including tool
 /// specs and prior tool calls/results — through the model's own chat template
 /// (`infr_chat::render_chat_oai`, model-independent), generates through the SAME `ChatModel`
 /// primitive `infr run`/`bench` drive (persistent session ⇒ per-request suffix-only prefill), and
-/// streams through the same [`ChatStream`] splitter (reasoning/content/auto-parsed tool calls).
+/// streams through the same `ChatStream` splitter (reasoning/content/auto-parsed tool calls).
 /// Grammar-FORCED tool_choice builds an llguidance constraint and generates through
 /// `generate_constrained` (llama.cpp-parity reliability); auto/none stream through the parser.
 /// SERIALISED: the backend is a `&mut`-only `ChatModel` with a single KV session, so concurrent
@@ -4018,7 +4018,7 @@ fn parse_model_spec(spec: &str) -> anyhow::Result<(&str, Option<usize>)> {
 
 /// `infr multi` — host several models at once, each pinned to a physical GPU, on ONE OpenAI server
 /// routed by model name. Data-parallel multi-device serving (Slice 1 of the multi-GPU campaign):
-/// each model is a self-contained concurrent-slot [`ParallelSeam`] on its OWN backend/device
+/// each model is a self-contained concurrent-slot [`infr_llama::parallel::ParallelSeam`] on its OWN backend/device
 /// (`new_on`), so nothing crosses devices; the server dispatches a request to the generator for the
 /// model it names. Graceful shutdown drains EVERY device (the server aborts all in-flight requests,
 /// then each generator — and its backend — drops as `serve_multi` returns).

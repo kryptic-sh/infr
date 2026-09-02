@@ -23,7 +23,7 @@ impl Default for Sampler {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Sampler {
-    /// The process-default sampler, read from the resolved [`SamplingCfg`] — the seam paths'
+    /// The process-default sampler, read from the resolved [`infr_core::config::SamplingCfg`] — the seam paths'
     /// sampling config (the bespoke path plumbs the same values through `Llama::set_sampling`).
     ///
     /// Was `Sampler::from_env()` until S4 (`docs/config-plan.md` §5.1). Its doc CONTRACT is

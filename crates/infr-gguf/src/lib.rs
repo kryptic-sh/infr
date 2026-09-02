@@ -414,7 +414,7 @@ fn tensor_nbytes(dtype: DType, numel: usize) -> usize {
 /// number of blocks). Public helper so backends can size a block-aligned prefix (e.g. a quantized
 /// KV cache: dequant only the first `kv_len` rows).
 ///
-/// This is the second entry point into [`tensor_nbytes`] — the first being tensor sizing in
+/// This is the second entry point into `tensor_nbytes` — the first being tensor sizing in
 /// [`Gguf::open`], which REJECTS a misaligned `numel` outright. This one cannot: its callers pass a
 /// prefix length they computed themselves, so there is no tensor name to name and no `Result` in
 /// the signatures of the CPU kernels that call it (`kvquant::quantize_row`, the KV dequant prefix

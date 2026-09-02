@@ -109,15 +109,15 @@ pub struct HyperGates {
 /// How a tensor handle is provisioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorKind {
-    /// Per-step input bound at execute time via [`Bindings`] (e.g. the embedded hidden state,
+    /// Per-step input bound at execute time via [`crate::backend::Bindings`] (e.g. the embedded hidden state,
     /// position ids, the KV cache). The backend does NOT allocate these.
     Input,
-    /// Model weight bound from the loader via [`Bindings`]. Read-only.
+    /// Model weight bound from the loader via [`crate::backend::Bindings`]. Read-only.
     Weight,
     /// Backend-allocated scratch / activation, lives for the duration of one execute.
     Internal,
     /// An [`Internal`](TensorKind::Internal) tensor whose final value is read back by the caller
-    /// (collected into [`Bindings::outputs`] after execute).
+    /// (collected into `Bindings::outputs` after execute).
     Output,
 }
 

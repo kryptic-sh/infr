@@ -12,7 +12,7 @@ use anyhow::Result;
 /// This is the default `infr run`/`infr serve` path for EVERY arch including qwen35 (Phase 3
 /// cutover — see the matching comment at both CLI call sites), so it's also where MTP mode
 /// (issue #33, `docs/mtp.md`) lives: `mtp_head` is `Some` once resolved+loaded, built lazily on
-/// the first [`generate`](ChatModel::generate) call when [`wants_mtp`](Self::wants_mtp) is true
+/// the first [`generate`](ChatModel::generate) call when `wants_mtp` (`Self::wants_mtp`) is true
 /// (opt-in `INFR_MTP=1`, and only for a qwen35 GGUF that actually ships an MTP head —
 /// `Config::n_layer_nextn`'s doc). `INFR_MTP` unset/`0`, or a GGUF without an MTP head:
 /// `wants_mtp` is always false, `mtp_head` stays `None` forever, and `generate` takes the EXACT

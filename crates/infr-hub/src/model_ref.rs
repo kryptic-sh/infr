@@ -15,8 +15,8 @@ pub enum ModelRef {
 }
 
 impl ModelRef {
-    /// Parse a reference. A string that looks like a HuggingFace `org/repo[:sel]` becomes [`Repo`];
-    /// anything else (an existing file, a path-like string, or a `*.gguf`) becomes [`Path`].
+    /// Parse a reference. A string that looks like a HuggingFace `org/repo[:sel]` becomes [`ModelRef::Repo`];
+    /// anything else (an existing file, a path-like string, or a `*.gguf`) becomes [`ModelRef::Path`].
     ///
     /// - `org/repo`                 → `Repo { repo, sel: None }` (default quant)
     /// - `org/repo:Q4_K_M`          → `Repo { repo, sel: Some("Q4_K_M") }`

@@ -3,7 +3,7 @@
 //!
 //! Four layers, later wins: `Default` (today's shipped behaviour, reproduced EXACTLY) < config
 //! file (TOML) < environment (`INFR_*`, names frozen) < CLI flags. Each layer parses into a
-//! [`PartialConfig`] — every leaf `Option`-wrapped — and the layers are folded, so a layer only
+//! `PartialConfig` — every leaf `Option`-wrapped — and the layers are folded, so a layer only
 //! overrides a field it actually specifies.
 //!
 //! ```no_run
@@ -15,14 +15,14 @@
 //! **Scaffold only (slice S0).** Nothing in the engine reads this yet; every `INFR_*` read site is
 //! still where it was, so the tree behaves exactly as before. The per-subsystem slices (S2–S7)
 //! move the read sites onto `Arc<Config>` one crate at a time, flipping
-//! [`manifest::KnobKey::migrated`] as they go.
+//! `manifest::KnobKey::migrated` as they go.
 //!
 //! Module map (`docs/config-plan.md` §4):
-//! - [`partial`] — the `cfg_struct!` macro that generates both halves, plus the value grammar.
+//! - `partial` — the `cfg_struct!` macro that generates both halves, plus the value grammar.
 //! - [`env`] — the ONLY place the process environment is read (through an INJECTED reader).
 //! - [`file`] — TOML → `PartialConfig`, plus the 3-step path lookup.
-//! - [`cli`] — [`ConfigOverrides`] (clap flags + `--set`) → `PartialConfig`.
-//! - [`manifest`] — the checked-in key table: env name → config path → grammar → `migrated`.
+//! - `cli` — `ConfigOverrides` (clap flags + `--set`) → `PartialConfig`.
+//! - `manifest` — the checked-in key table: env name → config path → grammar → `migrated`.
 //!
 //! Invariants (`docs/config-plan.md` §3): no globals (R4) — `Config::load` returns a VALUE; no
 //! policy in the layer parsers (R5) — clamping and defaulting live in `Default` and the typed

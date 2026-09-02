@@ -149,7 +149,7 @@ impl VulkanBackend {
     ///
     /// This returns `true` whenever the device enabled `VK_KHR_external_semaphore_fd`, i.e. the
     /// semaphore-ordered all-reduce path is LIVE (not gated off) on such a device — the all-reduce
-    /// selects [`AllReduceMode::P2pSemaphore`] and orders the peer read GPU-side. A device/driver
+    /// selects [`crate::tp_allreduce::AllReduceMode::P2pSemaphore`] and orders the peer read GPU-side. A device/driver
     /// that cannot import a cross-device `OPAQUE_FD` semaphore reports the exact failure and the
     /// all-reduce falls back to the host fence (`AllReduceMode::P2pHostFence`).
     pub fn external_semaphore_supported(&self) -> bool {

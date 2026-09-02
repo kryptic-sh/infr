@@ -13,9 +13,9 @@
 //! `ChatSession` (which borrows `&Llama`) needs no ownership change — the caller owns the `Llama`,
 //! the box borrows it.
 //!
-//! Per-backend [`ChatModel`] impls live one file per backend (module split): [`vulkan`] (dense +
-//! qwen35 on the Vulkan seam), [`metal`] (macOS-only dense + speculative), [`cpu`] (the CPU/Metal
-//! reference dense path), [`diffusion`] (diffusion-gemma). This module keeps the agnostic core —
+//! Per-backend [`ChatModel`] impls live one file per backend (module split): `vulkan` (dense +
+//! qwen35 on the Vulkan seam), `metal` (macOS-only dense + speculative), `cpu` (the CPU/Metal
+//! reference dense path), `diffusion` (diffusion-gemma). This module keeps the agnostic core —
 //! the trait, the shared REPL, and the OpenAI-shaped renderer.
 
 use crate::{no_template_err, GenStats};

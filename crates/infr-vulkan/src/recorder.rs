@@ -2479,7 +2479,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// int8 cooperative-matrix (WMMA) prefill GEMM for Q8_0 weights — MEASUREMENT kernel, gated by
-    /// the adapter behind [`VulkanBackend::i8_coopmat_ready`] (`INFR_I8_COOPMAT=1` +
+    /// the adapter behind `VulkanBackend::i8_coopmat_ready` (`INFR_I8_COOPMAT=1` +
     /// `caps.i8_coopmat` + this driver having PASSED the accumulator-layout probe; see
     /// `native_gemm_i8cm_q8_0.comp` for the design doc: 16x16 tile per workgroup, per-Q8_0-block
     /// int32 WMMA dot + in-fragment scale epilogue). The layout gate is the ADAPTER's, not this
@@ -3218,7 +3218,7 @@ impl<'a> Recorder<'a> {
     /// spec-decode verify / short-suffix-prefill shape, where the single-M-tile coopmat GEMM
     /// underfills the GPU (measured 51-182 GB/s effective vs the GEMV's 292-651 on a 7900 XTX)
     /// and the plain GEMV re-streams the weight per row. Same push layout as the GEMV; `w_off`
-    /// (fused-QKV slices) rides `w_base`. Caller gates on [`crate::gemm::native_mrow_kernel_name`].
+    /// (fused-QKV slices) rides `w_base`. Caller gates on `crate::gemm::native_mrow_kernel_name`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_mrow(
         &self,
@@ -3606,7 +3606,7 @@ impl<'a> Recorder<'a> {
     /// `native_mmv.comp`'s integer-dot math — the weight sub-block is unpacked once into packed
     /// int8 words and dp4a'd against every row's pre-quantized activation block (`qa`/`dact`/
     /// `sact` from [`Self::quant_q8`] over `rows` rows). NUM_ROWS=2 outputs per workgroup
-    /// (grid = ceil(out_f/2)). Caller gates on [`crate::gemm::native_mmv_mrow_kernel_name`].
+    /// (grid = ceil(out_f/2)). Caller gates on `crate::gemm::native_mmv_mrow_kernel_name`.
     ///
     /// `rows == 1` is not a special case: it is THE m=1 decode kernel now (see
     /// `native_mmv_mrow.comp`'s header). A row's math depends only on its own `qa`/`dact`/`sact`
@@ -3794,7 +3794,7 @@ impl<'a> Recorder<'a> {
 
     /// Gather + dequantize embedding rows (`Op::EmbedGather`): `dst[r,:] = table[ids[r],:] *
     /// scale`. One workgroup per row; per-format decode from native_decode.glsl. Caller gates on
-    /// [`crate::gemm::embed_gather_kernel_name`].
+    /// `crate::gemm::embed_gather_kernel_name`.
     #[allow(clippy::too_many_arguments)]
     pub fn embed_gather(
         &self,
@@ -3894,7 +3894,7 @@ impl<'a> Recorder<'a> {
     ///
     /// The table is BOUND (not read through the resident-BDA arena like [`Self::embed_gather`]'s):
     /// `ffn_gate_tid2eid` is `n_expert_used * n_vocab` dwords, far inside `maxStorageBufferRange`,
-    /// which [`Self::vkb`] asserts for a resident-BDA sub-tensor anyway.
+    /// which `Self::vkb` asserts for a resident-BDA sub-tensor anyway.
     pub fn gather_i32(
         &self,
         table: &dyn Buffer,
@@ -3921,7 +3921,7 @@ impl<'a> Recorder<'a> {
     /// Int8 dp4a decode GEMV (m=1): `y = x·Wᵀ` with `x` pre-quantized via [`Self::quant_q8`]
     /// (qa/dact/sact). NUM_ROWS=2 — one workgroup per 2 consecutive outputs (`ceil(out_f/2)`
     /// grid), the activation block read once for both. `w_base` = element offset (fused-QKV
-    /// slices). Caller gates on [`crate::gemm::native_mmv_kernel_name`].
+    /// slices). Caller gates on `crate::gemm::native_mmv_kernel_name`.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_mmv(
         &self,
@@ -5026,8 +5026,8 @@ impl<'a> Recorder<'a> {
     }
 
     /// Non-FA prefill attention: clean coopmat QK → row softmax → coopmat PV (ollama's approach).
-    /// `q`=[mpad,nh,hd] f16, `kc`/`vc`=[kv_len,nkv,hd] f16, `attn`=[mpad,nh*hd] f32 out, `s`=
-    /// [nh,mpad,kv_pad] f16 scratch (mpad=ceil(n/64)*64, kv_pad=ceil(kv_len/64)*64). `pos_offset` is
+    /// `q`=\[mpad,nh,hd\] f16, `kc`/`vc`=\[kv_len,nkv,hd\] f16, `attn`=\[mpad,nh*hd\] f32 out, `s`=
+    /// \[nh,mpad,kv_pad\] f16 scratch (mpad=ceil(n/64)*64, kv_pad=ceil(kv_len/64)*64). `pos_offset` is
     /// the absolute position of query row 0 (for causal masking).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill_nonfa(
@@ -5175,8 +5175,8 @@ impl<'a> Recorder<'a> {
         }
     }
 
-    /// Flash-attention prefill: fused QK→softmax→PV, no materialized S buffer. `q`=[mpad,nh,hd] f16,
-    /// `kc`/`vc`=[kv_len,nkv,hd] f16, `attn`=[mpad,nh*hd] f32 out. `pos_offset` = abs position of row
+    /// Flash-attention prefill: fused QK→softmax→PV, no materialized S buffer. `q`=\[mpad,nh,hd\] f16,
+    /// `kc`/`vc`=\[kv_len,nkv,hd\] f16, `attn`=\[mpad,nh*hd\] f32 out. `pos_offset` = abs position of row
     /// 0 (causal). Split-K over kv for occupancy at high ctx (few q tiles): each (q-tile, head, split)
     /// emits an online-softmax partial into `po`/`pm`/`pl`, merged by attn_flash_combine. Scratch
     /// (caller, sized for ≤8 splits): `po` = 8·mpad·nh·hd f32, `pm`/`pl` = 8·mpad·nh f32. n_splits==1
@@ -5432,7 +5432,7 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// FlashAttention-2 register-O prefill (Br=128, per-thread register accumulator → no [Br][HD]
+    /// FlashAttention-2 register-O prefill (Br=128, per-thread register accumulator → no \[Br\]\[HD\]
     /// shared O; 2× the query tile of the shared-Os flash → fewer q-tiles). hd MUST be 128 and the
     /// caller MUST allocate q/attn/po to mpad128 = ceil(n/128)*128 rows. Split-K → partials → combine.
     #[allow(clippy::too_many_arguments)]
@@ -6211,7 +6211,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// Qwen3 QK-norm + RoPE over `x[rows, nheads, hd]` → `y` at rows `out_base..`. `nw` is the
-    /// per-head [hd] norm weight. (q: out_base=0; k: out_base=pos so it lands in the cache.)
+    /// per-head \[hd\] norm weight. (q: out_base=0; k: out_base=pos so it lands in the cache.)
     #[allow(clippy::too_many_arguments)]
     pub fn qk_norm_rope(
         &self,
@@ -7253,7 +7253,7 @@ impl<'a> Recorder<'a> {
     /// SELF-CHUNKING variant for record-once REPLAY over a growing kv_len. A one-thread prologue
     /// (`attn_live`) derives the adaptive chunk (~32 chunks/head, 64..512, floored by the baked
     /// minimum `chunk`) from the LIVE kv_len and writes the partial pass's INDIRECT dispatch args
-    /// (`args`, ≥16 bytes: [gx,gy,gz,live]) — so one recorded plan launches exactly nh·live
+    /// (`args`, ≥16 bytes: \[gx,gy,gz,live\]) — so one recorded plan launches exactly nh·live
     /// workgroups at every depth (no dead workgroups shallow, no re-record deep). The combine
     /// loops the prologue's live count. `n_chunks` is only the pm/pl/pacc scratch STRIDE/capacity
     /// (cap.div_ceil(chunk), ≤1024).
@@ -7691,7 +7691,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// Fused GeGLU (GELU tanh-approx gate) over a combined `gu` `[rows, 2*nff]` → `y` `[rows, nff]`.
-    /// Same layout/dispatch as [`silu_mul_fused`]; gemma uses GELU instead of SiLU.
+    /// Same layout/dispatch as [`Self::silu_mul_fused`]; gemma uses GELU instead of SiLU.
     pub fn gelu_mul_fused(
         &self,
         gu: &dyn Buffer,
@@ -8631,9 +8631,9 @@ impl<'a> Recorder<'a> {
     /// the ring→arena staging copies, the way the paged MoE flow orders its own pointer-read arena.
     /// Bracketing each miss's copy with this barrier gives both directions in one primitive:
     ///   • RAW — the ring→arena copy (`TRANSFER_WRITE`) is visible to the reading dispatch
-    ///     (`SHADER_READ`) [`TRANSFER`→`COMPUTE_SHADER`];
+    ///     (`SHADER_READ`) `TRANSFER`→`COMPUTE_SHADER`;
     ///   • WAR — a prior dispatch's arena read (`SHADER_READ`) completes before a later copy
-    ///     overwrites that slot (`TRANSFER_WRITE`) [`COMPUTE_SHADER`→`TRANSFER`].
+    ///     overwrites that slot (`TRANSFER_WRITE`) `COMPUTE_SHADER`→`TRANSFER`.
     /// Streaming is PCIe/residency-bound, so the extra barrier per staged block is noise.
     pub fn arena_stream_barrier(&self) {
         let mb = vk::MemoryBarrier::default()
@@ -8992,7 +8992,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// ALL experts' mmq GEMMs in ONE dispatch (`gl_WorkGroupID.y` = expert): activation rows are
-    /// packed by expert (bucket layout, segment e = offsets[e]..+counts[e]); the weight bank is
+    /// packed by expert (bucket layout, segment e = offsets\[e\]..+counts\[e\]); the weight bank is
     /// indexed `w_base + e·stride`. Grid x covers the worst-case row tiles (`ceil(rows/BM)` — the
     /// whole chunk landing on one expert); tiles past a segment exit immediately, so the empty
     /// launches cost ~nothing while the dispatch count drops from ~n_expert·stages per layer to
@@ -9413,7 +9413,7 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
     }
 
-    /// [`linear_native_id`]'s paged twin: `w` is a `GpuPager` arena (fixed uniform slots, not one
+    /// [`Self::linear_native_id`]'s paged twin: `w` is a `GpuPager` arena (fixed uniform slots, not one
     /// contiguous per-expert tensor) and `lut` a run of per-expert resident SLOT INDICES for
     /// exactly this layer — the kernel sets `w_addr = arena_base + uint64_t(lut[lut_base +
     /// ids[slot_idx]]) * slot_bytes` with the layer-LOCAL expert ids moe_topk produced (no host
@@ -9477,11 +9477,11 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// [`linear_native_id_multi`]'s paged twin — same local-ids + LUT-window hop as
-    /// [`linear_native_id_paged`] (`w_addr = arena_base + uint64_t(lut[lut_base + ids[slot]]) *
+    /// [`Self::linear_native_id_multi`]'s paged twin — same local-ids + LUT-window hop as
+    /// [`Self::linear_native_id_paged`] (`w_addr = arena_base + uint64_t(lut[lut_base + ids[slot]]) *
     /// slot_bytes`), for the decode/small-m all-`n_used`-experts-in-one-dispatch path. Always the
     /// tree kernel (see
-    /// [`linear_native_id_paged`]'s doc for why the SG fast path is skipped).
+    /// [`Self::linear_native_id_paged`]'s doc for why the SG fast path is skipped).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_id_multi_paged(
         &self,
@@ -9527,7 +9527,7 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(k, &bufs, 1, &push, (rows * n_used * out_f) as u32);
     }
 
-    /// Quantize f32 activations `a` [m,k] → int8 `qa` [m,k] + per-32-block f16 `dact`/`sact`
+    /// Quantize f32 activations `a` \[m,k\] → int8 `qa` \[m,k\] + per-32-block f16 `dact`/`sact`
     /// ([m, k/32]) for the dp4a mmq matmul. (Pass 1 of mmq, reusable standalone.)
     pub fn quant_q8(
         &self,
@@ -9990,7 +9990,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// [`Self::finish`]'s pipelined twin: end recording and submit WITHOUT waiting, returning a
-    /// [`PendingSegment`] whose [`PendingSegment::wait`] blocks on a fence and releases the
+    /// `PendingSegment` whose `PendingSegment::wait` blocks on a fence and releases the
     /// command buffer / descriptor pools. The paged-MoE executor uses this to keep staging the
     /// next segment's expert uploads on the CPU while the GPU chews the one just submitted
     /// (`adapter::execute_paged_moe`'s ring rotation). Profiling recorders (INFR_PROF /
@@ -10103,7 +10103,7 @@ impl<'a> Recorder<'a> {
     /// End recording WITHOUT submitting, returning a single-segment [`RecordedCmd`] the caller can
     /// replay across tokens (skipping per-token re-recording). The one-segment shape is the tuned
     /// fast path taken by every discrete GPU; a device that watchdog-splits its decode builds a
-    /// multi-segment [`RecordedCmd`] from [`Self::end_segment`] instead.
+    /// multi-segment [`RecordedCmd`] from `Self::end_segment` instead.
     pub fn finish_record(self) -> Result<RecordedCmd> {
         let shared = std::sync::Arc::clone(&self.be.shared);
         let seg = self.end_segment()?;
@@ -10186,10 +10186,10 @@ pub(crate) struct RecordedSegment {
 }
 
 /// A pre-recorded, resubmittable decode step (from [`Recorder::finish_record`], or accumulated from
-/// [`Recorder::end_segment`] on a splitting device). Replaying it skips per-token re-recording in
+/// `Recorder::end_segment` on a splitting device). Replaying it skips per-token re-recording in
 /// the GPU-resident decode loop.
 ///
-/// The step is one or more [`RecordedSegment`]s. A discrete GPU (no submit cap) records the whole
+/// The step is one or more `RecordedSegment`s. A discrete GPU (no submit cap) records the whole
 /// decode into ONE segment and replays it in a single submit — the tuned fast path, unchanged. A
 /// device that must split its forward against the per-submit GPU hang watchdog records the decode
 /// across several watchdog-sized segments (`adapter::record_decode_replay`), and [`Self::replay`]

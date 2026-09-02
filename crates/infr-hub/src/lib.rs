@@ -3,7 +3,7 @@
 //!
 //! Models live in the **standard HF Hub cache** (`~/.cache/huggingface/hub`), shared with llama.cpp
 //! and `huggingface_hub`, so `infr run hf:org/repo:Q4_K_M` and `llama-cli -hf org/repo:Q4_K_M` use
-//! the same files — see [`store`] for the layout.
+//! the same files — see `store` for the layout.
 
 mod download;
 mod http;

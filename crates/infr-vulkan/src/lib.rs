@@ -215,7 +215,7 @@ pub(crate) fn max_storage_buffer_range() -> u32 {
 /// Device memory snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
 /// `live` is true (VK_EXT_memory_budget present), otherwise it equals `total` (best-effort).
 ///
-/// WHICH HEAPS THIS COUNTS depends on the device class (see [`vram_info`]): device-local only on a
+/// WHICH HEAPS THIS COUNTS depends on the device class (see `vram_info`): device-local only on a
 /// discrete card, ALL heaps on a unified-memory part where they are the same physical DDR.
 #[derive(Clone, Copy, Debug)]
 pub struct VramInfo {
@@ -228,8 +228,8 @@ pub struct VramInfo {
 }
 
 impl VramInfo {
-    /// Bytes a new device-local allocation may still take before [`VulkanBackend::check_vram_budget`]
-    /// REFUSES it: this snapshot's free figure minus the guard's own [`GUARD_HEADROOM`].
+    /// Bytes a new device-local allocation may still take before `VulkanBackend::check_vram_budget`
+    /// REFUSES it: this snapshot's free figure minus the guard's own `GUARD_HEADROOM`.
     ///
     /// **The ONE ceiling every sizing decision budgets against** — the context-fit math
     /// (`SeamModel::kv_fit_ctx_fmt`) and the placement sweeps (`vulkan_moe_binder`'s residency /
@@ -2639,7 +2639,7 @@ impl VulkanBackend {
     }
 
     /// The submit splitter's cap as it stands NOW, for reporting (`infr bench`'s result line).
-    /// `0` = unlimited, i.e. one command buffer per forward — see [`Self::observe_forward`] for
+    /// `0` = unlimited, i.e. one command buffer per forward — see `Self::observe_forward` for
     /// why this is worth printing next to a throughput number.
     pub fn submit_cap_now(&self) -> usize {
         self.submit_dispatch_cap()
@@ -2763,8 +2763,8 @@ impl VulkanBackend {
         vram_info(&self.shared)
     }
 
-    /// Bytes a new device-local allocation may still take before [`check_vram_budget`] REFUSES it:
-    /// [`vram`](Self::vram)'s free figure minus the guard's own [`GUARD_HEADROOM`]. The live-device
+    /// Bytes a new device-local allocation may still take before `check_vram_budget` REFUSES it:
+    /// [`vram`](Self::vram)'s free figure minus the guard's own `GUARD_HEADROOM`. The live-device
     /// spelling of [`VramInfo::alloc_room`], which carries the full rationale.
     ///
     /// Sizing math must budget against this, not against `vram().available` — the guard enforces
@@ -3142,12 +3142,12 @@ impl VulkanBackend {
         })
     }
 
-    /// Test-support hook: sub-allocate a resident-BDA weight tensor via [`Self::bda_weight_alloc`]
+    /// Test-support hook: sub-allocate a resident-BDA weight tensor via `Self::bda_weight_alloc`
     /// directly — the same "construct the arena alloc directly" approach
     /// `resident_bda_weight_arena_roundtrip` (this module's own `#[cfg(test)]`) uses, exposed as
     /// `pub` so an external `tests/*.rs` integration binary (which only links the crate's public
     /// API, never its private items) can build a buffer whose `device_addr()` reports `Some` and
-    /// drive dispatch routing on it. Boxed as `Box<dyn Buffer>` since [`VkBuffer`] itself is
+    /// drive dispatch routing on it. Boxed as `Box<dyn Buffer>` since `VkBuffer` itself is
     /// private.
     pub fn bda_weight_alloc_for_test(&self, size: usize) -> Result<Box<dyn Buffer>> {
         self.bda_weight_alloc(size)

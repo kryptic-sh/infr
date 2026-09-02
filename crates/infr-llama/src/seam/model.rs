@@ -15,7 +15,7 @@ use tokenizers::Tokenizer;
 ///
 /// **Why a throughput number is not interpretable without this.** Two of the inputs are decided at
 /// RUN time rather than by the shape being measured: the prefill chunk comes off the placement
-/// ladder ([`crate::seam::ubatch_rows`], which the VRAM residency sweep may pin below the default),
+/// ladder (`crate::seam::ubatch_rows`, which the VRAM residency sweep may pin below the default),
 /// and the submit cap is latched from a wall-clock sample of the first slow forward
 /// (`VulkanBackend::observe_forward`). Both change how the same graph is executed while leaving the
 /// dispatched KERNELS byte-identical, so neither is visible in `INFR_PROF_OPS` and a run that
@@ -127,13 +127,13 @@ fn open_backend(
     }
 }
 
-/// A persistent seam session: the backend it owns, the conversation [`SlotPool`], and the context
+/// A persistent seam session: the backend it owns, the conversation `SlotPool`, and the context
 /// window its generations are sized to.
 ///
 /// `B` is the backend (it is only ever passed to the seam as `&dyn Backend`, so no bound is needed
 /// here); `X` is per-backend extension state — `()` where a backend needs none (Metal),
-/// Vulkan's per-session [placement pins](crate::seam::PlacementPins) otherwise. Each backend names
-/// its own concrete pairing through a type alias ([`DenseVulkanSession`], [`DenseMetalSession`])
+/// Vulkan's per-session placement pins (`crate::seam::PlacementPins`) otherwise. Each backend names
+/// its own concrete pairing through a type alias ([`DenseVulkanSession`], `DenseMetalSession`)
 /// so every call site is unchanged.
 pub struct DenseSession<B, X = ()> {
     pub(crate) be: B,
@@ -152,7 +152,7 @@ pub struct DenseSession<B, X = ()> {
 impl<B, X> DenseSession<B, X> {
     /// Forget every slot's materialized tokens (buffers and the weight upload stay) — discards a
     /// warmup generation so the first real prompt starts from clean slots. The ONE implementation
-    /// every backend's session shares (it is pure [`SlotPool`] policy — no device involvement).
+    /// every backend's session shares (it is pure `SlotPool` policy — no device involvement).
     pub fn reset_cache(&mut self) {
         self.pool.reset_cache();
     }
@@ -164,14 +164,14 @@ impl<B, X> DenseSession<B, X> {
     }
 }
 
-/// The Vulkan session's [`DenseSession::ext`] state: that session's OWN placement pins (see
+/// The Vulkan session's `DenseSession::ext` state: that session's OWN placement pins (see
 /// `crate::seam::PlacementPins`) — per-session so a multi-model process never leaks one model's
 /// pinned chunk / auto-q8 decision into another. Opaque: the pins stay crate-private, this wrapper
 /// only exists so the public [`DenseVulkanSession`] alias can name a public type.
 pub struct VulkanSessionPins(std::sync::Arc<crate::seam::PlacementPins>);
 
 /// A persistent Vulkan seam session (see [`SeamModel::vulkan_session`]): owns the backend and the
-/// conversation [`SlotPool`], plus this session's [`VulkanSessionPins`] — entered as the current
+/// conversation `SlotPool`, plus this session's [`VulkanSessionPins`] — entered as the current
 /// `crate::seam::PlacementScope` around the default-ctx clamp (at construction) and every
 /// generation.
 pub type DenseVulkanSession = DenseSession<infr_vulkan::VulkanBackend, VulkanSessionPins>;
@@ -471,7 +471,7 @@ impl SeamModel {
     /// [`vulkan_session`](Self::vulkan_session) sized as a FRACTION of the device's free-VRAM KV
     /// capacity (`INFR_CTX=50%` → half the tokens that would fit after weights + headroom —
     /// device-appropriate %-base: this KV cache lives in VRAM). Uses the same fit math as
-    /// [`vulkan_session_default`]'s clamp, scaled by `frac`; unlike an explicit token count the
+    /// [`vulkan_session_default`](Self::vulkan_session_default)'s clamp, scaled by `frac`; unlike an explicit token count the
     /// result is inherently within budget, and the alloc-time guard stays the backstop.
     pub fn vulkan_session_frac(&self, frac: f64) -> Result<DenseVulkanSession> {
         self.vulkan_session_frac_on(None, frac)
@@ -774,7 +774,7 @@ impl SeamModel {
     /// Lazy on purpose: the Vulkan/Metal dense path uploads `token_embd.weight` to the device in
     /// its native dtype and never calls this, so it must not pay the dequant (~4s / ~3.1 GiB on
     /// Qwen3-14B). `Config::from_gguf` validated the tensor exists at load; a truncated/corrupt file
-    /// can still fail the dequant here, so this is FALLIBLE (see [`crate::seam::TokenEmbd::get`]).
+    /// can still fail the dequant here, so this is FALLIBLE (see `crate::seam::TokenEmbd::get`).
     pub fn token_embd(&self) -> Result<&[f32]> {
         self.embd().get()
     }
@@ -870,7 +870,7 @@ impl SeamModel {
     }
 
     /// Detokenize ids back to text (`encode`'s twin, `skip_special_tokens=true` — matches
-    /// [`crate::stream_token`]'s convention so a thinking model's `<|channel>thought`/`<channel|>`
+    /// `crate::stream_token`'s convention so a thinking model's `<|channel>thought`/`<channel|>`
     /// markers, which aren't in the tokenizer's added-specials set, still come through as text) —
     /// for callers that drive a decode loop directly on token ids (the diffusion decode loop's own
     /// tests) instead of through one of the `generate_*` string-in/string-out helpers.
@@ -1823,7 +1823,7 @@ impl SeamModel {
 
 /// A persistent CPU-reference session for DiffusionGemma's two-pass forward (Phase 2 — see
 /// docs/diffusion-gemma.md and [`SeamModel::diffusion_gemma_cpu_session`]). Model-independent (like
-/// [`DenseVulkanSession`]/[`DenseMetalSession`]) — `prefill`/`denoise` take the `&SeamModel` per
+/// [`DenseVulkanSession`]/`DenseMetalSession`) — `prefill`/`denoise` take the `&SeamModel` per
 /// call instead of borrowing it at construction, so a [`crate::chat::ChatModel`] can hold both an
 /// owned `SeamModel` and a persistent session side by side (Phase 3 — no self-referential borrow).
 pub struct DiffusionGemmaCpuSession {
@@ -1937,7 +1937,7 @@ impl DiffusionGemmaCpuSession {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl DiffusionGemmaVulkanSession {
     /// [`DiffusionGemmaCpuSession::prefill`]'s Vulkan twin. Weights bind through the SHARED
-    /// [`crate::seam::vulkan_moe_binder`] so DG gets the same MoE expert placement tiers
+    /// `crate::seam::vulkan_moe_binder` so DG gets the same MoE expert placement tiers
     /// (resident / `INFR_CACHE` / auto-paged) as every other MoE model — DG's fused
     /// `ffn_gate_up_exps` bank pages under `Role::Gate` and its mixed Q5_0/Q8_0 down banks split
     /// into per-byte-size pools (see `infr_vulkan::pager`'s MoE-session doc).

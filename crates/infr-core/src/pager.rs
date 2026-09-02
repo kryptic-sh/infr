@@ -127,7 +127,7 @@ impl Pager {
     /// # Panics
     /// If `n_slots == 0`. A zero-slot pager cannot satisfy even a one-block batch, so there is no
     /// correct behaviour to fall back to: the first `touch` would find `free` empty, scan an empty
-    /// `lru` for a victim, and die inside [`Self::take_slot`] on an `expect` about a `position()`
+    /// `lru` for a victim, and die inside `Self::take_slot` on an `expect` about a `position()`
     /// index — a panic that describes the wrong thing entirely, several frames away from the
     /// mistake. Clamping to 1 instead would be worse than either: it manufactures a pager that
     /// silently misses on EVERY touch and evicts the block the caller resolved a moment ago,

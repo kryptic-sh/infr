@@ -238,7 +238,7 @@ impl GpuPager {
     /// Same residency decision and the same ring→arena copy; only the source differs, so the two
     /// cannot drift on policy. Kept separate rather than folded behind a closure because the copy
     /// they perform is genuinely different work: the mmap path memcpys a slice with
-    /// [`par_copy_to_mapped`] (many threads over one already-resident buffer), while this issues a
+    /// `par_copy_to_mapped` (many threads over one already-resident buffer), while this issues a
     /// positioned read straight into the ring — one copy instead of the read-then-copy that going
     /// through a host arena would cost.
     pub fn touch_staged_read(

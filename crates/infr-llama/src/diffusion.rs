@@ -7,7 +7,7 @@
 //! `diffusion-cli.cpp`'s `run_turn` (the block/commit/trim loop), both read 2026-07-05.
 //!
 //! Not bit-for-bit RNG-identical to the reference's `std::mt19937` (a house xorshift64 stands in —
-//! see [`Rng`]): the design doc's validation ladder explicitly does NOT require token-identical
+//! see `Rng`): the design doc's validation ladder explicitly does NOT require token-identical
 //! output (a 128-expert top-8 MoE model's CPU/Vulkan routing already diverges legitimately), only
 //! the SAME schedule/acceptance/stop semantics under a fixed seed.
 

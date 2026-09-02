@@ -260,7 +260,7 @@ fn main_token_embd(g: &Gguf, ne: usize, vocab: usize) -> Result<MtpTensor> {
 /// Resolve the head's OWN embedding table (`nextn.embed_tokens`, dequantized) when the GGUF ships
 /// one — `None` when it doesn't (the shipped 4B GGUF: `docs/mtp.md`'s confirmed dump), in which
 /// case the caller passes the main model's already-dequantized `token_embd` straight to
-/// [`MtpHeadSession::new_cpu`]/[`new_vulkan`] instead.
+/// [`MtpHeadSession::new_cpu`]/[`MtpHeadSession::new_vulkan`] instead.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn resolve_own_embed_table(g: &Gguf, head: &MtpHeadWeights) -> Result<Option<Vec<f32>>> {
     match &head.embed_tokens {
@@ -1777,7 +1777,7 @@ impl<'a> MtpHeadSession<'a> {
     }
 
     /// Whether [`draft_chain`](Self::draft_chain) can run: the head's embedding table uploaded as
-    /// a device Weight (see [`build_embed_chain_buf`]) — `None` when the backend/dtype doesn't
+    /// a device Weight (see `build_embed_chain_buf`) — `None` when the backend/dtype doesn't
     /// support on-device `Op::EmbedGather` for this table (Metal today, or an unsupported quant
     /// format). Callers gate the fused-chain fast path on this and fall back to [`draft`].
     pub fn can_draft_chain(&self) -> bool {
@@ -1786,7 +1786,7 @@ impl<'a> MtpHeadSession<'a> {
 
     /// The self-chained greedy draft loop (issue #33 follow-up to `forward_draft`'s per-step
     /// fusion): unrolls `n_steps` copies of the head forward into ONE [`Graph`]
-    /// ([`build_mtp_draft_chain_graph`]) — id/`h_mtp` chained device-side via
+    /// (`build_mtp_draft_chain_graph`) — id/`h_mtp` chained device-side via
     /// `Op::EmbedGather`/internal tensors instead of the old `draft()`'s `n_steps` sequential
     /// submit→wait→readback round-trips — compiles + executes it ONCE, and downloads the
     /// `n_steps` drafted ids in one pass. Measured baseline: `n_max = 6` round-trips cost ~9ms/

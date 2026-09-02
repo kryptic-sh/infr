@@ -17,7 +17,7 @@
 //!
 //! That freedom is also what makes a block's read CONCURRENT rather than one syscall: an NVMe
 //! reaches its bandwidth only with several requests in flight, so one block is split across
-//! [`IO_FANOUT`] positioned reads (see [`read_pieces`]). This is what puts the tier's reader on
+//! `IO_FANOUT` positioned reads (see `read_pieces`). This is what puts the tier's reader on
 //! even footing with the mapping it replaces, whose faults the kernel already issues in parallel.
 //!
 //! The file can also change under a live run. A mapping makes that a `SIGBUS` or silently

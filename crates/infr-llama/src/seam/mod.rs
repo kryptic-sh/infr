@@ -1,10 +1,10 @@
-//! CPU model runner — builds and drives the agnostic decode [`Graph`] through [`CpuBackend`].
+//! CPU model runner — builds and drives the agnostic decode [`infr_core::graph::Graph`] through [`CpuBackend`].
 //! The backend itself lives in `infr-cpu`; this module is the model-specific "glue" that
 //! assembles the layer graph, uploads weights, and steps the KV cache.
 //!
-//! Split into submodules (pure move, zero behavior change): [`weights`] holds the per-layer
-//! weight-handle structs and the persistent seam session state; [`sc`] holds the DiffusionGemma
-//! self-conditioning pieces; [`runner`] holds the giant backend-generic `generate_dense_backend`
+//! Split into submodules (pure move, zero behavior change): `weights` holds the per-layer
+//! weight-handle structs and the persistent seam session state; `sc` holds the DiffusionGemma
+//! self-conditioning pieces; `runner` holds the giant backend-generic `generate_dense_backend`
 //! and its `DecodeHandles`. This file keeps the thin per-backend entry wrappers, the `verify_*`
 //! family, and the small shared helpers every submodule reaches into.
 #![allow(clippy::too_many_arguments)]

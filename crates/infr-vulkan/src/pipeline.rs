@@ -177,7 +177,7 @@ struct Prepared {
     segments: Vec<Segment>,
 }
 
-/// A [`PipelineBackend`] plan: the graph, plus the lazily-built [`Prepared`] partition.
+/// A [`PipelineBackend`] plan: the graph, plus the lazily-built `Prepared` partition.
 pub struct PipelinePlan {
     graph: Graph,
     prepared: Mutex<Option<Prepared>>,

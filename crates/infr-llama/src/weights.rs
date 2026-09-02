@@ -23,7 +23,7 @@ impl WeightFootprint {
 
     /// Footprint if experts are STREAMED through an `n_slots`-slot pool of `stride`-byte slots
     /// (a VRAM slot pool) instead of all kept resident: `dense + n_slots·stride`, bounded
-    /// regardless of the model's expert count. The MoE loader picks all-resident ([`total`]) when it
+    /// regardless of the model's expert count. The MoE loader picks all-resident ([`Self::total`]) when it
     /// fits VRAM, else reserves this and streams. (`stride` = one expert's max packed weight bytes.)
     pub fn streaming_total(&self, n_slots: usize, stride: usize) -> u64 {
         self.dense + n_slots as u64 * stride as u64

@@ -8,9 +8,9 @@
 //!
 //! | fmt | bits | centroids | block (128 elems) | packing |
 //! |-----|------|-----------|-------------------|---------|
-//! | turbo2 | 2 | 4  | 34 B = norm(2)+qs[32]           | 4 idx/byte in qs |
-//! | turbo3 | 3 | 8  | 50 B = norm(2)+qs[32]+signs[16] | low2 in qs, bit2 in signs |
-//! | turbo4 | 4 | 16 | 66 B = norm(2)+qs[64]           | nibble (2 idx/byte) in qs |
+//! | turbo2 | 2 | 4  | 34 B = norm(2)+qs\[32\]           | 4 idx/byte in qs |
+//! | turbo3 | 3 | 8  | 50 B = norm(2)+qs\[32\]+signs\[16\] | low2 in qs, bit2 in signs |
+//! | turbo4 | 4 | 16 | 66 B = norm(2)+qs\[64\]           | nibble (2 idx/byte) in qs |
 //!
 //! Dequant returns the values in the **rotated (WHT) domain**; the CPU reference then applies the
 //! inverse WHT ([`dequant_prefix_orig`]) to recover the original domain so the existing f32 SDPA runs
@@ -262,7 +262,7 @@ pub fn quantize_block(dt: DType, src: &[f32], dst: &mut [u8]) {
 
 /// Dequant the first `need` elements (a multiple of 128) to the ORIGINAL domain (rotated dequant +
 /// inverse WHT), so the CPU reference attention reads normal-domain K/V. Mirrors
-/// [`crate::dequant_prefix_q8_0`].
+/// `crate::dequant_prefix_q8_0`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn dequant_prefix_orig(dt: DType, bytes: &[u8], need: usize) -> Vec<f32> {
     let c = codec(dt);

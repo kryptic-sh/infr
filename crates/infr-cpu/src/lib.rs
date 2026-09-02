@@ -123,7 +123,7 @@ fn next_buffer_uid() -> u64 {
 /// A host buffer. Weights are **mapped** — a zero-copy [`TensorBytes`] view straight into the GGUF
 /// mmap (read-only, no `memcpy`, no owned RAM). Everything the model writes (KV / conv / recurrent
 /// state, per-step IO) is **owned** — a plain byte vec behind a `Mutex` (so `&dyn Buffer` stays
-/// `Send + Sync` and writes are safe). `&dyn Buffer` reads go through [`CpuBuffer::read`].
+/// `Send + Sync` and writes are safe). `&dyn Buffer` reads go through `CpuBuffer::read`.
 pub struct CpuBuffer {
     /// This buffer's identity for the backend's derived-data caches (`weight_cache`, the repack
     /// caches). It is a `uid` and not an address because those caches outlive a model: a reused

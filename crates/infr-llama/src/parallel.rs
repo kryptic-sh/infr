@@ -1,4 +1,4 @@
-//! [`ParallelSeam`] — the N-slot concurrent generation engine behind `infr serve --parallel N`.
+//! [`crate::parallel::ParallelSeam`] — the N-slot concurrent generation engine behind `infr serve --parallel N`.
 //!
 //! # What this is (and what it is not)
 //!
@@ -131,7 +131,7 @@ impl ParallelSeam {
     /// also what compiles every lazily-built pipeline), then fork N-1 sibling slots off it.
     ///
     /// `want_ctx` is the `--ctx` / `INFR_CTX` spec (token count or `%` of the free-VRAM KV
-    /// capacity); `None` derives the per-slot window. See [`SeamModel::vulkan_slot_ctx`].
+    /// capacity); `None` derives the per-slot window. See `SeamModel::vulkan_slot_ctx`.
     pub fn new(
         model: SeamModel,
         n_slots: usize,

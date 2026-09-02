@@ -46,7 +46,7 @@
 //! Dense attention models only (Qwen3/Llama/Gemma-dense); MoE / qwen35 DeltaNet / gemma-E2B /
 //! diffusion-gemma are rejected up front (they need per-op sharding beyond this slice). The
 //! GPU-resident fast paths (decode replay / embed-gather / gpu-sample / argmax) AND the fused
-//! qkv / gate-up weight concatenations are turned OFF via [`capabilities`], so the runner takes the
+//! qkv / gate-up weight concatenations are turned OFF via [`infr_core::backend::Backend::capabilities`], so the runner takes the
 //! classic host-embed + host-sample static path over SEPARATE q/k/v/gate/up projections — each a
 //! cleanly sliceable weight + op. Generalizes to any world size `W` that divides `n_head`, `n_kv`
 //! and `n_ff`; the all-reduce data path is `W`-general, only its ring/tree schedule optimization is
@@ -127,7 +127,7 @@ impl Buffer for TpBuffer {
     /// The LOGICAL tensor size (see [`Buffer::len_bytes`]), NOT rank 0's slice: a sharded buffer
     /// reports the SUM over its per-rank buffers, so a caller above the seam sees the same byte
     /// count it would on a single device. Only [`TensorParallelBackend`] itself divides by the
-    /// world, and only in [`TensorParallelBackend::shard_bytes`].
+    /// world, and only in `TensorParallelBackend::shard_bytes`.
     ///
     /// This USED to return `bufs[0].len_bytes()` (the per-rank slice), which broke both callers
     /// that mix buffer-derived and config-derived byte counts: `SeamKv::mtp_snapshot_delta` fed

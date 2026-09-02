@@ -21,9 +21,9 @@
 //!
 //! ## What is shared and what deliberately is not
 //!
-//! Shared here: the ACCOUNTING and the OUTPUT — [`OpProf`] (label → count + µs, folded into the
-//! process aggregate and printed in one format), [`op_label`] (what two dispatches must agree on to
-//! share a row), and [`enabled`] (the one predicate that decides whether to profile at all,
+//! Shared here: the ACCOUNTING and the OUTPUT — `OpProf` (label → count + µs, folded into the
+//! process aggregate and printed in one format), `op_label` (what two dispatches must agree on to
+//! share a row), and `enabled` (the one predicate that decides whether to profile at all,
 //! including the warmup-suppression AND).
 //!
 //! NOT shared, on purpose: **how a backend obtains a duration.** Those differ for hardware reasons,
@@ -37,7 +37,7 @@
 //!   measures host ENCODE time, which is a different quantity and is labeled as such.
 //! * cpu measures host wall directly, which for a host backend IS the device time.
 //!
-//! So each backend keeps its own timing acquisition and calls [`OpProf::add`] with the result. The
+//! So each backend keeps its own timing acquisition and calls `OpProf::add` with the result. The
 //! unit is microseconds everywhere — the conversion belongs at the acquisition site, where the
 //! clock's native unit is known (vulkan ticks × `timestamp_period`,
 //! host `Duration`s).

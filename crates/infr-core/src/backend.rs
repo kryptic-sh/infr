@@ -196,7 +196,7 @@ pub struct Capabilities {
     /// full context (see the seam's SWA ring sizing). Backends whose kernels index rows directly
     /// by position (Metal) leave this false and get full-context allocations for every layer.
     pub kv_swa_ring: bool,
-    /// What the ops write into a bound f32 [`TensorKind::Input`] is visible to the NEXT `execute`
+    /// What the ops write into a bound f32 [`crate::graph::TensorKind::Input`] is visible to the NEXT `execute`
     /// that binds the same buffer — either because the backend dispatches straight against the
     /// caller's buffer (Vulkan: only `Internal` handles get backend scratch) or because the
     /// executor copies every mutated f32 Input back at the end of the call
@@ -216,7 +216,7 @@ pub struct Capabilities {
 ///
 /// This bounds the cost of ONE DISPATCH, which is the one thing a backend cannot split: the GPU
 /// hang watchdog kills a whole submit, and a submit can be cut into more command buffers (that is
-/// [`Backend::submit_dispatch_cap`]'s job), but a single dispatch is indivisible, so its own
+/// `Backend::submit_dispatch_cap`'s job), but a single dispatch is indivisible, so its own
 /// runtime has to stay well inside the budget on its own.
 ///
 /// It is NOT the watchdog bound. It used to be sold as one, and that was measured WRONG on the

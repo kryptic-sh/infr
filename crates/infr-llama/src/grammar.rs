@@ -11,7 +11,7 @@
 //!
 //! KNOWN ISSUE — the GGUF→`tokenizers`→serialized-JSON tokenizer bridge is NOT canonical in toktrie's
 //! sense, so llguidance's token-level `compute_mask` returns a SUPERSET that the byte-forcing parser
-//! then rejects ("forced bytes: got '{'"). Mitigations applied: (1) [`NonCanonicalEnv`] forces the
+//! then rejects ("forced bytes: got '{'"). Mitigations applied: (1) `NonCanonicalEnv` forces the
 //! canonical flag false; (2) the decode loop validate-before-commits each pick ([`Constraint::try_accept`])
 //! and re-picks on rejection instead of erroring. These stop the crash, but on the live model the mask
 //! is still inconsistent enough that the forced JSON can mask out entirely (empty body) — so the server
@@ -54,7 +54,7 @@ impl TokenizerEnv for NonCanonicalEnv {
 /// Build an llguidance [`TokEnv`] from infr's in-memory tokenizer. Serializes the tokenizer to JSON
 /// and reparses it on toktrie's side (decoupling the `tokenizers` versions); `eos_ids` mark stop
 /// tokens; `vocab` is the model's logit width so the token trie matches the logits exactly. Wrapped in
-/// [`NonCanonicalEnv`] so the mask is consistent with `consume` (see that type's docs).
+/// `NonCanonicalEnv` so the mask is consistent with `consume` (see that type's docs).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn build_tok_env(tokenizer: &Tokenizer, vocab: usize, eos_ids: &[u32]) -> Result<TokEnv> {
     let json = tokenizer
@@ -100,7 +100,7 @@ impl Constraint {
     }
 
     /// Mask `logits` in place to the grammar's allowed tokens (disallowed → -inf). Then the caller
-    /// samples as usual and feeds the chosen token to [`accept`](Self::accept).
+    /// samples as usual and feeds the chosen token to [`try_accept`](Self::try_accept).
     pub fn apply_mask(&mut self, logits: &mut [f32]) -> Result<()> {
         let mask = self.matcher.compute_mask().map_err(|e| anyhow!("{e}"))?;
         let n = logits.len().min(self.vocab);
@@ -162,9 +162,9 @@ impl Constraint {
 /// SUPERSET on the non-canonical GGUF tokenizer bridge — a rejected candidate is dropped and
 /// re-picked, never failed). EOS terminates only in an accepting state.
 ///
-/// The free token is drawn with the SAME [`Sampler`]/`rng` the unconstrained decode path uses, so a
+/// The free token is drawn with the SAME [`crate::sampling::Sampler`]/`rng` the unconstrained decode path uses, so a
 /// request that sets `temperature`/`top_p`/`seed` alongside `tool_choice` is honoured instead of
-/// being silently forced to greedy. At `temp<=0` [`sample_logits`](crate::sampling::sample_logits)
+/// being silently forced to greedy. At `temp<=0` `sample_logits`
 /// collapses to `argmax`, so the deterministic tool-call path is byte-for-byte unchanged; a masked
 /// (-inf) token has probability 0 in the softmax, so sampling can never leave the grammar.
 ///

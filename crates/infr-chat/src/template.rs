@@ -166,7 +166,7 @@ impl std::error::Error for TemplateError {}
 /// THE jinja chat renderer — turns `(role, content)` messages into a prompt via the GGUF's embedded
 /// `tokenizer.chat_template`. Template handling (pycompat, `enable_thinking`, bos/eos, tools) lives
 /// here so every caller (single-turn, multi-turn, CPU + GPU backends) shares it. Returns `None` if
-/// there's no template or it fails to render (caller falls back to [`chatml`]).
+/// there's no template or it fails to render (caller falls back to `chatml`).
 ///
 /// `cfg` supplies the two knobs this renderer reads — `sampling.no_think` (`INFR_NO_THINK`) and
 /// `debug.chat` (`INFR_DEBUG_CHAT`). It is a BORROWED parameter rather than a field on a renderer
@@ -326,7 +326,7 @@ fn thinking_enabled(cfg: &Config) -> bool {
 
 /// Render a raw chat-template STRING with the full infr jinja environment (pycompat,
 /// `raise_exception`, `tojson` with `indent=`, `strftime_now`) and prompt context (`messages`,
-/// `tools`, bos/eos, `enable_thinking`). This is the GGUF-free seam — [`render_core`] wraps it, and
+/// `tools`, bos/eos, `enable_thinking`). This is the GGUF-free seam — `render_core` wraps it, and
 /// template-compat regression tests feed known templates (e.g. Llama-3.x) straight through it.
 #[allow(clippy::too_many_arguments)]
 pub fn render_template(

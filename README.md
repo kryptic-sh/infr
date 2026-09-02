@@ -58,6 +58,8 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)     |
 | Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert      |
 | DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode  |
+| BitNet b1.58      | `bitnet`          | llama skeleton + SubLN, ternary TQ2_0 weights           |
+| BitNet b1.58 (MS) | `bitnet-b1.58`    | same, for the `microsoft/bitnet-b1.58-*` GGUFs (i2_s)   |
 
 Fine-tunes on any of these backbones run unchanged. **Ornith-1.0**
 (DeepReinforce.AI agentic-coding) validated 2026-07-09 — the 9B rides `qwen35`
@@ -210,7 +212,8 @@ is indexed at [`docs/perf/`](docs/perf/README.md).
   E2B + 26B-A4B MoE), Qwen3.5/3.6 (dense + MoE) — all on GPU **and** the CPU
   reference; DiffusionGemma (block text-diffusion, CPU + GPU); Llama 4 (Scout —
   GPU by default via the paged expert cache, 37 GB Q2_K on a 24 GB card; pure
-  CPU under `--dev cpu`)
+  CPU under `--dev cpu`); BitNet b1.58 (`bitnet` and Microsoft's `bitnet-b1.58`,
+  ternary weights, CPU + GPU)
 - **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
   via a native **Metal backend** (`--dev metal`) covering every op the CPU
   reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is

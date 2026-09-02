@@ -416,15 +416,25 @@ fn serve(state: &State, stream: TcpStream) {
         slice
     };
 
-    // The slot is occupied for the whole delay and released once the bytes are handed to the
-    // kernel — see the module header for why the pause comes first.
+    // The slot is occupied for exactly the delay, and released BEFORE a byte is written — see the
+    // module header. Releasing it afterwards instead is an over-count with a real race behind it:
+    // between `flush` and the decrement this thread can be preempted, and in that window the
+    // client has already read the body, dropped its permit and started the next request, which the
+    // server accepts and counts. The peak then reads one above the budget while the budget was
+    // never exceeded. (Observed as a `the_bound_covers_files_and_ranges_together` failure on a
+    // two-core CI runner, peak 5 against a bound of 4.)
+    //
+    // The counted window is therefore a subset of the interval the client holds its permit for,
+    // rather than a superset — it excludes the write tail. That cannot hide a real violation here:
+    // the delay is 25 ms and a test body is 32 KiB onto a loopback socket, so genuinely concurrent
+    // requests overlap inside the sleep, not in the microseconds after it.
     let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
     state.peak.fetch_max(now, Ordering::SeqCst);
     std::thread::sleep(BODY_DELAY);
-    let _ = out.write_all(slice);
-    let _ = out.flush();
     state.in_flight.fetch_sub(1, Ordering::SeqCst);
     state.per_file.lock().unwrap().entry(file).or_default().0 -= 1;
+    let _ = out.write_all(slice);
+    let _ = out.flush();
     // `shutdown` (unlike a hard close) still delivers what is already in the send buffer, then
     // sends FIN — which is the `Connection: close` the header promised.
     let _ = stream.shutdown(Shutdown::Both);

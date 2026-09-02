@@ -2627,43 +2627,24 @@ What is still open:
   reparse-point bug was found. Everything above that level is still unverified
   on Windows.
 
-### B67 — `moe_topk.comp` corrupts routing above 256 experts (2026-08-30)
+### B70 — no MoE model above 256 experts has ever been run (2026-09-03)
 
-**Tag:** Vulkan MoE · **Blocked on:** nothing; found while planning Qwen3.8, not
-fixed because no currently supported model trips it
+**Tag:** Vulkan MoE coverage · **Blocked on:** nothing; a gap, stated so the B67
+fix is not mistaken for more than it is
 
-`crates/infr-vulkan/shaders/moe_topk.comp` declares `shared float ssel_adj[256]`
-with the comment "256 experts → 1 KB shared — well within limits", while the
-top-k selection scan immediately below it is sized for 1024
-(`#define MAX_CHUNKS 8u`, commented "128 lanes \* 8 chunks = 1024 experts"). The
-two disagree, and the smaller one wins destructively: the no-extension branch —
-the path every `qwen35moe` layer takes — fills the array across the full expert
-count unconditionally
-(`for (uint e = 0u; e < pc.n_expert; e++) ssel_adj[e] = 0.0;`), and the
-selection loop reads `ssel_adj[e]` for every `e < pc.n_expert`.
+B67's out-of-bounds `ssel_adj` write is fixed and the ceiling is now enforced
+(`MOE_TOPK_MAX_EXPERTS` in `infr-vulkan/src/recorder.rs`, refused loudly; the
+shader sizes the array from its own scan headroom, and
+`moe_topk_shader_ceiling_matches_host` fails if the two ever drift). What that
+does NOT establish is that a >256-expert model routes CORRECTLY: the OOB was
+read off the code and never observed, and no such model has been run here or
+anywhere in this tree. The two Qwen3.8 MoE models (512 experts — see
+[qwen38.md](qwen38.md)) are the first that would exercise it, and neither has
+been pulled.
 
-At `n_expert = 512` that is an out-of-bounds shared-memory write **and** read.
-In GLSL that is undefined behaviour, so the failure is corrupted routing weights
-or a driver-dependent hang — not a clean refusal. There is no Rust-side guard
-either: `recorder.rs`'s `moe_topk` passes `n_expert` into the push constants
-with no bound check, so nothing fails loudly first.
-
-This has never fired because no supported model exceeds 256 experts (DeepSeek's
-largest sits exactly at the boundary, which is presumably where the constant
-came from). Both Qwen3.8 MoE models have **512** experts — `Qwen3.8-2.4T-A95B`
-(`qwen35moe`) and `Qwen3.8-Flash-Next` (`qwen4exp`) — so this blocks the GPU
-path for either. The CPU MoE router is `Vec`-based and unaffected, so CPU-only
-inference would be correct.
-
-**Verified:** the shader source and the absence of a `recorder.rs` guard were
-both read directly. **Not verified:** no 512-expert model has been run, here or
-anywhere in this tree — the OOB is read off the code, not observed.
-
-Fix: size `ssel_adj` to the 1024 the selection scan already assumes (4 KB
-shared, still comfortable) or chunk-index it the way `taken[]` is done, **and**
-add the bound as an explicit `bail!` on the Rust side so a future ceiling is
-refused rather than silently exceeded. See [qwen38.md](qwen38.md) for the models
-that need it.
+So the guard is verified and the fix is not. The check to run when one of those
+models is available is expert-routing parity against the CPU router, which is
+`Vec`-based and was never affected.
 
 ### B68 — the Metal backend is gated on the host OS, not on itself (2026-09-02)
 

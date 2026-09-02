@@ -4124,7 +4124,7 @@ fn lower_op(
                     *n_expert_groups_used,
                     hash_buf,
                     hash,
-                );
+                )?;
                 // EP: rewrite the global top-k ids into this rank's local shard indices before the
                 // bucket sort (out-of-band → id 0, weight 0 — those assignments bucket harmlessly
                 // and the weighted combine drops them). No-op off EP.
@@ -4422,7 +4422,7 @@ fn lower_op(
                 *n_expert_groups_used,
                 hash_buf,
                 hash,
-            );
+            )?;
             // EP: rewrite the global top-k ids into this rank's local shard indices (out-of-band →
             // id 0, weight 0). The id-indexed GEMVs below then read the local bank; the weighted
             // `moe_accumulate` drops the zero-weight (out-of-band) slots. No-op off EP.
@@ -5851,7 +5851,7 @@ fn execute_paged_moe<'a>(
             *n_expert_groups_used,
             hash_buf,
             false,
-        );
+        )?;
     }
 
     let gate_buf = r(*gate_exps)?;

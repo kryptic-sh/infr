@@ -52,12 +52,16 @@ layout(binding = 4) writeonly buffer WB { float wts[]; };
 
 shared float sval[128];
 shared uint sidx[128];
-// Per-expert score adjustment: bias (if has_bias) + group mask. Thread 0 pre-fills.
-// 256 experts → 1 KB shared — well within limits.
-shared float ssel_adj[256];
 
-// n_expert headroom: 128 lanes * 8 chunks = 1024 experts.
+// n_expert headroom: one chunk per lane per iteration, up to MAX_CHUNKS chunks total (see the
+// chunked load/scan below, which indexes `t + c * gl_WorkGroupSize.x` for `c < MAX_CHUNKS`).
 #define MAX_CHUNKS 8u
+
+// Per-expert score adjustment: bias (if has_bias) + group mask. Thread 0 pre-fills.
+// Sized to the SAME n_expert headroom the chunked scan above assumes (`gl_WorkGroupSize.x` is a
+// compile-time constant tied to `local_size_x` above), so the two can never drift apart again —
+// B67 was exactly that drift, at 256 vs. the scan's headroom.
+shared float ssel_adj[gl_WorkGroupSize.x * MAX_CHUNKS];
 
 // WEIGHT score for one expert's (unbiased) logit. `mx` is the softmax shift and is used by the
 // softmax branch only: it must be >= every logit this is called with, or `exp` overflows. It is a

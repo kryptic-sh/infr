@@ -31,6 +31,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   one does not exist, with a warning naming both, so upgrading does not silently
   re-fetch gigabytes.
 
+- **The GPU MoE router no longer corrupts routing above 256 experts.**
+  `moe_topk.comp` sized its per-expert scratch `ssel_adj` for 256 while the
+  selection scan beside it was written for the chunked headroom above that, and
+  filled and read the array across the full expert count unconditionally — so a
+  model with more experts than the array holds wrote and read past it, which is
+  undefined behaviour in GLSL (corrupt routing weights or a driver hang, not a
+  clean failure). The array is now sized from the same constants the scan uses,
+  and `Recorder::moe_topk` refuses an expert count above the ceiling with a
+  message naming both numbers instead of dispatching. No supported model
+  exceeded the old bound, so nothing shipped was affected; the Qwen3.8 MoE
+  models, at 512 experts, are the first that would have been.
+
 - **Ctrl-C stops a download.** `infr pull` installed the `SIGINT`/`SIGTERM`
   handlers but nothing on the download path read the latch, so the first Ctrl-C
   appeared to do nothing and only `SIGKILL` ended a multi-gigabyte pull. Every

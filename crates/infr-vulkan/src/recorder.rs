@@ -109,6 +109,13 @@ const DENSE_SMALL_TILE_MAX_M: usize = 24;
 /// applies within the small-tile band and never disturbs `INFR_NO_SMALL_BM`'s BM=64 override.
 const DENSE_SMALL_TILE_MAX_M16: usize = 16;
 
+/// Ceiling on `n_expert` for the GPU MoE top-k router. It is the host's copy of `moe_topk.comp`'s
+/// `ssel_adj` capacity, which that shader sizes from its own chunked-scan headroom; the selection
+/// scan indexes every expert unconditionally, so a model above this would write and read past the
+/// array — undefined behaviour rather than a refusal. `moe_topk_shader_ceiling_matches_host` is
+/// what keeps the two from drifting.
+const MOE_TOPK_MAX_EXPERTS: usize = 1024;
+
 /// Upper bound on the number of buffers any single recorded dispatch binds (the widest kernel
 /// binds ≤ ~9). Sizes the stack scratch arrays in `dispatch3`/`dispatch_indirect`/`bind_descriptors`
 /// so those hot recording paths never touch the heap; a `debug_assert` guards the bound.
@@ -8422,6 +8429,9 @@ impl<'a> Recorder<'a> {
     /// Bound-buffer order matters: `dispatch` treats the last `n_out` buffers as writes, so the two
     /// WRITTEN buffers (`ids`, `wts`) must occupy the trailing slots for the hazard tracker to see
     /// the `ids` write; `bias` is read-only.
+    ///
+    /// Refuses `n_expert` above `MOE_TOPK_MAX_EXPERTS` rather than dispatching a shader that would
+    /// run off its routing scratch.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_topk(
         &self,
@@ -8440,7 +8450,14 @@ impl<'a> Recorder<'a> {
         n_expert_groups_used: u32,
         hash_ids: &dyn Buffer,
         hash: bool,
-    ) {
+    ) -> Result<()> {
+        if n_expert > MOE_TOPK_MAX_EXPERTS {
+            return Err(be(format!(
+                "moe_topk: n_expert ({n_expert}) exceeds the GPU router's ceiling of \
+                 MOE_TOPK_MAX_EXPERTS ({MOE_TOPK_MAX_EXPERTS}) — moe_topk.comp's ssel_adj scratch \
+                 is sized for this many experts and would corrupt routing above it"
+            )));
+        }
         let k = self
             .be
             .kernel("moe_topk", crate::gemm::moe_topk_spv(), 5, 36);
@@ -8467,6 +8484,7 @@ impl<'a> Recorder<'a> {
             &push,
             n_tokens as u32,
         );
+        Ok(())
     }
 
     /// Expert-parallel (multi-GPU EP) band remap: after the replicated router `moe_topk`, rewrite
@@ -12716,7 +12734,8 @@ mod tests {
             0,              // n_expert_groups_used
             bbias.as_ref(), // hash_ids: unused dummy (hash == false)
             false,          // hash
-        );
+        )
+        .unwrap();
         rec.finish().unwrap();
         let mut idb = vec![0u8; n_tokens * n_used * 4];
         be.download(bids.as_ref(), &mut idb).unwrap();
@@ -12741,6 +12760,85 @@ mod tests {
             (wts[1] - 1.0).abs() < 1e-6,
             "expected ~1 for the high-logit pick: {wts:?}"
         );
+    }
+
+    /// First run of digits after `marker` — `128` from `layout(local_size_x = 128,`, `8` from
+    /// `#define MAX_CHUNKS 8u`. (`adapter.rs`'s `glsl_define_u32` cannot read the latter: GLSL's
+    /// `u` suffix is not part of a `u32`.)
+    fn glsl_u32_after(src: &str, marker: &str) -> usize {
+        let rest = src
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("`{marker}` not found in the shader source"))
+            .1;
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|e| panic!("no u32 after `{marker}`: {e}"))
+    }
+
+    /// `MOE_TOPK_MAX_EXPERTS` is the host's copy of `moe_topk.comp`'s `ssel_adj` capacity, and
+    /// nothing in the toolchain ties the two together. Drift in the dangerous direction is exactly
+    /// B67: the shared array was sized 256 while the selection scan indexed every expert up to the
+    /// chunked headroom, so a 512-expert model wrote and read past it — undefined behaviour, not a
+    /// refusal. Read both numbers back out of the shader text, and check the array is still
+    /// declared THROUGH them rather than with a bare literal this test could not see.
+    #[test]
+    fn moe_topk_shader_ceiling_matches_host() {
+        let src = include_str!("../shaders/moe_topk.comp");
+        let lanes = glsl_u32_after(src, "layout(local_size_x = ");
+        let chunks = glsl_u32_after(src, "#define MAX_CHUNKS ");
+        assert_eq!(
+            lanes * chunks,
+            MOE_TOPK_MAX_EXPERTS,
+            "moe_topk.comp's ssel_adj capacity drifted from the host guard"
+        );
+        assert!(
+            src.contains("shared float ssel_adj[gl_WorkGroupSize.x * MAX_CHUNKS];"),
+            "moe_topk.comp's ssel_adj is no longer sized by the scan's own headroom"
+        );
+    }
+
+    /// The host guard refuses above the ceiling rather than dispatching a shader that would run
+    /// off `ssel_adj`, and does NOT refuse AT it — an off-by-one there would reject a model the
+    /// kernel fits.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn moe_topk_refuses_above_the_expert_ceiling() {
+        let be = be_with(|_| {});
+        let dummy = be.alloc(4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        let call = |n_expert: usize| {
+            rec.moe_topk(
+                dummy.as_ref(),
+                dummy.as_ref(),
+                dummy.as_ref(),
+                dummy.as_ref(),
+                1,
+                n_expert,
+                1,
+                1.0,
+                0,
+                false,
+                false,
+                0,
+                0,
+                dummy.as_ref(),
+                false,
+            )
+        };
+        let err = call(MOE_TOPK_MAX_EXPERTS + 1).unwrap_err().to_string();
+        assert!(
+            err.contains("MOE_TOPK_MAX_EXPERTS"),
+            "expected the ceiling refusal, got {err}"
+        );
+        // At the ceiling the dispatch may still fail on these dummy buffers, but never with the
+        // refusal above.
+        if let Err(e) = call(MOE_TOPK_MAX_EXPERTS) {
+            assert!(
+                !e.to_string().contains("MOE_TOPK_MAX_EXPERTS"),
+                "the ceiling itself must not be refused: {e}"
+            );
+        }
     }
 
     /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the

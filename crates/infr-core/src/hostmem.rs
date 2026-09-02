@@ -17,118 +17,12 @@
 /// which is the conservative failure — a model that would have streamed simply does not, and says
 /// so, instead of the process being killed part-way through a generation.
 ///
-/// **Linux** reads `MemAvailable` from `/proc/meminfo`, which is the kernel's own estimate of what
-/// a new allocation can have without swapping — it already accounts for reclaimable page cache, so
-/// it is exactly the figure this tier wants and not something derivable from `MemTotal`.
-///
-/// **Windows** reads `ullAvailPhys` from `GlobalMemoryStatusEx`. Every other platform answers
-/// `None` today; macOS would need `host_statistics64`'s free/inactive/purgeable split.
-///
-/// **A cgroup memory limit overrides it.** `/proc/meminfo` is host-wide and knows nothing about the
-/// limit a container or a `systemd-run --scope -p MemoryMax=` puts on this process — measured on
-/// this box, an 8 GB scope still reports 54.6 GB available. Sizing an anonymous arena from that
-/// figure is an OOM kill, so the smaller of the two wins.
+/// The probe itself, and what each platform's figure does and does not account for, lives in
+/// [`infr_plat::mem`]. This drops the provenance that [`infr_plat::mem::available`] carries,
+/// because everything below is PURE arithmetic that only needs the number; a caller reporting on
+/// the figure should read the provenance from the seam instead.
 pub fn available_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let host = parse_mem_available(&text)?;
-        Some(match cgroup_headroom() {
-            Some(limited) => host.min(limited),
-            None => host,
-        })
-    }
-    #[cfg(windows)]
-    {
-        Some(windows_memory_status()?.ullAvailPhys)
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        None
-    }
-}
-
-#[cfg(windows)]
-fn windows_memory_status() -> Option<windows::Win32::System::SystemInformation::MEMORYSTATUSEX> {
-    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-
-    // `dwLength` is an in-parameter: `GlobalMemoryStatusEx` rejects a struct that does not
-    // announce its own size, so it cannot be left at `Default`'s zero.
-    let mut status = MEMORYSTATUSEX {
-        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
-        ..Default::default()
-    };
-    unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
-    Some(status)
-}
-
-/// Memory this process may still commit before its cgroup kills it, or `None` when no ancestor
-/// limits it.
-///
-/// Walks from the process's own cgroup up to the root, because the binding limit is the TIGHTEST
-/// of the ancestors and not necessarily the leaf's — a container's leaf is often unlimited while
-/// the pod slice above it is capped. Both hierarchy versions are read: v2's `memory.max` /
-/// `memory.current`, and v1's `memory.limit_in_bytes` / `memory.usage_in_bytes`, whose "no limit"
-/// is a sentinel near `u64::MAX` rather than a word.
-#[cfg(target_os = "linux")]
-fn cgroup_headroom() -> Option<u64> {
-    let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let mut tightest: Option<u64> = None;
-    for line in own.lines() {
-        // v2: `0::/a/b`. v1: `N:memory:/a/b` (other controllers are not ours to read).
-        let mut parts = line.splitn(3, ':');
-        let hier = parts.next()?;
-        let ctrl = parts.next()?;
-        let path = parts.next()?;
-        let (root, max_file, cur_file) = if hier == "0" && ctrl.is_empty() {
-            ("/sys/fs/cgroup", "memory.max", "memory.current")
-        } else if ctrl.split(',').any(|c| c == "memory") {
-            (
-                "/sys/fs/cgroup/memory",
-                "memory.limit_in_bytes",
-                "memory.usage_in_bytes",
-            )
-        } else {
-            continue;
-        };
-        // From the leaf upward: `/a/b`, `/a`, `/`.
-        let mut at = std::path::PathBuf::from(root);
-        at.push(path.trim_start_matches('/'));
-        loop {
-            let max = read_u64(&at.join(max_file));
-            let cur = read_u64(&at.join(cur_file));
-            if let (Some(max), Some(cur)) = (max, cur) {
-                // v1 spells "unlimited" as a huge number; treat anything past the host's plausible
-                // range as no limit rather than as headroom nobody has.
-                if max < u64::MAX / 2 {
-                    let free = max.saturating_sub(cur);
-                    tightest = Some(tightest.map_or(free, |t: u64| t.min(free)));
-                }
-            }
-            if at.as_os_str().len() <= root.len() || !at.pop() {
-                break;
-            }
-        }
-    }
-    tightest
-}
-
-/// One cgroup value file: a decimal, or `None` for the `max` sentinel, a missing file, or junk.
-#[cfg(target_os = "linux")]
-fn read_u64(path: &std::path::Path) -> Option<u64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-/// Pull `MemAvailable` (in kB, as `/proc/meminfo` always reports it) out of the file's text.
-///
-/// Split from the read so the parse is testable against a literal — the one machine this runs on
-/// cannot produce a file with the field missing, which is the case worth checking.
-#[cfg(any(target_os = "linux", test))]
-fn parse_mem_available(text: &str) -> Option<u64> {
-    let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
-    // `MemAvailable:   12345678 kB`
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kb * 1024)
+    infr_plat::mem::available().map(|a| a.bytes)
 }
 
 /// Never take the last of the machine's memory: the larger of this and [`HEADROOM_FRACTION`] of
@@ -297,61 +191,6 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
-
-    #[test]
-    fn parses_mem_available_in_kb() {
-        let text = "MemTotal:       65780000 kB\nMemFree:         2000000 kB\n\
-                    MemAvailable:   43000000 kB\nBuffers:          100000 kB\n";
-        assert_eq!(parse_mem_available(text), Some(43_000_000 * 1024));
-    }
-
-    /// A kernel too old to report `MemAvailable` must produce `None`, not a figure derived from
-    /// `MemTotal` — auto-sizing against total memory would commit the page cache's share too.
-    #[test]
-    fn a_file_without_the_field_is_unknown() {
-        let text = "MemTotal:       65780000 kB\nMemFree:         2000000 kB\n";
-        assert_eq!(parse_mem_available(text), None);
-    }
-
-    #[test]
-    fn a_malformed_field_is_unknown() {
-        assert_eq!(parse_mem_available("MemAvailable:   plenty kB\n"), None);
-        assert_eq!(parse_mem_available("MemAvailable:\n"), None);
-    }
-
-    /// The probe must agree with itself on the machine running the tests: a plausible, non-zero
-    /// figure no larger than what the same file reports as total.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_live_probe_is_plausible() {
-        let avail = available_bytes().expect("linux always has /proc/meminfo");
-        let text = std::fs::read_to_string("/proc/meminfo").expect("meminfo");
-        let total: u64 = text
-            .lines()
-            .find(|l| l.starts_with("MemTotal:"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse::<u64>().ok())
-            .expect("MemTotal")
-            * 1024;
-        assert!(avail > 0, "available must be non-zero");
-        assert!(avail <= total, "available {avail} exceeds total {total}");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn the_windows_live_probe_is_plausible() {
-        let avail = available_bytes().expect("windows GlobalMemoryStatusEx should answer");
-        let status = windows_memory_status().expect("GlobalMemoryStatusEx");
-        assert!(
-            status.ullTotalPhys > 0,
-            "total physical memory must be non-zero"
-        );
-        assert!(
-            avail <= status.ullTotalPhys,
-            "available {avail} exceeds total {}",
-            status.ullTotalPhys
-        );
-    }
 
     /// Headroom is the point: the budget never equals what is available, however much there is.
     #[test]

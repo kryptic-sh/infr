@@ -31,6 +31,7 @@
 pub mod fileio;
 pub mod link;
 pub mod lock;
+pub mod mem;
 pub mod paths;
 pub mod proc;
 pub mod signal;

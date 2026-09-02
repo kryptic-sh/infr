@@ -444,7 +444,13 @@ mod tests {
         // fake_hf sets refs/main to the last commit written; assert it wins.
         let store = store_at(hub.to_path_buf());
         let got = store.resolve_repo("u/r", None).unwrap();
-        assert!(got.to_string_lossy().contains("snapshots/new/"));
+        // Compare components, not a substring: the separator is `\` on Windows, so a literal
+        // "snapshots/new/" matches nothing there however right the answer is.
+        let mut components = got.components().map(|c| c.as_os_str());
+        assert!(
+            components.any(|c| c == "snapshots") && components.next() == Some("new".as_ref()),
+            "expected a snapshots/new path, got {got:?}"
+        );
     }
 
     #[test]

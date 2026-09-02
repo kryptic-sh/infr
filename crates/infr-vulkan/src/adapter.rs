@@ -172,9 +172,9 @@ fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
     // `kernels.vulkan.no_replay` (`INFR_SEAM_NO_REPLAY`) forces the static per-execute path
-    // (INFR_PROF_OPS timestamps work there; the replay path can't report them). §6.12: ONE field read
+    // (INFR_PROF_OPS timestamps work there; the replay path can't report them). ONE field read
     // `is_ok()` here and `!no_replay` in the llama runner — both halves now come off the same
-    // `Config` (the runner's moved in S4, this one in S5b).
+    // `Config`.
     if be_.cfg().kernels.vulkan.no_replay {
         return false;
     }
@@ -423,7 +423,7 @@ const MROW16_BAND: usize = 1;
 /// GEMV; the mmv kernels stay reachable for A/B + future re-tuning. (The m≥3 mrow PREFILL mmv is
 /// UNAFFECTED — it still wins: E2B pp4@d4096 loses 5.3% under `INFR_NO_MMV`.)
 ///
-/// §10.2: the two knobs are DIFFERENT grammars and interact here — `INFR_MMV_DECODE` is `presence`
+/// The two knobs are DIFFERENT grammars and interact here — `INFR_MMV_DECODE` is `presence`
 /// (`mmv_decode`, default `false`), `INFR_NO_MMV` is `presence-inv` (`mmv`, default `true`), and the
 /// site is `mmv_decode && mmv`.
 fn mmv_decode_enabled(vk: &infr_core::config::VulkanCfg) -> bool {
@@ -530,7 +530,7 @@ fn mmv_int8_decode_dtypes(
     vk: &infr_core::config::VulkanCfg,
 ) -> &'static [infr_core::DType] {
     use infr_core::DType::{Iq4Nl, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
-    // §10.3: `INFR_MMV_MW` is TRI-state — `mmv_mw: Option<bool>`, where `Some(false)` is the exact
+    // `INFR_MMV_MW` is TRI-state — `mmv_mw: Option<bool>`, where `Some(false)` is the exact
     // string `"0"`, `Some(true)` any other value, and `None` (unset) the unified default below.
     match vk.mmv_mw {
         Some(false) => &[], // force-off everywhere
@@ -6811,9 +6811,9 @@ mod tests {
             i8_dot: true,
             ..Default::default()
         };
-        // `kernels.vulkan.mmv_mw`, the tri-state (§10.3): `None` = unset (the shipping default),
+        // `kernels.vulkan.mmv_mw`, the tri-state: `None` = unset (the shipping default),
         // `Some(true)` = `INFR_MMV_MW=1` (any non-"0" value), `Some(false)` = `INFR_MMV_MW=0`.
-        // A VALUE per sweep step since S5b — no process env, no guard, no serialization needed.
+        // A VALUE per sweep step — no process env, no guard, no serialization needed.
         let vkcfg = |mmv_mw: Option<bool>| infr_core::config::VulkanCfg {
             mmv_mw,
             ..Default::default()

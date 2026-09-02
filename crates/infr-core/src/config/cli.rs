@@ -1,21 +1,21 @@
 //! The CLI layer: the bespoke clap flags plus `--set <config.path>=<value>`.
 //!
 //! `infr-core` cannot depend on clap (and must not), so the CLI fills a plain
-//! [`ConfigOverrides`] and this module folds it into a [`PartialConfig`]. In S1 the CLI's
-//! `DeviceOpts::resolve` / `SamplingOpts::resolve` stop writing `std::env::set_var` and write
-//! `ConfigOverrides::flags` instead.
+//! [`ConfigOverrides`] and this module folds it into a [`PartialConfig`]. The CLI's
+//! `DeviceOpts::resolve` / `SamplingOpts::resolve` write `ConfigOverrides::flags` rather than
+//! `std::env::set_var`.
 //!
-//! **`--set` is ADDITIVE (§11 [DECIDE-3]).** Every flag that exists today keeps its name and
+//! **`--set` is ADDITIVE.** Every flag that exists today keeps its name and
 //! semantics; `--set` exists so the ~150 knobs with no dedicated flag are reachable without
 //! inventing ~150 flags. Within the CLI layer:
 //! - the bespoke flag WINS over a `--set` targeting the same field, and passing both prints a
 //!   warning naming the field, so a user who typed `--ctx 32k --set device.ctx=8k` is told which
 //!   one applied;
 //! - two `--set`s for the same path are an ERROR, not a silent last-wins;
-//! - an unknown `--set` path is a HARD error with a did-you-mean (§11 [DECIDE-5]/[DECIDE-6]) —
-//!   unlike the file layer, which warns and ignores.
+//! - an unknown `--set` path is a HARD error with a did-you-mean, unlike the file layer, which
+//!   warns and ignores.
 //!
-//! **`--set` takes the CONFIG path, never the env name (§11 [DECIDE-6]).** They are not 1:1:
+//! **`--set` takes the CONFIG path, never the env name.** They are not 1:1:
 //! `INFR_NO_GEMM_WARP` maps to `gemm_warp=false`, `INFR_NO_GEMV_REG` and `INFR_GEMV_VARIANT` both
 //! map to one `variant` field, and `INFR_MMV_MW` is tri-state. One grammar, copy-pasteable
 //! between `--set` and the config file in both directions.

@@ -11,7 +11,7 @@ use infr_core::graph::{Graph, Op};
 use infr_core::tensor::{DType, TensorDesc};
 use infr_metal::MetalBackend;
 
-/// A backend on an EXPLICIT `MetalCfg` (S6). Every kill-switch these probes A/B is a config field
+/// A backend on an EXPLICIT `MetalCfg`. Every kill-switch these probes A/B is a config field
 /// now, so each arm builds its own backend from a VALUE — no `EnvGuard`, no process-wide lock, no
 /// restore, and no ordering hazard against the other tests in this binary.
 fn be_with(metal: &MetalCfg) -> MetalBackend {

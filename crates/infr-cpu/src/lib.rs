@@ -257,8 +257,8 @@ pub struct CpuBackend {
     /// `kernels.cpu.{spin,spinpool,repack_mb,reference}`, `prof.prof_ops` and
     /// `debug.moe_counts{,_dump}`.
     ///
-    /// Every construction site inside this repo goes through [`CpuBackend::new_with`] (S4 threaded
-    /// the seam's `Arc<Config>` into them). [`CpuBackend::new`] survives as the ENV-SOURCED twin
+    /// Every construction site inside this repo goes through [`CpuBackend::new_with`] (the seam
+    /// threads its `Arc<Config>` into them). [`CpuBackend::new`] survives as the ENV-SOURCED twin
     /// for a library caller that has no config of its own: ONE
     /// [`infr_core::config::Config::load_from_env`] per backend, in place of the scattered
     /// per-read `std::env::var` calls it replaced. It is not a bridge to be deleted — it is the
@@ -267,7 +267,7 @@ pub struct CpuBackend {
 }
 
 /// `default()` is `new()` — the env-sourced bridge, NOT `Config::default()`. Keeping them the same
-/// value is what makes this slice behaviour-preserving: before S3 `CpuBackend` derived `Default`
+/// value is what makes this behaviour-preserving: `CpuBackend` used to derive `Default`
 /// and `new()` was `default()`, and every knob was read from the environment further down.
 impl Default for CpuBackend {
     fn default() -> Self {
@@ -309,7 +309,7 @@ impl CpuBackend {
     /// Reference mode is for oracles and triage only — it is far slower and it is NOT what the
     /// CPU goldens pin (`cpu_golden_qwen3` = the production int8 path).
     ///
-    /// Since S3 the mode is the `kernels.cpu.reference` config field and this is the shorthand for
+    /// The mode is the `kernels.cpu.reference` config field and this is the shorthand for
     /// setting it — `new()`'s configuration with that one field flipped, so an oracle run still
     /// honours the same `kernels.cpu.*` knobs the production backend does. It has no env key and
     /// never had one: the caller chooses the mode, which is the shape the rest of the campaign
@@ -320,7 +320,7 @@ impl CpuBackend {
 
     /// [`Self::reference`] on a CALLER-supplied configuration — the same `kernels.cpu.reference`
     /// flip, applied to the config the caller already holds instead of one built from the
-    /// environment. S4's seam uses this (it owns an `Arc<Config>` and must not re-read the
+    /// environment. The seam uses this (it owns an `Arc<Config>` and must not re-read the
     /// environment); `reference()` stays as the shorthand for callers that have none.
     pub fn reference_with(cfg: Arc<Config>) -> Self {
         let mut cfg = (*cfg).clone();

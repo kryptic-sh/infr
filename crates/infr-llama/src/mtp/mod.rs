@@ -103,7 +103,7 @@ pub fn mtp_enabled() -> bool {
 /// drifted: one warned on the parked path, the other silently ignored the env var.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn should_use_mtp(cfg: &crate::Config, ec: &crate::EngineConfig) -> bool {
-    // `spec.mtp` is the EXACT string "1" (§10.4) — `INFR_MTP=true` did nothing before and still
+    // `spec.mtp` is the EXACT string "1" — `INFR_MTP=true` did nothing before and still
     // does nothing; the env layer owns that comparison now.
     if !ec.spec.mtp {
         return false;

@@ -18,15 +18,15 @@ fn blk_bytes(dt: DType) -> usize {
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn decode_gemv_bw() {
     // `kernels.vulkan.gemv.*` (`INFR_GEMV_*` / `INFR_NO_GEMV_*`) is resolved at backend
-    // construction since S5b — the routing knobs are a VALUE, not process env — so each mode is its
+    // construction — the routing knobs are a VALUE, not process env — so each mode is its
     // own backend and the six stay live together (the interleaved best-of-3 below needs that).
     // Each mode fully specifies the group so precedence is explicit (SG > RM > tree in the
     // recorder), exactly as the old `cfg()` env re-set did.
     //
     // The six devices are built INSIDE the shape loop and dropped with it. Six live backends each
-    // holding a shape's ~200 MiB cache-busting weight set is 6x the pre-S5b footprint, and holding
-    // that across all 18 shapes trips the VRAM guard on a 24 GiB part; per-shape devices bound the
-    // peak to one shape (worst case: lm_head, 6 x 3 x 511 MB).
+    // holding a shape's ~200 MiB cache-busting weight set is 6x the old per-backend footprint, and
+    // holding that across all 18 shapes trips the VRAM guard on a 24 GiB part; per-shape devices
+    // bound the peak to one shape (worst case: lm_head, 6 x 3 x 511 MB).
     let mode_cfg = |mode: &str| -> infr_core::config::GemvCfg {
         let mut g = infr_core::config::GemvCfg {
             rm_maxout: 999_999,
@@ -98,7 +98,7 @@ fn decode_gemv_bw() {
         let n_w = (200usize << 20).div_ceil(wbytes).clamp(3, 24);
         // The same synthetic weight bytes, uploaded once per mode-backend (a buffer belongs to the
         // device that allocated it) — so the reported bit-parity compare is still against the SAME
-        // weights, and the working set per mode is unchanged from the pre-S5b single-backend run.
+        // weights, and the working set per mode is unchanged from the old single-backend run.
         let src: Vec<Vec<u8>> = (0..n_w)
             .map(|s| {
                 let mut src: Vec<u8> = (0..wbytes)

@@ -262,12 +262,12 @@ impl DiffusionGemmaChat {
         let eb = crate::diffusion::EbConfig::from_config(cfg);
         // Seed determinism (see `crate::diffusion::diffusion_generate`'s doc): the reference
         // reseeds its RNG from a fixed value every block, so a fixed `sampling.seed` (INFR_SEED;
-        // default 42 HERE — §6.12's two-defaults knob, both kept at their own site — matching the
+        // default 42 HERE — a two-defaults knob, both kept at their own site — matching the
         // oracle's `-s 42`) makes every turn reproducible.
         // The REQUEST's seed wins when it carries one. `GenParams.seed` is an accepted field that
         // `request_sampling` copies into `RequestSampling`, but this path used to read only the
         // process config, so two serve requests with different seeds produced identical output
-        // (backlog B21). Falling back to `INFR_SEED`, then to 42 — §6.12's two-defaults knob, kept
+        // (backlog B21). Falling back to `INFR_SEED`, then to 42 — a two-defaults knob, kept
         // at its own site, matching the oracle's `-s 42`.
         let seed: u64 = resolve_seed(
             req.and_then(|r| r.sampling().seed),
@@ -341,7 +341,7 @@ impl DiffusionGemmaChat {
 /// that only the middle term was ever read, so two serve requests with different `seed` values
 /// produced identical output.
 ///
-/// The 42 is §6.12's two-defaults knob kept at its own site, and matches the reference CLI's
+/// The 42 is a two-defaults knob kept at its own site, and matches the reference CLI's
 /// `-s 42`; DiffusionGemma reseeds per block, so a fixed seed makes a turn reproducible.
 fn resolve_seed(req_seed: Option<u64>, cfg_seed: Option<u64>) -> u64 {
     req_seed.or(cfg_seed).unwrap_or(42)

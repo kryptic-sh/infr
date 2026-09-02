@@ -81,7 +81,7 @@ impl PcachePersist {
     /// `~/.cache/infr/vk-pipeline-cache-{vendor:08x}-{device:08x}.bin` (XDG-aware) — keyed per
     /// device so a multi-GPU box never clobbers one GPU's cache with another's.
     ///
-    /// `disk` is `kernels.vulkan.pipeline_cache_disk` off the backend's `Config` (S5a): `false` ⇒
+    /// `disk` is `kernels.vulkan.pipeline_cache_disk` off the backend's `Config`: `false` ⇒
     /// no persistence, which is `None` here. `None` too when there is no XDG/HOME cache dir at all
     /// — Vulkan reports "no persistence available" rather than falling back to a temp dir, since
     /// its blob is re-saved throughout the run. The in-process cache handle is unaffected either

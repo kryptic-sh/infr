@@ -243,7 +243,7 @@ pub fn profiling_suppressed() -> bool {
 }
 
 /// Where [`report`] writes its JSON report — the resolved `prof.out` (`INFR_PROF_OUT`),
-/// PUSHED here at startup by whoever owns the `Config` (S7; `infr-cli`'s `main`, beside
+/// PUSHED here at startup by whoever owns the `Config` (`infr-cli`'s `main`, beside
 /// `publish_thread_count`). `None`/empty = no JSON, stderr report only.
 ///
 /// It is report state on this crate's existing process-global reporter, not a `Config` bridge
@@ -642,7 +642,7 @@ mod tests {
         global().names.lock().unwrap().truncate(saved_len);
     }
 
-    /// `prof.out` reaches the reporter by being PUSHED at startup (S7) — the report itself
+    /// `prof.out` reaches the reporter by being PUSHED at startup — the report itself
     /// never touches the environment. Round-trips the installed value, including the "unset =
     /// stderr only" state; a non-empty value is what makes [`report`] write its JSON.
     #[test]

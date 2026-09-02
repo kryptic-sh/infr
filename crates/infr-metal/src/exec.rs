@@ -1214,9 +1214,9 @@ fn replay_gpu_decode_op_supported(op: &Op, g: &infr_core::graph::Graph) -> Optio
 /// handles fully on-device, attention must be the rows=1 f16 shape with a dynamic-pos kernel
 /// instantiation (hd 64/128), and a QkNormRope must exist to name the positions buffer.
 ///
-/// `m` is the backend's [`MetalCfg`] (S6): the Conv1dSilu/DeltaNet gates mirror their arms'
+/// `m` is the backend's [`MetalCfg`]: the Conv1dSilu/DeltaNet gates mirror their arms'
 /// `cfg.deltanet` (`INFR_METAL_NODELTA`) and the MoeFfn gate mirrors `cfg.moe`
-/// (`INFR_METAL_NOMOE`) — see §6.12, where each key is read BOTH ways with one meaning.
+/// (`INFR_METAL_NOMOE`) — each key is read BOTH ways with one meaning.
 fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) -> bool {
     use infr_core::graph::TensorKind;
     let mut has_rope = false;

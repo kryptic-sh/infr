@@ -50,9 +50,9 @@ pub struct SeamModel {
     /// Shared by `Arc` into every backend and session this model opens — one configuration per
     /// process, exactly the scope the config migration settled on.
     ///
-    /// Always HANDED in: [`SeamModel::load_with`] is the only constructor. S4's transitional
-    /// `load()` — which built one from the environment for callers that had none — is gone as of
-    /// S8; every caller in the tree (CLI commands, benches, tests) has a `Config` to give, and a
+    /// Always HANDED in: [`SeamModel::load_with`] is the only constructor. The transitional
+    /// `load()` — which built one from the environment for callers that had none — is gone;
+    /// every caller in the tree (CLI commands, benches, tests) has a `Config` to give, and a
     /// library caller that wants today's defaults writes `Arc::new(EngineConfig::default())`
     /// rather than silently inheriting the developer's shell.
     ecfg: std::sync::Arc<crate::EngineConfig>,
@@ -113,7 +113,7 @@ fn pick_continuation(
 /// ([`infr_vulkan::VulkanBackend::new_with`]). The single funnel every seam-session constructor
 /// uses so the pinned and default paths stay in lockstep.
 ///
-/// `cfg` is the MODEL's `Arc<Config>` (S4/S5a): the backend reads its construction-time knobs —
+/// `cfg` is the MODEL's `Arc<Config>`: the backend reads its construction-time knobs —
 /// device pick, capability masking, VRAM guard, pager diagnostics — off it instead of the
 /// environment.
 fn open_backend(
@@ -353,7 +353,7 @@ pub type DenseMetalSession = DenseSession<infr_metal::MetalBackend>;
 impl SeamModel {
     /// The engine configuration this model was loaded with (see the `ecfg` field). Handed to every
     /// backend this model — or a caller holding it (`ParallelSeam`, `DenseSeamChat`, the MTP entry
-    /// points) — opens, so nothing downstream has to re-read the environment (S4/S5a).
+    /// points) — opens, so nothing downstream has to re-read the environment.
     pub fn cfg(&self) -> &std::sync::Arc<crate::EngineConfig> {
         &self.ecfg
     }
@@ -363,9 +363,9 @@ impl SeamModel {
     ///
     /// THE constructor: no environment, no globals, no process-wide ordering hazard, and two
     /// models with different configurations can coexist in one process. `infr-cli` resolves ONE
-    /// `Arc<Config>` in `main()` and hands the same handle to every model it loads (§5.1). S4's
+    /// `Arc<Config>` in `main()` and hands the same handle to every model it loads. The old
     /// `load(gguf, tok)` — which built a config from the environment for callers that had none —
-    /// was deleted in S8 once every caller had one to give.
+    /// was deleted once every caller had one to give.
     pub fn load_with(
         gguf_path: &Path,
         tokenizer_path: Option<&Path>,

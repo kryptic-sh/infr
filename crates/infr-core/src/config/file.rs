@@ -1,6 +1,6 @@
 //! The config-file layer: TOML → [`PartialConfig`], plus the file lookup.
 //!
-//! **Format (§4).** Section path == struct path, and the file speaks the POSITIVE field names —
+//! **Format.** Section path == struct path, and the file speaks the POSITIVE field names —
 //! `gemm_warp = false`, never `no_gemm_warp`. The `INFR_NO_*` spellings exist only in the
 //! environment layer.
 //!
@@ -16,14 +16,14 @@
 //! gemm_warp = false
 //! ```
 //!
-//! **Lookup (§4, first EXISTING file wins, no merging across files):**
+//! **Lookup (first EXISTING file wins, no merging across files):**
 //! 1. `--config <PATH>` — an error if the path does not exist,
 //! 2. `./infr.toml`,
 //! 3. `$XDG_CONFIG_HOME/infr/config.toml`, else `~/.config/infr/config.toml`.
 //!
 //! An absent file is a no-op, never an error. A MALFORMED file is an error.
 //!
-//! **Unknown keys warn and are ignored (§11 [DECIDE-5]).** That is what lets an older binary read
+//! **Unknown keys warn and are ignored.** That is what lets an older binary read
 //! a file written for a newer one, and makes deleting a knob a non-breaking change. Typo
 //! protection comes from the warning line, not from a hard failure. `--set` is the opposite: an
 //! unknown path there is a hard error, because it was typed for this run. A value of the wrong
@@ -72,7 +72,7 @@ pub fn discover(explicit: Option<&Path>) -> Result<Option<PathBuf>, ConfigError>
         return Ok(Some(cwd));
     }
     // Not `INFR_*` and not engine configuration — the standard XDG location of the file itself,
-    // which by definition cannot come from the file (§5.3). Resolved through `infr-plat` because
+    // which by definition cannot come from the file. Resolved through `infr-plat` because
     // the `$HOME` spelling this used to hand-roll finds nothing on Windows, where that variable is
     // not normally set: the global step returned `None` there for every user, silently.
     let global = infr_plat::paths::config_dir().map(|b| b.join("config.toml"));

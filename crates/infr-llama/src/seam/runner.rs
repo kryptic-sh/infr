@@ -540,7 +540,7 @@ pub(crate) fn generate_dense_backend(
     // the old inline match did.
     // `want` is the config's already-parsed dtype (`budget::parse_kv_dtype`, applied once in the
     // env/file/CLI layer). A name nothing recognizes yields `None` here AND leaves `*_specified`
-    // true, which is exactly today's split (§11 decision 8): it falls through to the ladder below
+    // true, which is exactly today's split: it falls through to the ladder below
     // while still having suppressed auto-q8 up in the placement.
     let parse_kv_fmt = |want: Option<DType>| -> DType {
         match want {
@@ -5183,7 +5183,7 @@ pub(crate) fn generate_dense_backend(
     // `prof.stages` (INFR_PROF_STAGES): split decode per-token wall time into host setup (build
     // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
     // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
-    // EVERY decode step (R6/§10.9).
+    // EVERY decode step (R6).
     let prof_dec = ec.prof.stages;
     let mut dec_setup = std::time::Duration::ZERO;
     let mut dec_exec = std::time::Duration::ZERO;

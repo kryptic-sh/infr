@@ -1307,7 +1307,7 @@ fn moe_expert_row_tile_bench_down() {
 /// sits on the right side of both the steady-state (m≈7) and no-rewind-tail (m≈30-50) regimes.
 /// `bm(dtype)`: probes the recorder's real gate through `kernels.vulkan.small_bm`
 /// (`INFR_NO_SMALL_BM`, which forces BM=64), so this exercises the SAME code path production uses,
-/// not a hand-rolled kernel pick — one backend per tier since S5b.
+/// not a hand-rolled kernel pick — one backend per tier.
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn dense_small_m_row_tile_bench() {

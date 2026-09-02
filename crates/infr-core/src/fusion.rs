@@ -114,7 +114,7 @@ pub struct FusionPlan {
 }
 
 /// Plan the peephole fusions `cfg` enables over `graph`. Pure host logic over the IR — no device
-/// types, and (since the config campaign's S2) no environment: each pattern's escape hatch arrives
+/// types, and (since the config campaign) no environment: each pattern's escape hatch arrives
 /// as the `enabled` flag its backend read off its own `Config`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn plan_fusions(graph: &Graph, cfg: &FusionCfg) -> FusionPlan {

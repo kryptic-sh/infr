@@ -2620,6 +2620,40 @@ calls RETURN sane figures: no Mac has reported a page count through
 `host_statistics64` here, and no Windows container has reported a Job Object
 limit. That is behaviour, and only real hardware answers it.
 
+### B72 — three test fixtures resolve the HF cache by hand, and skip silently (2026-09-03)
+
+**Tag:** infr-plat residual · **Blocked on:** nothing; found while retiring
+B71's labels, out of scope for a comments-only change
+
+Three `#[cfg(test)]` model locators in `infr-llama` build the hub path
+themselves instead of asking the seam:
+
+- `util.rs`'s `test_qwen3_06b` (3 callers) and `qwen35.rs`'s `model_path` — both
+  `std::env::var("HOME").ok()? + "/.cache/huggingface/hub"`, string
+  concatenation with a forward slash.
+- `grammar.rs`'s test-module `dirs_home` (feeding `qwen3_06b`, 3 callers) —
+  `std::env::var_os("HOME")`.
+
+This is a fourth copy of a resolution the tree already owns twice over
+(`infr_plat::paths::cache_home` and `Store::discover`, which agree with
+`huggingface_hub`'s full chain). It diverges in two ways that matter:
+
+- **It reads only `HOME`.** `HF_HOME`, `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`
+  and `XDG_CACHE_HOME` are all ignored, so anyone whose cache is not at
+  `~/.cache/huggingface` finds nothing.
+- **Windows sets `USERPROFILE`, not `HOME`.** These locators therefore find
+  nothing on the Windows leg, and each caller SELF-SKIPS on `None` — six tests
+  reporting as passed because they never ran. VERIFIED: the code reads only
+  `HOME` and self-skips on `None`. NOT verified: that `HOME` is in fact unset on
+  the `windows-2025` runner — inferred from the platform convention, not read
+  off a CI log.
+
+The fix is to call the seam (`infr_plat::paths::cache_home`, or better
+`infr_hub::Store`, which is the thing under test's real answer). Worth doing
+with the skip made LOUD at the same time: a fixture-absent skip should say so,
+per the "a guard whose scope silently matches nothing" rule — otherwise fixing
+the path just changes which tests quietly do nothing.
+
 ### B70 — no MoE model above 256 experts has ever been run (2026-09-03)
 
 **Tag:** Vulkan MoE coverage · **Blocked on:** nothing; a gap, stated so the B67

@@ -42,7 +42,7 @@ impl Sampler {
     /// The sampler the decode loop actually runs: ONE sequence's EXPLICIT overrides (its
     /// [`RequestCtx`], carried by the scheduler's slot) layered over [`from_cfg`](Self::from_cfg).
     /// `req: None` (`infr run`, `bench`, every test) IS `from_cfg(cfg)` — the precedence
-    /// (`RequestCtx` > `Config`) is byte-for-byte what it was over `from_env()` (§5.1).
+    /// (`RequestCtx` > `Config`) is byte-for-byte what it was over `from_env()`.
     pub fn resolve(req: Option<&RequestCtx>, cfg: &infr_core::config::SamplingCfg) -> Self {
         let mut s = Self::from_cfg(cfg);
         if let Some(r) = req.map(RequestCtx::sampling) {
@@ -404,7 +404,7 @@ impl Penalties {
 /// draw the same stream given the same seed); unset falls back to a wall-clock seed.
 ///
 /// `sampling.seed` is deliberately an `Option`: the knob has TWO defaults in the tree (this
-/// wall-clock one, and `42` in the CLI/diffusion paths) and BOTH stay at their own site (§6.12).
+/// wall-clock one, and `42` in the CLI/diffusion paths) and BOTH stay at their own site.
 ///
 /// The result goes through [`legal_xorshift_state`], exactly as [`resolve_seed`] does — so
 /// `INFR_SEED=2` and `INFR_SEED=3` are DIFFERENT streams, and the wall-clock fallback can never
@@ -692,7 +692,7 @@ mod tests {
     }
 
     /// The PROCESS-default sampling config these tests layer their per-request overrides over —
-    /// the shipped defaults, built as a value. Since S4 this is what `Sampler::resolve` /
+    /// the shipped defaults, built as a value. This is what `Sampler::resolve` /
     /// `resolve_seed` take instead of reading the environment, so these tests no longer depend on
     /// (or perturb) `INFR_TEMP`/`INFR_SEED` at all and run in parallel with everything else.
     fn scfg() -> infr_core::config::SamplingCfg {
@@ -700,7 +700,7 @@ mod tests {
     }
 
     /// `Sampler::from_cfg`'s doc contract, pinned as a value: nothing set ⇒ GREEDY. This is what
-    /// keeps the goldens and every library caller deterministic (§10.7); it used to be spelled
+    /// keeps the goldens and every library caller deterministic; it used to be spelled
     /// "`INFR_TEMP` unset".
     #[test]
     fn default_sampling_cfg_is_greedy() {
@@ -727,7 +727,7 @@ mod tests {
         };
         assert_eq!(seed_rng(&pinned), 47);
         assert_eq!(resolve_seed(None, &pinned), 47);
-        // A per-request seed still WINS over the process config (§5.1's unchanged precedence).
+        // A per-request seed still WINS over the process config (the unchanged precedence).
         let ctx = RequestCtx::new(cfg(1.0, 7));
         assert_eq!(resolve_seed(Some(&ctx), &pinned), 7);
         // Adjacent PROCESS seeds must NOT collapse onto one state (the `| 1` bug: 2|1 == 3|1 == 3).

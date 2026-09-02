@@ -659,8 +659,8 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
 /// lower them to FORCE a normal model's lm_head/embed to split so the always-1-chunk path can be
 /// proven bitwise-identical to the split one on real hardware.
 ///
-/// **S5b:** this pair used to be two `AtomicU64` cells seeded from the environment on first read
-/// (`cap_from_env`) — a memo, and therefore unsettable from a test (§10.6). The caps are now
+/// This pair used to be two `AtomicU64` cells seeded from the environment on first read
+/// (`cap_from_env`) — a memo, and therefore unsettable from a test. The caps are now
 /// resolved ONCE per `Recorder` at construction (`Recorder::bda_chunk_elem_cap` /
 /// `bda_chunk_byte_cap` fields, hoisted from the backend's `Config`) and passed down, so nothing
 /// reads the environment and nothing latches process-wide.
@@ -845,7 +845,7 @@ pub struct Recorder<'a> {
     /// indirect-command read of GPU-written dispatch args.
     indirect_pending: std::cell::Cell<bool>,
     /// Debug knobs, resolved ONCE at construction from the backend's `Config` — `debug.no_barrier`,
-    /// `debug.full_barrier`, `prof.stages` (S5b). Per-dispatch paths read these fields, never a
+    /// `debug.full_barrier`, `prof.stages`. Per-dispatch paths read these fields, never a
     /// config tree walk and never the environment.
     no_barrier: bool,
     full_barrier: bool,
@@ -879,7 +879,7 @@ pub struct Recorder<'a> {
     /// The submit splitter reads it to decide when the segment has grown to the device's cap —
     /// see `VulkanShared::submit_dispatch_cap` and `adapter::execute_static`.
     dispatches: std::cell::Cell<usize>,
-    /// `kernels.vulkan.bda_chunk_elems` / `_bytes`, HOISTED here at construction (§10.6 — they used
+    /// `kernels.vulkan.bda_chunk_elems` / `_bytes`, HOISTED here at construction (they used
     /// to be two env-seeded `AtomicU64` memos). Read on the decode GEMV path via
     /// [`Self::chunk_caps`].
     bda_chunk_elem_cap: u64,
@@ -5244,7 +5244,7 @@ impl<'a> Recorder<'a> {
         // skips flash entirely when even bm=32 won't fit, so one of these always fits here.
         let shared_limit = self.be.max_shared_memory_bytes();
         let bm64_shared = 64 * crate::FLASH_SHARED_PER_ROW; // 58112 B
-                                                            // `INFR_FLASH_BM=32` (`kernels.vulkan.flash_bm32` — compared to the LITERAL "32", §10.4)
+                                                            // `INFR_FLASH_BM=32` (`kernels.vulkan.flash_bm32` — compared to the LITERAL "32")
                                                             // forces the small (29056 B) tile even on a 64 KB device, so the bm=32 shaders get
                                                             // numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
         let force_bm32 = self.vk().flash_bm32;
@@ -10575,7 +10575,7 @@ mod tests {
     /// neither the (deleted) `OnceLock<GemvKnobs>` memo nor its replacement can change a
     /// kernel-selection decision.
     ///
-    /// S5b: the struct under test is now `infr_core::config::GemvCfg`, resolved through the config
+    /// The struct under test is now `infr_core::config::GemvCfg`, resolved through the config
     /// ENV LAYER with an injected reader — the same `HashMap` states as before, and still zero
     /// contact with the process environment (R7).
     #[test]
@@ -11494,7 +11494,7 @@ mod tests {
         // A per-backend `Config` value, not an `EnvGuard`: this test and
         // `attn_flash_warp_dequant_parity` both drive `flash_splits`, and while they were env-global
         // one would clear the knob the other was still running under (both failed together, both
-        // passed individually). Two backends, two values, no lock, no restore (S5b / R7).
+        // passed individually). Two backends, two values, no lock, no restore (R7).
         let be = be_with(|v| {
             v.flash_warp = false;
             v.flash_splits = Some(2);
@@ -11844,7 +11844,7 @@ mod tests {
                 .collect()
         };
         // The four `attention_prefill_flash` build selections, each as its own backend + tier
-        // config. Pre-S5b these were four `EnvGuard` cases over ONE backend; the tiers are now
+        // config. These used to be four `EnvGuard` cases over ONE backend; the tiers are now
         // resolved at construction, so a case IS a backend (R7 — no env, no serialization).
         #[allow(clippy::type_complexity)]
         let cases: Vec<(VulkanBackend, &str)> = vec![

@@ -2,7 +2,7 @@
 //!
 //! Every test here is PURE: the env layer is driven through an injected `HashMap` reader and the
 //! file layer through a string literal, so nothing touches the process environment or the
-//! filesystem. That is the property the whole campaign exists to buy (§8.8) — these tests run in
+//! filesystem. That is the property the whole campaign exists to buy — these tests run in
 //! parallel with each other and with everything else in the binary, with no lock and no restore
 //! guard.
 
@@ -44,15 +44,15 @@ fn cli_layer(sets: &[&str]) -> PartialConfig {
     .0
 }
 
-// ── §8.1 ─────────────────────────────────────────────────────────────────────
+// ── Defaults ─────────────────────────────────────────────────────────────────
 
 /// Every default is the shipped behaviour, and an empty stack of layers changes nothing.
 ///
-/// The plan words this as "every field's `Default` equals the value in `manifest.rs`"; the
-/// manifest records grammar and destination, not defaults (a default lives in exactly one place —
-/// `impl Default` — precisely so it cannot disagree with a second copy). What is checkable, and
-/// what this pins, is that (a) folding nothing is `Config::default()`, (b) folding three EMPTY
-/// layers is `Config::default()`, and (c) the defaults §6/§10 call out by name are what they say.
+/// The manifest records grammar and destination, not defaults (a default lives in exactly one
+/// place — `impl Default` — precisely so it cannot disagree with a second copy). What is
+/// checkable, and what this pins, is that (a) folding nothing is `Config::default()`, (b) folding
+/// three EMPTY layers is `Config::default()`, and (c) the defaults called out by name below are
+/// what they say.
 #[test]
 fn default_config_matches_documented_defaults() {
     assert_eq!(Config::default(), Config::load_from_layers(&[]));
@@ -63,23 +63,23 @@ fn default_config_matches_documented_defaults() {
     );
 
     let d = Config::default();
-    // §10.7: `Sampler::from_cfg`'s doc contract — unset ⇒ greedy, so goldens stay deterministic.
+    // `Sampler::from_cfg`'s doc contract — unset ⇒ greedy, so goldens stay deterministic.
     assert_eq!(d.sampling.temp, 0.0);
     assert_eq!(d.sampling.top_k, 20);
     assert_eq!(d.sampling.top_p, 0.95);
     assert_eq!(d.sampling.seed, None);
     assert_eq!(d.sampling.max_new, 2048);
-    // §6.1: `Option` means "the user pinned it"; the 1024 / iGPU-adaptive chain stays at its site.
+    // `Option` means "the user pinned it"; the 1024 / iGPU-adaptive chain stays at its site.
     assert_eq!(d.device.ubatch, None);
     assert_eq!(d.device.ubatch_parallel, 256);
     assert_eq!(d.device.submit_dispatches, None);
     assert_eq!(d.device.subgroup_pref, None);
-    // §6.3 / §6.4.
+    // kv.
     assert_eq!(d.kv.slots, 4);
     assert!(d.kv.ring);
     assert!(!d.kv.force_q8);
 
-    // §6.5 / §10.2: the mmv tier is ON by default — `INFR_NO_MMV` is presence-INV.
+    // The mmv tier is ON by default — `INFR_NO_MMV` is presence-INV.
     assert!(d.kernels.vulkan.mmv);
     assert!(!d.kernels.vulkan.mmv_decode);
     assert_eq!(d.kernels.vulkan.mmv_mw, None);
@@ -90,7 +90,7 @@ fn default_config_matches_documented_defaults() {
         d.kernels.vulkan.dn_chunk_scan,
         "positively spelled, read is_err()"
     );
-    // §6.5b: `variant` is COMPUTED and defaults to Some("reg"), not None.
+    // `variant` is COMPUTED and defaults to Some("reg"), not None.
     assert_eq!(d.kernels.vulkan.gemv.variant.as_deref(), Some("reg"));
     assert_eq!(d.kernels.vulkan.gemv.rm, 2);
     assert_eq!(d.kernels.vulkan.gemv.rm_maxout, usize::MAX);
@@ -98,7 +98,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kernels.vulkan.gemv.sg_minout, 2048);
     assert_eq!(d.kernels.vulkan.gemv.sg_maxout, 8192);
     assert_eq!(d.kernels.vulkan.gemv.sg_nr, 2);
-    // §6.7 / §6.9.
+    // cpu, serve.
     assert_eq!(d.kernels.cpu.spin, 1 << 15);
     assert!(d.kernels.cpu.spinpool);
     assert_eq!(d.kernels.cpu.repack_mb, 4096);
@@ -109,19 +109,19 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.serve.max_tokens_cap, 131_072);
     assert_eq!(d.serve.api_key, None);
     // A per-request wall-clock deadline is OFF unless the operator asks for one: it truncates a
-    // legitimate slow reply, so it cannot be a shipped default (§6.9).
+    // legitimate slow reply, so it cannot be a shipped default.
     assert_eq!(d.serve.request_timeout_secs, 0);
     // The periodic throughput line is ON by default (it is a log line, not a policy) and reports
     // every 5 s — but only for intervals in which something happened.
     assert_eq!(d.serve.stats_interval_secs, 5);
-    // §6.8: `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.
+    // `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.
     assert!(!d.spec.mtp);
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
     assert_eq!(d.spec.k, 6);
     assert_eq!(d.spec.decode_chain, 8);
 }
 
-// ── §8.2 / §8.3 / §8.4 — precedence ──────────────────────────────────────────
+// ── Precedence ───────────────────────────────────────────────────────────────
 
 /// The environment beats the config file.
 #[test]
@@ -176,7 +176,7 @@ fn bespoke_flag_wins_over_set_and_warns() {
     assert!(warnings[0].contains("device.ctx"), "{}", warnings[0]);
 }
 
-/// Two `--set`s for the same path are an error, not a silent last-wins (§11 [DECIDE-3]).
+/// Two `--set`s for the same path are an error, not a silent last-wins.
 #[test]
 fn duplicate_set_is_an_error() {
     let err = cli::parse_reporting(&ConfigOverrides {
@@ -187,9 +187,9 @@ fn duplicate_set_is_an_error() {
     assert!(matches!(err, ConfigError::DuplicateSet { .. }), "{err:?}");
 }
 
-// ── §8.5 — unknown keys ──────────────────────────────────────────────────────
+// ── Unknown keys ─────────────────────────────────────────────────────────────
 
-/// An unknown TOML key WARNS and is ignored (§11 [DECIDE-5]): an older binary must be able to
+/// An unknown TOML key WARNS and is ignored: an older binary must be able to
 /// read a file written for a newer one, and deleting a knob must not break anyone's config.
 #[test]
 fn unknown_toml_key_warns_and_is_ignored() {
@@ -224,14 +224,14 @@ fn unknown_toml_section_warns_once() {
     assert!(warnings[0].contains("kernels.opencl"), "{}", warnings[0]);
 }
 
-/// Invalid TOML syntax is still a hard error (§11 [DECIDE-5]).
+/// Invalid TOML syntax is still a hard error.
 #[test]
 fn malformed_toml_is_an_error() {
     let err = file::parse_str("[kv\nslots = 1\n", Path::new("infr.toml")).unwrap_err();
     assert!(matches!(err, ConfigError::Toml { .. }), "{err:?}");
 }
 
-// ── §8.6 — bad values ────────────────────────────────────────────────────────
+// ── Bad values ───────────────────────────────────────────────────────────────
 
 /// A bad value fails where it fails TODAY, and is swallowed where it is swallowed today (R1).
 ///
@@ -241,8 +241,8 @@ fn malformed_toml_is_an_error() {
 /// - [`BadValue::Ignored`] — everything else does `.and_then(parse).ok().unwrap_or(default)`, so
 ///   garbage falls back to the default and the layer reports "not specified".
 ///
-/// The FILE layer is stricter for everyone (§11 [DECIDE-5]: a value of the wrong type for a known
-/// key is a hard error), which the `ctx = "banana"` case at the end pins.
+/// The FILE layer is stricter for everyone: a value of the wrong type for a known key is a hard
+/// error there, which the `ctx = "banana"` case at the end pins.
 #[test]
 fn bad_value_is_an_error_not_a_silent_default() {
     for key in KEYS {
@@ -337,8 +337,8 @@ fn mib_and_size_string_spellings() {
     assert_eq!(cfg.paging.ring, Some(super::SizeSpec::Bytes(1 << 30)));
 }
 
-/// The device-list grammar, inherited from `infr_llama::seam::parse_device_spec` when S4 deleted
-/// that duplicate — these are its `seam_helper_tests` cases, moved to the surviving copy.
+/// The device-list grammar, inherited from `infr_llama::seam::parse_device_spec` after that
+/// duplicate was deleted — these are its `seam_helper_tests` cases, moved to the surviving copy.
 #[test]
 fn device_spec_accepts_vulkan_and_bare_indices() {
     assert_eq!(
@@ -385,13 +385,13 @@ fn device_lists_reach_their_fields() {
     assert!(none.multi.pipeline_p2p && none.multi.tp_p2p && none.multi.ep_p2p);
 }
 
-// ── §8.7 — polarity ──────────────────────────────────────────────────────────
+// ── Polarity ─────────────────────────────────────────────────────────────────
 
 /// The `presence-inv` truth table, for EVERY inverted knob in the manifest.
 ///
 /// `INFR_NO_FOO` unset ⇒ the field is `true` (feature ON); set to `""`, `"0"` or `"1"` ⇒ the field
 /// is `false` (feature OFF). The `"0"` row is the one that catches a wrong-grammar migration:
-/// only PRESENCE matters, so `INFR_NO_GEMM_WARP=0` still turns warp GEMM off (§7.0).
+/// only PRESENCE matters, so `INFR_NO_GEMM_WARP=0` still turns warp GEMM off.
 #[test]
 fn presence_inverted_knobs_have_the_right_polarity() {
     let defaults = Config::default();
@@ -422,7 +422,7 @@ fn presence_inverted_knobs_have_the_right_polarity() {
 }
 
 /// The three grammars that are NOT plain presence, spelled out because getting any of them wrong
-/// is invisible to the goldens (§10.1, §10.5).
+/// is invisible to the goldens.
 #[test]
 fn non_presence_grammars_are_preserved() {
     // `budget::flag_from`: empty and "0" are OFF here, unlike every `is_ok()` knob.
@@ -443,13 +443,13 @@ fn non_presence_grammars_are_preserved() {
             "INFR_CPU_NO_SPINPOOL={value:?}"
         );
     }
-    // Tri-state (§10.3): unset = vendor default, "0" = force off, anything else = force on.
+    // Tri-state: unset = vendor default, "0" = force off, anything else = force on.
     assert_eq!(Config::default().kernels.vulkan.mmv_mw, None);
     for (value, want) in [("0", Some(false)), ("1", Some(true)), ("", Some(true))] {
         let cfg = Config::load_from_layers(&[env_layer(&[("INFR_MMV_MW", value)])]);
         assert_eq!(cfg.kernels.vulkan.mmv_mw, want, "INFR_MMV_MW={value:?}");
     }
-    // Exact string literals (§10.4): `INFR_FLASH_BM` is compared to "32", not parsed.
+    // Exact string literals: `INFR_FLASH_BM` is compared to "32", not parsed.
     assert!(
         Config::load_from_layers(&[env_layer(&[("INFR_FLASH_BM", "32")])])
             .kernels
@@ -534,7 +534,7 @@ fn non_presence_grammars_are_preserved() {
     );
 }
 
-/// The asymmetric mrows-attn pair: `INFR_NO_MROWS_ATTN` WINS when both are set (§6.5).
+/// The asymmetric mrows-attn pair: `INFR_NO_MROWS_ATTN` WINS when both are set.
 #[test]
 fn mrows_attn_pair_is_asymmetric() {
     let both = Config::load_from_layers(&[env_layer(&[
@@ -547,7 +547,7 @@ fn mrows_attn_pair_is_asymmetric() {
     assert_eq!(Config::default().kernels.vulkan.mrows_attn, None);
 }
 
-/// `INFR_NO_GEMV_REG` silently wins over `INFR_GEMV_VARIANT` — R1-frozen (§10.11).
+/// `INFR_NO_GEMV_REG` silently wins over `INFR_GEMV_VARIANT` — R1-frozen.
 #[test]
 fn gemv_variant_is_computed_from_two_keys() {
     let cfg = Config::load_from_layers(&[env_layer(&[
@@ -559,8 +559,8 @@ fn gemv_variant_is_computed_from_two_keys() {
     assert_eq!(cfg.kernels.vulkan.gemv.variant.as_deref(), Some("rm"));
 }
 
-/// §11 [DECIDE-8]: an unparseable KV dtype still counts as SPECIFIED (so it keeps suppressing
-/// auto-q8) while yielding no dtype (so the runner still falls through to f16).
+/// An unparseable KV dtype still counts as SPECIFIED (so it keeps suppressing auto-q8) while
+/// yielding no dtype (so the runner still falls through to f16).
 #[test]
 fn kv_dtype_presence_survives_an_unparseable_name() {
     let cfg = Config::load_from_layers(&[env_layer(&[("INFR_KV_TYPE_K", "nonsense")])]);
@@ -575,7 +575,7 @@ fn kv_dtype_presence_survives_an_unparseable_name() {
     assert!(!Config::default().kv.type_k_specified);
 }
 
-// ── §8.8 — every key is read ─────────────────────────────────────────────────
+// ── Every key is read ────────────────────────────────────────────────────────
 
 /// Setting ANY manifest key through the injected reader must change what the layer specifies.
 ///
@@ -633,13 +633,14 @@ fn manifest_paths_are_real_config_paths() {
     );
 }
 
-// ── §8.9 — the manifest matches the tree ─────────────────────────────────────
+// ── The manifest matches the tree ───────────────────────────────────────────
 
 /// Every `INFR_*` literal in `crates/*/src` and `crates/*/build.rs` is accounted for.
 ///
-/// Re-runs the §6.0 derivation in Rust (no shell, so it works under `cargo test` anywhere the
-/// repo is checked out) and cross-checks it against `KEYS` ∪ `NOT_MIGRATED` ∪ `NOT_KNOBS`.
-/// Without this, the next feature branch silently re-introduces an ungoverned knob.
+/// Re-runs `manifest.rs`'s module-doc derivation command in Rust (no shell, so it works under
+/// `cargo test` anywhere the repo is checked out) and cross-checks it against `KEYS` ∪
+/// `NOT_MIGRATED` ∪ `NOT_KNOBS`. Without this, the next feature branch silently re-introduces an
+/// ungoverned knob.
 #[test]
 fn manifest_matches_the_tree() {
     let Some(crates) = repo_crates_dir() else {
@@ -705,8 +706,8 @@ fn scan_for_keys(dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// The §6.0 grep, in Rust: `"INFR_[A-Z_0-9]*"` string LITERALS (so a doc comment mentioning a knob
-/// does not count), minus the `_TEST_` fixtures.
+/// The `manifest.rs` module-doc derivation grep, in Rust: `"INFR_[A-Z_0-9]*"` string LITERALS (so
+/// a doc comment mentioning a knob does not count), minus the `_TEST_` fixtures.
 fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
@@ -737,16 +738,16 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 
 /// **The R3 exit criterion, as a test so it cannot rot.**
 ///
-/// After S8 the process environment is read for an `INFR_*` knob in exactly ONE place — the config
+/// The process environment is read for an `INFR_*` knob in exactly ONE place — the config
 /// crate's env layer, through the injected reader `Config::load` passes it. Anything else is a
 /// regression: a knob that has crept back onto ambient state, invisible to the config file, to
 /// `--set`, and to any test that wants to drive it as a value.
 ///
 /// This is the shell grep `env::var(_os)?("INFR_` over `crates/*/src` + `crates/*/build.rs`, in
-/// Rust, minus comments. The allowed hits are exactly §6.10's permanent exclusions:
+/// Rust, minus comments. The allowed hits are exactly the permanent exclusions below:
 ///
 /// * `INFR_PROFILE` in the five `build.rs` — a BUILD-time input; a runtime `Config` cannot exist
-///   when it is read (§5.3).
+///   when it is read.
 /// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that
 ///   point at files on disk, deliberately left on the environment.
 ///
@@ -754,7 +755,7 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 /// because rayon's global pool has no other input.
 #[test]
 fn no_infr_env_reads_outside_the_config_layer() {
-    /// Keys any file may still read directly (§6.10).
+    /// Keys any file may still read directly.
     const FIXTURE_KEYS: &[&str] = &[
         "INFR_TEST_GGUF",
         "INFR_TEST_MODEL",
@@ -828,11 +829,10 @@ fn scan_file_for_env_reads(path: &Path, out: &mut Vec<String>) {
     }
 }
 
-// ── §8.10 — `--set` path validation ──────────────────────────────────────────
+// ── `--set` path validation ──────────────────────────────────────────────────
 
 /// `--set` with a typo'd path is a HARD error with a did-you-mean, never a silent no-op: it was
-/// typed for THIS run, so ignoring it would give a wrong result with no second chance to notice
-/// (§11 [DECIDE-5]/[DECIDE-6]).
+/// typed for THIS run, so ignoring it would give a wrong result with no second chance to notice.
 #[test]
 fn dotted_path_setter_rejects_unknown_paths() {
     let err = cli::parse_reporting(&ConfigOverrides {
@@ -863,7 +863,7 @@ fn dotted_path_setter_rejects_unknown_paths() {
         Err(SetPathError::Unknown)
     );
 
-    // …and env NAMES are deliberately not accepted (§11 [DECIDE-6]): they are not 1:1 with fields.
+    // …and env NAMES are deliberately not accepted: they are not 1:1 with fields.
     assert_eq!(
         p.set_path("INFR_NO_GEMM_WARP", "1"),
         Err(SetPathError::Unknown)
@@ -898,7 +898,7 @@ fn set_path_covers_every_value_grammar() {
     assert_eq!(cfg.serve.api_key.as_deref(), Some("hunter2"));
 }
 
-// ── §11 [DECIDE-7] — the file layer announces diagnostics ────────────────────
+// ── The file layer announces diagnostics ────────────────────────────────────
 
 /// A `prof.*` / `debug.*` knob turned on by the FILE is announced at startup, naming the file and
 /// the fields — otherwise "why is my server printing timings" is unanswerable.
@@ -927,7 +927,7 @@ fn file_set_diagnostics_are_announced() {
 
 // ── the TOML schema itself ───────────────────────────────────────────────────
 
-/// The file speaks the POSITIVE field names, and the sections nest exactly like the structs (§4).
+/// The file speaks the POSITIVE field names, and the sections nest exactly like the structs.
 #[test]
 fn toml_sections_mirror_the_struct_paths() {
     let cfg = Config::load_from_layers(&[file_layer(
@@ -1090,7 +1090,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// `INFR_TOP_P`/`INFR_SEED`/`INFR_IGNORE_EOS`/`INFR_MAX_NEW` from the environment until S8
     /// deletes it, and `INFR_NO_THINK` is `infr-chat`'s until S7. Likewise `prof.prof`
     /// (`infr-vulkan`'s recorder still reads it) and `kernels.vulkan.{delta_strided, no_replay,
-    /// gpu_pos}` (§6.12's two-crate knobs — the llama half moved, S5 takes the Vulkan half).
+    /// gpu_pos}` (two-crate knobs — the llama half moved, S5b takes the Vulkan half).
     const S4: &[&str] = &[
         "INFR_CACHE",
         "INFR_DECODE_CHAIN",
@@ -1126,7 +1126,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     ];
 
     /// S5a — `infr-vulkan`'s CONSTRUCTION-time tier: everything `VulkanBackend::new_with` resolves
-    /// once, at device selection / capability probing / allocator setup. The six §5.2 capability
+    /// once, at device selection / capability probing / allocator setup. The six capability
     /// maskers fold into the PROBE (they are NOT `Capabilities` fields and nothing downstream
     /// re-reads them), `device.subgroup_pref` + `device.submit_dispatches` are the last two of the
     /// five loud keys, and `device.dev` reaches `pick_default_device` as a parameter.
@@ -1153,12 +1153,12 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// S5b — `infr-vulkan`'s PER-OP / PER-DISPATCH tier: everything `recorder.rs`, `adapter.rs` and
     /// `gemm.rs` used to re-read inside a lowering or dispatch path. `Recorder` borrows
     /// `&VulkanCfg` off the backend that created it (R6), and the two MEMOIZED families are hoisted
-    /// rather than de-memoized into per-call `getenv`s (§10.6): the eleven `kernels.vulkan.gemv.*`
+    /// rather than de-memoized into per-call `getenv`s: the eleven `kernels.vulkan.gemv.*`
     /// keys (was `OnceLock<GemvKnobs>`) come off the borrowed config, and
     /// `kernels.vulkan.bda_chunk_{elems,bytes}` (was two `AtomicU64` cells) become two `Recorder`
     /// fields resolved at construction.
     ///
-    /// This also closes the three §6.12 two-crate knobs (`delta_strided`, `no_replay`, `gpu_pos` —
+    /// This also closes the three two-crate knobs (`delta_strided`, `no_replay`, `gpu_pos` —
     /// the `infr-llama` halves moved in S4) and `prof.prof`, which S4 had to leave behind.
     ///
     /// NOT here, deliberately: `paging.stats` (`INFR_PAGER_STATS`) — the pager still
@@ -1236,7 +1236,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     ///
     /// Metal: `MetalBackend::new_with(cfg)`, and `exec.rs` reads `self.metal()` (a borrow of the
     /// backend's `Config`) at each selector. Fifteen of the twenty are `INFR_METAL_NO_*`
-    /// `presence-inv` kill-switches; `INFR_METAL_NODELTA`/`INFR_METAL_NOMOE` are §6.12's
+    /// `presence-inv` kill-switches; `INFR_METAL_NODELTA`/`INFR_METAL_NOMOE` are a
     /// read-both-ways pair collapsed onto ONE positive field each; `INFR_METAL_PROFILE` is the
     /// three-derived-boolean literal grammar (`is_ok()` / `== "2"` / `== "3"`), NOT an int level.
     ///
@@ -1271,7 +1271,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// `prof.profile_out` is PUSHED into `infr-prof-rt` at startup (its report runs from a C
     /// `atexit` hook with nothing to borrow); `serve.*` moved onto `AppState`.
     ///
-    /// NOT here: `INFR_DIFFUSION_VISUAL`, which §6.10 sends to a plain clap flag rather than to
+    /// NOT here: `INFR_DIFFUSION_VISUAL`, which goes to a plain clap flag rather than to
     /// `Config` — it stays in `manifest::NOT_MIGRATED`.
     ///
     /// `INFR_REQUEST_TIMEOUT_SECS` and `INFR_SERVE_STATS_SECS` were never migrated — both were BORN

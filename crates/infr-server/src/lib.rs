@@ -1068,7 +1068,7 @@ impl ModelEntry {
 pub struct AppState {
     /// Invariant: non-empty. `models[0]` is the default route.
     models: Arc<Vec<ModelEntry>>,
-    /// The resolved process configuration (S7). The handler reads `serve.api_key` and
+    /// The resolved process configuration. The handler reads `serve.api_key` and
     /// `serve.max_tokens_cap` off it instead of the environment; it is an EXPLICIT constructor
     /// parameter on every entry point that can host a real model, so an embedder cannot silently
     /// end up with auth disabled by forgetting to pass one.
@@ -1928,7 +1928,7 @@ const DEFAULT_MAX_TOKENS_CAP: u32 = 131_072;
 
 /// The configured `max_tokens` ceiling: `serve.max_tokens_cap` (`INFR_MAX_TOKENS_CAP`) if a
 /// positive integer, else [`DEFAULT_MAX_TOKENS_CAP`]. Read per-request off the borrowed `Config`
-/// the [`AppState`] owns (S7 — this used to be a per-request `std::env::var`).
+/// the [`AppState`] owns (this used to be a per-request `std::env::var`).
 ///
 /// The `> 0` guard stays HERE, at the accessor (R5): the env layer already drops a non-positive
 /// `INFR_MAX_TOKENS_CAP`, but a config FILE can name the same field, and "must be a positive
@@ -2075,9 +2075,9 @@ fn auth_gate(cfg: &Config, headers: &HeaderMap) -> Option<Response> {
 /// auth disabled.
 ///
 /// The empty-string filter is load-bearing and is NOT the `is_ok()` presence grammar every other
-/// knob uses (§10.5): `INFR_API_KEY=` means "no auth", not "auth with the empty key". The env
+/// knob uses: `INFR_API_KEY=` means "no auth", not "auth with the empty key". The env
 /// layer already maps an empty value to `Some(None)`; the filter is kept here as well so a config
-/// FILE saying `api_key = ""` means the same thing (S7 — this used to read the `INFR_API_KEY`
+/// FILE saying `api_key = ""` means the same thing (this used to read the `INFR_API_KEY`
 /// variable from the process environment and apply the same filter).
 fn configured_api_key(cfg: &Config) -> Option<&str> {
     cfg.serve
@@ -3132,10 +3132,10 @@ mod tests {
         assert!(!authorize(key, Some("Bearer   s3cre  ")));
     }
 
-    // --- the `serve.*` knobs, driven through a `Config` (S7, R7: never the environment) ------
+    // --- the `serve.*` knobs, driven through a `Config` (R7: never the environment) ------
 
     /// `serve.api_key` decides whether auth is on, and the EMPTY string still means OFF — the
-    /// grammar `INFR_API_KEY=` has always had (§10.5). Getting this backwards would turn an empty
+    /// grammar `INFR_API_KEY=` has always had. Getting this backwards would turn an empty
     /// key into a credential every request has to guess, so it is asserted explicitly.
     #[test]
     fn configured_api_key_reads_the_config_and_empty_still_means_no_auth() {

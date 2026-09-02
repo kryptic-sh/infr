@@ -3173,9 +3173,9 @@ dyn_spv!(attn_partial_dynac_nohd_spv, "attn_partial_dynac_nohd");
 /// `INFR_NO_ATTN_HD=1` (`kernels.vulkan.no_attn_hd_spec`) — select the `-DNO_HD_SPEC` attn_partial
 /// variants (general loops only).
 ///
-/// Takes the knob as a BORROWED config (S5b): it used to be a `std::env::var` here, deliberately
+/// Takes the knob as a BORROWED config: it used to be a `std::env::var` here, deliberately
 /// un-memoized because a `OnceLock` latched whatever the first attention record saw and made the
-/// knob unsettable from a test (§10.6). Reading it off the recorder's backing `Config` removes both
+/// knob unsettable from a test. Reading it off the recorder's backing `Config` removes both
 /// the memo question and the `getenv`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_hd_spec_disabled(vk: &infr_core::config::VulkanCfg) -> bool {

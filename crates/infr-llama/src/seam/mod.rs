@@ -408,8 +408,8 @@ pub(crate) fn generate_dense_cpu(
     req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    // S4 deletes S3's bridge: the CPU backend takes the config the SEAM was handed instead of
-    // building one from the environment inside `CpuBackend::new`.
+    // The CPU backend takes the config the SEAM was handed instead of
+    // building one from the environment inside `CpuBackend::new` (the old bridge is gone).
     generate_dense_cpu_mode(
         CpuBackend::new_with(ec.clone()),
         g,
@@ -768,10 +768,10 @@ const ACT_RESERVE_PAD: (u64, u64) = (3, 2);
 /// prefill loop, the activation reserve, and the SWA ring sizing below all derive from this,
 /// because the ring's correctness bound is "window + one whole prefill chunk".
 ///
-/// **`ubatch_specified` IS needed** (the S0 report's open question; §10's `INFR_UBATCH=abc` note).
-/// `INFR_UBATCH` is a §6.12 two-consumer knob — the VALUE here, and the PRESENCE the placement
+/// **`ubatch_specified` IS needed.**
+/// `INFR_UBATCH` is a two-consumer knob — the VALUE here, and the PRESENCE the placement
 /// sweeps read ([`user_pinned_ubatch`]) — and the two DISAGREE about an unusable value, exactly as
-/// the KV dtypes do (§11 decision 8). The old value site was
+/// the KV dtypes do. The old value site was
 /// `.parse().ok().filter(|&v| v > 0).unwrap_or_else(pin/default)` and the old presence site was a
 /// bare `is_err()` on the raw variable, so `INFR_UBATCH=0` (and `=abc`) yielded NO height
 /// while still disabling the sweep. That is not a corner case: `infr … -u 0` is the DOCUMENTED
@@ -791,7 +791,7 @@ pub(crate) fn ubatch_rows(ec: &EngineConfig) -> usize {
     })
 }
 
-/// Did the user PIN a prefill chunk height? The PRESENCE half of `INFR_UBATCH` (§6.12) — the dense
+/// Did the user PIN a prefill chunk height? The PRESENCE half of `INFR_UBATCH` — the dense
 /// placement sweeps skip themselves when it is true, because the user's height is authoritative.
 /// True even for a value this reader cannot use (`0`, garbage): see [`ubatch_rows`].
 pub(crate) fn user_pinned_ubatch(ec: &EngineConfig) -> bool {
@@ -999,7 +999,7 @@ pub(crate) fn pin_kv_auto_q8() {
 
 /// True when the user expressed NO explicit KV-format choice — the only state auto-q8 may fill.
 ///
-/// §11 decision 8: the `*_specified` flags, NOT `type_k.is_some()`. An unrecognized format name
+/// Use the `*_specified` flags, NOT `type_k.is_some()`. An unrecognized format name
 /// (`INFR_KV_TYPE_K=nonsense`) parses to no dtype, so the runner falls through to f16 — but it was
 /// still SUPPLIED, and today's `is_err()` reads it as "the user chose", suppressing auto-q8. Both
 /// halves of that asymmetry are preserved.
@@ -1281,7 +1281,7 @@ fn kv_pair_bytes(k_elems: usize, v_elems: usize, k_fmt: DType, v_fmt: DType) -> 
 pub(crate) fn kv_ring_wanted(cfg: &Config, ec: &EngineConfig) -> bool {
     // Not-supplied = the f16 default = ring-capable; otherwise the requested format must PARSE to
     // f16 or q8 (a name the runner would not recognize either is not ring-capable — the
-    // `specified && dtype.is_none()` case, §11 decision 8). The dtype comes from the ONE shared
+    // `specified && dtype.is_none()` case). The dtype comes from the ONE shared
     // spelling table (`budget::parse_kv_dtype`, now applied in the config's env layer), so adding
     // an alias cannot make this gate and the runner disagree.
     let fmt_ok = |specified: bool, dt: Option<DType>| {
@@ -2915,7 +2915,7 @@ pub(crate) fn generate_dense_vulkan_tp(
 /// The `multi.expert_parallel` device list (`INFR_EXPERT_PARALLEL=Vulkan0,Vulkan1,…`), or `None`
 /// when unset. Sibling of [`tensor_parallel_devices`], but its minimum is **1**, not 2 (a single
 /// device is the identity, used only as the correctness reference) — the three minimums differ and
-/// are preserved by the env layer (§6.11).
+/// are preserved by the env layer.
 pub fn expert_parallel_devices(ec: &EngineConfig) -> Option<&[usize]> {
     ec.multi.expert_parallel.as_deref()
 }
@@ -3626,9 +3626,9 @@ mod seam_helper_tests {
     use super::{kv_pair_bytes, Config, DType, EngineConfig, PlacementPins, PlacementScope};
 
     // NB: `parse_device_spec`'s own cases moved to `infr_core::config::tests` with the function
-    // (S4 deleted this crate's duplicate of that grammar — §6.11).
+    // (this crate's duplicate of that grammar was deleted).
 
-    /// `device.ubatch` is TWO readers, and an unusable value must split them (§6.12, and the
+    /// `device.ubatch` is TWO readers, and an unusable value must split them (see the
     /// `ubatch_specified` decision recorded on [`super::ubatch_rows`]): `-u 0` / a typo yields no
     /// chunk height yet still counts as "the user pinned one", which is what disables the dense
     /// placement sweeps. Collapsing them onto `Option::is_some` would silently re-enable the sweep.
@@ -3676,7 +3676,7 @@ mod seam_helper_tests {
         );
     }
 
-    /// The `*_specified` rule (§11 decision 8): an UNRECOGNIZED KV format name still suppresses
+    /// The `*_specified` rule: an UNRECOGNIZED KV format name still suppresses
     /// auto-q8 (it was supplied) while yielding no dtype, and it is not ring-capable either.
     #[test]
     fn kv_specified_beats_a_parsed_dtype() {

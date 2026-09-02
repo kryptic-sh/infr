@@ -213,14 +213,14 @@ impl MetalBackend {
 
     /// Default constructor for callers with no [`Config`] to hand in — this crate's own GPU
     /// tests/probes and external library users. Resolves `Default` < environment once and forwards
-    /// to [`new_with`](Self::new_with). Fallible for the same reason `VulkanBackend::new` is (S5a):
+    /// to [`new_with`](Self::new_with). Fallible for the same reason `VulkanBackend::new` is:
     /// the five LOUD keys are `Config`-sourced, so a layer error must not be swallowed.
     pub fn new() -> Result<Self> {
         let layer = infr_core::config::ConfigLayer::env().map_err(|e| be(e.to_string()))?;
         Self::new_with(Arc::new(Config::load_from_layers(&[layer])))
     }
 
-    /// **The real constructor (S6).** Build a backend reading every knob — the profiler level, the
+    /// **The real constructor.** Build a backend reading every knob — the profiler level, the
     /// 15 kernel kill-switches, the DeltaNet/MoE escape hatches, the lm_head mrv ceiling — from the
     /// `cfg` the caller hands in rather than the process environment.
     pub fn new_with(cfg: Arc<Config>) -> Result<Self> {

@@ -528,9 +528,9 @@ mod tests {
 
     /// `kernels.cpu.spin` reaches the two places it is used — the workers' adaptive-budget ceiling
     /// and the caller-side wait loop's yield threshold — from the `CpuCfg` the pool was built with,
-    /// and the SHIPPED default is still `1 << 15`. Before S3 this was a process-wide `OnceLock`
-    /// memo of the knob's env spelling, so a second pool could not see a different value at all
-    /// (§10.6); two pools with different budgets in one test is what could not be written before.
+    /// and the SHIPPED default is still `1 << 15`. This used to be a process-wide `OnceLock`
+    /// memo of the knob's env spelling, so a second pool could not see a different value at all;
+    /// two pools with different budgets in one test is what could not be written before.
     #[test]
     fn spin_budget_comes_off_the_config_per_pool() {
         assert_eq!(CpuCfg::default().spin, 1 << 15);

@@ -65,14 +65,13 @@ cfg_struct! {
         /// iGPU-adaptive fallback chain stays at its call site (R5).
         ubatch: Option<usize> = None,
         /// Was `INFR_UBATCH` / `--ubatch` supplied AT ALL, usable or not? The PRESENCE half of
-        /// §6.12's two-consumer knob, and — like [`KvCfg::type_k_specified`] — a SEPARATE flag
+        /// this two-consumer knob, and — like [`KvCfg::type_k_specified`] — a SEPARATE flag
         /// rather than `ubatch.is_some()`, because the two consumers disagree about an unusable
         /// value: `INFR_UBATCH=0` and `INFR_UBATCH=abc` yield NO chunk height (the value site is
         /// `.parse().ok().filter(|&v| v > 0)`) yet still count as "the user pinned a height", which
         /// is what the seam's dense placement sweeps read to skip themselves (`is_err()` at
         /// `seam/mod.rs`'s three sweep gates). Collapsing the two onto one `Option` would silently
-        /// re-enable the sweep for `-u 0`, a shipped CLI spelling (R1). S0 left this open; S4
-        /// resolved it here.
+        /// re-enable the sweep for `-u 0`, a shipped CLI spelling (R1).
         ubatch_specified: bool = false,
         /// `INFR_UBATCH_PARALLEL`: prefill chunk for a sequence sharing the GPU (`serve -np N`).
         ubatch_parallel: usize = 256,
@@ -89,7 +88,7 @@ cfg_struct! {
 
 cfg_struct! {
     /// Process-default sampling. A server request's `RequestCtx` still layers OVER this, exactly
-    /// as it layered over `Sampler::from_env()` before S4 (§5.1) — that precedence is unchanged.
+    /// as it layered over `Sampler::from_env()` in the past — that precedence is unchanged.
     SamplingCfg / PartialSamplingCfg {
         /// `INFR_TEMP`. `0.0` = greedy: the doc contract that keeps library callers and the
         /// goldens deterministic.
@@ -116,7 +115,7 @@ cfg_struct! {
         /// `INFR_KV_TYPE_K`: requested K-cache dtype. The runner's backend/alignment GATES stay at
         /// the call site (a gated-out request silently falls back to f16) — R5.
         type_k: Option<DType> = None,
-        /// Was `INFR_KV_TYPE_K` supplied AT ALL, parseable or not (§11 [DECIDE-8])? Today an
+        /// Was `INFR_KV_TYPE_K` supplied AT ALL, parseable or not? Today an
         /// unparseable name is `is_ok()` for the auto-q8 suppression check but falls through to
         /// f16 for the dtype; this flag preserves that asymmetry exactly.
         type_k_specified: bool = false,
@@ -135,7 +134,7 @@ cfg_struct! {
         /// `INFR_KV_COOPMAT_BDA`.
         coopmat_bda: bool = false,
         /// `INFR_KV_OVERFLOW`: spill KV to host RAM. `budget::flag_from` grammar — `""` and `"0"`
-        /// are OFF here, unlike every `is_ok()` knob (§10.5).
+        /// are OFF here, unlike every `is_ok()` knob.
         overflow: bool = false,
         /// `INFR_KV_OVERFLOW_VRAM_MB`, in MiB (the byte conversion is the accessor's).
         overflow_vram_mb: Option<u64> = None,
@@ -214,16 +213,16 @@ cfg_struct! {
 cfg_struct! {
     /// Vulkan kernel-tier selection. Every field is named for the thing being ENABLED and is
     /// `true` when the feature is on; the env layer inverts the `INFR_NO_*` spellings. The four
-    /// `no_*` fields are the sanctioned exceptions (§4) — their EFFECT is negative, so a positive
+    /// `no_*` fields are the sanctioned exceptions — their EFFECT is negative, so a positive
     /// name would be a lie.
     VulkanCfg / PartialVulkanCfg {
         subs {
-            /// The GEMV family (§6.5b).
+            /// The GEMV family.
             gemv: GemvCfg => PartialGemvCfg,
         }
         leaves {
         /// `INFR_NO_COOPMAT` (inverted). ANDed with [`VulkanCfg::f16`] at the probe: with
-        /// `INFR_NO_F16` set, coopmat is off regardless — preserve that AND (§5.2).
+        /// `INFR_NO_F16` set, coopmat is off regardless — preserve that AND.
         coopmat: bool = true,
         /// `INFR_CM_8X8`: the 8x8x16 coopmat shape (Intel Arc XMX opt-in).
         coopmat_8x8: bool = false,
@@ -258,7 +257,7 @@ cfg_struct! {
         /// `INFR_NO_MMQ_FALLBACK` (inverted).
         mmq_fallback: bool = true,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
-        /// this backwards disables the mmv tier for everyone (§10.2).
+        /// this backwards disables the mmv tier for everyone.
         mmv: bool = true,
         /// `INFR_MMV_DECODE`. The site is `mmv_decode && mmv`.
         mmv_decode: bool = false,
@@ -267,7 +266,7 @@ cfg_struct! {
         /// `INFR_NO_MMV_O4` (inverted).
         mmv_o4: bool = true,
         /// `INFR_MMV_MW`, TRI-state: `None` = vendor default, `Some(false)` = `"0"` (force off),
-        /// `Some(true)` = any other value (force on). Three different dtype lists (§10.3).
+        /// `Some(true)` = any other value (force on). Three different dtype lists.
         mmv_mw: Option<bool> = None,
         /// `INFR_MMV_MW_WARPS`.
         mmv_mw_warps: Option<usize> = None,
@@ -309,7 +308,7 @@ cfg_struct! {
         /// `INFR_PV_SPLITS`.
         pv_splits: Option<usize> = None,
         /// `INFR_NO_ATTN_HD`: a `presence` knob despite the `NO_` spelling — sanctioned negative
-        /// field (§4).
+        /// field.
         no_attn_hd_spec: bool = false,
         /// `INFR_NO_ATTN_DECODE` (inverted) — the decode-only split-K pass-1 specialization
         /// (`attn_decode.comp`). Setting the env var keeps the general `attn_partial` builds on
@@ -327,7 +326,7 @@ cfg_struct! {
         mla_sg: bool = true,
 
         /// `INFR_DN_CHUNK_SCAN` — spelled POSITIVELY but read with `.is_err()`: setting it
-        /// DISABLES the chunked scan. The name lies about its polarity; R2 freezes it (§10.11).
+        /// DISABLES the chunked scan. The name lies about its polarity; R2 freezes it.
         dn_chunk_scan: bool = true,
         /// `INFR_NO_DN_CHUNK` (inverted).
         dn_chunk: bool = true,
@@ -339,11 +338,11 @@ cfg_struct! {
         push_desc: bool = true,
         /// `INFR_NO_PIPELINE_CACHE` (inverted).
         pipeline_cache_disk: bool = true,
-        /// `INFR_NO_VRAM_GUARD` — sanctioned negative field (§4).
+        /// `INFR_NO_VRAM_GUARD` — sanctioned negative field.
         no_vram_guard: bool = false,
-        /// `INFR_NO_MOE_SM_POOL` — sanctioned negative field (§4).
+        /// `INFR_NO_MOE_SM_POOL` — sanctioned negative field.
         no_moe_sm_pool: bool = false,
-        /// `INFR_SEAM_NO_REPLAY` — sanctioned negative field (§4). Read `is_ok()` in the Vulkan
+        /// `INFR_SEAM_NO_REPLAY` — sanctioned negative field. Read `is_ok()` in the Vulkan
         /// adapter and `is_err()` in the llama runner; ONE field, the llama site becomes
         /// `!cfg.no_replay`.
         no_replay: bool = false,
@@ -427,7 +426,7 @@ cfg_struct! {
 cfg_struct! {
     /// CPU backend knobs.
     CpuCfg / PartialCpuCfg {
-        /// `INFR_CPU_SPIN`: spin-pool idle ceiling. Was a `OnceLock` memo before S3 (§10.6); it is
+        /// `INFR_CPU_SPIN`: spin-pool idle ceiling. Used to be a `OnceLock` memo; it is
         /// now hoisted to a `SpinPool` field at construction, so it costs nothing per call AND a
         /// second pool can hold a different value.
         spin: u32 = 32768,
@@ -497,7 +496,7 @@ cfg_struct! {
 
 cfg_struct! {
     /// Multi-GPU splits and their host/P2P transport. Per-device configs are OUT OF SCOPE for
-    /// this campaign — every backend in a multi-GPU process gets the SAME `Arc<Config>` (§5.1).
+    /// this campaign — every backend in a multi-GPU process gets the SAME `Arc<Config>`.
     MultiCfg / PartialMultiCfg {
         /// `INFR_PIPELINE`: layer-split device list, minimum 2 devices.
         pipeline: Option<Vec<usize>> = None,
@@ -565,7 +564,7 @@ impl std::fmt::Display for MetalDeviceTime {
 
 cfg_struct! {
     /// Profiling and timing output. Setting any of these from the config FILE is announced at
-    /// startup (§11 [DECIDE-7]).
+    /// startup.
     ///
     /// These names describe what each knob DOES. They used to not: `prof`, `prof2`,
     /// `prof2_shapes`, `prof_dec`, `prof_ops`, `prof_pf` were six names carrying no information
@@ -658,7 +657,7 @@ cfg_struct! {
 
 cfg_struct! {
     /// Debug/poison/barrier switches. Setting any of these from the config FILE is announced at
-    /// startup (§11 [DECIDE-7]).
+    /// startup.
     DebugCfg / PartialDebugCfg {
         /// `INFR_DEBUG_BDA_CHUNK`.
         bda_chunk: bool = false,
@@ -683,10 +682,10 @@ cfg_struct! {
 
 cfg_struct! {
     /// `infr serve` process-level knobs. Per-request sampling is NOT here — it stays on
-    /// `RequestCtx` (§5.1).
+    /// `RequestCtx`.
     ServeCfg / PartialServeCfg {
         /// `INFR_API_KEY`: bearer token. An EMPTY value means NO auth — the opposite of the
-        /// `is_ok()` presence grammar. Do not unify them (§10.5).
+        /// `is_ok()` presence grammar. Do not unify them.
         api_key: Option<String> = None,
         /// `INFR_MAX_TOKENS_CAP`: must be a positive integer, else the default.
         max_tokens_cap: u32 = 131_072,
@@ -784,7 +783,7 @@ pub enum ConfigError {
     },
     /// `--set` named a path that does not exist. Unlike the file layer (which warns and ignores),
     /// this is a HARD error: it was typed for this run, and ignoring it silently would give a
-    /// wrong result with no second chance to notice (§11 [DECIDE-5]).
+    /// wrong result with no second chance to notice.
     #[error("unknown config path `{path}`{}", .suggestion.as_ref().map(|s| format!(" — did you mean `{s}`?")).unwrap_or_default())]
     UnknownPath {
         /// The path the user typed.
@@ -792,7 +791,7 @@ pub enum ConfigError {
         /// The nearest known path, if one is close enough.
         suggestion: Option<String>,
     },
-    /// The same `--set` path was given twice. Not a silent last-wins (§11 [DECIDE-3]).
+    /// The same `--set` path was given twice. Not a silent last-wins.
     #[error("`--set {path}=` given more than once")]
     DuplicateSet {
         /// The repeated path.
@@ -813,7 +812,8 @@ pub enum ConfigError {
 impl Config {
     /// Fold `layers` (LOWEST precedence first) over [`Config::default`].
     ///
-    /// `load_from_layers(&[])` is exactly `Config::default()` — the property §8.1 pins.
+    /// `load_from_layers(&[])` is exactly `Config::default()` — the property
+    /// `default_config_matches_documented_defaults` pins.
     pub fn load_from_layers(layers: &[PartialConfig]) -> Config {
         let mut merged = PartialConfig::default();
         for layer in layers {
@@ -833,7 +833,7 @@ impl Config {
         let env_layer = ConfigLayer::env()?;
         let cli_layer = ConfigLayer::cli(overrides)?;
         let cfg = Config::load_from_layers(&[file_layer.clone(), env_layer, cli_layer]);
-        // §11 [DECIDE-7]: the file MAY set the diagnostic knobs, but it has to say so — otherwise
+        // The file MAY set the diagnostic knobs, but it has to say so — otherwise
         // "why is my server printing timings" is unanswerable from the command line.
         if let Some(path) = &file_path {
             if let Some(line) = announce_file_diagnostics(&file_layer, path) {
@@ -845,12 +845,11 @@ impl Config {
 
     /// The `Default` < environment fold, with no file and no CLI layer.
     ///
-    /// No longer transitional: `SeamModel::load` — the last bridge caller — was deleted in S8, and
+    /// No longer transitional: `SeamModel::load` — the last bridge caller — was deleted, and
     /// what remains is `CpuBackend::new` / `CpuBackend::reference`, the env-sourced TWINS of
     /// `new_with`/`reference_with` that a library caller may legitimately want (infallible is
-    /// right there — CPU owns none of the loud keys). The Vulkan bridge went away in S5a and the
-    /// Metal one similarly, when `MetalBackend::new_with(device_id,
-    /// cfg)` became the real constructors.
+    /// right there — CPU owns none of the loud keys). The Vulkan bridge went away, and the Metal
+    /// one similarly, when `MetalBackend::new_with(device_id, cfg)` became the real constructor.
     ///
     /// It is NOT `Config::load`: no file layer (these knobs were env-only before the migration, so
     /// reading a file here would ADD behaviour, and the diagnostics banner would print twice), and
@@ -877,8 +876,8 @@ impl Config {
     }
 }
 
-/// The one line printed when a config FILE turned on a `prof.*` / `debug.*` knob (§11
-/// [DECIDE-7]). Returns `None` when the file set no diagnostics. Split out from
+/// The one line printed when a config FILE turned on a `prof.*` / `debug.*` knob.
+/// Returns `None` when the file set no diagnostics. Split out from
 /// [`Config::load`] so it is testable without capturing stderr.
 pub fn announce_file_diagnostics(file_layer: &PartialConfig, path: &Path) -> Option<String> {
     let defaults = Config::default();
@@ -909,7 +908,7 @@ impl ConfigLayer {
     /// First existing file wins; there is no merging across files.
     ///
     /// Returns the layer AND the file it came from (`None` = no file found, which is a no-op, not
-    /// an error). Unknown keys are warned about on stderr and ignored (§11 [DECIDE-5]).
+    /// an error). Unknown keys are warned about on stderr and ignored.
     pub fn file(explicit: Option<&Path>) -> Result<(PartialConfig, Option<PathBuf>), ConfigError> {
         file::load(explicit)
     }
@@ -917,7 +916,7 @@ impl ConfigLayer {
     /// The environment layer, over the REAL process environment.
     ///
     /// This thin wrapper is the only impure entry point; [`env::parse`] takes an injected reader,
-    /// so tests drive it with a `HashMap` and never touch the process environment (§8.8).
+    /// so tests drive it with a `HashMap` and never touch the process environment.
     pub fn env() -> Result<PartialConfig, ConfigError> {
         env::parse(&|k| std::env::var(k).ok())
     }
@@ -931,10 +930,11 @@ impl ConfigLayer {
 /// Parse a multi-GPU device spec (`Vulkan0,Vulkan1,…`; a bare index `N` is also accepted) into
 /// physical device indices, requiring at least `min` of them.
 ///
-/// **The ONE copy of this grammar.** It existed twice until S4 — here (behind
-/// `ConfigValue for Vec<usize>`) and as `infr_llama::seam::parse_device_spec` — which is precisely
-/// the drift class this campaign removes. The seam's copy, and the `parse_device_list` `var_os`
-/// wrapper around it, are deleted; the env layer (§6.11), the TOML file and `--set` all come here.
+/// **The ONE copy of this grammar.** It used to exist twice — here (behind
+/// `ConfigValue for Vec<usize>`) and as `infr_llama::seam::parse_device_spec` — which was
+/// precisely the drift class this campaign removed. The seam's copy, and the `parse_device_list`
+/// `var_os` wrapper around it, were deleted; the env layer, the TOML file and `--set` all come
+/// here.
 ///
 /// `min` is the per-knob minimum device count — `INFR_PIPELINE`/`INFR_TENSOR_PARALLEL` need 2,
 /// `INFR_EXPERT_PARALLEL` needs 1, and those three minimums are NOT the same (R1). `0` skips the

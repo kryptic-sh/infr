@@ -14,15 +14,16 @@
 //! went through a helper that took the key name as a `&str`: `budget::env_flag`/`env_mib`/
 //! `overflow_vram_reserve`, `pager::ring_bytes_policy`, `tier::EnvRows::get`, `fusion`'s
 //! `disable_env`, `seam::parse_device_list`, `recorder::GemvKnobs::resolve` and
-//! `recorder::cap_from_env`. Any inventory built from that one grep is wrong by ~15%. The first
-//! four of those wrappers are gone as of S2; the rest go with their own slices.)
+//! `recorder::cap_from_env`. Any inventory built from that one grep is wrong by ~15%. All of
+//! those wrapper functions are gone now, folded into typed accessors as each crate moved onto
+//! `Config`.)
 //!
 //! Three things read this table:
-//! - `config::tests::env_layer_reads_every_key` (§8.8) — set each key through the injected reader
+//! - `config::tests::env_layer_reads_every_key` — set each key through the injected reader
 //!   and assert the layer noticed. This is what stops a knob being silently dropped mid-campaign.
-//! - `config::tests::presence_inverted_knobs_have_the_right_polarity` (§8.7) — the `""`/`"0"`/
+//! - `config::tests::presence_inverted_knobs_have_the_right_polarity` — the `""`/`"0"`/
 //!   `"1"` truth table for every `presence-inv` entry.
-//! - `config::tests::manifest_matches_the_tree` (§8.9) — a new `INFR_*` literal in `crates/*/src`
+//! - `config::tests::manifest_matches_the_tree` — a new `INFR_*` literal in `crates/*/src`
 //!   with no entry here fails the build's tests, so a feature branch cannot re-introduce an
 //!   ungoverned knob.
 //!
@@ -74,9 +75,8 @@ pub enum Grammar {
 ///
 /// Most keys swallow it (`.and_then(parse).ok().unwrap_or(default)`); five reject it loudly and
 /// must keep doing so. The FILE layer is stricter for everyone: a value that does not parse into
-/// a known key's type is always a hard error there (§11 [DECIDE-5] — "a value of the wrong type
-/// for a known key stays a hard error"), which is why `ctx = "banana"` fails to load from a file
-/// while `INFR_CTX=banana` is still silently ignored.
+/// a known key's type is always a hard error there, which is why `ctx = "banana"` fails to load
+/// from a file while `INFR_CTX=banana` is still silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadValue {
     /// Falls back to the default. The layer reports "not specified".
@@ -98,7 +98,8 @@ pub struct KnobKey {
     pub grammar: Grammar,
     /// What a bad value does in the env layer today.
     pub bad_value: BadValue,
-    /// A value that provably makes the env layer specify this knob — the §8.8 probe.
+    /// A value that provably makes the env layer specify this knob — used by
+    /// `env_layer_reads_every_key` to prove it does.
     pub sample: &'static str,
     /// Has the read site moved onto `Config` yet? Flipped by the slice that migrates it.
     pub migrated: bool,
@@ -123,7 +124,7 @@ macro_rules! knobs {
 }
 
 knobs! {
-    // ── device (§6.1) ────────────────────────────────────────────────────────
+    // ── device ───────────────────────────────────────────────────────────────
     "INFR_DEV"                  => "device.dev",               Text, Ignored, "vulkan0", migrated;
     "INFR_CTX"                  => "device.ctx",               Size, Ignored, "32k",     migrated;
     "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     migrated;
@@ -131,7 +132,7 @@ knobs! {
     "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      migrated;
     "INFR_SG"                   => "device.subgroup_pref",     Literal, Error, "16",     migrated;
 
-    // ── sampling (§6.2) ──────────────────────────────────────────────────────
+    // ── sampling ─────────────────────────────────────────────────────────────
     "INFR_TEMP"                 => "sampling.temp",       Float,      Ignored, "0.6",  migrated;
     "INFR_TOP_K"                => "sampling.top_k",      Int,        Ignored, "40",   migrated;
     "INFR_TOP_P"                => "sampling.top_p",      Float,      Ignored, "0.9",  migrated;
@@ -140,7 +141,7 @@ knobs! {
     "INFR_IGNORE_EOS"           => "sampling.ignore_eos", Presence,   Ignored, "1",    migrated;
     "INFR_NO_THINK"             => "sampling.no_think",   SetNotZero, Ignored, "1",    migrated;
 
-    // ── kv (§6.3) ────────────────────────────────────────────────────────────
+    // ── kv ───────────────────────────────────────────────────────────────────
     "INFR_KV_TYPE_K"            => "kv.type_k",              Dtype,       Ignored, "q8_0", migrated;
     "INFR_KV_TYPE_V"            => "kv.type_v",              Dtype,       Ignored, "q8_0", migrated;
     "INFR_KV_Q8"                => "kv.force_q8",            Presence,    Ignored, "1",    migrated;
@@ -152,7 +153,7 @@ knobs! {
     "INFR_KV_OVERFLOW_VRAM_MB"  => "kv.overflow_vram_mb",    Mib,         Ignored, "512",  migrated;
     "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  migrated;
 
-    // ── paging (§6.4) ────────────────────────────────────────────────────────
+    // ── paging ───────────────────────────────────────────────────────────────
     "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  migrated;
     "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
@@ -160,7 +161,7 @@ knobs! {
     "INFR_DRAM_BYPASS"          => "paging.dram_bypass",               Flag,     Ignored, "1",   migrated;
     "INFR_LAYER_MAJOR"          => "paging.layer_major",               TriState, Ignored, "1",   migrated;
 
-    // ── kernels.vulkan — coopmat / capability masking (§6.5, §5.2) ───────────
+    // ── kernels.vulkan — coopmat / capability masking ────────────────────────
     "INFR_NO_COOPMAT"   => "kernels.vulkan.coopmat",      PresenceInv, Ignored, "1", migrated;
     "INFR_CM_8X8"       => "kernels.vulkan.coopmat_8x8",  Presence,    Ignored, "1", migrated;
     "INFR_BF16_COOPMAT" => "kernels.vulkan.bf16_coopmat", Presence,    Ignored, "1", migrated;
@@ -171,7 +172,7 @@ knobs! {
     "INFR_NO_F16"       => "kernels.vulkan.f16",          PresenceInv, Ignored, "1", migrated;
     "INFR_NO_I8DOT"     => "kernels.vulkan.i8_dot",       PresenceInv, Ignored, "1", migrated;
 
-    // ── kernels.vulkan — GEMM / GEMV tiers (§6.5) ────────────────────────────
+    // ── kernels.vulkan — GEMM / GEMV tiers ───────────────────────────────────
     "INFR_NO_GEMM_WARP"     => "kernels.vulkan.gemm_warp",      PresenceInv, Ignored, "1",  migrated;
     "INFR_GEMM_WIDE_TILE"   => "kernels.vulkan.gemm_wide_tile", Presence,    Ignored, "1",  migrated;
     "INFR_GEMM_DIRECT_A"    => "kernels.vulkan.gemm_direct_a",  Presence,    Ignored, "1",  migrated;
@@ -193,7 +194,7 @@ knobs! {
     "INFR_MOE_SMALL_M"      => "kernels.vulkan.moe_small_m",    Int,         Ignored, "16", migrated;
     "INFR_CANVAS_CHUNK_N"   => "kernels.vulkan.canvas_chunk_n", Int,         Ignored, "5",  migrated;
 
-    // ── kernels.vulkan — attention (§6.5) ────────────────────────────────────
+    // ── kernels.vulkan — attention ───────────────────────────────────────────
     "INFR_FLASH_SPLITS"   => "kernels.vulkan.flash_splits",     Int,              Ignored, "2",  migrated;
     "INFR_FLASH_BM"       => "kernels.vulkan.flash_bm32",       Literal,          Ignored, "32", migrated;
     "INFR_FLASH_MIN_ROWS" => "kernels.vulkan.flash_min_rows",   Int,              Ignored, "8",  migrated;
@@ -210,7 +211,7 @@ knobs! {
     "INFR_MROWS_ATTN"     => "kernels.vulkan.mrows_attn",       PresenceOptTrue,  Ignored, "1",  migrated;
     "INFR_NO_MLA_SG"      => "kernels.vulkan.mla_sg",           PresenceInv,      Ignored, "1",  migrated;
 
-    // ── kernels.vulkan — DeltaNet + misc (§6.5) ──────────────────────────────
+    // ── kernels.vulkan — DeltaNet + misc ─────────────────────────────────────
     "INFR_DN_CHUNK_SCAN"      => "kernels.vulkan.dn_chunk_scan",      PresenceInv, Ignored, "1", migrated;
     "INFR_NO_DN_CHUNK"        => "kernels.vulkan.dn_chunk",           PresenceInv, Ignored, "1", migrated;
     "INFR_NO_DN_SPLIT"        => "kernels.vulkan.dn_split",           PresenceInv, Ignored, "1", migrated;
@@ -223,11 +224,11 @@ knobs! {
     "INFR_NO_GPU_POS"         => "kernels.vulkan.gpu_pos",            PresenceInv, Ignored, "1", migrated;
     "INFR_NO_FUSE_ADD"        => "kernels.vulkan.fuse_add",           PresenceInv, Ignored, "1", migrated;
 
-    // ── kernels.vulkan — BDA chunk caps (§6.5c) ──────────────────────────────
+    // ── kernels.vulkan — BDA chunk caps ──────────────────────────────────────
     "INFR_BDA_CHUNK_ELEMS" => "kernels.vulkan.bda_chunk_elems", Int, Ignored, "1024", migrated;
     "INFR_BDA_CHUNK_BYTES" => "kernels.vulkan.bda_chunk_bytes", Int, Ignored, "4096", migrated;
 
-    // ── kernels.vulkan.gemv (§6.5b) ──────────────────────────────────────────
+    // ── kernels.vulkan.gemv ──────────────────────────────────────────────────
     "INFR_NO_GEMV_RM"     => "kernels.vulkan.gemv.no_rm",     Presence,       Ignored, "1",     migrated;
     "INFR_GEMV_RM"        => "kernels.vulkan.gemv.rm",        Int,            Ignored, "4",     migrated;
     "INFR_GEMV_RM_MAXOUT" => "kernels.vulkan.gemv.rm_maxout", Int,            Ignored, "16384", migrated;
@@ -240,7 +241,7 @@ knobs! {
     "INFR_NO_GEMV_REG"    => "kernels.vulkan.gemv.variant",   PresenceClears, Ignored, "1",     migrated;
     "INFR_GEMV_VARIANT"   => "kernels.vulkan.gemv.variant",   Text,           Ignored, "rm",    migrated;
 
-    // ── kernels.metal (§6.6) ─────────────────────────────────────────────────
+    // ── kernels.metal ────────────────────────────────────────────────────────
     "INFR_METAL_NO_F16_NATIVE"    => "kernels.metal.f16_native",    PresenceInv, Ignored, "1", migrated;
     "INFR_METAL_NO_F32_NATIVE"    => "kernels.metal.f32_native",    PresenceInv, Ignored, "1", migrated;
     "INFR_METAL_NO_BF16_NATIVE"   => "kernels.metal.bf16_native",   PresenceInv, Ignored, "1", migrated;
@@ -260,16 +261,16 @@ knobs! {
     "INFR_METAL_NODELTA"          => "kernels.metal.deltanet",      PresenceInv, Ignored, "1", migrated;
     "INFR_METAL_NOMOE"            => "kernels.metal.moe",           PresenceInv, Ignored, "1", migrated;
 
-    // ── kernels.cpu (§6.7) ───────────────────────────────────────────────────
+    // ── kernels.cpu ──────────────────────────────────────────────────────────
     "INFR_CPU_SPIN"        => "kernels.cpu.spin",      Int,           Ignored, "4096", migrated;
     "INFR_CPU_NO_SPINPOOL" => "kernels.cpu.spinpool",  SetNotZeroInv, Ignored, "1",    migrated;
     "INFR_CPU_REPACK_MB"   => "kernels.cpu.repack_mb", Int,           Ignored, "1024", migrated;
 
-    // ── kernels — graph shape, `infr-llama` (§6.9) ───────────────────────────
+    // ── kernels — graph shape, `infr-llama` ──────────────────────────────────
     "INFR_NO_QKV_FUSE"      => "kernels.qkv_fuse",      PresenceInv, Ignored, "1", migrated;
     "INFR_NO_GATED_RMSNORM" => "kernels.gated_rmsnorm", PresenceInv, Ignored, "1", migrated;
 
-    // ── spec (§6.8) ──────────────────────────────────────────────────────────
+    // ── spec ─────────────────────────────────────────────────────────────────
     "INFR_MTP"                => "spec.mtp",             Literal,     Ignored, "1",         migrated;
     "INFR_NO_MTP_CKPT"        => "spec.mtp_ckpt",        PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_MTP_REPRIME"     => "spec.mtp_reprime",     PresenceInv, Ignored, "1",         migrated;
@@ -284,7 +285,7 @@ knobs! {
     "INFR_NO_GPU_SAMPLE"      => "spec.gpu_sample",      PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_GPU_EMBED"       => "spec.gpu_embed",       PresenceInv, Ignored, "1",         migrated;
 
-    // ── multi (§6.11) ────────────────────────────────────────────────────────
+    // ── multi ────────────────────────────────────────────────────────────────
     "INFR_PIPELINE"        => "multi.pipeline",        DeviceList,  Error,   "0,1", migrated;
     "INFR_TENSOR_PARALLEL" => "multi.tensor_parallel", DeviceList,  Error,   "0,1", migrated;
     "INFR_EXPERT_PARALLEL" => "multi.expert_parallel", DeviceList,  Error,   "0",   migrated;
@@ -292,7 +293,7 @@ knobs! {
     "INFR_TP_HOST"         => "multi.tp_p2p",          PresenceInv, Ignored, "1",   migrated;
     "INFR_EP_HOST"         => "multi.ep_p2p",          PresenceInv, Ignored, "1",   migrated;
 
-    // ── prof (§6.9) ──────────────────────────────────────────────────────────
+    // ── prof ─────────────────────────────────────────────────────────────────
     // One `INFR_PROF_*` prefix, and each name says what it does. Thirteen keys became eight: the
     // per-op profile had four (INFR_PROF2 / INFR_PROF_OPS / INFR_PROF2_SHAPES / INFR_METAL_PROFILE)
     // and host-side stage timing had five, one per pipeline (INFR_PROF, INFR_PROF_DEC,
@@ -306,7 +307,7 @@ knobs! {
     "INFR_PROF_METAL_DEVICE_TIME"  => "prof.metal_device_time", Text,     Ignored, "counters",    migrated;
     "INFR_PROF_METAL_DEBUG"        => "prof.metal_debug",       Presence, Ignored, "1",           migrated;
 
-    // ── debug (§6.9) ─────────────────────────────────────────────────────────
+    // ── debug ────────────────────────────────────────────────────────────────
     "INFR_DEBUG_BDA_CHUNK"     => "debug.bda_chunk",       Presence, Ignored, "1", migrated;
     "INFR_DEBUG_COOPMAT"       => "debug.coopmat",         Presence, Ignored, "1", migrated;
     "INFR_DEBUG_WIDE_DISPATCH" => "debug.wide_dispatch",   Presence, Ignored, "1", migrated;
@@ -317,7 +318,7 @@ knobs! {
     "INFR_NOBARRIER"           => "debug.no_barrier",      Presence, Ignored, "1", migrated;
     "INFR_FULLBARRIER"         => "debug.full_barrier",    Presence, Ignored, "1", migrated;
 
-    // ── serve (§6.9) ─────────────────────────────────────────────────────────
+    // ── serve ────────────────────────────────────────────────────────────────
     "INFR_API_KEY"        => "serve.api_key",        Text, Ignored, "hunter2", migrated;
     "INFR_MAX_TOKENS_CAP" => "serve.max_tokens_cap", Int,  Ignored, "4096",    migrated;
     // `0`/unset = no deadline, so the env layer does NOT filter non-positive values the way
@@ -327,14 +328,14 @@ knobs! {
     // throughput line, so the env layer must not filter it out.
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
 
-    // ── hub (§6.9) ───────────────────────────────────────────────────────────
+    // ── hub ──────────────────────────────────────────────────────────────────
     // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",
     // so the env layer must not filter it out.
     "INFR_PULL_JOBS" => "hub.pull_jobs", Int, Ignored, "4", migrated;
 }
 
 /// `INFR_*` keys that exist in `crates/*/src` (or a `build.rs`) and deliberately do NOT become
-/// configuration (§6.10). Listed here so the drift test can tell "excluded on purpose" from
+/// configuration. Listed here so the drift test can tell "excluded on purpose" from
 /// "someone added a knob and forgot the manifest".
 pub const NOT_MIGRATED: &[(&str, &str)] = &[
     (
@@ -354,7 +355,8 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
     ),
 ];
 
-/// `INFR_*` spellings that the §6.0 filter drops and that are NOT knobs at all.
+/// `INFR_*` spellings that the derivation command's filter (module docs, above) drops and that
+/// are NOT knobs at all.
 ///
 /// - `INFR_*_TEST_*` — `#[cfg(test)]` fixtures that exist only to prove a wrapper reads its own
 ///   variable; they vanish with the wrapper.

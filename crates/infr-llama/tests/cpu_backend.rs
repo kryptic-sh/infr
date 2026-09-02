@@ -38,12 +38,12 @@ macro_rules! need_model {
 /// Serialize the model-gated GPU tests against each other.
 ///
 /// No test in this file drives a knob through the environment any more — the last one,
-/// `INFR_NO_THINK`, became a `sampling.no_think` VALUE on the model's own config in S7 (see
+/// `INFR_NO_THINK`, became a `sampling.no_think` VALUE on the model's own config (see
 /// [`model_cfg`]). What is left is the GPU: these tests upload whole models and open device
 /// sessions, and cargo runs a binary's tests in parallel, so several of them racing for the same
 /// device is a VRAM problem, not a configuration one.
 ///
-/// So this is a plain, LOCAL mutex (S9), not `infr_core::test_env::EnvGuard` — that module existed
+/// So this is a plain, LOCAL mutex, not `infr_core::test_env::EnvGuard` — that module existed
 /// to serialize *and restore* environment mutations, and with nothing left to restore anywhere in
 /// the tree it was deleted. Poison-tolerant, so a failing test does not cascade-poison the rest;
 /// not re-entrant, so take it exactly once per test.
@@ -61,8 +61,9 @@ fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
 /// This is what replaced the `env.set("INFR_TEMP", "0")` / `env.set("INFR_KV_TYPE_K", …)` pattern
 /// throughout this file. `test_serial_lock` is now taken ONLY to serialise the GPU tests against
 /// each other; no test in this file sets a knob through the environment any more.
-/// `INFR_MOE_SMALL_M` and `INFR_PAGER_STATS` came off it in S5a; `INFR_SEAM_NO_REPLAY`'s Vulkan
-/// half and `INFR_I8_COOPMAT` in S5b; `INFR_NO_THINK` — the last one — in S7.
+/// `INFR_MOE_SMALL_M` and `INFR_PAGER_STATS` came off it in a later pass; `INFR_SEAM_NO_REPLAY`'s
+/// Vulkan half and `INFR_I8_COOPMAT` in another; `INFR_NO_THINK` — the last one — in the final
+/// pass of the campaign.
 fn model_cfg(
     path: &std::path::Path,
     f: impl FnOnce(&mut infr_llama::EngineConfig),
@@ -490,7 +491,7 @@ fn gpu_seam_matches_cpu_qwen3_q2k() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen3_q8_0_i8coopmat() {
     let path = need_model!(qwen3_quant("Q8_0"), "Qwen3-0.6B-Q8_0");
-    // The GPU tests stay serialized against each other; the KNOB is a config value since S5b.
+    // The GPU tests stay serialized against each other; the KNOB is a config value.
     let _tlk = test_serial_lock();
     seam_vulkan_matches_cpu_cfg(
         &path,
@@ -1008,8 +1009,8 @@ fn metal_llama_replay_matches_static() {
         .render_chat("Count from one to five, digits only.")
         .expect("render chat");
 
-    // `kernels.vulkan.no_replay` is the SEAM's half of `INFR_SEAM_NO_REPLAY` (§6.12: the Vulkan
-    // adapter reads the same knob the other way round, and S5 moves that half) — since S4 the
+    // `kernels.vulkan.no_replay` is the SEAM's half of `INFR_SEAM_NO_REPLAY` (the Vulkan
+    // adapter reads the same knob the other way round, and its half moved separately) — the
     // runner's replay gate takes it off the model's config, so the mode is a per-model value.
     let run_metal = |no_replay: bool| {
         let model = model_cfg(&path, |c| c.kernels.vulkan.no_replay = no_replay);
@@ -2106,7 +2107,7 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
         pin_ubatch(c);
         c.paging.cache = Some(infr_core::SizeSpec::Bytes(50 * 1024 * 1024));
         // `paging.stats`: the pager's hit/miss/eviction report, on the PAGED model only. A value
-        // on this model's config since S5a (`VulkanBackend::new_with` hands it to the pager
+        // on this model's config (`VulkanBackend::new_with` hands it to the pager
         // sessions), so it no longer has to be an env write the resident run above would also see.
         c.paging.stats = true;
     });
@@ -3121,8 +3122,8 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
 fn gpu_diffusion_gemma_denoise_replay_matches_static() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     // The guard now only serializes this GPU test against the others: BOTH halves of
-    // `INFR_SEAM_NO_REPLAY` (§6.12 — the seam's replay gate and the Vulkan adapter's
-    // `decode_eligible`) read the per-model `kernels.vulkan.no_replay` since S5b, so the mode is
+    // `INFR_SEAM_NO_REPLAY` (the seam's replay gate and the Vulkan adapter's
+    // `decode_eligible`) read the per-model `kernels.vulkan.no_replay`, so the mode is
     // entirely a value on the config below.
     let _tlk = test_serial_lock();
     let base = model_default(&path);
@@ -3319,7 +3320,7 @@ fn two_models_two_devices_concurrent() {
         let path = path.clone();
         std::thread::spawn(move || -> DevOut {
             // Deterministic + no <think> span, so the answer settles on "Paris" within a few
-            // tokens. `sampling.no_think` is a VALUE on this model's own config since S7 — the
+            // tokens. `sampling.no_think` is a VALUE on this model's own config — the
             // renderer takes it from the `Config` its `SeamModel` carries, so this no longer
             // writes `INFR_NO_THINK` into the process the sibling thread is also rendering in.
             let model = model_cfg(&path, |c| c.sampling.no_think = true);
@@ -3437,7 +3438,7 @@ fn pipeline_matches_single_device() {
     let _tlk = test_serial_lock();
 
     // No <think> span, so the answer settles within `n` tokens. A VALUE on this model's own
-    // config since S7 (`sampling.no_think`), not a process-global `INFR_NO_THINK` write.
+    // config (`sampling.no_think`), not a process-global `INFR_NO_THINK` write.
     let model = model_cfg(&path, |c| c.sampling.no_think = true);
     let prompt = model
         .render_chat("What is the capital of France? Reply with just the city name.")
@@ -3519,7 +3520,7 @@ fn tensor_parallel_matches_single_device() {
     let _tlk = test_serial_lock();
 
     // No <think> span, so the answer settles within `n` tokens. A VALUE on this model's own
-    // config since S7 (`sampling.no_think`), not a process-global `INFR_NO_THINK` write.
+    // config (`sampling.no_think`), not a process-global `INFR_NO_THINK` write.
     let model = model_cfg(&path, |c| c.sampling.no_think = true);
     let prompt = model
         .render_chat("What is the capital of France? Reply with just the city name.")
@@ -3597,8 +3598,8 @@ fn expert_parallel_matches_single_device() {
     // and drop the <think> span so the answer settles within `n` tokens.
     // A VALUE on this model's own `Config`: the EP backends are opened by `SeamModel` through
     // `VulkanBackend::new_on_with`, so `kernels.vulkan.moe_small_m` reaches `tier::EnvRows::clamped`
-    // without an env write (S5a, closing S2's recorded R7 exception); `sampling.no_think` joined it
-    // in S7, when `infr-chat`'s renderer stopped reading `INFR_NO_THINK` from the environment.
+    // without an env write (closing the recorded R7 exception); `sampling.no_think` joined it
+    // later, when `infr-chat`'s renderer stopped reading `INFR_NO_THINK` from the environment.
     let model = model_cfg(&path, |c| {
         c.kernels.vulkan.moe_small_m = 64;
         c.sampling.no_think = true;

@@ -173,7 +173,7 @@ impl std::error::Error for TemplateError {}
 /// struct because `infr-chat` deliberately owns no state at all (no model, no backend, no cache
 /// beyond the compiled-template memo): every entry point here is a pure function of its inputs, and
 /// the config is one of those inputs. Callers that DO own a renderer — `SeamModel`,
-/// `infr_llama::chat::OaiRenderer` — hold the `Arc<Config>` and hand out a borrow (§5, R6).
+/// `infr_llama::chat::OaiRenderer` — hold the `Arc<Config>` and hand out a borrow (R6).
 pub fn render_chat_jinja(
     gguf: &Gguf,
     tokenizer: &Tokenizer,
@@ -314,7 +314,7 @@ fn render_core(
     }
 }
 
-/// The `enable_thinking` a render gets, from `sampling.no_think` (S7 — [`render_core`] used to
+/// The `enable_thinking` a render gets, from `sampling.no_think` ([`render_core`] used to
 /// read the `INFR_NO_THINK` variable from the process environment right here).
 ///
 /// `INFR_NO_THINK=1` turns thinking OFF and `INFR_NO_THINK=0` is a NO-OP, matching the other
@@ -450,7 +450,7 @@ mod template_tests {
     }
 
     /// `sampling.no_think` drives the template's `enable_thinking`, read off a `Config` VALUE —
-    /// never the environment (S7, R7). The truth table the env layer feeds this with:
+    /// never the environment (R7). The truth table the env layer feeds this with:
     ///
     /// | `INFR_NO_THINK` | env layer emits | `sampling.no_think` | `enable_thinking` |
     /// | --------------- | --------------- | ------------------- | ----------------- |

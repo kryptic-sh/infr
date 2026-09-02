@@ -15,7 +15,7 @@
 //!
 //! Polarity: a config field is named for the thing being ENABLED. An `INFR_NO_*` key therefore
 //! emits `Some(false)` when it is PRESENT and `None` when it is absent — never `Some(true)`. Note
-//! `INFR_NO_FOO=0` still turns the feature OFF: only presence matters (§7.0's truth table). The
+//! `INFR_NO_FOO=0` still turns the feature OFF: only presence matters. The
 //! four `budget::flag_from` keys are the exception, where `"0"` and `""` mean off.
 
 use std::path::PathBuf;
@@ -101,10 +101,10 @@ fn opt_kv_dtype(get: Get, key: &str) -> Option<Option<DType>> {
 }
 
 /// A multi-GPU device list. This is one of the five knobs that ERROR on a bad value today, so the
-/// error propagates out of the layer instead of falling back (§6.1, §6.11). The per-knob minimum
-/// device counts differ (2 / 2 / 1) and are passed straight through to the shared parser.
+/// error propagates out of the layer instead of falling back. The per-knob minimum device counts
+/// differ (2 / 2 / 1) and are passed straight through to the shared parser.
 ///
-/// The grammar itself is [`super::parse_device_spec`] — the ONE copy since S4, shared with the
+/// The grammar itself is [`super::parse_device_spec`] — the ONE copy, shared with the
 /// `--set`/TOML value grammar and with what used to be `infr_llama::seam::parse_device_spec`.
 fn device_list(
     get: Get,
@@ -134,7 +134,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // policy and stays at its site, and `resolve_infr_dev_index` tolerates an empty value.
     p.device.dev = opt_text(get, "INFR_DEV");
     p.device.ctx = opt_size(get, "INFR_CTX");
-    // §6.12: the VALUE (`>0`, else fall through) and the PRESENCE (the placement sweeps' "the user
+    // The VALUE (`>0`, else fall through) and the PRESENCE (the placement sweeps' "the user
     // pinned a height") are recorded separately — `INFR_UBATCH=0`/`=abc` is specified-but-unusable.
     p.device.ubatch = num_pos(get, "INFR_UBATCH").map(Some);
     p.device.ubatch_specified = presence(get, "INFR_UBATCH");
@@ -175,8 +175,8 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.sampling.no_think = set_not_zero(get, "INFR_NO_THINK");
 
     // ── kv ───────────────────────────────────────────────────────────────────
-    // §11 [DECIDE-8]: an unparseable name still counts as SPECIFIED (it suppresses auto-q8) while
-    // yielding no dtype (the runner falls through to f16). Both halves are recorded.
+    // An unparseable name still counts as SPECIFIED (it suppresses auto-q8) while yielding no
+    // dtype (the runner falls through to f16). Both halves are recorded.
     p.kv.type_k = opt_kv_dtype(get, "INFR_KV_TYPE_K");
     p.kv.type_k_specified = presence(get, "INFR_KV_TYPE_K");
     p.kv.type_v = opt_kv_dtype(get, "INFR_KV_TYPE_V");
@@ -259,7 +259,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         None
     };
 
-    // Spelled positively, read with `.is_err()` — setting it DISABLES the chunked scan (§10.11).
+    // Spelled positively, read with `.is_err()` — setting it DISABLES the chunked scan.
     v.dn_chunk_scan = presence_inv(get, "INFR_DN_CHUNK_SCAN");
     v.dn_chunk = presence_inv(get, "INFR_NO_DN_CHUNK");
     v.dn_split = presence_inv(get, "INFR_NO_DN_SPLIT");
@@ -282,7 +282,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         .filter(|&n| n >= 2)
         .map(Some);
 
-    // `GemvKnobs::resolve`, verbatim (§6.5b) — this whole group is already a pure resolver today.
+    // `GemvKnobs::resolve`, verbatim — this whole group is already a pure resolver today.
     let g = &mut v.gemv;
     g.no_rm = presence(get, "INFR_NO_GEMV_RM");
     g.rm = num(get, "INFR_GEMV_RM");
@@ -293,7 +293,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     g.sg_minout = num(get, "INFR_GEMV_SG_MINOUT");
     g.sg_maxout = num(get, "INFR_GEMV_SG_MAXOUT");
     g.sg_nr = num(get, "INFR_GEMV_SG_NR");
-    // `INFR_NO_GEMV_REG` silently WINS over `INFR_GEMV_VARIANT` — R1-frozen (§10.11).
+    // `INFR_NO_GEMV_REG` silently WINS over `INFR_GEMV_VARIANT` — R1-frozen.
     if get("INFR_NO_GEMV_REG").is_some() {
         g.variant = Some(None);
     } else if let Some(s) = get("INFR_GEMV_VARIANT") {

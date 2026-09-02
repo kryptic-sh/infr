@@ -5,13 +5,14 @@
 //! Why one macro for both halves: a `PartialConfig` is the resolved `Config` with every leaf
 //! wrapped in `Option` — "this layer specified it" vs "it didn't". Writing the two by hand means
 //! 174 chances for them to drift, and a drifted partial silently drops a knob (exactly the failure
-//! mode §8.8 exists to catch). The macro also emits the dotted-path accessors, so the TOML schema,
-//! `--set`'s path grammar and the tests' field probes are all THE SAME table by construction.
+//! mode `env_layer_reads_every_key` exists to catch). The macro also emits the dotted-path
+//! accessors, so the TOML schema, `--set`'s path grammar and the tests' field probes are all THE
+//! SAME table by construction.
 //!
 //! The generated items land in [`super`] (that is where the macro is invoked), so `PartialConfig`
 //! and the per-section partials are re-exported from there; this module owns their behaviour.
 //!
-//! Fold rule (§2): a layer only overrides a field it actually specifies. `merge` therefore keeps
+//! Fold rule: a layer only overrides a field it actually specifies. `merge` therefore keeps
 //! `self`'s value whenever `other`'s is `None` — a `None` never clobbers a `Some`.
 
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ use crate::{DType, SizeSpec};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetPathError {
     /// No such field. `--set` makes this a hard error with a did-you-mean; the file layer warns
-    /// and ignores (§11 [DECIDE-5]).
+    /// and ignores.
     Unknown,
     /// The path exists but the value does not parse into the field's type.
     Value(String),
@@ -129,10 +130,10 @@ impl ConfigValue for super::MetalDeviceTime {
 }
 
 impl ConfigValue for Vec<usize> {
-    /// The multi-GPU device-list grammar — [`super::parse_device_spec`], the ONE copy (S4 folded
-    /// `infr-llama`'s duplicate into it). The per-knob minimum device count is NOT checked here
-    /// (`min: 0`): that is policy and belongs to the consumer (R5); the env layer applies it
-    /// because it must reproduce today's loud error.
+    /// The multi-GPU device-list grammar — [`super::parse_device_spec`], the ONE copy (the
+    /// migration folded `infr-llama`'s duplicate into it). The per-knob minimum device count is
+    /// NOT checked here (`min: 0`): that is policy and belongs to the consumer (R5); the env
+    /// layer applies it because it must reproduce today's loud error.
     fn parse_set(raw: &str) -> Result<Self, String> {
         super::parse_device_spec(raw, 0)
     }
@@ -296,7 +297,7 @@ macro_rules! cfg_struct {
                 ::core::result::Result::Err($crate::config::SetPathError::Unknown)
             }
 
-            /// Did THIS layer specify `path`? (`--set` vs a bespoke CLI flag, §11 [DECIDE-3].)
+            /// Did THIS layer specify `path`? (`--set` vs a bespoke CLI flag.)
             pub fn is_path_set(&self, path: &str) -> bool {
                 let (head, tail) = $crate::config::partial::split_path(path);
                 $(

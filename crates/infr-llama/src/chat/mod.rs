@@ -158,7 +158,7 @@ pub(crate) fn reset_session<B, X>(session: &mut Option<crate::seam::model::Dense
 /// to different VRAM-fit constructors); Metal resolves it through [`cfg_ctx`]. `None` = no
 /// override.
 ///
-/// Takes the borrowed engine config each chat already owns through its [`crate::SeamModel`] (S7) —
+/// Takes the borrowed engine config each chat already owns through its [`crate::SeamModel`] —
 /// this used to read the `INFR_CTX` variable from the process environment, where an unparseable
 /// value fell through to `None`; the env LAYER now drops it just the same (R5).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -293,7 +293,7 @@ pub struct OaiRenderer {
     tokenizer: tokenizers::Tokenizer,
     eos: u32,
     /// The engine configuration this renderer was opened with — `infr-chat`'s renderer reads
-    /// `sampling.no_think` / `debug.chat` off it (S7). Held as the `Arc` the caller resolved in
+    /// `sampling.no_think` / `debug.chat` off it. Held as the `Arc` the caller resolved in
     /// `main()`, borrowed at the render site (R6).
     ecfg: std::sync::Arc<crate::EngineConfig>,
 }
@@ -507,7 +507,7 @@ mod tests {
     }
 
     /// `device.ctx` (`INFR_CTX`) reaches the session-backed chats off the `Config` their
-    /// `SeamModel` carries — never `std::env::var` (S7, R7). Both halves of the knob: the raw
+    /// `SeamModel` carries — never `std::env::var` (R7). Both halves of the knob: the raw
     /// `SizeSpec` the Vulkan chat routes on, and the token count Metal/diffusion resolve.
     #[test]
     fn ctx_override_comes_from_the_config() {

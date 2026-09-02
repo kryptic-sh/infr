@@ -1013,7 +1013,7 @@ pub struct VulkanBackend {
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site.
     ///
-    /// Handed in by [`VulkanBackend::new_with`] (S5a); the S2 `Config::load_from_env()` bridge that
+    /// Handed in by [`VulkanBackend::new_with`]; the `Config::load_from_env()` bridge that
     /// used to build it inside `new_selected` is GONE. `infr-cli` resolves the four layers once in
     /// `main()` and the `Arc` reaches here through the seam, so nothing on the production path
     /// crosses this boundary through the environment. The env-only [`VulkanBackend::new`] entry
@@ -1104,7 +1104,7 @@ pub struct WeightProgress {
     shared: Arc<VulkanShared>,
     /// `prof.vram` (`INFR_PROF_VRAM`), copied off the backend's `Config` when the scope opens —
     /// `Drop` holds only the shared state, so the flag rides along rather than being looked up
-    /// (S5a; R4 — no global, no second config).
+    /// (R4 — no global, no second config).
     vram_log: bool,
 }
 
@@ -1210,8 +1210,8 @@ impl VulkanBackend {
     /// — since a process that reaches this Vulkan constructor built a Vulkan backend regardless.
     /// Split out of `new()` so `new_on` can bypass it, and so the behavior is a single named unit.
     ///
-    /// `spec` is `device.dev` off the caller's [`Config`] (S5a) — the raw string, unparsed, exactly
-    /// as `INFR_DEV` delivered it before. §6.12/§10.8: the CLI's `parse_dev_spec` and this
+    /// `spec` is `device.dev` off the caller's [`Config`] — the raw string, unparsed, exactly
+    /// as `INFR_DEV` delivered it before. The CLI's `parse_dev_spec` and this
     /// crate's [`resolve_infr_dev_index`] are two DIFFERENT parsers of that one string and are
     /// deliberately NOT unified.
     fn pick_default_device(
@@ -1252,7 +1252,7 @@ impl VulkanBackend {
     /// host-less-transfer feasibility signal the multi-GPU campaign needs.
     ///
     /// Takes the caller's [`Config`] because `is_default_pick` marks the device
-    /// [`new_with`](Self::new_with) WOULD bind, which `device.dev` (`INFR_DEV`) steers (S5a).
+    /// [`new_with`](Self::new_with) WOULD bind, which `device.dev` (`INFR_DEV`) steers.
     pub fn enumerate_devices(cfg: &Config) -> Result<Vec<DeviceInfo>> {
         Self::reject_on_apple()?;
         let entry =
@@ -1310,7 +1310,7 @@ impl VulkanBackend {
         result
     }
 
-    /// **The real constructor (S5a).** Build a backend on the default device, reading every
+    /// **The real constructor.** Build a backend on the default device, reading every
     /// construction-time knob — device pick, capability masking, subgroup preference, the submit
     /// splitter, the VRAM guard, the pipeline-cache and pager diagnostics — from `cfg` instead of
     /// the process environment. The `Arc` is held for the backend's whole life and borrowed
@@ -1332,7 +1332,7 @@ impl VulkanBackend {
     /// `#[cfg(test)]` GPU tests and external library users. Resolves `Default` < environment once
     /// (the same fold [`Config::load_from_env`] performs, but FALLIBLE, so `INFR_SG` /
     /// `INFR_SUBMIT_DISPATCHES` / the device lists still reject a bad value LOUDLY here exactly as
-    /// the pre-S5a read sites did) and forwards to [`new_with`](Self::new_with). Every caller
+    /// the old read sites did) and forwards to [`new_with`](Self::new_with). Every caller
     /// inside `infr-llama` and `infr-cli` passes its own `Arc<Config>` instead.
     pub fn new() -> Result<Self> {
         Self::new_with(Self::cfg_from_env()?)
@@ -1354,12 +1354,12 @@ impl VulkanBackend {
     /// [`enumerate_devices_from_env`](Self::enumerate_devices_from_env) entry points that are handed
     /// no `Config`.
     ///
-    /// Deliberately NOT [`Config::load_from_env`]: that one is infallible (S2 needed it to be,
-    /// because the loud keys were still read — and still rejected — at their own sites). S5a moved
-    /// the last two of those five (`INFR_SG`, `INFR_SUBMIT_DISPATCHES`) onto `Config`, so swallowing
-    /// a layer error here would SILENTLY drop an error a `VulkanBackend::new()` caller gets today
-    /// (R1). No file layer either — these knobs were env-only, and a second diagnostics banner
-    /// would print.
+    /// Deliberately NOT [`Config::load_from_env`]: that one is infallible (it needed to be, when
+    /// the loud keys were still read — and still rejected — at their own sites). The last two of
+    /// those five (`INFR_SG`, `INFR_SUBMIT_DISPATCHES`) have since moved onto `Config`, so
+    /// swallowing a layer error here would SILENTLY drop an error a `VulkanBackend::new()` caller
+    /// gets today (R1). No file layer either — these knobs were env-only, and a second diagnostics
+    /// banner would print.
     fn cfg_from_env() -> Result<Arc<Config>> {
         let layer = infr_core::config::ConfigLayer::env().map_err(|e| be(e.to_string()))?;
         Ok(Arc::new(Config::load_from_layers(&[layer])))
@@ -2180,8 +2180,8 @@ impl VulkanBackend {
             32
         };
         // `device.subgroup_pref` (`INFR_SG=16|32`): A/B override (Intel testers; inert on devices
-        // that can't pin the value). The env layer already rejects anything but "16"/"32" with the
-        // pre-S5a wording, but the field is now also reachable from the TOML file and `--set`, so
+        // that can't pin the value). The env layer already rejects anything but "16"/"32", as it
+        // always has, but the field is now also reachable from the TOML file and `--set`, so
         // the "only 16 and 32 have builds" POLICY stays here at the consumer (R5) and still refuses
         // a value it has no kernels for.
         let sg_pref = match cfg.device.subgroup_pref {
@@ -4364,9 +4364,9 @@ mod tests {
         assert!(resolve_infr_dev_index(Some("VulkanX"), &names).is_err());
     }
 
-    /// A `Config` built as a VALUE reaches `pick_default_device` (S5a): `device.dev` is threaded in
+    /// A `Config` built as a VALUE reaches `pick_default_device`: `device.dev` is threaded in
     /// as a parameter, so the two consumers of the one raw string (`infr-cli`'s `parse_dev_spec`
-    /// and this crate's index resolver, §10.8) each keep their own parse and neither reads the
+    /// and this crate's index resolver) each keep their own parse and neither reads the
     /// environment. No GPU needed — this pins the plumbing, `dev_from_config_selects_the_device`
     /// below pins the effect.
     #[test]
@@ -4410,7 +4410,7 @@ mod tests {
         );
     }
 
-    /// §5.2, on real hardware: the capability MASKERS are configuration, `Capabilities` stays a
+    /// On real hardware: the capability MASKERS are configuration, `Capabilities` stays a
     /// probe result. Clearing `kernels.vulkan.f16` must drop `caps.f16` AND `caps.f16_coopmat()`
     /// (f16 is a coopmat prerequisite — the AND `INFR_NO_F16` has always implied); clearing
     /// `coopmat` alone must drop the coopmat tiers while LEAVING `caps.f16` up; clearing `i8_dot`
@@ -4522,7 +4522,7 @@ mod tests {
         );
     }
 
-    /// `kernels.vulkan.no_vram_guard` (`INFR_NO_VRAM_GUARD`) — a SANCTIONED negative field (§4).
+    /// `kernels.vulkan.no_vram_guard` (`INFR_NO_VRAM_GUARD`) — a SANCTIONED negative field.
     /// Set, it turns the alloc-time budget check into a no-op; clear, an ask several times the
     /// device's capacity is refused. Drives `check_vram_budget` directly, so it asserts the guard
     /// itself and allocates nothing.

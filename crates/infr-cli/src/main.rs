@@ -74,7 +74,7 @@ impl CompletionShell {
 /// (from `--dev` + whatever `device.dev` the other layers carry) and by the ONE reader
 /// [`selected_backend`] (from the resolved [`Config`] alone) — so `--dev`,
 /// [`DeviceOpts::overrides`] and every command's backend funnel (`run`/`serve`/`bench`) can never
-/// disagree on the pick. Since S8 nothing publishes `INFR_DEV` back into the environment; the CLI
+/// disagree on the pick. Nothing publishes `INFR_DEV` back into the environment; the CLI
 /// layer of the `Config` is the whole delivery mechanism.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Backend {
@@ -92,7 +92,7 @@ enum Backend {
 /// than a scatter of ad-hoc `std::env::var` reads with drifting precedence.
 ///
 /// `device.dev` is the SINGLE device-selection knob (`INFR_DEV`, or `[device] dev` in the config
-/// file, same grammar as `--dev`); since S1 it reaches this struct through the resolved [`Config`]
+/// file, same grammar as `--dev`); it reaches this struct through the resolved [`Config`]
 /// rather than through a direct `std::env::var`. The old `INFR_METAL=1`/`INFR_CPU=1` flags were
 /// removed cleanly (no aliases) — use `INFR_DEV=metal`/`cpu`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -157,9 +157,9 @@ fn selected_backend(cfg: &Config) -> anyhow::Result<Backend> {
 }
 
 /// The `device.dev` spelling for a parsed [`Backend`] — the inverse of [`parse_dev_spec`], and the
-/// value `--dev` contributes to the CLI config layer. Since S5a that layer is the ONLY route to
+/// value `--dev` contributes to the CLI config layer. That layer is now the ONLY route to
 /// `infr-vulkan`'s device pick: it takes `cfg.device.dev` off the `Arc<Config>` it is constructed
-/// with, so the S1 bridge no longer re-publishes `INFR_DEV`.
+/// with, so nothing re-publishes `INFR_DEV` any more.
 fn dev_spec_of(backend: &Backend) -> String {
     match backend {
         Backend::Vulkan(Some(d)) => d.clone(),
@@ -236,7 +236,7 @@ impl DeviceOpts {
         // filters `v > 0`, exactly as it did when this was published as INFR_UBATCH=0. Likewise
         // RAYON_NUM_THREADS=0 falls back to all cores in rayon.
         //
-        // `ubatch_specified` is the OTHER half of the knob (§6.12, and `seam::ubatch_rows`'s doc):
+        // `ubatch_specified` is the OTHER half of the knob (see `seam::ubatch_rows`'s doc):
         // passing `-u` at all pins the chunk height, which is what disables the dense placement
         // sweeps — including for `-u 0`, where the value itself is unusable. That used to be
         // carried by the mere PRESENCE of the published `INFR_UBATCH`; the flag layer has to say
@@ -599,8 +599,9 @@ fn main() -> anyhow::Result<()> {
     publish_profile_out(&cfg);
     // WHICH paths a layer actually specified — the one thing a resolved `Config` cannot answer,
     // and the input the model-recommended sampling defaults need (they may only fill a knob nobody
-    // named). S1 answered it by re-publishing the values into the environment and probing it back;
-    // S8 hands the partial down instead. Nothing writes `INFR_*` any more.
+    // named). This used to be answered by re-publishing the values into the environment and
+    // probing it back; the partial is handed down directly instead. Nothing writes `INFR_*` any
+    // more.
     let specified = specified_by_the_layers(&overrides)?;
 
     // The subcommand runs to completion (or to its abort) and EVERYTHING it owns — model, backend,
@@ -614,7 +615,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// The CLI layer's BESPOKE half: what this invocation's dedicated flags specify (`--set` is folded
-/// in by `infr-core`, and loses to these — §11 [DECIDE-3]).
+/// in by `infr-core`, and loses to these).
 ///
 /// Built before dispatch so a bad `--dev`/`--ctx` fails fast, before anything is downloaded or
 /// loaded, exactly as `DeviceOpts::resolve` did.
@@ -746,7 +747,7 @@ use std::path::{Path, PathBuf};
 /// file's unknown-key warnings, the diagnostics announcement and any `--set`-shadowed-by-a-flag
 /// warning.
 ///
-/// PERMANENT since S8. It used to feed the transitional env bridge; now it is threaded straight
+/// PERMANENT. It used to feed the transitional env bridge; now it is threaded straight
 /// into the commands that need provenance — [`apply_model_sampling_defaults`] (the model's
 /// recommended sampler may only fill a knob NO layer named) and `cmd_run`'s `max_new` default
 /// (diffusion-gemma wants a different fallback from the autoregressive one). Nothing publishes
@@ -787,14 +788,14 @@ fn publish_thread_count(cfg: &Config) {
     }
 }
 
-/// `prof.out` → the profiler runtime's report destination (S7).
+/// `prof.out` → the profiler runtime's report destination.
 ///
-/// PERMANENT, like [`publish_thread_count`] and unlike the S1 bridge: `infr-prof-rt` writes its
-/// JSON from a C `atexit` hook that has no receiver and no config to borrow, and it cannot depend
-/// on `infr-core` to fetch one (the dependency runs the other way). So the resolved value is PUSHED
-/// into the reporter here, once, in `main` — a value handed across an API boundary, not laundered
-/// through the environment. `None` leaves the reporter on stderr only, exactly as an unset
-/// `INFR_PROF_OUT` did.
+/// PERMANENT, like [`publish_thread_count`] and unlike the deleted transitional env bridge:
+/// `infr-prof-rt` writes its JSON from a C `atexit` hook that has no receiver and no config to
+/// borrow, and it cannot depend on `infr-core` to fetch one (the dependency runs the other way).
+/// So the resolved value is PUSHED into the reporter here, once, in `main` — a value handed
+/// across an API boundary, not laundered through the environment. `None` leaves the reporter on
+/// stderr only, exactly as an unset `INFR_PROF_OUT` did.
 fn publish_profile_out(cfg: &Config) {
     infr_prof_rt::set_profile_out(cfg.prof.out.as_deref().and_then(|p| p.to_str()));
 }
@@ -1090,8 +1091,8 @@ fn cmd_run(
     //
     // The knob has TWO defaults on this path — 2048 autoregressive, 1024 for diffusion-gemma — and
     // `SamplingCfg::default()` can only carry one, so the fallback stays HERE (R5) and `specified`
-    // decides which side to take. That is exactly what the S1 bridge encoded by publishing
-    // `INFR_MAX_NEW` only when a layer had named it.
+    // decides which side to take. That is exactly what the transitional env bridge used to encode
+    // by publishing `INFR_MAX_NEW` only when a layer had named it.
     let max_new = if specified.is_path_set("sampling.max_new") {
         cfg.sampling.max_new
     } else if is_dg {
@@ -1400,7 +1401,7 @@ impl DiffusionVisual {
     /// for scripted verification against piped stdout, e.g. `... | tail -20`).
     ///
     /// `mode` is `infr run --diffusion-visual`'s value. This is a CLI PRESENTATION knob, not a
-    /// `Config` field (§6.10): nothing below `main` can observe it, and it steers a terminal
+    /// `Config` field: nothing below `main` can observe it, and it steers a terminal
     /// drawing routine rather than the forward. The `INFR_DIFFUSION_VISUAL` spelling survives as
     /// clap's `env` fallback for the flag, so scripts that set it keep working (R2) and the value
     /// still enters through the flag layer, not a `std::env::var` in the middle of `cmd_run`.
@@ -1591,10 +1592,10 @@ fn metal_chat_model(
 ) -> anyhow::Result<Box<dyn infr_llama::chat::ChatModel + Send>> {
     if let Some(draft_path) = cfg.spec.draft.clone() {
         // Spec decode is GREEDY-ONLY: the draft/verify equality check assumes argmax, so a
-        // non-zero temperature would reject every correctly-drafted token. S1 forced that by
-        // writing `INFR_TEMP=0` into the process (`publish_transitional_greedy`); S8 pins it on
-        // the VALUE the two models are loaded with, which is where the sampler has read it since
-        // S4 — the env write had already stopped being observed by anything.
+        // non-zero temperature would reject every correctly-drafted token. This used to be forced
+        // by writing `INFR_TEMP=0` into the process (`publish_transitional_greedy`, since
+        // deleted); now it is pinned on the VALUE the two models are loaded with, which is where
+        // the sampler reads it — the env write had already stopped being observed by anything.
         let cfg = &{
             let mut greedy = (**cfg).clone();
             greedy.sampling.temp = 0.0;
@@ -1697,7 +1698,7 @@ trait GenBackend: Send + Sync {
     /// The reply budget for a request that names none: `sampling.max_new` (`INFR_MAX_NEW`,
     /// default 2048) off the config this backend's renderer was opened with. A trait method
     /// rather than a free function because the config is per-backend state — and the default
-    /// body serves both generators, since both hold the same renderer (S8; `run_chat` used to
+    /// body serves both generators, since both hold the same renderer (`run_chat` used to
     /// read the `INFR_MAX_NEW` variable from the process environment here).
     fn max_new_default(&self) -> usize {
         self.renderer().engine_cfg().sampling.max_new
@@ -2014,7 +2015,7 @@ fn cmd_bench(
     cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
     // `--dev`/`-u`/`-t` reached the engine before the model loads: `--dev` through this `cfg`
-    // (which `VulkanBackend::new_with` reads its device pick off since S5a), `-u` through
+    // (which `VulkanBackend::new_with` reads its device pick off), `-u` through
     // INFR_UBATCH, `-t` through RAYON_NUM_THREADS. So `--dev metal`/`--dev cpu` route here exactly
     // like a raw `INFR_DEV=metal`/`INFR_DEV=cpu` invocation.
     // Bench also pins `sampling.ignore_eos` (see `cli_flag_layer`): benchmarks decode a FIXED token
@@ -2644,7 +2645,7 @@ fn dg_bench_run(
         cfg.eos_ids.clone()
     };
     // `sampling.seed`; `42` is THIS path's fallback (the knob has two defaults in the tree and
-    // both stay at their sites — §6.12).
+    // both stay at their sites).
     let seed: u64 = ecfg.sampling.seed.unwrap_or(42);
 
     if prompt_text.is_some() && depth > 0 {
@@ -3037,7 +3038,7 @@ struct ModelBench {
     ubatch: usize,
     /// The resolved process configuration. Only the DG arm needs it — [`dg_infr`](Self::dg_infr)
     /// runs `dg_bench_run` IN-PROCESS (every other arm shells out to `infr bench`, which resolves
-    /// its own), and since S8 that function takes `sampling.ignore_eos` / `sampling.seed` from a
+    /// its own), and that function takes `sampling.ignore_eos` / `sampling.seed` from a
     /// `Config` rather than from the environment.
     cfg: Arc<Config>,
 }
@@ -3847,20 +3848,21 @@ fn model_sampling_defaults(gguf: &std::path::Path) -> (f32, usize, f32, String) 
 /// the resolved `cfg` (via `SamplingOpts::overrides`), so it wins and shows through here. Shared
 /// by `run`, `serve` and `multi`.
 ///
-/// The seam reads `sampling.*` off this returned `Config` (S4), so what this function returns IS
+/// The seam reads `sampling.*` off this returned `Config`, so what this function returns IS
 /// what `infr run` samples with — the library default is greedy, which is right for goldens and
 /// wrong for a chat REPL (pure argmax makes a thinking model degenerate).
 ///
 /// **Precedence, unchanged:** the model recommendation is the LOWEST source, below the config file
-/// and below the environment — so it may only fill a knob NO layer specified. S1 answered "did a
-/// layer specify it?" by re-publishing the resolved values into the process environment and then
-/// probing `std::env::var(..).is_ok()`; S8 asks the `specified` [`PartialConfig`] threaded down
-/// from `main()` directly, and nothing writes `INFR_*` any more.
+/// and below the environment — so it may only fill a knob NO layer specified. "Did a
+/// layer specify it?" used to be answered by re-publishing the resolved values into the process
+/// environment and then probing `std::env::var(..).is_ok()`; now the `specified`
+/// [`PartialConfig`] is threaded down from `main()` directly, and nothing writes `INFR_*` any
+/// more.
 ///
 /// One edge behaves better than it did: a value no layer could PARSE (`INFR_TEMP=banana`) used to
 /// answer "specified" to the env probe — the variable was present — and so suppressed the model
 /// recommendation, leaving the sampler on the library's greedy default. It is not in `specified`
-/// (the env layer emits `None` for an unparseable `Float`, §7.0 step 3), so the recommendation now
+/// (the env layer emits `None` for an unparseable `Float`), so the recommendation now
 /// applies, which is what an ignored bad value is supposed to mean.
 fn apply_model_sampling_defaults(
     cfg: &Arc<Config>,
@@ -4397,7 +4399,7 @@ mod tests {
         assert_eq!(cfg.device.threads, Some(6));
 
         // `-u 0` keeps its "adaptive" meaning: carried verbatim, filtered by the seam (`v > 0`) —
-        // but it is still SPECIFIED, which is what keeps the dense placement sweeps off (§6.12).
+        // but it is still SPECIFIED, which is what keeps the dense placement sweeps off.
         let mut flags = PartialConfig::default();
         DeviceOpts {
             dev: None,
@@ -4511,7 +4513,7 @@ mod tests {
             &["sampling.temp=0.2"],
         );
         assert!((cfg.sampling.temp - 0.2).abs() < 1e-6);
-        // …and it LOSES to the dedicated flag for the same field (§11 [DECIDE-3]).
+        // …and it LOSES to the dedicated flag for the same field.
         let mut flags = PartialConfig::default();
         SamplingOpts {
             temp: Some(0.9),

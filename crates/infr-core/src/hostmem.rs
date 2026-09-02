@@ -52,8 +52,12 @@ pub fn available_bytes() -> Option<u64> {
 fn windows_memory_status() -> Option<windows::Win32::System::SystemInformation::MEMORYSTATUSEX> {
     use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
-    let mut status = MEMORYSTATUSEX::default();
-    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // `dwLength` is an in-parameter: `GlobalMemoryStatusEx` rejects a struct that does not
+    // announce its own size, so it cannot be left at `Default`'s zero.
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
     unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
     Some(status)
 }

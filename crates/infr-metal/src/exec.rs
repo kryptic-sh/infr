@@ -2352,7 +2352,9 @@ impl MetalBackend {
             (
                 "linear_quik4",
                 f.codes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|p| p[0] | (p[1] << 4))
                     .collect(),
             )
@@ -2361,7 +2363,9 @@ impl MetalBackend {
             (
                 "linear_quik6",
                 f.codes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|c| {
                         [
                             c[0] | (c[1] << 6),
@@ -5542,16 +5546,10 @@ impl MetalBackend {
                 );
                 let bwk = self.weight_buf(wk_b, g, bindings)?;
                 let bwv = self.weight_buf(wv_b, g, bindings)?;
-                let bff = match freq_factors {
-                    Some(f) => Some(self.ensure_device(r, f)),
-                    None => None,
-                };
+                let bff = freq_factors.map(|f| self.ensure_device(r, f));
                 // deepseek32's `[rows, kv_len]` additive top-k score mask (`Op::TopkMask`'s
                 // output); `None` on deepseek2, which keeps the exact kernel it always took.
-                let bkb = match key_bias {
-                    Some(b) => Some(self.ensure_device(r, b)),
-                    None => None,
-                };
+                let bkb = key_bias.map(|b| self.ensure_device(r, b));
                 let bd = self.dev_dst(
                     r,
                     dst,

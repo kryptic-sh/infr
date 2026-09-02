@@ -22,6 +22,8 @@ windows = { version = "0.58", features = [
     "Win32_Storage_FileSystem",       # LockFileEx / UnlockFileEx
     "Win32_System_IO",                # OVERLAPPED
     "Win32_System_SystemInformation", # GlobalMemoryStatusEx
+    "Win32_System_JobObjects",        # QueryInformationJobObject
+    "Win32_System_Threading",         # JOBOBJECT_EXTENDED_LIMIT_INFORMATION embeds IO_COUNTERS
 ] }
 
 [dev-dependencies]

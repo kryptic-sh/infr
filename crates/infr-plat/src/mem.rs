@@ -23,11 +23,18 @@ pub enum Source {
     /// Linux `MemAvailable` clamped by the tightest cgroup limit above this process — the figure
     /// an arena must be sized from inside a container.
     LinuxCgroupClamped,
-    /// Windows `ullAvailPhys`. **Machine-wide and unclamped**: it knows nothing about a job
-    /// object's `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` commit limit, so inside a Windows container
-    /// it can report far more than this process may actually take. The Linux arm has a clamp for
-    /// exactly this reason and this one does not yet.
+    /// macOS `host_statistics64`'s VM info, converted to a reclaimable-without-swapping page count
+    /// (`free_count - speculative_count + inactive_count + purgeable_count`) and then to bytes.
+    /// Host-wide: macOS has no per-process commit limit analogous to a cgroup or Job Object.
+    MacosVmStatistics64,
+    /// Windows `ullAvailPhys`, with no Job Object limit binding this process. Machine-wide: it
+    /// knows nothing about a job object's `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` commit limit, so
+    /// inside a Windows container it can report far more than this process may actually take.
     WindowsAvailPhys,
+    /// Windows `ullAvailPhys` clamped by the tighter of the current process's Job Object
+    /// `JobMemoryLimit` / `ProcessMemoryLimit` — the figure an arena must be sized from inside a
+    /// Windows container.
+    WindowsJobObjectClamped,
 }
 
 /// Host memory that could be committed right now, or `None` where this platform has no probe.
@@ -42,12 +49,21 @@ pub enum Source {
 /// a `systemd-run --scope -p MemoryMax=` puts on this process — measured on the dev box, an 8 GB
 /// scope still reports 54.6 GB available — so the smaller of the two wins.
 ///
-/// **Windows** reads `ullAvailPhys` from `GlobalMemoryStatusEx`, with no equivalent clamp.
+/// **Windows** reads `ullAvailPhys` from `GlobalMemoryStatusEx`, then clamps it the same way: a
+/// process running inside a Job Object (as a Windows container does) has its `JobMemoryLimit` /
+/// `ProcessMemoryLimit` read via `QueryInformationJobObject`, and the tighter of the two wins over
+/// the machine-wide figure when it binds — the identical "smaller of the two, and say so" policy
+/// as the Linux clamp above, sharing its implementation (`apply_limit_clamp`) rather than
+/// duplicating it.
 ///
-/// **macOS and the BSDs have no probe at all** and answer `None`. That is a real gap rather than a
-/// spelling difference: anything that sizes an arena from this figure is running unbudgeted there
-/// today. Closing it needs `host_statistics64`'s free/inactive/purgeable split, which is its own
-/// piece of work and not a translation of either arm above.
+/// **macOS** reads `host_statistics64`'s VM info and reports what is reclaimable without swapping:
+/// `free_count - speculative_count + inactive_count + purgeable_count`, converted to bytes by
+/// `vm_page_size`. `free_count` already INCLUDES speculative pages, so it is subtracted back out
+/// rather than added a second time. `compressor_page_count` and wired/active pages are deliberately
+/// excluded: reclaiming the former costs CPU decompressing it, and the latter is in use.
+///
+/// **The BSDs still have no probe at all** and answer `None` — the same conservative "do not
+/// auto-size" as before.
 pub fn available() -> Option<Available> {
     #[cfg(target_os = "linux")]
     {
@@ -57,38 +73,82 @@ pub fn available() -> Option<Available> {
             cgroup_headroom(),
         ))
     }
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
     {
+        let vm = macos_vm_statistics64()?;
         Some(Available {
-            bytes: windows_memory_status()?.ullAvailPhys,
-            source: Source::WindowsAvailPhys,
+            bytes: macos_available_bytes(
+                vm.free_count as u64,
+                vm.speculative_count as u64,
+                vm.inactive_count as u64,
+                vm.purgeable_count as u64,
+                macos_page_size(),
+            ),
+            source: Source::MacosVmStatistics64,
         })
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(windows)]
+    {
+        Some(apply_job_object_clamp(
+            windows_memory_status()?.ullAvailPhys,
+            windows_job_memory_limit(),
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         None
     }
 }
 
-/// Pick between the host figure and a cgroup's headroom, and say which was taken.
+/// Pick between a host figure and a container's headroom, and say which was taken.
 ///
-/// Split out and pure because the alternative is comparing two separate reads of `MemAvailable`,
-/// which is a live number: it moves between them, so an equality assertion on it fails by a page
-/// at random. Here every case is reachable from a literal.
-#[cfg(any(target_os = "linux", test))]
-fn apply_cgroup_clamp(host: u64, cgroup: Option<u64>) -> Available {
-    // Only a limit that actually BINDS is reported as one — otherwise `LinuxCgroupClamped` would
-    // appear whenever a cgroup merely exists, which is always, and stop meaning anything.
-    match cgroup {
+/// Shared by the Linux cgroup clamp and the Windows Job Object clamp: both are the same policy —
+/// "a limit below the host figure wins, and only a limit that actually binds counts as a clamp" —
+/// and writing it twice is how the two copies drift. Split out and pure because the alternative is
+/// comparing two separate reads of a live host figure (`MemAvailable` moves between reads), so an
+/// equality assertion on it fails by a page at random. Here every case is reachable from a literal.
+#[cfg(any(target_os = "linux", windows, test))]
+fn apply_limit_clamp(
+    host: u64,
+    limit: Option<u64>,
+    host_source: Source,
+    limited_source: Source,
+) -> Available {
+    // Only a limit that actually BINDS is reported as one — otherwise the clamped source would
+    // appear whenever a limit merely exists, which is always, and stop meaning anything.
+    match limit {
         Some(limited) if limited < host => Available {
             bytes: limited,
-            source: Source::LinuxCgroupClamped,
+            source: limited_source,
         },
         _ => Available {
             bytes: host,
-            source: Source::LinuxMemAvailable,
+            source: host_source,
         },
     }
+}
+
+/// The Linux cgroup clamp: [`apply_limit_clamp`] parameterised with the Linux [`Source`] pair.
+#[cfg(any(target_os = "linux", test))]
+fn apply_cgroup_clamp(host: u64, cgroup: Option<u64>) -> Available {
+    apply_limit_clamp(
+        host,
+        cgroup,
+        Source::LinuxMemAvailable,
+        Source::LinuxCgroupClamped,
+    )
+}
+
+/// The Windows Job Object clamp: [`apply_limit_clamp`] parameterised with the Windows [`Source`]
+/// pair.
+#[cfg(any(windows, test))]
+fn apply_job_object_clamp(host: u64, job_limit: Option<u64>) -> Available {
+    apply_limit_clamp(
+        host,
+        job_limit,
+        Source::WindowsAvailPhys,
+        Source::WindowsJobObjectClamped,
+    )
 }
 
 #[cfg(windows)]
@@ -103,6 +163,133 @@ fn windows_memory_status() -> Option<windows::Win32::System::SystemInformation::
     };
     unsafe { GlobalMemoryStatusEx(&mut status).ok()? };
     Some(status)
+}
+
+/// The current process's Job Object memory limit in bytes, or `None` when it is not bound by one.
+///
+/// Passes a null job handle, which asks `QueryInformationJobObject` for the job the CURRENT
+/// process belongs to rather than naming one — there is no other job this process could mean here.
+/// The call itself fails (and this returns `None`) for a process not associated with any job,
+/// which is the correct fallback: no limit binds it, so the unclamped host figure stands.
+#[cfg(windows)]
+fn windows_job_memory_limit() -> Option<u64> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    };
+
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    let len = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+    // SAFETY: `info` is a valid, correctly-sized buffer for the call's duration; `len` matches its
+    // actual size.
+    unsafe {
+        QueryInformationJobObject(
+            HANDLE::default(),
+            JobObjectExtendedLimitInformation,
+            (&mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            len,
+            None,
+        )
+        .ok()?
+    };
+    job_object_limit_bytes(
+        info.BasicLimitInformation.LimitFlags.0,
+        info.JobMemoryLimit as u64,
+        info.ProcessMemoryLimit as u64,
+    )
+}
+
+/// Pick the binding memory limit out of a Job Object's extended limit info, or `None` if neither
+/// applies.
+///
+/// A limit field is only meaningful when its bit is set in `LimitFlags` — reading it unconditionally
+/// produces a garbage clamp from a zeroed-but-unset field. Both `JobMemoryLimit` and
+/// `ProcessMemoryLimit` can be set at once (a process limit inside a looser job limit, say), so the
+/// binding one is the TIGHTER of whichever are actually set — the same "tightest ancestor wins" rule
+/// `cgroup_headroom` applies to the cgroup hierarchy. The two flag values (512, 256) are fixed by
+/// the Win32 ABI as `JOB_OBJECT_LIMIT_JOB_MEMORY` / `JOB_OBJECT_LIMIT_PROCESS_MEMORY`; they are
+/// re-declared here rather than imported because this function must also compile under `cfg(test)`
+/// on non-Windows targets, where the `windows` crate is not a dependency.
+#[cfg(any(windows, test))]
+fn job_object_limit_bytes(
+    limit_flags: u32,
+    job_memory_limit: u64,
+    process_memory_limit: u64,
+) -> Option<u64> {
+    const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 512;
+    const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 256;
+
+    let job = (limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0).then_some(job_memory_limit);
+    let process =
+        (limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0).then_some(process_memory_limit);
+    match (job, process) {
+        (Some(j), Some(p)) => Some(j.min(p)),
+        (Some(j), None) => Some(j),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    }
+}
+
+/// Read macOS's VM statistics via `host_statistics64`, or `None` if the kernel call fails.
+///
+/// `mach_host_self()` returns a send right to the host port that is valid for the life of the
+/// process, so there is nothing to release. `HOST_VM_INFO64_COUNT` is the field count
+/// `host_statistics64` expects for the `HOST_VM_INFO64` flavor — passing anything else is how this
+/// call fails or truncates.
+#[cfg(target_os = "macos")]
+fn macos_vm_statistics64() -> Option<libc::vm_statistics64> {
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
+    // SAFETY: `stats` is sized for exactly `HOST_VM_INFO64_COUNT` `natural_t`s, which is what
+    // `host_statistics64` writes for the `HOST_VM_INFO64` flavor; `count` is passed by pointer as
+    // the API requires but this call does not resize the output on success.
+    let kr = unsafe {
+        libc::host_statistics64(
+            libc::mach_host_self(),
+            libc::HOST_VM_INFO64,
+            stats.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    if kr != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: `kr == KERN_SUCCESS` means the kernel filled in every field of `stats`.
+    Some(unsafe { stats.assume_init() })
+}
+
+/// The host's page size in bytes.
+#[cfg(target_os = "macos")]
+fn macos_page_size() -> u64 {
+    // SAFETY: `vm_page_size` is set once by the kernel before `main` runs and never changes for
+    // the life of the process; reading it is not a data race with anything.
+    (unsafe { libc::vm_page_size }) as u64
+}
+
+/// Reclaimable-without-swapping bytes from macOS VM statistics.
+///
+/// `free_count` on macOS already INCLUDES speculative pages (read ahead but not yet touched), so
+/// adding `speculative_count` on top would double-count it — it is subtracted back out instead.
+/// `inactive_count` (clean, evictable) and `purgeable_count` (the owner already said it may vanish)
+/// are added because both can be reclaimed without writing anything back. Deliberately excluded:
+/// `compressor_page_count` (reclaiming it costs CPU decompressing, not just freeing) and
+/// wired/active pages (in use). Saturating throughout: a `natural_t` well below `u64::MAX` cannot
+/// overflow the adds, but the final multiply by `page_size` can, and a probe should report "a lot"
+/// rather than panic when it does.
+#[cfg(any(target_os = "macos", test))]
+fn macos_available_bytes(
+    free_count: u64,
+    speculative_count: u64,
+    inactive_count: u64,
+    purgeable_count: u64,
+    page_size: u64,
+) -> u64 {
+    let pages = free_count
+        .saturating_sub(speculative_count)
+        .saturating_add(inactive_count)
+        .saturating_add(purgeable_count);
+    pages.saturating_mul(page_size)
 }
 
 /// Memory this process may still commit before its cgroup kills it, or `None` when no ancestor
@@ -296,9 +483,139 @@ mod tests {
     }
 
     /// Every platform without a probe says so, rather than inventing a number.
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     #[test]
     fn a_platform_without_a_probe_answers_none() {
         assert_eq!(available(), None);
+    }
+
+    /// The probe must agree with itself on the machine running the tests: a plausible, non-zero
+    /// figure, reported through the macOS source.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_live_probe_is_plausible() {
+        let got = available().expect("macos host_statistics64 should answer");
+        assert_eq!(got.source, Source::MacosVmStatistics64);
+        assert!(got.bytes > 0, "available must be non-zero");
+    }
+
+    /// Every branch of the shared clamp, from literals, exercised through the Job Object wrapper —
+    /// the arithmetic itself is [`a_cgroup_limit_is_reported_only_when_it_binds`]'s job; this just
+    /// proves the Windows wrapper reports the Windows [`Source`] pair rather than the Linux one.
+    #[test]
+    fn a_job_object_limit_is_reported_only_when_it_binds() {
+        const HOST: u64 = 8 << 30;
+
+        assert_eq!(
+            apply_job_object_clamp(HOST, None),
+            Available {
+                bytes: HOST,
+                source: Source::WindowsAvailPhys
+            }
+        );
+        assert_eq!(
+            apply_job_object_clamp(HOST, Some(2 << 30)),
+            Available {
+                bytes: 2 << 30,
+                source: Source::WindowsJobObjectClamped
+            },
+            "a binding job limit wins, and says so"
+        );
+        assert_eq!(
+            apply_job_object_clamp(HOST, Some(64 << 30)),
+            Available {
+                bytes: HOST,
+                source: Source::WindowsAvailPhys
+            },
+            "a limit above the host figure is not a clamp"
+        );
+    }
+
+    /// `job_object_limit_bytes` re-declares the two flag bits so it can compile under `cfg(test)`
+    /// where the `windows` crate is not a dependency — which means two copies of a value, and the
+    /// copy this crate reads is not the one the ABI hands it. Pin them together where the real
+    /// ones exist. Windows-only by necessity, so it is the Windows CI leg that enforces this.
+    #[test]
+    #[cfg(windows)]
+    fn the_re_declared_flag_bits_match_the_windows_crate() {
+        use windows::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        };
+        // Both limits set, `job` the tighter: it can only come back as `job` if the bit the
+        // function tests is the bit the ABI actually sets.
+        assert_eq!(
+            job_object_limit_bytes(
+                JOB_OBJECT_LIMIT_JOB_MEMORY.0 | JOB_OBJECT_LIMIT_PROCESS_MEMORY.0,
+                1 << 30,
+                2 << 30,
+            ),
+            Some(1 << 30),
+        );
+        // And each alone selects its own field, which a wrong bit value could not do.
+        assert_eq!(
+            job_object_limit_bytes(JOB_OBJECT_LIMIT_JOB_MEMORY.0, 1 << 30, 2 << 30),
+            Some(1 << 30),
+        );
+        assert_eq!(
+            job_object_limit_bytes(JOB_OBJECT_LIMIT_PROCESS_MEMORY.0, 1 << 30, 2 << 30),
+            Some(2 << 30),
+        );
+    }
+
+    /// `JOB_OBJECT_LIMIT_JOB_MEMORY` is bit 512, `JOB_OBJECT_LIMIT_PROCESS_MEMORY` is bit 256 —
+    /// every combination of set/unset, and which one wins when both are set.
+    #[test]
+    fn job_object_limit_bytes_honors_only_set_flags_and_takes_the_tighter() {
+        const JOB: u32 = 512;
+        const PROCESS: u32 = 256;
+
+        assert_eq!(
+            job_object_limit_bytes(0, 1 << 30, 2 << 30),
+            None,
+            "neither flag set"
+        );
+        assert_eq!(
+            job_object_limit_bytes(JOB, 1 << 30, 2 << 30),
+            Some(1 << 30),
+            "only the job flag set"
+        );
+        assert_eq!(
+            job_object_limit_bytes(PROCESS, 1 << 30, 2 << 30),
+            Some(2 << 30),
+            "only the process flag set"
+        );
+        assert_eq!(
+            job_object_limit_bytes(JOB | PROCESS, 1 << 30, 2 << 30),
+            Some(1 << 30),
+            "both set, job is tighter"
+        );
+        assert_eq!(
+            job_object_limit_bytes(JOB | PROCESS, 4 << 30, 2 << 30),
+            Some(2 << 30),
+            "both set, process is tighter"
+        );
+    }
+
+    /// `free_count` already includes speculative pages, so it is subtracted rather than added
+    /// again; inactive and purgeable pages are added; the multiply saturates instead of wrapping.
+    #[test]
+    fn macos_available_bytes_matches_the_documented_formula() {
+        let page_size = 16 << 10; // Apple Silicon's page size.
+
+        assert_eq!(
+            macos_available_bytes(1000, 200, 300, 50, page_size),
+            (1000 - 200 + 300 + 50) * page_size,
+            "free minus speculative plus inactive plus purgeable"
+        );
+        assert_eq!(
+            macos_available_bytes(0, 0, 0, 0, page_size),
+            0,
+            "an idle-empty report is zero, not a panic"
+        );
+        assert_eq!(
+            macos_available_bytes(u64::MAX, 0, u64::MAX, u64::MAX, u64::MAX),
+            u64::MAX,
+            "the page-count sum and the final multiply both saturate instead of wrapping"
+        );
     }
 }

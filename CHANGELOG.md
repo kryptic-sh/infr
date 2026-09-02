@@ -31,6 +31,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   one does not exist, with a warning naming both, so upgrading does not silently
   re-fetch gigabytes.
 
+- **macOS reports host memory, and Windows respects a container limit.**
+  `infr_plat::mem::available` returned `None` on macOS, so anything sizing a
+  host arena from it — the DRAM paging tier — stayed off on every Mac however
+  much RAM it had. It now probes `host_statistics64` and reports what is
+  reclaimable without swapping (`free - speculative + inactive + purgeable`;
+  `free_count` already includes speculative pages, so adding them again would
+  double-count). On Windows, `ullAvailPhys` is machine-wide and knew nothing
+  about a Job Object's commit limit, so a process inside a Windows container
+  could size an arena from far more memory than it was allowed — it is now
+  clamped by `QueryInformationJobObject`'s binding limit, the same policy the
+  Linux cgroup clamp already applied and now literally the same code. Both
+  figures carry their provenance in `Available::source`.
+
 - **The GPU MoE router no longer corrupts routing above 256 experts.**
   `moe_topk.comp` sized its per-expert scratch `ssel_adj` for 256 while the
   selection scan beside it was written for the chunked headroom above that, and

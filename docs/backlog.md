@@ -2588,44 +2588,32 @@ one": either request `robustBufferAccess` on the device, or clamp in-shader, or
 validate the id range host-side where the ids are uploaded. Say which, and why
 the other two were not chosen.
 
-### B66 — Windows and macOS paths that CI now compiles but cannot fully exercise (2026-09-02)
+### B66 — the Windows paths are compiled and unit-tested, not exercised (2026-09-02)
 
-**Tag:** PR#91 residual · **Blocked on:** nothing; each item below is separable
+**Tag:** PR#91 residual · **Blocked on:** nothing
 
-Most of this entry has shipped. `clippy` and `test` fan out over `ubuntu-26.04`
-/ `macos-15` / `windows-2025`, `metal-check` lints every crate that cross-builds
-for `aarch64-apple-darwin`, and the platform code all moved behind `infr-plat`
-(see [infr-plat.md](infr-plat.md)). Two of the three PR-review residuals this
-entry was keeping are resolved with it: the hand-rolled `LockFileEx` FFI is
-gone, replaced by the `windows` crate's generated bindings in the one crate that
-already depends on them, and `available_bytes` now reports its provenance
-through `infr_plat::mem::Available`, so the Linux clamp and the unclamped
-Windows figure are distinguishable rather than hidden behind one `Option<u64>`.
+The rest of this entry has shipped. `clippy` and `test` fan out over
+`ubuntu-26.04` / `macos-15` / `windows-2025`, `metal-check` lints every crate
+that cross-builds for `aarch64-apple-darwin`, the platform code moved behind
+`infr-plat` (see [infr-plat.md](infr-plat.md)), and `infr_plat::mem::available`
+now answers on all three platforms with its provenance attached — the macOS
+`host_statistics64` probe and the Windows Job Object clamp both landed.
 
-What is still open:
+What is still open: the matrix runs the workspace suite on a Windows runner,
+which is a large step up from nothing, but **no job downloads a model or runs a
+generation there**. `FileLock`'s `LockFileEx` arm has a portable exclusion test
+(`infr-plat`'s `a_held_lock_excludes_a_second_holder`), and `link_blob`'s
+symlink arm is covered end to end by `infr-hub`'s pull tests — which is how the
+forward-slash reparse-point bug was found. Everything above that level is still
+unverified on Windows.
 
-- **The Windows figure has no container clamp.** `infr_plat::mem::available`
-  reports `Source::WindowsAvailPhys`, which is machine-wide: it knows nothing
-  about a Job Object's commit limit, so inside a Windows container it can report
-  far more than the process may take. The Linux arm clamps by the tightest
-  ancestor cgroup for exactly this reason. Note `ullAvailPhys` does include the
-  standby list, so this is the missing clamp and not a counter-choice problem.
-  Fixing it means `QueryInformationJobObject` with
-  `JobObjectExtendedLimitInformation`, and a way to test it.
-- **macOS has no host-memory probe at all.** `infr_plat::mem::available` returns
-  `None` there, so anything sizing a host arena from it — the DRAM paging tier —
-  simply stays off on every Mac. That is the conservative failure rather than a
-  wrong number, but it means a Mac never pages weights however much RAM it has.
-  Closing it needs `host_statistics64`'s free/inactive/purgeable split, which is
-  a new implementation and not a translation of either existing arm.
-- **The Windows paths are compiled and unit-tested, not exercised.** The matrix
-  runs the workspace suite on a Windows runner, which is a large step up from
-  nothing, but no job downloads a model or runs a generation there. `FileLock`'s
-  `LockFileEx` arm now has a portable exclusion test (`infr-plat`'s
-  `a_held_lock_excludes_a_second_holder`), and `link_blob`'s symlink arm is
-  covered end to end by `infr-hub`'s pull tests — which is how the forward-slash
-  reparse-point bug was found. Everything above that level is still unverified
-  on Windows.
+The same gap now covers the two probes just added: `macos_vm_statistics64`,
+`macos_page_size` and `windows_job_memory_limit` are behind `cfg` arms that no
+Linux build compiles. Their arithmetic is in pure functions tested everywhere
+(`macos_available_bytes`, `apply_limit_clamp`, `job_object_limit_bytes`), and
+`the_re_declared_flag_bits_match_the_windows_crate` pins the two Win32 flag
+values against the real ones — but that the FFI calls themselves return sane
+figures on a real Mac or inside a real Windows container is still unobserved.
 
 ### B70 — no MoE model above 256 experts has ever been run (2026-09-03)
 

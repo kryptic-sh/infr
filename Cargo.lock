@@ -1154,7 +1154,6 @@ dependencies = [
  "infr-prof-rt",
  "infr-server",
  "infr-vulkan",
- "libc",
  "serde_json",
  "tokio",
  "tracing",

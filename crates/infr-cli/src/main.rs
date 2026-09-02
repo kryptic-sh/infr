@@ -1249,44 +1249,27 @@ fn cmd_run(
 ///
 /// Returns bytes read (0 = EOF or shutdown), like `read_line`.
 fn read_line_interruptible(line: &mut String) -> anyhow::Result<usize> {
-    #[cfg(not(unix))]
-    {
-        // Tail expression, not a `return`: the `cfg(unix)` block below is absent in this build, so
-        // this is already the last thing in the function.
-        Ok(std::io::stdin().read_line(line)?)
-    }
-    #[cfg(unix)]
-    {
-        // Bytes, not chars: a multi-byte UTF-8 codepoint (any non-ASCII prompt) arrives one byte
-        // per read and is only a `char` once it is whole.
-        let mut buf: Vec<u8> = Vec::new();
-        loop {
-            if infr_core::shutdown::shutdown_requested() {
-                return Ok(0);
-            }
-            let mut b = 0u8;
-            // SAFETY: a 1-byte read into a live stack byte.
-            let r = unsafe { libc::read(0, std::ptr::addr_of_mut!(b).cast(), 1) };
-            match r {
-                0 => break, // EOF
-                1 => {
-                    buf.push(b);
-                    if b == b'\n' {
-                        break;
-                    }
-                }
-                _ => {
-                    let e = std::io::Error::last_os_error();
-                    if e.kind() == std::io::ErrorKind::Interrupted {
-                        continue; // signal: the latch check at the top of the loop decides
-                    }
-                    return Err(e.into());
-                }
-            }
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if infr_core::shutdown::shutdown_requested() {
+            return Ok(0);
         }
-        line.push_str(&String::from_utf8_lossy(&buf));
-        Ok(buf.len())
+        match infr_plat::stdin::read_byte() {
+            Ok(None) => break, // EOF
+            Ok(Some(b)) => {
+                buf.push(b);
+                if b == b'\n' {
+                    break;
+                }
+            }
+            // A signal arrived: the latch check at the top of the loop decides what to do about
+            // it. Only unix can produce this — see the seam's docs.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
     }
+    line.push_str(&String::from_utf8_lossy(&buf));
+    Ok(buf.len())
 }
 
 /// Run one chat turn through the shared [`Chat`]: stream pieces via the `<think>` renderer, then

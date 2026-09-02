@@ -4400,10 +4400,12 @@ mod tests {
             crate::pcache::PcachePersist::new(&props, false).is_none(),
             "cleared `pipeline_cache_disk` must disable on-disk persistence"
         );
-        // The default is ON; it can still be `None` when there is no cache dir (no `HOME`/
-        // `XDG_CACHE_HOME`), which is not this knob's doing — assert only the knob's direction.
-        let has_cache_dir =
-            std::env::var_os("XDG_CACHE_HOME").is_some() || std::env::var_os("HOME").is_some();
+        // The default is ON; it can still be `None` when the platform has no cache directory to
+        // put a blob in, which is not this knob's doing — assert only the knob's direction. Ask
+        // the resolver the code itself uses rather than re-deriving it from the environment: a
+        // second copy of that rule is how this test started asserting `$HOME`, which Windows does
+        // not set, against a `cache_dir()` that resolves there perfectly well.
+        let has_cache_dir = infr_core::kernel_cache::cache_dir().is_some();
         assert_eq!(
             crate::pcache::PcachePersist::new(&props, true).is_some(),
             has_cache_dir,

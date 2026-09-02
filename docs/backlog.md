@@ -2621,48 +2621,50 @@ one": either request `robustBufferAccess` on the device, or clamp in-shader, or
 validate the id range host-side where the ids are uploaded. Say which, and why
 the other two were not chosen.
 
-### B66 — the CI matrix is one platform wide, and PR #91 made that a coverage hole (2026-08-30)
+### B66 — Windows and macOS paths that CI now compiles but cannot fully exercise (2026-09-02)
 
-**Tag:** PR#91 residual · **Blocked on:** nothing; runner minutes and a decision
-about which jobs are worth fanning out
+**Tag:** PR#91 residual · **Blocked on:** nothing; each item below is separable
 
-PR #91 (merged `c59f692`) added native Windows support, and no CI job builds,
-lints or runs any of it. **The full analysis and the staged plan now live in
-[ci-matrix.md](ci-matrix.md)** — current job table with measured durations, what
-cross-compiles from a Linux runner versus what needs a real one, and the five
-platform-gated clippy failures that exist in the tree right now
-(`infr-core/src/hostmem.rs` for Windows; four in `infr-metal/src/exec.rs` for
-Apple). This entry keeps only the PR-review residuals below, which are not about
-CI topology and would otherwise be lost when that plan ships.
+Most of this entry has shipped. `clippy` and `test` fan out over `ubuntu-26.04`
+/ `macos-15` / `windows-2025`, `metal-check` lints every crate that cross-builds
+for `aarch64-apple-darwin`, and the platform code all moved behind `infr-plat`
+(see [infr-plat.md](infr-plat.md)). Two of the three PR-review residuals this
+entry was keeping are resolved with it: the hand-rolled `LockFileEx` FFI is
+gone, replaced by the `windows` crate's generated bindings in the one crate that
+already depends on them, and `available_bytes` now reports its provenance
+through `infr_plat::mem::Available`, so the Linux clamp and the unclamped
+Windows figure are distinguishable rather than hidden behind one `Option<u64>`.
 
-Two corrections to what this entry originally recorded, both verified since:
-Windows-gated code also lives in `infr-vulkan` (`p2p.rs`, `tp_sem.rs`), not just
-`infr-hub`/`infr-core`; and `infr-core/src/mem.rs` does not exist — the host
-memory arm is `infr-core/src/hostmem.rs`.
+What is still open:
 
-**Also raised in the PR review and not addressed** (recorded so they are not
-re-derived):
-
-- **Hand-rolled FFI beside a dependency that already has it.** The PR adds the
-  `windows` crate to `infr-core` for `GlobalMemoryStatusEx`, then declares
-  `extern "system"` bindings and a `#[repr(C)]` `OVERLAPPED` by hand in
-  `infr-hub`. The transcription was checked against the documented layout and is
-  correct, so this is not a bug report — but a verified upstream definition
-  cannot drift and a hand-written ABI struct can. Deciding factor is whether a
-  second dependency edge on `infr-hub` is wanted; the contributor was asked and
-  has not answered.
-- **`available_bytes` is clamped on Linux and not on Windows.** The Linux arm
-  picks `MemAvailable` over `MemFree` and then clamps by the cgroup limit, with
-  a comment explaining that sizing an arena from the unclamped figure is an OOM
-  kill in a container. The Windows arm returns `ullAvailPhys` with no equivalent
-  — Job Objects are the rough analogue. Note `ullAvailPhys` does include the
-  standby list, so it is not simply the under-reporting figure it first looks
-  like; the asymmetry is the missing container clamp, not the counter choice.
-- **The doc rewrite dropped a caveat rather than updating it.** The removed text
-  pointed at B30 and said the behaviour "could not be verified on the machine
-  this was written on". Given that is still true of every Windows path here, a
-  note about what is unverified is worth more than the tidier sentence that
-  replaced it.
+- **The Windows figure has no container clamp.** `infr_plat::mem::available`
+  reports `Source::WindowsAvailPhys`, which is machine-wide: it knows nothing
+  about a Job Object's commit limit, so inside a Windows container it can report
+  far more than the process may take. The Linux arm clamps by the tightest
+  ancestor cgroup for exactly this reason. Note `ullAvailPhys` does include the
+  standby list, so this is the missing clamp and not a counter-choice problem.
+  Fixing it means `QueryInformationJobObject` with
+  `JobObjectExtendedLimitInformation`, and a way to test it.
+- **macOS has no host-memory probe at all.** `infr_plat::mem::available` returns
+  `None` there, so anything sizing a host arena from it — the DRAM paging tier —
+  simply stays off on every Mac. That is the conservative failure rather than a
+  wrong number, but it means a Mac never pages weights however much RAM it has.
+  Closing it needs `host_statistics64`'s free/inactive/purgeable split, which is
+  a new implementation and not a translation of either existing arm.
+- **The Windows paths are compiled and unit-tested, not exercised.** The matrix
+  runs the workspace suite on a Windows runner, which is a large step up from
+  nothing, but no job downloads a model or runs a generation there. `FileLock`'s
+  `LockFileEx` arm now has a portable exclusion test (`infr-plat`'s
+  `a_held_lock_excludes_a_second_holder`), and `link_blob`'s symlink arm is
+  covered end to end by `infr-hub`'s pull tests — which is how the forward-slash
+  reparse-point bug was found. Everything above that level is still unverified
+  on Windows.
+- **`infr-hub`'s `Store::discover` uses `dirs::cache_dir()`,** which resolves to
+  `~/Library/Caches` on macOS while `huggingface_hub` and llama.cpp use
+  `~/.cache/huggingface` on every platform. If that is right, infr does not see
+  models downloaded by `hf download` on a Mac and re-downloads them. NOT
+  verified on a Mac — stated as a suspicion with the mechanism, not a finding.
+  `HF_HOME` / `HF_HUB_CACHE` override it, so there is a workaround either way.
 
 ### B67 — `moe_topk.comp` corrupts routing above 256 experts (2026-08-30)
 
@@ -2701,6 +2703,74 @@ shared, still comfortable) or chunk-index it the way `taken[]` is done, **and**
 add the bound as an explicit `bail!` on the Rust side so a future ceiling is
 refused rather than silently exceeded. See [qwen38.md](qwen38.md) for the models
 that need it.
+
+### B68 — the Metal backend is gated on the host OS, not on itself (2026-09-02)
+
+**Tag:** infr-plat residual · **Blocked on:** a decision between the two options
+below
+
+`docs/infr-plat.md` called this Problem B and deliberately scoped it out: it is
+a feature-gating question, not a platform-plumbing one, and moving the gates
+into a crate would relocate them rather than remove them. The platform seam has
+landed without touching it, so the analysis is recorded here.
+
+About 55 `#[cfg(target_os = "macos")]` sites — most of the remaining ones in the
+tree — do not mean "spell this differently here". They mean "the Metal backend
+exists here": conditional re-exports in `infr-llama/src/chat/mod.rs`, a
+`metal_chat_model` constructor, and errors like `chat/cpu.rs`'s _"the Metal
+backend is only available on macOS"_. The consequence is that on a Mac the
+"Metal unavailable" path cannot be compiled at all, and everywhere else the
+"available" path cannot — each arm is built by exactly one runner and neither by
+both.
+
+Two facts settle the design, both verified by experiment rather than recalled:
+
+1. **A build script cannot set a Cargo feature.** Feature resolution finishes
+   before any build script runs, so `cargo:rustc-cfg=metal` injects
+   `--cfg metal` and never `--cfg feature="metal"`. The two predicates are
+   disconnected.
+2. **Cargo CAN enable a dependency's feature per target**, via
+   `[target.'cfg(..)'.dependencies] dep = { features = [..] }`. What it cannot
+   do is let a crate enable its OWN feature per target — which is what consumer
+   code would need to keep today's "on by default on macOS" behaviour.
+
+So:
+
+- **Option A — one build-script `cfg(metal)`, used uniformly.** No Cargo
+  feature. Every crate gating on Metal emits `cfg(metal)` from its `build.rs`
+  when `CARGO_CFG_TARGET_OS == "macos"` unless an opt-out env var is set. This
+  matches in-tree precedent: `infr-core`, `infr-cpu`, `infr-gguf` and
+  `infr-llama` already carry byte-identical build scripts of that shape for
+  `INFR_PROFILE` → `cfg(infr_profile)`. Cost is two new `build.rs` files.
+- **Option B — a real Cargo feature end-to-end.** Discoverable via `--features`,
+  no build script, but consumer code still cannot key on its own feature per
+  target, so only `infr-metal` itself becomes feature-gated and about 55 gates
+  stay exactly as they are. It does not solve the problem.
+
+Either way, guard the confusing failure: today selecting Metal off macOS fails
+cleanly at runtime with a sentence, and if a feature can be forced on for a
+non-Apple target the build instead dies inside unresolved `metal`/`objc`
+imports. What this buys is that both arms become compilable on macOS; what it
+does not buy is cross-building Metal from Linux, since `metal`/`objc` link the
+Objective-C runtime.
+
+### B69 — cross-process Vulkan sharing is POSIX-fd-only, with a stub on Windows (2026-09-02)
+
+**Tag:** infr-plat residual · **Blocked on:** nothing but the work itself
+
+`infr-vulkan`'s `p2p.rs` and `tp_sem.rs` export device memory and semaphores
+between processes by duplicating POSIX file descriptors — `vkGetMemoryFdKHR`,
+`libc::dup`. It looks like it has a Windows arm and does not: `p2p.rs` declares
+`#[cfg(target_os = "windows")] type RawFd = std::os::raw::c_int`, which exists
+only to keep `P2pExport`'s field type-checking. There is no `HANDLE` and no
+`VK_KHR_external_memory_win32` anywhere in the tree, so every call site is
+POSIX-only and the multi-GPU sharing path does not work on Windows.
+
+This is why `infr-vulkan` is the one crate allow-listed to depend on `libc` in
+`infr-plat`'s `platform_seam` test. Hoisting the stub into the seam would
+launder it into an abstraction; implementing `external_memory_win32` is feature
+work, not a move. Either do that, or delete the Windows alias in favour of a
+refusal that says so.
 
 ## Whole-codebase correctness review 2026-08-30
 

@@ -6,6 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`infr` can find a global config file on Windows.** `config::file::discover`
+  resolved `$XDG_CONFIG_HOME`, else `$HOME/.config`, else nothing — and Windows
+  sets neither variable, so the third lookup step silently never found anything
+  there. It now resolves through `dirs::home_dir()`, which reads the
+  `FOLDERID_Profile` Known Folder. `--config <path>` and `./infr.toml` were
+  unaffected and are unchanged. The layout stays `~/.config/infr/config.toml` on
+  every platform, deliberately: adopting `dirs::config_dir()` would have moved
+  the file to `~/Library/Application Support` for existing macOS users. An
+  absolute `$XDG_CONFIG_HOME` still wins; a relative or empty one is now ignored
+  rather than honoured, per the spec.
+- **Cached models are readable on Windows.** `link_blob` wrote its snapshot
+  symlink with the forward-slash target `../../blobs/<hex>` that
+  `huggingface_hub` and llama.cpp use. Windows accepts that in an ordinary path
+  but not inside a symlink's reparse point: the link was created and every read
+  through it failed with `ERROR_INVALID_NAME`. The target now uses the
+  platform's own separator.
+
 ### Changed
 
 - **`infr serve --parallel` (`-n`, `--np`) defaults to 1 slot, was 4.** Each
@@ -19,6 +38,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`infr-plat`, the platform seam.** Every direct use of an operating system —
+  file locks, positioned reads and writes, the content-addressed store's link
+  step, the host-memory probe, process liveness, signal handlers, config/cache
+  directory resolution, an interruptible stdin read — now lives in one leaf
+  crate with an arm per platform, and a test forbids any other crate from
+  depending on `libc` or the `windows` crate (`infr-vulkan` is allow-listed with
+  its reason). `infr-core`, `infr-hub` and `infr-cli` no longer name an OS
+  library at all, and `infr-hub`'s hand-written `LockFileEx` bindings and
+  `#[repr(C)] OVERLAPPED` are replaced by the `windows` crate's generated ones.
+  `infr_plat::mem::available` reports where its figure came from, so the Linux
+  cgroup clamp, the unclamped Windows figure, and macOS having no probe at all
+  are distinguishable instead of hidden behind one `Option<u64>`.
+- **CI runs clippy and the test suite on Linux, macOS and Windows.** Previously
+  one platform wide. This immediately found four things that had been sitting in
+  the tree: a dead constant on aarch64, two Windows-only lint failures, a
+  wall-clock assertion that fails on a loaded runner, and the Windows symlink
+  bug above.
+
 - **`infr` builds and runs natively on Windows** (thanks to
   [@Headmaster218](https://github.com/Headmaster218), PR #91). `infr-hub` and
   `infr-core` previously called `libc::flock`,
@@ -29,10 +66,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   for ranged downloads (Windows' positional write can return short where
   `write_all_at` cannot), a hard-link fallback in `link_blob`, and
   `GlobalMemoryStatusEx` for available memory. Unix and macOS behaviour is
-  unchanged. **Caveat worth knowing before you rely on it:** no CI job builds or
-  tests a Windows target, and the one test covering the file lock is excluded
-  there, so these paths are reviewed but unexercised — see `docs/backlog.md` §
-  B66.
+  unchanged. CI now builds, lints and runs the workspace suite on a Windows
+  runner, and the file lock has a test that runs on every platform; what is
+  still unexercised there is anything above unit-test level — no job downloads a
+  model or runs a generation on Windows. See `docs/backlog.md` § B66.
 - **`Op::CompressPool` — DeepSeek V4's compressor pooling — on CPU, Vulkan and
   Metal.** One op for the four ggml nodes both V4 compressor variants share
   (`build_hca_compressed_kv_from_state` and

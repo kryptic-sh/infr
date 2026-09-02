@@ -71,13 +71,15 @@ at that index. It holds:
   fake in-repo GGUF fixture, so real multi-GB models can be deleted without
   losing coverage. Why token-hash goldens are not portable, why a golden must be
   blessed against an external oracle, and which archs are dark today.
-- [infr-plat.md](infr-plat.md) — plan to move OS-specific code (file locks,
-  positional IO, memory query, signals, config/cache dirs) into one leaf crate
-  behind a platform-agnostic seam, and to gate the Metal backend on something
-  that says what it means instead of on the host OS.
-- [ci-matrix.md](ci-matrix.md) — plan to lint and test on Linux, macOS and
-  Windows. What cross-compiles from a Linux runner and what needs a real one,
-  plus the five platform-gated clippy failures CI does not currently see.
+- [infr-plat.md](infr-plat.md) — the platform seam, as shipped: `infr-plat` owns
+  every direct use of an operating system (file locks, positional IO, memory
+  query, signals, process liveness, config/cache dirs, interruptible stdin), and
+  a test forbids any other crate from depending on `libc` or `windows`. Read it
+  before adding platform-specific code.
+- [ci-matrix.md](ci-matrix.md) — the three-platform CI matrix, as shipped: what
+  runs natively on Linux, macOS and Windows, which jobs stay single-platform and
+  why, and the `target-cpu=native` and `msvc`-vs-`gnu` traps to know before
+  editing the workflow.
 
 ## Audit
 

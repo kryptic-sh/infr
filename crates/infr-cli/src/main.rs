@@ -3340,7 +3340,11 @@ impl ModelBench {
     /// [`llama_diffusion_cli_path`](Self::llama_diffusion_cli_path)'s last-resort candidate AND as
     /// [`llama_diffusion`](Self::llama_diffusion)'s fallback target (see its doc comment).
     fn fork_diffusion_cli_path(cpu: bool) -> PathBuf {
-        let fork = PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        // `unwrap_or_default` keeps the shape of the old lookup — an unresolvable home yields a
+        // path that simply does not exist, and every caller of this already probes for existence.
+        // What changed is that Windows now resolves at all: `$HOME` is unset there.
+        let fork = infr_plat::paths::home_dir()
+            .unwrap_or_default()
             .join("Projects/mxaddict/llama.cpp-dg");
         if cpu {
             fork.join("build/bin/llama-diffusion-cli")

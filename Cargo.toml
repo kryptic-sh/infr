@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/infr-core",
+    "crates/infr-plat",
     "crates/infr-vulkan",
     "crates/infr-metal",
     "crates/infr-hub",
@@ -26,6 +27,10 @@ repository = "https://github.com/kryptic-sh/infr"
 [workspace.dependencies]
 # internal
 infr-core = { path = "crates/infr-core" }
+# The platform seam: every `cfg(unix)` / `cfg(windows)` / `cfg(target_os)` arm in
+# the workspace lives here, so the OS-specific surface is one reviewable crate.
+# A LEAF — it must not depend on any other infr crate (see docs/infr-plat.md).
+infr-plat = { path = "crates/infr-plat" }
 infr-vulkan = { path = "crates/infr-vulkan" }
 infr-metal = { path = "crates/infr-metal" }
 infr-hub = { path = "crates/infr-hub" }

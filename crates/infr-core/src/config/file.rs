@@ -72,11 +72,10 @@ pub fn discover(explicit: Option<&Path>) -> Result<Option<PathBuf>, ConfigError>
         return Ok(Some(cwd));
     }
     // Not `INFR_*` and not engine configuration — the standard XDG location of the file itself,
-    // which by definition cannot come from the file (§5.3).
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-    let global = base.map(|b| b.join("infr").join("config.toml"));
+    // which by definition cannot come from the file (§5.3). Resolved through `infr-plat` because
+    // the `$HOME` spelling this used to hand-roll finds nothing on Windows, where that variable is
+    // not normally set: the global step returned `None` there for every user, silently.
+    let global = infr_plat::paths::config_dir().map(|b| b.join("config.toml"));
     Ok(global.filter(|p| p.exists()))
 }
 

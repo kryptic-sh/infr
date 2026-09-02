@@ -119,16 +119,17 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// `$XDG_CACHE_HOME/infr` → `$HOME/.cache/infr`, or `None` when neither is set. Callers that want
-/// a cache no matter what get the temp-dir fallback [`KernelCache::open`] applies; callers that
-/// want to report "no persistence available" (Vulkan's `pipeline_cache_disk` probe) ask here.
+/// `$XDG_CACHE_HOME/infr` → `~/.cache/infr`, or `None` when the home directory is unknown.
+/// Callers that want a cache no matter what get the temp-dir fallback [`KernelCache::open`]
+/// applies; callers that want to report "no persistence available" (Vulkan's
+/// `pipeline_cache_disk` probe) ask here.
 ///
 /// Does NOT create the directory — [`KernelCache::open`] does that, and only when enabled.
+///
+/// Re-exported from [`infr_plat::paths::cache_dir`] so this module keeps its call sites while the
+/// `$HOME` resolution — the part that was Unix-only — lives in one place.
 pub fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("infr"))
+    infr_plat::paths::cache_dir()
 }
 
 /// Is `pid` still running? `kill(pid, 0)` delivers no signal and only asks the kernel whether the

@@ -1,0 +1,28 @@
+[package]
+name = "infr-plat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Config/cache/data directory resolution. `dirs::home_dir()` goes through the
+# `FOLDERID_Profile` Known Folder on Windows, which is the whole reason the
+# hand-rolled `$HOME` lookups this crate replaces could not find anything there.
+dirs.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# `flock`, `kill(pid, 0)`, `sigaction` and the async-signal-safe `write`/`_exit`
+# pair. Target-gated because this crate is the one place they are reached from.
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",               # HANDLE, BOOL
+    "Win32_Storage_FileSystem",       # LockFileEx / UnlockFileEx
+    "Win32_System_IO",                # OVERLAPPED
+    "Win32_System_SystemInformation", # GlobalMemoryStatusEx
+] }
+
+[dev-dependencies]
+tempfile = "3"

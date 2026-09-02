@@ -1150,6 +1150,7 @@ dependencies = [
  "infr-engine",
  "infr-hub",
  "infr-llama",
+ "infr-plat",
  "infr-prof-rt",
  "infr-server",
  "infr-vulkan",
@@ -1167,6 +1168,7 @@ dependencies = [
  "bytemuck",
  "half",
  "indicatif",
+ "infr-plat",
  "infr-prof",
  "infr-prof-rt",
  "libc",
@@ -1277,6 +1279,16 @@ dependencies = [
  "metal",
  "objc",
  "tracing",
+]
+
+[[package]]
+name = "infr-plat"
+version = "0.0.0"
+dependencies = [
+ "dirs",
+ "libc",
+ "tempfile",
+ "windows",
 ]
 
 [[package]]

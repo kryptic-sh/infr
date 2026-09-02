@@ -29,12 +29,13 @@ use crate::http::{api_client, download_client, token, ConnBudget, Permit};
 use crate::parts::{self, Plan};
 use indicatif::{MultiProgress, ProgressBar};
 use infr_core::error::{Error, Result};
+use infr_plat::fileio::write_all_at;
 use reqwest::header::{
     ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE,
 };
 use reqwest::StatusCode;
 use std::fs;
-use std::io::{self, Read};
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -305,32 +306,6 @@ impl Job<'_> {
         let start = (i as u64) * self.chunk;
         (start, self.chunk.min(self.size - start))
     }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn write_all_at(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-
-    file.write_all_at(buf, offset)
-}
-
-#[cfg(target_os = "windows")]
-fn write_all_at(file: &fs::File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
-    use std::io::ErrorKind;
-    use std::os::windows::fs::FileExt;
-
-    while !buf.is_empty() {
-        let n = file.seek_write(buf, offset)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                ErrorKind::WriteZero,
-                "failed to write the full chunk at its offset",
-            ));
-        }
-        buf = &buf[n..];
-        offset += n as u64;
-    }
-    Ok(())
 }
 
 /// Start one more chunk worker, holding `permit` for as long as it runs. The permit rides with the

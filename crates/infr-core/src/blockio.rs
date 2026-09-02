@@ -27,6 +27,7 @@
 
 use crate::error::{Error, Result};
 use crate::pager::BlockId;
+use infr_plat::fileio::read_exact_at;
 use std::fs::File;
 use std::path::Path;
 
@@ -358,11 +359,11 @@ fn read_pieces<'a>(
             .into_iter()
             .map(|(shard, e, buf)| {
                 s.spawn(move || {
-                    read_exact_at(&shard.file, e.offset, buf).map_err(|err| (shard, e, err))
+                    read_exact_at(&shard.file, buf, e.offset).map_err(|err| (shard, e, err))
                 })
             })
             .collect();
-        first_err = read_exact_at(&last_shard.file, last.offset, last_dst)
+        first_err = read_exact_at(&last_shard.file, last_dst, last.offset)
             .map_err(|err| (last_shard, last, err))
             .err();
         for h in handles {
@@ -377,39 +378,6 @@ fn read_pieces<'a>(
         Some(e) => Err(e),
         None => Ok(()),
     }
-}
-
-/// Read exactly `buf.len()` bytes at `offset`, looping over short reads.
-///
-/// A positioned read is allowed to return fewer bytes than asked for even mid-file, so the loop is
-/// not optional; a partially-filled slot is the silent-wrong-output case this whole tier exists to
-/// avoid. Hitting EOF before the buffer is full is an error, not a short success.
-fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    use std::os::unix::fs::FileExt;
-    #[cfg(windows)]
-    use std::os::windows::fs::FileExt;
-
-    let mut done = 0usize;
-    while done < buf.len() {
-        #[cfg(unix)]
-        let n = file.read_at(&mut buf[done..], offset + done as u64)?;
-        #[cfg(windows)]
-        let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
-        #[cfg(not(any(unix, windows)))]
-        compile_error!("positioned reads need a unix or windows FileExt");
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "short read: wanted {} bytes at {offset}, got {done}",
-                    buf.len()
-                ),
-            ));
-        }
-        done += n;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

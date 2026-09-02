@@ -1231,6 +1231,7 @@ dependencies = [
  "dirs",
  "indicatif",
  "infr-core",
+ "infr-plat",
  "libc",
  "reqwest",
  "serde",

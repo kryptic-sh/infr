@@ -28,5 +28,6 @@
 //! - [`proc::pid_alive`] answers `true` on a platform with no probe — losing a tripwire rather
 //!   than misreporting a live process as dead.
 
+pub mod fileio;
 pub mod paths;
 pub mod proc;

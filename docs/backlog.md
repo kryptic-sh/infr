@@ -2588,37 +2588,41 @@ one": either request `robustBufferAccess` on the device, or clamp in-shader, or
 validate the id range host-side where the ids are uploaded. Say which, and why
 the other two were not chosen.
 
-### B66 — the Windows paths are compiled and unit-tested, not exercised (2026-09-02)
+### B66 — the platform memory probes are compiled, not observed (2026-09-02)
 
-**Tag:** PR#91 residual · **Blocked on:** nothing
+**Tag:** PR#91 residual · **Blocked on:** nothing; a gap, narrowed to what is
+actually still unknown
 
 The rest of this entry has shipped. `clippy` and `test` fan out over
 `ubuntu-26.04` / `macos-15` / `windows-2025`, `metal-check` lints every crate
 that cross-builds for `aarch64-apple-darwin`, the platform code moved behind
-`infr-plat` (see [infr-plat.md](infr-plat.md)), and `infr_plat::mem::available`
-now answers on all three platforms with its provenance attached — the macOS
-`host_statistics64` probe and the Windows Job Object clamp both landed.
+`infr-plat` (see [infr-plat.md](infr-plat.md)), and the `windows-smoke` job now
+pulls a model and generates on a Windows runner — which closed the "compiled but
+never exercised" half of this entry and proved the hub cache resolves to
+`C:\Users\runneradmin\.cache\huggingface\hub` there, not `%LOCALAPPDATA%`.
 
-What is still open: the matrix runs the workspace suite on a Windows runner,
-which is a large step up from nothing, but **no job downloads a model or runs a
-generation there**. `FileLock`'s `LockFileEx` arm has a portable exclusion test
-(`infr-plat`'s `a_held_lock_excludes_a_second_holder`), and `link_blob`'s
-symlink arm is covered end to end by `infr-hub`'s pull tests — which is how the
-forward-slash reparse-point bug was found. Everything above that level is still
-unverified on Windows.
-
-The same gap covers the two probes just added. `macos_vm_statistics64`,
-`macos_page_size` and `windows_job_memory_limit` do TYPECHECK on this Linux box
-— `cargo clippy -p infr-plat --target aarch64-apple-darwin` and
-`--target x86_64-pc-windows-msvc` both compile their `cfg` arms, verified by
-planting a type error inside `windows_job_memory_limit` and watching it get
-caught — and their arithmetic is in pure functions tested everywhere
-(`macos_available_bytes`, `apply_limit_clamp`, `job_object_limit_bytes`), with
+What is still unobserved is narrower: `infr_plat::mem::available`'s two newest
+arms. `macos_vm_statistics64`, `macos_page_size` and `windows_job_memory_limit`
+TYPECHECK on Linux — `cargo clippy -p infr-plat --target aarch64-apple-darwin`
+and `--target x86_64-pc-windows-msvc` both compile their `cfg` arms, verified by
+planting a type error inside `windows_job_memory_limit` and watching the Windows
+cross-check catch it — and their arithmetic is in pure functions tested
+everywhere (`macos_available_bytes`, `apply_limit_clamp`,
+`job_object_limit_bytes`), with
 `the_re_declared_flag_bits_match_the_windows_crate` pinning the two Win32 flag
-values against the real ones. What no local run can say is whether the kernel
-calls RETURN sane figures: no Mac has reported a page count through
-`host_statistics64` here, and no Windows container has reported a Job Object
-limit. That is behaviour, and only real hardware answers it.
+values against the real ones on the Windows leg.
+
+But no Mac has reported a page count through `host_statistics64` here, and no
+Windows container has reported a Job Object limit. Nothing asserts the FIGURES
+are sane — only that the code compiles and the arithmetic is right given inputs.
+Closing it means a test that calls `available()` on each platform and asserts a
+plausible range (non-zero, below total RAM), plus a container run for the clamp.
+Note the smoke job runs OUTSIDE a Job Object limit, so it exercises the
+unclamped Windows arm only.
+
+Also unverified on Windows: which arm of `link_blob` actually ran. The blob
+landed and the model loaded through the snapshot entry, so one of the two
+succeeded, but neither the symlink nor the hard-link fallback is logged.
 
 ### B72 — three test fixtures resolve the HF cache by hand, and skip silently (2026-09-03)
 

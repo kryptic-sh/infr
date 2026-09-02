@@ -947,35 +947,34 @@ residue worth tracking; what follows is that plus what was deliberately left.
   are cached, not how many bytes. Any fully-spending split is equivalent on I/O
   volume.
 
-### B37 — the cheap macOS guard does not guard the crate that keeps breaking
+### B37 — a macOS break in `infr-llama` still costs a macOS runner (2026-09-02)
 
-**Tag:** ci coverage · **Blocked on:** a decision about how much cross-compile
-setup is worth paying for
+**Tag:** ci coverage · **Blocked on:** nothing; what is left is latency, not
+coverage, so it may never be worth doing
 
-`metal-check` in `.github/workflows/ci.yml` runs
-`cargo check -p infr-metal --target aarch64-apple-darwin` on a Linux runner, and
-its comment sells it as catching "Op-signature drift before the expensive
-`test-macos` runner". It does not: every macOS break so far has been in
-`infr-llama`'s `#[cfg(target_os = "macos")]` arms, not in `infr-metal`, and that
-crate is outside the job's `-p`. `WBytes` replaced the binder's `&[u8]` in
-`e657a66d` and left three Metal upload sites uncompilable; `test-macos` was red
-for every commit from there to `588653b`, where it was fixed, because nothing
-cheaper ever looks at that code.
+This was "the cheap guard does not guard the crate that keeps breaking", and the
+coverage half of it is closed. `clippy` and `test` now run natively on
+`macos-15` over the whole workspace, so a `WBytes`-style break in `infr-llama`'s
+`#[cfg(target_os = "macos")]` arms — the failure that left `test-macos` red from
+`e657a66d` to `588653b` — is caught on every commit instead of being discovered
+by whoever next looked at the Metal job.
 
-Widening the `-p` is not free. `infr-llama` pulls `tokenizers`, whose `onig_sys`
-and `esaxx-rs` build scripts compile C for the target — verified locally, where
-both fail with `unrecognized command-line option '-arch'` — so the job would
-need a macOS SDK and stop being the cheap Linux guard it was designed as. The
-options are: pay for an SDK (osxcross or similar) on that job; find a
-feature/dependency arrangement where the typecheck does not need the C deps; or
-accept the gap and rely on `test-macos`, which is honest but leaves every macOS
-break a full round trip away.
+What remains is only how FAST it is caught. `metal-check` cross-lints from the
+Linux runner in about a minute and covers the nine crates that cross-build;
+`infr-llama`, `infr-hub`, `infr-chat`, `infr-engine`, `infr-server` and
+`infr-cli` cannot join it because `ring` and `esaxx-rs`/`onig_sys` compile C for
+the target and need an Apple SDK (locally both fail with
+`unrecognized command-line option '-arch'`). So a break in those six is found by
+a macOS runner in about three minutes rather than a Linux one in about one.
 
-Worth knowing either way: `rustup target list --installed` claimed
+That is a small enough difference that paying for an SDK (osxcross or similar)
+on the cross-lint job is probably not worth it. Recorded so the question is not
+re-opened from scratch.
+
+Worth keeping either way: `rustup target list --installed` claimed
 `aarch64-apple-darwin` was present on this machine while
 `$(rustc --print sysroot)/lib/rustlib/` did not contain it, so a local
 cross-check has to be run against a target confirmed in the sysroot.
-`x86_64-apple-darwin` gates identically and was actually installed.
 
 ### B38 — doc drift found while rewriting `docs/plan.md` (2026-08-05)
 

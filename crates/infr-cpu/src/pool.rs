@@ -68,9 +68,9 @@ pub(crate) struct SpinPool {
     /// a worker wake per op (qwen3 pp512 404 → 356 t/s at a fixed 1k). The adaptive budget collapses
     /// after a park and regrows on jobs arriving mid-spin, so the ceiling can be generous.
     ///
-    /// A FIELD, not a `OnceLock` memo (`docs/config-plan.md` §10.6): the value comes off the
-    /// backend's `Config`, so a per-call read would be a `getenv`-shaped cost on the wait loop and
-    /// a memo would pin the first pool's value process-wide.
+    /// A FIELD, not a `OnceLock` memo: the value comes off the backend's `Config`, so a per-call
+    /// read would be a `getenv`-shaped cost on the wait loop and a memo would pin the first pool's
+    /// value process-wide.
     spin_limit: u32,
     /// Serializes `run` — the pool holds ONE job; concurrent dispatch is a caller bug
     /// (converted call sites are all reached from the single-threaded `execute` op loop).

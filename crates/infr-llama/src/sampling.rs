@@ -26,7 +26,7 @@ impl Sampler {
     /// The process-default sampler, read from the resolved [`infr_core::config::SamplingCfg`] — the seam paths'
     /// sampling config (the bespoke path plumbs the same values through `Llama::set_sampling`).
     ///
-    /// Was `Sampler::from_env()` until S4 (`docs/config-plan.md` §5.1). Its doc CONTRACT is
+    /// Was `Sampler::from_env()` until the config migration. Its doc CONTRACT is
     /// unchanged and is what `SamplingCfg::default()` now carries: nothing set ⇒ `temp: 0.0` ⇒
     /// GREEDY, so library callers and the golden/parity tests stay deterministic; the CLI sets
     /// chat-appropriate defaults for run/serve through the config's CLI layer instead of the

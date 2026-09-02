@@ -52,7 +52,7 @@ fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
     GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Load a model on an EXPLICIT engine configuration (`docs/config-plan.md` S4): `kv.*`, `spec.*`,
+/// Load a model on an EXPLICIT engine configuration: `kv.*`, `spec.*`,
 /// `sampling.*`, `device.ubatch*` and `paging.cache` are a VALUE this test hands to
 /// `SeamModel::load_with`, not a process-global the next test can observe — and, just as
 /// importantly, not one this test can INHERIT (an ambient `INFR_TEMP=0.6` in the developer's shell

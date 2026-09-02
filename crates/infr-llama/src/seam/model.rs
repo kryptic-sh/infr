@@ -46,9 +46,9 @@ pub struct SeamModel {
     cfg: Config,
     /// The ENGINE configuration every seam path this model drives reads its knobs from —
     /// `kv.*`, `spec.*`, `sampling.*`, `multi.*`, `device.ubatch*`, `paging.cache`, the seam's
-    /// `prof.*` diagnostics — held for the model's whole life and BORROWED at each read site
-    /// (`docs/config-plan.md` R4/R6). Shared by `Arc` into every backend and session this model
-    /// opens, which is exactly the per-process scope §5.1 prescribes.
+    /// `prof.*` diagnostics — held for the model's whole life and BORROWED at each read site.
+    /// Shared by `Arc` into every backend and session this model opens — one configuration per
+    /// process, exactly the scope the config migration settled on.
     ///
     /// Always HANDED in: [`SeamModel::load_with`] is the only constructor. S4's transitional
     /// `load()` — which built one from the environment for callers that had none — is gone as of

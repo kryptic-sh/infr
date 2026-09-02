@@ -175,10 +175,10 @@ pub struct MetalBackend {
     pub(crate) scratch:
         std::sync::Mutex<std::collections::HashMap<(usize, u8), std::sync::Arc<metal::Buffer>>>,
     /// The engine configuration this backend reads its knobs from — HANDED IN by the caller
-    /// ([`MetalBackend::new_with`], S6), held for the backend's whole life, and borrowed (never
-    /// cloned) at every read site, including the per-forward exec walk (`docs/config-plan.md`
-    /// R4/R6). The 15 `INFR_METAL_NO_*` kill-switches, `INFR_METAL_LMHEAD_MRV`,
-    /// `INFR_METAL_NODELTA`, `INFR_METAL_NOMOE` and the two profiler keys all come off it.
+    /// ([`MetalBackend::new_with`]), held for the backend's whole life, and borrowed (never
+    /// cloned) at every read site, including the per-forward exec walk. The 15
+    /// `INFR_METAL_NO_*` kill-switches, `INFR_METAL_LMHEAD_MRV`, `INFR_METAL_NODELTA`,
+    /// `INFR_METAL_NOMOE` and the two profiler keys all come off it.
     cfg: Arc<Config>,
 }
 
@@ -188,7 +188,7 @@ unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
 
 impl MetalBackend {
-    /// Borrowed engine configuration — a REFERENCE, never a clone (`docs/config-plan.md` R6).
+    /// Borrowed engine configuration — a REFERENCE, never a clone.
     ///
     /// `pub` so `infr-llama`'s seam and this crate's own probes read the knobs off the backend they
     /// already hold instead of growing a second env-sourced config.

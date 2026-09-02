@@ -342,8 +342,8 @@ enum Cmd {
         message: Option<String>,
         /// Live per-denoise-step canvas view (diffusion-gemma models only). Bare `--diffusion-visual`
         /// (or `=1`) draws it when stdout is a tty; `=force` draws it anyway, for scripted
-        /// verification against piped stdout. CLI presentation only — NOT a `Config` field
-        /// (docs/config-plan.md §6.10), so it never reaches the forward.
+        /// verification against piped stdout. CLI presentation only — NOT a `Config` field, so it
+        /// never reaches the forward.
         #[arg(
             long = "diffusion-visual",
             value_name = "MODE",
@@ -586,9 +586,9 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    // THE configuration, resolved exactly once: defaults < config file < `INFR_*` < flags/`--set`
-    // (docs/config-plan.md §2). It is a VALUE, threaded into the commands as an `Arc` — there is
-    // deliberately no global (R4).
+    // THE configuration, resolved exactly once: defaults < config file < `INFR_*` < flags/`--set`.
+    // It is a VALUE, threaded into the commands as an `Arc` — there is deliberately no global
+    // (R4).
     let overrides = ConfigOverrides {
         config_path: cli.config.clone(),
         sets: cli.set.clone(),
@@ -766,8 +766,8 @@ fn specified_by_the_layers(overrides: &ConfigOverrides) -> anyhow::Result<Partia
 
 /// `-t`/`--threads` → `RAYON_NUM_THREADS`.
 ///
-/// PERMANENT, unlike the bridge below (docs/config-plan.md §6.1): rayon's global pool has no input
-/// other than the process environment, and `device.threads` is not an `INFR_*` knob — it only ever
+/// PERMANENT, unlike the bridge below: rayon's global pool has no input other than the process
+/// environment, and `device.threads` is not an `INFR_*` knob — it only ever
 /// comes from the flag or the config file, so publishing it is the whole delivery mechanism, not a
 /// stand-in for one. Must run before any parallel work spins the pool up, hence: in `main`.
 fn publish_thread_count(cfg: &Config) {
@@ -1600,8 +1600,8 @@ fn metal_chat_model(
             greedy.sampling.temp = 0.0;
             Arc::new(greedy)
         };
-        // Target and draft get the SAME config — a process loading both hands them one value
-        // (`docs/config-plan.md` §5.1), which is exactly what the shared environment did.
+        // Target and draft get the SAME config — a process loading both hands them one value,
+        // which is exactly what the shared environment did.
         let target = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
         let draft = infr_llama::SeamModel::load_with(&draft_path, None, cfg.clone())?;
         // Upper bound on the draft length; the driver adapts the actual k per round to recent
@@ -4158,8 +4158,8 @@ mod tests {
 
     /// A synthetic `INFR_*` environment, driven through the config env layer's INJECTED reader.
     ///
-    /// This is what replaced the module's old `static ENV_LOCK: Mutex<()>` (docs/config-plan.md R7):
-    /// the tests that used to mutate the real process environment — and therefore had to serialise
+    /// This is what replaced the module's old `static ENV_LOCK: Mutex<()>`: the tests that used to
+    /// mutate the real process environment — and therefore had to serialise
     /// against each other and restore afterwards — now build a `Config` from a `HashMap` and assert
     /// on the resolved value. Nothing here touches the process environment, so it all runs in
     /// parallel with everything else in the binary.

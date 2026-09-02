@@ -83,9 +83,8 @@ fn cpu_linear_all_weight_quants_match_the_host_oracle_at_m1() {
 /// (`gpu_seam_matches_cpu_qwen3_q2k` failed for exactly this reason: the production CPU leg's ~4e-3
 /// moved a greedy token at Q2_K while the GPU sat at ~1e-7).
 ///
-/// This is also the `kernels.cpu.reference` knob's behaviour test (`docs/config-plan.md` §8): the
-/// mode is selected purely by the `Config` handed to the backend, and the assertion is the numeric
-/// consequence of picking it.
+/// This is also the `kernels.cpu.reference` knob's behaviour test: the mode is selected purely by
+/// the `Config` handed to the backend, and the assertion is the numeric consequence of picking it.
 ///
 /// The `1e-5` bound is ~3 orders tighter than [`CPU_INT8_ACT_TOL`] — if reference mode ever silently
 /// falls back to an int8 kernel, this test fails while the production sweeps stay green.

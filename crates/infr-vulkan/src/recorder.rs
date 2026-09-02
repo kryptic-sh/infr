@@ -130,9 +130,9 @@ const MAX_DISPATCH_BINDINGS: usize = 16;
 /// `INFR_GEMV_RM_MAXOUT` overrides the out_f gate.
 ///
 /// `k` is [`GemvCfg`](infr_core::config::GemvCfg) off the backend's `Config` — borrowed from the
-/// recorder, never re-resolved (`docs/config-plan.md` R6). It replaced a `OnceLock<GemvKnobs>` that
-/// re-read ~10 env vars process-once (§10.6): the memo is gone AND the value is now settable per
-/// backend, at the same per-GEMV cost (a field read off a reference).
+/// recorder, never re-resolved. It replaced a `OnceLock<GemvKnobs>` that re-read ~10 env vars
+/// process-once: the memo is gone AND the value is now settable per backend, at the same per-GEMV
+/// cost (a field read off a reference).
 fn native_rm_choice(
     dtype: infr_core::DType,
     out_f: usize,
@@ -1021,8 +1021,8 @@ impl<'a> Recorder<'a> {
     }
 
     /// The Vulkan kernel-tier config this recorder steers on — BORROWED off the backend that
-    /// created it, never cloned and never re-resolved (`docs/config-plan.md` R6). Every per-op /
-    /// per-dispatch knob below reads through here instead of `std::env::var` (S5b).
+    /// created it, never cloned and never re-resolved. Every per-op / per-dispatch knob below
+    /// reads through here instead of `std::env::var`.
     #[inline]
     pub(crate) fn vk(&self) -> &infr_core::config::VulkanCfg {
         &self.be.cfg().kernels.vulkan
@@ -10558,7 +10558,7 @@ mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
 
-    /// A backend built on an EXPLICIT Vulkan kernel-tier configuration (`docs/config-plan.md` S5b).
+    /// A backend built on an EXPLICIT Vulkan kernel-tier configuration.
     ///
     /// This is what replaced `EnvGuard::with([("INFR_FLASH_SPLITS", "4"), …])` in every test below:
     /// the tier knobs are a VALUE handed to `VulkanBackend::new_with`, so nothing is process-global,

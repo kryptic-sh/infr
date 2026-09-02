@@ -2510,9 +2510,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
 /// Open one Vulkan backend per physical device index (the shared front of every multi-GPU
 /// `generate_*` wrapper). Errors name the failing `VulkanN`.
 ///
-/// Every backend gets the SAME `Arc<Config>` — `docs/config-plan.md` §5.1: per-device configs are
-/// explicitly out of scope for the config campaign, and today's multi-GPU paths all read one
-/// process environment, so one shared handle reproduces that exactly.
+/// Every backend gets the SAME `Arc<Config>`: per-device configs are explicitly out of scope for
+/// the config campaign, and today's multi-GPU paths all read one process environment, so one
+/// shared handle reproduces that exactly.
 fn open_vulkan_devices(
     devices: &[usize],
     ec: &EngineConfig,
@@ -2594,10 +2594,9 @@ fn run_dense_oneshot(
 
 /// The `multi.pipeline` device list (`INFR_PIPELINE=Vulkan0,Vulkan1,…`), or `None` for
 /// single-device. Needs >=2 devices for a layer split; garbage or too-few errors LOUDLY — but now
-/// at `Config::load`, not here (see `docs/config-plan.md`'s S1 note), since the grammar and the
-/// minimum both moved into `infr_core::config::parse_device_spec`. The `parse_device_spec` /
-/// `parse_device_list` pair this crate used to own is DELETED — it was a second copy of that
-/// grammar (§6.11).
+/// at `Config::load`, not here, since the grammar and the minimum both moved into
+/// `infr_core::config::parse_device_spec`. The `parse_device_spec` / `parse_device_list` pair this
+/// crate used to own is DELETED — it was a second copy of that grammar.
 pub fn pipeline_devices(ec: &EngineConfig) -> Option<&[usize]> {
     ec.multi.pipeline.as_deref()
 }

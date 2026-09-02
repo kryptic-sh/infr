@@ -62,8 +62,8 @@ pub struct EnvRows {
 
 impl EnvRows {
     /// The knob's value as CONFIGURED, clamped into `[min, max]` — the accessor half of the
-    /// migrated knob (`docs/config-plan.md` R5: the config layer only parses, the clamp is policy
-    /// and lives here). The caller passes `cfg.kernels.vulkan.moe_small_m` (etc.), whose
+    /// migrated knob (R5: the config layer only parses, the clamp is policy and lives here). The
+    /// caller passes `cfg.kernels.vulkan.moe_small_m` (etc.), whose
     /// `Config::default()` is this table's [`default`](Self::default) — pinned by the backend's
     /// own knob-table test, since the two spellings must not drift.
     pub fn clamped(&self, value: usize) -> usize {

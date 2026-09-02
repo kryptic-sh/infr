@@ -1,4 +1,4 @@
-//! Acceptance criteria for the config scaffold — `docs/config-plan.md` §8.
+//! Acceptance criteria for the config layer.
 //!
 //! Every test here is PURE: the env layer is driven through an injected `HashMap` reader and the
 //! file layer through a string literal, so nothing touches the process environment or the
@@ -735,7 +735,7 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// **The R3 exit criterion, as a test so it cannot rot** (`docs/config-plan.md` §7 S8).
+/// **The R3 exit criterion, as a test so it cannot rot.**
 ///
 /// After S8 the process environment is read for an `INFR_*` knob in exactly ONE place — the config
 /// crate's env layer, through the injected reader `Config::load` passes it. Anything else is a
@@ -1053,8 +1053,8 @@ fn metal_device_time_is_named_modes_not_a_level() {
 
 /// The migrated set, pinned key by key. A slice flips its own entries AND updates this list, so
 /// "which knobs have actually moved" is one diff away and a stray flip cannot ride along
-/// unnoticed. Every key below must come back clean from the three R3 greps
-/// (`docs/config-plan.md` §3) — its read site takes the value from a `Config`.
+/// unnoticed. Every key below must come back clean from the three R3 greps — its read site
+/// takes the value from a `Config`.
 #[test]
 fn migrated_keys_are_exactly_the_landed_slices() {
     /// S2 — `infr-core`'s own knobs: the two `tier::EnvRows` tables, the six `budget` spill knobs,
@@ -1310,7 +1310,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     ];
 
     /// Keys added AFTER the migration campaign finished. There is no transitional half for these:
-    /// they were born reading `Config` (`docs/config-plan.md` R3), so they are `migrated` from
+    /// they were born reading `Config` (R3), so they are `migrated` from
     /// their first commit and this list exists only to keep the count honest.
     const POST_MIGRATION: &[&str] = &[
         "INFR_DRAM_CACHE",

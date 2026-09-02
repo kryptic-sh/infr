@@ -1011,8 +1011,7 @@ pub struct VulkanBackend {
     /// `backend_drop_frees_device_after_moe_pager`.
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
-    /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
-    /// R4/R6).
+    /// backend's whole life, borrowed (never cloned) at every read site.
     ///
     /// Handed in by [`VulkanBackend::new_with`] (S5a); the S2 `Config::load_from_env()` bridge that
     /// used to build it inside `new_selected` is GONE. `infr-cli` resolves the four layers once in
@@ -1154,8 +1153,7 @@ impl VulkanBackend {
     }
 
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
-    /// steers on. A REFERENCE, never a clone: the adapter reads it inside per-op lowering
-    /// (`docs/config-plan.md` R6).
+    /// steers on. A REFERENCE, never a clone: the adapter reads it inside per-op lowering.
     ///
     /// `pub` because `infr-llama`'s seam reads the paging/KV knobs off the backend it already
     /// holds rather than growing a second env-sourced config of its own.
@@ -1316,7 +1314,7 @@ impl VulkanBackend {
     /// construction-time knob — device pick, capability masking, subgroup preference, the submit
     /// splitter, the VRAM guard, the pipeline-cache and pager diagnostics — from `cfg` instead of
     /// the process environment. The `Arc` is held for the backend's whole life and borrowed
-    /// (never cloned) at each read site (`docs/config-plan.md` R4/R6).
+    /// (never cloned) at each read site.
     ///
     /// Device pick: `cfg.device.dev` (`INFR_DEV`) if it names a `VulkanN`, else the first discrete
     /// GPU, else device 0. See [`new_on_with`](Self::new_on_with) to pin a SPECIFIC index.
@@ -1384,8 +1382,8 @@ impl VulkanBackend {
         Self::reject_on_apple()?;
 
         // Every knob below is resolved ONCE, here, from the caller's config — the construction-time
-        // tier (`docs/config-plan.md` §7 S5a). Borrowed, never cloned (R6); `cfg` itself moves onto
-        // the backend at the bottom of this function.
+        // tier. Borrowed, never cloned (R6); `cfg` itself moves onto the backend at the bottom of
+        // this function.
         let vkcfg = &cfg.kernels.vulkan;
 
         // ── entry ──────────────────────────────────────────────────────────────
@@ -1888,10 +1886,9 @@ impl VulkanBackend {
         // ── force-disable capabilities for fallback-path testing on capable HW ──
         // These knobs drop a DETECTED capability so the next kernel tier down is exercised on a
         // device that actually has the feature — otherwise the portability fallbacks are only
-        // reachable on hardware we may not own. This is `docs/config-plan.md` §5.2: `Capabilities`
-        // stays a PROBE result (no config fields on it, nothing downstream re-reads a knob), and
-        // the config MASKS the probe right here, at construction. Applied before the ext list /
-        // feature chain so a forced-off feature is genuinely NOT enabled on the device (a faithful
+        // reachable on hardware we may not own. `Capabilities` stays a PROBE result (no config
+        // fields on it, nothing downstream re-reads a knob), and the config MASKS the probe right
+        // here, at construction. Applied before the ext list / feature chain so a forced-off feature is genuinely NOT enabled on the device (a faithful
         // simulation, not just a caps flag flip). f16 is a coopmat prerequisite, so `!f16` ⇒ NO
         // coopmat too — preserve that AND, it is not a bug.
         let has_f16 = has_f16 && vkcfg.f16;

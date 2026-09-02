@@ -1,7 +1,8 @@
 //! The checked-in `INFR_*` key table: env name → config path → grammar → `migrated`.
 //!
-//! This — not `docs/config-plan.md` — is the authority on what the campaign has to move, because
-//! the compiler and the tests read it. It is seeded from the `docs/config-plan.md` §6.0 command:
+//! This is the authority on what the campaign had to move, because the compiler and the tests
+//! read it. It was seeded from this command (the plan doc it was drafted against was deleted at
+//! `3010e45`, once the migration landed):
 //!
 //! ```bash
 //! grep -rhoE '"INFR_[A-Z_0-9]*"' crates/*/src crates/*/build.rs | tr -d '"' | sort -u \
@@ -339,7 +340,7 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
     (
         "INFR_PROFILE",
         "build-time input: read by build.rs in core/cpu/gguf/llama/vulkan to set cfg(infr_profile). \
-         A runtime Config cannot exist when it is read (§5.3).",
+         A runtime Config cannot exist when it is read.",
     ),
     (
         "INFR_LLAMA_DIFFUSION_CLI",
@@ -347,7 +348,7 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
     ),
     (
         "INFR_DIFFUSION_VISUAL",
-        "CLI presentation only, NOT a Config field: since S7 it is `infr run --diffusion-visual`, \
+        "CLI presentation only, NOT a Config field: it is `infr run --diffusion-visual`, \
          a plain clap flag whose `env =` fallback keeps the old spelling working. The literal that \
          remains in `cli/main.rs` is that clap attribute, not a `std::env::var` read.",
     ),

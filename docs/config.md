@@ -340,4 +340,8 @@ Backends take it at construction (`VulkanBackend::new_with(cfg)`,
 that wants the environment honoured but no config file.
 
 The migration history — the layer machinery, the per-knob polarity tables, and
-the slice-by-slice record — is in [`config-plan.md`](config-plan.md).
+the slice-by-slice record — lived in the campaign's planning doc while the
+migration was in flight; it was deleted at commit `3010e45` once the migration
+landed, so that record now exists only in `git log`. What actually moved is
+tracked today in
+[`crates/infr-core/src/config/manifest.rs`](../crates/infr-core/src/config/manifest.rs).

@@ -27,7 +27,7 @@ pub use config::Config;
 /// The ENGINE configuration ([`infr_core::config::Config`]), re-exported under a name that cannot
 /// be confused with this crate's own MODEL [`Config`] (the GGUF-derived architecture description).
 ///
-/// Since S4 (`docs/config-plan.md`) every `INFR_*` knob this crate used to read out of the process
+/// Since the config migration, every `INFR_*` knob this crate used to read out of the process
 /// environment — `kv.*`, `spec.*`, `sampling.*`, `multi.*`, `device.ubatch*`, `paging.cache`, and
 /// the seam's `prof.*` diagnostics — is read from a value of this type, owned by [`SeamModel`] and
 /// by each [`seam::model::DenseSession`] and BORROWED at every read site (R4/R6: no globals, no

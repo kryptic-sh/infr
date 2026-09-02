@@ -6,7 +6,7 @@
 use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_vulkan::VulkanBackend;
 
-/// A backend on an EXPLICIT Vulkan kernel-tier configuration (`docs/config-plan.md` S5b).
+/// A backend on an EXPLICIT Vulkan kernel-tier configuration.
 ///
 /// The GEMM tier knobs (`INFR_NO_GEMM_WARP`, `INFR_GEMM_WIDE_TILE`, `INFR_NO_SMALL_BM`,
 /// `INFR_NO_BM16`) are resolved at BACKEND CONSTRUCTION now, so a bench that used to flip an env

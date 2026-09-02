@@ -253,9 +253,9 @@ pub struct CpuBackend {
     /// never spawn threads. MoeFfn's nested per-expert fan-out stays on rayon (phase 3).
     pool: std::sync::OnceLock<pool::SpinPool>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
-    /// backend's whole life, borrowed (never cloned) at every read site (`docs/config-plan.md`
-    /// R4/R6). The knobs it reads are `kernels.cpu.{spin,spinpool,repack_mb,reference}`,
-    /// `prof.prof_ops` and `debug.moe_counts{,_dump}`.
+    /// backend's whole life, borrowed (never cloned) at every read site. The knobs it reads are
+    /// `kernels.cpu.{spin,spinpool,repack_mb,reference}`, `prof.prof_ops` and
+    /// `debug.moe_counts{,_dump}`.
     ///
     /// Every construction site inside this repo goes through [`CpuBackend::new_with`] (S4 threaded
     /// the seam's `Arc<Config>` into them). [`CpuBackend::new`] survives as the ENV-SOURCED twin
@@ -773,7 +773,7 @@ impl Backend for CpuBackend {
 
         // The knobs this interpreter loop consults, read ONCE off the backend's config: the loop
         // below runs them per op (`reference`) or per MoeFfn op (`moe_counts`), so a resolve per
-        // iteration would be a cost the env reads never had either (`docs/config-plan.md` R6).
+        // iteration would be a cost the env reads never had either.
         // The shared predicate (`INFR_PROF_OPS` or `INFR_PROF_OPS`, ANDed with warmup suppression) —
         // this backend used to read `prof.prof_ops` alone, so a bench that suppressed profiling
         // around its untimed warmup still got that forward in the table.

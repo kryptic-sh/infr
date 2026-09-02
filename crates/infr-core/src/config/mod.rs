@@ -1,5 +1,5 @@
 //! The typed, immutable, explicitly-passed engine configuration — the replacement for the ~174
-//! `INFR_*` environment gates scattered across the backends (see `docs/config-plan.md`).
+//! `INFR_*` environment gates that used to be scattered across the backends.
 //!
 //! Four layers, later wins: `Default` (today's shipped behaviour, reproduced EXACTLY) < config
 //! file (TOML) < environment (`INFR_*`, names frozen) < CLI flags. Each layer parses into a
@@ -12,21 +12,25 @@
 //! # Ok::<(), infr_core::config::ConfigError>(())
 //! ```
 //!
-//! **Scaffold only (slice S0).** Nothing in the engine reads this yet; every `INFR_*` read site is
-//! still where it was, so the tree behaves exactly as before. The per-subsystem slices (S2–S7)
-//! move the read sites onto `Arc<Config>` one crate at a time, flipping
-//! `manifest::KnobKey::migrated` as they go.
+//! **The migration is complete.** Every `INFR_*` knob in `manifest::KEYS` carries
+//! `migrated: true`: its read site takes the value from a `Config`, not `std::env::var`, and
+//! `manifest.rs` is the checked-in authority on what moved — the compiler and the
+//! `manifest_matches_the_tree` test enforce it, so a knob cannot silently drift back onto
+//! ambient state. The exceptions are `manifest`'s `NOT_MIGRATED` keys, which were never
+//! candidates: a build-time input, a dev fixture, and one clap flag's `env =` fallback.
 //!
-//! Module map (`docs/config-plan.md` §4):
+//! Module map:
 //! - `partial` — the `cfg_struct!` macro that generates both halves, plus the value grammar.
 //! - [`env`] — the ONLY place the process environment is read (through an INJECTED reader).
 //! - [`file`] — TOML → `PartialConfig`, plus the 3-step path lookup.
 //! - `cli` — `ConfigOverrides` (clap flags + `--set`) → `PartialConfig`.
 //! - `manifest` — the checked-in key table: env name → config path → grammar → `migrated`.
 //!
-//! Invariants (`docs/config-plan.md` §3): no globals (R4) — `Config::load` returns a VALUE; no
-//! policy in the layer parsers (R5) — clamping and defaulting live in `Default` and the typed
-//! accessors; field names are POSITIVE and the env layer inverts the `INFR_NO_*` spellings.
+//! Invariants: no globals (R4) — `Config::load` returns a VALUE; no policy in the layer parsers
+//! (R5) — clamping and defaulting live in `Default` and the typed accessors; the resolved
+//! `Config` is BORROWED at every read site, never cloned, and resolved once at construction
+//! rather than re-read per call (R6); field names are POSITIVE and the env layer inverts the
+//! `INFR_NO_*` spellings.
 
 use std::path::{Path, PathBuf};
 

@@ -51,10 +51,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cgroup clamp, the unclamped Windows figure, and macOS having no probe at all
   are distinguishable instead of hidden behind one `Option<u64>`.
 - **CI runs clippy and the test suite on Linux, macOS and Windows.** Previously
-  one platform wide. This immediately found four things that had been sitting in
-  the tree: a dead constant on aarch64, two Windows-only lint failures, a
-  wall-clock assertion that fails on a loaded runner, and the Windows symlink
-  bug above.
+  one platform wide, and every platform arm had something sitting in it.
+  Bringing the matrix up found, in order: a constant that is dead on aarch64,
+  two Windows-only lint failures, a profiler test asserting a wall-clock ceiling
+  that a loaded runner blows past, the `link_blob` symlink bug above, a download
+  test whose hub over-counted bodies in flight and could fail on two cores, and
+  two tests that hard-coded a POSIX path separator or `$HOME` and so asserted
+  the behaviour Windows never had. Only the symlink bug affected shipped code;
+  the rest were checks that could not have run, or could not have passed, where
+  nothing was running them.
 
 - **`infr` builds and runs natively on Windows** (thanks to
   [@Headmaster218](https://github.com/Headmaster218), PR #91). `infr-hub` and

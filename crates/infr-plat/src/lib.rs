@@ -30,5 +30,6 @@
 
 pub mod fileio;
 pub mod link;
+pub mod lock;
 pub mod paths;
 pub mod proc;

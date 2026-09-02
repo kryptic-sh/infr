@@ -12,10 +12,9 @@ use crate::ranged::{self, RangedError};
 use indicatif::{MultiProgress, ProgressBar};
 use infr_core::error::{Error, Result};
 use infr_core::progress::{self, Unit};
+use infr_plat::lock::FileLock;
 use reqwest::blocking::Response;
 use sha2::{Digest, Sha256};
-#[cfg(not(target_os = "windows"))]
-use std::os::unix::io::AsRawFd;
 use std::{
     fs,
     io::{Read, Write},
@@ -412,179 +411,6 @@ fn response_validator(headers: &reqwest::header::HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// An advisory exclusive `flock` on a lockfile, released when dropped. Serializes concurrent
-/// downloads of the same blob so two processes can't interleave writes into the shared temp.
-#[cfg(not(target_os = "windows"))]
-struct FileLock {
-    _file: fs::File,
-}
-
-#[cfg(not(target_os = "windows"))]
-impl FileLock {
-    fn acquire(path: &Path) -> Result<Self> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .map_err(Error::from)?;
-        // Blocks until any other holder releases. `flock` is process-associated and auto-releases if
-        // the holder dies (crash-safe — no stale lock).
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(Error::Other(format!(
-                "flock {path:?}: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(FileLock { _file: file })
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        // Closing the fd releases the lock; the explicit unlock is belt-and-suspenders.
-        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-
-#[cfg(target_os = "windows")]
-struct FileLock {
-    _file: fs::File,
-}
-
-#[cfg(target_os = "windows")]
-impl FileLock {
-    fn acquire(path: &Path) -> Result<Self> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .map_err(Error::from)?;
-        lock_file_exclusive(&file)
-            .map_err(|e| Error::Other(format!("LockFileEx {path:?}: {e}")))?;
-        Ok(FileLock { _file: file })
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = unlock_file(&self._file);
-    }
-}
-
-#[cfg(target_os = "windows")]
-#[repr(C)]
-union OverlappedOffset {
-    offset: OffsetPair,
-    pointer: *mut std::ffi::c_void,
-}
-
-#[cfg(target_os = "windows")]
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct OffsetPair {
-    offset: u32,
-    offset_high: u32,
-}
-
-#[cfg(target_os = "windows")]
-#[repr(C)]
-struct Overlapped {
-    internal: usize,
-    internal_high: usize,
-    offset_or_pointer: OverlappedOffset,
-    h_event: *mut std::ffi::c_void,
-}
-
-#[cfg(target_os = "windows")]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn LockFileEx(
-        h_file: *mut std::ffi::c_void,
-        dw_flags: u32,
-        dw_reserved: u32,
-        n_number_of_bytes_to_lock_low: u32,
-        n_number_of_bytes_to_lock_high: u32,
-        lp_overlapped: *mut Overlapped,
-    ) -> i32;
-    fn UnlockFileEx(
-        h_file: *mut std::ffi::c_void,
-        dw_reserved: u32,
-        n_number_of_bytes_to_unlock_low: u32,
-        n_number_of_bytes_to_unlock_high: u32,
-        lp_overlapped: *mut Overlapped,
-    ) -> i32;
-}
-
-#[cfg(target_os = "windows")]
-fn zero_overlapped() -> Overlapped {
-    Overlapped {
-        internal: 0,
-        internal_high: 0,
-        offset_or_pointer: OverlappedOffset {
-            offset: OffsetPair {
-                offset: 0,
-                offset_high: 0,
-            },
-        },
-        h_event: std::ptr::null_mut(),
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn lock_file_exclusive(file: &fs::File) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-
-    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
-    const LOCK_LEN_LOW: u32 = u32::MAX;
-    const LOCK_LEN_HIGH: u32 = u32::MAX;
-
-    let mut overlapped = zero_overlapped();
-    let ok = unsafe {
-        LockFileEx(
-            file.as_raw_handle() as *mut std::ffi::c_void,
-            LOCKFILE_EXCLUSIVE_LOCK,
-            0,
-            LOCK_LEN_LOW,
-            LOCK_LEN_HIGH,
-            &mut overlapped,
-        )
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn unlock_file(file: &fs::File) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-
-    const LOCK_LEN_LOW: u32 = u32::MAX;
-    const LOCK_LEN_HIGH: u32 = u32::MAX;
-
-    let mut overlapped = zero_overlapped();
-    let ok = unsafe {
-        UnlockFileEx(
-            file.as_raw_handle() as *mut std::ffi::c_void,
-            0,
-            LOCK_LEN_LOW,
-            LOCK_LEN_HIGH,
-            &mut overlapped,
-        )
-    };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 /// Assert the downloaded digest `hex` matches the `expected` LFS sha256 (case-insensitive). `None`
 /// means no digest was available (non-LFS file) → verification is skipped.
 fn verify_sha(label: &str, hex: &str, expected: Option<&str>) -> Result<()> {
@@ -759,28 +585,6 @@ mod tests {
         );
         h.insert(ETAG, HeaderValue::from_static("\"deadbeef\""));
         assert_eq!(response_validator(&h).as_deref(), Some("\"deadbeef\""));
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn file_lock_is_exclusive() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("blob.lock");
-        let guard = FileLock::acquire(&path).unwrap();
-        // A second exclusive lock on the same file (separate fd) must NOT be grantable while held.
-        let other = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_ne!(rc, 0, "second flock should fail while the first is held");
-        // After the first releases, the lock is grantable again.
-        drop(guard);
-        let rc = unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(rc, 0, "flock should succeed once the holder drops");
-        unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_UN) };
     }
 
     /// `sanitise` maps `/` to `_`, so the sanitised name ALONE is not a unique temp/lock key once

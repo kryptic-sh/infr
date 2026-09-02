@@ -15,8 +15,12 @@ use std::io;
 /// this crate a leaf. `write(2)` and `_exit(2)` are both on POSIX's async-signal-safe list, unlike
 /// `exit`, which runs atexit handlers and flushes streams from a signal context.
 ///
-/// Idempotent: installing twice replaces the previous handler. Errors are returned rather than
-/// panicked on, since a CLI can run without one.
+/// Idempotent, with one caveat worth stating: installing twice re-arms the signal disposition,
+/// but the FIRST latch wins — a second call with a *different* latch leaves the first in place.
+/// That is a deliberate consequence of storing it somewhere a signal handler can read without
+/// `unsafe`; nothing in this workspace installs two, and a caller that needs to swap one should
+/// change its own latch rather than reinstall. Errors are returned rather than panicked on, since
+/// a CLI can run without a handler.
 ///
 /// **No `SA_RESTART`.** An interrupted blocking `read(2)` then returns `EINTR`, which is what lets
 /// an idle chat prompt notice a Ctrl-C instead of sitting on the read until the user presses
@@ -29,7 +33,8 @@ use std::io;
 /// different safety rules than the async-signal-safe ones above.
 #[cfg(unix)]
 pub fn install_handlers(on_signal: fn(i32) -> bool) -> io::Result<()> {
-    LATCH.store(on_signal as usize, std::sync::atomic::Ordering::Relaxed);
+    // Set BEFORE `sigaction`, so the handler cannot fire against an empty latch.
+    let _ = LATCH.set(on_signal);
 
     // SAFETY: a zeroed `sigaction` with a valid handler pointer and an empty mask is exactly what
     // POSIX asks for; `trampoline` is async-signal-safe (see its own comment).
@@ -53,20 +58,20 @@ pub fn install_handlers(on_signal: fn(i32) -> bool) -> io::Result<()> {
     Ok(())
 }
 
-/// The caller's latch, as a raw `fn` pointer so the handler can read it with one relaxed atomic
-/// load. A `Mutex` or a `Box<dyn Fn>` would be unusable from signal context.
+/// The caller's latch.
+///
+/// A `OnceLock` because reading it from signal context must be async-signal-safe: `get` is one
+/// atomic load and a reference, with no allocation and no locking. A `Mutex` or a `Box<dyn Fn>`
+/// would be unusable here, and a raw `fn`-pointer-as-`usize` would need a `transmute` to get back
+/// — this needs no `unsafe` at all.
 #[cfg(unix)]
-static LATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LATCH: std::sync::OnceLock<fn(i32) -> bool> = std::sync::OnceLock::new();
 
 /// The installed handler. **Async-signal-safe by construction**: one relaxed atomic load, one
 /// indirect call into the caller's latch, and — only for a second signal — `write` and `_exit`.
 #[cfg(unix)]
 extern "C" fn trampoline(signo: libc::c_int) {
-    let raw = LATCH.load(std::sync::atomic::Ordering::Relaxed);
-    if raw != 0 {
-        // SAFETY: `raw` is only ever written by `install_handlers` from a `fn(i32) -> bool`, and
-        // this handler is only reachable after that write.
-        let latch: fn(i32) -> bool = unsafe { std::mem::transmute::<usize, fn(i32) -> bool>(raw) };
+    if let Some(latch) = LATCH.get() {
         if latch(signo) {
             return; // first signal: let the caller wind down at its next safe point
         }
@@ -83,12 +88,19 @@ extern "C" fn trampoline(signo: libc::c_int) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    static SEEN: AtomicI32 = AtomicI32::new(0);
+    // One slot per signal, not one shared cell: `install_handlers` keeps the FIRST latch, so both
+    // tests below necessarily share this one, and they run concurrently in the same process.
+    static SAW_INT: AtomicBool = AtomicBool::new(false);
+    static SAW_TERM: AtomicBool = AtomicBool::new(false);
 
     fn latch(signo: i32) -> bool {
-        SEEN.store(signo, Ordering::Relaxed);
+        match signo {
+            libc::SIGINT => SAW_INT.store(true, Ordering::Relaxed),
+            libc::SIGTERM => SAW_TERM.store(true, Ordering::Relaxed),
+            other => panic!("unexpected signal {other}"),
+        }
         true // always "first signal", so the handler returns instead of calling _exit
     }
 
@@ -101,18 +113,21 @@ mod tests {
         install_handlers(latch).expect("install");
         // SAFETY: raising SIGTERM in-process with a handler installed; the handler returns.
         unsafe { libc::raise(libc::SIGTERM) };
-        assert_eq!(
-            SEEN.load(Ordering::Relaxed),
-            libc::SIGTERM,
+        assert!(
+            SAW_TERM.load(Ordering::Relaxed),
             "the latch must have been called with the signal that was raised"
         );
     }
 
-    /// Installing twice replaces rather than accumulating or failing.
+    /// Installing twice succeeds and leaves a working handler, rather than accumulating or
+    /// failing. Raising afterwards is what proves the second call did not disarm the first.
     #[test]
-    fn installing_is_idempotent() {
+    fn installing_twice_leaves_a_working_handler() {
         install_handlers(latch).expect("install once");
         install_handlers(latch).expect("install twice");
+        // SAFETY: raising SIGINT in-process with a handler installed; the handler returns.
+        unsafe { libc::raise(libc::SIGINT) };
+        assert!(SAW_INT.load(Ordering::Relaxed));
     }
 }
 

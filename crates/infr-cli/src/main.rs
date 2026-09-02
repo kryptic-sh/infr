@@ -505,59 +505,25 @@ enum Cmd {
 // Signals — the graceful GPU shutdown path (see `infr_core::shutdown`)
 // ---------------------------------------------------------------------------
 
-/// `SIGINT`/`SIGTERM` handler. **Async-signal-safe by construction**: the first signal does nothing
-/// but a lock-free atomic compare-exchange ([`infr_core::shutdown::request_shutdown`]) — no
-/// allocation, no locking, no Rust `println!` (which takes the stdout lock and would deadlock
-/// against an interrupted `print!`). The engine's poll sites see the latch at their next submit
-/// boundary, drain the GPU work already in flight, unwind, and let the backend's `Drop` destroy the
-/// device.
+/// Install the `SIGINT`/`SIGTERM` handlers, once, before anything touches the GPU.
 ///
-/// The SECOND signal is the user saying they have given up waiting, and is honoured immediately:
-/// `write(2)` and `_exit(2)` are both on POSIX's async-signal-safe list (unlike `exit`, which runs
-/// atexit handlers and flushes streams from a signal context). It is a real risk, so it says so.
-#[cfg(unix)]
-extern "C" fn on_signal(signo: libc::c_int) {
-    if infr_core::shutdown::request_shutdown(signo) {
-        return; // first signal: latch and let the engine wind down at its next submit boundary
-    }
-    const MSG: &[u8] = b"\ninfr: second signal - exiting NOW without draining the GPU. \
-        If a submit was in flight, the device may stay wedged until reboot.\n";
-    // SAFETY: `write` and `_exit` are async-signal-safe; MSG is a 'static byte string.
-    unsafe {
-        libc::write(2, MSG.as_ptr().cast(), MSG.len());
-        libc::_exit(128 + signo);
-    }
-}
-
-/// Install [`on_signal`] for `SIGINT` and `SIGTERM`, once, before anything touches the GPU.
+/// The latch is [`infr_core::shutdown::request_shutdown`]: the first signal does nothing but a
+/// lock-free compare-exchange, and the engine's poll sites see it at their next submit boundary,
+/// drain the GPU work already in flight, unwind, and let the backend's `Drop` destroy the device.
+/// A second signal is the user saying they have given up waiting, and `infr-plat` honours it
+/// immediately. Passing the latch in is what keeps `infr-plat` a leaf crate — see its docs for the
+/// async-signal-safety contract this function is relying on.
 ///
 /// Chosen over `tokio::signal` (which is in the tree via tokio's `full` feature) because three of
 /// the four subcommands — `run`, `bench`, `compare` — are plain synchronous code with no runtime to
 /// hang a signal future off, and `serve` builds its runtime only after the model is loaded (uploads
-/// = submits: a signal during LOAD must already be safe). `libc` is a direct dep now but adds
-/// nothing to the lockfile — it was already there under tokio and indicatif/console.
-///
-/// No `SA_RESTART`: an interrupted blocking `read(2)` at the chat prompt then returns `EINTR`,
-/// which is what lets [`read_line_interruptible`] notice a Ctrl-C at an idle REPL instead of
-/// sitting on the read until the user presses Enter. Everything else in the process that can see
-/// an interrupted syscall already retries it (Rust's `io` retries `ErrorKind::Interrupted`, libdrm's
-/// ioctl wrapper loops on `EINTR`).
-#[cfg(unix)]
+/// = submits: a signal during LOAD must already be safe).
 fn install_signal_handlers() {
-    // SAFETY: a zeroed `sigaction` with a valid handler pointer and an empty mask is exactly what
-    // POSIX asks for; the handler itself is async-signal-safe (see `on_signal`).
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = on_signal as *const () as usize;
-        libc::sigemptyset(&mut sa.sa_mask);
-        sa.sa_flags = 0;
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    if let Err(e) = infr_plat::signal::install_handlers(infr_core::shutdown::request_shutdown) {
+        // Not fatal: the CLI runs without a handler, it just cannot drain the GPU on Ctrl-C.
+        tracing::warn!(error = %e, "could not install signal handlers; Ctrl-C will not drain the GPU");
     }
 }
-
-#[cfg(not(unix))]
-fn install_signal_handlers() {}
 
 /// The conventional exit status for a signal-terminated process, `128 + signo` (130 for `SIGINT`,
 /// 143 for `SIGTERM`) — what a shell reports for a process killed by that signal, so scripts and
@@ -963,7 +929,7 @@ impl ThinkRender {
         use std::io::Write;
         if !self.tty {
             // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-            // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+            // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
             print!("{delta}");
             let _ = std::io::stdout().flush();
             return;
@@ -979,13 +945,13 @@ impl ThinkRender {
             self.split.finish(&mut |d| Self::render(d, in_think));
             if *in_think {
                 // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-                // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+                // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
                 print!("[0m");
                 self.in_think = false;
             }
         }
         // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-        // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+        // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
         println!();
         let _ = std::io::stdout().flush();
     }
@@ -996,12 +962,12 @@ impl ThinkRender {
             infr_engine::Delta::Reasoning(t) => {
                 if !*in_think {
                     // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-                    // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+                    // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
                     print!("[2;3m");
                     *in_think = true;
                 }
                 // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-                // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+                // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
                 print!("{t}");
             }
             infr_engine::Delta::Content(t) => {
@@ -1011,18 +977,18 @@ impl ThinkRender {
                     // E2B) end reasoning at a bare `<channel|>` — without this the answer renders
                     // GLUED to the last thinking line ("…clearly.The capital of France is Paris.").
                     // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-                    // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+                    // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
                     print!("[0m\n\n");
                     *in_think = false;
                     // The splitter strips markers, not whitespace: a think-model's own newline
                     // after `</think>` shouldn't stack a third blank line on top of ours.
                     // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-                    // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+                    // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
                     print!("{}", t.trim_start_matches('\n'));
                     return;
                 }
                 // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-                // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+                // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
                 print!("{t}");
             }
             infr_engine::Delta::ToolCall { .. } => {}
@@ -1236,10 +1202,10 @@ fn cmd_run(
     loop {
         match chat.repl_status() {
             // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-            // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+            // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
             Some(s) => print!("\n[{s}] > "),
             // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-            // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+            // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
             None => print!("\n> "),
         }
         std::io::stdout().flush().ok();
@@ -1482,10 +1448,10 @@ impl DiffusionVisual {
     fn begin(&mut self) {
         self.prev_rows = 0;
         // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-        // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+        // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
         print!("\x1b[?25l{}", "\n".repeat(DG_VISUAL_ROWS));
         // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-        // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+        // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
         print!("\x1b[{DG_VISUAL_ROWS}A");
         std::io::stdout().flush().ok();
         self.active = true;
@@ -1574,7 +1540,7 @@ impl DiffusionVisual {
         frame.push_str("\x1b[?7h\x1b[?2026l"); // auto-wrap back on, end synchronized update
         self.prev_rows = DG_VISUAL_ROWS - 1;
         // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-        // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+        // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
         print!("{frame}");
         std::io::stdout().flush().ok();
     }
@@ -1591,7 +1557,7 @@ impl DiffusionVisual {
         }
         frame.push_str("\r\x1b[J\x1b[?25h"); // erase from cursor to end of screen, show cursor
                                              // print-ok: program OUTPUT — the token-streaming path, which writes stdout raw and takes no
-                                             // lock (see `on_signal`'s doc); `tracing` allocates and locks.
+                                             // lock (see `infr_plat::signal::install_handlers`); `tracing` allocates and locks.
         print!("{frame}");
         std::io::stdout().flush().ok();
         self.prev_rows = 0;

@@ -29,6 +29,7 @@ use crate::http::{api_client, download_client, token, ConnBudget, Permit};
 use crate::parts::{self, Plan};
 use indicatif::{MultiProgress, ProgressBar};
 use infr_core::error::{Error, Result};
+use infr_core::shutdown::shutdown_requested;
 use infr_plat::fileio::write_all_at;
 use reqwest::header::{
     ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE,
@@ -214,10 +215,16 @@ pub(crate) fn run(
     }
     let plan = job.plan.lock().unwrap_or_else(|e| e.into_inner());
     if !plan.all_done() {
-        return Err(RangedError::Fatal(Error::Other(format!(
-            "{label}: ranged download ended with {} chunk(s) missing",
-            plan.remaining()
-        ))));
+        // Both are `Fatal`, so the partial and its sidecar are kept either way; they differ only
+        // in what the user is told. A Ctrl-C is not "chunks went missing".
+        return Err(RangedError::Fatal(if shutdown_requested() {
+            Error::Aborted
+        } else {
+            Error::Other(format!(
+                "{label}: ranged download ended with {} chunk(s) missing",
+                plan.remaining()
+            ))
+        }));
     }
     // The grid tiles the file exactly, so a complete plan means a complete file — assert it rather
     // than trust it, because the alternative is committing a blob with a hole in it.
@@ -334,7 +341,11 @@ fn spawn_worker<'s, 'e>(
 /// bounded by the same budget as everything else, so it can only ever fill the allowance, never
 /// exceed it.
 fn worker<'s>(scope: &'s std::thread::Scope<'s, '_>, job: &'s Job<'s>, budget: &'s ConnBudget) {
-    while !job.stop.load(Ordering::Relaxed) {
+    // `shutdown_requested()` here stops a worker CLAIMING another chunk, without touching
+    // `job.stop`. A worker already inside a chunk stops there instead (`fetch_chunk`), which does
+    // set `job.stop` — but it reports `Error::Aborted`, and the first error wins, so a Ctrl-C
+    // still reads as a Ctrl-C rather than as a download failure.
+    while !job.stop.load(Ordering::Relaxed) && !shutdown_requested() {
         // Only worth another connection if there is a cell for it to claim after this one.
         if job.cursor.load(Ordering::Relaxed) + 1 < job.chunks {
             if let Some(permit) = budget.try_acquire() {
@@ -428,6 +439,13 @@ fn fetch_chunk(job: &Job, i: usize) -> std::result::Result<(), RangedError> {
     let mut at = start;
     let mut left = len;
     while left > 0 {
+        // Between chunks is not often enough: a chunk is 64 MiB, so a worker that only checked
+        // there would keep pulling for tens of seconds after a Ctrl-C. Abandoning mid-chunk costs
+        // nothing — the bytes already written are at their absolute offsets and stay, the chunk
+        // just never gets marked done, so a resume re-fetches this one chunk and no more.
+        if shutdown_requested() {
+            return Err(RangedError::Fatal(Error::Aborted));
+        }
         let want = buf.len().min(left as usize);
         let n = resp.read(&mut buf[..want]).map_err(|e| {
             RangedError::Fatal(Error::Other(format!(

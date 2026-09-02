@@ -31,6 +31,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   one does not exist, with a warning naming both, so upgrading does not silently
   re-fetch gigabytes.
 
+- **Ctrl-C stops a download.** `infr pull` installed the `SIGINT`/`SIGTERM`
+  handlers but nothing on the download path read the latch, so the first Ctrl-C
+  appeared to do nothing and only `SIGKILL` ended a multi-gigabyte pull. Every
+  loop that moves bytes now polls it: `pull::fetch_all` stops claiming files,
+  `ranged::worker` stops claiming chunks, and both `download::stream_into` and
+  the ranged chunk reader stop mid-body per 64 KiB — the last one matters
+  because a chunk is 64 MiB, so checking only between chunks left the process
+  running for seconds after the signal. The partial and its resume sidecar are
+  kept in every case, so the next `infr pull` continues where it stopped; the
+  exit status is the conventional 130 / 143. An interrupted transfer reports
+  `Error::Aborted` rather than a download failure.
+
 - **Cached models are readable on Windows.** `link_blob` wrote its snapshot
   symlink with the forward-slash target `../../blobs/<hex>` that
   `huggingface_hub` and llama.cpp use. Windows accepts that in an ordinary path

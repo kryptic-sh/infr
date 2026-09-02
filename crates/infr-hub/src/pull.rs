@@ -14,6 +14,7 @@ use indicatif::MultiProgress;
 use infr_core::config::Config;
 use infr_core::error::{Error, Result};
 use infr_core::progress;
+use infr_core::shutdown::shutdown_requested;
 use infr_plat::link::link_blob;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
@@ -220,7 +221,9 @@ fn fetch_all(
                     // whichever download is still going — the tail of a shard set is one file with
                     // the whole budget, not one file on one connection.
                     let _permit = permit;
-                    while !stop.load(Ordering::Relaxed) {
+                    // `shutdown_requested()` stops claiming new FILES; it does not set `stop`,
+                    // which means "a worker failed" and would misreport a Ctrl-C as a failure.
+                    while !stop.load(Ordering::Relaxed) && !shutdown_requested() {
                         let Some(f) = files.get(next.fetch_add(1, Ordering::Relaxed)) else {
                             break;
                         };
@@ -252,6 +255,10 @@ fn fetch_all(
     // the others visible rather than dropping them silently.
     let mut failures = failures.into_iter();
     match failures.next() {
+        // Stopping early on the shutdown latch is not success: files are left unclaimed, and a
+        // caller that took `Ok(())` at face value would go on to load a model that is not there.
+        // The partials stay on disk for the next run to resume — only the OUTCOME is an error.
+        None if shutdown_requested() => Err(Error::Aborted),
         None => Ok(()),
         Some(first) => {
             for e in failures {

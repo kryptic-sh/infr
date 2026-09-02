@@ -1169,38 +1169,6 @@ tier is already covered on a split model — `FileBlockIo::open_shards` stamps
 every shard and refuses one whose length no longer matches what the weights were
 loaded against — so this gap is only about the non-streaming mmap path.
 
-### B57 — `infr pull` ignores the shutdown latch (2026-08-10)
-
-**Tag:** concurrent-pull slice · **Blocked on:** nothing; PRE-EXISTING, left out
-of the concurrency slice on scope grounds
-
-The CLI installs `SIGINT`/`SIGTERM` handlers that latch
-`infr_core::shutdown::request_shutdown`, and every GPU submit path polls
-`shutdown_requested()`. Nothing on the download path does: neither
-`download::stream_into`'s read loop nor `pull::fetch_all`'s claim loop. Verified
-by observation, not by reading alone — a `SIGTERM` sent to a running
-`infr pull unsloth/DeepSeek-V3.2-GGUF:Q2_K` left the process downloading, and it
-took `SIGKILL` to stop it.
-
-Nothing is corrupted by that: the partials are append-only, the next run resumes
-from `metadata(tmp).len()`, and a real 229 GB pull was in fact killed and
-resumed exactly this way. The defect is that the first Ctrl-C appears to do
-nothing.
-
-**The fix is three polls now**, all of which keep today's "partial kept for
-resume" contract: `fetch_all`'s `while !stop` becomes
-`while !stop && !shutdown_requested()` so a fan-out over 236 shards stops
-claiming files; `ranged::worker`'s claim loop gets the same, so a 161 GB
-single-file pull stops claiming CHUNKS (its sidecar already makes that a clean
-stopping point — every completed cell is recorded); and `stream_into` checks per
-64 KiB chunk and returns `Error::Aborted`. The last one is why this was not just
-done: `Aborted` would have to travel out through `StreamError`, and the caller
-must treat it as the KEEP-the-partial case rather than the discard case — a
-distinction the current two-variant enum makes by accident of which error it is,
-not deliberately. `RangedError` already makes exactly that distinction
-deliberately (`Fatal` keeps the partial, `Changed`/`NoRanges` discard it), so
-the ranged half is the cheap one.
-
 ### B58 — what the concurrent-pull slice did NOT verify (2026-08-10)
 
 **Tag:** concurrent-pull slice coverage · **Blocked on:** nothing; each line is

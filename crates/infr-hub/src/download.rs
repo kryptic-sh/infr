@@ -12,6 +12,7 @@ use crate::ranged::{self, RangedError};
 use indicatif::{MultiProgress, ProgressBar};
 use infr_core::error::{Error, Result};
 use infr_core::progress::{self, Unit};
+use infr_core::shutdown::shutdown_requested;
 use infr_plat::lock::FileLock;
 use reqwest::blocking::Response;
 use sha2::{Digest, Sha256};
@@ -384,6 +385,12 @@ fn fetch_stream(
                 "download failed (partial kept for resume): {e}"
             )));
         }
+        // Shutdown requested: keep the partial, exactly like `Io`, so a later `infr pull` resumes
+        // it instead of restarting.
+        Err(StreamError::Aborted) => {
+            pb.abandon_with_message(format!("⚠ {label} interrupted (shutdown, resumable)"));
+            return Err(Error::Aborted);
+        }
     }
     drop(file); // flush + close before re-reading for the digest
     Ok((tmp.to_path_buf(), pb))
@@ -444,13 +451,19 @@ fn over_cap(total: u64, cap: Option<u64>) -> bool {
     matches!(cap, Some(c) if total > c)
 }
 
-/// Why the streaming loop fails, because the two outcomes need OPPOSITE cleanup: an I/O error is
-/// transient and the partial is kept so the next call resumes it, while an over-cap body is a
-/// response we will never accept and its partial must be deleted. Collapsing both into
-/// `io::Error` would leave up-to-cap junk in the blob dir after every rejected download.
+/// Why the streaming loop stopped, split by what the caller must DO about the partial — the
+/// outcomes need different treatment of the bytes already on disk, and collapsing them is how a
+/// rejected or interrupted download gets the wrong cleanup.
 enum StreamError {
+    /// Transport or I/O. The caller KEEPS the partial, so the next call resumes it.
     Io(std::io::Error),
+    /// The body exceeded the cap. The caller DISCARDS the partial: it is a response we will never
+    /// accept, and keeping up-to-cap bytes would leave junk in the blob dir and a prefix already at
+    /// the limit for the next attempt to "resume" from.
     TooLarge { cap: u64 },
+    /// The shutdown latch (`infr_core::shutdown`) was set. The caller KEEPS the partial, exactly
+    /// like `Io`, so a later `infr pull` resumes from here instead of restarting.
+    Aborted,
 }
 
 impl From<std::io::Error> for StreamError {
@@ -479,6 +492,11 @@ fn stream_into(
     let mut total = written;
     let mut buf = [0u8; 1 << 16];
     loop {
+        // Polled once per 64 KiB iteration, the same cadence GPU submit paths use, so a Ctrl-C
+        // during a multi-GB body is bounded by one read rather than waiting for the whole stream.
+        if shutdown_requested() {
+            return Err(StreamError::Aborted);
+        }
         let n = resp.read(&mut buf)?;
         if n == 0 {
             break;

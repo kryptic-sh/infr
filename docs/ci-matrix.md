@@ -31,6 +31,14 @@ surface minutes later as a `build.rs` panic on whichever job reached
   and `--include-ignored`. `tests/pcache.rs`'s `--nocapture` output is the only
   place the cold-vs-warm pipeline-cache measurement exists, so it is
   load-bearing rather than debug noise.
+- **`windows-smoke`** pulls a model and runs one CPU generation on the Windows
+  runner. The matrix already compiles and unit-tests there, so this exists for
+  the part unit tests cannot reach: the cache location, a real ranged download,
+  the blob link, and a GGUF open, on an actual Windows filesystem. It is the
+  only place `link_blob`'s hard-link fallback runs — a GitHub runner's account
+  has no `SeCreateSymbolicLinkPrivilege`, so `symlink_file` is refused there.
+  Windows-only because the Linux and macOS legs already reach this path through
+  `cpu-goldens` and `test-macos`.
 - **`metal-check`** cross-lints for `aarch64-apple-darwin` from the Linux
   runner. It covers the nine crates that cross-build; `ring` (via rustls →
   reqwest → infr-hub) and `esaxx-rs` (via tokenizers → infr-chat/infr-llama) are

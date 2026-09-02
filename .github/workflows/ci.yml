@@ -29,7 +29,9 @@ env:
 # that are not reproducible across CPU microarchitectures (commit 273f8d4), so
 # fanning it out would multiply a known-flaky check; `build` is a release-profile
 # smoke test the matrix already covers in debug; `test-macos` runs the Metal
-# parity suite, which needs a real Metal device and `--include-ignored`.
+# parity suite, which needs a real Metal device and `--include-ignored`;
+# `windows-smoke` is a Windows-only gap-filler, since Linux and macOS already
+# download and run models in other jobs.
 
 jobs:
   fmt:
@@ -234,3 +236,57 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --locked
       - run: cargo test -p infr-metal --locked -- --include-ignored --nocapture
+
+  # Windows end to end: the matrix compiles and unit-tests on Windows, but until
+  # this job nothing there had ever downloaded a model or run a generation — and
+  # downloading is where Windows actually differs. It exercises, on a real
+  # Windows filesystem and in one command, the whole path the unit tests can only
+  # approximate: the Hugging Face cache location, the ranged/concurrent pull, the
+  # blob link (a plain account has no `SeCreateSymbolicLinkPrivilege`, so this is
+  # the only place `link_blob`'s HARD-LINK fallback runs), the GGUF open, and a
+  # CPU forward.
+  #
+  # `--dev cpu` because the runner has no GPU. Greedy and 8 tokens: this is a
+  # smoke test of the path, not of what the model says — the token-exact goldens
+  # live in `cpu-goldens`, which is pinned to one CPU for reproducibility.
+  windows-smoke:
+    name: infr run (Windows, end to end)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/install-glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
+      # Same model and quant as `cpu-goldens`, and the same cache-key rule: bump
+      # the suffix when the model below changes. The path is where infr itself
+      # resolves the hub on Windows — `~/.cache/huggingface`, NOT
+      # `%LOCALAPPDATA%`, because `huggingface_hub` has no native-directory arm
+      # and infr agrees with it (see `Store::discover`).
+      - name: Cache the smoke-test GGUF
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-windows-smoke-qwen3-06b-q4km-v1
+      - run: cargo build --release -p infr-cli --locked
+      # The pull is deliberately NOT a separate `infr pull` step: `infr run`
+      # auto-pulls, so this asserts the fetch and the load agree about where the
+      # file went, which is the half a two-step version would not check.
+      - name: Pull a model and generate on CPU
+        shell: pwsh
+        run: |
+          $out = & ./target/release/infr.exe run `
+            unsloth/Qwen3-0.6B-GGUF:Q4_K_M "Say hello." `
+            --dev cpu --max-new 8 --temp 0 --no-think
+          if ($LASTEXITCODE -ne 0) {
+            throw "infr run exited $LASTEXITCODE"
+          }
+          # Generation goes to STDOUT (logs go to stderr), so an empty capture
+          # here means the forward produced nothing however clean the exit was.
+          if ([string]::IsNullOrWhiteSpace($out -join "")) {
+            throw "infr run produced no output on stdout"
+          }
+          Write-Host "generated: $out"

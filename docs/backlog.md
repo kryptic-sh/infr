@@ -2607,13 +2607,18 @@ symlink arm is covered end to end by `infr-hub`'s pull tests — which is how th
 forward-slash reparse-point bug was found. Everything above that level is still
 unverified on Windows.
 
-The same gap now covers the two probes just added: `macos_vm_statistics64`,
-`macos_page_size` and `windows_job_memory_limit` are behind `cfg` arms that no
-Linux build compiles. Their arithmetic is in pure functions tested everywhere
-(`macos_available_bytes`, `apply_limit_clamp`, `job_object_limit_bytes`), and
-`the_re_declared_flag_bits_match_the_windows_crate` pins the two Win32 flag
-values against the real ones — but that the FFI calls themselves return sane
-figures on a real Mac or inside a real Windows container is still unobserved.
+The same gap covers the two probes just added. `macos_vm_statistics64`,
+`macos_page_size` and `windows_job_memory_limit` do TYPECHECK on this Linux box
+— `cargo clippy -p infr-plat --target aarch64-apple-darwin` and
+`--target x86_64-pc-windows-msvc` both compile their `cfg` arms, verified by
+planting a type error inside `windows_job_memory_limit` and watching it get
+caught — and their arithmetic is in pure functions tested everywhere
+(`macos_available_bytes`, `apply_limit_clamp`, `job_object_limit_bytes`), with
+`the_re_declared_flag_bits_match_the_windows_crate` pinning the two Win32 flag
+values against the real ones. What no local run can say is whether the kernel
+calls RETURN sane figures: no Mac has reported a page count through
+`host_statistics64` here, and no Windows container has reported a Job Object
+limit. That is behaviour, and only real hardware answers it.
 
 ### B70 — no MoE model above 256 experts has ever been run (2026-09-03)
 

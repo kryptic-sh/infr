@@ -237,16 +237,25 @@ fn job_object_limit_bytes(
 /// process, so there is nothing to release. `HOST_VM_INFO64_COUNT` is the field count
 /// `host_statistics64` expects for the `HOST_VM_INFO64` flavor — passing anything else is how this
 /// call fails or truncates.
+///
+/// `libc` deprecated `mach_host_self` (only that one — `host_statistics64` and `vm_page_size` are
+/// current) in favour of the `mach2` crate, which would be a new dependency for one Mach trap that
+/// is not going anywhere. The allow is scoped to the single call rather than the module so a
+/// future deprecation elsewhere still surfaces.
 #[cfg(target_os = "macos")]
 fn macos_vm_statistics64() -> Option<libc::vm_statistics64> {
     let mut count = libc::HOST_VM_INFO64_COUNT;
     let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::uninit();
+    // SAFETY: a Mach trap taking no arguments; the send right it returns is valid for the life of
+    // the process and needs no release.
+    #[allow(deprecated)]
+    let host = unsafe { libc::mach_host_self() };
     // SAFETY: `stats` is sized for exactly `HOST_VM_INFO64_COUNT` `natural_t`s, which is what
     // `host_statistics64` writes for the `HOST_VM_INFO64` flavor; `count` is passed by pointer as
     // the API requires but this call does not resize the output on success.
     let kr = unsafe {
         libc::host_statistics64(
-            libc::mach_host_self(),
+            host,
             libc::HOST_VM_INFO64,
             stats.as_mut_ptr().cast(),
             &mut count,

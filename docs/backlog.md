@@ -2659,20 +2659,6 @@ What is still open:
   covered end to end by `infr-hub`'s pull tests — which is how the forward-slash
   reparse-point bug was found. Everything above that level is still unverified
   on Windows.
-- **`infr-hub`'s `Store::discover` looks in the wrong place on macOS.** Its own
-  doc comment says the fallback is `~/.cache/huggingface/hub`, but the code is
-  `dirs::cache_dir()`, which is `home_dir()/Library/Caches` on macOS
-  (`dirs-5.0.1/src/mac.rs:9`, read directly) — so the comment and the code
-  disagree there, and only there. `huggingface_hub` and llama.cpp use
-  `~/.cache/huggingface` on every platform, so if that holds, a Mac user who ran
-  `hf download` has models infr cannot see and will re-download. The `dirs` call
-  is verified; the consequence assumes `huggingface_hub`'s default `HF_HOME`,
-  which was NOT checked on a Mac. `HF_HUB_CACHE` / `HF_HOME` override the whole
-  branch, so there is a workaround either way. The fix is the same resolution
-  `infr_plat::paths` already does — `$XDG_CACHE_HOME` else `~/.cache` — rather
-  than `dirs::cache_dir()`; it is a behaviour change for any Mac user who
-  already has a populated `~/Library/Caches/huggingface`, which is why it is
-  here and not folded into the seam work.
 
 ### B67 — `moe_topk.comp` corrupts routing above 256 experts (2026-08-30)
 

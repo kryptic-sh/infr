@@ -1226,7 +1226,6 @@ dependencies = [
 name = "infr-hub"
 version = "0.0.0"
 dependencies = [
- "dirs",
  "indicatif",
  "infr-core",
  "infr-plat",

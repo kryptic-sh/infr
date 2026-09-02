@@ -18,6 +18,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the file to `~/Library/Application Support` for existing macOS users. An
   absolute `$XDG_CONFIG_HOME` still wins; a relative or empty one is now ignored
   rather than honoured, per the spec.
+- **The Hugging Face cache is in the right place on macOS and Windows.**
+  `Store::discover` fell back to `dirs::cache_dir()`, which is
+  `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows —
+  `huggingface_hub` uses `$XDG_CACHE_HOME`, else `~/.cache`, on every platform
+  with no native-directory arm, so infr agreed with it only on Linux and would
+  re-download models `hf download` had already fetched. The resolution now
+  matches `huggingface_hub`'s exactly, including the `HUGGINGFACE_HUB_CACHE`
+  legacy variable, which was not read at all, and treating an empty `HF_HOME=`
+  as unset rather than resolving the cache to the relative path `hub`. A cache
+  an older infr left in the OS-native directory is still used while the standard
+  one does not exist, with a warning naming both, so upgrading does not silently
+  re-fetch gigabytes.
+
 - **Cached models are readable on Windows.** `link_blob` wrote its snapshot
   symlink with the forward-slash target `../../blobs/<hex>` that
   `huggingface_hub` and llama.cpp use. Windows accepts that in an ordinary path

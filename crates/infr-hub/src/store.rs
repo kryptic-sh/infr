@@ -35,20 +35,84 @@ pub struct Store {
     pub hub: PathBuf,
 }
 
+/// `huggingface_hub`'s own precedence, as a pure function of the four inputs.
+///
+/// Takes the environment's values rather than reading them, so the chain is testable without
+/// `set_var` racing every other thread in the test binary — and so the same code proves the answer
+/// is identical on all three platforms, which is the entire point of the layout.
+///
+/// An empty variable is treated as unset: `HF_HOME=` from a cleared shell export would otherwise
+/// resolve the cache to the relative path `hub`.
+fn hub_dir(
+    hf_hub_cache: Option<std::ffi::OsString>,
+    huggingface_hub_cache: Option<std::ffi::OsString>,
+    hf_home: Option<std::ffi::OsString>,
+    cache_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let set = |v: Option<std::ffi::OsString>| v.filter(|s| !s.is_empty()).map(PathBuf::from);
+    if let Some(p) = set(hf_hub_cache).or_else(|| set(huggingface_hub_cache)) {
+        return Some(p);
+    }
+    if let Some(home) = set(hf_home) {
+        return Some(home.join("hub"));
+    }
+    Some(cache_home?.join("huggingface").join("hub"))
+}
+
 impl Store {
-    /// Locate the HF Hub cache: `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`.
+    /// Locate the Hugging Face hub cache, agreeing with `huggingface_hub` on every platform:
+    /// `$HF_HUB_CACHE`, else `$HUGGINGFACE_HUB_CACHE`, else `$HF_HOME/hub`, else
+    /// `$XDG_CACHE_HOME/huggingface/hub`, else `~/.cache/huggingface/hub`.
+    ///
+    /// **Agreeing matters more than being conventional.** The layout is not infr's to choose: the
+    /// `models--org--repo/snapshots/<commit>/<file>` tree is `huggingface_hub`'s, llama.cpp reads
+    /// the same one, and a user who ran `hf download` must not have to fetch the same 30 GB again.
+    /// So this deliberately does NOT use each platform's native cache directory —
+    /// `huggingface_hub` reads `$XDG_CACHE_HOME` and falls back to `~/.cache` on Windows and macOS
+    /// too, with no `%LOCALAPPDATA%` or `~/Library/Caches` arm (verified against
+    /// `huggingface_hub/constants.py`).
+    ///
+    /// A cache an older infr left in the OS-native location is still honoured when the standard
+    /// one does not exist yet — see [`Self::legacy_hub_dir`].
     pub fn discover() -> Result<Self> {
-        let hub = if let Ok(p) = std::env::var("HF_HUB_CACHE") {
-            PathBuf::from(p)
-        } else if let Ok(h) = std::env::var("HF_HOME") {
-            PathBuf::from(h).join("hub")
-        } else {
-            dirs::cache_dir()
-                .ok_or_else(|| Error::Other("cannot determine cache directory".into()))?
-                .join("huggingface")
-                .join("hub")
+        let hub = hub_dir(
+            std::env::var_os("HF_HUB_CACHE"),
+            std::env::var_os("HUGGINGFACE_HUB_CACHE"),
+            std::env::var_os("HF_HOME"),
+            infr_plat::paths::cache_home(),
+        )
+        .ok_or_else(|| Error::Other("cannot determine cache directory".into()))?;
+        Ok(Store {
+            hub: Self::legacy_hub_dir(hub),
+        })
+    }
+
+    /// Redirect to a cache an OLDER infr wrote to the OS-native directory, but only while the
+    /// standard location does not exist.
+    ///
+    /// Before this agreed with `huggingface_hub`, the fallback was `dirs::cache_dir()` — the same
+    /// path on Linux, but `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows. Switching
+    /// without looking would leave those models on disk, unseen, and re-download them. The
+    /// redirect is one-way and conditional, so a fresh install and anyone already on the standard
+    /// path are unaffected, and it disappears by itself once the standard directory exists.
+    fn legacy_hub_dir(standard: PathBuf) -> PathBuf {
+        if standard.exists() {
+            return standard;
+        }
+        let Some(legacy) = infr_plat::paths::os_cache_home()
+            .map(|b| b.join("huggingface").join("hub"))
+            .filter(|p| *p != standard && p.is_dir())
+        else {
+            return standard;
         };
-        Ok(Store { hub })
+        tracing::warn!(
+            "using the Hugging Face cache at {} left by an older infr; the standard location is \
+             {}. Move it there (or set HF_HOME) — this fallback stops applying as soon as the \
+             standard directory exists.",
+            legacy.display(),
+            standard.display(),
+        );
+        legacy
     }
 
     /// `<hub>/models--<org>--<repo>` — the HF Hub repo dir (HF replaces `/` with `--`).
@@ -432,6 +496,114 @@ mod tests {
             pick_gguf(&["only-F16.gguf".to_string()], None).as_deref(),
             Some("only-F16.gguf")
         );
+    }
+
+    /// `huggingface_hub`'s precedence, in order, and the fallback shape.
+    ///
+    /// The literal `.cache/huggingface/hub` is the point of the test, not an implementation
+    /// detail: it is `huggingface_hub`'s layout (`constants.py` — `$XDG_CACHE_HOME`, else
+    /// `~/.cache`, then `huggingface`, then `hub`) and infr has to match it or it re-downloads
+    /// models `hf download` already fetched.
+    #[test]
+    fn hub_dir_follows_huggingface_hubs_precedence() {
+        let cache_home = || Some(PathBuf::from("/xdg-cache"));
+        let expected_default = PathBuf::from("/xdg-cache/huggingface/hub");
+
+        // Nothing set: the XDG cache base, then HF's two path segments.
+        assert_eq!(
+            hub_dir(None, None, None, cache_home()),
+            Some(expected_default.clone())
+        );
+        // HF_HOME appends `hub`, and beats the base.
+        assert_eq!(
+            hub_dir(None, None, Some("/hfhome".into()), cache_home()),
+            Some(PathBuf::from("/hfhome/hub"))
+        );
+        // HF_HUB_CACHE is the full hub dir, no `hub` appended, and beats HF_HOME.
+        assert_eq!(
+            hub_dir(
+                Some("/explicit".into()),
+                None,
+                Some("/hfhome".into()),
+                cache_home()
+            ),
+            Some(PathBuf::from("/explicit"))
+        );
+        // The legacy variable is honoured, but loses to the current one.
+        assert_eq!(
+            hub_dir(None, Some("/legacy".into()), None, cache_home()),
+            Some(PathBuf::from("/legacy"))
+        );
+        assert_eq!(
+            hub_dir(
+                Some("/new".into()),
+                Some("/legacy".into()),
+                None,
+                cache_home()
+            ),
+            Some(PathBuf::from("/new"))
+        );
+        // An empty variable is unset, not a relative path — `HF_HOME=` must not yield `hub`.
+        assert_eq!(
+            hub_dir(
+                Some("".into()),
+                Some("".into()),
+                Some("".into()),
+                cache_home()
+            ),
+            Some(expected_default)
+        );
+        // No home directory at all is "cannot tell", not a relative path.
+        assert_eq!(hub_dir(None, None, None, None), None);
+    }
+
+    /// The layout is `huggingface_hub`'s, so it must NOT vary by platform — no `%LOCALAPPDATA%`,
+    /// no `~/Library/Caches`. This is what the whole fix is about, so assert it directly: the
+    /// resolver is a pure function of the XDG base, and the base is the same shape everywhere.
+    #[test]
+    fn the_hub_layout_is_identical_on_every_platform() {
+        let base = PathBuf::from("/base");
+        let got = hub_dir(None, None, None, Some(base.clone())).expect("a base always resolves");
+        assert_eq!(got, base.join("huggingface").join("hub"));
+
+        // ...and the live resolution uses that same base, rather than the OS-native cache dir,
+        // which differs per platform and is only consulted for an older infr's leftovers.
+        let live = hub_dir(None, None, None, infr_plat::paths::cache_home())
+            .expect("this platform resolves a cache home");
+        assert!(
+            live.ends_with("huggingface/hub"),
+            "expected <base>/huggingface/hub, got {live:?}"
+        );
+        if let Some(os) = infr_plat::paths::os_cache_home() {
+            assert_eq!(
+                cfg!(target_os = "linux"),
+                os == infr_plat::paths::cache_home().unwrap(),
+                "the OS cache dir coincides with the XDG one on Linux and nowhere else"
+            );
+        }
+
+        // And that `discover` passes the XDG base rather than the OS one. On Linux the two are
+        // equal, so this assertion is only load-bearing on the macOS and Windows CI legs — which
+        // is exactly where getting it wrong costs a re-download. Skipped when the environment
+        // names a cache, since then neither base is consulted.
+        let env_names_a_cache = ["HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_HOME"]
+            .iter()
+            .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+        if !env_names_a_cache {
+            let expected = infr_plat::paths::cache_home()
+                .expect("a cache home")
+                .join("huggingface")
+                .join("hub");
+            let store = Store::discover().expect("discover");
+            // `discover` may redirect to an older infr's cache; accept either, reject a third.
+            let legacy = infr_plat::paths::os_cache_home().map(|b| b.join("huggingface/hub"));
+            assert!(
+                store.hub == expected || Some(store.hub.clone()) == legacy,
+                "discover resolved {:?}, expected the XDG path {expected:?} (or the legacy \
+                 {legacy:?})",
+                store.hub,
+            );
+        }
     }
 
     #[test]

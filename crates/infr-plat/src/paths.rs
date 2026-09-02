@@ -30,7 +30,30 @@ pub fn config_dir() -> Option<PathBuf> {
 /// See [`config_dir`] for why this is spelled out rather than delegated to `dirs::cache_dir()`.
 /// Does NOT create the directory — callers that want one no matter what apply their own fallback.
 pub fn cache_dir() -> Option<PathBuf> {
-    xdg_base(std::env::var_os("XDG_CACHE_HOME"), ".cache").map(|b| b.join("infr"))
+    cache_home().map(|b| b.join("infr"))
+}
+
+/// The XDG cache BASE — `$XDG_CACHE_HOME` when absolute, else `~/.cache` — without any
+/// application name appended.
+///
+/// Separate from [`cache_dir`] because not everything under it belongs to infr: the Hugging Face
+/// hub cache is `<base>/huggingface/hub`, a layout owned by `huggingface_hub` and shared with
+/// llama.cpp, and infr must agree with it byte for byte or it re-downloads models another tool
+/// already has. Like the rest of this module it is the SAME shape on every platform, which is what
+/// `huggingface_hub` itself does: it reads `$XDG_CACHE_HOME` and falls back to `~/.cache`
+/// unconditionally, with no `%LOCALAPPDATA%` or `~/Library/Caches` arm.
+pub fn cache_home() -> Option<PathBuf> {
+    xdg_base(std::env::var_os("XDG_CACHE_HOME"), ".cache")
+}
+
+/// The operating system's OWN cache directory, which is a different place from [`cache_home`] on
+/// everything but Linux: `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows.
+///
+/// Exposed for ONE purpose — finding data an earlier version of infr wrote there before it agreed
+/// with `huggingface_hub`'s layout — so that upgrading does not silently re-download multi-gigabyte
+/// models. New data should not be written here; use [`cache_home`] or [`cache_dir`].
+pub fn os_cache_home() -> Option<PathBuf> {
+    dirs::cache_dir()
 }
 
 /// The XDG base directory, given the raw environment value and the `~`-relative fallback.

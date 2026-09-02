@@ -1251,7 +1251,9 @@ fn cmd_run(
 fn read_line_interruptible(line: &mut String) -> anyhow::Result<usize> {
     #[cfg(not(unix))]
     {
-        return Ok(std::io::stdin().read_line(line)?);
+        // Tail expression, not a `return`: the `cfg(unix)` block below is absent in this build, so
+        // this is already the last thing in the function.
+        Ok(std::io::stdin().read_line(line)?)
     }
     #[cfg(unix)]
     {

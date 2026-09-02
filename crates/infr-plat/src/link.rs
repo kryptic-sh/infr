@@ -27,7 +27,13 @@ pub fn link_blob(target: impl AsRef<Path>, link: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let target = target.as_ref();
+        // The caller's target is `../../blobs/<hex>` with FORWARD slashes, which is what
+        // `huggingface_hub` and llama.cpp write and what keeps the store portable. Windows accepts
+        // those in an ordinary path, but NOT inside a symlink's reparse point: the link is created
+        // successfully and then every open of it fails with ERROR_INVALID_NAME (123). Re-joining
+        // through `components()` yields the same path with the platform's own separator.
+        let target = target.as_ref().components().collect::<std::path::PathBuf>();
+        let target = target.as_path();
         match std::os::windows::fs::symlink_file(target, link) {
             Ok(()) => Ok(()),
             Err(symlink_err) => {

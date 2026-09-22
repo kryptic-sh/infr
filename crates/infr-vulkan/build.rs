@@ -1,4 +1,6 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Compile GLSL compute shaders (which need features WGSL/naga can't express, e.g.
 /// cooperative matrix) to SPIR-V via `glslc` at build time. Output to OUT_DIR.
@@ -3499,28 +3501,7 @@ fn main() {
             }
         })
         .collect();
-    for (src_stem, dst_stem, defines) in &builds {
-        let src = format!("shaders/{src_stem}.comp");
-        let dst = format!("{out}/{dst_stem}.spv");
-        println!("cargo:rerun-if-changed={src}");
-        let mut args: Vec<String> = vec![
-            "-fshader-stage=comp".into(),
-            "--target-env=vulkan1.3".into(),
-            "-O".into(),
-            format!("-I{out}"),
-        ];
-        for d in defines {
-            args.push(d.clone());
-        }
-        args.push(src.clone());
-        args.push("-o".into());
-        args.push(dst);
-        let status = Command::new("glslc")
-            .args(&args)
-            .status()
-            .expect("failed to run glslc — install shaderc (provides glslc)");
-        assert!(status.success(), "glslc failed for {src}");
-    }
+    compile_shaders(&glslc_path(), &out, &builds);
     // Shader-set fingerprint for the on-disk vkPipelineCache (see src/pcache.rs): FNV-1a over
     // every compiled SPIR-V blob in the (stable) build-list order. Any shader edit, new variant,
     // or glslc/define change flips it, and the persisted cache file is discarded wholesale —
@@ -3656,4 +3637,72 @@ fn gen_grids(out: &str) {
     }
     s += "    barrier();\n}\n";
     std::fs::write(format!("{out}/native_grids.glsl"), s).expect("write native_grids.glsl");
+}
+
+/// Compile every `(source stem, output stem, defines)` build to `{out}/{output stem}.spv`, spread
+/// over the build script's job allowance (`NUM_JOBS`, which cargo sets from `-j`).
+///
+/// One `glslc` process per variant, one after another, made every shader edit a multi-minute
+/// rebuild — worst on Windows, where starting a process costs several times what it does on Linux.
+/// The builds are independent (each writes only its own `.spv`), and everything downstream reads
+/// the outputs back in list order, so completion order is irrelevant. A failed compile panics its
+/// worker, and `thread::scope` re-raises that panic here once the other workers finish.
+fn compile_shaders(glslc: &Path, out: &str, builds: &[(String, String, Vec<String>)]) {
+    for (src_stem, _, _) in builds {
+        println!("cargo:rerun-if-changed=shaders/{src_stem}.comp");
+    }
+    let jobs = std::env::var("NUM_JOBS")
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(builds.len()) {
+            scope.spawn(|| {
+                while let Some((src_stem, dst_stem, defines)) =
+                    builds.get(next.fetch_add(1, Ordering::Relaxed))
+                {
+                    let src = format!("shaders/{src_stem}.comp");
+                    let status = Command::new(glslc)
+                        .args(["-fshader-stage=comp", "--target-env=vulkan1.3", "-O"])
+                        .arg(format!("-I{out}"))
+                        .args(defines)
+                        .arg(&src)
+                        .arg("-o")
+                        .arg(format!("{out}/{dst_stem}.spv"))
+                        .status()
+                        .expect("failed to run glslc — install shaderc (provides glslc)");
+                    assert!(status.success(), "glslc failed for {src}");
+                }
+            });
+        }
+    });
+}
+
+/// The `glslc` to run: the one on `PATH`, else the Vulkan SDK's (`$VULKAN_SDK/Bin`).
+///
+/// The SDK installer sets `VULKAN_SDK` and adds its `Bin` to the system `PATH`, but a shell
+/// opened before the install still has the old `PATH` — the usual first-build failure on a fresh
+/// Windows setup. Falling back to `VULKAN_SDK` covers that without changing which `glslc` wins
+/// when one is already on `PATH`. (`Bin` is the Windows SDK's spelling, `bin` the Linux and macOS
+/// SDKs'; Windows paths are case-insensitive, so trying both is right everywhere.)
+fn glslc_path() -> PathBuf {
+    println!("cargo:rerun-if-env-changed=VULKAN_SDK");
+    let exe = format!("glslc{}", std::env::consts::EXE_SUFFIX);
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|dir| dir.join(&exe).is_file()));
+    if !on_path {
+        if let Some(sdk) = std::env::var_os("VULKAN_SDK") {
+            let sdk = PathBuf::from(sdk);
+            if let Some(found) = ["Bin", "bin"]
+                .iter()
+                .map(|bin| sdk.join(bin).join(&exe))
+                .find(|cand| cand.is_file())
+            {
+                return found;
+            }
+        }
+    }
+    PathBuf::from("glslc")
 }

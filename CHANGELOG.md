@@ -107,6 +107,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Shaders compile in parallel, and the build finds the Vulkan SDK's `glslc`.**
+  `infr-vulkan`'s build script ran one `glslc` per shader variant sequentially;
+  it now spreads them across cargo's job allowance (`NUM_JOBS`) — a release
+  rebuild of `infr-vulkan` after a shader edit took 148 s with `-j 1` and 14 s
+  at the default 32 jobs on a Ryzen 9 9950X3D. When `glslc` is not on `PATH` it
+  falls back to `$VULKAN_SDK/Bin`, so a shell opened before the Vulkan SDK was
+  installed still builds.
 - **`infr serve --parallel` (`-n`, `--np`) defaults to 1 slot, was 4.** Each
   slot owns a full KV cache and, with `--ctx` unset, the per-slot window is the
   VRAM-fit context divided by N — so the old default handed every user a quarter

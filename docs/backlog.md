@@ -1361,10 +1361,10 @@ sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
 GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
 row. Reaching it needs a hand-built synthetic tensor, which is precisely the
 hazard B39 was about, so this is a real gap and not a non-issue. The reason to
-stop was scope: each
-`matmul*\*` entry carries its own tiling constraints (`gemm.rs`'s `matmul_f16`already asserts`m,n
-%64 && k %32`) and several take `k` with different meanings, so a uniform guard
-needs its own read of the family rather than a mechanical sweep.
+stop was scope: each `matmul*\*` entry carries its own tiling constraints
+(`gemm.rs`'s `matmul_f16`already asserts`m,n %64 && k %32`) and several take `k`
+with different meanings, so a uniform guard needs its own read of the family
+rather than a mechanical sweep.
 
 **Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
 prefill GEMM, the one path that DOES take BF16) steps
@@ -2624,39 +2624,99 @@ Also unverified on Windows: which arm of `link_blob` actually ran. The blob
 landed and the model loaded through the snapshot entry, so one of the two
 succeeded, but neither the symlink nor the hard-link fallback is logged.
 
-### B72 — three test fixtures resolve the HF cache by hand, and skip silently (2026-09-03)
+### B73 — the Windows Job Object clamp reports the limit, not the headroom (2026-09-23)
 
-**Tag:** infr-plat residual · **Blocked on:** nothing; found while retiring
-B71's labels, out of scope for a comments-only change
+**Tag:** Windows review · **Blocked on:** a way to observe it (no Job Object on
+the dev box) and a struct the `windows` crate does not bind
 
-Three `#[cfg(test)]` model locators in `infr-llama` build the hub path
-themselves instead of asking the seam:
+`infr_plat::mem::windows_job_memory_limit` returns the Job Object's raw
+`JobMemoryLimit` / `ProcessMemoryLimit`. The Linux arm (`cgroup_headroom`)
+returns `max - current`, and the two share `apply_limit_clamp`, so on Windows a
+16 GB job limit with 12 GB already committed reports 16 GB available and a host
+arena sized from it overcommits. VERIFIED by reading; never observed, since
+nothing here runs inside a Job Object.
 
-- `util.rs`'s `test_qwen3_06b` (3 callers) and `qwen35.rs`'s `model_path` — both
-  `std::env::var("HOME").ok()? + "/.cache/huggingface/hub"`, string
-  concatenation with a forward slash.
-- `grammar.rs`'s test-module `dirs_home` (feeding `qwen3_06b`, 3 callers) —
-  `std::env::var_os("HOME")`.
+The fix: subtract current use — the job's from
+`QueryInformationJobObject(JobObjectMemoryUsageInformation)` (`JobMemory`), the
+process's from `GetProcessMemoryInfo`
+(`PROCESS_MEMORY_COUNTERS_EX::PrivateUsage`, feature
+`Win32_System_ProcessStatus`). `windows` 0.58 binds neither
+`JOBOBJECT_MEMORY_USAGE_INFORMATION` nor that info class (28), so both need
+declaring locally from the Win32 ABI. Verifying it means a test that assigns a
+child process to a job with a memory limit and reads `available()` from inside.
 
-This is a fourth copy of a resolution the tree already owns twice over
-(`infr_plat::paths::cache_home` and `Store::discover`, which agree with
-`huggingface_hub`'s full chain). It diverges in two ways that matter:
+Also a suspicion, not verified: Windows refuses allocations on commit charge,
+not physical RAM, so `min(ullAvailPhys, ullAvailPageFile)` may be the more
+honest host figure than `ullAvailPhys` alone.
 
-- **It reads only `HOME`.** `HF_HOME`, `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`
-  and `XDG_CACHE_HOME` are all ignored, so anyone whose cache is not at
-  `~/.cache/huggingface` finds nothing.
-- **Windows sets `USERPROFILE`, not `HOME`.** These locators therefore find
-  nothing on the Windows leg, and each caller SELF-SKIPS on `None` — six tests
-  reporting as passed because they never ran. VERIFIED: the code reads only
-  `HOME` and self-skips on `None`. NOT verified: that `HOME` is in fact unset on
-  the `windows-2025` runner — inferred from the platform convention, not read
-  off a CI log.
+### B74 — LNK4098 on every Windows link: `esaxx-rs` forces the static CRT (2026-09-23)
 
-The fix is to call the seam (`infr_plat::paths::cache_home`, or better
-`infr_hub::Store`, which is the thing under test's real answer). Worth doing
-with the skip made LOUD at the same time: a fixture-absent skip should say so,
-per the "a guard whose scope silently matches nothing" rule — otherwise fixing
-the path just changes which tests quietly do nothing.
+**Tag:** Windows review · **Blocked on:** upstream (`tokenizers` /
+`toktrie_hf_tokenizers`)
+
+Every Windows link of `infr-cli` prints
+`LINK : warning LNK4098: defaultlib 'LIBCMT' conflicts with use of other libs`.
+The cause is `esaxx-rs`, whose `build.rs` compiles its C++ with
+`.static_crt(true)` while everything else links the dynamic CRT. It arrives
+through `tokenizers`' default `esaxx_fast` feature, which only the Unigram
+_trainer_ uses — infr never trains a tokenizer. Turning it off in the workspace
+manifest does not help: `toktrie_hf_tokenizers` depends on `tokenizers` 0.21
+with default features, and feature unification turns `esaxx-rs/cpp` back on.
+Harmless so far (no heap object crosses the CRT boundary on the inference path),
+but it is a warning a `-D warnings` link policy would fail on. Options: ask
+upstream for `default-features = false`, or patch the crate.
+
+### B75 — Windows-specific leftovers from the 2026-09-23 review (2026-09-23)
+
+**Tag:** Windows review · **Blocked on:** nothing; each is small and none is on
+a hot path
+
+- **`infr compare`'s diffusion fork lookup ignores MSVC build layouts.**
+  `fork_diffusion_cli_path` looks in `build*/bin/`, but a multi-config MSVC
+  CMake build puts the binary in `build*/bin/Release/`. `.exe` is now appended
+  (`diffusion_cli_file`); the `Release` subdirectory is not tried.
+  `INFR_LLAMA_DIFFUSION_CLI` is the workaround.
+- **Declined: keeping an existing blob instead of renaming over it.** The review
+  suspected `download::commit`'s `fs::rename` over an already-cached blob would
+  fail on Windows while another infr has that blob memory-mapped. Tested on
+  Windows 11 with the blob mapped through `memmap2` for the whole download: the
+  rename succeeds (std renames with POSIX semantics, and std opens files with
+  `FILE_SHARE_DELETE`). Not a bug here; revisit only if an older Windows build
+  or a non-std file open ever maps a blob.
+- **Out-of-order ranged writes on NTFS.** `ranged::worker` writes chunks with
+  `seek_write` in any order. NTFS zero-fills everything below a write past the
+  valid-data length, synchronously, so a late chunk landing first in a large
+  file can stall a worker. Not measured. Marking the file sparse
+  (`FSCTL_SET_SPARSE`) or pre-sizing it would avoid it.
+- **No read-ahead hint at model load.** `infr-gguf`'s `WillNeed` advice is
+  `cfg(unix)`; the Windows equivalent is `PrefetchVirtualMemory`. Not measured
+  whether load time on Windows suffers for it.
+- **`gpu_seam_kv_mainline_quants_coherent` fails on the 7900 XTX under
+  Windows.** Its `K=f16 V=turbo2` case continues the raw (untemplated) prompt as
+  `" -  -  -  - …"` on the AMD proprietary driver; the same test passes on the
+  Ryzen iGPU on the same driver, and `infr run` with `INFR_KV_TYPE_V=turbo2`
+  answers coherently on both. So it reads as 2-bit V losing its precision margin
+  on a 0.6B model under that driver's arithmetic rather than a Windows defect —
+  unverified; the coopmat path the dGPU takes (the iGPU refuses coopmat) is the
+  first thing to rule in or out. Not run on Linux RADV in this session.
+- **The `infr-vulkan` micro-benchmarks lose the device on a 2-CU iGPU.**
+  `attn_dsplit_probe`, `attn_ktile_probe`, `gemm_bench`'s MoE tile benches and
+  `small_m_bench` (all `#[ignore]`d) hit `VK_ERROR_DEVICE_LOST` on the Ryzen
+  iGPU under Windows: a submit outlasts TDR's ~2 s. After a loss the driver
+  drops the iGPU from enumeration for a while, so the tests after it fail with
+  "no such Vulkan device" — a cascade, not separate bugs.
+  `moe_id_gemv_real_dims` asserts dGPU-scale timings (a 5 ms single dispatch)
+  the iGPU cannot meet. These are sized for a discrete card; the production path
+  splits submits on an iGPU and was not affected. Run the correctness tests on
+  an iGPU without them, as [windows.md](windows.md) does.
+- **Why Windows CPU goldens diverge is unconfirmed.** `cpu_golden_qwen3` and
+  `cpu_golden_gemma3`'s 48-token cases produce different, coherent text on
+  Windows than on Linux on the same Ryzen, with and without `target-cpu=native`,
+  identically run after run; the short cases match bit-for-bit. They carry a
+  Windows hash via `per_os`. The C runtime's `f32` transcendentals (UCRT vs
+  glibc) are the suspect — confirming it means diffing per-op outputs between
+  the two builds. Nothing in CI runs these on Windows (no model cache in the
+  `test` job), so the Windows hashes are checked on dev boxes only.
 
 ### B70 — no MoE model above 256 experts has ever been run (2026-09-03)
 

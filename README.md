@@ -239,6 +239,17 @@ loader   WeightSource     (Gguf; safetensors later)
 compute  Backend          (Vulkan via ash + SPIR-V; native Metal via MSL; CPU reference)
 ```
 
+## Building
+
+```bash
+cargo build --release -p infr-cli   # → target/release/infr
+```
+
+Needs a stable Rust toolchain and `glslc` (shaderc; ships with the Vulkan SDK),
+which compiles the compute shaders at build time. At runtime only a GPU driver
+with Vulkan is required. Windows setup, step by step:
+[`docs/windows.md`](docs/windows.md).
+
 ## Documentation
 
 Deeper design docs, backend architecture, and performance material live in

@@ -6,6 +6,10 @@ the `infr` inference engine. The top-level project overview lives in the root
 
 ## Using infr
 
+- [windows.md](windows.md) — developing on Windows: prerequisites (MSVC Build
+  Tools, Rust, the Vulkan SDK for `glslc`), building, picking a GPU including an
+  iGPU, running the tests, and where Windows behaves differently.
+
 - [config.md](config.md) — the configuration reference: the four layers
   (defaults < config file < `INFR_*` env < CLI flags) and their precedence, the
   TOML file format and lookup order, `--set`, and a per-section walkthrough of

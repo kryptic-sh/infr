@@ -405,14 +405,20 @@ mod tests {
         d
     }
 
-    /// A pid that is guaranteed DEAD (spawned and reaped). Reusing a just-reaped pid is
-    /// theoretically possible but the kernel hands out pids sequentially, so it will not happen
-    /// within one test.
-    #[cfg(unix)]
+    /// A pid that is guaranteed DEAD (spawned and reaped). Reuse of a just-reaped pid is possible
+    /// — Linux hands pids out sequentially so it effectively never happens within a test, Windows
+    /// recycles them sooner — which is why the probe is asserted here, where a reuse would surface
+    /// as this message rather than as a confusing tripwire failure further on.
+    #[cfg(any(unix, windows))]
     fn spawn_and_reap() -> u32 {
-        let mut c = std::process::Command::new("true")
-            .spawn()
-            .expect("spawn /bin/true");
+        let mut cmd = if cfg!(windows) {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", "exit 0"]);
+            cmd
+        } else {
+            std::process::Command::new("true")
+        };
+        let mut c = cmd.spawn().expect("spawn a child that exits at once");
         let pid = c.id();
         c.wait().expect("reap");
         assert!(!pid_alive(pid as i32), "the reaped child must be gone");
@@ -499,7 +505,7 @@ mod tests {
 
     /// THE TRIPWIRE. A blob that hangs the GPU is perfectly well-formed, so no envelope check can
     /// see it — the only evidence is that the run which SEEDED from it never came back.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn tripwire_discards_a_blob_whose_seeded_run_died() {
         let dir = tmp_dir("tripwire");
@@ -553,7 +559,7 @@ mod tests {
     /// Sibling caches in ONE process (distinct nonces on the same path) own SEPARATE markers — so
     /// one instance's clean `disarm()` never deletes a live sibling's, and a still-armed sibling
     /// that later dies uncleanly is still caught.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn sibling_markers_are_independent() {
         let dir = tmp_dir("siblings");

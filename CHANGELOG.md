@@ -17,6 +17,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   on unix. A Ctrl-C at an idle `infr run` prompt also takes effect immediately,
   where it used to wait for Enter: console input is now read with
   `ReadConsoleW`, which reports the aborted read that `Stdin` silently retries.
+- **The GPU kernel-cache tripwire works on Windows.** A cached pipeline binary
+  whose seeding run died (the signature of a GPU hang) is discarded on the next
+  start — but `infr_plat::proc::pid_alive` answered "alive" for every pid on
+  Windows, so the dead run was never noticed, the suspect blob was fed back to
+  the driver on every launch, and `.seeded.*` markers piled up in the cache
+  directory. It now probes with `OpenProcess` / `GetExitCodeProcess`.
 - **`infr` can find a global config file on Windows.** `config::file::discover`
   resolved `$XDG_CONFIG_HOME`, else `$HOME/.config`, else nothing — and Windows
   sets neither variable, so the third lookup step silently never found anything

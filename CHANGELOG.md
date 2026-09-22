@@ -107,6 +107,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Windows builds target the host CPU, like Linux builds.**
+  `.cargo/config.toml` set `target-cpu=native` for Linux only, so on Windows the
+  CPU backend's dequant and matvec loops never vectorized to AVX2/AVX-512. On a
+  Ryzen 9 9950X3D, Qwen3-0.6B Q4_K_M on `--dev cpu` went from ~380 to ~580 tok/s
+  prefill (pp256) and ~48 to ~61 tok/s decode (tg64). As on Linux, the binary is
+  then specific to the CPU it was built on.
 - **Shaders compile in parallel, and the build finds the Vulkan SDK's `glslc`.**
   `infr-vulkan`'s build script ran one `glslc` per shader variant sequentially;
   it now spreads them across cargo's job allowance (`NUM_JOBS`) — a release

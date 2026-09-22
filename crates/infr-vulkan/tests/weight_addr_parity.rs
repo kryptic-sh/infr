@@ -66,14 +66,20 @@ fn weight_bytes_for(dtype: DType, elems: usize) -> usize {
 }
 
 /// Byte offset a tensor sits at inside the shared arena for the non-zero-offset leg. Must be a
-/// whole number of blocks (so `w_base`-relative decode still lands on a block boundary) and is
-/// 256-byte aligned to satisfy any natural alignment the pointer reads assume.
+/// whole number of blocks (so `w_base`-relative decode still lands on a block boundary) AND
+/// 256-byte aligned, as production places every sub-tensor (`BDA_WEIGHT_ALIGN`): the shaders
+/// declare `buffer_reference_align = 4`, so a misaligned base is undefined behaviour. The least
+/// common multiple is the smallest offset that is both. (Rounding 8 blocks up to 256 and then
+/// back up to a block multiple put Q6_K, 210-byte blocks, at 1890 — not even 4-aligned. Mesa
+/// happened to read through it; AMD's proprietary compiler does not.)
 fn nonzero_off(dtype: DType) -> usize {
+    const ALIGN: usize = 256;
     let (_, blk_bytes) = infr_gguf::block_layout(dtype);
-    let mut off = blk_bytes * 8;
-    off = off.div_ceil(256) * 256;
-    // Re-round UP to a block multiple; 256-alignment alone can land mid-block for odd block sizes.
-    off.div_ceil(blk_bytes) * blk_bytes
+    let (mut a, mut b) = (blk_bytes, ALIGN);
+    while b != 0 {
+        (a, b) = (b, a % b); // Euclid: `a` ends as gcd(blk_bytes, ALIGN)
+    }
+    blk_bytes / a * ALIGN
 }
 
 struct Case {

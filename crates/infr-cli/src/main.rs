@@ -2875,7 +2875,11 @@ fn cmd_compare_sweep(
     // (model, metric, infr, llama, ratio) for the ranked summary.
     let mut rows: Vec<(String, String, f64, f64)> = Vec::new();
     for model in models {
-        let short = model.rsplit('/').next().unwrap_or(model);
+        // `Path`, not a split on `/`: a Windows `.gguf` path separates with `\`.
+        let short = std::path::Path::new(model)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(model);
         // Cooldown between models to reduce thermal skew across the sweep.
         std::thread::sleep(std::time::Duration::from_secs(10));
         let mb = match ModelBench::new(
@@ -3301,11 +3305,16 @@ impl ModelBench {
         let fork = infr_plat::paths::home_dir()
             .unwrap_or_default()
             .join("Projects/mxaddict/llama.cpp-dg");
-        if cpu {
-            fork.join("build/bin/llama-diffusion-cli")
-        } else {
-            fork.join("build-vulkan/bin/llama-diffusion-cli")
-        }
+        let build = if cpu { "build" } else { "build-vulkan" };
+        fork.join(build)
+            .join("bin")
+            .join(Self::diffusion_cli_file())
+    }
+
+    /// `llama-diffusion-cli` as a file name on this platform. `Command::new` appends `.exe` on
+    /// Windows by itself, but these lookups probe with `is_file()`, which does not.
+    fn diffusion_cli_file() -> String {
+        format!("llama-diffusion-cli{}", std::env::consts::EXE_SUFFIX)
     }
 
     /// Resolve `llama-diffusion-cli`'s binary path (Phase 4/E compare arm) — precedence, in order:
@@ -3326,7 +3335,7 @@ impl ModelBench {
         }
         if let Ok(path_var) = std::env::var("PATH") {
             for dir in std::env::split_paths(&path_var) {
-                let cand = dir.join("llama-diffusion-cli");
+                let cand = dir.join(Self::diffusion_cli_file());
                 if cand.is_file() {
                     return cand;
                 }

@@ -35,6 +35,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   creation (`infr_vulkan::spirv`). Devices that already round to nearest keep
   their modules unchanged — declaring the mode there is not neutral, and moved a
   GPU golden on an RDNA3 card.
+- **`infr compare` finds `llama-diffusion-cli` on Windows.** The `PATH` and
+  fork-build lookups probed for the file without `.exe`, so the diffusion
+  comparison always reported the binary missing.
 - **`infr` can find a global config file on Windows.** `config::file::discover`
   resolved `$XDG_CONFIG_HOME`, else `$HOME/.config`, else nothing — and Windows
   sets neither variable, so the third lookup step silently never found anything

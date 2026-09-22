@@ -26,11 +26,21 @@ use std::io;
 /// an idle chat prompt notice a Ctrl-C instead of sitting on the read until the user presses
 /// Enter. Everything else in the process that can see an interrupted syscall already retries it.
 ///
-/// **Not implemented off unix**, where this is a no-op returning `Ok(())`: the process keeps the
-/// default disposition and dies on the first signal without draining the GPU. That is the
-/// pre-existing behaviour, and it is a real gap rather than a spelling difference — a Windows
-/// implementation needs `SetConsoleCtrlHandler`, whose handler runs on its own thread and so has
-/// different safety rules than the async-signal-safe ones above.
+/// **Windows** has no signals; the nearest equivalent is the console control handler
+/// (`SetConsoleCtrlHandler`). Ctrl-C and Ctrl-Break latch as `SIGINT`; closing the console window,
+/// logging off and shutting down latch as `SIGTERM`. The handler runs on a thread the system
+/// creates for it rather than interrupting one, so the async-signal-safe rules are stricter than
+/// it needs — the latch is still one atomic, which is what it must be on unix anyway. Two
+/// behaviours differ from unix and are stated here rather than hidden:
+///
+/// - For a close/logoff/shutdown event the system terminates the process as soon as the handler
+///   RETURNS. So the handler parks its thread instead: the process then exits when `main` finishes
+///   draining the GPU, or when the system's own close timeout expires, whichever is first.
+/// - A second event force-exits through `TerminateProcess`, the `_exit(2)` analogue — no atexit
+///   handlers, no DLL detach notifications into a GPU driver that may be mid-submit.
+///
+/// **Other targets** (neither unix nor Windows) get a no-op returning `Ok(())`: the process keeps
+/// the default disposition and dies on the first signal without draining the GPU.
 #[cfg(unix)]
 pub fn install_handlers(on_signal: fn(i32) -> bool) -> io::Result<()> {
     // Set BEFORE `sigaction`, so the handler cannot fire against an empty latch.
@@ -52,10 +62,84 @@ pub fn install_handlers(on_signal: fn(i32) -> bool) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn install_handlers(on_signal: fn(i32) -> bool) -> io::Result<()> {
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // Set BEFORE registering, so the handler cannot fire against an empty latch.
+    let _ = LATCH.set(on_signal);
+    // SAFETY: `console_handler` has the `PHANDLER_ROUTINE` signature and lives for the whole
+    // process. Registering it twice is harmless: the system calls the most recently added routine
+    // first, and this one returns TRUE (handled) for every event it latches.
+    unsafe { SetConsoleCtrlHandler(Some(console_handler), true) }?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn install_handlers(on_signal: fn(i32) -> bool) -> io::Result<()> {
     let _ = on_signal;
     Ok(())
+}
+
+/// The C runtime's numbering (MSVC `<signal.h>`), which is also the POSIX one for these two. Using
+/// it keeps `128 + signo` the same exit status on every platform: 130 for Ctrl-C, 143 for a close.
+#[cfg(windows)]
+const SIGINT: i32 = 2;
+#[cfg(windows)]
+const SIGTERM: i32 = 15;
+
+/// Which signal a console control event stands for, or `None` for an event this process leaves to
+/// the next handler in the chain (ultimately the system default).
+#[cfg(windows)]
+fn signal_for(ctrl_type: u32) -> Option<i32> {
+    use windows::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => Some(SIGINT),
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => Some(SIGTERM),
+        _ => None,
+    }
+}
+
+/// The installed console control handler. Runs on its own system-created thread.
+#[cfg(windows)]
+unsafe extern "system" fn console_handler(ctrl_type: u32) -> windows::Win32::Foundation::BOOL {
+    use windows::Win32::Foundation::{FALSE, TRUE};
+
+    let Some(signo) = signal_for(ctrl_type) else {
+        return FALSE;
+    };
+    if !LATCH.get().is_some_and(|latch| latch(signo)) {
+        force_exit(signo);
+    }
+    if signo == SIGTERM {
+        // Returning would let the system terminate the process right now, mid-submit. Hold this
+        // thread instead; `main` ends the process once the GPU has drained (see the fn docs).
+        loop {
+            std::thread::park();
+        }
+    }
+    TRUE
+}
+
+/// The second-signal path: warn on stderr and terminate without running any cleanup.
+#[cfg(windows)]
+fn force_exit(signo: i32) -> ! {
+    use windows::Win32::Storage::FileSystem::WriteFile;
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+    use windows::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+
+    // SAFETY: plain Win32 calls on this process's own stderr handle and pseudo-handle. Both
+    // results are deliberately dropped: the write is a courtesy that a closed stderr must not
+    // block, and a failed terminate falls through to `abort` below.
+    unsafe {
+        if let Ok(stderr) = GetStdHandle(STD_ERROR_HANDLE) {
+            let _ = WriteFile(stderr, Some(SECOND_SIGNAL_MSG), None, None);
+        }
+        let _ = TerminateProcess(GetCurrentProcess(), (128 + signo) as u32);
+    }
+    std::process::abort()
 }
 
 /// The caller's latch.
@@ -64,8 +148,13 @@ pub fn install_handlers(on_signal: fn(i32) -> bool) -> io::Result<()> {
 /// atomic load and a reference, with no allocation and no locking. A `Mutex` or a `Box<dyn Fn>`
 /// would be unusable here, and a raw `fn`-pointer-as-`usize` would need a `transmute` to get back
 /// — this needs no `unsafe` at all.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 static LATCH: std::sync::OnceLock<fn(i32) -> bool> = std::sync::OnceLock::new();
+
+/// What a second signal prints on its way out, on every platform that installs a handler.
+#[cfg(any(unix, windows))]
+const SECOND_SIGNAL_MSG: &[u8] = b"\ninfr: second signal - exiting NOW without draining the GPU. \
+    If a submit was in flight, the device may stay wedged until reboot.\n";
 
 /// The installed handler. **Async-signal-safe by construction**: one relaxed atomic load, one
 /// indirect call into the caller's latch, and — only for a second signal — `write` and `_exit`.
@@ -76,11 +165,13 @@ extern "C" fn trampoline(signo: libc::c_int) {
             return; // first signal: let the caller wind down at its next safe point
         }
     }
-    const MSG: &[u8] = b"\ninfr: second signal - exiting NOW without draining the GPU. \
-        If a submit was in flight, the device may stay wedged until reboot.\n";
-    // SAFETY: `write` and `_exit` are async-signal-safe; MSG is a 'static byte string.
+    // SAFETY: `write` and `_exit` are async-signal-safe; the message is a 'static byte string.
     unsafe {
-        libc::write(2, MSG.as_ptr().cast(), MSG.len());
+        libc::write(
+            2,
+            SECOND_SIGNAL_MSG.as_ptr().cast(),
+            SECOND_SIGNAL_MSG.len(),
+        );
         libc::_exit(128 + signo);
     }
 }
@@ -131,9 +222,57 @@ mod tests {
     }
 }
 
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use windows::Win32::Foundation::{FALSE, TRUE};
+    use windows::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+
+    static SAW: AtomicI32 = AtomicI32::new(0);
+
+    fn latch(signo: i32) -> bool {
+        SAW.store(signo, Ordering::Relaxed);
+        true // always "first signal", so the handler returns instead of terminating
+    }
+
+    #[test]
+    fn console_events_map_to_the_posix_signal_numbers() {
+        assert_eq!(signal_for(CTRL_C_EVENT), Some(SIGINT));
+        assert_eq!(signal_for(CTRL_BREAK_EVENT), Some(SIGINT));
+        assert_eq!(signal_for(CTRL_CLOSE_EVENT), Some(SIGTERM));
+        assert_eq!(signal_for(CTRL_LOGOFF_EVENT), Some(SIGTERM));
+        assert_eq!(signal_for(CTRL_SHUTDOWN_EVENT), Some(SIGTERM));
+        assert_eq!(
+            signal_for(3),
+            None,
+            "3 is unassigned; it must fall through to the default"
+        );
+    }
+
+    /// Installing succeeds, and the routine it installs routes Ctrl-C into the latch and reports
+    /// it handled. A real console event cannot be raised here without also hitting the test runner
+    /// that shares the console, so the routine is called directly; the registration is the one
+    /// `SetConsoleCtrlHandler` call whose error `install_handlers` returns.
+    #[test]
+    fn an_installed_handler_latches_ctrl_c() {
+        install_handlers(latch).expect("install");
+        install_handlers(latch).expect("installing twice is harmless");
+        // SAFETY: called on this thread with a latch that returns `true`, so the routine neither
+        // parks (Ctrl-C is not a close event) nor terminates.
+        let handled = unsafe { console_handler(CTRL_C_EVENT) };
+        assert_eq!(handled, TRUE);
+        assert_eq!(SAW.load(Ordering::Relaxed), SIGINT);
+        // SAFETY: as above; an unmapped event returns before touching the latch.
+        assert_eq!(unsafe { console_handler(3) }, FALSE);
+    }
+}
+
 /// The documented no-op, pinned so it stays a deliberate stub rather than drifting into an
 /// implementation nobody checked. A platform that grows a real handler replaces this test.
-#[cfg(all(test, not(unix)))]
+#[cfg(all(test, not(any(unix, windows))))]
 mod tests {
     use super::*;
 

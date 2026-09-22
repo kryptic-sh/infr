@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Ctrl-C on Windows drains the GPU instead of killing infr mid-submit.**
+  `infr_plat::signal::install_handlers` was a no-op off unix, so the first
+  Ctrl-C terminated the process with a submit still in flight. It now registers
+  a console control handler: Ctrl-C and Ctrl-Break latch the same graceful
+  shutdown as `SIGINT`, closing the console window (or logoff/shutdown) latches
+  it as `SIGTERM`, a second event force-exits, and the exit status is 130/143 as
+  on unix. A Ctrl-C at an idle `infr run` prompt also takes effect immediately,
+  where it used to wait for Enter: console input is now read with
+  `ReadConsoleW`, which reports the aborted read that `Stdin` silently retries.
 - **`infr` can find a global config file on Windows.** `config::file::discover`
   resolved `$XDG_CONFIG_HOME`, else `$HOME/.config`, else nothing — and Windows
   sets neither variable, so the third lookup step silently never found anything

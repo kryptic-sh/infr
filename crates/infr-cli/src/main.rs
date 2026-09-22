@@ -1242,7 +1242,9 @@ fn cmd_run(
 /// `Stdin::read_line` cannot: `BufRead::read_until` swallows `EINTR` and re-issues the `read`, so a
 /// Ctrl-C at an IDLE chat prompt would leave the latch set but the process parked on the terminal
 /// until the user pressed Enter. Reading fd 0 directly lets the `EINTR` (the handler installs
-/// without `SA_RESTART`) come back to us, where we check the latch and return EOF.
+/// without `SA_RESTART`) come back to us, where we check the latch and return EOF. On a Windows
+/// console the seam does the same with `ReadConsoleW`'s aborted read (see
+/// [`infr_plat::stdin::read_byte`]).
 ///
 /// Byte-at-a-time so no input past the newline is ever consumed (nothing else in the process reads
 /// stdin, but over-reading a pipe would silently eat the next prompt). One syscall per typed
@@ -1264,7 +1266,8 @@ fn read_line_interruptible(line: &mut String) -> anyhow::Result<usize> {
                 }
             }
             // A signal arrived: the latch check at the top of the loop decides what to do about
-            // it. Only unix can produce this — see the seam's docs.
+            // it. Unix and a Windows console produce this; redirected input cannot — see the seam's
+            // docs.
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.into()),
         }

@@ -54,6 +54,7 @@ pub(crate) fn make_compute_kernel(
     required_sg: Option<u32>,
     push_descriptor: bool,
     max_push_constants: u32,
+    rte_f16: bool,
 ) -> ComputeKernel {
     try_make_compute_kernel(
         device,
@@ -65,6 +66,7 @@ pub(crate) fn make_compute_kernel(
         required_sg,
         push_descriptor,
         max_push_constants,
+        rte_f16,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -92,13 +94,18 @@ pub(crate) fn try_make_compute_kernel(
     required_sg: Option<u32>,
     push_descriptor: bool,
     max_push_constants: u32,
+    rte_f16: bool,
 ) -> Result<ComputeKernel> {
     // The device's real `maxPushConstantsSize` — Vulkan only GUARANTEES 128 bytes, and every push
     // block here was sized against that floor by inspection. Checked before the layout is built so
     // an oversize block names itself instead of surfacing as a driver-side VUID.
     crate::caps::check_push_constant_size(name, push_size, max_push_constants).map_err(be)?;
+    // `spv` itself stays the kernel's identity (`spv_hash` below): the patch is a function of the
+    // module and the device, so the same `spv` always builds the same pipeline here.
+    let rte_patched = rte_f16.then(|| crate::spirv::with_rte_f16(spv)).flatten();
+    let code = rte_patched.as_deref().unwrap_or(spv);
     let shader = unsafe {
-        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spv), None)
+        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(code), None)
     }
     .map_err(|e| {
         be(format!(
@@ -382,6 +389,9 @@ impl VulkanBackend {
                 required_sg,
                 self.shared.push_descriptor.is_some(),
                 self.shared.max_push_constants,
+                self.shared
+                    .rte_f16
+                    .load(std::sync::atomic::Ordering::Relaxed),
             )
         });
         drop(map);

@@ -21,6 +21,7 @@ pub mod pager;
 mod pcache;
 pub mod pipeline;
 mod recorder;
+mod spirv;
 pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
@@ -47,7 +48,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk;
@@ -274,6 +275,11 @@ struct VulkanShared {
     /// against the 128 bytes Vulkan merely guarantees (see `ops::try_make_compute_kernel`, which
     /// refuses an oversize block by name instead of letting `vkCreatePipelineLayout` fail a VUID).
     max_push_constants: u32,
+    /// Declare round-to-nearest-even for 16-bit floats on every kernel that has an f16 type (see
+    /// [`spirv::with_rte_f16`]). Set once, during construction and before any such kernel is built,
+    /// and only where the driver was OBSERVED to round an f32→f16 conversion some other way — see
+    /// [`VulkanBackend::arm_f16_rounding`].
+    rte_f16: AtomicBool,
     /// Set once the int8 coopmat accumulator-layout known-answer probe has run on this device:
     /// `true` = this driver lays the fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
     /// UNSET when the probe was never run, which is every default run — the tier it guards is
@@ -2122,11 +2128,15 @@ impl VulkanBackend {
         // Maintenance3 (core in Vulkan 1.1) carries `maxMemoryAllocationSize` — the weight arena
         // splits its up-front reservation into blocks no larger than this.
         let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
+        // Float controls (core in Vulkan 1.2) say whether a shader may declare its f16 rounding.
+        let mut float_controls = vk::PhysicalDeviceFloatControlsProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut sgsize_props)
-            .push_next(&mut maint3_props);
+            .push_next(&mut maint3_props)
+            .push_next(&mut float_controls);
         unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
         let props = props2.properties;
+        let rte_f16_supported = float_controls.shader_rounding_mode_rte_float16 == vk::TRUE;
         // 0 = not reported → fall back to the Vulkan-guaranteed floor (2^30 = 1 GiB).
         let max_mem_alloc_size = if maint3_props.max_memory_allocation_size == 0 {
             1 << 30
@@ -2448,6 +2458,7 @@ impl VulkanBackend {
                 has_mem_budget,
                 max_mem_alloc_size,
                 max_push_constants: props.limits.max_push_constants_size,
+                rte_f16: AtomicBool::new(false),
                 i8cm_layout_ok: OnceLock::new(),
                 push_descriptor,
                 external_memory_fd,
@@ -2468,11 +2479,104 @@ impl VulkanBackend {
             }),
         };
 
+        // Before any other kernel is built: every f16 kernel compiled from here on is patched or not
+        // according to what this finds.
+        backend.arm_f16_rounding(rte_f16_supported);
         // The int8 coopmat tier's accumulator-layout check — a real dispatch, so it can only run
         // once the backend exists. No-op unless that tier is actually asked for.
         backend.verify_i8_coopmat_layout();
 
         Ok(backend)
+    }
+
+    /// Declare round-to-nearest-even on f16 kernels only where the driver does not already do it.
+    ///
+    /// SPIR-V leaves f32→f16 conversion rounding to the implementation, and AMD's proprietary
+    /// driver truncates on RDNA2 while rounding to nearest on RDNA3 (and Mesa RADV rounds to
+    /// nearest on both). Declaring the mode everywhere it is supported was tried and is NOT
+    /// neutral: on the RDNA3 card, whose conversions were already correct, it still moved a GPU
+    /// golden — the declaration changes more than conversions. So the patch is armed only after a
+    /// known-answer dispatch shows this device rounding some other way, and every device that
+    /// already rounds correctly keeps the exact modules it had.
+    ///
+    /// The probe itself runs an UNPATCHED `store_f16` (the KV-cache store) built outside the kernel
+    /// cache, so nothing it builds survives into the forward. A probe that cannot run leaves the
+    /// driver's default in place and says so.
+    fn arm_f16_rounding(&self, supported: bool) {
+        if !supported {
+            return; // the declaration would be invalid on this device; nothing to decide
+        }
+        match self.f16_conversion_rounds_to_nearest() {
+            Ok(true) => {}
+            Ok(false) => {
+                self.shared.rte_f16.store(true, Ordering::Relaxed);
+                tracing::info!(
+                    "[infr] this driver truncates f32->f16 conversions by default — declaring \
+                     round-to-nearest-even on every f16 kernel"
+                );
+            }
+            Err(e) => tracing::warn!(
+                "[infr] f16 rounding probe could not run ({e}) — f16 kernels keep this driver's \
+                 default rounding, which may truncate"
+            ),
+        }
+    }
+
+    /// Convert two f32 values that sit 3/4 of an f16 ulp above ±1.0 through an unpatched
+    /// `store_f16`, and report whether both came back rounded to nearest (up, away from 1.0) rather
+    /// than truncated.
+    fn f16_conversion_rounds_to_nearest(&self) -> Result<bool> {
+        const THREE_QUARTER_ULP: f32 = 0.75 / 1024.0; // f16 has 10 fraction bits
+        let input = [1.0 + THREE_QUARTER_ULP, -(1.0 + THREE_QUARTER_ULP)];
+        let k = crate::ops::try_make_compute_kernel(
+            &self.shared.device,
+            self.shared.pipeline_cache,
+            "store_f16_rounding_probe",
+            crate::gemm::store_f16_spv(),
+            2,
+            16,
+            None,
+            self.shared.push_descriptor.is_some(),
+            self.shared.max_push_constants,
+            false,
+        )?;
+        let run = || -> Result<bool> {
+            let src = self.alloc(std::mem::size_of_val(&input), BufferUsage::Staging)?;
+            let dst = self.alloc(input.len() * 2, BufferUsage::Readback)?;
+            self.upload(src.as_ref(), bytemuck::cast_slice(&input))?;
+            let vk_bufs = [
+                as_vk_buf(src.as_ref())?.buffer,
+                as_vk_buf(dst.as_ref())?.buffer,
+            ];
+            let binding = self.eager_bind(&k, &vk_bufs)?;
+            // store_f16's push block: n, dst offset, src offset, ring cap (unused here).
+            let push: [u32; 4] = [input.len() as u32, 0, 0, 0];
+            let shared = &self.shared;
+            self.one_shot(|cmd| unsafe {
+                shared
+                    .device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+                binding.bind(shared, cmd, k.pipeline_layout);
+                shared.device.cmd_push_constants(
+                    cmd,
+                    k.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytemuck::cast_slice(&push),
+                );
+                shared.device.cmd_dispatch(cmd, 1, 1, 1);
+            })?;
+            let mut got = [0u8; 4];
+            self.download(dst.as_ref(), &mut got)?;
+            let want: Vec<u8> = input
+                .iter()
+                .flat_map(|&v| half::f16::from_f32(v).to_bits().to_ne_bytes())
+                .collect();
+            Ok(got[..] == want[..])
+        };
+        let res = run();
+        crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        res
     }
 
     /// The int8 cooperative-matrix GEMM tier is usable on this device: the hardware enumerates the
@@ -2546,6 +2650,7 @@ impl VulkanBackend {
             Some(32),
             self.shared.push_descriptor.is_some(),
             self.shared.max_push_constants,
+            self.shared.rte_f16.load(Ordering::Relaxed),
         )?;
         let run = || -> Result<Vec<i32>> {
             let (a, b) = crate::caps::frag_probe_inputs();

@@ -23,6 +23,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Windows, so the dead run was never noticed, the suspect blob was fed back to
   the driver on every launch, and `.seeded.*` markers piled up in the cache
   directory. It now probes with `OpenProcess` / `GetExitCodeProcess`.
+- **f16 values round to nearest on AMD's proprietary driver.** SPIR-V leaves the
+  rounding of a conversion to `float16_t` up to the driver unless the shader
+  declares one, and AMD's Windows driver truncates on RDNA2 (a Ryzen iGPU) — so
+  every f16 the shaders wrote, KV-cache entries and activation scales included,
+  came out up to one ulp low, and that device's results drifted from every
+  other's (`copy_f32_to_f16_cast_matches_host` and the expert-parallel test
+  failed on it). A known-answer dispatch at device creation now checks how the
+  driver rounds; where it truncates, every kernel with an f16 type declares
+  `RoundingModeRTE` for 16-bit floats, patched into the module at pipeline
+  creation (`infr_vulkan::spirv`). Devices that already round to nearest keep
+  their modules unchanged — declaring the mode there is not neutral, and moved a
+  GPU golden on an RDNA3 card.
 - **`infr` can find a global config file on Windows.** `config::file::discover`
   resolved `$XDG_CONFIG_HOME`, else `$HOME/.config`, else nothing — and Windows
   sets neither variable, so the third lookup step silently never found anything

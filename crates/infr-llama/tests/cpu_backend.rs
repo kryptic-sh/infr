@@ -11,15 +11,11 @@
 use infr_core::WeightSource;
 use std::path::PathBuf;
 
-/// Locate a cached GGUF `<file>` under `~/.cache/huggingface/hub/models--<repo>/snapshots/*/`, or
-/// `None` if it isn't downloaded (the test self-skips). `repo` is the HF id with `/` → `--`.
+/// Locate a cached GGUF `<file>` in the HF Hub cache — found the way `infr` finds it, so
+/// `HF_HOME` and friends apply and Windows (no `$HOME`) works — or `None` if it isn't downloaded
+/// (the test self-skips). `repo` is the HF id with `/` → `--`.
 fn find_gguf(repo: &str, file: &str) -> Option<PathBuf> {
-    let hub = std::env::var("HOME").ok()? + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--{repo}/snapshots");
-    std::fs::read_dir(&base).ok()?.find_map(|e| {
-        let f = e.ok()?.path().join(file);
-        f.exists().then_some(f)
-    })
+    infr_hub::Store::discover().ok()?.snapshot_file(repo, file)
 }
 
 /// Resolve a model path or self-skip the test (it runs only when the GGUF is present).
@@ -69,6 +65,9 @@ fn model_cfg(
     f: impl FnOnce(&mut infr_llama::EngineConfig),
 ) -> infr_llama::SeamModel {
     let mut cfg = infr_llama::EngineConfig::default();
+    // The one environment knob these tests honour: WHICH GPU they run on, so a box with more than
+    // one (a dGPU beside an iGPU) can test either. Unset keeps the first-discrete default.
+    cfg.device.dev = std::env::var("INFR_DEV").ok();
     f(&mut cfg);
     infr_llama::SeamModel::load_with(path, None, std::sync::Arc::new(cfg)).expect("model load")
 }
@@ -204,6 +203,21 @@ fn gpu_seam_matches_cpu_qwen2() {
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
 
+/// A golden hash that differs between Windows and every other platform.
+///
+/// Windows builds produce different greedy tokens from Linux ones on the same CPU with the same
+/// `target-cpu` — deterministically, run after run, and only once a generation is long enough for
+/// accumulated float drift to flip an argmax (every short case still matches bit-for-bit). The
+/// likeliest cause is the C runtime's transcendental functions (MSVC's UCRT versus glibc), not
+/// confirmed. Both outputs were read and are coherent; they are simply different arithmetic.
+const fn per_os(windows: u64, elsewhere: u64) -> u64 {
+    if cfg!(windows) {
+        windows
+    } else {
+        elsewhere
+    }
+}
+
 // Captured + verified coherent (chat-templated, Qwen3 thinks then answers): "…France's capital is
 // Paris", a simple-terms computer explanation, an ocean paragraph.
 const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
@@ -211,12 +225,12 @@ const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Explain how a computer works in simple terms.",
         48,
-        0xcf56ba8c4bb5c455,
+        per_os(0xec2b171ab4126f09, 0xcf56ba8c4bb5c455),
     ),
     (
         "Write a short paragraph about the ocean.",
         48,
-        0x29f45fb169b84b9a,
+        per_os(0xfb31f388412112f1, 0x29f45fb169b84b9a),
     ),
 ];
 
@@ -1295,7 +1309,7 @@ const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x28e39d5dd5b5f858,
+        per_os(0x47634670c5e2ac70, 0x28e39d5dd5b5f858),
     ),
 ];
 

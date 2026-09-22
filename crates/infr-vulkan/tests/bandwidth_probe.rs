@@ -33,11 +33,10 @@ const LAYER_BYTES: usize = 660 * MIB; // one Scout Q2_K layer's stacked gate+up+
 /// Real GGUF blob already on this box (avoids materializing a 660 MiB scratch file); falls back to
 /// a temp file of the max block size so the probe still runs on a box without the model cached.
 fn mmap_source(min_bytes: usize) -> Mmap {
-    let real = std::env::var("HOME").ok().map(|h| {
-        format!(
-            "{h}/.cache/huggingface/hub/models--unsloth--Llama-4-Scout-17B-16E-Instruct-GGUF/\
-             snapshots/72a6853f56a66dc13a3a4b6bdc9cf7ee4c364b47/\
-             Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf"
+    let real = infr_hub::Store::discover().ok().and_then(|store| {
+        store.snapshot_file(
+            "unsloth/Llama-4-Scout-17B-16E-Instruct-GGUF",
+            "Llama-4-Scout-17B-16E-Instruct-Q2_K.gguf",
         )
     });
     if let Some(p) = &real {

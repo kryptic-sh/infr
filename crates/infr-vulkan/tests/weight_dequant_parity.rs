@@ -26,12 +26,7 @@ const COLS_PER_DISPATCH: usize = 128;
 
 /// Locate a GGUF in the HF cache the way `infr-llama`'s model-gated tests do.
 fn find_gguf(repo: &str, file: &str) -> Option<PathBuf> {
-    let hub = std::env::var("HOME").ok()? + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--{repo}/snapshots");
-    std::fs::read_dir(&base).ok()?.find_map(|e| {
-        let f = e.ok()?.path().join(file);
-        f.exists().then_some(f)
-    })
+    infr_hub::Store::discover().ok()?.snapshot_file(repo, file)
 }
 
 fn deepseek_v2_lite() -> Option<PathBuf> {

@@ -295,18 +295,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn qwen3_06b() -> Option<PathBuf> {
-        let base =
-            dirs_home()?.join(".cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots");
-        std::fs::read_dir(&base)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .find_map(|e| {
-                let p = e.path().join("Qwen3-0.6B-Q4_K_M.gguf");
-                p.exists().then_some(p)
-            })
-    }
-    fn dirs_home() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(PathBuf::from)
+        crate::test_hub_gguf("unsloth/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_K_M.gguf")
     }
 
     /// **Finding 2 — `apply_mask` must fail CLOSED past `vocab`.** On a padded-vocab model the

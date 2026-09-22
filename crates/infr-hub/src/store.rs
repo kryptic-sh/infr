@@ -166,6 +166,16 @@ impl Store {
         None
     }
 
+    /// The cached file named exactly `file` in any snapshot of `repo`, `refs/main`'s first — no
+    /// quant matching and no fallback, unlike [`Self::resolve_repo`]. For callers that need one
+    /// specific file or nothing, such as a model-gated test whose golden belongs to that file.
+    pub fn snapshot_file(&self, repo: &str, file: &str) -> Option<PathBuf> {
+        self.ordered_snapshots(repo)
+            .into_iter()
+            .map(|snap| snap.join(file))
+            .find(|p| p.exists())
+    }
+
     /// Snapshot dirs for `repo`, the one named by `refs/main` FIRST (when present), then the rest.
     /// HF leaves stale snapshots in place across commits, so preferring `refs/main` avoids returning
     /// an arbitrary older snapshot for the current model.
@@ -697,6 +707,19 @@ mod tests {
             .unwrap()
             .ends_with("weird-name.gguf"));
         assert_eq!(store.resolve_repo("u/r", Some("Q4_K_M")), None);
+    }
+
+    /// `snapshot_file` returns the named file or nothing: where `resolve_repo` would settle for a
+    /// neighbouring quant, this must not, since its callers pin a golden to one exact file.
+    #[test]
+    fn snapshot_file_is_exact() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_hf(tmp.path(), "u/r", "c", "m-Q8_0.gguf", "aa");
+        let store = store_at(tmp.path().to_path_buf());
+        let got = store.snapshot_file("u/r", "m-Q8_0.gguf").unwrap();
+        assert_eq!(fs::read_to_string(&got).unwrap(), "fake gguf bytes");
+        assert_eq!(store.snapshot_file("u/r", "m-Q4_K_M.gguf"), None);
+        assert_eq!(store.snapshot_file("nope/missing", "m-Q8_0.gguf"), None);
     }
 
     #[test]

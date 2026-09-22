@@ -171,12 +171,7 @@ mod tests {
         if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
             return Some(std::path::PathBuf::from(p));
         }
-        let hub = std::env::var("HOME").ok()? + "/.cache/huggingface/hub";
-        let base = format!("{hub}/models--unsloth--Qwen3.5-0.8B-GGUF/snapshots");
-        std::fs::read_dir(&base).ok()?.find_map(|e| {
-            let f = e.ok()?.path().join("Qwen3.5-0.8B-Q4_K_M.gguf");
-            f.exists().then_some(f)
-        })
+        crate::test_hub_gguf("unsloth/Qwen3.5-0.8B-GGUF", "Qwen3.5-0.8B-Q4_K_M.gguf")
     }
 
     /// Serialize the qwen35 tests: several toggle process-global env vars mid-generate, which

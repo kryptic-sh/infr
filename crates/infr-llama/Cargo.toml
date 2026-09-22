@@ -24,4 +24,5 @@ rayon.workspace = true
 tracing.workspace = true
 tokenizers = { workspace = true }
 
-
+[dev-dependencies]
+infr-hub.workspace = true

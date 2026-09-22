@@ -179,12 +179,15 @@ pub(crate) fn test_qwen3_06b() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("INFR_TEST_MODEL") {
         return Some(std::path::PathBuf::from(p));
     }
-    let hub = std::env::var("HOME").ok()? + "/.cache/huggingface/hub";
-    let base = format!("{hub}/models--unsloth--Qwen3-0.6B-GGUF/snapshots");
-    std::fs::read_dir(&base).ok()?.find_map(|e| {
-        let f = e.ok()?.path().join("Qwen3-0.6B-Q4_K_M.gguf");
-        f.exists().then_some(f)
-    })
+    test_hub_gguf("unsloth/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_K_M.gguf")
+}
+
+/// `file` from `repo` in the HF Hub cache, resolved exactly as `infr` itself finds the cache
+/// (`HF_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME`, the home directory on every platform), or `None`
+/// when it is not downloaded.
+#[cfg(test)]
+pub(crate) fn test_hub_gguf(repo: &str, file: &str) -> Option<std::path::PathBuf> {
+    infr_hub::Store::discover().ok()?.snapshot_file(repo, file)
 }
 
 /// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to

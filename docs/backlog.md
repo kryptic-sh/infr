@@ -2746,6 +2746,44 @@ and logical counts on Linux. If physical wins, give `physical_cores` a Linux arm
 than widening the Windows one. macOS would need the same measurement and
 `sysctl hw.physicalcpu`.
 
+### B77 — what the 2026-09-23 Windows session did not verify (2026-09-23)
+
+**Tag:** Windows session residual · **Blocked on:** hardware or a way to trigger
+it; nothing here is known broken
+
+Coverage gaps, stated plainly:
+
+- **The console close / logoff / shutdown path of the Windows Ctrl-C handler.**
+  Ctrl-C was verified end to end (a real `CTRL_C_EVENT` sent to an idle
+  `infr run`, a generating `infr run` and an `infr serve`: each exited 130 after
+  draining). `CTRL_CLOSE_EVENT` cannot be generated programmatically, so the
+  branch that parks the handler thread until `main` drains is covered only by
+  the unit test's event-to-signal mapping. Closing a console window during a
+  long generation, and checking the process exits 143, is the missing check.
+- **The f16 rounding probe off AMD's Windows driver.**
+  `VulkanBackend::arm_f16_rounding` was observed on two devices only: it armed
+  on the RDNA2 iGPU and stayed off on the RDNA3 7900 XTX. It was not run on Mesa
+  RADV, NVIDIA or Intel, so which of those default to truncation is unknown. The
+  probe decides for itself, so a wrong guess costs nothing, but no patched
+  module has ever been compiled by a non-AMD driver.
+- **Linux GPU behaviour after this session's Vulkan changes.** CI has no GPU.
+  The f16 probe, the misaligned-offset test fix and the `INFR_DEV` test knob
+  were run on Windows GPUs only; the Linux RADV box should rerun the ignored GPU
+  suites once.
+- **iGPU performance against llama.cpp on Windows.** No `llama-bench` was
+  installed, so the iGPU numbers in [windows.md](windows.md) have no comparison.
+  `infr compare` is the tool once it is.
+- **Emoji through console input.** Typed input round-tripped `café`; an emoji
+  came back as `�` in the screen scrape, but conhost's screen buffer cannot draw
+  astral characters either, so whether the bytes the model received were right
+  was not established.
+
+A structural problem noticed, not addressed (out of scope for the session):
+`crates/infr-vulkan/build.rs` (3,708 lines, most of it one shader build list)
+and `crates/infr-vulkan/src/lib.rs` (5,157 lines) are monoliths. The build list
+would split naturally by kernel family into data files or per-family modules;
+`lib.rs` along its existing sections (device creation, probes, allocation).
+
 ### B70 — no MoE model above 256 experts has ever been run (2026-09-03)
 
 **Tag:** Vulkan MoE coverage · **Blocked on:** nothing; a gap, stated so the B67

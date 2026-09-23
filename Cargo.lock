@@ -1341,7 +1341,7 @@ dependencies = [
  "indicatif",
  "infr-core",
  "infr-gguf",
- "infr-hub",
+ "infr-plat",
  "infr-prof",
  "infr-prof-rt",
  "infr-testkit",

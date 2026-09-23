@@ -24,9 +24,17 @@ use std::path::PathBuf;
 /// structure; this is the chunk the rows are batched into.
 const COLS_PER_DISPATCH: usize = 128;
 
-/// Locate a GGUF in the HF cache the way `infr-llama`'s model-gated tests do.
+/// Locate a GGUF in the HF cache (`infr_plat::paths::hf_hub_cache`, the same root `infr` uses).
+/// `repo` is the HF id with `/` → `--`. Not `infr_hub::Store`: that would pull reqwest's TLS stack
+/// into this crate's dev-dependencies, whose C build cannot cross-compile to macOS from Linux.
 fn find_gguf(repo: &str, file: &str) -> Option<PathBuf> {
-    infr_hub::Store::discover().ok()?.snapshot_file(repo, file)
+    let snapshots = infr_plat::paths::hf_hub_cache()?
+        .join(format!("models--{repo}"))
+        .join("snapshots");
+    std::fs::read_dir(snapshots).ok()?.find_map(|e| {
+        let f = e.ok()?.path().join(file);
+        f.exists().then_some(f)
+    })
 }
 
 fn deepseek_v2_lite() -> Option<PathBuf> {

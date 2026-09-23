@@ -46,6 +46,42 @@ pub fn cache_home() -> Option<PathBuf> {
     xdg_base(std::env::var_os("XDG_CACHE_HOME"), ".cache")
 }
 
+/// The Hugging Face hub cache, resolved from the environment exactly as `huggingface_hub` does —
+/// see [`hf_hub_cache_from`] for the precedence. `None` when no home directory can be found.
+pub fn hf_hub_cache() -> Option<PathBuf> {
+    hf_hub_cache_from(
+        std::env::var_os("HF_HUB_CACHE"),
+        std::env::var_os("HUGGINGFACE_HUB_CACHE"),
+        std::env::var_os("HF_HOME"),
+        cache_home(),
+    )
+}
+
+/// `huggingface_hub`'s own precedence, as a pure function of the four inputs: `$HF_HUB_CACHE`,
+/// else `$HUGGINGFACE_HUB_CACHE`, else `$HF_HOME/hub`, else `<cache_home>/huggingface/hub`.
+///
+/// Takes the environment's values rather than reading them, so the chain is testable without
+/// `set_var` racing every other thread in the test binary — and so the same code proves the answer
+/// is identical on all three platforms, which is the entire point of the layout.
+///
+/// An empty variable is treated as unset: `HF_HOME=` from a cleared shell export would otherwise
+/// resolve the cache to the relative path `hub`.
+pub fn hf_hub_cache_from(
+    hf_hub_cache: Option<std::ffi::OsString>,
+    huggingface_hub_cache: Option<std::ffi::OsString>,
+    hf_home: Option<std::ffi::OsString>,
+    cache_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let set = |v: Option<std::ffi::OsString>| v.filter(|s| !s.is_empty()).map(PathBuf::from);
+    if let Some(p) = set(hf_hub_cache).or_else(|| set(huggingface_hub_cache)) {
+        return Some(p);
+    }
+    if let Some(home) = set(hf_home) {
+        return Some(home.join("hub"));
+    }
+    Some(cache_home?.join("huggingface").join("hub"))
+}
+
 /// The operating system's OWN cache directory, which is a different place from [`cache_home`] on
 /// everything but Linux: `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows.
 ///
@@ -115,5 +151,64 @@ mod tests {
         // The absolute case must not be the fallback in disguise — otherwise every assertion
         // above passes for a `xdg_base` that ignores its argument entirely.
         assert_ne!(xdg_base(Some(absolute.into()), ".config"), home_fallback);
+    }
+
+    /// `huggingface_hub`'s precedence, in order, and the fallback shape.
+    ///
+    /// The literal `.cache/huggingface/hub` is the point of the test, not an implementation
+    /// detail: it is `huggingface_hub`'s layout (`constants.py` — `$XDG_CACHE_HOME`, else
+    /// `~/.cache`, then `huggingface`, then `hub`) and infr has to match it or it re-downloads
+    /// models `hf download` already fetched.
+    #[test]
+    fn hf_hub_cache_follows_huggingface_hubs_precedence() {
+        let cache_home = || Some(PathBuf::from("/xdg-cache"));
+        let expected_default = PathBuf::from("/xdg-cache/huggingface/hub");
+
+        // Nothing set: the XDG cache base, then HF's two path segments.
+        assert_eq!(
+            hf_hub_cache_from(None, None, None, cache_home()),
+            Some(expected_default.clone())
+        );
+        // HF_HOME appends `hub`, and beats the base.
+        assert_eq!(
+            hf_hub_cache_from(None, None, Some("/hfhome".into()), cache_home()),
+            Some(PathBuf::from("/hfhome/hub"))
+        );
+        // HF_HUB_CACHE is the full hub dir, no `hub` appended, and beats HF_HOME.
+        assert_eq!(
+            hf_hub_cache_from(
+                Some("/explicit".into()),
+                None,
+                Some("/hfhome".into()),
+                cache_home()
+            ),
+            Some(PathBuf::from("/explicit"))
+        );
+        // The legacy variable is honoured, but loses to the current one.
+        assert_eq!(
+            hf_hub_cache_from(None, Some("/legacy".into()), None, cache_home()),
+            Some(PathBuf::from("/legacy"))
+        );
+        assert_eq!(
+            hf_hub_cache_from(
+                Some("/new".into()),
+                Some("/legacy".into()),
+                None,
+                cache_home()
+            ),
+            Some(PathBuf::from("/new"))
+        );
+        // An empty variable is unset, not a relative path — `HF_HOME=` must not yield `hub`.
+        assert_eq!(
+            hf_hub_cache_from(
+                Some("".into()),
+                Some("".into()),
+                Some("".into()),
+                cache_home()
+            ),
+            Some(expected_default)
+        );
+        // No home directory at all is "cannot tell", not a relative path.
+        assert_eq!(hf_hub_cache_from(None, None, None, None), None);
     }
 }

@@ -141,6 +141,11 @@ cross-process sharing it probes is POSIX-only (backlog B69).
   AVX2/AVX-512 — on a Ryzen 9 9950X3D that took Qwen3-0.6B on `--dev cpu` from
   ~380 to ~580 tok/s prefill and ~48 to ~61 tok/s decode. The binary will not
   run on an older CPU; build on the machine that runs it.
+- **CPU threads.** With no `-t`, infr runs one thread per physical core rather
+  than per logical processor: the CPU backend's spin pool loses badly when two
+  workers share a core's hyperthreads (about half the decode speed on the
+  9950X3D). `-t N` or `RAYON_NUM_THREADS` overrides it. Other platforms still
+  default to every logical processor (backlog B76).
 - **CPU golden hashes.** The long `cpu_golden_*` cases produce different (still
   coherent) text on Windows than on Linux on the same CPU, deterministically, so
   those cases carry a Windows hash (`per_os` in

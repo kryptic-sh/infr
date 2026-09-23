@@ -2718,6 +2718,26 @@ a hot path
   the two builds. Nothing in CI runs these on Windows (no model cache in the
   `test` job), so the Windows hashes are checked on dev boxes only.
 
+### B76 — the physical-core thread default is Windows-only until Linux is measured (2026-09-23)
+
+**Tag:** Windows optimisation · **Blocked on:** a Linux measurement
+
+With no `-t`, infr now publishes one thread per physical core on Windows
+(`infr_plat::cpu::physical_cores`, used by `default_thread_count` in
+`infr-cli`), because the CPU backend's spin pool with a worker on both
+hyperthreads of every core decoded Qwen3-0.6B at ~65 tok/s against ~127 on the
+same Ryzen 9 9950X3D with one per core; prefill improved too, and a GPU run's
+end-to-end time did not change. Linux keeps rayon's logical-count default
+because nobody has measured it there — the contention mechanism is not
+Windows-specific, so it probably applies, but that is a guess.
+
+To close: run `infr bench --dev cpu -p 0 -n 64 -r 5` with `-t` at the physical
+and logical counts on Linux. If physical wins, give `physical_cores` a Linux arm
+(count unique `core_id`s per `physical_package_id` under
+`/sys/devices/system/cpu`, restricted to the process's affinity mask) rather
+than widening the Windows one. macOS would need the same measurement and
+`sysctl hw.physicalcpu`.
+
 ### B70 — no MoE model above 256 experts has ever been run (2026-09-03)
 
 **Tag:** Vulkan MoE coverage · **Blocked on:** nothing; a gap, stated so the B67

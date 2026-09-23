@@ -203,7 +203,8 @@ struct DeviceOpts {
     #[arg(long, visible_alias = "ub", short = 'u', value_name = "N")]
     ubatch: Option<usize>,
     /// CPU threads (matches llama-bench -t). Config `device.threads`; published as
-    /// RAYON_NUM_THREADS (rayon has no other input). Unset = all cores.
+    /// RAYON_NUM_THREADS (rayon has no other input). Unset = one per physical core where the
+    /// platform reports it (Windows), else every logical core.
     #[arg(long, short = 't', value_name = "N")]
     threads: Option<usize>,
 }
@@ -772,7 +773,7 @@ fn specified_by_the_layers(overrides: &ConfigOverrides) -> anyhow::Result<Partia
 /// comes from the flag or the config file, so publishing it is the whole delivery mechanism, not a
 /// stand-in for one. Must run before any parallel work spins the pool up, hence: in `main`.
 fn publish_thread_count(cfg: &Config) {
-    if let Some(t) = cfg.device.threads {
+    if let Some(t) = cfg.device.threads.or_else(default_thread_count) {
         // TODO(edition-2024): `std::env::set_var` becomes an `unsafe fn` in edition 2024, so THIS
         // call is the migration point for this crate — bumping the edition will not compile until
         // it is wrapped in `unsafe { .. }` with the argument below written out as its SAFETY note.
@@ -786,6 +787,19 @@ fn publish_thread_count(cfg: &Config) {
         // does-it-work-at-all argument are the same argument.
         std::env::set_var("RAYON_NUM_THREADS", t.to_string());
     }
+}
+
+/// The thread count when `-t` is unset: one per PHYSICAL core where [`infr_plat::cpu`] can count
+/// them and SMT doubles the logical count, else `None` — rayon's own default, every logical
+/// processor. The CPU backend's spin pool runs a worker per thread, and two spinning on one core's
+/// hyperthreads contend rather than help (see `physical_cores` for the measurement). An inherited
+/// `RAYON_NUM_THREADS` is the user's explicit choice and is left alone.
+fn default_thread_count() -> Option<usize> {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return None;
+    }
+    let logical = std::thread::available_parallelism().ok()?.get();
+    infr_plat::cpu::physical_cores().filter(|&cores| cores < logical)
 }
 
 /// `prof.out` → the profiler runtime's report destination.

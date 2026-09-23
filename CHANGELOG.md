@@ -112,6 +112,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **On Windows, `-t` defaults to one thread per physical core.** It defaulted to
+  every logical processor, so with SMT the CPU backend's spin pool put two
+  workers on each core's hyperthreads, where they contend instead of helping. On
+  a Ryzen 9 9950X3D (16 cores, 32 threads), Qwen3-0.6B Q4_K_M on `--dev cpu`
+  decodes at ~127 tok/s by default instead of ~65, and prefills at ~660 tok/s
+  instead of ~580; GPU runs are unaffected. `-t` or `RAYON_NUM_THREADS` still
+  set it explicitly. The core count comes from the new
+  `infr_plat::cpu::physical_cores`; other platforms keep the logical-count
+  default until the same measurement is made there.
 - **Windows builds target the host CPU, like Linux builds.**
   `.cargo/config.toml` set `target-cpu=native` for Linux only, so on Windows the
   CPU backend's dequant and matvec loops never vectorized to AVX2/AVX-512. On a

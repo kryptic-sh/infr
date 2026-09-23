@@ -2676,6 +2676,14 @@ a hot path
   CMake build puts the binary in `build*/bin/Release/`. `.exe` is now appended
   (`diffusion_cli_file`); the `Release` subdirectory is not tried.
   `INFR_LLAMA_DIFFUSION_CLI` is the workaround.
+- **The iGPU's first submit cap costs ~5% decode on small models.** On the Ryzen
+  iGPU under Windows, Qwen3-0.6B decodes at 52.5 tok/s with the integrated
+  default (`initial_submit_dispatch_cap`, 128 dispatches per submit) and 55.0
+  with `INFR_SUBMIT_DISPATCHES=256` or `0`; prefill is unchanged. Left alone:
+  the cap guards a large model's first forward against TDR before the adaptive
+  splitter has measured anything, and the splitter only ever ratchets down. A
+  per-model starting cap would need the same watchdog evidence the current one
+  was set from (see [igpu.md](igpu.md)).
 - **Declined: keeping an existing blob instead of renaming over it.** The review
   suspected `download::commit`'s `fs::rename` over an already-cached blob would
   fail on Windows while another infr has that blob memory-mapped. Tested on

@@ -212,6 +212,134 @@ fn run_mmq(be: &VulkanBackend, dt: DType) {
     let tol = if min_carrying { 5e-2 } else { 1e-3 };
     let got = download_rows(be, outs[0].as_ref(), mpad);
     assert_parity(&got, &want, tol, &label);
+    if dt == DType::Q4K {
+        let mut seen = [[0u16; 2]; 4];
+        for block in bank.as_chunks::<144>().0 {
+            for (i, &byte) in block[16..144].iter().enumerate() {
+                seen[i % 4][0] |= 1 << (byte & 15);
+                seen[i % 4][1] |= 1 << (byte >> 4);
+            }
+        }
+        assert_eq!(seen, [[u16::MAX; 2]; 4], "Q4K nibble coverage");
+
+        let mut prefixed = synth_bank(dt, 256, 0x1234);
+        prefixed.extend_from_slice(&bank);
+        let bound = be.alloc(prefixed.len(), BufferUsage::Weights).unwrap();
+        be.upload(bound.as_ref(), &prefixed).unwrap();
+        let mut arena_bytes = vec![0xa5; 256];
+        arena_bytes.extend_from_slice(&prefixed);
+        let (arena, addr) = be.alloc_arena_bda(arena_bytes.len()).unwrap();
+        be.upload(arena.as_ref(), &arena_bytes).unwrap();
+        let route_outs: Vec<_> = (0..3)
+            .map(|_| be.alloc(mpad * N * 4, BufferUsage::Activations).unwrap())
+            .collect();
+
+        let banks: Vec<_> = (0..5)
+            .map(|e| {
+                if e == 0 {
+                    bank.clone()
+                } else {
+                    synth_bank(dt, N * K, 0x1234 + e)
+                }
+            })
+            .collect();
+        for (i, a) in banks.iter().enumerate() {
+            for b in &banks[i + 1..] {
+                assert_ne!(a, b, "pager banks must differ");
+            }
+        }
+        let mut pager = infr_vulkan::pager::GpuPager::new(be, 5, 3, bank.len()).unwrap();
+        let staging = be.alloc(bank.len(), BufferUsage::Staging).unwrap();
+        let first_slot = pager
+            .ensure_resident(be, staging.as_ref(), 0, &banks[0])
+            .unwrap();
+        let evictions = pager.stats().evictions;
+        for e in [1u32, 2, 3, 4] {
+            pager
+                .ensure_resident(be, staging.as_ref(), e, &banks[e as usize])
+                .unwrap();
+        }
+        assert!(!pager.is_resident(0), "expert zero must be evicted");
+        let reloaded_slot = pager
+            .ensure_resident(be, staging.as_ref(), 0, &banks[0])
+            .unwrap();
+        assert!(pager.stats().evictions > evictions, "pager must churn");
+        assert_ne!(first_slot, reloaded_slot, "expert zero must move slots");
+        pager.flush_lut(be).unwrap();
+        let mut lut = [0u32; 5];
+        be.download(pager.lut_buffer(), bytemuck::cast_slice_mut(&mut lut))
+            .unwrap();
+        assert_eq!(lut[0], reloaded_slot);
+        let counts = be.alloc(5 * 4, BufferUsage::Activations).unwrap();
+        let offsets = be.alloc(5 * 4, BufferUsage::Activations).unwrap();
+        be.upload(
+            counts.as_ref(),
+            bytemuck::cast_slice(&[M as u32, 0, 0, 0, 0]),
+        )
+        .unwrap();
+        be.upload(
+            offsets.as_ref(),
+            bytemuck::cast_slice(&[0u32, M as u32, M as u32, M as u32, M as u32]),
+        )
+        .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.matmul_mmq_q4k(
+            qa.as_ref(),
+            dact.as_ref(),
+            sact.as_ref(),
+            bound.as_ref(),
+            256,
+            route_outs[0].as_ref(),
+            M,
+            K,
+            N,
+        );
+        rec.matmul_mmq_at(
+            dt,
+            qa.as_ref(),
+            dact.as_ref(),
+            sact.as_ref(),
+            addr + 256,
+            256,
+            route_outs[1].as_ref(),
+            M,
+            K,
+            N,
+        );
+        rec.matmul_mmq_experts_paged(
+            dt,
+            "expert_gateup",
+            qa.as_ref(),
+            dact.as_ref(),
+            Some(sact.as_ref()),
+            pager.arena_addr(),
+            pager.slot_bytes() as u32,
+            pager.lut_buffer(),
+            0,
+            counts.as_ref(),
+            offsets.as_ref(),
+            route_outs[2].as_ref(),
+            M,
+            K,
+            N,
+            5,
+            1,
+        );
+        rec.finish().unwrap();
+        assert_eq!(got.len(), M * N);
+        assert!(got.iter().all(|v| v.is_finite()));
+        for (route, out) in ["SSBO", "offset BDA", "paged reload"]
+            .iter()
+            .zip(&route_outs)
+        {
+            let actual = download_rows(be, out.as_ref(), mpad);
+            assert_eq!(actual.len(), got.len());
+            for (i, (a, b)) in actual.iter().zip(&got).enumerate() {
+                assert!(a.is_finite(), "{route}: non-finite at {i}");
+                assert_eq!(a.to_bits(), b.to_bits(), "{route}: mismatch at {i}");
+            }
+        }
+    }
     println!("{label}: OK");
 }
 

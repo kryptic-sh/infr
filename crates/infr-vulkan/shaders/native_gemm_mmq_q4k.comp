@@ -184,12 +184,13 @@ void main() {
             uint sub = (gelem / 32u) & 7u;
             uint qbase = bd + 16u + (sub >> 1u) * 32u;
             bool lo = (sub & 1u) == 0u;
-            uint qp = 0u;
-            for (uint b = 0u; b < 4u; b++) {
-                uint qbyte = rb(qbase + j * 4u + b);
-                uint val = lo ? (qbyte & 0xFu) : (qbyte >> 4u);
-                qp |= val << (b * 8u);
-            }
+            uint wi = (qbase >> 2u) + j;
+#if defined(PAGED) || defined(STREAMED)
+            uint w = arena_word(wi);
+#else
+            uint w = nw[wi];
+#endif
+            uint qp = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
             Bs[cc * SP + j] = qp;
         }
         barrier();

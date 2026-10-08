@@ -152,6 +152,42 @@ cross-process sharing it probes is POSIX-only (backlog B69).
   `infr-llama/tests/cpu_backend.rs`). Re-bless with `INFR_BLESS=1` on both
   platforms when a golden legitimately moves.
 
+## Small-model iGPU baseline (2026-10-08)
+
+Measured headlessly on `Vulkan1`, the Ryzen RDNA2 iGPU with AMD's proprietary
+Windows driver, using the cached `unsloth/Qwen3-0.6B-GGUF:Q4_K_M` model. The
+infr baseline was `af2355a`, built with Rust 1.98.1; the comparison used
+llama.cpp's `b11491` Windows Vulkan release. These are baseline measurements,
+not an optimization result.
+
+Both tools used `-r 3`, depth zero and f16 KV. infr used `--ctx 2048` and its
+default `ubatch=128`, `submit_cap=128`; llama-bench used `-ub 128 -fa on`. Each
+leg ran infr prefill/decode, then llama-bench prefill/decode, serially on the
+same iGPU. Prefill used `-p 128 -n 0`; decode used `-p 0 -n 64`.
+
+| Workload | Tool        | Leg | Individual repetitions (tok/s) |
+| -------- | ----------- | --- | ------------------------------ |
+| Prefill  | infr        | 1   | 356.57, 356.41, 356.23         |
+| Prefill  | llama-bench | 1   | 434.433, 433.707, 435.839      |
+| Prefill  | infr        | 2   | 355.83, 355.44, 355.47         |
+| Prefill  | llama-bench | 2   | 434.356, 434.082, 433.67       |
+| Decode   | infr        | 1   | 53.86, 53.80, 53.91            |
+| Decode   | llama-bench | 1   | 56.057, 55.7353, 56.135        |
+| Decode   | infr        | 2   | 53.82, 53.77, 53.78            |
+| Decode   | llama-bench | 2   | 55.7126, 56.6712, 56.5547      |
+
+A separate `INFR_PROF_OPS=1` prefill run attributed 61.16% of device time to
+`native_gemm_mmq_q4k_streamed`, 14.48% to `native_gemm_mmq_q6k_streamed`, and
+17.67% to `attn_nc_fa_hd128`. Backlog B77 records the next experiment.
+
+After matching CI's Rust 1.99 toolchain, workspace formatting, Clippy, tests
+with `INFR_DEV=Vulkan1 --test-threads 1`, the release CLI build, and the
+Apple-target cross-lint passed. The explicitly enabled GPU suites
+`nc_gemm_parity`, `pager_mmq_parity`, and `mmq_wide_bn_determinism` also passed
+on the iGPU. Cached Qwen3-0.6B, Gemma-3-1B, and Qwen3.5-0.8B Q4_K_M models
+answered the capital-of-France smoke prompt correctly. This does not cover the
+entire ignored GPU suite or other GPU vendors.
+
 ## Troubleshooting
 
 - **`failed to run glslc`** — the Vulkan SDK is missing, or neither `PATH` nor

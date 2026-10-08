@@ -2765,9 +2765,19 @@ Coverage gaps, stated plainly:
   The f16 probe, the misaligned-offset test fix and the `INFR_DEV` test knob
   were run on Windows GPUs only; the Linux RADV box should rerun the ignored GPU
   suites once.
-- **iGPU performance against llama.cpp on Windows.** No `llama-bench` was
-  installed, so the iGPU numbers in [windows.md](windows.md) have no comparison.
-  `infr compare` is the tool once it is.
+- **iGPU prefill still trails llama.cpp on Windows.** The Qwen3-0.6B Q4_K_M
+  baseline and every repeat are now in [windows.md](windows.md), measured
+  against llama.cpp `b11491`. Profiling identified
+  `native_gemm_mmq_q4k_streamed` as the main prefill cost. The next experiment
+  is replacing the byte-at-a-time quant unpack in
+  `crates/infr-vulkan/shaders/native_gemm_mmq_q4k.comp` with packed word reads,
+  following the existing Q4_K `wdec` in `native_mmv_mrow.comp`. This is a
+  candidate, not a measured improvement: no shader change was made before the
+  session ended. Verify numerical parity for bound, resident-BDA and paged
+  weights and alternate baseline/candidate benchmarks using the same compiler
+  before accepting it. Comparisons on other small models and the full ignored
+  GPU suite remain unrun; `nc_gemm_parity`, `pager_mmq_parity`, and
+  `mmq_wide_bn_determinism` did pass on the iGPU.
 - **Emoji through console input.** Typed input round-tripped `café`; an emoji
   came back as `�` in the screen scrape, but conhost's screen buffer cannot draw
   astral characters either, so whether the bytes the model received were right

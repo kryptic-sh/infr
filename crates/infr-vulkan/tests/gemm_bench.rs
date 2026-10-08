@@ -1,42 +1,173 @@
-//! Serialized micro-bench of the Q4_K prefill GEMM variants at qwen35-in-proj shape
-//! ([512,1024]×[1024,6144]): mmq (dp4a int8), native 64×64 coopmat, native 8-warp warptile.
-//! WAW hazards on the shared output buffer serialize the repeated dispatches, so wall/REPS is the
-//! per-GEMM cost. Weights are zeros (perf only). Run: cargo test -p infr-vulkan --test gemm_bench -- --ignored --nocapture
+//! Perf-only micro-benchmarks with zero-filled weights and activations; no parity claim.
+//! Integrated devices use reduced shapes before recording any work. Unsupported direct coopmat
+//! variants are reported, never replaced by a fallback under the same label. Timings include bounded
+//! record/submit/wait batches, and stopped samples do not produce throughput statistics.
+//! Run: cargo test -p infr-vulkan --test gemm_bench --release -- --include-ignored --nocapture --test-threads=1
 
+mod bench_support;
+
+use bench_support::backend_with as be_with;
 use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_vulkan::VulkanBackend;
 
-/// A backend on an EXPLICIT Vulkan kernel-tier configuration.
-///
-/// The GEMM tier knobs (`INFR_NO_GEMM_WARP`, `INFR_GEMM_WIDE_TILE`, `INFR_NO_SMALL_BM`,
-/// `INFR_NO_BM16`) are resolved at BACKEND CONSTRUCTION now, so a bench that used to flip an env
-/// var between two runs on one device gets one device per tier instead. That is also what makes
-/// these benches honest: an env flip after `VulkanBackend::new()` would silently be a no-op and the
-/// two arms would measure the same kernel.
-fn be_with(f: impl FnOnce(&mut infr_core::config::VulkanCfg)) -> VulkanBackend {
-    let mut cfg = infr_core::config::Config::default();
-    f(&mut cfg.kernels.vulkan);
-    VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap()
+fn profile<T>(be: &VulkanBackend, small: T, discrete: T) -> T {
+    if be.capabilities().integrated {
+        small
+    } else {
+        discrete
+    }
+}
+
+fn supported(available: bool, variant: &str) -> bool {
+    if !available {
+        println!("{variant}: unsupported");
+    }
+    available
+}
+
+// Static arrays in deltanet_chunked.comp; runtime kd/vd do not shrink these.
+const DELTANET_CHUNKED_SHARED_BYTES: u32 = (2 * 32 * 128 + 32 * 32 + 32 * 32 + 5 * 32 + 256) * 4;
+// deltanet_prep.comp is the split peak: f32 kn/qn/red/nrm and f16 knf/qnf.
+// deltanet_scan.comp uses (128*8 + 32*32 + 32*8 + 3*32) f32s; gates has no shared arrays.
+const DELTANET_SPLIT_SHARED_BYTES: u32 = (2 * 32 * 128 + 256 + 32) * 4 + 2 * 32 * 128 * 2;
+
+fn shared_capacity(available: u32, required: u32, variant: &str) -> bool {
+    supported(
+        available >= required,
+        &format!("{variant} (shared memory: required={required} available={available} bytes)"),
+    )
+}
+
+#[test]
+fn deltanet_shared_capacity_boundaries() {
+    assert_eq!(DELTANET_CHUNKED_SHARED_BYTES, 42_624);
+    assert_eq!(DELTANET_SPLIT_SHARED_BYTES, 50_304);
+    for required in [DELTANET_CHUNKED_SHARED_BYTES, DELTANET_SPLIT_SHARED_BYTES] {
+        assert!(!shared_capacity(32_768, required, "DeltaNet"));
+        assert!(!shared_capacity(required - 1, required, "DeltaNet"));
+        assert!(shared_capacity(required, required, "DeltaNet"));
+        assert!(shared_capacity(required + 1, required, "DeltaNet"));
+    }
+    assert!(!shared_capacity(
+        DELTANET_CHUNKED_SHARED_BYTES,
+        DELTANET_SPLIT_SHARED_BYTES,
+        "deltanet_split",
+    ));
+}
+
+fn routing_offsets(counts: &[u32], tokens: usize, pairs: usize) -> Vec<u32> {
+    let mut total = 0u32;
+    let offsets = counts
+        .iter()
+        .map(|&count| {
+            assert!(count as usize <= tokens, "expert count exceeds token bound");
+            let offset = total;
+            total += count;
+            assert!(
+                total as usize <= pairs,
+                "expert segment exceeds packed buffer"
+            );
+            offset
+        })
+        .collect();
+    assert_eq!(total as usize, pairs);
+    offsets
+}
+
+fn bank_bytes(dtype: infr_core::DType, experts: usize, k: usize, n: usize) -> usize {
+    let (elements, bytes) = infr_gguf::block_layout(dtype);
+    assert!(k.is_multiple_of(elements));
+    experts * n * (k / elements) * bytes
+}
+
+const SMALL_SKEW: [u32; 8] = [32, 0, 17, 7, 3, 2, 2, 1];
+const SMALL_BALANCED: &[(&str, usize, usize, usize, usize, usize)] = &[
+    ("integrated balanced low", 512, 256, 8, 2, 32),
+    ("integrated balanced high", 512, 256, 8, 2, 132),
+];
+
+#[test]
+fn integrated_routing_and_bank_layout() {
+    assert!(!supported(false, "unsupported capability regression"));
+    assert!(supported(true, "supported capability regression"));
+    assert_eq!(
+        routing_offsets(&SMALL_SKEW, 32, 64),
+        [0, 32, 32, 49, 56, 59, 61, 63]
+    );
+    assert!(SMALL_SKEW.contains(&0));
+    assert!(SMALL_SKEW.iter().any(|c| !c.is_multiple_of(32)));
+    let mut averages = Vec::new();
+    for &(_, ne, nff, experts, used, tokens) in SMALL_BALANCED {
+        assert_eq!((ne, nff, experts), (512, 256, 8));
+        let pairs = tokens * used;
+        let counts = vec![(pairs / experts) as u32; experts];
+        let offsets = routing_offsets(&counts, tokens, pairs);
+        assert_eq!(
+            offsets.last().unwrap() + counts.last().unwrap(),
+            pairs as u32
+        );
+        averages.push(pairs / experts);
+    }
+    assert_eq!(averages, [8, 33]);
+    assert_eq!(
+        bank_bytes(infr_core::DType::Q6K, 8, 256, 512),
+        8 * 512 * 210
+    );
+    assert_eq!(
+        bank_bytes(infr_core::DType::Q5K, 8, 256, 512),
+        8 * 512 * 176
+    );
+}
+
+#[test]
+#[should_panic(expected = "expert count exceeds token bound")]
+fn routing_rejects_over_bound() {
+    routing_offsets(&[33], 32, 33);
+}
+
+#[test]
+#[should_panic(expected = "expert segment exceeds packed buffer")]
+fn routing_rejects_overflowing_segment() {
+    routing_offsets(&[32, 1], 32, 32);
+}
+
+#[test]
+#[should_panic(expected = "assertion `left == right` failed")]
+fn routing_rejects_missing_pairs() {
+    routing_offsets(&[31], 32, 32);
 }
 
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn q4k_gemm_variants_bench() {
-    let (m, k, n) = (512usize, 1024usize, 6144usize);
     let reps = 20usize;
     // `mmq` = the dp4a int8 arm; `native` = `matmul_native`, whose tile pick reads
     // `kernels.vulkan.gemm_warp` off the backend it is recorded on.
     let run = |be: &VulkanBackend, name: &str, mmq: bool| {
+        if !supported(
+            if mmq {
+                be.capabilities().i8_dot
+            } else {
+                be.capabilities().f16_coopmat()
+            },
+            name,
+        ) {
+            return;
+        }
+        let (m, k, n) = profile(be, (8usize, 512usize, 256usize), (512, 1024, 6144));
         // Q4_K: 144 bytes / 256 elems
         let wbytes = n * k / 256 * 144;
         let w = be.alloc(wbytes, BufferUsage::Weights).unwrap();
-        let a = be.alloc(m * k * 4, BufferUsage::Activations).unwrap();
-        let c = be.alloc(m * n * 4, BufferUsage::Activations).unwrap();
+        let mpad = m.div_ceil(64) * 64;
+        let a = be.alloc(mpad * k * 4, BufferUsage::Activations).unwrap();
+        let c = be
+            .alloc(m.div_ceil(64) * 64 * n * 4, BufferUsage::Activations)
+            .unwrap();
         // mmq activation quant buffers
         let nblk = k / 32;
-        let qa = be.alloc(m * k, BufferUsage::Activations).unwrap();
-        let dact = be.alloc(m * nblk * 2, BufferUsage::Activations).unwrap();
-        let sact = be.alloc(m * nblk * 2, BufferUsage::Activations).unwrap();
+        let qa = be.alloc(mpad * k, BufferUsage::Activations).unwrap();
+        let dact = be.alloc(mpad * nblk * 2, BufferUsage::Activations).unwrap();
+        let sact = be.alloc(mpad * nblk * 2, BufferUsage::Activations).unwrap();
         let f = |rec: &infr_vulkan::Recorder| {
             if mmq {
                 rec.quant_q8(a.as_ref(), qa.as_ref(), dact.as_ref(), sact.as_ref(), m, k);
@@ -64,16 +195,9 @@ fn q4k_gemm_variants_bench() {
             }
         };
         // warmup (pipeline compile)
-        let rec = be.recorder().unwrap();
-        f(&rec);
-        rec.finish().unwrap();
-        let t0 = std::time::Instant::now();
-        let rec = be.recorder().unwrap();
-        for _ in 0..reps {
-            f(&rec);
-        }
-        rec.finish().unwrap();
-        let us = t0.elapsed().as_micros() as f64 / reps as f64;
+        let Some(us) = bench_support::time(be, name, reps, f).unwrap().mean_us() else {
+            return;
+        };
         let gflops = (2.0 * m as f64 * n as f64 * k as f64) / (us * 1e3);
         println!("{name:>10}: {us:8.1} us/GEMM  ({gflops:.0} GFLOP/s)");
     };
@@ -81,8 +205,8 @@ fn q4k_gemm_variants_bench() {
     let be = be_with(|_| {});
     run(&be, "mmq", true);
     let be64 = be_with(|v| v.gemm_warp = false);
-    run(&be64, "native64", false);
-    run(&be, "warp", false);
+    run(&be64, "no-warp-config", false);
+    run(&be, "default-config", false);
 }
 
 /// Sum the real qwen35 prefill GEMM inventory (one 512-row chunk) on the warp kernel — ground
@@ -90,8 +214,13 @@ fn q4k_gemm_variants_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn qwen35_gemm_inventory_bench() {
-    let be = VulkanBackend::new().unwrap();
-    let m = 512usize;
+    let Some(be) = bench_support::optional_backend() else {
+        return;
+    };
+    if !supported(be.capabilities().f16_coopmat(), "direct coopmat variants") {
+        return;
+    }
+    let m = profile(&be, 64usize, 512);
     // (k, n, count): DeltaNet-layer in-proj/out/FFN ×18, attention-layer qkv/out/FFN ×6
     let shapes = [
         (1024usize, 6144usize, 18usize), // qkvz in-proj
@@ -105,23 +234,10 @@ fn qwen35_gemm_inventory_bench() {
     let c = be.alloc(m * 6144 * 4, BufferUsage::Activations).unwrap();
     let mut total = 0f64;
     for (k, n, cnt) in shapes {
+        let (k, n) = profile(&be, (512, 256), (k, n));
         let w = be.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
         // warmup
-        let rec = be.recorder().unwrap();
-        rec.matmul_native(
-            infr_core::DType::Q4K,
-            a.as_ref(),
-            w.as_ref(),
-            c.as_ref(),
-            m,
-            k,
-            n,
-        );
-        rec.finish().unwrap();
-        let reps = 10usize;
-        let t0 = std::time::Instant::now();
-        let rec = be.recorder().unwrap();
-        for _ in 0..reps {
+        let Some(us) = bench_support::time(&be, &format!("qwen35 m={m} k={k} n={n}"), 10, |rec| {
             rec.matmul_native(
                 infr_core::DType::Q4K,
                 a.as_ref(),
@@ -131,16 +247,18 @@ fn qwen35_gemm_inventory_bench() {
                 k,
                 n,
             );
-        }
-        rec.finish().unwrap();
-        let us = t0.elapsed().as_micros() as f64 / reps as f64;
+        })
+        .unwrap()
+        .mean_us() else {
+            return;
+        };
         println!(
             "[{k}x{n}] {us:8.1} us  ×{cnt} = {:.1} ms",
             us * cnt as f64 / 1e3
         );
         total += us * cnt as f64 / 1e3;
     }
-    println!("qwen35 512-row chunk GEMM total: {total:.1} ms");
+    println!("qwen35 profile-scaled m={m} GEMM total: {total:.1} ms");
 }
 
 /// Sum the real qwen3-0.6B Q8_0 prefill GEMM inventory (m=512) per kernel variant — the pp512
@@ -149,7 +267,6 @@ fn qwen35_gemm_inventory_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn qwen3_gemm_inventory_bench() {
-    let m = 512usize;
     // (k, n, count/layer-set): q, k+v, o, gate+up (fused), down — 28 layers.
     let shapes = [
         (1024usize, 2048usize, 28usize), // q
@@ -160,41 +277,36 @@ fn qwen3_gemm_inventory_bench() {
     ];
     // One backend per tile tier (`kernels.vulkan.gemm_warp`), each with its own buffers.
     for (variant, be) in [
-        ("warp", be_with(|_| {})),
-        ("native64", be_with(|v| v.gemm_warp = false)),
+        ("default-config", be_with(|_| {})),
+        ("no-warp-config", be_with(|v| v.gemm_warp = false)),
     ] {
+        if !supported(be.capabilities().f16_coopmat(), variant) {
+            continue;
+        }
+        let m = profile(&be, 64usize, 512);
         let a = be.alloc(m * 3072 * 4, BufferUsage::Activations).unwrap();
         let c = be.alloc(m * 6144 * 4, BufferUsage::Activations).unwrap();
         let mut total = 0f64;
         for (k, n, cnt) in shapes {
+            let (k, n) = profile(&be, (512, 256), (k, n));
             let w = be.alloc(n * k / 32 * 34, BufferUsage::Weights).unwrap();
-            let rec = be.recorder().unwrap(); // warmup (pipeline compile)
-            rec.matmul_native(
-                infr_core::DType::Q8_0,
-                a.as_ref(),
-                w.as_ref(),
-                c.as_ref(),
-                m,
-                k,
-                n,
-            );
-            rec.finish().unwrap();
-            let reps = 20usize;
-            let t0 = std::time::Instant::now();
-            let rec = be.recorder().unwrap();
-            for _ in 0..reps {
-                rec.matmul_native(
-                    infr_core::DType::Q8_0,
-                    a.as_ref(),
-                    w.as_ref(),
-                    c.as_ref(),
-                    m,
-                    k,
-                    n,
-                );
-            }
-            rec.finish().unwrap();
-            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            let Some(us) =
+                bench_support::time(&be, &format!("{variant} m={m} k={k} n={n}"), 20, |rec| {
+                    rec.matmul_native(
+                        infr_core::DType::Q8_0,
+                        a.as_ref(),
+                        w.as_ref(),
+                        c.as_ref(),
+                        m,
+                        k,
+                        n,
+                    );
+                })
+                .unwrap()
+                .mean_us()
+            else {
+                return;
+            };
             let tflops = (2.0 * m as f64 * k as f64 * n as f64) / us / 1e6;
             println!(
                 "[{variant:>8}] [{k}x{n}] {us:8.1} us  {tflops:5.1} TF  ×{cnt} = {:.2} ms",
@@ -202,7 +314,7 @@ fn qwen3_gemm_inventory_bench() {
             );
             total += us * cnt as f64 / 1e3;
         }
-        println!("[{variant:>8}] qwen3-0.6B m=512 GEMM total: {total:.1} ms\n");
+        println!("[{variant:>8}] qwen3 profile-scaled m={m} GEMM total: {total:.1} ms\n");
     }
 }
 
@@ -212,8 +324,11 @@ fn qwen3_gemm_inventory_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn qwen3_8b_gemm_shapes_bench() {
-    let be = VulkanBackend::new().unwrap();
-    let m = 512usize;
+    let be = bench_support::backend();
+    if !supported(be.capabilities().f16_coopmat(), "direct coopmat variants") {
+        return;
+    }
+    let m = profile(&be, 64usize, 512);
     let shapes = [
         (4096usize, 6144usize, "qkv"),
         (4096, 4096, "o"),
@@ -224,42 +339,44 @@ fn qwen3_8b_gemm_shapes_bench() {
     let a16 = be.alloc(m * 12288 * 2, BufferUsage::Activations).unwrap();
     let c = be.alloc(m * 24576 * 4, BufferUsage::Activations).unwrap();
     for (k, n, label) in shapes {
+        let (k, n) = profile(&be, (512, 256), (k, n));
         let w = be.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
         for f16a in [false, true] {
-            let run = |reps: usize| {
-                let rec = be.recorder().unwrap();
-                for _ in 0..reps {
-                    if f16a {
-                        rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
-                        rec.matmul_native_f16a(
-                            infr_core::DType::Q4K,
-                            a16.as_ref(),
-                            w.device_addr().unwrap(),
-                            0,
-                            c.as_ref(),
-                            m,
-                            k,
-                            n,
-                        );
-                    } else {
-                        rec.matmul_native(
-                            infr_core::DType::Q4K,
-                            a.as_ref(),
-                            w.as_ref(),
-                            c.as_ref(),
-                            m,
-                            k,
-                            n,
-                        );
-                    }
+            let run = |rec: &infr_vulkan::Recorder| {
+                if f16a {
+                    rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
+                    rec.matmul_native_f16a(
+                        infr_core::DType::Q4K,
+                        a16.as_ref(),
+                        w.device_addr().unwrap(),
+                        0,
+                        c.as_ref(),
+                        m,
+                        k,
+                        n,
+                    );
+                } else {
+                    rec.matmul_native(
+                        infr_core::DType::Q4K,
+                        a.as_ref(),
+                        w.as_ref(),
+                        c.as_ref(),
+                        m,
+                        k,
+                        n,
+                    );
                 }
-                rec.finish().unwrap();
             };
-            run(1);
-            let reps = 10usize;
-            let t0 = std::time::Instant::now();
-            run(reps);
-            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            let Some(us) = bench_support::time(
+                &be,
+                &format!("{label} m={m} k={k} n={n} f16a={f16a}"),
+                10,
+                run,
+            )
+            .unwrap()
+            .mean_us() else {
+                continue;
+            };
             let tflops = (2.0 * m as f64 * k as f64 * n as f64) / us / 1e6;
             let tag = if f16a { "f16a" } else { "f32 " };
             println!("[{label:>8}] [{k}x{n}] {tag} {us:8.1} us  {tflops:5.1} TF");
@@ -276,7 +393,6 @@ fn qwen3_8b_gemm_shapes_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn wide_square_occupancy_sweep() {
-    let m = 512usize;
     let dt = infr_core::DType::Q4K;
     let shapes = [
         (4096usize, 4096usize, "o"),
@@ -287,7 +403,11 @@ fn wide_square_occupancy_sweep() {
     // Two backends: the default (n128) tile and the restored BN=256 wide tile
     // (`kernels.vulkan.gemm_wide_tile`, `INFR_GEMM_WIDE_TILE`). Buffers belong to their backend.
     let be = be_with(|_| {});
+    if !supported(be.capabilities().f16_coopmat(), "direct coopmat variants") {
+        return;
+    }
     let bew = be_with(|v| v.gemm_wide_tile = true);
+    let m = profile(&be, 64usize, 512);
     let scratch = |b: &VulkanBackend| {
         (
             b.alloc(m * 12288 * 4, BufferUsage::Activations).unwrap(),
@@ -301,24 +421,18 @@ fn wide_square_occupancy_sweep() {
     let tf = |us: f64, k: usize, n: usize| (2.0 * m as f64 * k as f64 * n as f64) / us / 1e6;
 
     for (k, n, label) in shapes {
+        let (k, n) = profile(&be, (512, 256), (k, n));
         let w = be.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
         let ww = bew.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
         let mpad = m.div_ceil(64) * 64;
-        let time = |b: &VulkanBackend, f: &dyn Fn(&infr_vulkan::Recorder)| -> f64 {
-            let rec = b.recorder().unwrap();
-            f(&rec);
-            rec.finish().unwrap(); // warmup (pipeline compile)
-            let t0 = std::time::Instant::now();
-            let rec = b.recorder().unwrap();
-            for _ in 0..reps {
-                f(&rec);
-            }
-            rec.finish().unwrap();
-            t0.elapsed().as_micros() as f64 / reps as f64
+        let time = |b: &VulkanBackend, f: &dyn Fn(&infr_vulkan::Recorder)| {
+            bench_support::time(b, &format!("{label} m={m} k={k} n={n}"), reps, f)
+                .unwrap()
+                .mean_us()
         };
 
         // wide ag (old BN=256 tile, restored via `kernels.vulkan.gemm_wide_tile`)
-        let us = time(&bew, &|rec| {
+        let Some(us) = time(&bew, &|rec| {
             rec.store_f16(aw.as_ref(), a16w.as_ref(), m * k, 0);
             rec.matmul_native_f16a(
                 dt,
@@ -330,14 +444,16 @@ fn wide_square_occupancy_sweep() {
                 k,
                 n,
             );
-        });
+        }) else {
+            continue;
+        };
         println!(
-            "[{label:>5}] [{k}x{n}] wide_ag      {us:7.1} us  {:5.1} TF",
+            "[{label:>5}] [{k}x{n}] wide-config  {us:7.1} us  {:5.1} TF",
             tf(us, k, n)
         );
 
         // n128 ag (BN=128 → 2× workgroups) — the new default
-        let us = time(&be, &|rec| {
+        let Some(us) = time(&be, &|rec| {
             rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
             rec.matmul_native_f16a(
                 dt,
@@ -349,9 +465,11 @@ fn wide_square_occupancy_sweep() {
                 k,
                 n,
             );
-        });
+        }) else {
+            continue;
+        };
         println!(
-            "[{label:>5}] [{k}x{n}] n128_ag      {us:7.1} us  {:5.1} TF",
+            "[{label:>5}] [{k}x{n}] default-config {us:7.1} us  {:5.1} TF",
             tf(us, k, n)
         );
 
@@ -360,7 +478,7 @@ fn wide_square_occupancy_sweep() {
             let pk = be
                 .alloc(splits * mpad * n * 4, BufferUsage::Activations)
                 .unwrap();
-            let us = time(&be, &|rec| {
+            let Some(us) = time(&be, &|rec| {
                 rec.store_f16(a.as_ref(), a16.as_ref(), m * k, 0);
                 rec.matmul_native_splitk(
                     dt,
@@ -375,9 +493,11 @@ fn wide_square_occupancy_sweep() {
                     splits,
                     true,
                 );
-            });
+            }) else {
+                continue;
+            };
             println!(
-                "[{label:>5}] [{k}x{n}] sk_ag x{splits}     {us:7.1} us  {:5.1} TF",
+                "[{label:>5}] [{k}x{n}] split-k x{splits}     {us:7.1} us  {:5.1} TF",
                 tf(us, k, n)
             );
         }
@@ -395,6 +515,9 @@ fn wide_n128_crossover_sweep() {
     // One backend per tile (`kernels.vulkan.gemm_wide_tile`) — the arms interleave, so they must be
     // two live devices rather than one device and an env flip between runs.
     let be = be_with(|_| {});
+    if !supported(be.capabilities().f16_coopmat(), "direct coopmat variants") {
+        return;
+    }
     let bew = be_with(|v| v.gemm_wide_tile = true);
     let dt = infr_core::DType::Q4K;
     // (m, k, n): only n%256==0 (wide-eligible). Covers qwen3-0.6b (k=1024, n up to 6144),
@@ -415,8 +538,8 @@ fn wide_n128_crossover_sweep() {
         (64, 4096, 4096),
         (256, 4096, 4096),
     ];
-    let amax = 12288usize;
-    let nmax = 24576usize;
+    let amax = profile(&be, 512usize, 12288);
+    let nmax = profile(&be, 256usize, 24576);
     let a16 = be.alloc(512 * amax * 2, BufferUsage::Activations).unwrap();
     let c = be.alloc(512 * nmax * 4, BufferUsage::Activations).unwrap();
     let a16w = bew.alloc(512 * amax * 2, BufferUsage::Activations).unwrap();
@@ -426,11 +549,12 @@ fn wide_n128_crossover_sweep() {
         "{:>4} {:>6} {:>6} | {:>8} {:>8} | {:>8} {:>8} | winner",
         "m", "k", "n", "wide us", "wideTF", "n128 us", "n128TF"
     );
-    for (m, k, n) in grid {
+    'shape: for (m, k, n) in grid {
+        let (m, k, n) = profile(&be, (64usize, 512, 256), (m, k, n));
         let w = be.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
         let ww = bew.alloc(n * k / 256 * 144, BufferUsage::Weights).unwrap();
         let tf = |us: f64| (2.0 * m as f64 * k as f64 * n as f64) / us / 1e6;
-        let time = |wide: bool| -> f64 {
+        let time = |wide: bool| {
             let (b, aa, cc, wt) = if wide {
                 (&bew, &a16w, &cw, &ww)
             } else {
@@ -448,24 +572,27 @@ fn wide_n128_crossover_sweep() {
                     n,
                 );
             };
-            let rec = b.recorder().unwrap();
-            f(&rec);
-            rec.finish().unwrap(); // warmup
-            let t0 = std::time::Instant::now();
-            let rec = b.recorder().unwrap();
-            for _ in 0..reps {
-                f(&rec);
-            }
-            rec.finish().unwrap();
-            t0.elapsed().as_micros() as f64 / reps as f64
+            bench_support::time(b, &format!("wide-config={wide} m={m} k={k} n={n}"), reps, f)
+                .unwrap()
+                .mean_us()
         };
         // interleave wide/n128 twice, take the min of each (thermal-robust)
         let (mut uw, mut un) = (f64::MAX, f64::MAX);
         for _ in 0..2 {
-            uw = uw.min(time(true));
-            un = un.min(time(false));
+            let Some(wide) = time(true) else {
+                continue 'shape;
+            };
+            let Some(narrow) = time(false) else {
+                continue 'shape;
+            };
+            uw = uw.min(wide);
+            un = un.min(narrow);
         }
-        let win = if un < uw { "n128" } else { "WIDE" };
+        let win = if un < uw {
+            "default-config"
+        } else {
+            "wide-config"
+        };
         let wide_grid = m.div_ceil(64) * (n / 256).max(1);
         println!(
             "{m:>4} {k:>6} {n:>6} | {uw:8.1} {:8.1} | {un:8.1} {:8.1} | {win}  (wg={wide_grid})",
@@ -481,30 +608,29 @@ fn wide_n128_crossover_sweep() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn chained_op_bubble_bench() {
-    let be = VulkanBackend::new().unwrap();
-    let n = 512usize * 1024; // one chunk's hidden activations
+    let be = bench_support::backend();
+    let (rows, cols) = profile(&be, (8usize, 256usize), (512, 1024));
+    let n = rows * cols;
     let a = be.alloc(n * 4, BufferUsage::Activations).unwrap();
     let b = be.alloc(n * 4, BufferUsage::Activations).unwrap();
-    let w = be.alloc(1024 * 4, BufferUsage::Activations).unwrap();
+    let w = be.alloc(cols * 4, BufferUsage::Activations).unwrap();
     for ops in [50usize, 400] {
-        // warmup
-        let rec = be.recorder().unwrap();
-        rec.rmsnorm(a.as_ref(), w.as_ref(), b.as_ref(), 512, 1024, 1e-6);
-        rec.finish().unwrap();
-        let t0 = std::time::Instant::now();
-        let rec = be.recorder().unwrap();
-        for i in 0..ops {
-            // ping-pong a→b→a…: every dispatch RAW-depends on the previous one
-            let (x, y) = if i % 2 == 0 { (&a, &b) } else { (&b, &a) };
-            rec.rmsnorm(x.as_ref(), w.as_ref(), y.as_ref(), 512, 1024, 1e-6);
+        let next = std::cell::Cell::new(false);
+        // One ping-pong dispatch is a logical operation; helper batches stay below the cap.
+        let timing = bench_support::time(
+            &be,
+            &format!("chained rmsnorm rows={rows} cols={cols} requested={ops}"),
+            ops,
+            |rec| {
+                let (x, y) = if next.get() { (&b, &a) } else { (&a, &b) };
+                next.set(!next.get());
+                rec.rmsnorm(x.as_ref(), w.as_ref(), y.as_ref(), rows, cols, 1e-6);
+            },
+        )
+        .unwrap();
+        if let Some(us) = timing.mean_us() {
+            println!("{ops} bounded chained rmsnorm: {us:.1} us/op (includes submission seams)");
         }
-        rec.finish().unwrap();
-        let us = t0.elapsed().as_micros() as f64;
-        println!(
-            "{ops} chained rmsnorm(512x1024): {:.1} us total, {:.1} us/op",
-            us,
-            us / ops as f64
-        );
     }
 }
 
@@ -512,148 +638,151 @@ fn chained_op_bubble_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn qwen35_dn_attn_bench() {
-    let be = VulkanBackend::new().unwrap();
-    let rows = 512usize;
-    let (nv, nk, kd, vd) = (16usize, 16usize, 128usize, 128usize);
-    let q = be
-        .alloc(rows * nk * kd * 4, BufferUsage::Activations)
-        .unwrap();
-    let k = be
-        .alloc(rows * nk * kd * 4, BufferUsage::Activations)
-        .unwrap();
-    let v = be
-        .alloc(rows * nv * vd * 4, BufferUsage::Activations)
-        .unwrap();
-    let b = be.alloc(rows * nv * 4, BufferUsage::Activations).unwrap();
-    let al = be.alloc(rows * nv * 4, BufferUsage::Activations).unwrap();
-    let ac = be.alloc(nv * 4, BufferUsage::Weights).unwrap();
-    let dt = be.alloc(nv * 4, BufferUsage::Weights).unwrap();
-    let st = be
-        .alloc(nv * kd * vd * 4, BufferUsage::Activations)
-        .unwrap();
-    let o = be
-        .alloc(rows * nv * vd * 4, BufferUsage::Activations)
-        .unwrap();
+    let be = bench_support::backend();
+    let rows = profile(&be, 8usize, 512);
+    let (nv, nk, kd, vd) = profile(&be, (2usize, 2usize, 32usize, 32usize), (16, 16, 128, 128));
     let reps = 10usize;
-    let rec = be.recorder().unwrap();
-    rec.deltanet_chunked(
-        q.as_ref(),
-        k.as_ref(),
-        v.as_ref(),
-        b.as_ref(),
-        al.as_ref(),
-        ac.as_ref(),
-        dt.as_ref(),
-        st.as_ref(),
-        o.as_ref(),
-        rows,
-        nv,
-        nk,
-        kd,
-        vd,
-        1e-6,
-    );
-    rec.finish().unwrap();
-    let t0 = std::time::Instant::now();
-    let rec = be.recorder().unwrap();
-    for _ in 0..reps {
-        rec.deltanet_chunked(
-            q.as_ref(),
-            k.as_ref(),
-            v.as_ref(),
-            b.as_ref(),
-            al.as_ref(),
-            ac.as_ref(),
-            dt.as_ref(),
-            st.as_ref(),
-            o.as_ref(),
-            rows,
-            nv,
-            nk,
-            kd,
-            vd,
-            1e-6,
+    for (split_variant, required, variant) in [
+        (false, DELTANET_CHUNKED_SHARED_BYTES, "deltanet_chunked"),
+        (true, DELTANET_SPLIT_SHARED_BYTES, "deltanet_split"),
+    ] {
+        if !shared_capacity(be.max_shared_memory_bytes(), required, variant) {
+            continue;
+        }
+        if split_variant
+            && !supported(
+                be.capabilities().f16_coopmat(),
+                "deltanet_split (f16_coopmat)",
+            )
+        {
+            continue;
+        }
+        let q = be
+            .alloc(rows * nk * kd * 4, BufferUsage::Activations)
+            .unwrap();
+        let k = be
+            .alloc(rows * nk * kd * 4, BufferUsage::Activations)
+            .unwrap();
+        let v = be
+            .alloc(rows * nv * vd * 4, BufferUsage::Activations)
+            .unwrap();
+        let b = be.alloc(rows * nv * 4, BufferUsage::Activations).unwrap();
+        let al = be.alloc(rows * nv * 4, BufferUsage::Activations).unwrap();
+        let ac = be.alloc(nv * 4, BufferUsage::Weights).unwrap();
+        let dt = be.alloc(nv * 4, BufferUsage::Weights).unwrap();
+        let st = be
+            .alloc(nv * kd * vd * 4, BufferUsage::Activations)
+            .unwrap();
+        let o = be
+            .alloc(rows * nv * vd * 4, BufferUsage::Activations)
+            .unwrap();
+        if !split_variant {
+            let timing =
+                bench_support::time(&be, &format!("deltanet_chunked rows={rows}"), reps, |rec| {
+                    rec.deltanet_chunked(
+                        q.as_ref(),
+                        k.as_ref(),
+                        v.as_ref(),
+                        b.as_ref(),
+                        al.as_ref(),
+                        ac.as_ref(),
+                        dt.as_ref(),
+                        st.as_ref(),
+                        o.as_ref(),
+                        rows,
+                        nv,
+                        nk,
+                        kd,
+                        vd,
+                        1e-6,
+                    );
+                })
+                .unwrap();
+            if let Some(us) = timing.mean_us() {
+                println!(
+                    "deltanet_chunked rows={rows}: {us:.1} us/op  ×18 = {:.1} ms/chunk",
+                    us * 18.0 / 1e3
+                );
+            }
+            continue;
+        }
+        // split variant (prep + gates + scan)
+        let nchunk = rows.div_ceil(32);
+        let kn = be
+            .alloc(rows * nk * kd * 4, BufferUsage::Activations)
+            .unwrap();
+        let qn = be
+            .alloc(rows * nk * kd * 4, BufferUsage::Activations)
+            .unwrap();
+        let dkb = be
+            .alloc(nchunk * nk * 1024 * 4, BufferUsage::Activations)
+            .unwrap();
+        let dqb = be
+            .alloc(nchunk * nk * 1024 * 4, BufferUsage::Activations)
+            .unwrap();
+        let bg = be
+            .alloc(nchunk * nv * 32 * 4, BufferUsage::Activations)
+            .unwrap();
+        let gg = be
+            .alloc(nchunk * nv * 32 * 4, BufferUsage::Activations)
+            .unwrap();
+        let split = |rec: &infr_vulkan::Recorder| {
+            rec.deltanet_chunked_split(
+                q.as_ref(),
+                k.as_ref(),
+                v.as_ref(),
+                b.as_ref(),
+                al.as_ref(),
+                ac.as_ref(),
+                dt.as_ref(),
+                st.as_ref(),
+                o.as_ref(),
+                kn.as_ref(),
+                qn.as_ref(),
+                dkb.as_ref(),
+                dqb.as_ref(),
+                bg.as_ref(),
+                gg.as_ref(),
+                rows,
+                nv,
+                nk,
+                kd,
+                vd,
+                1e-6,
+            );
+        };
+        let Some(us) =
+            bench_support::time(&be, &format!("deltanet_split rows={rows}"), reps, split)
+                .unwrap()
+                .mean_us()
+        else {
+            continue;
+        };
+        println!(
+            "deltanet_split   rows={rows}: {us:.1} us/op  ×18 = {:.1} ms/chunk",
+            us * 18.0 / 1e3
         );
     }
-    rec.finish().unwrap();
-    let us = t0.elapsed().as_micros() as f64 / reps as f64;
-    println!(
-        "deltanet_chunked rows=512: {us:.1} us/op  ×18 = {:.1} ms/chunk",
-        us * 18.0 / 1e3
-    );
 
-    // split variant (prep + gates + scan)
-    let nchunk = rows.div_ceil(32);
-    let kn = be
-        .alloc(rows * nk * kd * 4, BufferUsage::Activations)
-        .unwrap();
-    let qn = be
-        .alloc(rows * nk * kd * 4, BufferUsage::Activations)
-        .unwrap();
-    let dkb = be
-        .alloc(nchunk * nk * 1024 * 4, BufferUsage::Activations)
-        .unwrap();
-    let dqb = be
-        .alloc(nchunk * nk * 1024 * 4, BufferUsage::Activations)
-        .unwrap();
-    let bg = be
-        .alloc(nchunk * nv * 32 * 4, BufferUsage::Activations)
-        .unwrap();
-    let gg = be
-        .alloc(nchunk * nv * 32 * 4, BufferUsage::Activations)
-        .unwrap();
-    let split = |rec: &infr_vulkan::Recorder| {
-        rec.deltanet_chunked_split(
-            q.as_ref(),
-            k.as_ref(),
-            v.as_ref(),
-            b.as_ref(),
-            al.as_ref(),
-            ac.as_ref(),
-            dt.as_ref(),
-            st.as_ref(),
-            o.as_ref(),
-            kn.as_ref(),
-            qn.as_ref(),
-            dkb.as_ref(),
-            dqb.as_ref(),
-            bg.as_ref(),
-            gg.as_ref(),
-            rows,
-            nv,
-            nk,
-            kd,
-            vd,
-            1e-6,
-        );
-    };
-    let rec = be.recorder().unwrap();
-    split(&rec);
-    rec.finish().unwrap();
-    let t0 = std::time::Instant::now();
-    let rec = be.recorder().unwrap();
-    for _ in 0..reps {
-        split(&rec);
+    if !supported(
+        be.capabilities().f16_coopmat(),
+        "nonfa attention (f16_coopmat)",
+    ) {
+        return;
     }
-    rec.finish().unwrap();
-    let us = t0.elapsed().as_micros() as f64 / reps as f64;
-    println!(
-        "deltanet_split   rows=512: {us:.1} us/op  ×18 = {:.1} ms/chunk",
-        us * 18.0 / 1e3
-    );
-
     // nonfa attention at qwen35 attn shape: rows=512, kv=822, nh=16, nkv=2, hd=256
-    let (nh, nkv, hd, kv_len) = (16usize, 2usize, 256usize, 822usize);
-    let mpad = 512usize;
+    let (nh, nkv, hd, kv_len) =
+        profile(&be, (2usize, 1usize, 64usize, 128usize), (16, 2, 256, 822));
+    let mpad = rows.div_ceil(64) * 64;
     let kv_pad = kv_len.div_ceil(256) * 256;
     let qb = be
         .alloc(mpad * nh * hd * 2, BufferUsage::Activations)
         .unwrap();
     let kc = be
-        .alloc(kv_len * nkv * hd * 2, BufferUsage::Activations)
+        .alloc(kv_pad * nkv * hd * 2, BufferUsage::Activations)
         .unwrap();
     let vc = be
-        .alloc(kv_len * nkv * hd * 2, BufferUsage::Activations)
+        .alloc(kv_pad * nkv * hd * 2, BufferUsage::Activations)
         .unwrap();
     let at = be
         .alloc(mpad * nh * hd * 4, BufferUsage::Activations)
@@ -664,48 +793,35 @@ fn qwen35_dn_attn_bench() {
     let pv = be
         .alloc(8 * mpad * nh * hd * 4, BufferUsage::Activations)
         .unwrap();
-    let rec = be.recorder().unwrap();
-    rec.attention_prefill_nonfa(
-        qb.as_ref(),
-        kc.as_ref(),
-        vc.as_ref(),
-        at.as_ref(),
-        s.as_ref(),
-        pv.as_ref(),
-        mpad,
-        kv_len,
-        nh,
-        nkv,
-        hd,
-        310,
-        0,
-        0.0,
-    );
-    rec.finish().unwrap();
-    let t0 = std::time::Instant::now();
-    let rec = be.recorder().unwrap();
-    for _ in 0..reps {
-        rec.attention_prefill_nonfa(
-            qb.as_ref(),
-            kc.as_ref(),
-            vc.as_ref(),
-            at.as_ref(),
-            s.as_ref(),
-            pv.as_ref(),
-            mpad,
-            kv_len,
-            nh,
-            nkv,
-            hd,
-            310,
-            0,
-            0.0,
-        );
-    }
-    rec.finish().unwrap();
-    let us = t0.elapsed().as_micros() as f64 / reps as f64;
+    let Some(us) = bench_support::time(
+        &be,
+        &format!("nonfa rows={rows} kv={kv_len} hd={hd}"),
+        reps,
+        |rec| {
+            rec.attention_prefill_nonfa(
+                qb.as_ref(),
+                kc.as_ref(),
+                vc.as_ref(),
+                at.as_ref(),
+                s.as_ref(),
+                pv.as_ref(),
+                mpad,
+                kv_len,
+                nh,
+                nkv,
+                hd,
+                kv_len - rows,
+                0,
+                0.0,
+            );
+        },
+    )
+    .unwrap()
+    .mean_us() else {
+        return;
+    };
     println!(
-        "nonfa attn rows=512 kv=822 hd=256: {us:.1} us/op  ×6 = {:.1} ms/chunk",
+        "nonfa attn rows={rows} kv={kv_len} hd={hd}: {us:.1} us/op  ×6 = {:.1} ms/chunk",
         us * 6.0 / 1e3
     );
 }
@@ -716,10 +832,10 @@ fn qwen35_dn_attn_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn decode_attn_variants_bench() {
-    let be = VulkanBackend::new().unwrap();
-    let (nh, nkv, hd) = (16usize, 8usize, 128usize);
-    let kv_len = 8000usize;
-    let cap = 8065usize;
+    let be = bench_support::backend();
+    let (nh, nkv, hd) = profile(&be, (2usize, 1usize, 64usize), (16, 8, 128));
+    let kv_len = profile(&be, 257usize, 8000);
+    let cap = kv_len + 65;
     let q = be.alloc(nh * hd * 2, BufferUsage::Activations).unwrap();
     let kc = be
         .alloc(cap * nkv * hd * 2, BufferUsage::Activations)
@@ -737,19 +853,16 @@ fn decode_attn_variants_bench() {
     let reps = 200usize;
 
     let run = |name: &str, f: &dyn Fn(&infr_vulkan::Recorder)| {
-        let rec = be.recorder().unwrap();
-        f(&rec);
-        rec.finish().unwrap();
-        let t0 = std::time::Instant::now();
-        let rec = be.recorder().unwrap();
-        for _ in 0..reps {
-            f(&rec);
+        let timing = bench_support::time(
+            &be,
+            &format!("{name} kv={kv_len} cap={cap} nh={nh} hd={hd}"),
+            reps,
+            f,
+        )
+        .unwrap();
+        if let Some(us) = timing.mean_us() {
+            println!("{name}: {us:.1} us/op");
         }
-        rec.finish().unwrap();
-        println!(
-            "{name:>22}: {:8.1} us/op",
-            t0.elapsed().as_micros() as f64 / reps as f64
-        );
     };
 
     // static split (bespoke-style): adaptive chunk for kv=8000
@@ -764,7 +877,7 @@ fn decode_attn_variants_bench() {
     let pacc = be
         .alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)
         .unwrap();
-    run("static split c250", &|rec| {
+    run("static split adaptive", &|rec| {
         rec.attention_kv_split(
             q.as_ref(),
             kc.as_ref(),
@@ -791,7 +904,7 @@ fn decode_attn_variants_bench() {
         );
     });
     // dyn split, same chunks
-    run("dyn split c250", &|rec| {
+    run("dyn split adaptive", &|rec| {
         rec.attention_kv_split_dyn(
             q.as_ref(),
             kc.as_ref(),
@@ -822,7 +935,7 @@ fn decode_attn_variants_bench() {
         .alloc(nh * cap_chunks * hd * 4, BufferUsage::Activations)
         .unwrap();
     let args = be.alloc(16, BufferUsage::Activations).unwrap();
-    run("dynac cap126", &|rec| {
+    run("dynac capacity", &|rec| {
         rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, 64, 0);
         rec.attention_kv_split_dynac(
             q.as_ref(),
@@ -847,7 +960,7 @@ fn decode_attn_variants_bench() {
     });
     // dynac with a TIGHT bake (capacity == live): isolates the dead-workgroup/scan cost from the
     // SELF_CHUNK in-kernel logic cost.
-    run("dynac tight c250", &|rec| {
+    run("dynac tight adaptive", &|rec| {
         rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, 0);
         rec.attention_kv_split_dynac(
             q.as_ref(),
@@ -907,8 +1020,15 @@ fn decode_attn_variants_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn moe_expert_grid_bound_bench() {
-    let be = VulkanBackend::new().unwrap();
-    let (ne, nff, n_expert, n_used, tokens) = (2816usize, 704usize, 128usize, 8usize, 256usize);
+    let be = bench_support::backend();
+    if !supported(be.capabilities().i8_dot, "expert MMQ (i8_dot)") {
+        return;
+    }
+    let (ne, nff, n_expert, n_used, tokens) = profile(
+        &be,
+        (512usize, 256usize, 8usize, 2usize, 32usize),
+        (2816, 704, 128, 8, 256),
+    );
     let n_pairs = tokens * n_used; // 2048
     let npad = n_pairs.div_ceil(64) * 64 + 64;
     let reps = 30usize;
@@ -953,12 +1073,7 @@ fn moe_expert_grid_bound_bench() {
     ) {
         assert_eq!(counts_v.len(), n_expert);
         assert_eq!(counts_v.iter().sum::<u32>() as usize, n_pairs);
-        let mut offsets_v = vec![0u32; n_expert];
-        let mut acc = 0u32;
-        for e in 0..n_expert {
-            offsets_v[e] = acc;
-            acc += counts_v[e];
-        }
+        let offsets_v = routing_offsets(counts_v, tokens, n_pairs);
         let counts = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
         let offsets = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
         be.upload(counts.as_ref(), bytemuck::cast_slice(counts_v))
@@ -968,14 +1083,14 @@ fn moe_expert_grid_bound_bench() {
         (counts, offsets)
     };
 
-    // 16 each, sum 2048.
+    // Balanced counts and a hot expert probe the grid bound independently of the real work.
     let balanced: Vec<u32> = vec![(n_pairs / n_expert) as u32; n_expert];
-    // Skewed: one "hot" expert takes 150 of the 256 tokens' assignments (near the hard ceiling —
-    // a top-k router picks each expert at most once per token, so any expert's count is bounded by
-    // `tokens`=256, never `n_pairs`=2048; see matmul_mmq_experts' doc), the rest share the
-    // remainder — stresses the same bound question under real imbalance instead of the average.
-    let hot = 150u32;
-    let mut skewed = vec![(n_pairs as u32 - hot) / (n_expert as u32 - 1); n_expert];
+    let hot = profile(&be, 29u32, 150);
+    let others = n_expert - profile(&be, 2, 1);
+    let mut skewed = vec![(n_pairs as u32 - hot) / others as u32; n_expert];
+    if be.capabilities().integrated {
+        skewed[1] = 0;
+    }
     skewed[0] = hot;
     {
         let sum: u32 = skewed.iter().sum();
@@ -987,26 +1102,30 @@ fn moe_expert_grid_bound_bench() {
     #[allow(clippy::type_complexity)]
     let run =
         |label: &str, gemm: &dyn Fn(&infr_vulkan::Recorder, usize, &dyn Buffer, &dyn Buffer)| {
-            for (dist_name, counts_v) in [("balanced~16", &balanced), ("skewed", &skewed)] {
+            for (dist_name, counts_v) in [("balanced", &balanced), ("skewed", &skewed)] {
                 let (counts, offsets) = upload_dist(counts_v);
                 let max_real = *counts_v.iter().max().unwrap();
-                for &bound in &[64usize, 128, 192, 256] {
+                for bound in profile(&be, [32usize, 48, 64, 96], [64, 128, 192, 256]) {
                     if (bound as u32) < max_real {
                         continue; // would silently truncate this distribution's hottest expert
                     }
-                    let rec = be.recorder().unwrap();
-                    gemm(&rec, bound, counts.as_ref(), offsets.as_ref()); // warmup (pipeline compile)
-                    rec.finish().unwrap();
-                    let t0 = std::time::Instant::now();
-                    let rec = be.recorder().unwrap();
-                    for _ in 0..reps {
-                        gemm(&rec, bound, counts.as_ref(), offsets.as_ref());
-                    }
-                    rec.finish().unwrap();
-                    let us = t0.elapsed().as_micros() as f64 / reps as f64;
+                    let Some(us) = bench_support::time(
+                        &be,
+                        &format!(
+                            "{label} {dist_name} bound={bound} ne={ne} nff={nff} experts={n_expert}"
+                        ),
+                        reps,
+                        |rec| {
+                            gemm(rec, bound, counts.as_ref(), offsets.as_ref());
+                        },
+                    )
+                    .unwrap()
+                    .mean_us() else {
+                        continue;
+                    };
                     println!(
-                    "[{label:>11}] dist={dist_name:>11} (max={max_real:3}) bound={bound:3}: {us:7.1} us"
-                );
+                        "[{label:>11}] dist={dist_name:>11} (max={max_real:3}) bound={bound:3}: {us:7.1} us"
+                    );
                 }
             }
         };
@@ -1075,7 +1194,10 @@ fn moe_expert_grid_bound_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn moe_expert_row_tile_bench() {
-    let be = VulkanBackend::new().unwrap();
+    let be = bench_support::backend();
+    if !supported(be.capabilities().i8_dot, "expert MMQ (i8_dot)") {
+        return;
+    }
     let reps = 30usize;
 
     // (label, ne, nff, n_expert, real n_used, tokens)
@@ -1089,6 +1211,7 @@ fn moe_expert_row_tile_bench() {
         ("avg~256(pp8000)", 2048, 512, 256, 8, 8192),
     ];
 
+    let shapes = profile(&be, SMALL_BALANCED, shapes);
     for &(label, ne, nff, n_expert, n_used, tokens) in shapes {
         let n_pairs = tokens * n_used;
         let npad = n_pairs.div_ceil(64) * 64 + 64;
@@ -1118,12 +1241,7 @@ fn moe_expert_row_tile_bench() {
         for c in counts_v.iter_mut().take(rem) {
             *c += 1;
         }
-        let mut offsets_v = vec![0u32; n_expert];
-        let mut acc = 0u32;
-        for e in 0..n_expert {
-            offsets_v[e] = acc;
-            acc += counts_v[e];
-        }
+        let offsets_v = routing_offsets(&counts_v, tokens, n_pairs);
         let counts = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
         let offsets = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
         be.upload(counts.as_ref(), bytemuck::cast_slice(&counts_v))
@@ -1133,54 +1251,44 @@ fn moe_expert_row_tile_bench() {
 
         // n_used_probe = n_expert*100 forces avg_rows far past the threshold → BM=64, regardless
         // of the shape's real n_used — the counts/offsets/rows stay the SAME real distribution.
-        for (tile_label, n_used_probe) in [("BM32", n_used), ("BM64", n_expert * 100)] {
-            let rec = be.recorder().unwrap();
-            rec.matmul_mmq_experts(
-                infr_core::DType::Q4K,
-                "bench_gateup",
-                qa.as_ref(),
-                dact.as_ref(),
-                Some(sact.as_ref()),
-                gu_w.as_ref(),
-                0,
-                ne,
-                counts.as_ref(),
-                offsets.as_ref(),
-                gu_c.as_ref(),
-                tokens,
-                ne,
-                2 * nff,
-                n_expert,
-                n_used_probe,
-            );
-            rec.finish().unwrap(); // warmup (pipeline compile)
-            let t0 = std::time::Instant::now();
-            let rec = be.recorder().unwrap();
-            for _ in 0..reps {
-                rec.matmul_mmq_experts(
-                    infr_core::DType::Q4K,
-                    "bench_gateup",
-                    qa.as_ref(),
-                    dact.as_ref(),
-                    Some(sact.as_ref()),
-                    gu_w.as_ref(),
-                    0,
-                    ne,
-                    counts.as_ref(),
-                    offsets.as_ref(),
-                    gu_c.as_ref(),
-                    tokens,
-                    ne,
-                    2 * nff,
-                    n_expert,
-                    n_used_probe,
-                );
-            }
-            rec.finish().unwrap();
-            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+        for (tile_label, n_used_probe) in [
+            ("routing-default", n_used),
+            ("high-average-probe", n_expert * 100),
+        ] {
+            let Some(us) = bench_support::time(
+                &be,
+                &format!("gate_up {label} probe={n_used_probe}"),
+                reps,
+                |rec| {
+                    rec.matmul_mmq_experts(
+                        infr_core::DType::Q4K,
+                        "bench_gateup",
+                        qa.as_ref(),
+                        dact.as_ref(),
+                        Some(sact.as_ref()),
+                        gu_w.as_ref(),
+                        0,
+                        ne,
+                        counts.as_ref(),
+                        offsets.as_ref(),
+                        gu_c.as_ref(),
+                        tokens,
+                        ne,
+                        2 * nff,
+                        n_expert,
+                        n_used_probe,
+                    );
+                },
+            )
+            .unwrap()
+            .mean_us() else {
+                continue;
+            };
             let flops = 2.0 * (n_pairs as f64) * (ne as f64) * (2.0 * nff as f64);
             let tflops = flops / (us * 1e-6) / 1e12;
-            println!("[{label:>20}] tile={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)");
+            println!(
+                "[{label:>20}] config={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)"
+            );
         }
     }
 }
@@ -1195,9 +1303,16 @@ fn moe_expert_row_tile_bench() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn moe_expert_row_tile_bench_down() {
-    let be = VulkanBackend::new().unwrap();
+    let be = bench_support::backend();
+    if !supported(be.capabilities().i8_dot, "expert MMQ (i8_dot)") {
+        return;
+    }
     let reps = 30usize;
-    let (ne, nff, n_expert, n_used) = (2048usize, 512usize, 256usize, 8usize);
+    let (ne, nff, n_expert, n_used) = profile(
+        &be,
+        (512usize, 256usize, 8usize, 2usize),
+        (2048, 512, 256, 8),
+    );
 
     let shapes: &[(&str, usize)] = &[
         ("avg~16", 512),
@@ -1206,6 +1321,14 @@ fn moe_expert_row_tile_bench_down() {
         ("avg~128", 4096),
     ];
 
+    let shapes = profile(
+        &be,
+        &[
+            ("integrated balanced low", 32usize),
+            ("integrated balanced high", 132),
+        ][..],
+        shapes,
+    );
     for &(label, tokens) in shapes {
         let n_pairs = tokens * n_used;
         let npad = n_pairs.div_ceil(64) * 64 + 64;
@@ -1220,7 +1343,7 @@ fn moe_expert_row_tile_bench_down() {
         let down_c = be.alloc(npad * ne * 4, BufferUsage::Activations).unwrap();
         let down_w = be
             .alloc(
-                n_expert * ne * (nff / 256).max(1) * 176,
+                bank_bytes(infr_core::DType::Q5K, n_expert, nff, ne),
                 BufferUsage::Weights,
             )
             .unwrap();
@@ -1231,12 +1354,7 @@ fn moe_expert_row_tile_bench_down() {
         for c in counts_v.iter_mut().take(rem) {
             *c += 1;
         }
-        let mut offsets_v = vec![0u32; n_expert];
-        let mut acc = 0u32;
-        for e in 0..n_expert {
-            offsets_v[e] = acc;
-            acc += counts_v[e];
-        }
+        let offsets_v = routing_offsets(&counts_v, tokens, n_pairs);
         let counts = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
         let offsets = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
         be.upload(counts.as_ref(), bytemuck::cast_slice(&counts_v))
@@ -1244,55 +1362,43 @@ fn moe_expert_row_tile_bench_down() {
         be.upload(offsets.as_ref(), bytemuck::cast_slice(&offsets_v))
             .unwrap();
 
-        for (tile_label, n_used_probe) in [("BM32", n_used), ("BM64", n_expert * 100)] {
-            let rec = be.recorder().unwrap();
-            rec.matmul_mmq_experts(
-                infr_core::DType::Q5K,
-                "bench_down",
-                dqa.as_ref(),
-                dda.as_ref(),
-                Some(dsa.as_ref()),
-                down_w.as_ref(),
-                0,
-                nff,
-                counts.as_ref(),
-                offsets.as_ref(),
-                down_c.as_ref(),
-                tokens,
-                nff,
-                ne,
-                n_expert,
-                n_used_probe,
-            );
-            rec.finish().unwrap();
-            let t0 = std::time::Instant::now();
-            let rec = be.recorder().unwrap();
-            for _ in 0..reps {
-                rec.matmul_mmq_experts(
-                    infr_core::DType::Q5K,
-                    "bench_down",
-                    dqa.as_ref(),
-                    dda.as_ref(),
-                    Some(dsa.as_ref()),
-                    down_w.as_ref(),
-                    0,
-                    nff,
-                    counts.as_ref(),
-                    offsets.as_ref(),
-                    down_c.as_ref(),
-                    tokens,
-                    nff,
-                    ne,
-                    n_expert,
-                    n_used_probe,
-                );
-            }
-            rec.finish().unwrap();
-            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+        for (tile_label, n_used_probe) in [
+            ("routing-default", n_used),
+            ("high-average-probe", n_expert * 100),
+        ] {
+            let Some(us) = bench_support::time(
+                &be,
+                &format!("down {label} probe={n_used_probe}"),
+                reps,
+                |rec| {
+                    rec.matmul_mmq_experts(
+                        infr_core::DType::Q5K,
+                        "bench_down",
+                        dqa.as_ref(),
+                        dda.as_ref(),
+                        Some(dsa.as_ref()),
+                        down_w.as_ref(),
+                        0,
+                        nff,
+                        counts.as_ref(),
+                        offsets.as_ref(),
+                        down_c.as_ref(),
+                        tokens,
+                        nff,
+                        ne,
+                        n_expert,
+                        n_used_probe,
+                    );
+                },
+            )
+            .unwrap()
+            .mean_us() else {
+                continue;
+            };
             let flops = 2.0 * (n_pairs as f64) * (nff as f64) * (ne as f64);
             let tflops = flops / (us * 1e-6) / 1e12;
             println!(
-                "[down {label:>10}] tile={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)"
+                "[down {label:>10}] config={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)"
             );
         }
     }
@@ -1312,20 +1418,15 @@ fn moe_expert_row_tile_bench_down() {
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn dense_small_m_row_tile_bench() {
     let be32 = be_with(|_| {}); // small-tile default: BM=32 within the band
+    if !supported(
+        be32.capabilities().f16_coopmat(),
+        "dense direct coopmat variants",
+    ) {
+        return;
+    }
     let be64 = be_with(|v| v.small_bm = false); // `INFR_NO_SMALL_BM`: BM=64
     let reps = 30usize;
     let ms: &[usize] = &[4, 6, 8, 12, 16, 20, 24, 32, 48, 64];
-
-    fn blk(dtype: infr_core::DType) -> (usize, usize) {
-        use infr_core::DType::*;
-        match dtype {
-            Q4K => (256, 144),
-            Q5K => (256, 176),
-            Q6K => (256, 210),
-            Q8_0 => (32, 34),
-            _ => unreachable!("bench dtype not covered"),
-        }
-    }
 
     // n128_ag family (matmul_native_f16a): wide-N shapes — gate_up fused proj, vocab head.
     let n128_shapes: &[(&str, infr_core::DType, usize, usize)] = &[
@@ -1333,9 +1434,9 @@ fn dense_small_m_row_tile_bench() {
         ("vocab_head", infr_core::DType::Q6K, 2560, 248320),
     ];
     for &(label, dtype, k, n) in n128_shapes {
-        let (k_, n_) = (k, n);
+        let (k_, n_) = profile(&be32, (512usize, 256usize), (k, n));
         let mpad_max = 64usize;
-        let (belem, bbytes) = blk(dtype);
+        let (belem, bbytes) = infr_gguf::block_layout(dtype);
         let scratch = |b: &VulkanBackend| {
             (
                 b.alloc(mpad_max * k_ * 2, BufferUsage::Activations)
@@ -1349,43 +1450,34 @@ fn dense_small_m_row_tile_bench() {
         let s32 = scratch(&be32);
         let s64 = scratch(&be64);
         for &m in ms {
-            for (tile_label, be_, (a16, w, c), bm) in
-                [("BM32", &be32, &s32, 32.0), ("BM64", &be64, &s64, 64.0)]
+            for (tile_label, be_, (a16, w, c)) in
+                [("small-config", &be32, &s32), ("large-config", &be64, &s64)]
             {
-                let rec = be_.recorder().unwrap();
-                rec.matmul_native_f16a(
-                    dtype,
-                    a16.as_ref(),
-                    w.device_addr().unwrap(),
-                    0,
-                    c.as_ref(),
-                    m,
-                    k_,
-                    n_,
-                );
-                rec.finish().unwrap(); // warmup (pipeline compile)
-                let t0 = std::time::Instant::now();
-                let rec = be_.recorder().unwrap();
-                for _ in 0..reps {
-                    rec.matmul_native_f16a(
-                        dtype,
-                        a16.as_ref(),
-                        w.device_addr().unwrap(),
-                        0,
-                        c.as_ref(),
-                        m,
-                        k_,
-                        n_,
-                    );
-                }
-                rec.finish().unwrap();
-                let us = t0.elapsed().as_micros() as f64 / reps as f64;
+                let Some(us) = bench_support::time(
+                    be_,
+                    &format!("{label} config={tile_label} m={m} k={k_} n={n_}"),
+                    reps,
+                    |rec| {
+                        rec.matmul_native_f16a(
+                            dtype,
+                            a16.as_ref(),
+                            w.device_addr().unwrap(),
+                            0,
+                            c.as_ref(),
+                            m,
+                            k_,
+                            n_,
+                        );
+                    },
+                )
+                .unwrap()
+                .mean_us() else {
+                    continue;
+                };
                 let flops = 2.0 * m as f64 * k_ as f64 * n_ as f64;
                 let tflops = flops / (us * 1e-6) / 1e12;
-                let fill = m as f64 / bm;
                 println!(
-                    "[n128_ag {label:>10} k={k_} n={n_:>6}] m={m:3} tile={tile_label}: {us:7.1} us  ({tflops:5.2} TFLOP/s, fill={fill:4.0}%)",
-                    fill = fill * 100.0,
+                    "[n128_ag {label:>10} k={k_} n={n_:>6}] m={m:3} config={tile_label}: {us:7.1} us  ({tflops:5.2} TFLOP/s)",
                 );
             }
         }
@@ -1401,9 +1493,9 @@ fn dense_small_m_row_tile_bench() {
     ];
     let splits = 8usize;
     for &(label, dtype, k, n) in sk_shapes {
-        let (k_, n_) = (k, n);
+        let (k_, n_) = profile(&be32, (512usize, 256usize), (k, n));
         let mpad_max = 64usize;
-        let (belem, bbytes) = blk(dtype);
+        let (belem, bbytes) = infr_gguf::block_layout(dtype);
         let scratch = |b: &VulkanBackend| {
             (
                 b.alloc(mpad_max * k_ * 2, BufferUsage::Activations)
@@ -1419,49 +1511,37 @@ fn dense_small_m_row_tile_bench() {
         let s32 = scratch(&be32);
         let s64 = scratch(&be64);
         for &m in ms {
-            for (tile_label, be_, (a16, w, c, partials), bm) in
-                [("BM32", &be32, &s32, 32.0), ("BM64", &be64, &s64, 64.0)]
+            for (tile_label, be_, (a16, w, c, partials)) in
+                [("small-config", &be32, &s32), ("large-config", &be64, &s64)]
             {
-                let rec = be_.recorder().unwrap();
-                rec.matmul_native_splitk(
-                    dtype,
-                    a16.as_ref(),
-                    w.device_addr().unwrap(),
-                    0,
-                    partials.as_ref(),
-                    c.as_ref(),
-                    m,
-                    k_,
-                    n_,
-                    splits,
-                    true,
-                );
-                rec.finish().unwrap(); // warmup (pipeline compile)
-                let t0 = std::time::Instant::now();
-                let rec = be_.recorder().unwrap();
-                for _ in 0..reps {
-                    rec.matmul_native_splitk(
-                        dtype,
-                        a16.as_ref(),
-                        w.device_addr().unwrap(),
-                        0,
-                        partials.as_ref(),
-                        c.as_ref(),
-                        m,
-                        k_,
-                        n_,
-                        splits,
-                        true,
-                    );
-                }
-                rec.finish().unwrap();
-                let us = t0.elapsed().as_micros() as f64 / reps as f64;
+                let Some(us) = bench_support::time(
+                    be_,
+                    &format!("{label} config={tile_label} m={m} k={k_} n={n_}"),
+                    reps,
+                    |rec| {
+                        rec.matmul_native_splitk(
+                            dtype,
+                            a16.as_ref(),
+                            w.device_addr().unwrap(),
+                            0,
+                            partials.as_ref(),
+                            c.as_ref(),
+                            m,
+                            k_,
+                            n_,
+                            splits,
+                            true,
+                        );
+                    },
+                )
+                .unwrap()
+                .mean_us() else {
+                    continue;
+                };
                 let flops = 2.0 * m as f64 * k_ as f64 * n_ as f64;
                 let tflops = flops / (us * 1e-6) / 1e12;
-                let fill = m as f64 / bm;
                 println!(
-                    "[sk_ag {label:>10} k={k_:>5} n={n_:>5}] m={m:3} tile={tile_label}: {us:7.1} us  ({tflops:5.2} TFLOP/s, fill={fill:4.0}%)",
-                    fill = fill * 100.0,
+                    "[sk_ag {label:>10} k={k_:>5} n={n_:>5}] m={m:3} config={tile_label}: {us:7.1} us  ({tflops:5.2} TFLOP/s)",
                 );
             }
         }
@@ -1483,21 +1563,16 @@ fn bm16_crossover_bench() {
     // One backend per tile tier: BM16 = the defaults, BM32 = `INFR_NO_BM16`
     // (`kernels.vulkan.bm16 = false`), BM64 = `INFR_NO_SMALL_BM` (`small_bm = false`).
     let be16 = be_with(|_| {});
+    if !supported(
+        be16.capabilities().f16_coopmat(),
+        "dense direct coopmat variants",
+    ) {
+        return;
+    }
     let be32 = be_with(|v| v.bm16 = false);
     let be64 = be_with(|v| v.small_bm = false);
     let reps = 30usize;
     let ms: &[usize] = &[4, 6, 8, 12, 16, 24, 32];
-
-    fn blk(dtype: infr_core::DType) -> (usize, usize) {
-        use infr_core::DType::*;
-        match dtype {
-            Q4K => (256, 144),
-            Q5K => (256, 176),
-            Q6K => (256, 210),
-            Q8_0 => (32, 34),
-            _ => unreachable!("bench dtype not covered"),
-        }
-    }
 
     // n128_ag family (matmul_native_f16a) at the qwen35-4B-UD-Q4_K_XL verify's dominant projection
     // shapes captured via INFR_MTP=1 INFR_PROF_OP_SHAPES=1 — attn qkv/o (deep-k narrow-n, routed
@@ -1508,9 +1583,9 @@ fn bm16_crossover_bench() {
         ("vocab_head", infr_core::DType::Q6K, 2560, 248320),
     ];
     for &(label, dtype, k, n) in n128_shapes {
-        let (k_, n_) = (k, n);
+        let (k_, n_) = profile(&be16, (512usize, 256usize), (k, n));
         let mpad_max = 64usize;
-        let (belem, bbytes) = blk(dtype);
+        let (belem, bbytes) = infr_gguf::block_layout(dtype);
         let scratch = |b: &VulkanBackend| {
             (
                 b.alloc(mpad_max * k_ * 2, BufferUsage::Activations)
@@ -1525,45 +1600,36 @@ fn bm16_crossover_bench() {
         let s32 = scratch(&be32);
         let s64 = scratch(&be64);
         for &m in ms {
-            for (tile_label, be_, (a16, w, c), bm) in [
-                ("BM16", &be16, &s16, 16.0),
-                ("BM32", &be32, &s32, 32.0),
-                ("BM64", &be64, &s64, 64.0),
+            for (tile_label, be_, (a16, w, c)) in [
+                ("default-config", &be16, &s16),
+                ("small-config", &be32, &s32),
+                ("large-config", &be64, &s64),
             ] {
-                let rec = be_.recorder().unwrap();
-                rec.matmul_native_f16a(
-                    dtype,
-                    a16.as_ref(),
-                    w.device_addr().unwrap(),
-                    0,
-                    c.as_ref(),
-                    m,
-                    k_,
-                    n_,
-                );
-                rec.finish().unwrap(); // warmup (pipeline compile)
-                let t0 = std::time::Instant::now();
-                let rec = be_.recorder().unwrap();
-                for _ in 0..reps {
-                    rec.matmul_native_f16a(
-                        dtype,
-                        a16.as_ref(),
-                        w.device_addr().unwrap(),
-                        0,
-                        c.as_ref(),
-                        m,
-                        k_,
-                        n_,
-                    );
-                }
-                rec.finish().unwrap();
-                let us = t0.elapsed().as_micros() as f64 / reps as f64;
+                let Some(us) = bench_support::time(
+                    be_,
+                    &format!("{label} config={tile_label} m={m} k={k_} n={n_}"),
+                    reps,
+                    |rec| {
+                        rec.matmul_native_f16a(
+                            dtype,
+                            a16.as_ref(),
+                            w.device_addr().unwrap(),
+                            0,
+                            c.as_ref(),
+                            m,
+                            k_,
+                            n_,
+                        );
+                    },
+                )
+                .unwrap()
+                .mean_us() else {
+                    continue;
+                };
                 let flops = 2.0 * m as f64 * k_ as f64 * n_ as f64;
                 let tflops = flops / (us * 1e-6) / 1e12;
-                let fill = m as f64 / bm;
                 println!(
-                    "[n128_ag {label:>10} k={k_} n={n_:>6}] m={m:3} tile={tile_label}: {us:7.1} us  ({tflops:5.2} TFLOP/s, fill={fill:4.0}%)",
-                    fill = fill * 100.0,
+                    "[n128_ag {label:>10} k={k_} n={n_:>6}] m={m:3} config={tile_label}: {us:7.1} us  ({tflops:5.2} TFLOP/s)",
                 );
             }
         }
@@ -1611,7 +1677,10 @@ const COUNTS_36MOE: [u32; 256] = [0, 11, 0, 0, 0, 0, 46, 5, 2, 25, 0, 2, 6, 0, 0
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn moe_expert_row_tile_bench_real_skew() {
-    let be = VulkanBackend::new().unwrap();
+    let be = bench_support::backend();
+    if !supported(be.capabilities().i8_dot, "expert MMQ (i8_dot)") {
+        return;
+    }
     let reps = 30usize;
 
     // (label, ne, gate/up nff, gate/up dtype, down dtype, n_expert, tokens, counts,
@@ -1652,6 +1721,31 @@ fn moe_expert_row_tile_bench_real_skew() {
         ),
     ];
 
+    let small_cases = [
+        (
+            "integrated synthetic skew Q6K",
+            512,
+            256,
+            infr_core::DType::Q4K,
+            infr_core::DType::Q6K,
+            8,
+            32,
+            &SMALL_SKEW[..],
+            1,
+        ),
+        (
+            "integrated synthetic skew Q5K",
+            512,
+            256,
+            infr_core::DType::Q4K,
+            infr_core::DType::Q5K,
+            8,
+            32,
+            &SMALL_SKEW[..],
+            1,
+        ),
+    ];
+    let cases = profile(&be, &small_cases[..], cases);
     for &(label, ne, nff, gdt, ddt, n_expert, tokens, counts_v, probe32) in cases {
         let n_pairs: usize = counts_v.iter().map(|&c| c as usize).sum();
         let npad = n_pairs.div_ceil(64) * 64 + 64;
@@ -1682,18 +1776,10 @@ fn moe_expert_row_tile_bench_real_skew() {
             .unwrap();
         let down_c = be.alloc(npad * ne * 4, BufferUsage::Activations).unwrap();
         let down_w = be
-            .alloc(
-                n_expert * ne * (nff / 256).max(1) * 176,
-                BufferUsage::Weights,
-            )
+            .alloc(bank_bytes(ddt, n_expert, nff, ne), BufferUsage::Weights)
             .unwrap();
 
-        let mut offsets_v = vec![0u32; n_expert];
-        let mut acc = 0u32;
-        for e in 0..n_expert {
-            offsets_v[e] = acc;
-            acc += counts_v[e];
-        }
+        let offsets_v = routing_offsets(counts_v, tokens, n_pairs);
         let counts = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
         let offsets = be.alloc(n_expert * 4, BufferUsage::Activations).unwrap();
         be.upload(counts.as_ref(), bytemuck::cast_slice(counts_v))
@@ -1705,109 +1791,83 @@ fn moe_expert_row_tile_bench_real_skew() {
         // MOE_EXPERT_SMALL_TILE_AVG_ROWS (BM32 bucket) regardless of the real n_used (probe32 is
         // NOT the model's real n_used=8 for the 30B case — it's an artificial probe forcing BM32
         // on that distribution for comparison, since its real avg~32 already selects BM64).
-        for (tile_label, n_used_probe) in [("BM32", probe32), ("BM64", n_expert * 100)] {
-            let rec = be.recorder().unwrap();
-            rec.matmul_mmq_experts(
-                gdt,
-                "bench_gateup",
-                qa.as_ref(),
-                dact.as_ref(),
-                Some(sact.as_ref()),
-                gu_w.as_ref(),
-                0,
-                ne,
-                counts.as_ref(),
-                offsets.as_ref(),
-                gu_c.as_ref(),
-                tokens,
-                ne,
-                2 * nff,
-                n_expert,
-                n_used_probe,
-            );
-            rec.finish().unwrap();
-            let t0 = std::time::Instant::now();
-            let rec = be.recorder().unwrap();
-            for _ in 0..reps {
-                rec.matmul_mmq_experts(
-                    gdt,
-                    "bench_gateup",
-                    qa.as_ref(),
-                    dact.as_ref(),
-                    Some(sact.as_ref()),
-                    gu_w.as_ref(),
-                    0,
-                    ne,
-                    counts.as_ref(),
-                    offsets.as_ref(),
-                    gu_c.as_ref(),
-                    tokens,
-                    ne,
-                    2 * nff,
-                    n_expert,
-                    n_used_probe,
-                );
-            }
-            rec.finish().unwrap();
-            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+        for (tile_label, n_used_probe) in [
+            ("low-average-probe", probe32),
+            ("high-average-probe", n_expert * 100),
+        ] {
+            let Some(us) =
+                bench_support::time(&be, &format!("{label} probe={n_used_probe}"), reps, |rec| {
+                    rec.matmul_mmq_experts(
+                        gdt,
+                        "bench_gateup",
+                        qa.as_ref(),
+                        dact.as_ref(),
+                        Some(sact.as_ref()),
+                        gu_w.as_ref(),
+                        0,
+                        ne,
+                        counts.as_ref(),
+                        offsets.as_ref(),
+                        gu_c.as_ref(),
+                        tokens,
+                        ne,
+                        2 * nff,
+                        n_expert,
+                        n_used_probe,
+                    );
+                })
+                .unwrap()
+                .mean_us()
+            else {
+                continue;
+            };
             let flops = 2.0 * (n_pairs as f64) * (ne as f64) * (2.0 * nff as f64);
             let tflops = flops / (us * 1e-6) / 1e12;
-            println!("[gate_up {label:>20}] tile={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)");
+            println!(
+                "[gate_up {label:>20}] config={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)"
+            );
         }
 
-        for (tile_label, n_used_probe) in [("BM32", probe32), ("BM64", n_expert * 100)] {
+        for (tile_label, n_used_probe) in [
+            ("low-average-probe", probe32),
+            ("high-average-probe", n_expert * 100),
+        ] {
             let sact_d: Option<&dyn Buffer> = if matches!(ddt, infr_core::DType::Q5K) {
                 Some(dsa.as_ref())
             } else {
                 None
             };
-            let rec = be.recorder().unwrap();
-            rec.matmul_mmq_experts(
-                ddt,
-                "bench_down",
-                dqa.as_ref(),
-                dda.as_ref(),
-                sact_d,
-                down_w.as_ref(),
-                0,
-                nff,
-                counts.as_ref(),
-                offsets.as_ref(),
-                down_c.as_ref(),
-                tokens,
-                nff,
-                ne,
-                n_expert,
-                n_used_probe,
-            );
-            rec.finish().unwrap();
-            let t0 = std::time::Instant::now();
-            let rec = be.recorder().unwrap();
-            for _ in 0..reps {
-                rec.matmul_mmq_experts(
-                    ddt,
-                    "bench_down",
-                    dqa.as_ref(),
-                    dda.as_ref(),
-                    sact_d,
-                    down_w.as_ref(),
-                    0,
-                    nff,
-                    counts.as_ref(),
-                    offsets.as_ref(),
-                    down_c.as_ref(),
-                    tokens,
-                    nff,
-                    ne,
-                    n_expert,
-                    n_used_probe,
-                );
-            }
-            rec.finish().unwrap();
-            let us = t0.elapsed().as_micros() as f64 / reps as f64;
+            let Some(us) =
+                bench_support::time(&be, &format!("{label} probe={n_used_probe}"), reps, |rec| {
+                    rec.matmul_mmq_experts(
+                        ddt,
+                        "bench_down",
+                        dqa.as_ref(),
+                        dda.as_ref(),
+                        sact_d,
+                        down_w.as_ref(),
+                        0,
+                        nff,
+                        counts.as_ref(),
+                        offsets.as_ref(),
+                        down_c.as_ref(),
+                        tokens,
+                        nff,
+                        ne,
+                        n_expert,
+                        n_used_probe,
+                    );
+                })
+                .unwrap()
+                .mean_us()
+            else {
+                continue;
+            };
             let flops = 2.0 * (n_pairs as f64) * (nff as f64) * (ne as f64);
             let tflops = flops / (us * 1e-6) / 1e12;
-            println!("[down    {label:>20}] tile={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)");
+            println!(
+                "[down    {label:>20}] config={tile_label}: {us:8.1} us  ({tflops:5.2} TFLOP/s useful)"
+            );
         }
     }
 }

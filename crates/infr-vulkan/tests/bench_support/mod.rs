@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use infr_core::backend::Backend;
-use infr_core::config::{Config, ConfigLayer};
+use infr_core::config::{Config, ConfigLayer, VulkanCfg};
 use infr_vulkan::{Recorder, VulkanBackend};
 
 const BATCH_BUDGET: Duration = Duration::from_millis(50);
@@ -11,11 +11,15 @@ const MAX_DISPATCHES: usize = 16;
 const MAX_OPERATIONS: usize = 16;
 
 pub fn backend() -> VulkanBackend {
-    initialize(false).expect("benchmark requires a Vulkan device")
+    backend_with(|_| {})
+}
+
+pub fn backend_with(f: impl FnOnce(&mut VulkanCfg)) -> VulkanBackend {
+    initialize(false, f).expect("benchmark requires a Vulkan device")
 }
 
 pub fn optional_backend() -> Option<VulkanBackend> {
-    initialize(true)
+    initialize(true, |_| {})
 }
 
 fn unavailable(error: &infr_core::Error, explicit: bool) -> bool {
@@ -27,9 +31,16 @@ fn unavailable(error: &infr_core::Error, explicit: bool) -> bool {
                 || message.starts_with("Vulkan is not supported on Apple."))
 }
 
-fn initialize(optional: bool) -> Option<VulkanBackend> {
-    let cfg =
-        Config::load_from_layers(&[ConfigLayer::env().expect("benchmark environment config")]);
+fn configure(mut cfg: Config, f: impl FnOnce(&mut VulkanCfg)) -> Config {
+    f(&mut cfg.kernels.vulkan);
+    cfg
+}
+
+fn initialize(optional: bool, f: impl FnOnce(&mut VulkanCfg)) -> Option<VulkanBackend> {
+    let cfg = configure(
+        Config::load_from_layers(&[ConfigLayer::env().expect("benchmark environment config")]),
+        f,
+    );
     let selected = cfg.device.dev.clone();
     let be = match VulkanBackend::new_with(Arc::new(cfg)) {
         Ok(be) => be,
@@ -220,6 +231,18 @@ fn measure(
 mod tests {
     use super::*;
     use infr_core::backend::BufferUsage;
+
+    #[test]
+    fn kernel_override_preserves_device_selection() {
+        let mut cfg = Config::default();
+        cfg.device.dev = Some("Vulkan1".into());
+        cfg.kernels.vulkan.gemm_warp = true;
+        cfg.kernels.vulkan.small_bm = true;
+        let cfg = configure(cfg, |v| v.gemm_warp = false);
+        assert_eq!(cfg.device.dev.as_deref(), Some("Vulkan1"));
+        assert!(!cfg.kernels.vulkan.gemm_warp);
+        assert!(cfg.kernels.vulkan.small_bm);
+    }
 
     #[test]
     fn budget_boundaries() {

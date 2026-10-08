@@ -3320,9 +3320,15 @@ impl ModelBench {
             .unwrap_or_default()
             .join("Projects/mxaddict/llama.cpp-dg");
         let build = if cpu { "build" } else { "build-vulkan" };
-        fork.join(build)
-            .join("bin")
-            .join(Self::diffusion_cli_file())
+        let bin = fork.join(build).join("bin");
+        let cli = bin.join(Self::diffusion_cli_file());
+        // Multi-config CMake generators put optimized binaries in a configuration directory.
+        let release = bin.join("Release").join(Self::diffusion_cli_file());
+        if cli.is_file() || !release.is_file() {
+            cli
+        } else {
+            release
+        }
     }
 
     /// `llama-diffusion-cli` as a file name on this platform. `Command::new` appends `.exe` on

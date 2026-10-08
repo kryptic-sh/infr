@@ -37,7 +37,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   GPU golden on an RDNA3 card.
 - **`infr compare` finds `llama-diffusion-cli` on Windows.** The `PATH` and
   fork-build lookups probed for the file without `.exe`, so the diffusion
-  comparison always reported the binary missing.
+  comparison always reported the binary missing. Fork-build lookup also checks
+  `bin/Release/` for multi-config CMake builds, retaining `bin/` precedence.
 - **rustls 0.23.45** (from 0.23.41) for
   [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): rustls
   accepted TLS 1.3 handshake messages sent at the wrong encryption level. It is

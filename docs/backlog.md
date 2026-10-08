@@ -2671,11 +2671,6 @@ upstream for `default-features = false`, or patch the crate.
 **Tag:** Windows review · **Blocked on:** nothing; each is small and none is on
 a hot path
 
-- **`infr compare`'s diffusion fork lookup ignores MSVC build layouts.**
-  `fork_diffusion_cli_path` looks in `build*/bin/`, but a multi-config MSVC
-  CMake build puts the binary in `build*/bin/Release/`. `.exe` is now appended
-  (`diffusion_cli_file`); the `Release` subdirectory is not tried.
-  `INFR_LLAMA_DIFFUSION_CLI` is the workaround.
 - **The iGPU's first submit cap costs ~5% decode on small models.** On the Ryzen
   iGPU under Windows, Qwen3-0.6B decodes at 52.5 tok/s with the integrated
   default (`initial_submit_dispatch_cap`, 128 dispatches per submit) and 55.0

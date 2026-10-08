@@ -32,8 +32,8 @@ pub enum Source {
     /// inside a Windows container it can report far more than this process may actually take.
     WindowsAvailPhys,
     /// Windows `ullAvailPhys` clamped by the tighter of the current process's Job Object
-    /// `JobMemoryLimit` / `ProcessMemoryLimit` — the figure an arena must be sized from inside a
-    /// Windows container.
+    /// remaining `JobMemoryLimit` / `ProcessMemoryLimit` headroom — the figure an arena must be
+    /// sized from inside a Windows container.
     WindowsJobObjectClamped,
 }
 
@@ -51,10 +51,9 @@ pub enum Source {
 ///
 /// **Windows** reads `ullAvailPhys` from `GlobalMemoryStatusEx`, then clamps it the same way: a
 /// process running inside a Job Object (as a Windows container does) has its `JobMemoryLimit` /
-/// `ProcessMemoryLimit` read via `QueryInformationJobObject`, and the tighter of the two wins over
-/// the machine-wide figure when it binds — the identical "smaller of the two, and say so" policy
-/// as the Linux clamp above, sharing its implementation (`apply_limit_clamp`) rather than
-/// duplicating it.
+/// `ProcessMemoryLimit` read via `QueryInformationJobObject`. Each enabled limit has its current
+/// commit usage subtracted, saturating at zero, before the tighter headroom clamps the host figure.
+/// A failed job or usage probe returns `None` rather than assuming the whole limit remains free.
 ///
 /// **macOS** reads `host_statistics64`'s VM info and reports what is reclaimable without swapping:
 /// `free_count - speculative_count + inactive_count + purgeable_count`, converted to bytes by
@@ -91,7 +90,7 @@ pub fn available() -> Option<Available> {
     {
         Some(apply_job_object_clamp(
             windows_memory_status()?.ullAvailPhys,
-            windows_job_memory_limit(),
+            windows_job::probe().ok()?,
         ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -165,71 +164,8 @@ fn windows_memory_status() -> Option<windows::Win32::System::SystemInformation::
     Some(status)
 }
 
-/// The current process's Job Object memory limit in bytes, or `None` when it is not bound by one.
-///
-/// Passes a null job handle, which asks `QueryInformationJobObject` for the job the CURRENT
-/// process belongs to rather than naming one — there is no other job this process could mean here.
-/// The call itself fails (and this returns `None`) for a process not associated with any job,
-/// which is the correct fallback: no limit binds it, so the unclamped host figure stands.
-#[cfg(windows)]
-fn windows_job_memory_limit() -> Option<u64> {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::JobObjects::{
-        JobObjectExtendedLimitInformation, QueryInformationJobObject,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    };
-
-    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    let len = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
-    // SAFETY: `info` is a valid, correctly-sized buffer for the call's duration; `len` matches its
-    // actual size.
-    unsafe {
-        QueryInformationJobObject(
-            HANDLE::default(),
-            JobObjectExtendedLimitInformation,
-            (&mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            len,
-            None,
-        )
-        .ok()?
-    };
-    job_object_limit_bytes(
-        info.BasicLimitInformation.LimitFlags.0,
-        info.JobMemoryLimit as u64,
-        info.ProcessMemoryLimit as u64,
-    )
-}
-
-/// Pick the binding memory limit out of a Job Object's extended limit info, or `None` if neither
-/// applies.
-///
-/// A limit field is only meaningful when its bit is set in `LimitFlags` — reading it unconditionally
-/// produces a garbage clamp from a zeroed-but-unset field. Both `JobMemoryLimit` and
-/// `ProcessMemoryLimit` can be set at once (a process limit inside a looser job limit, say), so the
-/// binding one is the TIGHTER of whichever are actually set — the same "tightest ancestor wins" rule
-/// `cgroup_headroom` applies to the cgroup hierarchy. The two flag values (512, 256) are fixed by
-/// the Win32 ABI as `JOB_OBJECT_LIMIT_JOB_MEMORY` / `JOB_OBJECT_LIMIT_PROCESS_MEMORY`; they are
-/// re-declared here rather than imported because this function must also compile under `cfg(test)`
-/// on non-Windows targets, where the `windows` crate is not a dependency.
 #[cfg(any(windows, test))]
-fn job_object_limit_bytes(
-    limit_flags: u32,
-    job_memory_limit: u64,
-    process_memory_limit: u64,
-) -> Option<u64> {
-    const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 512;
-    const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 256;
-
-    let job = (limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0).then_some(job_memory_limit);
-    let process =
-        (limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0).then_some(process_memory_limit);
-    match (job, process) {
-        (Some(j), Some(p)) => Some(j.min(p)),
-        (Some(j), None) => Some(j),
-        (None, Some(p)) => Some(p),
-        (None, None) => None,
-    }
-}
+mod windows_job;
 
 /// Read macOS's VM statistics via `host_statistics64`, or `None` if the kernel call fails.
 ///
@@ -540,7 +476,7 @@ mod tests {
         );
     }
 
-    /// `job_object_limit_bytes` re-declares the two flag bits so it can compile under `cfg(test)`
+    /// `windows_job::headroom` re-declares the two flag bits so it can compile under `cfg(test)`
     /// where the `windows` crate is not a dependency — which means two copies of a value, and the
     /// copy this crate reads is not the one the ABI hands it. Pin them together where the real
     /// ones exist. Windows-only by necessity, so it is the Windows CI leg that enforces this.
@@ -553,20 +489,22 @@ mod tests {
         // Both limits set, `job` the tighter: it can only come back as `job` if the bit the
         // function tests is the bit the ABI actually sets.
         assert_eq!(
-            job_object_limit_bytes(
+            windows_job::headroom(
                 JOB_OBJECT_LIMIT_JOB_MEMORY.0 | JOB_OBJECT_LIMIT_PROCESS_MEMORY.0,
                 1 << 30,
                 2 << 30,
+                0,
+                0,
             ),
             Some(1 << 30),
         );
         // And each alone selects its own field, which a wrong bit value could not do.
         assert_eq!(
-            job_object_limit_bytes(JOB_OBJECT_LIMIT_JOB_MEMORY.0, 1 << 30, 2 << 30),
+            windows_job::headroom(JOB_OBJECT_LIMIT_JOB_MEMORY.0, 1 << 30, 2 << 30, 0, 0),
             Some(1 << 30),
         );
         assert_eq!(
-            job_object_limit_bytes(JOB_OBJECT_LIMIT_PROCESS_MEMORY.0, 1 << 30, 2 << 30),
+            windows_job::headroom(JOB_OBJECT_LIMIT_PROCESS_MEMORY.0, 1 << 30, 2 << 30, 0, 0),
             Some(2 << 30),
         );
     }
@@ -574,32 +512,32 @@ mod tests {
     /// `JOB_OBJECT_LIMIT_JOB_MEMORY` is bit 512, `JOB_OBJECT_LIMIT_PROCESS_MEMORY` is bit 256 —
     /// every combination of set/unset, and which one wins when both are set.
     #[test]
-    fn job_object_limit_bytes_honors_only_set_flags_and_takes_the_tighter() {
+    fn job_headroom_honors_only_set_flags_and_takes_the_tighter() {
         const JOB: u32 = 512;
         const PROCESS: u32 = 256;
 
         assert_eq!(
-            job_object_limit_bytes(0, 1 << 30, 2 << 30),
+            windows_job::headroom(0, 1 << 30, 2 << 30, 0, 0),
             None,
             "neither flag set"
         );
         assert_eq!(
-            job_object_limit_bytes(JOB, 1 << 30, 2 << 30),
+            windows_job::headroom(JOB, 1 << 30, 2 << 30, 0, 0),
             Some(1 << 30),
             "only the job flag set"
         );
         assert_eq!(
-            job_object_limit_bytes(PROCESS, 1 << 30, 2 << 30),
+            windows_job::headroom(PROCESS, 1 << 30, 2 << 30, 0, 0),
             Some(2 << 30),
             "only the process flag set"
         );
         assert_eq!(
-            job_object_limit_bytes(JOB | PROCESS, 1 << 30, 2 << 30),
+            windows_job::headroom(JOB | PROCESS, 1 << 30, 2 << 30, 0, 0),
             Some(1 << 30),
             "both set, job is tighter"
         );
         assert_eq!(
-            job_object_limit_bytes(JOB | PROCESS, 4 << 30, 2 << 30),
+            windows_job::headroom(JOB | PROCESS, 4 << 30, 2 << 30, 0, 0),
             Some(2 << 30),
             "both set, process is tighter"
         );

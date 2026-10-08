@@ -2624,31 +2624,6 @@ Also unverified on Windows: which arm of `link_blob` actually ran. The blob
 landed and the model loaded through the snapshot entry, so one of the two
 succeeded, but neither the symlink nor the hard-link fallback is logged.
 
-### B73 — the Windows Job Object clamp reports the limit, not the headroom (2026-09-23)
-
-**Tag:** Windows review · **Blocked on:** a way to observe it (no Job Object on
-the dev box) and a struct the `windows` crate does not bind
-
-`infr_plat::mem::windows_job_memory_limit` returns the Job Object's raw
-`JobMemoryLimit` / `ProcessMemoryLimit`. The Linux arm (`cgroup_headroom`)
-returns `max - current`, and the two share `apply_limit_clamp`, so on Windows a
-16 GB job limit with 12 GB already committed reports 16 GB available and a host
-arena sized from it overcommits. VERIFIED by reading; never observed, since
-nothing here runs inside a Job Object.
-
-The fix: subtract current use — the job's from
-`QueryInformationJobObject(JobObjectMemoryUsageInformation)` (`JobMemory`), the
-process's from `GetProcessMemoryInfo`
-(`PROCESS_MEMORY_COUNTERS_EX::PrivateUsage`, feature
-`Win32_System_ProcessStatus`). `windows` 0.58 binds neither
-`JOBOBJECT_MEMORY_USAGE_INFORMATION` nor that info class (28), so both need
-declaring locally from the Win32 ABI. Verifying it means a test that assigns a
-child process to a job with a memory limit and reads `available()` from inside.
-
-Also a suspicion, not verified: Windows refuses allocations on commit charge,
-not physical RAM, so `min(ullAvailPhys, ullAvailPageFile)` may be the more
-honest host figure than `ullAvailPhys` alone.
-
 ### B74 — LNK4098 on every Windows link: `esaxx-rs` forces the static CRT (2026-09-23)
 
 **Tag:** Windows review · **Blocked on:** upstream (`tokenizers` /
@@ -2765,19 +2740,21 @@ Coverage gaps, stated plainly:
   The f16 probe, the misaligned-offset test fix and the `INFR_DEV` test knob
   were run on Windows GPUs only; the Linux RADV box should rerun the ignored GPU
   suites once.
-- **iGPU prefill still trails llama.cpp on Windows.** The Qwen3-0.6B Q4_K_M
-  baseline and every repeat are now in [windows.md](windows.md), measured
-  against llama.cpp `b11491`. Profiling identified
-  `native_gemm_mmq_q4k_streamed` as the main prefill cost. The next experiment
-  is replacing the byte-at-a-time quant unpack in
-  `crates/infr-vulkan/shaders/native_gemm_mmq_q4k.comp` with packed word reads,
-  following the existing Q4_K `wdec` in `native_mmv_mrow.comp`. This is a
-  candidate, not a measured improvement: no shader change was made before the
-  session ended. Verify numerical parity for bound, resident-BDA and paged
-  weights and alternate baseline/candidate benchmarks using the same compiler
-  before accepting it. Comparisons on other small models and the full ignored
-  GPU suite remain unrun; `nc_gemm_parity`, `pager_mmq_parity`, and
-  `mmq_wide_bn_determinism` did pass on the iGPU.
+- **Broader Q4_K performance and portability coverage.** The packed-word
+  `native_gemm_mmq_q4k.comp` optimization has only been measured on cached
+  Qwen3-0.6B Q4_K_M with the Windows AMD RDNA2 iGPU. Other small models,
+  drivers/vendors and Linux GPU execution remain unverified. The entire ignored
+  GPU suite was deliberately not run because its dGPU-sized probes can exceed
+  the iGPU watchdog; selected parity suites do not cover every tile variant.
+  Decode results were mixed, so no decode improvement is established. See
+  [windows.md](windows.md#packed-q4_k-follow-up-2026-10-08) for measurements.
+- **Windows memory-budget scope.** `mem::windows_job::probe` queries the
+  immediate job; tighter ancestor jobs remain unaccounted for. Nested-job
+  budgeting needs a separate design and regression test. Whether host budgeting
+  should also clamp `ullAvailPhys` by `ullAvailPageFile` remains unverified.
+  Application Verifier required elevation and did not run; native job tests
+  passed under AddressSanitizer instead, which does not validate every Win32
+  handle/API contract.
 - **Emoji through console input.** Typed input round-tripped `café`; an emoji
   came back as `�` in the screen scrape, but conhost's screen buffer cannot draw
   astral characters either, so whether the bytes the model received were right

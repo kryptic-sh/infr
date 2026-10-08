@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Windows memory budgets use remaining Job Object headroom.**
+  `infr_plat::mem::available` subtracts current job commit usage and process
+  private usage from their enabled limits before choosing the tighter budget.
+  Failed probes return unknown instead of treating already committed memory as
+  available. Native child-process regression tests cover both limit types.
+
 - **Ctrl-C on Windows drains the GPU instead of killing infr mid-submit.**
   `infr_plat::signal::install_handlers` was a no-op off unix, so the first
   Ctrl-C terminated the process with a submit still in flight. It now registers
@@ -112,6 +118,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   platform's own separator.
 
 ### Changed
+
+- **Q4_K Vulkan MMQ unpacks weights with aligned word reads.**
+  `native_gemm_mmq_q4k.comp` masks packed nibbles instead of reconstructing each
+  word byte by byte, preserving scales, accumulation order and watchdog limits.
+  Alternating cached Qwen3-0.6B benchmarks improved prefill on the Windows AMD
+  RDNA2 iGPU; decode results were mixed. Bound-buffer, resident-BDA and paged
+  reload parity are covered in `nc_gemm_parity`; measurements and scope are in
+  [the Windows guide](docs/windows.md#packed-q4_k-follow-up-2026-10-08).
 
 - **On Windows, `-t` defaults to one thread per physical core.** It defaulted to
   every logical processor, so with SMT the CPU backend's spin pool put two

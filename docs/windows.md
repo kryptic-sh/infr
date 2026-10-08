@@ -178,7 +178,8 @@ same iGPU. Prefill used `-p 128 -n 0`; decode used `-p 0 -n 64`.
 
 A separate `INFR_PROF_OPS=1` prefill run attributed 61.16% of device time to
 `native_gemm_mmq_q4k_streamed`, 14.48% to `native_gemm_mmq_q6k_streamed`, and
-17.67% to `attn_nc_fa_hd128`. Backlog B77 records the next experiment.
+17.67% to `attn_nc_fa_hd128`. The packed-Q4_K follow-up below targets the
+largest measured cost; backlog B77 records remaining coverage gaps.
 
 After matching CI's Rust 1.99 toolchain, workspace formatting, Clippy, tests
 with `INFR_DEV=Vulkan1 --test-threads 1`, the release CLI build, and the
@@ -187,6 +188,44 @@ Apple-target cross-lint passed. The explicitly enabled GPU suites
 on the iGPU. Cached Qwen3-0.6B, Gemma-3-1B, and Qwen3.5-0.8B Q4_K_M models
 answered the capital-of-France smoke prompt correctly. This does not cover the
 entire ignored GPU suite or other GPU vendors.
+
+## Packed Q4_K follow-up (2026-10-08)
+
+The `native_gemm_mmq_q4k.comp` packed-word unpack change in `67c31e9` was
+compared with baseline `7c79a95`, both built with Rust 1.99.0 and the same
+shader compiler. Runs were headless and serial on `Vulkan1`, the AMD RDNA2
+integrated GPU, using the cached Qwen3-0.6B Q4_K_M GGUF pathname. No model was
+downloaded. Profiling was disabled.
+
+Each leg ran prefill then decode, alternating baseline and candidate. Both used
+`--ctx 2048 -u 128 -d 0 -r 3`, f16 KV and the unchanged submit cap. Prefill used
+`-p 128 -n 0`; decode used `-p 0 -n 64`. Values below are the benchmark's
+printed throughput and repetition range, in tok/s.
+
+| Leg         | Prefill | Prefill range | Decode | Decode range |
+| ----------- | ------- | ------------- | ------ | ------------ |
+| Baseline 1  | 354.3   | 353.6–354.8   | 53.7   | 53.6–53.8    |
+| Candidate 1 | 362.3   | 361.9–362.9   | 54.0   | 53.7–54.4    |
+| Baseline 2  | 356.9   | 355.1–357.9   | 54.0   | 53.6–54.2    |
+| Candidate 2 | 362.7   | 361.9–363.6   | 53.4   | 53.3–53.5    |
+
+Prefill improved in both comparisons; decode results were mixed. This is not a
+cross-model or cross-driver performance claim. The optimization changes only
+packed quant reads, not scales, accumulation order, tile sizes or watchdog
+budgets.
+
+`nc_gemm_parity` now compares bound SSBO, offset resident-BDA and paged Q4_K
+weights after actual eviction/reload against every output bit of a host-checked
+dense result. The selected `nc_gemm_parity`, `pager_mmq_parity`,
+`weight_addr_parity` and `mmq_wide_bn_determinism` suites passed serially on the
+iGPU, as did the workspace gate, workspace tests/doctests and warning-denied
+intra-doc-link build. The full ignored GPU suite and other vendors were not run;
+see backlog B77.
+
+The Windows Job Object headroom tests also passed under native AddressSanitizer
+using the installed nightly toolchain and MSVC ASan runtime. Application
+Verifier could not run without elevation; ASan is not equivalent coverage of
+Win32 API contracts.
 
 ## Troubleshooting
 

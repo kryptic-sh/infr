@@ -923,7 +923,7 @@ impl Backend for CpuBackend {
                     let xs = &vals[x.0 as usize];
                     // `None` = V4's weightless Q norm (bare `ggml_rms_norm` per head): the scale is
                     // the only factor. The reduction is identical either way.
-                    let ws = w.map(&weight);
+                    let ws = w.map(weight);
                     let mut out = vec![0f32; rows * nh * hd];
                     for r in 0..rows {
                         for h in 0..nh {
@@ -1814,7 +1814,7 @@ impl Backend for CpuBackend {
                     // Per-head attention sinks (V4's `attn_sinks`, `None` everywhere else): one
                     // extra logit per head in the max AND the denominator, never in the numerator.
                     // See `Op::Attention::sinks`.
-                    let sk = sinks.map(&weight);
+                    let sk = sinks.map(weight);
                     // DeepSeek V4 CSA's additive per-(row, key) top-k score mask (`None` everywhere
                     // else) — indexed by KEY POSITION, not the ring row. See `Op::Attention::key_bias`.
                     let kbias = key_bias.map(|b| vals[b.0 as usize].clone());
@@ -2355,7 +2355,7 @@ impl Backend for CpuBackend {
                     let gst = gb.len() / n_expert;
                     let ust = ub.as_ref().map(|b| b.len() / n_expert);
                     let dst_ = db.len() / n_expert;
-                    let dscale = down_scale.map(&weight); // per-expert scale [n_expert], if any
+                    let dscale = down_scale.map(weight); // per-expert scale [n_expert], if any
 
                     // ── Router: ONE batched matvec over every row (router_x is tiny — [n_expert, ne]
                     // — so this alone replaces what used to be `rows` separate re-dequants of it),

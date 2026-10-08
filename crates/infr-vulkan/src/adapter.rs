@@ -2483,7 +2483,7 @@ fn lower_op(
                      record-once decode have no -DBACKWARD kernel build)",
                 ));
             }
-            let ff = freq_factors.map(&r).transpose()?;
+            let ff = freq_factors.map(r).transpose()?;
             let (out_buf, fused) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
                 (r(cache)?, Some(pos))
             } else {
@@ -4638,8 +4638,8 @@ fn lower_op(
                 AttnMask::SlidingWindow(w) => (1u32, *w as u32, 0u32),
                 AttnMask::Canvas { lo } => (2u32, 0u32, *lo as u32),
             };
-            let ff = freq_factors.map(&r).transpose()?;
-            let kbias = key_bias.map(&r).transpose()?;
+            let ff = freq_factors.map(r).transpose()?;
+            let kbias = key_bias.map(r).transpose()?;
             rec.mla(
                 r(*q)?,
                 r(*k_cache)?,

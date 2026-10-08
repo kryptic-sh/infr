@@ -23,7 +23,8 @@ fn unavailable(error: &infr_core::Error, explicit: bool) -> bool {
         && matches!(error, infr_core::Error::Backend(message)
             if message.starts_with("ash::Entry::load:")
                 || message == "no Vulkan physical devices"
-                || message == "create_instance: Unable to find a Vulkan driver")
+                || message == "create_instance: Unable to find a Vulkan driver"
+                || message.starts_with("Vulkan is not supported on Apple."))
 }
 
 fn initialize(optional: bool) -> Option<VulkanBackend> {
@@ -261,6 +262,7 @@ mod tests {
             "ash::Entry::load: library not found",
             "no Vulkan physical devices",
             "create_instance: Unable to find a Vulkan driver",
+            "Vulkan is not supported on Apple. Use the native Metal backend:",
         ] {
             let error = infr_core::Error::Backend(message.into());
             assert!(unavailable(&error, false));

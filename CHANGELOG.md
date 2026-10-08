@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Selected Vulkan benchmarks use bounded integrated-GPU profiles.**
+  `small_m_bench`, `attn_dsplit_probe`, `attn_ktile_probe`, `gemm_bench` and
+  `moe_id_gemv_real_dims` select small synthetic workloads before dispatch,
+  enforce submission bounds, and report unavailable timings and unsupported
+  kernels explicitly. Kernel overrides preserve `INFR_DEV`; Q6_K expert-bank
+  sizing uses the format layout. MoE parity checks every exercised bank after
+  timing, while discrete performance budgets remain required on their original
+  paths. Production kernels, submission policy and Windows TDR settings are
+  unchanged.
+
 - **Windows memory budgets use remaining Job Object headroom.**
   `infr_plat::mem::available` subtracts current job commit usage and process
   private usage from their enabled limits before choosing the tighter budget.

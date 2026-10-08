@@ -112,14 +112,54 @@ cargo test --release -p infr-vulkan -p infr-llama -- --include-ignored --test-th
 are much faster with `--release`. `--test-threads 1` keeps the GPU tests from
 contending for one device's memory.
 
-On a small iGPU, leave out `infr-vulkan`'s benchmark and probe binaries
-(`attn_dsplit_probe`, `attn_ktile_probe`, `bandwidth_probe`, `decode_gemv_bw`,
-`gemm_bench`, `small_m_bench`, `interconnect_probe`, `moe_id_gemv_real_dims`):
-they are sized for a discrete card, some run a single submit past the ~2 s TDR
-limit and lose the device, and a lost iGPU drops out of enumeration for a while,
-failing every test after it. Name the correctness binaries with `--lib` and
-`--test <name>` instead. `interconnect_probe` fails everywhere on Windows: the
-cross-process sharing it probes is POSIX-only (backlog B69).
+On a small iGPU, do **not** enable the whole ignored suite. `bandwidth_probe`
+retains large allocations, `decode_gemv_bw` retains cache-busting workloads and
+unbounded repetition submissions, and `interconnect_probe` uses POSIX-only
+cross-process sharing (backlog B69). Name the binaries to run instead.
+
+### Bounded iGPU benchmarks (2026-10-09)
+
+The following synthetic benchmarks were run headlessly and serially on native
+Windows with `Vulkan1` (AMD Radeon(TM) Graphics, integrated RDNA2). Confirm the
+integrated index with `infr devices` on your machine before setting `INFR_DEV`.
+No model download is needed. Run from a headless terminal; process launchers
+should use no-window process creation and drain both output streams.
+
+```powershell
+$env:INFR_DEV = "Vulkan1"
+cargo test --release --locked --offline -p infr-vulkan --test small_m_bench --test attn_dsplit_probe --test attn_ktile_probe --test gemm_bench --test moe_id_gemv_real_dims -- --include-ignored --nocapture --test-threads=1
+```
+
+These binaries select small integrated shapes before allocating test buffers.
+Their shared `bench_support` helper reports the selected device, capabilities,
+built kernels, logical-operation and actual-dispatch counts, and
+record/submit/wait wall time. Integrated submissions contain one logical
+operation; the dispatch cap is checked before submission. The completed-batch
+budget stops further batches, **not a dispatch already running**. Cold timings
+are separate, and stopped or insufficient samples produce no throughput result.
+One cold expert-GEMM sample stopped in the combined validation run; this is not
+complete timing coverage of every case. TDR settings and production submission
+policies are unchanged.
+
+Attention retains finite/nonzero reference checks and its numerical tolerance.
+MoE checks all grid formats, both projection orientations and every bank after
+execution; integrated coverage is scaled parity, not real-dimension performance.
+The original discrete timing budgets still fail on incomplete required samples.
+`gemm_bench` uses zero inputs for performance only and does not establish
+parity.
+
+Unsupported cooperative-matrix and shared-memory-heavy variants are reported
+before recording, not replaced with another kernel under the same label. On this
+device that excludes direct cooperative-matrix GEMMs, non-FA attention, DeltaNet
+variants and the `w128` K-tile. Those paths, discrete-device execution and other
+vendors remain unverified by this Windows run.
+
+For memory-constrained local workspace checks, use
+`cargo nextest run --workspace --locked --offline --test-threads=1` and
+`cargo test --workspace --locked --offline -- --test-threads=1`.
+Default-parallel nextest exhausted Windows commit capacity during validation;
+serial runs passed the whole workspace without changing assertions or the page
+file.
 
 ## Where Windows differs
 

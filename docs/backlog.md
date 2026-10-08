@@ -2677,16 +2677,22 @@ a hot path
   on a 0.6B model under that driver's arithmetic rather than a Windows defect —
   unverified; the coopmat path the dGPU takes (the iGPU refuses coopmat) is the
   first thing to rule in or out. Not run on Linux RADV in this session.
-- **The `infr-vulkan` micro-benchmarks lose the device on a 2-CU iGPU.**
-  `attn_dsplit_probe`, `attn_ktile_probe`, `gemm_bench`'s MoE tile benches and
-  `small_m_bench` (all `#[ignore]`d) hit `VK_ERROR_DEVICE_LOST` on the Ryzen
-  iGPU under Windows: a submit outlasts TDR's ~2 s. After a loss the driver
-  drops the iGPU from enumeration for a while, so the tests after it fail with
-  "no such Vulkan device" — a cascade, not separate bugs.
-  `moe_id_gemv_real_dims` asserts dGPU-scale timings (a 5 ms single dispatch)
-  the iGPU cannot meet. These are sized for a discrete card; the production path
-  splits submits on an iGPU and was not affected. Run the correctness tests on
-  an iGPU without them, as [windows.md](windows.md) does.
+- **Remaining iGPU benchmark exclusions.** `decode_gemv_bw` still needs
+  device-selection preservation, scaled cache-busting allocations, bounded
+  repetition submissions and asserted parity. `bandwidth_probe` needs a separate
+  small-workload/upload-cache design; `interconnect_probe` remains blocked by
+  B69. Do not run these unchanged on a small Windows iGPU. The selected bounded
+  command is in [windows.md](windows.md#bounded-igpu-benchmarks-2026-10-09).
+- **Benchmark hardware coverage remains limited.** The bounded Windows run did
+  not exercise discrete profiles, direct cooperative-matrix kernels,
+  shared-memory-ineligible K-tile/DeltaNet variants, Linux GPUs or other
+  vendors. One cold expert-GEMM sample exceeded the completed-batch budget and
+  stopped without measured throughput; full timing coverage is not claimed.
+- **Default-parallel local nextest exceeds available Windows commit capacity.**
+  Validation hit allocation failures and `os error 1455` (paging file too
+  small), plus a downloader concurrency-floor failure under contention. The
+  whole workspace passed with `--test-threads=1`; no assertions or system memory
+  settings were changed. Revisit parallel resource scheduling separately.
 - **Why Windows CPU goldens diverge is unconfirmed.** `cpu_golden_qwen3` and
   `cpu_golden_gemma3`'s 48-token cases produce different, coherent text on
   Windows than on Linux on the same Ryzen, with and without `target-cpu=native`,

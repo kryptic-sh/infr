@@ -15,19 +15,20 @@
 //!    several shapes, for EVERY width. Width 32 reproduces the shipped summation order exactly;
 //!    the narrower widths reassociate the 128-dim dot, so this is a tight RELATIVE tolerance. The
 //!    reference is first asserted finite and mostly non-zero so the compare cannot pass vacuously.
-//!  * `dsplit_bench` (`--ignored`) — per-dispatch us for the reference and every width at the B7
-//!    target shape (nh=32, nkv=4, hd=128, chunk=512) and kv_len 8192 / 32768. The reference is
-//!    measured IN THIS HARNESS, alternated around every probe leg, rather than trusting B7's table.
+//!  * Ignored timing uses the same shape roster as parity. Integrated devices select small
+//!    MHA/GQA cases before allocation; discrete devices retain the long-context cases.
+//!    Timings include record/submit/wait and stop when the bounded helper declines more work.
 //!
-//! Run: `cargo test --release -p infr-vulkan --test attn_dsplit_probe -- --ignored --nocapture`
+//! Run: `cargo test --release -p infr-vulkan --test attn_dsplit_probe -- --include-ignored --nocapture --test-threads=1`
 //! (the cargo wrapper swallows test stdout — run `target/release/deps/attn_dsplit_probe-*`
 //! directly).
+mod bench_support;
+
 use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_vulkan::{Recorder, VulkanBackend};
 
 /// `(reduction width, workgroup threads, label)` — every build of `attn_partial_dsplit.comp`.
-/// Width 32 + wg 64 is the shipped configuration expressed through the parameterization, and is
-/// the self-check that the parameterization is faithful (it must match the reference's timing).
+/// Width 32 preserves the reference reduction order, not a production chunk-policy assertion.
 const CFGS: &[(u32, u32, &str)] = &[
     (1, 64, "w=1  wg=64  (32 keys/wave, no cross-lane op)"),
     (2, 64, "w=2  wg=64  (16 keys/wave)"),
@@ -73,6 +74,95 @@ struct Shape {
 }
 
 const HD: usize = 128;
+
+fn shapes(integrated: bool) -> Vec<Shape> {
+    if integrated {
+        return vec![
+            Shape {
+                kv_len: 40,
+                nh: 4,
+                nkv: 1,
+                chunk: 32,
+            },
+            Shape {
+                kv_len: 129,
+                nh: 4,
+                nkv: 1,
+                chunk: 128,
+            },
+            Shape {
+                kv_len: 257,
+                nh: 4,
+                nkv: 1,
+                chunk: 256,
+            },
+            Shape {
+                kv_len: 512,
+                nh: 2,
+                nkv: 2,
+                chunk: 128,
+            },
+        ];
+    }
+    vec![
+        // The B7 decode shape, scaled down: GQA g=8, several full chunks.
+        Shape {
+            kv_len: 2048,
+            nh: 32,
+            nkv: 4,
+            chunk: 512,
+        },
+        // Ragged last chunk (1000 = 3*256 + 232) — exercises the masked key tail.
+        Shape {
+            kv_len: 1000,
+            nh: 32,
+            nkv: 4,
+            chunk: 256,
+        },
+        // A chunk holding a SINGLE key (513 = 512 + 1): in that workgroup only one lane group has
+        // a valid key, so the whole tail is masked except one cluster.
+        Shape {
+            kv_len: 513,
+            nh: 16,
+            nkv: 2,
+            chunk: 512,
+        },
+        // MHA (g == 1, nh == nkv) — the other end of the workgroup→(head, chunk) decomposition.
+        Shape {
+            kv_len: 1024,
+            nh: 8,
+            nkv: 8,
+            chunk: 512,
+        },
+        // kv_len below one chunk, and fewer keys than the widest configuration's per-iteration key
+        // count (w=1 wg=128 covers 128 keys per iteration) → the pipelined loop never runs.
+        Shape {
+            kv_len: 40,
+            nh: 8,
+            nkv: 2,
+            chunk: 32,
+        },
+        // The BENCHMARKED shapes themselves, so no timed configuration goes unverified.
+        Shape {
+            kv_len: 8192,
+            nh: 32,
+            nkv: 4,
+            chunk: 512,
+        },
+        Shape {
+            kv_len: 8192,
+            nh: 32,
+            nkv: 4,
+            chunk: 256,
+        },
+        Shape {
+            kv_len: 32768,
+            nh: 32,
+            nkv: 4,
+            chunk: 512,
+        },
+    ]
+}
 
 /// Allocates one case's buffers and returns `(reference_o, dsplit_o[cfg])`.
 fn run_case(be: &VulkanBackend, s: &Shape) -> (Vec<f32>, Vec<Vec<f32>>) {
@@ -195,68 +285,10 @@ fn reference(
 
 #[test]
 fn dsplit_matches_split_reference() {
-    let Ok(be) = VulkanBackend::new() else {
-        eprintln!("skip: no Vulkan device");
+    let Some(be) = bench_support::optional_backend() else {
         return;
     };
-    let cases = [
-        // The B7 decode shape, scaled down: GQA g=8, several full chunks.
-        Shape {
-            kv_len: 2048,
-            nh: 32,
-            nkv: 4,
-            chunk: 512,
-        },
-        // Ragged last chunk (1000 = 3*256 + 232) — exercises the masked key tail.
-        Shape {
-            kv_len: 1000,
-            nh: 32,
-            nkv: 4,
-            chunk: 256,
-        },
-        // A chunk holding a SINGLE key (513 = 512 + 1): in that workgroup only one lane group has
-        // a valid key, so the whole tail is masked except one cluster.
-        Shape {
-            kv_len: 513,
-            nh: 16,
-            nkv: 2,
-            chunk: 512,
-        },
-        // MHA (g == 1, nh == nkv) — the other end of the workgroup→(head, chunk) decomposition.
-        Shape {
-            kv_len: 1024,
-            nh: 8,
-            nkv: 8,
-            chunk: 512,
-        },
-        // kv_len below one chunk, and fewer keys than the widest configuration's per-iteration key
-        // count (w=1 wg=128 covers 128 keys per iteration) → the pipelined loop never runs.
-        Shape {
-            kv_len: 40,
-            nh: 8,
-            nkv: 2,
-            chunk: 32,
-        },
-        // The BENCHMARKED shapes themselves, so no timed configuration goes unverified.
-        Shape {
-            kv_len: 8192,
-            nh: 32,
-            nkv: 4,
-            chunk: 512,
-        },
-        Shape {
-            kv_len: 8192,
-            nh: 32,
-            nkv: 4,
-            chunk: 256,
-        },
-        Shape {
-            kv_len: 32768,
-            nh: 32,
-            nkv: 4,
-            chunk: 512,
-        },
-    ];
+    let cases = shapes(be.capabilities().integrated);
     let mut worst = 0f32;
     let mut worst_w32 = 0f32;
     for s in &cases {
@@ -312,16 +344,17 @@ fn dsplit_matches_split_reference() {
 #[test]
 #[ignore = "requires a Vulkan GPU (perf micro-bench); run alone, nothing else on the GPU"]
 fn dsplit_bench() {
-    let be = VulkanBackend::new().unwrap();
-    let (nh, nkv) = (32usize, 4usize);
-    let reps = 200usize;
-    let rounds = 5usize;
-
-    // (kv_len, chunk). B7's shape is chunk=512 at both depths, but the SHIPPED policy
-    // (`adaptive_chunk`, ~32 chunks/head clamped to 64..512) picks 256 at kv_len 8192 and 512 at
-    // 32768 — so 8192 is measured BOTH ways: at 512 the reference runs only 512 workgroups on 96
-    // CUs, which is not a configuration production ever dispatches.
-    for (kv_len, chunk) in [(8192usize, 512usize), (8192, 256), (32768, 512)] {
+    let be = bench_support::backend();
+    let integrated = be.capabilities().integrated;
+    let reps = if integrated { 3 } else { 200 };
+    for Shape {
+        kv_len,
+        nh,
+        nkv,
+        chunk,
+    } in shapes(integrated)
+    {
+        println!("kv_len={kv_len} nh={nh} nkv={nkv} hd={HD} chunk={chunk}");
         let n_chunks = kv_len.div_ceil(chunk);
         let pos = kv_len - 1;
         let cache_elems = kv_len * nkv * HD;
@@ -344,18 +377,6 @@ fn dsplit_bench() {
             .unwrap();
         let o = be.alloc(nh * HD * 4, BufferUsage::Activations).unwrap();
 
-        let time = |f: &dyn Fn(&Recorder)| -> f64 {
-            let rec = be.recorder().unwrap(); // warmup: pipeline compile out of the timed region
-            f(&rec);
-            rec.finish().unwrap();
-            let t0 = std::time::Instant::now();
-            let rec = be.recorder().unwrap();
-            for _ in 0..reps {
-                f(&rec);
-            }
-            rec.finish().unwrap();
-            t0.elapsed().as_secs_f64() * 1e6 / reps as f64
-        };
         let run_ref = |rec: &Recorder| {
             reference(
                 rec,
@@ -377,17 +398,19 @@ fn dsplit_bench() {
             );
         };
 
-        // Alternate the reference around every probe leg (perf-ab-methodology: order matters), and
-        // take the MEDIAN of `rounds` sweeps — a single sweep on this GPU carries several percent.
-        let mut ref_us: Vec<f64> = Vec::new();
-        let mut cfg_us: Vec<Vec<f64>> = vec![Vec::new(); CFGS.len()];
-        // Warm-up sweep, DISCARDED: `time()`'s own single-dispatch warmup gets the pipeline
-        // compiled but not the clocks up, and the first few measured sweeps otherwise land 20-40%
-        // high — which showed up as a reference spread far wider than any effect being measured.
-        for _ in 0..2 {
-            time(&run_ref);
-            for &(width, wg, _) in CFGS {
-                time(&|rec: &Recorder| {
+        let rounds = if integrated { 1 } else { 5 };
+        let warmups = if integrated { 0 } else { 2 };
+        let mut samples = vec![Vec::<f64>::new(); CFGS.len()];
+        let mut ratios = samples.clone();
+        for sweep in 0..warmups + rounds {
+            let reference_timing =
+                bench_support::time(&be, "reference before", reps, run_ref).unwrap();
+            let Some(mut r) = reference_timing.mean_us() else {
+                println!("timing unavailable: {:?}", reference_timing.outcome);
+                return;
+            };
+            for (i, &(width, wg, name)) in CFGS.iter().enumerate() {
+                let timing = bench_support::time(&be, name, reps, |rec| {
                     rec.attention_kv_split_dsplit_at(
                         qb.as_ref(),
                         kb.as_ref(),
@@ -409,67 +432,36 @@ fn dsplit_bench() {
                         width,
                         wg,
                     );
-                });
+                })
+                .unwrap();
+                let Some(m) = timing.mean_us() else {
+                    println!("{name}: timing unavailable: {:?}", timing.outcome);
+                    return;
+                };
+                let after = bench_support::time(&be, "reference after", reps, run_ref).unwrap();
+                let Some(next_r) = after.mean_us() else {
+                    println!("timing unavailable: {:?}", after.outcome);
+                    return;
+                };
+                if sweep >= warmups {
+                    samples[i].push(m);
+                    ratios[i].push((r + next_r) / (2.0 * m));
+                }
+                r = next_r;
             }
         }
-        for _ in 0..rounds {
-            ref_us.push(time(&run_ref));
-            for (i, &(width, wg, _)) in CFGS.iter().enumerate() {
-                cfg_us[i].push(time(&|rec: &Recorder| {
-                    rec.attention_kv_split_dsplit_at(
-                        qb.as_ref(),
-                        kb.as_ref(),
-                        vb.as_ref(),
-                        ka,
-                        va,
-                        o.as_ref(),
-                        pm.as_ref(),
-                        pl.as_ref(),
-                        pacc.as_ref(),
-                        pos,
-                        kv_len,
-                        nh,
-                        nkv,
-                        HD,
-                        chunk,
-                        n_chunks,
-                        0.0,
-                        width,
-                        wg,
-                    );
-                }));
-                ref_us.push(time(&run_ref));
-            }
-        }
-        let med = |v: &mut Vec<f64>| -> f64 {
-            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            v[v.len() / 2]
-        };
-        let spread = |v: &[f64]| -> f64 {
-            let (lo, hi) = v
-                .iter()
-                .fold((f64::MAX, 0f64), |(l, h), &x| (l.min(x), h.max(x)));
-            (hi - lo) / lo * 100.0
-        };
-        let rspread = spread(&ref_us);
-        let r = med(&mut ref_us);
-        println!(
-            "\n=== kv_len={kv_len}  nh={nh} nkv={nkv} hd={HD} chunk={chunk} n_chunks={n_chunks} \
-             ({} workgroups)  reps={reps} rounds={rounds} ===",
-            nh * n_chunks
-        );
-        println!(
-            "  {:52} {:>9}  {:>7}  {:>7}",
-            "leg (pass1 + attn_combine)", "us/disp", "vs ref", "spread"
-        );
-        println!(
-            "  {:52} {r:9.1}  {:>7}  {rspread:6.1}%",
-            "attention_kv_split_at (SHIPPED reference)", "1.00x"
-        );
-        for (i, (_, _, name)) in CFGS.iter().enumerate() {
-            let sp = spread(&cfg_us[i]);
-            let m = med(&mut cfg_us[i]);
-            println!("  {name:52} {m:9.1}  {:6.2}x  {sp:6.1}%", r / m);
+        for (i, &(_, _, name)) in CFGS.iter().enumerate() {
+            samples[i].sort_by(f64::total_cmp);
+            ratios[i].sort_by(f64::total_cmp);
+            println!(
+                "{name}: median {:.1} us/op (spread {:.1}..{:.1}), paired vs reference median {:.2}x (spread {:.2}..{:.2})",
+                samples[i][rounds / 2],
+                samples[i][0],
+                samples[i][rounds - 1],
+                ratios[i][rounds / 2],
+                ratios[i][0],
+                ratios[i][rounds - 1]
+            );
         }
     }
 }

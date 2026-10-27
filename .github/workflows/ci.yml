@@ -3,12 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch: {}
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -290,3 +291,183 @@ jobs:
             throw "infr run produced no output on stdout"
           }
           Write-Host "generated: $out"
+
+  # Release packaging, after the sibling repos (hrdr, gpur, krypt). Runs on every
+  # main push as a packaging dry run and on every v* tag; PRs skip it. Uploading
+  # to a GitHub Release is the separate, tag-gated job below.
+  #
+  # Linux goes through `cargo zigbuild` against glibc 2.28 so the binary runs on
+  # distros older than the runner; zig also compiles the C/C++ that `tokenizers`
+  # (esaxx-rs, onig_sys) and `ring` pull in. No musl targets: ash loads
+  # libvulkan with dlopen, which a static musl binary cannot do. `glslc` runs on
+  # the HOST inside `infr-vulkan/build.rs`, so the x86_64 one serves the
+  # aarch64 cross build too.
+  dist:
+    name: Package ${{ matrix.target }}
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+            zigbuild_target: x86_64-unknown-linux-gnu.2.28
+            macos_min: ""
+            archive: tar.gz
+          - os: ubuntu-26.04
+            target: aarch64-unknown-linux-gnu
+            zigbuild_target: aarch64-unknown-linux-gnu.2.28
+            macos_min: ""
+            archive: tar.gz
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            zigbuild_target: ""
+            macos_min: ""
+            archive: zip
+          - os: macos-15
+            target: aarch64-apple-darwin
+            zigbuild_target: ""
+            macos_min: "11.0"
+            archive: tar.gz
+          - os: macos-15
+            target: x86_64-apple-darwin
+            zigbuild_target: ""
+            macos_min: "10.15"
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$CARGO_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME != Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+      - uses: ./.github/actions/install-glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          cache: false
+      - run: rustup update --no-self-update stable
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dist-${{ matrix.target }}
+      - name: Setup zig
+        if: matrix.zigbuild_target != ''
+        uses: step-security/setup-zig@1e9fbd457bcc3587b58845344a267f12f151709c # v2.2.2
+        with:
+          version: "0.15.1"
+      - name: Install cargo-zigbuild
+        if: matrix.zigbuild_target != ''
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build binary (zigbuild)
+        if: matrix.zigbuild_target != ''
+        run:
+          cargo zigbuild --release --locked --target ${{ matrix.zigbuild_target
+          }} -p infr-cli --bin infr
+      - name: Build binary (native)
+        if: matrix.zigbuild_target == ''
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
+        run:
+          cargo build --release --locked --target ${{ matrix.target }} -p
+          infr-cli --bin infr
+      # Every target the runner can execute, so a binary that links but cannot
+      # start (a missing DLL, a too-new glibc symbol) fails here, not for a user.
+      - name: Smoke artifact
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: ./target/${{ matrix.target }}/release/infr --version
+      # Branch refs can contain `/`; tags never do.
+      - name: Package (Linux / macOS)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          REF=${GITHUB_REF_NAME//\//-}
+          ARCHIVE="infr-${REF}-${{ matrix.target }}.tar.gz"
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/infr dist/
+          cp README.md LICENSE dist/
+          tar -czf "$ARCHIVE" -C dist .
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          fi
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ref = $env:GITHUB_REF_NAME -replace '/', '-'
+          $archive = "infr-$ref-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/infr.exe dist/
+          Copy-Item README.md, LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath $archive
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: infr-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            infr-*.tar.gz
+            infr-*.tar.gz.sha256
+            infr-*.zip
+            infr-*.zip.sha256
+
+  # Gated on every check job, so a red check SKIPS the release rather than
+  # shipping past it — read the run's job list, not its summary, after a tag.
+  publish-github-release:
+    name: Publish GitHub Release
+    needs:
+      [
+        dist,
+        fmt,
+        clippy,
+        docs,
+        test,
+        cpu-goldens,
+        build,
+        metal-check,
+        test-macos,
+        windows-smoke,
+      ]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: infr-*
+          merge-multiple: true
+          path: dist
+      - name: Completions + man page
+        run: |
+          # Archive entries are prefixed ./ (tar -C dist .)
+          tar -xzf dist/infr-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz ./infr
+          mkdir -p pkgext/completions
+          for shell in bash zsh fish powershell elvish nushell; do
+            ./infr --completions "$shell" > "pkgext/completions/infr.$shell"
+          done
+          ./infr --man > pkgext/infr.1
+          tar -C pkgext -czf dist/infr-${GITHUB_REF_NAME}-completions-man.tar.gz .
+      - name: Aggregate checksums
+        working-directory: dist
+        run: sha256sum $(ls infr-* | grep -v '\.sha256$') > SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

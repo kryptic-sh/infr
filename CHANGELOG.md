@@ -170,6 +170,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Prebuilt release binaries.** A `v*` tag now builds `infr` for
+  `x86_64`/`aarch64-unknown-linux-gnu` (glibc 2.28 and up),
+  `x86_64-pc-windows-msvc`, and `aarch64`/`x86_64-apple-darwin`. It attaches
+  each one to a GitHub Release as a `.tar.gz` or `.zip` with a `.sha256`
+  sidecar, together with a `SHA256SUMS` file and a shell-completions plus man
+  page tarball. Installing no longer means building from source with `glslc`.
+
 - **`infr-plat`, the platform seam.** Every direct use of an operating system —
   file locks, positioned reads and writes, the content-addressed store's link
   step, the host-memory probe, process liveness, signal handlers, config/cache

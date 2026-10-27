@@ -466,7 +466,7 @@ impl SeamModel {
     /// the VRAM budget — a long-context model's trained window (128k+) would otherwise allocate
     /// a KV cache that blows VRAM at startup or on the first request. Explicit contexts
     /// (INFR_CTX → `vulkan_session(ctx)`) are NEVER clamped: they get a q8_0 cache when only
-    /// that fits ([`auto_q8_for_explicit_ctx`](Self::auto_q8_for_explicit_ctx)), and the Vulkan
+    /// that fits (`auto_q8_for_explicit_ctx`), and the Vulkan
     /// allocation budget guard still fails a truly-oversized one cleanly at alloc time.
     pub fn vulkan_session_default(&self) -> Result<DenseVulkanSession> {
         self.vulkan_session_default_on(None)

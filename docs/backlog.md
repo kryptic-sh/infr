@@ -2936,28 +2936,20 @@ could not be satisfied.
 parse failure and test that successful required/named responses always carry the
 requested tool.
 
-### Medium — request deadline does not stop prompt prefill
+### Decision — a deadline that fires during prefill returns HTTP 500
 
-The server deadline sets its `cancel` atomic at
-`crates/infr-server/src/lib.rs:1493`, but `run_chat` creates a distinct
-`RequestCtx` abort latch at `crates/infr-cli/src/main.rs:1936`. The prefill loop
-polls only `RequestCtx` through `abort_requested` at
-`crates/infr-llama/src/seam/runner.rs:5312`; the external cancellation is copied
-into that context only from the generated-piece callback at
-`crates/infr-cli/src/main.rs:2015`, after prefill.
+Since the prefill fix, a `serve.request_timeout_secs` deadline that fires before
+the first token makes `run_chat` fail with
+`aborted: request cancelled during prompt prefill`. The non-streaming handler
+answers every generator error with `500 server_error`, and the streaming one
+sends an error frame. A deadline hit AFTER output started is a `200` with
+`finish_reason: "length"`. Verified on CPU with Qwen3-0.6B (2026-10-27).
 
-**Repro:** set `serve.request_timeout_secs` below the runtime of a long,
-multi-chunk prompt prefill.
-
-**Expect:** the in-flight chunk drains, then the next prefill-boundary poll
-stops the request.
-
-**Actual:** every prefill chunk runs; cancellation reaches `RequestCtx` only
-when generation emits its first piece.
-
-**Action:** make `RequestCtx` directly observe the server cancellation source,
-or expose the exact abort handle to the deadline; test cancellation during a
-prefill-only interval.
+Options: keep the 500 (honest: nothing was produced), or map
+`deadline_hit && Err` to `504 Gateway Timeout` / a `timeout` error type so
+clients can retry it differently from a crash. Needs the user's call on the
+status code; the change itself is a few lines in `infr-server`'s two chat
+handlers.
 
 ### Cleared
 

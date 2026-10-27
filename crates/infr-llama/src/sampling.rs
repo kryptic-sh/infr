@@ -137,6 +137,10 @@ pub struct RequestCtx {
     /// Latched by [`abort`](Self::abort) from inside a streaming callback (the server's
     /// stop-sequence matcher); polled once per decoded token by the decode loop.
     abort: std::sync::atomic::AtomicBool,
+    /// A latch set from OUTSIDE the generation — the server's per-request cancel, which its
+    /// deadline and its client-disconnect check set. Read on every poll, so it stops a prefill
+    /// that has not produced a piece yet, which no `on_piece` callback can.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// This sequence's turn-taking baton on the GPU (`None` = sole user, e.g. `infr run`).
     gate: Option<std::sync::Arc<StepGate>>,
 }
@@ -147,6 +151,7 @@ impl RequestCtx {
         Self {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
+            cancel: None,
             gate: None,
         }
     }
@@ -157,8 +162,15 @@ impl RequestCtx {
         Self {
             sampling,
             abort: std::sync::atomic::AtomicBool::new(false),
+            cancel: None,
             gate: Some(gate),
         }
+    }
+
+    /// Also stop when `cancel` is set, at the same poll sites as [`abort`](Self::abort).
+    pub fn with_cancel(mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     pub fn sampling(&self) -> &RequestSampling {
@@ -173,9 +185,14 @@ impl RequestCtx {
         self.abort.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Polled by the decode loop once per token (one relaxed atomic load — no allocation, no lock).
-    pub(crate) fn aborted(&self) -> bool {
+    /// Polled by the decode loop once per token and the prefill loop once per chunk (relaxed atomic
+    /// loads — no allocation, no lock).
+    pub fn aborted(&self) -> bool {
         self.abort.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Take this sequence's turn on the GPU, blocking until the baton reaches it. `None` (no gate)
@@ -791,6 +808,26 @@ mod tests {
         assert!(!abort_requested(Some(&b)), "B must NOT see A's abort");
         // And a non-serve caller (run/bench/tests/goldens) has no latch at all.
         assert!(!abort_requested(None));
+    }
+
+    /// The server's own cancel latch is seen at every poll, with nothing in between to copy it
+    /// across, and only by the sequence it was handed to.
+    #[test]
+    fn a_linked_cancel_aborts_its_own_sequence() {
+        use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
+        let cancel = Arc::new(AtomicBool::new(false));
+        let linked = RequestCtx::new(RequestSampling::default()).with_cancel(cancel.clone());
+        let other = RequestCtx::new(RequestSampling::default());
+        assert!(!abort_requested(Some(&linked)));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            abort_requested(Some(&linked)),
+            "the linked cancel was not seen"
+        );
+        assert!(
+            !abort_requested(Some(&other)),
+            "an unlinked sequence saw it"
+        );
     }
 
     /// `seed: 42` must reproduce byte-identically no matter how many other sequences are in flight.

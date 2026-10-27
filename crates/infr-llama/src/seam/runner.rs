@@ -5310,7 +5310,10 @@ pub(crate) fn generate_dense_backend(
                 // so this is an error and not a partial success; the CLI turns the latched signal
                 // into the conventional 130/143 exit status regardless of what this call returns.
                 if crate::sampling::abort_requested(req) {
-                    anyhow::bail!("aborted: shutdown requested");
+                    if infr_core::shutdown::shutdown_requested() {
+                        anyhow::bail!("aborted: shutdown requested");
+                    }
+                    anyhow::bail!("aborted: request cancelled during prompt prefill");
                 }
                 // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
                 // the baton to whichever sequence has been waiting longest.

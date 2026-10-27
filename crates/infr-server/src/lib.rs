@@ -88,9 +88,11 @@ pub trait ChatGenerator: Send + Sync {
     ///   reference so the generator parses the ONE it was already given instead of a
     ///   `Value`→string→`Value` round-trip (see audit finding 6).
     /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client disconnects (an
-    ///   SSE `send` starts failing); the generator must poll it in its decode loop and stop promptly
-    ///   so the GPU slot is freed rather than held to `max_tokens`. It is ORed with the process-wide
-    ///   shutdown latch, never a replacement for it.
+    ///   SSE `send` starts failing) or the request deadline fires; the generator must poll it in its
+    ///   prefill AND decode loops and stop promptly so the GPU slot is freed rather than held to
+    ///   `max_tokens`. An `Arc` so the generator can keep it for the whole call — a deadline that
+    ///   fires during prefill comes before any piece, so a copy made from a streaming callback is
+    ///   too late. It is ORed with the process-wide shutdown latch, never a replacement for it.
     /// * Returns a [`ChatOutcome`] carrying the finish reason AND the real prompt/completion token
     ///   counts so the handler can populate `usage` truthfully.
     fn chat(
@@ -99,7 +101,7 @@ pub trait ChatGenerator: Send + Sync {
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &GenParams,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
 }
@@ -2217,7 +2219,7 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
             on_delta(Delta::Content(format!("from:{}", self.0)));
@@ -3298,7 +3300,7 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            cancel: &AtomicBool,
+            cancel: &Arc<AtomicBool>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
             on_delta(Delta::Content("partial".into()));
@@ -3490,7 +3492,7 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
             on_delta(Delta::Content("partial".into()));
@@ -3543,7 +3545,7 @@ mod tests {
             _tools: Option<&serde_json::Value>,
             _tool_choice: Option<&str>,
             _params: &GenParams,
-            _cancel: &AtomicBool,
+            _cancel: &Arc<AtomicBool>,
             on_delta: &mut dyn FnMut(Delta),
         ) -> anyhow::Result<ChatOutcome> {
             on_delta(Delta::Content("partial".into()));

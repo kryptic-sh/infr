@@ -1837,7 +1837,7 @@ impl infr_server::ChatGenerator for SeamGenerator {
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
         run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
@@ -1851,7 +1851,7 @@ impl infr_server::ChatGenerator for ParallelGenerator {
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
         params: &infr_server::GenParams,
-        cancel: &std::sync::atomic::AtomicBool,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
         on_delta: &mut dyn FnMut(infr_engine::Delta),
     ) -> anyhow::Result<infr_server::ChatOutcome> {
         run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
@@ -1882,7 +1882,7 @@ fn run_chat(
     tools: Option<&serde_json::Value>,
     tool_choice: Option<&str>,
     params: &infr_server::GenParams,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
     on_delta: &mut dyn FnMut(infr_engine::Delta),
 ) -> anyhow::Result<infr_server::ChatOutcome> {
     {
@@ -1901,8 +1901,12 @@ fn run_chat(
             .unwrap_or_else(|| be.max_new_default());
         // THIS sequence's own sampling (temperature/top_p/top_k/seed/penalties) + abort latch + GPU
         // turn. Owned by this call — not installed anywhere ambient — so it cannot be observed by,
-        // or leak into, any other in-flight request.
-        let req = be.request_ctx(request_sampling(params));
+        // or leak into, any other in-flight request. The server's `cancel` (client disconnect or
+        // deadline) is linked in rather than copied from a piece callback, so it also stops a
+        // prefill that has not produced a piece yet.
+        let req = be
+            .request_ctx(request_sampling(params))
+            .with_cancel(cancel.clone());
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
         // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
@@ -1916,13 +1920,7 @@ fn run_chat(
                 max_new,
                 Some(&mut constraint),
                 &req,
-                &mut |p: &str| {
-                    body.push_str(p);
-                    // Client disconnected (server latched `cancel`): stop this constrained decode.
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        req.abort();
-                    }
-                },
+                &mut |p: &str| body.push_str(p),
             ) {
                 Ok(gstats) => {
                     tokens = (gstats.n_prompt as u32, gstats.n_gen as u32);
@@ -1986,9 +1984,9 @@ fn run_chat(
                 if !safe.is_empty() {
                     stream.push(&safe, &mut *od);
                 }
-                // A stop sequence hit OR a client disconnect (the server latched `cancel`) both
-                // abort THIS sequence's decode at its next poll, freeing the GPU slot promptly.
-                if stops.hit() || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                // A stop sequence hit aborts THIS sequence's decode at its next poll, freeing the
+                // GPU slot promptly (the server's `cancel` already reaches it through `req`).
+                if stops.hit() {
                     req.abort();
                 }
             })?;

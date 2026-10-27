@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`serve.request_timeout_secs` now stops a request during prompt prefill.**
+  The server's cancel latch reached the generation only through the first
+  generated piece, so a deadline shorter than the prefill let every chunk run
+  (on CPU, a 3,512-token prompt with a 1 s deadline still took 31.8 s and held
+  its slot throughout). `RequestCtx::with_cancel` now links the latch into the
+  per-request abort that the prefill loop polls between chunks, so the request
+  ends at the next chunk boundary. A deadline that fires before any output
+  returns an `aborted: request cancelled during prompt prefill` error instead of
+  the misleading `shutdown requested`. `ChatGenerator::chat` now takes
+  `cancel: &Arc<AtomicBool>`.
+
 - **A resumed single-stream download no longer gets stuck or splices the wrong
   bytes.** A partial that already held the whole file (interrupted after the
   last byte, before the commit) got `416 Range Not Satisfiable` on every retry

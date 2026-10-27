@@ -1960,7 +1960,7 @@ impl VulkanBackend {
         }
 
         // ── build extension name list (only available ones) ────────────────────
-        let mut ext_ptrs: Vec<*const i8> = Vec::new();
+        let mut ext_ptrs: Vec<*const std::ffi::c_char> = Vec::new();
         if has_coop_matrix {
             ext_ptrs.push(c"VK_KHR_cooperative_matrix".as_ptr());
         }

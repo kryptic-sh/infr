@@ -369,61 +369,36 @@ is defensible where silently handing back less than asked is not.
 means "of free VRAM" (today) or "of what can actually be allocated" before
 changing it; either way it is one `spec.resolve` argument per arm.
 
-### B12 — an explicit `--ctx N` never reaches the refuse rung
+### B12 — an explicit `--ctx N` that fits in no KV format still fails late
 
-**Tag:** raised 2026-08-02 · **Blocked on:** nothing — the product decision was
-made 2026-08-12, see "DECIDED" at the end of this entry
+**Tag:** raised 2026-08-02 · **Blocked on:** nothing; the q8 half shipped
+2026-10-27
 
-`SeamModel::clamp_default_ctx` gained a refuse rung: when neither f16 nor q8_0
-can serve even `MIN_SESSION_CTX` tokens it returns an `Err` naming the requested
-context, both fits, the KV bytes needed and the free bytes after weights,
-instead of handing back an unusable window.
+**DECIDED 2026-08-12 (user):** an explicit `--ctx N` that does not fit must try
+q8_0 KV first — _"when setting `--ctx` that would not fit in VRAM using k/v
+cache, have infr auto quant the context to Q8_0 if it will fit"_ — so the
+explicit path walks f16, then q8_0, then refuse.
 
-It only ever sees the MODEL-DEFAULT context. A user-supplied `--ctx N` /
-`INFR_CTX=N` is taken verbatim — `vulkan_session_on` and `vulkan_slot_ctx`'s
-`SizeSpec::Bytes` arm both return it without consulting the fit math — and fails
-later at allocation time with the generic VRAM-guard message. That is the case
-where "refuse rather than silently degrade" has the most force, and it is the
-one not covered.
+**Shipped:** `SeamModel::auto_q8_for_explicit_ctx` (decision in the pure
+`explicit_ctx_q8_fit`, unit-tested) runs from `vulkan_session_on` and from
+`vulkan_slot_ctx`'s `SizeSpec::Bytes` arm, pricing `want * n_slots` caches. It
+pins q8_0 for that session's placement scope when f16 misses and q8_0 holds the
+whole window, and keeps the window as asked.
 
-The narrowness of the default-path rung is also deliberate and should not be
-widened by accident: refusing whenever the TRAINED window does not fit would
-break every ordinary long-context model on a 24 GiB card (Qwen3-30B-A3B clamps
-262144 → ~50k and runs at 148 t/s; gemma-4-31B clamps 262144 → 14 592 and fills
-it at 30.3 t/s). Only "no usable context at all" may refuse.
+**Not done: the refuse rung.** A window that fits in neither format is still
+honoured and fails at the alloc-time VRAM guard with its generic message, after
+`reclamp_ctx_to_live_room`'s warning. An early refusal with
+`clamp_default_ctx`'s detailed message must be **provable**: exact KV bytes +
+weights vs `alloc_room()`, with no activation reserve, so an over-estimate can
+never refuse a run that would have worked. `kv_fit_ctx` includes the dense
+activation reserve, so it cannot be reused for that as-is.
 
-**To do:** decide whether an explicit oversized `--ctx` should fail early with
-the detailed message (a behaviour change on a path documented as "never clamped
-— the user asked") or keep failing at the alloc guard. If early: the check must
-be provable, i.e. exact KV bytes alone + weights > `alloc_room()`, with no
-activation reserve in it, so an over-estimating reserve can never refuse a run
-that would have worked.
-
-**Since 2026-08-04 the explicit path at least says so first.**
-`reclamp_ctx_to_live_room` runs on it too and WARNs, naming the window that does
-fit the device's measured free memory, before honoring the one that was asked
-for. The decision above is now only about whether to escalate that warning to an
-error — and the "provable check" it asks for is exactly what that path already
-computes.
-
-**DECIDED 2026-08-12 (user).** An explicit `--ctx N` that does not fit **must
-try q8_0 KV before doing anything else**: _"when setting `--ctx` that would not
-fit in VRAM using k/v cache, have infr auto quant the context to Q8_0 if it will
-fit."_ So the explicit path walks the same ladder `clamp_default_ctx` already
-has — f16, then q8_0, then refuse — instead of being taken verbatim and failing
-later at the alloc guard. Quantizing to serve the window the user asked for is
-preferred over clamping the window; refusing stays the last rung.
-
-To implement: route `vulkan_session_on` and `vulkan_slot_ctx`'s
-`SizeSpec::Bytes` arm through the fit math rather than returning the value
-verbatim. Two constraints from above still bind — the check must be **provable**
-(exact KV bytes + weights vs `alloc_room()`, no activation reserve in it), and
-the DEFAULT-path refuse rung must not widen (only "no usable context at all" may
-refuse, or every ordinary long-context model breaks on a 24 GiB card).
-
-Sequencing note: this is one rung of the ladder in `vram-audit-2026-07-12` (SWA
-→ q8 → clamp → stream → KV-overflow last), and the rung ORDER itself is what B62
-asks someone to verify.
+**Not observed:** the q8 pin itself in a real run. Reaching it means an explicit
+window close to the whole device, which on this box means filling the iGPU's
+shared memory or using the dGPU, both off-limits. Only the decision function is
+tested. The DEFAULT-path refuse rung stays as narrow as it was: only "no usable
+context at all" may refuse, or every ordinary long-context model breaks on a 24
+GiB card.
 
 ### B13 — the `+64` rows in every KV footprint estimate is slop, not padding
 

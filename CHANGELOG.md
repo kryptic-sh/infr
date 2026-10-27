@@ -174,6 +174,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **An explicit `--ctx N` that an f16 KV cache cannot hold now gets q8_0.** The
+  default context already tried a q8_0 cache before clamping. A window the user
+  chose (`--ctx N` / `INFR_CTX=N`, including per slot under `--parallel`) was
+  taken as given and failed at allocation if f16 did not fit. It now switches
+  the cache to q8_0 when that holds the whole window, with a warning, and keeps
+  the window as asked. A window that fits in neither format still fails at the
+  VRAM guard, and setting `INFR_KV_TYPE_K/V` still wins.
+
 - **Q4_K Vulkan MMQ unpacks weights with aligned word reads.**
   `native_gemm_mmq_q4k.comp` masks packed nibbles instead of reconstructing each
   word byte by byte, preserving scales, accumulation order and watchdog limits.

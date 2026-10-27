@@ -107,6 +107,25 @@ fn pick_continuation(
         .map(|(idx, _, _)| idx)
 }
 
+/// The q8_0 KV capacity that serves an explicit `want`-token context across `n_slots` caches,
+/// when f16 cannot: `Some` only if the `fit` f16 tokens fall short, q8 is allowed at all, and
+/// `fit_q8` (asked lazily, since it re-runs the fit math) reaches the whole demand.
+///
+/// Split out as a pure fn so the rung is unit-testable without a live backend.
+fn explicit_ctx_q8_fit(
+    want: usize,
+    n_slots: usize,
+    fit: usize,
+    may_auto_q8: bool,
+    fit_q8: impl FnOnce() -> Option<usize>,
+) -> Option<usize> {
+    let need = want.saturating_mul(n_slots);
+    if fit >= need || !may_auto_q8 {
+        return None;
+    }
+    fit_q8().filter(|&f| f >= need)
+}
+
 /// Open a Vulkan backend on physical device `dev`: `Some(idx)` pins `VulkanN`
 /// ([`infr_vulkan::VulkanBackend::new_on_with`], bypassing `device.dev`/the discrete-default rule
 /// for the multi-device path), `None` is the historical default
@@ -427,12 +446,18 @@ impl SeamModel {
         max_ctx: usize,
     ) -> Result<DenseVulkanSession> {
         let vk = open_backend(dev, self.ecfg.clone())?;
+        // The auto-q8 rung may pin this session's KV format, so it runs under THIS session's
+        // placement scope, as in `vulkan_session_default_on`.
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        let scope = crate::seam::PlacementScope::enter(pins.clone());
+        self.auto_q8_for_explicit_ctx(&vk, max_ctx, 1);
+        drop(scope);
         Ok(DenseVulkanSession {
             be: vk,
             pool: SlotPool::new(),
             max_ctx,
             cfg: self.ecfg.clone(),
-            ext: VulkanSessionPins(std::sync::Arc::new(crate::seam::PlacementPins::default())),
+            ext: VulkanSessionPins(pins),
         })
     }
 
@@ -440,8 +465,9 @@ impl SeamModel {
     /// trained context (`n_ctx_train`) clamped so weights + KV cache + activation headroom fit
     /// the VRAM budget — a long-context model's trained window (128k+) would otherwise allocate
     /// a KV cache that blows VRAM at startup or on the first request. Explicit contexts
-    /// (INFR_CTX → `vulkan_session(ctx)`) are NEVER clamped; the Vulkan allocation budget
-    /// guard still fails a truly-oversized one cleanly at alloc time.
+    /// (INFR_CTX → `vulkan_session(ctx)`) are NEVER clamped: they get a q8_0 cache when only
+    /// that fits ([`auto_q8_for_explicit_ctx`](Self::auto_q8_for_explicit_ctx)), and the Vulkan
+    /// allocation budget guard still fails a truly-oversized one cleanly at alloc time.
     pub fn vulkan_session_default(&self) -> Result<DenseVulkanSession> {
         self.vulkan_session_default_on(None)
     }
@@ -522,7 +548,9 @@ impl SeamModel {
     /// window is bigger than this card" — a 262144-token trained window on a 24 GiB card is
     /// completely ordinary (Qwen3-30B-A3B) and must keep clamping to a working ~50k, not refuse.
     /// A context the USER asked for explicitly (`--ctx N` / `INFR_CTX=N`) never reaches this
-    /// function at all: those are taken verbatim and backstopped by the alloc-time VRAM guard.
+    /// function at all: those are taken verbatim, given q8_0 by
+    /// [`auto_q8_for_explicit_ctx`](Self::auto_q8_for_explicit_ctx) when only that fits, and
+    /// backstopped by the alloc-time VRAM guard.
     ///
     /// Extra KV slots (INFR_KV_SLOTS forks) and MoE expert host-offload aren't modeled — the
     /// alloc-time budget guard remains the backstop for those.
@@ -535,13 +563,11 @@ impl SeamModel {
         }
         // Auto-q8 KV rung, clamp flavor (see `crate::seam::PlacementPins` for the policy): before
         // shrinking the DEFAULT context below the trained window, try a Q8_0 KV cache — roughly
-        // half the bytes per token. Dense non-MoE models only, matching the placement rung this
-        // was validated on (MoE placement budgets pager arenas separately from this fit math).
-        let may_auto_q8 = self.cfg.moe.is_none()
-            && !crate::seam::kv_auto_q8()
-            && crate::seam::kv_unset(&self.ecfg)
-            && crate::seam::kv_q8_layout_ok(&self.cfg);
-        let fit_q8 = may_auto_q8.then(|| self.kv_fit_ctx_fmt(vk, true)).flatten();
+        // half the bytes per token.
+        let fit_q8 = self
+            .may_auto_q8()
+            .then(|| self.kv_fit_ctx_fmt(vk, true))
+            .flatten();
         if fit_q8.is_some_and(|f| f >= want) {
             crate::seam::pin_kv_auto_q8();
             tracing::warn!(
@@ -634,6 +660,49 @@ impl SeamModel {
             if vram.live { ", live" } else { ", total heap" },
         );
         Ok(fit)
+    }
+
+    /// Whether a fit may switch the KV cache to Q8_0 on its own: the user set no KV format and no
+    /// earlier rung already pinned one, and the model is dense (non-MoE) with a q8-compatible
+    /// layout — the placement rung this was validated on, since MoE placement budgets pager arenas
+    /// separately from this fit math.
+    fn may_auto_q8(&self) -> bool {
+        self.cfg.moe.is_none()
+            && !crate::seam::kv_auto_q8()
+            && crate::seam::kv_unset(&self.ecfg)
+            && crate::seam::kv_q8_layout_ok(&self.cfg)
+    }
+
+    /// The auto-q8 rung for a context the USER chose (`--ctx N` / `INFR_CTX=N`), which is never
+    /// clamped: when `n_slots` f16 caches of `want` tokens do not fit but q8_0 ones do, pin q8_0
+    /// for the current placement scope so the window that was asked for is served. Otherwise
+    /// nothing changes, and a window that fits in neither format still meets the alloc-time VRAM
+    /// guard, as before.
+    fn auto_q8_for_explicit_ctx(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        want: usize,
+        n_slots: usize,
+    ) {
+        let Some(fit) = self.kv_fit_ctx(vk) else {
+            return; // pure recurrent-state arch: no per-token KV to size.
+        };
+        let Some(fit_q8) = explicit_ctx_q8_fit(want, n_slots, fit, self.may_auto_q8(), || {
+            self.kv_fit_ctx_fmt(vk, true)
+        }) else {
+            return;
+        };
+        crate::seam::pin_kv_auto_q8();
+        tracing::warn!(
+            requested_ctx = want,
+            slots = n_slots,
+            f16_fit_ctx = fit,
+            q8_fit_ctx = fit_q8,
+            kv_dtype = "q8_0",
+            "kv auto-quant: q8_0 KV cache — an f16 cache cannot hold the requested context {want} \
+             (fits {fit} tokens in total); set INFR_KV_TYPE_K/V=f16 to force f16 (decode is ~10-16% \
+             slower on q8)"
+        );
     }
 
     /// The VRAM-fit KV capacity in tokens: the LARGEST context whose KV cache — priced as the
@@ -840,9 +909,12 @@ impl SeamModel {
         want: Option<infr_core::SizeSpec>,
     ) -> Result<usize> {
         let n_slots = n_slots.max(1);
-        // An explicit token count is the user's demand — honour it verbatim, at any N.
+        // An explicit token count is the user's demand — honour it verbatim, at any N, quantizing
+        // the cache to q8_0 when that is what it takes to fit.
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
-            return Ok((c as usize).max(1));
+            let ctx = (c as usize).max(1);
+            self.auto_q8_for_explicit_ctx(vk, ctx, n_slots);
+            return Ok(ctx);
         }
         if n_slots == 1 && want.is_none() {
             return self.clamp_default_ctx(vk, self.cfg.n_ctx_train);
@@ -2454,5 +2526,57 @@ mod pick_continuation_tests {
         assert_eq!(pick_continuation(candidates, 100), None);
         // Empty candidate set.
         assert_eq!(pick_continuation(std::iter::empty(), 100), None);
+    }
+}
+
+#[cfg(test)]
+mod explicit_ctx_q8_tests {
+    use super::explicit_ctx_q8_fit;
+
+    /// The B12 rung: an explicit window f16 cannot hold gets q8_0 when q8_0 holds all of it.
+    #[test]
+    fn q8_serves_a_window_f16_cannot() {
+        assert_eq!(
+            explicit_ctx_q8_fit(8000, 1, 5000, true, || Some(9000)),
+            Some(9000)
+        );
+    }
+
+    /// Never quantize what already fits, and never ask the second fit for nothing.
+    #[test]
+    fn a_fitting_window_stays_f16() {
+        let probe = || panic!("the q8 fit must not be computed when f16 fits");
+        assert_eq!(explicit_ctx_q8_fit(5000, 1, 5000, true, probe), None);
+    }
+
+    /// q8_0 that still falls short is not a rescue: the window stays as asked, f16, and meets the
+    /// alloc guard exactly as before. So is a model or config where auto-q8 is not allowed.
+    #[test]
+    fn no_partial_or_forbidden_rescue() {
+        assert_eq!(
+            explicit_ctx_q8_fit(8000, 1, 5000, true, || Some(7999)),
+            None
+        );
+        assert_eq!(explicit_ctx_q8_fit(8000, 1, 5000, true, || None), None);
+        let probe = || panic!("a forbidden q8 rung must not run the fit");
+        assert_eq!(explicit_ctx_q8_fit(8000, 1, 5000, false, probe), None);
+    }
+
+    /// Each `--parallel` slot owns a full cache, so the demand is the window times the slots.
+    #[test]
+    fn every_slot_owns_a_cache() {
+        assert_eq!(
+            explicit_ctx_q8_fit(4000, 2, 6000, true, || Some(9000)),
+            Some(9000)
+        );
+        assert_eq!(
+            explicit_ctx_q8_fit(4000, 3, 6000, true, || Some(9000)),
+            None
+        );
+        assert_eq!(
+            explicit_ctx_q8_fit(4000, 1, 6000, true, || Some(9000)),
+            None,
+            "f16 fits one"
+        );
     }
 }

@@ -24,8 +24,18 @@ runs:
     - name: Install glslc (Vulkan SDK)
       if: runner.os == 'Windows'
       shell: pwsh
+      # Retried because the community feed times out now and then (a 504 on 2026-10-27 failed
+      # every Windows job of a run), and one flake here skips the whole release.
       run: |
-        choco install vulkan-sdk --no-progress -y
+        # A failed attempt must reach the retry below, not end the step.
+        $PSNativeCommandUseErrorActionPreference = $false
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+          choco install vulkan-sdk --no-progress -y
+          if ($LASTEXITCODE -eq 0) { break }
+          if ($attempt -eq 3) { throw "choco install vulkan-sdk failed $attempt times" }
+          Write-Warning "choco install vulkan-sdk failed (exit $LASTEXITCODE); retrying in 30s"
+          Start-Sleep -Seconds 30
+        }
         $bin = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
           Sort-Object Name -Descending |
           ForEach-Object { Join-Path $_.FullName 'Bin' } |

@@ -951,31 +951,6 @@ Worth keeping either way: `rustup target list --installed` claimed
 `$(rustc --print sysroot)/lib/rustlib/` did not contain it, so a local
 cross-check has to be run against a target confirmed in the sysroot.
 
-### B71 — bare `S<n>` / `§N.N` labels point at a deleted doc (2026-09-03)
-
-**Tag:** docs · **Blocked on:** nothing; found while retiring B38's
-`config-plan.md` references, left out to keep that change to one defect
-
-The 37 `docs/config-plan.md` citations are gone, but the campaign's slice and
-section labels survive on their own, without the path that once made them
-resolvable: `(S5a)`, `since S7`, `as of S2`, `PERMANENT since S8`, `§6.10`,
-`§5.3`. A reader cannot follow any of them — the document they index was deleted
-at `3010e45`, so the meaning is in `git log` and nowhere else.
-
-`grep -rnE '\((S[0-9][a-z]?)\)|since S[0-9]|as of S[0-9]' --include=*.rs crates/`
-found **45** on 2026-09-03, concentrated in `infr-vulkan/src/lib.rs`,
-`infr-cli/src/main.rs`, `infr-core/src/config/tests.rs` and
-`infr-vulkan/src/gemm.rs`.
-
-Each is one of two things and they need different treatment: a label decorating
-a sentence that already says what happened ("Handed in by `new_with` (S5a)")
-just loses the label, while one carrying the whole claim ("PERMANENT since S8")
-has to be restated in plain words. That is a per-site judgement over 45 sites,
-which is why it is not a `sed`.
-
-The R-numbers (R3–R7) are deliberately NOT in scope: `infr-core::config`'s
-module docs now STATE those invariants, so those labels resolve.
-
 ### B48 — the segment-abort error paths are wired but never fired (2026-08-10)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** a way to make these calls fail

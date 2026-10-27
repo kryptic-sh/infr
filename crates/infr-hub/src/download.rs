@@ -308,14 +308,37 @@ fn fetch_stream(
     let resp = req
         .send()
         .map_err(|e| Error::Other(format!("HTTP request: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(Error::Other(format!(
-            "download failed: HTTP {}",
-            resp.status()
-        )));
+    let status = resp.status();
+    // `bytes={have}-` is unsatisfiable when the partial already holds the whole object: an
+    // interrupt between the last byte and `commit` leaves exactly that. Retrying the same range
+    // would get the same 416 forever, so hand a partial the server agrees is complete to the commit
+    // gate, and start over on anything else.
+    if have > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        let total = content_range(&resp).and_then(ranged::parse_unsatisfied_range);
+        if total == Some(have) {
+            progress.suspend(|| info!("{label}: the partial is already complete ({have} bytes)"));
+            let pb = progress::bar_in(progress, Some(have), label, Unit::Bytes);
+            pb.set_position(have);
+            return Ok((tmp.to_path_buf(), pb));
+        }
+        let why = match total {
+            Some(t) => format!("the server reports {t} bytes but the partial holds {have}"),
+            None => "the server could not satisfy the resume range".to_string(),
+        };
+        return restart_stream(obj, temps, max_bytes, progress, &why);
+    }
+    if !status.is_success() {
+        return Err(Error::Other(format!("download failed: HTTP {status}")));
     }
     // The server honours the Range only with 206; on 200 it sends the whole file → restart clean.
-    let resuming = have > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let resuming = have > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    // A 206 is only a continuation if it describes the bytes that were asked for. Appending any
+    // other span is a splice, and a non-LFS file has no sha256 gate to catch it.
+    if resuming {
+        if let Err(why) = check_resume(&resp, have) {
+            return restart_stream(obj, temps, max_bytes, progress, &why);
+        }
+    }
     let remaining = resp.content_length();
     let total = remaining.map(|r| if resuming { have + r } else { r });
 
@@ -394,6 +417,54 @@ fn fetch_stream(
     }
     drop(file); // flush + close before re-reading for the digest
     Ok((tmp.to_path_buf(), pb))
+}
+
+/// Throw away a stream partial the server will not continue, and fetch the object from byte 0.
+/// With nothing on disk the retry sends no `Range`, so it cannot come back here: if the partial
+/// cannot be removed, that is an error rather than another round of the same refusal.
+fn restart_stream(
+    obj: &Object,
+    temps: &Temps,
+    max_bytes: Option<u64>,
+    progress: &MultiProgress,
+    why: &str,
+) -> Result<(PathBuf, ProgressBar)> {
+    ranged::warn_restart(
+        progress,
+        &format!(
+            "{}: {why}; the partial was discarded, downloading it again",
+            obj.label
+        ),
+    );
+    fs::remove_file(&temps.stream).map_err(Error::from)?;
+    let _ = fs::remove_file(&temps.meta);
+    fetch_stream(obj, temps, max_bytes, progress)
+}
+
+fn content_range(resp: &Response) -> Option<&str> {
+    resp.headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+}
+
+/// Check that a `206` answering `bytes={have}-` carries exactly the rest of the object: it starts
+/// at `have`, runs to the last byte of the total it reports, and announces a matching length.
+fn check_resume(resp: &Response, have: u64) -> std::result::Result<(), String> {
+    let Some((first, last, total)) = content_range(resp).and_then(ranged::parse_content_range)
+    else {
+        return Err("the resume came back 206 with no usable Content-Range".to_string());
+    };
+    if first != have || last.checked_add(1) != Some(total) || last < first {
+        return Err(format!(
+            "asked for bytes {have}- and was served {first}-{last}/{total}"
+        ));
+    }
+    match resp.content_length() {
+        Some(n) if n != last - first + 1 => Err(format!(
+            "the resume announced {n} bytes for the span {first}-{last}"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Build the resume request directives: the `Range` value and an optional `If-Range` value. Returns
@@ -568,6 +639,7 @@ fn sanitise(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::pull::MAX_COMPANION_BYTES;
+    use crate::testhttp::{RangeFault, TestHub};
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -647,5 +719,106 @@ mod tests {
         // Mismatch fails loudly.
         let other = "b".repeat(64);
         assert!(verify_sha("f", SHA_A, Some(&other)).is_err());
+    }
+
+    /// One file on a [`TestHub`], with `partial` planted as its interrupted single-stream download
+    /// (and the hub's current validator beside it, as the first attempt would have stored).
+    fn resume_from(
+        hub: &TestHub,
+        name: &str,
+        partial: &[u8],
+        expected_sha: Option<&str>,
+    ) -> (tempfile::TempDir, Result<(PathBuf, String, u64)>) {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = partial_name(name);
+        fs::write(dir.path().join(&stem), partial).unwrap();
+        fs::write(dir.path().join(format!("{stem}.meta")), "\"v1\"").unwrap();
+        let url = format!("{}/org/repo/resolve/main/{name}", hub.origin());
+        let got = download_to_blob(
+            &url,
+            dir.path(),
+            name,
+            expected_sha,
+            None,
+            &ConnBudget::new(1),
+            &progress::group(),
+        );
+        (dir, got)
+    }
+
+    /// A partial that already holds the whole object — the process died between the last byte
+    /// and the commit — is answered `416` on resume. It must reach the sha256 gate and become the
+    /// blob, in that ONE request; retrying the same unsatisfiable range is the stuck state.
+    #[test]
+    fn a_complete_partial_is_committed_on_416() {
+        let hub = TestHub::start();
+        let name = hub.add_shards("m-whole", 1, 30_000).remove(0);
+        let body = hub.body(&name);
+        for expected in [Some(hub.sha(&name)), None] {
+            let (dir, got) = resume_from(&hub, &name, &body, expected.as_deref());
+            let (blob, hex, size) = got.expect("a complete partial must commit");
+            assert_eq!((hex, size), (hub.sha(&name), body.len() as u64));
+            assert_eq!(fs::read(blob).unwrap(), body);
+            assert!(!dir.path().join(partial_name(&name)).exists());
+        }
+        let served = hub.served_bodies(&name);
+        assert_eq!(served.len(), 2, "one request per attempt: {served:?}");
+        assert!(served
+            .iter()
+            .all(|s| s.range == Some((body.len() as u64, None)) && !s.honoured));
+    }
+
+    /// A partial LONGER than the object is not complete, whatever the `416` says: it is thrown away
+    /// and the object fetched again from byte 0.
+    #[test]
+    fn a_416_for_another_size_restarts() {
+        let hub = TestHub::start();
+        let name = hub.add_shards("m-long", 1, 30_000).remove(0);
+        let body = hub.body(&name);
+        let mut partial = body.clone();
+        partial.extend_from_slice(&[0xEE; 100]);
+
+        let (_dir, got) = resume_from(&hub, &name, &partial, None);
+        let (blob, _, _) = got.expect("the restart must succeed");
+        assert_eq!(fs::read(blob).unwrap(), body);
+        let ranges: Vec<_> = hub.served_bodies(&name).iter().map(|s| s.range).collect();
+        assert_eq!(ranges, vec![Some((partial.len() as u64, None)), None]);
+    }
+
+    /// A `206` that does not describe exactly the rest of the object is never appended. This is
+    /// the non-LFS case on purpose: with no advertised digest nothing after this point would catch
+    /// the splice, so `{"top_k":` plus the wrong span would be committed as valid JSON.
+    #[test]
+    fn a_206_for_the_wrong_range_restarts() {
+        for fault in [
+            RangeFault::SkewStart,
+            RangeFault::NoHeader,
+            RangeFault::WrongTotal,
+        ] {
+            let hub = TestHub::start();
+            let name = hub.add_shards("m-skew", 1, 30_000).remove(0);
+            let body = hub.body(&name);
+            hub.fault_ranges(fault);
+
+            let (_dir, got) = resume_from(&hub, &name, &body[..9], None);
+            let (blob, _, _) = got.unwrap_or_else(|e| panic!("{fault:?}: {e}"));
+            assert_eq!(fs::read(blob).unwrap(), body, "{fault:?} was spliced");
+            let ranges: Vec<_> = hub.served_bodies(&name).iter().map(|s| s.range).collect();
+            assert_eq!(ranges, vec![Some((9, None)), None], "{fault:?}");
+        }
+    }
+
+    /// The other half of the check above: a correct `206` is still a resume, not a restart.
+    #[test]
+    fn a_correct_206_is_still_appended() {
+        let hub = TestHub::start();
+        let name = hub.add_shards("m-ok", 1, 30_000).remove(0);
+        let body = hub.body(&name);
+        let (_dir, got) = resume_from(&hub, &name, &body[..9], None);
+        assert_eq!(fs::read(got.unwrap().0).unwrap(), body);
+        let served = hub.served_bodies(&name);
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].range, Some((9, None)));
+        assert!(served[0].honoured);
     }
 }

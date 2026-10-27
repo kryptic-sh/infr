@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A resumed single-stream download no longer gets stuck or splices the wrong
+  bytes.** A partial that already held the whole file (interrupted after the
+  last byte, before the commit) got `416 Range Not Satisfiable` on every retry
+  and never finished. It now goes through the sha256 gate and is committed when
+  the server's reported size matches, and is downloaded again otherwise. A `206`
+  whose `Content-Range` is missing, starts somewhere other than the resume
+  offset, or reports a different total is no longer appended. That matters most
+  for non-LFS files such as `generation_config.json`, which have no digest to
+  catch a splice.
+
 - **Selected Vulkan benchmarks use bounded integrated-GPU profiles.**
   `small_m_bench`, `attn_dsplit_probe`, `attn_ktile_probe`, `gemm_bench` and
   `moe_id_gemv_real_dims` select small synthetic workloads before dispatch,

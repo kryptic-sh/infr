@@ -2959,46 +2959,6 @@ when generation emits its first piece.
 or expose the exact abort handle to the deadline; test cancellation during a
 prefill-only interval.
 
-### Medium — complete stream partial is stuck on HTTP 416
-
-`crates/infr-hub/src/download.rs:286` derives the resume offset from the partial
-file length and requests `bytes={have}-`. A server response of
-`416 Range Not Satisfiable` exits through the generic non-success path at
-`crates/infr-hub/src/download.rs:311`, before the existing partial can reach the
-hash/commit gate.
-
-**Repro:** leave a complete `N`-byte `.dl-*` file by terminating after
-`stream_into` finishes but before `commit`, then retry against a server that
-answers `Range: bytes=N-` with `416` and `Content-Range: bytes */N`.
-
-**Expect:** verify and commit the complete partial, or discard it and restart.
-
-**Actual:** each retry sends the same unsatisfiable range and leaves the partial
-unchanged.
-
-**Action:** handle `416` explicitly; when the advertised total equals `have`,
-run the existing commit gate, otherwise restart safely. Add a crash-recovery
-test.
-
-### Low — stream resume accepts a 206 for the wrong range
-
-`crates/infr-hub/src/download.rs:318` classifies any `206 Partial Content` as a
-valid continuation without checking `Content-Range`, then appends it at
-`crates/infr-hub/src/download.rs:346`. Non-LFS `generation_config.json` has no
-expected digest, so valid but wrong JSON can pass the commit gate and alter
-sampling defaults. The ranged downloader already performs the missing exact
-check at `crates/infr-hub/src/ranged.rs:422`.
-
-**Repro:** keep the nine-byte prefix `{"top_k":`, request `bytes=9-`, and return
-`206`, `Content-Range: bytes 10-11/12`, body `0}`.
-
-**Expect:** reject the mismatched range.
-
-**Actual:** append the body and commit valid but incorrect `{"top_k":0}`.
-
-**Action:** share the ranged path's `Content-Range` validation and test wrong
-start, missing header, inconsistent total, and short body.
-
 ### Cleared
 
 - Empty-logit sampling does not expose a reachable empty-vocabulary generation

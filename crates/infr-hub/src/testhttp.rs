@@ -72,6 +72,22 @@ struct State {
     /// half — a download dying mid-flight, without a second process to kill.
     bodies: AtomicUsize,
     cut_after: AtomicUsize,
+    /// How an honoured range is misdescribed, if at all.
+    range_fault: Mutex<RangeFault>,
+}
+
+/// A `206` that does not describe the bytes that were asked for — what a broken proxy or mirror
+/// can send, and what a resume must refuse to append.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RangeFault {
+    #[default]
+    None,
+    /// Serve the span one byte LATER than asked, and say so in `Content-Range`.
+    SkewStart,
+    /// Serve the right bytes with no `Content-Range` at all.
+    NoHeader,
+    /// Serve the right bytes, but report a total one byte larger than the object.
+    WrongTotal,
 }
 
 pub(crate) struct TestHub {
@@ -207,6 +223,10 @@ impl TestHub {
     }
 
     /// Stop cutting: the next run of the same download completes normally.
+    pub(crate) fn fault_ranges(&self, fault: RangeFault) {
+        *self.state.range_fault.lock().unwrap() = fault;
+    }
+
     pub(crate) fn heal(&self) {
         self.state.cut_after.store(usize::MAX, Ordering::SeqCst);
     }
@@ -356,6 +376,10 @@ fn serve(state: &State, stream: TcpStream) {
         }
         _ => None,
     };
+    // An honoured range that starts at or past the end — a resume of a partial that is already
+    // whole — is answered the way RFC 9110 §15.5.17 says: 416, with the total in `*/N` form.
+    let unsatisfiable = span.is_none()
+        && matches!(range, Some((first, _)) if honour && first as usize >= body.len());
     if method == "GET" {
         state
             .served
@@ -368,7 +392,22 @@ fn serve(state: &State, stream: TcpStream) {
                 honoured: span.is_some(),
             });
     }
+    if unsatisfiable {
+        let _ = write!(
+            &stream,
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\n\
+             Content-Length: 0\r\nETag: {etag}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
 
+    let fault = *state.range_fault.lock().unwrap();
+    let span = span.map(|(first, last)| match fault {
+        RangeFault::SkewStart => ((first + 1).min(last), last),
+        _ => (first, last),
+    });
     let slice = match span {
         Some((first, last)) => &body[first..=last],
         None => &body[..],
@@ -379,10 +418,13 @@ fn serve(state: &State, stream: TcpStream) {
         None => "HTTP/1.1 200 OK\r\n",
     });
     if let Some((first, last)) = span {
-        head.push_str(&format!(
-            "Content-Range: bytes {first}-{last}/{}\r\n",
-            body.len()
-        ));
+        let total = match fault {
+            RangeFault::WrongTotal => body.len() + 1,
+            _ => body.len(),
+        };
+        if fault != RangeFault::NoHeader {
+            head.push_str(&format!("Content-Range: bytes {first}-{last}/{total}\r\n"));
+        }
     }
     head.push_str(&format!("Content-Length: {}\r\n", slice.len()));
     head.push_str(&format!("ETag: {etag}\r\n"));

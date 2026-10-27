@@ -114,7 +114,7 @@ fn validator_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
 
 /// `bytes 200-299/1000` → `(200, 299, 1000)`. `None` for any other shape, including the `*/N`
 /// unsatisfied form and an unknown total (`.../*`), neither of which can plan a grid.
-fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
     let rest = value.trim().strip_prefix("bytes ")?;
     let (span, total) = rest.split_once('/')?;
     let (first, last) = span.split_once('-')?;
@@ -123,6 +123,13 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
         last.trim().parse().ok()?,
         total.trim().parse().ok()?,
     ))
+}
+
+/// `bytes */1000` → `1000`: the total a `416 Range Not Satisfiable` reports. `None` for any other
+/// shape, including a satisfied span.
+pub(crate) fn parse_unsatisfied_range(value: &str) -> Option<u64> {
+    let total = value.trim().strip_prefix("bytes ")?.strip_prefix("*/")?;
+    total.trim().parse().ok()
 }
 
 /// Why a ranged download stopped, split by what the caller must DO about it — the three outcomes
@@ -505,6 +512,15 @@ mod tests {
             "",
         ] {
             assert!(parse_content_range(bad).is_none(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn unsatisfied_range_parses_only_the_star_form() {
+        assert_eq!(parse_unsatisfied_range("bytes */1000"), Some(1000));
+        assert_eq!(parse_unsatisfied_range(" bytes */0 "), Some(0));
+        for bad in ["bytes 0-99/100", "bytes */*", "*/100", "bytes */x", ""] {
+            assert!(parse_unsatisfied_range(bad).is_none(), "accepted {bad:?}");
         }
     }
 

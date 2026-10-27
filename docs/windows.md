@@ -71,11 +71,11 @@ infr run --dev Vulkan1 unsloth/Qwen3-0.6B-GGUF:Q4_K_M "hello"
 $env:INFR_DEV = "Vulkan1"   # or for the whole shell, tests included
 ```
 
-The index is not stable across driver changes, so read it from `infr devices`
-each time rather than reusing one. With two AMD driver packages installed (one
-per GPU), each driver's ICD enumerates every AMD GPU, and each card is listed
-twice: on 2026-10-27 this box showed the 7900 XTX as `Vulkan0`/`Vulkan1` and the
-iGPU as `Vulkan2`/`Vulkan3`, so `--dev Vulkan1` ran on the discrete card. The
+Read the index from `infr devices` rather than assuming one: adding or removing
+a GPU or a driver can move it. A card that several driver packages claim is
+listed once. With one AMD package per GPU, each ICD enumerates every AMD GPU,
+and infr keeps the first entry per `deviceUUID`; before that, this box listed
+each card twice and `--dev Vulkan1` bound the discrete card. The
 `vulkan: selected VulkanN=...` log line names the device actually bound.
 
 `--dev cpu` runs the CPU reference backend and needs no GPU at all.

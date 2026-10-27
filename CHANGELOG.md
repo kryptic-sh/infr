@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Each GPU gets one `VulkanN` index, however many drivers claim it.** The
+  Vulkan loader lists a device once per ICD that reports it, so a machine with
+  two installs of the same vendor driver (one AMD package per GPU, say) listed
+  every card twice and shifted every later index. On such a box `--dev Vulkan1`
+  bound the discrete card instead of the iGPU. `infr devices` and device
+  selection now keep the first entry for each `deviceUUID`.
+
 - **A forced `tool_choice` never returns ordinary text instead of the call.**
   With `tool_choice: "required"` or a named function, a constrained decode that
   failed or produced no parseable call used to retry unconstrained and could

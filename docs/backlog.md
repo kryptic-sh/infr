@@ -2889,28 +2889,6 @@ is NOT done:
   distro. The smoke step runs `--version` on ubuntu-26.04 only, and aarch64
   Linux is never executed at all (it is cross-built).
 
-### B79 — one GPU enumerated by two ICDs gets two `VulkanN` indices (2026-10-27)
-
-**Tag:** device selection · **Blocked on:** a decision on which ICD wins
-
-On the Windows dev box each GPU now carries a different AMD driver package
-(`VulkanDriverName` under the display-class registry keys points at
-`u0199522.inf_…` for one adapter and `u0204441.inf_…` for the other). Each ICD
-enumerates every AMD GPU, so `infr devices` lists four devices: the 7900 XTX as
-`Vulkan0` and `Vulkan1`, the iGPU as `Vulkan2` and `Vulkan3`. Every index past
-the first duplicate shifts, so a remembered `--dev Vulkan1` (the iGPU on
-2026-09-23) silently binds the discrete card. `infr-vulkan`'s device listing and
-selection (`enumerate_physical_devices` in `lib.rs`) do no de-duplication.
-
-Option: collapse entries with the same
-`VkPhysicalDeviceIDProperties::deviceUUID` (what llama.cpp's Vulkan backend
-does), keeping one per physical GPU. The open question is which ICD to keep when
-the two differ in version: the newest driver, the one the adapter's own registry
-key names, or the first enumerated. Not verified: whether the two entries for
-one card actually report the same `deviceUUID` and differ in `driverVersion`.
-That is the first thing to check, with a read-only `infr devices` extension,
-before choosing.
-
 ## Whole-codebase correctness review 2026-08-30
 
 ### Decision — a deadline that fires during prefill returns HTTP 500

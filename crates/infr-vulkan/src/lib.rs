@@ -827,6 +827,36 @@ fn device_type_str(t: vk::PhysicalDeviceType) -> &'static str {
     }
 }
 
+/// `pd`'s `deviceUUID`, or `None` when it has none to compare: a Vulkan 1.0 device (no
+/// `vkGetPhysicalDeviceProperties2` for it) or a driver reporting all zeros.
+fn device_uuid(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<[u8; vk::UUID_SIZE]> {
+    let p = unsafe { instance.get_physical_device_properties(pd) };
+    if p.api_version < vk::API_VERSION_1_1 {
+        return None;
+    }
+    let mut id = vk::PhysicalDeviceIDProperties::default();
+    {
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+        unsafe { instance.get_physical_device_properties2(pd, &mut p2) };
+    }
+    Some(id.device_uuid).filter(|u| u.iter().any(|&b| b != 0))
+}
+
+/// The indices of `uuids` to keep: the first entry for each UUID, and every entry without one.
+fn distinct_devices(uuids: &[Option<[u8; vk::UUID_SIZE]>]) -> Vec<usize> {
+    let mut seen = Vec::new();
+    (0..uuids.len())
+        .filter(|&i| match uuids[i] {
+            Some(u) if seen.contains(&u) => false,
+            Some(u) => {
+                seen.push(u);
+                true
+            }
+            None => true,
+        })
+        .collect()
+}
+
 /// A physical device as seen by [`VulkanBackend::enumerate_devices`]. `index` is the `VulkanN` /
 /// `INFR_DEV` / [`VulkanBackend::new_on`] handle. The `external_memory*` flags report whether the
 /// device could, in principle, participate in a host-less GPU↔GPU transfer (dma-buf / fd import) —
@@ -1220,6 +1250,23 @@ impl VulkanBackend {
     /// as `INFR_DEV` delivered it before. The CLI's `parse_dev_spec` and this
     /// crate's [`resolve_infr_dev_index`] are two DIFFERENT parsers of that one string and are
     /// deliberately NOT unified.
+    /// Every physical GPU once, in enumeration order: the list `VulkanN` indexes.
+    ///
+    /// The loader returns one entry per ICD that claims a device, so a box with two installs of
+    /// the same vendor driver (one AMD package per GPU, say) lists every card twice, and every
+    /// index past the first duplicate shifts. Entries whose `deviceUUID` was already seen are
+    /// dropped; the first is kept. A device that cannot report a UUID (pre-1.1, or all zeros) is
+    /// always kept, since nothing proves it is a duplicate.
+    fn physical_devices(instance: &ash::Instance) -> Result<Vec<vk::PhysicalDevice>> {
+        let all = unsafe { instance.enumerate_physical_devices() }
+            .map_err(|e| be(format!("enumerate_physical_devices: {e}")))?;
+        let uuids: Vec<_> = all.iter().map(|&pd| device_uuid(instance, pd)).collect();
+        Ok(distinct_devices(&uuids)
+            .into_iter()
+            .map(|i| all[i])
+            .collect())
+    }
+
     fn pick_default_device(
         instance: &ash::Instance,
         pdevices: &[vk::PhysicalDevice],
@@ -1273,8 +1320,7 @@ impl VulkanBackend {
         .map_err(|e| be(format!("create_instance: {e}")))?;
 
         let result = (|| -> Result<Vec<DeviceInfo>> {
-            let pdevices = unsafe { instance.enumerate_physical_devices() }
-                .map_err(|e| be(format!("enumerate_physical_devices: {e}")))?;
+            let pdevices = Self::physical_devices(&instance)?;
             let default_pick =
                 Self::pick_default_device(&instance, &pdevices, cfg.device.dev.as_deref()).ok();
             let mut out = Vec::with_capacity(pdevices.len());
@@ -1457,14 +1503,14 @@ impl VulkanBackend {
 
         // ── physical device: `INFR_DEV` if set, else prefer discrete ──────────
         // `INFR_DEV=VulkanN` (set by the CLI's `--dev`) pins the Nth device in ENUMERATION order,
-        // matching llama.cpp's `--dev VulkanN` naming so the two tools address the same GPU on a
-        // multi-GPU box. Unset => the historical rule: first DISCRETE_GPU, else device 0.
+        // one entry per physical GPU (see `physical_devices`), meant to match llama.cpp's
+        // `--dev VulkanN` naming so the two tools address the same GPU on a multi-GPU box.
+        // Unset => the historical rule: first DISCRETE_GPU, else device 0.
         //
         // An out-of-range / unparseable INFR_DEV is a hard error, NOT a fallback: silently running
         // on a different GPU than the one asked for produces numbers that look plausible and are
         // wrong, which is far worse than refusing to start.
-        let pdevices = unsafe { instance.enumerate_physical_devices() }
-            .map_err(|e| be(format!("enumerate_physical_devices: {e}")))?;
+        let pdevices = Self::physical_devices(&instance)?;
         if pdevices.is_empty() {
             return Err(be("no Vulkan physical devices"));
         }
@@ -4363,6 +4409,20 @@ mod tests {
             }
             Ok(()) => panic!("a non-VkBuffer must not downcast to &VkBuffer"),
         }
+    }
+
+    /// One entry per physical GPU: a repeated UUID is the same card seen through a second ICD
+    /// (two AMD driver packages listed each GPU twice on the Windows dev box), so only its first
+    /// entry keeps an index. An entry with no UUID is never treated as a duplicate.
+    #[test]
+    fn distinct_devices_drops_repeated_uuids() {
+        let (a, b) = (Some([1u8; vk::UUID_SIZE]), Some([2u8; vk::UUID_SIZE]));
+        // The dev box: dGPU, dGPU, iGPU, iGPU.
+        assert_eq!(distinct_devices(&[a, a, b, b]), vec![0, 2]);
+        // Order is kept, and the first of each UUID wins wherever its twin sits.
+        assert_eq!(distinct_devices(&[b, a, b]), vec![0, 1]);
+        assert_eq!(distinct_devices(&[None, None, a]), vec![0, 1, 2]);
+        assert_eq!(distinct_devices(&[]), Vec::<usize>::new());
     }
 
     /// Finding #2: the device-local zero-init fill must cover the WHOLE logical extent, not the old

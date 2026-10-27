@@ -5910,6 +5910,7 @@ pub(crate) fn generate_dense_backend(
                     &c.eos_ids,
                     sampler,
                     &mut rng,
+                    max_new.saturating_sub(out.len()),
                 )
                 .map_err(|e| anyhow!("{e}"))?;
                 decode_t += step_t0.elapsed();

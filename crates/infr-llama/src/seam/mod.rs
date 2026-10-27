@@ -419,6 +419,7 @@ pub(crate) fn generate_dense_cpu(
         ple,
         prompt,
         max_new,
+        None, // constraint
         req,
         on_token,
     )
@@ -440,6 +441,7 @@ pub(crate) fn generate_dense_cpu_mode(
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     max_new: usize,
+    constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
@@ -461,7 +463,7 @@ pub(crate) fn generate_dense_cpu_mode(
         on_token,
         &mut None,
         prompt.len() + max_new + 1,
-        None, // constraint
+        constraint,
         None, // verify
         None, // verify_ids
         None, // logits_out

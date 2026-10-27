@@ -168,9 +168,13 @@ impl Constraint {
 /// collapses to `argmax`, so the deterministic tool-call path is byte-for-byte unchanged; a masked
 /// (-inf) token has probability 0 in the softmax, so sampling can never leave the grammar.
 ///
+/// `budget` is how many tokens the request may still emit. A forced run can be many tokens long,
+/// so only its first `budget` are consumed — the grammar stays where those leave it — and an
+/// exhausted budget emits nothing.
+///
 /// Returns `(tokens emitted this step, grammar finished)`; an EMPTY step means the constrained
-/// span is done (accepting EOS or mask exhausted). ONE implementation shared by the bespoke
-/// decode loop and both seam decode paths.
+/// span is done (accepting EOS, mask exhausted, or no budget left). ONE implementation shared by
+/// the bespoke decode loop and both seam decode paths.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn constrained_step(
     c: &mut Constraint,
@@ -178,9 +182,14 @@ pub fn constrained_step(
     eos_ids: &[u32],
     sampler: crate::sampling::Sampler,
     rng: &mut u64,
+    budget: usize,
 ) -> Result<(Vec<u32>, bool)> {
-    let forced = c.forced();
+    if budget == 0 {
+        return Ok((Vec::new(), false));
+    }
+    let mut forced = c.forced();
     if !forced.is_empty() {
+        forced.truncate(budget);
         c.consume(&forced)?;
         let done = c.stopped();
         return Ok((forced, done));
@@ -360,9 +369,15 @@ mod tests {
                 }
                 let mut logits: Vec<f32> =
                     (0..cfg.vocab).map(|i| (i as f32 * 0.01).sin()).collect();
-                let (step, done) =
-                    constrained_step(&mut c, &mut logits, &[cfg.eos], sampler, &mut rng)
-                        .expect("constrained step");
+                let (step, done) = constrained_step(
+                    &mut c,
+                    &mut logits,
+                    &[cfg.eos],
+                    sampler,
+                    &mut rng,
+                    usize::MAX,
+                )
+                .expect("constrained step");
                 if step.is_empty() {
                     break;
                 }
@@ -409,6 +424,86 @@ mod tests {
                 "sampled token {t} escaped the grammar mask"
             );
         }
+    }
+
+    /// A forced run longer than the request's remaining budget is cut to that budget, and the
+    /// grammar is left where the consumed tokens put it, so `max_tokens` holds even when one step
+    /// would otherwise fast-forward several tokens. Model-gated like the test above.
+    ///
+    /// Two things make the forced branch reachable here, and neither holds in production today.
+    /// The env is CANONICAL, because llguidance only fast-forwards when `tokenize_is_canonical()`
+    /// is true, so under [`build_tok_env`]'s `NonCanonicalEnv` `forced()` is always empty. And the
+    /// grammar is a fixed literal, because the tool-call schema allows flexible JSON whitespace
+    /// and so forces almost nothing.
+    #[test]
+    fn a_forced_run_is_cut_to_the_budget() {
+        let Some(path) = qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B not cached");
+            return;
+        };
+        let g = infr_gguf::Gguf::open(&path).expect("open gguf");
+        let cfg = crate::Config::from_gguf(&g).expect("config");
+        let tok = crate::build_tokenizer(&g).expect("tokenizer");
+        let json = tok.to_string(false).expect("serialize tokenizer");
+        let mut bt = ByteTokenizer::from_json_bytes(json.as_bytes()).expect("byte tokenizer");
+        bt.set_eos_tokens(&[cfg.eos]);
+        let env: TokEnv =
+            Arc::new(ByteTokenizerEnv::new(bt, Some(cfg.vocab)).expect("canonical tok env"));
+        let new_constraint = || {
+            let grammar = TopLevelGrammar::from_lark(
+                r#"start: "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Oslo\"}}""#
+                    .to_string(),
+            );
+            Constraint::new(env.clone(), grammar).expect("constraint")
+        };
+        let greedy = crate::sampling::Sampler {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let step = |c: &mut Constraint, budget: usize| {
+            let mut logits = vec![0.0f32; cfg.vocab];
+            constrained_step(c, &mut logits, &[cfg.eos], greedy, &mut 1, budget)
+                .expect("constrained step")
+        };
+
+        let mut c = new_constraint();
+        let forced = c.forced();
+        assert!(
+            forced.len() >= 2,
+            "the literal must force a multi-token run: {forced:?}"
+        );
+
+        assert!(
+            step(&mut c, 0).0.is_empty(),
+            "a spent budget must emit nothing"
+        );
+        assert_eq!(
+            c.forced(),
+            forced,
+            "a spent budget must not move the grammar"
+        );
+
+        let (cut, done) = step(&mut c, 1);
+        assert_eq!(
+            cut,
+            forced[..1],
+            "budget 1 must emit exactly the first forced token"
+        );
+        assert!(!done);
+
+        // The grammar stands exactly where the one emitted token put it: a fresh constraint fed
+        // that token forces the same continuation, and the rest of the run is still there.
+        let mut check = new_constraint();
+        check.consume(&cut).expect("the cut token left the grammar");
+        let rest = c.forced();
+        assert_eq!(check.forced(), rest, "the cut left the grammar out of step");
+        assert!(!rest.is_empty(), "the rest of the forced run was dropped");
+
+        // An unlimited budget still drains the whole run.
+        let (tail, done) = step(&mut c, usize::MAX);
+        assert_eq!(tail, rest);
+        assert!(done, "the literal must be complete after its forced run");
     }
 
     /// End-to-end: build the TokEnv from a real GGUF tokenizer, build the forced tool-call grammar,

@@ -1745,13 +1745,27 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
         req: Option<&crate::sampling::RequestCtx>,
+        on_piece: impl FnMut(&str),
+    ) -> Result<crate::GenStats> {
+        self.generate_cpu_constrained(prompt, max_new, None, req, on_piece)
+    }
+
+    /// [`Self::generate_cpu`] with an optional llguidance grammar constraint applied to the decode
+    /// (serve's forced `tool_choice`), through the same runner path the Vulkan session uses.
+    pub fn generate_cpu_constrained(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        constraint: Option<&mut crate::grammar::Constraint>,
+        req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         // Stream each generated token: incrementally detokenize and emit the new suffix.
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
-        let (_generated, stats) = crate::seam::generate_dense_cpu(
+        let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
+            infr_cpu::CpuBackend::new_with(self.ecfg.clone()),
             &self.gguf,
             &self.cfg,
             &self.ecfg,
@@ -1759,6 +1773,7 @@ impl SeamModel {
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
+            constraint,
             req,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
         )?;
@@ -1790,6 +1805,7 @@ impl SeamModel {
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
             max_new,
+            None, // constraint
             req,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
         )?;

@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A forced `tool_choice` never returns ordinary text instead of the call.**
+  With `tool_choice: "required"` or a named function, a constrained decode that
+  failed or produced no parseable call used to retry unconstrained and could
+  answer with plain text and no tool call. It now fails the request, saying the
+  call did not complete within `max_tokens` or did not parse. The CPU backend
+  (`--dev cpu`) now supports the constrained decode, so forced tool calls work
+  there instead of always taking that fallback. Diffusion and speculative Metal
+  models still have no constrained path, and a forced `tool_choice` on them now
+  fails rather than returning plain text.
+
 - **`serve.request_timeout_secs` now stops a request during prompt prefill.**
   The server's cancel latch reached the generation only through the first
   generated piece, so a deadline shorter than the prefill let every chunk run

@@ -126,8 +126,8 @@ pub trait ChatModel {
     }
 
     /// Like [`generate`](Self::generate), with an llguidance grammar constraint applied to the
-    /// decode (serve's FORCED tool_choice). Backends without constraint support return an error —
-    /// the caller falls back to unconstrained generation.
+    /// decode (serve's FORCED tool_choice). Backends without constraint support return an error,
+    /// and the serve request then fails: a forced choice is never answered unconstrained.
     fn generate_constrained(
         &mut self,
         _prompt: &str,

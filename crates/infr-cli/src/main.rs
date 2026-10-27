@@ -1736,12 +1736,6 @@ trait GenBackend: Send + Sync {
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats>;
-
-    /// Drop the serialised session's persistent KV so the NEXT `generate` re-prefills from scratch.
-    /// The forced-tool fallback calls this before its unconstrained retry so the retry can never
-    /// inherit the constrained attempt's primed `<tool_call>` state. Default no-op: the multi-slot
-    /// engine hands each request a fresh best-prefix slot, so there is nothing serialised to reset.
-    fn reset(&self) {}
 }
 
 impl GenBackend for SeamGenerator {
@@ -1775,13 +1769,6 @@ impl GenBackend for SeamGenerator {
             Some(c) => model.generate_constrained(prompt, max_new, c, Some(req), on_piece),
             None => model.generate(prompt, max_new, Some(req), on_piece),
         }
-    }
-
-    fn reset(&self) {
-        self.model
-            .lock()
-            .expect("serve generator poisoned")
-            .reset_kv();
     }
 }
 
@@ -1867,6 +1854,20 @@ fn tool_parsing_allowed(tools: Option<&serde_json::Value>, tool_choice: Option<&
         && tool_choice != Some("none")
 }
 
+/// The `(name, arguments JSON)` of a grammar-forced tool call body, or `None` when the body is not
+/// a JSON object with a string `name` — a constrained decode cut short by `max_tokens` or an abort.
+/// Absent `arguments` mean an empty object.
+fn forced_tool_call(body: &str) -> Option<(String, String)> {
+    let body = body.trim().trim_end_matches("</tool_call>").trim();
+    let val: serde_json::Value = serde_json::from_str(body).ok()?;
+    let name = val.get("name")?.as_str()?.to_string();
+    let arguments = val
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+    Some((name, serde_json::to_string(&arguments).ok()?))
+}
+
 /// The OpenAI chat body, shared by every serve backend: render the conversation through the model's
 /// own template, honour a FORCED tool_choice with an llguidance constraint, then stream the reply
 /// through the reasoning/content/tool-call splitter with stop sequences applied to the raw text.
@@ -1910,58 +1911,35 @@ fn run_chat(
         // Forced tool_choice ("required"/named): grammar-constrain the call body (the same
         // llguidance machinery as the bespoke path — grammar::constrained_step runs inside the
         // seam decode). Prime the assistant turn with the <tool_call> opener and parse the
-        // constrained JSON; on any failure fall back to unconstrained (mirrors LlamaGenerator).
+        // constrained JSON. A forced choice is a contract: the reply carries the requested call or
+        // the request fails, never ordinary text in its place.
         if let Some(mut constraint) = be.renderer().tool_constraint(tools, tool_choice)? {
             let primed = format!("{prompt}<tool_call>\n");
             let mut body = String::new();
-            let mut tokens = (0u32, 0u32);
-            let emitted = match be.generate(
-                &primed,
-                max_new,
-                Some(&mut constraint),
-                &req,
-                &mut |p: &str| body.push_str(p),
-            ) {
-                Ok(gstats) => {
-                    tokens = (gstats.n_prompt as u32, gstats.n_gen as u32);
-                    let body = body.trim().trim_end_matches("</tool_call>").trim();
-                    match serde_json::from_str::<serde_json::Value>(body) {
-                        Ok(val) => val.get("name").and_then(|v| v.as_str()).map(|name| {
-                            let arguments = val
-                                .get("arguments")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
-                            on_delta(infr_engine::Delta::ToolCall {
-                                name: name.to_string(),
-                                arguments: serde_json::to_string(&arguments)
-                                    .unwrap_or_else(|_| "{}".to_string()),
-                            });
-                        }),
-                        Err(_) => None,
-                    }
-                    .is_some()
+            let gstats = be
+                .generate(
+                    &primed,
+                    max_new,
+                    Some(&mut constraint),
+                    &req,
+                    &mut |p: &str| body.push_str(p),
+                )
+                .map_err(|e| anyhow::anyhow!("forced tool call failed: {e}"))?;
+            let (name, arguments) = forced_tool_call(&body).ok_or_else(|| {
+                if gstats.n_gen >= max_new {
+                    anyhow::anyhow!(
+                        "forced tool call did not complete within max_tokens ({max_new})"
+                    )
+                } else {
+                    anyhow::anyhow!("forced tool call did not produce a parseable call")
                 }
-                Err(e) => {
-                    tracing::warn!("[tools] seam grammar-constrained generation failed ({e})");
-                    false
-                }
-            };
-            if emitted {
-                return Ok(infr_server::ChatOutcome {
-                    finish: infr_server::Finish::ToolCalls,
-                    prompt_tokens: tokens.0,
-                    completion_tokens: tokens.1,
-                });
-            }
-            // The constrained attempt advanced the serialised session past the primed `<tool_call>`
-            // opener + the (unparseable) body. Reset it so the unconstrained retry below re-prefills
-            // the clean `prompt` from scratch, instead of inheriting that divergent KV state and
-            // relying on the seam's common-prefix rewind to unwind it. No-op on the multi-slot
-            // engine (each request already gets a fresh best-prefix slot).
-            be.reset();
-            tracing::warn!(
-                "[tools] forced tool call produced no parseable call; falling back to unconstrained"
-            );
+            })?;
+            on_delta(infr_engine::Delta::ToolCall { name, arguments });
+            return Ok(infr_server::ChatOutcome {
+                finish: infr_server::Finish::ToolCalls,
+                prompt_tokens: gstats.n_prompt as u32,
+                completion_tokens: gstats.n_gen as u32,
+            });
         }
         let mut stream = infr_engine::ChatStream::new(tool_parsing_allowed(tools, tool_choice));
         // Stop sequences run on the RAW decoded text, BEFORE the reasoning/tool splitter — so a
@@ -4233,6 +4211,30 @@ mod tests {
         assert!(!tool_parsing_allowed(Some(&empty), None));
         assert!(tool_parsing_allowed(Some(&tools), None));
         assert!(!tool_parsing_allowed(Some(&tools), Some("none")));
+    }
+
+    /// The forced-call parser accepts only a complete call. Every `None` here is now a failed
+    /// request rather than a silent fall back to ordinary text, so a body cut short must never
+    /// read as a call.
+    #[test]
+    fn forced_tool_call_needs_a_complete_named_call() {
+        assert_eq!(
+            forced_tool_call(r#"{"name": "get_weather", "arguments": {"city": "Oslo"}}"#),
+            Some(("get_weather".into(), r#"{"city":"Oslo"}"#.into()))
+        );
+        assert_eq!(
+            forced_tool_call("\n{\"name\": \"ls\"}\n</tool_call>"),
+            Some(("ls".into(), "{}".into())),
+            "a closing tag and absent arguments are both fine"
+        );
+        for bad in [
+            r#"{"name": "get_weather", "argu"#, // cut short by max_tokens
+            r#"{"arguments": {}}"#,
+            r#"{"name": 7}"#,
+            "",
+        ] {
+            assert_eq!(forced_tool_call(bad), None, "accepted {bad:?}");
+        }
     }
 
     #[test]

@@ -2891,47 +2891,6 @@ is NOT done:
 
 ## Whole-codebase correctness review 2026-08-30
 
-### Medium — constrained fast-forward can exceed `max_tokens`
-
-`crates/infr-llama/src/seam/runner.rs:5901` appends every token returned by
-`constrained_step` before checking the request budget. `constrained_step`
-consumes and returns the complete forced vector at
-`crates/infr-llama/src/grammar.rs:182`, so one decode iteration can exceed
-`max_new`.
-
-**Repro:** `/v1/chat/completions` with `max_tokens: 1`, a forced tool choice,
-and a grammar state whose next forced vector is `[20, 21, 22]`.
-
-**Expect:** at most one completion token is emitted and counted.
-
-**Actual:** all three tokens are emitted and counted before the budget check at
-`crates/infr-llama/src/seam/runner.rs:5922`.
-
-**Action:** limit grammar consumption to the remaining budget and add a
-regression test whose forced vector exceeds that budget.
-
-### Medium — required tool choice falls back to ordinary text
-
-`crates/infr-cli/src/main.rs:1977` converts constrained-generation errors into
-`false`, and invalid or nameless JSON does the same. The path resets the session
-and deliberately retries unconstrained generation at
-`crates/infr-cli/src/main.rs:1989`, despite `tool_constraint_for` classifying
-`"required"` and named choices as forced at
-`crates/infr-llama/src/grammar.rs:223`.
-
-**Repro:** submit a valid forced tool request on a tokenizer/model for which the
-known non-canonical grammar bridge produces an empty or unparseable constrained
-body.
-
-**Expect:** a valid requested tool call, or an error saying the forced contract
-could not be satisfied.
-
-**Actual:** unconstrained assistant text can be returned with no tool call.
-
-**Action:** do not downgrade forced choices; propagate constrained-generation or
-parse failure and test that successful required/named responses always carry the
-requested tool.
-
 ### Decision — a deadline that fires during prefill returns HTTP 500
 
 Since the prefill fix, a `serve.request_timeout_secs` deadline that fires before

@@ -3850,7 +3850,9 @@ impl<'a> Recorder<'a> {
                  (row_bytes={row_bytes})"
             );
         }
-        self.embed_gather_at(dtype, arena_addr, ids, dst, rows, ne, scale, row_bytes);
+        self.embed_gather_at(
+            dtype, arena_addr, ids, dst, rows, ne, scale, row_bytes, vocab,
+        );
     }
 
     /// `-DSTREAMED` twin of [`Self::embed_gather`] (slice A5 build-variant: see
@@ -3859,6 +3861,8 @@ impl<'a> Recorder<'a> {
     /// build's weight SSBO) takes a harmless FILLER (`ids`) since the arena is never bound as a
     /// descriptor. `row_bytes` is the mode selector (0 = element-offset gather for a u32-fitting
     /// table; nonzero = 64-bit row-base fold for a `>= 2^32`-element table — see the `.comp` PC doc).
+    /// `n_rows` is the table's row count: an id at or past it gathers a zero row instead of
+    /// reading past the arena.
     #[allow(clippy::too_many_arguments)]
     pub fn embed_gather_at(
         &self,
@@ -3870,6 +3874,7 @@ impl<'a> Recorder<'a> {
         ne: usize,
         scale: f32,
         row_bytes: u32,
+        n_rows: usize,
     ) {
         // The shader gathers in whole 32-element sub-blocks (`nsub = ne / 32`), so a ragged tail of
         // `ne % 32` elements is left unwritten (uninitialized embedding rows) and `ne < 32` writes
@@ -3877,8 +3882,8 @@ impl<'a> Recorder<'a> {
         // (see [`assert_native_k`], which also says why this is a hard assert and not debug-only).
         assert_native_k("embed_gather_at (row width ne)", ne);
         let (name, spv) = crate::gemm::embed_gather_spv(dtype).expect("embed_gather streamed spv");
-        let k = self.be.kernel(name, spv, 3, 24);
-        let mut push = [0u8; 24];
+        let k = self.be.kernel(name, spv, 3, 28);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&scale.to_ne_bytes());
@@ -3887,6 +3892,8 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&row_bytes.to_ne_bytes());
+        // Saturating: a table of 2^32 rows or more is never out of range by this test.
+        push[24..28].copy_from_slice(&u32::try_from(n_rows).unwrap_or(u32::MAX).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(ids), Self::vkb(ids), Self::vkb(dst)],
@@ -3912,10 +3919,14 @@ impl<'a> Recorder<'a> {
     ) {
         let k = self
             .be
-            .kernel("gather_i32", crate::gemm::gather_i32_spv(), 3, 8);
-        let mut push = [0u8; 8];
+            .kernel("gather_i32", crate::gemm::gather_i32_spv(), 3, 12);
+        // The table's LOGICAL row count, not what the bound range holds: the allocator rounds a
+        // buffer up, so the shader's own `table.length()` would admit ids into the padding.
+        let n_rows = table.len_bytes() / 4 / ne.max(1);
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&u32::try_from(n_rows).unwrap_or(u32::MAX).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(table), Self::vkb(ids), Self::vkb(dst)],

@@ -2501,27 +2501,6 @@ Methodology, learned the hard way this session: benches run ONE AT A TIME (a
 concurrent GPU process skews everything), arms alternate across reps, and the
 spread is reported rather than just the mean.
 
-### B64 — the i32 gathers trust their ids, and robust buffer access is not requested (2026-08-12)
-
-**Tag:** vulkan · soundness · **Blocked on:** nothing; small
-
-`gather_i32.comp` indexes `table[uint(ids[r]) * ne + j]` and `embed_gather.comp`
-does the equivalent, neither validating that `ids[r]` is inside the table. Both
-document the contract in a comment — the ids are the model's own token ids, and
-`generate_dense_backend` refuses a `ffn_gate_tid2eid` whose row count is not the
-vocabulary — but nothing enforces it at the boundary the shader reads.
-
-`grep -rn 'robust' crates/infr-vulkan/src/` finds nothing, so
-`robustBufferAccess` is not requested and an out-of-range id is an undefined
-read rather than a clamped or zeroed one.
-
-This is **pre-existing, not introduced** by `Op::GatherI32` — `embed_gather` has
-carried it since it was written, and no path currently produces an out-of-vocab
-id. Worth closing anyway, per CLAUDE.md's "enforce a contract, don't document
-one": either request `robustBufferAccess` on the device, or clamp in-shader, or
-validate the id range host-side where the ids are uploaded. Say which, and why
-the other two were not chosen.
-
 ### B66 — the Windows Job Object memory clamp has never seen a real limit (2026-09-02)
 
 **Tag:** PR#91 residual · **Blocked on:** nothing; a gap, narrowed to what is

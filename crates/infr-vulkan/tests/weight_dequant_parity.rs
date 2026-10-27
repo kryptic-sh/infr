@@ -280,6 +280,7 @@ fn embed_gather_matches_host_dequant_on_deepseek_v2_lite() {
         ne,
         1.0,
         0,
+        vocab,
     );
     rec.finish().unwrap();
     let mut out = vec![0u8; ids.len() * ne * 4];

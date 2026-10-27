@@ -1294,6 +1294,7 @@ fn embed_gather_matches_resident() {
             ne,
             scale,
             0, // u32-fitting table → original element-offset gather path (issue #77)
+            n_table_rows,
         );
         rec.finish().unwrap();
         let mut out = vec![0u8; rows * ne * 4];
@@ -1328,6 +1329,7 @@ fn embed_gather_matches_resident() {
             ne,
             scale,
             0, // u32-fitting table → original element-offset gather path (issue #77)
+            n_table_rows,
         );
         rec.finish().unwrap();
         let mut out = vec![0u8; rows * ne * 4];
@@ -1346,6 +1348,122 @@ fn embed_gather_matches_resident() {
         }
         println!("ok: embed_gather dtype={dtype:?}");
     }
+}
+
+/// B64: an id at or past the table, or a negative one, gathers a zero row instead of reading past
+/// the arena, and the in-range rows beside it are untouched. The id is the model's own token id,
+/// so this never fires on a healthy model; it is the contract enforced where the shader reads.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn embed_gather_zeroes_an_out_of_range_id() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (n_table_rows, ne) = (16usize, 256usize);
+    let ids: [i32; 4] = [3, 16, -1, 12];
+    let rows = ids.len();
+    let ids_buf = be.alloc(rows * 4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+        .unwrap();
+    let dtype = DType::F16;
+    let w_bytes = weight_bytes_for(dtype, n_table_rows * ne);
+    let table = synth_weight_bytes(w_bytes, ne * 13 + n_table_rows);
+    let w_buf = be.alloc(w_bytes, BufferUsage::Weights).unwrap();
+    be.upload(w_buf.as_ref(), &table).unwrap();
+    let y_buf = be.alloc(rows * ne * 4, BufferUsage::Activations).unwrap();
+    // Poison the output first, so a row the kernel skipped cannot pass as zeroed.
+    be.upload(y_buf.as_ref(), &vec![0xFFu8; rows * ne * 4])
+        .unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.embed_gather(
+        dtype,
+        w_buf.as_ref(),
+        ids_buf.as_ref(),
+        y_buf.as_ref(),
+        rows,
+        ne,
+        1.0,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; rows * ne * 4];
+    be.download(y_buf.as_ref(), &mut out).unwrap();
+    let y: &[f32] = bytemuck::cast_slice(&out);
+    let row = |r: usize| &y[r * ne..(r + 1) * ne];
+
+    for r in [1, 2] {
+        assert!(
+            row(r).iter().all(|&v| v == 0.0),
+            "id {} must gather a zero row, got {:?}",
+            ids[r],
+            &row(r)[..4]
+        );
+    }
+    for r in [0, 3] {
+        assert!(
+            row(r).iter().all(|v| v.is_finite()) && row(r).iter().any(|&v| v != 0.0),
+            "in-range id {} must still gather its row",
+            ids[r]
+        );
+    }
+}
+
+/// B64, integer half: `gather_i32` bounds an id by the bound table's own length, so a past-the-end
+/// or negative id yields `0` beside correctly gathered rows.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn gather_i32_zeroes_an_out_of_range_id() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let ne = 2usize;
+    let table: Vec<i32> = (0..4 * ne as i32).map(|v| v + 100).collect(); // 4 rows
+    let ids: [i32; 4] = [1, 4, -1, 3];
+    let t_buf = be.alloc(table.len() * 4, BufferUsage::Weights).unwrap();
+    be.upload(t_buf.as_ref(), bytemuck::cast_slice(&table))
+        .unwrap();
+    let ids_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+    be.upload(ids_buf.as_ref(), bytemuck::cast_slice(&ids))
+        .unwrap();
+    let dst = be
+        .alloc(ids.len() * ne * 4, BufferUsage::Activations)
+        .unwrap();
+    be.upload(dst.as_ref(), &vec![0xFFu8; ids.len() * ne * 4])
+        .unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.gather_i32(
+        t_buf.as_ref(),
+        ids_buf.as_ref(),
+        dst.as_ref(),
+        ids.len(),
+        ne,
+    );
+    rec.finish().unwrap();
+    let mut out = vec![0u8; ids.len() * ne * 4];
+    be.download(dst.as_ref(), &mut out).unwrap();
+    let got: &[i32] = bytemuck::cast_slice(&out);
+    assert_eq!(got, &[102, 103, 0, 0, 0, 0, 106, 107]);
+
+    // The leg above cannot fail on its own: fresh memory past a small buffer reads as zero, so an
+    // unguarded kernel returns the same zeros. A PARTIAL trailing row can: at `ne = 3` the 8-int
+    // table holds 2 whole rows, so id 2 is out of range, yet an unguarded read of it returns the
+    // real values 106 and 107 before running off the end.
+    let ids3: [i32; 1] = [2];
+    let ids3_buf = be.alloc(4, BufferUsage::Activations).unwrap();
+    be.upload(ids3_buf.as_ref(), bytemuck::cast_slice(&ids3))
+        .unwrap();
+    let dst3 = be.alloc(3 * 4, BufferUsage::Activations).unwrap();
+    be.upload(dst3.as_ref(), &[0xFFu8; 12]).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.gather_i32(t_buf.as_ref(), ids3_buf.as_ref(), dst3.as_ref(), 1, 3);
+    rec.finish().unwrap();
+    let mut out3 = [0u8; 12];
+    be.download(dst3.as_ref(), &mut out3).unwrap();
+    let got3: &[i32] = bytemuck::cast_slice(&out3);
+    assert_eq!(got3, &[0, 0, 0], "a partial trailing row is out of range");
 }
 
 // ─── model-specific float-weight kernels — qwen35 conv1d + gemma4 E2B ─────────────────────────

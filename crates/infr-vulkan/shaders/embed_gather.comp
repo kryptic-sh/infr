@@ -17,6 +17,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // it is a multiple of 4 (so `w_addr` stays buffer_reference-aligned).
 layout(push_constant) uniform PC {
     uint rows; uint ne; float scale; uint arena_lo; uint arena_hi; uint row_bytes;
+    // Rows in the table: an id at or past it (a negative id included, as uint) gathers zeros
+    // instead of reading past the table — the arena has no descriptor bound to clamp the read.
+    uint n_rows;
 } pc;
 layout(binding = 1) readonly buffer IB { int ids[]; };
 layout(binding = 2) writeonly buffer YB { float y_buf[]; };
@@ -31,6 +34,13 @@ void main() {
     if (row >= pc.rows) { return; }
     uint t = gl_LocalInvocationID.x;
     uint nsub = pc.ne / 32u;
+    if (uint(ids[row]) >= pc.n_rows) {
+        for (uint s = t; s < nsub; s += 64u) {
+            uint o = row * pc.ne + s * 32u;
+            for (uint w = 0u; w < 32u; w++) { y_buf[o + w] = 0.0; }
+        }
+        return;
+    }
     // `row_bytes == 0` (the host sentinel for a table that FITS u32 — every current model, INCLUDING
     // quant tables whose row stride is NOT word-aligned, e.g. gemma) selects the original
     // element-offset path: `base = ids*ne`, decoded off the 256-aligned table base by

@@ -5316,8 +5316,13 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             fresh.seed_barrier();
             rec = Some(fresh);
         }
+        // Every error exit below goes through `abort_segment`: the segment being recorded has no
+        // `Drop`, so a bare `?` here would leak its descriptor pools.
         if let Op::MoeFfn { gate_exps, .. } = op {
-            let gbuf = resolve(&scratch, bindings, *gate_exps)?;
+            let gbuf = match resolve(&scratch, bindings, *gate_exps) {
+                Ok(b) => b,
+                Err(e) => return Err(abort_segment(rec.take(), e)),
+            };
             let paged = be_.moe_pager().lock().unwrap().as_ref().is_some_and(|s| {
                 s.is_paged(
                     crate::pager::Role::Gate,
@@ -5325,7 +5330,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 )
             });
             if paged {
-                execute_paged_moe(
+                if let Err(e) = execute_paged_moe(
                     be_,
                     graph,
                     op,
@@ -5334,7 +5339,9 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     &mut pool,
                     &mut rec,
                     &mut pstream,
-                )?;
+                ) {
+                    return Err(abort_segment(rec.take(), e));
+                }
                 continue;
             }
         }
@@ -5347,7 +5354,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // so every miss is known the moment the op is reached.
         if be_.dense_paged() {
             if let Op::Linear { weight, .. } = op {
-                let wid = crate::pager::buffer_identity(resolve(&scratch, bindings, *weight)?);
+                let wid = match resolve(&scratch, bindings, *weight) {
+                    Ok(w) => crate::pager::buffer_identity(w),
+                    Err(e) => return Err(abort_segment(rec.take(), e)),
+                };
                 let streamed = be_
                     .dense_pager()
                     .lock()
@@ -5355,7 +5365,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     .as_ref()
                     .is_some_and(|s| s.is_streamed(wid));
                 if streamed {
-                    let arena_addr = stage_dense_linear(be_, &mut rec, &mut pstream, wid)?;
+                    let arena_addr = match stage_dense_linear(be_, &mut rec, &mut pstream, wid) {
+                        Ok(a) => a,
+                        Err(e) => return Err(abort_segment(rec.take(), e)),
+                    };
                     if let Err(e) = lower_op(
                         be_,
                         graph,

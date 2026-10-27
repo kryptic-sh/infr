@@ -1001,28 +1001,23 @@ which is why it is not a `sed`.
 The R-numbers (R3–R7) are deliberately NOT in scope: `infr-core::config`'s
 module docs now STATE those invariants, so those labels resolve.
 
-### B48 — a failing op leaks its in-flight Vulkan recorder on most error paths (2026-08-10)
+### B48 — the segment-abort error paths are wired but never fired (2026-08-10)
 
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; surfaced by the B45
-guard, which was the first `lower_op` error path that could fire in a real run
+**Tag:** CR-2026-08-09 deepseek · **Blocked on:** a way to make these calls fail
 
-`Recorder` has no `Drop` by design — a segment is finished or explicitly
-discarded — so an early `?` out of `execute_static`'s op loop drops it with its
-descriptor pools still allocated, and the validation layer reports them as
-leaked objects at `vkDestroyDevice`. The two `lower_op` call sites now route
-through `abort_segment`, which discards the partial recorder and folds any
-teardown error into the message. The other `?` exits inside the same loop —
-`resolve`, `execute_paged_moe`, `stage_dense_linear`, `finish_nowait` — still
-drop it.
+Every `?` exit inside `execute_static`'s op loop that can drop a live recorder
+now routes through `abort_segment`: both `lower_op` sites (since B45), plus
+2026-10-27's `resolve` for the paged-MoE gate and the streamed `Linear` weight,
+`execute_paged_moe`, and `stage_dense_linear`. `Recorder::finish_nowait` was
+checked and needs nothing: it frees its own command buffer and pools on each of
+its error exits.
 
-None of them fires in a healthy run, which is why this was invisible until an op
-gained a reachable refusal. Fix is mechanical (same `abort_segment` wrapper);
-the reason it was not done with B45 is that each site returns from a different
-place in the loop and the change wants its own review. Verified live: before the
-`abort_segment` fix the guard's own test printed
-`VUID-vkDestroyDevice-device-05137 … has 2 leaked objects` under
-`VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation`; after it, that run is
-clean.
+Only the `lower_op` route has been observed. The B45 guard test
+(`mla_oversized_dims_are_refused`) is clean under
+`VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation` (re-run on the iGPU
+2026-10-27), and printed `VUID-vkDestroyDevice-device-05137 … 2 leaked objects`
+before its fix. The four newer sites fail only on a broken binding or a paging
+I/O error, and no test produces either, so their cleanup is unverified.
 
 ### B49 — the full-softmax MoE weight has no regression test, and cannot have one here (2026-08-10)
 

@@ -1111,6 +1111,15 @@ Two V4-specific instances of the same gap, both found reading
 Fix is one shared "expected dims" check in `wload` rather than per-arch asserts;
 the tests that exist would then gain teeth for free.
 
+Re-checked 2026-10-27: there is no expected shape anywhere to check against.
+`generate_dense_backend`'s `build` declares every weight as a flat
+`TensorDesc::new(vec![n], dt)` whose `n` comes from `wspecs`, which `wload`
+fills from the GGUF itself, so a check at bind time would compare the file with
+itself. The "one shared check" still needs a per-architecture table mapping each
+tensor role to dims derived from `Config` (`n_embd`, `n_head * head_dim`,
+`n_ff`, the MLA ranks, …). That table is the work, and it is sized per arch, not
+per call site.
+
 ### B53 — V4's KV geometry duplicates the V side (2026-08-10)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** a one-line change in

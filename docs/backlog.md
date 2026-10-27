@@ -856,16 +856,16 @@ counters `INFR_PAGER_STATS` reports. Three items LANDED from it — the concurre
 reader, the admission doorkeeper, and auto-sizing — and only the last leaves a
 residue worth tracking; what follows is that plus what was deliberately left.
 
-- **Auto-sizing LANDED; what is left is the platforms it cannot measure.**
-  `infr_core::hostmem` sizes the arena from `MemAvailable` floored by the
-  tightest cgroup limit, and the tier turns itself on whenever a model does not
-  fit. Measured: it picks 7.44 GB under an 8 GB cap and reaches 0.38 t/s against
-  the swept best of 0.39. **Linux only.** macOS needs `host_statistics64`'s
-  free/inactive/purgeable split and Windows `GlobalMemoryStatusEx`; neither is
-  reachable through this workspace's existing dependencies and neither could be
-  verified on the machine this was written on, so both answer "unknown" and keep
-  the mmap path unless `INFR_DRAM_CACHE` is set by hand. Adding either means
-  adding a dependency, which is the user's call.
+- **Auto-sizing LANDED on every platform; only Linux has been measured.**
+  `infr_core::hostmem::available_bytes` sizes the arena from
+  `infr_plat::mem::available`, which now has a Linux arm (`MemAvailable` floored
+  by the tightest cgroup limit), a macOS arm (`host_statistics64`) and a Windows
+  arm (`GlobalMemoryStatusEx`, clamped by a Job Object limit). The tier turns
+  itself on whenever a model does not fit. Measured on Linux only: it picks 7.44
+  GB under an 8 GB cap and reaches 0.38 t/s against the swept best of 0.39. The
+  macOS and Windows arms are only checked for plausible figures (the
+  `*_live_probe_is_plausible` tests, which pass on CI's macOS and Windows legs);
+  neither has been benchmarked against a cap.
 - **The unified-memory path is unverified on unified hardware.** An iGPU/APU now
   streams `DISK → GPU-accessible RAM` with no host cache
   (`HostPager::stream_only`, selected by `DeviceCaps::unified_memory`). The
@@ -2588,7 +2588,7 @@ one": either request `robustBufferAccess` on the device, or clamp in-shader, or
 validate the id range host-side where the ids are uploaded. Say which, and why
 the other two were not chosen.
 
-### B66 — the platform memory probes are compiled, not observed (2026-09-02)
+### B66 — the Windows Job Object memory clamp has never seen a real limit (2026-09-02)
 
 **Tag:** PR#91 residual · **Blocked on:** nothing; a gap, narrowed to what is
 actually still unknown
@@ -2601,24 +2601,19 @@ pulls a model and generates on a Windows runner — which closed the "compiled b
 never exercised" half of this entry and proved the hub cache resolves to
 `C:\Users\runneradmin\.cache\huggingface\hub` there, not `%LOCALAPPDATA%`.
 
-What is still unobserved is narrower: `infr_plat::mem::available`'s two newest
-arms. `macos_vm_statistics64`, `macos_page_size` and `windows_job_memory_limit`
-TYPECHECK on Linux — `cargo clippy -p infr-plat --target aarch64-apple-darwin`
-and `--target x86_64-pc-windows-msvc` both compile their `cfg` arms, verified by
-planting a type error inside `windows_job_memory_limit` and watching the Windows
-cross-check catch it — and their arithmetic is in pure functions tested
-everywhere (`macos_available_bytes`, `apply_limit_clamp`,
-`job_object_limit_bytes`), with
-`the_re_declared_flag_bits_match_the_windows_crate` pinning the two Win32 flag
-values against the real ones on the Windows leg.
+The live probes are now observed too. `infr_plat::mem`'s
+`the_live_probe_is_plausible`, `the_macos_live_probe_is_plausible` and
+`the_windows_live_probe_is_plausible` call `available()` for real and pass on
+the ubuntu-26.04, macos-15 and windows-2025 `test` legs (checked in the
+2026-10-27 run for `c71b144`). The Linux and Windows ones also bound the figure
+by total RAM; the macOS one checks only that it is non-zero, through
+`MacosVmStatistics64`.
 
-But no Mac has reported a page count through `host_statistics64` here, and no
-Windows container has reported a Job Object limit. Nothing asserts the FIGURES
-are sane — only that the code compiles and the arithmetic is right given inputs.
-Closing it means a test that calls `available()` on each platform and asserts a
-plausible range (non-zero, below total RAM), plus a container run for the clamp.
-Note the smoke job runs OUTSIDE a Job Object limit, so it exercises the
-unclamped Windows arm only.
+What is still unobserved: the Windows Job Object CLAMP. No Windows container has
+reported a `JobMemoryLimit` / `ProcessMemoryLimit`, so `windows_job::probe` has
+only ever returned "no limit" for real, and the clamped arm is covered by the
+pure `apply_job_object_clamp` / `headroom` tests alone. Closing it needs a run
+inside a job with a memory limit.
 
 Also unverified on Windows: which arm of `link_blob` actually ran. The blob
 landed and the model loaded through the snapshot entry, so one of the two

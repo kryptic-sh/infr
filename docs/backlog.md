@@ -2859,6 +2859,40 @@ launder it into an abstraction; implementing `external_memory_win32` is feature
 work, not a move. Either do that, or delete the Windows alias in favour of a
 refusal that says so.
 
+### B78 — infr has no release pipeline (2026-10-27)
+
+**Tag:** delivery · **Blocked on:** nothing for the GitHub Release; secrets for
+the downstream channels
+
+`.github/workflows/ci.yml` triggers on `main` pushes and PRs only — no `v*` tag
+trigger, no packaging, no release job — and the workspace version is still
+`0.0.0` with no tag ever cut. Nobody can install infr without building it, which
+also means installing `glslc`.
+
+The sibling repos (hrdr, gpur, krypt) all release the same way, from one
+`ci.yml`: a tag-gated `build` matrix (Linux via `cargo zigbuild` against glibc
+2.28, `x86_64-pc-windows-msvc` natively, both macOS arches natively with a
+`MACOSX_DEPLOYMENT_TARGET` floor) packages `<bin>-<tag>-<target>.tar.gz` /
+`.zip` with a `.sha256` sidecar and uploads it as an artifact. It also runs on
+`main` pushes as a packaging dry run. `publish-github-release` then gates on
+every check job and attaches the archives through `softprops/action-gh-release`.
+hrdr adds `.deb`/`.rpm`, crates.io, AUR, Homebrew (`kryptic-sh/homebrew-tap`),
+Scoop (`kryptic-sh/scoop-bucket`) and Alpine jobs fed from `pkg/*.in` templates.
+
+What is specific to infr:
+
+- Every build runner needs `glslc` (`.github/actions/install-glslc`), including
+  the cross-compiling Linux ones. The host glslc runs in `infr-vulkan/build.rs`,
+  so it does not have to match the target arch.
+- `tokenizers` pulls in C/C++ (`esaxx-rs`, `onig_sys`) and `reqwest` pulls in
+  `ring`, so the aarch64 zigbuild cross has to compile C++ through zig.
+- No musl targets: ash loads `libvulkan` with `dlopen`, which a static musl
+  binary cannot do.
+- The infr repo has no Actions secrets, so crates.io / AUR / brew / scoop
+  publishing cannot run until `CARGO_REGISTRY_TOKEN`, `AUR_SSH_KEY`,
+  `BREW_SSH_KEY` and `SCOOP_SSH_KEY` are added. Whether infr should go to
+  crates.io at all is the user's call.
+
 ## Whole-codebase correctness review 2026-08-30
 
 ### Medium — constrained fast-forward can exceed `max_tokens`

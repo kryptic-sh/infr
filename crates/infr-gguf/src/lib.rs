@@ -1802,6 +1802,33 @@ mod tests {
         assert_eq!(from_second.shards(), from_first.shards());
     }
 
+    /// The weight watch covers every shard of a split model, not only the one the user named: a
+    /// truncated shard 2 is reported even when the watch was opened by shard 1's path.
+    #[test]
+    fn the_weight_watch_covers_every_shard() {
+        let (_dir, paths) = two_shard_fixture();
+        let watch = crate::watch::WeightWatch::open_model(&paths[0]).expect("watch the set");
+        watch.check().expect("an untouched set is clean");
+
+        let len = std::fs::metadata(&paths[1]).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&paths[1])
+            .unwrap()
+            .set_len(len / 2)
+            .unwrap();
+
+        let err = watch
+            .check()
+            .expect_err("a truncated shard 2 must be reported");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("00002-of-00002"),
+            "the error must name shard 2: {msg}"
+        );
+        assert!(msg.contains(&format!("{len} -> {}", len / 2)), "{msg}");
+    }
+
     /// A shard named by `split.count` that is not on disk must fail naming the file, not silently
     /// load a model missing a third of its weights.
     #[test]

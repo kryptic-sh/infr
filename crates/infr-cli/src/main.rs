@@ -1092,7 +1092,7 @@ fn cmd_run(
     use std::io::Write;
     let (gguf, tok) = resolve(model, cfg)?;
     // Stamped next to the mapping it guards, then checked before every turn below.
-    let watch = infr_llama::WeightWatch::open(&gguf)?;
+    let watch = infr_llama::WeightWatch::open_model(&gguf)?;
     // diffusion-gemma (block text-diffusion, Phase 3 — docs/diffusion-gemma.md): a cheap arch peek
     // (no full SeamModel load) so the default token budget below and the ChatModel selection further
     // down can both branch on it. -n/max_new drives `blocks = ceil(n_predict / canvas_length)`
@@ -1674,7 +1674,7 @@ impl SeamGenerator {
         Ok(Self {
             model: std::sync::Mutex::new(model),
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
-            watch: infr_llama::WeightWatch::open(gguf_path)?,
+            watch: infr_llama::WeightWatch::open_model(gguf_path)?,
         })
     }
 }
@@ -1696,7 +1696,7 @@ impl ParallelGenerator {
         Ok(Self {
             engine,
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
-            watch: infr_llama::WeightWatch::open(gguf_path)?,
+            watch: infr_llama::WeightWatch::open_model(gguf_path)?,
         })
     }
 }
@@ -2024,7 +2024,7 @@ fn cmd_bench(
     let (gguf, tok) = resolve(model, cfg)?;
     // Stamped before the model loads and checked before any arm reports, so the timed window is
     // covered end to end. Each sub-bench arm below stamps its own for the same reason.
-    let watch = infr_llama::WeightWatch::open(&gguf)?;
+    let watch = infr_llama::WeightWatch::open_model(&gguf)?;
     // ONE backend reader shared with `cmd_run`/`cmd_serve` ([`selected_backend`], METAL > CPU >
     // Vulkan) — bench used to read CPU before METAL, disagreeing with run/serve. `-ngl 0` is bench's
     // own extra "force the CPU reference backend" gate (llama-bench semantics), so it wins first.
@@ -2436,7 +2436,7 @@ fn cmd_bench_metal(
     }
     #[cfg(target_os = "macos")]
     {
-        let watch = infr_llama::WeightWatch::open(gguf)?;
+        let watch = infr_llama::WeightWatch::open_model(gguf)?;
         let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
         let shape = metal_bench_shape(n_prompt, n_gen, depth, pg);
         // ONE session for warmup + every rep: backend, uploaded weights, compiled pipelines and
@@ -2520,7 +2520,7 @@ fn cmd_bench_cpu(
     json: bool,
     cfg: &Arc<Config>,
 ) -> anyhow::Result<()> {
-    let watch = infr_llama::WeightWatch::open(gguf)?;
+    let watch = infr_llama::WeightWatch::open_model(gguf)?;
     let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
     let measure_tg = pg.is_none() && n_gen > 0;
     // One untimed warmup to build runtime caches before the timed reps.
@@ -2807,7 +2807,7 @@ fn cmd_bench_diffusion_gemma(
              AR turn); use separate -p/-n instead — `infr bench <model> -p P -n N`"
         );
     }
-    let watch = infr_llama::WeightWatch::open(gguf)?;
+    let watch = infr_llama::WeightWatch::open_model(gguf)?;
     let r = dg_bench_run(
         gguf, tok, n_prompt, n_gen, depth, reps, None, cpu, metal, cfg,
     )?;

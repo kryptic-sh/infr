@@ -57,12 +57,8 @@ impl FileStamp {
     }
 }
 
-/// A weight file's identity as of load, re-checkable at any later point.
-///
-/// Hold one alongside a loaded model and [`check`](Self::check) it at whatever boundary suits the
-/// command — per generated turn, per served request, once before reporting a benchmark. The check
-/// is a single `fstat`, so the boundary can be as tight as makes sense.
-pub struct WeightWatch {
+/// One watched file: its held descriptor, the path it was opened by, and its stamp at load.
+struct Watched {
     /// Held open for the watch's whole life: this descriptor IS the identity being tracked, and
     /// `fstat` on it follows the inode even after the path stops naming it.
     file: File,
@@ -70,45 +66,76 @@ pub struct WeightWatch {
     at_load: FileStamp,
 }
 
+/// A model's weight files' identity as of load, re-checkable at any later point.
+///
+/// Hold one alongside a loaded model and [`check`](Self::check) it at whatever boundary suits the
+/// command — per generated turn, per served request, once before reporting a benchmark. The check
+/// is one `fstat` per file, so the boundary can be as tight as makes sense.
+pub struct WeightWatch {
+    files: Vec<Watched>,
+}
+
 impl WeightWatch {
-    /// Stamp `path` as it is now.
+    /// Stamp the single file `path` as it is now.
     ///
     /// Call this next to the `Gguf::open` whose mapping it guards. The two opens are not atomic
     /// with respect to each other, so a rename landing exactly between them leaves this watching
     /// the new inode while the mapping holds the old — a missed detection, never a false one, and
     /// the window is two syscalls wide.
     pub fn open(path: &Path) -> Result<Self> {
+        Ok(WeightWatch {
+            files: vec![Self::stamp(path)?],
+        })
+    }
+
+    /// Stamp every file of the model `path` names: the whole `gguf-split` set when `path` is one
+    /// shard of it, otherwise just `path`. The set comes from [`crate::Gguf::open`] itself, so it
+    /// is exactly the files the model's mapping reads, found the same way.
+    pub fn open_model(path: &Path) -> Result<Self> {
+        let model = crate::Gguf::open(path)?;
+        let files = model
+            .shards()
+            .into_iter()
+            .map(|(p, _)| Self::stamp(p))
+            .collect::<Result<_>>()?;
+        Ok(WeightWatch { files })
+    }
+
+    fn stamp(path: &Path) -> Result<Watched> {
         let file = File::open(path)?;
         let at_load = FileStamp::of(&file)?;
-        Ok(WeightWatch {
+        Ok(Watched {
             file,
             path: path.to_path_buf(),
             at_load,
         })
     }
 
-    /// `Ok(())` while the mapped file is byte-identical in the ways this can see; a described
-    /// [`Error::Loader`] once it is not.
+    /// `Ok(())` while every watched file is byte-identical in the ways this can see; a described
+    /// [`Error::Loader`] naming the first one that is not.
     ///
     /// The error names what moved and says the loaded weights are suspect, because by the time
     /// this fires the mapping may already be serving mutated bytes — the caller's job is to stop,
     /// not to carry on with a warning.
     pub fn check(&self) -> Result<()> {
-        let now = FileStamp::of(&self.file)?;
-        if now == self.at_load {
-            return Ok(());
+        for w in &self.files {
+            let now = FileStamp::of(&w.file)?;
+            if now == w.at_load {
+                continue;
+            }
+            let what = if now.len != w.at_load.len {
+                format!("size changed {} -> {} bytes", w.at_load.len, now.len)
+            } else {
+                "contents were rewritten in place (mtime moved, size unchanged)".to_owned()
+            };
+            return Err(Error::Loader(format!(
+                "weight file {:?} changed while mapped: {what}. The loaded weights are no longer \
+                 trustworthy — any output produced since may be wrong, and a shrunk file can fault \
+                 the process on next access. Restart against the current file.",
+                w.path
+            )));
         }
-        let what = if now.len != self.at_load.len {
-            format!("size changed {} -> {} bytes", self.at_load.len, now.len)
-        } else {
-            "contents were rewritten in place (mtime moved, size unchanged)".to_owned()
-        };
-        Err(Error::Loader(format!(
-            "weight file {:?} changed while mapped: {what}. The loaded weights are no longer \
-             trustworthy — any output produced since may be wrong, and a shrunk file can fault \
-             the process on next access. Restart against the current file.",
-            self.path
-        )))
+        Ok(())
     }
 }
 

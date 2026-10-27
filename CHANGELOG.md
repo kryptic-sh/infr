@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The weight-file watch covers every shard of a split model.** `run`, `serve`
+  and `bench` stamp the model's files at load and refuse to continue if one is
+  truncated or rewritten in place. On a `gguf-split` set only the shard named on
+  the command line was stamped, so shards 2..N could change unnoticed under the
+  live mapping. `WeightWatch::open_model` now stamps every file `Gguf::open`
+  maps.
+
 - **Each GPU gets one `VulkanN` index, however many drivers claim it.** The
   Vulkan loader lists a device once per ICD that reports it, so a machine with
   two installs of the same vendor driver (one AMD package per GPU, say) listed

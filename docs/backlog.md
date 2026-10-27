@@ -1158,26 +1158,6 @@ per-token rows, so the precedent is `MixerW::DeltaNet`'s conv/S-state
 allocation. Sizes are tabulated in `docs/deepseek.md` § Stage 4. Nothing reads
 them: `generate_dense_backend` refuses a non-zero ratio before a graph is built.
 
-### B54 — `WeightWatch` watches one file of a shard set (2026-08-10)
-
-**Tag:** multi-shard GGUF slice · **Blocked on:** nothing; scoped out of the
-loading slice that surfaced it
-
-`Gguf::open` now loads a whole `gguf-split` set, but `WeightWatch::open` is
-still called from `infr-cli` with the single path the user typed, so on a split
-model it stamps shard 1 and notices nothing about shards 2..N being replaced
-mid-run. The detection it provides is per-inode (see B30), so extending it means
-holding one stamp per shard — the shape `FileBlockIo::open_shards` already has,
-where every shard's descriptor is stamped and `verify_unchanged` walks them.
-
-The pieces to connect: `Gguf::shards` reports `(path, length)` per shard, which
-is what a set-aware `WeightWatch::open` would take instead of a path, and every
-`WeightWatch::open` call site in `infr-cli/src/main.rs` passes a path it got
-from model resolution rather than from the loaded `Gguf`. Note the streaming
-tier is already covered on a split model — `FileBlockIo::open_shards` stamps
-every shard and refuses one whose length no longer matches what the weights were
-loaded against — so this gap is only about the non-streaming mmap path.
-
 ### B58 — what the concurrent-pull slice did NOT verify (2026-08-10)
 
 **Tag:** concurrent-pull slice coverage · **Blocked on:** nothing; each line is

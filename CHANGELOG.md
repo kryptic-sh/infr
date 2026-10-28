@@ -6,6 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /metrics` on `infr serve`**, in the Prometheus text format: request
+  counts by result, prompt tokens prefilled and tokens generated, time spent in
+  prefill and decode, running and queued requests, and slots per model (total
+  and busy). Counters only grow, so `rate()` gives throughput over any window.
+  Like `/v1/models`, it needs the bearer token when `serve.api_key` is set.
+
 ### Changed
 
 - **`infr pull` retries a failed chunk of a ranged download** instead of failing

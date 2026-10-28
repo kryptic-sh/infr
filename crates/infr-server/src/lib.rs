@@ -6,6 +6,7 @@
 //! Routes (`auth` = gated by `serve.api_key` when one is configured — see `auth_gate`):
 //!   GET  /health                -> 200 OK                                              (open)
 //!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
+//!   GET  /metrics               -> Prometheus text exposition (see `metrics`)          (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
@@ -42,6 +43,8 @@ use infr_engine::{ChatMessage, Delta, ToolCall};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
+
+mod metrics;
 
 /// Why generation ended — the OpenAI `finish_reason`. The generator reports it; the handlers
 /// serialize it (a tool call still overrides to [`Finish::ToolCalls`] at the wire layer).
@@ -621,9 +624,10 @@ fn next_req_id() -> u64 {
 /// sequence behind it (the same reason the SSE channel is unbounded).
 ///
 /// The four `interval_*` counters are DRAINED (swapped to zero) by each report, which is what makes
-/// the reported numbers cover the interval rather than the process lifetime. There is deliberately
-/// no cumulative total kept alongside them: a total nobody drains is the thing that silently turns
-/// a rate into an average-since-boot.
+/// the reported numbers cover the interval rather than the process lifetime. The periodic line
+/// never reads a cumulative total: a total nobody drains is the thing that silently turns a rate
+/// into an average-since-boot. The lifetime counters in [`Self::lifetime`] exist for `/metrics`
+/// only, where the scraper takes the rate itself.
 #[derive(Debug, Default)]
 struct ServeStats {
     /// Prompt tokens PREFILLED in this interval. Folded once per request, at completion — the real
@@ -650,6 +654,8 @@ struct ServeStats {
     /// the window it landed in is what lets [`Self::fold_completion`] tell "still correctable" from
     /// "already published" (backlog B24).
     window: AtomicU64,
+    /// Never-drained counters behind `/metrics`.
+    lifetime: metrics::Lifetime,
 }
 
 impl ServeStats {
@@ -690,6 +696,7 @@ impl ServeStats {
             self.bump_gen(-correction.abs().min(retractable));
         }
         self.interval_completed.fetch_add(1, Ordering::Relaxed);
+        self.lifetime.fold_completion(rec);
     }
 
     /// Fold one request that ended in an error. Its partial deltas are already counted; there is no
@@ -697,6 +704,7 @@ impl ServeStats {
     fn fold_failure(&self) {
         self.interval_completed.fetch_add(1, Ordering::Relaxed);
         self.interval_failed.fetch_add(1, Ordering::Relaxed);
+        self.lifetime.fold_failure();
     }
 
     /// Take the interval counters (resetting them to zero) and sample the gauges. `elapsed` is the
@@ -1060,6 +1068,12 @@ impl ModelEntry {
             capacity,
         }
     }
+
+    /// Slot permits held right now: what the semaphore is NOT handing out, which is exactly the
+    /// set of this model's generations in flight.
+    fn busy(&self) -> usize {
+        self.capacity - self.slots.available_permits().min(self.capacity)
+    }
 }
 
 /// Shared server state — a non-empty, ordered set of hosted `ModelEntry`s. A request is routed to
@@ -1136,12 +1150,10 @@ impl AppState {
         }
     }
 
-    /// KV slot occupancy across every hosted model: `(busy, total)` permits. `busy` is what the
-    /// semaphores are NOT handing out right now, which is exactly the set of generations in flight.
+    /// KV slot occupancy across every hosted model: `(busy, total)` permits.
     fn slot_occupancy(&self) -> (u64, u64) {
         self.models.iter().fold((0, 0), |(busy, total), m| {
-            let free = m.slots.available_permits().min(m.capacity);
-            (busy + (m.capacity - free) as u64, total + m.capacity as u64)
+            (busy + m.busy() as u64, total + m.capacity as u64)
         })
     }
 
@@ -1166,6 +1178,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
+        .route("/metrics", get(metrics::metrics_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
         .with_state(state)
 }
@@ -2211,7 +2224,7 @@ mod tests {
 
     /// A stub generator that streams back exactly one content delta naming the model it belongs to,
     /// so a routing test can prove WHICH generator answered.
-    struct EchoGen(&'static str);
+    pub(crate) struct EchoGen(pub(crate) &'static str);
     impl ChatGenerator for EchoGen {
         fn chat(
             &self,

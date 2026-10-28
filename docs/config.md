@@ -256,7 +256,7 @@ And host-side stage timing was five knobs, one per pipeline (`INFR_PROF`,
 all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 
 **`[serve]`** — `api_key` (bearer token; an **empty** value means no auth — it
-gates `/v1/chat/completions` and `/v1/models`, never `/health`),
+gates `/v1/chat/completions`, `/v1/models` and `/metrics`, never `/health`),
 `max_tokens_cap`, `request_timeout_secs` (per-request wall-clock deadline in
 seconds; `0`, the default, means no deadline — a deadline truncates a legitimate
 slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`

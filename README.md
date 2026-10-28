@@ -171,6 +171,11 @@ Works as a drop-in backend for OpenAI-API clients (opencode, the Claude Code
 CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
 (Qwen, Llama-3.x, Gemma tool dialects supported).
 
+`GET /metrics` serves Prometheus counters and gauges (`infr_requests_total`,
+`infr_generation_tokens_total`, `infr_decode_seconds_total`,
+`infr_requests_running`, `infr_slots_busy`, …), behind the API key when one is
+set.
+
 `--temp` / `--top-k` / `--top-p` set the SERVER defaults (`--temp 0` = greedy);
 a per-request OpenAI `temperature`/`top_p` still overrides them. See
 [Configuration](#configuration).

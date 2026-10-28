@@ -2483,23 +2483,6 @@ Methodology, learned the hard way this session: benches run ONE AT A TIME (a
 concurrent GPU process skews everything), arms alternate across reps, and the
 spread is reported rather than just the mean.
 
-### B66 — which `link_blob` arm runs on Windows is not logged (2026-09-02)
-
-**Tag:** PR#91 residual · **Blocked on:** nothing; a gap, narrowed to what is
-actually still unknown
-
-The rest of this entry has shipped. CI runs `clippy` and `test` on
-`windows-2025`, `windows-smoke` pulls a model and generates there, and the
-`infr_plat::mem` live probes pass on every `test` leg. The Job Object clamp is
-observed for real: `mem::windows_job::native_tests` runs a child inside a job
-with a 256 MiB process or job memory limit and checks that `probe()` tracks
-retained commit and that `available()` reports `WindowsJobObjectClamped` within
-the limit (it fails when the clamp is bypassed).
-
-Still unverified on Windows: which arm of `link_blob` actually ran. The blob
-landed and the model loaded through the snapshot entry, so one of the two
-succeeded, but neither the symlink nor the hard-link fallback is logged.
-
 ### B74 — LNK4098 on every Windows link: `esaxx-rs` forces the static CRT (2026-09-23)
 
 **Tag:** Windows review · **Blocked on:** upstream (`tokenizers` /
@@ -2542,6 +2525,14 @@ a hot path
   valid-data length, synchronously, so a late chunk landing first in a large
   file can stall a worker. Not measured. Marking the file sparse
   (`FSCTL_SET_SPARSE`) or pre-sizing it would avoid it.
+- **Which `link_blob` arm runs on Windows.** Observed on this dev box: the
+  snapshot entry `infr pull` made on 2026-09-23 is a symlink, so the
+  `symlink_file` arm ran (Developer Mode grants the privilege). The hard-link
+  fallback is what a machine without that privilege takes; neither is logged.
+  `windows-smoke` cannot answer it for CI: it restores `~/.cache/huggingface`
+  from the Actions cache, so on a hit `link_blob` never runs there. Left
+  unlogged on purpose — `infr-plat` has no logging dependency, and both arms
+  yield a working entry that `link.rs`'s tests read through.
 - **No read-ahead hint at model load.** `infr-gguf`'s `WillNeed` advice is
   `cfg(unix)`; the Windows equivalent is `PrefetchVirtualMemory`. Not measured
   whether load time on Windows suffers for it.

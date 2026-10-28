@@ -390,11 +390,12 @@ refused in under a second with the sizes.
 
 **Gaps:**
 
-- **The refusal ignores the weights**, so it is only the "the KV cache alone
-  cannot fit" case. A window whose KV fits but KV + weights does not still stops
-  at dense placement with "dense weights exceed VRAM … streaming floor", which
-  names the weights rather than the window. Folding weights in is only provable
-  for a model that cannot stream them, so that message is what to fix next.
+- **The refusal ignores the weights**, so it covers only "the KV cache alone
+  cannot fit". A window whose KV fits but KV + weights does not stops at dense
+  placement's streaming-floor error, which now names the context and the KV size
+  (observed on the iGPU: Qwen3-0.6B, f16 KV, `INFR_CTX=500000`). Folding the
+  weights into the early refusal is provable only for a model that cannot stream
+  them.
 - **Not observed in a real run:** the q8 pin, and the runner's post-load
   refusal. Both need an explicit window close to the whole device: on this box
   that means filling the iGPU's shared memory or using the dGPU, both

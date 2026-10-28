@@ -2444,11 +2444,21 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 .sum();
             if alloc > budget.max(1) && cache_override.is_none() {
                 // Auto tier only: the floors overran what's actually free — streaming can't help.
+                // Name the KV cache: it is what a too-big context fills the device with, and a
+                // message about the weights alone sends the user after the wrong thing.
+                let (k, v) = kv_fmts(kv_auto_q8());
+                let ub = ubatch_rows(ec);
+                let kv =
+                    kv_bytes_estimate_fmt(cfg, want_ctx, placement_ring(cfg, ec, k, v), ub, k, v);
                 return Err(anyhow!(
-                    "dense weights exceed VRAM and the leftover budget ({:.2} GB) can't hold \
-                     even the streaming floor ({:.2} GB) — reduce ctx or run on the CPU backend \
-                     (INFR_DEV=cpu)",
+                    "context {want_ctx} does not fit this device: after its KV cache ({:.2} GB in \
+                     {k:?}/{v:?}) and the activation reserve, {:.2} GB is left for streaming the \
+                     {:.2} GB of dense weights, below the streaming floor ({:.2} GB) — reduce ctx \
+                     (--ctx N / INFR_CTX=N), quantize the cache (INFR_KV_TYPE_K/V=q8_0), or run \
+                     on the CPU backend (INFR_DEV=cpu)",
+                    kv as f64 / 1e9,
                     budget as f64 / 1e9,
+                    fp.total() as f64 / 1e9,
                     alloc as f64 / 1e9,
                 ));
             }

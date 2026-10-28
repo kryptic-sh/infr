@@ -22,7 +22,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   after the weights had loaded with the allocation guard's generic message. The
   check counts only the KV buffers the VRAM guard checks, at the cheapest format
   the cache could still use, so it never refuses a window that would have run.
-  `INFR_KV_OVERFLOW=1` and `INFR_NO_VRAM_GUARD=1` skip it.
+  `INFR_KV_OVERFLOW=1` and `INFR_NO_VRAM_GUARD=1` skip it. A window whose cache
+  fits on its own but not beside the weights still stops at placement, and that
+  message now names the context and the KV cache size too.
 
 ## [0.1.0] - 2026-10-28
 

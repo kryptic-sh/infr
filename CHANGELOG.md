@@ -6,230 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
-
-- **tokio 1.54.1** (from 1.52.3) for
-  [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386)
-  (`AsyncFd::new` and related constructors violated I/O safety), and **rustls
-  0.23.46**, **rustls-webpki 0.103.16** and **webpki-roots 1.0.11** for
-  RUSTSEC-2026-0346 to -0349 (TLS secrets in `Debug` output, data sent after an
-  ECH rejection, unbounded Brotli certificate decompression, a ServerHello
-  key-exchange downgrade) and RUSTSEC-2026-0381/-0382 (distrusted emSign
-  intermediates accepted). tokio runs `infr serve` and every `infr pull`, and
-  rustls is the TLS stack under `infr pull`.
-
-- **The weight-file watch covers every shard of a split model.** `run`, `serve`
-  and `bench` stamp the model's files at load and refuse to continue if one is
-  truncated or rewritten in place. On a `gguf-split` set only the shard named on
-  the command line was stamped, so shards 2..N could change unnoticed under the
-  live mapping. `WeightWatch::open_model` now stamps every file `Gguf::open`
-  maps.
-
-- **Each GPU gets one `VulkanN` index, however many drivers claim it.** The
-  Vulkan loader lists a device once per ICD that reports it, so a machine with
-  two installs of the same vendor driver (one AMD package per GPU, say) listed
-  every card twice and shifted every later index. On such a box `--dev Vulkan1`
-  bound the discrete card instead of the iGPU. `infr devices` and device
-  selection now keep the first entry for each `deviceUUID`.
-
-- **A forced `tool_choice` never returns ordinary text instead of the call.**
-  With `tool_choice: "required"` or a named function, a constrained decode that
-  failed or produced no parseable call used to retry unconstrained and could
-  answer with plain text and no tool call. It now fails the request, saying the
-  call did not complete within `max_tokens` or did not parse. The CPU backend
-  (`--dev cpu`) now supports the constrained decode, so forced tool calls work
-  there instead of always taking that fallback. Diffusion and speculative Metal
-  models still have no constrained path, and a forced `tool_choice` on them now
-  fails rather than returning plain text.
-
-- **`serve.request_timeout_secs` now stops a request during prompt prefill.**
-  The server's cancel latch reached the generation only through the first
-  generated piece, so a deadline shorter than the prefill let every chunk run
-  (on CPU, a 3,512-token prompt with a 1 s deadline still took 31.8 s and held
-  its slot throughout). `RequestCtx::with_cancel` now links the latch into the
-  per-request abort that the prefill loop polls between chunks, so the request
-  ends at the next chunk boundary. A deadline that fires before any output
-  returns an `aborted: request cancelled during prompt prefill` error instead of
-  the misleading `shutdown requested`. `ChatGenerator::chat` now takes
-  `cancel: &Arc<AtomicBool>`.
-
-- **A resumed single-stream download no longer gets stuck or splices the wrong
-  bytes.** A partial that already held the whole file (interrupted after the
-  last byte, before the commit) got `416 Range Not Satisfiable` on every retry
-  and never finished. It now goes through the sha256 gate and is committed when
-  the server's reported size matches, and is downloaded again otherwise. A `206`
-  whose `Content-Range` is missing, starts somewhere other than the resume
-  offset, or reports a different total is no longer appended. That matters most
-  for non-LFS files such as `generation_config.json`, which have no digest to
-  catch a splice.
-
-- **Selected Vulkan benchmarks use bounded integrated-GPU profiles.**
-  `small_m_bench`, `attn_dsplit_probe`, `attn_ktile_probe`, `gemm_bench` and
-  `moe_id_gemv_real_dims` select small synthetic workloads before dispatch,
-  enforce submission bounds, and report unavailable timings and unsupported
-  kernels explicitly. Kernel overrides preserve `INFR_DEV`; Q6_K expert-bank
-  sizing uses the format layout. MoE parity checks every exercised bank after
-  timing, while discrete performance budgets remain required on their original
-  paths. Production kernels, submission policy and Windows TDR settings are
-  unchanged.
-
-- **Windows memory budgets use remaining Job Object headroom.**
-  `infr_plat::mem::available` subtracts current job commit usage and process
-  private usage from their enabled limits before choosing the tighter budget.
-  Failed probes return unknown instead of treating already committed memory as
-  available. Native child-process regression tests cover both limit types.
-
-- **Ctrl-C on Windows drains the GPU instead of killing infr mid-submit.**
-  `infr_plat::signal::install_handlers` was a no-op off unix, so the first
-  Ctrl-C terminated the process with a submit still in flight. It now registers
-  a console control handler: Ctrl-C and Ctrl-Break latch the same graceful
-  shutdown as `SIGINT`, closing the console window (or logoff/shutdown) latches
-  it as `SIGTERM`, a second event force-exits, and the exit status is 130/143 as
-  on unix. A Ctrl-C at an idle `infr run` prompt also takes effect immediately,
-  where it used to wait for Enter: console input is now read with
-  `ReadConsoleW`, which reports the aborted read that `Stdin` silently retries.
-- **The GPU kernel-cache tripwire works on Windows.** A cached pipeline binary
-  whose seeding run died (the signature of a GPU hang) is discarded on the next
-  start — but `infr_plat::proc::pid_alive` answered "alive" for every pid on
-  Windows, so the dead run was never noticed, the suspect blob was fed back to
-  the driver on every launch, and `.seeded.*` markers piled up in the cache
-  directory. It now probes with `OpenProcess` / `GetExitCodeProcess`.
-- **f16 values round to nearest on AMD's proprietary driver.** SPIR-V leaves the
-  rounding of a conversion to `float16_t` up to the driver unless the shader
-  declares one, and AMD's Windows driver truncates on RDNA2 (a Ryzen iGPU) — so
-  every f16 the shaders wrote, KV-cache entries and activation scales included,
-  came out up to one ulp low, and that device's results drifted from every
-  other's (`copy_f32_to_f16_cast_matches_host` and the expert-parallel test
-  failed on it). A known-answer dispatch at device creation now checks how the
-  driver rounds; where it truncates, every kernel with an f16 type declares
-  `RoundingModeRTE` for 16-bit floats, patched into the module at pipeline
-  creation (`infr_vulkan::spirv`). Devices that already round to nearest keep
-  their modules unchanged — declaring the mode there is not neutral, and moved a
-  GPU golden on an RDNA3 card.
-- **`infr compare` finds `llama-diffusion-cli` on Windows.** The `PATH` and
-  fork-build lookups probed for the file without `.exe`, so the diffusion
-  comparison always reported the binary missing. Fork-build lookup also checks
-  `bin/Release/` for multi-config CMake builds, retaining `bin/` precedence.
-- **rustls 0.23.45** (from 0.23.41) for
-  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): rustls
-  accepted TLS 1.3 handshake messages sent at the wrong encryption level. It is
-  the TLS stack under every `infr pull`; the weekly `cargo-deny` job had failed
-  on it.
-- **`infr` can find a global config file on Windows.** `config::file::discover`
-  resolved `$XDG_CONFIG_HOME`, else `$HOME/.config`, else nothing — and Windows
-  sets neither variable, so the third lookup step silently never found anything
-  there. It now resolves through `dirs::home_dir()`, which reads the
-  `FOLDERID_Profile` Known Folder. `--config <path>` and `./infr.toml` were
-  unaffected and are unchanged. The layout stays `~/.config/infr/config.toml` on
-  every platform, deliberately: adopting `dirs::config_dir()` would have moved
-  the file to `~/Library/Application Support` for existing macOS users. An
-  absolute `$XDG_CONFIG_HOME` still wins; a relative or empty one is now ignored
-  rather than honoured, per the spec.
-- **The Hugging Face cache is in the right place on macOS and Windows.**
-  `Store::discover` fell back to `dirs::cache_dir()`, which is
-  `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows —
-  `huggingface_hub` uses `$XDG_CACHE_HOME`, else `~/.cache`, on every platform
-  with no native-directory arm, so infr agreed with it only on Linux and would
-  re-download models `hf download` had already fetched. The resolution now
-  matches `huggingface_hub`'s exactly, including the `HUGGINGFACE_HUB_CACHE`
-  legacy variable, which was not read at all, and treating an empty `HF_HOME=`
-  as unset rather than resolving the cache to the relative path `hub`. A cache
-  an older infr left in the OS-native directory is still used while the standard
-  one does not exist, with a warning naming both, so upgrading does not silently
-  re-fetch gigabytes.
-
-- **macOS reports host memory, and Windows respects a container limit.**
-  `infr_plat::mem::available` returned `None` on macOS, so anything sizing a
-  host arena from it — the DRAM paging tier — stayed off on every Mac however
-  much RAM it had. It now probes `host_statistics64` and reports what is
-  reclaimable without swapping (`free - speculative + inactive + purgeable`;
-  `free_count` already includes speculative pages, so adding them again would
-  double-count). On Windows, `ullAvailPhys` is machine-wide and knew nothing
-  about a Job Object's commit limit, so a process inside a Windows container
-  could size an arena from far more memory than it was allowed — it is now
-  clamped by `QueryInformationJobObject`'s binding limit, the same policy the
-  Linux cgroup clamp already applied and now literally the same code. Both
-  figures carry their provenance in `Available::source`.
-
-- **The GPU MoE router no longer corrupts routing above 256 experts.**
-  `moe_topk.comp` sized its per-expert scratch `ssel_adj` for 256 while the
-  selection scan beside it was written for the chunked headroom above that, and
-  filled and read the array across the full expert count unconditionally — so a
-  model with more experts than the array holds wrote and read past it, which is
-  undefined behaviour in GLSL (corrupt routing weights or a driver hang, not a
-  clean failure). The array is now sized from the same constants the scan uses,
-  and `Recorder::moe_topk` refuses an expert count above the ceiling with a
-  message naming both numbers instead of dispatching. No supported model
-  exceeded the old bound, so nothing shipped was affected; the Qwen3.8 MoE
-  models, at 512 experts, are the first that would have been.
-
-- **Ctrl-C stops a download.** `infr pull` installed the `SIGINT`/`SIGTERM`
-  handlers but nothing on the download path read the latch, so the first Ctrl-C
-  appeared to do nothing and only `SIGKILL` ended a multi-gigabyte pull. Every
-  loop that moves bytes now polls it: `pull::fetch_all` stops claiming files,
-  `ranged::worker` stops claiming chunks, and both `download::stream_into` and
-  the ranged chunk reader stop mid-body per 64 KiB — the last one matters
-  because a chunk is 64 MiB, so checking only between chunks left the process
-  running for seconds after the signal. The partial and its resume sidecar are
-  kept in every case, so the next `infr pull` continues where it stopped; the
-  exit status is the conventional 130 / 143. An interrupted transfer reports
-  `Error::Aborted` rather than a download failure.
-
-- **Cached models are readable on Windows.** `link_blob` wrote its snapshot
-  symlink with the forward-slash target `../../blobs/<hex>` that
-  `huggingface_hub` and llama.cpp use. Windows accepts that in an ordinary path
-  but not inside a symlink's reparse point: the link was created and every read
-  through it failed with `ERROR_INVALID_NAME`. The target now uses the
-  platform's own separator.
-
-### Changed
-
-- **An explicit `--ctx N` that an f16 KV cache cannot hold now gets q8_0.** The
-  default context already tried a q8_0 cache before clamping. A window the user
-  chose (`--ctx N` / `INFR_CTX=N`, including per slot under `--parallel`) was
-  taken as given and failed at allocation if f16 did not fit. It now switches
-  the cache to q8_0 when that holds the whole window, with a warning, and keeps
-  the window as asked. A window that fits in neither format still fails at the
-  VRAM guard, and setting `INFR_KV_TYPE_K/V` still wins.
-
-- **Q4_K Vulkan MMQ unpacks weights with aligned word reads.**
-  `native_gemm_mmq_q4k.comp` masks packed nibbles instead of reconstructing each
-  word byte by byte, preserving scales, accumulation order and watchdog limits.
-  Alternating cached Qwen3-0.6B benchmarks improved prefill on the Windows AMD
-  RDNA2 iGPU; decode results were mixed. Bound-buffer, resident-BDA and paged
-  reload parity are covered in `nc_gemm_parity`; measurements and scope are in
-  [the Windows guide](docs/windows.md#packed-q4_k-follow-up-2026-10-08).
-
-- **On Windows, `-t` defaults to one thread per physical core.** It defaulted to
-  every logical processor, so with SMT the CPU backend's spin pool put two
-  workers on each core's hyperthreads, where they contend instead of helping. On
-  a Ryzen 9 9950X3D (16 cores, 32 threads), Qwen3-0.6B Q4_K_M on `--dev cpu`
-  decodes at ~127 tok/s by default instead of ~65, and prefills at ~660 tok/s
-  instead of ~580; GPU runs are unaffected. `-t` or `RAYON_NUM_THREADS` still
-  set it explicitly. The core count comes from the new
-  `infr_plat::cpu::physical_cores`; other platforms keep the logical-count
-  default until the same measurement is made there.
-- **Windows builds target the host CPU, like Linux builds.**
-  `.cargo/config.toml` set `target-cpu=native` for Linux only, so on Windows the
-  CPU backend's dequant and matvec loops never vectorized to AVX2/AVX-512. On a
-  Ryzen 9 9950X3D, Qwen3-0.6B Q4_K_M on `--dev cpu` went from ~380 to ~580 tok/s
-  prefill (pp256) and ~48 to ~61 tok/s decode (tg64). As on Linux, the binary is
-  then specific to the CPU it was built on.
-- **Shaders compile in parallel, and the build finds the Vulkan SDK's `glslc`.**
-  `infr-vulkan`'s build script ran one `glslc` per shader variant sequentially;
-  it now spreads them across cargo's job allowance (`NUM_JOBS`) — a release
-  rebuild of `infr-vulkan` after a shader edit took 148 s with `-j 1` and 14 s
-  at the default 32 jobs on a Ryzen 9 9950X3D. When `glslc` is not on `PATH` it
-  falls back to `$VULKAN_SDK/Bin`, so a shell opened before the Vulkan SDK was
-  installed still builds.
-- **`infr serve --parallel` (`-n`, `--np`) defaults to 1 slot, was 4.** Each
-  slot owns a full KV cache and, with `--ctx` unset, the per-slot window is the
-  VRAM-fit context divided by N — so the old default handed every user a quarter
-  of the context window whether or not they ever issued a concurrent request.
-  Concurrency is now opt-in and a single request gets the whole window; pass
-  `--parallel N` for the previous behaviour. `infr multi` already defaulted to
-  1, so the two now agree. The engine is unchanged: the concurrent seam runs at
-  one slot exactly as before.
+## [0.1.0] - 2026-10-28
 
 ### Added
 
@@ -575,6 +352,53 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **An explicit `--ctx N` that an f16 KV cache cannot hold now gets q8_0.** The
+  default context already tried a q8_0 cache before clamping. A window the user
+  chose (`--ctx N` / `INFR_CTX=N`, including per slot under `--parallel`) was
+  taken as given and failed at allocation if f16 did not fit. It now switches
+  the cache to q8_0 when that holds the whole window, with a warning, and keeps
+  the window as asked. A window that fits in neither format still fails at the
+  VRAM guard, and setting `INFR_KV_TYPE_K/V` still wins.
+
+- **Q4_K Vulkan MMQ unpacks weights with aligned word reads.**
+  `native_gemm_mmq_q4k.comp` masks packed nibbles instead of reconstructing each
+  word byte by byte, preserving scales, accumulation order and watchdog limits.
+  Alternating cached Qwen3-0.6B benchmarks improved prefill on the Windows AMD
+  RDNA2 iGPU; decode results were mixed. Bound-buffer, resident-BDA and paged
+  reload parity are covered in `nc_gemm_parity`; measurements and scope are in
+  [the Windows guide](docs/windows.md#packed-q4_k-follow-up-2026-10-08).
+
+- **On Windows, `-t` defaults to one thread per physical core.** It defaulted to
+  every logical processor, so with SMT the CPU backend's spin pool put two
+  workers on each core's hyperthreads, where they contend instead of helping. On
+  a Ryzen 9 9950X3D (16 cores, 32 threads), Qwen3-0.6B Q4_K_M on `--dev cpu`
+  decodes at ~127 tok/s by default instead of ~65, and prefills at ~660 tok/s
+  instead of ~580; GPU runs are unaffected. `-t` or `RAYON_NUM_THREADS` still
+  set it explicitly. The core count comes from the new
+  `infr_plat::cpu::physical_cores`; other platforms keep the logical-count
+  default until the same measurement is made there.
+- **Windows builds target the host CPU, like Linux builds.**
+  `.cargo/config.toml` set `target-cpu=native` for Linux only, so on Windows the
+  CPU backend's dequant and matvec loops never vectorized to AVX2/AVX-512. On a
+  Ryzen 9 9950X3D, Qwen3-0.6B Q4_K_M on `--dev cpu` went from ~380 to ~580 tok/s
+  prefill (pp256) and ~48 to ~61 tok/s decode (tg64). As on Linux, the binary is
+  then specific to the CPU it was built on.
+- **Shaders compile in parallel, and the build finds the Vulkan SDK's `glslc`.**
+  `infr-vulkan`'s build script ran one `glslc` per shader variant sequentially;
+  it now spreads them across cargo's job allowance (`NUM_JOBS`) — a release
+  rebuild of `infr-vulkan` after a shader edit took 148 s with `-j 1` and 14 s
+  at the default 32 jobs on a Ryzen 9 9950X3D. When `glslc` is not on `PATH` it
+  falls back to `$VULKAN_SDK/Bin`, so a shell opened before the Vulkan SDK was
+  installed still builds.
+- **`infr serve --parallel` (`-n`, `--np`) defaults to 1 slot, was 4.** Each
+  slot owns a full KV cache and, with `--ctx` unset, the per-slot window is the
+  VRAM-fit context divided by N — so the old default handed every user a quarter
+  of the context window whether or not they ever issued a concurrent request.
+  Concurrency is now opt-in and a single request gets the whole window; pass
+  `--parallel N` for the previous behaviour. `infr multi` already defaulted to
+  1, so the two now agree. The engine is unchanged: the concurrent seam runs at
+  one slot exactly as before.
+
 - **DeepSeek MLA attention gained a subgroup kernel tier, and it is the whole
   DeepSeek frame.** `mla.comp` was the only MLA kernel at any depth, and
   `INFR_PROF_OPS` measured it at 97.3% of decode GPU time at `-d 2048` and 89.4%
@@ -637,13 +461,181 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   live activation bytes that the runner compares against what it reserved,
   warning when a generation's real peak exceeds the prediction.
 
-### Security
-
-- Update `crossbeam-epoch` 0.9.18 → 0.9.20 for RUSTSEC-2026-0204 (invalid
-  pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`). Reached
-  through `rayon`, so it applies to every CPU-backend build.
-
 ### Fixed
+
+- **tokio 1.54.1** (from 1.52.3) for
+  [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386)
+  (`AsyncFd::new` and related constructors violated I/O safety), and **rustls
+  0.23.46**, **rustls-webpki 0.103.16** and **webpki-roots 1.0.11** for
+  RUSTSEC-2026-0346 to -0349 (TLS secrets in `Debug` output, data sent after an
+  ECH rejection, unbounded Brotli certificate decompression, a ServerHello
+  key-exchange downgrade) and RUSTSEC-2026-0381/-0382 (distrusted emSign
+  intermediates accepted). tokio runs `infr serve` and every `infr pull`, and
+  rustls is the TLS stack under `infr pull`.
+
+- **The weight-file watch covers every shard of a split model.** `run`, `serve`
+  and `bench` stamp the model's files at load and refuse to continue if one is
+  truncated or rewritten in place. On a `gguf-split` set only the shard named on
+  the command line was stamped, so shards 2..N could change unnoticed under the
+  live mapping. `WeightWatch::open_model` now stamps every file `Gguf::open`
+  maps.
+
+- **Each GPU gets one `VulkanN` index, however many drivers claim it.** The
+  Vulkan loader lists a device once per ICD that reports it, so a machine with
+  two installs of the same vendor driver (one AMD package per GPU, say) listed
+  every card twice and shifted every later index. On such a box `--dev Vulkan1`
+  bound the discrete card instead of the iGPU. `infr devices` and device
+  selection now keep the first entry for each `deviceUUID`.
+
+- **A forced `tool_choice` never returns ordinary text instead of the call.**
+  With `tool_choice: "required"` or a named function, a constrained decode that
+  failed or produced no parseable call used to retry unconstrained and could
+  answer with plain text and no tool call. It now fails the request, saying the
+  call did not complete within `max_tokens` or did not parse. The CPU backend
+  (`--dev cpu`) now supports the constrained decode, so forced tool calls work
+  there instead of always taking that fallback. Diffusion and speculative Metal
+  models still have no constrained path, and a forced `tool_choice` on them now
+  fails rather than returning plain text.
+
+- **`serve.request_timeout_secs` now stops a request during prompt prefill.**
+  The server's cancel latch reached the generation only through the first
+  generated piece, so a deadline shorter than the prefill let every chunk run
+  (on CPU, a 3,512-token prompt with a 1 s deadline still took 31.8 s and held
+  its slot throughout). `RequestCtx::with_cancel` now links the latch into the
+  per-request abort that the prefill loop polls between chunks, so the request
+  ends at the next chunk boundary. A deadline that fires before any output
+  returns an `aborted: request cancelled during prompt prefill` error instead of
+  the misleading `shutdown requested`. `ChatGenerator::chat` now takes
+  `cancel: &Arc<AtomicBool>`.
+
+- **A resumed single-stream download no longer gets stuck or splices the wrong
+  bytes.** A partial that already held the whole file (interrupted after the
+  last byte, before the commit) got `416 Range Not Satisfiable` on every retry
+  and never finished. It now goes through the sha256 gate and is committed when
+  the server's reported size matches, and is downloaded again otherwise. A `206`
+  whose `Content-Range` is missing, starts somewhere other than the resume
+  offset, or reports a different total is no longer appended. That matters most
+  for non-LFS files such as `generation_config.json`, which have no digest to
+  catch a splice.
+
+- **Selected Vulkan benchmarks use bounded integrated-GPU profiles.**
+  `small_m_bench`, `attn_dsplit_probe`, `attn_ktile_probe`, `gemm_bench` and
+  `moe_id_gemv_real_dims` select small synthetic workloads before dispatch,
+  enforce submission bounds, and report unavailable timings and unsupported
+  kernels explicitly. Kernel overrides preserve `INFR_DEV`; Q6_K expert-bank
+  sizing uses the format layout. MoE parity checks every exercised bank after
+  timing, while discrete performance budgets remain required on their original
+  paths. Production kernels, submission policy and Windows TDR settings are
+  unchanged.
+
+- **Windows memory budgets use remaining Job Object headroom.**
+  `infr_plat::mem::available` subtracts current job commit usage and process
+  private usage from their enabled limits before choosing the tighter budget.
+  Failed probes return unknown instead of treating already committed memory as
+  available. Native child-process regression tests cover both limit types.
+
+- **Ctrl-C on Windows drains the GPU instead of killing infr mid-submit.**
+  `infr_plat::signal::install_handlers` was a no-op off unix, so the first
+  Ctrl-C terminated the process with a submit still in flight. It now registers
+  a console control handler: Ctrl-C and Ctrl-Break latch the same graceful
+  shutdown as `SIGINT`, closing the console window (or logoff/shutdown) latches
+  it as `SIGTERM`, a second event force-exits, and the exit status is 130/143 as
+  on unix. A Ctrl-C at an idle `infr run` prompt also takes effect immediately,
+  where it used to wait for Enter: console input is now read with
+  `ReadConsoleW`, which reports the aborted read that `Stdin` silently retries.
+- **The GPU kernel-cache tripwire works on Windows.** A cached pipeline binary
+  whose seeding run died (the signature of a GPU hang) is discarded on the next
+  start — but `infr_plat::proc::pid_alive` answered "alive" for every pid on
+  Windows, so the dead run was never noticed, the suspect blob was fed back to
+  the driver on every launch, and `.seeded.*` markers piled up in the cache
+  directory. It now probes with `OpenProcess` / `GetExitCodeProcess`.
+- **f16 values round to nearest on AMD's proprietary driver.** SPIR-V leaves the
+  rounding of a conversion to `float16_t` up to the driver unless the shader
+  declares one, and AMD's Windows driver truncates on RDNA2 (a Ryzen iGPU) — so
+  every f16 the shaders wrote, KV-cache entries and activation scales included,
+  came out up to one ulp low, and that device's results drifted from every
+  other's (`copy_f32_to_f16_cast_matches_host` and the expert-parallel test
+  failed on it). A known-answer dispatch at device creation now checks how the
+  driver rounds; where it truncates, every kernel with an f16 type declares
+  `RoundingModeRTE` for 16-bit floats, patched into the module at pipeline
+  creation (`infr_vulkan::spirv`). Devices that already round to nearest keep
+  their modules unchanged — declaring the mode there is not neutral, and moved a
+  GPU golden on an RDNA3 card.
+- **`infr compare` finds `llama-diffusion-cli` on Windows.** The `PATH` and
+  fork-build lookups probed for the file without `.exe`, so the diffusion
+  comparison always reported the binary missing. Fork-build lookup also checks
+  `bin/Release/` for multi-config CMake builds, retaining `bin/` precedence.
+- **rustls 0.23.45** (from 0.23.41) for
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): rustls
+  accepted TLS 1.3 handshake messages sent at the wrong encryption level. It is
+  the TLS stack under every `infr pull`; the weekly `cargo-deny` job had failed
+  on it.
+- **`infr` can find a global config file on Windows.** `config::file::discover`
+  resolved `$XDG_CONFIG_HOME`, else `$HOME/.config`, else nothing — and Windows
+  sets neither variable, so the third lookup step silently never found anything
+  there. It now resolves through `dirs::home_dir()`, which reads the
+  `FOLDERID_Profile` Known Folder. `--config <path>` and `./infr.toml` were
+  unaffected and are unchanged. The layout stays `~/.config/infr/config.toml` on
+  every platform, deliberately: adopting `dirs::config_dir()` would have moved
+  the file to `~/Library/Application Support` for existing macOS users. An
+  absolute `$XDG_CONFIG_HOME` still wins; a relative or empty one is now ignored
+  rather than honoured, per the spec.
+- **The Hugging Face cache is in the right place on macOS and Windows.**
+  `Store::discover` fell back to `dirs::cache_dir()`, which is
+  `~/Library/Caches` on macOS and `%LOCALAPPDATA%` on Windows —
+  `huggingface_hub` uses `$XDG_CACHE_HOME`, else `~/.cache`, on every platform
+  with no native-directory arm, so infr agreed with it only on Linux and would
+  re-download models `hf download` had already fetched. The resolution now
+  matches `huggingface_hub`'s exactly, including the `HUGGINGFACE_HUB_CACHE`
+  legacy variable, which was not read at all, and treating an empty `HF_HOME=`
+  as unset rather than resolving the cache to the relative path `hub`. A cache
+  an older infr left in the OS-native directory is still used while the standard
+  one does not exist, with a warning naming both, so upgrading does not silently
+  re-fetch gigabytes.
+
+- **macOS reports host memory, and Windows respects a container limit.**
+  `infr_plat::mem::available` returned `None` on macOS, so anything sizing a
+  host arena from it — the DRAM paging tier — stayed off on every Mac however
+  much RAM it had. It now probes `host_statistics64` and reports what is
+  reclaimable without swapping (`free - speculative + inactive + purgeable`;
+  `free_count` already includes speculative pages, so adding them again would
+  double-count). On Windows, `ullAvailPhys` is machine-wide and knew nothing
+  about a Job Object's commit limit, so a process inside a Windows container
+  could size an arena from far more memory than it was allowed — it is now
+  clamped by `QueryInformationJobObject`'s binding limit, the same policy the
+  Linux cgroup clamp already applied and now literally the same code. Both
+  figures carry their provenance in `Available::source`.
+
+- **The GPU MoE router no longer corrupts routing above 256 experts.**
+  `moe_topk.comp` sized its per-expert scratch `ssel_adj` for 256 while the
+  selection scan beside it was written for the chunked headroom above that, and
+  filled and read the array across the full expert count unconditionally — so a
+  model with more experts than the array holds wrote and read past it, which is
+  undefined behaviour in GLSL (corrupt routing weights or a driver hang, not a
+  clean failure). The array is now sized from the same constants the scan uses,
+  and `Recorder::moe_topk` refuses an expert count above the ceiling with a
+  message naming both numbers instead of dispatching. No supported model
+  exceeded the old bound, so nothing shipped was affected; the Qwen3.8 MoE
+  models, at 512 experts, are the first that would have been.
+
+- **Ctrl-C stops a download.** `infr pull` installed the `SIGINT`/`SIGTERM`
+  handlers but nothing on the download path read the latch, so the first Ctrl-C
+  appeared to do nothing and only `SIGKILL` ended a multi-gigabyte pull. Every
+  loop that moves bytes now polls it: `pull::fetch_all` stops claiming files,
+  `ranged::worker` stops claiming chunks, and both `download::stream_into` and
+  the ranged chunk reader stop mid-body per 64 KiB — the last one matters
+  because a chunk is 64 MiB, so checking only between chunks left the process
+  running for seconds after the signal. The partial and its resume sidecar are
+  kept in every case, so the next `infr pull` continues where it stopped; the
+  exit status is the conventional 130 / 143. An interrupted transfer reports
+  `Error::Aborted` rather than a download failure.
+
+- **Cached models are readable on Windows.** `link_blob` wrote its snapshot
+  symlink with the forward-slash target `../../blobs/<hex>` that
+  `huggingface_hub` and llama.cpp use. Windows accepts that in an ordinary path
+  but not inside a symlink's reparse point: the link was created and every read
+  through it failed with `ERROR_INVALID_NAME`. The target now uses the
+  platform's own separator.
 
 - **Every DeepSeek V2/V3 model added its attention output to the residual stream
   twice.** The MLA mixer arm in `seam/runner.rs` pushed its own `hidden += sub`
@@ -810,3 +802,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   outlives a model — `infr serve` reloading one — could otherwise return a
   cached weight built from the PREVIOUS model, because both the allocator and a
   fresh mmap hand out addresses that were just freed.
+
+### Security
+
+- Update `crossbeam-epoch` 0.9.18 → 0.9.20 for RUSTSEC-2026-0204 (invalid
+  pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`). Reached
+  through `rayon`, so it applies to every CPU-backend build.
+
+[Unreleased]: https://github.com/kryptic-sh/infr/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/kryptic-sh/infr/releases/tag/v0.1.0

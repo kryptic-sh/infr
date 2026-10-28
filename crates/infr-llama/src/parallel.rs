@@ -273,6 +273,11 @@ impl ParallelSeam {
         self.vk.capabilities().name
     }
 
+    /// A live snapshot of the bound device's memory, for `infr serve`'s `/status`.
+    pub fn vram(&self) -> infr_vulkan::VramInfo {
+        self.vk.vram()
+    }
+
     pub fn model(&self) -> &SeamModel {
         &self.model
     }

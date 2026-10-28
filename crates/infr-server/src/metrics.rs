@@ -16,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::{auth_gate, AppState, ReqRecord};
+use crate::{auth_gate, AppState, GeneratorStatus, ReqRecord};
 
 /// The media type of the text exposition format.
 const CONTENT_TYPE_TEXT: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -170,6 +170,40 @@ fn render(state: &AppState) -> String {
     for m in state.models.iter() {
         sample(&mut out, "infr_slots_busy", &[("model", &m.id)], m.busy());
     }
+
+    // What each generator can see of its device. A model whose backend reports nothing gets no
+    // sample, which Prometheus reads as "no data" rather than as a zero.
+    let reported: Vec<_> = state
+        .models
+        .iter()
+        .filter_map(|m| Some((&*m.id, m.engine.as_ref()?.status())))
+        .collect();
+    type Reading = fn(&GeneratorStatus) -> Option<u64>;
+    let gauges: [(&str, &str, Reading); 3] = [
+        (
+            "infr_context_tokens",
+            "Context window each slot holds, per model.",
+            |s| s.ctx_per_slot.map(|c| c as u64),
+        ),
+        (
+            "infr_device_memory_total_bytes",
+            "Memory of the device serving each model; on an integrated GPU, the shared pool.",
+            |s| Some(s.memory?.total_bytes),
+        ),
+        (
+            "infr_device_memory_available_bytes",
+            "Device memory this process could still allocate, by the driver's budget.",
+            |s| Some(s.memory?.available_bytes),
+        ),
+    ];
+    for (name, help, read) in gauges {
+        family(&mut out, name, "gauge", help);
+        for (id, s) in &reported {
+            if let Some(v) = read(s) {
+                sample(&mut out, name, &[("model", id)], v);
+            }
+        }
+    }
     out
 }
 
@@ -279,6 +313,21 @@ mod tests {
         assert_eq!(value_of(&body, r#"infr_slots{model="be\"ta"}"#), 1.0);
         assert_eq!(value_of(&body, r#"infr_slots_busy{model="be\"ta"}"#), 0.0);
         assert!(value_of(&body, "infr_decode_seconds_total") >= 0.0);
+        assert_eq!(
+            value_of(&body, r#"infr_context_tokens{model="alpha"}"#),
+            4096.0
+        );
+        assert_eq!(
+            value_of(&body, r#"infr_device_memory_total_bytes{model="alpha"}"#),
+            (8u64 << 30) as f64
+        );
+        assert_eq!(
+            value_of(
+                &body,
+                r#"infr_device_memory_available_bytes{model="alpha"}"#
+            ),
+            (6u64 << 30) as f64
+        );
         // Every family is declared once, before its samples.
         for name in ["infr_requests_total", "infr_slots", "infr_slots_busy"] {
             let decl = format!("# TYPE {name} ");
@@ -299,6 +348,16 @@ mod tests {
             value_of(&body, r#"infr_requests_total{result="error"}"#),
             1.0
         );
+    }
+
+    /// A model with nothing to report about its device gets no sample at all, not a zero.
+    #[test]
+    fn an_unreported_device_has_no_samples() {
+        let body = render(&AppState::headless("m", Arc::new(Config::default())));
+        assert!(body.contains("# TYPE infr_device_memory_total_bytes gauge"));
+        for name in ["infr_context_tokens", "infr_device_memory_total_bytes"] {
+            assert!(!body.contains(&format!("\n{name}{{")), "{name}:\n{body}");
+        }
     }
 
     #[tokio::test]

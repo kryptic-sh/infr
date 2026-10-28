@@ -1663,15 +1663,20 @@ struct SeamGenerator {
     model: std::sync::Mutex<Box<dyn infr_llama::chat::ChatModel + Send>>,
     renderer: infr_llama::chat::OaiRenderer,
     watch: infr_llama::WeightWatch,
+    /// The backend label `/status` reports. Fixed at construction: reading anything off `model`
+    /// would wait on its lock, which a generation holds for its whole run.
+    backend: &'static str,
 }
 
 impl SeamGenerator {
     fn new(
         gguf_path: &Path,
         model: Box<dyn infr_llama::chat::ChatModel + Send>,
+        backend: &'static str,
         cfg: Arc<Config>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
+            backend,
             model: std::sync::Mutex::new(model),
             renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
             watch: infr_llama::WeightWatch::open_model(gguf_path)?,
@@ -1818,6 +1823,17 @@ fn request_sampling(p: &infr_server::GenParams) -> infr_llama::sampling::Request
 }
 
 impl infr_server::ChatGenerator for SeamGenerator {
+    /// Only the backend: the device, context and memory sit behind the model's lock, and the
+    /// backends served this way do not expose them through `ChatModel`.
+    fn status(&self) -> infr_server::GeneratorStatus {
+        infr_server::GeneratorStatus {
+            backend: self.backend,
+            device: None,
+            ctx_per_slot: None,
+            memory: None,
+        }
+    }
+
     fn chat(
         &self,
         messages: &[infr_engine::ChatMessage],
@@ -1832,6 +1848,21 @@ impl infr_server::ChatGenerator for SeamGenerator {
 }
 
 impl infr_server::ChatGenerator for ParallelGenerator {
+    fn status(&self) -> infr_server::GeneratorStatus {
+        let vram = self.engine.vram();
+        infr_server::GeneratorStatus {
+            backend: "vulkan",
+            device: Some(self.engine.device_name()),
+            ctx_per_slot: Some(self.engine.max_ctx()),
+            memory: Some(infr_server::DeviceMemory {
+                total_bytes: vram.total,
+                available_bytes: vram.available,
+                live: vram.live,
+                unified: vram.uma,
+            }),
+        }
+    }
+
     fn chat(
         &self,
         messages: &[infr_engine::ChatMessage],
@@ -3979,6 +4010,11 @@ fn cmd_serve(
     // the reference backends; Vulkan is the default. qwen35 shares the SAME funnel as every other arch
     // (issue #30). Metal also honours INFR_SPEC_DRAFT (draft-verify speculative decode) via
     // `metal_chat_model` inside the funnel.
+    let backend = match selected_backend(cfg)? {
+        Backend::Vulkan(_) => "vulkan",
+        Backend::Metal => "metal",
+        Backend::Cpu => "cpu",
+    };
     let mut m = build_chat_model(&gguf, tok.as_deref(), is_dg, cfg)?;
     {
         // Compile every lazily-built pipeline NOW (a tiny throwaway generation) so the first
@@ -3990,7 +4026,7 @@ fn cmd_serve(
             t0.elapsed().as_secs_f32()
         );
         let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(SeamGenerator::new(&gguf, m, cfg.clone())?);
+            std::sync::Arc::new(SeamGenerator::new(&gguf, m, backend, cfg.clone())?);
         let rt = tokio::runtime::Runtime::new()?;
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");

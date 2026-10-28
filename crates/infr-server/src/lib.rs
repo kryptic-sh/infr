@@ -7,6 +7,7 @@
 //!   GET  /health                -> 200 OK                                              (open)
 //!   GET  /v1/models             -> { object: "list", data: [{ id, object, owned_by }] } (auth)
 //!   GET  /metrics               -> Prometheus text exposition (see `metrics`)          (auth)
+//!   GET  /status                -> JSON: per-model backend, device, ctx, slots, memory (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
@@ -45,6 +46,9 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 mod metrics;
+mod status;
+
+pub use status::{DeviceMemory, GeneratorStatus};
 
 /// Why generation ended — the OpenAI `finish_reason`. The generator reports it; the handlers
 /// serialize it (a tool call still overrides to [`Finish::ToolCalls`] at the wire layer).
@@ -107,6 +111,12 @@ pub trait ChatGenerator: Send + Sync {
         cancel: &Arc<AtomicBool>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
+
+    /// Where this generator runs and how much room it has, read fresh on each call, for
+    /// `GET /status` and the device gauges in `/metrics`. Report `None` for what the backend
+    /// cannot see rather than a placeholder. It must not wait on a generation: both routes call it
+    /// while requests are running.
+    fn status(&self) -> GeneratorStatus;
 }
 
 /// What one [`ChatGenerator::chat`] call produced: why it ended, plus the real token counts the
@@ -1093,6 +1103,8 @@ pub struct AppState {
     /// [`stats_reporter`] that `serve_state` spawns; a state built for tests simply has no reporter
     /// draining it.
     stats: Arc<ServeStats>,
+    /// When this state was built, for `/status`'s uptime.
+    started: Instant,
 }
 
 impl AppState {
@@ -1113,6 +1125,7 @@ impl AppState {
             )]),
             cfg,
             stats: Arc::default(),
+            started: Instant::now(),
         }
     }
 
@@ -1136,6 +1149,7 @@ impl AppState {
             models: Arc::new(models),
             cfg,
             stats: Arc::default(),
+            started: Instant::now(),
         }
     }
 
@@ -1147,6 +1161,7 @@ impl AppState {
             models: Arc::new(vec![ModelEntry::new(&model_id.into(), None, 1)]),
             cfg,
             stats: Arc::default(),
+            started: Instant::now(),
         }
     }
 
@@ -1179,6 +1194,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/metrics", get(metrics::metrics_handler))
+        .route("/status", get(status::status_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
         .with_state(state)
 }
@@ -2222,10 +2238,34 @@ mod tests {
         assert_eq!(card["owned_by"], "local");
     }
 
+    /// What a test generator with nothing to say about its device reports.
+    fn cpu_status() -> GeneratorStatus {
+        GeneratorStatus {
+            backend: "cpu",
+            device: None,
+            ctx_per_slot: None,
+            memory: None,
+        }
+    }
+
     /// A stub generator that streams back exactly one content delta naming the model it belongs to,
     /// so a routing test can prove WHICH generator answered.
     pub(crate) struct EchoGen(pub(crate) &'static str);
     impl ChatGenerator for EchoGen {
+        fn status(&self) -> GeneratorStatus {
+            GeneratorStatus {
+                backend: "vulkan",
+                device: Some(format!("dev-{}", self.0)),
+                ctx_per_slot: Some(4096),
+                memory: Some(DeviceMemory {
+                    total_bytes: 8 << 30,
+                    available_bytes: 6 << 30,
+                    live: true,
+                    unified: false,
+                }),
+            }
+        }
+
         fn chat(
             &self,
             _messages: &[ChatMessage],
@@ -3307,6 +3347,10 @@ mod tests {
     /// tell WHY the flag was set, which is why the handler has to relabel.
     struct LoopGen;
     impl ChatGenerator for LoopGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
         fn chat(
             &self,
             _messages: &[ChatMessage],
@@ -3499,6 +3543,10 @@ mod tests {
     /// clean `stop`; it must emit a terminal error frame, then `[DONE]`.
     struct FailGen;
     impl ChatGenerator for FailGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
         fn chat(
             &self,
             _messages: &[ChatMessage],
@@ -3552,6 +3600,10 @@ mod tests {
     /// was `DoneGuard`'s `[DONE]`.
     struct PanicGen;
     impl ChatGenerator for PanicGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
         fn chat(
             &self,
             _messages: &[ChatMessage],

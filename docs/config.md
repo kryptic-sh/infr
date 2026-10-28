@@ -256,12 +256,13 @@ And host-side stage timing was five knobs, one per pipeline (`INFR_PROF`,
 all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 
 **`[serve]`** — `api_key` (bearer token; an **empty** value means no auth — it
-gates `/v1/chat/completions`, `/v1/models` and `/metrics`, never `/health`),
-`max_tokens_cap`, `request_timeout_secs` (per-request wall-clock deadline in
-seconds; `0`, the default, means no deadline — a deadline truncates a legitimate
-slow reply, so it is opt-in), and `stats_interval_secs` (`INFR_SERVE_STATS_SECS`
-— how often the server logs its throughput line, default `5`; `0` switches the
-line off). Per-request sampling is not here — it stays on the request.
+gates `/v1/chat/completions`, `/v1/models`, `/metrics` and `/status`, never
+`/health`), `max_tokens_cap`, `request_timeout_secs` (per-request wall-clock
+deadline in seconds; `0`, the default, means no deadline — a deadline truncates
+a legitimate slow reply, so it is opt-in), and `stats_interval_secs`
+(`INFR_SERVE_STATS_SECS` — how often the server logs its throughput line,
+default `5`; `0` switches the line off). Per-request sampling is not here — it
+stays on the request.
 
 The throughput line is **activity-only**: an interval in which nothing happened
 emits nothing, so an idle server leaves a clean log and there is no heartbeat to

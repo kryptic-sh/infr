@@ -14,6 +14,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and busy). Counters only grow, so `rate()` gives throughput over any window.
   Like `/v1/models`, it needs the bearer token when `serve.api_key` is set.
 
+- **`GET /status` on `infr serve`**: one JSON snapshot with the version, uptime,
+  running and queued requests, and for each hosted model its backend, device,
+  context per slot, slots (total and busy) and device memory (total and still
+  allocatable, from the driver's live budget). `/metrics` carries the same
+  context and memory figures as gauges. Only the Vulkan multi-slot engine (the
+  default `infr serve` path) reports a device, context and memory; the CPU,
+  Metal and diffusion paths report their backend and `null` for the rest. Gated
+  by the API key like `/metrics`.
+
 ### Changed
 
 - **`infr pull` retries a failed chunk of a ranged download** instead of failing

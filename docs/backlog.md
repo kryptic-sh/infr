@@ -2767,13 +2767,46 @@ own CI, all competing with engine and backend work.
 
 If it is reopened, the cheap shape is a status page compiled into the binary
 (`include_str!`) and served at `/` by the existing axum router in
-`crates/infr-server`, like llama-server's built-in UI. It would sit on a new
-JSON endpoint reporting what generic clients cannot see: the bound device, free
-VRAM, the fitted context, slot count and occupancy, and decode tok/s. Such an
-endpoint is worth building on its own merits for operating the service, GUI or
-not. Model management (pull with progress, cache listing, a fit estimate per
-quant) would come after that, and a native wrapper only if there were demand for
-a tray app.
+`crates/infr-server`, like llama-server's built-in UI, reading `GET /status` and
+`GET /metrics` (built 2026-10-29 for operating the service; see B80). Model
+management (pull with progress, cache listing, a fit estimate per quant) would
+come after that, and a native wrapper only if there were demand for a tray app.
+
+### B80 — what `/status` and `/metrics` do not report yet (2026-10-29)
+
+**Tag:** serve · **Blocked on:** nothing; scoped out of the first slice
+
+The two routes (`crates/infr-server/src/status.rs`, `metrics.rs`) shipped with
+these gaps:
+
+- **Only `ParallelGenerator` reports a device.** `SeamGenerator` (CPU, Metal,
+  diffusion-gemma, and anything else served through `build_chat_model`) reports
+  its backend label and `null` device, context and memory, because that
+  information sits behind the `ChatModel` mutex a generation holds and
+  `ChatModel` has no accessor for it. Fixing it means capturing the figures at
+  construction (context, device name) and adding a lock-free memory query: host
+  RAM through `infr_plat::mem::available()` for CPU, the Metal working-set
+  budget for Metal.
+- **No latency histograms.** vLLM and TGI export time-to-first-token and
+  end-to-end latency histograms; `/metrics` has only the prefill and decode
+  second totals, which give mean rates but no tail. `ReqRecord` already carries
+  `prefill` and `total`, so a fixed-bucket histogram is a matter of atomics per
+  bucket.
+- **Counters are server-wide, not per model.** `ServeStats` is shared by every
+  hosted model, so under `infr multi` the token and request counters cannot be
+  split by model; only the slot, context and memory gauges carry a `model`
+  label.
+- **Prompt tokens mean "prefilled".** `infr_prompt_tokens_total` sums
+  `ChatOutcome::prompt_tokens`, which on the Vulkan seam is the uncached suffix
+  (`GenStats::n_prompt`), so a request that reuses a cached prefix adds only its
+  new tokens. Seen live on the iGPU: a repeat of a 10-token prompt added 1. A
+  separate counter for the whole prompt would need the generator to report it.
+- **A failed request's partial tokens are not counted** in the lifetime counters
+  (they have no authoritative `ChatOutcome`); the periodic log line does count
+  them, live.
+- **Not verified:** a real Prometheus scrape. The format was checked by the
+  route tests and by reading a live `/metrics` body, not by a Prometheus or
+  `promtool check metrics` run (neither is installed here).
 
 ## Whole-codebase correctness review 2026-08-30
 

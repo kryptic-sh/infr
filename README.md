@@ -173,8 +173,10 @@ CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
 
 `GET /metrics` serves Prometheus counters and gauges (`infr_requests_total`,
 `infr_generation_tokens_total`, `infr_decode_seconds_total`,
-`infr_requests_running`, `infr_slots_busy`, …), behind the API key when one is
-set.
+`infr_requests_running`, `infr_slots_busy`,
+`infr_device_memory_available_bytes`, …). `GET /status` returns the same picture
+as JSON — each model's backend, device, context per slot, slots and device
+memory. Both sit behind the API key when one is set.
 
 `--temp` / `--top-k` / `--top-p` set the SERVER defaults (`--temp 0` = greedy);
 a per-request OpenAI `temperature`/`top_p` still overrides them. See

@@ -54,6 +54,19 @@ fn run_in_child(test: &str, flags: JOB_OBJECT_LIMIT) {
         let before = super::probe()
             .expect("job probe before allocation")
             .expect("job limit");
+        // The public figure is clamped to the job, not just the probe: a limit far below this
+        // machine's free RAM has to win, and has to say it came from the job.
+        let avail = super::super::available().expect("available() inside a job");
+        assert_eq!(
+            avail.source,
+            super::super::Source::WindowsJobObjectClamped,
+            "a binding job limit must clamp available(): {avail:?}"
+        );
+        assert!(
+            avail.bytes <= LIMIT as u64,
+            "available() {} exceeds the job's {LIMIT}-byte limit",
+            avail.bytes
+        );
         let mut retained = vec![0_u8; ALLOCATION];
         // Touch every byte and retain the allocation across the second live probe.
         retained.fill(0xa5);

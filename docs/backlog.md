@@ -672,8 +672,8 @@ does any editor, nor llama.cpp. Reusable machinery exists (`FileLock` in
 `pull.rs`) if this is ever revisited, and it should be taken SHARED — exclusive
 would stop two `infr` processes sharing one model. `FileLock` is portable as of
 PR #91: the `libc::flock` call is now a `cfg(unix)` arm with a `LockFileEx`
-counterpart, so a revisit no longer has to solve Windows first. CI still builds
-only ubuntu-26.04 and macos-15 (§ B66).
+counterpart, so a revisit no longer has to solve Windows first, and CI tests it
+on windows-2025 as well as ubuntu-26.04 and macos-15.
 
 ### B31a — what the weekly miri job does NOT cover
 
@@ -2483,34 +2483,20 @@ Methodology, learned the hard way this session: benches run ONE AT A TIME (a
 concurrent GPU process skews everything), arms alternate across reps, and the
 spread is reported rather than just the mean.
 
-### B66 — the Windows Job Object memory clamp has never seen a real limit (2026-09-02)
+### B66 — which `link_blob` arm runs on Windows is not logged (2026-09-02)
 
 **Tag:** PR#91 residual · **Blocked on:** nothing; a gap, narrowed to what is
 actually still unknown
 
-The rest of this entry has shipped. `clippy` and `test` fan out over
-`ubuntu-26.04` / `macos-15` / `windows-2025`, `metal-check` lints every crate
-that cross-builds for `aarch64-apple-darwin`, the platform code moved behind
-`infr-plat` (see [infr-plat.md](infr-plat.md)), and the `windows-smoke` job now
-pulls a model and generates on a Windows runner — which closed the "compiled but
-never exercised" half of this entry and proved the hub cache resolves to
-`C:\Users\runneradmin\.cache\huggingface\hub` there, not `%LOCALAPPDATA%`.
+The rest of this entry has shipped. CI runs `clippy` and `test` on
+`windows-2025`, `windows-smoke` pulls a model and generates there, and the
+`infr_plat::mem` live probes pass on every `test` leg. The Job Object clamp is
+observed for real: `mem::windows_job::native_tests` runs a child inside a job
+with a 256 MiB process or job memory limit and checks that `probe()` tracks
+retained commit and that `available()` reports `WindowsJobObjectClamped` within
+the limit (it fails when the clamp is bypassed).
 
-The live probes are now observed too. `infr_plat::mem`'s
-`the_live_probe_is_plausible`, `the_macos_live_probe_is_plausible` and
-`the_windows_live_probe_is_plausible` call `available()` for real and pass on
-the ubuntu-26.04, macos-15 and windows-2025 `test` legs (checked in the
-2026-10-27 run for `c71b144`). The Linux and Windows ones also bound the figure
-by total RAM; the macOS one checks only that it is non-zero, through
-`MacosVmStatistics64`.
-
-What is still unobserved: the Windows Job Object CLAMP. No Windows container has
-reported a `JobMemoryLimit` / `ProcessMemoryLimit`, so `windows_job::probe` has
-only ever returned "no limit" for real, and the clamped arm is covered by the
-pure `apply_job_object_clamp` / `headroom` tests alone. Closing it needs a run
-inside a job with a memory limit.
-
-Also unverified on Windows: which arm of `link_blob` actually ran. The blob
+Still unverified on Windows: which arm of `link_blob` actually ran. The blob
 landed and the model loaded through the snapshot entry, so one of the two
 succeeded, but neither the symlink nor the hard-link fallback is logged.
 

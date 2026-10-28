@@ -306,6 +306,11 @@ jobs:
     name: Package ${{ matrix.target }}
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
+    # The release profile keeps line tables for profilers, which bloats the ELF
+    # binaries; a shipped binary drops them and keeps symbols, so a panic
+    # backtrace still names its functions.
+    env:
+      CARGO_PROFILE_RELEASE_STRIP: debuginfo
     strategy:
       fail-fast: false
       matrix:
@@ -412,7 +417,8 @@ jobs:
           Copy-Item README.md, LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath $archive
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
-          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+          # LF, not Out-File's CRLF: `sha256sum -c` reads the CR into the name.
+          Set-Content -NoNewline -Encoding ascii -Path "$archive.sha256" -Value "$hash  $archive`n"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: infr-${{ matrix.target }}

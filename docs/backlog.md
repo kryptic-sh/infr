@@ -710,12 +710,12 @@ diff. It is set to `allow` because this workspace's own members are declared
 applies only to crates marked `publish = false`, and only `infr-testkit` is.
 
 Marking the remaining members `publish = false` turns the gate back on and is
-accurate today — everything is at `0.0.0` and nothing is on crates.io. It is
-also a statement that these crates will not be published, which is a call to
-make on purpose rather than in passing, and `infr-cli` is the one where the
-answer might reasonably be "eventually". No registry wildcard exists in the tree
-right now (`grep '= "\*"' crates/*/Cargo.toml`), so what is currently missing is
-a guard against a future mistake, not cover for a present one.
+accurate today — nothing is on crates.io. It is also a statement that these
+crates will not be published, which is a call to make on purpose rather than in
+passing, and `infr-cli` is the one where the answer might reasonably be
+"eventually". No registry wildcard exists in the tree right now
+(`grep '= "\*"' crates/*/Cargo.toml`), so what is currently missing is a guard
+against a future mistake, not cover for a present one.
 
 ### B34 — no fuzz targets, and there is an obvious first one
 
@@ -2774,13 +2774,10 @@ refusal that says so.
 `ci.yml` now packages `infr` for x86_64/aarch64 Linux (zigbuild, glibc 2.28),
 x86_64 Windows and both macOS arches in the `dist` matrix on every `main` push.
 On a `v*` tag, `publish-github-release` attaches the archives, `SHA256SUMS` and
-a completions plus man page tarball. The dry run went green on `c71b144`. What
-is NOT done:
+a completions plus man page tarball; `v0.1.0` is the first. The shipped binaries
+are built with `CARGO_PROFILE_RELEASE_STRIP=debuginfo`, so profiling a release
+build with line attribution means building it locally. What is NOT done:
 
-- **No tag has been cut.** The workspace is still `0.0.0`, so the first release
-  is a BCTP away, and the release job itself (download, completions,
-  `softprops/action-gh-release`) has never run. Watch that first tag's jobs, not
-  the push.
 - **Downstream channels.** hrdr also publishes to crates.io, AUR (`*-bin`),
   Homebrew (`kryptic-sh/homebrew-tap`), Scoop (`kryptic-sh/scoop-bucket`) and
   Alpine, from `pkg/*.in` templates and jobs after its release job. The infr

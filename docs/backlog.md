@@ -2753,6 +2753,28 @@ build with line attribution means building it locally. What is NOT done:
   distro. The smoke step runs `--version` on ubuntu-26.04 only, and aarch64
   Linux is never executed at all (it is cross-built).
 
+### B79 — a GUI for infr: declined for now, service first (2026-10-28)
+
+**Tag:** product · **Decision:** the user's, 2026-10-28 — focus on infr as a
+service
+
+Considered and declined, recorded so it is not re-argued from scratch. Any chat
+GUI that speaks the OpenAI API (Open WebUI, Jan, Chatbox, Msty) already works
+against `infr serve` through `/v1/chat/completions` and `/v1/models`, so an infr
+chat app mostly duplicates them. A native desktop app (Tauri, egui) would add a
+new dependency tree, per-OS installers, code signing and notarization, and its
+own CI, all competing with engine and backend work.
+
+If it is reopened, the cheap shape is a status page compiled into the binary
+(`include_str!`) and served at `/` by the existing axum router in
+`crates/infr-server`, like llama-server's built-in UI. It would sit on a new
+JSON endpoint reporting what generic clients cannot see: the bound device, free
+VRAM, the fitted context, slot count and occupancy, and decode tok/s. Such an
+endpoint is worth building on its own merits for operating the service, GUI or
+not. Model management (pull with progress, cache listing, a fit estimate per
+quant) would come after that, and a native wrapper only if there were demand for
+a tray app.
+
 ## Whole-codebase correctness review 2026-08-30
 
 ### Decision — a deadline that fires during prefill returns HTTP 500

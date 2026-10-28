@@ -1207,34 +1207,35 @@ MB/s end to end, sha256 equal to HF's `lfs.oid`. Not covered:
   code does (chunk workers all `inc` the same bar); the real pull ran with
   stderr redirected to a file, where bars are hidden.
 
-### B60 — every infr-vs-llama.cpp cosine in the docs is the wrong metric (2026-08-11)
+### B60 — three CPU-vs-Vulkan tests still pass or fail on a whole-vocab logit cosine (2026-08-11)
 
-**Tag:** CR-2026-08-11 · **Blocked on:** nothing; the replacement metric exists
-and is in use
+**Tag:** CR-2026-08-11 · **Blocked on:** the models (none is ≤1B, so none runs
+on this box under the iGPU rule)
 
-`cpu_prefill_matches_llama_debug_dump` scores infr's prefill against llama.cpp's
-on the same GGUF over llama.cpp's own token ids. Running it produced a result
-that invalidates how this repo has been reporting agreement:
+`cpu_prefill_matches_llama_debug_dump` showed a whole-vocab logit cosine cannot
+separate a match from a mismatch: a **correct** V2-Lite row (both engines pick "
+Paris", probability cosine 0.9969) scored **0.774**, while two **unrelated**
+Qwen3-0.6B rows scored **0.851** (probability cosine 0.0164). The bias every row
+of a model shares dominates it.
 
-| pair                                         | logit cosine | probability cosine |
-| -------------------------------------------- | -----------: | -----------------: |
-| V2-Lite, same prompt, **both pick " Paris"** |    **0.774** |             0.9969 |
-| Qwen3-0.6B, same prompt                      |       0.9985 |             0.9994 |
-| Qwen3-0.6B, **unrelated prompt**             |    **0.851** |             0.0164 |
+Swept 2026-10-28: the docs no longer quote an infr-vs-llama.cpp logit cosine as
+evidence (`docs/deepseek.md`'s YaRN entry carries the correction). The
+CPU-vs-Vulkan figures in `docs/deepseek.md` and the synthetic tests in
+`tests/synthetic_deepseek2.rs` also assert the two backends' argmax is equal, so
+the cosine there is a report, not the gate. What still gates on it, all in
+`crates/infr-llama/tests/cpu_backend.rs`:
 
-A **correct** deepseek2 match scores BELOW an **unrelated** Qwen pair. A
-whole-vocab logit cosine is dominated by the per-token bias every row of a model
-shares, so it cannot separate a match from a mismatch, and the "~0.79–0.91
-established range" the docs quoted was measuring that bias rather than
-agreement. `docs/deepseek.md`'s YaRN checklist entry is corrected; the
-greedy-token identities it reports are real evidence and stand.
+- `gpu_seam_matches_cpu_qwen35moe`: top-5 overlap plus `cos > 0.5`.
+- `gpu_seam_matches_cpu_diffusion_gemma`: `overlap || cos > 0.78`, then
+  `cos > 0.7`. On the B60 numbers an unrelated row clears both.
+- `gpu_seam_matches_cpu_diffusion_gemma_denoise`: per row
+  `overlap || mask_tie || cos > 0.8`, and a min-row floor of `0.75`.
 
-Where this still needs sweeping: any other cosine figure quoted as evidence in
-`docs/`, and — separately — the CPU-vs-**Vulkan** cosines (`0.9955` for
-deepseek2, `0.99999992` for V4). Those compare two runs of the SAME model and
-weights, so the shared bias argument is weaker and they may well be fine, but
-they have not been re-examined against a probability cosine and should not be
-assumed sound just because they are high.
+Their thresholds were calibrated against measured healthy runs (the comments
+record 0.74–0.89), which is exactly the range an unrelated pair also reaches.
+Replace each with a cosine over softmax probabilities, re-measured on the model
+it guards, and show a broken backend fails it. Needs Qwen3.5-MoE and
+DiffusionGemma-26B, plus a GPU the user allows them on.
 
 ### B65 — 29 elementwise dispatchers use the UNSPLIT grid and can exceed `maxComputeWorkGroupCount[0]` (2026-08-13)
 

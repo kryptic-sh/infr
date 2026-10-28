@@ -451,7 +451,9 @@ impl SeamModel {
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         self.auto_q8_for_explicit_ctx(&vk, max_ctx, 1);
+        let refused = self.refuse_explicit_ctx(&vk, max_ctx, 1);
         drop(scope);
+        refused?;
         Ok(DenseVulkanSession {
             be: vk,
             pool: SlotPool::new(),
@@ -466,8 +468,8 @@ impl SeamModel {
     /// the VRAM budget — a long-context model's trained window (128k+) would otherwise allocate
     /// a KV cache that blows VRAM at startup or on the first request. Explicit contexts
     /// (INFR_CTX → `vulkan_session(ctx)`) are NEVER clamped: they get a q8_0 cache when only
-    /// that fits (`auto_q8_for_explicit_ctx`), and the Vulkan
-    /// allocation budget guard still fails a truly-oversized one cleanly at alloc time.
+    /// that fits (`auto_q8_for_explicit_ctx`), and one whose KV cache cannot fit at all is
+    /// refused before it is allocated (`refuse_unallocatable_kv`).
     pub fn vulkan_session_default(&self) -> Result<DenseVulkanSession> {
         self.vulkan_session_default_on(None)
     }
@@ -550,7 +552,7 @@ impl SeamModel {
     /// A context the USER asked for explicitly (`--ctx N` / `INFR_CTX=N`) never reaches this
     /// function at all: those are taken verbatim, given q8_0 by
     /// [`auto_q8_for_explicit_ctx`](Self::auto_q8_for_explicit_ctx) when only that fits, and
-    /// backstopped by the alloc-time VRAM guard.
+    /// refused by `refuse_unallocatable_kv` when their KV cache cannot fit at all.
     ///
     /// Extra KV slots (INFR_KV_SLOTS forks) and MoE expert host-offload aren't modeled — the
     /// alloc-time budget guard remains the backstop for those.
@@ -676,8 +678,8 @@ impl SeamModel {
     /// The auto-q8 rung for a context the USER chose (`--ctx N` / `INFR_CTX=N`), which is never
     /// clamped: when `n_slots` f16 caches of `want` tokens do not fit but q8_0 ones do, pin q8_0
     /// for the current placement scope so the window that was asked for is served. Otherwise
-    /// nothing changes, and a window that fits in neither format still meets the alloc-time VRAM
-    /// guard, as before.
+    /// nothing changes, and a window that fits in neither format is refused by
+    /// `crate::seam::refuse_unallocatable_kv` once the weights are resident.
     fn auto_q8_for_explicit_ctx(
         &self,
         vk: &infr_vulkan::VulkanBackend,
@@ -703,6 +705,32 @@ impl SeamModel {
              (fits {fit} tokens in total); set INFR_KV_TYPE_K/V=f16 to force f16 (decode is ~10-16% \
              slower on q8)"
         );
+    }
+
+    /// The refuse rung for a context the USER chose, taken before any weight is loaded: `Err` when
+    /// even the smallest KV cache `n_slots` windows of `want` tokens could still allocate
+    /// (`crate::seam::kv_floor_alloc_bytes`) cannot fit the device at all. Runs after
+    /// [`auto_q8_for_explicit_ctx`](Self::auto_q8_for_explicit_ctx), under the same placement
+    /// scope, so a q8_0 pin it just made is what gets priced.
+    fn refuse_explicit_ctx(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        want: usize,
+        n_slots: usize,
+    ) -> Result<()> {
+        let (k_fmt, v_fmt) = self.kv_fit_fmts(crate::seam::kv_auto_q8());
+        let sizes =
+            crate::seam::kv_floor_alloc_bytes(&self.cfg, &self.ecfg, want, n_slots, k_fmt, v_fmt);
+        crate::seam::refuse_unallocatable_kv(
+            &self.ecfg,
+            &sizes,
+            Some(vk.alloc_room()),
+            want,
+            k_fmt,
+            v_fmt,
+            "on this device before the weights load",
+            || self.kv_fit_ctx(vk).map(|f| f / n_slots.max(1)),
+        )
     }
 
     /// The VRAM-fit KV capacity in tokens: the LARGEST context whose KV cache — priced as the
@@ -914,6 +942,7 @@ impl SeamModel {
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
             let ctx = (c as usize).max(1);
             self.auto_q8_for_explicit_ctx(vk, ctx, n_slots);
+            self.refuse_explicit_ctx(vk, ctx, n_slots)?;
             return Ok(ctx);
         }
         if n_slots == 1 && want.is_none() {

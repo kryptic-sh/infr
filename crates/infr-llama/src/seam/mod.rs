@@ -1588,8 +1588,9 @@ pub(crate) const POST_KV_DEVICE_RESERVE: u64 = 256 * 1024 * 1024;
 /// ([`dense_act_reserve_at`]) and [`POST_KV_DEVICE_RESERVE`].
 ///
 /// **Only ever shrinks**, and only a context the SESSION chose. A user-pinned `--ctx`/`INFR_CTX`
-/// is documented as taken verbatim (never clamped), so it is warned about and honored — the
-/// alloc-time VRAM guard stays its backstop. Returns `want_ctx` unchanged on a backend with no
+/// is documented as taken verbatim (never clamped), so it is warned about and honored —
+/// [`refuse_unallocatable_kv`] refuses one whose KV cache alone cannot land, and the alloc-time
+/// VRAM guard stays the backstop for the rest. Returns `want_ctx` unchanged on a backend with no
 /// budget to report (`Backend::device_alloc_room` → `None`: CPU, Metal today).
 ///
 /// May also LOWER the pinned prefill chunk ([`repin_ubatch_lower`]) when a shorter one serves more
@@ -1669,6 +1670,149 @@ pub(crate) fn reclamp_ctx_to_live_room(
         gib(POST_KV_DEVICE_RESERVE),
     );
     fit
+}
+
+/// Bytes layer `l`'s two cache buffers ALLOCATE at `want_ctx` and prefill chunk `ubatch` —
+/// `(K side, V side)`, exactly what the runner hands `Backend::alloc` with `BufferUsage::KvCache`.
+/// A qwen35 DeltaNet layer holds its conv history and recurrent state there instead (fixed-size
+/// f32, not `want_ctx`-scaled); an attention layer holds `kv_rows_at` rows of its own per-side
+/// width.
+pub(crate) fn kv_layer_alloc_bytes(
+    cfg: &Config,
+    l: usize,
+    want_ctx: usize,
+    ring: bool,
+    ubatch: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> (usize, usize) {
+    if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
+        let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
+        let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+        return (conv_elems * 4, s_elems * 4);
+    }
+    // Per-token row widths, MLA included: DeepSeek2 caches ONE compressed row
+    // (kv_lora_rank + qk_rope_dim) per token and has no V side, so `v_row` is 0 and `kv_side_bytes`
+    // allocates the placeholder buffer the backends still bind. deepseek32 puts its
+    // lightning-indexer cache on that otherwise-unused V side, so `v_row` there is
+    // `indexer_head_size` and is reserved like any other side.
+    let (k_row, v_row) = kv_row_elems(cfg, l);
+    // SWA ring: window layers hold only `window + ubatch` rows (the ring recycles rows the window
+    // mask already excludes — `kv_rows` has the argument).
+    let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch);
+    // The indexer cache MUST hold the whole context: `Op::LightningIndexer` masks causally only, so
+    // position 0 stays eligible for every query row and a ring that had wrapped would have
+    // overwritten it — every backend refuses `cap_rows < kv_len` rather than score a row holding
+    // some other position. V3.2 declares no sliding window, so `kv_rows_at` already returns
+    // `want_ctx` here; this is what keeps that true if the ring gate ever widens, checked where the
+    // buffer is actually sized.
+    assert!(
+        !cfg.deepseek32 || rows >= want_ctx,
+        "deepseek32 layer {l}: the lightning indexer's KV cache was sized at {rows} rows for a \
+         {want_ctx}-token context — it must not ring, because the indexer's causal-only mask keeps \
+         position 0 eligible for every query"
+    );
+    (
+        kv_side_bytes(k_fmt, rows * k_row),
+        kv_side_bytes(v_fmt, rows * v_row),
+    )
+}
+
+/// The smallest KV cache `n_slots` sessions of `want_ctx` tokens can still end up allocating,
+/// priced BEFORE the runner settles the details: each side at the cheapest of the format the fit
+/// math expects, f16 and q8_0 (the runner falls back to one of those when it gates a format out),
+/// the SWA ring wherever ringing is possible at all, and the shortest prefill chunk placement may
+/// lower to. Every choice can only shrink the figure, so [`refuse_unallocatable_kv`] reading it
+/// stays provable before a single weight is loaded.
+pub(crate) fn kv_floor_alloc_bytes(
+    cfg: &Config,
+    ec: &EngineConfig,
+    want_ctx: usize,
+    n_slots: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+) -> Vec<(usize, usize)> {
+    let cheapest = |dt: DType| {
+        [dt, DType::F16, DType::Q8_0]
+            .into_iter()
+            .min_by_key(|&d| kv_side_bytes(d, 1 << 20))
+            .expect("the candidate list is not empty")
+    };
+    let (k_fmt, v_fmt) = (cheapest(k_fmt), cheapest(v_fmt));
+    let ring = kv_ring_wanted(cfg, ec);
+    let ubatch = ubatch_candidates(ec)
+        .into_iter()
+        .min()
+        .expect("ubatch_candidates is never empty");
+    let one: Vec<(usize, usize)> = (0..cfg.n_layer)
+        .map(|l| kv_layer_alloc_bytes(cfg, l, want_ctx, ring, ubatch, k_fmt, v_fmt))
+        .collect();
+    std::iter::repeat_n(one, n_slots.max(1)).flatten().collect()
+}
+
+/// The KV allocations of `sizes` the Vulkan VRAM guard will check, summed — `None` when nothing
+/// can be proven: no budget to compare against, or a configuration where the guard is not the last
+/// word (`INFR_KV_OVERFLOW` places what does not fit in system RAM; `INFR_NO_VRAM_GUARD` turns the
+/// guard off).
+///
+/// A LOWER bound on what the guard will see, never an over-estimate: a sub-MiB request is skipped
+/// even though its aligned size may reach the guard, and the guard checks `requirements.size`,
+/// which is never below the request.
+fn kv_guarded_bytes(sizes: &[(usize, usize)], room: Option<u64>, ec: &EngineConfig) -> Option<u64> {
+    if room.is_none() || ec.kv.overflow || ec.kernels.vulkan.no_vram_guard {
+        return None;
+    }
+    let total = sizes
+        .iter()
+        .flat_map(|&(k, v)| [k as u64, v as u64])
+        .filter(|&b| b >= infr_vulkan::VRAM_GUARD_MIN_ALLOC)
+        .sum();
+    Some(total)
+}
+
+/// Refuse rung for a context no rung can save: `Err` when the KV cache buffers `sizes` ALONE
+/// cannot be allocated in `room`, the device's allocation ceiling. Two callers: the explicit-`--ctx`
+/// path before any weight loads (pricing [`kv_floor_alloc_bytes`] against the whole device), and the
+/// runner between the weight upload and the KV allocation (pricing the exact buffers against what
+/// the device reports is left). `fit` supplies the window to suggest instead, when one is known.
+///
+/// Provable, so it can never refuse a run that would have worked: it counts only the buffers the
+/// guard checks ([`kv_guarded_bytes`]), against the guard's own ceiling, with no weights and no
+/// activation reserve. If they sum past `room`, the first buffer that crosses it is refused, and
+/// the room only shrinks as the earlier ones land. Without this an oversized explicit window failed
+/// on a misleading streaming-floor error or on one layer's buffer with the guard's generic message.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refuse_unallocatable_kv(
+    ec: &EngineConfig,
+    sizes: &[(usize, usize)],
+    room: Option<u64>,
+    want_ctx: usize,
+    k_fmt: DType,
+    v_fmt: DType,
+    room_is: &str,
+    fit: impl FnOnce() -> Option<usize>,
+) -> AResult<()> {
+    let Some(need) = kv_guarded_bytes(sizes, room, ec) else {
+        return Ok(());
+    };
+    let room = room.expect("kv_guarded_bytes is None without a room");
+    if need <= room {
+        return Ok(());
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    Err(anyhow!(
+        "context {want_ctx} cannot be served on this device: its KV cache alone needs at least \
+         {:.2} GiB (requested {k_fmt:?}/{v_fmt:?}), and only {:.2} GiB can be allocated {room_is}.\n  \
+         Try a smaller window (--ctx N / INFR_CTX=N{}), a more quantized cache (INFR_KV_TYPE_K / \
+         INFR_KV_TYPE_V), INFR_KV_OVERFLOW=1 to place the cache in system RAM, or a smaller quant \
+         of the model.",
+        gib(need),
+        gib(room),
+        match fit() {
+            Some(f) if f > 0 => format!("; about {f} tokens fit here"),
+            _ => String::new(),
+        },
+    ))
 }
 
 /// One resident-BDA / streamed-arena addressing unit's ELEMENT-count cap (the invariant's element
@@ -4485,6 +4629,78 @@ mod seam_helper_tests {
             ..Default::default()
         };
         assert_eq!(call(&RoomOnly(Some(tight)), &pinned), want);
+    }
+
+    /// The KV refuse rung fires only when the buffers the guard checks provably cannot land: past
+    /// the room it refuses with the numbers, at the room it lets the session through, and it stays
+    /// out of the way wherever the guard is not the last word.
+    #[test]
+    fn kv_refuse_rung_fires_only_when_the_guard_must_refuse() {
+        let (k, v) = (DType::F16, DType::F16);
+        let mib = 1usize << 20;
+        let sizes = vec![(64 * mib, 64 * mib); 4]; // 512 MiB in guarded buffers
+        let need = 512 * mib as u64;
+        let call = |sizes: &[(usize, usize)], room: Option<u64>, ec: &EngineConfig| {
+            super::refuse_unallocatable_kv(ec, sizes, room, 32768, k, v, "here", || Some(1024))
+        };
+        let ec = EngineConfig::default();
+
+        let err = call(&sizes, Some(need - 1), &ec).expect_err("one byte short must refuse");
+        assert!(
+            err.to_string().contains("cannot be served on this device"),
+            "{err}"
+        );
+        call(&sizes, Some(need), &ec).expect("an exact fit must be allowed");
+        call(&sizes, None, &ec).expect("no budget to report: nothing to prove");
+
+        // Sub-MiB buffers are never checked by the guard, so they cannot prove a refusal however
+        // many there are.
+        let tiny = vec![(mib - 1, mib - 1); 1024];
+        call(&tiny, Some(1), &ec).expect("unguarded buffers must not count");
+
+        // KV overflow spills what does not fit; a disabled guard refuses nothing.
+        let mut overflow = EngineConfig::default();
+        overflow.kv.overflow = true;
+        call(&sizes, Some(1), &overflow).expect("INFR_KV_OVERFLOW must not refuse");
+        let mut unguarded = EngineConfig::default();
+        unguarded.kernels.vulkan.no_vram_guard = true;
+        call(&sizes, Some(1), &unguarded).expect("INFR_NO_VRAM_GUARD must not refuse");
+    }
+
+    /// The pre-load floor must never price more than any cache the runner can still settle on —
+    /// that is what lets the refuse rung read it before a weight is loaded.
+    #[test]
+    fn kv_floor_never_exceeds_a_cache_the_runner_could_allocate() {
+        let cfg = gemma3_12b();
+        let ec = EngineConfig::default();
+        let want = 32768;
+        let total =
+            |sizes: Vec<(usize, usize)>| -> usize { sizes.iter().map(|&(k, v)| k + v).sum() };
+        let exact = |ring: bool, ub: usize, dt: DType| {
+            total(
+                (0..cfg.n_layer)
+                    .map(|l| super::kv_layer_alloc_bytes(&cfg, l, want, ring, ub, dt, dt))
+                    .collect(),
+            )
+        };
+        let floor =
+            |n: usize, dt: DType| total(super::kv_floor_alloc_bytes(&cfg, &ec, want, n, dt, dt));
+        let f16 = floor(1, DType::F16);
+        for ub in super::ubatch_candidates(&ec) {
+            for ring in [false, true] {
+                for dt in [DType::F16, DType::Q8_0] {
+                    assert!(
+                        f16 <= exact(ring, ub, dt),
+                        "floor {f16} > the {dt:?} cache at chunk {ub}, ring {ring}"
+                    );
+                }
+            }
+        }
+        assert_eq!(floor(2, DType::F16), 2 * f16, "each slot owns a cache");
+        assert!(
+            floor(1, DType::Turbo2) < f16,
+            "a requested format cheaper than q8_0 is the floor"
+        );
     }
 
     #[test]

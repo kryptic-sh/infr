@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **An explicit `--ctx` / `INFR_CTX` whose KV cache cannot fit on the Vulkan
+  device is refused before the weights load**, with the cache size, the room the
+  device has and a window that would fit. It used to fail during placement with
+  "dense weights exceed VRAM … streaming floor", which blamed the weights, or
+  after the weights had loaded with the allocation guard's generic message. The
+  check counts only the KV buffers the VRAM guard checks, at the cheapest format
+  the cache could still use, so it never refuses a window that would have run.
+  `INFR_KV_OVERFLOW=1` and `INFR_NO_VRAM_GUARD=1` skip it.
+
 ## [0.1.0] - 2026-10-28
 
 ### Added

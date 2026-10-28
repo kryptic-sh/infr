@@ -753,6 +753,11 @@ fn kv_overflow_vram_cap(cfg: &infr_core::config::Config) -> Option<u64> {
 /// driver-internal allocations (descriptor pools, pipeline/shader memory, command buffers).
 const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
 
+/// Smallest device-local allocation the VRAM budget guard checks: anything below it
+/// is let through unasked. Public so a caller proving that an allocation set MUST be refused (the
+/// seam's KV refuse rung) can count exactly the allocations the guard will see.
+pub const VRAM_GUARD_MIN_ALLOC: u64 = 1 << 20;
+
 /// Free bytes on the DEVICE-LOCAL heaps alone — what the UMA spill decision keys off (unlike
 /// [`vram_info`]'s UMA figure, which spans every heap). Live VK_EXT_memory_budget when present, so
 /// a device-local heap another process has filled reads as full here too; otherwise the heap size
@@ -2947,8 +2952,7 @@ impl VulkanBackend {
     /// Sub-MiB allocations skip the check (no per-tiny-alloc driver query; they cannot
     /// individually blow the budget and stay covered by the next large allocation's check).
     fn check_vram_budget(&self, want: u64) -> Result<()> {
-        const CHECK_MIN: u64 = 1 << 20; // 1 MiB
-        if want < CHECK_MIN || self.cfg.kernels.vulkan.no_vram_guard {
+        if want < VRAM_GUARD_MIN_ALLOC || self.cfg.kernels.vulkan.no_vram_guard {
             return Ok(());
         }
         // The probe is the single source of truth for "does `want` fit?" so the hard guard here and

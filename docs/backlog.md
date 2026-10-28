@@ -369,36 +369,39 @@ is defensible where silently handing back less than asked is not.
 means "of free VRAM" (today) or "of what can actually be allocated" before
 changing it; either way it is one `spec.resolve` argument per arm.
 
-### B12 — an explicit `--ctx N` that fits in no KV format still fails late
+### B12 — what the explicit `--ctx N` fit ladder still does not cover
 
-**Tag:** raised 2026-08-02 · **Blocked on:** nothing; the q8 half shipped
-2026-10-27
+**Tag:** raised 2026-08-02 · **Blocked on:** nothing; the ladder shipped (q8
+2026-10-27, refuse 2026-10-28), these are its gaps
 
 **DECIDED 2026-08-12 (user):** an explicit `--ctx N` that does not fit must try
-q8_0 KV first — _"when setting `--ctx` that would not fit in VRAM using k/v
-cache, have infr auto quant the context to Q8_0 if it will fit"_ — so the
-explicit path walks f16, then q8_0, then refuse.
+q8_0 KV first, then refuse — f16, then q8_0, then refuse.
 
-**Shipped:** `SeamModel::auto_q8_for_explicit_ctx` (decision in the pure
-`explicit_ctx_q8_fit`, unit-tested) runs from `vulkan_session_on` and from
-`vulkan_slot_ctx`'s `SizeSpec::Bytes` arm, pricing `want * n_slots` caches. It
-pins q8_0 for that session's placement scope when f16 misses and q8_0 holds the
-whole window, and keeps the window as asked.
+**Shipped:** `SeamModel::auto_q8_for_explicit_ctx` pins q8_0 when f16 misses and
+q8_0 holds `want * n_slots`. `SeamModel::refuse_explicit_ctx` then refuses,
+before any weight loads, when `seam::kv_floor_alloc_bytes` (each side at the
+cheapest of the requested format, f16 and q8_0, the ring wherever possible, the
+shortest prefill chunk) exceeds `alloc_room()`. The runner repeats the check
+with the exact buffers against the measured room between the weight upload and
+the KV allocation. Both count only buffers of at least
+`infr_vulkan::VRAM_GUARD_MIN_ALLOC`, and both skip under `INFR_KV_OVERFLOW` and
+`INFR_NO_VRAM_GUARD`. Observed on the iGPU: Qwen3-0.6B at `INFR_CTX=1000000` is
+refused in under a second with the sizes.
 
-**Not done: the refuse rung.** A window that fits in neither format is still
-honoured and fails at the alloc-time VRAM guard with its generic message, after
-`reclamp_ctx_to_live_room`'s warning. An early refusal with
-`clamp_default_ctx`'s detailed message must be **provable**: exact KV bytes +
-weights vs `alloc_room()`, with no activation reserve, so an over-estimate can
-never refuse a run that would have worked. `kv_fit_ctx` includes the dense
-activation reserve, so it cannot be reused for that as-is.
+**Gaps:**
 
-**Not observed:** the q8 pin itself in a real run. Reaching it means an explicit
-window close to the whole device, which on this box means filling the iGPU's
-shared memory or using the dGPU, both off-limits. Only the decision function is
-tested. The DEFAULT-path refuse rung stays as narrow as it was: only "no usable
-context at all" may refuse, or every ordinary long-context model breaks on a 24
-GiB card.
+- **The refusal ignores the weights**, so it is only the "the KV cache alone
+  cannot fit" case. A window whose KV fits but KV + weights does not still stops
+  at dense placement with "dense weights exceed VRAM … streaming floor", which
+  names the weights rather than the window. Folding weights in is only provable
+  for a model that cannot stream them, so that message is what to fix next.
+- **Not observed in a real run:** the q8 pin, and the runner's post-load
+  refusal. Both need an explicit window close to the whole device: on this box
+  that means filling the iGPU's shared memory or using the dGPU, both
+  off-limits. Only their decision functions are tested.
+- The DEFAULT-path refuse rung stays as narrow as it was: only "no usable
+  context at all" may refuse, or every ordinary long-context model breaks on a
+  24 GiB card.
 
 ### B13 — the `+64` rows in every KV footprint estimate is slop, not padding
 
@@ -1692,21 +1695,6 @@ is left:
   be free, not measured. `moe_topk`'s hash branch replaces the whole `n_used`
   reduction with an `n_used`-element copy, so it can only be faster; also not
   measured.
-
-### B-DSV4-METAL-CLIPPY — `cargo clippy --target x86_64-apple-darwin` is red at HEAD (2026-08-10)
-
-**Tag:** metal · lint · **Blocked on:** nothing; pre-existing, not this slice's
-
-`crates/infr-metal/src/exec.rs`'s `Op::Mla` arm has two `manual_map` clippy
-errors (the `freq_factors` and `key_bias`
-`match … { Some(x) => Some(f(x)), None => None }` pairs), so
-`cargo clippy -p infr-metal --all-targets --target x86_64-apple-darwin -- -D warnings`
-fails. Confirmed present at `HEAD`
-(`git show HEAD:crates/infr-metal/src/exec.rs`), i.e. it came in with the MLA
-`key_bias` work, not with the hash-routing slice — left alone on scope grounds.
-The workspace clippy run is green because those lines are Apple-only and a Linux
-build never compiles them. Worth checking whether CI lints that target at all;
-if it does, it has been red since `key_bias` landed.
 
 ### B-DSV4-REAL — the shipped V4 file now needs ONLY the compressed tiers (2026-08-13)
 

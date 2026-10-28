@@ -1039,6 +1039,47 @@ mod tests {
         assert!(cache.blobs().join(hub.sha(f)).exists());
     }
 
+    /// One chunk's connection drops mid-body: that chunk is fetched again in place and the pull
+    /// finishes in the same run, rather than failing the file and waiting for the next `infr pull`.
+    #[test]
+    fn a_dropped_chunk_is_retried_in_the_same_run() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-retry", 1, big());
+        let cache = TempRepo::new();
+
+        hub.cut_one_after(3); // three bodies intact, one cut, then healthy
+        pull_one(&hub, &cache, &files, 4).expect("a single dropped chunk must not fail the pull");
+        assert_one_cell_refetched(&hub, &cache, &files[0]);
+    }
+
+    /// An edge answering `503` for one chunk is retried the same way.
+    #[test]
+    fn a_503_chunk_is_retried_in_the_same_run() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-503", 1, big());
+        let cache = TempRepo::new();
+
+        hub.unavailable_after(3); // three ranged GETs served, one 503, then healthy
+        pull_one(&hub, &cache, &files, 4).expect("a single 503 must not fail the pull");
+        assert_one_cell_refetched(&hub, &cache, &files[0]);
+    }
+
+    /// `f` was committed whole in ONE run with exactly one cell requested twice. Read off the
+    /// request log, since a run that failed and was re-run would produce the same bytes.
+    fn assert_one_cell_refetched(hub: &TestHub, cache: &TempRepo, f: &str) {
+        let mut starts: Vec<u64> = chunk_spans(hub, f).iter().map(|(a, _)| *a).collect();
+        let fetched = starts.len();
+        starts.sort();
+        starts.dedup();
+        assert_eq!(starts.len(), 10, "every cell was requested");
+        assert_eq!(
+            fetched, 11,
+            "exactly one cell was requested twice: {starts:?}"
+        );
+        assert_eq!(fs::read(cache.snapshot().join(f)).unwrap(), hub.body(f));
+        assert!(!partial_of(&cache.blobs(), f).exists());
+    }
+
     /// `hub.pull_jobs` may change between an interrupted run and the next one. The grid is fixed by
     /// the OBJECT (size and chunk size, both recorded in the sidecar) rather than by the worker
     /// count, so a different job count claims different cells of the same plan instead of

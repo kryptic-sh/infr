@@ -40,6 +40,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 use tracing::{debug, warn};
 
 /// What a one-byte probe learned about the object: how big it is, and the validator to present on
@@ -377,12 +378,67 @@ fn worker<'s>(scope: &'s std::thread::Scope<'s, '_>, job: &'s Job<'s>, budget: &
     }
 }
 
-/// Fetch chunk `i` and record it as landed — in that order, and only if every byte of it arrived.
+/// Tries one chunk gets before its failure ends the whole file. A transient failure — a dropped
+/// connection, a short body, a `5xx` or `429` — usually clears on a fresh connection, and the
+/// alternative is aborting a download that may be hours in for one bad request.
+const CHUNK_ATTEMPTS: u32 = 3;
+
+/// Wait before retry `n` is `n` times this. Short under test, where the local origin is the only
+/// thing being waited on.
+const CHUNK_RETRY_BACKOFF: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(1)
+};
+
+/// One failed attempt at a chunk.
+enum ChunkFailure {
+    /// Worth another try on a fresh connection. Carries the message the file fails with if the
+    /// tries run out.
+    Transient(String),
+    /// Retrying cannot help: the object moved, ranges stopped working, the disk failed, or the user
+    /// asked to stop.
+    Permanent(RangedError),
+}
+
+/// Fetch chunk `i` and record it as landed, retrying a transient failure in place up to
+/// [`CHUNK_ATTEMPTS`] times before it fails the file. Another worker's failure or a Ctrl-C stops
+/// the retrying, since the file is ending anyway.
 fn fetch_chunk(job: &Job, i: usize) -> std::result::Result<(), RangedError> {
+    let mut attempt = 1;
+    loop {
+        match fetch_chunk_once(job, i) {
+            Ok(()) => return Ok(()),
+            Err(ChunkFailure::Permanent(e)) => return Err(e),
+            Err(ChunkFailure::Transient(why)) => {
+                if attempt >= CHUNK_ATTEMPTS
+                    || job.stop.load(Ordering::Relaxed)
+                    || shutdown_requested()
+                {
+                    return Err(RangedError::Fatal(Error::Other(why)));
+                }
+                job.pb.suspend(|| {
+                    warn!(
+                        "{why}; retrying (attempt {} of {CHUNK_ATTEMPTS})",
+                        attempt + 1
+                    )
+                });
+                std::thread::sleep(CHUNK_RETRY_BACKOFF * attempt);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// One attempt at chunk `i`: fetch it and record it as landed — in that order, and only if every
+/// byte of it arrived. A transient failure takes back the progress it had shown, because the retry
+/// counts those bytes again.
+fn fetch_chunk_once(job: &Job, i: usize) -> std::result::Result<(), ChunkFailure> {
+    use ChunkFailure::{Permanent, Transient};
     let (start, len) = job.range(i);
     let end = start + len - 1;
     let mut req = download_client()
-        .map_err(RangedError::Fatal)?
+        .map_err(|e| Permanent(RangedError::Fatal(e)))?
         .get(job.url)
         .header(RANGE, format!("bytes={start}-{end}"));
     if let Some(v) = &job.validator {
@@ -392,25 +448,32 @@ fn fetch_chunk(job: &Job, i: usize) -> std::result::Result<(), RangedError> {
         req = req.bearer_auth(t);
     }
     let mut resp = req.send().map_err(|e| {
-        RangedError::Fatal(Error::Other(format!(
+        Transient(format!(
             "{}: chunk {i} ({start}..={end}): {e} (partial kept for resume)",
             job.label
-        )))
+        ))
     })?;
     if resp.status() == StatusCode::OK {
         // The range was declined and the whole object is on its way — writing that at `start` is
         // exactly the splice this design exists to prevent.
-        return Err(RangedError::NoRanges(format!(
+        return Err(Permanent(RangedError::NoRanges(format!(
             "{}: the server answered chunk {i} with the whole object",
             job.label
+        ))));
+    }
+    if resp.status().is_server_error() || resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        return Err(Transient(format!(
+            "{}: chunk {i}: HTTP {} (partial kept for resume)",
+            job.label,
+            resp.status()
         )));
     }
     if resp.status() != StatusCode::PARTIAL_CONTENT {
-        return Err(RangedError::Fatal(Error::Other(format!(
+        return Err(Permanent(RangedError::Fatal(Error::Other(format!(
             "{}: chunk {i}: HTTP {}",
             job.label,
             resp.status()
-        ))));
+        )))));
     }
     // The reply must describe the bytes that were asked for, out of the size the plan was built on.
     match resp
@@ -421,53 +484,68 @@ fn fetch_chunk(job: &Job, i: usize) -> std::result::Result<(), RangedError> {
     {
         Some((a, b, total)) if a == start && b == end && total == job.size => {}
         Some((a, b, total)) => {
-            return Err(RangedError::Changed(format!(
+            return Err(Permanent(RangedError::Changed(format!(
                 "{}: asked for bytes {start}-{end}/{} and was served {a}-{b}/{total}",
                 job.label, job.size
-            )));
+            ))));
         }
         None => {
-            return Err(RangedError::NoRanges(format!(
+            return Err(Permanent(RangedError::NoRanges(format!(
                 "{}: chunk {i} came back 206 with no usable Content-Range",
                 job.label
-            )));
+            ))));
         }
     }
     if let Some(n) = resp.content_length() {
         if n != len {
-            return Err(RangedError::Fatal(Error::Other(format!(
+            return Err(Permanent(RangedError::Fatal(Error::Other(format!(
                 "{}: chunk {i} announced {n} bytes, expected {len}",
                 job.label
-            ))));
+            )))));
         }
     }
 
     let mut buf = vec![0u8; 1 << 16];
     let mut at = start;
     let mut left = len;
+    // A failure past this point has already advanced the bar by what landed of this attempt.
+    let undo = |left: u64, why: String| {
+        job.pb.dec(len - left);
+        Transient(why)
+    };
     while left > 0 {
         // Between chunks is not often enough: a chunk is 64 MiB, so a worker that only checked
         // there would keep pulling for tens of seconds after a Ctrl-C. Abandoning mid-chunk costs
         // nothing — the bytes already written are at their absolute offsets and stay, the chunk
         // just never gets marked done, so a resume re-fetches this one chunk and no more.
         if shutdown_requested() {
-            return Err(RangedError::Fatal(Error::Aborted));
+            return Err(Permanent(RangedError::Fatal(Error::Aborted)));
         }
         let want = buf.len().min(left as usize);
-        let n = resp.read(&mut buf[..want]).map_err(|e| {
-            RangedError::Fatal(Error::Other(format!(
-                "{}: chunk {i} at {at}: {e} (partial kept for resume)",
-                job.label
-            )))
-        })?;
+        let n = match resp.read(&mut buf[..want]) {
+            Ok(n) => n,
+            Err(e) => {
+                return Err(undo(
+                    left,
+                    format!(
+                        "{}: chunk {i} at {at}: {e} (partial kept for resume)",
+                        job.label
+                    ),
+                ))
+            }
+        };
         if n == 0 {
             // A short body would otherwise leave a hole under a chunk marked done.
-            return Err(RangedError::Fatal(Error::Other(format!(
-                "{}: chunk {i} ended {left} bytes early (partial kept for resume)",
-                job.label
-            ))));
+            return Err(undo(
+                left,
+                format!(
+                    "{}: chunk {i} ended {left} bytes early (partial kept for resume)",
+                    job.label
+                ),
+            ));
         }
-        write_all_at(&job.file, &buf[..n], at).map_err(|e| RangedError::Fatal(Error::from(e)))?;
+        write_all_at(&job.file, &buf[..n], at)
+            .map_err(|e| Permanent(RangedError::Fatal(Error::from(e))))?;
         at += n as u64;
         left -= n as u64;
         job.pb.inc(n as u64);
@@ -477,10 +555,10 @@ fn fetch_chunk(job: &Job, i: usize) -> std::result::Result<(), RangedError> {
     // object had been downloaded again for nothing.
     job.file
         .sync_data()
-        .map_err(|e| RangedError::Fatal(Error::from(e)))?;
+        .map_err(|e| Permanent(RangedError::Fatal(Error::from(e))))?;
     let mut plan = job.plan.lock().unwrap();
     plan.mark_done(i);
-    parts::save(job.tmp, &plan).map_err(RangedError::Fatal)?;
+    parts::save(job.tmp, &plan).map_err(|e| Permanent(RangedError::Fatal(e)))?;
     Ok(())
 }
 

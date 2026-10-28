@@ -1126,9 +1126,9 @@ one real 229 GB five-shard pull. Not covered:
   unmeasured is a bound above 8, and whether the ceiling is the link, the CDN or
   a per-client cap.
 - **Two `infr` processes pulling the same model at once.** The per-blob `flock`
-  that serialises them is unchanged and still unit-tested
-  (`file_lock_is_exclusive`), but no test starts a second process, and the
-  cross-process case is now N locks held at once instead of one.
+  that serialises them is unchanged and still unit-tested (`infr_plat::lock`'s
+  `a_held_lock_excludes_a_second_holder`), but no test starts a second process,
+  and the cross-process case is now N locks held at once instead of one.
 - **A repo with more files than the bound.** `DeepSeek-V3.2-REAP`'s 236 shards
   is the case the bound exists for, and it has only been exercised at 10 files /
   3 workers against a local origin with the progress group HIDDEN. What that
@@ -1139,11 +1139,6 @@ one real 229 GB five-shard pull. Not covered:
   growing past `pull_jobs` lines. Five shards did not show it. If it turns out
   to matter, the lever is `MultiProgress::remove` / `finish_and_clear` on each
   completed bar, at the cost of the per-shard `✓` line.
-- **Windows and macOS.** The fan-out itself is `std::thread::scope` and
-  portable. `infr-hub` builds on Windows as of PR #91, but nothing RUNS the
-  fan-out there — no CI job builds or tests that target, and the one test that
-  covered the lock is now `cfg(not(target_os = "windows"))` (§ B66). macOS is
-  CI-only.
 - **`HF_TOKEN` on a gated repo.** The token now reaches `download_to_blob` from
   inside rather than as a parameter; unchanged in effect, but no gated repo was
   pulled.
@@ -1158,12 +1153,12 @@ one real 229 GB five-shard pull. Not covered:
 gap, stated so the coverage claim stays honest
 
 Intra-file ranged parallelism (`infr_hub::ranged`, `infr_hub::parts`) is covered
-by twelve tests against the local origin (`infr-hub/src/testhttp.rs`) plus
-eleven unit tests for the sidecar, the grid, the identity check and the
-connection budget — each one shown red before green by breaking what it guards —
-and by one real pull of `unsloth/DeepSeek-V3.2-GGUF:UD-TQ1_0`: 161 280 830 528
-bytes over 2 404 ranges through two deliberate `SIGKILL`s, 33.6 minutes at 80.0
-MB/s end to end, sha256 equal to HF's `lfs.oid`. Not covered:
+by tests against the local origin (`infr-hub/src/testhttp.rs`) plus unit tests
+for the sidecar, the grid, the identity check and the connection budget — each
+one shown red before green by breaking what it guards — and by one real pull of
+`unsloth/DeepSeek-V3.2-GGUF:UD-TQ1_0`: 161 280 830 528 bytes over 2 404 ranges
+through two deliberate `SIGKILL`s, 33.6 minutes at 80.0 MB/s end to end, sha256
+equal to HF's `lfs.oid`. Not covered:
 
 - **A re-upload of a REAL object mid-download.** The splice guard is exercised
   only against the local origin. In production the guard that actually fires is
@@ -1179,9 +1174,12 @@ MB/s end to end, sha256 equal to HF's `lfs.oid`. Not covered:
   would make that chunk come back `200` and the file would restart as a single
   stream — correct, but slow, and nothing would say why beyond one `warn!`.
   Unobserved in a 2 404-chunk pull, so the risk is bounded but not zero.
-- **Chunk-level retry.** A failed chunk aborts the whole file (its partial and
-  sidecar are kept, so the next run resumes). Retrying that one range in place
-  would be strictly better on a flaky link and is not implemented.
+- **Chunk retry, beyond the local origin.** A transient failure (send or read
+  error, short body, `5xx`, `429`) is retried in place up to `CHUNK_ATTEMPTS`
+  times, tested with one dropped body and one `503`. Not tested: the progress
+  bar giving back a failed attempt's bytes (`ProgressBar::dec`, read only), and
+  a retry against the real CDN, which never failed a chunk in the 2 404-range
+  pull.
 - **The 64 MiB chunk size was not swept.** It was picked from the two costs it
   trades (a request per chunk against work lost on interruption) and the real
   pull confirms the request overhead is not visible at 80 MB/s, but 32 or 128
@@ -1193,12 +1191,6 @@ MB/s end to end, sha256 equal to HF's `lfs.oid`. Not covered:
   serialises them is unchanged and still unit-tested, and both modes take it
   from the same `.dl-…lock` name so a mode difference cannot dodge it. No test
   starts a second process.
-- **Windows.** `ranged::fetch_chunk`'s
-  `std::os::unix::fs::FileExt::write_all_at` is a `cfg(unix)` arm as of PR #91,
-  paired with a `seek_write` retry loop — Windows' positional write can be
-  partial where `write_all_at` cannot, so the two arms are not the same code and
-  only the unix one has ever run. Nothing exercises the Windows arm: no CI job
-  builds that target (§ B66).
 - **A gated repo over ranges.** The bearer token is attached to the probe and to
   every chunk request, but reqwest drops `Authorization` across the cross-origin
   redirect to the CDN (as it should — the CDN URL is pre-signed), and no gated

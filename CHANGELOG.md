@@ -8,6 +8,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`infr pull` retries a failed chunk of a ranged download** instead of failing
+  the whole file. A dropped connection, a short body, or an HTTP `5xx` or `429`
+  for one range is retried in place with a short backoff, a few times, before
+  the file fails as before (keeping its partial for the next run). A re-uploaded
+  object, a server that stopped serving ranges and local disk errors still fail
+  at once.
+
 - **An explicit `--ctx` / `INFR_CTX` whose KV cache cannot fit on the Vulkan
   device is refused before the weights load**, with the cache size, the room the
   device has and a window that would fit. It used to fail during placement with

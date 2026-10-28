@@ -72,6 +72,12 @@ struct State {
     /// half — a download dying mid-flight, without a second process to kill.
     bodies: AtomicUsize,
     cut_after: AtomicUsize,
+    /// Bodies from this one on go out intact again: with `cut_after`, the window of cut bodies — a
+    /// connection that dropped once rather than a server that stays broken.
+    cut_until: AtomicUsize,
+    /// Ranged GETs answered so far, and which one of them (by that count) is answered `503`.
+    ranged_gets: AtomicUsize,
+    unavailable_at: AtomicUsize,
     /// How an honoured range is misdescribed, if at all.
     range_fault: Mutex<RangeFault>,
 }
@@ -102,6 +108,8 @@ impl TestHub {
         let addr = listener.local_addr().expect("test hub addr");
         let state = Arc::new(State::default());
         state.cut_after.store(usize::MAX, Ordering::Relaxed); // nothing is cut by default
+        state.cut_until.store(usize::MAX, Ordering::Relaxed);
+        state.unavailable_at.store(usize::MAX, Ordering::Relaxed);
         state.advertise_ranges.store(true, Ordering::Relaxed);
         let acceptor = state.clone();
         std::thread::spawn(move || {
@@ -222,13 +230,32 @@ impl TestHub {
         );
     }
 
-    /// Stop cutting: the next run of the same download completes normally.
+    /// Let `n` more bodies out intact, cut exactly the one after them, and serve the rest normally
+    /// — one connection dropping mid-body, which a retry can recover from.
+    pub(crate) fn cut_one_after(&self, n: usize) {
+        let at = self.state.bodies.load(Ordering::SeqCst) + n;
+        self.state.cut_until.store(at + 1, Ordering::SeqCst);
+        self.state.cut_after.store(at, Ordering::SeqCst);
+    }
+
+    /// Let `n` more ranged GETs through, answer the one after them `503 Service Unavailable`, and
+    /// serve ranges normally again — an overloaded edge that recovers.
+    pub(crate) fn unavailable_after(&self, n: usize) {
+        self.state.unavailable_at.store(
+            self.state.ranged_gets.load(Ordering::SeqCst) + n,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Misdescribe every honoured range from now on (see [`RangeFault`]).
     pub(crate) fn fault_ranges(&self, fault: RangeFault) {
         *self.state.range_fault.lock().unwrap() = fault;
     }
 
+    /// Stop cutting: the next run of the same download completes normally.
     pub(crate) fn heal(&self) {
         self.state.cut_after.store(usize::MAX, Ordering::SeqCst);
+        self.state.cut_until.store(usize::MAX, Ordering::SeqCst);
     }
 
     /// Answer `404` for `name` from now on.
@@ -392,6 +419,18 @@ fn serve(state: &State, stream: TcpStream) {
                 honoured: span.is_some(),
             });
     }
+    let unavailable = method == "GET"
+        && span.is_some()
+        && state.ranged_gets.fetch_add(1, Ordering::SeqCst)
+            == state.unavailable_at.load(Ordering::SeqCst);
+    if unavailable {
+        let _ = write!(
+            &stream,
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
     if unsatisfiable {
         let _ = write!(
             &stream,
@@ -452,7 +491,9 @@ fn serve(state: &State, stream: TcpStream) {
         e.1 = e.1.max(e.0);
     }
     let nth = state.bodies.fetch_add(1, Ordering::SeqCst);
-    let slice = if nth >= state.cut_after.load(Ordering::SeqCst) {
+    let cut = nth >= state.cut_after.load(Ordering::SeqCst)
+        && nth < state.cut_until.load(Ordering::SeqCst);
+    let slice = if cut {
         &slice[..slice.len() / 2]
     } else {
         slice

@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **tokio 1.54.1** (from 1.52.3) for
+  [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386)
+  (`AsyncFd::new` and related constructors violated I/O safety), and **rustls
+  0.23.46**, **rustls-webpki 0.103.16** and **webpki-roots 1.0.11** for
+  RUSTSEC-2026-0346 to -0349 (TLS secrets in `Debug` output, data sent after an
+  ECH rejection, unbounded Brotli certificate decompression, a ServerHello
+  key-exchange downgrade) and RUSTSEC-2026-0381/-0382 (distrusted emSign
+  intermediates accepted). tokio runs `infr serve` and every `infr pull`, and
+  rustls is the TLS stack under `infr pull`.
+
 - **The weight-file watch covers every shard of a split model.** `run`, `serve`
   and `bench` stamp the model's files at load and refuse to continue if one is
   truncated or rewritten in place. On a `gguf-split` set only the shard named on

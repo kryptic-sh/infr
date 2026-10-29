@@ -2740,17 +2740,12 @@ secrets visible to every repo. The shipped binaries are built with
 `CARGO_PROFILE_RELEASE_STRIP=debuginfo`, so profiling a release build with line
 attribution means building it locally. What is NOT done:
 
-- **The publish jobs have never run.** They were ported from hrdr's and only run
-  on a tag; `v0.1.0` predates them, so the first tag after it is their first
-  run. Checked locally: `cargo package --workspace --exclude infr-testkit`
-  builds every crate from its tarball, the `ORDER` dependency check passes and
-  fails on a scrambled order, and the templates render with `v0.1.0`'s real
-  checksums. Not checked: `makepkg`, `brew audit` or a Scoop install of the
-  rendered files.
-- **The first crates.io publish is 14 new crates**, and crates.io rate-limits
-  new crate names much harder than new versions, so that run's `publish-crates`
-  job can sit in its 429 back-off for a long while. Later releases are version
-  updates.
+- **Verified on `v0.2.0` (2026-10-29), the first tag to run the publish jobs:**
+  all 14 crates are on crates.io at 0.2.0, `infr-bin` 0.2.0-1 is on the AUR, and
+  the tap's `Formula/infr.rb` and the bucket's `bucket/infr.json` carry 0.2.0,
+  each with the checksums in the release's `SHA256SUMS`. Not checked: an actual
+  `brew install`, `yay -S infr-bin`, `scoop install infr` or
+  `cargo install infr-cli` on a clean machine.
 - **`cargo install infr-cli` needs `glslc`**, like any source build:
   `infr-vulkan`'s build script compiles the shaders and has no prebuilt SPIR-V
   fallback.

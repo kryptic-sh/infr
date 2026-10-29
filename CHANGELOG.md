@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-29
+
+### Breaking
+
+- **`infr_server::ChatGenerator` has a new required method, `status()`**,
+  returning a `GeneratorStatus` (backend, device, context per slot, device
+  memory) for `/status` and `/metrics`. An out-of-tree generator must implement
+  it; it must not wait on a running generation.
+
 ### Added
 
 - **`GET /metrics` on `infr serve`**, in the Prometheus text format: request
@@ -854,5 +863,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`). Reached
   through `rayon`, so it applies to every CPU-backend build.
 
-[Unreleased]: https://github.com/kryptic-sh/infr/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/infr/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/kryptic-sh/infr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kryptic-sh/infr/releases/tag/v0.1.0

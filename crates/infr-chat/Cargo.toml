@@ -1,5 +1,6 @@
 [package]
 name = "infr-chat"
+description = "Chat prompt rendering and model output parsing for infr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

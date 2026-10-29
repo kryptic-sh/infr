@@ -1,5 +1,6 @@
 [package]
 name = "infr-server"
+description = "OpenAI-compatible HTTP server for the infr LLM inference engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

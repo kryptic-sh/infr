@@ -1,0 +1,27 @@
+{
+  "version": "{VERSION}",
+  "description": "Pure-Rust LLM inference engine with an OpenAI-compatible server",
+  "homepage": "https://github.com/kryptic-sh/infr",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/kryptic-sh/infr/releases/download/v{VERSION}/infr-v{VERSION}-x86_64-pc-windows-msvc.zip",
+      "hash": "{SHA256_X86_64_WINDOWS}"
+    }
+  },
+  "bin": "infr.exe",
+  "notes": "Enable PowerShell completions: add 'infr --completions powershell | Out-String | Invoke-Expression' to your $PROFILE.",
+  "checkver": {
+    "github": "https://github.com/kryptic-sh/infr"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/kryptic-sh/infr/releases/download/v$version/infr-v$version-x86_64-pc-windows-msvc.zip"
+      }
+    },
+    "hash": {
+      "url": "$url.sha256"
+    }
+  }
+}

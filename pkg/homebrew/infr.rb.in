@@ -1,0 +1,37 @@
+# Auto-generated. Source: https://github.com/kryptic-sh/infr
+# Edits made directly to this file in the tap will be overwritten on the
+# next tag — change `pkg/homebrew/infr.rb.in` in the upstream repo and
+# let `.github/workflows/ci.yml` rebuild on the next release.
+class Infr < Formula
+  desc "Pure-Rust LLM inference engine with an OpenAI-compatible server"
+  homepage "https://github.com/kryptic-sh/infr"
+  version "{VERSION}"
+  license "MIT"
+
+  # Homebrew loads each formula for every OS and architecture when it taps
+  # the tap, and refuses the whole tap if one has no URL there, so the URLs
+  # stay outside `on_macos`; `depends_on :macos` keeps it macOS-only.
+  depends_on :macos
+
+  on_arm do
+    url "https://github.com/kryptic-sh/infr/releases/download/v{VERSION}/infr-v{VERSION}-aarch64-apple-darwin.tar.gz"
+    sha256 "{SHA256_AARCH64_DARWIN}"
+  end
+  on_intel do
+    url "https://github.com/kryptic-sh/infr/releases/download/v{VERSION}/infr-v{VERSION}-x86_64-apple-darwin.tar.gz"
+    sha256 "{SHA256_X86_64_DARWIN}"
+  end
+
+  def install
+    bin.install "infr"
+    # Default shell_parameter_format appends the shell name:
+    # `infr --completions bash|zsh|fish`.
+    generate_completions_from_executable(bin/"infr", "--completions",
+                                         shells: [:bash, :zsh, :fish])
+    (man1/"infr.1").write Utils.safe_popen_read(bin/"infr", "--man")
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/infr --version")
+  end
+end

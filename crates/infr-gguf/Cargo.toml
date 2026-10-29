@@ -1,5 +1,6 @@
 [package]
 name = "infr-gguf"
+description = "Zero-copy GGUF weight loader for the infr LLM inference engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

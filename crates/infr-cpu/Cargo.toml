@@ -1,5 +1,6 @@
 [package]
 name = "infr-cpu"
+description = "CPU reference backend for the infr LLM inference engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

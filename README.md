@@ -246,6 +246,21 @@ loader   WeightSource     (Gguf; safetensors later)
 compute  Backend          (Vulkan via ash + SPIR-V; native Metal via MSL; CPU reference)
 ```
 
+## Install
+
+```bash
+brew install kryptic-sh/tap/infr          # macOS
+yay -S infr-bin                           # Arch Linux (AUR)
+scoop bucket add kryptic-sh https://github.com/kryptic-sh/scoop-bucket
+scoop install infr                        # Windows
+cargo install infr-cli --locked           # from source; needs glslc, see below
+```
+
+Prebuilt archives for Linux (x86_64, aarch64), macOS and Windows are on the
+[releases page](https://github.com/kryptic-sh/infr/releases). The crate is
+`infr-cli` because `infr` on crates.io is another project; it installs the
+`infr` binary.
+
 ## Building
 
 ```bash

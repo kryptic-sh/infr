@@ -1,5 +1,6 @@
 [package]
 name = "infr-engine"
+description = "Chat text logic shared by infr's run and serve commands"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

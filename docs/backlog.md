@@ -2726,29 +2726,41 @@ launder it into an abstraction; implementing `external_memory_win32` is feature
 work, not a move. Either do that, or delete the Windows alias in favour of a
 refusal that says so.
 
-### B78 — release channels beyond the GitHub Release (2026-10-27)
+### B78 — release channels still open (2026-10-27)
 
-**Tag:** delivery · **Blocked on:** two decisions (secrets are in place)
+**Tag:** delivery
 
-`ci.yml` now packages `infr` for x86_64/aarch64 Linux (zigbuild, glibc 2.28),
-x86_64 Windows and both macOS arches in the `dist` matrix on every `main` push.
-On a `v*` tag, `publish-github-release` attaches the archives, `SHA256SUMS` and
-a completions plus man page tarball; `v0.1.0` is the first. The shipped binaries
-are built with `CARGO_PROFILE_RELEASE_STRIP=debuginfo`, so profiling a release
-build with line attribution means building it locally. What is NOT done:
+`ci.yml` packages `infr` for x86_64/aarch64 Linux (zigbuild, glibc 2.28), x86_64
+Windows and both macOS arches in the `dist` matrix on every `main` push. On a
+`v*` tag, `publish-github-release` attaches the archives, `SHA256SUMS` and a
+completions plus man page tarball, and then `publish-crates`, `aur-bin`,
+`brew-tap` and `scoop-bucket` publish from `pkg/*.in` (decided 2026-10-29:
+crates.io, AUR, Homebrew and Scoop). Their secrets are kryptic-sh organisation
+secrets visible to every repo. The shipped binaries are built with
+`CARGO_PROFILE_RELEASE_STRIP=debuginfo`, so profiling a release build with line
+attribution means building it locally. What is NOT done:
 
-- **Downstream channels.** hrdr also publishes to crates.io, AUR (`*-bin`),
-  Homebrew (`kryptic-sh/homebrew-tap`), Scoop (`kryptic-sh/scoop-bucket`) and
-  Alpine, from `pkg/*.in` templates and jobs after its release job. infr has
-  none of those jobs yet. The secrets they need — `CARGO_REGISTRY_TOKEN`,
-  `AUR_SSH_KEY`, `BREW_SSH_KEY` and `SCOOP_SSH_KEY` — are kryptic-sh
-  organisation secrets with visibility `ALL` (`gh secret list -o kryptic-sh`),
-  so infr's workflows can already read them; it needs no repo secrets of its
-  own. Whether infr goes to crates.io at all (14 crates, none published,
-  `infr-testkit` already `publish = false`) is the user's call.
-- **`.deb` / `.rpm`.** hrdr builds them with `cargo-deb` / `cargo-generate-rpm`;
-  infr has no `[package.metadata.deb]` or `generate-rpm` section in
-  `crates/infr-cli/Cargo.toml` yet.
+- **The publish jobs have never run.** They were ported from hrdr's and only run
+  on a tag; `v0.1.0` predates them, so the first tag after it is their first
+  run. Checked locally: `cargo package --workspace --exclude infr-testkit`
+  builds every crate from its tarball, the `ORDER` dependency check passes and
+  fails on a scrambled order, and the templates render with `v0.1.0`'s real
+  checksums. Not checked: `makepkg`, `brew audit` or a Scoop install of the
+  rendered files.
+- **The first crates.io publish is 14 new crates**, and crates.io rate-limits
+  new crate names much harder than new versions, so that run's `publish-crates`
+  job can sit in its 429 back-off for a long while. Later releases are version
+  updates.
+- **`cargo install infr-cli` needs `glslc`**, like any source build:
+  `infr-vulkan`'s build script compiles the shaders and has no prebuilt SPIR-V
+  fallback.
+- **The tap and bucket READMEs** (`kryptic-sh/homebrew-tap`,
+  `kryptic-sh/scoop-bucket`) don't list infr; they were already behind on hrdr
+  and the others.
+- **`.deb` / `.rpm` and Alpine.** hrdr builds them with `cargo-deb` /
+  `cargo-generate-rpm` and an `APKBUILD`; infr has no `[package.metadata.deb]`
+  or `generate-rpm` section in `crates/infr-cli/Cargo.toml`, and Alpine is musl
+  (see the next point).
 - **No musl targets, by design:** ash loads `libvulkan` with `dlopen`, which a
   static musl binary cannot do.
 - **Not verified:** that the glibc-2.28 Linux binary actually starts on an old

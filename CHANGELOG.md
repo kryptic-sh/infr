@@ -23,6 +23,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Metal and diffusion paths report their backend and `null` for the rest. Gated
   by the API key like `/metrics`.
 
+- **Releases now publish to crates.io, Homebrew, the AUR and Scoop.** A `v*` tag
+  publishes every workspace crate except `infr-testkit` to crates.io, in
+  dependency order; install the binary with `cargo install infr-cli` (the `infr`
+  name there belongs to another project). It also pushes the `infr` formula to
+  `kryptic-sh/homebrew-tap`, `infr-bin` to the AUR and the `infr` manifest to
+  `kryptic-sh/scoop-bucket`, all from the release's own archives and checksums.
+  Templates live in `pkg/`.
+
 ### Changed
 
 - **`infr pull` retries a failed chunk of a ranged download** instead of failing

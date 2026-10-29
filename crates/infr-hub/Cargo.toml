@@ -1,5 +1,6 @@
 [package]
 name = "infr-hub"
+description = "Hugging Face Hub model download and cache resolution for infr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

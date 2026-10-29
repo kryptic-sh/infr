@@ -26,21 +26,22 @@ repository = "https://github.com/kryptic-sh/infr"
 
 [workspace.dependencies]
 # internal
-infr-core = { path = "crates/infr-core" }
+infr-core = { path = "crates/infr-core", version = "0.1.0" }
 # The platform seam: every `cfg(unix)` / `cfg(windows)` / `cfg(target_os)` arm in
 # the workspace lives here, so the OS-specific surface is one reviewable crate.
 # A LEAF — it must not depend on any other infr crate (see docs/infr-plat.md).
-infr-plat = { path = "crates/infr-plat" }
-infr-vulkan = { path = "crates/infr-vulkan" }
-infr-metal = { path = "crates/infr-metal" }
-infr-hub = { path = "crates/infr-hub" }
-infr-gguf = { path = "crates/infr-gguf" }
-infr-cpu = { path = "crates/infr-cpu" }
-infr-chat = { path = "crates/infr-chat" }
-infr-engine = { path = "crates/infr-engine" }
-infr-server = { path = "crates/infr-server" }
-infr-prof = { path = "crates/infr-prof" }
-infr-prof-rt = { path = "crates/infr-prof-rt" }
+infr-plat = { path = "crates/infr-plat", version = "0.1.0" }
+infr-vulkan = { path = "crates/infr-vulkan", version = "0.1.0" }
+infr-metal = { path = "crates/infr-metal", version = "0.1.0" }
+infr-hub = { path = "crates/infr-hub", version = "0.1.0" }
+infr-gguf = { path = "crates/infr-gguf", version = "0.1.0" }
+infr-cpu = { path = "crates/infr-cpu", version = "0.1.0" }
+infr-chat = { path = "crates/infr-chat", version = "0.1.0" }
+infr-engine = { path = "crates/infr-engine", version = "0.1.0" }
+infr-server = { path = "crates/infr-server", version = "0.1.0" }
+infr-llama = { path = "crates/infr-llama", version = "0.1.0" }
+infr-prof = { path = "crates/infr-prof", version = "0.1.0" }
+infr-prof-rt = { path = "crates/infr-prof-rt", version = "0.1.0" }
 # Test-support only — a `[dev-dependencies]` entry in the backends, never a production dep.
 infr-testkit = { path = "crates/infr-testkit" }
 

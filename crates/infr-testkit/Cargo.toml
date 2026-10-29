@@ -1,5 +1,6 @@
 [package]
 name = "infr-testkit"
+description = "Test-only backend parity harness for infr. Never published"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "infr-metal"
+description = "Metal compute backend for the infr LLM inference engine on Apple GPUs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

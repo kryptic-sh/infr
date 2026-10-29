@@ -477,3 +477,273 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [publish-github-release]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      # `cargo publish` builds each crate to verify it; infr-vulkan's build.rs needs glslc.
+      - uses: ./.github/actions/install-glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - name: Publish workspace crates (topo order, idempotent)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          # hjkl-style publish helper: idempotency probe (crates.io 403s
+          # UA-less requests, so it must send a User-Agent), 429 retries
+          # parsing the "try again after" timestamp (11-min fallback), and
+          # pacing between crates to stay under the publish rate limits.
+          publish_if_missing() {
+            local crate="$1"
+            local url="https://crates.io/api/v1/crates/${crate}/${VERSION}"
+            if curl -fsS -A "${crate}-release-ci" -o /dev/null "$url"; then
+              echo "::notice::${crate}@${VERSION} already on crates.io, skipping"
+              return 0
+            fi
+            local attempt=0
+            while [ $attempt -lt 6 ]; do
+              if cargo publish -p "${crate}" --locked 2>&1 | tee /tmp/publish_"${crate}".log; then
+                # Pacing across the workspace (cargo itself waits for index
+                # propagation before returning).
+                sleep 25
+                return 0
+              fi
+              if grep -qiE "429|Too Many Requests" /tmp/publish_"${crate}".log; then
+                local wait_until wait_secs target
+                # Match the RFC 1123 stamp exactly. The old pattern was
+                # `try again after [^.]+`, which runs past the timestamp and
+                # stops at the first period — inside `crates.io` — yielding
+                # "… 10:18:27 GMT and see https://crates". `date -d` then fails,
+                # the substitution is empty, the arithmetic goes hugely negative
+                # and the floor below turns every wait into a flat 30s. hrdr's v0.8.1
+                # retried 11s BEFORE the limit lifted, three times, and gave up
+                # with eight of nine crates published.
+                wait_until=$(grep -oE 'try again after [A-Za-z]{3}, [0-9]{1,2} [A-Za-z]{3} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} GMT' \
+                  /tmp/publish_"${crate}".log | head -1 | sed 's/try again after //' || true)
+                if [ -n "$wait_until" ] && target=$(date -d "$wait_until" +%s 2>/dev/null); then
+                  wait_secs=$(( target - $(date +%s) + 15 ))
+                  # Only a floor for a stamp already in the past, never a cap:
+                  # sleeping less than the server asked for burns an attempt and
+                  # pushes the next slot further out.
+                  [ "$wait_secs" -lt 15 ] && wait_secs=15
+                  echo "::warning::rate limited publishing ${crate}, sleeping ${wait_secs}s until $wait_until"
+                else
+                  wait_secs=660
+                  echo "::warning::rate limited publishing ${crate}, sleeping ${wait_secs}s (11 min fallback; no parsable stamp)"
+                fi
+                sleep "$wait_secs"
+                attempt=$(( attempt + 1 ))
+              else
+                echo "::error::publish failed for ${crate} (non-rate-limit error)"
+                return 1
+              fi
+            done
+            # Every attempt honours the server's own timestamp: a whole release
+            # publishes every crate in `ORDER`, and crates.io refills the "updates to existing
+            # crates" bucket about once a minute, so a release cut minutes after
+            # another one needs real patience here.
+            echo "::error::publish failed for ${crate} after 6 rate-limit retries"
+            return 1
+          }
+          # Dependency order: each crate after every infr crate it needs, and
+          # the `infr-cli` binary (the `infr` name on crates.io is someone
+          # else's) last because it depends on most of them.
+          ORDER="infr-plat infr-prof infr-prof-rt infr-core infr-gguf infr-hub infr-chat infr-cpu infr-vulkan infr-metal infr-engine infr-server infr-llama infr-cli"
+          # A crate missing from ORDER fails the release *before* anything is
+          # uploaded, rather than half-publishing and stranding the binary: a new
+          # library that ships without being added here cannot be published, and
+          # neither can `infr-cli` once the libs ahead of it are already up — leaving
+          # a tagged release with no binary. `publish = false` members are not
+          # publishable and are not listed.
+          MEMBERS=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish != []) | .name' | sort)
+          LISTED=$(printf '%s\n' $ORDER | sort)
+          if [ "$MEMBERS" != "$LISTED" ]; then
+            echo "::error::publish list drift — every publishable workspace member must be in ORDER, in dependency order"
+            diff <(echo "$LISTED") <(echo "$MEMBERS") | sed 's/^/  /' || true
+            exit 1
+          fi
+          # And in dependency order: a crate listed before an infr crate it
+          # needs fails to publish after the ones ahead of it are already up.
+          # Dev-dependencies don't count; cargo strips path-only ones.
+          MISORDERED=$(cargo metadata --no-deps --format-version 1 | jq -r --arg order "$ORDER" '
+            ($order | split(" ")) as $o
+            | .packages[] | select(.publish != []) | . as $p
+            | ($o | index($p.name)) as $i
+            | $p.dependencies[] | select(.path != null and .kind != "dev") | . as $d
+            | select(($o | index($d.name)) >= $i)
+            | "  \($p.name) is listed before \($d.name), which it needs"')
+          if [ -n "$MISORDERED" ]; then
+            echo "::error::ORDER is not in dependency order"
+            echo "$MISORDERED"
+            exit 1
+          fi
+          for CRATE in $ORDER; do
+            publish_if_missing "$CRATE"
+          done
+
+  aur-bin:
+    name: Publish AUR (infr-bin)
+    needs: [publish-github-release]
+    runs-on: ubuntu-26.04
+    container: archlinux:latest
+    steps:
+      - name: Install deps
+        run: pacman -Sy --noconfirm --needed base-devel git openssh curl
+      - uses: actions/checkout@v7
+      - name: Resolve version
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Render PKGBUILD
+        run: |
+          VERSION=${{ steps.tag.outputs.version }}
+          BASE="https://github.com/kryptic-sh/infr/releases/download/v${VERSION}"
+          SHA_X86=$(curl -sL "$BASE/infr-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
+          SHA_A64=$(curl -sL "$BASE/infr-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
+          test -n "$SHA_X86" && test -n "$SHA_A64"
+          mkdir -p out
+          sed -e "s/{VERSION}/${VERSION}/g" \
+              -e "s/{SHA256_X86_64}/${SHA_X86}/g" \
+              -e "s/{SHA256_AARCH64}/${SHA_A64}/g" \
+              pkg/aur/PKGBUILD-bin.in > out/PKGBUILD
+      - name: Generate .SRCINFO
+        run: |
+          useradd -m builder
+          chown -R builder out
+          su -s /bin/bash builder -c 'cd out && makepkg --printsrcinfo > .SRCINFO'
+      - name: Push to AUR
+        run: |
+          # Assigned HERE, not in an `env:` block: a `~` inside an env value is
+          # never expanded. git runs this via `sh -c`, tilde expansion does not
+          # apply to the result of a parameter expansion, and ssh does not expand
+          # `~` in a `-o` value either -- so the pin below would go unread and
+          # StrictHostKeyChecking=yes would fail with "No ED25519 host key is
+          # known". That is exactly how buffr's v0.14.7 AUR publish broke.
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          install -dm700 ~/.ssh
+          echo "${{ secrets.AUR_SSH_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          # Pinned host keys. Source: ssh-keyscan aur.archlinux.org.
+          cat > ~/.ssh/known_hosts <<'KNOWN_HOSTS_EOF'
+          aur.archlinux.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLMiLrP8pVi5BFX2i3vepSUnpedeiewE5XptnUnau+ZoeUOPkpoCgZZuYfpaIQfhhJJI5qgnjJmr4hyJbe/zxow=
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+          aur.archlinux.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDKF9vAFWdgm9Bi8uc+tYRBmXASBb5cB5iZsB7LOWWFeBrLp3r14w0/9S2vozjgqY5sJLDPONWoTTaVTbhe3vwO8CBKZTEt1AcWxuXNlRnk9FliR1/eNB9uz/7y1R0+c1Md+P98AJJSJWKN12nqIDIhjl2S1vOUvm7FNY43fU2knIhEbHybhwWeg+0wxpKwcAd/JeL5i92Uv03MYftOToUijd1pqyVFdJvQFhqD4v3M157jxS5FTOBrccAEjT+zYmFyD8WvKUa9vUclRddNllmBJdy4NyLB8SvVZULUPrP3QOlmzemeKracTlVOUG1wsDbxknF1BwSCU7CmU6UFP90kpWIyz66bP0bl67QAvlIc52Yix7pKJPbw85+zykvnfl2mdROsaT8p8R9nwCdFsBc9IiD0NhPEHcyHRwB8fokXTajk2QnGhL+zP5KnkmXnyQYOCUYo3EKMXIlVOVbPDgRYYT/XqvBuzq5S9rrU70KoI/S5lDnFfx/+lPLdtcnnEPk=
+          KNOWN_HOSTS_EOF
+          chmod 600 ~/.ssh/known_hosts
+          git config --global user.name  "infr-ci"
+          git config --global user.email "ci@kryptic.sh"
+          git clone ssh://aur@aur.archlinux.org/infr-bin.git aur-repo
+          cp out/PKGBUILD out/.SRCINFO aur-repo/
+          cp pkg/aur/LICENSE pkg/aur/.gitignore aur-repo/
+          cd aur-repo
+          git add PKGBUILD .SRCINFO LICENSE .gitignore
+          if git diff --cached --quiet; then echo "nothing to push"; exit 0; fi
+          git commit -m "infr-bin ${{ steps.tag.outputs.version }}-1"
+          git push origin master
+
+  brew-tap:
+    name: Publish Homebrew formula
+    needs: [publish-github-release]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve version
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Render formula
+        run: |
+          VERSION=${{ steps.tag.outputs.version }}
+          BASE="https://github.com/kryptic-sh/infr/releases/download/v${VERSION}"
+          SHA_ARM=$(curl -sL "$BASE/infr-v${VERSION}-aarch64-apple-darwin.tar.gz.sha256" | awk '{print $1}')
+          SHA_X86=$(curl -sL "$BASE/infr-v${VERSION}-x86_64-apple-darwin.tar.gz.sha256" | awk '{print $1}')
+          test -n "$SHA_ARM" && test -n "$SHA_X86"
+          mkdir -p out
+          sed -e "s/{VERSION}/${VERSION}/g" \
+              -e "s/{SHA256_AARCH64_DARWIN}/${SHA_ARM}/g" \
+              -e "s/{SHA256_X86_64_DARWIN}/${SHA_X86}/g" \
+              pkg/homebrew/infr.rb.in > out/infr.rb
+      - name: Push to tap
+        run: |
+          # Assigned HERE, not in an `env:` block: a `~` inside an env value is
+          # never expanded. git runs this via `sh -c`, tilde expansion does not
+          # apply to the result of a parameter expansion, and ssh does not expand
+          # `~` in a `-o` value either -- so the pin below would go unread and
+          # StrictHostKeyChecking=yes would fail with "No ED25519 host key is
+          # known". That is exactly how buffr's v0.14.7 AUR publish broke.
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/brew -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          install -dm700 ~/.ssh
+          echo "${{ secrets.BREW_SSH_KEY }}" > ~/.ssh/brew
+          chmod 600 ~/.ssh/brew
+          # Pinned host keys. Source: https://api.github.com/meta (.ssh_keys).
+          cat > ~/.ssh/known_hosts <<'KNOWN_HOSTS_EOF'
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          KNOWN_HOSTS_EOF
+          chmod 600 ~/.ssh/known_hosts
+          git config --global user.name  "infr-ci"
+          git config --global user.email "ci@kryptic.sh"
+          git clone git@github.com:kryptic-sh/homebrew-tap.git tap
+          mkdir -p tap/Formula
+          cp out/infr.rb tap/Formula/infr.rb
+          cd tap
+          git add Formula/infr.rb
+          if git diff --cached --quiet; then echo "nothing to push"; exit 0; fi
+          git commit -m "infr ${{ steps.tag.outputs.version }}"
+          git push origin HEAD:main
+
+  scoop-bucket:
+    name: Publish Scoop manifest
+    needs: [publish-github-release]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve version
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Render manifest
+        run: |
+          VERSION=${{ steps.tag.outputs.version }}
+          BASE="https://github.com/kryptic-sh/infr/releases/download/v${VERSION}"
+          SHA_WIN=$(curl -sL "$BASE/infr-v${VERSION}-x86_64-pc-windows-msvc.zip.sha256" | awk '{print $1}')
+          test -n "$SHA_WIN"
+          mkdir -p out
+          sed -e "s/{VERSION}/${VERSION}/g" \
+              -e "s/{SHA256_X86_64_WINDOWS}/${SHA_WIN}/g" \
+              pkg/scoop/infr.json.in > out/infr.json
+      - name: Push to bucket
+        run: |
+          # Assigned HERE, not in an `env:` block: a `~` inside an env value is
+          # never expanded. git runs this via `sh -c`, tilde expansion does not
+          # apply to the result of a parameter expansion, and ssh does not expand
+          # `~` in a `-o` value either -- so the pin below would go unread and
+          # StrictHostKeyChecking=yes would fail with "No ED25519 host key is
+          # known". That is exactly how buffr's v0.14.7 AUR publish broke.
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/scoop -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          install -dm700 ~/.ssh
+          echo "${{ secrets.SCOOP_SSH_KEY }}" > ~/.ssh/scoop
+          chmod 600 ~/.ssh/scoop
+          # Pinned host keys. Source: https://api.github.com/meta (.ssh_keys).
+          cat > ~/.ssh/known_hosts <<'KNOWN_HOSTS_EOF'
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          KNOWN_HOSTS_EOF
+          chmod 600 ~/.ssh/known_hosts
+          git config --global user.name  "infr-ci"
+          git config --global user.email "ci@kryptic.sh"
+          git clone git@github.com:kryptic-sh/scoop-bucket.git bucket
+          mkdir -p bucket/bucket
+          cp out/infr.json bucket/bucket/infr.json
+          cd bucket
+          git add bucket/infr.json
+          if git diff --cached --quiet; then echo "nothing to push"; exit 0; fi
+          git commit -m "infr ${{ steps.tag.outputs.version }}"
+          git push origin HEAD:main

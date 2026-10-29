@@ -1,5 +1,6 @@
 [package]
 name = "infr-llama"
+description = "Transformer model runner for infr over its CPU, Vulkan and Metal backends"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

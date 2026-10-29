@@ -1,8 +1,10 @@
 [package]
 name = "infr-cli"
+description = "Pure-Rust LLM inference engine with an OpenAI-compatible server (the infr binary)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+readme = "../../README.md"
 repository.workspace = true
 
 [[bin]]
@@ -17,7 +19,7 @@ infr-vulkan.workspace = true
 infr-hub.workspace = true
 infr-engine.workspace = true
 infr-server.workspace = true
-infr-llama = { path = "../infr-llama" }
+infr-llama.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 clap_complete_nushell.workspace = true

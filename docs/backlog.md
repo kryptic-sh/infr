@@ -2728,7 +2728,7 @@ refusal that says so.
 
 ### B78 — release channels beyond the GitHub Release (2026-10-27)
 
-**Tag:** delivery · **Blocked on:** repo secrets and two decisions
+**Tag:** delivery · **Blocked on:** two decisions (secrets are in place)
 
 `ci.yml` now packages `infr` for x86_64/aarch64 Linux (zigbuild, glibc 2.28),
 x86_64 Windows and both macOS arches in the `dist` matrix on every `main` push.
@@ -2739,10 +2739,12 @@ build with line attribution means building it locally. What is NOT done:
 
 - **Downstream channels.** hrdr also publishes to crates.io, AUR (`*-bin`),
   Homebrew (`kryptic-sh/homebrew-tap`), Scoop (`kryptic-sh/scoop-bucket`) and
-  Alpine, from `pkg/*.in` templates and jobs after its release job. The infr
-  repo has no Actions secrets, so none of that can run until
-  `CARGO_REGISTRY_TOKEN`, `AUR_SSH_KEY`, `BREW_SSH_KEY` and `SCOOP_SSH_KEY`
-  exist. Whether infr goes to crates.io at all (14 crates, none published,
+  Alpine, from `pkg/*.in` templates and jobs after its release job. infr has
+  none of those jobs yet. The secrets they need — `CARGO_REGISTRY_TOKEN`,
+  `AUR_SSH_KEY`, `BREW_SSH_KEY` and `SCOOP_SSH_KEY` — are kryptic-sh
+  organisation secrets with visibility `ALL` (`gh secret list -o kryptic-sh`),
+  so infr's workflows can already read them; it needs no repo secrets of its
+  own. Whether infr goes to crates.io at all (14 crates, none published,
   `infr-testkit` already `publish = false`) is the user's call.
 - **`.deb` / `.rpm`.** hrdr builds them with `cargo-deb` / `cargo-generate-rpm`;
   infr has no `[package.metadata.deb]` or `generate-rpm` section in

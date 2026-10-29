@@ -2873,3 +2873,22 @@ CLI, hub, chat, profiling, and llama paths.
 **Gaps:** most numerical kernels and shader math were not reviewed line by line;
 platform-only Metal and Windows behavior was not executed. No formatter, linter,
 build, or test command was run for this report.
+
+### B81 — minijinja 2.24 prints booleans as `True` / `False` (2026-10-29)
+
+**Tag:** chat templates · **Needs:** a decision
+
+Regenerating `Cargo.lock` for v0.2.0 moved `minijinja` and `minijinja-contrib`
+from 2.21.0 to 2.24.0, and `{{ enable_thinking }}` started rendering as `True`
+instead of `true`: `template_tests::no_think_config_drives_enable_thinking`
+failed. 2.24 writes a bool the way Python's Jinja2 does (`value/mod.rs`,
+`utils.rs`), so any chat template that prints a bool, rather than testing one,
+changes its prompt text. Both crates are held at 2.21.0 in `Cargo.lock` only
+(`cargo update -p minijinja --precise 2.21.0`); the manifest still says `"2"`,
+so the next `cargo generate-lockfile` or `cargo update` brings 2.24 back.
+
+To decide: take 2.24 (it is probably closer to HF transformers, which renders
+these templates with Python's Jinja2; not verified against a real template that
+prints a bool) and change the test's expectation, or pin `~2.21` in
+`[workspace.dependencies]` until someone checks what HF and llama.cpp's minja
+actually emit.

@@ -223,6 +223,9 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.bm16 = presence_inv(get, "INFR_NO_BM16");
     v.mmq = presence_inv(get, "INFR_NO_MMQ");
     v.mmq_fallback = presence_inv(get, "INFR_NO_MMQ_FALLBACK");
+    // Tri-state: "0" ⇒ force off, any other value ⇒ force on, unset ⇒ auto.
+    v.kq_fma_tier = get("INFR_KQ_FMA_TIER").map(|s| Some(s != "0"));
+    v.kq_fma_gemv = get("INFR_KQ_FMA_GEMV").map(|s| Some(s != "0"));
     v.mmv = presence_inv(get, "INFR_NO_MMV");
     v.mmv_decode = presence(get, "INFR_MMV_DECODE");
     v.mmv_m4 = presence_inv(get, "INFR_NO_MMV_M4");

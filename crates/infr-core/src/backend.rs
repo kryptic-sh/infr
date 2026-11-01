@@ -84,6 +84,9 @@ pub struct Capabilities {
     /// SEPARATE primitive from coopmat (hence not `coopmat_i8`). False = route to the scalar
     /// dequant GEMV (needs no extension). Independent of `f16`/`coopmat_f16`.
     pub i8_dot: bool,
+    /// `i8_dot` and the driver reports the packed signed 4x8 dot as hardware-accelerated. False
+    /// on GPUs that emulate dp4a in ALU (AMD GCN), where fp32 FMA kernels beat it.
+    pub i8_dot_fast: bool,
     /// The (M,N,K) tile the cooperative-matrix unit accepts for SINT8×SINT8→SINT32 components
     /// (enumerated from the device's coopmat config list, same discipline as `coopmat_f16`; only
     /// [`COOPMAT_TILE_16`] is ever selected — the shape every int8 coopmat shader is hardcoded

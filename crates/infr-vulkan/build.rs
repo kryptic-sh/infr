@@ -708,6 +708,7 @@ fn main() {
         // `linear_f32`'s builds were dead — same as `e2b_proj` below, just not called out in the
         // audit by name.
         ("linear_f32r", "linear_f32r", &[]),
+        ("linear_f32_mo", "linear_f32_mo", &[]),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
         (
             "linear_f32r",
@@ -3422,8 +3423,8 @@ fn main() {
             // eager thread-per-output f32 GEMV) is NOT here — see the base builds list above for why
             // it's gone entirely. linear_res IS the fused-residual f16 GEMV file, included since
             // the resident-BDA endgame deletes every bound-SSBO weight path.
-            "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32r" | "linear_res"
-            | "native_gemm_fma" | "native_gemm_kq_fma" => true,
+            "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32r" | "linear_f32_mo"
+            | "linear_res" | "native_gemm_fma" | "native_gemm_kq_fma" => true,
             // Model-specific float-weight kernels: qwen35's SSM depthwise conv1d+SiLU (both the
             // sequential and batch-pass-1 variants — conv1d_shift never reads the weight) and
             // gemma4 E2B's per-layer fused inp_gate GEMV. Same typed buffer_reference seam as the

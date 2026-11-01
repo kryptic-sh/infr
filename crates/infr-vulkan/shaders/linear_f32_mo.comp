@@ -1,0 +1,45 @@
+#version 460
+// Decode (m=1) f32-weight GEMV y = x·Wᵀ: 256 threads, 2^tpo_log2 threads per output, vec4 loads.
+// Requires in_f % 4 == 0 and a 16-byte-aligned weight base.
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint tpo_log2; uint arena_lo; uint arena_hi;
+} pc;
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer ArenaW { vec4 v[]; };
+uint64_t w_ptr = 0ul;
+#define WV(i) ArenaW(w_ptr).v[i]
+layout(binding = 1) readonly buffer XB { vec4 x[]; };
+layout(binding = 2) writeonly buffer YB { float y[]; };
+
+shared float red[256];
+
+void main() {
+    w_ptr = (uint64_t(pc.arena_hi) << 32) | uint64_t(pc.arena_lo);
+    uint t = gl_LocalInvocationID.x;
+    uint tpo = 1u << pc.tpo_log2;
+    uint lane = t & (tpo - 1u);
+    uint o = gl_WorkGroupID.x * (256u >> pc.tpo_log2) + (t >> pc.tpo_log2);
+    uint nv = pc.in_f >> 2u;
+    vec4 a0 = vec4(0.0);
+    vec4 a1 = vec4(0.0);
+    if (o < pc.out_f) {
+        uint wb = o * nv;
+        uint i = lane;
+        for (; i + tpo < nv; i += 2u * tpo) {
+            a0 += WV(wb + i) * x[i];
+            a1 += WV(wb + i + tpo) * x[i + tpo];
+        }
+        if (i < nv) { a0 += WV(wb + i) * x[i]; }
+    }
+    vec4 a = a0 + a1;
+    red[t] = (a.x + a.y) + (a.z + a.w);
+    barrier();
+    for (uint s = tpo >> 1u; s > 0u; s >>= 1u) {
+        if (lane < s) { red[t] += red[t + s]; }
+        barrier();
+    }
+    if (lane == 0u && o < pc.out_f) { y[o] = red[t]; }
+}

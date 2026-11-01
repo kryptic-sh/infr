@@ -3226,6 +3226,7 @@ dyn_spv!(attention_kv_sinks_bias_spv, "attention_kv_sinks_bias");
 // K/V read by 64-bit device address (kv_addr.glsl) instead of bound SSBOs. Bound twins above stay
 // for kv_addr_parity.rs; production forks here via Recorder::attention_kv_at / attention_kv_dyn_at.
 dyn_spv!(attention_kv_bda_spv, "attention_kv_bda");
+dyn_spv!(linear_f32_mo_spv, "linear_f32_mo");
 dyn_spv!(attention_kv_dyn_bda_spv, "attention_kv_dyn_bda");
 dyn_spv!(attention_kv_q8_bda_spv, "attention_kv_q8_bda");
 dyn_spv!(attention_kv_kq8_bda_spv, "attention_kv_kq8_bda");

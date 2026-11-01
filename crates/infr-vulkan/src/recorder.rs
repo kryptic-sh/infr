@@ -1825,6 +1825,38 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Decode (m=1) f32 GEMV over `linear_f32_mo.comp` with `2^tpo_log2` threads per output
+    /// (1..=8). Requires `in_f % 4 == 0` and a 16-byte-aligned `arena_addr`.
+    pub fn linear_f32_mo_at(
+        &self,
+        arena_addr: u64,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        tpo_log2: u32,
+    ) {
+        debug_assert!(in_f.is_multiple_of(4) && arena_addr.is_multiple_of(16) && tpo_log2 <= 8);
+        self.label_gemv("lin_f32_mo", 1, in_f, out_f);
+        let k = self
+            .be
+            .kernel("linear_f32_mo", crate::gemm::linear_f32_mo_spv(), 3, 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&tpo_log2.to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let per_wg = 256usize >> tpo_log2;
+        self.dispatch(
+            k,
+            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            out_f.div_ceil(per_wg) as u32,
+        );
+    }
+
     /// Arena-addressed body of [`Self::linear_f32`] — mirrors the eager dispatcher's mrow/vec4
     /// variant routing (same env escapes) so parity comparisons land on the same kernel.
     /// Production routes here through [`Self::linear_f32`] (the weight's own BDA address); parity
@@ -1838,6 +1870,13 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        if rows == 1 && in_f.is_multiple_of(4) && arena_addr.is_multiple_of(16) && self.vk().f32_v4
+        {
+            // 64 threads per output, 32 when a row is too short to give each thread two vec4s.
+            let tpo_log2 = if in_f / 4 >= 128 { 6 } else { 5 };
+            self.linear_f32_mo_at(arena_addr, x, y, in_f, out_f, tpo_log2);
+            return;
+        }
         self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
         let use_mrow = rows > 1 && self.vk().f32_mrow;
         let use_v4 = use_mrow && in_f.is_multiple_of(4) && self.vk().f32_v4;
@@ -3172,6 +3211,15 @@ impl<'a> Recorder<'a> {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: linear_native requires a u64 BDA device address");
+        // bf16 decode: the dedicated reduction GEMV is ~5x the generic dequant GEMV's bandwidth.
+        if rows == 1
+            && dtype == infr_core::DType::Bf16
+            && w_base.is_multiple_of(2)
+            && out_f <= Self::MAX_GROUP_COUNT_X as usize
+        {
+            self.linear_bf16_at(arena_addr + 2 * w_base as u64, x, y, 1, in_f, out_f);
+            return;
+        }
         // Replicate the resident SG → RM-v2 → RM → plain precedence, routing each branch to its own
         // `_streamed` twin (the build tables are 1:1 mirrored — see this fn's doc). Every branch
         // reachable here has a streamed kernel to route to.

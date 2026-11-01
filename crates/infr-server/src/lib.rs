@@ -234,6 +234,15 @@ pub struct ChatRequest {
     /// OpenAI `stream_options`; only `include_usage` is read.
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// OpenAI: `"none"` turns thinking off; `"minimal"`/`"low"`/`"medium"`/`"high"` turn it on.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// vLLM/llama.cpp: `{"enable_thinking": bool}`; other keys are ignored.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Ollama: `true`/`false`, or an effort level string (thinking on).
+    #[serde(default)]
+    pub think: Option<serde_json::Value>,
 }
 
 /// A request's `logit_bias` as the client sent it: the object's entries in order with a repeated
@@ -345,6 +354,8 @@ pub struct GenParams {
     pub logit_bias: Vec<(u32, f32)>,
     /// Already normalised: empty strings dropped (an empty stop would fire on the first token).
     pub stop: Vec<String>,
+    /// The request's thinking switch; `None` keeps the server default (`--no-think`/`--think`).
+    pub think: Option<bool>,
 }
 
 /// An OpenAI-shaped 400: `{"error":{"message":..,"type":"invalid_request_error","param":..}}`.
@@ -471,6 +482,7 @@ impl GenParams {
         }
 
         let logit_bias = parse_logit_bias(req.logit_bias.as_ref())?;
+        let think = request_think(req)?;
 
         Ok(Self {
             // OpenAI renamed `max_tokens` -> `max_completion_tokens`; the new name wins.
@@ -485,6 +497,7 @@ impl GenParams {
             min_p: rng("min_p", req.min_p, 0.0, 1.0)?,
             logit_bias,
             stop,
+            think,
         })
     }
 
@@ -584,6 +597,53 @@ fn parse_logit_bias(v: Option<&LogitBiasArg>) -> Result<Vec<(u32, f32)>, ParamEr
         return Err(err(format!("logit_bias names token {} twice", w[0].0)));
     }
     Ok(out)
+}
+
+/// The request's thinking switch. Precedence: `chat_template_kwargs.enable_thinking`, then
+/// `think`, then `reasoning_effort`.
+fn request_think(req: &ChatRequest) -> Result<Option<bool>, ParamError> {
+    let kw = req
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|v| v.get("enable_thinking"));
+    match kw {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Bool(b)) => return Ok(Some(*b)),
+        Some(_) => {
+            return Err(ParamError {
+                param: "chat_template_kwargs",
+                message: "chat_template_kwargs.enable_thinking must be a boolean".into(),
+            })
+        }
+    }
+    match &req.think {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Bool(b)) => return Ok(Some(*b)),
+        Some(serde_json::Value::String(s)) => return effort_think("think", s).map(Some),
+        Some(_) => {
+            return Err(ParamError {
+                param: "think",
+                message: "think must be a boolean or an effort level string".into(),
+            })
+        }
+    }
+    req.reasoning_effort
+        .as_deref()
+        .map(|s| effort_think("reasoning_effort", s))
+        .transpose()
+}
+
+fn effort_think(param: &'static str, effort: &str) -> Result<bool, ParamError> {
+    match effort {
+        "none" => Ok(false),
+        "minimal" | "low" | "medium" | "high" => Ok(true),
+        other => Err(ParamError {
+            param,
+            message: format!(
+                "{param} must be one of none, minimal, low, medium, high; got {other:?}"
+            ),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3370,6 +3430,52 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(p.max_tokens, Some(20));
+    }
+
+    #[test]
+    fn thinking_switch_parses_every_spelling() {
+        let think = |body: &str| {
+            GenParams::from_request(&req(&format!(r#"{{"model":"m","messages":[]{body}}}"#)))
+                .unwrap()
+                .think
+        };
+        assert_eq!(think(""), None);
+        assert_eq!(think(r#","reasoning_effort":"none""#), Some(false));
+        assert_eq!(think(r#","reasoning_effort":"high""#), Some(true));
+        assert_eq!(think(r#","think":false"#), Some(false));
+        assert_eq!(think(r#","think":"low""#), Some(true));
+        assert_eq!(
+            think(r#","chat_template_kwargs":{"enable_thinking":false}"#),
+            Some(false)
+        );
+        assert_eq!(think(r#","chat_template_kwargs":{"other":1}"#), None);
+        assert_eq!(
+            think(
+                r#","chat_template_kwargs":{"enable_thinking":true},"think":false,"reasoning_effort":"none""#
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            think(r#","think":true,"reasoning_effort":"none""#),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn invalid_thinking_values_are_a_400() {
+        for (body, param) in [
+            (r#","reasoning_effort":"max""#, "reasoning_effort"),
+            (r#","think":3"#, "think"),
+            (
+                r#","chat_template_kwargs":{"enable_thinking":"no"}"#,
+                "chat_template_kwargs",
+            ),
+        ] {
+            let e =
+                GenParams::from_request(&req(&format!(r#"{{"model":"m","messages":[]{body}}}"#)))
+                    .unwrap_err();
+            assert_eq!(e.param, param);
+        }
     }
 
     #[test]

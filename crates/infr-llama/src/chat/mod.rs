@@ -337,10 +337,12 @@ impl OaiRenderer {
         &self.ecfg
     }
 
+    /// `think` overrides the configured thinking default for this render (`None` = keep it).
     pub fn render(
         &self,
         messages: &[infr_chat::ChatMessage],
         tools: Option<&serde_json::Value>,
+        think: Option<bool>,
     ) -> Result<String> {
         infr_chat::render_chat_oai(
             &self.gguf,
@@ -349,6 +351,7 @@ impl OaiRenderer {
             messages,
             tools,
             true,
+            think,
             &self.ecfg,
         )
         .map_err(|e| match e {

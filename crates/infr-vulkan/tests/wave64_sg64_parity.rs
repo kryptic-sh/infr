@@ -49,7 +49,14 @@ fn backend(wave64_native: bool) -> VulkanBackend {
     VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap()
 }
 
-fn run_leg(be: &VulkanBackend, w_bytes: &[u8], xv: &[f32], in_f: usize, out_f: usize, nr: u32) -> Vec<f32> {
+fn run_leg(
+    be: &VulkanBackend,
+    w_bytes: &[u8],
+    xv: &[f32],
+    in_f: usize,
+    out_f: usize,
+    nr: u32,
+) -> Vec<f32> {
     let (arena, addr) = be.alloc_arena_bda(w_bytes.len()).unwrap();
     be.upload(arena.as_ref(), w_bytes).unwrap();
     let x = be.alloc(xv.len() * 4, BufferUsage::Activations).unwrap();
@@ -59,7 +66,8 @@ fn run_leg(be: &VulkanBackend, w_bytes: &[u8], xv: &[f32], in_f: usize, out_f: u
     rec.linear_native_sg_at(DType::Q6K, addr, 0, x.as_ref(), y.as_ref(), in_f, out_f, nr);
     rec.finish().unwrap();
     let mut got = vec![0f32; out_f];
-    be.download(y.as_ref(), bytemuck::cast_slice_mut(&mut got)).unwrap();
+    be.download(y.as_ref(), bytemuck::cast_slice_mut(&mut got))
+        .unwrap();
     got
 }
 
@@ -80,7 +88,11 @@ fn wave64_sg64_parity() {
             let mut max_cross = 0f32;
             for o in 0..out_f {
                 let row = &wq[o * in_f..(o + 1) * in_f];
-                let want: f64 = row.iter().zip(&xv).map(|(a, b)| *a as f64 * *b as f64).sum();
+                let want: f64 = row
+                    .iter()
+                    .zip(&xv)
+                    .map(|(a, b)| *a as f64 * *b as f64)
+                    .sum();
                 let want = want as f32;
                 let tol = 1e-4 + 1e-4 * want.abs();
                 assert!(
@@ -132,7 +144,9 @@ fn wave64_sg64_bw() {
         let src: Vec<Vec<u8>> = (0..n_w)
             .map(|s| {
                 (0..wbytes)
-                    .map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(s as u32) >> 24) as u8)
+                    .map(|i| {
+                        ((i as u32).wrapping_mul(2654435761).wrapping_add(s as u32) >> 24) as u8
+                    })
                     .collect()
             })
             .collect();
@@ -157,11 +171,25 @@ fn wave64_sg64_bw() {
         let (nws, nx, ny) = prep(&native);
         let (ews, ex, ey) = prep(&emulated);
         let reps = (n_w * 4).max(40);
-        let bench = |be: &VulkanBackend, ws: &[Box<dyn infr_core::backend::Buffer>], x: &Box<dyn infr_core::backend::Buffer>, y: &Box<dyn infr_core::backend::Buffer>, nr: u32| -> f64 {
+        let bench = |be: &VulkanBackend,
+                     ws: &[Box<dyn infr_core::backend::Buffer>],
+                     x: &Box<dyn infr_core::backend::Buffer>,
+                     y: &Box<dyn infr_core::backend::Buffer>,
+                     nr: u32|
+         -> f64 {
             let run = || {
                 let rec = be.recorder().unwrap();
                 for r in 0..reps {
-                    rec.linear_native_sg_at(DType::Q6K, ws[r % n_w].device_addr().unwrap(), 0, x.as_ref(), y.as_ref(), in_f, out_f, nr);
+                    rec.linear_native_sg_at(
+                        DType::Q6K,
+                        ws[r % n_w].device_addr().unwrap(),
+                        0,
+                        x.as_ref(),
+                        y.as_ref(),
+                        in_f,
+                        out_f,
+                        nr,
+                    );
                 }
                 rec.finish().unwrap();
             };

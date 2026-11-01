@@ -3403,20 +3403,12 @@ fn main() {
             if SG16_SOURCES.contains(src_stem) {
                 let mut sg_defines = base.2.clone();
                 sg_defines.push("-DSG=16".to_string());
-                out.push((
-                    src_stem.to_string(),
-                    format!("{dst_stem}_sg16"),
-                    sg_defines,
-                ));
+                out.push((src_stem.to_string(), format!("{dst_stem}_sg16"), sg_defines));
             }
             if SG64_SOURCES.contains(src_stem) {
                 let mut sg_defines = base.2.clone();
                 sg_defines.push("-DSG=64".to_string());
-                out.push((
-                    src_stem.to_string(),
-                    format!("{dst_stem}_sg64"),
-                    sg_defines,
-                ));
+                out.push((src_stem.to_string(), format!("{dst_stem}_sg64"), sg_defines));
             }
             out
         })

@@ -46,6 +46,12 @@ uint wl[EPT / 4u + 1u];
 uint wqh[EPT / 4u + 1u];
 uint wsc;
 uint wd;
+#elif defined(FMT_Q4_0)
+// Q4_0: 18-byte blocks, d at bd, 16 qs bytes at bd+2. A thread's EPT nibbles
+// always sit in one 32-elem half (runs never cross a 16-elem half: BK=32-aligned
+// k0, part*EPT in {0,8,16,24}/{0,16}), so one d + EPT/2 qs bytes per thread.
+uint wq[EPT / 4u + 1u];
+uint wd;
 #endif
 
 // Unaligned-safe word funnel: sh in {0,8,16,24}; (hi<<1)<<(31-sh) is 0 when sh==0.
@@ -92,6 +98,19 @@ void loadRaw(uint k0) {
 #endif
     wsc = NW((bd + 192u + hf * 8u + og * 2u + lo / 16u) >> 2u);
     wd = NW((bd + 208u) >> 2u);
+#elif defined(FMT_Q4_0)
+    // Block index is exact: w_base/k0/col*k are all 32-aligned (gate + BK stride),
+    // so elem % 32 == 0 and one block covers the thread's whole run.
+    uint bd = (elem >> 5u) * 18u;
+    uint eblk = part * EPT;
+    uint qoff = bd + 2u + (eblk & 15u);
+    uint qw = qoff >> 2u;
+#if BN == 128
+    uvec4 x = NW4(qw); wq[0] = x.x; wq[1] = x.y; wq[2] = x.z; wq[3] = x.w; wq[4] = NW(qw + 4u);
+#else
+    uvec2 x = NW2(qw); wq[0] = x.x; wq[1] = x.y; wq[2] = NW(qw + 2u);
+#endif
+    wd = NW(bd >> 2u);
 #endif
 }
 
@@ -139,6 +158,20 @@ void storeTile(uint k0) {
         [[unroll]] for (uint b = 0u; b < 4u; b++) {
             Ws[part * EPT + w * 4u + b][col >> 2u][col & 3u] =
                 dsc * (float((qq >> (8u * b)) & 0xFFu) - 32.0);
+        }
+    }
+#elif defined(FMT_Q4_0)
+    // Same half for the whole run (see loadRaw): one d, nibble select hoisted.
+    uint bd = (elem >> 5u) * 18u;
+    uint eblk = part * EPT;
+    uint nsh = (eblk >= 16u) ? 4u : 0u;
+    uint sh = ((bd + 2u + (eblk & 15u)) & 3u) << 3u;
+    float d = unpackHalf2x16((wd >> (((bd) & 3u) * 8u)) & 0xFFFFu).x;
+    [[unroll]] for (uint w = 0u; w < EPT / 4u; w++) {
+        uint q = (fun(wq[w], wq[w + 1u], sh) >> nsh) & 0x0F0F0F0Fu;
+        [[unroll]] for (uint b = 0u; b < 4u; b++) {
+            Ws[part * EPT + w * 4u + b][col >> 2u][col & 3u] =
+                d * (float((q >> (8u * b)) & 0xFFu) - 8.0);
         }
     }
 #endif

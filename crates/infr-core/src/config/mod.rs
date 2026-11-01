@@ -256,7 +256,7 @@ cfg_struct! {
         mmq: bool = true,
         /// `INFR_NO_MMQ_FALLBACK` (inverted).
         mmq_fallback: bool = true,
-        /// `INFR_KQ_FMA_TIER`, TRI-state: the fp32 K-quant prefill GEMM tier
+        /// `INFR_KQ_FMA_TIER`, TRI-state: the fp32 K-quant/Q4_0 prefill GEMM tier
         /// (`native_gemm_kq_fma`) for older Vulkan GPUs without fast int8 dot
         /// (GCN4/Polaris and other pre-coopmat parts). `None` = auto (on when
         /// int8 dot is emulated).

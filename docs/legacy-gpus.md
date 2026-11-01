@@ -13,7 +13,7 @@ to [kryptic-sh/infr](https://github.com/kryptic-sh/infr).
 |---|---|
 | Wave64 support | Wave32 kernels run as 32-lane halves of a 64-lane wave (`shaders/wave64.glsl`, spec constant `W64`), so infr starts at all on wave64-only devices. |
 | First-forward submit split | Slow discrete GPUs split even the first prefill into submits of 64 dispatches, so a long prompt can't trip the driver's hang watchdog. |
-| `kq_fma` prefill GEMM | An fp32 FMA GEMM for Q4_K/Q6_K (`native_gemm_kq_fma.comp`) replaces the dp4a MMQ kernels, which are emulated in ALU on GCN. |
+| `kq_fma` prefill GEMM | An fp32 FMA GEMM for Q4_K/Q6_K/Q4_0 (`native_gemm_kq_fma.comp`) replaces the dp4a MMQ kernels, which are emulated in ALU on GCN. |
 | `kq_fma` decode GEMV | An fp32 Q4_K/Q6_K GEMV on f32 activations (`native_gemv_kq_fma.comp`) replaces `quant_q8` + the dp4a GEMV. |
 | Float decode GEMVs | F32 weights use a multi-output GEMV (`linear_f32_mo.comp`); BF16 weights use the dedicated reduction GEMV. |
 
@@ -45,12 +45,12 @@ Q4_K_M, tokens/s. llama.cpp numbers are its Vulkan backend on the same card.
 |---|---|---|---|---|---|
 | Qwen2.5-Coder-3B | 206 | 499 | 421 | 63.6 | 63.8 |
 | Gemma 4 E2B | 285 | 616 | 602 | — | 65.7 |
+| Gemma 4 E4B QAT Q4_0 | 146 | 340 | 343 | 37.2 | 42.6 |
 
 Gemma 4 E4B decode at 4k context: 29.6 → 36.5 t/s.
 
 ## Status and plans
 
-Tracked on the fork's project board. Next up: Q4_0 support in the `kq_fma`
-kernels (Gemma QAT quants are Q4_0), single-pass sliding-window attention for
+Tracked on the fork's project board. Next up: single-pass sliding-window attention for
 decode, KV shifting for rolling chat windows, and speculative decoding on
 Vulkan.

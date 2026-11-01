@@ -11,7 +11,7 @@
 //! and the divergence assert is skipped (both legs still prove correctness vs the host).
 //!
 //! Run: `cargo test -p infr-vulkan --test wave64_sg64_parity -- --ignored --nocapture`
-use infr_core::backend::{Backend, Buffer, BufferUsage};
+use infr_core::backend::{Backend, BufferUsage};
 use infr_core::DType;
 use infr_vulkan::VulkanBackend;
 
@@ -173,8 +173,8 @@ fn wave64_sg64_bw() {
         let reps = (n_w * 4).max(40);
         let bench = |be: &VulkanBackend,
                      ws: &[Box<dyn infr_core::backend::Buffer>],
-                     x: &Box<dyn infr_core::backend::Buffer>,
-                     y: &Box<dyn infr_core::backend::Buffer>,
+                     x: &dyn infr_core::backend::Buffer,
+                     y: &dyn infr_core::backend::Buffer,
                      nr: u32|
          -> f64 {
             let run = || {
@@ -184,8 +184,8 @@ fn wave64_sg64_bw() {
                         DType::Q6K,
                         ws[r % n_w].device_addr().unwrap(),
                         0,
-                        x.as_ref(),
-                        y.as_ref(),
+                        x,
+                        y,
                         in_f,
                         out_f,
                         nr,
@@ -203,8 +203,8 @@ fn wave64_sg64_bw() {
             let mut nat_best = 0f64;
             let mut emu_best = 0f64;
             for _ in 0..3 {
-                emu_best = emu_best.max(bench(&emulated, &ews, &ex, &ey, nr));
-                nat_best = nat_best.max(bench(&native, &nws, &nx, &ny, nr));
+                emu_best = emu_best.max(bench(&emulated, &ews, ex.as_ref(), ey.as_ref(), nr));
+                nat_best = nat_best.max(bench(&native, &nws, nx.as_ref(), ny.as_ref(), nr));
             }
             println!(
                 "  {label} in{in_f} out{out_f} Q6_K NR={nr} [{} MiB]:  SG64-native {nat_best:5.0}  SG32-emulated {emu_best:5.0} GB/s  (native {:+.1}%)",

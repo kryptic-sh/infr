@@ -297,6 +297,40 @@ pub(crate) fn native_sg_streamed_build_spv(
     }
 }
 
+/// Wave64-NATIVE twin of [`native_sg_streamed_build_spv`] (`-DSG=64` builds): one full wave64
+/// per workgroup, plain subgroup ops (`W64=false` at pipeline time). Same (dtype, res, nr)
+/// coverage — Q6_K × {2,4,8} × {plain,res} — and the same reassociation-tolerant (NOT
+/// bit-identical) accumulation-order caveat. Selected by `Recorder::sg64`
+/// (`kernels.vulkan.wave64_native` on wave64 devices); `None` for everything else.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_sg64_streamed_build_spv(
+    dtype: infr_core::DType,
+    res: bool,
+    nr: u32,
+) -> Option<(&'static str, &'static [u32])> {
+    use infr_core::DType::*;
+    macro_rules! v {
+        ($name:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            let s = S
+                .get_or_init(|| {
+                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
+                })
+                .as_slice();
+            Some(($name, s))
+        }};
+    }
+    match (dtype, res, nr) {
+        (Q6K, false, 2) => v!("native_q6k_sg2_sg64"),
+        (Q6K, true, 2) => v!("native_q6k_sg2_res_sg64"),
+        (Q6K, false, 4) => v!("native_q6k_sg4_sg64"),
+        (Q6K, true, 4) => v!("native_q6k_sg4_res_sg64"),
+        (Q6K, false, 8) => v!("native_q6k_sg8_sg64"),
+        (Q6K, true, 8) => v!("native_q6k_sg8_res_sg64"),
+        _ => None,
+    }
+}
+
 /// Paged variant of the id-indexed native GEMV (`infr_vulkan::pager`) — one extra LUT-buffer
 /// binding. (The old bound-SSBO resident id GEMV is gone; STREAMED / this paged build are the
 /// only weight builds.)

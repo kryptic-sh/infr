@@ -264,6 +264,12 @@ cfg_struct! {
         /// `INFR_KQ_FMA_GEMV`, TRI-state: the fp32 K-quant decode GEMV (`native_gemv_kq_fma`) in
         /// place of quant_q8 + the dp4a GEMV. `None` = auto (on when int8 dot is emulated).
         kq_fma_gemv: Option<bool> = None,
+        /// `INFR_WAVE64_NATIVE`, `=0|1`: on wave64-only devices (GCN), run the subgroup
+        /// decode GEMV family at its native 64-lane width (`-DSG=64` twins, plain full-wave
+        /// subgroup ops) instead of the default 32-lane halves emulated through
+        /// `subgroupClusteredAdd` (`shaders/wave64.glsl`). Default on; inert everywhere else
+        /// (only wave64 devices select the SG=64 builds). A/B knob for the wave64 data point.
+        wave64_native: bool = true,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
         /// this backwards disables the mmv tier for everyone.
         mmv: bool = true,

@@ -193,6 +193,7 @@ pub fn render_chat_jinja(
         msgs,
         Value::Null,
         add_generation_prompt,
+        None,
         cfg,
     )
     .ok()
@@ -209,6 +210,8 @@ pub fn render_chat_jinja(
 ///
 /// Errors carry the real cause ([`TemplateError`]) so serve can return the render error message
 /// instead of a bare 500.
+///
+/// `think` overrides `sampling.no_think` for this render (a request's own thinking switch).
 #[allow(clippy::too_many_arguments)]
 pub fn render_chat_oai(
     gguf: &Gguf,
@@ -217,6 +220,7 @@ pub fn render_chat_oai(
     messages: &[ChatMessage],
     tools: Option<&Value>,
     add_generation_prompt: bool,
+    think: Option<bool>,
     cfg: &Config,
 ) -> Result<String, TemplateError> {
     let msgs: Vec<Value> = messages.iter().map(message_to_json).collect();
@@ -228,6 +232,7 @@ pub fn render_chat_oai(
         msgs,
         tools,
         add_generation_prompt,
+        think,
         cfg,
     )
 }
@@ -269,6 +274,7 @@ fn render_core(
     msgs: Vec<Value>,
     tools: Value,
     add_generation_prompt: bool,
+    think: Option<bool>,
     cfg: &Config,
 ) -> Result<String, TemplateError> {
     let template = gguf
@@ -289,7 +295,7 @@ fn render_core(
     // ignored by non-thinking templates, and thinking-capable models (Qwen3, Qwen3.5)
     // then behave the same under `infr run`/`serve` regardless of what their template's own
     // default is (Qwen3.5 defaults itself OFF via `enable_thinking is defined and is true`).
-    let think = thinking_enabled(cfg);
+    let think = think.unwrap_or_else(|| thinking_enabled(cfg));
     match render_template(
         template,
         msgs,

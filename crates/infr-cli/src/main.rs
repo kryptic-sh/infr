@@ -1924,7 +1924,7 @@ fn run_chat(
         // `infr_gguf::watch` for what this can and cannot see.
         be.weights().check()?;
         // `tools` arrives already parsed (a borrowed Value) — no Value→string→Value round-trip.
-        let prompt = be.renderer().render(messages, tools)?;
+        let prompt = be.renderer().render(messages, tools, params.think)?;
         // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
         // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
         let max_new = params

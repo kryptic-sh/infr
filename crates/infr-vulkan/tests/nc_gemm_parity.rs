@@ -545,7 +545,7 @@ fn nc_kq_fma_gemm_parity_and_determinism() {
         eprintln!("skip: no Vulkan device");
         return;
     };
-    for dt in [DType::Q4K, DType::Q6K] {
+    for dt in [DType::Q4_0, DType::Q4K, DType::Q6K] {
         for bn in [64, 128] {
             // k=768 gives 3 blocks per row, so Q6_K columns alternate 2-byte block alignment.
             for (m, k, n) in [

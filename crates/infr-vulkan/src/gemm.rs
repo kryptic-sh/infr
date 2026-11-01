@@ -1059,6 +1059,8 @@ pub(crate) fn native_gemm_kq_fma_spv(
     }
     use infr_core::DType::*;
     Some(match (dtype, bn) {
+        (Q4_0, 64) => spv!("native_gemm_kq_fma_q4_0_t64"),
+        (Q4_0, 128) => spv!("native_gemm_kq_fma_q4_0_t128"),
         (Q4K, 64) => spv!("native_gemm_kq_fma_q4k_t64"),
         (Q4K, 128) => spv!("native_gemm_kq_fma_q4k_t128"),
         (Q6K, 64) => spv!("native_gemm_kq_fma_q6k_t64"),
@@ -1096,8 +1098,14 @@ pub(crate) fn native_gemv_kq_fma_spv(
     })
 }
 /// Whether `native_gemm_kq_fma` has a build for `dtype`.
+///
+/// Q4_0 rides the same tier: its dequant is cheaper than the K-quants' and the
+/// emulated-dp4a MMQ path loses to fp32 FMA on it by the same margin.
 pub(crate) fn native_gemm_kq_fma_supported(dtype: infr_core::DType) -> bool {
-    matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K)
+    matches!(
+        dtype,
+        infr_core::DType::Q4_0 | infr_core::DType::Q4K | infr_core::DType::Q6K
+    )
 }
 /// SPIR-V for the non-coopmat float-weight prefill GEMM (the "fma-warp" tier, see
 /// `native_gemm_fma.comp`): shared-memory fma warptile for f16/bf16/f32 weights on devices

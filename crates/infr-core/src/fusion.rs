@@ -275,8 +275,20 @@ fn plan_rmsnorm_linear(graph: &Graph, cfg: &RmsNormLinearCfg, plan: &mut FusionP
         // Each must be a fusable decode GEMV whose `in_f` matches the norm `dim`.
         let mut consumers: Vec<usize> = Vec::new();
         let mut ok = true;
+        // A fused consumer re-reads the norm's input `x` at its own position, so `x` must be
+        // unchanged from the norm up to every consumer.
+        let mut x_written = false;
         for j in (i + 1)..graph.ops.len() {
             let (ins, outs) = graph.ops[j].io();
+            if ins.contains(&dst) && x_written {
+                tracing::debug!(
+                    norm = i,
+                    consumer = j,
+                    "rmsnorm fusion: input rewritten before consumer"
+                );
+                ok = false;
+                break;
+            }
             if ins.contains(&dst) {
                 match &graph.ops[j] {
                     Op::Linear {
@@ -316,6 +328,9 @@ fn plan_rmsnorm_linear(graph: &Graph, cfg: &RmsNormLinearCfg, plan: &mut FusionP
             }
             if outs.contains(&dst) {
                 break; // `dst` rewritten — live range ends (a fusable Linear never writes it).
+            }
+            if outs.contains(&x) {
+                x_written = true;
             }
         }
         if ok && !consumers.is_empty() {
@@ -624,6 +639,68 @@ mod tests {
         assert!(!p.skip.contains(&2), "the Add must still dispatch");
         // The norm fold is independent and still fires (its own live range is unaffected).
         assert!(p.rmsnorm_linear.contains_key(&1));
+    }
+
+    /// A fused consumer re-reads the norm's input, so a write to that input between the norm and
+    /// a consumer must block the fold.
+    #[test]
+    fn rmsnorm_linear_fold_requires_unchanged_input() {
+        let build = |rewrite_input: bool| {
+            let mut g = Graph::new();
+            let hidden = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+            let nw = g.weight(TensorDesc::new(vec![4], DType::F32));
+            let hn = g.internal(TensorDesc::new(vec![1, 4], DType::F32));
+            let w = g.weight(TensorDesc::new(vec![4, 4], DType::Q4K));
+            let (a, b) = (
+                g.internal(TensorDesc::new(vec![1, 4], DType::F32)),
+                g.output(TensorDesc::new(vec![1, 4], DType::F32)),
+            );
+            g.push(Op::RmsNorm {
+                x: hidden,
+                weight: nw,
+                dst: hn,
+                rows: 1,
+                dim: 4,
+                eps: 1e-6,
+            });
+            let linear = |dst| Op::Linear {
+                x: hn,
+                weight: w,
+                dst,
+                m: 1,
+                in_f: 4,
+                out_f: 4,
+                w_off: 0,
+            };
+            g.push(linear(a));
+            if rewrite_input {
+                g.push(Op::Add {
+                    a: hidden,
+                    b: a,
+                    dst: hidden,
+                    n: 4,
+                });
+            }
+            g.push(linear(b));
+            g
+        };
+        let all: &dyn Fn(DType) -> bool = &|_| true;
+        let cfg = FusionCfg {
+            linear_add: None,
+            rmsnorm_linear: Some(RmsNormLinearCfg {
+                weight_ok: all,
+                moe_ok: None,
+                enabled: true,
+            }),
+            moe_add: None,
+            kv_write: false,
+        };
+        let clean = plan_fusions(&build(false), &cfg);
+        assert_eq!(clean.rmsnorm_linear.len(), 2);
+        assert!(clean.skip.contains(&0));
+        let rewritten = plan_fusions(&build(true), &cfg);
+        assert!(rewritten.rmsnorm_linear.is_empty());
+        assert!(!rewritten.skip.contains(&0), "the norm must still dispatch");
     }
 
     /// A multi-row (prefill) `MoeFfn` is NOT a fusable norm consumer — the backends' MoE arms chunk

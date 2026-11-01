@@ -165,11 +165,10 @@ fn session_stable(
     let has_wv = has("attn_v.weight");
     let has_wk = has("attn_k.weight");
     let has_k_norm = has("attn_k_norm.weight");
-    if let Some(l) = (0..c.n_layer).find(|&l| c.has_own_kv(l) && !has_wk[l]) {
-        return Err(anyhow!(
-            "blk.{l}.attn_k.weight missing on a layer that owns its KV cache"
-        ));
-    }
+    // NOTE: no hard error here for a KV-owning layer missing attn_k — MLA/DeltaNet
+    // layers legitimately lack it (compressed KV), and the per-layer loader below
+    // already skips the absent tensors. A file that is actually broken still fails
+    // loudly at graph build (the `aw.wk.expect(..)` on the K-projection Linear).
     // gemma4 per-layer output scale (`layer_output_scale.weight`, a single scalar multiplying the
     // layer output before the next layer). Read host-side; applied as an `Op::Scale`. diffusion-
     // gemma ships TWO per-layer scalars (encoder for the prompt, decoder for the canvas); Phase 1

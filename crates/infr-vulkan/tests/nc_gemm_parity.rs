@@ -452,7 +452,15 @@ fn nc_fma_gemm_parity_and_determinism() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_kq_fma(be: &VulkanBackend, dt: DType, bn: usize, m: usize, k: usize, n: usize, w_base: usize) {
+fn run_kq_fma(
+    be: &VulkanBackend,
+    dt: DType,
+    bn: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    w_base: usize,
+) {
     let label = format!("{dt:?} kq_fma t{bn} m{m} k{k} n{n} w_base{w_base}");
     let bank = synth_bank(dt, w_base + n * k, 0x9c4 ^ dt as u64 ^ (k * n) as u64);
     let w_host = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();

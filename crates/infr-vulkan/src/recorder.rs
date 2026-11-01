@@ -3097,6 +3097,73 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Decode (m=1) K-quant GEMV on f32 activations (`native_gemv_kq_fma.comp`): `y = x·Wᵀ`, or
+    /// `y = residual + x·Wᵀ` with `residual`. Q4_K/Q6_K, `in_f % 256 == 0`, `w_base % 256 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_kq_fma(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        residual: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let nr = self.kq_fma_gemv_rows(out_f);
+        self.linear_kq_fma_nr(dtype, w, w_base, x, residual, y, in_f, out_f, nr);
+    }
+
+    /// Rows per workgroup for [`Self::linear_kq_fma`]: 8, or 4 when 8 would leave fewer than
+    /// 16 single-wave workgroups per CU.
+    pub fn kq_fma_gemv_rows(&self, out_f: usize) -> usize {
+        let cu = (self.be.caps().compute_units as usize).max(1);
+        if out_f.div_ceil(8) >= 16 * cu {
+            8
+        } else {
+            4
+        }
+    }
+
+    /// [`Self::linear_kq_fma`] at an explicit `nr` (4 or 8) rows per workgroup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_kq_fma_nr(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        residual: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        in_f: usize,
+        out_f: usize,
+        nr: usize,
+    ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: linear_kq_fma requires a u64 BDA device address");
+        let (name, spv) = crate::gemm::native_gemv_kq_fma_spv(dtype, residual.is_some(), nr)
+            .expect("linear_kq_fma: dtype/nr gated by native_gemv_kq_fma_spv");
+        debug_assert!(in_f.is_multiple_of(256) && w_base.is_multiple_of(256));
+        self.label_gemv(name, 1, in_f, out_f);
+        let kern = self.be.kernel(name, spv, 3, 20);
+        let mut push = [0u8; 20];
+        push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let r = residual.unwrap_or(x);
+        self.dispatch_wide(
+            kern,
+            &[Self::vkb(x), Self::vkb(r), Self::vkb(y)],
+            1,
+            &push,
+            out_f.div_ceil(nr) as u32,
+        );
+    }
+
     /// Arena-addressed body of [`Self::matmul_kq_fma`] at column tile `bn` (64 or 128).
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_kq_fma_at(

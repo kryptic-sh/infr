@@ -709,6 +709,47 @@ fn main() {
         // audit by name.
         ("linear_f32r", "linear_f32r", &[]),
         ("linear_f32_mo", "linear_f32_mo", &[]),
+        // Decode K-quant GEMV on f32 activations for GPUs without fast int8 dot (GCN).
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k",
+            &["-DFMT_Q4K"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res",
+            &["-DFMT_Q4K", "-DUSE_RES"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k",
+            &["-DFMT_Q6K"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res",
+            &["-DFMT_Q6K", "-DUSE_RES"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_nr4",
+            &["-DFMT_Q4K", "-DNR=4"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res_nr4",
+            &["-DFMT_Q4K", "-DUSE_RES", "-DNR=4"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_nr4",
+            &["-DFMT_Q6K", "-DNR=4"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res_nr4",
+            &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4"],
+        ),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
         (
             "linear_f32r",
@@ -3424,7 +3465,9 @@ fn main() {
             // it's gone entirely. linear_res IS the fused-residual f16 GEMV file, included since
             // the resident-BDA endgame deletes every bound-SSBO weight path.
             "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32r" | "linear_f32_mo"
-            | "linear_res" | "native_gemm_fma" | "native_gemm_kq_fma" => true,
+            | "native_gemv_kq_fma" | "linear_res" | "native_gemm_fma" | "native_gemm_kq_fma" => {
+                true
+            }
             // Model-specific float-weight kernels: qwen35's SSM depthwise conv1d+SiLU (both the
             // sequential and batch-pass-1 variants — conv1d_shift never reads the weight) and
             // gemma4 E2B's per-layer fused inp_gate GEMV. Same typed buffer_reference seam as the

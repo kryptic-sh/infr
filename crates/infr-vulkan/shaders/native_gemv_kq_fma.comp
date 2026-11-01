@@ -1,0 +1,152 @@
+#version 460
+// Decode (m=1) K-quant GEMV y = x·Wᵀ on f32 activations (no quant_q8 pass), for GPUs without fast
+// int8 dot. One 64-thread workgroup per NR output rows; 8 lanes per 256-element superblock, and
+// each work item applies one superblock's activations to 4 rows.
+// -DFMT_Q4K | -DFMT_Q6K, optional -DUSE_RES (y = residual + x·Wᵀ). Requires in_f % 256 == 0.
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef NR
+#define NR 8
+#endif
+const uint RG = uint(NR) / 4u;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 0) readonly buffer XB { vec4 x4[]; };
+#ifdef USE_RES
+layout(binding = 1) readonly buffer RB { float res[]; };
+#endif
+layout(binding = 2) writeonly buffer YB { float y[]; };
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#include "native_decode.glsl"
+
+shared float red[NR * 64];
+
+// Unaligned-safe word funnel: sh in {0,8,16,24}; (hi<<1)<<(31-sh) is 0 when sh==0.
+uint fun(uint lo, uint hi, uint sh) { return (lo >> sh) | ((hi << 1u) << (31u - sh)); }
+
+float dot4b(uint q, vec4 xv) {
+    return float(q & 0xFFu) * xv.x + float((q >> 8u) & 0xFFu) * xv.y
+         + float((q >> 16u) & 0xFFu) * xv.z + float(q >> 24u) * xv.w;
+}
+float hsum(vec4 v) { return (v.x + v.y) + (v.z + v.w); }
+
+// Superblock `sb` of rows row0..row0+3 (rows past out_f clamp to the last row; never written).
+#if defined(FMT_Q4K)
+vec4 item(uint row0, uint sb, uint l8) {
+    uint g = l8 >> 1u;
+    uint h = l8 & 1u;
+    uint xb = (sb * 256u + 64u * g + 16u * h) >> 2u;
+    vec4 xa[4];
+    vec4 xc[4];
+    [[unroll]] for (uint w = 0u; w < 4u; w++) {
+        xa[w] = x4[xb + w];
+        xc[w] = x4[xb + 8u + w];
+    }
+    float sxa = hsum(xa[0] + xa[1] + xa[2] + xa[3]);
+    float sxc = hsum(xc[0] + xc[1] + xc[2] + xc[3]);
+    vec4 out4;
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        uint row = min(row0 + r, pc.out_f - 1u);
+        uint bd = ((pc.w_base + row * pc.in_f) / 256u + sb) * 144u;
+        uvec4 hdr = NW4(bd >> 2u);
+        uvec4 q = NW4((bd + 16u + 32u * g + 16u * h) >> 2u);
+        float slo = 0.0, shi = 0.0;
+        [[unroll]] for (uint w = 0u; w < 4u; w++) {
+            slo += dot4b(q[w] & 0x0F0F0F0Fu, xa[w]);
+            shi += dot4b((q[w] >> 4u) & 0x0F0F0F0Fu, xc[w]);
+        }
+        vec2 dm = unpackHalf2x16(hdr.x);
+        uvec2 klo = k4w(2u * g, hdr);
+        uvec2 khi = k4w(2u * g + 1u, hdr);
+        out4[r] = dm.x * (float(klo.x) * slo + float(khi.x) * shi)
+                - dm.y * (float(klo.y) * sxa + float(khi.y) * sxc);
+    }
+    return out4;
+}
+#elif defined(FMT_Q6K)
+vec4 item(uint row0, uint sb, uint l8) {
+    uint hf = l8 >> 2u;
+    uint j = l8 & 3u;
+    uint xb = (sb * 256u + hf * 128u + 8u * j) >> 2u;
+    vec4 xv[8];
+    float sx[4];
+    [[unroll]] for (uint og = 0u; og < 4u; og++) {
+        xv[og * 2u] = x4[xb + og * 8u];
+        xv[og * 2u + 1u] = x4[xb + og * 8u + 1u];
+        sx[og] = hsum(xv[og * 2u] + xv[og * 2u + 1u]);
+    }
+    vec4 out4;
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        uint row = min(row0 + r, pc.out_f - 1u);
+        uint bd = ((pc.w_base + row * pc.in_f) / 256u + sb) * 210u;
+        uint sh = (bd & 3u) * 8u;
+        uint qa = (bd + hf * 64u + 8u * j) >> 2u;
+        uint qh = (bd + 128u + hf * 32u + 8u * j) >> 2u;
+        uint sc = (bd + 192u + hf * 8u) >> 2u;
+        uvec2 a0 = NW2(qa); uint a2 = NW(qa + 2u);
+        uvec2 b0 = NW2(qa + 8u); uint b2 = NW(qa + 10u);
+        uvec2 h0 = NW2(qh); uint h2 = NW(qh + 2u);
+        uvec2 s0 = NW2(sc); uint s2 = NW(sc + 2u);
+        uint la[2] = uint[2](fun(a0.x, a0.y, sh), fun(a0.y, a2, sh));
+        uint lb[2] = uint[2](fun(b0.x, b0.y, sh), fun(b0.y, b2, sh));
+        uint hh[2] = uint[2](fun(h0.x, h0.y, sh), fun(h0.y, h2, sh));
+        uint sw[2] = uint[2](fun(s0.x, s0.y, sh), fun(s0.y, s2, sh));
+        float d = unpackHalf2x16((NW((bd + 208u) >> 2u) >> (((bd + 208u) & 3u) * 8u)) & 0xFFFFu).x;
+        float acc = 0.0;
+        [[unroll]] for (uint og = 0u; og < 4u; og++) {
+            float s = 0.0;
+            [[unroll]] for (uint w = 0u; w < 2u; w++) {
+                uint src = (og & 1u) == 0u ? la[w] : lb[w];
+                uint q = ((og < 2u ? src : (src >> 4u)) & 0x0F0F0F0Fu)
+                       | (((hh[w] >> (2u * og)) & 0x03030303u) << 4u);
+                s += dot4b(q, xv[og * 2u + w]);
+            }
+            uint si = og * 2u + (j >> 1u);
+            float scv = float(sgn8((sw[si >> 2u] >> ((si & 3u) * 8u)) & 0xFFu));
+            acc += scv * (s - 32.0 * sx[og]);
+        }
+        out4[r] = d * acc;
+    }
+    return out4;
+}
+#endif
+
+void main() {
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+    uint lane = gl_LocalInvocationIndex;
+    uint l8 = lane & 7u;
+    uint slot = lane >> 3u;
+    uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(NR);
+    if (o0 >= pc.out_f) { return; }
+    uint nsb = pc.in_f / 256u;
+    vec4 acc[RG];
+    [[unroll]] for (uint g = 0u; g < RG; g++) acc[g] = vec4(0.0);
+    for (uint it = slot; it < RG * nsb; it += 8u) {
+        uint g = it / nsb;
+        vec4 v = item(o0 + 4u * g, it - g * nsb, l8);
+        [[unroll]] for (uint k = 0u; k < RG; k++) {
+            if (g == k) acc[k] += v;
+        }
+    }
+    [[unroll]] for (uint g = 0u; g < RG; g++)
+        [[unroll]] for (uint r = 0u; r < 4u; r++) red[(4u * g + r) * 64u + lane] = acc[g][r];
+    barrier();
+    [[unroll]] for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            [[unroll]] for (uint r = 0u; r < uint(NR); r++) red[r * 64u + lane] += red[r * 64u + lane + s];
+        }
+        barrier();
+    }
+    if (lane < uint(NR) && o0 + lane < pc.out_f) {
+        float v = red[lane * 64u];
+#ifdef USE_RES
+        v += res[o0 + lane];
+#endif
+        y[o0 + lane] = v;
+    }
+}

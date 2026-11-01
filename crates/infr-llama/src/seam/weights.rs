@@ -101,7 +101,7 @@ pub(super) struct MoeSharedW {
 /// per-layer embeddings) stays on [`LayerW`].
 pub(super) struct AttnW {
     pub(super) wq: TensorId,
-    pub(super) wk: TensorId,
+    pub(super) wk: Option<TensorId>,
     pub(super) wv: Option<TensorId>,
     // Qwen2/2.5 q/k/v projection biases (`Config::qkv_bias`); `None` on every bias-free arch.
     pub(super) qb: Option<TensorId>,
@@ -271,6 +271,9 @@ pub(super) struct LayerW {
 pub(crate) struct SessionStable {
     /// Per-layer presence of an explicit V projection (gemma4 full-attention layers omit it).
     pub(super) has_wv: Vec<bool>,
+    /// Per-layer presence of the K projection and K norm (gemma4 KV-shared layers may omit both).
+    pub(super) has_wk: Vec<bool>,
+    pub(super) has_k_norm: Vec<bool>,
     /// gemma4 per-layer output scalar (`layer_output_scale` / `enc_layer_output_scale`), dequanted.
     pub(super) out_scale: Vec<Option<f32>>,
     /// diffusion-gemma DECODER per-layer output scalar (`layer_output_scale`), dequanted.

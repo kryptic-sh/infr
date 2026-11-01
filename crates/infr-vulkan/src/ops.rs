@@ -357,7 +357,7 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
     ) -> ComputeKernel {
-        self.kernel_inner(name, spv, n_buf, push_size, None)
+        self.kernel_inner(name, spv, n_buf, push_size, None, self.shared.wave64)
     }
 
     /// Like `kernel`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
@@ -377,10 +377,26 @@ impl VulkanBackend {
             n_buf,
             push_size,
             (sg_size > 0).then_some(sg_size),
+            self.shared.wave64,
         )
     }
 
-    /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]. The build runs UNDER the
+    /// Wave64-NATIVE subgroup kernel: pins 64 WITHOUT the W64 wave32-halves emulation, so the
+    /// `-DSG=64` SPIR-V runs as plain full-wave subgroup ops. Only valid where 64 is pinnable
+    /// (the caller gates on the backend's wave64 flag); anywhere else it would fail pipeline
+    /// creation exactly the way an unpinnable `kernel_sg` size does.
+    pub(crate) fn kernel_sg64_native(
+        &self,
+        name: &'static str,
+        spv: &[u32],
+        n_buf: usize,
+        push_size: u32,
+    ) -> ComputeKernel {
+        self.kernel_inner(name, spv, n_buf, push_size, Some(64), false)
+    }
+
+    /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]/[`Self::kernel_sg64_native`].
+    /// The build runs UNDER the
     /// cache lock (via the `entry` API) so exactly one thread compiles a given `name` on
     /// concurrent first use — the old lock→get→unlock→compile→lock→insert had two racing threads
     /// both build the full shader+pipeline+pool and the second `insert` overwrite (and leak for
@@ -392,6 +408,7 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
         required_sg: Option<u32>,
+        wave64: bool,
     ) -> ComputeKernel {
         let mut map = self.shared.kernels.lock().unwrap();
         let mut built = false;
@@ -410,7 +427,7 @@ impl VulkanBackend {
                 self.shared
                     .rte_f16
                     .load(std::sync::atomic::Ordering::Relaxed),
-                self.shared.wave64,
+                wave64,
             )
         });
         drop(map);

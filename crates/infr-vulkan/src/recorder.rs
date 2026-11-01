@@ -10273,7 +10273,11 @@ impl RecordedCmd {
             .shared
             .submit_dispatch_cap
             .load(std::sync::atomic::Ordering::Relaxed);
-        if cap == 0 || self.dispatches == 0 {
+        let prefill_only = self
+            .shared
+            .split_prefill_only
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cap == 0 || prefill_only || self.dispatches == 0 {
             return usize::MAX;
         }
         // Always at least one: a single decode step is indivisible, and it is short enough on

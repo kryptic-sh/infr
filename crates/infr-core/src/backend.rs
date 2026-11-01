@@ -262,7 +262,7 @@ pub const SUBMIT_BUDGET_NS: u64 = 250_000_000;
 /// Discrete GPUs get 0: a whole forward there is tens of milliseconds, two orders of magnitude
 /// inside any watchdog, and splitting it would only add barriers and submit overhead to the tuned
 /// path. Integrated GPUs get a real cap, because they are the parts whose forward is measured in
-/// SECONDS.
+/// SECONDS. So do `slow` discrete GPUs (no matrix units and no fast int8 dot, e.g. GCN).
 ///
 /// 128 comes from the surveyed 2-CU part: 757 dispatches ≈ 2.05 s ⇒ ~2.7 ms/dispatch ⇒ 128
 /// dispatches ≈ 0.35 s, inside [`SUBMIT_BUDGET_NS`] with room to spare. It is deliberately NOT
@@ -281,9 +281,11 @@ pub const SUBMIT_BUDGET_NS: u64 = 250_000_000;
 /// and would also stay correct if a caller forced a much larger `INFR_UBATCH` on an iGPU (each
 /// dispatch then gets heavier while the count stays put); today that case is caught one forward
 /// late by the measured loop instead. Worth adopting if this ever needs to be tighter.
-pub fn initial_submit_dispatch_cap(integrated: bool) -> usize {
+pub fn initial_submit_dispatch_cap(integrated: bool, slow: bool) -> usize {
     if integrated {
         128
+    } else if slow {
+        64
     } else {
         0
     }
@@ -702,13 +704,14 @@ mod tests {
         }
     }
 
-    /// The submit splitter's pre-measurement default. The load-bearing property is that a DISCRETE
-    /// GPU never splits: a dGPU forward is tens of milliseconds, nowhere near a hang watchdog, and
-    /// splitting it would only add barriers and submits to a tuned path.
+    /// The submit splitter's pre-measurement default. The load-bearing property is that a fast
+    /// DISCRETE GPU never splits: a dGPU forward is tens of milliseconds, nowhere near a hang
+    /// watchdog, and splitting it would only add barriers and submits to a tuned path.
     #[test]
-    fn initial_submit_cap_splits_only_integrated() {
-        assert_eq!(initial_submit_dispatch_cap(false), 0); // discrete: never split
-        assert_eq!(initial_submit_dispatch_cap(true), 128); // integrated: the measured default
+    fn initial_submit_cap_splits_integrated_and_slow_discrete() {
+        assert_eq!(initial_submit_dispatch_cap(false, false), 0); // discrete: never split
+        assert_eq!(initial_submit_dispatch_cap(true, false), 128); // integrated: the measured default
+        assert_eq!(initial_submit_dispatch_cap(false, true), 64); // slow discrete (RX 580)
     }
 
     /// The measured feedback loop. The property that matters is that the cap it returns puts a

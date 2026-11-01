@@ -76,7 +76,7 @@ cfg_struct! {
         /// `INFR_UBATCH_PARALLEL`: prefill chunk for a sequence sharing the GPU (`serve -np N`).
         ubatch_parallel: usize = 256,
         /// `INFR_SUBMIT_DISPATCHES`: submit-splitter cap (`0` = never split). `None` = the
-        /// measured `initial_submit_dispatch_cap(integrated)` default.
+        /// measured `initial_submit_dispatch_cap(integrated, slow)` default.
         submit_dispatches: Option<usize> = None,
         /// `INFR_SG`: subgroup-size preference, exactly 16 or 32. `None` = vendor-derived.
         subgroup_pref: Option<u32> = None,

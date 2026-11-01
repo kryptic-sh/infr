@@ -4992,7 +4992,7 @@ fn record_decode_replay(
     // instead of one long one. This preserves the `_dyn`/params/ring decode semantics exactly — the
     // identical dispatch stream is just distributed across command buffers, with a seeded global
     // barrier at each continuation segment's head carrying the cross-segment ordering.
-    let cap = be_.submit_dispatch_cap();
+    let cap = be_.decode_submit_cap();
     let mut segments: Vec<crate::recorder::RecordedSegment> = Vec::new();
     let mut rec = be_.recorder_persistent()?;
     // Device-side position stream: seed params to [pos0-1, pos0] and record a one-thread
@@ -5239,7 +5239,15 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // default) bounds the dispatches per command buffer; segments are submitted WITHOUT waiting
     // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
     // only the watchdog's view changes, from one long job to several short ones.
-    let cap = be_.submit_dispatch_cap();
+    let single_token = graph
+        .ops
+        .iter()
+        .all(|op| !matches!(op, Op::Linear { m, .. } if *m > 1));
+    let cap = if single_token {
+        be_.decode_submit_cap()
+    } else {
+        be_.submit_dispatch_cap()
+    };
     let t_forward = std::time::Instant::now();
     let mut submitted_dispatches = 0usize;
     /// In-flight segments allowed at once. Each one pins a command buffer plus its descriptor

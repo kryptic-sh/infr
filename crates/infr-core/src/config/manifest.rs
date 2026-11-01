@@ -180,6 +180,7 @@ knobs! {
     "INFR_NO_BM16"          => "kernels.vulkan.bm16",           PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMQ"           => "kernels.vulkan.mmq",            PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMQ_FALLBACK"  => "kernels.vulkan.mmq_fallback",   PresenceInv, Ignored, "1",  migrated;
+    "INFR_GCN_TIER"         => "kernels.vulkan.gcn_tier",       TriState,    Ignored, "1",  migrated;
     "INFR_NO_MMV"           => "kernels.vulkan.mmv",            PresenceInv, Ignored, "1",  migrated;
     "INFR_MMV_DECODE"       => "kernels.vulkan.mmv_decode",     Presence,    Ignored, "1",  migrated;
     "INFR_NO_MMV_M4"        => "kernels.vulkan.mmv_m4",         PresenceInv, Ignored, "1",  migrated;

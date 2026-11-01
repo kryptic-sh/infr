@@ -2311,6 +2311,7 @@ impl VulkanBackend {
             coopmat_f8,
             i8: has_int8,
             i8_dot: has_i8_dot,
+            i8_dot_fast: has_i8_dot && device_probe.dot4x8_signed_accelerated,
             coopmat_i8,
             bf16: has_bf16_ext && post_ash.bf16_type,
             coopmat_bf16,

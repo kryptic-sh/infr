@@ -2237,6 +2237,27 @@ fn main() {
         ("native_gemm_fma", "native_gemm_fma_f16", &["-DFMT_F16"]),
         ("native_gemm_fma", "native_gemm_fma_bf16", &["-DFMT_BF16"]),
         ("native_gemm_fma", "native_gemm_fma_f32", &["-DFMT_F32"]),
+        // fp32 K-quant prefill GEMM for GPUs without fast int8 dot (GCN), see native_gemm_gcn.comp.
+        (
+            "native_gemm_gcn",
+            "native_gemm_gcn_q4k_t64",
+            &["-DFMT_Q4K", "-DBN=64"],
+        ),
+        (
+            "native_gemm_gcn",
+            "native_gemm_gcn_q4k_t128",
+            &["-DFMT_Q4K", "-DBN=128"],
+        ),
+        (
+            "native_gemm_gcn",
+            "native_gemm_gcn_q6k_t64",
+            &["-DFMT_Q6K", "-DBN=64"],
+        ),
+        (
+            "native_gemm_gcn",
+            "native_gemm_gcn_q6k_t128",
+            &["-DFMT_Q6K", "-DBN=128"],
+        ),
         // Non-coopmat shared-memory fma flash-attention prefill (adapter.rs `nc_fa_ok`, see
         // attn_nc_fa.comp): the attention companion of the fma GEMM tier above. No subgroup ops.
         // One build per shared-Os ceiling: hd<=128 (37.6 KB), hd<=256 (54.0 KB), hd<=512 (BM=16,
@@ -3402,7 +3423,7 @@ fn main() {
             // it's gone entirely. linear_res IS the fused-residual f16 GEMV file, included since
             // the resident-BDA endgame deletes every bound-SSBO weight path.
             "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32r" | "linear_res"
-            | "native_gemm_fma" => true,
+            | "native_gemm_fma" | "native_gemm_gcn" => true,
             // Model-specific float-weight kernels: qwen35's SSM depthwise conv1d+SiLU (both the
             // sequential and batch-pass-1 variants — conv1d_shift never reads the weight) and
             // gemma4 E2B's per-layer fused inp_gate GEMV. Same typed buffer_reference seam as the

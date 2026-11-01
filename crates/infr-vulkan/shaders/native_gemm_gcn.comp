@@ -1,0 +1,197 @@
+#version 460
+// fp32 K-quant prefill GEMM (C = A·Wᵀ, 128xBN tile) for GPUs without fast int8 dot or coopmat.
+// -DFMT_Q4K|-DFMT_Q6K, -DBN=64|128; requires n%BN, k%256, w_base%256; no subgroup ops.
+#extension GL_EXT_control_flow_attributes : require
+
+const uint BM = 128u;
+#ifndef BN
+#define BN 64
+#endif
+const uint BK = 32u;
+const uint THREADS = 256u;
+const uint TNV = uint(BN) / 64u;               // vec4 column groups per thread (1 or 2)
+const uint CPT = THREADS / uint(BN);           // staging threads per weight column (4 or 2)
+const uint EPT = uint(BN) * BK / THREADS;      // weight elements staged per thread (8 or 16)
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 0) readonly buffer AB { vec4 a4[]; };
+layout(binding = 2) writeonly buffer CB { vec4 c4[]; };
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#include "native_decode.glsl"
+
+shared vec4 As[BK][BM / 4u];
+shared vec4 Ws[BK][uint(BN) / 4u];
+
+uint li;
+uint wgRow;
+uint wgCol;
+
+// Prefetch registers: raw activation and weight words for the next K tile.
+vec4 ar[4];
+#if defined(FMT_Q4K)
+uvec4 wh;
+#if BN == 128
+uvec4 wq;
+#else
+uvec2 wq;
+#endif
+#elif defined(FMT_Q6K)
+uint wl[EPT / 4u + 1u];
+uint wqh[EPT / 4u + 1u];
+uint wsc;
+uint wd;
+#endif
+
+// Unaligned-safe word funnel: sh in {0,8,16,24}; (hi<<1)<<(31-sh) is 0 when sh==0.
+uint fun(uint lo, uint hi, uint sh) { return (lo >> sh) | ((hi << 1u) << (31u - sh)); }
+
+void loadRaw(uint k0) {
+    uint row = li & (BM - 1u);
+    uint kh = li / BM;
+    uint gr = wgRow + row;
+    if (gr < pc.m) {
+        uint base = (gr * pc.k + k0 + kh * 16u) >> 2u;
+        [[unroll]] for (uint j = 0u; j < 4u; j++) ar[j] = a4[base + j];
+    } else {
+        [[unroll]] for (uint j = 0u; j < 4u; j++) ar[j] = vec4(0.0);
+    }
+
+    uint col = li % uint(BN);
+    uint part = li / uint(BN);
+    uint elem = pc.w_base + (wgCol + col) * pc.k + k0;
+#if defined(FMT_Q4K)
+    uint bd = (elem >> 8u) * 144u;
+    uint sub = (elem >> 5u) & 7u;
+    wh = NW4(bd >> 2u);
+    uint qw = ((bd + 16u + (sub >> 1u) * 32u) >> 2u) + part * (EPT / 4u);
+#if BN == 128
+    wq = NW4(qw);
+#else
+    wq = NW2(qw);
+#endif
+#elif defined(FMT_Q6K)
+    uint bd = (elem >> 8u) * 210u;
+    uint p0 = elem & 255u;
+    uint hf = p0 >> 7u;
+    uint og = (p0 >> 5u) & 3u;
+    uint lo = part * EPT;
+    uint qlb = (bd + hf * 64u + (og & 1u) * 32u + lo) >> 2u;
+    uint qhb = (bd + 128u + hf * 32u + lo) >> 2u;
+#if BN == 128
+    uvec4 x = NW4(qlb); wl[0] = x.x; wl[1] = x.y; wl[2] = x.z; wl[3] = x.w; wl[4] = NW(qlb + 4u);
+    uvec4 y = NW4(qhb); wqh[0] = y.x; wqh[1] = y.y; wqh[2] = y.z; wqh[3] = y.w; wqh[4] = NW(qhb + 4u);
+#else
+    uvec2 x = NW2(qlb); wl[0] = x.x; wl[1] = x.y; wl[2] = NW(qlb + 2u);
+    uvec2 y = NW2(qhb); wqh[0] = y.x; wqh[1] = y.y; wqh[2] = NW(qhb + 2u);
+#endif
+    wsc = NW((bd + 192u + hf * 8u + og * 2u + lo / 16u) >> 2u);
+    wd = NW((bd + 208u) >> 2u);
+#endif
+}
+
+void storeTile(uint k0) {
+    uint row = li & (BM - 1u);
+    uint kh = li / BM;
+    [[unroll]] for (uint j = 0u; j < 4u; j++) {
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            As[kh * 16u + j * 4u + c][row >> 2u][row & 3u] = ar[j][c];
+        }
+    }
+
+    uint col = li % uint(BN);
+    uint part = li / uint(BN);
+    uint elem = pc.w_base + (wgCol + col) * pc.k + k0;
+#if defined(FMT_Q4K)
+    uint sub = (elem >> 5u) & 7u;
+    vec2 dm = unpackHalf2x16(wh.x);
+    uvec2 sm = k4w(sub, wh);
+    float dl = dm.x * float(sm.x);
+    float mm = dm.y * float(sm.y);
+    uint nsh = (sub & 1u) * 4u;
+    [[unroll]] for (uint w = 0u; w < EPT / 4u; w++) {
+        uint q = (wq[w] >> nsh) & 0x0F0F0F0Fu;
+        [[unroll]] for (uint b = 0u; b < 4u; b++) {
+            Ws[part * EPT + w * 4u + b][col >> 2u][col & 3u] = dl * float((q >> (8u * b)) & 0xFFu) - mm;
+        }
+    }
+#elif defined(FMT_Q6K)
+    uint bd = (elem >> 8u) * 210u;
+    uint p0 = elem & 255u;
+    uint hf = p0 >> 7u;
+    uint og = (p0 >> 5u) & 3u;
+    uint lo = part * EPT;
+    uint sh = (bd & 3u) * 8u;
+    uint nsh = og >= 2u ? 4u : 0u;
+    uint qsh = og * 2u;
+    float d = unpackHalf2x16((wd >> (((bd + 208u) & 3u) * 8u)) & 0xFFFFu).x;
+    uint sbo = bd + 192u + hf * 8u + og * 2u + lo / 16u;
+    float dsc = d * float(sgn8((wsc >> ((sbo & 3u) * 8u)) & 0xFFu));
+    [[unroll]] for (uint w = 0u; w < EPT / 4u; w++) {
+        uint q = (fun(wl[w], wl[w + 1u], sh) >> nsh) & 0x0F0F0F0Fu;
+        uint h = ((fun(wqh[w], wqh[w + 1u], sh) >> qsh) & 0x03030303u) << 4u;
+        uint qq = q | h;
+        [[unroll]] for (uint b = 0u; b < 4u; b++) {
+            Ws[part * EPT + w * 4u + b][col >> 2u][col & 3u] =
+                dsc * (float((qq >> (8u * b)) & 0xFFu) - 32.0);
+        }
+    }
+#endif
+}
+
+void main() {
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+    li = gl_LocalInvocationIndex;
+    uint tilesN = pc.n / uint(BN);
+    wgRow = (gl_WorkGroupID.x / tilesN) * BM;
+    wgCol = (gl_WorkGroupID.x % tilesN) * uint(BN);
+    uint tr = li & 15u;
+    uint tc = li >> 4u;
+
+    vec4 acc[8][TNV];
+    [[unroll]] for (uint i = 0u; i < 8u; i++)
+        [[unroll]] for (uint j = 0u; j < TNV; j++) acc[i][j] = vec4(0.0);
+
+    loadRaw(0u);
+    storeTile(0u);
+    barrier();
+    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
+        bool more = k0 + BK < pc.k;
+        if (more) loadRaw(k0 + BK);
+        [[unroll]] for (uint kk = 0u; kk < BK; kk++) {
+            vec4 a0 = As[kk][tr];
+            vec4 a1 = As[kk][16u + tr];
+            vec4 b[TNV];
+            [[unroll]] for (uint j = 0u; j < TNV; j++) b[j] = Ws[kk][j * 16u + tc];
+            [[unroll]] for (uint j = 0u; j < TNV; j++) {
+                acc[0][j] += a0.x * b[j];
+                acc[1][j] += a0.y * b[j];
+                acc[2][j] += a0.z * b[j];
+                acc[3][j] += a0.w * b[j];
+                acc[4][j] += a1.x * b[j];
+                acc[5][j] += a1.y * b[j];
+                acc[6][j] += a1.z * b[j];
+                acc[7][j] += a1.w * b[j];
+            }
+        }
+        barrier();
+        if (more) {
+            storeTile(k0 + BK);
+            barrier();
+        }
+    }
+
+    uint mpad = (pc.m + 63u) & ~63u;
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        uint r = wgRow + (i < 4u ? tr * 4u + i : 64u + tr * 4u + i - 4u);
+        if (r < mpad) {
+            [[unroll]] for (uint j = 0u; j < TNV; j++) {
+                c4[(r * pc.n + wgCol + j * 64u + tc * 4u) >> 2u] = acc[i][j];
+            }
+        }
+    }
+}

@@ -664,6 +664,7 @@ impl Backend for CpuBackend {
             coopmat_f8: None,
             i8: true,
             i8_dot: false,
+            i8_dot_fast: false,
             coopmat_i8: None,
             bf16: false,
             coopmat_bf16: None,

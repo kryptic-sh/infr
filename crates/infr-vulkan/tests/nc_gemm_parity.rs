@@ -450,3 +450,105 @@ fn nc_fma_gemm_parity_and_determinism() {
     // Non-zero element base (a bf16 fused-QKV slice / streamed-slot offset rides `w_base`).
     run_fma(&be, DType::Bf16, K);
 }
+
+#[allow(clippy::too_many_arguments)]
+fn run_gcn(be: &VulkanBackend, dt: DType, bn: usize, m: usize, k: usize, n: usize, w_base: usize) {
+    let label = format!("{dt:?} gcn t{bn} m{m} k{k} n{n} w_base{w_base}");
+    let bank = synth_bank(dt, w_base + n * k, 0x9c4 ^ dt as u64 ^ (k * n) as u64);
+    let w_host = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
+    let padded = pad_to_u32_align(&bank);
+    let w = be.alloc(padded.len(), BufferUsage::Weights).unwrap();
+    be.upload(w.as_ref(), &padded).unwrap();
+
+    let x: Vec<f32> = (0..m * k)
+        .map(|i| (i as f32 * 0.13).sin() * 0.2 - 0.01)
+        .collect();
+    let xbuf = be.alloc(m * k * 4, BufferUsage::Activations).unwrap();
+    be.upload(xbuf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    let mpad = m.div_ceil(64) * 64;
+    // One spare row past the padded range catches an epilogue overrun.
+    let outs: Vec<_> = (0..3)
+        .map(|_| {
+            let b = be
+                .alloc((mpad + 1) * n * 4, BufferUsage::Activations)
+                .unwrap();
+            be.upload(b.as_ref(), &vec![0u8; (mpad + 1) * n * 4])
+                .unwrap();
+            b
+        })
+        .collect();
+    let rec = be.recorder().unwrap();
+    for out in &outs {
+        rec.matmul_gcn(
+            dt,
+            bn,
+            xbuf.as_ref(),
+            w.as_ref(),
+            w_base,
+            out.as_ref(),
+            m,
+            k,
+            n,
+        );
+    }
+    rec.finish().unwrap();
+
+    let download = |b: &dyn Buffer| {
+        let mut v = vec![0f32; (mpad + 1) * n];
+        be.download(b, bytemuck::cast_slice_mut(&mut v)).unwrap();
+        v
+    };
+    let got = download(outs[0].as_ref());
+    assert!(
+        got[mpad * n..].iter().all(|v| *v == 0.0),
+        "{label}: wrote past the padded row range"
+    );
+    for (run, out) in outs.iter().enumerate().skip(1) {
+        let other = download(out.as_ref());
+        let ndiff = got[..m * n]
+            .iter()
+            .zip(&other)
+            .filter(|(p, q)| p != q)
+            .count();
+        assert_eq!(ndiff, 0, "{label}: nondeterministic — dispatch 0 vs {run}");
+    }
+    for r in 0..m {
+        for o in 0..n {
+            let want: f32 = w_host[w_base + o * k..w_base + (o + 1) * k]
+                .iter()
+                .zip(&x[r * k..(r + 1) * k])
+                .map(|(a, b)| a * b)
+                .sum();
+            let g = got[r * n + o];
+            assert!(
+                g.is_finite() && (g - want).abs() < 1e-3 + 1e-3 * want.abs(),
+                "{label}: mismatch at row {r} col {o}: got {g} want {want}"
+            );
+        }
+    }
+    println!("{label}: OK");
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn nc_gcn_gemm_parity_and_determinism() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    for dt in [DType::Q4K, DType::Q6K] {
+        for bn in [64, 128] {
+            // k=768 gives 3 blocks per row, so Q6_K columns alternate 2-byte block alignment.
+            for (m, k, n) in [
+                (2, 256, 128),
+                (100, 512, 128),
+                (130, 768, 256),
+                (512, 1024, 256),
+            ] {
+                run_gcn(&be, dt, bn, m, k, n, 0);
+            }
+            run_gcn(&be, dt, bn, 70, 768, 128, 256);
+        }
+    }
+}

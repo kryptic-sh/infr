@@ -1180,6 +1180,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_FLASH_SPLITS",
         "INFR_FLASH_STAGE",
         "INFR_FULLBARRIER",
+        "INFR_GCN_TIER",
         "INFR_GEMM_DIRECT_A",
         "INFR_GEMM_WIDE_TILE",
         "INFR_GEMV_RM",

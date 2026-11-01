@@ -15,6 +15,10 @@ the `infr` inference engine. The top-level project overview lives in the root
   TOML file format and lookup order, `--set`, and a per-section walkthrough of
   what is tunable. Start here before reaching for an `INFR_*` variable.
 
+- [legacy-gpus.md](legacy-gpus.md) — this fork's focus: older and lower-end
+  Vulkan GPUs (AMD GCN / Polaris as the baseline). What changes on them, the
+  switches, serving tips for 8 GB cards, and measured results.
+
 ## Performance
 
 Everything performance-related lives under **[perf/](perf/README.md)** — start

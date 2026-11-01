@@ -146,6 +146,10 @@ mrow = true
 # K-quant/Q4_0 FMA tier for older Vulkan GPUs (GCN4/Polaris and other pre-coopmat
 # parts without fast int8 dot). Unset = auto (on when int8 dot is emulated).
 # kq_fma_tier = true
+# Wave64-native subgroup decode GEMV (GCN4/Polaris wave64-only devices run one full
+# wave64 per workgroup with plain subgroup ops instead of emulated 32-lane halves).
+# Unset = auto (on for wave64-only devices, inert elsewhere).
+wave64_native = true
 moe_small_m = 8 # clamped to 0..=64 by the accessor
 
 # Attention.

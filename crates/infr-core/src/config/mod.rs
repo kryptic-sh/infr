@@ -78,7 +78,7 @@ cfg_struct! {
         /// `INFR_UBATCH_PARALLEL`: prefill chunk for a sequence sharing the GPU (`serve -np N`).
         ubatch_parallel: usize = 256,
         /// `INFR_SUBMIT_DISPATCHES`: submit-splitter cap (`0` = never split). `None` = the
-        /// measured `initial_submit_dispatch_cap(integrated)` default.
+        /// measured `initial_submit_dispatch_cap(integrated, slow)` default.
         submit_dispatches: Option<usize> = None,
         /// `INFR_GPU_WAIT_TIMEOUT_MS`: how long one host wait on GPU work may take before the
         /// backend gives up, reports the submit it was waiting on and refuses further work

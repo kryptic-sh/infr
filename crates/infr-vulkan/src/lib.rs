@@ -344,6 +344,8 @@ struct VulkanShared {
     /// forced onto it by `kernels.vulkan.force_wave64`. Every pipeline pins subgroup 64 and sets
     /// `shaders/wave64.glsl`'s `W64`, which gives the wave32 kernels 32-lane virtual subgroups.
     wave64: bool,
+    /// No matrix units and no fast int8 dot: seeds the submit splitter even on a discrete GPU.
+    slow_device: bool,
     /// Set once the int8 coopmat accumulator-layout known-answer probe has run on this device:
     /// `true` = this driver lays the fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
     /// UNSET when the probe was never run, which is every default run — the tier it guards is
@@ -429,6 +431,8 @@ struct VulkanShared {
     /// from measurement after every forward (`infr_core::submit_cap_from_measurement`), so the
     /// bound tracks whatever the device actually is rather than a table of magic numbers.
     submit_dispatch_cap: AtomicUsize,
+    /// Cap is only a `slow_device` seed: decode ignores it until a measured forward tightens it.
+    split_prefill_only: AtomicBool,
     /// `device.submit_dispatches = 0` (`INFR_SUBMIT_DISPATCHES=0`) was configured: the splitter
     /// is OFF for the life of the backend, and `observe_forward` never arms it. The variable's
     /// documented meaning ("0 = never split — the kill switch if this ever misjudges a device");
@@ -2720,10 +2724,13 @@ impl VulkanBackend {
         // (`ConfigError::Env` renders as `INFR_SUBMIT_DISPATCHES: expected a dispatch count …`).
         // A configured 0 is the kill switch: never split, and never let a measurement arm it.
         let submit_split_disabled = cfg.device.submit_dispatches == Some(0);
-        let submit_dispatch_cap = cfg
-            .device
-            .submit_dispatches
-            .unwrap_or_else(|| infr_core::initial_submit_dispatch_cap(caps.integrated));
+        let slow_device =
+            wave64 || (!caps.f16_coopmat() && !device_probe.dot4x8_signed_accelerated);
+        let submit_dispatch_cap = cfg.device.submit_dispatches.unwrap_or_else(|| {
+            infr_core::initial_submit_dispatch_cap(caps.integrated, slow_device)
+        });
+        let split_prefill_only =
+            cfg.device.submit_dispatches.is_none() && !caps.integrated && slow_device;
         // Integrated GPUs run a DIFFERENT shape of forward (smaller prefill chunk, and the whole
         // pass split across several submits so no single command buffer can trip the GPU's hang
         // watchdog), so say so out loud: it is the first thing to check when an iGPU run hangs or
@@ -2851,6 +2858,7 @@ impl VulkanBackend {
                 kernel_limits: crate::caps::KernelLimits::of(&props.limits),
                 rte_f16: AtomicBool::new(false),
                 wave64,
+                slow_device,
                 i8cm_layout_ok: OnceLock::new(),
                 push_descriptor,
                 external_memory_fd,
@@ -2870,6 +2878,7 @@ impl VulkanBackend {
                 static_executes: AtomicU64::new(0),
                 arena_barriers: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
+                split_prefill_only: AtomicBool::new(split_prefill_only),
                 submit_split_disabled,
                 segment_ts_period,
                 tuning: tuned,
@@ -3179,6 +3188,15 @@ impl VulkanBackend {
         self.shared.submit_dispatch_cap.load(Ordering::Relaxed)
     }
 
+    /// The cap for decode recordings and chains: unlimited while the cap is only a slow-device seed.
+    pub(crate) fn decode_submit_cap(&self) -> usize {
+        if self.shared.split_prefill_only.load(Ordering::Relaxed) {
+            0
+        } else {
+            self.submit_dispatch_cap()
+        }
+    }
+
     /// Start timing one forward for the submit splitter — see [`ForwardClock`].
     pub(crate) fn forward_clock(&self) -> ForwardClock {
         ForwardClock {
@@ -3206,6 +3224,9 @@ impl VulkanBackend {
             self.shared
                 .submit_dispatch_cap
                 .store(next, Ordering::Relaxed);
+            self.shared
+                .split_prefill_only
+                .store(false, Ordering::Relaxed);
             // SAY IT OUT LOUD when a never-split device starts splitting. This transition is
             // latched (the cap only ratchets down) and it is decided by ONE sample, so a slow
             // forward permanently changes the submit structure of every later forward in the
@@ -4596,7 +4617,7 @@ impl Backend for VulkanBackend {
     /// device that never splits (every discrete GPU) keeps the unbounded default, and the tuned
     /// chained-decode fast path is untouched.
     fn max_decode_chain(&self) -> usize {
-        if self.submit_dispatch_cap() == 0 {
+        if self.decode_submit_cap() == 0 {
             usize::MAX
         } else {
             1
@@ -5566,7 +5587,7 @@ mod tests {
     }
 
     /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides the measured initial submit
-    /// cap, `0` meaning "never split"; unset keeps `initial_submit_dispatch_cap(integrated)`.
+    /// cap, `0` meaning "never split"; unset keeps `initial_submit_dispatch_cap(integrated, slow)`.
     /// A configured 0 is also a kill switch: a forward that would arm the splitter does not.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
@@ -5689,7 +5710,7 @@ mod tests {
         let integrated = dflt.caps().integrated;
         assert_eq!(
             dflt.submit_dispatch_cap(),
-            infr_core::initial_submit_dispatch_cap(integrated)
+            infr_core::initial_submit_dispatch_cap(integrated, dflt.shared.slow_device)
         );
         drop(dflt);
         assert_eq!(build(Some(7)).submit_dispatch_cap(), 7);

@@ -41,6 +41,9 @@ fn hash_spv(spv: &[u32]) -> u64 {
     h.finish()
 }
 
+/// `constant_id` of `W64` in `shaders/wave64.glsl`.
+pub(crate) const WAVE64_SPEC_ID: u32 = 1000;
+
 /// Build a kernel, PANICKING on any failure — the surface every production dispatch path uses (see
 /// [`try_make_compute_kernel`] for the fallible one and for why the panics read the way they do).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -55,6 +58,7 @@ pub(crate) fn make_compute_kernel(
     push_descriptor: bool,
     max_push_constants: u32,
     rte_f16: bool,
+    wave64: bool,
 ) -> ComputeKernel {
     try_make_compute_kernel(
         device,
@@ -67,6 +71,7 @@ pub(crate) fn make_compute_kernel(
         push_descriptor,
         max_push_constants,
         rte_f16,
+        wave64,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -95,6 +100,7 @@ pub(crate) fn try_make_compute_kernel(
     push_descriptor: bool,
     max_push_constants: u32,
     rte_f16: bool,
+    wave64: bool,
 ) -> Result<ComputeKernel> {
     // The device's real `maxPushConstantsSize` — Vulkan only GUARANTEES 128 bytes, and every push
     // block here was sized against that floor by inspection. Checked before the layout is built so
@@ -171,7 +177,19 @@ pub(crate) fn try_make_compute_kernel(
         .stage(vk::ShaderStageFlags::COMPUTE)
         .module(shader)
         .name(entry);
-    if let Some(sz) = required_sg {
+    let w64_entry = vk::SpecializationMapEntry::default()
+        .constant_id(WAVE64_SPEC_ID)
+        .offset(0)
+        .size(std::mem::size_of::<vk::Bool32>());
+    let w64_data = vk::TRUE.to_ne_bytes();
+    let w64_spec = vk::SpecializationInfo::default()
+        .map_entries(std::slice::from_ref(&w64_entry))
+        .data(&w64_data);
+    if wave64 {
+        // Pin every pipeline to 64 without REQUIRE_FULL_SUBGROUPS (local_size 32 kernels can't meet it).
+        req_sz = req_sz.required_subgroup_size(64);
+        stage = stage.specialization_info(&w64_spec).push_next(&mut req_sz);
+    } else if let Some(sz) = required_sg {
         req_sz = req_sz.required_subgroup_size(sz);
         stage = stage
             .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
@@ -392,6 +410,7 @@ impl VulkanBackend {
                 self.shared
                     .rte_f16
                     .load(std::sync::atomic::Ordering::Relaxed),
+                self.shared.wave64,
             )
         });
         drop(map);

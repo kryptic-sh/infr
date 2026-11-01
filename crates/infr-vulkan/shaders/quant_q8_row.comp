@@ -22,6 +22,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_control_flow_attributes : require
+#include "wave64.glsl"
 
 #ifndef SG
 #define SG 32

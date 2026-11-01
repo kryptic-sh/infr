@@ -3775,6 +3775,7 @@ mod tests {
     fn attn_decode_reduction_is_not_clustered() {
         const OP_GROUP_NON_UNIFORM_FADD: u16 = 350;
         const REDUCE: u32 = 0;
+        const CLUSTERED_REDUCE: u32 = 3;
         // A SPIR-V module is a 5-word header then a stream of instructions; word 0 of each is
         // (wordcount << 16) | opcode.
         fn reduce_ops(spv: &[u32]) -> Vec<u32> {
@@ -3813,8 +3814,11 @@ mod tests {
                 !ops.is_empty(),
                 "{name}: found no OpGroupNonUniformFAdd at all — this check matched nothing"
             );
+            // Each ClusteredReduce must be the wave64.glsl twin of a plain Reduce (dead unless W64).
+            let reduces = ops.iter().filter(|&&o| o == REDUCE).count();
+            let clustered = ops.iter().filter(|&&o| o == CLUSTERED_REDUCE).count();
             assert!(
-                ops.iter().all(|&o| o == REDUCE),
+                reduces + clustered == ops.len() && clustered <= reduces,
                 "{name}: subgroup float add is not a plain Reduce (operations {ops:?}); \
                  3 = ClusteredReduce, which changes the reduction tree and breaks bit-identity"
             );

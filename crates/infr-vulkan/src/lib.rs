@@ -280,6 +280,8 @@ struct VulkanShared {
     /// and only where the driver was OBSERVED to round an f32→f16 conversion some other way — see
     /// [`VulkanBackend::arm_f16_rounding`].
     rte_f16: AtomicBool,
+    /// Wave64-only device (GCN): pipelines pin 64 and `shaders/wave64.glsl` emulates wave32 halves.
+    wave64: bool,
     /// Set once the int8 coopmat accumulator-layout known-answer probe has run on this device:
     /// `true` = this driver lays the fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
     /// UNSET when the probe was never run, which is every default run — the tier it guards is
@@ -2181,7 +2183,9 @@ impl VulkanBackend {
         let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
         // Float controls (core in Vulkan 1.2) say whether a shader may declare its f16 rounding.
         let mut float_controls = vk::PhysicalDeviceFloatControlsProperties::default();
+        let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
+            .push_next(&mut subgroup_props)
             .push_next(&mut sgsize_props)
             .push_next(&mut maint3_props)
             .push_next(&mut float_controls);
@@ -2208,23 +2212,35 @@ impl VulkanBackend {
             (0, 0)
         };
 
-        // infr's Vulkan compute kernels are written for a PINNED subgroup size of 32 (RDNA3 wave32):
-        // rmsnorm / softmax / quant_q8 / the coopmat GEMM / attention QK+PV / flash / DeltaNet all
-        // dispatch via `kernel_sg(..., 32)`, which sets `requiredSubgroupSize=32` and FAILS pipeline
-        // creation on any device that can't provide a size-32 subgroup (no `subgroup_size_control`,
-        // or 32 outside `[minSubgroupSize, maxSubgroupSize]`). rmsnorm/softmax run on EVERY forward
-        // and are NOT coopmat-gated, so gating only the coopmat caps wouldn't prevent the crash —
-        // the whole backend needs 32. Refuse the Vulkan backend here (a clean Err, not a mid-forward
-        // panic) so `gpu_available()`/the seam falls back to CPU. Every real target — RADV (32-64),
-        // NVIDIA (32), Intel Arc (…-32) — provides 32; this only rejects exotic no-32 /
-        // no-size-control devices (older/mobile/llvmpipe), which can't run these wave32 kernels
-        // correctly anyway.
-        if !(has_sgsize && subgroup_min <= 32 && 32 <= subgroup_max) {
+        // Kernels are written for wave32; wave64-only devices run them as 32-lane halves (wave64.glsl).
+        let pin32 = has_sgsize && subgroup_min <= 32 && 32 <= subgroup_max;
+        let wave64 = !pin32 && has_sgsize && subgroup_min <= 64 && 64 <= subgroup_max;
+        if !pin32 && !wave64 {
             return Err(be(format!(
-                "infr's Vulkan backend requires a pinnable subgroup size of 32 (wave32); this \
+                "infr's Vulkan backend requires a pinnable subgroup size of 32 or 64; this \
                  device's subgroup range is [{subgroup_min}, {subgroup_max}] and \
                  subgroup_size_control={has_sgsize} — falling back to another backend"
             )));
+        }
+        // wave64.glsl puts clustered and shuffle ops in every module, live or not.
+        let need_ops = vk::SubgroupFeatureFlags::BASIC
+            | vk::SubgroupFeatureFlags::ARITHMETIC
+            | vk::SubgroupFeatureFlags::CLUSTERED
+            | vk::SubgroupFeatureFlags::SHUFFLE;
+        if !subgroup_props
+            .supported_stages
+            .contains(vk::ShaderStageFlags::COMPUTE)
+            || !subgroup_props.supported_operations.contains(need_ops)
+        {
+            return Err(be(format!(
+                "infr's Vulkan backend requires basic/arithmetic/clustered/shuffle subgroup ops in \
+                 compute; this device reports operations {:?} in stages {:?} — falling back to \
+                 another backend",
+                subgroup_props.supported_operations, subgroup_props.supported_stages
+            )));
+        }
+        if wave64 {
+            tracing::info!("[infr] wave64-only device: running wave32 kernels as 32-lane halves");
         }
 
         // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
@@ -2510,6 +2526,7 @@ impl VulkanBackend {
                 max_mem_alloc_size,
                 max_push_constants: props.limits.max_push_constants_size,
                 rte_f16: AtomicBool::new(false),
+                wave64,
                 i8cm_layout_ok: OnceLock::new(),
                 push_descriptor,
                 external_memory_fd,
@@ -2590,6 +2607,7 @@ impl VulkanBackend {
             self.shared.push_descriptor.is_some(),
             self.shared.max_push_constants,
             false,
+            self.shared.wave64,
         )?;
         let run = || -> Result<bool> {
             let src = self.alloc(std::mem::size_of_val(&input), BufferUsage::Staging)?;
@@ -2702,6 +2720,7 @@ impl VulkanBackend {
             self.shared.push_descriptor.is_some(),
             self.shared.max_push_constants,
             self.shared.rte_f16.load(Ordering::Relaxed),
+            self.shared.wave64,
         )?;
         let run = || -> Result<Vec<i32>> {
             let (a, b) = crate::caps::frag_probe_inputs();

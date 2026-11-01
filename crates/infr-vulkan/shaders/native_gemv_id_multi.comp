@@ -19,6 +19,7 @@
 // mul_mat_vec_q.comp; see native_gemv_mrow.comp for why the m=1 native_gemv keeps its tree.
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#include "wave64.glsl"
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // `rows`: total dispatched-should-be workgroup count is rows*n_used*out_f — needed ONLY to bound-

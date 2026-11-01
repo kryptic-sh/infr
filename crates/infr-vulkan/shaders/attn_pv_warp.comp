@@ -10,6 +10,7 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_control_flow_attributes : require
+#include "wave64.glsl"
 
 const uint BM = 64u;
 const uint BN = 128u;

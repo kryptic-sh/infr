@@ -23,6 +23,7 @@
 // should match that kernel's speed while keeping bf16's accuracy).
 #ifdef BF16CM
 #extension GL_EXT_bfloat16 : require
+#include "wave64.glsl"
 #define CMTYPE bfloat16_t
 #else
 #define CMTYPE float16_t

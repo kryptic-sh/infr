@@ -20,6 +20,7 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "wave64.glsl"
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 

@@ -11,6 +11,7 @@
 // cheap occupancy: vd=128 / COLS=16 → nv·8 workgroups. LDS is tiny (~7KB) — many wgs per CU.
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#include "wave64.glsl"
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 

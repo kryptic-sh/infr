@@ -9,6 +9,7 @@
 // single subgroupAdd — no LDS, no barriers. Grid is rows·nk (8192 at rows=512, nk=16), so this pass
 // is embarrassingly parallel and effectively free next to the scan.
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#include "wave64.glsl"
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 

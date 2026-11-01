@@ -2887,3 +2887,33 @@ these templates with Python's Jinja2; not verified against a real template that
 prints a bool) and change the test's expectation, or pin `~2.21` in
 `[workspace.dependencies]` until someone checks what HF and llama.cpp's minja
 actually emit.
+
+### B82 — EXL3 quant support (2026-11-02)
+
+**Tag:** user request · **Needs:** a spike (format decode + benchmark)
+
+EXL3 (the Trellis quantizer from
+[exllamav3](https://github.com/turboderp/exllamav3)) is the current
+quality-per-byte leader around 3 bits — directly relevant to this fork's
+8 GB cards, where a 7.5 B-parameter model at Q4_0 already fills 5 GB before
+KV cache. Reference weights to try first:
+`turboderp/Qwen3-8B-exl3` on Hugging Face.
+
+What landing it in infr would take (none of it started):
+
+- a new `DType` plus GGUF tensor-dtype plumbing (`infr-gguf`, `infr-core`
+  quant lists, `moe_mmq_ok`-style capability gates),
+- a `dqblk` arm in `native_decode.glsl` (EXL3's trellis decode shares
+  nothing with the K-quant scale/min layout, so it is a fresh decode
+  path, not a parameter tweak — read exllamav3's quantizer source before
+  designing it),
+- the codebook tables uploaded once per pipeline (the grids precedent in
+  `native_grids.glsl` applies — no per-thread const arrays),
+- `weight_dequant_parity`-style host-vs-GPU parity plus an oracle seeded
+  from the Qwen3-8B EXL3 file.
+
+Suggested order: port the scalar trellis decode to Rust first and score it
+against llama.cpp's EXL3 perplexity on wikitext-2 (correctness baseline),
+then write the shader arm, then benchmark RX580 tok/s against the Q4_K_M
+and Q4_0 files of the same model. Parked until the QAT-vs-Unsloth
+comparison and the llama.cpp gap work above it in the queue are done.

@@ -5,6 +5,15 @@
 Pure-Rust LLM inference engine. Vulkan-first, built to run on any mainstream
 GPU.
 
+> **This is the [KessokuNet](https://github.com/KessokuNet/infr) fork of
+> [kryptic-sh/infr](https://github.com/kryptic-sh/infr).** It focuses on
+> optimizing and backporting infr to older and lower-end Vulkan GPUs — AMD
+> GCN / Polaris (RX 470/480/570/580) is the baseline target: wave64-only
+> devices, no cooperative matrix, no hardware int8 dot. Fixes that are not
+> specific to those GPUs are meant to go upstream. See
+> [docs/legacy-gpus.md](docs/legacy-gpus.md) for what changed and the measured
+> results.
+
 > Early WIP. The only non-Rust parts are the GPU driver calls (Vulkan via `ash`)
 > and the compute shaders (SPIR-V).
 

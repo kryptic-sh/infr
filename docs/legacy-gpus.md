@@ -27,6 +27,7 @@ GPUs that have it.
 |---|---|---|
 | `INFR_KQ_FMA_TIER=0\|1` | `kernels.vulkan.kq_fma_tier` | Force the `kq_fma` prefill GEMM off/on. |
 | `INFR_KQ_FMA_GEMV=0\|1` | `kernels.vulkan.kq_fma_gemv` | Force the `kq_fma` decode GEMV off/on. |
+| `INFR_WAVE64_NATIVE=0\|1` | `kernels.vulkan.wave64_native` | Run the subgroup decode GEMV at its native 64-lane width instead of emulated 32-lane halves (default on; inert off wave64 hardware). |
 | `INFR_SUBMIT_DISPATCHES=N` | `device.submit_dispatches` | Dispatches per submit (`0` = never split). |
 
 ## Serving tips (8 GB cards)

@@ -357,7 +357,7 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
     ) -> ComputeKernel {
-        self.kernel_inner(name, spv, n_buf, push_size, None)
+        self.kernel_inner(name, spv, n_buf, push_size, None, self.shared.wave64)
     }
 
     /// Like `kernel`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
@@ -377,7 +377,22 @@ impl VulkanBackend {
             n_buf,
             push_size,
             (sg_size > 0).then_some(sg_size),
+            self.shared.wave64,
         )
+    }
+
+    /// Wave64-NATIVE subgroup kernel: pins 64 WITHOUT the W64 wave32-halves emulation, so the
+    /// `-DSG=64` SPIR-V runs as plain full-wave subgroup ops. Only valid where 64 is pinnable
+    /// (the caller gates on the backend's wave64 flag); anywhere else it would fail pipeline
+    /// creation exactly the way an unpinnable `kernel_sg` size does.
+    pub(crate) fn kernel_sg64_native(
+        &self,
+        name: &'static str,
+        spv: &[u32],
+        n_buf: usize,
+        push_size: u32,
+    ) -> ComputeKernel {
+        self.kernel_inner(name, spv, n_buf, push_size, Some(64), false)
     }
 
     /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]. The build runs UNDER the
@@ -389,7 +404,7 @@ impl VulkanBackend {
     /// A build that fails still panics (this surface is infallible until B98 threads a `Result`
     /// through), but only after the lock is released: a panic while holding it would poison the
     /// cache, and every later kernel request in the process would panic on the poison instead of
-    /// building.
+    /// building.)
     fn kernel_inner(
         &self,
         name: &'static str,
@@ -397,6 +412,7 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
         required_sg: Option<u32>,
+        wave64: bool,
     ) -> ComputeKernel {
         let mut map = self.shared.kernels.lock().unwrap();
         let cached = map.get(name).copied();

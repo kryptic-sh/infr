@@ -15,6 +15,7 @@
 // fast path keeps, not a runtime branch).
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#include "wave64.glsl"
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // -DPAGED extends the push constant with the arena's 64-bit base address (split lo/hi to dodge the

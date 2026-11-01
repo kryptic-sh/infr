@@ -11,6 +11,7 @@
 // Requires requiredSubgroupSize=32 (wave32 -> 8 subgroups).
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#include "wave64.glsl"
 
 #define NTHREAD 256u
 #define NSGMAX 8

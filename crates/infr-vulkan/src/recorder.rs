@@ -11578,6 +11578,7 @@ mod tests {
             be.shared.push_descriptor.is_some(),
             floor,
             false,
+            be.shared.wave64,
         )
         .err()
         .expect("a 1024-wide workgroup on a 128-wide device must be refused")

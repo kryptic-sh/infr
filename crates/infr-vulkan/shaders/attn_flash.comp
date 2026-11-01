@@ -15,6 +15,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
+#include "wave64.glsl"
 
 layout(local_size_x = (BM_TILE * 2), local_size_y = 1, local_size_z = 1) in;
 

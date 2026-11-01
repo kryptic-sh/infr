@@ -2,6 +2,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_control_flow_attributes : require
+#include "wave64.glsl"
 // llama-style REASSOCIATION-TOLERANT decode GEMV y = x·Wᵀ for the latency-STARVED low-out_f
 // projection shapes (q/k/v/o/down, out_f ~1024..8192). Structure ported from llama.cpp's
 // mul_mat_vec_q: one WAVE32 SUBGROUP per NR-output group, NO shared memory, NO barriers —

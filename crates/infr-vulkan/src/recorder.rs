@@ -1650,6 +1650,14 @@ impl<'a> Recorder<'a> {
         self.sgp() == 16
     }
 
+    /// Whether the decode GEMV family should use its `-DSG=64` NATIVE twins: wave64-only
+    /// devices (GCN) with `kernels.vulkan.wave64_native` on run one full wave64 per workgroup
+    /// with plain subgroup ops instead of 32-lane halves emulated through `subgroupClusteredAdd`.
+    /// False everywhere else (non-wave64 devices never select the SG=64 builds).
+    fn sg64(&self) -> bool {
+        self.be.shared.wave64 && self.vk().wave64_native
+    }
+
     /// `y[rows,out] = x[rows,in] · Wᵀ` (W stored `[out,in]`). Resident-BDA route: `w.device_addr()`
     /// `Some` means `w` is a sub-tensor of a `bufferDeviceAddress` arena block (see
     /// `Buffer::device_addr`'s doc) — always fork to the `-DSTREAMED` twin here rather than binding
@@ -3475,9 +3483,18 @@ impl<'a> Recorder<'a> {
     ) {
         assert_native_k("linear_native_sg_at", in_f);
         self.label_gemv("gemv_sg_streamed", 1, in_f, out_f);
-        let (name, spv) = crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
-            .expect("native sg streamed spv");
-        let k = self.be.kernel_sg(name, spv, 3, 24, self.sgp());
+        let (name, spv) = if self.sg64() {
+            crate::gemm::native_sg64_streamed_build_spv(dtype, false, nr)
+                .expect("native sg64 streamed spv")
+        } else {
+            crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
+                .expect("native sg streamed spv")
+        };
+        let k = if self.sg64() {
+            self.be.kernel_sg64_native(name, spv, 3, 24)
+        } else {
+            self.be.kernel_sg(name, spv, 3, 24, self.sgp())
+        };
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&1u32.to_ne_bytes()); // rows: SG serves m=1 decode only
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -3935,10 +3952,17 @@ impl<'a> Recorder<'a> {
         // Reassociation-tolerant subgroup route — precedence over RM, mirrors linear_add_native.
         if rows == 1 {
             if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
-                if let Some((name, spv)) =
+                let sg = if self.sg64() {
+                    crate::gemm::native_sg64_streamed_build_spv(dtype, true, nr)
+                } else {
                     crate::gemm::native_sg_streamed_build_spv(dtype, true, nr, self.sg16())
-                {
-                    let k = self.be.kernel_sg(name, spv, 4, 24, self.sgp());
+                };
+                if let Some((name, spv)) = sg {
+                    let k = if self.sg64() {
+                        self.be.kernel_sg64_native(name, spv, 4, 24)
+                    } else {
+                        self.be.kernel_sg(name, spv, 4, 24, self.sgp())
+                    };
                     self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(nr));
                     return;
                 }

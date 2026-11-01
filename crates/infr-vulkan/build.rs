@@ -3383,6 +3383,14 @@ fn main() {
         "native_mmv_mw",
         "quant_q8_row",
     ];
+    // Subgroup-64 NATIVE twins for wave64-only devices (GCN, EXL3 #6): every build of these
+    // SOURCES also gets a `<stem>_sg64` variant compiled with -DSG=64 — one full wave64 per
+    // workgroup with plain (un-emulated) subgroup ops (`W64=false` at pipeline time, so the
+    // wave64.glsl macros fold back to the native builtins). Selected by
+    // `kernels.vulkan.wave64_native` on wave64 devices; never created elsewhere. Tight scope:
+    // only the dense Q6_K decode GEMV — the id/multi and mmv/quant families keep the emulated
+    // path until a measurement says otherwise.
+    const SG64_SOURCES: &[&str] = &["native_gemv_sg"];
     let builds: Vec<(String, String, Vec<String>)> = builds
         .iter()
         .flat_map(|(src_stem, dst_stem, defines)| {
@@ -3391,16 +3399,26 @@ fn main() {
                 dst_stem.to_string(),
                 defines.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
             );
+            let mut out = vec![base.clone()];
             if SG16_SOURCES.contains(src_stem) {
                 let mut sg_defines = base.2.clone();
                 sg_defines.push("-DSG=16".to_string());
-                vec![
-                    base.clone(),
-                    (src_stem.to_string(), format!("{dst_stem}_sg16"), sg_defines),
-                ]
-            } else {
-                vec![base]
+                out.push((
+                    src_stem.to_string(),
+                    format!("{dst_stem}_sg16"),
+                    sg_defines,
+                ));
             }
+            if SG64_SOURCES.contains(src_stem) {
+                let mut sg_defines = base.2.clone();
+                sg_defines.push("-DSG=64".to_string());
+                out.push((
+                    src_stem.to_string(),
+                    format!("{dst_stem}_sg64"),
+                    sg_defines,
+                ));
+            }
+            out
         })
         .collect();
     // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a

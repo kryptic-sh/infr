@@ -5116,7 +5116,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
             None => {
@@ -5134,7 +5134,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
         }
@@ -5177,7 +5177,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
             None => {
@@ -5189,7 +5189,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
         }
@@ -5230,7 +5230,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
             None => {
@@ -5242,7 +5242,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
         }
@@ -6261,7 +6261,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
             None => {
@@ -6273,7 +6273,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
         }
@@ -6319,7 +6319,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
             None => {
@@ -6334,7 +6334,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads) as u32,
+                    (t * n_heads).div_ceil(64) as u32,
                 );
             }
         }

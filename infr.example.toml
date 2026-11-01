@@ -143,6 +143,9 @@ bf16_coopmat = false
 gemm_warp = true
 mmv = true
 mrow = true
+# K-quant FMA tier for older Vulkan GPUs (GCN4/Polaris and other pre-coopmat
+# parts without fast int8 dot). Unset = auto (on when int8 dot is emulated).
+# kq_fma_tier = true
 moe_small_m = 8 # clamped to 0..=64 by the accessor
 
 # Attention.

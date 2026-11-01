@@ -452,8 +452,8 @@ fn nc_fma_gemm_parity_and_determinism() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_gcn(be: &VulkanBackend, dt: DType, bn: usize, m: usize, k: usize, n: usize, w_base: usize) {
-    let label = format!("{dt:?} gcn t{bn} m{m} k{k} n{n} w_base{w_base}");
+fn run_kq_fma(be: &VulkanBackend, dt: DType, bn: usize, m: usize, k: usize, n: usize, w_base: usize) {
+    let label = format!("{dt:?} kq_fma t{bn} m{m} k{k} n{n} w_base{w_base}");
     let bank = synth_bank(dt, w_base + n * k, 0x9c4 ^ dt as u64 ^ (k * n) as u64);
     let w_host = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
     let padded = pad_to_u32_align(&bank);
@@ -480,7 +480,7 @@ fn run_gcn(be: &VulkanBackend, dt: DType, bn: usize, m: usize, k: usize, n: usiz
         .collect();
     let rec = be.recorder().unwrap();
     for out in &outs {
-        rec.matmul_gcn(
+        rec.matmul_kq_fma(
             dt,
             bn,
             xbuf.as_ref(),
@@ -532,7 +532,7 @@ fn run_gcn(be: &VulkanBackend, dt: DType, bn: usize, m: usize, k: usize, n: usiz
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
-fn nc_gcn_gemm_parity_and_determinism() {
+fn nc_kq_fma_gemm_parity_and_determinism() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -546,9 +546,9 @@ fn nc_gcn_gemm_parity_and_determinism() {
                 (130, 768, 256),
                 (512, 1024, 256),
             ] {
-                run_gcn(&be, dt, bn, m, k, n, 0);
+                run_kq_fma(&be, dt, bn, m, k, n, 0);
             }
-            run_gcn(&be, dt, bn, 70, 768, 128, 256);
+            run_kq_fma(&be, dt, bn, 70, 768, 128, 256);
         }
     }
 }

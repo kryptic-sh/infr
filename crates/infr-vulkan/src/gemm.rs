@@ -1043,10 +1043,10 @@ pub(crate) fn native_gemm_fma_spv(
         _ => return None,
     })
 }
-/// SPIR-V (kernel-cache name + words) for the fp32 K-quant prefill GEMM (`native_gemm_gcn.comp`)
+/// SPIR-V (kernel-cache name + words) for the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`)
 /// at column tile `bn` (64 or 128); `None` for dtypes or tiles without a build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_gcn_spv(
+pub(crate) fn native_gemm_kq_fma_spv(
     dtype: infr_core::DType,
     bn: usize,
 ) -> Option<(&'static str, &'static [u32])> {
@@ -1059,15 +1059,15 @@ pub(crate) fn native_gemm_gcn_spv(
     }
     use infr_core::DType::*;
     Some(match (dtype, bn) {
-        (Q4K, 64) => spv!("native_gemm_gcn_q4k_t64"),
-        (Q4K, 128) => spv!("native_gemm_gcn_q4k_t128"),
-        (Q6K, 64) => spv!("native_gemm_gcn_q6k_t64"),
-        (Q6K, 128) => spv!("native_gemm_gcn_q6k_t128"),
+        (Q4K, 64) => spv!("native_gemm_kq_fma_q4k_t64"),
+        (Q4K, 128) => spv!("native_gemm_kq_fma_q4k_t128"),
+        (Q6K, 64) => spv!("native_gemm_kq_fma_q6k_t64"),
+        (Q6K, 128) => spv!("native_gemm_kq_fma_q6k_t128"),
         _ => return None,
     })
 }
-/// Whether `native_gemm_gcn` has a build for `dtype`.
-pub(crate) fn native_gemm_gcn_supported(dtype: infr_core::DType) -> bool {
+/// Whether `native_gemm_kq_fma` has a build for `dtype`.
+pub(crate) fn native_gemm_kq_fma_supported(dtype: infr_core::DType) -> bool {
     matches!(dtype, infr_core::DType::Q4K | infr_core::DType::Q6K)
 }
 /// SPIR-V for the non-coopmat float-weight prefill GEMM (the "fma-warp" tier, see

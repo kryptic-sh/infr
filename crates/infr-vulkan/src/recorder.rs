@@ -3058,9 +3058,9 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Arena-addressed body of [`Self::matmul_gcn`] at column tile `bn` (64 or 128).
+    /// Arena-addressed body of [`Self::matmul_kq_fma`] at column tile `bn` (64 or 128).
     #[allow(clippy::too_many_arguments)]
-    pub fn matmul_gcn_at(
+    pub fn matmul_kq_fma_at(
         &self,
         dtype: infr_core::DType,
         bn: usize,
@@ -3072,8 +3072,8 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        let (name, spv) = crate::gemm::native_gemm_gcn_spv(dtype, bn)
-            .expect("matmul_gcn_at: dtype/tile gated by native_gemm_gcn_spv");
+        let (name, spv) = crate::gemm::native_gemm_kq_fma_spv(dtype, bn)
+            .expect("matmul_kq_fma_at: dtype/tile gated by native_gemm_kq_fma_spv");
         debug_assert!(n.is_multiple_of(bn) && k.is_multiple_of(256) && w_base.is_multiple_of(256));
         self.label_gemm(name, m, k, n);
         let kern = self.be.kernel(name, spv, 3, 24);
@@ -3094,11 +3094,11 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// fp32 K-quant prefill GEMM for GPUs without fast int8 dot (`native_gemm_gcn.comp`):
+    /// fp32 K-quant prefill GEMM for GPUs without fast int8 dot (`native_gemm_kq_fma.comp`):
     /// `c = a·W[w_base]ᵀ`, Q4_K/Q6_K weights dequantized in-shader, `c` padded to
     /// `ceil(m/64)*64` rows. Requires `n % bn == 0` and `k % 256 == 0`.
     #[allow(clippy::too_many_arguments)]
-    pub fn matmul_gcn(
+    pub fn matmul_kq_fma(
         &self,
         dtype: infr_core::DType,
         bn: usize,
@@ -3112,8 +3112,8 @@ impl<'a> Recorder<'a> {
     ) {
         let arena_addr = w
             .device_addr()
-            .expect("resident-BDA weight: matmul_gcn requires a u64 BDA device address");
-        self.matmul_gcn_at(dtype, bn, a, arena_addr, w_base, c, m, k, n);
+            .expect("resident-BDA weight: matmul_kq_fma requires a u64 BDA device address");
+        self.matmul_kq_fma_at(dtype, bn, a, arena_addr, w_base, c, m, k, n);
     }
 
     /// Non-coopmat float-weight prefill GEMM (the "fma-warp" tier): `c = a·W[w_base]ᵀ`, `a` f32

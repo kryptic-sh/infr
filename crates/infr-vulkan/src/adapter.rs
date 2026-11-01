@@ -1469,19 +1469,19 @@ fn lower_op(
             // disables the WHOLE tier (both arms) for A/B against the scalar floor.
             let nc_tier =
                 gemm_ok && !be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.mmq_fallback;
-            // fp32 K-quant GEMM (`matmul_gcn`) ahead of mmq where dp4a is emulated (GCN).
-            let nc_gcn = nc_tier
+            // fp32 K-quant GEMM (`matmul_kq_fma`) ahead of mmq where dp4a is emulated.
+            let nc_kq_fma = nc_tier
                 && be_
                     .cfg()
                     .kernels
                     .vulkan
-                    .gcn_tier
+                    .kq_fma_tier
                     .unwrap_or(!be_.caps().i8_dot_fast)
-                && crate::gemm::native_gemm_gcn_supported(dt)
+                && crate::gemm::native_gemm_kq_fma_supported(dt)
                 && in_f % 256 == 0
                 && w_off % 256 == 0;
             let nc_mmq =
-                nc_tier && !nc_gcn && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
+                nc_tier && !nc_kq_fma && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
             let nc_fma =
                 nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_kernel_name(dt).is_some();
             // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
@@ -1489,7 +1489,7 @@ fn lower_op(
             // 64-row weight tile that can't be split into single input rows, so a breach on this
             // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
             // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
-            if (is_gemm || nc_gcn || nc_mmq || nc_fma)
+            if (is_gemm || nc_kq_fma || nc_mmq || nc_fma)
                 && crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
             {
                 return Err(be(format!(
@@ -1765,7 +1765,7 @@ fn lower_op(
                     }
                     Ok(())
                 })?;
-            } else if nc_gcn {
+            } else if nc_kq_fma {
                 // BN=128 only when it still gives every CU a workgroup.
                 let cu = be_.caps().compute_units.max(1) as usize;
                 let bn = if out_f % 128 == 0 && m.div_ceil(128) * (out_f / 128) >= cu {
@@ -1774,7 +1774,7 @@ fn lower_op(
                     64
                 };
                 with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-                    rec.matmul_gcn(dt, bn, xb, w, w_off, out, m, in_f, out_f);
+                    rec.matmul_kq_fma(dt, bn, xb, w, w_off, out, m, in_f, out_f);
                     Ok(())
                 })?;
             } else if nc_mmq || nc_fma {

@@ -256,9 +256,11 @@ cfg_struct! {
         mmq: bool = true,
         /// `INFR_NO_MMQ_FALLBACK` (inverted).
         mmq_fallback: bool = true,
-        /// `INFR_GCN_TIER`, TRI-state: the fp32 K-quant prefill GEMM (`native_gemm_gcn`) in the
-        /// non-coopmat tier. `None` = auto (on when int8 dot is not hardware-accelerated).
-        gcn_tier: Option<bool> = None,
+        /// `INFR_KQ_FMA_TIER`, TRI-state: the fp32 K-quant prefill GEMM tier
+        /// (`native_gemm_kq_fma`) for older Vulkan GPUs without fast int8 dot
+        /// (GCN4/Polaris and other pre-coopmat parts). `None` = auto (on when
+        /// int8 dot is emulated).
+        kq_fma_tier: Option<bool> = None,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
         /// this backwards disables the mmv tier for everyone.
         mmv: bool = true,

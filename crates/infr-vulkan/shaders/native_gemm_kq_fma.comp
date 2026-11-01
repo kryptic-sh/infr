@@ -1,5 +1,6 @@
 #version 460
 // fp32 K-quant prefill GEMM (C = A·Wᵀ, 128xBN tile) for GPUs without fast int8 dot or coopmat.
+// Validated on Polaris10 (GCN4, RX 580): Qwen pp512 206 -> 499 t/s vs emulated-dp4a MMQ.
 // -DFMT_Q4K|-DFMT_Q6K, -DBN=64|128; requires n%BN, k%256, w_base%256; no subgroup ops.
 #extension GL_EXT_control_flow_attributes : require
 

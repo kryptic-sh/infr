@@ -23,6 +23,7 @@ mod pool;
 pub mod turbo;
 
 mod dequant_row;
+pub mod exl3;
 mod kernels;
 mod moe;
 mod quant;

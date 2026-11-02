@@ -3119,15 +3119,21 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        let nr = self.kq_fma_gemv_rows(out_f);
+        let nr = self.kq_fma_gemv_rows(in_f, out_f);
         self.linear_kq_fma_nr(dtype, w, w_base, x, residual, y, in_f, out_f, nr);
     }
 
-    /// Rows per workgroup for [`Self::linear_kq_fma`]: 8, or 4 when 8 would leave fewer than
-    /// 16 single-wave workgroups per CU.
-    pub fn kq_fma_gemv_rows(&self, out_f: usize) -> usize {
+    /// Rows per workgroup for [`Self::linear_kq_fma`]. A workgroup runs `nr/4 * in_f/256` items over
+    /// 8 slots; 8 rows only when it fills the last pass clearly better than 4 and still leaves
+    /// 4 workgroups per CU.
+    pub fn kq_fma_gemv_rows(&self, in_f: usize, out_f: usize) -> usize {
         let cu = (self.be.caps().compute_units as usize).max(1);
-        if out_f.div_ceil(8) >= 16 * cu {
+        let fill = |nr: usize| {
+            let items = nr / 4 * (in_f / 256).max(1);
+            items as f64 / (items.div_ceil(8) * 8) as f64
+        };
+        let wgs8 = out_f.div_ceil(8);
+        if fill(8) >= fill(4) * 1.1 && wgs8 >= 4 * cu {
             8
         } else {
             4

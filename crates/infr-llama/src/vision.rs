@@ -39,6 +39,162 @@ use std::sync::{Arc, Mutex};
 /// the CPU encoder's attention is quadratic in patches, and 280 is the Gemma 4 default budget.
 pub const MIN_IMAGE_TOKENS: usize = 70;
 pub const MAX_IMAGE_TOKENS: usize = 1120;
+/// Bounds apply before decoding or encoding untrusted request images.
+pub use infr_chat::{MAX_IMAGE_BYTES, MAX_REQUEST_IMAGES};
+pub const MAX_IMAGE_PIXELS: u64 = 16 << 20;
+pub const MAX_REQUEST_PIXELS: u64 = 32 << 20;
+const MAX_IMAGE_DIMENSION: u32 = 16384;
+const CACHE_BYTES: usize = 32 << 20;
+
+/// Inspect dimensions without allocating a decoded image. Shared with HTTP request preflight.
+pub fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+    if bytes.len() > MAX_IMAGE_BYTES {
+        bail!("image exceeds the 16 MiB encoded size limit");
+    }
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_dimensions()
+        .context("invalid image header")?;
+    if w == 0
+        || h == 0
+        || w > MAX_IMAGE_DIMENSION
+        || h > MAX_IMAGE_DIMENSION
+        || u64::from(w) * u64::from(h) > MAX_IMAGE_PIXELS
+    {
+        bail!("image geometry {w}x{h} exceeds the dimension/pixel limit");
+    }
+    Ok((w, h))
+}
+
+fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage> {
+    image_dimensions(bytes)?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(128 << 20);
+    reader.limits(limits);
+    reader.decode().context("image decode failed")
+}
+
+/// Check the complete payload with explicit decode limits, without running the vision tower.
+pub fn validate_image(bytes: &[u8]) -> Result<()> {
+    decode_image(bytes).map(|_| ())
+}
+
+fn bounded_target_size(
+    w: usize,
+    h: usize,
+    patch: usize,
+    merge: usize,
+    n_pos: usize,
+    max_tokens: usize,
+) -> Result<(usize, usize)> {
+    if w == 0 || h == 0 || patch == 0 || merge == 0 {
+        bail!("vision: zero image/tower geometry");
+    }
+    let align = patch
+        .checked_mul(merge)
+        .ok_or_else(|| anyhow!("vision: geometry overflow"))?;
+    let grid_limit = n_pos / merge;
+    if grid_limit == 0 {
+        bail!("vision: position table cannot fit a merged patch");
+    }
+    let budget = max_tokens.clamp(MIN_IMAGE_TOKENS, MAX_IMAGE_TOKENS);
+    let (wf, hf) = (w as f64 / align as f64, h as f64 / align as f64);
+    let mut gx = wf.round().max(1.0);
+    let mut gy = hf.round().max(1.0);
+    if gx * gy > budget as f64 {
+        let scale = (budget as f64 / (wf * hf)).sqrt();
+        gx = (wf * scale).floor().max(1.0);
+        gy = (hf * scale).floor().max(1.0);
+    } else if gx * gy < MIN_IMAGE_TOKENS as f64 {
+        let scale = (MIN_IMAGE_TOKENS as f64 / (wf * hf)).sqrt();
+        gx = (wf * scale).ceil().max(1.0);
+        gy = (hf * scale).ceil().max(1.0);
+    }
+    let (mut gx, mut gy) = (
+        (gx as usize).min(grid_limit).min(budget),
+        (gy as usize).min(grid_limit).min(budget),
+    );
+    // Alignment can make the advisory minimum impossible. The ceiling and position bounds win.
+    while gx > budget / gy {
+        if gx > 1 && (gy == 1 || gx as f64 / gy as f64 > wf / hf) {
+            gx -= 1;
+        } else {
+            gy -= 1;
+        }
+    }
+    Ok((
+        gx.checked_mul(align)
+            .ok_or_else(|| anyhow!("vision: width overflow"))?,
+        gy.checked_mul(align)
+            .ok_or_else(|| anyhow!("vision: height overflow"))?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_tower_geometry(
+    n_embd: usize,
+    n_head: usize,
+    n_layer: usize,
+    patch: usize,
+    merge: usize,
+    n_embd_out: usize,
+    eps: f32,
+) -> Result<()> {
+    if [n_embd, n_head, n_layer, patch, merge, n_embd_out].contains(&0)
+        || !eps.is_finite()
+        || eps <= 0.0
+    {
+        bail!("mmproj: dimensions must be positive and normalization epsilon finite/positive");
+    }
+    if n_embd > 16384
+        || n_head > 128
+        || n_layer > 128
+        || patch > 128
+        || merge > 16
+        || n_embd_out > 65536
+    {
+        bail!("mmproj: tower dimensions exceed supported resource limits");
+    }
+    if !n_embd.is_multiple_of(n_head) || !(n_embd / n_head).is_multiple_of(4) {
+        bail!("mmproj: head dim {n_embd}/{n_head} is not a multiple of 4");
+    }
+    Ok(())
+}
+
+fn require_len(name: &str, got: usize, want: usize) -> Result<()> {
+    if got != want {
+        bail!("mmproj: {name} has {got} elements, expected {want}");
+    }
+    Ok(())
+}
+
+fn validate_tensor(g: &infr_gguf::Gguf, name: &str, shape: &[usize]) -> Result<()> {
+    let info = g
+        .tensors()
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| anyhow!("mmproj: missing tensor {name}"))?;
+    if info.shape != shape {
+        bail!("mmproj: {name} shape {:?}, expected {shape:?}", info.shape);
+    }
+    let size = match info.dtype {
+        DType::F32 => 4,
+        DType::F16 | DType::Bf16 => 2,
+        _ => bail!("mmproj: unsupported dtype for {name}"),
+    };
+    let bytes = shape
+        .iter()
+        .try_fold(size, |n: usize, &d| n.checked_mul(d))
+        .ok_or_else(|| anyhow!("mmproj: {name} geometry overflow"))?;
+    require_len(
+        name,
+        g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?.len(),
+        bytes,
+    )
+}
 
 /// `Gemma4ClippableLinear`'s four scalars; `±inf` where the GGUF carries none.
 #[derive(Clone, Copy, Debug)]
@@ -110,7 +266,7 @@ pub struct Gemma4Vision {
 const CACHE_IMAGES: usize = 16;
 
 /// One cached encode: (content hash, token budget, rows).
-type CacheEntry = (u64, usize, Arc<Vec<f32>>);
+type CacheEntry = (Arc<[u8]>, usize, Arc<Vec<f32>>);
 
 fn meta_f64(g: &infr_gguf::Gguf, key: &str) -> Option<f64> {
     match g.metadata().get(key)? {
@@ -124,8 +280,8 @@ fn meta_f64(g: &infr_gguf::Gguf, key: &str) -> Option<f64> {
 fn meta_usize(g: &infr_gguf::Gguf, key: &str) -> Result<usize> {
     g.metadata()
         .u64(key)
-        .map(|v| v as usize)
-        .ok_or_else(|| anyhow!("mmproj: missing metadata {key}"))
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| anyhow!("mmproj: missing or oversized metadata {key}"))
 }
 
 /// Any f32/f16/bf16 tensor as f32.
@@ -188,9 +344,7 @@ impl Gemma4Vision {
             .u64("clip.vision.projector.scale_factor")
             .map(|v| v as usize)
             .unwrap_or(3);
-        if !n_embd.is_multiple_of(n_head) || !(n_embd / n_head).is_multiple_of(4) {
-            bail!("mmproj: head dim {n_embd}/{n_head} is not a multiple of 4");
-        }
+        validate_tower_geometry(n_embd, n_head, n_layer, patch, merge, n_embd_out, eps)?;
         // gemma4v's image_mean/std are 0/1 — anything else would need a normalize step we skip.
         for (key, want) in [
             ("clip.vision.image_mean", 0.0),
@@ -207,56 +361,80 @@ impl Gemma4Vision {
             }
         }
 
-        let proj = |name: &str| -> Result<Proj> {
+        let proj = |name: &str, expected_in: usize, expected_out: Option<usize>| -> Result<Proj> {
             let w = format!("{name}.weight");
             let info = src
                 .tensors()
                 .iter()
                 .find(|t| t.name == w)
                 .ok_or_else(|| anyhow!("mmproj: missing tensor {w}"))?;
-            let n_in = info.shape[0];
-            let n_out = info.shape[1..].iter().product();
+            if info.shape.len() != 2 || info.shape.contains(&0) {
+                bail!("mmproj: invalid projection shape for {w}");
+            }
+            let (n_in, n_out) = (info.shape[0], info.shape[1]);
+            require_len(&w, n_in, expected_in)?;
+            if let Some(want) = expected_out {
+                require_len(&w, n_out, want)?;
+            }
+            validate_tensor(&src, &w, &[n_in, n_out])?;
             let get =
                 |suffix: &str, dflt: f32| scalar(&src, &format!("{name}.{suffix}")).unwrap_or(dflt);
+            let clamp = Clamp {
+                in_lo: get("input_min", f32::NEG_INFINITY),
+                in_hi: get("input_max", f32::INFINITY),
+                out_lo: get("output_min", f32::NEG_INFINITY),
+                out_hi: get("output_max", f32::INFINITY),
+            };
+            if !(clamp.in_lo <= clamp.in_hi && clamp.out_lo <= clamp.out_hi) {
+                bail!("mmproj: invalid clipping range for {name}");
+            }
             Ok(Proj {
                 name: w,
                 n_in,
                 n_out,
-                clamp: Clamp {
-                    in_lo: get("input_min", f32::NEG_INFINITY),
-                    in_hi: get("input_max", f32::INFINITY),
-                    out_lo: get("output_min", f32::NEG_INFINITY),
-                    out_hi: get("output_max", f32::INFINITY),
-                },
+                clamp,
             })
         };
 
         let mut layers = Vec::with_capacity(n_layer);
         for l in 0..n_layer {
             let p = format!("v.blk.{l}");
-            let t = |s: &str| tensor_f32(&src, &format!("{p}.{s}.weight"));
+            let t = |s: &str, width: usize| -> Result<Vec<f32>> {
+                let name = format!("{p}.{s}.weight");
+                let values = tensor_f32(&src, &name)?;
+                require_len(&name, values.len(), width)?;
+                Ok(values)
+            };
+            let gate = proj(&format!("{p}.ffn_gate"), n_embd, None)?;
+            let up = proj(&format!("{p}.ffn_up"), n_embd, Some(gate.n_out))?;
+            let down = proj(&format!("{p}.ffn_down"), gate.n_out, Some(n_embd))?;
             layers.push(Layer {
-                ln1: t("ln1")?,
-                ln2: t("ln2")?,
-                attn_post_norm: t("attn_post_norm")?,
-                ffn_post_norm: t("ffn_post_norm")?,
-                q_norm: t("attn_q_norm")?,
-                k_norm: t("attn_k_norm")?,
-                q: proj(&format!("{p}.attn_q"))?,
-                k: proj(&format!("{p}.attn_k"))?,
-                v: proj(&format!("{p}.attn_v"))?,
-                o: proj(&format!("{p}.attn_out"))?,
-                gate: proj(&format!("{p}.ffn_gate"))?,
-                up: proj(&format!("{p}.ffn_up"))?,
-                down: proj(&format!("{p}.ffn_down"))?,
+                ln1: t("ln1", n_embd)?,
+                ln2: t("ln2", n_embd)?,
+                attn_post_norm: t("attn_post_norm", n_embd)?,
+                ffn_post_norm: t("ffn_post_norm", n_embd)?,
+                q_norm: t("attn_q_norm", n_embd / n_head)?,
+                k_norm: t("attn_k_norm", n_embd / n_head)?,
+                q: proj(&format!("{p}.attn_q"), n_embd, Some(n_embd))?,
+                k: proj(&format!("{p}.attn_k"), n_embd, Some(n_embd))?,
+                v: proj(&format!("{p}.attn_v"), n_embd, Some(n_embd))?,
+                o: proj(&format!("{p}.attn_out"), n_embd, Some(n_embd))?,
+                gate,
+                up,
+                down,
             });
         }
 
         // `v.patch_embd.weight` is ggml [kw, kh, c, out] — i.e. `out` rows of (c, ky, kx) — so it is
         // exactly a Linear over the flattened patch.
+        let patch_in = patch
+            .checked_mul(patch)
+            .and_then(|v| v.checked_mul(3))
+            .ok_or_else(|| anyhow!("mmproj: patch geometry overflow"))?;
+        validate_tensor(&src, "v.patch_embd.weight", &[patch, patch, 3, n_embd])?;
         let patch_embd = Proj {
             name: "v.patch_embd.weight".into(),
-            n_in: 3 * patch * patch,
+            n_in: patch_in,
             n_out: n_embd,
             clamp: Clamp::NONE,
         };
@@ -272,11 +450,26 @@ impl Gemma4Vision {
             );
         }
         let n_pos = pe_info.shape[1];
+        if n_pos < merge {
+            bail!("mmproj: position table cannot fit a merged patch");
+        }
+        validate_tensor(&src, "v.position_embd.weight", &[n_embd, n_pos, 2])?;
         let pos_embd = tensor_f32(&src, "v.position_embd.weight")?;
-        let mut mm_proj = proj("mm.input_projection")?;
+        let mut mm_proj = proj("mm.input_projection", n_embd, Some(n_embd_out))?;
         mm_proj.clamp = Clamp::NONE; // never clipped (no scalars in the GGUF either)
-        let std_bias = tensor_f32(&src, "v.std_bias").ok();
-        let std_scale = tensor_f32(&src, "v.std_scale").ok();
+        let optional = |name: &str| -> Result<Option<Vec<f32>>> {
+            if !src.tensors().iter().any(|t| t.name == name) {
+                return Ok(None);
+            }
+            let values = tensor_f32(&src, name)?;
+            require_len(name, values.len(), n_embd)?;
+            Ok(Some(values))
+        };
+        let std_bias = optional("v.std_bias")?;
+        let std_scale = optional("v.std_scale")?;
+        if std_bias.is_some() != std_scale.is_some() {
+            bail!("mmproj: std_bias and std_scale must both be present");
+        }
 
         tracing::info!(
             "[vision] gemma4v encoder from {}: {n_layer} layers, {n_embd} wide, patch {patch}, merge {merge} -> {n_embd_out}",
@@ -325,57 +518,49 @@ impl Gemma4Vision {
         found.into_iter().next()
     }
 
-    /// Target `(width, height)` for an image of `w x h`: llama.cpp's `calc_size_preserved_ratio`
-    /// (round-half-away, `align = patch * merge`, pixel budget from the token limits).
-    pub fn target_size(&self, w: usize, h: usize, max_tokens: usize) -> (usize, usize) {
-        let align = (self.patch * self.merge) as f32;
-        let area = (self.patch * self.patch * self.merge * self.merge) as f32;
-        let max_tokens = max_tokens.clamp(MIN_IMAGE_TOKENS, MAX_IMAGE_TOKENS);
-        let min_px = MIN_IMAGE_TOKENS as f32 * area;
-        let max_px = max_tokens as f32 * area;
-        let (wf, hf) = (w as f32, h as f32);
-        let round = |x: f32| (x / align).round() * align;
-        let ceil = |x: f32| (x / align).ceil() * align;
-        let floor = |x: f32| (x / align).floor() * align;
-        let mut wb = round(wf).max(align);
-        let mut hb = round(hf).max(align);
-        if wb * hb > max_px {
-            let beta = (hf * wf / max_px).sqrt();
-            hb = floor(hf / beta).max(align);
-            wb = floor(wf / beta).max(align);
-        } else if wb * hb < min_px {
-            let beta = (min_px / (hf * wf)).sqrt();
-            hb = ceil(hf * beta);
-            wb = ceil(wf * beta);
-        }
-        (wb as usize, hb as usize)
+    /// Aspect-preserving aligned geometry, bounded by both token ceiling and position table.
+    /// The minimum is advisory when alignment makes it incompatible with the strict ceiling.
+    pub fn target_size(&self, w: usize, h: usize, max_tokens: usize) -> Result<(usize, usize)> {
+        bounded_target_size(w, h, self.patch, self.merge, self.n_pos, max_tokens)
+    }
+
+    /// Preflight the exact soft-token count without image decode or transformer work.
+    pub fn image_tokens(&self, bytes: &[u8], max_tokens: usize) -> Result<usize> {
+        let (w, h) = image_dimensions(bytes)?;
+        let (w, h) = self.target_size(w as usize, h as usize, max_tokens)?;
+        Ok((w / (self.patch * self.merge)) * (h / (self.patch * self.merge)))
     }
 
     /// Decode `bytes` (PNG/JPEG/GIF/WebP/BMP) and encode it: `[n_tokens * n_embd_out]` row-major.
     /// Cached by content, so a resent image costs nothing.
     pub fn encode(&self, bytes: &[u8], max_tokens: usize) -> Result<Arc<Vec<f32>>> {
-        let key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            bytes.hash(&mut h);
-            h.finish()
-        };
+        self.encode_with_request(bytes, max_tokens, None)
+    }
+
+    /// Request-aware variant: cancellation is checked before work and between tower layers.
+    pub fn encode_with_request(
+        &self,
+        bytes: &[u8],
+        max_tokens: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+    ) -> Result<Arc<Vec<f32>>> {
+        if req.is_some_and(crate::sampling::RequestCtx::aborted) {
+            bail!("image encoding cancelled");
+        }
+        let (w0, h0) = image_dimensions(bytes)?;
+        let (w, h) = self.target_size(w0 as usize, h0 as usize, max_tokens)?;
         if let Some(hit) = self
             .cache
             .lock()
             .unwrap()
             .iter()
-            .find(|(k, t, _)| *k == key && *t == max_tokens)
+            .find(|(k, t, _)| k.as_ref() == bytes && *t == max_tokens)
             .map(|(_, _, v)| v.clone())
         {
             return Ok(hit);
         }
         let t0 = std::time::Instant::now();
-        let img = image::load_from_memory(bytes)
-            .map_err(|e| anyhow!("image decode failed: {e}"))?
-            .to_rgb8();
-        let (w0, h0) = (img.width() as usize, img.height() as usize);
-        let (w, h) = self.target_size(w0, h0, max_tokens);
+        let img = decode_image(bytes)?.to_rgb8();
         let img = image::imageops::resize(
             &img,
             w as u32,
@@ -383,28 +568,52 @@ impl Gemma4Vision {
             image::imageops::FilterType::CatmullRom,
         );
         let rgb: Vec<f32> = img.as_raw().iter().map(|&b| b as f32 / 255.0).collect();
-        let out = Arc::new(self.encode_pixels(&rgb, w, h)?);
+        let out = Arc::new(self.encode_pixels_with_request(&rgb, w, h, req)?);
         tracing::info!(
             "[vision] encoded {w0}x{h0} image as {w}x{h} -> {} tokens in {:.2}s",
             out.len() / self.n_embd_out,
             t0.elapsed().as_secs_f32()
         );
         let mut cache = self.cache.lock().unwrap();
-        if cache.len() >= CACHE_IMAGES {
+        while !cache.is_empty()
+            && (cache.len() >= CACHE_IMAGES
+                || cache.iter().map(|(b, _, _)| b.len()).sum::<usize>() + bytes.len() > CACHE_BYTES)
+        {
             cache.remove(0);
         }
-        cache.push((key, max_tokens, out.clone()));
+        cache.push((Arc::from(bytes), max_tokens, out.clone()));
         Ok(out)
     }
 
     /// Encode an already-resized image: `rgb` is HWC, values in [0, 1], `w`/`h` multiples of
     /// `patch * merge`.
     pub fn encode_pixels(&self, rgb: &[f32], w: usize, h: usize) -> Result<Vec<f32>> {
+        self.encode_pixels_with_request(rgb, w, h, None)
+    }
+
+    fn encode_pixels_with_request(
+        &self,
+        rgb: &[f32],
+        w: usize,
+        h: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+    ) -> Result<Vec<f32>> {
         let (p, m, ne) = (self.patch, self.merge, self.n_embd);
-        if !w.is_multiple_of(p * m) || !h.is_multiple_of(p * m) || rgb.len() != w * h * 3 {
+        if w == 0
+            || h == 0
+            || !w.is_multiple_of(p * m)
+            || !h.is_multiple_of(p * m)
+            || w.checked_mul(h).and_then(|v| v.checked_mul(3)) != Some(rgb.len())
+        {
             bail!("vision: bad image geometry {w}x{h} ({} values)", rgb.len());
         }
         let (cols, rows) = (w / p, h / p);
+        if (cols / m)
+            .checked_mul(rows / m)
+            .is_none_or(|n| n > MAX_IMAGE_TOKENS)
+        {
+            bail!("vision: image exceeds the soft-token limit");
+        }
         if cols > self.n_pos || rows > self.n_pos {
             bail!(
                 "vision: {cols}x{rows} patches exceeds the {} position table",
@@ -443,6 +652,9 @@ impl Gemma4Vision {
         });
 
         for layer in &self.layers {
+            if req.is_some_and(crate::sampling::RequestCtx::aborted) {
+                bail!("image encoding cancelled");
+            }
             self.block(layer, &mut x, n, &pos_x, &pos_y)?;
         }
 
@@ -546,7 +758,9 @@ impl Gemma4Vision {
 
     /// `clip(clip(x) · Wᵀ)` for `rows` rows.
     fn linear(&self, p: &Proj, x: &[f32], rows: usize) -> Result<Vec<f32>> {
-        debug_assert_eq!(x.len(), rows * p.n_in);
+        if rows.checked_mul(p.n_in) != Some(x.len()) {
+            bail!("mmproj: {} input geometry mismatch", p.name);
+        }
         let info = self
             .src
             .tensors()
@@ -582,7 +796,11 @@ impl Gemma4Vision {
 
 /// `y[m, n] = a[m, k] · b[n, k]ᵀ` (both row-major), via `gemm` on all cores.
 pub(crate) fn matmul_nt(y: &mut [f32], a: &[f32], b: &[f32], m: usize, k: usize, n: usize) {
-    assert!(y.len() >= m * n && a.len() >= m * k && b.len() >= n * k);
+    assert!(
+        m.checked_mul(n).is_some_and(|v| y.len() >= v)
+            && m.checked_mul(k).is_some_and(|v| a.len() >= v)
+            && n.checked_mul(k).is_some_and(|v| b.len() >= v)
+    );
     // SAFETY: the asserts bound every access gemm makes for these shapes/strides; `y` does not
     // alias `a`/`b` (distinct borrows).
     unsafe {
@@ -619,9 +837,21 @@ fn attention(
     n_head: usize,
     hd: usize,
 ) -> Result<Vec<f32>> {
-    let ne = n_head * hd;
-    let mut out = vec![0f32; n * ne];
-    let mut s = vec![0f32; n * n];
+    let ne = n_head
+        .checked_mul(hd)
+        .ok_or_else(|| anyhow!("vision: attention width overflow"))?;
+    let len = n
+        .checked_mul(ne)
+        .ok_or_else(|| anyhow!("vision: attention geometry overflow"))?;
+    let scores = n
+        .checked_mul(n)
+        .ok_or_else(|| anyhow!("vision: attention score geometry overflow"))?;
+    if n == 0 || n_head == 0 || hd == 0 || [q.len(), k.len(), v.len()].iter().any(|&got| got != len)
+    {
+        bail!("vision: invalid Q/K/V attention geometry");
+    }
+    let mut out = vec![0f32; len];
+    let mut s = vec![0f32; scores];
     for h in 0..n_head {
         // S = Q_h · K_hᵀ : strided views into the packed [n, ne] rows.
         // SAFETY: every index stays inside q/k (rows < n, cols < hd from offset h*hd < ne).
@@ -708,6 +938,63 @@ fn gelu_tanh(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_geometry_obeys_ceiling_and_position_bounds() {
+        for (w, h) in [
+            (1, 1),
+            (1, 100000),
+            (100000, 1),
+            (1536, 1024),
+            (48, 48),
+            (usize::MAX, 1),
+        ] {
+            for tokens in [70, 280, 1120] {
+                let (tw, th) = bounded_target_size(w, h, 16, 3, 64, tokens).unwrap();
+                assert!(tw > 0 && th > 0 && tw.is_multiple_of(48) && th.is_multiple_of(48));
+                assert!((tw / 48) * (th / 48) <= tokens);
+                assert!(tw / 16 <= 64 && th / 16 <= 64);
+            }
+        }
+        assert!(bounded_target_size(0, 1, 16, 3, 64, 70).is_err());
+        assert!(bounded_target_size(1, 1, 16, 0, 64, 70).is_err());
+        assert!(bounded_target_size(1, 1, 16, 3, 2, 70).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_tower_and_attention_geometry() {
+        assert!(validate_tower_geometry(8, 2, 1, 16, 3, 16, 1e-6).is_ok());
+        for args in [
+            (8, 0, 1, 16, 3, 16),
+            (8, 2, 0, 16, 3, 16),
+            (8, 2, 1, 0, 3, 16),
+            (8, 2, 1, 16, 0, 16),
+            (8, 2, 1, 16, 3, 0),
+            (8, 3, 1, 16, 3, 16),
+            (usize::MAX, 1, 1, 16, 3, 16),
+        ] {
+            assert!(
+                validate_tower_geometry(args.0, args.1, args.2, args.3, args.4, args.5, 1e-6)
+                    .is_err()
+            );
+        }
+        assert!(validate_tower_geometry(8, 2, 1, 16, 3, 16, f32::NAN).is_err());
+        assert!(attention(&[0.0; 8], &[0.0; 8], &[0.0; 4], 1, 2, 4).is_err());
+        assert!(attention(&[], &[], &[], 1, 0, 4).is_err());
+        assert!(attention(&[], &[], &[], usize::MAX, 2, 4).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_image_payload_before_encoding() {
+        assert!(validate_image(&[1, 2, 3]).is_err());
+        assert!(image_dimensions(&vec![0; MAX_IMAGE_BYTES + 1]).is_err());
+        let image = image::RgbImage::from_pixel(1, 1, image::Rgb([1, 2, 3]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert!(validate_image(png.get_ref()).is_ok());
+        assert_eq!(image_dimensions(png.get_ref()).unwrap(), (1, 1));
+        assert!(validate_image(&png.get_ref()[..33]).is_err());
+    }
 
     #[test]
     fn matmul_nt_matches_naive() {

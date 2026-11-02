@@ -9,7 +9,8 @@
 //! 2. `SeamModel::encode_prompt` splits the rendered prompt on the marker, runs the vision
 //!    encoder, and lays each image out as `<|image>` + N placeholder ids + `<image|>`. The
 //!    placeholder ids sit above every vocab ([`MEDIA_ID_BASE`]) and are derived from the image's
-//!    content hash, so the KV prefix cache reuses an image's rows only when the image is the same.
+//!    content hash. These compact tags do not prove identity: the KV prefix cache stops before
+//!    image rows. The encoder's independent cache compares the complete image bytes.
 //! 3. It returns an `OverrideScope` that publishes the encoded rows for the runner, which swaps
 //!    them in for the placeholders' embeddings during prefill (`seam::runner`).
 //!

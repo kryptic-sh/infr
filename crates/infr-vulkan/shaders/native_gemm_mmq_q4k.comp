@@ -219,7 +219,7 @@ void main() {
             rbw[u] = w4((qbase >> 2u) + h * 4u); \
         } \
     }
-    PREFETCH(0u)
+    if (nblk > 0u) { PREFETCH(0u) }
     for (uint blk = 0u; blk < nblk; blk++) {
         // Write the prefetched block to shared (activations, per-col scale/min, weight nibbles).
         [[unroll]] for (uint u = 0u; u < NA; u++) {

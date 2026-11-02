@@ -664,6 +664,10 @@ pub(crate) fn generate_dense_backend_bound(
             .find(|t| t.name == "per_layer_token_embd.weight")
             .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype));
 
+    // Vision rows this request injects (`infr_llama::media`): a prompt position the model receives
+    // as an already-projected image row instead of a token embedding.
+    let media = crate::media::current_override();
+
     // KV cache dtype, chosen PER-SIDE (K and V independent, like llama's --cache-type-k /
     // --cache-type-v). Q8_0 stores 34 bytes / 32 elems — half the f16 footprint and bandwidth.
     //   INFR_KV_TYPE_K / INFR_KV_TYPE_V ∈ {f16, q8_0}  (per-side override)
@@ -5958,6 +5962,9 @@ pub(crate) fn generate_dense_backend_bound(
                     // the baton to whichever sequence has been waiting longest.
                     let _gp = req.and_then(|r| r.gate_pass());
                     let pf_m = cend - cstart;
+                    // Image rows in this chunk force the host-embed path for it (see `media`).
+                    let chunk_media = media.as_deref().filter(|o| o.any_in(cstart..cend));
+                    let chunk_gpu_embed = gpu_embed && chunk_media.is_none();
                     if live[ci].is_none() {
                         // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
                         // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
@@ -5972,16 +5979,21 @@ pub(crate) fn generate_dense_backend_bound(
                                 .map_err(|e| anyhow!("{e}"))?;
                             Ok(b)
                         };
-                        let ids = if hash_ids && !gpu_embed {
+                        let ids = if hash_ids && !chunk_gpu_embed {
                             Some(upload_ids()?)
                         } else {
                             None
                         };
-                        let input = if gpu_embed {
+                        let input = if chunk_gpu_embed {
                             upload_ids()?
                         } else {
-                            let pf_hidden =
-                                token_embd.rows(&prompt[cstart..cend], ne, embed_scale)?;
+                            let pf_hidden = token_embd.prompt_rows(
+                                &prompt[cstart..cend],
+                                cstart,
+                                ne,
+                                embed_scale,
+                                chunk_media,
+                            )?;
                             let b = be
                                 .alloc(pf_m * ne * 4, BufferUsage::Staging)
                                 .map_err(|e| anyhow!("{e}"))?;
@@ -5997,7 +6009,7 @@ pub(crate) fn generate_dense_backend_bound(
                         // binds — the interpreters' write-back is a length-checked `copy_from_slice`
                         // against the declared numel, and the host-embed path has always bound this
                         // shape, so nothing writes past it.
-                        let resid = if gpu_embed {
+                        let resid = if chunk_gpu_embed {
                             Some(
                                 be.alloc(pf_m * ne * 4, BufferUsage::Activations)
                                     .map_err(|e| anyhow!("{e}"))?,
@@ -6015,7 +6027,7 @@ pub(crate) fn generate_dense_backend_bound(
                         // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
                         // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
                         // prologue).
-                        let ipl = if let (Some(ple), false) = (ple, gpu_ple) {
+                        let ipl = if let (Some(ple), false) = (ple, gpu_ple && chunk_gpu_embed) {
                             let rows = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
                             let b = be
                                 .alloc(rows.len() * 4, BufferUsage::Staging)
@@ -6071,7 +6083,7 @@ pub(crate) fn generate_dense_backend_bound(
                         false,
                         // The token-id input + in-graph gather belong to the span that STARTS the
                         // stack; a later span reads the residual stream that one left behind.
-                        gpu_embed && span.start == 0,
+                        chunk_gpu_embed && span.start == 0,
                         false, // mtp_verify: ordinary chunked prefill, not MTP verify
                         Some(span.clone()),
                     );

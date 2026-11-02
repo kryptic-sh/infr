@@ -330,50 +330,66 @@ fn rejects_unsupported_configs_and_codebooks() {
 }
 
 #[test]
-fn accepts_mcg_marker_and_rejects_unsupported_parameters() {
-    let mut fixture = Fixture::new();
-    let cb0 = fixture
-        .open()
-        .unwrap()
-        .take_fold("output.weight")
-        .unwrap()
-        .unwrap();
-    fixture.tensors.push((
-        "lm_head.mcg".into(),
-        "I32".into(),
-        vec![],
-        0xcbac1fed_u32.to_le_bytes().to_vec(),
-    ));
-    let source = fixture.open().unwrap();
-    let mcg = source.take_fold("output.weight").unwrap().unwrap();
-    assert_ne!(mcg, cb0);
-    let native = Exl3Source::open_native(&fixture.dir.path().join("model.safetensors")).unwrap();
-    assert_eq!(
-        native.native_spec("output.weight").unwrap().codebook,
-        Exl3Codebook::Mcg
-    );
-    assert_eq!(
-        native.native_spec("blk.0.attn_q.weight").unwrap().codebook,
-        Exl3Codebook::Cb0
-    );
-    assert!(native
-        .linears
-        .values()
-        .all(|linear| linear.cache.get().is_none()));
-    for (dtype, shape, multiplier) in [
-        ("F32", vec![], 0xcbac1fed_u32),
-        ("I32", vec![1], 0xcbac1fed_u32),
-        ("I32", vec![], 1u32),
+fn accepts_codebook_markers_and_rejects_unsupported_parameters() {
+    for (marker, codebook, multiplier) in [
+        ("mcg", Exl3Codebook::Mcg, 0xcbac1fed_u32),
+        ("mul1", Exl3Codebook::Mul1, 0x83dcd12d_u32),
     ] {
-        let mut invalid = Fixture::new();
-        invalid.tensors.push((
-            "lm_head.mcg".into(),
-            dtype.into(),
-            shape,
+        let mut fixture = Fixture::new();
+        let cb0 = fixture
+            .open()
+            .unwrap()
+            .take_fold("output.weight")
+            .unwrap()
+            .unwrap();
+        fixture.tensors.push((
+            format!("lm_head.{marker}"),
+            "I32".into(),
+            vec![],
             multiplier.to_le_bytes().to_vec(),
         ));
-        assert!(invalid.open().is_err());
+        let source = fixture.open().unwrap();
+        let folded = source.take_fold("output.weight").unwrap().unwrap();
+        assert_ne!(folded, cb0);
+        let native =
+            Exl3Source::open_native(&fixture.dir.path().join("model.safetensors")).unwrap();
+        assert_eq!(
+            native.native_spec("output.weight").unwrap().codebook,
+            codebook
+        );
+        assert_eq!(
+            native.native_spec("blk.0.attn_q.weight").unwrap().codebook,
+            Exl3Codebook::Cb0
+        );
+        assert!(native
+            .linears
+            .values()
+            .all(|linear| linear.cache.get().is_none()));
+        for (dtype, shape, value) in [
+            ("F32", vec![], multiplier),
+            ("I32", vec![1], multiplier),
+            ("I32", vec![], 1),
+        ] {
+            let mut invalid = Fixture::new();
+            invalid.tensors.push((
+                format!("lm_head.{marker}"),
+                dtype.into(),
+                shape,
+                value.to_le_bytes().to_vec(),
+            ));
+            assert!(invalid.open().is_err());
+        }
     }
+    let mut conflicting = Fixture::new();
+    for (marker, multiplier) in [("mcg", 0xcbac1fed_u32), ("mul1", 0x83dcd12d_u32)] {
+        conflicting.tensors.push((
+            format!("lm_head.{marker}"),
+            "I32".into(),
+            vec![],
+            multiplier.to_le_bytes().to_vec(),
+        ));
+    }
+    assert!(conflicting.open().is_err());
 }
 
 #[test]

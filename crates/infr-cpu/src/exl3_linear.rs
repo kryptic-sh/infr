@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn streamed_projection_matches_dense_reference_all_rates_and_tail_batches() {
-        for (codebook, bits) in [Exl3Codebook::Cb0, Exl3Codebook::Mcg]
+        for (codebook, bits) in [Exl3Codebook::Cb0, Exl3Codebook::Mcg, Exl3Codebook::Mul1]
             .into_iter()
             .flat_map(|codebook| (1..=8).map(move |bits| (codebook, bits)))
         {
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn grouped_input_and_output_heads_match_independent_dense_reference() {
-        for (codebook, bits) in [Exl3Codebook::Cb0, Exl3Codebook::Mcg]
+        for (codebook, bits) in [Exl3Codebook::Cb0, Exl3Codebook::Mcg, Exl3Codebook::Mul1]
             .into_iter()
             .flat_map(|codebook| (1..=8).map(move |bits| (codebook, bits)))
         {

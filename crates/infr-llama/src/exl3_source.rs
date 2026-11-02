@@ -381,28 +381,28 @@ impl Exl3Source {
             "exl3: {prefix}.trellis shape {:?} disagrees with config ({k},{n})",
             info.shape
         );
-        ensure!(
-            !self
-                .st
-                .tensors()
-                .iter()
-                .any(|t| t.name == format!("{prefix}.mul1")),
-            "exl3: {prefix}.mul1 codebook is unsupported"
-        );
-        let marker = format!("{prefix}.mcg");
-        let codebook = if let Some(info) = self.st.tensors().iter().find(|t| t.name == marker) {
-            ensure!(
-                info.dtype == DType::I32 && info.shape.is_empty(),
-                "exl3: {marker} must be scalar I32"
-            );
-            ensure!(
-                self.st.tensor_bytes(&marker)? == 0xcbac1fed_u32.to_le_bytes(),
-                "exl3: {marker} has an unsupported MCG multiplier"
-            );
-            Exl3Codebook::Mcg
-        } else {
-            Exl3Codebook::Cb0
-        };
+        let mut codebook = Exl3Codebook::Cb0;
+        for (suffix, kind, multiplier) in [
+            ("mcg", Exl3Codebook::Mcg, 0xcbac1fed_u32),
+            ("mul1", Exl3Codebook::Mul1, 0x83dcd12d_u32),
+        ] {
+            let marker = format!("{prefix}.{suffix}");
+            if let Some(info) = self.st.tensors().iter().find(|t| t.name == marker) {
+                ensure!(
+                    codebook == Exl3Codebook::Cb0,
+                    "exl3: {prefix} has conflicting codebook markers"
+                );
+                ensure!(
+                    info.dtype == DType::I32 && info.shape.is_empty(),
+                    "exl3: {marker} must be scalar I32"
+                );
+                ensure!(
+                    self.st.tensor_bytes(&marker)? == multiplier.to_le_bytes(),
+                    "exl3: {marker} has an unsupported multiplier"
+                );
+                codebook = kind;
+            }
+        }
         for (scale, size) in [("suh", k), ("svh", n)] {
             let info = find_hf(&self.st, &format!("{prefix}.{scale}"))?;
             ensure!(

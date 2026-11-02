@@ -694,7 +694,14 @@ const BDA_CHUNK_UNIT_MAX: u64 = 1 << 32;
 /// it measured faster at every LFM3-1.7B decode shape on the RDNA2 iGPU (the per-op timings are
 /// in the CHANGELOG and backlog B188).
 fn mmv_o4(vk: &infr_core::config::VulkanCfg, in_f: usize, o4: MmvO4) -> bool {
-    vk.mmv_o4 && (in_f < o4.max_in_f || o4.all_widths)
+    // OUTS4 (4 outputs x 16 lanes, K-stride 16) exactly where the 2-output layout would idle
+    // lanes: nsub % 64 != 0 leaves a partial 64-wide K wave, while stride 16 wastes no more than
+    // stride 64 anywhere (both exact, or OUTS4's tail is smaller). Where stride 64 is exact the
+    // 2-output subgroupAdd reduction wins, so it keeps those shapes. `mmv_o4` stays master.
+    if o4.all_widths {
+        return vk.mmv_o4;
+    }
+    vk.mmv_o4 && (in_f < o4.max_in_f || (in_f / 32) % 64 != 0)
 }
 
 /// When [`mmv_o4`] takes the four-outputs build: the `mmv_mrow.o4_max_in_f` and

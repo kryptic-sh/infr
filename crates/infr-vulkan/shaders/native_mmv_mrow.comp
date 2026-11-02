@@ -628,7 +628,9 @@ void main() {
     // the weight row is still decoded through the 64-bit pointer, so a padding workgroup must return
     // before it reads past the tensor. o0 is workgroup-uniform, so no barrier is skipped unevenly.
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u;
-    if (o0 >= pc.out_f) { return; }
+    if (o0 >= pc.out_f) { return; } // fully-past-the-tail padding workgroup (2-D split
+    // rounding can land whole groups past out_f) — the per-output `live` guard below covers a
+    // PARTIAL tail group; without this, padding groups pay the full K-loop for nothing.
     uint t = gl_LocalInvocationID.x;
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint ot = t >> 4u;               // which of the 4 outputs this lane serves

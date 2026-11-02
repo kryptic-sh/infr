@@ -33,9 +33,6 @@ layout(binding = 3) readonly buffer WB { uint nw[]; };
 
 shared float red[NR * 64]; // per-subgroup partials when a workgroup spans several subgroups
 
-// Unaligned-safe word funnel: sh in {0,8,16,24}; (hi<<1)<<(31-sh) is 0 when sh==0.
-uint fun(uint lo, uint hi, uint sh) { return (lo >> sh) | ((hi << 1u) << (31u - sh)); }
-
 float dot4b(uint q, vec4 xv) {
     return float(q & 0xFFu) * xv.x + float((q >> 8u) & 0xFFu) * xv.y
          + float((q >> 16u) & 0xFFu) * xv.z + float(q >> 24u) * xv.w;
@@ -111,22 +108,29 @@ vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
         xv[og * 2u + 1u] = x4[xb + og * 8u + 1u];
         sx[og] = hsum(xv[og * 2u] + xv[og * 2u + 1u]);
     }
-    vec4 out4;
+    // Q6_K blocks are 210 bytes and every field offset is even, so a word is either aligned or
+    // straddles at 16 bits.
+    uvec3 wa[4], wb[4], wh[4], ws[4];
+    uint wd[4];
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
         uint bd = rb[r] + sbb;
-        uint sh = (bd & 3u) * 8u;
         uint qa = (bd + hf * 64u + 8u * j) >> 2u;
         uint qh = (bd + 128u + hf * 32u + 8u * j) >> 2u;
         uint sc = (bd + 192u + hf * 8u) >> 2u;
-        uvec2 a0 = NW2(qa); uint a2 = NW(qa + 2u);
-        uvec2 b0 = NW2(qa + 8u); uint b2 = NW(qa + 10u);
-        uvec2 h0 = NW2(qh); uint h2 = NW(qh + 2u);
-        uvec2 s0 = NW2(sc); uint s2 = NW(sc + 2u);
-        uint la[2] = uint[2](fun(a0.x, a0.y, sh), fun(a0.y, a2, sh));
-        uint lb[2] = uint[2](fun(b0.x, b0.y, sh), fun(b0.y, b2, sh));
-        uint hh[2] = uint[2](fun(h0.x, h0.y, sh), fun(h0.y, h2, sh));
-        uint sw[2] = uint[2](fun(s0.x, s0.y, sh), fun(s0.y, s2, sh));
-        float d = unpackHalf2x16((NW((bd + 208u) >> 2u) >> (((bd + 208u) & 3u) * 8u)) & 0xFFFFu).x;
+        wa[r] = uvec3(NW2(qa), NW(qa + 2u));
+        wb[r] = uvec3(NW2(qa + 8u), NW(qa + 10u));
+        wh[r] = uvec3(NW2(qh), NW(qh + 2u));
+        ws[r] = uvec3(NW2(sc), NW(sc + 2u));
+        wd[r] = NW((bd + 208u) >> 2u);
+    }
+    vec4 out4;
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        bool odd = ((rb[r] + sbb) & 2u) != 0u;
+        uvec2 la = odd ? (wa[r].xy >> 16u) | (wa[r].yz << 16u) : wa[r].xy;
+        uvec2 lb = odd ? (wb[r].xy >> 16u) | (wb[r].yz << 16u) : wb[r].xy;
+        uvec2 hh = odd ? (wh[r].xy >> 16u) | (wh[r].yz << 16u) : wh[r].xy;
+        uvec2 sw = odd ? (ws[r].xy >> 16u) | (ws[r].yz << 16u) : ws[r].xy;
+        float d = unpackHalf2x16(odd ? wd[r] >> 16u : wd[r]).x;
         float acc = 0.0;
         [[unroll]] for (uint og = 0u; og < 4u; og++) {
             float s = 0.0;
@@ -137,7 +141,7 @@ vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
                 s += dot4b(q, xv[og * 2u + w]);
             }
             uint si = og * 2u + (j >> 1u);
-            float scv = float(sgn8((sw[si >> 2u] >> ((si & 3u) * 8u)) & 0xFFu));
+            float scv = float(bitfieldExtract(int(sw[si >> 2u]), int((si & 3u) * 8u), 8));
             acc += scv * (s - 32.0 * sx[og]);
         }
         out4[r] = d * acc;

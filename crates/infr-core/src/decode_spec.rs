@@ -307,6 +307,7 @@ pub const fn block_spec(dtype: DType) -> BlockSpec {
         DType::Bf16 => spec!(1, 2, NO_SCALE, "bf16"),
         DType::I32 => spec!(1, 4, NO_SCALE, "i32"),
         DType::U32 => spec!(1, 4, NO_SCALE, "u32"),
+        DType::I16 => spec!(1, 2, NO_SCALE, "i16"),
         // ── legacy round quants (QK=32) ──
         // block_q4_0: [half d][u8 qs[16]]
         DType::Q4_0 => spec!(32, 18, D_AT_0, "q4_0"),

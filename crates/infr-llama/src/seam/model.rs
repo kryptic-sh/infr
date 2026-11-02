@@ -69,6 +69,7 @@ pub struct BenchPlacement {
 /// (`MixerW::DeltaNet`) all drive this same struct.
 pub struct SeamModel {
     gguf: Gguf,
+    path: std::path::PathBuf,
     cfg: Config,
     /// The ENGINE configuration every seam path this model drives reads its knobs from —
     /// `kv.*`, `spec.*`, `sampling.*`, `multi.*`, `device.ubatch*`, `paging.cache`, the seam's
@@ -491,6 +492,7 @@ impl SeamModel {
         warn_ctx_cap(&cfg, &ecfg);
         Ok(Self {
             gguf: g,
+            path: gguf_path.to_path_buf(),
             cfg,
             ecfg,
             token_embd: std::sync::OnceLock::new(),
@@ -569,6 +571,11 @@ impl SeamModel {
     ) -> T {
         let slot = self.cpu.lock().unwrap();
         f(slot.resident.as_ref(), slot.opened)
+    }
+
+    /// The GGUF file this model was loaded from.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The ENGINE configuration this model was loaded with (see the `ecfg` field). Every seam path

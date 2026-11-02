@@ -29,6 +29,9 @@ pub struct DenseSeamChat {
     /// turn on the SAME VkDevice/allocator/pipeline-cache instead of constructing a new one each
     /// time (previously: two full Vulkan backends for a single-turn `INFR_MTP=1` run).
     mtp_vk: Option<infr_vulkan::VulkanBackend>,
+    /// Gemma 4 MTP draft model (`gemma4-assistant`), loaded on the first `generate` under `INFR_MTP=1`.
+    gemma4_asst: Option<crate::mtp::gemma4::Gemma4Assistant>,
+    gemma4_mtp: crate::mtp::gemma4::Gemma4Mtp,
     /// Physical device this chat's session pins: `Some(idx)` = `VulkanN` (the multi-device path,
     /// `new_on`), `None` = the default device (`new`, byte-identical to before). Threaded into
     /// [`ensure_session`](Self::ensure_session) and [`ensure_mtp_backend`](Self::ensure_mtp_backend)
@@ -45,6 +48,8 @@ impl DenseSeamChat {
             mtp_head: None,
             mtp_checked: false,
             mtp_vk: None,
+            gemma4_asst: None,
+            gemma4_mtp: Default::default(),
             dev: None,
         }
     }
@@ -59,6 +64,8 @@ impl DenseSeamChat {
             mtp_head: None,
             mtp_checked: false,
             mtp_vk: None,
+            gemma4_asst: None,
+            gemma4_mtp: Default::default(),
             dev: Some(idx),
         }
     }
@@ -68,6 +75,38 @@ impl DenseSeamChat {
     /// unimplemented, not merely untested; `DenseSeamChat` IS always Vulkan, so no backend gate
     /// is needed here beyond the GGUF check). Memoized after the first call (`mtp_checked`) so a
     /// non-MTP GGUF doesn't re-parse its `Config` every turn.
+    /// `INFR_MTP=1` on a gemma4 target: load its `gemma4-assistant` draft model (`spec.draft`, else
+    /// the sibling `mtp-*.gguf`). Memoized through `mtp_checked`.
+    fn wants_gemma4_mtp(&mut self) -> Result<bool> {
+        if self.gemma4_asst.is_some() {
+            return Ok(true);
+        }
+        let ec = self.model.engine_cfg();
+        if self.mtp_checked || !ec.spec.mtp || !self.model.config().gemma4 {
+            return Ok(false);
+        }
+        self.mtp_checked = true;
+        let path = match ec.spec.draft.clone() {
+            Some(p) => p,
+            None => match crate::mtp::gemma4::Gemma4Assistant::sibling_of(self.model.path()) {
+                Some(p) => p,
+                None => {
+                    tracing::warn!(
+                        "INFR_MTP=1: no mtp-*.gguf beside {} and no INFR_SPEC_DRAFT; decoding without MTP",
+                        self.model.path().display()
+                    );
+                    return Ok(false);
+                }
+            },
+        };
+        tracing::info!("[gemma4 mtp — draft model {}]", path.display());
+        self.gemma4_asst = Some(crate::mtp::gemma4::Gemma4Assistant::open(
+            &path,
+            self.model.config(),
+        )?);
+        Ok(true)
+    }
+
     fn wants_mtp(&mut self) -> Result<bool> {
         if self.mtp_head.is_some() {
             return Ok(true);
@@ -135,6 +174,7 @@ impl ChatModel for DenseSeamChat {
 
     fn reset_kv(&mut self) {
         super::reset_session(&mut self.session);
+        self.gemma4_mtp.reset();
     }
 
     fn warmup(&mut self) -> Result<()> {
@@ -150,6 +190,24 @@ impl ChatModel for DenseSeamChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        if self.wants_gemma4_mtp()? {
+            self.ensure_mtp_backend()?;
+            let asst = self
+                .gemma4_asst
+                .as_ref()
+                .expect("wants_gemma4_mtp loaded it");
+            let vk = self.mtp_vk.as_ref().expect("ensure_mtp_backend set it");
+            return crate::mtp::gemma4::generate_vulkan(
+                vk,
+                &self.model,
+                asst,
+                &mut self.gemma4_mtp,
+                prompt,
+                max_new,
+                |p| on_piece(p),
+            )
+            .map(|(stats, _)| stats);
+        }
         if self.wants_mtp()? {
             self.ensure_mtp_backend()?;
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");

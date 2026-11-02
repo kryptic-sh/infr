@@ -602,6 +602,15 @@ impl BoundWeights {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+/// A borrowed view of one layer's KV cache (see [`SeamKv::kv_layer`]).
+pub(crate) struct KvLayerView<'a> {
+    pub(crate) k: &'a dyn Buffer,
+    pub(crate) v: &'a dyn Buffer,
+    pub(crate) k_fmt: DType,
+    pub(crate) v_fmt: DType,
+    pub(crate) ring: bool,
+}
+
 impl SeamKv {
     /// The context this slot's KV cache was allocated for — the AUTHORITY on a session's window,
     /// because the cold init may have re-clamped the caller's `want_ctx` against the device's live
@@ -656,6 +665,17 @@ impl SeamKv {
         std::sync::Arc::ptr_eq(&self.weights, &bound.weights)
     }
 
+    /// Layer `l`'s K and V cache buffers, their formats, and whether SWA layers use ring rows —
+    /// what a draft model that attends this cache must declare to read it.
+    pub(crate) fn kv_layer(&self, l: usize) -> KvLayerView<'_> {
+        KvLayerView {
+            k: self.kbufs[l].as_ref(),
+            v: self.vbufs[l].as_ref(),
+            k_fmt: self.k_fmt,
+            v_fmt: self.v_fmt,
+            ring: self.kv_ring,
+        }
+    }
     /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {

@@ -1,0 +1,219 @@
+#version 460
+// GQA-batched decode split-K pass 1: ONE workgroup per (kv head, chunk) that reads each K and V row
+// once and applies it to all G query heads of the group, instead of G workgroups re-streaming the
+// same rows. The pm/pl/pacc layout, the chunk policy and pass 2 (`attn_combine`) are the
+// `attn_decode` family's unchanged; only the workgroup -> work mapping differs, so it is a
+// drop-in for pass 1 apart from float summation order (not bit-identical to `attn_decode`).
+//
+// The grid stays `nh * n_chunks` workgroups so the record-once prologue's indirect args need no
+// change; the G-1 workgroups of each group with `gl_WorkGroupID.x % G != 0` return immediately.
+//
+// Layout (one wave64 per workgroup): 8 head dims per lane (one b128 K/V load per lane per key),
+// LPK = HD/8 lanes per key, KPP = 64/LPK keys per pass. QK reduces each head's partial dot across
+// the LPK lanes of a key; PV keeps G*8 accumulators per lane and folds the KPP key slots at the end.
+//
+// -DHD=128|256|512  -DG=<query heads per kv head>  -DSWA -DRING  -DUSE_PARAMS -DSELF_CHUNK
+// Requires subgroupSize == 64, f16 K/V read by device address, chunk <= 512.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#ifndef HD
+#define HD 256
+#endif
+#ifndef G
+#define G 4
+#endif
+#if HD != 128 && HD != 256 && HD != 512
+#error "HD must be 128, 256 or 512"
+#endif
+
+const uint LPK = uint(HD) / 8u;
+const uint KPP = 64u / LPK;
+const uint PIPE = 4u;
+const uint TPH = 64u / uint(G);
+const uint CHMAX = 512u;
+
+layout(push_constant) uniform PC {
+    uint kv_len; uint nh; uint nkv; uint hd; uint chunk; uint n_chunks; uint window; float scale;
+    uint cap;
+    uint pos; uint rows;
+    uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+} pc;
+#include "kv_addr.glsl"
+
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };
+layout(binding = 1) readonly buffer KB { uint ku_inert[]; };
+layout(binding = 2) readonly buffer VB { uint vu_inert[]; };
+#ifdef USE_PARAMS
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
+layout(binding = 4) buffer PM { float pm[]; };
+layout(binding = 5) buffer PL { float pl[]; };
+layout(binding = 6) buffer PACC { float pacc[]; };
+#else
+layout(binding = 3) buffer PM { float pm[]; };
+layout(binding = 4) buffer PL { float pl[]; };
+layout(binding = 5) buffer PACC { float pacc[]; };
+#endif
+
+shared float sc[uint(G) * CHMAX];
+
+#if HD == 512
+#define LANE_SUM(x) subgroupAdd(x)
+#else
+#define LANE_SUM(x) subgroupClusteredAdd(x, LPK)
+#endif
+
+void unpack8(uvec4 w, out float f[8]) {
+    vec2 a = unpackHalf2x16(w.x);
+    vec2 b = unpackHalf2x16(w.y);
+    vec2 c = unpackHalf2x16(w.z);
+    vec2 d = unpackHalf2x16(w.w);
+    f[0] = a.x; f[1] = a.y; f[2] = b.x; f[3] = b.y;
+    f[4] = c.x; f[5] = c.y; f[6] = d.x; f[7] = d.y;
+}
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    uint g = pc.nh / pc.nkv;
+    if (gl_WorkGroupID.x % g != 0u) { return; }
+    k_addr = kv_base(pc.k_lo, pc.k_hi);
+    v_addr = kv_base(pc.v_lo, pc.v_hi);
+    uint hd = pc.hd;
+    float scale = pc.scale > 0.0 ? pc.scale : 1.0 / sqrt(float(hd));
+    uint rest = gl_WorkGroupID.x / g;
+#ifdef SELF_CHUNK
+    uint kv_len = p_kvlen;
+    uint qpos1 = kv_len;
+#ifdef SWA
+    uint lo = (pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u;
+#else
+    uint lo = 0u;
+#endif
+    uint span = kv_len - lo;
+    uint chunkv = max(pc.chunk, min(max(span / 32u, 64u), 512u));
+    uint live = (span + chunkv - 1u) / chunkv;
+    uint c = rest % live;
+    uint kvh = rest / live;
+    uint j0 = lo + c * chunkv;
+    uint j1 = min(j0 + chunkv, kv_len);
+#else
+    uint c = rest % pc.n_chunks;
+    uint kvh = rest / pc.n_chunks;
+    uint qpos1 = pc.pos + 1u;
+#ifdef SWA
+    uint lo = (pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u;
+#else
+    uint lo = 0u;
+#endif
+    uint j0 = lo + c * pc.chunk;
+    uint j1 = min(j0 + pc.chunk, qpos1);
+#endif
+    uint h0 = kvh * uint(G);
+
+#ifdef RING
+    uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
+#define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
+#else
+#define RROW(j) (j)
+#endif
+
+    uint kl = t % LPK;
+    uint ks = t / LPK;
+    uint kofs = kl * 8u;
+    uint len = j1 - j0;
+    uint npass = (len + KPP - 1u) / KPP;
+
+    // ── QK: every key's K row is read once and dotted with all G query heads ─────────────────────
+    float qr[G][8];
+    [[unroll]] for (uint hh = 0u; hh < uint(G); hh++) {
+        uint qb4 = ((h0 + hh) * uint(HD) + kofs) >> 2u;
+        vec4 qa = vec4(q4[qb4]);
+        vec4 qb = vec4(q4[qb4 + 1u]);
+        qr[hh][0] = qa.x; qr[hh][1] = qa.y; qr[hh][2] = qa.z; qr[hh][3] = qa.w;
+        qr[hh][4] = qb.x; qr[hh][5] = qb.y; qr[hh][6] = qb.z; qr[hh][7] = qb.w;
+    }
+    for (uint p0 = 0u; p0 < npass; p0 += PIPE) {
+        uvec4 kw[PIPE];
+        uint jj[PIPE];
+        [[unroll]] for (uint u = 0u; u < PIPE; u++) {
+            uint j = j0 + (p0 + u) * KPP + ks;
+            jj[u] = j;
+            uint jc = (j < j1) ? j : j0;
+            kw[u] = KV4(k_addr, ((RROW(jc) * pc.nkv + kvh) * uint(HD) + kofs) >> 1u);
+        }
+        [[unroll]] for (uint u = 0u; u < PIPE; u++) {
+            float kf[8];
+            unpack8(kw[u], kf);
+            [[unroll]] for (uint hh = 0u; hh < uint(G); hh++) {
+                float d = 0.0;
+                [[unroll]] for (uint i = 0u; i < 8u; i++) { d = fma(qr[hh][i], kf[i], d); }
+                d = LANE_SUM(d) * scale;
+                if (kl == 0u && jj[u] < j1) { sc[hh * CHMAX + (jj[u] - j0)] = d; }
+            }
+        }
+    }
+    barrier();
+
+    // ── softmax statistics, TPH threads per head ─────────────────────────────────────────────────
+    uint shh = t / TPH;
+    uint stl = t % TPH;
+    float mx = -3.0e38;
+    for (uint i = stl; i < len; i += TPH) { mx = max(mx, sc[shh * CHMAX + i]); }
+    mx = subgroupClusteredMax(mx, TPH);
+    float sum = 0.0;
+    for (uint i = stl; i < len; i += TPH) {
+        float p = exp(sc[shh * CHMAX + i] - mx);
+        sc[shh * CHMAX + i] = p;
+        sum += p;
+    }
+    sum = subgroupClusteredAdd(sum, TPH);
+    if (stl == 0u) {
+        pm[(h0 + shh) * pc.n_chunks + c] = mx;
+        pl[(h0 + shh) * pc.n_chunks + c] = sum;
+    }
+    barrier();
+
+    // ── P·V: every V row read once, accumulated into all G heads ────────────────────────────────
+    float acc[G][8];
+    [[unroll]] for (uint hh = 0u; hh < uint(G); hh++) {
+        [[unroll]] for (uint i = 0u; i < 8u; i++) { acc[hh][i] = 0.0; }
+    }
+    for (uint p0 = 0u; p0 < npass; p0 += PIPE) {
+        uvec4 vw[PIPE];
+        float pw[PIPE][G];
+        [[unroll]] for (uint u = 0u; u < PIPE; u++) {
+            uint j = j0 + (p0 + u) * KPP + ks;
+            bool ok = j < j1;
+            uint jc = ok ? j : j0;
+            vw[u] = KV4(v_addr, ((RROW(jc) * pc.nkv + kvh) * uint(HD) + kofs) >> 1u);
+            [[unroll]] for (uint hh = 0u; hh < uint(G); hh++) {
+                pw[u][hh] = ok ? sc[hh * CHMAX + (j - j0)] : 0.0;
+            }
+        }
+        [[unroll]] for (uint u = 0u; u < PIPE; u++) {
+            float vf[8];
+            unpack8(vw[u], vf);
+            [[unroll]] for (uint hh = 0u; hh < uint(G); hh++) {
+                [[unroll]] for (uint i = 0u; i < 8u; i++) { acc[hh][i] = fma(pw[u][hh], vf[i], acc[hh][i]); }
+            }
+        }
+    }
+    // Fold the KPP key slots (lanes that share `kl`).
+    [[unroll]] for (uint s = LPK; s < 64u; s <<= 1u) {
+        [[unroll]] for (uint hh = 0u; hh < uint(G); hh++) {
+            [[unroll]] for (uint i = 0u; i < 8u; i++) { acc[hh][i] += subgroupShuffleXor(acc[hh][i], s); }
+        }
+    }
+    if (ks == 0u) {
+        [[unroll]] for (uint hh = 0u; hh < uint(G); hh++) {
+            uint pb = ((h0 + hh) * pc.n_chunks + c) * uint(HD) + kofs;
+            [[unroll]] for (uint i = 0u; i < 8u; i++) { pacc[pb + i] = acc[hh][i]; }
+        }
+    }
+}

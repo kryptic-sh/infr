@@ -745,10 +745,74 @@ fn main() {
             "native_gemv_kq_fma_q6k_nr4",
             &["-DFMT_Q6K", "-DNR=4"],
         ),
+        // Multi-row (verify) twin of the kq_fma decode GEMV above (MR=4 rows per workgroup
+        // sharing each superblock's weight-word load — see native_gemv_kq_fma_mrow.comp). No
+        // USE_RES builds: the fused residual is a decode-only (m=1) shape.
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q4k",
+            &["-DFMT_Q4K"],
+        ),
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q6k",
+            &["-DFMT_Q6K"],
+        ),
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q4k_nr4",
+            &["-DFMT_Q4K", "-DNR=4"],
+        ),
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q6k_nr4",
+            &["-DFMT_Q6K", "-DNR=4"],
+        ),
         (
             "native_gemv_kq_fma",
             "native_gemv_kq_fma_q6k_res_nr4",
             &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4"],
+        ),
+        // `kernels.vulkan.weights_as_ssbo` twins: the weight bound as a storage buffer.
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_ssbo",
+            &["-DFMT_Q4K", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res_ssbo",
+            &["-DFMT_Q4K", "-DUSE_RES", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_ssbo",
+            &["-DFMT_Q6K", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res_ssbo",
+            &["-DFMT_Q6K", "-DUSE_RES", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_nr4_ssbo",
+            &["-DFMT_Q4K", "-DNR=4", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res_nr4_ssbo",
+            &["-DFMT_Q4K", "-DUSE_RES", "-DNR=4", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_nr4_ssbo",
+            &["-DFMT_Q6K", "-DNR=4", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res_nr4_ssbo",
+            &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4", "-DWEIGHTS_SSBO"],
         ),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
         (
@@ -3413,6 +3477,28 @@ fn main() {
             out
         })
         .collect();
+    // GQA-batched decode pass 1 (`attn_decode_gqa.comp`): every (head dim, heads per kv head,
+    // sliding-window, record-once) combination `gemm::attn_decode_gqa_kernel` can select.
+    let mut builds = builds;
+    for hd in [128u32, 256, 512] {
+        for g in [4u32, 8] {
+            for swa in [false, true] {
+                for dynac in [false, true] {
+                    let mut defines = vec![format!("-DHD={hd}"), format!("-DG={g}")];
+                    let mut name = format!("attn_decode_gqa_hd{hd}_g{g}");
+                    if swa {
+                        defines.extend(["-DSWA".to_string(), "-DRING".to_string()]);
+                        name.push_str("_swa");
+                    }
+                    if dynac {
+                        defines.extend(["-DUSE_PARAMS".to_string(), "-DSELF_CHUNK".to_string()]);
+                        name.push_str("_dynac");
+                    }
+                    builds.push(("attn_decode_gqa".to_string(), name, defines));
+                }
+            }
+        }
+    }
     // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a
     // `bufferDeviceAddress` arena pool (native_weight_addr.glsl) instead of a bound SSBO, lifting the
     // ~4 GiB `maxStorageBufferRange` cap one SSBO binding imposes. `wants_streamed_twin` marks the

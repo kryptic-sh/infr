@@ -49,6 +49,9 @@ layout(push_constant) uniform PC {
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 #endif
 layout(binding = 0) readonly buffer QA { uint qa[]; };          // [m, k/4] packed int8 activations
+// The same activations viewed 16 bytes at a time: a row's block (WPB = 8 words) starts on a
+// 16-byte boundary (k%32 ⇒ kw%8), so staging issues 128-bit loads.
+layout(binding = 0) readonly buffer QA4 { uvec4 qa4[]; };
 layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, nblk]
 layout(binding = 2) readonly buffer SA { float16_t sact[]; };   // [m, nblk]
 #if !defined(PAGED) && !defined(STREAMED)
@@ -91,6 +94,20 @@ uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
 #endif
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
+// Four consecutive weight words starting at word `wi` (one 128-bit load where the path allows it).
+#if defined(PAGED) || defined(STREAMED)
+uvec4 w4(uint wi) { return arena_word4(wi); }
+#else
+uvec4 w4(uint wi) { return uvec4(nw[wi], nw[wi + 1u], nw[wi + 2u], nw[wi + 3u]); }
+#endif
+// k4() over a Q4_K block's 12 scale bytes already in registers (header words 1..3).
+uint sbyte(uvec3 sw, uint i) { return (sw[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+uvec2 k4r(uint i, uvec3 sw) {
+    if (i < 4u) { return uvec2(sbyte(sw, i) & 63u, sbyte(sw, i + 4u) & 63u); }
+    uint sc = (sbyte(sw, i + 4u) & 0xFu) | ((sbyte(sw, i - 4u) >> 6u) << 4u);
+    uint mn = (sbyte(sw, i + 4u) >> 4u) | ((sbyte(sw, i) >> 6u) << 4u);
+    return uvec2(sc, mn);
+}
 uvec2 k4(uint i, uint sb) {
     if (i < 4u) { return uvec2(rb(sb + i) & 63u, rb(sb + i + 4u) & 63u); }
     uint sc = (rb(sb + i + 4u) & 0xFu) | ((rb(sb + i - 4u) >> 6u) << 4u);
@@ -159,41 +176,79 @@ void main() {
     const bool live = true;
 #endif
 
+    // Register prefetch: block blk+1's global loads are issued BEFORE block blk's dp4a work and
+    // only written to shared after the trailing barrier, so their latency hides behind the math.
+    // (Staging, not the dp4a, bounded this kernel on RDNA2: measured with the math or the loads
+    // ablated, each alone took most of the full kernel's time.) Each thread owns at most NA/NB/NH
+    // of the tile's 128-bit loads.
+    const uint NA = (BM * (WPB / 4u) + THREADS - 1u) / THREADS;
+    const uint NB = (BN * (WPB / 4u) + THREADS - 1u) / THREADS;
+    const uint NH = (BN + THREADS - 1u) / THREADS;
+    uvec4 ra[NA];
+    uvec4 rbw[NB];
+    uvec4 rh[NH];
+    uint rsub[NH];
+    uint rsh[NB];
+    // Issue block `b`'s loads into registers.
+#define PREFETCH(b) \
+    [[unroll]] for (uint u = 0u; u < NA; u++) { \
+        uint idx = li + u * THREADS; \
+        if (idx < BM * (WPB / 4u)) { \
+            uint r = idx / (WPB / 4u); \
+            uint h = idx % (WPB / 4u); \
+            ra[u] = qa4[((wgRow + r) * kw + (b) * WPB) / 4u + h]; \
+        } \
+    } \
+    [[unroll]] for (uint u = 0u; u < NH; u++) { \
+        uint cc = li + u * THREADS; \
+        if (cc < BN) { \
+            uint gelem = wbase + (wgCol + cc) * pc.k + (b) * BLK; \
+            rsub[u] = (gelem / 32u) & 7u; \
+            rh[u] = w4(((gelem / 256u) * 144u) >> 2u); \
+        } \
+    } \
+    [[unroll]] for (uint u = 0u; u < NB; u++) { \
+        uint idx = li + u * THREADS; \
+        if (idx < BN * (WPB / 4u)) { \
+            uint cc = idx / (WPB / 4u); \
+            uint h = idx % (WPB / 4u); \
+            uint gelem = wbase + (wgCol + cc) * pc.k + (b) * BLK; \
+            uint sub = (gelem / 32u) & 7u; \
+            uint qbase = (gelem / 256u) * 144u + 16u + (sub >> 1u) * 32u; \
+            rsh[u] = (sub & 1u) * 4u; \
+            rbw[u] = w4((qbase >> 2u) + h * 4u); \
+        } \
+    }
+    PREFETCH(0u)
     for (uint blk = 0u; blk < nblk; blk++) {
-        // stage activations: BM rows × WPB packed words (rows ≥ m read garbage, output ignored)
-        for (uint idx = li; idx < BM * WPB; idx += THREADS) {
-            uint r = idx / WPB;
-            uint p = idx % WPB;
-            As[r * SP + p] = qa[(wgRow + r) * kw + blk * WPB + p];
+        // Write the prefetched block to shared (activations, per-col scale/min, weight nibbles).
+        [[unroll]] for (uint u = 0u; u < NA; u++) {
+            uint idx = li + u * THREADS;
+            if (idx < BM * (WPB / 4u)) {
+                uint o = (idx / (WPB / 4u)) * SP + (idx % (WPB / 4u)) * 4u;
+                As[o] = ra[u].x; As[o + 1u] = ra[u].y; As[o + 2u] = ra[u].z; As[o + 3u] = ra[u].w;
+            }
         }
-        // per-col 6-bit scale/min for this block
-        for (uint cc = li; cc < BN; cc += THREADS) {
-            uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
-            uint bd = (gelem / 256u) * 144u;
-            uint sub = (gelem / 32u) & 7u;
-            uvec2 km = k4(sub, bd + 4u);
-            Bdl[cc] = f16tof32(ru16(bd)) * float(km.x);
-            Bmm[cc] = f16tof32(ru16(bd + 2u)) * float(km.y);
+        [[unroll]] for (uint u = 0u; u < NH; u++) {
+            uint cc = li + u * THREADS;
+            if (cc < BN) {
+                uvec2 km = k4r(rsub[u], rh[u].yzw);
+                Bdl[cc] = f16tof32(rh[u].x) * float(km.x);
+                Bmm[cc] = f16tof32(rh[u].x >> 16u) * float(km.y);
+            }
         }
-        // stage weights: BN cols × WPB words, q4 nibbles → packed int8
-        for (uint idx = li; idx < BN * WPB; idx += THREADS) {
-            uint cc = idx / WPB;
-            uint j = idx % WPB;
-            uint gelem = wbase + (wgCol + cc) * pc.k + blk * BLK;
-            uint bd = (gelem / 256u) * 144u;
-            uint sub = (gelem / 32u) & 7u;
-            uint qbase = bd + 16u + (sub >> 1u) * 32u;
-            bool lo = (sub & 1u) == 0u;
-            uint wi = (qbase >> 2u) + j;
-#if defined(PAGED) || defined(STREAMED)
-            uint w = arena_word(wi);
-#else
-            uint w = nw[wi];
-#endif
-            uint qp = lo ? (w & 0x0F0F0F0Fu) : ((w >> 4u) & 0x0F0F0F0Fu);
-            Bs[cc * SP + j] = qp;
+        [[unroll]] for (uint u = 0u; u < NB; u++) {
+            uint idx = li + u * THREADS;
+            if (idx < BN * (WPB / 4u)) {
+                uvec4 w = (rbw[u] >> rsh[u]) & 0x0F0F0F0Fu;
+                uint o = (idx / (WPB / 4u)) * SP + (idx % (WPB / 4u)) * 4u;
+                Bs[o] = w.x; Bs[o + 1u] = w.y; Bs[o + 2u] = w.z; Bs[o + 3u] = w.w;
+            }
         }
         barrier();
+        if (blk + 1u < nblk) {
+            PREFETCH(blk + 1u)
+        }
 
         if (live) {
         int qsum[TM][TN];

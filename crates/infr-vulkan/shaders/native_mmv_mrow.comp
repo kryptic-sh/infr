@@ -605,6 +605,9 @@ void main() {
     // why no extra bounds check is needed here (the existing `live` guard below already covers a
     // padding workgroup's out-of-range o0 for every lane).
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u;
+    if (o0 >= pc.out_f) { return; } // fully-past-the-tail padding workgroup (2-D split
+    // rounding can land whole groups past out_f) — the per-output `live` guard below covers a
+    // PARTIAL tail group; without this, padding groups pay the full K-loop for nothing.
     uint t = gl_LocalInvocationID.x;
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint ot = t >> 4u;               // which of the 4 outputs this lane serves

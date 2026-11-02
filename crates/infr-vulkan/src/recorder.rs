@@ -3793,7 +3793,16 @@ impl<'a> Recorder<'a> {
         );
         assert_native_k("linear_mmv_mrow_at", in_f);
         self.label_gemv("mmvr_streamed", rows, in_f, out_f);
-        let o4 = in_f < 2048 && self.vk().mmv_o4;
+        // OUTS4 (4 outputs x 16 lanes, K-stride 16) exactly where the 2-output layout
+        // would idle lanes: nsub % 64 != 0 leaves a partial 64-wide K wave, while stride 16
+        // wastes no more than stride 64 anywhere (both exact, or OUTS4's tail is smaller) —
+        // E4B gate+up nsub=80 goes 37.5% lane-idle to fully packed. Where stride 64 is exact
+        // the 2-output subgroupAdd reduction wins, so it keeps those shapes. (The old
+        // `in_f < 2048` gate is the nsub < 64 subset of this rule.) The `mmv_o4` knob stays
+        // master; every (dtype, o4, m4, res) arm exists in `native_mmv_mrow_variant_spv`.
+        // An o0 early-out in the shader (not just the per-output `live` guard) keeps 2-D-split
+        // padding groups cheap, so ceil(out_f/4) landing just past 65535 can't regress lm_head.
+        let o4 = self.vk().mmv_o4 && (in_f / 32) % 64 != 0;
         let m4 = rows <= 4 && self.vk().mmv_m4;
         let res = residual.is_some();
         let (name, spv) = if rows > 8 {

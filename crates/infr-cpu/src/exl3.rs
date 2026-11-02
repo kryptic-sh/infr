@@ -30,10 +30,34 @@
 //!   the integer rates cb0 = 2 bpw, cb1 = 3 bpw, cb2 = 4 bpw.
 //! - Full-tensor layout (16x16 tiles, Hadamard + `suh`/`svh` scales) is Phase 1
 //!   scope. This module decodes **one 256-weight tile** given its trellis words,
-//!   which is the unit the CUDA `dq*` family operates on.
+//!   which is the unit the CUDA `dq*` family operates on. The second half of this
+//!   module (below [`decode_matrix`]) lifts tiles to full `(k, n)` matrices:
+//!   the in-tile permutation ([`tile_perm`], transliterated from
+//!   `reconstruct_tile`'s shuffle/scatter/readback in `reconstruct.cu`), the
+//!   `suh`/`svh` diagonal scales, and the orthonormal 128-wide Hadamard
+//!   ([`hadamard128`], `r_scale = scale / sqrt(128)` per `hadamard.cu`).
 //!
 //! Run: `cargo test -p infr-cpu --lib exl3` (unit goldens) and
 //! `cargo test -p infr-cpu --test exl3_parity` (seeded bit-parity sweep).
+//!
+//! # Phase-1 math (from `modules/quant/exl3.py` + `reconstruct.cu`)
+//!
+//! For a linear with trellis `T`, scales `suh` (k) / `svh` (n), bias `b`:
+//!
+//! ```text
+//! D[k,n] = decode(T)                       // rotated-basis weight (this module)
+//! S[k,n] = D[k,n] * suh[k] * svh[n]        // [`apply_scales`]
+//! xh = H * (suh * x) / sqrt(128)           // input pre-scale + Hadamard
+//! y_ = D^T * xh                            // GEMV/GEMM against the decoded trellis
+//! y  = svh * (H * y_) / sqrt(128) + b      // output Hadamard + post-scale + bias
+//! ```
+//!
+//! Equivalently `y = x @ W + b` with the folded weight
+//! `W = diag(suh) * H * D * H * diag(svh) / 128` (the `reconstruct_had_tile`
+//! comment in `reconstruct.cu`), which is what the prefill path materializes.
+//! `H` is the symmetric orthonormal FWHT ([`hadamard128`]); `suh` scales the
+//! input side, `svh` the output side (see `had_r_128(x, xh, suh, None, 1.0)`
+//! and `had_r_128(y_, y_, None, svh, 1.0)` in `exl3.py::forward`).
 
 use half::f16;
 
@@ -255,6 +279,151 @@ pub fn tile_words_u16(bits: u32) -> usize {
     16 * (bits as usize)
 }
 
+// ─── Phase 1: full-tensor layout ─────────────────────────────────────────────
+// Tiles to matrices: the in-tile permutation, the suh/svh scales, the Hadamard.
+//
+// Reference: `reconstruct_tile` in `reconstruct.cu` (decode + tensor-core shuffle
+// + scatter to row-major) and `had_hf/ff_r_128_inner` in `hadamard_inner.cuh`.
+
+/// In-tile permutation: stream index `s` (0..256, the `t_offset` order of [`decode_tile`])
+/// maps to within-tile `(row, col)` = `(perm[s] / 16, perm[s] % 16)`.
+///
+/// Transliterated from `reconstruct_tile` (`reconstruct.cu`): each warp decodes one
+/// 16x16 tile (`dq_dispatch(ptr, lane * 8, ...)` — lane `L` owns stream words
+/// `8*L..8*L+8`), the `__shfl_down_sync(..., 4)` + `tile[r][warp][c]` scatter routes
+/// `(lane, frag_entry)` to tile coordinates, and the `tile_int4[t]` readback copies
+/// tile halves to row-major `(k*16 + t/16, group*128 + (t%16)*8 + l)`.
+///
+/// Readback subtlety (`tile_int4[t] = ...`, `*out_int4 = tile_int4[t]`): an int4
+/// is FOUR half2, so readback quad `t` carries tile half2 `{4t..4t+3}` — tile
+/// row `r = t/16` (matching the output row), tile-in-group `W = (t%16)/2`, and
+/// tile col-pairs `c2 = 4*(t%2) + {0..3}`. Within-tile column is therefore
+/// `8*(c2 >= 4) + 2*(c2%4) + hi`, NOT `2*c2 + hi` (that misreading failed
+/// `tile_perm_is_permutation`; the test earns its keep).
+///
+/// The routing (shuffle/scatter/readback) is rate-independent; only the
+/// `(lane, entry) -> stream word` step depends on `bits` (see [`stream_index`]).
+/// `tile_perm_is_permutation` asserts the composed map is a bijection (every
+/// weight lands in exactly one matrix slot — a dropped or doubled weight would
+/// silently corrupt the model), and `fragment_entries_match_scalar_words`
+/// pins the rate-specific step against an independent bit-op transliteration.
+pub fn tile_perm(bits: u32) -> [u16; 256] {
+    assert!((1..=8).contains(&bits));
+    let mut perm = [0u16; 256];
+    // Readback half2 coordinates (r_t, w_t, c2_t, hi): tile[r_t][w_t][c2_t] low/high half.
+    // Inverting the scatter: the storing lane and frag entry behind each tile half.
+    for r_t in 0..16usize {
+        // Storing-lane residue: r_t = 2*(L%4) + {0,1} (+8 for the second row pair).
+        let m = (r_t % 8) / 2;
+        let jr = (r_t % 2) + if r_t >= 8 { 2 } else { 0 };
+        for c2 in 0..8usize {
+            // Storing lane: c2 in 0..4 -> c0 = L/8; c2 in 4..8 -> c1 = L/8 + 4.
+            let l = 8 * (c2 % 4) + m;
+            let e = jr + if c2 >= 4 { 4 } else { 0 };
+            // Within-tile column from the readback interleave (see above).
+            let c16 = 8 * usize::from(c2 >= 4) + 2 * (c2 % 4);
+            for hi in 0..2usize {
+                let s = stream_index(bits, (l + hi * 4) as u32, e as u32);
+                perm[s as usize] = (r_t * 16 + c16 + hi) as u16;
+            }
+        }
+    }
+    perm
+}
+
+/// Scalar stream word behind fragment entry `e` of warp lane `lane`.
+///
+/// `reconstruct_tile` calls `dq_dispatch(s_packed[warp], lane * 8, frag0, frag1)`.
+/// Every rate variant decodes 8 consecutive scalar words `8*lane..8*lane+8`
+/// (entries `e0..e7 = w0..w7`): `dq8`/`dq4`/`dq2x2` by the window arithmetic in
+/// `exl3_dq.cuh` (`b0 = (t_offset+257)*bits - 16`, windows spaced `bits` apart);
+/// the `aligned_1/2/4bit` specializations by the independent transliteration
+/// checked in `fragment_entries_match_scalar_words`.
+#[inline]
+fn stream_index(_bits: u32, lane: u32, entry: u32) -> u32 {
+    debug_assert!(entry < 8);
+    lane * 8 + entry
+}
+
+/// Decode a full `(k, n)` weight matrix from checkpoint trellis words (rotated basis,
+/// UNSCALED — caller applies [`apply_scales`]).
+///
+/// `trellis_u16` is the raw `*.trellis` tensor contents (`(k//16, n//16, 16*K)`
+/// int16, row-major): tile `(ki, nj)` holds `16*K` u16 words. Output is `(k, n)`
+/// row-major, one `f32` per weight, tile interiors ordered by [`tile_perm`].
+pub fn decode_matrix(cb: Codebook, bits: u32, trellis_u16: &[u16], k: usize, n: usize) -> Vec<f32> {
+    assert!((1..=8).contains(&bits));
+    assert!(k.is_multiple_of(16) && n.is_multiple_of(16));
+    let w = tile_words_u16(bits);
+    let (kti, nt) = (k / 16, n / 16);
+    assert_eq!(trellis_u16.len(), kti * nt * w);
+    let perm = tile_perm(bits);
+    let mut out = vec![0f32; k * n];
+    let mut tile32 = vec![0u32; w / 2];
+    for ki in 0..kti {
+        for nj in 0..nt {
+            let base = (ki * nt + nj) * w;
+            for (i, pair) in trellis_u16[base..base + w]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .enumerate()
+            {
+                tile32[i] = (pair[0] as u32) | ((pair[1] as u32) << 16);
+            }
+            let vals = decode_tile(cb, bits, &tile32);
+            for (s, v) in vals.iter().enumerate() {
+                let p = perm[s] as usize;
+                out[(ki * 16 + p / 16) * n + nj * 16 + p % 16] = *v;
+            }
+        }
+    }
+    out
+}
+
+/// Fold the diagonal scales: `mat[r*n+c] *= suh[r] * svh[c]` in place.
+///
+/// Upstream applies them around the Hadamards (`had_r_128(x, xh, suh, ...)` pre,
+/// `had_r_128(y_, y_, None, svh, ...)` post); the folded-matrix view in
+/// `reconstruct_columns` is the same product (`w *= suh` rows, `w *= svh` cols).
+/// `suh`/`svh` arrive as f16 in the checkpoint — convert to f32 on load.
+pub fn apply_scales(mat: &mut [f32], suh: &[f32], svh: &[f32], k: usize, n: usize) {
+    assert_eq!(mat.len(), k * n);
+    assert_eq!(suh.len(), k);
+    assert_eq!(svh.len(), n);
+    for (r, row) in mat.chunks_exact_mut(n).enumerate() {
+        let a = suh[r];
+        for (c, v) in row.iter_mut().enumerate() {
+            *v *= a * svh[c];
+        }
+    }
+}
+
+/// In-place orthonormal 128-point Hadamard (FWHT + `/sqrt(128)`).
+///
+/// Matches `had_hf/ff_r_128_inner` with `r_scale = scale / sqrt(128)` (`hadamard.cu`;
+/// `0.088388347648f`): pre-scale, butterfly, single `/sqrt(128)` normalization.
+/// `H` is symmetric and orthonormal: `H(H(x)) == x`, `|H(x)| == |x|`.
+pub fn hadamard128(v: &mut [f32]) {
+    assert_eq!(v.len(), 128);
+    let mut len = 1usize;
+    while len < 128 {
+        for i in (0..128).step_by(2 * len) {
+            for j in 0..len {
+                let (a, b) = (v[i + j], v[i + j + len]);
+                v[i + j] = a + b;
+                v[i + j + len] = a - b;
+            }
+        }
+        len *= 2;
+    }
+    // 1/sqrt(128): the exact CUDA constant, not a recomputation.
+    const R_SCALE: f32 = 0.088388347648_f64 as f32;
+    for x in v.iter_mut() {
+        *x *= R_SCALE;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,4 +520,402 @@ mod tests {
             }
         }
     }
-}
+
+    // ── Phase-1 layout tests ────────────────────────────────────────────
+
+    /// Deterministic PRBS for the layout tests (xorshift64, no `rand` dep).
+    fn xrs(state: &mut u64) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        (*state >> 32) as u32
+    }
+
+    fn prbs_tile(bits: u32, seed: u64) -> Vec<u32> {
+        let n = bits as usize * 8;
+        let mut s = seed | 1;
+        (0..n).map(|_| xrs(&mut s)).collect()
+    }
+
+    /// Scalar window start of stream word `s` (the `dq` formula), for pinning
+    /// the fragment extractors below against [`window16_funnel`].
+    fn scalar_b0(bits: u32, s: u32) -> usize {
+        (s as usize) * (bits as usize) + (bits as usize) + 256 * (bits as usize) - 16
+    }
+
+    /// Exact transliteration of the `aligned_*` + `dq8`/`dq4`/`dq2x2` fragment
+    /// extractors' EIGHT windows for the lane decoded at `idx` (`dq_dispatch`
+    /// is always called with `lane * 8`). Entry order `e0..e7 = w0..w7`
+    /// (`frag0[0] = (w0,w1)`, `frag0[1] = (w2,w3)`, `frag1[0] = (w4,w5)`,
+    /// `frag1[1] = (w6,w7)`), matching [`stream_index`]'s contract.
+    ///
+    /// Bit-op details from `exl3_dq.cuh`: `FSHF_IMM(s, b, a, imm)` is read as
+    /// `funnelshift_r(b, a, imm)` (same arg order as the scalar `dq`'s
+    /// `__funnelshift_r(b, a, s0)`); `BFE16_IMM(w, b, n)` is `(b >> n) & 0xffff`.
+    /// If either macro reads the other way, this test fails and the shift
+    /// direction gets revisited — it does NOT silently adapt.
+    fn fragment_windows(bits: u32, words: &[u32], idx: u32) -> [u16; 8] {
+        let nwords = words.len() as u32;
+        let at = |i: u32| words[(i % nwords) as usize];
+        let mut w = [0u16; 8];
+        match bits {
+            1 => {
+                let i1 = idx >> 5;
+                let a = at(i1.wrapping_add(nwords - 1) % nwords);
+                let b0 = at(i1);
+                let b = funnel(a, b0, (!idx) & 24);
+                for j in 0..8 {
+                    w[j] = ((b >> (7 - j as u32)) & 0xffff) as u16;
+                }
+            }
+            2 => {
+                let i1 = idx >> 4;
+                let a = at(i1.wrapping_add(nwords - 1) % nwords);
+                let b0 = at(i1);
+                let b = funnel(a, b0, ((!idx) & 8) << 1);
+                for j in 0..8 {
+                    w[j] = ((b >> (2 * (7 - j as u32))) & 0xffff) as u16;
+                }
+            }
+            3 => {
+                // dq8<bits=3, align=4>: two funnel shifts + shift chains.
+                // NOTE the shifts operate on UNMASKED 32-bit values (masks
+                // apply at decode); the transliteration keeps full u32s too.
+                let b1 = (idx + 257) * 3;
+                let b2 = b1 + 3 * 7;
+                let b0 = b1 - 16;
+                let i0 = b0 / 32;
+                let i2 = (b2 - 1) / 32;
+                let s2 = (i2 + 1) * 32 - b2;
+                let a = at(i0);
+                let b = at(i2);
+                let mut f = [0u32; 8];
+                f[7] = funnel(a, b, s2);
+                f[6] = f[7] >> 3;
+                f[5] = f[6] >> 3;
+                f[4] = f[5] >> 3;
+                f[3] = funnel(a, b, s2 + 3 * 4);
+                f[2] = f[3] >> 3;
+                f[1] = f[2] >> 3;
+                f[0] = f[1] >> 3;
+                for j in 0..8 {
+                    w[j] = (f[j] & 0xffff) as u16;
+                }
+            }
+            4 => {
+                let i1 = idx >> 3;
+                let a = at(i1.wrapping_add(nwords - 1) % nwords);
+                let b0 = at(i1);
+                let s = funnel(a, b0, 20);
+                w[7] = (b0 & 0xffff) as u16;
+                w[6] = ((b0 >> 4) & 0xffff) as u16;
+                w[5] = ((b0 >> 8) & 0xffff) as u16;
+                w[4] = ((b0 >> 12) & 0xffff) as u16;
+                w[3] = ((b0 >> 16) & 0xffff) as u16;
+                w[2] = (s & 0xffff) as u16;
+                w[1] = ((s >> 4) & 0xffff) as u16;
+                w[0] = ((s >> 8) & 0xffff) as u16;
+            }
+            5 | 6 | 8 => {
+                // dq4(idx) -> e0..e3, dq4(idx+4) -> e4..e7: the
+                // (t_offset+257)*bits - 16 window arithmetic, textually
+                // independent of the scalar dq's t*bits + bits - 16 + 256*bits.
+                for (g, base) in [(0, idx), (4, idx + 4)] {
+                    let b0 = (base + 257) * bits - 16;
+                    let b2 = b0 + 3 * bits + 16;
+                    let i0 = b0 / 32;
+                    let i2 = (b2 - 1) / 32;
+                    let s2 = (i2 + 1) * 32 - b2;
+                    let a = at(i0);
+                    let b = at(i2);
+                    w[g] = (funnel(a, b, s2 + 3 * bits) & 0xffff) as u16;
+                    w[g + 1] = (funnel(a, b, s2 + 2 * bits) & 0xffff) as u16;
+                    w[g + 2] = (funnel(a, b, s2 + bits) & 0xffff) as u16;
+                    w[g + 3] = (funnel(a, b, s2) & 0xffff) as u16;
+                }
+            }
+            7 => {
+                // dq2x2(idx) -> e0..e3, dq2x2(idx+4) -> e4..e7.
+                for (g, base) in [(0, idx), (4, idx + 4)] {
+                    for i in 0..2u32 {
+                        let b0 = (base + 2 * i + 257) * bits - 16;
+                        let b2 = b0 + bits + 16;
+                        let i0 = b0 / 32;
+                        let i2 = (b2 - 1) / 32;
+                        let s2 = (i2 + 1) * 32 - b2;
+                        let a = at(i0);
+                        let b = at(i2);
+                        w[g + (2 * i) as usize] = (funnel(a, b, s2 + bits) & 0xffff) as u16;
+                        w[g + (2 * i + 1) as usize] = (funnel(a, b, s2) & 0xffff) as u16;
+                    }
+                }
+            }
+            _ => panic!("integer rates 1..=8, got {bits}"),
+        }
+        w
+    }
+
+    /// Every fragment entry of every lane must be the scalar window of the
+    /// matching stream word (`idx + entry`): the rate-specific half of the
+    /// [`tile_perm`] composition. For `dq8`/`dq4`/`dq2x2` this re-derives the
+    /// window arithmetic through a second code path; for the `aligned_*`
+    /// specializations the bit ops are genuinely independent of the scalar
+    /// funnel reader, so agreement pins both (including the `FSHF_IMM` shift
+    /// direction and the MSB-first stream order).
+    #[test]
+    fn fragment_entries_match_scalar_words() {
+        for bits in 1..=8u32 {
+            let words = prbs_tile(bits, 0x1234_5678_9abc_def0 ^ (bits as u64));
+            for lane in 0..32u32 {
+                let idx = lane * 8;
+                let got = fragment_windows(bits, &words, idx);
+                for (j, g) in got.iter().enumerate() {
+                    let want = window16_funnel(&words, scalar_b0(bits, idx + j as u32));
+                    assert_eq!(
+                        *g, want,
+                        "bits={bits} lane={lane} entry={j}: fragment {g:#06x} != scalar {want:#06x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The composed in-tile map must be a bijection: 256 stream words to 256
+    /// distinct `(row, col)` slots. A collision would stack two weights in one
+    /// slot (and leave another zero); a gap would drop a weight — both
+    /// silently corrupt the matrix.
+    #[test]
+    fn tile_perm_is_permutation() {
+        for bits in 1..=8u32 {
+            let mut seen = tile_perm(bits);
+            seen.sort_unstable();
+            for (i, v) in seen.iter().enumerate() {
+                assert_eq!(*v as usize, i, "bits={bits}: perm is not bijective at {i}");
+            }
+        }
+    }
+
+    /// `pack_trellis_kernel` transliteration (`pack.cu`): 256 K-bit codes to
+    /// `16*K` packed u16 words, 16 spans of 16 weights MSB-first, with the
+    /// kernel's `SWAP16` on the u32 store.
+    fn pack_codes(codes: &[u16], bits: u32) -> Vec<u16> {
+        assert_eq!(codes.len(), 256);
+        let k = bits;
+        let mut packed = vec![0u16; 16 * k as usize];
+        for span in 0..16usize {
+            let (mut i, mut j, mut kk, mut buf) = (16 * span, k as usize * span, 32u32, 0u32);
+            for _ in 0..16 {
+                let v = (codes[i] as u32) & ((1 << k) - 1);
+                kk -= k;
+                buf |= v << kk;
+                if kk <= 16 {
+                    packed[j] = (buf >> 16) as u16;
+                    buf <<= 16;
+                    kk += 16;
+                    j += 1;
+                }
+                i += 1;
+            }
+        }
+        // SWAP16 on each u32: swap the two u16 halves.
+        for pair in packed.as_chunks_mut::<2>().0.iter_mut() {
+            pair.swap(0, 1);
+        }
+        packed
+    }
+
+    /// Reference bitstream packer: 256 K-bit codes to u32 words, MSB-first
+    /// (code 0's K bits at the TOP of word 0). Obviously correct by
+    /// construction; the anchor the two transliterations below are checked
+    /// against.
+    fn pack_stream_u32(codes: &[u16], bits: u32) -> Vec<u32> {
+        assert_eq!(codes.len(), 256);
+        let nbits = 256 * bits as usize;
+        let mut words = vec![0u32; nbits / 32];
+        for (u, c) in codes.iter().enumerate() {
+            for j in 0..bits as usize {
+                // Code bit j (MSB-first: j=0 is the code's top bit) lives at
+                // stream bit u*K + j; stream bit k is word bit 31 - (k % 32).
+                if (c >> (bits as usize - 1 - j)) & 1 == 1 {
+                    let k = u * bits as usize + j;
+                    words[k / 32] |= 1 << (31 - (k % 32));
+                }
+            }
+        }
+        words
+    }
+
+    /// `unpack_trellis_kernel` transliteration over a u32 stream (`pack.cu`):
+    /// thread `t` yields windows `2t, 2t+1` (`word01 = w1 << 16 | w0`, so
+    /// `unpacked[2t] = w0`, `unpacked[2t+1] = w1`).
+    ///
+    /// Arg order note: unpack calls `__funnelshift_r(b, a, s1)` with `a` the
+    /// FIRST-bit word and `b` the LAST-bit word — the same convention as the
+    /// scalar `dq` (`__funnelshift_r(b, a, s0)`), i.e. CUDA's `(lo, hi)` args
+    /// map to this module's `funnel(hi, lo, shift)`, so `funnel(a, b, s1)`.
+    fn unpack_from_u32(words32: &[u32], bits: u32) -> Vec<u16> {
+        let k = bits as usize;
+        let n32 = words32.len() as u32;
+        let mut out = vec![0u16; 256];
+        for t in 0..128usize {
+            let b0 = t * 2 * k + k + 256 * k - 16;
+            let b1 = b0 + k;
+            let b2 = b1 + 16;
+            let i0 = b0 / 32;
+            let i1 = (b2 - 1) / 32;
+            let s1 = ((i1 + 1) * 32 - b2) as u32;
+            let a = words32[i0 % n32 as usize];
+            let b = words32[i1 % n32 as usize];
+            let w1 = funnel(a, b, s1) & 0xffff;
+            let w0 = funnel(a, b, s1 + k as u32) & 0xffff;
+            out[2 * t] = w0 as u16;
+            out[2 * t + 1] = w1 as u16;
+        }
+        out
+    }
+
+    /// Three upstream kernels must agree on the stream layout, or the oracle's
+    /// bit order matches neither the quantizer nor the decoder:
+    ///
+    /// (a) `pack_trellis_kernel`'s u16 output, read as raw u32 pairs (exactly
+    ///     what `unpack_trellis_kernel`'s `((uint32_t*) g_packed)[t]` sees,
+    ///     SWAP16 included), must equal the reference bitstream — pins the
+    ///     SWAP16 endianness dance.
+    /// (b) `unpack_trellis_kernel`'s windows must equal the scalar funnel
+    ///     reader at stream words `2t, 2t+1` — pins the unpack index
+    ///     arithmetic (`i0/i1/s1`) against the Phase-0-verified reader.
+    /// (c) Scalar window `s` must carry code `s` in its LOW `K` bits (window
+    ///     `[sK+K-16+256K, +16)` overlaps code `[sK, sK+K)` at its tail) — pins
+    ///     the code/window alignment the trellis constraint relies on.
+    #[test]
+    fn pack_unpack_roundtrip_matches_scalar() {
+        for bits in 1..=8u32 {
+            let mut s = 0x5eed_5eed_5eed_5eed ^ (bits as u64);
+            let mask = (1u32 << bits) - 1;
+            let codes: Vec<u16> = (0..256).map(|_| (xrs(&mut s) & mask) as u16).collect();
+            // (a) transliterated pack (with SWAP16) == reference bitstream.
+            let packed = pack_codes(&codes, bits);
+            let as_u32: Vec<u32> = packed
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| (p[0] as u32) | ((p[1] as u32) << 16))
+                .collect();
+            assert_eq!(
+                as_u32,
+                pack_stream_u32(&codes, bits),
+                "bits={bits}: pack transliteration != reference bitstream"
+            );
+            // (b) unpack transliteration == scalar reader, every window.
+            let words32 = pack_stream_u32(&codes, bits);
+            let unpacked = unpack_from_u32(&words32, bits);
+            for (u, w) in unpacked.iter().enumerate() {
+                let want = window16_funnel(&words32, scalar_b0(bits, u as u32));
+                assert_eq!(*w, want, "bits={bits} word={u}: unpack != scalar");
+            }
+            // (c) window s carries code s in its low K bits.
+            for (u, w) in unpacked.iter().enumerate() {
+                assert_eq!(
+                    *w & (mask as u16),
+                    codes[u],
+                    "bits={bits} word={u}: window does not contain its code"
+                );
+            }
+        }
+    }
+    /// `decode_matrix` must equal per-tile `decode_tile` scattered by
+    /// [`tile_perm`], and stay finite over adversarial bytes at every rate.
+    #[test]
+    fn decode_matrix_agrees_with_scattered_tiles() {
+        for bits in 1..=8u32 {
+            let (k, n) = (32, 48);
+            let w = tile_words_u16(bits);
+            let mut s = 0x7777_7777_7777_7777 ^ (bits as u64);
+            let trellis: Vec<u16> = (0..(k / 16) * (n / 16) * w)
+                .map(|_| xrs(&mut s) as u16)
+                .collect();
+            for cb in [Codebook::Cb0, Codebook::Cb1, Codebook::Cb2] {
+                let mat = decode_matrix(cb, bits, &trellis, k, n);
+                assert_eq!(mat.len(), k * n);
+                assert!(mat.iter().all(|v| v.is_finite()), "bits={bits} {cb:?}");
+                // Manual scatter of the same tiles.
+                let perm = tile_perm(bits);
+                let tile32n = w / 2;
+                for ki in 0..k / 16 {
+                    for nj in 0..n / 16 {
+                        let base = (ki * (n / 16) + nj) * w;
+                        let t32: Vec<u32> = trellis[base..base + w]
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|p| (p[0] as u32) | ((p[1] as u32) << 16))
+                            .collect();
+                        assert_eq!(t32.len(), tile32n);
+                        let vals = decode_tile(cb, bits, &t32);
+                        for (st, v) in vals.iter().enumerate() {
+                            let p = perm[st] as usize;
+                            assert_eq!(
+                                mat[(ki * 16 + p / 16) * n + nj * 16 + p % 16],
+                                *v,
+                                "bits={bits} tile=({ki},{nj}) stream={st}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `apply_scales` multiplies rows by `suh` and columns by `svh`.
+    #[test]
+    fn apply_scales_folds_both_sides() {
+        let (k, n) = (32, 16);
+        let mut mat = vec![1.0f32; k * n];
+        let suh: Vec<f32> = (0..k).map(|r| (r + 1) as f32).collect();
+        let svh: Vec<f32> = (0..n).map(|c| 0.5 + 0.25 * c as f32).collect();
+        apply_scales(&mut mat, &suh, &svh, k, n);
+        for r in 0..k {
+            for c in 0..n {
+                assert_eq!(mat[r * n + c], (r + 1) as f32 * (0.5 + 0.25 * c as f32));
+            }
+        }
+    }
+
+    /// `hadamard128` is the orthonormal FWHT: involution, norm-preserving,
+    /// with the two closed forms (`H(e0) = 1/sqrt(128)`, `H(ones)[0] = sqrt(128)`).
+    #[test]
+    fn hadamard128_is_orthonormal() {
+        // e0 -> uniform 1/sqrt(128).
+        let mut v = [0.0f32; 128];
+        v[0] = 1.0;
+        hadamard128(&mut v);
+        let want = 1.0 / 128.0f32.sqrt();
+        for x in v {
+            assert!((x - want).abs() < 1e-6, "H(e0) = {x}, want {want}");
+        }
+        // ones -> (sqrt(128), 0, ..., 0).
+        let mut v = [1.0f32; 128];
+        hadamard128(&mut v);
+        assert!((v[0] - 128.0f32.sqrt()).abs() < 1e-4, "H(1)[0] = {}", v[0]);
+        for x in v.iter().skip(1) {
+            assert!(x.abs() < 1e-4, "H(1)[i!=0] = {x}");
+        }
+        // Involution + norm preservation on PRBS data.
+        let mut s = 0x5a5a_5a5a_5a5a_5a5a;
+        let orig: Vec<f32> = (0..128)
+            .map(|_| (xrs(&mut s) as f32 / u32::MAX as f32) * 2.0 - 1.0)
+            .collect();
+        let norm0: f32 = orig.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let mut v = orig.clone();
+        hadamard128(&mut v);
+        let norm1: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm0 - norm1).abs() / norm0 < 1e-5,
+            "norm {norm0} -> {norm1}"
+        );
+        hadamard128(&mut v);
+        for (a, b) in v.iter().zip(&orig) {
+            assert!((a - b).abs() < 1e-4, "H(H(x)) != x: {a} vs {b}");
+        }
+    }
+} // mod tests

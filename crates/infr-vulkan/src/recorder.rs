@@ -3197,7 +3197,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        let nr = self.kq_fma_gemv_rows(out_f);
+        let nr = self.kq_fma_gemv_rows(in_f, out_f);
         self.linear_kq_fma_mrow_nr(dtype, w, w_base, x, y, rows, in_f, out_f, nr);
     }
 

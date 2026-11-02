@@ -9,11 +9,13 @@
 // int8-quantized activations flip near-tie greedy tokens vs the fp32 decode stream (the Gemma4
 // MTP verify failure mode).
 // Per-row float op ORDER is identical to the m=1 kernel (same strided superblock traversal per
-// lane, same tree reduction), so row r here is bit-identical to the m=1 kernel's output for that
+// lane, same subgroup reduction), so row r here is bit-identical to the m=1 kernel's output for that
 // row — the MTP-verify-vs-decode identity contract holds by construction, the same argument as
 // the unified `linear_mmv_mrow(rows=1)` decode.
 // -DFMT_Q4K | -DFMT_Q6K. Requires in_f % 256 == 0. MR is fixed at 4; any `rows` runs grouped.
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 #ifndef NR
 #define NR 8
@@ -189,19 +191,29 @@ void main() {
     // One m=1-shaped reduction per row (uniform guard — every lane agrees, barriers stay legal).
     [[unroll]] for (uint mr = 0u; mr < MR; mr++) {
         if (g0 + mr < pc.rows) {
+            float part[NR];
             [[unroll]] for (uint g = 0u; g < RG; g++)
-                [[unroll]] for (uint r = 0u; r < 4u; r++)
-                    red[(4u * g + r) * 64u + lane] = acc[mr][g][r];
-            barrier();
-            [[unroll]] for (uint s = 32u; s > 0u; s >>= 1u) {
-                if (lane < s) {
-                    [[unroll]] for (uint r = 0u; r < uint(NR); r++)
-                        red[r * 64u + lane] += red[r * 64u + lane + s];
+                [[unroll]] for (uint r = 0u; r < 4u; r++) part[4u * g + r] = subgroupAdd(acc[mr][g][r]);
+            if (gl_NumSubgroups > 1u) {
+                if (subgroupElect()) {
+                    [[unroll]] for (uint r = 0u; r < uint(NR); r++) red[gl_SubgroupID * uint(NR) + r] = part[r];
                 }
+                barrier();
+                if (lane < uint(NR)) {
+                    float v = 0.0;
+                    for (uint s = 0u; s < gl_NumSubgroups; s++) v += red[s * uint(NR) + lane];
+                    red[lane] = v;
+                }
+                barrier();
+                [[unroll]] for (uint r = 0u; r < uint(NR); r++) part[r] = red[r];
                 barrier();
             }
             if (lane < uint(NR) && o0 + lane < pc.out_f) {
-                y[(g0 + mr) * pc.out_f + o0 + lane] = red[lane * 64u];
+                float v = part[0];
+                [[unroll]] for (uint r = 1u; r < uint(NR); r++) {
+                    if (lane == r) v = part[r];
+                }
+                y[(g0 + mr) * pc.out_f + o0 + lane] = v;
             }
         }
     }

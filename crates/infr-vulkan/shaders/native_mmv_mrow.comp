@@ -165,9 +165,25 @@ uvec2 k4(uint i, uint sb) {
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 256u) * 144u; // super-block byte base
     uint sub = (gelem / 32u) & 7u;   // sub-block 0..7
+#ifdef Q4K_PACKED_META
+    // The 16-byte header is aligned (144-byte block stride): one wide load replaces
+    // repeated byte/half loads of d, dmin and the twelve packed scale/min bytes.
+    // Extract the exact same six-bit fields as k4(), including sub-blocks 4..7.
+    uvec4 meta = NW4(bd >> 2u);
+    vec2 dm = unpackHalf2x16(meta.x);
+    float d = dm.x;
+    float dmin = dm.y;
+    uint sh = (sub & 3u) * 8u;
+    uint sc = (meta.y >> sh) & 255u;
+    uint mn = (meta.z >> sh) & 255u;
+    uint hi = (meta.w >> sh) & 255u;
+    uvec2 km = sub < 4u ? uvec2(sc & 63u, mn & 63u)
+        : uvec2((hi & 15u) | ((sc >> 6u) << 4u), (hi >> 4u) | ((mn >> 6u) << 4u));
+#else
     float d = f16tof32(ru16(bd));
     float dmin = f16tof32(ru16(bd + 2u));
     uvec2 km = k4(sub, bd + 4u);
+#endif
     f0 = d * float(km.x);
     f1 = dmin * float(km.y);
     // qbase is always word-aligned (bd = sb·144, 144 % 4 == 0; +16 +32·k) — load each 4-byte

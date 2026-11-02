@@ -641,6 +641,38 @@ pub(crate) fn native_mmv_spv(
         _ => None,
     }
 }
+/// Packed-header twins for Q4_K OUTS4. Only metadata loads/unpacking differ;
+/// the dot products, row/K lane layout and reduction tree stay unchanged.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_mmv_mrow_q4k_meta_spv(
+    m4: bool,
+    res: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! v {
+        ($suffix:literal) => {{
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            Some((
+                concat!("native_mmv_mrow_q4k", $suffix, "_packed_meta"),
+                S.get_or_init(|| {
+                    spv_words(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/native_mmv_mrow_q4k",
+                        $suffix,
+                        "_packed_meta.spv"
+                    )))
+                })
+                .as_slice(),
+            ))
+        }};
+    }
+    match (m4, res) {
+        (false, false) => v!("_o4"),
+        (true, false) => v!("_o4_m4"),
+        (true, true) => v!("_o4_m4_res"),
+        (false, true) => None,
+    }
+}
+
 /// SPIR-V (kernel-cache name + words) for a multi-row int8 dp4a GEMV layout variant, covering the
 /// rows<=8 layout matrix: `o4` = the small-in_f 4-outputs × 16-K-lanes workgroup split
 /// (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4), `res` = the fused-residual decode

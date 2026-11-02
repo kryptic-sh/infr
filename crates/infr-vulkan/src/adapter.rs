@@ -6146,6 +6146,21 @@ fn quant_linear(
         && be_.cfg().kernels.vulkan.mrow
         && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
     {
+        // fp32 K-quant multi-row GEMV for an MTP-VERIFY batch on the emulated-dot tier (GCN4):
+        // decode runs fp32 here (`linear_kq_fma`), and the int8 mrow would both run ALU-bound on
+        // emulated dp4a and score differently from the fp32 decode stream. Same per-row math as
+        // decode, bit-identical row-for-row, keyed off the DECODE knob.
+        if graph.mtp_verify
+            && w.buffer.is_some()
+            && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off)
+            && crate::gemm::native_gemv_kq_fma_mrow_spv(dt, 8).is_some()
+        {
+            let Some(wb) = w.buffer else {
+                unreachable!("kq_fma_gemv_ok implies a resident weight buffer")
+            };
+            rec.linear_kq_fma_mrow(dt, wb, w_off, xb, y, m, in_f, out_f);
+            return Ok(());
+        }
         // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
         // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
         // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound

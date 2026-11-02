@@ -6,7 +6,6 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
 use tokenizers::decoders::byte_fallback::ByteFallback;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
 use tokenizers::decoders::fuse::Fuse;
@@ -87,7 +86,7 @@ fn register_token_types(md: &Metadata, toks: &[MetaValue], tok: &mut Tokenizer) 
 /// user-defined tokens (token_type 3/4, e.g. `<|im_start|>`) registered as special so they encode
 /// atomically. SentencePiece (`model == "llama"`) isn't built here — pass a `tokenizer.json`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
+pub(crate) fn build_tokenizer(g: &dyn WeightSource) -> Result<Tokenizer> {
     let md = g.metadata();
     let model = md.str("tokenizer.ggml.model").unwrap_or("");
     match model {
@@ -236,7 +235,7 @@ fn build_multi_split_seq(patterns: &[&str]) -> Result<PreSequence> {
 /// (type 3, e.g. `<bos>`/`<start_of_turn>`) register as special so they encode atomically. The
 /// Metaspace replacement (▁) maps spaces; `add_space_prefix` controls the leading dummy space.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
+pub(crate) fn build_spm_tokenizer(g: &dyn WeightSource) -> Result<Tokenizer> {
     let md = g.metadata();
     let toks = md
         .get("tokenizer.ggml.tokens")
@@ -326,6 +325,7 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
 mod tokenizer_tests {
     use super::*;
     use crate::sampling::{sample_logits, Sampler};
+    use infr_gguf::Gguf;
 
     /// The chunk boundaries a DeepSeek pre-tokenizer sequence yields, as slices of the ORIGINAL
     /// text. [`build_multi_split_seq`] ends the sequence with `ByteLevel`, which rewrites each

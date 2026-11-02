@@ -3,7 +3,6 @@
 use crate::*;
 use anyhow::{anyhow, Result};
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
 use tokenizers::Tokenizer;
 
 /// Qwen2/Qwen3 pre-tokenizer regex (same string the HF `tokenizer.json` uses) — applied via a
@@ -62,7 +61,10 @@ pub(crate) struct PerLayerEmbd {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn build_per_layer_embd(g: &Gguf, cfg: &Config) -> Result<Option<PerLayerEmbd>> {
+pub(crate) fn build_per_layer_embd(
+    g: &dyn WeightSource,
+    cfg: &Config,
+) -> Result<Option<PerLayerEmbd>> {
     if cfg.n_embd_per_layer == 0 {
         return Ok(None);
     }
@@ -204,13 +206,13 @@ pub(crate) fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn meta_u64(g: &Gguf, key: &str) -> Option<u64> {
+pub(crate) fn meta_u64(g: &dyn WeightSource, key: &str) -> Option<u64> {
     g.metadata().u64(key)
 }
 
 /// Float metadata lookup (diffusion-gemma's `eb_*` sampler params are stored as GGUF strings —
 /// same KV store, no typed float accessor on `Metadata` — so parse through `as_f64`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn meta_f64(g: &Gguf, key: &str) -> Option<f64> {
+pub(crate) fn meta_f64(g: &dyn WeightSource, key: &str) -> Option<f64> {
     g.metadata().get(key).and_then(|v| v.as_f64())
 }

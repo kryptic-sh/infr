@@ -142,7 +142,7 @@ pub fn generate_mtp_spec_vulkan_timed_on(
     };
     let mut head_sess = MtpHeadSession::new_vulkan(
         vk,
-        model.gguf(),
+        model.weights(),
         cfg,
         model.engine_cfg(),
         head,
@@ -186,7 +186,7 @@ pub fn generate_mtp_spec_metal_timed(
     };
     let mut head_sess = MtpHeadSession::new_metal(
         &mtl,
-        model.gguf(),
+        model.weights(),
         cfg,
         model.engine_cfg(),
         head,
@@ -232,7 +232,7 @@ pub fn generate_mtp_spec_cpu_timed(
     };
     let mut head_sess = MtpHeadSession::new_cpu(
         &cpu,
-        model.gguf(),
+        model.weights(),
         cfg,
         model.engine_cfg(),
         head,

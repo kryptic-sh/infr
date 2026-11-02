@@ -50,7 +50,10 @@ impl Safetensors {
                 path.display()
             )));
         }
-        let hlen = u64::from_le_bytes(mmap[..8].try_into().expect("len checked")) as usize;
+        let hlen = usize::try_from(u64::from_le_bytes(
+            mmap[..8].try_into().expect("len checked"),
+        ))
+        .map_err(|_| Error::Loader("safetensors header length overflows usize".into()))?;
         let data_start = hlen_size
             .checked_add(hlen)
             .ok_or_else(|| Error::Loader("safetensors header length overflows usize".into()))?;
@@ -141,10 +144,17 @@ impl Safetensors {
                     path.display()
                 )));
             }
-            let nbytes = (end - begin) as usize;
-            let numel: usize = shape.iter().product();
-            let expect = dtype.dense_bytes(numel).ok_or_else(|| {
+            let nbytes = usize::try_from(end - begin)
+                .map_err(|_| Error::Loader(format!("{name}: tensor byte range overflows usize")))?;
+            let numel = shape
+                .iter()
+                .try_fold(1usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| Error::Loader(format!("{name}: shape product overflows usize")))?;
+            let width = dtype.dense_bytes(1).ok_or_else(|| {
                 Error::Loader(format!("{name}: quant dtype {dtype:?} in safetensors"))
+            })?;
+            let expect = numel.checked_mul(width).ok_or_else(|| {
+                Error::Loader(format!("{name}: tensor byte size overflows usize"))
             })?;
             if nbytes != expect {
                 return Err(Error::Loader(format!(
@@ -169,6 +179,22 @@ impl Safetensors {
                 offset,
                 nbytes,
             });
+        }
+        let mut ranges: Vec<_> = tensors.iter().map(|t| (t.offset, t.nbytes)).collect();
+        ranges.sort_unstable();
+        let mut cursor = data_start as u64;
+        for (offset, size) in ranges {
+            if offset != cursor {
+                return Err(Error::Loader(
+                    "safetensors tensor ranges overlap or leave a gap".into(),
+                ));
+            }
+            cursor += size as u64;
+        }
+        if cursor != file_len as u64 {
+            return Err(Error::Loader(
+                "safetensors has unclaimed trailing data".into(),
+            ));
         }
         Ok(Self {
             mmap,
@@ -219,6 +245,10 @@ impl WeightSource for Safetensors {
     fn chat_template(&self) -> Option<&str> {
         None
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -248,6 +278,55 @@ mod tests {
         f.write_all(bytes).expect("write fixture");
         f.flush().unwrap();
         f
+    }
+
+    fn file_for_header(header: serde_json::Value, bytes: &[u8]) -> tempfile::NamedTempFile {
+        let h = serde_json::to_vec(&header).unwrap();
+        let mut file = (h.len() as u64).to_le_bytes().to_vec();
+        file.extend(h);
+        file.extend_from_slice(bytes);
+        write_temp(&file)
+    }
+
+    #[test]
+    fn rejects_size_overflows_without_panicking() {
+        for shape in [vec![u64::MAX, 4], vec![usize::MAX as u64 / 2 + 1]] {
+            let file = file_for_header(
+                serde_json::json!({
+                    "w":{"dtype":"F16","shape":shape,"data_offsets":[0,0]}
+                }),
+                &[],
+            );
+            assert!(Safetensors::open(file.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_overlapping_gapped_and_unclaimed_ranges() {
+        for (begin, end, total) in [(0, 2, 4), (3, 5, 5), (2, 4, 6)] {
+            let file = file_for_header(
+                serde_json::json!({
+                    "a":{"dtype":"F16","shape":[1],"data_offsets":[0,2]},
+                    "b":{"dtype":"F16","shape":[1],"data_offsets":[begin,end]}
+                }),
+                &vec![0; total],
+            );
+            assert!(Safetensors::open(file.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_empty_and_scalar_tensors() {
+        let file = file_for_header(
+            serde_json::json!({
+                "a":{"dtype":"F16","shape":[0],"data_offsets":[0,0]},
+                "b":{"dtype":"F16","shape":[],"data_offsets":[0,2]}
+            }),
+            &[0, 0],
+        );
+        let source = Safetensors::open(file.path()).unwrap();
+        assert!(source.tensor_bytes("a").unwrap().is_empty());
+        assert_eq!(source.tensor_bytes("b").unwrap(), &[0, 0]);
     }
 
     #[test]

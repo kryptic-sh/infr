@@ -88,10 +88,14 @@ impl WeightWatch {
         })
     }
 
-    /// Stamp every file of the model `path` names: the whole `gguf-split` set when `path` is one
-    /// shard of it, otherwise just `path`. The set comes from [`crate::Gguf::open`] itself, so it
-    /// is exactly the files the model's mapping reads, found the same way.
+    /// Stamp the model's GGUF shards, or its single safetensors file.
     pub fn open_model(path: &Path) -> Result<Self> {
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))
+        {
+            return Self::open(path);
+        }
         let model = crate::Gguf::open(path)?;
         let files = model
             .shards()

@@ -56,7 +56,7 @@ impl ChatModel for CpuDenseChat {
         // draft-verify loop — its acceptance rate is the oracle a GPU backend's alpha is judged
         // against (a backend whose head numerics drift from its trunk shows a lower alpha here).
         if crate::mtp::should_use_mtp(self.model.config(), self.model.engine_cfg()) {
-            let head = crate::mtp::load_mtp_head(self.model.gguf(), self.model.config())?;
+            let head = crate::mtp::load_mtp_head(self.model.weights(), self.model.config())?;
             return crate::mtp::generate_mtp_spec_cpu_timed(
                 &self.model,
                 &head,

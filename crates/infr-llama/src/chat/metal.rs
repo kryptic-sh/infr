@@ -49,7 +49,7 @@ impl MetalSeamChat {
             return Ok(false);
         }
         self.mtp_head = Some(crate::mtp::load_mtp_head(
-            self.model.gguf(),
+            self.model.weights(),
             self.model.config(),
         )?);
         Ok(true)

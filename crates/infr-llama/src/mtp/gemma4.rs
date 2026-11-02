@@ -36,14 +36,14 @@ pub struct Gemma4Assistant {
     layers: Vec<AsstLayer>,
 }
 
-fn meta_usize_at(g: &Gguf, key: &str, il: usize) -> Option<usize> {
+fn meta_usize_at(g: &dyn WeightSource, key: &str, il: usize) -> Option<usize> {
     match g.metadata().get(key)? {
         MetaValue::Arr(a) => a.get(il)?.as_u64().map(|v| v as usize),
         v => v.as_u64().map(|v| v as usize),
     }
 }
 
-fn meta_f32(g: &Gguf, key: &str) -> Option<f32> {
+fn meta_f32(g: &dyn WeightSource, key: &str) -> Option<f32> {
     g.metadata().get(key)?.as_f64().map(|v| v as f32)
 }
 
@@ -631,7 +631,7 @@ pub(crate) fn generate_spec(
     let (ids, _) = crate::seam::generate_dense_backend(
         be,
         bind,
-        model.gguf(),
+        model.weights(),
         cfg,
         ec,
         model.embd(),
@@ -699,7 +699,7 @@ pub(crate) fn generate_spec(
         crate::seam::generate_dense_backend(
             be,
             bind,
-            model.gguf(),
+            model.weights(),
             cfg,
             ec,
             model.embd(),
@@ -820,7 +820,7 @@ pub fn generate_vulkan(
     let bind: &crate::seam::BindWeight<'_> = if mtp.trunk.is_none() {
         cold_bind = crate::seam::vulkan_moe_binder(
             vk,
-            model.gguf(),
+            model.weights(),
             model.config(),
             ec,
             true,

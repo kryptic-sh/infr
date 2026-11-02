@@ -387,6 +387,14 @@ impl CpuBackend {
         Box::new(CpuBuffer::mapped_buf(bytes))
     }
 
+    /// Adopt loader-owned weight bytes without a second allocation or copy.
+    pub fn own_weight(&self, bytes: Vec<u8>) -> Box<dyn Buffer> {
+        Box::new(CpuBuffer {
+            uid: next_buffer_uid(),
+            store: CpuStore::Owned(Mutex::new(bytes)),
+        })
+    }
+
     /// Wrap a registered paged weight (see [`paged::PagedWeights`]) as a read-only weight buffer.
     /// Nothing is read here: the bytes arrive on the first pin.
     pub fn paged_weight(

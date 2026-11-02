@@ -17,7 +17,6 @@ use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
 use infr_core::graph::{Activation, AttnMask, Graph, HyperGates, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
 
 /// Combined gate+up FFN upload decision (one GEMV/GEMM + GatedActFused instead of two Linears +
 /// GatedAct). Requires the backend to opt in (`Capabilities::combined_gu` — Vulkan; the CPU keeps
@@ -29,7 +28,7 @@ use infr_gguf::Gguf;
 /// `c.moe.is_none()`: a pure MoE arch has no `ffn_gate.weight` at all, so the `.all()` is false
 /// for it regardless; see the original comment block at the call site for the DiffusionGemma
 /// rationale.
-pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool {
+pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &dyn WeightSource, c: &Config) -> bool {
     combined_gu
         && (0..c.n_layer).all(|l| {
             let dt = |s: &str| {
@@ -48,7 +47,7 @@ pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool 
 /// for A/B. Shared with the seam's dense-streaming plan — see [`fuse_gu_decision`].
 pub(crate) fn fuse_qkv_decision(
     combined_gu: bool,
-    g: &Gguf,
+    g: &dyn WeightSource,
     c: &Config,
     ec: &EngineConfig,
 ) -> bool {
@@ -144,7 +143,7 @@ fn bind_layer_io<'a>(
 /// is stashed in `SeamKv` and reused via `Arc` on warm calls / forks) instead of every request.
 fn session_stable(
     be: &dyn Backend,
-    g: &Gguf,
+    g: &dyn WeightSource,
     c: &Config,
     ec: &EngineConfig,
 ) -> AResult<SessionStable> {
@@ -370,7 +369,7 @@ pub(super) struct DecodeHandles {
 pub(crate) fn generate_dense_backend(
     be: &dyn Backend,
     bind_weight: &BindWeight,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     // The ENGINE configuration this whole forward reads its knobs from — `kv.*`, `spec.*`,
     // `sampling.*`, `device.ubatch*`, `kernels.{qkv_fuse,gated_rmsnorm}` and the `prof.*`
@@ -681,13 +680,32 @@ pub(crate) fn generate_dense_backend(
                     .cloned()
                     .ok_or_else(|| anyhow!("tensor not found: {name}"))
             };
-            // Bytes-per-row for the permute: a weight row is `n_embd` elements of the tensor's
-            // dtype (block-aligned); a bias "row" is one f32.
+            // GGUF keeps its zero-copy views and file ranges through the shared loader trait.
+            let gguf: Option<&infr_gguf::Gguf> = g.as_any().downcast_ref::<infr_gguf::Gguf>();
+            // Bias permutation rows contain one scalar; weight rows contain n_embd scalars.
             let row_bytes = |name: &str, dt: DType| -> usize {
                 if name.ends_with(".bias") {
-                    4
+                    infr_gguf::nbytes(dt, 1)
                 } else {
                     infr_gguf::nbytes(dt, c.n_embd)
+                }
+            };
+            // Fresh EXL3 folds bypass the borrow cache, avoiding a second full-model copy.
+            let get_arc = |name: &str| -> AResult<WBytes> {
+                match gguf {
+                    Some(g) => Ok(WBytes::Mmap(
+                        g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?,
+                    )),
+                    None => match g
+                        .as_any()
+                        .downcast_ref::<crate::Exl3Source>()
+                        .and_then(|ex| ex.take_fold(name).transpose())
+                    {
+                        Some(fold) => Ok(WBytes::Owned(fold?)),
+                        None => Ok(WBytes::Owned(
+                            g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?.to_vec(),
+                        )),
+                    },
                 }
             };
             let (bytes, dt, numel) = if info(names[0])?.dtype == DType::I2S {
@@ -706,7 +724,9 @@ pub(crate) fn generate_dense_backend(
                         return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
                     }
                     numel += i.shape.iter().product::<usize>();
-                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    // I2S packing is a GGUF-only format.
+                    let gg = gguf.ok_or_else(|| anyhow!("I2S host-dequant needs GGUF"))?;
+                    let tb = gg.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
                     let f32v = crate::dequant_block(DType::I2S, &tb).map_err(|e| anyhow!("{e}"))?;
                     let f16: Vec<u8> = f32v
                         .iter()
@@ -732,20 +752,28 @@ pub(crate) fn generate_dense_backend(
                 if c.deepseek2
                     && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight"))
                 {
-                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                    let gg = gguf.ok_or_else(|| anyhow!("absorbed MLA needs GGUF"))?;
+                    let tb = gg.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
                     let numel = i.shape.iter().product();
                     let f32v = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
                     let bytes: Vec<u8> = f32v.iter().flat_map(|&x| x.to_le_bytes()).collect();
                     (WBytes::Owned(bytes), DType::F32, numel)
                 } else {
-                    let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
                     let numel = i.shape.iter().product();
-                    match qk_perm_heads(name) {
-                        Some(heads) => {
+                    match (get_arc(name)?, qk_perm_heads(name)) {
+                        (WBytes::Mmap(tb), None) => (WBytes::Mmap(tb), i.dtype, numel),
+                        (WBytes::Mmap(tb), Some(heads)) => {
                             let rb = row_bytes(name, i.dtype);
                             (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
                         }
-                        None => (WBytes::Mmap(tb), i.dtype, numel),
+                        (WBytes::Owned(b), None) => (WBytes::Owned(b), i.dtype, numel),
+                        (WBytes::Owned(b), Some(heads)) => {
+                            let rb = row_bytes(name, i.dtype);
+                            (WBytes::Owned(permute_rows(&b, heads, rb)), i.dtype, numel)
+                        }
+                        (WBytes::Concat(_), _) => {
+                            return Err(anyhow!("get_arc never returns Concat"));
+                        }
                     }
                 }
             } else {
@@ -761,28 +789,54 @@ pub(crate) fn generate_dense_backend(
                 let mut numel = 0usize;
                 let mut permuted = false;
                 let dt = info(names[0])?.dtype;
-                for name in names {
-                    let i = info(name)?;
-                    if i.dtype != dt {
-                        return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
-                    }
-                    numel += i.shape.iter().product::<usize>();
-                    parts.push(g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
-                    permuted |= qk_perm_heads(name).is_some();
-                }
-                if !permuted {
-                    (WBytes::Concat(parts), dt, numel)
-                } else {
+                // Sources without file ranges cannot page a fused group.
+                if gguf.is_none() {
                     let mut cat = Vec::new();
-                    for (name, tb) in names.iter().zip(&parts) {
+                    for name in names {
+                        let i = info(name)?;
+                        if i.dtype != dt {
+                            return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
+                        }
+                        numel += i.shape.iter().product::<usize>();
+                        let bytes = get_arc(name)?;
+                        let b = bytes.materialize();
                         match qk_perm_heads(name) {
                             Some(heads) => {
-                                cat.extend_from_slice(&permute_rows(tb, heads, row_bytes(name, dt)))
+                                cat.extend_from_slice(&permute_rows(&b, heads, row_bytes(name, dt)))
                             }
-                            None => cat.extend_from_slice(tb),
+                            None => cat.extend_from_slice(&b),
                         }
                     }
                     (WBytes::Owned(cat), dt, numel)
+                } else {
+                    for name in names {
+                        let i = info(name)?;
+                        if i.dtype != dt {
+                            return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
+                        }
+                        numel += i.shape.iter().product::<usize>();
+                        let Some(gg) = gguf else {
+                            unreachable!("concat off-GGUF returns in the is_none branch above");
+                        };
+                        parts.push(gg.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
+                        permuted |= qk_perm_heads(name).is_some();
+                    }
+                    if !permuted {
+                        (WBytes::Concat(parts), dt, numel)
+                    } else {
+                        let mut cat = Vec::new();
+                        for (name, tb) in names.iter().zip(&parts) {
+                            match qk_perm_heads(name) {
+                                Some(heads) => cat.extend_from_slice(&permute_rows(
+                                    tb,
+                                    heads,
+                                    row_bytes(name, dt),
+                                )),
+                                None => cat.extend_from_slice(tb),
+                            }
+                        }
+                        (WBytes::Owned(cat), dt, numel)
+                    }
                 }
             };
             // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float

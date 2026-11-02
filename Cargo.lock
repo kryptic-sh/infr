@@ -1302,13 +1302,16 @@ dependencies = [
  "infr-metal",
  "infr-prof",
  "infr-prof-rt",
+ "infr-safetensors",
  "infr-vulkan",
  "llguidance",
  "rayon",
  "serde_json",
+ "tempfile",
  "tokenizers 0.20.4",
  "toktrie_hf_tokenizers",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

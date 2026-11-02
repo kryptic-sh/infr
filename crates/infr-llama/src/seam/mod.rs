@@ -15,7 +15,7 @@ use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_core::tensor::DType;
 use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
-use infr_gguf::{Gguf, TensorBytes};
+use infr_gguf::TensorBytes;
 
 mod dsv4_plan;
 pub mod model;
@@ -46,12 +46,12 @@ pub(crate) use weights::SeamKv;
 #[derive(Clone, Copy)]
 pub(crate) struct TokenEmbd<'a> {
     cell: &'a std::sync::OnceLock<Vec<f32>>,
-    gguf: &'a Gguf,
+    ws: &'a dyn WeightSource,
 }
 
 impl<'a> TokenEmbd<'a> {
-    pub(crate) fn new(cell: &'a std::sync::OnceLock<Vec<f32>>, gguf: &'a Gguf) -> Self {
-        Self { cell, gguf }
+    pub(crate) fn new(cell: &'a std::sync::OnceLock<Vec<f32>>, ws: &'a dyn WeightSource) -> Self {
+        Self { cell, ws }
     }
 
     /// The dequantized `[vocab, n_embd]` row-major table — dequantized on first call, cached after.
@@ -63,8 +63,8 @@ impl<'a> TokenEmbd<'a> {
             return Ok(v);
         }
         let (v, _) =
-            crate::quant::load_tensor_dequant(self.gguf, "token_embd.weight").map_err(|e| {
-                anyhow!("token_embd.weight: dequant failed (corrupt/truncated GGUF?): {e}")
+            crate::quant::load_tensor_dequant(self.ws, "token_embd.weight").map_err(|e| {
+                anyhow!("token_embd.weight: dequant failed (corrupt/truncated file?): {e}")
             })?;
         // Race-safe cache fill: another thread may have won the init; `set` drops ours if so, then
         // `get` returns whichever value stuck (get_or_init semantics without a fallible init).
@@ -101,7 +101,7 @@ impl<'a> TokenEmbd<'a> {
 /// today's behaviour rather than failing the load.
 fn cpu_paged_store(
     ec: &EngineConfig,
-    g: &Gguf,
+    g: &dyn WeightSource,
 ) -> AResult<Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>> {
     // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
     let explicit = infr_core::hostmem::Requested::from_config(
@@ -165,8 +165,13 @@ fn cpu_paged_store(
         );
         return Ok(None);
     }
+    // Disk paging requires GGUF shard ranges.
+    let Some(gguf) = g.as_any().downcast_ref::<infr_gguf::Gguf>() else {
+        tracing::warn!("host paging: disk paging needs GGUF shard ranges; using resident weights");
+        return Ok(None);
+    };
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open_shards(&g.shards()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::open_shards(&gguf.shards()).map_err(|e| anyhow!("{e}"))?,
     );
     let store = infr_cpu::paged::PagedWeights::new(&plans, io).map_err(|e| anyhow!("{e}"))?;
     tracing::info!(
@@ -215,7 +220,7 @@ fn cpu_paged_store(
 /// user asking for it by name may be working around something this does not model.
 fn vulkan_host_tier(
     ec: &EngineConfig,
-    g: &Gguf,
+    g: &dyn WeightSource,
     what: &str,
     classes: &[(usize, usize)],
     unified: bool,
@@ -234,8 +239,12 @@ fn vulkan_host_tier(
             // to cache down here — but its misses still come from BLOCK reads instead of the
             // mapping, which is what lets a big model run on these machines at all.
             infr_core::hostmem::ArenaPlan::StreamOnly => {
+                // Streaming reads file blocks — GGUF-only; other sources cannot stream.
+                let Some(gguf) = g.as_any().downcast_ref::<infr_gguf::Gguf>() else {
+                    anyhow::bail!("{what} host tier: streaming from disk needs GGUF shard ranges");
+                };
                 let io = std::sync::Arc::new(
-                    infr_core::blockio::FileBlockIo::open_shards(&g.shards())
+                    infr_core::blockio::FileBlockIo::open_shards(&gguf.shards())
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 tracing::info!(
@@ -301,8 +310,13 @@ fn vulkan_host_tier(
         );
         return Ok(unpaged());
     }
+    // The arena reads file blocks — GGUF-only; other sources (EXL3) stay on the mmap path.
+    let Some(gguf) = g.as_any().downcast_ref::<infr_gguf::Gguf>() else {
+        tracing::warn!("{what} host tier: disk paging needs GGUF shard ranges — unpaged",);
+        return Ok(unpaged());
+    };
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open_shards(&g.shards()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::open_shards(&gguf.shards()).map_err(|e| anyhow!("{e}"))?,
     );
     let mut arena = 0usize;
     let mut out = Vec::with_capacity(classes.len());
@@ -357,9 +371,8 @@ fn cpu_bind_with<'a>(
 fn cpu_bind_resident(be: &CpuBackend, tb: WBytes, dt: DType) -> AResult<(Box<dyn Buffer>, DType)> {
     match tb {
         WBytes::Mmap(tb) => Ok((be.map_weight(tb), dt)),
-        // Owned bytes (a load-time rewrite) and a fused group both become one host buffer here.
-        // The concat is materialized only on this arm — a binder that pages the group never
-        // reaches it.
+        // Adopt owned bytes; fused groups materialize only when resident.
+        WBytes::Owned(v) => Ok((be.own_weight(v), dt)),
         other => {
             let v = other.materialize();
             let buf = be
@@ -398,7 +411,7 @@ fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_cpu(
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
@@ -434,7 +447,7 @@ pub(crate) fn generate_dense_cpu(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_cpu_mode(
     cpu_be: CpuBackend,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -507,7 +520,7 @@ fn report_host_paging(store: &infr_cpu::paged::PagedWeights) {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -540,7 +553,7 @@ pub(crate) fn generate_dense_vulkan(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan_session(
     vk: &infr_vulkan::VulkanBackend,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -1866,7 +1879,7 @@ fn chunk_covered_dense_tensor(name: &str) -> bool {
 /// consistent BEFORE the upload (see the double-count note inside).
 pub(crate) fn vulkan_moe_binder<'a>(
     vk: &'a infr_vulkan::VulkanBackend,
-    g: &'a Gguf,
+    g: &'a dyn WeightSource,
     cfg: &'a Config,
     ec: &EngineConfig,
     first_load: bool,
@@ -2527,10 +2540,18 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     let segments: Vec<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>> = comps
                         .iter()
                         .map(|c| {
-                            Ok(std::sync::Arc::new(
-                                g.tensor_bytes_arc(c).map_err(|e| anyhow!("{e}"))?,
-                            )
-                                as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
+                            // GGUF preserves zero-copy mmap segments.
+                            if let Some(gg) = g.as_any().downcast_ref::<infr_gguf::Gguf>() {
+                                Ok(std::sync::Arc::new(
+                                    gg.tensor_bytes_arc(c).map_err(|e| anyhow!("{e}"))?,
+                                )
+                                    as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
+                            } else {
+                                Ok(std::sync::Arc::new(
+                                    g.tensor_bytes(c).map_err(|e| anyhow!("{e}"))?.to_vec(),
+                                )
+                                    as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
+                            }
                         })
                         .collect::<AResult<_>>()?;
                     let total = segments.iter().map(|s| s.as_ref().as_ref().len()).sum();
@@ -2716,7 +2737,7 @@ fn dense_multi_gpu_guard(cfg: &Config, label: &str) -> AResult<()> {
 fn run_dense_oneshot(
     be: &dyn Backend,
     bind: &BindWeight<'_>,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -2797,7 +2818,7 @@ fn pipeline_binder<'a>(pb: &'a infr_vulkan::PipelineBackend) -> Box<BindWeight<'
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan_pipeline(
     devices: &[usize],
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3016,7 +3037,7 @@ fn tensor_parallel_binder<'a>(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan_tp(
     devices: &[usize],
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3170,7 +3191,7 @@ fn expert_parallel_binder<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_moe_vulkan_ep(
     devices: &[usize],
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3250,7 +3271,7 @@ pub(crate) fn generate_moe_vulkan_ep(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_metal(
     mtl: &infr_metal::MetalBackend,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3285,7 +3306,7 @@ pub(crate) fn generate_dense_metal(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_metal_session(
     mtl: &infr_metal::MetalBackend,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3331,7 +3352,7 @@ pub(crate) fn generate_dense_metal_session(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_metal2(
     mtl: &infr_metal::MetalBackend,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3371,7 +3392,7 @@ pub(crate) fn verify_dense_metal2(
 /// token discarded) — MoE-compatible, unlike the batched `verify` path.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_cpu(
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
@@ -3411,7 +3432,7 @@ pub(crate) fn verify_dense_cpu(
 /// Returns `(logits, h)`, both `[vocab]`/`[n_embd]` for the last prompt token.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_cpu_with_h(
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
@@ -3454,7 +3475,7 @@ pub(crate) fn verify_dense_cpu_with_h(
 /// `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_rows_cpu_with_h(
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
@@ -3494,7 +3515,7 @@ pub(crate) fn verify_rows_cpu_with_h(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3544,7 +3565,7 @@ pub(crate) fn verify_dense_vulkan(
 pub(crate) fn window_logits_rows(
     be: &dyn Backend,
     bind: &BindWeight<'_>,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3693,7 +3714,7 @@ pub(crate) use infr_core::budget::kv_fmt_bytes;
 /// Returns `pl_tok_scaled[r][l*npl+j] = per_layer_tok_embd[tok_r][l*npl+j] * √npl`, `[rows,
 /// n_layer*npl]` row-major — uploaded to `ipl_buf` and bound to the graph Input `pl_tok_in`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn e2b_ipl_rows(g: &Gguf, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32>> {
+fn e2b_ipl_rows(g: &dyn WeightSource, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32>> {
     use rayon::prelude::*;
     let (npl, nl) = (ple.npl, ple.n_layer);
     let sqrt_npl = (npl as f32).sqrt();

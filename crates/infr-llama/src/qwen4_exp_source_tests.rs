@@ -496,9 +496,9 @@ fn bounded_prime_validation_handles_large_values() {
 }
 
 #[test]
-#[ignore = "set INFR_QWEN4_EXP_TEST_MODEL to cached model.safetensors with adjacent config.json"]
+#[ignore = "set INFR_TEST_MODEL to cached model.safetensors with adjacent config.json"]
 fn cached_tiny_checkpoint_schema() {
-    let path = std::env::var_os("INFR_QWEN4_EXP_TEST_MODEL").expect("INFR_QWEN4_EXP_TEST_MODEL");
+    let path = std::env::var_os("INFR_TEST_MODEL").expect("INFR_TEST_MODEL");
     let s = Qwen4ExpSource::open(Path::new(&path)).unwrap();
     assert_eq!(s.cfg.hidden_size, 64);
     assert_eq!(s.infos.len(), 149);

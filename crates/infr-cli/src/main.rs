@@ -457,6 +457,26 @@ enum Cmd {
         #[command(flatten)]
         device: DeviceOpts,
     },
+    /// Perplexity of a text file — same scheme as llama.cpp's `llama-perplexity` (`-f`/`-c`/
+    /// `--chunks`), so the two are directly comparable on the same model + text.
+    Perplexity {
+        model: String,
+        /// Text file to score.
+        #[arg(short = 'f', long = "file")]
+        file: PathBuf,
+        /// Window length in tokens (matches llama-perplexity -c).
+        #[arg(short = 'c', long = "ctx-size", default_value_t = 512)]
+        ctx_size: usize,
+        /// Score at most this many windows (matches llama-perplexity --chunks). Unset = all.
+        #[arg(long)]
+        chunks: Option<usize>,
+        /// GPU layers (matches llama-bench -ngl): 0 = CPU reference backend.
+        #[arg(long = "n-gpu-layers", visible_alias = "ngl", default_value_t = 999)]
+        ngl: usize,
+        /// Shared device/config flags (`--dev`, `-t`).
+        #[command(flatten)]
+        device: DeviceOpts,
+    },
     /// Compare infr vs llama.cpp on coding-agent-shaped workloads (long context, replies at depth,
     /// whole turns). Shells out to `infr bench` and `llama-bench` with matching flags, same model+GPU.
     Compare {
@@ -632,6 +652,7 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             device.overrides(&mut layer)?;
             sampling.overrides(&mut layer);
         }
+        Cmd::Perplexity { device, .. } => device.overrides(&mut layer)?,
         Cmd::Bench { device, .. } => {
             device.overrides(&mut layer)?;
             // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a
@@ -684,6 +705,14 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             json,
             ..
         } => cmd_bench(&model, n_prompt, n_gen, depth, pg, reps, ngl, json, cfg),
+        Cmd::Perplexity {
+            model,
+            file,
+            ctx_size,
+            chunks,
+            ngl,
+            ..
+        } => cmd_perplexity(&model, &file, ctx_size, chunks, ngl, cfg),
         Cmd::Compare {
             models,
             sweep,
@@ -2021,6 +2050,41 @@ fn run_chat(
             completion_tokens: stats.n_gen as u32,
         })
     }
+}
+
+/// `infr perplexity`: score `file` in `ctx_size`-token windows and print `llama-perplexity`'s
+/// final line.
+fn cmd_perplexity(
+    model: &str,
+    file: &Path,
+    ctx_size: usize,
+    chunks: Option<usize>,
+    ngl: usize,
+    cfg: &Arc<Config>,
+) -> anyhow::Result<()> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let (gguf, tok) = resolve(model, cfg)?;
+    let watch = infr_llama::WeightWatch::open_model(&gguf)?;
+    let cpu = ngl == 0 || matches!(selected_backend(cfg)?, Backend::Cpu);
+    let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
+    let tokens = model.perplexity_tokens(&text)?;
+    tracing::info!(
+        tokens = tokens.len(),
+        ctx_size,
+        cpu,
+        "perplexity: tokenized {}",
+        file.display()
+    );
+    let report = model.perplexity(&tokens, ctx_size, chunks, cpu, |i, n, ppl| {
+        tracing::info!(chunk = i, of = n, ppl, "perplexity: running estimate");
+    })?;
+    watch.check()?;
+    match report.uncertainty() {
+        Some(u) => println!("Final estimate: PPL = {:.4} +/- {u:.5}", report.ppl()),
+        None => println!("Final estimate: PPL = {:.4}", report.ppl()),
+    }
+    Ok(())
 }
 
 /// Benchmark prefill (pp) or decode (tg) tok/s with the same -p/-n/-d/-r interface as

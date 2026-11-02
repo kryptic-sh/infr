@@ -274,6 +274,16 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
     bytes as u32
 }
 
+/// Outputs per 64-lane workgroup in `native_gemv.comp`; must match the shader's `per_wg`.
+pub(crate) fn native_gemv_outs_per_wg(in_f: usize) -> u32 {
+    let nsub = (in_f / 32).max(1);
+    if nsub >= 64 {
+        1
+    } else {
+        64 / nsub.next_power_of_two() as u32
+    }
+}
+
 /// Reject a native-block dispatch whose K axis is off the 32-element sub-block grid.
 ///
 /// Every `native_decode.glsl` consumer walks K as `nsub = in_f / 32` whole 32-element sub-blocks —
@@ -3591,6 +3601,7 @@ impl<'a> Recorder<'a> {
     ) {
         assert_native_k("linear_native_at", in_f);
         self.label_gemv("gemv_streamed", rows, in_f, out_f);
+        let per_wg = native_gemv_outs_per_wg(in_f);
         let (name, spv) =
             crate::gemm::native_streamed_build_spv(dtype, false).expect("native streamed GEMV spv");
         let k = self.be.kernel(name, spv, 3, 24);
@@ -3619,7 +3630,7 @@ impl<'a> Recorder<'a> {
                 in_f,
                 out_f,
                 push,
-                |n| n,
+                |n| n.div_ceil(per_wg),
             );
             return;
         }
@@ -3630,7 +3641,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
-            (rows * out_f) as u32,
+            ((rows * out_f) as u32).div_ceil(per_wg),
         );
     }
 
@@ -4235,7 +4246,8 @@ impl<'a> Recorder<'a> {
         let (name, spv) = crate::gemm::native_streamed_build_spv(dtype, true)
             .expect("native streamed GEMV res spv");
         let k = self.be.kernel(name, spv, 4, 24);
-        self.dispatch_wide(k, &bufs, 1, &push, (rows * out_f) as u32);
+        let per_wg = native_gemv_outs_per_wg(in_f);
+        self.dispatch_wide(k, &bufs, 1, &push, ((rows * out_f) as u32).div_ceil(per_wg));
     }
 
     /// Gather + dequantize embedding rows (`Op::EmbedGather`): `dst[r,:] = table[ids[r],:] *

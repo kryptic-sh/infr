@@ -45,28 +45,37 @@ float dqsub(uint gstart, uint xoff) {
 void main() {
     GRID_INIT; // barrier inside — must precede the (workgroup-uniform) early return below
     // Flat-index recovery for a possibly-2-D dispatch grid — see linear_f16.comp's main() for why.
-    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
-    if (unit >= pc.rows * pc.out_f) { return; }
+    uint nsub = pc.in_f / 32u;
+    // Lanes per output: the smallest power of two covering nsub (64 max); keep in sync with Recorder::native_gemv_outs_per_wg.
+    uint lanes = nsub >= 64u ? 64u : max(1u, 1u << findMSB(max(nsub, 1u) * 2u - 1u));
+    uint per_wg = 64u / lanes;
+    uint total = pc.rows * pc.out_f;
+    uint t = gl_LocalInvocationID.x;
+    uint unit0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * per_wg;
+    if (unit0 >= total) { return; }
+    uint unit = unit0 + t / lanes;
+    uint lt = t & (lanes - 1u);
+    bool live = unit < total;
     uint o = unit % pc.out_f;
     uint r = unit / pc.out_f;
-    uint t = gl_LocalInvocationID.x;
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint wbase = pc.w_base + o * pc.in_f;
     uint xbase = r * pc.in_f;
-    uint nsub = pc.in_f / 32u;
     float acc = 0.0;
-    for (uint s = t; s < nsub; s += 64u) {
-        acc += dqsub(wbase + s * 32u, xbase + s * 32u);
+    if (live) {
+        for (uint s = lt; s < nsub; s += lanes) {
+            acc += dqsub(wbase + s * 32u, xbase + s * 32u);
+        }
     }
     red[t] = acc;
     barrier();
-    for (uint stride = 32u; stride > 0u; stride /= 2u) {
-        if (t < stride) { red[t] += red[t + stride]; }
+    for (uint stride = lanes / 2u; stride > 0u; stride /= 2u) {
+        if (lt < stride) { red[t] += red[t + stride]; }
         barrier();
     }
 #ifdef USE_RES
-    if (t == 0u) { y_buf[unit] = r_buf[unit] + red[0]; }
+    if (lt == 0u && live) { y_buf[unit] = r_buf[unit] + red[t]; }
 #else
-    if (t == 0u) { y_buf[unit] = red[0]; }
+    if (lt == 0u && live) { y_buf[unit] = red[t]; }
 #endif
 }

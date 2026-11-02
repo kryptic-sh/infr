@@ -63,6 +63,12 @@ serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 memmap2 = "0.9"
 rayon = "1"
+# Gemma 4 vision (`infr_llama::vision`): the CPU image encoder's f32 GEMMs, and decoding the
+# images `infr serve` receives as OpenAI `image_url` data URIs. `image` is trimmed to the formats a
+# chat client actually sends.
+gemm = "0.19"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+base64 = "0.22"
 # SIGINT/SIGTERM via `sigaction` in the CLI (see `infr_core::shutdown`). Already in the lockfile
 # under tokio and indicatif/console — a direct dep here costs nothing new.
 libc = "0.2"

@@ -334,6 +334,8 @@ knobs! {
     // Same "`0` is a VALUE, not a bad one" grammar as the deadline above: `0` disables the periodic
     // throughput line, so the env layer must not filter it out.
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
+    "INFR_MMPROJ" => "serve.mmproj", Path, Ignored, "/tmp/mmproj.gguf", migrated;
+    "INFR_IMAGE_MAX_TOKENS" => "serve.image_max_tokens", Int, Ignored, "560", migrated;
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",

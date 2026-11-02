@@ -3,10 +3,11 @@
 // via hardware int8 dot-product. Q6_K is symmetric (no min): w = d·sc·(q6 − 32). We bake the (q6 − 32)
 // centering into a signed int8 weight and fold d·sc into a per-sub-block float scale. Activations are
 // pre-quantized to int8 per 32-block (qa/dact from quant_q8; the per-block sum/min is unused — Q6_K has
-// no min term). BLK = 16 = the Q6_K scale granularity (one i8 scale per 16 elements), so each sub-block
-// has ONE (d·sc); two consecutive sub-blocks share the activation's 32-block scale (dact). Mirrors
+// no min term). The Q6_K scale granularity is 16 elements (one i8 scale per sub-block); the K loop steps
+// 32-element groups = two sub-blocks, each with its own (d·sc) and integer sum, sharing the activation's
+// 32-block scale (dact). Mirrors
 // native_gemm_mmq_q4k (register-blocked 64×64 tile, TM×TN = 4×4, scalar dp4a — RADV int8 WMMA hangs).
-// w_base = expert·stride. Requires n%64, k%16.
+// w_base = expert·stride. Requires n%64, k%32 (Q6_K tensors are k%256).
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -24,8 +25,13 @@ const uint BM = BM_TILE; // row tile — 64 default, EXPERT_GRID batched-MoE cal
 #define BN_TILE 64u
 #endif
 const uint BN = BN_TILE; // col tile — 64 default, EXPERT_GRID small-row callers may widen (128)
-const uint BLK = 16u;       // Q6_K scale sub-block
-const uint WPB = BLK / 4u;  // 4 packed-int8 u32 words per 16-block
+// The K loop steps one 32-element GROUP per iteration — two Q6_K 16-element scale sub-blocks,
+// kept as separate integer sums (qsA/qsB) so each still gets its own int8 scale. A 32-group never
+// straddles a 256-superblock, and it is exactly one activation `dact` block. (The loop used to
+// step a single 16-sub-block: twice the barriers for the same dp4a work, which on RDNA2 left this
+// kernel ~3.5x slower than the Q4_K mmq at the same shape.)
+const uint GRP = 32u;       // elements per K step
+const uint WPB = GRP / 4u;  // 8 packed-int8 u32 words per group (words 0-3: scale A, 4-7: B)
 const uint TM = 4u;
 const uint TN = 4u;
 const uint THREADS = (BM / TM) * (BN / TN); // 256
@@ -51,6 +57,8 @@ layout(push_constant) uniform PC {
 layout(push_constant) uniform PC { uint m; uint n; uint k; uint w_base; } pc;
 #endif
 layout(binding = 0) readonly buffer QA { uint qa[]; };          // [m, k/4] packed int8 activations
+// The same activations 16 bytes at a time (a row's 32-group starts 16-aligned: k%32 ⇒ kw%8).
+layout(binding = 0) readonly buffer QA4 { uvec4 qa4[]; };
 layout(binding = 1) readonly buffer DA { float16_t dact[]; };   // [m, k/32]
 #if !defined(PAGED) && !defined(STREAMED)
 layout(binding = 2) readonly buffer WB { uint nw[]; };          // stacked Q6_K weight bytes
@@ -79,6 +87,7 @@ layout(binding = 3) writeonly buffer CB { float c[]; };         // [m, n]
 shared uint As[BM * SP];
 shared uint Bs[BN * SP];
 shared float Bdl[BN];
+shared float Bdl2[BN];
 
 #if defined(PAGED) || defined(STREAMED)
 // Arena read via 64-bit device address (see native_weight_addr.glsl): `w_addr` (set in main) is
@@ -90,6 +99,36 @@ uint rb(uint byte) { return (arena_word(byte >> 2) >> ((byte & 3u) * 8u)) & 0xFF
 uint rb(uint byte) { return (nw[byte >> 2] >> ((byte & 3u) * 8u)) & 0xFFu; }
 #endif
 uint ru16(uint byte) { return rb(byte) | (rb(byte + 1u) << 8u); }
+#if defined(PAGED) || defined(STREAMED)
+uint rw_aligned(uint wi) { return arena_word(wi); }
+#else
+uint rw_aligned(uint wi) { return nw[wi]; }
+#endif
+// The 4 bytes starting at `byte`, little-endian. Q6_K superblocks are 210 bytes, so every odd
+// block starts 2 bytes off a word boundary: two aligned loads + a funnel shift instead of four
+// byte loads.
+#if defined(PAGED) || defined(STREAMED)
+uvec4 rw4_aligned(uint wi) { return arena_word4(wi); }
+#else
+uvec4 rw4_aligned(uint wi) { return uvec4(nw[wi], nw[wi + 1u], nw[wi + 2u], nw[wi + 3u]); }
+#endif
+// The 16 bytes starting at `byte` (2-aligned at worst): one 128-bit load, plus one more word and a
+// funnel shift when the superblock sits on the odd half-word.
+uvec4 rw4(uint byte) {
+    uint wi = byte >> 2u;
+    uint sh = (byte & 3u) * 8u;
+    uvec4 a = rw4_aligned(wi);
+    if (sh == 0u) { return a; }
+    uint e = rw_aligned(wi + 4u);
+    return uvec4((a.x >> sh) | (a.y << (32u - sh)), (a.y >> sh) | (a.z << (32u - sh)),
+                 (a.z >> sh) | (a.w << (32u - sh)), (a.w >> sh) | (e << (32u - sh)));
+}
+uint rw(uint byte) {
+    uint wi = byte >> 2u;
+    uint sh = (byte & 3u) * 8u;
+    uint lo = rw_aligned(wi);
+    return sh == 0u ? lo : ((lo >> sh) | (rw_aligned(wi + 1u) << (32u - sh)));
+}
 float f16tof32(uint bits) { return unpackHalf2x16(bits & 0xffffu).x; }
 int sgn8(uint b) { return int(b << 24u) >> 24; }
 
@@ -97,7 +136,7 @@ void main() {
 #ifdef STREAMED
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident tensor base byte address; NO LUT/slot multiply
 #endif
-    uint nsub = pc.k / BLK;       // 16-element sub-blocks along k
+    uint ngrp = pc.k / GRP;       // 32-element groups along k
     uint nblk32 = pc.k / 32u;     // activation 32-blocks along k
     uint kw = pc.k / 4u;
     uint tilesN = pc.n / BN;
@@ -143,88 +182,127 @@ void main() {
     const bool live = true;
 #endif
 
-    for (uint sub = 0u; sub < nsub; sub++) {
-        uint blk32 = sub >> 1u; // the 32-block this 16-sub-block lives in (for dact)
-        // stage activations: BM rows × WPB packed words (rows ≥ m read garbage, output ignored)
-        for (uint idx = li; idx < BM * WPB; idx += THREADS) {
-            uint r = idx / WPB;
-            uint p = idx % WPB;
-            As[r * SP + p] = qa[(wgRow + r) * kw + sub * WPB + p];
-        }
-        // per-col scale d·sc for this sub-block (constant across the 16 elements)
-        for (uint cc = li; cc < BN; cc += THREADS) {
-            uint gstart = wbase + (wgCol + cc) * pc.k + sub * BLK;
-            uint bd = (gstart / 256u) * 210u;
-            uint p0 = gstart % 256u;
-            uint hf = p0 / 128u;
-            uint ph = p0 % 128u;
-            uint og = ph / 32u;
-            uint l0 = ph % 32u;
-            float d = f16tof32(ru16(bd + 208u));
-            uint sc_idx = hf * 8u + l0 / 16u + 2u * og;
-            Bdl[cc] = d * float(sgn8(rb(bd + 192u + sc_idx)));
-        }
-        // stage weights: BN cols × WPB words, (q6 − 32) → packed signed int8
-        for (uint idx = li; idx < BN * WPB; idx += THREADS) {
-            uint cc = idx / WPB;
-            uint wd = idx % WPB; // word wd → elements 4*wd .. 4*wd+3 within the sub-block
-            uint gstart = wbase + (wgCol + cc) * pc.k + sub * BLK;
-            uint bd = (gstart / 256u) * 210u;
-            uint p0 = gstart % 256u;
-            uint hf = p0 / 128u;
-            uint og = (p0 % 128u) / 32u;
-            uint l0 = (p0 % 128u) % 32u;
-            uint qlo = hf * 64u;
-            uint qho = hf * 32u;
-            uint packed = 0u;
-            for (uint b = 0u; b < 4u; b++) {
-                uint l = l0 + 4u * wd + b;
-                // ggml Q6_K nibble map (see native_decode.glsl FMT_Q6K, the production GEMV
-                // decode): og pairs {0,2} share ql[l] (low/high nibble), {1,3} share ql[l+32] —
-                // byte select on og&1, nibble select on og<2. This was TRANSPOSED here (byte on
-                // og<2, nibble on og&1 — og=1/og=2 read each other's ql source) from the kernel's
-                // introduction until 2026-07: every in-tree parity input was 64-periodic
-                // (q6[p+64]==q6[p]), which makes the transposition invisible; random banks
-                // (nc_gemm_parity.rs) exposed it.
-                uint byte = ((og & 1u) == 0u) ? rb(bd + qlo + l) : rb(bd + qlo + l + 32u);
-                uint qh = rb(bd + 128u + qho + l);
-                uint nib = (og < 2u) ? (byte & 0xFu) : (byte >> 4u);
-                uint q = nib | (((qh >> (2u * og)) & 3u) << 4u);
-                packed |= (uint(int(q) - 32) & 0xFFu) << (b * 8u);
+    // Register prefetch (as in native_gemm_mmq_q4k): group g+1's global loads are issued before
+    // group g's dp4a work and written to shared after the trailing barrier. All loads are 128-bit.
+    const uint NA = (BM * (WPB / 4u) + THREADS - 1u) / THREADS;
+    const uint NB = (BN * (WPB / 4u) + THREADS - 1u) / THREADS;
+    const uint NH = (BN + THREADS - 1u) / THREADS;
+    uvec4 ra[NA];
+    uvec4 rql[NB];
+    uvec4 rqh[NB];
+    uint rog[NB];
+    uint rsc[NH];
+    uint rd[NH];
+#define PREFETCH(gg) \
+    [[unroll]] for (uint u = 0u; u < NA; u++) { \
+        uint idx = li + u * THREADS; \
+        if (idx < BM * (WPB / 4u)) { \
+            uint r = idx / (WPB / 4u); \
+            uint h = idx % (WPB / 4u); \
+            ra[u] = qa4[((wgRow + r) * kw + (gg) * WPB) / 4u + h]; \
+        } \
+    } \
+    [[unroll]] for (uint u = 0u; u < NH; u++) { \
+        uint cc = li + u * THREADS; \
+        if (cc < BN) { \
+            uint gstart = wbase + (wgCol + cc) * pc.k + (gg) * GRP; \
+            uint bd = (gstart / 256u) * 210u; \
+            uint p0 = gstart % 256u; \
+            uint sc_idx = (p0 / 128u) * 8u + 2u * ((p0 % 128u) / 32u); \
+            rsc[u] = ru16(bd + 192u + sc_idx); \
+            rd[u] = ru16(bd + 208u); \
+        } \
+    } \
+    [[unroll]] for (uint u = 0u; u < NB; u++) { \
+        uint idx = li + u * THREADS; \
+        if (idx < BN * (WPB / 4u)) { \
+            uint cc = idx / (WPB / 4u); \
+            uint h = idx % (WPB / 4u); \
+            uint gstart = wbase + (wgCol + cc) * pc.k + (gg) * GRP; \
+            uint bd = (gstart / 256u) * 210u; \
+            uint p0 = gstart % 256u; \
+            uint hf = p0 / 128u; \
+            uint og = (p0 % 128u) / 32u; \
+            rog[u] = og; \
+            rql[u] = rw4(bd + hf * 64u + (og & 1u) * 32u + h * 16u); \
+            rqh[u] = rw4(bd + 128u + hf * 32u + h * 16u); \
+        } \
+    }
+    PREFETCH(0u)
+    for (uint g = 0u; g < ngrp; g++) {
+        [[unroll]] for (uint u = 0u; u < NA; u++) {
+            uint idx = li + u * THREADS;
+            if (idx < BM * (WPB / 4u)) {
+                uint o = (idx / (WPB / 4u)) * SP + (idx % (WPB / 4u)) * 4u;
+                As[o] = ra[u].x; As[o + 1u] = ra[u].y; As[o + 2u] = ra[u].z; As[o + 3u] = ra[u].w;
             }
-            Bs[cc * SP + wd] = packed;
+        }
+        // Per column: the group's two 16-sub-block scales (d * sc[sub]).
+        [[unroll]] for (uint u = 0u; u < NH; u++) {
+            uint cc = li + u * THREADS;
+            if (cc < BN) {
+                float d = f16tof32(rd[u]);
+                Bdl[cc] = d * float(sgn8(rsc[u] & 0xFFu));
+                Bdl2[cc] = d * float(sgn8(rsc[u] >> 8u));
+            }
+        }
+        // Per (column, word): 4 consecutive 6-bit codes from one ql word + one qh word, re-centred
+        // to signed int8 (q - 32) lane-wise without carries: x = q ^ 0x20 is (q - 32) as a 6-bit
+        // two's-complement value, then bit 5 is copied into bits 6-7 to sign-extend it.
+        [[unroll]] for (uint u = 0u; u < NB; u++) {
+            uint idx = li + u * THREADS;
+            if (idx < BN * (WPB / 4u)) {
+                uint og = rog[u];
+                uvec4 lo4 = (og < 2u) ? (rql[u] & 0x0F0F0F0Fu) : ((rql[u] >> 4u) & 0x0F0F0F0Fu);
+                uvec4 q = lo4 | (((rqh[u] >> (2u * og)) & 0x03030303u) << 4u);
+                uvec4 x = q ^ 0x20202020u;
+                uvec4 sb = x & 0x20202020u;
+                uvec4 v = x | (sb << 1u) | (sb << 2u);
+                uint o = (idx / (WPB / 4u)) * SP + (idx % (WPB / 4u)) * 4u;
+                Bs[o] = v.x; Bs[o + 1u] = v.y; Bs[o + 2u] = v.z; Bs[o + 3u] = v.w;
+            }
         }
         barrier();
+        if (g + 1u < ngrp) {
+            PREFETCH(g + 1u)
+        }
 
         if (live) {
-        int qsum[TM][TN];
+        int qsA[TM][TN];
+        int qsB[TM][TN];
         [[unroll]] for (uint i = 0u; i < TM; i++)
-            [[unroll]] for (uint j = 0u; j < TN; j++) qsum[i][j] = 0;
+            [[unroll]] for (uint j = 0u; j < TN; j++) { qsA[i][j] = 0; qsB[i][j] = 0; }
         [[unroll]] for (uint p = 0u; p < WPB; p++) {
             int av[TM];
             int bv[TN];
             [[unroll]] for (uint i = 0u; i < TM; i++) av[i] = int(As[(tr * TM + i) * SP + p]);
             [[unroll]] for (uint j = 0u; j < TN; j++) bv[j] = int(Bs[(tc * TN + j) * SP + p]);
-            [[unroll]] for (uint i = 0u; i < TM; i++)
-                [[unroll]] for (uint j = 0u; j < TN; j++)
-                    qsum[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsum[i][j]);
+            if (p < WPB / 2u) {
+                [[unroll]] for (uint i = 0u; i < TM; i++)
+                    [[unroll]] for (uint j = 0u; j < TN; j++)
+                        qsA[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsA[i][j]);
+            } else {
+                [[unroll]] for (uint i = 0u; i < TM; i++)
+                    [[unroll]] for (uint j = 0u; j < TN; j++)
+                        qsB[i][j] = dotPacked4x8AccSatEXT(av[i], bv[j], qsB[i][j]);
+            }
         }
-
         float dval[TM];
         [[unroll]] for (uint i = 0u; i < TM; i++)
-            dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + blk32]);
+            dval[i] = float(dact[(wgRow + tr * TM + i) * nblk32 + g]);
         [[unroll]] for (uint j = 0u; j < TN; j++) {
-            float dl = Bdl[tc * TN + j];
+            float dA = Bdl[tc * TN + j];
+            float dB = Bdl2[tc * TN + j];
             [[unroll]] for (uint i = 0u; i < TM; i++) {
-                acc[i][j] += dval[i] * dl * float(qsum[i][j]);
+                // Two separate accumulations, sub-block A then B, in the exact order the old
+                // one-sub-block-per-iteration loop used: the output stays bit-identical.
+                acc[i][j] += dval[i] * dA * float(qsA[i][j]);
+                acc[i][j] += dval[i] * dB * float(qsB[i][j]);
             }
         }
         }
-        // Placed AFTER the shared-scale reads above (Bdl/Bmm), not after the qsum loop: every
-        // shared read of this iteration (As/Bs in qsum AND the per-col scales here) must complete
-        // before any thread loops around and restages — a barrier between qsum and this block let
-        // a fast thread overwrite Bdl/Bmm while a slow one was still reading them (data race,
-        // exposed by the BN=128 wide tile's fuller occupancy; nondeterministic expert GEMM output).
+        // Keep the second barrier INSIDE the loop: a fast thread must not restage As/Bs/Bdl while
+        // a slow one is still reading them (the mmq barrier-race lesson).
         barrier();
     }
 

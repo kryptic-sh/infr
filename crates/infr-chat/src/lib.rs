@@ -23,6 +23,12 @@ pub use tools::{
     split_reasoning, split_think, ToolCall,
 };
 
+/// Stands in for one image in a message's text: `infr serve` renders each OpenAI `image_url` part
+/// as this, and the multimodal prompt encoder (`infr_llama::media`) splits the rendered prompt on it
+/// and splices the image's soft tokens in its place. Private-use code points, so ordinary text never
+/// contains it by accident and no chat template rewrites it.
+pub const IMAGE_MARKER: &str = "\u{E000}infr:image\u{E001}";
+
 /// One chat message (OpenAI-shaped; tool fields preserved for the agentic round-trip).
 #[derive(Clone, Debug, Default)]
 pub struct ChatMessage {

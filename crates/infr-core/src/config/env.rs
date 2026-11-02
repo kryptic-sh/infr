@@ -402,6 +402,8 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // Ditto: `0` means "no periodic throughput line", a value the operator may need to set OVER a
     // config file that enabled it, so it must survive this layer rather than be filtered as junk.
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");
+    p.serve.mmproj = opt_path(get, "INFR_MMPROJ");
+    p.serve.image_max_tokens = num::<usize>(get, "INFR_IMAGE_MAX_TOKENS").filter(|&v| v > 0);
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // NO `> 0` filter: `0` is a MEANINGFUL value ("fetch strictly one file at a time"), so it must

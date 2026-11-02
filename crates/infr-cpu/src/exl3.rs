@@ -302,7 +302,7 @@ pub fn tile_words_u16(bits: u32) -> usize {
 /// `tile_perm_is_permutation`; the test earns its keep).
 ///
 /// The routing (shuffle/scatter/readback) is rate-independent; only the
-/// `(lane, entry) -> stream word` step depends on `bits` (see [`stream_index`]).
+/// `(lane, entry) -> stream word` step depends on `bits` (see `stream_index`).
 /// `tile_perm_is_permutation` asserts the composed map is a bijection (every
 /// weight lands in exactly one matrix slot — a dropped or doubled weight would
 /// silently corrupt the model), and `fragment_entries_match_scalar_words`

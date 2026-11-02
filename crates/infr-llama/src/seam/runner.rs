@@ -4952,8 +4952,8 @@ pub(crate) fn generate_dense_backend(
     // truncates its committed token list and the next call's prefix diff overwrites the
     // stale KV rows. Dense non-E2B models only (mirrors the batched-prefill guard).
     if let Some(out_logits) = verify {
-        if c.moe.is_some() || ple.is_some() {
-            return Err(anyhow!("speculative verify: dense non-E2B models only"));
+        if c.moe.is_some() {
+            return Err(anyhow!("speculative verify: dense models only"));
         }
         let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
@@ -5026,9 +5026,24 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
+        let vf_ipl_buf = match (ple, vh.pl_tok_in) {
+            (Some(ple), Some(_)) => {
+                let rows = e2b_ipl_rows(g, ple, &prompt[start..])?;
+                let b = be
+                    .alloc(rows.len() * 4, BufferUsage::Staging)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
+                    .map_err(|e| anyhow!("{e}"))?;
+                Some(b)
+            }
+            _ => None,
+        };
         let mut vb = Bindings::new();
         vb.bind(vh.hidden, vf_hidden_buf.as_ref());
         vb.bind(vh.positions, vf_pos_buf.as_ref());
+        if let (Some(pid), Some(ib)) = (vh.pl_tok_in, &vf_ipl_buf) {
+            vb.bind(pid, ib.as_ref());
+        }
         bind_layer_io(
             &mut vb,
             &vh,

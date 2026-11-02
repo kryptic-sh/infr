@@ -10,6 +10,32 @@ use infr_gguf::Gguf;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
+/// Accumulated negative log-likelihoods from [`SeamModel::perplexity`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PplReport {
+    pub nll_sum: f64,
+    pub nll_sq: f64,
+    pub count: usize,
+    pub chunks: usize,
+}
+
+impl PplReport {
+    pub fn ppl(&self) -> f64 {
+        (self.nll_sum / self.count.max(1) as f64).exp()
+    }
+
+    /// `llama-perplexity`'s `+/-` figure.
+    pub fn uncertainty(&self) -> Option<f64> {
+        if self.count < 2 {
+            return None;
+        }
+        let n = self.count as f64;
+        let mean = self.nll_sum / n;
+        let var = self.nll_sq / n - mean * mean;
+        (var > 0.0).then(|| self.ppl() * (var / (n - 1.0)).sqrt())
+    }
+}
+
 /// The placement/dispatch choices a Vulkan bench run actually settled on — reported next to the
 /// throughput figure by [`SeamModel::bench_vulkan`]'s caller.
 ///
@@ -1025,6 +1051,132 @@ impl SeamModel {
             self.per_layer_embd.as_ref(),
             tokens,
         )
+    }
+
+    /// Tokenize `text` for perplexity scoring the way `llama-perplexity` does: the model's BOS is
+    /// prepended when the GGUF asks for one (`tokenizer.ggml.add_bos_token`).
+    pub fn perplexity_tokens(&self, text: &str) -> Result<Vec<u32>> {
+        use infr_core::loader::MetaValue;
+        use infr_core::WeightSource;
+        let md = self.gguf.metadata();
+        let bos = md.u64("tokenizer.ggml.bos_token_id");
+        let add_bos = match md.get("tokenizer.ggml.add_bos_token") {
+            Some(MetaValue::Bool(b)) => *b,
+            _ => md.str("tokenizer.ggml.model") == Some("llama"),
+        };
+        let mut ids = Vec::new();
+        if let (true, Some(b)) = (add_bos, bos) {
+            ids.push(b as u32);
+        }
+        ids.extend(self.encode(text)?);
+        Ok(ids)
+    }
+
+    /// Perplexity of `tokens` in `llama-perplexity`'s own scheme: consecutive windows of `n_ctx`
+    /// tokens, each led by `tokens[0]` (the BOS) in place of its first token, scoring only the
+    /// second half of every window. `max_chunks` caps the window count; `on_chunk(i, n, ppl)`
+    /// reports the running perplexity after each window. `cpu` forces the CPU reference backend.
+    pub fn perplexity(
+        &self,
+        tokens: &[u32],
+        n_ctx: usize,
+        max_chunks: Option<usize>,
+        cpu: bool,
+        mut on_chunk: impl FnMut(usize, usize, f64),
+    ) -> Result<PplReport> {
+        use rayon::prelude::*;
+        if n_ctx < 4 {
+            return Err(anyhow!("perplexity: context must be at least 4 tokens"));
+        }
+        let mut n_chunks = tokens.len() / n_ctx;
+        if let Some(cap) = max_chunks {
+            n_chunks = n_chunks.min(cap);
+        }
+        if n_chunks == 0 {
+            return Err(anyhow!(
+                "perplexity: {} tokens is fewer than one {n_ctx}-token window",
+                tokens.len()
+            ));
+        }
+        const PIECE_ROWS: usize = 256;
+        let vocab = self.cfg.vocab;
+        let first = n_ctx / 2;
+        let want_ctx = n_ctx + 1;
+        let vk = if cpu {
+            None
+        } else {
+            Some(
+                infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+                    .map_err(|e| anyhow!("vulkan init: {e}"))?,
+            )
+        };
+        let cpu_be = CpuBackend::new_with(self.ecfg.clone());
+        let cpu_bind = crate::seam::cpu_upload_bind(&cpu_be);
+        let vk_bind = match &vk {
+            Some(vk) => Some(crate::seam::vulkan_moe_binder(
+                vk,
+                &self.gguf,
+                &self.cfg,
+                &self.ecfg,
+                true,
+                want_ctx,
+            )?),
+            None => None,
+        };
+        let (be, bind): (&dyn Backend, &crate::seam::BindWeight<'_>) = match (&vk, &vk_bind) {
+            (Some(vk), Some(b)) => (vk, &**b),
+            _ => (&cpu_be, &*cpu_bind),
+        };
+        let mut state: Option<crate::seam::SeamKv> = None;
+        let mut report = PplReport::default();
+        for chunk in 0..n_chunks {
+            let mut window = tokens[chunk * n_ctx..(chunk + 1) * n_ctx].to_vec();
+            window[0] = tokens[0];
+            if let Some(st) = state.as_mut() {
+                st.reset();
+            }
+            let mut end = 0;
+            while end < n_ctx - 1 {
+                let start = end;
+                end = (end + PIECE_ROWS).min(n_ctx - 1);
+                let logits = crate::seam::window_logits_rows(
+                    be,
+                    bind,
+                    &self.gguf,
+                    &self.cfg,
+                    &self.ecfg,
+                    self.embd(),
+                    self.per_layer_embd.as_ref(),
+                    &window[..end],
+                    &mut state,
+                    want_ctx,
+                )?;
+                let rows = end - start;
+                if logits.len() != rows * vocab {
+                    return Err(anyhow!(
+                        "perplexity: expected {rows}x{vocab} logits, got {}",
+                        logits.len()
+                    ));
+                }
+                let scored: Vec<f64> = (start.max(first)..end)
+                    .into_par_iter()
+                    .map(|j| {
+                        let row = &logits[(j - start) * vocab..(j - start + 1) * vocab];
+                        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                        let lse = row.iter().map(|&x| (x as f64 - max).exp()).sum::<f64>().ln();
+                        lse + max - row[window[j + 1] as usize] as f64
+                    })
+                    .collect();
+                for nll in scored {
+                    report.nll_sum += nll;
+                    report.nll_sq += nll * nll;
+                    report.count += 1;
+                }
+            }
+            report.chunks = chunk + 1;
+            on_chunk(chunk + 1, n_chunks, report.ppl());
+        }
+        Ok(report)
     }
 
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s Vulkan twin, for the CPU/Vulkan

@@ -3536,6 +3536,48 @@ pub(crate) fn verify_dense_vulkan(
     Ok(logits)
 }
 
+/// Logits for rows `from..tokens.len()` of `tokens`, extending whatever `state` already holds as a
+/// prefix. Call with [`SeamKv::reset`] first for a fresh window, then with growing prefixes to walk
+/// it in bounded pieces.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn window_logits_rows(
+    be: &dyn Backend,
+    bind: &BindWeight<'_>,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+) -> AResult<Vec<f32>> {
+    let mut logits = Vec::new();
+    generate_dense_backend(
+        be,
+        bind,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        tokens,
+        0,
+        |_| {},
+        state,
+        want_ctx,
+        None,
+        Some(&mut logits),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    Ok(logits)
+}
+
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it
 /// on `be` (CPU reference or Vulkan). `bind_weight` turns each native-dtype GGUF tensor into a
 /// backend buffer: the CPU maps it zero-copy from the mmap; the GPU pads + uploads it to VRAM. This
@@ -3603,7 +3645,7 @@ impl WBytes {
 /// GPU binder may convert float weights to f16), so the graph declares the handle to match. The
 /// tensor NAME lets a binder place specific tensors differently (the Vulkan binder puts
 /// auto-fit-offloaded MoE expert banks in host-visible memory instead of VRAM).
-type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
+pub(crate) type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
 
 /// Persistent per-session seam state: the uploaded weights, the KV cache (sized to `max_ctx`
 /// once), the per-step IO buffers, and the token ids currently MATERIALIZED in the cache. A caller

@@ -55,6 +55,8 @@ longer uses it.
 
 Disk paging and dense streaming need GGUF shard byte ranges and are unavailable for
 EXL3. Resident footprint is the raw trellis, scale, embedding, norm, and bias bytes.
+Large resident BDA tensors use near-exact-sized blocks; small tensors share arena
+blocks. This avoids charging a full 64 MiB block to each half-block-sized projection.
 
 ## Validation
 
@@ -83,6 +85,8 @@ cargo test --release -p infr-vulkan --test exl3_linear_parity -- --ignored   # n
   `infr run /path/to/model.safetensors "What is the capital of France?" --dev Vulkan0
   --ctx 256 --ubatch 64 --temp 0 --max-new 16` produces
   `The capital of France is Paris.` Both prefill and token decoding execute on Vulkan.
+  The same checkpoint also loads and generates on an 8 GB RX 580, with the VRAM
+  guard enabled and the portable FP32 kernels.
 
 Perplexity scores the second half of each context window, excluding its final
 position: two 512-token windows score 510 targets. Windows keep their first corpus

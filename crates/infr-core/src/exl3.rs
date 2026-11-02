@@ -109,6 +109,37 @@ impl Exl3Layout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Exl3EmbeddingSpec {
+    pub width: u32,
+    pub vocab: u32,
+    pub bits: u32,
+}
+
+impl Exl3EmbeddingSpec {
+    pub fn row_bytes(self) -> Result<usize> {
+        if self.width == 0 || self.vocab == 0 || !(1..=8).contains(&self.bits) {
+            return Err(Error::Backend(
+                "exl3 embedding: invalid dimensions or rate".into(),
+            ));
+        }
+        (self.width.div_ceil(256) as usize)
+            .checked_mul(2 * (16 * self.bits as usize + 1))
+            .ok_or_else(|| Error::Backend("exl3 embedding: row size overflow".into()))
+    }
+    pub fn trellis_bytes(self) -> Result<usize> {
+        self.row_bytes()?
+            .checked_mul(self.vocab as usize)
+            .ok_or_else(|| Error::Backend("exl3 embedding: table size overflow".into()))
+    }
+    pub fn sign_bytes(self) -> Result<usize> {
+        self.row_bytes()?;
+        (self.width.div_ceil(256) as usize)
+            .checked_mul(512)
+            .ok_or_else(|| Error::Backend("exl3 embedding: sign size overflow".into()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Exl3Spec {
     pub in_f: u32,
     pub out_f: u32,

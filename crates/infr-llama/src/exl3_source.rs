@@ -6,10 +6,14 @@ use std::sync::OnceLock;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use infr_core::loader::{MetaValue, Metadata, TensorInfo};
-use infr_core::{DType, Error, Exl3Codebook, Exl3Layout, Exl3Spec, WeightSource};
+use infr_core::{
+    DType, Error, Exl3Codebook, Exl3EmbeddingSpec, Exl3Layout, Exl3Spec, WeightSource,
+};
 
 #[path = "exl3_source_dense.rs"]
 mod dense;
+#[path = "exl3_source_gemma4.rs"]
+mod gemma4;
 #[path = "exl3_source_qwen35.rs"]
 mod qwen35;
 use dense::{DenseOp, DenseOptions};
@@ -48,12 +52,27 @@ struct DenseSpec {
     cache: OnceLock<std::result::Result<Vec<u8>, String>>,
 }
 
+enum EmbeddingSpec {
+    Packed {
+        hf_prefix: String,
+        geometry: Exl3EmbeddingSpec,
+    },
+    Dense {
+        hf_name: String,
+        width: usize,
+        vocab: usize,
+        dtype: DType,
+    },
+}
+
 pub(crate) struct Exl3Source {
     st: infr_safetensors::Safetensors,
     metadata: Metadata,
     infos: Vec<TensorInfo>,
     linears: HashMap<String, LinearSpec>,
     passthrough: HashMap<String, DenseSpec>,
+    embeddings: HashMap<String, EmbeddingSpec>,
+    owned: HashMap<String, Vec<u8>>,
     chat_template: Option<String>,
     native: bool,
 }
@@ -84,6 +103,12 @@ impl Exl3Source {
             cfg["quantization_config"]["quant_method"] == "exl3",
             "exl3: quant_method must be exl3"
         );
+        if matches!(
+            cfg["model_type"].as_str(),
+            Some("gemma4" | "gemma4_unified")
+        ) {
+            return Self::open_gemma4(st, &cfg, dir);
+        }
         ensure!(
             cfg["tie_word_embeddings"] == false,
             "exl3: tied embeddings are unsupported"
@@ -274,6 +299,8 @@ impl Exl3Source {
             infos: Vec::new(),
             linears: HashMap::new(),
             passthrough: HashMap::new(),
+            embeddings: HashMap::new(),
+            owned: HashMap::new(),
             chat_template,
             native: false,
         })
@@ -590,7 +617,64 @@ impl WeightSource for Exl3Source {
     fn tensors(&self) -> &[TensorInfo] {
         &self.infos
     }
+    fn tensor_rows(&self, name: &str, ids: &[u32]) -> infr_core::Result<Option<Vec<f32>>> {
+        let Some(spec) = self.embeddings.get(name) else {
+            return Ok(None);
+        };
+        match spec {
+            EmbeddingSpec::Packed {
+                hf_prefix,
+                geometry,
+            } => {
+                let trellis = self.st.tensor_bytes(&format!("{hf_prefix}.trellis"))?;
+                let signs = self.st.tensor_bytes(&format!("{hf_prefix}.signs"))?;
+                infr_cpu::exl3_embedding::lookup(trellis, signs, ids, *geometry).map(Some)
+            }
+            EmbeddingSpec::Dense {
+                hf_name,
+                width,
+                vocab,
+                dtype,
+            } => {
+                if ids.iter().any(|&id| id as usize >= *vocab) {
+                    return Err(Error::Loader("embedding token id out of range".into()));
+                }
+                let bytes = self.st.tensor_bytes(hf_name)?;
+                let mut rows = Vec::with_capacity(
+                    ids.len()
+                        .checked_mul(*width)
+                        .ok_or_else(|| Error::Loader("embedding rows size overflow".into()))?,
+                );
+                for &id in ids {
+                    for word in bytes[id as usize * width * 2..(id as usize + 1) * width * 2]
+                        .as_chunks::<2>()
+                        .0
+                    {
+                        let raw = if *dtype == DType::Bf16 {
+                            half::bf16::from_le_bytes(*word).to_f32()
+                        } else {
+                            half::f16::from_le_bytes(*word).to_f32()
+                        };
+                        let value = half::f16::from_f32(raw).to_f32();
+                        if !value.is_finite() {
+                            return Err(Error::Loader("nonfinite embedding row".into()));
+                        }
+                        rows.push(value);
+                    }
+                }
+                Ok(Some(rows))
+            }
+        }
+    }
     fn tensor_bytes(&self, name: &str) -> infr_core::error::Result<&[u8]> {
+        if let Some(bytes) = self.owned.get(name) {
+            return Ok(bytes);
+        }
+        if self.embeddings.contains_key(name) {
+            return Err(Error::Loader(format!(
+                "{name}: row-only embedding cannot be expanded"
+            )));
+        }
         if self.native {
             if let Some(spec) = self.linears.get(name) {
                 return self.st.tensor_bytes(&format!("{}.trellis", spec.hf_prefix));

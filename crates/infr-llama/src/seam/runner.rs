@@ -500,7 +500,8 @@ pub(crate) fn generate_dense_backend(
     // reuse the already-uploaded lm_head buffer (same tensor); untied models upload token_embd
     // once more (extra VRAM = its on-disk size). INFR_NO_GPU_EMBED forces the host path (A/B).
     let untied_lm = g.tensors().iter().any(|t| t.name == "output.weight");
-    let gpu_embed = caps.embed_gather
+    let gpu_embed = g.tensor_rows("token_embd.weight", &[])?.is_none()
+        && caps.embed_gather
         && c.n_embd.is_multiple_of(32)
         && g.tensors()
             .iter()
@@ -1189,9 +1190,16 @@ pub(crate) fn generate_dense_backend(
         if e2b {
             wload(&["per_layer_model_proj.weight"])?;
             wload(&["per_layer_proj_norm.weight"])?;
-            // Sanity-check the two uploads landed with the shapes the GPU prologue assumes
-            // (model_proj is `[n_layer*npl, n_embd]`, proj_norm is `[npl]`).
-            debug_assert_eq!(wspecs[wspecs.len() - 2].1, c.n_layer * npl * ne);
+            if let Some(spec) = g
+                .as_any()
+                .downcast_ref::<crate::Exl3Source>()
+                .and_then(|src| src.native_spec("per_layer_model_proj.weight"))
+            {
+                debug_assert_eq!(spec.in_f as usize, ne);
+                debug_assert_eq!(spec.out_f as usize, c.n_layer * npl);
+            } else {
+                debug_assert_eq!(wspecs[wspecs.len() - 2].1, c.n_layer * npl * ne);
+            }
             debug_assert_eq!(wspecs[wspecs.len() - 1].1, npl);
         }
         // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
@@ -5105,12 +5113,7 @@ pub(crate) fn generate_dense_backend(
         }
         let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
-        let mut vf_hidden: Vec<f32> = Vec::with_capacity(m * ne);
-        let token_embd = token_embd.get()?; // host embed gather → materialize the table
-        for &tok in &prompt[start..] {
-            let base = tok as usize * ne;
-            vf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * vf_scale));
-        }
+        let vf_hidden = token_embd.rows(&prompt[start..], ne, vf_scale)?;
         let vf_positions: Vec<i32> = (start as i32..(start + m) as i32).collect();
         let vf_hidden_buf = be
             .alloc(m * ne * 4, BufferUsage::Staging)
@@ -5489,14 +5492,7 @@ pub(crate) fn generate_dense_backend(
                             .map_err(|e| anyhow!("{e}"))?;
                         b
                     } else {
-                        let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
-                        let token_embd = token_embd.get()?; // host embed gather → materialize
-                        for &tok in &prompt[cstart..cend] {
-                            let base = tok as usize * ne;
-                            pf_hidden.extend(
-                                token_embd[base..base + ne].iter().map(|&x| x * embed_scale),
-                            );
-                        }
+                        let pf_hidden = token_embd.rows(&prompt[cstart..cend], ne, embed_scale)?;
                         let b = be
                             .alloc(pf_m * ne * 4, BufferUsage::Staging)
                             .map_err(|e| anyhow!("{e}"))?;
@@ -5913,18 +5909,9 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
         }
         if !gpu_embed {
-            // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
-            // table slice is already the row to upload — hand it straight to the backend rather
-            // than allocating a throwaway `Vec<f32>` per token to copy it.
-            let row = &token_embd.get()?[tok * ne..tok * ne + ne];
-            if embed_scale == 1.0 {
-                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
-                    .map_err(|e| anyhow!("{e}"))?;
-            } else {
-                let emb: Vec<f32> = row.iter().map(|&x| x * embed_scale).collect();
-                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
-                    .map_err(|e| anyhow!("{e}"))?;
-            }
+            let row = token_embd.rows(&[tok as u32], ne, embed_scale)?;
+            be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&row))
+                .map_err(|e| anyhow!("{e}"))?;
         }
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;

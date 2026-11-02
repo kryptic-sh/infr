@@ -59,6 +59,9 @@ pub fn weight_footprint(g: &dyn WeightSource) -> WeightFootprint {
         .downcast_ref::<crate::Exl3Source>()
         .is_some_and(|source| source.is_native());
     for t in g.tensors() {
+        if matches!(g.tensor_rows(&t.name, &[]), Ok(Some(_))) {
+            continue;
+        }
         let numel: usize = t.shape.iter().product();
         let bytes = if raw_exl3 {
             ((t.nbytes + 3) & !3) as u64

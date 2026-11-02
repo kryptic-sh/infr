@@ -1266,6 +1266,23 @@ impl Config {
             .find(|t| t.name == "token_embd.weight")
             .and_then(|t| t.shape.last().copied())
             .context("token_embd.weight shape")?;
+        let mut eos_ids = vec![eos];
+        if let Some(ids) = g
+            .metadata()
+            .get("tokenizer.ggml.eos_token_ids")
+            .and_then(MetaValue::as_arr)
+        {
+            for id in ids {
+                let id = id
+                    .as_u64()
+                    .filter(|&id| id < vocab as u64 && id <= u32::MAX as u64)
+                    .context("invalid tokenizer.ggml.eos_token_ids entry")?
+                    as u32;
+                if !eos_ids.contains(&id) {
+                    eos_ids.push(id);
+                }
+            }
+        }
         // qwen35 (gated-DeltaNet hybrid) extras — ports of the old seam's `qwen35::Cfg::from_gguf`.
         // These metadata keys sit directly under `qwen35.*` (NOT `qwen35.attention.*`), matching the
         // old seam's parser exactly.
@@ -1400,7 +1417,7 @@ impl Config {
             rms_eps,
             vocab,
             eos,
-            eos_ids: vec![eos],
+            eos_ids,
             qk_norm,
             qkv_bias,
             permute_qk_neox,

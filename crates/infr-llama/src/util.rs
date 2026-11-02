@@ -192,11 +192,16 @@ pub(crate) fn test_hub_gguf(repo: &str, file: &str) -> Option<std::path::PathBuf
     infr_hub::Store::discover().ok()?.snapshot_file(repo, file)
 }
 
-/// Append chat-end markers in the vocab (`<|im_end|>` / `<|endoftext|>` / `<|eot_id|>`) to
-/// `cfg.eos_ids` so generation stops on any of them, not just the GGUF `eos`.
+/// Include vocabulary chat-end markers in the generation stop ids.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn add_chat_eos(cfg: &mut Config, tokenizer: &Tokenizer) {
-    for name in ["<|im_end|>", "<|endoftext|>", "<|eot_id|>"] {
+    for name in [
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|eot_id|>",
+        "<end_of_turn>",
+        "<turn|>",
+    ] {
         if let Some(id) = tokenizer.token_to_id(name) {
             if !cfg.eos_ids.contains(&id) {
                 cfg.eos_ids.push(id);

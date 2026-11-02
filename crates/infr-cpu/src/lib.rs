@@ -15,6 +15,7 @@ mod pool;
 pub mod turbo;
 
 pub mod exl3;
+pub mod exl3_embedding;
 pub mod exl3_linear;
 mod kernels;
 mod moe;

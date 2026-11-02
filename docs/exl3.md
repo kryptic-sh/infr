@@ -1,7 +1,7 @@
 # EXL3 checkpoints
 
-Infr loads local Qwen2 and text-only Qwen3.5 EXL3 `model.safetensors` checkpoints
-with adjacent `config.json` and `tokenizer.json`. The chat template comes from
+Infr loads local Qwen2, text-only Qwen3.5, and dense Gemma 4 EXL3
+`model.safetensors` checkpoints with adjacent `config.json` and `tokenizer.json`. The chat template comes from
 `tokenizer_config.json` or an adjacent `chat_template.jinja`.
 Hugging Face auto-resolution still targets GGUF, so download the EXL3 branch first
 and pass the local weight path.
@@ -14,7 +14,7 @@ RUST_LOG=info cargo run -p infr-llama --release --example exl3_smoke -- /path/to
 Test checkpoint: `turboderp/Qwen2.5-7B-Instruct-exl3`, branch `4.0bpw`
 (default codebook; 4-bit projections, 6-bit LM head).
 
-Supported: Qwen2 and the Qwen3.5 hybrid text architecture, untied embeddings,
+Supported: Qwen2, Qwen3.5 hybrid text, and Gemma 4 dense text architectures,
 integer rates 1–8, the default `3inst` codebook (cb0), `mcg` with multiplier
 `0xCBAC1FED`, and `mul1` with multiplier `0x83DCD12D`. Every released turboderp Qwen2.5-7B branch inspected (2/3/4 bpw)
 is cb0; rate and codebook are independent.
@@ -25,9 +25,16 @@ The adapter handles zero-centered norms, `A_log` decay conversion, BF16 convolut
 parameters, and grouped-to-tiled value-head ordering. Vision and MTP tensors are
 not exposed by the text-only source.
 
+Gemma 4 loading reuses the existing `gemma4` runtime. It handles heterogeneous
+sliding/full attention head dimensions and KV-head counts, KV sharing, per-layer
+inputs, proportional RoPE, and BF16 norms without an added unit offset. The supplied
+6-bit LM head stays independent even when the HF configuration marks embeddings tied.
+Vision tensors are not exposed.
+
 Rejected with an explicit error: custom codebook multipliers, fractional rates,
-custom RoPE scaling, sliding-window attention, sharded EXL3 checkpoints, and tied
-embeddings.
+unsupported architecture-specific RoPE/attention configurations, Gemma 4 MoE or
+double-width FFNs, sharded EXL3 checkpoints, and checkpoints requiring an absent
+tied LM head.
 
 ## Execution
 
@@ -47,7 +54,13 @@ biases are permuted by the existing binder. Qwen3.5 DeltaNet projections use
 `Exl3Layout::GroupedValueHeads`: input gather precedes the original scale/Hadamard,
 and output scatter follows the original Hadamard/scale. Compressed factors are not
 permuted. Full-attention Q/gate interleaving remains unchanged.
-Norm and bias vectors are widened to F32 at load; embeddings stay F16 mmap views.
+Norm and bias vectors are widened to F32 at load. Qwen embeddings stay F16 mmap
+views. Gemma 4 embeddings are gathered from the host mmap one requested row at a time:
+BF16 dense rows are converted to F16, while ROW256 trellises decode the circular
+LSB-first symbol stream, fixed `mul1` codebook, group gain, H256, and stored signs.
+Neither token nor per-layer tables are expanded or uploaded in full. The main
+embedding multiplier is BF16-rounded; main and per-layer products retain their
+F16 rounding boundary before being uploaded as F32 graph inputs.
 
 | backend | status |
 |---|---|
@@ -69,7 +82,9 @@ each linear to row-major F16 (about 14 GB for the 7B linears). Production loadin
 longer uses it.
 
 Disk paging and dense streaming need GGUF shard byte ranges and are unavailable for
-EXL3. Resident footprint is the raw trellis, scale, embedding, norm, and bias bytes.
+EXL3. Resident footprint is the uploaded raw trellis, scale, norm, and bias bytes;
+host-only row embeddings retain their packed/dense size in metadata but are not
+charged against VRAM.
 Large resident BDA tensors use near-exact-sized blocks; small tensors share arena
 blocks. This avoids charging a full 64 MiB block to each half-block-sized projection.
 
@@ -89,9 +104,13 @@ cargo test --release -p infr-vulkan --test exl3_linear_parity -- --ignored   # n
   exllamav3 source; the tile permutation is checked as a bijection.
 - The CPU native projection matches a dense decode + Hadamard + scale reference at
   every integer rate, with partial-rotary output scatter and tail batches.
-- Full synthetic Qwen2 and Qwen3.5 logits from the native path match the folded
-  reference, and batched logits match fresh causal-prefix forwards. Unequal
+- Full synthetic Qwen2, Qwen3.5, and Gemma 4 logits from the native path match the
+  folded reference, and batched logits match fresh causal-prefix forwards. Unequal
   key/value-head counts check the non-involutive value-head permutations.
+- ROW256 lookup covers every integer rate, circular group tails, partial groups,
+  repeated/unsorted/boundary token ids, nonfinite parameters, and explicit Walsh
+  reconstruction. Compact first/last-group goldens from the pinned E4B checkpoint
+  are generated independently by `crates/infr-cpu/tests/generate_exl3_embedding_reference.py`.
 - The Vulkan projection matches the CPU kernel within `1e-4 × max|y|` for rates 1–8,
   identity, rotary, and grouped input/output layouts, m ∈ {1, 2, 7, 8, 9, 17},
   and Qwen-sized projections.
@@ -105,8 +124,15 @@ cargo test --release -p infr-vulkan --test exl3_linear_parity -- --ignored   # n
   The same checkpoint also loads and generates on an 8 GB RX 580, with the VRAM
   guard enabled and the portable FP32 kernels.
 
-The Qwen3.5-9B EXL3 `2.00bpw` checkpoint is the next full-model generation test;
-its end-to-end Vulkan generation has not yet been verified.
+- Full text generation on the 8 GB RX 580 also runs for
+  `cortexist/gemma-4-E4B-it-qat-exl3-4.0bpw` and upstream
+  `turboderp/gemma-4-12B-it-exl3` at `2.00bpw`. The former uses row-quantized token
+  and per-layer embeddings; the latter has a dense BF16 token table. Both keep
+  projections compressed and the VRAM guard enabled. These are loading/generation
+  smoke tests, not quality or performance benchmarks.
+
+The Qwen3.5-9B EXL3 `2.00bpw` checkpoint's end-to-end Vulkan generation has not yet
+been verified.
 
 Perplexity scores the second half of each context window, excluding its final
 position: two 512-token windows score 510 targets. Windows keep their first corpus
@@ -119,3 +145,6 @@ against an upstream exllamav3 reference yet, so none is a quality claim.
 `&dyn WeightSource`. Format-specific paging and zero-copy GGUF views use
 `weights.as_any().downcast_ref::<Gguf>()`; callers must handle non-GGUF sources.
 Custom `WeightSource` implementations must implement `as_any()` by returning `self`.
+`tensor_rows(name, ids)` is an optional bounded embedding hook with a default of
+`Ok(None)`; row-only sources return selected raw F32 rows and reject whole-table
+`tensor_bytes` access.

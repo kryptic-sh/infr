@@ -1,6 +1,8 @@
 use super::*;
 use serde_json::{json, Value};
 
+#[path = "exl3_source_gemma4_tests.rs"]
+mod gemma4;
 #[path = "exl3_source_qwen35_tests.rs"]
 mod qwen35;
 
@@ -101,6 +103,74 @@ impl Fixture {
         .unwrap();
         Exl3Source::open(&self.dir.path().join("model.safetensors"))
     }
+}
+
+#[test]
+fn row_only_embeddings_feed_scaled_host_inputs_without_a_table_cache() {
+    let mut fixture = Fixture::new();
+    let geometry = Exl3EmbeddingSpec {
+        width: 256,
+        vocab: 2,
+        bits: 4,
+    };
+    let mut packed = vec![0; geometry.trellis_bytes().unwrap()];
+    for row in 0..2 {
+        packed[row * 130..row * 130 + 2].copy_from_slice(&half::f16::ONE.to_le_bytes());
+    }
+    for prefix in ["row_emb", "row_ple"] {
+        fixture.tensors.push((
+            format!("{prefix}.trellis"),
+            "I16".into(),
+            vec![2, 65],
+            packed.clone(),
+        ));
+        fixture.dense(&format!("{prefix}.signs"), &[1, 256], 1.0);
+    }
+    let mut source = fixture.open().unwrap();
+    for (name, prefix) in [
+        ("token_embd.weight", "row_emb"),
+        ("per_layer_token_embd.weight", "row_ple"),
+    ] {
+        source.embeddings.insert(
+            name.into(),
+            EmbeddingSpec::Packed {
+                hf_prefix: prefix.into(),
+                geometry,
+            },
+        );
+    }
+    source.metadata.kv.insert(
+        "infr.exl3.embedding_fp16_scale".into(),
+        MetaValue::Bool(true),
+    );
+    let cache = OnceLock::new();
+    let handle = crate::seam::TokenEmbd::new(&cache, &source);
+    let rows = handle.rows(&[1, 0, 1], 256, (2560f32).sqrt()).unwrap();
+    let scaled = half::f16::from_f32(-55.25 * 50.5).to_f32();
+    for row in rows.as_chunks::<256>().0 {
+        assert_eq!(row[0], scaled);
+        assert!(row[1..].iter().all(|&v| v == 0.0));
+    }
+    assert!(cache.get().is_none());
+    assert!(handle.get().is_err());
+    assert!(handle.rows(&[2], 256, 1.0).is_err());
+    assert!(source.tensor_bytes("token_embd.weight").is_err());
+    let ple = crate::util::PerLayerEmbd {
+        npl: 128,
+        n_layer: 2,
+        tok_embd_dtype: DType::I16,
+        tok_embd_row_bytes: 130,
+    };
+    let rows = crate::seam::e2b_ipl_rows(&source, &ple, &[1, 0]).unwrap();
+    let scale = 128f32.sqrt();
+    assert_eq!(rows[0], half::f16::from_f32(-55.25 * scale).to_f32());
+    assert_eq!(rows[256], rows[0]);
+    let mut main = [0.05078125f32];
+    let mut per_layer = main;
+    crate::seam::scale_embedding_rows(&source, &mut main, scale, true).unwrap();
+    crate::seam::scale_embedding_rows(&source, &mut per_layer, scale, false).unwrap();
+    assert_eq!(main[0], 0.57421875);
+    assert_eq!(per_layer[0], 0.57470703125_f64 as f32);
 }
 
 #[test]

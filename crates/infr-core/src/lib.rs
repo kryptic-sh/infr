@@ -40,7 +40,7 @@ pub use backend::{
     SUBMIT_BUDGET_NS, SUBMIT_DANGER_NS,
 };
 pub use error::{Error, Result};
-pub use exl3::{Exl3Codebook, Exl3Layout, Exl3OutputLayout, Exl3Spec};
+pub use exl3::{Exl3Codebook, Exl3EmbeddingSpec, Exl3Layout, Exl3OutputLayout, Exl3Spec};
 pub use graph::{Activation, AttnMask, Graph, Op, TensorDecl, TensorKind};
 pub use loader::{MetaValue, Metadata, TensorInfo, WeightSource};
 pub use pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};

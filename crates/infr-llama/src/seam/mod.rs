@@ -54,11 +54,13 @@ impl<'a> TokenEmbd<'a> {
         Self { cell, ws }
     }
 
-    /// The dequantized `[vocab, n_embd]` row-major table — dequantized on first call, cached after.
-    /// `Config::from_gguf` already validated the tensor exists at load, but a truncated/corrupt GGUF
-    /// can still fail the dequant here (the first host gather, lazily). FALLIBLE so that a real
-    /// non-programmer input surfaces a clear error at the call site instead of aborting the process.
+    /// Lazily materialize a supported full embedding table; row-only representations reject this.
     pub(crate) fn get(&self) -> AResult<&'a [f32]> {
+        if self.ws.tensor_rows("token_embd.weight", &[])?.is_some() {
+            return Err(anyhow!(
+                "token_embd.weight: row-only embedding cannot be expanded"
+            ));
+        }
         if let Some(v) = self.cell.get() {
             return Ok(v);
         }
@@ -74,6 +76,81 @@ impl<'a> TokenEmbd<'a> {
             .get()
             .expect("cell was just set or already initialized"))
     }
+
+    pub(crate) fn rows(
+        &self,
+        ids: &[u32],
+        width: usize,
+        scale: f32,
+    ) -> AResult<std::borrow::Cow<'a, [f32]>> {
+        use std::borrow::Cow;
+        anyhow::ensure!(width > 0, "embedding width must be positive");
+        let count = ids
+            .len()
+            .checked_mul(width)
+            .ok_or_else(|| anyhow!("embedding row size overflow"))?;
+        let mut rows = if let Some(rows) = self.ws.tensor_rows("token_embd.weight", ids)? {
+            anyhow::ensure!(
+                rows.len() == count,
+                "embedding lookup returned incorrect row length"
+            );
+            rows
+        } else {
+            let table = self.get()?;
+            if ids.len() == 1 && scale == 1.0 {
+                let start = (ids[0] as usize)
+                    .checked_mul(width)
+                    .ok_or_else(|| anyhow!("embedding row offset overflow"))?;
+                return Ok(Cow::Borrowed(
+                    table
+                        .get(start..start + width)
+                        .ok_or_else(|| anyhow!("embedding token id out of range"))?,
+                ));
+            }
+            let mut rows = Vec::with_capacity(count);
+            for &id in ids {
+                let start = (id as usize)
+                    .checked_mul(width)
+                    .ok_or_else(|| anyhow!("embedding row offset overflow"))?;
+                rows.extend_from_slice(
+                    table
+                        .get(start..start + width)
+                        .ok_or_else(|| anyhow!("embedding token id out of range"))?,
+                );
+            }
+            rows
+        };
+        scale_embedding_rows(self.ws, &mut rows, scale, true)?;
+        Ok(Cow::Owned(rows))
+    }
+}
+
+pub(crate) fn scale_embedding_rows(
+    ws: &dyn WeightSource,
+    rows: &mut [f32],
+    scale: f32,
+    main: bool,
+) -> AResult<()> {
+    let half = matches!(
+        ws.metadata().get("infr.exl3.embedding_fp16_scale"),
+        Some(infr_core::loader::MetaValue::Bool(true))
+    );
+    let scale = if half && main {
+        half::bf16::from_f32(scale).to_f32()
+    } else {
+        scale
+    };
+    for value in rows {
+        *value *= scale;
+        if half {
+            *value = half::f16::from_f32(*value).to_f32();
+        }
+        anyhow::ensure!(
+            value.is_finite(),
+            "embedding scaling produced a nonfinite value"
+        );
+    }
+    Ok(())
 }
 
 /// The CPU seam weight binder, hoisted so the CPU runner and every CPU `verify_*` entry share one
@@ -3737,10 +3814,22 @@ pub(crate) use infr_core::budget::kv_fmt_bytes;
 /// Returns `pl_tok_scaled[r][l*npl+j] = per_layer_tok_embd[tok_r][l*npl+j] * √npl`, `[rows,
 /// n_layer*npl]` row-major — uploaded to `ipl_buf` and bound to the graph Input `pl_tok_in`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn e2b_ipl_rows(g: &dyn WeightSource, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32>> {
+pub(crate) fn e2b_ipl_rows(
+    g: &dyn WeightSource,
+    ple: &PerLayerEmbd,
+    tokens: &[u32],
+) -> AResult<Vec<f32>> {
     use rayon::prelude::*;
     let (npl, nl) = (ple.npl, ple.n_layer);
     let sqrt_npl = (npl as f32).sqrt();
+    if let Some(mut rows) = g.tensor_rows("per_layer_token_embd.weight", tokens)? {
+        anyhow::ensure!(
+            rows.len() == tokens.len() * nl * npl,
+            "per-layer lookup returned incorrect row length"
+        );
+        scale_embedding_rows(g, &mut rows, sqrt_npl, false)?;
+        return Ok(rows);
+    }
     let te_bytes = g
         .tensor_bytes("per_layer_token_embd.weight")
         .map_err(|e| anyhow!("{e}"))?;

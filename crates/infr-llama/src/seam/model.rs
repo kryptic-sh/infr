@@ -1858,7 +1858,7 @@ impl SeamModel {
             let td = std::time::Instant::now();
             let (cand, _) = crate::seam::generate_dense_metal_session(
                 &draft_session.be,
-                &draft.gguf,
+                draft.weights(),
                 &draft.cfg,
                 &draft_session.cfg,
                 draft.embd(),

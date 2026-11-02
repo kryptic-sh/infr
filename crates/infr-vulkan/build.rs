@@ -745,6 +745,29 @@ fn main() {
             "native_gemv_kq_fma_q6k_nr4",
             &["-DFMT_Q6K", "-DNR=4"],
         ),
+        // Multi-row (verify) twin of the kq_fma decode GEMV above (MR=4 rows per workgroup
+        // sharing each superblock's weight-word load — see native_gemv_kq_fma_mrow.comp). No
+        // USE_RES builds: the fused residual is a decode-only (m=1) shape.
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q4k",
+            &["-DFMT_Q4K"],
+        ),
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q6k",
+            &["-DFMT_Q6K"],
+        ),
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q4k_nr4",
+            &["-DFMT_Q4K", "-DNR=4"],
+        ),
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q6k_nr4",
+            &["-DFMT_Q6K", "-DNR=4"],
+        ),
         (
             "native_gemv_kq_fma",
             "native_gemv_kq_fma_q6k_res_nr4",

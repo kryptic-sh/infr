@@ -1131,6 +1131,31 @@ pub(crate) fn native_gemv_kq_fma_spv(
         _ => return None,
     })
 }
+/// SPIR-V (kernel-cache name + words) for the multi-row K-quant verify GEMV
+/// (`native_gemv_kq_fma_mrow.comp`), MR=4 input rows per workgroup sharing each superblock's
+/// weight-word load, at `nr` (4 or 8) output columns per workgroup; `None` for dtypes without
+/// a build.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemv_kq_fma_mrow_spv(
+    dtype: infr_core::DType,
+    nr: usize,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match (dtype, nr) {
+        (Q4K, 8) => spv!("native_gemv_kq_fma_mrow_q4k"),
+        (Q6K, 8) => spv!("native_gemv_kq_fma_mrow_q6k"),
+        (Q4K, 4) => spv!("native_gemv_kq_fma_mrow_q4k_nr4"),
+        (Q6K, 4) => spv!("native_gemv_kq_fma_mrow_q6k_nr4"),
+        _ => return None,
+    })
+}
 /// Whether `native_gemm_kq_fma` has a build for `dtype`.
 ///
 /// Q4_0 rides the same tier: its dequant is cheaper than the K-quants' and the

@@ -2081,7 +2081,9 @@ fn cmd_perplexity(
     })?;
     watch.check()?;
     match report.uncertainty() {
+        // print-ok: program OUTPUT — the `infr perplexity` result line users pipe.
         Some(u) => println!("Final estimate: PPL = {:.4} +/- {u:.5}", report.ppl()),
+        // print-ok: program OUTPUT — the `infr perplexity` result line users pipe.
         None => println!("Final estimate: PPL = {:.4}", report.ppl()),
     }
     Ok(())

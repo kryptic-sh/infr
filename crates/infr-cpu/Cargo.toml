@@ -22,3 +22,5 @@ tracing.workspace = true
 infr-testkit.workspace = true
 # Checkpoint probing only (`examples/exl3_probe.rs` reads safetensors headers).
 serde_json.workspace = true
+# Full-matrix reconstruct validation (`examples/exl3_matrix.rs`).
+infr-safetensors.workspace = true

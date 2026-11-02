@@ -1234,6 +1234,7 @@ dependencies = [
  "infr-gguf",
  "infr-prof",
  "infr-prof-rt",
+ "infr-safetensors",
  "infr-testkit",
  "rayon",
  "serde_json",

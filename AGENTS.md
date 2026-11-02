@@ -18,3 +18,7 @@
 - Commit and push each completed slice to `main`.
 - Watch CI for the pushed commit, inspect its jobs, and resolve failures before
   considering the slice complete. A successful push alone is not verification.
+- Do not block a turn polling slow CI jobs: the CPU-goldens suite takes ~20+ min
+  on GHA. Merge/push once the fast signal is green (platform `cargo test` jobs,
+  clippy, fmt, plus a local run of the directly-affected tests), then check back
+  on the slow jobs and resolve any failures as a follow-up slice.

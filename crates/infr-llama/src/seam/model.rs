@@ -69,6 +69,7 @@ pub struct BenchPlacement {
 /// (`MixerW::DeltaNet`) all drive this same struct.
 pub struct SeamModel {
     gguf: Gguf,
+    path: std::path::PathBuf,
     cfg: Config,
     /// The ENGINE configuration every seam path this model drives reads its knobs from —
     /// `kv.*`, `spec.*`, `sampling.*`, `multi.*`, `device.ubatch*`, `paging.cache`, the seam's
@@ -429,6 +430,7 @@ impl SeamModel {
         let per_layer_embd = build_per_layer_embd(&g, &cfg)?;
         Ok(Self {
             gguf: g,
+            path: gguf_path.to_path_buf(),
             cfg,
             ecfg,
             token_embd: std::sync::OnceLock::new(),
@@ -436,6 +438,11 @@ impl SeamModel {
             tokenizer,
             footprint: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The GGUF file this model was loaded from.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The ENGINE configuration this model was loaded with (see the `ecfg` field). Every seam path

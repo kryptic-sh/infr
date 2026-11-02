@@ -24,6 +24,7 @@ use infr_core::{TensorInfo, WeightSource};
 use infr_gguf::Gguf;
 
 mod backends;
+pub mod gemma4;
 pub use backends::*;
 
 /// One resolved-and-shape-checked tensor: its GGUF metadata (name/shape/dtype/offset), kept around

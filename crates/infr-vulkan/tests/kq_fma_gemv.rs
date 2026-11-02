@@ -266,7 +266,7 @@ fn kq_fma_mrow_parity() {
                 }
                 // BIT-EXACT against one m=1 dispatch per row: the verify-vs-decode identity
                 // contract. The m=1 kernel reads a single row, so stage each row separately.
-                let nr = be.recorder().unwrap().kq_fma_gemv_rows(out_f);
+                let nr = be.recorder().unwrap().kq_fma_gemv_rows(in_f, out_f);
                 for r in 0..rows {
                     let xr = upload(
                         &be,

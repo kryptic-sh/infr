@@ -20,3 +20,5 @@ tracing.workspace = true
 [dev-dependencies]
 # The shared backend decode-parity harness (`tests/decode_parity.rs`).
 infr-testkit.workspace = true
+# Checkpoint probing only (`examples/exl3_probe.rs` reads safetensors headers).
+serde_json.workspace = true

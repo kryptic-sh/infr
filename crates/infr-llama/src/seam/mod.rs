@@ -458,6 +458,18 @@ pub(crate) fn generate_dense_cpu_mode(
     req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
+    if cfg.qwen4_exp.is_some() || g.as_any().is::<crate::qwen4_exp_source::Qwen4ExpSource>() {
+        return crate::qwen4_exp_cpu::generate(
+            g,
+            ec,
+            prompt,
+            max_new,
+            &cfg.eos_ids,
+            constraint,
+            req,
+            on_token,
+        );
+    }
     // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a weight binder that maps
     // each tensor straight from the GGUF mmap (no alloc, no memcpy) — or, when `paging.dram` asks
     // for a host weight cache, registers the big ones to be read from the file on demand.
@@ -3401,6 +3413,9 @@ pub(crate) fn verify_dense_cpu(
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<Vec<f32>> {
+    if cfg.qwen4_exp.is_some() || g.as_any().is::<crate::qwen4_exp_source::Qwen4ExpSource>() {
+        return crate::qwen4_exp_cpu::verify(g, tokens, false).map(|(logits, _)| logits);
+    }
     let cpu_be = CpuBackend::new_with(ec.clone());
     let mut logits = Vec::new();
     let mut state = None;
@@ -3441,6 +3456,9 @@ pub(crate) fn verify_dense_cpu_with_h(
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<(Vec<f32>, Vec<f32>)> {
+    if cfg.qwen4_exp.is_some() || g.as_any().is::<crate::qwen4_exp_source::Qwen4ExpSource>() {
+        return crate::qwen4_exp_cpu::verify(g, tokens, false);
+    }
     let cpu_be = CpuBackend::new_with(ec.clone());
     let mut logits = Vec::new();
     let mut h = Vec::new();
@@ -3484,6 +3502,9 @@ pub(crate) fn verify_rows_cpu_with_h(
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<(Vec<f32>, Vec<f32>)> {
+    if cfg.qwen4_exp.is_some() || g.as_any().is::<crate::qwen4_exp_source::Qwen4ExpSource>() {
+        return crate::qwen4_exp_cpu::verify(g, tokens, true);
+    }
     let cpu_be = CpuBackend::new_with(ec.clone());
     let mut logits = Vec::new();
     let mut h = Vec::new();

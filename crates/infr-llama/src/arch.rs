@@ -49,7 +49,8 @@ pub const QWEN35: &str = "qwen35";
 pub const QWEN35_MOE: &str = "qwen35moe";
 /// HF-only Qwen4-Exp text checkpoint identifier. Unlike the GGUF strings above, this is
 /// Transformers' `model_type`, not a claim about llama.cpp's canonical arch table. The
-/// safetensors adapter can load it; inference is still refused, so it is not in [`ALL`].
+/// safetensors adapter and scalar CPU reference support it. It is not in [`ALL`], which
+/// enumerates shared-runner/GGUF families; generic graph and GPU execution still refuse.
 pub const QWEN4_EXP: &str = "qwen4_exp";
 /// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
 /// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN

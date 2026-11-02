@@ -171,7 +171,7 @@ fn tiny_source_is_zero_copy_and_has_no_fake_norms() {
 }
 
 #[test]
-fn load_with_routes_hf_and_refuses_before_cpu_or_gpu_work() {
+fn load_with_routes_hf_and_refuses_before_gpu_work() {
     let f = Fixture::new(&config(), &manifest());
     let model = crate::SeamModel::load_with(
         &f.path,
@@ -186,11 +186,11 @@ fn load_with_routes_hf_and_refuses_before_cpu_or_gpu_work() {
     );
     assert_eq!(model.weights().chat_template(), Some("{{ messages }}"));
     let mut called = false;
-    let e = model
+    let generated = model
         .generate_cpu_ids(&[1, 2], 1, |_| called = true)
-        .unwrap_err();
-    assert_eq!(e.to_string(), FORWARD_UNSUPPORTED);
-    assert!(!called);
+        .unwrap();
+    assert_eq!(generated.len(), 1);
+    assert!(called || model.config().eos_ids.contains(&generated[0]));
     // No Vulkan enumeration, backend creation, placement or tensor binding is allowed.
     for result in [
         model.vulkan_session_on(Some(usize::MAX), 8),

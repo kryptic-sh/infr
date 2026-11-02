@@ -4,6 +4,8 @@
 // each work item applies one superblock's activations to 4 rows.
 // -DFMT_Q4K | -DFMT_Q6K, optional -DUSE_RES (y = residual + x·Wᵀ). Requires in_f % 256 == 0.
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 #ifndef NR
 #define NR 8
@@ -24,7 +26,7 @@ layout(binding = 2) writeonly buffer YB { float y[]; };
 #define NW(i) arena_word(i)
 #include "native_decode.glsl"
 
-shared float red[NR * 64];
+shared float red[NR * 64]; // per-subgroup partials when a workgroup spans several subgroups
 
 // Unaligned-safe word funnel: sh in {0,8,16,24}; (hi<<1)<<(31-sh) is 0 when sh==0.
 uint fun(uint lo, uint hi, uint sh) { return (lo >> sh) | ((hi << 1u) << (31u - sh)); }
@@ -163,17 +165,27 @@ void main() {
         sb += 8u;
         while (g < RG && sb >= nsb) { sb -= nsb; g++; }
     }
+    float part[NR];
     [[unroll]] for (uint g = 0u; g < RG; g++)
-        [[unroll]] for (uint r = 0u; r < 4u; r++) red[(4u * g + r) * 64u + lane] = acc[g][r];
-    barrier();
-    [[unroll]] for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (lane < s) {
-            [[unroll]] for (uint r = 0u; r < uint(NR); r++) red[r * 64u + lane] += red[r * 64u + lane + s];
+        [[unroll]] for (uint r = 0u; r < 4u; r++) part[4u * g + r] = subgroupAdd(acc[g][r]);
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint r = 0u; r < uint(NR); r++) red[gl_SubgroupID * uint(NR) + r] = part[r];
         }
         barrier();
+        if (lane < uint(NR)) {
+            float v = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; s++) v += red[s * uint(NR) + lane];
+            red[lane] = v;
+        }
+        barrier();
+        [[unroll]] for (uint r = 0u; r < uint(NR); r++) part[r] = red[r];
     }
     if (lane < uint(NR) && o0 + lane < pc.out_f) {
-        float v = red[lane * 64u];
+        float v = part[0];
+        [[unroll]] for (uint r = 1u; r < uint(NR); r++) {
+            if (lane == r) v = part[r];
+        }
 #ifdef USE_RES
         v += res[o0 + lane];
 #endif

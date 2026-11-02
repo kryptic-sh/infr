@@ -125,6 +125,11 @@ fn kq_fma_gemv_bw() {
         ("q", DType::Q4K, 2560, 2048),
         ("o", DType::Q4K, 2048, 2560),
         ("lm_head", DType::Q4K, 2560, 262144),
+        ("qw gu", DType::Q4K, 2048, 22016),
+        ("qw dn q4", DType::Q4K, 11008, 2048),
+        ("qw dn q6", DType::Q6K, 11008, 2048),
+        ("qw q", DType::Q4K, 2048, 2048),
+        ("qw head", DType::Q6K, 2048, 151936),
     ] {
         let bank = synth(dt, in_f * out_f, 3);
         let wbytes = bank.len();
@@ -189,7 +194,7 @@ fn kq_fma_gemv_bw() {
             })
         };
         let (k4, k8) = (kq(4), kq(8));
-        let pick = be.recorder().unwrap().kq_fma_gemv_rows(out_f);
+        let pick = be.recorder().unwrap().kq_fma_gemv_rows(in_f, out_f);
         let best = if pick == 4 { k4 } else { k8 };
         println!(
             "{label:8} {dt:?} {in_f}x{out_f} [{} MiB]: quant_q8+mrow {mrow:4.0}  mrow_fuseq {fuseq:4.0}  kq_fma nr4 {k4:4.0} nr8 {k8:4.0} GB/s  picked nr{pick} ({:+.0}%)",

@@ -37,15 +37,19 @@ float dot4b(uint q, vec4 xv) {
 }
 float hsum(vec4 v) { return (v.x + v.y) + (v.z + v.w); }
 
-// Branch-free k4w: a divergent branch here serialized the per-row weight loads.
-uvec2 k4sel(uint i, uvec4 hdr) {
-    uint s = (i & 3u) * 8u;
-    uint by = (hdr.y >> s) & 0xFFu;
-    uint bz = (hdr.z >> s) & 0xFFu;
-    uint bw = (hdr.w >> s) & 0xFFu;
-    uvec2 lo = uvec2(by & 63u, bz & 63u);
-    uvec2 hi = uvec2((bw & 0xFu) | ((by >> 6u) << 4u), (bw >> 4u) | ((bz >> 6u) << 4u));
-    return i < 4u ? lo : hi;
+// Q4_K (scale, min) of sub-blocks 2g and 2g+1, branch-free; hi = g >= 2, s = ((2g) & 3) * 8.
+uvec4 k4pair(uvec4 hdr, bool hi, uint s) {
+    uint ps = hi ? hdr.w : hdr.y;
+    uint pm = hi ? hdr.w : hdr.z;
+    uint o = hi ? 6u : 4u;
+    uint om = hi ? 4u : 0u;
+    uvec4 k;
+    [[unroll]] for (uint t = 0u; t < 2u; t++) {
+        uint st = s + 8u * t;
+        k[2u * t] = bitfieldExtract(ps, int(st), 4) + bitfieldExtract(hdr.y, int(st + o), 2) * 16u;
+        k[2u * t + 1u] = bitfieldExtract(pm, int(st + om), 4) + bitfieldExtract(hdr.z, int(st + o), 2) * 16u;
+    }
+    return k;
 }
 
 // Superblock `sb` of the 4 rows whose superblock-0 byte offsets are `rb` (`sbb` = sb * BLK).
@@ -70,6 +74,8 @@ vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
         hdrs[r] = NW4(bd >> 2u);
         qs[r] = NW4((bd + 16u + 32u * g + 16u * h) >> 2u);
     }
+    bool hi = g >= 2u;
+    uint s = ((2u * g) & 3u) * 8u;
     vec4 out4;
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
         uvec4 hdr = hdrs[r];
@@ -77,13 +83,13 @@ vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
         float slo = 0.0, shi = 0.0;
         [[unroll]] for (uint w = 0u; w < 4u; w++) {
             slo += dot4b(q[w] & 0x0F0F0F0Fu, xa[w]);
-            shi += dot4b((q[w] >> 4u) & 0x0F0F0F0Fu, xc[w]);
+            shi += dot4b(q[w] & 0xF0F0F0F0u, xc[w]);
         }
         vec2 dm = unpackHalf2x16(hdr.x);
-        uvec2 klo = k4sel(2u * g, hdr);
-        uvec2 khi = k4sel(2u * g + 1u, hdr);
-        out4[r] = dm.x * (float(klo.x) * slo + float(khi.x) * shi)
-                - dm.y * (float(klo.y) * sxa + float(khi.y) * sxc);
+        uvec4 k = k4pair(hdr, hi, s);
+        // shi carries 16x the high nibbles.
+        out4[r] = dm.x * (float(k.x) * slo + float(k.z) * 0.0625 * shi)
+                - dm.y * (float(k.y) * sxa + float(k.w) * sxc);
     }
     return out4;
 }

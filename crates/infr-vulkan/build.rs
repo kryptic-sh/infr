@@ -3477,6 +3477,28 @@ fn main() {
             out
         })
         .collect();
+    // GQA-batched decode pass 1 (`attn_decode_gqa.comp`): every (head dim, heads per kv head,
+    // sliding-window, record-once) combination `gemm::attn_decode_gqa_kernel` can select.
+    let mut builds = builds;
+    for hd in [128u32, 256, 512] {
+        for g in [4u32, 8] {
+            for swa in [false, true] {
+                for dynac in [false, true] {
+                    let mut defines = vec![format!("-DHD={hd}"), format!("-DG={g}")];
+                    let mut name = format!("attn_decode_gqa_hd{hd}_g{g}");
+                    if swa {
+                        defines.extend(["-DSWA".to_string(), "-DRING".to_string()]);
+                        name.push_str("_swa");
+                    }
+                    if dynac {
+                        defines.extend(["-DUSE_PARAMS".to_string(), "-DSELF_CHUNK".to_string()]);
+                        name.push_str("_dynac");
+                    }
+                    builds.push(("attn_decode_gqa".to_string(), name, defines));
+                }
+            }
+        }
+    }
     // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a
     // `bufferDeviceAddress` arena pool (native_weight_addr.glsl) instead of a bound SSBO, lifting the
     // ~4 GiB `maxStorageBufferRange` cap one SSBO binding imposes. `wants_streamed_twin` marks the

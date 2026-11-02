@@ -3577,6 +3577,41 @@ pub(crate) fn attn_decode_kernel(
         _ => return None,
     })
 }
+/// The GQA-batched decode pass-1 build (`attn_decode_gqa.comp`) for `(hd, g, swa, dynac)`, where
+/// `g` is query heads per kv head, or `None` when no build covers the shape.
+pub(crate) fn attn_decode_gqa_kernel(
+    hd: usize,
+    g: usize,
+    swa: bool,
+    dynac: bool,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:expr) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    macro_rules! variants {
+        ($hd:literal, $g:literal) => {
+            match (swa, dynac) {
+                (false, false) => spv!(concat!("attn_decode_gqa_hd", $hd, "_g", $g)),
+                (false, true) => spv!(concat!("attn_decode_gqa_hd", $hd, "_g", $g, "_dynac")),
+                (true, false) => spv!(concat!("attn_decode_gqa_hd", $hd, "_g", $g, "_swa")),
+                (true, true) => spv!(concat!("attn_decode_gqa_hd", $hd, "_g", $g, "_swa_dynac")),
+            }
+        };
+    }
+    Some(match (hd, g) {
+        (128, 4) => variants!(128, 4),
+        (128, 8) => variants!(128, 8),
+        (256, 4) => variants!(256, 4),
+        (256, 8) => variants!(256, 8),
+        (512, 4) => variants!(512, 4),
+        (512, 8) => variants!(512, 8),
+        _ => return None,
+    })
+}
 // PROBE (B7 slice 1): LDS-staged K-tile decode pass 1 — one whole 128-dim dot per THREAD out of
 // shared memory instead of attn_partial's per-key cross-lane `subgroupAdd`. Reachable ONLY from
 // `Recorder::attention_kv_split_ktile_at`, whose only caller is tests/attn_ktile_probe.rs.

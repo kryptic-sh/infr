@@ -540,13 +540,24 @@ fn run_shape(be: &VulkanBackend, s: &Shape) -> Legs {
 /// A backend whose config differs from the default in nothing but the fast-path knob, so the two
 /// legs go through the production selector rather than a test-only entry point.
 fn backend(attn_decode: bool) -> Option<VulkanBackend> {
+    backend_with(attn_decode, Some(false))
+}
+
+fn backend_with(attn_decode: bool, gqa: Option<bool>) -> Option<VulkanBackend> {
     let mut cfg = Config::default();
     cfg.kernels.vulkan.attn_decode = attn_decode;
+    cfg.kernels.vulkan.attn_decode_gqa = gqa;
     VulkanBackend::new_with(Arc::new(cfg)).ok()
 }
 
 fn run_all(attn_decode: bool) -> Option<(Vec<Legs>, Vec<&'static str>)> {
     let be = backend(attn_decode)?;
+    let out = SHAPES.iter().map(|s| run_shape(&be, s)).collect();
+    Some((out, be.built_kernel_names()))
+}
+
+fn run_all_gqa(gqa: bool) -> Option<(Vec<Legs>, Vec<&'static str>)> {
+    let be = backend_with(true, Some(gqa))?;
     let out = SHAPES.iter().map(|s| run_shape(&be, s)).collect();
     Some((out, be.built_kernel_names()))
 }
@@ -696,4 +707,51 @@ fn attn_decode_is_bit_identical_to_attn_partial() {
         SHAPES.len(),
         want_fast.len()
     );
+}
+
+/// The GQA-batched pass 1 (`attn_decode_gqa.comp`) is not bit-identical to `attn_decode` (it sums
+/// in a different order), so it is held to an absolute tolerance on outputs bounded by 1.
+#[test]
+#[ignore = "requires a wave64 Vulkan GPU"]
+fn attn_decode_gqa_matches_attn_decode() {
+    let Some((want, ref_kernels)) = run_all_gqa(false) else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (got, gqa_kernels) = run_all_gqa(true).expect("second backend");
+    if !gqa_kernels.iter().any(|k| k.starts_with("attn_decode_gqa")) {
+        eprintln!("skip: device cannot run the GQA kernel (needs a pinnable 64-wide subgroup)");
+        return;
+    }
+    assert!(
+        !ref_kernels.iter().any(|k| k.starts_with("attn_decode_gqa")),
+        "attn_decode_gqa=false still built a GQA kernel: {ref_kernels:?}"
+    );
+    let mut covered = 0usize;
+    for (i, s) in SHAPES.iter().enumerate() {
+        let g = s.nh / s.nkv;
+        let batched = s.nh % s.nkv == 0 && (g == 4 || g == 8);
+        for (leg, w, o) in [
+            ("static", &want[i].stat, &got[i].stat),
+            ("replay", &want[i].replay, &got[i].replay),
+        ] {
+            assert_real_signal(w, s.label);
+            let mut worst = 0f32;
+            for (a, b) in w.iter().zip(o) {
+                let (a, b) = (f32::from_bits(*a), f32::from_bits(*b));
+                worst = worst.max((a - b).abs());
+            }
+            assert!(
+                worst <= 1e-4,
+                "{} [{leg}]: GQA vs attn_decode max abs diff {worst}",
+                s.label
+            );
+            if !batched {
+                assert!(worst == 0.0, "{} [{leg}]: unbatched shape changed", s.label);
+            }
+        }
+        covered += batched as usize;
+    }
+    assert!(covered > 0, "no shape reached the GQA kernel");
+    eprintln!("attn_decode_gqa within 1e-4 of attn_decode on {covered} batched shapes");
 }

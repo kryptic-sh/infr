@@ -43,6 +43,8 @@ pub use weights::{weight_footprint, WeightFootprint};
 pub use infr_gguf::watch::WeightWatch;
 mod exl3_source;
 pub mod mtp;
+pub mod qwen4_exp;
+mod qwen4_exp_source;
 pub(crate) use exl3_source::Exl3Source;
 mod quant;
 pub mod qwen35;

@@ -21,6 +21,17 @@ pub struct Safetensors {
     mmap: memmap2::Mmap,
     metadata: Metadata,
     tensors: Vec<TensorInfo>,
+    i64_buffers: Vec<I64Buffer>,
+}
+
+/// Host-only persistent integer buffer. Deliberately NOT a `TensorInfo`: infr has no
+/// graph I64 dtype, and these bytes must not be bound as dense model weights.
+#[derive(Clone, Debug)]
+pub struct I64Buffer {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub offset: u64,
+    pub nbytes: usize,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -28,16 +39,41 @@ impl Safetensors {
     /// Open and parse a safetensors file. The file is memory-mapped; no tensor
     /// bytes are copied.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_impl(path, false)
+    }
+
+    /// Explicitly allow I64 persistent buffers, exposed separately from `WeightSource`.
+    /// All shapes, byte sizes and ranges are still validated, including buffer ranges.
+    /// The default `open` remains strict for existing EXL3/dense callers.
+    pub fn open_with_i64_buffers(path: &Path) -> Result<Self> {
+        Self::open_impl(path, true)
+    }
+
+    pub fn i64_buffers(&self) -> &[I64Buffer] {
+        &self.i64_buffers
+    }
+
+    pub fn i64_buffer_bytes(&self, name: &str) -> Result<&[u8]> {
+        let info = self
+            .i64_buffers
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| Error::Loader(format!("I64 buffer not found: '{name}'")))?;
+        let start = info.offset as usize;
+        Ok(&self.mmap[start..start + info.nbytes])
+    }
+
+    fn open_impl(path: &Path, allow_i64: bool) -> Result<Self> {
         let file = std::fs::File::open(path)
             .map_err(|e| Error::Loader(format!("open {}: {e}", path.display())))?;
         // SAFETY: same contract as the GGUF loader — the file must not be written to or
         // truncated while the mapping is live.
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| Error::Loader(format!("mmap {}: {e}", path.display())))?;
-        Self::parse(mmap, path)
+        Self::parse(mmap, path, allow_i64)
     }
 
-    fn parse(mmap: memmap2::Mmap, path: &Path) -> Result<Self> {
+    fn parse(mmap: memmap2::Mmap, path: &Path, allow_i64: bool) -> Result<Self> {
         let file_len = mmap.len();
         let hlen_size: usize = 8;
         if file_len < hlen_size {
@@ -85,6 +121,8 @@ impl Safetensors {
         }
 
         let mut tensors = Vec::new();
+        let mut i64_buffers = Vec::new();
+        let mut ranges = Vec::new();
         // `preserve_order` (workspace serde_json) keeps file order — deterministic enumeration.
         for (name, entry) in obj {
             if name == "__metadata__" {
@@ -111,8 +149,14 @@ impl Safetensors {
             let dtype_str = entry.get("dtype").and_then(|d| d.as_str()).ok_or_else(|| {
                 Error::Loader(format!("{name}: missing `dtype` in {}", path.display()))
             })?;
-            let dtype = map_dtype(dtype_str)
-                .ok_or_else(|| Error::Loader(format!("{name}: unsupported dtype `{dtype_str}`")))?;
+            let dtype = map_dtype(dtype_str);
+            let width = if dtype_str == "I64" && allow_i64 {
+                8
+            } else {
+                dtype.and_then(|d| d.dense_bytes(1)).ok_or_else(|| {
+                    Error::Loader(format!("{name}: unsupported dtype `{dtype_str}`"))
+                })?
+            };
             let offsets = entry
                 .get("data_offsets")
                 .and_then(|o| o.as_array())
@@ -146,15 +190,12 @@ impl Safetensors {
                 .iter()
                 .try_fold(1usize, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| Error::Loader(format!("{name}: shape product overflows usize")))?;
-            let width = dtype.dense_bytes(1).ok_or_else(|| {
-                Error::Loader(format!("{name}: quant dtype {dtype:?} in safetensors"))
-            })?;
             let expect = numel.checked_mul(width).ok_or_else(|| {
                 Error::Loader(format!("{name}: tensor byte size overflows usize"))
             })?;
             if nbytes != expect {
                 return Err(Error::Loader(format!(
-                    "{name}: byte range is {nbytes} bytes but {numel} x {dtype:?} needs {expect}"
+                    "{name}: byte range is {nbytes} bytes but {numel} x {dtype_str} needs {expect}"
                 )));
             }
             let offset = (data_start as u64)
@@ -168,15 +209,24 @@ impl Safetensors {
                     "{name}: bytes {offset}..{abs_end} exceed file length {file_len}"
                 )));
             }
-            tensors.push(TensorInfo {
-                name: name.clone(),
-                shape,
-                dtype,
-                offset,
-                nbytes,
-            });
+            ranges.push((offset, nbytes));
+            if let Some(dtype) = dtype {
+                tensors.push(TensorInfo {
+                    name: name.clone(),
+                    shape,
+                    dtype,
+                    offset,
+                    nbytes,
+                });
+            } else {
+                i64_buffers.push(I64Buffer {
+                    name: name.clone(),
+                    shape,
+                    offset,
+                    nbytes,
+                });
+            }
         }
-        let mut ranges: Vec<_> = tensors.iter().map(|t| (t.offset, t.nbytes)).collect();
         ranges.sort_unstable();
         let mut cursor = data_start as u64;
         for (offset, size) in ranges {
@@ -196,6 +246,7 @@ impl Safetensors {
             mmap,
             metadata,
             tensors,
+            i64_buffers,
         })
     }
 }
@@ -352,6 +403,36 @@ mod tests {
         );
         assert!(st.chat_template().is_none());
         assert!(st.tensor_bytes("missing").is_err());
+    }
+
+    #[test]
+    fn i64_buffers_are_explicit_host_only_and_range_checked() {
+        let header = serde_json::json!({
+            "w": {"dtype":"BF16", "shape":[1], "data_offsets":[0,2]},
+            "ids": {"dtype":"I64", "shape":[2], "data_offsets":[2,18]},
+        });
+        let mut bytes = vec![0u8; 2];
+        bytes.extend_from_slice(&(-1i64).to_le_bytes());
+        bytes.extend_from_slice(&i64::MAX.to_le_bytes());
+        let f = file_for_header(header.clone(), &bytes);
+        assert!(Safetensors::open(f.path()).is_err());
+        let st = Safetensors::open_with_i64_buffers(f.path()).unwrap();
+        assert_eq!(st.tensors().len(), 1);
+        assert_eq!(st.i64_buffers()[0].shape, [2]);
+        assert_eq!(st.i64_buffer_bytes("ids").unwrap(), &bytes[2..]);
+        assert!(st.tensor_bytes("ids").is_err());
+        for (begin, end, total) in [
+            (0, 16, 18),
+            (3, 19, 19),
+            (2, 17, 17),
+            (2, 18, 17),
+            (2, 18, 19),
+        ] {
+            let mut h = header.clone();
+            h["ids"]["data_offsets"] = serde_json::json!([begin, end]);
+            let f = file_for_header(h, &vec![0; total]);
+            assert!(Safetensors::open_with_i64_buffers(f.path()).is_err());
+        }
     }
 
     #[test]

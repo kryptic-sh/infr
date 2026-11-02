@@ -50,7 +50,7 @@ pub struct Cfg {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Cfg {
-    pub fn from_gguf(g: &Gguf) -> Result<Self> {
+    pub fn from_gguf(g: &dyn WeightSource) -> Result<Self> {
         let arch = g.metadata().str("general.architecture").unwrap_or("");
         if arch != crate::arch::QWEN35 {
             bail!("not a qwen35 model (arch={arch:?})");

@@ -18,7 +18,6 @@ use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
 use infr_core::graph::{Activation, AttnMask, Graph, HyperGates, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
 
 /// Combined gate+up FFN upload decision (one GEMV/GEMM + GatedActFused instead of two Linears +
 /// GatedAct). Requires the backend to opt in (`Capabilities::combined_gu` — Vulkan; the CPU keeps
@@ -30,7 +29,7 @@ use infr_gguf::Gguf;
 /// `c.moe.is_none()`: a pure MoE arch has no `ffn_gate.weight` at all, so the `.all()` is false
 /// for it regardless; see the original comment block at the call site for the DiffusionGemma
 /// rationale.
-pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool {
+pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &dyn WeightSource, c: &Config) -> bool {
     combined_gu
         && (0..c.n_layer).all(|l| {
             let dt = |s: &str| {
@@ -49,7 +48,7 @@ pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool 
 /// for A/B. Shared with the seam's dense-streaming plan — see [`fuse_gu_decision`].
 pub(crate) fn fuse_qkv_decision(
     combined_gu: bool,
-    g: &Gguf,
+    g: &dyn WeightSource,
     c: &Config,
     ec: &EngineConfig,
 ) -> bool {
@@ -158,7 +157,7 @@ fn bind_layer_io<'a>(
 /// is stashed in `SeamKv` and reused via `Arc` on warm calls / forks) instead of every request.
 fn session_stable(
     be: &dyn Backend,
-    g: &Gguf,
+    g: &dyn WeightSource,
     c: &Config,
     ec: &EngineConfig,
 ) -> AResult<SessionStable> {
@@ -460,7 +459,7 @@ fn zero_unrewindable_state(
 pub(crate) fn generate_dense_backend(
     be: &dyn Backend,
     bind_weight: &BindWeight,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -511,7 +510,7 @@ pub(crate) fn generate_dense_backend_bound(
     prebound: Option<&BoundWeights>,
     be: &dyn Backend,
     bind_weight: &BindWeight,
-    g: &Gguf,
+    g: &dyn WeightSource,
     cfg: &Config,
     // The ENGINE configuration this whole forward reads its knobs from — `kv.*`, `spec.*`,
     // `sampling.*`, `device.ubatch*`, `kernels.{qkv_fuse,gated_rmsnorm}` and the `prof.*`
@@ -884,9 +883,9 @@ pub(crate) fn generate_dense_backend_bound(
                             return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
                         }
                         numel += i.shape.iter().product::<usize>();
-                        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                        let tb = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
                         let f32v =
-                            crate::dequant_block(DType::I2S, &tb).map_err(|e| anyhow!("{e}"))?;
+                            crate::dequant_block(DType::I2S, tb).map_err(|e| anyhow!("{e}"))?;
                         let f16: Vec<u8> = f32v
                             .iter()
                             .flat_map(|&x| infr_gguf::dequant::f32_to_f16_sat(x).to_le_bytes())
@@ -919,21 +918,20 @@ pub(crate) fn generate_dense_backend_bound(
                             && (name.ends_with("attn_k_b.weight")
                                 || name.ends_with("attn_v_b.weight"))
                     {
-                        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                        let tb = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
                         let numel = i.shape.iter().product();
-                        let f32v =
-                            crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
+                        let f32v = crate::dequant_block(i.dtype, tb).map_err(|e| anyhow!("{e}"))?;
                         let bytes: Vec<u8> = f32v.iter().flat_map(|&x| x.to_le_bytes()).collect();
                         (WBytes::Owned(bytes), DType::F32, numel)
                     } else {
-                        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                        let tb = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
                         let numel = i.shape.iter().product();
                         match qk_perm_heads(name) {
                             Some(heads) => {
                                 let rb = row_bytes(name, i.dtype);
-                                (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
+                                (WBytes::Owned(permute_rows(tb, heads, rb)), i.dtype, numel)
                             }
-                            None => (WBytes::Mmap(tb), i.dtype, numel),
+                            None => (WBytes::Owned(tb.to_vec()), i.dtype, numel),
                         }
                     }
                 } else {
@@ -955,24 +953,47 @@ pub(crate) fn generate_dense_backend_bound(
                             return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
                         }
                         numel += i.shape.iter().product::<usize>();
-                        parts.push(g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
                         permuted |= qk_perm_heads(name).is_some();
                     }
-                    if !permuted {
-                        (WBytes::Concat(parts), dt, numel)
-                    } else {
-                        let mut cat = Vec::new();
-                        for (name, tb) in names.iter().zip(&parts) {
-                            match qk_perm_heads(name) {
-                                Some(heads) => cat.extend_from_slice(&permute_rows(
-                                    tb,
-                                    heads,
-                                    row_bytes(name, dt),
-                                )),
-                                None => cat.extend_from_slice(tb),
+                    match g.as_any().downcast_ref::<infr_gguf::Gguf>() {
+                        // Only a GGUF source can hand over zero-copy mmap views; a non-mmap source
+                        // (EXL3) joins its group into one owned buffer instead.
+                        None => {
+                            let mut cat = Vec::new();
+                            for name in names {
+                                let tb = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+                                match qk_perm_heads(name) {
+                                    Some(heads) => cat.extend_from_slice(&permute_rows(
+                                        tb,
+                                        heads,
+                                        row_bytes(name, dt),
+                                    )),
+                                    None => cat.extend_from_slice(tb),
+                                }
+                            }
+                            (WBytes::Owned(cat), dt, numel)
+                        }
+                        Some(gg) => {
+                            for name in names {
+                                parts.push(gg.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
+                            }
+                            if !permuted {
+                                (WBytes::Concat(parts), dt, numel)
+                            } else {
+                                let mut cat = Vec::new();
+                                for (name, tb) in names.iter().zip(&parts) {
+                                    match qk_perm_heads(name) {
+                                        Some(heads) => cat.extend_from_slice(&permute_rows(
+                                            tb,
+                                            heads,
+                                            row_bytes(name, dt),
+                                        )),
+                                        None => cat.extend_from_slice(tb),
+                                    }
+                                }
+                                (WBytes::Owned(cat), dt, numel)
                             }
                         }
-                        (WBytes::Owned(cat), dt, numel)
                     }
                 };
                 // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
@@ -6721,10 +6742,11 @@ fn seed_step_uniform(ring: &mut [f32; 64], pos: usize, u: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        resident_after_gen, seed_step_uniform, validate_token_ids, Config, EngineConfig, Gguf,
-        SeamKv,
+        resident_after_gen, seed_step_uniform, validate_token_ids, Config, EngineConfig, SeamKv,
     };
     use crate::seam::TokenEmbd;
+    use infr_core::WeightSource;
+    use infr_gguf::Gguf;
     use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 
     thread_local! {
@@ -7012,7 +7034,7 @@ mod tests {
 
     /// The last prompt token's logits for `prompt`, run on `state` (`None` = a fresh slot).
     fn q35_logits(
-        g: &Gguf,
+        g: &dyn WeightSource,
         cfg: &Config,
         embd: &std::sync::OnceLock<Vec<f32>>,
         prompt: &[u32],
@@ -7964,7 +7986,7 @@ mod tests {
     /// `sampling` — the serve path's request scope, through the real decode loop and its
     /// device-sampling gates (the CPU backend runs `Op::Argmax` and `Op::Sample` as a GPU does).
     fn llama_tokens(
-        g: &Gguf,
+        g: &dyn WeightSource,
         cfg: &Config,
         prompt: &[u32],
         sampling: crate::sampling::RequestSampling,
@@ -8148,7 +8170,7 @@ mod tests {
     fn fresh_logits(
         be: &dyn infr_core::backend::Backend,
         bind: &super::BindWeight<'_>,
-        g: &Gguf,
+        g: &dyn WeightSource,
         cfg: &Config,
         ec: &EngineConfig,
         prompt: &[u32],
@@ -8250,7 +8272,7 @@ mod tests {
     /// runner's replay mirror bypassed (`REPLAY_MIRROR_BYPASS`). Returns the last prompt token's
     /// logits, how many record-once recordings the backend made, and how many tokens it decoded.
     fn vulkan_logits_past_the_mirror(
-        g: &Gguf,
+        g: &dyn WeightSource,
         cfg: &Config,
         prompt: &[u32],
     ) -> Option<(Vec<f32>, u64, usize)> {

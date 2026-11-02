@@ -7,7 +7,6 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
 use tokenizers::decoders::byte_fallback::ByteFallback;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
 use tokenizers::decoders::fuse::Fuse;
@@ -146,7 +145,7 @@ impl SpecialStrip {
 /// user-defined tokens (token_type 3/4, e.g. `<|im_start|>`) registered as special so they encode
 /// atomically. SentencePiece (`model == "llama"`) isn't built here — pass a `tokenizer.json`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
+pub(crate) fn build_tokenizer(g: &dyn WeightSource) -> Result<Tokenizer> {
     tokenizer_from_metadata(g.metadata())
 }
 
@@ -156,7 +155,10 @@ const SIDECAR_CHECK_SAMPLES: usize = 64;
 /// The model's tokenizer: the `tokenizer.json` at `sidecar` when the caller found one beside the
 /// GGUF, else the one embedded in the GGUF. Every consumer of one model — generation, the chat
 /// renderer, the tool-call grammar — loads through here, so they cannot disagree on the vocabulary.
-pub(crate) fn load_tokenizer(g: &Gguf, sidecar: Option<&std::path::Path>) -> Result<Tokenizer> {
+pub(crate) fn load_tokenizer(
+    g: &dyn WeightSource,
+    sidecar: Option<&std::path::Path>,
+) -> Result<Tokenizer> {
     let Some(path) = sidecar else {
         return build_tokenizer(g);
     };
@@ -529,6 +531,7 @@ fn build_spm_tokenizer(md: &Metadata) -> Result<Tokenizer> {
 mod tokenizer_tests {
     use super::*;
     use crate::sampling::{sample_logits, Sampler};
+    use infr_gguf::Gguf;
 
     /// The chunk boundaries a DeepSeek pre-tokenizer sequence yields, as slices of the ORIGINAL
     /// text. [`build_multi_split_seq`] ends the sequence with `ByteLevel`, which rewrites each

@@ -265,7 +265,7 @@ impl ParallelSeam {
         crate::with_profiling_suppressed(|| {
             crate::seam::generate_dense_vulkan_session(
                 &self.vk,
-                self.model.gguf(),
+                self.model.weights(),
                 self.model.config(),
                 self.model.engine_cfg(),
                 self.model.embd(),
@@ -493,7 +493,7 @@ impl ParallelSeam {
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         let (_ids, mut stats) = crate::seam::generate_dense_vulkan_session(
             &self.vk,
-            self.model.gguf(),
+            self.model.weights(),
             self.model.config(),
             self.model.engine_cfg(),
             self.model.embd(),

@@ -1038,6 +1038,10 @@ impl WeightSource for Gguf {
     fn chat_template(&self) -> Option<&str> {
         self.metadata.str("tokenizer.chat_template")
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────

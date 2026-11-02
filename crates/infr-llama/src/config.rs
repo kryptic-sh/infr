@@ -3,7 +3,6 @@ use crate::{meta_f64, meta_u64, MoeConfig};
 use anyhow::{bail, Context, Result};
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
 
 /// llama4's attention chunk: the `n_swa` its rope layers attend within and the
 /// `n_attn_temp_floor_scale` of its NoPE temperature — both hardcoded in
@@ -722,7 +721,7 @@ impl Config {
     /// upload. The single source of truth for both the GPU loader (`Llama::load_opt`) and the
     /// CPU-only loader (`SeamModel::load`). `eos_ids` holds only the GGUF `eos` here; chat-end
     /// markers (`<|im_end|>` …) are appended once a tokenizer exists (see `add_chat_eos`).
-    pub fn from_gguf(g: &Gguf) -> Result<Config> {
+    pub fn from_gguf(g: &dyn WeightSource) -> Result<Config> {
         let arch = g
             .metadata()
             .str("general.architecture")
@@ -1944,7 +1943,7 @@ impl Config {
 /// LFM3's per-layer `attention.head_count_kv` (`key`): `0` marks a short-convolution layer, and
 /// every attention layer must carry the same positive count, which is returned as the model's
 /// `n_kv` beside the per-layer short-convolution flags.
-fn lfm3_layer_kinds(g: &Gguf, key: &str, n_layer: usize) -> Result<(usize, Vec<bool>)> {
+fn lfm3_layer_kinds(g: &dyn WeightSource, key: &str, n_layer: usize) -> Result<(usize, Vec<bool>)> {
     let counts: Vec<u64> = g
         .metadata()
         .get(key)
@@ -1969,7 +1968,7 @@ fn lfm3_layer_kinds(g: &Gguf, key: &str, n_layer: usize) -> Result<(usize, Vec<b
 /// Whether an LFM3 file carries sandwich norms. `lfm3.cpp` loads `attn_post_norm` and
 /// `ffn_post_norm` as optional, but refuses a layer with only one of them; infr also refuses a
 /// file whose layers disagree, since the norms are loaded under one flag.
-fn lfm3_sandwich_norm(g: &Gguf, n_layer: usize) -> Result<bool> {
+fn lfm3_sandwich_norm(g: &dyn WeightSource, n_layer: usize) -> Result<bool> {
     let has = |l: usize, s: &str| {
         let name = format!("blk.{l}.{s}");
         g.tensors().iter().any(|t| t.name == name)
@@ -2003,7 +2002,7 @@ fn lfm3_sandwich_norm(g: &Gguf, n_layer: usize) -> Result<bool> {
 /// accepted only if the key says exactly what the rule would; any other layout is refused by
 /// name.
 fn check_recurrent_layers(
-    g: &Gguf,
+    g: &dyn WeightSource,
     key: &str,
     n_layer_all: usize,
     n_layer: usize,
@@ -2028,7 +2027,7 @@ fn check_recurrent_layers(
                 .map(|x| flag(x).with_context(|| format!("{key}: not a bool array")))
                 .collect::<Result<_>>()?
         }
-        v => vec![flag(v).with_context(|| format!("{key}: not a bool"))?; n_layer_all],
+        v => vec![flag(&v).with_context(|| format!("{key}: not a bool"))?; n_layer_all],
     };
     let periodic = |i: usize| {
         i < n_layer && full_attn_interval > 0 && !(i + 1).is_multiple_of(full_attn_interval)
@@ -2251,7 +2250,7 @@ fn applied_weight_scales(arch: &str) -> Vec<&'static str> {
 ///
 /// `.input_scale` (an activation-quantization scale) is never refused: llama.cpp loads it but no
 /// graph reads it.
-fn refuse_unapplied_weight_scales(g: &Gguf, arch: &str, dual_moe: bool) -> Result<()> {
+fn refuse_unapplied_weight_scales(g: &dyn WeightSource, arch: &str, dual_moe: bool) -> Result<()> {
     let reference = applied_weight_scales(arch);
     let projection = |name: &str| -> Option<String> {
         let stem = name.strip_suffix(".scale")?;
@@ -2305,7 +2304,7 @@ const QKV_BIAS_ARCHS: [&str; 10] = [
 /// infr's single `MoeConfig::n_ff_exp` takes a scalar or an array whose entries all agree, and
 /// refuses an array whose entries differ: what such a file means is unclear (the reference's
 /// reading of it disagrees with its own metadata), so infr does not pick an entry for it.
-fn ernie4_5_moe_expert_ff(g: &Gguf, key: &str, n_layer: usize) -> Result<usize> {
+fn ernie4_5_moe_expert_ff(g: &dyn WeightSource, key: &str, n_layer: usize) -> Result<usize> {
     let value = g
         .metadata()
         .get(key)
@@ -2344,7 +2343,7 @@ fn ernie4_5_moe_expert_ff(g: &Gguf, key: &str, n_layer: usize) -> Result<usize> 
 /// `refuse_unapplied_weight_scales`. The reference treats `ffn_gate_exps` as optional (an
 /// ungated expert FFN); infr has no ungated expert path, so it is required here. The missing
 /// tensor, or the unexpected one, is named in the error.
-fn ernie4_5_moe_tensors(g: &Gguf, cfg: &Config) -> Result<()> {
+fn ernie4_5_moe_tensors(g: &dyn WeightSource, cfg: &Config) -> Result<()> {
     let present: std::collections::HashSet<&str> =
         g.tensors().iter().map(|t| t.name.as_str()).collect();
     let mut required: Vec<String> = vec!["token_embd.weight".into(), "output_norm.weight".into()];
@@ -2424,7 +2423,7 @@ fn ernie4_5_moe_tensors(g: &Gguf, cfg: &Config) -> Result<()> {
 /// build through `build_qkv`, but infr's gated-Q attention takes no bias, so a file carrying one
 /// is refused. The other archs' builders never load these tensors, so they are left unread as the
 /// reference leaves them.
-fn qkv_projection_biases(g: &Gguf, arch: &str, n_layer: usize) -> Result<bool> {
+fn qkv_projection_biases(g: &dyn WeightSource, arch: &str, n_layer: usize) -> Result<bool> {
     const BIASES: [&str; 3] = ["attn_q.bias", "attn_k.bias", "attn_v.bias"];
     let names: std::collections::HashSet<&str> =
         g.tensors().iter().map(|t| t.name.as_str()).collect();
@@ -2489,7 +2488,7 @@ mod tests {
     /// Write a fixture to a uniquely-named temp file, parse it, and clean up.
     fn config_from_fixture(name: &str, model: &SyntheticModel) -> Result<Config> {
         let tmp = TempGguf::write(name, model);
-        let gguf = Gguf::open(tmp.path()).expect("open GGUF fixture");
+        let gguf = infr_gguf::Gguf::open(tmp.path()).expect("open GGUF fixture");
         Config::from_gguf(&gguf)
     }
 
@@ -2519,7 +2518,7 @@ mod tests {
     #[test]
     fn gemma4_array_kv_heads_must_be_positive() {
         let tmp = TempGguf::write("gemma4-zero-kv-heads", &gemma4_zero_kv_heads_fixture());
-        let gguf = Gguf::open(tmp.path()).expect("open GGUF fixture");
+        let gguf = infr_gguf::Gguf::open(tmp.path()).expect("open GGUF fixture");
         drop(tmp);
 
         let Err(err) = Config::from_gguf(&gguf) else {

@@ -585,7 +585,7 @@ impl AssistantWeights {
     }
 }
 
-/// Counters from one [`generate_spec`] run.
+/// Counters from one `generate_spec` run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpecStats {
     pub cycles: usize,
@@ -793,7 +793,7 @@ impl Gemma4Mtp {
     }
 }
 
-/// [`generate_spec`] on `vk` for a rendered chat `prompt`, streaming decoded text to `on_piece`.
+/// `generate_spec` on `vk` for a rendered chat `prompt`, streaming decoded text to `on_piece`.
 pub fn generate_vulkan(
     vk: &infr_vulkan::VulkanBackend,
     model: &crate::SeamModel,

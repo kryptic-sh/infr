@@ -1,4 +1,4 @@
-//! Qwen2 EXL3 checkpoint names with native trellis or folded reference projections.
+//! EXL3 checkpoint names with native trellis or folded reference projections.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -6,7 +6,13 @@ use std::sync::OnceLock;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use infr_core::loader::{MetaValue, Metadata, TensorInfo};
-use infr_core::{DType, Error, Exl3Codebook, WeightSource};
+use infr_core::{DType, Error, Exl3Codebook, Exl3Layout, Exl3Spec, WeightSource};
+
+#[path = "exl3_source_dense.rs"]
+mod dense;
+#[path = "exl3_source_qwen35.rs"]
+mod qwen35;
+use dense::{DenseOp, DenseOptions};
 use infr_cpu::exl3::{decode_tile, hadamard128, tile_perm, Codebook};
 
 struct LinearSpec {
@@ -15,13 +21,31 @@ struct LinearSpec {
     n: usize,
     bits: u32,
     codebook: Exl3Codebook,
+    input_layout: Exl3Layout,
+    output_layout: Exl3Layout,
     cache: OnceLock<std::result::Result<Vec<u8>, String>>,
+}
+
+impl LinearSpec {
+    fn projection(&self) -> Exl3Spec {
+        Exl3Spec {
+            in_f: self.k as u32,
+            out_f: self.n as u32,
+            bits: self.bits,
+            codebook: self.codebook,
+            input_layout: self.input_layout,
+            output_layout: self.output_layout,
+        }
+    }
 }
 
 struct DenseSpec {
     hf_name: String,
-    widen: bool,
-    cache: OnceLock<Vec<u8>>,
+    dtype: DType,
+    convert: bool,
+    op: DenseOp,
+    layout: Exl3Layout,
+    cache: OnceLock<std::result::Result<Vec<u8>, String>>,
 }
 
 pub(crate) struct Exl3Source {
@@ -57,16 +81,19 @@ impl Exl3Source {
         )
         .context("exl3: parse config.json")?;
         ensure!(
-            cfg["model_type"] == "qwen2",
-            "exl3: only model_type=qwen2 is supported"
-        );
-        ensure!(
             cfg["quantization_config"]["quant_method"] == "exl3",
             "exl3: quant_method must be exl3"
         );
         ensure!(
             cfg["tie_word_embeddings"] == false,
             "exl3: tied embeddings are unsupported"
+        );
+        if cfg["model_type"] == "qwen3_5" {
+            return Self::open_qwen35(st, &cfg, dir);
+        }
+        ensure!(
+            cfg["model_type"] == "qwen2",
+            "exl3: only qwen2 and qwen3_5 are supported"
         );
         ensure!(
             cfg["hidden_act"].as_str().unwrap_or("silu") == "silu",
@@ -165,23 +192,7 @@ impl Exl3Source {
                 .kv
                 .insert("tokenizer.ggml.bos_token_id".into(), MetaValue::U64(bos));
         }
-        let tokenizer_cfg = dir.join("tokenizer_config.json");
-        let chat_template = if tokenizer_cfg.exists() {
-            let tc: serde_json::Value = serde_json::from_slice(&std::fs::read(&tokenizer_cfg)?)
-                .context("exl3: parse tokenizer_config.json")?;
-            tc["chat_template"].as_str().map(str::to_owned)
-        } else {
-            None
-        };
-        let mut source = Self {
-            st,
-            metadata,
-            infos: Vec::new(),
-            linears: HashMap::new(),
-            passthrough: HashMap::new(),
-            chat_template,
-            native: false,
-        };
+        let mut source = Self::with_metadata(st, metadata, dir)?;
         source.add_dense(
             "token_embd.weight",
             "model.embed_tokens.weight",
@@ -240,6 +251,34 @@ impl Exl3Source {
         Ok(source)
     }
 
+    fn with_metadata(
+        st: infr_safetensors::Safetensors,
+        metadata: Metadata,
+        dir: &Path,
+    ) -> Result<Self> {
+        let tokenizer_cfg = dir.join("tokenizer_config.json");
+        let mut chat_template = if tokenizer_cfg.exists() {
+            let tc: serde_json::Value = serde_json::from_slice(&std::fs::read(&tokenizer_cfg)?)
+                .context("exl3: parse tokenizer_config.json")?;
+            tc["chat_template"].as_str().map(str::to_owned)
+        } else {
+            None
+        };
+        let file = dir.join("chat_template.jinja");
+        if chat_template.is_none() && file.exists() {
+            chat_template = Some(std::fs::read_to_string(file)?);
+        }
+        Ok(Self {
+            st,
+            metadata,
+            infos: Vec::new(),
+            linears: HashMap::new(),
+            passthrough: HashMap::new(),
+            chat_template,
+            native: false,
+        })
+    }
+
     pub(crate) fn open_native(path: &Path) -> Result<Self> {
         let mut source = Self::open(path)?;
         let mut scales = Vec::new();
@@ -247,13 +286,7 @@ impl Exl3Source {
             let Some(linear) = source.linears.get(&info.name) else {
                 continue;
             };
-            let spec = infr_core::Exl3Spec {
-                in_f: u32::try_from(linear.k)?,
-                out_f: u32::try_from(linear.n)?,
-                bits: linear.bits,
-                codebook: linear.codebook,
-                output_layout: infr_core::Exl3OutputLayout::Identity,
-            };
+            let spec = linear.projection();
             info.nbytes = spec.trellis_bytes()?;
             info.dtype = DType::I16;
             info.shape = vec![linear.k / 16, linear.n / 16, 16 * linear.bits as usize];
@@ -280,6 +313,9 @@ impl Exl3Source {
             }
         }
         source.infos.extend(scales);
+        for dense in source.passthrough.values().filter(|dense| dense.convert) {
+            source.dense_bytes(dense)?;
+        }
         source.native = true;
         Ok(source)
     }
@@ -288,13 +324,7 @@ impl Exl3Source {
         if !self.native {
             return None;
         }
-        self.linears.get(name).map(|linear| infr_core::Exl3Spec {
-            in_f: linear.k as u32,
-            out_f: linear.n as u32,
-            bits: linear.bits,
-            codebook: linear.codebook,
-            output_layout: infr_core::Exl3OutputLayout::Identity,
-        })
+        self.linears.get(name).map(LinearSpec::projection)
     }
 
     pub(crate) fn is_native(&self) -> bool {
@@ -302,35 +332,31 @@ impl Exl3Source {
     }
 
     fn add_dense(&mut self, name: &str, hf: &str, shape: &[usize]) -> Result<()> {
-        let info = find_hf(&self.st, hf)?;
-        let hf_shape: Vec<_> = shape.iter().rev().copied().collect();
-        ensure!(
-            info.dtype == DType::F16 && info.shape == hf_shape,
-            "exl3: {hf} must be F16 {hf_shape:?}, got {:?} {:?}",
-            info.dtype,
-            info.shape
-        );
-        let widen = shape.len() == 1;
-        let nbytes = dense_size(shape, if widen { 4 } else { 2 })?;
-        self.infos.push(TensorInfo {
-            name: name.into(),
-            shape: shape.into(),
-            dtype: if widen { DType::F32 } else { DType::F16 },
-            offset: 0,
-            nbytes,
-        });
-        self.passthrough.insert(
-            name.into(),
-            DenseSpec {
-                hf_name: hf.into(),
-                widen,
-                cache: OnceLock::new(),
-            },
-        );
-        Ok(())
+        self.add_dense_with(name, hf, shape, None, DenseOptions::default())
     }
 
     fn add_linear(&mut self, name: &str, prefix: &str, k: usize, n: usize) -> Result<()> {
+        self.add_linear_with(
+            name,
+            prefix,
+            k,
+            n,
+            Exl3Layout::Identity,
+            Exl3Layout::Identity,
+        )
+    }
+
+    fn add_linear_with(
+        &mut self,
+        name: &str,
+        prefix: &str,
+        k: usize,
+        n: usize,
+        input_layout: Exl3Layout,
+        output_layout: Exl3Layout,
+    ) -> Result<()> {
+        input_layout.validate(u32::try_from(k)?)?;
+        output_layout.validate(u32::try_from(n)?)?;
         ensure!(
             k.is_multiple_of(128) && n.is_multiple_of(128),
             "exl3: {prefix} dimensions ({k},{n}) must be 128-divisible"
@@ -399,6 +425,8 @@ impl Exl3Source {
                 n,
                 bits,
                 codebook,
+                input_layout,
+                output_layout,
                 cache: OnceLock::new(),
             },
         );
@@ -435,10 +463,7 @@ impl Exl3Source {
             &trellis,
             &scales("suh")?,
             &scales("svh")?,
-            spec.k,
-            spec.n,
-            spec.bits,
-            spec.codebook,
+            spec.projection(),
         )
     }
 
@@ -455,19 +480,14 @@ impl Exl3Source {
     }
 }
 
-fn fold_trellis(
-    trellis: &[u16],
-    suh: &[f32],
-    svh: &[f32],
-    k: usize,
-    n: usize,
-    bits: u32,
-    codebook: Exl3Codebook,
-) -> Result<Vec<u8>> {
+fn fold_trellis(trellis: &[u16], suh: &[f32], svh: &[f32], spec: Exl3Spec) -> Result<Vec<u8>> {
     use rayon::prelude::*;
-    ensure!(
-        (1..=8).contains(&bits) && k > 0 && n > 0 && k.is_multiple_of(128) && n.is_multiple_of(128),
-        "exl3: invalid fold geometry or rate"
+    spec.trellis_bytes()?;
+    let (k, n, bits, codebook) = (
+        spec.in_f as usize,
+        spec.out_f as usize,
+        spec.bits,
+        spec.codebook,
     );
     let w = 16 * bits as usize;
     ensure!(
@@ -535,6 +555,31 @@ fn fold_trellis(
             }
             Ok(())
         })?;
+    let swaps = |layout: Exl3Layout, width: usize| {
+        let mut map: Vec<_> = (0..width).map(|i| layout.index(i)).collect();
+        let mut swaps = Vec::new();
+        for i in 0..width {
+            while map[i] != i {
+                let j = map[i];
+                map.swap(i, j);
+                swaps.push((i, j));
+            }
+        }
+        swaps
+    };
+    for (i, j) in swaps(spec.output_layout, n) {
+        let (left, right) = out.split_at_mut(j * k * 2);
+        left[i * k * 2..(i + 1) * k * 2].swap_with_slice(&mut right[..k * 2]);
+    }
+    let col_swaps = swaps(spec.input_layout, k);
+    if !col_swaps.is_empty() {
+        out.par_chunks_mut(k * 2).for_each(|row| {
+            let elements = row.as_chunks_mut::<2>().0;
+            for &(i, j) in &col_swaps {
+                elements.swap(i, j);
+            }
+        });
+    }
     Ok(out)
 }
 
@@ -573,18 +618,8 @@ impl WeightSource for Exl3Source {
             .passthrough
             .get(name)
             .ok_or_else(|| Error::Loader(format!("tensor not found: '{name}'")))?;
-        let bytes = self.st.tensor_bytes(&spec.hf_name)?;
-        if !spec.widen {
-            return Ok(bytes);
-        }
-        Ok(spec.cache.get_or_init(|| {
-            bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .flat_map(|p| half::f16::from_le_bytes(*p).to_f32().to_le_bytes())
-                .collect()
-        }))
+        self.dense_bytes(spec)
+            .map_err(|e| Error::Loader(e.to_string()))
     }
     fn chat_template(&self) -> Option<&str> {
         self.chat_template.as_deref()

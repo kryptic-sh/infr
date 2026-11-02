@@ -84,6 +84,7 @@ fn exl3_projection_reads_weights_after_recorded_transfers() {
         out_f: 128,
         bits: 4,
         codebook: Exl3Codebook::Cb0,
+        input_layout: Exl3OutputLayout::Identity,
         output_layout: Exl3OutputLayout::Identity,
     };
     let packed: Vec<u8> = (0..spec.trellis_bytes().unwrap())
@@ -146,15 +147,37 @@ fn exl3_linear_matches_cpu_all_rates_decode_and_prefill() {
         .into_iter()
         .flat_map(|codebook| (1..=8).map(move |bits| (codebook, bits)))
     {
-        for (k, n, layout) in [
-            (256, 384, Exl3OutputLayout::Identity),
+        for (k, n, input_layout, layout) in [
+            (
+                256,
+                384,
+                Exl3OutputLayout::Identity,
+                Exl3OutputLayout::Identity,
+            ),
             (
                 384,
                 256,
+                Exl3OutputLayout::Identity,
                 Exl3OutputLayout::RopeInterleaved {
                     heads: 4,
                     head_dim: 64,
                     rotary_dim: 48,
+                },
+            ),
+            (
+                384,
+                512,
+                Exl3OutputLayout::GroupedValueHeads {
+                    prefix: 0,
+                    key_heads: 3,
+                    value_heads: 6,
+                    head_dim: 64,
+                },
+                Exl3OutputLayout::GroupedValueHeads {
+                    prefix: 128,
+                    key_heads: 3,
+                    value_heads: 6,
+                    head_dim: 64,
                 },
             ),
         ] {
@@ -163,6 +186,7 @@ fn exl3_linear_matches_cpu_all_rates_decode_and_prefill() {
                 out_f: n,
                 bits,
                 codebook,
+                input_layout,
                 output_layout: layout,
             };
             for m in [1, 2, 7, 8, 9, 17] {
@@ -197,6 +221,7 @@ fn exl3_linear_matches_cpu_at_qwen25_7b_shapes() {
             out_f: n,
             bits,
             codebook,
+            input_layout: Exl3OutputLayout::Identity,
             output_layout: Exl3OutputLayout::Identity,
         };
         for m in [1, 5] {

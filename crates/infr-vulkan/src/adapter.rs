@@ -6471,6 +6471,7 @@ mod tests {
                 out_f: 128,
                 bits: 4,
                 codebook: infr_core::Exl3Codebook::Cb0,
+                input_layout: infr_core::Exl3OutputLayout::Identity,
                 output_layout: infr_core::Exl3OutputLayout::Identity,
             },
         };

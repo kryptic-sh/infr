@@ -1,7 +1,8 @@
 # EXL3 checkpoints
 
-Infr loads a local Qwen2 EXL3 `model.safetensors` with adjacent `config.json` and
-`tokenizer.json`; `tokenizer_config.json`, if present, supplies the chat template.
+Infr loads local Qwen2 and text-only Qwen3.5 EXL3 `model.safetensors` checkpoints
+with adjacent `config.json` and `tokenizer.json`. The chat template comes from
+`tokenizer_config.json` or an adjacent `chat_template.jinja`.
 Hugging Face auto-resolution still targets GGUF, so download the EXL3 branch first
 and pass the local weight path.
 
@@ -13,11 +14,20 @@ RUST_LOG=info cargo run -p infr-llama --release --example exl3_smoke -- /path/to
 Test checkpoint: `turboderp/Qwen2.5-7B-Instruct-exl3`, branch `4.0bpw`
 (default codebook; 4-bit projections, 6-bit LM head).
 
-Supported: Qwen2 architecture, untied embeddings, integer rates 1–8, the default
-`3inst` codebook (cb0) and `mcg` with multiplier `0xCBAC1FED`.
-Rejected with an explicit error: `.mul1` or custom MCG multipliers, fractional rates,
-RoPE scaling, sliding-window attention, sharded checkpoints, and tied embeddings. Every released turboderp Qwen2.5-7B branch inspected (2/3/4 bpw)
+Supported: Qwen2 and the Qwen3.5 hybrid text architecture, untied embeddings,
+integer rates 1–8, the default `3inst` codebook (cb0) and `mcg` with multiplier
+`0xCBAC1FED`. Every released turboderp Qwen2.5-7B branch inspected (2/3/4 bpw)
 is cb0; rate and codebook are independent.
+
+Qwen3.5 loading translates the HF tensor names and configuration into the existing
+`qwen35` runtime; it does not add another DeltaNet or attention implementation.
+The adapter handles zero-centered norms, `A_log` decay conversion, BF16 convolution
+parameters, and grouped-to-tiled value-head ordering. Vision and MTP tensors are
+not exposed by the text-only source.
+
+Rejected with an explicit error: `.mul1` or custom MCG multipliers, fractional rates,
+custom RoPE scaling, sliding-window attention, sharded EXL3 checkpoints, and tied
+embeddings.
 
 ## Execution
 
@@ -26,15 +36,18 @@ weights — the raw I16 trellis, F16 `suh`, F16 `svh` — and the seam rewrites 
 matching `Op::Linear` into `Op::LinearExl3` after graph construction. Per row:
 
 ```text
-xh = H128(x ⊙ suh)            input scale + orthonormal 128-point Hadamard
-z  = xh · D                   D decoded tile by tile from the trellis; never stored
-y  = scatter(H128(z) ⊙ svh)   output Hadamard + scale, then the Q/K rotary reorder
+xh = H128(gather(x) ⊙ suh)   input ordering + scale + orthonormal Hadamard
+z  = xh · D                  D decoded tile by tile from the trellis; never stored
+y  = scatter(H128(z) ⊙ svh)  output Hadamard + scale, then output ordering
 ```
 
-Q/K projections carry `Exl3OutputLayout::RopeInterleaved`, which reorders outputs
+Qwen2 Q/K projections carry `Exl3Layout::RopeInterleaved`, which reorders outputs
 from HF rotate-half order to the interleaved order the existing `Op::Rope` expects;
-biases are permuted by the existing binder. Norm and bias vectors are widened to F32
-at load; embeddings stay F16 mmap views.
+biases are permuted by the existing binder. Qwen3.5 DeltaNet projections use
+`Exl3Layout::GroupedValueHeads`: input gather precedes the original scale/Hadamard,
+and output scatter follows the original Hadamard/scale. Compressed factors are not
+permuted. Full-attention Q/gate interleaving remains unchanged.
+Norm and bias vectors are widened to F32 at load; embeddings stay F16 mmap views.
 
 | backend | status |
 |---|---|
@@ -74,10 +87,12 @@ cargo test --release -p infr-vulkan --test exl3_linear_parity -- --ignored   # n
   exllamav3 source; the tile permutation is checked as a bijection.
 - The CPU native projection matches a dense decode + Hadamard + scale reference at
   every integer rate, with partial-rotary output scatter and tail batches.
-- Full synthetic Qwen2 logits from the native path match the folded reference, and
-  batched logits match fresh causal-prefix forwards.
+- Full synthetic Qwen2 and Qwen3.5 logits from the native path match the folded
+  reference, and batched logits match fresh causal-prefix forwards. Unequal
+  key/value-head counts check the non-involutive value-head permutations.
 - The Vulkan projection matches the CPU kernel within `1e-4 × max|y|` for rates 1–8,
-  identity and rotary layouts, m ∈ {1, 2, 7, 8, 9, 17}, and Qwen-sized projections.
+  identity, rotary, and grouped input/output layouts, m ∈ {1, 2, 7, 8, 9, 17},
+  and Qwen-sized projections.
   Both `3inst` and `mcg` are verified on an RX 580 (RADV Polaris), including
   4096×8192 and 4096×4096 at 2bpw. `3inst` is also verified on the Ryzen 7800X3D
   integrated GPU (RADV) and an RTX 4070 (NVIDIA 615.71.09).
@@ -87,6 +102,9 @@ cargo test --release -p infr-vulkan --test exl3_linear_parity -- --ignored   # n
   `The capital of France is Paris.` Both prefill and token decoding execute on Vulkan.
   The same checkpoint also loads and generates on an 8 GB RX 580, with the VRAM
   guard enabled and the portable FP32 kernels.
+
+The Qwen3.5-9B EXL3 `2.00bpw` checkpoint is the next full-model generation test;
+its end-to-end Vulkan generation has not yet been verified.
 
 Perplexity scores the second half of each context window, excluding its final
 position: two 512-token windows score 510 targets. Windows keep their first corpus

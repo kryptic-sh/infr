@@ -10,6 +10,10 @@ pub enum DType {
     Bf16,
     I32,
     U32,
+    /// Dense signed 16-bit integers (1 elem, 2 bytes, no scale). NOT a quant format — the only
+    /// producer is EXL3 checkpoints, whose `trellis` tensors are `I16` word arrays the trellis
+    /// decoder reads (see `infr_cpu::exl3`); no backend dequants or uploads it as weights.
+    I16,
     // legacy round quants
     Q4_0,
     Q4_1,
@@ -129,7 +133,7 @@ impl DType {
     pub fn dense_bytes(self, n: usize) -> Option<usize> {
         let sz = match self {
             DType::F32 | DType::I32 | DType::U32 => 4,
-            DType::F16 | DType::Bf16 => 2,
+            DType::F16 | DType::Bf16 | DType::I16 => 2,
             _ => return None,
         };
         Some(n * sz)

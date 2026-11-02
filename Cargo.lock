@@ -1350,6 +1350,21 @@ name = "infr-prof-rt"
 version = "0.2.0"
 
 [[package]]
+name = "infr-safetensors"
+version = "0.2.0"
+dependencies = [
+ "infr-core",
+ "infr-prof",
+ "infr-prof-rt",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
 name = "infr-server"
 version = "0.2.0"
 dependencies = [

@@ -263,8 +263,7 @@ fn message_to_json(m: &ChatMessage) -> Value {
     Value::Object(obj)
 }
 
-/// Core renderer over a GGUF: pull the template + bos/eos out of the metadata, then delegate to
-/// [`render_template`]. Shared by every entry point so template handling lives in ONE place.
+/// Render the weight source's template with BOS/EOS from its metadata.
 #[allow(clippy::too_many_arguments)]
 fn render_core(
     ws: &dyn WeightSource,
@@ -276,10 +275,7 @@ fn render_core(
     think: Option<bool>,
     cfg: &Config,
 ) -> Result<String, TemplateError> {
-    let template = ws
-        .metadata()
-        .str("tokenizer.chat_template")
-        .ok_or(TemplateError::NoTemplate)?;
+    let template = ws.chat_template().ok_or(TemplateError::NoTemplate)?;
     // BOS: use the metadata id if present, else fall back to the tokenizer's own BOS token — never
     // a hardcoded id (the old `2` default is EOS for Llama-family GGUFs, so a missing-metadata
     // model would inject the EOS string at the prompt head).
@@ -381,6 +377,53 @@ mod template_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
             serde_json::json!({"role": "assistant", "content": "yo"}),
         ]
+    }
+
+    struct TemplateSource {
+        metadata: infr_core::loader::Metadata,
+        template: Option<&'static str>,
+    }
+
+    impl WeightSource for TemplateSource {
+        fn metadata(&self) -> &infr_core::loader::Metadata {
+            &self.metadata
+        }
+        fn tensors(&self) -> &[infr_core::loader::TensorInfo] {
+            &[]
+        }
+        fn tensor_bytes(&self, _: &str) -> infr_core::Result<&[u8]> {
+            Err(infr_core::Error::backend("template fixture has no tensors"))
+        }
+        fn chat_template(&self) -> Option<&str> {
+            self.template
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn renders_weight_source_template_without_gguf_metadata() {
+        let mut source = TemplateSource {
+            metadata: Default::default(),
+            template: Some("{{ messages[0].content }}"),
+        };
+        let tokenizer = Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+        let render = |source: &TemplateSource| {
+            render_core(
+                source,
+                &tokenizer,
+                0,
+                msgs(),
+                Value::Null,
+                true,
+                None,
+                &Config::default(),
+            )
+        };
+        assert_eq!(render(&source).unwrap(), "hi");
+        source.template = None;
+        assert!(matches!(render(&source), Err(TemplateError::NoTemplate)));
     }
 
     #[test]

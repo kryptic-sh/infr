@@ -4966,6 +4966,11 @@ fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
     Ok(())
 }
 
+fn single_token_forward(ops: &[Op]) -> bool {
+    ops.iter()
+        .all(|op| !matches!(op, Op::Linear { m, .. } | Op::LinearExl3 { m, .. } if *m > 1))
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
     let plan = plan
@@ -5348,10 +5353,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // default) bounds the dispatches per command buffer; segments are submitted WITHOUT waiting
     // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
     // only the watchdog's view changes, from one long job to several short ones.
-    let single_token = graph
-        .ops
-        .iter()
-        .all(|op| !matches!(op, Op::Linear { m, .. } if *m > 1));
+    let single_token = single_token_forward(&graph.ops);
     let cap = if single_token {
         be_.decode_submit_cap()
     } else {
@@ -6453,6 +6455,39 @@ mod tests {
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
     use infr_core::DType;
+
+    #[test]
+    fn native_exl3_prefill_uses_prefill_submit_cap() {
+        let id = TensorId(0);
+        let native = |m| Op::LinearExl3 {
+            x: id,
+            trellis: id,
+            suh: id,
+            svh: id,
+            dst: id,
+            m,
+            spec: infr_core::Exl3Spec {
+                in_f: 128,
+                out_f: 128,
+                bits: 4,
+                codebook: infr_core::Exl3Codebook::Cb0,
+                output_layout: infr_core::Exl3OutputLayout::Identity,
+            },
+        };
+        let dense = |m| Op::Linear {
+            x: id,
+            weight: id,
+            dst: id,
+            m,
+            in_f: 128,
+            out_f: 128,
+            w_off: 0,
+        };
+        assert!(single_token_forward(&[native(1), dense(1)]));
+        assert!(!single_token_forward(&[native(36), native(1)]));
+        assert!(!single_token_forward(&[native(36)]));
+        assert!(!single_token_forward(&[dense(36), native(1)]));
+    }
 
     /// Read a `#define <name> <integer>` back out of GLSL source. Panics when the define is gone —
     /// a shader that no longer states its bound is exactly the drift this guards.

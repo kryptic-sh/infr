@@ -45,8 +45,7 @@ at load; embeddings stay F16 mmap views.
 The Vulkan kernels are portable correctness-first implementations: no subgroup-size
 assumption, no cooperative matrix, no integer dot product. The codebook's half-precision
 sum is rounded to nearest-even with integer arithmetic because `packHalf2x16` rounding is
-implementation-defined (AMD rounds toward zero, which perturbed decoded weights by one
-half-precision ULP).
+implementation-defined.
 
 `Exl3Source::open` keeps the earlier folded-F16 reference path for tests: it expands
 each linear to row-major F16 (about 14 GB for the 7B linears). Production loading no
@@ -76,7 +75,11 @@ cargo test --release -p infr-vulkan --test exl3_linear_parity -- --ignored   # n
 - The Vulkan projection matches the CPU kernel within `1e-4 × max|y|` for rates 1–8,
   identity and rotary layouts, m ∈ {1, 2, 7, 8, 9, 17}, and the Qwen2.5-7B projection
   shapes (3584×512, 3584×18944, 18944×3584, 3584×3584). Verified on an RX 580
-  (RADV Polaris).
+  (RADV Polaris), the Ryzen 7800X3D integrated GPU (RADV), and an RTX 4070 (NVIDIA 615.71.09).
+- Full Qwen2.5-7B EXL3 4.0bpw chat generation runs on the RTX 4070 through Vulkan:
+  `infr run /path/to/model.safetensors "What is the capital of France?" --dev Vulkan0
+  --ctx 256 --ubatch 64 --temp 0 --max-new 16` produces
+  `The capital of France is Paris.` Both prefill and token decoding execute on Vulkan.
 
 Perplexity scores the second half of each context window, excluding its final
 position: two 512-token windows score 510 targets. Windows keep their first corpus

@@ -953,12 +953,20 @@ const RING_SLOT_BYTES: usize = 32 * 1024 * 1024;
 /// widest today is a 16-byte vec4 load) with headroom to spare for future wider kernels.
 const BDA_WEIGHT_ALIGN: u64 = 256;
 
-/// Minimum size for a resident-BDA arena block (see [`VulkanBackend::bda_weight_alloc`]). Blocks
-/// are opened ON DEMAND — one per call that outgrows the current block's remainder — so without a
-/// floor a run of small tensors would each pay for a separate dedicated `vkAllocateMemory`. Reuses
-/// [`ARENA_OVERFLOW_BLOCK`]'s size: the same "big enough to amortize, small enough not to waste"
-/// reasoning applies unchanged.
+/// Arena block size for batching small resident weights.
 const BDA_BLOCK_MIN: u64 = ARENA_OVERFLOW_BLOCK;
+
+fn bda_weight_block_size(want: u64, max_alloc: u64) -> u64 {
+    let size = if want >= BDA_BLOCK_MIN / 2 {
+        want
+    } else {
+        BDA_BLOCK_MIN
+    };
+    size.min(max_alloc)
+}
+
+#[cfg(test)]
+mod bda_weight_plan_tests;
 
 /// Upper bound on ONE resident-BDA addressing unit's byte size (see [`BdaWeightArena`]'s addressing
 /// invariant). The 64-bit promotion protects the arena/expert BASE, but a tensor's (or a per-expert
@@ -3263,11 +3271,7 @@ impl VulkanBackend {
         let mut guard = self.bda_weight_arena.lock().unwrap();
         let arena = guard.get_or_insert_with(BdaWeightArena::default);
 
-        // First-fit over ALL open blocks, not just the last: a big tensor opens an exact-size
-        // (fully consumed) block, so last-block-only would strand every earlier block's tail and
-        // open a fresh `BDA_BLOCK_MIN` block for EACH tiny tensor that follows a big one — ~64 MiB
-        // stranded per norm gamma, GiBs across a model's layers (caught live: Qwen3-30B-A3B
-        // tripped the VRAM guard flag-on while fitting comfortably flag-off).
+        // Reuse older tails after exact-sized blocks.
         for b in arena.blocks.iter_mut() {
             let off = b.cursor.div_ceil(BDA_WEIGHT_ALIGN) * BDA_WEIGHT_ALIGN;
             if off + want <= b.size {
@@ -3288,12 +3292,7 @@ impl VulkanBackend {
             }
         }
 
-        // The current block (if any) has no room: open a fresh dedicated block sized to the
-        // request, floored at `BDA_BLOCK_MIN` and capped at `max_mem_alloc_size` — a whole
-        // multi-GiB model can't be one `vkAllocateMemory`, same reasoning as `WeightArena`'s block
-        // cap. A single tensor bigger than the cap can't be placed at all; report it rather than
-        // silently truncating.
-        let block_bytes = want.max(BDA_BLOCK_MIN).min(self.shared.max_mem_alloc_size);
+        let block_bytes = bda_weight_block_size(want, self.shared.max_mem_alloc_size);
         if want > block_bytes {
             return Err(be(format!(
                 "resident-BDA weight tensor ({want} bytes) exceeds max_mem_alloc_size ({} bytes) \

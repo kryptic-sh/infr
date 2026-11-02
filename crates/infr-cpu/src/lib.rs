@@ -14,6 +14,7 @@ pub mod paged;
 mod pool;
 pub mod turbo;
 
+pub mod exl3;
 mod kernels;
 mod moe;
 mod quant;

@@ -1899,12 +1899,7 @@ impl<'a> Recorder<'a> {
         self.linear_f16_noext_at(arena_addr, x, y, rows, in_f, out_f);
     }
 
-    /// f32-weight GEMV `y = x·Wᵀ` — full-precision projection weights (gemma4 E2B's per-layer
-    /// inp_gate/proj and qwen3moe's router ship as F32; reading them through the f16 kernel
-    /// produced garbage). Dispatches the `linear_f32r` family (see
-    /// [`Self::linear_f32_at`]'s mrow/vec4 tile pick) — these weights are small, so the
-    /// simple kernels are fine. (The old eager thread-per-output `linear_f32.comp` is deleted;
-    /// see build.rs's note where its entry used to live.)
+    /// Apply a compressed EXL3 projection with input/output Hadamard transforms.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_exl3(
         &self,
@@ -1972,6 +1967,7 @@ impl<'a> Recorder<'a> {
             0,
             0,
         ]);
+        self.sync(&[Self::vk_of(suh).buffer], &[], false);
         self.dispatch_wide(
             kin,
             &[Self::vkb(x), Self::vkb(xh)],
@@ -1994,6 +1990,7 @@ impl<'a> Recorder<'a> {
             packed as u32,
             (packed >> 32) as u32,
         ]);
+        self.sync(&[Self::vk_of(trellis).buffer], &[], false);
         self.dispatch_wide(
             dot,
             &[Self::vkb(xh), Self::vkb(z)],
@@ -2022,6 +2019,7 @@ impl<'a> Recorder<'a> {
             rotary_dim,
             0,
         ]);
+        self.sync(&[Self::vk_of(svh).buffer], &[], false);
         self.dispatch_wide(
             kout,
             &[Self::vkb(z), Self::vkb(y)],

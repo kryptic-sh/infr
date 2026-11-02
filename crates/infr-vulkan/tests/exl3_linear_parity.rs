@@ -77,6 +77,69 @@ fn run(be: &VulkanBackend, spec: Exl3Spec, m: usize, seed: usize) {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn exl3_projection_reads_weights_after_recorded_transfers() {
+    let be = VulkanBackend::new().unwrap();
+    let spec = Exl3Spec {
+        in_f: 128,
+        out_f: 128,
+        bits: 4,
+        codebook: Exl3Codebook::Cb0,
+        output_layout: Exl3OutputLayout::Identity,
+    };
+    let packed: Vec<u8> = (0..spec.trellis_bytes().unwrap())
+        .map(|i| (i * 131) as u8)
+        .collect();
+    let suh = vec![0.125f32; 128];
+    let svh = vec![-0.125f32; 128];
+    let scale_bytes = |v: &[f32]| {
+        v.iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
+    let x: Vec<f32> = (0..128).map(|i| (i as f32 * 0.07).sin()).collect();
+    let expected = infr_cpu::exl3_linear::linear(&packed, &suh, &svh, &x, 1, spec).unwrap();
+    let sources = [
+        upload(&be, &packed, BufferUsage::Activations),
+        upload(&be, &scale_bytes(&suh), BufferUsage::Activations),
+        upload(&be, &scale_bytes(&svh), BufferUsage::Activations),
+    ];
+    let weights = [
+        be.alloc(packed.len(), BufferUsage::Weights).unwrap(),
+        be.alloc(256, BufferUsage::Weights).unwrap(),
+        be.alloc(256, BufferUsage::Weights).unwrap(),
+    ];
+    let input = upload(&be, bytemuck::cast_slice(&x), BufferUsage::Activations);
+    let xh = be.alloc(512, BufferUsage::Activations).unwrap();
+    let z = be.alloc(512, BufferUsage::Activations).unwrap();
+    let output = be.alloc(512, BufferUsage::Activations).unwrap();
+    let rec = be.recorder().unwrap();
+    for (src, dst) in sources.iter().zip(&weights) {
+        rec.copy(src.as_ref(), 0, dst.as_ref(), 0, src.len_bytes());
+    }
+    rec.linear_exl3(
+        weights[0].as_ref(),
+        weights[1].as_ref(),
+        weights[2].as_ref(),
+        input.as_ref(),
+        xh.as_ref(),
+        z.as_ref(),
+        output.as_ref(),
+        1,
+        spec,
+    )
+    .unwrap();
+    rec.finish().unwrap();
+    let mut got = vec![0f32; 128];
+    be.download(output.as_ref(), bytemuck::cast_slice_mut(&mut got))
+        .unwrap();
+    let scale = expected.iter().fold(0f32, |a, v| a.max(v.abs()));
+    for (a, b) in got.iter().zip(expected) {
+        assert!((a - b).abs() <= 1e-4 * scale + 1e-6, "GPU {a} vs CPU {b}");
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
 fn exl3_linear_matches_cpu_all_rates_decode_and_prefill() {
     let be = VulkanBackend::new().unwrap();
     for bits in 1..=8 {

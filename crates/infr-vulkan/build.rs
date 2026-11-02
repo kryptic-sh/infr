@@ -773,6 +773,47 @@ fn main() {
             "native_gemv_kq_fma_q6k_res_nr4",
             &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4"],
         ),
+        // `kernels.vulkan.weights_as_ssbo` twins: the weight bound as a storage buffer.
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_ssbo",
+            &["-DFMT_Q4K", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res_ssbo",
+            &["-DFMT_Q4K", "-DUSE_RES", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_ssbo",
+            &["-DFMT_Q6K", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res_ssbo",
+            &["-DFMT_Q6K", "-DUSE_RES", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_nr4_ssbo",
+            &["-DFMT_Q4K", "-DNR=4", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res_nr4_ssbo",
+            &["-DFMT_Q4K", "-DUSE_RES", "-DNR=4", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_nr4_ssbo",
+            &["-DFMT_Q6K", "-DNR=4", "-DWEIGHTS_SSBO"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res_nr4_ssbo",
+            &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4", "-DWEIGHTS_SSBO"],
+        ),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
         (
             "linear_f32r",

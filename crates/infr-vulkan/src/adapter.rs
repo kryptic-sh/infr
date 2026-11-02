@@ -659,7 +659,7 @@ fn kq_fma_gemv_ok(
 ) -> bool {
     let vk = &be_.cfg().kernels.vulkan;
     vk.kq_fma_gemv.unwrap_or(!be_.caps().i8_dot_fast)
-        && crate::gemm::native_gemv_kq_fma_spv(dt, false, 8).is_some()
+        && crate::gemm::native_gemv_kq_fma_spv(dt, false, 8, false).is_some()
         && in_f.is_multiple_of(256)
         && w_off.is_multiple_of(256)
         && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)

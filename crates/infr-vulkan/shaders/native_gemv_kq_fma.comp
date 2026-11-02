@@ -3,6 +3,7 @@
 // int8 dot. One 64-thread workgroup per NR output rows; 8 lanes per 256-element superblock, and
 // each work item applies one superblock's activations to 4 rows.
 // -DFMT_Q4K | -DFMT_Q6K, optional -DUSE_RES (y = residual + x·Wᵀ). Requires in_f % 256 == 0.
+// -DWEIGHTS_SSBO reads the weight from binding 3 instead of its device address.
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -22,8 +23,12 @@ layout(binding = 1) readonly buffer RB { float res[]; };
 #endif
 layout(binding = 2) writeonly buffer YB { float y[]; };
 
+#ifdef WEIGHTS_SSBO
+layout(binding = 3) readonly buffer WB { uint nw[]; };
+#else
 #include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
+#endif
 #include "native_decode.glsl"
 
 shared float red[NR * 64]; // per-subgroup partials when a workgroup spans several subgroups
@@ -142,7 +147,9 @@ vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
 #endif
 
 void main() {
+#ifndef WEIGHTS_SSBO
     w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+#endif
     uint lane = gl_LocalInvocationIndex;
     uint l8 = lane & 7u;
     uint slot = lane >> 3u;

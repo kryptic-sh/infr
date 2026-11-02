@@ -482,20 +482,37 @@ impl SeamModel {
         tokenizer_path: Option<&Path>,
         ecfg: std::sync::Arc<crate::EngineConfig>,
     ) -> Result<Self> {
-        let is_exl3 = gguf_path
+        let is_safetensors = gguf_path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
-        let g: std::boxed::Box<dyn infr_core::WeightSource> = if is_exl3 {
-            std::boxed::Box::new(crate::Exl3Source::open_native(gguf_path)?)
+        let g: std::boxed::Box<dyn infr_core::WeightSource> = if is_safetensors {
+            let config_path = gguf_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("config.json");
+            let config: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&config_path)
+                    .map_err(|e| anyhow!("read adjacent {}: {e}", config_path.display()))?,
+            )
+            .map_err(|e| anyhow!("parse adjacent config.json: {e}"))?;
+            if matches!(
+                config["model_type"].as_str(),
+                Some("qwen4_exp" | "qwen4_exp_text")
+            ) {
+                std::boxed::Box::new(crate::qwen4_exp_source::Qwen4ExpSource::open(gguf_path)?)
+            } else {
+                // Preserve EXL3's model/quantizer checks and native trellis route.
+                std::boxed::Box::new(crate::Exl3Source::open_native(gguf_path)?)
+            }
         } else {
             std::boxed::Box::new(Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?)
         };
-        Self::from_source(g, is_exl3, gguf_path, tokenizer_path, ecfg)
+        Self::from_source(g, is_safetensors, gguf_path, tokenizer_path, ecfg)
     }
 
     pub(crate) fn from_source(
         g: std::boxed::Box<dyn infr_core::WeightSource>,
-        is_exl3: bool,
+        is_safetensors: bool,
         gguf_path: &Path,
         tokenizer_path: Option<&Path>,
         ecfg: std::sync::Arc<crate::EngineConfig>,
@@ -503,13 +520,13 @@ impl SeamModel {
         let mut cfg = Config::from_gguf(&*g)?;
         let tokenizer = match tokenizer_path {
             Some(p) => crate::tokenizer::load_tokenizer(&*g, Some(p))?,
-            None if is_exl3 => Tokenizer::from_file(
+            None if is_safetensors => Tokenizer::from_file(
                 gguf_path
                     .parent()
                     .unwrap_or(std::path::Path::new("."))
                     .join("tokenizer.json"),
             )
-            .map_err(|e| anyhow!("load adjacent EXL3 tokenizer.json: {e}"))?,
+            .map_err(|e| anyhow!("load adjacent tokenizer.json: {e}"))?,
             None => crate::tokenizer::load_tokenizer(&*g, None)?,
         };
         add_chat_eos(&mut cfg, &tokenizer, infr_core::WeightSource::metadata(&*g));
@@ -601,7 +618,7 @@ impl SeamModel {
         f(slot.resident.as_ref(), slot.opened)
     }
 
-    /// The GGUF file this model was loaded from.
+    /// The GGUF or HF safetensors file this model was loaded from.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -651,6 +668,7 @@ impl SeamModel {
         max_ctx: usize,
     ) -> Result<DenseVulkanSession> {
         let max_ctx = self.session_ctx(max_ctx);
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = open_backend(dev, self.ecfg.clone())?;
         // The auto-q8 rung may pin this session's KV format, so it runs under THIS session's
         // placement scope, as in `vulkan_session_default_on`.
@@ -685,6 +703,7 @@ impl SeamModel {
     /// VRAM budget clamps its own default context — a session on the weak iGPU gets a window sized
     /// to the iGPU's memory, independent of the discrete card's.
     pub fn vulkan_session_default_on(&self, dev: Option<usize>) -> Result<DenseVulkanSession> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = open_backend(dev, self.ecfg.clone())?;
         // The clamp's auto-q8 rung may pin this session's KV format — do it under THIS session's
         // placement scope so the decision lands on its own pins, not a process-global cell.
@@ -719,6 +738,7 @@ impl SeamModel {
         dev: Option<usize>,
         frac: f64,
     ) -> Result<DenseVulkanSession> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = open_backend(dev, self.ecfg.clone())?;
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
@@ -1261,6 +1281,7 @@ impl SeamModel {
         cpu: bool,
         mut on_chunk: impl FnMut(usize, usize, f64),
     ) -> Result<PplReport> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         use rayon::prelude::*;
         if n_ctx < 4 {
             return Err(anyhow!("perplexity: context must be at least 4 tokens"));
@@ -1363,6 +1384,7 @@ impl SeamModel {
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s Vulkan twin, for the CPU/Vulkan
     /// cross-backend parity check.
     pub fn prefill_logits_vulkan(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         crate::seam::verify_dense_vulkan(
@@ -1415,6 +1437,7 @@ impl SeamModel {
         &self,
         max_ctx: usize,
     ) -> Result<DiffusionGemmaVulkanSession> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         Ok(DiffusionGemmaVulkanSession {
@@ -1434,6 +1457,7 @@ impl SeamModel {
         &self,
         max_ctx: usize,
     ) -> Result<DiffusionGemmaMetalSession> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("metal init: {e}"))?;
         Ok(DiffusionGemmaMetalSession {
@@ -1472,6 +1496,7 @@ impl SeamModel {
     /// compiled + executed by `VulkanBackend`; greedy tokens are detokenized. Same graph, two
     /// backends — this is the end-to-end dense CPU↔GPU parity path.
     pub fn generate_dense_vulkan(&self, prompt: &str, max_new: usize) -> Result<String> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
@@ -1505,6 +1530,7 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan(
@@ -1531,6 +1557,7 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
     ) -> Result<String> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_pipeline(
             devices,
@@ -1557,6 +1584,7 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_pipeline(
             devices,
             &*self.weights,
@@ -1582,6 +1610,7 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
     ) -> Result<String> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_tp(
             devices,
@@ -1608,6 +1637,7 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_tp(
             devices,
             &*self.weights,
@@ -1633,6 +1663,7 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
     ) -> Result<String> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_moe_vulkan_ep(
             devices,
@@ -1659,6 +1690,7 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let (generated, _stats) = crate::seam::generate_moe_vulkan_ep(
             devices,
             &*self.weights,
@@ -1687,6 +1719,7 @@ impl SeamModel {
         pg: Option<(usize, usize)>,
         reps: usize,
     ) -> Result<(Vec<f64>, BenchPlacement)> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
@@ -1819,6 +1852,7 @@ impl SeamModel {
     /// later calls prefill only the un-cached suffix.
     #[cfg(target_os = "macos")]
     pub fn metal_session(&self, max_ctx: usize) -> Result<DenseMetalSession> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("metal init: {e}"))?;
         Ok(DenseMetalSession {
@@ -1895,6 +1929,7 @@ impl SeamModel {
         req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("metal init: {e}"))?;
@@ -1937,6 +1972,8 @@ impl SeamModel {
         k: usize,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
+        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
+        crate::qwen4_exp::ensure_forward_supported(&draft.cfg)?;
         let sampler = crate::sampling::Sampler::from_cfg(&self.ecfg.sampling);
         if sampler.temp > 0.0 {
             return Err(anyhow!(

@@ -1787,7 +1787,7 @@ impl<'a> Recorder<'a> {
         } else {
             ("exl3_prefill", crate::exl3::prefill())
         };
-        let dot = self.be.kernel(name, spv, 2, 24);
+        let dot = self.be.kernel(name, spv, 2, 28);
         let pdot = push(&[
             rows,
             spec.in_f,
@@ -1795,6 +1795,7 @@ impl<'a> Recorder<'a> {
             spec.bits,
             packed as u32,
             (packed >> 32) as u32,
+            spec.codebook as u32,
         ]);
         self.sync(&[Self::vk_of(trellis).buffer], &[], false);
         self.dispatch_wide(

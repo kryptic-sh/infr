@@ -64,19 +64,23 @@ use half::f16;
 /// Trellis codebook, matching exllamav3's `codebook` names (`tests/testlib/exl3.py`:
 /// `CODEBOOKS = ("3inst", "mcg", "mul1")`) and the `cb` template parameter of
 /// `decode_3inst<cb>` in `codebook.cuh`.
-///
-/// Bitrate association (issue #6, Phase 0 plan): cb2 ≈ 4 bpw, cb1 ≈ 3 bpw,
-/// cb0 ≈ 2 bpw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codebook {
     /// `3inst` — hash + add path (`x *= 89226354; x += 64248484`).
     Cb0,
     /// `mcg` — multiplicative congruential generator path (`x *= 0xCBAC1FED`).
-    /// This is the **3 bpw** codebook the Phase 0 gate is decided on.
     Cb1,
     /// `mul1` — byte-sum path (`x *= 0x83DCD12D`, dp4a over the four bytes).
-    /// This is the **4 bpw** codebook.
     Cb2,
+}
+
+impl From<infr_core::Exl3Codebook> for Codebook {
+    fn from(value: infr_core::Exl3Codebook) -> Self {
+        match value {
+            infr_core::Exl3Codebook::Cb0 => Self::Cb0,
+            infr_core::Exl3Codebook::Mcg => Self::Cb1,
+        }
+    }
 }
 
 /// `exl3_lop3_6a` from `ptx_portable.cuh` (the ROCm C fallback for the

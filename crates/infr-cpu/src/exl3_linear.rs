@@ -44,6 +44,7 @@ pub fn linear(
         .ok_or_else(|| Error::backend("exl3: scratch size overflow"))?;
     let mut bands = vec![0.0_f32; scratch_len];
     let perm = tile_perm(spec.bits);
+    let codebook = Codebook::from(spec.codebook);
     let tile_bytes = 32 * spec.bits as usize;
     let word_count = 8 * spec.bits as usize;
     bands
@@ -69,7 +70,7 @@ pub fn linear(
                             s * spec.bits as usize + spec.bits as usize + 256 * spec.bits as usize
                                 - 16;
                         tile[perm[s] as usize] =
-                            decode_3inst(Codebook::Cb0, window16_funnel(&words[..word_count], b0));
+                            decode_3inst(codebook, window16_funnel(&words[..word_count], b0));
                     }
                     for r in 0..rows {
                         let xr = &xh[(row0 + r) * k + ki * 16..];
@@ -109,12 +110,15 @@ mod tests {
 
     #[test]
     fn streamed_projection_matches_dense_reference_all_rates_and_tail_batches() {
-        for bits in 1..=8 {
+        for (codebook, bits) in [Exl3Codebook::Cb0, Exl3Codebook::Mcg]
+            .into_iter()
+            .flat_map(|codebook| (1..=8).map(move |bits| (codebook, bits)))
+        {
             let spec = Exl3Spec {
                 in_f: 256,
                 out_f: 384,
                 bits,
-                codebook: Exl3Codebook::Cb0,
+                codebook,
                 output_layout: Exl3OutputLayout::RopeInterleaved {
                     heads: 6,
                     head_dim: 64,
@@ -132,7 +136,7 @@ mod tests {
                 .iter()
                 .map(|b| u16::from_le_bytes(*b))
                 .collect();
-            let mut d = decode_matrix(Codebook::Cb0, bits, &words, 256, 384);
+            let mut d = decode_matrix(Codebook::from(codebook), bits, &words, 256, 384);
             for row in d.as_chunks_mut::<384>().0 {
                 for block in row.as_chunks_mut::<128>().0 {
                     hadamard128(block);
@@ -160,7 +164,7 @@ mod tests {
                         let actual = got[r * 384 + spec.output_index(j)];
                         assert!(
                             (actual - expected).abs() < 3e-5,
-                            "bits={bits} m={m} r={r} j={j}: {actual} != {expected}"
+                            "codebook={codebook:?} bits={bits} m={m} r={r} j={j}: {actual} != {expected}"
                         );
                     }
                 }

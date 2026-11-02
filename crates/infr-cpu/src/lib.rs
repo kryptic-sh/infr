@@ -24,6 +24,7 @@ pub mod turbo;
 
 mod dequant_row;
 pub mod exl3;
+pub mod exl3_embedding;
 pub mod exl3_linear;
 mod kernels;
 mod moe;

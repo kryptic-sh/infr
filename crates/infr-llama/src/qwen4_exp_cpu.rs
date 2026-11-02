@@ -523,6 +523,7 @@ pub(crate) fn generate(
                 sampler,
                 &mut rng,
                 max_new - out.len(),
+                None, // penalties
             )?;
             if step.is_empty() {
                 break;
@@ -569,6 +570,7 @@ pub(crate) fn generate(
             prompt_secs,
             n_gen,
             decode_secs: decode.elapsed().as_secs_f64(),
+            ..Default::default()
         },
     ))
 }

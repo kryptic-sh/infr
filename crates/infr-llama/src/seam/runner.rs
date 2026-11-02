@@ -639,7 +639,8 @@ pub(crate) fn generate_dense_backend_bound(
     // reuse the already-uploaded lm_head buffer (same tensor); untied models upload token_embd
     // once more (extra VRAM = its on-disk size). INFR_NO_GPU_EMBED forces the host path (A/B).
     let untied_lm = g.tensors().iter().any(|t| t.name == "output.weight");
-    let gpu_embed = caps.embed_gather
+    let gpu_embed = g.tensor_rows("token_embd.weight", &[])?.is_none()
+        && caps.embed_gather
         && c.n_embd.is_multiple_of(32)
         && g.tensors()
             .iter()
@@ -5167,12 +5168,9 @@ pub(crate) fn generate_dense_backend_bound(
         // the gpu_sc path this is ALL of `hidden_host` — the SC add + weightless norm run IN-GRAPH
         // instead (see `build`'s SC subgraph); on CPU it's completed below exactly as Phase A.
         let embed_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
-        let mut hidden_host: Vec<f32> = Vec::with_capacity(cc * ne);
-        let token_embd = token_embd.get()?; // host embed gather → materialize the table
-        for &tok in canvas {
-            let base = tok as usize * ne;
-            hidden_host.extend(token_embd[base..base + ne].iter().map(|&x| x * embed_scale));
-        }
+        let mut hidden_host = token_embd.rows(canvas, ne, embed_scale)?.into_owned();
+        // The self-conditioning path still reads the whole table (one-time f16 conversion).
+        let token_embd = token_embd.get()?;
         // Per-step host-premultiplied previous canvas logits for the Metal `gpu_sc` path — `Some`
         // only when `plan_sc && !dyn_sc` (populated below); declared here so it outlives the
         // upload further down. Vulkan's `dyn_sc` path never populates this — see `use_ping`'s doc.
@@ -5533,12 +5531,7 @@ pub(crate) fn generate_dense_backend_bound(
         }
         let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
-        let mut vf_hidden: Vec<f32> = Vec::with_capacity(m * ne);
-        let token_embd = token_embd.get()?; // host embed gather → materialize the table
-        for &tok in &prompt[start..] {
-            let base = tok as usize * ne;
-            vf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * vf_scale));
-        }
+        let vf_hidden = token_embd.rows(&prompt[start..], ne, vf_scale)?;
         let vf_positions: Vec<i32> = (start as i32..(start + m) as i32).collect();
         let vf_hidden_buf = be
             .alloc(m * ne * 4, BufferUsage::Staging)
@@ -5987,14 +5980,8 @@ pub(crate) fn generate_dense_backend_bound(
                         let input = if gpu_embed {
                             upload_ids()?
                         } else {
-                            let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
-                            let token_embd = token_embd.get()?; // host embed gather → materialize
-                            for &tok in &prompt[cstart..cend] {
-                                let base = tok as usize * ne;
-                                pf_hidden.extend(
-                                    token_embd[base..base + ne].iter().map(|&x| x * embed_scale),
-                                );
-                            }
+                            let pf_hidden =
+                                token_embd.rows(&prompt[cstart..cend], ne, embed_scale)?;
                             let b = be
                                 .alloc(pf_m * ne * 4, BufferUsage::Staging)
                                 .map_err(|e| anyhow!("{e}"))?;
@@ -6488,18 +6475,11 @@ pub(crate) fn generate_dense_backend_bound(
                 .map_err(|e| anyhow!("{e}"))?;
         }
         if !gpu_embed {
-            // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
-            // table slice is already the row to upload — hand it straight to the backend rather
-            // than allocating a throwaway `Vec<f32>` per token to copy it.
-            let row = &token_embd.get()?[tok * ne..tok * ne + ne];
-            if embed_scale == 1.0 {
-                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
-                    .map_err(|e| anyhow!("{e}"))?;
-            } else {
-                let emb: Vec<f32> = row.iter().map(|&x| x * embed_scale).collect();
-                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
-                    .map_err(|e| anyhow!("{e}"))?;
-            }
+            // Host embed (gemma scales by √n_embd; qwen3/llama identity). A row-only source folds
+            // just this token's row; a table-backed one borrows the slice, no per-token copy.
+            let row = token_embd.rows(&[tok as u32], ne, embed_scale)?;
+            be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&row))
+                .map_err(|e| anyhow!("{e}"))?;
         }
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;

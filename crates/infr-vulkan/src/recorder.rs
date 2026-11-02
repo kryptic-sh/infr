@@ -243,6 +243,12 @@ fn native_id_sg_choice(
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
+/// Workgroups for `rope.comp`: one thread per (token, head, pair); the shader grid-strides past
+/// the 65535-group cap.
+fn rope_groups(t: usize, n_heads: usize, hd: usize) -> u32 {
+    (t * n_heads * hd.div_ceil(2)).div_ceil(64).clamp(1, 65535) as u32
+}
+
 /// Converts an element-space per-expert stride to the per-expert BYTE stride the STREAMED
 /// (resident-BDA arena) id-indexed/expert-grid kernels apply on the 64-bit pointer (`w_addr +=
 /// uint64_t(ex) * uint64_t(pc.m)` / `arena + uint64_t(ids[slot]) * uint64_t(stride)`) — see
@@ -4920,7 +4926,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -4938,7 +4944,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -4976,7 +4982,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(y)],
             1,
             &push,
-            (t * n_heads).div_ceil(64) as u32,
+            rope_groups(t, n_heads, hd),
         );
     }
 
@@ -5011,7 +5017,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
             1,
             &push,
-            (t * n_heads).div_ceil(64) as u32,
+            rope_groups(t, n_heads, hd),
         );
     }
 
@@ -5969,7 +5975,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(y)],
             1,
             &push,
-            (t * n_heads).div_ceil(64) as u32,
+            rope_groups(t, n_heads, hd),
         );
     }
 
@@ -6010,7 +6016,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
             1,
             &push,
-            (t * n_heads).div_ceil(64) as u32,
+            rope_groups(t, n_heads, hd),
         );
     }
 

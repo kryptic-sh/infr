@@ -63,8 +63,14 @@ void main() {
 #if defined(OUT_F16) && defined(KV_BDA)
     k_addr = kv_base(pc.d_lo, pc.d_hi);
 #endif
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx >= pc.t * pc.nheads) { return; }
+    // Grid-stride over (t, head, slot): slots [0, hf) rotate one pair, the rest copy two tail
+    // elements of [rope_dim, hd).
+    uint hf = pc.rope_dim / 2u;
+    uint hd2 = (pc.hd + 1u) / 2u;
+    uint total = pc.t * pc.nheads * hd2;
+    for (uint gi = gl_GlobalInvocationID.x; gi < total; gi += gl_NumWorkGroups.x * 64u) {
+    uint idx = gi / hd2;
+    uint i = gi - idx * hd2;
 #ifdef USE_PARAMS
     uint pos = p_pos + idx / pc.nheads;
     uint out_base = pc.out_base * p_pos; // pc.out_base is the 0/1 multiplier in dyn mode
@@ -74,16 +80,18 @@ void main() {
 #endif
     uint base = idx * pc.hd;
     uint obase = out_base * pc.nheads * pc.hd + base;
-    // Passthrough only the un-rotated tail [rope_dim, hd); the rotated loop below overwrites
-    // [0, rope_dim), so copying it here too just doubled the store traffic (into the KV cache
-    // under KV_BDA). Final bytes are identical (as in qk_norm_rope.comp's partial-RoPE tail).
+    if (i >= hf) {
+        uint e = pc.rope_dim + 2u * (i - hf);
+        for (uint k = e; k < min(e + 2u, pc.hd); k++) {
 #ifdef OUT_F16
-    for (uint i = pc.rope_dim; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
+            KVWH(obase + k, x[base + k]);
 #else
-    for (uint i = pc.rope_dim; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
+            y[obase + k] = x[base + k];
 #endif
-    uint hf = pc.rope_dim / 2u;
-    for (uint i = 0u; i < hf; i++) {
+        }
+        continue;
+    }
+    {
         float freq = pow(pc.theta, -2.0 * float(i) / float(pc.rope_dim));
         float ang = float(pos) * freq;
 #ifdef FREQ_FACTORS
@@ -109,5 +117,6 @@ void main() {
         y[obase + i0] = a * co - b * s;
         y[obase + i1] = a * s + b * co;
 #endif
+    }
     }
 }

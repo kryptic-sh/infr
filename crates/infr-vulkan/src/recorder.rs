@@ -1760,6 +1760,21 @@ impl<'a> Recorder<'a> {
                 .flat_map(|v| v.to_ne_bytes())
                 .collect::<Vec<u8>>()
         };
+        let layout_words = |layout: infr_core::Exl3Layout| match layout {
+            infr_core::Exl3Layout::Identity => [0, 0, 0, 0],
+            infr_core::Exl3Layout::RopeInterleaved {
+                head_dim,
+                rotary_dim,
+                ..
+            } => [1, head_dim, rotary_dim, 0],
+            infr_core::Exl3Layout::GroupedValueHeads {
+                prefix,
+                key_heads,
+                head_dim,
+                ..
+            } => [2, head_dim, key_heads, prefix],
+        };
+        let [layout, head_dim, param, prefix] = layout_words(spec.input_layout);
         let kin = self
             .be
             .kernel("exl3_hadamard_in", crate::exl3::hadamard_in(), 2, 32);
@@ -1768,10 +1783,10 @@ impl<'a> Recorder<'a> {
             spec.in_f,
             in_scale as u32,
             (in_scale >> 32) as u32,
-            0,
-            0,
-            0,
-            0,
+            layout,
+            head_dim,
+            param,
+            prefix,
         ]);
         self.sync(&[Self::vk_of(suh).buffer], &[], false);
         self.dispatch_wide(
@@ -1805,14 +1820,7 @@ impl<'a> Recorder<'a> {
             &pdot,
             rows.div_ceil(batch) * (spec.out_f / 16),
         );
-        let (interleaved, head_dim, rotary_dim) = match spec.output_layout {
-            infr_core::Exl3OutputLayout::Identity => (0, 0, 0),
-            infr_core::Exl3OutputLayout::RopeInterleaved {
-                head_dim,
-                rotary_dim,
-                ..
-            } => (1, head_dim, rotary_dim),
-        };
+        let [layout, head_dim, param, prefix] = layout_words(spec.output_layout);
         let kout = self
             .be
             .kernel("exl3_hadamard_out", crate::exl3::hadamard_out(), 2, 32);
@@ -1821,10 +1829,10 @@ impl<'a> Recorder<'a> {
             spec.out_f,
             out_scale as u32,
             (out_scale >> 32) as u32,
-            interleaved,
+            layout,
             head_dim,
-            rotary_dim,
-            0,
+            param,
+            prefix,
         ]);
         self.sync(&[Self::vk_of(svh).buffer], &[], false);
         self.dispatch_wide(

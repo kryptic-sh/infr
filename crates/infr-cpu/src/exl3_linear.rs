@@ -27,15 +27,17 @@ pub fn linear(
     if suh.iter().chain(svh).any(|v| !v.is_finite()) {
         return Err(Error::backend("exl3: non-finite scale"));
     }
-    let mut xh = x.to_vec();
-    xh.par_chunks_mut(k).for_each(|row| {
-        for (v, scale) in row.iter_mut().zip(suh) {
-            *v *= scale;
-        }
-        for block in row.as_chunks_mut::<128>().0 {
-            hadamard128(block);
-        }
-    });
+    let mut xh = vec![0.0; x.len()];
+    xh.par_chunks_mut(k)
+        .zip(x.par_chunks(k))
+        .for_each(|(row, input)| {
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = input[spec.input_index(j)] * suh[j];
+            }
+            for block in row.as_chunks_mut::<128>().0 {
+                hadamard128(block);
+            }
+        });
     let n_blocks = n / 128;
     let row_groups = m.div_ceil(8);
     let scratch_len = row_groups
@@ -119,6 +121,7 @@ mod tests {
                 out_f: 384,
                 bits,
                 codebook,
+                input_layout: Exl3OutputLayout::Identity,
                 output_layout: Exl3OutputLayout::RopeInterleaved {
                     heads: 6,
                     head_dim: 64,
@@ -173,12 +176,95 @@ mod tests {
     }
 
     #[test]
+    fn grouped_input_and_output_heads_match_independent_dense_reference() {
+        for (codebook, bits) in [Exl3Codebook::Cb0, Exl3Codebook::Mcg]
+            .into_iter()
+            .flat_map(|codebook| (1..=8).map(move |bits| (codebook, bits)))
+        {
+            let spec = Exl3Spec {
+                in_f: 384,
+                out_f: 512,
+                bits,
+                codebook,
+                input_layout: Exl3OutputLayout::GroupedValueHeads {
+                    prefix: 0,
+                    key_heads: 3,
+                    value_heads: 6,
+                    head_dim: 64,
+                },
+                output_layout: Exl3OutputLayout::GroupedValueHeads {
+                    prefix: 128,
+                    key_heads: 3,
+                    value_heads: 6,
+                    head_dim: 64,
+                },
+            };
+            let packed: Vec<u8> = (0..spec.trellis_bytes().unwrap())
+                .map(|i| ((i * 79) ^ (i >> 5)) as u8)
+                .collect();
+            let words: Vec<u16> = packed
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| u16::from_le_bytes(*p))
+                .collect();
+            let suh: Vec<f32> = (0..384).map(|i| ((i % 19) as f32 - 9.0) * 0.017).collect();
+            let svh: Vec<f32> = (0..512).map(|i| ((i % 23) as f32 - 11.0) * 0.009).collect();
+            let mut d = decode_matrix(Codebook::from(codebook), bits, &words, 384, 512);
+            for row in d.as_chunks_mut::<512>().0 {
+                for block in row.as_chunks_mut::<128>().0 {
+                    hadamard128(block);
+                }
+            }
+            for r0 in [0, 128, 256] {
+                for j in 0..512 {
+                    let mut col = [0.0; 128];
+                    for i in 0..128 {
+                        col[i] = d[(r0 + i) * 512 + j];
+                    }
+                    hadamard128(&mut col);
+                    for i in 0..128 {
+                        d[(r0 + i) * 512 + j] = col[i];
+                    }
+                }
+            }
+            apply_scales(&mut d, &suh, &svh, 384, 512);
+            let tiled_heads = [0, 3, 1, 4, 2, 5];
+            for m in [1, 3, 9] {
+                let x: Vec<f32> = (0..m * 384).map(|i| (i as f32 * 0.017).sin()).collect();
+                let got = linear(&packed, &suh, &svh, &x, m, spec).unwrap();
+                for row in 0..m {
+                    for j in 0..512 {
+                        let expected: f32 = (0..384)
+                            .map(|i| {
+                                let logical = tiled_heads[i / 64] * 64 + i % 64;
+                                x[row * 384 + logical] * d[i * 512 + j]
+                            })
+                            .sum();
+                        let logical = if j < 128 {
+                            j
+                        } else {
+                            128 + tiled_heads[(j - 128) / 64] * 64 + (j - 128) % 64
+                        };
+                        let actual = got[row * 512 + logical];
+                        assert!(
+                            (actual - expected).abs() < 3e-5,
+                            "{codebook:?} bits={bits} m={m} j={j}: {actual} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn malformed_buffers_return_errors() {
         let spec = Exl3Spec {
             in_f: 128,
             out_f: 128,
             bits: 4,
             codebook: Exl3Codebook::Cb0,
+            input_layout: Exl3OutputLayout::Identity,
             output_layout: Exl3OutputLayout::Identity,
         };
         assert!(linear(&[], &[1.0; 128], &[1.0; 128], &[1.0; 128], 1, spec).is_err());

@@ -1,6 +1,9 @@
 use super::*;
 use serde_json::{json, Value};
 
+#[path = "exl3_source_qwen35_tests.rs"]
+mod qwen35;
+
 struct Fixture {
     dir: tempfile::TempDir,
     config: Value,
@@ -478,7 +481,20 @@ fn folded_linear_matches_unfused_hadamard_forward_for_every_integer_rate() {
             .zip(&svh)
             .map(|(a, b)| a * b)
             .collect();
-        let folded = fold_trellis(&packed, &suh, &svh, k, n, bits, codebook).unwrap();
+        let folded = fold_trellis(
+            &packed,
+            &suh,
+            &svh,
+            Exl3Spec {
+                in_f: k as u32,
+                out_f: n as u32,
+                bits,
+                codebook,
+                input_layout: Exl3Layout::Identity,
+                output_layout: Exl3Layout::Identity,
+            },
+        )
+        .unwrap();
         for j in 0..n {
             let actual: f32 = (0..k)
                 .map(|i| {

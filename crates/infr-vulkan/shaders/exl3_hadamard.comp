@@ -7,9 +7,23 @@ layout(binding = 0) readonly buffer XB { float x[]; };
 layout(binding = 1) writeonly buffer YB { float y[]; };
 layout(push_constant) uniform PC {
     uint rows; uint dim; uint scale_lo; uint scale_hi;
-    uint interleaved; uint head_dim; uint rotary_dim; uint pad;
+    uint layout_kind; uint head_dim; uint param; uint prefix;
 } pc;
 shared float h[128];
+
+uint mapped_index(uint col) {
+    if (pc.layout_kind == 0u) { return col; }
+    if (pc.layout_kind == 1u) {
+        uint j = col % pc.head_dim;
+        uint half_rotary = pc.param / 2u;
+        uint mapped = j < half_rotary ? 2u * j : (j < pc.param ? 2u * (j - half_rotary) + 1u : j);
+        return col - j + mapped;
+    }
+    if (col < pc.prefix) { return col; }
+    uint per_key = ((pc.dim - pc.prefix) / pc.head_dim) / pc.param;
+    uint head = (col - pc.prefix) / pc.head_dim;
+    return pc.prefix + (pc.param * (head % per_key) + head / per_key) * pc.head_dim + (col - pc.prefix) % pc.head_dim;
+}
 
 void main() {
     uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
@@ -20,9 +34,10 @@ void main() {
     uint64_t addr = (uint64_t(pc.scale_hi) << 32) | uint64_t(pc.scale_lo);
     vec2 pair = unpackHalf2x16(Scales(addr).v[col >> 1]);
     float scale = (col & 1u) == 0u ? pair.x : pair.y;
+#ifdef OUTPUT_TRANSFORM
     float v = x[row * pc.dim + col];
-#ifndef OUTPUT_TRANSFORM
-    v *= scale;
+#else
+    float v = x[row * pc.dim + mapped_index(col)] * scale;
 #endif
     h[t] = v;
     barrier();
@@ -36,12 +51,7 @@ void main() {
     v = h[t] * 0.088388347648;
 #ifdef OUTPUT_TRANSFORM
     v *= scale;
-    if (pc.interleaved != 0u) {
-        uint j = col % pc.head_dim;
-        uint half_rotary = pc.rotary_dim / 2u;
-        uint mapped = j < half_rotary ? 2u * j : (j < pc.rotary_dim ? 2u * (j - half_rotary) + 1u : j);
-        col = col - j + mapped;
-    }
+    col = mapped_index(col);
 #endif
     y[row * pc.dim + col] = v;
 }

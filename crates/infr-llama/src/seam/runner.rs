@@ -4971,7 +4971,7 @@ pub(crate) fn generate_dense_backend(
             .alloc(m * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
         let vf_logits_buf = be
-            .alloc(m * c.vocab * 4, BufferUsage::Staging)
+            .alloc(m * c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(vf_hidden_buf.as_ref(), bytemuck::cast_slice(&vf_hidden))
             .map_err(|e| anyhow!("{e}"))?;

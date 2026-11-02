@@ -1098,7 +1098,7 @@ impl SeamModel {
                 tokens.len()
             ));
         }
-        const PIECE_ROWS: usize = 256;
+        const PIECE_ROWS: usize = 128;
         let vocab = self.cfg.vocab;
         let first = n_ctx / 2;
         let want_ctx = n_ctx + 1;
@@ -1114,12 +1114,7 @@ impl SeamModel {
         let cpu_bind = crate::seam::cpu_upload_bind(&cpu_be);
         let vk_bind = match &vk {
             Some(vk) => Some(crate::seam::vulkan_moe_binder(
-                vk,
-                &self.gguf,
-                &self.cfg,
-                &self.ecfg,
-                true,
-                want_ctx,
+                vk, &self.gguf, &self.cfg, &self.ecfg, true, want_ctx,
             )?),
             None => None,
         };
@@ -1163,7 +1158,11 @@ impl SeamModel {
                     .map(|j| {
                         let row = &logits[(j - start) * vocab..(j - start + 1) * vocab];
                         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-                        let lse = row.iter().map(|&x| (x as f64 - max).exp()).sum::<f64>().ln();
+                        let lse = row
+                            .iter()
+                            .map(|&x| (x as f64 - max).exp())
+                            .sum::<f64>()
+                            .ln();
                         lse + max - row[window[j + 1] as usize] as f64
                     })
                     .collect();

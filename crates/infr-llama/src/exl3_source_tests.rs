@@ -155,6 +155,33 @@ fn row_only_embeddings_feed_scaled_host_inputs_without_a_table_cache() {
     assert!(handle.get().is_err());
     assert!(handle.rows(&[2], 256, 1.0).is_err());
     assert!(source.tensor_bytes("token_embd.weight").is_err());
+
+    // A mixed prefill chunk must use row-only text lookup and leave vision rows unscaled,
+    // unrounded, and in their absolute prompt positions. Placeholder ids must never be looked up.
+    let tag = crate::media::MEDIA_ID_BASE | 17;
+    let image_rows = vec![0.05078125; 512];
+    let media = crate::media::EmbedOverride {
+        n_embd: 256,
+        spans: vec![(7, std::sync::Arc::new(image_rows.clone()))],
+    };
+    let mixed = handle
+        .prompt_rows(&[1, tag, tag, 0], 6, 256, (2560f32).sqrt(), Some(&media))
+        .unwrap();
+    assert_eq!(&mixed[..256], &rows[..256]);
+    assert_eq!(&mixed[256..768], image_rows.as_slice());
+    assert_eq!(&mixed[768..], &rows[256..512]);
+    let images_only = handle
+        .prompt_rows(&[tag, tag], 7, 256, (2560f32).sqrt(), Some(&media))
+        .unwrap();
+    assert_eq!(images_only.as_ref(), image_rows.as_slice());
+    assert!(handle
+        .prompt_rows(&[tag], 6, 256, 1.0, Some(&media))
+        .is_err());
+    assert!(handle
+        .prompt_rows(&[tag], 7, 128, 1.0, Some(&media))
+        .is_err());
+    assert!(cache.get().is_none());
+
     let ple = crate::util::PerLayerEmbd {
         npl: 128,
         n_layer: 2,
@@ -165,6 +192,8 @@ fn row_only_embeddings_feed_scaled_host_inputs_without_a_table_cache() {
     let scale = 128f32.sqrt();
     assert_eq!(rows[0], half::f16::from_f32(-55.25 * scale).to_f32());
     assert_eq!(rows[256], rows[0]);
+    let image_ple = crate::seam::e2b_ipl_rows(&source, &ple, &[1, tag]).unwrap();
+    assert_eq!(image_ple, rows);
     let mut main = [0.05078125f32];
     let mut per_layer = main;
     crate::seam::scale_embedding_rows(&source, &mut main, scale, true).unwrap();

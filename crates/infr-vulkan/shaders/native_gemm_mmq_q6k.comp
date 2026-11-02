@@ -228,7 +228,7 @@ void main() {
             rqh[u] = rw4(bd + 128u + hf * 32u + h * 16u); \
         } \
     }
-    PREFETCH(0u)
+    if (ngrp > 0u) { PREFETCH(0u) }
     for (uint g = 0u; g < ngrp; g++) {
         [[unroll]] for (uint u = 0u; u < NA; u++) {
             uint idx = li + u * THREADS;

@@ -900,7 +900,7 @@ impl SeamModel {
     ) -> Result<crate::GenStats> {
         // Images (if any) become placeholder ids + an embedding override the runner reads; the
         // guard keeps that override published for exactly this generation.
-        let (prompt_tokens, _media) = self.encode_prompt(prompt)?;
+        let (prompt_tokens, _media) = self.encode_prompt(prompt, session.max_ctx, req)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let slot = session
@@ -1026,6 +1026,46 @@ impl SeamModel {
             .map_err(|e| anyhow!("{e}"))
     }
 
+    fn image_token_counts(&self, images: &[std::sync::Arc<[u8]>]) -> Result<Vec<usize>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.cfg.gemma4 {
+            anyhow::bail!("image input is only supported for Gemma 4 models");
+        }
+        if images.len() > crate::vision::MAX_REQUEST_IMAGES {
+            anyhow::bail!("at most four images are allowed per request");
+        }
+        let vision = self.vision()?;
+        let mut pixels = 0u64;
+        let mut tokens = 0usize;
+        let mut counts = Vec::with_capacity(images.len());
+        for bytes in images {
+            let (w, h) = crate::vision::image_dimensions(bytes)?;
+            pixels += u64::from(w) * u64::from(h);
+            if pixels > crate::vision::MAX_REQUEST_PIXELS {
+                anyhow::bail!("request images exceed the aggregate pixel limit");
+            }
+            let count = vision.image_tokens(bytes, self.ecfg.serve.image_max_tokens)?;
+            tokens += count;
+            if tokens > crate::vision::MAX_IMAGE_TOKENS {
+                anyhow::bail!("request images exceed the aggregate soft-token limit");
+            }
+            counts.push(count);
+        }
+        Ok(counts)
+    }
+
+    /// Validate image support, aggregate budgets, and complete image payloads before a server
+    /// commits response headers. This performs no vision transformer work.
+    pub fn preflight_images(&self, images: &[std::sync::Arc<[u8]>]) -> Result<()> {
+        self.image_token_counts(images)?;
+        for bytes in images {
+            crate::vision::validate_image(bytes)?;
+        }
+        Ok(())
+    }
+
     /// Tokenize a rendered prompt that may carry [`crate::media::IMAGE_MARKER`]s: each marker
     /// becomes `<|image>` + one placeholder id per soft token + `<image|>` (the layout llama.cpp's
     /// mtmd and HF's Gemma 4 processor both produce), and the returned guard publishes the encoded
@@ -1035,6 +1075,8 @@ impl SeamModel {
     pub(crate) fn encode_prompt(
         &self,
         prompt: &str,
+        max_ctx: usize,
+        req: Option<&crate::sampling::RequestCtx>,
     ) -> Result<(Vec<u32>, Option<crate::media::OverrideScope>)> {
         use crate::media::{
             current_media, EmbedOverride, OverrideScope, IMAGE_MARKER, MEDIA_ID_BASE,
@@ -1054,6 +1096,24 @@ impl SeamModel {
                 media.len()
             ));
         }
+        let counts = self.image_token_counts(&media)?;
+        let text: Vec<Vec<u32>> = parts
+            .iter()
+            .map(|part| self.encode_text(part))
+            .collect::<Result<_>>()?;
+        let text_len = text
+            .iter()
+            .try_fold(0usize, |n, p| n.checked_add(p.len()))
+            .ok_or_else(|| anyhow!("image prompt length overflow"))?;
+        let total = counts
+            .iter()
+            .try_fold(text_len, |n, &count| n.checked_add(count + 2))
+            .ok_or_else(|| anyhow!("image prompt length overflow"))?;
+        if total >= max_ctx {
+            return Err(anyhow!(
+                "image prompt ({total} tokens) does not fit context {max_ctx}"
+            ));
+        }
         let vision = self.vision()?;
         let special = |s: &str| -> Result<u32> {
             match self.encode_text(s)?.as_slice() {
@@ -1067,16 +1127,22 @@ impl SeamModel {
         let max_tokens = self.ecfg.serve.image_max_tokens;
         let mut ids = Vec::new();
         let mut spans = Vec::with_capacity(n_img);
-        for (i, part) in parts.iter().enumerate() {
-            ids.extend(self.encode_text(part)?);
+        for (i, part) in text.iter().enumerate() {
+            if req.is_some_and(crate::sampling::RequestCtx::aborted) {
+                return Err(anyhow!("image encoding cancelled"));
+            }
+            ids.extend_from_slice(part);
             if i == n_img {
                 break;
             }
             let bytes = &media[i];
-            let rows = vision.encode(bytes, max_tokens)?;
+            let rows = vision.encode_with_request(bytes, max_tokens, req)?;
             let n = rows.len() / self.cfg.n_embd;
-            // Content-derived placeholder: equal images share ids (so the prefix cache may reuse
-            // their KV rows), different images do not.
+            if n != counts[i] {
+                return Err(anyhow!("vision output token count differs from preflight"));
+            }
+            // Compact content-derived tags are not identity proofs: KV reuse stops before image
+            // rows. The encoder's cache compares complete bytes, so hash collisions are harmless.
             let tag = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();

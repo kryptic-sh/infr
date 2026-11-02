@@ -1948,6 +1948,10 @@ impl infr_server::ChatGenerator for SeamGenerator {
 }
 
 impl infr_server::ChatGenerator for ParallelGenerator {
+    fn validate_images(&self, images: &[std::sync::Arc<[u8]>]) -> anyhow::Result<()> {
+        self.engine.model().preflight_images(images)
+    }
+
     fn status(&self) -> infr_server::GeneratorStatus {
         let vram = self.engine.vram();
         infr_server::GeneratorStatus {

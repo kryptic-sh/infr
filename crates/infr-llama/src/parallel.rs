@@ -417,7 +417,7 @@ impl ParallelSeam {
     ) -> Result<GenStats> {
         // Images (if any) become placeholder ids + an embedding override the runner reads; the
         // guard keeps that override published for exactly this generation.
-        let (prompt_tokens, _media) = self.model.encode_prompt(prompt)?;
+        let (prompt_tokens, _media) = self.model.encode_prompt(prompt, self.max_ctx, Some(req))?;
         let mut guard = self.checkout(&prompt_tokens, req)?;
         // Cap the reply to the context actually left in THIS slot (a per-slot ctx is smaller than
         // the model's trained window under `-np N`), mirroring the sequential session path: a

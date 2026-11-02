@@ -426,6 +426,55 @@ fn run_fma(be: &VulkanBackend, dt: DType, w_base: usize) {
 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
+fn nc_kq_mmq_zero_k_keeps_output_canary() {
+    let be = VulkanBackend::new().unwrap();
+    let n = 64;
+    let mpad = 64;
+    let canary = 12345.0f32;
+    // Deliberately tiny inputs: zero-K must not prefetch any activation or weight data.
+    let tiny = be.alloc(16, BufferUsage::Weights).unwrap();
+    be.upload(tiny.as_ref(), &[0xff; 16]).unwrap();
+    for dt in [DType::Q4K, DType::Q6K] {
+        let out = be
+            .alloc((mpad * n + 16) * 4, BufferUsage::Activations)
+            .unwrap();
+        be.upload(
+            out.as_ref(),
+            bytemuck::cast_slice(&vec![canary; mpad * n + 16]),
+        )
+        .unwrap();
+        let rec = be.recorder().unwrap();
+        rec.matmul_mmq(
+            dt,
+            tiny.as_ref(),
+            tiny.as_ref(),
+            tiny.as_ref(),
+            tiny.as_ref(),
+            0,
+            out.as_ref(),
+            1,
+            0,
+            n,
+        );
+        rec.finish().unwrap();
+        let mut got = vec![0.0f32; mpad * n + 16];
+        be.download(out.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        assert!(
+            got[..mpad * n].iter().all(|v| v.to_bits() == 0),
+            "{dt:?} zero-K output"
+        );
+        assert!(
+            got[mpad * n..]
+                .iter()
+                .all(|v| v.to_bits() == canary.to_bits()),
+            "{dt:?} output overrun"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires Vulkan GPU"]
 fn nc_mmq_dense_gemm_parity_and_determinism() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");

@@ -5525,31 +5525,13 @@ pub(crate) fn generate_dense_backend(
                             .map_err(|e| anyhow!("{e}"))?;
                         b
                     } else {
-                        // An image row goes in as-is: the vision projector's output is
-                        // already in the residual stream's scale (no sqrt(n_embd)).
-                        let pf_hidden: std::borrow::Cow<'_, [f32]> = match chunk_media {
-                            None => token_embd.rows(&prompt[cstart..cend], ne, embed_scale)?,
-                            Some(o) => {
-                                let ids: Vec<u32> = prompt[cstart..cend]
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(i, _)| o.row(cstart + i).is_none())
-                                    .map(|(_, &t)| t)
-                                    .collect();
-                                let text_rows = token_embd.rows(&ids, ne, embed_scale)?;
-                                let mut text_rows = text_rows.chunks_exact(ne);
-                                let mut rows = Vec::with_capacity(pf_m * ne);
-                                for i in 0..pf_m {
-                                    match o.row(cstart + i) {
-                                        Some(row) => rows.extend_from_slice(row),
-                                        None => rows.extend_from_slice(
-                                            text_rows.next().expect("row per text token"),
-                                        ),
-                                    }
-                                }
-                                std::borrow::Cow::Owned(rows)
-                            }
-                        };
+                        let pf_hidden = token_embd.prompt_rows(
+                            &prompt[cstart..cend],
+                            cstart,
+                            ne,
+                            embed_scale,
+                            chunk_media,
+                        )?;
                         let b = be
                             .alloc(pf_m * ne * 4, BufferUsage::Staging)
                             .map_err(|e| anyhow!("{e}"))?;

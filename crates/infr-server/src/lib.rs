@@ -91,6 +91,15 @@ impl Finish {
 /// today) keeps an internal `Mutex` and is served with `--parallel 1`, which is honest rather than
 /// silently serialising a server the user asked to parallelise.
 pub trait ChatGenerator: Send + Sync {
+    /// Validate backend support, request budgets, and image payloads before HTTP response headers.
+    /// Called on a blocking thread; must not run the vision transformer or acquire a GPU slot.
+    fn validate_images(&self, images: &[Arc<[u8]>]) -> anyhow::Result<()> {
+        if !images.is_empty() {
+            anyhow::bail!("image input is not supported by this model/backend");
+        }
+        Ok(())
+    }
+
     /// Run one chat turn.
     ///
     /// * `tools` is the request's `tools` array as a borrowed [`serde_json::Value`] — passed by
@@ -1456,6 +1465,43 @@ async fn chat_completions_handler(
     // The response `model` field echoes the entry ACTUALLY served, not the raw request string, so a
     // client that omitted/mis-named the model sees which one answered.
     let entry = state.route(&req.model);
+    if !params.images.is_empty() {
+        let Some(engine) = entry.engine.clone() else {
+            return param_error(
+                Some("messages"),
+                "image input is not supported by this model/backend".into(),
+            );
+        };
+        // Image decoding has its own process-wide admission limit, independent of GPU slots.
+        // Do not queue compressed payloads: reject overload before allocating decoder buffers.
+        // The closure owns the permit so disconnecting/aborting this handler cannot release it
+        // while an uncancellable blocking decoder is still running.
+        static IMAGE_PREFLIGHT_GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let gate = IMAGE_PREFLIGHT_GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)));
+        let Ok(permit) = gate.clone().try_acquire_owned() else {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "image validation is busy; retry later".into(),
+            );
+        };
+        let images = params.images.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            engine.validate_images(&images)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return param_error(Some("messages"), e.to_string()),
+            Err(e) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("image preflight failed: {e}"),
+                )
+            }
+        }
+    }
     let model_id = entry.id.to_string();
     let ctx = ReqCtx {
         id: next_req_id(),
@@ -2277,6 +2323,9 @@ pub fn flatten_content_media(
                     param: "messages",
                     message,
                 };
+                if images.len() >= infr_engine::MAX_REQUEST_IMAGES {
+                    return Err(bad("at most four images are allowed per request".into()));
+                }
                 let Some(rest) = url.strip_prefix("data:") else {
                     return Err(bad(
                         "image_url must be a base64 data: URI (remote image URLs are not fetched)"
@@ -2289,9 +2338,16 @@ pub fn flatten_content_media(
                 if !meta.ends_with(";base64") {
                     return Err(bad("image data: URI must be base64-encoded".into()));
                 }
+                let data = data.trim();
+                if data.len() > infr_engine::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+                    return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
+                }
                 let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(data.trim())
+                    .decode(data)
                     .map_err(|e| bad(format!("image data: URI is not valid base64: {e}")))?;
+                if bytes.len() > infr_engine::MAX_IMAGE_BYTES {
+                    return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
+                }
                 images.push(Arc::from(bytes));
                 out.push_str(marker);
             }
@@ -3130,18 +3186,19 @@ mod tests {
     #[test]
     fn flatten_content_media_turns_data_uris_into_markers() {
         let m = infr_engine::IMAGE_MARKER;
+        let uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGIGAAAOAAfXb+R4AAAAAElFTkSuQmCC";
         let v = Some(serde_json::json!([
             {"type": "text", "text": "look "},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
+            {"type": "image_url", "image_url": {"url": uri}},
             {"type": "text", "text": "and"},
-            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BAU="}}
+            {"type": "image_url", "image_url": {"url": uri}}
         ]));
         let mut images = Vec::new();
         let text = flatten_content_media(&v, &mut images).unwrap();
         assert_eq!(text, format!("look {m}and{m}"));
         assert_eq!(images.len(), 2);
-        assert_eq!(&*images[0], &[1u8, 2, 3][..]);
-        assert_eq!(&*images[1], &[4u8, 5][..]);
+        assert_eq!(&images[0][..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(images[0], images[1]);
     }
 
     #[test]
@@ -3156,6 +3213,45 @@ mod tests {
             assert!(flatten_content_media(&v, &mut images).is_err(), "{url}");
         }
         assert!(images.is_empty());
+    }
+
+    #[test]
+    fn flatten_content_media_enforces_count_and_encoded_size() {
+        let mut images = vec![Arc::<[u8]>::from([0u8]); infr_engine::MAX_REQUEST_IMAGES];
+        let v = Some(
+            serde_json::json!([{"type":"image_url", "image_url":{"url":"data:image/png;base64,AQID"}}]),
+        );
+        assert!(flatten_content_media(&v, &mut images)
+            .unwrap_err()
+            .message
+            .contains("four images"));
+        let v = Some(
+            serde_json::json!([{"type":"image_url", "image_url":{"url":format!("data:image/png;base64,{}", "A".repeat(infr_engine::MAX_IMAGE_BYTES.div_ceil(3)*4+1))}}]),
+        );
+        assert!(flatten_content_media(&v, &mut Vec::new())
+            .unwrap_err()
+            .message
+            .contains("16 MiB"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_images_are_json_400_even_when_streaming() {
+        for stream in [false, true] {
+            let resp = multi_router().oneshot(Request::builder()
+                .method("POST").uri("/v1/chat/completions").header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"model":"alpha", "stream":stream, "messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGIGAAAOAAfXb+R4AAAAAElFTkSuQmCC"}}]}]}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(resp.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json"));
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not supported"));
+        }
     }
 
     #[test]

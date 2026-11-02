@@ -3123,7 +3123,8 @@ impl<'a> Recorder<'a> {
     /// Tiled Q6_K dp4a (mmq) GEMM for a stacked expert (the MoE down projection): `c = qa·W[w_base]ᵀ`
     /// using hardware int8 dot-product (activations pre-quantized via `quant_q8`; the per-block sum is
     /// unused — Q6_K is symmetric, no min). `c` is `ceil(m/64)*64` rows. Faster than the coopmat-f16
-    /// `matmul_native` for u6 weights. Requires `n%64`, `k%16`.
+    /// `matmul_native` for u6 weights. Requires `n%64`, `k%32`; activations/scales must include
+    /// all `ceil(m/64)*64` padded rows, including when `m` is not a multiple of 64.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_q6k(
         &self,
@@ -3136,6 +3137,10 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert!(
+            k.is_multiple_of(32) && n.is_multiple_of(64),
+            "Q6_K MMQ requires k%32 == 0 and n%64 == 0"
+        );
         self.label_gemm("native_gemm_mmq_q6k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q6k",

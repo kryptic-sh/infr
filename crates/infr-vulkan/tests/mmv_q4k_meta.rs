@@ -12,7 +12,7 @@ fn weights(in_f: usize, out_f: usize, base: usize, seed: u32) -> Vec<u8> {
         .map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(seed) >> 24) as u8)
         .collect();
     let scales = [0.0, -0.0, 0.000001, -0.000001, 0.004, -0.007, 0.25, 0.75];
-    for (i, block) in bytes.chunks_exact_mut(144).enumerate() {
+    for (i, block) in bytes.as_chunks_mut::<144>().0.iter_mut().enumerate() {
         block[0..2].copy_from_slice(&half::f16::from_f32(scales[i % scales.len()]).to_le_bytes());
         block[2..4]
             .copy_from_slice(&half::f16::from_f32(scales[(i + 3) % scales.len()]).to_le_bytes());
@@ -49,7 +49,9 @@ impl Inputs {
             .map(|i| half::f16::from_f32(0.003 + (i % 11) as f32 * 0.001))
             .collect();
         let sact: Vec<half::f16> = qa
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .zip(&dact)
             .map(|(q, d)| {
                 half::f16::from_f32(q.iter().map(|&v| v as f32).sum::<f32>() * d.to_f32())

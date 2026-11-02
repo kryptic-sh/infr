@@ -123,6 +123,44 @@ impl<'a> TokenEmbd<'a> {
         scale_embedding_rows(self.ws, &mut rows, scale, true)?;
         Ok(Cow::Owned(rows))
     }
+
+    /// Gather text through the format's row lookup without ever indexing image placeholder ids.
+    /// Vision rows already have residual-stream scale, so copy them without text scaling or rounding.
+    pub(crate) fn prompt_rows(
+        &self,
+        ids: &[u32],
+        start: usize,
+        width: usize,
+        scale: f32,
+        media: Option<&crate::media::EmbedOverride>,
+    ) -> AResult<std::borrow::Cow<'a, [f32]>> {
+        use std::borrow::Cow;
+        let Some(media) = media else {
+            return self.rows(ids, width, scale);
+        };
+        anyhow::ensure!(width > 0, "embedding width must be positive");
+        let count = ids
+            .len()
+            .checked_mul(width)
+            .ok_or_else(|| anyhow!("embedding row size overflow"))?;
+        let mut rows = Vec::with_capacity(count);
+        let mut i = 0;
+        while i < ids.len() {
+            if let Some(row) = media.row(start + i) {
+                anyhow::ensure!(row.len() == width, "image embedding width mismatch");
+                rows.extend_from_slice(row);
+                i += 1;
+            } else {
+                let begin = i;
+                i += 1;
+                while i < ids.len() && media.row(start + i).is_none() {
+                    i += 1;
+                }
+                rows.extend_from_slice(&self.rows(&ids[begin..i], width, scale)?);
+            }
+        }
+        Ok(Cow::Owned(rows))
+    }
 }
 
 pub(crate) fn scale_embedding_rows(
@@ -3838,7 +3876,24 @@ pub(crate) fn e2b_ipl_rows(
     use rayon::prelude::*;
     let (npl, nl) = (ple.npl, ple.n_layer);
     let sqrt_npl = (npl as f32).sqrt();
-    if let Some(mut rows) = g.tensor_rows("per_layer_token_embd.weight", tokens)? {
+    // Both row-only EXL3 and ordinary GGUF embeddings use PAD (id 0) at image positions.
+    let tokens = if tokens.iter().any(|&tok| crate::media::is_media_id(tok)) {
+        std::borrow::Cow::Owned(
+            tokens
+                .iter()
+                .map(|&tok| {
+                    if crate::media::is_media_id(tok) {
+                        0
+                    } else {
+                        tok
+                    }
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(tokens)
+    };
+    if let Some(mut rows) = g.tensor_rows("per_layer_token_embd.weight", &tokens)? {
         anyhow::ensure!(
             rows.len() == tokens.len() * nl * npl,
             "per-layer lookup returned incorrect row length"
@@ -3853,13 +3908,7 @@ pub(crate) fn e2b_ipl_rows(
     out.par_chunks_mut(nl * npl)
         .zip(tokens.par_iter())
         .try_for_each(|(dst, &tok)| -> AResult<()> {
-            // Image placeholder positions read the PAD row (id 0), as llama.cpp's gemma4 does for
-            // multimodal embeddings ([TAG_GEMMA4_IMG_PADDING]).
-            let tok = if crate::media::is_media_id(tok) {
-                0
-            } else {
-                tok as usize
-            };
+            let tok = tok as usize;
             let r0 = tok * ple.tok_embd_row_bytes;
             let pl_tok = dequant_block(
                 ple.tok_embd_dtype,
@@ -3874,10 +3923,29 @@ pub(crate) fn e2b_ipl_rows(
     Ok(out)
 }
 
-/// Longest shared prefix of the cached tokens and the new prompt (the KV rows that stay valid).
+/// Longest provably reusable KV prefix. Image ids are compact tags, not collision-proof
+/// identities: stop before any image row, even for equal tags. The vision encoder separately
+/// caches by exact image bytes; text-only prefix reuse is unchanged.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    a.iter()
+        .zip(b)
+        .take_while(|(x, y)| x == y && !crate::media::is_media_id(**x))
+        .count()
+}
+
+#[cfg(test)]
+mod media_prefix_tests {
+    #[test]
+    fn image_tags_never_authorize_kv_reuse() {
+        let tag = crate::media::MEDIA_ID_BASE | 17;
+        assert_eq!(
+            super::common_prefix_len(&[1, 2, tag, 3], &[1, 2, tag, 3]),
+            2
+        );
+        assert_eq!(super::common_prefix_len(&[tag], &[tag]), 0);
+        assert_eq!(super::common_prefix_len(&[1, 2, 3], &[1, 2, 4]), 2);
+    }
 }
 
 #[cfg(test)]

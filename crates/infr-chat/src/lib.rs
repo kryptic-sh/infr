@@ -28,6 +28,10 @@ pub use tools::{
 /// and splices the image's soft tokens in its place. Private-use code points, so ordinary text never
 /// contains it by accident and no chat template rewrites it.
 pub const IMAGE_MARKER: &str = "\u{E000}infr:image\u{E001}";
+/// Shared request limits, checked before allocating decoded data-URI bytes.
+pub const MAX_REQUEST_IMAGES: usize = 4;
+/// Maximum encoded image file size (after base64 decoding).
+pub const MAX_IMAGE_BYTES: usize = 16 << 20;
 
 /// One chat message (OpenAI-shaped; tool fields preserved for the agentic round-trip).
 #[derive(Clone, Debug, Default)]

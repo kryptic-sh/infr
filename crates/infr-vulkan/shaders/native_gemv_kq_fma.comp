@@ -35,9 +35,21 @@ float dot4b(uint q, vec4 xv) {
 }
 float hsum(vec4 v) { return (v.x + v.y) + (v.z + v.w); }
 
-// Superblock `sb` of rows row0..row0+3 (rows past out_f clamp to the last row; never written).
+// Branch-free k4w: a divergent branch here serialized the per-row weight loads.
+uvec2 k4sel(uint i, uvec4 hdr) {
+    uint s = (i & 3u) * 8u;
+    uint by = (hdr.y >> s) & 0xFFu;
+    uint bz = (hdr.z >> s) & 0xFFu;
+    uint bw = (hdr.w >> s) & 0xFFu;
+    uvec2 lo = uvec2(by & 63u, bz & 63u);
+    uvec2 hi = uvec2((bw & 0xFu) | ((by >> 6u) << 4u), (bw >> 4u) | ((bz >> 6u) << 4u));
+    return i < 4u ? lo : hi;
+}
+
+// Superblock `sb` of the 4 rows whose superblock-0 byte offsets are `rb` (`sbb` = sb * BLK).
 #if defined(FMT_Q4K)
-vec4 item(uint row0, uint sb, uint l8) {
+const uint BLK = 144u;
+vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
     uint g = l8 >> 1u;
     uint h = l8 & 1u;
     uint xb = (sb * 256u + 64u * g + 16u * h) >> 2u;
@@ -49,27 +61,33 @@ vec4 item(uint row0, uint sb, uint l8) {
     }
     float sxa = hsum(xa[0] + xa[1] + xa[2] + xa[3]);
     float sxc = hsum(xc[0] + xc[1] + xc[2] + xc[3]);
+    uvec4 hdrs[4];
+    uvec4 qs[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        uint bd = rb[r] + sbb;
+        hdrs[r] = NW4(bd >> 2u);
+        qs[r] = NW4((bd + 16u + 32u * g + 16u * h) >> 2u);
+    }
     vec4 out4;
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
-        uint row = min(row0 + r, pc.out_f - 1u);
-        uint bd = ((pc.w_base + row * pc.in_f) / 256u + sb) * 144u;
-        uvec4 hdr = NW4(bd >> 2u);
-        uvec4 q = NW4((bd + 16u + 32u * g + 16u * h) >> 2u);
+        uvec4 hdr = hdrs[r];
+        uvec4 q = qs[r];
         float slo = 0.0, shi = 0.0;
         [[unroll]] for (uint w = 0u; w < 4u; w++) {
             slo += dot4b(q[w] & 0x0F0F0F0Fu, xa[w]);
             shi += dot4b((q[w] >> 4u) & 0x0F0F0F0Fu, xc[w]);
         }
         vec2 dm = unpackHalf2x16(hdr.x);
-        uvec2 klo = k4w(2u * g, hdr);
-        uvec2 khi = k4w(2u * g + 1u, hdr);
+        uvec2 klo = k4sel(2u * g, hdr);
+        uvec2 khi = k4sel(2u * g + 1u, hdr);
         out4[r] = dm.x * (float(klo.x) * slo + float(khi.x) * shi)
                 - dm.y * (float(klo.y) * sxa + float(khi.y) * sxc);
     }
     return out4;
 }
 #elif defined(FMT_Q6K)
-vec4 item(uint row0, uint sb, uint l8) {
+const uint BLK = 210u;
+vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
     uint hf = l8 >> 2u;
     uint j = l8 & 3u;
     uint xb = (sb * 256u + hf * 128u + 8u * j) >> 2u;
@@ -82,8 +100,7 @@ vec4 item(uint row0, uint sb, uint l8) {
     }
     vec4 out4;
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
-        uint row = min(row0 + r, pc.out_f - 1u);
-        uint bd = ((pc.w_base + row * pc.in_f) / 256u + sb) * 210u;
+        uint bd = rb[r] + sbb;
         uint sh = (bd & 3u) * 8u;
         uint qa = (bd + hf * 64u + 8u * j) >> 2u;
         uint qh = (bd + 128u + hf * 32u + 8u * j) >> 2u;
@@ -124,14 +141,27 @@ void main() {
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(NR);
     if (o0 >= pc.out_f) { return; }
     uint nsb = pc.in_f / 256u;
+    // Rows past out_f clamp to the last row; never written.
+    uvec4 rbs[RG];
+    [[unroll]] for (uint g = 0u; g < RG; g++)
+        [[unroll]] for (uint r = 0u; r < 4u; r++)
+            rbs[g][r] = (pc.w_base / 256u + min(o0 + 4u * g + r, pc.out_f - 1u) * nsb) * BLK;
     vec4 acc[RG];
     [[unroll]] for (uint g = 0u; g < RG; g++) acc[g] = vec4(0.0);
-    for (uint it = slot; it < RG * nsb; it += 8u) {
-        uint g = it / nsb;
-        vec4 v = item(o0 + 4u * g, it - g * nsb, l8);
+    uint g = 0u;
+    uint sb = slot;
+    while (g < RG && sb >= nsb) { sb -= nsb; g++; }
+    while (g < RG) {
+        uvec4 rb = rbs[0];
+        [[unroll]] for (uint k = 1u; k < RG; k++) {
+            if (g == k) rb = rbs[k];
+        }
+        vec4 v = item(rb, sb, sb * BLK, l8);
         [[unroll]] for (uint k = 0u; k < RG; k++) {
             if (g == k) acc[k] += v;
         }
+        sb += 8u;
+        while (g < RG && sb >= nsb) { sb -= nsb; g++; }
     }
     [[unroll]] for (uint g = 0u; g < RG; g++)
         [[unroll]] for (uint r = 0u; r < 4u; r++) red[(4u * g + r) * 64u + lane] = acc[g][r];

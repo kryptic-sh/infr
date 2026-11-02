@@ -15,6 +15,11 @@ layout(push_constant) uniform PC {
 shared float tile[256];
 shared float red[B_ROWS * 128];
 
+float half_rne(float value) {
+    uint u = floatBitsToUint(value);
+    return uintBitsToFloat((u + 0xfffu + ((u >> 13u) & 1u)) & ~0x1fffu);
+}
+
 float weight_at(uint64_t addr, uint base, uint r, uint c) {
     uint lane = 8u * ((c >> 1u) & 3u) + ((r & 7u) >> 1u) + 4u * (c & 1u);
     uint entry = (r & 1u) + 2u * (r >> 3u) + 4u * (c >> 3u);
@@ -27,12 +32,16 @@ float weight_at(uint64_t addr, uint base, uint r, uint c) {
     uint b = Trellis(addr).v[base + (wi + 1u) % words];
     uint funnel = shift == 0u ? a : (a << shift) | (b >> (32u - shift));
     uint w = funnel >> 16u;
+    if (pc.codebook == 2u) {
+        uint h = w * 0x83dcd12du;
+        uint sum = 0x6400u + (h & 255u) + ((h >> 8u) & 255u) + ((h >> 16u) & 255u) + (h >> 24u);
+        float value = unpackHalf2x16(sum).x;
+        return half_rne(value * unpackHalf2x16(0x1eeeu).x + unpackHalf2x16(0xc931u).x);
+    }
     uint h = pc.codebook == 0u ? w * 89226354u + 64248484u : w * 0xcbac1fedu;
     h = (h & 0x8fff8fffu) ^ 0x3b603b60u;
     vec2 halves = unpackHalf2x16(h);
-    // The f32 sum is exact; round it to f16 nearest-even (packHalf2x16 rounding is unspecified).
-    uint u = floatBitsToUint(halves.x + halves.y);
-    return uintBitsToFloat((u + 0xfffu + ((u >> 13u) & 1u)) & ~0x1fffu);
+    return half_rne(halves.x + halves.y);
 }
 
 void main() {

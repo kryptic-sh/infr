@@ -15,8 +15,8 @@ Test checkpoint: `turboderp/Qwen2.5-7B-Instruct-exl3`, branch `4.0bpw`
 (default codebook; 4-bit projections, 6-bit LM head).
 
 Supported: Qwen2 and the Qwen3.5 hybrid text architecture, untied embeddings,
-integer rates 1–8, the default `3inst` codebook (cb0) and `mcg` with multiplier
-`0xCBAC1FED`. Every released turboderp Qwen2.5-7B branch inspected (2/3/4 bpw)
+integer rates 1–8, the default `3inst` codebook (cb0), `mcg` with multiplier
+`0xCBAC1FED`, and `mul1` with multiplier `0x83DCD12D`. Every released turboderp Qwen2.5-7B branch inspected (2/3/4 bpw)
 is cb0; rate and codebook are independent.
 
 Qwen3.5 loading translates the HF tensor names and configuration into the existing
@@ -25,7 +25,7 @@ The adapter handles zero-centered norms, `A_log` decay conversion, BF16 convolut
 parameters, and grouped-to-tiled value-head ordering. Vision and MTP tensors are
 not exposed by the text-only source.
 
-Rejected with an explicit error: `.mul1` or custom MCG multipliers, fractional rates,
+Rejected with an explicit error: custom codebook multipliers, fractional rates,
 custom RoPE scaling, sliding-window attention, sharded EXL3 checkpoints, and tied
 embeddings.
 
@@ -60,7 +60,9 @@ and FP32 projection/transform arithmetic, with no `shaderFloat16` requirement,
 subgroup-size assumption, cooperative matrix, or integer dot-product requirement.
 The RX 580 uses this same path automatically; no separate legacy-math switch is needed.
 The codebook's half-precision sum is rounded to nearest-even with integer arithmetic
-because `packHalf2x16` rounding is implementation-defined.
+because `packHalf2x16` rounding is implementation-defined. The `mul1` byte-sum/FMA
+path uses exact FP32 intermediates before the same rounding; all 65,536 windows
+are checked against the CPU half-FMA oracle.
 
 `Exl3Source::open` keeps the earlier folded-F16 reference path for tests: it expands
 each linear to row-major F16 (about 14 GB for the 7B linears). Production loading no
@@ -93,8 +95,8 @@ cargo test --release -p infr-vulkan --test exl3_linear_parity -- --ignored   # n
 - The Vulkan projection matches the CPU kernel within `1e-4 × max|y|` for rates 1–8,
   identity, rotary, and grouped input/output layouts, m ∈ {1, 2, 7, 8, 9, 17},
   and Qwen-sized projections.
-  Both `3inst` and `mcg` are verified on an RX 580 (RADV Polaris), including
-  4096×8192 and 4096×4096 at 2bpw. `3inst` is also verified on the Ryzen 7800X3D
+  `3inst`, `mcg`, and `mul1` are verified on an RX 580 (RADV Polaris), including
+  4096×8192 and 4096×4096 at 2bpw and Gemma E4B-sized 4bpw projections. `3inst` is also verified on the Ryzen 7800X3D
   integrated GPU (RADV) and an RTX 4070 (NVIDIA 615.71.09).
 - Full Qwen2.5-7B EXL3 4.0bpw chat generation runs on the RTX 4070 through Vulkan:
   `infr run /path/to/model.safetensors "What is the capital of France?" --dev Vulkan0

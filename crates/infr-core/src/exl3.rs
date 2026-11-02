@@ -7,6 +7,7 @@ use crate::{Error, Result};
 pub enum Exl3Codebook {
     Cb0 = 0,
     Mcg = 1,
+    Mul1 = 2,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

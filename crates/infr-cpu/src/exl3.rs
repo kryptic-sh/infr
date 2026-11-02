@@ -79,6 +79,7 @@ impl From<infr_core::Exl3Codebook> for Codebook {
         match value {
             infr_core::Exl3Codebook::Cb0 => Self::Cb0,
             infr_core::Exl3Codebook::Mcg => Self::Cb1,
+            infr_core::Exl3Codebook::Mul1 => Self::Cb2,
         }
     }
 }
@@ -431,6 +432,30 @@ pub fn hadamard128(v: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mul1_shader_f32_expression_matches_half_fma_for_every_window() {
+        let inv = f16::from_bits(0x1eee).to_f32();
+        let bias = f16::from_bits(0xc931).to_f32();
+        for word in 0..=u16::MAX {
+            let hash = u32::from(word).wrapping_mul(0x83dcd12d);
+            let sum = 0x6400
+                + hash
+                    .to_le_bytes()
+                    .iter()
+                    .map(|&b| u32::from(b))
+                    .sum::<u32>();
+            let value = f16::from_bits(sum as u16).to_f32() * inv + bias;
+            assert!(value.abs() >= f16::from_bits(0x0400).to_f32());
+            let bits = value.to_bits();
+            let rounded = f32::from_bits((bits + 0xfff + ((bits >> 13) & 1)) & !0x1fff);
+            assert_eq!(
+                rounded,
+                decode_3inst(Codebook::Cb2, word),
+                "word={word:#06x}"
+            );
+        }
+    }
 
     /// `lop3_6a(0) == 0x3b603b60`: the AND kills everything, the XOR stamps the
     /// constant — pins the two magic constants against the ROCm fallback.

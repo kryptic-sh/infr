@@ -183,6 +183,7 @@ knobs! {
     "INFR_KQ_FMA_TIER"      => "kernels.vulkan.kq_fma_tier",    TriState,    Ignored, "1",  migrated;
     "INFR_KQ_FMA_GEMV"      => "kernels.vulkan.kq_fma_gemv",    TriState,    Ignored, "1",  migrated;
     "INFR_WAVE64_NATIVE"    => "kernels.vulkan.wave64_native",  SetNotZero,  Ignored, "1",  migrated;
+    "INFR_WEIGHTS_AS_SSBO"  => "kernels.vulkan.weights_as_ssbo", SetNotZero, Ignored, "1",  migrated;
     "INFR_NO_MMV"           => "kernels.vulkan.mmv",            PresenceInv, Ignored, "1",  migrated;
     "INFR_MMV_DECODE"       => "kernels.vulkan.mmv_decode",     Presence,    Ignored, "1",  migrated;
     "INFR_NO_MMV_M4"        => "kernels.vulkan.mmv_m4",         PresenceInv, Ignored, "1",  migrated;
@@ -210,6 +211,7 @@ knobs! {
     "INFR_PV_SPLITS"      => "kernels.vulkan.pv_splits",        Int,              Ignored, "2",  migrated;
     "INFR_NO_ATTN_HD"     => "kernels.vulkan.no_attn_hd_spec",  Presence,         Ignored, "1",  migrated;
     "INFR_NO_ATTN_DECODE" => "kernels.vulkan.attn_decode",      PresenceInv,      Ignored, "1",  migrated;
+    "INFR_ATTN_DECODE_GQA" => "kernels.vulkan.attn_decode_gqa", TriState,         Ignored, "1",  migrated;
     "INFR_NO_MROWS_ATTN"  => "kernels.vulkan.mrows_attn",       PresenceOptFalse, Ignored, "1",  migrated;
     "INFR_MROWS_ATTN"     => "kernels.vulkan.mrows_attn",       PresenceOptTrue,  Ignored, "1",  migrated;
     "INFR_NO_MLA_SG"      => "kernels.vulkan.mla_sg",           PresenceInv,      Ignored, "1",  migrated;

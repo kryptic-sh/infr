@@ -223,6 +223,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.kq_fma_tier = get("INFR_KQ_FMA_TIER").map(|s| Some(s != "0"));
     v.kq_fma_gemv = get("INFR_KQ_FMA_GEMV").map(|s| Some(s != "0"));
     v.wave64_native = get("INFR_WAVE64_NATIVE").map(|s| s != "0");
+    v.weights_as_ssbo = get("INFR_WEIGHTS_AS_SSBO").map(|s| s != "0");
     v.mmv = presence_inv(get, "INFR_NO_MMV");
     v.mmv_decode = presence(get, "INFR_MMV_DECODE");
     v.mmv_m4 = presence_inv(get, "INFR_NO_MMV_M4");
@@ -253,6 +254,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.pv_splits = opt_num(get, "INFR_PV_SPLITS");
     v.no_attn_hd_spec = presence(get, "INFR_NO_ATTN_HD");
     v.attn_decode = presence_inv(get, "INFR_NO_ATTN_DECODE");
+    v.attn_decode_gqa = get("INFR_ATTN_DECODE_GQA").map(|s| Some(s != "0"));
     v.mla_sg = presence_inv(get, "INFR_NO_MLA_SG");
     // Asymmetric pair: the `NO_` key wins over the opt-in when BOTH are set.
     v.mrows_attn = if get("INFR_NO_MROWS_ATTN").is_some() {

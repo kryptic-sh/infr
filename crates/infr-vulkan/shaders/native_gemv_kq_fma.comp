@@ -3,7 +3,10 @@
 // int8 dot. One 64-thread workgroup per NR output rows; 8 lanes per 256-element superblock, and
 // each work item applies one superblock's activations to 4 rows.
 // -DFMT_Q4K | -DFMT_Q6K, optional -DUSE_RES (y = residual + x·Wᵀ). Requires in_f % 256 == 0.
+// -DWEIGHTS_SSBO reads the weight from binding 3 instead of its device address.
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 #ifndef NR
 #define NR 8
@@ -20,14 +23,15 @@ layout(binding = 1) readonly buffer RB { float res[]; };
 #endif
 layout(binding = 2) writeonly buffer YB { float y[]; };
 
+#ifdef WEIGHTS_SSBO
+layout(binding = 3) readonly buffer WB { uint nw[]; };
+#else
 #include "native_weight_addr.glsl"
 #define NW(i) arena_word(i)
+#endif
 #include "native_decode.glsl"
 
-shared float red[NR * 64];
-
-// Unaligned-safe word funnel: sh in {0,8,16,24}; (hi<<1)<<(31-sh) is 0 when sh==0.
-uint fun(uint lo, uint hi, uint sh) { return (lo >> sh) | ((hi << 1u) << (31u - sh)); }
+shared float red[NR * 64]; // per-subgroup partials when a workgroup spans several subgroups
 
 float dot4b(uint q, vec4 xv) {
     return float(q & 0xFFu) * xv.x + float((q >> 8u) & 0xFFu) * xv.y
@@ -35,9 +39,25 @@ float dot4b(uint q, vec4 xv) {
 }
 float hsum(vec4 v) { return (v.x + v.y) + (v.z + v.w); }
 
-// Superblock `sb` of rows row0..row0+3 (rows past out_f clamp to the last row; never written).
+// Q4_K (scale, min) of sub-blocks 2g and 2g+1, branch-free; hi = g >= 2, s = ((2g) & 3) * 8.
+uvec4 k4pair(uvec4 hdr, bool hi, uint s) {
+    uint ps = hi ? hdr.w : hdr.y;
+    uint pm = hi ? hdr.w : hdr.z;
+    uint o = hi ? 6u : 4u;
+    uint om = hi ? 4u : 0u;
+    uvec4 k;
+    [[unroll]] for (uint t = 0u; t < 2u; t++) {
+        uint st = s + 8u * t;
+        k[2u * t] = bitfieldExtract(ps, int(st), 4) + bitfieldExtract(hdr.y, int(st + o), 2) * 16u;
+        k[2u * t + 1u] = bitfieldExtract(pm, int(st + om), 4) + bitfieldExtract(hdr.z, int(st + o), 2) * 16u;
+    }
+    return k;
+}
+
+// Superblock `sb` of the 4 rows whose superblock-0 byte offsets are `rb` (`sbb` = sb * BLK).
 #if defined(FMT_Q4K)
-vec4 item(uint row0, uint sb, uint l8) {
+const uint BLK = 144u;
+vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
     uint g = l8 >> 1u;
     uint h = l8 & 1u;
     uint xb = (sb * 256u + 64u * g + 16u * h) >> 2u;
@@ -49,27 +69,35 @@ vec4 item(uint row0, uint sb, uint l8) {
     }
     float sxa = hsum(xa[0] + xa[1] + xa[2] + xa[3]);
     float sxc = hsum(xc[0] + xc[1] + xc[2] + xc[3]);
+    uvec4 hdrs[4];
+    uvec4 qs[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        uint bd = rb[r] + sbb;
+        hdrs[r] = NW4(bd >> 2u);
+        qs[r] = NW4((bd + 16u + 32u * g + 16u * h) >> 2u);
+    }
+    bool hi = g >= 2u;
+    uint s = ((2u * g) & 3u) * 8u;
     vec4 out4;
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
-        uint row = min(row0 + r, pc.out_f - 1u);
-        uint bd = ((pc.w_base + row * pc.in_f) / 256u + sb) * 144u;
-        uvec4 hdr = NW4(bd >> 2u);
-        uvec4 q = NW4((bd + 16u + 32u * g + 16u * h) >> 2u);
+        uvec4 hdr = hdrs[r];
+        uvec4 q = qs[r];
         float slo = 0.0, shi = 0.0;
         [[unroll]] for (uint w = 0u; w < 4u; w++) {
             slo += dot4b(q[w] & 0x0F0F0F0Fu, xa[w]);
-            shi += dot4b((q[w] >> 4u) & 0x0F0F0F0Fu, xc[w]);
+            shi += dot4b(q[w] & 0xF0F0F0F0u, xc[w]);
         }
         vec2 dm = unpackHalf2x16(hdr.x);
-        uvec2 klo = k4w(2u * g, hdr);
-        uvec2 khi = k4w(2u * g + 1u, hdr);
-        out4[r] = dm.x * (float(klo.x) * slo + float(khi.x) * shi)
-                - dm.y * (float(klo.y) * sxa + float(khi.y) * sxc);
+        uvec4 k = k4pair(hdr, hi, s);
+        // shi carries 16x the high nibbles.
+        out4[r] = dm.x * (float(k.x) * slo + float(k.z) * 0.0625 * shi)
+                - dm.y * (float(k.y) * sxa + float(k.w) * sxc);
     }
     return out4;
 }
 #elif defined(FMT_Q6K)
-vec4 item(uint row0, uint sb, uint l8) {
+const uint BLK = 210u;
+vec4 item(uvec4 rb, uint sb, uint sbb, uint l8) {
     uint hf = l8 >> 2u;
     uint j = l8 & 3u;
     uint xb = (sb * 256u + hf * 128u + 8u * j) >> 2u;
@@ -80,23 +108,29 @@ vec4 item(uint row0, uint sb, uint l8) {
         xv[og * 2u + 1u] = x4[xb + og * 8u + 1u];
         sx[og] = hsum(xv[og * 2u] + xv[og * 2u + 1u]);
     }
-    vec4 out4;
+    // Q6_K blocks are 210 bytes and every field offset is even, so a word is either aligned or
+    // straddles at 16 bits.
+    uvec3 wa[4], wb[4], wh[4], ws[4];
+    uint wd[4];
     [[unroll]] for (uint r = 0u; r < 4u; r++) {
-        uint row = min(row0 + r, pc.out_f - 1u);
-        uint bd = ((pc.w_base + row * pc.in_f) / 256u + sb) * 210u;
-        uint sh = (bd & 3u) * 8u;
+        uint bd = rb[r] + sbb;
         uint qa = (bd + hf * 64u + 8u * j) >> 2u;
         uint qh = (bd + 128u + hf * 32u + 8u * j) >> 2u;
         uint sc = (bd + 192u + hf * 8u) >> 2u;
-        uvec2 a0 = NW2(qa); uint a2 = NW(qa + 2u);
-        uvec2 b0 = NW2(qa + 8u); uint b2 = NW(qa + 10u);
-        uvec2 h0 = NW2(qh); uint h2 = NW(qh + 2u);
-        uvec2 s0 = NW2(sc); uint s2 = NW(sc + 2u);
-        uint la[2] = uint[2](fun(a0.x, a0.y, sh), fun(a0.y, a2, sh));
-        uint lb[2] = uint[2](fun(b0.x, b0.y, sh), fun(b0.y, b2, sh));
-        uint hh[2] = uint[2](fun(h0.x, h0.y, sh), fun(h0.y, h2, sh));
-        uint sw[2] = uint[2](fun(s0.x, s0.y, sh), fun(s0.y, s2, sh));
-        float d = unpackHalf2x16((NW((bd + 208u) >> 2u) >> (((bd + 208u) & 3u) * 8u)) & 0xFFFFu).x;
+        wa[r] = uvec3(NW2(qa), NW(qa + 2u));
+        wb[r] = uvec3(NW2(qa + 8u), NW(qa + 10u));
+        wh[r] = uvec3(NW2(qh), NW(qh + 2u));
+        ws[r] = uvec3(NW2(sc), NW(sc + 2u));
+        wd[r] = NW((bd + 208u) >> 2u);
+    }
+    vec4 out4;
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        bool odd = ((rb[r] + sbb) & 2u) != 0u;
+        uvec2 la = odd ? (wa[r].xy >> 16u) | (wa[r].yz << 16u) : wa[r].xy;
+        uvec2 lb = odd ? (wb[r].xy >> 16u) | (wb[r].yz << 16u) : wb[r].xy;
+        uvec2 hh = odd ? (wh[r].xy >> 16u) | (wh[r].yz << 16u) : wh[r].xy;
+        uvec2 sw = odd ? (ws[r].xy >> 16u) | (ws[r].yz << 16u) : ws[r].xy;
+        float d = unpackHalf2x16(odd ? wd[r] >> 16u : wd[r]).x;
         float acc = 0.0;
         [[unroll]] for (uint og = 0u; og < 4u; og++) {
             float s = 0.0;
@@ -107,7 +141,7 @@ vec4 item(uint row0, uint sb, uint l8) {
                 s += dot4b(q, xv[og * 2u + w]);
             }
             uint si = og * 2u + (j >> 1u);
-            float scv = float(sgn8((sw[si >> 2u] >> ((si & 3u) * 8u)) & 0xFFu));
+            float scv = float(bitfieldExtract(int(sw[si >> 2u]), int((si & 3u) * 8u), 8));
             acc += scv * (s - 32.0 * sx[og]);
         }
         out4[r] = d * acc;
@@ -117,33 +151,58 @@ vec4 item(uint row0, uint sb, uint l8) {
 #endif
 
 void main() {
+#ifndef WEIGHTS_SSBO
     w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+#endif
     uint lane = gl_LocalInvocationIndex;
     uint l8 = lane & 7u;
     uint slot = lane >> 3u;
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * uint(NR);
     if (o0 >= pc.out_f) { return; }
     uint nsb = pc.in_f / 256u;
+    // Rows past out_f clamp to the last row; never written.
+    uvec4 rbs[RG];
+    [[unroll]] for (uint g = 0u; g < RG; g++)
+        [[unroll]] for (uint r = 0u; r < 4u; r++)
+            rbs[g][r] = (pc.w_base / 256u + min(o0 + 4u * g + r, pc.out_f - 1u) * nsb) * BLK;
     vec4 acc[RG];
     [[unroll]] for (uint g = 0u; g < RG; g++) acc[g] = vec4(0.0);
-    for (uint it = slot; it < RG * nsb; it += 8u) {
-        uint g = it / nsb;
-        vec4 v = item(o0 + 4u * g, it - g * nsb, l8);
+    uint g = 0u;
+    uint sb = slot;
+    while (g < RG && sb >= nsb) { sb -= nsb; g++; }
+    while (g < RG) {
+        uvec4 rb = rbs[0];
+        [[unroll]] for (uint k = 1u; k < RG; k++) {
+            if (g == k) rb = rbs[k];
+        }
+        vec4 v = item(rb, sb, sb * BLK, l8);
         [[unroll]] for (uint k = 0u; k < RG; k++) {
             if (g == k) acc[k] += v;
         }
+        sb += 8u;
+        while (g < RG && sb >= nsb) { sb -= nsb; g++; }
     }
+    float part[NR];
     [[unroll]] for (uint g = 0u; g < RG; g++)
-        [[unroll]] for (uint r = 0u; r < 4u; r++) red[(4u * g + r) * 64u + lane] = acc[g][r];
-    barrier();
-    [[unroll]] for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (lane < s) {
-            [[unroll]] for (uint r = 0u; r < uint(NR); r++) red[r * 64u + lane] += red[r * 64u + lane + s];
+        [[unroll]] for (uint r = 0u; r < 4u; r++) part[4u * g + r] = subgroupAdd(acc[g][r]);
+    if (gl_NumSubgroups > 1u) {
+        if (subgroupElect()) {
+            [[unroll]] for (uint r = 0u; r < uint(NR); r++) red[gl_SubgroupID * uint(NR) + r] = part[r];
         }
         barrier();
+        if (lane < uint(NR)) {
+            float v = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; s++) v += red[s * uint(NR) + lane];
+            red[lane] = v;
+        }
+        barrier();
+        [[unroll]] for (uint r = 0u; r < uint(NR); r++) part[r] = red[r];
     }
     if (lane < uint(NR) && o0 + lane < pc.out_f) {
-        float v = red[lane * 64u];
+        float v = part[0];
+        [[unroll]] for (uint r = 1u; r < uint(NR); r++) {
+            if (lane == r) v = part[r];
+        }
 #ifdef USE_RES
         v += res[o0 + lane];
 #endif

@@ -270,6 +270,14 @@ cfg_struct! {
         /// `subgroupClusteredAdd` (`shaders/wave64.glsl`). Default on; inert everywhere else
         /// (only wave64 devices select the SG=64 builds). A/B knob for the wave64 data point.
         wave64_native: bool = true,
+        /// `INFR_WEIGHTS_AS_SSBO`, `=0|1` — EXPERIMENTAL, default off: bind decode-GEMV
+        /// weights as storage buffers instead of reading them by 64-bit device address
+        /// (`native_gemv_kq_fma` today). May help GPUs without a scalar-base global load,
+        /// e.g. GFX8/Polaris, where every device-address load builds its own 64-bit address.
+        /// KNOWN-BAD in production (2026-11-02): parity-clean at test shapes but produces
+        /// nondeterministic garbage in-model on RX 580 Polaris — do not enable without a
+        /// greedy value-probe. Tensors past `maxStorageBufferRange` keep the device-address path.
+        weights_as_ssbo: bool = false,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
         /// this backwards disables the mmv tier for everyone.
         mmv: bool = true,
@@ -328,6 +336,12 @@ cfg_struct! {
         /// (`attn_decode.comp`). Setting the env var keeps the general `attn_partial` builds on
         /// the decode fast path; the output is bit-identical either way, so this is an A/B knob.
         attn_decode: bool = true,
+        /// `INFR_ATTN_DECODE_GQA`, TRI-state: the GQA-batched decode pass 1
+        /// (`attn_decode_gqa.comp`), which reads each K/V row once for all query heads sharing a
+        /// KV head instead of once per head. Not bit-identical to `attn_decode` (float summation
+        /// order). `None` = auto = off (measured slower than `attn_decode` on GFX8/Polaris,
+        /// the only hardware it has been tuned for; opt in per device with `=1`).
+        attn_decode_gqa: Option<bool> = None,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the
         /// `NO_` key) wins unconditionally; `Some(true)` bypasses the rows/kv_len heuristic;
         /// `None` lets the heuristic decide.

@@ -150,6 +150,9 @@ mrow = true
 # wave64 per workgroup with plain subgroup ops instead of emulated 32-lane halves).
 # Unset = auto (on for wave64-only devices, inert elsewhere).
 wave64_native = true
+# Bind decode-GEMV weights as storage buffers instead of 64-bit device addresses.
+# May help GPUs without a scalar-base global load (e.g. GFX8/Polaris). Default off.
+# weights_as_ssbo = false
 moe_small_m = 8 # clamped to 0..=64 by the accessor
 
 # Attention.

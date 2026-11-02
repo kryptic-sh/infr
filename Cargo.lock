@@ -1411,6 +1411,7 @@ dependencies = [
  "half",
  "indicatif",
  "infr-core",
+ "infr-cpu",
  "infr-gguf",
  "infr-plat",
  "infr-prof",

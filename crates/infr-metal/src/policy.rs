@@ -270,6 +270,7 @@ pub(crate) fn static_walk_live_positions(
             | Op::RmsNormAdd { .. }
             | Op::LayerNorm { .. }
             | Op::Linear { .. }
+            | Op::LinearExl3 { .. }
             | Op::Softmax { .. }
             | Op::QkNorm { .. }
             | Op::GatedRmsNorm { .. }

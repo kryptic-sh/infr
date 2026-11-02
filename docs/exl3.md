@@ -1,65 +1,91 @@
 # EXL3 checkpoints
 
-The Qwen2 CPU reference path accepts a local EXL3 `model.safetensors` with adjacent
-`config.json` and `tokenizer.json`. If present, `tokenizer_config.json` supplies
-the chat template. Hugging Face automatic model resolution still targets GGUF;
-download the EXL3 branch before passing its local weight path.
+Infr loads a local Qwen2 EXL3 `model.safetensors` with adjacent `config.json` and
+`tokenizer.json`; `tokenizer_config.json`, if present, supplies the chat template.
+Hugging Face auto-resolution still targets GGUF, so download the EXL3 branch first
+and pass the local weight path.
 
 ```sh
 INFR_DEV=cpu infr perplexity /path/to/model.safetensors -f corpus.txt -c 512 --chunks 2
 RUST_LOG=info cargo run -p infr-llama --release --example exl3_smoke -- /path/to/model-directory
 ```
 
-The initial checkpoint is `turboderp/Qwen2.5-7B-Instruct-exl3`, branch `4.0bpw`.
-Supported files have Qwen2 architecture metadata, separate embeddings and LM
-head, integer rates 1–8, and the default three-instruction codebook. `.mcg` and
-`.mul1` codebooks, fractional rates, custom RoPE scaling, sliding-window
-attention, and sharded checkpoints are rejected explicitly. Bit rate and
-codebook are independent: the test checkpoint uses the default codebook at
-4 bits for projections and 6 bits for the LM head.
+Test checkpoint: `turboderp/Qwen2.5-7B-Instruct-exl3`, branch `4.0bpw`
+(default codebook; 4-bit projections, 6-bit LM head).
 
-## CPU reference representation
+Supported: Qwen2 architecture, untied embeddings, integer rates 1–8, the default
+`3inst` codebook (cb0). Rejected with an explicit error: `.mcg`/`.mul1` codebooks,
+fractional rates, RoPE scaling, sliding-window attention, sharded checkpoints, and
+tied embeddings. Every released turboderp Qwen2.5-7B branch inspected (2/3/4 bpw)
+is cb0; rate and codebook are independent.
 
-The loader reconstructs each linear into row-major F16, including both
-orthonormal 128-element Hadamard transforms and input/output scales. HF Q/K row
-ordering is converted by the existing Qwen2 binder. Norm and bias vectors are
-widened to F32 to match all backend scalar-vector kernels; embeddings retain
-their F16 mmap representation. Loader-owned folds bypass the source's borrowed
-weight cache so resident CPU weights do not retain a second folded copy.
+## Execution
 
-This path validates model integration, not compressed-memory performance. A 7B
-model expands to approximately 14 GB of linear weights, in addition to
-embeddings, KV cache, and loader scratch. Native compressed GPU execution is a
-separate implementation, not provided by this reference representation.
+Projections stay compressed. `Exl3Source::open_native` exposes each linear as three
+weights — the raw I16 trellis, F16 `suh`, F16 `svh` — and the seam rewrites the
+matching `Op::Linear` into `Op::LinearExl3` after graph construction. Per row:
+
+```text
+xh = H128(x ⊙ suh)            input scale + orthonormal 128-point Hadamard
+z  = xh · D                   D decoded tile by tile from the trellis; never stored
+y  = scatter(H128(z) ⊙ svh)   output Hadamard + scale, then the Q/K rotary reorder
+```
+
+Q/K projections carry `Exl3OutputLayout::RopeInterleaved`, which reorders outputs
+from HF rotate-half order to the interleaved order the existing `Op::Rope` expects;
+biases are permuted by the existing binder. Norm and bias vectors are widened to F32
+at load; embeddings stay F16 mmap views.
+
+| backend | status |
+|---|---|
+| CPU | `infr_cpu::exl3_linear` streams 16×16 tiles into 8-row × 128-column accumulators; no expanded weight is allocated |
+| Vulkan | three dispatches: `exl3_hadamard_in`, `exl3_gemv` (m = 1) or `exl3_prefill` (8-row tiles), `exl3_hadamard_out`; trellis and scales are read by buffer device address |
+| Metal | not implemented; graphs containing `LinearExl3` are rejected |
+
+The Vulkan kernels are portable correctness-first implementations: no subgroup-size
+assumption, no cooperative matrix, no integer dot product. The codebook's half-precision
+sum is rounded to nearest-even with integer arithmetic because `packHalf2x16` rounding is
+implementation-defined (AMD rounds toward zero, which perturbed decoded weights by one
+half-precision ULP).
+
+`Exl3Source::open` keeps the earlier folded-F16 reference path for tests: it expands
+each linear to row-major F16 (about 14 GB for the 7B linears). Production loading no
+longer uses it.
+
+Disk paging and dense streaming need GGUF shard byte ranges and are unavailable for
+EXL3. Resident footprint is the raw trellis, scale, embedding, norm, and bias bytes.
 
 ## Validation
 
 ```sh
 cargo test -p infr-safetensors
+cargo test -p infr-core --lib exl3
+cargo test -p infr-cpu --lib exl3
 cargo test -p infr-cpu --test exl3_parity
 cargo test -p infr-llama --lib exl3_source
 cargo test -p infr-llama --lib perplexity_window
+cargo test --release -p infr-vulkan --test exl3_linear_parity -- --ignored   # needs a GPU
 ```
 
-Synthetic tests cover config/tensor validation, signed nonuniform scales,
-multiple 128-row output bands, all integer bit rates, folded versus unfused
-Hadamard forward execution, and batched versus fresh causal-prefix logits.
-The pre-existing trellis tests independently check bit extraction and CUDA
-fragment layouts against the pinned exllamav3 source.
+- Trellis bit extraction and CUDA fragment layouts are checked against the pinned
+  exllamav3 source; the tile permutation is checked as a bijection.
+- The CPU native projection matches a dense decode + Hadamard + scale reference at
+  every integer rate, with partial-rotary output scatter and tail batches.
+- Full synthetic Qwen2 logits from the native path match the folded reference, and
+  batched logits match fresh causal-prefix forwards.
+- The Vulkan projection matches the CPU kernel within `1e-4 × max|y|` for rates 1–8,
+  identity and rotary layouts, m ∈ {1, 2, 7, 8, 9, 17}, and the Qwen2.5-7B projection
+  shapes (3584×512, 3584×18944, 18944×3584, 3584×3584). Verified on an RX 580
+  (RADV Polaris).
 
 Perplexity scores the second half of each context window, excluding its final
-position. Two 512-token windows therefore score 510 targets, not 1,024.
-Windows retain their first corpus token for models that do not prepend BOS.
-An early Alice-in-Wonderland smoke score is not a quality gate: its boilerplate
-and famous opening may be memorized. Compare the same unfamiliar corpus,
-tokenizer, and scoring scheme against an upstream reference before claiming
-model-quality parity or an advantage over another quantization.
+position: two 512-token windows score 510 targets. Windows keep their first corpus
+token for models that do not prepend BOS. No perplexity result has been compared
+against an upstream exllamav3 reference yet, so none is a quality claim.
 
 ## Weight-source API migration
 
 `SeamModel::weights()` replaces the GGUF-specific accessor and returns
-`&dyn WeightSource`. Configuration, chat templates, and common tensor loading
-accept this trait. Format-specific paging and zero-copy GGUF views use
+`&dyn WeightSource`. Format-specific paging and zero-copy GGUF views use
 `weights.as_any().downcast_ref::<Gguf>()`; callers must handle non-GGUF sources.
-Custom `WeightSource` implementations must implement `as_any()` by returning
-`self`. Paging that requires GGUF shard byte ranges is unavailable for EXL3.
+Custom `WeightSource` implementations must implement `as_any()` by returning `self`.

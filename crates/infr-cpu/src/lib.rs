@@ -24,6 +24,7 @@ pub mod turbo;
 
 mod dequant_row;
 pub mod exl3;
+pub mod exl3_linear;
 mod kernels;
 mod moe;
 mod quant;
@@ -1396,6 +1397,30 @@ impl Backend for CpuBackend {
                         }
                     }
                     rc.set(&mut vals, dst.0 as usize, out);
+                }
+                Op::LinearExl3 {
+                    x,
+                    trellis,
+                    suh,
+                    svh,
+                    dst,
+                    m,
+                    spec,
+                } => {
+                    let buf = bindings
+                        .get(trellis)
+                        .ok_or_else(|| infr_core::Error::backend("exl3: unbound trellis"))?;
+                    let bytes = cpu_buf(buf).read();
+                    let (suh, svh) = (weight(suh), weight(svh));
+                    let out = exl3_linear::linear(
+                        &bytes,
+                        &suh,
+                        &svh,
+                        &vals[x.0 as usize],
+                        m as usize,
+                        spec,
+                    )?;
+                    vals[dst.0 as usize] = out;
                 }
                 Op::Linear {
                     x,

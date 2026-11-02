@@ -575,6 +575,7 @@ pub(super) fn alloc_dsv4_comp_bufs(
 pub(crate) struct SeamWeights {
     pub(super) wbufs: Vec<Box<dyn Buffer>>,
     pub(super) wspecs: Vec<(DType, usize)>,
+    pub(super) exl3_specs: std::collections::HashMap<usize, infr_core::Exl3Spec>,
     pub(super) rf_buf: Option<(Box<dyn Buffer>, usize)>,
     /// DeepSeek V2+ YaRN per-pair frequency divisors (`yarn_ff`), uploaded once like `rf_buf`.
     pub(super) yff_buf: Option<(Box<dyn Buffer>, usize)>,

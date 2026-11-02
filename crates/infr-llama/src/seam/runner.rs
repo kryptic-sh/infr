@@ -800,6 +800,7 @@ pub(crate) fn generate_dense_backend_bound(
             //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
             let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
             let mut wspecs: Vec<(DType, usize)> = Vec::new();
+            let mut exl3_specs = std::collections::HashMap::new();
             let mut layer_has_epb = vec![false; c.n_layer];
             // Load one weight (zero-copy mmap slice — no alloc, no memcpy) or CONCATENATE several into
             // one owned buffer (the combined gate+up upload; same dtype, row-major concat of [nff, ne]
@@ -846,6 +847,62 @@ pub(crate) fn generate_dense_backend_bound(
                 out
             };
             let mut wload = |names: &[&str]| -> AResult<()> {
+                anyhow::ensure!(!names.is_empty(), "weight load requires a tensor name");
+                // A native EXL3 projection stays compressed: its trellis + two scales upload as-is
+                // and the spec rides beside the handle, so the kernels fold it on read.
+                if let Some(source) = g.as_any().downcast_ref::<crate::Exl3Source>() {
+                    if names.iter().any(|name| source.native_spec(name).is_some()) {
+                        anyhow::ensure!(
+                            names.len() == 1,
+                            "exl3: compressed projections cannot be concatenated"
+                        );
+                        let mut spec = source
+                            .native_spec(names[0])
+                            .expect("native projection checked");
+                        if let Some(heads) = qk_perm_heads(names[0]) {
+                            spec.output_layout = infr_core::Exl3OutputLayout::RopeInterleaved {
+                                heads: u32::try_from(heads)?,
+                                head_dim: u32::try_from(c.head_dim)?,
+                                rotary_dim: u32::try_from(c.rope_dim)?,
+                            };
+                        }
+                        spec.trellis_bytes()?;
+                        exl3_specs.insert(wspecs.len(), spec);
+                        for name in [
+                            names[0].to_owned(),
+                            format!("{}.suh", names[0]),
+                            format!("{}.svh", names[0]),
+                        ] {
+                            let i = g
+                                .tensors()
+                                .iter()
+                                .find(|info| info.name == name)
+                                .ok_or_else(|| anyhow!("exl3: missing native component {name}"))?;
+                            let numel = i.shape.iter().product();
+                            let bytes = g.tensor_bytes(&name)?.to_vec();
+                            let (buf, dt) =
+                                bind_weight(&name, WBytes::Owned(bytes), i.dtype, numel)?;
+                            anyhow::ensure!(
+                                dt == i.dtype,
+                                "exl3: native component dtype was converted"
+                            );
+                            wbufs.push(buf);
+                            wspecs.push((dt, numel));
+                        }
+                        return Ok(());
+                    }
+                }
+                // Bytes for a weight this seam OWNS a copy of, whichever source it came from. A
+                // non-native EXL3 fold is taken fresh instead of through the borrow cache, so a
+                // folded model does not stay resident beside its own trellis.
+                let own_bytes = |name: &str| -> AResult<Vec<u8>> {
+                    if let Some(ex) = g.as_any().downcast_ref::<crate::Exl3Source>() {
+                        if let Some(bytes) = ex.take_fold(name)? {
+                            return Ok(bytes);
+                        }
+                    }
+                    Ok(g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?.to_vec())
+                };
                 // Found AND the shape the graph will index it as: a mismatch is refused here, naming
                 // both shapes, rather than read out of bounds by the first forward pass.
                 let info = |name: &str| {
@@ -883,9 +940,9 @@ pub(crate) fn generate_dense_backend_bound(
                             return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
                         }
                         numel += i.shape.iter().product::<usize>();
-                        let tb = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+                        let tb = own_bytes(name)?;
                         let f32v =
-                            crate::dequant_block(DType::I2S, tb).map_err(|e| anyhow!("{e}"))?;
+                            crate::dequant_block(DType::I2S, &tb).map_err(|e| anyhow!("{e}"))?;
                         let f16: Vec<u8> = f32v
                             .iter()
                             .flat_map(|&x| infr_gguf::dequant::f32_to_f16_sat(x).to_le_bytes())
@@ -918,20 +975,21 @@ pub(crate) fn generate_dense_backend_bound(
                             && (name.ends_with("attn_k_b.weight")
                                 || name.ends_with("attn_v_b.weight"))
                     {
-                        let tb = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+                        let tb = own_bytes(name)?;
                         let numel = i.shape.iter().product();
-                        let f32v = crate::dequant_block(i.dtype, tb).map_err(|e| anyhow!("{e}"))?;
+                        let f32v =
+                            crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
                         let bytes: Vec<u8> = f32v.iter().flat_map(|&x| x.to_le_bytes()).collect();
                         (WBytes::Owned(bytes), DType::F32, numel)
                     } else {
-                        let tb = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+                        let tb = own_bytes(name)?;
                         let numel = i.shape.iter().product();
                         match qk_perm_heads(name) {
                             Some(heads) => {
                                 let rb = row_bytes(name, i.dtype);
-                                (WBytes::Owned(permute_rows(tb, heads, rb)), i.dtype, numel)
+                                (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
                             }
-                            None => (WBytes::Owned(tb.to_vec()), i.dtype, numel),
+                            None => (WBytes::Owned(tb), i.dtype, numel),
                         }
                     }
                 } else {
@@ -961,14 +1019,14 @@ pub(crate) fn generate_dense_backend_bound(
                         None => {
                             let mut cat = Vec::new();
                             for name in names {
-                                let tb = g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?;
+                                let tb = own_bytes(name)?;
                                 match qk_perm_heads(name) {
                                     Some(heads) => cat.extend_from_slice(&permute_rows(
-                                        tb,
+                                        &tb,
                                         heads,
                                         row_bytes(name, dt),
                                     )),
-                                    None => cat.extend_from_slice(tb),
+                                    None => cat.extend_from_slice(&tb),
                                 }
                             }
                             (WBytes::Owned(cat), dt, numel)
@@ -1362,7 +1420,7 @@ pub(crate) fn generate_dense_backend_bound(
                 wbufs.push(b);
                 wspecs.push((DType::F32, c.hc_mult * ne));
             }
-            Some((wbufs, wspecs, layer_has_epb))
+            Some((wbufs, wspecs, exl3_specs, layer_has_epb))
         };
 
         // ── re-decide the context against what the device says is LEFT ───────────────────────
@@ -1449,7 +1507,7 @@ pub(crate) fn generate_dense_backend_bound(
             .alloc(4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
         let weights = match fresh {
-            Some((wbufs, wspecs, layer_has_epb)) => {
+            Some((wbufs, wspecs, exl3_specs, layer_has_epb)) => {
                 let rf_buf = match &stable.rope_freqs {
                     Some(rf) => {
                         let b = be
@@ -1475,6 +1533,7 @@ pub(crate) fn generate_dense_backend_bound(
                 std::sync::Arc::new(SeamWeights {
                     wbufs,
                     wspecs,
+                    exl3_specs,
                     rf_buf,
                     yff_buf,
                     layer_has_epb,
@@ -1562,6 +1621,7 @@ pub(crate) fn generate_dense_backend_bound(
     let SeamWeights {
         wbufs,
         wspecs,
+        exl3_specs,
         rf_buf,
         yff_buf,
         layer_has_epb,
@@ -2081,11 +2141,22 @@ pub(crate) fn generate_dense_backend_bound(
         // `wpush` records the handle in the flat `weights` list (for binding) and returns it.
         let mut weights: Vec<TensorId> = Vec::new();
         let mut wi = 0usize;
+        let mut exl3_handles = std::collections::HashMap::new();
         let mut wpush = |g: &mut Graph, weights: &mut Vec<TensorId>| -> TensorId {
+            let native = exl3_specs.get(&wi).copied();
             let (dt, n) = wspecs[wi];
             wi += 1;
             let id = g.weight(TensorDesc::new(vec![n], dt));
             weights.push(id);
+            if let Some(spec) = native {
+                let (dt, n) = wspecs[wi];
+                let suh = g.weight(TensorDesc::new(vec![n], dt));
+                let (dt, n) = wspecs[wi + 1];
+                let svh = g.weight(TensorDesc::new(vec![n], dt));
+                wi += 2;
+                weights.extend([suh, svh]);
+                exl3_handles.insert(id, (suh, svh, spec));
+            }
             id
         };
         let mut lw: Vec<LayerW> = Vec::new();
@@ -4941,6 +5012,37 @@ pub(crate) fn generate_dense_backend_bound(
         } else {
             (None, None, None)
         };
+        // A native EXL3 projection was declared as a plain Linear; rewrite it to the compressed op
+        // now that every handle exists.
+        for op in &mut g.ops {
+            if let Op::Linear {
+                x,
+                weight,
+                dst,
+                m,
+                in_f,
+                out_f,
+                w_off,
+            } = op
+            {
+                if let Some(&(suh, svh, spec)) = exl3_handles.get(weight) {
+                    assert_eq!(
+                        (*in_f, *out_f, *w_off),
+                        (spec.in_f, spec.out_f, 0),
+                        "exl3: graph projection geometry mismatch"
+                    );
+                    *op = Op::LinearExl3 {
+                        x: *x,
+                        trellis: *weight,
+                        suh,
+                        svh,
+                        dst: *dst,
+                        m: *m,
+                        spec,
+                    };
+                }
+            }
+        }
         (
             g,
             DecodeHandles {

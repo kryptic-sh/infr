@@ -1516,6 +1516,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::LayerNorm { .. } => "LayerNorm",
         Op::Softmax { .. } => "Softmax",
         Op::Linear { .. } => "Linear",
+        Op::LinearExl3 { .. } => "LinearExl3",
         Op::QkNorm { .. } => "QkNorm",
         Op::GatedRmsNorm { .. } => "GatedRmsNorm",
         Op::Rope { .. } => "Rope",
@@ -2977,6 +2978,11 @@ impl MetalBackend {
                     32,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::LinearExl3 { .. } => {
+                return Err(Error::Unsupported(
+                    "native EXL3 projections are not implemented on Metal".into(),
+                ));
             }
             Op::Linear {
                 x,

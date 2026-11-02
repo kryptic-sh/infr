@@ -7,6 +7,7 @@ members = [
     "crates/infr-metal",
     "crates/infr-hub",
     "crates/infr-gguf",
+    "crates/infr-safetensors",
     "crates/infr-cpu",
     "crates/infr-chat",
     "crates/infr-engine",
@@ -35,6 +36,7 @@ infr-vulkan = { path = "crates/infr-vulkan", version = "0.3.0" }
 infr-metal = { path = "crates/infr-metal", version = "0.3.0" }
 infr-hub = { path = "crates/infr-hub", version = "0.3.0" }
 infr-gguf = { path = "crates/infr-gguf", version = "0.3.0" }
+infr-safetensors = { path = "crates/infr-safetensors", version = "0.3.0" }
 infr-cpu = { path = "crates/infr-cpu", version = "0.3.0" }
 infr-chat = { path = "crates/infr-chat", version = "0.3.0" }
 infr-engine = { path = "crates/infr-engine", version = "0.3.0" }
@@ -42,6 +44,7 @@ infr-server = { path = "crates/infr-server", version = "0.3.0" }
 infr-llama = { path = "crates/infr-llama", version = "0.3.0" }
 infr-prof = { path = "crates/infr-prof", version = "0.3.0" }
 infr-prof-rt = { path = "crates/infr-prof-rt", version = "0.3.0" }
+
 # Test-support only — a `[dev-dependencies]` entry in the backends, never a production dep.
 infr-testkit = { path = "crates/infr-testkit" }
 

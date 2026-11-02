@@ -1,0 +1,20 @@
+[package]
+name = "infr-safetensors"
+description = "Zero-copy safetensors weight loader for the infr LLM inference engine (EXL3 and dense HF checkpoints)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+infr-prof.workspace = true
+infr-prof-rt.workspace = true
+infr-core.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

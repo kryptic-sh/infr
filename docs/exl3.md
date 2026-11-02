@@ -99,12 +99,15 @@ context 256, microbatch 64) measured:
 | Cached Google QAT Q4_0 GGUF | 41.48 |
 | Initial EXL3 4.0bpw kernel | 3.89 |
 | EXL3 with register-local accumulation and cheaper circular indexing | 5.21 |
+| One trellis lane per thread, 16 K-slices per workgroup | 12.04 |
 
-Before the cleanup, GPU timestamps attributed 96.5% of device time to EXL3 GEMV;
-both Hadamard passes together accounted for less than 1%. Removing the per-K-tile
-shared-memory round-trip and barriers improves throughput, but packed-window
-decoding and the narrow K-parallelism remain the next optimization targets. Lower
-stored bpw does not translate into higher throughput until this kernel is efficient.
+The decode GEMV gives each thread one 8-entry trellis lane, loaded once as a
+four-word register window, and splits K across 16 slices per 512-thread workgroup.
+Sweeping 4/8/16/32 slices measured 10.26/11.57/11.73/10.68 tok/s. GEMV still takes
+~89% of device time while streaming only ~32 GB/s, so it is ALU-bound: the 3INST
+decode costs roughly 25-30 VALU slots per weight on Polaris, which has no shader
+fp16. Matching Q4_0 needs about 15, independent of stored bpw, so lower bpw alone
+does not close the gap on GCN4.
 These timings compare the same architecture/QAT lineage, not bit-identical weights.
 
 ## Validation

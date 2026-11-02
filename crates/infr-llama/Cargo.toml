@@ -23,6 +23,8 @@ half.workspace = true
 bytemuck.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
+gemm.workspace = true
+image.workspace = true
 tracing.workspace = true
 tokenizers = { workspace = true }
 

@@ -187,6 +187,14 @@ CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
 as JSON — each model's backend, device, context per slot, slots and device
 memory. Both sit behind the API key when one is set.
 
+**Images (Gemma 4).** OpenAI `image_url` parts with a base64 `data:` URI (PNG/JPEG/GIF/WebP/BMP)
+are accepted on the Vulkan backend when a Gemma 4 vision projector is available — the first
+`mmproj*.gguf` beside the model (`infr pull unsloth/gemma-4-E4B-it-GGUF:mmproj-F16.gguf` puts it
+there), or `serve.mmproj` / `INFR_MMPROJ`. The vision encoder runs on the CPU (~1–3 s per image on
+an 8-core desktop, cached per image so follow-up turns don't pay it again); `serve.image_max_tokens`
+/ `INFR_IMAGE_MAX_TOKENS` (default 280, range 70–1120) trades detail for encode time. Remote image
+URLs are not fetched.
+
 `--temp` / `--top-k` / `--top-p` set the SERVER defaults (`--temp 0` = greedy);
 a per-request OpenAI `temperature`/`top_p` still overrides them. See
 [Configuration](#configuration).

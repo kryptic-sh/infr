@@ -3727,7 +3727,13 @@ fn e2b_ipl_rows(g: &dyn WeightSource, ple: &PerLayerEmbd, tokens: &[u32]) -> ARe
     out.par_chunks_mut(nl * npl)
         .zip(tokens.par_iter())
         .try_for_each(|(dst, &tok)| -> AResult<()> {
-            let tok = tok as usize;
+            // Image placeholder positions read the PAD row (id 0), as llama.cpp's gemma4 does for
+            // multimodal embeddings ([TAG_GEMMA4_IMG_PADDING]).
+            let tok = if crate::media::is_media_id(tok) {
+                0
+            } else {
+                tok as usize
+            };
             let r0 = tok * ple.tok_embd_row_bytes;
             let pl_tok = dequant_block(
                 ple.tok_embd_dtype,

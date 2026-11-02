@@ -42,9 +42,11 @@ pub use weights::{weight_footprint, WeightFootprint};
 /// depending on `infr-gguf` directly, and a watch is opened beside each model load.
 pub use infr_gguf::watch::WeightWatch;
 mod exl3_source;
+pub mod media;
 pub mod mtp;
 pub mod qwen4_exp;
 mod qwen4_exp_source;
+pub mod vision;
 pub(crate) use exl3_source::Exl3Source;
 mod quant;
 pub mod qwen35;

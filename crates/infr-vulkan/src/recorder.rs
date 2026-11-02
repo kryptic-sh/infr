@@ -1711,6 +1711,133 @@ impl<'a> Recorder<'a> {
     /// [`Self::linear_f32_at`]'s mrow/vec4 tile pick) — these weights are small, so the
     /// simple kernels are fine. (The old eager thread-per-output `linear_f32.comp` is deleted;
     /// see build.rs's note where its entry used to live.)
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_exl3(
+        &self,
+        trellis: &dyn Buffer,
+        suh: &dyn Buffer,
+        svh: &dyn Buffer,
+        x: &dyn Buffer,
+        xh: &dyn Buffer,
+        z: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: u32,
+        spec: infr_core::Exl3Spec,
+    ) -> Result<()> {
+        let bytes = spec.trellis_bytes()?;
+        let k = spec.in_f as usize;
+        let n = spec.out_f as usize;
+        let m = rows as usize;
+        let input = m
+            .checked_mul(k)
+            .filter(|v| *v <= u32::MAX as usize)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| be("exl3: input address overflow"))?;
+        let output = m
+            .checked_mul(n)
+            .filter(|v| *v <= u32::MAX as usize)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| be("exl3: output address overflow"))?;
+        if bytes / 4 > u32::MAX as usize
+            || trellis.len_bytes() < bytes
+            || suh.len_bytes() < k * 2
+            || svh.len_bytes() < n * 2
+            || x.len_bytes() < input
+            || xh.len_bytes() < input
+            || z.len_bytes() < output
+            || y.len_bytes() < output
+        {
+            return Err(be("exl3: projection buffer size mismatch"));
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        let addr = |b: &dyn Buffer| {
+            b.device_addr()
+                .ok_or_else(|| be("exl3: weight requires buffer device address"))
+        };
+        let packed = addr(trellis)?;
+        let in_scale = addr(suh)?;
+        let out_scale = addr(svh)?;
+        let push = |words: &[u32]| {
+            words
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<u8>>()
+        };
+        let kin = self
+            .be
+            .kernel("exl3_hadamard_in", crate::exl3::hadamard_in(), 2, 32);
+        let pin = push(&[
+            rows,
+            spec.in_f,
+            in_scale as u32,
+            (in_scale >> 32) as u32,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        self.dispatch_wide(
+            kin,
+            &[Self::vkb(x), Self::vkb(xh)],
+            1,
+            &pin,
+            rows * (spec.in_f / 128),
+        );
+        let batch = if rows == 1 { 1 } else { 8 };
+        let (name, spv) = if rows == 1 {
+            ("exl3_gemv", crate::exl3::gemv())
+        } else {
+            ("exl3_prefill", crate::exl3::prefill())
+        };
+        let dot = self.be.kernel(name, spv, 2, 24);
+        let pdot = push(&[
+            rows,
+            spec.in_f,
+            spec.out_f,
+            spec.bits,
+            packed as u32,
+            (packed >> 32) as u32,
+        ]);
+        self.dispatch_wide(
+            dot,
+            &[Self::vkb(xh), Self::vkb(z)],
+            1,
+            &pdot,
+            rows.div_ceil(batch) * (spec.out_f / 16),
+        );
+        let (interleaved, head_dim, rotary_dim) = match spec.output_layout {
+            infr_core::Exl3OutputLayout::Identity => (0, 0, 0),
+            infr_core::Exl3OutputLayout::RopeInterleaved {
+                head_dim,
+                rotary_dim,
+                ..
+            } => (1, head_dim, rotary_dim),
+        };
+        let kout = self
+            .be
+            .kernel("exl3_hadamard_out", crate::exl3::hadamard_out(), 2, 32);
+        let pout = push(&[
+            rows,
+            spec.out_f,
+            out_scale as u32,
+            (out_scale >> 32) as u32,
+            interleaved,
+            head_dim,
+            rotary_dim,
+            0,
+        ]);
+        self.dispatch_wide(
+            kout,
+            &[Self::vkb(z), Self::vkb(y)],
+            1,
+            &pout,
+            rows * (spec.out_f / 128),
+        );
+        Ok(())
+    }
+
     pub fn linear_f32(
         &self,
         w: &dyn Buffer,

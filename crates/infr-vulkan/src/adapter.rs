@@ -202,6 +202,7 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             // params-driven `_dyn` twin), so a replayed tape would select keys for the position it
             // was recorded at.
             Op::Mla { .. } | Op::LightningIndexer { .. } => return false,
+            Op::LinearExl3 { m, .. } if *m != 1 => return false,
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -1130,6 +1131,46 @@ fn lower_op(
         // GEMV (or f16 GEMV). Prefill (m>1) with a native-quant weight uses the TILED coopmat GEMM
         // `matmul_native` (decode each weight element ONCE, reuse across the 64-row tile) instead
         // of the GEMV (which re-reads every weight row per output row) — the prefill perf win.
+        Op::LinearExl3 {
+            x,
+            trellis,
+            suh,
+            svh,
+            dst,
+            m,
+            spec,
+        } => {
+            spec.trellis_bytes()?;
+            if graph.desc(*trellis).dtype != infr_core::DType::I16
+                || graph.desc(*suh).dtype != infr_core::DType::F16
+                || graph.desc(*svh).dtype != infr_core::DType::F16
+                || graph.desc(*x).dtype != infr_core::DType::F32
+                || graph.desc(*dst).dtype != infr_core::DType::F32
+            {
+                return Err(be("exl3: unsupported projection dtypes"));
+            }
+            let input_bytes = (*m as usize)
+                .checked_mul(spec.in_f as usize)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| be("exl3: input size overflow"))?;
+            let output_bytes = (*m as usize)
+                .checked_mul(spec.out_f as usize)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| be("exl3: output size overflow"))?;
+            let xh = pooled(pool, be_, "exl3_xh", input_bytes)?;
+            let z = pooled(pool, be_, "exl3_z", output_bytes)?;
+            rec.linear_exl3(
+                r(*trellis)?,
+                r(*suh)?,
+                r(*svh)?,
+                r(*x)?,
+                pool[&xh].as_ref(),
+                pool[&z].as_ref(),
+                r(*dst)?,
+                *m,
+                *spec,
+            )?;
+        }
         Op::Linear {
             x,
             weight,

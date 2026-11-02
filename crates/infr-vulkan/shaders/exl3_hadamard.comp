@@ -1,0 +1,47 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 128) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Scales { uint v[]; };
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) writeonly buffer YB { float y[]; };
+layout(push_constant) uniform PC {
+    uint rows; uint dim; uint scale_lo; uint scale_hi;
+    uint interleaved; uint head_dim; uint rotary_dim; uint pad;
+} pc;
+shared float h[128];
+
+void main() {
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * (pc.dim / 128u)) { return; }
+    uint t = gl_LocalInvocationID.x;
+    uint col = (unit % (pc.dim / 128u)) * 128u + t;
+    uint row = unit / (pc.dim / 128u);
+    uint64_t addr = (uint64_t(pc.scale_hi) << 32) | uint64_t(pc.scale_lo);
+    vec2 pair = unpackHalf2x16(Scales(addr).v[col >> 1]);
+    float scale = (col & 1u) == 0u ? pair.x : pair.y;
+    float v = x[row * pc.dim + col];
+#ifndef OUTPUT_TRANSFORM
+    v *= scale;
+#endif
+    h[t] = v;
+    barrier();
+    for (uint stride = 1u; stride < 128u; stride <<= 1u) {
+        float a = h[t];
+        float b = h[t ^ stride];
+        barrier();
+        h[t] = (t & stride) == 0u ? a + b : b - a;
+        barrier();
+    }
+    v = h[t] * 0.088388347648;
+#ifdef OUTPUT_TRANSFORM
+    v *= scale;
+    if (pc.interleaved != 0u) {
+        uint j = col % pc.head_dim;
+        uint half_rotary = pc.rotary_dim / 2u;
+        uint mapped = j < half_rotary ? 2u * j : (j < pc.rotary_dim ? 2u * (j - half_rotary) + 1u : j);
+        col = col - j + mapped;
+    }
+#endif
+    y[row * pc.dim + col] = v;
+}

@@ -54,9 +54,17 @@ pub(crate) fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbyte
 pub fn weight_footprint(g: &dyn WeightSource) -> WeightFootprint {
     let mut dense = 0u64;
     let mut expert = 0u64;
+    let raw_exl3 = g
+        .as_any()
+        .downcast_ref::<crate::Exl3Source>()
+        .is_some_and(|source| source.is_native());
     for t in g.tensors() {
         let numel: usize = t.shape.iter().product();
-        let bytes = tensor_resident_bytes(t.dtype, numel, t.nbytes);
+        let bytes = if raw_exl3 {
+            ((t.nbytes + 3) & !3) as u64
+        } else {
+            tensor_resident_bytes(t.dtype, numel, t.nbytes)
+        };
         if t.name.contains("_exps") {
             expert += bytes;
         } else {

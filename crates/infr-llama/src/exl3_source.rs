@@ -1,4 +1,4 @@
-//! Qwen2 EXL3 checkpoints exposed as folded F16 weights under GGUF tensor names.
+//! Qwen2 EXL3 checkpoint names with native trellis or folded reference projections.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -30,6 +30,7 @@ pub(crate) struct Exl3Source {
     linears: HashMap<String, LinearSpec>,
     passthrough: HashMap<String, DenseSpec>,
     chat_template: Option<String>,
+    native: bool,
 }
 
 fn find_hf<'a>(st: &'a infr_safetensors::Safetensors, name: &str) -> Result<&'a TensorInfo> {
@@ -178,6 +179,7 @@ impl Exl3Source {
             linears: HashMap::new(),
             passthrough: HashMap::new(),
             chat_template,
+            native: false,
         };
         source.add_dense(
             "token_embd.weight",
@@ -235,6 +237,67 @@ impl Exl3Source {
         }
         source.add_linear("output.weight", "lm_head", hidden, vocab)?;
         Ok(source)
+    }
+
+    pub(crate) fn open_native(path: &Path) -> Result<Self> {
+        let mut source = Self::open(path)?;
+        let mut scales = Vec::new();
+        for info in &mut source.infos {
+            let Some(linear) = source.linears.get(&info.name) else {
+                continue;
+            };
+            let spec = infr_core::Exl3Spec {
+                in_f: u32::try_from(linear.k)?,
+                out_f: u32::try_from(linear.n)?,
+                bits: linear.bits,
+                codebook: infr_core::Exl3Codebook::Cb0,
+                output_layout: infr_core::Exl3OutputLayout::Identity,
+            };
+            info.nbytes = spec.trellis_bytes()?;
+            info.dtype = DType::I16;
+            info.shape = vec![linear.k / 16, linear.n / 16, 16 * linear.bits as usize];
+            for (suffix, size) in [("suh", linear.k), ("svh", linear.n)] {
+                let bytes = source
+                    .st
+                    .tensor_bytes(&format!("{}.{suffix}", linear.hf_prefix))?;
+                ensure!(
+                    bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .all(|p| half::f16::from_le_bytes(*p).is_finite()),
+                    "exl3: {}.{suffix} contains non-finite scales",
+                    linear.hf_prefix
+                );
+                scales.push(TensorInfo {
+                    name: format!("{}.{suffix}", info.name),
+                    shape: vec![size],
+                    dtype: DType::F16,
+                    offset: 0,
+                    nbytes: size * 2,
+                });
+            }
+        }
+        source.infos.extend(scales);
+        source.native = true;
+        Ok(source)
+    }
+
+    pub(crate) fn native_spec(&self, name: &str) -> Option<infr_core::Exl3Spec> {
+        if !self.native {
+            return None;
+        }
+        self.linears.get(name).map(|linear| infr_core::Exl3Spec {
+            in_f: linear.k as u32,
+            out_f: linear.n as u32,
+            bits: linear.bits,
+            codebook: infr_core::Exl3Codebook::Cb0,
+            output_layout: infr_core::Exl3OutputLayout::Identity,
+        })
+    }
+
+    pub(crate) fn is_native(&self) -> bool {
+        self.native
     }
 
     fn add_dense(&mut self, name: &str, hf: &str, shape: &[usize]) -> Result<()> {
@@ -366,6 +429,10 @@ impl Exl3Source {
 
     // Loader-owned folds bypass the borrow cache to avoid retaining a second full model.
     pub(crate) fn take_fold(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        ensure!(
+            !self.native || !self.linears.contains_key(name),
+            "exl3: native projection cannot be folded"
+        );
         self.linears
             .get(name)
             .map(|spec| self.fold_uncached(spec))
@@ -460,6 +527,20 @@ impl WeightSource for Exl3Source {
         &self.infos
     }
     fn tensor_bytes(&self, name: &str) -> infr_core::error::Result<&[u8]> {
+        if self.native {
+            if let Some(spec) = self.linears.get(name) {
+                return self.st.tensor_bytes(&format!("{}.trellis", spec.hf_prefix));
+            }
+            if let Some((base, suffix)) = name.rsplit_once('.') {
+                if matches!(suffix, "suh" | "svh") {
+                    if let Some(spec) = self.linears.get(base) {
+                        return self
+                            .st
+                            .tensor_bytes(&format!("{}.{suffix}", spec.hf_prefix));
+                    }
+                }
+            }
+        }
         if let Some(spec) = self.linears.get(name) {
             return match spec
                 .cache

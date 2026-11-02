@@ -1,0 +1,78 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#ifndef B_ROWS
+#define B_ROWS 1
+#endif
+layout(local_size_x = 128) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Trellis { uint v[]; };
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) writeonly buffer YB { float y[]; };
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint bits;
+    uint trellis_lo; uint trellis_hi;
+} pc;
+shared float tile[256];
+shared float red[B_ROWS * 128];
+
+float weight_at(uint64_t addr, uint base, uint r, uint c) {
+    uint lane = 8u * ((c >> 1u) & 3u) + ((r & 7u) >> 1u) + 4u * (c & 1u);
+    uint entry = (r & 1u) + 2u * (r >> 3u) + 4u * (c >> 3u);
+    uint s = 8u * lane + entry;
+    uint b0 = s * pc.bits + pc.bits + 256u * pc.bits - 16u;
+    uint words = 8u * pc.bits;
+    uint wi = (b0 >> 5u) % words;
+    uint shift = b0 & 31u;
+    uint a = Trellis(addr).v[base + wi];
+    uint b = Trellis(addr).v[base + (wi + 1u) % words];
+    uint funnel = shift == 0u ? a : (a << shift) | (b >> (32u - shift));
+    uint h = (funnel >> 16u) * 89226354u + 64248484u;
+    h = (h & 0x8fff8fffu) ^ 0x3b603b60u;
+    vec2 halves = unpackHalf2x16(h);
+    // The f32 sum is exact; round it to f16 nearest-even (packHalf2x16 rounding is unspecified).
+    uint u = floatBitsToUint(halves.x + halves.y);
+    return uintBitsToFloat((u + 0xfffu + ((u >> 13u) & 1u)) & ~0x1fffu);
+}
+
+void main() {
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint n_tiles = pc.out_f / 16u;
+    if (unit >= ((pc.rows + B_ROWS - 1u) / B_ROWS) * n_tiles) { return; }
+    uint row0 = (unit / n_tiles) * B_ROWS;
+    uint out0 = (unit % n_tiles) * 16u;
+    uint t = gl_LocalInvocationID.x;
+    uint col = t & 15u;
+    uint p = t >> 4u;
+    uint64_t addr = (uint64_t(pc.trellis_hi) << 32) | uint64_t(pc.trellis_lo);
+    float acc[B_ROWS];
+    for (uint r = 0u; r < B_ROWS; ++r) { acc[r] = 0.0; }
+    for (uint ki = 0u; ki < pc.in_f / 16u; ++ki) {
+        uint base = (ki * n_tiles + out0 / 16u) * (8u * pc.bits);
+        tile[p * 16u + col] = weight_at(addr, base, p, col);
+        tile[(p + 8u) * 16u + col] = weight_at(addr, base, p + 8u, col);
+        barrier();
+        for (uint r = 0u; r < B_ROWS; ++r) {
+            if (row0 + r < pc.rows) {
+                uint xb = (row0 + r) * pc.in_f + ki * 16u;
+                acc[r] += x[xb + p] * tile[p * 16u + col];
+                acc[r] += x[xb + p + 8u] * tile[(p + 8u) * 16u + col];
+            }
+        }
+        barrier();
+    }
+    for (uint r = 0u; r < B_ROWS; ++r) { red[r * 128u + t] = acc[r]; }
+    barrier();
+    for (uint stride = 4u; stride > 0u; stride >>= 1u) {
+        if (p < stride) {
+            for (uint r = 0u; r < B_ROWS; ++r) {
+                red[r * 128u + t] += red[r * 128u + t + stride * 16u];
+            }
+        }
+        barrier();
+    }
+    if (p == 0u) {
+        for (uint r = 0u; r < B_ROWS; ++r) {
+            if (row0 + r < pc.rows) { y[(row0 + r) * pc.out_f + out0 + col] = red[r * 128u + t]; }
+        }
+    }
+}

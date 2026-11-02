@@ -1103,13 +1103,14 @@ pub(crate) fn native_gemm_kq_fma_spv(
     })
 }
 /// SPIR-V (kernel-cache name + words) for the fp32 K-quant decode GEMV (`native_gemv_kq_fma.comp`),
-/// with or without the fused residual add, at `nr` (4 or 8) rows per workgroup; `None` for dtypes
-/// without a build.
+/// with or without the fused residual add, at `nr` (4 or 8) rows per workgroup, reading the weight
+/// by device address or (`ssbo`) from binding 3; `None` for dtypes without a build.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemv_kq_fma_spv(
     dtype: infr_core::DType,
     res: bool,
     nr: usize,
+    ssbo: bool,
 ) -> Option<(&'static str, &'static [u32])> {
     macro_rules! spv {
         ($name:literal) => {{
@@ -1119,15 +1120,23 @@ pub(crate) fn native_gemv_kq_fma_spv(
         }};
     }
     use infr_core::DType::*;
-    Some(match (dtype, res, nr) {
-        (Q4K, false, 8) => spv!("native_gemv_kq_fma_q4k"),
-        (Q4K, true, 8) => spv!("native_gemv_kq_fma_q4k_res"),
-        (Q6K, false, 8) => spv!("native_gemv_kq_fma_q6k"),
-        (Q6K, true, 8) => spv!("native_gemv_kq_fma_q6k_res"),
-        (Q4K, false, 4) => spv!("native_gemv_kq_fma_q4k_nr4"),
-        (Q4K, true, 4) => spv!("native_gemv_kq_fma_q4k_res_nr4"),
-        (Q6K, false, 4) => spv!("native_gemv_kq_fma_q6k_nr4"),
-        (Q6K, true, 4) => spv!("native_gemv_kq_fma_q6k_res_nr4"),
+    Some(match (dtype, res, nr, ssbo) {
+        (Q4K, false, 8, false) => spv!("native_gemv_kq_fma_q4k"),
+        (Q4K, true, 8, false) => spv!("native_gemv_kq_fma_q4k_res"),
+        (Q6K, false, 8, false) => spv!("native_gemv_kq_fma_q6k"),
+        (Q6K, true, 8, false) => spv!("native_gemv_kq_fma_q6k_res"),
+        (Q4K, false, 4, false) => spv!("native_gemv_kq_fma_q4k_nr4"),
+        (Q4K, true, 4, false) => spv!("native_gemv_kq_fma_q4k_res_nr4"),
+        (Q6K, false, 4, false) => spv!("native_gemv_kq_fma_q6k_nr4"),
+        (Q6K, true, 4, false) => spv!("native_gemv_kq_fma_q6k_res_nr4"),
+        (Q4K, false, 8, true) => spv!("native_gemv_kq_fma_q4k_ssbo"),
+        (Q4K, true, 8, true) => spv!("native_gemv_kq_fma_q4k_res_ssbo"),
+        (Q6K, false, 8, true) => spv!("native_gemv_kq_fma_q6k_ssbo"),
+        (Q6K, true, 8, true) => spv!("native_gemv_kq_fma_q6k_res_ssbo"),
+        (Q4K, false, 4, true) => spv!("native_gemv_kq_fma_q4k_nr4_ssbo"),
+        (Q4K, true, 4, true) => spv!("native_gemv_kq_fma_q4k_res_nr4_ssbo"),
+        (Q6K, false, 4, true) => spv!("native_gemv_kq_fma_q6k_nr4_ssbo"),
+        (Q6K, true, 4, true) => spv!("native_gemv_kq_fma_q6k_res_nr4_ssbo"),
         _ => return None,
     })
 }

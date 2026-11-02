@@ -270,6 +270,12 @@ cfg_struct! {
         /// `subgroupClusteredAdd` (`shaders/wave64.glsl`). Default on; inert everywhere else
         /// (only wave64 devices select the SG=64 builds). A/B knob for the wave64 data point.
         wave64_native: bool = true,
+        /// `INFR_WEIGHTS_AS_SSBO`, `=0|1`: bind decode-GEMV weights as storage buffers instead of
+        /// reading them by 64-bit device address (`native_gemv_kq_fma` today). May help GPUs
+        /// without a scalar-base global load, e.g. GFX8/Polaris, where every device-address load
+        /// builds its own 64-bit address. Default off; tensors past `maxStorageBufferRange` keep
+        /// the device-address path.
+        weights_as_ssbo: bool = false,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
         /// this backwards disables the mmv tier for everyone.
         mmv: bool = true,

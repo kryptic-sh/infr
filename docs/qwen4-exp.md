@@ -80,7 +80,7 @@ network access. Set the path to a cached `model.safetensors` whose directory als
 contains the original `config.json`:
 
 ```sh
-INFR_QWEN4_EXP_TEST_MODEL=/path/to/model.safetensors \
+INFR_TEST_MODEL=/path/to/model.safetensors \
   cargo test -p infr-llama --lib cached_tiny_checkpoint_schema -- --ignored
 ```
 

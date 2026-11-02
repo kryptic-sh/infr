@@ -78,7 +78,10 @@ fn softcap_matches_host() {
             .unwrap();
         for i in 0..n {
             let want = 30.0 * (v[i] / 30.0).tanh();
-            assert!((got[i] - want).abs() <= 1e-4 * want.abs().max(1.0), "n {n} i {i}");
+            assert!(
+                (got[i] - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "n {n} i {i}"
+            );
         }
     }
 }
@@ -87,7 +90,10 @@ fn softcap_matches_host() {
 #[ignore = "requires a Vulkan GPU (perf micro-bench)"]
 fn logits_tail_time() {
     let be = VulkanBackend::new().unwrap();
-    let n: usize = std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(262144);
+    let n: usize = std::env::var("N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(262144);
     let v = logits(n, 5);
     let x = upload(&be, &v);
     let y = be.alloc(n * 4, BufferUsage::Activations).unwrap();

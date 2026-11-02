@@ -18,6 +18,14 @@ fn main() {
     gen_grids(&out);
     // (source stem, output stem, extra glslc defines)
     let builds: &[(&str, &str, &[&str])] = &[
+        ("exl3_hadamard", "exl3_hadamard_in", &[]),
+        (
+            "exl3_hadamard",
+            "exl3_hadamard_out",
+            &["-DOUTPUT_TRANSFORM"],
+        ),
+        ("exl3_dot", "exl3_gemv", &[]),
+        ("exl3_dot", "exl3_prefill", &["-DB_ROWS=8"]),
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
         ("gemm_warp", "gemm_warp", &[]),
         ("quant_q8", "quant_q8", &[]),

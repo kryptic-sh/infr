@@ -418,15 +418,24 @@ impl SeamModel {
         tokenizer_path: Option<&Path>,
         ecfg: std::sync::Arc<crate::EngineConfig>,
     ) -> Result<Self> {
-        // EXL3 is folded lazily by the weight binder; GGUF remains mmap-backed.
         let is_exl3 = gguf_path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
         let g: std::boxed::Box<dyn infr_core::WeightSource> = if is_exl3 {
-            std::boxed::Box::new(crate::Exl3Source::open(gguf_path)?)
+            std::boxed::Box::new(crate::Exl3Source::open_native(gguf_path)?)
         } else {
             std::boxed::Box::new(Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?)
         };
+        Self::from_source(g, is_exl3, gguf_path, tokenizer_path, ecfg)
+    }
+
+    pub(crate) fn from_source(
+        g: std::boxed::Box<dyn infr_core::WeightSource>,
+        is_exl3: bool,
+        gguf_path: &Path,
+        tokenizer_path: Option<&Path>,
+        ecfg: std::sync::Arc<crate::EngineConfig>,
+    ) -> Result<Self> {
         let mut cfg = Config::from_gguf(&*g)?;
         let tokenizer = match tokenizer_path {
             Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,

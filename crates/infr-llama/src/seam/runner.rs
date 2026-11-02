@@ -30,6 +30,10 @@ use infr_core::WeightSource;
 /// rationale.
 pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &dyn WeightSource, c: &Config) -> bool {
     combined_gu
+        && !g
+            .as_any()
+            .downcast_ref::<crate::Exl3Source>()
+            .is_some_and(|source| source.is_native())
         && (0..c.n_layer).all(|l| {
             let dt = |s: &str| {
                 let name = format!("blk.{l}.{s}");
@@ -627,6 +631,7 @@ pub(crate) fn generate_dense_backend(
         //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
         let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut wspecs: Vec<(DType, usize)> = Vec::new();
+        let mut exl3_specs = std::collections::HashMap::new();
         let mut layer_has_epb = vec![false; c.n_layer];
         // Load one weight (zero-copy mmap slice — no alloc, no memcpy) or CONCATENATE several into
         // one owned buffer (the combined gate+up upload; same dtype, row-major concat of [nff, ne]
@@ -673,6 +678,49 @@ pub(crate) fn generate_dense_backend(
             out
         };
         let mut wload = |names: &[&str]| -> AResult<()> {
+            anyhow::ensure!(!names.is_empty(), "weight load requires a tensor name");
+            if let Some(source) = g.as_any().downcast_ref::<crate::Exl3Source>() {
+                if names.iter().any(|name| source.native_spec(name).is_some()) {
+                    anyhow::ensure!(
+                        names.len() == 1,
+                        "exl3: compressed projections cannot be concatenated"
+                    );
+                    let mut spec = source
+                        .native_spec(names[0])
+                        .expect("native projection checked");
+                    if let Some(heads) = qk_perm_heads(names[0]) {
+                        spec.output_layout = infr_core::Exl3OutputLayout::RopeInterleaved {
+                            heads: u32::try_from(heads)?,
+                            head_dim: u32::try_from(c.head_dim)?,
+                            rotary_dim: u32::try_from(c.rope_dim)?,
+                        };
+                    }
+                    spec.trellis_bytes()?;
+                    exl3_specs.insert(wspecs.len(), spec);
+                    for name in [
+                        names[0].to_owned(),
+                        format!("{}.suh", names[0]),
+                        format!("{}.svh", names[0]),
+                    ] {
+                        let info = g
+                            .tensors()
+                            .iter()
+                            .find(|info| info.name == name)
+                            .ok_or_else(|| anyhow!("exl3: missing native component {name}"))?;
+                        let numel = info.shape.iter().product();
+                        let bytes = g.tensor_bytes(&name)?.to_vec();
+                        let (buf, dt) =
+                            bind_weight(&name, WBytes::Owned(bytes), info.dtype, numel)?;
+                        anyhow::ensure!(
+                            dt == info.dtype,
+                            "exl3: native component dtype was converted"
+                        );
+                        wbufs.push(buf);
+                        wspecs.push((dt, numel));
+                    }
+                    return Ok(());
+                }
+            }
             let info = |name: &str| {
                 g.tensors()
                     .iter()
@@ -1294,6 +1342,7 @@ pub(crate) fn generate_dense_backend(
             weights: std::sync::Arc::new(SeamWeights {
                 wbufs,
                 wspecs,
+                exl3_specs,
                 rf_buf,
                 yff_buf,
                 layer_has_epb,
@@ -1348,6 +1397,7 @@ pub(crate) fn generate_dense_backend(
     let SeamWeights {
         wbufs,
         wspecs,
+        exl3_specs,
         rf_buf,
         yff_buf,
         layer_has_epb,
@@ -1793,11 +1843,22 @@ pub(crate) fn generate_dense_backend(
         // `wpush` records the handle in the flat `weights` list (for binding) and returns it.
         let mut weights: Vec<TensorId> = Vec::new();
         let mut wi = 0usize;
+        let mut exl3_handles = std::collections::HashMap::new();
         let mut wpush = |g: &mut Graph, weights: &mut Vec<TensorId>| -> TensorId {
+            let native = exl3_specs.get(&wi).copied();
             let (dt, n) = wspecs[wi];
             wi += 1;
             let id = g.weight(TensorDesc::new(vec![n], dt));
             weights.push(id);
+            if let Some(spec) = native {
+                let (dt, n) = wspecs[wi];
+                let suh = g.weight(TensorDesc::new(vec![n], dt));
+                let (dt, n) = wspecs[wi + 1];
+                let svh = g.weight(TensorDesc::new(vec![n], dt));
+                wi += 2;
+                weights.extend([suh, svh]);
+                exl3_handles.insert(id, (suh, svh, spec));
+            }
             id
         };
         let mut lw: Vec<LayerW> = Vec::new();
@@ -4544,6 +4605,35 @@ pub(crate) fn generate_dense_backend(
         } else {
             (None, None, None)
         };
+        for op in &mut g.ops {
+            if let Op::Linear {
+                x,
+                weight,
+                dst,
+                m,
+                in_f,
+                out_f,
+                w_off,
+            } = op
+            {
+                if let Some(&(suh, svh, spec)) = exl3_handles.get(weight) {
+                    assert_eq!(
+                        (*in_f, *out_f, *w_off),
+                        (spec.in_f, spec.out_f, 0),
+                        "exl3: graph projection geometry mismatch"
+                    );
+                    *op = Op::LinearExl3 {
+                        x: *x,
+                        trellis: *weight,
+                        suh,
+                        svh,
+                        dst: *dst,
+                        m: *m,
+                        spec,
+                    };
+                }
+            }
+        }
         (
             g,
             DecodeHandles {

@@ -189,6 +189,16 @@ pub enum Op {
         /// its slices. Must be row-aligned (`w_off % in_f == 0`) and block-aligned for quants.
         w_off: u32,
     },
+    /// Native trellis projection with scale-Hadamard transforms on both sides.
+    LinearExl3 {
+        x: TensorId,
+        trellis: TensorId,
+        suh: TensorId,
+        svh: TensorId,
+        dst: TensorId,
+        m: u32,
+        spec: crate::Exl3Spec,
+    },
     /// Row-wise softmax: `dst[r, :] = softmax(x[r, :] * scale)` over `dim` columns, `rows` rows.
     /// diffusion-gemma's in-graph self-conditioning (see `docs/diffusion-gemma.md`'s Phase-B and
     /// the reference's `dg_canvas_embed`): softmaxes the previous step's canvas logits over the
@@ -1153,6 +1163,7 @@ impl Op {
             Op::LayerNorm { .. } => "LayerNorm",
             Op::Softmax { .. } => "Softmax",
             Op::Linear { .. } => "Linear",
+            Op::LinearExl3 { .. } => "LinearExl3",
             Op::QkNorm { .. } => "QkNorm",
             Op::GatedRmsNorm { .. } => "GatedRmsNorm",
             Op::Rope { .. } => "Rope",
@@ -1214,6 +1225,14 @@ impl Op {
                 (r, vec![dst])
             }
             Op::Linear { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
+            Op::LinearExl3 {
+                x,
+                trellis,
+                suh,
+                svh,
+                dst,
+                ..
+            } => (vec![x, trellis, suh, svh], vec![dst]),
             Op::QkNorm { x, weight, dst, .. } => {
                 let mut r = vec![x];
                 r.extend(weight);

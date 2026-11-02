@@ -12,6 +12,7 @@ pub mod config;
 pub mod decode_spec;
 pub mod error;
 pub mod exec;
+pub mod exl3;
 pub mod fusion;
 /// llama.cpp's `gguf-split` filename convention — shared by the hub (is the set complete?) and the
 /// GGUF loader (which files make up this model?).
@@ -39,6 +40,7 @@ pub use backend::{
     SUBMIT_BUDGET_NS, SUBMIT_DANGER_NS,
 };
 pub use error::{Error, Result};
+pub use exl3::{Exl3Codebook, Exl3OutputLayout, Exl3Spec};
 pub use graph::{Activation, AttnMask, Graph, Op, TensorDecl, TensorKind};
 pub use loader::{MetaValue, Metadata, TensorInfo, WeightSource};
 pub use pager::{BlockId, Pager, PagerStats, Resolution, NOT_RESIDENT};

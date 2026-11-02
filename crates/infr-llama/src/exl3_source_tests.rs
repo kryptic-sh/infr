@@ -101,6 +101,102 @@ impl Fixture {
 }
 
 #[test]
+fn native_source_exposes_only_compressed_projection_bytes_and_scales() {
+    let fixture = Fixture::new();
+    fixture.open().unwrap();
+    let source = Exl3Source::open_native(&fixture.dir.path().join("model.safetensors")).unwrap();
+    assert!(source.is_native());
+    let name = "blk.0.attn_q.weight";
+    let spec = source.native_spec(name).unwrap();
+    let info = source
+        .tensors()
+        .iter()
+        .find(|info| info.name == name)
+        .unwrap();
+    assert_eq!(info.dtype, DType::I16);
+    assert_eq!(info.shape, [8, 8, 64]);
+    assert_eq!(
+        source.tensor_bytes(name).unwrap().len(),
+        spec.trellis_bytes().unwrap()
+    );
+    assert_eq!(
+        source.tensor_bytes(&format!("{name}.suh")).unwrap().len(),
+        256
+    );
+    assert!(source.take_fold(name).is_err());
+    assert!(source
+        .linears
+        .values()
+        .all(|linear| linear.cache.get().is_none()));
+    let expected: u64 = source
+        .tensors()
+        .iter()
+        .map(|info| ((info.nbytes + 3) & !3) as u64)
+        .sum();
+    assert_eq!(crate::weights::weight_footprint(&source).total(), expected);
+}
+
+#[test]
+fn native_and_folded_reference_logits_agree() {
+    let mut fixture = Fixture::new();
+    let embed = fixture
+        .tensors
+        .iter_mut()
+        .find(|t| t.0 == "model.embed_tokens.weight")
+        .unwrap();
+    for (i, pair) in embed.3.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+        pair.copy_from_slice(&half::f16::from_f32((i as f32 * 0.11).cos() * 0.1).to_le_bytes());
+    }
+    for t in fixture
+        .tensors
+        .iter_mut()
+        .filter(|t| t.0.ends_with(".suh") || t.0.ends_with(".svh"))
+    {
+        for (i, pair) in t.3.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let v = (((i * 7) % 11) as f32 - 5.0) * 0.03;
+            pair.copy_from_slice(
+                &half::f16::from_f32(if v == 0.0 { 0.02 } else { v }).to_le_bytes(),
+            );
+        }
+    }
+    fixture.open().unwrap();
+    let path = fixture.dir.path().join("model.safetensors");
+    let ecfg = std::sync::Arc::new(crate::EngineConfig::default());
+    let native = crate::SeamModel::load_with(&path, None, ecfg.clone()).unwrap();
+    let folded = crate::SeamModel::from_source(
+        Box::new(Exl3Source::open(&path).unwrap()),
+        true,
+        &path,
+        None,
+        ecfg,
+    )
+    .unwrap();
+    let tokens = [3, 1, 4, 1, 5, 9, 2, 6, 5];
+    let (a, _) = native.verify_logits_and_h_cpu(&tokens).unwrap();
+    let (b, _) = folded.verify_logits_and_h_cpu(&tokens).unwrap();
+    let scale = b.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!(
+            (x - y).abs() <= scale * 0.01,
+            "logit {i}: native {x} vs folded {y}"
+        );
+    }
+}
+
+#[test]
+fn native_source_rejects_nonfinite_scales_before_binding() {
+    let mut fixture = Fixture::new();
+    let scale = fixture
+        .tensors
+        .iter_mut()
+        .find(|t| t.0 == "lm_head.svh")
+        .unwrap();
+    scale.3[..2].copy_from_slice(&half::f16::NAN.to_le_bytes());
+    fixture.open().unwrap();
+    assert!(Exl3Source::open_native(&fixture.dir.path().join("model.safetensors")).is_err());
+}
+
+#[test]
 fn maps_qwen_metadata_names_shapes_and_biases() {
     let source = Fixture::new().open().unwrap();
     let cfg = crate::Config::from_gguf(&source).unwrap();
@@ -274,6 +370,16 @@ fn synthetic_qwen_batched_logits_match_causal_prefix_forwards() {
     let (changed, _) = model.verify_logits_and_h_cpu(&[1, 2, 3, 19, 23]).unwrap();
     assert_eq!(&all[..3 * vocab], &changed[..3 * vocab]);
     assert_ne!(&all[4 * vocab..], &changed[4 * vocab..]);
+    let source = model
+        .weights()
+        .as_any()
+        .downcast_ref::<Exl3Source>()
+        .unwrap();
+    assert!(source.is_native());
+    assert!(source
+        .linears
+        .values()
+        .all(|linear| linear.cache.get().is_none()));
 }
 
 fn walsh_reference(x: &[f32]) -> Vec<f32> {

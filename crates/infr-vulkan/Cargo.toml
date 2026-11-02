@@ -41,3 +41,5 @@ memmap2.workspace = true
 # `*_matches_host` unit tests in `adapter.rs`).
 infr-testkit.workspace = true
 infr-plat.workspace = true
+# CPU reference for the native EXL3 projection parity test.
+infr-cpu.workspace = true

@@ -217,6 +217,10 @@ pub fn op_label(op: &Op, g: &Graph) -> String {
             out_f,
             ..
         } => format!("Linear m={m} {in_f}x{out_f} {:?}", g.desc(weight).dtype),
+        Op::LinearExl3 { m, spec, .. } => format!(
+            "LinearExl3 m={m} {}x{} cb0/{}",
+            spec.in_f, spec.out_f, spec.bits
+        ),
         Op::Attention {
             rows,
             kv_len,

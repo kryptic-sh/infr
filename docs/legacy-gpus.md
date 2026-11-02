@@ -15,6 +15,7 @@ to [kryptic-sh/infr](https://github.com/kryptic-sh/infr).
 | First-forward submit split | Slow discrete GPUs split even the first prefill into submits of 64 dispatches, so a long prompt can't trip the driver's hang watchdog. |
 | `kq_fma` prefill GEMM | An fp32 FMA GEMM for Q4_K/Q6_K/Q4_0 (`native_gemm_kq_fma.comp`) replaces the dp4a MMQ kernels, which are emulated in ALU on GCN. |
 | `kq_fma` decode GEMV | An fp32 Q4_K/Q6_K GEMV on f32 activations (`native_gemv_kq_fma.comp`) replaces `quant_q8` + the dp4a GEMV. |
+| `kq_fma` verify GEMV | An fp32 multi-row Q4_K/Q6_K GEMV (`native_gemv_kq_fma_mrow.comp`) for MTP-verify batches — MR=4 rows share each superblock's weight-word load, bit-identical row-for-row to the decode GEMV. Replaces the int8 `mrow` on verify batches, whose quantized activations flip near-tie greedy tokens vs decode. |
 | Float decode GEMVs | F32 weights use a multi-output GEMV (`linear_f32_mo.comp`); BF16 weights use the dedicated reduction GEMV. |
 
 All of these switch on automatically when the device does not report int8 dot
@@ -49,6 +50,14 @@ Q4_K_M, tokens/s. llama.cpp numbers are its Vulkan backend on the same card.
 | Gemma 4 E4B QAT Q4_0 | 146 | 340 | 343 | 37.2 | 42.6 |
 
 Gemma 4 E4B decode at 4k context: 29.6 → 36.5 t/s.
+
+MTP-verify shapes (RX 580, effective weight-stream GB/s, m = drafts+1): the verify
+kernel ties the int8 `mrow` it replaces on big weights (down-proj Q4_K m=7: 39 vs 49)
+and beats it on small ones (lm_head m=2: 89 vs 77), while crushing the f32-dequant
+`mrow` that serves small weights (2–3.5×). The property that matters is exactness:
+verify-flagged graphs score rel ~2e-7 vs the host oracle (pure f32 reassociation
+noise), where the int8 path scores ~4e-3 — the noise that flipped greedy tokens
+and collapsed draft acceptance.
 
 ## Status and plans
 

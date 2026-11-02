@@ -3172,6 +3172,68 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Multi-row K-quant GEMV on f32 activations (`native_gemv_kq_fma_mrow.comp`): `y = x·Wᵀ`
+    /// for `rows` input rows, MR=4 rows per workgroup sharing each superblock's weight-word
+    /// load — the MTP-verify shape on the emulated-dot tier, where decode runs
+    /// [`Self::linear_kq_fma`]. Per-row float op order matches the m=1 kernel exactly
+    /// (bit-identical row-for-row — see the shader header). No fused-residual build: nothing
+    /// fuses above m=1. Q4_K/Q6_K, `in_f % 256 == 0`, `w_base % 256 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_kq_fma_mrow(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
+        let nr = self.kq_fma_gemv_rows(out_f);
+        self.linear_kq_fma_mrow_nr(dtype, w, w_base, x, y, rows, in_f, out_f, nr);
+    }
+
+    /// [`Self::linear_kq_fma_mrow`] at an explicit `nr` (4 or 8) output columns per workgroup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_kq_fma_mrow_nr(
+        &self,
+        dtype: infr_core::DType,
+        w: &dyn Buffer,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+        nr: usize,
+    ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: linear_kq_fma_mrow requires a u64 BDA device address");
+        let (name, spv) = crate::gemm::native_gemv_kq_fma_mrow_spv(dtype, nr)
+            .expect("linear_kq_fma_mrow: dtype/nr gated by native_gemv_kq_fma_mrow_spv");
+        debug_assert!(in_f.is_multiple_of(256) && w_base.is_multiple_of(256));
+        self.label_gemv(name, rows, in_f, out_f);
+        let kern = self.be.kernel(name, spv, 2, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
+        let tiles = out_f.div_ceil(nr) as u32;
+        let groups = rows.div_ceil(4) as u32;
+        self.dispatch_wide(
+            kern,
+            &[Self::vkb(x), Self::vkb(y)],
+            1,
+            &push,
+            tiles * groups,
+        );
+    }
+
     /// Arena-addressed body of [`Self::matmul_kq_fma`] at column tile `bn` (64 or 128).
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_kq_fma_at(

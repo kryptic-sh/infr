@@ -41,7 +41,9 @@ pub use weights::{weight_footprint, WeightFootprint};
 /// Re-exported here because the CLI reaches every GGUF concern through this crate rather than
 /// depending on `infr-gguf` directly, and a watch is opened beside each model load.
 pub use infr_gguf::watch::WeightWatch;
+mod exl3_source;
 pub mod mtp;
+pub(crate) use exl3_source::Exl3Source;
 mod quant;
 pub mod qwen35;
 mod tokenizer;

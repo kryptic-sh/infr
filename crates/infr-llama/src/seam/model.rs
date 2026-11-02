@@ -64,11 +64,12 @@ pub struct BenchPlacement {
 /// A **GPU-free** model for the CPU reference backend. Holds only what the agnostic CPU compute
 /// graph needs — the parsed [`Config`], the host f32 token embeddings (for the gather + tied lm
 /// head), the tokenizer, and the gemma4 E2B per-layer-embd tensors. No `VulkanBackend`, no VRAM,
-/// no weight upload: the projection weights are streamed straight from the kept-open GGUF mmap at
-/// forward time. Dense Qwen3/Llama, Gemma 3, Gemma 4 (dense + E2B), qwen3moe, and qwen35
+/// no weight upload: the projection weights are streamed straight from the kept-open weight
+/// source at forward time (a GGUF mmap, or an EXL3 safetensors with folded-F16 linears).
+/// Dense Qwen3/Llama, Gemma 3, Gemma 4 (dense + E2B), qwen3moe, and qwen35
 /// (`MixerW::DeltaNet`) all drive this same struct.
 pub struct SeamModel {
-    gguf: Gguf,
+    weights: std::boxed::Box<dyn infr_core::WeightSource>,
     path: std::path::PathBuf,
     cfg: Config,
     /// The ENGINE configuration every seam path this model drives reads its knobs from —
@@ -417,19 +418,34 @@ impl SeamModel {
         tokenizer_path: Option<&Path>,
         ecfg: std::sync::Arc<crate::EngineConfig>,
     ) -> Result<Self> {
-        let g = Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?;
-        let mut cfg = Config::from_gguf(&g)?;
+        // EXL3 is folded lazily by the weight binder; GGUF remains mmap-backed.
+        let is_exl3 = gguf_path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+        let g: std::boxed::Box<dyn infr_core::WeightSource> = if is_exl3 {
+            std::boxed::Box::new(crate::Exl3Source::open(gguf_path)?)
+        } else {
+            std::boxed::Box::new(Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?)
+        };
+        let mut cfg = Config::from_gguf(&*g)?;
         let tokenizer = match tokenizer_path {
             Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,
-            None => build_tokenizer(&g)?,
+            None if is_exl3 => Tokenizer::from_file(
+                gguf_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("tokenizer.json"),
+            )
+            .map_err(|e| anyhow!("load adjacent EXL3 tokenizer.json: {e}"))?,
+            None => build_tokenizer(&*g)?,
         };
         add_chat_eos(&mut cfg, &tokenizer);
         // `token_embd.weight` is NOT dequantized here — see the field's doc. `Config::from_gguf`
         // above already read its shape, so a model missing the tensor still fails at load, not on
         // the lazy path below.
-        let per_layer_embd = build_per_layer_embd(&g, &cfg)?;
+        let per_layer_embd = build_per_layer_embd(&*g, &cfg)?;
         Ok(Self {
-            gguf: g,
+            weights: g,
             path: gguf_path.to_path_buf(),
             cfg,
             ecfg,
@@ -457,7 +473,7 @@ impl SeamModel {
     fn footprint(&self) -> crate::weights::WeightFootprint {
         *self
             .footprint
-            .get_or_init(|| crate::weights::weight_footprint(&self.gguf))
+            .get_or_init(|| crate::weights::weight_footprint(&*self.weights))
     }
 
     /// Open a persistent Vulkan seam session: weights uploaded ONCE, the KV cache sized to
@@ -864,7 +880,7 @@ impl SeamModel {
         let _scope = crate::seam::PlacementScope::enter(session.pins().clone());
         let (_generated, stats) = crate::seam::generate_dense_vulkan_session(
             &session.be,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &session.cfg,
             self.embd(),
@@ -891,10 +907,11 @@ impl SeamModel {
         &self.cfg
     }
 
-    /// The open GGUF handle — MTP Phase 2 (issue #33) needs it to resolve/upload the head's own
-    /// tensors (`crate::mtp::load_mtp_head` / `MtpHeadSession::new_cpu`/`new_vulkan`).
-    pub fn gguf(&self) -> &Gguf {
-        &self.gguf
+    /// The open weight source — GGUF for converted models, folded-F16 EXL3 for safetensors.
+    /// MTP Phase 2 (issue #33) needs it to resolve/upload the head's own tensors
+    /// (`crate::mtp::load_mtp_head` / `MtpHeadSession::new_cpu`/`new_vulkan`).
+    pub fn weights(&self) -> &dyn infr_core::WeightSource {
+        &*self.weights
     }
 
     /// The host f32 token-embedding table (`token_embd.weight`), dequantized ONCE on first call
@@ -914,7 +931,7 @@ impl SeamModel {
     /// table on: the GPU/Metal dense runners never read it, so handing them the handle (rather
     /// than a materialized slice) keeps the ~4s / ~3.1 GiB dequant off the GPU load path.
     pub(crate) fn embd(&self) -> crate::seam::TokenEmbd<'_> {
-        crate::seam::TokenEmbd::new(&self.token_embd, &self.gguf)
+        crate::seam::TokenEmbd::new(&self.token_embd, &*self.weights)
     }
 
     /// Tokenize raw text with the model's own tokenizer (no chat template) — for callers that
@@ -1020,7 +1037,7 @@ impl SeamModel {
     /// caller today (see `docs/diffusion-gemma.md`).
     pub fn prefill_logits_cpu(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         crate::seam::verify_dense_cpu(
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1035,7 +1052,7 @@ impl SeamModel {
     /// needs, validated here via `lm_head(h) == logits`. Returns `(logits, h)`.
     pub fn prefill_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
         crate::seam::verify_dense_cpu_with_h(
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1051,7 +1068,7 @@ impl SeamModel {
     /// Dense non-MoE models only. Returns `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
     pub fn verify_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
         crate::seam::verify_rows_cpu_with_h(
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1063,26 +1080,15 @@ impl SeamModel {
     /// Tokenize `text` for perplexity scoring the way `llama-perplexity` does: the model's BOS is
     /// prepended when the GGUF asks for one (`tokenizer.ggml.add_bos_token`).
     pub fn perplexity_tokens(&self, text: &str) -> Result<Vec<u32>> {
-        use infr_core::loader::MetaValue;
-        use infr_core::WeightSource;
-        let md = self.gguf.metadata();
-        let bos = md.u64("tokenizer.ggml.bos_token_id");
-        let add_bos = match md.get("tokenizer.ggml.add_bos_token") {
-            Some(MetaValue::Bool(b)) => *b,
-            _ => md.str("tokenizer.ggml.model") == Some("llama"),
-        };
         let mut ids = Vec::new();
-        if let (true, Some(b)) = (add_bos, bos) {
-            ids.push(b as u32);
+        if let Some(bos) = perplexity_bos(self.weights.metadata()) {
+            ids.push(bos);
         }
         ids.extend(self.encode(text)?);
         Ok(ids)
     }
 
-    /// Perplexity of `tokens` in `llama-perplexity`'s own scheme: consecutive windows of `n_ctx`
-    /// tokens, each led by `tokens[0]` (the BOS) in place of its first token, scoring only the
-    /// second half of every window. `max_chunks` caps the window count; `on_chunk(i, n, ppl)`
-    /// reports the running perplexity after each window. `cpu` forces the CPU reference backend.
+    /// Score consecutive windows' second halves, replacing the first token only for BOS models.
     pub fn perplexity(
         &self,
         tokens: &[u32],
@@ -1121,7 +1127,12 @@ impl SeamModel {
         let cpu_bind = crate::seam::cpu_upload_bind(&cpu_be);
         let vk_bind = match &vk {
             Some(vk) => Some(crate::seam::vulkan_moe_binder(
-                vk, &self.gguf, &self.cfg, &self.ecfg, true, want_ctx,
+                vk,
+                &*self.weights,
+                &self.cfg,
+                &self.ecfg,
+                true,
+                want_ctx,
             )?),
             None => None,
         };
@@ -1131,9 +1142,9 @@ impl SeamModel {
         };
         let mut state: Option<crate::seam::SeamKv> = None;
         let mut report = PplReport::default();
+        let bos = perplexity_bos(self.weights.metadata()).filter(|&bos| tokens[0] == bos);
         for chunk in 0..n_chunks {
-            let mut window = tokens[chunk * n_ctx..(chunk + 1) * n_ctx].to_vec();
-            window[0] = tokens[0];
+            let window = perplexity_window(tokens, chunk, n_ctx, bos);
             if let Some(st) = state.as_mut() {
                 st.reset();
             }
@@ -1144,7 +1155,7 @@ impl SeamModel {
                 let logits = crate::seam::window_logits_rows(
                     be,
                     bind,
-                    &self.gguf,
+                    &*self.weights,
                     &self.cfg,
                     &self.ecfg,
                     self.embd(),
@@ -1192,7 +1203,7 @@ impl SeamModel {
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         crate::seam::verify_dense_vulkan(
             &vk,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1258,7 +1269,7 @@ impl SeamModel {
     pub fn bench(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
         let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
         let (_, stats) = crate::seam::generate_dense_cpu(
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1282,7 +1293,7 @@ impl SeamModel {
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan(
             &vk,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1314,7 +1325,7 @@ impl SeamModel {
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan(
             &vk,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1339,7 +1350,7 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_pipeline(
             devices,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1364,7 +1375,7 @@ impl SeamModel {
     ) -> Result<Vec<u32>> {
         let (generated, _stats) = crate::seam::generate_dense_vulkan_pipeline(
             devices,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1390,7 +1401,7 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_tp(
             devices,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1415,7 +1426,7 @@ impl SeamModel {
     ) -> Result<Vec<u32>> {
         let (generated, _stats) = crate::seam::generate_dense_vulkan_tp(
             devices,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1441,7 +1452,7 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_moe_vulkan_ep(
             devices,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1466,7 +1477,7 @@ impl SeamModel {
     ) -> Result<Vec<u32>> {
         let (generated, _stats) = crate::seam::generate_moe_vulkan_ep(
             devices,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1507,7 +1518,7 @@ impl SeamModel {
          -> Result<crate::GenStats> {
             let (_, stats) = crate::seam::generate_dense_vulkan_session(
                 &vk,
-                &self.gguf,
+                &*self.weights,
                 &self.cfg,
                 &self.ecfg,
                 self.embd(),
@@ -1670,7 +1681,7 @@ impl SeamModel {
             .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
         let (_generated, stats) = crate::seam::generate_dense_metal_session(
             &session.be,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &session.cfg,
             self.embd(),
@@ -1705,7 +1716,7 @@ impl SeamModel {
         let mut printed = 0usize;
         let (_generated, stats) = crate::seam::generate_dense_metal(
             &mtl,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1783,7 +1794,7 @@ impl SeamModel {
         let mut printed = 0usize;
         let (first, _stats) = crate::seam::generate_dense_metal_session(
             &session.be,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &session.cfg,
             self.embd(),
@@ -1866,7 +1877,7 @@ impl SeamModel {
             let tv = std::time::Instant::now();
             let (logits, vstats) = crate::seam::verify_dense_metal2(
                 &session.be,
-                &self.gguf,
+                &*self.weights,
                 &self.cfg,
                 &session.cfg,
                 self.embd(),
@@ -1955,7 +1966,7 @@ impl SeamModel {
         let _profile_guard = (!profile).then(|| session.be.suppress_profiling());
         let (_, stats) = crate::seam::generate_dense_metal_session(
             &session.be,
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &session.cfg,
             self.embd(),
@@ -1975,8 +1986,14 @@ impl SeamModel {
     /// Qwen, … — answers coherently). Errors if the GGUF has no `tokenizer.chat_template` or it fails
     /// to render — infr only supports models that ship one (no fabricated-ChatML fallback).
     pub fn render_chat(&self, user: &str) -> Result<String> {
-        render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user, &self.ecfg)
-            .ok_or_else(no_template_err)
+        render_chat_user(
+            &*self.weights,
+            &self.tokenizer,
+            self.cfg.eos,
+            user,
+            &self.ecfg,
+        )
+        .ok_or_else(no_template_err)
     }
 
     /// Render a multi-turn conversation `(role, content)` through the model's OWN embedded chat
@@ -1985,7 +2002,7 @@ impl SeamModel {
     /// [`render_chat`](Self::render_chat), generalized past a single user turn.
     pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
         render_chat_jinja(
-            &self.gguf,
+            &*self.weights,
             &self.tokenizer,
             self.cfg.eos,
             messages,
@@ -2025,7 +2042,7 @@ impl SeamModel {
         let mut printed = 0usize;
         let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
             infr_cpu::CpuBackend::new_with(self.ecfg.clone()),
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -2057,7 +2074,7 @@ impl SeamModel {
         let mut printed = 0usize;
         let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
             infr_cpu::CpuBackend::reference_with(self.ecfg.clone()),
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -2082,7 +2099,7 @@ impl SeamModel {
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
         let (generated, _stats) = crate::seam::generate_dense_cpu(
-            &self.gguf,
+            &*self.weights,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -2138,7 +2155,7 @@ impl DiffusionGemmaCpuSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &model.gguf,
+            &*model.weights,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2179,7 +2196,7 @@ impl DiffusionGemmaCpuSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &model.gguf,
+            &*model.weights,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2220,7 +2237,7 @@ impl DiffusionGemmaVulkanSession {
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         let bind = crate::seam::vulkan_moe_binder(
             &self.be,
-            &model.gguf,
+            &*model.weights,
             &model.cfg,
             &model.ecfg,
             self.state.is_none(),
@@ -2229,7 +2246,7 @@ impl DiffusionGemmaVulkanSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &model.gguf,
+            &*model.weights,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2280,7 +2297,7 @@ impl DiffusionGemmaVulkanSession {
         // make the same placement decision prefill would have.
         let bind = crate::seam::vulkan_moe_binder(
             &self.be,
-            &model.gguf,
+            &*model.weights,
             &model.cfg,
             &model.ecfg,
             self.state.is_none(),
@@ -2289,7 +2306,7 @@ impl DiffusionGemmaVulkanSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &model.gguf,
+            &*model.weights,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2338,7 +2355,7 @@ impl DiffusionGemmaMetalSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &model.gguf,
+            &*model.weights,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2373,7 +2390,7 @@ impl DiffusionGemmaMetalSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &model.gguf,
+            &*model.weights,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2524,6 +2541,60 @@ pub(crate) fn spec_accept_stochastic(
     // Every candidate accepted: sample the bonus token from the target's own distribution.
     let bonus = crate::sampling::sample_from_dist(&p_dists[cand.len()], rng);
     (cand.len(), bonus)
+}
+
+fn perplexity_bos(md: &infr_core::loader::Metadata) -> Option<u32> {
+    use infr_core::loader::MetaValue;
+    let add = match md.get("tokenizer.ggml.add_bos_token") {
+        Some(MetaValue::Bool(b)) => *b,
+        _ => md.str("tokenizer.ggml.model") == Some("llama"),
+    };
+    add.then(|| {
+        md.u64("tokenizer.ggml.bos_token_id")
+            .and_then(|n| u32::try_from(n).ok())
+    })
+    .flatten()
+}
+
+fn perplexity_window(tokens: &[u32], chunk: usize, n_ctx: usize, bos: Option<u32>) -> Vec<u32> {
+    let mut window = tokens[chunk * n_ctx..(chunk + 1) * n_ctx].to_vec();
+    if let Some(bos) = bos {
+        window[0] = bos;
+    }
+    window
+}
+
+#[cfg(test)]
+mod perplexity_window_tests {
+    use super::*;
+
+    #[test]
+    fn no_bos_preserves_later_windows_first_tokens() {
+        let tokens = [11, 12, 13, 14, 21, 22, 23, 24];
+        assert_eq!(perplexity_window(&tokens, 1, 4, None), [21, 22, 23, 24]);
+        assert_eq!(perplexity_window(&tokens, 0, 4, None), [11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn bos_models_replace_only_the_windows_prefix() {
+        let tokens = [1, 12, 13, 14, 21, 22, 23, 24];
+        assert_eq!(perplexity_window(&tokens, 1, 4, Some(1)), [1, 22, 23, 24]);
+        let mut md = infr_core::loader::Metadata::default();
+        md.kv.insert(
+            "tokenizer.ggml.bos_token_id".into(),
+            infr_core::loader::MetaValue::U64(1),
+        );
+        md.kv.insert(
+            "tokenizer.ggml.add_bos_token".into(),
+            infr_core::loader::MetaValue::Bool(false),
+        );
+        assert_eq!(perplexity_bos(&md), None);
+        md.kv.insert(
+            "tokenizer.ggml.add_bos_token".into(),
+            infr_core::loader::MetaValue::Bool(true),
+        );
+        assert_eq!(perplexity_bos(&md), Some(1));
+    }
 }
 
 #[cfg(test)]

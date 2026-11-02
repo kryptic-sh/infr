@@ -3,7 +3,6 @@
 //! so all existing `crate::dequant_block` / `crate::rdf16` call-sites continue to work.
 use anyhow::{anyhow, Context, Result};
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
 
 // Re-export from infr_gguf::dequant so existing callers inside infr-llama resolve via `crate::`.
 pub(crate) use infr_gguf::dequant::dequant_block;
@@ -16,7 +15,10 @@ pub(crate) use infr_gguf::dequant::dequant_block;
 /// and SSM recurrence math (qwen35), the `Q35_CPU=1` oracle, and serves as the f32 source we
 /// convert into f16/bf16/quant GPU weights. Survives even with full GPU format coverage.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn load_tensor_dequant(g: &Gguf, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+pub(crate) fn load_tensor_dequant(
+    g: &dyn WeightSource,
+    name: &str,
+) -> Result<(Vec<f32>, Vec<usize>)> {
     let info = g
         .tensors()
         .iter()

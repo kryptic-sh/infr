@@ -848,11 +848,12 @@ fn publish_profile_out(cfg: &Config) {
 /// gate that keeps `resolve` from treating a cwd entry that merely collides with an `org/repo` ref
 /// as the model, and from sending a typo'd local path to a confusing network pull. Split out so the
 /// classification is unit-testable without the network.
+/// An existing local GGUF or EXL3 safetensors weight file.
 fn is_local_gguf(path: &Path) -> bool {
     path.is_file()
-        && path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        && path.extension().is_some_and(|e| {
+            e.eq_ignore_ascii_case("gguf") || e.eq_ignore_ascii_case("safetensors")
+        })
 }
 
 /// Resolve a model arg to (gguf_path, optional tokenizer_json_path).
@@ -872,13 +873,13 @@ fn resolve(model: &str, cfg: &Config) -> anyhow::Result<(PathBuf, Option<PathBuf
             Ok(r) => infr_hub::ensure(&r, cfg).map_err(|e| anyhow!("{e}"))?,
             Err(e) if p.exists() => {
                 anyhow::bail!(
-                    "`{model}` exists but is not a `.gguf` file — pass a path to a `.gguf`, or an \
-                     `org/repo[:quant]` HuggingFace ref ({e})"
+                    "`{model}` exists but is not a weight file — pass a path to a `.gguf` or an \
+                     EXL3 `.safetensors`, or an `org/repo[:quant]` HuggingFace ref ({e})"
                 );
             }
             Err(e) => {
                 anyhow::bail!(
-                    "`{model}` is not a `.gguf` file and not a valid `org/repo[:quant]` ref ({e})"
+                    "`{model}` is not a weight file and not a valid `org/repo[:quant]` ref ({e})"
                 );
             }
         }
@@ -2262,7 +2263,7 @@ fn bench_mtp_tg(
     reps: usize,
     cfg: &Config,
 ) -> anyhow::Result<MtpBenchStats> {
-    let head = infr_llama::mtp::load_mtp_head(model.gguf(), model.config())?;
+    let head = infr_llama::mtp::load_mtp_head(model.weights(), model.config())?;
     let want = (n_prompt + depth).max(1);
     let prompt = MTP_SENTENCE.repeat(want.div_ceil(10));
     let mut samples = Vec::with_capacity(reps.max(1));
@@ -4707,7 +4708,7 @@ mod tests {
 
     // ── finding 3: local `.gguf` FILE vs HF ref classifier ──────────────────────────────────────
     #[test]
-    fn is_local_gguf_requires_an_existing_gguf_file() {
+    fn local_weights_require_an_existing_supported_file() {
         // Unique scratch dir (no tempfile dep); cleaned at the end.
         let dir = std::env::temp_dir().join(format!(
             "infr-cli-test-{}-{}",
@@ -4726,6 +4727,11 @@ mod tests {
         let gguf_up = dir.join("model.GGUF");
         std::fs::write(&gguf_up, b"x").unwrap();
         assert!(is_local_gguf(&gguf_up));
+        for filename in ["model.safetensors", "model.SAFETENSORS"] {
+            let path = dir.join(filename);
+            std::fs::write(&path, b"x").unwrap();
+            assert!(is_local_gguf(&path));
+        }
 
         // A directory (even named `*.gguf`) is NOT local → falls through to the HF ref path.
         let dir_gguf = dir.join("weights.gguf");

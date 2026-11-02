@@ -82,7 +82,7 @@ pub struct TensorInfo {
     pub nbytes: usize,
 }
 
-/// A model weight file. GGUF is the MVP impl (`infr-gguf`).
+/// A named model weight source with architecture metadata.
 pub trait WeightSource: Send + Sync {
     fn metadata(&self) -> &Metadata;
     fn tensors(&self) -> &[TensorInfo];
@@ -90,6 +90,8 @@ pub trait WeightSource: Send + Sync {
     fn tensor_bytes(&self, name: &str) -> Result<&[u8]>;
     /// Embedded jinja chat template, if present.
     fn chat_template(&self) -> Option<&str>;
+    /// Downcast for format-specific mmap and paging fast paths.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[cfg(test)]

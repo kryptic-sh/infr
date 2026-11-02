@@ -2,7 +2,6 @@
 //! (dense vs MoE-expert), mirroring the native-quant/f16 upload policy used by the production
 //! agnostic-seam loaders.
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
 
 /// VRAM the model's weights will occupy once resident, split dense vs MoE-expert. Experts are
 /// tracked separately so a future expert-streaming / partial-offload mode can budget them apart
@@ -52,7 +51,7 @@ pub(crate) fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbyte
 /// whose weights fit resident. (The rare host-embed fallback paths keep the table off-VRAM, so
 /// counting it is the safe over-estimate direction there.)
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn weight_footprint(g: &Gguf) -> WeightFootprint {
+pub fn weight_footprint(g: &dyn WeightSource) -> WeightFootprint {
     let mut dense = 0u64;
     let mut expert = 0u64;
     for t in g.tensors() {

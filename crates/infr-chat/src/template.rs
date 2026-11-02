@@ -7,8 +7,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use infr_core::config::Config;
 use infr_core::loader::MetaValue;
-use infr_core::WeightSource; // brings `Gguf::metadata()` into scope
-use infr_gguf::Gguf;
+use infr_core::WeightSource;
 use serde_json::Value;
 use tokenizers::Tokenizer;
 
@@ -175,7 +174,7 @@ impl std::error::Error for TemplateError {}
 /// the config is one of those inputs. Callers that DO own a renderer — `SeamModel`,
 /// `infr_llama::chat::OaiRenderer` — hold the `Arc<Config>` and hand out a borrow (R6).
 pub fn render_chat_jinja(
-    gguf: &Gguf,
+    ws: &dyn WeightSource,
     tokenizer: &Tokenizer,
     eos: u32,
     messages: &[(&str, &str)],
@@ -187,7 +186,7 @@ pub fn render_chat_jinja(
         .map(|(r, c)| serde_json::json!({ "role": r, "content": c }))
         .collect();
     render_core(
-        gguf,
+        ws,
         tokenizer,
         eos,
         msgs,
@@ -214,7 +213,7 @@ pub fn render_chat_jinja(
 /// `think` overrides `sampling.no_think` for this render (a request's own thinking switch).
 #[allow(clippy::too_many_arguments)]
 pub fn render_chat_oai(
-    gguf: &Gguf,
+    ws: &dyn WeightSource,
     tokenizer: &Tokenizer,
     eos: u32,
     messages: &[ChatMessage],
@@ -226,7 +225,7 @@ pub fn render_chat_oai(
     let msgs: Vec<Value> = messages.iter().map(message_to_json).collect();
     let tools = tools.cloned().unwrap_or(Value::Null);
     render_core(
-        gguf,
+        ws,
         tokenizer,
         eos,
         msgs,
@@ -268,7 +267,7 @@ fn message_to_json(m: &ChatMessage) -> Value {
 /// [`render_template`]. Shared by every entry point so template handling lives in ONE place.
 #[allow(clippy::too_many_arguments)]
 fn render_core(
-    gguf: &Gguf,
+    ws: &dyn WeightSource,
     tokenizer: &Tokenizer,
     eos: u32,
     msgs: Vec<Value>,
@@ -277,14 +276,14 @@ fn render_core(
     think: Option<bool>,
     cfg: &Config,
 ) -> Result<String, TemplateError> {
-    let template = gguf
+    let template = ws
         .metadata()
         .str("tokenizer.chat_template")
         .ok_or(TemplateError::NoTemplate)?;
     // BOS: use the metadata id if present, else fall back to the tokenizer's own BOS token — never
     // a hardcoded id (the old `2` default is EOS for Llama-family GGUFs, so a missing-metadata
     // model would inject the EOS string at the prompt head).
-    let bos = gguf
+    let bos = ws
         .metadata()
         .get("tokenizer.ggml.bos_token_id")
         .and_then(MetaValue::as_u64)
@@ -361,13 +360,13 @@ pub fn render_template(
 /// Single user turn through [`render_chat_jinja`] (`add_generation_prompt=true`). Shared by the GPU
 /// and CPU one-shot paths so an instruct model answers coherently.
 pub fn render_chat_user(
-    gguf: &Gguf,
+    ws: &dyn WeightSource,
     tokenizer: &Tokenizer,
     eos: u32,
     user: &str,
     cfg: &Config,
 ) -> Option<String> {
-    render_chat_jinja(gguf, tokenizer, eos, &[("user", user)], true, cfg)
+    render_chat_jinja(ws, tokenizer, eos, &[("user", user)], true, cfg)
 }
 
 #[cfg(test)]

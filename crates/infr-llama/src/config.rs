@@ -3,7 +3,6 @@ use crate::{meta_f64, meta_u64, MoeConfig};
 use anyhow::{bail, Context, Result};
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource;
-use infr_gguf::Gguf;
 
 /// `Default` is an ALL-ZERO placeholder, not a runnable model: [`Config::from_gguf`] is the only
 /// source of a real one. It exists so a test can name the two or three fields the arithmetic it is
@@ -528,7 +527,7 @@ impl Config {
     /// upload. The single source of truth for both the GPU loader (`Llama::load_opt`) and the
     /// CPU-only loader (`SeamModel::load`). `eos_ids` holds only the GGUF `eos` here; chat-end
     /// markers (`<|im_end|>` …) are appended once a tokenizer exists (see `add_chat_eos`).
-    pub fn from_gguf(g: &Gguf) -> Result<Config> {
+    pub fn from_gguf(g: &dyn WeightSource) -> Result<Config> {
         let arch = g
             .metadata()
             .str("general.architecture")
@@ -1473,6 +1472,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infr_gguf::Gguf;
 
     fn push_u32(bytes: &mut Vec<u8>, value: u32) {
         bytes.extend_from_slice(&value.to_le_bytes());

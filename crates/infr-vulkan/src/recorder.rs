@@ -3985,12 +3985,17 @@ impl<'a> Recorder<'a> {
         let o4 = self.vk().mmv_o4 && !(in_f / 32).is_multiple_of(64);
         let m4 = rows <= 4 && self.vk().mmv_m4;
         let res = residual.is_some();
-        let (name, spv) = if rows > 8 {
-            crate::gemm::native_mmv_mrow_m16_spv(dtype).expect("native mmv mrow m16 streamed spv")
-        } else {
-            crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
-                .expect("native mmv mrow streamed spv")
-        };
+        let (name, spv) =
+            if o4 && rows <= 8 && dtype == infr_core::DType::Q4K && self.vk().mmv_q4k_meta {
+                crate::gemm::native_mmv_mrow_q4k_meta_spv(m4, res)
+                    .expect("native mmv mrow q4k packed metadata streamed spv")
+            } else if rows > 8 {
+                crate::gemm::native_mmv_mrow_m16_spv(dtype)
+                    .expect("native mmv mrow m16 streamed spv")
+            } else {
+                crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
+                    .expect("native mmv mrow streamed spv")
+            };
         let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
         let nbind = if res { 6 } else { 5 };
         let k = self.be.kernel(name, spv, nbind, 24);

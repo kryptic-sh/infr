@@ -287,6 +287,9 @@ cfg_struct! {
         mmv: bool = true,
         /// `INFR_MMV_DECODE`. The site is `mmv_decode && mmv`.
         mmv_decode: bool = false,
+        /// `INFR_NO_MMV_Q4K_META` (inverted): packed 16-byte Q4_K header loads
+        /// in the four-output int8 decode/verify kernel; disable for scalar metadata loads.
+        mmv_q4k_meta: bool = true,
         /// `INFR_NO_MMV_M4` (inverted).
         mmv_m4: bool = true,
         /// `INFR_NO_MMV_O4` (inverted).

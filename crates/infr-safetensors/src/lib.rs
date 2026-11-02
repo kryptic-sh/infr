@@ -17,10 +17,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// A memory-mapped safetensors file implementing [`WeightSource`].
-///
-/// See [`Gguf`](infr_gguf::Gguf) for the GGUF counterpart and the shared
-/// mmap-lifetime reasoning (another process truncating the file under a live
-/// mapping is `SIGBUS`; see the `UNENFORCED INVARIANT` discussion there).
 pub struct Safetensors {
     mmap: memmap2::Mmap,
     metadata: Metadata,

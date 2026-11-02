@@ -566,6 +566,7 @@ pub(crate) fn generate_dense_vulkan_session(
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
+    crate::qwen4_exp::ensure_forward_supported(cfg)?;
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
     // baton is released before the runner starts stepping. See `StepGate`.
@@ -1885,6 +1886,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
     first_load: bool,
     want_ctx: usize,
 ) -> AResult<Box<BindWeight<'a>>> {
+    crate::qwen4_exp::ensure_forward_supported(cfg)?;
     // ── MoE expert placement ─────────────────────────────────────────────────────────────────
     // The pager (`infr_vulkan::pager`) is the ONLY MoE offload mechanism — the legacy
     // host-visible (HostWeights/GTT) split and its INFR_NCMOE knob are gone. Tiers, in

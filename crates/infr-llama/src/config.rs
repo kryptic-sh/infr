@@ -114,6 +114,9 @@ pub struct Config {
     /// field below plus the `MixerW::DeltaNet` mixer branch in `seam`'s layer loop — the same
     /// shared transformer skeleton every other architecture runs through.
     pub qwen35: bool,
+    /// HF Qwen4-Exp config. Shares hybrid dimensions with qwen35, but NOT its forward:
+    /// HC, PLE, QSA and the output gate require separate emission. Inference is refused.
+    pub qwen4_exp: Option<crate::qwen4_exp::Cfg>,
     /// qwen35: attention layers sit at `i` where `(i+1) % full_attn_interval == 0`; every other
     /// layer is gated-DeltaNet linear attention. `0` for every non-qwen35 model (never read).
     pub full_attn_interval: usize,
@@ -501,6 +504,9 @@ impl Config {
     /// qwen35: whether layer `il` is one of the FULL-attention layers (vs gated-DeltaNet linear
     /// attention). `false` for every non-qwen35 model. Mirrors the old seam's `Cfg::is_attn_layer`.
     pub fn is_qwen35_attn_layer(&self, il: usize) -> bool {
+        if let Some(c) = &self.qwen4_exp {
+            return c.layer_types.get(il) == Some(&crate::qwen4_exp::LayerType::IndexedAttention);
+        }
         self.qwen35
             && self.full_attn_interval > 0
             && (il + 1).is_multiple_of(self.full_attn_interval)
@@ -533,6 +539,13 @@ impl Config {
             .str("general.architecture")
             .unwrap_or("")
             .to_string();
+        if arch == crate::arch::QWEN4_EXP {
+            // No canonical GGUF schema exists here yet. Only the validated HF adapter may
+            // construct this config; never guess it from a GGUF bearing a similar string.
+            let source = g.as_any().downcast_ref::<crate::qwen4_exp_source::Qwen4ExpSource>()
+                .context("qwen4_exp requires a dense HF safetensors checkpoint with adjacent config.json")?;
+            return Ok(source.cfg.clone().shared_config());
+        }
         let qk_norm = match arch.as_str() {
             // llama4 has no LEARNED q/k-norm weights; its weightless per-head L2-norm on Q/K is
             // applied AFTER rope (see `kq_l2norm` below), not via the qwen3-style QkNormRope.
@@ -1414,6 +1427,7 @@ impl Config {
             n_ctx_train,
             qwen35,
             full_attn_interval,
+            qwen4_exp: None,
             ssm_d_conv,
             ssm_d_state,
             ssm_d_inner,

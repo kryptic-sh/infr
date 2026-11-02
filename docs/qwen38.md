@@ -8,7 +8,7 @@ which infr already runs:
 | ------------------------- | ---------------------------------- | ----------- | ------- | --------------------------- |
 | `Qwen/Qwen3.8-27B`        | `Qwen3_5ForConditionalGeneration`  | `qwen35`    | 27.3 B  | **arch already supported**  |
 | `Qwen/Qwen3.8-2.4T-A95B`  | `Qwen3_5MoeForCausalLM`            | `qwen35moe` | 2.446 T | arch supported, one GPU bug |
-| `Qwen/Qwen3.8-Flash-Next` | `Qwen4ExpForConditionalGeneration` | `qwen4exp`  | 176.9 B | **net-new architecture**    |
+| `Qwen/Qwen3.8-Flash-Next` | `Qwen4ExpForConditionalGeneration` | `qwen4exp`  | 176.9 B | HF loading only; no forward |
 
 So this is not one port. It is one config check, one shader fix, and one large
 new family — and they are independent, so they are staged that way below.
@@ -189,6 +189,12 @@ model that has never been loaded.
 ---
 
 ## Stage C — Qwen3.8-Flash-Next (`qwen4exp`)
+
+**Implementation status:** the first [Qwen4-Exp loader slice](qwen4-exp.md)
+loads local single-file dense HF safetensors using the HF identifier
+`qwen4_exp`, including the tiny random fixture. It does not yet run inference
+or load GGUF's `qwen4exp`; generation explicitly refuses before backend setup.
+The architecture investigation below describes the remaining forward work.
 
 **A genuinely new architecture — and the one that overlaps the DeepSeek V4 work
 already in flight.**

@@ -47,6 +47,10 @@ pub const QWEN35: &str = "qwen35";
 /// per-token sigmoid). Shares every `qwen35` field (`Config::from_gguf`'s `qwen35` gate,
 /// `MixerW::DeltaNet`); only the FFN differs (`FfnW::Moe`'s `shexp` branch — see `seam::weights`).
 pub const QWEN35_MOE: &str = "qwen35moe";
+/// HF-only Qwen4-Exp text checkpoint identifier. Unlike the GGUF strings above, this is
+/// Transformers' `model_type`, not a claim about llama.cpp's canonical arch table. The
+/// safetensors adapter can load it; inference is still refused, so it is not in [`ALL`].
+pub const QWEN4_EXP: &str = "qwen4_exp";
 /// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
 /// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN
 /// (dense GeGLU ∥ 128-expert MoE, summed) and encoder/decoder per-layer output scalars. See

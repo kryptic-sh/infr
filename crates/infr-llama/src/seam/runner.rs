@@ -427,6 +427,10 @@ pub(crate) fn generate_dense_backend(
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
+    // Qwen4-Exp must never silently take the qwen35 forward: that would ignore its HC
+    // residual streams, n-gram embeddings, indexed mask and different GDN output gate.
+    // Refuse before session derivation, binding weights, or allocating recurrent/KV state.
+    crate::qwen4_exp::ensure_forward_supported(c)?;
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
     let caps = be.capabilities();

@@ -26,7 +26,6 @@ pub(crate) struct Qwen4ExpSource {
     consumed: HashSet<String>,
     chat_template: Option<String>,
     // Host-only PLE hash buffers, decoded without narrowing or binding as graph weights.
-    // Retained for the future forward implementation.
     _ple_buffers: HashMap<String, Vec<i64>>,
 }
 
@@ -134,6 +133,19 @@ fn validate_ple_hashes(
 }
 
 impl Qwen4ExpSource {
+    pub(crate) fn ple_buffer(&self, layer: usize, suffix: &str) -> Result<&[i64]> {
+        let key = format!("blk.{layer}.ple_key.weight");
+        let prefix = self
+            .names
+            .get(&key)
+            .and_then(|name| name.strip_suffix(".key_proj.weight"))
+            .context("qwen4_exp CPU: missing PLE prefix")?;
+        self._ple_buffers
+            .get(&format!("{prefix}.ple_embedding.{suffix}"))
+            .map(Vec::as_slice)
+            .context("qwen4_exp CPU: missing PLE buffer")
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let dir = path.parent().unwrap_or(Path::new("."));
         let root: serde_json::Value = serde_json::from_slice(

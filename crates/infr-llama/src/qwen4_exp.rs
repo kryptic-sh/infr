@@ -1,10 +1,12 @@
 //! Qwen4-Exp text configuration. The HF identifier is not a canonical GGUF architecture.
 //!
-//! Loading is supported as a foundation for inference; HC, PLE, QSA and the sigmoid GDN
-//! output gate must be emitted together before the shared runner can execute this architecture.
+//! Dense HF loading and scalar CPU-reference text inference are supported. HC, PLE, QSA
+//! and the GDN output gate execute together in [`CpuModel`], not the shared GPU graph runner.
 
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
+
+pub use crate::qwen4_exp_cpu::{CpuModel, CpuStep};
 
 /// Layer kinds accepted by both the tiny checkpoint and newer Transformers configs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -536,4 +538,4 @@ impl Cfg {
     }
 }
 
-pub(crate) const FORWARD_UNSUPPORTED: &str = "arch=qwen4_exp: checkpoint loading is supported, but inference is not yet implemented (requires Qwen4-Exp HC, PLE, QSA and GDN output-gate semantics)";
+pub(crate) const FORWARD_UNSUPPORTED: &str = "arch=qwen4_exp: only dense HF CPU-reference inference is supported; GPU and generic graph execution are not implemented (requires Qwen4-Exp HC, PLE, QSA and GDN output-gate semantics)";

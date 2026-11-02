@@ -3508,11 +3508,14 @@ impl<'a> Recorder<'a> {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: linear_kq_fma requires a u64 BDA device address");
-        let (name, spv) = crate::gemm::native_gemv_kq_fma_spv(dtype, residual.is_some(), nr)
+        let ssbo = self.be.cfg().kernels.vulkan.weights_as_ssbo
+            && (Self::vk_of(w).size as u64).next_multiple_of(256)
+                <= crate::max_storage_buffer_range() as u64;
+        let (name, spv) = crate::gemm::native_gemv_kq_fma_spv(dtype, residual.is_some(), nr, ssbo)
             .expect("linear_kq_fma: dtype/nr gated by native_gemv_kq_fma_spv");
         debug_assert!(in_f.is_multiple_of(256) && w_base.is_multiple_of(256));
         self.label_gemv(name, 1, in_f, out_f);
-        let kern = self.be.kernel(name, spv, 3, 20);
+        let kern = self.be.kernel(name, spv, if ssbo { 4 } else { 3 }, 20);
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
@@ -3520,13 +3523,11 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let r = residual.unwrap_or(x);
-        self.dispatch_wide(
-            kern,
-            &[Self::vkb(x), Self::vkb(r), Self::vkb(y)],
-            1,
-            &push,
-            out_f.div_ceil(nr) as u32,
-        );
+        let mut binds = vec![Self::vkb(x), Self::vkb(r), Self::vkb(y)];
+        if ssbo {
+            binds.push(Self::vkb(w));
+        }
+        self.dispatch_wide(kern, &binds, 1, &push, out_f.div_ceil(nr) as u32);
     }
 
     /// Multi-row K-quant GEMV on f32 activations (`native_gemv_kq_fma_mrow.comp`): `y = x·Wᵀ`
@@ -3547,7 +3548,7 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        let nr = self.kq_fma_gemv_rows(out_f);
+        let nr = self.kq_fma_gemv_rows(in_f, out_f);
         self.linear_kq_fma_mrow_nr(dtype, w, w_base, x, y, rows, in_f, out_f, nr);
     }
 

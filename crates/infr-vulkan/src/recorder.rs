@@ -739,6 +739,12 @@ pub(crate) fn mmv_mrow_variant(
     }
     let o4 = mmv_o4(vk, in_f, o4);
     let m4 = rows <= 4 && vk.mmv_m4;
+    // Q4_K has a packed-metadata build for the OUTS4 layout: same dots, cheaper header unpacks.
+    if o4 && dtype == infr_core::DType::Q4K && vk.mmv_q4k_meta {
+        if let Some((n, s)) = crate::gemm::native_mmv_mrow_q4k_meta_spv(m4, res) {
+            return Some((n, s, 4));
+        }
+    }
     crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
         .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
 }

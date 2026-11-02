@@ -371,6 +371,10 @@ pub struct GenParams {
     pub stop: Vec<String>,
     /// The request's thinking switch; `None` keeps the server default (`--no-think`/`--think`).
     pub think: Option<bool>,
+    /// The request's images (decoded `image_url` data URIs), in the order their
+    /// [`infr_engine::IMAGE_MARKER`]s appear in the flattened messages. Filled by the
+    /// handler, not by [`GenParams::from_request`] (the messages are flattened separately).
+    pub images: Vec<Arc<[u8]>>,
 }
 
 /// An OpenAI-shaped 400: `{"error":{"message":..,"type":"invalid_request_error","param":..}}`.
@@ -513,6 +517,7 @@ impl GenParams {
             logit_bias,
             stop,
             think,
+            images: Vec::new(),
         })
     }
 
@@ -1752,7 +1757,18 @@ async fn chat_completions_handler(
     };
     // Cap an absurd explicit budget so one request can't pin a slot forever. Unset stays unset.
     params.max_tokens = clamp_max_tokens(params.max_tokens, max_tokens_cap(&state.cfg));
-    let messages: Vec<ChatMessage> = req.messages.iter().map(dto_to_engine).collect();
+    let messages: Vec<ChatMessage> = {
+        let mut images = Vec::new();
+        let mut out = Vec::with_capacity(req.messages.len());
+        for m in &req.messages {
+            match dto_to_engine(m, &mut images) {
+                Ok(m) => out.push(m),
+                Err(e) => return param_error(Some(e.param), e.message),
+            }
+        }
+        params.images = images;
+        out
+    };
     // Pass the request's `tools` array THROUGH as a Value (moved into the blocking task) — no
     // Value→string→Value round-trip (audit finding 6).
     let tools: Option<serde_json::Value> = req.tools.clone();
@@ -2715,14 +2731,74 @@ pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     }
 }
 
-fn dto_to_engine(dto: &ChatMessageDto) -> ChatMessage {
-    ChatMessage {
+/// [`flatten_content`], keeping images: each `image_url` part becomes an
+/// [`infr_llama::media::IMAGE_MARKER`] in the text and its decoded bytes are appended to `images`,
+/// so the two stay in the same order. Only `data:` URIs are accepted — the server never fetches
+/// URLs on a client's behalf. A marker typed into the text itself is removed, so a user cannot
+/// claim an image slot.
+pub fn flatten_content_media(
+    v: &Option<serde_json::Value>,
+    images: &mut Vec<Arc<[u8]>>,
+) -> Result<String, ParamError> {
+    use base64::Engine as _;
+    let marker = infr_engine::IMAGE_MARKER;
+    let strip = |t: &str| t.replace(marker, "");
+    let Some(serde_json::Value::Array(parts)) = v else {
+        return Ok(strip(&flatten_content(v)));
+    };
+    let mut out = String::new();
+    for p in parts {
+        match p.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(&strip(t));
+                }
+            }
+            Some("image_url") | Some("image") => {
+                let url = p
+                    .get("image_url")
+                    .and_then(|u| u.get("url").or(Some(u)))
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("");
+                let bad = |message: String| ParamError {
+                    param: "messages",
+                    message,
+                };
+                let Some(rest) = url.strip_prefix("data:") else {
+                    return Err(bad(
+                        "image_url must be a base64 data: URI (remote image URLs are not fetched)"
+                            .into(),
+                    ));
+                };
+                let Some((meta, data)) = rest.split_once(',') else {
+                    return Err(bad("malformed image data: URI".into()));
+                };
+                if !meta.ends_with(";base64") {
+                    return Err(bad("image data: URI must be base64-encoded".into()));
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data.trim())
+                    .map_err(|e| bad(format!("image data: URI is not valid base64: {e}")))?;
+                images.push(Arc::from(bytes));
+                out.push_str(marker);
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+fn dto_to_engine(
+    dto: &ChatMessageDto,
+    images: &mut Vec<Arc<[u8]>>,
+) -> Result<ChatMessage, ParamError> {
+    Ok(ChatMessage {
         role: dto.role.clone(),
-        content: flatten_content(&dto.content),
+        content: flatten_content_media(&dto.content, images)?,
         tool_calls: dto.tool_calls.as_ref().and_then(parse_oai_tool_calls),
         tool_call_id: dto.tool_call_id.clone(),
         name: dto.name.clone(),
-    }
+    })
 }
 
 /// Convert an inbound OpenAI `tool_calls` array (`[{function:{name, arguments}}]`, where `arguments`
@@ -3015,7 +3091,12 @@ mod tests {
             {"id":"a1B2c3D4e","type":"function",
              "function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}},
             {"type":"function","function":{"name":"noid","arguments":"{}"}}]}"#;
-        let msg = dto_to_engine(&serde_json::from_str::<ChatMessageDto>(raw).unwrap());
+        let mut images = Vec::new();
+        let msg = dto_to_engine(
+            &serde_json::from_str::<ChatMessageDto>(raw).unwrap(),
+            &mut images,
+        )
+        .unwrap();
         let calls = msg.tool_calls.expect("two calls parse");
         assert_eq!(calls[0].id.as_deref(), Some("a1B2c3D4e"));
         assert_eq!(calls[0].arguments, serde_json::json!({"cmd": "ls"}));
@@ -3038,7 +3119,12 @@ mod tests {
                 r#"{{"role":"assistant","content":null,"tool_calls":[
                 {{"type":"function","function":{{"name":"f","arguments":{arguments}}}}}]}}"#
             );
-            let msg = dto_to_engine(&serde_json::from_str::<ChatMessageDto>(&raw).unwrap());
+            let mut images = Vec::new();
+            let msg = dto_to_engine(
+                &serde_json::from_str::<ChatMessageDto>(&raw).unwrap(),
+                &mut images,
+            )
+            .unwrap();
             let a = &msg.tool_calls.expect("one call")[0].arguments;
             let got = [&a["a"], &a["b"], &a["c"][0]].map(|v| v.as_f64().unwrap());
             let want = floats.map(|f| f.parse::<f64>().unwrap());

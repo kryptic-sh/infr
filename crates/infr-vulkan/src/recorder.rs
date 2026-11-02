@@ -3826,7 +3826,7 @@ impl<'a> Recorder<'a> {
         // master; every (dtype, o4, m4, res) arm exists in `native_mmv_mrow_variant_spv`.
         // An o0 early-out in the shader (not just the per-output `live` guard) keeps 2-D-split
         // padding groups cheap, so ceil(out_f/4) landing just past 65535 can't regress lm_head.
-        let o4 = self.vk().mmv_o4 && (in_f / 32) % 64 != 0;
+        let o4 = self.vk().mmv_o4 && !(in_f / 32).is_multiple_of(64);
         let m4 = rows <= 4 && self.vk().mmv_m4;
         let res = residual.is_some();
         let (name, spv) = if rows > 8 {

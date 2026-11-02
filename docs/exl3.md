@@ -88,6 +88,25 @@ charged against VRAM.
 Large resident BDA tensors use near-exact-sized blocks; small tensors share arena
 blocks. This avoids charging a full 64 MiB block to each half-block-sized projection.
 
+## Performance status
+
+The portable EXL3 decode kernel is not yet competitive with the optimized GGUF
+path on the RX580. A warmed E4B QAT comparison (`infr bench -p 0 -n 64 -d 16 -r 3`,
+context 256, microbatch 64) measured:
+
+| Path | Decode tok/s |
+| --- | ---: |
+| Cached Google QAT Q4_0 GGUF | 41.48 |
+| Initial EXL3 4.0bpw kernel | 3.89 |
+| EXL3 with register-local accumulation and cheaper circular indexing | 5.21 |
+
+Before the cleanup, GPU timestamps attributed 96.5% of device time to EXL3 GEMV;
+both Hadamard passes together accounted for less than 1%. Removing the per-K-tile
+shared-memory round-trip and barriers improves throughput, but packed-window
+decoding and the narrow K-parallelism remain the next optimization targets. Lower
+stored bpw does not translate into higher throughput until this kernel is efficient.
+These timings compare the same architecture/QAT lineage, not bit-identical weights.
+
 ## Validation
 
 ```sh

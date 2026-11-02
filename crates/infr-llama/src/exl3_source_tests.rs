@@ -327,6 +327,53 @@ fn rejects_unsupported_configs_and_codebooks() {
 }
 
 #[test]
+fn accepts_mcg_marker_and_rejects_unsupported_parameters() {
+    let mut fixture = Fixture::new();
+    let cb0 = fixture
+        .open()
+        .unwrap()
+        .take_fold("output.weight")
+        .unwrap()
+        .unwrap();
+    fixture.tensors.push((
+        "lm_head.mcg".into(),
+        "I32".into(),
+        vec![],
+        0xcbac1fed_u32.to_le_bytes().to_vec(),
+    ));
+    let source = fixture.open().unwrap();
+    let mcg = source.take_fold("output.weight").unwrap().unwrap();
+    assert_ne!(mcg, cb0);
+    let native = Exl3Source::open_native(&fixture.dir.path().join("model.safetensors")).unwrap();
+    assert_eq!(
+        native.native_spec("output.weight").unwrap().codebook,
+        Exl3Codebook::Mcg
+    );
+    assert_eq!(
+        native.native_spec("blk.0.attn_q.weight").unwrap().codebook,
+        Exl3Codebook::Cb0
+    );
+    assert!(native
+        .linears
+        .values()
+        .all(|linear| linear.cache.get().is_none()));
+    for (dtype, shape, multiplier) in [
+        ("F32", vec![], 0xcbac1fed_u32),
+        ("I32", vec![1], 0xcbac1fed_u32),
+        ("I32", vec![], 1u32),
+    ] {
+        let mut invalid = Fixture::new();
+        invalid.tensors.push((
+            "lm_head.mcg".into(),
+            dtype.into(),
+            shape,
+            multiplier.to_le_bytes().to_vec(),
+        ));
+        assert!(invalid.open().is_err());
+    }
+}
+
+#[test]
 fn cached_fold_errors_are_returned_without_panics() {
     let mut f = Fixture::new();
     let t = f.tensors.iter_mut().find(|t| t.0 == "lm_head.svh").unwrap();
@@ -410,14 +457,17 @@ fn walsh_reference(x: &[f32]) -> Vec<f32> {
 #[test]
 fn folded_linear_matches_unfused_hadamard_forward_for_every_integer_rate() {
     let (k, n) = (256, 256);
-    for bits in 1..=8 {
+    for (codebook, bits) in [Exl3Codebook::Cb0, Exl3Codebook::Mcg]
+        .into_iter()
+        .flat_map(|codebook| (1..=8).map(move |bits| (codebook, bits)))
+    {
         let packed: Vec<_> = (0..(k / 16) * (n / 16) * 16 * bits as usize)
             .map(|i| (i as u16).wrapping_mul(313).wrapping_add(117))
             .collect();
         let suh: Vec<_> = (0..k).map(|i| (i as f32 % 13.0 - 6.0) * 0.017).collect();
         let svh: Vec<_> = (0..n).map(|i| (i as f32 % 7.0 - 3.0) * 0.023).collect();
         let x: Vec<_> = (0..k).map(|i| (i as f32 * 0.23).sin()).collect();
-        let d = infr_cpu::exl3::decode_matrix(Codebook::Cb0, bits, &packed, k, n);
+        let d = infr_cpu::exl3::decode_matrix(Codebook::from(codebook), bits, &packed, k, n);
         let scaled: Vec<_> = x.iter().zip(&suh).map(|(a, b)| a * b).collect();
         let xh = walsh_reference(&scaled);
         let raw: Vec<_> = (0..n)
@@ -428,7 +478,7 @@ fn folded_linear_matches_unfused_hadamard_forward_for_every_integer_rate() {
             .zip(&svh)
             .map(|(a, b)| a * b)
             .collect();
-        let folded = fold_trellis(&packed, &suh, &svh, k, n, bits).unwrap();
+        let folded = fold_trellis(&packed, &suh, &svh, k, n, bits, codebook).unwrap();
         for j in 0..n {
             let actual: f32 = (0..k)
                 .map(|i| {
@@ -441,7 +491,7 @@ fn folded_linear_matches_unfused_hadamard_forward_for_every_integer_rate() {
             let tolerance = 0.0002 + expected[j].abs() * 0.002;
             assert!(
                 (actual - expected[j]).abs() < tolerance,
-                "K={bits} out={j}: {actual} != {}",
+                "codebook={codebook:?} K={bits} out={j}: {actual} != {}",
                 expected[j]
             );
         }

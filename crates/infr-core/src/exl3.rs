@@ -3,8 +3,10 @@
 use crate::{Error, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
 pub enum Exl3Codebook {
-    Cb0,
+    Cb0 = 0,
+    Mcg = 1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

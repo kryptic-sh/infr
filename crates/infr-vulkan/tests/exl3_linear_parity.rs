@@ -142,7 +142,10 @@ fn exl3_projection_reads_weights_after_recorded_transfers() {
 #[ignore = "requires a Vulkan GPU"]
 fn exl3_linear_matches_cpu_all_rates_decode_and_prefill() {
     let be = VulkanBackend::new().unwrap();
-    for bits in 1..=8 {
+    for (codebook, bits) in [Exl3Codebook::Cb0, Exl3Codebook::Mcg]
+        .into_iter()
+        .flat_map(|codebook| (1..=8).map(move |bits| (codebook, bits)))
+    {
         for (k, n, layout) in [
             (256, 384, Exl3OutputLayout::Identity),
             (
@@ -159,7 +162,7 @@ fn exl3_linear_matches_cpu_all_rates_decode_and_prefill() {
                 in_f: k,
                 out_f: n,
                 bits,
-                codebook: Exl3Codebook::Cb0,
+                codebook,
                 output_layout: layout,
             };
             for m in [1, 2, 7, 8, 9, 17] {
@@ -173,17 +176,27 @@ fn exl3_linear_matches_cpu_all_rates_decode_and_prefill() {
 #[ignore = "requires a Vulkan GPU"]
 fn exl3_linear_matches_cpu_at_qwen25_7b_shapes() {
     let be = VulkanBackend::new().unwrap();
-    for (k, n, bits) in [
-        (3584, 512, 4),
-        (3584, 18944, 4),
-        (18944, 3584, 4),
-        (3584, 3584, 3),
-    ] {
+    for (codebook, (k, n, bits)) in
+        [Exl3Codebook::Cb0, Exl3Codebook::Mcg]
+            .into_iter()
+            .flat_map(|codebook| {
+                [
+                    (3584, 512, 4),
+                    (3584, 18944, 4),
+                    (18944, 3584, 4),
+                    (3584, 3584, 3),
+                    (4096, 8192, 2),
+                    (4096, 4096, 2),
+                ]
+                .into_iter()
+                .map(move |shape| (codebook, shape))
+            })
+    {
         let spec = Exl3Spec {
             in_f: k,
             out_f: n,
             bits,
-            codebook: Exl3Codebook::Cb0,
+            codebook,
             output_layout: Exl3OutputLayout::Identity,
         };
         for m in [1, 5] {

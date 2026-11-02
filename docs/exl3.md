@@ -14,9 +14,9 @@ Test checkpoint: `turboderp/Qwen2.5-7B-Instruct-exl3`, branch `4.0bpw`
 (default codebook; 4-bit projections, 6-bit LM head).
 
 Supported: Qwen2 architecture, untied embeddings, integer rates 1–8, the default
-`3inst` codebook (cb0). Rejected with an explicit error: `.mcg`/`.mul1` codebooks,
-fractional rates, RoPE scaling, sliding-window attention, sharded checkpoints, and
-tied embeddings. Every released turboderp Qwen2.5-7B branch inspected (2/3/4 bpw)
+`3inst` codebook (cb0) and `mcg` with multiplier `0xCBAC1FED`.
+Rejected with an explicit error: `.mul1` or custom MCG multipliers, fractional rates,
+RoPE scaling, sliding-window attention, sharded checkpoints, and tied embeddings. Every released turboderp Qwen2.5-7B branch inspected (2/3/4 bpw)
 is cb0; rate and codebook are independent.
 
 ## Execution
@@ -42,10 +42,12 @@ at load; embeddings stay F16 mmap views.
 | Vulkan | three dispatches: `exl3_hadamard_in`, `exl3_gemv` (m = 1) or `exl3_prefill` (8-row tiles), `exl3_hadamard_out`; trellis and scales are read by buffer device address |
 | Metal | not implemented; graphs containing `LinearExl3` are rejected |
 
-The Vulkan kernels are portable correctness-first implementations: no subgroup-size
-assumption, no cooperative matrix, no integer dot product. The codebook's half-precision
-sum is rounded to nearest-even with integer arithmetic because `packHalf2x16` rounding is
-implementation-defined.
+The Vulkan kernels are portable correctness-first implementations: integer decoding
+and FP32 projection/transform arithmetic, with no `shaderFloat16` requirement,
+subgroup-size assumption, cooperative matrix, or integer dot-product requirement.
+The RX 580 uses this same path automatically; no separate legacy-math switch is needed.
+The codebook's half-precision sum is rounded to nearest-even with integer arithmetic
+because `packHalf2x16` rounding is implementation-defined.
 
 `Exl3Source::open` keeps the earlier folded-F16 reference path for tests: it expands
 each linear to row-major F16 (about 14 GB for the 7B linears). Production loading no
@@ -73,9 +75,10 @@ cargo test --release -p infr-vulkan --test exl3_linear_parity -- --ignored   # n
 - Full synthetic Qwen2 logits from the native path match the folded reference, and
   batched logits match fresh causal-prefix forwards.
 - The Vulkan projection matches the CPU kernel within `1e-4 × max|y|` for rates 1–8,
-  identity and rotary layouts, m ∈ {1, 2, 7, 8, 9, 17}, and the Qwen2.5-7B projection
-  shapes (3584×512, 3584×18944, 18944×3584, 3584×3584). Verified on an RX 580
-  (RADV Polaris), the Ryzen 7800X3D integrated GPU (RADV), and an RTX 4070 (NVIDIA 615.71.09).
+  identity and rotary layouts, m ∈ {1, 2, 7, 8, 9, 17}, and Qwen-sized projections.
+  Both `3inst` and `mcg` are verified on an RX 580 (RADV Polaris), including
+  4096×8192 and 4096×4096 at 2bpw. `3inst` is also verified on the Ryzen 7800X3D
+  integrated GPU (RADV) and an RTX 4070 (NVIDIA 615.71.09).
 - Full Qwen2.5-7B EXL3 4.0bpw chat generation runs on the RTX 4070 through Vulkan:
   `infr run /path/to/model.safetensors "What is the capital of France?" --dev Vulkan0
   --ctx 256 --ubatch 64 --temp 0 --max-new 16` produces

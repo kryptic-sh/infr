@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use infr_core::loader::{MetaValue, Metadata, TensorInfo};
-use infr_core::{DType, Error, WeightSource};
+use infr_core::{DType, Error, Exl3Codebook, WeightSource};
 use infr_cpu::exl3::{decode_tile, hadamard128, tile_perm, Codebook};
 
 struct LinearSpec {
@@ -14,6 +14,7 @@ struct LinearSpec {
     k: usize,
     n: usize,
     bits: u32,
+    codebook: Exl3Codebook,
     cache: OnceLock<std::result::Result<Vec<u8>, String>>,
 }
 
@@ -250,7 +251,7 @@ impl Exl3Source {
                 in_f: u32::try_from(linear.k)?,
                 out_f: u32::try_from(linear.n)?,
                 bits: linear.bits,
-                codebook: infr_core::Exl3Codebook::Cb0,
+                codebook: linear.codebook,
                 output_layout: infr_core::Exl3OutputLayout::Identity,
             };
             info.nbytes = spec.trellis_bytes()?;
@@ -291,7 +292,7 @@ impl Exl3Source {
             in_f: linear.k as u32,
             out_f: linear.n as u32,
             bits: linear.bits,
-            codebook: infr_core::Exl3Codebook::Cb0,
+            codebook: linear.codebook,
             output_layout: infr_core::Exl3OutputLayout::Identity,
         })
     }
@@ -354,16 +355,28 @@ impl Exl3Source {
             "exl3: {prefix}.trellis shape {:?} disagrees with config ({k},{n})",
             info.shape
         );
-        for marker in ["mcg", "mul1"] {
+        ensure!(
+            !self
+                .st
+                .tensors()
+                .iter()
+                .any(|t| t.name == format!("{prefix}.mul1")),
+            "exl3: {prefix}.mul1 codebook is unsupported"
+        );
+        let marker = format!("{prefix}.mcg");
+        let codebook = if let Some(info) = self.st.tensors().iter().find(|t| t.name == marker) {
             ensure!(
-                !self
-                    .st
-                    .tensors()
-                    .iter()
-                    .any(|t| t.name == format!("{prefix}.{marker}")),
-                "exl3: {prefix}.{marker} codebooks are unsupported"
+                info.dtype == DType::I32 && info.shape.is_empty(),
+                "exl3: {marker} must be scalar I32"
             );
-        }
+            ensure!(
+                self.st.tensor_bytes(&marker)? == 0xcbac1fed_u32.to_le_bytes(),
+                "exl3: {marker} has an unsupported MCG multiplier"
+            );
+            Exl3Codebook::Mcg
+        } else {
+            Exl3Codebook::Cb0
+        };
         for (scale, size) in [("suh", k), ("svh", n)] {
             let info = find_hf(&self.st, &format!("{prefix}.{scale}"))?;
             ensure!(
@@ -385,6 +398,7 @@ impl Exl3Source {
                 k,
                 n,
                 bits,
+                codebook,
                 cache: OnceLock::new(),
             },
         );
@@ -424,6 +438,7 @@ impl Exl3Source {
             spec.k,
             spec.n,
             spec.bits,
+            spec.codebook,
         )
     }
 
@@ -447,6 +462,7 @@ fn fold_trellis(
     k: usize,
     n: usize,
     bits: u32,
+    codebook: Exl3Codebook,
 ) -> Result<Vec<u8>> {
     use rayon::prelude::*;
     ensure!(
@@ -485,7 +501,10 @@ fn fold_trellis(
                         {
                             *dst = pair[0] as u32 | ((pair[1] as u32) << 16);
                         }
-                        for (s, v) in decode_tile(Codebook::Cb0, bits, &tile32).iter().enumerate() {
+                        for (s, v) in decode_tile(Codebook::from(codebook), bits, &tile32)
+                            .iter()
+                            .enumerate()
+                        {
                             let p = perm[s] as usize;
                             d[(ti * 16 + p / 16) * 128 + tj * 16 + p % 16] = *v;
                         }

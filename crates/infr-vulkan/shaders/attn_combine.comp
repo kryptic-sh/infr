@@ -1,6 +1,7 @@
 #version 460
 // Flash-decode combine: one workgroup per (head, hd-tile). Merges n_chunks partial softmax results
 // (per-chunk max pm, sum pl, weighted-V pacc) via the online-softmax rule. o = [nh, hd].
+#extension GL_EXT_control_flow_attributes : require
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint nh; uint hd; uint n_chunks; uint ntile; } pc;
@@ -17,6 +18,8 @@ layout(binding = 4) buffer OB { float o[]; };               // [nh, hd]
 layout(binding = 3) buffer OB { float o[]; };               // [nh, hd]
 #endif
 
+shared float spm[1024];
+shared float spl[1024];
 shared float wexp[1024];
 
 void main() {
@@ -32,18 +35,33 @@ void main() {
 #else
     uint nch = pc.n_chunks;
 #endif
+    for (uint c = t; c < nch; c += 32u) {
+        spm[c] = pm[base + c];
+        spl[c] = pl[base + c];
+    }
+    barrier();
     float mm = -3.0e38;
-    for (uint c = 0u; c < nch; c++) { mm = max(mm, pm[base + c]); }
-    for (uint c = t; c < nch; c += 32u) { wexp[c] = exp(pm[base + c] - mm); }
+    for (uint c = 0u; c < nch; c++) { mm = max(mm, spm[c]); }
+    for (uint c = t; c < nch; c += 32u) { wexp[c] = exp(spm[c] - mm); }
     barrier();
     float l = 0.0;
-    for (uint c = 0u; c < nch; c++) { l += pl[base + c] * wexp[c]; }
+    for (uint c = 0u; c < nch; c++) { l += spl[c] * wexp[c]; }
     float inv = 1.0 / l;
     for (uint d = d0 + t; d < d0 + hdt; d += 32u) {
         float acc = 0.0;
         // Skip zero-weight chunks: the self-chunking partial leaves pacc UNINITIALIZED for
         // workgroups past the live kv range (0 × garbage could be NaN, so test the weight).
-        for (uint c = 0u; c < nch; c++) {
+        // The loads of a batch go out before any weight test so they overlap.
+        uint c = 0u;
+        for (; c + 8u <= nch; c += 8u) {
+            float v[8];
+            [[unroll]] for (uint k = 0u; k < 8u; k++) v[k] = pacc[(base + c + k) * hd + d];
+            [[unroll]] for (uint k = 0u; k < 8u; k++) {
+                float w = wexp[c + k];
+                if (w != 0.0) { acc += v[k] * w; }
+            }
+        }
+        for (; c < nch; c++) {
             if (wexp[c] != 0.0) { acc += pacc[(base + c) * hd + d] * wexp[c]; }
         }
         o[h * hd + d] = acc * inv;

@@ -1,0 +1,208 @@
+#version 460
+// Multi-row (verify) K-quant GEMV y[r] = x[r]·Wᵀ on f32 activations (no quant_q8 pass), for GPUs
+// without fast int8 dot — the verify-batch twin of native_gemv_kq_fma.comp (the m=1 decode GEMV).
+// One 64-thread workgroup covers MR=4 input rows × NR output columns. Each lane loads its
+// superblock slice's weight words ONCE per iteration and dots them against all MR rows'
+// activations (reloading per row would re-traffic VRAM — the weight no longer fits L2 past a few
+// MB — while the int8 `mrow` this replaces streams it once). The m=1 grid re-streams the weight
+// per row (m× bandwidth), and the int8 `mrow` is ALU-bound where dp4a is emulated — while its
+// int8-quantized activations flip near-tie greedy tokens vs the fp32 decode stream (the Gemma4
+// MTP verify failure mode).
+// Per-row float op ORDER is identical to the m=1 kernel (same strided superblock traversal per
+// lane, same tree reduction), so row r here is bit-identical to the m=1 kernel's output for that
+// row — the MTP-verify-vs-decode identity contract holds by construction, the same argument as
+// the unified `linear_mmv_mrow(rows=1)` decode.
+// -DFMT_Q4K | -DFMT_Q6K. Requires in_f % 256 == 0. MR is fixed at 4; any `rows` runs grouped.
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef NR
+#define NR 8
+#endif
+const uint RG = uint(NR) / 4u;
+const uint MR = 4u;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint rows; uint in_f; uint out_f; uint w_base; uint arena_lo; uint arena_hi;
+} pc;
+layout(binding = 0) readonly buffer XB { vec4 x4[]; };
+layout(binding = 1) writeonly buffer YB { float y[]; };
+
+#include "native_weight_addr.glsl"
+#define NW(i) arena_word(i)
+#include "native_decode.glsl"
+
+shared float red[NR * 64];
+
+// Unaligned-safe word funnel: sh in {0,8,16,24}; (hi<<1)<<(31-sh) is 0 when sh==0.
+uint fun(uint lo, uint hi, uint sh) { return (lo >> sh) | ((hi << 1u) << (31u - sh)); }
+
+float dot4b(uint q, vec4 xv) {
+    return float(q & 0xFFu) * xv.x + float((q >> 8u) & 0xFFu) * xv.y
+         + float((q >> 16u) & 0xFFu) * xv.z + float(q >> 24u) * xv.w;
+}
+float hsum(vec4 v) { return (v.x + v.y) + (v.z + v.w); }
+
+// Weight words for superblock `sb` of rows row0..row0+3, this lane's slice (g, h): loaded ONCE
+// per lane-iteration and shared across the MR activation rows. Same words the m=1 kernel's
+// item() loads — only the sharing is new.
+#if defined(FMT_Q4K)
+void wload(uint row0, uint sb, uint g, uint h, out uvec4 hdr[4], out uvec4 qq[4]) {
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        uint row = min(row0 + r, pc.out_f - 1u);
+        uint bd = ((pc.w_base + row * pc.in_f) / 256u + sb) * 144u;
+        hdr[r] = NW4(bd >> 2u);
+        qq[r] = NW4((bd + 16u + 32u * g + 16u * h) >> 2u);
+    }
+}
+// Dots the preloaded words against activation row `xo` (word offset into x4). The float op order
+// matches the m=1 kernel's item() exactly.
+vec4 vdot(uint sb, uint g, uint h, uint xo, uvec4 hdr[4], uvec4 qq[4]) {
+    uint xb = ((sb * 256u + 64u * g + 16u * h) >> 2u) + xo;
+    vec4 xa[4];
+    vec4 xc[4];
+    [[unroll]] for (uint w = 0u; w < 4u; w++) {
+        xa[w] = x4[xb + w];
+        xc[w] = x4[xb + 8u + w];
+    }
+    float sxa = hsum(xa[0] + xa[1] + xa[2] + xa[3]);
+    float sxc = hsum(xc[0] + xc[1] + xc[2] + xc[3]);
+    vec4 out4;
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        float slo = 0.0, shi = 0.0;
+        [[unroll]] for (uint w = 0u; w < 4u; w++) {
+            slo += dot4b(qq[r][w] & 0x0F0F0F0Fu, xa[w]);
+            shi += dot4b((qq[r][w] >> 4u) & 0x0F0F0F0Fu, xc[w]);
+        }
+        vec2 dm = unpackHalf2x16(hdr[r].x);
+        uvec2 klo = k4w(2u * g, hdr[r]);
+        uvec2 khi = k4w(2u * g + 1u, hdr[r]);
+        out4[r] = dm.x * (float(klo.x) * slo + float(khi.x) * shi)
+                - dm.y * (float(klo.y) * sxa + float(khi.y) * sxc);
+    }
+    return out4;
+}
+#elif defined(FMT_Q6K)
+void wload(uint row0, uint sb, uint hf, uint j,
+           out uint la[8], out uint lb[8], out uint hh[8], out uint sw[8], out float dd[4]) {
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        uint row = min(row0 + r, pc.out_f - 1u);
+        uint bd = ((pc.w_base + row * pc.in_f) / 256u + sb) * 210u;
+        uint sh = (bd & 3u) * 8u;
+        uint qa = (bd + hf * 64u + 8u * j) >> 2u;
+        uint qh = (bd + 128u + hf * 32u + 8u * j) >> 2u;
+        uint sc = (bd + 192u + hf * 8u) >> 2u;
+        uvec2 a0 = NW2(qa); uint a2 = NW(qa + 2u);
+        uvec2 b0 = NW2(qa + 8u); uint b2 = NW(qa + 10u);
+        uvec2 h0 = NW2(qh); uint h2 = NW(qh + 2u);
+        uvec2 s0 = NW2(sc); uint s2 = NW(sc + 2u);
+        la[2u * r] = fun(a0.x, a0.y, sh); la[2u * r + 1u] = fun(a0.y, a2, sh);
+        lb[2u * r] = fun(b0.x, b0.y, sh); lb[2u * r + 1u] = fun(b0.y, b2, sh);
+        hh[2u * r] = fun(h0.x, h0.y, sh); hh[2u * r + 1u] = fun(h0.y, h2, sh);
+        sw[2u * r] = fun(s0.x, s0.y, sh); sw[2u * r + 1u] = fun(s0.y, s2, sh);
+        dd[r] = unpackHalf2x16((NW((bd + 208u) >> 2u) >> (((bd + 208u) & 3u) * 8u)) & 0xFFFFu).x;
+    }
+}
+vec4 vdot(uint hf, uint j, uint xo,
+          uint la[8], uint lb[8], uint hh[8], uint sw[8], float dd[4]) {
+    uint xb = ((hf * 128u + 8u * j) >> 2u) + xo;
+    vec4 xv[8];
+    float sx[4];
+    [[unroll]] for (uint og = 0u; og < 4u; og++) {
+        xv[og * 2u] = x4[xb + og * 8u];
+        xv[og * 2u + 1u] = x4[xb + og * 8u + 1u];
+        sx[og] = hsum(xv[og * 2u] + xv[og * 2u + 1u]);
+    }
+    vec4 out4;
+    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+        // NOTE: the m=1 kernel folds the superblock index into xb (`sb * 256`); here the caller
+        // passes xo already including it — same addresses, same order.
+        float acc = 0.0;
+        [[unroll]] for (uint og = 0u; og < 4u; og++) {
+            float s = 0.0;
+            [[unroll]] for (uint w = 0u; w < 2u; w++) {
+                uint src = (og & 1u) == 0u ? la[2u * r + w] : lb[2u * r + w];
+                uint q = ((og < 2u ? src : (src >> 4u)) & 0x0F0F0F0Fu)
+                       | (((hh[2u * r + w] >> (2u * og)) & 0x03030303u) << 4u);
+                s += dot4b(q, xv[og * 2u + w]);
+            }
+            uint si = og * 2u + (j >> 1u);
+            float scv = float(sgn8((sw[2u * r + (si >> 2u)] >> ((si & 3u) * 8u)) & 0xFFu));
+            acc += scv * (s - 32.0 * sx[og]);
+        }
+        out4[r] = dd[r] * acc;
+    }
+    return out4;
+}
+#endif
+
+void main() {
+    w_addr = arena_base(pc.arena_lo, pc.arena_hi);
+    uint lane = gl_LocalInvocationIndex;
+    uint l8 = lane & 7u;
+    uint slot = lane >> 3u;
+    uint tiles = (pc.out_f + uint(NR) - 1u) / uint(NR);
+    uint groups = (pc.rows + MR - 1u) / MR;
+    uint wgs = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint tile = wgs % tiles;
+    uint grp = wgs / tiles;
+    if (tile >= tiles || grp >= groups) { return; }
+    uint o0 = tile * uint(NR);
+    uint g0 = grp * MR;
+    uint in_f4 = pc.in_f >> 2u;
+    // Activation row word-offsets for the MR rows (xo already includes the superblock stride for
+    // Q4K; the Q6K vdot takes the sb part separately — see below).
+    uint nsb = pc.in_f / 256u;
+    vec4 acc[MR][RG];
+    [[unroll]] for (uint mr = 0u; mr < MR; mr++)
+        [[unroll]] for (uint g = 0u; g < RG; g++) acc[mr][g] = vec4(0.0);
+#if defined(FMT_Q4K)
+    uint g = l8 >> 1u;
+    uint h = l8 & 1u;
+    for (uint it = slot; it < RG * nsb; it += 8u) {
+        uint gg = it / nsb;
+        uint sb = it - gg * nsb;
+        uvec4 hdr[4]; uvec4 qq[4];
+        wload(o0 + 4u * gg, sb, g, h, hdr, qq);
+        [[unroll]] for (uint mr = 0u; mr < MR; mr++) {
+            if (g0 + mr < pc.rows) {
+                acc[mr][gg] += vdot(sb, g, h, (g0 + mr) * in_f4, hdr, qq);
+            }
+        }
+    }
+#elif defined(FMT_Q6K)
+    uint hf = l8 >> 2u;
+    uint j = l8 & 3u;
+    for (uint it = slot; it < RG * nsb; it += 8u) {
+        uint gg = it / nsb;
+        uint sb = it - gg * nsb;
+        uint la[8]; uint lb[8]; uint hh[8]; uint sw[8]; float dd[4];
+        wload(o0 + 4u * gg, sb, hf, j, la, lb, hh, sw, dd);
+        [[unroll]] for (uint mr = 0u; mr < MR; mr++) {
+            if (g0 + mr < pc.rows) {
+                acc[mr][gg] += vdot(hf, j, (g0 + mr) * in_f4 + (sb * 256u >> 2u),
+                                    la, lb, hh, sw, dd);
+            }
+        }
+    }
+#endif
+    // One m=1-shaped reduction per row (uniform guard — every lane agrees, barriers stay legal).
+    [[unroll]] for (uint mr = 0u; mr < MR; mr++) {
+        if (g0 + mr < pc.rows) {
+            [[unroll]] for (uint g = 0u; g < RG; g++)
+                [[unroll]] for (uint r = 0u; r < 4u; r++)
+                    red[(4u * g + r) * 64u + lane] = acc[mr][g][r];
+            barrier();
+            [[unroll]] for (uint s = 32u; s > 0u; s >>= 1u) {
+                if (lane < s) {
+                    [[unroll]] for (uint r = 0u; r < uint(NR); r++)
+                        red[r * 64u + lane] += red[r * 64u + lane + s];
+                }
+                barrier();
+            }
+            if (lane < uint(NR) && o0 + lane < pc.out_f) {
+                y[(g0 + mr) * pc.out_f + o0 + lane] = red[lane * 64u];
+            }
+        }
+    }
+}

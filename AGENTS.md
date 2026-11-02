@@ -55,3 +55,7 @@
 - Streaming is a standing goal: disk to DRAM to VRAM, so that any model size
   runs on any hardware. That includes the cache eviction logic in every tier,
   which should be as fast as it can be made.
+- Do not block a turn polling slow CI jobs: the CPU-goldens suite takes ~20+ min
+  on GHA. Merge/push once the fast signal is green (platform `cargo test` jobs,
+  clippy, fmt, plus a local run of the directly-affected tests), then check back
+  on the slow jobs and resolve any failures as a follow-up slice.)

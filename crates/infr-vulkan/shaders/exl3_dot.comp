@@ -12,7 +12,6 @@ layout(push_constant) uniform PC {
     uint rows; uint in_f; uint out_f; uint bits;
     uint trellis_lo; uint trellis_hi; uint codebook;
 } pc;
-shared float tile[256];
 shared float red[B_ROWS * 128];
 
 float half_rne(float value) {
@@ -26,10 +25,13 @@ float weight_at(uint64_t addr, uint base, uint r, uint c) {
     uint s = 8u * lane + entry;
     uint b0 = s * pc.bits + pc.bits + 256u * pc.bits - 16u;
     uint words = 8u * pc.bits;
-    uint wi = (b0 >> 5u) % words;
+    uint wi = b0 >> 5u;
+    if (wi >= words) { wi -= words; }
+    uint next = wi + 1u;
+    if (next == words) { next = 0u; }
     uint shift = b0 & 31u;
     uint a = Trellis(addr).v[base + wi];
-    uint b = Trellis(addr).v[base + (wi + 1u) % words];
+    uint b = Trellis(addr).v[base + next];
     uint funnel = shift == 0u ? a : (a << shift) | (b >> (32u - shift));
     uint w = funnel >> 16u;
     if (pc.codebook == 2u) {
@@ -58,17 +60,15 @@ void main() {
     for (uint r = 0u; r < B_ROWS; ++r) { acc[r] = 0.0; }
     for (uint ki = 0u; ki < pc.in_f / 16u; ++ki) {
         uint base = (ki * n_tiles + out0 / 16u) * (8u * pc.bits);
-        tile[p * 16u + col] = weight_at(addr, base, p, col);
-        tile[(p + 8u) * 16u + col] = weight_at(addr, base, p + 8u, col);
-        barrier();
+        float w0 = weight_at(addr, base, p, col);
+        float w1 = weight_at(addr, base, p + 8u, col);
         for (uint r = 0u; r < B_ROWS; ++r) {
             if (row0 + r < pc.rows) {
                 uint xb = (row0 + r) * pc.in_f + ki * 16u;
-                acc[r] += x[xb + p] * tile[p * 16u + col];
-                acc[r] += x[xb + p + 8u] * tile[(p + 8u) * 16u + col];
+                acc[r] += x[xb + p] * w0;
+                acc[r] += x[xb + p + 8u] * w1;
             }
         }
-        barrier();
     }
     for (uint r = 0u; r < B_ROWS; ++r) { red[r * 128u + t] = acc[r]; }
     barrier();

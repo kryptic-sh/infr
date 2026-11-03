@@ -1934,6 +1934,16 @@ impl infr_server::ChatGenerator for SeamGenerator {
     ) -> anyhow::Result<infr_server::ChatOutcome> {
         run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
     }
+
+    fn complete(
+        &self,
+        prompt: &str,
+        params: &infr_server::GenParams,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+        on_text: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        run_completion(self, prompt, params, cancel, on_text)
+    }
 }
 
 impl infr_server::ChatGenerator for ParallelGenerator {
@@ -1963,6 +1973,60 @@ impl infr_server::ChatGenerator for ParallelGenerator {
     ) -> anyhow::Result<infr_server::ChatOutcome> {
         run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
     }
+
+    fn complete(
+        &self,
+        prompt: &str,
+        params: &infr_server::GenParams,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
+        on_text: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<infr_server::ChatOutcome> {
+        run_completion(self, prompt, params, cancel, on_text)
+    }
+}
+
+/// The `/v1/completions` body shared by every serve backend: the raw prompt (plus BOS when the model
+/// wants one) is continued as plain text, with stop sequences applied to the decoded stream.
+fn run_completion(
+    be: &dyn GenBackend,
+    prompt: &str,
+    params: &infr_server::GenParams,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    on_text: &mut dyn FnMut(&str),
+) -> anyhow::Result<infr_server::ChatOutcome> {
+    be.weights().check()?;
+    let prompt = be.renderer().with_bos(prompt);
+    let max_new = params
+        .max_tokens
+        .map(|v| v as usize)
+        .unwrap_or_else(|| be.max_new_default());
+    let req = be
+        .request_ctx(request_sampling(params))
+        .with_cancel(cancel.clone());
+    let mut stops = infr_server::StopMatcher::new(params.stop.clone());
+    let stats = be.generate(&prompt, max_new, None, &req, &mut |piece: &str| {
+        let safe = stops.push(piece);
+        if !safe.is_empty() {
+            on_text(&safe);
+        }
+        if stops.hit() {
+            req.abort();
+        }
+    })?;
+    let tail = stops.flush();
+    if !tail.is_empty() {
+        on_text(&tail);
+    }
+    let finish = if !stops.hit() && stats.n_gen >= max_new {
+        infr_server::Finish::Length
+    } else {
+        infr_server::Finish::Stop
+    };
+    Ok(infr_server::ChatOutcome {
+        finish,
+        prompt_tokens: stats.n_prompt as u32,
+        completion_tokens: stats.n_gen as u32,
+    })
 }
 
 /// Tool-call parsing is enabled only when the request offers at least one tool and has not

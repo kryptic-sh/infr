@@ -9,6 +9,7 @@
 //!   GET  /metrics               -> Prometheus text exposition (see `metrics`)          (auth)
 //!   GET  /status                -> JSON: per-model backend, device, ctx, slots, memory (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
+//!   POST /v1/completions        -> text_completion | SSE text_completion stream (raw prompt, no template) (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
 //! (tokens — see `clamp_max_tokens`) and `serve.request_timeout_secs` (wall clock — see
@@ -45,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
+mod completions;
 mod metrics;
 mod status;
 
@@ -111,6 +113,19 @@ pub trait ChatGenerator: Send + Sync {
         cancel: &Arc<AtomicBool>,
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
+
+    /// Continue `prompt` as raw text — no chat template, no reasoning/tool splitting — streaming the
+    /// decoded pieces to `on_text`. Backs `/v1/completions`; `cancel` and the return value behave as
+    /// in [`chat`](Self::chat).
+    fn complete(
+        &self,
+        _prompt: &str,
+        _params: &GenParams,
+        _cancel: &Arc<AtomicBool>,
+        _on_text: &mut dyn FnMut(&str),
+    ) -> anyhow::Result<ChatOutcome> {
+        anyhow::bail!("this backend does not support text completions")
+    }
 
     /// Where this generator runs and how much room it has, read fresh on each call, for
     /// `GET /status` and the device gauges in `/metrics`. Report `None` for what the backend
@@ -1257,6 +1272,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(metrics::metrics_handler))
         .route("/status", get(status::status_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/completions", post(completions::completions_handler))
         .with_state(state)
 }
 

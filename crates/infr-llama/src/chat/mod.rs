@@ -323,6 +323,26 @@ impl OaiRenderer {
         &self.ecfg
     }
 
+    /// `prompt` with the model's BOS token in front when the GGUF asks for one and the prompt does
+    /// not already start with it — for raw text completion, where no chat template supplies it.
+    pub fn with_bos(&self, prompt: &str) -> String {
+        use infr_core::loader::MetaValue;
+        use infr_core::WeightSource;
+        let md = self.gguf.metadata();
+        let add = match md.get("tokenizer.ggml.add_bos_token") {
+            Some(MetaValue::Bool(b)) => *b,
+            _ => md.str("tokenizer.ggml.model") == Some("llama"),
+        };
+        let bos = add
+            .then(|| md.u64("tokenizer.ggml.bos_token_id"))
+            .flatten()
+            .and_then(|id| self.tokenizer.id_to_token(id as u32));
+        match bos {
+            Some(b) if !prompt.starts_with(&b) => format!("{b}{prompt}"),
+            _ => prompt.to_string(),
+        }
+    }
+
     /// `think` overrides the configured thinking default for this render (`None` = keep it).
     pub fn render(
         &self,

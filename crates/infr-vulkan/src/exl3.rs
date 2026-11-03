@@ -16,4 +16,5 @@ macro_rules! shader {
 shader!(hadamard_in, "exl3_hadamard_in");
 shader!(hadamard_out, "exl3_hadamard_out");
 shader!(gemv, "exl3_gemv");
+shader!(gemv_f16, "exl3_gemv_f16");
 shader!(prefill, "exl3_prefill");

@@ -2,6 +2,9 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_control_flow_attributes : require
+#ifdef USE_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 #ifndef B_ROWS
 #define B_ROWS 1
 #endif
@@ -33,8 +36,13 @@ float decode(uint w) {
     }
     uint h = pc.codebook == 0u ? w * 89226354u + 64248484u : w * 0xcbac1fedu;
     h = (h & 0x8fff8fffu) ^ 0x3b603b60u;
+#ifdef USE_F16
+    f16vec2 hv = unpackFloat2x16(h);
+    return float(hv.x + hv.y);
+#else
     vec2 halves = unpackHalf2x16(h);
     return half_rne(halves.x + halves.y);
+#endif
 }
 
 uint funnel(uint a, uint b, uint sh) {

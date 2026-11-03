@@ -332,6 +332,12 @@ impl SamplingOpts {
 enum Cmd {
     /// Download + cache a model (`org/repo[:quant]` from HuggingFace, or a path to a `.gguf`).
     Pull { model: String },
+    /// List models in the local cache (what `infr pull` downloaded).
+    #[command(alias = "list")]
+    Ls,
+    /// Remove a cached model: `org/repo` deletes the whole repo, `org/repo:quant` just that quant.
+    #[command(alias = "remove")]
+    Rm { model: String },
     /// List the Vulkan physical devices infr can see — index, name, type, VRAM — marking the
     /// device the default (no `--dev`) path binds. The index is the `--dev VulkanN` / `INFR_DEV`
     /// handle. Reports each device's external-memory extensions (GPU↔GPU / dma-buf feasibility).
@@ -661,7 +667,12 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             // override it wins over the file and the environment just as that overwrite did.
             layer.sampling.ignore_eos = Some(true);
         }
-        Cmd::Pull { .. } | Cmd::Devices | Cmd::Multi { .. } | Cmd::Compare { .. } => {}
+        Cmd::Pull { .. }
+        | Cmd::Ls
+        | Cmd::Rm { .. }
+        | Cmd::Devices
+        | Cmd::Multi { .. }
+        | Cmd::Compare { .. } => {}
     }
     Ok(layer)
 }
@@ -669,6 +680,8 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
 fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model, cfg),
+        Cmd::Ls => cmd_ls(),
+        Cmd::Rm { model } => cmd_rm(&model),
         Cmd::Devices => cmd_devices(cfg),
         Cmd::Run {
             model,
@@ -948,6 +961,52 @@ fn cmd_pull(model: &str, cfg: &Config) -> anyhow::Result<()> {
     let path = infr_hub::ensure_latest(&r, cfg).map_err(|e| anyhow!("{e}"))?;
     // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
     println!("{}", path.display());
+    Ok(())
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1000.0 && u < UNITS.len() - 1 {
+        v /= 1000.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+fn cmd_ls() -> anyhow::Result<()> {
+    let store = infr_hub::Store::discover().map_err(|e| anyhow!("{e}"))?;
+    let models = store.list();
+    // print-ok: program OUTPUT — the `infr ls` table users read and pipe.
+    let names: Vec<String> = models
+        .iter()
+        .map(|m| format!("{}:{}", m.repo, m.file))
+        .collect();
+    let w = names.iter().map(String::len).max().unwrap_or(0).max(5);
+    println!("{:<w$}  {:<10} {:>6}", "MODEL", "SIZE", "SHARDS");
+    for (m, name) in models.iter().zip(&names) {
+        println!("{name:<w$}  {:<10} {:>6}", human_size(m.bytes), m.shards);
+    }
+    Ok(())
+}
+
+fn cmd_rm(model: &str) -> anyhow::Result<()> {
+    let infr_hub::ModelRef::Repo { repo, sel } =
+        infr_hub::ModelRef::parse(model).map_err(|e| anyhow!("{e}"))?
+    else {
+        anyhow::bail!("'{model}' is not a cached model reference (expected org/repo[:quant])");
+    };
+    let store = infr_hub::Store::discover().map_err(|e| anyhow!("{e}"))?;
+    let r = store
+        .remove(&repo, sel.as_deref())
+        .map_err(|e| anyhow!("{e}"))?;
+    // print-ok: program OUTPUT — confirmation of what `infr rm` deleted.
+    println!("removed {model} ({} freed)", human_size(r.bytes));
     Ok(())
 }
 

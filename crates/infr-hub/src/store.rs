@@ -162,7 +162,7 @@ impl Store {
     /// Snapshot dirs for `repo`, the one named by `refs/main` FIRST (when present), then the rest.
     /// HF leaves stale snapshots in place across commits, so preferring `refs/main` avoids returning
     /// an arbitrary older snapshot for the current model.
-    fn ordered_snapshots(&self, repo: &str) -> Vec<PathBuf> {
+    pub(crate) fn ordered_snapshots(&self, repo: &str) -> Vec<PathBuf> {
         // An invalid repo id has no snapshots: nothing outside the cache is ever listed for it.
         let Ok(dir) = self.repo_dir(repo) else {
             return Vec::new();
@@ -247,7 +247,7 @@ const MAX_SNAPSHOT_DEPTH: usize = 3;
 /// they are re-joined onto `snap` to test for existence. A NON-recursive listing here was the bug
 /// that made a subdirectory GGUF invisible to the cache check, so `infr run` re-downloaded multiple
 /// GB on every single invocation.
-fn snapshot_ggufs(snap: &Path) -> Vec<String> {
+pub(crate) fn snapshot_ggufs(snap: &Path) -> Vec<String> {
     let mut out = Vec::new();
     collect_ggufs(snap, "", 0, &mut out);
     out

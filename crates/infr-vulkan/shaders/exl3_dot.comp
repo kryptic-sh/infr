@@ -5,6 +5,10 @@
 #ifdef USE_F16
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
+#ifdef SHUFFLE
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
 #ifndef B_ROWS
 #define B_ROWS 1
 #endif
@@ -55,17 +59,33 @@ void main() {
     if (unit >= ((pc.rows + B_ROWS - 1u) / B_ROWS) * n_tiles) { return; }
     uint row0 = (unit / n_tiles) * B_ROWS;
     uint tile = unit % n_tiles;
+#ifdef SHUFFLE
+    uint lane = gl_SubgroupInvocationID & 31u;
+    uint slice = gl_SubgroupID * (gl_SubgroupSize >> 5u) + (gl_SubgroupInvocationID >> 5u);
+    uint sbase = gl_SubgroupInvocationID & ~31u;
+    uint t = slice * 32u + lane;
+#else
     uint t = gl_LocalInvocationID.x;
     uint lane = t & 31u;
     uint slice = t >> 5u;
+#endif
     uint r0 = 2u * (lane & 3u);
     uint c0 = 2u * (lane >> 3u) + ((lane >> 2u) & 1u);
     uint64_t addr = (uint64_t(pc.trellis_hi) << 32) | uint64_t(pc.trellis_lo);
-    uint words = 8u * pc.bits;
-    uint total = 256u * pc.bits;
-    uint start = ((8u * lane + 1u) * pc.bits + total - 16u) % total;
+#ifdef BITS
+    const uint nbits = uint(BITS);
+    // 8*lane*bits is a multiple of 32 when bits % 4 == 0, so the bit offset is lane-invariant.
+    const uint off = (nbits % 4u == 0u) ? ((nbits + 1024u - 16u) & 31u) : 0u;
+#else
+    uint nbits = pc.bits;
+#endif
+    uint words = 8u * nbits;
+    uint total = 256u * nbits;
+    uint start = ((8u * lane + 1u) * nbits + total - 16u) % total;
     uint w0 = start >> 5u;
+#ifndef BITS
     uint off = start & 31u;
+#endif
     uint i1 = w0 + 1u >= words ? w0 + 1u - words : w0 + 1u;
     uint i2 = i1 + 1u >= words ? i1 + 1u - words : i1 + 1u;
     uint i3 = i2 + 1u >= words ? i2 + 1u - words : i2 + 1u;
@@ -73,15 +93,50 @@ void main() {
     float acc_hi[B_ROWS];
     for (uint r = 0u; r < B_ROWS; ++r) { acc_lo[r] = 0.0; acc_hi[r] = 0.0; }
     uint k_tiles = pc.in_f / 16u;
+#ifdef SHUFFLE
+    bool two = words > 32u;
+    uint ca = 0u, cb = 0u;
+    if (slice < k_tiles) {
+        uint base = (slice * n_tiles + tile) * words;
+        if (lane < words) { ca = Trellis(addr).v[base + lane]; }
+        if (two && lane + 32u < words) { cb = Trellis(addr).v[base + 32u + lane]; }
+    }
+#endif
     for (uint ki = slice; ki < k_tiles; ki += K_SLICES) {
+#ifdef SHUFFLE
+        uint na = 0u, nb = 0u;
+        uint kn = ki + K_SLICES;
+        if (kn < k_tiles) {
+            uint nbase = (kn * n_tiles + tile) * words;
+            if (lane < words) { na = Trellis(addr).v[nbase + lane]; }
+            if (two && lane + 32u < words) { nb = Trellis(addr).v[nbase + 32u + lane]; }
+        }
+        uint a0 = subgroupShuffle(ca, sbase + (w0 & 31u));
+        uint a1 = subgroupShuffle(ca, sbase + (i1 & 31u));
+        uint a2 = subgroupShuffle(ca, sbase + (i2 & 31u));
+        uint a3 = subgroupShuffle(ca, sbase + (i3 & 31u));
+        if (two) {
+            uint b0 = subgroupShuffle(cb, sbase + (w0 & 31u));
+            uint b1 = subgroupShuffle(cb, sbase + (i1 & 31u));
+            uint b2 = subgroupShuffle(cb, sbase + (i2 & 31u));
+            uint b3 = subgroupShuffle(cb, sbase + (i3 & 31u));
+            a0 = w0 >= 32u ? b0 : a0;
+            a1 = i1 >= 32u ? b1 : a1;
+            a2 = i2 >= 32u ? b2 : a2;
+            a3 = i3 >= 32u ? b3 : a3;
+        }
+        ca = na;
+        cb = nb;
+#else
         uint base = (ki * n_tiles + tile) * words;
         uint a0 = Trellis(addr).v[base + w0];
         uint a1 = Trellis(addr).v[base + i1];
         uint a2 = Trellis(addr).v[base + i2];
         uint a3 = Trellis(addr).v[base + i3];
+#endif
         float wv[8];
         [[unroll]] for (uint e = 0u; e < 8u; ++e) {
-            uint p = off + e * pc.bits;
+            uint p = off + e * nbits;
             uint q = p >> 5u;
             uint hi = q == 0u ? a0 : (q == 1u ? a1 : a2);
             uint lo = q == 0u ? a1 : (q == 1u ? a2 : a3);

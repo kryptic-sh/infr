@@ -26,6 +26,22 @@ fn main() {
         ),
         ("exl3_dot", "exl3_gemv", &["-DK_SLICES=16"]),
         ("exl3_dot", "exl3_gemv_f16", &["-DK_SLICES=16", "-DUSE_F16"]),
+        ("exl3_dot", "exl3_gemv_sh", &["-DK_SLICES=16", "-DSHUFFLE"]),
+        (
+            "exl3_dot",
+            "exl3_gemv_f16_sh",
+            &["-DK_SLICES=16", "-DUSE_F16", "-DSHUFFLE"],
+        ),
+        (
+            "exl3_dot",
+            "exl3_gemv_sh_b4",
+            &["-DK_SLICES=16", "-DSHUFFLE", "-DBITS=4"],
+        ),
+        (
+            "exl3_dot",
+            "exl3_gemv_f16_sh_b4",
+            &["-DK_SLICES=16", "-DUSE_F16", "-DSHUFFLE", "-DBITS=4"],
+        ),
         ("exl3_dot", "exl3_prefill", &["-DB_ROWS=8"]),
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
         ("gemm_warp", "gemm_warp", &[]),

@@ -1807,10 +1807,19 @@ impl<'a> Recorder<'a> {
             rows * (spec.in_f / 128),
         );
         let batch = if rows == 1 { 1 } else { 8 };
-        let (name, spv) = if rows == 1 && self.be.caps().f16 {
-            ("exl3_gemv_f16", crate::exl3::gemv_f16())
-        } else if rows == 1 {
-            ("exl3_gemv", crate::exl3::gemv())
+        let caps = self.be.caps();
+        let shuffle = caps.subgroup_min >= 32;
+        let (name, spv) = if rows == 1 {
+            match (caps.f16, shuffle) {
+                (true, true) if spec.bits == 4 => {
+                    ("exl3_gemv_f16_sh_b4", crate::exl3::gemv_f16_sh_b4())
+                }
+                (false, true) if spec.bits == 4 => ("exl3_gemv_sh_b4", crate::exl3::gemv_sh_b4()),
+                (true, true) => ("exl3_gemv_f16_sh", crate::exl3::gemv_f16_sh()),
+                (true, false) => ("exl3_gemv_f16", crate::exl3::gemv_f16()),
+                (false, true) => ("exl3_gemv_sh", crate::exl3::gemv_sh()),
+                (false, false) => ("exl3_gemv", crate::exl3::gemv()),
+            }
         } else {
             ("exl3_prefill", crate::exl3::prefill())
         };

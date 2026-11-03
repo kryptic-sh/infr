@@ -25,6 +25,7 @@ fn main() {
             &["-DOUTPUT_TRANSFORM"],
         ),
         ("exl3_dot", "exl3_gemv", &["-DK_SLICES=16"]),
+        ("exl3_dot", "exl3_gemv_f16", &["-DK_SLICES=16", "-DUSE_F16"]),
         ("exl3_dot", "exl3_prefill", &["-DB_ROWS=8"]),
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
         ("gemm_warp", "gemm_warp", &[]),

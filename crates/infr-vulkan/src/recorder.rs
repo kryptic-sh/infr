@@ -1807,7 +1807,9 @@ impl<'a> Recorder<'a> {
             rows * (spec.in_f / 128),
         );
         let batch = if rows == 1 { 1 } else { 8 };
-        let (name, spv) = if rows == 1 {
+        let (name, spv) = if rows == 1 && self.be.caps().f16 {
+            ("exl3_gemv_f16", crate::exl3::gemv_f16())
+        } else if rows == 1 {
             ("exl3_gemv", crate::exl3::gemv())
         } else {
             ("exl3_prefill", crate::exl3::prefill())

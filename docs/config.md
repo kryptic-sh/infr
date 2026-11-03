@@ -225,6 +225,8 @@ and these exist to force one off when bisecting a correctness or perf problem.
   today. The hardware-shaped numbers (split counts, thresholds, rows per
   workgroup, subgroup pins) are per-device tuning parameters, set under
   `[kernels.vulkan.tune]`; see the next section.
+  Some defaults were measured on one GPU and may be wrong for yours; A/B them
+  with `infr bench` before trusting one.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
   dtype, plus `deltanet`, `moe` and `pipeline_cache` (persist the compiled
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so

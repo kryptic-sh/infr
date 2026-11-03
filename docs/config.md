@@ -216,6 +216,20 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `no_replay`, `no_vram_guard`, the BDA chunk caps). Note `f16 = false` also
   disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
   today.
+
+  Some defaults were measured on one GPU and may be wrong for yours. These are
+  worth an A/B with `infr bench` before you trust them. Each one may help, do
+  nothing, or regress on a given device:
+
+  - `mmv_mw` (`INFR_MMV_MW`): `true` routes every dtype with an int8 decode
+    kernel through it, including Q5_K, Q8_0, Q4_1 and Q3_K, which are off by
+    default. On an RX 580, Gemma 4 E4B Q5_K_S decode went from 20.7 to 34.6
+    tok/s, because GCN4's fp32 dequant GEMV is slow. On a 7900 XTX, Q5_K measured
+    about 1.4% slower. Greedy output can drift slightly from the fp32 path, and
+    Q3_K has a known coherence cliff on small mixed Q2_K files. An empty
+    `INFR_MMV_MW=` counts as on; only `0` forces off.
+  - `mmv_o4`, `mmv_m4`: the decode MMV layouts. Both default on; turning `mmv_o4`
+    off was slower on every RX 580 shape measured.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
   dtype, plus `deltanet`, `moe` and `pipeline_cache` (persist the compiled
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so

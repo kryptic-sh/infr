@@ -124,7 +124,7 @@ void main() {
 #ifdef SELF_CHUNK
     // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, so derive the
     // SAME adaptive policy the `attn_live` prologue and `attn_partial`'s SELF_CHUNK arm use (~32
-    // chunks/head, 64..512, floored by the baked minimum pc.chunk) from the LIVE kv_len. The
+    // chunks/head, floored by the baked minimum pc.chunk, capped at 512) from the LIVE kv_len. The
     // prologue dispatches EXACTLY nh·live workgroups (indirect), so the workgroup → (head, chunk)
     // decomposition must use the live count, NOT pc.n_chunks (only the pm/pl/pacc scratch stride).
     uint kv_len = p_kvlen;
@@ -137,7 +137,7 @@ void main() {
     uint lo = 0u;
 #endif
     uint span = kv_len - lo;
-    uint chunkv = max(pc.chunk, min(max(span / 32u, 64u), 512u));
+    uint chunkv = min(max(span / 32u, pc.chunk), 512u);
     uint live = (span + chunkv - 1u) / chunkv;
     uint hh = gl_WorkGroupID.x % g;
     uint rest = gl_WorkGroupID.x / g;

@@ -6,8 +6,6 @@
 //! two is what a staging rewrite could win, and a small gap means decode is already at the wall.
 //!
 //! Run: `cargo test -p infr-vulkan --release --test bw_scan -- --ignored --nocapture`
-mod bench_support;
-
 use infr_core::backend::{Backend, BufferUsage};
 use infr_vulkan::VulkanBackend;
 use std::time::Instant;

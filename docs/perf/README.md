@@ -20,6 +20,9 @@ headline.
 - **[vulkan-kq-fma-splitk.md](vulkan-kq-fma-splitk.md)** — why the prefill
   GEMM's narrow grid is worth a split-k, and why it only pays when the slices
   share one dispatch.
+- **[vulkan-decode-attn-chunk.md](vulkan-decode-attn-chunk.md)** — the decode
+  attention split-K chunk floor: why 64 keys per chunk was the wrong floor at
+  rows==1, and what it cost at shallow depths.
 - **[kernels.md](kernels.md)** — cross-backend fast-kernel coverage: which
   weight-quant formats have a native kernel on CPU / Vulkan / Metal, and each
   backend's decode strategy.

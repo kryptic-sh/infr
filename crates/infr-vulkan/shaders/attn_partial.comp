@@ -281,14 +281,14 @@ void main() {
     // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, but ONE baked
     // chunk can't serve every depth (small chunks drown in per-workgroup overhead at deep kv; big
     // chunks under-occupy at shallow kv). Derive the SAME adaptive policy the re-recording path
-    // uses (~32 chunks/head, 64..512, floored by the baked minimum pc.chunk) from the LIVE kv_len.
+    // uses (~32 chunks/head, floored by the baked minimum pc.chunk, capped at 512) from the LIVE kv_len.
     // The attn_live prologue dispatches EXACTLY nh·live workgroups (indirect), so the workgroup →
     // (head, chunk) decomposition must use the live count, NOT the baked pc.n_chunks (which is
     // only the pm/pl/pacc scratch stride).
     // Chunk the WINDOW's span, offset by `lo` — every dispatched chunk is fully in-window (the
     // attn_live prologue derives the identical span-based live count).
     uint span = kv_len - lo;
-    uint chunkv = max(pc.chunk, min(max(span / 32u, 64u), 512u));
+    uint chunkv = min(max(span / 32u, pc.chunk), 512u);
     uint live = (span + chunkv - 1u) / chunkv;
     uint hh = gl_WorkGroupID.x % g;
     uint rest = gl_WorkGroupID.x / g;

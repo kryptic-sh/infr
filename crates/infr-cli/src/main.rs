@@ -636,7 +636,7 @@ fn main() -> anyhow::Result<()> {
     // SIGINT/SIGTERM into 130/143, and it does so in preference to the abort error the unwinding
     // produced (an aborted forward reports `aborted: shutdown requested`, which is noise once we
     // are already saying "interrupted" with the right status).
-    let res = dispatch(cmd, &cfg, &specified);
+    let res = dispatch(cmd, &cfg, &specified, &overrides);
     exit_if_signalled();
     res
 }
@@ -677,7 +677,12 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
     Ok(layer)
 }
 
-fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::Result<()> {
+fn dispatch(
+    cmd: Cmd,
+    cfg: &Arc<Config>,
+    specified: &PartialConfig,
+    overrides: &ConfigOverrides,
+) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model, cfg),
         Cmd::Ls => cmd_ls(),
@@ -740,6 +745,17 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             turns,
             llama_bench,
         } => {
+            if cfg
+                .prof
+                .out
+                .iter()
+                .chain(cfg.prof.trace.iter())
+                .any(|path| !path.as_os_str().is_empty())
+            {
+                tracing::warn!(
+                    "compare reuses profiling output paths; later processes may overwrite reports"
+                );
+            }
             if sweep {
                 cmd_compare_sweep(
                     &models,
@@ -751,6 +767,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
                     ubatch,
                     &llama_bench,
                     cfg,
+                    overrides,
                 )
             } else {
                 if models.len() > 1 {
@@ -771,6 +788,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
                     &turns,
                     &llama_bench,
                     cfg,
+                    overrides,
                 )
             }
         }
@@ -3084,6 +3102,7 @@ fn cmd_compare_sweep(
     ubatch: usize,
     llama_bench: &str,
     cfg: &Arc<Config>,
+    overrides: &ConfigOverrides,
 ) -> anyhow::Result<()> {
     const METRICS: [&str; 4] = ["pp512", "tg128", "tg64@d", "pp4@d"];
     // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
@@ -3112,6 +3131,7 @@ fn cmd_compare_sweep(
             ubatch,
             llama_bench,
             cfg.clone(),
+            overrides,
         ) {
             Ok(mb) => mb,
             Err(e) => {
@@ -3237,6 +3257,19 @@ fn compare_infr_dev(dev: &str) -> &str {
     }
 }
 
+fn compare_config_args(overrides: &ConfigOverrides) -> Vec<std::ffi::OsString> {
+    let mut args = Vec::new();
+    if let Some(path) = &overrides.config_path {
+        args.push("--config".into());
+        args.push(path.as_os_str().to_owned());
+    }
+    for value in &overrides.sets {
+        args.push("--set".into());
+        args.push(value.as_str().into());
+    }
+    args
+}
+
 /// One model's infr-vs-llama.cpp bench harness: resolves the shared model ref once and shells
 /// out to `infr bench --json` / `llama-bench -o json` with MATCHED flags. Both the deep
 /// coding-agent scenarios (`cmd_compare`) and the multi-model survey (`cmd_compare_sweep`) run
@@ -3269,6 +3302,7 @@ struct ModelBench {
     /// its own), and that function takes `sampling.ignore_eos` / `sampling.seed` from a
     /// `Config` rather than from the environment.
     cfg: Arc<Config>,
+    infr_config_args: Vec<std::ffi::OsString>,
 }
 
 impl ModelBench {
@@ -3282,6 +3316,7 @@ impl ModelBench {
         ubatch: usize,
         llama_bench: &str,
         cfg: Arc<Config>,
+        overrides: &ConfigOverrides,
     ) -> anyhow::Result<Self> {
         let exe = std::env::current_exe().context("locating the infr binary")?;
         // infr and llama.cpp share the HF Hub cache and the same `org/repo:quant` ref grammar, so
@@ -3325,6 +3360,7 @@ impl ModelBench {
             reps,
             ubatch,
             cfg,
+            infr_config_args: compare_config_args(overrides),
         })
     }
 
@@ -3335,12 +3371,8 @@ impl ModelBench {
         infr_llama::mtp::has_mtp_head(&self.gguf_path)
     }
 
-    /// Run `infr bench --json` and return the parsed row object (`[{"avg_ts": .., ..}]`'s first
-    /// element) — shared by [`infr`](Self::infr) (`avg_ts`) and [`infr_mtp`](Self::infr_mtp)
-    /// (`mtp_ts`), so both read one shelled-out call's worth of plumbing.
-    fn infr_json(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
-        use std::process::Command;
-        let mut c = Command::new(&self.exe);
+    fn infr_command(&self, args: &[&str]) -> std::process::Command {
+        let mut c = std::process::Command::new(&self.exe);
         c.arg("bench")
             .arg(&self.model)
             .args(["-r", &self.reps.to_string()]);
@@ -3356,8 +3388,30 @@ impl ModelBench {
         if self.ubatch > 0 {
             c.args(["-u", &self.ubatch.to_string()]);
         }
-        c.args(args).arg("--json");
-        let out = c.output().context("running `infr bench`")?;
+        c.args(&self.infr_config_args).args(args).arg("--json");
+        c
+    }
+
+    /// Run `infr bench --json` with the invocation's configuration overrides.
+    fn infr_json(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
+        let out = self
+            .infr_command(args)
+            .output()
+            .context("running `infr bench`")?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::ensure!(
+            out.status.success(),
+            "infr bench exited with {}: {}",
+            out.status,
+            stderr.trim()
+        );
+        for line in stderr.lines() {
+            if line.contains("ERROR") {
+                tracing::error!(model = %self.model, diagnostic = %line, "infr bench");
+            } else if line.contains("WARN") || line.starts_with("warning:") {
+                tracing::warn!(model = %self.model, diagnostic = %line, "infr bench");
+            }
+        }
         serde_json::from_slice(&out.stdout).with_context(|| {
             format!(
                 "parsing infr bench output: {}",
@@ -3839,6 +3893,7 @@ fn cmd_compare(
     turns: &[String],
     llama_bench: &str,
     cfg: &Arc<Config>,
+    overrides: &ConfigOverrides,
 ) -> anyhow::Result<()> {
     let mb = ModelBench::new(
         model,
@@ -3849,6 +3904,7 @@ fn cmd_compare(
         ubatch,
         llama_bench,
         cfg.clone(),
+        overrides,
     )?;
     let infr_b = |args: &[&str]| mb.infr(args);
     let llama_b = |np: usize, ng: usize, args: &[&str]| mb.llama(np, ng, args);
@@ -4585,6 +4641,90 @@ mod tests {
             resolve_backend(None, BackendEnv::default()).unwrap(),
             Backend::Vulkan(None)
         );
+    }
+
+    #[test]
+    fn compare_forwards_config_and_sets_to_infr() {
+        let cli = Cli::try_parse_from([
+            "infr",
+            "--config",
+            "config with spaces.toml",
+            "--set",
+            "kernels.vulkan.kq_fma_gemv=false",
+            "--set",
+            "kernels.vulkan.mrows_attn=true",
+            "compare",
+            "fixture.gguf",
+        ])
+        .unwrap();
+        let overrides = ConfigOverrides {
+            config_path: cli.config,
+            sets: cli.set,
+            flags: PartialConfig::default(),
+        };
+        let mut mb = ModelBench {
+            exe: PathBuf::from("infr"),
+            model: "fixture.gguf".into(),
+            gguf_path: PathBuf::from("fixture.gguf"),
+            tok_path: None,
+            is_dg: false,
+            llama_model_args: vec!["-m".into(), "fixture.gguf".into()],
+            llama_bench: "llama-bench".into(),
+            dev: "Vulkan0".into(),
+            ngl: 999,
+            threads: 0,
+            reps: 3,
+            ubatch: 0,
+            cfg: Arc::new(Config::default()),
+            infr_config_args: compare_config_args(&overrides),
+        };
+        let cmd = mb.infr_command(&["-p", "4", "-n", "0", "-d", "4096"]);
+        let got: Vec<_> = cmd.get_args().map(|a| a.to_os_string()).collect();
+        let want: Vec<std::ffi::OsString> = [
+            "bench",
+            "fixture.gguf",
+            "-r",
+            "3",
+            "--ngl",
+            "999",
+            "--dev",
+            "Vulkan0",
+            "--config",
+            "config with spaces.toml",
+            "--set",
+            "kernels.vulkan.kq_fma_gemv=false",
+            "--set",
+            "kernels.vulkan.mrows_attn=true",
+            "-p",
+            "4",
+            "-n",
+            "0",
+            "-d",
+            "4096",
+            "--json",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        assert_eq!(got, want);
+        assert!(compare_config_args(&ConfigOverrides::default()).is_empty());
+
+        mb.threads = 4;
+        mb.ubatch = 512;
+        mb.infr_config_args = compare_config_args(&ConfigOverrides {
+            sets: vec!["device.threads=2".into(), "device.ubatch=256".into()],
+            ..Default::default()
+        });
+        let cmd = mb.infr_command(&["-p", "4", "-n", "0", "-d", "4096"]);
+        let child = Cli::try_parse_from(
+            std::iter::once(std::ffi::OsString::from("infr"))
+                .chain(cmd.get_args().map(std::ffi::OsStr::to_os_string)),
+        )
+        .unwrap();
+        let flags = cli_flag_layer(child.cmd.as_ref().unwrap()).unwrap();
+        let cfg = resolve_cfg(&[], flags, &["device.threads=2", "device.ubatch=256"]);
+        assert_eq!(cfg.device.threads, Some(4));
+        assert_eq!(cfg.device.ubatch, Some(512));
     }
 
     #[test]

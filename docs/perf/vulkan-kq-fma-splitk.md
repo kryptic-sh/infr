@@ -59,3 +59,26 @@ Q4_0/Q4_K/Q6_K and both tiles.
 
 `INFR_KQ_FMA_SPLITK=<n>` (config `kernels.vulkan.kq_fma_splitk`) forces the count; `1`
 disables the split.
+
+## Tiles that were measured and rejected
+
+The grid is the easy axis. The tile itself is not, and both wider shapes lost on this card:
+
+| Variant | Shared (per workgroup) | Result |
+| --- | ---: | --- |
+| `BN=128`, `BK=32`, 8x8 per thread (shipped) | 32 KiB | pp512 360 t/s, pp128 318 |
+| `BN=256` for Q4_0, 8x16 per thread | 48 KiB | pp512 331, pp128 299 (-8%) |
+| `BK=16`, 16 KiB | 16 KiB | rejected: parity failure |
+
+`BN=256` is numerically clean — a Q4_0 staging thread owns one whole 32-element block, so it
+reads both nibble halves of the same bytes — but 48 KiB of shared memory drops residency from
+two workgroups per CU to one, and half the residency costs more than the reduced load count
+buys. `BK=16` would fit three or four workgroups, yet it cannot work in this kernel: the quant
+block math assumes a 32-element-aligned `k0` (a 16-aligned tile start lands in the wrong Q4_0
+block, and `part * EPT` offsets no longer start a run), so `nc_kq_fma_gemm_parity_and_determinism`
+fails for Q4_0 at `BN=64` before any measurement.
+
+Both are reverted. The shipped tile sits at a local optimum: 32 KiB exactly, two workgroups per
+CU, 64 accumulators per thread. The distance to the fp32 peak (~4.1 of 6.17 TFLOP/s on the two
+hot rows) is per-thread issue rate, not tile shape — closing it means packed f16 math, which
+trades the exactness the parity test enforces.

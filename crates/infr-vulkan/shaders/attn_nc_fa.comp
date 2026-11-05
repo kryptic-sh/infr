@@ -65,7 +65,13 @@ layout(push_constant) uniform PC {
     uint window; // sliding-window size (0 = full causal)
     float scale; // 0 → 1/√hd
     uint cap; // total cache ELEMENTS (ring row mapping); matches attn_partial's push
+    // Page table (kv.paged): the device address of the slot's logical→physical page ids, and the
+    // rows per page. `page_rows == 0` means the cache is one contiguous run and `pages` is unused.
+    uint page_lo;
+    uint page_hi;
+    uint page_rows;
 } pc;
+#include "kv_addr.glsl"
 layout(binding = 0) readonly buffer QB { f16vec4 q4[]; }; // [q_len, nh, hd]
 layout(binding = 1) readonly buffer KB { f16vec4 k4[]; }; // [rcap, nkv, hd] (ring rows)
 layout(binding = 2) readonly buffer VB { f16vec4 v4[]; }; // [rcap, nkv, hd]
@@ -92,6 +98,11 @@ void main() {
     // on a full-context cache (every live j < kv_len <= rcap).
     uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
 #define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
+    // Page walk: a page is `page_rows` rows (512) and BN is 64, so every kv tile below sits inside
+    // ONE page — the tile's shift is a single table word, and `RROW(kpos) + rsh` is the physical row
+    // (the ring modulo is identity here: a paged cache is never a ring).
+    uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
+    uint page_rows = pc.page_rows;
 
     for (uint i = li; i < BM * hd; i += THREADS) { Os[i] = 0.0; }
     if (li < BM) {
@@ -114,6 +125,11 @@ void main() {
     uint kvend = min(pc.kv_len, pc.pos + qr0 + BM);
 
     for (uint b0 = lo_tile; b0 < kvend; b0 += BN) {
+        uint rsh = 0u;
+        if (page_rows > 0u) {
+            uint pg = b0 / page_rows;
+            rsh = (kv_word(pt, pg) - pg) * page_rows;
+        }
         // ── S = Q·Kᵀ over BK-dim chunks (native_gemm_fma's staging pattern) ──
         float accs[E];
         [[unroll]] for (uint e = 0u; e < E; e++) accs[e] = 0.0;
@@ -141,7 +157,7 @@ void main() {
                 uint kpos = b0 + j;
                 uint d = k0 + c4 * 4u;
                 vec4 kv = (kpos < pc.kv_len && d < hd)
-                              ? vec4(k4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
+                              ? vec4(k4[((RROW(kpos) + rsh) * pc.nkv + kvh) * hd4 + (d >> 2u)])
                               : vec4(0.0);
                 uint b = j * SK + c4 * 4u;
                 KVs[b] = kv.x;
@@ -200,7 +216,7 @@ void main() {
                 uint kpos = b0 + j;
                 uint d = d0 + c4 * 4u;
                 vec4 vv = (kpos < pc.kv_len && d < hd)
-                              ? vec4(v4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
+                              ? vec4(v4[((RROW(kpos) + rsh) * pc.nkv + kvh) * hd4 + (d >> 2u)])
                               : vec4(0.0);
                 uint b = j * SK + c4 * 4u;
                 KVs[b] = vv.x;

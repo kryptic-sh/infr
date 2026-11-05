@@ -47,10 +47,13 @@ What it does not do, and the reasons:
 - **The gemma4 MTP draft refuses a paged trunk**, because it reads the trunk's
   cache rows by position.
 
-It is a memory feature, not a speed feature: decode reads are one extra table
-lookup per chunk, and prefill on a paged cache takes the split-K attention
-kernel — the coopmat prefill tiers read the cache as one flat run and would
-need a page walk in their K/V tile loads.
+It is a memory feature, not a speed feature: reads pay one table lookup per KV
+tile. Decode pays it once per chunk, and the prefill tiers that matter on a
+device without f16 coopmat (`attn_nc_fa`, one lookup per 64-row tile) pay it
+once per tile — 13.4k-token cold prefill measured 66.7 s paged against 65.2 s
+contiguous. The coopmat prefill tiers (flash, non-FA) still read the cache as
+one flat run and fall back to split-K on a paged cache, which costs ~1.5x on a
+device that has coopmat.
 
 ## Reverse PagedAttention: what `kv.store_mb` does
 

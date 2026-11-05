@@ -5,7 +5,7 @@
 //!
 //! Run: `cargo test -p infr-llama --test kv_paged_graph`
 
-use infr_core::backend::{Backend, Bindings, BufferUsage};
+use infr_core::backend::{Bindings, BufferUsage};
 use infr_core::graph::{AttnMask, Graph, Op};
 use infr_core::tensor::{PageMap, TensorDesc};
 use infr_core::{DType, TensorId};
@@ -120,16 +120,17 @@ fn attention_graph(cache_elems: usize, paged: Option<(usize, usize)>) -> Built {
     }
 }
 
-fn table_bytes(pages: usize) -> Vec<u8> {
-    // Every logical page maps to pool page 1 — block 1's only page.
+fn table_bytes(pages: usize, first: u32) -> Vec<u8> {
+    // Logical page `j` maps to pool page `first + j` — the slot's own block, so the stores' row-base
+    // bias and the reads through this table agree. The last entry repeats.
     (0..=pages)
-        .flat_map(|_| 1u32.to_le_bytes())
+        .flat_map(|j| (first + j.min(pages - 1) as u32).to_le_bytes())
         .collect::<Vec<u8>>()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    be: &infr_vulkan::VulkanBackend,
+    be: &dyn infr_core::backend::Backend,
     built: &Built,
     q_data: &[f32],
     k_data: &[f32],
@@ -218,7 +219,7 @@ fn a_paged_cache_attends_the_same_bits_as_a_contiguous_one() {
     let pool_rows = 2 * pps * PAGE_ROWS;
     let pool_elems = pool_rows * row;
     let pg = attention_graph(pool_elems, Some((ROW_BASE, pps + 1)));
-    let table = table_bytes(pps);
+    let table = table_bytes(pps, 1);
     let got = run(
         &be,
         &pg,
@@ -350,7 +351,7 @@ fn a_paged_decode_over_a_written_span_matches_a_contiguous_one() {
     let pps = ROW_BASE.div_ceil(PAGE_ROWS);
     let pool_elems = 2 * pps * PAGE_ROWS * row;
     let (pg, _) = decode_graph(pool_elems, Some((ROW_BASE, pps + 1)));
-    let table = table_bytes(pps);
+    let table = table_bytes(pps, 1);
     let got = run(
         &be,
         &pg,
@@ -375,4 +376,146 @@ fn a_paged_decode_over_a_written_span_matches_a_contiguous_one() {
         max_err < 1e-4,
         "the paged decode diverges: max_err={max_err:e}"
     );
+}
+
+/// The prefill shape: `BATCH` query rows attending a `PFX`-row prefix that spans two pages. Both
+/// legs are pushed onto the same kernel (see `CAP` and `nc_fa`), so this compares layouts, not
+/// kernels: `attn_nc_fa` on a non-coopmat GPU, the split-K tier with it disabled.
+const PFX: usize = 700;
+const BATCH: usize = 128;
+// More capacity than the span attended (`cap_short`: 1024 rounded up against 900), which sends the
+// contiguous leg down the split path instead of whatever tier its exact fit would pick.
+const CAP: usize = 900;
+
+fn prefill_graph(cache_elems: usize, paged: Option<(usize, usize)>) -> Built {
+    let kv_len = PFX + BATCH;
+    let mut g = Graph::new();
+    let q = g.input(f16d(BATCH * NH * HD));
+    let k = g.input(f32d(kv_len * NKV * HD));
+    let v = g.input(f32d(kv_len * NKV * HD));
+    let table = paged.map(|(_, len)| g.input(TensorDesc::new(vec![len], DType::I32)));
+    let mut kc_desc = f16d(cache_elems);
+    let mut vc_desc = f16d(cache_elems);
+    if let (Some(t), Some((row_base, _))) = (table, paged) {
+        kc_desc.pages = Some(PageMap {
+            table: t,
+            page_rows: PAGE_ROWS as u32,
+            row_base,
+        });
+        vc_desc.pages = Some(PageMap {
+            table: t,
+            page_rows: PAGE_ROWS as u32,
+            row_base,
+        });
+    }
+    let kc = g.input(kc_desc);
+    let vc = g.input(vc_desc);
+    let out = g.output(f32d(BATCH * NH * HD));
+    for (src, cache) in [(k, kc), (v, vc)] {
+        g.push(Op::WriteKv {
+            src,
+            cache,
+            rows: kv_len as u32,
+            row_stride: (NKV * HD) as u32,
+            pos: 0,
+        });
+    }
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst: out,
+        rows: BATCH as u32,
+        kv_len: kv_len as u32,
+        n_head: NH as u32,
+        n_kv: NKV as u32,
+        head_dim: HD as u32,
+        scale: 1.0 / (HD as f32).sqrt(),
+        mask: AttnMask::Causal,
+        pos: PFX as u32,
+        sinks: None,
+        key_bias: None,
+    });
+    Built {
+        g,
+        q,
+        k,
+        v,
+        kc,
+        vc,
+        table,
+        out,
+    }
+}
+
+fn prefill_parity(nc_fa: bool) {
+    let mut cfg = infr_core::config::Config::default();
+    cfg.kernels.vulkan.nc_fa = nc_fa;
+    let be = match infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(cfg)) {
+        Ok(be) => be,
+        Err(e) => {
+            eprintln!("skipping: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let row = NKV * HD;
+    let kv_len = PFX + BATCH;
+    let lin = prefill_graph(CAP * row, None);
+    let k_data = gen(kv_len * row, 31);
+    let v_data = gen(kv_len * row, 32);
+    let q_data = gen(BATCH * NH * HD, 33);
+    let want = run(
+        &be,
+        &lin,
+        &q_data,
+        &k_data,
+        &v_data,
+        CAP * row * 2,
+        None,
+        BATCH * NH * HD,
+    );
+
+    let pps = kv_len.div_ceil(PAGE_ROWS);
+    let row_base = pps * PAGE_ROWS;
+    let pool_elems = 2 * pps * PAGE_ROWS * row;
+    let pg = prefill_graph(pool_elems, Some((row_base, pps + 1)));
+    let table = table_bytes(pps, pps as u32);
+    let got = run(
+        &be,
+        &pg,
+        &q_data,
+        &k_data,
+        &v_data,
+        pool_elems * 2,
+        Some(&table),
+        BATCH * NH * HD,
+    );
+
+    assert!(
+        want.iter().any(|x| *x != 0.0),
+        "the output must not be all zero"
+    );
+    assert!(
+        got.iter().any(|x| *x != 0.0),
+        "the paged output must not be all zero"
+    );
+    let max_err = want
+        .iter()
+        .zip(&got)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 1e-4,
+        "the paged prefill diverges (nc_fa={nc_fa}): max_err={max_err:e}"
+    );
+}
+
+#[test]
+fn a_paged_prefill_batch_matches_a_contiguous_one() {
+    prefill_parity(true);
+}
+
+#[test]
+fn a_paged_prefill_batch_matches_a_contiguous_one_on_the_split_tier() {
+    prefill_parity(false);
 }

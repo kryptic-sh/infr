@@ -3292,6 +3292,12 @@ fn lower_op(
                 // tier that tiles the cache as one flat run is off the table. A slot's rows start at
                 // `row_base`, so a flat read would attend the pool's zeroed block 0 instead.
                 let paged = graph.desc(*k_cache).pages.filter(|p| p.page_rows > 0);
+                // The table's device address and page geometry, resolved once: the decode-free
+                // prefill tiers below read it whether or not they take the paged arm.
+                let paged_table = match paged {
+                    Some(p) => Some((r(p.table)?.device_addr(), p.page_rows)),
+                    None => None,
+                };
                 let flash_ok = flash_geom && !(k_q8_eff || v_q8_eff) && paged.is_none();
                 // Coopmat prefill shmem-staging mode (Levers 2 & 5). Dequant wins over the pure-f16
                 // stage; both need the flash geometry. INFR_FLASH_STAGE stages the f16 KV (cache, or
@@ -3355,7 +3361,10 @@ fn lower_op(
                 // against the scalar/split floor).
                 let nc_fa_ok = !flash_ok
                     && !nonfa_ok
-                    && paged.is_none()
+                    // A paged cache is fine here: `attn_nc_fa` shifts each 64-row tile by one table
+                    // word, which needs only the table's device address.
+                    && (paged.is_none()
+                        || paged_table.is_some_and(|(addr, rows)| addr.is_some() && rows > 0))
                     && !be_.caps().f16_coopmat()
                     && (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && canvas_lo.is_none()
@@ -3588,6 +3597,10 @@ fn lower_op(
                         Some(k) => pool[k].as_ref(),
                         None => r(*v_cache)?,
                     };
+                    let nc_fa_pages = match paged_table {
+                        Some((Some(addr), rows)) => Some((addr, rows)),
+                        _ => None,
+                    };
                     rec.attention_prefill_nc_fa(
                         r(*q)?,
                         kcb,
@@ -3602,6 +3615,7 @@ fn lower_op(
                         window,
                         *scale,
                         cap,
+                        nc_fa_pages,
                     );
                 } else if split_ok {
                     // `canvas_lo` (computed above) rides a SEPARATE param into

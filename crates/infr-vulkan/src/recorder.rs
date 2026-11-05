@@ -6003,11 +6003,14 @@ impl<'a> Recorder<'a> {
         window: usize,
         scale: f32,
         cap: usize,
+        // `kv.paged`: Some((table_addr, page_rows)) reads K/V through the slot's page table, so the
+        // tile's rows come from wherever its block and shared pages live. None → contiguous.
+        pages: Option<(u64, u32)>,
     ) {
         let (name, spv, bm) =
             crate::gemm::attn_nc_fa_spv(hd).expect("attention_prefill_nc_fa: hd gated <= 512");
-        let k = self.be.kernel(name, spv, 4, 36);
-        let mut p = [0u8; 36];
+        let k = self.be.kernel(name, spv, 4, 48);
+        let mut p = [0u8; 48];
         p[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -6017,6 +6020,11 @@ impl<'a> Recorder<'a> {
         p[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         p[28..32].copy_from_slice(&scale.to_ne_bytes());
         p[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        if let Some((addr, page_rows)) = pages {
+            p[36..40].copy_from_slice(&(addr as u32).to_ne_bytes());
+            p[40..44].copy_from_slice(&((addr >> 32) as u32).to_ne_bytes());
+            p[44..48].copy_from_slice(&page_rows.to_ne_bytes());
+        }
         let groups = (rows.div_ceil(bm) * nh) as u32;
         self.dispatch(
             k,
@@ -12719,6 +12727,7 @@ mod tests {
                 window,
                 scale,
                 cap,
+                None,
             );
         }
         rec.finish().unwrap();

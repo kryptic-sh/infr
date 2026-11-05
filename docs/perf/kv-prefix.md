@@ -8,11 +8,11 @@ block size, and nothing else.
 2. **Reuse inside a slot set.** Two live sequences share a prefix, so their
    page tables point at the same physical rows and diverge by copy-on-write.
 
-This tree ships (1) and is building the table for (2). When writing about them,
-be blunt: (1) is **reverse PagedAttention** — paging turned inside out. Physical
-rows stay contiguous in a slot; the blocks are the thing that travels, and the
-"restore" is a bulk upload back into a linear buffer. It is a cache in the CPU
-sense, not an allocator.
+This tree ships both: (1) as `kv.store_mb`, (2) as `kv.paged`. When writing
+about them, be blunt: (1) is **reverse PagedAttention** — paging turned inside
+out. Physical rows stay contiguous in a slot; the blocks are the thing that
+travels, and the "restore" is a bulk upload back into a linear buffer. It is a
+cache in the CPU sense, not an allocator. (2) is the allocator.
 
 ## Knobs
 
@@ -21,12 +21,33 @@ Two mechanisms, two knobs, and neither implies the other:
 | Knob | Config / env | Direction | Status |
 | --- | --- | --- | --- |
 | `store_mb` | `kv.store_mb` / `INFR_KV_STORE_MB` | reverse (host block store) | shipped |
-| `paged` | `kv.paged` / `INFR_KV_PAGED` | forward (page pool) | not wired |
+| `paged` | `kv.paged` / `INFR_KV_PAGED` | forward (page pool) | shipped |
 
-`kv.paged` parses but refuses at session setup: the page-table read path, the
-refcounted pool and the offset-capable copies are in, but nothing allocates
-pages until the seam binds a slot's rows into the pool (tracked in issue #21).
-Do not document it as a working switch before that lands.
+`kv.paged` puts a session's KV in one page pool at the first fork: the slot that
+was forked from keeps its block, the fork points at its parent's complete pages,
+and only a page it later writes is copied. Everything about the size is
+unchanged — the pool holds one block per slot the session may fork, which is
+exactly what `--parallel N` already cost in linear slots — and a session that
+never forks never builds a pool.
+
+What it does not do, and the reasons:
+
+- **Forks land on page boundaries.** Page ids are 512 rows, so a fork shares
+  `⌊prefix / 512⌋` pages and re-prefills the rest. Below 512 shared tokens there
+  is nothing to share.
+- **Ring layers stay linear.** A sliding-window cache recycles rows the window
+  mask already excludes, and its read path is a modulo, not a page walk; the same
+  goes for the recurrent (DeltaNet), MLA and diffusion layers, which have no
+  row-addressed cache at all. On Gemma 4 E4B that is 35 of 42 layers, so paging
+  buys little there and a great deal on a full-attention model.
+- **A paged slot skips the host store.** `kv.store_mb` would upload into row 0 of
+  a slot whose rows start at its block; the pool already shares prefixes between
+  live slots, so the keys are simply not used. The two knobs are independent.
+- **The gemma4 MTP draft refuses a paged trunk**, because it reads the trunk's
+  cache rows by position.
+
+It is a memory feature, not a speed feature: decode reads are one extra table
+lookup per chunk.
 
 ## Reverse PagedAttention: what `kv.store_mb` does
 

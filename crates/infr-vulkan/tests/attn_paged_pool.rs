@@ -304,3 +304,66 @@ fn two_slots_share_a_prefix_and_stay_bit_identical() {
 fn walk_nonzero(bits: &[u32]) -> usize {
     bits.iter().filter(|b| **b & 0x7fff_ffff != 0).count()
 }
+
+/// A write lands at a page's byte offset inside the pool, and the same rows read back
+/// through the table bit-for-bit — the store side of the pool, minus the kernel that
+/// computes the address.
+#[test]
+fn a_write_at_a_page_offset_reads_back_through_the_table() {
+    let be = match VulkanBackend::new_with(Arc::new(Config::default())) {
+        Ok(be) => be,
+        Err(e) => {
+            eprintln!("skipping: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let page_elems = PAGE_ROWS * NKV * HD;
+    let bytes = page_elems * 2;
+    let k_data = f16_data(page_elems, 9001);
+    let v_data = f16_data(page_elems, 9002);
+
+    let kb = be.alloc(bytes * 2, BufferUsage::KvCache).unwrap();
+    let vb = be.alloc(bytes * 2, BufferUsage::KvCache).unwrap();
+    be.upload_at(kb.as_ref(), bytes, &k_data).unwrap();
+    be.upload_at(vb.as_ref(), bytes, &v_data).unwrap();
+
+    let mut mirrored = vec![0u8; bytes];
+    be.download_at(kb.as_ref(), bytes, &mut mirrored).unwrap();
+    assert_eq!(mirrored, k_data, "the write must land at the page offset");
+
+    let lk = be.alloc(bytes, BufferUsage::KvCache).unwrap();
+    let lv = be.alloc(bytes, BufferUsage::KvCache).unwrap();
+    be.upload(lk.as_ref(), &k_data).unwrap();
+    be.upload(lv.as_ref(), &v_data).unwrap();
+
+    let table = be.alloc(8, BufferUsage::KvCache).unwrap();
+    be.upload(
+        table.as_ref(),
+        &[1u32.to_le_bytes(), 1u32.to_le_bytes()].concat(),
+    )
+    .unwrap();
+
+    let q = be.alloc(NH * HD * 2, BufferUsage::Activations).unwrap();
+    be.upload(q.as_ref(), &f16_data(NH * HD, 4242)).unwrap();
+
+    let want = run(
+        &be,
+        q.as_ref(),
+        Layout::Linear(lk.as_ref()),
+        Layout::Linear(lv.as_ref()),
+        PAGE_ROWS,
+        CHUNK,
+        1,
+    );
+    let got = run(
+        &be,
+        q.as_ref(),
+        Layout::Paged(kb.as_ref(), table.as_ref(), PAGE_ROWS as u32),
+        Layout::Paged(vb.as_ref(), table.as_ref(), PAGE_ROWS as u32),
+        PAGE_ROWS,
+        CHUNK,
+        1,
+    );
+    assert_eq!(got.bits, want.bits);
+    assert!(walk_nonzero(&want.bits) > 0);
+}

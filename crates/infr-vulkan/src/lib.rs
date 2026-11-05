@@ -3921,6 +3921,111 @@ impl Backend for VulkanBackend {
 
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
     /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
+    fn upload_at(&self, dst: &dyn Buffer, offset: usize, src: &[u8]) -> Result<()> {
+        let vk_dst = as_vk_buf(dst)?;
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| be("upload_at: range overflows"))?;
+        check_extent("upload_at", "into", end, vk_dst.size)?;
+        let base = vk_dst.sub_offset as u64 + offset as u64;
+        if let Some(ptr) = vk_dst.mapped_ptr() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), ptr.add(offset), src.len());
+            }
+            return Ok(());
+        }
+        let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_at_staging")?;
+        let stg_ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("staging buffer is not mapped"))?;
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), stg_ptr, src.len()) };
+        let (stg_buf, dst_buf) = (staging.buffer, vk_dst.buffer);
+        let size = src.len() as u64;
+        let shared = Arc::clone(&self.shared);
+        self.one_shot(move |cmd| {
+            let region = vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: base,
+                size,
+            };
+            unsafe {
+                shared
+                    .device
+                    .cmd_copy_buffer(cmd, stg_buf, dst_buf, &[region])
+            };
+        })
+    }
+
+    fn download_at(&self, src: &dyn Buffer, offset: usize, dst: &mut [u8]) -> Result<()> {
+        let vk_src = as_vk_buf(src)?;
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(|| be("download_at: range overflows"))?;
+        check_extent("download_at", "out of", end, vk_src.size)?;
+        let base = vk_src.sub_offset as u64 + offset as u64;
+        if let Some(ptr) = vk_src.mapped_ptr() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    ptr.add(offset) as *const u8,
+                    dst.as_mut_ptr(),
+                    dst.len(),
+                )
+            };
+            return Ok(());
+        }
+        let staging = self.make_buf(dst.len(), MemoryLocation::GpuToCpu, "download_at_staging")?;
+        let (src_buf, stg_buf) = (vk_src.buffer, staging.buffer);
+        let size = dst.len() as u64;
+        let shared = Arc::clone(&self.shared);
+        self.one_shot(move |cmd| {
+            let region = vk::BufferCopy {
+                src_offset: base,
+                dst_offset: 0,
+                size,
+            };
+            unsafe {
+                shared
+                    .device
+                    .cmd_copy_buffer(cmd, src_buf, stg_buf, &[region])
+            };
+        })?;
+        let ptr = staging
+            .mapped_ptr()
+            .ok_or_else(|| be("readback staging is not mapped"))? as *const u8;
+        unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
+        Ok(())
+    }
+
+    fn copy_buffer_at(
+        &self,
+        src: &dyn Buffer,
+        src_offset: usize,
+        dst: &dyn Buffer,
+        dst_offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+        let s_end = src_offset
+            .checked_add(bytes)
+            .ok_or_else(|| be("copy_buffer_at: source range overflows"))?;
+        let d_end = dst_offset
+            .checked_add(bytes)
+            .ok_or_else(|| be("copy_buffer_at: destination range overflows"))?;
+        check_extent("copy_buffer_at", "out of", s_end, s.size)?;
+        check_extent("copy_buffer_at", "into", d_end, d.size)?;
+        let (sb, db) = (s.buffer, d.buffer);
+        let so = s.sub_offset as u64 + src_offset as u64;
+        let do_ = d.sub_offset as u64 + dst_offset as u64;
+        self.one_shot(move |cmd| unsafe {
+            let region = vk::BufferCopy {
+                src_offset: so,
+                dst_offset: do_,
+                size: bytes as u64,
+            };
+            self.shared.device.cmd_copy_buffer(cmd, sb, db, &[region]);
+        })
+    }
+
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
         let vk_dst = as_vk_buf(dst)?;
         // Same guard as `download`/`copy_buffer`, same wording — this one is the original, the

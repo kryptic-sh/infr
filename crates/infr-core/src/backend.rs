@@ -510,6 +510,37 @@ pub trait Backend: Send + Sync {
     }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
+    /// [`upload`](Self::upload) into `dst` starting at byte `offset`. The default bounces the whole
+    /// buffer through the host, which is correct but costs `len_bytes()` of traffic; a backend that
+    /// can address the range directly should override.
+    fn upload_at(&self, dst: &dyn Buffer, offset: usize, src: &[u8]) -> Result<()> {
+        if offset == 0 {
+            return self.upload(dst, src);
+        }
+        let end = offset
+            .checked_add(src.len())
+            .filter(|end| *end <= dst.len_bytes())
+            .ok_or_else(|| Error::backend("upload_at: range runs out of the buffer"))?;
+        let mut whole = vec![0u8; dst.len_bytes()];
+        self.download(dst, &mut whole)?;
+        whole[offset..end].copy_from_slice(src);
+        self.upload(dst, &whole)
+    }
+    /// [`download`](Self::download) from `src` starting at byte `offset`. Same default caveat as
+    /// [`upload_at`](Self::upload_at).
+    fn download_at(&self, src: &dyn Buffer, offset: usize, dst: &mut [u8]) -> Result<()> {
+        if offset == 0 {
+            return self.download(src, dst);
+        }
+        let end = offset
+            .checked_add(dst.len())
+            .filter(|end| *end <= src.len_bytes())
+            .ok_or_else(|| Error::backend("download_at: range runs out of the buffer"))?;
+        let mut whole = vec![0u8; src.len_bytes()];
+        self.download(src, &mut whole)?;
+        dst.copy_from_slice(&whole[offset..end]);
+        Ok(())
+    }
     /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan
     /// `INFR_KV_OVERFLOW` path): how many `BufferUsage::KvCache` buffers landed in device-local VRAM
     /// vs spilled to system RAM. The runner calls this ONCE, right after the per-layer KV allocation
@@ -555,11 +586,38 @@ pub trait Backend: Send + Sync {
     /// prefix, then upload it) — correct everywhere; backends override with a device-side copy.
     /// Errors (rather than panics) if `bytes` exceeds `src`'s length.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
-        check_copy_bytes(bytes, src.len_bytes())?;
-        // Only the prefix crosses the bus — NOT the whole (potentially `max_ctx`) `src` buffer.
-        let mut tmp = vec![0u8; bytes];
-        self.download(src, &mut tmp)?;
-        self.upload(dst, &tmp)
+        self.copy_buffer_at(src, 0, dst, 0, bytes)
+    }
+    /// Copy `bytes` from `src` at `src_offset` into `dst` at `dst_offset` — the primitive a page pool
+    /// needs, where every slot's rows live somewhere inside one shared buffer.
+    /// The default bounces through the host, copying only the requested range.
+    fn copy_buffer_at(
+        &self,
+        src: &dyn Buffer,
+        src_offset: usize,
+        dst: &dyn Buffer,
+        dst_offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let src_end = src_offset
+            .checked_add(bytes)
+            .filter(|end| *end <= src.len_bytes())
+            .ok_or_else(|| Error::backend("copy_buffer_at: range runs out of the source"))?;
+        let dst_end = dst_offset
+            .checked_add(bytes)
+            .filter(|end| *end <= dst.len_bytes())
+            .ok_or_else(|| Error::backend("copy_buffer_at: range runs out of the destination"))?;
+        debug_assert!(src_end > src_offset || bytes == 0);
+        debug_assert!(dst_end > dst_offset || bytes == 0);
+        if src_offset == 0 && dst_offset == 0 {
+            // Only the requested prefix crosses the bus, as `copy_buffer` always did.
+            let mut tmp = vec![0u8; bytes];
+            self.download(src, &mut tmp)?;
+            return self.upload(dst, &tmp);
+        }
+        let mut whole = vec![0u8; src.len_bytes()];
+        self.download(src, &mut whole)?;
+        self.upload_at(dst, dst_offset, &whole[src_offset..src_end])
     }
 
     // ---- execution (compile once per shape, execute per token/step) ----

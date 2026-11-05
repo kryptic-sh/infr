@@ -31,6 +31,9 @@ const OUTPUT_CRATES: &[&str] = &["infr-cli"];
 const REPORT_FILES: &[&str] = &[
     // The `INFR_PROFILE` / `INFR_PROF_OPS` exit report. Runs from a C `atexit` hook.
     "infr-prof-rt/src/lib.rs",
+    // The `INFR_PROF_TRACE` timeline write: its one-line confirmation belongs next to the report
+    // it was requested with, and it also runs from that `atexit` hook.
+    "infr-prof-rt/src/timeline.rs",
     // `OpProf::flush`'s per-op table, which feeds the report above.
     "infr-core/src/prof.rs",
     // infr-metal's `prof.stages` table and its pipeline-cache summary line.

@@ -184,7 +184,7 @@ INFR_PROF_STAGES=1 infr bench ...                    # host-side stage timing
 
 Every `prof.*` knob is settable three ways — `INFR_PROF_*` in the environment,
 `--set prof.<name>=<value>` on any command, or a `[prof]` section in
-`infr.toml`. There are eight, all prefixed `INFR_PROF_`:
+`infr.toml`. There are nine, all prefixed `INFR_PROF_`:
 
 | knob                | what it does                                               |
 | ------------------- | ---------------------------------------------------------- |
@@ -193,6 +193,7 @@ Every `prof.*` knob is settable three ways — `INFR_PROF_*` in the environment,
 | `stages`            | host-side stage timing (see below)                         |
 | `vram`              | live VRAM in use after weight load                         |
 | `out`               | also write the exit report as JSON to this path            |
+| `trace`             | write the span timeline (Chrome Trace JSON) to this path   |
 | `diffusion_trace`   | per-step schedule/entropy trace for diffusion models       |
 | `metal_device_time` | `off`/`flush`/`counters` — how Metal gets device time      |
 | `metal_debug`       | extra Metal profiler output                                |
@@ -204,6 +205,18 @@ its pipeline ran. That used to be five separate knobs (`INFR_PROF`,
 `INFR_PROF_DEC`, `INFR_PROF_PF`, `INFR_MTP_TIME`, `INFR_DIFFUSION_TIME`), so
 "where does the wall time go" meant discovering four more switches after you
 found the first.
+
+`trace` is the SEQUENCE where every other knob is an aggregate: one `"ph":"X"`
+slice per instrumented span, on one track per thread, timestamped from the
+profiling epoch. `ui.perfetto.dev` (or `chrome://tracing`) then shows gaps,
+ordering and per-token shape — the things a process-wide total cannot. Host
+spans only exist in an `INFR_PROFILE=1` build, so a default build ignores the
+knob. Recording keeps a 1.5M-event ring and drops the OLDEST half on overflow,
+so a long `serve` keeps what you were looking at rather than the warmup:
+
+```bash
+INFR_PROFILE=1 INFR_PROF_TRACE=/tmp/t.json infr bench "$M" -p 0 -n 32 -d 16 -r 1
+```
 
 Every backend prints the same table, tagged with its name, sorted by total time:
 

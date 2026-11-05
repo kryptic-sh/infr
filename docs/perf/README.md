@@ -17,6 +17,9 @@ headline.
 - **[playbook.md](playbook.md)** — the optimization method: measure → profile →
   one lever at a time, the bottleneck taxonomy, and a long tail of dead ends
   recorded so they are not re-tried. Read before starting a perf slice.
+- **[vulkan-kq-fma-splitk.md](vulkan-kq-fma-splitk.md)** — why the prefill
+  GEMM's narrow grid is worth a split-k, and why it only pays when the slices
+  share one dispatch.
 - **[kernels.md](kernels.md)** — cross-backend fast-kernel coverage: which
   weight-quant formats have a native kernel on CPU / Vulkan / Metal, and each
   backend's decode strategy.

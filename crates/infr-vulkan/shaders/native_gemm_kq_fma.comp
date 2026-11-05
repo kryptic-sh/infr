@@ -2,6 +2,11 @@
 // fp32 K-quant prefill GEMM (C = A·Wᵀ, 128xBN tile) for GPUs without fast int8 dot or coopmat.
 // Validated on Polaris10 (GCN4, RX 580): Qwen pp512 206 -> 499 t/s vs emulated-dp4a MMQ.
 // -DFMT_Q4K|-DFMT_Q6K, -DBN=64|128; requires n%BN, k%256, w_base%256; no subgroup ops.
+// The same build serves the direct tile and split-K: the k range is cut into pc.splits slices, and
+// `splits = 1` is the plain tile writing c4 at offset 0. For splits > 1 every workgroup carries its
+// slice in the top of gl_WorkGroupID.x, so one dispatch keeps the whole grid resident: groups are
+// (row tiles x column tiles x splits). Slices write their own plane of a `splits x mpad x n`
+// partial buffer and splitk_reduce sums the planes.
 #extension GL_EXT_control_flow_attributes : require
 
 const uint BM = 128u;
@@ -16,7 +21,7 @@ const uint EPT = uint(BN) * BK / THREADS;      // weight elements staged per thr
 
 layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
-    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi;
+    uint m; uint n; uint k; uint w_base; uint arena_lo; uint arena_hi; uint pad; uint splits;
 } pc;
 layout(binding = 0) readonly buffer AB { vec4 a4[]; };
 layout(binding = 2) writeonly buffer CB { vec4 c4[]; };
@@ -181,20 +186,26 @@ void main() {
     w_addr = arena_base(pc.arena_lo, pc.arena_hi);
     li = gl_LocalInvocationIndex;
     uint tilesN = pc.n / uint(BN);
-    wgRow = (gl_WorkGroupID.x / tilesN) * BM;
-    wgCol = (gl_WorkGroupID.x % tilesN) * uint(BN);
+    uint rows = (pc.m + uint(BM) - 1u) / uint(BM);
+    uint tiles = rows * tilesN;
+    uint wg = gl_WorkGroupID.x % tiles;
+    uint slice = gl_WorkGroupID.x / tiles;
+    wgRow = (wg / tilesN) * BM;
+    wgCol = (wg % tilesN) * uint(BN);
     uint tr = li & 15u;
     uint tc = li >> 4u;
+    uint k0b = slice * (pc.k / pc.splits);
+    uint k0e = k0b + pc.k / pc.splits;
 
     vec4 acc[8][TNV];
     [[unroll]] for (uint i = 0u; i < 8u; i++)
         [[unroll]] for (uint j = 0u; j < TNV; j++) acc[i][j] = vec4(0.0);
 
-    loadRaw(0u);
-    storeTile(0u);
+    loadRaw(k0b);
+    storeTile(k0b);
     barrier();
-    for (uint k0 = 0u; k0 < pc.k; k0 += BK) {
-        bool more = k0 + BK < pc.k;
+    for (uint k0 = k0b; k0 < k0e; k0 += BK) {
+        bool more = k0 + BK < k0e;
         if (more) loadRaw(k0 + BK);
         [[unroll]] for (uint kk = 0u; kk < BK; kk++) {
             vec4 a0 = As[kk][tr];
@@ -220,11 +231,12 @@ void main() {
     }
 
     uint mpad = (pc.m + 63u) & ~63u;
+    uint pbase = slice * (mpad * pc.n / 4u);
     [[unroll]] for (uint i = 0u; i < 8u; i++) {
         uint r = wgRow + (i < 4u ? tr * 4u + i : 64u + tr * 4u + i - 4u);
         if (r < mpad) {
             [[unroll]] for (uint j = 0u; j < TNV; j++) {
-                c4[(r * pc.n + wgCol + j * 64u + tc * 4u) >> 2u] = acc[i][j];
+                c4[pbase + ((r * pc.n + wgCol + j * 64u + tc * 4u) >> 2u)] = acc[i][j];
             }
         }
     }

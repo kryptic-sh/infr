@@ -182,6 +182,7 @@ knobs! {
     "INFR_NO_MMQ"           => "kernels.vulkan.mmq",            PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMQ_FALLBACK"  => "kernels.vulkan.mmq_fallback",   PresenceInv, Ignored, "1",  migrated;
     "INFR_KQ_FMA_TIER"      => "kernels.vulkan.kq_fma_tier",    TriState,    Ignored, "1",  migrated;
+    "INFR_KQ_FMA_SPLITK"    => "kernels.vulkan.kq_fma_splitk",  Int,         Ignored, "4",  migrated;
     "INFR_KQ_FMA_GEMV"      => "kernels.vulkan.kq_fma_gemv",    TriState,    Ignored, "1",  migrated;
     "INFR_WAVE64_NATIVE"    => "kernels.vulkan.wave64_native",  SetNotZero,  Ignored, "1",  migrated;
     "INFR_WEIGHTS_AS_SSBO"  => "kernels.vulkan.weights_as_ssbo", SetNotZero, Ignored, "1",  migrated;

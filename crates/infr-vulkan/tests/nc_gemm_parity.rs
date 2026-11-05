@@ -509,8 +509,9 @@ fn run_kq_fma(
     k: usize,
     n: usize,
     w_base: usize,
+    splits: Option<usize>,
 ) {
-    let label = format!("{dt:?} kq_fma t{bn} m{m} k{k} n{n} w_base{w_base}");
+    let label = format!("{dt:?} kq_fma t{bn} m{m} k{k} n{n} w_base{w_base} splits{splits:?}");
     let bank = synth_bank(dt, w_base + n * k, 0x9c4 ^ dt as u64 ^ (k * n) as u64);
     let w_host = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
     let padded = pad_to_u32_align(&bank);
@@ -536,18 +537,37 @@ fn run_kq_fma(
         })
         .collect();
     let rec = be.recorder().unwrap();
+    let parts = splits.map(|s| {
+        be.alloc(s * mpad * n * 4, BufferUsage::Activations)
+            .unwrap()
+    });
     for out in &outs {
-        rec.matmul_kq_fma(
-            dt,
-            bn,
-            xbuf.as_ref(),
-            w.as_ref(),
-            w_base,
-            out.as_ref(),
-            m,
-            k,
-            n,
-        );
+        match (&parts, splits) {
+            (Some(p), Some(s)) => rec.matmul_kq_fma_splitk(
+                dt,
+                bn,
+                xbuf.as_ref(),
+                w.as_ref(),
+                w_base,
+                p.as_ref(),
+                out.as_ref(),
+                m,
+                k,
+                n,
+                s,
+            ),
+            _ => rec.matmul_kq_fma(
+                dt,
+                bn,
+                xbuf.as_ref(),
+                w.as_ref(),
+                w_base,
+                out.as_ref(),
+                m,
+                k,
+                n,
+            ),
+        }
     }
     rec.finish().unwrap();
 
@@ -603,9 +623,28 @@ fn nc_kq_fma_gemm_parity_and_determinism() {
                 (130, 768, 256),
                 (512, 1024, 256),
             ] {
-                run_kq_fma(&be, dt, bn, m, k, n, 0);
+                run_kq_fma(&be, dt, bn, m, k, n, 0, None);
             }
-            run_kq_fma(&be, dt, bn, 70, 768, 128, 256);
+            run_kq_fma(&be, dt, bn, 70, 768, 128, 256, None);
+        }
+    }
+}
+
+/// The `-DKSPLIT` twin: same host-reference parity and run-to-run determinism as the direct tile,
+/// with the k range cut into `splits` slices plus a `splitk_reduce` pass. Shapes cover a single
+/// row tile, a partial row tile and several (m=512: 4 row tiles) across both column tiles.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn nc_kq_fma_splitk_matches_the_direct_tile() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    for dt in [DType::Q4_0, DType::Q4K, DType::Q6K] {
+        for bn in [64, 128] {
+            for (m, k, n, splits) in [(2, 1024, 128, 4), (130, 1024, 256, 4), (512, 1024, 256, 2)] {
+                run_kq_fma(&be, dt, bn, m, k, n, 0, Some(splits));
+            }
         }
     }
 }

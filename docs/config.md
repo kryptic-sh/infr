@@ -213,7 +213,7 @@ and these exist to force one off when bisecting a correctness or perf problem.
 
 - **`[kernels.vulkan]`** (the biggest section — 62 of the 156 keys): capability
   masks (`coopmat`, `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV
-  tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, `kq_fma_tier` — the
+  tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, `kq_fma_tier`, `kq_fma_splitk` — the
   K-quant/Q4_0 FMA tier for older Vulkan GPUs without fast int8 dot, auto-on — the
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,

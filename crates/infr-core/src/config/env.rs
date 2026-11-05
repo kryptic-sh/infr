@@ -222,6 +222,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.mmq_fallback = presence_inv(get, "INFR_NO_MMQ_FALLBACK");
     // Tri-state: "0" ⇒ force off, any other value ⇒ force on, unset ⇒ auto.
     v.kq_fma_tier = get("INFR_KQ_FMA_TIER").map(|s| Some(s != "0"));
+    v.kq_fma_splitk = opt_num(get, "INFR_KQ_FMA_SPLITK");
     v.kq_fma_gemv = get("INFR_KQ_FMA_GEMV").map(|s| Some(s != "0"));
     v.wave64_native = get("INFR_WAVE64_NATIVE").map(|s| s != "0");
     v.weights_as_ssbo = get("INFR_WEIGHTS_AS_SSBO").map(|s| s != "0");

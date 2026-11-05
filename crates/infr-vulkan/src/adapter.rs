@@ -877,6 +877,30 @@ fn split_k_plan(m: usize, in_f: usize, out_f: usize) -> usize {
     }
 }
 
+/// Split-K count for the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`), overridable by
+/// `kernels.vulkan.kq_fma_splitk`. The direct tile's grid is `ceil(m/128) * (n/bn)` workgroups;
+/// below ~8 per CU a tile runs up to 1.8x slower per workgroup (measured on Polaris10: 80 wgs
+/// 32.6us/tile vs 640 wgs 18.1us/tile), and the k cut is the cheap way to add workgroups. Slices
+/// stay K-block-aligned, halving until the k range divides.
+fn kq_fma_split_plan(
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    bn: usize,
+    cu: usize,
+    force: Option<usize>,
+) -> usize {
+    let grid = (m.div_ceil(128) * (out_f / bn).max(1)).max(1);
+    let mut splits = match force {
+        Some(n) => n.clamp(1, 8),
+        None => (cu * 8).div_ceil(grid).next_power_of_two().clamp(1, 8),
+    };
+    while splits > 1 && !in_f.is_multiple_of(256 * splits) {
+        splits /= 2;
+    }
+    splits
+}
+
 /// The coopmat-warp prefill GEMM tile selection shared by the resident native-dense `Op::Linear`
 /// arm and its arena-addressed streamed twin (`streamed_prefill_gemm`): the A_GLOBAL f16-A cast,
 /// the narrow-n split-K (`split_k_plan`), or the direct tile — reading the weight from `w_addr`
@@ -1854,8 +1878,34 @@ fn lower_op(
                 } else {
                     64
                 };
+                let splits = kq_fma_split_plan(
+                    m,
+                    in_f,
+                    out_f,
+                    bn,
+                    cu,
+                    be_.cfg().kernels.vulkan.kq_fma_splitk,
+                );
                 with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-                    rec.matmul_kq_fma(dt, bn, xb, w, w_off, out, m, in_f, out_f);
+                    if splits > 1 {
+                        let mpad = m.div_ceil(64) * 64;
+                        let pk = pooled(pool, be_, "kq_splitk_part", splits * mpad * out_f * 4)?;
+                        rec.matmul_kq_fma_splitk(
+                            dt,
+                            bn,
+                            xb,
+                            w,
+                            w_off,
+                            pool[&pk].as_ref(),
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                            splits,
+                        );
+                    } else {
+                        rec.matmul_kq_fma(dt, bn, xb, w, w_off, out, m, in_f, out_f);
+                    }
                     Ok(())
                 })?;
             } else if nc_mmq || nc_fma {

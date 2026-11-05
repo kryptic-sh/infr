@@ -1110,7 +1110,9 @@ pub(crate) fn native_gemm_fma_spv(
     })
 }
 /// SPIR-V (kernel-cache name + words) for the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`)
-/// at column tile `bn` (64 or 128); `None` for dtypes or tiles without a build.
+/// at column tile `bn` (64 or 128); `None` for dtypes or tiles without a build. One build serves
+/// both the direct tile (`splits = 1`) and split-K (`splits > 1`) — the shader takes the slice
+/// bounds from its push constants.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_kq_fma_spv(
     dtype: infr_core::DType,

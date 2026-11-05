@@ -592,13 +592,14 @@ fn run_shape(be: &VulkanBackend, s: &Shape, decode: bool) -> Legs {
     }
 
     // ── record-once replay path ──────────────────────────────────────────────────────────────
-    // `[pos, kv_len, table_lo, table_hi]` — words 2-3 are the paged K/V table address (0 = linear).
-    let params = be.alloc(16, BufferUsage::Activations).unwrap();
-    be.upload(
-        params.as_ref(),
-        bytemuck::cast_slice(&[pos as u32, kv_len as u32]),
-    )
-    .unwrap();
+    // `[pos, kv_len, table_lo, table_hi, row_base, _]` — words 2-3 are the paged K/V table
+    // address and word 4 the row base (0 = linear).
+    let params = be.alloc(24, BufferUsage::Activations).unwrap();
+    let mut pb = [0u32; 6];
+    pb[0] = pos as u32;
+    pb[1] = kv_len as u32;
+    be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
+        .unwrap();
     let args = be.alloc(16, BufferUsage::Activations).unwrap();
     let o_rep = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
     let rec = be.recorder().unwrap();

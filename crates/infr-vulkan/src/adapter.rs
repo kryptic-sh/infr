@@ -56,8 +56,8 @@ struct DecodeReplay {
     /// Persistent `Internal` scratch (activations), allocated ONCE. The recorded descriptor sets bind
     /// these, so re-allocating per token would leave the recording pointing at freed buffers.
     scratch: Vec<Option<Box<dyn Buffer>>>,
-    /// `[pos, kv_len]` (u32×2) SSBO the `_dyn` kernels read. When `self_advancing`, a
-    /// `params_advance` dispatch recorded FIRST increments it on the device every replay
+    /// `[pos, kv_len, table_lo, table_hi, row_base, _]` (u32×6) SSBO the `_dyn` kernels read.
+    /// When `self_advancing`, a `params_advance` dispatch recorded FIRST increments it every replay
     /// (initialized to `[pos0-1, pos0]` at record time) — the adapter never touches it again.
     params: Box<dyn Buffer>,
     /// The recording starts with the device-side params increment; `execute` skips the host
@@ -75,7 +75,7 @@ struct DecodeReplay {
     /// 2-3 at record time. `None` for a linear cache. ONE table covers every layer of a slot
     /// (page ids are token-granular and identical across layers) and the buffer is allocated once
     /// at session setup, so the address stays valid for every replay without a per-token write.
-    page_table: Option<(u64, u32)>,
+    page_table: Option<PageInfo>,
     /// Transient GEMM/attention scratch the recording references. Empty for an eligible decode (all
     /// ops are GEMV/silu/dyn kernels with no transient), held anyway so a stray one can't dangle.
     _transient: Vec<Box<dyn Buffer>>,
@@ -332,7 +332,16 @@ fn resolve<'a>(
     }
 }
 
-/// Paged K/V: the single page table a paged decode reads through, as `(device address, page rows)`.
+/// What a paged decode needs from the graph: the page table's `(device address, rows per page)` and
+/// the slot's `row_base`.
+#[derive(Clone, Copy)]
+struct PageInfo {
+    addr: u64,
+    page_rows: u32,
+    row_base: usize,
+}
+
+/// Paged K/V: the single page table a paged decode reads and writes through.
 /// Page ids are token-granular and identical across layers, so ONE table per slot covers every
 /// layer's K and V caches — a graph whose caches disagree would silently read one layer's rows
 /// through another's pages, so that is a hard error. `None` for a fully linear graph.
@@ -341,35 +350,42 @@ fn replay_page_table(
     graph: &Graph,
     scratch: &ScratchSet,
     bindings: &Bindings,
-) -> Result<Option<(u64, u32)>> {
-    let mut table: Option<(infr_core::TensorId, u32)> = None;
+) -> Result<Option<PageInfo>> {
+    let mut table: Option<(infr_core::TensorId, u32, usize)> = None;
     for (i, decl) in graph.tensors.iter().enumerate() {
         let Some(p) = decl.desc.pages else { continue };
         match table {
-            Some((t, rows)) if (t, rows) != (p.table, p.page_rows) => {
+            Some((t, rows, rb)) if (t, rows, rb) != (p.table, p.page_rows, p.row_base) => {
                 return Err(be(format!(
                     "vulkan adapter: paged KV cache (tensor {i}) disagrees on the page table: \
-                     table {} with {} rows/page against table {} with {} elsewhere",
-                    p.table.0, p.page_rows, t.0, rows
+                     table {} with {} rows/page at row base {} against table {} with {} rows/page \
+                     at row base {} elsewhere",
+                    p.table.0, p.page_rows, p.row_base, t.0, rows, rb
                 )))
             }
-            _ => table = Some((p.table, p.page_rows)),
+            _ => table = Some((p.table, p.page_rows, p.row_base)),
         }
     }
-    let Some((id, rows)) = table else {
+    let Some((id, page_rows, row_base)) = table else {
         return Ok(None);
     };
     let addr = resolve(scratch, bindings, id)?
         .device_addr()
         .ok_or_else(|| be("vulkan adapter: paged KV cache table has no device address"))?;
-    Ok(Some((addr, rows)))
+    Ok(Some(PageInfo {
+        addr,
+        page_rows,
+        row_base,
+    }))
 }
 
-/// Write `[table_lo, table_hi]` into params words 2-3 (zero when the cache is linear).
-fn write_page_table(pbytes: &mut [u8; 16], table: Option<(u64, u32)>) {
-    if let Some((addr, _)) = table {
-        pbytes[8..12].copy_from_slice(&(addr as u32).to_le_bytes());
-        pbytes[12..16].copy_from_slice(&((addr >> 32) as u32).to_le_bytes());
+/// Write the paged decode's params words: 2-3 the page-table address, 4 the row base (all zero for
+/// a linear cache). Word 5 stays reserved for the kernels it pads.
+fn write_page_table(pbytes: &mut [u8; 24], table: Option<PageInfo>) {
+    if let Some(p) = table {
+        pbytes[8..12].copy_from_slice(&(p.addr as u32).to_le_bytes());
+        pbytes[12..16].copy_from_slice(&((p.addr >> 32) as u32).to_le_bytes());
+        pbytes[16..20].copy_from_slice(&(p.row_base as u32).to_le_bytes());
     }
 }
 
@@ -2716,15 +2732,22 @@ fn lower_op(
                 ));
             }
             let ff = freq_factors.map(r).transpose()?;
-            let (out_buf, fused) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
-                (r(cache)?, Some(pos))
-            } else {
-                (r(*dst)?, None)
-            };
+            let (out_buf, fused, fused_cache) =
+                if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
+                    (r(cache)?, Some(pos), Some(cache))
+                } else {
+                    (r(*dst)?, None, None)
+                };
             // #74: fork to the BDA path when the fused K write lands in the KV cache (device address
             // present); the un-fused Q-scratch write stays bound. `out_buf` stays bound at its write
-            // slot in the `_at` method for the store→read barrier.
-            let y_addr = out_buf.device_addr();
+            // slot in the `_at` method for the store→read barrier. A pooled cache's rows start at
+            // its block, so the fused write's row is biased by `row_base` through the address (the
+            // push's fused row is a bare `pos`, or `pos` from the params stream).
+            let k_bias = fused_cache.map_or(0, |cache| {
+                let k_row = (*n_head as usize) * (*head_dim as usize);
+                kv_row_base(graph, cache) * graph.desc(cache).dtype.dense_bytes(k_row).unwrap_or(0)
+            });
+            let y_addr = out_buf.device_addr().map(|a| a + k_bias as u64);
             match mode {
                 RopeMode::Static(rope_pos) => {
                     if f16_out {
@@ -5159,7 +5182,7 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         // Host fallback (INFR_NO_GPU_POS): pos from positions[0] (decode rows=1); kv_len = pos+1.
         let pos = read_pos0(be_, resolve(&replay.scratch, bindings, replay.positions)?)?;
         let kv_len = pos + 1;
-        let mut pbytes = [0u8; 16];
+        let mut pbytes = [0u8; 24];
         pbytes[0..4].copy_from_slice(&pos.to_le_bytes());
         pbytes[4..8].copy_from_slice(&kv_len.to_le_bytes());
         write_page_table(&mut pbytes, replay.page_table);
@@ -5236,10 +5259,11 @@ fn record_decode_replay(
     bindings: &Bindings,
 ) -> Result<DecodeReplay> {
     let scratch = alloc_scratch(be_, graph)?;
-    // `[pos, kv_len, table_lo, table_hi]` — Staging (host-visible mapped) so per-token `upload` is a
-    // plain memcpy. Words 2-3 hold the paged K/V table's device address (0 = linear cache);
-    // `params_advance` only ever writes words 0-1, so they survive the whole replay.
-    let params = be_.alloc(16, BufferUsage::Staging)?;
+    // `[pos, kv_len, table_lo, table_hi, row_base, _]` — Staging (host-visible mapped) so the
+    // per-token refresh is a plain memcpy. Words 2-3 hold the paged K/V table's device address and
+    // word 4 the slot's row base (0 for a linear cache); `params_advance` only ever writes words
+    // 0-1, so they survive the whole replay.
+    let params = be_.alloc(24, BufferUsage::Staging)?;
     let page_table = replay_page_table(graph, &scratch, bindings)?;
     let positions = graph
         .ops
@@ -5276,7 +5300,7 @@ fn record_decode_replay(
     let self_advancing = be_.cfg().kernels.vulkan.gpu_pos;
     if self_advancing {
         let pos0 = read_pos0(be_, resolve(&scratch, bindings, positions)?)?;
-        let mut pbytes = [0u8; 16];
+        let mut pbytes = [0u8; 24];
         pbytes[0..4].copy_from_slice(&pos0.wrapping_sub(1).to_le_bytes());
         pbytes[4..8].copy_from_slice(&pos0.to_le_bytes());
         write_page_table(&mut pbytes, page_table);

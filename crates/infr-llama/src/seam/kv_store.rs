@@ -136,7 +136,9 @@ impl KvPrefixStore {
         kv: &mut SeamKv,
         prompt: &[u32],
     ) -> Result<usize> {
-        if !self.enabled() || cfg.qwen35 {
+        // A paged slot's rows live at its block inside the pool, not at row 0, and the pool already
+        // shares prefixes between its slots — the host-RAM store has nothing to add there.
+        if !self.enabled() || cfg.qwen35 || kv.is_paged() {
             return Ok(0);
         }
         let (mut p, hits) = self.matched(prompt);
@@ -206,7 +208,7 @@ impl KvPrefixStore {
         kv: &SeamKv,
         upto: usize,
     ) -> Result<usize> {
-        if !self.enabled() || cfg.qwen35 {
+        if !self.enabled() || cfg.qwen35 || kv.is_paged() {
             return Ok(0);
         }
         let p = upto.min(kv.cached.len()).min(kv.max_ctx);

@@ -166,8 +166,8 @@ fn run_replay(
         (Layout::Linear(kb), Layout::Linear(vb)) => (kb, vb, None, 0),
         _ => unreachable!("replay leg takes both sides paged or both linear"),
     };
-    let params = be.alloc(16, BufferUsage::Activations).unwrap();
-    let mut pb = [0u8; 16];
+    let params = be.alloc(24, BufferUsage::Activations).unwrap();
+    let mut pb = [0u8; 24];
     pb[0..4].copy_from_slice(&((kv_len - 1) as u32).to_le_bytes());
     pb[4..8].copy_from_slice(&(kv_len as u32).to_le_bytes());
     if let Some(t) = table {

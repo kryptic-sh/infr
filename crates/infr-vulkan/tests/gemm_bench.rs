@@ -844,13 +844,13 @@ fn decode_attn_variants_bench() {
         .alloc(cap * nkv * hd * 2, BufferUsage::Activations)
         .unwrap();
     let o = be.alloc(nh * hd * 4, BufferUsage::Activations).unwrap();
-    // `[pos, kv_len, table_lo, table_hi]` — the attn_dynac kernels' params block spans all four.
-    let params = be.alloc(16, BufferUsage::Activations).unwrap();
-    be.upload(
-        params.as_ref(),
-        bytemuck::cast_slice(&[kv_len as u32 - 1, kv_len as u32]),
-    )
-    .unwrap();
+    // `[pos, kv_len, table_lo, table_hi, row_base, _]` — the attn_dynac kernels' params block.
+    let params = be.alloc(24, BufferUsage::Activations).unwrap();
+    let mut pb = [0u32; 6];
+    pb[0] = kv_len as u32 - 1;
+    pb[1] = kv_len as u32;
+    be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
+        .unwrap();
     let reps = 200usize;
 
     let run = |name: &str, f: &dyn Fn(&infr_vulkan::Recorder)| {

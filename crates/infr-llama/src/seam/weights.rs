@@ -297,8 +297,14 @@ pub(crate) struct SeamKv {
     pub(super) weights: std::sync::Arc<SeamWeights>,
     /// Session-stable pure derivations (see [`SessionStable`]) — shared across warm calls + forks.
     pub(super) stable: std::sync::Arc<SessionStable>,
-    pub(super) kbufs: Vec<Box<dyn Buffer>>,
-    pub(super) vbufs: Vec<Box<dyn Buffer>>,
+    /// Per-layer KV cache buffers. `Arc` so a pooled layer can point every slot of a session at
+    /// the one buffer that holds that layer's pages (see [`crate::seam::KvPool`]); a linearly
+    /// cached layer still owns its buffer outright.
+    pub(super) kbufs: Vec<std::sync::Arc<dyn Buffer>>,
+    pub(super) vbufs: Vec<std::sync::Arc<dyn Buffer>>,
+    /// This slot's pages, when the session runs `kv.paged`: its blocks in the pool plus the table
+    /// every attention read of a pooled layer goes through. `None` for a linear slot.
+    pub(super) paged: Option<crate::seam::PagedSlot>,
     /// KV cache element dtypes, chosen per-side (K and V independent). Fork/seed reuse them so a
     /// forked slot sizes + copies its buffers to match this slot's layout.
     pub(super) k_fmt: DType,
@@ -439,6 +445,55 @@ impl SeamKv {
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        if let Some(p) = &mut self.paged {
+            p.release_pages();
+        }
+    }
+
+    /// The (K, V) dtypes this slot's cache uses — what a session pool must be built with.
+    pub(crate) fn kv_fmts(&self) -> (DType, DType) {
+        (self.k_fmt, self.v_fmt)
+    }
+
+    /// Whether this slot serves its pooled layers out of a page pool.
+    pub(crate) fn is_paged(&self) -> bool {
+        self.paged.is_some()
+    }
+
+    /// This slot's store bias: the row its block starts at, 0 for a linear slot.
+    pub(crate) fn paged_row_base(&self) -> usize {
+        self.paged.as_ref().map_or(0, |p| p.row_base())
+    }
+
+    /// Turn this slot's pooled layers into blocks of `pool`: move the rows it already holds into
+    /// its block, point the layer buffers at the pool, and materialize the table. Linear layers
+    /// keep their private buffers.
+    pub(crate) fn attach_paged(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        pool: &std::sync::Arc<crate::seam::KvPool>,
+    ) -> AResult<()> {
+        let slot = crate::seam::PagedSlot::new(pool, be)?;
+        let block = slot.map.block();
+        let rows = self.cached.len().min(pool.slot_rows());
+        for l in 0..cfg.n_layer {
+            let Some(dst) = pool.k(l) else { continue };
+            if rows > 0 {
+                pool.import_rows(
+                    be,
+                    l,
+                    block,
+                    rows,
+                    self.kbufs[l].as_ref(),
+                    self.vbufs[l].as_ref(),
+                )?;
+            }
+            self.kbufs[l] = std::sync::Arc::clone(dst);
+            self.vbufs[l] = std::sync::Arc::clone(pool.v(l).expect("pooled layer has both sides"));
+        }
+        self.paged = Some(slot);
+        Ok(())
     }
 
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
@@ -532,22 +587,37 @@ impl SeamKv {
     ) -> AResult<SeamKv> {
         let e2b = self.ipl_buf.is_some();
         let npl = cfg.n_embd_per_layer.max(1);
-        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
-        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        // A paged slot's forks share its pool: their pooled layers point at the same per-layer
+        // pool buffers and only their page maps differ (see [`crate::seam::KvPool`]).
+        let pool = self
+            .paged
+            .as_ref()
+            .map(|p| std::sync::Arc::clone(p.map.pool()));
+        let mut kbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
+        let mut vbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
         for l in 0..cfg.n_layer {
             // qwen35 DeltaNet layers: fixed-size conv/S state, NOT a `max_ctx`-scaled KV cache (see
             // the matching alloc in `generate_dense_backend`'s state init and `MixerW::DeltaNet`).
             if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
                 let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
                 let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
-                kbufs.push(
+                kbufs.push(std::sync::Arc::from(
                     be.alloc(conv_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
-                );
-                vbufs.push(
+                ));
+                vbufs.push(std::sync::Arc::from(
                     be.alloc(s_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
-                );
+                ));
+                continue;
+            }
+            if let Some(pk) = pool.as_ref().and_then(|p| p.k(l)) {
+                kbufs.push(std::sync::Arc::clone(pk));
+                vbufs.push(std::sync::Arc::clone(
+                    pool.as_ref()
+                        .and_then(|p| p.v(l))
+                        .expect("pooled layer has both sides"),
+                ));
                 continue;
             }
             // Same per-layer geometry as the original allocation — same widths from the same
@@ -556,36 +626,39 @@ impl SeamKv {
             // ring-sized (see `crate::seam::kv_rows`).
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
             let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring, ec);
-            kbufs.push(
+            kbufs.push(std::sync::Arc::from(
                 be.alloc(
                     crate::seam::kv_side_bytes(self.k_fmt, rows_l * k_row),
                     BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
-            );
-            vbufs.push(
+            ));
+            vbufs.push(std::sync::Arc::from(
                 be.alloc(
                     crate::seam::kv_side_bytes(self.v_fmt, rows_l * v_row),
                     BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
-            );
+            ));
         }
         // A fork is only usable if its buffers have the SAME geometry as the slot it forked from,
         // and the source's own sizes are right here — so check them instead of trusting two call
         // sites to derive the same width. They did not: the MLA row width was missing from this
-        // one, which allocated a third of what the kernels index (docs/backlog.md B41).
-        for l in 0..cfg.n_layer {
-            for (side, forked, src) in [
-                ("k", kbufs[l].len_bytes(), self.kbufs[l].len_bytes()),
-                ("v", vbufs[l].len_bytes(), self.vbufs[l].len_bytes()),
-            ] {
-                if forked != src {
-                    return Err(anyhow!(
-                        "forked KV slot geometry differs from its source at layer {l} ({side}): \
-                         {forked} bytes vs {src} — the fork and the original allocation disagree \
-                         about this layer's cache row"
-                    ));
+        // one, which allocated a third of what the kernels index (docs/backlog.md B41). Pool
+        // buffers are shared wholesale, so a paged fork has no geometry of its own to check.
+        if pool.is_none() {
+            for l in 0..cfg.n_layer {
+                for (side, forked, src) in [
+                    ("k", kbufs[l].len_bytes(), self.kbufs[l].len_bytes()),
+                    ("v", vbufs[l].len_bytes(), self.vbufs[l].len_bytes()),
+                ] {
+                    if forked != src {
+                        return Err(anyhow!(
+                            "forked KV slot geometry differs from its source at layer {l} ({side}): \
+                             {forked} bytes vs {src} — the fork and the original allocation disagree \
+                             about this layer's cache row"
+                        ));
+                    }
                 }
             }
         }
@@ -616,6 +689,10 @@ impl SeamKv {
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
+            paged: match (&pool, self.paged.as_ref()) {
+                (Some(p), Some(src)) => Some(crate::seam::PagedSlot::fork(p, be, &src.map, 0)?),
+                _ => None,
+            },
             // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
             // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
             // slot's first denoise call. `self_cond_w`/`sc_embt` are model-derived (not
@@ -675,23 +752,42 @@ impl SeamKv {
                 return Ok(());
             }
         }
+        // Paged slots share whole pages: the prefix's pages become the same physical pages in both
+        // slots, and the tokens inside a partial page re-prefill here alone.
+        if let (Some(dst), Some(src_paged)) = (self.paged.as_mut(), src.paged.as_ref()) {
+            let page_rows = infr_vulkan::paged::PAGE_ROWS;
+            let pages = p / page_rows;
+            if pages > 0 {
+                dst.map.share_prefix(&src_paged.map, pages);
+                dst.upload_table(be)?;
+            }
+            let p = pages * page_rows;
+            self.cached = src.cached[..p].to_vec();
+            return Ok(());
+        }
         for l in 0..cfg.n_layer {
             // One prefix position is `k_row`/`v_row` elements per side — MLA's compressed row is
             // three times `n_kv * head_dim` wide and has no V side at all, so both widths come
             // from the shared `crate::seam::kv_row_elems` (docs/backlog.md B41).
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            be.copy_buffer(
+            // A paged slot's rows start at its block's first row, so the copy lands there.
+            let bias = kv_fmt_bytes(self.k_fmt, self.paged_row_base() * k_row);
+            be.copy_buffer_at(
                 src.kbufs[l].as_ref(),
+                0,
                 self.kbufs[l].as_ref(),
+                bias,
                 kv_fmt_bytes(self.k_fmt, p * k_row),
             )
             .map_err(|e| anyhow!("{e}"))?;
             // `v_row == 0`: this arch caches no V (MLA) and `vbufs[l]` is the placeholder — there
             // is nothing to seed.
             if v_row > 0 {
-                be.copy_buffer(
+                be.copy_buffer_at(
                     src.vbufs[l].as_ref(),
+                    0,
                     self.vbufs[l].as_ref(),
+                    kv_fmt_bytes(self.v_fmt, self.paged_row_base() * v_row),
                     kv_fmt_bytes(self.v_fmt, p * v_row),
                 )
                 .map_err(|e| anyhow!("{e}"))?;

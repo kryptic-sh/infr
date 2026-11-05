@@ -31,7 +31,11 @@ layout(binding = 0) readonly buffer SB { float16_t src[]; };
 layout(binding = 0) readonly buffer SB { float src[]; };
 #endif
 #ifdef USE_PARAMS
-layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+// Words 2-5 mirror the attention/store params layout: the page table (unused here) and `p_rb`, the
+// row base of a paged slot's private block, so the write row is (pos + rb) % rows.
+layout(binding = 1) readonly buffer PB {
+    uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi; uint p_rb; uint _pad;
+};
 #endif
 #define KV_STORE_BYTE
 #include "kv_addr.glsl"
@@ -46,7 +50,8 @@ void main() {
     // n IS the row width here). The ring recycles rows the window mask already excludes, so the
     // write row is pos % rows — an identity on a full-context cache (pos < rows always).
     uint rows = pc.cap / pc.n;
-    uint row = (rows > 0u) ? (p_pos % rows) : p_pos;
+    uint pos = p_pos + p_rb;
+    uint row = (rows > 0u) ? (pos % rows) : pos;
     uint off = row * pc.n;
 #else
     uint off = pc.off;

@@ -348,12 +348,19 @@ impl SlotPool {
             // slot can own most of free VRAM) degrades to recycling the LRU slot instead of
             // failing the request: correctness is identical (the slot re-prefills from scratch),
             // only cross-conversation KV reuse is lost.
-            let src = self
+            let src_i = self
                 .slots
                 .iter()
-                .flatten()
-                .next()
+                .position(|s| s.is_some())
                 .expect("pick_slot: no initialized slot to fork from");
+            start_paging(
+                self.slots[src_i].as_mut().expect("checked above"),
+                be,
+                cfg,
+                ec,
+                max_slots,
+            );
+            let src = self.slots[src_i].as_ref().expect("checked above");
             match src.fork(be, cfg, ec) {
                 Ok(fresh) => {
                     self.slots.push(Some(fresh));
@@ -390,6 +397,39 @@ impl SlotPool {
         }
         self.last_used[target] = self.tick;
         Ok(target)
+    }
+}
+
+/// `kv.paged`: put the session's KV in one page pool at the first fork, so this slot and every
+/// later one start from the parent's SHARED prefix pages instead of a copy. The pool holds one
+/// block per slot the session may fork — the same device bytes `max_slots` linear slots cost — and
+/// a pool it cannot build (VRAM, or a model with no pageable layer) degrades to linear slots with a
+/// warning rather than failing the request.
+fn start_paging(
+    src: &mut crate::seam::SeamKv,
+    be: &dyn infr_core::backend::Backend,
+    cfg: &crate::Config,
+    ec: &crate::EngineConfig,
+    max_slots: usize,
+) {
+    if ec.kv.paged != Some(true) || src.is_paged() {
+        return;
+    }
+    let caps = be.capabilities();
+    if !caps.kv_paging {
+        tracing::warn!(
+            "kv.paged: backend {} reads KV by position and has no page-table path; slots stay \
+             linear",
+            caps.name,
+        );
+        return;
+    }
+    let (k_fmt, v_fmt) = src.kv_fmts();
+    let blocks = max_slots.max(crate::seam::POOL_BLOCKS);
+    let built = crate::seam::KvPool::new(be, cfg, src.max_ctx(), k_fmt, v_fmt, blocks)
+        .and_then(|pool| src.attach_paged(be, cfg, &pool));
+    if let Err(e) = built {
+        tracing::warn!("kv.paged: could not page this session's KV ({e}); slots stay linear");
     }
 }
 

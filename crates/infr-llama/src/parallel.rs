@@ -229,6 +229,31 @@ impl ParallelSeam {
         // Drop the warmup tokens so the first real prompt prefills a clean slot from row 0 instead
         // of forking off a garbage prefix.
         slot0.reset();
+        // `kv.paged`: one page pool for the whole session, so every slot forked below starts from
+        // the SHARED prefix pages instead of a copy of them (docs/perf/kv-prefix.md). Blocks are
+        // one per slot — the same device bytes `--parallel N` already costs — and a pool that does
+        // not fit degrades to the linear slots of old.
+        if n_slots > 1 && self.model.engine_cfg().kv.paged == Some(true) {
+            if !infr_core::backend::Backend::capabilities(&self.vk).kv_paging {
+                tracing::warn!("kv.paged: backend has no page-table KV path; slots stay linear");
+            } else {
+                let (k_fmt, v_fmt) = slot0.kv_fmts();
+                let paged = crate::seam::KvPool::new(
+                    &self.vk,
+                    self.model.config(),
+                    self.max_ctx,
+                    k_fmt,
+                    v_fmt,
+                    n_slots,
+                )
+                .and_then(|pool| slot0.attach_paged(&self.vk, self.model.config(), &pool));
+                if let Err(e) = paged {
+                    tracing::warn!(
+                        "kv.paged: could not page this session's KV ({e}); slots stay linear"
+                    );
+                }
+            }
+        }
 
         let mut slots = Vec::with_capacity(n_slots);
         for i in 1..n_slots {

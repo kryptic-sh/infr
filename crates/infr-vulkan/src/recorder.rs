@@ -11617,12 +11617,12 @@ mod tests {
         let pacc = be
             .alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)
             .unwrap();
-        let params = be.alloc(16, BufferUsage::Activations).unwrap();
-        be.upload(
-            params.as_ref(),
-            bytemuck::cast_slice(&[pos_offset as u32, kv_len as u32]),
-        )
-        .unwrap();
+        let params = be.alloc(24, BufferUsage::Activations).unwrap();
+        let mut pb = [0u32; 6];
+        pb[0] = pos_offset as u32;
+        pb[1] = kv_len as u32;
+        be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
+            .unwrap();
         let args = be.alloc(16, BufferUsage::Activations).unwrap();
         let rec = be.recorder().unwrap();
         rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, win);

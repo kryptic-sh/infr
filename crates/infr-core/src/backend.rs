@@ -199,6 +199,11 @@ pub struct Capabilities {
     /// full context (see the seam's SWA ring sizing). Backends whose kernels index rows directly
     /// by position (Metal) leave this false and get full-context allocations for every layer.
     pub kv_swa_ring: bool,
+    /// The backend reads a KV cache through a page table (`TensorDesc::pages`): `WriteKv` lands a
+    /// row at `(pos + row_base) % cap_rows` and `Attention` resolves key/value position `j` through
+    /// `table[j / page_rows]`. Backends without it index rows by position and ignore `pages`
+    /// outright, so a paged cache never reaches them.
+    pub kv_paging: bool,
     /// What the ops write into a bound f32 [`crate::graph::TensorKind::Input`] is visible to the NEXT `execute`
     /// that binds the same buffer — either because the backend dispatches straight against the
     /// caller's buffer (Vulkan: only `Internal` handles get backend scratch) or because the

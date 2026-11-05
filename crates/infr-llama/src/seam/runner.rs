@@ -142,10 +142,14 @@ fn bind_layer_io<'a>(
     n_layer: usize,
     rf_buf: &'a Option<(Box<dyn Buffer>, usize)>,
     yff_buf: &'a Option<(Box<dyn Buffer>, usize)>,
-    kbufs: &'a [Box<dyn Buffer>],
-    vbufs: &'a [Box<dyn Buffer>],
+    kbufs: &'a [std::sync::Arc<dyn Buffer>],
+    vbufs: &'a [std::sync::Arc<dyn Buffer>],
     wbufs: &'a [Box<dyn Buffer>],
+    page_table: Option<&'a dyn Buffer>,
 ) {
+    if let (Some(tid), Some(tb)) = (h.page_table, page_table) {
+        b.bind(tid, tb);
+    }
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
         b.bind(rid, rb.as_ref());
     }
@@ -384,6 +388,9 @@ pub(super) struct DecodeHandles {
     tok_id: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
+    /// A paged session's page table (`kv.paged`): bound once per plan, read by every pooled
+    /// layer's replayed attention and store kernels.
+    page_table: Option<TensorId>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
@@ -1297,14 +1304,6 @@ pub(crate) fn generate_dense_backend(
         // DeepSeek2 MLA layers have ONE k_cache (key_length = kv_lora_rank + qk_rope_dim wide) per
         // token; V is an aliased prefix view — no separate v_cache.
         let ubatch = crate::seam::ubatch_rows(ec);
-        // The page pool is not wired into the seam yet; refuse instead of silently running the
-        // linear path, so a "paged" benchmark cannot measure the wrong thing.
-        if ec.kv.paged == Some(true) {
-            return Err(anyhow!(
-                "kv.paged (INFR_KV_PAGED) is not wired into the seam yet: the page-table read path \
-                 and the pool allocator exist, but slots still allocate their own contiguous KV"
-            ));
-        }
         let kv_sizes: Vec<(usize, usize)> = (0..c.n_layer)
             .map(|l| {
                 crate::seam::kv_layer_alloc_bytes(c, l, want_ctx, kv_ring, ubatch, k_fmt, v_fmt)
@@ -1324,17 +1323,17 @@ pub(crate) fn generate_dense_backend(
                 crate::seam::kv_fit_ctx_in_budget(c, ec, budget, None, &[ubatch], k_fmt, v_fmt)
             },
         )?;
-        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
-        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut kbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
+        let mut vbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
         for &(k_bytes, v_bytes) in &kv_sizes {
-            kbufs.push(
+            kbufs.push(std::sync::Arc::from(
                 be.alloc(k_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
-            );
-            vbufs.push(
+            ));
+            vbufs.push(std::sync::Arc::from(
                 be.alloc(v_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
-            );
+            ));
         }
         // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
         // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
@@ -1403,6 +1402,7 @@ pub(crate) fn generate_dense_backend(
             max_ctx: want_ctx,
             kv_ring,
             cached: Vec::new(),
+            paged: None,
             denoise_cache: None,
             self_cond_w: None,
             sc_embt: None,
@@ -1421,6 +1421,7 @@ pub(crate) fn generate_dense_backend(
         vbufs,
         k_fmt: _,
         v_fmt: _,
+        paged,
         hidden_buf,
         pos_buf,
         ipl_buf,
@@ -1545,6 +1546,23 @@ pub(crate) fn generate_dense_backend(
         start
     };
     cached.truncate(start);
+
+    // Paged slot: this call writes rows [start, prompt.len()), so those are the rows it must stop
+    // sharing with the slot it forked from (page by page, device-to-device). Pages past the prefix
+    // are the slot's own already. `refresh` pushes a table a `reset` left behind.
+    if let Some(p) = paged.as_mut() {
+        p.refresh(be)?;
+        p.make_private(be, start, prompt.len())?;
+    }
+    let pg_table = paged.as_ref().map(|p| p.table.as_ref() as &dyn Buffer);
+    let pg_desc = paged.as_ref().map(|p| {
+        let pool = p.map.pool();
+        (
+            pool.table_len(),
+            p.row_base(),
+            pool.slot_rows() * pool.blocks(),
+        )
+    });
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.
     // `batch = 1` is the normal decode path; `batch > 1` is the batched-prefill path.
@@ -1862,6 +1880,9 @@ pub(crate) fn generate_dense_backend(
         // qwen35 DeltaNet layers have no KV cache — `k_cache[l]`/`v_cache[l]` instead declare that
         // layer's conv-state / DeltaNet-S-state Inputs (see the matching alloc in
         // `generate_dense_backend` and `MixerW::DeltaNet`'s use of them below).
+        // Paged session: every pooled layer reads through this one table, so the graph declares it
+        // once and the adapter finds the same table on every pooled cache's `pages` map.
+        let page_table = pg_desc.map(|(len, _, _)| g.input(f32d(len)));
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
         for l in 0..c.n_layer {
@@ -1878,8 +1899,27 @@ pub(crate) fn generate_dense_backend(
             // (row = pos % (numel / row_width)).
             let (k_row, v_row) = crate::seam::kv_row_elems(c, l);
             let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
-            k_cache.push(g.input(kd(crate::seam::kv_side_elems(rows_l * k_row))));
-            v_cache.push(g.input(vd(crate::seam::kv_side_elems(rows_l * v_row))));
+            let (mut kdesc, mut vdesc) = (
+                kd(crate::seam::kv_side_elems(rows_l * k_row)),
+                vd(crate::seam::kv_side_elems(rows_l * v_row)),
+            );
+            // A pooled layer declares the WHOLE pool: the kernels address rows by physical page,
+            // and the block bias keeps a slot's own writes inside its block.
+            if let (Some((_, row_base, pool_rows)), Some(table)) = (pg_desc, page_table) {
+                if crate::seam::paged_layer(c, l) {
+                    let pages = infr_core::tensor::PageMap {
+                        table,
+                        page_rows: infr_vulkan::paged::PAGE_ROWS as u32,
+                        row_base,
+                    };
+                    kdesc = kd(crate::seam::kv_side_elems(pool_rows * k_row));
+                    kdesc.pages = Some(pages);
+                    vdesc = vd(crate::seam::kv_side_elems(pool_rows * v_row));
+                    vdesc.pages = Some(pages);
+                }
+            }
+            k_cache.push(g.input(kdesc));
+            v_cache.push(g.input(vdesc));
         }
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
@@ -4696,6 +4736,7 @@ pub(crate) fn generate_dense_backend(
                 tok_id,
                 k_cache,
                 v_cache,
+                page_table,
                 weights,
             },
         )
@@ -4976,6 +5017,7 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
+            pg_table,
         );
         if plan_sc {
             if dyn_sc {
@@ -5242,6 +5284,7 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
+            pg_table,
         );
         vb.bind(
             vh.logits.expect("verify build has logits"),
@@ -5649,6 +5692,7 @@ pub(crate) fn generate_dense_backend(
                     &kbufs[..],
                     &vbufs[..],
                     &wbufs[..],
+                    pg_table,
                 );
                 debug_assert!(
                     pf_h.logits.is_none(),
@@ -5797,6 +5841,7 @@ pub(crate) fn generate_dense_backend(
             &kbufs[..],
             &vbufs[..],
             &wbufs[..],
+            pg_table,
         );
         b.bind(
             h.logits.expect("decode build has logits"),
@@ -6052,6 +6097,7 @@ pub(crate) fn generate_dense_backend(
                 &kbufs[..],
                 &vbufs[..],
                 &wbufs[..],
+                pg_table,
             );
             b.bind(
                 h.logits.expect("decode build has logits"),

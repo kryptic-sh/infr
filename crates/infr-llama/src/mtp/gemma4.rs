@@ -531,6 +531,12 @@ impl AssistantWeights {
         h: &[f32],
         pos: usize,
     ) -> Result<(u32, f32, Vec<f32>)> {
+        if state.is_paged() {
+            return Err(anyhow!(
+                "the gemma4 MTP draft reads the trunk's KV rows by position, which a paged trunk \
+                 cache (kv.paged) does not have — run with kv.paged=false"
+            ));
+        }
         let src_swa = target.kv_src_layer(target.n_layer - 2);
         let src_full = target.kv_src_layer(target.n_layer - 1);
         let swa_view = state.kv_layer(src_swa);

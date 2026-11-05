@@ -66,12 +66,13 @@ fn planar_q8_store_dyn_roundtrip() {
     let sbuf = be.alloc(rs * 4, BufferUsage::Activations).unwrap();
     be.upload(sbuf.as_ref(), bytemuck::cast_slice(&row))
         .unwrap();
-    let params = be.alloc(16, BufferUsage::Activations).unwrap();
-    be.upload(
-        params.as_ref(),
-        bytemuck::cast_slice(&[pos as u32, (pos + 1) as u32]),
-    )
-    .unwrap();
+    // Six words: pos, kv_len, then the paged block's table/row-base words (all zero here).
+    let params = be.alloc(24, BufferUsage::Activations).unwrap();
+    let mut pb = [0u32; 6];
+    pb[0] = pos as u32;
+    pb[1] = pos as u32 + 1;
+    be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
+        .unwrap();
     let cache = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
     let ne = (pos + 1) * rs;
     let dst = be.alloc(ne * 2, BufferUsage::Activations).unwrap();
@@ -351,12 +352,12 @@ fn planar_q8_dynac_matches_f16() {
     let vf = be.alloc(n * 2, BufferUsage::Activations).unwrap();
     be.upload(kf.as_ref(), &to_f16_bytes(&kv)).unwrap();
     be.upload(vf.as_ref(), &to_f16_bytes(&kv)).unwrap();
-    let params = be.alloc(16, BufferUsage::Activations).unwrap();
-    be.upload(
-        params.as_ref(),
-        bytemuck::cast_slice(&[kv_len as u32 - 1, kv_len as u32]),
-    )
-    .unwrap();
+    let params = be.alloc(24, BufferUsage::Activations).unwrap();
+    let mut pb = [0u32; 6];
+    pb[0] = kv_len as u32 - 1;
+    pb[1] = kv_len as u32;
+    be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
+        .unwrap();
 
     let chunk = 64usize;
     let n_chunks = kv_len.div_ceil(chunk).max(2);
@@ -476,8 +477,10 @@ fn planar_q8_store_replay_tape_matches_static() {
     // ── replay tape: params seeded [pos0-1, pos0] = [-1, 0]; advance lands row 0 first ──
     let kf = be.alloc(rs * 2, BufferUsage::Activations).unwrap(); // f16 K staging
     let vf = be.alloc(rs * 4, BufferUsage::Activations).unwrap(); // f32 V
-    let params = be.alloc(16, BufferUsage::Activations).unwrap();
-    be.upload(params.as_ref(), bytemuck::cast_slice(&[u32::MAX, 0u32]))
+    let params = be.alloc(24, BufferUsage::Activations).unwrap();
+    let mut pb = [0u32; 6];
+    pb[0] = u32::MAX;
+    be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
         .unwrap();
     let kq_dyn = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
     let vq_dyn = be.alloc(cbytes, BufferUsage::KvCache).unwrap();

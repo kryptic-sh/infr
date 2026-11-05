@@ -493,6 +493,16 @@ impl SeamKv {
             self.vbufs[l] = std::sync::Arc::clone(pool.v(l).expect("pooled layer has both sides"));
         }
         self.paged = Some(slot);
+        let layers = (0..cfg.n_layer).filter(|&l| pool.k(l).is_some()).count();
+        tracing::info!(
+            "kv.paged: {} of {} layers in {} pool blocks of {} rows; this slot's block starts at \
+             row {}",
+            layers,
+            cfg.n_layer,
+            pool.blocks(),
+            pool.slot_rows(),
+            self.paged.as_ref().expect("just set").row_base(),
+        );
         Ok(())
     }
 
@@ -760,6 +770,11 @@ impl SeamKv {
             if pages > 0 {
                 dst.map.share_prefix(&src_paged.map, pages);
                 dst.upload_table(be)?;
+                tracing::info!(
+                    "kv.paged: forked slot shares {} pages ({} rows) of the prefix",
+                    pages,
+                    pages * page_rows,
+                );
             }
             let p = pages * page_rows;
             self.cached = src.cached[..p].to_vec();

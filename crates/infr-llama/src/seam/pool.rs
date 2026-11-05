@@ -270,6 +270,11 @@ impl SlotMap {
         self.map[j] as usize == self.block * self.pool.pps + j
     }
 
+    /// Physical page holding logical page `j`.
+    pub(crate) fn page(&self, j: usize) -> u32 {
+        self.map[j]
+    }
+
     /// One physical page id per logical page, plus the repeat of the last page.
     pub(crate) fn table_bytes(&self) -> Vec<u8> {
         let mut t = self.map.clone();
@@ -349,6 +354,25 @@ fn copy_page(be: &dyn Backend, buf: &dyn Buffer, src: u32, dst: u32, bytes: usiz
         .map_err(|e| anyhow!("{e}"))
 }
 
+/// Copy `bytes` from physical page `src` of `buf` into page `dst`; `page_bytes` is that page's
+/// size, so page `p` starts at `p * page_bytes` and only the first `bytes` of it move.
+fn copy_page_rows(
+    be: &dyn Backend,
+    buf: &dyn Buffer,
+    src: u32,
+    dst: u32,
+    bytes: usize,
+    page_bytes: usize,
+) -> AResult<()> {
+    if bytes == 0 || src == dst {
+        return Ok(());
+    }
+    let from = src as usize * page_bytes;
+    let to = dst as usize * page_bytes;
+    be.copy_buffer_at(buf, from, buf, to, bytes.min(page_bytes))
+        .map_err(|e| anyhow!("{e}"))
+}
+
 impl Drop for SlotMap {
     fn drop(&mut self) {
         self.unshare_all();
@@ -401,6 +425,37 @@ impl PagedSlot {
 
     pub(crate) fn row_base(&self) -> usize {
         self.map.row_base()
+    }
+
+    /// Copy the rows a prefix has inside logical page `page` (fewer than `PAGE_ROWS` of them) from
+    /// `src` to this slot's own page, so a shared prefix shorter than one page is still reused.
+    pub(crate) fn copy_tail(
+        &self,
+        be: &dyn Backend,
+        src: &SlotMap,
+        page: usize,
+        rows: usize,
+    ) -> AResult<()> {
+        let pool = self.map.pool();
+        let rows = rows.min(PAGE_ROWS);
+        if rows == 0 || page >= self.map.map.len() {
+            return Ok(());
+        }
+        let from = src.page(page);
+        let to = self.map.page(page);
+        for l in 0..pool.k.len() {
+            let Some(k) = pool.k[l].as_ref() else {
+                continue;
+            };
+            let kb = kv_fmt_bytes(pool.k_fmt, PAGE_ROWS * pool.k_row[l]);
+            let n = kv_fmt_bytes(pool.k_fmt, rows * pool.k_row[l]);
+            copy_page_rows(be, k.as_ref(), from, to, n, kb)?;
+            let v = pool.v[l].as_ref().expect("pooled layer has both sides");
+            let vb = kv_fmt_bytes(pool.v_fmt, PAGE_ROWS * pool.v_row[l]);
+            let n = kv_fmt_bytes(pool.v_fmt, rows * pool.v_row[l]);
+            copy_page_rows(be, v.as_ref(), from, to, n, vb)?;
+        }
+        Ok(())
     }
 
     /// Drop every shared page without a device copy; the table is refreshed on the next forward.
@@ -553,5 +608,34 @@ mod tests {
         assert_eq!(split, 1, "rows 600..700 live in page 1 only");
         assert!(!slot.map.is_private(0), "page 0 is still the parent's");
         assert!(slot.map.is_private(1));
+    }
+
+    /// A prefix that ends inside a page must still be reused, not dropped: the tail rows are copied
+    /// into the fork's own page while the pages before stay shared.
+    #[test]
+    fn a_prefix_shorter_than_a_page_is_copied() {
+        let be = cpu();
+        let c = cfg();
+        let pool = KvPool::new(&be, &c, 1024, DType::F16, DType::F16, 2).unwrap();
+        let bytes = page_bytes(&pool);
+        let row = bytes / PAGE_ROWS;
+        assert_eq!(row, 64, "n_kv·head_dim f16");
+
+        let src = SlotMap::take(&pool).unwrap();
+        let k = pool.k(0).unwrap().clone();
+        be.upload_at(k.as_ref(), 0, &vec![0xAAu8; 7 * row]).unwrap();
+
+        let dst = PagedSlot::new(&pool, &be).unwrap();
+        dst.copy_tail(&be, &src, 0, 7).unwrap();
+        assert!(
+            dst.map.is_private(0),
+            "the tail lands in the fork's own page"
+        );
+        let page = read_page(&be, k.as_ref(), dst.map.page(0) as usize, bytes);
+        assert!(page[..7 * row].iter().all(|&b| b == 0xAA));
+        assert!(
+            page[7 * row..].iter().all(|&b| b == 0),
+            "nothing past the copied rows"
+        );
     }
 }

@@ -768,7 +768,7 @@ impl SeamKv {
             }
         }
         // Paged slots share whole pages: the prefix's pages become the same physical pages in both
-        // slots, and the tokens inside a partial page re-prefill here alone.
+        // slots, and only the partial page at the end is copied.
         if let (Some(dst), Some(src_paged)) = (self.paged.as_mut(), src.paged.as_ref()) {
             let page_rows = infr_vulkan::paged::PAGE_ROWS;
             let pages = p / page_rows;
@@ -781,7 +781,12 @@ impl SeamKv {
                     pages * page_rows,
                 );
             }
-            let p = pages * page_rows;
+            // The prefix ends inside a page more often than not; the linear path copies those rows,
+            // so a fork that shared nothing (a prefix under one page) must not be worse than it.
+            let tail = p - pages * page_rows;
+            if tail > 0 {
+                dst.copy_tail(be, &src_paged.map, pages, tail)?;
+            }
             self.cached = src.cached[..p].to_vec();
             return Ok(());
         }

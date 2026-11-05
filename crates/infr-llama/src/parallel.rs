@@ -117,6 +117,9 @@ pub struct ParallelSeam {
     /// The GPU baton. `None` when `n_slots == 1`: a lone sequence must not pay even a mutex per
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
+    /// Host-RAM KV prefixes shared by every conversation on this engine (see
+    /// [`crate::seam::KvPrefixStore`]). Empty and inert unless `kv.store_mb` is set.
+    store: Mutex<crate::seam::KvPrefixStore>,
     max_ctx: usize,
     /// This model's OWN placement pins (pinned prefill chunk / auto-q8 KV — see
     /// [`crate::seam::PlacementPins`]). Per-engine so a multi-model host (`infr multi` runs N of
@@ -165,6 +168,12 @@ impl ParallelSeam {
         let pins = Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
+        let store_bytes = model
+            .cfg()
+            .kv
+            .store_mb
+            .map(|mb| (mb as usize).saturating_mul(1024 * 1024))
+            .unwrap_or(0);
         let mut engine = Self {
             model,
             vk,
@@ -173,6 +182,7 @@ impl ParallelSeam {
                 tick: 0,
             }),
             freed: Condvar::new(),
+            store: Mutex::new(crate::seam::KvPrefixStore::new(store_bytes)),
             // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
@@ -419,6 +429,24 @@ impl ParallelSeam {
         // guard keeps that override published for exactly this generation.
         let (prompt_tokens, _media) = self.model.encode_prompt(prompt, self.max_ctx, Some(req))?;
         let mut guard = self.checkout(&prompt_tokens, req)?;
+        // A prefix this engine already materialized — possibly for another conversation — costs one
+        // upload here and is then skipped by the prefill, exactly like a seed from a sibling slot.
+        if let Some(kv) = guard.kv.as_mut() {
+            let restored = self
+                .store
+                .lock()
+                .map_err(|_| anyhow!("kv store lock poisoned"))?
+                .restore(
+                    &self.vk,
+                    self.model.config(),
+                    self.model.engine_cfg(),
+                    kv,
+                    &prompt_tokens,
+                )?;
+            if restored > 0 {
+                tracing::debug!(tokens = restored, "kv store: restored a stored prefix");
+            }
+        }
         // Cap the reply to the context actually left in THIS slot (a per-slot ctx is smaller than
         // the model's trained window under `-np N`), mirroring the sequential session path: a
         // generation ceiling is a default, not a demand. An over-long PROMPT still errors cleanly
@@ -452,6 +480,25 @@ impl ParallelSeam {
             constraint,
             Some(req),
         )?;
+        // Keep this prompt's rows for whoever asks the adjacent question next. A failure here is a
+        // cache miss on the next request, never a failed request.
+        if let Some(kv) = guard.kv.as_ref() {
+            match self.store.lock().map(|mut s| {
+                s.capture(
+                    &self.vk,
+                    self.model.config(),
+                    self.model.engine_cfg(),
+                    kv,
+                    prompt_tokens.len(),
+                )
+            }) {
+                Ok(Ok(kept)) if kept > 0 => {
+                    tracing::debug!(tokens = kept, "kv store: captured a prefix");
+                }
+                Ok(Err(e)) => tracing::warn!(error = %e, "kv store: capture failed"),
+                _ => {}
+            }
+        }
         Ok(stats)
     }
 }

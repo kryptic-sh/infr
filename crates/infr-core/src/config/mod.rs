@@ -140,6 +140,9 @@ cfg_struct! {
         overflow_vram_mb: Option<u64> = None,
         /// `INFR_KV_OVERFLOW_RESERVE_MB`, in MiB. `None` = `max(12% of VRAM, 2 GiB)`.
         overflow_reserve_mb: Option<u64> = None,
+        /// `INFR_KV_STORE_MB`: host-RAM budget for the cross-conversation KV prefix store, in MiB.
+        /// `None` = off, and the store is never built.
+        store_mb: Option<u64> = None,
     }
 }
 

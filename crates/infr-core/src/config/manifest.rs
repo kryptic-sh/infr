@@ -152,6 +152,7 @@ knobs! {
     "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;
     "INFR_KV_OVERFLOW_VRAM_MB"  => "kv.overflow_vram_mb",    Mib,         Ignored, "512",  migrated;
     "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  migrated;
+    "INFR_KV_STORE_MB"          => "kv.store_mb",           Mib,         Ignored, "1024", migrated;
 
     // ── paging ───────────────────────────────────────────────────────────────
     "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  migrated;

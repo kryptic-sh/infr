@@ -47,7 +47,9 @@ What it does not do, and the reasons:
   cache rows by position.
 
 It is a memory feature, not a speed feature: decode reads are one extra table
-lookup per chunk.
+lookup per chunk, and prefill on a paged cache takes the split-K attention
+kernel — the coopmat prefill tiers read the cache as one flat run and would
+need a page walk in their K/V tile loads.
 
 ## Reverse PagedAttention: what `kv.store_mb` does
 

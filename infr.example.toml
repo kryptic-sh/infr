@@ -93,10 +93,12 @@ slots = 4
 # The sliding-window ring cache (INFR_NO_KV_RING inverted).
 ring = true
 
-# Host-RAM budget (MiB) for the cross-conversation KV prefix store: a prompt's
-# K/V rows are kept after the slot is recycled, so a later chat that starts with
-# the same tokens uploads them instead of re-prefilling. Off by default — the
-# store holds prompt-derived data, so enabling it is a deliberate choice.
+# Host-RAM budget (MiB) for the cross-conversation KV prefix store — reverse
+# PagedAttention: a prompt's K/V rows are kept after the slot is recycled, so a
+# later chat that starts with the same tokens uploads them instead of
+# re-prefilling. Unrelated to forward PagedAttention (slots sharing pages
+# inside one pool), which has its own knob. Off by default — the store holds
+# prompt-derived data, so enabling it is a deliberate choice.
 # store_mb = 1024
 
 # Decode-time inline KV write, and the coopmat/BDA KV path.

@@ -14,6 +14,20 @@ rows stay contiguous in a slot; the blocks are the thing that travels, and the
 "restore" is a bulk upload back into a linear buffer. It is a cache in the CPU
 sense, not an allocator.
 
+## Knobs
+
+Two mechanisms, two knobs, and neither implies the other:
+
+| Knob | Config / env | Direction | Status |
+| --- | --- | --- | --- |
+| `store_mb` | `kv.store_mb` / `INFR_KV_STORE_MB` | reverse (host block store) | shipped |
+| `paged` | `kv.paged` / `INFR_KV_PAGED` | forward (page pool) | not wired |
+
+`kv.paged` does not exist in the tree yet: the page-table read path, the
+refcounted pool and the offset-capable copies are in, but nothing allocates
+pages until the seam binds a slot's rows into the pool. Do not document it as a
+working switch before that lands.
+
 ## Reverse PagedAttention: what `kv.store_mb` does
 
 `crates/infr-llama/src/seam/kv_store.rs` keys captured KV in 128-token blocks

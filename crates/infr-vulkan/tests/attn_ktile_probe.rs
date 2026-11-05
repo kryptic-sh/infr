@@ -307,7 +307,7 @@ fn reference(
 ) {
     rec.attention_kv_split_at(
         q, kc, vc, ka, va, o, pm, pl, pacc, 1, pos, kv_len, nh, nkv, HD, chunk, n_chunks, 0.0, 0,
-        None, false, false, 0, false, None,
+        None, false, false, 0, false, None, None,
     );
 }
 

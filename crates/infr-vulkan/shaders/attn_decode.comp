@@ -58,8 +58,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #error "DHD4 must be 32 (hd=128), 64 (hd=256) or 128 (hd=512)"
 #endif
 
-// EXACTLY `attn_partial.comp`'s `-DKV_BDA` push block (15 words = 60 B) so the recorder's existing
-// packing is reused verbatim and the two kernels are interchangeable at the dispatch site.
+// `attn_partial.comp`'s `-DKV_BDA` push block (15 words = 60 B) plus three paging words (18 words =
+// 72 B, see the page table below) so the recorder's packing is reused verbatim and the two kernels
+// stay interchangeable at the dispatch site.
 // `rows` is the specialization's zero; `pos` is dead under USE_PARAMS, `window` outside -DSWA and
 // `cap` outside -DRING. The block is declared unconditionally: vkCreateComputePipelines validates
 // the range against the declared Block SIZE, not per-member static use
@@ -69,6 +70,9 @@ layout(push_constant) uniform PC {
     uint cap;
     uint pos; uint rows;
     uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+    // Paged K/V: `page_rows` == 0 means the cache is contiguous (the identity mapping). Otherwise
+    // `(page_lo, page_hi)` addresses a table of u32 physical page ids, indexed by logical page.
+    uint page_lo; uint page_hi; uint page_rows;
 } pc;
 #include "kv_addr.glsl"
 
@@ -175,7 +179,22 @@ void main() {
     uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
 #define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
 #else
-#define RROW(j) (j)
+    // Paged K/V (opt-in, contiguous caches leave `page_rows` at 0). The table maps a logical page of
+    // `page_rows` keys to a physical page id; a chunk is at most 512 keys, so it spans at most two
+    // pages and two wave-uniform table reads cover it: `off` turns a logical row into its physical
+    // one with one compare and one add per key. The table carries one entry per page PLUS a repeat of
+    // the last page, because the tail chunk looks one page ahead.
+    uint pg0 = 0u, pg1 = 0u, pgcut = 0xFFFFFFFFu;
+    if (pc.page_rows > 0u) {
+        uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
+        uint p0 = j0 / pc.page_rows;
+        uint t0 = kv_word(pt, p0);
+        uint t1 = kv_word(pt, p0 + 1u);
+        pg0 = (t0 - p0) * pc.page_rows;
+        pg1 = (t1 - (p0 + 1u)) * pc.page_rows;
+        pgcut = (p0 + 1u) * pc.page_rows;
+    }
+#define RROW(j) ((j) < pgcut ? ((j) + pg0) : ((j) + pg1))
 #endif
 
     // ── QK via subgroup reduction ────────────────────────────────────────────────────────────────

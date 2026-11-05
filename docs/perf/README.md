@@ -23,6 +23,10 @@ headline.
 - **[vulkan-decode-attn-chunk.md](vulkan-decode-attn-chunk.md)** — the decode
   attention split-K chunk floor: why 64 keys per chunk was the wrong floor at
   rows==1, and what it cost at shallow depths.
+- **[kv-prefix.md](kv-prefix.md)** — KV reuse across requests (the host block
+  store, a.k.a. reverse PagedAttention) and why long-context runs need the
+  inversion: page tables, copy-on-write, and the host store demoted to a cold
+  tier.
 - **[kernels.md](kernels.md)** — cross-backend fast-kernel coverage: which
   weight-quant formats have a native kernel on CPU / Vulkan / Metal, and each
   backend's decode strategy.

@@ -255,11 +255,22 @@ pub fn moe_paged_mmq_ok(dt: DType) -> bool {
 
 pub type Shape = Vec<usize>;
 
+/// Physical layout of a KV cache whose rows are scattered across a page pool: logical pages of
+/// `page_rows` keys are mapped through `table` (one u32 physical page id per entry, plus a repeat of
+/// the last page) to their rows. Only the attention kernels read this; a cache without one is linear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageMap {
+    pub table: TensorId,
+    pub page_rows: u32,
+}
+
 /// Shape + dtype of a tensor value flowing through the graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TensorDesc {
     pub shape: Shape,
     pub dtype: DType,
+    /// `Some` only on a KV cache that is not stored contiguously. `None` is the linear layout.
+    pub pages: Option<PageMap>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -268,6 +279,7 @@ impl TensorDesc {
         Self {
             shape: shape.into(),
             dtype,
+            pages: None,
         }
     }
 

@@ -428,7 +428,7 @@ struct Legs {
     replay: Vec<u32>,
 }
 
-fn run_shape(be: &VulkanBackend, s: &Shape) -> Legs {
+fn run_shape(be: &VulkanBackend, s: &Shape, decode: bool) -> Legs {
     let (kv_len, nh, nkv, hd, chunk) = (s.kv_len, s.nh, s.nkv, s.hd, s.chunk);
     let pos = kv_len - 1; // rows == 1: the decode query is position kv_len-1
     let cache_elems = s.rows_alloc() * nkv * hd;
@@ -495,9 +495,101 @@ fn run_shape(be: &VulkanBackend, s: &Shape) -> Legs {
         cap,
         false, // batched
         None,  // kv_ml
+        None,  // pages
     );
     rec.finish().unwrap();
     let stat = bits(o_stat.as_ref());
+
+    // ── paged leg ────────────────────────────────────────────────────────────────────────────
+    // The same KV, physically shuffled at page granularity and read back through a page table. The
+    // table must be transparent: one compare per key, same bits. Only a linear cache carries the
+    // mapping (the `-DRING` builds keep `j % rcap` and never read the words), AND only the
+    // `attn_decode` pass-1 declares the paging words — the bound-SSBO reference kernel is a 15-word
+    // push, so it must not be exercised here.
+    if decode && s.cap() == 0 {
+        let page_rows = 512usize.max(chunk.next_power_of_two());
+        let rows = s.rows_alloc();
+        let full = rows / page_rows;
+        if full > 1 {
+            let row_bytes = nkv * hd * 2;
+            let mut kbuf = vec![0u8; cache_elems * 2];
+            let mut vbuf = vec![0u8; cache_elems * 2];
+            be.download(kb.as_ref(), &mut kbuf).unwrap();
+            be.download(vb.as_ref(), &mut vbuf).unwrap();
+            // The partial tail page keeps its own slot, so every permuted page is exactly
+            // `page_rows` long. Three legs: the identity proves the plumbing (push words, BDA base,
+            // lookahead entry), the reversal proves the mapping, and the zero-table leg proves the
+            // words are LIVE — a contiguous buffer with a table that says "every page is page 0"
+            // must not reproduce the contiguous result.
+            let identity: Vec<usize> = (0..=full).collect();
+            let mut reversed: Vec<usize> = (0..full).rev().collect();
+            reversed.push(full);
+            let legs = [
+                ("identity", identity.clone(), identity.clone(), false),
+                ("reversed", reversed.clone(), reversed.clone(), false),
+                ("zero-table", identity, vec![0usize; full + 1], true),
+            ];
+            for (tag, perm, table_seed, expect_differs) in legs {
+                let mut kp = vec![0u8; cache_elems * 2];
+                let mut vp = vec![0u8; cache_elems * 2];
+                for (p, &q) in perm.iter().enumerate() {
+                    let n = page_rows.min(rows - p * page_rows) * row_bytes;
+                    let src = p * page_rows * row_bytes;
+                    let dst = q * page_rows * row_bytes;
+                    kp[dst..dst + n].copy_from_slice(&kbuf[src..src + n]);
+                    vp[dst..dst + n].copy_from_slice(&vbuf[src..src + n]);
+                }
+                let kpb = be.alloc(cache_elems * 2, BufferUsage::KvCache).unwrap();
+                let vpb = be.alloc(cache_elems * 2, BufferUsage::KvCache).unwrap();
+                be.upload(kpb.as_ref(), &kp).unwrap();
+                be.upload(vpb.as_ref(), &vp).unwrap();
+                let mut table: Vec<u32> = table_seed.iter().map(|&p| p as u32).collect();
+                let last = *table.last().unwrap();
+                table.push(last);
+                let tb = be.alloc(table.len() * 4, BufferUsage::KvCache).unwrap();
+                be.upload(tb.as_ref(), bytemuck::cast_slice(&table))
+                    .unwrap();
+                let ta = tb.device_addr().expect("page table device address");
+                let o_page = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
+                let rec = be.recorder().unwrap();
+                rec.attention_kv_split_at(
+                    qb.as_ref(),
+                    kpb.as_ref(),
+                    vpb.as_ref(),
+                    kpb.device_addr().unwrap(),
+                    vpb.device_addr().unwrap(),
+                    o_page.as_ref(),
+                    pm.as_ref(),
+                    pl.as_ref(),
+                    pacc.as_ref(),
+                    1, // rows
+                    pos,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    chunk,
+                    n_chunks,
+                    s.scale,
+                    s.window,
+                    None,  // canvas_lo
+                    false, // k f16
+                    false, // v f16
+                    cap,
+                    false, // batched
+                    None,  // kv_ml
+                    Some((ta, page_rows as u32)),
+                );
+                rec.finish().unwrap();
+                let same = stat == bits(o_page.as_ref());
+                assert_eq!(
+                    same, !expect_differs,
+                    "{}: the {tag} page table leg disagrees (same = {same})",
+                    s.label
+                );
+            }
+        }
+    }
 
     // ── record-once replay path ──────────────────────────────────────────────────────────────
     let params = be.alloc(8, BufferUsage::Activations).unwrap();
@@ -552,13 +644,16 @@ fn backend_with(attn_decode: bool, gqa: Option<bool>) -> Option<VulkanBackend> {
 
 fn run_all(attn_decode: bool) -> Option<(Vec<Legs>, Vec<&'static str>)> {
     let be = backend(attn_decode)?;
-    let out = SHAPES.iter().map(|s| run_shape(&be, s)).collect();
+    let out = SHAPES
+        .iter()
+        .map(|s| run_shape(&be, s, attn_decode))
+        .collect();
     Some((out, be.built_kernel_names()))
 }
 
 fn run_all_gqa(gqa: bool) -> Option<(Vec<Legs>, Vec<&'static str>)> {
     let be = backend_with(true, Some(gqa))?;
-    let out = SHAPES.iter().map(|s| run_shape(&be, s)).collect();
+    let out = SHAPES.iter().map(|s| run_shape(&be, s, true)).collect();
     Some((out, be.built_kernel_names()))
 }
 

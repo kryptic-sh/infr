@@ -6988,7 +6988,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.attention_kv_split_impl(
             q, kc, vc, o, pm, pl, pacc, rows, pos, kv_len, nh, nkv, hd, chunk, n_chunks, scale,
-            window, canvas_lo, k_q8, v_q8, cap, batched, None, None,
+            window, canvas_lo, k_q8, v_q8, cap, batched, None, None, None,
         );
     }
 
@@ -7029,6 +7029,10 @@ impl<'a> Recorder<'a> {
         // low-bit block quant `dt` (K and V share the dtype) — the cache is read/dequanted in-kernel,
         // no dequant→f16 prepass. Requires the BDA base (this `_at` method); `None` keeps f16/Q8.
         kv_ml: Option<infr_core::DType>,
+        // Paged K/V: `Some((table_addr, page_rows))` reads the cache through a page table, so a slot
+        // can be assembled from a shared page pool instead of a contiguous buffer (`attn_decode`
+        // only; `page_rows == 0` on the wire is the identity, and pass 2 never touches KV).
+        pages: Option<(u64, u32)>,
     ) {
         self.attention_kv_split_impl(
             q,
@@ -7055,6 +7059,7 @@ impl<'a> Recorder<'a> {
             batched,
             Some((k_addr, v_addr)),
             kv_ml,
+            pages,
         );
     }
 
@@ -7107,6 +7112,9 @@ impl<'a> Recorder<'a> {
         // no dequant→f16 prepass). Only ever set with `kv_addr` Some (inline decode needs the BDA
         // base) and with `k_q8`/`v_q8`/`batched` false (mainline is a distinct read path).
         kv_ml: Option<infr_core::DType>,
+        // Paged K/V: `Some((table_addr, page_rows))` reads rows through a page table (attn_decode
+        // builds only), so a slot can point at a shared page pool instead of a contiguous buffer.
+        pages: Option<(u64, u32)>,
     ) {
         let bda = kv_addr.is_some();
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32). Each
@@ -7220,15 +7228,18 @@ impl<'a> Recorder<'a> {
         // one row, no canvas, chunk <= 512, ring-safe).
         let gqa = fast.and_then(|_| self.gqa_pass1(hd, nh, nkv, window, false));
         let (p1name, p1spv) = gqa.or(fast).unwrap_or((p1name, p1spv));
-        // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
-        // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
-        let plen: usize = if bda { 60 } else { 44 };
+        // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes, plus the three
+        // paging words `attn_decode.comp` declares (page_lo/page_hi/page_rows) → 72; the bound push
+        // is the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under
+        // BDA. A kernel that declares a smaller block (attn_partial's 60) is fine on a larger range —
+        // only a range SHORTER than the declared block fails pipeline creation.
+        let plen: usize = if bda { 72 } else { 44 };
         let k1 = if gqa.is_some() {
             self.be.kernel_sg64_native(p1name, p1spv, 6, plen as u32)
         } else {
             self.be.kernel_sg(p1name, p1spv, 6, plen as u32, 32)
         };
-        let mut p1 = [0u8; 60];
+        let mut p1 = [0u8; 72];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
@@ -7256,6 +7267,11 @@ impl<'a> Recorder<'a> {
             p1[48..52].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
             p1[52..56].copy_from_slice(&(v_addr as u32).to_ne_bytes());
             p1[56..60].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
+        }
+        if let Some((page_addr, page_rows)) = pages {
+            p1[60..64].copy_from_slice(&(page_addr as u32).to_ne_bytes());
+            p1[64..68].copy_from_slice(&((page_addr >> 32) as u32).to_ne_bytes());
+            p1[68..72].copy_from_slice(&page_rows.to_ne_bytes());
         }
         // Batched: workgroup y = 4-row group; per-row: y = row.
         let gy = if batched { rows.div_ceil(4) } else { rows };
@@ -8030,14 +8046,16 @@ impl<'a> Recorder<'a> {
         // 10069 — confirmed firing on the 7900 XTX under validation layers: "push constant buffer
         // Block with range [0, 44] which is outside the VkPushConstantRange of [0, 36]"). The
         // range must cover the full declared block; the trailing 8 bytes stay zero and unread.
-        // BDA push grows to 60 (k_lo/k_hi/v_lo/v_hi at 44..60); bound stays 44. n_buf stays 7.
-        let plen: usize = if bda { 60 } else { 44 };
+        // BDA push grows to 60 (k_lo/k_hi/v_lo/v_hi at 44..60), plus the three paging words the
+        // `attn_decode` replay build declares → 72; bound stays 44. n_buf stays 7. Replay paging is
+        // not wired yet: the words stay zero, which is the identity mapping.
+        let plen: usize = if bda { 72 } else { 44 };
         let k1 = if gqa.is_some() {
             self.be.kernel_sg64_native(p1name, p1spv, 7, plen as u32)
         } else {
             self.be.kernel_sg(p1name, p1spv, 7, plen as u32, 32)
         };
-        let mut p1 = [0u8; 60];
+        let mut p1 = [0u8; 72];
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());

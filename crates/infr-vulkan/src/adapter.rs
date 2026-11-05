@@ -3534,6 +3534,15 @@ fn lower_op(
                     // address → the `(Some, Some)` arm). `decode_inline` ⟹ `split_ok` here, so this
                     // is the arm that fires. None for f16/Q8/prefill.
                     let kv_ml = if decode_inline { Some(kdt) } else { None };
+                    // Paged cache: the read side maps logical pages through the table on the cache
+                    // tensor's descriptor. Linear caches (the only kind anything allocates today)
+                    // resolve to None, which is the identity in the kernel.
+                    let pages = match graph.desc(*k_cache).pages {
+                        Some(pm) if pm.page_rows > 0 => {
+                            r(pm.table)?.device_addr().map(|a| (a, pm.page_rows))
+                        }
+                        _ => None,
+                    };
                     match (kcb.device_addr(), vcb.device_addr()) {
                         (Some(ka), Some(va)) => rec.attention_kv_split_at(
                             r(*q)?,
@@ -3561,6 +3570,7 @@ fn lower_op(
                             cap,
                             batched_attn,
                             kv_ml,
+                            pages,
                         ),
                         _ => rec.attention_kv_split(
                             r(*q)?,

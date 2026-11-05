@@ -453,6 +453,7 @@ fn run_split(be: &VulkanBackend, c: &SplitCase, k_q8: bool, v_q8: bool) -> Legs 
                 cap,
                 batched,
                 None,
+                None,
             ),
             None => rec.attention_kv_split(
                 q_buf.as_ref(),
@@ -770,6 +771,7 @@ fn run_mainline(
             cap,
             false,
             Some(dt),
+            None,
         );
         rec.finish().unwrap();
         let mut out = vec![0u8; o_bytes];

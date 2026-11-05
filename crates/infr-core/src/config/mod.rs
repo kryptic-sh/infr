@@ -145,7 +145,8 @@ cfg_struct! {
         store_mb: Option<u64> = None,
         /// `INFR_KV_PAGED`: forward PagedAttention — one page pool shared by the slots, with
         /// copy-on-write for a shared prefix. `None`/`false` = every slot owns a contiguous cache.
-        /// Nothing honors it yet; setting it is refused at session setup rather than ignored.
+        /// The pool is built at the session's first fork (see `docs/perf/kv-prefix.md`), so a
+        /// single-conversation run never allocates one.
         paged: Option<bool> = None,
     }
 }

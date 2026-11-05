@@ -262,6 +262,9 @@ pub type Shape = Vec<usize>;
 pub struct PageMap {
     pub table: TensorId,
     pub page_rows: u32,
+    /// First row of this slot's private block inside the pool. Reads ignore it (the table carries
+    /// the mapping); stores bias into it, because new rows never land in a shared page.
+    pub row_base: usize,
 }
 
 /// Shape + dtype of a tensor value flowing through the graph.

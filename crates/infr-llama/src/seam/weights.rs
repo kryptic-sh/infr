@@ -460,9 +460,14 @@ impl SeamKv {
         self.paged.is_some()
     }
 
-    /// This slot's store bias: the row its block starts at, 0 for a linear slot.
-    pub(crate) fn paged_row_base(&self) -> usize {
-        self.paged.as_ref().map_or(0, |p| p.row_base())
+    /// The store bias for ONE layer: its block's first row when that layer is pooled, else 0 — a
+    /// slot's sliding-window, recurrent and compressed layers keep private buffers that still start
+    /// at row 0.
+    pub(crate) fn paged_row_base_at(&self, cfg: &Config, l: usize) -> usize {
+        match &self.paged {
+            Some(p) if crate::seam::paged_layer(cfg, l) => p.row_base(),
+            _ => 0,
+        }
     }
 
     /// Turn this slot's pooled layers into blocks of `pool`: move the rows it already holds into
@@ -785,8 +790,8 @@ impl SeamKv {
             // three times `n_kv * head_dim` wide and has no V side at all, so both widths come
             // from the shared `crate::seam::kv_row_elems` (docs/backlog.md B41).
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            // A paged slot's rows start at its block's first row, so the copy lands there.
-            let bias = kv_fmt_bytes(self.k_fmt, self.paged_row_base() * k_row);
+            // A paged slot's pooled rows start at its block's first row, so the copy lands there.
+            let bias = kv_fmt_bytes(self.k_fmt, self.paged_row_base_at(cfg, l) * k_row);
             be.copy_buffer_at(
                 src.kbufs[l].as_ref(),
                 0,
@@ -802,7 +807,7 @@ impl SeamKv {
                     src.vbufs[l].as_ref(),
                     0,
                     self.vbufs[l].as_ref(),
-                    kv_fmt_bytes(self.v_fmt, self.paged_row_base() * v_row),
+                    kv_fmt_bytes(self.v_fmt, self.paged_row_base_at(cfg, l) * v_row),
                     kv_fmt_bytes(self.v_fmt, p * v_row),
                 )
                 .map_err(|e| anyhow!("{e}"))?;

@@ -136,9 +136,10 @@ impl KvPrefixStore {
         kv: &mut SeamKv,
         prompt: &[u32],
     ) -> Result<usize> {
-        // A paged slot's rows live at its block inside the pool, not at row 0, and the pool already
-        // shares prefixes between its slots — the host-RAM store has nothing to add there.
-        if !self.enabled() || cfg.qwen35 || kv.is_paged() {
+        // A paged slot's rows live at its block inside the pool, not at row 0 — the upload below
+        // is offset to the block, and the pages it overwrites are copied first because the pool
+        // may share them with another slot.
+        if !self.enabled() || cfg.qwen35 {
             return Ok(0);
         }
         let (mut p, hits) = self.matched(prompt);
@@ -170,6 +171,9 @@ impl KvPrefixStore {
         if n < MIN_PREFIX_TOKENS {
             return Ok(0);
         }
+        if let Some(p) = kv.paged.as_mut() {
+            p.make_private(be, 0, n)?;
+        }
         for l in 0..cfg.n_layer {
             let (k_row, v_row) = kv_row_elems(cfg, l);
             let kb = kv_fmt_bytes(kv.k_fmt, n * k_row);
@@ -178,7 +182,8 @@ impl KvPrefixStore {
                 buf.extend_from_slice(&self.blocks[*i].k[l]);
             }
             debug_assert_eq!(buf.len(), kb);
-            be.upload(kv.kbufs[l].as_ref(), &buf)?;
+            let off = kv_fmt_bytes(kv.k_fmt, kv.paged_row_base_at(cfg, l) * k_row);
+            be.upload_at(kv.kbufs[l].as_ref(), off, &buf)?;
             if v_row > 0 {
                 let vb = kv_fmt_bytes(kv.v_fmt, n * v_row);
                 let mut buf = Vec::with_capacity(vb);
@@ -186,7 +191,8 @@ impl KvPrefixStore {
                     buf.extend_from_slice(&self.blocks[*i].v[l]);
                 }
                 debug_assert_eq!(buf.len(), vb);
-                be.upload(kv.vbufs[l].as_ref(), &buf)?;
+                let off = kv_fmt_bytes(kv.v_fmt, kv.paged_row_base_at(cfg, l) * v_row);
+                be.upload_at(kv.vbufs[l].as_ref(), off, &buf)?;
             }
         }
         kv.cached = prompt[..n].to_vec();
@@ -208,7 +214,7 @@ impl KvPrefixStore {
         kv: &SeamKv,
         upto: usize,
     ) -> Result<usize> {
-        if !self.enabled() || cfg.qwen35 || kv.is_paged() {
+        if !self.enabled() || cfg.qwen35 {
             return Ok(0);
         }
         let p = upto.min(kv.cached.len()).min(kv.max_ctx);
@@ -284,10 +290,12 @@ impl KvPrefixStore {
         for l in 0..cfg.n_layer {
             let (k_row, v_row) = kv_row_elems(cfg, l);
             let mut kbuf = vec![0u8; kv_fmt_bytes(kv.k_fmt, p * k_row)];
-            be.download(kv.kbufs[l].as_ref(), &mut kbuf)?;
+            let koff = kv_fmt_bytes(kv.k_fmt, kv.paged_row_base_at(cfg, l) * k_row);
+            be.download_at(kv.kbufs[l].as_ref(), koff, &mut kbuf)?;
             let vbuf = if v_row > 0 {
                 let mut buf = vec![0u8; kv_fmt_bytes(kv.v_fmt, p * v_row)];
-                be.download(kv.vbufs[l].as_ref(), &mut buf)?;
+                let voff = kv_fmt_bytes(kv.v_fmt, kv.paged_row_base_at(cfg, l) * v_row);
+                be.download_at(kv.vbufs[l].as_ref(), voff, &mut buf)?;
                 buf
             } else {
                 Vec::new()

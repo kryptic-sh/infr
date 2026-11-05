@@ -47,6 +47,9 @@ fn engine(paged: bool) -> infr_llama::EngineConfig {
     let mut c = infr_llama::EngineConfig::default();
     c.kv.paged = Some(paged);
     c.kv.slots = 2;
+    // A tiny host store, so a recycled slot restores into its block (and copies a shared page
+    // before it writes) — the two prefix mechanisms have to compose.
+    c.kv.store_mb = Some(64);
     c
 }
 
@@ -79,14 +82,19 @@ fn conversations(model: &infr_llama::SeamModel, ctx: usize) -> (Vec<String>, Vec
     let pb = format!("{sys}Which copy rides the train?");
     let mut texts = Vec::new();
     let mut prefilled = Vec::new();
-    for prompt in [&pa, &pb] {
+    let mut turn = |sess: &mut _, prompt: &str| {
         let mut t = String::new();
         let stats = model
-            .generate_vulkan_session(&mut sess, prompt, 8, None, |p| t.push_str(p))
+            .generate_vulkan_session(sess, prompt, 8, None, |p| t.push_str(p))
             .expect("generation");
-        texts.push(t);
+        texts.push(t.clone());
         prefilled.push(stats.n_prompt);
-    }
+        t
+    };
+    let a = turn(&mut sess, &pa);
+    turn(&mut sess, &pb);
+    // Back to the first conversation: its slot must still hold A's prefix after B forked it.
+    turn(&mut sess, &format!("{pa}{a} And the fourth place?"));
     (texts, prefilled)
 }
 

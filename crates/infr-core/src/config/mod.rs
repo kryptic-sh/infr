@@ -143,6 +143,10 @@ cfg_struct! {
         /// `INFR_KV_STORE_MB`: host-RAM budget for the cross-conversation KV prefix store, in MiB.
         /// `None` = off, and the store is never built.
         store_mb: Option<u64> = None,
+        /// `INFR_KV_PAGED`: forward PagedAttention — one page pool shared by the slots, with
+        /// copy-on-write for a shared prefix. `None`/`false` = every slot owns a contiguous cache.
+        /// Nothing honors it yet; setting it is refused at session setup rather than ignored.
+        paged: Option<bool> = None,
     }
 }
 

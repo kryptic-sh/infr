@@ -1297,6 +1297,14 @@ pub(crate) fn generate_dense_backend(
         // DeepSeek2 MLA layers have ONE k_cache (key_length = kv_lora_rank + qk_rope_dim wide) per
         // token; V is an aliased prefix view — no separate v_cache.
         let ubatch = crate::seam::ubatch_rows(ec);
+        // The page pool is not wired into the seam yet; refuse instead of silently running the
+        // linear path, so a "paged" benchmark cannot measure the wrong thing.
+        if ec.kv.paged == Some(true) {
+            return Err(anyhow!(
+                "kv.paged (INFR_KV_PAGED) is not wired into the seam yet: the page-table read path \
+                 and the pool allocator exist, but slots still allocate their own contiguous KV"
+            ));
+        }
         let kv_sizes: Vec<(usize, usize)> = (0..c.n_layer)
             .map(|l| {
                 crate::seam::kv_layer_alloc_bytes(c, l, want_ctx, kv_ring, ubatch, k_fmt, v_fmt)

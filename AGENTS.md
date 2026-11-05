@@ -16,9 +16,11 @@
 - Pull the latest changes before continuing each slice of work, preserving local
   changes when integrating upstream work.
 - Commit and push each completed slice to `main`.
-- Watch CI for the pushed commit, inspect its jobs, and resolve failures before
-  considering the slice complete. A successful push alone is not verification.
-- Do not block a turn polling slow CI jobs: the CPU-goldens suite takes ~20+ min
-  on GHA. Merge/push once the fast signal is green (platform `cargo test` jobs,
-  clippy, fmt, plus a local run of the directly-affected tests), then check back
-  on the slow jobs and resolve any failures as a follow-up slice.
+- Verify locally before calling a slice complete: `cargo fmt --all`,
+  `cargo clippy --workspace --all-targets`, the tests for the crates you touched,
+  and `cargo doc --workspace --no-deps` when you edited doc comments. A
+  successful push alone is not verification.
+- Do not wait on GitHub Actions CI. Don't poll runs, don't block a turn on a
+  queued or running job, and don't hold a slice open for a green check: local
+  verification is the gate. If a run later reports a failure, fix it as a
+  follow-up slice.

@@ -2459,6 +2459,22 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Probe-only sequential-read kernel (`bw_scan.comp`): every thread streams consecutive vec4
+    /// words, so the read is one linear run and the result is this device's read-only bandwidth
+    /// ceiling. Nothing in production dispatches it.
+    pub fn bw_scan_at(&self, src: &dyn Buffer, dst: &dyn Buffer, n_vec4: usize, groups: usize) {
+        let kern = self.be.kernel("bw_scan", crate::gemm::bw_scan_spv(), 2, 4);
+        let mut push = [0u8; 4];
+        push[0..4].copy_from_slice(&(n_vec4 as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            groups as u32,
+        );
+    }
+
     /// Native-block projection GEMM `c = a · Wᵀ` for prefill: raw GGUF blocks dequantized in-shader
     /// during coopmat tiled staging (decode-once per weight element, reused across the 64-row tile).
     /// `c` is allocated `ceil(m/64)*64` rows. Requires `n%64==0`, `k%32==0`.

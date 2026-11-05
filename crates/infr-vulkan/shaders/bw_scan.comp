@@ -1,0 +1,16 @@
+#version 460
+// Probe-only: the sequential-read ceiling the decode GEMV is measured against. Every thread reads
+// consecutive vec4 words (a warp covers 512B), so DRAM sees one linear stream and the result is the
+// best bandwidth this device gives a read-only kernel. Nothing in production dispatches it.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n_vec4; } pc;
+layout(binding = 0) readonly buffer SB { vec4 s[]; };
+layout(binding = 1) writeonly buffer OB { vec4 o[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint stride = gl_NumWorkGroups.x * 256u;
+    vec4 acc = vec4(0.0);
+    for (; i < pc.n_vec4; i += stride) acc += s[i];
+    o[gl_GlobalInvocationID.x] = acc;
+}

@@ -1043,6 +1043,12 @@ pub(crate) fn linear_res_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// SPIR-V for the probe-only sequential-read kernel (`bw_scan.comp`); see `tests/bw_scan.rs`.
+/// Nothing in production dispatches it.
+pub fn bw_scan_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/bw_scan.spv"))))
+}
 /// SPIR-V (kernel-cache name + words) for [`native_gemm_fma_kernel_name`]'s pick; the sole weight
 /// build — production dispatches it via [`crate::recorder::Recorder::matmul_fma_at`] (the
 /// adapter's `nc_prefill_gemm`, resident or streamed); [`crate::recorder::Recorder::matmul_fma`]

@@ -1033,6 +1033,20 @@ const ATTN_PARTIAL_MAX_CHUNK: usize = 1024;
 /// array sized by its `-DSC_MAX` build define (`build.rs`): its fixed chunk, and its bound.
 const ATTN_MROWS_CHUNK: usize = 256;
 
+/// Baked split-K chunk floor for DECODE rows. Shallow kv is latency-bound, not bandwidth-bound:
+/// a 64-key floor put one wave64 per (head, chunk) on the device and left a 42-layer chain of
+/// ~40us dispatches at kv < 200. Both decode paths re-derive `max(span/32, floor)` from the live
+/// span, so a lower floor only binds below span 512 and deep decode is unchanged.
+const ATTN_DECODE_MIN_CHUNK: usize = 16;
+
+/// Decode's [`ATTN_SPLIT`]: the same ~32 chunks/head shape with the decoder's lower floor.
+const ATTN_SPLIT_DECODE: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
+    target_chunks: 32,
+    min_chunk: ATTN_DECODE_MIN_CHUNK,
+    max_chunk: 512,
+    rounding: infr_core::tier::ChunkRounding::Down,
+};
+
 /// Flash-decoding split-K chunk policy: ~32 chunks/head, each 64..512 keys, floor-rounded (the
 /// measured Vulkan `attn_partial` shape — see [`infr_core::tier::ChunkRounding`] for why the
 /// rounding is config and not a shared constant).
@@ -2639,12 +2653,11 @@ fn lower_op(
                 // planar-Q8 scales-region base push constant): shadowing the latter with the
                 // former here is exactly the bug that garbled Q8 KV under record-once replay.
                 let cap_rows = graph.desc(*k_cache).numel() / (nkv * hd);
-                // Baked MIN chunk (the policy's `min_chunk`, rising only when the capacity would
-                // exceed the ATTN_MAX_CHUNKS scratch/combine cap); the kernel derives the effective
-                // adaptive chunk from the live kv_len each token, so one recorded plan serves every
-                // depth.
+                // Baked MIN chunk, rising only when the capacity would exceed the
+                // ATTN_MAX_CHUNKS scratch/combine cap; the kernel derives the effective adaptive
+                // chunk from the live kv_len each token, so one recorded plan serves every depth.
                 let chunk =
-                    infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_SPLIT.min_chunk);
+                    infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_DECODE_MIN_CHUNK);
                 let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
                 // A cache past `ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS` rows bakes a chunk the
                 // partial kernel cannot stage; it takes the scalar decode instead.
@@ -3134,6 +3147,10 @@ fn lower_op(
                     // rows for a ring, kv_len itself here), so a few big chunks keep the scratch
                     // ~100s of MB with plenty of workgroups (nh * n_chunks * rows).
                     512
+                } else if rows == 1 {
+                    // Decode: the shuffle-free scalar kernel is the only fallback below the split
+                    // floor, and at kv < 64 it costs more than the whole split pass.
+                    infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT_DECODE)
                 } else {
                     infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT)
                 };

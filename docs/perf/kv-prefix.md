@@ -23,10 +23,10 @@ Two mechanisms, two knobs, and neither implies the other:
 | `store_mb` | `kv.store_mb` / `INFR_KV_STORE_MB` | reverse (host block store) | shipped |
 | `paged` | `kv.paged` / `INFR_KV_PAGED` | forward (page pool) | not wired |
 
-`kv.paged` does not exist in the tree yet: the page-table read path, the
+`kv.paged` parses but refuses at session setup: the page-table read path, the
 refcounted pool and the offset-capable copies are in, but nothing allocates
-pages until the seam binds a slot's rows into the pool. Do not document it as a
-working switch before that lands.
+pages until the seam binds a slot's rows into the pool (tracked in issue #21).
+Do not document it as a working switch before that lands.
 
 ## Reverse PagedAttention: what `kv.store_mb` does
 

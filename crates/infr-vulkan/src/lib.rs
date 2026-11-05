@@ -18,6 +18,7 @@ pub mod linear;
 mod matmul;
 mod ops;
 pub mod p2p;
+pub mod paged;
 pub mod pager;
 mod pcache;
 pub mod pipeline;

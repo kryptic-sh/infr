@@ -8331,7 +8331,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.attention_kv_split_dynac_impl(
             q, kc, vc, o, pm, pl, pacc, params, args, nh, nkv, hd, chunk, n_chunks, scale, window,
-            q8, cap, None,
+            q8, cap, None, 0,
         );
     }
 
@@ -8363,6 +8363,9 @@ impl<'a> Recorder<'a> {
         window: usize,
         q8: bool,
         cap: usize,
+        // Paged K/V: rows per page of the table whose address rides `params` words 2-3 (0 = the
+        // linear cache). Pushed only; the address itself is a per-slot constant of the replay.
+        page_rows: usize,
     ) {
         self.attention_kv_split_dynac_impl(
             q,
@@ -8384,6 +8387,7 @@ impl<'a> Recorder<'a> {
             q8,
             cap,
             Some((k_addr, v_addr)),
+            page_rows,
         );
     }
 
@@ -8412,6 +8416,9 @@ impl<'a> Recorder<'a> {
         cap: usize,
         // #74 slice 2: Some((k_addr, v_addr)) selects the `-DKV_BDA` twins; None keeps bound SSBOs.
         kv_addr: Option<(u64, u64)>,
+        // Paged K/V: rows per page (0 = linear). The table ADDRESS is not pushed — it is a per-slot
+        // constant of the replay, so the adapter seeds it into `params` words 2-3 at record time.
+        page_rows: usize,
     ) {
         let bda = kv_addr.is_some();
         // pass 1: self-chunking partials, workgroup count from `args` (the caller records ONE
@@ -8479,8 +8486,9 @@ impl<'a> Recorder<'a> {
         // Block with range [0, 44] which is outside the VkPushConstantRange of [0, 36]"). The
         // range must cover the full declared block; the trailing 8 bytes stay zero and unread.
         // BDA push grows to 60 (k_lo/k_hi/v_lo/v_hi at 44..60), plus the three paging words the
-        // `attn_decode` replay build declares → 72; bound stays 44. n_buf stays 7. Replay paging is
-        // not wired yet: the words stay zero, which is the identity mapping.
+        // `attn_decode` replay build declares → 72; bound stays 44. n_buf stays 7. Only
+        // `page_rows` is pushed (60..68 stay zero): under -DUSE_PARAMS the table address comes from
+        // `params` words 2-3, which `params_advance` never touches.
         let plen: usize = if bda { 72 } else { 44 };
         let k1 = if gqa.is_some() {
             self.be.kernel_sg64_native(p1name, p1spv, 7, plen as u32)
@@ -8501,6 +8509,7 @@ impl<'a> Recorder<'a> {
             p1[48..52].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
             p1[52..56].copy_from_slice(&(v_addr as u32).to_ne_bytes());
             p1[56..60].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
+            p1[68..72].copy_from_slice(&(page_rows as u32).to_ne_bytes());
         }
         self.dispatch_indirect(
             k1,
@@ -13265,7 +13274,7 @@ mod tests {
         let pacc = be
             .alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)
             .unwrap();
-        let params = be.alloc(8, BufferUsage::Activations).unwrap();
+        let params = be.alloc(16, BufferUsage::Activations).unwrap();
         be.upload(
             params.as_ref(),
             bytemuck::cast_slice(&[pos_offset as u32, kv_len as u32]),

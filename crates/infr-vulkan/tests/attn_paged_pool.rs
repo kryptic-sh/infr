@@ -135,6 +135,78 @@ fn run(
     }
 }
 
+/// The record-once replay leg: same dispatch, but the page table's address rides the params
+/// SSBO's words 2-3 (the tape is recorded once, so it cannot be a push constant) and only the
+/// page size is pushed. Must produce the same bits as the static paged leg.
+fn run_replay(
+    be: &VulkanBackend,
+    q: &dyn Buffer,
+    k: Layout<'_>,
+    v: Layout<'_>,
+    kv_len: usize,
+    chunk: usize,
+) -> Vec<u32> {
+    let n_chunks = kv_len.div_ceil(chunk);
+    let pm = be
+        .alloc(NH * n_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pl = be
+        .alloc(NH * n_chunks * 4, BufferUsage::Activations)
+        .unwrap();
+    let pacc = be
+        .alloc(NH * n_chunks * HD * 4, BufferUsage::Activations)
+        .unwrap();
+    let args = be.alloc(16, BufferUsage::Activations).unwrap();
+    let out_bytes = NH * HD * 4;
+    let out = be.alloc(out_bytes, BufferUsage::Activations).unwrap();
+    let (kb, vb, table, page_rows) = match (k, v) {
+        (Layout::Paged(kb, t, rows), Layout::Paged(vb, _, _)) => {
+            (kb, vb, Some(t.device_addr().unwrap()), rows)
+        }
+        (Layout::Linear(kb), Layout::Linear(vb)) => (kb, vb, None, 0),
+        _ => unreachable!("replay leg takes both sides paged or both linear"),
+    };
+    let params = be.alloc(16, BufferUsage::Activations).unwrap();
+    let mut pb = [0u8; 16];
+    pb[0..4].copy_from_slice(&((kv_len - 1) as u32).to_le_bytes());
+    pb[4..8].copy_from_slice(&(kv_len as u32).to_le_bytes());
+    if let Some(t) = table {
+        pb[8..12].copy_from_slice(&(t as u32).to_le_bytes());
+        pb[12..16].copy_from_slice(&((t >> 32) as u32).to_le_bytes());
+    }
+    be.upload(params.as_ref(), &pb).unwrap();
+
+    let rec = be.recorder().unwrap();
+    rec.attn_live_prologue(params.as_ref(), args.as_ref(), NH, chunk, 0);
+    rec.attention_kv_split_dynac_at(
+        q,
+        kb,
+        vb,
+        kb.device_addr().unwrap(),
+        vb.device_addr().unwrap(),
+        out.as_ref(),
+        pm.as_ref(),
+        pl.as_ref(),
+        pacc.as_ref(),
+        params.as_ref(),
+        args.as_ref(),
+        NH,
+        NKV,
+        HD,
+        chunk,
+        n_chunks,
+        0.0,
+        0,
+        false,
+        0,
+        page_rows as usize,
+    );
+    rec.finish().unwrap();
+    let mut bytes = vec![0u8; out_bytes];
+    be.download(out.as_ref(), &mut bytes).unwrap();
+    bytemuck::cast_slice::<u8, u32>(&bytes).to_vec()
+}
+
 #[test]
 fn two_slots_share_a_prefix_and_stay_bit_identical() {
     let be = match VulkanBackend::new_with(Arc::new(Config::default())) {
@@ -244,6 +316,18 @@ fn two_slots_share_a_prefix_and_stay_bit_identical() {
             "slot {i} must read the same bits through pages"
         );
         assert!(walk_nonzero(&want.bits) > 0, "slot {i} output is all zero");
+        let rep = run_replay(
+            &be,
+            q.as_ref(),
+            Layout::Paged(kb.as_ref(), table.as_ref(), PAGE_ROWS as u32),
+            Layout::Paged(vb.as_ref(), table.as_ref(), PAGE_ROWS as u32),
+            kv_len,
+            CHUNK,
+        );
+        assert_eq!(
+            rep, got.bits,
+            "slot {i}: the replay tape must read the same pages through params words 2-3"
+        );
     }
 
     // Cost of the indirection at a longer context: 16 pages, 8192 rows.

@@ -195,10 +195,13 @@ OpenAI `temperature`/`top_p` still overrides them.
 `force_q8` alias), prefix-cache `slots`, the sliding-window `ring`, and the
 host-overflow trio (`overflow`, `overflow_vram_mb`, `overflow_reserve_mb`) that
 spills KV to system RAM when VRAM runs out. `store_mb` turns on the
-cross-conversation prefix store: the K/V rows of a prompt stay in host RAM after
+cross-conversation prefix store (reverse PagedAttention, see
+`docs/perf/kv-prefix.md`): the K/V rows of a prompt stay in host RAM after
 its slot is recycled, and a later request sharing that prefix uploads them
 instead of re-prefilling, with LRU eviction once the budget is full. It is
-off by default because those rows are derived from the prompt.
+off by default because those rows are derived from the prompt. Forward
+PagedAttention — slots sharing pages inside one pool — is a separate knob
+and is not wired yet.
 
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),

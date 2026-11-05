@@ -3489,6 +3489,21 @@ fn main() {
                 defines.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
             );
             let mut out = vec![base.clone()];
+            // Packed Q4_K header loads for the OUTS4 decode/verify layout. Derive
+            // its three row-cap/residual twins; keep scalar builds for exact A/B.
+            if *src_stem == "native_mmv_mrow"
+                && defines.contains(&"-DFMT_Q4K")
+                && defines.contains(&"-DOUTS4")
+                && !defines.contains(&"-DFUSE_QUANT")
+            {
+                let mut meta_defines = base.2.clone();
+                meta_defines.push("-DQ4K_PACKED_META".into());
+                out.push((
+                    src_stem.to_string(),
+                    format!("{dst_stem}_packed_meta"),
+                    meta_defines,
+                ));
+            }
             if SG16_SOURCES.contains(src_stem) {
                 let mut sg_defines = base.2.clone();
                 sg_defines.push("-DSG=16".to_string());

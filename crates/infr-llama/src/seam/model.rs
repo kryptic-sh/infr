@@ -97,6 +97,13 @@ pub struct SeamModel {
     /// path recomputes this 2-3× (`kv_fit_ctx` → `kv_fit_ctx_fmt`, the auto-q8 re-probe, then the
     /// clamp log line) — cache it so the scan runs once per model. See [`SeamModel::footprint`].
     footprint: std::sync::OnceLock<crate::weights::WeightFootprint>,
+    /// The vision tower (`mmproj-*.gguf`), opened on the FIRST image a prompt carries — text-only
+    /// use never touches the file. The `Err` arm caches why there is none, so a model without a
+    /// projector answers every image request with the same clear message instead of re-probing.
+    #[allow(clippy::type_complexity)]
+    vision: std::sync::OnceLock<
+        std::result::Result<std::sync::Arc<crate::vision::Gemma4Vision>, String>,
+    >,
 }
 
 /// The conversation SLOTS a persistent GPU seam session owns: up to `INFR_KV_SLOTS` (default 4)
@@ -479,6 +486,7 @@ impl SeamModel {
             per_layer_embd,
             tokenizer,
             footprint: std::sync::OnceLock::new(),
+            vision: std::sync::OnceLock::new(),
         })
     }
 
@@ -890,7 +898,9 @@ impl SeamModel {
         req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
+        // Images (if any) become placeholder ids + an embedding override the runner reads; the
+        // guard keeps that override published for exactly this generation.
+        let (prompt_tokens, _media) = self.encode_prompt(prompt, session.max_ctx, req)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         let slot = session
@@ -967,12 +977,188 @@ impl SeamModel {
     /// need token ids directly (e.g. a raw-forward validation harness), as opposed to
     /// [`render_chat`](Self::render_chat) + the generation loop.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        // A marker reaching here means a multimodal prompt took a path that cannot splice images
+        // (CPU/Metal/MTP): fail loudly rather than feed the model the marker as literal text.
+        if text.contains(crate::media::IMAGE_MARKER) {
+            return Err(anyhow!(
+                "image input is only supported on the Vulkan backend without MTP"
+            ));
+        }
+        self.encode_text(text)
+    }
+
+    fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
         Ok(self
             .tokenizer
             .encode(text, false)
             .map_err(|e| anyhow!("encode: {e}"))?
             .get_ids()
             .to_vec())
+    }
+
+    /// The vision tower for this model, loaded on first use: `serve.mmproj` when set, else the
+    /// first `mmproj*.gguf` beside the model file.
+    pub fn vision(&self) -> Result<std::sync::Arc<crate::vision::Gemma4Vision>> {
+        self.vision
+            .get_or_init(|| {
+                let path = match self.ecfg.serve.mmproj.clone() {
+                    Some(p) => p,
+                    None => crate::vision::Gemma4Vision::sibling_of(&self.path).ok_or_else(|| {
+                        format!(
+                            "this model has no vision projector: no mmproj*.gguf beside {} \
+                             (pull one, e.g. `infr pull <repo>:mmproj-F16.gguf`, or set serve.mmproj)",
+                            self.path.display()
+                        )
+                    })?,
+                };
+                let v = crate::vision::Gemma4Vision::open(&path).map_err(|e| format!("{e:#}"))?;
+                if v.n_embd_out != self.cfg.n_embd {
+                    return Err(format!(
+                        "mmproj {} projects to {} but the model is {} wide — wrong projector for this model",
+                        path.display(),
+                        v.n_embd_out,
+                        self.cfg.n_embd
+                    ));
+                }
+                Ok(std::sync::Arc::new(v))
+            })
+            .clone()
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    fn image_token_counts(&self, images: &[std::sync::Arc<[u8]>]) -> Result<Vec<usize>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.cfg.gemma4 {
+            anyhow::bail!("image input is only supported for Gemma 4 models");
+        }
+        if images.len() > crate::vision::MAX_REQUEST_IMAGES {
+            anyhow::bail!("at most four images are allowed per request");
+        }
+        let vision = self.vision()?;
+        let mut pixels = 0u64;
+        let mut tokens = 0usize;
+        let mut counts = Vec::with_capacity(images.len());
+        for bytes in images {
+            let (w, h) = crate::vision::image_dimensions(bytes)?;
+            pixels += u64::from(w) * u64::from(h);
+            if pixels > crate::vision::MAX_REQUEST_PIXELS {
+                anyhow::bail!("request images exceed the aggregate pixel limit");
+            }
+            let count = vision.image_tokens(bytes, self.ecfg.serve.image_max_tokens)?;
+            tokens += count;
+            if tokens > crate::vision::MAX_IMAGE_TOKENS {
+                anyhow::bail!("request images exceed the aggregate soft-token limit");
+            }
+            counts.push(count);
+        }
+        Ok(counts)
+    }
+
+    /// Validate image support, aggregate budgets, and complete image payloads before a server
+    /// commits response headers. This performs no vision transformer work.
+    pub fn preflight_images(&self, images: &[std::sync::Arc<[u8]>]) -> Result<()> {
+        self.image_token_counts(images)?;
+        for bytes in images {
+            crate::vision::validate_image(bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Tokenize a rendered prompt that may carry [`crate::media::IMAGE_MARKER`]s: each marker
+    /// becomes `<|image>` + one placeholder id per soft token + `<image|>` (the layout llama.cpp's
+    /// mtmd and HF's Gemma 4 processor both produce), and the returned guard publishes the encoded
+    /// image rows for the runner until it drops. A prompt without markers is plain [`encode`].
+    ///
+    /// [`encode`]: Self::encode
+    pub(crate) fn encode_prompt(
+        &self,
+        prompt: &str,
+        max_ctx: usize,
+        req: Option<&crate::sampling::RequestCtx>,
+    ) -> Result<(Vec<u32>, Option<crate::media::OverrideScope>)> {
+        use crate::media::{
+            current_media, EmbedOverride, OverrideScope, IMAGE_MARKER, MEDIA_ID_BASE,
+        };
+        if !prompt.contains(IMAGE_MARKER) {
+            return Ok((self.encode(prompt)?, None));
+        }
+        if !self.cfg.gemma4 {
+            return Err(anyhow!("image input is only supported for Gemma 4 models"));
+        }
+        let parts: Vec<&str> = prompt.split(IMAGE_MARKER).collect();
+        let n_img = parts.len() - 1;
+        let media = current_media().unwrap_or_default();
+        if media.len() != n_img {
+            return Err(anyhow!(
+                "the prompt has {n_img} image placeholder(s) but {} image(s) were attached",
+                media.len()
+            ));
+        }
+        let counts = self.image_token_counts(&media)?;
+        let text: Vec<Vec<u32>> = parts
+            .iter()
+            .map(|part| self.encode_text(part))
+            .collect::<Result<_>>()?;
+        let text_len = text
+            .iter()
+            .try_fold(0usize, |n, p| n.checked_add(p.len()))
+            .ok_or_else(|| anyhow!("image prompt length overflow"))?;
+        let total = counts
+            .iter()
+            .try_fold(text_len, |n, &count| n.checked_add(count + 2))
+            .ok_or_else(|| anyhow!("image prompt length overflow"))?;
+        if total >= max_ctx {
+            return Err(anyhow!(
+                "image prompt ({total} tokens) does not fit context {max_ctx}"
+            ));
+        }
+        let vision = self.vision()?;
+        let special = |s: &str| -> Result<u32> {
+            match self.encode_text(s)?.as_slice() {
+                [id] => Ok(*id),
+                other => Err(anyhow!(
+                    "tokenizer: {s:?} is not a single special token ({other:?})"
+                )),
+            }
+        };
+        let (boi, eoi) = (special("<|image>")?, special("<image|>")?);
+        let max_tokens = self.ecfg.serve.image_max_tokens;
+        let mut ids = Vec::new();
+        let mut spans = Vec::with_capacity(n_img);
+        for (i, part) in text.iter().enumerate() {
+            if req.is_some_and(crate::sampling::RequestCtx::aborted) {
+                return Err(anyhow!("image encoding cancelled"));
+            }
+            ids.extend_from_slice(part);
+            if i == n_img {
+                break;
+            }
+            let bytes = &media[i];
+            let rows = vision.encode_with_request(bytes, max_tokens, req)?;
+            let n = rows.len() / self.cfg.n_embd;
+            if n != counts[i] {
+                return Err(anyhow!("vision output token count differs from preflight"));
+            }
+            // Compact content-derived tags are not identity proofs: KV reuse stops before image
+            // rows. The encoder's cache compares complete bytes, so hash collisions are harmless.
+            let tag = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                (h.finish() as u32) & !MEDIA_ID_BASE
+            };
+            ids.push(boi);
+            spans.push((ids.len(), rows));
+            ids.extend(std::iter::repeat_n(MEDIA_ID_BASE | tag, n));
+            ids.push(eoi);
+        }
+        let scope = OverrideScope::enter(EmbedOverride {
+            n_embd: self.cfg.n_embd,
+            spans,
+        });
+        Ok((ids, Some(scope)))
     }
 
     /// Raw tokenizer accessor for callers outside this module that need incremental detok (the

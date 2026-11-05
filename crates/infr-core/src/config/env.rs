@@ -227,6 +227,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.weights_as_ssbo = get("INFR_WEIGHTS_AS_SSBO").map(|s| s != "0");
     v.mmv = presence_inv(get, "INFR_NO_MMV");
     v.mmv_decode = presence(get, "INFR_MMV_DECODE");
+    v.mmv_q4k_meta = presence_inv(get, "INFR_NO_MMV_Q4K_META");
     v.mmv_m4 = presence_inv(get, "INFR_NO_MMV_M4");
     v.mmv_o4 = presence_inv(get, "INFR_NO_MMV_O4");
     // Tri-state: "0" ⇒ force off, any other value ⇒ force on, unset ⇒ the vendor default.
@@ -401,6 +402,8 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // Ditto: `0` means "no periodic throughput line", a value the operator may need to set OVER a
     // config file that enabled it, so it must survive this layer rather than be filtered as junk.
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");
+    p.serve.mmproj = opt_path(get, "INFR_MMPROJ");
+    p.serve.image_max_tokens = num::<usize>(get, "INFR_IMAGE_MAX_TOKENS").filter(|&v| v > 0);
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // NO `> 0` filter: `0` is a MEANINGFUL value ("fetch strictly one file at a time"), so it must

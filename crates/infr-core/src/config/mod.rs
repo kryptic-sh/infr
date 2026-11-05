@@ -287,6 +287,9 @@ cfg_struct! {
         mmv: bool = true,
         /// `INFR_MMV_DECODE`. The site is `mmv_decode && mmv`.
         mmv_decode: bool = false,
+        /// `INFR_NO_MMV_Q4K_META` (inverted): packed 16-byte Q4_K header loads
+        /// in the four-output int8 decode/verify kernel; disable for scalar metadata loads.
+        mmv_q4k_meta: bool = true,
         /// `INFR_NO_MMV_M4` (inverted).
         mmv_m4: bool = true,
         /// `INFR_NO_MMV_O4` (inverted).
@@ -741,6 +744,13 @@ cfg_struct! {
         /// happened emits nothing, so an idle server's log stays clean and the knob is only worth
         /// reaching for when the log itself is expensive.
         stats_interval_secs: u64 = 5,
+        /// `INFR_MMPROJ`: the vision projector (`mmproj-*.gguf`) for image input. Unset = the first
+        /// `mmproj*.gguf` beside the model file, if any.
+        mmproj: Option<PathBuf> = None,
+        /// `INFR_IMAGE_MAX_TOKENS`: soft-token ceiling per image (clamped to Gemma 4's 70..=1120).
+        /// More tokens = more detail, but the CPU vision encoder's attention grows with the square
+        /// of the image's patch count. 280 is Gemma 4's default budget.
+        image_max_tokens: usize = 280,
     }
 }
 

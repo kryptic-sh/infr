@@ -1948,6 +1948,10 @@ impl infr_server::ChatGenerator for SeamGenerator {
 }
 
 impl infr_server::ChatGenerator for ParallelGenerator {
+    fn validate_images(&self, images: &[std::sync::Arc<[u8]>]) -> anyhow::Result<()> {
+        self.engine.model().preflight_images(images)
+    }
+
     fn status(&self) -> infr_server::GeneratorStatus {
         let vram = self.engine.vram();
         infr_server::GeneratorStatus {
@@ -2079,6 +2083,9 @@ fn run_chat(
         be.weights().check()?;
         // `tools` arrives already parsed (a borrowed Value) — no Value→string→Value round-trip.
         let prompt = be.renderer().render(messages, tools, params.think)?;
+        // The request's images, in marker order, for the prompt encoder (`infr_llama::media`).
+        // Scoped to this call — every generate below runs on this thread.
+        let _media = infr_llama::media::MediaScope::enter(params.images.clone());
         // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
         // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
         let max_new = params

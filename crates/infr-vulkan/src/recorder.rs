@@ -3123,7 +3123,8 @@ impl<'a> Recorder<'a> {
     /// Tiled Q6_K dp4a (mmq) GEMM for a stacked expert (the MoE down projection): `c = qa·W[w_base]ᵀ`
     /// using hardware int8 dot-product (activations pre-quantized via `quant_q8`; the per-block sum is
     /// unused — Q6_K is symmetric, no min). `c` is `ceil(m/64)*64` rows. Faster than the coopmat-f16
-    /// `matmul_native` for u6 weights. Requires `n%64`, `k%16`.
+    /// `matmul_native` for u6 weights. Requires `n%64`, `k%32`; activations/scales must include
+    /// all `ceil(m/64)*64` padded rows, including when `m` is not a multiple of 64.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_q6k(
         &self,
@@ -3136,6 +3137,10 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert!(
+            k.is_multiple_of(32) && n.is_multiple_of(64),
+            "Q6_K MMQ requires k%32 == 0 and n%64 == 0"
+        );
         self.label_gemm("native_gemm_mmq_q6k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q6k",
@@ -3985,12 +3990,17 @@ impl<'a> Recorder<'a> {
         let o4 = self.vk().mmv_o4 && !(in_f / 32).is_multiple_of(64);
         let m4 = rows <= 4 && self.vk().mmv_m4;
         let res = residual.is_some();
-        let (name, spv) = if rows > 8 {
-            crate::gemm::native_mmv_mrow_m16_spv(dtype).expect("native mmv mrow m16 streamed spv")
-        } else {
-            crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
-                .expect("native mmv mrow streamed spv")
-        };
+        let (name, spv) =
+            if o4 && rows <= 8 && dtype == infr_core::DType::Q4K && self.vk().mmv_q4k_meta {
+                crate::gemm::native_mmv_mrow_q4k_meta_spv(m4, res)
+                    .expect("native mmv mrow q4k packed metadata streamed spv")
+            } else if rows > 8 {
+                crate::gemm::native_mmv_mrow_m16_spv(dtype)
+                    .expect("native mmv mrow m16 streamed spv")
+            } else {
+                crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
+                    .expect("native mmv mrow streamed spv")
+            };
         let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
         let nbind = if res { 6 } else { 5 };
         let k = self.be.kernel(name, spv, nbind, 24);

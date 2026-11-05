@@ -1221,6 +1221,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_MMV",
         "INFR_NO_MMV_M4",
         "INFR_NO_MMV_O4",
+        "INFR_NO_MMV_Q4K_META",
         "INFR_NO_MOE_SM_POOL",
         "INFR_NO_MROW",
         "INFR_NO_MROW16",
@@ -1324,6 +1325,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_MLA_SG",
         "INFR_WAVE64_NATIVE",
         "INFR_WEIGHTS_AS_SSBO",
+        "INFR_MMPROJ",
+        "INFR_IMAGE_MAX_TOKENS",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

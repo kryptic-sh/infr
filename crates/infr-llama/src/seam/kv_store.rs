@@ -171,6 +171,11 @@ impl KvPrefixStore {
         if n < MIN_PREFIX_TOKENS {
             return Ok(0);
         }
+        // The checkout may already have seeded this slot from a live sibling, exactly and without
+        // an upload; a shorter run of stored blocks must not throw that away.
+        if kv.prefix_score(prompt) >= n {
+            return Ok(0);
+        }
         if let Some(p) = kv.paged.as_mut() {
             p.make_private(be, 0, n)?;
         }

@@ -5,7 +5,7 @@
 //!
 //! Run: `cargo test -p infr-llama --test kv_paged_graph`
 
-use infr_core::backend::{Bindings, BufferUsage};
+use infr_core::backend::{Backend, Bindings, BufferUsage};
 use infr_core::graph::{AttnMask, Graph, Op};
 use infr_core::tensor::{PageMap, TensorDesc};
 use infr_core::{DType, TensorId};
@@ -518,4 +518,187 @@ fn a_paged_prefill_batch_matches_a_contiguous_one() {
 #[test]
 fn a_paged_prefill_batch_matches_a_contiguous_one_on_the_split_tier() {
     prefill_parity(false);
+}
+
+/// One decode `params` buffer serves every op of the tape, but its caches need not share a row
+/// base: a paged slot's pooled layers sit at its block, while the sliding-window ring layers keep
+/// private buffers and stay at row 0. A store that took the base from the shared params wrote the
+/// ring cache at `(pos + row_base) % cap` — the second slot of a two-slot server decoded into that
+/// garbage. Each store pushes its own base; this pins it.
+#[test]
+fn a_replay_biases_only_the_paged_cache() {
+    let be = match infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
+        infr_core::config::Config::default(),
+    )) {
+        Ok(be) => be,
+        Err(e) => {
+            eprintln!("skipping: no Vulkan device ({e})");
+            return;
+        }
+    };
+    // gemma4's sliding-window ring, and not a divisor of ROW_BASE: a wrongly added base lands the
+    // row at 512 instead of 0.
+    const CAP_ROWS: usize = 1536;
+    const PPS: usize = 32;
+    let row = NKV * HD;
+    let pool_elems = 2 * PPS * PAGE_ROWS * row;
+    let lin_elems = CAP_ROWS * row;
+
+    let mut g = Graph::new();
+    let q = g.input(f16d(NH * HD));
+    // Any rope op makes the graph replay-eligible; this one feeds nothing.
+    let xs = g.input(f32d(NH * HD));
+    let positions = g.input(TensorDesc::new(vec![1], DType::I32));
+    let xd = g.internal(f16d(NH * HD));
+    g.push(Op::Rope {
+        x: xs,
+        positions,
+        dst: xd,
+        rows: 1,
+        n_head: NH as u32,
+        head_dim: HD as u32,
+        rope_dim: HD as u32,
+        theta: 10_000.0,
+        freq_factors: None,
+        x_stride: 0,
+        neox: false,
+        backward: false,
+    });
+    let k = g.input(f32d(row));
+    let v = g.input(f32d(row));
+    let table = g.input(TensorDesc::new(vec![PPS + 1], DType::I32));
+    let paged = |n: usize| {
+        let mut d = f16d(n);
+        d.pages = Some(PageMap {
+            table,
+            page_rows: PAGE_ROWS as u32,
+            row_base: ROW_BASE,
+        });
+        d
+    };
+    let (kp, vp) = (g.input(paged(pool_elems)), g.input(paged(pool_elems)));
+    let (kl, vl) = (g.input(f16d(lin_elems)), g.input(f16d(lin_elems)));
+    let out_p = g.output(f32d(NH * HD));
+    let out_l = g.output(f32d(NH * HD));
+    for (cache_k, cache_v, dst) in [(kp, vp, out_p), (kl, vl, out_l)] {
+        g.push(Op::WriteKv {
+            src: k,
+            cache: cache_k,
+            rows: 1,
+            row_stride: row as u32,
+            pos: 0,
+        });
+        g.push(Op::WriteKv {
+            src: v,
+            cache: cache_v,
+            rows: 1,
+            row_stride: row as u32,
+            pos: 0,
+        });
+        g.push(Op::Attention {
+            q,
+            k_cache: cache_k,
+            v_cache: cache_v,
+            dst,
+            rows: 1,
+            kv_len: 1,
+            n_head: NH as u32,
+            n_kv: NKV as u32,
+            head_dim: HD as u32,
+            scale: 1.0 / (HD as f32).sqrt(),
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: None,
+            key_bias: None,
+        });
+    }
+
+    let f16_of = |data: &[f32]| {
+        let bytes: Vec<u8> = data
+            .iter()
+            .flat_map(|x| half::f16::from_f32(*x).to_bits().to_le_bytes())
+            .collect();
+        let buf = be.alloc(bytes.len(), BufferUsage::Activations).unwrap();
+        be.upload(buf.as_ref(), &bytes).unwrap();
+        (buf, bytes)
+    };
+    let f32b = |data: &[f32]| {
+        let buf = be.alloc(data.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(buf.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        buf
+    };
+    let k_data = gen(row, 31);
+    let v_data = gen(row, 32);
+    let (qb, _) = f16_of(&gen(NH * HD, 33));
+    let kb = f32b(&k_data);
+    let vb = f32b(&v_data);
+    let want: Vec<u8> = k_data
+        .iter()
+        .flat_map(|x| half::f16::from_f32(*x).to_bits().to_le_bytes())
+        .collect();
+    let xb = f32b(&vec![0.0; NH * HD]);
+    let posb = be.alloc(4, BufferUsage::Activations).unwrap();
+    be.upload(posb.as_ref(), &0i32.to_le_bytes()).unwrap();
+    let kp_b = be.alloc(pool_elems * 2, BufferUsage::KvCache).unwrap();
+    let vp_b = be.alloc(pool_elems * 2, BufferUsage::KvCache).unwrap();
+    let kl_b = be.alloc(lin_elems * 2, BufferUsage::KvCache).unwrap();
+    let vl_b = be.alloc(lin_elems * 2, BufferUsage::KvCache).unwrap();
+    let tb = be.alloc((PPS + 1) * 4, BufferUsage::KvCache).unwrap();
+    be.upload(
+        tb.as_ref(),
+        &table_bytes(PPS, (ROW_BASE / PAGE_ROWS) as u32),
+    )
+    .unwrap();
+    let o_p = be.alloc(NH * HD * 4, BufferUsage::Readback).unwrap();
+    let o_l = be.alloc(NH * HD * 4, BufferUsage::Readback).unwrap();
+
+    let plan = be.compile(&g).expect("compile");
+    let mut b = Bindings::new();
+    let binds: [(TensorId, &dyn infr_core::backend::Buffer); 12] = [
+        (q, qb.as_ref()),
+        (xs, xb.as_ref()),
+        (positions, posb.as_ref()),
+        (k, kb.as_ref()),
+        (v, vb.as_ref()),
+        (table, tb.as_ref()),
+        (kp, kp_b.as_ref()),
+        (vp, vp_b.as_ref()),
+        (kl, kl_b.as_ref()),
+        (vl, vl_b.as_ref()),
+        (out_p, o_p.as_ref()),
+        (out_l, o_l.as_ref()),
+    ];
+    for (id, buf) in binds {
+        b.bind(id, buf);
+    }
+    be.execute(plan.as_ref(), &b).expect("execute");
+
+    let mut lin = vec![0u8; lin_elems * 2];
+    be.download(kl_b.as_ref(), &mut lin).unwrap();
+    let mut pooled = vec![0u8; pool_elems * 2];
+    be.download(kp_b.as_ref(), &mut pooled).unwrap();
+    assert_eq!(
+        &lin[..row * 2],
+        &want[..],
+        "the ring cache's row must land at row 0, not at (0 + row_base) % cap"
+    );
+    let at = ROW_BASE * row * 2;
+    assert_eq!(
+        &pooled[at..at + row * 2],
+        &want[..],
+        "the pooled cache's row must land at the slot's block base"
+    );
+
+    let mut a = vec![0f32; NH * HD];
+    be.download(o_p.as_ref(), bytemuck::cast_slice_mut(&mut a))
+        .unwrap();
+    let mut c = vec![0f32; NH * HD];
+    be.download(o_l.as_ref(), bytemuck::cast_slice_mut(&mut c))
+        .unwrap();
+    let max_err = a
+        .iter()
+        .zip(&c)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_err < 1e-4, "both caches hold the same row: {max_err:e}");
 }

@@ -483,7 +483,6 @@ fn a_store_row_base_puts_the_row_in_that_block() {
         let params = be.alloc(24, BufferUsage::Activations).unwrap();
         let mut pb = [0u8; 24];
         pb[4..8].copy_from_slice(&1u32.to_le_bytes());
-        pb[16..20].copy_from_slice(&rb.to_le_bytes());
         be.upload(params.as_ref(), &pb).unwrap();
         let rec = be.recorder().unwrap();
         if q8 {
@@ -494,6 +493,7 @@ fn a_store_row_base_puts_the_row_in_that_block() {
                 n,
                 pool_elems,
                 false,
+                rb as usize,
             );
         } else {
             rec.store_f16_dyn_at(
@@ -503,6 +503,7 @@ fn a_store_row_base_puts_the_row_in_that_block() {
                 dst.device_addr().unwrap(),
                 n,
                 pool_rows,
+                rb as usize,
             );
         }
         rec.finish().unwrap();

@@ -6233,18 +6233,20 @@ impl<'a> Recorder<'a> {
         dst_addr: u64,
         n: usize,
         cap_rows: usize,
+        row_base: usize,
     ) {
         let k = self.be.kernel(
             "store_f16_dyn_bda",
             crate::gemm::store_f16_dyn_bda_spv(),
             3,
-            24,
+            28,
         );
-        let mut push = [0u8; 24];
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(cap_rows as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(row_base as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
@@ -6611,6 +6613,7 @@ impl<'a> Recorder<'a> {
 
     /// Record-once decode variant of [`Recorder::store_q8`]: the write offset is `p_pos*n` (one KV
     /// row at the token's position), `p_pos` read from the `params` SSBO so the buffer replays.
+    /// `row_base` is a paged slot's block base (0 otherwise), pushed per op.
     pub fn store_q8_dyn(
         &self,
         src: &dyn Buffer,
@@ -6619,6 +6622,7 @@ impl<'a> Recorder<'a> {
         n: usize,
         cap: usize,
         src_f16: bool,
+        row_base: usize,
     ) {
         // #74 (slice 5): BDA-only. `dst` (the planar-Q8 KV cache) is written by device address; it
         // stays bound at slot 2 as an inert descriptor so Recorder::sync keeps the store→read barrier.
@@ -6630,14 +6634,15 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
         };
-        let k = self.be.kernel(name, spv, 3, 24);
-        let mut push = [0u8; 24];
+        let k = self.be.kernel(name, spv, 3, 28);
+        let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         // [4..8] off: unused (from params). [12..16] src_off: always 0 here (a single decode row
         // never crosses the ring wrap). The kernel derives the ring row capacity from cap/n.
         push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(row_base as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
@@ -7640,7 +7645,7 @@ impl<'a> Recorder<'a> {
 
     /// Cast-copy f32 `src[0..n]` → f16 `dst[row*n..]` (one KV row at position pos from `params`;
     /// `cap_rows` = the cache's row capacity, so an SWA ring cache writes row `pos % cap_rows` —
-    /// identity on a full-context cache).
+    /// identity on a full-context cache; `row_base` = a paged slot's block base, 0 otherwise).
     pub fn store_f16_dyn(
         &self,
         src: &dyn Buffer,
@@ -7648,14 +7653,16 @@ impl<'a> Recorder<'a> {
         dst: &dyn Buffer,
         n: usize,
         cap_rows: usize,
+        row_base: usize,
     ) {
         let k = self
             .be
-            .kernel("store_f16_dyn", crate::gemm::store_f16_dyn_spv(), 3, 16);
-        let mut push = [0u8; 16];
+            .kernel("store_f16_dyn", crate::gemm::store_f16_dyn_spv(), 3, 20);
+        let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        // [4..8] off: unused (computed as (pos % cap)*n from params). [8..12] src_off: 0.
+        // [4..8] off: unused (computed as (pos + rb) % cap from params). [8..12] src_off: 0.
         push[12..16].copy_from_slice(&(cap_rows as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(row_base as u32).to_ne_bytes());
         self.dispatch(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],

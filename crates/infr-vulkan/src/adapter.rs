@@ -56,7 +56,7 @@ struct DecodeReplay {
     /// Persistent `Internal` scratch (activations), allocated ONCE. The recorded descriptor sets bind
     /// these, so re-allocating per token would leave the recording pointing at freed buffers.
     scratch: Vec<Option<Box<dyn Buffer>>>,
-    /// `[pos, kv_len, table_lo, table_hi, row_base, _]` (u32×6) SSBO the `_dyn` kernels read.
+    /// `[pos, kv_len, table_lo, table_hi, _, _]` (u32×6) SSBO the `_dyn` kernels read.
     /// When `self_advancing`, a `params_advance` dispatch recorded FIRST increments it every replay
     /// (initialized to `[pos0-1, pos0]` at record time) — the adapter never touches it again.
     params: Box<dyn Buffer>,
@@ -379,13 +379,14 @@ fn replay_page_table(
     }))
 }
 
-/// Write the paged decode's params words: 2-3 the page-table address, 4 the row base (all zero for
-/// a linear cache). Word 5 stays reserved for the kernels it pads.
+/// Write the paged decode's params words: 2-3 the page-table address (zero for a linear cache).
+/// The row base is NOT here: one params buffer serves every op of the tape, and a paged plan mixes
+/// pooled caches (rows at their block) with private ring caches (rows at 0), so each store carries
+/// its own row base in its push constant.
 fn write_page_table(pbytes: &mut [u8; 24], table: Option<PageInfo>) {
     if let Some(p) = table {
         pbytes[8..12].copy_from_slice(&(p.addr as u32).to_le_bytes());
         pbytes[12..16].copy_from_slice(&((p.addr >> 32) as u32).to_le_bytes());
-        pbytes[16..20].copy_from_slice(&(p.row_base as u32).to_le_bytes());
     }
 }
 
@@ -2448,7 +2449,7 @@ fn lower_op(
                     }
                 }
                 RopeMode::Dynamic(params) if cache_q8 => {
-                    rec.store_q8_dyn(s, *params, c, n, cap, src_f16)
+                    rec.store_q8_dyn(s, *params, c, n, cap, src_f16, rb)
                 }
                 // Mainline low-bit KV quants: quantize into standard GGUF blocks (static only — a
                 // quantized KV cache forces static decode, so a Dynamic WriteKv never reaches here).
@@ -2487,8 +2488,8 @@ fn lower_op(
                         return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"))
                     }
                     _ => match c_addr {
-                        Some(a) => rec.store_f16_dyn_at(s, *params, c, a, n, cap_rows),
-                        None => rec.store_f16_dyn(s, *params, c, n, cap_rows),
+                        Some(a) => rec.store_f16_dyn_at(s, *params, c, a, n, cap_rows, rb),
+                        None => rec.store_f16_dyn(s, *params, c, n, cap_rows, rb),
                     },
                 },
             }

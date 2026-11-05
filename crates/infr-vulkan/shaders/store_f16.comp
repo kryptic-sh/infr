@@ -14,17 +14,21 @@ layout(push_constant) uniform PC { uint n; uint off; uint src_off; uint cap;
 #ifdef KV_BDA
     uint d_lo; uint d_hi; // K/V cache dst base device address (uvec2-split)
 #endif
+#ifdef USE_PARAMS
+    // A paged slot's rows start at its block: `rb` is that row base, pushed per op (SO a plan that
+    // mixes a paged slot's pooled caches with private ring caches biases only the pooled writes).
+    uint rb;
+#endif
 } pc;
 layout(binding = 0) readonly buffer SB { float src[]; };
 #ifdef USE_PARAMS
 // Record-once decode: the write offset is row*n (one KV row at position pos), pos from a host-updated
 // params SSBO instead of the `pc.off` push constant. `dst` moves to binding 2 (params takes 1).
 // `cap` is the cache's ROW capacity: an SWA ring cache recycles rows the window mask already
-// excludes, so the row is pos % cap (identity on a full-context cache, where pos < cap always).
-// `p_rb` is the row base of a paged slot's private block inside the shared pool: the write lands at
-// (pos + rb) % cap, which is where that slot's rows live (0 for a linear slot).
+// excludes, so the row is (pos + pc.rb) % cap (identity on a full-context cache, where pos < cap
+// always). `pc.rb` is the row base of a paged slot's private block inside the shared pool.
 layout(binding = 1) readonly buffer PB {
-    uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi; uint p_rb; uint _pad;
+    uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi;
 };
 #ifndef KV_BDA
 layout(binding = 2) buffer DB { float16_t dst[]; };
@@ -43,7 +47,7 @@ void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.n) { return; }
 #ifdef USE_PARAMS
-    uint pos = p_pos + p_rb;
+    uint pos = p_pos + pc.rb;
     uint row = (pc.cap > 0u) ? (pos % pc.cap) : pos;
     uint off = row * pc.n;
 #else

@@ -24,6 +24,11 @@ layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 // vectorize (cold path); the hot f16 stores go through store_f16/qk_norm_rope.
 layout(push_constant) uniform PC { uint n; uint off; uint cap; uint src_off;
     uint d_lo; uint d_hi;
+#ifdef USE_PARAMS
+    // A paged slot's rows start at its block; pushed per op so a plan that mixes pooled and private
+    // ring caches biases only the pooled writes.
+    uint rb;
+#endif
 } pc;
 #ifdef SRC_F16
 layout(binding = 0) readonly buffer SB { float16_t src[]; };
@@ -31,10 +36,10 @@ layout(binding = 0) readonly buffer SB { float16_t src[]; };
 layout(binding = 0) readonly buffer SB { float src[]; };
 #endif
 #ifdef USE_PARAMS
-// Words 2-5 mirror the attention/store params layout: the page table (unused here) and `p_rb`, the
-// row base of a paged slot's private block, so the write row is (pos + rb) % rows.
+// Words 2-3 are the page table (unused here): a Q8 cache is read through its codes, so paging only
+// moves the rows. `pc.rb` is the row base of a paged slot's private block.
 layout(binding = 1) readonly buffer PB {
-    uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi; uint p_rb; uint _pad;
+    uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi;
 };
 #endif
 #define KV_STORE_BYTE
@@ -50,7 +55,7 @@ void main() {
     // n IS the row width here). The ring recycles rows the window mask already excludes, so the
     // write row is pos % rows — an identity on a full-context cache (pos < rows always).
     uint rows = pc.cap / pc.n;
-    uint pos = p_pos + p_rb;
+    uint pos = p_pos + pc.rb;
     uint row = (rows > 0u) ? (pos % rows) : pos;
     uint off = row * pc.n;
 #else

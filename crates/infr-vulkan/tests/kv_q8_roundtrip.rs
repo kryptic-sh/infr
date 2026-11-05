@@ -85,6 +85,7 @@ fn planar_q8_store_dyn_roundtrip() {
         rs,
         cap,
         false,
+        0,
     );
     rec.dequant_q8_f16(cache.as_ref(), dst.as_ref(), ne, cap);
     rec.finish().unwrap();
@@ -487,7 +488,15 @@ fn planar_q8_store_replay_tape_matches_static() {
     let rec = be.recorder_persistent().unwrap();
     rec.global_barrier();
     rec.params_advance(params.as_ref());
-    rec.store_q8_dyn(kf.as_ref(), params.as_ref(), kq_dyn.as_ref(), rs, cap, true);
+    rec.store_q8_dyn(
+        kf.as_ref(),
+        params.as_ref(),
+        kq_dyn.as_ref(),
+        rs,
+        cap,
+        true,
+        0,
+    );
     rec.store_q8_dyn(
         vf.as_ref(),
         params.as_ref(),
@@ -495,6 +504,7 @@ fn planar_q8_store_replay_tape_matches_static() {
         rs,
         cap,
         false,
+        0,
     );
     let tape = rec.finish_record().unwrap();
     for t in 0..t_single {

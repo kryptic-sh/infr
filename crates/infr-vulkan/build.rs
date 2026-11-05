@@ -4039,6 +4039,12 @@ fn compile_parallel(glslc: &Path, out: &str, builds: &[&Build]) -> Result<(), St
         .and_then(|n| n.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(1);
+    // Every variant is content-addressed: an unchanged shader and define set reuses the SPIR-V a
+    // previous build produced, so a one-shader edit no longer recompiles the whole set.
+    let cache = spv_hoard::Cache::new(glslc, spv_hoard::default_cache_dir(Path::new(out)))
+        .map_err(|e| format!("cannot run {}: {e}\n{GLSLC_HELP}", glslc_display(glslc)))?
+        .flags(GLSLC_FLAGS.map(String::from))
+        .include(out);
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
     let first: Mutex<Option<String>> = Mutex::new(None);
@@ -4053,21 +4059,17 @@ fn compile_parallel(glslc: &Path, out: &str, builds: &[&Build]) -> Result<(), St
                         break;
                     };
                     let src = format!("shaders/{src_stem}.comp");
-                    let run = Command::new(glslc)
-                        .args(GLSLC_FLAGS)
-                        .arg(format!("-I{out}"))
-                        .args(defines)
-                        .arg(&src)
-                        .arg("-o")
-                        .arg(format!("{out}/{dst_stem}.spv"))
-                        .output();
-                    let err = match run {
-                        Ok(o) if o.status.success() => continue,
-                        Ok(o) => GlslcError::Failed {
-                            status: o.status,
-                            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-                        },
-                        Err(e) => GlslcError::Spawn(e),
+                    let job = spv_hoard::Job {
+                        src: PathBuf::from(&src),
+                        defines: defines.clone(),
+                        out: PathBuf::from(format!("{out}/{dst_stem}.spv")),
+                    };
+                    let err = match cache.compile(&job) {
+                        Ok(()) => continue,
+                        Err(spv_hoard::Error::Glslc { status, stderr, .. }) => {
+                            GlslcError::Failed { status, stderr }
+                        }
+                        Err(spv_hoard::Error::Io(e)) => GlslcError::Spawn(e),
                     };
                     failed.store(true, Ordering::Relaxed);
                     let mut first = first.lock().unwrap_or_else(|e| e.into_inner());

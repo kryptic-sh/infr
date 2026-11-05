@@ -1666,6 +1666,7 @@ dependencies = [
  "libc",
  "memmap2",
  "rayon",
+ "spv-hoard",
  "thiserror 2.0.21",
  "toml",
  "tracing",
@@ -2823,6 +2824,10 @@ dependencies = [
  "serde",
  "unicode-segmentation",
 ]
+
+[[package]]
+name = "spv-hoard"
+version = "0.3.0"
 
 [[package]]
 name = "stable_deref_trait"

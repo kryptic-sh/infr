@@ -2990,7 +2990,8 @@ fn lower_op(
                 let chunk =
                     infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_DECODE_MIN_CHUNK);
                 let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
-                if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
+                let paged_dyn = graph.desc(*k_cache).pages.is_some_and(|p| p.page_rows > 0);
+                if hd % 4 == 0 && hd <= 512 && (n_chunks > 1 || paged_dyn) {
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later
                     // same-shape layer reuses (kv_len is per-token, and the layers' attention ops
@@ -3287,7 +3288,11 @@ fn lower_op(
                 // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
                 // already the scalar decode/short-prefill path, dispatch with no coopmat and no
                 // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
-                let flash_ok = flash_geom && !(k_q8_eff || v_q8_eff);
+                // Paged cache (`kv.paged`): only the split-K kernels walk the page table, so every
+                // tier that tiles the cache as one flat run is off the table. A slot's rows start at
+                // `row_base`, so a flat read would attend the pool's zeroed block 0 instead.
+                let paged = graph.desc(*k_cache).pages.filter(|p| p.page_rows > 0);
+                let flash_ok = flash_geom && !(k_q8_eff || v_q8_eff) && paged.is_none();
                 // Coopmat prefill shmem-staging mode (Levers 2 & 5). Dequant wins over the pure-f16
                 // stage; both need the flash geometry. INFR_FLASH_STAGE stages the f16 KV (cache, or
                 // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.
@@ -3321,6 +3326,7 @@ fn lower_op(
                 };
                 let nonfa_ok = !flash_ok
                     && canvas_lo.is_none()
+                    && paged.is_none()
                     && rows >= 64
                     // attn_qk reads K tiles up to ceil(kv_len/256)*256 rows (masked in softmax) —
                     // a ring cache past its wrap has neither those rows nor a direct position →
@@ -3349,6 +3355,7 @@ fn lower_op(
                 // against the scalar/split floor).
                 let nc_fa_ok = !flash_ok
                     && !nonfa_ok
+                    && paged.is_none()
                     && !be_.caps().f16_coopmat()
                     && (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && canvas_lo.is_none()
@@ -3383,6 +3390,7 @@ fn lower_op(
                     && hd <= 128
                     && kv_len <= att_cap_rows // the mrows kernel has no ring row mapping
                     && canvas_lo.is_none()
+                    && paged.is_none()
                     && !(k_q8_eff || v_q8_eff)
                     && mrows_attn != Some(false)
                     && ((rows >= 12 && kv_len >= 8192) || mrows_attn == Some(true));
@@ -3475,13 +3483,20 @@ fn lower_op(
                 // span span.div_ceil(1024) <= the branch value above, so `chunk` — and the recorded
                 // dispatch — is byte-identical. (The Dynamic path caps count the same way, ~2531.)
                 let chunk = split_k_chunk_count_cap(span, chunk);
+                // A paged cache may only use the split path, so the span has to be splittable: leave
+                // the live span above one chunk even at a handful of rows (n_chunks 1 is fine).
+                let chunk = match paged {
+                    Some(_) => chunk.min(span.saturating_sub(1).max(1)),
+                    None => chunk,
+                };
                 // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
                 // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
-                let split_ok = (rows < 64 || canvas_lo.is_some() || ring_past || cap_short)
-                    && span > chunk
-                    && hd % 4 == 0
-                    && hd <= 512
-                    && (rows == 1 || !(k_q8_eff || v_q8_eff));
+                let split_ok =
+                    (rows < 64 || canvas_lo.is_some() || ring_past || cap_short || paged.is_some())
+                        && span > chunk
+                        && hd % 4 == 0
+                        && hd <= 512
+                        && (rows == 1 || !(k_q8_eff || v_q8_eff));
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
@@ -3624,13 +3639,11 @@ fn lower_op(
                     // Paged cache: the read side maps logical pages through the table on the cache
                     // tensor's descriptor. Linear caches (the only kind anything allocates today)
                     // resolve to None, which is the identity in the kernel.
-                    let pmap = graph.desc(*k_cache).pages;
+                    let pmap = paged;
                     let row_base = pmap.map_or(0, |p| p.row_base);
                     let pages = match pmap {
-                        Some(p) if p.page_rows > 0 => {
-                            r(p.table)?.device_addr().map(|a| (a, p.page_rows))
-                        }
-                        _ => None,
+                        Some(p) => r(p.table)?.device_addr().map(|a| (a, p.page_rows)),
+                        None => None,
                     };
                     // A pooled cache that keeps its own pages (the SWA rings) reads linearly from its
                     // block; a shared prefix reads through the table from the pool base.

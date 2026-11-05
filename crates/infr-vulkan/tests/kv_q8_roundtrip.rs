@@ -66,7 +66,7 @@ fn planar_q8_store_dyn_roundtrip() {
     let sbuf = be.alloc(rs * 4, BufferUsage::Activations).unwrap();
     be.upload(sbuf.as_ref(), bytemuck::cast_slice(&row))
         .unwrap();
-    let params = be.alloc(8, BufferUsage::Activations).unwrap();
+    let params = be.alloc(16, BufferUsage::Activations).unwrap();
     be.upload(
         params.as_ref(),
         bytemuck::cast_slice(&[pos as u32, (pos + 1) as u32]),
@@ -351,7 +351,7 @@ fn planar_q8_dynac_matches_f16() {
     let vf = be.alloc(n * 2, BufferUsage::Activations).unwrap();
     be.upload(kf.as_ref(), &to_f16_bytes(&kv)).unwrap();
     be.upload(vf.as_ref(), &to_f16_bytes(&kv)).unwrap();
-    let params = be.alloc(8, BufferUsage::Activations).unwrap();
+    let params = be.alloc(16, BufferUsage::Activations).unwrap();
     be.upload(
         params.as_ref(),
         bytemuck::cast_slice(&[kv_len as u32 - 1, kv_len as u32]),
@@ -476,7 +476,7 @@ fn planar_q8_store_replay_tape_matches_static() {
     // ── replay tape: params seeded [pos0-1, pos0] = [-1, 0]; advance lands row 0 first ──
     let kf = be.alloc(rs * 2, BufferUsage::Activations).unwrap(); // f16 K staging
     let vf = be.alloc(rs * 4, BufferUsage::Activations).unwrap(); // f32 V
-    let params = be.alloc(8, BufferUsage::Activations).unwrap();
+    let params = be.alloc(16, BufferUsage::Activations).unwrap();
     be.upload(params.as_ref(), bytemuck::cast_slice(&[u32::MAX, 0u32]))
         .unwrap();
     let kq_dyn = be.alloc(cbytes, BufferUsage::KvCache).unwrap();

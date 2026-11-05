@@ -26,6 +26,12 @@ layout(push_constant) uniform PC {
     // align) — see kv_addr.glsl. K binding 1 / V binding 2 become INERT (bound only for the store→read
     // hazard edge, never read here); every KVEC4/VVEC4 reads through k_addr/v_addr instead.
     uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+    // Paged K/V: `page_rows` == 0 means the cache is contiguous (the identity mapping). Otherwise
+    // `(page_lo, page_hi)` addresses a table of u32 physical page ids indexed by logical page, and
+    // key position j lives at physical row `table[j / page_rows] * page_rows + j % page_rows`. A
+    // chunk is at most 512 keys (`ATTN_SPLIT.max_chunk`) and a page is 512 rows, so a chunk spans at
+    // most two pages — two wave-uniform table reads cover it.
+    uint page_lo; uint page_hi; uint page_rows;
 #endif
 } pc;
 #ifdef KV_BDA
@@ -215,8 +221,11 @@ layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
 #endif
 #ifdef USE_PARAMS
 // Record-once decode: kv_len comes from a host-updated params SSBO so the buffer replays across
-// tokens. Outputs shift to bindings 4/5/6 (params takes binding 3) to stay output-last.
-layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
+// tokens. Outputs shift to bindings 4/5/6 (params takes binding 3) to stay output-last. Words 2-3
+// are the paged K/V table's device address (0 = linear cache) — the tape is recorded once, so the
+// table cannot ride the push constant, but the per-slot table buffer is never reallocated and
+// `params_advance` only writes words 0-1.
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi; };
 layout(binding = 4) buffer PM { float pm[]; };
 layout(binding = 5) buffer PL { float pl[]; };
 layout(binding = 6) buffer PACC { float pacc[]; };
@@ -327,7 +336,33 @@ void main() {
     // positions the sliding-window mask (lo/j0) already excludes, so this mapping is exact. On a
     // full-context cache every processed j < kv_len <= rcap, so RROW is an identity there.
     uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
+#if defined(KV_BDA)
+    // Paged K/V (opt-in, contiguous caches leave `page_rows` at 0; ring layers never page — a ring
+    // recycles rows in place, a pool is shared between slots). Same two-page scheme as
+    // `attn_decode.comp`'s paged arm, read from the same source: push constants on the static path,
+    // params words 2-3 on the record-once replay.
+    uint pg0 = 0u, pg1 = 0u, pgcut = 0xFFFFFFFFu;
+    bool paged = pc.page_rows > 0u;
+    if (paged) {
+#ifdef USE_PARAMS
+        uint64_t pt = kv_base(p_pagelo, p_pagehi);
+#else
+        uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
+#endif
+        uint p0 = j0 / pc.page_rows;
+        uint t0 = kv_word(pt, p0);
+        uint t1 = kv_word(pt, p0 + 1u);
+        pg0 = (t0 - p0) * pc.page_rows;
+        pg1 = (t1 - (p0 + 1u)) * pc.page_rows;
+        pgcut = (p0 + 1u) * pc.page_rows;
+    }
+    // A cache is EITHER a ring (sliding-window layer, recycled rows) or paged (shared pool) — never
+    // both; `page_rows == 0 && cap == 0` is the linear, full-context identity.
+#define RROW(j) (paged ? ((j) < pgcut ? ((j) + pg0) : ((j) + pg1)) \
+                       : ((rcap > 0u) ? ((j) % rcap) : (j)))
+#else
 #define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
+#endif
     // QK via subgroup reduction (one key per subgroup-iteration; vec4 coalesced K reads). Each lane's
     // query vec4(s) are loop-invariant across keys → hold in registers (no q_sh, no barrier).
     uint sg = gl_SubgroupID;            // 0..1

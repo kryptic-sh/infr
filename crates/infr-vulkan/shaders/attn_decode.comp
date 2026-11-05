@@ -82,8 +82,12 @@ layout(binding = 2) readonly buffer VB { uint vu_inert[]; }; // INERT
 #ifdef USE_PARAMS
 // Record-once decode replay: kv_len comes from the host-updated params SSBO so the command buffer
 // replays across tokens. Outputs shift to 4/5/6 (params takes 3) to stay output-last — the same
-// binding shuffle `attn_partial.comp` does under -DUSE_PARAMS.
-layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
+// binding shuffle `attn_partial.comp` does under -DUSE_PARAMS. Words 2-3 are the paged K/V table's
+// device address (0 = linear cache): the tape is recorded ONCE, so a per-token page table cannot
+// ride the push constant — but the table BUFFER is per slot and never reallocated, so its address
+// written at record time stays right for the replay's whole life. `params_advance` only touches
+// words 0-1, leaving these alone.
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi; };
 layout(binding = 4) buffer PM { float pm[]; };
 layout(binding = 5) buffer PL { float pl[]; };
 layout(binding = 6) buffer PACC { float pacc[]; };
@@ -186,7 +190,11 @@ void main() {
     // the last page, because the tail chunk looks one page ahead.
     uint pg0 = 0u, pg1 = 0u, pgcut = 0xFFFFFFFFu;
     if (pc.page_rows > 0u) {
+#ifdef USE_PARAMS
+        uint64_t pt = kv_base(p_pagelo, p_pagehi);
+#else
         uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
+#endif
         uint p0 = j0 / pc.page_rows;
         uint t0 = kv_word(pt, p0);
         uint t1 = kv_word(pt, p0 + 1u);

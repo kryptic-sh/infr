@@ -71,6 +71,11 @@ struct DecodeReplay {
     /// The `positions` Input tensor — `execute` downloads element 0 to learn `pos` for `params`.
     positions: TensorId,
     recorded: RecordedCmd,
+    /// Paged K/V: the slot's page table device address and page size, seeded into `params` words
+    /// 2-3 at record time. `None` for a linear cache. ONE table covers every layer of a slot
+    /// (page ids are token-granular and identical across layers) and the buffer is allocated once
+    /// at session setup, so the address stays valid for every replay without a per-token write.
+    page_table: Option<(u64, u32)>,
     /// Transient GEMM/attention scratch the recording references. Empty for an eligible decode (all
     /// ops are GEMV/silu/dyn kernels with no transient), held anyway so a stray one can't dangle.
     _transient: Vec<Box<dyn Buffer>>,
@@ -324,6 +329,47 @@ fn resolve<'a>(
         None => bindings
             .get(id)
             .ok_or_else(|| be(format!("vulkan adapter: unbound tensor {}", id.0))),
+    }
+}
+
+/// Paged K/V: the single page table a paged decode reads through, as `(device address, page rows)`.
+/// Page ids are token-granular and identical across layers, so ONE table per slot covers every
+/// layer's K and V caches — a graph whose caches disagree would silently read one layer's rows
+/// through another's pages, so that is a hard error. `None` for a fully linear graph.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn replay_page_table(
+    graph: &Graph,
+    scratch: &ScratchSet,
+    bindings: &Bindings,
+) -> Result<Option<(u64, u32)>> {
+    let mut table: Option<(infr_core::TensorId, u32)> = None;
+    for (i, decl) in graph.tensors.iter().enumerate() {
+        let Some(p) = decl.desc.pages else { continue };
+        match table {
+            Some((t, rows)) if (t, rows) != (p.table, p.page_rows) => {
+                return Err(be(format!(
+                    "vulkan adapter: paged KV cache (tensor {i}) disagrees on the page table: \
+                     table {} with {} rows/page against table {} with {} elsewhere",
+                    p.table.0, p.page_rows, t.0, rows
+                )))
+            }
+            _ => table = Some((p.table, p.page_rows)),
+        }
+    }
+    let Some((id, rows)) = table else {
+        return Ok(None);
+    };
+    let addr = resolve(scratch, bindings, id)?
+        .device_addr()
+        .ok_or_else(|| be("vulkan adapter: paged KV cache table has no device address"))?;
+    Ok(Some((addr, rows)))
+}
+
+/// Write `[table_lo, table_hi]` into params words 2-3 (zero when the cache is linear).
+fn write_page_table(pbytes: &mut [u8; 16], table: Option<(u64, u32)>) {
+    if let Some((addr, _)) = table {
+        pbytes[8..12].copy_from_slice(&(addr as u32).to_le_bytes());
+        pbytes[12..16].copy_from_slice(&((addr >> 32) as u32).to_le_bytes());
     }
 }
 
@@ -2959,6 +3005,10 @@ fn lower_op(
                     // the bound dispatch (kept dual-arm: attn_partial's .comp also serves prefill).
                     let kb = r(*k_cache)?;
                     let vb = r(*v_cache)?;
+                    // Paged K/V: the replay reads rows through a page table whose ADDRESS lives in
+                    // params words 2-3 (seeded once at record time); only the page size is pushed
+                    // here. Every layer of a slot shares one table, so any layer's desc answers.
+                    let page_rows = graph.desc(*k_cache).pages.map_or(0, |p| p.page_rows) as usize;
                     match (kb.device_addr(), vb.device_addr()) {
                         (Some(ka), Some(va)) => rec.attention_kv_split_dynac_at(
                             r(*q)?,
@@ -2981,6 +3031,7 @@ fn lower_op(
                             window,
                             kv_q8,
                             cap,
+                            page_rows,
                         ),
                         _ => rec.attention_kv_split_dynac(
                             r(*q)?,
@@ -5108,9 +5159,10 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         // Host fallback (INFR_NO_GPU_POS): pos from positions[0] (decode rows=1); kv_len = pos+1.
         let pos = read_pos0(be_, resolve(&replay.scratch, bindings, replay.positions)?)?;
         let kv_len = pos + 1;
-        let mut pbytes = [0u8; 8];
+        let mut pbytes = [0u8; 16];
         pbytes[0..4].copy_from_slice(&pos.to_le_bytes());
         pbytes[4..8].copy_from_slice(&kv_len.to_le_bytes());
+        write_page_table(&mut pbytes, replay.page_table);
         be_.upload(replay.params.as_ref(), &pbytes)?;
     }
     replay.recorded.replay().map_err(|e| be(e.to_string()))?;
@@ -5184,8 +5236,11 @@ fn record_decode_replay(
     bindings: &Bindings,
 ) -> Result<DecodeReplay> {
     let scratch = alloc_scratch(be_, graph)?;
-    // `[pos, kv_len]` — Staging (host-visible mapped) so per-token `upload` is a plain memcpy.
-    let params = be_.alloc(8, BufferUsage::Staging)?;
+    // `[pos, kv_len, table_lo, table_hi]` — Staging (host-visible mapped) so per-token `upload` is a
+    // plain memcpy. Words 2-3 hold the paged K/V table's device address (0 = linear cache);
+    // `params_advance` only ever writes words 0-1, so they survive the whole replay.
+    let params = be_.alloc(16, BufferUsage::Staging)?;
+    let page_table = replay_page_table(graph, &scratch, bindings)?;
     let positions = graph
         .ops
         .iter()
@@ -5221,9 +5276,10 @@ fn record_decode_replay(
     let self_advancing = be_.cfg().kernels.vulkan.gpu_pos;
     if self_advancing {
         let pos0 = read_pos0(be_, resolve(&scratch, bindings, positions)?)?;
-        let mut pbytes = [0u8; 8];
+        let mut pbytes = [0u8; 16];
         pbytes[0..4].copy_from_slice(&pos0.wrapping_sub(1).to_le_bytes());
         pbytes[4..8].copy_from_slice(&pos0.to_le_bytes());
+        write_page_table(&mut pbytes, page_table);
         be_.upload(params.as_ref(), &pbytes)?;
         // Cross-iteration fence for the chained decode (replay_n submits this recording n times
         // back-to-back): orders iteration i's tail writes (sampled id, id_log) before iteration
@@ -5358,6 +5414,7 @@ fn record_decode_replay(
         self_advancing,
         ring,
         positions,
+        page_table,
         recorded,
         _transient: transient,
     })
